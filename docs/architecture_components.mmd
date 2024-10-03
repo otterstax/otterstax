@@ -1,0 +1,104 @@
+%%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#E1F5FE', 'primaryBorderColor': '#0288D1', 'lineColor': '#0288D1', 'textColor': '#000000', 'fontFamily': 'Arial', 'fontSize': '14px' } } }%%
+classDiagram
+    title Component Architecture Overview
+    
+    class Client {
+        +FlightSQL Client
+        +MySQL Client
+        +PostgreSQL Client
+    }
+    
+    class FlightSqlServer {
+        +GetFlightInfoStatement()
+        +DoGetStatement()
+        +GetFlightInfoTables()
+        +DoPutCommandStatementUpdate()
+    }
+    
+    class MySQLServer {
+        +handleCommand()
+        +sendResultSet()
+    }
+    
+    class PostgresServer {
+        +handleSimpleQuery()
+        +sendDataRow()
+    }
+    
+    class Scheduler {
+        +execute()
+        +parse_query()
+        +build_execution_plan()
+        +execute_statement()
+    }
+    
+    class CatalogManager {
+        +get_catalog_schema()
+        +get_tables()
+        +resolve_tables()
+    }
+    
+    class SqlConnectionManager {
+        +execute()
+        +addConnection()
+        +removeConnection()
+    }
+    
+    class PgConnectionManager {
+        +execute()
+        +addConnection()
+        +removeConnection()
+    }
+    
+    class OtterbrixManager {
+        +execute_plan()
+        +merge_chunks()
+    }
+    
+    class MySQLConnector {
+        +runQuery()
+        +connect()
+        +tryReconnect()
+    }
+    
+    class PostgreSQLConnector {
+        +runQuery()
+        +connect()
+        +tryReconnect()
+    }
+    
+    Client --> FlightSqlServer : request
+    Client --> MySQLServer : request
+    Client --> PostgresServer : request
+
+    FlightSqlServer ..> Client : response
+    MySQLServer ..> Client : response
+    PostgresServer ..> Client : response
+
+    FlightSqlServer --> Scheduler : execute
+    MySQLServer --> Scheduler : execute
+    PostgresServer --> Scheduler : execute
+
+    Scheduler ..> FlightSqlServer : result
+    Scheduler ..> MySQLServer : result
+    Scheduler ..> PostgresServer : result
+
+    Scheduler --> CatalogManager : get_catalog_schema
+    Scheduler --> SqlConnectionManager : execute
+    Scheduler --> PgConnectionManager : execute
+    Scheduler --> OtterbrixManager : execute_plan
+
+    CatalogManager ..> Scheduler : schema result
+    SqlConnectionManager ..> Scheduler : execute result
+    PgConnectionManager ..> Scheduler : execute result
+    OtterbrixManager ..> Scheduler : plan result
+
+    SqlConnectionManager --> MySQLConnector : execute
+    PgConnectionManager --> PostgreSQLConnector : execute
+    OtterbrixManager --> SqlConnectionManager : execute
+    OtterbrixManager --> PgConnectionManager : execute
+
+    MySQLConnector ..> SqlConnectionManager : runQuery result
+    PostgreSQLConnector ..> PgConnectionManager : runQuery result
+    SqlConnectionManager ..> OtterbrixManager : chunk result
+    PgConnectionManager ..> OtterbrixManager : chunk result

@@ -119,9 +119,9 @@ for i in {1..30}; do
         echo "✅ MariaDB1 is ready"
         break
     fi
-    echo "⏳ Waiting for MariaDB1... ($i/30)"
-    sleep 2
-    if [ $i -eq 30 ]; then
+    echo "⏳ Waiting for MariaDB1... ($i/${WAIT_RETRIES})"
+    sleep ${WAIT_SLEEP}
+    if [ $i -eq ${WAIT_RETRIES} ]; then
         echo "❌ Timeout waiting for MariaDB1"
         $COMPOSE_CMD -f compose.test.yml logs mariadb1 | tail -20
         exit 1
@@ -135,9 +135,9 @@ for i in {1..30}; do
         echo "✅ MariaDB2 is ready"
         break
     fi
-    echo "⏳ Waiting for MariaDB2... ($i/30)"
-    sleep 2
-    if [ $i -eq 30 ]; then
+    echo "⏳ Waiting for MariaDB2... ($i/${WAIT_RETRIES})"
+    sleep ${WAIT_SLEEP}
+    if [ $i -eq ${WAIT_RETRIES} ]; then
         echo "❌ Timeout waiting for MariaDB2"
         $COMPOSE_CMD -f compose.test.yml logs mariadb2 | tail -20
         exit 1

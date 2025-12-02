@@ -1,0 +1,49 @@
+FROM ubuntu:22.04 as builder
+
+ENV TZ=America/US
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONFAULTHANDLER=1
+
+RUN apt update && \
+    apt upgrade -y && \
+    apt install -y \
+        build-essential \
+        ninja-build \
+        python3-pip \
+        python3-venv \
+        python3-dev curl gnupg apt-transport-https \
+        zlib1g libgflags2.2 libgflags-dev && \
+    apt clean && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN pip3 install --no-cache-dir conan==2.15.0 'cmake<4.0' && \
+     conan profile detect --force && \
+     conan remote add otterbrix http://conan.otterbrix.com
+
+RUN rm /bin/sh && ln -s /bin/bash /bin/sh
+
+WORKDIR /app/build
+COPY conanfile.py ./conanfile.py
+RUN conan install conanfile.py --build missing -s build_type=Release -s compiler.cppstd=gnu17
+
+WORKDIR /app
+COPY ./catalog ./catalog
+COPY ./connectors ./connectors
+COPY ./db_integration ./db_integration
+COPY ./frontend/ ./frontend
+COPY ./otterbrix ./otterbrix
+COPY ./component_manager ./component_manager
+COPY ./routes ./routes
+COPY ./scheduler ./scheduler
+COPY ./client_example ./client_example
+COPY ./types ./types
+COPY ./utility ./utility
+COPY ./main.cpp ./main.cpp
+COPY ./CMakeLists.txt ./CMakeLists.txt
+
+WORKDIR /app/build
+
+RUN cmake .. -DCMAKE_TOOLCHAIN_FILE=./build/Release/generators/conan_toolchain.cmake -DCMAKE_BUILD_TYPE=Release && \
+    cmake --build . --target all -- -j $(nproc)
+
+CMD [ "./server" ]

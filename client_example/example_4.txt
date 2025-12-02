@@ -1,0 +1,1 @@
+SELECT * FROM impressions.db2.schema.impressions WHERE clicks > 200;

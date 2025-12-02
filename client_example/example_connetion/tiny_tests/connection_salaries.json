@@ -1,0 +1,9 @@
+{
+    "alias": "salaries",
+    "host": "127.0.0.1",
+    "port": "",
+    "username": "test_user",
+    "password": "test",
+    "database": "my_database_2",
+    "table": ""
+}

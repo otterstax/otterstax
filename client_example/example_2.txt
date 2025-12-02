@@ -1,0 +1,5 @@
+SELECT * FROM campaigns.db1.schema.campaigns JOIN
+impressions.db2.schema.impressions ON
+campaigns.campaign_id = impressions.campaign_id
+WHERE campaigns.campaign_length > 30
+ORDER BY impressions.clicks DESC;

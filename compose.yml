@@ -1,0 +1,80 @@
+version: '3.8'
+
+services:
+
+  mariadb1:
+    image: mariadb:latest
+    container_name: mariadb_instance1
+    environment:
+      MYSQL_ROOT_PASSWORD: root_password
+      MYSQL_DATABASE: db1
+      MYSQL_USER: user1
+      MYSQL_PASSWORD: password1
+    ports:
+      - "3101:3306"
+    volumes:
+      - ./init/mariadb1:/docker-entrypoint-initdb.d
+      - ./mariadb1_data:/var/lib/mysql
+    networks:
+      - app_network
+    restart: unless-stopped
+
+  mariadb2:
+    image: mariadb:latest
+    container_name: mariadb_instance2
+    environment:
+      MYSQL_ROOT_PASSWORD: root_password
+      MYSQL_DATABASE: db2
+      MYSQL_USER: user2
+      MYSQL_PASSWORD: password2
+    ports:
+      - "3102:3306"
+    volumes:
+      - ./init/mariadb2:/docker-entrypoint-initdb.d
+      - ./mariadb2_data:/var/lib/mysql
+    networks:
+      - app_network
+    restart: unless-stopped
+
+  mariadb3:
+    image: mariadb:latest
+    container_name: mariadb_instance3
+    environment:
+      MYSQL_ROOT_PASSWORD: root_password
+      MYSQL_DATABASE: db2
+      MYSQL_USER: user3
+      MYSQL_PASSWORD: password3
+    ports:
+      - "127.0.0.1:3103:3306"
+    volumes:
+      - ./init/mariadb3:/docker-entrypoint-initdb.d
+      - ./mariadb3_data:/var/lib/mysql
+    networks:
+      - app_network
+    restart: unless-stopped
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: otterstax_app
+    depends_on:
+      - mariadb1
+      - mariadb2
+    ports:
+      - "0.0.0.0:8085:8085"
+      - "0.0.0.0:8815:8815"
+      - "0.0.0.0:8816:8816"
+    volumes:
+      - ./app_data:/app/data
+    networks:
+      - app_network
+
+networks:
+  app_network:
+    driver: bridge
+
+volumes:
+  mariadb1_data:
+  mariadb2_data:
+  app_data:

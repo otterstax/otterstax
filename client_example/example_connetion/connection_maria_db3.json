@@ -1,0 +1,9 @@
+{
+    "alias": "maria3",
+    "host": "mariadb3",
+    "port": "3306",
+    "username": "user3",
+    "password": "password3",
+    "database": "db2",
+    "table": ""
+}

@@ -1,0 +1,1 @@
+CREATE INDEX temp_index ON campaigns.db1.schema.temp_table (temp_int);

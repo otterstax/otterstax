@@ -1,0 +1,84 @@
+version: '3.8'
+
+services:
+  mariadb1:
+    image: mariadb:latest
+    container_name: test-mariadb1
+    environment:
+      MYSQL_ROOT_PASSWORD: root_password
+      MYSQL_DATABASE: db1
+      MYSQL_USER: user1
+      MYSQL_PASSWORD: password1
+    expose:
+      - "3306"
+    healthcheck:
+      test: ["CMD", "mariadb-admin", "ping", "-h", "localhost", "-u", "user1", "-ppassword1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    volumes:
+      - mariadb1_init:/docker-entrypoint-initdb.d    # Shared volume for init scripts
+    networks:
+      - test_app_network
+    restart: unless-stopped
+
+  mariadb2:
+    image: mariadb:latest
+    container_name: test-mariadb2
+    environment:
+      MYSQL_ROOT_PASSWORD: root_password
+      MYSQL_DATABASE: db2
+      MYSQL_USER: user2
+      MYSQL_PASSWORD: password2
+    expose:
+      - "3306"
+    healthcheck:
+      test: ["CMD", "mariadb-admin", "ping", "-h", "localhost", "-u", "user2", "-ppassword2"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    volumes:
+      - mariadb2_init:/docker-entrypoint-initdb.d    # Shared volume for init scripts
+    networks:
+      - test_app_network
+    restart: unless-stopped
+
+  test-otterstax:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: test_otterstax_app
+    depends_on:
+      - mariadb1
+      - mariadb2
+    expose:
+      - "8815"
+      - "8085"
+    networks:
+      - test_app_network
+
+  test-client:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    container_name: test-client
+    depends_on:
+      - mariadb1
+      - mariadb2
+      - test-otterstax
+    volumes:
+      - mariadb1_init:/app/mariadb1_init    # Mount SAME volumes as MariaDB
+      - mariadb2_init:/app/mariadb2_init
+      - ./tests/logs:/app/logs
+    networks:
+      - test_app_network
+
+networks:
+  test_app_network:
+    driver: bridge
+
+volumes:
+  mariadb1_init:    # Shared between test-client and mariadb1
+  mariadb2_init:    # Shared between test-client and mariadb2

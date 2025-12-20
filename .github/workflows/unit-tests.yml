@@ -1,0 +1,70 @@
+name: Unit & Mock Tests
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+  unit-tests:
+    name: Run Unit & Mock Tests
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            ninja-build \
+            python3-pip \
+            python3-venv \
+            python3-dev \
+            curl \
+            gnupg \
+            apt-transport-https \
+            zlib1g \
+            libgflags2.2 \
+            libgflags-dev
+
+      - name: Install Conan and CMake
+        run: |
+          pip3 install --no-cache-dir conan==2.15.0 'cmake<4.0'
+          conan profile detect --force
+          conan remote add otterbrix http://conan.otterbrix.com || true
+
+      - name: Cache Conan packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.conan2
+          key: conan-${{ runner.os }}-${{ hashFiles('conanfile.py') }}
+          restore-keys: |
+            conan-${{ runner.os }}-
+
+      - name: Install dependencies with Conan
+        run: |
+          conan install . --build missing -s build_type=Release -s compiler.cppstd=gnu17
+
+      - name: Configure CMake
+        run: |
+          cmake -B build \
+            -DCMAKE_TOOLCHAIN_FILE=build/Release/generators/conan_toolchain.cmake \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTS=ON
+
+      - name: Build
+        run: cmake --build build --parallel $(nproc)
+
+      - name: Run Unit Tests
+        run: |
+          cd build
+          ctest --output-on-failure --test-dir tests/unit -j $(nproc)
+
+      - name: Run Mock Tests (MySQL Frontend)
+        run: |
+          cd build
+          ctest --output-on-failure --test-dir tests/mysql-front -j $(nproc)

@@ -33,3 +33,5 @@ RUN chmod +x /app/startup.sh
 # Create directories where volumes will be mounted
 RUN mkdir -p /app/mariadb1_init
 RUN mkdir -p /app/mariadb2_init
+
+CMD ["./startup.sh"]

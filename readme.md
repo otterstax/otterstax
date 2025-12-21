@@ -1,4 +1,4 @@
-# Sqlflight Server with Otterbrix Integration
+# OtterStax
 
 ## How to Run
 
@@ -13,18 +13,35 @@
 
 ## How to Test
 
-### Install dependencies: 
-Install faker via pip 
-
+### Run test script:
 ```sh
-    pip install faker
+chmod +x ./docker-run-tests.sh
+./docker-run-tests.sh
 ```
 
-### Run test script:
-  ```sh
-  chmod +x ./docker-run-tests.sh~~~~
-  ./docker-run-tests.sh
-  ```
+### Run integration tests with Docker Compose:
+```sh
+docker compose -f compose.test.yml up --build
+```
+
+## CI/CD
+
+This project uses GitHub Actions for continuous integration:
+
+| Workflow | Description | Trigger |
+|----------|-------------|---------|
+| `unit-tests.yml` | C++ unit and mock tests (Catch2) | Push/PR to main, develop |
+| `integration.yml` | Integration tests with Docker Compose | Push/PR to main, develop |
+
+### Unit & Mock Tests
+- Builds project with Conan/CMake
+- Runs `test_utils` (unit tests)
+- Runs `test_mysql_front` (mock tests)
+
+### Integration Tests
+- Starts MariaDB instances
+- Runs otterstax server
+- Executes Python test client
 
 ## License
 

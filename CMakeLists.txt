@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.15)
-project(sqlflight_server)
+project(otterstax)
 
 set(CMAKE_VERBOSE_MAKEFILE TRUE)
 set(CMAKE_CXX_STANDARD 20 CACHE STRING "The C++ standard whose features are requested.")

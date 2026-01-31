@@ -5,8 +5,8 @@ from conan import ConanFile
 from conan.tools.cmake import CMakeToolchain, CMakeDeps, cmake_layout
 
 
-class SqlFlightServer(ConanFile):
-    name = "sqlflight_server"
+class OtterStax(ConanFile):
+    name = "otterstax"
     version = "1.0.0"
 
     # Binary configuration

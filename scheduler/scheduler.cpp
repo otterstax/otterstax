@@ -1,17 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2025 OtterStax
+// Copyright 2025-2026  OtterStax
 
 #include "scheduler.hpp"
 
-#include "../routes/nosql_connection_manager.hpp"
-#include "../routes/otterbrix_manager.hpp"
-#include "../routes/scheduler.hpp"
-#include "../routes/sql_connection_manager.hpp"
-#include "../utility/timer.hpp"
+#include "routes/nosql_connection_manager.hpp"
+#include "routes/otterbrix_manager.hpp"
+#include "routes/scheduler.hpp"
+#include "routes/sql_connection_manager.hpp"
+#include "utility/timer.hpp"
+#include "utility/logger.hpp"
 
 #include <actor-zeta.hpp>
 #include <cassert>
-#include <iostream>
 
 using namespace components;
 
@@ -70,7 +70,9 @@ Scheduler::Scheduler(std::pmr::memory_resource* res,
                                     &Scheduler::get_otterbrix_schema_finish))
     , sql_connection_manager_(sql_connection_manager)
     , otterbrix_manager_(otterbrix_manager)
-    , catalog_manager_(catalog_manager) {
+    , catalog_manager_(catalog_manager)
+    , log_(get_logger(logger_tag::SCHEDULER)) {
+    assert(log_.is_valid());
     assert(res != nullptr);
     assert(parser_ != nullptr);
     worker_.start(); // Start the worker thread manager
@@ -139,14 +141,14 @@ auto Scheduler::enqueue_impl(actor_zeta::message_ptr msg, actor_zeta::execution_
 auto Scheduler::execute(session_hash_t id, shared_flight_data sdata, std::string sql) -> void {
     try {
         Timer timer("Scheduler::execute");
-        std::cout << "Scheduler::execute " << std::this_thread::get_id() << "\n Scheduler::execute, sql: " << sql
-                  << "\n Scheduler::execute, id hash: " << id << std::endl;
+        // log_->trace("execute thread: {}, sql: {}, id hash: {}", std::this_thread::get_id(), sql, id);  // fmt v11 doesn't format thread::id
+        log_->trace("execute sql: {}, id hash: {}", sql, id);
         register_session(id, sdata); // in case parse() throws
         auto parsed = parser_->parse(sql);
         update_metadata(id, std::move(parsed)); // skip schema computing
         execute_statement(id, std::move(sdata));
     } catch (const std::exception& e) {
-        std::cerr << "Scheduler::execute caught exception: " << e.what() << std::endl;
+        log_->error("execute caught exception: {}", e.what());
         complete_session_on_error(id, e.what());
     }
 }
@@ -154,15 +156,15 @@ auto Scheduler::execute(session_hash_t id, shared_flight_data sdata, std::string
 void Scheduler::execute_statement(session_hash_t id, shared_flight_data sdata) {
     try {
         Timer timer("Scheduler::execute_statement");
-        std::cout << "Scheduler::execute_statement " << std::this_thread::get_id()
-                  << "\n Scheduler::execute_statement Shared data size: " << sdata->result.chunk.size()
-                  << "\n Scheduler::execute_statement, id hash: " << id << std::endl;
+        // log_->trace("execute_statement thread: {}, Shared data size: {}, id hash: {}",
+        //            std::this_thread::get_id(), sdata->result.chunk.size(), id);  // fmt v11 doesn't format thread::id
+        log_->trace("execute_statement Shared data size: {}, id hash: {}", sdata->result.chunk.size(), id);
         register_session(id, std::move(sdata));
 
-        std::cout << "Scheduler::execute_statement send to sql" << std::endl;
+        log_->debug("execute_statement send to sql");
         auto task = [this, id]() {
             if (auto data_ptr = get_statement(id); data_ptr) {
-                std::cout << "Scheduler::execute_statement send task: " << std::this_thread::get_id() << std::endl;
+                // log_->trace("execute_statement send task: {}", std::this_thread::get_id());  // fmt v11 doesn't format thread::id
                 actor_zeta::send(this->sql_connection_manager_,
                                  this->address(),
                                  sql_connection_manager::handler_id(sql_connection_manager::route::execute),
@@ -175,9 +177,9 @@ void Scheduler::execute_statement(session_hash_t id, shared_flight_data sdata) {
                 "No needed metadata found, unable to DoGet. A GetFlightInfoStatement call is required");
         };
         worker_.addTask(std::move(task));
-        std::cout << "Scheduler::execute_statement send to sql done" << std::endl;
+        log_->debug("execute_statement send to sql done");
     } catch (const std::exception& e) {
-        std::cerr << "Scheduler::execute_statement caught exception: " << e.what() << std::endl;
+        log_->error("execute_statement caught exception: {}", e.what());
         complete_session_on_error(id, e.what());
     }
 }
@@ -204,7 +206,7 @@ auto Scheduler::execute_prepared_statement(session_hash_t id,
 
         execute_statement(id, std::move(sdata));
     } catch (const std::exception& e) {
-        std::cerr << "Scheduler::execute_prepared_statement caught exception: " << e.what() << std::endl;
+        log_->error("execute_prepared_statement caught exception: {}", e.what());
         complete_session_on_error(id, e.what());
     }
 }
@@ -212,9 +214,9 @@ auto Scheduler::execute_prepared_statement(session_hash_t id,
 auto Scheduler::prepare_schema(session_hash_t id, shared_flight_data sdata, std::string sql) -> void {
     try {
         Timer timer("Scheduler::prepare_schema");
-        std::cout << "Scheduler::prepare_schema " << std::this_thread::get_id()
-                  << "\n Scheduler::prepare_schema, sql: " << sql << "\n Scheduler::prepare_schema, id hash: " << id
-                  << std::endl;
+        // log_->trace("prepare_schema thread: {}, sql: {}, id hash: {}",
+        //            std::this_thread::get_id(), sql, id);  // fmt v11 doesn't format thread::id
+        log_->trace("prepare_schema sql: {}, id hash: {}", sql, id);
 
         register_session(id, std::move(sdata));
         auto parsed = parser_->parse(sql);
@@ -235,13 +237,13 @@ auto Scheduler::prepare_schema(session_hash_t id, shared_flight_data sdata, std:
             get_catalog_schema_finish(id, std::move(parsed), catalog::catalog_error{});
         }
     } catch (const std::exception& e) {
-        std::cerr << "Scheduler::execute_statement caught exception: " << e.what() << std::endl;
+        log_->error("Scheduler::execute_statement caught exception: {}", e.what());
         complete_session_on_error(id, e.what());
     }
 }
 
 void Scheduler::execute_remote_sql_finish(session_hash_t id, ParsedQueryDataPtr&& data) {
-    std::cout << "Scheduler::execute_remote_sql_finish" << std::endl;
+    log_->trace("Scheduler::execute_remote_sql_finish");
     actor_zeta::send(otterbrix_manager_,
                      address(),
                      otterbrix_manager::handler_id(otterbrix_manager::route::execute),
@@ -249,7 +251,7 @@ void Scheduler::execute_remote_sql_finish(session_hash_t id, ParsedQueryDataPtr&
                      std::move(data->otterbrix_params));
 }
 void Scheduler::execute_remote_nosql_finish(session_hash_t id, ParsedQueryDataPtr&& data) {
-    std::cout << "Scheduler::execute_remote_nosql_finish" << std::endl;
+    log_->trace("Scheduler::execute_remote_nosql_finish");
     actor_zeta::send(otterbrix_manager_,
                      address(),
                      otterbrix_manager::handler_id(otterbrix_manager::route::execute),
@@ -261,40 +263,43 @@ void Scheduler::execute_otterbrix_finish(session_hash_t id, cursor::cursor_t_ptr
     try {
         Timer timer("Scheduler::execute_otterbrix_finish");
 
-        std::cout << "Scheduler::execute_otterbrix_finish" << std::endl;
+        log_->trace("Scheduler::execute_otterbrix_finish");
         if (!cursor->is_success()) {
             std::string error_msg =
                 "Scheduler::execute_otterbrix_finish Otterbrix execution failed: " + cursor->get_error().what;
-            std::cerr << error_msg << std::endl;
+            log_->error(error_msg);
             complete_session_on_error(id, std::move(error_msg));
             return;
         }
 
         if (cursor->size() == 0) { // empty cursor is not an error now
-            std::cout << "Scheduler::execute_otterbrix_finish Otterbrix execution returned empty result" << std::endl;
+            log_->debug("Scheduler::execute_otterbrix_finish Otterbrix execution returned empty result");
             complete_session(id);
             return;
         }
 
-        std::cout << "Scheduler::execute_otterbrix_finish Rows after otterbrix: " << cursor->size() << std::endl;
+        log_->debug("Scheduler::execute_otterbrix_finish Rows after otterbrix: {}", cursor->size());
         auto& chunk_res = cursor->chunk_data();
-        std::cout << "Scheduler::execute_otterbrix_finish chunk_res: " << cursor->size() << std::endl;
+        log_->trace("Scheduler::execute_otterbrix_finish chunk_res: {}", cursor->size());
 
         auto& meta = get_metadata(id);
-        complete_session(id, flight_data{std::move(meta.schema), std::move(chunk_res), 0}, session_type::DO_GET);
+        complete_session(id,
+                         flight_data{std::move(meta.schema), std::move(chunk_res), 0, meta.tag},
+                         session_type::DO_GET);
     } catch (const std::exception& e) {
-        std::cerr << "Scheduler::execute_statement caught exception: " << e.what() << std::endl;
+        log_->error("Scheduler::execute_statement caught exception: {}", e.what());
         complete_session_on_error(id, e.what());
     }
 }
 
 void Scheduler::execute_failed(session_hash_t id, std::string error_msg) {
-    std::cout << "Scheduler::execute_failed with message: " << error_msg << std::endl;
+    log_->error("Scheduler::execute_failed with message: {}", error_msg);
     complete_session_on_error(id, std::move(error_msg));
 }
 
-auto Scheduler::get_catalog_schema_finish(session_hash_t id, ParsedQueryDataPtr&& data, catalog::catalog_error err)
-    -> void {
+auto Scheduler::get_catalog_schema_finish(session_hash_t id,
+                                          ParsedQueryDataPtr&& data,
+                                          catalog::catalog_error err) -> void {
     if (err) {
         complete_session_on_error(id, err.what());
         return;
@@ -337,8 +342,9 @@ auto Scheduler::get_catalog_schema_finish(session_hash_t id, ParsedQueryDataPtr&
                      std::move(data));
 }
 
-auto Scheduler::get_otterbrix_schema_finish(session_hash_t id, cursor::cursor_t_ptr cursor, ParsedQueryDataPtr&& data)
-    -> void {
+auto Scheduler::get_otterbrix_schema_finish(session_hash_t id,
+                                            cursor::cursor_t_ptr cursor,
+                                            ParsedQueryDataPtr&& data) -> void {
     if (cursor->is_error()) {
         complete_session_on_error(id, cursor->get_error().what);
         return;
@@ -350,50 +356,52 @@ auto Scheduler::get_otterbrix_schema_finish(session_hash_t id, cursor::cursor_t_
         schema = cursor->type_data()[0];
     }
     const size_t param_cnt = data->otterbrix_params->parameters_count;
+    const NodeTag tag = data->tag;
     update_metadata(id, std::move(data), schema);
     complete_session(id,
-                     flight_data{std::move(schema), data_chunk_t{resource(), {}, 0}, param_cnt},
+                     flight_data{std::move(schema), data_chunk_t{resource(), {}, 0}, param_cnt, tag},
                      session_type::GET_FLIGHT_INFO);
 }
 
 void Scheduler::register_session(session_hash_t id, shared_flight_data sdata) {
     std::lock_guard<std::mutex> lock(data_map_mtx_);
     shared_data_map_[id] = std::move(sdata);
-    std::cout << "Scheduler::register_session" << std::endl;
+    log_->trace("Scheduler::register_session");
 }
 
 void Scheduler::update_metadata(session_hash_t id, ParsedQueryDataPtr metadata, types::complex_logical_type schema) {
     std::lock_guard<std::mutex> lock(data_map_mtx_);
-    std::cout << "Scheduler::update_metadata start" << std::endl;
-    metadata_map_[id] = metadata_t(std::move(schema), std::move(metadata));
-    std::cout << "Scheduler::update_metadata finish" << std::endl;
+    log_->trace("Scheduler::update_metadata start");
+    NodeTag tag = metadata->tag;
+    metadata_map_[id] = metadata_t(std::move(schema), std::move(metadata), tag);
+    log_->trace("Scheduler::update_metadata finish");
 }
 
 void Scheduler::complete_session(session_hash_t id) {
     std::lock_guard<std::mutex> lock(data_map_mtx_);
-    std::cout << "Scheduler::complete_session empty start" << std::endl;
+    log_->trace("Scheduler::complete_session empty start");
 
     if (auto it = shared_data_map_.find(id);
         it != shared_data_map_.end() && it->second->status() == cv_wrapper::Status::Unknown) {
-        std::cout << "Scheduler::complete_session updated" << std::endl;
+        log_->trace("Scheduler::complete_session updated");
         it->second->release_empty();
     }
-    std::cout << "Scheduler::complete_session empty finish" << std::endl;
+    log_->trace("Scheduler::complete_session empty finish");
     shared_data_map_.erase(id);
     metadata_map_.erase(id);
 }
 
 void Scheduler::complete_session(session_hash_t id, flight_data data, session_type type) {
     std::lock_guard<std::mutex> lock(data_map_mtx_);
-    std::cout << "Scheduler::complete_session start" << std::endl;
+    log_->trace("Scheduler::complete_session start");
 
     if (auto it = shared_data_map_.find(id);
         it != shared_data_map_.end() && it->second->status() == cv_wrapper::Status::Unknown) {
-        std::cout << "Scheduler::complete_session updated" << std::endl;
+        log_->trace("Scheduler::complete_session updated");
         it->second->result = std::move(data);
         it->second->release();
     }
-    std::cout << "Scheduler::complete_session finish" << std::endl;
+    log_->trace("Scheduler::complete_session finish");
     shared_data_map_.erase(id);
 
     if (type == session_type::DO_GET) {
@@ -404,12 +412,12 @@ void Scheduler::complete_session(session_hash_t id, flight_data data, session_ty
 
 void Scheduler::complete_session_on_error(session_hash_t id, std::string error_msg) {
     std::lock_guard<std::mutex> lock(data_map_mtx_);
-    std::cout << "Scheduler::complete_session_on_error start" << std::endl;
+    log_->trace("Scheduler::complete_session_on_error start");
 
     if (auto it = shared_data_map_.find(id); it != shared_data_map_.end()) {
         it->second->release_on_error(std::move(error_msg));
     }
-    std::cout << "Scheduler::complete_session_on_error finish" << std::endl;
+    log_->trace("Scheduler::complete_session_on_error finish");
     shared_data_map_.erase(id);
     metadata_map_.erase(id);
 }

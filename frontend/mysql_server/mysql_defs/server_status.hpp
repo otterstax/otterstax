@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2025 OtterStax
+// Copyright 2025-2026  OtterStax
 
 #pragma once
 
 #include <cstdint>
 
-namespace mysql_front {
+namespace frontend::mysql {
     // The status flags are a bit-field
     using server_status_flags_t = uint16_t;
 
@@ -37,4 +37,4 @@ namespace mysql_front {
         changed on the server because of the execution of the last statement. */
         SERVER_SESSION_STATE_CHANGED = (1UL << 14)
     };
-} // namespace mysql_front
+} // namespace frontend::mysql

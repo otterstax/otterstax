@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2025 OtterStax
+// Copyright 2025-2026  OtterStax
 
 #pragma once
+
+#include <components/log/log.hpp>
 
 #include <boost/asio.hpp>
 #include <boost/mysql.hpp>
@@ -17,7 +19,7 @@
 #include <boost/asio/this_coro.hpp>
 #include <boost/asio/use_awaitable.hpp>
 
-#include "../otterbrix/translators/input/mysql_to_chunk.hpp"
+#include "otterbrix/translators/input/mysql_to_chunk.hpp"
 #include <components/catalog/catalog_error.hpp>
 #include <otterbrix/otterbrix.hpp>
 
@@ -96,14 +98,16 @@ namespace mysqlc {
         }
 
     private:
+        log_t log_;
+
         template<typename Callable>
         requires std::invocable<Callable, const boost::mysql::results&>
             asio::awaitable<std::invoke_result_t<Callable, const boost::mysql::results&>>
             runQuery_(std::string_view query, Callable handler) {
-            std::cout << "[Connector::run_query] Thread id: " << std::this_thread::get_id() << std::endl;
+            // log_->trace("Thread id: {}", std::this_thread::get_id()); // Removed: fmt doesn't format thread::id
             if (status_ != Status::Connected) {
                 std::string err = "[Run query] Connector with alias: " + alias_ + " is not connected";
-                std::cerr << err << std::endl;
+                log_->error(err);
                 throw std::runtime_error(err);
             }
             boost::system::error_code ec;
@@ -111,7 +115,7 @@ namespace mysqlc {
 
             if (ec) {
                 std::string err = "[Run query] Connector with alias: " + alias_ + " ping failed: " + ec.message();
-                std::cerr << err << std::endl;
+                log_->error(err);
                 throw std::runtime_error(err);
             }
 
@@ -119,13 +123,12 @@ namespace mysqlc {
             // TODO add atomic working status to block removing while get results from
             // DB
             // Issue the SQL query to the server
-            std::cout << "[Run query] Alias: " << alias_ << " query: " << query << std::endl;
+            log_->debug("Alias: {} query: {}", alias_, query);
             mysql::results result;
             co_await conn_.async_execute(query, result, asio::redirect_error(asio::use_awaitable, ec));
 
             if (ec) {
-                std::cerr << "[Run query] Alias: " << alias_ << " query [" << std::string(query)
-                          << "] failed: " << ec.message() << std::endl;
+                log_->error("Alias: {} query [{}] failed: {}", alias_, std::string(query), ec.message());
                 throw std::runtime_error("[Run query] Alias: " + alias_ + " query [" + std::string(query) +
                                          "]\nfailed: " + ec.message());
             }

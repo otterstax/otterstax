@@ -1,35 +1,54 @@
-FROM python:3.12-slim-bookworm
+FROM ubuntu:22.04 AS builder
+
+ENV TZ=America/US
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONFAULTHANDLER=1
+
+RUN apt update && \
+    apt upgrade -y && \
+    apt install -y \
+        build-essential \
+        ninja-build \
+        python3-pip \
+        python3-venv \
+        python3-dev curl gnupg apt-transport-https \
+        zlib1g libgflags2.2 libgflags-dev \
+        libssl-dev && \
+    apt clean && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN pip3 install --no-cache-dir conan==2.15.0 'cmake<4.0' && \
+     conan profile detect --force && \
+     conan remote add otterbrix http://conan.otterbrix.com
+
+RUN rm /bin/sh && ln -s /bin/bash /bin/sh
+
+WORKDIR /app/build
+COPY conanfile.py ./conanfile.py
+RUN conan install conanfile.py --build missing -s build_type=Release -s compiler.cppstd=gnu17
+
 
 WORKDIR /app
+COPY ./catalog ./catalog
+COPY ./connectors ./connectors
+COPY ./db_integration ./db_integration
+COPY ./frontend/ ./frontend
+COPY ./otterbrix ./otterbrix
+COPY ./component_manager ./component_manager
+COPY ./routes ./routes
+COPY ./scheduler ./scheduler
+COPY ./client_example ./client_example
+COPY ./tests ./tests
+COPY ./types ./types
+COPY ./utility ./utility
+COPY ./main.cpp ./main.cpp
+COPY ./CMakeLists.txt ./CMakeLists.txt
 
-# Install system dependencies including Faker
-RUN apt-get update && apt-get install -y \
-    build-essential \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
+WORKDIR /app/build
 
-# Install Python dependencies including Faker
-RUN pip install --no-cache-dir \
-    pyarrow \
-    flightsql-dbapi \
-    pymysql \
-    tabulate \
-    mysql-connector-python \
-    faker
+RUN cmake .. -DCMAKE_TOOLCHAIN_FILE=./build/Release/generators/conan_toolchain.cmake -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=ON && \
+    cmake --build . --target all -- -j $(nproc)
 
-# Copy application files
-COPY ./tests/scripts .
-COPY ./tests/query_data.py .
-COPY ./tests/test_client.py .
-COPY ./tests/test_client_mutable.py .
-COPY ./tests/test_schema.py .
-COPY ./tests/mysql_test_client.py .
-COPY ./tests/create_test_data.py .
+RUN ctest -C Release -V --output-on-failure --timeout 60
 
-RUN chmod +x /app/http_healthcheck.sh
-RUN chmod +x /app/add_connections.sh
-RUN chmod +x /app/startup.sh
-
-# Create directories where volumes will be mounted
-RUN mkdir -p /app/mariadb1_init
-RUN mkdir -p /app/mariadb2_init
+CMD [ "./server" ]

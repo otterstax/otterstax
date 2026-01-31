@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2025 OtterStax
+// Copyright 2025-2026  OtterStax
 
 #include "parser.hpp"
 
@@ -63,8 +63,7 @@ static size_t get_external_nodes(std::pmr::memory_resource* resource,
     nodes_lookup.emplace_back(&node, nullptr, 0);
     while (!nodes_lookup.empty()) {
         auto& n = nodes_lookup.front();
-        std::cout << "checking nodes: type: " << to_string((*n.ptr)->type())
-                  << "; collection: " << (*n.ptr)->collection_full_name().to_string() << std::endl;
+        // log_.trace("checking nodes: type: {}; collection: {}", to_string((*n.ptr)->type()), (*n.ptr)->collection_full_name().to_string());
         if (!(*n.ptr)->collection_full_name().unique_identifier.empty() && is_valid_external((*n.ptr)->type())) {
             {
                 // TODO: remove this segment when connection pool will be added
@@ -102,9 +101,11 @@ static size_t get_external_nodes(std::pmr::memory_resource* resource,
 }
 
 ParsedQueryData::ParsedQueryData(OtterbrixStatementPtr otterbrix_params,
-                                 components::sql::transform::transform_result&& binder)
+                                 components::sql::transform::transform_result&& binder,
+                                 NodeTag tag)
     : otterbrix_params(std::move(otterbrix_params))
-    , binder_(std::move(binder)) {}
+    , binder_(std::move(binder))
+    , tag(tag) {}
 
 components::sql::transform::transform_result& ParsedQueryData::binder() { return binder_; }
 
@@ -116,7 +117,8 @@ GreenplumParser::GreenplumParser(std::pmr::memory_resource* resource)
 ParsedQueryDataPtr GreenplumParser::parse(const std::string& sql) {
     std::pmr::monotonic_buffer_resource arena_resource(resource_);
     sql::transform::transformer transformer(resource_);
-    auto res = raw_parser(&arena_resource, sql.c_str())->lst.front().data;
+    auto res = linitial(raw_parser(&arena_resource, sql.c_str()));
+    auto tag = nodeTag(res);
     auto binder = transformer.transform(sql::transform::pg_cell_to_node_cast(res));
 
     const size_t param_cnt = binder.parameter_count();
@@ -129,7 +131,8 @@ ParsedQueryDataPtr GreenplumParser::parse(const std::string& sql) {
                                              std::move(node),
                                              0,
                                              param_cnt),
-        std::move(binder));
+        std::move(binder),
+        tag);
 
     result->otterbrix_params->external_nodes_count =
         get_external_nodes(resource_, result->otterbrix_params->node, result->otterbrix_params->external_nodes);

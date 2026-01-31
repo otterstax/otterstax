@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2025 OtterStax
+// Copyright 2025-2026  OtterStax
 
 #pragma once
 
 #include <cstdint>
 
-namespace mysql_front {
+namespace frontend::mysql {
     enum class mysql_error : uint16_t
     {
         ER_CON_COUNT_ERROR = 1040,
@@ -46,4 +46,4 @@ namespace mysql_front {
         static constexpr const char* COMMAND_ERROR = "42000";    // Syntax error or access violation
         static constexpr const char* NOT_SUPPORTED_AUTH_ERROR = "08004";
     };
-} // namespace mysql_front
+} // namespace frontend::mysql

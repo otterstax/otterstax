@@ -1,7 +1,4 @@
 #!/bin/bash
-# SPDX-License-Identifier: Apache-2.0
-# Copyright 2025 OtterStax
-
 
 URL="http://0.0.0.0:8085/check_connection"
 

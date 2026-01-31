@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2025 OtterStax
+// Copyright 2025-2026  OtterStax
 
-#include "../../../otterbrix/translators/input/mysql_to_chunk.hpp"
-#include "../../../scheduler/schema_utils.hpp"
+#include "otterbrix/translators/input/mysql_to_chunk.hpp"
+#include "scheduler/schema_utils.hpp"
 
 #include <catch2/catch.hpp>
 #include <components/logical_plan/node_data.hpp>

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2025 OtterStax
+// Copyright 2025-2026  OtterStax
 
 #include "mysql_to_chunk.hpp"
 
@@ -176,68 +176,67 @@ namespace tsl {
             switch (column.type()) {
                 case boost::mysql::column_type::tinyint: {
                     if (is_signed) {
-                        // std::cout << "Set int8 handler\n";
+                        // spdlog::debug("Set int8 handler");
                         return {set_int8, {types::logical_type::TINYINT, column.column_name()}};
                     } else {
-                        // std::cout << "Set uint8 handler\n";
+                        // spdlog::debug("Set uint8 handler");
                         return {set_uint8, {types::logical_type::UTINYINT, column.column_name()}};
                     }
                 }
                 case boost::mysql::column_type::smallint: {
                     if (is_signed) {
-                        // std::cout << "Set int16 handler\n";
+                        // spdlog::debug("Set int16 handler");
                         return {set_int16, {types::logical_type::SMALLINT, column.column_name()}};
                     } else {
-                        // std::cout << "Set uint16 handler\n";
+                        // spdlog::debug("Set uint16 handler");
                         return {set_uint16, {types::logical_type::USMALLINT, column.column_name()}};
                     }
                 }
                 case boost::mysql::column_type::mediumint: {
                     if (is_signed) {
-                        // std::cout << "Set int32 handler\n";
+                        // spdlog::debug("Set int32 handler");
                         return {set_int32, {types::logical_type::INTEGER, column.column_name()}};
                     } else {
-                        // std::cout << "Set uint32 handler\n";
+                        // spdlog::debug("Set uint32 handler");
                         return {set_uint32, {types::logical_type::UINTEGER, column.column_name()}};
                     }
                 }
                 case boost::mysql::column_type::bigint:
                 case boost::mysql::column_type::int_: {
                     if (is_signed) {
-                        // std::cout << "Set int64 handler\n";
+                        // spdlog::debug("Set int64 handler");
                         return {set_int64, {types::logical_type::BIGINT, column.column_name()}};
                     } else {
-                        // std::cout << "Set uint64 handler\n";
+                        // spdlog::debug("Set uint64 handler");
                         return {set_uint64, {types::logical_type::UBIGINT, column.column_name()}};
                     }
                 }
                 case boost::mysql::column_type::bit: {
-                    // std::cout << "Set bit handler\n";
+                    // spdlog::debug("Set bit handler");
                     return {set_bit, {types::logical_type::BOOLEAN, column.column_name()}};
                 }
                 case boost::mysql::column_type::float_: {
-                    // std::cout << "Set float handler\n";
+                    // spdlog::debug("Set float handler");
                     return {set_float, {types::logical_type::FLOAT, column.column_name()}};
                 }
                 case boost::mysql::column_type::double_: {
-                    // std::cout << "Set double handler\n";
+                    // spdlog::debug("Set double handler");
                     return {set_double, {types::logical_type::DOUBLE, column.column_name()}};
                 }
                 case boost::mysql::column_type::decimal:
                 case boost::mysql::column_type::text:
                 case boost::mysql::column_type::char_:
                 case boost::mysql::column_type::varchar: {
-                    // std::cout << "Set string handler\n";
+                    // spdlog::debug("Set string handler");
                     return {set_string, {types::logical_type::STRING_LITERAL, column.column_name()}};
                 }
                 case boost::mysql::column_type::blob: {
-                    // std::cout << "Set blob handler\n";
+                    // spdlog::debug("Set blob handler");
                     return {set_blob, {types::logical_type::STRING_LITERAL, column.column_name()}};
                 }
                 default: {
                     std::stringstream oss;
                     oss << "Cant find to_local_type translator for type: " << column.type();
-                    std::cerr << oss.str() << std::endl;
                     throw std::runtime_error(oss.str());
                 }
             }
@@ -251,25 +250,25 @@ namespace tsl {
 
         const auto ncolumns = result.rows().num_columns();
         const auto nrows = result.rows().size();
-        std::cout << "nrows: " << nrows << std::endl;
-        // std::cout << "ncolumns: " << ncolumns << std::endl;
+        // spdlog::debug("nrows: {}", nrows);
+        // spdlog::debug("ncolumns: {}", ncolumns);
 
         std::pmr::vector<impl::value_translator_t> translators(resource);
         std::pmr::vector<types::complex_logical_type> types(resource);
         translators.reserve(ncolumns);
         types.reserve(ncolumns);
 
-        // std::cout << "Schema Information:\n";
+        // spdlog::debug("Schema Information:");
         size_t counter = 0;
         // simple wrapper to check if the data is signed
         auto is_signed = [&](size_t index) {
             return nrows > 0 ? impl::is_signed_int(result.rows().at(0), counter) : true;
         };
-        std::cout << "Collecting schema information\n";
+        // spdlog::debug("Collecting schema information");
         for (const auto& column : metadata) {
-            // std::cout << "column.database(): " << column.database() << std::endl;
-            // std::cout << "column.column_name(): " << column.column_name() << std::endl;
-            // std::cout << "column.original_column_name(): " << column.original_column_name() << std::endl;
+            // spdlog::debug("column.database(): {}", column.database());
+            // spdlog::debug("column.column_name(): {}", column.column_name());
+            // spdlog::debug("column.original_column_name(): {}", column.original_column_name());
 
             // In case where the rows is empty we assume that the numeric data is signed
             translators.emplace_back(impl::to_local_translator(column, is_signed(counter)));
@@ -279,7 +278,7 @@ namespace tsl {
         data_chunk_t chunk(resource, types, nrows);
         chunk.set_cardinality(nrows);
 
-        std::cout << "Converting mysql rows to otterbrix data chunk\n";
+        // spdlog::debug("Converting mysql rows to otterbrix data chunk");
         for (size_t i = 0; i < nrows; i++) {
             for (size_t j = 0; j < ncolumns; j++) {
                 translators.at(j).conversion_func(chunk, result.rows(), i, j);

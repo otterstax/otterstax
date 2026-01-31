@@ -1,21 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2025 OtterStax
+// Copyright 2025-2026  OtterStax
 
 #pragma once
 
 #include <actor-zeta.hpp>
+#include <components/log/log.hpp>
 
-#include "../otterbrix/operators/execute_plan.hpp"
-#include "../otterbrix/parser/parser.hpp"
-#include "../otterbrix/query_generation/sql_query_generator.hpp"
-#include "../otterbrix/translators/input/mysql_to_chunk.hpp"
-#include "../otterbrix/translators/output/chunk_to_arrow.hpp"
-#include "../routes/catalog_manager.hpp"
-#include "../utility/cv_wrapper.hpp"
-#include "../utility/session.hpp"
-#include "../utility/shared_flight_data.hpp"
-#include "../utility/worker.hpp"
+#include "otterbrix/operators/execute_plan.hpp"
+#include "otterbrix/parser/parser.hpp"
+#include "otterbrix/query_generation/sql_query_generator.hpp"
+#include "otterbrix/translators/input/mysql_to_chunk.hpp"
+#include "otterbrix/translators/output/chunk_to_arrow.hpp"
+#include "routes/catalog_manager.hpp"
 #include "schema_utils.hpp"
+#include "utility/cv_wrapper.hpp"
+#include "utility/session.hpp"
+#include "utility/shared_flight_data.hpp"
+#include "utility/worker.hpp"
 #include <components/catalog/catalog.hpp>
 // #include <core/spinlock/spinlock.hpp>
 
@@ -48,9 +49,11 @@ private:
     struct metadata_t {
         components::types::complex_logical_type schema;
         ParsedQueryDataPtr query_data_ptr;
+        NodeTag tag;
     };
 
     std::unordered_map<session_hash_t, shared_flight_data> shared_data_map_;
+    log_t log_;
     std::unordered_map<session_hash_t, metadata_t> metadata_map_;
 
     void register_session(session_hash_t id, shared_flight_data sdata);

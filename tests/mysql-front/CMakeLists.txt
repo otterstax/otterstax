@@ -1,6 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0
-# Copyright 2025 OtterStax
-
 project(test_mysql_front)
 
 set(${PROJECT_NAME}_SOURCES
@@ -14,7 +11,7 @@ add_executable(${PROJECT_NAME} ${${PROJECT_NAME}_SOURCES})
 target_link_libraries(
     ${PROJECT_NAME} PRIVATE
     otterbrix::otterbrix
-    lib_sqlflight_server
+    lib_otterstax
     Catch2::Catch2
 )
 

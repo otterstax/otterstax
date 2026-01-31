@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2025 OtterStax
+// Copyright 2025-2026  OtterStax
 
 #pragma once
 
-#include "../../otterbrix/parser/parser.hpp"
 #include "mock_config.hpp"
+#include "otterbrix/parser/parser.hpp"
 
+#include <chrono>
 #include <iostream>
 #include <string>
+#include <thread>
 
 class SimpleMockParser : public IParser {
 public:
@@ -42,7 +44,8 @@ public:
                                                  binder.params_ptr(),
                                                  binder.node_ptr(),
                                                  1),
-            std::move(binder));
+            std::move(binder),
+            NodeTag::T_SelectStmt);
         parsed->otterbrix_params->external_nodes.push_back({&parsed->otterbrix_params->node});
         return parsed;
     }

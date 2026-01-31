@@ -1,6 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0
-# Copyright 2025 OtterStax
-
 project(test_utils)
 
 set(${PROJECT_NAME}_SOURCES
@@ -11,6 +8,11 @@ set(${PROJECT_NAME}_SOURCES
 )
 
 add_executable(${PROJECT_NAME} ${${PROJECT_NAME}_SOURCES})
+
+target_include_directories(
+    ${PROJECT_NAME} PRIVATE
+    ${CMAKE_SOURCE_DIR}
+)
 
 target_link_libraries(
     ${PROJECT_NAME} PRIVATE

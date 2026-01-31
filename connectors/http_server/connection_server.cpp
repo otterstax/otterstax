@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2025 OtterStax
+// Copyright 2025-2026  OtterStax
 
 #include "connection_server.hpp"
 #include <optional>
@@ -24,13 +24,11 @@ namespace {
             if (!json_body.contains(key)) {
                 std::stringstream ss;
                 ss << "Missing key: " << key;
-                std::cerr << "Missing key: " << key << std::endl;
                 return ss.str();
             }
             if (!json_body.at(key).is_string()) {
                 std::stringstream ss;
                 ss << "Key is not a string: " << key;
-                std::cerr << "Key is not a string: " << key << std::endl;
                 return ss.str();
             }
         }
@@ -64,14 +62,13 @@ namespace http_server {
             response_.set(http::field::content_type, "application/json");
             response_.body() = R"({"status": "healthy", "timestamp": ")" + get_current_timestamp() + "\"}";
             response_.content_length(response_.body().size());
-            std::cout << "Health check OK" << std::endl;
+            // Health check OK
         } else if (request_.method() == http::verb::post && request_.target() == "/add_connection") {
             try {
                 auto json_body = boost::json::parse(request_.body());
                 if (auto err = check_json_body(boost::json::parse(request_.body()).as_object()); err.has_value()) {
                     response_.result(http::status::bad_request);
                     response_.body() = std::string("Invalid JSON: ") + err.value();
-                    std::cerr << "HTTP SERVER ERROR: " << std::string("Invalid JSON: ") + err.value() << std::endl;
                     write_response();
                     return;
                 }
@@ -84,8 +81,6 @@ namespace http_server {
                     .database = json_body.at("database").as_string().c_str(),
                     .table = json_body.at("table").as_string().c_str(),
                 };
-                std::cout << "HTTP SERVER: Add connection" << std::endl;
-                std::cout << params << std::endl;
 
                 conn_manager_->addConnection(params);
 
@@ -93,12 +88,10 @@ namespace http_server {
                 response_.set(http::field::content_type, "application/json");
                 response_.body() = std::string("Connection added");
                 response_.content_length(response_.body().size());
-                std::cout << "HTTP SERVER: Connection added" << std::endl;
 
             } catch (const std::exception& e) {
                 response_.result(http::status::bad_request);
                 response_.body() = std::string("ERROR: ") + e.what();
-                std::cerr << "HTTP SERVER ERROR: " << e.what() << std::endl;
             }
         } else if (request_.method() == http::verb::get && request_.target() == "/check_connection") {
             try {
@@ -106,13 +99,11 @@ namespace http_server {
                 if (!boost::json::parse(request_.body()).as_object().contains("alias")) {
                     response_.result(http::status::bad_request);
                     response_.body() = std::string("Missing alias");
-                    std::cerr << "HTTP SERVER ERROR: " << std::string("Missing alias") << std::endl;
 
                     write_response();
                     return;
                 }
                 std::string alias = json_body.at("alias").as_string().c_str();
-                std::cout << "HTTP SERVER: check connection with alias: " << alias << std::endl;
 
                 const bool conn_exist = conn_manager_->hasConnection(alias);
 
@@ -127,16 +118,13 @@ namespace http_server {
                     response_.body() = std::string("Connection [" + alias + "] not exist exists");
                     response_.content_length(response_.body().size());
                 }
-                std::cout << "HTTP SERVER: Check connection OK" << std::endl;
             } catch (const std::exception& e) {
                 response_.result(http::status::bad_request);
                 response_.body() = std::string("ERROR: ") + e.what();
-                std::cerr << "HTTP SERVER ERROR: " << e.what() << std::endl;
             }
         } else {
             response_.result(http::status::not_found);
             response_.body() = "Resource not found";
-            std::cerr << "HTTP SERVER ERROR: Resource not found" << std::endl;
         }
         response_.prepare_payload();
         write_response();

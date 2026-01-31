@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2025 OtterStax
+// Copyright 2025-2026  OtterStax
 
 #include "chunk_to_arrow.hpp"
 
@@ -62,7 +62,6 @@ void append_physical_to_arrow_fields(arrow::FieldVector& field_vector, std::stri
             break;
         }
         default: {
-            std::cerr << "Chunk to arrow: Unknown type\n";
             throw std::runtime_error("Chunk to arrow: Unknown type: " + std::to_string(static_cast<uint8_t>(type)));
         }
     }

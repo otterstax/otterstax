@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2025 OtterStax
+// Copyright 2025-2026  OtterStax
 
 #pragma once
 
-#include "../catalog/catalog_manager.hpp"
-#include "../connectors/mysql_manager.hpp"
-#include "../db_integration/otterbrix/otterbrix_manager.hpp"
-#include "../db_integration/sql/connection_manager.hpp"
-#include "../scheduler/scheduler.hpp"
+#include "catalog/catalog_manager.hpp"
+#include "connectors/mysql_manager.hpp"
+#include "db_integration/otterbrix/otterbrix_manager.hpp"
+#include "db_integration/sql/connection_manager.hpp"
+#include "scheduler/scheduler.hpp"
 
 #include <actor-zeta.hpp>
 #include <otterbrix/otterbrix.hpp>
@@ -20,6 +20,7 @@ class ComponentManager {
 public:
     explicit ComponentManager(const configuration::config& config);
     std::pmr::memory_resource* getResource();
+    std::string getLogPath();
     std::shared_ptr<mysqlc::ConnectorManager> db_connection_manager() const;
     actor_zeta::address_t scheduler_address() const;
     actor_zeta::address_t catalog_address() const;
@@ -28,6 +29,7 @@ public:
 private:
     otterbrix::otterbrix_ptr otterbrix_{nullptr};
     std::pmr::memory_resource* resource_{nullptr};
+    std::string log_path_;
     std::shared_ptr<mysqlc::ConnectorManager> db_connector_manager_{nullptr};
     std::unique_ptr<mysqlc::CatalogManager, actor_zeta::pmr::deleter_t> catalog_manager_{
         nullptr,

@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright 2025 OtterStax
+# Copyright 2025-2026  OtterStax
 
 from conan import ConanFile
 from conan.tools.cmake import CMakeToolchain, CMakeDeps, cmake_layout
 
 
-class SqlFlightServer(ConanFile):
-    name = "sqlflight_server"
+class OtterStax(ConanFile):
+    name = "otterstax"
     version = "1.0.0"
 
     # Binary configuration
@@ -23,10 +23,6 @@ class SqlFlightServer(ConanFile):
     # Sources are located in the same place as this recipe
     exports_sources = "CMakeLists.txt", "src/*", "include/*"
 
-    def config_options(self):
-        if self.settings.os == "Windows":
-            del self.options.fPIC
-
     def layout(self):
         cmake_layout(self)
 
@@ -39,6 +35,7 @@ class SqlFlightServer(ConanFile):
         self.requires("msgpack-cxx/4.1.1")
         self.requires("catch2/2.13.7")
         self.requires("grpc/1.50.0")
+        self.requires("gflags/2.2.2", override=True)
         self.requires("abseil/20230802.1")
         self.requires("benchmark/1.6.1")
         self.requires("zlib/1.3.1")
@@ -48,7 +45,11 @@ class SqlFlightServer(ConanFile):
         self.requires("actor-zeta/1.0.0a12@")
 
     def config_options(self):
+        if self.settings.os == "Windows":
+            del self.options.fPIC
         # Setting options for packages
+        self.options["gflags/*"].shared = True
+        
         self.options["arrow/*"].with_flight_sql = True
         self.options["arrow/*"].shared = True
         self.options["arrow/*"].with_protobuf = True
@@ -58,6 +59,9 @@ class SqlFlightServer(ConanFile):
         self.options["arrow/*"].with_zlib = True
         self.options["arrow/*"].with_lz4 = True
         self.options["arrow/*"].with_zstd = True
+        self.options["arrow/*"].with_gflags = True
+        self.options["arrow/*"].use_system_gflags = True
+
         self.options["otterbrix/*"].shared = True
         
         self.options["boost/*"].shared = True

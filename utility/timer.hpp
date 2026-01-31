@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2025 OtterStax
+// Copyright 2025-2026  OtterStax
 
 #pragma once
 
@@ -13,13 +13,10 @@ public:
         start();
     }
     ~Timer() {
-        std::cout << "[" << name_ << "] "
-                  << "Total Time elapsed: " << elapsed() << "ms\n";
+        // Total Time elapsed
     }
     void timePoint(const std::string& sub_name = "") {
-        std::cout << "[" << name_ << "] "
-                  << "[" << sub_name << "] "
-                  << "Time elapsed: " << elapsed() << "ms\n";
+        // Time elapsed at point
     }
 
 private:

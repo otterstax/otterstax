@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2025 OtterStax
+// Copyright 2025-2026  OtterStax
 
 #pragma once
 
 #include <components/cursor/cursor.hpp>
 #include <otterbrix/otterbrix.hpp>
 
-#include "../../types/otterbrix.hpp"
-#include "../translators/input/mysql_to_chunk.hpp"
+#include "otterbrix/translators/input/mysql_to_chunk.hpp"
+#include "types/otterbrix.hpp"
 
 class IDataManager {
 public:

@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2025 OtterStax
+// Copyright 2025-2026  OtterStax
 
 #pragma once
 
+#include "../../common/resultset_utils.hpp"
 #include "../mysql_defs/column_flags.hpp"
 #include "../mysql_defs/field_type.hpp"
 #include "../packet/packet_utils.hpp"
@@ -16,13 +17,7 @@
 #include <optional>
 #include <string>
 
-namespace mysql_front {
-    enum class result_encoding : uint8_t
-    {
-        TEXT,
-        BINARY,
-    };
-
+namespace frontend::mysql {
     // https://dev.mysql.com/doc/dev/mysql-server/9.5.0/page_protocol_com_query_response_text_resultset.html
     // https://dev.mysql.com/doc/dev/mysql-server/9.5.0/page_protocol_binary_resultset.html
     class mysql_resultset {
@@ -32,7 +27,6 @@ namespace mysql_front {
                         std::string database = "",
                         std::string table = "");
 
-        void add_column(std::string name, field_type type, column_flags_t flags = 0);
         void add_chunk_columns(const components::vector::data_chunk_t& chunk);
 
         void add_row(const components::vector::data_chunk_t& chunk, size_t row_index);
@@ -55,4 +49,4 @@ namespace mysql_front {
         result_encoding encoding_;
     };
 
-} // namespace mysql_front
+} // namespace frontend::mysql

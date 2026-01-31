@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2025 OtterStax
+// Copyright 2025-2026  OtterStax
 
 #pragma once
 
 #include <actor-zeta.hpp>
+#include <components/log/log.hpp>
 
-#include "../../connectors/mysql_manager.hpp"
-#include "../../otterbrix/parser/parser.hpp"
-#include "../../scheduler/schema_utils.hpp"
-#include "../../utility/session.hpp"
-#include "../../utility/worker.hpp"
+#include "connectors/mysql_manager.hpp"
+#include "otterbrix/parser/parser.hpp"
+#include "scheduler/schema_utils.hpp"
+#include "utility/session.hpp"
+#include "utility/worker.hpp"
 
 #include <functional>
 #include <memory_resource>
@@ -31,6 +32,7 @@ namespace db_conn {
         std::shared_ptr<mysqlc::ConnectorManager> connector_manager_;
         // Behaviors
         actor_zeta::behavior_t execute_;
+        log_t log_;
 
         /// async method
         auto execute(session_hash_t id, ParsedQueryDataPtr&& data) -> void;

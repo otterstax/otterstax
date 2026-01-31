@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2025 OtterStax
+// Copyright 2025-2026  OtterStax
 
 #pragma once
 
 #include <cstdint>
 
-namespace mysql_front {
+namespace frontend::mysql {
     enum server_command : uint8_t
     {
         COM_SLEEP, // Currently refused by the server. Also used internally to mark the start of a session
@@ -45,4 +45,4 @@ namespace mysql_front {
         /* Must be last */
         COM_END // Not a real command. Refused.
     };
-} // namespace mysql_front
+} // namespace frontend::mysql

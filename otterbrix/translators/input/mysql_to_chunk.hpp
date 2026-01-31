@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2025 OtterStax
+// Copyright 2025-2026  OtterStax
 
 #pragma once
 
@@ -9,7 +9,7 @@
 #undef DAY
 #undef SECOND
 
-#include "../../types.hpp"
+#include "otterbrix/types.hpp"
 
 #include <boost/mysql.hpp>
 

@@ -1,0 +1,4 @@
+add_subdirectory(flight_sql_server)
+add_subdirectory(common)
+add_subdirectory(mysql_server)
+add_subdirectory(postgres_server)

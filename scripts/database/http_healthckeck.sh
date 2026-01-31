@@ -1,7 +1,4 @@
 #!/bin/bash
-# SPDX-License-Identifier: Apache-2.0
-# Copyright 2025 OtterStax
-
 
 URL="http://otterstax_app:8085/health"
 

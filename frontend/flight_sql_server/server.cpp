@@ -1,29 +1,30 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2025 OtterStax
+// Copyright 2025-2026  OtterStax
 
 #include "server.hpp"
 #include "batch_reader.hpp"
 
-#include "../../otterbrix/operators/execute_plan.hpp"
-#include "../../otterbrix/translators/input/mysql_to_chunk.hpp"
-#include "../../otterbrix/translators/output/chunk_to_arrow.hpp"
-#include "../../utility/connection_uid.hpp"
-#include "../../utility/timer.hpp"
+#include "otterbrix/operators/execute_plan.hpp"
+#include "otterbrix/translators/input/mysql_to_chunk.hpp"
+#include "otterbrix/translators/output/chunk_to_arrow.hpp"
+#include "utility/connection_uid.hpp"
+#include "utility/timer.hpp"
+#include "utility/logger.hpp"
 
-#include "../../otterbrix/config.hpp"
-#include "../../routes/scheduler.hpp"
+#include "otterbrix/config.hpp"
+#include "routes/scheduler.hpp"
 
 #include "../../utility/cv_wrapper.hpp"
 #include "../../utility/session.hpp"
 
 #include <boost/mysql/results.hpp>
+#include <spdlog/spdlog.h>
 
 #include <chrono>
 #include <components/logical_plan/node_data.hpp>
 #include <components/logical_plan/node_function.hpp>
 #include <components/sql/transformer/utils.hpp>
 #include <deque>
-#include <iostream>
 #include <thread>
 
 #include "arrow/flight/server.h"
@@ -49,10 +50,10 @@ struct QueryHandleWaiter {
     void wait() {
         for (auto& future : futures) {
             auto result = future.get();
-            std::cout << "Received from DB rows: " << result.size() << std::endl;
+            // Received from DB rows
             results.push_back(std::move(result));
         }
-        std::cout << "Finished!\n";
+        // Finished
     }
 };
 
@@ -69,7 +70,7 @@ arrow::Result<arrow::flight::Ticket> EncodeTransactionQuery(TicketData data) {
 
 // Decode input ticket to query, transaction ID, and session hash
 arrow::Result<TicketData> DecodeTransactionQuery(const std::string& ticket) {
-    std::cout << "DecodeTransactionQuery ticket: " << ticket << std::endl;
+    // Decode ticket
 
     // SQL & transaction_id
     auto first_divider = ticket.find(':');
@@ -97,10 +98,13 @@ arrow::Result<TicketData> DecodeTransactionQuery(const std::string& ticket) {
 }
 
 SimpleFlightSQLServer::SimpleFlightSQLServer(const Config& config)
-    : location_(arrow::flight::Location::ForGrpcTcp(config.host, config.port).ValueOrDie())
+    : log_(get_logger(logger_tag::FLIGHTSQL_SERVER))
+    , location_(arrow::flight::Location::ForGrpcTcp(config.host, config.port).ValueOrDie())
     , resource_(config.resource)
     , catalog_address_(config.catalog_address)
-    , scheduler_address_(config.scheduler_address) {}
+    , scheduler_address_(config.scheduler_address) {
+    assert(log_.is_valid());
+}
 
 // Method in arrow::flight::sql to start communication
 arrow::Result<std::unique_ptr<arrow::flight::FlightInfo>>
@@ -110,9 +114,9 @@ SimpleFlightSQLServer::GetFlightInfoStatement(const arrow::flight::ServerCallCon
     Timer timer("GetFlightInfoStatement");
     session_id id;
     const std::string& query = command.query;
-    std::cout << "Received query in ticket: " << query << std::endl;
+    log_->debug("Received query in ticket: {}", query);
     auto ticket = EncodeTransactionQuery({query, command.transaction_id, id.hash()}).ValueOrDie();
-    std::cout << "ticket: " << ticket.ToString() << std::endl;
+    log_->trace("ticket: {}", ticket.ToString());
 
     auto shared_data = create_cv_wrapper(flight_data(resource_));
     actor_zeta::send(scheduler_address_,
@@ -132,10 +136,10 @@ SimpleFlightSQLServer::GetFlightInfoStatement(const arrow::flight::ServerCallCon
         auto result = arrow::flight::FlightInfo::Make(*schema, descriptor, endpoints, -1, -1, ordered).ValueOrDie();
         return std::make_unique<arrow::flight::FlightInfo>(result);
     } else if (shared_data->status() == cv_wrapper::Status::Timeout) {
-        std::cerr << "[WARN] Timeout while preparing query: " << query << std::endl;
+        log_->warn("Timeout while preparing query: {}", query);
         return arrow::Status::Invalid("Timeout while preparing query: " + query);
     } else {
-        std::cerr << "[Error] while GetFlightInfoStatement: " << shared_data->error_message() << std::endl;
+        log_->error("Error while GetFlightInfoStatement: {}", shared_data->error_message());
         return arrow::Status::Invalid("Error while GetFlightInfoStatement: " + shared_data->error_message());
     }
 }
@@ -145,15 +149,17 @@ arrow::Result<std::unique_ptr<arrow::flight::FlightDataStream>>
 SimpleFlightSQLServer::DoGetStatement(const arrow::flight::ServerCallContext& context,
                                       const arrow::flight::sql::StatementQueryTicket& command) {
     Timer timer("DoGetStatement");
-    std::cout << "[DOGET] Thread id: " << std::this_thread::get_id() << std::endl;
+    // log_->trace("[DOGET] Thread id: {}", std::this_thread::get_id()); // fmt doesn't format thread::id
 
     try {
         const auto& [query, transaction_id, session_hash] =
             DecodeTransactionQuery(command.statement_handle).ValueOrDie();
 
         // Log the received ticket, assuming the query is stored in the ticket
-        std::cout << "Received query in ticket: " << query << "\nSession hash: " << session_hash
-                  << "\nTransaction ID: " << transaction_id << std::endl;
+        log_->debug("Received query in ticket: {} Session hash: {} Transaction ID: {}",
+                    query,
+                    session_hash,
+                    transaction_id);
         auto shared_data = create_cv_wrapper(flight_data(resource_));
         actor_zeta::send(scheduler_address_,
                          scheduler_address_,
@@ -163,35 +169,34 @@ SimpleFlightSQLServer::DoGetStatement(const arrow::flight::ServerCallContext& co
         shared_data->wait_for(cv_wrapper::DEFAULT_TIMEOUT);
 
         if (shared_data->status() == cv_wrapper::Status::Ok) {
-            std::cout << "[DOGET] Scheduler finished successfully, rows size: " << shared_data->result.chunk.size()
-                      << std::endl;
+            log_->debug("[DOGET] Scheduler finished successfully, rows size: {}", shared_data->result.chunk.size());
             auto chunk_res = std::move(shared_data->result.chunk);
             timer.timePoint("[DOGET] Scheduler finished successfully");
 
             auto schema = to_arrow_schema(shared_data->result.schema);
             auto batch_reader = ChunkBatchReader::Make(std::move(schema), std::move(chunk_res)).ValueOrDie();
             // Use a record batch stream
-            std::cout << "[ARROW FLIGHT SERVER] Send data\n";
+            log_->trace("[ARROW FLIGHT SERVER] Send data");
             timer.timePoint("[DOGET] datastream created");
             return std::make_unique<arrow::flight::RecordBatchStream>(batch_reader);
         } else if (shared_data->status() == cv_wrapper::Status::Empty) {
             std::shared_ptr<arrow::Schema> schema;
             auto chunk_res = std::move(shared_data->result.chunk);
-            std::cerr << "[WARN] [Otterbrix]: result cursor size : " << chunk_res.size() << std::endl;
+            log_->warn("[Otterbrix]: result cursor size : {}", chunk_res.size());
             auto batch_reader = ChunkBatchReader::Make(arrow::schema({}), std::move(chunk_res)).ValueOrDie();
             return std::make_unique<arrow::flight::RecordBatchStream>(batch_reader);
         } else if (shared_data->status() == cv_wrapper::Status::Timeout) {
-            std::cerr << "[WARN] Timeout while executing query: " << query << std::endl;
+            log_->warn("Timeout while executing query: {}", query);
             return arrow::Status::Invalid("Timeout while executing query: " + query);
         } else {
-            std::cerr << "[Error] while DOGET: " << shared_data->error_message() << std::endl;
+            log_->error("Error while DOGET: {}", shared_data->error_message());
             return arrow::Status::Invalid("Error while DOGET: " + shared_data->error_message());
         }
     } catch (const std::exception& e) {
-        std::cerr << "Error: " << e.what() << std::endl;
+        log_->error("Error: {}", e.what());
         return arrow::Status::Invalid("Error: " + std::string(e.what()));
     } catch (...) {
-        std::cerr << "Error: unknown\n";
+        log_->error("Error: unknown");
         return arrow::Status::Invalid("Error while DOGET: unknown");
     }
 }
@@ -234,7 +239,7 @@ SimpleFlightSQLServer::DoGetTables(const arrow::flight::ServerCallContext& conte
 
     // otherwise always Ok or Empty
     if (shared_data->status() == cv_wrapper::Status::Timeout) {
-        std::cerr << "[WARN] Timeout while getting tables" << std::endl;
+        log_->warn("Timeout while getting tables");
         return arrow::Status::Invalid("Timeout while getting tables");
     }
 
@@ -279,7 +284,7 @@ SimpleFlightSQLServer::DoPutCommandStatementUpdate(const arrow::flight::ServerCa
     Timer timer("DoPutCommandStatementUpdate");
     try {
         // Log the received ticket, assuming the query is stored in the ticket
-        std::cout << "Received query in ticket: " << command.query << "\nId: " << command.transaction_id << std::endl;
+        log_->debug("Received query in ticket: {} Id: {}", command.query, command.transaction_id);
         auto shared_data = create_cv_wrapper(flight_data(resource_));
         session_id id;
         actor_zeta::send(scheduler_address_,
@@ -294,23 +299,22 @@ SimpleFlightSQLServer::DoPutCommandStatementUpdate(const arrow::flight::ServerCa
 
         if (shared_data->status() == cv_wrapper::Status::Ok) {
             affected_rows = shared_data->result.chunk.size();
-            std::cout << "[DoPutCommandStatementUpdate] Scheduler finished successfully, rows size: " << affected_rows
-                      << std::endl;
+            log_->debug("[DoPutCommandStatementUpdate] Scheduler finished successfully, rows size: {}", affected_rows);
             timer.timePoint("[DoPutCommandStatementUpdate] Scheduler finished successfully");
 
-            std::cout << "[DoPutCommandStatementUpdate] Affected rows: " << affected_rows << std::endl;
-            std::cout << "[ARROW FLIGHT SERVER] Send data\n";
+            log_->debug("[DoPutCommandStatementUpdate] Affected rows: {}", affected_rows);
+            log_->trace("[ARROW FLIGHT SERVER] Send data");
             timer.timePoint("[DoPutCommandStatementUpdate] datastream created");
             return affected_rows;
         } else if (shared_data->status() == cv_wrapper::Status::Empty) {
             affected_rows = shared_data->result.chunk.size();
-            std::cerr << "[WARN] [Otterbrix]: result cursor size : " << affected_rows << std::endl;
+            log_->warn("[Otterbrix]: result cursor size : {}", affected_rows);
             return affected_rows;
         } else if (shared_data->status() == cv_wrapper::Status::Timeout) {
-            std::cerr << "[WARN] Timeout while executing query: " << command.query << std::endl;
+            log_->warn("Timeout while executing query: {}", command.query);
             return arrow::Status::Invalid("Timeout while executing query: " + command.query);
         } else {
-            std::cerr << "[Error] while DoPutCommandStatementUpdate: " << shared_data->error_message() << std::endl;
+            log_->error("Error while DoPutCommandStatementUpdate: {}", shared_data->error_message());
             return arrow::Status::Invalid("Error while DoPutCommandStatementUpdate: " + shared_data->error_message());
         }
     } catch (const boost::mysql::error_with_diagnostics& err) {
@@ -318,15 +322,17 @@ SimpleFlightSQLServer::DoPutCommandStatementUpdate(const arrow::flight::ServerCa
         // Security note: diagnostics::server_message may contain s-supplied values (e.g. the
         // field value that caused the error) and is encoded using to the connection's character set
         // (UTF-8 by default). Treat is as untrusted input.
-        std::cerr << "Error: " << err.what() << ", error code: " << err.code() << '\n'
-                  << "Server diagnostics: " << err.get_diagnostics().server_message() << std::endl;
+        log_->error("Error: {}, error code: {} Server diagnostics: {}",
+                    err.what(),
+                    err.code().value(),
+                    err.get_diagnostics().server_message());
         return arrow::Status::Invalid("Arrow server error: " + std::string(err.what()) +
                                       " message: " + std::string(err.get_diagnostics().server_message()));
     } catch (const std::exception& e) {
-        std::cerr << "Error: " << e.what() << std::endl;
+        log_->error("Error: {}", e.what());
         return arrow::Status::Invalid("Error: " + std::string(e.what()));
     } catch (...) {
-        std::cerr << "Error: unknown\n";
+        log_->error("Error: unknown");
         return arrow::Status::Invalid("Error while DoPutCommandStatementUpdate: unknown");
     }
 }
@@ -340,20 +346,20 @@ arrow::Status SimpleFlightSQLServer::Start() {
     // options.verify_client = false;
     const auto status_init = this->Init(options);
     if (status_init != arrow::Status::OK()) {
-        std::cout << "Init error: " << status_init << std::endl;
+        log_->error("Init error: {}", status_init.ToString());
         return status_init;
     }
 
     const auto status_set_sig = this->SetShutdownOnSignals({SIGTERM});
     if (status_set_sig != arrow::Status::OK()) {
-        std::cout << "SetShutdownOnSignals error: " << status_set_sig << std::endl;
+        log_->error("SetShutdownOnSignals error: {}", status_set_sig.ToString());
         return status_set_sig;
     }
 
-    std::cout << "Flight SQL server try started on " << options.location.ToString() << std::endl;
+    spdlog::info("Flight SQL server try started on {}", options.location.ToString());
     const auto status_serve = this->Serve();
     if (status_serve != arrow::Status::OK()) {
-        std::cout << "Serve error: " << status_serve << std::endl;
+        log_->error("Serve error: {}", status_serve.ToString());
         return status_serve;
     }
     return arrow::Status::OK();

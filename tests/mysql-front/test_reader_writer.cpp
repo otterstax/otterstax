@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2025 OtterStax
+// Copyright 2025-2026  OtterStax
 
-#include "../../frontend/mysql_server/packet/packet_reader.hpp"
-#include "../../frontend/mysql_server/packet/packet_writer.hpp"
+#include "frontend/mysql_server/packet/packet_reader.hpp"
+#include "frontend/mysql_server/packet/packet_writer.hpp"
 
 #include <catch2/catch.hpp>
 
-using namespace mysql_front;
+using namespace frontend::mysql;
 
 TEST_CASE("packet_writer: basic operations") {
     packet_writer writer;
@@ -28,7 +28,7 @@ TEST_CASE("packet_writer: basic operations") {
     }
 
     SECTION("write uint16_le") {
-        writer.write_uint16_le(0x1234);
+        writer.write_uint16(0x1234);
 
         auto packet = writer.build_from_payload(2);
 
@@ -37,7 +37,7 @@ TEST_CASE("packet_writer: basic operations") {
     }
 
     SECTION("write uint32_le") {
-        writer.write_uint32_le(0x12345678);
+        writer.write_uint32(0x12345678);
 
         auto packet = writer.build_from_payload(3);
 
@@ -176,14 +176,14 @@ TEST_CASE("packet_reader: basic operations") {
         std::vector<uint8_t> data = {0x34, 0x12}; // little endian 0x1234
         packet_reader reader(std::move(data));
 
-        REQUIRE(reader.read_uint16_le() == 0x1234);
+        REQUIRE(reader.read_uint16() == 0x1234);
     }
 
     SECTION("read uint32_le") {
         std::vector<uint8_t> data = {0x78, 0x56, 0x34, 0x12}; // little endian 0x12345678
         packet_reader reader(std::move(data));
 
-        REQUIRE(reader.read_uint32_le() == 0x12345678);
+        REQUIRE(reader.read_uint32() == 0x12345678);
     }
 }
 
@@ -295,7 +295,7 @@ TEST_CASE("packet_reader: error handling") {
         std::vector<uint8_t> data = {1};
         packet_reader reader(std::move(data));
 
-        REQUIRE_THROWS_AS(reader.read_uint16_le(), std::out_of_range);
+        REQUIRE_THROWS_AS(reader.read_uint16(), std::out_of_range);
     }
 
     SECTION("skip_bytes beyond bounds") {
@@ -309,7 +309,7 @@ TEST_CASE("packet_reader: error handling") {
 TEST_CASE("round-trip writer -> reader") {
     packet_writer writer;
     writer.write_uint8(42);
-    writer.write_uint16_le(0x1234);
+    writer.write_uint16(0x1234);
     writer.write_string_null("hello");
     writer.write_length_encoded_integer(300);
     writer.write_length_encoded_string("world");
@@ -321,7 +321,7 @@ TEST_CASE("round-trip writer -> reader") {
     packet_reader reader(std::move(payload));
 
     REQUIRE(reader.read_uint8() == 42);
-    REQUIRE(reader.read_uint16_le() == 0x1234);
+    REQUIRE(reader.read_uint16() == 0x1234);
     REQUIRE(reader.read_string_null() == "hello");
     REQUIRE(reader.read_length_encoded_integer() == 300);
     REQUIRE(reader.read_length_encoded_string() == "world");

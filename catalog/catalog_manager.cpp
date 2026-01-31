@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2025 OtterStax
+// Copyright 2025-2026  OtterStax
 
 #include "catalog_manager.hpp"
 
@@ -28,7 +28,9 @@ namespace mysqlc {
                                                 this,
                                                 &CatalogManager::get_tables))
         , catalog_(resource())
-        , conn_manager_(nullptr) {
+        , conn_manager_(nullptr)
+        , log_(get_logger(logger_tag::CATALOG_MANAGER)) {
+        assert(log_.is_valid());
         assert(res != nullptr);
         worker_.start();
     }
@@ -107,8 +109,7 @@ namespace mysqlc {
 
     auto CatalogManager::add_connection_schema(collection_full_name_t name) -> catalog::catalog_error {
         if (!conn_manager_) {
-            std::cout << "CatalogManager::add_connection_schema: mysql_manager is null, unable to query schema"
-                      << std::endl;
+            log_->warn("add_connection_schema: mysql_manager is null, unable to query schema");
             return catalog::catalog_error(catalog::catalog_mistake_t::FIELD_MISSING, "Unable to query schema");
         }
 
@@ -123,8 +124,9 @@ namespace mysqlc {
 
             catalog_.create_namespace(id.get_namespace());
             auto err = catalog_.create_table(id, catalog::table_metadata(resource(), std::move(schema)));
-            std::cout << "CatalogManager::add_connection_schema: "
-                      << ((err) ? "failed to add schema for: " : "schema added for: ") << id.to_string() << std::endl;
+            log_->info("add_connection_schema: {} for: {}",
+                       (err) ? "failed to add schema" : "schema added",
+                       id.to_string());
             return err;
         };
 
@@ -140,14 +142,13 @@ namespace mysqlc {
                                                  param.add_parameter(types::logical_value_t(0)))));
 
         std::string query = sql_gen::generate_query(node, &param.parameters());
-        std::cout << "CatalogManager::add_connection_schema: Generated SQL Query: \"" << query << "\"" << std::endl;
+        log_->debug("add_connection_schema: Generated SQL Query: \"{}\"", query);
 
         try {
             auto future = conn_manager_->executeQuery(name.schema, query, schema_handler);
             return future.get();
         } catch (const std::exception& e) {
-            std::cerr << "CatalogManager::add_connection_schema: failed to query schema for " << id.to_string()
-                      << std::endl;
+            log_->error("add_connection_schema: failed to query schema for {}", id.to_string());
             return catalog::catalog_error(catalog::catalog_mistake_t::FIELD_MISSING,
                                           std::string("Schema query failed: ") + e.what());
         }
@@ -225,9 +226,9 @@ namespace mysqlc {
                              std::move(err));
         };
         if (!worker_.addTask(std::move(send_task))) {
-            std::cerr << "CatalogManager::get_catalog_schema failed to add task to worker" << std::endl;
+            log_->error("get_catalog_schema failed to add task to worker");
         } else {
-            std::cout << "CatalogManager::get_catalog_schema added task to worker" << std::endl;
+            log_->trace("get_catalog_schema added task to worker");
         }
     }
 

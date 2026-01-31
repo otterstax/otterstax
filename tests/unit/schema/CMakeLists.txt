@@ -1,6 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0
-# Copyright 2025 OtterStax
-
 project(test_schema)
 
 set(${PROJECT_NAME}_SOURCES

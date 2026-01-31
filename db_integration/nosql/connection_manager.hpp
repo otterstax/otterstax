@@ -1,16 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2025 OtterStax
+// Copyright 2025-2026  OtterStax
 
 #pragma once
 
 #include <actor-zeta.hpp>
+#include <components/log/log.hpp>
 // #include <core/spinlock/spinlock.hpp>
 // #include <integration/cpp/impl/session_blocker.hpp>
 
-#include "../../otterbrix/translators/input/mysql_to_chunk.hpp"
-#include "../../types/otterbrix.hpp"
+#include "otterbrix/translators/input/mysql_to_chunk.hpp"
+#include "types/otterbrix.hpp"
 
-#include <iostream>
 #include <memory_resource>
 #include <string>
 #include <vector>
@@ -28,6 +28,7 @@ namespace db_conn {
         auto enqueue_impl(actor_zeta::message_ptr msg, actor_zeta::execution_unit*) -> void final;
 
     private:
+        log_t log_;
         // Behaviors
         actor_zeta::behavior_t execute_;
 

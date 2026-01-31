@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2025 OtterStax
+// Copyright 2025-2026  OtterStax
 
 #include "mysql_connection.hpp"
 
@@ -11,22 +11,21 @@ namespace {
     constexpr size_t null_bitmap_size(size_t column_count) { return (column_count + 7) / 8; }
 } // namespace
 
-namespace mysql_front {
+namespace frontend::mysql {
     constexpr uint8_t MIN_AUTH_PAYLOAD_SIZE = 32;
     constexpr uint8_t AUTH_FILLER_SIZE = 23;
 
     void mysql_connection::handle_auth(std::vector<uint8_t> payload) {
         if (payload.size() < MIN_AUTH_PAYLOAD_SIZE) {
-            std::cerr << "[Connection " << connection_id_ << "] AUTH: Payload too small" << std::endl;
+            log_->info("[Connection {}] AUTH: Payload too small", connection_id_);
             send_error(mysql_error::ER_ACCESS_DENIED_ERROR, "Access denied for user (using password: NO)");
             return;
         }
 
         packet_reader reader(std::move(payload));
 
-        uint32_t client_flags = reader.read_uint32_le();
-        std::cout << "[Connection " << connection_id_ << "] AUTH: flags=0x" << std::hex << client_flags << std::dec
-                  << std::endl;
+        uint32_t client_flags = reader.read_uint32();
+        log_->info("[Connection {}] AUTH: flags=0x{:x}", connection_id_, client_flags);
 
         if (!(client_flags & CLIENT_PROTOCOL_41)) {
             send_error(mysql_error::ER_NOT_SUPPORTED_AUTH_MODE,
@@ -34,7 +33,7 @@ namespace mysql_front {
             return;
         }
 
-        uint32_t max_packet_size = reader.read_uint32_le();
+        uint32_t max_packet_size = reader.read_uint32();
         //            if (max_packet_size > MAX_PACKET_SIZE) {
         //                std::cerr << "[Connection " << connection_id_ << "] AUTH: client max packet size is" << max_packet_size
         //                          << " while max allowed is 0xFFFFFF" << std::endl;
@@ -44,7 +43,7 @@ namespace mysql_front {
         client_max_packet_size_ = max_packet_size;
 
         uint8_t charset = reader.read_uint8();
-        std::cout << "[Connection " << connection_id_ << "] AUTH: charset=" << static_cast<int>(charset) << std::endl;
+        log_->info("[Connection {}] AUTH: charset={}", connection_id_, static_cast<int>(charset));
 
         if (reader.remaining() < AUTH_FILLER_SIZE) {
             send_error(mysql_error::ER_ACCESS_DENIED_ERROR, "Access denied - malformed auth packet");
@@ -52,14 +51,12 @@ namespace mysql_front {
         }
 
         reader.skip_bytes(AUTH_FILLER_SIZE); // filler
-        std::cout << "[Connection " << connection_id_ << "] AUTH: user='" << reader.read_string_null() << "'"
-                  << std::endl;
+        log_->info("[Connection {}] AUTH: user='{}'", connection_id_, reader.read_string_null());
 
         std::vector<uint8_t> password;
         if (reader.remaining() > 0) {
             uint8_t auth_length = reader.read_uint8();
-            std::cout << "[Connection " << connection_id_ << "] AUTH: auth_len=" << static_cast<int>(auth_length)
-                      << std::endl;
+            log_->info("[Connection {}] AUTH: auth_len={}", connection_id_, static_cast<int>(auth_length));
 
             if (auth_length > 0 && auth_length <= reader.remaining()) {
                 password.resize(auth_length);
@@ -73,19 +70,18 @@ namespace mysql_front {
         if ((client_flags & CLIENT_CONNECT_WITH_DB) && reader.remaining() > 0) {
             // todo: support
             requested_database = reader.read_string_null();
-            std::cout << "[Connection " << connection_id_ << "] AUTH: database='" << requested_database << "'"
-                      << std::endl;
+            log_->info("[Connection {}] AUTH: database='{}'", connection_id_, requested_database);
         }
 
         std::string auth_plugin;
         if ((client_flags & CLIENT_PLUGIN_AUTH) && reader.remaining() > 0) {
             auth_plugin = reader.read_string_null();
-            std::cout << "[Connection " << connection_id_ << "] AUTH: plugin='" << auth_plugin << "'" << std::endl;
+            log_->info("[Connection {}] AUTH: plugin='{}'", connection_id_, auth_plugin);
         }
 
         // skip auth
-        state_ = State::COMMAND;
-        std::cout << "[Connection " << connection_id_ << "] AUTH: Success -> COMMAND state" << std::endl;
+        state_ = connection_state::COMMAND;
+        log_->info("[Connection {}] AUTH: Success -> COMMAND state", connection_id_);
         send_packet(build_ok(writer_, sequence_id_));
     }
 
@@ -98,11 +94,11 @@ namespace mysql_front {
         auto cmd = static_cast<server_command>(payload[0]);
         switch (cmd) {
             case COM_QUIT:
-                std::cout << "[Connection " << connection_id_ << "] COM_QUIT" << std::endl;
+                log_->info("[Connection {}] COM_QUIT", connection_id_);
                 finish();
                 break;
             case COM_PING: {
-                std::cout << "[Connection " << connection_id_ << "] COM_PING" << std::endl;
+                log_->info("[Connection {}] COM_PING", connection_id_);
                 send_packet(build_ok(writer_, sequence_id_));
                 break;
             }
@@ -115,8 +111,7 @@ namespace mysql_front {
 
                 std::string db_name(std::make_move_iterator(payload.begin() + 1),
                                     std::make_move_iterator(payload.end()));
-                std::cout << "[Connection " << connection_id_ << "] COM_INIT_DB: '" << std::move(db_name) << "'"
-                          << std::endl;
+                log_->info("[Connection {}] COM_INIT_DB: '{}'", connection_id_, std::move(db_name));
                 send_packet(build_ok(writer_, sequence_id_));
                 break;
             }
@@ -128,9 +123,10 @@ namespace mysql_front {
                 }
 
                 std::string query(std::make_move_iterator(payload.begin() + 1), std::make_move_iterator(payload.end()));
-                std::cout << "[Connection " << connection_id_ << "] "
-                          << (cmd == COM_QUERY ? "COM_QUERY" : "COM_STMT_PREPARE") << ": '" << query << "'"
-                          << std::endl;
+                log_->info("[Connection {}] {}: '{}'",
+                           connection_id_,
+                           (cmd == COM_QUERY ? "COM_QUERY" : "COM_STMT_PREPARE"),
+                           query);
 
                 if (query.find_first_not_of(" \t\r\n") == std::string::npos) {
                     send_error(mysql_error::ER_EMPTY_QUERY, "Query was empty");
@@ -141,11 +137,11 @@ namespace mysql_front {
                 break;
             }
             case COM_STMT_EXECUTE: {
-                mysql_front::packet_reader reader(std::move(payload));
+                packet_reader reader(std::move(payload));
                 reader.read_uint8(); // skip [0x17] - COM_STMT_EXECUTE
-                uint32_t stmt_id = reader.read_uint32_le();
+                uint32_t stmt_id = reader.read_uint32();
                 uint8_t flags = reader.read_uint8();
-                reader.read_uint32_le(); // iteration count - always 1, ignore
+                reader.read_uint32(); // iteration count - always 1, ignore
 
                 auto it_stmt = statement_id_map_.find(stmt_id);
                 if (it_stmt == statement_id_map_.end()) {
@@ -154,24 +150,28 @@ namespace mysql_front {
                 }
 
                 size_t num_params = it_stmt->second.parameter_count;
-                std::cout << "[Connection " << connection_id_ << "] COM_STMT_EXECUTE stmt_id=" << stmt_id
-                          << " flags=" << static_cast<int>(flags) << " num_params=" << num_params << std::endl;
+                log_->info("[Connection {}] COM_STMT_EXECUTE stmt_id={} flags={} num_params={}",
+                           connection_id_,
+                           stmt_id,
+                           static_cast<int>(flags),
+                           num_params);
 
                 if (num_params == 0) {
                     handle_execute_stmt(it_stmt->second.stmt_session, {});
                     break;
                 }
 
-                if (auto param_values = handle_execute_params(stmt_id, num_params, it_stmt->second.param_types, reader);
+                if (auto param_values =
+                        handle_execute_params(stmt_id, num_params, it_stmt->second.param_types, std::move(reader));
                     !param_values.empty()) {
                     handle_execute_stmt(it_stmt->second.stmt_session, std::move(param_values));
                 }
                 break;
             }
             case COM_STMT_CLOSE: {
-                mysql_front::packet_reader reader(std::move(payload));
+                packet_reader reader(std::move(payload));
                 reader.read_uint8(); // skip [0x25] - COM_STMT_CLOSE
-                uint32_t stmt_id = reader.read_uint32_le();
+                uint32_t stmt_id = reader.read_uint32();
                 statement_id_map_.erase(stmt_id);
                 read_packet(); // nothing is sent to client, read next
                 break;
@@ -200,7 +200,10 @@ namespace mysql_front {
 
         switch (shared_data->status()) {
             case cv_wrapper::Status::Ok:
-                break; // do nothing
+                if (!shared_data->result.chunk.empty()) {
+                    break;
+                }
+                // fallthrough otherwise
             case cv_wrapper::Status::Empty:
                 send_packet(build_ok(writer_, sequence_id_, 0));
                 return;
@@ -215,11 +218,6 @@ namespace mysql_front {
         }
 
         // handle Ok
-        if (shared_data->result.chunk.empty()) {
-            send_packet(build_ok(writer_, sequence_id_, 0));
-            return;
-        }
-
         // empty db & table in metadata (not critical, but may be improved)
         mysql_resultset result(writer_, result_encoding::TEXT);
         result.add_chunk_columns(shared_data->result.chunk);
@@ -314,8 +312,11 @@ namespace mysql_front {
 
         uint16_t column_cnt = result.schema != types::logical_type::NA ? result.schema.child_types().size() : 0;
         packets.reserve(4 + column_cnt + result.parameter_count);
-        std::cout << "[Connection " << connection_id_ << "] COM_STMT_PREPARE: id=" << next_statement_id_
-                  << " column_cnt=" << column_cnt << " param_cnt=" << result.parameter_count << std::endl;
+        log_->info("[Connection {}] COM_STMT_PREPARE: id={} column_cnt={} param_cnt={}",
+                   connection_id_,
+                   next_statement_id_,
+                   column_cnt,
+                   result.parameter_count);
         packets.push_back(
             build_stmt_prepare_ok(writer_, sequence_id_++, next_statement_id_, column_cnt, result.parameter_count));
         statement_id_map_.emplace(next_statement_id_++,
@@ -380,7 +381,7 @@ namespace mysql_front {
     mysql_connection::handle_execute_params(uint32_t stmt_id,
                                             size_t num_params,
                                             std::pmr::vector<uint16_t>& param_types,
-                                            packet_reader& reader) {
+                                            packet_reader&& reader) {
         std::vector<uint8_t> null_bitmap(null_bitmap_size(num_params));
         for (auto& b : null_bitmap) {
             b = reader.read_uint8();
@@ -393,7 +394,7 @@ namespace mysql_front {
             param_types.clear();
             param_types.reserve(num_params);
             for (size_t i = 0; i < num_params; ++i) {
-                uint16_t t = reader.read_uint16_le();
+                uint16_t t = reader.read_uint16();
                 param_types.push_back(t);
             }
         }
@@ -429,7 +430,7 @@ namespace mysql_front {
                     break;
                 }
                 case field_type::MYSQL_TYPE_SHORT: {
-                    auto val = reader.read_uint16_le();
+                    auto val = reader.read_uint16();
                     if (is_unsigned) {
                         param_values.emplace_back(val);
                     } else {
@@ -438,7 +439,7 @@ namespace mysql_front {
                     break;
                 }
                 case field_type::MYSQL_TYPE_LONG: {
-                    auto val = reader.read_uint32_le();
+                    auto val = reader.read_uint32();
                     if (is_unsigned) {
                         param_values.emplace_back(val);
                     } else {
@@ -447,7 +448,7 @@ namespace mysql_front {
                     break;
                 }
                 case field_type::MYSQL_TYPE_LONGLONG: {
-                    auto val = reader.read_uint64_le();
+                    auto val = reader.read_uint64();
                     if (is_unsigned) {
                         param_values.emplace_back(val);
                     } else {
@@ -456,12 +457,12 @@ namespace mysql_front {
                     break;
                 }
                 case field_type::MYSQL_TYPE_FLOAT: {
-                    auto f = std::bit_cast<float>(reader.read_uint32_le());
+                    auto f = std::bit_cast<float>(reader.read_uint32());
                     param_values.emplace_back(f);
                     break;
                 }
                 case field_type::MYSQL_TYPE_DOUBLE: {
-                    auto d = std::bit_cast<double>(reader.read_uint64_le());
+                    auto d = std::bit_cast<double>(reader.read_uint64());
                     param_values.emplace_back(d);
                     break;
                 }
@@ -494,7 +495,10 @@ namespace mysql_front {
 
         switch (shared_data->status()) {
             case cv_wrapper::Status::Ok:
-                break;
+                if (!shared_data->result.chunk.empty()) {
+                    break;
+                }
+                // fallthrough otherwise
             case cv_wrapper::Status::Empty:
                 send_packet(build_ok(writer_, sequence_id_, 0));
                 return;
@@ -507,11 +511,6 @@ namespace mysql_front {
                 return;
         }
 
-        if (shared_data->result.chunk.size() == 0) {
-            send_packet(build_ok(writer_, sequence_id_, 0));
-            return;
-        }
-
         mysql_resultset result(writer_, result_encoding::BINARY);
         result.add_chunk_columns(shared_data->result.chunk);
         for (size_t i = 0; i < shared_data->result.chunk.size(); i++) {
@@ -522,6 +521,6 @@ namespace mysql_front {
     }
 
     void mysql_connection::send_resultset(mysql_resultset&& result) {
-        send_packet_sequence(mysql_resultset::build_packets(std::move(result), sequence_id_), 0);
+        send_packet_merged(mysql_resultset::build_packets(std::move(result), sequence_id_));
     }
-} // namespace mysql_front
+} // namespace frontend::mysql

@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2025 OtterStax
+// Copyright 2025-2026  OtterStax
 
 #include "otterbrix_manager.hpp"
 
-#include "../../routes/otterbrix_manager.hpp"
-#include "../../routes/scheduler.hpp"
-#include "../../scheduler/schema_utils.hpp"
-#include "../../utility/timer.hpp"
+#include "routes/otterbrix_manager.hpp"
+#include "routes/scheduler.hpp"
+#include "scheduler/schema_utils.hpp"
+#include "utility/timer.hpp"
+#include "utility/logger.hpp"
 
-#include <iostream>
 #include <ranges>
 #include <thread>
 
@@ -24,7 +24,9 @@ OtterbrixManager::OtterbrixManager(std::pmr::memory_resource* res, std::unique_p
     , get_schema_(actor_zeta::make_behavior(resource(),
                                             otterbrix_manager::handler_id(otterbrix_manager::route::get_schema),
                                             this,
-                                            &OtterbrixManager::get_schema)) {
+                                            &OtterbrixManager::get_schema))
+    , log_(get_logger(logger_tag::OTTERBRIX_MANAGER)) {
+    assert(log_.is_valid());
     worker_.start(); // Start the worker thread manager
 }
 
@@ -60,12 +62,12 @@ auto OtterbrixManager::execute(session_hash_t id, OtterbrixStatementPtr&& params
     try {
         Timer timer("OtterbrixManager::execute");
 
-        std::cout << "OtterbrixManager::execute id hash: " << id << std::endl;
+        log_->trace("execute id hash: {}", id);
 
         auto cursor_data = this->data_manager_->execute_plan(params);
-        std::cout << "OtterbrixManager::execute: execute_plan done" << std::endl;
+        log_->trace("execute: execute_plan done");
         send_result(id, std::move(cursor_data));
-        std::cout << "OtterbrixManager::execute finish" << std::endl;
+        log_->trace("execute finish");
     } catch (const std::exception& e) {
         send_error(id, e.what());
     } catch (...) {
@@ -78,7 +80,7 @@ auto OtterbrixManager::get_schema(session_hash_t id,
                                   ParsedQueryDataPtr&& data) -> void {
     Timer timer("OtterbrixManager::get_schema");
 
-    std::cout << "OtterbrixManager::get_schema id hash: " << id << std::endl;
+    log_->trace("get_schema id hash: {}", id);
 
     // we finally have everything to compute schema
     // joins - resulting schema does not depend on type of join - it's always union of aggregated fields
@@ -98,7 +100,7 @@ auto OtterbrixManager::get_schema(session_hash_t id,
     auto cursor_data = cursor::make_cursor(resource());
     if (params.size()) {
         cursor_data = this->data_manager_->get_schema(params);
-        std::cout << "OtterbrixManager::get_schema: get_schema done" << std::endl;
+        log_->trace("get_schema: get_schema done");
         if (cursor_data->is_error()) {
             send_schema(id, std::move(cursor_data), std::move(data));
             return;
@@ -111,14 +113,14 @@ auto OtterbrixManager::get_schema(session_hash_t id,
         std::move(cursor_data),
         std::move(dependencies));
     send_schema(id, std::move(schema), std::move(data));
-    std::cout << "OtterbrixManager::get_schema finish" << std::endl;
+    log_->trace("get_schema finish");
 }
 
 void OtterbrixManager::send_schema(session_hash_t id,
                                    components::cursor::cursor_t_ptr cursor,
                                    ParsedQueryDataPtr&& data) {
     auto send_task = [this, id, cursor_data = std::move(cursor), &data]() mutable {
-        std::cout << "OtterbrixManager::get_schema send task" << std::endl;
+        log_->trace("get_schema send task");
         actor_zeta::send(current_message()->sender(),
                          address(),
                          scheduler::handler_id(scheduler::route::get_otterbrix_schema_finish),
@@ -127,15 +129,15 @@ void OtterbrixManager::send_schema(session_hash_t id,
                          std::move(data));
     };
     if (!worker_.addTask(std::move(send_task))) {
-        std::cerr << "OtterbrixManager::get_schema failed to add task to worker" << std::endl;
+        log_->error("get_schema failed to add task to worker");
     } else {
-        std::cout << "OtterbrixManager::get_schema added task to worker" << std::endl;
+        log_->trace("get_schema added task to worker");
     }
 }
 
 void OtterbrixManager::send_result(session_hash_t id, components::cursor::cursor_t_ptr cursor) {
     auto send_task = [this, id, cursor_data = std::move(cursor)]() mutable {
-        std::cout << "OtterbrixManager::execute send task" << std::endl;
+        log_->trace("execute send task");
         actor_zeta::send(current_message()->sender(),
                          address(),
                          scheduler::handler_id(scheduler::route::execute_otterbrix_finish),
@@ -143,14 +145,14 @@ void OtterbrixManager::send_result(session_hash_t id, components::cursor::cursor
                          std::move(cursor_data));
     };
     if (!worker_.addTask(std::move(send_task))) {
-        std::cerr << "OtterbrixManager::execute failed to add task to worker" << std::endl;
+        log_->error("execute failed to add task to worker");
     } else {
-        std::cout << "OtterbrixManager::execute added task to worker" << std::endl;
+        log_->trace("execute added task to worker");
     }
 }
 
 void OtterbrixManager::send_error(session_hash_t id, std::string error_msg) {
-    std::cerr << "OtterbrixManager::execute caught exception: " << error_msg << std::endl;
+    log_->error("execute caught exception: {}", error_msg);
     auto send_task = [this, id, msg = std::move(error_msg)]() mutable {
         actor_zeta::send(current_message()->sender(),
                          address(),
@@ -159,8 +161,8 @@ void OtterbrixManager::send_error(session_hash_t id, std::string error_msg) {
                          std::move(msg));
     };
     if (!worker_.addTask(std::move(send_task))) {
-        std::cerr << "OtterbrixManager::execute failed to add task to worker" << std::endl;
+        log_->error("execute failed to add task to worker");
     } else {
-        std::cout << "OtterbrixManager::execute added task to worker" << std::endl;
+        log_->trace("execute added task to worker");
     }
 }

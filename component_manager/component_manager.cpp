@@ -1,11 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2025 OtterStax
+// Copyright 2025-2026  OtterStax
 
 #include "component_manager.hpp"
+#include "utility/logger.hpp"
 
 ComponentManager::ComponentManager(const configuration::config& config)
     : otterbrix_(otterbrix::make_otterbrix(config))
-    , resource_(otterbrix_->dispatcher()->resource()) {
+    , resource_(otterbrix_->dispatcher()->resource())
+    , log_path_(config.log.path.c_str()) {
+    initialize_all_loggers(log_path_);
+
     // To test otterbrix create some tables
     assert(resource_ != nullptr && "memory resource must not be null");
 
@@ -39,6 +43,8 @@ std::pmr::memory_resource* ComponentManager::getResource() {
     assert(resource_);
     return resource_;
 }
+
+std::string ComponentManager::getLogPath() { return log_path_; }
 
 std::shared_ptr<mysqlc::ConnectorManager> ComponentManager::db_connection_manager() const { return db_connector_manager_; }
 

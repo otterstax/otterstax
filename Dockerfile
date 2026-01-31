@@ -1,4 +1,4 @@
-FROM ubuntu:22.04 as builder
+FROM ubuntu:22.04 AS builder
 
 ENV TZ=America/US
 ENV DEBIAN_FRONTEND=noninteractive
@@ -12,7 +12,8 @@ RUN apt update && \
         python3-pip \
         python3-venv \
         python3-dev curl gnupg apt-transport-https \
-        zlib1g libgflags2.2 libgflags-dev && \
+        zlib1g libgflags2.2 libgflags-dev \
+        libssl-dev && \
     apt clean && \
     rm -rf /var/lib/apt/lists/*
 

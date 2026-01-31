@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2025 OtterStax
+// Copyright 2025-2026  OtterStax
 
 #pragma once
 
-#include "../../connectors/mysql_connector.hpp"
+#include "connectors/mysql_connector.hpp"
 #include "mock_config.hpp"
 
 #include <boost/asio.hpp>

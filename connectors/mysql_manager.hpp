@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2025 OtterStax
+// Copyright 2025-2026  OtterStax
 
 #pragma once
+
+#include <components/log/log.hpp>
 
 #include "mysql_connector.hpp"
 
@@ -9,7 +11,6 @@
 #include <coroutine>
 #include <exception>
 #include <functional>
-#include <iostream>
 #include <thread>
 
 #include <optional>
@@ -17,10 +18,10 @@
 #include <thread>
 #include <unordered_map>
 
-#include "../routes/catalog_manager.hpp"
-#include "../utility/cv_wrapper.hpp"
-#include "../utility/thread_pool_manager.hpp"
 #include "http_server/connection_config.hpp"
+#include "routes/catalog_manager.hpp"
+#include "utility/cv_wrapper.hpp"
+#include "utility/thread_pool_manager.hpp"
 
 #include <components/expressions/compare_expression.hpp>
 
@@ -56,11 +57,11 @@ namespace mysqlc {
             executeQuery(const std::string& uuid, std::string_view query, Callable handler) {
             auto conn = connections_.find(uuid);
             if (conn == connections_.end()) {
-                std::cerr << "[ConnectorManager::executeQuery]  Invalid connection uuid: " << uuid << "\n";
+                log_->error("[ConnectorManager::executeQuery] Invalid connection uuid: {}", uuid);
                 throw std::runtime_error("[ConnectorManager::executeQuery]  Invalid connection uuid: " + uuid);
             }
             if (conn->second->status() == Status::Closed) {
-                std::cerr << "[ConnectorManager::executeQuery]  Connector is not connected\n";
+                log_->error("[ConnectorManager::executeQuery] Connector is not connected");
                 throw std::runtime_error("[ConnectorManager::executeQuery]  Connector is not connected\n");
             }
             if (!conn->second->isConnected()) {
@@ -82,6 +83,7 @@ namespace mysqlc {
         bool hasConnection(const std::string& uuid) const noexcept;
 
     private:
+        log_t log_;
         thread_pool_manager thread_pool_manager_;
         actor_zeta::address_t catalog_manager_;
         connector_factory make_connector_;

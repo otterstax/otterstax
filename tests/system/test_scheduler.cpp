@@ -1,16 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2025 OtterStax
+// Copyright 2025-2026  OtterStax
 
-// #include "../../db_integration/nosql/connection_manager.hpp"
-#include "../../catalog/catalog_manager.hpp"
-#include "../../db_integration/otterbrix/otterbrix_manager.hpp"
-#include "../../db_integration/sql/connection_manager.hpp"
-#include "../../scheduler/scheduler.hpp"
+// #include "db_integration/nosql/connection_manager.hpp"
+#include "catalog/catalog_manager.hpp"
+#include "db_integration/otterbrix/otterbrix_manager.hpp"
+#include "db_integration/sql/connection_manager.hpp"
+#include "scheduler/scheduler.hpp"
 
 #include "../mock/mock_config.hpp"
 #include "../mock/otterbrix.hpp"
 #include "../mock/parser.hpp"
 #include "../mock/sql_db_connector.hpp"
+
+#include "utility/logger.hpp"
 
 #include <actor-zeta.hpp>
 #include <otterbrix/otterbrix.hpp>
@@ -18,10 +20,21 @@
 #include <catch2/catch.hpp>
 #include <chrono>
 
+namespace {
+    otterbrix::otterbrix_ptr init_otterbrix() {
+        auto config = configuration::config::default_config();
+
+        auto log_path = config.log.path.string();
+        initialize_all_loggers(log_path);
+
+        return otterbrix::make_otterbrix(std::move(config));
+    }
+} // namespace
+
 TEST_CASE("base test case") {
     using namespace std::chrono_literals;
 
-    otterbrix::otterbrix_ptr otterbrix = otterbrix::make_otterbrix(configuration::config::default_config());
+    otterbrix::otterbrix_ptr otterbrix = init_otterbrix();
     auto resource = std::pmr::get_default_resource(); // no ottterbrix processing, use default for easier mock
     assert(resource);
 
@@ -63,7 +76,7 @@ TEST_CASE("base test case") {
 TEST_CASE("Error in connector test case") {
     using namespace std::chrono_literals;
 
-    otterbrix::otterbrix_ptr otterbrix = otterbrix::make_otterbrix(configuration::config::default_config());
+    otterbrix::otterbrix_ptr otterbrix = init_otterbrix();
     auto resource = otterbrix->dispatcher()->resource();
     assert(resource);
 
@@ -106,7 +119,7 @@ TEST_CASE("Error in connector test case") {
 TEST_CASE("Error in otterbrix test case") {
     using namespace std::chrono_literals;
 
-    otterbrix::otterbrix_ptr otterbrix = otterbrix::make_otterbrix(configuration::config::default_config());
+    otterbrix::otterbrix_ptr otterbrix = init_otterbrix();
     auto resource = otterbrix->dispatcher()->resource();
     assert(resource);
 
@@ -149,7 +162,7 @@ TEST_CASE("Error in otterbrix test case") {
 TEST_CASE("Error in scheduler test case") {
     using namespace std::chrono_literals;
 
-    otterbrix::otterbrix_ptr otterbrix = otterbrix::make_otterbrix(configuration::config::default_config());
+    otterbrix::otterbrix_ptr otterbrix = init_otterbrix();
     auto resource = otterbrix->dispatcher()->resource();
     assert(resource);
 
@@ -193,7 +206,7 @@ TEST_CASE("Error in scheduler test case") {
 TEST_CASE("Error in otterbrix + sql connector test case") {
     using namespace std::chrono_literals;
 
-    otterbrix::otterbrix_ptr otterbrix = otterbrix::make_otterbrix(configuration::config::default_config());
+    otterbrix::otterbrix_ptr otterbrix = init_otterbrix();
     auto resource = otterbrix->dispatcher()->resource();
     assert(resource);
 
@@ -236,7 +249,7 @@ TEST_CASE("Error in otterbrix + sql connector test case") {
 TEST_CASE("return empty test case") {
     using namespace std::chrono_literals;
 
-    otterbrix::otterbrix_ptr otterbrix = otterbrix::make_otterbrix(configuration::config::default_config());
+    otterbrix::otterbrix_ptr otterbrix = init_otterbrix();
     auto resource = otterbrix->dispatcher()->resource();
     assert(resource);
 

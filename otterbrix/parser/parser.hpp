@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2025 OtterStax
+// Copyright 2025-2026  OtterStax
 
 #pragma once
 
-#include "../../types/otterbrix.hpp"
+#include "types/otterbrix.hpp"
 
 #include <otterbrix/otterbrix.hpp>
 
@@ -16,11 +16,14 @@
 
 struct ParsedQueryData {
     explicit ParsedQueryData(OtterbrixStatementPtr otterbrix_params,
-                             components::sql::transform::transform_result&& binder);
+                             components::sql::transform::transform_result&& binder,
+                             NodeTag tag);
 
     components::sql::transform::transform_result& binder();
 
     OtterbrixStatementPtr otterbrix_params;
+
+    NodeTag tag;
 
 private:
     components::sql::transform::transform_result binder_;

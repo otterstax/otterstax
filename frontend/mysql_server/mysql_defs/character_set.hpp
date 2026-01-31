@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2025 OtterStax
+// Copyright 2025-2026  OtterStax
 
 #pragma once
 
 #include <cstdint>
 
-namespace mysql_front {
+namespace frontend::mysql {
     enum class character_set : uint16_t
     {
         BIG5_CHINESE_CI = 1,
@@ -281,4 +281,4 @@ namespace mysql_front {
         UTF8MB4_ZH_0900_AS_CS = 308,
         UTF8MB4_0900_BIN = 309
     };
-} // namespace mysql_front
+} // namespace frontend::mysql

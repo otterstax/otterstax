@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2025 OtterStax
+// Copyright 2025-2026  OtterStax
 
 #include "connection_manager.hpp"
 
-#include "../../routes/nosql_connection_manager.hpp"
-#include "../../routes/scheduler.hpp"
+#include "routes/nosql_connection_manager.hpp"
+#include "routes/scheduler.hpp"
 
-#include <iostream>
 #include <ranges>
 #include <thread>
 
@@ -14,6 +13,7 @@ using namespace db_conn;
 
 NoSqlConnectionManager::NoSqlConnectionManager(std::pmr::memory_resource* res)
     : actor_zeta::cooperative_supervisor<NoSqlConnectionManager>(res)
+    , log_("NoSqlConnectionManager")
     , execute_(actor_zeta::make_behavior(resource(),
                                          nosql_connection_manager::handler_id(nosql_connection_manager::route::execute),
                                          this,
@@ -46,5 +46,5 @@ actor_zeta::behavior_t NoSqlConnectionManager::behavior() {
 auto NoSqlConnectionManager::execute(size_t id,
                                      OtterbrixExecuteParamsPtr params,
                                      std::vector<components::vector::data_chunk_t> data) -> void {
-    std::cout << "NoSqlConnectionManager::execute id: " << id << std::endl;
+    log_->debug("NoSqlConnectionManager::execute id: {}", id);
 }

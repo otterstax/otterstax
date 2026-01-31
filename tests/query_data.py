@@ -1,14 +1,14 @@
 #!/usr/bin/env python
 # SPDX-License-Identifier: Apache-2.0
-# Copyright 2025 OtterStax
+# Copyright 2025-2026  OtterStax
 
 """
-Скрипт для запроса и отображения данных из обоих экземпляров MariaDB.
+Script for querying and displaying data from both MariaDB instances.
 """
 import pymysql
 from tabulate import tabulate
 
-# Параметры подключения к первому серверу MariaDB
+# Connection parameters for the first MariaDB server
 CAMPAIGNS_DB_HOST = "mariadb1"
 # CAMPAIGNS_DB_HOST = "0.0.0.0"
 # CAMPAIGNS_DB_PORT = 3101
@@ -17,7 +17,7 @@ CAMPAIGNS_DB_USER = "user1"
 CAMPAIGNS_DB_PASSWORD = "password1"
 CAMPAIGNS_DB_NAME = "db1"
 
-# Параметры подключения ко второму серверу MariaDB
+# Connection parameters for the second MariaDB server
 IMPRESSIONS_DB_HOST = "mariadb2"
 # IMPRESSIONS_DB_HOST = "0.0.0.0"
 # IMPRESSIONS_DB_PORT = 3102
@@ -28,7 +28,7 @@ IMPRESSIONS_DB_NAME = "db2"
 
 
 def get_campaigns():
-    """Получает данные о кампаниях из первого сервера MariaDB."""
+    """Retrieves campaign data from the first MariaDB server."""
     conn = pymysql.connect(
         host=CAMPAIGNS_DB_HOST,
         port=CAMPAIGNS_DB_PORT,
@@ -46,7 +46,7 @@ def get_campaigns():
 
 
 def get_impressions():
-    """Получает данные о показах из второго сервера MariaDB."""
+    """Retrieves impression data from the second MariaDB server."""
     conn = pymysql.connect(
         host=IMPRESSIONS_DB_HOST,
         port=IMPRESSIONS_DB_PORT,
@@ -64,36 +64,36 @@ def get_impressions():
 
 
 def display_campaigns(campaigns):
-    """Отображает данные о кампаниях в табличном виде."""
+    """Displays campaign data in table format."""
     if not campaigns:
-        print("Нет данных о кампаниях.")
+        print("No campaign data available.")
         return
 
-    print("\n===== КАМПАНИИ =====")
+    print("\n===== CAMPAIGNS =====")
     headers = campaigns[0].keys()
     rows = [list(campaign.values()) for campaign in campaigns]
     print(tabulate(rows[:10], headers=headers, tablefmt="grid"))
 
 
 def display_impressions(impressions):
-    """Отображает данные о показах в табличном виде."""
+    """Displays impression data in table format."""
     if not impressions:
-        print("Нет данных о показах.")
+        print("No impression data available.")
         return
 
-    print("\n===== ПОКАЗЫ =====")
+    print("\n===== IMPRESSIONS =====")
     headers = impressions[0].keys()
     rows = [list(impression.values()) for impression in impressions]
     print(tabulate(rows[:10], headers=headers, tablefmt="grid"))
 
 
 def display_combined_data(campaigns, impressions):
-    """Объединяет и отображает данные из обоих серверов."""
+    """Combines and displays data from both servers."""
     if not campaigns or not impressions:
-        print("Недостаточно данных для объединения.")
+        print("Insufficient data for combining.")
         return
 
-    # Группируем показы по ID кампании
+    # Group impressions by campaign ID
     impressions_by_campaign = {}
     for impression in impressions:
         campaign_id = impression['campaign_id']
@@ -101,23 +101,23 @@ def display_combined_data(campaigns, impressions):
             impressions_by_campaign[campaign_id] = []
         impressions_by_campaign[campaign_id].append(impression)
 
-    print("\n===== ОБЪЕДИНЕННЫЕ ДАННЫЕ =====")
+    print("\n===== COMBINED DATA =====")
     for campaign in campaigns[:10]:
         campaign_id = campaign['campaign_id']
         campaign_impressions = impressions_by_campaign.get(campaign_id, [])
 
-        print(f"\nКампания: {campaign['campaign_name']}")
-        print(f"Бюджет: ${campaign['budget']}")
-        print(f"Количество показов: {len(campaign_impressions)}")
+        print(f"\nCampaign: {campaign['campaign_name']}")
+        print(f"Budget: ${campaign['budget']}")
+        print(f"Number of impressions: {len(campaign_impressions)}")
 
         if campaign_impressions:
             total_clicks = sum(imp['clicks'] for imp in campaign_impressions)
             total_conversions = sum(imp['conversions'] for imp in campaign_impressions)
             total_revenue = sum(imp['revenue'] for imp in campaign_impressions)
 
-            print(f"Всего кликов: {total_clicks}")
-            print(f"Всего конверсий: {total_conversions}")
-            print(f"Общий доход: ${total_revenue:.2f}")
+            print(f"Total clicks: {total_clicks}")
+            print(f"Total conversions: {total_conversions}")
+            print(f"Total revenue: ${total_revenue:.2f}")
             print(f"ROI: {(total_revenue / campaign['budget'] * 100):.2f}%")
 
         print("-" * 50)
@@ -125,17 +125,17 @@ def display_combined_data(campaigns, impressions):
 
 def main():
     try:
-        print("Получение данных с серверов MariaDB...")
+        print("Fetching data from MariaDB servers...")
         campaigns = get_campaigns()
         impressions = get_impressions()
 
-        # Отображаем данные
+        # Display data
         display_campaigns(campaigns)
         display_impressions(impressions)
         display_combined_data(campaigns, impressions)
 
     except Exception as e:
-        print(f"Ошибка при получении данных: {e}")
+        print(f"Error fetching data: {e}")
 
 
 if __name__ == "__main__":

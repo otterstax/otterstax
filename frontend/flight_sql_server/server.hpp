@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2025 OtterStax
+// Copyright 2025-2026  OtterStax
 
 #pragma once
 
@@ -16,6 +16,7 @@
 #include "../../utility/table_info.hpp"
 
 #include <boost/mysql/results.hpp>
+#include <components/log/log.hpp>
 
 #include "arrow/api.h"
 #include "arrow/flight/api.h"
@@ -63,6 +64,7 @@ public:
     arrow::Status Start();
 
 private:
+    log_t log_;
     arrow::flight::Location location_;
     std::pmr::memory_resource* resource_{nullptr};
     actor_zeta::address_t catalog_address_;

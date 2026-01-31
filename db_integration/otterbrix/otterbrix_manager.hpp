@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2025 OtterStax
+// Copyright 2025-2026  OtterStax
 
 #pragma once
 
-#include "../../otterbrix/operators/execute_plan.hpp"
-#include "../../otterbrix/parser/parser.hpp"
-#include "../../types/otterbrix.hpp"
-#include "../../utility/session.hpp"
-#include "../../utility/worker.hpp"
+#include <components/log/log.hpp>
+
+#include "otterbrix/operators/execute_plan.hpp"
+#include "otterbrix/parser/parser.hpp"
+#include "types/otterbrix.hpp"
+#include "utility/session.hpp"
+#include "utility/worker.hpp"
 #include <actor-zeta.hpp>
 
 #include <memory_resource>
@@ -31,6 +33,7 @@ namespace db_conn {
         // Behaviors
         actor_zeta::behavior_t execute_;
         actor_zeta::behavior_t get_schema_;
+        log_t log_;
 
         /// async method
         auto execute(session_hash_t id, OtterbrixStatementPtr&& params) -> void;

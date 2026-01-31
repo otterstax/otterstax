@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2025 OtterStax
+// Copyright 2025-2026  OtterStax
 
 #pragma once
 
@@ -14,9 +14,9 @@ struct QueryHandleWaiter {
     void wait() {
         for (auto& future : futures) {
             auto result = future.get();
-            std::cout << "Received from DB rows: " << result->size() << std::endl;
+            // Received from DB
             results.push_back(std::move(result));
         }
-        std::cout << "Finished!\n";
+        // Finished
     }
 };

@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2025 OtterStax
+// Copyright 2025-2026  OtterStax
 
 #pragma once
 
 #include <cstdint>
 
-namespace mysql_front {
+namespace frontend::mysql {
     enum class field_type : uint8_t
     {
         MYSQL_TYPE_DECIMAL,
@@ -44,4 +44,4 @@ namespace mysql_front {
         MYSQL_TYPE_STRING = 254,
         MYSQL_TYPE_GEOMETRY = 255
     };
-} // namespace mysql_front
+} // namespace frontend::mysql

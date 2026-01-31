@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2025 OtterStax
+// Copyright 2025-2026  OtterStax
 
 #pragma once
 
-void mock_ml_functionality() { std::cout << "Mocked ML functionality is active." << std::endl; }
+void mock_ml_functionality() { log << "Mocked ML functionality is active." << std::endl; }

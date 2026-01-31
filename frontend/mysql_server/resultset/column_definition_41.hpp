@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2025 OtterStax
+// Copyright 2025-2026  OtterStax
 
 #pragma once
 
@@ -9,7 +9,7 @@
 #include "../packet/packet_writer.hpp"
 #include <string>
 
-namespace mysql_front {
+namespace frontend::mysql {
     // https://dev.mysql.com/doc/dev/mysql-server/9.5.0/page_protocol_com_query_response_text_resultset_column_definition.html
     struct column_definition_41 {
         column_definition_41() = default;
@@ -38,4 +38,4 @@ namespace mysql_front {
         void init_type(field_type type);
     };
 
-} // namespace mysql_front
+} // namespace frontend::mysql

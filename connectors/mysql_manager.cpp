@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2025 OtterStax
+// Copyright 2025-2026  OtterStax
 
 #include "mysql_manager.hpp"
-#include "../utility/connection_uid.hpp"
+#include "utility/connection_uid.hpp"
+#include "utility/logger.hpp"
 
 using namespace components;
 
@@ -16,9 +17,12 @@ namespace mysqlc {
     ConnectorManager::ConnectorManager(actor_zeta::address_t catalog_manager,
                                        connector_factory make_connector,
                                        size_t pool_size)
-        : thread_pool_manager_(pool_size)
+        : log_(get_logger(logger_tag::CONNECTOR_MANAGER))
+        , thread_pool_manager_(pool_size)
         , catalog_manager_(catalog_manager)
-        , make_connector_(make_connector) {}
+        , make_connector_(make_connector) {
+        assert(log_.is_valid());
+    }
 
     thread_pool_status ConnectorManager::status() const noexcept { return thread_pool_manager_.status(); }
 
@@ -33,7 +37,7 @@ namespace mysqlc {
             std::string addr = std::string(connection_param.server_address.hostname()) + ":" +
                                std::to_string(connection_param.server_address.port());
 
-            std::cout << "[addConnection impl] Try add connection with uuid: " << uuid << "\n";
+            log_->debug("Try add connection with uuid: {}", uuid);
             connections_[uuid] = make_connector_(thread_pool_manager_.ctx(), connection_param, uuid);
             connections_[uuid]->connect();
 
@@ -44,15 +48,15 @@ namespace mysqlc {
                              std::move(name));
             return uuid;
         } catch (const boost::mysql::error_with_diagnostics& e) {
-            std::cerr << "MySQL error occurred:\n";
-            std::cerr << "Error code: " << e.code() << "\n";
-            std::cerr << "Error message: " << e.what() << "\n";
-            std::cerr << "Diagnostics: " << e.get_diagnostics().server_message() << "\n";
+            log_->error("MySQL error occurred - Error code: {}, Message: {}, Diagnostics: {}",
+                        e.code().value(),
+                        e.what(),
+                        e.get_diagnostics().server_message());
             connections_[uuid]->close();
             connections_.erase(uuid);
             throw std::runtime_error("Add connection asio error: " + std::string(e.what()));
         } catch (const std::exception& e) {
-            std::cerr << "Error: " << e.what() << std::endl;
+            log_->error("Error: {}", e.what());
             connections_[uuid]->close();
             connections_.erase(uuid);
             throw std::runtime_error("Add connection common error: " + std::string(e.what()));
@@ -62,10 +66,10 @@ namespace mysqlc {
     // TODO not threadsafe!!!
     std::string ConnectorManager::addConnection(http_server::ConnectionParams connection_param) {
         boost::mysql::connect_params params;
-        std::cout << "Try add connection with alias: " << connection_param.alias << "\n";
-        std::cout << "Host: " << connection_param.host << "\n";
+        log_->debug("Try add connection with alias: {}", connection_param.alias);
+        log_->debug("Host: {}", connection_param.host);
         if (!connection_param.port.empty()) {
-            std::cout << "Port: " << connection_param.port << "\n";
+            log_->debug("Port: {}", connection_param.port);
             params.server_address.emplace_host_and_port(connection_param.host, std::stoi(connection_param.port));
         } else {
             params.server_address.emplace_host_and_port(connection_param.host);
@@ -79,7 +83,7 @@ namespace mysqlc {
     void ConnectorManager::removeConnection(const std::string& uuid) {
         auto conn = connections_.find(uuid);
         if (conn == connections_.end()) {
-            std::cerr << "Invalid connection uuid: " << uuid << "\n";
+            log_->error("Invalid connection uuid: {}", uuid);
             throw std::runtime_error("Invalid connection uuid: : " + uuid);
         }
         conn->second->close();

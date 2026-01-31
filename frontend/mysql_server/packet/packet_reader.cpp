@@ -1,31 +1,43 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2025 OtterStax
+// Copyright 2025-2026  OtterStax
 
 #include "packet_reader.hpp"
 
-namespace mysql_front {
-    packet_reader::packet_reader(std::vector<uint8_t> data)
-        : data_(std::move(data))
-        , pos_(0) {}
-
-    uint8_t packet_reader::read_uint8() { return data_.at(pos_++); }
-
-    uint16_t packet_reader::read_uint16_le() {
-        auto val = merge_n_bytes<uint16_t, 2>(data_, pos_);
+namespace frontend::mysql {
+    int16_t packet_reader::read_int16() {
+        auto v = merge_data_bytes<int16_t, endian::LITTLE>(data_, pos_);
         pos_ += 2;
-        return val;
+        return v;
     }
 
-    uint32_t packet_reader::read_uint32_le() {
-        auto val = merge_n_bytes<uint32_t, 4>(data_, pos_);
+    uint16_t packet_reader::read_uint16() {
+        auto v = merge_data_bytes<uint16_t, endian::LITTLE>(data_, pos_);
+        pos_ += 2;
+        return v;
+    }
+
+    int32_t packet_reader::read_int32() {
+        auto v = merge_data_bytes<int32_t, endian::LITTLE>(data_, pos_);
+        pos_ += 4;
+        return v;
+    }
+
+    uint32_t packet_reader::read_uint32() {
+        auto val = merge_data_bytes<uint32_t, endian::LITTLE>(data_, pos_);
         pos_ += 4;
         return val;
     }
 
-    uint64_t packet_reader::read_uint64_le() {
-        auto val = merge_n_bytes<uint64_t, 8>(data_, pos_);
+    int64_t packet_reader::read_int64() {
+        auto v = merge_data_bytes<int64_t, endian::LITTLE>(data_, pos_);
         pos_ += 8;
-        return val;
+        return v;
+    }
+
+    uint64_t packet_reader::read_uint64() {
+        auto v = merge_data_bytes<uint64_t, endian::LITTLE>(data_, pos_);
+        pos_ += 8;
+        return v;
     }
 
     uint64_t packet_reader::read_length_encoded_integer() {
@@ -34,38 +46,16 @@ namespace mysql_front {
         if (first_byte < 251) {
             return first_byte;
         } else if (first_byte == TWO_BYTE_INT_MARKER) {
-            return read_uint16_le();
+            return read_uint16();
         } else if (first_byte == THREE_BYTE_INT_MARKER) {
-            auto val = merge_n_bytes<uint32_t, 3>(data_, pos_);
+            auto val = merge_n_bytes<uint32_t, 3, endian::LITTLE>(data_, pos_);
             pos_ += 3;
             return val;
         } else if (first_byte == EIGHT_BYTE_INT_MARKER) {
-            auto val = merge_n_bytes<uint64_t, 8>(data_, pos_);
-            return val;
+            return read_int64();
         } else { // 0xFB - NULL marker
             throw std::runtime_error("NULL value in length-encoded integer");
         }
-    }
-
-    std::string packet_reader::read_string_null() {
-        size_t start = pos_;
-
-        while (pos_ < data_.size() && data_[pos_] != 0) {
-            pos_++;
-        }
-
-        std::string result(data_.begin() + start, data_.begin() + pos_);
-        if (pos_ < data_.size()) {
-            pos_++;
-        }
-
-        return result;
-    }
-
-    std::string packet_reader::read_string_eof() {
-        std::string result(data_.begin() + pos_, data_.end());
-        pos_ = data_.size();
-        return result;
     }
 
     std::string packet_reader::read_length_encoded_string() {
@@ -79,17 +69,4 @@ namespace mysql_front {
         pos_ += length;
         return result;
     }
-
-    void packet_reader::skip_bytes(size_t n) {
-        check_bounds(n);
-        pos_ += n;
-    }
-
-    size_t packet_reader::remaining() const { return data_.size() - pos_; }
-
-    void packet_reader::check_bounds(size_t needed) const {
-        if (pos_ + needed > data_.size()) {
-            throw std::out_of_range("Buffer underflow");
-        }
-    }
-} // namespace mysql_front
+} // namespace frontend::mysql

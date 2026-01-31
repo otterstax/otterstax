@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2025 OtterStax
+// Copyright 2025-2026  OtterStax
 
-#include <iostream>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -10,12 +10,14 @@
 #include <arrow/util/logging.h>
 #include <boost/asio.hpp>
 #include <boost/program_options.hpp>
+#include <spdlog/spdlog.h>
 
 #include "component_manager/component_manager.hpp"
 #include "connectors/http_server/connection_server.hpp"
 #include "connectors/mysql_connector.hpp"
 #include "frontend/flight_sql_server/server.hpp"
 #include "frontend/mysql_server/mysql_server.hpp"
+#include "frontend/postgres_server/postgres_server.hpp"
 #include "otterbrix/config.hpp"
 
 namespace po = boost::program_options;
@@ -25,6 +27,7 @@ int main(int argc, char* argv[]) {
     std::string flight_host = "0.0.0.0";
     uint16_t flight_port = 8815;
     uint16_t mysql_port = 8816;
+    uint16_t postgres_port = 8817;
     uint16_t http_port = 8085;
 
     // Define command-line options
@@ -36,6 +39,12 @@ int main(int argc, char* argv[]) {
     ("port-flight",
     po::value<uint16_t>(&flight_port)->default_value(flight_port),
     "FlightSQL server port")
+    ("port-mysql",
+    po::value<uint16_t>(&mysql_port)->default_value(mysql_port),
+    "MySQL server port")
+    ("port-postgres",
+    po::value<uint16_t>(&postgres_port)->default_value(postgres_port),
+    "PostgreSQL server port")
     ("port-http",
     po::value<uint16_t>(&http_port)->default_value(http_port),
     "Connection manager HTTP server port");
@@ -46,14 +55,18 @@ int main(int argc, char* argv[]) {
         po::store(po::parse_command_line(argc, argv, desc), vm);
         po::notify(vm);
     } catch (const std::exception& e) {
-        std::cerr << "Error parsing arguments: " << e.what() << "\n";
-        std::cerr << desc << "\n";
+        spdlog::error("Error parsing arguments: {}", e.what());
+        std::ostringstream oss;
+        oss << desc;
+        spdlog::error("{}", oss.str());
         return 1;
     }
 
     // Show help message if requested
     if (vm.count("help")) {
-        std::cout << desc << "\n";
+        std::ostringstream oss;
+        oss << desc;
+        spdlog::info("{}", oss.str());
         return 0;
     }
 
@@ -78,26 +91,38 @@ int main(int argc, char* argv[]) {
     std::jthread server_thread([db_connection_manager = std::move(cmanager.db_connection_manager()), http_port]() {
         asio::io_context ctx;
         http_server::Server server(ctx, http_port, db_connection_manager);
-        std::cout << "HTTP Server running on port " << http_port << "..." << std::endl;
+        spdlog::info("HTTP Server running on port {}...", http_port);
         ctx.run();
     });
 
     // Configure MySQL server
-    mysql_front::mysql_server_config mysql_config{
+    frontend::frontend_server_config mysql_config{
         .resource = cmanager.getResource(),
         .port = mysql_port,
         .scheduler = cmanager.scheduler_address(),
     };
 
-    // Start mysql server
-    std::cout << "MySQL Server running on port " << mysql_config.port << "..." << std::endl;
-    mysql_front::mysql_server mysql(mysql_config);
+    // Start MySQL server
+    spdlog::info("MySQL Server running on port {}...", mysql_config.port);
+    frontend::mysql::mysql_server mysql(mysql_config);
     mysql.start();
+
+    // Configure Postgres server
+    frontend::frontend_server_config postgres_config{
+        .resource = cmanager.getResource(),
+        .port = postgres_port,
+        .scheduler = cmanager.scheduler_address(),
+    };
+
+    // Start Postgres server
+    spdlog::info("Postgres Server running on port {}...", postgres_config.port);
+    frontend::postgres::postgres_server postgres(postgres_config);
+    postgres.start();
 
     // Start the Flight SQL server
     arrow::Status status = server.Start();
     if (!status.ok()) {
-        std::cerr << "Failed to start FlightSQL server: " << status.ToString() << std::endl;
+        spdlog::error("Failed to start FlightSQL server: {}", status.ToString());
         server_thread.join();
         return -1;
     }

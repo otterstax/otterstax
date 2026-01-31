@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2025 OtterStax
+// Copyright 2025-2026  OtterStax
 
 #include "column_definition_41.hpp"
 
-namespace mysql_front {
+namespace frontend::mysql {
     constexpr uint8_t COLUMN_DEF_FIXED_FIELDS_SIZE = 0x0C;
 
     column_definition_41::column_definition_41(std::string col_name, field_type type)
@@ -19,9 +19,8 @@ namespace mysql_front {
 
     size_t column_definition_41::packet_size() const { return packet_size_; }
 
-    std::vector<uint8_t> column_definition_41::write_packet(mysql_front::column_definition_41&& column_def,
-                                                            mysql_front::packet_writer& writer,
-                                                            uint8_t sequence_id) {
+    std::vector<uint8_t>
+    column_definition_41::write_packet(column_definition_41&& column_def, packet_writer& writer, uint8_t sequence_id) {
         writer.reserve_payload(column_def.packet_size_);
 
         writer.write_length_encoded_string(std::move(column_def.catalog));
@@ -32,12 +31,12 @@ namespace mysql_front {
         writer.write_length_encoded_string(std::move(column_def.org_name));
 
         writer.write_uint8(COLUMN_DEF_FIXED_FIELDS_SIZE); // fixed-length fields size [0x0C]
-        writer.write_uint16_le(static_cast<uint16_t>(column_def.charset));
-        writer.write_uint32_le(column_def.column_length);
+        writer.write_uint16(static_cast<uint16_t>(column_def.charset));
+        writer.write_uint32(column_def.column_length);
         writer.write_uint8(static_cast<uint8_t>(column_def.column_type));
-        writer.write_uint16_le(column_def.column_flags);
+        writer.write_uint16(column_def.column_flags);
         writer.write_uint8(column_def.decimals);
-        writer.write_uint16_le(0x0000); // reserved (string[2]) filler
+        writer.write_uint16(0x0000); // reserved (string[2]) filler
 
         return writer.build_from_payload(sequence_id);
     }
@@ -93,4 +92,4 @@ namespace mysql_front {
                 break;
         }
     }
-} // namespace mysql_front
+} // namespace frontend::mysql

@@ -1,32 +1,33 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2025 OtterStax
+// Copyright 2025-2026  OtterStax
 
 #include "mysql_connector.hpp"
 
+#include "utility/logger.hpp"
 #include <functional>
-#include <iostream>
 #include <memory>
 #include <string>
 #include <thread>
-
-#include <iostream>
 
 namespace mysql = boost::mysql;
 namespace asio = boost::asio;
 
 namespace mysqlc {
     Connector::Connector(asio::io_context& io_ctx, mysql::connect_params params, std::string alias)
-        : conn_(io_ctx)
+        : log_(get_logger(logger_tag::CONNECTOR))
+        , conn_(io_ctx)
         , params_{std::move(params)}
         , status_{Status::Created}
-        , alias_{std::move(alias)} {}
+        , alias_{std::move(alias)} {
+        assert(log_.is_valid());
+    }
 
     mysql::connect_params Connector::params() const noexcept { return params_; }
 
     Status Connector::status() const noexcept { return status_; }
 
     void Connector::close() {
-        std::cout << "[Connector] Alias: " << alias_ << " close connection\n";
+        log_->debug("Alias: {} close connection", alias_);
         if (status_ != Status::Connected) {
             return;
         }
@@ -42,7 +43,7 @@ namespace mysqlc {
         boost::mysql::diagnostics diag;
         conn_.connect(params_, ec, diag);
         if (ec) {
-            std::cout << "[Connector] Alias: " << alias_ << " connect failed\n";
+            log_->debug("Alias: {} connect failed", alias_);
             tryReconnect();
         }
         status_ = Status::Connected;
@@ -56,7 +57,7 @@ namespace mysqlc {
         conn_.ping(ec, diag);
         if (ec) {
             status_ = Status::Disconnected;
-            std::cout << "[Connector] Alias: " << alias_ << " Ping failed: " << ec.message() << std::endl;
+            log_->debug("Alias: {} Ping failed: {}", alias_, ec.message());
             return false;
         }
         return true;
@@ -68,26 +69,28 @@ namespace mysqlc {
         }
         status_ = Status::Disconnected;
         size_t attempts = 0;
-        std::cout << "[Connector] Alias: " << alias_ << " Try to reconnect\n";
+        log_->debug("Alias: {} Try to reconnect", alias_);
 
         boost::system::error_code ec;
         boost::mysql::diagnostics diag;
         do {
-            std::cout << "[Connector] Alias: " << alias_ << " Attempt: " << attempts << std::endl;
+            log_->debug("Alias: {} Attempt: {}", alias_, attempts);
             conn_.connect(params_, ec, diag);
             if (!ec) {
-                std::cout << "[Connector] Alias: " << alias_ << " Reconnect success\n";
+                log_->debug("Alias: {} Reconnect success", alias_);
                 status_ = Status::Connected;
                 return;
             }
-            std::cout << "[Connector] Alias: " << alias_ << " Reconnect attempt: " << attempts
-                      << " failed: " << ec.message() << std::endl
-                      << diag.server_message() << std::endl;
+            log_->debug("Alias: {} Reconnect attempt: {} failed: {} - {}",
+                        alias_,
+                        attempts,
+                        ec.message(),
+                        diag.server_message());
             ++attempts;
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
         } while (attempts < 3);
         std::string error = "[Connector] Alias: " + alias_ + " connect failed " + ec.message();
-        std::cout << error;
+        log_->error(error);
         throw std::runtime_error(error);
     }
 

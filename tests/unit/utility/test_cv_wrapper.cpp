@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2025 OtterStax
+// Copyright 2025-2026  OtterStax
 
-#include "../../../utility/cv_wrapper.hpp"
+#include "utility/cv_wrapper.hpp"
 
 #include <catch2/catch.hpp>
 #include <chrono>

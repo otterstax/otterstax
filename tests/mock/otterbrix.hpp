@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2025 OtterStax
+// Copyright 2025-2026  OtterStax
 
 #pragma once
 
-#include "../../otterbrix/operators/execute_plan.hpp"
 #include "mock_config.hpp"
+#include "otterbrix/operators/execute_plan.hpp"
+#include <iostream>
+#include <thread>
 
 // TODO figure out how to mock cursor
 class SimpleMockOtterbrixManager : public IDataManager {

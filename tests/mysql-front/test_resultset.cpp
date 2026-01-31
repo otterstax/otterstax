@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2025 OtterStax
+// Copyright 2025-2026  OtterStax
 
-#include "../../frontend/mysql_server/packet/packet_reader.hpp"
-#include "../../frontend/mysql_server/resultset/mysql_resultset.hpp"
+#include "frontend/mysql_server/packet/packet_reader.hpp"
+#include "frontend/mysql_server/resultset/mysql_resultset.hpp"
 
 #include <catch2/catch.hpp>
 #include <components/document/document.hpp>
 
 using namespace components;
-using namespace mysql_front;
+using namespace frontend;
+using namespace frontend::mysql;
 
 namespace {
     void check_header(packet_reader& r, uint8_t seq_id) {

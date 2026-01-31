@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2025 OtterStax
+// Copyright 2025-2026  OtterStax
 
 #pragma once
 
 #include <cstdint>
 
-namespace mysql_front {
+namespace frontend::mysql {
     // Values for the flags bitmask, currently need to fit into 32 bits
     using column_flags_t = uint32_t;
 
@@ -40,4 +40,4 @@ namespace mysql_front {
     constexpr uint32_t EXPLICIT_NULL_FLAG = (1 << 27); // Field is explicitly specified as \ NULL by the user. More...
     constexpr uint32_t NOT_SECONDARY_FLAG = (1 << 29);
     constexpr uint32_t FIELD_IS_INVISIBLE = (1 << 30); //Field is explicitly marked as invisible by the user
-} // namespace mysql_front
+} // namespace frontend::mysql

@@ -1,17 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2025 OtterStax
+// Copyright 2025-2026  OtterStax
 
 #pragma once
 
+#include "../../common/protocol_config.hpp"
 #include "../mysql_defs/capabilities.hpp"
 #include "../mysql_defs/character_set.hpp"
 #include "../mysql_defs/error.hpp"
 #include "../mysql_defs/server_status.hpp"
-#include "../protocol_const.hpp"
 #include "length_encoded.hpp"
 #include "packet_writer.hpp"
 
-namespace mysql_front {
+namespace frontend::mysql {
     constexpr uint8_t AUTH_DATA_PART1_LENGTH = 8;
     constexpr uint8_t AUTH_DATA_FULL_LENGTH = 20;
 
@@ -37,7 +37,7 @@ namespace mysql_front {
     std::vector<uint8_t>
     build_handshake_10(packet_writer& writer,
                        uint32_t connection_id,
-                       std::string auth_data,
+                       std::vector<uint8_t> auth_data,
                        server_status_flags_t flags = static_cast<uint16_t>(server_status::SERVER_STATUS_AUTOCOMMIT));
 
     // https://dev.mysql.com/doc/dev/mysql-server/9.5.0/page_protocol_command_phase_ps.html
@@ -47,4 +47,4 @@ namespace mysql_front {
                                                uint16_t num_columns,
                                                uint16_t num_params,
                                                uint16_t warning_count = 0);
-} // namespace mysql_front
+} // namespace frontend::mysql

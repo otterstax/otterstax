@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
-// Copyright 2025 OtterStax
+// Copyright 2025-2026  OtterStax
 
 #pragma once
 
 #include <cstdint>
 
-namespace mysql_front {
+namespace frontend::mysql {
     //Values for the capabilities flag bitmask, currently need to fit into 32 bits
     using capabilities_flags_t = uint32_t;
 
@@ -43,4 +43,4 @@ namespace mysql_front {
     constexpr uint32_t CLIENT_OPTIONAL_RESULTSET_METADATA =
         (1UL << 25); // The client can handle optional metadata information in the resultset
     constexpr uint32_t CLIENT_REMEMBER_OPTIONS = (1UL << 31); // Don't reset the options after an unsuccessful connect
-} // namespace mysql_front
+} // namespace frontend::mysql

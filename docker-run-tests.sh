@@ -2,6 +2,9 @@
 
 set -e  # Exit on any error
 
+# Get project name (directory name, used as Docker Compose project prefix)
+PROJECT_NAME=$(basename "$(pwd)" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]//g')
+
 # Function to check database readiness
 # When building from scratch, docker compose may not have enough time to assemble everything within the given timeout
 wait_for_database_init() {
@@ -27,10 +30,10 @@ wait_for_database_init() {
 # Function to check volume contents
 check_volume_contents() {
     echo "🔍 Checking volume contents:"
-    
-    # Use the actual volume names that Docker Compose creates
-    local volume1="sqlflite_server_mariadb1_init"
-    local volume2="sqlflite_server_mariadb2_init"
+
+    # Use the actual volume names that Docker Compose creates (project_name + volume_name)
+    local volume1="${PROJECT_NAME}_mariadb1_init"
+    local volume2="${PROJECT_NAME}_mariadb2_init"
     
     echo "=== Volume $volume1 ==="
     docker run --rm -v $volume1:/data alpine sh -c "
@@ -91,7 +94,8 @@ check_volume_contents
 echo ""
 echo "=== Step 3: Creating test data from Docker container ==="
 echo ""
-docker compose -f compose.test.yml run --rm test-client python create_test_data.py
+# Use --no-deps to prevent MariaDB from starting before init scripts are written
+docker compose -f compose.test.yml run --rm --no-deps test-client python create_test_data.py
 
 echo ""
 echo "=== Step 4: Checking volumes after creating data ==="
@@ -101,7 +105,8 @@ check_volume_contents
 echo ""
 echo "=== Step 5: Starting databases with init scripts ==="
 echo ""
-docker compose -f compose.test.yml up -d mariadb1 mariadb2
+# Force recreate to ensure init scripts are executed
+docker compose -f compose.test.yml up -d --force-recreate mariadb1 mariadb2
 
 echo ""
 echo "=== Step 6: Waiting for MariaDB to start ==="

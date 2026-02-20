@@ -2,6 +2,8 @@
 
 [![Unit Tests](https://github.com/otterstax/otterstax/actions/workflows/unit-tests.yml/badge.svg)](https://github.com/otterstax/otterstax/actions/workflows/unit-tests.yml)
 [![Integration Tests](https://github.com/otterstax/otterstax/actions/workflows/integration-tests.yml/badge.svg)](https://github.com/otterstax/otterstax/actions/workflows/integration-tests.yml)
+[![Integration Tests (ASAN)](https://github.com/otterstax/otterstax/actions/workflows/integration-tests-asan.yml/badge.svg)](https://github.com/otterstax/otterstax/actions/workflows/integration-tests-asan.yml)
+[![Integration Tests (TSAN)](https://github.com/otterstax/otterstax/actions/workflows/integration-tests-tsan.yml/badge.svg)](https://github.com/otterstax/otterstax/actions/workflows/integration-tests-tsan.yml)
 
 A high-performance SQL federation server that provides unified access to multiple databases through MySQL, PostgreSQL, and Apache Arrow FlightSQL wire protocols.
 
@@ -116,6 +118,29 @@ This script orchestrates a full integration test cycle:
 
 ```bash
 docker build -f Dockerfile.test -t otterstax-test .
+```
+
+### Run Tests with Sanitizers
+
+Build with AddressSanitizer (detects memory errors):
+```bash
+docker build -f Dockerfile.test \
+  --build-arg BUILD_TYPE=RelWithDebInfo \
+  --build-arg ENABLE_ASAN=ON \
+  -t otterstax-test-asan .
+```
+
+Build with ThreadSanitizer (detects data races):
+```bash
+docker build -f Dockerfile.test \
+  --build-arg BUILD_TYPE=RelWithDebInfo \
+  --build-arg ENABLE_TSAN=ON \
+  -t otterstax-test-tsan .
+```
+
+Run integration tests with a sanitizer-enabled image:
+```bash
+IMAGE_TAG=test-asan ./docker-run-tests.sh
 ```
 
 ## Project Structure

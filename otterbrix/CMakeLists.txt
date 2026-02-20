@@ -13,6 +13,7 @@ set(OTTERBRIX_SOURCES
     translators/input/mysql_to_chunk.cpp
     translators/input/mysql_to_complex.cpp
     translators/output/chunk_to_arrow.cpp
+    translators/internal/doc_to_chunk.cpp
     operators/execute_plan.cpp
     parser/parser.cpp
     query_generation/sql_query_generator.cpp

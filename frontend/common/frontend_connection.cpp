@@ -32,12 +32,23 @@ namespace frontend {
     }
 
     void frontend_connection::finish() {
-        if (close_callback_) {
-            logger()->info("[Connection {}] FINISH: Client disconnected", connection_id_);
-            socket_.close();
-            close_callback_();
-            close_callback_ = nullptr;
+        bool expected = false;
+        if (!closing_.compare_exchange_strong(expected, true)) {
+            return;
         }
+
+        boost::asio::post(socket_.get_executor(), [this] {
+            logger()->info("[Connection {}] FINISH", connection_id_);
+
+            boost::system::error_code ec;
+            socket_.close(ec);
+
+            if (close_callback_) {
+                auto cb = std::move(close_callback_);
+                close_callback_ = nullptr;
+                cb();
+            }
+        });
     }
 
     void frontend_connection::read_packet() {
@@ -155,7 +166,7 @@ namespace frontend {
 
         boost::asio::async_write(socket_,
                                  boost::asio::buffer(std::move(merged)),
-                                 [this](boost::system::error_code ec, std::size_t bytes) {
+                                 [this](boost::system::error_code ec, std::size_t) {
                                      if (ec) {
                                          std::cerr << "[Connection " << connection_id_
                                                    << "] ERROR: Failed to send merged packets:" << ec.message()

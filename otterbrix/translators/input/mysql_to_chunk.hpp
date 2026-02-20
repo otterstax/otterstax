@@ -9,8 +9,6 @@
 #undef DAY
 #undef SECOND
 
-#include "otterbrix/types.hpp"
-
 #include <boost/mysql.hpp>
 
 #include <exception>

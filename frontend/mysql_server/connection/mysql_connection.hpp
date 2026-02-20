@@ -87,8 +87,6 @@ namespace frontend::mysql {
         void send_resultset(mysql_resultset&& result);
         void send_error(mysql_error error_code, std::string message);
 
-        void reset_packet_sequence();
-
         std::pmr::memory_resource* resource_;
         std::pmr::unordered_map<uint32_t, prepared_stmt_meta> statement_id_map_;
         packet_writer writer_;

@@ -23,9 +23,11 @@ RUN pip3 install --no-cache-dir conan==2.15.0 'cmake<4.0' && \
 
 RUN rm /bin/sh && ln -s /bin/bash /bin/sh
 
+ARG BUILD_TYPE=Release
+
 WORKDIR /app/build
 COPY conanfile.py ./conanfile.py
-RUN conan install conanfile.py --build missing -s build_type=Release -s compiler.cppstd=gnu17
+RUN conan install conanfile.py --build missing -s build_type=${BUILD_TYPE} -s compiler.cppstd=gnu17
 
 
 WORKDIR /app
@@ -44,11 +46,15 @@ COPY ./utility ./utility
 COPY ./main.cpp ./main.cpp
 COPY ./CMakeLists.txt ./CMakeLists.txt
 
+ARG BUILD_TYPE=Release
+ARG ENABLE_ASAN=OFF
+ARG ENABLE_TSAN=OFF
+
 WORKDIR /app/build
 
-RUN cmake .. -DCMAKE_TOOLCHAIN_FILE=./build/Release/generators/conan_toolchain.cmake -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=ON && \
+RUN cmake .. -DCMAKE_TOOLCHAIN_FILE=./build/${BUILD_TYPE}/generators/conan_toolchain.cmake -DCMAKE_BUILD_TYPE=${BUILD_TYPE} -DBUILD_TESTS=ON -DENABLE_ASAN=${ENABLE_ASAN} -DENABLE_TSAN=${ENABLE_TSAN} && \
     cmake --build . --target all -- -j $(nproc)
 
-RUN ctest -C Release -V --output-on-failure --timeout 60
+RUN ctest -C ${BUILD_TYPE} -V --output-on-failure --timeout 60
 
 CMD [ "./server" ]

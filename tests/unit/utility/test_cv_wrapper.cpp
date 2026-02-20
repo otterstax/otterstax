@@ -2,6 +2,7 @@
 // Copyright 2025-2026  OtterStax
 
 #include "utility/cv_wrapper.hpp"
+#include "utility/tsan_helper.hpp"
 
 #include <catch2/catch.hpp>
 #include <chrono>
@@ -31,6 +32,10 @@ TEST_CASE("cv_wrapper: ok") {
 }
 
 TEST_CASE("cv_wrapper: timeout") {
+    if constexpr (TSAN_ENABLED) {
+        return; // skip test, TSAN considers synchronization via sleep as data race, however, this is a valid test case
+    }
+
     using namespace std::chrono_literals;
 
     auto cv_w = create_cv_wrapper(std::unique_ptr<std::string>());

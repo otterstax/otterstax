@@ -8,9 +8,9 @@
 #include "routes/scheduler.hpp"
 #include "routes/sql_connection_manager.hpp"
 #include "utility/cv_wrapper.hpp"
+#include "utility/logger.hpp"
 #include "utility/timer.hpp"
 #include "utility/wait_barrier.hpp"
-#include "utility/logger.hpp"
 
 using namespace db_conn;
 SqlConnectionManager::SqlConnectionManager(std::pmr::memory_resource* res,
@@ -107,8 +107,8 @@ auto SqlConnectionManager::execute(session_hash_t id, ParsedQueryDataPtr&& data)
             log_->debug("execute Run Query Success!");
             assert(generated_queries.size() == it->size());
             for (size_t i = 0; i < it->size(); i++) {
-                auto data_node =
-                    logical_plan::make_node_raw_data(resource(), std::move(*wait_guard.results[i].release()));
+                auto tmp = std::move(*wait_guard.results[i]);
+                auto data_node = logical_plan::make_node_raw_data(resource(), std::move(tmp));
                 *(*it)[i] = data_node;
             }
         }

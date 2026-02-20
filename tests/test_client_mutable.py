@@ -1,6 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0
-# Copyright 2025-2026  OtterStax
-
 import sys
 import argparse
 from flightsql import FlightSQLClient

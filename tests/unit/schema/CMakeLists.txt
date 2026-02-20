@@ -10,7 +10,7 @@ add_executable(${PROJECT_NAME} ${${PROJECT_NAME}_SOURCES})
 target_link_libraries(
     ${PROJECT_NAME} PRIVATE
     otterbrix::otterbrix
-    lib_otterstax
+    lib_sqlflight_server
     Catch2::Catch2
 )
 

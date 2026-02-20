@@ -1,7 +1,4 @@
 #!/usr/bin/env python
-# SPDX-License-Identifier: Apache-2.0
-# Copyright 2025-2026  OtterStax
-
 """
 Script for generating SQL files with data for database initialization.
 Now creates files directly in mounted volumes.

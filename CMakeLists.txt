@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.15)
-project(otterstax)
+project(sqlflight_server)
 
 set(CMAKE_VERBOSE_MAKEFILE TRUE)
 set(CMAKE_CXX_STANDARD 20 CACHE STRING "The C++ standard whose features are requested.")
@@ -11,17 +11,37 @@ option(BUILD_TESTS "Build unit tests" OFF)
 # Option to build examples
 option(BUILD_EXAMPLES "Build examples" OFF)
 
+# Option to enable address sanitizer
+option(ENABLE_ASAN "Enable AddressSanitizer" OFF)
+
+# Option to enable thread sanitizer
+option(ENABLE_TSAN "Enable ThreadSanitizer" OFF)
+
+if(ENABLE_ASAN AND ENABLE_TSAN)
+    message(FATAL_ERROR "ENABLE_ASAN and ENABLE_TSAN cannot be enabled at the same time, choose only one sanitizer.")
+endif()
+
+if (ENABLE_ASAN)
+    add_compile_options(-O0 -g -fno-omit-frame-pointer -fsanitize=address)
+    add_link_options(-fsanitize=address)
+endif()
+
+if (ENABLE_TSAN)
+    add_compile_options(-O0 -g -fno-omit-frame-pointer -fsanitize=thread)
+    add_link_options(-fsanitize=thread)
+endif()
+
 # Find the Conan packages
 find_package(Arrow REQUIRED)
 find_package(otterbrix REQUIRED COMPONENTS log)
 find_package(actor-zeta REQUIRED)
 find_package(Catch2 2.13.7 REQUIRED)
 find_package(Boost 1.87.0 REQUIRED COMPONENTS
-    asio
-    beast
-    json
-    program_options
-    mysql
+        asio
+        beast
+        json
+        program_options
+        mysql
 )
 find_package(Threads)
 
@@ -60,8 +80,8 @@ set(${PROJECT_NAME}_SOURCES
 )
 
 add_library(lib_${PROJECT_NAME}
-    ${${PROJECT_NAME}_HEADERS}
-    ${${PROJECT_NAME}_SOURCES}
+        ${${PROJECT_NAME}_HEADERS}
+        ${${PROJECT_NAME}_SOURCES}
 )
 
 # add_library(otterbrix::${PROJECT_NAME} ALIAS otterbrix_${PROJECT_NAME})
@@ -69,28 +89,28 @@ add_library(lib_${PROJECT_NAME}
 # set_property(TARGET otterbrix_${PROJECT_NAME} PROPERTY EXPORT_NAME ${PROJECT_NAME})
 
 target_link_libraries(
-    lib_${PROJECT_NAME} PUBLIC
-    flight_sql_server
-    common_server
-    mysql_server
-    postgres_server
-    catalog
-    connectors
-    component_manager
-    db_integration
-    otterbrix_local
-    routes
-    scheduler
-    arrow::arrow
-    Boost::boost
-    Boost::json
-    Boost::program_options
-    Threads::Threads
-    OpenSSL::Crypto
-    OpenSSL::SSL
-    otterbrix::otterbrix
-    Catch2::Catch2
-    actor-zeta::actor-zeta
+        lib_${PROJECT_NAME} PUBLIC
+        flight_sql_server
+        common_server
+        mysql_server
+        postgres_server
+        catalog
+        connectors
+        component_manager
+        db_integration
+        otterbrix_local
+        routes
+        scheduler
+        arrow::arrow
+        Boost::boost
+        Boost::json
+        Boost::program_options
+        Threads::Threads
+        OpenSSL::Crypto
+        OpenSSL::SSL
+        otterbrix::otterbrix
+        Catch2::Catch2
+        actor-zeta::actor-zeta
 )
 
 
@@ -101,10 +121,10 @@ target_link_libraries(
 add_executable(server main.cpp)
 
 target_link_libraries(server
-    PRIVATE
-    lib_${PROJECT_NAME}
-    otterbrix_log
-    )
+        PRIVATE
+        lib_${PROJECT_NAME}
+        otterbrix_log
+)
 
 # Examples
 if(BUILD_EXAMPLES)

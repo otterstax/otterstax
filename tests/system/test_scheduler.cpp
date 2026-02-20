@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2025-2026  OtterStax
 
-// #include "db_integration/nosql/connection_manager.hpp"
 #include "catalog/catalog_manager.hpp"
 #include "db_integration/otterbrix/otterbrix_manager.hpp"
 #include "db_integration/sql/connection_manager.hpp"
@@ -35,23 +34,23 @@ TEST_CASE("base test case") {
     using namespace std::chrono_literals;
 
     otterbrix::otterbrix_ptr otterbrix = init_otterbrix();
-    auto resource = std::pmr::get_default_resource(); // no ottterbrix processing, use default for easier mock
+    auto resource = otterbrix->dispatcher()->resource();
     assert(resource);
 
     auto catalog_manager = actor_zeta::spawn_supervisor<mysqlc::CatalogManager>(resource);
     auto conn_manager =
-        std::make_shared<mysqlc::ConnectorManager>(catalog_manager->address(), make_mysql_mock_connector);
+        std::make_shared<mysqlc::ConnectorManager>(catalog_manager->address(), mysql_mock_connector_factory(resource));
 
     conn_manager->addConnection(boost::mysql::connect_params{}, "1");
     conn_manager->addConnection(boost::mysql::connect_params{}, "2");
 
-    auto otterbrix_manager =
-        actor_zeta::spawn_supervisor<db_conn::OtterbrixManager>(resource,
-                                                                std::make_unique<SimpleMockOtterbrixManager>());
+    auto otterbrix_manager = actor_zeta::spawn_supervisor<db_conn::OtterbrixManager>(
+        resource,
+        std::make_unique<SimpleMockOtterbrixManager>(mock_config{.resource = resource}));
     auto sql_conn_manager = actor_zeta::spawn_supervisor<db_conn::SqlConnectionManager>(resource, conn_manager);
 
     auto scheduler = actor_zeta::spawn_supervisor<Scheduler>(resource,
-                                                             std::make_unique<SimpleMockParser>(),
+                                                             make_mock_parser(resource),
                                                              sql_conn_manager->address(),
                                                              otterbrix_manager->address(),
                                                              catalog_manager->address());
@@ -81,19 +80,19 @@ TEST_CASE("Error in connector test case") {
     assert(resource);
 
     auto catalog_manager = actor_zeta::spawn_supervisor<mysqlc::CatalogManager>(resource);
-    auto conn_manager =
-        std::make_shared<mysqlc::ConnectorManager>(catalog_manager->address(), make_mysql_mock_connector_throw);
+    auto conn_manager = std::make_shared<mysqlc::ConnectorManager>(catalog_manager->address(),
+                                                                   mysql_mock_connector_factory_throw(resource));
 
     conn_manager->addConnection(boost::mysql::connect_params{}, "1");
     conn_manager->addConnection(boost::mysql::connect_params{}, "2");
 
-    auto otterbrix_manager =
-        actor_zeta::spawn_supervisor<db_conn::OtterbrixManager>(resource,
-                                                                std::make_unique<SimpleMockOtterbrixManager>());
+    auto otterbrix_manager = actor_zeta::spawn_supervisor<db_conn::OtterbrixManager>(
+        resource,
+        std::make_unique<SimpleMockOtterbrixManager>(mock_config{.resource = resource}));
     auto sql_conn_manager = actor_zeta::spawn_supervisor<db_conn::SqlConnectionManager>(resource, conn_manager);
 
     auto scheduler = actor_zeta::spawn_supervisor<Scheduler>(resource,
-                                                             std::make_unique<SimpleMockParser>(),
+                                                             make_mock_parser(resource),
                                                              sql_conn_manager->address(),
                                                              otterbrix_manager->address(),
                                                              catalog_manager->address());
@@ -125,18 +124,18 @@ TEST_CASE("Error in otterbrix test case") {
 
     auto catalog_manager = actor_zeta::spawn_supervisor<mysqlc::CatalogManager>(resource);
     auto conn_manager =
-        std::make_shared<mysqlc::ConnectorManager>(catalog_manager->address(), make_mysql_mock_connector);
+        std::make_shared<mysqlc::ConnectorManager>(catalog_manager->address(), mysql_mock_connector_factory(resource));
 
     conn_manager->addConnection(boost::mysql::connect_params{}, "1");
     conn_manager->addConnection(boost::mysql::connect_params{}, "2");
 
     auto otterbrix_manager = actor_zeta::spawn_supervisor<db_conn::OtterbrixManager>(
         resource,
-        std::make_unique<SimpleMockOtterbrixManager>(mock_config{.can_throw = true}));
+        std::make_unique<SimpleMockOtterbrixManager>(mock_config{.resource = resource, .can_throw = true}));
     auto sql_conn_manager = actor_zeta::spawn_supervisor<db_conn::SqlConnectionManager>(resource, conn_manager);
 
     auto scheduler = actor_zeta::spawn_supervisor<Scheduler>(resource,
-                                                             std::make_unique<SimpleMockParser>(),
+                                                             make_mock_parser(resource),
                                                              sql_conn_manager->address(),
                                                              otterbrix_manager->address(),
                                                              catalog_manager->address());
@@ -168,22 +167,22 @@ TEST_CASE("Error in scheduler test case") {
 
     auto catalog_manager = actor_zeta::spawn_supervisor<mysqlc::CatalogManager>(resource);
     auto conn_manager =
-        std::make_shared<mysqlc::ConnectorManager>(catalog_manager->address(), make_mysql_mock_connector);
+        std::make_shared<mysqlc::ConnectorManager>(catalog_manager->address(), mysql_mock_connector_factory(resource));
 
     conn_manager->addConnection(boost::mysql::connect_params{}, "1");
     conn_manager->addConnection(boost::mysql::connect_params{}, "2");
 
-    auto otterbrix_manager =
-        actor_zeta::spawn_supervisor<db_conn::OtterbrixManager>(resource,
-                                                                std::make_unique<SimpleMockOtterbrixManager>());
+    auto otterbrix_manager = actor_zeta::spawn_supervisor<db_conn::OtterbrixManager>(
+        resource,
+        std::make_unique<SimpleMockOtterbrixManager>(mock_config{.resource = resource}));
     auto sql_conn_manager = actor_zeta::spawn_supervisor<db_conn::SqlConnectionManager>(resource, conn_manager);
 
-    auto scheduler =
-        actor_zeta::spawn_supervisor<Scheduler>(resource,
-                                                std::make_unique<SimpleMockParser>(mock_config{.can_throw = true}),
-                                                sql_conn_manager->address(),
-                                                otterbrix_manager->address(),
-                                                catalog_manager->address());
+    auto scheduler = actor_zeta::spawn_supervisor<Scheduler>(
+        resource,
+        std::make_unique<SimpleMockParser>(mock_config{.resource = resource, .can_throw = true}),
+        sql_conn_manager->address(),
+        otterbrix_manager->address(),
+        catalog_manager->address());
     assert(scheduler);
     std::string sql = "SELECT 1 AS test";
     session_hash_t id = 1;
@@ -211,19 +210,19 @@ TEST_CASE("Error in otterbrix + sql connector test case") {
     assert(resource);
 
     auto catalog_manager = actor_zeta::spawn_supervisor<mysqlc::CatalogManager>(resource);
-    auto conn_manager =
-        std::make_shared<mysqlc::ConnectorManager>(catalog_manager->address(), make_mysql_mock_connector_throw);
+    auto conn_manager = std::make_shared<mysqlc::ConnectorManager>(catalog_manager->address(),
+                                                                   mysql_mock_connector_factory_throw(resource));
 
     conn_manager->addConnection(boost::mysql::connect_params{}, "1");
     conn_manager->addConnection(boost::mysql::connect_params{}, "2");
 
     auto otterbrix_manager = actor_zeta::spawn_supervisor<db_conn::OtterbrixManager>(
         resource,
-        std::make_unique<SimpleMockOtterbrixManager>(mock_config{.can_throw = true}));
+        std::make_unique<SimpleMockOtterbrixManager>(mock_config{.resource = resource, .can_throw = true}));
     auto sql_conn_manager = actor_zeta::spawn_supervisor<db_conn::SqlConnectionManager>(resource, conn_manager);
 
     auto scheduler = actor_zeta::spawn_supervisor<Scheduler>(resource,
-                                                             std::make_unique<SimpleMockParser>(),
+                                                             make_mock_parser(resource),
                                                              sql_conn_manager->address(),
                                                              otterbrix_manager->address(),
                                                              catalog_manager->address());
@@ -255,18 +254,18 @@ TEST_CASE("return empty test case") {
 
     auto catalog_manager = actor_zeta::spawn_supervisor<mysqlc::CatalogManager>(resource);
     auto conn_manager =
-        std::make_shared<mysqlc::ConnectorManager>(catalog_manager->address(), make_mysql_mock_connector);
+        std::make_shared<mysqlc::ConnectorManager>(catalog_manager->address(), mysql_mock_connector_factory(resource));
 
     conn_manager->addConnection(boost::mysql::connect_params{}, "1");
     conn_manager->addConnection(boost::mysql::connect_params{}, "2");
 
     auto otterbrix_manager = actor_zeta::spawn_supervisor<db_conn::OtterbrixManager>(
         resource,
-        std::make_unique<SimpleMockOtterbrixManager>(mock_config{.return_empty = true}));
+        std::make_unique<SimpleMockOtterbrixManager>(mock_config{.resource = resource, .return_empty = true}));
     auto sql_conn_manager = actor_zeta::spawn_supervisor<db_conn::SqlConnectionManager>(resource, conn_manager);
 
     auto scheduler = actor_zeta::spawn_supervisor<Scheduler>(resource,
-                                                             std::make_unique<SimpleMockParser>(),
+                                                             make_mock_parser(resource),
                                                              sql_conn_manager->address(),
                                                              otterbrix_manager->address(),
                                                              catalog_manager->address());

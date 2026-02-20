@@ -46,9 +46,7 @@ services:
     restart: unless-stopped
 
   test-otterstax:
-    build:
-      context: .
-      dockerfile: Dockerfile.test
+    image: otterstax_app:${IMAGE_TAG:-latest}
     container_name: test_otterstax_app
     depends_on:
       - mariadb1

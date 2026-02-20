@@ -10,11 +10,12 @@
 #include <iostream>
 #include <string>
 #include <thread>
+#include <utility>
 
 class SimpleMockParser : public IParser {
 public:
     SimpleMockParser(mock_config config = {})
-        : config_(config) {
+        : config_(std::move(config)) {
         std::cout << "MockParser created with config:" << std::endl;
         std::cout << "can_throw: " << config_.can_throw << std::endl;
         std::cout << "return_empty: " << config_.return_empty << std::endl;
@@ -32,13 +33,12 @@ public:
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(config_.wait_time)); // Simulate some processing delay
 
-        auto resource = std::pmr::get_default_resource();
-        auto binder =
-            sql::transform::transform_result(logical_plan::make_node_aggregate(resource, {"1", "db", "", "table"}),
-                                             logical_plan::make_parameter_node(resource),
-                                             {},
-                                             {},
-                                             data_chunk_t(resource, {}));
+        auto binder = sql::transform::transform_result(
+            logical_plan::make_node_aggregate(config_.resource, {"1", "db", "", "table"}),
+            logical_plan::make_parameter_node(config_.resource),
+            {},
+            {},
+            data_chunk_t(config_.resource, {}));
         auto parsed = std::make_unique<ParsedQueryData>(
             std::make_unique<OtterbrixStatement>(std::vector<std::vector<logical_plan::node_ptr*>>{},
                                                  binder.params_ptr(),
@@ -54,4 +54,6 @@ private:
     mock_config config_;
 };
 
-inline parser_ptr make_mock_parser() { return std::make_unique<SimpleMockParser>(); }
+inline parser_ptr make_mock_parser(std::pmr::memory_resource* resource) {
+    return std::make_unique<SimpleMockParser>(mock_config({.resource = resource}));
+}

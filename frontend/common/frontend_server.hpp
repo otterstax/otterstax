@@ -9,13 +9,13 @@
 #include "utility/thread_pool_manager.hpp"
 
 #include <actor-zeta.hpp>
-#include <atomic>
 #include <boost/asio.hpp>
 #include <components/log/log.hpp>
-#include <iostream>
+
+#include <atomic>
 #include <mutex>
+#include <optional>
 #include <queue>
-#include <stdexcept>
 #include <vector>
 
 namespace frontend {
@@ -32,11 +32,9 @@ namespace frontend {
         explicit frontend_server(const frontend_server_config& config)
             : resource_(config.resource)
             , thread_pool_manager_(config.pool_size)
-            , acceptor_(thread_pool_manager_.ctx(),
-                        boost::asio::ip::tcp::endpoint(boost::asio::ip::tcp::v4(), config.port))
+            , acceptor_(thread_pool_manager_.ctx(), {boost::asio::ip::tcp::v4(), config.port})
             , rejector_socket_(thread_pool_manager_.ctx())
             , next_connection_id_(1)
-            , active_connections_(0)
             , scheduler_(config.scheduler)
             , log_(get_logger(logger_tag::FRONTEND_SERVER)) {
             assert(log_.is_valid());
@@ -45,6 +43,8 @@ namespace frontend {
             connection_pool_.reserve(MAX_CONNECTIONS);
         }
 
+        ~frontend_server() { stop(); }
+
         thread_pool_status status() const noexcept { return thread_pool_manager_.status(); }
 
         void start() {
@@ -52,67 +52,59 @@ namespace frontend {
             thread_pool_manager_.start();
         }
 
-        void stop() { thread_pool_manager_.stop(); }
-
-        virtual ~frontend_server() { shutdown(); }
-
-        void release_connection_slot(size_t slot) {
-            std::lock_guard<std::mutex> lock(pool_mutex_);
-
-            if (slot < connection_pool_.size()) {
-                available_slots_.push(slot);
-                if (active_connections_.fetch_sub(1) == 0) { // underflow
-                    active_connections_.store(0);
-                }
-            }
-        }
-
-    protected:
-        void shutdown() {
-            shutting_down.store(true);
-
+        void stop() {
             acceptor_.cancel();
             acceptor_.close();
-            {
-                std::lock_guard<std::mutex> lock(pool_mutex_);
-                for (auto& conn : connection_pool_) {
-                    conn.finish();
+            rejector_socket_.close();
+
+            std::lock_guard lock(pool_mutex_);
+            for (auto& conn : connection_pool_) {
+                if (conn) {
+                    conn->finish();
                 }
             }
 
             thread_pool_manager_.stop();
-            rejector_socket_.close();
         }
 
     private:
-        void accept_connections() {
-            if (shutting_down.load()) {
-                return;
-            }
+        static constexpr size_t MAX_CONNECTIONS = 1000;
+        static constexpr std::chrono::milliseconds CONNECTION_EXCEPTION_TIMEOUT = std::chrono::milliseconds(100);
 
+        void accept_connections() {
             try {
-                if (auto slt = acquire_connection_slot(); slt.has_value()) {
-                    acceptor_.async_accept(connection_pool_[slt.value()].socket(),
-                                           [this, slot = slt.value()](boost::system::error_code ec) {
-                                               if (!ec) {
-                                                   log_->debug("Connection accepted (slot {})", slot);
-                                                   connection_pool_[slot].start();
-                                                   active_connections_.fetch_add(1);
-                                               } else {
-                                                   release_connection_slot(slot);
-                                               }
-                                               accept_connections();
-                                           });
-                } else {
+                auto slot_opt = acquire_connection_slot();
+                if (!slot_opt) {
                     acceptor_.async_accept(rejector_socket_, [this](boost::system::error_code ec) {
                         if (!ec) {
-                            log_->debug("Connection pool exhausted: rejecting connection");
                             reject_connection();
-                        } else {
-                            accept_connections();
                         }
+                        accept_connections();
                     });
+                    return;
                 }
+
+                const size_t index = *slot_opt;
+                auto on_close = [this, index]() {
+                    log_->debug("Connection closed (slot {})", index);
+                    release_connection_slot(index);
+                };
+
+                connection_pool_[index] = std::make_unique<DerivedConnection>(resource_,
+                                                                              thread_pool_manager_.ctx(),
+                                                                              next_connection_id_.fetch_add(1),
+                                                                              scheduler_,
+                                                                              std::move(on_close));
+
+                acceptor_.async_accept(connection_pool_[index]->socket(), [this, index](boost::system::error_code ec) {
+                    if (!ec) {
+                        log_->debug("Connection accepted (slot {})", index);
+                        connection_pool_[index]->start();
+                    } else {
+                        release_connection_slot(index);
+                    }
+                    accept_connections();
+                });
             } catch (const std::exception& e) {
                 log_->error("Fatal connection error: {}", e.what());
                 auto timer = std::make_shared<boost::asio::steady_timer>(thread_pool_manager_.ctx(),
@@ -131,60 +123,51 @@ namespace frontend {
                                          if (ec) {
                                              log_->error("Failed to send rejection packet: {}", ec.message());
                                          }
+                                         if (close_ec) {
+                                             log_->error("Failed to close rejector socket: {}", close_ec.message());
+                                         }
                                          accept_connections();
                                      });
         }
 
         std::optional<size_t> acquire_connection_slot() {
-            static auto callback_factory = [this](size_t slot) {
-                return [this, slot]() {
-                    log_->debug("Connection closed (slot {})", slot);
-                    release_connection_slot(slot);
-                };
-            };
+            std::lock_guard lock(pool_mutex_);
 
-            std::lock_guard<std::mutex> lock(pool_mutex_);
             if (!available_slots_.empty()) {
                 size_t slot = available_slots_.front();
                 available_slots_.pop();
-
-                connection_pool_[slot].finish();
-                connection_pool_[slot] = DerivedConnection(resource_,
-                                                           thread_pool_manager_.ctx(),
-                                                           next_connection_id_.fetch_add(1),
-                                                           scheduler_,
-                                                           callback_factory(slot));
                 return slot;
             }
 
             if (connection_pool_.size() < MAX_CONNECTIONS) {
-                connection_pool_.emplace_back(resource_,
-                                              thread_pool_manager_.ctx(),
-                                              next_connection_id_.fetch_add(1),
-                                              scheduler_,
-                                              callback_factory(connection_pool_.size()));
+                connection_pool_.emplace_back(nullptr);
                 return connection_pool_.size() - 1;
             }
 
-            return {};
+            return std::nullopt;
         }
 
-        static constexpr size_t MAX_CONNECTIONS = 1000;
-        static constexpr std::chrono::milliseconds CONNECTION_EXCEPTION_TIMEOUT = std::chrono::milliseconds(100);
+        void release_connection_slot(size_t slot) {
+            std::lock_guard lock(pool_mutex_);
+
+            if (slot < connection_pool_.size()) {
+                connection_pool_[slot].reset();
+                available_slots_.push(slot);
+            }
+        }
 
         std::pmr::memory_resource* resource_;
         thread_pool_manager thread_pool_manager_;
         boost::asio::ip::tcp::acceptor acceptor_;
         boost::asio::ip::tcp::socket rejector_socket_;
-        std::atomic<uint32_t> next_connection_id_;
-        std::atomic<size_t> active_connections_;
-        std::atomic<bool> shutting_down = false;
 
         actor_zeta::address_t scheduler_;
-        std::vector<DerivedConnection> connection_pool_;
+        std::atomic<uint32_t> next_connection_id_;
+        std::vector<std::unique_ptr<DerivedConnection>> connection_pool_;
         std::queue<size_t> available_slots_;
         log_t log_;
 
         mutable std::mutex pool_mutex_;
     };
+
 } // namespace frontend

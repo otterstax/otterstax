@@ -7,8 +7,8 @@
 #include "routes/otterbrix_manager.hpp"
 #include "routes/scheduler.hpp"
 #include "routes/sql_connection_manager.hpp"
-#include "utility/timer.hpp"
 #include "utility/logger.hpp"
+#include "utility/timer.hpp"
 
 #include <actor-zeta.hpp>
 #include <cassert>
@@ -134,8 +134,8 @@ auto Scheduler::make_scheduler() noexcept -> actor_zeta::scheduler_abstract_t* {
 
 auto Scheduler::enqueue_impl(actor_zeta::message_ptr msg, actor_zeta::execution_unit*) -> void {
     std::unique_lock<std::mutex> _(input_mtx_);
-    auto tmp = std::move(msg);
-    behavior()(tmp.get());
+    set_current_message(std::move(msg));
+    behavior()(current_message());
 }
 
 auto Scheduler::execute(session_hash_t id, shared_flight_data sdata, std::string sql) -> void {
@@ -377,10 +377,13 @@ void Scheduler::update_metadata(session_hash_t id, ParsedQueryDataPtr metadata, 
     log_->trace("Scheduler::update_metadata finish");
 }
 
+// WARN: erase from metadata_map_ before release to avoid possible destructor data-race
+// NOTE: shared_data_map_'s data is managed by shared_ptr, erase after release is safe
 void Scheduler::complete_session(session_hash_t id) {
     std::lock_guard<std::mutex> lock(data_map_mtx_);
     log_->trace("Scheduler::complete_session empty start");
 
+    metadata_map_.erase(id);
     if (auto it = shared_data_map_.find(id);
         it != shared_data_map_.end() && it->second->status() == cv_wrapper::Status::Unknown) {
         log_->trace("Scheduler::complete_session updated");
@@ -388,12 +391,16 @@ void Scheduler::complete_session(session_hash_t id) {
     }
     log_->trace("Scheduler::complete_session empty finish");
     shared_data_map_.erase(id);
-    metadata_map_.erase(id);
 }
 
 void Scheduler::complete_session(session_hash_t id, flight_data data, session_type type) {
     std::lock_guard<std::mutex> lock(data_map_mtx_);
     log_->trace("Scheduler::complete_session start");
+
+    if (type == session_type::DO_GET) {
+        // metadata not needed anymore
+        metadata_map_.erase(id);
+    }
 
     if (auto it = shared_data_map_.find(id);
         it != shared_data_map_.end() && it->second->status() == cv_wrapper::Status::Unknown) {
@@ -403,23 +410,18 @@ void Scheduler::complete_session(session_hash_t id, flight_data data, session_ty
     }
     log_->trace("Scheduler::complete_session finish");
     shared_data_map_.erase(id);
-
-    if (type == session_type::DO_GET) {
-        // metadata not needed anymore
-        metadata_map_.erase(id);
-    }
 }
 
 void Scheduler::complete_session_on_error(session_hash_t id, std::string error_msg) {
     std::lock_guard<std::mutex> lock(data_map_mtx_);
     log_->trace("Scheduler::complete_session_on_error start");
 
+    metadata_map_.erase(id);
     if (auto it = shared_data_map_.find(id); it != shared_data_map_.end()) {
         it->second->release_on_error(std::move(error_msg));
     }
     log_->trace("Scheduler::complete_session_on_error finish");
     shared_data_map_.erase(id);
-    metadata_map_.erase(id);
 }
 
 ParsedQueryDataPtr Scheduler::get_statement(session_hash_t id) {

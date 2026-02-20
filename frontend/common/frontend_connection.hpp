@@ -9,13 +9,12 @@
 #include <atomic>
 #include <boost/asio.hpp>
 #include <components/log/log.hpp>
+#include <functional>
 #include <iostream>
-#include <mutex>
-#include <queue>
-#include <stdexcept>
 #include <vector>
 
 namespace frontend {
+
     class frontend_connection {
     public:
         frontend_connection(boost::asio::io_context& ctx, uint32_t connection_id, std::function<void()> on_close);
@@ -23,9 +22,9 @@ namespace frontend {
         virtual ~frontend_connection() = default;
 
         frontend_connection(const frontend_connection&) = delete;
-        frontend_connection(frontend_connection&& other) = default;
+        frontend_connection(frontend_connection&&) = delete;
         frontend_connection& operator=(const frontend_connection&) = delete;
-        frontend_connection& operator=(frontend_connection&& other) noexcept = default;
+        frontend_connection& operator=(frontend_connection&&) = delete;
 
         boost::asio::ip::tcp::socket& socket();
         log_t& logger();
@@ -77,5 +76,8 @@ namespace frontend {
         static constexpr size_t TRY_RESEND_RESULTSET_ATTEMPTS = 3;
 
         void read_packet_payload(std::vector<uint8_t> header);
+
+        std::atomic<bool> closing_{false};
     };
+
 } // namespace frontend

@@ -1,6 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0
-# Copyright 2025-2026  OtterStax
-
 import mysql.connector
 import pymysql
 import sys
@@ -160,7 +157,7 @@ class client:
 
             cursor.execute(insert_sql, (
                 gen_id(1), 'Hello World',
-                gen_id(2), 'Bonjour monde',
+                gen_id(2), 'Привет мир',
                 gen_id(3), '你好世界',
                 gen_id(4), 'こんにちは世界',
                 gen_id(5), '🌍🚀✨',

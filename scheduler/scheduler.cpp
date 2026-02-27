@@ -76,6 +76,7 @@ Scheduler::Scheduler(std::pmr::memory_resource* res,
     assert(res != nullptr);
     assert(parser_ != nullptr);
     worker_.start(); // Start the worker thread manager
+    log_->info("Scheduler initialized successfully");
 }
 
 actor_zeta::behavior_t Scheduler::behavior() {
@@ -141,8 +142,8 @@ auto Scheduler::enqueue_impl(actor_zeta::message_ptr msg, actor_zeta::execution_
 auto Scheduler::execute(session_hash_t id, shared_flight_data sdata, std::string sql) -> void {
     try {
         Timer timer("Scheduler::execute");
-        // log_->trace("execute thread: {}, sql: {}, id hash: {}", std::this_thread::get_id(), sql, id);  // fmt v11 doesn't format thread::id
-        log_->trace("execute sql: {}, id hash: {}", sql, id);
+        log_->info("Scheduler::execute called with sql: {}", sql);
+        log_->trace("execute id hash: {}", id);
         register_session(id, sdata); // in case parse() throws
         auto parsed = parser_->parse(sql);
         update_metadata(id, std::move(parsed)); // skip schema computing
@@ -156,9 +157,7 @@ auto Scheduler::execute(session_hash_t id, shared_flight_data sdata, std::string
 void Scheduler::execute_statement(session_hash_t id, shared_flight_data sdata) {
     try {
         Timer timer("Scheduler::execute_statement");
-        // log_->trace("execute_statement thread: {}, Shared data size: {}, id hash: {}",
-        //            std::this_thread::get_id(), sdata->result.chunk.size(), id);  // fmt v11 doesn't format thread::id
-        log_->trace("execute_statement Shared data size: {}, id hash: {}", sdata->result.chunk.size(), id);
+        log_->info("Scheduler::execute_statement called with Shared data size: {}, id hash: {}", sdata->result.chunk.size(), id);
         register_session(id, std::move(sdata));
 
         log_->debug("execute_statement send to sql");

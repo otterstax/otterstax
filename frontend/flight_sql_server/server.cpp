@@ -104,6 +104,7 @@ SimpleFlightSQLServer::SimpleFlightSQLServer(const Config& config)
     , catalog_address_(config.catalog_address)
     , scheduler_address_(config.scheduler_address) {
     assert(log_.is_valid());
+    log_->info("FlightSQLServer initialized successfully");
 }
 
 // Method in arrow::flight::sql to start communication

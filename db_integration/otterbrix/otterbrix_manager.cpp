@@ -27,6 +27,7 @@ OtterbrixManager::OtterbrixManager(std::pmr::memory_resource* res, std::unique_p
                                             &OtterbrixManager::get_schema))
     , log_(get_logger(logger_tag::OTTERBRIX_MANAGER)) {
     assert(log_.is_valid());
+    log_->info("OtterbrixManager initialized successfully");
     worker_.start(); // Start the worker thread manager
 }
 

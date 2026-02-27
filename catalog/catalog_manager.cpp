@@ -32,6 +32,7 @@ namespace mysqlc {
         , log_(get_logger(logger_tag::CATALOG_MANAGER)) {
         assert(log_.is_valid());
         assert(res != nullptr);
+        log_->info("CatalogManager initialized successfully");
         worker_.start();
     }
 

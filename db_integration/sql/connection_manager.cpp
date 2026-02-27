@@ -27,6 +27,7 @@ SqlConnectionManager::SqlConnectionManager(std::pmr::memory_resource* res,
     assert(connector_manager_ != nullptr);
     connector_manager_->start(); // Start the connector manager
     worker_.start();             // Start the worker thread manager
+    log_->info("SqlConnectionManager initialized successfully");
 }
 
 auto SqlConnectionManager::make_scheduler() noexcept -> actor_zeta::scheduler_abstract_t* {

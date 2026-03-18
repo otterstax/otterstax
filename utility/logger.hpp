@@ -33,6 +33,8 @@ inline log_t get_logger(std::string_view tag) { return get_logger(std::string(ta
 inline log_t initialize_logger(std::string name, std::string prefix) {
     if (auto log_ptr = get_logger(name); log_ptr.is_valid()) {
         // prevent creating two loggers with same name
+        // Set runtime level to match compile-time level
+        log_ptr->set_level(static_cast<spdlog::level::level_enum>(SPDLOG_ACTIVE_LEVEL));
         return log_ptr;
     }
 
@@ -59,12 +61,16 @@ inline log_t initialize_logger(std::string name, std::string prefix) {
 
     spdlog::flush_every(std::chrono::seconds(1)); //todo: hack
     logger->set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%n] [%l] [pid %P tid %t] %v");
+    logger->set_level(static_cast<spdlog::level::level_enum>(SPDLOG_ACTIVE_LEVEL));
     logger->flush_on(spdlog::level::debug);
     spdlog::register_logger(logger);
     return logger;
 }
 
 inline void initialize_all_loggers(const std::string& prefix) {
+    // Set global default level to match compile-time level
+    spdlog::set_level(static_cast<spdlog::level::level_enum>(SPDLOG_ACTIVE_LEVEL));
+    
     static constexpr std::array<std::string_view, 10> all_loggers = {
         logger_tag::CATALOG_MANAGER,
         logger_tag::CONNECTOR,

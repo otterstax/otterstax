@@ -56,7 +56,7 @@ actor_zeta::behavior_t SqlConnectionManager::behavior() {
 auto SqlConnectionManager::execute(session_hash_t id, ParsedQueryDataPtr&& data) -> void {
     assert(data);
     try {
-        Timer timer("SqlConnectionManager::execute");
+        Timer timer("SqlConnectionManager::execute", log_);
 
         log_->trace("execute, id hash: {}", id);
 

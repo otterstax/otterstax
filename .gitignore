@@ -425,6 +425,9 @@ conaninfo.txt
 *.wal
 *.txt.user
 
+# gitea
+.gitea/
+
 
 # Local configuration
 app_data/
@@ -441,4 +444,4 @@ fixtures/init/mariadb1/init.sql
 fixtures/init/mariadb2/init.sql
 CMakeUserPresets.json
 fixtures/init/mariadb1/init.sql
-compose.yml
+

@@ -2,21 +2,22 @@
 // Copyright 2025-2026  OtterStax
 
 #pragma once
+#include <components/log/log.hpp>
 
 #include <chrono>
 #include <iostream>
 
 class Timer {
 public:
-    Timer(std::string name = "")
-        : name_{std::move(name)} {
+    Timer(std::string name, log_t log)
+        : name_{std::move(name)}, log_{log} {
         start();
     }
     ~Timer() {
-        // Total Time elapsed
+        log_->trace("Timer [{}]: Total Time elapsed = {:.2f} ms", name_, elapsed());
     }
     void timePoint(const std::string& sub_name = "") {
-        // Time elapsed at point
+        log_->trace("Timer [{}]: Time point [{}] = {:.2f} ms", name_, sub_name, elapsed());
     }
 
 private:
@@ -29,5 +30,6 @@ private:
 
 private:
     std::string name_;
+    log_t log_;
     std::chrono::time_point<std::chrono::system_clock> start_point_;
 };

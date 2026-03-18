@@ -2,8 +2,14 @@ cmake_minimum_required(VERSION 3.15)
 project(otterstax)
 
 set(CMAKE_VERBOSE_MAKEFILE TRUE)
-set(CMAKE_CXX_STANDARD 20 CACHE STRING "The C++ standard whose features are requested.")
+set(CMAKE_CXX_STANDARD 20 CACHE STRING "The C++ standard whose features are requested." FORCE)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_CXX_FLAGS "-fcoroutines")
+
+# Set spdlog active level (can be overridden via -DSPDLOG_ACTIVE_LEVEL=...)
+set(SPDLOG_ACTIVE_LEVEL "SPDLOG_LEVEL_ERROR" CACHE STRING "Active spdlog level")
+add_compile_definitions(SPDLOG_ACTIVE_LEVEL=${SPDLOG_ACTIVE_LEVEL})
 
 # Option to build tests
 option(BUILD_TESTS "Build unit tests" OFF)

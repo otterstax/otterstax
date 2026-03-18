@@ -76,6 +76,9 @@ class OtterStax(ConanFile):
 
     def generate(self):
         tc = CMakeToolchain(self)
+        tc.variables["CMAKE_CXX_STANDARD"] = "20"
+        tc.variables["CMAKE_CXX_STANDARD_REQUIRED"] = "ON"
+        tc.variables["CMAKE_CXX_EXTENSIONS"] = "OFF"
         tc.generate()
 
         deps = CMakeDeps(self)

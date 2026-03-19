@@ -17,7 +17,10 @@ ComponentManager::ComponentManager(const configuration::config& config)
     assert(catalog_manager_ != nullptr && "catalog manager must not be null");
 
     db_connector_manager_ = std::make_shared<mysqlc::ConnectorManager>(catalog_manager_->address());
-    catalog_manager_->set_connector_manager(db_connector_manager_); // cyclic dependency
+    catalog_manager_->set_mysql_connector_manager(db_connector_manager_); // cyclic dependency
+
+    pg_connector_manager_ = std::make_shared<pgc::ConnectorManager>(catalog_manager_->address());
+    catalog_manager_->set_pg_connector_manager(pg_connector_manager_);
 
     otterbrix_manager_ =
         actor_zeta::spawn_supervisor<db_conn::OtterbrixManager>(resource_, make_otterbrix_manager(otterbrix_));
@@ -27,16 +30,22 @@ ComponentManager::ComponentManager(const configuration::config& config)
         actor_zeta::spawn_supervisor<db_conn::SqlConnectionManager>(resource_, db_connector_manager_);
     assert(sql_connection_manager_ != nullptr && "sql connection manager must not be null");
 
+    pg_connection_manager_ =
+        actor_zeta::spawn_supervisor<db_conn::PgConnectionManager>(resource_, pg_connector_manager_);
+    assert(pg_connection_manager_ != nullptr && "pg connection manager must not be null");
+
     scheduler_ = actor_zeta::spawn_supervisor<Scheduler>(resource_,
                                                          make_parser(resource_),
                                                          sql_connection_manager_->address(),
+                                                         pg_connection_manager_->address(),
                                                          otterbrix_manager_->address(),
                                                          catalog_manager_->address());
 
     assert(scheduler_ != nullptr && "scheduler must not be null");
 
-    // Start connector manager
+    // Start connector managers
     db_connector_manager_->start();
+    pg_connector_manager_->start();
 }
 
 std::pmr::memory_resource* ComponentManager::getResource() {
@@ -48,6 +57,8 @@ std::string ComponentManager::getLogPath() { return log_path_; }
 
 std::shared_ptr<mysqlc::ConnectorManager> ComponentManager::db_connection_manager() const { return db_connector_manager_; }
 
+std::shared_ptr<pgc::ConnectorManager> ComponentManager::pg_connection_manager() const { return pg_connector_manager_; }
+
 actor_zeta::address_t ComponentManager::scheduler_address() const { return scheduler_->address(); }
 
 actor_zeta::address_t ComponentManager::catalog_address() const { return catalog_manager_->address(); }
@@ -55,3 +66,5 @@ actor_zeta::address_t ComponentManager::catalog_address() const { return catalog
 actor_zeta::address_t ComponentManager::otterbrix_manager_address() const { return otterbrix_manager_->address(); }
 
 actor_zeta::address_t ComponentManager::sql_connection_manager_address() const { return sql_connection_manager_->address(); }
+
+actor_zeta::address_t ComponentManager::pg_connection_manager_address() const { return pg_connection_manager_->address(); }

@@ -20,6 +20,7 @@ namespace logger_tag {
     inline constexpr std::string_view CONNECTOR_MANAGER = "ConnectorManager";
     inline constexpr std::string_view OTTERBRIX_MANAGER = "OtterbrixManager";
     inline constexpr std::string_view SQL_CONNECTION_MANAGER = "SqlConnectionManager";
+    inline constexpr std::string_view PG_CONNECTION_MANAGER = "PgConnectionManager";
     inline constexpr std::string_view FRONTEND_SERVER = "FrontendServer";
     inline constexpr std::string_view FLIGHTSQL_SERVER = "FlightSQLServer";
     inline constexpr std::string_view MYSQL_CONNECTION = "MysqlConnection";
@@ -71,12 +72,13 @@ inline void initialize_all_loggers(const std::string& prefix) {
     // Set global default level to match compile-time level
     spdlog::set_level(static_cast<spdlog::level::level_enum>(SPDLOG_ACTIVE_LEVEL));
     
-    static constexpr std::array<std::string_view, 10> all_loggers = {
+    static constexpr std::array<std::string_view, 11> all_loggers = {
         logger_tag::CATALOG_MANAGER,
         logger_tag::CONNECTOR,
         logger_tag::CONNECTOR_MANAGER,
         logger_tag::OTTERBRIX_MANAGER,
         logger_tag::SQL_CONNECTION_MANAGER,
+        logger_tag::PG_CONNECTION_MANAGER,
         logger_tag::FRONTEND_SERVER,
         logger_tag::FLIGHTSQL_SERVER,
         logger_tag::MYSQL_CONNECTION,

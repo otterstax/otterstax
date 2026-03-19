@@ -104,6 +104,7 @@ SimpleFlightSQLServer::SimpleFlightSQLServer(const Config& config)
     , catalog_address_(config.catalog_address)
     , scheduler_address_(config.scheduler_address) {
     assert(log_.is_valid());
+    log_->info("FlightSQLServer initialized successfully");
 }
 
 // Method in arrow::flight::sql to start communication
@@ -112,19 +113,23 @@ SimpleFlightSQLServer::GetFlightInfoStatement(const arrow::flight::ServerCallCon
                                               const arrow::flight::sql::StatementQuery& command,
                                               const arrow::flight::FlightDescriptor& descriptor) {
     Timer timer("GetFlightInfoStatement", log_);
+    log_->debug("[GetFlightInfoStatement] Start");
     session_id id;
     const std::string& query = command.query;
-    log_->debug("Received query in ticket: {}", query);
+    log_->debug("[GetFlightInfoStatement] Received query: {}", query);
+    log_->debug("[GetFlightInfoStatement] Encoding ticket...");
     auto ticket = EncodeTransactionQuery({query, command.transaction_id, id.hash()}).ValueOrDie();
-    log_->trace("ticket: {}", ticket.ToString());
+    log_->debug("[GetFlightInfoStatement] Ticket encoded, creating cv_wrapper...");
 
-    auto shared_data = create_cv_wrapper(flight_data(resource_));
+    auto shared_data = create_cv_wrapper(session_payload(resource_));
+    log_->debug("[GetFlightInfoStatement] Sending to scheduler...");
     actor_zeta::send(scheduler_address_,
                      scheduler_address_,
                      scheduler::handler_id(scheduler::route::prepare_schema),
                      id.hash(),
                      shared_data,
                      query);
+    log_->debug("[GetFlightInfoStatement] Waiting for response...");
     shared_data->wait_for(cv_wrapper::DEFAULT_TIMEOUT);
 
     if (shared_data->status() == cv_wrapper::Status::Ok) {
@@ -160,7 +165,7 @@ SimpleFlightSQLServer::DoGetStatement(const arrow::flight::ServerCallContext& co
                     query,
                     session_hash,
                     transaction_id);
-        auto shared_data = create_cv_wrapper(flight_data(resource_));
+        auto shared_data = create_cv_wrapper(session_payload(resource_));
         actor_zeta::send(scheduler_address_,
                          scheduler_address_,
                          scheduler::handler_id(scheduler::route::execute_statement),
@@ -285,7 +290,7 @@ SimpleFlightSQLServer::DoPutCommandStatementUpdate(const arrow::flight::ServerCa
     try {
         // Log the received ticket, assuming the query is stored in the ticket
         log_->debug("Received query in ticket: {} Id: {}", command.query, command.transaction_id);
-        auto shared_data = create_cv_wrapper(flight_data(resource_));
+        auto shared_data = create_cv_wrapper(session_payload(resource_));
         session_id id;
         actor_zeta::send(scheduler_address_,
                          scheduler_address_,

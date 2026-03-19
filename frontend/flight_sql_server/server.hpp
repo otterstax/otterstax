@@ -1,18 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2025-2026  OtterStax
 
+
 #pragma once
 
 #include "../../catalog/catalog_manager.hpp"
-#include "../../connectors/mysql_manager.hpp"
+#include "../../connectors/mysql/manager.hpp"
 #include "../../otterbrix/operators/execute_plan.hpp"
 #include "../../otterbrix/parser/parser.hpp"
-// #include "../db_integration/nosql/connection_manager.hpp"
 #include "../../db_integration/otterbrix/otterbrix_manager.hpp"
 #include "../../db_integration/sql/connection_manager.hpp"
 #include "../../otterbrix/config.hpp"
 #include "../../scheduler/scheduler.hpp"
-#include "../../utility/shared_flight_data.hpp"
+#include "../../utility/session_payload.hpp"
 #include "../../utility/table_info.hpp"
 
 #include <boost/mysql/results.hpp>

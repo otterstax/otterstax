@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2025-2026  OtterStax
 
+
 #include "sql_query_generator.hpp"
 
+#include <spdlog/spdlog.h>
 #include <components/expressions/aggregate_expression.hpp>
 #include <components/expressions/compare_expression.hpp>
 #include <components/expressions/scalar_expression.hpp>
@@ -82,8 +84,9 @@ namespace {
         return stream;
     }
 
+    // Write a logical value to stream with backend-specific quoting
     template<class OStream>
-    OStream& operator<<(OStream& stream, const components::types::logical_value_t& value) {
+    void write_logical_value(OStream& stream, const components::types::logical_value_t& value, backend_type_t backend) {
         switch (value.type().type()) {
             case logical_type::NA:
                 stream << "NULL";
@@ -127,9 +130,27 @@ namespace {
             case logical_type::UHUGEINT:
                 stream << value.value<components::types::uint128_t>();
                 break;
-            case logical_type::STRING_LITERAL:
-                stream << "\"" << *value.value<std::string*>() << "\"";
+            case logical_type::STRING_LITERAL: {
+                // PostgreSQL requires single quotes for string literals
+                // MySQL accepts both, but single quotes are standard SQL
+                const std::string& str = *value.value<std::string*>();
+                if (backend == backend_type_t::PostgreSQL) {
+                    // For PostgreSQL, use single quotes and escape any single quotes in the string
+                    stream << "'";
+                    for (char c : str) {
+                        if (c == '\'') {
+                            stream << "''";  // SQL standard escape: '' becomes '
+                        } else {
+                            stream << c;
+                        }
+                    }
+                    stream << "'";
+                } else {
+                    // MySQL: use single quotes (standard SQL, works in all modes)
+                    stream << "'" << str << "'";
+                }
                 break;
+            }
             case logical_type::STRUCT: {
                 stream << "ROW(";
                 bool separator = false;
@@ -137,7 +158,7 @@ namespace {
                     if (separator) {
                         stream << ", ";
                     }
-                    stream << child_val;
+                    write_logical_value(stream, child_val, backend);
                     separator = true;
                 }
                 stream << ")";
@@ -150,7 +171,7 @@ namespace {
                     if (separator) {
                         stream << ", ";
                     }
-                    stream << child_val;
+                    write_logical_value(stream, child_val, backend);
                     separator = true;
                 }
                 stream << "}";
@@ -160,6 +181,13 @@ namespace {
                 // TODO: implement other value types
                 throw std::runtime_error("Encountered an unsupported value type during query generation");
         }
+    }
+
+    // Legacy operator for backward compatibility (uses MySQL-style quoting)
+    template<class OStream>
+    OStream& operator<<(OStream& stream, const components::types::logical_value_t& value) {
+        // Default to MySQL behavior for backward compatibility
+        write_logical_value(stream, value, backend_type_t::MySQL);
         return stream;
     }
 
@@ -372,7 +400,7 @@ namespace {
     }
 
     void
-    generate_select(std::stringstream& stream, const node_aggregate_ptr& node, const storage_parameters* parameters) {
+    generate_select(std::stringstream& stream, const node_aggregate_ptr& node, const storage_parameters* parameters, backend_type_t backend) {
         node_group_ptr group = nullptr;
         node_match_ptr match = nullptr;
         node_sort_ptr sort = nullptr;
@@ -463,7 +491,7 @@ namespace {
                 stream << "*";
             }
             stream << " FROM ";
-            stream << node->collection_full_name().to_string();
+            stream << sql_gen::table_reference(node->collection_full_name(), backend);
         }
         // where
         {
@@ -476,10 +504,36 @@ namespace {
         }
         // group by
         {
-
-        } // order by
+            if (group) {
+                std::vector<std::string> group_by_fields;
+                for (const auto& expr : group->expressions()) {
+                    if (expr->group() == expression_group::scalar) {
+                        auto scalar_expr = reinterpret_cast<const scalar_expression_ptr&>(expr);
+                        // Get the field name for GROUP BY
+                        if (scalar_expr->params().empty()) {
+                            group_by_fields.emplace_back(scalar_expr->key().as_string());
+                        } else if (std::holds_alternative<components::expressions::key_t>(scalar_expr->params().front())) {
+                            group_by_fields.emplace_back(
+                                std::get<components::expressions::key_t>(scalar_expr->params().front()).as_string());
+                        }
+                    }
+                }
+                if (!group_by_fields.empty()) {
+                    stream << " GROUP BY ";
+                    bool comma = false;
+                    for (const auto& field : group_by_fields) {
+                        if (comma) {
+                            stream << ", ";
+                        }
+                        stream << field;
+                        comma = true;
+                    }
+                }
+            }
+        }
+        // order by
         {
-            if (sort) {
+            if (sort && !sort->expressions().empty()) {
                 stream << " ORDER BY ";
                 bool comma = false;
                 for (const auto& expr : sort->expressions()) {
@@ -530,7 +584,7 @@ namespace {
         stream << ")";
     }
 
-    void generate_delete(std::stringstream& stream, const node_delete_ptr& node, const storage_parameters* parameters) {
+    void generate_delete(std::stringstream& stream, const node_delete_ptr& node, const storage_parameters* parameters, backend_type_t backend) {
         node_match_ptr match = nullptr;
         for (const auto& child : node->children()) {
             if (child->type() == node_type::match_t) {
@@ -538,12 +592,12 @@ namespace {
             }
         }
         stream << "DELETE FROM ";
-        stream << node->collection_full_name().collection;
+        stream << sql_gen::table_reference(node->collection_full_name(), backend);
         if (!node->collection_from().empty()) {
             //! node_delete supports raw_data after using, but it is not possible to send it
             assert(node->collection_full_name().unique_identifier.empty() ||
                    node->collection_full_name().unique_identifier == node->collection_from().unique_identifier);
-            stream << " USING " << node->collection_from().to_string();
+            stream << " USING " << sql_gen::table_reference(node->collection_from(), backend);
         }
         // WHERE
         if (match) {
@@ -567,8 +621,8 @@ namespace {
         stream << "DROP INDEX IF EXISTS " << node->name() << " ON " << node->collection_full_name().collection;
     }
 
-    void generate_insert(std::stringstream& stream, const node_insert_ptr& node, const storage_parameters* parameters) {
-        stream << "INSERT INTO " << node->collection_full_name().collection << " ";
+    void generate_insert(std::stringstream& stream, const node_insert_ptr& node, const storage_parameters* parameters, backend_type_t backend) {
+        stream << "INSERT INTO " << sql_gen::table_reference(node->collection_full_name(), backend) << " ";
         if (!node->key_translation().empty()) {
             stream << "(";
             bool comma = false;
@@ -588,23 +642,24 @@ namespace {
                 keys.emplace_back(k_pair.second.as_string());
             }
             sql_gen::generate_values(stream,
-                                     reinterpret_cast<const node_data_ptr&>(node->children().front())->data_chunk());
+                                     reinterpret_cast<const node_data_ptr&>(node->children().front())->data_chunk(),
+                                     backend);
         } else {
             assert(node->children().front()->type() == node_type::aggregate_t);
             assert(node->collection_full_name().unique_identifier ==
                    node->children().front()->collection_full_name().unique_identifier);
-            generate_select(stream, reinterpret_cast<const node_aggregate_ptr&>(node->children().front()), parameters);
+            generate_select(stream, reinterpret_cast<const node_aggregate_ptr&>(node->children().front()), parameters, backend);
         }
     }
 
-    void generate_update(std::stringstream& stream, const node_update_ptr& node, const storage_parameters* parameters) {
+    void generate_update(std::stringstream& stream, const node_update_ptr& node, const storage_parameters* parameters, backend_type_t backend) {
         node_match_ptr match = nullptr;
         for (const auto& child : node->children()) {
             if (child->type() == node_type::match_t) {
                 match = reinterpret_cast<const node_match_ptr&>(child);
             }
         }
-        stream << "UPDATE " << node->collection_full_name().collection << " ";
+        stream << "UPDATE " << sql_gen::table_reference(node->collection_full_name(), backend) << " ";
         bool comma = false;
         for (const auto& set : node->updates()) {
             if (comma) {
@@ -617,7 +672,7 @@ namespace {
         if (!node->collection_from().empty()) {
             assert(node->collection_from().unique_identifier.empty() ||
                    node->collection_full_name().unique_identifier == node->collection_from().unique_identifier);
-            stream << " FROM " << node->collection_from().to_string();
+            stream << " FROM " << sql_gen::table_reference(node->collection_from(), backend);
         }
         // WHERE
         if (match) {
@@ -632,7 +687,40 @@ namespace {
 
 namespace sql_gen {
 
-    void generate_values(std::stringstream& stream, const components::vector::data_chunk_t& chunk) {
+    std::string table_reference(const collection_full_name_t& name, backend_type_t backend) {
+        std::stringstream s;
+        if (name.empty()) {
+            spdlog::debug("table_reference: empty name, returning NonCollectionData");
+            return "NonCollectionData";
+        }
+
+        spdlog::debug("table_reference: uid={}, db={}, schema={}, table={}, backend={}",
+                      name.unique_identifier, name.database, name.schema, name.collection,
+                      static_cast<int>(backend));
+
+        switch (backend) {
+            case backend_type_t::PostgreSQL:
+                // PostgreSQL: schema.collection (e.g., public.products)
+                // If schema is empty, use "public" as default
+                if (!name.schema.empty()) {
+                    s << name.schema << "." << name.collection;
+                } else {
+                    s << "public." << name.collection;
+                }
+                break;
+            case backend_type_t::MySQL:
+            case backend_type_t::Unknown:
+            case backend_type_t::Mixed:
+            default:
+                // MySQL: database.collection
+                s << name.database << "." << name.collection;
+                break;
+        }
+        spdlog::debug("table_reference: generated '{}'", s.str());
+        return s.str();
+    }
+
+    void generate_values(std::stringstream& stream, const components::vector::data_chunk_t& chunk, backend_type_t backend) {
         stream << "VALUES ";
         bool comma = false;
         for (size_t i = 0; i < chunk.size(); i++) {
@@ -646,17 +734,17 @@ namespace sql_gen {
                     stream << ", ";
                 }
 
-                stream << chunk.value(j, i);
+                write_logical_value(stream, chunk.value(j, i), backend);
             }
             stream << ")";
             comma = true;
         }
     }
 
-    void generate_query(std::stringstream& stream, const node_ptr& node, const storage_parameters* parameters) {
+    void generate_query(std::stringstream& stream, const node_ptr& node, const storage_parameters* parameters, backend_type_t backend) {
         switch (node->type()) {
             case node_type::aggregate_t:
-                generate_select(stream, reinterpret_cast<const node_aggregate_ptr&>(node), parameters);
+                generate_select(stream, reinterpret_cast<const node_aggregate_ptr&>(node), parameters, backend);
                 break;
             case node_type::create_collection_t:
                 generate_create_collection(stream, reinterpret_cast<const node_create_collection_ptr&>(node));
@@ -668,7 +756,7 @@ namespace sql_gen {
                 generate_create_index(stream, reinterpret_cast<const node_create_index_ptr&>(node));
                 break;
             case node_type::delete_t:
-                generate_delete(stream, reinterpret_cast<const node_delete_ptr&>(node), parameters);
+                generate_delete(stream, reinterpret_cast<const node_delete_ptr&>(node), parameters, backend);
                 break;
             case node_type::drop_collection_t:
                 generate_drop_collection(stream, reinterpret_cast<const node_drop_collection_ptr&>(node));
@@ -680,19 +768,19 @@ namespace sql_gen {
                 generate_drop_index(stream, reinterpret_cast<const node_drop_index_ptr&>(node));
                 break;
             case node_type::insert_t:
-                generate_insert(stream, reinterpret_cast<const node_insert_ptr&>(node), parameters);
+                generate_insert(stream, reinterpret_cast<const node_insert_ptr&>(node), parameters, backend);
                 break;
             case node_type::update_t:
-                generate_update(stream, reinterpret_cast<const node_update_ptr&>(node), parameters);
+                generate_update(stream, reinterpret_cast<const node_update_ptr&>(node), parameters, backend);
                 break;
             default:
                 throw std::logic_error("incorrect node type for generate_query: " + to_string(node->type()));
         }
     }
 
-    std::string generate_query(const node_ptr& node, const storage_parameters* parameters) {
+    std::string generate_query(const node_ptr& node, const storage_parameters* parameters, backend_type_t backend) {
         std::stringstream stream;
-        generate_query(stream, node, parameters);
+        generate_query(stream, node, parameters, backend);
         stream << ";";
         return stream.str();
     }

@@ -2,21 +2,28 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2025-2026  OtterStax
 
+
 """
 Script for generating SQL files with data for database initialization.
-Creates SQL scripts for two databases with campaigns and impressions tables.
+Creates SQL scripts for MariaDB and PostgreSQL databases.
 """
 import os
 import random
-from datetime import date, timedelta
+from pathlib import Path
 from faker import Faker
 
 # Initialize Faker with English locale
 fake = Faker('en_US')
 
-# Create directories for init scripts if they don't exist
-os.makedirs('init/mariadb1', exist_ok=True)
-os.makedirs('init/mariadb2', exist_ok=True)
+# Get the directory where this script is located
+SCRIPT_DIR = Path(__file__).parent.resolve()
+PROJECT_ROOT = SCRIPT_DIR.parent
+
+# Create directories for init scripts (project root - used by docker-compose)
+init_dir = PROJECT_ROOT / 'init'
+(init_dir / 'mariadb1').mkdir(parents=True, exist_ok=True)
+(init_dir / 'mariadb2').mkdir(parents=True, exist_ok=True)
+(init_dir / 'postgres').mkdir(parents=True, exist_ok=True)
 
 # Generation parameters
 NUM_CAMPAIGNS = 500
@@ -104,13 +111,47 @@ VALUES ({impression_id}, {campaign['id']}, '{current_length}', {clicks}, {conver
         impression_id += 1
         current_length += 1
 
-# Write SQL to files
-with open('init/mariadb1/init.sql', 'w') as f:
+# Write SQL to files (project root init directory)
+with open(init_dir / 'mariadb1' / 'init.sql', 'w') as f:
     f.write(campaigns_sql)
 
-with open('init/mariadb2/init.sql', 'w') as f:
+with open(init_dir / 'mariadb2' / 'init.sql', 'w') as f:
     f.write(impressions_sql)
 
 print(f"SQL files successfully generated:")
-print(f"- init/mariadb1/init.sql (campaigns table with {NUM_CAMPAIGNS} campaigns)")
-print(f"- init/mariadb2/init.sql (impressions table with {impression_id - 1} records)")
+print(f"- {init_dir}/mariadb1/init.sql (campaigns table with {NUM_CAMPAIGNS} campaigns)")
+print(f"- {init_dir}/mariadb2/init.sql (impressions table with {impression_id - 1} records)")
+
+# SQL for creating PostgreSQL products table
+postgres_sql = """-- Creating products table for PostgreSQL
+CREATE TABLE IF NOT EXISTS products (
+    product_id SERIAL PRIMARY KEY,
+    campaign_id INT NOT NULL,
+    product_name VARCHAR(255) NOT NULL,
+    price FLOAT NOT NULL,
+    category VARCHAR(100) NOT NULL
+);
+
+-- Inserting product data
+"""
+
+print(f"Generating products for campaigns...")
+product_id = 1
+categories = ['Electronics', 'Clothing', 'Food', 'Home', 'Sports', 'Books', 'Toys', 'Beauty']
+for campaign in campaigns_data:
+    # Each campaign has 2-5 products
+    num_products = random.randint(2, 5)
+    for _ in range(num_products):
+        product_name = f"{fake.word().capitalize()} {fake.word().capitalize()}"
+        price = round(random.uniform(9.99, 499.99), 2)
+        category = random.choice(categories)
+
+        postgres_sql += f"""INSERT INTO products (campaign_id, product_name, price, category)
+VALUES ({campaign['id']}, '{product_name}', {price}, '{category}');\n"""
+        product_id += 1
+
+# Write PostgreSQL SQL
+with open(init_dir / 'postgres' / 'init.sql', 'w') as f:
+    f.write(postgres_sql)
+
+print(f"- {init_dir}/postgres/init.sql (products table with {product_id - 1} records)")

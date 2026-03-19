@@ -1,0 +1,1 @@
+DROP TABLE campaigns.db1.schema.temp_table;

@@ -1,0 +1,1 @@
+UPDATE campaigns.db1.schema.temp_table SET temp_int = temp_int * 1000 WHERE temp_int < 1000;

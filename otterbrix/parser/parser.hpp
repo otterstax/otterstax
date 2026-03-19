@@ -12,7 +12,17 @@
 
 #include <memory_resource>
 #include <string>
+#include <unordered_map>
 #include <vector>
+
+enum class backend_type_t : uint8_t {
+    Unknown = 0,
+    MySQL = 1,
+    PostgreSQL = 2,
+    Mixed = 3,
+    Otterbrix = 4 // No external nodes, but should be executed by otterbrix
+
+};
 
 struct ParsedQueryData {
     explicit ParsedQueryData(OtterbrixStatementPtr otterbrix_params,
@@ -24,6 +34,11 @@ struct ParsedQueryData {
     OtterbrixStatementPtr otterbrix_params;
 
     NodeTag tag;
+
+    backend_type_t backend_type{backend_type_t::Unknown};  // Set by CatalogManager during get_catalog_schema
+
+    // For mixed backend: maps connection UID to its backend type
+    std::unordered_map<std::string, backend_type_t> node_backend_types;
 
 private:
     components::sql::transform::transform_result binder_;

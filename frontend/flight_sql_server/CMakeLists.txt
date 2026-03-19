@@ -18,6 +18,7 @@ target_link_libraries(flight_sql_server PUBLIC
     Boost::boost
     otterbrix::otterbrix
     actor-zeta::actor-zeta
+    PostgreSQL::PostgreSQL
 )
 
 target_include_directories(flight_sql_server PUBLIC

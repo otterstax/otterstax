@@ -103,7 +103,7 @@ actor_zeta::send(
 - `db_conn::` - Database integration actors (Otterbrix/SQL managers)
 
 ### Thread Safety Notes
-- `ConnectorManager::addConnection/removeConnection` is **NOT thread-safe** (see TODOs in `connectors/mysql_manager.hpp:44-45`)
+- `ConnectorManager::addConnection/removeConnection` is **NOT thread-safe** (see TODOs in `connectors/mysql/mysql_manager.hpp:44-45`)
 - `Scheduler` uses `std::mutex data_map_mtx_` for session map access
 - Boost.MySQL connections run on `thread_pool_manager` io_context
 
@@ -116,7 +116,7 @@ actor_zeta::send(
 4. Update senders to use new `handler_id(route::new_route)`
 
 ### Adding External Database Support
-1. Implement `IConnector` interface (see `connectors/mysql_connector.hpp`)
+1. Implement `IConnector` interface (see `connectors/mysql/mysql_connector.hpp`)
 2. Add factory function to `ConnectorManager` constructor
 3. Update `CatalogManager` schema discovery for new DB type
 4. Add translator in `otterbrix/translators/input/` for result conversion
@@ -141,7 +141,7 @@ actor_zeta::send(
 - 3101-3103: MariaDB test instances
 
 ### Known Limitations (from TODOs)
-- No connection pool timeout handling (see `connectors/mysql_connector.hpp:115`)
+- No connection pool timeout handling (see `connectors/mysql/mysql_connector.hpp:115`)
 - Single query per connection limitation (`db_integration/sql/connection_manager.cpp:81`)
 - Array types only support single dimension (`otterbrix/query_generation/sql_query_generator.cpp:70`)
 

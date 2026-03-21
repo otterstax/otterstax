@@ -111,7 +111,7 @@ arrow::Result<std::unique_ptr<arrow::flight::FlightInfo>>
 SimpleFlightSQLServer::GetFlightInfoStatement(const arrow::flight::ServerCallContext& context,
                                               const arrow::flight::sql::StatementQuery& command,
                                               const arrow::flight::FlightDescriptor& descriptor) {
-    Timer timer("GetFlightInfoStatement");
+    Timer timer("GetFlightInfoStatement", log_);
     session_id id;
     const std::string& query = command.query;
     log_->debug("Received query in ticket: {}", query);
@@ -148,7 +148,7 @@ SimpleFlightSQLServer::GetFlightInfoStatement(const arrow::flight::ServerCallCon
 arrow::Result<std::unique_ptr<arrow::flight::FlightDataStream>>
 SimpleFlightSQLServer::DoGetStatement(const arrow::flight::ServerCallContext& context,
                                       const arrow::flight::sql::StatementQueryTicket& command) {
-    Timer timer("DoGetStatement");
+    Timer timer("DoGetStatement", log_);
     // log_->trace("[DOGET] Thread id: {}", std::this_thread::get_id()); // fmt doesn't format thread::id
 
     try {
@@ -205,7 +205,7 @@ arrow::Result<std::unique_ptr<arrow::flight::FlightInfo>>
 SimpleFlightSQLServer::GetFlightInfoTables(const arrow::flight::ServerCallContext& context,
                                            const arrow::flight::sql::GetTables& command,
                                            const arrow::flight::FlightDescriptor& descriptor) {
-    Timer timer("GetFlightInfoTables");
+    Timer timer("GetFlightInfoTables", log_);
     std::vector<arrow::flight::FlightEndpoint> endpoints{{arrow::flight::Ticket{descriptor.cmd}, {}, std::nullopt, ""}};
     auto schema = command.include_schema ? *arrow::flight::sql::SqlSchema::GetTablesSchemaWithIncludedSchema()
                                          : *arrow::flight::sql::SqlSchema::GetTablesSchema();
@@ -217,7 +217,7 @@ SimpleFlightSQLServer::GetFlightInfoTables(const arrow::flight::ServerCallContex
 arrow::Result<std::unique_ptr<arrow::flight::FlightDataStream>>
 SimpleFlightSQLServer::DoGetTables(const arrow::flight::ServerCallContext& context,
                                    const arrow::flight::sql::GetTables& command) {
-    Timer timer("DoGetTables");
+    Timer timer("DoGetTables", log_);
     bool include_schema = command.include_schema;
     arrow::StringBuilder catalog_builder;
     arrow::StringBuilder db_schema_builder;
@@ -281,7 +281,7 @@ SimpleFlightSQLServer::DoGetTables(const arrow::flight::ServerCallContext& conte
 arrow::Result<int64_t>
 SimpleFlightSQLServer::DoPutCommandStatementUpdate(const arrow::flight::ServerCallContext& context,
                                                    const arrow::flight::sql::StatementUpdate& command) {
-    Timer timer("DoPutCommandStatementUpdate");
+    Timer timer("DoPutCommandStatementUpdate", log_);
     try {
         // Log the received ticket, assuming the query is stored in the ticket
         log_->debug("Received query in ticket: {} Id: {}", command.query, command.transaction_id);

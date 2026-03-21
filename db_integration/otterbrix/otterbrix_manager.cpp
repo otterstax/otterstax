@@ -60,7 +60,7 @@ actor_zeta::behavior_t OtterbrixManager::behavior() {
 
 auto OtterbrixManager::execute(session_hash_t id, OtterbrixStatementPtr&& params) -> void {
     try {
-        Timer timer("OtterbrixManager::execute");
+        Timer timer("OtterbrixManager::execute", log_);
 
         log_->trace("execute id hash: {}", id);
 
@@ -78,7 +78,7 @@ auto OtterbrixManager::execute(session_hash_t id, OtterbrixStatementPtr&& params
 auto OtterbrixManager::get_schema(session_hash_t id,
                                   std::pmr::map<collection_full_name_t, size_t> dependencies,
                                   ParsedQueryDataPtr&& data) -> void {
-    Timer timer("OtterbrixManager::get_schema");
+    Timer timer("OtterbrixManager::get_schema", log_);
 
     log_->trace("get_schema id hash: {}", id);
 

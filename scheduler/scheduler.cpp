@@ -140,7 +140,7 @@ auto Scheduler::enqueue_impl(actor_zeta::message_ptr msg, actor_zeta::execution_
 
 auto Scheduler::execute(session_hash_t id, shared_flight_data sdata, std::string sql) -> void {
     try {
-        Timer timer("Scheduler::execute");
+        Timer timer("Scheduler::execute", log_);
         // log_->trace("execute thread: {}, sql: {}, id hash: {}", std::this_thread::get_id(), sql, id);  // fmt v11 doesn't format thread::id
         log_->trace("execute sql: {}, id hash: {}", sql, id);
         register_session(id, sdata); // in case parse() throws
@@ -155,7 +155,7 @@ auto Scheduler::execute(session_hash_t id, shared_flight_data sdata, std::string
 
 void Scheduler::execute_statement(session_hash_t id, shared_flight_data sdata) {
     try {
-        Timer timer("Scheduler::execute_statement");
+        Timer timer("Scheduler::execute_statement", log_);
         // log_->trace("execute_statement thread: {}, Shared data size: {}, id hash: {}",
         //            std::this_thread::get_id(), sdata->result.chunk.size(), id);  // fmt v11 doesn't format thread::id
         log_->trace("execute_statement Shared data size: {}, id hash: {}", sdata->result.chunk.size(), id);
@@ -188,7 +188,7 @@ auto Scheduler::execute_prepared_statement(session_hash_t id,
                                            std::pmr::vector<types::logical_value_t> parameters,
                                            shared_flight_data sdata) -> void {
     try {
-        Timer timer("Scheduler::execute_prepared_statement");
+        Timer timer("Scheduler::execute_prepared_statement", log_);
         register_session(id, sdata);
 
         auto& meta = get_metadata(id);
@@ -213,7 +213,7 @@ auto Scheduler::execute_prepared_statement(session_hash_t id,
 
 auto Scheduler::prepare_schema(session_hash_t id, shared_flight_data sdata, std::string sql) -> void {
     try {
-        Timer timer("Scheduler::prepare_schema");
+        Timer timer("Scheduler::prepare_schema", log_);
         // log_->trace("prepare_schema thread: {}, sql: {}, id hash: {}",
         //            std::this_thread::get_id(), sql, id);  // fmt v11 doesn't format thread::id
         log_->trace("prepare_schema sql: {}, id hash: {}", sql, id);
@@ -261,7 +261,7 @@ void Scheduler::execute_remote_nosql_finish(session_hash_t id, ParsedQueryDataPt
 
 void Scheduler::execute_otterbrix_finish(session_hash_t id, cursor::cursor_t_ptr cursor) {
     try {
-        Timer timer("Scheduler::execute_otterbrix_finish");
+        Timer timer("Scheduler::execute_otterbrix_finish", log_);
 
         log_->trace("Scheduler::execute_otterbrix_finish");
         if (!cursor->is_success()) {

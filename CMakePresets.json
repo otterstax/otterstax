@@ -1,0 +1,28 @@
+{
+    "version": 4,
+    "vendor": {
+        "conan": {}
+    },
+    "include": [
+        "build/Release/generators/CMakePresets.json"
+    ],
+    "buildPresets": [
+        {
+            "name": "conan-release",
+            "jobs": 3,
+            "inherits": "conan-release"
+        },
+        {
+            "name": "conan-release-low-parallel",
+            "displayName": "conan-release (low parallel)",
+            "configurePreset": "conan-release",
+            "jobs": 3
+        }
+    ],
+    "testPresets": [
+        {
+            "name": "conan-release-low-parallel",
+            "configurePreset": "conan-release"
+        }
+    ]
+}

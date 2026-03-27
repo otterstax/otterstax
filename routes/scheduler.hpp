@@ -13,11 +13,12 @@ namespace scheduler {
         execute_prepared_statement,
         prepare_schema,
         execute_remote_sql_finish,
-        execute_remote_nosql_finish,
+        execute_remote_pg_finish,
         execute_otterbrix_finish,
         execute_failed,
         get_catalog_schema_finish,
         get_otterbrix_schema_finish,
+        update_backend_type_finish,
     };
 
     constexpr auto handler_id(route type) { return handler_id(group_id_t::scheduler, type); }

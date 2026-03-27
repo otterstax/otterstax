@@ -187,7 +187,7 @@ namespace frontend::mysql {
     }
 
     void mysql_connection::handle_query(std::string query) {
-        auto shared_data = create_cv_wrapper(flight_data(resource_));
+        auto shared_data = create_cv_wrapper(session_payload(resource_));
         session_id id;
         // todo: one execute() call for simplicity - use computed schema for text_resultset columns
         actor_zeta::send(scheduler_->address(),
@@ -283,7 +283,7 @@ namespace frontend::mysql {
     }
 
     void mysql_connection::handle_prepared_stmt(std::string query) {
-        auto shared_data = create_cv_wrapper(flight_data(resource_));
+        auto shared_data = create_cv_wrapper(session_payload(resource_));
         session_id id;
         actor_zeta::send(scheduler_->address(),
                          scheduler_->address(),
@@ -484,7 +484,7 @@ namespace frontend::mysql {
 
     void mysql_connection::handle_execute_stmt(session_hash_t id,
                                                std::pmr::vector<types::logical_value_t> param_values) {
-        auto shared_data = create_cv_wrapper(flight_data(resource_));
+        auto shared_data = create_cv_wrapper(session_payload(resource_));
         actor_zeta::send(scheduler_->address(),
                          scheduler_->address(),
                          scheduler::handler_id(scheduler::route::execute_prepared_statement),

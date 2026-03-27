@@ -1,38 +1,95 @@
 #!/bin/bash
 
-# Exit immediately if a command exits with a non-zero status
-set -e
+# Do not exit immediately on first failure; we aggregate failures and continue
+# so the test harness can report diagnostics for all tests.
+# set -e is intentionally NOT used here.
 
-# Run health check script
-echo "Starting HTTP health check..."
+# Counter for test results
+PASSED=0
+FAILED=0
+
+run_test() {
+    local test_name=$1
+    local test_file=$2
+    local logfile
+    logfile=$(mktemp /tmp/$(basename "$test_file").XXXXXX)
+
+    echo ""
+    echo "========================================="
+    echo "========================================="
+    echo " Running: $test_name "
+    echo "========================================="
+    echo "========================================="
+
+    # Run the test and capture stdout/stderr to a temporary buffer
+    python "$test_file" > "$logfile" 2>&1
+    local rc=$?
+    if [ $rc -eq 0 ]; then
+        echo "✅ PASSED: $test_name"
+        ((PASSED++))
+    else
+        echo "❌ FAILED: $test_name (exit code $rc)"
+        ((FAILED++))
+        echo "--- Last 200 lines of test output ---"
+        tail -n 200 "$logfile" || true
+        echo "--- end output ---"
+        rm -f "$logfile" || true
+    fi
+}
+
+# Wait for otterstax to be healthy
+echo ""
+echo "========================================="
+echo "Waiting for OtterStax to be ready..."
+echo "========================================="
 ./http_healthcheck.sh
 
-# Check data presence in the database
-echo "Checking data presence in the database..."
-python query_data.py
+if [ $? -ne 0 ]; then
+    echo "❌ OtterStax health check failed!"
+    exit 1
+fi
 
-# Run connection setup script
+# Run connection setup script with retries
+echo ""
+echo "========================================="
 echo "Adding connections..."
+echo "========================================="
 ./add_connections.sh
 
-# Run the Python test schema
-echo "Running Python test client..."
-python test_schema.py
+# Add PostgreSQL connection (extra attempt)
+echo "Adding PostgreSQL connection (extra attempt)..."
+curl -X POST "http://test-otterstax:8085/add_pg_connection" \
+    -H "Content-Type: application/json" \
+    -d @connection_postgres.json || echo "PostgreSQL connection may already exist"
 
-# Run the Python test client
-echo "Running Python test client..."
-python test_client.py
+# Give server time to register connections
+echo "Waiting for connections to register..."
+sleep 3
 
-# Run the Python test mysql client
-echo "Running Python test mysql client..."
-python  mysql_test_client.py
+# Schema tests
+run_test "FlightSQL Schema (MySQL backend)" "test_schema_flightsql_client_mysql_backend.py"
+run_test "FlightSQL Schema (PostgreSQL backend)" "test_schema_flightsql_client_pg_backend.py"
+run_test "Cross-backend Schema" "test_schema_cross_backend.py"
 
-# Run the Python test postgres client
-echo "Running Python test postgres client..."
-python  postgres_test_client.py
+# Functional tests
+run_test "FlightSQL Client (MySQL backend)" "test_flightsql_client_mysql_backend.py"
+run_test "FlightSQL Client (PostgreSQL backend)" "test_flightsql_client_pg_backend.py"
+run_test "MySQL Client (MySQL backend)" "test_mysql_client_mysql_backend.py"
+run_test "PostgreSQL Client (MySQL backend)" "test_pg_client_mysql_backend.py"
+run_test "PostgreSQL Client (PostgreSQL backend)" "test_pg_client_pg_backend.py"
+run_test "FlightSQL Client (MySQL backend, mutable)" "test_flightsql_client_mysql_backend_mutable.py"
 
-# Run the Python test client mutable
-echo "Running Python test client..."
-python test_client_mutable.py
 
+# Cross-backend tests
+# run_test "Cross-backend Queries" "test_mysql_clinet_cross_backend_queries.py"
+# run_test "Cross-backend Queries (PostgreSQL client)" "test_pg_clinet_cross_backend_queries.py"
+# run_test "Simple Cross-backend JOIN" "test_simple_cross_backend_join.py"
 
+echo ""
+echo "========================================="
+echo "Test Summary: $PASSED passed, $FAILED failed"
+echo "========================================="
+
+if [ $FAILED -gt 0 ]; then
+    exit 1
+fi

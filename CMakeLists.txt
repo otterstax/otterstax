@@ -14,9 +14,6 @@ add_compile_definitions(SPDLOG_ACTIVE_LEVEL=${SPDLOG_ACTIVE_LEVEL})
 # Option to build tests
 option(BUILD_TESTS "Build unit tests" OFF)
 
-# Option to build examples
-option(BUILD_EXAMPLES "Build examples" OFF)
-
 # Find the Conan packages
 find_package(Arrow REQUIRED)
 find_package(otterbrix REQUIRED COMPONENTS log)
@@ -29,6 +26,7 @@ find_package(Boost 1.87.0 REQUIRED COMPONENTS
     program_options
     mysql
 )
+find_package(PostgreSQL REQUIRED)
 find_package(Threads)
 
 if(NOT Threads_FOUND)
@@ -111,11 +109,6 @@ target_link_libraries(server
     lib_${PROJECT_NAME}
     otterbrix_log
     )
-
-# Examples
-if(BUILD_EXAMPLES)
-    add_subdirectory(client_example)
-endif()
 
 # Unit tests
 if(BUILD_TESTS)

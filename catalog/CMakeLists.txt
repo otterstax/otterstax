@@ -17,6 +17,7 @@ target_link_libraries(catalog PUBLIC
     otterbrix_log
     actor-zeta::actor-zeta
     arrow::arrow
+    PostgreSQL::PostgreSQL
 )
 
 target_include_directories(catalog PUBLIC

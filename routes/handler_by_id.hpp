@@ -13,8 +13,8 @@ enum class group_id_t : uint8_t
     scheduler = 0,
     catalog_manager,
     sql_connection_manager,
-    nosql_connection_manager,
     otterbrix_manager,
+    pg_connection_manager,
 };
 
 template<class T>

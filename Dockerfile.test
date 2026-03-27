@@ -37,18 +37,18 @@ COPY ./otterbrix ./otterbrix
 COPY ./component_manager ./component_manager
 COPY ./routes ./routes
 COPY ./scheduler ./scheduler
-COPY ./client_example ./client_example
-COPY ./tests ./tests
 COPY ./types ./types
 COPY ./utility ./utility
 COPY ./main.cpp ./main.cpp
 COPY ./CMakeLists.txt ./CMakeLists.txt
+COPY ./tests ./tests
+
 
 WORKDIR /app/build
 
 RUN cmake .. -DCMAKE_TOOLCHAIN_FILE=./build/Release/generators/conan_toolchain.cmake -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=ON && \
-    cmake --build . --target all -- -j $(nproc)
+    cmake --build . --target all -- -j 2
 
-RUN ctest -C Release -V --output-on-failure --timeout 60
+RUN ctest -C Release -V --output-on-failure --timeout 60 -j 2
 
 CMD [ "./server" ]

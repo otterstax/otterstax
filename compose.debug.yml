@@ -1,0 +1,84 @@
+# This docker-compose file is used for debugging purposes. 
+# It sets up multiple database instances (MariaDB and PostgreSQL) to allow 
+# testing and development of the application in a controlled environment. 
+# It doesnt include the application service, it runs separetly.
+# It used debug network to avoid conflicts with the main compose file and allow simultaneous running of both environments.
+services:
+
+  mariadb1:
+    image: mariadb:latest
+    container_name: mariadb_instance1
+    environment:
+      MYSQL_ROOT_PASSWORD: root_password
+      MYSQL_DATABASE: db1
+      MYSQL_USER: user1
+      MYSQL_PASSWORD: password1
+    ports:
+      - "3101:3306"
+    volumes:
+      - ./init/mariadb1:/docker-entrypoint-initdb.d
+      - ./mariadb1_data:/var/lib/mysql
+    networks:
+      - app_network_debug
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mariadb-admin", "ping", "-h", "localhost", "-u", "user1", "-ppassword1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  mariadb2:
+    image: mariadb:latest
+    container_name: mariadb_instance2
+    environment:
+      MYSQL_ROOT_PASSWORD: root_password
+      MYSQL_DATABASE: db2
+      MYSQL_USER: user2
+      MYSQL_PASSWORD: password2
+    ports:
+      - "3102:3306"
+    volumes:
+      - ./init/mariadb2:/docker-entrypoint-initdb.d
+      - ./mariadb2_data:/var/lib/mysql
+    networks:
+      - app_network_debug
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mariadb-admin", "ping", "-h", "localhost", "-u", "user2", "-ppassword2"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  postgres1:
+    image: postgres:15
+    container_name: postgres_instance1
+    environment:
+      POSTGRES_USER: pguser
+      POSTGRES_PASSWORD: pgpassword
+      POSTGRES_DB: pgdb
+    ports:
+      - "3103:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pguser -d pgdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    volumes:
+      - ./init/postgres:/docker-entrypoint-initdb.d
+      - ./postgres_data:/var/lib/postgresql/data
+    networks:
+      - app_network_debug
+    restart: unless-stopped
+
+networks:
+  app_network:
+    external: true
+    name: otterstax_app_network_debug
+
+volumes:
+  mariadb1_data:
+  mariadb2_data:
+  postgres_data:

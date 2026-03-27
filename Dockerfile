@@ -36,7 +36,6 @@ COPY ./otterbrix ./otterbrix
 COPY ./component_manager ./component_manager
 COPY ./routes ./routes
 COPY ./scheduler ./scheduler
-COPY ./client_example ./client_example
 COPY ./types ./types
 COPY ./utility ./utility
 COPY ./main.cpp ./main.cpp
@@ -45,6 +44,6 @@ COPY ./CMakeLists.txt ./CMakeLists.txt
 WORKDIR /app/build
 
 RUN cmake .. -DCMAKE_TOOLCHAIN_FILE=./build/Release/generators/conan_toolchain.cmake -DCMAKE_BUILD_TYPE=Release && \
-    cmake --build . --target all -- -j $(nproc)
+    cmake --build . --target all -- -j 2
 
 CMD [ "./server" ]

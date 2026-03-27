@@ -1,0 +1,4 @@
+SELECT * FROM campaigns.db1.schema.campaigns JOIN
+impressions.db2.schema.impressions ON
+campaigns.campaign_id = impressions.campaign_id AND campaign_length > 80 AND clicks > 200
+WHERE budget > 80000 OR budget < 90000;

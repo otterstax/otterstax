@@ -1,0 +1,1 @@
+DROP INDEX campaigns.db1.schema.temp_table.temp_index;

@@ -10,6 +10,7 @@ namespace catalog_manager {
     enum class route
     {
         get_catalog_schema,
+        update_backend_type,
         add_connection_schema,
         remove_connection_schema,
         get_tables,

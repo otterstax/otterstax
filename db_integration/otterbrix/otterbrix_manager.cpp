@@ -27,6 +27,7 @@ OtterbrixManager::OtterbrixManager(std::pmr::memory_resource* res, std::unique_p
                                             &OtterbrixManager::get_schema))
     , log_(get_logger(logger_tag::OTTERBRIX_MANAGER)) {
     assert(log_.is_valid());
+    log_->info("OtterbrixManager initialized successfully");
     worker_.start(); // Start the worker thread manager
 }
 
@@ -75,7 +76,7 @@ auto OtterbrixManager::execute(session_hash_t id, OtterbrixStatementPtr&& params
     }
 }
 
-auto OtterbrixManager::get_schema(session_hash_t id,
+    auto OtterbrixManager::get_schema(session_hash_t id,
                                   std::pmr::map<collection_full_name_t, size_t> dependencies,
                                   ParsedQueryDataPtr&& data) -> void {
     Timer timer("OtterbrixManager::get_schema", log_);
@@ -119,7 +120,7 @@ auto OtterbrixManager::get_schema(session_hash_t id,
 void OtterbrixManager::send_schema(session_hash_t id,
                                    components::cursor::cursor_t_ptr cursor,
                                    ParsedQueryDataPtr&& data) {
-    auto send_task = [this, id, cursor_data = std::move(cursor), &data]() mutable {
+    std::packaged_task<void()> send_task([this, id, cursor_data = std::move(cursor), data = std::move(data)]() mutable {
         log_->trace("get_schema send task");
         actor_zeta::send(current_message()->sender(),
                          address(),
@@ -127,7 +128,7 @@ void OtterbrixManager::send_schema(session_hash_t id,
                          id,
                          std::move(cursor_data),
                          std::move(data));
-    };
+    });
     if (!worker_.addTask(std::move(send_task))) {
         log_->error("get_schema failed to add task to worker");
     } else {
@@ -136,14 +137,14 @@ void OtterbrixManager::send_schema(session_hash_t id,
 }
 
 void OtterbrixManager::send_result(session_hash_t id, components::cursor::cursor_t_ptr cursor) {
-    auto send_task = [this, id, cursor_data = std::move(cursor)]() mutable {
+    std::packaged_task<void()> send_task([this, id, cursor_data = std::move(cursor)]() mutable {
         log_->trace("execute send task");
         actor_zeta::send(current_message()->sender(),
                          address(),
                          scheduler::handler_id(scheduler::route::execute_otterbrix_finish),
                          id,
                          std::move(cursor_data));
-    };
+    });
     if (!worker_.addTask(std::move(send_task))) {
         log_->error("execute failed to add task to worker");
     } else {
@@ -153,13 +154,13 @@ void OtterbrixManager::send_result(session_hash_t id, components::cursor::cursor
 
 void OtterbrixManager::send_error(session_hash_t id, std::string error_msg) {
     log_->error("execute caught exception: {}", error_msg);
-    auto send_task = [this, id, msg = std::move(error_msg)]() mutable {
+    std::packaged_task<void()> send_task([this, id, msg = std::move(error_msg)]() mutable {
         actor_zeta::send(current_message()->sender(),
                          address(),
                          scheduler::handler_id(scheduler::route::execute_failed),
                          id,
                          std::move(msg));
-    };
+    });
     if (!worker_.addTask(std::move(send_task))) {
         log_->error("execute failed to add task to worker");
     } else {

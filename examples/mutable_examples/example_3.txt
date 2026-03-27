@@ -1,0 +1,2 @@
+INSERT INTO campaigns.db1.schema.temp_table (temp_int)
+VALUES (1), (2), (3), (4);

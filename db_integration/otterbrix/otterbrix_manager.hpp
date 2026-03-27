@@ -45,6 +45,6 @@ namespace db_conn {
         void send_error(session_hash_t id, std::string error_msg);
 
         std::mutex input_mtx_;
-        TaskManager<std::function<void()>> worker_;
+        TaskManager<std::packaged_task<void()>> worker_;
     };
 } // namespace db_conn

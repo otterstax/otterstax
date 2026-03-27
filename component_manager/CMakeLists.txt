@@ -16,6 +16,7 @@ target_link_libraries(component_manager PUBLIC
     actor-zeta::actor-zeta
     otterbrix::otterbrix
     arrow::arrow
+    PostgreSQL::PostgreSQL
 )
 
 target_include_directories(component_manager PUBLIC

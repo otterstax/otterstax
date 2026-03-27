@@ -1,0 +1,9 @@
+{
+    "alias": "impressions",
+    "host": "mariadb2",
+    "port": "3306",
+    "username": "user2",
+    "password": "password2",
+    "database": "db2",
+    "table": ""
+}

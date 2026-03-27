@@ -6,7 +6,7 @@
 #include <actor-zeta.hpp>
 #include <components/log/log.hpp>
 
-#include "connectors/mysql_manager.hpp"
+#include "connectors/mysql/manager.hpp"
 #include "otterbrix/parser/parser.hpp"
 #include "scheduler/schema_utils.hpp"
 #include "utility/session.hpp"
@@ -35,12 +35,12 @@ namespace db_conn {
         log_t log_;
 
         /// async method
-        auto execute(session_hash_t id, ParsedQueryDataPtr&& data) -> void;
+        auto execute(session_hash_t id, ParsedQueryDataPtr&& data, actor_zeta::address_t scheduler) -> void;
 
-        void send_error(session_hash_t id, std::string error_msg);
-        void send_result(session_hash_t id, ParsedQueryDataPtr&& data);
+        void send_error(session_hash_t id, std::string error_msg, actor_zeta::address_t scheduler);
+        void send_result(session_hash_t id, ParsedQueryDataPtr&& data, actor_zeta::address_t scheduler);
 
         std::mutex input_mtx_;
-        TaskManager<std::function<void()>> worker_;
+        TaskManager<std::packaged_task<void()>> worker_;
     };
 } // namespace db_conn

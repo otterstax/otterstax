@@ -1,0 +1,1 @@
+SELECT * FROM campaigns.db1.schema.campaigns WHERE campaign_length > 30;

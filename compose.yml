@@ -18,6 +18,12 @@ services:
     networks:
       - app_network
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mariadb-admin", "ping", "-h", "localhost", "-u", "user1", "-ppassword1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
 
   mariadb2:
     image: mariadb:latest
@@ -35,20 +41,31 @@ services:
     networks:
       - app_network
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mariadb-admin", "ping", "-h", "localhost", "-u", "user2", "-ppassword2"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
 
-  mariadb3:
-    image: mariadb:latest
-    container_name: mariadb_instance3
+  postgres1:
+    image: postgres:15
+    container_name: postgres_instance1
     environment:
-      MYSQL_ROOT_PASSWORD: root_password
-      MYSQL_DATABASE: db2
-      MYSQL_USER: user3
-      MYSQL_PASSWORD: password3
+      POSTGRES_USER: pguser
+      POSTGRES_PASSWORD: pgpassword
+      POSTGRES_DB: pgdb
     ports:
-      - "127.0.0.1:3103:3306"
+      - "3103:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pguser -d pgdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
     volumes:
-      - ./init/mariadb3:/docker-entrypoint-initdb.d
-      - ./mariadb3_data:/var/lib/mysql
+      - ./init/postgres:/docker-entrypoint-initdb.d
+      - ./postgres_data:/var/lib/postgresql/data
     networks:
       - app_network
     restart: unless-stopped
@@ -61,6 +78,7 @@ services:
     depends_on:
       - mariadb1
       - mariadb2
+      - postgres1
     ports:
       - "0.0.0.0:8085:8085"
       - "0.0.0.0:8815:8815"
@@ -77,4 +95,4 @@ networks:
 volumes:
   mariadb1_data:
   mariadb2_data:
-  app_data:
+  postgres_data:

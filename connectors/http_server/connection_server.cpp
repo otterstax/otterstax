@@ -5,6 +5,7 @@
 #include <optional>
 
 #include "connection_config.hpp"
+#include "pg_connection_config.hpp"
 
 namespace {
     std::string get_current_timestamp() {
@@ -37,9 +38,12 @@ namespace {
 } // namespace
 
 namespace http_server {
-    Session::Session(tcp::socket socket, std::shared_ptr<mysqlc::ConnectorManager> conn_manager)
+    Session::Session(tcp::socket socket,
+                     std::shared_ptr<mysqlc::ConnectorManager> mysql_conn_manager,
+                     std::shared_ptr<pgc::ConnectorManager> pg_conn_manager)
         : socket_(std::move(socket))
-        , conn_manager_(std::move(conn_manager)) {}
+        , mysql_conn_manager_(std::move(mysql_conn_manager))
+        , pg_conn_manager_(std::move(pg_conn_manager)) {}
 
     void Session::start() { read_request(); }
 
@@ -82,11 +86,45 @@ namespace http_server {
                     .table = json_body.at("table").as_string().c_str(),
                 };
 
-                conn_manager_->addConnection(params);
+                mysql_conn_manager_->addConnection(params);
 
                 response_.result(http::status::ok);
                 response_.set(http::field::content_type, "application/json");
                 response_.body() = std::string("Connection added");
+                response_.content_length(response_.body().size());
+
+            } catch (const std::exception& e) {
+                response_.result(http::status::bad_request);
+                response_.body() = std::string("ERROR: ") + e.what();
+            }
+        } else if (request_.method() == http::verb::post && request_.target() == "/add_pg_connection") {
+            try {
+                auto json_body = boost::json::parse(request_.body());
+                if (auto err = check_json_body(boost::json::parse(request_.body()).as_object()); err.has_value()) {
+                    response_.result(http::status::bad_request);
+                    response_.body() = std::string("Invalid JSON: ") + err.value();
+                    write_response();
+                    return;
+                }
+                PgConnectionParams params{
+                    .alias = json_body.at("alias").as_string().c_str(),
+                    .host = json_body.at("host").as_string().c_str(),
+                    .port = json_body.at("port").as_string().c_str(),
+                    .username = json_body.at("username").as_string().c_str(),
+                    .password = json_body.at("password").as_string().c_str(),
+                    .database = json_body.at("database").as_string().c_str(),
+                    // schema is optional, defaults to "public"
+                    .schema = json_body.as_object().contains("schema")
+                        ? json_body.at("schema").as_string().c_str()
+                        : "public",
+                    .table = json_body.at("table").as_string().c_str(),
+                };
+
+                pg_conn_manager_->addConnection(params);
+
+                response_.result(http::status::ok);
+                response_.set(http::field::content_type, "application/json");
+                response_.body() = std::string("PostgreSQL connection added");
                 response_.content_length(response_.body().size());
 
             } catch (const std::exception& e) {
@@ -105,7 +143,7 @@ namespace http_server {
                 }
                 std::string alias = json_body.at("alias").as_string().c_str();
 
-                const bool conn_exist = conn_manager_->hasConnection(alias);
+                const bool conn_exist = mysql_conn_manager_->hasConnection(alias);
 
                 if (conn_exist) {
                     response_.result(http::status::ok);
@@ -116,6 +154,35 @@ namespace http_server {
                     response_.result(http::status::ok);
                     response_.set(http::field::content_type, "application/json");
                     response_.body() = std::string("Connection [" + alias + "] not exist exists");
+                    response_.content_length(response_.body().size());
+                }
+            } catch (const std::exception& e) {
+                response_.result(http::status::bad_request);
+                response_.body() = std::string("ERROR: ") + e.what();
+            }
+        } else if (request_.method() == http::verb::get && request_.target() == "/check_pg_connection") {
+            try {
+                auto json_body = boost::json::parse(request_.body());
+                if (!boost::json::parse(request_.body()).as_object().contains("alias")) {
+                    response_.result(http::status::bad_request);
+                    response_.body() = std::string("Missing alias");
+
+                    write_response();
+                    return;
+                }
+                std::string alias = json_body.at("alias").as_string().c_str();
+
+                const bool conn_exist = pg_conn_manager_->hasConnection(alias);
+
+                if (conn_exist) {
+                    response_.result(http::status::ok);
+                    response_.set(http::field::content_type, "application/json");
+                    response_.body() = std::string("PostgreSQL connection [" + alias + "] exists");
+                    response_.content_length(response_.body().size());
+                } else {
+                    response_.result(http::status::ok);
+                    response_.set(http::field::content_type, "application/json");
+                    response_.body() = std::string("PostgreSQL connection [" + alias + "] not exist");
                     response_.content_length(response_.body().size());
                 }
             } catch (const std::exception& e) {
@@ -137,17 +204,20 @@ namespace http_server {
         });
     }
 
-    Server::Server(asio::io_context& ioc, unsigned short port, std::shared_ptr<mysqlc::ConnectorManager> conn_manager)
+    Server::Server(asio::io_context& ioc, unsigned short port,
+                   std::shared_ptr<mysqlc::ConnectorManager> mysql_conn_manager,
+                   std::shared_ptr<pgc::ConnectorManager> pg_conn_manager)
         : ioc_(ioc)
         , acceptor_(ioc, tcp::endpoint(tcp::v4(), port))
-        , conn_manager_(std::move(conn_manager)) {
+        , mysql_conn_manager_(std::move(mysql_conn_manager))
+        , pg_conn_manager_(std::move(pg_conn_manager)) {
         accept();
     }
 
     void Server::accept() {
         acceptor_.async_accept([this](beast::error_code ec, tcp::socket socket) {
             if (!ec)
-                std::make_shared<Session>(std::move(socket), conn_manager_)->start();
+                std::make_shared<Session>(std::move(socket), mysql_conn_manager_, pg_conn_manager_)->start();
             accept();
         });
     }

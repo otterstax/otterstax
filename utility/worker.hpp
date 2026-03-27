@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <future>
 #include <iostream>
 #include <mutex>
 #include <queue>
@@ -31,7 +32,7 @@ public:
     }
     Task enqueueTask() {
         std::unique_lock<std::shared_mutex> lock;
-        auto task = tasks_.front();
+        auto task = std::move(tasks_.front());
         tasks_.pop();
         return task;
     }

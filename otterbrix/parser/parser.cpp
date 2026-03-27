@@ -115,16 +115,22 @@ GreenplumParser::GreenplumParser(std::pmr::memory_resource* resource)
 }
 
 ParsedQueryDataPtr GreenplumParser::parse(const std::string& sql) {
+    std::cerr << "[Parser] Starting parse for: " << sql.substr(0, 100) << std::endl;
     std::pmr::monotonic_buffer_resource arena_resource(resource_);
     sql::transform::transformer transformer(resource_);
+    std::cerr << "[Parser] Calling raw_parser..." << std::endl;
     auto res = linitial(raw_parser(&arena_resource, sql.c_str()));
+    std::cerr << "[Parser] raw_parser complete" << std::endl;
     auto tag = nodeTag(res);
+    std::cerr << "[Parser] Calling transformer.transform..." << std::endl;
     auto binder = transformer.transform(sql::transform::pg_cell_to_node_cast(res));
+    std::cerr << "[Parser] transform complete" << std::endl;
 
     const size_t param_cnt = binder.parameter_count();
     auto node = binder.node_ptr();
     auto params = binder.params_ptr();
 
+    std::cerr << "[Parser] Creating ParsedQueryData..." << std::endl;
     ParsedQueryDataPtr result = std::make_unique<ParsedQueryData>(
         std::make_unique<OtterbrixStatement>(std::vector<std::vector<logical_plan::node_ptr*>>{},
                                              std::move(params),
@@ -134,7 +140,9 @@ ParsedQueryDataPtr GreenplumParser::parse(const std::string& sql) {
         std::move(binder),
         tag);
 
+    std::cerr << "[Parser] Calling get_external_nodes..." << std::endl;
     result->otterbrix_params->external_nodes_count =
         get_external_nodes(resource_, result->otterbrix_params->node, result->otterbrix_params->external_nodes);
+    std::cerr << "[Parser] get_external_nodes complete, count=" << result->otterbrix_params->external_nodes_count << std::endl;
     return result;
 }

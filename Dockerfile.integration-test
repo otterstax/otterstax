@@ -2,7 +2,7 @@ FROM python:3.12-slim-bookworm
 
 WORKDIR /app
 
-# Install system dependencies including libpq for psycopg
+# Install system dependencies including Faker
 RUN apt-get update && apt-get install -y \
     build-essential \
     curl \
@@ -17,17 +17,26 @@ RUN pip install --no-cache-dir \
     "psycopg[binary]" \
     psycopg2-binary \
     tabulate \
-    faker
+    faker \
+    requests
 
 # Copy application files
 COPY ./tests/scripts .
-COPY ./tests/query_data.py .
-COPY ./tests/test_client.py .
-COPY ./tests/test_client_mutable.py .
-COPY ./tests/test_schema.py .
-COPY ./tests/mysql_test_client.py .
-COPY ./tests/postgres_test_client.py .
 COPY ./tests/create_test_data.py .
+COPY ./tests/query_data.py .
+COPY ./tests/test_flightsql_client_mysql_backend.py .
+COPY ./tests/test_flightsql_client_mysql_backend_mutable.py .
+COPY ./tests/test_flightsql_client_pg_backend.py .
+COPY ./tests/test_mysql_client_mysql_backend.py .
+COPY ./tests/test_pg_client_mysql_backend.py .
+COPY ./tests/test_pg_client_pg_backend.py .
+COPY ./tests/test_schema_flightsql_client_mysql_backend.py .
+COPY ./tests/test_schema_flightsql_client_pg_backend.py .
+COPY ./tests/test_schema_cross_backend.py .
+COPY ./tests/test_schema_cross_backend_join.py .
+COPY ./tests/test_mysql_clinet_cross_backend_queries.py .
+COPY ./tests/test_pg_clinet_cross_backend_queries.py .
+COPY ./tests/test_simple_cross_backend_join.py .
 
 RUN chmod +x /app/http_healthcheck.sh
 RUN chmod +x /app/add_connections.sh
@@ -36,3 +45,6 @@ RUN chmod +x /app/startup.sh
 # Create directories where volumes will be mounted
 RUN mkdir -p /app/mariadb1_init
 RUN mkdir -p /app/mariadb2_init
+RUN mkdir -p /app/postgres_init
+
+CMD ["./startup.sh"]

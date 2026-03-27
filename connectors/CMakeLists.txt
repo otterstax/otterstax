@@ -1,12 +1,18 @@
 set(CONNECTORS_HEADERS
-    mysql_connector.hpp
-    mysql_manager.hpp
+    mysql/connector.hpp
+    mysql/manager.hpp
+    postgresql/types.hpp
+    postgresql/connector.hpp
+    postgresql/manager.hpp
     http_server/connection_server.hpp
+    http_server/pg_connection_config.hpp
 )
 
 set(CONNECTORS_SOURCES
-    mysql_connector.cpp
-    mysql_manager.cpp
+    mysql/connector.cpp
+    mysql/manager.cpp
+    postgresql/connector.cpp
+    postgresql/manager.cpp
     http_server/connection_server.cpp
 )
 
@@ -21,6 +27,7 @@ target_link_libraries(connectors PUBLIC
     OpenSSL::SSL
     otterbrix::otterbrix
     actor-zeta::actor-zeta
+    PostgreSQL::PostgreSQL
 )
 
 target_include_directories(connectors PUBLIC

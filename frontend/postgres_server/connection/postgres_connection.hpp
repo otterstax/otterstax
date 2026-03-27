@@ -16,7 +16,7 @@
 
 #include "routes/scheduler.hpp"
 #include "utility/session.hpp"
-#include "utility/shared_flight_data.hpp"
+#include "utility/session_payload.hpp"
 
 #include <actor-zeta.hpp>
 #include <boost/asio.hpp>

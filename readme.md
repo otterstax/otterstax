@@ -3,89 +3,106 @@
 [![Unit Tests](https://github.com/otterstax/otterstax/actions/workflows/unit-tests.yml/badge.svg)](https://github.com/otterstax/otterstax/actions/workflows/unit-tests.yml)
 [![Integration Tests](https://github.com/otterstax/otterstax/actions/workflows/integration-tests.yml/badge.svg)](https://github.com/otterstax/otterstax/actions/workflows/integration-tests.yml)
 
-A high-performance SQL federation server that provides unified access to multiple databases through MySQL, PostgreSQL, and Apache Arrow FlightSQL wire protocols.
+A high-performance SQL federation server that provides unified access to multiple
+databases through MySQL, PostgreSQL, and Apache Arrow FlightSQL wire protocols.
+OtterStax is built on top of the Otterbrix query engine and is docker-friendly
+for easy integration testing and deployment.
 
 ## Features
 
-- **Multi-Protocol Support**: Connect using MySQL, PostgreSQL, or FlightSQL clients
-- **Database Federation**: Query multiple MariaDB/MySQL,PostgreSQL databases through a single endpoint
-- **Otterbrix Integration**: Powered by the Otterbrix query engine
-- **Docker Ready**: Easy deployment with Docker and Docker Compose
+- Multi-protocol support: MySQL, PostgreSQL and FlightSQL
+- Database federation: query multiple MariaDB/MySQL and PostgreSQL backends
+  through a single endpoint
+- Otterbrix integration: powered by the Otterbrix query engine
+- Docker ready: compose files to bring up test databases and the server
 
 ## Architecture
 
-OtterStax runs multiple protocol servers simultaneously:
+OtterStax runs several protocol servers concurrently:
 
-| Protocol   | Default Port | Description                          |
-|------------|--------------|--------------------------------------|
-| FlightSQL  | 8815         | Apache Arrow FlightSQL protocol      |
-| MySQL      | 8816         | MySQL wire protocol                  |
-| PostgreSQL | 8817         | PostgreSQL wire protocol             |
-| HTTP       | 8085         | Connection management REST API       |
+| Protocol   | Default Port | Description |
+|------------|--------------:|-------------|
+| FlightSQL  | 8815          | Apache Arrow FlightSQL protocol |
+| MySQL      | 8816          | MySQL wire protocol |
+| PostgreSQL | 8817          | PostgreSQL wire protocol |
+| HTTP       | 8085          | Connection manager REST API |
 
 ## Requirements
 
-### For Building
-- CMake 3.15+
-- C++20 compatible compiler with coroutine support
-- Conan 2.x package manager
+### Build
 
-### For Running with Docker
-- Docker
-- Docker Compose
+- CMake 3.15+
+- C++20-capable compiler with coroutine support
+- Conan (2.x) package manager
+
+### Runtime (for local testing)
+
+- Docker & Docker Compose
+- Python 3.x (used by clients and test helpers)
 
 ## Quick Start
 
-### Using Docker Compose
+These instructions assume you are in the repository root.
+
+### Using Docker Compose (recommended for integration testing)
 
 1. Generate test data:
-   ```bash
-   python fixtures/generate_data.py
-   ```
 
-2. Start all services:
-   ```bash
-   docker compose up
-   ```
+```bash
+python fixtures/generate_data.py
+```
 
-3. Add database connections:
-   ```bash
-   cd client_example
-   ./example_connection/add_connections_maria_db.sh
-   ```
+2. Start services (databases + server):
 
-4. Run queries using the Python client:
-   ```bash
-   python client.py example_1.txt
-   ```
+```bash
+docker compose up
+```
+
+3. (Optional) Add example database connections used by clients:
+
+```bash
+cd client_example/example_connetion
+./add_connections_maria_db.sh
+```
+
+4. Run example queries using the Python client:
+
+```bash
+python client_example/client.py example_1.txt
+```
 
 ### Building from Source
 
-1. Install Conan and configure the remote:
-   ```bash
-   pip install conan==2.15.0
-   conan profile detect --force
-   conan remote add otterbrix http://conan.otterbrix.com
-   ```
+1. Install and configure Conan (example using a recommended version):
 
-2. Install dependencies:
-   ```bash
-   mkdir build && cd build
-   conan install ../conanfile.py --build missing -s build_type=Release -s compiler.cppstd=gnu17
-   ```
+```bash
+pip install "conan>=2.0"
+conan profile detect --force
+# (optional) add Otterbrix remote if required by your conanfile
+# conan remote add otterbrix http://conan.otterbrix.com
+```
 
-3. Build:
-   ```bash
-   cmake .. -DCMAKE_TOOLCHAIN_FILE=./build/Release/generators/conan_toolchain.cmake -DCMAKE_BUILD_TYPE=Release
-   cmake --build . -- -j $(nproc)
-   ```
+2. Create build directory and install dependencies:
 
-4. Run the server:
-   ```bash
-   ./server --help
-   ```
+```bash
+mkdir -p build && cd build
+conan install ../conanfile.py --build missing -s build_type=Release
+```
 
-## Command Line Options
+3. Configure and build with CMake:
+
+```bash
+cmake -S .. -B . -DCMAKE_BUILD_TYPE=Release
+cmake --build . -- -j$(nproc)
+```
+
+4. Run the server (from the build directory or repo root if configured):
+
+```bash
+./build/server
+```
+
+## Command-line Options
 
 ```
 --host-flight     FlightSQL server host (default: 0.0.0.0)
@@ -97,22 +114,20 @@ OtterStax runs multiple protocol servers simultaneously:
 
 ## Testing
 
-### Run All Tests with Docker
+### Run integration tests (Docker-based)
+
+Make the test runner executable and run it:
 
 ```bash
 chmod +x ./docker-run-tests.sh
 ./docker-run-tests.sh
 ```
 
-This script orchestrates a full integration test cycle:
-1. Cleans up previous state
-2. Creates test data
-3. Starts MariaDB instances
-4. Runs OtterStax server
-5. Executes Python test suite
-6. Cleans up containers
+This script will bring up MariaDB/PostgreSQL containers, generate and load
+test data, start the OtterStax server, run the Python integration tests,
+and then clean up.
 
-### Run Unit Tests Only
+### Unit tests (containerized)
 
 ```bash
 docker build -f Dockerfile.test -t otterstax-test .
@@ -130,11 +145,18 @@ otterstax/
 ├── otterbrix/          # Otterbrix query engine integration
 ├── routes/             # Query routing
 ├── scheduler/          # Query scheduling
-├── tests/              # Unit tests (Catch2)
-├── client_example/     # Python client examples
+├── tests/              # Tests (integration/unit)
+├── client_example/     # Python client and examples
 └── fixtures/           # Test data generation
 ```
 
+## Contributing
+
+Contributions are welcome. Please follow the repository's style and add tests
+for new functionality where appropriate.
+
 ## License
 
-This project is licensed under the Apache License 2.0 - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the Apache License 2.0 — see the [LICENSE](LICENSE)
+file for details.
+

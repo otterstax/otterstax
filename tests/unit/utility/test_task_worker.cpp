@@ -10,10 +10,10 @@
 
 TEST_CASE("worker: base test case") {
     std::atomic<int> c{0};
-    TaskManager<std::function<void()>> tm;
+    TaskManager<std::packaged_task<void()>> tm;
 
-    auto f1 = [&c]() { c++; };
-    auto f2 = [&c]() { c++; };
+    std::packaged_task<void()> f1([&c]() { c++; });
+    std::packaged_task<void()> f2([&c]() { c++; });
     tm.start();
     tm.addTask(std::move(f1));
     tm.addTask(std::move(f2));

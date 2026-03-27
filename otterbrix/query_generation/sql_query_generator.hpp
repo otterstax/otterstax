@@ -9,13 +9,23 @@
 #include <components/types/types.hpp>
 #include <components/vector/data_chunk.hpp>
 
+#include "otterbrix/parser/parser.hpp"  // For BackendType
+
 namespace sql_gen {
 
-    void generate_values(std::stringstream& stream, const components::vector::data_chunk_t& chunk);
+    void generate_values(std::stringstream& stream, const components::vector::data_chunk_t& chunk, backend_type_t backend = backend_type_t::MySQL);
+
+    // Generate table reference string based on backend type
+    // MySQL: database.collection
+    // PostgreSQL: schema.collection (e.g., public.products)
+    std::string table_reference(const collection_full_name_t& name, backend_type_t backend = backend_type_t::MySQL);
+
     void generate_query(std::stringstream& stream,
                         const components::logical_plan::node_ptr& node,
-                        const components::logical_plan::storage_parameters* parameters);
+                        const components::logical_plan::storage_parameters* parameters,
+                        backend_type_t backend = backend_type_t::MySQL);
     std::string generate_query(const components::logical_plan::node_ptr& node,
-                               const components::logical_plan::storage_parameters* parameters);
+                               const components::logical_plan::storage_parameters* parameters,
+                               backend_type_t backend = backend_type_t::MySQL);
 
 } // namespace sql_gen

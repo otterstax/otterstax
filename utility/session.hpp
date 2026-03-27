@@ -7,7 +7,7 @@
 using session_id = components::session::session_id_t;
 using session_hash_t = std::size_t;
 
-enum class session_type : uint8_t
+enum class flightsql_session_type : uint8_t
 {
     GET_FLIGHT_INFO,
     DO_GET,

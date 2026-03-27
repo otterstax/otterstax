@@ -14,7 +14,7 @@
 
 #include "component_manager/component_manager.hpp"
 #include "connectors/http_server/connection_server.hpp"
-#include "connectors/mysql_connector.hpp"
+#include "connectors/mysql/connector.hpp"
 #include "frontend/flight_sql_server/server.hpp"
 #include "frontend/mysql_server/mysql_server.hpp"
 #include "frontend/postgres_server/postgres_server.hpp"
@@ -88,9 +88,11 @@ int main(int argc, char* argv[]) {
     SimpleFlightSQLServer server(config);
 
     // Start the HTTP server in a separate thread
-    std::jthread server_thread([db_connection_manager = std::move(cmanager.db_connection_manager()), http_port]() {
+    std::jthread server_thread([mysql_conn_manager = std::move(cmanager.db_connection_manager()),
+                                pg_conn_manager = std::move(cmanager.pg_connection_manager()),
+                                http_port]() {
         asio::io_context ctx;
-        http_server::Server server(ctx, http_port, db_connection_manager);
+        http_server::Server server(ctx, http_port, mysql_conn_manager, pg_conn_manager);
         spdlog::info("HTTP Server running on port {}...", http_port);
         ctx.run();
     });

@@ -15,7 +15,7 @@
 #include "schema_utils.hpp"
 #include "utility/cv_wrapper.hpp"
 #include "utility/session.hpp"
-#include "utility/shared_flight_data.hpp"
+#include "utility/session_payload.hpp"
 #include "utility/worker.hpp"
 #include <components/catalog/catalog.hpp>
 // #include <core/spinlock/spinlock.hpp>
@@ -30,11 +30,21 @@
 #include <unordered_set>
 #include <vector>
 
+// Forward declarations
+namespace mysqlc {
+    class ConnectorManager;
+    class CatalogManager;
+}
+namespace pgc {
+    class ConnectorManager;
+}
+
 class Scheduler final : public actor_zeta::cooperative_supervisor<Scheduler> {
 public:
     Scheduler(std::pmr::memory_resource* res,
               std::unique_ptr<IParser> parser,
               actor_zeta::address_t sql_connection_manager,
+              actor_zeta::address_t pg_connection_manager,
               actor_zeta::address_t otterbrix_manager,
               actor_zeta::address_t catalog_manager);
 
@@ -50,20 +60,25 @@ private:
         components::types::complex_logical_type schema;
         ParsedQueryDataPtr query_data_ptr;
         NodeTag tag;
+        backend_type_t backend_type{backend_type_t::Unknown};
     };
 
-    std::unordered_map<session_hash_t, shared_flight_data> shared_data_map_;
+
+    std::unordered_map<session_hash_t, shared_session_payload> shared_data_map_;
     log_t log_;
     std::unordered_map<session_hash_t, metadata_t> metadata_map_;
 
-    void register_session(session_hash_t id, shared_flight_data sdata);
+    void register_session(session_hash_t id, shared_session_payload sdata);
     void update_metadata(session_hash_t id, ParsedQueryDataPtr metadata, types::complex_logical_type schema = {});
     void complete_session(session_hash_t id);
-    void complete_session(session_hash_t id, flight_data data, session_type type);
+    void complete_session(session_hash_t id, session_payload data, flightsql_session_type type);
     void complete_session_on_error(session_hash_t id, std::string error_msg);
     ParsedQueryDataPtr get_statement(session_hash_t id);
     const metadata_t& get_metadata(session_hash_t id) const;
     bool session_exists(session_hash_t id) const;
+    shared_session_payload get_session_payload(session_hash_t id) const;
+    void set_backend_type_otterbrix(session_hash_t id);
+    backend_type_t get_backend_type(session_hash_t id) const;
 
 private:
     std::unique_ptr<IParser> parser_;
@@ -73,34 +88,37 @@ private:
     actor_zeta::behavior_t execute_prepared_statement_;
     actor_zeta::behavior_t prepare_schema_;
     actor_zeta::behavior_t execute_remote_sql_finish_;
-    actor_zeta::behavior_t execute_remote_nosql_finish_;
+    actor_zeta::behavior_t execute_remote_pg_finish_;
     actor_zeta::behavior_t execute_otterbrix_finish_;
     actor_zeta::behavior_t execute_failed_;
     actor_zeta::behavior_t get_catalog_schema_finish_;
+    actor_zeta::behavior_t update_backend_type_finish_;
     actor_zeta::behavior_t get_otterbrix_schema_finish_;
 
     /// async method
-    auto execute(session_hash_t id, shared_flight_data sdata, std::string sql) -> void;
-    auto execute_statement(session_hash_t id, shared_flight_data sdata) -> void;
+    auto execute(session_hash_t id, shared_session_payload sdata, std::string sql) -> void;
+    auto execute_statement(session_hash_t id, shared_session_payload sdata) -> void;
     auto execute_prepared_statement(session_hash_t id,
                                     std::pmr::vector<components::types::logical_value_t> parameters,
-                                    shared_flight_data sdata) -> void;
-    auto prepare_schema(session_hash_t id, shared_flight_data sdata, std::string sql) -> void;
+                                    shared_session_payload sdata) -> void;
+    auto prepare_schema(session_hash_t id, shared_session_payload sdata, std::string sql) -> void;
     auto execute_remote_sql_finish(session_hash_t id, ParsedQueryDataPtr&& data) -> void;
-    auto execute_remote_nosql_finish(session_hash_t id, ParsedQueryDataPtr&& data) -> void;
+    auto execute_remote_pg_finish(session_hash_t id, ParsedQueryDataPtr&& data) -> void;
     auto execute_otterbrix_finish(session_hash_t id, components::cursor::cursor_t_ptr cursor) -> void;
     auto execute_failed(session_hash_t id, std::string error_msg) -> void;
     auto get_catalog_schema_finish(session_hash_t id, ParsedQueryDataPtr&& data, catalog::catalog_error err) -> void;
+    auto update_backend_type_finish(session_hash_t id, ParsedQueryDataPtr&& data, catalog::catalog_error err) -> void;
     auto get_otterbrix_schema_finish(session_hash_t id,
                                      components::cursor::cursor_t_ptr cursor,
                                      ParsedQueryDataPtr&& data) -> void;
 
     actor_zeta::address_t sql_connection_manager_;
+    actor_zeta::address_t pg_connection_manager_;
     actor_zeta::address_t otterbrix_manager_;
     actor_zeta::address_t catalog_manager_;
 
     mutable std::mutex data_map_mtx_;
     std::mutex input_mtx_;
 
-    TaskManager<std::function<void()>> worker_;
+    TaskManager<std::packaged_task<void()>> worker_;
 };

@@ -1,0 +1,9 @@
+{
+    "alias": "campaigns",
+    "host": "mariadb1",
+    "port": "3306",
+    "username": "user1",
+    "password": "password1",
+    "database": "db1",
+    "table": ""
+}

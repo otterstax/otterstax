@@ -1,0 +1,58 @@
+%%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#E1F5FE', 'primaryBorderColor': '#0288D1', 'lineColor': '#0288D1', 'textColor': '#000000', 'fontFamily': 'Arial', 'fontSize': '14px' } } }%%
+sequenceDiagram
+    title Complete Request Flow with Error Handling
+
+    participant Client
+    participant Frontend as Frontend Server
+    participant Scheduler
+    participant Catalog as Catalog Manager
+    participant ConnMgr as Connection Manager
+    participant Backend as Database Backend
+
+    Client->>Frontend: Query Request
+    activate Frontend
+
+    Frontend->>Scheduler: execute(session_hash, sql)
+    activate Scheduler
+
+    Scheduler->>Scheduler: parse_query()
+
+    alt Parse Error
+        Scheduler-->>Frontend: error(ParseError)
+        Frontend-->>Client: Error Response
+    else Parse OK
+        Scheduler->>Catalog: get_catalog_schema()
+        activate Catalog
+
+        alt Catalog Error (table not found)
+            Catalog-->>Scheduler: error(TableNotFound)
+            Scheduler-->>Frontend: error(CatalogError)
+            Frontend-->>Client: Error Response
+        else Catalog OK
+            Catalog-->>Scheduler: schema_metadata
+
+            Scheduler->>Scheduler: build_execution_plan
+            Scheduler->>ConnMgr: execute(query)
+            activate ConnMgr
+
+            ConnMgr->>Backend: runQuery(sql)
+            activate Backend
+
+            alt Backend Error
+                Backend-->>ConnMgr: error(DbError)
+                ConnMgr-->>Scheduler: error(ExecutionError)
+                Scheduler-->>Frontend: error(ExecutionError)
+                Frontend-->>Client: Error Response
+            else Backend Success
+                Backend-->>ConnMgr: result_data
+                ConnMgr-->>Scheduler: result_cursor
+                Scheduler-->>Frontend: result_data
+                Frontend-->>Client: Query Result
+            end
+            deactivate Backend
+            deactivate ConnMgr
+        end
+        deactivate Catalog
+    end
+    deactivate Scheduler
+    deactivate Frontend

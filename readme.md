@@ -105,11 +105,8 @@ cmake --build . -- -j$(nproc)
 ## Command-line Options
 
 ```
---host-flight     FlightSQL server host (default: 0.0.0.0)
---port-flight     FlightSQL server port (default: 8815)
---port-mysql      MySQL server port (default: 8816)
---port-postgres   PostgreSQL server port (default: 8817)
---port-http       Connection manager HTTP port (default: 8085)
+--help, -h        Show help message
+--config <path>   Path to configuration file (default: config.yaml)
 ```
 
 ## Testing
@@ -141,6 +138,7 @@ otterstax/
 ├── catalog/            # Metadata catalog
 ├── connectors/         # Database connectors and HTTP server
 ├── component_manager/  # Component lifecycle management
+├── config/             # Configuration loading and runtime settings
 ├── db_integration/     # Database integration layer
 ├── otterbrix/          # Otterbrix query engine integration
 ├── routes/             # Query routing
@@ -159,4 +157,3 @@ for new functionality where appropriate.
 
 This project is licensed under the Apache License 2.0 — see the [LICENSE](LICENSE)
 file for details.
-

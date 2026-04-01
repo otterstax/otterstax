@@ -16,7 +16,7 @@ for easy integration testing and deployment.
 - Otterbrix integration: powered by the Otterbrix query engine
 - Docker ready: compose files to bring up test databases and the server
 
-## Prerequisites
+## Architecture
 
 OtterStax runs several protocol servers concurrently:
 
@@ -40,8 +40,7 @@ OtterStax runs several protocol servers concurrently:
 - Docker & Docker Compose
 - Python 3.x (used by clients and test helpers)
 
-- Python 3.x with `faker` package (for test data generation)
-- Docker and Docker Compose (for containerized testing)
+## Quick Start
 
 These instructions assume you are in the repository root.
 
@@ -72,7 +71,7 @@ cd client_example/example_connetion
 python client_example/client.py example_1.txt
 ```
 
-### Running Natively
+### Building from Source
 
 1. Install and configure Conan (example using a recommended version):
 
@@ -106,11 +105,8 @@ cmake --build . -- -j$(nproc)
 ## Command-line Options
 
 ```
---host-flight     FlightSQL server host (default: 0.0.0.0)
---port-flight     FlightSQL server port (default: 8815)
---port-mysql      MySQL server port (default: 8816)
---port-postgres   PostgreSQL server port (default: 8817)
---port-http       Connection manager HTTP port (default: 8085)
+--help, -h        Show help message
+--config <path>   Path to configuration file (default: config.yaml)
 ```
 
 ## Testing
@@ -120,7 +116,8 @@ cmake --build . -- -j$(nproc)
 Make the test runner executable and run it:
 
 ```bash
-./build/server
+chmod +x ./docker-run-tests.sh
+./docker-run-tests.sh
 ```
 
 This script will bring up MariaDB/PostgreSQL containers, generate and load
@@ -129,12 +126,11 @@ and then clean up.
 
 ### Unit tests (containerized)
 
-### Integration Tests
+```bash
+docker build -f Dockerfile.test -t otterstax-test .
+```
 
-1. Install Python dependencies:
-   ```bash
-   pip install faker
-   ```
+## Project Structure
 
 ```
 otterstax/
@@ -142,6 +138,7 @@ otterstax/
 ├── catalog/            # Metadata catalog
 ├── connectors/         # Database connectors and HTTP server
 ├── component_manager/  # Component lifecycle management
+├── config/             # Configuration loading and runtime settings
 ├── db_integration/     # Database integration layer
 ├── otterbrix/          # Otterbrix query engine integration
 ├── routes/             # Query routing
@@ -160,4 +157,3 @@ for new functionality where appropriate.
 
 This project is licensed under the Apache License 2.0 — see the [LICENSE](LICENSE)
 file for details.
-

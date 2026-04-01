@@ -29,6 +29,7 @@ RUN conan install conanfile.py --build missing -s build_type=Release -s compiler
 
 WORKDIR /app
 COPY ./catalog ./catalog
+COPY ./config ./config
 COPY ./connectors ./connectors
 COPY ./db_integration ./db_integration
 COPY ./frontend/ ./frontend

@@ -1,0 +1,92 @@
+%%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#E1F5FE', 'primaryBorderColor': '#0288D1', 'lineColor': '#0288D1', 'textColor': '#000000', 'fontFamily': 'Arial', 'fontSize': '14px' } } }%%
+sequenceDiagram
+    title FlightSQL SELECT Query Data Flow
+    
+    participant Client
+    participant FlightSQL as FlightSQL Server
+    participant Scheduler
+    participant Catalog as Catalog Manager
+    participant SqlConnMgr as SQL Connection Manager
+    participant PgConnMgr as PG Connection Manager
+    participant Otterbrix as Otterbrix Manager
+    participant MySQL as MySQL Connector
+    participant PostgreSQL as PostgreSQL Connector
+
+    Client->>FlightSQL: GetFlightInfoStatement(sql_query)
+    activate FlightSQL
+    FlightSQL->>Scheduler: execute(session_hash, sql_query)
+    activate Scheduler
+
+    Scheduler->>Scheduler: parse_query(sql_query)
+    Scheduler->>Catalog: get_catalog_schema(session_hash, parsed_data)
+    activate Catalog
+
+    Catalog->>Catalog: resolve_tables/columns
+    Catalog->>SqlConnMgr: get_mysql_schema(uuid)
+    activate SqlConnMgr
+    SqlConnMgr->>MySQL: runQuery("DESCRIBE table")
+    activate MySQL
+    MySQL-->>SqlConnMgr: schema_chunk
+    deactivate MySQL
+    SqlConnMgr-->>Catalog: schema_info
+    deactivate SqlConnMgr
+
+    Catalog->>PgConnMgr: get_pg_schema(uuid)
+    activate PgConnMgr
+    PgConnMgr->>PostgreSQL: runQuery("SELECT FROM information_schema")
+    activate PostgreSQL
+    PostgreSQL-->>PgConnMgr: schema_chunk
+    deactivate PostgreSQL
+    PgConnMgr-->>Catalog: schema_info
+    deactivate PgConnMgr
+
+    Catalog-->>Scheduler: schema_metadata
+    deactivate Catalog
+
+    Scheduler->>Scheduler: build_execution_plan
+
+    alt Cross-backend Query
+        Scheduler->>Otterbrix: execute_plan(plan)
+        activate Otterbrix
+        Otterbrix->>SqlConnMgr: execute_mysql(query)
+        activate SqlConnMgr
+        SqlConnMgr->>MySQL: runQuery(sql)
+        activate MySQL
+        MySQL-->>SqlConnMgr: result_chunk
+        deactivate MySQL
+        SqlConnMgr-->>Otterbrix: data_chunk
+        deactivate SqlConnMgr
+
+        Otterbrix->>PgConnMgr: execute_pg(query)
+        activate PgConnMgr
+        PgConnMgr->>PostgreSQL: runQuery(sql)
+        activate PostgreSQL
+        PostgreSQL-->>PgConnMgr: result_chunk
+        deactivate PostgreSQL
+        PgConnMgr-->>Otterbrix: data_chunk
+        deactivate PgConnMgr
+
+        Otterbrix->>Otterbrix: merge_chunks()
+        Otterbrix-->>Scheduler: merged_cursor
+        deactivate Otterbrix
+    else Single-backend Query
+        Scheduler->>SqlConnMgr: execute(query)
+        activate SqlConnMgr
+        SqlConnMgr->>MySQL: runQuery(sql)
+        activate MySQL
+        MySQL-->>SqlConnMgr: result_chunk
+        deactivate MySQL
+        SqlConnMgr-->>Scheduler: result_cursor
+        deactivate SqlConnMgr
+    end
+
+    Scheduler-->>FlightSQL: FlightInfo(ticket)
+    deactivate Scheduler
+    FlightSQL-->>Client: FlightInfo
+    deactivate FlightSQL
+
+    Client->>FlightSQL: DoGetStatement(ticket)
+    activate FlightSQL
+    FlightSQL->>FlightSQL: read_ticket(ticket)
+    FlightSQL-->>Client: FlightDataStream(arrow_data)
+    deactivate FlightSQL

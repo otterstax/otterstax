@@ -27,6 +27,7 @@ find_package(Boost 1.87.0 REQUIRED COMPONENTS
     mysql
 )
 find_package(PostgreSQL REQUIRED)
+find_package(yaml-cpp REQUIRED)
 find_package(Threads)
 
 if(NOT Threads_FOUND)
@@ -47,6 +48,7 @@ add_subdirectory(frontend)
 add_subdirectory(catalog)
 add_subdirectory(connectors)
 add_subdirectory(component_manager)
+add_subdirectory(config)
 add_subdirectory(db_integration)
 add_subdirectory(otterbrix)
 add_subdirectory(routes)
@@ -85,6 +87,7 @@ target_link_libraries(
     otterbrix_local
     routes
     scheduler
+    config::config
     arrow::arrow
     Boost::boost
     Boost::json

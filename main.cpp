@@ -19,56 +19,11 @@
 #include "frontend/mysql_server/mysql_server.hpp"
 #include "frontend/postgres_server/postgres_server.hpp"
 #include "otterbrix/config.hpp"
+#include "config/config.hpp"
 
 namespace po = boost::program_options;
 
 int main(int argc, char* argv[]) {
-    // Default values
-    std::string flight_host = "0.0.0.0";
-    uint16_t flight_port = 8815;
-    uint16_t mysql_port = 8816;
-    uint16_t postgres_port = 8817;
-    uint16_t http_port = 8085;
-
-    // Define command-line options
-    po::options_description desc("Allowed options");
-    desc.add_options()("help,h", "Show help message")
-    ("host-flight",
-    po::value<std::string>(&flight_host)->default_value(flight_host),
-    "FlightSQL server host")
-    ("port-flight",
-    po::value<uint16_t>(&flight_port)->default_value(flight_port),
-    "FlightSQL server port")
-    ("port-mysql",
-    po::value<uint16_t>(&mysql_port)->default_value(mysql_port),
-    "MySQL server port")
-    ("port-postgres",
-    po::value<uint16_t>(&postgres_port)->default_value(postgres_port),
-    "PostgreSQL server port")
-    ("port-http",
-    po::value<uint16_t>(&http_port)->default_value(http_port),
-    "Connection manager HTTP server port");
-
-    // Parse arguments
-    po::variables_map vm;
-    try {
-        po::store(po::parse_command_line(argc, argv, desc), vm);
-        po::notify(vm);
-    } catch (const std::exception& e) {
-        spdlog::error("Error parsing arguments: {}", e.what());
-        std::ostringstream oss;
-        oss << desc;
-        spdlog::error("{}", oss.str());
-        return 1;
-    }
-
-    // Show help message if requested
-    if (vm.count("help")) {
-        std::ostringstream oss;
-        oss << desc;
-        spdlog::info("{}", oss.str());
-        return 0;
-    }
 
     // Logging
     arrow::util::ArrowLog::StartArrowLog("server", arrow::util::ArrowLogLevel::ARROW_DEBUG);
@@ -76,10 +31,55 @@ int main(int argc, char* argv[]) {
     // Create component manager
     ComponentManager cmanager(make_create_config("/tmp/test_collection_sql/base"));
 
+    auto log = get_logger(logger_tag::Main);
+    log->info("Starting server...");
+    // Load configuration from YAML file
+    std::string config_path = "config.yaml";
+    
+    // Allow overriding config path via command line
+    po::options_description desc("Allowed options");
+    desc.add_options()
+        ("help,h", "Show help message")
+        ("config", po::value<std::string>(&config_path)->default_value(config_path),
+         "Path to configuration file");
+
+    // Parse arguments
+    po::variables_map vm;
+    try {
+        po::store(po::parse_command_line(argc, argv, desc), vm);
+        po::notify(vm);
+    } catch (const std::exception& e) {
+        log->error("Error parsing arguments: {}", e.what());
+        std::ostringstream oss;
+        oss << desc;
+        log->error("{}", oss.str());
+        return 1;
+    }
+
+    // Show help message if requested
+    if (vm.count("help")) {
+        std::ostringstream oss;
+        oss << desc;
+        log->info("{}", oss.str());
+        return 0;
+    }
+
+    // Load server configuration from YAML file
+    config::ServiceConfig server_config;
+    try {
+        config::ConfigReader reader;
+        server_config = reader.load(config_path);
+    } catch (const std::exception& e) {
+        log->error("Failed to load configuration: {}", e.what());
+        return 1;
+    }
+
+
+
     // Configure the Flight SQL server
     Config config{
-        .host = flight_host,
-        .port = flight_port,
+        .host = server_config.flight_sql.host,
+        .port = server_config.flight_sql.port,
         .resource = cmanager.getResource(),
         .catalog_address = cmanager.catalog_address(),
         .scheduler_address = cmanager.scheduler_address(),
@@ -90,44 +90,46 @@ int main(int argc, char* argv[]) {
     // Start the HTTP server in a separate thread
     std::jthread server_thread([mysql_conn_manager = std::move(cmanager.db_connection_manager()),
                                 pg_conn_manager = std::move(cmanager.pg_connection_manager()),
-                                http_port]() {
+                                http_port = server_config.connection_manager.port]() {
         asio::io_context ctx;
         http_server::Server server(ctx, http_port, mysql_conn_manager, pg_conn_manager);
-        spdlog::info("HTTP Server running on port {}...", http_port);
+        auto log = get_logger(logger_tag::Main);
+        log->info("HTTP Server running on port {}...", http_port);
         ctx.run();
     });
 
     // Configure MySQL server
     frontend::frontend_server_config mysql_config{
         .resource = cmanager.getResource(),
-        .port = mysql_port,
+        .port = server_config.mysql.port,
         .scheduler = cmanager.scheduler_address(),
     };
 
     // Start MySQL server
-    spdlog::info("MySQL Server running on port {}...", mysql_config.port);
+    log->info("MySQL Server running on port {}...", mysql_config.port);
     frontend::mysql::mysql_server mysql(mysql_config);
     mysql.start();
 
     // Configure Postgres server
     frontend::frontend_server_config postgres_config{
         .resource = cmanager.getResource(),
-        .port = postgres_port,
+        .port = server_config.postgres.port,
         .scheduler = cmanager.scheduler_address(),
     };
 
     // Start Postgres server
-    spdlog::info("Postgres Server running on port {}...", postgres_config.port);
+    log->info("Postgres Server running on port {}...", postgres_config.port);
     frontend::postgres::postgres_server postgres(postgres_config);
     postgres.start();
 
     // Start the Flight SQL server
     arrow::Status status = server.Start();
     if (!status.ok()) {
-        spdlog::error("Failed to start FlightSQL server: {}", status.ToString());
+        log->error("Failed to start FlightSQL server: {}", status.ToString());
         server_thread.join();
         return -1;
     }
 
     return 0;
 }
+

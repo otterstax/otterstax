@@ -1,0 +1,58 @@
+%%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#E1F5FE', 'primaryBorderColor': '#0288D1', 'lineColor': '#0288D1', 'textColor': '#000000', 'fontFamily': 'Arial', 'fontSize': '14px' } } }%%
+sequenceDiagram
+    title FlightSQL Schema Query Data Flow (GetTables)
+    
+    participant Client
+    participant FlightSQL as FlightSQL Server
+    participant Scheduler
+    participant Catalog as Catalog Manager
+    participant SqlConnMgr as SQL Connection Manager
+    participant PgConnMgr as PG Connection Manager
+    participant MySQL as MySQL Connector
+    participant PostgreSQL as PostgreSQL Connector
+
+    Client->>FlightSQL: GetFlightInfoTables(catalog_pattern, schema_pattern, table_pattern)
+    activate FlightSQL
+
+    FlightSQL->>Scheduler: prepare_schema(session_hash, sql)
+    activate Scheduler
+
+    Scheduler->>Catalog: get_tables(command, shared_data)
+    activate Catalog
+
+    Catalog->>Catalog: filter_by_patterns()
+
+    par Parallel Schema Discovery
+        Catalog->>SqlConnMgr: get_mysql_tables()
+        activate SqlConnMgr
+        SqlConnMgr->>MySQL: runQuery("SHOW TABLES")
+        activate MySQL
+        MySQL-->>SqlConnMgr: table_list
+        deactivate MySQL
+        SqlConnMgr-->>Catalog: mysql_tables
+        deactivate SqlConnMgr
+
+        Catalog->>PgConnMgr: get_pg_tables()
+        activate PgConnMgr
+        PgConnMgr->>PostgreSQL: runQuery("SELECT FROM pg_tables")
+        activate PostgreSQL
+        PostgreSQL-->>PgConnMgr: table_list
+        deactivate PostgreSQL
+        PgConnMgr-->>Catalog: pg_tables
+        deactivate PgConnMgr
+    end
+
+    Catalog->>Catalog: merge_table_info()
+    Catalog-->>Scheduler: tables_metadata
+    deactivate Catalog
+
+    Scheduler-->>FlightSQL: FlightInfo(ticket)
+    deactivate Scheduler
+
+    FlightSQL-->>Client: FlightInfo(tables)
+    deactivate FlightSQL
+
+    Client->>FlightSQL: DoGetTables(ticket)
+    activate FlightSQL
+    FlightSQL-->>Client: FlightDataStream(arrow_schema)
+    deactivate FlightSQL

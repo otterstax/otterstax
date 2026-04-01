@@ -1,0 +1,23 @@
+# SqlFlite Server Configuration File
+# This file contains general server settings for all connectors
+
+general:
+  # Path to the connection configuration file (database connections, credentials, etc.)
+  connection_config_path: ".connections/connection_config.yaml"
+
+flight_sql:
+  # Flight SQL server configuration
+  host: "0.0.0.0"
+  port: 8815
+
+mysql:
+  # MySQL connector server configuration
+  port: 8816
+
+postgres:
+  # PostgreSQL connector server configuration
+  port: 8817
+
+connection_manager:
+  # HTTP Connection Manager server configuration
+  port: 8085

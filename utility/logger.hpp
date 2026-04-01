@@ -26,6 +26,8 @@ namespace logger_tag {
     inline constexpr std::string_view MYSQL_CONNECTION = "MysqlConnection";
     inline constexpr std::string_view POSTGRES_CONNECTION = "PostgresConnection";
     inline constexpr std::string_view SCHEDULER = "Scheduler";
+    inline constexpr std::string_view Main = "Main";
+    inline constexpr std::string_view Config = "Config";
 } // namespace logger_tag
 
 inline log_t get_logger(std::string_view tag) { return get_logger(std::string(tag)); }
@@ -72,7 +74,7 @@ inline void initialize_all_loggers(const std::string& prefix) {
     // Set global default level to match compile-time level
     spdlog::set_level(static_cast<spdlog::level::level_enum>(SPDLOG_ACTIVE_LEVEL));
     
-    static constexpr std::array<std::string_view, 11> all_loggers = {
+    static constexpr std::array<std::string_view, 13> all_loggers = {
         logger_tag::CATALOG_MANAGER,
         logger_tag::CONNECTOR,
         logger_tag::CONNECTOR_MANAGER,
@@ -84,6 +86,8 @@ inline void initialize_all_loggers(const std::string& prefix) {
         logger_tag::MYSQL_CONNECTION,
         logger_tag::POSTGRES_CONNECTION,
         logger_tag::SCHEDULER,
+        logger_tag::Main,
+        logger_tag::Config,
     };
 
     for (auto tag : all_loggers) {

@@ -44,6 +44,7 @@ class OtterStax(ConanFile):
         self.requires("magic_enum/0.8.1")
         self.requires("actor-zeta/1.0.0a12@")
         self.requires("libpq/15.4")
+        self.requires("yaml-cpp/0.7.0")
 
     def config_options(self):
         if self.settings.os == "Windows":

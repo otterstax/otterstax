@@ -134,8 +134,8 @@ namespace {
                 // PostgreSQL requires single quotes for string literals
                 // MySQL accepts both, but single quotes are standard SQL
                 const std::string& str = *value.value<std::string*>();
-                if (backend == backend_type_t::PostgreSQL) {
-                    // For PostgreSQL, use single quotes and escape any single quotes in the string
+                if (backend == backend_type_t::PostgreSQL || backend == backend_type_t::ClickHouse) {
+                    // For PostgreSQL/ClickHouse, use single quotes and escape any single quotes in the string
                     stream << "'";
                     for (char c : str) {
                         if (c == '\'') {
@@ -707,6 +707,10 @@ namespace sql_gen {
                 } else {
                     s << "public." << name.collection;
                 }
+                break;
+            case backend_type_t::ClickHouse:
+                // ClickHouse: database.collection (no schema level)
+                s << name.database << "." << name.collection;
                 break;
             case backend_type_t::MySQL:
             case backend_type_t::Unknown:

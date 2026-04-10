@@ -9,8 +9,7 @@ using namespace components;
 
 namespace pgc {
 
-    std::unique_ptr<pgc::IConnector>
-    make_pg_connector(connect_params params, std::string alias) {
+    std::unique_ptr<pgc::IConnector> make_pg_connector(connect_params params, std::string alias) {
         return std::make_unique<pgc::Connector>(std::move(params), std::move(alias));
     }
 
@@ -41,12 +40,15 @@ namespace pgc {
             // For PostgreSQL: use schema.table format
             // collection_full_name_t(database, schema, collection) -> database.schema, with unique_identifier=uuid
             // We need to store: uuid=alias, database, schema, table
-            collection_full_name_t name(uuid,  // unique_identifier (connection alias)
-                                         connection_param.database,
-                                         connection_param.schema.empty() ? "public" : connection_param.schema,
-                                         connection_param.table);
+            collection_full_name_t name(uuid,
+                                        connection_param.database,
+                                        connection_param.schema.empty() ? "public" : connection_param.schema,
+                                        connection_param.table);
             log_->debug("Creating collection_full_name: uid={}, db={}, schema={}, table={}",
-                        name.unique_identifier, name.database, name.schema, name.collection);
+                        name.unique_identifier,
+                        name.database,
+                        name.schema,
+                        name.collection);
             actor_zeta::send(catalog_manager_->address(),
                              catalog_manager_->address(),
                              catalog_manager::handler_id(catalog_manager::route::add_connection_schema),

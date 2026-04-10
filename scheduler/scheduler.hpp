@@ -45,6 +45,7 @@ public:
               std::unique_ptr<IParser> parser,
               actor_zeta::address_t sql_connection_manager,
               actor_zeta::address_t pg_connection_manager,
+              actor_zeta::address_t ch_connection_manager,
               actor_zeta::address_t otterbrix_manager,
               actor_zeta::address_t catalog_manager);
 
@@ -89,6 +90,7 @@ private:
     actor_zeta::behavior_t prepare_schema_;
     actor_zeta::behavior_t execute_remote_sql_finish_;
     actor_zeta::behavior_t execute_remote_pg_finish_;
+    actor_zeta::behavior_t execute_remote_ch_finish_;
     actor_zeta::behavior_t execute_otterbrix_finish_;
     actor_zeta::behavior_t execute_failed_;
     actor_zeta::behavior_t get_catalog_schema_finish_;
@@ -104,6 +106,7 @@ private:
     auto prepare_schema(session_hash_t id, shared_session_payload sdata, std::string sql) -> void;
     auto execute_remote_sql_finish(session_hash_t id, ParsedQueryDataPtr&& data) -> void;
     auto execute_remote_pg_finish(session_hash_t id, ParsedQueryDataPtr&& data) -> void;
+    auto execute_remote_ch_finish(session_hash_t id, ParsedQueryDataPtr&& data) -> void;
     auto execute_otterbrix_finish(session_hash_t id, components::cursor::cursor_t_ptr cursor) -> void;
     auto execute_failed(session_hash_t id, std::string error_msg) -> void;
     auto get_catalog_schema_finish(session_hash_t id, ParsedQueryDataPtr&& data, catalog::catalog_error err) -> void;
@@ -114,6 +117,7 @@ private:
 
     actor_zeta::address_t sql_connection_manager_;
     actor_zeta::address_t pg_connection_manager_;
+    actor_zeta::address_t ch_connection_manager_;
     actor_zeta::address_t otterbrix_manager_;
     actor_zeta::address_t catalog_manager_;
 

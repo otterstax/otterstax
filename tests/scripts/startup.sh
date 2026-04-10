@@ -62,6 +62,12 @@ curl -X POST "http://test-otterstax:8085/add_pg_connection" \
     -H "Content-Type: application/json" \
     -d @connection_postgres.json || echo "PostgreSQL connection may already exist"
 
+# Add ClickHouse connection (extra attempt)
+echo "Adding ClickHouse connection (extra attempt)..."
+curl -X POST "http://test-otterstax:8085/add_ch_connection" \
+    -H "Content-Type: application/json" \
+    -d @connection_clickhouse.json || echo "ClickHouse connection may already exist"
+
 # Give server time to register connections
 echo "Waiting for connections to register..."
 sleep 3
@@ -69,21 +75,29 @@ sleep 3
 # Schema tests
 run_test "FlightSQL Schema (MySQL backend)" "test_schema_flightsql_client_mysql_backend.py"
 run_test "FlightSQL Schema (PostgreSQL backend)" "test_schema_flightsql_client_pg_backend.py"
+run_test "FlightSQL Schema (ClickHouse backend)" "test_schema_flightsql_client_ch_backend.py"
 run_test "Cross-backend Schema" "test_schema_cross_backend.py"
 
 # Functional tests
 run_test "FlightSQL Client (MySQL backend)" "test_flightsql_client_mysql_backend.py"
 run_test "FlightSQL Client (PostgreSQL backend)" "test_flightsql_client_pg_backend.py"
+run_test "FlightSQL Client (ClickHouse backend)" "test_flightsql_client_ch_backend.py"
 run_test "MySQL Client (MySQL backend)" "test_mysql_client_mysql_backend.py"
 run_test "PostgreSQL Client (MySQL backend)" "test_pg_client_mysql_backend.py"
+run_test "MySQL Client (PostgreSQL backend)" "test_mysql_client_pg_backend.py"
 run_test "PostgreSQL Client (PostgreSQL backend)" "test_pg_client_pg_backend.py"
+run_test "MySQL Client (ClickHouse backend)" "test_mysql_client_ch_backend.py"
+run_test "PostgreSQL Client (ClickHouse backend)" "test_pg_client_ch_backend.py"
 run_test "FlightSQL Client (MySQL backend, mutable)" "test_flightsql_client_mysql_backend_mutable.py"
 
+# Cross-backend JOIN tests
+run_test "Cross-backend Queries (MySQL wire)" "test_cross_backend_queries.py"
+run_test "Cross-backend Queries (PostgreSQL wire)" "test_cross_backend_queries_pg.py"
 
-# Cross-backend tests
-# run_test "Cross-backend Queries" "test_mysql_clinet_cross_backend_queries.py"
-# run_test "Cross-backend Queries (PostgreSQL client)" "test_pg_clinet_cross_backend_queries.py"
-# run_test "Simple Cross-backend JOIN" "test_simple_cross_backend_join.py"
+echo ""
+echo "========================================="
+echo "All tests completed!"
+echo "========================================="
 
 echo ""
 echo "========================================="

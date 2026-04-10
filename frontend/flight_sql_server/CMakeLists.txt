@@ -19,6 +19,7 @@ target_link_libraries(flight_sql_server PUBLIC
     otterbrix::otterbrix
     actor-zeta::actor-zeta
     PostgreSQL::PostgreSQL
+    catalog
 )
 
 target_include_directories(flight_sql_server PUBLIC

@@ -2,12 +2,14 @@ set(DB_INTEGRATION_HEADERS
     otterbrix/otterbrix_manager.hpp
     sql/connection_manager.hpp
     postgresql/connection_manager.hpp
+    clickhouse/connection_manager.hpp
 )
 
 set(DB_INTEGRATION_SOURCES
     otterbrix/otterbrix_manager.cpp
     sql/connection_manager.cpp
     postgresql/connection_manager.cpp
+    clickhouse/connection_manager.cpp
 )
 
 add_library(db_integration
@@ -20,6 +22,7 @@ target_link_libraries(db_integration PUBLIC
     otterbrix::otterbrix
     actor-zeta::actor-zeta
     PostgreSQL::PostgreSQL
+    clickhouse-cpp-lib::clickhouse-cpp-lib
 )
 
 target_include_directories(db_integration PUBLIC

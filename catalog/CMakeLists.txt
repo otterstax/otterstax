@@ -18,6 +18,7 @@ target_link_libraries(catalog PUBLIC
     actor-zeta::actor-zeta
     arrow::arrow
     PostgreSQL::PostgreSQL
+    clickhouse-cpp-lib::clickhouse-cpp-lib
 )
 
 target_include_directories(catalog PUBLIC

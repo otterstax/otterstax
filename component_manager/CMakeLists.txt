@@ -17,6 +17,7 @@ target_link_libraries(component_manager PUBLIC
     otterbrix::otterbrix
     arrow::arrow
     PostgreSQL::PostgreSQL
+    clickhouse-cpp-lib::clickhouse-cpp-lib
 )
 
 target_include_directories(component_manager PUBLIC

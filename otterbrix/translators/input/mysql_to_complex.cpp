@@ -41,9 +41,9 @@ namespace tsl {
                 }
             case boost::mysql::column_type::int_:
                 if (is_unsigned) {
-                    return {logical_type::UBIGINT};
+                    return {logical_type::UINTEGER};
                 } else {
-                    return {logical_type::BIGINT};
+                    return {logical_type::INTEGER};
                 }
             case boost::mysql::column_type::float_:
                 return {logical_type::FLOAT};

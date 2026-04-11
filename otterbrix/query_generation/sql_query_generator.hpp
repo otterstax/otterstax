@@ -3,7 +3,6 @@
 
 #pragma once
 
-#include <components/document/document.hpp>
 #include <components/logical_plan/node.hpp>
 #include <components/logical_plan/param_storage.hpp>
 #include <components/types/types.hpp>

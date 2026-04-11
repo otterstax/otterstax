@@ -35,7 +35,6 @@ COPY ./db_integration ./db_integration
 COPY ./frontend/ ./frontend
 COPY ./otterbrix ./otterbrix
 COPY ./component_manager ./component_manager
-COPY ./routes ./routes
 COPY ./scheduler ./scheduler
 COPY ./types ./types
 COPY ./utility ./utility

@@ -72,8 +72,7 @@ namespace frontend::postgres {
         auto shared_data = create_cv_wrapper(session_payload(resource_));
         session_id id;
         actor_zeta::send(scheduler_->address(),
-                         scheduler_->address(),
-                         scheduler::handler_id(scheduler::route::execute),
+                         &Scheduler::execute,
                          id.hash(),
                          shared_data,
                          query);
@@ -197,8 +196,7 @@ namespace frontend::postgres {
         auto shared_data = create_cv_wrapper(session_payload(resource_));
         session_id id;
         actor_zeta::send(scheduler_->address(),
-                         scheduler_->address(),
-                         scheduler::handler_id(scheduler::route::prepare_schema),
+                         &Scheduler::prepare_schema,
                          id.hash(),
                          shared_data,
                          query);
@@ -446,8 +444,7 @@ namespace frontend::postgres {
         auto& stmt = portal_meta.statement.get();
         auto shared_data = create_cv_wrapper(session_payload(resource_));
         actor_zeta::send(scheduler_->address(),
-                         scheduler_->address(),
-                         scheduler::handler_id(scheduler::route::execute_prepared_statement),
+                         &Scheduler::execute_prepared_statement,
                          stmt.stmt_session,
                          portal_meta.portal,
                          shared_data);

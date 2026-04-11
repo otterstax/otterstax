@@ -43,8 +43,7 @@ namespace mysqlc {
 
             collection_full_name_t name(connection_param.database, uuid, uuid); // treat uuid as schema
             actor_zeta::send(catalog_manager_->address(),
-                             catalog_manager_->address(),
-                             catalog_manager::handler_id(catalog_manager::route::add_connection_schema),
+                             &mysqlc::CatalogManager::add_connection_schema,
                              std::move(name));
             return uuid;
         } catch (const boost::mysql::error_with_diagnostics& e) {
@@ -89,8 +88,7 @@ namespace mysqlc {
         conn->second->close();
         connections_.erase(uuid);
         actor_zeta::send(catalog_manager_->address(),
-                         catalog_manager_->address(),
-                         catalog_manager::handler_id(catalog_manager::route::remove_connection_schema),
+                         &mysqlc::CatalogManager::remove_connection_schema,
                          uuid);
     }
 

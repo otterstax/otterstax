@@ -12,7 +12,8 @@
 #include "utility/logger.hpp"
 
 #include "otterbrix/config.hpp"
-#include "routes/scheduler.hpp"
+#include "scheduler/scheduler.hpp"
+#include "catalog/catalog_manager.hpp"
 
 #include "../../utility/cv_wrapper.hpp"
 #include "../../utility/session.hpp"
@@ -124,8 +125,7 @@ SimpleFlightSQLServer::GetFlightInfoStatement(const arrow::flight::ServerCallCon
     auto shared_data = create_cv_wrapper(session_payload(resource_));
     log_->debug("[GetFlightInfoStatement] Sending to scheduler...");
     actor_zeta::send(scheduler_address_,
-                     scheduler_address_,
-                     scheduler::handler_id(scheduler::route::prepare_schema),
+                     &Scheduler::prepare_schema,
                      id.hash(),
                      shared_data,
                      query);
@@ -167,8 +167,7 @@ SimpleFlightSQLServer::DoGetStatement(const arrow::flight::ServerCallContext& co
                     transaction_id);
         auto shared_data = create_cv_wrapper(session_payload(resource_));
         actor_zeta::send(scheduler_address_,
-                         scheduler_address_,
-                         scheduler::handler_id(scheduler::route::execute_statement),
+                         &Scheduler::execute_statement,
                          session_hash,
                          shared_data);
         shared_data->wait_for(cv_wrapper::DEFAULT_TIMEOUT);
@@ -236,8 +235,7 @@ SimpleFlightSQLServer::DoGetTables(const arrow::flight::ServerCallContext& conte
 
     auto shared_data = create_cv_wrapper(std::pmr::vector<table_info>(resource_));
     actor_zeta::send(catalog_address_,
-                     catalog_address_,
-                     catalog_manager::handler_id(catalog_manager::route::get_tables),
+                     &mysqlc::CatalogManager::get_tables,
                      command,
                      shared_data);
     shared_data->wait_for(cv_wrapper::DEFAULT_TIMEOUT);
@@ -293,8 +291,7 @@ SimpleFlightSQLServer::DoPutCommandStatementUpdate(const arrow::flight::ServerCa
         auto shared_data = create_cv_wrapper(session_payload(resource_));
         session_id id;
         actor_zeta::send(scheduler_address_,
-                         scheduler_address_,
-                         scheduler::handler_id(scheduler::route::execute),
+                         &Scheduler::execute,
                          id.hash(),
                          shared_data,
                          command.query);

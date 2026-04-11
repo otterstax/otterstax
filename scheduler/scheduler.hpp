@@ -11,14 +11,12 @@
 #include "otterbrix/query_generation/sql_query_generator.hpp"
 #include "otterbrix/translators/input/mysql_to_chunk.hpp"
 #include "otterbrix/translators/output/chunk_to_arrow.hpp"
-#include "routes/catalog_manager.hpp"
 #include "schema_utils.hpp"
 #include "utility/cv_wrapper.hpp"
+#include "utility/pipeline_error.hpp"
 #include "utility/session.hpp"
 #include "utility/session_payload.hpp"
-#include "utility/worker.hpp"
 #include <components/catalog/catalog.hpp>
-// #include <core/spinlock/spinlock.hpp>
 
 #include <condition_variable>
 #include <iostream>
@@ -38,8 +36,13 @@ namespace mysqlc {
 namespace pgc {
     class ConnectorManager;
 }
+namespace db_conn {
+    class SqlConnectionManager;
+    class PgConnectionManager;
+    class OtterbrixManager;
+}
 
-class Scheduler final : public actor_zeta::cooperative_supervisor<Scheduler> {
+class Scheduler final : public actor_zeta::actor::actor_mixin<Scheduler> {
 public:
     Scheduler(std::pmr::memory_resource* res,
               std::unique_ptr<IParser> parser,
@@ -48,12 +51,18 @@ public:
               actor_zeta::address_t otterbrix_manager,
               actor_zeta::address_t catalog_manager);
 
-    actor_zeta::behavior_t behavior();
-    auto make_scheduler() noexcept -> actor_zeta::scheduler_abstract_t*;
-    auto make_type() const noexcept -> const char* const;
+    std::pmr::memory_resource* resource() const noexcept { return resource_; }
 
-protected:
-    auto enqueue_impl(actor_zeta::message_ptr msg, actor_zeta::execution_unit*) -> void final;
+    using dispatch_traits = actor_zeta::dispatch_traits<
+        &Scheduler::execute,
+        &Scheduler::execute_statement,
+        &Scheduler::execute_prepared_statement,
+        &Scheduler::prepare_schema>;
+
+    actor_zeta::behavior_t behavior(actor_zeta::mailbox::message* msg);
+
+    std::pair<bool, actor_zeta::detail::enqueue_result>
+    enqueue_impl(actor_zeta::mailbox::message_ptr msg);
 
 private:
     struct metadata_t {
@@ -63,11 +72,23 @@ private:
         backend_type_t backend_type{backend_type_t::Unknown};
     };
 
-
+    std::pmr::memory_resource* resource_;
     std::unordered_map<session_hash_t, shared_session_payload> shared_data_map_;
     log_t log_;
     std::unordered_map<session_hash_t, metadata_t> metadata_map_;
 
+    /// entry-point handler coroutines
+    actor_zeta::unique_future<void> execute(session_hash_t id, shared_session_payload sdata, std::string sql);
+    actor_zeta::unique_future<void> execute_statement(session_hash_t id, shared_session_payload sdata);
+    actor_zeta::unique_future<void> execute_prepared_statement(session_hash_t id,
+                                    std::pmr::vector<components::types::logical_value_t> parameters,
+                                    shared_session_payload sdata);
+    actor_zeta::unique_future<void> prepare_schema(session_hash_t id, shared_session_payload sdata, std::string sql);
+
+    /// helper (extracted from old get_otterbrix_schema_finish)
+    void finish_schema(session_hash_t id, components::cursor::cursor_t_ptr cursor, ParsedQueryDataPtr data);
+
+    /// session management (unchanged)
     void register_session(session_hash_t id, shared_session_payload sdata);
     void update_metadata(session_hash_t id, ParsedQueryDataPtr metadata, types::complex_logical_type schema = {});
     void complete_session(session_hash_t id);
@@ -80,45 +101,13 @@ private:
     void set_backend_type_otterbrix(session_hash_t id);
     backend_type_t get_backend_type(session_hash_t id) const;
 
-private:
     std::unique_ptr<IParser> parser_;
-    // Behaviors
-    actor_zeta::behavior_t execute_;
-    actor_zeta::behavior_t execute_statement_;
-    actor_zeta::behavior_t execute_prepared_statement_;
-    actor_zeta::behavior_t prepare_schema_;
-    actor_zeta::behavior_t execute_remote_sql_finish_;
-    actor_zeta::behavior_t execute_remote_pg_finish_;
-    actor_zeta::behavior_t execute_otterbrix_finish_;
-    actor_zeta::behavior_t execute_failed_;
-    actor_zeta::behavior_t get_catalog_schema_finish_;
-    actor_zeta::behavior_t update_backend_type_finish_;
-    actor_zeta::behavior_t get_otterbrix_schema_finish_;
-
-    /// async method
-    auto execute(session_hash_t id, shared_session_payload sdata, std::string sql) -> void;
-    auto execute_statement(session_hash_t id, shared_session_payload sdata) -> void;
-    auto execute_prepared_statement(session_hash_t id,
-                                    std::pmr::vector<components::types::logical_value_t> parameters,
-                                    shared_session_payload sdata) -> void;
-    auto prepare_schema(session_hash_t id, shared_session_payload sdata, std::string sql) -> void;
-    auto execute_remote_sql_finish(session_hash_t id, ParsedQueryDataPtr&& data) -> void;
-    auto execute_remote_pg_finish(session_hash_t id, ParsedQueryDataPtr&& data) -> void;
-    auto execute_otterbrix_finish(session_hash_t id, components::cursor::cursor_t_ptr cursor) -> void;
-    auto execute_failed(session_hash_t id, std::string error_msg) -> void;
-    auto get_catalog_schema_finish(session_hash_t id, ParsedQueryDataPtr&& data, catalog::catalog_error err) -> void;
-    auto update_backend_type_finish(session_hash_t id, ParsedQueryDataPtr&& data, catalog::catalog_error err) -> void;
-    auto get_otterbrix_schema_finish(session_hash_t id,
-                                     components::cursor::cursor_t_ptr cursor,
-                                     ParsedQueryDataPtr&& data) -> void;
-
     actor_zeta::address_t sql_connection_manager_;
     actor_zeta::address_t pg_connection_manager_;
     actor_zeta::address_t otterbrix_manager_;
     actor_zeta::address_t catalog_manager_;
 
     mutable std::mutex data_map_mtx_;
-    std::mutex input_mtx_;
-
-    TaskManager<std::packaged_task<void()>> worker_;
+    std::mutex mutex_;
+    actor_zeta::behavior_t current_behavior_;
 };

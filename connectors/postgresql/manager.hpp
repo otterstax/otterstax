@@ -19,7 +19,7 @@
 #include <unordered_map>
 
 #include "connectors/http_server/pg_connection_config.hpp"
-#include "routes/catalog_manager.hpp"
+#include "catalog/catalog_manager.hpp"
 #include "utility/cv_wrapper.hpp"
 #include "utility/thread_pool_manager.hpp"
 
@@ -66,8 +66,7 @@ namespace pgc {
                     conn->second->tryReconnect();
                 } catch (const std::exception& e) {
                     actor_zeta::send(catalog_manager_->address(),
-                                     catalog_manager_->address(),
-                                     catalog_manager::handler_id(catalog_manager::route::remove_connection_schema),
+                                     &mysqlc::CatalogManager::remove_connection_schema,
                                      uuid);
                     throw std::runtime_error("Failed to reconnect. Error message: " + std::string(e.what()));
                 }

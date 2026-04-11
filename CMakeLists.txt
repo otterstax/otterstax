@@ -51,13 +51,14 @@ add_subdirectory(component_manager)
 add_subdirectory(config)
 add_subdirectory(db_integration)
 add_subdirectory(otterbrix)
-add_subdirectory(routes)
 add_subdirectory(scheduler)
 
 set(${PROJECT_NAME}_HEADERS
 
         utility/timer.hpp
         utility/cv_wrapper.hpp
+        utility/result.hpp
+        utility/pipeline_error.hpp
 
         types/otterbrix.hpp
 )
@@ -85,7 +86,6 @@ target_link_libraries(
     component_manager
     db_integration
     otterbrix_local
-    routes
     scheduler
     config::config
     arrow::arrow

@@ -14,7 +14,7 @@
 #include "pipeline_state.hpp"
 #include "transaction_manager.hpp"
 
-#include "routes/scheduler.hpp"
+#include "scheduler/scheduler.hpp"
 #include "utility/session.hpp"
 #include "utility/session_payload.hpp"
 

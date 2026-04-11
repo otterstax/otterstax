@@ -3,7 +3,6 @@ project(test_utils)
 set(${PROJECT_NAME}_SOURCES
     main.cpp
     test_cv_wrapper.cpp
-    test_task_worker.cpp
     test_session.cpp
 )
 

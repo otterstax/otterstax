@@ -48,8 +48,7 @@ namespace pgc {
             log_->debug("Creating collection_full_name: uid={}, db={}, schema={}, table={}",
                         name.unique_identifier, name.database, name.schema, name.collection);
             actor_zeta::send(catalog_manager_->address(),
-                             catalog_manager_->address(),
-                             catalog_manager::handler_id(catalog_manager::route::add_connection_schema),
+                             &mysqlc::CatalogManager::add_connection_schema,
                              std::move(name));
             return uuid;
         } catch (const std::exception& e) {
@@ -92,8 +91,7 @@ namespace pgc {
         conn->second->close();
         connections_.erase(uuid);
         actor_zeta::send(catalog_manager_->address(),
-                         catalog_manager_->address(),
-                         catalog_manager::handler_id(catalog_manager::route::remove_connection_schema),
+                         &mysqlc::CatalogManager::remove_connection_schema,
                          uuid);
     }
 

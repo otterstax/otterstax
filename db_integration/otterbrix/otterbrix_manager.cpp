@@ -3,8 +3,6 @@
 
 #include "otterbrix_manager.hpp"
 
-#include "routes/otterbrix_manager.hpp"
-#include "routes/scheduler.hpp"
 #include "scheduler/schema_utils.hpp"
 #include "utility/timer.hpp"
 #include "utility/logger.hpp"
@@ -13,53 +11,49 @@
 #include <thread>
 
 using namespace db_conn;
+using otterstax::pipeline_error;
+using otterstax::error_code_t;
+using otterstax::error_tag_t;
 
 OtterbrixManager::OtterbrixManager(std::pmr::memory_resource* res, std::unique_ptr<IDataManager> data_manager)
-    : actor_zeta::cooperative_supervisor<OtterbrixManager>(res)
+    : resource_(res)
     , data_manager_(std::move(data_manager))
-    , execute_(actor_zeta::make_behavior(resource(),
-                                         otterbrix_manager::handler_id(otterbrix_manager::route::execute),
-                                         this,
-                                         &OtterbrixManager::execute))
-    , get_schema_(actor_zeta::make_behavior(resource(),
-                                            otterbrix_manager::handler_id(otterbrix_manager::route::get_schema),
-                                            this,
-                                            &OtterbrixManager::get_schema))
     , log_(get_logger(logger_tag::OTTERBRIX_MANAGER)) {
     assert(log_.is_valid());
+    assert(res != nullptr);
     log_->info("OtterbrixManager initialized successfully");
-    worker_.start(); // Start the worker thread manager
 }
 
-auto OtterbrixManager::make_scheduler() noexcept -> actor_zeta::scheduler_abstract_t* {
-    assert("OtterbrixManager::make_scheduler");
-    return nullptr; // This should be implemented to return a valid scheduler
-}
+std::pair<bool, actor_zeta::detail::enqueue_result>
+OtterbrixManager::enqueue_impl(actor_zeta::mailbox::message_ptr msg) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    current_behavior_ = behavior(msg.get());
 
-auto OtterbrixManager::make_type() const noexcept -> const char* const { return "OtterbrixManager"; }
-
-auto OtterbrixManager::enqueue_impl(actor_zeta::message_ptr msg, actor_zeta::execution_unit*) -> void {
-    std::unique_lock<std::mutex> _(input_mtx_);
-    set_current_message(std::move(msg));
-    behavior()(current_message());
-}
-
-actor_zeta::behavior_t OtterbrixManager::behavior() {
-    return actor_zeta::make_behavior(resource(), [this](actor_zeta::message* msg) -> void {
-        switch (msg->command()) {
-            case otterbrix_manager::handler_id(otterbrix_manager::route::execute): {
-                execute_(msg);
-                break;
+    while (current_behavior_.is_busy()) {
+        if (current_behavior_.is_awaited_ready()) {
+            auto cont = current_behavior_.take_awaited_continuation();
+            if (cont) {
+                cont.resume();
             }
-            case otterbrix_manager::handler_id(otterbrix_manager::route::get_schema): {
-                get_schema_(msg);
-                break;
-            }
+        } else {
+            std::this_thread::yield();
         }
-    });
+    }
+
+    return {false, actor_zeta::detail::enqueue_result::success};
 }
 
-auto OtterbrixManager::execute(session_hash_t id, OtterbrixStatementPtr&& params) -> void {
+actor_zeta::behavior_t OtterbrixManager::behavior(actor_zeta::mailbox::message* msg) {
+    auto cmd = msg->command();
+    if (cmd == actor_zeta::msg_id<OtterbrixManager, &OtterbrixManager::execute>) {
+        co_await actor_zeta::dispatch(this, &OtterbrixManager::execute, msg);
+    } else if (cmd == actor_zeta::msg_id<OtterbrixManager, &OtterbrixManager::get_schema>) {
+        co_await actor_zeta::dispatch(this, &OtterbrixManager::get_schema, msg);
+    }
+}
+
+actor_zeta::unique_future<components::cursor::cursor_t_ptr>
+OtterbrixManager::execute(session_hash_t id, OtterbrixStatementPtr params) {
     try {
         Timer timer("OtterbrixManager::execute", log_);
 
@@ -67,25 +61,26 @@ auto OtterbrixManager::execute(session_hash_t id, OtterbrixStatementPtr&& params
 
         auto cursor_data = this->data_manager_->execute_plan(params);
         log_->trace("execute: execute_plan done");
-        send_result(id, std::move(cursor_data));
         log_->trace("execute finish");
+        co_return std::move(cursor_data);
     } catch (const std::exception& e) {
-        send_error(id, e.what());
+        log_->error("execute caught exception: {}", e.what());
+        co_return cursor::make_cursor(resource(), cursor::error_code_t::other_error, e.what());
     } catch (...) {
-        send_error(id, "OtterbrixManager::execute caught unknown exception");
+        log_->error("execute caught unknown exception");
+        co_return cursor::make_cursor(resource(), cursor::error_code_t::other_error,
+                                      "OtterbrixManager::execute caught unknown exception");
     }
 }
 
-    auto OtterbrixManager::get_schema(session_hash_t id,
-                                  std::pmr::map<collection_full_name_t, size_t> dependencies,
-                                  ParsedQueryDataPtr&& data) -> void {
+actor_zeta::unique_future<otterstax::result<std::pair<components::cursor::cursor_t_ptr, ParsedQueryDataPtr>>>
+OtterbrixManager::get_schema(session_hash_t id,
+                             std::pmr::map<collection_full_name_t, size_t> dependencies,
+                             ParsedQueryDataPtr data) {
     Timer timer("OtterbrixManager::get_schema", log_);
 
     log_->trace("get_schema id hash: {}", id);
 
-    // we finally have everything to compute schema
-    // joins - resulting schema does not depend on type of join - it's always union of aggregated fields
-    // (nullability does depend on join type, however, all fields are nullable in arrow::schema by default)
     OtterbrixSchemaParams params(resource());
     params.reserve(dependencies.size());
 
@@ -94,8 +89,7 @@ auto OtterbrixManager::execute(session_hash_t id, OtterbrixStatementPtr&& params
     }
 
     if (data->otterbrix_params->node->type() != logical_plan::node_type::aggregate_t) {
-        send_schema(id, cursor::make_cursor(resource()), std::move(data));
-        return;
+        co_return std::make_pair(cursor::make_cursor(resource()), std::move(data));
     }
 
     auto cursor_data = cursor::make_cursor(resource());
@@ -103,8 +97,7 @@ auto OtterbrixManager::execute(session_hash_t id, OtterbrixStatementPtr&& params
         cursor_data = this->data_manager_->get_schema(params);
         log_->trace("get_schema: get_schema done");
         if (cursor_data->is_error()) {
-            send_schema(id, std::move(cursor_data), std::move(data));
-            return;
+            co_return std::make_pair(std::move(cursor_data), std::move(data));
         }
     }
 
@@ -113,57 +106,7 @@ auto OtterbrixManager::execute(session_hash_t id, OtterbrixStatementPtr&& params
         data->otterbrix_params->params_node.get(),
         std::move(cursor_data),
         std::move(dependencies));
-    send_schema(id, std::move(schema), std::move(data));
+
     log_->trace("get_schema finish");
-}
-
-void OtterbrixManager::send_schema(session_hash_t id,
-                                   components::cursor::cursor_t_ptr cursor,
-                                   ParsedQueryDataPtr&& data) {
-    std::packaged_task<void()> send_task([this, id, cursor_data = std::move(cursor), data = std::move(data)]() mutable {
-        log_->trace("get_schema send task");
-        actor_zeta::send(current_message()->sender(),
-                         address(),
-                         scheduler::handler_id(scheduler::route::get_otterbrix_schema_finish),
-                         id,
-                         std::move(cursor_data),
-                         std::move(data));
-    });
-    if (!worker_.addTask(std::move(send_task))) {
-        log_->error("get_schema failed to add task to worker");
-    } else {
-        log_->trace("get_schema added task to worker");
-    }
-}
-
-void OtterbrixManager::send_result(session_hash_t id, components::cursor::cursor_t_ptr cursor) {
-    std::packaged_task<void()> send_task([this, id, cursor_data = std::move(cursor)]() mutable {
-        log_->trace("execute send task");
-        actor_zeta::send(current_message()->sender(),
-                         address(),
-                         scheduler::handler_id(scheduler::route::execute_otterbrix_finish),
-                         id,
-                         std::move(cursor_data));
-    });
-    if (!worker_.addTask(std::move(send_task))) {
-        log_->error("execute failed to add task to worker");
-    } else {
-        log_->trace("execute added task to worker");
-    }
-}
-
-void OtterbrixManager::send_error(session_hash_t id, std::string error_msg) {
-    log_->error("execute caught exception: {}", error_msg);
-    std::packaged_task<void()> send_task([this, id, msg = std::move(error_msg)]() mutable {
-        actor_zeta::send(current_message()->sender(),
-                         address(),
-                         scheduler::handler_id(scheduler::route::execute_failed),
-                         id,
-                         std::move(msg));
-    });
-    if (!worker_.addTask(std::move(send_task))) {
-        log_->error("execute failed to add task to worker");
-    } else {
-        log_->trace("execute added task to worker");
-    }
+    co_return std::make_pair(std::move(schema), std::move(data));
 }

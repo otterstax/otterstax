@@ -40,9 +40,9 @@ class OtterStax(ConanFile):
         self.requires("benchmark/1.6.1")
         self.requires("zlib/1.3.1")
         self.requires("bzip2/1.0.8")
-        self.requires("otterbrix/1.0.0a10-rc-10")
+        self.requires("otterbrix/1.0.0a12-rc-1")
         self.requires("magic_enum/0.8.1")
-        self.requires("actor-zeta/1.0.0a12@")
+        self.requires("actor-zeta/1.1.1@")
         self.requires("libpq/15.4")
         self.requires("yaml-cpp/0.7.0")
 
@@ -70,7 +70,7 @@ class OtterStax(ConanFile):
         self.options["boost/*"].without_charconv = False
         self.options["boost/*"].without_charconv_float128 = True
 
-        self.options["actor-zeta/*"].cxx_standard = 17
+        self.options["actor-zeta/*"].cxx_standard = 20
         self.options["actor-zeta/*"].fPIC = True
         self.options["actor-zeta/*"].exceptions_disable = False
         self.options["actor-zeta/*"].rtti_disable = False

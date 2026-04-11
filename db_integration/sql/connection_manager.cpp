@@ -5,62 +5,58 @@
 
 #include "otterbrix/query_generation/sql_query_generator.hpp"
 #include "otterbrix/translators/input/mysql_to_chunk.hpp"
-#include "routes/scheduler.hpp"
-#include "routes/sql_connection_manager.hpp"
 #include "utility/cv_wrapper.hpp"
 #include "utility/timer.hpp"
 #include "utility/wait_barrier.hpp"
 #include "utility/logger.hpp"
 
+#include <thread>
+
 using namespace db_conn;
+using otterstax::pipeline_error;
+using otterstax::error_code_t;
+using otterstax::error_tag_t;
+
 SqlConnectionManager::SqlConnectionManager(std::pmr::memory_resource* res,
                                            std::shared_ptr<mysqlc::ConnectorManager> connector_manager)
-    : actor_zeta::cooperative_supervisor<SqlConnectionManager>(res)
+    : resource_(res)
     , connector_manager_(std::move(connector_manager))
-    , execute_(actor_zeta::make_behavior(resource(),
-                                         sql_connection_manager::handler_id(sql_connection_manager::route::execute),
-                                         this,
-                                         &SqlConnectionManager::execute))
     , log_(get_logger(logger_tag::SQL_CONNECTION_MANAGER)) {
     assert(log_.is_valid());
     assert(res != nullptr);
     assert(connector_manager_ != nullptr);
     log_->info("SqlConnectionManager initialized successfully");
-    connector_manager_->start(); // Start the connector manager
-    worker_.start();             // Start the worker thread manager
+    connector_manager_->start();
 }
 
-auto SqlConnectionManager::make_scheduler() noexcept -> actor_zeta::scheduler_abstract_t* {
-    assert("SQLConnectionManager::make_scheduler");
-    return nullptr; // This should be implemented to return a valid scheduler
-}
+std::pair<bool, actor_zeta::detail::enqueue_result>
+SqlConnectionManager::enqueue_impl(actor_zeta::mailbox::message_ptr msg) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    current_behavior_ = behavior(msg.get());
 
-auto SqlConnectionManager::make_type() const noexcept -> const char* const { return "SQLConnectionManager"; }
-
-auto SqlConnectionManager::enqueue_impl(actor_zeta::message_ptr msg, actor_zeta::execution_unit*) -> void {
-    log_->debug("enqueue_impl received message, command: {}", static_cast<uint64_t>(msg->command()));
-    std::unique_lock<std::mutex> _(input_mtx_);
-    set_current_message(std::move(msg));
-    behavior()(current_message());
-}
-
-actor_zeta::behavior_t SqlConnectionManager::behavior() {
-    return actor_zeta::make_behavior(resource(), [this](actor_zeta::message* msg) -> void {
-        log_->debug("behavior() processing command: {}", static_cast<uint64_t>(msg->command()));
-        switch (msg->command()) {
-            case sql_connection_manager::handler_id(sql_connection_manager::route::execute): {
-                log_->debug("behavior() matched execute route");
-                execute_(msg);
-                break;
+    while (current_behavior_.is_busy()) {
+        if (current_behavior_.is_awaited_ready()) {
+            auto cont = current_behavior_.take_awaited_continuation();
+            if (cont) {
+                cont.resume();
             }
-            default:
-                log_->warn("behavior() unknown command: {}", static_cast<uint64_t>(msg->command()));
-                break;
+        } else {
+            std::this_thread::yield();
         }
-    });
+    }
+
+    return {false, actor_zeta::detail::enqueue_result::success};
 }
 
-auto SqlConnectionManager::execute(session_hash_t id, ParsedQueryDataPtr&& data, actor_zeta::address_t scheduler) -> void {
+actor_zeta::behavior_t SqlConnectionManager::behavior(actor_zeta::mailbox::message* msg) {
+    auto cmd = msg->command();
+    if (cmd == actor_zeta::msg_id<SqlConnectionManager, &SqlConnectionManager::execute>) {
+        co_await actor_zeta::dispatch(this, &SqlConnectionManager::execute, msg);
+    }
+}
+
+actor_zeta::unique_future<otterstax::result<ParsedQueryDataPtr>>
+SqlConnectionManager::execute(session_hash_t id, ParsedQueryDataPtr data) {
     assert(data);
     try {
         Timer timer("SqlConnectionManager::execute", log_);
@@ -151,8 +147,8 @@ auto SqlConnectionManager::execute(session_hash_t id, ParsedQueryDataPtr&& data,
                 *(*it)[i] = data_node;
             }
         }
-        send_result(id, std::move(data), scheduler);
         log_->debug("execute finished");
+        co_return std::move(data);
     } catch (const boost::mysql::error_with_diagnostics& err) {
         std::string error_msg =
             "SqlConnectionManager::execute caught boost::mysql exception: " + std::string(err.what()) +
@@ -161,43 +157,16 @@ auto SqlConnectionManager::execute(session_hash_t id, ParsedQueryDataPtr&& data,
                     err.what(),
                     err.code().value(),
                     err.get_diagnostics().server_message());
-        send_error(id, error_msg, scheduler);
+        co_return pipeline_error(error_code_t::query_error,
+                                 error_tag_t::sql_connection_manager,
+                                 std::move(error_msg));
     } catch (const std::exception& e) {
-        send_error(id, e.what(), scheduler);
+        co_return pipeline_error(error_code_t::internal_error,
+                                 error_tag_t::sql_connection_manager,
+                                 e.what());
     } catch (...) {
-        std::string error_msg = "SqlConnectionManager::execute caught unknown exception";
-        send_error(id, error_msg, scheduler);
-    }
-}
-
-void SqlConnectionManager::send_result(session_hash_t id, ParsedQueryDataPtr&& data, actor_zeta::address_t scheduler) {
-    std::packaged_task<void()> send_task([this, id, scheduler, data = std::move(data)]() mutable {
-        log_->trace("execute send task");
-        actor_zeta::send(scheduler,
-                         address(),
-                         scheduler::handler_id(scheduler::route::execute_remote_sql_finish),
-                         id,
-                         std::move(data));
-    });
-    if (!worker_.addTask(std::move(send_task))) {
-        log_->error("execute failed to add task to worker");
-    } else {
-        log_->trace("execute added task to worker");
-    }
-}
-
-void SqlConnectionManager::send_error(session_hash_t id, std::string error_msg, actor_zeta::address_t scheduler) {
-    log_->error("{}", error_msg);
-    std::packaged_task<void()> send_task([this, id, scheduler, msg = std::move(error_msg)]() mutable {
-        actor_zeta::send(scheduler,
-                         address(),
-                         scheduler::handler_id(scheduler::route::execute_failed),
-                         id,
-                         std::move(msg));
-    });
-    if (!worker_.addTask(std::move(send_task))) {
-        log_->error("execute failed to add task to worker");
-    } else {
-        log_->trace("execute added task to worker");
+        co_return pipeline_error(error_code_t::internal_error,
+                                 error_tag_t::sql_connection_manager,
+                                 "SqlConnectionManager::execute caught unknown exception");
     }
 }

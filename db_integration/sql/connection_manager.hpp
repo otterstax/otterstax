@@ -9,38 +9,39 @@
 #include "connectors/mysql/manager.hpp"
 #include "otterbrix/parser/parser.hpp"
 #include "scheduler/schema_utils.hpp"
+#include "utility/pipeline_error.hpp"
 #include "utility/session.hpp"
-#include "utility/worker.hpp"
 
 #include <functional>
 #include <memory_resource>
+#include <mutex>
 #include <string>
 
 namespace db_conn {
-    class SqlConnectionManager final : public actor_zeta::cooperative_supervisor<SqlConnectionManager> {
+    class SqlConnectionManager final : public actor_zeta::actor::actor_mixin<SqlConnectionManager> {
     public:
         SqlConnectionManager(std::pmr::memory_resource* res,
                              std::shared_ptr<mysqlc::ConnectorManager> connector_manager);
-        actor_zeta::behavior_t behavior();
-        auto make_scheduler() noexcept -> actor_zeta::scheduler_abstract_t*;
-        auto make_type() const noexcept -> const char* const;
 
-    protected:
-        auto enqueue_impl(actor_zeta::message_ptr msg, actor_zeta::execution_unit*) -> void final;
+        std::pmr::memory_resource* resource() const noexcept { return resource_; }
+
+        using dispatch_traits = actor_zeta::dispatch_traits<
+            &SqlConnectionManager::execute>;
+
+        actor_zeta::behavior_t behavior(actor_zeta::mailbox::message* msg);
+
+        std::pair<bool, actor_zeta::detail::enqueue_result>
+        enqueue_impl(actor_zeta::mailbox::message_ptr msg);
+
+        /// handler coroutine
+        actor_zeta::unique_future<otterstax::result<ParsedQueryDataPtr>>
+        execute(session_hash_t id, ParsedQueryDataPtr data);
 
     private:
+        std::pmr::memory_resource* resource_;
         std::shared_ptr<mysqlc::ConnectorManager> connector_manager_;
-        // Behaviors
-        actor_zeta::behavior_t execute_;
         log_t log_;
-
-        /// async method
-        auto execute(session_hash_t id, ParsedQueryDataPtr&& data, actor_zeta::address_t scheduler) -> void;
-
-        void send_error(session_hash_t id, std::string error_msg, actor_zeta::address_t scheduler);
-        void send_result(session_hash_t id, ParsedQueryDataPtr&& data, actor_zeta::address_t scheduler);
-
-        std::mutex input_mtx_;
-        TaskManager<std::packaged_task<void()>> worker_;
+        std::mutex mutex_;
+        actor_zeta::behavior_t current_behavior_;
     };
 } // namespace db_conn

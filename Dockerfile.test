@@ -13,7 +13,7 @@ RUN apt update && \
         python3-venv \
         python3-dev curl gnupg apt-transport-https \
         zlib1g libgflags2.2 libgflags-dev \
-        libssl-dev && \
+        libssl-dev bison flex && \
     apt clean && \
     rm -rf /var/lib/apt/lists/*
 
@@ -25,7 +25,7 @@ RUN rm /bin/sh && ln -s /bin/bash /bin/sh
 
 WORKDIR /app/build
 COPY conanfile.py ./conanfile.py
-RUN conan install conanfile.py --build missing -s build_type=Release -s compiler.cppstd=gnu20
+RUN conan install conanfile.py --build missing -s build_type=Release -s compiler.cppstd=20
 
 
 WORKDIR /app

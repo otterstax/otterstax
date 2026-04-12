@@ -10,7 +10,6 @@
 #include "../packet/packet_writer.hpp"
 #include "column_definition_41.hpp"
 
-#include <components/document/document.hpp>
 #include <components/types/types.hpp>
 #include <components/vector/data_chunk.hpp>
 #include <iostream>

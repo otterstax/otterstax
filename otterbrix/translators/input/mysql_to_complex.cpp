@@ -16,7 +16,7 @@ namespace tsl {
             fields.back().set_alias(column.column_name());
         }
 
-        return complex_logical_type::create_struct(std::move(fields));
+        return complex_logical_type::create_struct("", std::move(fields));
     }
 
     complex_logical_type mysql_to_complex(boost::mysql::column_type type, const bool is_unsigned) {

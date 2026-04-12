@@ -247,7 +247,7 @@ namespace tsl {
             fields.emplace_back(translator.type);
         }
 
-        return types::complex_logical_type::create_struct(std::move(fields));
+        return types::complex_logical_type::create_struct("", std::move(fields));
     }
 
 } // namespace tsl

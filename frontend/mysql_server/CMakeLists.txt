@@ -36,6 +36,7 @@ add_library(mysql_server
 target_link_libraries(mysql_server PUBLIC
     Boost::boost
     common_server
+    arrow::arrow
 )
 
 target_include_directories(mysql_server PUBLIC

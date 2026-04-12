@@ -22,7 +22,7 @@ struct session_payload {
         , tag(NodeTag::T_Null) {}
 
     session_payload(components::types::complex_logical_type schema,
-                    components::vector::data_chunk_t chunk,
+                    components::vector::data_chunk_t&& chunk,
                     size_t parameter_count,
                     NodeTag tag)
         : schema(std::move(schema))

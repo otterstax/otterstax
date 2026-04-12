@@ -3,7 +3,7 @@
 
 #pragma once
 
-#include <components/catalog/schema.hpp>
+#include <components/catalog/catalog_types.hpp>
 #include <components/cursor/cursor.hpp>
 #include <components/expressions/aggregate_expression.hpp>
 #include <components/expressions/scalar_expression.hpp>
@@ -46,7 +46,7 @@ namespace schema_utils {
     components::types::complex_logical_type
     aggregate_filter_schema(const components::logical_plan::node_aggregate_t& node,
                             components::logical_plan::parameter_node_t* params,
-                            const components::catalog::schema& schema);
+                            const std::vector<components::types::complex_logical_type>& schema_types);
 
     components::cursor::cursor_t_ptr
     compute_otterbrix_schema(const components::logical_plan::node_aggregate_t& node,

@@ -3,12 +3,34 @@
 
 #include "catalog_manager.hpp"
 
+#include <components/table/column_definition.hpp>
 #include <thread>
 
 using namespace components;
 using otterstax::pipeline_error;
 using otterstax::error_code_t;
 using otterstax::error_tag_t;
+
+namespace {
+    // Convert a STRUCT complex_logical_type to a catalog::schema
+    catalog::schema schema_from_struct(std::pmr::memory_resource* resource,
+                                       const types::complex_logical_type& struct_type) {
+        auto& ext = catalog::to_struct(struct_type);
+        auto& fields = ext.child_types();
+
+        std::vector<table::column_definition_t> columns;
+        std::vector<types::field_description> descriptions;
+        columns.reserve(fields.size());
+        descriptions.reserve(fields.size());
+
+        for (uint64_t i = 0; i < fields.size(); ++i) {
+            columns.emplace_back(fields[i].alias(), fields[i]);
+            descriptions.emplace_back(i + 1, true);
+        }
+
+        return catalog::schema(resource, columns, descriptions);
+    }
+} // namespace
 
 namespace mysqlc {
     CatalogManager::CatalogManager(std::pmr::memory_resource* res)
@@ -193,10 +215,10 @@ namespace mysqlc {
                     }
 
                     const auto& agg = static_cast<logical_plan::node_aggregate_t&>(*(*batch[i]));
-                    auto initial_schema = catalog_.get_table_schema(uid_as_schema_id).schema_struct();
-                    initial_schema = schema_utils::aggregate_filter_schema(agg,
+                    auto schema_types = catalog_.get_table_schema(uid_as_schema_id).types();
+                    auto initial_schema = schema_utils::aggregate_filter_schema(agg,
                                                                            updated_data->otterbrix_params->params_node.get(),
-                                                                           catalog::schema(resource(), initial_schema));
+                                                                           schema_types);
 
                     auto node_schema = schema_utils::make_node_schema(name,
                                                                       std::move(initial_schema),
@@ -242,7 +264,7 @@ namespace mysqlc {
         if (is_mysql) {
             auto schema_handler = [this, &id](const boost::mysql::results& result) -> catalog::catalog_error {
                 auto schema_struct = tsl::mysql_to_struct(result.meta());
-                auto schema = catalog::schema(resource(), std::move(schema_struct));
+                auto schema = schema_from_struct(resource(), schema_struct);
 
                 if (catalog_.table_exists(id)) {
                     return catalog::catalog_error(catalog::catalog_mistake_t::ALREADY_EXISTS, "Connection already exists");
@@ -264,8 +286,8 @@ namespace mysqlc {
                 expressions::make_compare_expression(resource(),
                                                      expressions::compare_type::eq,
                                                      expressions::side_t::undefined,
-                                                     expressions::key_t("1"),
-                                                     param.add_parameter(types::logical_value_t(0)))));
+                                                     expressions::key_t(resource(), "1"),
+                                                     param.add_parameter(types::logical_value_t(resource(), 0)))));
 
             std::string query = sql_gen::generate_query(node, &param.parameters(), backend_type_t::MySQL);
             log_->debug("add_connection_schema: Generated MySQL Query: \"{}\"", query);
@@ -319,7 +341,7 @@ namespace mysqlc {
 
                         auto schema_handler = [this, table_id, pg_schema, table_name](PGresult* schema_result) -> catalog::catalog_error {
                             auto schema_struct = tsl::pg_to_struct(schema_result);
-                            auto schema = catalog::schema(resource(), std::move(schema_struct));
+                            auto schema = schema_from_struct(resource(), schema_struct);
 
                             if (catalog_.table_exists(table_id)) {
                                 log_->info("add_connection_schema: table {}.{} already exists, skipping", pg_schema, table_name);
@@ -417,7 +439,7 @@ namespace mysqlc {
         for (auto&& id : ids) {
             data.emplace_back(id.collection_full_name());
             if (command.include_schema) {
-                data.back().schema = catalog_.get_table_schema(id).schema_struct();
+                data.back().schema = types::complex_logical_type::create_struct("", catalog_.get_table_schema(id).types());
             }
         }
 

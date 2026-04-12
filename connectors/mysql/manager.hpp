@@ -68,7 +68,7 @@ namespace mysqlc {
                 try {
                     conn->second->tryReconnect();
                 } catch (const std::exception& e) {
-                    actor_zeta::send(catalog_manager_->address(),
+                    actor_zeta::send(catalog_manager_,
                                      &mysqlc::CatalogManager::remove_connection_schema,
                                      uuid);
                     throw std::runtime_error("Failed to reconnect. Error message: " + std::string(e.what()));

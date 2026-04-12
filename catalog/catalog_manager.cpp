@@ -285,7 +285,6 @@ namespace mysqlc {
                 name,
                 expressions::make_compare_expression(resource(),
                                                      expressions::compare_type::eq,
-                                                     expressions::side_t::undefined,
                                                      expressions::key_t(resource(), "1"),
                                                      param.add_parameter(types::logical_value_t(resource(), 0)))));
 

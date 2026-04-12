@@ -234,7 +234,17 @@ namespace {
                 break;
         }
 
-        stream << expr->key_left();
+        // left side
+        if (std::holds_alternative<expressions::key_t>(expr->left())) {
+            stream << std::get<expressions::key_t>(expr->left()).as_string();
+        } else if (std::holds_alternative<core::parameter_id_t>(expr->left())) {
+            auto it = parameters->parameters.find(std::get<core::parameter_id_t>(expr->left()));
+            if (it != parameters->parameters.end()) {
+                stream << it->second;
+            } else {
+                stream << "NULL";
+            }
+        }
         switch (expr->type()) {
             case compare_type::eq:
                 stream << " = ";
@@ -255,15 +265,16 @@ namespace {
                 stream << " <= ";
                 break;
         }
-        if (expr->key_right().is_null()) {
-            auto it = parameters->parameters.find(expr->value());
+        // right side
+        if (std::holds_alternative<expressions::key_t>(expr->right())) {
+            stream << std::get<expressions::key_t>(expr->right()).as_string();
+        } else if (std::holds_alternative<core::parameter_id_t>(expr->right())) {
+            auto it = parameters->parameters.find(std::get<core::parameter_id_t>(expr->right()));
             if (it != parameters->parameters.end()) {
                 stream << it->second;
             } else {
                 stream << "NULL";
             }
-        } else {
-            stream << expr->key_right();
         }
     }
 
@@ -274,7 +285,7 @@ namespace {
                 stream << "SET " << reinterpret_cast<const update_expr_set_ptr&>(expr)->key().as_string() << " = ";
                 generate_update_expr(stream, expr->left(), parameters);
                 break;
-            case update_expr_type::get_value_doc:
+            case update_expr_type::get_value:
                 stream << reinterpret_cast<const update_expr_get_value_ptr&>(expr)->key().as_string();
                 break;
             case update_expr_type::get_value_params: {
@@ -422,23 +433,11 @@ namespace {
                     switch (expr->group()) {
                         case expression_group::aggregate: {
                             auto agg_expr = reinterpret_cast<const aggregate_expression_ptr&>(expr);
-                            switch (agg_expr->type()) {
-                                case aggregate_type::count:
-                                    fields.emplace_back("COUNT(");
-                                    break;
-                                case aggregate_type::sum:
-                                    fields.emplace_back("SUM(");
-                                    break;
-                                case aggregate_type::min:
-                                    fields.emplace_back("MIN(");
-                                    break;
-                                case aggregate_type::max:
-                                    fields.emplace_back("MAX(");
-                                    break;
-                                case aggregate_type::avg:
-                                    fields.emplace_back("AVG(");
-                                    break;
-                            }
+                            auto fname = agg_expr->function_name();
+                            // Convert function name to SQL uppercase
+                            std::string sql_func;
+                            for (auto c : fname) sql_func += static_cast<char>(std::toupper(c));
+                            fields.emplace_back(sql_func + "(");
                             if (agg_expr->params().empty()) {
                                 fields.back().append(agg_expr->key().as_string() + ")");
                             } else {
@@ -626,21 +625,16 @@ namespace {
         if (!node->key_translation().empty()) {
             stream << "(";
             bool comma = false;
-            for (const auto& k_pair : node->key_translation()) {
+            for (const auto& key : node->key_translation()) {
                 if (comma) {
                     stream << ", ";
                 }
-                stream << k_pair.first.as_string();
+                stream << key.as_string();
                 comma = true;
             }
             stream << ") ";
         }
         if (node->children().front()->type() == node_type::data_t) {
-            std::vector<std::string_view> keys;
-            keys.reserve(node->key_translation().size());
-            for (const auto& k_pair : node->key_translation()) {
-                keys.emplace_back(k_pair.second.as_string());
-            }
             sql_gen::generate_values(stream,
                                      reinterpret_cast<const node_data_ptr&>(node->children().front())->data_chunk(),
                                      backend);

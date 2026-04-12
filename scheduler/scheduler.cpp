@@ -364,9 +364,10 @@ Scheduler::prepare_schema(session_hash_t id, shared_session_payload sdata, std::
             // (this logic was in get_catalog_schema_finish)
             if (data->otterbrix_params->node->type() == logical_plan::node_type::unused) {
                 // EmptySchema shortcut — schema nodes tagged as unused
-                auto cursor = cursor::make_cursor(resource(),
-                    {static_cast<schema_utils::schema_node_t&>(
-                        *data->otterbrix_params->node).schema()});
+                std::pmr::vector<types::complex_logical_type> schema_types(resource());
+                schema_types.push_back(static_cast<schema_utils::schema_node_t&>(
+                    *data->otterbrix_params->node).schema());
+                auto cursor = cursor::make_cursor(resource(), std::move(schema_types));
                 finish_schema(id, std::move(cursor), std::move(data));
                 co_return;
             }

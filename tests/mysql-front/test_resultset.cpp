@@ -5,7 +5,6 @@
 #include "frontend/mysql_server/resultset/mysql_resultset.hpp"
 
 #include <catch2/catch.hpp>
-#include <components/document/document.hpp>
 
 using namespace components;
 using namespace frontend;

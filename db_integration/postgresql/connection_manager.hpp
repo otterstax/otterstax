@@ -21,6 +21,8 @@ namespace db_conn {
     // PgConnectionManager ONLY fetches data from PostgreSQL, NO JOIN operations
     class PgConnectionManager final : public actor_zeta::actor::actor_mixin<PgConnectionManager> {
     public:
+        using is_cooperative_actor_type = void; // Required by actor_zeta::send() concept
+
         PgConnectionManager(std::pmr::memory_resource* res,
                             std::shared_ptr<pgc::ConnectorManager> connector_manager);
 

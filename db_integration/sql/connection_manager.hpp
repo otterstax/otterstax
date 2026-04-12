@@ -21,6 +21,8 @@ namespace db_conn {
     class SqlConnectionManager final : public actor_zeta::actor::actor_mixin<SqlConnectionManager> {
     public:
         using is_cooperative_actor_type = void; // Required by actor_zeta::send() concept
+        template<typename T>
+        using unique_future = actor_zeta::unique_future<T>;
 
         SqlConnectionManager(std::pmr::memory_resource* res,
                              std::shared_ptr<mysqlc::ConnectorManager> connector_manager);

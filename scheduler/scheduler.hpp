@@ -45,6 +45,8 @@ namespace db_conn {
 class Scheduler final : public actor_zeta::actor::actor_mixin<Scheduler> {
 public:
     using is_cooperative_actor_type = void; // Required by actor_zeta::send() concept
+    template<typename T>
+    using unique_future = actor_zeta::unique_future<T>;
 
     Scheduler(std::pmr::memory_resource* res,
               std::unique_ptr<IParser> parser,

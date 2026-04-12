@@ -13,6 +13,8 @@
 #include <components/logical_plan/param_storage.hpp>
 #include <components/types/types.hpp>
 
+#include <map>
+
 namespace schema_utils {
     // used during schema computation, replaces external nodes in main node (like node_raw_data does during execute())
     // generate query during schema analysis

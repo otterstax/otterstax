@@ -20,6 +20,8 @@
 namespace db_conn {
     class OtterbrixManager final : public actor_zeta::actor::actor_mixin<OtterbrixManager> {
     public:
+        using is_cooperative_actor_type = void; // Required by actor_zeta::send() concept
+
         OtterbrixManager(std::pmr::memory_resource* res, std::unique_ptr<IDataManager> data_manager);
 
         std::pmr::memory_resource* resource() const noexcept { return resource_; }

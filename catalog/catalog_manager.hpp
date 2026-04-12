@@ -45,6 +45,8 @@ namespace catalog_ext {
 namespace mysqlc {
     class CatalogManager final : public actor_zeta::actor::actor_mixin<CatalogManager> {
     public:
+        using is_cooperative_actor_type = void; // Required by actor_zeta::send() concept
+
         CatalogManager(std::pmr::memory_resource* res);
         void set_mysql_connector_manager(std::shared_ptr<ConnectorManager> mysql_conn_manager);
         void set_pg_connector_manager(std::shared_ptr<pgc::ConnectorManager> pg_conn_manager);

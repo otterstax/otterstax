@@ -53,18 +53,6 @@ namespace mysqlc {
 
         std::pmr::memory_resource* resource() const noexcept { return resource_; }
 
-        using dispatch_traits = actor_zeta::dispatch_traits<
-            &CatalogManager::get_catalog_schema,
-            &CatalogManager::update_backend_type,
-            &CatalogManager::add_connection_schema,
-            &CatalogManager::remove_connection_schema,
-            &CatalogManager::get_tables>;
-
-        actor_zeta::behavior_t behavior(actor_zeta::mailbox::message* msg);
-
-        std::pair<bool, actor_zeta::detail::enqueue_result>
-        enqueue_impl(actor_zeta::mailbox::message_ptr msg);
-
         // Connection type management
         void registerConnection(const std::string& uuid, catalog_ext::ConnectionType type,
                                 const collection_full_name_t& name);
@@ -87,6 +75,18 @@ namespace mysqlc {
 
         actor_zeta::unique_future<void>
         get_tables(arrow::flight::sql::GetTables command, shared_data<std::pmr::vector<table_info>> sdata);
+
+        using dispatch_traits = actor_zeta::dispatch_traits<
+            &CatalogManager::get_catalog_schema,
+            &CatalogManager::update_backend_type,
+            &CatalogManager::add_connection_schema,
+            &CatalogManager::remove_connection_schema,
+            &CatalogManager::get_tables>;
+
+        actor_zeta::behavior_t behavior(actor_zeta::mailbox::message* msg);
+
+        std::pair<bool, actor_zeta::detail::enqueue_result>
+        enqueue_impl(actor_zeta::mailbox::message_ptr msg);
 
     private:
         std::pmr::memory_resource* resource_;

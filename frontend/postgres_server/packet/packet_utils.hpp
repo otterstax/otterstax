@@ -9,6 +9,7 @@
 #include "../resultset/field_description.hpp"
 #include "packet_writer.hpp"
 #include <components/sql/parser/nodes/nodes.h>
+#include <optional>
 
 namespace frontend::postgres {
     enum class transaction_status : char

@@ -235,8 +235,8 @@ namespace {
         }
 
         // left side
-        if (std::holds_alternative<expressions::key_t>(expr->left())) {
-            stream << std::get<expressions::key_t>(expr->left()).as_string();
+        if (std::holds_alternative<key_t>(expr->left())) {
+            stream << std::get<key_t>(expr->left()).as_string();
         } else if (std::holds_alternative<core::parameter_id_t>(expr->left())) {
             auto it = parameters->parameters.find(std::get<core::parameter_id_t>(expr->left()));
             if (it != parameters->parameters.end()) {
@@ -266,8 +266,8 @@ namespace {
                 break;
         }
         // right side
-        if (std::holds_alternative<expressions::key_t>(expr->right())) {
-            stream << std::get<expressions::key_t>(expr->right()).as_string();
+        if (std::holds_alternative<key_t>(expr->right())) {
+            stream << std::get<key_t>(expr->right()).as_string();
         } else if (std::holds_alternative<core::parameter_id_t>(expr->right())) {
             auto it = parameters->parameters.find(std::get<core::parameter_id_t>(expr->right()));
             if (it != parameters->parameters.end()) {

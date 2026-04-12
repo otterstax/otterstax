@@ -71,7 +71,7 @@ namespace frontend::postgres {
     void postgres_connection::handle_query(std::string query) {
         auto shared_data = create_cv_wrapper(session_payload(resource_));
         session_id id;
-        actor_zeta::send(scheduler_->address(),
+        actor_zeta::send(scheduler_,
                          &Scheduler::execute,
                          id.hash(),
                          shared_data,
@@ -195,7 +195,7 @@ namespace frontend::postgres {
 
         auto shared_data = create_cv_wrapper(session_payload(resource_));
         session_id id;
-        actor_zeta::send(scheduler_->address(),
+        actor_zeta::send(scheduler_,
                          &Scheduler::prepare_schema,
                          id.hash(),
                          shared_data,
@@ -443,7 +443,7 @@ namespace frontend::postgres {
         auto& portal_meta = it->second;
         auto& stmt = portal_meta.statement.get();
         auto shared_data = create_cv_wrapper(session_payload(resource_));
-        actor_zeta::send(scheduler_->address(),
+        actor_zeta::send(scheduler_,
                          &Scheduler::execute_prepared_statement,
                          stmt.stmt_session,
                          portal_meta.portal,

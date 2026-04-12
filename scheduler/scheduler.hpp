@@ -55,6 +55,14 @@ public:
 
     std::pmr::memory_resource* resource() const noexcept { return resource_; }
 
+    /// entry-point handler coroutines
+    actor_zeta::unique_future<void> execute(session_hash_t id, shared_session_payload sdata, std::string sql);
+    actor_zeta::unique_future<void> execute_statement(session_hash_t id, shared_session_payload sdata);
+    actor_zeta::unique_future<void> execute_prepared_statement(session_hash_t id,
+                                    std::pmr::vector<components::types::logical_value_t> parameters,
+                                    shared_session_payload sdata);
+    actor_zeta::unique_future<void> prepare_schema(session_hash_t id, shared_session_payload sdata, std::string sql);
+
     using dispatch_traits = actor_zeta::dispatch_traits<
         &Scheduler::execute,
         &Scheduler::execute_statement,
@@ -78,14 +86,6 @@ private:
     std::unordered_map<session_hash_t, shared_session_payload> shared_data_map_;
     log_t log_;
     std::unordered_map<session_hash_t, metadata_t> metadata_map_;
-
-    /// entry-point handler coroutines
-    actor_zeta::unique_future<void> execute(session_hash_t id, shared_session_payload sdata, std::string sql);
-    actor_zeta::unique_future<void> execute_statement(session_hash_t id, shared_session_payload sdata);
-    actor_zeta::unique_future<void> execute_prepared_statement(session_hash_t id,
-                                    std::pmr::vector<components::types::logical_value_t> parameters,
-                                    shared_session_payload sdata);
-    actor_zeta::unique_future<void> prepare_schema(session_hash_t id, shared_session_payload sdata, std::string sql);
 
     /// helper (extracted from old get_otterbrix_schema_finish)
     void finish_schema(session_hash_t id, components::cursor::cursor_t_ptr cursor, ParsedQueryDataPtr data);

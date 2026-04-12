@@ -26,15 +26,6 @@ namespace db_conn {
 
         std::pmr::memory_resource* resource() const noexcept { return resource_; }
 
-        using dispatch_traits = actor_zeta::dispatch_traits<
-            &OtterbrixManager::execute,
-            &OtterbrixManager::get_schema>;
-
-        actor_zeta::behavior_t behavior(actor_zeta::mailbox::message* msg);
-
-        std::pair<bool, actor_zeta::detail::enqueue_result>
-        enqueue_impl(actor_zeta::mailbox::message_ptr msg);
-
         /// handler coroutines
         actor_zeta::unique_future<components::cursor::cursor_t_ptr>
         execute(session_hash_t id, OtterbrixStatementPtr params);
@@ -43,6 +34,15 @@ namespace db_conn {
         get_schema(session_hash_t id,
                    std::pmr::map<collection_full_name_t, size_t> dependencies,
                    ParsedQueryDataPtr data);
+
+        using dispatch_traits = actor_zeta::dispatch_traits<
+            &OtterbrixManager::execute,
+            &OtterbrixManager::get_schema>;
+
+        actor_zeta::behavior_t behavior(actor_zeta::mailbox::message* msg);
+
+        std::pair<bool, actor_zeta::detail::enqueue_result>
+        enqueue_impl(actor_zeta::mailbox::message_ptr msg);
 
     private:
         std::pmr::memory_resource* resource_;

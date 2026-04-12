@@ -27,6 +27,10 @@ namespace db_conn {
 
         std::pmr::memory_resource* resource() const noexcept { return resource_; }
 
+        /// handler coroutine
+        actor_zeta::unique_future<otterstax::result<ParsedQueryDataPtr>>
+        execute(session_hash_t id, ParsedQueryDataPtr data);
+
         using dispatch_traits = actor_zeta::dispatch_traits<
             &SqlConnectionManager::execute>;
 
@@ -34,10 +38,6 @@ namespace db_conn {
 
         std::pair<bool, actor_zeta::detail::enqueue_result>
         enqueue_impl(actor_zeta::mailbox::message_ptr msg);
-
-        /// handler coroutine
-        actor_zeta::unique_future<otterstax::result<ParsedQueryDataPtr>>
-        execute(session_hash_t id, ParsedQueryDataPtr data);
 
     private:
         std::pmr::memory_resource* resource_;

@@ -18,6 +18,7 @@ target_link_libraries(scheduler PUBLIC
     otterbrix::otterbrix
     actor-zeta::actor-zeta
     arrow::arrow
+    PostgreSQL::PostgreSQL
 )
 
 target_include_directories(scheduler PUBLIC

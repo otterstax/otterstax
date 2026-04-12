@@ -2,6 +2,7 @@
 // Copyright 2025-2026  OtterStax
 
 #include "manager.hpp"
+#include "catalog/catalog_manager.hpp"
 #include "utility/connection_uid.hpp"
 #include "utility/logger.hpp"
 
@@ -42,7 +43,7 @@ namespace mysqlc {
             connections_[uuid]->connect();
 
             collection_full_name_t name(connection_param.database, uuid, uuid); // treat uuid as schema
-            actor_zeta::send(catalog_manager_->address(),
+            actor_zeta::send(catalog_manager_,
                              &mysqlc::CatalogManager::add_connection_schema,
                              std::move(name));
             return uuid;
@@ -87,9 +88,7 @@ namespace mysqlc {
         }
         conn->second->close();
         connections_.erase(uuid);
-        actor_zeta::send(catalog_manager_->address(),
-                         &mysqlc::CatalogManager::remove_connection_schema,
-                         uuid);
+        notify_connection_removed(uuid);
     }
 
     size_t ConnectorManager::totalConnections() const noexcept { return connections_.size(); }
@@ -103,4 +102,10 @@ namespace mysqlc {
     }
 
     bool ConnectorManager::hasConnection(const std::string& uuid) const noexcept { return connections_.contains(uuid); }
+
+    void ConnectorManager::notify_connection_removed(const std::string& uuid) {
+        actor_zeta::send(catalog_manager_,
+                         &mysqlc::CatalogManager::remove_connection_schema,
+                         uuid);
+    }
 } // namespace mysqlc

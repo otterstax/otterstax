@@ -60,7 +60,7 @@ TEST_CASE("aggregate: filter") {
 
 TEST_CASE("aggregate: constants & aggregations") {
     auto* resource = std::pmr::get_default_resource();
-    auto schema = catalog::schema(resource, complex_logical_type::create_struct({}));
+    std::vector<complex_logical_type> schema_types; // empty schema
     {
         auto [node, params] = parse("SELECT 1, avg(smth) from test;");
         auto filtered =

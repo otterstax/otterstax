@@ -72,7 +72,7 @@ TEST_CASE("base test case") {
     std::cout << "[Main thread] " << std::this_thread::get_id() << std::endl;
     actor_zeta::send(scheduler->address(),
                      &Scheduler::execute,
-                     id,
+                     id.hash(),
                      shared_data,
                      sql);
     shared_data->wait_for(5000ms);

@@ -410,7 +410,7 @@ namespace frontend::mysql {
         for (size_t i = 0; i < num_params; ++i) {
             bool is_null = (null_bitmap[i / 8] >> (i % 8)) & 1;
             if (is_null) {
-                param_values.emplace_back(nullptr);
+                param_values.emplace_back(resource_,nullptr);
                 continue;
             }
 
@@ -421,54 +421,54 @@ namespace frontend::mysql {
                 case field_type::MYSQL_TYPE_TINY: {
                     auto val = reader.read_uint8();
                     if (is_unsigned) {
-                        param_values.emplace_back(val);
+                        param_values.emplace_back(resource_,val);
                     } else {
-                        param_values.emplace_back(static_cast<int8_t>(val));
+                        param_values.emplace_back(resource_,static_cast<int8_t>(val));
                     }
                     break;
                 }
                 case field_type::MYSQL_TYPE_SHORT: {
                     auto val = reader.read_uint16();
                     if (is_unsigned) {
-                        param_values.emplace_back(val);
+                        param_values.emplace_back(resource_,val);
                     } else {
-                        param_values.emplace_back(static_cast<int16_t>(val));
+                        param_values.emplace_back(resource_,static_cast<int16_t>(val));
                     }
                     break;
                 }
                 case field_type::MYSQL_TYPE_LONG: {
                     auto val = reader.read_uint32();
                     if (is_unsigned) {
-                        param_values.emplace_back(val);
+                        param_values.emplace_back(resource_,val);
                     } else {
-                        param_values.emplace_back(static_cast<int32_t>(val));
+                        param_values.emplace_back(resource_,static_cast<int32_t>(val));
                     }
                     break;
                 }
                 case field_type::MYSQL_TYPE_LONGLONG: {
                     auto val = reader.read_uint64();
                     if (is_unsigned) {
-                        param_values.emplace_back(val);
+                        param_values.emplace_back(resource_,val);
                     } else {
-                        param_values.emplace_back(static_cast<int64_t>(val));
+                        param_values.emplace_back(resource_,static_cast<int64_t>(val));
                     }
                     break;
                 }
                 case field_type::MYSQL_TYPE_FLOAT: {
                     auto f = std::bit_cast<float>(reader.read_uint32());
-                    param_values.emplace_back(f);
+                    param_values.emplace_back(resource_,f);
                     break;
                 }
                 case field_type::MYSQL_TYPE_DOUBLE: {
                     auto d = std::bit_cast<double>(reader.read_uint64());
-                    param_values.emplace_back(d);
+                    param_values.emplace_back(resource_,d);
                     break;
                 }
                 case field_type::MYSQL_TYPE_VAR_STRING:
                 case field_type::MYSQL_TYPE_STRING:
                 case field_type::MYSQL_TYPE_BLOB: {
                     std::string s = reader.read_length_encoded_string();
-                    param_values.emplace_back(std::move(s));
+                    param_values.emplace_back(resource_,std::move(s));
                     break;
                 }
                 default:

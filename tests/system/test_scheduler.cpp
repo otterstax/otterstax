@@ -72,7 +72,7 @@ TEST_CASE("base test case") {
     std::cout << "[Main thread] " << std::this_thread::get_id() << std::endl;
     actor_zeta::send(scheduler->address(),
                      &Scheduler::execute,
-                     id.hash(),
+                     id,
                      shared_data,
                      sql);
     shared_data->wait_for(5000ms);
@@ -120,7 +120,7 @@ TEST_CASE("Error in connector test case") {
     std::cout << "[Main thread] " << std::this_thread::get_id() << std::endl;
     actor_zeta::send(scheduler->address(),
                      &Scheduler::execute,
-                     id.hash(),
+                     id,
                      shared_data,
                      sql);
     shared_data->wait_for(5000ms);
@@ -169,7 +169,7 @@ TEST_CASE("Error in otterbrix test case") {
     std::cout << "[Main thread] " << std::this_thread::get_id() << std::endl;
     actor_zeta::send(scheduler->address(),
                      &Scheduler::execute,
-                     id.hash(),
+                     id,
                      shared_data,
                      sql);
     shared_data->wait_for(5000ms);
@@ -215,7 +215,7 @@ TEST_CASE("Error in scheduler test case") {
     std::cout << "[Main thread] " << std::this_thread::get_id() << std::endl;
     actor_zeta::send(scheduler->address(),
                      &Scheduler::execute,
-                     id.hash(),
+                     id,
                      shared_data,
                      sql);
     shared_data->wait_for(5000ms);
@@ -264,7 +264,7 @@ TEST_CASE("Error in otterbrix + sql connector test case") {
     std::cout << "[Main thread] " << std::this_thread::get_id() << std::endl;
     actor_zeta::send(scheduler->address(),
                      &Scheduler::execute,
-                     id.hash(),
+                     id,
                      shared_data,
                      sql);
     shared_data->wait_for(5000ms);
@@ -381,7 +381,7 @@ TEST_CASE("Cross-backend JOIN detection test case") {
     std::cout << "[Main thread] " << std::this_thread::get_id() << " sending cross-backend query" << std::endl;
     actor_zeta::send(scheduler->address(),
                      &Scheduler::execute,
-                     id.hash(),
+                     id,
                      shared_data,
                      sql);
     
@@ -448,7 +448,7 @@ TEST_CASE("return empty test case") {
     std::cout << "[Main thread] " << std::this_thread::get_id() << std::endl;
     actor_zeta::send(scheduler->address(),
                      &Scheduler::execute,
-                     id.hash(),
+                     id,
                      shared_data,
                      sql);
     shared_data->wait_for(5000ms);

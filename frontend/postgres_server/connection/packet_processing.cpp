@@ -289,7 +289,7 @@ namespace frontend::postgres {
 
             int32_t len = reader.read_int32();
             if (len == -1) {
-                portal.emplace_back(nullptr);
+                portal.emplace_back(resource_, nullptr);
                 continue;
             }
 

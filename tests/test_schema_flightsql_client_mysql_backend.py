@@ -114,17 +114,17 @@ def main(local=False):
     expected_schemas = {
         'campaigns': {
             'campaign_name': pa.string(),
-            'campaign_id': pa.int64(),
-            'campaign_length': pa.int64(),
+            'campaign_id': pa.int32(),
+            'campaign_length': pa.int32(),
             'budget': pa.float32()
         },
         'impressions': {
-            'impression_id': pa.int64(),
-            'campaign_id': pa.int64(),
-            'clicks': pa.int64(),
-            'days_since_start': pa.int64(),
+            'impression_id': pa.int32(),
+            'campaign_id': pa.int32(),
+            'clicks': pa.int32(),
+            'days_since_start': pa.int32(),
             'revenue': pa.float32(),
-            'conversions': pa.int64()
+            'conversions': pa.int32()
         }
     }
 

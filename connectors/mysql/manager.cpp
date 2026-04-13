@@ -41,7 +41,7 @@ namespace mysqlc {
             connections_[uuid] = make_connector_(thread_pool_manager_.ctx(), connection_param, uuid);
             connections_[uuid]->connect();
 
-            collection_full_name_t name(connection_param.database, uuid, uuid); // treat uuid as schema
+            collection_full_name_t name(uuid, connection_param.database, "", uuid);
             actor_zeta::send(catalog_manager_->address(),
                              catalog_manager_->address(),
                              catalog_manager::handler_id(catalog_manager::route::add_connection_schema),

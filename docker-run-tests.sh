@@ -18,6 +18,19 @@ else
     exit 1
 fi
 
+compose() {
+    $COMPOSE_CMD -f compose.test.yml "$@"
+}
+
+compose_exec() {
+    # -T avoids pseudo-TTY allocation issues in non-interactive CI runners.
+    compose exec -T "$@"
+}
+
+# Retry configuration: allow overriding via env vars (e.g. WAIT_RETRIES=60)
+WAIT_RETRIES=${WAIT_RETRIES:-120}
+WAIT_SLEEP=${WAIT_SLEEP:-2}
+
 # Activate virtualenv if available
 if [ -f ".venv/bin/activate" ]; then
     source .venv/bin/activate
@@ -34,7 +47,7 @@ wait_for_database_init() {
 
     echo "🕒 Waiting for table $table initialization in $container..."
     for i in {1..120}; do
-        if $COMPOSE_CMD -f compose.test.yml exec $container mariadb -u $user -p$password $database -e "SELECT 1 FROM $table LIMIT 1;" 2>/dev/null; then
+        if compose_exec $container mariadb -u $user -p$password $database -e "SELECT 1 FROM $table LIMIT 1;" 2>/dev/null; then
             echo "✅ Table $table is ready in $container"
             return 0
         fi
@@ -49,7 +62,7 @@ wait_for_database_init() {
 check_mariadb_logs() {
     local container=$1
     echo "📋 Logs for $container:"
-    $COMPOSE_CMD -f compose.test.yml logs $container | tail -20
+    compose logs $container | tail -20
 }
 
 # Function to check existing tables
@@ -62,10 +75,34 @@ check_database_tables() {
     echo "📊 Tables in $database ($container):"
     # Check if it's a PostgreSQL container
     if [[ "$container" == *"postgres" ]]; then
-        $COMPOSE_CMD -f compose.test.yml exec $container psql -U $user -d $database -c "\dt" 2>/dev/null || echo "❌ Failed to connect to PostgreSQL"
+        compose_exec $container psql -U $user -d $database -c "\dt" 2>/dev/null || echo "❌ Failed to connect to PostgreSQL"
+    # Check if it's a ClickHouse container
+    elif [[ "$container" == *"clickhouse"* ]]; then
+        compose_exec $container clickhouse-client --user $user --password $password --database $database --query "SHOW TABLES" 2>/dev/null || echo "❌ Failed to connect to ClickHouse"
     else
-        $COMPOSE_CMD -f compose.test.yml exec $container mariadb -u $user -p$password $database -e "SHOW TABLES;" 2>/dev/null || echo "❌ Failed to connect to database"
+        compose_exec $container mariadb -u $user -p$password $database -e "SHOW TABLES;" 2>/dev/null || echo "❌ Failed to connect to database"
     fi
+}
+
+# Function to check ClickHouse table readiness
+wait_for_ch_table() {
+    local container=$1
+    local user=$2
+    local password=$3
+    local database=$4
+    local table=$5
+
+    echo "🕒 Waiting for table $table initialization in $container..."
+    for i in {1..120}; do
+        if compose_exec $container clickhouse-client --user $user --password $password --database $database --query "SELECT 1 FROM $table LIMIT 1" 2>/dev/null; then
+            echo "✅ Table $table is ready in $container"
+            return 0
+        fi
+        echo "⏳ Waiting for table $table... ($i/60)"
+        sleep 5
+    done
+    echo "❌ Timeout waiting for table $table in $container"
+    return 1
 }
 
 # Function to check PostgreSQL table readiness
@@ -77,7 +114,7 @@ wait_for_pg_table() {
 
     echo "🕒 Waiting for table $table initialization in $container..."
     for i in {1..120}; do
-        if $COMPOSE_CMD -f compose.test.yml exec $container psql -U $user -d $database -c "SELECT 1 FROM $table LIMIT 1;" 2>/dev/null; then
+        if compose_exec $container psql -U $user -d $database -c "SELECT 1 FROM $table LIMIT 1;" 2>/dev/null; then
             echo "✅ Table $table is ready in $container"
             return 0
         fi
@@ -93,20 +130,20 @@ mkdir -p logs
 echo ""
 echo "=== Step 1: Cleaning up previous state ==="
 echo ""
-$COMPOSE_CMD -f compose.test.yml down --volumes --remove-orphans 2>/dev/null || true
+compose down --volumes --remove-orphans 2>/dev/null || true
 # Clean up init directories to ensure fresh data
-rm -rf init/mariadb1/* init/mariadb2/* init/postgres/* 2>/dev/null || true
+rm -rf init/mariadb1/* init/mariadb2/* init/postgres/* init/clickhouse/* 2>/dev/null || true
 
 # Rebuild Docker images to pick up latest script changes
 echo "🔨 Rebuilding Docker images..."
-$COMPOSE_CMD -f compose.test.yml build --no-cache test-client test-otterstax
+compose build --no-cache test-client test-otterstax
 
 echo "✅ Previous containers and volumes removed"
 
 echo ""
 echo "=== Step 2: Starting databases ==="
 echo ""
-$COMPOSE_CMD -f compose.test.yml up -d mariadb1 mariadb2 postgres1
+compose up -d mariadb1 mariadb2 postgres1 clickhouse1
 
 echo ""
 echo "=== Step 3: Waiting for databases to be ready ==="
@@ -114,48 +151,64 @@ echo ""
 
 # Wait for MariaDB1 to be ready (use mariadb client to verify SQL connectivity)
 echo "🕒 Waiting for MariaDB1 to be ready..."
-for i in {1..30}; do
-    if $COMPOSE_CMD -f compose.test.yml exec mariadb1 sh -c "mariadb -h 127.0.0.1 -u user1 -ppassword1 -e 'SELECT 1;'" >/dev/null 2>&1; then
+for ((i=1;i<=WAIT_RETRIES;i++)); do
+    if compose_exec mariadb1 sh -c "(command -v mysqladmin >/dev/null 2>&1 && mysqladmin -h 127.0.0.1 -u user1 -ppassword1 ping >/dev/null 2>&1) || mariadb -h 127.0.0.1 -u user1 -ppassword1 -e 'SELECT 1;'" >/dev/null 2>&1; then
         echo "✅ MariaDB1 is ready"
         break
     fi
-    echo "⏳ Waiting for MariaDB1... ($i/30)"
-    sleep 2
-    if [ $i -eq 30 ]; then
+    echo "⏳ Waiting for MariaDB1... ($i/${WAIT_RETRIES})"
+    sleep ${WAIT_SLEEP}
+    if [ $i -eq ${WAIT_RETRIES} ]; then
         echo "❌ Timeout waiting for MariaDB1"
-        $COMPOSE_CMD -f compose.test.yml logs mariadb1 | tail -20
+        compose logs mariadb1 | tail -20
         exit 1
     fi
 done
 
 # Wait for MariaDB2 to be ready (use mariadb client to verify SQL connectivity)
 echo "🕒 Waiting for MariaDB2 to be ready..."
-for i in {1..30}; do
-    if $COMPOSE_CMD -f compose.test.yml exec mariadb2 sh -c "mariadb -h 127.0.0.1 -u user2 -ppassword2 -e 'SELECT 1;'" >/dev/null 2>&1; then
+for ((i=1;i<=WAIT_RETRIES;i++)); do
+    if compose_exec mariadb2 sh -c "(command -v mysqladmin >/dev/null 2>&1 && mysqladmin -h 127.0.0.1 -u user2 -ppassword2 ping >/dev/null 2>&1) || mariadb -h 127.0.0.1 -u user2 -ppassword2 -e 'SELECT 1;'" >/dev/null 2>&1; then
         echo "✅ MariaDB2 is ready"
         break
     fi
-    echo "⏳ Waiting for MariaDB2... ($i/30)"
-    sleep 2
-    if [ $i -eq 30 ]; then
+    echo "⏳ Waiting for MariaDB2... ($i/${WAIT_RETRIES})"
+    sleep ${WAIT_SLEEP}
+    if [ $i -eq ${WAIT_RETRIES} ]; then
         echo "❌ Timeout waiting for MariaDB2"
-        $COMPOSE_CMD -f compose.test.yml logs mariadb2 | tail -20
+        compose logs mariadb2 | tail -20
         exit 1
     fi
 done
 
 # Wait for PostgreSQL to be ready
 echo "🕒 Waiting for PostgreSQL to be ready..."
-for i in {1..30}; do
-    if $COMPOSE_CMD -f compose.test.yml exec postgres1 pg_isready -U pguser -d pgdb >/dev/null 2>&1; then
+for ((i=1;i<=WAIT_RETRIES;i++)); do
+    if compose_exec postgres1 pg_isready -U pguser -d pgdb >/dev/null 2>&1; then
         echo "✅ PostgreSQL is ready"
         break
     fi
-    echo "⏳ Waiting for PostgreSQL... ($i/30)"
+    echo "⏳ Waiting for PostgreSQL... ($i/${WAIT_RETRIES})"
+    sleep ${WAIT_SLEEP}
+    if [ $i -eq ${WAIT_RETRIES} ]; then
+        echo "❌ Timeout waiting for PostgreSQL"
+        compose logs postgres1 | tail -20
+        exit 1
+    fi
+done
+
+# Wait for ClickHouse to be ready
+echo "🕒 Waiting for ClickHouse to be ready..."
+for i in {1..30}; do
+    if compose_exec clickhouse1 clickhouse-client --user chuser --password chpassword --query "SELECT 1" >/dev/null 2>&1; then
+        echo "✅ ClickHouse is ready"
+        break
+    fi
+    echo "⏳ Waiting for ClickHouse... ($i/30)"
     sleep 2
     if [ $i -eq 30 ]; then
-        echo "❌ Timeout waiting for PostgreSQL"
-        $COMPOSE_CMD -f compose.test.yml logs postgres1 | tail -20
+        echo "❌ Timeout waiting for ClickHouse"
+        compose logs clickhouse1 | tail -20
         exit 1
     fi
 done
@@ -169,14 +222,15 @@ echo "=== Step 4: Creating test data ==="
 echo ""
 # Create test data by connecting directly to running databases
 # Use --use-aliases to ensure proper network connectivity
-$COMPOSE_CMD -f compose.test.yml run --rm --no-deps --use-aliases test-client python create_test_data.py
+compose run --rm --no-deps --use-aliases test-client python create_test_data.py
 
 if [ $? -ne 0 ]; then
     echo "❌ Test data creation failed!"
     echo "📋 Checking database status..."
-    $COMPOSE_CMD -f compose.test.yml exec mariadb1 mariadb -u user1 -ppassword1 db1 -e "SELECT 1;" 2>&1 || echo "MariaDB1 not accessible"
-    $COMPOSE_CMD -f compose.test.yml exec mariadb2 mariadb -u user2 -ppassword2 db2 -e "SELECT 1;" 2>&1 || echo "MariaDB2 not accessible"
-    $COMPOSE_CMD -f compose.test.yml exec postgres1 psql -U pguser -d pgdb -c "SELECT 1;" 2>&1 || echo "PostgreSQL not accessible"
+    compose_exec mariadb1 mariadb -u user1 -ppassword1 db1 -e "SELECT 1;" 2>&1 || echo "MariaDB1 not accessible"
+    compose_exec mariadb2 mariadb -u user2 -ppassword2 db2 -e "SELECT 1;" 2>&1 || echo "MariaDB2 not accessible"
+    compose_exec postgres1 psql -U pguser -d pgdb -c "SELECT 1;" 2>&1 || echo "PostgreSQL not accessible"
+    compose_exec clickhouse1 clickhouse-client --user chuser --password chpassword --database chdb --query "SELECT 1" 2>&1 || echo "ClickHouse not accessible"
     exit 1
 fi
 
@@ -187,6 +241,7 @@ echo ""
 check_database_tables mariadb1 user1 password1 db1
 check_database_tables mariadb2 user2 password2 db2
 check_database_tables postgres1 pguser "" pgdb
+check_database_tables clickhouse1 chuser chpassword chdb
 
 echo ""
 echo "=== Step 6: Checking specific tables ==="
@@ -194,24 +249,25 @@ echo ""
 wait_for_database_init mariadb1 user1 password1 db1 campaigns
 wait_for_database_init mariadb2 user2 password2 db2 impressions
 wait_for_pg_table postgres1 pguser pgdb products
+wait_for_ch_table clickhouse1 chuser chpassword chdb orders
 
 echo ""
 echo "=== Step 7: Starting otterstax ==="
 echo ""
-$COMPOSE_CMD -f compose.test.yml up -d test-otterstax
+compose up -d test-otterstax
 
 # Wait for otterstax to be healthy with retry logic
 echo "🕒 Waiting for otterstax to be healthy..."
-for i in {1..60}; do
-    if $COMPOSE_CMD -f compose.test.yml exec test-otterstax curl -s -f http://localhost:8085/health >/dev/null 2>&1; then
+for ((i=1;i<=WAIT_RETRIES;i++)); do
+    if compose_exec test-otterstax curl -s -f http://localhost:8085/health >/dev/null 2>&1; then
         echo "✅ Otterstax is healthy"
         break
     fi
-    echo "⏳ Waiting for otterstax... ($i/60)"
-    sleep 2
-    if [ $i -eq 60 ]; then
+    echo "⏳ Waiting for otterstax... ($i/${WAIT_RETRIES})"
+    sleep ${WAIT_SLEEP}
+    if [ $i -eq ${WAIT_RETRIES} ]; then
         echo "❌ Timeout waiting for otterstax"
-        $COMPOSE_CMD -f compose.test.yml logs test-otterstax | tail -30
+        compose logs test-otterstax | tail -30
         exit 1
     fi
 done
@@ -224,7 +280,7 @@ echo ""
 echo "=== Step 8: Running main tests ==="
 echo ""
 # Run tests in a new container with proper network connectivity (--use-aliases for DNS)
-$COMPOSE_CMD -f compose.test.yml run --rm --use-aliases test-client bash -c "/app/startup.sh"
+compose run --rm --use-aliases test-client bash -c "/app/startup.sh"
 TEST_RC=$?
 echo ""
 echo "=== Test run exit code: $TEST_RC ==="
@@ -237,7 +293,7 @@ fi
 echo ""
 echo "=== Step 9: Cleanup ==="
 echo ""
-$COMPOSE_CMD -f compose.test.yml down --volumes --remove-orphans
+compose down --volumes --remove-orphans
 rm -rf .volumes 2>/dev/null || true
 
 echo "✅ Tests completed."

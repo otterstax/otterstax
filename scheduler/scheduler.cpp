@@ -5,6 +5,7 @@
 #include "scheduler.hpp"
 #include "routes/otterbrix_manager.hpp"
 #include "routes/pg_connection_manager.hpp"
+#include "routes/ch_connection_manager.hpp"
 #include "routes/scheduler.hpp"
 #include "routes/sql_connection_manager.hpp"
 #include "utility/timer.hpp"
@@ -19,6 +20,7 @@ Scheduler::Scheduler(std::pmr::memory_resource* res,
                      std::unique_ptr<IParser> parser,
                      actor_zeta::address_t sql_connection_manager,
                      actor_zeta::address_t pg_connection_manager,
+                     actor_zeta::address_t ch_connection_manager,
                      actor_zeta::address_t otterbrix_manager,
                      actor_zeta::address_t catalog_manager)
     : actor_zeta::cooperative_supervisor<Scheduler>(res)
@@ -50,6 +52,11 @@ Scheduler::Scheduler(std::pmr::memory_resource* res,
                                     scheduler::handler_id(scheduler::route::execute_remote_pg_finish),
                                     this,
                                     &Scheduler::execute_remote_pg_finish))
+    , execute_remote_ch_finish_(
+          actor_zeta::make_behavior(resource(),
+                                    scheduler::handler_id(scheduler::route::execute_remote_ch_finish),
+                                    this,
+                                    &Scheduler::execute_remote_ch_finish))
     , execute_otterbrix_finish_(
           actor_zeta::make_behavior(resource(),
                                     scheduler::handler_id(scheduler::route::execute_otterbrix_finish),
@@ -76,6 +83,7 @@ Scheduler::Scheduler(std::pmr::memory_resource* res,
                                     &Scheduler::get_otterbrix_schema_finish))
     , sql_connection_manager_(sql_connection_manager)
     , pg_connection_manager_(pg_connection_manager)
+    , ch_connection_manager_(ch_connection_manager)
     , otterbrix_manager_(otterbrix_manager)
     , catalog_manager_(catalog_manager)
     , log_(get_logger(logger_tag::SCHEDULER)) {
@@ -113,6 +121,10 @@ actor_zeta::behavior_t Scheduler::behavior() {
             }
             case scheduler::handler_id(scheduler::route::execute_remote_pg_finish): {
                 execute_remote_pg_finish_(msg);
+                break;
+            }
+            case scheduler::handler_id(scheduler::route::execute_remote_ch_finish): {
+                execute_remote_ch_finish_(msg);
                 break;
             }
             case scheduler::handler_id(scheduler::route::execute_otterbrix_finish): {
@@ -202,7 +214,7 @@ void Scheduler::execute_statement(session_hash_t id, shared_session_payload sdat
     try {
         Timer timer("Scheduler::execute_statement", log_);
         log_->trace("execute_statement Shared data size: {}, id hash: {}", sdata->result.chunk.size(), id);
-        register_session(id, std::move(sdata));
+        register_session(id, std::move(sdata)); // TODO check if ne
 
         const auto backend_type = get_backend_type(id);
         log_->debug("execute_statement routing to backend_type: {}", static_cast<int>(backend_type));
@@ -241,6 +253,16 @@ void Scheduler::execute_statement(session_hash_t id, shared_session_payload sdat
                         actor_zeta::send(this->sql_connection_manager_,
                                          this->address(),
                                          sql_connection_manager::handler_id(sql_connection_manager::route::execute),
+                                         id,
+                                         std::move(data_ptr),
+                                         this->address());
+                        break;
+                    }
+                    case backend_type_t::ClickHouse: {
+                        log_->debug("execute_statement sending to ch_connection_manager");
+                        actor_zeta::send(this->ch_connection_manager_,
+                                         this->address(),
+                                         ch_connection_manager::handler_id(ch_connection_manager::route::execute),
                                          id,
                                          std::move(data_ptr),
                                          this->address());
@@ -380,7 +402,28 @@ void Scheduler::execute_remote_pg_finish(session_hash_t id, ParsedQueryDataPtr&&
     if (data && data->otterbrix_params) {
         log_->debug("execute_remote_pg_finish: external_nodes_count: {}", data->otterbrix_params->external_nodes_count);
     }
+    // Check if this is a mixed backend query - if so, forward to ClickHouse next
+    if (data->backend_type == backend_type_t::Mixed) {
+        log_->debug("execute_remote_pg_finish: Mixed backend, forwarding to ClickHouse");
+        actor_zeta::send(ch_connection_manager_,
+                         address(),
+                         ch_connection_manager::handler_id(ch_connection_manager::route::execute),
+                         id,
+                         std::move(data),
+                         address());
+        return;
+    }
     // After PostgreSQL fetch is complete, send to otterbrix for JOIN and other operations
+    actor_zeta::send(otterbrix_manager_,
+                     address(),
+                     otterbrix_manager::handler_id(otterbrix_manager::route::execute),
+                     id,
+                     std::move(data->otterbrix_params));
+}
+
+void Scheduler::execute_remote_ch_finish(session_hash_t id, ParsedQueryDataPtr&& data) {
+    log_->debug("Scheduler::execute_remote_ch_finish, id hash: {}", id);
+    // After ClickHouse fetch is complete, send to otterbrix for JOIN and other operations
     actor_zeta::send(otterbrix_manager_,
                      address(),
                      otterbrix_manager::handler_id(otterbrix_manager::route::execute),

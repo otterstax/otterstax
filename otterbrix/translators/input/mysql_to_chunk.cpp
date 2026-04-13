@@ -192,6 +192,7 @@ namespace tsl {
                         return {set_uint16, {types::logical_type::USMALLINT, column.column_name()}};
                     }
                 }
+                case boost::mysql::column_type::int_:
                 case boost::mysql::column_type::mediumint: {
                     if (is_signed) {
                         // spdlog::debug("Set int32 handler");
@@ -201,8 +202,7 @@ namespace tsl {
                         return {set_uint32, {types::logical_type::UINTEGER, column.column_name()}};
                     }
                 }
-                case boost::mysql::column_type::bigint:
-                case boost::mysql::column_type::int_: {
+                case boost::mysql::column_type::bigint: {
                     if (is_signed) {
                         // spdlog::debug("Set int64 handler");
                         return {set_int64, {types::logical_type::BIGINT, column.column_name()}};

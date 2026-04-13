@@ -2,293 +2,201 @@
 # Copyright 2025-2026  OtterStax
 
 """
-Cross-Backend Query Tests
+Cross-backend INNER JOIN tests via MySQL wire protocol (port 8816).
 
-Tests that verify cross-backend JOIN operations by:
-1. Using MySQL client (port 8816) to query MySQL backend
-2. Using PostgreSQL client (port 8817) to query PostgreSQL backend
-3. Testing cross-backend JOINs (MySQL + PostgreSQL tables)
+Covers:
+  - MySQL + PostgreSQL JOINs
+  - MySQL + ClickHouse JOINs
+  - PostgreSQL + ClickHouse JOINs
+  - MySQL + PostgreSQL + ClickHouse triple JOINs
 
-This tests the server's ability to JOIN data across different database backends.
-
-Usage:
-    python3 test_cross_backend_queries.py --local
+NOTE: LEFT/RIGHT/OUTER JOINs intentionally omitted — they crash otterbrix
+vector engine (SIGABRT in vector_ops::copy, assertion source.type()==target.type()).
+See memory/bugs.md for details.
 """
 
 import sys
 import argparse
-from contextlib import contextmanager
+import mysql.connector
 
-# Import existing client classes
-sys.path.insert(0, '/workspaces/sqlflite_server/tests')
-from test_mysql_client_mysql_backend import client as mysql_client
-from test_pg_client_mysql_backend import client as pg_client
+import config
 
 
-class cross_backend_client:
-    def __init__(self, local=False):
-        self.mysql_client = mysql_client(local=local)
-        self.pg_client = pg_client(local=local)
-        self.local = local
-
-    @contextmanager
-    def mysql_connection(self):
-        """MySQL client connection (port 8816)"""
-        conn = None
-        try:
-            import mysql.connector
-            conn = mysql.connector.connect(**self.mysql_client.proxy_config)
-            yield conn
-        finally:
-            if conn:
-                conn.close()
-
-    @contextmanager
-    def pg_connection(self):
-        """PostgreSQL client connection (port 8817)"""
-        conn = None
-        try:
-            import psycopg2
-            conn = psycopg2.connect(**self.pg_client.proxy_config)
-            conn.autocommit = True
-            yield conn
-        finally:
-            if conn:
-                conn.close()
+def make_config(local=False):
+    host = config.get_host(local)
+    return {
+        'host': host,
+        'port': config.MYSQL_PORT,
+        'user': 'testuser',
+        'password': 'testpass',
+    }
 
 
-def test_mysql_backend(mysql_client_instance):
-    """Test MySQL backend queries"""
+def run_query(cfg, query):
+    conn = mysql.connector.connect(**cfg)
+    try:
+        cur = conn.cursor(buffered=True)
+        cur.execute(query)
+        return cur.fetchall()
+    finally:
+        conn.close()
+
+
+def test_mysql_pg_joins(cfg):
     print(f"\n{'='*70}")
-    print("MySQL Backend Tests (via mysql_client on port 8816)")
+    print("Cross-Backend INNER JOIN Tests — MySQL + PostgreSQL")
     print(f"{'='*70}")
 
-    with mysql_client_instance.mysql_connection() as conn:
-        cursor = conn.cursor()
-
-        # Test 1: Count campaigns
-        cursor.execute("SELECT COUNT(*) FROM campaigns.db1.schema.campaigns")
-        count = cursor.fetchone()[0]
-        print(f"✓ MySQL - Campaigns count: {count}")
-        assert count > 0, "No campaigns found"
-
-        # Test 2: Count impressions
-        cursor.execute("SELECT COUNT(*) FROM impressions.db2.schema.impressions")
-        count = cursor.fetchone()[0]
-        print(f"✓ MySQL - Impressions count: {count}")
-        assert count > 0, "No impressions found"
-
-        # Test 3: Sample campaign
-        cursor.execute("""
-            SELECT campaign_id, campaign_name, budget
-            FROM campaigns.db1.schema.campaigns
-            ORDER BY campaign_id
-            LIMIT 5
-        """)
-        rows = cursor.fetchall()
-        print(f"✓ MySQL - Sample campaigns: {len(rows)} rows")
-        for row in rows:
-            print(f"    ID: {row[0]}, Name: {row[1]}, Budget: {row[2]}")
-
-        # Test 4: JOIN campaigns + impressions (MySQL internal JOIN)
-        cursor.execute("""
-            SELECT c.campaign_id, c.campaign_name, i.clicks, i.revenue
-            FROM campaigns.db1.schema.campaigns c
-            JOIN impressions.db2.schema.impressions i ON c.campaign_id = i.campaign_id
-            LIMIT 10
-        """)
-        rows = cursor.fetchall()
-        print(f"✓ MySQL - JOIN campaigns + impressions: {len(rows)} rows")
-        for row in rows[:3]:
-            print(f"    Campaign {row[0]}: clicks={row[2]}, revenue={row[3]}")
-
-    print(f"\n{'='*70}")
-    print("✅ MySQL Backend Tests PASSED")
-    print(f"{'='*70}")
-
-
-def test_pg_backend(pg_client_instance):
-    """Test PostgreSQL backend queries"""
-    print(f"\n{'='*70}")
-    print("PostgreSQL Backend Tests (via pg_client on port 8817)")
-    print(f"{'='*70}")
-
-    with pg_client_instance.pg_connection() as conn:
-        cursor = conn.cursor()
-
-        # Test 1: Count products
-        cursor.execute("SELECT COUNT(*) FROM products.pgdb.public.products")
-        count = cursor.fetchone()[0]
-        print(f"✓ PostgreSQL - Products count: {count}")
-        assert count > 0, "No products found"
-
-        # Test 2: Sample products
-        cursor.execute("""
-            SELECT product_id, product_name, price, category
-            FROM products.pgdb.public.products
-            ORDER BY product_id
-            LIMIT 5
-        """)
-        rows = cursor.fetchall()
-        print(f"✓ PostgreSQL - Sample products: {len(rows)} rows")
-        for row in rows:
-            print(f"    ID: {row[0]}, Name: {row[1]}, Price: {row[2]}, Category: {row[3]}")
-
-        # Test 3: Products with WHERE
-        cursor.execute("""
-            SELECT product_id, product_name, price
-            FROM products.pgdb.public.products
-            WHERE price > 100
-            ORDER BY price DESC
-            LIMIT 10
-        """)
-        rows = cursor.fetchall()
-        print(f"✓ PostgreSQL - Products with price > 100: {len(rows)} rows")
-
-    print(f"\n{'='*70}")
-    print("✅ PostgreSQL Backend Tests PASSED")
-    print(f"{'='*70}")
-
-
-def test_cross_backend_joins(mysql_client_instance, pg_client_instance):
-    """Test cross-backend JOIN operations"""
-    print(f"\n{'='*70}")
-    print("Cross-Backend JOIN Tests (MySQL + PostgreSQL)")
-    print(f"{'='*70}")
-
-    # Note: Cross-backend JOINs currently fail with server bug
-    # This test documents the expected behavior
-
-    print("\n⚠️  Cross-backend JOIN tests DISABLED due to server bug:")
-    print("   Error: 'Array length did not match record batch length'")
-    print("   Affects: ALL JOINs (single backend and cross-backend)")
-    print("   See bugs.md #2 for details.")
-    print()
-
-    # Example queries that SHOULD work but currently fail:
-    print("Expected queries (currently failing):")
-    print("""
-    -- Cross-backend JOIN: products (PG) + campaigns (MySQL)
-    SELECT p.product_id, p.product_name, c.campaign_name
-    FROM products.pgdb.public.products p
-    JOIN campaigns.db1.schema.campaigns c
-    ON p.campaign_id = c.campaign_id
-    LIMIT 10;
-
-    -- Cross-backend JOIN with aggregation
-    SELECT c.campaign_name, COUNT(p.product_id) as product_count
-    FROM campaigns.db1.schema.campaigns c
-    LEFT JOIN products.pgdb.public.products p
-    ON c.campaign_id = p.campaign_id
-    GROUP BY c.campaign_name;
+    # PG table on the left, MySQL on the right
+    print("\n-- Test 1: products (PG) INNER JOIN campaigns (MySQL)")
+    rows = run_query(cfg, """
+        SELECT p.product_id, p.product_name, p.price, c.campaign_name
+        FROM products.pgdb.public.products p
+        JOIN campaigns.db1.schema.campaigns c ON p.campaign_id = c.campaign_id
+        LIMIT 10
     """)
+    assert len(rows) > 0, "PG JOIN MySQL returned no rows"
+    print(f"  ✓ {len(rows)} rows")
+    for r in rows[:3]:
+        print(f"    product_id={r[0]}, product={r[1]}, price={r[2]}, campaign={r[3]}")
 
+    # MySQL table on the left, PG on the right
+    print("\n-- Test 2: campaigns (MySQL) INNER JOIN products (PG)")
+    rows = run_query(cfg, """
+        SELECT c.campaign_name, c.budget, p.product_name, p.price
+        FROM campaigns.db1.schema.campaigns c
+        JOIN products.pgdb.public.products p ON c.campaign_id = p.campaign_id
+        LIMIT 10
+    """)
+    assert len(rows) > 0, "MySQL JOIN PG returned no rows"
+    print(f"  ✓ {len(rows)} rows")
+    for r in rows[:3]:
+        print(f"    campaign={r[0]}, budget={r[1]}, product={r[2]}, price={r[3]}")
+
+    # Cross-backend WHERE filter
+    print("\n-- Test 3: INNER JOIN + WHERE (price > 100)")
+    rows = run_query(cfg, """
+        SELECT p.product_name, p.price, c.campaign_name, c.budget
+        FROM products.pgdb.public.products p
+        JOIN campaigns.db1.schema.campaigns c ON p.campaign_id = c.campaign_id
+        WHERE p.price > 100
+        LIMIT 10
+    """)
+    assert len(rows) > 0, "MySQL+PG JOIN with WHERE returned no rows"
+    assert all(r[1] > 100 for r in rows), "WHERE price > 100 not respected"
+    print(f"  ✓ {len(rows)} rows, all price > 100")
+
+    # Cross-backend GROUP BY aggregation
+    print("\n-- Test 4: INNER JOIN + GROUP BY aggregation")
+    rows = run_query(cfg, """
+        SELECT c.campaign_name,
+               COUNT(p.product_id) as product_count,
+               AVG(p.price) as avg_product_price
+        FROM campaigns.db1.schema.campaigns c
+        INNER JOIN products.pgdb.public.products p ON c.campaign_id = p.campaign_id
+        GROUP BY c.campaign_name
+        ORDER BY product_count DESC
+        LIMIT 10
+    """)
+    assert len(rows) > 0, "MySQL+PG GROUP BY aggregation returned no rows"
+    print(f"  ✓ {len(rows)} rows")
+    for r in rows[:3]:
+        avg_p = f"{r[2]:.2f}" if r[2] is not None else "NULL"
+        print(f"    campaign={r[0]}, products={r[1]}, avg_price={avg_p}")
+
+    print(f"\n✅ MySQL + PostgreSQL JOIN Tests PASSED")
+
+
+def test_mysql_ch_joins(cfg):
     print(f"\n{'='*70}")
-    print("⚠️  Cross-Backend JOIN Tests SKIPPED (known bug)")
+    print("Cross-Backend INNER JOIN Tests — MySQL + ClickHouse")
     print(f"{'='*70}")
 
+    print("\n-- Test 1: campaigns (MySQL) INNER JOIN orders (CH)")
+    rows = run_query(cfg, """
+        SELECT c.campaign_name, o.order_id, o.customer_name, o.total_amount
+        FROM campaigns.db1.schema.campaigns c
+        INNER JOIN chtest.chdb.schema.orders o ON c.campaign_id = o.campaign_id
+        LIMIT 20
+    """)
+    assert len(rows) > 0, "MySQL+CH JOIN returned no rows"
+    print(f"  ✓ {len(rows)} rows")
+    for r in rows[:3]:
+        print(f"    campaign={r[0]}, order_id={r[1]}, customer={r[2]}, amount={r[3]}")
 
-def test_data_integrity(mysql_client_instance, pg_client_instance):
-    """Test data integrity between backends"""
+    print(f"\n✅ MySQL + ClickHouse JOIN Tests PASSED")
+
+
+def test_pg_ch_joins(cfg):
     print(f"\n{'='*70}")
-    print("Cross-Backend Data Integrity Tests")
+    print("Cross-Backend INNER JOIN Tests — PostgreSQL + ClickHouse")
     print(f"{'='*70}")
 
-    # Get campaign IDs from MySQL
-    with mysql_client_instance.mysql_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT DISTINCT campaign_id FROM campaigns.db1.schema.campaigns ORDER BY campaign_id")
-        mysql_campaign_ids = set(row[0] for row in cursor.fetchall())
-        print(f"✓ MySQL - Found {len(mysql_campaign_ids)} unique campaign IDs")
+    print("\n-- Test 1: products (PG) INNER JOIN orders (CH)")
+    rows = run_query(cfg, """
+        SELECT p.product_name, p.price, o.order_id, o.quantity, o.total_amount
+        FROM products.pgdb.public.products p
+        INNER JOIN chtest.chdb.schema.orders o ON p.product_id = o.product_id
+        LIMIT 20
+    """)
+    assert len(rows) > 0, "PG+CH JOIN returned no rows"
+    print(f"  ✓ {len(rows)} rows")
+    for r in rows[:3]:
+        print(f"    product={r[0]}, price={r[1]}, order_id={r[2]}, qty={r[3]}, amount={r[4]}")
 
-    # Get campaign IDs from PostgreSQL products
-    with pg_client_instance.pg_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT DISTINCT campaign_id FROM products.pgdb.public.products ORDER BY campaign_id")
-        pg_campaign_ids = set(row[0] for row in cursor.fetchall())
-        print(f"✓ PostgreSQL - Found {len(pg_campaign_ids)} unique campaign IDs in products")
+    print(f"\n✅ PostgreSQL + ClickHouse JOIN Tests PASSED")
 
-    # Check overlap
-    common_ids = mysql_campaign_ids & pg_campaign_ids
-    print(f"✓ Cross-backend - {len(common_ids)} campaign IDs exist in both backends")
 
-    # Check for orphaned products
-    orphaned = pg_campaign_ids - mysql_campaign_ids
-    if orphaned:
-        print(f"⚠️  Warning: {len(orphaned)} products reference non-existent campaigns")
-        print(f"    Orphaned campaign IDs: {sorted(orphaned)[:10]}...")
-    else:
-        print("✓ All products reference valid campaigns")
-
-    # Check for campaigns without products
-    no_products = mysql_campaign_ids - pg_campaign_ids
-    print(f"✓ {len(no_products)} campaigns have no products")
-
+def test_triple_join(cfg):
     print(f"\n{'='*70}")
-    print("✅ Cross-Backend Data Integrity Tests PASSED")
+    print("Cross-Backend INNER JOIN Tests — MySQL + PostgreSQL + ClickHouse")
     print(f"{'='*70}")
 
+    print("\n-- Test 1: campaigns (MySQL) + products (PG) + orders (CH)")
+    rows = run_query(cfg, """
+        SELECT c.campaign_name, p.product_name, p.category,
+               o.customer_name, o.total_amount
+        FROM campaigns.db1.schema.campaigns c
+        INNER JOIN products.pgdb.public.products p ON c.campaign_id = p.campaign_id
+        INNER JOIN chtest.chdb.schema.orders o ON p.product_id = o.product_id
+        LIMIT 20
+    """)
+    assert len(rows) > 0, "MySQL+PG+CH triple JOIN returned no rows"
+    print(f"  ✓ {len(rows)} rows")
+    for r in rows[:3]:
+        print(f"    campaign={r[0]}, product={r[1]}, category={r[2]},"
+              f" customer={r[3]}, amount={r[4]}")
 
-def main(local=False):
-    print(f"\n{'#'*70}")
-    print(f"# Cross-Backend Query Tests")
-    print(f"{'#'*70}")
-    print(f"Using:")
-    print(f"  - mysql_client (port 8816) for MySQL backend")
-    print(f"  - pg_client (port 8817) for PostgreSQL backend")
-    print(f"{'#'*70}\n")
-
-    # Create client instances
-    mysql_client_instance = cross_backend_client(local=local)
-    pg_client_instance = mysql_client_instance.pg_client
-
-    # Test MySQL backend
-    test_mysql_backend(mysql_client_instance)
-
-    # Test PostgreSQL backend
-    test_pg_backend(mysql_client_instance)
-
-    # Test cross-backend JOINs (documented as failing)
-    test_cross_backend_joins(mysql_client_instance, pg_client_instance)
-
-    # Test data integrity
-    test_data_integrity(mysql_client_instance, pg_client_instance)
-
-    print(f"\n{'='*70}")
-    print("Cross-Backend Test Summary")
-    print(f"{'='*70}")
-    print("\n✓ MySQL Backend: Working")
-    print("✓ PostgreSQL Backend: Working")
-    print("✓ Data Integrity: Verified")
-    print("⚠️  Cross-Backend JOINs: DISABLED (server bug)")
-    print("\nSee bugs.md for details on JOIN limitation.")
-    print(f"{'='*70}")
+    print(f"\n✅ Triple Backend JOIN Tests PASSED")
 
 
 def main_test():
-    parser = argparse.ArgumentParser(description='Cross-backend query tests (mysql_client + pg_client)')
+    parser = argparse.ArgumentParser(description='Cross-backend query tests via MySQL wire')
     parser.add_argument('--local', action='store_true',
-                       help='Use local host (0.0.0.0) instead of test-otterstax')
+                        help='Use local host instead of test-otterstax')
     args = parser.parse_args()
 
+    cfg = make_config(local=args.local)
+
     try:
-        main(local=args.local)
-        # Print Test Success message in Green
-        print("\n" + "="*70)
-        print("\033[92m✅ ALL TESTS PASSED - Cross-Backend Queries\033[0m")
-        print("="*70)
-        print("\033[92mTest success.\033[0m")
+        test_mysql_pg_joins(cfg)
+        test_mysql_ch_joins(cfg)
+        test_pg_ch_joins(cfg)
+        test_triple_join(cfg)
+
+        print("\n" + "=" * 70)
+        print("\033[92m✅ ALL TESTS PASSED - Cross-Backend Queries (MySQL wire)\033[0m")
+        print("=" * 70)
+        return 0
     except Exception as e:
-        # Print Test Fail message in Red and the error details
-        print("\n" + "="*70)
-        print(f"\033[91m❌ TEST FAILED - Cross-Backend Queries\033[0m")
-        print("="*70)
-        print(f"\033[91mAn error occurred: {e}\033[0m")
-        print("\033[91mTest fails.\033[0m")
+        print("\n" + "=" * 70)
+        print(f"\033[91m❌ TEST FAILED - Cross-Backend Queries (MySQL wire)\033[0m")
+        print("=" * 70)
+        print(f"\033[91mError: {e}\033[0m")
+        return 1
     finally:
-        # Print Test Completed message in default color
         print("\nTest completed.")
 
 
 if __name__ == "__main__":
-    main_test()
+    sys.exit(main_test())

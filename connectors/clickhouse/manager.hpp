@@ -5,7 +5,7 @@
 
 #include <components/log/log.hpp>
 
-#include "mysql_connector.hpp"
+#include "connector.hpp"
 
 #include <concepts>
 #include <coroutine>
@@ -18,51 +18,48 @@
 #include <thread>
 #include <unordered_map>
 
-#include "http_server/connection_config.hpp"
+#include "connectors/http_server/ch_connection_config.hpp"
 #include "routes/catalog_manager.hpp"
 #include "utility/cv_wrapper.hpp"
 #include "utility/thread_pool_manager.hpp"
 
 #include <components/expressions/compare_expression.hpp>
 
-namespace mysqlc {
+namespace chc {
 
-    namespace mysql = boost::mysql;
     namespace asio = boost::asio;
     using asio::awaitable;
     using asio::co_spawn;
     using asio::use_awaitable;
 
-    std::unique_ptr<mysqlc::IConnector>
-    make_mysql_connector(asio::io_context& io_ctx, mysql::connect_params params, std::string alias);
+    std::unique_ptr<chc::IConnector>
+    make_ch_connector(connect_params params, std::string alias);
 
     class ConnectorManager {
     public:
         ConnectorManager(actor_zeta::address_t catalog_manager,
-                         connector_factory make_connector = make_mysql_connector,
+                         connector_factory make_connector = make_ch_connector,
                          size_t pool_size = std::thread::hardware_concurrency());
         thread_pool_status status() const noexcept;
         void start();
         void stop();
 
-        // TODO add query for adding and removing connections
-        // TODO this is not thread safe!!!
-        std::string addConnection(mysql::connect_params connection_param, const std::string& uuid);
-        std::string addConnection(http_server::ConnectionParams connection_param);
+        std::string addConnection(connect_params connection_param, const std::string& uuid);
+        std::string addConnection(http_server::ChConnectionParams connection_param);
         void removeConnection(const std::string& uuid);
 
         template<typename Callable>
-        requires std::invocable<Callable, const boost::mysql::results&>
-            std::future<std::invoke_result_t<Callable, const boost::mysql::results&>>
+        requires std::invocable<Callable, const std::vector<clickhouse::Block>&>
+            std::future<std::invoke_result_t<Callable, const std::vector<clickhouse::Block>&>>
             executeQuery(const std::string& uuid, std::string_view query, Callable handler) {
             auto conn = connections_.find(uuid);
             if (conn == connections_.end()) {
-                log_->error("[ConnectorManager::executeQuery] Invalid connection uuid: {}", uuid);
-                throw std::runtime_error("[ConnectorManager::executeQuery]  Invalid connection uuid: " + uuid);
+                log_->error("[ChConnectorManager::executeQuery] Invalid connection uuid: {}", uuid);
+                throw std::runtime_error("[ChConnectorManager::executeQuery] Invalid connection uuid: " + uuid);
             }
             if (conn->second->status() == Status::Closed) {
-                log_->error("[ConnectorManager::executeQuery] Connector is not connected");
-                throw std::runtime_error("[ConnectorManager::executeQuery]  Connector is not connected\n");
+                log_->error("[ChConnectorManager::executeQuery] Connector is not connected");
+                throw std::runtime_error("[ChConnectorManager::executeQuery] Connector is not connected\n");
             }
             if (!conn->second->isConnected()) {
                 try {
@@ -79,7 +76,7 @@ namespace mysqlc {
         }
 
         size_t totalConnections() const noexcept;
-        std::optional<mysql::connect_params> conn_params(const std::string& uuid) const;
+        std::optional<connect_params> conn_params(const std::string& uuid) const;
         bool hasConnection(const std::string& uuid) const noexcept;
 
     private:
@@ -87,6 +84,6 @@ namespace mysqlc {
         thread_pool_manager thread_pool_manager_;
         actor_zeta::address_t catalog_manager_;
         connector_factory make_connector_;
-        std::unordered_map<std::string, std::unique_ptr<mysqlc::IConnector>> connections_;
+        std::unordered_map<std::string, std::unique_ptr<chc::IConnector>> connections_;
     };
-} // namespace mysqlc
+} // namespace chc

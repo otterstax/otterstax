@@ -20,8 +20,8 @@ enum class backend_type_t : uint8_t {
     MySQL = 1,
     PostgreSQL = 2,
     Mixed = 3,
-    Otterbrix = 4 // No external nodes, but should be executed by otterbrix
-
+    Otterbrix = 4, // No external nodes, but should be executed by otterbrix
+    ClickHouse = 5
 };
 
 struct ParsedQueryData {

@@ -11,8 +11,8 @@ for easy integration testing and deployment.
 ## Features
 
 - Multi-protocol support: MySQL, PostgreSQL and FlightSQL
-- Database federation: query multiple MariaDB/MySQL and PostgreSQL backends
-  through a single endpoint
+- Database federation: query multiple MariaDB/MySQL, PostgreSQL, and ClickHouse
+  backends through a single endpoint
 - Otterbrix integration: powered by the Otterbrix query engine
 - Docker ready: compose files to bring up test databases and the server
 
@@ -120,7 +120,7 @@ chmod +x ./docker-run-tests.sh
 ./docker-run-tests.sh
 ```
 
-This script will bring up MariaDB/PostgreSQL containers, generate and load
+This script will bring up MariaDB/PostgreSQL/ClickHouse containers, generate and load
 test data, start the OtterStax server, run the Python integration tests,
 and then clean up.
 

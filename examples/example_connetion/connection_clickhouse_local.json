@@ -1,0 +1,9 @@
+{
+    "alias": "chtest",
+    "host": "localhost",
+    "port": "3104",
+    "username": "chuser",
+    "password": "chpassword",
+    "database": "chdb",
+    "table": ""
+}

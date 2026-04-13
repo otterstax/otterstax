@@ -126,10 +126,11 @@ namespace frontend {
     }
 
     void frontend_connection::send_packet(std::vector<uint8_t> packet, bool continue_reading) {
+        auto buf = std::make_shared<std::vector<uint8_t>>(std::move(packet));
         boost::asio::async_write(
             socket_,
-            boost::asio::buffer(std::move(packet)),
-            [this, continue_reading](boost::system::error_code ec, std::size_t bytes_sent) {
+            boost::asio::buffer(*buf),
+            [this, continue_reading, buf](boost::system::error_code ec, std::size_t bytes_sent) {
                 if (ec) {
                     logger()->error("[Connection {}] SEND: failed: {}", connection_id_, ec.message());
                     finish(); // todo: resend logic?
@@ -147,15 +148,15 @@ namespace frontend {
             total_size += msg.size();
         }
 
-        std::vector<uint8_t> merged;
-        merged.reserve(total_size);
+        auto merged = std::make_shared<std::vector<uint8_t>>();
+        merged->reserve(total_size);
         for (auto&& msg : packets) {
-            merged.insert(merged.end(), std::make_move_iterator(msg.begin()), std::make_move_iterator(msg.end()));
+            merged->insert(merged->end(), std::make_move_iterator(msg.begin()), std::make_move_iterator(msg.end()));
         }
 
         boost::asio::async_write(socket_,
-                                 boost::asio::buffer(std::move(merged)),
-                                 [this](boost::system::error_code ec, std::size_t bytes) {
+                                 boost::asio::buffer(*merged),
+                                 [this, merged](boost::system::error_code ec, std::size_t bytes) {
                                      if (ec) {
                                          std::cerr << "[Connection " << connection_id_
                                                    << "] ERROR: Failed to send merged packets:" << ec.message()
@@ -174,34 +175,34 @@ namespace frontend {
             return;
         }
 
-        auto current_packet = packets[index]; // copy only current packet
-        boost::asio::async_write(
-            socket_,
-            boost::asio::buffer(current_packet),
-            safe_callback(
-                [this, packets = std::move(packets), index, attempt](boost::system::error_code ec, std::size_t) {
-                    if (ec) {
-                        logger()->error("[Connection {}] ERROR: Sequential packet was lost {}",
-                                        connection_id_,
-                                        ec.message());
+        auto current_packet = std::make_shared<std::vector<uint8_t>>(packets[index]);
+        boost::asio::async_write(socket_,
+                                 boost::asio::buffer(*current_packet),
+                                 safe_callback([this, packets = std::move(packets), index, attempt, current_packet](
+                                                   boost::system::error_code ec,
+                                                   std::size_t) {
+                                     if (ec) {
+                                         logger()->error("[Connection {}] ERROR: Sequential packet was lost {}",
+                                                         connection_id_,
+                                                         ec.message());
 
-                        if (attempt < TRY_RESEND_RESULTSET_ATTEMPTS) {
-                            logger()->warn("[Connection {}] Attempting resend: {} out of {}",
-                                           connection_id_,
-                                           attempt,
-                                           TRY_RESEND_RESULTSET_ATTEMPTS);
+                                         if (attempt < TRY_RESEND_RESULTSET_ATTEMPTS) {
+                                             logger()->warn("[Connection {}] Attempting resend: {} out of {}",
+                                                            connection_id_,
+                                                            attempt,
+                                                            TRY_RESEND_RESULTSET_ATTEMPTS);
 
-                            send_packet_sequence(std::move(packets), index, attempt + 1);
-                            return;
-                        }
+                                             send_packet_sequence(std::move(packets), index, attempt + 1);
+                                             return;
+                                         }
 
-                        logger()->error("[Connection {}] Out of resend attempts, disconnecting {}",
-                                        connection_id_,
-                                        ec.message());
-                        finish();
-                    } else {
-                        send_packet_sequence(std::move(packets), index + 1);
-                    }
-                }));
+                                         logger()->error("[Connection {}] Out of resend attempts, disconnecting {}",
+                                                         connection_id_,
+                                                         ec.message());
+                                         finish();
+                                     } else {
+                                         send_packet_sequence(std::move(packets), index + 1);
+                                     }
+                                 }));
     }
 } // namespace frontend

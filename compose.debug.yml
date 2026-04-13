@@ -73,6 +73,29 @@ services:
       - app_network_debug
     restart: unless-stopped
 
+  clickhouse1:
+    image: clickhouse/clickhouse-server:23.8
+    container_name: clickhouse_instance1
+    environment:
+      CLICKHOUSE_DB: chdb
+      CLICKHOUSE_USER: chuser
+      CLICKHOUSE_PASSWORD: chpassword
+    ports:
+      - "3104:9000"
+      - "3105:8123"
+    healthcheck:
+      test: ["CMD-SHELL", "clickhouse-client --query 'SELECT 1' --password chpassword"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    volumes:
+      - ./init/clickhouse:/docker-entrypoint-initdb.d
+      - ./clickhouse_data:/var/lib/clickhouse
+    networks:
+      - app_network_debug
+    restart: unless-stopped
+
 networks:
   app_network:
     external: true
@@ -82,3 +105,4 @@ volumes:
   mariadb1_data:
   mariadb2_data:
   postgres_data:
+  clickhouse_data:

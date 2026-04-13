@@ -5,14 +5,15 @@
 
 # Connection parameters for the first MariaDB server
 """
-Script for querying and displaying data from both MariaDB instances and PostgreSQL.
-Use --devcon flag to use Docker container connection settings 
-(mariadb1:3306, mariadb2:3306, postgres1:5432).
-Without the flag, uses localhost connections (0.0.0.0:3101, 0.0.0.0:3102, localhost:5432).
+Script for querying and displaying data from MariaDB, PostgreSQL, and ClickHouse instances.
+Use --devcon flag to use Docker container connection settings
+(mariadb1:3306, mariadb2:3306, postgres1:5432, clickhouse1:9000).
+Without the flag, uses localhost connections (0.0.0.0:3101, 0.0.0.0:3102, localhost:5432, localhost:9000).
 """
 import argparse
 import pymysql
 import psycopg2
+import clickhouse_driver
 from tabulate import tabulate
 
 # Connection parameters for the first MariaDB server (campaigns)
@@ -39,6 +40,14 @@ POSTGRES_DB_USER = "pguser"
 POSTGRES_DB_PASSWORD = "pgpassword"
 POSTGRES_DB_NAME = "pgdb"
 
+# Connection parameters for ClickHouse server (orders)
+# Default: localhost connections
+CLICKHOUSE_DB_HOST = "0.0.0.0"
+CLICKHOUSE_DB_PORT = 3104
+CLICKHOUSE_DB_USER = "chuser"
+CLICKHOUSE_DB_PASSWORD = "chpassword"
+CLICKHOUSE_DB_NAME = "chdb"
+
 
 def setup_connections(use_devcon=False):
     """
@@ -52,6 +61,7 @@ def setup_connections(use_devcon=False):
     global CAMPAIGNS_DB_HOST, CAMPAIGNS_DB_PORT
     global IMPRESSIONS_DB_HOST, IMPRESSIONS_DB_PORT
     global POSTGRES_DB_HOST, POSTGRES_DB_PORT
+    global CLICKHOUSE_DB_HOST, CLICKHOUSE_DB_PORT, CLICKHOUSE_DB_USER, CLICKHOUSE_DB_PASSWORD, CLICKHOUSE_DB_NAME
 
     if use_devcon:
         # Docker container connections (as used in docker-compose)
@@ -67,16 +77,22 @@ def setup_connections(use_devcon=False):
         POSTGRES_DB_HOST = "postgres1"
         POSTGRES_DB_PORT = 5432
 
+        # ClickHouse Docker container connection (already default)
+        CLICKHOUSE_DB_HOST = "clickhouse1"
+        CLICKHOUSE_DB_PORT = 9000
+
         print("Using Docker container connections (--devcon mode)")
         print(f"  Campaigns DB: {CAMPAIGNS_DB_HOST}:{CAMPAIGNS_DB_PORT}")
         print(f"  Impressions DB: {IMPRESSIONS_DB_HOST}:{IMPRESSIONS_DB_PORT}")
         print(f"  PostgreSQL DB: {POSTGRES_DB_HOST}:{POSTGRES_DB_PORT}")
+        print(f"  ClickHouse DB: {CLICKHOUSE_DB_HOST}:{CLICKHOUSE_DB_PORT}")
     else:
         # Localhost connections (for direct access outside Docker)
         print("Using localhost connections")
         print(f"  Campaigns DB: {CAMPAIGNS_DB_HOST}:{CAMPAIGNS_DB_PORT}")
         print(f"  Impressions DB: {IMPRESSIONS_DB_HOST}:{IMPRESSIONS_DB_PORT}")
         print(f"  PostgreSQL DB: {POSTGRES_DB_HOST}:{POSTGRES_DB_PORT}")
+        print(f"  ClickHouse DB: {CLICKHOUSE_DB_HOST}:{CLICKHOUSE_DB_PORT}")
 
 
 def get_campaigns():
@@ -135,6 +151,25 @@ def get_products():
         conn.close()
 
 
+def get_orders():
+    """Retrieves order data from ClickHouse server."""
+    conn = clickhouse_driver.Client(
+        host=CLICKHOUSE_DB_HOST,
+        port=CLICKHOUSE_DB_PORT,
+        user=CLICKHOUSE_DB_USER,
+        password=CLICKHOUSE_DB_PASSWORD,
+        database=CLICKHOUSE_DB_NAME
+    )
+
+    try:
+        cursor = conn.execute("SELECT * FROM orders LIMIT 100")
+        columns = ['order_id', 'campaign_id', 'product_id', 'customer_name', 'order_date', 'quantity', 'total_amount']
+        rows = cursor
+        return [dict(zip(columns, row)) for row in rows]
+    finally:
+        conn.disconnect()
+
+
 def display_campaigns(campaigns):
     """Displays campaign data in table format (first 5 rows)."""
     if not campaigns:
@@ -177,8 +212,22 @@ def display_products(products):
         print(f"... and {len(products) - 5} more rows")
 
 
-def display_combined_data(campaigns, impressions, products=None):
-    """Combines and displays data from both servers (first 5 campaigns)."""
+def display_orders(orders):
+    """Displays order data in table format (first 5 rows)."""
+    if not orders:
+        print("No order data available.")
+        return
+
+    print("\n===== ORDERS (ClickHouse, first 5 rows) =====")
+    headers = orders[0].keys()
+    rows = [list(order.values()) for order in orders[:5]]
+    print(tabulate(rows, headers=headers, tablefmt="grid"))
+    if len(orders) > 5:
+        print(f"... and {len(orders) - 5} more rows")
+
+
+def display_combined_data(campaigns, impressions, products=None, orders=None):
+    """Combines and displays data from all servers (first 5 campaigns)."""
     if not campaigns or not impressions:
         print("Insufficient data for combining.")
         return
@@ -200,11 +249,21 @@ def display_combined_data(campaigns, impressions, products=None):
                 products_by_campaign[campaign_id] = []
             products_by_campaign[campaign_id].append(product)
 
+    # Group orders by campaign ID (if available)
+    orders_by_campaign = {}
+    if orders:
+        for order in orders:
+            campaign_id = order['campaign_id']
+            if campaign_id not in orders_by_campaign:
+                orders_by_campaign[campaign_id] = []
+            orders_by_campaign[campaign_id].append(order)
+
     print("\n===== COMBINED DATA (first 5 campaigns) =====")
     for campaign in campaigns[:5]:
         campaign_id = campaign['campaign_id']
         campaign_impressions = impressions_by_campaign.get(campaign_id, [])
         campaign_products = products_by_campaign.get(campaign_id, []) if products else []
+        campaign_orders = orders_by_campaign.get(campaign_id, []) if orders else []
 
         print(f"\nCampaign: {campaign['campaign_name']}")
         print(f"Campaign ID: {campaign_id}")
@@ -229,6 +288,13 @@ def display_combined_data(campaigns, impressions, products=None):
             print(f"Average product price: ${total_price / len(campaign_products):.2f}")
             print(f"Categories: {', '.join(categories)}")
 
+        if campaign_orders:
+            print(f"Number of orders: {len(campaign_orders)}")
+            total_quantity = sum(o['quantity'] for o in campaign_orders)
+            total_amount = sum(o['total_amount'] for o in campaign_orders)
+            print(f"Total quantity sold: {total_quantity}")
+            print(f"Total order amount: ${total_amount:.2f}")
+
         print("-" * 50)
 
     if len(campaigns) > 5:
@@ -238,12 +304,12 @@ def display_combined_data(campaigns, impressions, products=None):
 def main():
     # Parse command line arguments
     parser = argparse.ArgumentParser(
-        description="Query and display data from MariaDB instances and PostgreSQL"
+        description="Query and display data from MariaDB, PostgreSQL, and ClickHouse instances"
     )
     parser.add_argument(
         "--devcon",
         action="store_true",
-        help="Use Docker container connection settings (mariadb1:3306, mariadb2:3306, postgres1:5432) "
+        help="Use Docker container connection settings (mariadb1:3306, mariadb2:3306, postgres1:5432, clickhouse1:9000) "
              "as defined in examples/example_connetion/connection_maria_db*.json"
     )
     args = parser.parse_args()
@@ -255,7 +321,7 @@ def main():
         print("\nFetching data from database servers...")
         campaigns = get_campaigns()
         impressions = get_impressions()
-        
+
         # PostgreSQL is optional - handle connection errors gracefully
         try:
             products = get_products()
@@ -263,12 +329,21 @@ def main():
             print(f"⚠️  Could not connect to PostgreSQL: {e}")
             products = None
 
+        # ClickHouse is optional - handle connection errors gracefully
+        try:
+            orders = get_orders()
+        except Exception as e:
+            print(f"⚠️  Could not connect to ClickHouse: {e}")
+            orders = None
+
         # Display data
         display_campaigns(campaigns)
         display_impressions(impressions)
         if products:
             display_products(products)
-        display_combined_data(campaigns, impressions, products)
+        if orders:
+            display_orders(orders)
+        display_combined_data(campaigns, impressions, products, orders)
 
     except Exception as e:
         print(f"Error fetching data: {e}")

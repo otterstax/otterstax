@@ -4,8 +4,12 @@ set(CONNECTORS_HEADERS
     postgresql/types.hpp
     postgresql/connector.hpp
     postgresql/manager.hpp
+    clickhouse/types.hpp
+    clickhouse/connector.hpp
+    clickhouse/manager.hpp
     http_server/connection_server.hpp
     http_server/pg_connection_config.hpp
+    http_server/ch_connection_config.hpp
 )
 
 set(CONNECTORS_SOURCES
@@ -13,6 +17,8 @@ set(CONNECTORS_SOURCES
     mysql/manager.cpp
     postgresql/connector.cpp
     postgresql/manager.cpp
+    clickhouse/connector.cpp
+    clickhouse/manager.cpp
     http_server/connection_server.cpp
 )
 
@@ -28,6 +34,7 @@ target_link_libraries(connectors PUBLIC
     otterbrix::otterbrix
     actor-zeta::actor-zeta
     PostgreSQL::PostgreSQL
+    clickhouse-cpp-lib::clickhouse-cpp-lib
 )
 
 target_include_directories(connectors PUBLIC

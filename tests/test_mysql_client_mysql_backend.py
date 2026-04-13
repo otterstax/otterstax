@@ -266,7 +266,6 @@ def main_test():
     args = parser.parse_args()
 
     tests = client(local=args.local)
-
     try:
         tests.run_all_tests()
         # Print Test Success message in Green

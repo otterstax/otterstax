@@ -27,7 +27,7 @@ class OtterStax(ConanFile):
         cmake_layout(self)
 
     def requirements(self):
-        self.requires("arrow/19.0.1")
+        self.requires("arrow/21.0.0")
         self.requires("openssl/3.0.13")
         self.requires("boost/1.87.0", override=True)
         self.requires("fmt/11.1.3")
@@ -45,6 +45,7 @@ class OtterStax(ConanFile):
         self.requires("actor-zeta/1.0.0a12@")
         self.requires("libpq/15.4")
         self.requires("yaml-cpp/0.7.0")
+        self.requires("clickhouse-cpp/2.5.1")
 
     def config_options(self):
         if self.settings.os == "Windows":

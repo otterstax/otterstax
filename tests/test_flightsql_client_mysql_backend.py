@@ -88,30 +88,30 @@ def main(local=False):
     # List of expected columns (modify as needed)
     expected_schema_campaigns = {
         'campaign_name': pa.string(),
-        'campaign_id': pa.int64(),
-        'campaign_length': pa.int64(),
+        'campaign_id': pa.int32(),
+        'campaign_length': pa.int32(),
         'budget': pa.float32()
     }
 
     expected_schema_impressions = {
-        'impression_id': pa.int64(),
-        'campaign_id': pa.int64(),
-        'clicks': pa.int64(),
-        'days_since_start': pa.int64(),
+        'impression_id': pa.int32(),
+        'campaign_id': pa.int32(),
+        'clicks': pa.int32(),
+        'days_since_start': pa.int32(),
         'revenue': pa.float32(),
-        'conversions': pa.int64()
+        'conversions': pa.int32()
     }
 
     expected_schema_join = {
-        'campaign_length': pa.int64(),
-        'campaign_id': pa.int64(),
+        'campaign_length': pa.int32(),
+        'campaign_id': pa.int32(),
         'budget': pa.float32(),
         'campaign_name': pa.string(),
-        'impression_id': pa.int64(),
-        'clicks': pa.int64(),
-        'days_since_start': pa.int64(),
+        'impression_id': pa.int32(),
+        'clicks': pa.int32(),
+        'days_since_start': pa.int32(),
         'revenue': pa.float32(),
-        'conversions': pa.int64()
+        'conversions': pa.int32()
     }
 
     # Test 1: Basic JOIN with WHERE and ORDER BY (from examples/example_2.txt)

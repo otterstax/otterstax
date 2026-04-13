@@ -1,0 +1,9 @@
+{
+    "alias": "chtest",
+    "host": "clickhouse1",
+    "port": "9000",
+    "username": "chuser",
+    "password": "chpassword",
+    "database": "chdb",
+    "table": "orders"
+}

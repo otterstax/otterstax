@@ -10,6 +10,7 @@
 
 #include "../mysql/manager.hpp"
 #include "../postgresql/manager.hpp"
+#include "../clickhouse/manager.hpp"
 
 namespace beast = boost::beast;
 namespace http = beast::http;
@@ -24,11 +25,13 @@ namespace http_server {
         http::response<http::string_body> response_;
         std::shared_ptr<mysqlc::ConnectorManager> mysql_conn_manager_;
         std::shared_ptr<pgc::ConnectorManager> pg_conn_manager_;
+        std::shared_ptr<chc::ConnectorManager> ch_conn_manager_;
 
     public:
         explicit Session(tcp::socket socket,
                          std::shared_ptr<mysqlc::ConnectorManager> mysql_conn_manager,
-                         std::shared_ptr<pgc::ConnectorManager> pg_conn_manager);
+                         std::shared_ptr<pgc::ConnectorManager> pg_conn_manager,
+                         std::shared_ptr<chc::ConnectorManager> ch_conn_manager);
         void start();
 
     private:
@@ -44,11 +47,13 @@ namespace http_server {
     public:
         Server(asio::io_context& ioc, unsigned short port,
                std::shared_ptr<mysqlc::ConnectorManager> mysql_conn_manager,
-               std::shared_ptr<pgc::ConnectorManager> pg_conn_manager);
+               std::shared_ptr<pgc::ConnectorManager> pg_conn_manager,
+               std::shared_ptr<chc::ConnectorManager> ch_conn_manager);
 
     private:
         void accept();
         std::shared_ptr<mysqlc::ConnectorManager> mysql_conn_manager_;
         std::shared_ptr<pgc::ConnectorManager> pg_conn_manager_;
+        std::shared_ptr<chc::ConnectorManager> ch_conn_manager_;
     };
 } // namespace http_server

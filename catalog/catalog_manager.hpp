@@ -7,10 +7,12 @@
 
 #include "connectors/mysql/manager.hpp"
 #include "connectors/postgresql/manager.hpp"
+#include "connectors/clickhouse/manager.hpp"
 #include "otterbrix/parser/parser.hpp"
 #include "otterbrix/query_generation/sql_query_generator.hpp"
 #include "otterbrix/translators/input/mysql_to_complex.hpp"
 #include "otterbrix/translators/input/pg_to_chunk.hpp"
+#include "otterbrix/translators/input/ch_to_chunk.hpp"
 #include "routes/catalog_manager.hpp"
 #include "routes/scheduler.hpp"
 #include "scheduler/schema_utils.hpp"
@@ -33,7 +35,8 @@ namespace catalog_ext {
 
     enum class ConnectionType : uint8_t {
         MySQL = 0,
-        PostgreSQL = 1
+        PostgreSQL = 1,
+        ClickHouse = 2
     };
 
     struct ConnectionInfo {
@@ -56,6 +59,7 @@ namespace mysqlc {
         CatalogManager(std::pmr::memory_resource* res);
         void set_mysql_connector_manager(std::shared_ptr<ConnectorManager> mysql_conn_manager);
         void set_pg_connector_manager(std::shared_ptr<pgc::ConnectorManager> pg_conn_manager);
+        void set_ch_connector_manager(std::shared_ptr<chc::ConnectorManager> ch_conn_manager);
 
         actor_zeta::behavior_t behavior();
         auto make_scheduler() noexcept -> actor_zeta::scheduler_abstract_t*;
@@ -83,6 +87,7 @@ namespace mysqlc {
         components::catalog::catalog catalog_;
         std::shared_ptr<ConnectorManager> mysql_conn_manager_;
         std::shared_ptr<pgc::ConnectorManager> pg_conn_manager_;
+        std::shared_ptr<chc::ConnectorManager> ch_conn_manager_;
         std::mutex input_mtx_;
         TaskManager<std::packaged_task<void()>> worker_;
 

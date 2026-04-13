@@ -24,6 +24,7 @@ init_dir = PROJECT_ROOT / 'init'
 (init_dir / 'mariadb1').mkdir(parents=True, exist_ok=True)
 (init_dir / 'mariadb2').mkdir(parents=True, exist_ok=True)
 (init_dir / 'postgres').mkdir(parents=True, exist_ok=True)
+(init_dir / 'clickhouse').mkdir(parents=True, exist_ok=True)
 
 # Generation parameters
 NUM_CAMPAIGNS = 500
@@ -155,3 +156,41 @@ with open(init_dir / 'postgres' / 'init.sql', 'w') as f:
     f.write(postgres_sql)
 
 print(f"- {init_dir}/postgres/init.sql (products table with {product_id - 1} records)")
+
+# SQL for creating ClickHouse orders table
+clickhouse_sql = """-- Creating orders table for ClickHouse
+CREATE TABLE IF NOT EXISTS chdb.orders (
+    order_id Int64,
+    campaign_id Int32,
+    product_id Int32,
+    customer_name String,
+    order_date DateTime,
+    quantity Int32,
+    total_amount Float64
+) ENGINE = MergeTree()
+ORDER BY (campaign_id, order_date);
+
+-- Inserting order data
+"""
+
+print(f"Generating orders for ClickHouse...")
+order_id = 1
+for campaign in campaigns_data:
+    # Each campaign has 10-50 orders
+    num_orders = random.randint(10, 50)
+    for _ in range(num_orders):
+        customer_name = f"{fake.first_name()} {fake.last_name()}"
+        order_date = fake.date_time_between(start_date='-1y', end_date='now').strftime('%Y-%m-%d %H:%M:%S')
+        quantity = random.randint(1, 10)
+        total_amount = round(quantity * random.uniform(19.99, 999.99), 2)
+        # Link to a product (assume product_id starts from 1)
+        product_id_link = random.randint(1, product_id - 1)
+
+        clickhouse_sql += f"INSERT INTO chdb.orders (order_id, campaign_id, product_id, customer_name, order_date, quantity, total_amount) VALUES ({order_id}, {campaign['id']}, {product_id_link}, '{customer_name}', '{order_date}', {quantity}, {total_amount});\n"
+        order_id += 1
+
+# Write ClickHouse SQL
+with open(init_dir / 'clickhouse' / 'init.sql', 'w') as f:
+    f.write(clickhouse_sql)
+
+print(f"- {init_dir}/clickhouse/init.sql (orders table with {order_id - 1} records)")

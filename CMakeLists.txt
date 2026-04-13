@@ -13,6 +13,7 @@ add_compile_definitions(SPDLOG_ACTIVE_LEVEL=${SPDLOG_ACTIVE_LEVEL})
 
 # Option to build tests
 option(BUILD_TESTS "Build unit tests" OFF)
+option(BUILD_BENCHMARKS "Build benchmarks" OFF)
 
 # Find the Conan packages
 find_package(Arrow REQUIRED)
@@ -28,6 +29,7 @@ find_package(Boost 1.87.0 REQUIRED COMPONENTS
 )
 find_package(PostgreSQL REQUIRED)
 find_package(yaml-cpp REQUIRED)
+find_package(clickhouse-cpp REQUIRED)
 find_package(Threads)
 
 if(NOT Threads_FOUND)
@@ -121,4 +123,6 @@ if(BUILD_TESTS)
     add_subdirectory(tests/system)
 endif()
 
-
+if(BUILD_BENCHMARKS)
+    add_subdirectory(benchmark)
+endif()

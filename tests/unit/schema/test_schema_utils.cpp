@@ -48,10 +48,10 @@ TEST_CASE("aggregate: filter") {
     fields.back().set_alias("name");
     fields.emplace_back(logical_type::FLOAT);
     fields.back().set_alias("dummy");
-    auto schema = catalog::schema(resource, complex_logical_type::create_struct(fields));
+    auto schema_types = fields;
 
     auto filtered =
-        aggregate_filter_schema(static_cast<const logical_plan::node_aggregate_t&>(*node), params.get(), schema);
+        aggregate_filter_schema(static_cast<const logical_plan::node_aggregate_t&>(*node), params.get(), schema_types);
     REQUIRE(filtered.child_types().size() == 2);
     REQUIRE(complex_logical_type::contains(filtered, logical_type::BIGINT));
     REQUIRE(complex_logical_type::contains(filtered, logical_type::STRING_LITERAL));
@@ -64,7 +64,7 @@ TEST_CASE("aggregate: constants & aggregations") {
     {
         auto [node, params] = parse("SELECT 1, avg(smth) from test;");
         auto filtered =
-            aggregate_filter_schema(static_cast<const logical_plan::node_aggregate_t&>(*node), params.get(), schema);
+            aggregate_filter_schema(static_cast<const logical_plan::node_aggregate_t&>(*node), params.get(), schema_types);
         REQUIRE(filtered.child_types().size() == 2);
         REQUIRE(complex_logical_type::contains(filtered, [](const complex_logical_type& type) {
             return type.type() == logical_type::BIGINT && type.alias() == "1";
@@ -74,7 +74,7 @@ TEST_CASE("aggregate: constants & aggregations") {
     {
         auto [node, params] = parse("SELECT max(smth), count(smth), min(smth), max(smth), 'name' from test;");
         auto filtered =
-            aggregate_filter_schema(static_cast<const logical_plan::node_aggregate_t&>(*node), params.get(), schema);
+            aggregate_filter_schema(static_cast<const logical_plan::node_aggregate_t&>(*node), params.get(), schema_types);
         REQUIRE(filtered.child_types().size() == 5);
         for (size_t i = 0; i < 4; ++i) {
             REQUIRE(filtered.child_types()[i] == logical_type::BIGINT);
@@ -92,8 +92,11 @@ TEST_CASE("join: simple") {
     fields.back().set_alias("id");
     fields.emplace_back(logical_type::STRING_LITERAL);
     fields.back().set_alias("name");
-    auto struct_t = complex_logical_type::create_struct(fields);
-    auto cursor = cursor::make_cursor(resource, {struct_t, struct_t});
+    auto struct_t = complex_logical_type::create_struct("", fields);
+    std::pmr::vector<complex_logical_type> cursor_types(resource);
+    cursor_types.push_back(struct_t);
+    cursor_types.push_back(struct_t);
+    auto cursor = cursor::make_cursor(resource, std::move(cursor_types));
 
     auto dependencies = fill_test(2);
     auto joined_cur = compute_otterbrix_schema(static_cast<const logical_plan::node_aggregate_t&>(*node),
@@ -122,7 +125,7 @@ TEST_CASE("join: complex") {
         fields.back().set_alias("id");
         fields.emplace_back(logical_type::STRING_LITERAL);
         fields.back().set_alias("name");
-        catalog_vec.emplace_back(complex_logical_type::create_struct(fields));
+        catalog_vec.emplace_back(complex_logical_type::create_struct("", fields));
     }
     {
         std::vector<complex_logical_type> fields;
@@ -130,7 +133,7 @@ TEST_CASE("join: complex") {
         fields.back().set_alias("value");
         fields.emplace_back(logical_type::DOUBLE);
         fields.back().set_alias("pi");
-        catalog_vec.emplace_back(complex_logical_type::create_struct(fields));
+        catalog_vec.emplace_back(complex_logical_type::create_struct("", fields));
     }
     {
         std::vector<complex_logical_type> fields;
@@ -138,7 +141,7 @@ TEST_CASE("join: complex") {
         fields.back().set_alias("id");
         fields.emplace_back(logical_type::BOOLEAN);
         fields.back().set_alias("is_something");
-        catalog_vec.emplace_back(complex_logical_type::create_struct(fields));
+        catalog_vec.emplace_back(complex_logical_type::create_struct("", fields));
     }
 
     auto dependencies = fill_test(3);

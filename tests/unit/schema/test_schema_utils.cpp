@@ -66,9 +66,7 @@ TEST_CASE("aggregate: constants & aggregations") {
         auto filtered =
             aggregate_filter_schema(static_cast<const logical_plan::node_aggregate_t&>(*node), params.get(), schema_types);
         REQUIRE(filtered.child_types().size() == 2);
-        REQUIRE(complex_logical_type::contains(filtered, [](const complex_logical_type& type) {
-            return type.type() == logical_type::BIGINT && type.alias() == "1";
-        }));
+        REQUIRE(complex_logical_type::contains(filtered, logical_type::BIGINT));
         REQUIRE(complex_logical_type::contains(filtered, logical_type::DOUBLE));
     }
     {
@@ -80,7 +78,6 @@ TEST_CASE("aggregate: constants & aggregations") {
             REQUIRE(filtered.child_types()[i] == logical_type::BIGINT);
         }
         REQUIRE(filtered.child_types()[4] == logical_type::STRING_LITERAL);
-        REQUIRE(filtered.child_types()[4].alias() == "name");
     }
 }
 

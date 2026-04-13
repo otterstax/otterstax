@@ -5,6 +5,7 @@
 #include "frontend/mysql_server/resultset/mysql_resultset.hpp"
 
 #include <catch2/catch.hpp>
+#include <map>
 
 using namespace components;
 using namespace frontend;
@@ -34,10 +35,10 @@ TEST_CASE("text_resultset: single row") {
     fields.emplace_back(components::types::logical_type::DOUBLE, "double");
 
     vector::data_chunk_t row(resource, fields);
-    row.set_value(0, 0, types::logical_value_t{"test"});
-    row.set_value(1, 0, types::logical_value_t{1000});
-    row.set_value(2, 0, types::logical_value_t{true});
-    row.set_value(3, 0, types::logical_value_t{3.141593});
+    row.set_value(0, 0, types::logical_value_t{resource,"test"});
+    row.set_value(1, 0, types::logical_value_t{resource,1000});
+    row.set_value(2, 0, types::logical_value_t{resource,true});
+    row.set_value(3, 0, types::logical_value_t{resource,3.141593});
 
     std::vector<std::string> expected_names;
     std::map<std::string, field_type> expected_type{{"str", field_type::MYSQL_TYPE_STRING},
@@ -121,7 +122,7 @@ TEST_CASE("text_resultset: multi row") {
 
     chunk.resize(100);
     for (size_t i = 0; i < 100; ++i) {
-        chunk.set_value(0, i, types::logical_value_t{std::string_view(test_str)});
+        chunk.set_value(0, i, types::logical_value_t{resource,std::string_view(test_str)});
     }
 
     packet_writer w;
@@ -160,8 +161,8 @@ TEST_CASE("text_resultset: null (data_chunk)") {
 
     std::string test_str = "test";
 
-    chunk.set_value(0, 0, types::logical_value_t{test_str});
-    chunk.set_value(0, 1, types::logical_value_t{});
+    chunk.set_value(0, 0, types::logical_value_t{resource,test_str});
+    chunk.set_value(0, 1, types::logical_value_t{resource, nullptr});
 
     packet_writer w;
     mysql_resultset result(w, result_encoding::TEXT, "db", "tbl");

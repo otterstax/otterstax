@@ -175,7 +175,7 @@ TEST_CASE("Error in otterbrix test case") {
     shared_data->wait_for(5000ms);
     std::cout << "[Main thread] " << std::this_thread::get_id() << "check data" << std::endl;
     REQUIRE(shared_data->status() == cv_wrapper::Status::Error);
-    REQUIRE(shared_data->error_message() == "SimpleMockOtterbrixManager: exception in execute_plan");
+    REQUIRE(shared_data->error_message() == "Otterbrix execution failed: SimpleMockOtterbrixManager: exception in execute_plan");
     REQUIRE(shared_data->result.chunk.empty() == true);
 }
 

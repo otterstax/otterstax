@@ -20,6 +20,7 @@ done
 MYSQL_URL="http://${HOST}:8085/add_connection"
 PG_URL="http://${HOST}:8085/add_pg_connection"
 CH_URL="http://${HOST}:8085/add_ch_connection"
+S3_URL="http://${HOST}:8085/add_s3_connection"
 
 # Function to send connection request with retry
 send_connection_request() {
@@ -64,4 +65,9 @@ echo ""
 # ClickHouse connection
 FILE="connection_clickhouse.json"
 send_connection_request "$CH_URL" "$FILE" || echo "Warning: ClickHouse connection may have failed"
+echo ""
+
+# S3 connection
+FILE="connection_s3.json"
+send_connection_request "$S3_URL" "$FILE" || echo "Warning: S3 connection may have failed"
 echo ""

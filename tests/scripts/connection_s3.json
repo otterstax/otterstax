@@ -1,0 +1,10 @@
+{
+    "alias": "s3events",
+    "bucket": "test-bucket",
+    "region": "us-east-1",
+    "access_key": "test",
+    "secret_key": "test",
+    "endpoint": "http://localstack:4566",
+    "prefix": "data/events.parquet",
+    "format": "parquet"
+}

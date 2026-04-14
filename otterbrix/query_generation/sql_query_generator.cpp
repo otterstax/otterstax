@@ -712,6 +712,11 @@ namespace sql_gen {
                 // ClickHouse: database.collection (no schema level)
                 s << name.database << "." << name.collection;
                 break;
+            case backend_type_t::File:
+            case backend_type_t::S3:
+                // File/S3 backends don't generate SQL, but use alias as table reference
+                s << name.collection;
+                break;
             case backend_type_t::MySQL:
             case backend_type_t::Unknown:
             case backend_type_t::Mixed:

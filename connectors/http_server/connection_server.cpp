@@ -42,11 +42,15 @@ namespace http_server {
     Session::Session(tcp::socket socket,
                      std::shared_ptr<mysqlc::ConnectorManager> mysql_conn_manager,
                      std::shared_ptr<pgc::ConnectorManager> pg_conn_manager,
-                     std::shared_ptr<chc::ConnectorManager> ch_conn_manager)
+                     std::shared_ptr<chc::ConnectorManager> ch_conn_manager,
+                     std::shared_ptr<filec::ConnectorManager> file_conn_manager,
+                     std::shared_ptr<s3c::ConnectorManager> s3_conn_manager)
         : socket_(std::move(socket))
         , mysql_conn_manager_(std::move(mysql_conn_manager))
         , pg_conn_manager_(std::move(pg_conn_manager))
-        , ch_conn_manager_(std::move(ch_conn_manager)) {}
+        , ch_conn_manager_(std::move(ch_conn_manager))
+        , file_conn_manager_(std::move(file_conn_manager))
+        , s3_conn_manager_(std::move(s3_conn_manager)) {}
 
     void Session::start() { read_request(); }
 
@@ -259,6 +263,111 @@ namespace http_server {
                 response_.result(http::status::bad_request);
                 response_.body() = std::string("ERROR: ") + e.what();
             }
+        } else if (request_.method() == http::verb::post && request_.target() == "/add_file_connection") {
+            try {
+                auto json_body = boost::json::parse(request_.body());
+                for (const auto& key : {"alias", "path"}) {
+                    if (!json_body.as_object().contains(key)) {
+                        response_.result(http::status::bad_request);
+                        response_.body() = std::string("Missing key: ") + key;
+                        write_response();
+                        return;
+                    }
+                }
+                filec::connect_params params;
+                params.alias = json_body.at("alias").as_string().c_str();
+                params.path = json_body.at("path").as_string().c_str();
+                if (json_body.as_object().contains("format")) {
+                    std::string fmt = json_body.at("format").as_string().c_str();
+                    if (fmt == "parquet") params.format = filec::FileFormat::Parquet;
+                    else if (fmt == "csv") params.format = filec::FileFormat::CSV;
+                    else if (fmt == "json") params.format = filec::FileFormat::JSON;
+                    else params.format = filec::FileFormat::Auto;
+                }
+                if (json_body.as_object().contains("csv_delimiter")) {
+                    params.csv_delimiter = json_body.at("csv_delimiter").as_string().c_str()[0];
+                }
+                if (json_body.as_object().contains("csv_header")) {
+                    params.csv_header = json_body.at("csv_header").as_bool();
+                }
+                file_conn_manager_->addConnection(params);
+                response_.result(http::status::ok);
+                response_.set(http::field::content_type, "application/json");
+                response_.body() = "File connection added";
+                response_.content_length(response_.body().size());
+            } catch (const std::exception& e) {
+                response_.result(http::status::bad_request);
+                response_.body() = std::string("ERROR: ") + e.what();
+            }
+        } else if (request_.method() == http::verb::post && request_.target() == "/add_s3_connection") {
+            try {
+                auto json_body = boost::json::parse(request_.body());
+                for (const auto& key : {"alias", "bucket", "prefix"}) {
+                    if (!json_body.as_object().contains(key)) {
+                        response_.result(http::status::bad_request);
+                        response_.body() = std::string("Missing key: ") + key;
+                        write_response();
+                        return;
+                    }
+                }
+                s3c::connect_params params;
+                params.alias = json_body.at("alias").as_string().c_str();
+                params.bucket = json_body.at("bucket").as_string().c_str();
+                params.prefix = json_body.at("prefix").as_string().c_str();
+                if (json_body.as_object().contains("region"))
+                    params.region = json_body.at("region").as_string().c_str();
+                if (json_body.as_object().contains("access_key"))
+                    params.access_key = json_body.at("access_key").as_string().c_str();
+                if (json_body.as_object().contains("secret_key"))
+                    params.secret_key = json_body.at("secret_key").as_string().c_str();
+                if (json_body.as_object().contains("session_token"))
+                    params.session_token = json_body.at("session_token").as_string().c_str();
+                if (json_body.as_object().contains("endpoint"))
+                    params.endpoint = json_body.at("endpoint").as_string().c_str();
+                if (json_body.as_object().contains("format")) {
+                    std::string fmt = json_body.at("format").as_string().c_str();
+                    if (fmt == "parquet") params.format = filec::FileFormat::Parquet;
+                    else if (fmt == "csv") params.format = filec::FileFormat::CSV;
+                    else if (fmt == "json") params.format = filec::FileFormat::JSON;
+                    else params.format = filec::FileFormat::Auto;
+                }
+                s3_conn_manager_->addConnection(params);
+                response_.result(http::status::ok);
+                response_.set(http::field::content_type, "application/json");
+                response_.body() = "S3 connection added";
+                response_.content_length(response_.body().size());
+            } catch (const std::exception& e) {
+                response_.result(http::status::bad_request);
+                response_.body() = std::string("ERROR: ") + e.what();
+            }
+        } else if (request_.method() == http::verb::get && request_.target() == "/check_file_connection") {
+            try {
+                auto json_body = boost::json::parse(request_.body());
+                std::string alias = json_body.at("alias").as_string().c_str();
+                bool exists = file_conn_manager_->hasConnection(alias);
+                response_.result(http::status::ok);
+                response_.set(http::field::content_type, "application/json");
+                response_.body() = exists ? "File connection [" + alias + "] exists"
+                                          : "File connection [" + alias + "] not exist";
+                response_.content_length(response_.body().size());
+            } catch (const std::exception& e) {
+                response_.result(http::status::bad_request);
+                response_.body() = std::string("ERROR: ") + e.what();
+            }
+        } else if (request_.method() == http::verb::get && request_.target() == "/check_s3_connection") {
+            try {
+                auto json_body = boost::json::parse(request_.body());
+                std::string alias = json_body.at("alias").as_string().c_str();
+                bool exists = s3_conn_manager_->hasConnection(alias);
+                response_.result(http::status::ok);
+                response_.set(http::field::content_type, "application/json");
+                response_.body() = exists ? "S3 connection [" + alias + "] exists"
+                                          : "S3 connection [" + alias + "] not exist";
+                response_.content_length(response_.body().size());
+            } catch (const std::exception& e) {
+                response_.result(http::status::bad_request);
+                response_.body() = std::string("ERROR: ") + e.what();
+            }
         } else {
             response_.result(http::status::not_found);
             response_.body() = "Resource not found";
@@ -278,19 +387,25 @@ namespace http_server {
                    unsigned short port,
                    std::shared_ptr<mysqlc::ConnectorManager> mysql_conn_manager,
                    std::shared_ptr<pgc::ConnectorManager> pg_conn_manager,
-                   std::shared_ptr<chc::ConnectorManager> ch_conn_manager)
+                   std::shared_ptr<chc::ConnectorManager> ch_conn_manager,
+                   std::shared_ptr<filec::ConnectorManager> file_conn_manager,
+                   std::shared_ptr<s3c::ConnectorManager> s3_conn_manager)
         : ioc_(ioc)
         , acceptor_(ioc, tcp::endpoint(tcp::v4(), port))
         , mysql_conn_manager_(std::move(mysql_conn_manager))
         , pg_conn_manager_(std::move(pg_conn_manager))
-        , ch_conn_manager_(std::move(ch_conn_manager)) {
+        , ch_conn_manager_(std::move(ch_conn_manager))
+        , file_conn_manager_(std::move(file_conn_manager))
+        , s3_conn_manager_(std::move(s3_conn_manager)) {
         accept();
     }
 
     void Server::accept() {
         acceptor_.async_accept([this](beast::error_code ec, tcp::socket socket) {
             if (!ec)
-                std::make_shared<Session>(std::move(socket), mysql_conn_manager_, pg_conn_manager_, ch_conn_manager_)
+                std::make_shared<Session>(std::move(socket),
+                                          mysql_conn_manager_, pg_conn_manager_, ch_conn_manager_,
+                                          file_conn_manager_, s3_conn_manager_)
                     ->start();
             accept();
         });

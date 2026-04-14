@@ -59,6 +59,10 @@ namespace mysqlc {
         file_conn_manager_ = std::move(file_conn_manager);
     }
 
+    void CatalogManager::set_s3_connector_manager(std::shared_ptr<s3c::ConnectorManager> s3_conn_manager) {
+        s3_conn_manager_ = std::move(s3_conn_manager);
+    }
+
     void CatalogManager::registerConnection(const std::string& uuid,
                                             catalog_ext::ConnectionType type,
                                             const collection_full_name_t& name) {
@@ -137,6 +141,7 @@ namespace mysqlc {
         bool has_pg = false;
         bool has_ch = false;
         bool has_file = false;
+        bool has_s3 = false;
 
         for (auto& batch : data->otterbrix_params->external_nodes) {
             for (size_t i = 0; i < batch.size(); ++i) {
@@ -158,15 +163,20 @@ namespace mysqlc {
                     } else if (conn_type == catalog_ext::ConnectionType::File) {
                         has_file = true;
                         data->node_backend_types[name.unique_identifier] = backend_type_t::File;
+                    } else if (conn_type == catalog_ext::ConnectionType::S3) {
+                        has_s3 = true;
+                        data->node_backend_types[name.unique_identifier] = backend_type_t::S3;
                     }
                 }
             }
         }
 
         // Set backend type based on connections found
-        int backend_count = (has_mysql ? 1 : 0) + (has_pg ? 1 : 0) + (has_ch ? 1 : 0) + (has_file ? 1 : 0);
+        int backend_count = (has_mysql ? 1 : 0) + (has_pg ? 1 : 0) + (has_ch ? 1 : 0) + (has_file ? 1 : 0) + (has_s3 ? 1 : 0);
         if (backend_count > 1) {
             data->backend_type = backend_type_t::Mixed;
+        } else if (has_s3) {
+            data->backend_type = backend_type_t::S3;
         } else if (has_file) {
             data->backend_type = backend_type_t::File;
         } else if (has_ch) {
@@ -287,6 +297,7 @@ namespace mysqlc {
         bool is_pg = pg_conn_manager_ && pg_conn_manager_->hasConnection(uuid);
         bool is_ch = ch_conn_manager_ && ch_conn_manager_->hasConnection(uuid);
         bool is_file = file_conn_manager_ && file_conn_manager_->hasConnection(uuid);
+        bool is_s3 = s3_conn_manager_ && s3_conn_manager_->hasConnection(uuid);
 
         if (is_mysql) {
             conn_type = catalog_ext::ConnectionType::MySQL;
@@ -300,6 +311,9 @@ namespace mysqlc {
         } else if (is_file) {
             conn_type = catalog_ext::ConnectionType::File;
             log_->debug("add_connection_schema: detected File connection for uuid: {}", uuid);
+        } else if (is_s3) {
+            conn_type = catalog_ext::ConnectionType::S3;
+            log_->debug("add_connection_schema: detected S3 connection for uuid: {}", uuid);
         } else {
             log_->error("add_connection_schema: no connector manager has connection with uuid: {}", uuid);
             return catalog::catalog_error(catalog::catalog_mistake_t::FIELD_MISSING,

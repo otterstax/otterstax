@@ -17,6 +17,7 @@ enum class group_id_t : uint8_t
     pg_connection_manager,
     ch_connection_manager,
     file_connection_manager,
+    s3_connection_manager,
 };
 
 template<class T>

@@ -16,6 +16,7 @@ namespace scheduler {
         execute_remote_pg_finish,
         execute_remote_ch_finish,
         execute_remote_file_finish,
+        execute_remote_s3_finish,
         execute_otterbrix_finish,
         execute_failed,
         get_catalog_schema_finish,

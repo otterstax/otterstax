@@ -11,6 +11,8 @@
 #include "../mysql/manager.hpp"
 #include "../postgresql/manager.hpp"
 #include "../clickhouse/manager.hpp"
+#include "../file/manager.hpp"
+#include "../s3/manager.hpp"
 
 namespace beast = boost::beast;
 namespace http = beast::http;
@@ -26,12 +28,16 @@ namespace http_server {
         std::shared_ptr<mysqlc::ConnectorManager> mysql_conn_manager_;
         std::shared_ptr<pgc::ConnectorManager> pg_conn_manager_;
         std::shared_ptr<chc::ConnectorManager> ch_conn_manager_;
+        std::shared_ptr<filec::ConnectorManager> file_conn_manager_;
+        std::shared_ptr<s3c::ConnectorManager> s3_conn_manager_;
 
     public:
         explicit Session(tcp::socket socket,
                          std::shared_ptr<mysqlc::ConnectorManager> mysql_conn_manager,
                          std::shared_ptr<pgc::ConnectorManager> pg_conn_manager,
-                         std::shared_ptr<chc::ConnectorManager> ch_conn_manager);
+                         std::shared_ptr<chc::ConnectorManager> ch_conn_manager,
+                         std::shared_ptr<filec::ConnectorManager> file_conn_manager,
+                         std::shared_ptr<s3c::ConnectorManager> s3_conn_manager);
         void start();
 
     private:
@@ -48,12 +54,16 @@ namespace http_server {
         Server(asio::io_context& ioc, unsigned short port,
                std::shared_ptr<mysqlc::ConnectorManager> mysql_conn_manager,
                std::shared_ptr<pgc::ConnectorManager> pg_conn_manager,
-               std::shared_ptr<chc::ConnectorManager> ch_conn_manager);
+               std::shared_ptr<chc::ConnectorManager> ch_conn_manager,
+               std::shared_ptr<filec::ConnectorManager> file_conn_manager,
+               std::shared_ptr<s3c::ConnectorManager> s3_conn_manager);
 
     private:
         void accept();
         std::shared_ptr<mysqlc::ConnectorManager> mysql_conn_manager_;
         std::shared_ptr<pgc::ConnectorManager> pg_conn_manager_;
         std::shared_ptr<chc::ConnectorManager> ch_conn_manager_;
+        std::shared_ptr<filec::ConnectorManager> file_conn_manager_;
+        std::shared_ptr<s3c::ConnectorManager> s3_conn_manager_;
     };
 } // namespace http_server

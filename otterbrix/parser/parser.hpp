@@ -23,6 +23,7 @@ enum class backend_type_t : uint8_t {
     Otterbrix = 4, // No external nodes, but should be executed by otterbrix
     ClickHouse = 5,
     File = 6,
+    S3 = 7,
 };
 
 struct ParsedQueryData {

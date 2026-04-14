@@ -46,6 +46,7 @@ class OtterStax(ConanFile):
         self.requires("libpq/15.4")
         self.requires("yaml-cpp/0.7.0")
         self.requires("clickhouse-cpp/2.5.1")
+        self.requires("aws-sdk-cpp/1.11.352")
 
     def config_options(self):
         if self.settings.os == "Windows":
@@ -67,6 +68,11 @@ class OtterStax(ConanFile):
         self.options["arrow/*"].with_parquet = True
         self.options["arrow/*"].with_csv = True
         self.options["arrow/*"].with_json = True
+
+        self.options["aws-sdk-cpp/*"].shared = True
+        self.options["aws-sdk-cpp/*"].s3 = True
+        self.options["aws-sdk-cpp/*"].text_to_speech = False
+        self.options["aws-sdk-cpp/*"].transfer = False
 
         self.options["otterbrix/*"].shared = True
         

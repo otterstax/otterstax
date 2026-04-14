@@ -7,6 +7,7 @@
 #include "routes/pg_connection_manager.hpp"
 #include "routes/ch_connection_manager.hpp"
 #include "routes/file_connection_manager.hpp"
+#include "routes/s3_connection_manager.hpp"
 #include "routes/scheduler.hpp"
 #include "routes/sql_connection_manager.hpp"
 #include "utility/timer.hpp"
@@ -23,7 +24,9 @@ Scheduler::Scheduler(std::pmr::memory_resource* res,
                      actor_zeta::address_t pg_connection_manager,
                      actor_zeta::address_t ch_connection_manager,
                      actor_zeta::address_t file_connection_manager,
+                     actor_zeta::address_t s3_connection_manager,
                      actor_zeta::address_t otterbrix_manager,
+
                      actor_zeta::address_t catalog_manager)
     : actor_zeta::cooperative_supervisor<Scheduler>(res)
     , parser_(std::move(parser))
@@ -64,6 +67,11 @@ Scheduler::Scheduler(std::pmr::memory_resource* res,
                                     scheduler::handler_id(scheduler::route::execute_remote_file_finish),
                                     this,
                                     &Scheduler::execute_remote_file_finish))
+    , execute_remote_s3_finish_(
+          actor_zeta::make_behavior(resource(),
+                                    scheduler::handler_id(scheduler::route::execute_remote_s3_finish),
+                                    this,
+                                    &Scheduler::execute_remote_s3_finish))
     , execute_otterbrix_finish_(
           actor_zeta::make_behavior(resource(),
                                     scheduler::handler_id(scheduler::route::execute_otterbrix_finish),
@@ -92,6 +100,7 @@ Scheduler::Scheduler(std::pmr::memory_resource* res,
     , pg_connection_manager_(pg_connection_manager)
     , ch_connection_manager_(ch_connection_manager)
     , file_connection_manager_(file_connection_manager)
+    , s3_connection_manager_(s3_connection_manager)
     , otterbrix_manager_(otterbrix_manager)
     , catalog_manager_(catalog_manager)
     , log_(get_logger(logger_tag::SCHEDULER)) {
@@ -137,6 +146,10 @@ actor_zeta::behavior_t Scheduler::behavior() {
             }
             case scheduler::handler_id(scheduler::route::execute_remote_file_finish): {
                 execute_remote_file_finish_(msg);
+                break;
+            }
+            case scheduler::handler_id(scheduler::route::execute_remote_s3_finish): {
+                execute_remote_s3_finish_(msg);
                 break;
             }
             case scheduler::handler_id(scheduler::route::execute_otterbrix_finish): {
@@ -285,6 +298,16 @@ void Scheduler::execute_statement(session_hash_t id, shared_session_payload sdat
                         actor_zeta::send(this->file_connection_manager_,
                                          this->address(),
                                          file_connection_manager::handler_id(file_connection_manager::route::execute),
+                                         id,
+                                         std::move(data_ptr),
+                                         this->address());
+                        break;
+                    }
+                    case backend_type_t::S3: {
+                        log_->debug("execute_statement sending to s3_connection_manager");
+                        actor_zeta::send(this->s3_connection_manager_,
+                                         this->address(),
+                                         s3_connection_manager::handler_id(s3_connection_manager::route::execute),
                                          id,
                                          std::move(data_ptr),
                                          this->address());
@@ -455,6 +478,15 @@ void Scheduler::execute_remote_ch_finish(session_hash_t id, ParsedQueryDataPtr&&
 
 void Scheduler::execute_remote_file_finish(session_hash_t id, ParsedQueryDataPtr&& data) {
     log_->debug("Scheduler::execute_remote_file_finish, id hash: {}", id);
+    actor_zeta::send(otterbrix_manager_,
+                     address(),
+                     otterbrix_manager::handler_id(otterbrix_manager::route::execute),
+                     id,
+                     std::move(data->otterbrix_params));
+}
+
+void Scheduler::execute_remote_s3_finish(session_hash_t id, ParsedQueryDataPtr&& data) {
+    log_->debug("Scheduler::execute_remote_s3_finish, id hash: {}", id);
     actor_zeta::send(otterbrix_manager_,
                      address(),
                      otterbrix_manager::handler_id(otterbrix_manager::route::execute),

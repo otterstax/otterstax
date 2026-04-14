@@ -10,6 +10,9 @@ set(CONNECTORS_HEADERS
     file/types.hpp
     file/connector.hpp
     file/manager.hpp
+    s3/types.hpp
+    s3/connector.hpp
+    s3/manager.hpp
     http_server/connection_server.hpp
     http_server/pg_connection_config.hpp
     http_server/ch_connection_config.hpp
@@ -24,6 +27,8 @@ set(CONNECTORS_SOURCES
     clickhouse/manager.cpp
     file/connector.cpp
     file/manager.cpp
+    s3/connector.cpp
+    s3/manager.cpp
     http_server/connection_server.cpp
 )
 
@@ -40,6 +45,7 @@ target_link_libraries(connectors PUBLIC
     actor-zeta::actor-zeta
     PostgreSQL::PostgreSQL
     clickhouse-cpp-lib::clickhouse-cpp-lib
+    aws-sdk-cpp::s3
 )
 
 target_include_directories(connectors PUBLIC

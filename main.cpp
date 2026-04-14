@@ -91,9 +91,12 @@ int main(int argc, char* argv[]) {
     std::jthread server_thread([mysql_conn_manager = std::move(cmanager.db_connection_manager()),
                                 pg_conn_manager = std::move(cmanager.pg_connection_manager()),
                                 ch_conn_manager = std::move(cmanager.ch_connection_manager()),
+                                file_conn_manager = std::move(cmanager.file_connection_manager()),
+                                s3_conn_manager = std::move(cmanager.s3_connection_manager()),
                                 http_port = server_config.connection_manager.port]() {
         asio::io_context ctx;
-        http_server::Server server(ctx, http_port, mysql_conn_manager, pg_conn_manager, ch_conn_manager);
+        http_server::Server server(ctx, http_port, mysql_conn_manager, pg_conn_manager, ch_conn_manager,
+                                   file_conn_manager, s3_conn_manager);
         auto log = get_logger(logger_tag::Main);
         log->info("HTTP Server running on port {}...", http_port);
         ctx.run();

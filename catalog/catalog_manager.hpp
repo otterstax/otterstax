@@ -9,6 +9,7 @@
 #include "connectors/postgresql/manager.hpp"
 #include "connectors/clickhouse/manager.hpp"
 #include "connectors/file/manager.hpp"
+#include "connectors/s3/manager.hpp"
 #include "otterbrix/parser/parser.hpp"
 #include "otterbrix/query_generation/sql_query_generator.hpp"
 #include "otterbrix/translators/input/mysql_to_complex.hpp"
@@ -39,6 +40,7 @@ namespace catalog_ext {
         PostgreSQL = 1,
         ClickHouse = 2,
         File = 3,
+        S3 = 4,
     };
 
     struct ConnectionInfo {
@@ -63,6 +65,7 @@ namespace mysqlc {
         void set_pg_connector_manager(std::shared_ptr<pgc::ConnectorManager> pg_conn_manager);
         void set_ch_connector_manager(std::shared_ptr<chc::ConnectorManager> ch_conn_manager);
         void set_file_connector_manager(std::shared_ptr<filec::ConnectorManager> file_conn_manager);
+        void set_s3_connector_manager(std::shared_ptr<s3c::ConnectorManager> s3_conn_manager);
 
         actor_zeta::behavior_t behavior();
         auto make_scheduler() noexcept -> actor_zeta::scheduler_abstract_t*;
@@ -92,6 +95,7 @@ namespace mysqlc {
         std::shared_ptr<pgc::ConnectorManager> pg_conn_manager_;
         std::shared_ptr<chc::ConnectorManager> ch_conn_manager_;
         std::shared_ptr<filec::ConnectorManager> file_conn_manager_;
+        std::shared_ptr<s3c::ConnectorManager> s3_conn_manager_;
         std::mutex input_mtx_;
         TaskManager<std::packaged_task<void()>> worker_;
 

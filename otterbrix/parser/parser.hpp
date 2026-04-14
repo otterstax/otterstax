@@ -21,7 +21,8 @@ enum class backend_type_t : uint8_t {
     PostgreSQL = 2,
     Mixed = 3,
     Otterbrix = 4, // No external nodes, but should be executed by otterbrix
-    ClickHouse = 5
+    ClickHouse = 5,
+    File = 6,
 };
 
 struct ParsedQueryData {

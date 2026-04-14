@@ -5,6 +5,10 @@ set(OTTERBRIX_HEADERS
     translators/input/mysql_to_complex.hpp
     translators/input/pg_to_chunk.hpp
     translators/input/ch_to_chunk.hpp
+    translators/input/arrow_to_chunk.hpp
+    translators/input/parquet_to_chunk.hpp
+    translators/input/csv_to_chunk.hpp
+    translators/input/json_to_chunk.hpp
     translators/output/chunk_to_arrow.hpp
     operators/execute_plan.hpp
     parser/parser.hpp
@@ -16,6 +20,10 @@ set(OTTERBRIX_SOURCES
     translators/input/mysql_to_complex.cpp
     translators/input/pg_to_chunk.cpp
     translators/input/ch_to_chunk.cpp
+    translators/input/arrow_to_chunk.cpp
+    translators/input/parquet_to_chunk.cpp
+    translators/input/csv_to_chunk.cpp
+    translators/input/json_to_chunk.cpp
     translators/output/chunk_to_arrow.cpp
     translators/internal/doc_to_chunk.cpp
     operators/execute_plan.cpp
@@ -30,6 +38,7 @@ add_library(otterbrix_local
 
 target_link_libraries(otterbrix_local PUBLIC
     arrow::arrow
+    Parquet::parquet_shared
     Boost::boost
     otterbrix::otterbrix
     actor-zeta::actor-zeta

@@ -17,6 +17,7 @@ option(BUILD_BENCHMARKS "Build benchmarks" OFF)
 
 # Find the Conan packages
 find_package(Arrow REQUIRED)
+find_package(Parquet REQUIRED)
 find_package(otterbrix REQUIRED COMPONENTS log)
 find_package(actor-zeta REQUIRED)
 find_package(Catch2 2.13.7 REQUIRED)

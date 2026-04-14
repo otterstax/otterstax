@@ -55,6 +55,10 @@ namespace mysqlc {
         ch_conn_manager_ = std::move(ch_conn_manager);
     }
 
+    void CatalogManager::set_file_connector_manager(std::shared_ptr<filec::ConnectorManager> file_conn_manager) {
+        file_conn_manager_ = std::move(file_conn_manager);
+    }
+
     void CatalogManager::registerConnection(const std::string& uuid,
                                             catalog_ext::ConnectionType type,
                                             const collection_full_name_t& name) {
@@ -132,6 +136,7 @@ namespace mysqlc {
         bool has_mysql = false;
         bool has_pg = false;
         bool has_ch = false;
+        bool has_file = false;
 
         for (auto& batch : data->otterbrix_params->external_nodes) {
             for (size_t i = 0; i < batch.size(); ++i) {
@@ -150,15 +155,20 @@ namespace mysqlc {
                     } else if (conn_type == catalog_ext::ConnectionType::ClickHouse) {
                         has_ch = true;
                         data->node_backend_types[name.unique_identifier] = backend_type_t::ClickHouse;
+                    } else if (conn_type == catalog_ext::ConnectionType::File) {
+                        has_file = true;
+                        data->node_backend_types[name.unique_identifier] = backend_type_t::File;
                     }
                 }
             }
         }
 
         // Set backend type based on connections found
-        int backend_count = (has_mysql ? 1 : 0) + (has_pg ? 1 : 0) + (has_ch ? 1 : 0);
+        int backend_count = (has_mysql ? 1 : 0) + (has_pg ? 1 : 0) + (has_ch ? 1 : 0) + (has_file ? 1 : 0);
         if (backend_count > 1) {
             data->backend_type = backend_type_t::Mixed;
+        } else if (has_file) {
+            data->backend_type = backend_type_t::File;
         } else if (has_ch) {
             data->backend_type = backend_type_t::ClickHouse;
         } else if (has_pg) {
@@ -276,6 +286,7 @@ namespace mysqlc {
         bool is_mysql = mysql_conn_manager_ && mysql_conn_manager_->hasConnection(uuid);
         bool is_pg = pg_conn_manager_ && pg_conn_manager_->hasConnection(uuid);
         bool is_ch = ch_conn_manager_ && ch_conn_manager_->hasConnection(uuid);
+        bool is_file = file_conn_manager_ && file_conn_manager_->hasConnection(uuid);
 
         if (is_mysql) {
             conn_type = catalog_ext::ConnectionType::MySQL;
@@ -286,6 +297,9 @@ namespace mysqlc {
         } else if (is_ch) {
             conn_type = catalog_ext::ConnectionType::ClickHouse;
             log_->debug("add_connection_schema: detected ClickHouse connection for uuid: {}", uuid);
+        } else if (is_file) {
+            conn_type = catalog_ext::ConnectionType::File;
+            log_->debug("add_connection_schema: detected File connection for uuid: {}", uuid);
         } else {
             log_->error("add_connection_schema: no connector manager has connection with uuid: {}", uuid);
             return catalog::catalog_error(catalog::catalog_mistake_t::FIELD_MISSING,

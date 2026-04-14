@@ -64,6 +64,9 @@ class OtterStax(ConanFile):
         self.options["arrow/*"].with_zstd = True
         self.options["arrow/*"].with_gflags = True
         self.options["arrow/*"].use_system_gflags = True
+        self.options["arrow/*"].with_parquet = True
+        self.options["arrow/*"].with_csv = True
+        self.options["arrow/*"].with_json = True
 
         self.options["otterbrix/*"].shared = True
         

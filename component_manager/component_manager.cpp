@@ -41,11 +41,19 @@ ComponentManager::ComponentManager(const configuration::config& config)
         actor_zeta::spawn_supervisor<db_conn::ChConnectionManager>(resource_, ch_connector_manager_);
     assert(ch_connection_manager_actor_ != nullptr && "ch connection manager must not be null");
 
+    file_connector_manager_ = std::make_shared<filec::ConnectorManager>(catalog_manager_->address());
+    catalog_manager_->set_file_connector_manager(file_connector_manager_);
+
+    file_connection_manager_actor_ =
+        actor_zeta::spawn_supervisor<db_conn::FileConnectionManager>(resource_, file_connector_manager_);
+    assert(file_connection_manager_actor_ != nullptr && "file connection manager must not be null");
+
     scheduler_ = actor_zeta::spawn_supervisor<Scheduler>(resource_,
                                                          make_parser(resource_),
                                                          sql_connection_manager_->address(),
                                                          pg_connection_manager_->address(),
                                                          ch_connection_manager_actor_->address(),
+                                                         file_connection_manager_actor_->address(),
                                                          otterbrix_manager_->address(),
                                                          catalog_manager_->address());
 
@@ -55,6 +63,7 @@ ComponentManager::ComponentManager(const configuration::config& config)
     db_connector_manager_->start();
     pg_connector_manager_->start();
     ch_connector_manager_->start();
+    file_connector_manager_->start();
 }
 
 std::pmr::memory_resource* ComponentManager::getResource() {

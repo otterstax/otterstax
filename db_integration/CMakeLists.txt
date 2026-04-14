@@ -3,6 +3,7 @@ set(DB_INTEGRATION_HEADERS
     sql/connection_manager.hpp
     postgresql/connection_manager.hpp
     clickhouse/connection_manager.hpp
+    file/connection_manager.hpp
 )
 
 set(DB_INTEGRATION_SOURCES
@@ -10,6 +11,7 @@ set(DB_INTEGRATION_SOURCES
     sql/connection_manager.cpp
     postgresql/connection_manager.cpp
     clickhouse/connection_manager.cpp
+    file/connection_manager.cpp
 )
 
 add_library(db_integration

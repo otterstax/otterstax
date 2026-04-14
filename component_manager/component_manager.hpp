@@ -11,6 +11,8 @@
 #include "db_integration/sql/connection_manager.hpp"
 #include "db_integration/postgresql/connection_manager.hpp"
 #include "db_integration/clickhouse/connection_manager.hpp"
+#include "db_integration/file/connection_manager.hpp"
+#include "connectors/file/manager.hpp"
 #include "scheduler/scheduler.hpp"
 
 #include <actor-zeta.hpp>
@@ -40,6 +42,7 @@ private:
     std::shared_ptr<mysqlc::ConnectorManager> db_connector_manager_{nullptr};
     std::shared_ptr<pgc::ConnectorManager> pg_connector_manager_{nullptr};
     std::shared_ptr<chc::ConnectorManager> ch_connector_manager_{nullptr};
+    std::shared_ptr<filec::ConnectorManager> file_connector_manager_{nullptr};
     std::unique_ptr<mysqlc::CatalogManager, actor_zeta::pmr::deleter_t> catalog_manager_{
         nullptr,
         actor_zeta::pmr::deleter_t{getResource()}};
@@ -53,6 +56,9 @@ private:
         nullptr,
         actor_zeta::pmr::deleter_t{getResource()}};
     std::unique_ptr<db_conn::ChConnectionManager, actor_zeta::pmr::deleter_t> ch_connection_manager_actor_{
+        nullptr,
+        actor_zeta::pmr::deleter_t{getResource()}};
+    std::unique_ptr<db_conn::FileConnectionManager, actor_zeta::pmr::deleter_t> file_connection_manager_actor_{
         nullptr,
         actor_zeta::pmr::deleter_t{getResource()}};
     std::unique_ptr<Scheduler, actor_zeta::pmr::deleter_t> scheduler_{nullptr,

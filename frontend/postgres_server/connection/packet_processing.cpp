@@ -78,16 +78,17 @@ namespace frontend::postgres {
                          shared_data,
                          query);
         shared_data->wait_for(cv_wrapper::DEFAULT_TIMEOUT);
+        auto sdata_result = shared_data->get_result();
 
         switch (shared_data->status()) {
             case cv_wrapper::Status::Ok:
-                if (!shared_data->result.chunk.empty()) {
+                if (!sdata_result.chunk.empty()) {
                     break;
                 }
                 // fallthrough otherwise
             case cv_wrapper::Status::Empty:
                 send_packet_merged(
-                    {build_command_complete(writer_, command_complete_tag::simple_command(shared_data->result.tag)),
+                    {build_command_complete(writer_, command_complete_tag::simple_command(sdata_result.tag)),
                      build_ready_for_query(writer_, transaction_man_.get_transaction_status())});
                 return;
             case cv_wrapper::Status::Timeout:
@@ -102,11 +103,11 @@ namespace frontend::postgres {
         }
 
         // handle Ok
-        int32_t rows_cnt = shared_data->result.chunk.size();
+        int32_t rows_cnt = sdata_result.chunk.size();
         postgres_resultset result(writer_);
-        result.add_chunk_columns(shared_data->result.chunk); // default text encoding
+        result.add_chunk_columns(sdata_result.chunk); // default text encoding
         for (size_t i = 0; i < rows_cnt; i++) {
-            result.add_row(shared_data->result.chunk, i);
+            result.add_row(sdata_result.chunk, i);
         }
 
         auto response = postgres_resultset::build_packets(std::move(result));
@@ -217,7 +218,7 @@ namespace frontend::postgres {
                 return;
         }
 
-        auto& result = shared_data->result;
+        auto result = shared_data->get_result();
         log_->debug("[Connection {}] PARSE stmt: query: \"{}\", param_cnt={}",
                     connection_id_,
                     query,
@@ -452,16 +453,16 @@ namespace frontend::postgres {
                          portal_meta.portal,
                          shared_data);
         shared_data->wait_for(cv_wrapper::DEFAULT_TIMEOUT);
+        auto sdata_result = shared_data->get_result();
 
         switch (shared_data->status()) {
             case cv_wrapper::Status::Ok:
-                if (!shared_data->result.chunk.empty()) {
+                if (!sdata_result.chunk.empty()) {
                     break;
                 }
                 // fallthrough otherwise
             case cv_wrapper::Status::Empty:
-                send_packet(
-                    build_command_complete(writer_, command_complete_tag::simple_command(shared_data->result.tag)));
+                send_packet(build_command_complete(writer_, command_complete_tag::simple_command(sdata_result.tag)));
                 return;
             case cv_wrapper::Status::Timeout:
             case cv_wrapper::Status::Unknown:
@@ -473,19 +474,19 @@ namespace frontend::postgres {
         }
 
         // TODO: PortalSuspended
-        int32_t rows_cnt = shared_data->result.chunk.size();
+        int32_t rows_cnt = sdata_result.chunk.size();
         if (limit != 0) {
-            rows_cnt = std::min(static_cast<size_t>(limit), shared_data->result.chunk.size());
+            rows_cnt = std::min(static_cast<size_t>(limit), sdata_result.chunk.size());
         }
 
         postgres_resultset result(writer_, stmt.is_schema_known_);
         if (!stmt.is_schema_known_) {
-            result.add_chunk_columns(shared_data->result.chunk);
+            result.add_chunk_columns(sdata_result.chunk);
         }
         result.add_encoding(stmt.format);
 
         for (size_t i = 0; i < rows_cnt; i++) {
-            result.add_row(shared_data->result.chunk, i);
+            result.add_row(sdata_result.chunk, i);
         }
 
         auto response = postgres_resultset::build_packets(std::move(result));

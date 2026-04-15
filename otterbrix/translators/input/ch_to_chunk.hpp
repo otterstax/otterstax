@@ -6,8 +6,6 @@
 #undef DAY
 #undef SECOND
 
-#include "otterbrix/types.hpp"
-
 #include <clickhouse/client.h>
 
 #include <exception>

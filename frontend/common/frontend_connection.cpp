@@ -32,12 +32,23 @@ namespace frontend {
     }
 
     void frontend_connection::finish() {
-        if (close_callback_) {
-            logger()->info("[Connection {}] FINISH: Client disconnected", connection_id_);
-            socket_.close();
-            close_callback_();
-            close_callback_ = nullptr;
+        bool expected = false;
+        if (!closing_.compare_exchange_strong(expected, true)) {
+            return;
         }
+
+        boost::asio::post(socket_.get_executor(), [this] {
+            logger()->info("[Connection {}] FINISH", connection_id_);
+
+            boost::system::error_code ec;
+            socket_.close(ec);
+
+            if (close_callback_) {
+                auto cb = std::move(close_callback_);
+                close_callback_ = nullptr;
+                cb();
+            }
+        });
     }
 
     void frontend_connection::read_packet() {
@@ -126,11 +137,11 @@ namespace frontend {
     }
 
     void frontend_connection::send_packet(std::vector<uint8_t> packet, bool continue_reading) {
-        auto buf = std::make_shared<std::vector<uint8_t>>(std::move(packet));
+        send_buffer_ = std::move(packet);
         boost::asio::async_write(
             socket_,
-            boost::asio::buffer(*buf),
-            [this, continue_reading, buf](boost::system::error_code ec, std::size_t bytes_sent) {
+            boost::asio::buffer(send_buffer_),
+            [this, continue_reading](boost::system::error_code ec, std::size_t bytes_sent) {
                 if (ec) {
                     logger()->error("[Connection {}] SEND: failed: {}", connection_id_, ec.message());
                     finish(); // todo: resend logic?
@@ -148,15 +159,17 @@ namespace frontend {
             total_size += msg.size();
         }
 
-        auto merged = std::make_shared<std::vector<uint8_t>>();
-        merged->reserve(total_size);
+        send_buffer_.clear();
+        send_buffer_.reserve(total_size);
         for (auto&& msg : packets) {
-            merged->insert(merged->end(), std::make_move_iterator(msg.begin()), std::make_move_iterator(msg.end()));
+            send_buffer_.insert(send_buffer_.end(),
+                                std::make_move_iterator(msg.begin()),
+                                std::make_move_iterator(msg.end()));
         }
 
         boost::asio::async_write(socket_,
-                                 boost::asio::buffer(*merged),
-                                 [this, merged](boost::system::error_code ec, std::size_t bytes) {
+                                 boost::asio::buffer(send_buffer_),
+                                 [this](boost::system::error_code ec, std::size_t bytes) {
                                      if (ec) {
                                          std::cerr << "[Connection " << connection_id_
                                                    << "] ERROR: Failed to send merged packets:" << ec.message()

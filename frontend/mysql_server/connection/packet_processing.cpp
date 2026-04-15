@@ -197,10 +197,11 @@ namespace frontend::mysql {
                          shared_data,
                          query);
         shared_data->wait_for(cv_wrapper::DEFAULT_TIMEOUT);
+        auto sdata_result = shared_data->get_result();
 
         switch (shared_data->status()) {
             case cv_wrapper::Status::Ok:
-                if (!shared_data->result.chunk.empty()) {
+                if (!sdata_result.chunk.empty()) {
                     break;
                 }
                 // fallthrough otherwise
@@ -220,9 +221,9 @@ namespace frontend::mysql {
         // handle Ok
         // empty db & table in metadata (not critical, but may be improved)
         mysql_resultset result(writer_, result_encoding::TEXT);
-        result.add_chunk_columns(shared_data->result.chunk);
-        for (size_t i = 0; i < shared_data->result.chunk.size(); i++) {
-            result.add_row(shared_data->result.chunk, i);
+        result.add_chunk_columns(sdata_result.chunk);
+        for (size_t i = 0; i < sdata_result.chunk.size(); i++) {
+            result.add_row(sdata_result.chunk, i);
         }
 
         send_resultset(std::move(result));
@@ -307,7 +308,7 @@ namespace frontend::mysql {
                 return;
         }
 
-        auto& result = shared_data->result;
+        auto result = shared_data->get_result();
         std::vector<std::vector<uint8_t>> packets;
 
         uint16_t column_cnt = result.schema != types::logical_type::NA ? result.schema.child_types().size() : 0;
@@ -492,10 +493,11 @@ namespace frontend::mysql {
                          std::move(param_values),
                          shared_data);
         shared_data->wait_for(cv_wrapper::DEFAULT_TIMEOUT);
+        auto sdata_result = shared_data->get_result();
 
         switch (shared_data->status()) {
             case cv_wrapper::Status::Ok:
-                if (!shared_data->result.chunk.empty()) {
+                if (!sdata_result.chunk.empty()) {
                     break;
                 }
                 // fallthrough otherwise
@@ -512,9 +514,9 @@ namespace frontend::mysql {
         }
 
         mysql_resultset result(writer_, result_encoding::BINARY);
-        result.add_chunk_columns(shared_data->result.chunk);
-        for (size_t i = 0; i < shared_data->result.chunk.size(); i++) {
-            result.add_row(shared_data->result.chunk, i);
+        result.add_chunk_columns(sdata_result.chunk);
+        for (size_t i = 0; i < sdata_result.chunk.size(); i++) {
+            result.add_row(sdata_result.chunk, i);
         }
 
         send_resultset(std::move(result));

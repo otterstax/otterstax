@@ -8,14 +8,15 @@
 
 #include <iostream>
 #include <memory>
+#include <utility>
 
 namespace chc {
 
     class MockConnector : public chc::IConnector {
     public:
         explicit MockConnector(mock_config config = {}, std::string alias = "ch_mock_connector")
-            : config_(config)
-            , alias_(alias) {
+            : config_(std::move(config))
+            , alias_(std::move(alias)) {
             std::cout << "CH MockConnector created with alias: " << alias_ << std::endl;
         }
 
@@ -38,6 +39,21 @@ namespace chc {
 
         std::string alias() const noexcept override { return alias_; }
 
+        data_chunk_t get_chunk() {
+            std::pmr::vector<components::types::complex_logical_type> fields(config_.resource);
+            if (config_.return_empty) {
+                components::vector::data_chunk_t result(config_.resource, fields);
+                return result;
+            }
+
+            fields.reserve(2);
+            fields.emplace_back(types::logical_type::INTEGER, "id");
+            fields.emplace_back(types::logical_type::STRING_LITERAL, "name");
+            components::vector::data_chunk_t result(config_.resource, fields);
+            result.set_cardinality(2);
+            return result;
+        }
+
         asio::awaitable<std::unique_ptr<data_chunk_t>>
         runQuery(std::string_view query,
                  std::function<std::unique_ptr<data_chunk_t>(const std::vector<clickhouse::Block>&)> handler) override {
@@ -50,19 +66,7 @@ namespace chc {
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(config_.wait_time));
 
-            auto* resource = std::pmr::get_default_resource();
-            std::pmr::vector<components::types::complex_logical_type> fields(resource);
-            if (config_.return_empty) {
-                components::vector::data_chunk_t result(resource, fields);
-                co_return std::make_unique<data_chunk_t>(std::move(result));
-            }
-
-            fields.emplace_back(types::logical_type::INTEGER, "id");
-            fields.emplace_back(types::logical_type::STRING_LITERAL, "name");
-            components::vector::data_chunk_t result(resource, fields);
-            result.set_cardinality(2);
-
-            co_return std::make_unique<data_chunk_t>(std::move(result));
+            co_return std::make_unique<data_chunk_t>(get_chunk());
         }
 
         asio::awaitable<int64_t>
@@ -77,9 +81,9 @@ namespace chc {
             co_return 42;
         }
 
-        asio::awaitable<components::catalog::catalog_error>
-        runQuery(std::string_view query,
-                 std::function<components::catalog::catalog_error(const std::vector<clickhouse::Block>&)> handler) override {
+        asio::awaitable<components::catalog::catalog_error> runQuery(
+            std::string_view query,
+            std::function<components::catalog::catalog_error(const std::vector<clickhouse::Block>&)> handler) override {
             throw std::runtime_error("Unimplemented");
         }
 
@@ -90,8 +94,9 @@ namespace chc {
 
 } // namespace chc
 
-inline std::unique_ptr<chc::IConnector>
-make_ch_mock_connector(chc::connect_params params, std::string alias) {
-    std::cout << "Creating CH MockConnector." << std::endl;
-    return std::make_unique<chc::MockConnector>(mock_config{}, alias);
+inline auto ch_mock_connector_factory(std::pmr::memory_resource* resource) {
+    return [resource](chc::connect_params, std::string alias) {
+        std::cout << "Creating CH MockConnector." << std::endl;
+        return std::make_unique<chc::MockConnector>(mock_config{.resource = resource}, std::move(alias));
+    };
 }

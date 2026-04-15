@@ -15,6 +15,26 @@ add_compile_definitions(SPDLOG_ACTIVE_LEVEL=${SPDLOG_ACTIVE_LEVEL})
 option(BUILD_TESTS "Build unit tests" OFF)
 option(BUILD_BENCHMARKS "Build benchmarks" OFF)
 
+# Option to enable address sanitizer
+option(ENABLE_ASAN "Enable AddressSanitizer" OFF)
+
+# Option to enable thread sanitizer
+option(ENABLE_TSAN "Enable ThreadSanitizer" OFF)
+
+if(ENABLE_ASAN AND ENABLE_TSAN)
+    message(FATAL_ERROR "ENABLE_ASAN and ENABLE_TSAN cannot be enabled at the same time, choose only one sanitizer.")
+endif()
+
+if (ENABLE_ASAN)
+    add_compile_options(-O0 -g -fno-omit-frame-pointer -fsanitize=address)
+    add_link_options(-fsanitize=address)
+endif()
+
+if (ENABLE_TSAN)
+    add_compile_options(-O0 -g -fno-omit-frame-pointer -fsanitize=thread)
+    add_link_options(-fsanitize=thread)
+endif()
+
 # Find the Conan packages
 find_package(Arrow REQUIRED)
 find_package(otterbrix REQUIRED COMPONENTS log)
@@ -60,6 +80,7 @@ set(${PROJECT_NAME}_HEADERS
 
         utility/timer.hpp
         utility/cv_wrapper.hpp
+        utility/tsan_helper.hpp
 
         types/otterbrix.hpp
 )

@@ -1,6 +1,5 @@
 set(OTTERBRIX_HEADERS
     config.hpp
-    types.hpp
     translators/input/mysql_to_chunk.hpp
     translators/input/mysql_to_complex.hpp
     translators/input/pg_to_chunk.hpp

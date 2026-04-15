@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2025-2026  OtterStax
 
-
 #include "scheduler.hpp"
+#include "routes/ch_connection_manager.hpp"
 #include "routes/otterbrix_manager.hpp"
 #include "routes/pg_connection_manager.hpp"
-#include "routes/ch_connection_manager.hpp"
 #include "routes/scheduler.hpp"
 #include "routes/sql_connection_manager.hpp"
-#include "utility/timer.hpp"
 #include "utility/logger.hpp"
+#include "utility/timer.hpp"
 
 #include <actor-zeta.hpp>
 #include <cassert>
@@ -92,8 +91,14 @@ Scheduler::Scheduler(std::pmr::memory_resource* res,
     assert(parser_ != nullptr);
 
     log_->info("Scheduler initialized successfully");
-    
+
     worker_.start(); // Start the worker thread manager
+}
+
+Scheduler::~Scheduler() {
+    std::lock_guard<std::mutex> lock(data_map_mtx_);
+    shared_data_map_.clear();
+    metadata_map_.clear();
 }
 
 actor_zeta::behavior_t Scheduler::behavior() {
@@ -167,9 +172,10 @@ auto Scheduler::enqueue_impl(actor_zeta::message_ptr msg, actor_zeta::execution_
 auto Scheduler::execute(session_hash_t id, shared_session_payload sdata, std::string sql) -> void {
     try {
         Timer timer("Scheduler::execute", log_);
-        log_->info("Scheduler::execute called with sql: {}", sql);  // info level to ensure visibility
+        log_->info("Scheduler::execute called with sql: {}", sql); // info level to ensure visibility
         log_->trace("execute sql: {}, id hash: {}", sql, id);
-        std::cout << "[COUT] Scheduler::execute called with sql: " << sql << std::endl;  // also print to console for immediate visibility
+        std::cout << "[COUT] Scheduler::execute called with sql: " << sql
+                  << std::endl;      // also print to console for immediate visibility
         register_session(id, sdata); // in case parse() throws
         auto parsed = parser_->parse(sql);
         if (!parsed) {
@@ -178,7 +184,7 @@ auto Scheduler::execute(session_hash_t id, shared_session_payload sdata, std::st
             return;
         }
         bool has_external_nodes = parsed->otterbrix_params && parsed->otterbrix_params->external_nodes_count > 0;
-        if (! has_external_nodes) {
+        if (!has_external_nodes) {
             log_->debug("execute: parsed query has not external nodes");
             set_backend_type_otterbrix(id);
         }
@@ -186,7 +192,8 @@ auto Scheduler::execute(session_hash_t id, shared_session_payload sdata, std::st
             log_->debug("execute_statement: backend type unknown, call catalog to update");
             // Trigger catalog lookup to determine backend type
             if (has_external_nodes) {
-                log_->debug("execute: parsed query has {} external nodes", parsed->otterbrix_params->external_nodes_count);
+                log_->debug("execute: parsed query has {} external nodes",
+                            parsed->otterbrix_params->external_nodes_count);
                 log_->debug("execute_statement: has external nodes, routing to catalog_manager");
                 actor_zeta::send(catalog_manager_,
                                  address(),
@@ -198,8 +205,7 @@ auto Scheduler::execute(session_hash_t id, shared_session_payload sdata, std::st
                 update_metadata(id, std::move(parsed)); // skip schema computing
                 execute_statement(id, std::move(sdata));
             }
-        }
-        else {
+        } else {
             log_->debug("execute_statement: backend type already known: {}", static_cast<int>(backend_type));
             update_metadata(id, std::move(parsed)); // skip schema computing
             execute_statement(id, std::move(sdata));
@@ -213,7 +219,7 @@ auto Scheduler::execute(session_hash_t id, shared_session_payload sdata, std::st
 void Scheduler::execute_statement(session_hash_t id, shared_session_payload sdata) {
     try {
         Timer timer("Scheduler::execute_statement", log_);
-        log_->trace("execute_statement Shared data size: {}, id hash: {}", sdata->result.chunk.size(), id);
+        log_->trace("execute_statement id hash: {}", id);
         register_session(id, std::move(sdata)); // TODO check if ne
 
         const auto backend_type = get_backend_type(id);
@@ -248,8 +254,8 @@ void Scheduler::execute_statement(session_hash_t id, shared_session_payload sdat
                                          this->address());
                         break;
                     }
-                    case backend_type_t::MySQL:{
-                                                log_->debug("execute_statement sending to sql_connection_manager");
+                    case backend_type_t::MySQL: {
+                        log_->debug("execute_statement sending to sql_connection_manager");
                         actor_zeta::send(this->sql_connection_manager_,
                                          this->address(),
                                          sql_connection_manager::handler_id(sql_connection_manager::route::execute),
@@ -268,7 +274,7 @@ void Scheduler::execute_statement(session_hash_t id, shared_session_payload sdat
                                          this->address());
                         break;
                     }
-                    case backend_type_t::Otterbrix:{
+                    case backend_type_t::Otterbrix: {
                         log_->debug("execute_statement sending to otterbrix_manager");
                         actor_zeta::send(this->otterbrix_manager_,
                                          this->address(),
@@ -279,7 +285,7 @@ void Scheduler::execute_statement(session_hash_t id, shared_session_payload sdat
                         break;
                     }
                     case backend_type_t::Unknown:
-                    default:{
+                    default: {
                         log_->error("execute_statement: unknown backend type for session {}, cannot route", id);
                         complete_session_on_error(id, "Unknown backend type, cannot execute statement.");
                         break;
@@ -344,7 +350,7 @@ auto Scheduler::prepare_schema(session_hash_t id, shared_session_payload sdata, 
                     static_cast<int>(parsed->otterbrix_params->node->type()),
                     parsed->otterbrix_params->external_nodes_count,
                     static_cast<int>(parsed->backend_type));
-        
+
         // if (parsed->otterbrix_params->node->type() != logical_plan::node_type::aggregate_t) {
         //     // node is not aggregate nor join - result is empty schema
         //     log_->debug("prepare_schema: node is not aggregate, returning empty schema");
@@ -514,7 +520,9 @@ auto Scheduler::get_catalog_schema_finish(session_hash_t id,
                      std::move(data));
 }
 
-auto Scheduler::update_backend_type_finish(session_hash_t id, ParsedQueryDataPtr&& data, catalog::catalog_error err) -> void {
+auto Scheduler::update_backend_type_finish(session_hash_t id,
+                                           ParsedQueryDataPtr&& data,
+                                           catalog::catalog_error err) -> void {
     log_->trace("Scheduler::update_backend_type_finish");
     if (err) {
         complete_session_on_error(id, err.what());
@@ -524,7 +532,7 @@ auto Scheduler::update_backend_type_finish(session_hash_t id, ParsedQueryDataPtr
     // Update backend type in metadata based on catalog response
     update_metadata(id, std::move(data), types::complex_logical_type{});
     auto sdata = get_session_payload(id);
-    if(!sdata) {
+    if (!sdata) {
         complete_session_on_error(id, "Session data missing during update_backend_type_finish");
         return;
     }
@@ -547,8 +555,8 @@ auto Scheduler::get_otterbrix_schema_finish(session_hash_t id,
     const size_t param_cnt = data->otterbrix_params->parameters_count;
     const NodeTag tag = data->tag;
     update_metadata(id, std::move(data), schema);
-            complete_session(id,
-                         session_payload{std::move(schema), data_chunk_t{resource(), {}, 0}, param_cnt, tag},
+    complete_session(id,
+                     session_payload{std::move(schema), data_chunk_t{resource(), {}, 0}, param_cnt, tag},
                      flightsql_session_type::GET_FLIGHT_INFO);
 }
 
@@ -574,7 +582,7 @@ void Scheduler::set_backend_type_otterbrix(session_hash_t id) {
     log_->trace("Scheduler::set_backend_type_otterbrix finish");
 }
 
-backend_type_t Scheduler::get_backend_type(session_hash_t id) const{
+backend_type_t Scheduler::get_backend_type(session_hash_t id) const {
     std::lock_guard<std::mutex> lock(data_map_mtx_);
     if (auto it = metadata_map_.find(id); it != metadata_map_.end()) {
         return it->second.backend_type;
@@ -582,49 +590,53 @@ backend_type_t Scheduler::get_backend_type(session_hash_t id) const{
     return backend_type_t::Unknown;
 }
 
+// WARN: erase from metadata_map_ before release to avoid possible destructor data-race
+// NOTE: shared_data_map_'s data is managed by shared_ptr, erase after release is safe
 void Scheduler::complete_session(session_hash_t id) {
     std::lock_guard<std::mutex> lock(data_map_mtx_);
     log_->trace("Scheduler::complete_session empty start");
 
-    if (auto it = shared_data_map_.find(id);
-        it != shared_data_map_.end() && it->second->status() == cv_wrapper::Status::Unknown) {
-        log_->trace("Scheduler::complete_session updated");
-        it->second->release_empty();
+    metadata_map_.erase(id);
+    if (auto it = shared_data_map_.find(id); it != shared_data_map_.end()) {
+        if (auto sdata = it->second; sdata->status() == cv_wrapper::Status::Unknown) {
+            log_->trace("Scheduler::complete_session updated");
+            sdata->release_empty();
+        }
     }
     log_->trace("Scheduler::complete_session empty finish");
     shared_data_map_.erase(id);
-    metadata_map_.erase(id);
 }
 
 void Scheduler::complete_session(session_hash_t id, session_payload data, flightsql_session_type type) {
     std::lock_guard<std::mutex> lock(data_map_mtx_);
     log_->trace("Scheduler::complete_session start");
 
-    if (auto it = shared_data_map_.find(id);
-        it != shared_data_map_.end() && it->second->status() == cv_wrapper::Status::Unknown) {
-        log_->trace("Scheduler::complete_session updated");
-        it->second->result = std::move(data);
-        it->second->release();
-    }
-    log_->trace("Scheduler::complete_session finish");
-    shared_data_map_.erase(id);
-
     if (type == flightsql_session_type::DO_GET) {
         // metadata not needed anymore
         metadata_map_.erase(id);
     }
+
+    if (auto it = shared_data_map_.find(id); it != shared_data_map_.end()) {
+        if (auto sdata = it->second; sdata->status() == cv_wrapper::Status::Unknown) {
+            log_->trace("Scheduler::complete_session updated");
+            sdata->set_result(std::move(data));
+        }
+    }
+    log_->trace("Scheduler::complete_session finish");
+    shared_data_map_.erase(id);
 }
 
 void Scheduler::complete_session_on_error(session_hash_t id, std::string error_msg) {
     std::lock_guard<std::mutex> lock(data_map_mtx_);
     log_->trace("Scheduler::complete_session_on_error start");
 
+    metadata_map_.erase(id);
     if (auto it = shared_data_map_.find(id); it != shared_data_map_.end()) {
-        it->second->release_on_error(std::move(error_msg));
+        auto sdata = it->second;
+        sdata->release_on_error(std::move(error_msg));
     }
     log_->trace("Scheduler::complete_session_on_error finish");
     shared_data_map_.erase(id);
-    metadata_map_.erase(id);
 }
 
 ParsedQueryDataPtr Scheduler::get_statement(session_hash_t id) {
@@ -645,11 +657,10 @@ bool Scheduler::session_exists(session_hash_t id) const {
     return shared_data_map_.contains(id) && metadata_map_.contains(id);
 }
 
-shared_session_payload Scheduler::get_session_payload(session_hash_t id)  const {
+shared_session_payload Scheduler::get_session_payload(session_hash_t id) const {
     std::lock_guard<std::mutex> lock(data_map_mtx_);
     if (auto it = shared_data_map_.find(id); it != shared_data_map_.end()) {
         return it->second;
     }
-    return nullptr ;
+    return nullptr;
 }
-

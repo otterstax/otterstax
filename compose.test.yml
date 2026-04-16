@@ -86,6 +86,7 @@ services:
     restart: unless-stopped
 
   test-otterstax:
+    image: otterstax_app:${IMAGE_TAG:-latest}
     build:
       context: .
       dockerfile: Dockerfile.test

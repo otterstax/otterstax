@@ -18,7 +18,9 @@ public:
     thread_pool_manager(size_t pool_size = std::thread::hardware_concurrency())
         : pool_size_{pool_size}
         , pool_status_{thread_pool_status::CREATED}
-        , work_guard_(boost::asio::make_work_guard(ctx_)) {}
+        , work_guard_(boost::asio::make_work_guard(ctx_)) {
+        thread_pool_.reserve(pool_size);
+    }
 
     boost::asio::io_context& ctx() { return ctx_; }
 

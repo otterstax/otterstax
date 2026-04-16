@@ -3,13 +3,13 @@
 
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
-#include <thread>
 
 namespace cv_wrapper {
     constexpr std::chrono::milliseconds DEFAULT_TIMEOUT(90000);
@@ -26,38 +26,45 @@ namespace cv_wrapper {
     template<typename T>
     class cv_wrapper_t {
     public:
-    public:
         explicit cv_wrapper_t(T data)
-            : result(std::move(data)) {}
-        T result;
+            : result_(std::move(data)) {}
 
     public:
-        void wait() {
-            std::unique_lock<std::mutex> lock(m_);
-            cv_.wait(lock, [this]() { return ready_; });
-        }
-        void wait_for(std::chrono::milliseconds timeout) {
-            std::unique_lock<std::mutex> lock(m_);
-            auto is_timeout_ = !cv_.wait_for(lock, timeout, [this]() { return ready_; });
-            if (is_timeout_) {
-                status_ = Status::Timeout;
-            }
-        }
-        void release() {
+        void set_result(T data) {
             {
                 std::unique_lock<std::mutex> lock(m_);
-                ready_ = true;
-                status_ = Status::Ok;
+                result_ = std::move(data);
+                status_.store(Status::Ok);
+                ready_.store(true);
             }
             cv_.notify_one();
+        }
+
+        T get_result() {
+            std::unique_lock<std::mutex> lock(m_);
+            return std::move(result_);
+        }
+
+        void wait() {
+            std::unique_lock<std::mutex> lock(m_);
+            cv_.wait(lock, [this]() { return ready_.load(); });
+        }
+
+        void wait_for(std::chrono::milliseconds timeout) {
+            std::unique_lock<std::mutex> lock(m_);
+            auto is_timeout_ = !cv_.wait_for(lock, timeout, [this]() { return ready_.load(); });
+            if (is_timeout_) {
+                status_.store(Status::Timeout);
+                ready_.store(true);
+            }
         }
 
         void release_on_error(std::string error_msg) {
             {
                 std::unique_lock<std::mutex> lock(m_);
-                error = std::move(error_msg);
-                ready_ = true;
-                status_ = Status::Error;
+                error_ = std::move(error_msg);
+                status_.store(Status::Error);
+                ready_.store(true);
             }
             cv_.notify_one();
         }
@@ -65,26 +72,24 @@ namespace cv_wrapper {
         void release_empty() {
             {
                 std::unique_lock<std::mutex> lock(m_);
-                ready_ = true;
-                status_ = Status::Empty;
+                status_.store(Status::Empty);
+                ready_.store(true);
             }
             cv_.notify_one();
         }
 
-        Status status() const noexcept {
-            std::unique_lock<std::mutex> lock(m_);
-            return status_;
-        }
+        Status status() const noexcept { return status_.load(); }
 
         std::string error_message() const noexcept {
             std::unique_lock<std::mutex> lock(m_);
-            return error.value_or("");
+            return error_.value_or("");
         }
 
     private:
-        Status status_{Status::Unknown};
-        std::optional<std::string> error{std::nullopt};
-        bool ready_{false};
+        T result_;
+        std::atomic<Status> status_{Status::Unknown};
+        std::optional<std::string> error_{std::nullopt};
+        std::atomic<bool> ready_{false};
         mutable std::mutex m_;
         std::condition_variable cv_;
     };

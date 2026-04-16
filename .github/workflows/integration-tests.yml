@@ -2,7 +2,7 @@ name: Integration Tests
 
 on:
   push:
-    branches: [main, postgresql]
+    branches: [main, asan-tsan]
   pull_request:
     branches: [main]
 
@@ -12,5 +12,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build test image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.test
+          push: false
+          load: true
+          tags: otterstax_app:ci-${{ github.sha }}
+          cache-from: type=gha,scope=release
+          cache-to: type=gha,mode=max,scope=release
+
       - name: Run integration tests
+        env:
+          IMAGE_TAG: ci-${{ github.sha }}
         run: ./docker-run-tests.sh

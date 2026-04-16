@@ -30,10 +30,10 @@ public:
         }
         std::this_thread::sleep_for(config_.wait_time); // Simulate some processing delay
 
-        std::pmr::memory_resource* resource = std::pmr::get_default_resource();
         if (config_.return_empty) {
             std::cout << "Mock OtterbrixManager returning empty cursor." << std::endl;
-            return components::cursor::make_cursor(resource, components::vector::data_chunk_t{resource, {}, 0});
+            return components::cursor::make_cursor(config_.resource,
+                                                   components::vector::data_chunk_t{config_.resource, {}, 0});
         }
 
         assert(otterbrix_params->node->type() == logical_plan::node_type::data_t &&
@@ -42,7 +42,7 @@ public:
 
         auto& chunk =
             const_cast<data_chunk_t&>(static_cast<logical_plan::node_data_t&>(*otterbrix_params->node).data_chunk());
-        return cursor::make_cursor(resource, std::move(chunk));
+        return cursor::make_cursor(config_.resource, std::move(chunk));
     }
 
     components::cursor::cursor_t_ptr get_schema(const OtterbrixSchemaParams& otterbrix_params) override {

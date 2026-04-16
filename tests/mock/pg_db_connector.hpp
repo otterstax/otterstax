@@ -11,14 +11,15 @@
 
 #include <iostream>
 #include <memory>
+#include <utility>
 
 namespace pgc {
 
     class MockConnector : public pgc::IConnector {
     public:
         explicit MockConnector(mock_config config = {}, std::string alias = "pg_mock_connector")
-            : config_(config)
-            , alias_(alias) {
+            : config_(std::move(config))
+            , alias_(std::move(alias)) {
             std::cout << "PG MockConnector created with config: " << std::endl;
             std::cout << "can_throw: " << config_.can_throw << std::endl;
             std::cout << "return_empty: " << config_.return_empty << std::endl;
@@ -46,9 +47,24 @@ namespace pgc {
 
         std::string alias() const noexcept override { return alias_; }
 
+        data_chunk_t get_chunk() {
+            std::pmr::vector<components::types::complex_logical_type> fields(config_.resource);
+            if (config_.return_empty) {
+                std::cout << "PG MockConnector returning empty result." << std::endl;
+                components::vector::data_chunk_t result(config_.resource, fields);
+                return result;
+            }
+
+            fields.reserve(2);
+            fields.emplace_back(types::logical_type::INTEGER, "id");
+            fields.emplace_back(types::logical_type::STRING_LITERAL, "name");
+            components::vector::data_chunk_t result(config_.resource, fields);
+            result.set_cardinality(2);
+            return result;
+        }
+
         asio::awaitable<std::unique_ptr<data_chunk_t>>
-        runQuery(std::string_view query,
-                 std::function<std::unique_ptr<data_chunk_t>(PGresult*)> handler) override {
+        runQuery(std::string_view query, std::function<std::unique_ptr<data_chunk_t>(PGresult*)> handler) override {
             std::cout << "PG MockConnector running query: " << query << std::endl;
 
             if (config_.can_throw) {
@@ -59,24 +75,10 @@ namespace pgc {
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(config_.wait_time));
 
-            auto* resource = std::pmr::get_default_resource();
-            std::pmr::vector<components::types::complex_logical_type> fields(resource);
-            if (config_.return_empty) {
-                components::vector::data_chunk_t result(resource, fields);
-                std::cout << "PG MockConnector returning empty result." << std::endl;
-                co_return std::make_unique<data_chunk_t>(std::move(result));
-            }
-
-            fields.emplace_back(types::logical_type::INTEGER, "id");
-            fields.emplace_back(types::logical_type::STRING_LITERAL, "name");
-            components::vector::data_chunk_t result(resource, fields);
-            result.set_cardinality(2);
-
-            co_return std::make_unique<data_chunk_t>(std::move(result));
+            co_return std::make_unique<data_chunk_t>(get_chunk());
         }
 
-        asio::awaitable<int64_t> runQuery(std::string_view query,
-                                          std::function<int64_t(PGresult*)> handler) override {
+        asio::awaitable<int64_t> runQuery(std::string_view query, std::function<int64_t(PGresult*)> handler) override {
             std::cout << "PG MockConnector running update query: " << query << std::endl;
             if (config_.can_throw) {
                 std::string error_message =
@@ -100,18 +102,25 @@ namespace pgc {
 
 } // namespace pgc
 
-inline std::unique_ptr<pgc::IConnector>
-make_pg_mock_connector(pgc::connect_params params, std::string alias) {
-    std::cout << "Creating PG MockConnector." << std::endl;
-    return std::make_unique<pgc::MockConnector>(mock_config{}, alias);
+inline auto pg_mock_connector_factory(std::pmr::memory_resource* resource) {
+    return [resource](pgc::connect_params, std::string alias) {
+        std::cout << "Creating PG MockConnector." << std::endl;
+        return std::make_unique<pgc::MockConnector>(mock_config{.resource = resource}, std::move(alias));
+    };
 }
 
-inline std::unique_ptr<pgc::IConnector> make_pg_mock_connector_throw(pgc::connect_params params, std::string alias) {
-    std::cout << "Creating PG MockConnector (throw)." << std::endl;
-    return std::make_unique<pgc::MockConnector>(mock_config{.can_throw = true}, alias);
+inline auto pg_mock_connector_factory_throw(std::pmr::memory_resource* resource) {
+    return [resource](pgc::connect_params, std::string alias) {
+        std::cout << "Creating PG MockConnector (throw)." << std::endl;
+        return std::make_unique<pgc::MockConnector>(mock_config{.resource = resource, .can_throw = true},
+                                                    std::move(alias));
+    };
 }
 
-inline std::unique_ptr<pgc::IConnector> make_pg_mock_connector_return_empty(pgc::connect_params params, std::string alias) {
-    std::cout << "Creating PG MockConnector (return empty)." << std::endl;
-    return std::make_unique<pgc::MockConnector>(mock_config{.return_empty = true}, alias);
+inline auto pg_mock_connector_factory_return_empty(std::pmr::memory_resource* resource) {
+    return [resource](pgc::connect_params, std::string alias) {
+        std::cout << "Creating PG MockConnector (return empty)." << std::endl;
+        return std::make_unique<pgc::MockConnector>(mock_config{.resource = resource, .return_empty = true},
+                                                    std::move(alias));
+    };
 }

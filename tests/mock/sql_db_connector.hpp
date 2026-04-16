@@ -2,6 +2,7 @@
 // Copyright 2025-2026  OtterStax
 
 #pragma once
+
 #include "connectors/mysql/connector.hpp"
 #include "mock_config.hpp"
 
@@ -13,14 +14,15 @@
 
 #include <iostream>
 #include <memory>
+#include <utility>
 
 namespace mysqlc {
 
     class MockConnector : public mysqlc::IConnector {
     public:
         explicit MockConnector(mock_config config = {}, std::string alias = "mock_connector")
-            : config_(config)
-            , alias_(alias) {
+            : config_(std::move(config))
+            , alias_(std::move(alias)) {
             std::cout << "MockConnector created with config: " << std::endl;
             std::cout << "can_throw: " << config_.can_throw << std::endl;
             std::cout << "return_empty: " << config_.return_empty << std::endl;
@@ -48,6 +50,22 @@ namespace mysqlc {
 
         std::string alias() const noexcept override { return alias_; }
 
+        data_chunk_t get_chunk() {
+            std::pmr::vector<types::complex_logical_type> fields(config_.resource);
+            if (config_.return_empty) {
+                std::cout << "MockConnector returning empty result." << std::endl;
+                data_chunk_t chunk(config_.resource, fields);
+                return chunk;
+            }
+
+            fields.reserve(2);
+            fields.emplace_back(types::logical_type::INTEGER, "id");
+            fields.emplace_back(types::logical_type::STRING_LITERAL, "name");
+            data_chunk_t result(config_.resource, fields, 2);
+            result.set_cardinality(2);
+            return result;
+        }
+
         asio::awaitable<std::unique_ptr<data_chunk_t>>
         runQuery(std::string_view query,
                  std::function<std::unique_ptr<data_chunk_t>(const boost::mysql::results&)> handler) override {
@@ -59,23 +77,11 @@ namespace mysqlc {
                 std::cout << error_message << std::endl;
                 throw std::runtime_error(error_message);
             }
+
             std::this_thread::sleep_for(std::chrono::milliseconds(config_.wait_time)); // Simulate some processing delay
-
-            auto* resource = std::pmr::get_default_resource();
-            std::pmr::vector<components::types::complex_logical_type> fields(resource);
-            if (config_.return_empty) {
-                components::vector::data_chunk_t result(resource, fields);
-                std::cout << "MockConnector returning empty result." << std::endl;
-                co_return std::make_unique<data_chunk_t>(std::move(result));
-            }
-
-            fields.emplace_back(types::logical_type::INTEGER, "id");
-            fields.emplace_back(types::logical_type::STRING_LITERAL, "name");
-            components::vector::data_chunk_t result(resource, fields);
-            result.set_cardinality(2);
-
-            co_return std::make_unique<data_chunk_t>(std::move(result));
+            co_return std::make_unique<data_chunk_t>(get_chunk());
         }
+
         asio::awaitable<int64_t> runQuery(std::string_view query,
                                           std::function<int64_t(const boost::mysql::results&)> handler) override {
             // Mock implementation
@@ -88,6 +94,7 @@ namespace mysqlc {
             }
             co_return 42;
         }
+
         asio::awaitable<components::catalog::catalog_error>
         runQuery(std::string_view query,
                  std::function<components::catalog::catalog_error(const boost::mysql::results&)> handler) override {
@@ -101,22 +108,25 @@ namespace mysqlc {
 
 } // namespace mysqlc
 
-inline std::unique_ptr<mysqlc::IConnector>
-make_mysql_mock_connector(boost::asio::io_context& io_ctx, boost::mysql::connect_params params, std::string alias) {
-    std::cout << "Creating MockConnector." << std::endl;
-    return std::make_unique<mysqlc::MockConnector>(mock_config{}, alias);
+inline auto mysql_mock_connector_factory(std::pmr::memory_resource* resource) {
+    return [resource](boost::asio::io_context& io_ctx, boost::mysql::connect_params, std::string alias) {
+        std::cout << "Creating MockConnector." << std::endl;
+        return std::make_unique<mysqlc::MockConnector>(mock_config{.resource = resource}, std::move(alias));
+    };
 }
 
-inline std::unique_ptr<mysqlc::IConnector> make_mysql_mock_connector_throw(boost::asio::io_context& io_ctx,
-                                                                           boost::mysql::connect_params params,
-                                                                           std::string alias) {
-    std::cout << "Creating MockConnector." << std::endl;
-    return std::make_unique<mysqlc::MockConnector>(mock_config{.can_throw = true}, alias);
+inline auto mysql_mock_connector_factory_throw(std::pmr::memory_resource* resource) {
+    return [resource](boost::asio::io_context& io_ctx, boost::mysql::connect_params, std::string alias) {
+        std::cout << "Creating MockConnector." << std::endl;
+        return std::make_unique<mysqlc::MockConnector>(mock_config{.resource = resource, .can_throw = true},
+                                                       std::move(alias));
+    };
 }
 
-inline std::unique_ptr<mysqlc::IConnector> make_mysql_mock_connector_return_empty(boost::asio::io_context& io_ctx,
-                                                                                  boost::mysql::connect_params params,
-                                                                                  std::string alias) {
-    std::cout << "Creating MockConnector." << std::endl;
-    return std::make_unique<mysqlc::MockConnector>(mock_config{.return_empty = true}, alias);
+inline auto mysql_mock_connector_factory_return_empty(std::pmr::memory_resource* resource) {
+    return [resource](boost::asio::io_context& io_ctx, boost::mysql::connect_params, std::string alias) {
+        std::cout << "Creating MockConnector." << std::endl;
+        return std::make_unique<mysqlc::MockConnector>(mock_config{.resource = resource, .return_empty = true},
+                                                       std::move(alias));
+    };
 }

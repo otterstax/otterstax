@@ -136,7 +136,16 @@ rm -rf init/mariadb1/* init/mariadb2/* init/postgres/* init/clickhouse/* 2>/dev/
 
 # Rebuild Docker images to pick up latest script changes
 echo "🔨 Rebuilding Docker images..."
-compose build --no-cache test-client test-otterstax
+export DOCKER_BUILDKIT=1
+
+if [ -n "${IMAGE_TAG}" ]; then
+    # CI / sanitizer path: test-otterstax image is pre-built with specific
+    # build-args (e.g. ENABLE_ASAN / ENABLE_TSAN) by the workflow
+    echo "ℹ️  IMAGE_TAG=${IMAGE_TAG} set; skipping test-otterstax build"
+    compose build test-client
+else
+    compose build test-client test-otterstax
+fi
 
 echo "✅ Previous containers and volumes removed"
 

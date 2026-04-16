@@ -2,48 +2,54 @@
 // Copyright 2025-2026  OtterStax
 
 #include "utility/cv_wrapper.hpp"
+#include "utility/tsan_helper.hpp"
 
 #include <catch2/catch.hpp>
 #include <chrono>
 #include <iostream>
+#include <thread>
 
 using namespace cv_wrapper;
 
 TEST_CASE("cv_wrapper: ok") {
     auto cv_w = create_cv_wrapper(std::unique_ptr<std::string>());
     REQUIRE(cv_w != nullptr);
-    REQUIRE(cv_w->result == nullptr);
+    REQUIRE(cv_w->get_result() == nullptr);
 
     auto start_point_ = std::chrono::system_clock::now();
     auto worker = std::jthread([cv_w]() {
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
-        cv_w->result = std::make_unique<std::string>("Hello, World!");
-        cv_w->release();
+        cv_w->set_result(std::make_unique<std::string>("Hello, World!"));
     });
     cv_w->wait();
     auto end_point = std::chrono::system_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_point - start_point_);
     bool is_really_waited = (duration.count() >= 500) && (duration.count() < 600);
     REQUIRE(is_really_waited);
-    REQUIRE(cv_w->result != nullptr);
-    REQUIRE(*cv_w->result == "Hello, World!");
+
+    auto res = cv_w->get_result();
+    REQUIRE(res != nullptr);
+    REQUIRE(*res == "Hello, World!");
     REQUIRE(cv_w->status() == Status::Ok);
 }
 
 TEST_CASE("cv_wrapper: timeout") {
+    if constexpr (TSAN_ENABLED) {
+        return; // skip test, TSAN considers synchronization via sleep as data race, however, this is a valid test case
+    }
+
     using namespace std::chrono_literals;
 
     auto cv_w = create_cv_wrapper(std::unique_ptr<std::string>());
     REQUIRE(cv_w != nullptr);
-    REQUIRE(cv_w->result == nullptr);
+    REQUIRE(cv_w->get_result() == nullptr);
 
     auto start_point_ = std::chrono::system_clock::now();
     auto worker = std::jthread([cv_w]() {
         std::this_thread::sleep_for(std::chrono::milliseconds(5000));
         REQUIRE(cv_w->status() == Status::Timeout);
         if (!(cv_w->status() == Status::Timeout)) {
-            cv_w->result = std::make_unique<std::string>("Hello, World!");
-            cv_w->release();
+            cv_w->set_result(std::make_unique<std::string>("Hello, World!"));
         }
     });
     cv_w->wait_for(200ms);
@@ -51,16 +57,21 @@ TEST_CASE("cv_wrapper: timeout") {
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_point - start_point_);
     bool is_really_waited = (duration.count() >= 200) && (duration.count() < 220);
     REQUIRE(is_really_waited);
-    REQUIRE(cv_w->result == nullptr);
+
+    auto res = cv_w->get_result();
+    REQUIRE(res == nullptr);
     REQUIRE(cv_w->status() == Status::Timeout);
 }
 
 TEST_CASE("cv_wrapper: error") {
     using namespace std::chrono_literals;
+    if constexpr (TSAN_ENABLED) {
+        return; // skip test, TSAN considers synchronization via sleep as data race, however, this is a valid test case
+    }
 
     auto cv_w = create_cv_wrapper(std::unique_ptr<std::string>());
     REQUIRE(cv_w != nullptr);
-    REQUIRE(cv_w->result == nullptr);
+    REQUIRE(cv_w->get_result() == nullptr);
 
     auto start_point_ = std::chrono::system_clock::now();
     auto worker = std::jthread([cv_w]() {
@@ -73,7 +84,7 @@ TEST_CASE("cv_wrapper: error") {
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_point - start_point_);
     bool is_really_waited = (duration.count() >= 100) && (duration.count() < 120);
     REQUIRE(is_really_waited);
-    REQUIRE(cv_w->result == nullptr);
+    REQUIRE(cv_w->get_result() == nullptr);
     REQUIRE(cv_w->status() == Status::Error);
     REQUIRE(cv_w->error_message() == "Some error occurred");
 }

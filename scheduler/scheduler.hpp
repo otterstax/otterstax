@@ -34,7 +34,7 @@
 namespace mysqlc {
     class ConnectorManager;
     class CatalogManager;
-}
+} // namespace mysqlc
 namespace pgc {
     class ConnectorManager;
 }
@@ -48,6 +48,8 @@ public:
               actor_zeta::address_t ch_connection_manager,
               actor_zeta::address_t otterbrix_manager,
               actor_zeta::address_t catalog_manager);
+
+    ~Scheduler();
 
     actor_zeta::behavior_t behavior();
     auto make_scheduler() noexcept -> actor_zeta::scheduler_abstract_t*;
@@ -63,7 +65,6 @@ private:
         NodeTag tag;
         backend_type_t backend_type{backend_type_t::Unknown};
     };
-
 
     std::unordered_map<session_hash_t, shared_session_payload> shared_data_map_;
     log_t log_;

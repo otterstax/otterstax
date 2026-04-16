@@ -1,0 +1,35 @@
+name: Integration Tests (ASAN)
+
+on:
+  push:
+    branches: [main, asan-tsan]
+  pull_request:
+    branches: [main]
+
+jobs:
+  integration-tests-asan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build test image with ASAN
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.test
+          push: false
+          load: true
+          tags: otterstax_app:ci-asan-${{ github.sha }}
+          build-args: |
+            BUILD_TYPE=Release
+            ENABLE_ASAN=ON
+          cache-from: type=gha,scope=asan
+          cache-to: type=gha,mode=max,scope=asan
+
+      - name: Run integration tests
+        env:
+          IMAGE_TAG: ci-asan-${{ github.sha }}
+        run: ./docker-run-tests.sh

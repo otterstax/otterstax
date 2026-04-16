@@ -1,0 +1,12 @@
+# ThreadSanitizer suppressions.
+#
+# Activated in sanitizer builds via TSAN_OPTIONS=suppressions=/app/tsan.supp
+# (see Dockerfile.test).
+
+# otterbrix bundles spdlog, which double-locks its periodic_worker mutex during destruction.
+called_from_lib:libotterbrix_log.so
+mutex:initialize_all_loggers
+
+# TODO: remove with cv_wrapper after move to actors
+mutex:cv_wrapper::cv_wrapper_t
+mutex:cv_wrapper_t

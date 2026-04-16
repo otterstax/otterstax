@@ -8,7 +8,6 @@
 #include <arrow/flight/api.h>
 #include <arrow/flight/sql/api.h>
 
-#include "otterbrix/types.hpp"
 #include <otterbrix/otterbrix.hpp>
 
 std::shared_ptr<arrow::Schema> to_arrow_schema(const std::pmr::vector<components::types::complex_logical_type>& types);

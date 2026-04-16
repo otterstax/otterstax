@@ -152,8 +152,8 @@ auto ChConnectionManager::execute(session_hash_t id,
                 } else {
                     log_->warn("execute result[{}]: null chunk", j);
                 }
-                auto data_node =
-                    logical_plan::make_node_raw_data(resource(), std::move(*wait_guard.results[j].release()));
+                auto tmp = std::move(*wait_guard.results[j]);
+                auto data_node = logical_plan::make_node_raw_data(resource(), std::move(tmp));
                 *(*it)[i] = data_node;
             }
         }

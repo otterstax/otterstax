@@ -629,8 +629,7 @@ namespace mysqlc {
             }
         }
 
-        sdata->result = std::move(data);
-        sdata->release();
+        sdata->set_result(std::move(data));
     }
 
     auto CatalogManager::send_result(session_hash_t id,

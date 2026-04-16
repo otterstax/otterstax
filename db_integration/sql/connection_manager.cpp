@@ -8,9 +8,9 @@
 #include "routes/scheduler.hpp"
 #include "routes/sql_connection_manager.hpp"
 #include "utility/cv_wrapper.hpp"
+#include "utility/logger.hpp"
 #include "utility/timer.hpp"
 #include "utility/wait_barrier.hpp"
-#include "utility/logger.hpp"
 
 using namespace db_conn;
 SqlConnectionManager::SqlConnectionManager(std::pmr::memory_resource* res,
@@ -60,7 +60,9 @@ actor_zeta::behavior_t SqlConnectionManager::behavior() {
     });
 }
 
-auto SqlConnectionManager::execute(session_hash_t id, ParsedQueryDataPtr&& data, actor_zeta::address_t scheduler) -> void {
+auto SqlConnectionManager::execute(session_hash_t id,
+                                   ParsedQueryDataPtr&& data,
+                                   actor_zeta::address_t scheduler) -> void {
     assert(data);
     try {
         Timer timer("SqlConnectionManager::execute", log_);
@@ -122,11 +124,13 @@ auto SqlConnectionManager::execute(session_hash_t id, ParsedQueryDataPtr&& data,
                                                 backend_type_t::MySQL));
                 } else {
                     generated_queries.emplace_back(
-                        sql_gen::generate_query(node, &data->otterbrix_params->params_node->parameters(),
+                        sql_gen::generate_query(node,
+                                                &data->otterbrix_params->params_node->parameters(),
                                                 backend_type_t::MySQL));
                 }
                 log_->debug("execute Generated SQL Query: \"{}\"", generated_queries.back());
-                wait_guard.futures.push_back(connector_manager_->executeQuery(uid,generated_queries.back(),data_converter));
+                wait_guard.futures.push_back(
+                    connector_manager_->executeQuery(uid, generated_queries.back(), data_converter));
             }
 
             if (processed_indices.empty()) {
@@ -146,8 +150,8 @@ auto SqlConnectionManager::execute(session_hash_t id, ParsedQueryDataPtr&& data,
                 } else {
                     log_->warn("execute result[{}]: null chunk", j);
                 }
-                auto data_node =
-                    logical_plan::make_node_raw_data(resource(), std::move(*wait_guard.results[j].release()));
+                auto tmp = std::move(*wait_guard.results[j]);
+                auto data_node = logical_plan::make_node_raw_data(resource(), std::move(tmp));
                 *(*it)[i] = data_node;
             }
         }

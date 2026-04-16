@@ -8,8 +8,8 @@
 #include "otterbrix/translators/input/mysql_to_chunk.hpp"
 #include "otterbrix/translators/output/chunk_to_arrow.hpp"
 #include "utility/connection_uid.hpp"
-#include "utility/timer.hpp"
 #include "utility/logger.hpp"
+#include "utility/timer.hpp"
 
 #include "otterbrix/config.hpp"
 #include "routes/scheduler.hpp"
@@ -133,7 +133,7 @@ SimpleFlightSQLServer::GetFlightInfoStatement(const arrow::flight::ServerCallCon
     shared_data->wait_for(cv_wrapper::DEFAULT_TIMEOUT);
 
     if (shared_data->status() == cv_wrapper::Status::Ok) {
-        std::shared_ptr<arrow::Schema> schema = to_arrow_schema(shared_data->result.schema);
+        std::shared_ptr<arrow::Schema> schema = to_arrow_schema(shared_data->get_result().schema);
         std::vector<arrow::flight::FlightEndpoint> endpoints{
             arrow::flight::FlightEndpoint{std::move(ticket), {}, std::nullopt, ""}};
 
@@ -174,19 +174,19 @@ SimpleFlightSQLServer::DoGetStatement(const arrow::flight::ServerCallContext& co
         shared_data->wait_for(cv_wrapper::DEFAULT_TIMEOUT);
 
         if (shared_data->status() == cv_wrapper::Status::Ok) {
-            log_->debug("[DOGET] Scheduler finished successfully, rows size: {}", shared_data->result.chunk.size());
-            auto chunk_res = std::move(shared_data->result.chunk);
+            auto sdata_result = shared_data->get_result();
+            log_->debug("[DOGET] Scheduler finished successfully, rows size: {}", sdata_result.chunk.size());
             timer.timePoint("[DOGET] Scheduler finished successfully");
 
-            auto schema = to_arrow_schema(shared_data->result.schema);
-            auto batch_reader = ChunkBatchReader::Make(std::move(schema), std::move(chunk_res)).ValueOrDie();
+            auto schema = to_arrow_schema(sdata_result.schema);
+            auto batch_reader = ChunkBatchReader::Make(std::move(schema), std::move(sdata_result.chunk)).ValueOrDie();
             // Use a record batch stream
             log_->trace("[ARROW FLIGHT SERVER] Send data");
             timer.timePoint("[DOGET] datastream created");
             return std::make_unique<arrow::flight::RecordBatchStream>(batch_reader);
         } else if (shared_data->status() == cv_wrapper::Status::Empty) {
             std::shared_ptr<arrow::Schema> schema;
-            auto chunk_res = std::move(shared_data->result.chunk);
+            auto chunk_res = shared_data->get_result().chunk;
             log_->warn("[Otterbrix]: result cursor size : {}", chunk_res.size());
             auto batch_reader = ChunkBatchReader::Make(arrow::schema({}), std::move(chunk_res)).ValueOrDie();
             return std::make_unique<arrow::flight::RecordBatchStream>(batch_reader);
@@ -241,6 +241,7 @@ SimpleFlightSQLServer::DoGetTables(const arrow::flight::ServerCallContext& conte
                      command,
                      shared_data);
     shared_data->wait_for(cv_wrapper::DEFAULT_TIMEOUT);
+    auto sdata_result = shared_data->get_result();
 
     // otherwise always Ok or Empty
     if (shared_data->status() == cv_wrapper::Status::Timeout) {
@@ -248,7 +249,7 @@ SimpleFlightSQLServer::DoGetTables(const arrow::flight::ServerCallContext& conte
         return arrow::Status::Invalid("Timeout while getting tables");
     }
 
-    for (const auto& table : shared_data->result) {
+    for (const auto& table : sdata_result) {
         ARROW_RETURN_NOT_OK(catalog_builder.Append(table.name.database));
         ARROW_RETURN_NOT_OK(db_schema_builder.Append(table.name.schema));
         ARROW_RETURN_NOT_OK(table_name_builder.Append(table.name.collection));
@@ -278,7 +279,7 @@ SimpleFlightSQLServer::DoGetTables(const arrow::flight::ServerCallContext& conte
 
     auto schema = include_schema ? arrow::flight::sql::SqlSchema::GetTablesSchemaWithIncludedSchema()
                                  : arrow::flight::sql::SqlSchema::GetTablesSchema();
-    auto batch = arrow::RecordBatch::Make(schema, shared_data->result.size(), arrays);
+    auto batch = arrow::RecordBatch::Make(schema, sdata_result.size(), arrays);
     ARROW_ASSIGN_OR_RAISE(auto reader, arrow::RecordBatchReader::Make({batch}));
     return std::make_unique<arrow::flight::RecordBatchStream>(reader);
 }
@@ -299,11 +300,12 @@ SimpleFlightSQLServer::DoPutCommandStatementUpdate(const arrow::flight::ServerCa
                          shared_data,
                          command.query);
         shared_data->wait_for(cv_wrapper::DEFAULT_TIMEOUT);
+        auto sdata_result = shared_data->get_result();
 
         int64_t affected_rows = 0;
 
         if (shared_data->status() == cv_wrapper::Status::Ok) {
-            affected_rows = shared_data->result.chunk.size();
+            affected_rows = sdata_result.chunk.size();
             log_->debug("[DoPutCommandStatementUpdate] Scheduler finished successfully, rows size: {}", affected_rows);
             timer.timePoint("[DoPutCommandStatementUpdate] Scheduler finished successfully");
 
@@ -312,7 +314,7 @@ SimpleFlightSQLServer::DoPutCommandStatementUpdate(const arrow::flight::ServerCa
             timer.timePoint("[DoPutCommandStatementUpdate] datastream created");
             return affected_rows;
         } else if (shared_data->status() == cv_wrapper::Status::Empty) {
-            affected_rows = shared_data->result.chunk.size();
+            affected_rows = sdata_result.chunk.size();
             log_->warn("[Otterbrix]: result cursor size : {}", affected_rows);
             return affected_rows;
         } else if (shared_data->status() == cv_wrapper::Status::Timeout) {

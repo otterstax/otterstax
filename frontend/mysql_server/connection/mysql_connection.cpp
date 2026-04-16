@@ -17,7 +17,6 @@ namespace frontend::mysql {
         , resource_(resource)
         , statement_id_map_(resource_)
         , sequence_id_(0)
-        , expected_sequence_id_(0)
         , next_statement_id_(0)
         , client_max_packet_size_(DEFAULT_MAX_PACKET_SIZE)
         , scheduler_(scheduler)
@@ -87,16 +86,12 @@ namespace frontend::mysql {
         bool sequence_valid = false;
         switch (state_) {
             case connection_state::AUTH:
-                sequence_valid = (seq_id == 1);
-                if (sequence_valid) {
-                    sequence_id_ = 2;
-                }
+                sequence_valid = (seq_id == 1); // server sent auth packet
+                sequence_id_ = 2;
                 break;
             case connection_state::COMMAND:
-                sequence_valid = (seq_id == expected_sequence_id_);
-                if (sequence_valid) {
-                    sequence_id_ = seq_id + 1;
-                }
+                sequence_valid = (seq_id == 0); // start with 0
+                sequence_id_ = 1;
                 break;
             case connection_state::HANDSHAKE:
                 throw std::logic_error("Impossible connection state during packet sequence: HANDSHAKE");
@@ -105,8 +100,7 @@ namespace frontend::mysql {
         if (!sequence_valid) {
             std::string state_str = state_ == connection_state::AUTH ? "AUTH" : "COMMAND";
             send_error(mysql_error::ER_SEQUENCE_ERROR,
-                       "Packet sequence error in " + std::move(state_str) +
-                           " expected: " + std::to_string(expected_sequence_id_) + " got: " + std::to_string(seq_id));
+                       "Packet sequence error in " + std::move(state_str) + " got: " + std::to_string(seq_id));
             return;
         }
 
@@ -121,7 +115,6 @@ namespace frontend::mysql {
                 break;
             case connection_state::COMMAND:
                 handle_command(std::move(payload));
-                reset_packet_sequence();
                 break;
         }
     }
@@ -133,10 +126,5 @@ namespace frontend::mysql {
                    message,
                    static_cast<int>(sequence_id_));
         send_packet(build_error(writer_, sequence_id_++, error_code, std::move(message)));
-    }
-
-    void mysql_connection::reset_packet_sequence() {
-        expected_sequence_id_ = 0;
-        sequence_id_ = 1;
     }
 } // namespace frontend::mysql

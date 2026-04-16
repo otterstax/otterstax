@@ -15,7 +15,7 @@ struct QueryHandleWaiter {
         for (auto& future : futures) {
             auto result = future.get();
             // Received from DB
-            results.push_back(std::move(result));
+            results.emplace_back(std::move(result));
         }
         // Finished
     }

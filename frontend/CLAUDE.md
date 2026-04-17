@@ -26,6 +26,12 @@ frontend/
 
 `frontend_connection` provides the base connection class with shared utilities (`packet_reader_base`, `packet_writer_base`, `resultset_utils`).
 
+`asio_future_bridge.hpp` is the universal sink between the Scheduler/Worker pool
+(which hands back `actor_zeta::unique_future`s) and the per-connection asio
+executor: `async_await_future` polls `take_ready()` from inside a coroutine and
+co_returns the `core::result_wrapper_t<session_payload>` when ready, never
+blocking the executor thread.
+
 ## FlightSQL (`flight_sql_server/`)
 
 `SimpleFlightSQLServer` extends `arrow::flight::sql::FlightSqlServerBase`. Key overrides:
@@ -38,7 +44,7 @@ FlightSQL does its own session management because the Arrow Flight protocol sepa
 
 ## MySQL / PostgreSQL Servers
 
-Both follow the same pattern: `frontend_server<XConnection>` accepts TCP connections; each connection implements the respective handshake + query/response protocol, then calls `Scheduler::execute` and blocks on the `shared_session_payload` CV wrapper until results arrive.
+Both follow the same pattern: `frontend_server<XConnection>` accepts TCP connections; each connection implements the respective handshake + query/response protocol, then calls `Scheduler::execute` (and friends), which returns an `actor_zeta::unique_future<core::result_wrapper_t<session_payload>>`. The connection awaits that future via `frontend/common/asio_future_bridge.hpp::async_await_future` (polls `take_ready()` on the asio executor — no blocking get, no `cv_wrapper`).
 
 Packet encoding/decoding lives in `{mysql,postgres}_server/packet/` and `{mysql,postgres}_server/{mysql,postgres}_defs/`. Result-set serialisation is in `{mysql,postgres}_server/resultset/`.
 

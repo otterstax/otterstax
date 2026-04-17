@@ -50,8 +50,8 @@ python ./generate_data.py
 # --- 2. Bring up containers ---
 echo ""
 if $LOCAL; then
-    echo "=== 2. Starting demo backends only (bench/local mode) ==="
-    $COMPOSE_CMD -f compose.yml up -d demo-mariadb demo-postgres demo-clickhouse
+    echo "=== 2. Starting demo backends + MinIO only (bench/local mode) ==="
+    $COMPOSE_CMD -f compose.yml up -d demo-mariadb demo-postgres demo-clickhouse demo-minio demo-minio-init
 else
     echo "=== 2. Starting full demo stack (compose.yml --profile full) ==="
     $COMPOSE_CMD --profile full -f compose.yml up -d --build
@@ -61,9 +61,9 @@ fi
 echo ""
 echo "=== 3. Waiting for healthy containers ==="
 if $LOCAL; then
-    WAIT_SVCS="demo-mariadb demo-postgres demo-clickhouse"
+    WAIT_SVCS="demo-mariadb demo-postgres demo-clickhouse demo-minio"
 else
-    WAIT_SVCS="demo-mariadb demo-postgres demo-clickhouse demo-otterstax"
+    WAIT_SVCS="demo-mariadb demo-postgres demo-clickhouse demo-minio demo-otterstax"
 fi
 for svc in $WAIT_SVCS; do
     echo -n "   $svc"
@@ -86,9 +86,10 @@ done
 # --- 4. Register connections (full mode only) ---
 if ! $LOCAL; then
     echo ""
-    echo "=== 4. Registering demo connections (mysql, pg, ch) ==="
+    echo "=== 4. Registering demo connections (mysql, pg, ch, s3) ==="
     # otterstax runs INSIDE the docker network — use docker-DNS JSONs (no --local).
     ./connections/add_connections.sh
+    ./connections/add_s3_credentials.sh
 fi
 
 # --- 5. Print usage ---
@@ -96,19 +97,22 @@ if $LOCAL; then
 cat <<'EOF'
 
 ================================================================================
-✅  Demo backends are up:
+✅  Demo backends + MinIO are up:
 
   MariaDB:    localhost:3201   user=demo pass=demo db=bill
   Postgres:   localhost:3202   user=demo pass=demo db=shop
   ClickHouse: localhost:3204   user=demo pass=demo db=ev
+  MinIO:      localhost:3206   user=minioadmin pass=minioadmin bucket=demo-bucket
+              (console: http://localhost:3207)
 
   Now start your local otterstax server:
     ./build/server --port-flight 8815 --port-mysql 8816 --port-postgres 8817 --port-http 8085
 
   Then register connections (in another terminal once server is up):
-    examples/demo/connections/add_connections.sh --local
+    examples/demo/connections/add_connections.sh    --local
+    examples/demo/connections/add_s3_credentials.sh --local
 
-  Run all demo queries:
+  Run all demo queries (steps 1-9, incl. s3 load + dump):
     examples/demo/run-queries.sh
 
   Tear down with: examples/demo/down.sh
@@ -126,6 +130,7 @@ cat <<'EOF'
   Other wires:
     mysql -h localhost -P 8816 -u demo -pdemo
     HTTP API:  http://localhost:8085
+    MinIO console: http://localhost:3207  (user=minioadmin pass=minioadmin)
 
   Run demo SQL files step-by-step (paths relative to repo root):
 
@@ -138,16 +143,20 @@ cat <<'EOF'
     psql -h localhost -p 8817 -U demo demo -f examples/demo/sql/step_4.sql
     psql -h localhost -p 8817 -U demo demo -f examples/demo/sql/step_5.sql
     psql -h localhost -p 8817 -U demo demo -f examples/demo/sql/step_6.sql
+    psql -h localhost -p 8817 -U demo demo -f examples/demo/sql/step_7.sql   # s3 csv load
+    psql -h localhost -p 8817 -U demo demo -f examples/demo/sql/step_8.sql   # s3 parquet load
+    psql -h localhost -p 8817 -U demo demo -f examples/demo/sql/step_9.sql   # JOIN + dump back to s3
 
   Or all at once:
     examples/demo/run-queries.sh
 
-  After running steps 3a-3b (which create otter.warehouses), run cleanup
-  before re-doing the demo:
+  After running steps 3a-3b / 7-8 (which create otter.warehouses / otter.regions /
+  otter.promos), run cleanup before re-doing the demo:
 
     psql -h localhost -p 8817 -U demo demo -f examples/demo/sql/cleanup.sql
 
-  Tear everything down (releases volumes — clickhouse re-init needs this):
+  Tear everything down (releases volumes — clickhouse re-init needs this,
+  and the MinIO bucket is recreated on next `up`):
 
     examples/demo/down.sh
 

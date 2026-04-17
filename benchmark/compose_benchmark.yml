@@ -31,6 +31,12 @@ services:
       - "8085"
     ports:
       - "8086:8086"
+    volumes:
+      # s3/file external-table fixtures (regions.parquet / web_events.csv /
+      # campaigns.ndjson), generated into data/fixtures by run_benchmark.sh.
+      # The `file` source reads these directly; the `s3` source reads the same
+      # files seeded into MinIO (compose_minio.yml).  Empty for non-external runs.
+      - ./data/fixtures:/fixtures:ro
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8085/health"]
       interval: 5s

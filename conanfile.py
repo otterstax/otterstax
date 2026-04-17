@@ -45,6 +45,7 @@ class OtterStax(ConanFile):
         self.requires("catch2/2.13.7")
         self.requires("grpc/1.50.0")
         self.requires("gflags/2.2.2", override=True)
+        self.requires("aws-sdk-cpp/1.11.352", override=True)
         self.requires("abseil/20230802.1")
         self.requires("benchmark/1.6.1")
         self.requires("zlib/1.3.1")
@@ -73,9 +74,18 @@ class OtterStax(ConanFile):
         self.options["arrow/*"].with_brotli = True
         self.options["arrow/*"].with_zlib = True
         self.options["arrow/*"].with_lz4 = True
+        self.options["arrow/*"].with_snappy = True
         self.options["arrow/*"].with_zstd = True
         self.options["arrow/*"].with_gflags = True
         self.options["arrow/*"].use_system_gflags = True
+        self.options["arrow/*"].with_parquet = True
+        self.options["arrow/*"].with_csv = True
+        self.options["arrow/*"].with_json = True
+        self.options["arrow/*"].with_s3 = True
+
+        self.options["aws-sdk-cpp/*"].config = True
+        self.options["aws-sdk-cpp/*"].polly = False
+        setattr(self.options["aws-sdk-cpp/*"], "text-to-speech", False)
 
         self.options["otterbrix/*"].shared = True
 

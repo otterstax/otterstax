@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2025-2026  OtterStax
 
+#pragma once
+
 #include <boost/asio.hpp>
 #include <boost/beast.hpp>
 #include <boost/json.hpp>
@@ -8,16 +10,18 @@
 #include <memory>
 #include <thread>
 
+#include "../clickhouse/manager.hpp"
 #include "../mysql/manager.hpp"
 #include "../postgresql/manager.hpp"
-#include "../clickhouse/manager.hpp"
+#include "connectors/s3/manager.hpp"
+#include <actor-zeta.hpp>
 
 namespace beast = boost::beast;
 namespace http = beast::http;
 namespace asio = boost::asio;
 using tcp = asio::ip::tcp;
 
-namespace http_server {
+namespace conn::api_server {
     class Session : public std::enable_shared_from_this<Session> {
         tcp::socket socket_;
         beast::flat_buffer buffer_{8192};
@@ -26,12 +30,14 @@ namespace http_server {
         std::shared_ptr<mysql::ConnectorManager> mysql_conn_manager_;
         std::shared_ptr<pg::ConnectorManager> pg_conn_manager_;
         std::shared_ptr<ch::ConnectorManager> ch_conn_manager_;
+        actor_zeta::address_t s3_manager_;
 
     public:
         explicit Session(tcp::socket socket,
                          std::shared_ptr<mysql::ConnectorManager> mysql_conn_manager,
                          std::shared_ptr<pg::ConnectorManager> pg_conn_manager,
-                         std::shared_ptr<ch::ConnectorManager> ch_conn_manager);
+                         std::shared_ptr<ch::ConnectorManager> ch_conn_manager,
+                         actor_zeta::address_t s3_manager);
         void start();
 
     private:
@@ -48,12 +54,14 @@ namespace http_server {
         Server(asio::io_context& ioc, unsigned short port,
                std::shared_ptr<mysql::ConnectorManager> mysql_conn_manager,
                std::shared_ptr<pg::ConnectorManager> pg_conn_manager,
-               std::shared_ptr<ch::ConnectorManager> ch_conn_manager);
+               std::shared_ptr<ch::ConnectorManager> ch_conn_manager,
+               actor_zeta::address_t s3_manager);
 
     private:
         void accept();
         std::shared_ptr<mysql::ConnectorManager> mysql_conn_manager_;
         std::shared_ptr<pg::ConnectorManager> pg_conn_manager_;
         std::shared_ptr<ch::ConnectorManager> ch_conn_manager_;
+        actor_zeta::address_t s3_manager_;
     };
-} // namespace http_server
+} // namespace conn::api_server

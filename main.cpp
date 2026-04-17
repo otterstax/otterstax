@@ -13,7 +13,7 @@
 #include <spdlog/spdlog.h>
 
 #include "component_manager/component_manager.hpp"
-#include "connectors/api_connections/connection_server.hpp"
+#include "connectors/api_server/connection_server.hpp"
 #include "connectors/mysql/connector.hpp"
 #include "frontend/flight_sql_server/server.hpp"
 #include "frontend/mysql_server/mysql_server.hpp"
@@ -97,10 +97,12 @@ int main(int argc, char* argv[]) {
     std::jthread server_thread([mysql_conn_manager = cmanager.db_connection_manager(),
                                 pg_conn_manager = cmanager.pg_connection_manager(),
                                 ch_conn_manager = cmanager.ch_connection_manager(),
+                                s3_manager = cmanager.s3_manager_address(),
                                 http_port = server_config.connection_manager.port,
                                 &http_ctx]() {
         OTX_ZONE_N("http_server::thread");
-        http_server::Server http(http_ctx, http_port, mysql_conn_manager, pg_conn_manager, ch_conn_manager);
+        conn::api_server::Server http(http_ctx, http_port, mysql_conn_manager, pg_conn_manager, ch_conn_manager,
+                                      s3_manager);
         auto log = get_logger(logger_tag::Main);
         log->info("HTTP Server running on port {}...", http_port);
         OTX_MESSAGE_L("http_server: running");

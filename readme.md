@@ -14,6 +14,10 @@ for easy integration testing and deployment.
 - Database federation: query multiple MariaDB/MySQL, PostgreSQL, and ClickHouse
   backends through a single endpoint
 - Otterbrix integration: powered by the Otterbrix query engine
+- **File and S3 external tables**: `CREATE EXTERNAL TABLE` ingests parquet,
+  csv, or ndjson from a local path or an `s3://…` URI into the engine; `COPY
+  (<select>) TO '…'` exports any query result back to a local file or an S3
+  object — see [S3 / file external tables](#s3--file-external-tables) below.
 - Docker ready: compose files to bring up test databases and the server
 
 ## Architecture
@@ -26,6 +30,63 @@ OtterStax runs several protocol servers concurrently:
 | MySQL      | 8816          | MySQL wire protocol |
 | PostgreSQL | 8817          | PostgreSQL wire protocol |
 | HTTP       | 8085          | Connection manager REST API |
+
+## S3 / file external tables
+
+OtterStax can pull data into the engine from a local file or an S3-compatible
+object store (AWS S3, MinIO, …) and dump query results back out, all over the
+standard wire protocols. The surface SQL is two grammar extensions:
+
+```sql
+-- Load (auto-detects format from the file extension when omitted)
+CREATE EXTERNAL TABLE db.t
+    WITH (location = '/path/to/data.parquet', format = 'parquet');
+
+CREATE EXTERNAL TABLE db.t
+    WITH (s3_alias = 'minio1',
+          location = 's3://bucket/data.csv',
+          format   = 'csv');
+
+-- Export (inner SELECT is re-parsed and executed by the engine)
+COPY (SELECT * FROM db.t WHERE …) TO '/tmp/out.ndjson'
+    WITH (format = 'ndjson');
+
+COPY (SELECT * FROM db.t) TO 's3://bucket/exported/out.csv'
+    WITH (s3_alias = 'minio1', format = 'csv');
+```
+
+- **Supported formats**: `parquet`, `csv`, `ndjson` (read and write).
+- **Parquet compression** read/write: snappy, brotli, zlib (gzip), lz4, zstd
+  (uncompressed too).
+- **Format auto-detection**: optional — inferred from the file extension when
+  the `format` option is omitted.
+- **After load**: the external table becomes a normal otterbrix-internal
+  table; `SELECT`, `INSERT`, JOIN against other tables, `COPY ... TO` all
+  work the same way. JOINs between any combination of loaded external
+  sources execute in the engine in a single statement, and so do JOINs that
+  mix a **registered remote backend** (MariaDB / MySQL / PostgreSQL /
+  ClickHouse) with an otterbrix-internal table — the backend manager fetches
+  its slice into the engine as `raw_data` and the JOIN runs in-process. (See
+  the deep-dive in [`CLAUDE.md`](CLAUDE.md#working-join-shapes) for the
+  width-of-the-JOIN-key footgun to keep in mind.)
+- **S3 credentials**: register a named alias via the REST API once per
+  process, then reference it through `s3_alias=...`:
+
+  ```bash
+  curl -X GET http://localhost:8085/s3/add_credentials \
+       -H 'Content-Type: application/json' \
+       -d '{"alias":"minio1","access_key":"…","secret_key":"…",
+            "region":"us-east-1","endpoint":"minio:9000"}'
+  ```
+
+  The `endpoint` field switches the underlying Arrow S3 client to http +
+  path-style addressing (needed for MinIO); omit it to target real AWS.
+
+Implementation lives under `connectors/{s3,file}/` (raw I/O),
+`integration/s3/` (the `S3Manager` orchestrator), and
+`otterbrix/parser/grammar_extention/{s3,file}/` (the parser extensions). The
+top-level [`CLAUDE.md`](CLAUDE.md#external-tables--file--s3) has the full
+end-to-end actor flow.
 
 ## Requirements
 
@@ -142,7 +203,7 @@ and writes results to `benchmark_results/<timestamp>/`.
 | ------ | ----------- |
 | `--repetitions N` | Repetitions per sub-test (default: 10) |
 | `--frontend F` | `mysql` \| `postgres` \| `arrow`; may be repeated; default: `mysql postgres` |
-| `--bench T [T …]` | Tests to run: `simple_select` `complex_select` `join_same_instance` `join_cross_engine` `join_all` |
+| `--bench T [T …]` | Tests to run: `simple_select` `complex_select` `join_same_instance` `join_cross_engine` `join_all` `external_load` `external_join` `external_dump` `external_join_cross` `external_join_all`. Selecting any `external_*` test auto-starts MinIO, generates s3/file fixtures, and registers the `bench_minio` s3 alias (mysql/postgres frontends only). |
 | `--rebuild` | Force image rebuild even if images already exist |
 | `--clear` | Remove images + DB volumes, rebuild from scratch |
 | `-j N` | Parallel cmake build jobs (auto-capped by available RAM) |
@@ -190,16 +251,16 @@ never deleted automatically; each run creates a new timestamped sub-directory.
 ```
 otterstax/
 ├── frontend/           # Protocol servers (FlightSQL, MySQL, PostgreSQL)
-├── catalog/            # Metadata catalog
-├── connectors/         # Database connectors and HTTP server
+├── catalog/            # Metadata catalog + connection type registry
+├── connectors/         # MySQL / PG / ClickHouse / S3 / file connectors + HTTP API
 ├── component_manager/  # Component lifecycle management
 ├── config/             # Configuration loading and runtime settings
-├── db_integration/     # Database integration layer
-├── otterbrix/          # Otterbrix query engine integration
-├── routes/             # Query routing
-├── scheduler/          # Query scheduling
-├── tests/              # Tests (integration/unit)
-├── examples/          # Demo stack (examples/demo/) + simple client examples (examples/simple/)
+├── integration/        # Actor wrappers bridging Scheduler ↔ connectors (incl. S3Manager)
+├── otterbrix/          # Otterbrix engine integration + s3/file grammar extensions
+├── scheduler/          # Query routing actor
+├── cmake/              # Build helpers (parser-extension macro)
+├── tests/              # Catch2 C++ tests + python integration suite
+├── examples/           # Demo stack (examples/demo/) + simple client examples (examples/simple/)
 └── fixtures/           # Test data generation
 ```
 

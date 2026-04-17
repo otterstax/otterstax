@@ -19,7 +19,7 @@ RUN apt update && \
     apt clean && \
     rm -rf /var/lib/apt/lists/*
 
-RUN pip3 install --no-cache-dir conan==2.15.0 'cmake<4.0' && \
+RUN pip3 install --no-cache-dir conan==2.21.0 'cmake<4.0' && \
      conan profile detect --force && \
      conan remote add otterbrix http://conan.otterbrix.com
 
@@ -68,6 +68,7 @@ COPY ./component_manager ./component_manager
 COPY ./scheduler ./scheduler
 COPY ./types ./types
 COPY ./utility ./utility
+COPY ./cmake ./cmake
 COPY ./main.cpp ./main.cpp
 COPY ./CMakeLists.txt ./CMakeLists.txt
 

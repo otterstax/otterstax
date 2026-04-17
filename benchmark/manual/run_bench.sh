@@ -7,9 +7,11 @@
 #
 # Options:
 #   --frontend F    mysql | postgres | arrow  (repeatable; default: mysql postgres)
-#   --bench T [T..] Test name(s) to run, space-separated (default: all tests).
+#   --bench T [T..] Test name(s) to run, space-separated (default: cross-backend tests).
 #                   Values: simple_select complex_select join_same_instance
 #                           join_cross_engine join_all
+#                           external_load external_join external_dump
+#                   (external_* require ./start_service.sh --external)
 #   --repetitions N Reps per test (default: 3)
 #   --out-dir DIR   Output directory (default: benchmark_manual/<YYYYMMDD_HHMMSS>)
 set -e
@@ -46,10 +48,12 @@ done
 
 [ ${#FRONTENDS[@]} -eq 0 ] && FRONTENDS=("${DEFAULT_FRONTENDS[@]}")
 
-TESTS=("${ALL_TESTS[@]}")
+# Default to the cross-backend tests; --bench may also select external_* (which
+# need the service started with ./start_service.sh --external).
+TESTS=("${DEFAULT_TESTS[@]}")
 if [ ${#BENCH_FILTER[@]} -gt 0 ]; then
     _filtered=()
-    for _t in "${TESTS[@]}"; do
+    for _t in "${ALL_TESTS[@]}"; do
         for _b in "${BENCH_FILTER[@]}"; do
             [ "$_t" = "$_b" ] && { _filtered+=("$_t"); break; }
         done

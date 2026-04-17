@@ -24,3 +24,13 @@ race:boost::lockfree
 # interleaved output is harmless.
 race:std::__1::__put_character_sequence
 race:std::__1::ios_base::width
+
+# Arrow's JSON TableReader (and the IO read-ahead pipeline behind it) spawns
+# a BackgroundGenerator worker thread to feed buffer chunks, even when we set
+# ReadOptions::use_threads=false. That thread races with the main thread on
+# the generator's State / Mutex and on the Result<shared_ptr<Buffer>> slots in
+# its internal deque during teardown of the reader. Both sides of the race are
+# inside libarrow — no otterstax frame participates. Hit by ndjson_to_chunk
+# (file + buffer overloads) and shows up in test_unit_translators.
+race:arrow::BackgroundGenerator
+race:arrow::Result

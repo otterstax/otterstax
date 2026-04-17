@@ -18,6 +18,8 @@ target_link_libraries(component_manager PUBLIC
     arrow::arrow
     PostgreSQL::PostgreSQL
     clickhouse-cpp-lib::clickhouse-cpp-lib
+    s3
+    file
 )
 
 target_include_directories(component_manager PUBLIC

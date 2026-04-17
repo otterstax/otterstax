@@ -66,7 +66,7 @@ namespace pg {
         }
     }
 
-    std::string ConnectorManager::addConnection(http_server::PgConnectionParams connection_param) {
+    std::string ConnectorManager::addConnection(conn::api_server::PgConnectionParams connection_param) {
         OTX_ZONE_N("pg::ConnectorManager::addConnection(http)");
         connect_params params;
         log_->debug("Try add PostgreSQL connection with alias: {}", connection_param.alias);

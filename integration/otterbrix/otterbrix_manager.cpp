@@ -77,6 +77,8 @@ actor_zeta::behavior_t OtterbrixManager::behavior(actor_zeta::mailbox::message* 
         co_await actor_zeta::dispatch(this, &OtterbrixManager::register_external_table, msg);
     } else if (cmd == actor_zeta::msg_id<OtterbrixManager, &OtterbrixManager::drop_external_database>) {
         co_await actor_zeta::dispatch(this, &OtterbrixManager::drop_external_database, msg);
+    } else if (cmd == actor_zeta::msg_id<OtterbrixManager, &OtterbrixManager::create_table>) {
+        co_await actor_zeta::dispatch(this, &OtterbrixManager::create_table, msg);
     }
 }
 
@@ -253,4 +255,32 @@ OtterbrixManager::get_schema(session_hash_t id,
 
     log_->trace("get_schema finish");
     co_return std::make_pair(std::move(schema), std::move(data));
+}
+
+actor_zeta::unique_future<core::result_wrapper_t<bool>>
+OtterbrixManager::create_table(session_hash_t id, std::string database, std::string table,
+                               components::vector::data_chunk_t chunk) {
+    OTX_ZONE_N("otterbrix::create_table");
+    try {
+        data_manager_->create_database(database);
+
+        auto types = chunk.types();
+        std::vector<components::table::column_definition_t> columns;
+        columns.reserve(types.size());
+        for (auto& t : types) {
+            columns.emplace_back(t.alias(), t);
+        }
+
+        auto cursor = data_manager_->insert_data(database, table, std::move(columns), std::move(chunk));
+        if (cursor->is_error()) {
+            co_return core::error_t(core::error_code_t::other_error,
+                                    std::pmr::string{"create_table: insert_data failed", resource()});
+        }
+        co_return true;
+    } catch (const std::exception& e) {
+        log_->error("create_table caught exception: {}", e.what());
+        co_return core::error_t(
+            core::error_code_t::other_error,
+            std::pmr::string{(std::string("create_table: ") + e.what()).c_str(), resource()});
+    }
 }

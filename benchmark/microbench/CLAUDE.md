@@ -77,6 +77,36 @@ This is the hot path for every query result delivered over the FlightSQL fronten
 
 ---
 
+### `bench_file_translators.cpp`
+
+File-format translators used by the file/S3 ingestion path (`connectors/file`, `integration/s3`).
+
+Synthetic data: 2 columns — integer `id`, string `name` (`row_i`).
+
+#### Input — `csv_to_chunk` / `ndjson_to_chunk` / `parquet_to_chunk`
+
+| Benchmark | Rows | Notes |
+|-----------|------|-------|
+| `BM_csv_to_chunk/{1000,10000}` | 1 k / 10 k | In-memory buffer overload (no disk I/O) |
+| `BM_ndjson_to_chunk/{1000,10000}` | 1 k / 10 k | NDJSON, buffer overload |
+| `BM_parquet_to_chunk/{1000,10000}` | 1 k / 10 k | Parquet buffer built once outside the loop |
+
+Input benchmarks use the **buffer** overloads so only the parse + `data_chunk_t` construction is measured.
+
+#### Output — `chunk_to_csv` / `chunk_to_ndjson` / `chunk_to_parquet`
+
+| Benchmark | Rows | Notes |
+|-----------|------|-------|
+| `BM_chunk_to_csv/{1000,10000}` | 1 k / 10 k | |
+| `BM_chunk_to_ndjson/{1000,10000}` | 1 k / 10 k | |
+| `BM_chunk_to_parquet/{1000,10000}` | 1 k / 10 k | |
+
+`chunk_to_*` only expose a file-path API, so output timings **include the filesystem write** to `/tmp`. The source `data_chunk_t` is built once outside the loop (it is move-only, but `chunk_to_*` take it by const ref and so reuse it).
+
+**Arrow runtime note:** the conan cache holds several `libarrow.so` builds; only the one CMake links here ships the CSV/JSON/Parquet readers. `otterstax_bench` therefore pins an absolute `DT_RPATH` to `${CMAKE_BINARY_DIR}/lib` with `--disable-new-dtags` (see `CMakeLists.txt`) so the correct libarrow wins over `run-bench.sh`'s `LD_LIBRARY_PATH` glob.
+
+---
+
 ### `bench_parser.cpp`
 
 SQL parsing and subquery extraction.
@@ -155,13 +185,50 @@ Mirrors the exact runtime sequence: one `prepare_sql` call followed by one `repl
 
 #### `table_reference` — backend-specific table name formatting
 
-Measures `sql_gen::table_reference(collection_full_name_t, backend_type_t)` in isolation. Called once per table per query to produce `db.table` (MySQL) or `schema.table` (PG/CH) references.
+Measures `sql_gen::table_reference(qualified_name_t, backend_type_t)` in isolation. Called once per table per query to produce `db.table` (MySQL) or `schema.table` (PG/CH) references.
 
 | Benchmark | Backend |
 |-----------|---------|
 | `BM_table_reference_mysql` | MySQL |
 | `BM_table_reference_pg` | PostgreSQL |
 | `BM_table_reference_ch` | ClickHouse |
+
+---
+
+### `bench_grammar_extension.cpp`
+
+The `s3` / `file` SQL parser extensions (`otterbrix/parser/grammar_extention/{s3,file}`), which teach the
+engine `CREATE EXTERNAL TABLE … WITH (…)` and `COPY (<select>) TO '<location>' WITH (…)`. Two layers are
+measured. Each iteration creates a fresh `std::pmr::monotonic_buffer_resource` (mirrors `GreenplumParser`,
+which arena-scopes every parse; also bounds memory since a monotonic resource only frees on destruction).
+
+Links `otterbrix::s3_extension` + `otterbrix::file_extension` (they export their headers as PUBLIC includes).
+
+#### Isolated extension parse stage — `s3_ext::parse` / `file_ext::parse`
+
+| Benchmark | Statement | Notes |
+|-----------|-----------|-------|
+| `BM_s3_ext_parse_create` | `CREATE EXTERNAL TABLE … 's3://…'` | option-list + s3 claim check |
+| `BM_s3_ext_parse_copy` | `COPY (SELECT …) TO 's3://…'` | also the C++ driver's balanced-paren scan that strips the inner SELECT |
+| `BM_file_ext_parse_create` | `CREATE EXTERNAL TABLE … '/data/…'` | local-path claim |
+| `BM_file_ext_parse_copy` | `COPY (SELECT …) TO '/data/…'` | |
+
+#### Registry-routed full parse — `raw_parser(arena, sql, registry)`
+
+The realistic cost paid when the statement is typed at the wire: the **core Greenplum parser runs first and
+rejects**, then the extension claims. The registry (both extensions added) is built once outside the loop.
+
+| Benchmark | SQL | Path |
+|-----------|-----|------|
+| `BM_registry_parse_s3_create` | s3 CREATE EXTERNAL TABLE | core reject → `s3` claim |
+| `BM_registry_parse_file_create` | file CREATE EXTERNAL TABLE | core reject → `file` claim |
+| `BM_registry_parse_core_select` | `SELECT id, name FROM orders WHERE …` | core claims; extensions never consulted (dispatch-overhead baseline) |
+
+The two `*_create` registry benchmarks are dominated by the core-parser-rejection cost (the same for both);
+`BM_registry_parse_core_select` is the contrast where the core parser accepts.
+
+**`transform()` is not separately benchmarked:** it is a placeholder that emits a single-row data node (see
+`grammar_extention/CLAUDE.md`); there is no meaningful work to isolate until the real lowering lands.
 
 ---
 

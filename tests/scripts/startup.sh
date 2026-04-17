@@ -111,6 +111,17 @@ run_test "Concurrency" "test_concurrency.py"
 # when unset, so it's cheap to always invoke it here.
 run_test "Stress (optional)" "test_stress.py"
 
+# External-table (s3/file grammar extension) tests over the MySQL wire
+run_test "Schema MySQL Client (file external, all formats)" "test_schema_mysql_file.py"
+run_test "Schema MySQL Client (s3 external, all formats)" "test_schema_mysql_s3.py"
+run_test "MySQL Client (file external, all formats)" "test_mysql_file.py"
+run_test "MySQL Client (file external, ndjson)" "test_mysql_file_ndjson.py"
+run_test "MySQL Client (s3 external, all formats)" "test_mysql_s3.py"
+run_test "MySQL Client (JOIN sql-backend ⋈ s3 parquet → s3 csv)" "test_mysql_join_sql_s3_to_s3.py"
+run_test "MySQL Client (JOIN otterbrix-local ⋈ s3 parquet)" "test_mysql_join_otb_local_s3.py"
+run_test "MySQL Client (JOIN sql backend ⋈ otterbrix-local, string key)" "test_mysql_join_otb_local_backend.py"
+run_test "MySQL Client (JOIN s3 parquet ⋈ file csv ⋈ otterbrix-local)" "test_mysql_join_otb_local_s3_file.py"
+
 echo ""
 echo "========================================="
 echo "All tests completed!"

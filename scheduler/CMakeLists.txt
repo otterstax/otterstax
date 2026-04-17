@@ -18,6 +18,8 @@ target_link_libraries(scheduler PUBLIC
     otterbrix::otterbrix
     actor-zeta::actor-zeta
     arrow::arrow
+    PostgreSQL::PostgreSQL
+    clickhouse-cpp-lib::clickhouse-cpp-lib
 )
 
 target_include_directories(scheduler PUBLIC

@@ -33,6 +33,7 @@ add_library(postgres_server
 target_link_libraries(postgres_server PUBLIC
     Boost::boost
     common_server
+    arrow::arrow
 )
 
 target_include_directories(postgres_server PUBLIC

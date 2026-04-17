@@ -9,6 +9,7 @@
 
 #include <components/logical_plan/node_data.hpp>
 #include <components/sql/transformer/transform_result.hpp>
+#include <core/result_wrapper.hpp>
 
 #include <memory_resource>
 #include <string>
@@ -35,7 +36,7 @@ struct ParsedQueryData {
 
     NodeTag tag;
 
-    backend_type_t backend_type{backend_type_t::Unknown};  // Set by CatalogManager during get_catalog_schema
+    backend_type_t backend_type{backend_type_t::Unknown}; // Set by CatalogManager during get_catalog_schema
 
     // For mixed backend: maps connection UID to its backend type
     std::unordered_map<std::string, backend_type_t> node_backend_types;
@@ -50,14 +51,14 @@ class IParser {
 public:
     virtual ~IParser() = default;
 
-    virtual ParsedQueryDataPtr parse(const std::string& sql) = 0;
+    virtual core::result_wrapper_t<ParsedQueryDataPtr> parse(const std::string& sql) = 0;
 };
 
 class GreenplumParser : public IParser {
 public:
     explicit GreenplumParser(std::pmr::memory_resource* resource);
 
-    ParsedQueryDataPtr parse(const std::string& sql) override;
+    core::result_wrapper_t<ParsedQueryDataPtr> parse(const std::string& sql) override;
 
 private:
     std::pmr::memory_resource* resource_;

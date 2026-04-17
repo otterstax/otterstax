@@ -5,61 +5,57 @@
 
 #include "otterbrix/query_generation/sql_query_generator.hpp"
 #include "otterbrix/translators/input/ch_to_chunk.hpp"
-#include "routes/ch_connection_manager.hpp"
-#include "routes/scheduler.hpp"
 #include "utility/cv_wrapper.hpp"
 #include "utility/logger.hpp"
 #include "utility/timer.hpp"
 #include "utility/wait_barrier.hpp"
 
+#include <thread>
+
 using namespace db_conn;
+using otterstax::error_code_t;
+using otterstax::error_tag_t;
+using otterstax::pipeline_error;
 
 ChConnectionManager::ChConnectionManager(std::pmr::memory_resource* res,
                                          std::shared_ptr<chc::ConnectorManager> connector_manager)
-    : actor_zeta::cooperative_supervisor<ChConnectionManager>(res)
+    : resource_(res)
     , connector_manager_(std::move(connector_manager))
-    , execute_(actor_zeta::make_behavior(resource(),
-                                         ch_connection_manager::handler_id(ch_connection_manager::route::execute),
-                                         this,
-                                         &ChConnectionManager::execute))
     , log_(get_logger(logger_tag::CH_CONNECTION_MANAGER)) {
     assert(log_.is_valid());
     assert(res != nullptr);
     assert(connector_manager_ != nullptr);
     connector_manager_->start();
-    worker_.start();
 }
 
-auto ChConnectionManager::make_scheduler() noexcept -> actor_zeta::scheduler_abstract_t* {
-    assert("ChConnectionManager::make_scheduler");
-    return nullptr;
-}
+std::pair<bool, actor_zeta::detail::enqueue_result>
+ChConnectionManager::enqueue_impl(actor_zeta::mailbox::message_ptr msg) {
+    std::lock_guard<std::mutex> guard(mutex_);
+    current_behavior_ = behavior(msg.get());
 
-auto ChConnectionManager::make_type() const noexcept -> const char* const { return "ChConnectionManager"; }
-
-auto ChConnectionManager::enqueue_impl(actor_zeta::message_ptr msg, actor_zeta::execution_unit*) -> void {
-    std::unique_lock<std::mutex> _(input_mtx_);
-    set_current_message(std::move(msg));
-    behavior()(current_message());
-}
-
-actor_zeta::behavior_t ChConnectionManager::behavior() {
-    return actor_zeta::make_behavior(resource(), [this](actor_zeta::message* msg) -> void {
-        switch (msg->command()) {
-            case ch_connection_manager::handler_id(ch_connection_manager::route::execute): {
-                execute_(msg);
-                break;
+    while (current_behavior_.is_busy()) {
+        if (current_behavior_.is_awaited_ready()) {
+            auto cont = current_behavior_.take_awaited_continuation();
+            if (cont) {
+                cont.resume();
             }
-            default:
-                log_->warn("behavior() unknown command: {}", static_cast<uint64_t>(msg->command()));
-                break;
+        } else {
+            std::this_thread::yield();
         }
-    });
+    }
+
+    return {false, actor_zeta::detail::enqueue_result::success};
 }
 
-auto ChConnectionManager::execute(session_hash_t id,
-                                  ParsedQueryDataPtr&& data,
-                                  actor_zeta::address_t scheduler) -> void {
+actor_zeta::behavior_t ChConnectionManager::behavior(actor_zeta::mailbox::message* msg) {
+    auto cmd = msg->command();
+    if (cmd == actor_zeta::msg_id<ChConnectionManager, &ChConnectionManager::execute>) {
+        co_await actor_zeta::dispatch(this, &ChConnectionManager::execute, msg);
+    }
+}
+
+actor_zeta::unique_future<otterstax::result<ParsedQueryDataPtr>> ChConnectionManager::execute(session_hash_t id,
+                                                                                              ParsedQueryDataPtr data) {
     assert(data);
     try {
         Timer timer("ChConnectionManager::execute", log_);
@@ -157,48 +153,15 @@ auto ChConnectionManager::execute(session_hash_t id,
                 *(*it)[i] = data_node;
             }
         }
-        log_->debug("execute calling send_result");
-        send_result(id, std::move(data), scheduler);
         log_->debug("execute finished");
+        co_return std::move(data);
     } catch (const std::exception& e) {
         std::string error_msg = "ChConnectionManager::execute caught exception: " + std::string(e.what());
         log_->error("execute caught exception: {}", e.what());
-        send_error(id, error_msg, scheduler);
+        co_return pipeline_error(error_code_t::query_error, error_tag_t::ch_connection_manager, std::move(error_msg));
     } catch (...) {
-        std::string error_msg = "ChConnectionManager::execute caught unknown exception";
-        send_error(id, error_msg, scheduler);
-    }
-}
-
-void ChConnectionManager::send_result(session_hash_t id, ParsedQueryDataPtr&& data, actor_zeta::address_t scheduler) {
-    log_->debug("send_result: data valid before move: {}", data != nullptr);
-    std::packaged_task<void()> send_task([this, id, scheduler, data = std::move(data)]() mutable {
-        log_->debug("send_task executing: data valid: {}", data != nullptr);
-        actor_zeta::send(scheduler,
-                         address(),
-                         scheduler::handler_id(scheduler::route::execute_remote_ch_finish),
-                         id,
-                         std::move(data));
-    });
-    if (!worker_.addTask(std::move(send_task))) {
-        log_->error("execute failed to add task to worker");
-    } else {
-        log_->trace("execute added task to worker");
-    }
-}
-
-void ChConnectionManager::send_error(session_hash_t id, std::string error_msg, actor_zeta::address_t scheduler) {
-    log_->error("{}", error_msg);
-    std::packaged_task<void()> send_task([this, id, scheduler, msg = std::move(error_msg)]() mutable {
-        actor_zeta::send(scheduler,
-                         address(),
-                         scheduler::handler_id(scheduler::route::execute_failed),
-                         id,
-                         std::move(msg));
-    });
-    if (!worker_.addTask(std::move(send_task))) {
-        log_->error("execute failed to add task to worker");
-    } else {
-        log_->trace("execute added task to worker");
+        co_return pipeline_error(error_code_t::internal_error,
+                                 error_tag_t::ch_connection_manager,
+                                 "ChConnectionManager::execute caught unknown exception");
     }
 }

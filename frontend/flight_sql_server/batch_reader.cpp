@@ -43,6 +43,11 @@ arrow::Status ChunkBatchReader::ReadNext(std::shared_ptr<arrow::RecordBatch>* ou
     for (size_t i = 0; i < chunk_.column_count(); i++) {
         // field order could be different
         auto index = schema_ptr_->GetFieldIndex(chunk_.data[i].type().alias());
+        if (index == -1) {
+            // field is absent in schema - ignore
+            continue;
+        }
+
         const auto& field = schema_ptr_->field(index);
         const auto& field_type = field->type();
         for (size_t j = 0; j < chunk_.size(); j++) {

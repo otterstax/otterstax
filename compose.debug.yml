@@ -19,7 +19,7 @@ services:
       - ./init/mariadb1:/docker-entrypoint-initdb.d
       - ./mariadb1_data:/var/lib/mysql
     networks:
-      - app_network_debug
+      - otterstax_app_network_debug
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "mariadb-admin", "ping", "-h", "localhost", "-u", "user1", "-ppassword1"]
@@ -42,7 +42,7 @@ services:
       - ./init/mariadb2:/docker-entrypoint-initdb.d
       - ./mariadb2_data:/var/lib/mysql
     networks:
-      - app_network_debug
+      - otterstax_app_network_debug
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "mariadb-admin", "ping", "-h", "localhost", "-u", "user2", "-ppassword2"]
@@ -70,7 +70,7 @@ services:
       - ./init/postgres:/docker-entrypoint-initdb.d
       - ./postgres_data:/var/lib/postgresql/data
     networks:
-      - app_network_debug
+      - otterstax_app_network_debug
     restart: unless-stopped
 
   clickhouse1:
@@ -93,13 +93,12 @@ services:
       - ./init/clickhouse:/docker-entrypoint-initdb.d
       - ./clickhouse_data:/var/lib/clickhouse
     networks:
-      - app_network_debug
+      - otterstax_app_network_debug
     restart: unless-stopped
 
 networks:
-  app_network:
+  otterstax_app_network_debug:
     external: true
-    name: otterstax_app_network_debug
 
 volumes:
   mariadb1_data:

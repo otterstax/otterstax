@@ -13,7 +13,7 @@ ComponentManager::ComponentManager(const configuration::config& config)
     // To test otterbrix create some tables
     assert(resource_ != nullptr && "memory resource must not be null");
 
-    catalog_manager_ = actor_zeta::spawn_supervisor<mysqlc::CatalogManager>(resource_);
+    catalog_manager_ = actor_zeta::spawn<mysqlc::CatalogManager>(resource_);
     assert(catalog_manager_ != nullptr && "catalog manager must not be null");
 
     db_connector_manager_ = std::make_shared<mysqlc::ConnectorManager>(catalog_manager_->address());
@@ -26,22 +26,22 @@ ComponentManager::ComponentManager(const configuration::config& config)
     catalog_manager_->set_ch_connector_manager(ch_connector_manager_);
 
     otterbrix_manager_ =
-        actor_zeta::spawn_supervisor<db_conn::OtterbrixManager>(resource_, make_otterbrix_manager(otterbrix_));
+        actor_zeta::spawn<db_conn::OtterbrixManager>(resource_, make_otterbrix_manager(otterbrix_));
     assert(otterbrix_manager_ != nullptr && "otterbrix manager must not be null");
 
     sql_connection_manager_ =
-        actor_zeta::spawn_supervisor<db_conn::SqlConnectionManager>(resource_, db_connector_manager_);
+        actor_zeta::spawn<db_conn::SqlConnectionManager>(resource_, db_connector_manager_);
     assert(sql_connection_manager_ != nullptr && "sql connection manager must not be null");
 
     pg_connection_manager_ =
-        actor_zeta::spawn_supervisor<db_conn::PgConnectionManager>(resource_, pg_connector_manager_);
+        actor_zeta::spawn<db_conn::PgConnectionManager>(resource_, pg_connector_manager_);
     assert(pg_connection_manager_ != nullptr && "pg connection manager must not be null");
 
     ch_connection_manager_actor_ =
-        actor_zeta::spawn_supervisor<db_conn::ChConnectionManager>(resource_, ch_connector_manager_);
+        actor_zeta::spawn<db_conn::ChConnectionManager>(resource_, ch_connector_manager_);
     assert(ch_connection_manager_actor_ != nullptr && "ch connection manager must not be null");
 
-    scheduler_ = actor_zeta::spawn_supervisor<Scheduler>(resource_,
+    scheduler_ = actor_zeta::spawn<Scheduler>(resource_,
                                                          make_parser(resource_),
                                                          sql_connection_manager_->address(),
                                                          pg_connection_manager_->address(),

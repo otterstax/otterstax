@@ -19,7 +19,6 @@
 #include <unordered_map>
 
 #include "../http_server/connection_config.hpp"
-#include "routes/catalog_manager.hpp"
 #include "utility/cv_wrapper.hpp"
 #include "utility/thread_pool_manager.hpp"
 
@@ -68,10 +67,7 @@ namespace mysqlc {
                 try {
                     conn->second->tryReconnect();
                 } catch (const std::exception& e) {
-                    actor_zeta::send(catalog_manager_->address(),
-                                     catalog_manager_->address(),
-                                     catalog_manager::handler_id(catalog_manager::route::remove_connection_schema),
-                                     uuid);
+                    notify_connection_removed(uuid);
                     throw std::runtime_error("Failed to reconnect. Error message: " + std::string(e.what()));
                 }
             }
@@ -83,6 +79,8 @@ namespace mysqlc {
         bool hasConnection(const std::string& uuid) const noexcept;
 
     private:
+        void notify_connection_removed(const std::string& uuid);
+
         log_t log_;
         thread_pool_manager thread_pool_manager_;
         actor_zeta::address_t catalog_manager_;

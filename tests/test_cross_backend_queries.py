@@ -9,10 +9,6 @@ Covers:
   - MySQL + ClickHouse JOINs
   - PostgreSQL + ClickHouse JOINs
   - MySQL + PostgreSQL + ClickHouse triple JOINs
-
-NOTE: LEFT/RIGHT/OUTER JOINs intentionally omitted — they crash otterbrix
-vector engine (SIGABRT in vector_ops::copy, assertion source.type()==target.type()).
-See memory/bugs.md for details.
 """
 
 import sys

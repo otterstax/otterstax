@@ -11,6 +11,8 @@ RUN apt update && \
     apt install -y \
         build-essential \
         ninja-build \
+        bison \
+        flex \
         python3-pip \
         python3-venv \
         python3-dev curl gnupg apt-transport-https \

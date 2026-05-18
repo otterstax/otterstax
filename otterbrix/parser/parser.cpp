@@ -114,7 +114,7 @@ GreenplumParser::GreenplumParser(std::pmr::memory_resource* resource)
     assert(resource_ != nullptr && "memory resource must not be null");
 }
 
-ParsedQueryDataPtr GreenplumParser::parse(const std::string& sql) {
+core::result_wrapper_t<ParsedQueryDataPtr> GreenplumParser::parse(const std::string& sql) {
     std::cerr << "[Parser] Starting parse for: " << sql.substr(0, 100) << std::endl;
     std::pmr::monotonic_buffer_resource arena_resource(resource_);
     sql::transform::transformer transformer(resource_);
@@ -125,6 +125,10 @@ ParsedQueryDataPtr GreenplumParser::parse(const std::string& sql) {
     std::cerr << "[Parser] Calling transformer.transform..." << std::endl;
     auto binder = transformer.transform(sql::transform::pg_cell_to_node_cast(res));
     std::cerr << "[Parser] transform complete" << std::endl;
+
+    if (binder.has_error()) {
+        return binder.get_error();
+    }
 
     const size_t param_cnt = binder.parameter_count();
     auto node = binder.node_ptr();

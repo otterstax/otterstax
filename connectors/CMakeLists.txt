@@ -33,6 +33,7 @@ target_link_libraries(connectors PUBLIC
     OpenSSL::SSL
     otterbrix::otterbrix
     actor-zeta::actor-zeta
+    arrow::arrow
     PostgreSQL::PostgreSQL
     clickhouse-cpp-lib::clickhouse-cpp-lib
 )

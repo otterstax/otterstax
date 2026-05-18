@@ -17,7 +17,7 @@
 
 #include "types.hpp"
 #include "otterbrix/translators/input/pg_to_chunk.hpp"
-#include <components/catalog/catalog_error.hpp>
+#include "utility/asio_error.hpp"
 #include <otterbrix/otterbrix.hpp>
 
 #include <concepts>
@@ -68,9 +68,9 @@ namespace pgc {
         virtual asio::awaitable<int64_t>
         runQuery(std::string_view query,
                  std::function<int64_t(PGresult*)> handler) = 0;
-        virtual asio::awaitable<components::catalog::catalog_error>
+        virtual asio::awaitable<otterstax::asio_error_t>
         runQuery(std::string_view query,
-                 std::function<components::catalog::catalog_error(PGresult*)> handler) = 0;
+                 std::function<otterstax::asio_error_t(PGresult*)> handler) = 0;
     };
 
     class Connector : public IConnector {
@@ -96,9 +96,9 @@ namespace pgc {
                  std::function<int64_t(PGresult*)> handler) override {
             return runQuery_(query, handler);
         }
-        asio::awaitable<components::catalog::catalog_error>
+        asio::awaitable<otterstax::asio_error_t>
         runQuery(std::string_view query,
-                 std::function<components::catalog::catalog_error(PGresult*)> handler) override {
+                 std::function<otterstax::asio_error_t(PGresult*)> handler) override {
             return runQuery_(query, handler);
         }
 

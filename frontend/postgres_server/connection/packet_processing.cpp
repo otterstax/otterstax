@@ -3,6 +3,8 @@
 
 #include "postgres_connection.hpp"
 
+#include <tuple>
+
 using namespace components;
 using namespace components::sql;
 
@@ -71,12 +73,7 @@ namespace frontend::postgres {
     void postgres_connection::handle_query(std::string query) {
         auto shared_data = create_cv_wrapper(session_payload(resource_));
         session_id id;
-        actor_zeta::send(scheduler_->address(),
-                         scheduler_->address(),
-                         scheduler::handler_id(scheduler::route::execute),
-                         id.hash(),
-                         shared_data,
-                         query);
+        std::ignore = actor_zeta::send(scheduler_, &Scheduler::execute, id.hash(), shared_data, query);
         shared_data->wait_for(cv_wrapper::DEFAULT_TIMEOUT);
         auto sdata_result = shared_data->get_result();
 
@@ -197,12 +194,7 @@ namespace frontend::postgres {
 
         auto shared_data = create_cv_wrapper(session_payload(resource_));
         session_id id;
-        actor_zeta::send(scheduler_->address(),
-                         scheduler_->address(),
-                         scheduler::handler_id(scheduler::route::prepare_schema),
-                         id.hash(),
-                         shared_data,
-                         query);
+        std::ignore = actor_zeta::send(scheduler_, &Scheduler::prepare_schema, id.hash(), shared_data, query);
         shared_data->wait_for(cv_wrapper::DEFAULT_TIMEOUT);
 
         switch (shared_data->status()) {
@@ -292,7 +284,7 @@ namespace frontend::postgres {
 
             int32_t len = reader.read_int32();
             if (len == -1) {
-                portal.emplace_back(nullptr);
+                portal.emplace_back(resource_, nullptr);
                 continue;
             }
 
@@ -316,75 +308,75 @@ namespace frontend::postgres {
                                                     "Invalid boolean literal: " + str);
                                 return;
                             }
-                            portal.emplace_back(str == "t");
+                            portal.emplace_back(resource_, str == "t");
                         } else {
                             if (len != 1) {
                                 send_error_response(sql_state::PROTOCOL_VIOLATION, "Invalid BOOL binary length");
                                 return;
                             }
                             uint8_t v = reader.read_uint8();
-                            portal.emplace_back(v != 0);
+                            portal.emplace_back(resource_, v != 0);
                         }
                         break;
                     case field_type::INT2:
                         if (encoding == result_encoding::TEXT) {
-                            portal.emplace_back(static_cast<int16_t>(std::stoi(str)));
+                            portal.emplace_back(resource_, static_cast<int16_t>(std::stoi(str)));
                         } else {
                             if (len != 2) {
                                 send_error_response(sql_state::PROTOCOL_VIOLATION, "Invalid INT2 binary length");
                                 return;
                             }
-                            portal.emplace_back(reader.read_int16());
+                            portal.emplace_back(resource_, reader.read_int16());
                         }
                         break;
                     case field_type::INT4:
                         if (encoding == result_encoding::TEXT) {
-                            portal.emplace_back(static_cast<int32_t>(std::stol(str)));
+                            portal.emplace_back(resource_, static_cast<int32_t>(std::stol(str)));
                         } else {
                             if (len != 4) {
                                 send_error_response(sql_state::PROTOCOL_VIOLATION, "Invalid INT4 binary length");
                                 return;
                             }
-                            portal.emplace_back(reader.read_int32());
+                            portal.emplace_back(resource_, reader.read_int32());
                         }
                         break;
                     case field_type::INT8:
                         if (encoding == result_encoding::TEXT) {
-                            portal.emplace_back(static_cast<int64_t>(std::stoll(str)));
+                            portal.emplace_back(resource_, static_cast<int64_t>(std::stoll(str)));
                         } else {
                             if (len != 8) {
                                 send_error_response(sql_state::PROTOCOL_VIOLATION, "Invalid INT8 binary length");
                                 return;
                             }
-                            portal.emplace_back(reader.read_int64());
+                            portal.emplace_back(resource_, reader.read_int64());
                         }
                         break;
                     case field_type::FLOAT4:
                         if (encoding == result_encoding::TEXT) {
-                            portal.emplace_back(std::stof(str));
+                            portal.emplace_back(resource_, std::stof(str));
                         } else {
                             if (len != 4) {
                                 send_error_response(sql_state::PROTOCOL_VIOLATION, "Invalid FLOAT4 binary length");
                                 return;
                             }
                             uint32_t raw = reader.read_uint32();
-                            portal.emplace_back(std::bit_cast<float>(raw));
+                            portal.emplace_back(resource_, std::bit_cast<float>(raw));
                         }
                         break;
                     case field_type::FLOAT8:
                         if (encoding == result_encoding::TEXT) {
-                            portal.emplace_back(std::stod(str));
+                            portal.emplace_back(resource_, std::stod(str));
                         } else {
                             if (len != 8) {
                                 send_error_response(sql_state::PROTOCOL_VIOLATION, "Invalid FLOAT8 binary length");
                                 return;
                             }
                             uint64_t raw = reader.read_uint64();
-                            portal.emplace_back(std::bit_cast<double>(raw));
+                            portal.emplace_back(resource_, std::bit_cast<double>(raw));
                         }
                         break;
                     case field_type::TEXT: {
-                        portal.emplace_back(std::move(str));
+                        portal.emplace_back(resource_, std::move(str));
                         break;
                     }
                     default:
@@ -446,12 +438,11 @@ namespace frontend::postgres {
         auto& portal_meta = it->second;
         auto& stmt = portal_meta.statement.get();
         auto shared_data = create_cv_wrapper(session_payload(resource_));
-        actor_zeta::send(scheduler_->address(),
-                         scheduler_->address(),
-                         scheduler::handler_id(scheduler::route::execute_prepared_statement),
-                         stmt.stmt_session,
-                         portal_meta.portal,
-                         shared_data);
+        std::ignore = actor_zeta::send(scheduler_,
+                                &Scheduler::execute_prepared_statement,
+                                stmt.stmt_session,
+                                portal_meta.portal,
+                                shared_data);
         shared_data->wait_for(cv_wrapper::DEFAULT_TIMEOUT);
         auto sdata_result = shared_data->get_result();
 

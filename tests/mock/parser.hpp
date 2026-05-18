@@ -4,7 +4,8 @@
 #pragma once
 
 #include "mock_config.hpp"
-#include "otterbrix/parser/parser.hpp"
+#include <core/result_wrapper.hpp>
+#include <otterbrix/parser/parser.hpp>
 
 #include <chrono>
 #include <iostream>
@@ -23,7 +24,7 @@ public:
         std::cout << "error_message: " << config_.error_message << std::endl;
     }
 
-    ParsedQueryDataPtr parse(const std::string& sql) override {
+    core::result_wrapper_t<ParsedQueryDataPtr> parse(const std::string& sql) override {
         std::cout << "MockParser: parsing SQL: " << sql << std::endl;
         if (config_.can_throw) {
             std::string error_message =
@@ -34,10 +35,11 @@ public:
         std::this_thread::sleep_for(std::chrono::milliseconds(config_.wait_time)); // Simulate some processing delay
 
         auto binder = sql::transform::transform_result(
+            config_.resource,
             logical_plan::make_node_aggregate(config_.resource, {"1", "db", "", "table"}),
             logical_plan::make_parameter_node(config_.resource),
-            {},
-            {},
+            sql::transform::transform_result::parameter_map_t{config_.resource},
+            sql::transform::transform_result::insert_map_t{config_.resource},
             data_chunk_t(config_.resource, {}));
         auto parsed = std::make_unique<ParsedQueryData>(
             std::make_unique<OtterbrixStatement>(std::vector<std::vector<logical_plan::node_ptr*>>{},

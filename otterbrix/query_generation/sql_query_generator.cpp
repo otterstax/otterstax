@@ -1,10 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2025-2026  OtterStax
 
-
 #include "sql_query_generator.hpp"
 
-#include <spdlog/spdlog.h>
 #include <components/expressions/aggregate_expression.hpp>
 #include <components/expressions/compare_expression.hpp>
 #include <components/expressions/scalar_expression.hpp>
@@ -22,8 +20,10 @@
 #include <components/logical_plan/node_group.hpp>
 #include <components/logical_plan/node_insert.hpp>
 #include <components/logical_plan/node_match.hpp>
+#include <components/logical_plan/node_select.hpp>
 #include <components/logical_plan/node_sort.hpp>
 #include <components/logical_plan/node_update.hpp>
+#include <spdlog/spdlog.h>
 
 using namespace components::types;
 using namespace components::logical_plan;
@@ -139,7 +139,7 @@ namespace {
                     stream << "'";
                     for (char c : str) {
                         if (c == '\'') {
-                            stream << "''";  // SQL standard escape: '' becomes '
+                            stream << "''"; // SQL standard escape: '' becomes '
                         } else {
                             stream << c;
                         }
@@ -234,7 +234,17 @@ namespace {
                 break;
         }
 
-        stream << expr->key_left();
+        // left side
+        if (std::holds_alternative<components::expressions::key_t>(expr->left())) {
+            stream << std::get<components::expressions::key_t>(expr->left()).as_string();
+        } else if (std::holds_alternative<core::parameter_id_t>(expr->left())) {
+            auto it = parameters->parameters.find(std::get<core::parameter_id_t>(expr->left()));
+            if (it != parameters->parameters.end()) {
+                stream << it->second;
+            } else {
+                stream << "NULL";
+            }
+        }
         switch (expr->type()) {
             case compare_type::eq:
                 stream << " = ";
@@ -255,15 +265,16 @@ namespace {
                 stream << " <= ";
                 break;
         }
-        if (expr->key_right().is_null()) {
-            auto it = parameters->parameters.find(expr->value());
+        // right side
+        if (std::holds_alternative<components::expressions::key_t>(expr->right())) {
+            stream << std::get<components::expressions::key_t>(expr->right()).as_string();
+        } else if (std::holds_alternative<core::parameter_id_t>(expr->right())) {
+            auto it = parameters->parameters.find(std::get<core::parameter_id_t>(expr->right()));
             if (it != parameters->parameters.end()) {
                 stream << it->second;
             } else {
                 stream << "NULL";
             }
-        } else {
-            stream << expr->key_right();
         }
     }
 
@@ -274,7 +285,7 @@ namespace {
                 stream << "SET " << reinterpret_cast<const update_expr_set_ptr&>(expr)->key().as_string() << " = ";
                 generate_update_expr(stream, expr->left(), parameters);
                 break;
-            case update_expr_type::get_value_doc:
+            case update_expr_type::get_value:
                 stream << reinterpret_cast<const update_expr_get_value_ptr&>(expr)->key().as_string();
                 break;
             case update_expr_type::get_value_params: {
@@ -399,97 +410,148 @@ namespace {
         }
     }
 
-    void
-    generate_select(std::stringstream& stream, const node_aggregate_ptr& node, const storage_parameters* parameters, backend_type_t backend) {
+    inline std::string generate_aggregate(const aggregate_expression_ptr& agg_expr) {
+        auto fname = agg_expr->function_name();
+        std::string sql_func;
+        sql_func.reserve(fname.size());
+        for (auto c : fname) {
+            sql_func += static_cast<char>(std::toupper(c));
+        }
+        std::string out;
+        out.reserve(sql_func.size() + 16);
+        out.append(sql_func);
+        out.push_back('(');
+        if (agg_expr->params().empty()) {
+            // parameterless aggregate (e.g. COUNT(*)) — function name itself
+            out.push_back('*');
+        } else if (std::holds_alternative<components::expressions::key_t>(agg_expr->params().front())) {
+            out.append(std::get<components::expressions::key_t>(agg_expr->params().front()).as_string());
+        }
+        out.push_back(')');
+        // always alias the aggregate so the outer otterbrix plan can join
+        // backend results back to the expected column name.
+        out.append(" AS ");
+        out.append(agg_expr->key().as_string());
+        return out;
+    }
+
+    void generate_select(std::stringstream& stream,
+                         const node_aggregate_ptr& node,
+                         const storage_parameters* parameters,
+                         backend_type_t backend) {
+        node_select_ptr select = nullptr;
         node_group_ptr group = nullptr;
         node_match_ptr match = nullptr;
         node_sort_ptr sort = nullptr;
         for (const auto& child : node->children()) {
-            if (child->type() == node_type::group_t) {
-                group = reinterpret_cast<const node_group_ptr&>(child);
-            } else if (child->type() == node_type::match_t) {
-                match = reinterpret_cast<const node_match_ptr&>(child);
-            } else if (child->type() == node_type::sort_t) {
-                sort = reinterpret_cast<const node_sort_ptr&>(child);
+            switch (child->type()) {
+                case node_type::select_t:
+                    select = reinterpret_cast<const node_select_ptr&>(child);
+                    break;
+                case node_type::group_t:
+                    group = reinterpret_cast<const node_group_ptr&>(child);
+                    break;
+                case node_type::match_t:
+                    match = reinterpret_cast<const node_match_ptr&>(child);
+                    break;
+                case node_type::sort_t:
+                    sort = reinterpret_cast<const node_sort_ptr&>(child);
+                    break;
+                default:
+                    break;
             }
         }
+
+        std::unordered_map<std::string, aggregate_expression_ptr> aggregate_by_alias;
+        if (group) {
+            for (const auto& expr : group->expressions()) {
+                if (expr->group() == expression_group::aggregate) {
+                    auto agg_expr = reinterpret_cast<const aggregate_expression_ptr&>(expr);
+                    aggregate_by_alias.emplace(agg_expr->key().as_string(), agg_expr);
+                }
+            }
+        }
+
         stream << "SELECT ";
         // fields
         {
-            if (group) {
-                std::vector<std::string> fields;
-                for (const auto& expr : group->expressions()) {
-                    switch (expr->group()) {
-                        case expression_group::aggregate: {
-                            auto agg_expr = reinterpret_cast<const aggregate_expression_ptr&>(expr);
-                            switch (agg_expr->type()) {
-                                case aggregate_type::count:
-                                    fields.emplace_back("COUNT(");
-                                    break;
-                                case aggregate_type::sum:
-                                    fields.emplace_back("SUM(");
-                                    break;
-                                case aggregate_type::min:
-                                    fields.emplace_back("MIN(");
-                                    break;
-                                case aggregate_type::max:
-                                    fields.emplace_back("MAX(");
-                                    break;
-                                case aggregate_type::avg:
-                                    fields.emplace_back("AVG(");
-                                    break;
-                            }
-                            if (agg_expr->params().empty()) {
-                                fields.back().append(agg_expr->key().as_string() + ")");
-                            } else {
-                                fields.back().append(
-                                    std::get<components::expressions::key_t>(agg_expr->params().front()).as_string() +
-                                    ") AS " + agg_expr->key().as_string());
-                            }
-                            break;
-                        }
-                        case expression_group::scalar: {
-                            auto scalar_expr = reinterpret_cast<const scalar_expression_ptr&>(expr);
-                            if (scalar_expr->params().empty()) {
-                                fields.emplace_back(scalar_expr->key().as_string());
-                            } else if (auto param_v = scalar_expr->params().at(0);
-                                       std::holds_alternative<core::parameter_id_t>(param_v)) {
-                                std::stringstream ss;
-                                auto it =
-                                    parameters->parameters.find(std::get<core::parameter_id_t>(std::move(param_v)));
-                                if (it != parameters->parameters.end()) {
-                                    ss << it->second;
-                                } else {
-                                    ss << "NULL";
-                                }
-                                fields.emplace_back(ss.str());
-                            } else {
-                                fields.emplace_back(
-                                    std::get<components::expressions::key_t>(scalar_expr->params().front())
-                                        .as_string() +
-                                    " AS " + scalar_expr->key().as_string());
-                            }
-                            break;
+            std::vector<std::string> fields;
+            if (select) {
+                for (const auto& expr : select->expressions()) {
+                    if (expr->group() == expression_group::aggregate) {
+                        fields.emplace_back(
+                            generate_aggregate(reinterpret_cast<const aggregate_expression_ptr&>(expr)));
+                        continue;
+                    }
+                    auto scalar_expr = reinterpret_cast<const scalar_expression_ptr&>(expr);
+
+                    if (scalar_expr->type() == scalar_type::star_expand) {
+                        fields.emplace_back("*");
+                        continue;
+                    }
+
+                    if (scalar_expr->type() == scalar_type::get_field && scalar_expr->params().empty()) {
+                        if (auto it = aggregate_by_alias.find(scalar_expr->key().as_string());
+                            it != aggregate_by_alias.end()) {
+                            fields.emplace_back(generate_aggregate(it->second));
+                            continue;
                         }
                     }
-                }
 
-                if (fields.empty()) {
-                    stream << "*";
-                } else {
-                    bool comma = false;
-                    for (const auto& f : fields) {
-                        if (comma) {
-                            stream << ", ";
+                    // plain column reference.
+                    if (scalar_expr->params().empty()) {
+                        fields.emplace_back(scalar_expr->key().as_string());
+                        continue;
+                    }
+
+                    // constant / parameter.
+                    if (auto param_v = scalar_expr->params().at(0);
+                        std::holds_alternative<core::parameter_id_t>(param_v)) {
+                        std::stringstream ss;
+                        auto it = parameters->parameters.find(std::get<core::parameter_id_t>(std::move(param_v)));
+                        if (it != parameters->parameters.end()) {
+                            ss << it->second;
+                        } else {
+                            ss << "NULL";
                         }
-
-                        stream << f;
-                        comma = true;
+                        fields.emplace_back(ss.str());
+                    } else {
+                        // Aliased column: `col AS alias`
+                        fields.emplace_back(
+                            std::get<components::expressions::key_t>(scalar_expr->params().front()).as_string() +
+                            " AS " + scalar_expr->key().as_string());
                     }
                 }
-            } else {
-                stream << "*";
             }
+
+            // Empty select_node OR no select_node at all → SELECT *. When the
+            // outer query did SELECT col1, AGG(col2), AGG(col3) — and the
+            // transformer left the select_node empty (e.g. all entries were
+            // pure aggregates pulled into group_node), we still need to emit
+            // those aggregates so the backend computes them.
+            if (fields.empty() && group) {
+                for (const auto& expr : group->expressions()) {
+                    if (expr->group() == expression_group::aggregate) {
+                        fields.emplace_back(
+                            generate_aggregate(reinterpret_cast<const aggregate_expression_ptr&>(expr)));
+                    }
+                }
+            }
+
+            if (fields.empty()) {
+                stream << "*";
+            } else {
+                bool comma = false;
+                for (const auto& f : fields) {
+                    if (comma) {
+                        stream << ", ";
+                    }
+
+                    stream << f;
+                    comma = true;
+                }
+            }
+
             stream << " FROM ";
             stream << sql_gen::table_reference(node->collection_full_name(), backend);
         }
@@ -507,15 +569,19 @@ namespace {
             if (group) {
                 std::vector<std::string> group_by_fields;
                 for (const auto& expr : group->expressions()) {
-                    if (expr->group() == expression_group::scalar) {
-                        auto scalar_expr = reinterpret_cast<const scalar_expression_ptr&>(expr);
-                        // Get the field name for GROUP BY
-                        if (scalar_expr->params().empty()) {
-                            group_by_fields.emplace_back(scalar_expr->key().as_string());
-                        } else if (std::holds_alternative<components::expressions::key_t>(scalar_expr->params().front())) {
-                            group_by_fields.emplace_back(
-                                std::get<components::expressions::key_t>(scalar_expr->params().front()).as_string());
-                        }
+                    if (expr->group() != expression_group::scalar) {
+                        continue;
+                    }
+                    auto scalar_expr = reinterpret_cast<const scalar_expression_ptr&>(expr);
+                    // GROUP BY fields are marked with special scalar type
+                    if (scalar_expr->type() != scalar_type::group_field) {
+                        continue;
+                    }
+                    if (scalar_expr->params().empty()) {
+                        group_by_fields.emplace_back(scalar_expr->key().as_string());
+                    } else if (std::holds_alternative<components::expressions::key_t>(scalar_expr->params().front())) {
+                        group_by_fields.emplace_back(
+                            std::get<components::expressions::key_t>(scalar_expr->params().front()).as_string());
                     }
                 }
                 if (!group_by_fields.empty()) {
@@ -584,7 +650,10 @@ namespace {
         stream << ")";
     }
 
-    void generate_delete(std::stringstream& stream, const node_delete_ptr& node, const storage_parameters* parameters, backend_type_t backend) {
+    void generate_delete(std::stringstream& stream,
+                         const node_delete_ptr& node,
+                         const storage_parameters* parameters,
+                         backend_type_t backend) {
         node_match_ptr match = nullptr;
         for (const auto& child : node->children()) {
             if (child->type() == node_type::match_t) {
@@ -621,26 +690,24 @@ namespace {
         stream << "DROP INDEX IF EXISTS " << node->name() << " ON " << node->collection_full_name().collection;
     }
 
-    void generate_insert(std::stringstream& stream, const node_insert_ptr& node, const storage_parameters* parameters, backend_type_t backend) {
+    void generate_insert(std::stringstream& stream,
+                         const node_insert_ptr& node,
+                         const storage_parameters* parameters,
+                         backend_type_t backend) {
         stream << "INSERT INTO " << sql_gen::table_reference(node->collection_full_name(), backend) << " ";
         if (!node->key_translation().empty()) {
             stream << "(";
             bool comma = false;
-            for (const auto& k_pair : node->key_translation()) {
+            for (const auto& key : node->key_translation()) {
                 if (comma) {
                     stream << ", ";
                 }
-                stream << k_pair.first.as_string();
+                stream << key.as_string();
                 comma = true;
             }
             stream << ") ";
         }
         if (node->children().front()->type() == node_type::data_t) {
-            std::vector<std::string_view> keys;
-            keys.reserve(node->key_translation().size());
-            for (const auto& k_pair : node->key_translation()) {
-                keys.emplace_back(k_pair.second.as_string());
-            }
             sql_gen::generate_values(stream,
                                      reinterpret_cast<const node_data_ptr&>(node->children().front())->data_chunk(),
                                      backend);
@@ -648,11 +715,17 @@ namespace {
             assert(node->children().front()->type() == node_type::aggregate_t);
             assert(node->collection_full_name().unique_identifier ==
                    node->children().front()->collection_full_name().unique_identifier);
-            generate_select(stream, reinterpret_cast<const node_aggregate_ptr&>(node->children().front()), parameters, backend);
+            generate_select(stream,
+                            reinterpret_cast<const node_aggregate_ptr&>(node->children().front()),
+                            parameters,
+                            backend);
         }
     }
 
-    void generate_update(std::stringstream& stream, const node_update_ptr& node, const storage_parameters* parameters, backend_type_t backend) {
+    void generate_update(std::stringstream& stream,
+                         const node_update_ptr& node,
+                         const storage_parameters* parameters,
+                         backend_type_t backend) {
         node_match_ptr match = nullptr;
         for (const auto& child : node->children()) {
             if (child->type() == node_type::match_t) {
@@ -695,7 +768,10 @@ namespace sql_gen {
         }
 
         spdlog::debug("table_reference: uid={}, db={}, schema={}, table={}, backend={}",
-                      name.unique_identifier, name.database, name.schema, name.collection,
+                      name.unique_identifier,
+                      name.database,
+                      name.schema,
+                      name.collection,
                       static_cast<int>(backend));
 
         switch (backend) {
@@ -724,7 +800,8 @@ namespace sql_gen {
         return s.str();
     }
 
-    void generate_values(std::stringstream& stream, const components::vector::data_chunk_t& chunk, backend_type_t backend) {
+    void
+    generate_values(std::stringstream& stream, const components::vector::data_chunk_t& chunk, backend_type_t backend) {
         stream << "VALUES ";
         bool comma = false;
         for (size_t i = 0; i < chunk.size(); i++) {
@@ -745,7 +822,10 @@ namespace sql_gen {
         }
     }
 
-    void generate_query(std::stringstream& stream, const node_ptr& node, const storage_parameters* parameters, backend_type_t backend) {
+    void generate_query(std::stringstream& stream,
+                        const node_ptr& node,
+                        const storage_parameters* parameters,
+                        backend_type_t backend) {
         switch (node->type()) {
             case node_type::aggregate_t:
                 generate_select(stream, reinterpret_cast<const node_aggregate_ptr&>(node), parameters, backend);

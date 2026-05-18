@@ -20,7 +20,7 @@
 #include <boost/asio/use_awaitable.hpp>
 
 #include "otterbrix/translators/input/mysql_to_chunk.hpp"
-#include <components/catalog/catalog_error.hpp>
+#include "utility/asio_error.hpp"
 #include <otterbrix/otterbrix.hpp>
 
 #include <concepts>
@@ -64,9 +64,9 @@ namespace mysqlc {
                  std::function<std::unique_ptr<data_chunk_t>(const boost::mysql::results&)> handler) = 0;
         virtual asio::awaitable<int64_t> runQuery(std::string_view query,
                                                   std::function<int64_t(const boost::mysql::results&)> handler) = 0;
-        virtual asio::awaitable<components::catalog::catalog_error>
+        virtual asio::awaitable<otterstax::asio_error_t>
         runQuery(std::string_view query,
-                 std::function<components::catalog::catalog_error(const boost::mysql::results&)> handler) = 0;
+                 std::function<otterstax::asio_error_t(const boost::mysql::results&)> handler) = 0;
     };
 
     class Connector : public IConnector {
@@ -91,9 +91,9 @@ namespace mysqlc {
                                           std::function<int64_t(const boost::mysql::results&)> handler) override {
             return runQuery_(query, handler);
         }
-        asio::awaitable<components::catalog::catalog_error>
+        asio::awaitable<otterstax::asio_error_t>
         runQuery(std::string_view query,
-                 std::function<components::catalog::catalog_error(const boost::mysql::results&)> handler) override {
+                 std::function<otterstax::asio_error_t(const boost::mysql::results&)> handler) override {
             return runQuery_(query, handler);
         }
 

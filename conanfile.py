@@ -3,6 +3,10 @@
 
 from conan import ConanFile
 from conan.tools.cmake import CMakeToolchain, CMakeDeps, cmake_layout
+from conan.tools.files import copy
+import os
+import glob
+import subprocess
 
 
 class OtterStax(ConanFile):
@@ -20,11 +24,12 @@ class OtterStax(ConanFile):
         "fPIC": True,
     }
 
-    # Sources are located in the same place as this recipe
-    exports_sources = "CMakeLists.txt", "src/*", "include/*"
-
     def layout(self):
         cmake_layout(self)
+
+    def build_requirements(self):
+        if self.settings.os == "Linux":
+            self.tool_requires("patchelf/0.18")
 
     def requirements(self):
         self.requires("arrow/21.0.0")
@@ -40,9 +45,9 @@ class OtterStax(ConanFile):
         self.requires("benchmark/1.6.1")
         self.requires("zlib/1.3.1")
         self.requires("bzip2/1.0.8")
-        self.requires("otterbrix/1.0.0a10-rc-10")
+        self.requires("otterbrix/1.0.0a12-rc-3")
         self.requires("magic_enum/0.8.1")
-        self.requires("actor-zeta/1.0.0a12@")
+        self.requires("actor-zeta/1.1.1@")
         self.requires("libpq/15.4")
         self.requires("yaml-cpp/0.7.0")
         self.requires("clickhouse-cpp/2.5.1")
@@ -50,9 +55,10 @@ class OtterStax(ConanFile):
     def config_options(self):
         if self.settings.os == "Windows":
             del self.options.fPIC
-        # Setting options for packages
+
+    def configure(self):
         self.options["gflags/*"].shared = True
-        
+
         self.options["arrow/*"].with_flight_sql = True
         self.options["arrow/*"].shared = True
         self.options["arrow/*"].with_protobuf = True
@@ -66,16 +72,16 @@ class OtterStax(ConanFile):
         self.options["arrow/*"].use_system_gflags = True
 
         self.options["otterbrix/*"].shared = True
-        
+
         self.options["boost/*"].shared = True
+        self.options["boost/*"].without_test = True
         self.options["boost/*"].without_charconv = False
         self.options["boost/*"].without_charconv_float128 = True
 
-        self.options["actor-zeta/*"].cxx_standard = 17
+        self.options["actor-zeta/*"].cxx_standard = "20"
         self.options["actor-zeta/*"].fPIC = True
         self.options["actor-zeta/*"].exceptions_disable = False
         self.options["actor-zeta/*"].rtti_disable = False
-        
 
     def generate(self):
         tc = CMakeToolchain(self)
@@ -87,8 +93,27 @@ class OtterStax(ConanFile):
         deps = CMakeDeps(self)
         deps.generate()
 
-    def imports(self):
-        # Import DLLs, dylibs and so files
-        self.copy("*.dll", src="lib", dst="bin")  # Windows DLLs
-        self.copy("*.dylib*", src="lib", dst="bin")  # macOS dylibs
-        self.copy("*.so*", src="lib", dst="bin")  # Linux shared libraries
+        # cmake_layout sets build_folder to build/<build_type>/ relative to source_folder.
+        # Shared libs land there so RPATH $ORIGIN/lib (set by CMakeLists.txt) resolves correctly
+        # for both the Dockerfile (cmake -S . -B build/Release) and the devcontainer preset.
+        lib_output_dir = os.path.join(self.build_folder, "lib")
+
+        for dep in self.dependencies.values():
+            for libdir in dep.cpp_info.libdirs:
+                copy(self, "*.so*",    src=libdir, dst=lib_output_dir)
+                copy(self, "*.dylib*", src=libdir, dst=lib_output_dir)
+            if self.settings.os == "Windows":
+                bin_output_dir = os.path.join(self.build_folder, "bin")
+                for bindir in dep.cpp_info.bindirs:
+                    copy(self, "*.dll", src=bindir, dst=bin_output_dir)
+
+        # Patch every non-symlink .so to carry $ORIGIN as RPATH so each lib finds
+        # its siblings without relying on LD_LIBRARY_PATH or the executable's RPATH
+        # propagating through DT_RUNPATH chains.
+        if self.settings.os == "Linux":
+            patchelf_bin = os.path.join(
+                self.dependencies.build["patchelf"].package_folder, "bin", "patchelf"
+            )
+            for so in glob.glob(os.path.join(lib_output_dir, "*.so*")):
+                if os.path.isfile(so) and not os.path.islink(so):
+                    subprocess.run([patchelf_bin, "--set-rpath", "$ORIGIN", so], check=True)

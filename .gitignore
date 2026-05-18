@@ -434,6 +434,7 @@ mariadb1_data/
 mariadb2_data/
 mariadb3_data/
 postgres_data/
+clickhouse_data/
 init/
 fixtures/init/
 tests/init/

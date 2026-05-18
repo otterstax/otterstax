@@ -7,6 +7,15 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_CXX_FLAGS "-fcoroutines")
 
+# Load all shared deps from the local lib/ dir next to the binary.
+# CMAKE_INSTALL_RPATH is used at both build and install time (BUILD_WITH_INSTALL_RPATH),
+# overriding CMake's default behavior of embedding absolute conan cache paths.
+# The patchelf step in conanfile.py generate() adds $ORIGIN to every copied .so in lib/,
+# so each library can also find its own siblings — covering transitive deps through
+# RPATH-less Conan packages (e.g. boost) without requiring DT_RPATH inheritance.
+set(CMAKE_INSTALL_RPATH "$ORIGIN/lib:$ORIGIN")
+set(CMAKE_BUILD_WITH_INSTALL_RPATH ON)
+
 # Set spdlog active level (can be overridden via -DSPDLOG_ACTIVE_LEVEL=...)
 set(SPDLOG_ACTIVE_LEVEL "SPDLOG_LEVEL_ERROR" CACHE STRING "Active spdlog level")
 add_compile_definitions(SPDLOG_ACTIVE_LEVEL=${SPDLOG_ACTIVE_LEVEL})
@@ -73,7 +82,6 @@ add_subdirectory(component_manager)
 add_subdirectory(config)
 add_subdirectory(db_integration)
 add_subdirectory(otterbrix)
-add_subdirectory(routes)
 add_subdirectory(scheduler)
 
 set(${PROJECT_NAME}_HEADERS
@@ -81,6 +89,8 @@ set(${PROJECT_NAME}_HEADERS
         utility/timer.hpp
         utility/cv_wrapper.hpp
         utility/tsan_helper.hpp
+        utility/result.hpp
+        utility/pipeline_error.hpp
 
         types/otterbrix.hpp
 )
@@ -108,7 +118,6 @@ target_link_libraries(
     component_manager
     db_integration
     otterbrix_local
-    routes
     scheduler
     config::config
     arrow::arrow

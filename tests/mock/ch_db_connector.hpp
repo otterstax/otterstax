@@ -81,9 +81,9 @@ namespace chc {
             co_return 42;
         }
 
-        asio::awaitable<components::catalog::catalog_error> runQuery(
+        asio::awaitable<otterstax::asio_error_t> runQuery(
             std::string_view query,
-            std::function<components::catalog::catalog_error(const std::vector<clickhouse::Block>&)> handler) override {
+            std::function<otterstax::asio_error_t(const std::vector<clickhouse::Block>&)> handler) override {
             throw std::runtime_error("Unimplemented");
         }
 

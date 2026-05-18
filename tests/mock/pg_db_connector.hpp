@@ -89,9 +89,9 @@ namespace pgc {
             co_return 42;
         }
 
-        asio::awaitable<components::catalog::catalog_error>
+        asio::awaitable<otterstax::asio_error_t>
         runQuery(std::string_view query,
-                 std::function<components::catalog::catalog_error(PGresult*)> handler) override {
+                 std::function<otterstax::asio_error_t(PGresult*)> handler) override {
             throw std::runtime_error("Unimplemented");
         }
 

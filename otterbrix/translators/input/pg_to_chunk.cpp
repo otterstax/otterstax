@@ -38,62 +38,62 @@ namespace tsl {
 
         void set_bool(data_chunk_t& chunk, PGresult* result, int row_index, int column_index) {
             if (PQgetisnull(result, row_index, column_index)) {
-                chunk.set_value(column_index, row_index, types::logical_value_t{nullptr});
+                chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), nullptr});
                 return;
             }
             const char* val = PQgetvalue(result, row_index, column_index);
             bool bval = (val[0] == 't' || val[0] == 'T' || val[0] == '1');
-            chunk.set_value(column_index, row_index, types::logical_value_t{bval});
+            chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), bval});
         }
 
         void set_int16(data_chunk_t& chunk, PGresult* result, int row_index, int column_index) {
             if (PQgetisnull(result, row_index, column_index)) {
-                chunk.set_value(column_index, row_index, types::logical_value_t{nullptr});
+                chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), nullptr});
                 return;
             }
             const char* val = PQgetvalue(result, row_index, column_index);
             int16_t value = 0;
             auto [ptr, ec] = std::from_chars(val, val + std::strlen(val), value);
             if (ec != std::errc{}) {
-                chunk.set_value(column_index, row_index, types::logical_value_t{nullptr});
+                chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), nullptr});
                 return;
             }
-            chunk.set_value(column_index, row_index, types::logical_value_t{value});
+            chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), value});
         }
 
         void set_int32(data_chunk_t& chunk, PGresult* result, int row_index, int column_index) {
             if (PQgetisnull(result, row_index, column_index)) {
-                chunk.set_value(column_index, row_index, types::logical_value_t{nullptr});
+                chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), nullptr});
                 return;
             }
             const char* val = PQgetvalue(result, row_index, column_index);
             int32_t value = 0;
             auto [ptr, ec] = std::from_chars(val, val + std::strlen(val), value);
             if (ec != std::errc{}) {
-                chunk.set_value(column_index, row_index, types::logical_value_t{nullptr});
+                chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), nullptr});
                 return;
             }
-            chunk.set_value(column_index, row_index, types::logical_value_t{value});
+            chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), value});
         }
 
         void set_int64(data_chunk_t& chunk, PGresult* result, int row_index, int column_index) {
             if (PQgetisnull(result, row_index, column_index)) {
-                chunk.set_value(column_index, row_index, types::logical_value_t{nullptr});
+                chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), nullptr});
                 return;
             }
             const char* val = PQgetvalue(result, row_index, column_index);
             int64_t value = 0;
             auto [ptr, ec] = std::from_chars(val, val + std::strlen(val), value);
             if (ec != std::errc{}) {
-                chunk.set_value(column_index, row_index, types::logical_value_t{nullptr});
+                chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), nullptr});
                 return;
             }
-            chunk.set_value(column_index, row_index, types::logical_value_t{value});
+            chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), value});
         }
 
         void set_float(data_chunk_t& chunk, PGresult* result, int row_index, int column_index) {
             if (PQgetisnull(result, row_index, column_index)) {
-                chunk.set_value(column_index, row_index, types::logical_value_t{nullptr});
+                chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), nullptr});
                 return;
             }
             const char* val = PQgetvalue(result, row_index, column_index);
@@ -101,15 +101,15 @@ namespace tsl {
             float value = std::strtof(val, &end);
             if (end == val) {
                 // Conversion failed
-                chunk.set_value(column_index, row_index, types::logical_value_t{nullptr});
+                chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), nullptr});
                 return;
             }
-            chunk.set_value(column_index, row_index, types::logical_value_t{value});
+            chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), value});
         }
 
         void set_double(data_chunk_t& chunk, PGresult* result, int row_index, int column_index) {
             if (PQgetisnull(result, row_index, column_index)) {
-                chunk.set_value(column_index, row_index, types::logical_value_t{nullptr});
+                chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), nullptr});
                 return;
             }
             const char* val = PQgetvalue(result, row_index, column_index);
@@ -117,37 +117,36 @@ namespace tsl {
             double value = std::strtod(val, &end);
             if (end == val) {
                 // Conversion failed
-                chunk.set_value(column_index, row_index, types::logical_value_t{nullptr});
+                chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), nullptr});
                 return;
             }
-            chunk.set_value(column_index, row_index, types::logical_value_t{value});
+            chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), value});
         }
 
         void set_string(data_chunk_t& chunk, PGresult* result, int row_index, int column_index) {
             if (PQgetisnull(result, row_index, column_index)) {
-                chunk.set_value(column_index, row_index, types::logical_value_t{nullptr});
+                chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), nullptr});
                 return;
             }
             const char* val = PQgetvalue(result, row_index, column_index);
-            chunk.set_value(column_index, row_index,
-                            types::logical_value_t{std::string(val)});
+            chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), std::string(val)});
         }
 
         void set_bytea(data_chunk_t& chunk, PGresult* result, int row_index, int column_index) {
             if (PQgetisnull(result, row_index, column_index)) {
-                chunk.set_value(column_index, row_index, types::logical_value_t{nullptr});
+                chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), nullptr});
                 return;
             }
             size_t len = 0;
-            unsigned char* unescaped = PQunescapeBytea(
-                reinterpret_cast<const unsigned char*>(PQgetvalue(result, row_index, column_index)),
-                &len);
+            unsigned char* unescaped =
+                PQunescapeBytea(reinterpret_cast<const unsigned char*>(PQgetvalue(result, row_index, column_index)),
+                                &len);
             if (unescaped) {
                 std::string blob(reinterpret_cast<char*>(unescaped), len);
                 PQfreemem(unescaped);
-                chunk.set_value(column_index, row_index, types::logical_value_t{std::move(blob)});
+                chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), std::move(blob)});
             } else {
-                chunk.set_value(column_index, row_index, types::logical_value_t{nullptr});
+                chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), nullptr});
             }
         }
 
@@ -247,7 +246,7 @@ namespace tsl {
             fields.emplace_back(translator.type);
         }
 
-        return types::complex_logical_type::create_struct(std::move(fields));
+        return types::complex_logical_type::create_struct("", std::move(fields));
     }
 
 } // namespace tsl

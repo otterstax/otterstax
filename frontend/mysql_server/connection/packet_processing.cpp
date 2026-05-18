@@ -3,6 +3,8 @@
 
 #include "mysql_connection.hpp"
 
+#include <tuple>
+
 using namespace components;
 using namespace components::sql;
 
@@ -190,12 +192,7 @@ namespace frontend::mysql {
         auto shared_data = create_cv_wrapper(session_payload(resource_));
         session_id id;
         // todo: one execute() call for simplicity - use computed schema for text_resultset columns
-        actor_zeta::send(scheduler_->address(),
-                         scheduler_->address(),
-                         scheduler::handler_id(scheduler::route::execute),
-                         id.hash(),
-                         shared_data,
-                         query);
+        std::ignore = actor_zeta::send(scheduler_, &Scheduler::execute, id.hash(), shared_data, query);
         shared_data->wait_for(cv_wrapper::DEFAULT_TIMEOUT);
         auto sdata_result = shared_data->get_result();
 
@@ -286,12 +283,7 @@ namespace frontend::mysql {
     void mysql_connection::handle_prepared_stmt(std::string query) {
         auto shared_data = create_cv_wrapper(session_payload(resource_));
         session_id id;
-        actor_zeta::send(scheduler_->address(),
-                         scheduler_->address(),
-                         scheduler::handler_id(scheduler::route::prepare_schema),
-                         id.hash(),
-                         shared_data,
-                         query);
+        std::ignore = actor_zeta::send(scheduler_, &Scheduler::prepare_schema, id.hash(), shared_data, query);
         shared_data->wait_for(cv_wrapper::DEFAULT_TIMEOUT);
 
         switch (shared_data->status()) {
@@ -413,7 +405,7 @@ namespace frontend::mysql {
         for (size_t i = 0; i < num_params; ++i) {
             bool is_null = (null_bitmap[i / 8] >> (i % 8)) & 1;
             if (is_null) {
-                param_values.emplace_back(nullptr);
+                param_values.emplace_back(resource_, nullptr);
                 continue;
             }
 
@@ -424,54 +416,54 @@ namespace frontend::mysql {
                 case field_type::MYSQL_TYPE_TINY: {
                     auto val = reader.read_uint8();
                     if (is_unsigned) {
-                        param_values.emplace_back(val);
+                        param_values.emplace_back(resource_, val);
                     } else {
-                        param_values.emplace_back(static_cast<int8_t>(val));
+                        param_values.emplace_back(resource_, static_cast<int8_t>(val));
                     }
                     break;
                 }
                 case field_type::MYSQL_TYPE_SHORT: {
                     auto val = reader.read_uint16();
                     if (is_unsigned) {
-                        param_values.emplace_back(val);
+                        param_values.emplace_back(resource_, val);
                     } else {
-                        param_values.emplace_back(static_cast<int16_t>(val));
+                        param_values.emplace_back(resource_, static_cast<int16_t>(val));
                     }
                     break;
                 }
                 case field_type::MYSQL_TYPE_LONG: {
                     auto val = reader.read_uint32();
                     if (is_unsigned) {
-                        param_values.emplace_back(val);
+                        param_values.emplace_back(resource_, val);
                     } else {
-                        param_values.emplace_back(static_cast<int32_t>(val));
+                        param_values.emplace_back(resource_, static_cast<int32_t>(val));
                     }
                     break;
                 }
                 case field_type::MYSQL_TYPE_LONGLONG: {
                     auto val = reader.read_uint64();
                     if (is_unsigned) {
-                        param_values.emplace_back(val);
+                        param_values.emplace_back(resource_, val);
                     } else {
-                        param_values.emplace_back(static_cast<int64_t>(val));
+                        param_values.emplace_back(resource_, static_cast<int64_t>(val));
                     }
                     break;
                 }
                 case field_type::MYSQL_TYPE_FLOAT: {
                     auto f = std::bit_cast<float>(reader.read_uint32());
-                    param_values.emplace_back(f);
+                    param_values.emplace_back(resource_, f);
                     break;
                 }
                 case field_type::MYSQL_TYPE_DOUBLE: {
                     auto d = std::bit_cast<double>(reader.read_uint64());
-                    param_values.emplace_back(d);
+                    param_values.emplace_back(resource_, d);
                     break;
                 }
                 case field_type::MYSQL_TYPE_VAR_STRING:
                 case field_type::MYSQL_TYPE_STRING:
                 case field_type::MYSQL_TYPE_BLOB: {
                     std::string s = reader.read_length_encoded_string();
-                    param_values.emplace_back(std::move(s));
+                    param_values.emplace_back(resource_, std::move(s));
                     break;
                 }
                 default:
@@ -486,12 +478,11 @@ namespace frontend::mysql {
     void mysql_connection::handle_execute_stmt(session_hash_t id,
                                                std::pmr::vector<types::logical_value_t> param_values) {
         auto shared_data = create_cv_wrapper(session_payload(resource_));
-        actor_zeta::send(scheduler_->address(),
-                         scheduler_->address(),
-                         scheduler::handler_id(scheduler::route::execute_prepared_statement),
-                         id,
-                         std::move(param_values),
-                         shared_data);
+        std::ignore = actor_zeta::send(scheduler_,
+                                       &Scheduler::execute_prepared_statement,
+                                       id,
+                                       std::move(param_values),
+                                       shared_data);
         shared_data->wait_for(cv_wrapper::DEFAULT_TIMEOUT);
         auto sdata_result = shared_data->get_result();
 

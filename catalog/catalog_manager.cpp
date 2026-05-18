@@ -3,35 +3,38 @@
 
 #include "catalog_manager.hpp"
 
+#include <components/table/column_definition.hpp>
+#include <thread>
+
 using namespace components;
+using otterstax::error_code_t;
+using otterstax::error_tag_t;
+using otterstax::pipeline_error;
+
+namespace {
+    // Convert a STRUCT complex_logical_type to a catalog::schema
+    catalog::schema schema_from_struct(std::pmr::memory_resource* resource,
+                                       const types::complex_logical_type& struct_type) {
+        auto& ext = catalog::to_struct(struct_type);
+        auto& fields = ext.child_types();
+
+        std::vector<table::column_definition_t> columns;
+        std::vector<types::field_description> descriptions;
+        columns.reserve(fields.size());
+        descriptions.reserve(fields.size());
+
+        for (uint64_t i = 0; i < fields.size(); ++i) {
+            columns.emplace_back(fields[i].alias(), fields[i]);
+            descriptions.emplace_back(i + 1);
+        }
+
+        return catalog::schema(resource, columns, descriptions);
+    }
+} // namespace
 
 namespace mysqlc {
     CatalogManager::CatalogManager(std::pmr::memory_resource* res)
-        : actor_zeta::cooperative_supervisor<CatalogManager>(res)
-        , get_catalog_schema_(
-              actor_zeta::make_behavior(resource(),
-                                        catalog_manager::handler_id(catalog_manager::route::get_catalog_schema),
-                                        this,
-                                        &CatalogManager::get_catalog_schema))
-        , update_backend_type_(
-              actor_zeta::make_behavior(resource(),
-                                        catalog_manager::handler_id(catalog_manager::route::update_backend_type),
-                                        this,
-                                        &CatalogManager::update_backend_type))
-        , add_connection_schema_(
-              actor_zeta::make_behavior(resource(),
-                                        catalog_manager::handler_id(catalog_manager::route::add_connection_schema),
-                                        this,
-                                        &CatalogManager::add_connection_schema))
-        , remove_connection_schema_(
-              actor_zeta::make_behavior(resource(),
-                                        catalog_manager::handler_id(catalog_manager::route::remove_connection_schema),
-                                        this,
-                                        &CatalogManager::remove_connection_schema))
-        , get_tables_(actor_zeta::make_behavior(resource(),
-                                                catalog_manager::handler_id(catalog_manager::route::get_tables),
-                                                this,
-                                                &CatalogManager::get_tables))
+        : resource_(res)
         , catalog_(resource())
         , mysql_conn_manager_(nullptr)
         , pg_conn_manager_(nullptr)
@@ -40,7 +43,6 @@ namespace mysqlc {
         assert(log_.is_valid());
         assert(res != nullptr);
         log_->info("CatalogManager initialized successfully");
-        worker_.start();
     }
 
     void CatalogManager::set_mysql_connector_manager(std::shared_ptr<ConnectorManager> mysql_conn_manager) {
@@ -78,44 +80,43 @@ namespace mysqlc {
         return std::nullopt;
     }
 
-    actor_zeta::behavior_t CatalogManager::behavior() {
-        return actor_zeta::make_behavior(resource(), [this](actor_zeta::message* msg) -> void {
-            switch (msg->command()) {
-                case catalog_manager::handler_id(catalog_manager::route::get_catalog_schema): {
-                    get_catalog_schema_(msg);
-                    break;
+    bool CatalogManager::hasConnection(const std::string& uuid) const {
+        std::lock_guard<std::mutex> lock(connection_registry_mtx_);
+        return connection_registry_.contains(uuid);
+    }
+
+    std::pair<bool, actor_zeta::detail::enqueue_result>
+    CatalogManager::enqueue_impl(actor_zeta::mailbox::message_ptr msg) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        current_behavior_ = behavior(msg.get());
+
+        while (current_behavior_.is_busy()) {
+            if (current_behavior_.is_awaited_ready()) {
+                auto cont = current_behavior_.take_awaited_continuation();
+                if (cont) {
+                    cont.resume();
                 }
-                case catalog_manager::handler_id(catalog_manager::route::update_backend_type): {
-                    update_backend_type_(msg);
-                    break;
-                }
-                case catalog_manager::handler_id(catalog_manager::route::add_connection_schema): {
-                    add_connection_schema_(msg);
-                    break;
-                }
-                case catalog_manager::handler_id(catalog_manager::route::remove_connection_schema): {
-                    remove_connection_schema_(msg);
-                    break;
-                }
-                case catalog_manager::handler_id(catalog_manager::route::get_tables): {
-                    get_tables_(msg);
-                    break;
-                }
+            } else {
+                std::this_thread::yield();
             }
-        });
+        }
+
+        return {false, actor_zeta::detail::enqueue_result::success};
     }
 
-    auto CatalogManager::make_type() const noexcept -> const char* const { return "CatalogManager"; }
-
-    auto CatalogManager::make_scheduler() noexcept -> actor_zeta::scheduler_abstract_t* {
-        assert("CatalogManager::executor_impl");
-        return nullptr;
-    }
-
-    auto CatalogManager::enqueue_impl(actor_zeta::message_ptr msg, actor_zeta::execution_unit*) -> void {
-        std::unique_lock<std::mutex> _(input_mtx_);
-        set_current_message(std::move(msg));
-        behavior()(current_message());
+    actor_zeta::behavior_t CatalogManager::behavior(actor_zeta::mailbox::message* msg) {
+        auto cmd = msg->command();
+        if (cmd == actor_zeta::msg_id<CatalogManager, &CatalogManager::get_catalog_schema>) {
+            co_await actor_zeta::dispatch(this, &CatalogManager::get_catalog_schema, msg);
+        } else if (cmd == actor_zeta::msg_id<CatalogManager, &CatalogManager::update_backend_type>) {
+            co_await actor_zeta::dispatch(this, &CatalogManager::update_backend_type, msg);
+        } else if (cmd == actor_zeta::msg_id<CatalogManager, &CatalogManager::add_connection_schema>) {
+            co_await actor_zeta::dispatch(this, &CatalogManager::add_connection_schema, msg);
+        } else if (cmd == actor_zeta::msg_id<CatalogManager, &CatalogManager::remove_connection_schema>) {
+            co_await actor_zeta::dispatch(this, &CatalogManager::remove_connection_schema, msg);
+        } else if (cmd == actor_zeta::msg_id<CatalogManager, &CatalogManager::get_tables>) {
+            co_await actor_zeta::dispatch(this, &CatalogManager::get_tables, msg);
+        }
     }
 
     auto CatalogManager::update_backend_type_impl(ParsedQueryDataPtr&& data) -> ParsedQueryDataPtr const {
@@ -177,41 +178,35 @@ namespace mysqlc {
             } else {
                 log_->error(
                     "update_backend_type_impl: Can't determine backend type: no connections found for external nodes");
+                return data;
             }
-            return data;
         }
         log_->debug("update_backend_type_impl: determined backend_type = {}", static_cast<int>(data->backend_type));
         return data;
     }
 
-    auto CatalogManager::update_backend_type(session_hash_t id, ParsedQueryDataPtr&& data) -> void {
+    actor_zeta::unique_future<otterstax::result<ParsedQueryDataPtr>>
+    CatalogManager::update_backend_type(session_hash_t id, ParsedQueryDataPtr data) {
         auto updated_data = update_backend_type_impl(std::move(data));
         if (updated_data->backend_type == backend_type_t::Unknown) {
             log_->error("update_backend_type: Backend type is unknown after update_backend_type_impl, cannot proceed");
-            send_result(id,
-                        std::move(updated_data),
-                        catalog::catalog_error{
-                            catalog::catalog_mistake_t::FIELD_MISSING,
-                            std::string("Backend type is unknown after update_backend_type_impl, cannot proceed")},
-                        catalog_ext::catalog_result_t::BackendType);
-            return;
+            co_return pipeline_error(error_code_t::backend_unknown,
+                                     error_tag_t::catalog_manager,
+                                     "Backend type is unknown after update_backend_type_impl, cannot proceed");
         }
 
         log_->debug("update_backend_type: determined backend_type = {}", static_cast<int>(updated_data->backend_type));
-        send_result(id, std::move(updated_data), catalog::catalog_error{}, catalog_ext::catalog_result_t::BackendType);
+        co_return std::move(updated_data);
     }
 
-    auto CatalogManager::get_catalog_schema(session_hash_t id, ParsedQueryDataPtr&& data) -> void {
+    actor_zeta::unique_future<otterstax::result<ParsedQueryDataPtr>>
+    CatalogManager::get_catalog_schema(session_hash_t id, ParsedQueryDataPtr data) {
         auto updated_data = update_backend_type_impl(std::move(data));
         if (updated_data->backend_type == backend_type_t::Unknown) {
             log_->error("get_catalog_schema: Backend type is unknown after update_backend_type_impl, cannot proceed");
-            send_result(id,
-                        std::move(updated_data),
-                        catalog::catalog_error{
-                            catalog::catalog_mistake_t::FIELD_MISSING,
-                            std::string("Backend type is unknown after update_backend_type_impl, cannot proceed")},
-                        catalog_ext::catalog_result_t::Schema);
-            return;
+            co_return pipeline_error(error_code_t::backend_unknown,
+                                     error_tag_t::catalog_manager,
+                                     "Backend type is unknown after update_backend_type_impl, cannot proceed");
         }
 
         log_->debug(
@@ -224,11 +219,7 @@ namespace mysqlc {
         if (updated_data->otterbrix_params->node->type() != logical_plan::node_type::aggregate_t) {
             // node is not aggregate nor join - result is empty schema
             log_->debug("prepare_schema: node is not aggregate, returning empty schema");
-            send_result(id,
-                        std::move(updated_data),
-                        catalog::catalog_error{},
-                        catalog_ext::catalog_result_t::EmptySchema);
-            return;
+            co_return std::move(updated_data);
         }
 
         for (auto& batch : updated_data->otterbrix_params->external_nodes) {
@@ -242,18 +233,19 @@ namespace mysqlc {
                     catalog::table_id name_id(resource(), name);
 
                     if (!catalog_.table_exists(name_id)) {
-                        if (auto err = add_connection_schema(name); err) {
-                            send_result(id, std::move(updated_data), err, catalog_ext::catalog_result_t::Schema);
-                            return;
+                        if (auto err = add_connection_schema_sync(name); err.contains_error()) {
+                            co_return pipeline_error(error_code_t::catalog_error,
+                                                     error_tag_t::catalog_manager,
+                                                     std::string{err.what.c_str()});
                         }
                     }
 
                     const auto& agg = static_cast<logical_plan::node_aggregate_t&>(*(*node));
-                    auto initial_schema = catalog_.get_table_schema(name_id).schema_struct();
-                    initial_schema =
+                    auto schema_types = catalog_.get_table_schema(name_id).types();
+                    auto initial_schema =
                         schema_utils::aggregate_filter_schema(agg,
                                                               updated_data->otterbrix_params->params_node.get(),
-                                                              catalog::schema(resource(), initial_schema));
+                                                              schema_types);
 
                     auto node_schema = schema_utils::make_node_schema(name,
                                                                       std::move(initial_schema),
@@ -264,11 +256,16 @@ namespace mysqlc {
         }
 
         log_->debug("get_catalog_schema: determined backend_type = {}", static_cast<int>(updated_data->backend_type));
-
-        send_result(id, std::move(updated_data), catalog::catalog_error{}, catalog_ext::catalog_result_t::Schema);
+        co_return std::move(updated_data);
     }
 
-    auto CatalogManager::add_connection_schema(collection_full_name_t name) -> catalog::catalog_error {
+    actor_zeta::unique_future<core::error_t>
+    CatalogManager::add_connection_schema(collection_full_name_t name) {
+        co_return add_connection_schema_sync(std::move(name));
+    }
+
+    // Synchronous implementation — called from both the coroutine handler and internally from get_catalog_schema
+    core::error_t CatalogManager::add_connection_schema_sync(collection_full_name_t name) {
         const std::string& uuid = name.unique_identifier;
 
         // Determine connection type by checking which ConnectorManager has this connection
@@ -288,30 +285,30 @@ namespace mysqlc {
             log_->debug("add_connection_schema: detected ClickHouse connection for uuid: {}", uuid);
         } else {
             log_->error("add_connection_schema: no connector manager has connection with uuid: {}", uuid);
-            return catalog::catalog_error(catalog::catalog_mistake_t::FIELD_MISSING,
-                                          "No connector manager found for uuid: " + uuid);
+            return core::error_t(core::error_code_t::missing_field,
+                                 std::pmr::string{("No connector manager found for uuid: " + uuid).c_str(),
+                                                  resource()});
         }
 
-        // Register connection type
         registerConnection(uuid, conn_type, name);
 
         catalog::table_id id(resource(), name);
 
         if (is_mysql) {
             // MySQL: query schema using boost::mysql
-            auto schema_handler = [this, &id](const boost::mysql::results& result) -> catalog::catalog_error {
+            auto schema_handler = [this, &id](const boost::mysql::results& result) -> otterstax::asio_error_t {
                 auto schema_struct = tsl::mysql_to_struct(result.meta());
-                auto schema = catalog::schema(resource(), std::move(schema_struct));
+                auto schema = schema_from_struct(resource(), schema_struct);
 
                 if (catalog_.table_exists(id)) {
-                    return catalog::catalog_error(catalog::catalog_mistake_t::ALREADY_EXISTS,
-                                                  "Connection already exists");
+                    return core::error_t(core::error_code_t::already_exists,
+                                         std::pmr::string{"Connection already exists", resource()});
                 }
 
                 catalog_.create_namespace(id.get_namespace());
                 auto err = catalog_.create_table(id, catalog::table_metadata(resource(), std::move(schema)));
                 log_->info("add_connection_schema: {} for: {}",
-                           (err) ? "failed to add schema" : "schema added",
+                           (err.contains_error()) ? "failed to add schema" : "schema added",
                            id.to_string());
                 return err;
             };
@@ -323,20 +320,20 @@ namespace mysqlc {
                 name,
                 expressions::make_compare_expression(resource(),
                                                      expressions::compare_type::eq,
-                                                     expressions::side_t::undefined,
-                                                     expressions::key_t("1"),
-                                                     param.add_parameter(types::logical_value_t(0)))));
+                                                     expressions::key_t(resource(), "1"),
+                                                     param.add_parameter(types::logical_value_t(resource(), 0)))));
 
             std::string query = sql_gen::generate_query(node, &param.parameters(), backend_type_t::MySQL);
             log_->debug("add_connection_schema: Generated MySQL Query: \"{}\"", query);
 
             try {
                 auto future = mysql_conn_manager_->executeQuery(uuid, query, schema_handler);
-                return future.get();
+                return std::move(future.get()).release();
             } catch (const std::exception& e) {
                 log_->error("add_connection_schema: failed to query MySQL schema for {}", id.to_string());
-                return catalog::catalog_error(catalog::catalog_mistake_t::FIELD_MISSING,
-                                              std::string("MySQL schema query failed: ") + e.what());
+                return core::error_t(core::error_code_t::missing_field,
+                                     std::pmr::string{(std::string("MySQL schema query failed: ") + e.what()).c_str(),
+                                                      resource()});
             }
         } else if (is_pg) {
             // PostgreSQL: query schema using libpq
@@ -375,7 +372,7 @@ namespace mysqlc {
                             list_tables_query);
 
                 // Handler to process list of tables and then fetch each table's schema
-                auto list_handler = [this, uuid, pg_name](PGresult* result) -> catalog::catalog_error {
+                auto list_handler = [this, uuid, pg_name](PGresult* result) -> otterstax::asio_error_t {
                     int num_tables = PQntuples(result);
                     log_->info("add_connection_schema: found {} tables in schema {}", num_tables, pg_name.schema);
 
@@ -390,22 +387,22 @@ namespace mysqlc {
 
                         // Create a handler for this specific table's schema
                         auto schema_handler =
-                            [this, table_id, full_table_name](PGresult* schema_result) -> catalog::catalog_error {
+                            [this, table_id, full_table_name](PGresult* schema_result) -> otterstax::asio_error_t {
                             auto schema_struct = tsl::pg_to_struct(schema_result);
-                            auto schema = catalog::schema(resource(), std::move(schema_struct));
+                            auto schema = schema_from_struct(resource(), schema_struct);
 
                             if (catalog_.table_exists(table_id)) {
                                 log_->info("add_connection_schema: table {}.{} already exists, skipping",
                                            full_table_name.schema,
                                            full_table_name.collection);
-                                return catalog::catalog_error{};
+                                return otterstax::asio_error_t{};
                             }
 
                             catalog_.create_namespace(table_id.get_namespace());
                             auto err =
                                 catalog_.create_table(table_id, catalog::table_metadata(resource(), std::move(schema)));
                             log_->info("add_connection_schema: {} for: {}.{}",
-                                       (err) ? "failed to add schema" : "schema added",
+                                       (err.contains_error()) ? "failed to add schema" : "schema added",
                                        full_table_name.schema,
                                        full_table_name.collection);
                             return err;
@@ -417,7 +414,7 @@ namespace mysqlc {
                         try {
                             auto future = pg_conn_manager_->executeQuery(uuid, schema_query, schema_handler);
                             auto err = future.get();
-                            if (err) {
+                            if (err.contains_error()) {
                                 log_->error("add_connection_schema: failed to fetch schema for {}.{}",
                                             full_table_name.schema,
                                             full_table_name.collection);
@@ -429,35 +426,36 @@ namespace mysqlc {
                                         e.what());
                         }
                     }
-                    return catalog::catalog_error{};
+                    return otterstax::asio_error_t{};
                 };
 
                 try {
                     auto future = pg_conn_manager_->executeQuery(uuid, list_tables_query, list_handler);
-                    return future.get();
+                    return std::move(future.get()).release();
                 } catch (const std::exception& e) {
                     log_->error("add_connection_schema: failed to query table list from schema {}", pg_name.schema);
-                    return catalog::catalog_error(catalog::catalog_mistake_t::FIELD_MISSING,
-                                                  std::string("Failed to list tables: ") + e.what());
+                    return core::error_t(core::error_code_t::missing_field,
+                                         std::pmr::string{(std::string("Failed to list tables: ") + e.what()).c_str(),
+                                                          resource()});
                 }
             } else {
                 // Fetch schema for a single specific table
-                auto schema_handler = [this, pg_name](PGresult* schema_result) -> catalog::catalog_error {
+                auto schema_handler = [this, pg_name](PGresult* schema_result) -> otterstax::asio_error_t {
                     auto schema_struct = tsl::pg_to_struct(schema_result);
-                    auto schema = catalog::schema(resource(), std::move(schema_struct));
+                    auto schema = schema_from_struct(resource(), schema_struct);
 
                     catalog::table_id table_id(resource(), pg_name);
                     if (catalog_.table_exists(table_id)) {
                         log_->info("add_connection_schema: table {}.{} already exists, skipping",
                                    pg_name.schema,
                                    pg_name.collection);
-                        return catalog::catalog_error{};
+                        return otterstax::asio_error_t{};
                     }
 
                     catalog_.create_namespace(table_id.get_namespace());
                     auto err = catalog_.create_table(table_id, catalog::table_metadata(resource(), std::move(schema)));
                     log_->info("add_connection_schema: {} for: {}.{}",
-                               (err) ? "failed to add schema" : "schema added",
+                               (err.contains_error()) ? "failed to add schema" : "schema added",
                                pg_name.schema,
                                pg_name.collection);
                     return err;
@@ -469,13 +467,15 @@ namespace mysqlc {
 
                 try {
                     auto future = pg_conn_manager_->executeQuery(uuid, schema_query, schema_handler);
-                    return future.get();
+                    return std::move(future.get()).release();
                 } catch (const std::exception& e) {
                     log_->error("add_connection_schema: failed to query schema for {}.{}",
                                 pg_name.schema,
                                 pg_name.collection);
-                    return catalog::catalog_error(catalog::catalog_mistake_t::FIELD_MISSING,
-                                                  std::string("Failed to fetch table schema: ") + e.what());
+                    return core::error_t(
+                        core::error_code_t::missing_field,
+                        std::pmr::string{(std::string("Failed to fetch table schema: ") + e.what()).c_str(),
+                                         resource()});
                 }
             }
         } else if (is_ch) {
@@ -488,15 +488,16 @@ namespace mysqlc {
             log_->debug("add_connection_schema: querying ClickHouse tables: \"{}\"", list_tables_query);
 
             auto list_handler =
-                [this, uuid, ch_database](const std::vector<clickhouse::Block>& blocks) -> catalog::catalog_error {
+                [this, uuid, ch_database](const std::vector<clickhouse::Block>& blocks) -> otterstax::asio_error_t {
                 for (const auto& block : blocks) {
                     if (block.GetRowCount() == 0)
                         continue;
 
                     auto name_col = block[0]->As<clickhouse::ColumnString>();
                     if (!name_col) {
-                        return catalog::catalog_error(catalog::catalog_mistake_t::FIELD_MISSING,
-                                                      "Failed to read table names from ClickHouse");
+                        return core::error_t(
+                            core::error_code_t::missing_field,
+                            std::pmr::string{"Failed to read table names from ClickHouse", resource()});
                     }
 
                     for (size_t i = 0; i < block.GetRowCount(); ++i) {
@@ -508,24 +509,24 @@ namespace mysqlc {
 
                         auto schema_handler =
                             [this, table_id, ch_database, table_name](
-                                const std::vector<clickhouse::Block>& schema_blocks) -> catalog::catalog_error {
+                                const std::vector<clickhouse::Block>& schema_blocks) -> otterstax::asio_error_t {
                             const clickhouse::Block& schema_block =
                                 schema_blocks.empty() ? clickhouse::Block{} : schema_blocks[0];
                             auto schema_struct = tsl::ch_to_struct(schema_block);
-                            auto schema = catalog::schema(resource(), std::move(schema_struct));
+                            auto schema = schema_from_struct(resource(), schema_struct);
 
                             if (catalog_.table_exists(table_id)) {
                                 log_->info("add_connection_schema: table {}.{} already exists, skipping",
                                            ch_database,
                                            table_name);
-                                return catalog::catalog_error{};
+                                return otterstax::asio_error_t{};
                             }
 
                             catalog_.create_namespace(table_id.get_namespace());
                             auto err =
                                 catalog_.create_table(table_id, catalog::table_metadata(resource(), std::move(schema)));
                             log_->info("add_connection_schema: {} for: {}.{}",
-                                       (err) ? "failed to add schema" : "schema added",
+                                       (err.contains_error()) ? "failed to add schema" : "schema added",
                                        ch_database,
                                        table_name);
                             return err;
@@ -535,7 +536,7 @@ namespace mysqlc {
                         try {
                             auto future = ch_conn_manager_->executeQuery(uuid, schema_query, schema_handler);
                             auto err = future.get();
-                            if (err) {
+                            if (err.contains_error()) {
                                 log_->error("add_connection_schema: failed to fetch schema for {}.{}",
                                             ch_database,
                                             table_name);
@@ -548,31 +549,33 @@ namespace mysqlc {
                         }
                     }
                 }
-                return catalog::catalog_error{};
+                return otterstax::asio_error_t{};
             };
 
             try {
                 auto future = ch_conn_manager_->executeQuery(uuid, list_tables_query, list_handler);
-                return future.get();
+                return std::move(future.get()).release();
             } catch (const std::exception& e) {
                 log_->error("add_connection_schema: failed to query table list from ClickHouse database {}",
                             ch_database);
-                return catalog::catalog_error(catalog::catalog_mistake_t::FIELD_MISSING,
-                                              std::string("Failed to list ClickHouse tables: ") + e.what());
+                return core::error_t(
+                    core::error_code_t::missing_field,
+                    std::pmr::string{(std::string("Failed to list ClickHouse tables: ") + e.what()).c_str(),
+                                     resource()});
             }
-        } else {
-            log_->error("add_connection_schema: connection type for uuid {} not found during schema addition", uuid);
-            return catalog::catalog_error(catalog::catalog_mistake_t::FIELD_MISSING,
-                                          "Connection type not found for uuid: " + uuid);
         }
+        log_->error("add_connection_schema: connection type for uuid {} not found during schema addition", uuid);
+        return core::error_t(core::error_code_t::missing_field,
+                             std::pmr::string{("Connection type not found for uuid: " + uuid).c_str(), resource()});
     }
 
-    auto CatalogManager::remove_connection_schema(const std::string& uuid) -> void {
+    actor_zeta::unique_future<void> CatalogManager::remove_connection_schema(std::string uuid) {
         catalog_.drop_namespace({uuid.c_str()});
+        co_return;
     }
 
-    auto CatalogManager::get_tables(const arrow::flight::sql::GetTables& command,
-                                    shared_data<std::pmr::vector<table_info>> sdata) -> void {
+    actor_zeta::unique_future<void> CatalogManager::get_tables(arrow::flight::sql::GetTables command,
+                                                               shared_data<std::pmr::vector<table_info>> sdata) {
         std::pmr::vector<table_info> data(resource());
         std::pmr::vector<catalog::table_id> ids(resource());
 
@@ -619,86 +622,19 @@ namespace mysqlc {
 
         if (ids.empty()) {
             sdata->release_empty();
-            return;
+            co_return;
         }
 
         for (auto&& id : ids) {
             data.emplace_back(id.collection_full_name());
             if (command.include_schema) {
-                data.back().schema = catalog_.get_table_schema(id).schema_struct();
+                data.back().schema =
+                    types::complex_logical_type::create_struct("", catalog_.get_table_schema(id).types());
             }
         }
 
         sdata->set_result(std::move(data));
+        co_return;
     }
 
-    auto CatalogManager::send_result(session_hash_t id,
-                                     ParsedQueryDataPtr&& data,
-                                     catalog::catalog_error err,
-                                     catalog_ext::catalog_result_t result_type) -> void {
-        switch (result_type) {
-            case catalog_ext::catalog_result_t::Schema: {
-                auto sdata = std::make_shared<ParsedQueryDataPtr>(std::move(data));
-                std::packaged_task<void()> send_task([this, id, sdata, err = std::move(err)]() mutable {
-                    actor_zeta::send(current_message()->sender(),
-                                     address(),
-                                     scheduler::handler_id(scheduler::route::get_catalog_schema_finish),
-                                     id,
-                                     std::move(*sdata),
-                                     std::move(err));
-                });
-                if (!worker_.addTask(std::move(send_task))) {
-                    log_->error("send_result failed to add task to worker");
-                } else {
-                    log_->trace("send_result added task to worker");
-                }
-                break;
-            }
-
-            case catalog_ext::catalog_result_t::EmptySchema: {
-                std::packaged_task<void()> send_task(
-                    [this, id, data = std::move(data), err = std::move(err)]() mutable {
-                        auto result_cursor = cursor::make_cursor(resource());
-                        if (err) {
-                            result_cursor =
-                                cursor::make_cursor(resource(), cursor::error_code_t::schema_error, err.what());
-                        }
-                        actor_zeta::send(current_message()->sender(),
-                                         address(),
-                                         scheduler::handler_id(scheduler::route::get_otterbrix_schema_finish),
-                                         id,
-                                         std::move(result_cursor),
-                                         std::move(data));
-                    });
-                if (!worker_.addTask(std::move(send_task))) {
-                    log_->error("send_result failed to add task to worker");
-                } else {
-                    log_->trace("send_result added task to worker");
-                }
-                break;
-            }
-
-            case catalog_ext::catalog_result_t::BackendType: {
-                std::packaged_task<void()> send_task(
-                    [this, id, data = std::move(data), err = std::move(err)]() mutable {
-                        actor_zeta::send(current_message()->sender(),
-                                         address(),
-                                         scheduler::handler_id(scheduler::route::update_backend_type_finish),
-                                         id,
-                                         std::move(data),
-                                         std::move(err));
-                    });
-                if (!worker_.addTask(std::move(send_task))) {
-                    log_->error("send_result failed to add task to worker");
-                } else {
-                    log_->trace("send_result added task to worker");
-                }
-                break;
-            }
-            default: {
-                log_->error("send_result: unknown catalog_result_t: {}", static_cast<int>(result_type));
-                break;
-            }
-        }
-    }
 } // namespace mysqlc

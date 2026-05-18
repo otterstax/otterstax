@@ -16,7 +16,7 @@ The system uses `ComponentManager` (`component_manager/`) as the central orchest
 - `SqlConnectionManager`: Delegates queries to MySQL connection pool
 - `ConnectorManager`: Manages async MySQL connections via Boost.MySQL
 
-**Critical Pattern**: All components communicate via `actor_zeta::send()` using `actor_zeta::address_t` handles and route enums (see `routes/*.hpp`). Sessions are tracked by `session_hash_t` IDs.
+**Critical Pattern**: All components communicate via `actor_zeta::send(address, &Actor::method, args...)` using `actor_zeta::address_t` handles and C++20 coroutines (`co_await`, `co_return`). Sessions are tracked by `session_hash_t` IDs.
 
 ## Key Architectural Patterns
 
@@ -82,19 +82,19 @@ chmod +x ./docker-run-tests.sh
 
 ### Actor Communication Pattern
 ```cpp
-// Send message to actor (async, no return)
-actor_zeta::send(
+// Send message to actor (returns future for coroutine-based actors)
+auto [needs_sched, future] = actor_zeta::send(
     target_address,
-    self_address,
-    scheduler::handler_id(scheduler::route::execute),  // Route from routes/*.hpp
+    &Scheduler::execute,  // Type-safe method pointer (no route enums)
     session_id, shared_data, sql_query
 );
+auto result = co_await std::move(future);
 ```
 
 ### Memory Management
 - Use `std::pmr::memory_resource*` from Otterbrix dispatcher for all allocations
 - Components use `actor_zeta::pmr::deleter_t` for unique_ptr cleanup
-- Never manually delete actor supervisors (handled by actor-zeta)
+- Actors use `actor_mixin<T>` base class with inline message processing
 
 ### Namespace Organization
 - `mysqlc::` - MySQL connector/catalog management
@@ -109,11 +109,11 @@ actor_zeta::send(
 
 ## Common Tasks
 
-### Adding a New Query Route
-1. Add enum to `routes/scheduler.hpp` or relevant route file
-2. Add behavior in target actor's constructor (e.g., `Scheduler::behavior()`)
-3. Implement handler method following `execute_*` pattern
-4. Update senders to use new `handler_id(route::new_route)`
+### Adding a New Actor Handler
+1. Add handler coroutine method to actor class (returns `unique_future<T>`)
+2. Add method pointer to `dispatch_traits<...>` in actor header
+3. Add dispatch branch in `behavior()` coroutine
+4. Callers use `actor_zeta::send(address, &Actor::method, args...)`
 
 ### Adding External Database Support
 1. Implement `IConnector` interface (see `connectors/mysql/mysql_connector.hpp`)
@@ -123,7 +123,7 @@ actor_zeta::send(
 
 ### Debugging Actor Messages
 - Use `arrow::util::ArrowLog::StartArrowLog()` (set in `main.cpp`)
-- Each actor has `make_type()` returning string identifier for logging
+- Each actor uses `spdlog` logger with tag-based identification
 - Session IDs are consistent across components - grep logs by `session_hash_t`
 
 ## Dependencies & Constraints
@@ -132,7 +132,7 @@ actor_zeta::send(
 - **Otterbrix 1.0.0a10-rc-10**: Custom Conan remote at `http://conan.otterbrix.com`
 - **Arrow 19.0.1** with FlightSQL support (must set `with_flight_sql=True`)
 - **Boost 1.87.0**: Required for C++20 coroutines in MySQL connector
-- **actor-zeta 1.0.0a12**: Custom actor framework (not Akka/CAF)
+- **actor-zeta 1.1.1**: Custom actor framework with C++20 coroutines (not Akka/CAF)
 
 ### Port Assignments (Hardcoded)
 - 8815: FlightSQL server
@@ -147,8 +147,8 @@ actor_zeta::send(
 
 ## Anti-Patterns to Avoid
 
-1. **Don't** call `actor_zeta::spawn_supervisor` outside `ComponentManager` - breaks lifecycle management
-2. **Don't** use `std::make_unique` for actors - use `actor_zeta::spawn_supervisor` with pmr deleter
-3. **Don't** block on actor send() - actors communicate asynchronously via message passing
+1. **Don't** call `actor_zeta::spawn` outside `ComponentManager` - breaks lifecycle management
+2. **Don't** use `std::make_unique` for actors - use `actor_zeta::spawn` with pmr deleter
+3. **Don't** block on actor send() - actors communicate via coroutines and futures
 4. **Don't** access session maps without mutex locks in `Scheduler`
 5. **Don't** assume connection aliases are database names - they're logical identifiers for remote connections

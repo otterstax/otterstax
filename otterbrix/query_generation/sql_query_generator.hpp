@@ -3,17 +3,18 @@
 
 #pragma once
 
-#include <components/document/document.hpp>
 #include <components/logical_plan/node.hpp>
 #include <components/logical_plan/param_storage.hpp>
 #include <components/types/types.hpp>
 #include <components/vector/data_chunk.hpp>
 
-#include "otterbrix/parser/parser.hpp"  // For BackendType
+#include "otterbrix/parser/parser.hpp" // For BackendType
 
 namespace sql_gen {
 
-    void generate_values(std::stringstream& stream, const components::vector::data_chunk_t& chunk, backend_type_t backend = backend_type_t::MySQL);
+    void generate_values(std::stringstream& stream,
+                         const components::vector::data_chunk_t& chunk,
+                         backend_type_t backend = backend_type_t::MySQL);
 
     // Generate table reference string based on backend type
     // MySQL: database.collection

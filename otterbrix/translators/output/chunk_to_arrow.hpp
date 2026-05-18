@@ -3,10 +3,7 @@
 
 #pragma once
 
-#include "arrow/flight/sql/server.h"
 #include <arrow/api.h>
-#include <arrow/flight/api.h>
-#include <arrow/flight/sql/api.h>
 
 #include <otterbrix/otterbrix.hpp>
 

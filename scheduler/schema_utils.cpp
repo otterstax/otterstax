@@ -3,6 +3,8 @@
 
 #include "schema_utils.hpp"
 
+#include <core/result_wrapper.hpp>
+
 using namespace components;
 using namespace components::types;
 
@@ -13,10 +15,12 @@ namespace {
                                            const std::pmr::map<collection_full_name_t, size_t>& dependencies) {
         if (auto it = dependencies.find(node.collection_full_name()); it != dependencies.end()) {
             if (catalog->size() > it->second && catalog->type_data()[it->second].type() == logical_type::STRUCT) {
-                return schema_utils::aggregate_filter_schema(
-                    static_cast<const logical_plan::node_aggregate_t&>(node),
-                    params,
-                    catalog::schema(node.resource(), catalog->type_data()[it->second]));
+                auto& struct_ext = catalog::to_struct(catalog->type_data()[it->second]);
+                auto& fields = struct_ext.child_types();
+                std::vector<types::complex_logical_type> types_vec(fields.begin(), fields.end());
+                return schema_utils::aggregate_filter_schema(static_cast<const logical_plan::node_aggregate_t&>(node),
+                                                             params,
+                                                             types_vec);
             }
         }
         return logical_type::NA;
@@ -69,79 +73,92 @@ namespace schema_utils {
 
     complex_logical_type aggregate_filter_schema(const logical_plan::node_aggregate_t& node,
                                                  logical_plan::parameter_node_t* params,
-                                                 const catalog::schema& schema) {
+                                                 const std::vector<complex_logical_type>& schema_types) {
         auto it = std::find_if(node.children().begin(), node.children().end(), [](logical_plan::node_ptr node) {
-            return node->type() == logical_plan::node_type::group_t;
+            return node->type() == logical_plan::node_type::select_t;
         });
 
         if (it == node.children().end()) {
             // SELECT * case
-            return schema.schema_struct();
+            return types::complex_logical_type::create_struct("", schema_types);
         }
 
-        auto& group = *it;
-        std::vector<complex_logical_type> node_schema;
-        node_schema.reserve(group->expressions().size());
+        std::unordered_map<std::string, std::string> aggregate_fn_by_alias;
+        auto group_it = std::find_if(node.children().begin(), node.children().end(), [](logical_plan::node_ptr node) {
+            return node->type() == logical_plan::node_type::group_t;
+        });
 
-        for (const auto& expr_ptr : group->expressions()) {
-            types::complex_logical_type agg;
-            switch (expr_ptr->group()) {
-                case expressions::expression_group::aggregate: {
-                    auto& expr = static_cast<expressions::aggregate_expression_t&>(*expr_ptr);
-                    switch (expr.type()) {
-                        case expressions::aggregate_type::count:
-                        case expressions::aggregate_type::sum:
-                        case expressions::aggregate_type::min:
-                        case expressions::aggregate_type::max:
-                            agg = types::logical_type::BIGINT;
-                            break;
-                        case expressions::aggregate_type::avg:
-                            agg = types::logical_type::DOUBLE;
-                            break;
-                        case expressions::aggregate_type::invalid:
-                            break;
-                    }
-                    agg.set_alias(expr.key().as_string());
-                    break;
-                }
-                case expressions::expression_group::scalar: {
-                    auto& expr = static_cast<expressions::scalar_expression_t&>(*expr_ptr);
-                    if (expr.params().size()) {
-                        // size is either 1 or 0
-                        auto param_v = expr.params().at(0);
-                        if (std::holds_alternative<core::parameter_id_t>(param_v)) {
-                            auto param_id = std::get<core::parameter_id_t>(std::move(param_v));
-                            if (params->parameters().parameters.size() > param_id) {
-                                // param is available, will default to logical_type::NA otherwise
-                                agg = get_parameter(&params->parameters(), std::get<core::parameter_id_t>(param_v))
-                                          .type()
-                                          .type();
-                            }
-                        } else if (std::holds_alternative<expressions::key_t>(param_v)) {
-                            // can only be holding name of column
-                            auto cur = schema.find_field(std::get<expressions::key_t>(param_v).as_string().c_str());
-                            if (cur->is_success()) {
-                                agg = cur->type_data().front();
-                            }
-                        }
-                    } else {
-                        // otherwise key is a name of column
-                        auto cur = schema.find_field(expr.key().as_string().c_str());
-                        if (cur->is_success()) {
-                            agg = cur->type_data().front();
-                        }
-                    }
-                    agg.set_alias(expr.key().as_string());
-                    break;
-                }
-                default: {
-                    continue; // do nothing
+        if (group_it != node.children().end()) {
+            for (const auto& gexpr : (*group_it)->expressions()) {
+                if (gexpr->group() == expressions::expression_group::aggregate) {
+                    auto& agg_expr = static_cast<expressions::aggregate_expression_t&>(*gexpr);
+                    aggregate_fn_by_alias.emplace(agg_expr.key().as_string(), agg_expr.function_name());
                 }
             }
+        }
+
+        // helper: find field type by name in schema_types
+        auto find_field_type = [&schema_types](const std::string& name) -> complex_logical_type {
+            for (const auto& t : schema_types) {
+                if (t.alias() == name) {
+                    return t;
+                }
+            }
+            return logical_type::NA;
+        };
+
+        // helper: map alias to aggregate function type
+        // TODO: UDF return types
+        auto type_for_aggregate_fn = [](const std::string& fn) -> complex_logical_type {
+            if (fn == "count" || fn == "sum" || fn == "min" || fn == "max") {
+                return types::logical_type::BIGINT;
+            }
+            if (fn == "avg") {
+                return types::logical_type::DOUBLE;
+            }
+            return logical_type::NA;
+        };
+
+        auto& select = *it;
+        std::vector<complex_logical_type> node_schema;
+        node_schema.reserve(select->expressions().size());
+
+        for (const auto& expr_ptr : select->expressions()) {
+            types::complex_logical_type agg;
+            if (expr_ptr->group() != components::expressions::expression_group::scalar) {
+                continue;
+            }
+
+            auto& expr = static_cast<expressions::scalar_expression_t&>(*expr_ptr);
+            if (expr.params().size()) {
+                // size is either 1 or 0
+                auto param_v = expr.params().at(0);
+                if (std::holds_alternative<core::parameter_id_t>(param_v)) {
+                    auto param_id = std::get<core::parameter_id_t>(std::move(param_v));
+                    if (params->parameters().parameters.size() > param_id) {
+                        // param is available, will default to logical_type::NA otherwise
+                        agg =
+                            get_parameter(&params->parameters(), std::get<core::parameter_id_t>(param_v)).type().type();
+                    }
+                } else if (std::holds_alternative<expressions::key_t>(param_v)) {
+                    agg = find_field_type(std::get<expressions::key_t>(param_v).as_string());
+                }
+            } else {
+                auto key = expr.key().as_string();
+                agg = find_field_type(key);
+                if (agg == logical_type::NA) {
+                    // alias-routed aggregate, resolve type via the aggregate's function name.
+                    if (auto fn_it = aggregate_fn_by_alias.find(key); fn_it != aggregate_fn_by_alias.end()) {
+                        agg = type_for_aggregate_fn(fn_it->second);
+                    }
+                }
+            }
+
+            agg.set_alias(expr.key().as_string());
             node_schema.push_back(std::move(agg));
         }
 
-        return types::complex_logical_type::create_struct(node_schema);
+        return types::complex_logical_type::create_struct("", node_schema);
     }
 
     cursor::cursor_t_ptr compute_otterbrix_schema(const logical_plan::node_aggregate_t& node,
@@ -167,12 +184,16 @@ namespace schema_utils {
 
         if (schema.type() == logical_type::NA) {
             return cursor::make_cursor(node.resource(),
-                                       cursor::error_code_t::schema_error,
-                                       "OtterBrix collection is missing in catalog " +
-                                           node.collection_full_name().to_string());
+                                       core::error_t(core::error_code_t::schema_error,
+                                                     std::pmr::string{("OtterBrix collection is missing in catalog " +
+                                                                       node.collection_full_name().to_string())
+                                                                          .c_str(),
+                                                                      node.resource()}));
         }
 
-        return cursor::make_cursor(node.resource(), {std::move(schema)});
+        std::pmr::vector<types::complex_logical_type> result_types(node.resource());
+        result_types.emplace_back(std::move(schema));
+        return cursor::make_cursor(node.resource(), std::move(result_types));
     }
 
     types::complex_logical_type compute_join_schema(const logical_plan::node_join_t& node,
@@ -218,6 +239,6 @@ namespace schema_utils {
             merged_vector.push_back(column);
         }
 
-        return complex_logical_type::create_struct(merged_vector);
+        return complex_logical_type::create_struct("", merged_vector);
     }
 } // namespace schema_utils

@@ -13,7 +13,7 @@ RUN apt update && \
         python3-venv \
         python3-dev curl gnupg apt-transport-https \
         zlib1g libgflags2.2 libgflags-dev \
-        libssl-dev && \
+        libssl-dev bison flex && \
     apt clean && \
     rm -rf /var/lib/apt/lists/*
 
@@ -25,12 +25,18 @@ RUN rm /bin/sh && ln -s /bin/bash /bin/sh
 
 ARG BUILD_TYPE=Release
 
-WORKDIR /app/build
-COPY conanfile.py ./conanfile.py
-RUN conan install conanfile.py --build missing -s build_type=${BUILD_TYPE} -s compiler.cppstd=gnu17
-
-
+# Run conan install from the project root so self.source_folder=/app and
+# cmake_layout places generators + libs at build/${BUILD_TYPE}/ — matching
+# the devcontainer preset layout exactly.
 WORKDIR /app
+COPY conanfile.py .
+RUN conan install conanfile.py --build missing \
+    -s build_type=${BUILD_TYPE} \
+    -s compiler.cppstd=gnu20 \
+    -s 'clickhouse-cpp/*:compiler.cppstd=17' \
+    -s 'abseil/*:compiler.cppstd=17' \
+    -s 'grpc/*:compiler.cppstd=17'
+
 COPY ./catalog ./catalog
 COPY ./config ./config
 COPY ./connectors ./connectors
@@ -38,7 +44,6 @@ COPY ./db_integration ./db_integration
 COPY ./frontend/ ./frontend
 COPY ./otterbrix ./otterbrix
 COPY ./component_manager ./component_manager
-COPY ./routes ./routes
 COPY ./scheduler ./scheduler
 COPY ./types ./types
 COPY ./utility ./utility
@@ -47,7 +52,6 @@ COPY ./CMakeLists.txt ./CMakeLists.txt
 COPY ./tests ./tests
 COPY ./tsan.supp ./tsan.supp
 
-
 ARG ENABLE_ASAN=OFF
 ARG ENABLE_TSAN=OFF
 
@@ -55,10 +59,15 @@ ARG ENABLE_TSAN=OFF
 # Only takes effect in TSAN builds; plain Release / ASAN ignore it.
 ENV TSAN_OPTIONS="suppressions=/app/tsan.supp"
 
-WORKDIR /app/build
+RUN cmake -S . -B build/${BUILD_TYPE} \
+        -DCMAKE_TOOLCHAIN_FILE=build/${BUILD_TYPE}/generators/conan_toolchain.cmake \
+        -DCMAKE_BUILD_TYPE=${BUILD_TYPE} \
+        -DBUILD_TESTS=ON \
+        -DENABLE_ASAN=${ENABLE_ASAN} \
+        -DENABLE_TSAN=${ENABLE_TSAN} && \
+    cmake --build build/${BUILD_TYPE} --target all -- -j$(nproc)
 
-RUN cmake .. -DCMAKE_TOOLCHAIN_FILE=./build/${BUILD_TYPE}/generators/conan_toolchain.cmake -DCMAKE_BUILD_TYPE=${BUILD_TYPE} -DBUILD_TESTS=ON -DENABLE_ASAN=${ENABLE_ASAN} -DENABLE_TSAN=${ENABLE_TSAN} && \
-    cmake --build . --target all -- -j $(nproc)
+WORKDIR /app/build/${BUILD_TYPE}
 
 RUN ctest -C ${BUILD_TYPE} -V --output-on-failure --timeout 120
 

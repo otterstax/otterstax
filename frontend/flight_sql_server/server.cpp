@@ -11,11 +11,14 @@
 #include "utility/logger.hpp"
 #include "utility/timer.hpp"
 
+#include "catalog/catalog_manager.hpp"
 #include "otterbrix/config.hpp"
-#include "routes/scheduler.hpp"
+#include "scheduler/scheduler.hpp"
 
 #include "../../utility/cv_wrapper.hpp"
 #include "../../utility/session.hpp"
+
+#include <tuple>
 
 #include <boost/mysql/results.hpp>
 #include <spdlog/spdlog.h>
@@ -123,12 +126,7 @@ SimpleFlightSQLServer::GetFlightInfoStatement(const arrow::flight::ServerCallCon
 
     auto shared_data = create_cv_wrapper(session_payload(resource_));
     log_->debug("[GetFlightInfoStatement] Sending to scheduler...");
-    actor_zeta::send(scheduler_address_,
-                     scheduler_address_,
-                     scheduler::handler_id(scheduler::route::prepare_schema),
-                     id.hash(),
-                     shared_data,
-                     query);
+    std::ignore = actor_zeta::send(scheduler_address_, &Scheduler::prepare_schema, id.hash(), shared_data, query);
     log_->debug("[GetFlightInfoStatement] Waiting for response...");
     shared_data->wait_for(cv_wrapper::DEFAULT_TIMEOUT);
 
@@ -166,11 +164,7 @@ SimpleFlightSQLServer::DoGetStatement(const arrow::flight::ServerCallContext& co
                     session_hash,
                     transaction_id);
         auto shared_data = create_cv_wrapper(session_payload(resource_));
-        actor_zeta::send(scheduler_address_,
-                         scheduler_address_,
-                         scheduler::handler_id(scheduler::route::execute_statement),
-                         session_hash,
-                         shared_data);
+        std::ignore = actor_zeta::send(scheduler_address_, &Scheduler::execute_statement, session_hash, shared_data);
         shared_data->wait_for(cv_wrapper::DEFAULT_TIMEOUT);
 
         if (shared_data->status() == cv_wrapper::Status::Ok) {
@@ -235,11 +229,7 @@ SimpleFlightSQLServer::DoGetTables(const arrow::flight::ServerCallContext& conte
     }
 
     auto shared_data = create_cv_wrapper(std::pmr::vector<table_info>(resource_));
-    actor_zeta::send(catalog_address_,
-                     catalog_address_,
-                     catalog_manager::handler_id(catalog_manager::route::get_tables),
-                     command,
-                     shared_data);
+    std::ignore = actor_zeta::send(catalog_address_, &mysqlc::CatalogManager::get_tables, command, shared_data);
     shared_data->wait_for(cv_wrapper::DEFAULT_TIMEOUT);
     auto sdata_result = shared_data->get_result();
 
@@ -293,12 +283,7 @@ SimpleFlightSQLServer::DoPutCommandStatementUpdate(const arrow::flight::ServerCa
         log_->debug("Received query in ticket: {} Id: {}", command.query, command.transaction_id);
         auto shared_data = create_cv_wrapper(session_payload(resource_));
         session_id id;
-        actor_zeta::send(scheduler_address_,
-                         scheduler_address_,
-                         scheduler::handler_id(scheduler::route::execute),
-                         id.hash(),
-                         shared_data,
-                         command.query);
+        std::ignore = actor_zeta::send(scheduler_address_, &Scheduler::execute, id.hash(), shared_data, command.query);
         shared_data->wait_for(cv_wrapper::DEFAULT_TIMEOUT);
         auto sdata_result = shared_data->get_result();
 

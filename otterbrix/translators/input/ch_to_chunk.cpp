@@ -25,50 +25,60 @@ namespace tsl {
         set_int8(data_chunk_t& chunk, const clickhouse::Block& block, size_t block_row, size_t chunk_row, size_t col) {
             auto column = block[col]->As<clickhouse::ColumnInt8>();
             if (!column) {
-                chunk.set_value(col, chunk_row, types::logical_value_t{nullptr});
+                chunk.set_value(col, chunk_row, types::logical_value_t{chunk.resource(), nullptr});
                 return;
             }
-            chunk.set_value(col, chunk_row, types::logical_value_t{static_cast<int8_t>(column->At(block_row))});
+            chunk.set_value(col,
+                            chunk_row,
+                            types::logical_value_t{chunk.resource(), static_cast<int8_t>(column->At(block_row))});
         }
 
         void
         set_int16(data_chunk_t& chunk, const clickhouse::Block& block, size_t block_row, size_t chunk_row, size_t col) {
             auto column = block[col]->As<clickhouse::ColumnInt16>();
             if (!column) {
-                chunk.set_value(col, chunk_row, types::logical_value_t{nullptr});
+                chunk.set_value(col, chunk_row, types::logical_value_t{chunk.resource(), nullptr});
                 return;
             }
-            chunk.set_value(col, chunk_row, types::logical_value_t{static_cast<int16_t>(column->At(block_row))});
+            chunk.set_value(col,
+                            chunk_row,
+                            types::logical_value_t{chunk.resource(), static_cast<int16_t>(column->At(block_row))});
         }
 
         void
         set_int32(data_chunk_t& chunk, const clickhouse::Block& block, size_t block_row, size_t chunk_row, size_t col) {
             auto column = block[col]->As<clickhouse::ColumnInt32>();
             if (!column) {
-                chunk.set_value(col, chunk_row, types::logical_value_t{nullptr});
+                chunk.set_value(col, chunk_row, types::logical_value_t{chunk.resource(), nullptr});
                 return;
             }
-            chunk.set_value(col, chunk_row, types::logical_value_t{static_cast<int32_t>(column->At(block_row))});
+            chunk.set_value(col,
+                            chunk_row,
+                            types::logical_value_t{chunk.resource(), static_cast<int32_t>(column->At(block_row))});
         }
 
         void
         set_int64(data_chunk_t& chunk, const clickhouse::Block& block, size_t block_row, size_t chunk_row, size_t col) {
             auto column = block[col]->As<clickhouse::ColumnInt64>();
             if (!column) {
-                chunk.set_value(col, chunk_row, types::logical_value_t{nullptr});
+                chunk.set_value(col, chunk_row, types::logical_value_t{chunk.resource(), nullptr});
                 return;
             }
-            chunk.set_value(col, chunk_row, types::logical_value_t{static_cast<int64_t>(column->At(block_row))});
+            chunk.set_value(col,
+                            chunk_row,
+                            types::logical_value_t{chunk.resource(), static_cast<int64_t>(column->At(block_row))});
         }
 
         void
         set_uint8(data_chunk_t& chunk, const clickhouse::Block& block, size_t block_row, size_t chunk_row, size_t col) {
             auto column = block[col]->As<clickhouse::ColumnUInt8>();
             if (!column) {
-                chunk.set_value(col, chunk_row, types::logical_value_t{nullptr});
+                chunk.set_value(col, chunk_row, types::logical_value_t{chunk.resource(), nullptr});
                 return;
             }
-            chunk.set_value(col, chunk_row, types::logical_value_t{static_cast<uint8_t>(column->At(block_row))});
+            chunk.set_value(col,
+                            chunk_row,
+                            types::logical_value_t{chunk.resource(), static_cast<uint8_t>(column->At(block_row))});
         }
 
         void set_uint16(data_chunk_t& chunk,
@@ -78,10 +88,12 @@ namespace tsl {
                         size_t col) {
             auto column = block[col]->As<clickhouse::ColumnUInt16>();
             if (!column) {
-                chunk.set_value(col, chunk_row, types::logical_value_t{nullptr});
+                chunk.set_value(col, chunk_row, types::logical_value_t{chunk.resource(), nullptr});
                 return;
             }
-            chunk.set_value(col, chunk_row, types::logical_value_t{static_cast<uint16_t>(column->At(block_row))});
+            chunk.set_value(col,
+                            chunk_row,
+                            types::logical_value_t{chunk.resource(), static_cast<uint16_t>(column->At(block_row))});
         }
 
         void set_uint32(data_chunk_t& chunk,
@@ -91,10 +103,12 @@ namespace tsl {
                         size_t col) {
             auto column = block[col]->As<clickhouse::ColumnUInt32>();
             if (!column) {
-                chunk.set_value(col, chunk_row, types::logical_value_t{nullptr});
+                chunk.set_value(col, chunk_row, types::logical_value_t{chunk.resource(), nullptr});
                 return;
             }
-            chunk.set_value(col, chunk_row, types::logical_value_t{static_cast<uint32_t>(column->At(block_row))});
+            chunk.set_value(col,
+                            chunk_row,
+                            types::logical_value_t{chunk.resource(), static_cast<uint32_t>(column->At(block_row))});
         }
 
         void set_uint64(data_chunk_t& chunk,
@@ -104,10 +118,12 @@ namespace tsl {
                         size_t col) {
             auto column = block[col]->As<clickhouse::ColumnUInt64>();
             if (!column) {
-                chunk.set_value(col, chunk_row, types::logical_value_t{nullptr});
+                chunk.set_value(col, chunk_row, types::logical_value_t{chunk.resource(), nullptr});
                 return;
             }
-            chunk.set_value(col, chunk_row, types::logical_value_t{static_cast<uint64_t>(column->At(block_row))});
+            chunk.set_value(col,
+                            chunk_row,
+                            types::logical_value_t{chunk.resource(), static_cast<uint64_t>(column->At(block_row))});
         }
 
         void set_float32(data_chunk_t& chunk,
@@ -117,10 +133,12 @@ namespace tsl {
                          size_t col) {
             auto column = block[col]->As<clickhouse::ColumnFloat32>();
             if (!column) {
-                chunk.set_value(col, chunk_row, types::logical_value_t{nullptr});
+                chunk.set_value(col, chunk_row, types::logical_value_t{chunk.resource(), nullptr});
                 return;
             }
-            chunk.set_value(col, chunk_row, types::logical_value_t{static_cast<float>(column->At(block_row))});
+            chunk.set_value(col,
+                            chunk_row,
+                            types::logical_value_t{chunk.resource(), static_cast<float>(column->At(block_row))});
         }
 
         void set_float64(data_chunk_t& chunk,
@@ -130,10 +148,12 @@ namespace tsl {
                          size_t col) {
             auto column = block[col]->As<clickhouse::ColumnFloat64>();
             if (!column) {
-                chunk.set_value(col, chunk_row, types::logical_value_t{nullptr});
+                chunk.set_value(col, chunk_row, types::logical_value_t{chunk.resource(), nullptr});
                 return;
             }
-            chunk.set_value(col, chunk_row, types::logical_value_t{static_cast<double>(column->At(block_row))});
+            chunk.set_value(col,
+                            chunk_row,
+                            types::logical_value_t{chunk.resource(), static_cast<double>(column->At(block_row))});
         }
 
         void set_string(data_chunk_t& chunk,
@@ -143,10 +163,12 @@ namespace tsl {
                         size_t col) {
             auto column = block[col]->As<clickhouse::ColumnString>();
             if (!column) {
-                chunk.set_value(col, chunk_row, types::logical_value_t{nullptr});
+                chunk.set_value(col, chunk_row, types::logical_value_t{chunk.resource(), nullptr});
                 return;
             }
-            chunk.set_value(col, chunk_row, types::logical_value_t{std::string(column->At(block_row))});
+            chunk.set_value(col,
+                            chunk_row,
+                            types::logical_value_t{chunk.resource(), std::string(column->At(block_row))});
         }
 
         void set_fixed_string(data_chunk_t& chunk,
@@ -156,17 +178,19 @@ namespace tsl {
                               size_t col) {
             auto column = block[col]->As<clickhouse::ColumnFixedString>();
             if (!column) {
-                chunk.set_value(col, chunk_row, types::logical_value_t{nullptr});
+                chunk.set_value(col, chunk_row, types::logical_value_t{chunk.resource(), nullptr});
                 return;
             }
-            chunk.set_value(col, chunk_row, types::logical_value_t{std::string(column->At(block_row))});
+            chunk.set_value(col,
+                            chunk_row,
+                            types::logical_value_t{chunk.resource(), std::string(column->At(block_row))});
         }
 
         void
         set_date(data_chunk_t& chunk, const clickhouse::Block& block, size_t block_row, size_t chunk_row, size_t col) {
             auto column = block[col]->As<clickhouse::ColumnDate>();
             if (!column) {
-                chunk.set_value(col, chunk_row, types::logical_value_t{nullptr});
+                chunk.set_value(col, chunk_row, types::logical_value_t{chunk.resource(), nullptr});
                 return;
             }
             auto days = column->At(block_row);
@@ -175,7 +199,7 @@ namespace tsl {
             char buf[32];
             auto tt = std::chrono::system_clock::to_time_t(t);
             std::strftime(buf, sizeof(buf), "%Y-%m-%d", std::gmtime(&tt));
-            chunk.set_value(col, chunk_row, types::logical_value_t{std::string(buf)});
+            chunk.set_value(col, chunk_row, types::logical_value_t{chunk.resource(), std::string(buf)});
         }
 
         void set_datetime(data_chunk_t& chunk,
@@ -185,7 +209,7 @@ namespace tsl {
                           size_t col) {
             auto column = block[col]->As<clickhouse::ColumnDateTime>();
             if (!column) {
-                chunk.set_value(col, chunk_row, types::logical_value_t{nullptr});
+                chunk.set_value(col, chunk_row, types::logical_value_t{chunk.resource(), nullptr});
                 return;
             }
             auto secs = column->At(block_row);
@@ -194,7 +218,7 @@ namespace tsl {
             char buf[32];
             auto tt = std::chrono::system_clock::to_time_t(t);
             std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", std::gmtime(&tt));
-            chunk.set_value(col, chunk_row, types::logical_value_t{std::string(buf)});
+            chunk.set_value(col, chunk_row, types::logical_value_t{chunk.resource(), std::string(buf)});
         }
 
         void set_datetime64(data_chunk_t& chunk,
@@ -204,17 +228,19 @@ namespace tsl {
                             size_t col) {
             auto column = block[col]->As<clickhouse::ColumnDateTime64>();
             if (!column) {
-                chunk.set_value(col, chunk_row, types::logical_value_t{nullptr});
+                chunk.set_value(col, chunk_row, types::logical_value_t{chunk.resource(), nullptr});
                 return;
             }
-            chunk.set_value(col, chunk_row, types::logical_value_t{std::to_string(column->At(block_row))});
+            chunk.set_value(col,
+                            chunk_row,
+                            types::logical_value_t{chunk.resource(), std::to_string(column->At(block_row))});
         }
 
         void
         set_uuid(data_chunk_t& chunk, const clickhouse::Block& block, size_t block_row, size_t chunk_row, size_t col) {
             auto column = block[col]->As<clickhouse::ColumnUUID>();
             if (!column) {
-                chunk.set_value(col, chunk_row, types::logical_value_t{nullptr});
+                chunk.set_value(col, chunk_row, types::logical_value_t{chunk.resource(), nullptr});
                 return;
             }
             auto uuid_pair = column->At(block_row);
@@ -224,7 +250,7 @@ namespace tsl {
             std::string hex = oss.str();
             std::string formatted = hex.substr(0, 8) + "-" + hex.substr(8, 4) + "-" + hex.substr(12, 4) + "-" +
                                     hex.substr(16, 4) + "-" + hex.substr(20, 12);
-            chunk.set_value(col, chunk_row, types::logical_value_t{formatted});
+            chunk.set_value(col, chunk_row, types::logical_value_t{chunk.resource(), formatted});
         }
 
         struct value_translator_t {
@@ -248,7 +274,7 @@ namespace tsl {
                                                                 size_t col) {
                 auto column = block[col]->As<clickhouse::ColumnNullable>();
                 if (column && column->IsNull(block_row)) {
-                    chunk.set_value(col, chunk_row, types::logical_value_t{nullptr});
+                    chunk.set_value(col, chunk_row, types::logical_value_t{chunk.resource(), nullptr});
                     return;
                 }
                 base_converter(chunk, block, block_row, chunk_row, col);
@@ -420,7 +446,7 @@ namespace tsl {
             fields.emplace_back(translator.type);
         }
 
-        return types::complex_logical_type::create_struct(std::move(fields));
+        return types::complex_logical_type::create_struct("", std::move(fields));
     }
 
 } // namespace tsl

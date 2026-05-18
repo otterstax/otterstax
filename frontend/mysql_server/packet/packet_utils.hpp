@@ -10,6 +10,7 @@
 #include "../mysql_defs/server_status.hpp"
 #include "length_encoded.hpp"
 #include "packet_writer.hpp"
+#include <optional>
 
 namespace frontend::mysql {
     constexpr uint8_t AUTH_DATA_PART1_LENGTH = 8;

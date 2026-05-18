@@ -95,9 +95,9 @@ namespace mysqlc {
             co_return 42;
         }
 
-        asio::awaitable<components::catalog::catalog_error>
+        asio::awaitable<otterstax::asio_error_t>
         runQuery(std::string_view query,
-                 std::function<components::catalog::catalog_error(const boost::mysql::results&)> handler) override {
+                 std::function<otterstax::asio_error_t(const boost::mysql::results&)> handler) override {
             throw std::runtime_error("Unimplemented");
         }
 

@@ -18,18 +18,19 @@
 #include "utility/logger.hpp"
 
 #include <actor-zeta.hpp>
+#include <core/result_wrapper.hpp>
 #include <otterbrix/otterbrix.hpp>
 
 #include <catch2/catch.hpp>
 #include <chrono>
+#include <tuple>
 
 namespace {
-    std::once_flag log_init_flag;
-
     otterbrix::otterbrix_ptr init_otterbrix() {
         auto config = configuration::config::default_config();
 
-        std::call_once(log_init_flag, [&] { initialize_all_loggers(config.log.path.string()); });
+        auto log_path = config.log.path.string();
+        initialize_all_loggers(log_path);
 
         return otterbrix::make_otterbrix(std::move(config));
     }
@@ -39,10 +40,10 @@ TEST_CASE("base test case") {
     using namespace std::chrono_literals;
 
     otterbrix::otterbrix_ptr otterbrix = init_otterbrix();
-    auto resource = otterbrix->dispatcher()->resource();
+    auto resource = std::pmr::get_default_resource(); // no ottterbrix processing, use default for easier mock
     assert(resource);
 
-    auto catalog_manager = actor_zeta::spawn_supervisor<mysqlc::CatalogManager>(resource);
+    auto catalog_manager = actor_zeta::spawn<mysqlc::CatalogManager>(resource);
     auto mysql_conn_manager =
         std::make_shared<mysqlc::ConnectorManager>(catalog_manager->address(), mysql_mock_connector_factory(resource));
     auto pg_conn_manager =
@@ -55,35 +56,29 @@ TEST_CASE("base test case") {
     mysql_conn_manager->addConnection(boost::mysql::connect_params{}, "1");
     mysql_conn_manager->addConnection(boost::mysql::connect_params{}, "2");
 
-    auto otterbrix_manager = actor_zeta::spawn_supervisor<db_conn::OtterbrixManager>(
-        resource,
-        std::make_unique<SimpleMockOtterbrixManager>(mock_config{.resource = resource}));
-    auto mysql_connection_manager =
-        actor_zeta::spawn_supervisor<db_conn::SqlConnectionManager>(resource, mysql_conn_manager);
-    auto pg_connection_manager = actor_zeta::spawn_supervisor<db_conn::PgConnectionManager>(resource, pg_conn_manager);
+    auto otterbrix_manager =
+        actor_zeta::spawn<db_conn::OtterbrixManager>(resource, std::make_unique<SimpleMockOtterbrixManager>());
+    auto mysql_connection_manager = actor_zeta::spawn<db_conn::SqlConnectionManager>(resource, mysql_conn_manager);
+    auto pg_connection_manager = actor_zeta::spawn<db_conn::PgConnectionManager>(resource, pg_conn_manager);
     auto ch_conn_manager =
         std::make_shared<chc::ConnectorManager>(catalog_manager->address(), ch_mock_connector_factory(resource));
-    auto ch_connection_manager = actor_zeta::spawn_supervisor<db_conn::ChConnectionManager>(resource, ch_conn_manager);
+    catalog_manager->set_ch_connector_manager(ch_conn_manager);
+    auto ch_connection_manager = actor_zeta::spawn<db_conn::ChConnectionManager>(resource, ch_conn_manager);
 
-    auto scheduler = actor_zeta::spawn_supervisor<Scheduler>(resource,
-                                                             make_mock_parser(resource),
-                                                             mysql_connection_manager->address(),
-                                                             pg_connection_manager->address(),
-                                                             ch_connection_manager->address(),
-                                                             otterbrix_manager->address(),
-                                                             catalog_manager->address());
+    auto scheduler = actor_zeta::spawn<Scheduler>(resource,
+                                                  std::make_unique<SimpleMockParser>(mock_config{.resource = resource}),
+                                                  mysql_connection_manager->address(),
+                                                  pg_connection_manager->address(),
+                                                  ch_connection_manager->address(),
+                                                  otterbrix_manager->address(),
+                                                  catalog_manager->address());
     assert(scheduler);
     std::string sql = "SELECT 1 AS test";
     session_id id; // Use session_id type for consistency
     auto shared_data = create_cv_wrapper(session_payload(resource));
     // Register shared data in scheduler
     std::cout << "[Main thread] " << std::this_thread::get_id() << std::endl;
-    actor_zeta::send(scheduler->address(),
-                     scheduler->address(),
-                     scheduler::handler_id(scheduler::route::execute),
-                     id.hash(),
-                     shared_data,
-                     sql);
+    std::ignore = actor_zeta::send(scheduler->address(), &Scheduler::execute, id.hash(), shared_data, sql);
     shared_data->wait_for(5000ms);
     std::cout << "[Main thread] " << std::this_thread::get_id() << " check data" << std::endl;
     REQUIRE(shared_data->status() == cv_wrapper::Status::Ok);
@@ -97,7 +92,7 @@ TEST_CASE("Error in connector test case") {
     auto resource = otterbrix->dispatcher()->resource();
     assert(resource);
 
-    auto catalog_manager = actor_zeta::spawn_supervisor<mysqlc::CatalogManager>(resource);
+    auto catalog_manager = actor_zeta::spawn<mysqlc::CatalogManager>(resource);
     auto mysql_conn_manager = std::make_shared<mysqlc::ConnectorManager>(catalog_manager->address(),
                                                                          mysql_mock_connector_factory_throw(resource));
     auto pg_conn_manager =
@@ -110,35 +105,29 @@ TEST_CASE("Error in connector test case") {
     mysql_conn_manager->addConnection(boost::mysql::connect_params{}, "1");
     mysql_conn_manager->addConnection(boost::mysql::connect_params{}, "2");
 
-    auto otterbrix_manager = actor_zeta::spawn_supervisor<db_conn::OtterbrixManager>(
-        resource,
-        std::make_unique<SimpleMockOtterbrixManager>(mock_config{.resource = resource}));
-    auto mysql_connection_manager =
-        actor_zeta::spawn_supervisor<db_conn::SqlConnectionManager>(resource, mysql_conn_manager);
-    auto pg_connection_manager = actor_zeta::spawn_supervisor<db_conn::PgConnectionManager>(resource, pg_conn_manager);
+    auto otterbrix_manager =
+        actor_zeta::spawn<db_conn::OtterbrixManager>(resource, std::make_unique<SimpleMockOtterbrixManager>());
+    auto mysql_connection_manager = actor_zeta::spawn<db_conn::SqlConnectionManager>(resource, mysql_conn_manager);
+    auto pg_connection_manager = actor_zeta::spawn<db_conn::PgConnectionManager>(resource, pg_conn_manager);
     auto ch_conn_manager =
         std::make_shared<chc::ConnectorManager>(catalog_manager->address(), ch_mock_connector_factory(resource));
-    auto ch_connection_manager = actor_zeta::spawn_supervisor<db_conn::ChConnectionManager>(resource, ch_conn_manager);
+    catalog_manager->set_ch_connector_manager(ch_conn_manager);
+    auto ch_connection_manager = actor_zeta::spawn<db_conn::ChConnectionManager>(resource, ch_conn_manager);
 
-    auto scheduler = actor_zeta::spawn_supervisor<Scheduler>(resource,
-                                                             make_mock_parser(resource),
-                                                             mysql_connection_manager->address(),
-                                                             pg_connection_manager->address(),
-                                                             ch_connection_manager->address(),
-                                                             otterbrix_manager->address(),
-                                                             catalog_manager->address());
+    auto scheduler = actor_zeta::spawn<Scheduler>(resource,
+                                                  std::make_unique<SimpleMockParser>(mock_config{.resource = resource}),
+                                                  mysql_connection_manager->address(),
+                                                  pg_connection_manager->address(),
+                                                  ch_connection_manager->address(),
+                                                  otterbrix_manager->address(),
+                                                  catalog_manager->address());
     assert(scheduler);
     std::string sql = "SELECT 1 AS test";
     session_hash_t id = 1;
     auto shared_data = create_cv_wrapper(session_payload(resource));
     // Register shared data in scheduler
     std::cout << "[Main thread] " << std::this_thread::get_id() << std::endl;
-    actor_zeta::send(scheduler->address(),
-                     scheduler->address(),
-                     scheduler::handler_id(scheduler::route::execute),
-                     id,
-                     shared_data,
-                     sql);
+    std::ignore = actor_zeta::send(scheduler->address(), &Scheduler::execute, id, shared_data, sql);
     shared_data->wait_for(5000ms);
     std::cout << "[Main thread] " << std::this_thread::get_id() << "check data" << std::endl;
     REQUIRE(shared_data->status() == cv_wrapper::Status::Error);
@@ -153,7 +142,7 @@ TEST_CASE("Error in otterbrix test case") {
     auto resource = otterbrix->dispatcher()->resource();
     assert(resource);
 
-    auto catalog_manager = actor_zeta::spawn_supervisor<mysqlc::CatalogManager>(resource);
+    auto catalog_manager = actor_zeta::spawn<mysqlc::CatalogManager>(resource);
     auto mysql_conn_manager =
         std::make_shared<mysqlc::ConnectorManager>(catalog_manager->address(), mysql_mock_connector_factory(resource));
     auto pg_conn_manager =
@@ -166,39 +155,35 @@ TEST_CASE("Error in otterbrix test case") {
     mysql_conn_manager->addConnection(boost::mysql::connect_params{}, "1");
     mysql_conn_manager->addConnection(boost::mysql::connect_params{}, "2");
 
-    auto otterbrix_manager = actor_zeta::spawn_supervisor<db_conn::OtterbrixManager>(
+    auto otterbrix_manager = actor_zeta::spawn<db_conn::OtterbrixManager>(
         resource,
-        std::make_unique<SimpleMockOtterbrixManager>(mock_config{.resource = resource, .can_throw = true}));
-    auto mysql_connection_manager =
-        actor_zeta::spawn_supervisor<db_conn::SqlConnectionManager>(resource, mysql_conn_manager);
-    auto pg_connection_manager = actor_zeta::spawn_supervisor<db_conn::PgConnectionManager>(resource, pg_conn_manager);
+        std::make_unique<SimpleMockOtterbrixManager>(mock_config{.can_throw = true}));
+    auto mysql_connection_manager = actor_zeta::spawn<db_conn::SqlConnectionManager>(resource, mysql_conn_manager);
+    auto pg_connection_manager = actor_zeta::spawn<db_conn::PgConnectionManager>(resource, pg_conn_manager);
     auto ch_conn_manager =
         std::make_shared<chc::ConnectorManager>(catalog_manager->address(), ch_mock_connector_factory(resource));
-    auto ch_connection_manager = actor_zeta::spawn_supervisor<db_conn::ChConnectionManager>(resource, ch_conn_manager);
+    catalog_manager->set_ch_connector_manager(ch_conn_manager);
+    auto ch_connection_manager = actor_zeta::spawn<db_conn::ChConnectionManager>(resource, ch_conn_manager);
 
-    auto scheduler = actor_zeta::spawn_supervisor<Scheduler>(resource,
-                                                             make_mock_parser(resource),
-                                                             mysql_connection_manager->address(),
-                                                             pg_connection_manager->address(),
-                                                             ch_connection_manager->address(),
-                                                             otterbrix_manager->address(),
-                                                             catalog_manager->address());
+    auto scheduler = actor_zeta::spawn<Scheduler>(resource,
+                                                  std::make_unique<SimpleMockParser>(mock_config{.resource = resource}),
+                                                  mysql_connection_manager->address(),
+                                                  pg_connection_manager->address(),
+                                                  ch_connection_manager->address(),
+                                                  otterbrix_manager->address(),
+                                                  catalog_manager->address());
     assert(scheduler);
     std::string sql = "SELECT 1 AS test";
     session_hash_t id = 1;
     auto shared_data = create_cv_wrapper(session_payload(resource));
     // Register shared data in scheduler
     std::cout << "[Main thread] " << std::this_thread::get_id() << std::endl;
-    actor_zeta::send(scheduler->address(),
-                     scheduler->address(),
-                     scheduler::handler_id(scheduler::route::execute),
-                     id,
-                     shared_data,
-                     sql);
+    std::ignore = actor_zeta::send(scheduler->address(), &Scheduler::execute, id, shared_data, sql);
     shared_data->wait_for(5000ms);
     std::cout << "[Main thread] " << std::this_thread::get_id() << "check data" << std::endl;
     REQUIRE(shared_data->status() == cv_wrapper::Status::Error);
-    REQUIRE(shared_data->error_message() == "SimpleMockOtterbrixManager: exception in execute_plan");
+    REQUIRE(shared_data->error_message() ==
+            "Otterbrix execution failed: SimpleMockOtterbrixManager: exception in execute_plan");
     REQUIRE(shared_data->get_result().chunk.empty() == true);
 }
 
@@ -209,7 +194,7 @@ TEST_CASE("Error in scheduler test case") {
     auto resource = otterbrix->dispatcher()->resource();
     assert(resource);
 
-    auto catalog_manager = actor_zeta::spawn_supervisor<mysqlc::CatalogManager>(resource);
+    auto catalog_manager = actor_zeta::spawn<mysqlc::CatalogManager>(resource);
     auto mysql_conn_manager =
         std::make_shared<mysqlc::ConnectorManager>(catalog_manager->address(), mysql_mock_connector_factory(resource));
     auto pg_conn_manager =
@@ -218,17 +203,16 @@ TEST_CASE("Error in scheduler test case") {
     mysql_conn_manager->addConnection(boost::mysql::connect_params{}, "1");
     mysql_conn_manager->addConnection(boost::mysql::connect_params{}, "2");
 
-    auto otterbrix_manager = actor_zeta::spawn_supervisor<db_conn::OtterbrixManager>(
-        resource,
-        std::make_unique<SimpleMockOtterbrixManager>(mock_config{.resource = resource}));
-    auto mysql_connection_manager =
-        actor_zeta::spawn_supervisor<db_conn::SqlConnectionManager>(resource, mysql_conn_manager);
-    auto pg_connection_manager = actor_zeta::spawn_supervisor<db_conn::PgConnectionManager>(resource, pg_conn_manager);
+    auto otterbrix_manager =
+        actor_zeta::spawn<db_conn::OtterbrixManager>(resource, std::make_unique<SimpleMockOtterbrixManager>());
+    auto mysql_connection_manager = actor_zeta::spawn<db_conn::SqlConnectionManager>(resource, mysql_conn_manager);
+    auto pg_connection_manager = actor_zeta::spawn<db_conn::PgConnectionManager>(resource, pg_conn_manager);
     auto ch_conn_manager =
         std::make_shared<chc::ConnectorManager>(catalog_manager->address(), ch_mock_connector_factory(resource));
-    auto ch_connection_manager = actor_zeta::spawn_supervisor<db_conn::ChConnectionManager>(resource, ch_conn_manager);
+    catalog_manager->set_ch_connector_manager(ch_conn_manager);
+    auto ch_connection_manager = actor_zeta::spawn<db_conn::ChConnectionManager>(resource, ch_conn_manager);
 
-    auto scheduler = actor_zeta::spawn_supervisor<Scheduler>(
+    auto scheduler = actor_zeta::spawn<Scheduler>(
         resource,
         std::make_unique<SimpleMockParser>(mock_config{.resource = resource, .can_throw = true}),
         mysql_connection_manager->address(),
@@ -242,12 +226,7 @@ TEST_CASE("Error in scheduler test case") {
     auto shared_data = create_cv_wrapper(session_payload(resource));
     // Register shared data in scheduler
     std::cout << "[Main thread] " << std::this_thread::get_id() << std::endl;
-    actor_zeta::send(scheduler->address(),
-                     scheduler->address(),
-                     scheduler::handler_id(scheduler::route::execute),
-                     id,
-                     shared_data,
-                     sql);
+    std::ignore = actor_zeta::send(scheduler->address(), &Scheduler::execute, id, shared_data, sql);
     shared_data->wait_for(5000ms);
     std::cout << "[Main thread] " << std::this_thread::get_id() << "check data" << std::endl;
     REQUIRE(shared_data->status() == cv_wrapper::Status::Error);
@@ -262,7 +241,7 @@ TEST_CASE("Error in otterbrix + sql connector test case") {
     auto resource = otterbrix->dispatcher()->resource();
     assert(resource);
 
-    auto catalog_manager = actor_zeta::spawn_supervisor<mysqlc::CatalogManager>(resource);
+    auto catalog_manager = actor_zeta::spawn<mysqlc::CatalogManager>(resource);
     auto mysql_conn_manager = std::make_shared<mysqlc::ConnectorManager>(catalog_manager->address(),
                                                                          mysql_mock_connector_factory_throw(resource));
     auto pg_conn_manager =
@@ -275,35 +254,30 @@ TEST_CASE("Error in otterbrix + sql connector test case") {
     mysql_conn_manager->addConnection(boost::mysql::connect_params{}, "1");
     mysql_conn_manager->addConnection(boost::mysql::connect_params{}, "2");
 
-    auto otterbrix_manager = actor_zeta::spawn_supervisor<db_conn::OtterbrixManager>(
+    auto otterbrix_manager = actor_zeta::spawn<db_conn::OtterbrixManager>(
         resource,
-        std::make_unique<SimpleMockOtterbrixManager>(mock_config{.resource = resource, .can_throw = true}));
-    auto mysql_connection_manager =
-        actor_zeta::spawn_supervisor<db_conn::SqlConnectionManager>(resource, mysql_conn_manager);
-    auto pg_connection_manager = actor_zeta::spawn_supervisor<db_conn::PgConnectionManager>(resource, pg_conn_manager);
+        std::make_unique<SimpleMockOtterbrixManager>(mock_config{.can_throw = true}));
+    auto mysql_connection_manager = actor_zeta::spawn<db_conn::SqlConnectionManager>(resource, mysql_conn_manager);
+    auto pg_connection_manager = actor_zeta::spawn<db_conn::PgConnectionManager>(resource, pg_conn_manager);
     auto ch_conn_manager =
         std::make_shared<chc::ConnectorManager>(catalog_manager->address(), ch_mock_connector_factory(resource));
-    auto ch_connection_manager = actor_zeta::spawn_supervisor<db_conn::ChConnectionManager>(resource, ch_conn_manager);
+    catalog_manager->set_ch_connector_manager(ch_conn_manager);
+    auto ch_connection_manager = actor_zeta::spawn<db_conn::ChConnectionManager>(resource, ch_conn_manager);
 
-    auto scheduler = actor_zeta::spawn_supervisor<Scheduler>(resource,
-                                                             make_mock_parser(resource),
-                                                             mysql_connection_manager->address(),
-                                                             pg_connection_manager->address(),
-                                                             ch_connection_manager->address(),
-                                                             otterbrix_manager->address(),
-                                                             catalog_manager->address());
+    auto scheduler = actor_zeta::spawn<Scheduler>(resource,
+                                                  std::make_unique<SimpleMockParser>(mock_config{.resource = resource}),
+                                                  mysql_connection_manager->address(),
+                                                  pg_connection_manager->address(),
+                                                  ch_connection_manager->address(),
+                                                  otterbrix_manager->address(),
+                                                  catalog_manager->address());
     assert(scheduler);
     std::string sql = "SELECT 1 AS test";
     session_hash_t id = 1;
     auto shared_data = create_cv_wrapper(session_payload(resource));
     // Register shared data in scheduler
     std::cout << "[Main thread] " << std::this_thread::get_id() << std::endl;
-    actor_zeta::send(scheduler->address(),
-                     scheduler->address(),
-                     scheduler::handler_id(scheduler::route::execute),
-                     id,
-                     shared_data,
-                     sql);
+    std::ignore = actor_zeta::send(scheduler->address(), &Scheduler::execute, id, shared_data, sql);
     shared_data->wait_for(5000ms);
     std::cout << "[Main thread] " << std::this_thread::get_id() << "check data" << std::endl;
     REQUIRE(shared_data->status() == cv_wrapper::Status::Error);
@@ -314,22 +288,21 @@ TEST_CASE("Error in otterbrix + sql connector test case") {
 // Mock parser that creates cross-backend query (MySQL + PostgreSQL)
 class CrossBackendMockParser : public IParser {
 public:
-    explicit CrossBackendMockParser(std::pmr::memory_resource* resource)
-        : resource_(resource) {}
-
-    ParsedQueryDataPtr parse(const std::string& sql) override {
+    core::result_wrapper_t<ParsedQueryDataPtr> parse(const std::string& sql) override {
         std::cout << "CrossBackendMockParser: parsing SQL: " << sql << std::endl;
 
-        auto resource = resource_;
+        auto resource = std::pmr::get_default_resource();
 
         // Create result node
         auto result_node = logical_plan::make_node_aggregate(resource, {"result", "db", "schema", "result_table"});
 
-        auto binder = sql::transform::transform_result(result_node,
-                                                       logical_plan::make_parameter_node(resource),
-                                                       {},
-                                                       {},
-                                                       data_chunk_t(resource, {}));
+        auto binder = sql::transform::transform_result(
+            resource,
+            result_node,
+            logical_plan::make_parameter_node(resource),
+            sql::transform::transform_result::parameter_map_t{resource},
+            sql::transform::transform_result::insert_map_t{resource},
+            data_chunk_t(resource, {}));
 
         auto parsed = std::make_unique<ParsedQueryData>(
             std::make_unique<OtterbrixStatement>(std::vector<std::vector<logical_plan::node_ptr*>>{},
@@ -351,36 +324,30 @@ public:
                   << std::endl;
         return parsed;
     }
-
-private:
-    std::pmr::memory_resource* resource_;
 };
 
 // Mock Otterbrix Manager for cross-backend test
 class CrossBackendMockOtterbrixManager : public SimpleMockOtterbrixManager {
 public:
-    explicit CrossBackendMockOtterbrixManager(std::pmr::memory_resource* resource)
-        : SimpleMockOtterbrixManager(mock_config{.resource = resource})
-        , resource_(resource) {}
+    CrossBackendMockOtterbrixManager()
+        : SimpleMockOtterbrixManager(mock_config{}) {}
 
     components::cursor::cursor_t_ptr execute_plan(OtterbrixStatementPtr& otterbrix_params) override {
         std::cout << "CrossBackendMockOtterbrixManager: executing cross-backend plan" << std::endl;
         // Simulate successful execution - return a mock cursor
-        return components::cursor::make_cursor(resource_, components::vector::data_chunk_t{resource_, {}, 0});
+        std::pmr::memory_resource* resource = std::pmr::get_default_resource();
+        return components::cursor::make_cursor(resource, components::vector::data_chunk_t{resource, {}, 0});
     }
-
-private:
-    std::pmr::memory_resource* resource_;
 };
 
 TEST_CASE("Cross-backend JOIN detection test case") {
     using namespace std::chrono_literals;
 
     otterbrix::otterbrix_ptr otterbrix = init_otterbrix();
-    auto resource = otterbrix->dispatcher()->resource();
+    auto resource = std::pmr::get_default_resource(); // use default for easier mock
     assert(resource);
 
-    auto catalog_manager = actor_zeta::spawn_supervisor<mysqlc::CatalogManager>(resource);
+    auto catalog_manager = actor_zeta::spawn<mysqlc::CatalogManager>(resource);
     auto mysql_conn_manager =
         std::make_shared<mysqlc::ConnectorManager>(catalog_manager->address(), mysql_mock_connector_factory(resource));
     auto pg_conn_manager =
@@ -406,24 +373,23 @@ TEST_CASE("Cross-backend JOIN detection test case") {
     pg_conn_manager->addConnection(pg_params);
 
     // Use mock Otterbrix manager that doesn't require real execution
-    auto otterbrix_manager = actor_zeta::spawn_supervisor<db_conn::OtterbrixManager>(
-        resource,
-        std::make_unique<CrossBackendMockOtterbrixManager>(resource));
-    auto mysql_conn_manager_actor =
-        actor_zeta::spawn_supervisor<db_conn::SqlConnectionManager>(resource, mysql_conn_manager);
-    auto pg_connection_manager = actor_zeta::spawn_supervisor<db_conn::PgConnectionManager>(resource, pg_conn_manager);
+    auto otterbrix_manager =
+        actor_zeta::spawn<db_conn::OtterbrixManager>(resource, std::make_unique<CrossBackendMockOtterbrixManager>());
+    auto mysql_conn_manager_actor = actor_zeta::spawn<db_conn::SqlConnectionManager>(resource, mysql_conn_manager);
+    auto pg_connection_manager = actor_zeta::spawn<db_conn::PgConnectionManager>(resource, pg_conn_manager);
     auto ch_conn_manager =
         std::make_shared<chc::ConnectorManager>(catalog_manager->address(), ch_mock_connector_factory(resource));
-    auto ch_connection_manager = actor_zeta::spawn_supervisor<db_conn::ChConnectionManager>(resource, ch_conn_manager);
+    catalog_manager->set_ch_connector_manager(ch_conn_manager);
+    auto ch_connection_manager = actor_zeta::spawn<db_conn::ChConnectionManager>(resource, ch_conn_manager);
 
     // Use CrossBackendMockParser to simulate cross-backend query
-    auto scheduler = actor_zeta::spawn_supervisor<Scheduler>(resource,
-                                                             std::make_unique<CrossBackendMockParser>(resource),
-                                                             mysql_conn_manager_actor->address(),
-                                                             pg_connection_manager->address(),
-                                                             ch_connection_manager->address(),
-                                                             otterbrix_manager->address(),
-                                                             catalog_manager->address());
+    auto scheduler = actor_zeta::spawn<Scheduler>(resource,
+                                                  std::make_unique<CrossBackendMockParser>(),
+                                                  mysql_conn_manager_actor->address(),
+                                                  pg_connection_manager->address(),
+                                                  ch_connection_manager->address(),
+                                                  otterbrix_manager->address(),
+                                                  catalog_manager->address());
     assert(scheduler);
 
     std::string sql = "SELECT * FROM products.pgdb.public.products p JOIN campaigns.db1.schema.campaigns c ON "
@@ -432,12 +398,7 @@ TEST_CASE("Cross-backend JOIN detection test case") {
     auto shared_data = create_cv_wrapper(session_payload(resource));
 
     std::cout << "[Main thread] " << std::this_thread::get_id() << " sending cross-backend query" << std::endl;
-    actor_zeta::send(scheduler->address(),
-                     scheduler->address(),
-                     scheduler::handler_id(scheduler::route::execute),
-                     id,
-                     shared_data,
-                     sql);
+    std::ignore = actor_zeta::send(scheduler->address(), &Scheduler::execute, id, shared_data, sql);
 
     // Wait for completion
     shared_data->wait_for(10000ms);
@@ -469,7 +430,7 @@ TEST_CASE("return empty test case") {
     auto resource = otterbrix->dispatcher()->resource();
     assert(resource);
 
-    auto catalog_manager = actor_zeta::spawn_supervisor<mysqlc::CatalogManager>(resource);
+    auto catalog_manager = actor_zeta::spawn<mysqlc::CatalogManager>(resource);
     // Use return_empty connector so MySQL returns empty results
     auto mysql_conn_manager =
         std::make_shared<mysqlc::ConnectorManager>(catalog_manager->address(),
@@ -484,35 +445,30 @@ TEST_CASE("return empty test case") {
     mysql_conn_manager->addConnection(boost::mysql::connect_params{}, "1");
     mysql_conn_manager->addConnection(boost::mysql::connect_params{}, "2");
 
-    auto otterbrix_manager = actor_zeta::spawn_supervisor<db_conn::OtterbrixManager>(
+    auto otterbrix_manager = actor_zeta::spawn<db_conn::OtterbrixManager>(
         resource,
         std::make_unique<SimpleMockOtterbrixManager>(mock_config{.resource = resource, .return_empty = true}));
-    auto mysql_connection_manager =
-        actor_zeta::spawn_supervisor<db_conn::SqlConnectionManager>(resource, mysql_conn_manager);
-    auto pg_connection_manager = actor_zeta::spawn_supervisor<db_conn::PgConnectionManager>(resource, pg_conn_manager);
+    auto mysql_connection_manager = actor_zeta::spawn<db_conn::SqlConnectionManager>(resource, mysql_conn_manager);
+    auto pg_connection_manager = actor_zeta::spawn<db_conn::PgConnectionManager>(resource, pg_conn_manager);
     auto ch_conn_manager =
         std::make_shared<chc::ConnectorManager>(catalog_manager->address(), ch_mock_connector_factory(resource));
-    auto ch_connection_manager = actor_zeta::spawn_supervisor<db_conn::ChConnectionManager>(resource, ch_conn_manager);
+    catalog_manager->set_ch_connector_manager(ch_conn_manager);
+    auto ch_connection_manager = actor_zeta::spawn<db_conn::ChConnectionManager>(resource, ch_conn_manager);
 
-    auto scheduler = actor_zeta::spawn_supervisor<Scheduler>(resource,
-                                                             make_mock_parser(resource),
-                                                             mysql_connection_manager->address(),
-                                                             pg_connection_manager->address(),
-                                                             ch_connection_manager->address(),
-                                                             otterbrix_manager->address(),
-                                                             catalog_manager->address());
+    auto scheduler = actor_zeta::spawn<Scheduler>(resource,
+                                                  std::make_unique<SimpleMockParser>(mock_config{.resource = resource}),
+                                                  mysql_connection_manager->address(),
+                                                  pg_connection_manager->address(),
+                                                  ch_connection_manager->address(),
+                                                  otterbrix_manager->address(),
+                                                  catalog_manager->address());
     assert(scheduler);
     std::string sql = "SELECT 1 AS test";
     session_hash_t id = 1;
     auto shared_data = create_cv_wrapper(session_payload(resource));
     // Register shared data in scheduler
     std::cout << "[Main thread] " << std::this_thread::get_id() << std::endl;
-    actor_zeta::send(scheduler->address(),
-                     scheduler->address(),
-                     scheduler::handler_id(scheduler::route::execute),
-                     id,
-                     shared_data,
-                     sql);
+    std::ignore = actor_zeta::send(scheduler->address(), &Scheduler::execute, id, shared_data, sql);
     shared_data->wait_for(5000ms);
     std::cout << "[Main thread] " << std::this_thread::get_id() << " check data" << std::endl;
     REQUIRE(shared_data->status() == cv_wrapper::Status::Empty);

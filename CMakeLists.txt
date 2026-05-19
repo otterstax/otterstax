@@ -148,9 +148,7 @@ target_link_libraries(server
 # Unit tests
 if(BUILD_TESTS)
     enable_testing()
-    add_subdirectory(tests/mysql-front)
-    add_subdirectory(tests/unit)
-    add_subdirectory(tests/system)
+    add_subdirectory(tests)
 endif()
 
 if(BUILD_BENCHMARKS)

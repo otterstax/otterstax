@@ -17,6 +17,4 @@ target_link_libraries(
     otterbrix_log
 )
 
-include(CTest)
-include(Catch)
-catch_discover_tests(${PROJECT_NAME})
+otterstax_discover_tests(${PROJECT_NAME})

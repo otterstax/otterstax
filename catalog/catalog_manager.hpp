@@ -47,7 +47,7 @@ namespace catalog_ext {
 
 } // namespace catalog_ext
 
-namespace mysqlc {
+namespace mysql {
     class CatalogManager final : public actor_zeta::actor::actor_mixin<CatalogManager> {
     public:
         using is_cooperative_actor_type = void; // Required by actor_zeta::send() concept
@@ -56,8 +56,8 @@ namespace mysqlc {
 
         CatalogManager(std::pmr::memory_resource* res);
         void set_mysql_connector_manager(std::shared_ptr<ConnectorManager> mysql_conn_manager);
-        void set_pg_connector_manager(std::shared_ptr<pgc::ConnectorManager> pg_conn_manager);
-        void set_ch_connector_manager(std::shared_ptr<chc::ConnectorManager> ch_conn_manager);
+        void set_pg_connector_manager(std::shared_ptr<pg::ConnectorManager> pg_conn_manager);
+        void set_ch_connector_manager(std::shared_ptr<ch::ConnectorManager> ch_conn_manager);
 
         std::pmr::memory_resource* resource() const noexcept { return resource_; }
 
@@ -98,8 +98,8 @@ namespace mysqlc {
         log_t log_;
         components::catalog::catalog catalog_;
         std::shared_ptr<ConnectorManager> mysql_conn_manager_;
-        std::shared_ptr<pgc::ConnectorManager> pg_conn_manager_;
-        std::shared_ptr<chc::ConnectorManager> ch_conn_manager_;
+        std::shared_ptr<pg::ConnectorManager> pg_conn_manager_;
+        std::shared_ptr<ch::ConnectorManager> ch_conn_manager_;
         std::mutex mutex_;
         actor_zeta::behavior_t current_behavior_;
 
@@ -110,4 +110,4 @@ namespace mysqlc {
         auto update_backend_type_impl(ParsedQueryDataPtr&& data) -> ParsedQueryDataPtr const;
         core::error_t add_connection_schema_sync(collection_full_name_t name);
     };
-} // namespace mysqlc
+} // namespace mysql

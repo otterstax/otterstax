@@ -18,20 +18,21 @@
 #include <thread>
 #include <unordered_map>
 
-#include "connectors/http_server/pg_connection_config.hpp"
+#include "connectors/api_connections/pg_connection_config.hpp"
+#include "otterbrix/translators/input/pg_to_chunk.hpp"
 #include "utility/cv_wrapper.hpp"
 #include "utility/thread_pool_manager.hpp"
 
 #include <components/expressions/compare_expression.hpp>
 
-namespace pgc {
+namespace pg {
 
     namespace asio = boost::asio;
     using asio::awaitable;
     using asio::co_spawn;
     using asio::use_awaitable;
 
-    std::unique_ptr<pgc::IConnector> make_pg_connector(connect_params params, std::string alias);
+    std::unique_ptr<pg::IConnector> make_pg_connector(connect_params params, std::string alias);
 
     class ConnectorManager {
     public:
@@ -73,6 +74,9 @@ namespace pgc {
         std::optional<connect_params> conn_params(const std::string& uuid) const;
         bool hasConnection(const std::string& uuid) const noexcept;
 
+        void fetch_enum_types(const std::string& uuid);
+        tsl::pg_enum_oid_map enums_for(const std::string& uuid) const;
+
     private:
         void notify_connection_removed(const std::string& uuid);
 
@@ -80,6 +84,7 @@ namespace pgc {
         thread_pool_manager thread_pool_manager_;
         actor_zeta::address_t catalog_manager_;
         connector_factory make_connector_;
-        std::unordered_map<std::string, std::unique_ptr<pgc::IConnector>> connections_;
+        std::unordered_map<std::string, std::unique_ptr<pg::IConnector>> connections_;
+        std::unordered_map<std::string, tsl::pg_enum_oid_map> enums_;
     };
-} // namespace pgc
+} // namespace pg

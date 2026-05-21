@@ -19,13 +19,13 @@ namespace logger_tag {
     inline constexpr std::string_view CONNECTOR = "Connector";
     inline constexpr std::string_view CONNECTOR_MANAGER = "ConnectorManager";
     inline constexpr std::string_view OTTERBRIX_MANAGER = "OtterbrixManager";
-    inline constexpr std::string_view SQL_CONNECTION_MANAGER = "SqlConnectionManager";
-    inline constexpr std::string_view PG_CONNECTION_MANAGER = "PgConnectionManager";
+    inline constexpr std::string_view SQL_CONNECTION_MANAGER = "MySQLManager";
+    inline constexpr std::string_view PG_CONNECTION_MANAGER = "PostgressManager";
     inline constexpr std::string_view FRONTEND_SERVER = "FrontendServer";
     inline constexpr std::string_view FLIGHTSQL_SERVER = "FlightSQLServer";
     inline constexpr std::string_view MYSQL_CONNECTION = "MysqlConnection";
     inline constexpr std::string_view POSTGRES_CONNECTION = "PostgresConnection";
-    inline constexpr std::string_view CH_CONNECTION_MANAGER = "ChConnectionManager";
+    inline constexpr std::string_view CH_CONNECTION_MANAGER = "ClickhouseManager";
     inline constexpr std::string_view SCHEDULER = "Scheduler";
     inline constexpr std::string_view Main = "Main";
     inline constexpr std::string_view Config = "Config";

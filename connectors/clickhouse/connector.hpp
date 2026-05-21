@@ -26,7 +26,7 @@
 #include <memory>
 #include <string>
 
-namespace chc {
+namespace ch {
 
     namespace asio = boost::asio;
     using asio::awaitable;
@@ -116,4 +116,4 @@ namespace chc {
 
     using connector_factory = std::function<std::unique_ptr<IConnector>(connect_params, std::string)>;
 
-} // namespace chc
+} // namespace ch

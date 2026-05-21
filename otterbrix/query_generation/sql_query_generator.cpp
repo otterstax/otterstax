@@ -25,6 +25,9 @@
 #include <components/logical_plan/node_update.hpp>
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
+#include <regex>
+
 using namespace components::types;
 using namespace components::logical_plan;
 using namespace components::expressions;
@@ -759,6 +762,40 @@ namespace {
 } // namespace
 
 namespace sql_gen {
+
+    namespace {
+        // ClickHouse-only dialect fixup: postgres-style `(expr).field` tuple
+        // member access doesn't parse in CH, which expects plain `expr.field`.
+        std::string ch_unwrap_paren_field_access(std::string sql) {
+            static const std::regex paren_field(R"(\(([a-zA-Z_][\w.]*)\)\.([a-zA-Z_]\w*))");
+            for (int i = 0; i < 8; ++i) {
+                std::string out = std::regex_replace(sql, paren_field, "$1.$2");
+                if (out == sql)
+                    break;
+                sql = std::move(out);
+            }
+            return sql;
+        }
+    } // namespace
+
+    std::string replace_qualifiers(std::string raw_sql,
+                                   const std::vector<otterstax::parser::qualifier_rewrite_t>& quals,
+                                   backend_type_t backend) {
+        // substitute qualifiers in descending offset order so earlier slots won't shift the later ones
+        std::vector<otterstax::parser::qualifier_rewrite_t> sorted = quals;
+        std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return a.start > b.start; });
+        for (const auto& q : sorted) {
+            if (q.start < 0 || q.length <= 0 ||
+                static_cast<size_t>(q.start) + static_cast<size_t>(q.length) > raw_sql.size()) {
+                continue;
+            }
+            raw_sql.replace(q.start, q.length, table_reference(q.name, backend));
+        }
+        if (backend == backend_type_t::ClickHouse) {
+            raw_sql = ch_unwrap_paren_field_access(std::move(raw_sql));
+        }
+        return raw_sql;
+    }
 
     std::string table_reference(const collection_full_name_t& name, backend_type_t backend) {
         std::stringstream s;

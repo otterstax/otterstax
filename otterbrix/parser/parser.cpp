@@ -3,6 +3,9 @@
 
 #include "parser.hpp"
 
+#include "scheduler/schema_utils.hpp"
+#include "subquery_extractor.hpp"
+
 #include <components/logical_plan/node_function.hpp>
 #include <components/sql/parser/parser.h>
 #include <components/sql/transformer/utils.hpp>
@@ -11,6 +14,60 @@
 #include <iostream>
 
 using namespace components;
+
+namespace {
+    void swap_stubs_into_schema_nodes(std::pmr::memory_resource* resource,
+                                      std::vector<std::vector<logical_plan::node_ptr*>>& external_nodes,
+                                      const std::vector<otterstax::parser::subquery_stub_t>& stubs) {
+        if (stubs.empty()) {
+            return;
+        }
+
+        for (auto& batch : external_nodes) {
+            for (auto* slot : batch) {
+                auto& node_ref = *slot;
+                if (node_ref->type() != logical_plan::node_type::aggregate_t) {
+                    continue;
+                }
+                const auto& cfn = node_ref->collection_full_name();
+                if (cfn.collection.size() < otterstax::parser::k_stub_prefix.size() ||
+                    cfn.collection.compare(0,
+                                           otterstax::parser::k_stub_prefix.size(),
+                                           otterstax::parser::k_stub_prefix) != 0) {
+                    continue;
+                }
+
+                bool is_outer_aggregate = false;
+                for (const auto& child : node_ref->children()) {
+                    auto t = child->type();
+                    if (t == logical_plan::node_type::select_t ||
+                        t == logical_plan::node_type::match_t  ||
+                        t == logical_plan::node_type::sort_t   ||
+                        t == logical_plan::node_type::limit_t  ||
+                        t == logical_plan::node_type::group_t  ||
+                        t == logical_plan::node_type::having_t) {
+                        is_outer_aggregate = true;
+                        break;
+                    }
+                }
+
+                if (is_outer_aggregate) {
+                    continue;
+                }
+                for (const auto& stub : stubs) {
+                    if (stub.stub_id != cfn.collection) {
+                        continue;
+                    }
+                    auto schema_node =
+                        schema_utils::make_node_schema_raw(resource, cfn, stub.raw_sql, stub.qualifiers);
+                    schema_node->set_result_alias(node_ref->result_alias());
+                    node_ref = schema_node;
+                    break;
+                }
+            }
+        }
+    }
+} // namespace
 
 static constexpr bool is_valid_external(logical_plan::node_type type) {
     switch (type) {
@@ -63,7 +120,6 @@ static size_t get_external_nodes(std::pmr::memory_resource* resource,
     nodes_lookup.emplace_back(&node, nullptr, 0);
     while (!nodes_lookup.empty()) {
         auto& n = nodes_lookup.front();
-        // log_.trace("checking nodes: type: {}; collection: {}", to_string((*n.ptr)->type()), (*n.ptr)->collection_full_name().to_string());
         if (!(*n.ptr)->collection_full_name().unique_identifier.empty() && is_valid_external((*n.ptr)->type())) {
             {
                 // TODO: remove this segment when connection pool will be added
@@ -116,37 +172,76 @@ GreenplumParser::GreenplumParser(std::pmr::memory_resource* resource)
 
 core::result_wrapper_t<ParsedQueryDataPtr> GreenplumParser::parse(const std::string& sql) {
     std::cerr << "[Parser] Starting parse for: " << sql.substr(0, 100) << std::endl;
-    std::pmr::monotonic_buffer_resource arena_resource(resource_);
-    sql::transform::transformer transformer(resource_);
-    std::cerr << "[Parser] Calling raw_parser..." << std::endl;
-    auto res = linitial(raw_parser(&arena_resource, sql.c_str()));
-    std::cerr << "[Parser] raw_parser complete" << std::endl;
-    auto tag = nodeTag(res);
-    std::cerr << "[Parser] Calling transformer.transform..." << std::endl;
-    auto binder = transformer.transform(sql::transform::pg_cell_to_node_cast(res));
-    std::cerr << "[Parser] transform complete" << std::endl;
+    try {
+        std::pmr::monotonic_buffer_resource arena_resource(resource_);
+        sql::transform::transformer transformer(resource_);
 
-    if (binder.has_error()) {
-        return binder.get_error();
+        ::Node* reusable_root = nullptr;
+        auto extraction = otterstax::parser::prepare_sql(sql, &arena_resource, &reusable_root);
+        std::cerr << "[Parser] prepare_sql produced " << extraction.stubs.size() << " stub(s)" << std::endl;
+        std::cerr << "[Parser] modified SQL: " << extraction.modified_sql.substr(0, 200) << std::endl;
+
+        ::Node* res = nullptr;
+        if (extraction.stubs.empty() && reusable_root) {
+            std::cerr << "[Parser] reusing prepare_sql's AST (no extraction)" << std::endl;
+            res = reusable_root;
+        } else {
+            std::cerr << "[Parser] Calling raw_parser on modified SQL..." << std::endl;
+            auto* raw = raw_parser(&arena_resource, extraction.modified_sql.c_str());
+            if (!raw) {
+                std::cerr << "[Parser] raw_parser returned null" << std::endl;
+                return core::error_t{core::error_code_t::sql_parse_error,
+                                     std::pmr::string{"syntax error", resource_}};
+            }
+            res = reinterpret_cast<::Node*>(linitial(raw));
+            otterstax::parser::promote_three_part_qualifiers(res);
+        }
+
+        auto tag = nodeTag(res);
+        std::cerr << "[Parser] Calling transformer.transform..." << std::endl;
+        auto binder = transformer.transform(sql::transform::pg_cell_to_node_cast(res));
+        std::cerr << "[Parser] transform complete" << std::endl;
+
+        if (binder.has_error()) {
+            std::cerr << "[Parser] transformer error: " << binder.get_error().what.c_str() << std::endl;
+            return binder.get_error();
+        }
+
+        auto node = binder.node_ptr();
+        if (!node) {
+            std::cerr << "[Parser] transformer returned null root node — unsupported statement?" << std::endl;
+            return core::error_t{core::error_code_t::unimplemented_yet,
+                                 std::pmr::string{"Unsupported node type", resource_}};
+        }
+
+        const size_t param_cnt = binder.parameter_count();
+        auto params = binder.params_ptr();
+
+        std::cerr << "[Parser] Creating ParsedQueryData..." << std::endl;
+        ParsedQueryDataPtr result = std::make_unique<ParsedQueryData>(
+            std::make_unique<OtterbrixStatement>(std::vector<std::vector<logical_plan::node_ptr*>>{},
+                                                 std::move(params),
+                                                 std::move(node),
+                                                 0,
+                                                 param_cnt),
+            std::move(binder),
+            tag);
+
+        std::cerr << "[Parser] Calling get_external_nodes..." << std::endl;
+        result->otterbrix_params->external_nodes_count =
+            get_external_nodes(resource_, result->otterbrix_params->node, result->otterbrix_params->external_nodes);
+        std::cerr << "[Parser] get_external_nodes complete, count=" << result->otterbrix_params->external_nodes_count
+                  << std::endl;
+
+        swap_stubs_into_schema_nodes(resource_, result->otterbrix_params->external_nodes, extraction.stubs);
+        std::cerr << "[Parser] swap_stubs_into_schema_nodes complete" << std::endl;
+
+        return result;
+    } catch (const std::exception& e) {
+        std::cerr << "[Parser] caught exception: " << e.what() << std::endl;
+        return core::error_t{core::error_code_t::sql_parse_error, e.what()};
+    } catch (...) {
+        std::cerr << "[Parser] caught unknown exception" << std::endl;
+        return core::error_t{core::error_code_t::sql_parse_error, std::pmr::string{"syntax error", resource_}};
     }
-
-    const size_t param_cnt = binder.parameter_count();
-    auto node = binder.node_ptr();
-    auto params = binder.params_ptr();
-
-    std::cerr << "[Parser] Creating ParsedQueryData..." << std::endl;
-    ParsedQueryDataPtr result = std::make_unique<ParsedQueryData>(
-        std::make_unique<OtterbrixStatement>(std::vector<std::vector<logical_plan::node_ptr*>>{},
-                                             std::move(params),
-                                             std::move(node),
-                                             0,
-                                             param_cnt),
-        std::move(binder),
-        tag);
-
-    std::cerr << "[Parser] Calling get_external_nodes..." << std::endl;
-    result->otterbrix_params->external_nodes_count =
-        get_external_nodes(resource_, result->otterbrix_params->node, result->otterbrix_params->external_nodes);
-    std::cerr << "[Parser] get_external_nodes complete, count=" << result->otterbrix_params->external_nodes_count << std::endl;
-    return result;
 }

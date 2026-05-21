@@ -28,6 +28,16 @@ namespace frontend {
                 case components::types::logical_type::DOUBLE:
                     return mysql::field_type::MYSQL_TYPE_DOUBLE;
                 case components::types::logical_type::STRING_LITERAL:
+                case components::types::logical_type::ENUM:
+                    // ENUM serialises as the label string on the wire
+                    return mysql::field_type::MYSQL_TYPE_STRING;
+                case components::types::logical_type::STRUCT:
+                    // No native struct type in MySQL — emit as a string with
+                    // a postgres-style (f1,f2,f3)
+                    return mysql::field_type::MYSQL_TYPE_STRING;
+                case components::types::logical_type::ARRAY:
+                case components::types::logical_type::LIST:
+                    // Surface as a STRING in mysql wire — encoder emits {a,b,c}
                     return mysql::field_type::MYSQL_TYPE_STRING;
                     //            case components::types::logical_type::DECIMAL:
                     //                return field_type::MYSQL_TYPE_DECIMAL;
@@ -66,10 +76,20 @@ namespace frontend {
                     return postgres::field_type::FLOAT8;
                 case components::types::logical_type::STRING_LITERAL:
                 case components::types::logical_type::NA:
+                case components::types::logical_type::ENUM:
+                    // ENUM goes over PG wire as TEXT (label string)
+                    return postgres::field_type::TEXT;
+                case components::types::logical_type::STRUCT:
+                    // PG has a real RECORD OID (2249) but values for it
+                    // travel as TEXT composite literal (f1,f2,f3)
+                    return postgres::field_type::TEXT;
+                case components::types::logical_type::ARRAY:
+                case components::types::logical_type::LIST:
                     return postgres::field_type::TEXT;
                 default:
                     std::stringstream oss;
-                    oss << "Cant infer mysql type for logical type: " << std::to_string(static_cast<uint8_t>(log_type));
+                    oss << "Cant infer postgres type for logical type: "
+                        << std::to_string(static_cast<uint8_t>(log_type));
                     std::cerr << oss.str() << std::endl;
                     throw std::logic_error(oss.str());
             }

@@ -29,18 +29,18 @@
 #include <vector>
 
 // Forward declarations
-namespace mysqlc {
+namespace mysql {
     class ConnectorManager;
     class CatalogManager;
-} // namespace mysqlc
-namespace pgc {
+} // namespace mysql
+namespace pg {
     class ConnectorManager;
 }
-namespace db_conn {
-    class SqlConnectionManager;
-    class PgConnectionManager;
+namespace db {
+    class MySQLManager;
+    class PostgressManager;
     class OtterbrixManager;
-} // namespace db_conn
+} // namespace db
 
 class Scheduler final : public actor_zeta::actor::actor_mixin<Scheduler> {
 public:
@@ -95,7 +95,6 @@ private:
     /// session management (unchanged)
     void register_session(session_hash_t id, shared_session_payload sdata);
     void update_metadata(session_hash_t id, ParsedQueryDataPtr metadata, types::complex_logical_type schema = {});
-    void complete_session(session_hash_t id);
     void complete_session(session_hash_t id, session_payload data, flightsql_session_type type);
     void complete_session_on_error(session_hash_t id, std::string error_msg);
     ParsedQueryDataPtr get_statement(session_hash_t id);

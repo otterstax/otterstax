@@ -178,12 +178,6 @@ SimpleFlightSQLServer::DoGetStatement(const arrow::flight::ServerCallContext& co
             log_->trace("[ARROW FLIGHT SERVER] Send data");
             timer.timePoint("[DOGET] datastream created");
             return std::make_unique<arrow::flight::RecordBatchStream>(batch_reader);
-        } else if (shared_data->status() == cv_wrapper::Status::Empty) {
-            std::shared_ptr<arrow::Schema> schema;
-            auto chunk_res = shared_data->get_result().chunk;
-            log_->warn("[Otterbrix]: result cursor size : {}", chunk_res.size());
-            auto batch_reader = ChunkBatchReader::Make(arrow::schema({}), std::move(chunk_res)).ValueOrDie();
-            return std::make_unique<arrow::flight::RecordBatchStream>(batch_reader);
         } else if (shared_data->status() == cv_wrapper::Status::Timeout) {
             log_->warn("Timeout while executing query: {}", query);
             return arrow::Status::Invalid("Timeout while executing query: " + query);
@@ -229,11 +223,11 @@ SimpleFlightSQLServer::DoGetTables(const arrow::flight::ServerCallContext& conte
     }
 
     auto shared_data = create_cv_wrapper(std::pmr::vector<table_info>(resource_));
-    std::ignore = actor_zeta::send(catalog_address_, &mysqlc::CatalogManager::get_tables, command, shared_data);
+    std::ignore = actor_zeta::send(catalog_address_, &mysql::CatalogManager::get_tables, command, shared_data);
     shared_data->wait_for(cv_wrapper::DEFAULT_TIMEOUT);
     auto sdata_result = shared_data->get_result();
 
-    // otherwise always Ok or Empty
+    // otherwise always Ok (catalog_manager populates the vector, empty or not)
     if (shared_data->status() == cv_wrapper::Status::Timeout) {
         log_->warn("Timeout while getting tables");
         return arrow::Status::Invalid("Timeout while getting tables");
@@ -297,10 +291,6 @@ SimpleFlightSQLServer::DoPutCommandStatementUpdate(const arrow::flight::ServerCa
             log_->debug("[DoPutCommandStatementUpdate] Affected rows: {}", affected_rows);
             log_->trace("[ARROW FLIGHT SERVER] Send data");
             timer.timePoint("[DoPutCommandStatementUpdate] datastream created");
-            return affected_rows;
-        } else if (shared_data->status() == cv_wrapper::Status::Empty) {
-            affected_rows = sdata_result.chunk.size();
-            log_->warn("[Otterbrix]: result cursor size : {}", affected_rows);
             return affected_rows;
         } else if (shared_data->status() == cv_wrapper::Status::Timeout) {
             log_->warn("Timeout while executing query: {}", command.query);

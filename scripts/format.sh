@@ -5,12 +5,11 @@ set -eo pipefail
 
 python3 scripts/tools/code-fromat.py ${1} \
 catalog \
-client_example \
 connectors \
-db_integration \
+examples \
 frontend \
+integration \
 otterbrix \
-routes \
 scheduler \
 tests \
 types \

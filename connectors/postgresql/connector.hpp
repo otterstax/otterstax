@@ -27,7 +27,7 @@
 #include <memory>
 #include <string>
 
-namespace pgc {
+namespace pg {
 
     namespace asio = boost::asio;
     using asio::awaitable;
@@ -154,4 +154,4 @@ namespace pgc {
     using connector_factory =
         std::function<std::unique_ptr<IConnector>(connect_params, std::string)>;
 
-} // namespace pgc
+} // namespace pg

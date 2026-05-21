@@ -10,9 +10,9 @@
 #include <memory>
 #include <utility>
 
-namespace chc {
+namespace ch {
 
-    class MockConnector : public chc::IConnector {
+    class MockConnector : public ch::IConnector {
     public:
         explicit MockConnector(mock_config config = {}, std::string alias = "ch_mock_connector")
             : config_(std::move(config))
@@ -92,11 +92,11 @@ namespace chc {
         std::string alias_;
     };
 
-} // namespace chc
+} // namespace ch
 
 inline auto ch_mock_connector_factory(std::pmr::memory_resource* resource) {
-    return [resource](chc::connect_params, std::string alias) {
+    return [resource](ch::connect_params, std::string alias) {
         std::cout << "Creating CH MockConnector." << std::endl;
-        return std::make_unique<chc::MockConnector>(mock_config{.resource = resource}, std::move(alias));
+        return std::make_unique<ch::MockConnector>(mock_config{.resource = resource}, std::move(alias));
     };
 }

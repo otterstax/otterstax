@@ -10,10 +10,10 @@
 
 using namespace components;
 
-namespace chc {
+namespace ch {
 
-    std::unique_ptr<chc::IConnector> make_ch_connector(connect_params params, std::string alias) {
-        return std::make_unique<chc::Connector>(std::move(params), std::move(alias));
+    std::unique_ptr<ch::IConnector> make_ch_connector(connect_params params, std::string alias) {
+        return std::make_unique<ch::Connector>(std::move(params), std::move(alias));
     }
 
     ConnectorManager::ConnectorManager(actor_zeta::address_t catalog_manager,
@@ -47,7 +47,7 @@ namespace chc {
                         name.database,
                         name.schema,
                         name.collection);
-            std::ignore = actor_zeta::send(catalog_manager_, &mysqlc::CatalogManager::add_connection_schema, std::move(name));
+            std::ignore = actor_zeta::send(catalog_manager_, &mysql::CatalogManager::add_connection_schema, std::move(name));
             return uuid;
         } catch (const std::exception& e) {
             log_->error("ClickHouse Error: {}", e.what());
@@ -103,7 +103,58 @@ namespace chc {
 
     bool ConnectorManager::hasConnection(const std::string& uuid) const noexcept { return connections_.contains(uuid); }
 
-    void ConnectorManager::notify_connection_removed(const std::string& uuid) {
-        std::ignore = actor_zeta::send(catalog_manager_, &mysqlc::CatalogManager::remove_connection_schema, uuid);
+    void ConnectorManager::fetch_named_types(const std::string& uuid,
+                                             const std::string& database,
+                                             const std::string& table) {
+        auto conn = connections_.find(uuid);
+        if (conn == connections_.end()) {
+            log_->warn("fetch_named_types: no connection for uid={}", uuid);
+            return;
+        }
+
+        std::string query =
+            "SELECT name, type FROM system.columns WHERE database = '" + database + "' AND table = '" + table + "'";
+        auto handler = [this, uuid, table](const std::vector<clickhouse::Block>& blocks) -> int {
+            auto& slot = named_types_[uuid][table];
+            for (const auto& block : blocks) {
+                if (block.GetColumnCount() < 2 || block.GetRowCount() == 0)
+                    continue;
+                auto name_col = block[0]->As<clickhouse::ColumnString>();
+                auto type_col = block[1]->As<clickhouse::ColumnString>();
+                if (!name_col || !type_col) {
+                    log_->warn("fetch_named_types: unexpected system.columns shape");
+                    continue;
+                }
+                for (size_t i = 0; i < block.GetRowCount(); ++i) {
+                    std::string col_name(name_col->At(i));
+                    std::string col_type(type_col->At(i));
+                    log_->debug("fetch_named_types: {}.{}.{} -> {}", uuid, table, col_name, col_type);
+                    slot.emplace(std::move(col_name), std::move(col_type));
+                }
+            }
+            return 0;
+        };
+
+        try {
+            auto fut = co_spawn(thread_pool_manager_.ctx(), conn->second->runQuery(query, handler), asio::use_future);
+            fut.get();
+        } catch (const std::exception& e) {
+            log_->error("fetch_named_types failed for {}.{}: {}", database, table, e.what());
+        }
     }
-} // namespace chc
+
+    std::unordered_map<std::string, std::string> ConnectorManager::named_types_for(const std::string& uuid,
+                                                                                   const std::string& table) const {
+        auto u_it = named_types_.find(uuid);
+        if (u_it == named_types_.end())
+            return {};
+        auto t_it = u_it->second.find(table);
+        if (t_it == u_it->second.end())
+            return {};
+        return t_it->second;
+    }
+
+    void ConnectorManager::notify_connection_removed(const std::string& uuid) {
+        std::ignore = actor_zeta::send(catalog_manager_, &mysql::CatalogManager::remove_connection_schema, uuid);
+    }
+} // namespace ch

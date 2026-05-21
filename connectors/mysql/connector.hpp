@@ -30,9 +30,9 @@
 #include <memory>
 #include <string>
 
-namespace mysqlc {
+namespace mysql {
 
-    namespace mysql = boost::mysql;
+    namespace bm = boost::mysql;
     namespace asio = boost::asio;
     using asio::awaitable;
     using asio::co_spawn;
@@ -51,7 +51,7 @@ namespace mysqlc {
     public:
         virtual ~IConnector() = default;
         virtual Status status() const noexcept = 0;
-        virtual mysql::connect_params params() const noexcept = 0;
+        virtual bm::connect_params params() const noexcept = 0;
         virtual void close() = 0;
         virtual void connect() = 0;
         virtual bool isConnected() = 0;
@@ -71,9 +71,9 @@ namespace mysqlc {
 
     class Connector : public IConnector {
     public:
-        Connector(asio::io_context& io_ctx, mysql::connect_params params, std::string alias = "");
+        Connector(asio::io_context& io_ctx, bm::connect_params params, std::string alias = "");
         Status status() const noexcept override;
-        mysql::connect_params params() const noexcept override;
+        bm::connect_params params() const noexcept override;
         void close() override;
         ~Connector() override;
         void connect() override;
@@ -124,7 +124,7 @@ namespace mysqlc {
             // DB
             // Issue the SQL query to the server
             log_->debug("Alias: {} query: {}", alias_, query);
-            mysql::results result;
+            bm::results result;
             co_await conn_.async_execute(query, result, asio::redirect_error(asio::use_awaitable, ec));
 
             if (ec) {
@@ -137,14 +137,14 @@ namespace mysqlc {
         }
 
     private:
-        mysql::any_connection conn_;
-        mysql::connect_params params_;
+        bm::any_connection conn_;
+        bm::connect_params params_;
         Status status_;
         std::mutex mutex_;
         std::string alias_;
     };
 
     using connector_factory =
-        std::function<std::unique_ptr<IConnector>(asio::io_context&, mysql::connect_params, std::string)>;
+        std::function<std::unique_ptr<IConnector>(asio::io_context&, bm::connect_params, std::string)>;
 
-} // namespace mysqlc
+} // namespace mysql

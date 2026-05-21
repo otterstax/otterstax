@@ -13,7 +13,7 @@
 #include <spdlog/spdlog.h>
 
 #include "component_manager/component_manager.hpp"
-#include "connectors/http_server/connection_server.hpp"
+#include "connectors/api_connections/connection_server.hpp"
 #include "connectors/mysql/connector.hpp"
 #include "frontend/flight_sql_server/server.hpp"
 #include "frontend/mysql_server/mysql_server.hpp"

@@ -32,7 +32,7 @@ namespace {
     }
 } // namespace
 
-namespace mysqlc {
+namespace mysql {
     CatalogManager::CatalogManager(std::pmr::memory_resource* res)
         : resource_(res)
         , catalog_(resource())
@@ -49,11 +49,11 @@ namespace mysqlc {
         mysql_conn_manager_ = std::move(mysql_conn_manager);
     }
 
-    void CatalogManager::set_pg_connector_manager(std::shared_ptr<pgc::ConnectorManager> pg_conn_manager) {
+    void CatalogManager::set_pg_connector_manager(std::shared_ptr<pg::ConnectorManager> pg_conn_manager) {
         pg_conn_manager_ = std::move(pg_conn_manager);
     }
 
-    void CatalogManager::set_ch_connector_manager(std::shared_ptr<chc::ConnectorManager> ch_conn_manager) {
+    void CatalogManager::set_ch_connector_manager(std::shared_ptr<ch::ConnectorManager> ch_conn_manager) {
         ch_conn_manager_ = std::move(ch_conn_manager);
     }
 
@@ -259,8 +259,7 @@ namespace mysqlc {
         co_return std::move(updated_data);
     }
 
-    actor_zeta::unique_future<core::error_t>
-    CatalogManager::add_connection_schema(collection_full_name_t name) {
+    actor_zeta::unique_future<core::error_t> CatalogManager::add_connection_schema(collection_full_name_t name) {
         co_return add_connection_schema_sync(std::move(name));
     }
 
@@ -285,9 +284,9 @@ namespace mysqlc {
             log_->debug("add_connection_schema: detected ClickHouse connection for uuid: {}", uuid);
         } else {
             log_->error("add_connection_schema: no connector manager has connection with uuid: {}", uuid);
-            return core::error_t(core::error_code_t::missing_field,
-                                 std::pmr::string{("No connector manager found for uuid: " + uuid).c_str(),
-                                                  resource()});
+            return core::error_t(
+                core::error_code_t::missing_field,
+                std::pmr::string{("No connector manager found for uuid: " + uuid).c_str(), resource()});
         }
 
         registerConnection(uuid, conn_type, name);
@@ -331,9 +330,9 @@ namespace mysqlc {
                 return std::move(future.get()).release();
             } catch (const std::exception& e) {
                 log_->error("add_connection_schema: failed to query MySQL schema for {}", id.to_string());
-                return core::error_t(core::error_code_t::missing_field,
-                                     std::pmr::string{(std::string("MySQL schema query failed: ") + e.what()).c_str(),
-                                                      resource()});
+                return core::error_t(
+                    core::error_code_t::missing_field,
+                    std::pmr::string{(std::string("MySQL schema query failed: ") + e.what()).c_str(), resource()});
             }
         } else if (is_pg) {
             // PostgreSQL: query schema using libpq
@@ -362,6 +361,9 @@ namespace mysqlc {
                             pg_name.collection);
             }
 
+            pg_conn_manager_->fetch_enum_types(uuid);
+            auto pg_enum_oids = pg_conn_manager_->enums_for(uuid);
+
             // If table is empty, fetch all tables from the schema
             if (pg_name.collection.empty()) {
                 // First, get list of all tables in the schema
@@ -372,7 +374,7 @@ namespace mysqlc {
                             list_tables_query);
 
                 // Handler to process list of tables and then fetch each table's schema
-                auto list_handler = [this, uuid, pg_name](PGresult* result) -> otterstax::asio_error_t {
+                auto list_handler = [this, uuid, pg_name, pg_enum_oids](PGresult* result) -> otterstax::asio_error_t {
                     int num_tables = PQntuples(result);
                     log_->info("add_connection_schema: found {} tables in schema {}", num_tables, pg_name.schema);
 
@@ -386,9 +388,9 @@ namespace mysqlc {
                         catalog::table_id table_id(resource(), full_table_name);
 
                         // Create a handler for this specific table's schema
-                        auto schema_handler =
-                            [this, table_id, full_table_name](PGresult* schema_result) -> otterstax::asio_error_t {
-                            auto schema_struct = tsl::pg_to_struct(schema_result);
+                        auto schema_handler = [this, table_id, full_table_name, pg_enum_oids](
+                                                  PGresult* schema_result) -> otterstax::asio_error_t {
+                            auto schema_struct = tsl::pg_to_struct(schema_result, pg_enum_oids);
                             auto schema = schema_from_struct(resource(), schema_struct);
 
                             if (catalog_.table_exists(table_id)) {
@@ -434,14 +436,15 @@ namespace mysqlc {
                     return std::move(future.get()).release();
                 } catch (const std::exception& e) {
                     log_->error("add_connection_schema: failed to query table list from schema {}", pg_name.schema);
-                    return core::error_t(core::error_code_t::missing_field,
-                                         std::pmr::string{(std::string("Failed to list tables: ") + e.what()).c_str(),
-                                                          resource()});
+                    return core::error_t(
+                        core::error_code_t::missing_field,
+                        std::pmr::string{(std::string("Failed to list tables: ") + e.what()).c_str(), resource()});
                 }
             } else {
                 // Fetch schema for a single specific table
-                auto schema_handler = [this, pg_name](PGresult* schema_result) -> otterstax::asio_error_t {
-                    auto schema_struct = tsl::pg_to_struct(schema_result);
+                auto schema_handler =
+                    [this, pg_name, pg_enum_oids](PGresult* schema_result) -> otterstax::asio_error_t {
+                    auto schema_struct = tsl::pg_to_struct(schema_result, pg_enum_oids);
                     auto schema = schema_from_struct(resource(), schema_struct);
 
                     catalog::table_id table_id(resource(), pg_name);
@@ -504,6 +507,7 @@ namespace mysqlc {
                         std::string table_name(name_col->At(i));
                         log_->debug("add_connection_schema: processing ClickHouse table {}", table_name);
 
+                        ch_conn_manager_->fetch_named_types(uuid, ch_database, table_name);
                         collection_full_name_t table_name_obj(uuid, ch_database, "", table_name);
                         catalog::table_id table_id(resource(), table_name_obj);
 
@@ -620,11 +624,6 @@ namespace mysqlc {
             }
         }
 
-        if (ids.empty()) {
-            sdata->release_empty();
-            co_return;
-        }
-
         for (auto&& id : ids) {
             data.emplace_back(id.collection_full_name());
             if (command.include_schema) {
@@ -637,4 +636,4 @@ namespace mysqlc {
         co_return;
     }
 
-} // namespace mysqlc
+} // namespace mysql

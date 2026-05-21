@@ -1,0 +1,10 @@
+{
+    "alias": "pg",
+    "host": "localhost",
+    "port": "3202",
+    "username": "demo",
+    "password": "demo",
+    "database": "shop",
+    "schema": "shop",
+    "table": ""
+}

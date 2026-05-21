@@ -18,22 +18,22 @@
 #include <thread>
 #include <unordered_map>
 
-#include "../http_server/connection_config.hpp"
+#include "../api_connections/connection_config.hpp"
 #include "utility/cv_wrapper.hpp"
 #include "utility/thread_pool_manager.hpp"
 
 #include <components/expressions/compare_expression.hpp>
 
-namespace mysqlc {
+namespace mysql {
 
-    namespace mysql = boost::mysql;
+    namespace bm = boost::mysql;
     namespace asio = boost::asio;
     using asio::awaitable;
     using asio::co_spawn;
     using asio::use_awaitable;
 
-    std::unique_ptr<mysqlc::IConnector>
-    make_mysql_connector(asio::io_context& io_ctx, mysql::connect_params params, std::string alias);
+    std::unique_ptr<mysql::IConnector>
+    make_mysql_connector(asio::io_context& io_ctx, bm::connect_params params, std::string alias);
 
     class ConnectorManager {
     public:
@@ -46,7 +46,7 @@ namespace mysqlc {
 
         // TODO add query for adding and removing connections
         // TODO this is not thread safe!!!
-        std::string addConnection(mysql::connect_params connection_param, const std::string& uuid);
+        std::string addConnection(bm::connect_params connection_param, const std::string& uuid);
         std::string addConnection(http_server::ConnectionParams connection_param);
         void removeConnection(const std::string& uuid);
 
@@ -75,7 +75,7 @@ namespace mysqlc {
         }
 
         size_t totalConnections() const noexcept;
-        std::optional<mysql::connect_params> conn_params(const std::string& uuid) const;
+        std::optional<bm::connect_params> conn_params(const std::string& uuid) const;
         bool hasConnection(const std::string& uuid) const noexcept;
 
     private:
@@ -85,6 +85,6 @@ namespace mysqlc {
         thread_pool_manager thread_pool_manager_;
         actor_zeta::address_t catalog_manager_;
         connector_factory make_connector_;
-        std::unordered_map<std::string, std::unique_ptr<mysqlc::IConnector>> connections_;
+        std::unordered_map<std::string, std::unique_ptr<mysql::IConnector>> connections_;
     };
-} // namespace mysqlc
+} // namespace mysql

@@ -80,7 +80,7 @@ add_subdirectory(catalog)
 add_subdirectory(connectors)
 add_subdirectory(component_manager)
 add_subdirectory(config)
-add_subdirectory(db_integration)
+add_subdirectory(integration)
 add_subdirectory(otterbrix)
 add_subdirectory(scheduler)
 
@@ -116,7 +116,7 @@ target_link_libraries(
     catalog
     connectors
     component_manager
-    db_integration
+    integration
     otterbrix_local
     scheduler
     config::config

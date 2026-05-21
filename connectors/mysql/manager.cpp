@@ -10,11 +10,11 @@
 
 using namespace components;
 
-namespace mysqlc {
+namespace mysql {
 
-    std::unique_ptr<mysqlc::IConnector>
-    make_mysql_connector(asio::io_context& io_ctx, mysql::connect_params params, std::string alias) {
-        return std::make_unique<mysqlc::Connector>(io_ctx, std::move(params), std::move(alias));
+    std::unique_ptr<mysql::IConnector>
+    make_mysql_connector(asio::io_context& io_ctx, bm::connect_params params, std::string alias) {
+        return std::make_unique<mysql::Connector>(io_ctx, std::move(params), std::move(alias));
     }
 
     ConnectorManager::ConnectorManager(actor_zeta::address_t catalog_manager,
@@ -35,7 +35,7 @@ namespace mysqlc {
 
     // TODO add query for adding and removing connections
     // TODO this is not thread safe!!!
-    std::string ConnectorManager::addConnection(mysql::connect_params connection_param, const std::string& uuid) {
+    std::string ConnectorManager::addConnection(bm::connect_params connection_param, const std::string& uuid) {
         try {
             std::string addr = std::string(connection_param.server_address.hostname()) + ":" +
                                std::to_string(connection_param.server_address.port());
@@ -45,7 +45,7 @@ namespace mysqlc {
             connections_[uuid]->connect();
 
             collection_full_name_t name(uuid, connection_param.database, "", uuid);
-            std::ignore = actor_zeta::send(catalog_manager_, &mysqlc::CatalogManager::add_connection_schema, std::move(name));
+            std::ignore = actor_zeta::send(catalog_manager_, &mysql::CatalogManager::add_connection_schema, std::move(name));
             return uuid;
         } catch (const boost::mysql::error_with_diagnostics& e) {
             log_->error("MySQL error occurred - Error code: {}, Message: {}, Diagnostics: {}",
@@ -93,7 +93,7 @@ namespace mysqlc {
 
     size_t ConnectorManager::totalConnections() const noexcept { return connections_.size(); }
 
-    std::optional<mysql::connect_params> ConnectorManager::conn_params(const std::string& uuid) const {
+    std::optional<bm::connect_params> ConnectorManager::conn_params(const std::string& uuid) const {
         auto conn = connections_.find(uuid);
         if (conn == connections_.end()) {
             return std::nullopt;
@@ -104,6 +104,6 @@ namespace mysqlc {
     bool ConnectorManager::hasConnection(const std::string& uuid) const noexcept { return connections_.contains(uuid); }
 
     void ConnectorManager::notify_connection_removed(const std::string& uuid) {
-        std::ignore = actor_zeta::send(catalog_manager_, &mysqlc::CatalogManager::remove_connection_schema, uuid);
+        std::ignore = actor_zeta::send(catalog_manager_, &mysql::CatalogManager::remove_connection_schema, uuid);
     }
-} // namespace mysqlc
+} // namespace mysql

@@ -10,10 +10,10 @@
 
 using namespace components;
 
-namespace pgc {
+namespace pg {
 
-    std::unique_ptr<pgc::IConnector> make_pg_connector(connect_params params, std::string alias) {
-        return std::make_unique<pgc::Connector>(std::move(params), std::move(alias));
+    std::unique_ptr<pg::IConnector> make_pg_connector(connect_params params, std::string alias) {
+        return std::make_unique<pg::Connector>(std::move(params), std::move(alias));
     }
 
     ConnectorManager::ConnectorManager(actor_zeta::address_t catalog_manager,
@@ -52,7 +52,7 @@ namespace pgc {
                         name.database,
                         name.schema,
                         name.collection);
-            std::ignore = actor_zeta::send(catalog_manager_, &mysqlc::CatalogManager::add_connection_schema, std::move(name));
+            std::ignore = actor_zeta::send(catalog_manager_, &mysql::CatalogManager::add_connection_schema, std::move(name));
             return uuid;
         } catch (const std::exception& e) {
             log_->error("PostgreSQL Error: {}", e.what());
@@ -108,7 +108,66 @@ namespace pgc {
 
     bool ConnectorManager::hasConnection(const std::string& uuid) const noexcept { return connections_.contains(uuid); }
 
-    void ConnectorManager::notify_connection_removed(const std::string& uuid) {
-        std::ignore = actor_zeta::send(catalog_manager_, &mysqlc::CatalogManager::remove_connection_schema, uuid);
+    void ConnectorManager::fetch_enum_types(const std::string& uuid) {
+        const std::string query =
+            "SELECT t.oid, t.typname, e.enumlabel "
+            "FROM pg_type t "
+            "JOIN pg_enum e ON e.enumtypid = t.oid "
+            "WHERE t.typtype = 'e' "
+            "ORDER BY t.oid, e.enumsortorder;";
+
+        auto handler = [this, uuid](PGresult* result) -> otterstax::asio_error_t {
+            if (!result) {
+                return otterstax::asio_error_t{};
+            }
+            tsl::pg_enum_oid_map& map = enums_[uuid];
+            int nrows = PQntuples(result);
+            for (int i = 0; i < nrows; ++i) {
+                const char* oid_str = PQgetvalue(result, i, 0);
+                const char* typname = PQgetvalue(result, i, 1);
+                const char* enumlabel = PQgetvalue(result, i, 2);
+                if (!oid_str || !typname || !enumlabel) {
+                    continue;
+                }
+                unsigned int oid = static_cast<unsigned int>(std::stoul(oid_str));
+                auto& desc = map[oid];
+                if (desc.typname.empty()) {
+                    desc.typname = typname;
+                }
+                desc.values.emplace_back(enumlabel);
+            }
+            log_->info("fetch_enum_types: cached {} ENUM types for uuid={}", map.size(), uuid);
+            for (const auto& [oid, desc] : map) {
+                std::string joined;
+                for (const auto& v : desc.values) {
+                    if (!joined.empty()) {
+                        joined += ',';
+                    }
+                    joined += v;
+                }
+                log_->debug("  enum oid={} typname={} values=[{}]", oid, desc.typname, joined);
+            }
+            return otterstax::asio_error_t{};
+        };
+
+        try {
+            auto fut = executeQuery(uuid, query, handler);
+            (void) fut.get();
+        } catch (const std::exception& e) {
+            log_->warn("fetch_enum_types: query failed for uuid={}: {}", uuid, e.what());
+        }
     }
-} // namespace pgc
+
+    tsl::pg_enum_oid_map ConnectorManager::enums_for(const std::string& uuid) const {
+        auto it = enums_.find(uuid);
+        if (it == enums_.end()) {
+            return {};
+        }
+        return it->second;
+    }
+
+    void ConnectorManager::notify_connection_removed(const std::string& uuid) {
+        std::ignore = actor_zeta::send(catalog_manager_, &mysql::CatalogManager::remove_connection_schema, uuid);
+        enums_.erase(uuid);
+    }
+} // namespace pg

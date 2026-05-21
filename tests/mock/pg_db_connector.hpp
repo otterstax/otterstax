@@ -13,9 +13,9 @@
 #include <memory>
 #include <utility>
 
-namespace pgc {
+namespace pg {
 
-    class MockConnector : public pgc::IConnector {
+    class MockConnector : public pg::IConnector {
     public:
         explicit MockConnector(mock_config config = {}, std::string alias = "pg_mock_connector")
             : config_(std::move(config))
@@ -100,27 +100,27 @@ namespace pgc {
         std::string alias_;
     };
 
-} // namespace pgc
+} // namespace pg
 
 inline auto pg_mock_connector_factory(std::pmr::memory_resource* resource) {
-    return [resource](pgc::connect_params, std::string alias) {
+    return [resource](pg::connect_params, std::string alias) {
         std::cout << "Creating PG MockConnector." << std::endl;
-        return std::make_unique<pgc::MockConnector>(mock_config{.resource = resource}, std::move(alias));
+        return std::make_unique<pg::MockConnector>(mock_config{.resource = resource}, std::move(alias));
     };
 }
 
 inline auto pg_mock_connector_factory_throw(std::pmr::memory_resource* resource) {
-    return [resource](pgc::connect_params, std::string alias) {
+    return [resource](pg::connect_params, std::string alias) {
         std::cout << "Creating PG MockConnector (throw)." << std::endl;
-        return std::make_unique<pgc::MockConnector>(mock_config{.resource = resource, .can_throw = true},
+        return std::make_unique<pg::MockConnector>(mock_config{.resource = resource, .can_throw = true},
                                                     std::move(alias));
     };
 }
 
 inline auto pg_mock_connector_factory_return_empty(std::pmr::memory_resource* resource) {
-    return [resource](pgc::connect_params, std::string alias) {
+    return [resource](pg::connect_params, std::string alias) {
         std::cout << "Creating PG MockConnector (return empty)." << std::endl;
-        return std::make_unique<pgc::MockConnector>(mock_config{.resource = resource, .return_empty = true},
+        return std::make_unique<pg::MockConnector>(mock_config{.resource = resource, .return_empty = true},
                                                     std::move(alias));
     };
 }

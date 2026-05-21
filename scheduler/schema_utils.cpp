@@ -55,6 +55,16 @@ namespace schema_utils {
         , schema_(std::move(schema))
         , agg_node_(new components::logical_plan::node_aggregate_t(std::move(agg_node))) {}
 
+    schema_node_t::schema_node_t(std::pmr::memory_resource* resource,
+                                 const collection_full_name_t& name,
+                                 std::string raw_sql,
+                                 std::vector<otterstax::parser::qualifier_rewrite_t> qualifiers)
+        : logical_plan::node_t(resource, logical_plan::node_type::unused, name)
+        , schema_()
+        , agg_node_(new logical_plan::node_aggregate_t(resource, name))
+        , raw_sql_(std::move(raw_sql))
+        , qualifiers_(std::move(qualifiers)) {}
+
     const complex_logical_type& schema_node_t::schema() const { return schema_; }
 
     const components::logical_plan::node_aggregate_ptr schema_node_t::agg_node() { return agg_node_; }
@@ -69,6 +79,13 @@ namespace schema_utils {
                                      complex_logical_type&& schema,
                                      logical_plan::node_aggregate_t&& agg_node) {
         return {new schema_node_t(name, std::move(schema), std::move(agg_node))};
+    }
+
+    node_schema_ptr make_node_schema_raw(std::pmr::memory_resource* resource,
+                                         const collection_full_name_t& name,
+                                         std::string raw_sql,
+                                         std::vector<otterstax::parser::qualifier_rewrite_t> qualifiers) {
+        return {new schema_node_t(resource, name, std::move(raw_sql), std::move(qualifiers))};
     }
 
     complex_logical_type aggregate_filter_schema(const logical_plan::node_aggregate_t& node,

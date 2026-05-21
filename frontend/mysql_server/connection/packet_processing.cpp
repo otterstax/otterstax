@@ -198,13 +198,7 @@ namespace frontend::mysql {
 
         switch (shared_data->status()) {
             case cv_wrapper::Status::Ok:
-                if (!sdata_result.chunk.empty()) {
-                    break;
-                }
-                // fallthrough otherwise
-            case cv_wrapper::Status::Empty:
-                send_packet(build_ok(writer_, sequence_id_, 0));
-                return;
+                break;
             case cv_wrapper::Status::Timeout:
             case cv_wrapper::Status::Unknown:
                 send_error(mysql_error::ER_QUERY_TIMEOUT, "Query exceeded execution limit");
@@ -217,6 +211,11 @@ namespace frontend::mysql {
 
         // handle Ok
         // empty db & table in metadata (not critical, but may be improved)
+        if (sdata_result.chunk.column_count() == 0) {
+            send_packet(build_ok(writer_, sequence_id_, sdata_result.chunk.size()));
+            return;
+        }
+
         mysql_resultset result(writer_, result_encoding::TEXT);
         result.add_chunk_columns(sdata_result.chunk);
         for (size_t i = 0; i < sdata_result.chunk.size(); i++) {
@@ -288,7 +287,6 @@ namespace frontend::mysql {
 
         switch (shared_data->status()) {
             case cv_wrapper::Status::Ok:
-            case cv_wrapper::Status::Empty:
                 break;
             case cv_wrapper::Status::Timeout:
             case cv_wrapper::Status::Unknown:
@@ -488,13 +486,7 @@ namespace frontend::mysql {
 
         switch (shared_data->status()) {
             case cv_wrapper::Status::Ok:
-                if (!sdata_result.chunk.empty()) {
-                    break;
-                }
-                // fallthrough otherwise
-            case cv_wrapper::Status::Empty:
-                send_packet(build_ok(writer_, sequence_id_, 0));
-                return;
+                break;
             case cv_wrapper::Status::Timeout:
             case cv_wrapper::Status::Unknown:
                 send_error(mysql_error::ER_QUERY_TIMEOUT, "Query exceeded execution limit");
@@ -502,6 +494,11 @@ namespace frontend::mysql {
             case cv_wrapper::Status::Error:
                 send_error(mysql_error::ER_SYNTAX_ERROR, shared_data->error_message());
                 return;
+        }
+
+        if (sdata_result.chunk.column_count() == 0) {
+            send_packet(build_ok(writer_, sequence_id_, sdata_result.chunk.size()));
+            return;
         }
 
         mysql_resultset result(writer_, result_encoding::BINARY);

@@ -9,11 +9,11 @@
 #include <string>
 #include <thread>
 
-namespace mysql = boost::mysql;
+namespace bm = boost::mysql;
 namespace asio = boost::asio;
 
-namespace mysqlc {
-    Connector::Connector(asio::io_context& io_ctx, mysql::connect_params params, std::string alias)
+namespace mysql {
+    Connector::Connector(asio::io_context& io_ctx, bm::connect_params params, std::string alias)
         : log_(get_logger(logger_tag::CONNECTOR))
         , conn_(io_ctx)
         , params_{std::move(params)}
@@ -22,7 +22,7 @@ namespace mysqlc {
         assert(log_.is_valid());
     }
 
-    mysql::connect_params Connector::params() const noexcept { return params_; }
+    bm::connect_params Connector::params() const noexcept { return params_; }
 
     Status Connector::status() const noexcept { return status_; }
 
@@ -38,7 +38,7 @@ namespace mysqlc {
     Connector::~Connector() { close(); }
 
     void Connector::connect() {
-        conn_.set_meta_mode(mysql::metadata_mode::full);
+        conn_.set_meta_mode(bm::metadata_mode::full);
         boost::system::error_code ec;
         boost::mysql::diagnostics diag;
         conn_.connect(params_, ec, diag);
@@ -96,4 +96,4 @@ namespace mysqlc {
 
     bool Connector::isClosed() const noexcept { return status_ == Status::Closed; }
     std::string Connector::alias() const noexcept { return alias_; }
-} // namespace mysqlc
+} // namespace mysql

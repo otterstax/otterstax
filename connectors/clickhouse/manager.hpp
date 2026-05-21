@@ -18,20 +18,20 @@
 #include <thread>
 #include <unordered_map>
 
-#include "connectors/http_server/ch_connection_config.hpp"
+#include "connectors/api_connections/ch_connection_config.hpp"
 #include "utility/cv_wrapper.hpp"
 #include "utility/thread_pool_manager.hpp"
 
 #include <components/expressions/compare_expression.hpp>
 
-namespace chc {
+namespace ch {
 
     namespace asio = boost::asio;
     using asio::awaitable;
     using asio::co_spawn;
     using asio::use_awaitable;
 
-    std::unique_ptr<chc::IConnector> make_ch_connector(connect_params params, std::string alias);
+    std::unique_ptr<ch::IConnector> make_ch_connector(connect_params params, std::string alias);
 
     class ConnectorManager {
     public:
@@ -74,6 +74,11 @@ namespace chc {
         std::optional<connect_params> conn_params(const std::string& uuid) const;
         bool hasConnection(const std::string& uuid) const noexcept;
 
+        void fetch_named_types(const std::string& uuid, const std::string& database, const std::string& table);
+
+        std::unordered_map<std::string, std::string> named_types_for(const std::string& uuid,
+                                                                     const std::string& table) const;
+
     private:
         void notify_connection_removed(const std::string& uuid);
 
@@ -81,6 +86,9 @@ namespace chc {
         thread_pool_manager thread_pool_manager_;
         actor_zeta::address_t catalog_manager_;
         connector_factory make_connector_;
-        std::unordered_map<std::string, std::unique_ptr<chc::IConnector>> connections_;
+        std::unordered_map<std::string, std::unique_ptr<ch::IConnector>> connections_;
+        // uuid → table → column → named-type-string (e.g. "Tuple(channel String, ...)").
+        std::unordered_map<std::string, std::unordered_map<std::string, std::unordered_map<std::string, std::string>>>
+            named_types_;
     };
-} // namespace chc
+} // namespace ch

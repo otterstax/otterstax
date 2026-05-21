@@ -79,15 +79,7 @@ namespace frontend::postgres {
 
         switch (shared_data->status()) {
             case cv_wrapper::Status::Ok:
-                if (!sdata_result.chunk.empty()) {
-                    break;
-                }
-                // fallthrough otherwise
-            case cv_wrapper::Status::Empty:
-                send_packet_merged(
-                    {build_command_complete(writer_, command_complete_tag::simple_command(sdata_result.tag)),
-                     build_ready_for_query(writer_, transaction_man_.get_transaction_status())});
-                return;
+                break;
             case cv_wrapper::Status::Timeout:
             case cv_wrapper::Status::Unknown:
                 send_error_response(sql_state::QUERY_CANCELED, "Query exceeded execution limit");
@@ -101,14 +93,17 @@ namespace frontend::postgres {
 
         // handle Ok
         int32_t rows_cnt = sdata_result.chunk.size();
-        postgres_resultset result(writer_);
-        result.add_chunk_columns(sdata_result.chunk); // default text encoding
-        for (size_t i = 0; i < rows_cnt; i++) {
-            result.add_row(sdata_result.chunk, i);
+        std::vector<std::vector<uint8_t>> response;
+        if (sdata_result.chunk.column_count() > 0) {
+            postgres_resultset result(writer_);
+            result.add_chunk_columns(sdata_result.chunk); // default text encoding
+            for (size_t i = 0; i < rows_cnt; i++) {
+                result.add_row(sdata_result.chunk, i);
+            }
+            response = postgres_resultset::build_packets(std::move(result));
         }
-
-        auto response = postgres_resultset::build_packets(std::move(result));
-        response.emplace_back(build_command_complete(writer_, command_complete_tag::select(rows_cnt)));
+        response.emplace_back(
+            build_command_complete(writer_, command_complete_tag::simple_command(sdata_result.tag, rows_cnt)));
         response.emplace_back(build_ready_for_query(writer_, transaction_man_.get_transaction_status()));
         send_packet_merged(std::move(response));
     }
@@ -199,7 +194,6 @@ namespace frontend::postgres {
 
         switch (shared_data->status()) {
             case cv_wrapper::Status::Ok:
-            case cv_wrapper::Status::Empty:
                 break;
             case cv_wrapper::Status::Timeout:
             case cv_wrapper::Status::Unknown:
@@ -448,13 +442,7 @@ namespace frontend::postgres {
 
         switch (shared_data->status()) {
             case cv_wrapper::Status::Ok:
-                if (!sdata_result.chunk.empty()) {
-                    break;
-                }
-                // fallthrough otherwise
-            case cv_wrapper::Status::Empty:
-                send_packet(build_command_complete(writer_, command_complete_tag::simple_command(sdata_result.tag)));
-                return;
+                break;
             case cv_wrapper::Status::Timeout:
             case cv_wrapper::Status::Unknown:
                 send_error_response(sql_state::QUERY_CANCELED, "Query exceeded execution limit");
@@ -470,18 +458,21 @@ namespace frontend::postgres {
             rows_cnt = std::min(static_cast<size_t>(limit), sdata_result.chunk.size());
         }
 
-        postgres_resultset result(writer_, stmt.is_schema_known_);
-        if (!stmt.is_schema_known_) {
-            result.add_chunk_columns(sdata_result.chunk);
-        }
-        result.add_encoding(stmt.format);
+        std::vector<std::vector<uint8_t>> response;
+        if (sdata_result.chunk.column_count() > 0) {
+            postgres_resultset result(writer_, stmt.is_schema_known_);
+            if (!stmt.is_schema_known_) {
+                result.add_chunk_columns(sdata_result.chunk);
+            }
+            result.add_encoding(stmt.format);
 
-        for (size_t i = 0; i < rows_cnt; i++) {
-            result.add_row(sdata_result.chunk, i);
+            for (size_t i = 0; i < rows_cnt; i++) {
+                result.add_row(sdata_result.chunk, i);
+            }
+            response = postgres_resultset::build_packets(std::move(result));
         }
-
-        auto response = postgres_resultset::build_packets(std::move(result));
-        response.emplace_back(build_command_complete(writer_, command_complete_tag::select(rows_cnt)));
+        response.emplace_back(
+            build_command_complete(writer_, command_complete_tag::simple_command(sdata_result.tag, rows_cnt)));
         send_packet_merged(std::move(response));
     }
 

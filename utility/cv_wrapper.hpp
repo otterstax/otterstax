@@ -17,7 +17,6 @@ namespace cv_wrapper {
     enum class Status : uint8_t
     {
         Ok,
-        Empty,
         Timeout,
         Error,
         Unknown
@@ -64,15 +63,6 @@ namespace cv_wrapper {
                 std::unique_lock<std::mutex> lock(m_);
                 error_ = std::move(error_msg);
                 status_.store(Status::Error);
-                ready_.store(true);
-            }
-            cv_.notify_one();
-        }
-
-        void release_empty() {
-            {
-                std::unique_lock<std::mutex> lock(m_);
-                status_.store(Status::Empty);
                 ready_.store(true);
             }
             cv_.notify_one();

@@ -6,7 +6,7 @@
 #include <string>
 #include <cstdint>
 
-namespace chc {
+namespace ch {
 
     enum class Status
     {
@@ -29,4 +29,4 @@ namespace chc {
         uint32_t max_reconnect_attempts{3};
     };
 
-} // namespace chc
+} // namespace ch

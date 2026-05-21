@@ -1,0 +1,10 @@
+{
+    "alias": "pg",
+    "host": "demo-postgres",
+    "port": "5432",
+    "username": "demo",
+    "password": "demo",
+    "database": "shop",
+    "schema": "shop",
+    "table": ""
+}

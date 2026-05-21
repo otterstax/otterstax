@@ -1,3 +1,0 @@
-INSERT INTO campaigns.db1.schema.temp_table (temp_int)
-SELECT * FROM campaigns.db1.schema.temp_table
-WHERE temp_int = 1000;

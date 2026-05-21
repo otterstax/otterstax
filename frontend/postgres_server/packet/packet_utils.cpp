@@ -20,7 +20,7 @@ namespace frontend::postgres {
     command_complete_tag::command_complete_tag(std::string tag)
         : tag(std::move(tag)) {}
 
-    command_complete_tag command_complete_tag::simple_command(NodeTag node) {
+    command_complete_tag command_complete_tag::simple_command(NodeTag node, int32_t rows) {
         switch (node) {
             case T_CreateStmt:
                 return {"CREATE TABLE"};
@@ -33,13 +33,13 @@ namespace frontend::postgres {
             case T_IndexStmt:
                 return {"CREATE INDEX"};
             case T_SelectStmt:
-                return select();
+                return select(rows);
             case T_UpdateStmt:
-                return update();
+                return update(rows);
             case T_InsertStmt:
-                return insert();
+                return insert(rows);
             case T_DeleteStmt:
-                return delete_rows();
+                return delete_rows(rows);
             case T_DropStmt:
                 return {"DROP"};
             default:

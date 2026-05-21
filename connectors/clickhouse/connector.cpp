@@ -9,7 +9,7 @@
 #include <string>
 #include <thread>
 
-namespace chc {
+namespace ch {
 
     Connector::Connector(connect_params params, std::string alias)
         : log_(get_logger(logger_tag::CONNECTOR))
@@ -121,4 +121,4 @@ namespace chc {
     bool Connector::isClosed() const noexcept { return status_ == Status::Closed; }
     std::string Connector::alias() const noexcept { return alias_; }
 
-} // namespace chc
+} // namespace ch

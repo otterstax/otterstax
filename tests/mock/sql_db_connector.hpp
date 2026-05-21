@@ -16,9 +16,9 @@
 #include <memory>
 #include <utility>
 
-namespace mysqlc {
+namespace mysql {
 
-    class MockConnector : public mysqlc::IConnector {
+    class MockConnector : public mysql::IConnector {
     public:
         explicit MockConnector(mock_config config = {}, std::string alias = "mock_connector")
             : config_(std::move(config))
@@ -31,9 +31,9 @@ namespace mysqlc {
             std::cout << "alias: " << alias_ << std::endl;
         }
 
-        mysqlc::Status status() const noexcept override { return mysqlc::Status::Connected; }
+        mysql::Status status() const noexcept override { return mysql::Status::Connected; }
 
-        mysql::connect_params params() const noexcept override { return mysql::connect_params{}; }
+        bm::connect_params params() const noexcept override { return bm::connect_params{}; }
 
         void close() override { std::cout << "MockConnector closed." << std::endl; }
 
@@ -106,19 +106,19 @@ namespace mysqlc {
         std::string alias_;
     };
 
-} // namespace mysqlc
+} // namespace mysql
 
 inline auto mysql_mock_connector_factory(std::pmr::memory_resource* resource) {
     return [resource](boost::asio::io_context& io_ctx, boost::mysql::connect_params, std::string alias) {
         std::cout << "Creating MockConnector." << std::endl;
-        return std::make_unique<mysqlc::MockConnector>(mock_config{.resource = resource}, std::move(alias));
+        return std::make_unique<mysql::MockConnector>(mock_config{.resource = resource}, std::move(alias));
     };
 }
 
 inline auto mysql_mock_connector_factory_throw(std::pmr::memory_resource* resource) {
     return [resource](boost::asio::io_context& io_ctx, boost::mysql::connect_params, std::string alias) {
         std::cout << "Creating MockConnector." << std::endl;
-        return std::make_unique<mysqlc::MockConnector>(mock_config{.resource = resource, .can_throw = true},
+        return std::make_unique<mysql::MockConnector>(mock_config{.resource = resource, .can_throw = true},
                                                        std::move(alias));
     };
 }
@@ -126,7 +126,7 @@ inline auto mysql_mock_connector_factory_throw(std::pmr::memory_resource* resour
 inline auto mysql_mock_connector_factory_return_empty(std::pmr::memory_resource* resource) {
     return [resource](boost::asio::io_context& io_ctx, boost::mysql::connect_params, std::string alias) {
         std::cout << "Creating MockConnector." << std::endl;
-        return std::make_unique<mysqlc::MockConnector>(mock_config{.resource = resource, .return_empty = true},
+        return std::make_unique<mysql::MockConnector>(mock_config{.resource = resource, .return_empty = true},
                                                        std::move(alias));
     };
 }

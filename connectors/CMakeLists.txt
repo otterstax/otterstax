@@ -7,9 +7,9 @@ set(CONNECTORS_HEADERS
     clickhouse/types.hpp
     clickhouse/connector.hpp
     clickhouse/manager.hpp
-    http_server/connection_server.hpp
-    http_server/pg_connection_config.hpp
-    http_server/ch_connection_config.hpp
+    api_connections/connection_server.hpp
+    api_connections/pg_connection_config.hpp
+    api_connections/ch_connection_config.hpp
 )
 
 set(CONNECTORS_SOURCES
@@ -19,7 +19,7 @@ set(CONNECTORS_SOURCES
     postgresql/manager.cpp
     clickhouse/connector.cpp
     clickhouse/manager.cpp
-    http_server/connection_server.cpp
+    api_connections/connection_server.cpp
 )
 
 add_library(connectors

@@ -6,7 +6,7 @@
 #include <string>
 #include <cstdint>
 
-namespace pgc {
+namespace pg {
 
     enum class Status
     {
@@ -39,4 +39,4 @@ namespace pgc {
         }
     };
 
-} // namespace pgc
+} // namespace pg

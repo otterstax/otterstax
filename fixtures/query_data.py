@@ -55,7 +55,7 @@ def setup_connections(use_devcon=False):
 
     Args:
         use_devcon: If True, use Docker container connection settings
-                   (matches examples/example_connetion/connection_maria_db*.json)
+                   (matches examples/simple/example_connetion/connection_maria_db*.json)
                    If False, use localhost connections for direct access
     """
     global CAMPAIGNS_DB_HOST, CAMPAIGNS_DB_PORT
@@ -65,11 +65,11 @@ def setup_connections(use_devcon=False):
 
     if use_devcon:
         # Docker container connections (as used in docker-compose)
-        # Matches: examples/example_connetion/connection_maria_db1.json
+        # Matches: examples/simple/example_connetion/connection_maria_db1.json
         CAMPAIGNS_DB_HOST = "mariadb1"
         CAMPAIGNS_DB_PORT = 3306
 
-        # Matches: examples/example_connetion/connection_maria_db2.json
+        # Matches: examples/simple/example_connetion/connection_maria_db2.json
         IMPRESSIONS_DB_HOST = "mariadb2"
         IMPRESSIONS_DB_PORT = 3306
 
@@ -310,7 +310,7 @@ def main():
         "--devcon",
         action="store_true",
         help="Use Docker container connection settings (mariadb1:3306, mariadb2:3306, postgres1:5432, clickhouse1:9000) "
-             "as defined in examples/example_connetion/connection_maria_db*.json"
+             "as defined in examples/simple/example_connetion/connection_maria_db*.json"
     )
     args = parser.parse_args()
 

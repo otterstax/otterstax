@@ -1,0 +1,9 @@
+{
+    "alias": "ch",
+    "host": "localhost",
+    "port": "3204",
+    "username": "demo",
+    "password": "demo",
+    "database": "ev",
+    "table": ""
+}

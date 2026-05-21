@@ -427,6 +427,7 @@ conaninfo.txt
 
 # AI
 .qwen/
+.claude/settings.local.json
 
 # Local configuration
 app_data/

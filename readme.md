@@ -61,14 +61,13 @@ docker compose up
 3. (Optional) Add example database connections used by clients:
 
 ```bash
-cd client_example/example_connetion
-./add_connections_maria_db.sh
+examples/simple/example_connetion/add_connections.sh
 ```
 
 4. Run example queries using the Python client:
 
 ```bash
-python client_example/client.py example_1.txt
+python examples/simple/flight_sql_example.py examples/simple/example_1.txt
 ```
 
 ### Building from Source
@@ -144,7 +143,7 @@ otterstax/
 ├── routes/             # Query routing
 ├── scheduler/          # Query scheduling
 ├── tests/              # Tests (integration/unit)
-├── client_example/     # Python client and examples
+├── examples/          # Demo stack (examples/demo/) + simple client examples (examples/simple/)
 └── fixtures/           # Test data generation
 ```
 

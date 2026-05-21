@@ -13,32 +13,32 @@ ComponentManager::ComponentManager(const configuration::config& config)
     // To test otterbrix create some tables
     assert(resource_ != nullptr && "memory resource must not be null");
 
-    catalog_manager_ = actor_zeta::spawn<mysqlc::CatalogManager>(resource_);
+    catalog_manager_ = actor_zeta::spawn<mysql::CatalogManager>(resource_);
     assert(catalog_manager_ != nullptr && "catalog manager must not be null");
 
-    db_connector_manager_ = std::make_shared<mysqlc::ConnectorManager>(catalog_manager_->address());
+    db_connector_manager_ = std::make_shared<mysql::ConnectorManager>(catalog_manager_->address());
     catalog_manager_->set_mysql_connector_manager(db_connector_manager_); // cyclic dependency
 
-    pg_connector_manager_ = std::make_shared<pgc::ConnectorManager>(catalog_manager_->address());
+    pg_connector_manager_ = std::make_shared<pg::ConnectorManager>(catalog_manager_->address());
     catalog_manager_->set_pg_connector_manager(pg_connector_manager_);
 
-    ch_connector_manager_ = std::make_shared<chc::ConnectorManager>(catalog_manager_->address());
+    ch_connector_manager_ = std::make_shared<ch::ConnectorManager>(catalog_manager_->address());
     catalog_manager_->set_ch_connector_manager(ch_connector_manager_);
 
     otterbrix_manager_ =
-        actor_zeta::spawn<db_conn::OtterbrixManager>(resource_, make_otterbrix_manager(otterbrix_));
+        actor_zeta::spawn<db::OtterbrixManager>(resource_, make_otterbrix_manager(otterbrix_));
     assert(otterbrix_manager_ != nullptr && "otterbrix manager must not be null");
 
     sql_connection_manager_ =
-        actor_zeta::spawn<db_conn::SqlConnectionManager>(resource_, db_connector_manager_);
+        actor_zeta::spawn<db::MySQLManager>(resource_, db_connector_manager_);
     assert(sql_connection_manager_ != nullptr && "sql connection manager must not be null");
 
     pg_connection_manager_ =
-        actor_zeta::spawn<db_conn::PgConnectionManager>(resource_, pg_connector_manager_);
+        actor_zeta::spawn<db::PostgressManager>(resource_, pg_connector_manager_);
     assert(pg_connection_manager_ != nullptr && "pg connection manager must not be null");
 
     ch_connection_manager_actor_ =
-        actor_zeta::spawn<db_conn::ChConnectionManager>(resource_, ch_connector_manager_);
+        actor_zeta::spawn<db::ClickhouseManager>(resource_, ch_connector_manager_);
     assert(ch_connection_manager_actor_ != nullptr && "ch connection manager must not be null");
 
     scheduler_ = actor_zeta::spawn<Scheduler>(resource_,
@@ -64,11 +64,11 @@ std::pmr::memory_resource* ComponentManager::getResource() {
 
 std::string ComponentManager::getLogPath() { return log_path_; }
 
-std::shared_ptr<mysqlc::ConnectorManager> ComponentManager::db_connection_manager() const { return db_connector_manager_; }
+std::shared_ptr<mysql::ConnectorManager> ComponentManager::db_connection_manager() const { return db_connector_manager_; }
 
-std::shared_ptr<pgc::ConnectorManager> ComponentManager::pg_connection_manager() const { return pg_connector_manager_; }
+std::shared_ptr<pg::ConnectorManager> ComponentManager::pg_connection_manager() const { return pg_connector_manager_; }
 
-std::shared_ptr<chc::ConnectorManager> ComponentManager::ch_connection_manager() const { return ch_connector_manager_; }
+std::shared_ptr<ch::ConnectorManager> ComponentManager::ch_connection_manager() const { return ch_connector_manager_; }
 
 actor_zeta::address_t ComponentManager::scheduler_address() const { return scheduler_->address(); }
 

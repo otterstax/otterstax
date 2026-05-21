@@ -4,10 +4,10 @@
 #include "scheduler.hpp"
 
 #include "catalog/catalog_manager.hpp"
-#include "db_integration/clickhouse/connection_manager.hpp"
-#include "db_integration/otterbrix/otterbrix_manager.hpp"
-#include "db_integration/postgresql/connection_manager.hpp"
-#include "db_integration/sql/connection_manager.hpp"
+#include "integration/clickhouse/connection_manager.hpp"
+#include "integration/otterbrix/otterbrix_manager.hpp"
+#include "integration/postgresql/connection_manager.hpp"
+#include "integration/sql/connection_manager.hpp"
 #include "utility/logger.hpp"
 #include "utility/timer.hpp"
 
@@ -96,7 +96,7 @@ actor_zeta::unique_future<void> Scheduler::execute(session_hash_t id, shared_ses
         if (has_external_nodes && get_backend_type(id) == backend_type_t::Unknown) {
             log_->debug("execute: has external nodes, routing to catalog_manager");
             auto [needs_sched_catalog, catalog_future] =
-                actor_zeta::send(catalog_manager_, &mysqlc::CatalogManager::update_backend_type, id, std::move(data));
+                actor_zeta::send(catalog_manager_, &mysql::CatalogManager::update_backend_type, id, std::move(data));
             auto catalog_result = co_await std::move(catalog_future);
 
             if (catalog_result.has_error()) {
@@ -105,6 +105,7 @@ actor_zeta::unique_future<void> Scheduler::execute(session_hash_t id, shared_ses
             }
             update_metadata(id, catalog_result.take_store());
         } else {
+            data->backend_type = backend_type_t::Otterbrix;
             update_metadata(id, std::move(data));
         }
 
@@ -128,7 +129,7 @@ actor_zeta::unique_future<void> Scheduler::execute(session_hash_t id, shared_ses
         if (backend == backend_type_t::MySQL || backend == backend_type_t::Mixed) {
             log_->debug("execute: sending to sql_connection_manager");
             auto [needs_sched_sql, sql_future] = actor_zeta::send(sql_connection_manager_,
-                                                                  &db_conn::SqlConnectionManager::execute,
+                                                                  &db::MySQLManager::execute,
                                                                   id,
                                                                   std::move(data_ptr));
             auto sql_result = co_await std::move(sql_future);
@@ -141,7 +142,7 @@ actor_zeta::unique_future<void> Scheduler::execute(session_hash_t id, shared_ses
             if (backend == backend_type_t::Mixed) {
                 log_->debug("execute: Mixed backend, forwarding to pg_connection_manager");
                 auto [needs_sched_pg, pg_future] = actor_zeta::send(pg_connection_manager_,
-                                                                    &db_conn::PgConnectionManager::execute,
+                                                                    &db::PostgressManager::execute,
                                                                     id,
                                                                     std::move(data_ptr));
                 auto pg_result = co_await std::move(pg_future);
@@ -153,7 +154,7 @@ actor_zeta::unique_future<void> Scheduler::execute(session_hash_t id, shared_ses
 
                 log_->debug("execute: Mixed backend, forwarding to ch_connection_manager");
                 auto [needs_sched_ch, ch_future] = actor_zeta::send(ch_connection_manager_,
-                                                                    &db_conn::ChConnectionManager::execute,
+                                                                    &db::ClickhouseManager::execute,
                                                                     id,
                                                                     std::move(data_ptr));
                 auto ch_result = co_await std::move(ch_future);
@@ -166,7 +167,7 @@ actor_zeta::unique_future<void> Scheduler::execute(session_hash_t id, shared_ses
         } else if (backend == backend_type_t::PostgreSQL) {
             log_->debug("execute: sending to pg_connection_manager");
             auto [needs_sched_pg, pg_future] = actor_zeta::send(pg_connection_manager_,
-                                                                &db_conn::PgConnectionManager::execute,
+                                                                &db::PostgressManager::execute,
                                                                 id,
                                                                 std::move(data_ptr));
             auto pg_result = co_await std::move(pg_future);
@@ -178,7 +179,7 @@ actor_zeta::unique_future<void> Scheduler::execute(session_hash_t id, shared_ses
         } else if (backend == backend_type_t::ClickHouse) {
             log_->debug("execute: sending to ch_connection_manager");
             auto [needs_sched_ch, ch_future] = actor_zeta::send(ch_connection_manager_,
-                                                                &db_conn::ChConnectionManager::execute,
+                                                                &db::ClickhouseManager::execute,
                                                                 id,
                                                                 std::move(data_ptr));
             auto ch_result = co_await std::move(ch_future);
@@ -193,7 +194,7 @@ actor_zeta::unique_future<void> Scheduler::execute(session_hash_t id, shared_ses
         if (backend != backend_type_t::Otterbrix) {
             log_->debug("execute: sending to otterbrix_manager");
             auto [needs_sched_otterbrix, otterbrix_future] = actor_zeta::send(otterbrix_manager_,
-                                                                              &db_conn::OtterbrixManager::execute,
+                                                                              &db::OtterbrixManager::execute,
                                                                               id,
                                                                               std::move(data_ptr->otterbrix_params));
             auto cursor = co_await std::move(otterbrix_future);
@@ -202,12 +203,6 @@ actor_zeta::unique_future<void> Scheduler::execute(session_hash_t id, shared_ses
                 std::string error_msg = "Otterbrix execution failed: " + std::string{cursor->get_error().what.c_str()};
                 log_->error(error_msg);
                 complete_session_on_error(id, std::move(error_msg));
-                co_return;
-            }
-
-            if (cursor->size() == 0) {
-                log_->debug("execute: Otterbrix returned empty result");
-                complete_session(id);
                 co_return;
             }
 
@@ -220,7 +215,7 @@ actor_zeta::unique_future<void> Scheduler::execute(session_hash_t id, shared_ses
             // Pure otterbrix path — execute directly
             log_->debug("execute: sending to otterbrix_manager (pure otterbrix)");
             auto [needs_sched_otterbrix, otterbrix_future] = actor_zeta::send(otterbrix_manager_,
-                                                                              &db_conn::OtterbrixManager::execute,
+                                                                              &db::OtterbrixManager::execute,
                                                                               id,
                                                                               std::move(data_ptr->otterbrix_params));
             auto cursor = co_await std::move(otterbrix_future);
@@ -229,11 +224,6 @@ actor_zeta::unique_future<void> Scheduler::execute(session_hash_t id, shared_ses
                 complete_session_on_error(id,
                                           "Otterbrix execution failed: " +
                                               std::string{cursor->get_error().what.c_str()});
-                co_return;
-            }
-
-            if (cursor->size() == 0) {
-                complete_session(id);
                 co_return;
             }
 
@@ -275,7 +265,7 @@ actor_zeta::unique_future<void> Scheduler::execute_statement(session_hash_t id, 
         if (backend_type == backend_type_t::MySQL || backend_type == backend_type_t::Mixed) {
             log_->debug("execute_statement sending to sql_connection_manager");
             auto [needs_sched_sql, sql_future] = actor_zeta::send(sql_connection_manager_,
-                                                                  &db_conn::SqlConnectionManager::execute,
+                                                                  &db::MySQLManager::execute,
                                                                   id,
                                                                   std::move(data_ptr));
             auto sql_result = co_await std::move(sql_future);
@@ -288,7 +278,7 @@ actor_zeta::unique_future<void> Scheduler::execute_statement(session_hash_t id, 
             if (backend_type == backend_type_t::Mixed) {
                 log_->debug("execute_statement: Mixed backend, forwarding to pg_connection_manager");
                 auto [needs_sched_pg, pg_future] = actor_zeta::send(pg_connection_manager_,
-                                                                    &db_conn::PgConnectionManager::execute,
+                                                                    &db::PostgressManager::execute,
                                                                     id,
                                                                     std::move(data_ptr));
                 auto pg_result = co_await std::move(pg_future);
@@ -300,7 +290,7 @@ actor_zeta::unique_future<void> Scheduler::execute_statement(session_hash_t id, 
 
                 log_->debug("execute_statement: Mixed backend, forwarding to ch_connection_manager");
                 auto [needs_sched_ch, ch_future] = actor_zeta::send(ch_connection_manager_,
-                                                                    &db_conn::ChConnectionManager::execute,
+                                                                    &db::ClickhouseManager::execute,
                                                                     id,
                                                                     std::move(data_ptr));
                 auto ch_result = co_await std::move(ch_future);
@@ -313,7 +303,7 @@ actor_zeta::unique_future<void> Scheduler::execute_statement(session_hash_t id, 
         } else if (backend_type == backend_type_t::PostgreSQL) {
             log_->debug("execute_statement sending to pg_connection_manager");
             auto [needs_sched_pg, pg_future] = actor_zeta::send(pg_connection_manager_,
-                                                                &db_conn::PgConnectionManager::execute,
+                                                                &db::PostgressManager::execute,
                                                                 id,
                                                                 std::move(data_ptr));
             auto pg_result = co_await std::move(pg_future);
@@ -325,7 +315,7 @@ actor_zeta::unique_future<void> Scheduler::execute_statement(session_hash_t id, 
         } else if (backend_type == backend_type_t::ClickHouse) {
             log_->debug("execute_statement sending to ch_connection_manager");
             auto [needs_sched_ch, ch_future] = actor_zeta::send(ch_connection_manager_,
-                                                                &db_conn::ChConnectionManager::execute,
+                                                                &db::ClickhouseManager::execute,
                                                                 id,
                                                                 std::move(data_ptr));
             auto ch_result = co_await std::move(ch_future);
@@ -339,7 +329,7 @@ actor_zeta::unique_future<void> Scheduler::execute_statement(session_hash_t id, 
         // Send to otterbrix
         log_->debug("execute_statement sending to otterbrix_manager");
         auto [needs_sched_otterbrix, otterbrix_future] = actor_zeta::send(otterbrix_manager_,
-                                                                          &db_conn::OtterbrixManager::execute,
+                                                                          &db::OtterbrixManager::execute,
                                                                           id,
                                                                           std::move(data_ptr->otterbrix_params));
         auto cursor = co_await std::move(otterbrix_future);
@@ -347,11 +337,6 @@ actor_zeta::unique_future<void> Scheduler::execute_statement(session_hash_t id, 
         if (!cursor->is_success()) {
             complete_session_on_error(id,
                                       "Otterbrix execution failed: " + std::string{cursor->get_error().what.c_str()});
-            co_return;
-        }
-
-        if (cursor->size() == 0) {
-            complete_session(id);
             co_return;
         }
 
@@ -421,7 +406,7 @@ Scheduler::prepare_schema(session_hash_t id, shared_session_payload sdata, std::
             // Step 1: get catalog schema (replaces send to catalog + get_catalog_schema_finish callback)
             log_->debug("prepare_schema: has external nodes, routing to catalog_manager");
             auto [needs_sched_catalog, catalog_future] = actor_zeta::send(catalog_manager_,
-                                                                          &mysqlc::CatalogManager::get_catalog_schema,
+                                                                          &mysql::CatalogManager::get_catalog_schema,
                                                                           id,
                                                                           std::move(parsed_data));
             auto catalog_result = co_await std::move(catalog_future);
@@ -462,7 +447,7 @@ Scheduler::prepare_schema(session_hash_t id, shared_session_payload sdata, std::
 
             // Step 3: get otterbrix schema (replaces send to otterbrix + get_otterbrix_schema_finish callback)
             auto [needs_sched_schema, schema_future] = actor_zeta::send(otterbrix_manager_,
-                                                                        &db_conn::OtterbrixManager::get_schema,
+                                                                        &db::OtterbrixManager::get_schema,
                                                                         id,
                                                                         std::move(dependencies),
                                                                         std::move(data));
@@ -536,21 +521,6 @@ backend_type_t Scheduler::get_backend_type(session_hash_t id) const {
         return it->second.backend_type;
     }
     return backend_type_t::Unknown;
-}
-
-void Scheduler::complete_session(session_hash_t id) {
-    std::lock_guard<std::mutex> lock(data_map_mtx_);
-    log_->trace("Scheduler::complete_session empty start");
-
-    metadata_map_.erase(id);
-    if (auto it = shared_data_map_.find(id); it != shared_data_map_.end()) {
-        if (auto sdata = it->second; sdata->status() == cv_wrapper::Status::Unknown) {
-            log_->trace("Scheduler::complete_session updated");
-            sdata->release_empty();
-        }
-    }
-    log_->trace("Scheduler::complete_session empty finish");
-    shared_data_map_.erase(id);
 }
 
 void Scheduler::complete_session(session_hash_t id, session_payload data, flightsql_session_type type) {

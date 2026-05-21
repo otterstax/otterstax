@@ -37,7 +37,7 @@ SELECT * FROM campaigns.db1.schema.campaigns
 JOIN impressions.db2.schema.impressions ON campaigns.id = impressions.id
 ```
 - `campaigns` and `impressions` are **connection aliases** (not databases!)
-- Each alias maps to a registered MySQL connection (see `client_example/example_connetion/*.json`)
+- Each alias maps to a registered MySQL connection (see `examples/simple/example_connetion/*.json`)
 - Register connections via HTTP API: `POST localhost:8085/add_connection` with JSON payload
 
 ### Parser and Query Generation
@@ -52,9 +52,12 @@ JOIN impressions.db2.schema.impressions ON campaigns.id = impressions.id
 # Build with Conan dependencies (see conanfile.py for otterbrix/arrow versions)
 docker compose up           # Runs app + 3 MariaDB instances
 # OR local build:
+# IMPORTANT: if conanfile.py changed, remove the existing build dir first:
+#   rm -rf ./build
 conan install conanfile.py --build missing -s build_type=Release
-cmake .. -DCMAKE_TOOLCHAIN_FILE=build/Release/generators/conan_toolchain.cmake
-cmake --build . -- -j$(nproc)
+cmake -S . -B build/Release \
+  -DCMAKE_TOOLCHAIN_FILE=build/Release/generators/conan_toolchain.cmake
+/usr/local/bin/cmake --build /workspaces/otterstax/build/Release --parallel 5 --
 ```
 
 ### Testing (Critical Setup Steps)
@@ -66,8 +69,8 @@ chmod +x ./docker-run-tests.sh
 # Manual test workflow:
 1. fixtures/generate_data.py          # Creates MariaDB init SQL scripts
 2. docker compose up -d                # Starts services
-3. cd client_example && ./example_connetion/add_connections_maria_db.sh  # Registers connections
-4. python client.py example_1.txt      # Executes federated query
+3. examples/simple/example_connetion/add_connections.sh                  # Registers connections
+4. python examples/simple/flight_sql_example.py examples/simple/example_1.txt  # Executes federated query
 ```
 
 **Testing Anti-Pattern**: Docker volumes (`mariadb*_init`) can lag on cold starts. The test script includes `wait_for_database_init()` with 120-sec timeout - respect this when writing integration tests.

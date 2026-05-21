@@ -9,7 +9,7 @@
 #include <string>
 #include <thread>
 
-namespace pgc {
+namespace pg {
 
     Connector::Connector(connect_params params, std::string alias)
         : log_(get_logger(logger_tag::CONNECTOR))
@@ -108,4 +108,4 @@ namespace pgc {
     bool Connector::isClosed() const noexcept { return status_ == Status::Closed; }
     std::string Connector::alias() const noexcept { return alias_; }
 
-} // namespace pgc
+} // namespace pg

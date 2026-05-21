@@ -3,7 +3,74 @@
 
 #include "resultset_utils.hpp"
 
+#include <components/types/logical_value.hpp>
+
 namespace frontend {
+    namespace {
+        std::string element_to_text(const components::types::logical_value_t& v) {
+            using LT = components::types::logical_type;
+            switch (v.type().type()) {
+                case LT::NA:
+                    return "NULL";
+                case LT::BOOLEAN:
+                    return v.value<bool>() ? "t" : "f";
+                case LT::TINYINT:
+                    return std::to_string(v.value<int8_t>());
+                case LT::UTINYINT:
+                    return std::to_string(v.value<uint8_t>());
+                case LT::SMALLINT:
+                    return std::to_string(v.value<int16_t>());
+                case LT::USMALLINT:
+                    return std::to_string(v.value<uint16_t>());
+                case LT::INTEGER:
+                case LT::ENUM: // ENUM stores its ordinal as INT32
+                    return std::to_string(v.value<int32_t>());
+                case LT::UINTEGER:
+                    return std::to_string(v.value<uint32_t>());
+                case LT::BIGINT:
+                    return std::to_string(v.value<int64_t>());
+                case LT::UBIGINT:
+                    return std::to_string(v.value<uint64_t>());
+                case LT::FLOAT:
+                    return std::to_string(v.value<float>());
+                case LT::DOUBLE:
+                    return std::to_string(v.value<double>());
+                case LT::STRING_LITERAL: {
+                    // postgres array string element: wrap in double-quotes,
+                    // escape backslash and quote inside.
+                    auto sv = v.value<std::string_view>();
+                    std::string out;
+                    out.reserve(sv.size() + 2);
+                    out.push_back('"');
+                    for (char c : sv) {
+                        if (c == '\\' || c == '"') {
+                            out.push_back('\\');
+                        }
+                        out.push_back(c);
+                    }
+                    out.push_back('"');
+                    return out;
+                }
+                case LT::STRUCT: {
+                    // postgres composite literal: (f1,f2,f3)
+                    std::string out;
+                    out.push_back('(');
+                    bool first = true;
+                    for (const auto& child : v.children()) {
+                        if (!first) {
+                            out.push_back(',');
+                        }
+                        first = false;
+                        out += element_to_text(child);
+                    }
+                    out.push_back(')');
+                    return out;
+                }
+                default:
+                    return "";
+            }
+        }
+    } // namespace
     inline constexpr uint8_t MY_BOOLEAN_TEXT_SIZE = 5; // "TRUE" & "FALSE" text length - max 5
     inline constexpr uint8_t PG_BOOLEAN_TEXT_SIZE = 1; //  't' or 'f'
 
@@ -134,6 +201,52 @@ namespace frontend {
                 return std::string(chunk.data[column_index].data<std::string_view>()[row_index]);
             case components::types::logical_type::NA:
                 return {};
+            case components::types::logical_type::ENUM: {
+                auto val = chunk.data[column_index].value(row_index);
+                int32_t ordinal = val.value<int32_t>();
+                auto* ext = static_cast<components::types::enum_logical_type_extension*>(
+                    chunk.data[column_index].type().extension());
+                if (ext) {
+                    const auto& entries = ext->entries();
+                    if (ordinal >= 0 && static_cast<size_t>(ordinal) < entries.size()) {
+                        return entries[ordinal].type().alias();
+                    }
+                }
+                return std::to_string(ordinal);
+            }
+            case components::types::logical_type::ARRAY:
+            case components::types::logical_type::LIST: {
+                // postgres-style array literal {e1,e2,e3}
+                auto val = chunk.data[column_index].value(row_index);
+                std::string out;
+                out.push_back('{');
+                bool first = true;
+                for (const auto& child : val.children()) {
+                    if (!first) {
+                        out.push_back(',');
+                    }
+                    first = false;
+                    out += element_to_text(child);
+                }
+                out.push_back('}');
+                return out;
+            }
+            case components::types::logical_type::STRUCT: {
+                // postgres composite literal (f1,f2,f3)
+                auto val = chunk.data[column_index].value(row_index);
+                std::string out;
+                out.push_back('(');
+                bool first = true;
+                for (const auto& child : val.children()) {
+                    if (!first) {
+                        out.push_back(',');
+                    }
+                    first = false;
+                    out += element_to_text(child);
+                }
+                out.push_back(')');
+                return out;
+            }
             default:
                 throw std::logic_error("Cant add row from logical_type: " + std::to_string(static_cast<uint8_t>(type)));
         }

@@ -38,7 +38,7 @@ RUN conan install conanfile.py --build missing \
 COPY ./catalog ./catalog
 COPY ./config ./config
 COPY ./connectors ./connectors
-COPY ./db_integration ./db_integration
+COPY ./integration ./integration
 COPY ./frontend/ ./frontend
 COPY ./otterbrix ./otterbrix
 COPY ./component_manager ./component_manager

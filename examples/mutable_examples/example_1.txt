@@ -1,1 +1,0 @@
-CREATE TABLE campaigns.db1.schema.temp_table (temp_int int);

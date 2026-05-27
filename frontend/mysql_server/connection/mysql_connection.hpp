@@ -14,9 +14,11 @@
 #include "../packet/packet_writer.hpp"
 #include "../resultset/mysql_resultset.hpp"
 
+#include "frontend/common/asio_future_bridge.hpp"
+#include "scheduler/result.hpp"
 #include "scheduler/scheduler.hpp"
+#include "utility/pipeline_error.hpp"
 #include "utility/session.hpp"
-#include "utility/session_payload.hpp"
 
 #include <actor-zeta.hpp>
 #include <boost/asio.hpp>

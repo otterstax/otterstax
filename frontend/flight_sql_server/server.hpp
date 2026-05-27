@@ -12,7 +12,7 @@
 #include "../../integration/sql/connection_manager.hpp"
 #include "../../otterbrix/config.hpp"
 #include "../../scheduler/scheduler.hpp"
-#include "../../utility/session_payload.hpp"
+#include "../../scheduler/result.hpp"
 #include "../../utility/table_info.hpp"
 
 #include <boost/mysql/results.hpp>

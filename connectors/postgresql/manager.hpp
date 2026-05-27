@@ -20,7 +20,6 @@
 
 #include "connectors/api_connections/pg_connection_config.hpp"
 #include "otterbrix/translators/input/pg_to_chunk.hpp"
-#include "utility/cv_wrapper.hpp"
 #include "utility/thread_pool_manager.hpp"
 
 #include <components/expressions/compare_expression.hpp>

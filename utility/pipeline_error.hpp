@@ -20,6 +20,7 @@ namespace otterstax {
         catalog_error,    // catalog operation failed
         session_error,    // session missing/expired
         bind_error,       // prepared statement parameter binding failed
+        timeout,          // deadline reached while waiting for a future
         internal_error    // unknown/unexpected
     };
 

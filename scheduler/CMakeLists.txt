@@ -1,11 +1,14 @@
 set(SCHEDULER_HEADERS
     scheduler.hpp
     schema_utils.hpp
+    result.hpp
+    worker.hpp
 )
 
 set(SCHEDULER_SOURCES
     scheduler.cpp
     schema_utils.cpp
+    worker.cpp
 )
 
 add_library(scheduler

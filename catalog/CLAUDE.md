@@ -19,7 +19,7 @@ Despite the `mysql::` namespace the class handles all three backend types.
 | `update_backend_type` | Scheduler | Re-classify backend after schema is known |
 | `add_connection_schema` | ComponentManager (at connection registration) | Discover and store schema for a new connection |
 | `remove_connection_schema` | ComponentManager (at connection removal) | Drop cached schema |
-| `get_tables` | FlightSQL frontend | List tables for `GetTables` RPC |
+| `get_tables` | FlightSQL frontend | List tables for `GetTables` RPC; returns `unique_future<otterstax::result<std::pmr::vector<table_info>>>` (no `shared_data` side-channel) |
 
 ## State
 

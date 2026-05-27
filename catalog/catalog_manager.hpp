@@ -14,7 +14,6 @@
 #include "otterbrix/translators/input/mysql_to_complex.hpp"
 #include "otterbrix/translators/input/pg_to_chunk.hpp"
 #include "scheduler/schema_utils.hpp"
-#include "utility/cv_wrapper.hpp"
 #include "utility/pipeline_error.hpp"
 #include "utility/session.hpp"
 #include "utility/table_info.hpp"
@@ -80,8 +79,8 @@ namespace mysql {
 
         actor_zeta::unique_future<void> remove_connection_schema(std::string uuid);
 
-        actor_zeta::unique_future<void> get_tables(arrow::flight::sql::GetTables command,
-                                                   shared_data<std::pmr::vector<table_info>> sdata);
+        actor_zeta::unique_future<otterstax::result<std::pmr::vector<table_info>>>
+        get_tables(arrow::flight::sql::GetTables command);
 
         using dispatch_traits = actor_zeta::dispatch_traits<&CatalogManager::get_catalog_schema,
                                                             &CatalogManager::update_backend_type,

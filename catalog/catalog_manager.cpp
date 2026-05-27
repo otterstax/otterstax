@@ -578,8 +578,8 @@ namespace mysql {
         co_return;
     }
 
-    actor_zeta::unique_future<void> CatalogManager::get_tables(arrow::flight::sql::GetTables command,
-                                                               shared_data<std::pmr::vector<table_info>> sdata) {
+    actor_zeta::unique_future<otterstax::result<std::pmr::vector<table_info>>>
+    CatalogManager::get_tables(arrow::flight::sql::GetTables command) {
         std::pmr::vector<table_info> data(resource());
         std::pmr::vector<catalog::table_id> ids(resource());
 
@@ -632,8 +632,7 @@ namespace mysql {
             }
         }
 
-        sdata->set_result(std::move(data));
-        co_return;
+        co_return otterstax::result<std::pmr::vector<table_info>>{std::move(data)};
     }
 
 } // namespace mysql

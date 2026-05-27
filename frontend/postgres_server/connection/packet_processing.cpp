@@ -71,27 +71,29 @@ namespace frontend::postgres {
     }
 
     void postgres_connection::handle_query(std::string query) {
-        auto shared_data = create_cv_wrapper(session_payload(resource_));
         session_id id;
-        std::ignore = actor_zeta::send(scheduler_, &Scheduler::execute, id.hash(), shared_data, query);
-        shared_data->wait_for(cv_wrapper::DEFAULT_TIMEOUT);
-        auto sdata_result = shared_data->get_result();
+        auto fut = actor_zeta::send(scheduler_, &Scheduler::execute, id.hash(), query).second;
 
-        switch (shared_data->status()) {
-            case cv_wrapper::Status::Ok:
-                break;
-            case cv_wrapper::Status::Timeout:
-            case cv_wrapper::Status::Unknown:
+        otterstax::result<session_payload> r{std::make_unique<session_payload>(resource_)};
+        boost::asio::io_context local;
+        boost::asio::co_spawn(
+            local,
+            [&]() -> boost::asio::awaitable<void> {
+                r = co_await otterstax::await_az_future(std::move(fut), otterstax::DEFAULT_TIMEOUT);
+            },
+            boost::asio::detached);
+        local.run();
+
+        if (r.has_error()) {
+            if (r.error().code == otterstax::error_code_t::timeout) {
                 send_error_response(sql_state::QUERY_CANCELED, "Query exceeded execution limit");
-                return;
-            case cv_wrapper::Status::Error:
-                // may be a transaction block, handle them separately
-                // todo: psycopg2's PREPARE & EXECUTE
-                try_handle_transaction(std::move(query), shared_data->error_message());
-                return;
+            } else {
+                try_handle_transaction(std::move(query), r.error().what);
+            }
+            return;
         }
 
-        // handle Ok
+        auto sdata_result = r.take_value();
         int32_t rows_cnt = sdata_result.chunk.size();
         std::vector<std::vector<uint8_t>> response;
         if (sdata_result.chunk.column_count() > 0) {
@@ -187,24 +189,29 @@ namespace frontend::postgres {
             }
         }
 
-        auto shared_data = create_cv_wrapper(session_payload(resource_));
         session_id id;
-        std::ignore = actor_zeta::send(scheduler_, &Scheduler::prepare_schema, id.hash(), shared_data, query);
-        shared_data->wait_for(cv_wrapper::DEFAULT_TIMEOUT);
+        auto fut = actor_zeta::send(scheduler_, &Scheduler::prepare_schema, id.hash(), query).second;
 
-        switch (shared_data->status()) {
-            case cv_wrapper::Status::Ok:
-                break;
-            case cv_wrapper::Status::Timeout:
-            case cv_wrapper::Status::Unknown:
+        otterstax::result<session_payload> r{std::make_unique<session_payload>(resource_)};
+        boost::asio::io_context local;
+        boost::asio::co_spawn(
+            local,
+            [&]() -> boost::asio::awaitable<void> {
+                r = co_await otterstax::await_az_future(std::move(fut), otterstax::DEFAULT_TIMEOUT);
+            },
+            boost::asio::detached);
+        local.run();
+
+        if (r.has_error()) {
+            if (r.error().code == otterstax::error_code_t::timeout) {
                 send_error_response(sql_state::QUERY_CANCELED, "Query exceeded execution limit");
-                return;
-            case cv_wrapper::Status::Error:
-                send_error_response(sql_state::SYNTAX_ERROR, "Syntax error: " + shared_data->error_message());
-                return;
+            } else {
+                send_error_response(sql_state::SYNTAX_ERROR, "Syntax error: " + r.error().what);
+            }
+            return;
         }
 
-        auto result = shared_data->get_result();
+        auto result = r.take_value();
         log_->debug("[Connection {}] PARSE stmt: query: \"{}\", param_cnt={}",
                     connection_id_,
                     query,
@@ -431,27 +438,32 @@ namespace frontend::postgres {
 
         auto& portal_meta = it->second;
         auto& stmt = portal_meta.statement.get();
-        auto shared_data = create_cv_wrapper(session_payload(resource_));
-        std::ignore = actor_zeta::send(scheduler_,
-                                &Scheduler::execute_prepared_statement,
-                                stmt.stmt_session,
-                                portal_meta.portal,
-                                shared_data);
-        shared_data->wait_for(cv_wrapper::DEFAULT_TIMEOUT);
-        auto sdata_result = shared_data->get_result();
+        auto fut = actor_zeta::send(scheduler_,
+                                    &Scheduler::execute_prepared_statement,
+                                    stmt.stmt_session,
+                                    portal_meta.portal)
+                       .second;
 
-        switch (shared_data->status()) {
-            case cv_wrapper::Status::Ok:
-                break;
-            case cv_wrapper::Status::Timeout:
-            case cv_wrapper::Status::Unknown:
+        otterstax::result<session_payload> r{std::make_unique<session_payload>(resource_)};
+        boost::asio::io_context local;
+        boost::asio::co_spawn(
+            local,
+            [&]() -> boost::asio::awaitable<void> {
+                r = co_await otterstax::await_az_future(std::move(fut), otterstax::DEFAULT_TIMEOUT);
+            },
+            boost::asio::detached);
+        local.run();
+
+        if (r.has_error()) {
+            if (r.error().code == otterstax::error_code_t::timeout) {
                 send_error_response(sql_state::QUERY_CANCELED, "Query exceeded execution limit");
-                return;
-            case cv_wrapper::Status::Error:
-                send_error_response(sql_state::SYNTAX_ERROR, "Syntax error: " + shared_data->error_message());
-                return;
+            } else {
+                send_error_response(sql_state::SYNTAX_ERROR, "Syntax error: " + r.error().what);
+            }
+            return;
         }
 
+        auto sdata_result = r.take_value();
         // TODO: PortalSuspended
         int32_t rows_cnt = sdata_result.chunk.size();
         if (limit != 0) {

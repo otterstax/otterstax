@@ -3,8 +3,6 @@
 
 #pragma once
 
-#include "cv_wrapper.hpp"
-
 #include <components/sql/parser/nodes/nodes.h>
 #include <components/types/types.hpp>
 #include <components/vector/data_chunk.hpp>
@@ -30,5 +28,3 @@ struct session_payload {
         , parameter_count(parameter_count)
         , tag(tag) {}
 };
-
-using shared_session_payload = shared_data<session_payload>;

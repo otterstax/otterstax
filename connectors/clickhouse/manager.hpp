@@ -19,7 +19,6 @@
 #include <unordered_map>
 
 #include "connectors/api_connections/ch_connection_config.hpp"
-#include "utility/cv_wrapper.hpp"
 #include "utility/thread_pool_manager.hpp"
 
 #include <components/expressions/compare_expression.hpp>

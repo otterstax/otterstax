@@ -30,7 +30,10 @@ public:
             std::string error_message =
                 config_.error_message.empty() ? "SimpleMockParser: exception in parse" : config_.error_message;
             std::cout << error_message << std::endl;
-            throw std::runtime_error(error_message);
+            // Conform to the IParser contract: report failures through result<>
+            // (core::error_t) rather than throwing — matches the real parser
+            // (otterbrix/parser/parser.cpp) and the pipeline's "stay on result<>" rule.
+            return core::error_t{core::error_code_t::sql_parse_error, error_message.c_str()};
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(config_.wait_time)); // Simulate some processing delay
 

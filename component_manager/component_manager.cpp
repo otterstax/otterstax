@@ -4,11 +4,18 @@
 #include "component_manager.hpp"
 #include "utility/logger.hpp"
 
+#include <algorithm>
+#include <thread>
+
 ComponentManager::ComponentManager(const configuration::config& config)
     : otterbrix_(otterbrix::make_otterbrix(config))
     , resource_(otterbrix_->dispatcher()->resource())
-    , log_path_(config.log.path.c_str()) {
+    , log_path_(config.log.path.c_str())
+    , az_scheduler_(std::make_unique<actor_zeta::scheduler::sharing_scheduler>(
+          std::max<std::size_t>(2, std::thread::hardware_concurrency()),
+          /*max_throughput*/ 1000)) {
     initialize_all_loggers(log_path_);
+    az_scheduler_->start();
 
     // To test otterbrix create some tables
     assert(resource_ != nullptr && "memory resource must not be null");
@@ -42,12 +49,14 @@ ComponentManager::ComponentManager(const configuration::config& config)
     assert(ch_connection_manager_actor_ != nullptr && "ch connection manager must not be null");
 
     scheduler_ = actor_zeta::spawn<Scheduler>(resource_,
-                                                         make_parser(resource_),
-                                                         sql_connection_manager_->address(),
-                                                         pg_connection_manager_->address(),
-                                                         ch_connection_manager_actor_->address(),
-                                                         otterbrix_manager_->address(),
-                                                         catalog_manager_->address());
+                                              az_scheduler_.get(),
+                                              std::max<std::size_t>(2, std::thread::hardware_concurrency()),
+                                              [res = resource_]() { return make_parser(res); },
+                                              sql_connection_manager_->address(),
+                                              pg_connection_manager_->address(),
+                                              ch_connection_manager_actor_->address(),
+                                              otterbrix_manager_->address(),
+                                              catalog_manager_->address());
 
     assert(scheduler_ != nullptr && "scheduler must not be null");
 
@@ -55,6 +64,12 @@ ComponentManager::ComponentManager(const configuration::config& config)
     db_connector_manager_->start();
     pg_connector_manager_->start();
     ch_connector_manager_->start();
+}
+
+ComponentManager::~ComponentManager() {
+    if (az_scheduler_) {
+        az_scheduler_->stop();
+    }
 }
 
 std::pmr::memory_resource* ComponentManager::getResource() {

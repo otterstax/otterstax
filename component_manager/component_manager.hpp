@@ -14,6 +14,7 @@
 #include "scheduler/scheduler.hpp"
 
 #include <actor-zeta.hpp>
+#include <actor-zeta/scheduler/sharing_scheduler.hpp>
 #include <otterbrix/otterbrix.hpp>
 
 #include <memory_resource>
@@ -23,6 +24,7 @@
 class ComponentManager {
 public:
     explicit ComponentManager(const configuration::config& config);
+    ~ComponentManager();
     std::pmr::memory_resource* getResource();
     std::string getLogPath();
     std::shared_ptr<mysql::ConnectorManager> db_connection_manager() const;
@@ -37,6 +39,7 @@ private:
     otterbrix::otterbrix_ptr otterbrix_{nullptr};
     std::pmr::memory_resource* resource_{nullptr};
     std::string log_path_;
+    std::unique_ptr<actor_zeta::scheduler::sharing_scheduler> az_scheduler_;
     std::shared_ptr<mysql::ConnectorManager> db_connector_manager_{nullptr};
     std::shared_ptr<pg::ConnectorManager> pg_connector_manager_{nullptr};
     std::shared_ptr<ch::ConnectorManager> ch_connector_manager_{nullptr};

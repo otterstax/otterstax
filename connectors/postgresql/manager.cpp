@@ -5,6 +5,7 @@
 #include "catalog/catalog_manager.hpp"
 #include "utility/connection_uid.hpp"
 #include "utility/logger.hpp"
+#include "utility/tracy_profiler.hpp"
 
 #include <tuple>
 
@@ -33,6 +34,7 @@ namespace pg {
     void ConnectorManager::stop() { thread_pool_manager_.stop(); }
 
     std::string ConnectorManager::addConnection(connect_params connection_param, const std::string& uuid) {
+        OTX_ZONE_N("pg::ConnectorManager::addConnection");
         try {
             std::string addr = connection_param.host + ":" + std::to_string(connection_param.port);
 
@@ -65,6 +67,7 @@ namespace pg {
     }
 
     std::string ConnectorManager::addConnection(http_server::PgConnectionParams connection_param) {
+        OTX_ZONE_N("pg::ConnectorManager::addConnection(http)");
         connect_params params;
         log_->debug("Try add PostgreSQL connection with alias: {}", connection_param.alias);
         log_->debug("Host: {}", connection_param.host);
@@ -86,6 +89,7 @@ namespace pg {
     }
 
     void ConnectorManager::removeConnection(const std::string& uuid) {
+        OTX_ZONE_N("pg::ConnectorManager::removeConnection");
         auto conn = connections_.find(uuid);
         if (conn == connections_.end()) {
             log_->error("Invalid connection uuid: {}", uuid);
@@ -109,6 +113,7 @@ namespace pg {
     bool ConnectorManager::hasConnection(const std::string& uuid) const noexcept { return connections_.contains(uuid); }
 
     void ConnectorManager::fetch_enum_types(const std::string& uuid) {
+        OTX_ZONE_N("pg::ConnectorManager::fetch_enum_types");
         const std::string query =
             "SELECT t.oid, t.typname, e.enumlabel "
             "FROM pg_type t "

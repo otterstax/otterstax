@@ -40,7 +40,8 @@ OtterStax runs several protocol servers concurrently:
 - Docker & Docker Compose
 - Python 3.x (used by clients and test helpers)
 
-## Quick Start
+- Docker & Docker Compose
+- Python 3.x (used by clients and test helpers)
 
 These instructions assume you are in the repository root.
 
@@ -70,7 +71,7 @@ examples/simple/example_connetion/add_connections.sh
 python examples/simple/flight_sql_example.py examples/simple/example_1.txt
 ```
 
-### Building from Source
+3. (Optional) Add example database connections used by clients:
 
 1. Install and configure Conan (example using a recommended version):
 
@@ -112,24 +113,79 @@ cmake --build . -- -j$(nproc)
 
 ### Run integration tests (Docker-based)
 
-Make the test runner executable and run it:
-
 ```bash
-chmod +x ./docker-run-tests.sh
-./docker-run-tests.sh
+./build/server
 ```
 
-This script will bring up MariaDB/PostgreSQL/ClickHouse containers, generate and load
-test data, start the OtterStax server, run the Python integration tests,
-and then clean up.
+The script brings up MariaDB/PostgreSQL/ClickHouse containers, loads test data,
+starts the OtterStax server, runs the full Python integration test suite, then
+tears everything down.
+
+| Option | Description |
+| ------ | ----------- |
+| `-h`, `--help` | Print usage and exit |
+| `--tracy` | Collect a single Tracy profile for the entire run → `tracy_profiles/<timestamp>/otterstax.tracy` |
+| `--tracy-sep` | Collect one Tracy profile **per test** → `tracy_profiles/<timestamp>/<test_name>.tracy`. Otterstax is restarted between tests so each file is cleanly finalised. |
+| `-j N` | Parallel jobs for the Docker image build (default: all cores inside the container) |
+
+### Benchmark suite
+
+```bash
+./benchmark/scripts/run_benchmark.sh [OPTIONS]
+```
+
+Runs the full benchmark harness: builds images, starts backend DBs (MariaDB, PostgreSQL,
+ClickHouse), initialises data, runs latency tests across MySQL and PostgreSQL wire frontends,
+and writes results to `benchmark_results/<timestamp>/`.
+
+| Option | Description |
+| ------ | ----------- |
+| `--repetitions N` | Repetitions per sub-test (default: 10) |
+| `--frontend F` | `mysql` \| `postgres` \| `arrow`; may be repeated; default: `mysql postgres` |
+| `--bench T [T …]` | Tests to run: `simple_select` `complex_select` `join_same_instance` `join_cross_engine` `join_all` |
+| `--rebuild` | Force image rebuild even if images already exist |
+| `--clear` | Remove images + DB volumes, rebuild from scratch |
+| `-j N` | Parallel cmake build jobs (auto-capped by available RAM) |
+| `--tracy` | Continuous Tracy capture → `<out-dir>/benchmark.tracy` |
+| `--tracy-sep` | Per-test Tracy capture → `<out-dir>/<frontend>_<test>.tracy` |
+| `--perf` | CPU call-graph sampling with `perf` (99 Hz, dwarf unwind). Outputs `benchmark.perf.data` + `benchmark.perf` (drag into [speedscope.app](https://www.speedscope.app)). |
+| `--perf-alloc` | Like `--perf` but also attaches a `malloc` uprobe so allocation call-sites appear in the call graph alongside CPU samples. Implies `--perf`. |
+
+```bash
+# CPU flamegraph for the whole benchmark run
+./benchmark/scripts/run_benchmark.sh --frontend postgres --bench simple_select complex_select --perf
+
+# CPU + allocation hotspots
+./benchmark/scripts/run_benchmark.sh --frontend postgres --bench simple_select complex_select --perf-alloc
+```
+
+#### Examples
+
+```bash
+# Plain run
+./docker-run-tests.sh
+
+# Fast build using 4 cores
+./docker-run-tests.sh -j4
+
+# Collect a single Tracy profile for the whole suite
+./docker-run-tests.sh --tracy
+
+# Collect a separate Tracy file for every individual test
+./docker-run-tests.sh --tracy-sep
+
+# Tracy-sep with a faster build
+./docker-run-tests.sh --tracy-sep -j8
+```
+
+Tracy output is written to `tracy_profiles/` in the repository root and is
+never deleted automatically; each run creates a new timestamped sub-directory.
 
 ### Unit tests (containerized)
 
-```bash
-docker build -f Dockerfile.test -t otterstax-test .
-```
+## Testing
 
-## Project Structure
+### Run integration tests (Docker-based)
 
 ```
 otterstax/

@@ -1,0 +1,48 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2025-2026  OtterStax
+
+services:
+  bench-otterstax:
+    image: otterstax_app:${IMAGE_TAG:-bench}
+    build:
+      context: ..
+      dockerfile: Dockerfile.test
+      args:
+        WITH_TRACY: ${WITH_TRACY:-false}
+        BUILD_JOBS: ${BUILD_JOBS:-0}
+    container_name: bench_otterstax
+    depends_on:
+      bench_mariadb1:
+        condition: service_healthy
+      bench_mariadb2:
+        condition: service_healthy
+      bench_postgres1:
+        condition: service_healthy
+      bench_postgres2:
+        condition: service_healthy
+      bench_clickhouse1:
+        condition: service_healthy
+      bench_clickhouse2:
+        condition: service_healthy
+    expose:
+      - "8815"
+      - "8816"
+      - "8817"
+      - "8085"
+    ports:
+      - "8086:8086"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8085/health"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 10s
+    networks:
+      bench_net:
+        aliases:
+          - bench_otterstax
+
+networks:
+  bench_net:
+    name: bench_net
+    external: true

@@ -4,6 +4,7 @@
 #include "connector.hpp"
 
 #include "utility/logger.hpp"
+#include "utility/tracy_profiler.hpp"
 #include <functional>
 #include <memory>
 #include <string>
@@ -25,6 +26,7 @@ namespace ch {
     Status Connector::status() const noexcept { return status_; }
 
     void Connector::close() {
+        OTX_ZONE_N("ch::Connector::close");
         log_->debug("Alias: {} close connection", alias_);
         if (status_ != Status::Connected) {
             return;
@@ -36,6 +38,7 @@ namespace ch {
     Connector::~Connector() { close(); }
 
     void Connector::connect() {
+        OTX_ZONE_N("ch::Connector::connect");
         log_->debug("Alias: {} connecting with: host={} port={} database={}",
                     alias_, params_.host, params_.port, params_.database);
 
@@ -61,6 +64,7 @@ namespace ch {
     }
 
     bool Connector::isConnected() {
+        OTX_ZONE_N("ch::Connector::isConnected");
         if (status_ != Status::Connected)
             return false;
 
@@ -81,6 +85,7 @@ namespace ch {
     }
 
     void Connector::tryReconnect() {
+        OTX_ZONE_N("ch::Connector::tryReconnect");
         if (status_ == Status::Connected) {
             return;
         }

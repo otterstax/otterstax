@@ -5,6 +5,7 @@
 #include "catalog/catalog_manager.hpp"
 #include "utility/connection_uid.hpp"
 #include "utility/logger.hpp"
+#include "utility/tracy_profiler.hpp"
 
 #include <tuple>
 
@@ -36,6 +37,7 @@ namespace mysql {
     // TODO add query for adding and removing connections
     // TODO this is not thread safe!!!
     std::string ConnectorManager::addConnection(bm::connect_params connection_param, const std::string& uuid) {
+        OTX_ZONE_N("mysql::ConnectorManager::addConnection");
         try {
             std::string addr = std::string(connection_param.server_address.hostname()) + ":" +
                                std::to_string(connection_param.server_address.port());
@@ -65,6 +67,7 @@ namespace mysql {
 
     // TODO not threadsafe!!!
     std::string ConnectorManager::addConnection(http_server::ConnectionParams connection_param) {
+        OTX_ZONE_N("mysql::ConnectorManager::addConnection(http)");
         boost::mysql::connect_params params;
         log_->debug("Try add connection with alias: {}", connection_param.alias);
         log_->debug("Host: {}", connection_param.host);
@@ -81,6 +84,7 @@ namespace mysql {
     }
 
     void ConnectorManager::removeConnection(const std::string& uuid) {
+        OTX_ZONE_N("mysql::ConnectorManager::removeConnection");
         auto conn = connections_.find(uuid);
         if (conn == connections_.end()) {
             log_->error("Invalid connection uuid: {}", uuid);

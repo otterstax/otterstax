@@ -3,6 +3,9 @@
 
 #include "mysql_connection.hpp"
 
+#include "utility/tracy_memory_resource.hpp"
+#include "utility/tracy_profiler.hpp"
+
 #include <tuple>
 
 using namespace components;
@@ -18,6 +21,7 @@ namespace frontend::mysql {
     constexpr uint8_t AUTH_FILLER_SIZE = 23;
 
     void mysql_connection::handle_auth(std::vector<uint8_t> payload) {
+        OTX_ZONE_N("mysql::handle_auth");
         if (payload.size() < MIN_AUTH_PAYLOAD_SIZE) {
             log_->info("[Connection {}] AUTH: Payload too small", connection_id_);
             send_error(mysql_error::ER_ACCESS_DENIED_ERROR, "Access denied for user (using password: NO)");
@@ -88,6 +92,7 @@ namespace frontend::mysql {
     }
 
     void mysql_connection::handle_command(std::vector<uint8_t> payload) {
+        OTX_ZONE_N("mysql::handle_command");
         if (payload.empty()) {
             send_error(mysql_error::ER_MALFORMED_PACKET, "Empty command packet");
             return;
@@ -189,6 +194,7 @@ namespace frontend::mysql {
     }
 
     void mysql_connection::handle_query(std::string query) {
+        OTX_ZONE_N("mysql::handle_query");
         auto shared_data = create_cv_wrapper(session_payload(resource_));
         session_id id;
         // todo: one execute() call for simplicity - use computed schema for text_resultset columns
@@ -253,7 +259,8 @@ namespace frontend::mysql {
         }
 
         try {
-            std::pmr::monotonic_buffer_resource arena_resource(resource_);
+            tracy_memory_resource arena_mr(resource_, "mysql::parse_arena");
+            std::pmr::monotonic_buffer_resource arena_resource(&arena_mr);
             auto res = linitial(raw_parser(&arena_resource, fixed_query.c_str()));
             if (nodeTag(res) == T_VariableSetStmt) { // handle SET statements
                 auto set = transform::pg_ptr_cast<VariableSetStmt>(res);
@@ -280,6 +287,7 @@ namespace frontend::mysql {
     }
 
     void mysql_connection::handle_prepared_stmt(std::string query) {
+        OTX_ZONE_N("mysql::handle_prepared_stmt");
         auto shared_data = create_cv_wrapper(session_payload(resource_));
         session_id id;
         std::ignore = actor_zeta::send(scheduler_, &Scheduler::prepare_schema, id.hash(), shared_data, query);
@@ -475,6 +483,7 @@ namespace frontend::mysql {
 
     void mysql_connection::handle_execute_stmt(session_hash_t id,
                                                std::pmr::vector<types::logical_value_t> param_values) {
+        OTX_ZONE_N("mysql::handle_execute_stmt");
         auto shared_data = create_cv_wrapper(session_payload(resource_));
         std::ignore = actor_zeta::send(scheduler_,
                                        &Scheduler::execute_prepared_statement,

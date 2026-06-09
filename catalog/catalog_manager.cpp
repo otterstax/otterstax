@@ -3,6 +3,8 @@
 
 #include "catalog_manager.hpp"
 
+#include "utility/tracy_profiler.hpp"
+
 #include <components/table/column_definition.hpp>
 #include <thread>
 
@@ -60,19 +62,19 @@ namespace mysql {
     void CatalogManager::registerConnection(const std::string& uuid,
                                             catalog_ext::ConnectionType type,
                                             const collection_full_name_t& name) {
-        std::lock_guard<std::mutex> lock(connection_registry_mtx_);
+        std::lock_guard lock(connection_registry_mtx_);
         connection_registry_[uuid] = catalog_ext::ConnectionInfo{uuid, type, name};
         log_->debug("Registered connection: {} with type: {}", uuid, static_cast<int>(type));
     }
 
     void CatalogManager::unregisterConnection(const std::string& uuid) {
-        std::lock_guard<std::mutex> lock(connection_registry_mtx_);
+        std::lock_guard lock(connection_registry_mtx_);
         connection_registry_.erase(uuid);
         log_->debug("Unregistered connection: {}", uuid);
     }
 
     std::optional<catalog_ext::ConnectionType> CatalogManager::getConnectionType(const std::string& uuid) const {
-        std::lock_guard<std::mutex> lock(connection_registry_mtx_);
+        std::lock_guard lock(connection_registry_mtx_);
         auto it = connection_registry_.find(uuid);
         if (it != connection_registry_.end()) {
             return it->second.type;
@@ -81,13 +83,14 @@ namespace mysql {
     }
 
     bool CatalogManager::hasConnection(const std::string& uuid) const {
-        std::lock_guard<std::mutex> lock(connection_registry_mtx_);
+        std::lock_guard lock(connection_registry_mtx_);
         return connection_registry_.contains(uuid);
     }
 
     std::pair<bool, actor_zeta::detail::enqueue_result>
     CatalogManager::enqueue_impl(actor_zeta::mailbox::message_ptr msg) {
-        std::lock_guard<std::mutex> guard(mutex_);
+        OTX_ZONE_N("CatalogManager::enqueue_impl");
+        std::lock_guard guard(mutex_);
         current_behavior_ = behavior(msg.get());
 
         while (current_behavior_.is_busy()) {
@@ -105,6 +108,7 @@ namespace mysql {
     }
 
     actor_zeta::behavior_t CatalogManager::behavior(actor_zeta::mailbox::message* msg) {
+        OTX_ZONE_N("CatalogManager::behavior");
         auto cmd = msg->command();
         if (cmd == actor_zeta::msg_id<CatalogManager, &CatalogManager::get_catalog_schema>) {
             co_await actor_zeta::dispatch(this, &CatalogManager::get_catalog_schema, msg);
@@ -120,6 +124,7 @@ namespace mysql {
     }
 
     auto CatalogManager::update_backend_type_impl(ParsedQueryDataPtr&& data) -> ParsedQueryDataPtr const {
+        OTX_ZONE_N("catalog::backend_type_detection");
         assert(data != nullptr);
         log_->debug("update_backend_type_impl: start updating backend type for query with external nodes count {}",
                     static_cast<int>(data->otterbrix_params->external_nodes.size()));
@@ -187,6 +192,7 @@ namespace mysql {
 
     actor_zeta::unique_future<otterstax::result<ParsedQueryDataPtr>>
     CatalogManager::update_backend_type(session_hash_t id, ParsedQueryDataPtr data) {
+        OTX_ZONE_N("catalog::update_backend_type");
         auto updated_data = update_backend_type_impl(std::move(data));
         if (updated_data->backend_type == backend_type_t::Unknown) {
             log_->error("update_backend_type: Backend type is unknown after update_backend_type_impl, cannot proceed");
@@ -201,6 +207,7 @@ namespace mysql {
 
     actor_zeta::unique_future<otterstax::result<ParsedQueryDataPtr>>
     CatalogManager::get_catalog_schema(session_hash_t id, ParsedQueryDataPtr data) {
+        OTX_ZONE_N("catalog::get_catalog_schema");
         auto updated_data = update_backend_type_impl(std::move(data));
         if (updated_data->backend_type == backend_type_t::Unknown) {
             log_->error("get_catalog_schema: Backend type is unknown after update_backend_type_impl, cannot proceed");
@@ -259,12 +266,15 @@ namespace mysql {
         co_return std::move(updated_data);
     }
 
-    actor_zeta::unique_future<core::error_t> CatalogManager::add_connection_schema(collection_full_name_t name) {
+    actor_zeta::unique_future<core::error_t>
+    CatalogManager::add_connection_schema(collection_full_name_t name) {
+        OTX_ZONE_N("catalog::add_connection_schema");
         co_return add_connection_schema_sync(std::move(name));
     }
 
     // Synchronous implementation — called from both the coroutine handler and internally from get_catalog_schema
     core::error_t CatalogManager::add_connection_schema_sync(collection_full_name_t name) {
+        OTX_ZONE_N("catalog::add_connection_schema_sync");
         const std::string& uuid = name.unique_identifier;
 
         // Determine connection type by checking which ConnectorManager has this connection
@@ -574,12 +584,14 @@ namespace mysql {
     }
 
     actor_zeta::unique_future<void> CatalogManager::remove_connection_schema(std::string uuid) {
+        OTX_ZONE_N("catalog::remove_connection_schema");
         catalog_.drop_namespace({uuid.c_str()});
         co_return;
     }
 
     actor_zeta::unique_future<void> CatalogManager::get_tables(arrow::flight::sql::GetTables command,
                                                                shared_data<std::pmr::vector<table_info>> sdata) {
+        OTX_ZONE_N("catalog::get_tables");
         std::pmr::vector<table_info> data(resource());
         std::pmr::vector<catalog::table_id> ids(resource());
 

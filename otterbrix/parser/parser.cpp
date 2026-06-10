@@ -5,13 +5,14 @@
 
 #include "scheduler/schema_utils.hpp"
 #include "subquery_extractor.hpp"
+#include "utility/tracy_memory_resource.hpp"
+#include "utility/tracy_profiler.hpp"
 
 #include <components/logical_plan/node_function.hpp>
 #include <components/sql/parser/parser.h>
 #include <components/sql/transformer/utils.hpp>
 
 #include <deque>
-#include <iostream>
 
 using namespace components;
 
@@ -19,6 +20,7 @@ namespace {
     void swap_stubs_into_schema_nodes(std::pmr::memory_resource* resource,
                                       std::vector<std::vector<logical_plan::node_ptr*>>& external_nodes,
                                       const std::vector<otterstax::parser::subquery_stub_t>& stubs) {
+        OTX_ZONE_N("otterbrix::swap_stubs_into_schema_nodes");
         if (stubs.empty()) {
             return;
         }
@@ -108,6 +110,7 @@ static constexpr bool is_mutable(logical_plan::node_type type) {
 static size_t get_external_nodes(std::pmr::memory_resource* resource,
                                  logical_plan::node_ptr& node,
                                  std::vector<std::vector<logical_plan::node_ptr*>>& external_nodes) {
+    OTX_ZONE_N("otterbrix::get_external_nodes");
     struct lookup_node_t {
         logical_plan::node_ptr* ptr;
         logical_plan::node_ptr* parent_ptr;
@@ -166,30 +169,35 @@ ParsedQueryData::ParsedQueryData(OtterbrixStatementPtr otterbrix_params,
 components::sql::transform::transform_result& ParsedQueryData::binder() { return binder_; }
 
 GreenplumParser::GreenplumParser(std::pmr::memory_resource* resource)
-    : resource_(resource) {
+    : resource_(resource)
+    , log_(get_logger(logger_tag::PARSER)) {
     assert(resource_ != nullptr && "memory resource must not be null");
+    assert(log_.is_valid());
 }
 
 core::result_wrapper_t<ParsedQueryDataPtr> GreenplumParser::parse(const std::string& sql) {
-    std::cerr << "[Parser] Starting parse for: " << sql.substr(0, 100) << std::endl;
+    OTX_ZONE_N("otterbrix::parse");
+    log_->info("parse: starting for: {}", sql.substr(0, 100));
     try {
-        std::pmr::monotonic_buffer_resource arena_resource(resource_);
+        tracy_memory_resource arena_mr(resource_, "parser::arena");
+        std::pmr::monotonic_buffer_resource arena_resource(&arena_mr);
         sql::transform::transformer transformer(resource_);
 
         ::Node* reusable_root = nullptr;
         auto extraction = otterstax::parser::prepare_sql(sql, &arena_resource, &reusable_root);
-        std::cerr << "[Parser] prepare_sql produced " << extraction.stubs.size() << " stub(s)" << std::endl;
-        std::cerr << "[Parser] modified SQL: " << extraction.modified_sql.substr(0, 200) << std::endl;
+        log_->trace("parse: prepare_sql produced {} stub(s), modified SQL: {}",
+                    extraction.stubs.size(),
+                    extraction.modified_sql.substr(0, 200));
 
         ::Node* res = nullptr;
         if (extraction.stubs.empty() && reusable_root) {
-            std::cerr << "[Parser] reusing prepare_sql's AST (no extraction)" << std::endl;
+            log_->trace("parse: reusing prepare_sql AST (no extraction)");
             res = reusable_root;
         } else {
-            std::cerr << "[Parser] Calling raw_parser on modified SQL..." << std::endl;
+            log_->trace("parse: calling raw_parser on modified SQL");
             auto* raw = raw_parser(&arena_resource, extraction.modified_sql.c_str());
             if (!raw) {
-                std::cerr << "[Parser] raw_parser returned null" << std::endl;
+                log_->error("parse: raw_parser returned null for SQL: {}", sql.substr(0, 100));
                 return core::error_t{core::error_code_t::sql_parse_error,
                                      std::pmr::string{"syntax error", resource_}};
             }
@@ -198,18 +206,18 @@ core::result_wrapper_t<ParsedQueryDataPtr> GreenplumParser::parse(const std::str
         }
 
         auto tag = nodeTag(res);
-        std::cerr << "[Parser] Calling transformer.transform..." << std::endl;
+        log_->trace("parse: calling transformer.transform");
         auto binder = transformer.transform(sql::transform::pg_cell_to_node_cast(res));
-        std::cerr << "[Parser] transform complete" << std::endl;
+        log_->trace("parse: transformer.transform complete");
 
         if (binder.has_error()) {
-            std::cerr << "[Parser] transformer error: " << binder.get_error().what.c_str() << std::endl;
+            log_->error("parse: transformer error: {}", binder.get_error().what.c_str());
             return binder.get_error();
         }
 
         auto node = binder.node_ptr();
         if (!node) {
-            std::cerr << "[Parser] transformer returned null root node — unsupported statement?" << std::endl;
+            log_->error("parse: transformer returned null root node — unsupported statement");
             return core::error_t{core::error_code_t::unimplemented_yet,
                                  std::pmr::string{"Unsupported node type", resource_}};
         }
@@ -217,7 +225,7 @@ core::result_wrapper_t<ParsedQueryDataPtr> GreenplumParser::parse(const std::str
         const size_t param_cnt = binder.parameter_count();
         auto params = binder.params_ptr();
 
-        std::cerr << "[Parser] Creating ParsedQueryData..." << std::endl;
+        log_->trace("parse: building ParsedQueryData, param_count={}", param_cnt);
         ParsedQueryDataPtr result = std::make_unique<ParsedQueryData>(
             std::make_unique<OtterbrixStatement>(std::vector<std::vector<logical_plan::node_ptr*>>{},
                                                  std::move(params),
@@ -227,21 +235,19 @@ core::result_wrapper_t<ParsedQueryDataPtr> GreenplumParser::parse(const std::str
             std::move(binder),
             tag);
 
-        std::cerr << "[Parser] Calling get_external_nodes..." << std::endl;
         result->otterbrix_params->external_nodes_count =
             get_external_nodes(resource_, result->otterbrix_params->node, result->otterbrix_params->external_nodes);
-        std::cerr << "[Parser] get_external_nodes complete, count=" << result->otterbrix_params->external_nodes_count
-                  << std::endl;
+        log_->info("parse: external_nodes_count={}", result->otterbrix_params->external_nodes_count);
 
         swap_stubs_into_schema_nodes(resource_, result->otterbrix_params->external_nodes, extraction.stubs);
-        std::cerr << "[Parser] swap_stubs_into_schema_nodes complete" << std::endl;
+        log_->trace("parse: swap_stubs_into_schema_nodes complete");
 
         return result;
     } catch (const std::exception& e) {
-        std::cerr << "[Parser] caught exception: " << e.what() << std::endl;
+        log_->error("parse: caught exception: {}", e.what());
         return core::error_t{core::error_code_t::sql_parse_error, e.what()};
     } catch (...) {
-        std::cerr << "[Parser] caught unknown exception" << std::endl;
+        log_->error("parse: caught unknown exception");
         return core::error_t{core::error_code_t::sql_parse_error, std::pmr::string{"syntax error", resource_}};
     }
 }

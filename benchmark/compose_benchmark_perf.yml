@@ -1,0 +1,11 @@
+# Capabilities required to run perf inside bench-otterstax.
+# Used as an overlay when --perf is passed to run_benchmark.sh:
+#   docker compose -f compose_backends.yml -f compose_benchmark.yml \
+#                  -f compose_benchmark_perf.yml ...
+services:
+  bench-otterstax:
+    cap_add:
+      - SYS_ADMIN
+      - PERFMON
+    security_opt:
+      - seccomp:unconfined

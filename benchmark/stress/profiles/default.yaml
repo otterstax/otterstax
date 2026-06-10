@@ -1,0 +1,44 @@
+# OtterStax stress test — default profile
+# All three stages run the same query pool; only concurrency scales up.
+# Stage 1 is a sequential baseline (1 worker/frontend) that makes the
+# degradation numbers meaningful: S2/S1 and S3/S1 show pure concurrency cost.
+#
+# Run: ./benchmark/stress/run_stress_benchmarks.sh
+#      ./benchmark/stress/run_stress_benchmarks.sh -p benchmark/stress/profiles/default.yaml
+
+cooling_s: 10
+
+stages:
+
+  - name: baseline
+    label: "Stage 1 — Baseline (1 worker/frontend)"
+    workers_per_frontend: 1
+    duration_s: 60
+    ramp_secs: 2
+    query_pool:
+      simple_select:     1   # 25% — LIMIT 100 point reads (2–50 ms)
+      complex_select:    1   # 25% — GROUP BY + HAVING + ORDER BY (5–55 ms)
+      join_same_b:       1   # 25% — same-instance join, Group B ~5 k rows (1–3 s)
+      join_cross_engine: 1   # 25% — cross-engine join, Group B (3–5 s)
+
+  - name: medium
+    label: "Stage 2 — Medium Load (5 workers/frontend)"
+    workers_per_frontend: 5
+    duration_s: 60
+    ramp_secs: 5
+    query_pool:
+      simple_select:     1
+      complex_select:    1
+      join_same_b:       1
+      join_cross_engine: 1
+
+  - name: heavy
+    label: "Stage 3 — Heavy Load (15 workers/frontend)"
+    workers_per_frontend: 15
+    duration_s: 90
+    ramp_secs: 15
+    query_pool:
+      simple_select:     1
+      complex_select:    1
+      join_same_b:       1
+      join_cross_engine: 1

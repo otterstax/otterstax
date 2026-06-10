@@ -1,0 +1,4 @@
+pymysql
+psycopg2-binary
+clickhouse-driver
+faker

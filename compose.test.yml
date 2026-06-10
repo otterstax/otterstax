@@ -90,6 +90,9 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.test
+      args:
+        WITH_TRACY: ${WITH_TRACY:-false}
+        BUILD_JOBS: ${BUILD_JOBS:-0}
     container_name: test_otterstax_app
     depends_on:
       mariadb1:
@@ -103,6 +106,8 @@ services:
     expose:
       - "8815"
       - "8085"
+    ports:
+      - "8086:8086"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8085/health"]
       interval: 5s

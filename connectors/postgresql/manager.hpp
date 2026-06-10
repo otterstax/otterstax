@@ -6,6 +6,7 @@
 #include <components/log/log.hpp>
 
 #include "connector.hpp"
+#include "utility/tracy_profiler.hpp"
 
 #include <concepts>
 #include <coroutine>
@@ -50,6 +51,7 @@ namespace pg {
         template<typename Callable>
         requires std::invocable<Callable, PGresult*> std::future<std::invoke_result_t<Callable, PGresult*>>
         executeQuery(const std::string& uuid, std::string_view query, Callable handler) {
+            OTX_ZONE_N("pg::ConnectorManager::executeQuery");
             auto conn = connections_.find(uuid);
             if (conn == connections_.end()) {
                 log_->error("[PgConnectorManager::executeQuery] Invalid connection uuid: {}", uuid);

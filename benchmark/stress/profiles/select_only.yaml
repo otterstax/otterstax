@@ -1,0 +1,37 @@
+# OtterStax stress test — select_only profile
+# Simple and complex SELECT queries only — no joins.
+# Isolates connection-handling, parser, and routing overhead without
+# join latency noise. Same 1 → 5 → 15 concurrency ramp as default.yaml.
+#
+# Run: ./benchmark/stress/run_stress_benchmarks.sh -p benchmark/stress/profiles/select_only.yaml
+
+cooling_s: 10
+
+stages:
+
+  - name: baseline
+    label: "Stage 1 — Baseline (1 worker/frontend)"
+    workers_per_frontend: 1
+    duration_s: 60
+    ramp_secs: 2
+    query_pool:
+      simple_select:  1   # 50% — LIMIT 100 point reads (2–50 ms)
+      complex_select: 1   # 50% — GROUP BY + HAVING + ORDER BY (5–55 ms)
+
+  - name: medium
+    label: "Stage 2 — Medium Load (5 workers/frontend)"
+    workers_per_frontend: 5
+    duration_s: 60
+    ramp_secs: 5
+    query_pool:
+      simple_select:  1
+      complex_select: 1
+
+  - name: heavy
+    label: "Stage 3 — Heavy Load (15 workers/frontend)"
+    workers_per_frontend: 15
+    duration_s: 90
+    ramp_secs: 15
+    query_pool:
+      simple_select:  1
+      complex_select: 1

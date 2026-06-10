@@ -6,6 +6,7 @@
 #include <components/log/log.hpp>
 
 #include "connector.hpp"
+#include "utility/tracy_profiler.hpp"
 
 #include <concepts>
 #include <coroutine>
@@ -54,6 +55,7 @@ namespace mysql {
         requires std::invocable<Callable, const boost::mysql::results&>
             std::future<std::invoke_result_t<Callable, const boost::mysql::results&>>
             executeQuery(const std::string& uuid, std::string_view query, Callable handler) {
+            OTX_ZONE_N("mysql::ConnectorManager::executeQuery");
             auto conn = connections_.find(uuid);
             if (conn == connections_.end()) {
                 log_->error("[ConnectorManager::executeQuery] Invalid connection uuid: {}", uuid);

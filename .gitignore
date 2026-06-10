@@ -446,3 +446,6 @@ fixtures/init/mariadb1/init.sql
 fixtures/init/mariadb2/init.sql
 CMakeUserPresets.json
 fixtures/init/mariadb1/init.sql
+/tracy_profiles/
+/benchmark_results/
+/benchmark_manual/

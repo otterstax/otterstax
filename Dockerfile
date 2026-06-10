@@ -4,6 +4,8 @@ ENV TZ=America/US
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONFAULTHANDLER=1
 
+ARG WITH_TRACY=false
+
 RUN apt update && \
     apt upgrade -y && \
     apt install -y \
@@ -28,12 +30,33 @@ RUN rm /bin/sh && ln -s /bin/bash /bin/sh
 # devcontainer preset layout exactly.
 WORKDIR /app
 COPY conanfile.py .
-RUN conan install conanfile.py --build missing \
-    -s build_type=Release \
-    -s compiler.cppstd=20 \
-    -s 'clickhouse-cpp/*:compiler.cppstd=17' \
-    -s 'abseil/*:compiler.cppstd=17' \
-    -s 'grpc/*:compiler.cppstd=17'
+RUN if [ "$WITH_TRACY" = "true" ]; then \
+        conan install conanfile.py --build missing \
+            -s build_type=Release \
+            -s compiler.cppstd=20 \
+            -s 'clickhouse-cpp/*:compiler.cppstd=17' \
+            -s 'abseil/*:compiler.cppstd=17' \
+            -s 'grpc/*:compiler.cppstd=17' \
+            -o "&:with_tracy=True"; \
+    else \
+        conan install conanfile.py --build missing \
+            -s build_type=Release \
+            -s compiler.cppstd=20 \
+            -s 'clickhouse-cpp/*:compiler.cppstd=17' \
+            -s 'abseil/*:compiler.cppstd=17' \
+            -s 'grpc/*:compiler.cppstd=17'; \
+    fi
+
+# Build tracy-capture CLI (headless, no GUI deps) when Tracy is enabled
+RUN if [ "$WITH_TRACY" = "true" ]; then \
+        curl -L https://github.com/wolfpld/tracy/archive/refs/tags/v0.13.1.tar.gz \
+            | tar xz -C /tmp && \
+        cmake -S /tmp/tracy-0.13.1/capture -B /tmp/tracy-capture-build \
+            -DCMAKE_BUILD_TYPE=Release && \
+        cmake --build /tmp/tracy-capture-build -j$(nproc) && \
+        cp /tmp/tracy-capture-build/tracy-capture /usr/local/bin/ && \
+        rm -rf /tmp/tracy-0.13.1 /tmp/tracy-capture-build; \
+    fi
 
 COPY ./catalog ./catalog
 COPY ./config ./config
@@ -52,6 +75,9 @@ RUN cmake -S . -B build/Release \
         -DCMAKE_TOOLCHAIN_FILE=build/Release/generators/conan_toolchain.cmake \
         -DCMAKE_BUILD_TYPE=Release && \
     cmake --build build/Release --target all -- -j 5
+
+# Tracy profiler port (active only when built with --build-arg WITH_TRACY=true)
+EXPOSE 8086
 
 WORKDIR /app/build/Release
 CMD [ "./server" ]

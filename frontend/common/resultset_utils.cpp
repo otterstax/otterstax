@@ -3,6 +3,8 @@
 
 #include "resultset_utils.hpp"
 
+#include "utility/tracy_profiler.hpp"
+
 #include <components/types/logical_value.hpp>
 
 namespace frontend {
@@ -173,6 +175,7 @@ namespace frontend {
     }
 
     std::string encode_to_text(const components::vector::data_chunk_t& chunk, size_t column_index, size_t row_index) {
+        OTX_ZONE_N("frontend::encode_to_text");
         const auto type = chunk.data[column_index].type().type();
         switch (type) {
             case components::types::logical_type::BOOLEAN:

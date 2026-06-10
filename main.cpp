@@ -20,6 +20,7 @@
 #include "frontend/postgres_server/postgres_server.hpp"
 #include "otterbrix/config.hpp"
 #include "config/config.hpp"
+#include "utility/tracy_profiler.hpp"
 
 namespace po = boost::program_options;
 
@@ -29,6 +30,7 @@ int main(int argc, char* argv[]) {
     arrow::util::ArrowLog::StartArrowLog("server", arrow::util::ArrowLogLevel::ARROW_DEBUG);
 
     // Create component manager
+    OTX_MESSAGE_L("startup: creating component manager");
     ComponentManager cmanager(make_create_config("/tmp/test_collection_sql/base"));
 
     auto log = get_logger(logger_tag::Main);
@@ -87,16 +89,23 @@ int main(int argc, char* argv[]) {
 
     SimpleFlightSQLServer server(config);
 
+    // The io_context must live in main scope so we can stop it from outside
+    // the thread on shutdown — otherwise ctx.run() blocks the jthread join.
+    asio::io_context http_ctx;
+
     // Start the HTTP server in a separate thread
-    std::jthread server_thread([mysql_conn_manager = std::move(cmanager.db_connection_manager()),
-                                pg_conn_manager = std::move(cmanager.pg_connection_manager()),
-                                ch_conn_manager = std::move(cmanager.ch_connection_manager()),
-                                http_port = server_config.connection_manager.port]() {
-        asio::io_context ctx;
-        http_server::Server server(ctx, http_port, mysql_conn_manager, pg_conn_manager, ch_conn_manager);
+    std::jthread server_thread([mysql_conn_manager = cmanager.db_connection_manager(),
+                                pg_conn_manager = cmanager.pg_connection_manager(),
+                                ch_conn_manager = cmanager.ch_connection_manager(),
+                                http_port = server_config.connection_manager.port,
+                                &http_ctx]() {
+        OTX_ZONE_N("http_server::thread");
+        http_server::Server http(http_ctx, http_port, mysql_conn_manager, pg_conn_manager, ch_conn_manager);
         auto log = get_logger(logger_tag::Main);
         log->info("HTTP Server running on port {}...", http_port);
-        ctx.run();
+        OTX_MESSAGE_L("http_server: running");
+        http_ctx.run();
+        OTX_MESSAGE_L("http_server: stopped");
     });
 
     // Configure MySQL server
@@ -108,6 +117,7 @@ int main(int argc, char* argv[]) {
 
     // Start MySQL server
     log->info("MySQL Server running on port {}...", mysql_config.port);
+    OTX_MESSAGE_L("startup: mysql server starting");
     frontend::mysql::mysql_server mysql(mysql_config);
     mysql.start();
 
@@ -120,17 +130,41 @@ int main(int argc, char* argv[]) {
 
     // Start Postgres server
     log->info("Postgres Server running on port {}...", postgres_config.port);
+    OTX_MESSAGE_L("startup: postgres server starting");
     frontend::postgres::postgres_server postgres(postgres_config);
     postgres.start();
 
-    // Start the Flight SQL server
+    // Start the Flight SQL server. Serve() blocks until SIGTERM is received
+    // (registered via SetShutdownOnSignals inside Start()).
+    OTX_MESSAGE_L("startup: flightsql server starting");
     arrow::Status status = server.Start();
-    if (!status.ok()) {
-        log->error("Failed to start FlightSQL server: {}", status.ToString());
-        server_thread.join();
-        return -1;
+
+    // Serve() returned — graceful shutdown sequence.
+    // Stop the HTTP io_context first so ctx.run() returns and the jthread can
+    // join cleanly. Then stop the wire-protocol frontends explicitly before
+    // their destructors run, giving Tracy a clean window to flush the profile.
+    {
+        OTX_ZONE_N("server::shutdown");
+        OTX_MESSAGE_L("shutdown: initiated");
+
+        log->info("Shutdown initiated — stopping all servers...");
+        http_ctx.stop();
+        OTX_MESSAGE_L("shutdown: http server stopped");
+
+        mysql.stop();
+        OTX_MESSAGE_L("shutdown: mysql server stopped");
+
+        postgres.stop();
+        OTX_MESSAGE_L("shutdown: postgres server stopped");
+
+        log->info("Graceful shutdown complete.");
+        OTX_MESSAGE_L("shutdown: complete");
     }
 
+    if (!status.ok()) {
+        log->error("FlightSQL server error: {}", status.ToString());
+        return -1;
+    }
     return 0;
 }
 

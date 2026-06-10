@@ -3,6 +3,8 @@
 
 #include "mysql_to_chunk.hpp"
 
+#include "utility/tracy_profiler.hpp"
+
 namespace tsl {
 
     namespace impl {
@@ -257,6 +259,7 @@ namespace tsl {
 
     // callback to handle mysql results
     data_chunk_t mysql_to_chunk(std::pmr::memory_resource* resource, const boost::mysql::results& result) {
+        OTX_ZONE_N("tsl::mysql_to_chunk");
         const auto& metadata = result.meta();
 
         const auto ncolumns = result.rows().num_columns();

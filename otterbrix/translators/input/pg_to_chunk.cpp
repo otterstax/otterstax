@@ -3,6 +3,8 @@
 
 #include "pg_to_chunk.hpp"
 
+#include "utility/tracy_profiler.hpp"
+
 #include <charconv>
 #include <cstdlib>
 #include <cstring>
@@ -202,6 +204,7 @@ namespace tsl {
     } // namespace impl
 
     data_chunk_t pg_to_chunk(std::pmr::memory_resource* resource, PGresult* result) {
+        OTX_ZONE_N("tsl::pg_to_chunk");
         const int ncolumns = PQnfields(result);
         const int nrows = PQntuples(result);
 
@@ -272,6 +275,7 @@ namespace tsl {
     } // namespace impl
 
     data_chunk_t pg_to_chunk(std::pmr::memory_resource* resource, PGresult* result, const pg_enum_oid_map& enum_oids) {
+        OTX_ZONE_N("tsl::pg_to_chunk(enum)");
         const int ncolumns = PQnfields(result);
         const int nrows = PQntuples(result);
 

@@ -4,6 +4,7 @@
 #include "connector.hpp"
 
 #include "utility/logger.hpp"
+#include "utility/tracy_profiler.hpp"
 #include <functional>
 #include <memory>
 #include <string>
@@ -27,6 +28,7 @@ namespace mysql {
     Status Connector::status() const noexcept { return status_; }
 
     void Connector::close() {
+        OTX_ZONE_N("mysql::Connector::close");
         log_->debug("Alias: {} close connection", alias_);
         if (status_ != Status::Connected) {
             return;
@@ -38,6 +40,7 @@ namespace mysql {
     Connector::~Connector() { close(); }
 
     void Connector::connect() {
+        OTX_ZONE_N("mysql::Connector::connect");
         conn_.set_meta_mode(bm::metadata_mode::full);
         boost::system::error_code ec;
         boost::mysql::diagnostics diag;
@@ -50,6 +53,7 @@ namespace mysql {
     }
 
     bool Connector::isConnected() {
+        OTX_ZONE_N("mysql::Connector::isConnected");
         if (status_ != Status::Connected)
             return false;
         boost::system::error_code ec;
@@ -64,6 +68,7 @@ namespace mysql {
     }
 
     void Connector::tryReconnect() {
+        OTX_ZONE_N("mysql::Connector::tryReconnect");
         if (status_ == Status::Connected) {
             return;
         }

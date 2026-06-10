@@ -17,6 +17,7 @@
 
 #include "types.hpp"
 #include "utility/asio_error.hpp"
+#include "utility/tracy_profiler.hpp"
 #include <otterbrix/otterbrix.hpp>
 
 #include <concepts>
@@ -92,6 +93,7 @@ namespace ch {
             requires std::invocable<Callable, const std::vector<clickhouse::Block>&>
         asio::awaitable<std::invoke_result_t<Callable, const std::vector<clickhouse::Block>&>>
         runQuery_(std::string_view query, Callable handler) {
+            OTX_ZONE_N("ch::Connector::runQuery");
             if (status_ != Status::Connected) {
                 std::string err = "[Run query] Connector with alias: " + alias_ + " is not connected";
                 log_->error(err);

@@ -96,6 +96,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        WITH_TRACY: ${WITH_TRACY:-false}
     container_name: otterstax_app
     depends_on:
       - mariadb1
@@ -106,6 +108,7 @@ services:
       - "0.0.0.0:8085:8085"
       - "0.0.0.0:8815:8815"
       - "0.0.0.0:8816:8816"
+      - "0.0.0.0:8086:8086"
     volumes:
       - ./app_data:/app/data
     networks:

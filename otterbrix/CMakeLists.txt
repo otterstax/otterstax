@@ -38,6 +38,10 @@ target_link_libraries(otterbrix_local PUBLIC
     clickhouse-cpp-lib::clickhouse-cpp-lib
 )
 
+if(ENABLE_TRACY)
+    target_link_libraries(otterbrix_local PUBLIC Tracy::TracyClient)
+endif()
+
 target_include_directories(otterbrix_local PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/..
 )

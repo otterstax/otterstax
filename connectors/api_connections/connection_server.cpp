@@ -7,6 +7,7 @@
 #include "ch_connection_config.hpp"
 #include "connection_config.hpp"
 #include "pg_connection_config.hpp"
+#include "utility/tracy_profiler.hpp"
 
 namespace {
     std::string get_current_timestamp() {
@@ -59,6 +60,8 @@ namespace http_server {
     }
 
     void Session::handle_request() {
+        OTX_ZONE_N("http::handle_request");
+
         response_.clear();
         response_.version(request_.version());
         response_.keep_alive(request_.keep_alive());
@@ -71,6 +74,7 @@ namespace http_server {
             response_.content_length(response_.body().size());
             // Health check OK
         } else if (request_.method() == http::verb::post && request_.target() == "/add_connection") {
+            OTX_ZONE_N("http::add_connection");
             try {
                 auto json_body = boost::json::parse(request_.body());
                 if (auto err = check_json_body(boost::json::parse(request_.body()).as_object()); err.has_value()) {
@@ -101,6 +105,7 @@ namespace http_server {
                 response_.body() = std::string("ERROR: ") + e.what();
             }
         } else if (request_.method() == http::verb::post && request_.target() == "/add_pg_connection") {
+            OTX_ZONE_N("http::add_pg_connection");
             try {
                 auto json_body = boost::json::parse(request_.body());
                 if (auto err = check_json_body(boost::json::parse(request_.body()).as_object()); err.has_value()) {
@@ -192,6 +197,7 @@ namespace http_server {
                 response_.body() = std::string("ERROR: ") + e.what();
             }
         } else if (request_.method() == http::verb::post && request_.target() == "/add_ch_connection") {
+            OTX_ZONE_N("http::add_ch_connection");
             try {
                 auto json_body = boost::json::parse(request_.body());
                 const static std::vector<std::string> ch_required_keys =
@@ -268,6 +274,7 @@ namespace http_server {
     }
 
     void Session::write_response() {
+        OTX_ZONE_N("http::write_response");
         auto self = shared_from_this();
         http::async_write(socket_, response_, [self](beast::error_code ec, std::size_t) {
             self->socket_.shutdown(tcp::socket::shutdown_send, ec);
@@ -289,6 +296,7 @@ namespace http_server {
 
     void Server::accept() {
         acceptor_.async_accept([this](beast::error_code ec, tcp::socket socket) {
+            OTX_ZONE_N("http::accept");
             if (!ec)
                 std::make_shared<Session>(std::move(socket), mysql_conn_manager_, pg_conn_manager_, ch_conn_manager_)
                     ->start();

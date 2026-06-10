@@ -329,6 +329,13 @@ def main():
             print(f"⚠️  Could not connect to PostgreSQL: {e}")
             products = None
 
+        # PostgreSQL is optional - handle connection errors gracefully
+        try:
+            products = get_products()
+        except Exception as e:
+            print(f"⚠️  Could not connect to PostgreSQL: {e}")
+            products = None
+
         # ClickHouse is optional - handle connection errors gracefully
         try:
             orders = get_orders()

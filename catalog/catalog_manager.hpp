@@ -8,6 +8,7 @@
 #include "connectors/clickhouse/manager.hpp"
 #include "connectors/mysql/manager.hpp"
 #include "connectors/postgresql/manager.hpp"
+#include "connectors/clickhouse/manager.hpp"
 #include "otterbrix/parser/parser.hpp"
 #include "otterbrix/query_generation/sql_query_generator.hpp"
 #include "otterbrix/translators/input/ch_to_chunk.hpp"
@@ -100,11 +101,11 @@ namespace mysql {
         std::shared_ptr<ConnectorManager> mysql_conn_manager_;
         std::shared_ptr<pg::ConnectorManager> pg_conn_manager_;
         std::shared_ptr<ch::ConnectorManager> ch_conn_manager_;
-        std::mutex mutex_;
+        OTX_LOCKABLE_N(std::mutex, mutex_, "CatalogManager::mutex");
         actor_zeta::behavior_t current_behavior_;
 
         // Connection type registry
-        mutable std::mutex connection_registry_mtx_;
+        mutable OTX_LOCKABLE_N(std::mutex, connection_registry_mtx_, "CatalogManager::connection_registry_mtx");
         std::unordered_map<std::string, catalog_ext::ConnectionInfo> connection_registry_;
 
         auto update_backend_type_impl(ParsedQueryDataPtr&& data) -> ParsedQueryDataPtr const;

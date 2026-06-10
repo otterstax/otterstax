@@ -1,0 +1,124 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2025-2026  OtterStax
+
+services:
+  bench_mariadb1:
+    image: mariadb:latest
+    container_name: bench_mariadb1
+    environment:
+      MYSQL_ROOT_PASSWORD: root_password
+      MYSQL_DATABASE: benchdb1
+      MYSQL_USER: user1
+      MYSQL_PASSWORD: password1
+    expose:
+      - "3306"
+    healthcheck:
+      test: ["CMD", "mariadb-admin", "ping", "-h", "localhost", "-u", "user1", "-ppassword1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    networks:
+      - bench_net
+    restart: unless-stopped
+
+  bench_mariadb2:
+    image: mariadb:latest
+    container_name: bench_mariadb2
+    environment:
+      MYSQL_ROOT_PASSWORD: root_password
+      MYSQL_DATABASE: benchdb2
+      MYSQL_USER: user2
+      MYSQL_PASSWORD: password2
+    expose:
+      - "3306"
+    healthcheck:
+      test: ["CMD", "mariadb-admin", "ping", "-h", "localhost", "-u", "user2", "-ppassword2"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    networks:
+      - bench_net
+    restart: unless-stopped
+
+  bench_postgres1:
+    image: postgres:15
+    container_name: bench_postgres1
+    environment:
+      POSTGRES_USER: pguser
+      POSTGRES_PASSWORD: pgpassword
+      POSTGRES_DB: benchpg1
+    expose:
+      - "5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pguser -d benchpg1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    networks:
+      - bench_net
+    restart: unless-stopped
+
+  bench_postgres2:
+    image: postgres:15
+    container_name: bench_postgres2
+    environment:
+      POSTGRES_USER: pguser
+      POSTGRES_PASSWORD: pgpassword
+      POSTGRES_DB: benchpg2
+    expose:
+      - "5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pguser -d benchpg2"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    networks:
+      - bench_net
+    restart: unless-stopped
+
+  bench_clickhouse1:
+    image: clickhouse/clickhouse-server:23.8
+    container_name: bench_clickhouse1
+    environment:
+      CLICKHOUSE_DB: benchch1
+      CLICKHOUSE_USER: chuser
+      CLICKHOUSE_PASSWORD: chpassword
+    expose:
+      - "9000"
+    healthcheck:
+      test: ["CMD-SHELL", "clickhouse-client --user chuser --password chpassword --query 'SELECT 1'"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    networks:
+      - bench_net
+    restart: unless-stopped
+
+  bench_clickhouse2:
+    image: clickhouse/clickhouse-server:23.8
+    container_name: bench_clickhouse2
+    environment:
+      CLICKHOUSE_DB: benchch2
+      CLICKHOUSE_USER: chuser
+      CLICKHOUSE_PASSWORD: chpassword
+    expose:
+      - "9000"
+    healthcheck:
+      test: ["CMD-SHELL", "clickhouse-client --user chuser --password chpassword --query 'SELECT 1'"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    networks:
+      - bench_net
+    restart: unless-stopped
+
+networks:
+  bench_net:
+    name: bench_net
+    driver: bridge

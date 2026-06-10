@@ -1,0 +1,21 @@
+# OtterStax Benchmark Configuration
+
+# Repetitions per sub-test query (can be overridden with --repetitions)
+repetitions: 5
+
+# Group A — large databases (mysql1 / pg1 / ch1)
+# Used by: simple_select, complex_select, join_same_instance (camp×imp), join_all
+group_a:
+  num_campaigns: 1000
+  impressions_per_campaign: 60   # ~60k impressions total
+  stats_per_campaign: 60         # ~60k daily_stats total
+  batch_size: 1000
+
+# Group B — small databases (mysql2 / pg2 / ch2)
+# Used by: simple_select, complex_select, join_same_instance (prod×ord), join_cross_engine
+group_b:
+  num_campaigns: 1000
+  products_per_campaign: 5       # ~5k products total
+  orders_per_product: 1          # ~5k orders total  (≈ 5 per campaign)
+  events_per_campaign: 4         # ~4k events  total
+  batch_size: 1000

@@ -8,7 +8,7 @@
 #include "scheduler/schema_utils.hpp"
 #include "utility/cv_wrapper.hpp"
 #include "utility/logger.hpp"
-#include "utility/timer.hpp"
+#include "utility/tracy_profiler.hpp"
 #include "utility/wait_barrier.hpp"
 
 #include <thread>
@@ -31,7 +31,8 @@ ClickhouseManager::ClickhouseManager(std::pmr::memory_resource* res,
 
 std::pair<bool, actor_zeta::detail::enqueue_result>
 ClickhouseManager::enqueue_impl(actor_zeta::mailbox::message_ptr msg) {
-    std::lock_guard<std::mutex> guard(mutex_);
+    OTX_ZONE_N("ClickhouseManager::enqueue_impl");
+    std::lock_guard guard(mutex_);
     current_behavior_ = behavior(msg.get());
 
     while (current_behavior_.is_busy()) {
@@ -49,6 +50,7 @@ ClickhouseManager::enqueue_impl(actor_zeta::mailbox::message_ptr msg) {
 }
 
 actor_zeta::behavior_t ClickhouseManager::behavior(actor_zeta::mailbox::message* msg) {
+    OTX_ZONE_N("ClickhouseManager::behavior");
     auto cmd = msg->command();
     if (cmd == actor_zeta::msg_id<ClickhouseManager, &ClickhouseManager::execute>) {
         co_await actor_zeta::dispatch(this, &ClickhouseManager::execute, msg);
@@ -56,11 +58,10 @@ actor_zeta::behavior_t ClickhouseManager::behavior(actor_zeta::mailbox::message*
 }
 
 actor_zeta::unique_future<otterstax::result<ParsedQueryDataPtr>> ClickhouseManager::execute(session_hash_t id,
-                                                                                            ParsedQueryDataPtr data) {
+                                                                                              ParsedQueryDataPtr data) {
+    OTX_ZONE_N("ClickhouseManager::execute");
     assert(data);
     try {
-        Timer timer("ClickhouseManager::execute", log_);
-
         log_->debug("execute started, id hash: {}", id);
         log_->debug("execute data valid: {}, otterbrix_params valid: {}",
                     data != nullptr,
@@ -74,6 +75,7 @@ actor_zeta::unique_future<otterstax::result<ParsedQueryDataPtr>> ClickhouseManag
         for (auto it = data->otterbrix_params->external_nodes.rbegin();
              it != data->otterbrix_params->external_nodes.rend();
              ++it) {
+            OTX_ZONE_N("ClickhouseManager::batch");
             log_->debug("execute Current batch size: {}", it->size());
             std::vector<std::string> generated_queries;
             generated_queries.reserve(it->size());
@@ -82,6 +84,7 @@ actor_zeta::unique_future<otterstax::result<ParsedQueryDataPtr>> ClickhouseManag
             // Track which indices we processed (for mixed backend, we skip non-ClickHouse nodes)
             std::vector<size_t> processed_indices;
             for (size_t i = 0; i < it->size(); i++) {
+                OTX_ZONE_N("ClickhouseManager::node_dispatch");
                 log_->trace("Execute query: {}", ++counter);
 
                 auto& node = *(*it)[i];
@@ -159,6 +162,7 @@ actor_zeta::unique_future<otterstax::result<ParsedQueryDataPtr>> ClickhouseManag
             log_->debug("execute Run Query Success! results count: {}", wait_guard.results.size());
             assert(generated_queries.size() == processed_indices.size());
             for (size_t j = 0; j < processed_indices.size(); j++) {
+                OTX_ZONE_N("ClickhouseManager::to_chunk");
                 size_t i = processed_indices[j];
                 auto& chunk_ptr = wait_guard.results[j];
                 if (chunk_ptr) {

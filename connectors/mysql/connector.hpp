@@ -21,6 +21,7 @@
 
 #include "otterbrix/translators/input/mysql_to_chunk.hpp"
 #include "utility/asio_error.hpp"
+#include "utility/tracy_profiler.hpp"
 #include <otterbrix/otterbrix.hpp>
 
 #include <concepts>
@@ -104,7 +105,8 @@ namespace mysql {
         requires std::invocable<Callable, const boost::mysql::results&>
             asio::awaitable<std::invoke_result_t<Callable, const boost::mysql::results&>>
             runQuery_(std::string_view query, Callable handler) {
-            // log_->trace("Thread id: {}", std::this_thread::get_id()); // Removed: fmt doesn't format thread::id
+            // OTX_ZONE_N omitted: this coroutine crosses io_context threads via
+            // co_await — opening a Tracy zone here causes "Zone is ended twice".
             if (status_ != Status::Connected) {
                 std::string err = "[Run query] Connector with alias: " + alias_ + " is not connected";
                 log_->error(err);

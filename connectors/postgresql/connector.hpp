@@ -18,6 +18,7 @@
 #include "types.hpp"
 #include "otterbrix/translators/input/pg_to_chunk.hpp"
 #include "utility/asio_error.hpp"
+#include "utility/tracy_profiler.hpp"
 #include <otterbrix/otterbrix.hpp>
 
 #include <concepts>
@@ -109,6 +110,7 @@ namespace pg {
         requires std::invocable<Callable, PGresult*>
             asio::awaitable<std::invoke_result_t<Callable, PGresult*>>
             runQuery_(std::string_view query, Callable handler) {
+            OTX_ZONE_N("pg::Connector::runQuery");
             if (status_ != Status::Connected) {
                 std::string err = "[Run query] Connector with alias: " + alias_ + " is not connected";
                 log_->error(err);

@@ -3,6 +3,8 @@
 
 #include "schema_utils.hpp"
 
+#include "utility/tracy_profiler.hpp"
+
 #include <core/result_wrapper.hpp>
 
 using namespace components;
@@ -91,6 +93,7 @@ namespace schema_utils {
     complex_logical_type aggregate_filter_schema(const logical_plan::node_aggregate_t& node,
                                                  logical_plan::parameter_node_t* params,
                                                  const std::vector<complex_logical_type>& schema_types) {
+        OTX_ZONE_N("schema_utils::aggregate_filter_schema");
         auto it = std::find_if(node.children().begin(), node.children().end(), [](logical_plan::node_ptr node) {
             return node->type() == logical_plan::node_type::select_t;
         });
@@ -182,6 +185,7 @@ namespace schema_utils {
                                                   logical_plan::parameter_node_t* params,
                                                   cursor::cursor_t_ptr catalog,
                                                   std::pmr::map<collection_full_name_t, size_t> dependencies) {
+        OTX_ZONE_N("schema_utils::compute_otterbrix_schema");
         bool has_join = false;
         complex_logical_type schema;
         for (const auto& chld : node.children()) {
@@ -217,6 +221,7 @@ namespace schema_utils {
                                                     logical_plan::parameter_node_t* params,
                                                     cursor::cursor_t_ptr catalog,
                                                     const std::pmr::map<collection_full_name_t, size_t>& dependencies) {
+        OTX_ZONE_N("schema_utils::compute_join_schema");
         assert(node.children().size() == 2);
 
         if (node.children().front()->type() == logical_plan::node_type::join_t) {

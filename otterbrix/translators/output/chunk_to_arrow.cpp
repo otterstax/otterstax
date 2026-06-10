@@ -3,6 +3,8 @@
 
 #include "chunk_to_arrow.hpp"
 
+#include "utility/tracy_profiler.hpp"
+
 using namespace components::vector;
 using namespace components::types;
 using namespace components;
@@ -57,6 +59,7 @@ namespace {
 } // namespace
 
 std::shared_ptr<arrow::Schema> to_arrow_schema(const std::pmr::vector<components::types::complex_logical_type>& types) {
+    OTX_ZONE_N("tsl::to_arrow_schema(vec)");
     arrow::FieldVector field_vector;
     field_vector.reserve(types.size());
     for (const auto& type : types) {
@@ -66,6 +69,7 @@ std::shared_ptr<arrow::Schema> to_arrow_schema(const std::pmr::vector<components
 }
 
 std::shared_ptr<arrow::Schema> to_arrow_schema(const components::types::complex_logical_type& struct_t) {
+    OTX_ZONE_N("tsl::to_arrow_schema(struct)");
     if (struct_t.type() != types::logical_type::STRUCT) {
         // logical_type::NA case - empty schema
         return arrow::schema({});

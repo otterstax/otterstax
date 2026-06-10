@@ -6,6 +6,7 @@
 #include <components/log/log.hpp>
 
 #include "connector.hpp"
+#include "utility/tracy_profiler.hpp"
 
 #include <concepts>
 #include <coroutine>
@@ -50,6 +51,7 @@ namespace ch {
         requires std::invocable<Callable, const std::vector<clickhouse::Block>&>
             std::future<std::invoke_result_t<Callable, const std::vector<clickhouse::Block>&>>
             executeQuery(const std::string& uuid, std::string_view query, Callable handler) {
+            OTX_ZONE_N("ch::ConnectorManager::executeQuery");
             auto conn = connections_.find(uuid);
             if (conn == connections_.end()) {
                 log_->error("[ChConnectorManager::executeQuery] Invalid connection uuid: {}", uuid);

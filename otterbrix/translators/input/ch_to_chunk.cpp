@@ -1,5 +1,7 @@
 #include "ch_to_chunk.hpp"
 
+#include "utility/tracy_profiler.hpp"
+
 #include <charconv>
 #include <cstdlib>
 #include <cstring>
@@ -416,6 +418,7 @@ namespace tsl {
     data_chunk_t ch_to_chunk(std::pmr::memory_resource* resource,
                              const clickhouse::Block& block,
                              const std::unordered_map<std::string, std::string>& named_type_overrides) {
+        OTX_ZONE_N("tsl::ch_to_chunk(block)");
         const size_t ncols = block.GetColumnCount();
         const size_t nrows = block.GetRowCount();
 
@@ -455,6 +458,7 @@ namespace tsl {
     data_chunk_t ch_to_chunk(std::pmr::memory_resource* resource,
                              const std::vector<clickhouse::Block>& blocks,
                              const std::unordered_map<std::string, std::string>& named_type_overrides) {
+        OTX_ZONE_N("tsl::ch_to_chunk(blocks)");
         // Find schema block (first with column metadata) and count total rows
         const clickhouse::Block* schema_block = nullptr;
         size_t total_rows = 0;

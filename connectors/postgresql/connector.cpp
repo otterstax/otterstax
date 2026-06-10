@@ -4,6 +4,7 @@
 #include "connector.hpp"
 
 #include "utility/logger.hpp"
+#include "utility/tracy_profiler.hpp"
 #include <functional>
 #include <memory>
 #include <string>
@@ -25,6 +26,7 @@ namespace pg {
     Status Connector::status() const noexcept { return status_; }
 
     void Connector::close() {
+        OTX_ZONE_N("pg::Connector::close");
         log_->debug("Alias: {} close connection", alias_);
         if (status_ != Status::Connected) {
             return;
@@ -36,6 +38,7 @@ namespace pg {
     Connector::~Connector() { close(); }
 
     void Connector::connect() {
+        OTX_ZONE_N("pg::Connector::connect");
         std::string conn_str = params_.connection_string();
         log_->debug("Alias: {} connecting with: host={} port={} dbname={}",
                     alias_, params_.host, params_.port, params_.database);
@@ -53,6 +56,7 @@ namespace pg {
     }
 
     bool Connector::isConnected() {
+        OTX_ZONE_N("pg::Connector::isConnected");
         if (status_ != Status::Connected)
             return false;
 
@@ -73,6 +77,7 @@ namespace pg {
     }
 
     void Connector::tryReconnect() {
+        OTX_ZONE_N("pg::Connector::tryReconnect");
         if (status_ == Status::Connected) {
             return;
         }

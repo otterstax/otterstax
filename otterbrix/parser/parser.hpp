@@ -4,6 +4,7 @@
 #pragma once
 
 #include "types/otterbrix.hpp"
+#include "utility/logger.hpp"
 
 #include <otterbrix/otterbrix.hpp>
 
@@ -62,6 +63,7 @@ public:
 
 private:
     std::pmr::memory_resource* resource_;
+    log_t log_;
 };
 
 using parser_ptr = std::unique_ptr<IParser>;

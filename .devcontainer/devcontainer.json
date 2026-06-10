@@ -16,10 +16,16 @@
 	// "features": {},
 
 	// Use 'forwardPorts' to make a list of ports inside the container available locally.
-	// "forwardPorts": [],
+	"forwardPorts": [8086],
+	"portsAttributes": {
+		"8086": {
+			"label": "Tracy profiler",
+			"onAutoForward": "silent"
+		}
+	},
 
 	// Use 'postCreateCommand' to run commands after the container is created.
-	"postCreateCommand": "conan profile detect --force && (conan remote list | grep -q otterbrix || conan remote add otterbrix http://conan.otterbrix.com) && if ! grep -q 'otterbrix history sync' /home/vscode/.bashrc; then printf '\n# otterbrix history sync\nexport HISTFILE=~/.bash_history\nshopt -s histappend\nPROMPT_COMMAND=\"history -a; history -n; ${PROMPT_COMMAND}\"\n' >> /home/vscode/.bashrc; fi && if ! grep -q 'otterbrix history sync' /home/vscode/.zshrc; then printf '\n# otterbrix history sync\nexport HISTFILE=~/.zsh_history\nsetopt APPEND_HISTORY SHARE_HISTORY\n' >> /home/vscode/.zshrc; fi",
+	"postCreateCommand": "conan profile detect --force && sed -i 's/compiler.cppstd=.*/compiler.cppstd=gnu20/' \"${CONAN_HOME}/profiles/default\" && (conan remote list | grep -q otterbrix || conan remote add otterbrix http://conan.otterbrix.com) && if ! grep -q 'otterbrix history sync' /home/vscode/.bashrc; then printf '\n# otterbrix history sync\nexport HISTFILE=~/.bash_history\nshopt -s histappend\nPROMPT_COMMAND=\"history -a; history -n; ${PROMPT_COMMAND}\"\n' >> /home/vscode/.bashrc; fi && if ! grep -q 'otterbrix history sync' /home/vscode/.zshrc; then printf '\n# otterbrix history sync\nexport HISTFILE=~/.zsh_history\nsetopt APPEND_HISTORY SHARE_HISTORY\n' >> /home/vscode/.zshrc; fi",
 
 	"containerEnv": {
 		"CONAN_USER_HOME": "/conan",
@@ -66,7 +72,7 @@
 				"cmake.parallelJobs": 4
 			}
 		}
-	},
+	}
 
 	// Uncomment to connect as root instead. More info: https://aka.ms/dev-containers-non-root.
 	// "remoteUser": "root"

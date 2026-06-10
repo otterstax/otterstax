@@ -11,6 +11,8 @@
 #include "utility/pipeline_error.hpp"
 #include "utility/session.hpp"
 #include <actor-zeta.hpp>
+#include <components/catalog/catalog_oids.hpp>
+#include <components/table/column_definition.hpp>
 
 #include <memory_resource>
 #include <mutex>
@@ -34,10 +36,31 @@ namespace db {
 
         actor_zeta::unique_future<otterstax::result<std::pair<components::cursor::cursor_t_ptr, ParsedQueryDataPtr>>>
         get_schema(session_hash_t id,
-                   std::pmr::map<collection_full_name_t, size_t> dependencies,
+                   std::pmr::map<qualified_name_t, size_t> dependencies,
                    ParsedQueryDataPtr data);
 
-        using dispatch_traits = actor_zeta::dispatch_traits<&OtterbrixManager::execute, &OtterbrixManager::get_schema>;
+        // Registration channel: mirrors external (remote-backend) tables into the
+        // engine pg_catalog so the planner can resolve them by OID.
+        // Creates the engine database "<db_name>" (one per connection uid).
+        actor_zeta::unique_future<otterstax::result<bool>> register_external_database(std::string db_name);
+
+        // Creates collection `encoded_collection` in database `encoded_db` and
+        // reads back its pg_class OID. `name` is the original qualified name,
+        // used for diagnostics only.
+        actor_zeta::unique_future<otterstax::result<components::catalog::oid_t>>
+        register_external_table(qualified_name_t name,
+                                std::string encoded_db,
+                                std::string encoded_collection,
+                                std::vector<components::table::column_definition_t> columns);
+
+        // Drops the engine database "<db_name>" together with all collections.
+        actor_zeta::unique_future<otterstax::result<bool>> drop_external_database(std::string db_name);
+
+        using dispatch_traits = actor_zeta::dispatch_traits<&OtterbrixManager::execute,
+                                                            &OtterbrixManager::get_schema,
+                                                            &OtterbrixManager::register_external_database,
+                                                            &OtterbrixManager::register_external_table,
+                                                            &OtterbrixManager::drop_external_database>;
 
         actor_zeta::behavior_t behavior(actor_zeta::mailbox::message* msg);
 

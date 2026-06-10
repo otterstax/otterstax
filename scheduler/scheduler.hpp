@@ -16,7 +16,6 @@
 #include "utility/pipeline_error.hpp"
 #include "utility/session.hpp"
 #include "utility/session_payload.hpp"
-#include <components/catalog/catalog.hpp>
 
 #include <condition_variable>
 #include <iostream>

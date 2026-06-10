@@ -41,7 +41,7 @@ namespace ch {
             connections_[uuid]->connect();
 
             // ClickHouse: no schema level, use database.table
-            collection_full_name_t name(uuid, connection_param.database, "", connection_param.table);
+            qualified_name_t name(uuid, connection_param.database, "", connection_param.table);
             log_->debug("Creating collection_full_name: uid={}, db={}, schema={}, table={}",
                         name.unique_identifier,
                         name.database,

@@ -40,6 +40,7 @@ arrow::Status ChunkBatchReader::ReadNext(std::shared_ptr<arrow::RecordBatch>* ou
     };
 
     // Fill builders with row data
+    std::vector<bool> field_filled(static_cast<size_t>(num_fields), false);
     for (size_t i = 0; i < chunk_.column_count(); i++) {
         // field order could be different
         auto index = schema_ptr_->GetFieldIndex(chunk_.data[i].type().alias());
@@ -47,6 +48,12 @@ arrow::Status ChunkBatchReader::ReadNext(std::shared_ptr<arrow::RecordBatch>* ou
             // field is absent in schema - ignore
             continue;
         }
+        if (field_filled[static_cast<size_t>(index)]) {
+            // duplicate column name in the chunk (e.g. both join keys of an
+            // engine JOIN result) — the schema carries it once; keep the first.
+            continue;
+        }
+        field_filled[static_cast<size_t>(index)] = true;
 
         const auto& field = schema_ptr_->field(index);
         const auto& field_type = field->type();

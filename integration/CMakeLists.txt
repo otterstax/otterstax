@@ -23,6 +23,8 @@ target_link_libraries(integration PUBLIC
     actor-zeta::actor-zeta
     PostgreSQL::PostgreSQL
     clickhouse-cpp-lib::clickhouse-cpp-lib
+    OpenSSL::Crypto
+    OpenSSL::SSL
 )
 
 target_include_directories(integration PUBLIC

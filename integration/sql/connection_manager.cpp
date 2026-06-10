@@ -76,22 +76,28 @@ MySQLManager::execute(session_hash_t id, ParsedQueryDataPtr data) {
         log_->debug("execute Execute batches: {}", data->otterbrix_params->external_nodes.size());
         // Execute queries
         size_t counter = 0;
-        for (auto it = data->otterbrix_params->external_nodes.rbegin();
-             it != data->otterbrix_params->external_nodes.rend();
-             ++it) {
-            log_->debug("execute Current batch size: {}", it->size());
+        auto& batches = data->otterbrix_params->external_nodes;
+        auto& targets = data->otterbrix_params->external_targets;
+        assert(targets.size() == batches.size());
+        // Batches are processed back to front (innermost dependencies first).
+        for (size_t batch = batches.size(); batch-- > 0;) {
+            auto& batch_nodes = batches[batch];
+            const auto& batch_targets = targets[batch];
+            assert(batch_targets.size() == batch_nodes.size());
+            log_->debug("execute Current batch size: {}", batch_nodes.size());
             std::vector<std::string> generated_queries;
-            generated_queries.reserve(it->size());
+            generated_queries.reserve(batch_nodes.size());
             // wrapped in unique_ptr because data_chunk does not have a default constructor
             QueryHandleWaiter<std::unique_ptr<components::vector::data_chunk_t>> wait_guard{};
             // Order inside batch does not matter
             // Track which indices we processed (for mixed backend, we skip non-MySQL nodes)
             std::vector<size_t> processed_indices;
-            for (size_t i = 0; i < it->size(); i++) {
+            for (size_t i = 0; i < batch_nodes.size(); i++) {
                 log_->trace("Execute query: {}", ++counter);
 
-                auto& node = *(*it)[i];
-                const auto& uid = node->collection_full_name().unique_identifier;
+                auto& node = *batch_nodes[i];
+                const auto& target = batch_targets[i];
+                const auto& uid = target.name.unique_identifier;
                 log_->trace("UID: {}", uid);
 
                 // For mixed backend: skip nodes that don't belong to MySQL
@@ -122,13 +128,17 @@ MySQLManager::execute(session_hash_t id, ParsedQueryDataPtr data) {
                         generated_queries.emplace_back(
                             sql_gen::generate_query(sn.agg_node(),
                                                     &data->otterbrix_params->params_node->parameters(),
-                                                    backend_type_t::MySQL));
+                                                    backend_type_t::MySQL,
+                                                    target,
+                                                    batch_targets));
                     }
                 } else {
                     generated_queries.emplace_back(
                         sql_gen::generate_query(node,
                                                 &data->otterbrix_params->params_node->parameters(),
-                                                backend_type_t::MySQL));
+                                                backend_type_t::MySQL,
+                                                target,
+                                                batch_targets));
                 }
                 log_->debug("execute Generated SQL Query: \"{}\"", generated_queries.back());
                 wait_guard.futures.push_back(
@@ -154,7 +164,7 @@ MySQLManager::execute(session_hash_t id, ParsedQueryDataPtr data) {
                 }
                 auto tmp = std::move(*wait_guard.results[j]);
                 auto data_node = logical_plan::make_node_raw_data(resource(), std::move(tmp));
-                *(*it)[i] = data_node;
+                *batch_nodes[i] = data_node;
             }
         }
         log_->debug("execute finished");

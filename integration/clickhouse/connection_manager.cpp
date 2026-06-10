@@ -71,21 +71,27 @@ actor_zeta::unique_future<otterstax::result<ParsedQueryDataPtr>> ClickhouseManag
 
         // Execute queries - ONLY fetch data, no JOIN operations
         size_t counter = 0;
-        for (auto it = data->otterbrix_params->external_nodes.rbegin();
-             it != data->otterbrix_params->external_nodes.rend();
-             ++it) {
-            log_->debug("execute Current batch size: {}", it->size());
+        auto& batches = data->otterbrix_params->external_nodes;
+        auto& targets = data->otterbrix_params->external_targets;
+        assert(targets.size() == batches.size());
+        // Batches are processed back to front (innermost dependencies first).
+        for (size_t batch = batches.size(); batch-- > 0;) {
+            auto& batch_nodes = batches[batch];
+            const auto& batch_targets = targets[batch];
+            assert(batch_targets.size() == batch_nodes.size());
+            log_->debug("execute Current batch size: {}", batch_nodes.size());
             std::vector<std::string> generated_queries;
-            generated_queries.reserve(it->size());
+            generated_queries.reserve(batch_nodes.size());
             QueryHandleWaiter<std::unique_ptr<components::vector::data_chunk_t>> wait_guard{};
 
             // Track which indices we processed (for mixed backend, we skip non-ClickHouse nodes)
             std::vector<size_t> processed_indices;
-            for (size_t i = 0; i < it->size(); i++) {
+            for (size_t i = 0; i < batch_nodes.size(); i++) {
                 log_->trace("Execute query: {}", ++counter);
 
-                auto& node = *(*it)[i];
-                const auto& uid = node->collection_full_name().unique_identifier;
+                auto& node = *batch_nodes[i];
+                const auto& target = batch_targets[i];
+                const auto& uid = target.name.unique_identifier;
                 log_->trace("UID: {}", uid);
 
                 // Skip nodes that have already been processed (type is data_t - already fetched by another backend)
@@ -121,17 +127,21 @@ actor_zeta::unique_future<otterstax::result<ParsedQueryDataPtr>> ClickhouseManag
                         generated_queries.emplace_back(
                             sql_gen::generate_query(sn.agg_node(),
                                                     &data->otterbrix_params->params_node->parameters(),
-                                                    backend_type_t::ClickHouse));
+                                                    backend_type_t::ClickHouse,
+                                                    target,
+                                                    batch_targets));
                     }
                 } else {
                     generated_queries.emplace_back(
                         sql_gen::generate_query(node,
                                                 &data->otterbrix_params->params_node->parameters(),
-                                                backend_type_t::ClickHouse));
+                                                backend_type_t::ClickHouse,
+                                                target,
+                                                batch_targets));
                 }
                 log_->debug("execute Generated ClickHouse Query: \"{}\"", generated_queries.back());
 
-                std::string table_name = std::string(node->collection_full_name().collection);
+                std::string table_name = target.name.collection;
                 if (node->type() == logical_plan::node_type::unused) {
                     const auto& sn = static_cast<const schema_utils::schema_node_t&>(*node);
                     if (sn.has_raw_sql() && !sn.qualifiers().empty()) {
@@ -168,7 +178,7 @@ actor_zeta::unique_future<otterstax::result<ParsedQueryDataPtr>> ClickhouseManag
                 }
                 auto tmp = std::move(*wait_guard.results[j]);
                 auto data_node = logical_plan::make_node_raw_data(resource(), std::move(tmp));
-                *(*it)[i] = data_node;
+                *batch_nodes[i] = data_node;
             }
         }
         log_->debug("execute finished");

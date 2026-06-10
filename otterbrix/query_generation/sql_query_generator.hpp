@@ -8,8 +8,12 @@
 #include <components/types/types.hpp>
 #include <components/vector/data_chunk.hpp>
 
+#include "otterbrix/parser/name_resolution.hpp"
 #include "otterbrix/parser/parser.hpp"
 #include "otterbrix/parser/subquery_extractor.hpp"
+
+#include <memory_resource>
+#include <vector>
 
 namespace sql_gen {
 
@@ -20,18 +24,32 @@ namespace sql_gen {
     // Generate table reference string based on backend type
     // MySQL: database.collection
     // PostgreSQL: schema.collection (e.g., public.products)
-    std::string table_reference(const collection_full_name_t& name, backend_type_t backend = backend_type_t::MySQL);
+    std::string table_reference(const qualified_name_t& name, backend_type_t backend = backend_type_t::MySQL);
 
     std::string replace_qualifiers(std::string raw_sql,
                                    const std::vector<otterstax::parser::qualifier_rewrite_t>& quals,
                                    backend_type_t backend);
 
+    // Generate backend SQL for an external logical-plan node.
+    //
+    // `target` is THE resolved entry for `node`:
+    //   - target.name      — full alias.db.schema.table the statement operates on
+    //   - target.from_name — secondary table for UPDATE ... FROM / DELETE ... USING
+    //                        (empty otherwise; the clause is omitted when empty)
+    // `batch_targets` carries the whole batch's resolved targets (oids stamped
+    // by CatalogManager before SQL generation). It is used to resolve the inner
+    // SELECT table of INSERT ... SELECT via the child aggregate's table_oid();
+    // it may be empty for probe queries that have no INSERT ... SELECT shape.
     void generate_query(std::stringstream& stream,
                         const components::logical_plan::node_ptr& node,
                         const components::logical_plan::storage_parameters* parameters,
-                        backend_type_t backend = backend_type_t::MySQL);
+                        backend_type_t backend,
+                        const otterstax::names::resolved_target_t& target,
+                        const std::pmr::vector<otterstax::names::resolved_target_t>& batch_targets);
     std::string generate_query(const components::logical_plan::node_ptr& node,
                                const components::logical_plan::storage_parameters* parameters,
-                               backend_type_t backend = backend_type_t::MySQL);
+                               backend_type_t backend,
+                               const otterstax::names::resolved_target_t& target,
+                               const std::pmr::vector<otterstax::names::resolved_target_t>& batch_targets);
 
 } // namespace sql_gen

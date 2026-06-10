@@ -3,37 +3,49 @@
 
 #include "parser.hpp"
 
+#include "name_resolution.hpp"
 #include "scheduler/schema_utils.hpp"
 #include "subquery_extractor.hpp"
 
+#include <components/logical_plan/node_aggregate.hpp>
+#include <components/logical_plan/node_catalog_resolve_table.hpp>
 #include <components/logical_plan/node_function.hpp>
 #include <components/sql/parser/parser.h>
 #include <components/sql/transformer/utils.hpp>
 
+#include <cassert>
 #include <deque>
 #include <iostream>
 
 using namespace components;
 
 namespace {
-    void swap_stubs_into_schema_nodes(std::pmr::memory_resource* resource,
-                                      std::vector<std::vector<logical_plan::node_ptr*>>& external_nodes,
-                                      const std::vector<otterstax::parser::subquery_stub_t>& stubs) {
+    void swap_stubs_into_schema_nodes(
+        std::pmr::memory_resource* resource,
+        std::vector<std::vector<logical_plan::node_ptr*>>& external_nodes,
+        const std::pmr::vector<std::pmr::vector<otterstax::names::resolved_target_t>>& external_targets,
+        const std::vector<otterstax::parser::subquery_stub_t>& stubs) {
         if (stubs.empty()) {
             return;
         }
 
-        for (auto& batch : external_nodes) {
-            for (auto* slot : batch) {
-                auto& node_ref = *slot;
+        assert(external_targets.size() == external_nodes.size() &&
+               "external_targets must mirror external_nodes 1:1");
+        for (size_t batch = 0; batch < external_nodes.size(); ++batch) {
+            assert(external_targets[batch].size() == external_nodes[batch].size() &&
+                   "external_targets must mirror external_nodes 1:1");
+            for (size_t i = 0; i < external_nodes[batch].size(); ++i) {
+                auto& node_ref = *external_nodes[batch][i];
                 if (node_ref->type() != logical_plan::node_type::aggregate_t) {
                     continue;
                 }
-                const auto& cfn = node_ref->collection_full_name();
-                if (cfn.collection.size() < otterstax::parser::k_stub_prefix.size() ||
-                    cfn.collection.compare(0,
-                                           otterstax::parser::k_stub_prefix.size(),
-                                           otterstax::parser::k_stub_prefix) != 0) {
+                // A stub is an aggregate whose relname is the generated stub id.
+                const std::string& relname =
+                    static_cast<const logical_plan::node_aggregate_t&>(*node_ref).relname().t;
+                if (relname.size() < otterstax::parser::k_stub_prefix.size() ||
+                    relname.compare(0,
+                                    otterstax::parser::k_stub_prefix.size(),
+                                    otterstax::parser::k_stub_prefix) != 0) {
                     continue;
                 }
 
@@ -55,11 +67,15 @@ namespace {
                     continue;
                 }
                 for (const auto& stub : stubs) {
-                    if (stub.stub_id != cfn.collection) {
+                    if (stub.stub_id != relname) {
                         continue;
                     }
+                    // The resolved target for this slot is the promoted stub
+                    // RangeVar (`<uid>.subq.subq.<stub_id>`). Stubs are always
+                    // uid-qualified, so every stub slot has a resolved target.
+                    const qualified_name_t& name = external_targets[batch][i].name;
                     auto schema_node =
-                        schema_utils::make_node_schema_raw(resource, cfn, stub.raw_sql, stub.qualifiers);
+                        schema_utils::make_node_schema_raw(resource, name, stub.raw_sql, stub.qualifiers);
                     schema_node->set_result_alias(node_ref->result_alias());
                     node_ref = schema_node;
                     break;
@@ -105,9 +121,66 @@ static constexpr bool is_mutable(logical_plan::node_type type) {
     }
 }
 
-static size_t get_external_nodes(std::pmr::memory_resource* resource,
-                                 logical_plan::node_ptr& node,
-                                 std::vector<std::vector<logical_plan::node_ptr*>>& external_nodes) {
+// True when the node carries a table reference resolvable through the name
+// registry. Nodes with no name at all are local by construction and are
+// skipped here BEFORE resolution, so they can never produce a resolution
+// error. An aggregate_t with an empty relname is one of the wrapper
+// aggregates the transformer builds around JOIN trees / SELECT-without-FROM.
+static bool carries_table_reference(const logical_plan::node_t& node) {
+    switch (node.type()) {
+        case logical_plan::node_type::aggregate_t:
+            return !static_cast<const logical_plan::node_aggregate_t&>(node).relname().t.empty();
+        case logical_plan::node_type::insert_t:
+        case logical_plan::node_type::update_t:
+        case logical_plan::node_type::delete_t:
+        case logical_plan::node_type::create_collection_t:
+        case logical_plan::node_type::create_index_t:
+        case logical_plan::node_type::drop_collection_t:
+        case logical_plan::node_type::drop_index_t:
+            // Names live on the catalog_resolve_* sibling(s) inside the
+            // wrapping node_sequence_t; node_names() reads them via seq_ctx.
+            return true;
+        case logical_plan::node_type::create_database_t:
+        case logical_plan::node_type::drop_database_t:
+            // No alias is grammatically possible — local by construction.
+            return false;
+        default:
+            return false;
+    }
+}
+
+// Resolves the secondary table of UPDATE ... FROM / DELETE ... USING: the
+// wrapping sequence then carries a SECOND catalog_resolve_table_t. The first
+// resolve_table is the DML target (consumed by node_names); the second, when
+// present, is the FROM/USING source. Returns an empty name when there is no
+// second table.
+static core::result_wrapper_t<qualified_name_t>
+resolve_dml_from_name(std::pmr::memory_resource* resource,
+                      const otterstax::names::name_registry_t& registry,
+                      const logical_plan::node_t* seq_ctx) {
+    if (seq_ctx == nullptr) {
+        return qualified_name_t{};
+    }
+    size_t resolve_tables_seen = 0;
+    for (const auto& child : seq_ctx->children()) {
+        if (!child || child->type() != logical_plan::node_type::catalog_resolve_table_t) {
+            continue;
+        }
+        if (++resolve_tables_seen < 2) {
+            continue;
+        }
+        const auto& resolve = static_cast<const logical_plan::node_catalog_resolve_table_t&>(*child);
+        return otterstax::names::resolve_table_name(resource, registry, resolve.dbname(), resolve.relname());
+    }
+    return qualified_name_t{};
+}
+
+static core::result_wrapper_t<size_t>
+get_external_nodes(std::pmr::memory_resource* resource,
+                   const otterstax::names::name_registry_t& registry,
+                   logical_plan::node_ptr& node,
+                   std::vector<std::vector<logical_plan::node_ptr*>>& external_nodes,
+                   std::pmr::vector<std::pmr::vector<otterstax::names::resolved_target_t>>& external_targets) {
     struct lookup_node_t {
         logical_plan::node_ptr* ptr;
         logical_plan::node_ptr* parent_ptr;
@@ -115,34 +188,69 @@ static size_t get_external_nodes(std::pmr::memory_resource* resource,
     };
 
     external_nodes.emplace_back();
+    external_targets.emplace_back();
     size_t size = 0;
     std::deque<lookup_node_t> nodes_lookup;
     nodes_lookup.emplace_back(&node, nullptr, 0);
     while (!nodes_lookup.empty()) {
         auto& n = nodes_lookup.front();
-        if (!(*n.ptr)->collection_full_name().unique_identifier.empty() && is_valid_external((*n.ptr)->type())) {
-            {
-                // TODO: remove this segment when connection pool will be added
-                // For now uid call can not repeat inside a batch
-                auto it = std::find_if(external_nodes[n.batch_index].begin(),
-                                       external_nodes[n.batch_index].end(),
-                                       [&n](const auto& external_node) {
-                                           return (*external_node)->collection_full_name().unique_identifier ==
-                                                  (*n.ptr)->collection_full_name().unique_identifier;
-                                       });
-                if (it != external_nodes[n.batch_index].end()) {
-                    ++n.batch_index;
-                    if (external_nodes.size() == n.batch_index) {
-                        external_nodes.emplace_back();
+        const auto type = (*n.ptr)->type();
+        if (is_valid_external(type) && carries_table_reference(**n.ptr)) {
+            // DML roots are node_sequence_t wrappers; the DML node's names
+            // live on the sequence's catalog_resolve_table_t children, so
+            // pass the parent sequence as resolution context.
+            const logical_plan::node_t* seq_ctx =
+                (n.parent_ptr != nullptr && (*n.parent_ptr)->type() == logical_plan::node_type::sequence_t)
+                    ? n.parent_ptr->get()
+                    : nullptr;
+            auto resolved = otterstax::names::node_names(**n.ptr, registry, seq_ctx);
+            if (resolved.has_error()) {
+                return resolved.error();
+            }
+            qualified_name_t name = std::move(resolved.value());
+            // An empty unique_identifier marks a LOCAL (otterbrix) table —
+            // not external, not an error.
+            if (!name.unique_identifier.empty()) {
+                qualified_name_t from_name;
+                // The second resolve_table of the wrapping sequence carries the
+                // UPDATE...FROM / DELETE...USING source, or the index of a
+                // DROP INDEX (its first resolve_table is the indexed table).
+                if (type == logical_plan::node_type::update_t || type == logical_plan::node_type::delete_t ||
+                    type == logical_plan::node_type::drop_index_t) {
+                    auto from_resolved = resolve_dml_from_name(resource, registry, seq_ctx);
+                    if (from_resolved.has_error()) {
+                        return from_resolved.error();
+                    }
+                    from_name = std::move(from_resolved.value());
+                }
+                {
+                    // TODO: remove this segment when connection pool will be added
+                    // For now uid call can not repeat inside a batch
+                    auto it = std::find_if(external_targets[n.batch_index].begin(),
+                                           external_targets[n.batch_index].end(),
+                                           [&name](const auto& target) {
+                                               return target.name.unique_identifier == name.unique_identifier;
+                                           });
+                    if (it != external_targets[n.batch_index].end()) {
+                        ++n.batch_index;
+                        if (external_nodes.size() == n.batch_index) {
+                            external_nodes.emplace_back();
+                            external_targets.emplace_back();
+                        }
                     }
                 }
+                external_nodes[n.batch_index].emplace_back(n.ptr);
+                external_targets[n.batch_index].push_back(
+                    otterstax::names::resolved_target_t{components::catalog::INVALID_OID,
+                                                        std::move(name),
+                                                        std::move(from_name)});
+                ++size;
             }
-            external_nodes[n.batch_index].emplace_back(n.ptr);
-            ++size;
         }
-        bool mutable_node = is_mutable((*n.ptr)->type());
+        bool mutable_node = is_mutable(type);
         if (mutable_node) {
             external_nodes.emplace_back();
+            external_targets.emplace_back();
         }
         for (auto& child : (*n.ptr)->children()) {
             nodes_lookup.emplace_back(&child, n.ptr, n.batch_index + mutable_node);
@@ -152,6 +260,7 @@ static size_t get_external_nodes(std::pmr::memory_resource* resource,
 
     if (external_nodes.back().empty()) {
         external_nodes.erase(external_nodes.end() - 1);
+        external_targets.erase(external_targets.end() - 1);
     }
     return size;
 }
@@ -197,6 +306,13 @@ core::result_wrapper_t<ParsedQueryDataPtr> GreenplumParser::parse(const std::str
             otterstax::parser::promote_three_part_qualifiers(res);
         }
 
+        // Collect every RangeVar's full name (uid.db.schema.rel) from the
+        // promoted raw AST — including the stub RangeVars
+        // (`<uid>.subq.subq.__otterstax_subq_N`) injected by prepare_sql —
+        // before the transformer folds names down to (dbname, relname).
+        otterstax::names::name_registry_t registry(&arena_resource);
+        otterstax::parser::collect_qualified_names(res, registry);
+
         auto tag = nodeTag(res);
         std::cerr << "[Parser] Calling transformer.transform..." << std::endl;
         auto binder = transformer.transform(sql::transform::pg_cell_to_node_cast(res));
@@ -219,21 +335,35 @@ core::result_wrapper_t<ParsedQueryDataPtr> GreenplumParser::parse(const std::str
 
         std::cerr << "[Parser] Creating ParsedQueryData..." << std::endl;
         ParsedQueryDataPtr result = std::make_unique<ParsedQueryData>(
-            std::make_unique<OtterbrixStatement>(std::vector<std::vector<logical_plan::node_ptr*>>{},
-                                                 std::move(params),
-                                                 std::move(node),
-                                                 0,
-                                                 param_cnt),
+            std::make_unique<OtterbrixStatement>(
+                std::vector<std::vector<logical_plan::node_ptr*>>{},
+                std::pmr::vector<std::pmr::vector<otterstax::names::resolved_target_t>>{resource_},
+                std::move(params),
+                std::move(node),
+                0,
+                param_cnt),
             std::move(binder),
             tag);
 
         std::cerr << "[Parser] Calling get_external_nodes..." << std::endl;
-        result->otterbrix_params->external_nodes_count =
-            get_external_nodes(resource_, result->otterbrix_params->node, result->otterbrix_params->external_nodes);
+        auto external_count = get_external_nodes(resource_,
+                                                 registry,
+                                                 result->otterbrix_params->node,
+                                                 result->otterbrix_params->external_nodes,
+                                                 result->otterbrix_params->external_targets);
+        if (external_count.has_error()) {
+            std::cerr << "[Parser] external node name resolution failed: " << external_count.error().what.c_str()
+                      << std::endl;
+            return external_count.error();
+        }
+        result->otterbrix_params->external_nodes_count = external_count.value();
         std::cerr << "[Parser] get_external_nodes complete, count=" << result->otterbrix_params->external_nodes_count
                   << std::endl;
 
-        swap_stubs_into_schema_nodes(resource_, result->otterbrix_params->external_nodes, extraction.stubs);
+        swap_stubs_into_schema_nodes(resource_,
+                                     result->otterbrix_params->external_nodes,
+                                     result->otterbrix_params->external_targets,
+                                     extraction.stubs);
         std::cerr << "[Parser] swap_stubs_into_schema_nodes complete" << std::endl;
 
         return result;

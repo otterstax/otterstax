@@ -41,9 +41,9 @@ namespace pg {
             connections_[uuid]->connect();
 
             // For PostgreSQL: use schema.table format
-            // collection_full_name_t(database, schema, collection) -> database.schema, with unique_identifier=uuid
+            // qualified_name_t(database, schema, collection) -> database.schema, with unique_identifier=uuid
             // We need to store: uuid=alias, database, schema, table
-            collection_full_name_t name(uuid,
+            qualified_name_t name(uuid,
                                         connection_param.database,
                                         connection_param.schema.empty() ? "public" : connection_param.schema,
                                         connection_param.table);

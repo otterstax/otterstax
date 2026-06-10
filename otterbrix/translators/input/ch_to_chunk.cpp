@@ -367,8 +367,11 @@ namespace tsl {
             return {std::move(converter), {logical_t, column_name.c_str()}};
         }
 
-        types::complex_logical_type ast_to_complex_type(const clickhouse::TypeAst& ast, const std::string& alias);
-        types::complex_logical_type build_from_named_string(const std::string& type_str, const std::string& alias);
+        types::complex_logical_type
+        ast_to_complex_type(std::pmr::memory_resource* resource, const clickhouse::TypeAst& ast, const std::string& alias);
+        types::complex_logical_type build_from_named_string(std::pmr::memory_resource* resource,
+                                                            const std::string& type_str,
+                                                            const std::string& alias);
         types::logical_value_t read_value(std::pmr::memory_resource* res,
                                           const clickhouse::ColumnRef& col,
                                           size_t row,
@@ -393,7 +396,7 @@ namespace tsl {
                 std::string col_name = schema_block.GetColumnName(col);
                 auto override_it = named_type_overrides.find(col_name);
                 if (override_it != named_type_overrides.end()) {
-                    auto target_type = build_from_named_string(override_it->second, col_name);
+                    auto target_type = build_from_named_string(resource, override_it->second, col_name);
                     std::cerr << "[CH-MK] col=" << col_name << " target_logical=" << int(target_type.type())
                               << " target_physical=" << int(target_type.to_physical_type())
                               << " child_types_count=" << target_type.child_types().size() << "\n";
@@ -425,7 +428,7 @@ namespace tsl {
             std::string col_name = block.GetColumnName(col);
             auto override_it = named_type_overrides.find(col_name);
             if (override_it != named_type_overrides.end()) {
-                col_types.emplace_back(impl::build_from_named_string(override_it->second, col_name));
+                col_types.emplace_back(impl::build_from_named_string(resource, override_it->second, col_name));
             } else {
                 col_types.emplace_back(impl::to_local_translator(block[col]->Type(), col_name).type);
             }
@@ -475,7 +478,7 @@ namespace tsl {
             std::string col_name = schema_block->GetColumnName(col);
             auto override_it = named_type_overrides.find(col_name);
             if (override_it != named_type_overrides.end()) {
-                col_types.emplace_back(impl::build_from_named_string(override_it->second, col_name));
+                col_types.emplace_back(impl::build_from_named_string(resource, override_it->second, col_name));
             } else {
                 col_types.emplace_back(impl::to_local_translator((*schema_block)[col]->Type(), col_name).type);
             }
@@ -563,7 +566,9 @@ namespace tsl {
             return types::logical_type::STRING_LITERAL;
         }
 
-        types::complex_logical_type build_from_named_string(const std::string& type_str, const std::string& alias);
+        types::complex_logical_type build_from_named_string(std::pmr::memory_resource* resource,
+                                                            const std::string& type_str,
+                                                            const std::string& alias);
 
         std::vector<std::pair<std::string, std::string>> split_named_tuple_fields(const std::string& inner) {
             std::vector<std::pair<std::string, std::string>> out;
@@ -626,7 +631,9 @@ namespace tsl {
             return s.substr(wrapper.size() + 1, s.size() - wrapper.size() - 2);
         }
 
-        types::complex_logical_type build_from_named_string(const std::string& type_str, const std::string& alias) {
+        types::complex_logical_type build_from_named_string(std::pmr::memory_resource* resource,
+                                                            const std::string& type_str,
+                                                            const std::string& alias) {
             size_t a = type_str.find_first_not_of(" \t");
             size_t b = type_str.find_last_not_of(" \t");
             if (a == std::string::npos) {
@@ -635,23 +642,23 @@ namespace tsl {
             std::string s = type_str.substr(a, b - a + 1);
 
             if (auto inner = strip_wrapper(s, "Nullable"); !inner.empty()) {
-                return build_from_named_string(inner, alias);
+                return build_from_named_string(resource, inner, alias);
             }
             if (auto inner = strip_wrapper(s, "LowCardinality"); !inner.empty()) {
-                return build_from_named_string(inner, alias);
+                return build_from_named_string(resource, inner, alias);
             }
             if (auto inner = strip_wrapper(s, "Array"); !inner.empty()) {
-                auto child = build_from_named_string(inner, "");
+                auto child = build_from_named_string(resource, inner, "");
                 return types::complex_logical_type::create_array(child, /*size=*/2, alias);
             }
             if (auto inner = strip_wrapper(s, "Tuple"); !inner.empty()) {
                 auto fields = split_named_tuple_fields(inner);
-                std::vector<types::complex_logical_type> out_fields;
+                std::pmr::vector<types::complex_logical_type> out_fields(resource);
                 out_fields.reserve(fields.size());
                 size_t pos_idx = 0;
                 for (auto& [name, sub_type] : fields) {
                     std::string field_name = name.empty() ? ("_" + std::to_string(++pos_idx)) : name;
-                    out_fields.emplace_back(build_from_named_string(sub_type, field_name));
+                    out_fields.emplace_back(build_from_named_string(resource, sub_type, field_name));
                 }
                 return types::complex_logical_type::create_struct(alias.empty() ? "tuple_t" : (alias + "_t"),
                                                                   out_fields,
@@ -812,23 +819,24 @@ namespace tsl {
             return {std::move(conv), target_type};
         }
 
-        types::complex_logical_type ast_to_complex_type(const clickhouse::TypeAst& ast, const std::string& alias) {
+        types::complex_logical_type
+        ast_to_complex_type(std::pmr::memory_resource* resource, const clickhouse::TypeAst& ast, const std::string& alias) {
             using meta = clickhouse::TypeAst::Meta;
             switch (ast.meta) {
                 case meta::Array: {
                     if (ast.elements.empty()) {
                         return {types::logical_type::STRING_LITERAL, alias};
                     }
-                    auto inner = ast_to_complex_type(ast.elements[0], "");
+                    auto inner = ast_to_complex_type(resource, ast.elements[0], "");
                     return types::complex_logical_type::create_list(inner, alias);
                 }
                 case meta::Tuple: {
-                    std::vector<types::complex_logical_type> fields;
+                    std::pmr::vector<types::complex_logical_type> fields(resource);
                     fields.reserve(ast.elements.size());
                     size_t idx = 0;
                     for (const auto& elem : ast.elements) {
                         std::string field_name = elem.name.empty() ? ("_" + std::to_string(++idx)) : elem.name;
-                        fields.emplace_back(ast_to_complex_type(elem, field_name));
+                        fields.emplace_back(ast_to_complex_type(resource, elem, field_name));
                     }
                     return types::complex_logical_type::create_struct(alias.empty() ? "tuple_t" : (alias + "_t"),
                                                                       fields,
@@ -838,13 +846,13 @@ namespace tsl {
                     if (ast.elements.empty()) {
                         return {types::logical_type::STRING_LITERAL, alias};
                     }
-                    return ast_to_complex_type(ast.elements[0], alias);
+                    return ast_to_complex_type(resource, ast.elements[0], alias);
                 }
                 case meta::LowCardinality: {
                     if (ast.elements.empty()) {
                         return {types::logical_type::STRING_LITERAL, alias};
                     }
-                    return ast_to_complex_type(ast.elements[0], alias);
+                    return ast_to_complex_type(resource, ast.elements[0], alias);
                 }
                 case meta::Enum:
                     return {types::logical_type::STRING_LITERAL, alias};
@@ -854,20 +862,23 @@ namespace tsl {
         }
     } // namespace impl
 
-    types::complex_logical_type ch_to_struct(const clickhouse::Block& block) { return ch_to_struct(block, {}); }
+    types::complex_logical_type ch_to_struct(std::pmr::memory_resource* resource, const clickhouse::Block& block) {
+        return ch_to_struct(resource, block, {});
+    }
 
-    types::complex_logical_type ch_to_struct(const clickhouse::Block& block,
+    types::complex_logical_type ch_to_struct(std::pmr::memory_resource* resource,
+                                             const clickhouse::Block& block,
                                              const std::unordered_map<std::string, std::string>& named_type_overrides) {
         const size_t ncols = block.GetColumnCount();
 
-        std::vector<types::complex_logical_type> fields;
+        std::pmr::vector<types::complex_logical_type> fields(resource);
         fields.reserve(ncols);
 
         for (size_t col = 0; col < ncols; ++col) {
             std::string col_name = block.GetColumnName(col);
             auto override_it = named_type_overrides.find(col_name);
             if (override_it != named_type_overrides.end()) {
-                fields.emplace_back(impl::build_from_named_string(override_it->second, col_name));
+                fields.emplace_back(impl::build_from_named_string(resource, override_it->second, col_name));
                 continue;
             }
             auto type_ref = block[col]->Type();
@@ -878,7 +889,7 @@ namespace tsl {
                 auto translator = impl::to_local_translator(type_ref, col_name);
                 fields.emplace_back(translator.type);
             } else {
-                fields.emplace_back(impl::ast_to_complex_type(*ast, col_name));
+                fields.emplace_back(impl::ast_to_complex_type(resource, *ast, col_name));
             }
         }
 

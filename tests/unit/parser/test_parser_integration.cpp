@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2025-2026  OtterStax
 
+#include "otterbrix/parser/name_resolution.hpp"
 #include "otterbrix/parser/parser.hpp"
 #include "otterbrix/parser/subquery_extractor.hpp"
 #include "scheduler/schema_utils.hpp"
@@ -23,22 +24,32 @@ namespace {
         return std::move(result.value());
     }
 
-    std::vector<components::logical_plan::node_ptr> external_nodes_flat(const ParsedQueryDataPtr& parsed) {
-        std::vector<components::logical_plan::node_ptr> out;
-        for (const auto& batch : parsed->otterbrix_params->external_nodes) {
-            for (auto* slot : batch) {
-                out.push_back(*slot);
+    // One external slot: the node together with its parser-resolved target
+    // (external_targets is filled 1:1 with external_nodes).
+    struct flat_external_t {
+        components::logical_plan::node_ptr node;
+        otterstax::names::resolved_target_t target;
+    };
+
+    std::vector<flat_external_t> external_nodes_flat(const ParsedQueryDataPtr& parsed) {
+        std::vector<flat_external_t> out;
+        const auto& nodes = parsed->otterbrix_params->external_nodes;
+        const auto& targets = parsed->otterbrix_params->external_targets;
+        REQUIRE(targets.size() == nodes.size());
+        for (size_t batch = 0; batch < nodes.size(); ++batch) {
+            REQUIRE(targets[batch].size() == nodes[batch].size());
+            for (size_t i = 0; i < nodes[batch].size(); ++i) {
+                out.push_back(flat_external_t{*nodes[batch][i], targets[batch][i]});
             }
         }
         return out;
     }
 
-    components::logical_plan::node_ptr find_by_uid(const std::vector<components::logical_plan::node_ptr>& nodes,
-                                                   const std::string& uid) {
+    flat_external_t find_by_uid(const std::vector<flat_external_t>& nodes, const std::string& uid) {
         auto it = std::find_if(nodes.begin(), nodes.end(), [&uid](const auto& n) {
-            return n->collection_full_name().unique_identifier == uid;
+            return n.target.name.unique_identifier == uid;
         });
-        return it != nodes.end() ? *it : components::logical_plan::node_ptr{};
+        return it != nodes.end() ? *it : flat_external_t{};
     }
 
     bool is_schema_node_with_raw_sql(const components::logical_plan::node_ptr& n) {
@@ -63,16 +74,16 @@ TEST_CASE("integration: 4-part qualifier in cross-source JOIN") {
 
     auto mysql_node = find_by_uid(nodes, "mysql");
     auto pg_node = find_by_uid(nodes, "pg");
-    REQUIRE(mysql_node);
-    REQUIRE(pg_node);
+    REQUIRE(mysql_node.node);
+    REQUIRE(pg_node.node);
 
-    REQUIRE_FALSE(is_schema_node_with_raw_sql(mysql_node));
-    REQUIRE_FALSE(is_schema_node_with_raw_sql(pg_node));
+    REQUIRE_FALSE(is_schema_node_with_raw_sql(mysql_node.node));
+    REQUIRE_FALSE(is_schema_node_with_raw_sql(pg_node.node));
 
-    REQUIRE(mysql_node->collection_full_name().database == "bill");
-    REQUIRE(mysql_node->collection_full_name().collection == "orders");
-    REQUIRE(pg_node->collection_full_name().schema == "shop");
-    REQUIRE(pg_node->collection_full_name().collection == "products");
+    REQUIRE(mysql_node.target.name.database == "bill");
+    REQUIRE(mysql_node.target.name.collection == "orders");
+    REQUIRE(pg_node.target.name.schema == "shop");
+    REQUIRE(pg_node.target.name.collection == "products");
 }
 
 TEST_CASE("integration: 4-part qualifier untouched") {
@@ -87,12 +98,12 @@ TEST_CASE("integration: 4-part qualifier untouched") {
 
     auto n1 = find_by_uid(nodes, "uid1");
     auto n2 = find_by_uid(nodes, "uid2");
-    REQUIRE(n1);
-    REQUIRE(n2);
-    REQUIRE(n1->collection_full_name().database == "db1");
-    REQUIRE(n1->collection_full_name().schema == "sch1");
-    REQUIRE(n1->collection_full_name().collection == "test1");
-    REQUIRE(n2->collection_full_name().collection == "test2");
+    REQUIRE(n1.node);
+    REQUIRE(n2.node);
+    REQUIRE(n1.target.name.database == "db1");
+    REQUIRE(n1.target.name.schema == "sch1");
+    REQUIRE(n1.target.name.collection == "test1");
+    REQUIRE(n2.target.name.collection == "test2");
 }
 
 TEST_CASE("integration: no external_node") {
@@ -118,17 +129,20 @@ TEST_CASE("integration: derived table into schema_node") {
 
     auto mysql_stub = find_by_uid(nodes, "mysql");
     auto pg_real = find_by_uid(nodes, "pg");
-    REQUIRE(mysql_stub);
-    REQUIRE(pg_real);
+    REQUIRE(mysql_stub.node);
+    REQUIRE(pg_real.node);
 
-    REQUIRE(is_schema_node_with_raw_sql(mysql_stub));
-    const auto& raw = static_cast<const schema_utils::schema_node_t&>(*mysql_stub).raw_sql();
+    REQUIRE(is_schema_node_with_raw_sql(mysql_stub.node));
+    const auto& raw = static_cast<const schema_utils::schema_node_t&>(*mysql_stub.node).raw_sql();
     REQUIRE(raw.find("FROM mysql.bill.schema.orders") != std::string::npos);
     REQUIRE(raw.find("ts >= '2026-04-18'") != std::string::npos);
-    REQUIRE_FALSE(static_cast<const schema_utils::schema_node_t&>(*mysql_stub).qualifiers().empty());
+    REQUIRE_FALSE(static_cast<const schema_utils::schema_node_t&>(*mysql_stub.node).qualifiers().empty());
 
-    REQUIRE_FALSE(is_schema_node_with_raw_sql(pg_real));
-    REQUIRE(pg_real->collection_full_name().schema == "shop");
+    // The schema node itself carries the resolved stub name as well.
+    REQUIRE(static_cast<const schema_utils::schema_node_t&>(*mysql_stub.node).name() == mysql_stub.target.name);
+
+    REQUIRE_FALSE(is_schema_node_with_raw_sql(pg_real.node));
+    REQUIRE(pg_real.target.name.schema == "shop");
 }
 
 TEST_CASE("integration: qualified + local untouched") {
@@ -141,12 +155,12 @@ TEST_CASE("integration: qualified + local untouched") {
 
     auto nodes = external_nodes_flat(parsed);
     REQUIRE(nodes.size() == 1);
-    REQUIRE(nodes[0]->collection_full_name().unique_identifier == "pg");
+    REQUIRE(nodes[0].target.name.unique_identifier == "pg");
 
     // It's a real aggregate, NOT a wrapped raw_sql — proves wrap was skipped.
-    REQUIRE_FALSE(is_schema_node_with_raw_sql(nodes[0]));
-    REQUIRE(nodes[0]->collection_full_name().schema == "shop");
-    REQUIRE(nodes[0]->collection_full_name().collection == "customers");
+    REQUIRE_FALSE(is_schema_node_with_raw_sql(nodes[0].node));
+    REQUIRE(nodes[0].target.name.schema == "shop");
+    REQUIRE(nodes[0].target.name.collection == "customers");
 }
 
 TEST_CASE("integration: cross-source subqueries") {
@@ -167,17 +181,17 @@ TEST_CASE("integration: cross-source subqueries") {
     auto pg_node = find_by_uid(nodes, "pg");
     auto ch_stub = find_by_uid(nodes, "ch");
     auto mysql_stub = find_by_uid(nodes, "mysql");
-    REQUIRE(pg_node);
-    REQUIRE(ch_stub);
-    REQUIRE(mysql_stub);
+    REQUIRE(pg_node.node);
+    REQUIRE(ch_stub.node);
+    REQUIRE(mysql_stub.node);
 
-    REQUIRE_FALSE(is_schema_node_with_raw_sql(pg_node));
+    REQUIRE_FALSE(is_schema_node_with_raw_sql(pg_node.node));
 
-    REQUIRE(is_schema_node_with_raw_sql(ch_stub));
-    REQUIRE(is_schema_node_with_raw_sql(mysql_stub));
+    REQUIRE(is_schema_node_with_raw_sql(ch_stub.node));
+    REQUIRE(is_schema_node_with_raw_sql(mysql_stub.node));
 
-    const auto& ch_raw = static_cast<const schema_utils::schema_node_t&>(*ch_stub).raw_sql();
-    const auto& mysql_raw = static_cast<const schema_utils::schema_node_t&>(*mysql_stub).raw_sql();
+    const auto& ch_raw = static_cast<const schema_utils::schema_node_t&>(*ch_stub.node).raw_sql();
+    const auto& mysql_raw = static_cast<const schema_utils::schema_node_t&>(*mysql_stub.node).raw_sql();
     REQUIRE(ch_raw.find("FROM ch.ev.schema.sessions") != std::string::npos);
     REQUIRE(mysql_raw.find("FROM mysql.bill.schema.orders") != std::string::npos);
 }

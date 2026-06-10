@@ -22,15 +22,24 @@ namespace {
 
         auto res = linitial(raw_parser(&arena_resource, sql.c_str()));
         auto transform_res = transformer.transform(sql::transform::pg_cell_to_node_cast(res)).finalize();
-        return {std::move(transform_res.value().node), std::move(transform_res.value().params)};
+        REQUIRE_FALSE(transform_res.has_error());
+        auto& plan = transform_res.value();
+        // a13 wraps table-referencing statements in a node_sequence_t
+        // (catalog_resolve_* siblings + the consumer as the LAST child); the
+        // tests exercise the aggregate consumer itself.
+        auto node = plan.sub_queries.back();
+        if (node->type() == logical_plan::node_type::sequence_t && !node->children().empty()) {
+            node = node->children().back();
+        }
+        return {std::move(node), std::move(plan.parameters)};
     }
 
     // map of "".test1 -> 1, "".test2 -> 2, etc...
-    std::pmr::map<collection_full_name_t, size_t> fill_test(size_t n) {
-        std::pmr::map<collection_full_name_t, size_t> dep;
+    std::pmr::map<qualified_name_t, size_t> fill_test(size_t n) {
+        std::pmr::map<qualified_name_t, size_t> dep;
         for (size_t i = 1; i <= n; ++i) {
             std::string name = "test" + std::to_string(i);
-            dep.emplace(collection_full_name_t("", std::move(name)), i - 1);
+            dep.emplace(qualified_name_t("", std::move(name)), i - 1);
         }
 
         return dep;
@@ -40,7 +49,7 @@ namespace {
 TEST_CASE("aggregate: filter") {
     auto [node, params] = parse("SELECT id, name from test;");
     auto* resource = std::pmr::get_default_resource();
-    std::vector<complex_logical_type> fields;
+    std::pmr::vector<complex_logical_type> fields(resource);
     fields.emplace_back(logical_type::BIGINT);
     fields.back().set_alias("id");
     fields.emplace_back(logical_type::STRING_LITERAL);
@@ -59,7 +68,7 @@ TEST_CASE("aggregate: filter") {
 
 TEST_CASE("aggregate: constants & aggregations") {
     auto* resource = std::pmr::get_default_resource();
-    std::vector<complex_logical_type> schema_types; // empty schema
+    std::pmr::vector<complex_logical_type> schema_types(resource); // empty schema
     {
         auto [node, params] = parse("SELECT 1, avg(smth) from test;");
         auto filtered = aggregate_filter_schema(static_cast<const logical_plan::node_aggregate_t&>(*node),
@@ -85,7 +94,7 @@ TEST_CASE("aggregate: constants & aggregations") {
 TEST_CASE("join: simple") {
     auto [node, params] = parse("SELECT * from test1 cross join test2;");
     auto* resource = std::pmr::get_default_resource();
-    std::vector<complex_logical_type> fields;
+    std::pmr::vector<complex_logical_type> fields(resource);
     fields.emplace_back(logical_type::BIGINT);
     fields.back().set_alias("id");
     fields.emplace_back(logical_type::STRING_LITERAL);
@@ -118,7 +127,7 @@ TEST_CASE("join: complex") {
     auto* resource = std::pmr::get_default_resource();
     std::pmr::vector<complex_logical_type> catalog_vec;
     {
-        std::vector<complex_logical_type> fields;
+        std::pmr::vector<complex_logical_type> fields(resource);
         fields.emplace_back(logical_type::BIGINT);
         fields.back().set_alias("id");
         fields.emplace_back(logical_type::STRING_LITERAL);
@@ -126,7 +135,7 @@ TEST_CASE("join: complex") {
         catalog_vec.emplace_back(complex_logical_type::create_struct("", fields));
     }
     {
-        std::vector<complex_logical_type> fields;
+        std::pmr::vector<complex_logical_type> fields(resource);
         fields.emplace_back(logical_type::FLOAT);
         fields.back().set_alias("value");
         fields.emplace_back(logical_type::DOUBLE);
@@ -134,7 +143,7 @@ TEST_CASE("join: complex") {
         catalog_vec.emplace_back(complex_logical_type::create_struct("", fields));
     }
     {
-        std::vector<complex_logical_type> fields;
+        std::pmr::vector<complex_logical_type> fields(resource);
         fields.emplace_back(logical_type::BIGINT);
         fields.back().set_alias("id");
         fields.emplace_back(logical_type::BOOLEAN);

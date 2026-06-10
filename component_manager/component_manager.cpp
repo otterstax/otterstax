@@ -13,7 +13,13 @@ ComponentManager::ComponentManager(const configuration::config& config)
     // To test otterbrix create some tables
     assert(resource_ != nullptr && "memory resource must not be null");
 
-    catalog_manager_ = actor_zeta::spawn<mysql::CatalogManager>(resource_);
+    // OtterbrixManager must exist before CatalogManager: the catalog registers
+    // external table schemas in the engine through the OtterbrixManager actor.
+    otterbrix_manager_ =
+        actor_zeta::spawn<db::OtterbrixManager>(resource_, make_otterbrix_manager(otterbrix_));
+    assert(otterbrix_manager_ != nullptr && "otterbrix manager must not be null");
+
+    catalog_manager_ = actor_zeta::spawn<mysql::CatalogManager>(resource_, otterbrix_manager_->address());
     assert(catalog_manager_ != nullptr && "catalog manager must not be null");
 
     db_connector_manager_ = std::make_shared<mysql::ConnectorManager>(catalog_manager_->address());
@@ -24,10 +30,6 @@ ComponentManager::ComponentManager(const configuration::config& config)
 
     ch_connector_manager_ = std::make_shared<ch::ConnectorManager>(catalog_manager_->address());
     catalog_manager_->set_ch_connector_manager(ch_connector_manager_);
-
-    otterbrix_manager_ =
-        actor_zeta::spawn<db::OtterbrixManager>(resource_, make_otterbrix_manager(otterbrix_));
-    assert(otterbrix_manager_ != nullptr && "otterbrix manager must not be null");
 
     sql_connection_manager_ =
         actor_zeta::spawn<db::MySQLManager>(resource_, db_connector_manager_);

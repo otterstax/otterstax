@@ -441,7 +441,8 @@ namespace {
     void generate_select(std::stringstream& stream,
                          const node_aggregate_ptr& node,
                          const storage_parameters* parameters,
-                         backend_type_t backend) {
+                         backend_type_t backend,
+                         const qualified_name_t& table_name) {
         node_select_ptr select = nullptr;
         node_group_ptr group = nullptr;
         node_match_ptr match = nullptr;
@@ -556,7 +557,7 @@ namespace {
             }
 
             stream << " FROM ";
-            stream << sql_gen::table_reference(node->collection_full_name(), backend);
+            stream << sql_gen::table_reference(table_name, backend);
         }
         // where
         {
@@ -618,8 +619,10 @@ namespace {
         }
     }
 
-    void generate_create_collection(std::stringstream& stream, const node_create_collection_ptr& node) {
-        stream << "CREATE TABLE " << node->collection_full_name().collection;
+    void generate_create_collection(std::stringstream& stream,
+                                    const node_create_collection_ptr& node,
+                                    const qualified_name_t& name) {
+        stream << "CREATE TABLE " << name.collection;
         stream << " (";
         bool comma = false;
         for (const auto& type : node->schema()) {
@@ -634,12 +637,14 @@ namespace {
     }
 
     // this wight cause problems with connections
-    void generate_create_database(std::stringstream& stream, const node_create_database_ptr& node) {
-        stream << "CREATE DATABASE " << node->collection_full_name().database;
+    void generate_create_database(std::stringstream& stream, const qualified_name_t& name) {
+        stream << "CREATE DATABASE " << name.database;
     }
 
-    void generate_create_index(std::stringstream& stream, const node_create_index_ptr& node) {
-        stream << "CREATE INDEX " << node->name() << " ON " << node->collection_full_name().to_string();
+    void generate_create_index(std::stringstream& stream,
+                               const node_create_index_ptr& node,
+                               const qualified_name_t& name) {
+        stream << "CREATE INDEX " << node->name() << " ON " << name.to_string();
         stream << " (";
         bool comma = false;
         for (const auto& key : node->keys()) {
@@ -656,7 +661,8 @@ namespace {
     void generate_delete(std::stringstream& stream,
                          const node_delete_ptr& node,
                          const storage_parameters* parameters,
-                         backend_type_t backend) {
+                         backend_type_t backend,
+                         const otterstax::names::resolved_target_t& target) {
         node_match_ptr match = nullptr;
         for (const auto& child : node->children()) {
             if (child->type() == node_type::match_t) {
@@ -664,12 +670,10 @@ namespace {
             }
         }
         stream << "DELETE FROM ";
-        stream << sql_gen::table_reference(node->collection_full_name(), backend);
-        if (!node->collection_from().empty()) {
+        stream << sql_gen::table_reference(target.name, backend);
+        if (!target.from_name.collection.empty()) {
             //! node_delete supports raw_data after using, but it is not possible to send it
-            assert(node->collection_full_name().unique_identifier.empty() ||
-                   node->collection_full_name().unique_identifier == node->collection_from().unique_identifier);
-            stream << " USING " << sql_gen::table_reference(node->collection_from(), backend);
+            stream << " USING " << sql_gen::table_reference(target.from_name, backend);
         }
         // WHERE
         if (match) {
@@ -680,24 +684,28 @@ namespace {
         }
     }
 
-    void generate_drop_collection(std::stringstream& stream, const node_drop_collection_ptr& node) {
-        stream << "DROP TABLE " << node->collection_full_name().collection;
+    void generate_drop_collection(std::stringstream& stream, const qualified_name_t& name) {
+        stream << "DROP TABLE " << name.collection;
     }
 
     // this wight cause problems with connections
-    void generate_drop_database(std::stringstream& stream, const node_drop_database_ptr& node) {
-        stream << "DROP DATABASE " << node->collection_full_name().database;
+    void generate_drop_database(std::stringstream& stream, const qualified_name_t& name) {
+        stream << "DROP DATABASE " << name.database;
     }
 
-    void generate_drop_index(std::stringstream& stream, const node_drop_index_ptr& node) {
-        stream << "DROP INDEX IF EXISTS " << node->name() << " ON " << node->collection_full_name().collection;
+    void generate_drop_index(std::stringstream& stream, const otterstax::names::resolved_target_t& target) {
+        // target.name is the indexed table; target.from_name carries the index
+        // (the second catalog_resolve_table of the wrapping sequence).
+        stream << "DROP INDEX IF EXISTS " << target.from_name.collection << " ON " << target.name.collection;
     }
 
     void generate_insert(std::stringstream& stream,
                          const node_insert_ptr& node,
                          const storage_parameters* parameters,
-                         backend_type_t backend) {
-        stream << "INSERT INTO " << sql_gen::table_reference(node->collection_full_name(), backend) << " ";
+                         backend_type_t backend,
+                         const otterstax::names::resolved_target_t& target,
+                         const std::pmr::vector<otterstax::names::resolved_target_t>& batch_targets) {
+        stream << "INSERT INTO " << sql_gen::table_reference(target.name, backend) << " ";
         if (!node->key_translation().empty()) {
             stream << "(";
             bool comma = false;
@@ -716,26 +724,46 @@ namespace {
                                      backend);
         } else {
             assert(node->children().front()->type() == node_type::aggregate_t);
-            assert(node->collection_full_name().unique_identifier ==
-                   node->children().front()->collection_full_name().unique_identifier);
+            // INSERT ... SELECT: the inner SELECT's table is resolved through the
+            // batch targets by the child aggregate's stamped table_oid. A missing
+            // or invalid oid means CatalogManager did not run / stamp this node —
+            // a pipeline programming error, never something to paper over.
+            const auto& child = node->children().front();
+            const auto child_oid = child->table_oid();
+            if (child_oid == components::catalog::INVALID_OID) {
+                throw std::logic_error("generate_insert: INSERT..SELECT child aggregate has no table_oid stamped");
+            }
+            const qualified_name_t* child_name = nullptr;
+            for (const auto& t : batch_targets) {
+                if (t.oid == child_oid) {
+                    child_name = &t.name;
+                    break;
+                }
+            }
+            if (!child_name) {
+                throw std::logic_error(
+                    "generate_insert: no batch target matches the INSERT..SELECT child aggregate's table_oid");
+            }
             generate_select(stream,
                             reinterpret_cast<const node_aggregate_ptr&>(node->children().front()),
                             parameters,
-                            backend);
+                            backend,
+                            *child_name);
         }
     }
 
     void generate_update(std::stringstream& stream,
                          const node_update_ptr& node,
                          const storage_parameters* parameters,
-                         backend_type_t backend) {
+                         backend_type_t backend,
+                         const otterstax::names::resolved_target_t& target) {
         node_match_ptr match = nullptr;
         for (const auto& child : node->children()) {
             if (child->type() == node_type::match_t) {
                 match = reinterpret_cast<const node_match_ptr&>(child);
             }
         }
-        stream << "UPDATE " << sql_gen::table_reference(node->collection_full_name(), backend) << " ";
+        stream << "UPDATE " << sql_gen::table_reference(target.name, backend) << " ";
         bool comma = false;
         for (const auto& set : node->updates()) {
             if (comma) {
@@ -745,10 +773,8 @@ namespace {
             generate_update_expr(stream, set, parameters);
             comma = true;
         }
-        if (!node->collection_from().empty()) {
-            assert(node->collection_from().unique_identifier.empty() ||
-                   node->collection_full_name().unique_identifier == node->collection_from().unique_identifier);
-            stream << " FROM " << sql_gen::table_reference(node->collection_from(), backend);
+        if (!target.from_name.collection.empty()) {
+            stream << " FROM " << sql_gen::table_reference(target.from_name, backend);
         }
         // WHERE
         if (match) {
@@ -797,7 +823,7 @@ namespace sql_gen {
         return raw_sql;
     }
 
-    std::string table_reference(const collection_full_name_t& name, backend_type_t backend) {
+    std::string table_reference(const qualified_name_t& name, backend_type_t backend) {
         std::stringstream s;
         if (name.empty()) {
             spdlog::debug("table_reference: empty name, returning NonCollectionData");
@@ -862,46 +888,63 @@ namespace sql_gen {
     void generate_query(std::stringstream& stream,
                         const node_ptr& node,
                         const storage_parameters* parameters,
-                        backend_type_t backend) {
+                        backend_type_t backend,
+                        const otterstax::names::resolved_target_t& target,
+                        const std::pmr::vector<otterstax::names::resolved_target_t>& batch_targets) {
         switch (node->type()) {
             case node_type::aggregate_t:
-                generate_select(stream, reinterpret_cast<const node_aggregate_ptr&>(node), parameters, backend);
+                generate_select(stream,
+                                reinterpret_cast<const node_aggregate_ptr&>(node),
+                                parameters,
+                                backend,
+                                target.name);
                 break;
             case node_type::create_collection_t:
-                generate_create_collection(stream, reinterpret_cast<const node_create_collection_ptr&>(node));
+                generate_create_collection(stream,
+                                           reinterpret_cast<const node_create_collection_ptr&>(node),
+                                           target.name);
                 break;
             case node_type::create_database_t:
-                generate_create_database(stream, reinterpret_cast<const node_create_database_ptr&>(node));
+                generate_create_database(stream, target.name);
                 break;
             case node_type::create_index_t:
-                generate_create_index(stream, reinterpret_cast<const node_create_index_ptr&>(node));
+                generate_create_index(stream, reinterpret_cast<const node_create_index_ptr&>(node), target.name);
                 break;
             case node_type::delete_t:
-                generate_delete(stream, reinterpret_cast<const node_delete_ptr&>(node), parameters, backend);
+                generate_delete(stream, reinterpret_cast<const node_delete_ptr&>(node), parameters, backend, target);
                 break;
             case node_type::drop_collection_t:
-                generate_drop_collection(stream, reinterpret_cast<const node_drop_collection_ptr&>(node));
+                generate_drop_collection(stream, target.name);
                 break;
             case node_type::drop_database_t:
-                generate_drop_database(stream, reinterpret_cast<const node_drop_database_ptr&>(node));
+                generate_drop_database(stream, target.name);
                 break;
             case node_type::drop_index_t:
-                generate_drop_index(stream, reinterpret_cast<const node_drop_index_ptr&>(node));
+                generate_drop_index(stream, target);
                 break;
             case node_type::insert_t:
-                generate_insert(stream, reinterpret_cast<const node_insert_ptr&>(node), parameters, backend);
+                generate_insert(stream,
+                                reinterpret_cast<const node_insert_ptr&>(node),
+                                parameters,
+                                backend,
+                                target,
+                                batch_targets);
                 break;
             case node_type::update_t:
-                generate_update(stream, reinterpret_cast<const node_update_ptr&>(node), parameters, backend);
+                generate_update(stream, reinterpret_cast<const node_update_ptr&>(node), parameters, backend, target);
                 break;
             default:
                 throw std::logic_error("incorrect node type for generate_query: " + to_string(node->type()));
         }
     }
 
-    std::string generate_query(const node_ptr& node, const storage_parameters* parameters, backend_type_t backend) {
+    std::string generate_query(const node_ptr& node,
+                               const storage_parameters* parameters,
+                               backend_type_t backend,
+                               const otterstax::names::resolved_target_t& target,
+                               const std::pmr::vector<otterstax::names::resolved_target_t>& batch_targets) {
         std::stringstream stream;
-        generate_query(stream, node, parameters, backend);
+        generate_query(stream, node, parameters, backend, target, batch_targets);
         stream << ";";
         return stream.str();
     }

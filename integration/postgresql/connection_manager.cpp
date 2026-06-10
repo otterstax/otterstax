@@ -71,21 +71,27 @@ actor_zeta::unique_future<otterstax::result<ParsedQueryDataPtr>> PostgressManage
 
         // Execute queries - ONLY fetch data, no JOIN operations
         size_t counter = 0;
-        for (auto it = data->otterbrix_params->external_nodes.rbegin();
-             it != data->otterbrix_params->external_nodes.rend();
-             ++it) {
-            log_->debug("execute Current batch size: {}", it->size());
+        auto& batches = data->otterbrix_params->external_nodes;
+        auto& targets = data->otterbrix_params->external_targets;
+        assert(targets.size() == batches.size());
+        // Batches are processed back to front (innermost dependencies first).
+        for (size_t batch = batches.size(); batch-- > 0;) {
+            auto& batch_nodes = batches[batch];
+            const auto& batch_targets = targets[batch];
+            assert(batch_targets.size() == batch_nodes.size());
+            log_->debug("execute Current batch size: {}", batch_nodes.size());
             std::vector<std::string> generated_queries;
-            generated_queries.reserve(it->size());
+            generated_queries.reserve(batch_nodes.size());
             QueryHandleWaiter<std::unique_ptr<components::vector::data_chunk_t>> wait_guard{};
 
             // Track which indices we processed (for mixed backend, we skip non-PostgreSQL nodes)
             std::vector<size_t> processed_indices;
-            for (size_t i = 0; i < it->size(); i++) {
+            for (size_t i = 0; i < batch_nodes.size(); i++) {
                 log_->trace("Execute query: {}", ++counter);
 
-                auto& node = *(*it)[i];
-                const auto& uid = node->collection_full_name().unique_identifier;
+                auto& node = *batch_nodes[i];
+                const auto& target = batch_targets[i];
+                const auto& uid = target.name.unique_identifier;
                 log_->trace("UID: {}", uid);
 
                 // Skip nodes that have already been processed (type is data_t - already fetched by another backend)
@@ -121,13 +127,17 @@ actor_zeta::unique_future<otterstax::result<ParsedQueryDataPtr>> PostgressManage
                         generated_queries.emplace_back(
                             sql_gen::generate_query(sn.agg_node(),
                                                     &data->otterbrix_params->params_node->parameters(),
-                                                    backend_type_t::PostgreSQL));
+                                                    backend_type_t::PostgreSQL,
+                                                    target,
+                                                    batch_targets));
                     }
                 } else {
                     generated_queries.emplace_back(
                         sql_gen::generate_query(node,
                                                 &data->otterbrix_params->params_node->parameters(),
-                                                backend_type_t::PostgreSQL));
+                                                backend_type_t::PostgreSQL,
+                                                target,
+                                                batch_targets));
                 }
                 log_->debug("execute Generated PostgreSQL Query: \"{}\"", generated_queries.back());
                 auto enum_oids = connector_manager_->enums_for(uid);
@@ -157,7 +167,7 @@ actor_zeta::unique_future<otterstax::result<ParsedQueryDataPtr>> PostgressManage
                 }
                 auto tmp = std::move(*wait_guard.results[j]);
                 auto data_node = logical_plan::make_node_raw_data(resource(), std::move(tmp));
-                *(*it)[i] = data_node;
+                *batch_nodes[i] = data_node;
             }
         }
         log_->debug("execute finished");

@@ -12,12 +12,13 @@ namespace {
     complex_logical_type compute_aggregate(const logical_plan::node_aggregate_t& node,
                                            logical_plan::parameter_node_t* params,
                                            cursor::cursor_t_ptr catalog,
-                                           const std::pmr::map<collection_full_name_t, size_t>& dependencies) {
-        if (auto it = dependencies.find(node.collection_full_name()); it != dependencies.end()) {
+                                           const std::pmr::map<qualified_name_t, size_t>& dependencies) {
+        const qualified_name_t lookup_key = schema_utils::agg_key(node);
+        if (auto it = dependencies.find(lookup_key); it != dependencies.end()) {
             if (catalog->size() > it->second && catalog->type_data()[it->second].type() == logical_type::STRUCT) {
-                auto& struct_ext = catalog::to_struct(catalog->type_data()[it->second]);
-                auto& fields = struct_ext.child_types();
-                std::vector<types::complex_logical_type> types_vec(fields.begin(), fields.end());
+                const auto& fields = catalog->type_data()[it->second].child_types();
+                std::pmr::vector<types::complex_logical_type> types_vec(fields.begin(), fields.end(),
+                                                                        node.resource());
                 return schema_utils::aggregate_filter_schema(static_cast<const logical_plan::node_aggregate_t&>(node),
                                                              params,
                                                              types_vec);
@@ -30,7 +31,7 @@ namespace {
     compute_aggregate_or_schema(const logical_plan::node_t& node,
                                 logical_plan::parameter_node_t* params,
                                 cursor::cursor_t_ptr catalog,
-                                const std::pmr::map<collection_full_name_t, size_t>& dependencies) {
+                                const std::pmr::map<qualified_name_t, size_t>& dependencies) {
         switch (node.type()) {
             case logical_plan::node_type::unused: {
                 auto& schema = static_cast<const schema_utils::schema_node_t&>(node);
@@ -48,20 +49,25 @@ namespace {
 } // namespace
 
 namespace schema_utils {
-    schema_node_t::schema_node_t(const collection_full_name_t& name,
+    schema_node_t::schema_node_t(const qualified_name_t& name,
                                  complex_logical_type&& schema,
                                  logical_plan::node_aggregate_t&& agg_node)
-        : logical_plan::node_t(agg_node.resource(), logical_plan::node_type::unused, name)
+        : logical_plan::node_t(agg_node.resource(), logical_plan::node_type::unused)
+        , name_(name)
         , schema_(std::move(schema))
         , agg_node_(new components::logical_plan::node_aggregate_t(std::move(agg_node))) {}
 
     schema_node_t::schema_node_t(std::pmr::memory_resource* resource,
-                                 const collection_full_name_t& name,
+                                 const qualified_name_t& name,
                                  std::string raw_sql,
                                  std::vector<otterstax::parser::qualifier_rewrite_t> qualifiers)
-        : logical_plan::node_t(resource, logical_plan::node_type::unused, name)
+        : logical_plan::node_t(resource, logical_plan::node_type::unused)
+        , name_(name)
         , schema_()
-        , agg_node_(new logical_plan::node_aggregate_t(resource, name))
+        , agg_node_(logical_plan::make_node_aggregate(resource,
+                                                      core::uid_t{name.unique_identifier},
+                                                      core::dbname_t{name.database},
+                                                      core::relname_t{name.collection}))
         , raw_sql_(std::move(raw_sql))
         , qualifiers_(std::move(qualifiers)) {}
 
@@ -73,16 +79,14 @@ namespace schema_utils {
 
     std::string schema_node_t::to_string_impl() const { return ""; }
 
-    void schema_node_t::serialize_impl(serializer::msgpack_serializer_t*) const {}
-
-    node_schema_ptr make_node_schema(const collection_full_name_t& name,
+    node_schema_ptr make_node_schema(const qualified_name_t& name,
                                      complex_logical_type&& schema,
                                      logical_plan::node_aggregate_t&& agg_node) {
         return {new schema_node_t(name, std::move(schema), std::move(agg_node))};
     }
 
     node_schema_ptr make_node_schema_raw(std::pmr::memory_resource* resource,
-                                         const collection_full_name_t& name,
+                                         const qualified_name_t& name,
                                          std::string raw_sql,
                                          std::vector<otterstax::parser::qualifier_rewrite_t> qualifiers) {
         return {new schema_node_t(resource, name, std::move(raw_sql), std::move(qualifiers))};
@@ -90,7 +94,7 @@ namespace schema_utils {
 
     complex_logical_type aggregate_filter_schema(const logical_plan::node_aggregate_t& node,
                                                  logical_plan::parameter_node_t* params,
-                                                 const std::vector<complex_logical_type>& schema_types) {
+                                                 const std::pmr::vector<complex_logical_type>& schema_types) {
         auto it = std::find_if(node.children().begin(), node.children().end(), [](logical_plan::node_ptr node) {
             return node->type() == logical_plan::node_type::select_t;
         });
@@ -137,7 +141,7 @@ namespace schema_utils {
         };
 
         auto& select = *it;
-        std::vector<complex_logical_type> node_schema;
+        std::pmr::vector<complex_logical_type> node_schema(node.resource());
         node_schema.reserve(select->expressions().size());
 
         for (const auto& expr_ptr : select->expressions()) {
@@ -181,7 +185,7 @@ namespace schema_utils {
     cursor::cursor_t_ptr compute_otterbrix_schema(const logical_plan::node_aggregate_t& node,
                                                   logical_plan::parameter_node_t* params,
                                                   cursor::cursor_t_ptr catalog,
-                                                  std::pmr::map<collection_full_name_t, size_t> dependencies) {
+                                                  std::pmr::map<qualified_name_t, size_t> dependencies) {
         bool has_join = false;
         complex_logical_type schema;
         for (const auto& chld : node.children()) {
@@ -203,7 +207,7 @@ namespace schema_utils {
             return cursor::make_cursor(node.resource(),
                                        core::error_t(core::error_code_t::schema_error,
                                                      std::pmr::string{("OtterBrix collection is missing in catalog " +
-                                                                       node.collection_full_name().to_string())
+                                                                       node.dbname().t + "." + node.relname().t)
                                                                           .c_str(),
                                                                       node.resource()}));
         }
@@ -216,7 +220,7 @@ namespace schema_utils {
     types::complex_logical_type compute_join_schema(const logical_plan::node_join_t& node,
                                                     logical_plan::parameter_node_t* params,
                                                     cursor::cursor_t_ptr catalog,
-                                                    const std::pmr::map<collection_full_name_t, size_t>& dependencies) {
+                                                    const std::pmr::map<qualified_name_t, size_t>& dependencies) {
         assert(node.children().size() == 2);
 
         if (node.children().front()->type() == logical_plan::node_type::join_t) {
@@ -240,17 +244,15 @@ namespace schema_utils {
             return logical_type::NA;
         }
 
-        auto& struct1 = catalog::to_struct(sch1);
-        auto& struct2 = catalog::to_struct(sch2);
         std::unordered_map<std::string, complex_logical_type> merged;
-        for (const auto& column : struct1.child_types()) {
+        for (const auto& column : sch1.child_types()) {
             merged.insert({column.alias(), column});
         }
-        for (const auto& column : struct2.child_types()) {
+        for (const auto& column : sch2.child_types()) {
             merged.insert({column.alias(), column});
         }
 
-        std::vector<complex_logical_type> merged_vector;
+        std::pmr::vector<complex_logical_type> merged_vector(sch1.child_types().get_allocator());
         merged_vector.reserve(merged.size());
         for (const auto& [_, column] : merged) {
             merged_vector.push_back(column);

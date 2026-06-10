@@ -51,6 +51,114 @@ actor_zeta::behavior_t OtterbrixManager::behavior(actor_zeta::mailbox::message* 
         co_await actor_zeta::dispatch(this, &OtterbrixManager::execute, msg);
     } else if (cmd == actor_zeta::msg_id<OtterbrixManager, &OtterbrixManager::get_schema>) {
         co_await actor_zeta::dispatch(this, &OtterbrixManager::get_schema, msg);
+    } else if (cmd == actor_zeta::msg_id<OtterbrixManager, &OtterbrixManager::register_external_database>) {
+        co_await actor_zeta::dispatch(this, &OtterbrixManager::register_external_database, msg);
+    } else if (cmd == actor_zeta::msg_id<OtterbrixManager, &OtterbrixManager::register_external_table>) {
+        co_await actor_zeta::dispatch(this, &OtterbrixManager::register_external_table, msg);
+    } else if (cmd == actor_zeta::msg_id<OtterbrixManager, &OtterbrixManager::drop_external_database>) {
+        co_await actor_zeta::dispatch(this, &OtterbrixManager::drop_external_database, msg);
+    }
+}
+
+namespace {
+    // Double-quoted SQL identifier; embedded double quotes are doubled.
+    std::string quote_identifier(const std::string& ident) {
+        std::string quoted;
+        quoted.reserve(ident.size() + 2);
+        quoted.push_back('"');
+        for (char c : ident) {
+            if (c == '"') {
+                quoted.push_back('"');
+            }
+            quoted.push_back(c);
+        }
+        quoted.push_back('"');
+        return quoted;
+    }
+} // namespace
+
+actor_zeta::unique_future<otterstax::result<bool>>
+OtterbrixManager::register_external_database(std::string db_name) {
+    // try/catch only as containment at the engine boundary — mirrors execute().
+    try {
+        log_->debug("register_external_database: creating engine database {}", db_name);
+        auto cursor = data_manager_->execute_sql("CREATE DATABASE " + quote_identifier(db_name));
+        if (!cursor || cursor->is_error()) {
+            std::string what = cursor ? std::string{cursor->get_error().what.c_str()} : std::string{"null cursor"};
+            log_->error("register_external_database: CREATE DATABASE {} failed: {}", db_name, what);
+            co_return pipeline_error(error_code_t::catalog_error,
+                                     error_tag_t::otterbrix_manager,
+                                     "Failed to create engine database '" + db_name + "': " + what);
+        }
+        co_return true;
+    } catch (const std::exception& e) {
+        log_->error("register_external_database caught exception: {}", e.what());
+        co_return pipeline_error(error_code_t::catalog_error,
+                                 error_tag_t::otterbrix_manager,
+                                 "register_external_database failed for '" + db_name + "': " + e.what());
+    }
+}
+
+actor_zeta::unique_future<otterstax::result<components::catalog::oid_t>>
+OtterbrixManager::register_external_table(qualified_name_t name,
+                                          std::string encoded_db,
+                                          std::string encoded_collection,
+                                          std::vector<components::table::column_definition_t> columns) {
+    // try/catch only as containment at the engine boundary — mirrors execute().
+    try {
+        log_->debug("register_external_table: registering {} as {}.{}",
+                    name.to_string(),
+                    encoded_db,
+                    encoded_collection);
+
+        components::catalog::oid_t oid = components::catalog::INVALID_OID;
+        auto create_cursor =
+            data_manager_->create_collection(encoded_db, encoded_collection, std::move(columns), oid);
+        if (!create_cursor || create_cursor->is_error()) {
+            std::string what =
+                create_cursor ? std::string{create_cursor->get_error().what.c_str()} : std::string{"null cursor"};
+            log_->error("register_external_table: create_collection {}.{} failed: {}",
+                        encoded_db,
+                        encoded_collection,
+                        what);
+            co_return pipeline_error(error_code_t::catalog_error,
+                                     error_tag_t::otterbrix_manager,
+                                     "Failed to register external table '" + name.to_string() + "': " + what);
+        }
+        if (oid == components::catalog::INVALID_OID) {
+            log_->error("register_external_table: engine did not stamp an oid for {}", encoded_collection);
+            co_return pipeline_error(error_code_t::catalog_error,
+                                     error_tag_t::otterbrix_manager,
+                                     "Engine did not assign an oid for external table '" + name.to_string() + "'");
+        }
+        log_->debug("register_external_table: {} registered with oid {}", name.to_string(), oid);
+        co_return oid;
+    } catch (const std::exception& e) {
+        log_->error("register_external_table caught exception: {}", e.what());
+        co_return pipeline_error(error_code_t::catalog_error,
+                                 error_tag_t::otterbrix_manager,
+                                 "register_external_table failed for '" + name.to_string() + "': " + e.what());
+    }
+}
+
+actor_zeta::unique_future<otterstax::result<bool>> OtterbrixManager::drop_external_database(std::string db_name) {
+    // try/catch only as containment at the engine boundary — mirrors execute().
+    try {
+        log_->debug("drop_external_database: dropping engine database {}", db_name);
+        auto cursor = data_manager_->execute_sql("DROP DATABASE " + quote_identifier(db_name));
+        if (!cursor || cursor->is_error()) {
+            std::string what = cursor ? std::string{cursor->get_error().what.c_str()} : std::string{"null cursor"};
+            log_->error("drop_external_database: DROP DATABASE {} failed: {}", db_name, what);
+            co_return pipeline_error(error_code_t::catalog_error,
+                                     error_tag_t::otterbrix_manager,
+                                     "Failed to drop engine database '" + db_name + "': " + what);
+        }
+        co_return true;
+    } catch (const std::exception& e) {
+        log_->error("drop_external_database caught exception: {}", e.what());
+        co_return pipeline_error(error_code_t::catalog_error,
+                                 error_tag_t::otterbrix_manager,
+                                 "drop_external_database failed for '" + db_name + "': " + e.what());
     }
 }
 
@@ -81,17 +189,27 @@ actor_zeta::unique_future<components::cursor::cursor_t_ptr> OtterbrixManager::ex
 
 actor_zeta::unique_future<otterstax::result<std::pair<components::cursor::cursor_t_ptr, ParsedQueryDataPtr>>>
 OtterbrixManager::get_schema(session_hash_t id,
-                             std::pmr::map<collection_full_name_t, size_t> dependencies,
+                             std::pmr::map<qualified_name_t, size_t> dependencies,
                              ParsedQueryDataPtr data) {
     Timer timer("OtterbrixManager::get_schema", log_);
 
     log_->trace("get_schema id hash: {}", id);
 
+    // Dependency-map values are indices 0..N-1; the schema cursor returned by
+    // IDataManager::get_schema is positional (type_data()[i] = schema of
+    // dependency i), so invert the map into index order here.
     OtterbrixSchemaParams params(resource());
-    params.reserve(dependencies.size());
+    params.resize(dependencies.size());
 
-    for (auto& [name, _] : dependencies) {
-        params.emplace_back(std::make_pair(name.database, name.collection));
+    for (auto& [name, index] : dependencies) {
+        assert(index < params.size());
+        // Only local named tables are probed against the engine. External
+        // tables (non-empty uid) are resolved through the CatalogManager, and
+        // unnamed wrapper aggregates carry no table at all — both keep their
+        // positional slot as an empty entry.
+        if (name.unique_identifier.empty() && !name.collection.empty()) {
+            params[index] = std::make_pair(name.database, name.collection);
+        }
     }
 
     if (data->otterbrix_params->node->type() != logical_plan::node_type::aggregate_t) {

@@ -432,12 +432,14 @@ Scheduler::prepare_schema(session_hash_t id, shared_session_payload sdata, std::
             // Normal path — build dependency map and call otterbrix get_schema
             std::deque<logical_plan::node_ptr> nodes_traverse;
             nodes_traverse.emplace_back(data->otterbrix_params->node);
-            std::pmr::map<collection_full_name_t, size_t> dependencies(resource());
+            std::pmr::map<qualified_name_t, size_t> dependencies(resource());
             size_t cnt = 0;
             while (!nodes_traverse.empty()) {
                 auto& n = nodes_traverse.front();
                 if (n->type() == logical_plan::node_type::aggregate_t) {
-                    dependencies.emplace(n->collection_full_name(), cnt++);
+                    dependencies.emplace(
+                        schema_utils::agg_key(static_cast<const logical_plan::node_aggregate_t&>(*n)),
+                        cnt++);
                 }
                 for (auto& child : n->children()) {
                     nodes_traverse.emplace_back(child);

@@ -225,3 +225,107 @@ TEST_CASE("mixed plan group by integer key with double avg") { run_mixed_variant
 TEST_CASE("mixed plan group by string key", "[.][engine-group-by-string]") {
     run_mixed_variant("B", k_groupby_sql, true, false);
 }
+
+// Pure-engine reproduction: NO otterstax components involved. The plan is
+// produced by the ENGINE's own raw_parser + transformer, table aggregates are
+// swapped for node_data via public logical_plan API, and the plan is executed
+// through wrapper_dispatcher. A crash here is an otterbrix defect by
+// construction.
+#include <components/sql/parser/parser.h>
+#include <components/sql/transformer/transformer.hpp>
+#include <components/sql/transformer/utils.hpp>
+
+TEST_CASE("pure engine: group by string key over node_data", "[.][engine-group-by-string]") {
+    auto* resource = std::pmr::get_default_resource();
+
+    const char* sql = R"(
+        SELECT c.campaign_name, COUNT(p.product_id) as product_count, AVG(p.price) as avg_product_price
+        FROM db1.campaigns c
+        INNER JOIN pgdb.products p ON p.campaign_id = c.campaign_id
+        GROUP BY c.campaign_name ORDER BY product_count DESC;)";
+
+    auto* raw = raw_parser(resource, sql);
+    REQUIRE(raw != nullptr);
+    auto* res = reinterpret_cast<::Node*>(linitial(raw));
+    components::sql::transform::transformer transformer(resource);
+    auto binder = transformer.transform(components::sql::transform::pg_cell_to_node_cast(res));
+    REQUIRE_FALSE(binder.has_error());
+    auto root = binder.node_ptr();
+    REQUIRE(root);
+
+    auto make_chunk = [&](std::initializer_list<std::pair<const char*, components::types::logical_type>> names) {
+        std::pmr::vector<components::types::complex_logical_type> cols(resource);
+        for (auto& [n, t] : names) {
+            cols.emplace_back(t);
+            cols.back().set_alias(n);
+        }
+        components::vector::data_chunk_t chunk(resource, cols, 2);
+        for (size_t c = 0; c < cols.size(); ++c) {
+            for (size_t r = 0; r < 2; ++r) {
+                switch (cols[c].type()) {
+                    case components::types::logical_type::INTEGER:
+                        chunk.set_value(c,
+                                        r,
+                                        components::types::logical_value_t(resource, static_cast<int32_t>(r + 1)));
+                        break;
+                    case components::types::logical_type::DOUBLE:
+                        chunk.set_value(c, r, components::types::logical_value_t(resource, 100.5 * (r + 1)));
+                        break;
+                    default:
+                        chunk.set_value(
+                            c,
+                            r,
+                            components::types::logical_value_t(resource, std::string("n_") + std::to_string(r)));
+                        break;
+                }
+            }
+        }
+        chunk.set_cardinality(2);
+        return chunk;
+    };
+    using lt = components::types::logical_type;
+
+    // Swap the two table aggregates (relname campaigns/products) for raw data.
+    std::deque<components::logical_plan::node_ptr> walk{root};
+    size_t swapped = 0;
+    while (!walk.empty()) {
+        auto n = walk.front();
+        walk.pop_front();
+        for (auto& child : n->children()) {
+            if (child && child->type() == components::logical_plan::node_type::aggregate_t) {
+                const auto& rel = static_cast<const components::logical_plan::node_aggregate_t&>(*child).relname().t;
+                if (rel == "campaigns") {
+                    child =
+                        components::logical_plan::make_node_raw_data(resource,
+                                                                     make_chunk({{"campaign_id", lt::INTEGER},
+                                                                                 {"campaign_name", lt::STRING_LITERAL},
+                                                                                 {"budget", lt::DOUBLE}}));
+                    ++swapped;
+                    continue;
+                }
+                if (rel == "products") {
+                    child =
+                        components::logical_plan::make_node_raw_data(resource,
+                                                                     make_chunk({{"product_id", lt::INTEGER},
+                                                                                 {"campaign_id", lt::INTEGER},
+                                                                                 {"product_name", lt::STRING_LITERAL},
+                                                                                 {"price", lt::DOUBLE}}));
+                    ++swapped;
+                    continue;
+                }
+            }
+            if (child) {
+                walk.push_back(child);
+            }
+        }
+    }
+    REQUIRE(swapped == 2);
+
+    auto cfg = make_create_config("/tmp/otterstax_pure_engine_probe");
+    auto inst = otterbrix::make_otterbrix(cfg);
+    auto cursor = inst->dispatcher()->execute_plan(
+        otterbrix::session_id_t(),
+        components::logical_plan::execution_plan_t{resource, root, binder.params_ptr()});
+    std::cout << "pure engine execute: err=" << (cursor ? cursor->is_error() : true) << "\n";
+    REQUIRE(cursor);
+}

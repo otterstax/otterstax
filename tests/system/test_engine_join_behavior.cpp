@@ -60,3 +60,41 @@ TEST_CASE("engine string group by on real tables") {
     run("SELECT c.cname, COUNT(p.pid) AS cnt, AVG(p.price) AS av FROM sdb.c c JOIN sdb.p p ON p.cid = c.cid GROUP BY "
         "c.cname ORDER BY cnt DESC;");
 }
+
+// The buggy operator_group_t fallback is NOT reachable from plain SQL: every
+// SQL shape that would route into it (derived-table keys, joins of subqueries,
+// expression keys) is rejected by the engine with a clean error before the
+// group operator runs. The minimal reproduction therefore stays the
+// programmatic node_data plan in test_mixed_plan_engine.cpp.
+TEST_CASE("engine string group by via pure SQL fallback shapes") {
+    auto cfg = make_create_config("/tmp/otterstax_sqlgrp_probe");
+    auto inst = otterbrix::make_otterbrix(cfg);
+    auto* d = inst->dispatcher();
+    auto run = [&](const char* tag, const char* q) {
+        auto c = d->execute_sql(otterbrix::session_id_t(), q);
+        std::cout << "[" << tag << "] err=" << (c ? c->is_error() : true);
+        if (c && c->is_error()) {
+            std::cout << " what=" << c->get_error().what.c_str();
+        }
+        if (c && !c->is_error()) {
+            std::cout << " rows=" << c->size();
+        }
+        std::cout << "\n";
+        return c;
+    };
+    run("setup1", "CREATE DATABASE gdb;");
+    run("setup2", "CREATE TABLE gdb.c (cid INT, cname TEXT);");
+    run("setup3", "CREATE TABLE gdb.p (pid INT, cid INT, price DOUBLE);");
+    run("setup4", "INSERT INTO gdb.c (cid, cname) VALUES (1, 'alpha'), (2, 'beta');");
+    run("setup5", "INSERT INTO gdb.p (pid, cid, price) VALUES (1, 1, 10.5), (2, 1, 20.5), (3, 2, 30.0);");
+
+    // Each shape must come back as a cursor (error or success) — never a crash.
+    REQUIRE(run("derived", "SELECT t.cname, COUNT(*) AS cnt FROM (SELECT * FROM gdb.c) t GROUP BY t.cname;"));
+    REQUIRE(run("derived_join",
+                "SELECT t.cname, COUNT(s.pid) AS cnt, AVG(s.price) AS av "
+                "FROM (SELECT * FROM gdb.c) t JOIN (SELECT * FROM gdb.p) s ON s.cid = t.cid "
+                "GROUP BY t.cname ORDER BY cnt DESC;"));
+    REQUIRE(run("coalesce_key",
+                "SELECT COALESCE(c.cname, 'none') AS k, COUNT(*) AS cnt FROM gdb.c c "
+                "GROUP BY COALESCE(c.cname, 'none');"));
+}

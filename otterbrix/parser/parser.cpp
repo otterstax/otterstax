@@ -305,8 +305,11 @@ core::result_wrapper_t<ParsedQueryDataPtr> GreenplumParser::parse(const std::str
         } else {
             log_->trace("parse: calling raw_parser on modified SQL");
             auto* raw = raw_parser(&arena_resource, extraction.modified_sql.c_str());
-            if (!raw) {
-                log_->error("parse: raw_parser returned null for SQL: {}", sql.substr(0, 100));
+            if (!raw || list_length(raw) == 0) {
+                // raw_parser returns null on a syntax error and an EMPTY list
+                // for input with no statements (e.g. "") — linitial on an
+                // empty list is undefined behaviour, so guard both here.
+                log_->error("parse: raw_parser returned no statements for SQL: {}", sql.substr(0, 100));
                 return core::error_t{core::error_code_t::sql_parse_error,
                                      std::pmr::string{"syntax error", resource_}};
             }

@@ -80,8 +80,7 @@ TEST_CASE("cross-backend GROUP BY downstream calls") {
 // Engine defect (otterbrix a13-rc-1): operator_group_t fallback aggregation
 // dereferences null when the GROUP BY key is a table-qualified STRING column
 // over raw node_data chunks (key extraction yields NA -> NA-typed result
-// vector -> validity_mask_t::set on null). Hidden until the engine fix lands.
-TEST_CASE("mixed plan with node_data executes in engine", "[.][engine-group-by-string]") {
+TEST_CASE("mixed plan with node_data executes in engine", "[engine-group-by-string]") {
     auto* resource = std::pmr::get_default_resource();
     GreenplumParser parser(resource);
     const char* sql = R"(
@@ -222,7 +221,7 @@ static const char* k_groupby_sql = R"(
     GROUP BY c.campaign_name ORDER BY product_count DESC;)";
 
 TEST_CASE("mixed plan group by integer key with double avg") { run_mixed_variant("A", k_groupby_sql, false, true); }
-TEST_CASE("mixed plan group by string key", "[.][engine-group-by-string]") {
+TEST_CASE("mixed plan group by string key", "[engine-group-by-string]") {
     run_mixed_variant("B", k_groupby_sql, true, false);
 }
 
@@ -235,7 +234,7 @@ TEST_CASE("mixed plan group by string key", "[.][engine-group-by-string]") {
 #include <components/sql/transformer/transformer.hpp>
 #include <components/sql/transformer/utils.hpp>
 
-TEST_CASE("pure engine: group by string key over node_data", "[.][engine-group-by-string]") {
+TEST_CASE("pure engine: group by string key over node_data", "[engine-group-by-string]") {
     auto* resource = std::pmr::get_default_resource();
 
     const char* sql = R"(

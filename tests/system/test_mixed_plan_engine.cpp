@@ -243,7 +243,10 @@ TEST_CASE("pure engine: group by string key over node_data", "[engine-group-by-s
         INNER JOIN pgdb.products p ON p.campaign_id = c.campaign_id
         GROUP BY c.campaign_name ORDER BY product_count DESC;)";
 
-    auto* raw = raw_parser(resource, sql);
+    // The raw AST lives in an arena, exactly like GreenplumParser does in
+    // production — raw_parser allocations are never freed individually.
+    std::pmr::monotonic_buffer_resource arena(resource);
+    auto* raw = raw_parser(&arena, sql);
     REQUIRE(raw != nullptr);
     auto* res = reinterpret_cast<::Node*>(linitial(raw));
     components::sql::transform::transformer transformer(resource);

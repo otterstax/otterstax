@@ -17,7 +17,6 @@
 #include "otterbrix/translators/input/pg_to_chunk.hpp"
 #include "scheduler/schema_utils.hpp"
 #include "utility/cv_wrapper.hpp"
-#include "utility/pipeline_error.hpp"
 #include "utility/session.hpp"
 #include "utility/table_info.hpp"
 
@@ -86,11 +85,11 @@ namespace mysql {
         bool hasConnection(const std::string& uuid) const;
 
         /// handler coroutines
-        actor_zeta::unique_future<otterstax::result<ParsedQueryDataPtr>> get_catalog_schema(session_hash_t id,
-                                                                                            ParsedQueryDataPtr data);
+        actor_zeta::unique_future<core::result_wrapper_t<ParsedQueryDataPtr>>
+        get_catalog_schema(session_hash_t id, ParsedQueryDataPtr data);
 
-        actor_zeta::unique_future<otterstax::result<ParsedQueryDataPtr>> update_backend_type(session_hash_t id,
-                                                                                             ParsedQueryDataPtr data);
+        actor_zeta::unique_future<core::result_wrapper_t<ParsedQueryDataPtr>>
+        update_backend_type(session_hash_t id, ParsedQueryDataPtr data);
 
         actor_zeta::unique_future<core::error_t> add_connection_schema(qualified_name_t name);
 
@@ -130,15 +129,25 @@ namespace mysql {
         mutable OTX_LOCKABLE_N(std::mutex, connection_registry_mtx_, "CatalogManager::connection_registry_mtx");
         std::unordered_map<std::string, catalog_ext::ConnectionInfo> connection_registry_;
 
-        otterstax::result<ParsedQueryDataPtr> update_backend_type_impl(ParsedQueryDataPtr&& data);
+        core::result_wrapper_t<ParsedQueryDataPtr> update_backend_type_impl(ParsedQueryDataPtr&& data);
         // Shared pre-pass of update_backend_type/get_catalog_schema: normalizes
         // target names per connection type and lazily registers external tables
         // missing from the store (DDL targets are skipped — CREATE targets do
-        // not exist yet, DROP needs no schema).
-        actor_zeta::unique_future<core::error_t> ensure_external_targets_registered(ParsedQueryDataPtr& data);
-        // Synchronous remote-schema discovery: probes the backend through the
-        // connector managers and collects one (name, STRUCT) entry per table.
-        // Does NOT touch the engine catalog or the local store.
-        core::error_t discover_connection_schemas(const qualified_name_t& name, catalog_ext::discovered_tables_t& out);
+        // not exist yet, DROP needs no schema). Takes a non-owning reference:
+        // the pass MUTATES the parsed data (name normalization, store fills).
+        actor_zeta::unique_future<core::error_t> ensure_external_targets_registered(ParsedQueryData& data);
+        // Remote-schema discovery coroutine: probes the backend of `conn_type`
+        // through its connector manager and collects one (name, STRUCT) entry
+        // per table. Unified contract for all three backends: empty
+        // `name.collection` → discover every table of the configured
+        // database/schema; non-empty → discover that single table. Does NOT
+        // touch the engine catalog, the local store or the connection
+        // registry. All connector futures are consumed in straight-line
+        // coroutine code — never from inside another query's result handler on
+        // the same busy connection. Any per-table failure makes the whole
+        // discovery fail.
+        actor_zeta::unique_future<core::error_t> discover_connection_schemas(const qualified_name_t& name,
+                                                                             catalog_ext::ConnectionType conn_type,
+                                                                             catalog_ext::discovered_tables_t& out);
     };
 } // namespace mysql

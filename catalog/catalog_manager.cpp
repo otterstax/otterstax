@@ -4,7 +4,6 @@
 #include "catalog_manager.hpp"
 
 #include "integration/otterbrix/otterbrix_manager.hpp"
-#include "utility/external_name.hpp"
 #include "utility/tracy_profiler.hpp"
 
 #include <components/logical_plan/identifier_types.hpp>
@@ -13,9 +12,75 @@
 #include <thread>
 
 using namespace components;
-using otterstax::error_code_t;
-using otterstax::error_tag_t;
-using otterstax::pipeline_error;
+
+namespace {
+
+    // Single-quoted SQL string literal for the handwritten discovery list
+    // queries (information_schema / system.tables): embedded quotes doubled.
+    // Lives here because these are the only handwritten queries left — every
+    // per-table probe goes through sql_gen::generate_query.
+    std::string escape_sql_literal(const std::string& value) {
+        std::string out;
+        out.reserve(value.size() + 2);
+        out.push_back('\'');
+        for (char c : value) {
+            if (c == '\'') {
+                out.push_back('\'');
+            }
+            out.push_back(c);
+        }
+        out.push_back('\'');
+        return out;
+    }
+
+    // Backend-dialect schema probe (SELECT * FROM <table> WHERE 1 = 0) built
+    // through the regular plan-driven generator — the single quoting point.
+    // The always-false predicate is two bound parameters, so no fake column
+    // identifier appears in the generated SQL.
+    std::string make_schema_probe_query(std::pmr::memory_resource* resource,
+                                        const qualified_name_t& name,
+                                        backend_type_t backend) {
+        logical_plan::parameter_node_t param(resource);
+        auto node = logical_plan::make_node_aggregate(resource,
+                                                      core::uid_t{name.unique_identifier},
+                                                      core::dbname_t{name.database},
+                                                      core::relname_t{name.collection});
+        node->append_child(logical_plan::make_node_match(
+            resource,
+            core::dbname_t{name.database},
+            core::relname_t{name.collection},
+            expressions::make_compare_expression(resource,
+                                                 expressions::compare_type::eq,
+                                                 param.add_parameter(types::logical_value_t(resource, 1)),
+                                                 param.add_parameter(types::logical_value_t(resource, 0)))));
+
+        otterstax::names::resolved_target_t probe_target{components::catalog::INVALID_OID, name, {}};
+        std::pmr::vector<external_entry_t> empty_batch{resource};
+        return sql_gen::generate_query(node, &param.parameters(), backend, probe_target, empty_batch);
+    }
+
+    // §2.1: per-table discovery failures are collected and folded into one
+    // hard error naming the failure count and the first few tables.
+    core::error_t make_discovery_error(std::pmr::memory_resource* resource,
+                                       const std::pmr::vector<std::pmr::string>& failed_tables) {
+        constexpr size_t max_named = 3;
+        std::pmr::string msg{resource};
+        msg.append("Schema discovery failed for ");
+        msg.append(std::to_string(failed_tables.size()).c_str());
+        msg.append(" table(s): ");
+        for (size_t i = 0; i < failed_tables.size() && i < max_named; ++i) {
+            if (i != 0) {
+                msg.append(", ");
+            }
+            msg.append(failed_tables[i]);
+        }
+        if (failed_tables.size() > max_named) {
+            msg.append(", ...");
+        }
+        return core::error_t(core::error_code_t::schema_error, std::move(msg));
+    }
+
+} // namespace
 
 namespace mysql {
     CatalogManager::CatalogManager(std::pmr::memory_resource* res, actor_zeta::address_t otterbrix_manager)
@@ -108,7 +173,7 @@ namespace mysql {
         }
     }
 
-    otterstax::result<ParsedQueryDataPtr> CatalogManager::update_backend_type_impl(ParsedQueryDataPtr&& data) {
+    core::result_wrapper_t<ParsedQueryDataPtr> CatalogManager::update_backend_type_impl(ParsedQueryDataPtr&& data) {
         OTX_ZONE_N("catalog::backend_type_detection");
         assert(data != nullptr);
         log_->debug("update_backend_type_impl: start updating backend type for query with external nodes count {}",
@@ -124,26 +189,9 @@ namespace mysql {
         bool has_pg = false;
         bool has_ch = false;
 
-        auto& nodes = data->otterbrix_params->external_nodes;
-        auto& targets = data->otterbrix_params->external_targets;
-        if (targets.size() != nodes.size()) {
-            log_->error("update_backend_type_impl: external_targets/external_nodes batch count mismatch: {} vs {}",
-                        targets.size(),
-                        nodes.size());
-            return pipeline_error(error_code_t::internal_error,
-                                  error_tag_t::catalog_manager,
-                                  "external_targets/external_nodes batch count mismatch");
-        }
-
-        for (size_t b = 0; b < nodes.size(); ++b) {
-            if (targets[b].size() != nodes[b].size()) {
-                log_->error("update_backend_type_impl: external_targets/external_nodes size mismatch in batch {}", b);
-                return pipeline_error(error_code_t::internal_error,
-                                      error_tag_t::catalog_manager,
-                                      "external_targets/external_nodes size mismatch");
-            }
-            for (size_t i = 0; i < nodes[b].size(); ++i) {
-                auto& target = targets[b][i];
+        for (auto& batch : data->otterbrix_params->external_nodes) {
+            for (auto& entry : batch) {
+                auto& target = entry.target;
                 const auto& name = target.name;
 
                 // Determine backend type for this node
@@ -164,12 +212,16 @@ namespace mysql {
 
                 // DDL targets are exempt from OID stamping: CREATE targets a
                 // table that does not exist yet, DROP removes one — neither
-                // needs a registered schema to be routed.
-                auto node_type = (*nodes[b][i])->type();
+                // needs a registered schema to be routed. Subquery stubs
+                // (schema_node_t, node_type::unused) are placeholders whose
+                // schema is computed from the subquery plan — not remote
+                // tables either.
+                auto node_type = (*entry.node)->type();
                 if (node_type == logical_plan::node_type::create_collection_t ||
                     node_type == logical_plan::node_type::drop_collection_t ||
                     node_type == logical_plan::node_type::create_index_t ||
-                    node_type == logical_plan::node_type::drop_index_t) {
+                    node_type == logical_plan::node_type::drop_index_t ||
+                    node_type == logical_plan::node_type::unused) {
                     continue;
                 }
 
@@ -179,14 +231,15 @@ namespace mysql {
                     if (!name.unique_identifier.empty()) {
                         log_->error("update_backend_type_impl: no registered schema for external table {}",
                                     name.to_string());
-                        return pipeline_error(error_code_t::catalog_error,
-                                              error_tag_t::catalog_manager,
-                                              "External table is not registered: " + name.to_string());
+                        return core::error_t(
+                            core::error_code_t::table_not_exists,
+                            std::pmr::string{("External table is not registered: " + name.to_string()).c_str(),
+                                             resource()});
                     }
                     // No connection uid — local Otterbrix table, resolved by the engine itself.
                 } else {
                     target.oid = oid;
-                    (*nodes[b][i])->set_table_oid(oid);
+                    (*entry.node)->set_table_oid(oid);
                 }
             }
         }
@@ -221,25 +274,25 @@ namespace mysql {
     }
 
     actor_zeta::unique_future<core::error_t>
-    CatalogManager::ensure_external_targets_registered(ParsedQueryDataPtr& data) {
+    CatalogManager::ensure_external_targets_registered(ParsedQueryData& data) {
         // Normalize names and lazily register external tables the engine does
         // not know yet (e.g. created at runtime by a previous DDL statement).
         // Must run BEFORE update_backend_type_impl: OID stamping there requires
         // every non-DDL external table to be present in the store.
-        auto& nodes = data->otterbrix_params->external_nodes;
-        auto& targets = data->otterbrix_params->external_targets;
-        for (size_t b = 0; b < nodes.size() && b < targets.size(); ++b) {
-            for (size_t i = 0; i < nodes[b].size() && i < targets[b].size(); ++i) {
-                auto& target = targets[b][i];
+        for (auto& batch : data.otterbrix_params->external_nodes) {
+            for (auto& entry : batch) {
+                auto& target = entry.target;
                 if (target.name.unique_identifier.empty()) {
                     continue;
                 }
-                auto node_type = (*nodes[b][i])->type();
+                auto node_type = (*entry.node)->type();
                 if (node_type == logical_plan::node_type::create_collection_t ||
                     node_type == logical_plan::node_type::drop_collection_t ||
                     node_type == logical_plan::node_type::create_index_t ||
-                    node_type == logical_plan::node_type::drop_index_t) {
-                    // CREATE targets do not exist yet; DROP needs no schema.
+                    node_type == logical_plan::node_type::drop_index_t ||
+                    node_type == logical_plan::node_type::unused) {
+                    // CREATE targets do not exist yet; DROP needs no schema;
+                    // subquery stubs (schema_node_t) are computed, not remote.
                     continue;
                 }
                 auto conn_type_opt = getConnectionType(target.name.unique_identifier);
@@ -258,41 +311,38 @@ namespace mysql {
         co_return core::error_t::no_error();
     }
 
-    actor_zeta::unique_future<otterstax::result<ParsedQueryDataPtr>>
+    actor_zeta::unique_future<core::result_wrapper_t<ParsedQueryDataPtr>>
     CatalogManager::update_backend_type(session_hash_t id, ParsedQueryDataPtr data) {
         OTX_ZONE_N("catalog::update_backend_type");
-        auto err = co_await ensure_external_targets_registered(data);
+        auto err = co_await ensure_external_targets_registered(*data);
         if (err.contains_error()) {
             log_->error("update_backend_type: {}", err.what.c_str());
-            co_return pipeline_error(error_code_t::catalog_error,
-                                     error_tag_t::catalog_manager,
-                                     std::string{err.what.c_str()});
+            co_return std::move(err);
         }
         auto impl_result = update_backend_type_impl(std::move(data));
         if (impl_result.has_error()) {
             log_->error("update_backend_type: {}", impl_result.error().what);
             co_return std::move(impl_result);
         }
-        auto updated_data = impl_result.take_value();
+        auto updated_data = std::move(impl_result.value());
         if (updated_data->backend_type == backend_type_t::Unknown) {
             log_->error("update_backend_type: Backend type is unknown after update_backend_type_impl, cannot proceed");
-            co_return pipeline_error(error_code_t::backend_unknown,
-                                     error_tag_t::catalog_manager,
-                                     "Backend type is unknown after update_backend_type_impl, cannot proceed");
+            co_return core::error_t(
+                core::error_code_t::schema_error,
+                std::pmr::string{"Backend type is unknown after update_backend_type_impl, cannot proceed",
+                                 resource()});
         }
 
         log_->debug("update_backend_type: determined backend_type = {}", static_cast<int>(updated_data->backend_type));
         co_return std::move(updated_data);
     }
 
-    actor_zeta::unique_future<otterstax::result<ParsedQueryDataPtr>>
+    actor_zeta::unique_future<core::result_wrapper_t<ParsedQueryDataPtr>>
     CatalogManager::get_catalog_schema(session_hash_t id, ParsedQueryDataPtr data) {
         OTX_ZONE_N("catalog::get_catalog_schema");
-        auto err = co_await ensure_external_targets_registered(data);
+        auto err = co_await ensure_external_targets_registered(*data);
         if (err.contains_error()) {
-            co_return pipeline_error(error_code_t::catalog_error,
-                                     error_tag_t::catalog_manager,
-                                     std::string{err.what.c_str()});
+            co_return std::move(err);
         }
 
         auto impl_result = update_backend_type_impl(std::move(data));
@@ -300,12 +350,13 @@ namespace mysql {
             log_->error("get_catalog_schema: {}", impl_result.error().what);
             co_return std::move(impl_result);
         }
-        auto updated_data = impl_result.take_value();
+        auto updated_data = std::move(impl_result.value());
         if (updated_data->backend_type == backend_type_t::Unknown) {
             log_->error("get_catalog_schema: Backend type is unknown after update_backend_type_impl, cannot proceed");
-            co_return pipeline_error(error_code_t::backend_unknown,
-                                     error_tag_t::catalog_manager,
-                                     "Backend type is unknown after update_backend_type_impl, cannot proceed");
+            co_return core::error_t(
+                core::error_code_t::schema_error,
+                std::pmr::string{"Backend type is unknown after update_backend_type_impl, cannot proceed",
+                                 resource()});
         }
 
         log_->debug(
@@ -319,22 +370,21 @@ namespace mysql {
             co_return std::move(updated_data);
         }
 
-        auto& nodes = updated_data->otterbrix_params->external_nodes;
-        auto& targets = updated_data->otterbrix_params->external_targets;
-        for (size_t b = 0; b < nodes.size(); ++b) {
-            for (size_t i = 0; i < nodes[b].size(); ++i) {
-                auto& node = nodes[b][i];
+        for (auto& batch : updated_data->otterbrix_params->external_nodes) {
+            for (auto& entry : batch) {
+                auto* node = entry.node;
                 if ((*node)->type() == logical_plan::node_type::aggregate_t) {
-                    const auto& target = targets[b][i];
+                    const auto& target = entry.target;
 
                     const auto* struct_schema = store_.schema_by_oid(target.oid);
                     if (struct_schema == nullptr) {
                         log_->error("get_catalog_schema: no schema registered for external table {}",
                                     target.name.to_string());
-                        co_return pipeline_error(error_code_t::catalog_error,
-                                                 error_tag_t::catalog_manager,
-                                                 "No schema registered for external table: " +
-                                                     target.name.to_string());
+                        co_return core::error_t(
+                            core::error_code_t::schema_error,
+                            std::pmr::string{
+                                ("No schema registered for external table: " + target.name.to_string()).c_str(),
+                                resource()});
                     }
 
                     const auto& agg = static_cast<logical_plan::node_aggregate_t&>(*(*node));
@@ -362,11 +412,31 @@ namespace mysql {
         OTX_ZONE_N("catalog::add_connection_schema");
         const std::string uuid = name.unique_identifier;
 
-        // Step 1 (sync): probe the remote backend and collect per-table STRUCT schemas.
+        // Determine connection type by checking which ConnectorManager has this connection.
+        catalog_ext::ConnectionType conn_type;
+        if (mysql_conn_manager_ && mysql_conn_manager_->hasConnection(uuid)) {
+            conn_type = catalog_ext::ConnectionType::MySQL;
+            log_->debug("add_connection_schema: detected MySQL connection for uuid: {}", uuid);
+        } else if (pg_conn_manager_ && pg_conn_manager_->hasConnection(uuid)) {
+            conn_type = catalog_ext::ConnectionType::PostgreSQL;
+            log_->debug("add_connection_schema: detected PostgreSQL connection for uuid: {}", uuid);
+        } else if (ch_conn_manager_ && ch_conn_manager_->hasConnection(uuid)) {
+            conn_type = catalog_ext::ConnectionType::ClickHouse;
+            log_->debug("add_connection_schema: detected ClickHouse connection for uuid: {}", uuid);
+        } else {
+            log_->error("add_connection_schema: no connector manager has connection with uuid: {}", uuid);
+            co_return core::error_t(
+                core::error_code_t::missing_field,
+                std::pmr::string{("No connector manager found for uuid: " + uuid).c_str(), resource()});
+        }
+
+        // Step 1: probe the remote backend and collect per-table STRUCT schemas.
         catalog_ext::discovered_tables_t tables(resource());
-        if (auto err = discover_connection_schemas(name, tables); err.contains_error()) {
+        if (auto err = co_await discover_connection_schemas(name, conn_type, tables); err.contains_error()) {
             co_return err;
         }
+
+        registerConnection(uuid, conn_type, name);
 
         // Step 2: make sure the per-connection engine database exists (one per uid).
         std::pmr::string uid_key{uuid.c_str(), resource()};
@@ -380,9 +450,10 @@ namespace mysql {
                             db_result.error().what);
                 co_return core::error_t(
                     core::error_code_t::schema_error,
-                    std::pmr::string{
-                        ("Failed to create engine database for uid '" + uuid + "': " + db_result.error().what).c_str(),
-                        resource()});
+                    std::pmr::string{("Failed to create engine database for uid '" + uuid +
+                                      "': " + db_result.error().what.c_str())
+                                         .c_str(),
+                                     resource()});
             }
             registered_dbs_.insert(uid_key);
         }
@@ -404,8 +475,6 @@ namespace mysql {
             auto [tbl_sched, tbl_future] = actor_zeta::send(otterbrix_manager_,
                                                             &db::OtterbrixManager::register_external_table,
                                                             table.name,
-                                                            uuid,
-                                                            otterstax::encode_external_collection(table.name),
                                                             std::move(columns));
             auto tbl_result = co_await std::move(tbl_future);
             if (tbl_result.has_error()) {
@@ -415,12 +484,12 @@ namespace mysql {
                 co_return core::error_t(
                     core::error_code_t::schema_error,
                     std::pmr::string{("Failed to register external table '" + table.name.to_string() +
-                                      "': " + tbl_result.error().what)
+                                      "': " + tbl_result.error().what.c_str())
                                          .c_str(),
                                      resource()});
             }
 
-            auto oid = tbl_result.take_value();
+            auto oid = tbl_result.value();
             if (auto err = store_.put(oid, table.name, std::move(table.schema)); err.contains_error()) {
                 log_->error("add_connection_schema: failed to store schema for table {}: {}",
                             table.name.to_string(),
@@ -433,75 +502,129 @@ namespace mysql {
         co_return core::error_t::no_error();
     }
 
-    // Discovery only — engine registration happens in add_connection_schema.
-    core::error_t CatalogManager::discover_connection_schemas(const qualified_name_t& name,
-                                                              catalog_ext::discovered_tables_t& out) {
+    // Discovery only — engine registration and the connection-type registry
+    // update happen in add_connection_schema. Coroutine: every connector
+    // future is consumed at the top level of this body (one query in flight
+    // per connection at a time); result handlers never issue queries
+    // themselves. Unified contract: empty `name.collection` → discover every
+    // table of the configured database/schema; non-empty → that single table.
+    actor_zeta::unique_future<core::error_t>
+    CatalogManager::discover_connection_schemas(const qualified_name_t& name,
+                                                catalog_ext::ConnectionType conn_type,
+                                                catalog_ext::discovered_tables_t& out) {
         OTX_ZONE_N("catalog::discover_connection_schemas");
         const std::string& uuid = name.unique_identifier;
 
-        // Determine connection type by checking which ConnectorManager has this connection
-        catalog_ext::ConnectionType conn_type;
-        bool is_mysql = mysql_conn_manager_ && mysql_conn_manager_->hasConnection(uuid);
-        bool is_pg = pg_conn_manager_ && pg_conn_manager_->hasConnection(uuid);
-        bool is_ch = ch_conn_manager_ && ch_conn_manager_->hasConnection(uuid);
-
-        if (is_mysql) {
-            conn_type = catalog_ext::ConnectionType::MySQL;
-            log_->debug("add_connection_schema: detected MySQL connection for uuid: {}", uuid);
-        } else if (is_pg) {
-            conn_type = catalog_ext::ConnectionType::PostgreSQL;
-            log_->debug("add_connection_schema: detected PostgreSQL connection for uuid: {}", uuid);
-        } else if (is_ch) {
-            conn_type = catalog_ext::ConnectionType::ClickHouse;
-            log_->debug("add_connection_schema: detected ClickHouse connection for uuid: {}", uuid);
-        } else {
-            log_->error("add_connection_schema: no connector manager has connection with uuid: {}", uuid);
-            return core::error_t(
-                core::error_code_t::missing_field,
-                std::pmr::string{("No connector manager found for uuid: " + uuid).c_str(), resource()});
-        }
-
-        registerConnection(uuid, conn_type, name);
-
-        if (is_mysql) {
+        if (conn_type == catalog_ext::ConnectionType::MySQL) {
             // MySQL: query schema using boost::mysql
+            if (name.collection.empty()) {
+                // Whole-database discovery via information_schema.
+                if (name.database.empty()) {
+                    log_->error("discover_connection_schemas: no MySQL database configured for uuid {}", uuid);
+                    co_return core::error_t(
+                        core::error_code_t::missing_field,
+                        std::pmr::string{
+                            ("Cannot discover MySQL schema: no database configured for uuid: " + uuid).c_str(),
+                            resource()});
+                }
+
+                // Phase 1: list table names — one query, consumed here; the
+                // handler only collects names and never issues queries itself.
+                std::string list_tables_query =
+                    "SELECT table_name FROM information_schema.tables WHERE table_schema = " +
+                    escape_sql_literal(name.database) + " AND table_type = 'BASE TABLE';";
+                log_->debug("discover_connection_schemas: empty table, querying information_schema: \"{}\"",
+                            list_tables_query);
+
+                std::pmr::vector<std::pmr::string> table_names(resource());
+                auto list_handler = [&table_names](const boost::mysql::results& result) -> otterstax::asio_error_t {
+                    for (auto row : result.rows()) {
+                        auto view = row.at(0).as_string();
+                        table_names.emplace_back(view.data(), view.size());
+                    }
+                    return otterstax::asio_error_t{};
+                };
+
+                try {
+                    auto future = mysql_conn_manager_->executeQuery(uuid, list_tables_query, list_handler);
+                    if (auto err = std::move(future.get()).release(); err.contains_error()) {
+                        co_return err;
+                    }
+                } catch (const std::exception& e) {
+                    log_->error("discover_connection_schemas: failed to query table list from MySQL database {}",
+                                name.database);
+                    co_return core::error_t(
+                        core::error_code_t::missing_field,
+                        std::pmr::string{(std::string("Failed to list MySQL tables: ") + e.what()).c_str(),
+                                         resource()});
+                }
+                log_->info("discover_connection_schemas: found {} tables in MySQL database {}",
+                           table_names.size(),
+                           name.database);
+
+                // Phase 2: probe each table sequentially at coroutine top
+                // level — the connection is free between queries. Any failed
+                // table fails the whole discovery (§2.1).
+                std::pmr::vector<std::pmr::string> failed_tables(resource());
+                for (const auto& tn : table_names) {
+                    std::string table_name{tn.c_str(), tn.size()};
+                    log_->debug("discover_connection_schemas: processing MySQL table {}", table_name);
+
+                    qualified_name_t table_name_obj(uuid, name.database, "", table_name);
+                    auto schema_handler =
+                        [this, table_name_obj, &out](const boost::mysql::results& result) -> otterstax::asio_error_t {
+                        auto schema_struct = tsl::mysql_to_struct(resource(), result.meta());
+                        out.push_back(catalog_ext::discovered_table_t{table_name_obj, std::move(schema_struct)});
+                        log_->info("discover_connection_schemas: schema discovered for: {}",
+                                   table_name_obj.to_string());
+                        return otterstax::asio_error_t{};
+                    };
+
+                    std::string schema_query = make_schema_probe_query(resource(), table_name_obj, backend_type_t::MySQL);
+                    try {
+                        auto future = mysql_conn_manager_->executeQuery(uuid, schema_query, schema_handler);
+                        if (auto err = std::move(future.get()).release(); err.contains_error()) {
+                            log_->error("discover_connection_schemas: failed to fetch schema for {}.{}: {}",
+                                        name.database,
+                                        table_name,
+                                        err.what.c_str());
+                            failed_tables.emplace_back((name.database + "." + table_name).c_str());
+                        }
+                    } catch (const std::exception& e) {
+                        log_->error("discover_connection_schemas: failed to query schema for {}.{}: {}",
+                                    name.database,
+                                    table_name,
+                                    e.what());
+                        failed_tables.emplace_back((name.database + "." + table_name).c_str());
+                    }
+                }
+                if (!failed_tables.empty()) {
+                    co_return make_discovery_error(resource(), failed_tables);
+                }
+                co_return core::error_t::no_error();
+            }
+
+            // Single-table probe.
             auto schema_handler = [this, &name, &out](const boost::mysql::results& result) -> otterstax::asio_error_t {
                 auto schema_struct = tsl::mysql_to_struct(resource(), result.meta());
                 out.push_back(catalog_ext::discovered_table_t{name, std::move(schema_struct)});
-                log_->info("add_connection_schema: schema discovered for: {}", name.to_string());
+                log_->info("discover_connection_schemas: schema discovered for: {}", name.to_string());
                 return otterstax::asio_error_t{};
             };
 
-            logical_plan::parameter_node_t param(resource());
-            auto node = logical_plan::make_node_aggregate(resource(),
-                                                          core::uid_t{name.unique_identifier},
-                                                          core::dbname_t{name.database},
-                                                          core::relname_t{name.collection});
-            node->append_child(logical_plan::make_node_match(
-                resource(),
-                core::dbname_t{name.database},
-                core::relname_t{name.collection},
-                expressions::make_compare_expression(resource(),
-                                                     expressions::compare_type::eq,
-                                                     expressions::key_t(resource(), "1"),
-                                                     param.add_parameter(types::logical_value_t(resource(), 0)))));
-
-            otterstax::names::resolved_target_t probe_target{components::catalog::INVALID_OID, name, {}};
-            std::pmr::vector<otterstax::names::resolved_target_t> empty_targets{resource()};
-            std::string query =
-                sql_gen::generate_query(node, &param.parameters(), backend_type_t::MySQL, probe_target, empty_targets);
-            log_->debug("add_connection_schema: Generated MySQL Query: \"{}\"", query);
+            std::string query = make_schema_probe_query(resource(), name, backend_type_t::MySQL);
+            log_->debug("discover_connection_schemas: Generated MySQL Query: \"{}\"", query);
 
             try {
                 auto future = mysql_conn_manager_->executeQuery(uuid, query, schema_handler);
-                return std::move(future.get()).release();
+                co_return std::move(future.get()).release();
             } catch (const std::exception& e) {
-                log_->error("add_connection_schema: failed to query MySQL schema for {}", name.to_string());
-                return core::error_t(
+                log_->error("discover_connection_schemas: failed to query MySQL schema for {}", name.to_string());
+                co_return core::error_t(
                     core::error_code_t::missing_field,
                     std::pmr::string{(std::string("MySQL schema query failed: ") + e.what()).c_str(), resource()});
             }
-        } else if (is_pg) {
+        } else if (conn_type == catalog_ext::ConnectionType::PostgreSQL) {
             // PostgreSQL: query schema using libpq
             // Get the actual schema and table from connection params
             // The 'name' parameter may have unique_identifier in schema field (for catalog lookups)
@@ -509,21 +632,21 @@ namespace mysql {
             auto conn_params = pg_conn_manager_->conn_params(uuid);
             qualified_name_t pg_name;
             if (conn_params) {
-                // Use connection params for correct schema.table format
+                // Use connection params for the correct database/schema; the
+                // requested collection (when given) selects the single table.
                 pg_name = qualified_name_t(uuid,
                                            conn_params->database,
                                            conn_params->schema.empty() ? "public" : conn_params->schema,
-                                           conn_params->table);
-                log_->debug("add_connection_schema: using conn_params - schema={}, table={}",
+                                           name.collection.empty() ? conn_params->table : name.collection);
+                log_->debug("discover_connection_schemas: using conn_params - schema={}, table={}",
                             pg_name.schema,
                             pg_name.collection);
             } else {
-                // Fallback: use name as-is (may be from parsed query with correct schema)
                 pg_name = qualified_name_t(name.unique_identifier,
                                            name.database,
                                            name.schema.empty() ? "public" : name.schema,
                                            name.collection);
-                log_->debug("add_connection_schema: no conn_params, using name - schema={}, table={}",
+                log_->debug("discover_connection_schemas: no conn_params, using name - schema={}, table={}",
                             pg_name.schema,
                             pg_name.collection);
             }
@@ -533,107 +656,160 @@ namespace mysql {
 
             // If table is empty, fetch all tables from the schema
             if (pg_name.collection.empty()) {
-                // First, get list of all tables in the schema
+                // Phase 1: list table names — one query, consumed here; the
+                // handler only collects names and never issues queries itself.
                 std::string list_tables_query =
-                    "SELECT table_name FROM information_schema.tables WHERE table_schema = '" + pg_name.schema +
-                    "' AND table_type = 'BASE TABLE';";
-                log_->debug("add_connection_schema: empty table, querying information_schema: \"{}\"",
+                    "SELECT table_name FROM information_schema.tables WHERE table_schema = " +
+                    escape_sql_literal(pg_name.schema) + " AND table_type = 'BASE TABLE';";
+                log_->debug("discover_connection_schemas: empty table, querying information_schema: \"{}\"",
                             list_tables_query);
 
-                // Handler to process list of tables and then fetch each table's schema
-                auto list_handler = [this, uuid, pg_name, pg_enum_oids, &out](
-                                        PGresult* result) -> otterstax::asio_error_t {
+                std::pmr::vector<std::pmr::string> table_names(resource());
+                auto list_handler = [&table_names](PGresult* result) -> otterstax::asio_error_t {
                     int num_tables = PQntuples(result);
-                    log_->info("add_connection_schema: found {} tables in schema {}", num_tables, pg_name.schema);
-
-                    // For each table, fetch its schema
                     for (int i = 0; i < num_tables; ++i) {
-                        std::string table_name = PQgetvalue(result, i, 0);
-                        log_->debug("add_connection_schema: processing table {}", table_name);
-
-                        qualified_name_t full_table_name = pg_name;
-                        full_table_name.collection = table_name;
-
-                        // Create a handler for this specific table's schema
-                        auto schema_handler = [this, full_table_name, pg_enum_oids, &out](
-                                                  PGresult* schema_result) -> otterstax::asio_error_t {
-                            auto schema_struct = tsl::pg_to_struct(resource(), schema_result, pg_enum_oids);
-                            out.push_back(catalog_ext::discovered_table_t{full_table_name, std::move(schema_struct)});
-                            log_->info("add_connection_schema: schema discovered for: {}.{}",
-                                       full_table_name.schema,
-                                       full_table_name.collection);
-                            return otterstax::asio_error_t{};
-                        };
-
-                        // Query schema for this table
-                        std::string schema_query = "SELECT * FROM " + full_table_name.schema + "." +
-                                                   full_table_name.collection + " WHERE 1 = 0;";
-                        try {
-                            auto future = pg_conn_manager_->executeQuery(uuid, schema_query, schema_handler);
-                            auto err = future.get();
-                            if (err.contains_error()) {
-                                log_->error("add_connection_schema: failed to fetch schema for {}.{}",
-                                            full_table_name.schema,
-                                            full_table_name.collection);
-                            }
-                        } catch (const std::exception& e) {
-                            log_->error("add_connection_schema: failed to query schema for {}.{}: {}",
-                                        full_table_name.schema,
-                                        full_table_name.collection,
-                                        e.what());
-                        }
+                        table_names.emplace_back(PQgetvalue(result, i, 0));
                     }
                     return otterstax::asio_error_t{};
                 };
 
                 try {
                     auto future = pg_conn_manager_->executeQuery(uuid, list_tables_query, list_handler);
-                    return std::move(future.get()).release();
+                    if (auto err = std::move(future.get()).release(); err.contains_error()) {
+                        co_return err;
+                    }
                 } catch (const std::exception& e) {
-                    log_->error("add_connection_schema: failed to query table list from schema {}", pg_name.schema);
-                    return core::error_t(
+                    log_->error("discover_connection_schemas: failed to query table list from schema {}",
+                                pg_name.schema);
+                    co_return core::error_t(
                         core::error_code_t::missing_field,
                         std::pmr::string{(std::string("Failed to list tables: ") + e.what()).c_str(), resource()});
                 }
+                log_->info("discover_connection_schemas: found {} tables in schema {}",
+                           table_names.size(),
+                           pg_name.schema);
+
+                // Phase 2: probe each table sequentially at coroutine top
+                // level — the connection is free between queries. Any failed
+                // table fails the whole discovery (§2.1).
+                std::pmr::vector<std::pmr::string> failed_tables(resource());
+                for (const auto& table_name : table_names) {
+                    log_->debug("discover_connection_schemas: processing table {}", table_name);
+
+                    qualified_name_t full_table_name = pg_name;
+                    full_table_name.collection = std::string{table_name.c_str(), table_name.size()};
+
+                    auto schema_handler = [this, full_table_name, pg_enum_oids, &out](
+                                              PGresult* schema_result) -> otterstax::asio_error_t {
+                        auto schema_struct = tsl::pg_to_struct(resource(), schema_result, pg_enum_oids);
+                        out.push_back(catalog_ext::discovered_table_t{full_table_name, std::move(schema_struct)});
+                        log_->info("discover_connection_schemas: schema discovered for: {}.{}",
+                                   full_table_name.schema,
+                                   full_table_name.collection);
+                        return otterstax::asio_error_t{};
+                    };
+
+                    std::string schema_query =
+                        make_schema_probe_query(resource(), full_table_name, backend_type_t::PostgreSQL);
+                    try {
+                        auto future = pg_conn_manager_->executeQuery(uuid, schema_query, schema_handler);
+                        if (auto err = std::move(future.get()).release(); err.contains_error()) {
+                            log_->error("discover_connection_schemas: failed to fetch schema for {}.{}: {}",
+                                        full_table_name.schema,
+                                        full_table_name.collection,
+                                        err.what.c_str());
+                            failed_tables.emplace_back(
+                                (full_table_name.schema + "." + full_table_name.collection).c_str());
+                        }
+                    } catch (const std::exception& e) {
+                        log_->error("discover_connection_schemas: failed to query schema for {}.{}: {}",
+                                    full_table_name.schema,
+                                    full_table_name.collection,
+                                    e.what());
+                        failed_tables.emplace_back(
+                            (full_table_name.schema + "." + full_table_name.collection).c_str());
+                    }
+                }
+                if (!failed_tables.empty()) {
+                    co_return make_discovery_error(resource(), failed_tables);
+                }
+                co_return core::error_t::no_error();
             } else {
                 // Fetch schema for a single specific table
                 auto schema_handler =
                     [this, pg_name, pg_enum_oids, &out](PGresult* schema_result) -> otterstax::asio_error_t {
                     auto schema_struct = tsl::pg_to_struct(resource(), schema_result, pg_enum_oids);
                     out.push_back(catalog_ext::discovered_table_t{pg_name, std::move(schema_struct)});
-                    log_->info("add_connection_schema: schema discovered for: {}.{}",
+                    log_->info("discover_connection_schemas: schema discovered for: {}.{}",
                                pg_name.schema,
                                pg_name.collection);
                     return otterstax::asio_error_t{};
                 };
 
-                std::string schema_query =
-                    "SELECT * FROM " + pg_name.schema + "." + pg_name.collection + " WHERE 1 = 0;";
-                log_->debug("add_connection_schema: querying single table schema: \"{}\"", schema_query);
+                std::string schema_query = make_schema_probe_query(resource(), pg_name, backend_type_t::PostgreSQL);
+                log_->debug("discover_connection_schemas: querying single table schema: \"{}\"", schema_query);
 
                 try {
                     auto future = pg_conn_manager_->executeQuery(uuid, schema_query, schema_handler);
-                    return std::move(future.get()).release();
+                    co_return std::move(future.get()).release();
                 } catch (const std::exception& e) {
-                    log_->error("add_connection_schema: failed to query schema for {}.{}",
+                    log_->error("discover_connection_schemas: failed to query schema for {}.{}",
                                 pg_name.schema,
                                 pg_name.collection);
-                    return core::error_t(
+                    co_return core::error_t(
                         core::error_code_t::missing_field,
                         std::pmr::string{(std::string("Failed to fetch table schema: ") + e.what()).c_str(),
                                          resource()});
                 }
             }
-        } else if (is_ch) {
+        } else {
             // ClickHouse: query schema using clickhouse-cpp native protocol
             auto conn_params = ch_conn_manager_->conn_params(uuid);
             std::string ch_database = conn_params ? conn_params->database : "default";
 
-            // Phase 1: list tables in the database
-            std::string list_tables_query = "SELECT name FROM system.tables WHERE database = '" + ch_database + "'";
-            log_->debug("add_connection_schema: querying ClickHouse tables: \"{}\"", list_tables_query);
+            if (!name.collection.empty()) {
+                // Single-table probe.
+                std::string table_name = name.collection;
+                ch_conn_manager_->fetch_named_types(uuid, ch_database, table_name);
+                qualified_name_t table_name_obj(uuid, ch_database, "", table_name);
 
-            auto list_handler = [this, uuid, ch_database, &out](
+                auto schema_handler =
+                    [this, table_name_obj, ch_database, table_name, &out](
+                        const std::vector<clickhouse::Block>& schema_blocks) -> otterstax::asio_error_t {
+                    const clickhouse::Block& schema_block =
+                        schema_blocks.empty() ? clickhouse::Block{} : schema_blocks[0];
+                    auto schema_struct = tsl::ch_to_struct(resource(), schema_block);
+                    out.push_back(catalog_ext::discovered_table_t{table_name_obj, std::move(schema_struct)});
+                    log_->info("discover_connection_schemas: schema discovered for: {}.{}", ch_database, table_name);
+                    return otterstax::asio_error_t{};
+                };
+
+                std::string schema_query =
+                    make_schema_probe_query(resource(), table_name_obj, backend_type_t::ClickHouse);
+                log_->debug("discover_connection_schemas: querying single ClickHouse table schema: \"{}\"",
+                            schema_query);
+                try {
+                    auto future = ch_conn_manager_->executeQuery(uuid, schema_query, schema_handler);
+                    co_return std::move(future.get()).release();
+                } catch (const std::exception& e) {
+                    log_->error("discover_connection_schemas: failed to query schema for {}.{}",
+                                ch_database,
+                                table_name);
+                    co_return core::error_t(
+                        core::error_code_t::missing_field,
+                        std::pmr::string{(std::string("Failed to fetch ClickHouse table schema: ") + e.what()).c_str(),
+                                         resource()});
+                }
+            }
+
+            // Phase 1: list table names — the handler only collects names and
+            // never issues queries itself.
+            std::string list_tables_query =
+                "SELECT name FROM system.tables WHERE database = " + escape_sql_literal(ch_database);
+            log_->debug("discover_connection_schemas: querying ClickHouse tables: \"{}\"", list_tables_query);
+
+            std::pmr::vector<std::pmr::string> table_names(resource());
+            auto list_handler = [this, &table_names](
                                     const std::vector<clickhouse::Block>& blocks) -> otterstax::asio_error_t {
                 for (const auto& block : blocks) {
                     if (block.GetRowCount() == 0)
@@ -647,40 +823,8 @@ namespace mysql {
                     }
 
                     for (size_t i = 0; i < block.GetRowCount(); ++i) {
-                        std::string table_name(name_col->At(i));
-                        log_->debug("add_connection_schema: processing ClickHouse table {}", table_name);
-
-                        ch_conn_manager_->fetch_named_types(uuid, ch_database, table_name);
-                        qualified_name_t table_name_obj(uuid, ch_database, "", table_name);
-
-                        auto schema_handler =
-                            [this, table_name_obj, ch_database, table_name, &out](
-                                const std::vector<clickhouse::Block>& schema_blocks) -> otterstax::asio_error_t {
-                            const clickhouse::Block& schema_block =
-                                schema_blocks.empty() ? clickhouse::Block{} : schema_blocks[0];
-                            auto schema_struct = tsl::ch_to_struct(resource(), schema_block);
-                            out.push_back(catalog_ext::discovered_table_t{table_name_obj, std::move(schema_struct)});
-                            log_->info("add_connection_schema: schema discovered for: {}.{}",
-                                       ch_database,
-                                       table_name);
-                            return otterstax::asio_error_t{};
-                        };
-
-                        std::string schema_query = "SELECT * FROM " + ch_database + "." + table_name + " LIMIT 0";
-                        try {
-                            auto future = ch_conn_manager_->executeQuery(uuid, schema_query, schema_handler);
-                            auto err = future.get();
-                            if (err.contains_error()) {
-                                log_->error("add_connection_schema: failed to fetch schema for {}.{}",
-                                            ch_database,
-                                            table_name);
-                            }
-                        } catch (const std::exception& e) {
-                            log_->error("add_connection_schema: failed to query schema for {}.{}: {}",
-                                        ch_database,
-                                        table_name,
-                                        e.what());
-                        }
+                        auto view = name_col->At(i);
+                        table_names.emplace_back(view.data(), view.size());
                     }
                 }
                 return otterstax::asio_error_t{};
@@ -688,19 +832,68 @@ namespace mysql {
 
             try {
                 auto future = ch_conn_manager_->executeQuery(uuid, list_tables_query, list_handler);
-                return std::move(future.get()).release();
+                if (auto err = std::move(future.get()).release(); err.contains_error()) {
+                    co_return err;
+                }
             } catch (const std::exception& e) {
-                log_->error("add_connection_schema: failed to query table list from ClickHouse database {}",
+                log_->error("discover_connection_schemas: failed to query table list from ClickHouse database {}",
                             ch_database);
-                return core::error_t(
+                co_return core::error_t(
                     core::error_code_t::missing_field,
                     std::pmr::string{(std::string("Failed to list ClickHouse tables: ") + e.what()).c_str(),
                                      resource()});
             }
+            log_->info("discover_connection_schemas: found {} tables in ClickHouse database {}",
+                       table_names.size(),
+                       ch_database);
+
+            // Phase 2: probe each table sequentially at coroutine top level —
+            // fetch_named_types and the schema probe both run while the
+            // connection is otherwise idle. Any failed table fails the whole
+            // discovery (§2.1).
+            std::pmr::vector<std::pmr::string> failed_tables(resource());
+            for (const auto& tn : table_names) {
+                std::string table_name{tn.c_str(), tn.size()};
+                log_->debug("discover_connection_schemas: processing ClickHouse table {}", table_name);
+
+                ch_conn_manager_->fetch_named_types(uuid, ch_database, table_name);
+                qualified_name_t table_name_obj(uuid, ch_database, "", table_name);
+
+                auto schema_handler =
+                    [this, table_name_obj, ch_database, table_name, &out](
+                        const std::vector<clickhouse::Block>& schema_blocks) -> otterstax::asio_error_t {
+                    const clickhouse::Block& schema_block =
+                        schema_blocks.empty() ? clickhouse::Block{} : schema_blocks[0];
+                    auto schema_struct = tsl::ch_to_struct(resource(), schema_block);
+                    out.push_back(catalog_ext::discovered_table_t{table_name_obj, std::move(schema_struct)});
+                    log_->info("discover_connection_schemas: schema discovered for: {}.{}", ch_database, table_name);
+                    return otterstax::asio_error_t{};
+                };
+
+                std::string schema_query =
+                    make_schema_probe_query(resource(), table_name_obj, backend_type_t::ClickHouse);
+                try {
+                    auto future = ch_conn_manager_->executeQuery(uuid, schema_query, schema_handler);
+                    if (auto err = std::move(future.get()).release(); err.contains_error()) {
+                        log_->error("discover_connection_schemas: failed to fetch schema for {}.{}: {}",
+                                    ch_database,
+                                    table_name,
+                                    err.what.c_str());
+                        failed_tables.emplace_back((ch_database + "." + table_name).c_str());
+                    }
+                } catch (const std::exception& e) {
+                    log_->error("discover_connection_schemas: failed to query schema for {}.{}: {}",
+                                ch_database,
+                                table_name,
+                                e.what());
+                    failed_tables.emplace_back((ch_database + "." + table_name).c_str());
+                }
+            }
+            if (!failed_tables.empty()) {
+                co_return make_discovery_error(resource(), failed_tables);
+            }
+            co_return core::error_t::no_error();
         }
-        log_->error("add_connection_schema: connection type for uuid {} not found during schema addition", uuid);
-        return core::error_t(core::error_code_t::missing_field,
-                             std::pmr::string{("Connection type not found for uuid: " + uuid).c_str(), resource()});
     }
 
     actor_zeta::unique_future<void> CatalogManager::remove_connection_schema(std::string uuid) {

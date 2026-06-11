@@ -24,8 +24,7 @@ namespace {
         return std::move(result.value());
     }
 
-    // One external slot: the node together with its parser-resolved target
-    // (external_targets is filled 1:1 with external_nodes).
+    // One external slot: the node together with its parser-resolved target.
     struct flat_external_t {
         components::logical_plan::node_ptr node;
         otterstax::names::resolved_target_t target;
@@ -33,13 +32,11 @@ namespace {
 
     std::vector<flat_external_t> external_nodes_flat(const ParsedQueryDataPtr& parsed) {
         std::vector<flat_external_t> out;
-        const auto& nodes = parsed->otterbrix_params->external_nodes;
-        const auto& targets = parsed->otterbrix_params->external_targets;
-        REQUIRE(targets.size() == nodes.size());
-        for (size_t batch = 0; batch < nodes.size(); ++batch) {
-            REQUIRE(targets[batch].size() == nodes[batch].size());
-            for (size_t i = 0; i < nodes[batch].size(); ++i) {
-                out.push_back(flat_external_t{*nodes[batch][i], targets[batch][i]});
+        for (const auto& batch : parsed->otterbrix_params->external_nodes) {
+            for (const auto& entry : batch) {
+                // Every external slot must carry a plan-node reference.
+                REQUIRE(entry.node != nullptr);
+                out.push_back(flat_external_t{*entry.node, entry.target});
             }
         }
         return out;

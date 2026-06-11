@@ -48,23 +48,21 @@ public:
             sql::transform::transform_result::insert_map_t{config_.resource},
             data_chunk_t(config_.resource, {}));
         auto parsed = std::make_unique<ParsedQueryData>(
-            std::make_unique<OtterbrixStatement>(
-                std::vector<std::vector<logical_plan::node_ptr*>>{},
-                std::pmr::vector<std::pmr::vector<otterstax::names::resolved_target_t>>{config_.resource},
-                binder.params_ptr(),
-                binder.node_ptr(),
-                1),
+            std::make_unique<OtterbrixStatement>(std::pmr::vector<std::pmr::vector<external_entry_t>>{config_.resource},
+                                                 binder.params_ptr(),
+                                                 binder.node_ptr(),
+                                                 1),
             std::move(binder),
             NodeTag::T_SelectStmt);
-        parsed->otterbrix_params->external_nodes.push_back({&parsed->otterbrix_params->node});
-        // 1:1 with external_nodes; uid/name must match the connection the
-        // system tests register ("1", empty database) so the catalog can
-        // resolve the backend type and the registered schema for the target.
-        parsed->otterbrix_params->external_targets.emplace_back();
-        parsed->otterbrix_params->external_targets.back().push_back(
-            otterstax::names::resolved_target_t{components::catalog::INVALID_OID,
-                                                qualified_name_t{"1", "", "", "1"},
-                                                {}});
+        // uid/name must match the connection the system tests register
+        // ("1", empty database) so the catalog can resolve the backend type
+        // and the registered schema for the target.
+        parsed->otterbrix_params->external_nodes.emplace_back();
+        parsed->otterbrix_params->external_nodes.back().push_back(
+            external_entry_t{&parsed->otterbrix_params->node,
+                             otterstax::names::resolved_target_t{components::catalog::INVALID_OID,
+                                                                 qualified_name_t{"1", "", "", "1"},
+                                                                 {}}});
         return parsed;
     }
 

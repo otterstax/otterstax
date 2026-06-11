@@ -8,12 +8,12 @@
 #include "otterbrix/operators/execute_plan.hpp"
 #include "otterbrix/parser/parser.hpp"
 #include "types/otterbrix.hpp"
-#include "utility/pipeline_error.hpp"
 #include "utility/session.hpp"
 #include "utility/tracy_profiler.hpp"
 #include <actor-zeta.hpp>
 #include <components/catalog/catalog_oids.hpp>
 #include <components/table/column_definition.hpp>
+#include <core/result_wrapper.hpp>
 
 #include <memory_resource>
 #include <mutex>
@@ -35,7 +35,7 @@ namespace db {
         actor_zeta::unique_future<components::cursor::cursor_t_ptr> execute(session_hash_t id,
                                                                             OtterbrixStatementPtr params);
 
-        actor_zeta::unique_future<otterstax::result<std::pair<components::cursor::cursor_t_ptr, ParsedQueryDataPtr>>>
+        actor_zeta::unique_future<core::result_wrapper_t<std::pair<components::cursor::cursor_t_ptr, ParsedQueryDataPtr>>>
         get_schema(session_hash_t id,
                    std::pmr::map<qualified_name_t, size_t> dependencies,
                    ParsedQueryDataPtr data);
@@ -43,19 +43,17 @@ namespace db {
         // Registration channel: mirrors external (remote-backend) tables into the
         // engine pg_catalog so the planner can resolve them by OID.
         // Creates the engine database "<db_name>" (one per connection uid).
-        actor_zeta::unique_future<otterstax::result<bool>> register_external_database(std::string db_name);
+        actor_zeta::unique_future<core::result_wrapper_t<bool>> register_external_database(std::string db_name);
 
-        // Creates collection `encoded_collection` in database `encoded_db` and
-        // reads back its pg_class OID. `name` is the original qualified name,
-        // used for diagnostics only.
-        actor_zeta::unique_future<otterstax::result<components::catalog::oid_t>>
-        register_external_table(qualified_name_t name,
-                                std::string encoded_db,
-                                std::string encoded_collection,
-                                std::vector<components::table::column_definition_t> columns);
+        // Creates the engine collection for the external table `name` — the
+        // connection uid becomes the engine database, the remaining qualifiers
+        // are folded into the encoded collection name — and reads back its
+        // pg_class OID.
+        actor_zeta::unique_future<core::result_wrapper_t<components::catalog::oid_t>>
+        register_external_table(qualified_name_t name, std::vector<components::table::column_definition_t> columns);
 
         // Drops the engine database "<db_name>" together with all collections.
-        actor_zeta::unique_future<otterstax::result<bool>> drop_external_database(std::string db_name);
+        actor_zeta::unique_future<core::result_wrapper_t<bool>> drop_external_database(std::string db_name);
 
         using dispatch_traits = actor_zeta::dispatch_traits<&OtterbrixManager::execute,
                                                             &OtterbrixManager::get_schema,

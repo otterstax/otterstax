@@ -102,10 +102,10 @@ actor_zeta::unique_future<void> Scheduler::execute(session_hash_t id, shared_ses
             auto catalog_result = co_await std::move(catalog_future);
 
             if (catalog_result.has_error()) {
-                complete_session_on_error(id, std::move(catalog_result.error().what));
+                complete_session_on_error(id, catalog_result.error().what.c_str());
                 co_return;
             }
-            update_metadata(id, catalog_result.take_store());
+            update_metadata(id, std::move(catalog_result.value()));
         } else {
             data->backend_type = backend_type_t::Otterbrix;
             update_metadata(id, std::move(data));
@@ -136,10 +136,10 @@ actor_zeta::unique_future<void> Scheduler::execute(session_hash_t id, shared_ses
                                                                   std::move(data_ptr));
             auto sql_result = co_await std::move(sql_future);
             if (sql_result.has_error()) {
-                complete_session_on_error(id, std::move(sql_result.error().what));
+                complete_session_on_error(id, sql_result.error().what.c_str());
                 co_return;
             }
-            data_ptr = sql_result.take_store();
+            data_ptr = std::move(sql_result.value());
 
             if (backend == backend_type_t::Mixed) {
                 log_->debug("execute: Mixed backend, forwarding to pg_connection_manager");
@@ -149,10 +149,10 @@ actor_zeta::unique_future<void> Scheduler::execute(session_hash_t id, shared_ses
                                                                     std::move(data_ptr));
                 auto pg_result = co_await std::move(pg_future);
                 if (pg_result.has_error()) {
-                    complete_session_on_error(id, std::move(pg_result.error().what));
+                    complete_session_on_error(id, pg_result.error().what.c_str());
                     co_return;
                 }
-                data_ptr = pg_result.take_store();
+                data_ptr = std::move(pg_result.value());
 
                 log_->debug("execute: Mixed backend, forwarding to ch_connection_manager");
                 auto [needs_sched_ch, ch_future] = actor_zeta::send(ch_connection_manager_,
@@ -161,10 +161,10 @@ actor_zeta::unique_future<void> Scheduler::execute(session_hash_t id, shared_ses
                                                                     std::move(data_ptr));
                 auto ch_result = co_await std::move(ch_future);
                 if (ch_result.has_error()) {
-                    complete_session_on_error(id, std::move(ch_result.error().what));
+                    complete_session_on_error(id, ch_result.error().what.c_str());
                     co_return;
                 }
-                data_ptr = ch_result.take_store();
+                data_ptr = std::move(ch_result.value());
             }
         } else if (backend == backend_type_t::PostgreSQL) {
             log_->debug("execute: sending to pg_connection_manager");
@@ -174,10 +174,10 @@ actor_zeta::unique_future<void> Scheduler::execute(session_hash_t id, shared_ses
                                                                 std::move(data_ptr));
             auto pg_result = co_await std::move(pg_future);
             if (pg_result.has_error()) {
-                complete_session_on_error(id, std::move(pg_result.error().what));
+                complete_session_on_error(id, pg_result.error().what.c_str());
                 co_return;
             }
-            data_ptr = pg_result.take_store();
+            data_ptr = std::move(pg_result.value());
         } else if (backend == backend_type_t::ClickHouse) {
             log_->debug("execute: sending to ch_connection_manager");
             auto [needs_sched_ch, ch_future] = actor_zeta::send(ch_connection_manager_,
@@ -186,10 +186,10 @@ actor_zeta::unique_future<void> Scheduler::execute(session_hash_t id, shared_ses
                                                                 std::move(data_ptr));
             auto ch_result = co_await std::move(ch_future);
             if (ch_result.has_error()) {
-                complete_session_on_error(id, std::move(ch_result.error().what));
+                complete_session_on_error(id, ch_result.error().what.c_str());
                 co_return;
             }
-            data_ptr = ch_result.take_store();
+            data_ptr = std::move(ch_result.value());
         }
 
         // Step 3: otterbrix JOIN/aggregation (replaces execute_otterbrix_finish)
@@ -272,10 +272,10 @@ actor_zeta::unique_future<void> Scheduler::execute_statement(session_hash_t id, 
                                                                   std::move(data_ptr));
             auto sql_result = co_await std::move(sql_future);
             if (sql_result.has_error()) {
-                complete_session_on_error(id, std::move(sql_result.error().what));
+                complete_session_on_error(id, sql_result.error().what.c_str());
                 co_return;
             }
-            data_ptr = sql_result.take_store();
+            data_ptr = std::move(sql_result.value());
 
             if (backend_type == backend_type_t::Mixed) {
                 log_->debug("execute_statement: Mixed backend, forwarding to pg_connection_manager");
@@ -285,10 +285,10 @@ actor_zeta::unique_future<void> Scheduler::execute_statement(session_hash_t id, 
                                                                     std::move(data_ptr));
                 auto pg_result = co_await std::move(pg_future);
                 if (pg_result.has_error()) {
-                    complete_session_on_error(id, std::move(pg_result.error().what));
+                    complete_session_on_error(id, pg_result.error().what.c_str());
                     co_return;
                 }
-                data_ptr = pg_result.take_store();
+                data_ptr = std::move(pg_result.value());
 
                 log_->debug("execute_statement: Mixed backend, forwarding to ch_connection_manager");
                 auto [needs_sched_ch, ch_future] = actor_zeta::send(ch_connection_manager_,
@@ -297,10 +297,10 @@ actor_zeta::unique_future<void> Scheduler::execute_statement(session_hash_t id, 
                                                                     std::move(data_ptr));
                 auto ch_result = co_await std::move(ch_future);
                 if (ch_result.has_error()) {
-                    complete_session_on_error(id, std::move(ch_result.error().what));
+                    complete_session_on_error(id, ch_result.error().what.c_str());
                     co_return;
                 }
-                data_ptr = ch_result.take_store();
+                data_ptr = std::move(ch_result.value());
             }
         } else if (backend_type == backend_type_t::PostgreSQL) {
             log_->debug("execute_statement sending to pg_connection_manager");
@@ -310,10 +310,10 @@ actor_zeta::unique_future<void> Scheduler::execute_statement(session_hash_t id, 
                                                                 std::move(data_ptr));
             auto pg_result = co_await std::move(pg_future);
             if (pg_result.has_error()) {
-                complete_session_on_error(id, std::move(pg_result.error().what));
+                complete_session_on_error(id, pg_result.error().what.c_str());
                 co_return;
             }
-            data_ptr = pg_result.take_store();
+            data_ptr = std::move(pg_result.value());
         } else if (backend_type == backend_type_t::ClickHouse) {
             log_->debug("execute_statement sending to ch_connection_manager");
             auto [needs_sched_ch, ch_future] = actor_zeta::send(ch_connection_manager_,
@@ -322,10 +322,10 @@ actor_zeta::unique_future<void> Scheduler::execute_statement(session_hash_t id, 
                                                                 std::move(data_ptr));
             auto ch_result = co_await std::move(ch_future);
             if (ch_result.has_error()) {
-                complete_session_on_error(id, std::move(ch_result.error().what));
+                complete_session_on_error(id, ch_result.error().what.c_str());
                 co_return;
             }
-            data_ptr = ch_result.take_store();
+            data_ptr = std::move(ch_result.value());
         }
 
         // Send to otterbrix
@@ -416,10 +416,10 @@ Scheduler::prepare_schema(session_hash_t id, shared_session_payload sdata, std::
             auto catalog_result = co_await std::move(catalog_future);
 
             if (catalog_result.has_error()) {
-                complete_session_on_error(id, std::move(catalog_result.error().what));
+                complete_session_on_error(id, catalog_result.error().what.c_str());
                 co_return;
             }
-            auto data = catalog_result.take_store();
+            auto data = std::move(catalog_result.value());
 
             // Step 2: decide path based on node type
             // (this logic was in get_catalog_schema_finish)
@@ -460,10 +460,10 @@ Scheduler::prepare_schema(session_hash_t id, shared_session_payload sdata, std::
             auto schema_result = co_await std::move(schema_future);
 
             if (schema_result.has_error()) {
-                complete_session_on_error(id, std::move(schema_result.error().what));
+                complete_session_on_error(id, schema_result.error().what.c_str());
                 co_return;
             }
-            auto [cursor, data_back] = schema_result.take_value();
+            auto [cursor, data_back] = std::move(schema_result.value());
             finish_schema(id, std::move(cursor), std::move(data_back));
 
         } else {

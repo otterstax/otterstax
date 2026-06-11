@@ -37,6 +37,68 @@ using namespace components::types;
 
 namespace {
 
+    // Backend-aware identifier quoting (single quoting point for every
+    // identifier the generator emits). Otterbrix and PostgreSQL identifiers
+    // are double-quoted; MySQL and ClickHouse use backticks. The quote
+    // character itself is doubled when embedded. Unknown/Mixed land in the
+    // MySQL family, mirroring table_reference's default branch.
+    char ident_quote_char(backend_type_t backend) {
+        switch (backend) {
+            case backend_type_t::PostgreSQL:
+            case backend_type_t::Otterbrix:
+                return '"';
+            case backend_type_t::MySQL:
+            case backend_type_t::ClickHouse:
+            case backend_type_t::Unknown:
+            case backend_type_t::Mixed:
+            default:
+                return '`';
+        }
+    }
+
+    void quote_ident(std::stringstream& stream, std::string_view ident, backend_type_t backend) {
+        const char q = ident_quote_char(backend);
+        stream << q;
+        for (char c : ident) {
+            if (c == q) {
+                stream << q;
+            }
+            stream << c;
+        }
+        stream << q;
+    }
+
+    std::string quote_ident(std::string_view ident, backend_type_t backend) {
+        std::stringstream s;
+        quote_ident(s, ident, backend);
+        return s.str();
+    }
+
+    // Emit a (possibly multi-part) expression key. key_t carries identifier
+    // parts separately in storage() (table/column or struct-member paths);
+    // each part is quoted on its own — a dotted string is never quoted as one
+    // identifier. A '*' part is the star token, not an identifier.
+    void write_key(std::stringstream& stream, const components::expressions::key_t& key, backend_type_t backend) {
+        bool dot = false;
+        for (const auto& part : key.storage()) {
+            if (dot) {
+                stream << '.';
+            }
+            if (part == "*") {
+                stream << '*';
+            } else {
+                quote_ident(stream, std::string_view{part.data(), part.size()}, backend);
+            }
+            dot = true;
+        }
+    }
+
+    std::string key_to_string(const components::expressions::key_t& key, backend_type_t backend) {
+        std::stringstream s;
+        write_key(s, key, backend);
+        return s.str();
+    }
+
     template<class OStream>
     OStream& operator<<(OStream& stream, logical_type type) {
         switch (type) {
@@ -73,20 +135,24 @@ namespace {
         return stream;
     }
 
-    template<class OStream>
-    OStream& operator<<(OStream& stream, const components::types::complex_logical_type& type) {
-        stream << type.alias() << " ";
+    // Column definition inside CREATE TABLE: quoted column name + type keyword
+    // (type names are SQL keywords and stay unquoted).
+    void write_column_def(std::stringstream& stream,
+                          const components::types::complex_logical_type& type,
+                          backend_type_t backend) {
+        quote_ident(stream, type.alias(), backend);
+        stream << " ";
         if (type.type() == logical_type::ARRAY) {
             // TODO: multiple dimentions array
             stream << static_cast<const components::types::array_logical_type_extension*>(type.extension())
-                          ->internal_type();
+                          ->internal_type()
+                          .type();
             stream << "[";
             stream << static_cast<const components::types::array_logical_type_extension*>(type.extension())->size();
             stream << "]";
         } else {
             stream << type.type();
         }
-        return stream;
     }
 
     // Write a logical value to stream with backend-specific quoting
@@ -198,7 +264,8 @@ namespace {
 
     void generate_compare_expr(std::stringstream& stream,
                                const compare_expression_ptr& expr,
-                               const storage_parameters* parameters) {
+                               const storage_parameters* parameters,
+                               backend_type_t backend) {
         // to remove operation order deciphering incase everything in brackets
         switch (expr->type()) {
             case compare_type::union_and: {
@@ -208,7 +275,10 @@ namespace {
                     if (separator) {
                         stream << " AND ";
                     }
-                    generate_compare_expr(stream, reinterpret_cast<const compare_expression_ptr&>(child), parameters);
+                    generate_compare_expr(stream,
+                                          reinterpret_cast<const compare_expression_ptr&>(child),
+                                          parameters,
+                                          backend);
                     separator = true;
                 }
                 stream << ")";
@@ -221,7 +291,10 @@ namespace {
                     if (separator) {
                         stream << " OR ";
                     }
-                    generate_compare_expr(stream, reinterpret_cast<const compare_expression_ptr&>(child), parameters);
+                    generate_compare_expr(stream,
+                                          reinterpret_cast<const compare_expression_ptr&>(child),
+                                          parameters,
+                                          backend);
                     separator = true;
                 }
                 stream << ")";
@@ -231,7 +304,8 @@ namespace {
                 stream << "!(";
                 generate_compare_expr(stream,
                                       reinterpret_cast<const compare_expression_ptr&>(expr->children().front()),
-                                      parameters);
+                                      parameters,
+                                      backend);
                 stream << ")";
                 return;
             }
@@ -241,7 +315,7 @@ namespace {
 
         // left side
         if (std::holds_alternative<components::expressions::key_t>(expr->left())) {
-            stream << std::get<components::expressions::key_t>(expr->left()).as_string();
+            write_key(stream, std::get<components::expressions::key_t>(expr->left()), backend);
         } else if (std::holds_alternative<core::parameter_id_t>(expr->left())) {
             auto it = parameters->parameters.find(std::get<core::parameter_id_t>(expr->left()));
             if (it != parameters->parameters.end()) {
@@ -272,7 +346,7 @@ namespace {
         }
         // right side
         if (std::holds_alternative<components::expressions::key_t>(expr->right())) {
-            stream << std::get<components::expressions::key_t>(expr->right()).as_string();
+            write_key(stream, std::get<components::expressions::key_t>(expr->right()), backend);
         } else if (std::holds_alternative<core::parameter_id_t>(expr->right())) {
             auto it = parameters->parameters.find(std::get<core::parameter_id_t>(expr->right()));
             if (it != parameters->parameters.end()) {
@@ -283,15 +357,19 @@ namespace {
         }
     }
 
-    void
-    generate_update_expr(std::stringstream& stream, const update_expr_ptr& expr, const storage_parameters* parameters) {
+    void generate_update_expr(std::stringstream& stream,
+                              const update_expr_ptr& expr,
+                              const storage_parameters* parameters,
+                              backend_type_t backend) {
         switch (expr->type()) {
             case update_expr_type::set:
-                stream << "SET " << reinterpret_cast<const update_expr_set_ptr&>(expr)->key().as_string() << " = ";
-                generate_update_expr(stream, expr->left(), parameters);
+                stream << "SET ";
+                write_key(stream, reinterpret_cast<const update_expr_set_ptr&>(expr)->key(), backend);
+                stream << " = ";
+                generate_update_expr(stream, expr->left(), parameters, backend);
                 break;
             case update_expr_type::get_value:
-                stream << reinterpret_cast<const update_expr_get_value_ptr&>(expr)->key().as_string();
+                write_key(stream, reinterpret_cast<const update_expr_get_value_ptr&>(expr)->key(), backend);
                 break;
             case update_expr_type::get_value_params: {
                 auto it =
@@ -305,117 +383,117 @@ namespace {
             }
             case update_expr_type::add:
                 stream << "(";
-                generate_update_expr(stream, expr->left(), parameters);
+                generate_update_expr(stream, expr->left(), parameters, backend);
                 stream << " + ";
-                generate_update_expr(stream, expr->right(), parameters);
+                generate_update_expr(stream, expr->right(), parameters, backend);
                 stream << ")";
                 break;
             case update_expr_type::sub:
                 stream << "(";
-                generate_update_expr(stream, expr->left(), parameters);
+                generate_update_expr(stream, expr->left(), parameters, backend);
                 stream << " - ";
-                generate_update_expr(stream, expr->right(), parameters);
+                generate_update_expr(stream, expr->right(), parameters, backend);
                 stream << ")";
                 break;
             case update_expr_type::mult:
                 stream << "(";
-                generate_update_expr(stream, expr->left(), parameters);
+                generate_update_expr(stream, expr->left(), parameters, backend);
                 stream << " * ";
-                generate_update_expr(stream, expr->right(), parameters);
+                generate_update_expr(stream, expr->right(), parameters, backend);
                 stream << ")";
                 break;
             case update_expr_type::div:
                 stream << "(";
-                generate_update_expr(stream, expr->left(), parameters);
+                generate_update_expr(stream, expr->left(), parameters, backend);
                 stream << " / ";
-                generate_update_expr(stream, expr->right(), parameters);
+                generate_update_expr(stream, expr->right(), parameters, backend);
                 stream << ")";
                 break;
             case update_expr_type::mod:
                 stream << "(";
-                generate_update_expr(stream, expr->left(), parameters);
+                generate_update_expr(stream, expr->left(), parameters, backend);
                 stream << " % ";
-                generate_update_expr(stream, expr->right(), parameters);
+                generate_update_expr(stream, expr->right(), parameters, backend);
                 stream << ")";
                 break;
             case update_expr_type::exp:
                 stream << "(";
-                generate_update_expr(stream, expr->left(), parameters);
+                generate_update_expr(stream, expr->left(), parameters, backend);
                 stream << " ^ ";
-                generate_update_expr(stream, expr->right(), parameters);
+                generate_update_expr(stream, expr->right(), parameters, backend);
                 stream << ")";
                 break;
             case update_expr_type::sqr_root:
                 stream << "(";
-                generate_update_expr(stream, expr->left(), parameters);
+                generate_update_expr(stream, expr->left(), parameters, backend);
                 stream << " |/ ";
-                generate_update_expr(stream, expr->right(), parameters);
+                generate_update_expr(stream, expr->right(), parameters, backend);
                 stream << ")";
                 break;
             case update_expr_type::cube_root:
                 stream << "(";
-                generate_update_expr(stream, expr->left(), parameters);
+                generate_update_expr(stream, expr->left(), parameters, backend);
                 stream << " ||/ ";
-                generate_update_expr(stream, expr->right(), parameters);
+                generate_update_expr(stream, expr->right(), parameters, backend);
                 stream << ")";
                 break;
             case update_expr_type::factorial:
                 stream << "(";
                 stream << "!! ";
-                generate_update_expr(stream, expr->left(), parameters);
+                generate_update_expr(stream, expr->left(), parameters, backend);
                 stream << ")";
                 break;
             case update_expr_type::abs:
                 stream << "(";
                 stream << "@ ";
-                generate_update_expr(stream, expr->left(), parameters);
+                generate_update_expr(stream, expr->left(), parameters, backend);
                 stream << ")";
                 break;
             case update_expr_type::AND:
                 stream << "(";
-                generate_update_expr(stream, expr->left(), parameters);
+                generate_update_expr(stream, expr->left(), parameters, backend);
                 stream << " & ";
-                generate_update_expr(stream, expr->right(), parameters);
+                generate_update_expr(stream, expr->right(), parameters, backend);
                 stream << ")";
                 break;
             case update_expr_type::OR:
                 stream << "(";
-                generate_update_expr(stream, expr->left(), parameters);
+                generate_update_expr(stream, expr->left(), parameters, backend);
                 stream << " | ";
-                generate_update_expr(stream, expr->right(), parameters);
+                generate_update_expr(stream, expr->right(), parameters, backend);
                 stream << ")";
                 break;
             case update_expr_type::XOR:
                 stream << "(";
-                generate_update_expr(stream, expr->left(), parameters);
+                generate_update_expr(stream, expr->left(), parameters, backend);
                 stream << " # ";
-                generate_update_expr(stream, expr->right(), parameters);
+                generate_update_expr(stream, expr->right(), parameters, backend);
                 stream << ")";
                 break;
             case update_expr_type::NOT:
                 stream << "(";
                 stream << "~ ";
-                generate_update_expr(stream, expr->left(), parameters);
+                generate_update_expr(stream, expr->left(), parameters, backend);
                 stream << ")";
                 break;
             case update_expr_type::shift_left:
                 stream << "(";
-                generate_update_expr(stream, expr->left(), parameters);
+                generate_update_expr(stream, expr->left(), parameters, backend);
                 stream << " << ";
-                generate_update_expr(stream, expr->right(), parameters);
+                generate_update_expr(stream, expr->right(), parameters, backend);
                 stream << ")";
                 break;
             case update_expr_type::shift_right:
                 stream << "(";
-                generate_update_expr(stream, expr->left(), parameters);
+                generate_update_expr(stream, expr->left(), parameters, backend);
                 stream << " >> ";
-                generate_update_expr(stream, expr->right(), parameters);
+                generate_update_expr(stream, expr->right(), parameters, backend);
                 stream << ")";
                 break;
         }
     }
 
-    inline std::string generate_aggregate(const aggregate_expression_ptr& agg_expr) {
+    inline std::string generate_aggregate(const aggregate_expression_ptr& agg_expr, backend_type_t backend) {
         auto fname = agg_expr->function_name();
         std::string sql_func;
         sql_func.reserve(fname.size());
@@ -430,13 +508,13 @@ namespace {
             // parameterless aggregate (e.g. COUNT(*)) — function name itself
             out.push_back('*');
         } else if (std::holds_alternative<components::expressions::key_t>(agg_expr->params().front())) {
-            out.append(std::get<components::expressions::key_t>(agg_expr->params().front()).as_string());
+            out.append(key_to_string(std::get<components::expressions::key_t>(agg_expr->params().front()), backend));
         }
         out.push_back(')');
         // always alias the aggregate so the outer otterbrix plan can join
         // backend results back to the expected column name.
         out.append(" AS ");
-        out.append(agg_expr->key().as_string());
+        out.append(key_to_string(agg_expr->key(), backend));
         return out;
     }
 
@@ -486,7 +564,7 @@ namespace {
                 for (const auto& expr : select->expressions()) {
                     if (expr->group() == expression_group::aggregate) {
                         fields.emplace_back(
-                            generate_aggregate(reinterpret_cast<const aggregate_expression_ptr&>(expr)));
+                            generate_aggregate(reinterpret_cast<const aggregate_expression_ptr&>(expr), backend));
                         continue;
                     }
                     auto scalar_expr = reinterpret_cast<const scalar_expression_ptr&>(expr);
@@ -499,14 +577,14 @@ namespace {
                     if (scalar_expr->type() == scalar_type::get_field && scalar_expr->params().empty()) {
                         if (auto it = aggregate_by_alias.find(scalar_expr->key().as_string());
                             it != aggregate_by_alias.end()) {
-                            fields.emplace_back(generate_aggregate(it->second));
+                            fields.emplace_back(generate_aggregate(it->second, backend));
                             continue;
                         }
                     }
 
                     // plain column reference.
                     if (scalar_expr->params().empty()) {
-                        fields.emplace_back(scalar_expr->key().as_string());
+                        fields.emplace_back(key_to_string(scalar_expr->key(), backend));
                         continue;
                     }
 
@@ -524,8 +602,9 @@ namespace {
                     } else {
                         // Aliased column: `col AS alias`
                         fields.emplace_back(
-                            std::get<components::expressions::key_t>(scalar_expr->params().front()).as_string() +
-                            " AS " + scalar_expr->key().as_string());
+                            key_to_string(std::get<components::expressions::key_t>(scalar_expr->params().front()),
+                                          backend) +
+                            " AS " + key_to_string(scalar_expr->key(), backend));
                     }
                 }
             }
@@ -539,7 +618,7 @@ namespace {
                 for (const auto& expr : group->expressions()) {
                     if (expr->group() == expression_group::aggregate) {
                         fields.emplace_back(
-                            generate_aggregate(reinterpret_cast<const aggregate_expression_ptr&>(expr)));
+                            generate_aggregate(reinterpret_cast<const aggregate_expression_ptr&>(expr), backend));
                     }
                 }
             }
@@ -567,7 +646,8 @@ namespace {
                 stream << " WHERE ";
                 generate_compare_expr(stream,
                                       reinterpret_cast<const compare_expression_ptr&>(match->expressions().front()),
-                                      parameters);
+                                      parameters,
+                                      backend);
             }
         }
         // group by
@@ -584,10 +664,11 @@ namespace {
                         continue;
                     }
                     if (scalar_expr->params().empty()) {
-                        group_by_fields.emplace_back(scalar_expr->key().as_string());
+                        group_by_fields.emplace_back(key_to_string(scalar_expr->key(), backend));
                     } else if (std::holds_alternative<components::expressions::key_t>(scalar_expr->params().front())) {
                         group_by_fields.emplace_back(
-                            std::get<components::expressions::key_t>(scalar_expr->params().front()).as_string());
+                            key_to_string(std::get<components::expressions::key_t>(scalar_expr->params().front()),
+                                          backend));
                     }
                 }
                 if (!group_by_fields.empty()) {
@@ -614,7 +695,8 @@ namespace {
                     }
 
                     auto sort_expr = reinterpret_cast<const sort_expression_ptr&>(expr);
-                    stream << sort_expr->key() << (sort_expr->order() == sort_order::desc ? " DESC" : " ASC");
+                    write_key(stream, sort_expr->key(), backend);
+                    stream << (sort_expr->order() == sort_order::desc ? " DESC" : " ASC");
                     comma = true;
                 }
             }
@@ -623,8 +705,10 @@ namespace {
 
     void generate_create_collection(std::stringstream& stream,
                                     const node_create_collection_ptr& node,
-                                    const qualified_name_t& name) {
-        stream << "CREATE TABLE " << name.collection;
+                                    const qualified_name_t& name,
+                                    backend_type_t backend) {
+        stream << "CREATE TABLE ";
+        quote_ident(stream, name.collection, backend);
         stream << " (";
         bool comma = false;
         for (const auto& type : node->schema()) {
@@ -632,21 +716,25 @@ namespace {
                 stream << ", ";
             }
 
-            stream << type;
+            write_column_def(stream, type, backend);
             comma = true;
         }
         stream << ")";
     }
 
     // this wight cause problems with connections
-    void generate_create_database(std::stringstream& stream, const qualified_name_t& name) {
-        stream << "CREATE DATABASE " << name.database;
+    void generate_create_database(std::stringstream& stream, const qualified_name_t& name, backend_type_t backend) {
+        stream << "CREATE DATABASE ";
+        quote_ident(stream, name.database, backend);
     }
 
     void generate_create_index(std::stringstream& stream,
                                const node_create_index_ptr& node,
-                               const qualified_name_t& name) {
-        stream << "CREATE INDEX " << node->name() << " ON " << name.to_string();
+                               const qualified_name_t& name,
+                               backend_type_t backend) {
+        stream << "CREATE INDEX ";
+        quote_ident(stream, node->name(), backend);
+        stream << " ON " << sql_gen::table_reference(name, backend);
         stream << " (";
         bool comma = false;
         for (const auto& key : node->keys()) {
@@ -654,7 +742,7 @@ namespace {
                 stream << ", ";
             }
 
-            stream << key.as_string();
+            write_key(stream, key, backend);
             comma = true;
         }
         stream << ")";
@@ -682,23 +770,31 @@ namespace {
             stream << " WHERE ";
             generate_compare_expr(stream,
                                   reinterpret_cast<const compare_expression_ptr&>(match->expressions().front()),
-                                  parameters);
+                                  parameters,
+                                  backend);
         }
     }
 
-    void generate_drop_collection(std::stringstream& stream, const qualified_name_t& name) {
-        stream << "DROP TABLE " << name.collection;
+    void generate_drop_collection(std::stringstream& stream, const qualified_name_t& name, backend_type_t backend) {
+        stream << "DROP TABLE ";
+        quote_ident(stream, name.collection, backend);
     }
 
     // this wight cause problems with connections
-    void generate_drop_database(std::stringstream& stream, const qualified_name_t& name) {
-        stream << "DROP DATABASE " << name.database;
+    void generate_drop_database(std::stringstream& stream, const qualified_name_t& name, backend_type_t backend) {
+        stream << "DROP DATABASE ";
+        quote_ident(stream, name.database, backend);
     }
 
-    void generate_drop_index(std::stringstream& stream, const otterstax::names::resolved_target_t& target) {
+    void generate_drop_index(std::stringstream& stream,
+                             const otterstax::names::resolved_target_t& target,
+                             backend_type_t backend) {
         // target.name is the indexed table; target.from_name carries the index
         // (the second catalog_resolve_table of the wrapping sequence).
-        stream << "DROP INDEX IF EXISTS " << target.from_name.collection << " ON " << target.name.collection;
+        stream << "DROP INDEX IF EXISTS ";
+        quote_ident(stream, target.from_name.collection, backend);
+        stream << " ON ";
+        quote_ident(stream, target.name.collection, backend);
     }
 
     void generate_insert(std::stringstream& stream,
@@ -706,7 +802,7 @@ namespace {
                          const storage_parameters* parameters,
                          backend_type_t backend,
                          const otterstax::names::resolved_target_t& target,
-                         const std::pmr::vector<otterstax::names::resolved_target_t>& batch_targets) {
+                         const std::pmr::vector<external_entry_t>& batch) {
         stream << "INSERT INTO " << sql_gen::table_reference(target.name, backend) << " ";
         if (!node->key_translation().empty()) {
             stream << "(";
@@ -715,7 +811,7 @@ namespace {
                 if (comma) {
                     stream << ", ";
                 }
-                stream << key.as_string();
+                write_key(stream, key, backend);
                 comma = true;
             }
             stream << ") ";
@@ -736,9 +832,9 @@ namespace {
                 throw std::logic_error("generate_insert: INSERT..SELECT child aggregate has no table_oid stamped");
             }
             const qualified_name_t* child_name = nullptr;
-            for (const auto& t : batch_targets) {
-                if (t.oid == child_oid) {
-                    child_name = &t.name;
+            for (const auto& entry : batch) {
+                if (entry.target.oid == child_oid) {
+                    child_name = &entry.target.name;
                     break;
                 }
             }
@@ -772,7 +868,7 @@ namespace {
                 stream << ", ";
             }
 
-            generate_update_expr(stream, set, parameters);
+            generate_update_expr(stream, set, parameters, backend);
             comma = true;
         }
         if (!target.from_name.collection.empty()) {
@@ -783,7 +879,8 @@ namespace {
             stream << " WHERE ";
             generate_compare_expr(stream,
                                   reinterpret_cast<const compare_expression_ptr&>(match->expressions().front()),
-                                  parameters);
+                                  parameters,
+                                  backend);
         }
     }
 
@@ -843,22 +940,25 @@ namespace sql_gen {
             case backend_type_t::PostgreSQL:
                 // PostgreSQL: schema.collection (e.g., public.products)
                 // If schema is empty, use "public" as default
-                if (!name.schema.empty()) {
-                    s << name.schema << "." << name.collection;
-                } else {
-                    s << "public." << name.collection;
-                }
+                quote_ident(s, name.schema.empty() ? std::string_view{"public"} : std::string_view{name.schema},
+                            backend);
+                s << ".";
+                quote_ident(s, name.collection, backend);
                 break;
             case backend_type_t::ClickHouse:
                 // ClickHouse: database.collection (no schema level)
-                s << name.database << "." << name.collection;
+                quote_ident(s, name.database, backend);
+                s << ".";
+                quote_ident(s, name.collection, backend);
                 break;
             case backend_type_t::MySQL:
             case backend_type_t::Unknown:
             case backend_type_t::Mixed:
             default:
                 // MySQL: database.collection
-                s << name.database << "." << name.collection;
+                quote_ident(s, name.database, backend);
+                s << ".";
+                quote_ident(s, name.collection, backend);
                 break;
         }
         spdlog::debug("table_reference: generated '{}'", s.str());
@@ -892,7 +992,7 @@ namespace sql_gen {
                         const storage_parameters* parameters,
                         backend_type_t backend,
                         const otterstax::names::resolved_target_t& target,
-                        const std::pmr::vector<otterstax::names::resolved_target_t>& batch_targets) {
+                        const std::pmr::vector<external_entry_t>& batch) {
         switch (node->type()) {
             case node_type::aggregate_t:
                 generate_select(stream,
@@ -904,25 +1004,29 @@ namespace sql_gen {
             case node_type::create_collection_t:
                 generate_create_collection(stream,
                                            reinterpret_cast<const node_create_collection_ptr&>(node),
-                                           target.name);
+                                           target.name,
+                                           backend);
                 break;
             case node_type::create_database_t:
-                generate_create_database(stream, target.name);
+                generate_create_database(stream, target.name, backend);
                 break;
             case node_type::create_index_t:
-                generate_create_index(stream, reinterpret_cast<const node_create_index_ptr&>(node), target.name);
+                generate_create_index(stream,
+                                      reinterpret_cast<const node_create_index_ptr&>(node),
+                                      target.name,
+                                      backend);
                 break;
             case node_type::delete_t:
                 generate_delete(stream, reinterpret_cast<const node_delete_ptr&>(node), parameters, backend, target);
                 break;
             case node_type::drop_collection_t:
-                generate_drop_collection(stream, target.name);
+                generate_drop_collection(stream, target.name, backend);
                 break;
             case node_type::drop_database_t:
-                generate_drop_database(stream, target.name);
+                generate_drop_database(stream, target.name, backend);
                 break;
             case node_type::drop_index_t:
-                generate_drop_index(stream, target);
+                generate_drop_index(stream, target, backend);
                 break;
             case node_type::insert_t:
                 generate_insert(stream,
@@ -930,7 +1034,7 @@ namespace sql_gen {
                                 parameters,
                                 backend,
                                 target,
-                                batch_targets);
+                                batch);
                 break;
             case node_type::update_t:
                 generate_update(stream, reinterpret_cast<const node_update_ptr&>(node), parameters, backend, target);
@@ -944,11 +1048,25 @@ namespace sql_gen {
                                const storage_parameters* parameters,
                                backend_type_t backend,
                                const otterstax::names::resolved_target_t& target,
-                               const std::pmr::vector<otterstax::names::resolved_target_t>& batch_targets) {
+                               const std::pmr::vector<external_entry_t>& batch) {
         std::stringstream stream;
-        generate_query(stream, node, parameters, backend, target, batch_targets);
+        generate_query(stream, node, parameters, backend, target, batch);
         stream << ";";
         return stream.str();
+    }
+
+    std::string create_database_statement(const std::string& db) {
+        std::stringstream s;
+        s << "CREATE DATABASE ";
+        quote_ident(s, db, backend_type_t::Otterbrix);
+        return s.str();
+    }
+
+    std::string drop_database_statement(const std::string& db) {
+        std::stringstream s;
+        s << "DROP DATABASE ";
+        quote_ident(s, db, backend_type_t::Otterbrix);
+        return s.str();
     }
 
 } // namespace sql_gen

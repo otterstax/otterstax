@@ -26,7 +26,7 @@ TEST_CASE("MySQL qualifier to db.collection") {
     REQUIRE(r.stubs.size() == 1);
 
     auto out = render(r.stubs[0], backend_type_t::MySQL);
-    REQUIRE(out.find("FROM bill.orders") != std::string::npos);
+    REQUIRE(out.find("FROM `bill`.`orders`") != std::string::npos);
     REQUIRE(out.find("mysql.bill.schema.orders") == std::string::npos);
     REQUIRE(out.find("schema") == std::string::npos);
     // Date predicate inside the raw_sql is preserved verbatim.
@@ -40,7 +40,7 @@ TEST_CASE("PG qualifier to schema.collection") {
     REQUIRE(r.stubs.size() == 1);
 
     auto out = render(r.stubs[0], backend_type_t::PostgreSQL);
-    REQUIRE(out.find("FROM shop.customers") != std::string::npos);
+    REQUIRE(out.find("FROM \"shop\".\"customers\"") != std::string::npos);
     REQUIRE(out.find("pg.shop.shop.customers") == std::string::npos);
     REQUIRE(out.find("tier = 'gold'") != std::string::npos);
 }
@@ -52,7 +52,7 @@ TEST_CASE("CH qualifier to db.collection AND (expr).field") {
     REQUIRE(r.stubs.size() == 1);
 
     auto out = render(r.stubs[0], backend_type_t::ClickHouse);
-    REQUIRE(out.find("FROM ev.sessions") != std::string::npos);
+    REQUIRE(out.find("FROM `ev`.`sessions`") != std::string::npos);
     REQUIRE(out.find("ch.ev.schema.sessions") == std::string::npos);
     // CH dialect fixup: `(expr).field` → `expr.field`.
     REQUIRE(out.find("s.props.channel") != std::string::npos);
@@ -67,7 +67,7 @@ TEST_CASE("3-part — first segment promoted to uid") {
     REQUIRE(r.stubs.size() == 1);
 
     auto out = render(r.stubs[0], backend_type_t::MySQL);
-    REQUIRE(out.find("FROM bill.orders") != std::string::npos);
+    REQUIRE(out.find("FROM `bill`.`orders`") != std::string::npos);
     REQUIRE(out.find("mysql.bill.orders") == std::string::npos);
     REQUIRE(out.find("status = 'paid'") != std::string::npos);
 }
@@ -80,7 +80,7 @@ TEST_CASE("PG (expr).field untouched") {
 
     auto out = render(r.stubs[0], backend_type_t::PostgreSQL);
     REQUIRE(out.find("(s.props).channel") != std::string::npos);
-    REQUIRE(out.find("FROM shop.sessions") != std::string::npos);
+    REQUIRE(out.find("FROM \"shop\".\"sessions\"") != std::string::npos);
 }
 
 TEST_CASE("empty qualifiers") {

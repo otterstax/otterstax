@@ -12,13 +12,19 @@
 #include <memory_resource>
 #include <vector>
 
+// One external slot: pointer to the plan-node reference the backend manager
+// swaps for fetched data, together with the parser-resolved full table name
+// (oid stamped later by CatalogManager).
+struct external_entry_t {
+    components::logical_plan::node_ptr* node;
+    otterstax::names::resolved_target_t target;
+};
+
 struct OtterbrixStatement {
-    std::vector<std::vector<components::logical_plan::node_ptr*>> external_nodes;
-    // Resolved full table names, 1:1 with external_nodes
-    // (outer = batch index, inner = node index within the batch).
+    // External slots (outer = batch index, inner = slot within the batch).
     // Populated by the parser; construction sites must pass a
     // resource-constructed vector explicitly.
-    std::pmr::vector<std::pmr::vector<otterstax::names::resolved_target_t>> external_targets;
+    std::pmr::vector<std::pmr::vector<external_entry_t>> external_nodes;
     components::logical_plan::parameter_node_ptr params_node;
     components::logical_plan::node_ptr node;
     size_t external_nodes_count;

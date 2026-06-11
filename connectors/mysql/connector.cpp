@@ -39,12 +39,23 @@ namespace mysql {
 
     Connector::~Connector() { close(); }
 
+    boost::system::error_code Connector::connectWithTimeout(bm::diagnostics& diag) {
+        OTX_ZONE_N("mysql::Connector::connectWithTimeout");
+        constexpr std::chrono::seconds connect_timeout{10};
+        boost::system::error_code ec;
+        auto fut = conn_.async_connect(
+            params_,
+            diag,
+            asio::cancel_after(connect_timeout, asio::redirect_error(asio::use_future, ec)));
+        fut.get();
+        return ec;
+    }
+
     void Connector::connect() {
         OTX_ZONE_N("mysql::Connector::connect");
         conn_.set_meta_mode(bm::metadata_mode::full);
-        boost::system::error_code ec;
         boost::mysql::diagnostics diag;
-        conn_.connect(params_, ec, diag);
+        boost::system::error_code ec = connectWithTimeout(diag);
         if (ec) {
             log_->debug("Alias: {} connect failed", alias_);
             tryReconnect();
@@ -80,7 +91,7 @@ namespace mysql {
         boost::mysql::diagnostics diag;
         do {
             log_->debug("Alias: {} Attempt: {}", alias_, attempts);
-            conn_.connect(params_, ec, diag);
+            ec = connectWithTimeout(diag);
             if (!ec) {
                 log_->debug("Alias: {} Reconnect success", alias_);
                 status_ = Status::Connected;

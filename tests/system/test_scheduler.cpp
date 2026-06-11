@@ -315,12 +315,10 @@ public:
             data_chunk_t(resource, {}));
 
         auto parsed = std::make_unique<ParsedQueryData>(
-            std::make_unique<OtterbrixStatement>(
-                std::vector<std::vector<logical_plan::node_ptr*>>{},
-                std::pmr::vector<std::pmr::vector<otterstax::names::resolved_target_t>>{resource},
-                binder.params_ptr(),
-                binder.node_ptr(),
-                2), // 2 external nodes
+            std::make_unique<OtterbrixStatement>(std::pmr::vector<std::pmr::vector<external_entry_t>>{resource},
+                                                 binder.params_ptr(),
+                                                 binder.node_ptr(),
+                                                 2), // 2 external nodes
             std::move(binder),
             NodeTag::T_SelectStmt);
 
@@ -328,24 +326,23 @@ public:
         // Create two references to simulate MySQL and PostgreSQL backends
         // Note: In real usage, these would be separate nodes from different backends
         // For this mock test, we use the same node twice to verify backend detection works
-        parsed->otterbrix_params->external_nodes.push_back({&parsed->otterbrix_params->node});
-        parsed->otterbrix_params->external_nodes.push_back({&parsed->otterbrix_params->node});
+        // uids/names must match the connections registered in the test
+        // ("campaigns" MySQL with an empty database, "products" PostgreSQL
+        // with pgdb/public/products) so that the catalog maps each node to
+        // its backend and finds the registered schemas.
+        parsed->otterbrix_params->external_nodes.emplace_back();
+        parsed->otterbrix_params->external_nodes.back().push_back(
+            external_entry_t{&parsed->otterbrix_params->node,
+                             otterstax::names::resolved_target_t{components::catalog::INVALID_OID,
+                                                                 qualified_name_t{"campaigns", "", "", "campaigns"},
+                                                                 {}}});
+        parsed->otterbrix_params->external_nodes.emplace_back();
+        parsed->otterbrix_params->external_nodes.back().push_back(
+            external_entry_t{&parsed->otterbrix_params->node,
+                             otterstax::names::resolved_target_t{components::catalog::INVALID_OID,
+                                                                 qualified_name_t{"products", "pgdb", "public", "products"},
+                                                                 {}}});
         parsed->otterbrix_params->external_nodes_count = 2;
-
-        // 1:1 targets; uids/names must match the connections registered in the
-        // test ("campaigns" MySQL with an empty database, "products"
-        // PostgreSQL with pgdb/public/products) so that the catalog maps each
-        // node to its backend and finds the registered schemas.
-        parsed->otterbrix_params->external_targets.emplace_back();
-        parsed->otterbrix_params->external_targets.back().push_back(
-            otterstax::names::resolved_target_t{components::catalog::INVALID_OID,
-                                                qualified_name_t{"campaigns", "", "", "campaigns"},
-                                                {}});
-        parsed->otterbrix_params->external_targets.emplace_back();
-        parsed->otterbrix_params->external_targets.back().push_back(
-            otterstax::names::resolved_target_t{components::catalog::INVALID_OID,
-                                                qualified_name_t{"products", "pgdb", "public", "products"},
-                                                {}});
 
         std::cout << "CrossBackendMockParser: created query with 2 external nodes (simulating MySQL + PostgreSQL)"
                   << std::endl;

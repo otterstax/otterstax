@@ -110,9 +110,6 @@ set(${PROJECT_NAME}_HEADERS
         utility/timer.hpp
         utility/cv_wrapper.hpp
         utility/tsan_helper.hpp
-        utility/result.hpp
-        utility/pipeline_error.hpp
-        utility/external_name.hpp
         utility/tracy_profiler.hpp
         utility/tracy_memory_resource.hpp
 

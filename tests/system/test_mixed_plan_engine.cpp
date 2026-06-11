@@ -24,7 +24,6 @@ TEST_CASE("cross-backend GROUP BY downstream calls") {
     auto result = parser.parse(sql);
     REQUIRE_FALSE(result.has_error());
     auto data = std::move(result.value());
-    auto& targets = data->otterbrix_params->external_targets;
     auto& nodes = data->otterbrix_params->external_nodes;
     std::cout << "batches=" << nodes.size() << "\n";
 
@@ -42,8 +41,8 @@ TEST_CASE("cross-backend GROUP BY downstream calls") {
 
     for (size_t b = 0; b < nodes.size(); ++b) {
         for (size_t i = 0; i < nodes[b].size(); ++i) {
-            auto& node = nodes[b][i];
-            auto& target = targets[b][i];
+            auto* node = nodes[b][i].node;
+            auto& target = nodes[b][i].target;
             std::cout << "node type=" << static_cast<int>((*node)->type()) << " name=" << target.name.to_string()
                       << "\n";
             if ((*node)->type() != logical_plan::node_type::aggregate_t) {
@@ -56,7 +55,7 @@ TEST_CASE("cross-backend GROUP BY downstream calls") {
                                              &data->otterbrix_params->params_node->parameters(),
                                              backend_type_t::MySQL,
                                              target,
-                                             targets[b]);
+                                             nodes[b]);
             std::cout << "  SQL: " << q << "\n";
             std::cout << "  calling aggregate_filter_schema...\n";
             auto initial_schema =
@@ -124,10 +123,9 @@ TEST_CASE("mixed plan with node_data executes in engine", "[engine-group-by-stri
     };
 
     auto& nodes = data->otterbrix_params->external_nodes;
-    auto& targets = data->otterbrix_params->external_targets;
     for (size_t b = 0; b < nodes.size(); ++b) {
         for (size_t i = 0; i < nodes[b].size(); ++i) {
-            auto& target = targets[b][i];
+            auto& target = nodes[b][i].target;
             auto chunk = target.name.collection == "campaigns"
                              ? make_chunk({{"campaign_id", types::logical_type::INTEGER},
                                            {"campaign_name", types::logical_type::STRING_LITERAL},
@@ -136,7 +134,7 @@ TEST_CASE("mixed plan with node_data executes in engine", "[engine-group-by-stri
                                            {"campaign_id", types::logical_type::INTEGER},
                                            {"product_name", types::logical_type::STRING_LITERAL},
                                            {"price", types::logical_type::DOUBLE}});
-            *nodes[b][i] = logical_plan::make_node_raw_data(resource, std::move(chunk));
+            *nodes[b][i].node = logical_plan::make_node_raw_data(resource, std::move(chunk));
         }
     }
 
@@ -191,10 +189,9 @@ static void run_mixed_variant(const char* tag, const char* sql, bool string_name
     };
     using lt = components::types::logical_type;
     auto& nodes = data->otterbrix_params->external_nodes;
-    auto& targets = data->otterbrix_params->external_targets;
     for (size_t b = 0; b < nodes.size(); ++b) {
         for (size_t i = 0; i < nodes[b].size(); ++i) {
-            auto& target = targets[b][i];
+            auto& target = nodes[b][i].target;
             auto chunk = target.name.collection == "campaigns"
                              ? make_chunk({{"campaign_id", lt::INTEGER},
                                            {"campaign_name", string_names ? lt::STRING_LITERAL : lt::INTEGER},
@@ -203,7 +200,7 @@ static void run_mixed_variant(const char* tag, const char* sql, bool string_name
                                            {"campaign_id", lt::INTEGER},
                                            {"product_name", string_names ? lt::STRING_LITERAL : lt::INTEGER},
                                            {"price", double_price ? lt::DOUBLE : lt::INTEGER}});
-            *nodes[b][i] = components::logical_plan::make_node_raw_data(resource, std::move(chunk));
+            *nodes[b][i].node = components::logical_plan::make_node_raw_data(resource, std::move(chunk));
         }
     }
     auto cfg = make_create_config(std::string("/tmp/otterstax_mp_") + tag);

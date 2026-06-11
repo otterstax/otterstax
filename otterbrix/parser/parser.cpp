@@ -21,23 +21,17 @@
 using namespace components;
 
 namespace {
-    void swap_stubs_into_schema_nodes(
-        std::pmr::memory_resource* resource,
-        std::vector<std::vector<logical_plan::node_ptr*>>& external_nodes,
-        const std::pmr::vector<std::pmr::vector<otterstax::names::resolved_target_t>>& external_targets,
-        const std::vector<otterstax::parser::subquery_stub_t>& stubs) {
+    void swap_stubs_into_schema_nodes(std::pmr::memory_resource* resource,
+                                      std::pmr::vector<std::pmr::vector<external_entry_t>>& external_nodes,
+                                      const std::vector<otterstax::parser::subquery_stub_t>& stubs) {
         OTX_ZONE_N("otterbrix::swap_stubs_into_schema_nodes");
         if (stubs.empty()) {
             return;
         }
 
-        assert(external_targets.size() == external_nodes.size() &&
-               "external_targets must mirror external_nodes 1:1");
-        for (size_t batch = 0; batch < external_nodes.size(); ++batch) {
-            assert(external_targets[batch].size() == external_nodes[batch].size() &&
-                   "external_targets must mirror external_nodes 1:1");
-            for (size_t i = 0; i < external_nodes[batch].size(); ++i) {
-                auto& node_ref = *external_nodes[batch][i];
+        for (auto& batch : external_nodes) {
+            for (auto& entry : batch) {
+                auto& node_ref = *entry.node;
                 if (node_ref->type() != logical_plan::node_type::aggregate_t) {
                     continue;
                 }
@@ -75,7 +69,7 @@ namespace {
                     // The resolved target for this slot is the promoted stub
                     // RangeVar (`<uid>.subq.subq.<stub_id>`). Stubs are always
                     // uid-qualified, so every stub slot has a resolved target.
-                    const qualified_name_t& name = external_targets[batch][i].name;
+                    const qualified_name_t& name = entry.target.name;
                     auto schema_node =
                         schema_utils::make_node_schema_raw(resource, name, stub.raw_sql, stub.qualifiers);
                     schema_node->set_result_alias(node_ref->result_alias());
@@ -181,8 +175,7 @@ static core::result_wrapper_t<size_t>
 get_external_nodes(std::pmr::memory_resource* resource,
                    const otterstax::names::name_registry_t& registry,
                    logical_plan::node_ptr& node,
-                   std::vector<std::vector<logical_plan::node_ptr*>>& external_nodes,
-                   std::pmr::vector<std::pmr::vector<otterstax::names::resolved_target_t>>& external_targets) {
+                   std::pmr::vector<std::pmr::vector<external_entry_t>>& external_nodes) {
     OTX_ZONE_N("otterbrix::get_external_nodes");
     struct lookup_node_t {
         logical_plan::node_ptr* ptr;
@@ -191,7 +184,6 @@ get_external_nodes(std::pmr::memory_resource* resource,
     };
 
     external_nodes.emplace_back();
-    external_targets.emplace_back();
     size_t size = 0;
     std::deque<lookup_node_t> nodes_lookup;
     nodes_lookup.emplace_back(&node, nullptr, 0);
@@ -229,31 +221,29 @@ get_external_nodes(std::pmr::memory_resource* resource,
                 {
                     // TODO: remove this segment when connection pool will be added
                     // For now uid call can not repeat inside a batch
-                    auto it = std::find_if(external_targets[n.batch_index].begin(),
-                                           external_targets[n.batch_index].end(),
-                                           [&name](const auto& target) {
-                                               return target.name.unique_identifier == name.unique_identifier;
+                    auto it = std::find_if(external_nodes[n.batch_index].begin(),
+                                           external_nodes[n.batch_index].end(),
+                                           [&name](const auto& entry) {
+                                               return entry.target.name.unique_identifier == name.unique_identifier;
                                            });
-                    if (it != external_targets[n.batch_index].end()) {
+                    if (it != external_nodes[n.batch_index].end()) {
                         ++n.batch_index;
                         if (external_nodes.size() == n.batch_index) {
                             external_nodes.emplace_back();
-                            external_targets.emplace_back();
                         }
                     }
                 }
-                external_nodes[n.batch_index].emplace_back(n.ptr);
-                external_targets[n.batch_index].push_back(
-                    otterstax::names::resolved_target_t{components::catalog::INVALID_OID,
-                                                        std::move(name),
-                                                        std::move(from_name)});
+                external_nodes[n.batch_index].push_back(
+                    external_entry_t{n.ptr,
+                                     otterstax::names::resolved_target_t{components::catalog::INVALID_OID,
+                                                                         std::move(name),
+                                                                         std::move(from_name)}});
                 ++size;
             }
         }
         bool mutable_node = is_mutable(type);
         if (mutable_node) {
             external_nodes.emplace_back();
-            external_targets.emplace_back();
         }
         for (auto& child : (*n.ptr)->children()) {
             nodes_lookup.emplace_back(&child, n.ptr, n.batch_index + mutable_node);
@@ -263,7 +253,6 @@ get_external_nodes(std::pmr::memory_resource* resource,
 
     if (external_nodes.back().empty()) {
         external_nodes.erase(external_nodes.end() - 1);
-        external_targets.erase(external_targets.end() - 1);
     }
     return size;
 }
@@ -346,21 +335,18 @@ core::result_wrapper_t<ParsedQueryDataPtr> GreenplumParser::parse(const std::str
 
         log_->trace("parse: building ParsedQueryData, param_count={}", param_cnt);
         ParsedQueryDataPtr result = std::make_unique<ParsedQueryData>(
-            std::make_unique<OtterbrixStatement>(
-                std::vector<std::vector<logical_plan::node_ptr*>>{},
-                std::pmr::vector<std::pmr::vector<otterstax::names::resolved_target_t>>{resource_},
-                std::move(params),
-                std::move(node),
-                0,
-                param_cnt),
+            std::make_unique<OtterbrixStatement>(std::pmr::vector<std::pmr::vector<external_entry_t>>{resource_},
+                                                 std::move(params),
+                                                 std::move(node),
+                                                 0,
+                                                 param_cnt),
             std::move(binder),
             tag);
 
         auto external_count = get_external_nodes(resource_,
                                                  registry,
                                                  result->otterbrix_params->node,
-                                                 result->otterbrix_params->external_nodes,
-                                                 result->otterbrix_params->external_targets);
+                                                 result->otterbrix_params->external_nodes);
         if (external_count.has_error()) {
             log_->error("parse: external node name resolution failed: {}", external_count.error().what.c_str());
             return external_count.error();
@@ -368,10 +354,7 @@ core::result_wrapper_t<ParsedQueryDataPtr> GreenplumParser::parse(const std::str
         result->otterbrix_params->external_nodes_count = external_count.value();
         log_->info("parse: external_nodes_count={}", result->otterbrix_params->external_nodes_count);
 
-        swap_stubs_into_schema_nodes(resource_,
-                                     result->otterbrix_params->external_nodes,
-                                     result->otterbrix_params->external_targets,
-                                     extraction.stubs);
+        swap_stubs_into_schema_nodes(resource_, result->otterbrix_params->external_nodes, extraction.stubs);
         log_->trace("parse: swap_stubs_into_schema_nodes complete");
 
         return result;

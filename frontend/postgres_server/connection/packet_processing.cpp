@@ -466,7 +466,7 @@ namespace frontend::postgres {
         // TODO: PortalSuspended
         int32_t rows_cnt = sdata_result.chunk.size();
         if (limit != 0) {
-            rows_cnt = static_cast<int32_t>(std::min<uint64_t>(static_cast<uint64_t>(limit), sdata_result.chunk.size()));
+            rows_cnt = std::min(static_cast<uint64_t>(limit), sdata_result.chunk.size());
         }
 
         std::vector<std::vector<uint8_t>> response;

@@ -5,7 +5,11 @@ set(CMAKE_VERBOSE_MAKEFILE TRUE)
 set(CMAKE_CXX_STANDARD 20 CACHE STRING "The C++ standard whose features are requested." FORCE)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
-set(CMAKE_CXX_FLAGS "-fcoroutines")
+# -fcoroutines was required in GCC 10 but is a no-op (and causes bugs) in GCC 11+
+# with -std=c++20, where coroutines are enabled by default.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS "11")
+    set(CMAKE_CXX_FLAGS "-fcoroutines")
+endif()
 
 # Load all shared deps from the local lib/ dir next to the binary.
 # CMAKE_INSTALL_RPATH is used at both build and install time (BUILD_WITH_INSTALL_RPATH),
@@ -30,6 +34,12 @@ option(ENABLE_ASAN "Enable AddressSanitizer" OFF)
 # Option to enable thread sanitizer
 option(ENABLE_TSAN "Enable ThreadSanitizer" OFF)
 
+# Option to enable Tracy frame profiler (zero overhead when OFF)
+option(ENABLE_TRACY "Enable Tracy frame profiler (zero overhead when OFF)" OFF)
+
+# Option to enable perf-friendly build (frame pointers + minimal debug info)
+option(ENABLE_PERF "Add -fno-omit-frame-pointer -g1 for perf call-graph capture" OFF)
+
 if(ENABLE_ASAN AND ENABLE_TSAN)
     message(FATAL_ERROR "ENABLE_ASAN and ENABLE_TSAN cannot be enabled at the same time, choose only one sanitizer.")
 endif()
@@ -42,6 +52,10 @@ endif()
 if (ENABLE_TSAN)
     add_compile_options(-O0 -g -fno-omit-frame-pointer -fsanitize=thread)
     add_link_options(-fsanitize=thread)
+endif()
+
+if (ENABLE_PERF)
+    add_compile_options(-fno-omit-frame-pointer -g1)
 endif()
 
 # Find the Conan packages
@@ -59,6 +73,13 @@ find_package(Boost 1.87.0 REQUIRED COMPONENTS
 find_package(PostgreSQL REQUIRED)
 find_package(yaml-cpp REQUIRED)
 find_package(clickhouse-cpp REQUIRED)
+if(ENABLE_TRACY)
+    find_package(Tracy REQUIRED)
+    add_compile_definitions(TRACY_ENABLE)
+    get_target_property(_tracy_includes Tracy::TracyClient INTERFACE_INCLUDE_DIRECTORIES)
+    include_directories(${_tracy_includes})
+endif()
+
 find_package(Threads)
 
 if(NOT Threads_FOUND)
@@ -92,6 +113,8 @@ set(${PROJECT_NAME}_HEADERS
         utility/result.hpp
         utility/pipeline_error.hpp
         utility/external_name.hpp
+        utility/tracy_profiler.hpp
+        utility/tracy_memory_resource.hpp
 
         types/otterbrix.hpp
 )
@@ -133,6 +156,10 @@ target_link_libraries(
     Catch2::Catch2
     actor-zeta::actor-zeta
 )
+
+if(ENABLE_TRACY)
+    target_link_libraries(lib_${PROJECT_NAME} PUBLIC Tracy::TracyClient)
+endif()
 
 
 ###########################################

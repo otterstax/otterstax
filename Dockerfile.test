@@ -9,6 +9,9 @@ RUN apt update && \
     apt install -y \
         build-essential \
         ninja-build \
+        git \
+        pkg-config \
+        libdbus-1-dev \
         python3-pip \
         python3-venv \
         python3-dev curl gnupg apt-transport-https \
@@ -24,18 +27,54 @@ RUN pip3 install --no-cache-dir conan==2.15.0 'cmake<4.0' && \
 RUN rm /bin/sh && ln -s /bin/bash /bin/sh
 
 ARG BUILD_TYPE=Release
+ARG WITH_TRACY=false
+ARG WITH_PERF=false
+ARG BUILD_JOBS=0
 
 # Run conan install from the project root so self.source_folder=/app and
 # cmake_layout places generators + libs at build/${BUILD_TYPE}/ — matching
 # the devcontainer preset layout exactly.
 WORKDIR /app
 COPY conanfile.py .
-RUN conan install conanfile.py --build missing \
-    -s build_type=${BUILD_TYPE} \
-    -s compiler.cppstd=gnu20 \
-    -s 'clickhouse-cpp/*:compiler.cppstd=17' \
-    -s 'abseil/*:compiler.cppstd=17' \
-    -s 'grpc/*:compiler.cppstd=17'
+RUN if [ "$WITH_TRACY" = "true" ]; then \
+        conan install conanfile.py --build missing \
+            -s build_type=${BUILD_TYPE} \
+            -s compiler.cppstd=gnu20 \
+            -s 'clickhouse-cpp/*:compiler.cppstd=17' \
+            -s 'abseil/*:compiler.cppstd=17' \
+            -s 'grpc/*:compiler.cppstd=17' \
+            -o "&:with_tracy=True"; \
+    else \
+        conan install conanfile.py --build missing \
+            -s build_type=${BUILD_TYPE} \
+            -s compiler.cppstd=gnu20 \
+            -s 'clickhouse-cpp/*:compiler.cppstd=17' \
+            -s 'abseil/*:compiler.cppstd=17' \
+            -s 'grpc/*:compiler.cppstd=17'; \
+    fi
+
+# Install perf tools when WITH_PERF=true.
+# linux-tools-generic ships perf 5.15; it runs on the Docker Desktop linuxkit kernel
+# (currently 6.12.x) without issues for software events and syscall tracepoints.
+RUN if [ "$WITH_PERF" = "true" ]; then \
+    apt-get update && \
+    apt-get install -y --no-install-recommends linux-tools-generic linux-tools-common && \
+    ln -sf "$(find /usr/lib/linux-tools -name perf | sort -V | tail -1)" /usr/local/bin/perf && \
+    rm -rf /var/lib/apt/lists/*; \
+fi
+
+# Build tracy-capture CLI when Tracy is enabled
+RUN _jobs=$([ "${BUILD_JOBS}" = "0" ] && nproc || echo "${BUILD_JOBS}") && \
+    if [ "$WITH_TRACY" = "true" ]; then \
+        curl -L https://github.com/wolfpld/tracy/archive/refs/tags/v0.13.1.tar.gz \
+            | tar xz -C /tmp && \
+        cmake -S /tmp/tracy-0.13.1/capture -B /tmp/tracy-capture-build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DNFD_PORTAL=ON && \
+        cmake --build /tmp/tracy-capture-build -j${_jobs} && \
+        cp /tmp/tracy-capture-build/tracy-capture /usr/local/bin/ && \
+        rm -rf /tmp/tracy-0.13.1 /tmp/tracy-capture-build; \
+    fi
 
 COPY ./catalog ./catalog
 COPY ./config ./config
@@ -59,16 +98,31 @@ ARG ENABLE_TSAN=OFF
 # Only takes effect in TSAN builds; plain Release / ASAN ignore it.
 ENV TSAN_OPTIONS="suppressions=/app/tsan.supp"
 
-RUN cmake -S . -B build/${BUILD_TYPE} \
+RUN _jobs=$([ "${BUILD_JOBS}" = "0" ] && nproc || echo "${BUILD_JOBS}") && \
+    _tracy=$([ "${WITH_TRACY}" = "true" ] && echo "ON" || echo "OFF") && \
+    _perf=$([ "${WITH_PERF}" = "true" ] && echo "ON" || echo "OFF") && \
+    cmake -S . -B build/${BUILD_TYPE} \
         -DCMAKE_TOOLCHAIN_FILE=build/${BUILD_TYPE}/generators/conan_toolchain.cmake \
         -DCMAKE_BUILD_TYPE=${BUILD_TYPE} \
         -DBUILD_TESTS=ON \
         -DENABLE_ASAN=${ENABLE_ASAN} \
-        -DENABLE_TSAN=${ENABLE_TSAN} && \
-    cmake --build build/${BUILD_TYPE} --target all -- -j$(nproc)
+        -DENABLE_TSAN=${ENABLE_TSAN} \
+        -DENABLE_TRACY=${_tracy} \
+        -DENABLE_PERF=${_perf} && \
+    cmake --build build/${BUILD_TYPE} --target all -- -j${_jobs}
 
 WORKDIR /app/build/${BUILD_TYPE}
 
-RUN ctest -C ${BUILD_TYPE} -V --output-on-failure --timeout 120
+# Tracy-enabled builds skip tests: Tracy's profiler init crashes in a headless
+# Docker container (no profiler server attached). Non-Tracy CI builds run all tests.
+ARG WITH_TRACY=false
+RUN if [ "${WITH_TRACY}" != "true" ]; then \
+        ctest -C ${BUILD_TYPE} -V --output-on-failure --timeout 120; \
+    else \
+        echo "Skipping tests: Tracy build (headless Docker, no profiler attached)"; \
+    fi
+
+# Tracy profiler port (active only when built with --build-arg WITH_TRACY=true)
+EXPOSE 8086
 
 CMD [ "./server" ]

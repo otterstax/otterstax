@@ -8,7 +8,7 @@
 #include "scheduler/schema_utils.hpp"
 #include "utility/cv_wrapper.hpp"
 #include "utility/logger.hpp"
-#include "utility/timer.hpp"
+#include "utility/tracy_profiler.hpp"
 #include "utility/wait_barrier.hpp"
 
 #include <thread>
@@ -32,7 +32,8 @@ MySQLManager::MySQLManager(std::pmr::memory_resource* res,
 
 std::pair<bool, actor_zeta::detail::enqueue_result>
 MySQLManager::enqueue_impl(actor_zeta::mailbox::message_ptr msg) {
-    std::lock_guard<std::mutex> guard(mutex_);
+    OTX_ZONE_N("MySQLManager::enqueue_impl");
+    std::lock_guard guard(mutex_);
     current_behavior_ = behavior(msg.get());
 
     while (current_behavior_.is_busy()) {
@@ -50,6 +51,7 @@ MySQLManager::enqueue_impl(actor_zeta::mailbox::message_ptr msg) {
 }
 
 actor_zeta::behavior_t MySQLManager::behavior(actor_zeta::mailbox::message* msg) {
+    OTX_ZONE_N("MySQLManager::behavior");
     auto cmd = msg->command();
     if (cmd == actor_zeta::msg_id<MySQLManager, &MySQLManager::execute>) {
         co_await actor_zeta::dispatch(this, &MySQLManager::execute, msg);
@@ -58,10 +60,9 @@ actor_zeta::behavior_t MySQLManager::behavior(actor_zeta::mailbox::message* msg)
 
 actor_zeta::unique_future<otterstax::result<ParsedQueryDataPtr>>
 MySQLManager::execute(session_hash_t id, ParsedQueryDataPtr data) {
+    OTX_ZONE_N("MySQLManager::execute");
     assert(data);
     try {
-        Timer timer("MySQLManager::execute", log_);
-
         log_->debug("execute started, id hash: {}", id);
         log_->debug("execute data valid: {}, otterbrix_params valid: {}",
                     data != nullptr,
@@ -81,6 +82,7 @@ MySQLManager::execute(session_hash_t id, ParsedQueryDataPtr data) {
         assert(targets.size() == batches.size());
         // Batches are processed back to front (innermost dependencies first).
         for (size_t batch = batches.size(); batch-- > 0;) {
+            OTX_ZONE_N("MySQLManager::batch");
             auto& batch_nodes = batches[batch];
             const auto& batch_targets = targets[batch];
             assert(batch_targets.size() == batch_nodes.size());
@@ -93,6 +95,7 @@ MySQLManager::execute(session_hash_t id, ParsedQueryDataPtr data) {
             // Track which indices we processed (for mixed backend, we skip non-MySQL nodes)
             std::vector<size_t> processed_indices;
             for (size_t i = 0; i < batch_nodes.size(); i++) {
+                OTX_ZONE_N("MySQLManager::node_dispatch");
                 log_->trace("Execute query: {}", ++counter);
 
                 auto& node = *batch_nodes[i];
@@ -155,6 +158,7 @@ MySQLManager::execute(session_hash_t id, ParsedQueryDataPtr data) {
             log_->debug("execute Run Query Success! results count: {}", wait_guard.results.size());
             assert(generated_queries.size() == processed_indices.size());
             for (size_t j = 0; j < processed_indices.size(); j++) {
+                OTX_ZONE_N("MySQLManager::to_chunk");
                 size_t i = processed_indices[j];
                 auto& chunk_ptr = wait_guard.results[j];
                 if (chunk_ptr) {

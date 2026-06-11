@@ -16,12 +16,14 @@ class OtterStax(ConanFile):
     # Binary configuration
     settings = "os", "compiler", "build_type", "arch"
     options = {
-        "shared": [True, False],
-        "fPIC": [True, False],
+        "shared":      [True, False],
+        "fPIC":        [True, False],
+        "with_tracy":  [True, False],
     }
     default_options = {
-        "shared": False,
-        "fPIC": True,
+        "shared":      False,
+        "fPIC":        True,
+        "with_tracy":  False,
     }
 
     def layout(self):
@@ -32,6 +34,8 @@ class OtterStax(ConanFile):
             self.tool_requires("patchelf/0.18")
 
     def requirements(self):
+        if self.options.with_tracy:
+            self.requires("tracy/0.13.1")
         self.requires("arrow/21.0.0")
         self.requires("openssl/3.0.13")
         self.requires("boost/1.87.0", override=True)
@@ -57,6 +61,8 @@ class OtterStax(ConanFile):
             del self.options.fPIC
 
     def configure(self):
+        if self.options.with_tracy:
+            self.options["tracy/*"].on_demand = False
         self.options["gflags/*"].shared = True
 
         self.options["arrow/*"].with_flight_sql = True
@@ -88,6 +94,7 @@ class OtterStax(ConanFile):
         tc.variables["CMAKE_CXX_STANDARD"] = "20"
         tc.variables["CMAKE_CXX_STANDARD_REQUIRED"] = "ON"
         tc.variables["CMAKE_CXX_EXTENSIONS"] = "OFF"
+        tc.variables["ENABLE_TRACY"] = bool(self.options.with_tracy)
         tc.generate()
 
         deps = CMakeDeps(self)

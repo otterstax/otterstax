@@ -10,6 +10,7 @@
 #include "types/otterbrix.hpp"
 #include "utility/pipeline_error.hpp"
 #include "utility/session.hpp"
+#include "utility/tracy_profiler.hpp"
 #include <actor-zeta.hpp>
 #include <components/catalog/catalog_oids.hpp>
 #include <components/table/column_definition.hpp>
@@ -70,7 +71,7 @@ namespace db {
         std::pmr::memory_resource* resource_;
         std::unique_ptr<IDataManager> data_manager_;
         log_t log_;
-        std::mutex mutex_;
+        OTX_LOCKABLE_N(std::mutex, mutex_, "OtterbrixManager::mutex");
         actor_zeta::behavior_t current_behavior_;
     };
 } // namespace db

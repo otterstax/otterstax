@@ -7,6 +7,7 @@
 #include "protocol_config.hpp"
 #include "utility/logger.hpp"
 #include "utility/thread_pool_manager.hpp"
+#include "utility/tracy_profiler.hpp"
 
 #include <actor-zeta.hpp>
 #include <boost/asio.hpp>
@@ -175,7 +176,7 @@ namespace frontend {
         std::queue<size_t> available_slots_;
         log_t log_;
 
-        mutable std::mutex pool_mutex_;
+        mutable OTX_LOCKABLE_N(std::mutex, pool_mutex_, "frontend::pool_lock");
         std::atomic<bool> stopped_{false};
     };
 

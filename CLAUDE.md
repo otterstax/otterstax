@@ -53,6 +53,23 @@ docker build -f Dockerfile.test -t otterstax-test .
 # Full stack for manual testing
 python fixtures/generate_data.py
 docker compose up
+
+# Benchmark suite (builds images, starts DBs, runs tests, writes results)
+./benchmark/scripts/run_benchmark.sh --repetitions 5
+
+# Benchmark with CPU call-graph profiling (perf, 99 Hz dwarf unwind)
+# Outputs: benchmark_results/<ts>/benchmark.perf.data + benchmark.perf (speedscope)
+./benchmark/scripts/run_benchmark.sh --perf --frontend postgres --bench simple_select
+
+# Benchmark with CPU + allocation hotspot profiling (malloc uprobe, every call site)
+./benchmark/scripts/run_benchmark.sh --perf-alloc --frontend postgres --bench simple_select
+
+# Manual interactive mode (start services, run queries/benchmarks by hand, then stop)
+./benchmark/manual/start_service.sh            # start (reuses existing image)
+./benchmark/manual/start_service.sh --rebuild  # force rebuild both images
+./benchmark/manual/start_service.sh --perf     # start + perf recording (saved on stop)
+./benchmark/manual/start_service.sh --perf-alloc  # + malloc uprobe
+./benchmark/manual/stop_service.sh             # stop (saves perf.data if active)
 ```
 
 ## Architecture Overview

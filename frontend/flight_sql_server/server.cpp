@@ -9,7 +9,7 @@
 #include "otterbrix/translators/output/chunk_to_arrow.hpp"
 #include "utility/connection_uid.hpp"
 #include "utility/logger.hpp"
-#include "utility/timer.hpp"
+#include "utility/tracy_profiler.hpp"
 
 #include "catalog/catalog_manager.hpp"
 #include "otterbrix/config.hpp"
@@ -115,7 +115,7 @@ arrow::Result<std::unique_ptr<arrow::flight::FlightInfo>>
 SimpleFlightSQLServer::GetFlightInfoStatement(const arrow::flight::ServerCallContext& context,
                                               const arrow::flight::sql::StatementQuery& command,
                                               const arrow::flight::FlightDescriptor& descriptor) {
-    Timer timer("GetFlightInfoStatement", log_);
+    OTX_ZONE_N("flight::GetFlightInfoStatement");
     log_->debug("[GetFlightInfoStatement] Start");
     session_id id;
     const std::string& query = command.query;
@@ -151,7 +151,7 @@ SimpleFlightSQLServer::GetFlightInfoStatement(const arrow::flight::ServerCallCon
 arrow::Result<std::unique_ptr<arrow::flight::FlightDataStream>>
 SimpleFlightSQLServer::DoGetStatement(const arrow::flight::ServerCallContext& context,
                                       const arrow::flight::sql::StatementQueryTicket& command) {
-    Timer timer("DoGetStatement", log_);
+    OTX_ZONE_N("flight::DoGetStatement");
     // log_->trace("[DOGET] Thread id: {}", std::this_thread::get_id()); // fmt doesn't format thread::id
 
     try {
@@ -170,13 +170,9 @@ SimpleFlightSQLServer::DoGetStatement(const arrow::flight::ServerCallContext& co
         if (shared_data->status() == cv_wrapper::Status::Ok) {
             auto sdata_result = shared_data->get_result();
             log_->debug("[DOGET] Scheduler finished successfully, rows size: {}", sdata_result.chunk.size());
-            timer.timePoint("[DOGET] Scheduler finished successfully");
-
             auto schema = to_arrow_schema(sdata_result.schema);
             auto batch_reader = ChunkBatchReader::Make(std::move(schema), std::move(sdata_result.chunk)).ValueOrDie();
-            // Use a record batch stream
             log_->trace("[ARROW FLIGHT SERVER] Send data");
-            timer.timePoint("[DOGET] datastream created");
             return std::make_unique<arrow::flight::RecordBatchStream>(batch_reader);
         } else if (shared_data->status() == cv_wrapper::Status::Timeout) {
             log_->warn("Timeout while executing query: {}", query);
@@ -198,7 +194,7 @@ arrow::Result<std::unique_ptr<arrow::flight::FlightInfo>>
 SimpleFlightSQLServer::GetFlightInfoTables(const arrow::flight::ServerCallContext& context,
                                            const arrow::flight::sql::GetTables& command,
                                            const arrow::flight::FlightDescriptor& descriptor) {
-    Timer timer("GetFlightInfoTables", log_);
+    OTX_ZONE_N("flight::GetFlightInfoTables");
     std::vector<arrow::flight::FlightEndpoint> endpoints{{arrow::flight::Ticket{descriptor.cmd}, {}, std::nullopt, ""}};
     auto schema = command.include_schema ? *arrow::flight::sql::SqlSchema::GetTablesSchemaWithIncludedSchema()
                                          : *arrow::flight::sql::SqlSchema::GetTablesSchema();
@@ -210,7 +206,7 @@ SimpleFlightSQLServer::GetFlightInfoTables(const arrow::flight::ServerCallContex
 arrow::Result<std::unique_ptr<arrow::flight::FlightDataStream>>
 SimpleFlightSQLServer::DoGetTables(const arrow::flight::ServerCallContext& context,
                                    const arrow::flight::sql::GetTables& command) {
-    Timer timer("DoGetTables", log_);
+    OTX_ZONE_N("flight::DoGetTables");
     bool include_schema = command.include_schema;
     arrow::StringBuilder catalog_builder;
     arrow::StringBuilder db_schema_builder;
@@ -271,7 +267,7 @@ SimpleFlightSQLServer::DoGetTables(const arrow::flight::ServerCallContext& conte
 arrow::Result<int64_t>
 SimpleFlightSQLServer::DoPutCommandStatementUpdate(const arrow::flight::ServerCallContext& context,
                                                    const arrow::flight::sql::StatementUpdate& command) {
-    Timer timer("DoPutCommandStatementUpdate", log_);
+    OTX_ZONE_N("flight::DoPutCommandStatementUpdate");
     try {
         // Log the received ticket, assuming the query is stored in the ticket
         log_->debug("Received query in ticket: {} Id: {}", command.query, command.transaction_id);
@@ -286,11 +282,8 @@ SimpleFlightSQLServer::DoPutCommandStatementUpdate(const arrow::flight::ServerCa
         if (shared_data->status() == cv_wrapper::Status::Ok) {
             affected_rows = sdata_result.chunk.size();
             log_->debug("[DoPutCommandStatementUpdate] Scheduler finished successfully, rows size: {}", affected_rows);
-            timer.timePoint("[DoPutCommandStatementUpdate] Scheduler finished successfully");
-
             log_->debug("[DoPutCommandStatementUpdate] Affected rows: {}", affected_rows);
             log_->trace("[ARROW FLIGHT SERVER] Send data");
-            timer.timePoint("[DoPutCommandStatementUpdate] datastream created");
             return affected_rows;
         } else if (shared_data->status() == cv_wrapper::Status::Timeout) {
             log_->warn("Timeout while executing query: {}", command.query);

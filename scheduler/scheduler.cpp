@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2025-2026  OtterStax
 
-#include "scheduler.hpp"
+#include "scheduler/scheduler.hpp"
 
 #include "catalog/catalog_manager.hpp"
 #include "integration/clickhouse/connection_manager.hpp"
@@ -9,7 +9,7 @@
 #include "integration/postgresql/connection_manager.hpp"
 #include "integration/sql/connection_manager.hpp"
 #include "utility/logger.hpp"
-#include "utility/timer.hpp"
+#include "utility/tracy_profiler.hpp"
 
 #include <actor-zeta.hpp>
 #include <cassert>
@@ -40,7 +40,8 @@ Scheduler::Scheduler(std::pmr::memory_resource* res,
 }
 
 std::pair<bool, actor_zeta::detail::enqueue_result> Scheduler::enqueue_impl(actor_zeta::mailbox::message_ptr msg) {
-    std::lock_guard<std::mutex> guard(mutex_);
+    OTX_ZONE_N("Scheduler::enqueue_impl");
+    std::lock_guard guard(mutex_);
     current_behavior_ = behavior(msg.get());
 
     while (current_behavior_.is_busy()) {
@@ -58,6 +59,7 @@ std::pair<bool, actor_zeta::detail::enqueue_result> Scheduler::enqueue_impl(acto
 }
 
 actor_zeta::behavior_t Scheduler::behavior(actor_zeta::mailbox::message* msg) {
+    OTX_ZONE_N("Scheduler::behavior");
     auto cmd = msg->command();
     if (cmd == actor_zeta::msg_id<Scheduler, &Scheduler::execute>) {
         co_await actor_zeta::dispatch(this, &Scheduler::execute, msg);
@@ -73,8 +75,8 @@ actor_zeta::behavior_t Scheduler::behavior(actor_zeta::mailbox::message* msg) {
 // ─── Entry-point coroutines ───────────────────────────────────────────────────
 
 actor_zeta::unique_future<void> Scheduler::execute(session_hash_t id, shared_session_payload sdata, std::string sql) {
+    OTX_ZONE_N("Scheduler::execute");
     try {
-        Timer timer("Scheduler::execute", log_);
         log_->info("Scheduler::execute called with sql: {}", sql);
         log_->trace("execute sql: {}, id hash: {}", sql, id);
         register_session(id, sdata);
@@ -240,10 +242,10 @@ actor_zeta::unique_future<void> Scheduler::execute(session_hash_t id, shared_ses
 }
 
 actor_zeta::unique_future<void> Scheduler::execute_statement(session_hash_t id, shared_session_payload sdata) {
+    OTX_ZONE_N("Scheduler::execute_statement");
     try {
-        Timer timer("Scheduler::execute_statement", log_);
         log_->trace("execute_statement id hash: {}", id);
-        register_session(id, std::move(sdata));
+        register_session(id, std::move(sdata)); // TODO check if ne
 
         const auto backend_type = get_backend_type(id);
         log_->debug("execute_statement routing to backend_type: {}", static_cast<int>(backend_type));
@@ -355,8 +357,8 @@ actor_zeta::unique_future<void>
 Scheduler::execute_prepared_statement(session_hash_t id,
                                       std::pmr::vector<types::logical_value_t> parameters,
                                       shared_session_payload sdata) {
+    OTX_ZONE_N("Scheduler::execute_prepared_statement");
     try {
-        Timer timer("Scheduler::execute_prepared_statement", log_);
         register_session(id, sdata);
 
         log_->debug("execute_prepared_statement routing to backend_type: {}", static_cast<int>(get_backend_type(id)));
@@ -383,12 +385,14 @@ Scheduler::execute_prepared_statement(session_hash_t id,
 
 actor_zeta::unique_future<void>
 Scheduler::prepare_schema(session_hash_t id, shared_session_payload sdata, std::string sql) {
+    OTX_ZONE_N("Scheduler::prepare_schema");
     try {
-        Timer timer("Scheduler::prepare_schema", log_);
         log_->debug("[prepare_schema] Start, id hash: {}", id);
         log_->debug("[prepare_schema] SQL: {}", sql);
 
+        log_->debug("[prepare_schema] Registering session...");
         register_session(id, std::move(sdata));
+        log_->debug("[prepare_schema] Parsing SQL...");
         auto parsed = parser_->parse(sql);
         if (parsed.has_error()) {
             log_->error("Failed to parse SQL: {}", sql);
@@ -477,6 +481,7 @@ Scheduler::prepare_schema(session_hash_t id, shared_session_payload sdata, std::
 }
 
 void Scheduler::finish_schema(session_hash_t id, cursor::cursor_t_ptr cursor, ParsedQueryDataPtr data) {
+    OTX_ZONE_N("Scheduler::finish_schema");
     if (cursor->is_error()) {
         complete_session_on_error(id, std::string{cursor->get_error().what.c_str()});
         return;
@@ -496,13 +501,15 @@ void Scheduler::finish_schema(session_hash_t id, cursor::cursor_t_ptr cursor, Pa
 }
 
 void Scheduler::register_session(session_hash_t id, shared_session_payload sdata) {
-    std::lock_guard<std::mutex> lock(data_map_mtx_);
+    OTX_ZONE_N("Scheduler::register_session");
+    std::lock_guard lock(data_map_mtx_);
     shared_data_map_[id] = std::move(sdata);
     log_->trace("Scheduler::register_session");
 }
 
 void Scheduler::update_metadata(session_hash_t id, ParsedQueryDataPtr metadata, types::complex_logical_type schema) {
-    std::lock_guard<std::mutex> lock(data_map_mtx_);
+    OTX_ZONE_N("Scheduler::update_metadata");
+    std::lock_guard lock(data_map_mtx_);
     log_->trace("Scheduler::update_metadata start");
     NodeTag tag = metadata->tag;
     backend_type_t backend_type = metadata->backend_type;
@@ -511,14 +518,16 @@ void Scheduler::update_metadata(session_hash_t id, ParsedQueryDataPtr metadata, 
 }
 
 void Scheduler::set_backend_type_otterbrix(session_hash_t id) {
-    std::lock_guard<std::mutex> lock(data_map_mtx_);
+    OTX_ZONE_N("Scheduler::set_backend_type_otterbrix");
+    std::lock_guard lock(data_map_mtx_);
     log_->trace("Scheduler::set_backend_type_otterbrix start");
     metadata_map_[id].backend_type = backend_type_t::Otterbrix;
     log_->trace("Scheduler::set_backend_type_otterbrix finish");
 }
 
 backend_type_t Scheduler::get_backend_type(session_hash_t id) const {
-    std::lock_guard<std::mutex> lock(data_map_mtx_);
+    OTX_ZONE_N("Scheduler::get_backend_type");
+    std::lock_guard lock(data_map_mtx_);
     if (auto it = metadata_map_.find(id); it != metadata_map_.end()) {
         return it->second.backend_type;
     }
@@ -526,7 +535,8 @@ backend_type_t Scheduler::get_backend_type(session_hash_t id) const {
 }
 
 void Scheduler::complete_session(session_hash_t id, session_payload data, flightsql_session_type type) {
-    std::lock_guard<std::mutex> lock(data_map_mtx_);
+    OTX_ZONE_N("Scheduler::complete_session_with_data");
+    std::lock_guard lock(data_map_mtx_);
     log_->trace("Scheduler::complete_session start");
 
     if (type == flightsql_session_type::DO_GET) {
@@ -545,7 +555,8 @@ void Scheduler::complete_session(session_hash_t id, session_payload data, flight
 }
 
 void Scheduler::complete_session_on_error(session_hash_t id, std::string error_msg) {
-    std::lock_guard<std::mutex> lock(data_map_mtx_);
+    OTX_ZONE_N("Scheduler::complete_session_on_error");
+    std::lock_guard lock(data_map_mtx_);
     log_->trace("Scheduler::complete_session_on_error start");
 
     metadata_map_.erase(id);
@@ -558,7 +569,8 @@ void Scheduler::complete_session_on_error(session_hash_t id, std::string error_m
 }
 
 ParsedQueryDataPtr Scheduler::get_statement(session_hash_t id) {
-    std::lock_guard<std::mutex> lock(data_map_mtx_);
+    OTX_ZONE_N("Scheduler::get_statement");
+    std::lock_guard lock(data_map_mtx_);
     if (auto it = metadata_map_.find(id); it != metadata_map_.end()) {
         return std::move(it->second.query_data_ptr);
     }
@@ -566,17 +578,20 @@ ParsedQueryDataPtr Scheduler::get_statement(session_hash_t id) {
 }
 
 auto Scheduler::get_metadata(session_hash_t id) const -> const metadata_t& {
-    std::lock_guard<std::mutex> lock(data_map_mtx_);
+    OTX_ZONE_N("Scheduler::get_metadata");
+    std::lock_guard lock(data_map_mtx_);
     return metadata_map_.at(id);
 }
 
 bool Scheduler::session_exists(session_hash_t id) const {
-    std::lock_guard<std::mutex> lock(data_map_mtx_);
+    OTX_ZONE_N("Scheduler::session_exists");
+    std::lock_guard lock(data_map_mtx_);
     return shared_data_map_.contains(id) && metadata_map_.contains(id);
 }
 
 shared_session_payload Scheduler::get_session_payload(session_hash_t id) const {
-    std::lock_guard<std::mutex> lock(data_map_mtx_);
+    OTX_ZONE_N("Scheduler::get_session_payload");
+    std::lock_guard lock(data_map_mtx_);
     if (auto it = shared_data_map_.find(id); it != shared_data_map_.end()) {
         return it->second;
     }

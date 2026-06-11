@@ -110,7 +110,7 @@ private:
     actor_zeta::address_t otterbrix_manager_;
     actor_zeta::address_t catalog_manager_;
 
-    mutable std::mutex data_map_mtx_;
-    std::mutex mutex_;
+    mutable OTX_LOCKABLE_N(std::mutex, data_map_mtx_, "Scheduler::data_map_mtx");
+    OTX_LOCKABLE_N(std::mutex, mutex_, "Scheduler::mutex");
     actor_zeta::behavior_t current_behavior_;
 };

@@ -3,6 +3,9 @@
 
 #include "postgres_connection.hpp"
 
+#include "utility/tracy_memory_resource.hpp"
+#include "utility/tracy_profiler.hpp"
+
 #include <tuple>
 
 using namespace components;
@@ -14,6 +17,7 @@ namespace frontend::postgres {
     constexpr size_t SECRET_KEY_SIZE = 4;
 
     void postgres_connection::handle_startup_message(packet_reader& reader) {
+        OTX_ZONE_N("pg::handle_startup_message");
         log_->info("[Connection {}]: Client protocol version: {}", connection_id_, reader.read_int32());
         while (reader.remaining()) {
             std::string key = reader.read_string_null();
@@ -62,6 +66,7 @@ namespace frontend::postgres {
     }
 
     void postgres_connection::handle_ssl_decline(frontend::postgres::packet_reader& reader) {
+        OTX_ZONE_N("pg::handle_ssl_decline");
         std::vector<uint8_t> negative(1);
         negative[0] = 'N';
 
@@ -71,6 +76,7 @@ namespace frontend::postgres {
     }
 
     void postgres_connection::handle_query(std::string query) {
+        OTX_ZONE_N("pg::handle_query");
         auto shared_data = create_cv_wrapper(session_payload(resource_));
         session_id id;
         std::ignore = actor_zeta::send(scheduler_, &Scheduler::execute, id.hash(), shared_data, query);
@@ -109,9 +115,11 @@ namespace frontend::postgres {
     }
 
     void postgres_connection::try_handle_transaction(std::string query, std::string error) {
+        OTX_ZONE_N("pg::try_handle_transaction");
         if (error.find("Unsupported node type") != std::string::npos) {
             try {
-                std::pmr::monotonic_buffer_resource arena_resource(resource_);
+                tracy_memory_resource arena_mr(resource_, "pg::parse_arena");
+                std::pmr::monotonic_buffer_resource arena_resource(&arena_mr);
                 auto res = linitial(raw_parser(&arena_resource, query.c_str()));
                 if (nodeTag(res) == T_TransactionStmt) { // handle transactions
                     auto tr = transform::pg_ptr_cast<TransactionStmt>(res);
@@ -166,6 +174,7 @@ namespace frontend::postgres {
 
     void
     postgres_connection::handle_parse(std::string stmt, std::string query, int16_t num_params, packet_reader&& reader) {
+        OTX_ZONE_N("pg::handle_parse");
         if (pipeline_.has_error()) {
             log_->error("[Connection {}] PARSE stmt: \"{}\", query: \"{}\" IGNORED DUE TO PIPELINE ERROR, reading next "
                         "packet...",
@@ -232,6 +241,7 @@ namespace frontend::postgres {
                                           std::vector<result_encoding> format,
                                           int16_t num_params,
                                           packet_reader&& reader) {
+        OTX_ZONE_N("pg::handle_bind");
         if (pipeline_.has_error()) {
             log_->error("[Connection {}] BIND stmt: \"{}\", portal: \"{}\" IGNORED DUE TO PIPELINE ERROR, reading next "
                         "packet...",
@@ -412,6 +422,7 @@ namespace frontend::postgres {
     }
 
     void postgres_connection::handle_execute(std::string portal_name, int32_t limit) {
+        OTX_ZONE_N("pg::handle_execute");
         if (pipeline_.has_error()) {
             log_->error("[Connection {}] EXECUTE portal: \"{}\" IGNORED DUE TO PIPELINE ERROR, reading next "
                         "packet...",
@@ -477,6 +488,7 @@ namespace frontend::postgres {
     }
 
     void postgres_connection::handle_close(describe_close_arg type, std::string name) {
+        OTX_ZONE_N("pg::handle_close");
         log_->info("[Connection {}] CLOSE name: \"{}\" type:\"{}\"", connection_id_, name, static_cast<char>(type));
         do_close(type, std::move(name));
         send_packet(build_close_complete(writer_));
@@ -496,6 +508,7 @@ namespace frontend::postgres {
     }
 
     void postgres_connection::handle_describe(describe_close_arg type, std::string name) {
+        OTX_ZONE_N("pg::handle_describe");
         log_->info("[Connection {}] DESCRIBE name: \"{}\" type:\"{}\"", connection_id_, name, static_cast<char>(type));
 
         if (type == describe_close_arg::STATEMENT) {

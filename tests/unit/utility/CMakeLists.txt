@@ -19,4 +19,8 @@ target_link_libraries(
     Catch2::Catch2
 )
 
+if(ENABLE_TRACY)
+    target_link_libraries(${PROJECT_NAME} PRIVATE Tracy::TracyClient)
+endif()
+
 otterstax_discover_tests(${PROJECT_NAME})

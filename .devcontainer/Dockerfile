@@ -13,6 +13,7 @@ RUN apt update && \
         ninja-build \
         bison \
         flex \
+        clang-format-13 \
         python3-pip \
         python3-venv \
         python3-dev curl gnupg apt-transport-https \

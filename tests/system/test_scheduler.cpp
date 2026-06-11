@@ -26,11 +26,12 @@
 #include <tuple>
 
 namespace {
+    std::once_flag log_init_flag;
+
     otterbrix::otterbrix_ptr init_otterbrix() {
         auto config = configuration::config::default_config();
 
-        auto log_path = config.log.path.string();
-        initialize_all_loggers(log_path);
+        std::call_once(log_init_flag, [&] { initialize_all_loggers(config.log.path.string()); });
 
         return otterbrix::make_otterbrix(std::move(config));
     }
@@ -40,7 +41,7 @@ TEST_CASE("base test case") {
     using namespace std::chrono_literals;
 
     otterbrix::otterbrix_ptr otterbrix = init_otterbrix();
-    auto resource = std::pmr::get_default_resource(); // no ottterbrix processing, use default for easier mock
+    auto resource = otterbrix->dispatcher()->resource();
     assert(resource);
 
     auto otterbrix_manager = actor_zeta::spawn<db::OtterbrixManager>(
@@ -451,6 +452,7 @@ TEST_CASE("Cross-backend JOIN detection test case") {
     // Optional: Check that backend_type was set to Mixed (this would require exposing internal state)
     // For now, we verify that the query didn't fail immediately due to backend detection
 }
+
 
 TEST_CASE("return empty test case") {
     using namespace std::chrono_literals;

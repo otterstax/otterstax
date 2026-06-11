@@ -5,7 +5,7 @@
 
 #include "scheduler/schema_utils.hpp"
 #include "utility/logger.hpp"
-#include "utility/timer.hpp"
+#include "utility/tracy_profiler.hpp"
 
 #include <core/result_wrapper.hpp>
 
@@ -28,7 +28,8 @@ OtterbrixManager::OtterbrixManager(std::pmr::memory_resource* res, std::unique_p
 
 std::pair<bool, actor_zeta::detail::enqueue_result>
 OtterbrixManager::enqueue_impl(actor_zeta::mailbox::message_ptr msg) {
-    std::lock_guard<std::mutex> guard(mutex_);
+    OTX_ZONE_N("OtterbrixManager::enqueue_impl");
+    std::lock_guard guard(mutex_);
     current_behavior_ = behavior(msg.get());
 
     while (current_behavior_.is_busy()) {
@@ -164,9 +165,8 @@ actor_zeta::unique_future<otterstax::result<bool>> OtterbrixManager::drop_extern
 
 actor_zeta::unique_future<components::cursor::cursor_t_ptr> OtterbrixManager::execute(session_hash_t id,
                                                                                       OtterbrixStatementPtr params) {
+    OTX_ZONE_N("otterbrix::execute");
     try {
-        Timer timer("OtterbrixManager::execute", log_);
-
         log_->trace("execute id hash: {}", id);
 
         auto cursor_data = this->data_manager_->execute_plan(params);
@@ -191,8 +191,7 @@ actor_zeta::unique_future<otterstax::result<std::pair<components::cursor::cursor
 OtterbrixManager::get_schema(session_hash_t id,
                              std::pmr::map<qualified_name_t, size_t> dependencies,
                              ParsedQueryDataPtr data) {
-    Timer timer("OtterbrixManager::get_schema", log_);
-
+    OTX_ZONE_N("otterbrix::get_schema");
     log_->trace("get_schema id hash: {}", id);
 
     // Dependency-map values are indices 0..N-1; the schema cursor returned by

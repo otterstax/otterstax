@@ -59,4 +59,7 @@ RUN mkdir -p /app/mariadb2_init
 RUN mkdir -p /app/postgres_init
 RUN mkdir -p /app/clickhouse_init
 
+# Tracy profiler port — expose on the server side when profiling integration runs
+EXPOSE 8086
+
 CMD ["./startup.sh"]

@@ -5,6 +5,7 @@
 #include "catalog/catalog_manager.hpp"
 #include "utility/connection_uid.hpp"
 #include "utility/logger.hpp"
+#include "utility/tracy_profiler.hpp"
 
 #include <tuple>
 
@@ -33,6 +34,7 @@ namespace ch {
     void ConnectorManager::stop() { thread_pool_manager_.stop(); }
 
     std::string ConnectorManager::addConnection(connect_params connection_param, const std::string& uuid) {
+        OTX_ZONE_N("ch::ConnectorManager::addConnection");
         try {
             std::string addr = connection_param.host + ":" + std::to_string(connection_param.port);
 
@@ -60,6 +62,7 @@ namespace ch {
     }
 
     std::string ConnectorManager::addConnection(http_server::ChConnectionParams connection_param) {
+        OTX_ZONE_N("ch::ConnectorManager::addConnection(http)");
         connect_params params;
         log_->debug("Try add ClickHouse connection with alias: {}", connection_param.alias);
         log_->debug("Host: {}", connection_param.host);
@@ -81,6 +84,7 @@ namespace ch {
     }
 
     void ConnectorManager::removeConnection(const std::string& uuid) {
+        OTX_ZONE_N("ch::ConnectorManager::removeConnection");
         auto conn = connections_.find(uuid);
         if (conn == connections_.end()) {
             log_->error("Invalid connection uuid: {}", uuid);
@@ -106,6 +110,7 @@ namespace ch {
     void ConnectorManager::fetch_named_types(const std::string& uuid,
                                              const std::string& database,
                                              const std::string& table) {
+        OTX_ZONE_N("ch::ConnectorManager::fetch_named_types");
         auto conn = connections_.find(uuid);
         if (conn == connections_.end()) {
             log_->warn("fetch_named_types: no connection for uid={}", uuid);

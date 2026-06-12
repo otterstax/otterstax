@@ -364,7 +364,21 @@ namespace mysql {
             static_cast<int>(updated_data->otterbrix_params->external_nodes.size()),
             static_cast<int>(updated_data->backend_type));
 
-        if (updated_data->otterbrix_params->node->type() != logical_plan::node_type::aggregate_t) {
+        // a13 transformer output wraps table-referencing statements in a
+        // node_sequence_t whose data-producing node is the LAST child;
+        // planner-emitted sequences order children differently but never
+        // reach this path. Unwrap before the aggregate check below.
+        const logical_plan::node_t* schema_root = updated_data->otterbrix_params->node.get();
+        if (schema_root->type() == logical_plan::node_type::sequence_t) {
+            if (schema_root->children().empty()) {
+                log_->error("get_catalog_schema: sequence node has no children, cannot resolve schema");
+                co_return core::error_t(
+                    core::error_code_t::schema_error,
+                    std::pmr::string{"Sequence node has no children, cannot resolve schema", resource()});
+            }
+            schema_root = schema_root->children().back().get();
+        }
+        if (schema_root->type() != logical_plan::node_type::aggregate_t) {
             // node is not aggregate nor join - result is empty schema
             log_->debug("prepare_schema: node is not aggregate, returning empty schema");
             co_return std::move(updated_data);

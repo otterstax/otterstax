@@ -218,7 +218,21 @@ OtterbrixManager::get_schema(session_hash_t id,
         }
     }
 
-    if (data->otterbrix_params->node->type() != logical_plan::node_type::aggregate_t) {
+    // a13 transformer output wraps table-referencing statements in a
+    // node_sequence_t whose data-producing node is the LAST child;
+    // planner-emitted sequences order children differently but never reach
+    // this path. Unwrap before the aggregate check below.
+    const logical_plan::node_t* schema_root = data->otterbrix_params->node.get();
+    if (schema_root->type() == logical_plan::node_type::sequence_t) {
+        if (schema_root->children().empty()) {
+            log_->error("get_schema: sequence node has no children, cannot compute schema");
+            co_return core::error_t(
+                core::error_code_t::schema_error,
+                std::pmr::string{"Sequence node has no children, cannot compute schema", resource()});
+        }
+        schema_root = schema_root->children().back().get();
+    }
+    if (schema_root->type() != logical_plan::node_type::aggregate_t) {
         co_return std::make_pair(cursor::make_cursor(resource()), std::move(data));
     }
 
@@ -232,7 +246,7 @@ OtterbrixManager::get_schema(session_hash_t id,
     }
 
     auto schema = schema_utils::compute_otterbrix_schema(
-        static_cast<const logical_plan::node_aggregate_t&>(*data->otterbrix_params->node),
+        static_cast<const logical_plan::node_aggregate_t&>(*schema_root),
         data->otterbrix_params->params_node.get(),
         std::move(cursor_data),
         std::move(dependencies));

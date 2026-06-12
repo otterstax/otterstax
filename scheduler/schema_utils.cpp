@@ -123,10 +123,12 @@ namespace schema_utils {
             }
         }
 
-        // helper: find field type by name in schema_types
+        // helper: find field type by name in schema_types. Engine LIMIT-0
+        // schema probes can yield alias-less columns (null type extension) —
+        // alias() on those dereferences null, so they must be skipped.
         auto find_field_type = [&schema_types](const std::string& name) -> complex_logical_type {
             for (const auto& t : schema_types) {
-                if (t.alias() == name) {
+                if (t.has_alias() && t.alias() == name) {
                     return t;
                 }
             }

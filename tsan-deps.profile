@@ -18,12 +18,16 @@ include(default)
 otterbrix/*:compiler.version=12
 actor-zeta/*:compiler.version=12
 
+# -Wno-error=tsan: actor-zeta's cooperative_actor shutdown uses
+# std::atomic_thread_fence, which TSAN does not model; gcc-12's -Wtsan flags
+# it and the engine builds with -Werror. Keep it a visible warning until the
+# fences are replaced with atomic operations upstream.
 [conf]
 otterbrix/*:tools.build:compiler_executables={"c": "gcc-12", "cpp": "g++-12"}
 actor-zeta/*:tools.build:compiler_executables={"c": "gcc-12", "cpp": "g++-12"}
-otterbrix/*:tools.build:cxxflags=["-fsanitize=thread", "-g", "-fno-omit-frame-pointer"]
+otterbrix/*:tools.build:cxxflags=["-fsanitize=thread", "-g", "-fno-omit-frame-pointer", "-Wno-error=tsan"]
 otterbrix/*:tools.build:sharedlinkflags=["-fsanitize=thread"]
 otterbrix/*:tools.build:exelinkflags=["-fsanitize=thread"]
-actor-zeta/*:tools.build:cxxflags=["-fsanitize=thread", "-g", "-fno-omit-frame-pointer"]
+actor-zeta/*:tools.build:cxxflags=["-fsanitize=thread", "-g", "-fno-omit-frame-pointer", "-Wno-error=tsan"]
 actor-zeta/*:tools.build:sharedlinkflags=["-fsanitize=thread"]
 actor-zeta/*:tools.build:exelinkflags=["-fsanitize=thread"]

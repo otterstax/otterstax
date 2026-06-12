@@ -502,3 +502,314 @@ TEST_CASE("return empty test case") {
     REQUIRE(shared_data->status() == cv_wrapper::Status::Ok);
     REQUIRE(shared_data->get_result().chunk.empty() == true);
 }
+// ---------------------------------------------------------------------------
+// a13 sequence-root unwrap during schema resolution.
+//
+// The a13 transformer wraps table-referencing statements in a node_sequence_t
+// (catalog_resolve_* siblings first, the data-producing node LAST — see
+// maybe_wrap_with_catalog_resolve_table in components/sql/transformer).
+// CatalogManager::get_catalog_schema and OtterbrixManager::get_schema must
+// unwrap that root instead of silently returning an empty schema.
+// ---------------------------------------------------------------------------
+
+#include "otterbrix/config.hpp"
+#include "scheduler/schema_utils.hpp"
+
+#include <components/logical_plan/node_sequence.hpp>
+
+#include <filesystem>
+
+namespace {
+
+    template<typename Future>
+    void wait_until_ready(Future& future) {
+        using namespace std::chrono_literals;
+        for (int i = 0; i < 1000 && !future.is_ready(); ++i) {
+            std::this_thread::sleep_for(10ms);
+        }
+        REQUIRE(future.is_ready());
+    }
+
+    // Catalog actor graph with mocked connectors and a registered PostgreSQL
+    // connection "products" (pgdb/public/products) — shared by the
+    // sequence-unwrap catalog test cases below.
+    struct catalog_schema_fixture {
+        std::pmr::memory_resource* resource;
+        std::unique_ptr<db::OtterbrixManager, actor_zeta::pmr::deleter_t> otterbrix_manager;
+        std::unique_ptr<mysql::CatalogManager, actor_zeta::pmr::deleter_t> catalog_manager;
+        std::shared_ptr<mysql::ConnectorManager> mysql_conn_manager;
+        std::shared_ptr<pg::ConnectorManager> pg_conn_manager;
+        std::shared_ptr<ch::ConnectorManager> ch_conn_manager;
+        std::unique_ptr<db::MySQLManager, actor_zeta::pmr::deleter_t> mysql_connection_manager;
+        std::unique_ptr<db::PostgressManager, actor_zeta::pmr::deleter_t> pg_connection_manager;
+        std::unique_ptr<db::ClickhouseManager, actor_zeta::pmr::deleter_t> ch_connection_manager;
+
+        explicit catalog_schema_fixture(std::pmr::memory_resource* res)
+            : resource(res)
+            , otterbrix_manager(actor_zeta::spawn<db::OtterbrixManager>(
+                  res,
+                  std::make_unique<SimpleMockOtterbrixManager>(mock_config{.resource = res})))
+            , catalog_manager(actor_zeta::spawn<mysql::CatalogManager>(res, otterbrix_manager->address()))
+            , mysql_conn_manager(std::make_shared<mysql::ConnectorManager>(catalog_manager->address(),
+                                                                            mysql_mock_connector_factory(res)))
+            , pg_conn_manager(
+                  std::make_shared<pg::ConnectorManager>(catalog_manager->address(), pg_mock_connector_factory(res)))
+            , ch_conn_manager(
+                  std::make_shared<ch::ConnectorManager>(catalog_manager->address(), ch_mock_connector_factory(res)))
+            // Integration actors start the connector thread pools; addConnection
+            // below performs eager schema discovery and needs them running.
+            , mysql_connection_manager(actor_zeta::spawn<db::MySQLManager>(res, mysql_conn_manager))
+            , pg_connection_manager(actor_zeta::spawn<db::PostgressManager>(res, pg_conn_manager))
+            , ch_connection_manager(actor_zeta::spawn<db::ClickhouseManager>(res, ch_conn_manager)) {
+            catalog_manager->set_mysql_connector_manager(mysql_conn_manager);
+            catalog_manager->set_pg_connector_manager(pg_conn_manager);
+            catalog_manager->set_ch_connector_manager(ch_conn_manager);
+
+            http_server::PgConnectionParams pg_params;
+            pg_params.alias = "products";
+            pg_params.host = "localhost";
+            pg_params.port = "5432";
+            pg_params.username = "user";
+            pg_params.password = "pass";
+            pg_params.database = "pgdb";
+            pg_params.schema = "public";
+            pg_params.table = "products";
+            pg_conn_manager->addConnection(pg_params);
+        }
+    };
+
+} // namespace
+
+TEST_CASE("otterbrix get_schema: sequence-rooted SELECT resolves columns") {
+    const char* disk_path = "/tmp/otterstax_seq_get_schema";
+    std::filesystem::remove_all(disk_path);
+    auto cfg = make_create_config(disk_path);
+    auto inst = otterbrix::make_otterbrix(cfg);
+    auto* resource = inst->dispatcher()->resource();
+
+    {
+        // Local engine table the LIMIT 0 schema probe resolves against.
+        auto setup = make_otterbrix_manager(inst);
+        auto db_cursor = setup->execute_sql("CREATE DATABASE db1;");
+        REQUIRE(db_cursor);
+        REQUIRE_FALSE(db_cursor->is_error());
+        std::vector<components::table::column_definition_t> cols;
+        cols.emplace_back("campaign_id", types::complex_logical_type(types::logical_type::INTEGER));
+        cols.emplace_back("campaign_name", types::complex_logical_type(types::logical_type::STRING_LITERAL));
+        cols.emplace_back("budget", types::complex_logical_type(types::logical_type::DOUBLE));
+        components::catalog::oid_t oid = components::catalog::INVALID_OID;
+        auto create_cursor = setup->create_collection("db1", "campaigns", std::move(cols), oid);
+        REQUIRE(create_cursor);
+        REQUIRE_FALSE(create_cursor->is_error());
+    }
+
+    GreenplumParser parser(resource);
+    auto parsed = parser.parse("SELECT campaign_name, budget FROM db1.campaigns;");
+    REQUIRE_FALSE(parsed.has_error());
+    auto data = std::move(parsed.value());
+
+    // Transformer contract: sequence root, the aggregate consumer is LAST.
+    const auto& root = data->otterbrix_params->node;
+    REQUIRE(root->type() == logical_plan::node_type::sequence_t);
+    REQUIRE_FALSE(root->children().empty());
+    REQUIRE(root->children().back()->type() == logical_plan::node_type::aggregate_t);
+
+    std::pmr::map<qualified_name_t, size_t> dependencies(resource);
+    dependencies.emplace(
+        schema_utils::agg_key(static_cast<const logical_plan::node_aggregate_t&>(*root->children().back())),
+        0);
+
+    auto otterbrix_manager = actor_zeta::spawn<db::OtterbrixManager>(resource, make_otterbrix_manager(inst));
+    auto [needs_sched, future] = actor_zeta::send(otterbrix_manager->address(),
+                                                  &db::OtterbrixManager::get_schema,
+                                                  session_hash_t{1},
+                                                  std::move(dependencies),
+                                                  std::move(data));
+    wait_until_ready(future);
+    auto result = std::move(future).take_ready();
+    REQUIRE_FALSE(result.has_error());
+    auto [cursor, returned] = std::move(result.value());
+    REQUIRE(cursor);
+    REQUIRE_FALSE(cursor->is_error());
+    // Pre-unwrap this path silently returned an empty cursor (empty schema).
+    REQUIRE(cursor->size() == 1);
+    const auto& schema = cursor->type_data()[0];
+    REQUIRE(schema.type() == types::logical_type::STRUCT);
+    // The selected columns must be present. Their concrete types stay NA for
+    // now — the engine LIMIT-0 probe returns alias-less column types, so the
+    // SELECT-list lookup cannot match them by name yet.
+    REQUIRE(schema.child_types().size() == 2);
+    REQUIRE(schema.child_types()[0].alias() == "campaign_name");
+    REQUIRE(schema.child_types()[1].alias() == "budget");
+}
+
+TEST_CASE("otterbrix get_schema: non-aggregate plans keep the empty-schema contract") {
+    otterbrix::otterbrix_ptr otterbrix = init_otterbrix();
+    auto resource = otterbrix->dispatcher()->resource();
+    auto otterbrix_manager = actor_zeta::spawn<db::OtterbrixManager>(
+        resource,
+        std::make_unique<SimpleMockOtterbrixManager>(mock_config{.resource = resource}));
+    GreenplumParser parser(resource);
+
+    SECTION("non-sequence non-aggregate root -> empty schema, no error") {
+        auto parsed = parser.parse("SELECT campaign_name FROM db1.campaigns;");
+        REQUIRE_FALSE(parsed.has_error());
+        auto data = std::move(parsed.value());
+        data->otterbrix_params->node =
+            logical_plan::make_node_raw_data(resource, components::vector::data_chunk_t(resource, {}));
+
+        std::pmr::map<qualified_name_t, size_t> dependencies(resource);
+        auto [needs_sched, future] = actor_zeta::send(otterbrix_manager->address(),
+                                                      &db::OtterbrixManager::get_schema,
+                                                      session_hash_t{1},
+                                                      std::move(dependencies),
+                                                      std::move(data));
+        wait_until_ready(future);
+        auto result = std::move(future).take_ready();
+        REQUIRE_FALSE(result.has_error());
+        auto [cursor, returned] = std::move(result.value());
+        REQUIRE(cursor);
+        REQUIRE_FALSE(cursor->is_error());
+        REQUIRE(cursor->size() == 0);
+    }
+
+    SECTION("sequence whose last child is not an aggregate (CREATE) -> empty schema, no error") {
+        auto parsed = parser.parse("CREATE TABLE db1.newtable (id INT);");
+        REQUIRE_FALSE(parsed.has_error());
+        auto data = std::move(parsed.value());
+        REQUIRE(data->otterbrix_params->node->type() == logical_plan::node_type::sequence_t);
+        REQUIRE(data->otterbrix_params->node->children().back()->type() !=
+                logical_plan::node_type::aggregate_t);
+
+        std::pmr::map<qualified_name_t, size_t> dependencies(resource);
+        auto [needs_sched, future] = actor_zeta::send(otterbrix_manager->address(),
+                                                      &db::OtterbrixManager::get_schema,
+                                                      session_hash_t{1},
+                                                      std::move(dependencies),
+                                                      std::move(data));
+        wait_until_ready(future);
+        auto result = std::move(future).take_ready();
+        REQUIRE_FALSE(result.has_error());
+        auto [cursor, returned] = std::move(result.value());
+        REQUIRE(cursor);
+        REQUIRE_FALSE(cursor->is_error());
+        REQUIRE(cursor->size() == 0);
+    }
+
+    SECTION("sequence with no children -> error, not UB") {
+        auto parsed = parser.parse("SELECT campaign_name FROM db1.campaigns;");
+        REQUIRE_FALSE(parsed.has_error());
+        auto data = std::move(parsed.value());
+        data->otterbrix_params->node = logical_plan::node_ptr(new logical_plan::node_sequence_t(resource));
+
+        std::pmr::map<qualified_name_t, size_t> dependencies(resource);
+        auto [needs_sched, future] = actor_zeta::send(otterbrix_manager->address(),
+                                                      &db::OtterbrixManager::get_schema,
+                                                      session_hash_t{1},
+                                                      std::move(dependencies),
+                                                      std::move(data));
+        wait_until_ready(future);
+        auto result = std::move(future).take_ready();
+        REQUIRE(result.has_error());
+    }
+}
+
+TEST_CASE("catalog get_catalog_schema: sequence-rooted SELECT rewrites the external node") {
+    otterbrix::otterbrix_ptr otterbrix = init_otterbrix();
+    auto resource = otterbrix->dispatcher()->resource();
+    catalog_schema_fixture fx(resource);
+
+    GreenplumParser parser(resource);
+    auto parsed = parser.parse("SELECT id, name FROM products.pgdb.public.products;");
+    REQUIRE_FALSE(parsed.has_error());
+    auto data = std::move(parsed.value());
+
+    // Transformer contract: sequence root, the external aggregate is LAST.
+    REQUIRE(data->otterbrix_params->node->type() == logical_plan::node_type::sequence_t);
+    REQUIRE(data->otterbrix_params->external_nodes.size() == 1);
+    REQUIRE(data->otterbrix_params->external_nodes.front().size() == 1);
+    REQUIRE((*data->otterbrix_params->external_nodes.front().front().node)->type() ==
+            logical_plan::node_type::aggregate_t);
+
+    auto [needs_sched, future] = actor_zeta::send(fx.catalog_manager->address(),
+                                                  &mysql::CatalogManager::get_catalog_schema,
+                                                  session_hash_t{1},
+                                                  std::move(data));
+    wait_until_ready(future);
+    auto result = std::move(future).take_ready();
+    REQUIRE_FALSE(result.has_error());
+    auto updated = std::move(result.value());
+    REQUIRE(updated->backend_type == backend_type_t::PostgreSQL);
+
+    // Pre-unwrap the sequence root hit the empty-schema early return and the
+    // external aggregate was never rewritten into its schema node.
+    auto& entry = updated->otterbrix_params->external_nodes.front().front();
+    REQUIRE((*entry.node)->type() == logical_plan::node_type::unused);
+    const auto& schema = static_cast<schema_utils::schema_node_t&>(**entry.node).schema();
+    REQUIRE(schema.child_types().size() == 2);
+    REQUIRE(schema.child_types()[0].alias() == "id");
+    REQUIRE(schema.child_types()[1].alias() == "name");
+}
+
+TEST_CASE("catalog get_catalog_schema: non-aggregate plans keep the empty-schema contract") {
+    otterbrix::otterbrix_ptr otterbrix = init_otterbrix();
+    auto resource = otterbrix->dispatcher()->resource();
+    catalog_schema_fixture fx(resource);
+    GreenplumParser parser(resource);
+
+    SECTION("sequence whose last child is not an aggregate (CREATE) -> empty schema, no error") {
+        auto parsed = parser.parse("CREATE TABLE products.pgdb.public.newtable (id INT);");
+        REQUIRE_FALSE(parsed.has_error());
+        auto data = std::move(parsed.value());
+        REQUIRE(data->otterbrix_params->node->type() == logical_plan::node_type::sequence_t);
+        REQUIRE(data->otterbrix_params->node->children().back()->type() ==
+                logical_plan::node_type::create_collection_t);
+
+        auto [needs_sched, future] = actor_zeta::send(fx.catalog_manager->address(),
+                                                      &mysql::CatalogManager::get_catalog_schema,
+                                                      session_hash_t{2},
+                                                      std::move(data));
+        wait_until_ready(future);
+        auto result = std::move(future).take_ready();
+        REQUIRE_FALSE(result.has_error());
+        auto updated = std::move(result.value());
+        REQUIRE(updated->backend_type == backend_type_t::PostgreSQL);
+        REQUIRE(updated->otterbrix_params->node->children().back()->type() ==
+                logical_plan::node_type::create_collection_t);
+    }
+
+    SECTION("non-sequence non-aggregate root -> empty schema, no error") {
+        auto parsed = parser.parse("SELECT id, name FROM products.pgdb.public.products;");
+        REQUIRE_FALSE(parsed.has_error());
+        auto data = std::move(parsed.value());
+        data->otterbrix_params->node =
+            logical_plan::make_node_raw_data(resource, components::vector::data_chunk_t(resource, {}));
+        data->otterbrix_params->external_nodes.front().front().node = &data->otterbrix_params->node;
+
+        auto [needs_sched, future] = actor_zeta::send(fx.catalog_manager->address(),
+                                                      &mysql::CatalogManager::get_catalog_schema,
+                                                      session_hash_t{3},
+                                                      std::move(data));
+        wait_until_ready(future);
+        auto result = std::move(future).take_ready();
+        REQUIRE_FALSE(result.has_error());
+        auto updated = std::move(result.value());
+        REQUIRE(updated->otterbrix_params->node->type() == logical_plan::node_type::data_t);
+    }
+
+    SECTION("sequence with no children -> error, not UB") {
+        auto parsed = parser.parse("SELECT id, name FROM products.pgdb.public.products;");
+        REQUIRE_FALSE(parsed.has_error());
+        auto data = std::move(parsed.value());
+        data->otterbrix_params->node = logical_plan::node_ptr(new logical_plan::node_sequence_t(resource));
+        data->otterbrix_params->external_nodes.front().front().node = &data->otterbrix_params->node;
+
+        auto [needs_sched, future] = actor_zeta::send(fx.catalog_manager->address(),
+                                                      &mysql::CatalogManager::get_catalog_schema,
+                                                      session_hash_t{4},
+                                                      std::move(data));
+        wait_until_ready(future);
+        auto result = std::move(future).take_ready();
+        REQUIRE(result.has_error());
+    }
+}

@@ -9,6 +9,8 @@
 #include "utility/tracy_memory_resource.hpp"
 #include "utility/tracy_profiler.hpp"
 
+#include <algorithm>
+
 #include <components/logical_plan/node_aggregate.hpp>
 #include <components/logical_plan/node_catalog_resolve_table.hpp>
 #include <components/logical_plan/node_function.hpp>

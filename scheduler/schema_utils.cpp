@@ -5,6 +5,8 @@
 
 #include "utility/tracy_profiler.hpp"
 
+#include <algorithm>
+
 #include <core/result_wrapper.hpp>
 
 using namespace components;

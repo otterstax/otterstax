@@ -30,13 +30,26 @@ ARG BUILD_TYPE=Release
 ARG WITH_TRACY=false
 ARG WITH_PERF=false
 ARG BUILD_JOBS=0
+# TSAN_DEPS=true rebuilds otterbrix + actor-zeta from source with
+# -fsanitize=thread (see tsan-deps.profile). Without it the prebuilt engine's
+# atomics are invisible to TSAN and the sanitizer job has no diagnostic power.
+ARG TSAN_DEPS=false
 
 # Run conan install from the project root so self.source_folder=/app and
 # cmake_layout places generators + libs at build/${BUILD_TYPE}/ — matching
 # the devcontainer preset layout exactly.
 WORKDIR /app
-COPY conanfile.py .
-RUN if [ "$WITH_TRACY" = "true" ]; then \
+COPY conanfile.py tsan-deps.profile ./
+RUN if [ "$TSAN_DEPS" = "true" ]; then \
+        conan install conanfile.py --build missing \
+            --build="otterbrix/*" --build="actor-zeta/*" \
+            -pr:h ./tsan-deps.profile \
+            -s build_type=${BUILD_TYPE} \
+            -s compiler.cppstd=gnu20 \
+            -s 'clickhouse-cpp/*:compiler.cppstd=17' \
+            -s 'abseil/*:compiler.cppstd=17' \
+            -s 'grpc/*:compiler.cppstd=17'; \
+    elif [ "$WITH_TRACY" = "true" ]; then \
         conan install conanfile.py --build missing \
             -s build_type=${BUILD_TYPE} \
             -s compiler.cppstd=gnu20 \

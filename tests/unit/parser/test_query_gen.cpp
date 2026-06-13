@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2025-2026  OtterStax
 
+#include "otterbrix/parser/name_resolution.hpp"
 #include "otterbrix/parser/parser.hpp"
 #include "otterbrix/parser/subquery_extractor.hpp"
 #include "otterbrix/query_generation/sql_query_generator.hpp"
@@ -23,24 +24,42 @@ ParsedQueryDataPtr parse_or_die(GreenplumParser& p, const std::string& sql) {
     return std::move(r.value());
 }
 
+// One external slot: node + its parser-resolved target + owning batch index.
+struct flat_external_t {
+    components::logical_plan::node_ptr node;
+    otterstax::names::resolved_target_t target;
+    size_t batch{0};
+};
+
 // Collect all external nodes from all batches into a flat list.
-std::vector<components::logical_plan::node_ptr>
-flat_externals(const ParsedQueryDataPtr& parsed) {
-    std::vector<components::logical_plan::node_ptr> out;
-    for (const auto& batch : parsed->otterbrix_params->external_nodes)
-        for (auto* slot : batch)
-            out.push_back(*slot);
+std::vector<flat_external_t> flat_externals(const ParsedQueryDataPtr& parsed) {
+    std::vector<flat_external_t> out;
+    const auto& nodes = parsed->otterbrix_params->external_nodes;
+    for (size_t batch = 0; batch < nodes.size(); ++batch) {
+        for (size_t i = 0; i < nodes[batch].size(); ++i) {
+            // Every external slot must carry a plan-node reference.
+            REQUIRE(nodes[batch][i].node != nullptr);
+            out.push_back(flat_external_t{*nodes[batch][i].node, nodes[batch][i].target, batch});
+        }
+    }
     return out;
 }
 
 // Find the first node whose unique_identifier matches uid.
-components::logical_plan::node_ptr find_by_uid(
-    const std::vector<components::logical_plan::node_ptr>& nodes,
+flat_external_t find_by_uid(
+    const std::vector<flat_external_t>& nodes,
     const std::string& uid) {
     for (const auto& n : nodes)
-        if (n && n->collection_full_name().unique_identifier == uid)
+        if (n.node && n.target.name.unique_identifier == uid)
             return n;
     return {};
+}
+
+// The external entries of the batch a flat slot came from — generate_query
+// uses their targets to resolve the inner SELECT table of INSERT ... SELECT.
+const std::pmr::vector<external_entry_t>&
+batch_targets_of(const ParsedQueryDataPtr& parsed, const flat_external_t& slot) {
+    return parsed->otterbrix_params->external_nodes[slot.batch];
 }
 
 // Returns true when the node is a schema_node_t that carries raw SQL (stub path).
@@ -55,28 +74,29 @@ bool is_raw_sql_stub(const components::logical_plan::node_ptr& n) {
 // ── sql_gen::table_reference ──────────────────────────────────────────────────
 
 TEST_CASE("table_reference: MySQL uses database.collection") {
-    collection_full_name_t name{"bill", "", "orders"};
+    qualified_name_t name{"bill", "", "orders"};
     auto ref = sql_gen::table_reference(name, backend_type_t::MySQL);
-    REQUIRE(ref == "bill.orders");
+    REQUIRE(ref == "`bill`.`orders`");
 }
 
 TEST_CASE("table_reference: PostgreSQL uses schema.collection") {
-    collection_full_name_t name{"", "public", "products"};
+    qualified_name_t name{"", "public", "products"};
     auto ref = sql_gen::table_reference(name, backend_type_t::PostgreSQL);
-    REQUIRE(ref == "public.products");
+    REQUIRE(ref == "\"public\".\"products\"");
 }
 
-TEST_CASE("table_reference: ClickHouse uses schema.collection (same as PostgreSQL)") {
-    collection_full_name_t name{"", "events", "sessions"};
+TEST_CASE("table_reference: ClickHouse uses database.collection (same as MySQL)") {
+    // ClickHouse has no schema level: table_reference emits database.collection.
+    qualified_name_t name{"events", "", "sessions"};
     auto ref = sql_gen::table_reference(name, backend_type_t::ClickHouse);
-    REQUIRE(ref == "events.sessions");
+    REQUIRE(ref == "`events`.`sessions`");
 }
 
 TEST_CASE("table_reference: 2-arg constructor, MySQL") {
     // 2-arg ctor sets database=bill, collection=orders, schema=""
-    collection_full_name_t name{"bill", "orders"};
+    qualified_name_t name{"bill", "orders"};
     auto ref = sql_gen::table_reference(name, backend_type_t::MySQL);
-    REQUIRE(ref == "bill.orders");
+    REQUIRE(ref == "`bill`.`orders`");
 }
 
 // ── sql_gen::generate_query ───────────────────────────────────────────────────
@@ -95,15 +115,19 @@ TEST_CASE("generate_query: MySQL node produces db.collection reference") {
 
     auto nodes = flat_externals(parsed);
     auto mysql_node = find_by_uid(nodes, "mysql");
-    REQUIRE(mysql_node);
-    REQUIRE_FALSE(is_raw_sql_stub(mysql_node));
+    REQUIRE(mysql_node.node);
+    REQUIRE_FALSE(is_raw_sql_stub(mysql_node.node));
 
     const auto& params = parsed->otterbrix_params->params_node->parameters();
-    auto sql = sql_gen::generate_query(mysql_node, &params, backend_type_t::MySQL);
+    auto sql = sql_gen::generate_query(mysql_node.node,
+                                       &params,
+                                       backend_type_t::MySQL,
+                                       mysql_node.target,
+                                       batch_targets_of(parsed, mysql_node));
 
-    // MySQL table reference must be db.collection (no schema segment)
+    // MySQL table reference must be quoted db.collection (no schema segment)
     REQUIRE_FALSE(sql.empty());
-    REQUIRE(sql.find("bill.orders") != std::string::npos);
+    REQUIRE(sql.find("`bill`.`orders`") != std::string::npos);
     // 4-part qualifier must not leak into the generated SQL
     REQUIRE(sql.find("mysql.bill.schema.orders") == std::string::npos);
 }
@@ -120,15 +144,19 @@ TEST_CASE("generate_query: PostgreSQL node produces schema.collection reference"
 
     auto nodes = flat_externals(parsed);
     auto pg_node = find_by_uid(nodes, "pg");
-    REQUIRE(pg_node);
-    REQUIRE_FALSE(is_raw_sql_stub(pg_node));
+    REQUIRE(pg_node.node);
+    REQUIRE_FALSE(is_raw_sql_stub(pg_node.node));
 
     const auto& params = parsed->otterbrix_params->params_node->parameters();
-    auto sql = sql_gen::generate_query(pg_node, &params, backend_type_t::PostgreSQL);
+    auto sql = sql_gen::generate_query(pg_node.node,
+                                       &params,
+                                       backend_type_t::PostgreSQL,
+                                       pg_node.target,
+                                       batch_targets_of(parsed, pg_node));
 
-    // PostgreSQL table reference must be schema.collection
+    // PostgreSQL table reference must be quoted schema.collection
     REQUIRE_FALSE(sql.empty());
-    REQUIRE(sql.find("shop.products") != std::string::npos);
+    REQUIRE(sql.find("\"shop\".\"products\"") != std::string::npos);
     REQUIRE(sql.find("pg.shop.shop.products") == std::string::npos);
 }
 
@@ -142,15 +170,23 @@ TEST_CASE("generate_query: same node, different backends produce different refer
 
     auto nodes = flat_externals(parsed);
     auto n1 = find_by_uid(nodes, "uid1");
-    REQUIRE(n1);
+    REQUIRE(n1.node);
     const auto& params = parsed->otterbrix_params->params_node->parameters();
 
-    auto mysql_sql = sql_gen::generate_query(n1, &params, backend_type_t::MySQL);
-    auto pg_sql    = sql_gen::generate_query(n1, &params, backend_type_t::PostgreSQL);
+    auto mysql_sql = sql_gen::generate_query(n1.node,
+                                             &params,
+                                             backend_type_t::MySQL,
+                                             n1.target,
+                                             batch_targets_of(parsed, n1));
+    auto pg_sql    = sql_gen::generate_query(n1.node,
+                                             &params,
+                                             backend_type_t::PostgreSQL,
+                                             n1.target,
+                                             batch_targets_of(parsed, n1));
 
-    // MySQL: db1.test1   PG: sch1.test1
-    REQUIRE(mysql_sql.find("db1.test1")  != std::string::npos);
-    REQUIRE(pg_sql.find("sch1.test1")   != std::string::npos);
+    // MySQL: `db1`.`test1`   PG: "sch1"."test1"
+    REQUIRE(mysql_sql.find("`db1`.`test1`")        != std::string::npos);
+    REQUIRE(pg_sql.find("\"sch1\".\"test1\"")      != std::string::npos);
 }
 
 TEST_CASE("generate_query: stringstream overload produces the same output") {
@@ -164,18 +200,29 @@ TEST_CASE("generate_query: stringstream overload produces the same output") {
 
     auto nodes = flat_externals(parsed);
     auto mysql_node = find_by_uid(nodes, "mysql");
-    REQUIRE(mysql_node);
+    REQUIRE(mysql_node.node);
 
     const auto& params = parsed->otterbrix_params->params_node->parameters();
 
     // String overload
-    auto sql_str = sql_gen::generate_query(mysql_node, &params, backend_type_t::MySQL);
+    auto sql_str = sql_gen::generate_query(mysql_node.node,
+                                           &params,
+                                           backend_type_t::MySQL,
+                                           mysql_node.target,
+                                           batch_targets_of(parsed, mysql_node));
 
     // Stream overload
     std::stringstream ss;
-    sql_gen::generate_query(ss, mysql_node, &params, backend_type_t::MySQL);
+    sql_gen::generate_query(ss,
+                            mysql_node.node,
+                            &params,
+                            backend_type_t::MySQL,
+                            mysql_node.target,
+                            batch_targets_of(parsed, mysql_node));
 
-    REQUIRE(sql_str == ss.str());
+    // The string overload appends the statement terminator; the stream
+    // overload emits the bare statement so callers can keep composing.
+    REQUIRE(sql_str == ss.str() + ";");
 }
 
 // ── replace_qualifiers edge cases not covered in test_replace_qualifiers.cpp ──
@@ -188,8 +235,8 @@ TEST_CASE("replace_qualifiers: 3-part qualifier treated as db.schema.collection 
 
     REQUIRE(r.stubs.size() == 1);
     auto out = sql_gen::replace_qualifiers(r.stubs[0].raw_sql, r.stubs[0].qualifiers, backend_type_t::MySQL);
-    // After rewrite the 3-part name becomes db.collection for MySQL
-    REQUIRE(out.find("FROM bill.orders") != std::string::npos);
+    // After rewrite the 3-part name becomes quoted db.collection for MySQL
+    REQUIRE(out.find("FROM `bill`.`orders`") != std::string::npos);
     REQUIRE(out.find("mysql.bill.orders") == std::string::npos);
 }
 
@@ -203,8 +250,8 @@ TEST_CASE("replace_qualifiers: multiple qualifiers in one stub") {
     REQUIRE(r.stubs.size() == 1);
     auto out = sql_gen::replace_qualifiers(r.stubs[0].raw_sql, r.stubs[0].qualifiers, backend_type_t::MySQL);
     // Both 4-part names rewritten
-    REQUIRE(out.find("db.t1") != std::string::npos);
-    REQUIRE(out.find("db.t2") != std::string::npos);
+    REQUIRE(out.find("`db`.`t1`") != std::string::npos);
+    REQUIRE(out.find("`db`.`t2`") != std::string::npos);
     REQUIRE(out.find("mysql.db.sc.t1") == std::string::npos);
     REQUIRE(out.find("mysql.db.sc.t2") == std::string::npos);
 }

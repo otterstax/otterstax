@@ -11,12 +11,33 @@
 #include <boost/mysql.hpp>
 #include <boost/mysql/any_address.hpp>
 #include <boost/mysql/any_connection.hpp>
+#include <boost/mysql/detail/access.hpp>
+#include <boost/mysql/detail/ok_view.hpp>
+#include <boost/mysql/detail/resultset_encoding.hpp>
+#include <boost/mysql/diagnostics.hpp>
+#include <boost/mysql/metadata_mode.hpp>
 
 #include <iostream>
 #include <memory>
 #include <utility>
 
 namespace mysql {
+
+    // A valid, completed boost::mysql::results carrying a single OK packet
+    // (zero columns, zero rows). Lets the catalog's schema-discovery handler
+    // call results.meta() safely against the mock connector.
+    inline const boost::mysql::results& mock_ok_results() {
+        static const boost::mysql::results results = [] {
+            boost::mysql::results r;
+            auto& impl = boost::mysql::detail::access::get_impl(r);
+            impl.reset(boost::mysql::detail::resultset_encoding::text, boost::mysql::metadata_mode::minimal);
+            boost::mysql::diagnostics diag;
+            auto ec = impl.on_head_ok_packet(boost::mysql::detail::ok_view{0, 0, 0, 0, {}}, diag);
+            (void) ec;
+            return r;
+        }();
+        return results;
+    }
 
     class MockConnector : public mysql::IConnector {
     public:
@@ -95,10 +116,15 @@ namespace mysql {
             co_return 42;
         }
 
+        // Schema-discovery overload (CatalogManager::add_connection_schema).
+        // Always succeeds — registration must work even for connectors whose
+        // data path is configured to throw, mirroring a connection that came
+        // up healthy and only fails later at query time.
         asio::awaitable<otterstax::asio_error_t>
         runQuery(std::string_view query,
                  std::function<otterstax::asio_error_t(const boost::mysql::results&)> handler) override {
-            throw std::runtime_error("Unimplemented");
+            std::cout << "MockConnector running schema query: " << query << std::endl;
+            co_return handler(mock_ok_results());
         }
 
     private:

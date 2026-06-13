@@ -30,12 +30,17 @@ namespace pg {
         uint32_t reconnect_delay_ms{200};
         uint32_t max_reconnect_attempts{3};
 
+        // Per-attempt connect deadline (seconds); without it PQconnectdb can
+        // block the calling (HTTP API) thread until the OS TCP timeout.
+        uint32_t connect_timeout_s{10};
+
         std::string connection_string() const {
             return "host=" + host +
                    " port=" + std::to_string(port) +
                    " dbname=" + database +
                    " user=" + username +
-                   " password=" + password;
+                   " password=" + password +
+                   " connect_timeout=" + std::to_string(connect_timeout_s);
         }
     };
 

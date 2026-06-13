@@ -14,9 +14,6 @@
 #include <thread>
 
 using namespace db;
-using otterstax::error_code_t;
-using otterstax::error_tag_t;
-using otterstax::pipeline_error;
 
 MySQLManager::MySQLManager(std::pmr::memory_resource* res,
                                            std::shared_ptr<mysql::ConnectorManager> connector_manager)
@@ -58,7 +55,7 @@ actor_zeta::behavior_t MySQLManager::behavior(actor_zeta::mailbox::message* msg)
     }
 }
 
-actor_zeta::unique_future<otterstax::result<ParsedQueryDataPtr>>
+actor_zeta::unique_future<core::result_wrapper_t<ParsedQueryDataPtr>>
 MySQLManager::execute(session_hash_t id, ParsedQueryDataPtr data) {
     OTX_ZONE_N("MySQLManager::execute");
     assert(data);
@@ -77,24 +74,26 @@ MySQLManager::execute(session_hash_t id, ParsedQueryDataPtr data) {
         log_->debug("execute Execute batches: {}", data->otterbrix_params->external_nodes.size());
         // Execute queries
         size_t counter = 0;
-        for (auto it = data->otterbrix_params->external_nodes.rbegin();
-             it != data->otterbrix_params->external_nodes.rend();
-             ++it) {
+        auto& batches = data->otterbrix_params->external_nodes;
+        // Batches are processed back to front (innermost dependencies first).
+        for (size_t batch = batches.size(); batch-- > 0;) {
             OTX_ZONE_N("MySQLManager::batch");
-            log_->debug("execute Current batch size: {}", it->size());
+            auto& batch_nodes = batches[batch];
+            log_->debug("execute Current batch size: {}", batch_nodes.size());
             std::vector<std::string> generated_queries;
-            generated_queries.reserve(it->size());
+            generated_queries.reserve(batch_nodes.size());
             // wrapped in unique_ptr because data_chunk does not have a default constructor
             QueryHandleWaiter<std::unique_ptr<components::vector::data_chunk_t>> wait_guard{};
             // Order inside batch does not matter
             // Track which indices we processed (for mixed backend, we skip non-MySQL nodes)
             std::vector<size_t> processed_indices;
-            for (size_t i = 0; i < it->size(); i++) {
+            for (size_t i = 0; i < batch_nodes.size(); i++) {
                 OTX_ZONE_N("MySQLManager::node_dispatch");
                 log_->trace("Execute query: {}", ++counter);
 
-                auto& node = *(*it)[i];
-                const auto& uid = node->collection_full_name().unique_identifier;
+                auto& node = *batch_nodes[i].node;
+                const auto& target = batch_nodes[i].target;
+                const auto& uid = target.name.unique_identifier;
                 log_->trace("UID: {}", uid);
 
                 // For mixed backend: skip nodes that don't belong to MySQL
@@ -125,13 +124,17 @@ MySQLManager::execute(session_hash_t id, ParsedQueryDataPtr data) {
                         generated_queries.emplace_back(
                             sql_gen::generate_query(sn.agg_node(),
                                                     &data->otterbrix_params->params_node->parameters(),
-                                                    backend_type_t::MySQL));
+                                                    backend_type_t::MySQL,
+                                                    target,
+                                                    batch_nodes));
                     }
                 } else {
                     generated_queries.emplace_back(
                         sql_gen::generate_query(node,
                                                 &data->otterbrix_params->params_node->parameters(),
-                                                backend_type_t::MySQL));
+                                                backend_type_t::MySQL,
+                                                target,
+                                                batch_nodes));
                 }
                 log_->debug("execute Generated SQL Query: \"{}\"", generated_queries.back());
                 wait_guard.futures.push_back(
@@ -158,7 +161,7 @@ MySQLManager::execute(session_hash_t id, ParsedQueryDataPtr data) {
                 }
                 auto tmp = std::move(*wait_guard.results[j]);
                 auto data_node = logical_plan::make_node_raw_data(resource(), std::move(tmp));
-                *(*it)[i] = data_node;
+                *batch_nodes[i].node = data_node;
             }
         }
         log_->debug("execute finished");
@@ -171,12 +174,11 @@ MySQLManager::execute(session_hash_t id, ParsedQueryDataPtr data) {
                     err.what(),
                     err.code().value(),
                     err.get_diagnostics().server_message());
-        co_return pipeline_error(error_code_t::query_error, error_tag_t::sql_connection_manager, std::move(error_msg));
+        co_return core::error_t(core::error_code_t::other_error, std::pmr::string{error_msg.c_str(), resource()});
     } catch (const std::exception& e) {
-        co_return pipeline_error(error_code_t::internal_error, error_tag_t::sql_connection_manager, e.what());
+        co_return core::error_t(core::error_code_t::other_error, std::pmr::string{e.what(), resource()});
     } catch (...) {
-        co_return pipeline_error(error_code_t::internal_error,
-                                 error_tag_t::sql_connection_manager,
-                                 "MySQLManager::execute caught unknown exception");
+        co_return core::error_t(core::error_code_t::other_error,
+                                std::pmr::string{"MySQLManager::execute caught unknown exception", resource()});
     }
 }

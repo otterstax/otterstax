@@ -235,10 +235,10 @@ namespace tsl {
         return chunk;
     }
 
-    types::complex_logical_type pg_to_struct(PGresult* result) {
+    types::complex_logical_type pg_to_struct(std::pmr::memory_resource* resource, PGresult* result) {
         const int ncolumns = PQnfields(result);
 
-        std::vector<types::complex_logical_type> fields;
+        std::pmr::vector<types::complex_logical_type> fields(resource);
         fields.reserve(ncolumns);
 
         for (int col = 0; col < ncolumns; ++col) {
@@ -321,18 +321,18 @@ namespace tsl {
         return chunk;
     }
 
-    types::complex_logical_type pg_to_struct(PGresult* result, const pg_enum_oid_map& enum_oids) {
+    types::complex_logical_type
+    pg_to_struct(std::pmr::memory_resource* resource, PGresult* result, const pg_enum_oid_map& enum_oids) {
         const int ncolumns = PQnfields(result);
 
-        std::vector<types::complex_logical_type> fields;
+        std::pmr::vector<types::complex_logical_type> fields(resource);
         fields.reserve(ncolumns);
 
-        std::pmr::memory_resource* enum_arena = std::pmr::get_default_resource();
         for (int col = 0; col < ncolumns; ++col) {
             const char* column_name = PQfname(result, col);
             Oid column_type = PQftype(result, col);
 
-            if (auto enum_type = impl::try_make_enum_type(enum_arena, column_type, column_name, enum_oids)) {
+            if (auto enum_type = impl::try_make_enum_type(resource, column_type, column_name, enum_oids)) {
                 fields.emplace_back(*enum_type);
             } else {
                 auto translator = impl::to_local_translator(column_type, column_name);

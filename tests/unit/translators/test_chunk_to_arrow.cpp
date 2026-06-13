@@ -16,7 +16,7 @@ namespace {
 
 // Build a flat struct type with named scalar children for schema tests.
 complex_logical_type make_struct(std::vector<std::pair<std::string, logical_type>> cols) {
-    std::vector<complex_logical_type> fields;
+    std::pmr::vector<complex_logical_type> fields(std::pmr::get_default_resource());
     fields.reserve(cols.size());
     for (auto& [name, lt] : cols) {
         fields.emplace_back(lt);
@@ -86,7 +86,9 @@ TEST_CASE("to_arrow_schema(struct): non-STRUCT input (NA) produces empty schema"
 }
 
 TEST_CASE("to_arrow_schema(struct): empty struct produces zero-field schema") {
-    auto empty = complex_logical_type::create_struct("", {});
+    auto empty = complex_logical_type::create_struct(
+        "",
+        std::pmr::vector<complex_logical_type>(std::pmr::get_default_resource()));
     auto schema = to_arrow_schema(empty);
     REQUIRE(schema->num_fields() == 0);
 }
@@ -95,7 +97,7 @@ TEST_CASE("to_arrow_schema(struct): LIST child maps to arrow::list()") {
     auto inner = complex_logical_type{logical_type::INTEGER};
     auto list_t = complex_logical_type::create_list(inner, "items");
 
-    std::vector<complex_logical_type> fields{list_t};
+    std::pmr::vector<complex_logical_type> fields({list_t}, std::pmr::get_default_resource());
     auto struct_t = complex_logical_type::create_struct("", fields);
 
     auto schema = to_arrow_schema(struct_t);
@@ -108,7 +110,7 @@ TEST_CASE("to_arrow_schema(struct): ARRAY child maps to arrow::list()") {
     auto inner = complex_logical_type{logical_type::DOUBLE};
     auto arr_t = complex_logical_type::create_array(inner, 4, "coords");
 
-    std::vector<complex_logical_type> fields{arr_t};
+    std::pmr::vector<complex_logical_type> fields({arr_t}, std::pmr::get_default_resource());
     auto struct_t = complex_logical_type::create_struct("", fields);
 
     auto schema = to_arrow_schema(struct_t);
@@ -121,7 +123,7 @@ TEST_CASE("to_arrow_schema(struct): ARRAY child maps to arrow::list()") {
 TEST_CASE("to_arrow_schema(struct): nested STRUCT child maps to arrow::struct_()") {
     auto inner = make_struct({{"x", logical_type::INTEGER}, {"y", logical_type::DOUBLE}});
     inner.set_alias("point");
-    std::vector<complex_logical_type> fields{inner};
+    std::pmr::vector<complex_logical_type> fields({inner}, std::pmr::get_default_resource());
     auto outer = complex_logical_type::create_struct("", fields);
 
     auto schema = to_arrow_schema(outer);

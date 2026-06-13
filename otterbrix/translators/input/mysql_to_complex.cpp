@@ -9,9 +9,10 @@ using namespace components;
 using namespace components::types;
 
 namespace tsl {
-    complex_logical_type mysql_to_struct(const boost::mysql::metadata_collection_view& result) {
+    complex_logical_type mysql_to_struct(std::pmr::memory_resource* resource,
+                                         const boost::mysql::metadata_collection_view& result) {
         OTX_ZONE_N("tsl::mysql_to_struct");
-        std::vector<complex_logical_type> fields;
+        std::pmr::vector<complex_logical_type> fields(resource);
         fields.reserve(result.size());
 
         for (const auto& column : result) {

@@ -3,6 +3,8 @@
 
 #include "transaction_manager.hpp"
 
+#include <algorithm>
+
 namespace frontend::postgres {
     std::vector<std::vector<uint8_t>> transaction_manager::handle_begin(packet_writer& writer) {
         if (state_ != transaction_status::IDLE) {

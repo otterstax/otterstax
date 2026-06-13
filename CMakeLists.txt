@@ -110,8 +110,6 @@ set(${PROJECT_NAME}_HEADERS
         utility/timer.hpp
         utility/cv_wrapper.hpp
         utility/tsan_helper.hpp
-        utility/result.hpp
-        utility/pipeline_error.hpp
         utility/tracy_profiler.hpp
         utility/tracy_memory_resource.hpp
 
@@ -121,7 +119,8 @@ set(${PROJECT_NAME}_HEADERS
 set(${PROJECT_NAME}_SOURCES
 )
 
-add_library(lib_${PROJECT_NAME}
+# Header-only, so INTERFACE: an empty static archive fails to link (ar) on macOS.
+add_library(lib_${PROJECT_NAME} INTERFACE
     ${${PROJECT_NAME}_HEADERS}
     ${${PROJECT_NAME}_SOURCES}
 )
@@ -131,7 +130,7 @@ add_library(lib_${PROJECT_NAME}
 # set_property(TARGET otterbrix_${PROJECT_NAME} PROPERTY EXPORT_NAME ${PROJECT_NAME})
 
 target_link_libraries(
-    lib_${PROJECT_NAME} PUBLIC
+    lib_${PROJECT_NAME} INTERFACE
     flight_sql_server
     common_server
     mysql_server

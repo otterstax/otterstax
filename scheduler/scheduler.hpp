@@ -13,10 +13,10 @@
 #include "otterbrix/translators/output/chunk_to_arrow.hpp"
 #include "schema_utils.hpp"
 #include "utility/cv_wrapper.hpp"
-#include "utility/pipeline_error.hpp"
 #include "utility/session.hpp"
 #include "utility/session_payload.hpp"
-#include <components/catalog/catalog.hpp>
+
+#include <core/result_wrapper.hpp>
 
 #include <condition_variable>
 #include <iostream>

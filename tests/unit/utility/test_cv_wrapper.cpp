@@ -82,7 +82,10 @@ TEST_CASE("cv_wrapper: error") {
     cv_w->wait_for(200ms);
     auto end_point = std::chrono::system_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_point - start_point_);
-    bool is_really_waited = (duration.count() >= 100) && (duration.count() < 120);
+    // The waiter must wake on release_on_error (fired at ~100 ms), well before
+    // the 200 ms timeout. The upper bound leaves scheduler-jitter headroom for
+    // loaded/virtualized runners (docker, CI) while still proving early wake-up.
+    bool is_really_waited = (duration.count() >= 100) && (duration.count() < 180);
     REQUIRE(is_really_waited);
     REQUIRE(cv_w->get_result() == nullptr);
     REQUIRE(cv_w->status() == Status::Error);

@@ -5,6 +5,7 @@
 
 #include "mock_config.hpp"
 #include "otterbrix/operators/execute_plan.hpp"
+#include <components/catalog/catalog_oids.hpp>
 #include <iostream>
 #include <thread>
 
@@ -45,10 +46,35 @@ public:
         return cursor::make_cursor(config_.resource, std::move(chunk));
     }
 
+    // Positional schema contract: type_data()[i] is the STRUCT schema of
+    // dependency i (see OtterbrixManager::get_schema).
     components::cursor::cursor_t_ptr get_schema(const OtterbrixSchemaParams& otterbrix_params) override {
-        return cursor::make_cursor(std::pmr::get_default_resource());
+        std::pmr::vector<components::types::complex_logical_type> schemas(config_.resource);
+        schemas.reserve(otterbrix_params.size());
+        for (size_t i = 0; i < otterbrix_params.size(); ++i) {
+            schemas.push_back(components::types::complex_logical_type::create_struct(
+                "",
+                std::pmr::vector<components::types::complex_logical_type>(config_.resource)));
+        }
+        return cursor::make_cursor(config_.resource, std::move(schemas));
+    }
+
+    components::cursor::cursor_t_ptr execute_sql(const std::string& query) override {
+        std::cout << "Mock OtterbrixManager: execute_sql: " << query << std::endl;
+        return cursor::make_cursor(config_.resource);
+    }
+
+    components::cursor::cursor_t_ptr
+    create_collection(const std::string& database,
+                      const std::string& collection,
+                      std::vector<components::table::column_definition_t> columns,
+                      components::catalog::oid_t& out_oid) override {
+        std::cout << "Mock OtterbrixManager: create_collection: " << database << "." << collection << std::endl;
+        out_oid = next_oid_++;
+        return cursor::make_cursor(config_.resource);
     }
 
 private:
     mock_config config_;
+    components::catalog::oid_t next_oid_{components::catalog::FIRST_USER_OID};
 };

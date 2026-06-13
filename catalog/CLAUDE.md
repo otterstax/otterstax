@@ -23,7 +23,7 @@ Despite the `mysql::` namespace the class handles all three backend types.
 
 ## State
 
-- `components::catalog::catalog catalog_` — Otterbrix catalog component holding schema metadata
+- `otterstax::catalog::schema_store_t store_` — actor-confined mirror of external table schemas (qualified name + STRUCT, keyed by engine pg_class oid); the tables themselves are registered in the engine pg_catalog via `OtterbrixManager`, one engine database per connection uid (tracked in `registered_dbs_`)
 - `connection_registry_` (`unordered_map<uuid, ConnectionInfo>`) — guarded by `connection_registry_mtx_`; the sole source of truth for which UUID maps to which backend type
 - Three `ConnectorManager` shared_ptrs set via setters after construction (circular reference avoided — catalog is constructed first, managers pass catalog's address to their own constructors)
 

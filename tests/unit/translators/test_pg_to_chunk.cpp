@@ -38,7 +38,7 @@ TEST_CASE("pg_to_struct: empty PGresult produces empty STRUCT") {
     PGresultGuard g(PQmakeEmptyPGresult(nullptr, PGRES_TUPLES_OK));
     REQUIRE(g.res != nullptr);
 
-    auto s = tsl::pg_to_struct(g.res);
+    auto s = tsl::pg_to_struct(std::pmr::get_default_resource(), g.res);
 
     REQUIRE(s.type() == logical_type::STRUCT);
     REQUIRE(s.child_types().empty());
@@ -48,7 +48,7 @@ TEST_CASE("pg_to_struct (enum overload): empty PGresult produces empty STRUCT") 
     PGresultGuard g(PQmakeEmptyPGresult(nullptr, PGRES_TUPLES_OK));
     tsl::pg_enum_oid_map empty_map;
 
-    auto s = tsl::pg_to_struct(g.res, empty_map);
+    auto s = tsl::pg_to_struct(std::pmr::get_default_resource(), g.res, empty_map);
 
     REQUIRE(s.type() == logical_type::STRUCT);
     REQUIRE(s.child_types().empty());

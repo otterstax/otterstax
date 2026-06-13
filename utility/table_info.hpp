@@ -7,6 +7,6 @@
 #include <components/types/types.hpp>
 
 struct table_info {
-    collection_full_name_t name;
+    qualified_name_t name;
     components::types::complex_logical_type schema;
 };

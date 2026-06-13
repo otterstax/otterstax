@@ -1,9 +1,11 @@
 set(CATALOG_HEADERS
     catalog_manager.hpp
+    schema_store.hpp
 )
 
 set(CATALOG_SOURCES
     catalog_manager.cpp
+    schema_store.cpp
 )
 
 add_library(catalog

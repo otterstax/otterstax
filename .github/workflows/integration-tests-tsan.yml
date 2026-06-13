@@ -26,6 +26,7 @@ jobs:
           build-args: |
             BUILD_TYPE=Release
             ENABLE_TSAN=ON
+            TSAN_DEPS=true
           cache-from: type=gha,scope=tsan
           cache-to: type=gha,mode=max,scope=tsan
 

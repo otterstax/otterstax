@@ -30,10 +30,12 @@ namespace tsl {
                              const std::vector<clickhouse::Block>& blocks,
                              const std::unordered_map<std::string, std::string>& named_type_overrides);
 
-    components::types::complex_logical_type ch_to_struct(const clickhouse::Block& block);
+    components::types::complex_logical_type ch_to_struct(std::pmr::memory_resource* res,
+                                                         const clickhouse::Block& block);
 
     components::types::complex_logical_type
-    ch_to_struct(const clickhouse::Block& block,
+    ch_to_struct(std::pmr::memory_resource* res,
+                 const clickhouse::Block& block,
                  const std::unordered_map<std::string, std::string>& named_type_overrides);
 
 } // namespace tsl

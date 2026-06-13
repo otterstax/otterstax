@@ -4,6 +4,9 @@ set(${PROJECT_NAME}_SOURCES
     main.cpp
     test_scheduler.cpp
     test_logging.cpp
+    test_external_registration.cpp
+    test_engine_join_behavior.cpp
+    test_mixed_plan_engine.cpp
 )
 
 add_executable(${PROJECT_NAME} ${${PROJECT_NAME}_SOURCES})

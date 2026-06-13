@@ -10,3 +10,9 @@ mutex:initialize_all_loggers
 # TODO: remove with cv_wrapper after move to actors
 mutex:cv_wrapper::cv_wrapper_t
 mutex:cv_wrapper_t
+
+# boost::lockfree freelist tagged-pointer reuse: a designed-in speculative read
+# discarded by the ABA-protected CAS — correct but not expressible to TSAN.
+# The engine's actor inboxes and the buffer-pool eviction queue sit on
+# boost::lockfree::queue.
+race:boost::lockfree

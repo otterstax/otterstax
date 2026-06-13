@@ -39,7 +39,7 @@ TEST_CASE("ch_to_struct: schema extraction for primitive types") {
     block.AppendColumn("score", std::make_shared<clickhouse::ColumnFloat64>());
     block.AppendColumn("label", std::make_shared<clickhouse::ColumnString>());
 
-    auto s = tsl::ch_to_struct(block);
+    auto s = tsl::ch_to_struct(std::pmr::get_default_resource(), block);
 
     REQUIRE(s.type() == logical_type::STRUCT);
     REQUIRE(s.child_types().size() == 3);
@@ -55,7 +55,7 @@ TEST_CASE("ch_to_struct: schema extraction for primitive types") {
 }
 
 TEST_CASE("ch_to_struct: empty block produces empty STRUCT") {
-    auto s = tsl::ch_to_struct(clickhouse::Block{});
+    auto s = tsl::ch_to_struct(std::pmr::get_default_resource(), clickhouse::Block{});
     REQUIRE(s.type() == logical_type::STRUCT);
     REQUIRE(s.child_types().empty());
 }
@@ -172,7 +172,7 @@ TEST_CASE("ch_to_struct: Int64 and UInt32 columns") {
     block.AppendColumn("big",      std::make_shared<clickhouse::ColumnInt64>());
     block.AppendColumn("unsigned", std::make_shared<clickhouse::ColumnUInt32>());
 
-    auto s = tsl::ch_to_struct(block);
+    auto s = tsl::ch_to_struct(std::pmr::get_default_resource(), block);
 
     REQUIRE(s.child_types()[0].type() == logical_type::BIGINT);
     REQUIRE(s.child_types()[1].type() == logical_type::UINTEGER);

@@ -46,7 +46,10 @@ namespace mysql {
             connections_[uuid] = make_connector_(thread_pool_manager_.ctx(), connection_param, uuid);
             connections_[uuid]->connect();
 
-            collection_full_name_t name(uuid, connection_param.database, "", uuid);
+            // Empty collection → CatalogManager discovers every table of the
+            // configured database via information_schema (unified discovery
+            // contract; the alias is NOT a table name).
+            qualified_name_t name(uuid, connection_param.database, "", "");
             std::ignore = actor_zeta::send(catalog_manager_, &mysql::CatalogManager::add_connection_schema, std::move(name));
             return uuid;
         } catch (const boost::mysql::error_with_diagnostics& e) {

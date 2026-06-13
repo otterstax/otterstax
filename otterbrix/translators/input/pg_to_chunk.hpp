@@ -34,7 +34,8 @@ namespace tsl {
     data_chunk_t pg_to_chunk(std::pmr::memory_resource* res, PGresult* result, const pg_enum_oid_map& enum_oids);
 
     // Extract schema from PGresult (similar to mysql_to_struct)
-    components::types::complex_logical_type pg_to_struct(PGresult* result);
-    components::types::complex_logical_type pg_to_struct(PGresult* result, const pg_enum_oid_map& enum_oids);
+    components::types::complex_logical_type pg_to_struct(std::pmr::memory_resource* res, PGresult* result);
+    components::types::complex_logical_type
+    pg_to_struct(std::pmr::memory_resource* res, PGresult* result, const pg_enum_oid_map& enum_oids);
 
 } // namespace tsl

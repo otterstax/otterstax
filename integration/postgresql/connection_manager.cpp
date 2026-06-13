@@ -14,9 +14,6 @@
 #include <thread>
 
 using namespace db;
-using otterstax::error_code_t;
-using otterstax::error_tag_t;
-using otterstax::pipeline_error;
 
 PostgressManager::PostgressManager(std::pmr::memory_resource* res,
                                    std::shared_ptr<pg::ConnectorManager> connector_manager)
@@ -57,8 +54,8 @@ actor_zeta::behavior_t PostgressManager::behavior(actor_zeta::mailbox::message* 
     }
 }
 
-actor_zeta::unique_future<otterstax::result<ParsedQueryDataPtr>> PostgressManager::execute(session_hash_t id,
-                                                                                           ParsedQueryDataPtr data) {
+actor_zeta::unique_future<core::result_wrapper_t<ParsedQueryDataPtr>> PostgressManager::execute(session_hash_t id,
+                                                                                                ParsedQueryDataPtr data) {
     OTX_ZONE_N("PostgressManager::execute");
     assert(data);
     try {
@@ -72,23 +69,25 @@ actor_zeta::unique_future<otterstax::result<ParsedQueryDataPtr>> PostgressManage
 
         // Execute queries - ONLY fetch data, no JOIN operations
         size_t counter = 0;
-        for (auto it = data->otterbrix_params->external_nodes.rbegin();
-             it != data->otterbrix_params->external_nodes.rend();
-             ++it) {
+        auto& batches = data->otterbrix_params->external_nodes;
+        // Batches are processed back to front (innermost dependencies first).
+        for (size_t batch = batches.size(); batch-- > 0;) {
             OTX_ZONE_N("PostgressManager::batch");
-            log_->debug("execute Current batch size: {}", it->size());
+            auto& batch_nodes = batches[batch];
+            log_->debug("execute Current batch size: {}", batch_nodes.size());
             std::vector<std::string> generated_queries;
-            generated_queries.reserve(it->size());
+            generated_queries.reserve(batch_nodes.size());
             QueryHandleWaiter<std::unique_ptr<components::vector::data_chunk_t>> wait_guard{};
 
             // Track which indices we processed (for mixed backend, we skip non-PostgreSQL nodes)
             std::vector<size_t> processed_indices;
-            for (size_t i = 0; i < it->size(); i++) {
+            for (size_t i = 0; i < batch_nodes.size(); i++) {
                 OTX_ZONE_N("PostgressManager::node_dispatch");
                 log_->trace("Execute query: {}", ++counter);
 
-                auto& node = *(*it)[i];
-                const auto& uid = node->collection_full_name().unique_identifier;
+                auto& node = *batch_nodes[i].node;
+                const auto& target = batch_nodes[i].target;
+                const auto& uid = target.name.unique_identifier;
                 log_->trace("UID: {}", uid);
 
                 // Skip nodes that have already been processed (type is data_t - already fetched by another backend)
@@ -124,13 +123,17 @@ actor_zeta::unique_future<otterstax::result<ParsedQueryDataPtr>> PostgressManage
                         generated_queries.emplace_back(
                             sql_gen::generate_query(sn.agg_node(),
                                                     &data->otterbrix_params->params_node->parameters(),
-                                                    backend_type_t::PostgreSQL));
+                                                    backend_type_t::PostgreSQL,
+                                                    target,
+                                                    batch_nodes));
                     }
                 } else {
                     generated_queries.emplace_back(
                         sql_gen::generate_query(node,
                                                 &data->otterbrix_params->params_node->parameters(),
-                                                backend_type_t::PostgreSQL));
+                                                backend_type_t::PostgreSQL,
+                                                target,
+                                                batch_nodes));
                 }
                 log_->debug("execute Generated PostgreSQL Query: \"{}\"", generated_queries.back());
                 auto enum_oids = connector_manager_->enums_for(uid);
@@ -161,7 +164,7 @@ actor_zeta::unique_future<otterstax::result<ParsedQueryDataPtr>> PostgressManage
                 }
                 auto tmp = std::move(*wait_guard.results[j]);
                 auto data_node = logical_plan::make_node_raw_data(resource(), std::move(tmp));
-                *(*it)[i] = data_node;
+                *batch_nodes[i].node = data_node;
             }
         }
         log_->debug("execute finished");
@@ -169,10 +172,9 @@ actor_zeta::unique_future<otterstax::result<ParsedQueryDataPtr>> PostgressManage
     } catch (const std::exception& e) {
         std::string error_msg = "PostgressManager::execute caught exception: " + std::string(e.what());
         log_->error("execute caught exception: {}", e.what());
-        co_return pipeline_error(error_code_t::query_error, error_tag_t::pg_connection_manager, std::move(error_msg));
+        co_return core::error_t(core::error_code_t::other_error, std::pmr::string{error_msg.c_str(), resource()});
     } catch (...) {
-        co_return pipeline_error(error_code_t::internal_error,
-                                 error_tag_t::pg_connection_manager,
-                                 "PostgressManager::execute caught unknown exception");
+        co_return core::error_t(core::error_code_t::other_error,
+                                std::pmr::string{"PostgressManager::execute caught unknown exception", resource()});
     }
 }

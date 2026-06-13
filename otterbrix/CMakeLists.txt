@@ -6,6 +6,7 @@ set(OTTERBRIX_HEADERS
     translators/input/ch_to_chunk.hpp
     translators/output/chunk_to_arrow.hpp
     operators/execute_plan.hpp
+    parser/name_resolution.hpp
     parser/parser.hpp
     parser/subquery_extractor.hpp
     query_generation/sql_query_generator.hpp
@@ -19,6 +20,7 @@ set(OTTERBRIX_SOURCES
     translators/output/chunk_to_arrow.cpp
     translators/internal/doc_to_chunk.cpp
     operators/execute_plan.cpp
+    parser/name_resolution.cpp
     parser/parser.cpp
     parser/subquery_extractor.cpp
     query_generation/sql_query_generator.cpp

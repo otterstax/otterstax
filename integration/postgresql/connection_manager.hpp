@@ -9,9 +9,10 @@
 #include "connectors/postgresql/manager.hpp"
 #include "otterbrix/parser/parser.hpp"
 #include "scheduler/schema_utils.hpp"
-#include "utility/pipeline_error.hpp"
 #include "utility/session.hpp"
 #include "utility/tracy_profiler.hpp"
+
+#include <core/result_wrapper.hpp>
 
 #include <functional>
 #include <memory_resource>
@@ -31,8 +32,8 @@ namespace db {
         std::pmr::memory_resource* resource() const noexcept { return resource_; }
 
         /// handler coroutine — ONLY fetches data, does NOT perform JOIN
-        actor_zeta::unique_future<otterstax::result<ParsedQueryDataPtr>> execute(session_hash_t id,
-                                                                                 ParsedQueryDataPtr data);
+        actor_zeta::unique_future<core::result_wrapper_t<ParsedQueryDataPtr>> execute(session_hash_t id,
+                                                                                       ParsedQueryDataPtr data);
 
         using dispatch_traits = actor_zeta::dispatch_traits<&PostgressManager::execute>;
 

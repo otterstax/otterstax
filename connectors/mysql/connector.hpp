@@ -13,11 +13,13 @@
 #include <boost/mysql/results.hpp>
 
 #include <boost/asio/awaitable.hpp>
+#include <boost/asio/cancel_after.hpp>
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/executor_work_guard.hpp>
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/this_coro.hpp>
 #include <boost/asio/use_awaitable.hpp>
+#include <boost/asio/use_future.hpp>
 
 #include "otterbrix/translators/input/mysql_to_chunk.hpp"
 #include "utility/asio_error.hpp"
@@ -100,6 +102,17 @@ namespace mysql {
 
     private:
         log_t log_;
+
+        // Connect with a hard per-attempt deadline. The plain sync
+        // connect(params, ec, diag) performs blocking socket I/O on the calling
+        // thread with NO timeout: pointed at a non-MySQL server (e.g.
+        // PostgreSQL on 5432) both sides wait for the other's first packet and
+        // the call blocks until the remote auth timeout closes the socket —
+        // freezing the single HTTP API thread for minutes. The async op runs on
+        // the connector's io_context (pool started before any addConnection)
+        // and asio::cancel_after bounds it; use_future always becomes ready
+        // (success, error_code, or operation_aborted on timeout).
+        boost::system::error_code connectWithTimeout(boost::mysql::diagnostics& diag);
 
         template<typename Callable>
         requires std::invocable<Callable, const boost::mysql::results&>

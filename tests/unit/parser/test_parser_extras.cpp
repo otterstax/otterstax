@@ -48,7 +48,9 @@ TEST_CASE("parse: invalid SQL syntax returns error") {
 TEST_CASE("parse: incomplete statement returns error") {
     auto* resource = std::pmr::get_default_resource();
     GreenplumParser parser(resource);
-    auto r = parser.parse("SELECT");
+    // Note: a bare "SELECT" is VALID in the PostgreSQL grammar (empty target
+    // list), so an actually incomplete statement is used here.
+    auto r = parser.parse("SELECT id FROM");
     REQUIRE(r.has_error());
 }
 
@@ -142,11 +144,10 @@ TEST_CASE("parse: same UID in two tables → two batches, one node each") {
     REQUIRE(parsed->otterbrix_params->external_nodes[0].size() == 1);
     REQUIRE(parsed->otterbrix_params->external_nodes[1].size() == 1);
 
-    // Both nodes must carry the same uid
-    auto* n0 = parsed->otterbrix_params->external_nodes[0][0];
-    auto* n1 = parsed->otterbrix_params->external_nodes[1][0];
-    REQUIRE((*n0)->collection_full_name().unique_identifier == "uid1");
-    REQUIRE((*n1)->collection_full_name().unique_identifier == "uid1");
+    // Both nodes must carry the same uid (each external entry carries its
+    // resolved target — nodes themselves no longer carry names)
+    REQUIRE(parsed->otterbrix_params->external_nodes[0][0].target.name.unique_identifier == "uid1");
+    REQUIRE(parsed->otterbrix_params->external_nodes[1][0].target.name.unique_identifier == "uid1");
 }
 
 TEST_CASE("parse: different UIDs in two tables → one batch, two nodes") {

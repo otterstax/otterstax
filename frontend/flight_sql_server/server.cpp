@@ -18,6 +18,10 @@
 #include "../../utility/cv_wrapper.hpp"
 #include "../../utility/session.hpp"
 
+#include <boost/asio/co_spawn.hpp>
+#include <boost/asio/detached.hpp>
+#include <boost/asio/io_context.hpp>
+
 #include <tuple>
 
 #include <boost/mysql/results.hpp>
@@ -122,28 +126,35 @@ SimpleFlightSQLServer::GetFlightInfoStatement(const arrow::flight::ServerCallCon
     log_->debug("[GetFlightInfoStatement] Received query: {}", query);
     log_->debug("[GetFlightInfoStatement] Encoding ticket...");
     auto ticket = EncodeTransactionQuery({query, command.transaction_id, id.hash()}).ValueOrDie();
-    log_->debug("[GetFlightInfoStatement] Ticket encoded, creating cv_wrapper...");
+    log_->debug("[GetFlightInfoStatement] Encoded ticket, sending to scheduler...");
 
-    auto shared_data = create_cv_wrapper(session_payload(resource_));
-    log_->debug("[GetFlightInfoStatement] Sending to scheduler...");
-    std::ignore = actor_zeta::send(scheduler_address_, &Scheduler::prepare_schema, id.hash(), shared_data, query);
+    auto [needs_sched, fut] = actor_zeta::send(scheduler_address_, &Scheduler::prepare_schema, id.hash(), query);
+    (void) needs_sched; // sending to the Scheduler event-loop always returns needs_sched=false
     log_->debug("[GetFlightInfoStatement] Waiting for response...");
-    shared_data->wait_for(cv_wrapper::DEFAULT_TIMEOUT);
+    otterstax::result<session_payload> r{std::make_unique<session_payload>(resource_)};
+    boost::asio::io_context io;
+    boost::asio::co_spawn(
+        io,
+        [&]() -> boost::asio::awaitable<void> {
+            r = co_await otterstax::async_await_future<session_payload>(std::move(fut));
+        },
+        boost::asio::detached);
+    io.run();
 
-    if (shared_data->status() == cv_wrapper::Status::Ok) {
-        std::shared_ptr<arrow::Schema> schema = to_arrow_schema(shared_data->get_result().schema);
+    if (!r.has_error()) {
+        std::shared_ptr<arrow::Schema> schema = to_arrow_schema(r.take_value().schema);
         std::vector<arrow::flight::FlightEndpoint> endpoints{
             arrow::flight::FlightEndpoint{std::move(ticket), {}, std::nullopt, ""}};
 
         const bool ordered = false;
         auto result = arrow::flight::FlightInfo::Make(*schema, descriptor, endpoints, -1, -1, ordered).ValueOrDie();
         return std::make_unique<arrow::flight::FlightInfo>(result);
-    } else if (shared_data->status() == cv_wrapper::Status::Timeout) {
+    } else if (r.error().code == otterstax::error_code_t::timeout) {
         log_->warn("Timeout while preparing query: {}", query);
         return arrow::Status::Invalid("Timeout while preparing query: " + query);
     } else {
-        log_->error("Error while GetFlightInfoStatement: {}", shared_data->error_message());
-        return arrow::Status::Invalid("Error while GetFlightInfoStatement: " + shared_data->error_message());
+        log_->error("Error while GetFlightInfoStatement: {}", r.error().what);
+        return arrow::Status::Invalid("Error while GetFlightInfoStatement: " + r.error().what);
     }
 }
 
@@ -163,23 +174,32 @@ SimpleFlightSQLServer::DoGetStatement(const arrow::flight::ServerCallContext& co
                     query,
                     session_hash,
                     transaction_id);
-        auto shared_data = create_cv_wrapper(session_payload(resource_));
-        std::ignore = actor_zeta::send(scheduler_address_, &Scheduler::execute_statement, session_hash, shared_data);
-        shared_data->wait_for(cv_wrapper::DEFAULT_TIMEOUT);
+        auto [needs_sched, fut] =
+            actor_zeta::send(scheduler_address_, &Scheduler::execute_statement, session_hash);
+        (void) needs_sched; // sending to the Scheduler event-loop always returns needs_sched=false
+        otterstax::result<session_payload> r{std::make_unique<session_payload>(resource_)};
+        boost::asio::io_context io;
+        boost::asio::co_spawn(
+            io,
+            [&]() -> boost::asio::awaitable<void> {
+                r = co_await otterstax::async_await_future<session_payload>(std::move(fut));
+            },
+            boost::asio::detached);
+        io.run();
 
-        if (shared_data->status() == cv_wrapper::Status::Ok) {
-            auto sdata_result = shared_data->get_result();
+        if (!r.has_error()) {
+            session_payload sdata_result = r.take_value();
             log_->debug("[DOGET] Scheduler finished successfully, rows size: {}", sdata_result.chunk.size());
             auto schema = to_arrow_schema(sdata_result.schema);
             auto batch_reader = ChunkBatchReader::Make(std::move(schema), std::move(sdata_result.chunk)).ValueOrDie();
             log_->trace("[ARROW FLIGHT SERVER] Send data");
             return std::make_unique<arrow::flight::RecordBatchStream>(batch_reader);
-        } else if (shared_data->status() == cv_wrapper::Status::Timeout) {
+        } else if (r.error().code == otterstax::error_code_t::timeout) {
             log_->warn("Timeout while executing query: {}", query);
             return arrow::Status::Invalid("Timeout while executing query: " + query);
         } else {
-            log_->error("Error while DOGET: {}", shared_data->error_message());
-            return arrow::Status::Invalid("Error while DOGET: " + shared_data->error_message());
+            log_->error("Error while DOGET: {}", r.error().what);
+            return arrow::Status::Invalid("Error while DOGET: " + r.error().what);
         }
     } catch (const std::exception& e) {
         log_->error("Error: {}", e.what());
@@ -271,26 +291,34 @@ SimpleFlightSQLServer::DoPutCommandStatementUpdate(const arrow::flight::ServerCa
     try {
         // Log the received ticket, assuming the query is stored in the ticket
         log_->debug("Received query in ticket: {} Id: {}", command.query, command.transaction_id);
-        auto shared_data = create_cv_wrapper(session_payload(resource_));
         session_id id;
-        std::ignore = actor_zeta::send(scheduler_address_, &Scheduler::execute, id.hash(), shared_data, command.query);
-        shared_data->wait_for(cv_wrapper::DEFAULT_TIMEOUT);
-        auto sdata_result = shared_data->get_result();
+        auto [needs_sched, fut] =
+            actor_zeta::send(scheduler_address_, &Scheduler::execute, id.hash(), command.query);
+        (void) needs_sched; // sending to the Scheduler event-loop always returns needs_sched=false
+        otterstax::result<session_payload> r{std::make_unique<session_payload>(resource_)};
+        boost::asio::io_context io;
+        boost::asio::co_spawn(
+            io,
+            [&]() -> boost::asio::awaitable<void> {
+                r = co_await otterstax::async_await_future<session_payload>(std::move(fut));
+            },
+            boost::asio::detached);
+        io.run();
 
         int64_t affected_rows = 0;
 
-        if (shared_data->status() == cv_wrapper::Status::Ok) {
-            affected_rows = sdata_result.chunk.size();
+        if (!r.has_error()) {
+            affected_rows = r.take_value().chunk.size();
             log_->debug("[DoPutCommandStatementUpdate] Scheduler finished successfully, rows size: {}", affected_rows);
             log_->debug("[DoPutCommandStatementUpdate] Affected rows: {}", affected_rows);
             log_->trace("[ARROW FLIGHT SERVER] Send data");
             return affected_rows;
-        } else if (shared_data->status() == cv_wrapper::Status::Timeout) {
+        } else if (r.error().code == otterstax::error_code_t::timeout) {
             log_->warn("Timeout while executing query: {}", command.query);
             return arrow::Status::Invalid("Timeout while executing query: " + command.query);
         } else {
-            log_->error("Error while DoPutCommandStatementUpdate: {}", shared_data->error_message());
-            return arrow::Status::Invalid("Error while DoPutCommandStatementUpdate: " + shared_data->error_message());
+            log_->error("Error while DoPutCommandStatementUpdate: {}", r.error().what);
+            return arrow::Status::Invalid("Error while DoPutCommandStatementUpdate: " + r.error().what);
         }
     } catch (const boost::mysql::error_with_diagnostics& err) {
         // Some errors include additional diagnostics, like server-provided error messages.

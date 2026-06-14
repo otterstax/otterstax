@@ -54,7 +54,7 @@ class OtterStax(ConanFile):
         self.requires("actor-zeta/1.2.0@")
         self.requires("libpq/15.4")
         self.requires("yaml-cpp/0.7.0")
-        self.requires("clickhouse-cpp/2.5.1")
+        self.requires("clickhouse-cpp/2.6.1")
 
     def config_options(self):
         if self.settings.os == "Windows":

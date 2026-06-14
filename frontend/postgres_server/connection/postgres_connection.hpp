@@ -14,12 +14,17 @@
 #include "pipeline_state.hpp"
 #include "transaction_manager.hpp"
 
+#include "frontend/common/asio_future_bridge.hpp"
+#include "scheduler/result.hpp"
 #include "scheduler/scheduler.hpp"
+#include "utility/pipeline_error.hpp"
 #include "utility/session.hpp"
-#include "utility/session_payload.hpp"
 
 #include <actor-zeta.hpp>
 #include <boost/asio.hpp>
+#include <boost/asio/co_spawn.hpp>
+#include <boost/asio/detached.hpp>
+#include <boost/asio/io_context.hpp>
 #include <components/sql/parser/parser.h>
 #include <components/sql/transformer/utils.hpp>
 #include <components/types/types.hpp>

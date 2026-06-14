@@ -27,6 +27,16 @@ run_test() {
     if [ $rc -eq 0 ]; then
         echo "✅ PASSED: $test_name"
         ((PASSED++))
+        # Concurrency / stress tests report measurements that are worth keeping
+        # in the main run log. Other tests are noisy on success — keep them quiet.
+        case "$test_name" in
+            Concurrency|"Stress (optional)")
+                echo "--- $test_name output ---"
+                cat "$logfile" || true
+                echo "--- end output ---"
+                ;;
+        esac
+        rm -f "$logfile" || true
     else
         echo "❌ FAILED: $test_name (exit code $rc)"
         ((FAILED++))
@@ -93,6 +103,13 @@ run_test "FlightSQL Client (MySQL backend, mutable)" "test_flightsql_client_mysq
 # Cross-backend JOIN tests
 run_test "Cross-backend Queries (MySQL wire)" "test_cross_backend_queries.py"
 run_test "Cross-backend Queries (PostgreSQL wire)" "test_cross_backend_queries_pg.py"
+
+# Concurrency tests (sync-code regression net)
+run_test "Concurrency" "test_concurrency.py"
+
+# Stress tests are gated behind OTTERSTAX_RUN_STRESS=1; the script no-ops fast
+# when unset, so it's cheap to always invoke it here.
+run_test "Stress (optional)" "test_stress.py"
 
 echo ""
 echo "========================================="

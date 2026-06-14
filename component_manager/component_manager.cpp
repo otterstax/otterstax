@@ -5,6 +5,9 @@
 #include "utility/logger.hpp"
 #include "utility/tracy_profiler.hpp"
 
+#include <algorithm>
+#include <thread>
+
 ComponentManager::ComponentManager(const configuration::config& config)
     : otterbrix_(otterbrix::make_otterbrix(config))
     , resource_(otterbrix_->dispatcher()->resource())
@@ -53,8 +56,17 @@ ComponentManager::ComponentManager(const configuration::config& config)
 
     {
         OTX_ZONE_N("ComponentManager::spawn_scheduler");
+        // Work-sharing thread pool for the Worker actors: one Worker per pool
+        // thread; queries shard onto workers by session hash (id % worker_count).
+        const std::size_t worker_count = std::max<std::size_t>(2, std::thread::hardware_concurrency());
+        az_scheduler_ =
+            std::make_unique<actor_zeta::scheduler::sharing_scheduler>(worker_count, /*max_throughput*/ 1000);
+        az_scheduler_->start();
+
         scheduler_ = actor_zeta::spawn<Scheduler>(resource_,
-                                                   make_parser(resource_),
+                                                   az_scheduler_.get(),
+                                                   worker_count,
+                                                   &make_parser,
                                                    sql_connection_manager_->address(),
                                                    pg_connection_manager_->address(),
                                                    ch_connection_manager_actor_->address(),
@@ -68,6 +80,15 @@ ComponentManager::ComponentManager(const configuration::config& config)
         db_connector_manager_->start();
         pg_connector_manager_->start();
         ch_connector_manager_->start();
+    }
+}
+
+ComponentManager::~ComponentManager() {
+    // Stop the worker pool BEFORE any actor is destroyed: once stop() returns no
+    // pool thread will resume a Worker, so the Scheduler (event loop + workers) can
+    // be torn down safely during member destruction (supervisor lifecycle rule).
+    if (az_scheduler_) {
+        az_scheduler_->stop();
     }
 }
 

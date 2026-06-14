@@ -195,27 +195,32 @@ namespace frontend::mysql {
 
     void mysql_connection::handle_query(std::string query) {
         OTX_ZONE_N("mysql::handle_query");
-        auto shared_data = create_cv_wrapper(session_payload(resource_));
         session_id id;
         // todo: one execute() call for simplicity - use computed schema for text_resultset columns
-        std::ignore = actor_zeta::send(scheduler_, &Scheduler::execute, id.hash(), shared_data, query);
-        shared_data->wait_for(cv_wrapper::DEFAULT_TIMEOUT);
-        auto sdata_result = shared_data->get_result();
+        auto [needs_sched, fut] = actor_zeta::send(scheduler_, &Scheduler::execute, id.hash(), query);
+        (void) needs_sched; // sending to the Scheduler event-loop always returns needs_sched=false
+        otterstax::result<session_payload> r{std::make_unique<session_payload>(resource_)};
+        boost::asio::io_context io;
+        boost::asio::co_spawn(
+            io,
+            [&]() -> boost::asio::awaitable<void> {
+                r = co_await otterstax::async_await_future<session_payload>(std::move(fut));
+            },
+            boost::asio::detached);
+        io.run();
 
-        switch (shared_data->status()) {
-            case cv_wrapper::Status::Ok:
-                break;
-            case cv_wrapper::Status::Timeout:
-            case cv_wrapper::Status::Unknown:
+        if (r.has_error()) {
+            if (r.error().code == otterstax::error_code_t::timeout) {
                 send_error(mysql_error::ER_QUERY_TIMEOUT, "Query exceeded execution limit");
-                return;
-            case cv_wrapper::Status::Error:
+            } else {
                 // all connectors send "SET NAMES utf8mb4" and "SET AUTOCOMMIT=0" after auth, handle them separately
-                try_fix_variable_set_query(query, shared_data->error_message());
-                return;
+                try_fix_variable_set_query(query, r.error().what);
+            }
+            return;
         }
 
         // handle Ok
+        session_payload sdata_result = r.take_value();
         // empty db & table in metadata (not critical, but may be improved)
         if (sdata_result.chunk.column_count() == 0) {
             send_packet(build_ok(writer_, sequence_id_, sdata_result.chunk.size()));
@@ -288,25 +293,30 @@ namespace frontend::mysql {
 
     void mysql_connection::handle_prepared_stmt(std::string query) {
         OTX_ZONE_N("mysql::handle_prepared_stmt");
-        auto shared_data = create_cv_wrapper(session_payload(resource_));
         session_id id;
-        std::ignore = actor_zeta::send(scheduler_, &Scheduler::prepare_schema, id.hash(), shared_data, query);
-        shared_data->wait_for(cv_wrapper::DEFAULT_TIMEOUT);
+        auto [needs_sched, fut] = actor_zeta::send(scheduler_, &Scheduler::prepare_schema, id.hash(), query);
+        (void) needs_sched; // sending to the Scheduler event-loop always returns needs_sched=false
+        otterstax::result<session_payload> r{std::make_unique<session_payload>(resource_)};
+        boost::asio::io_context io;
+        boost::asio::co_spawn(
+            io,
+            [&]() -> boost::asio::awaitable<void> {
+                r = co_await otterstax::async_await_future<session_payload>(std::move(fut));
+            },
+            boost::asio::detached);
+        io.run();
 
-        switch (shared_data->status()) {
-            case cv_wrapper::Status::Ok:
-                break;
-            case cv_wrapper::Status::Timeout:
-            case cv_wrapper::Status::Unknown:
+        if (r.has_error()) {
+            if (r.error().code == otterstax::error_code_t::timeout) {
                 send_error(mysql_error::ER_QUERY_TIMEOUT, "Query exceeded execution limit");
-                return;
-            case cv_wrapper::Status::Error:
+            } else {
                 // ? case - postgres will not allow
-                try_fix_prepared_stmt(query, shared_data->error_message());
-                return;
+                try_fix_prepared_stmt(query, r.error().what);
+            }
+            return;
         }
 
-        auto result = shared_data->get_result();
+        session_payload result = r.take_value();
         std::vector<std::vector<uint8_t>> packets;
 
         uint16_t column_cnt = result.schema != types::logical_type::NA ? result.schema.child_types().size() : 0;
@@ -484,26 +494,29 @@ namespace frontend::mysql {
     void mysql_connection::handle_execute_stmt(session_hash_t id,
                                                std::pmr::vector<types::logical_value_t> param_values) {
         OTX_ZONE_N("mysql::handle_execute_stmt");
-        auto shared_data = create_cv_wrapper(session_payload(resource_));
-        std::ignore = actor_zeta::send(scheduler_,
-                                       &Scheduler::execute_prepared_statement,
-                                       id,
-                                       std::move(param_values),
-                                       shared_data);
-        shared_data->wait_for(cv_wrapper::DEFAULT_TIMEOUT);
-        auto sdata_result = shared_data->get_result();
+        auto [needs_sched, fut] =
+            actor_zeta::send(scheduler_, &Scheduler::execute_prepared_statement, id, std::move(param_values));
+        (void) needs_sched; // sending to the Scheduler event-loop always returns needs_sched=false
+        otterstax::result<session_payload> r{std::make_unique<session_payload>(resource_)};
+        boost::asio::io_context io;
+        boost::asio::co_spawn(
+            io,
+            [&]() -> boost::asio::awaitable<void> {
+                r = co_await otterstax::async_await_future<session_payload>(std::move(fut));
+            },
+            boost::asio::detached);
+        io.run();
 
-        switch (shared_data->status()) {
-            case cv_wrapper::Status::Ok:
-                break;
-            case cv_wrapper::Status::Timeout:
-            case cv_wrapper::Status::Unknown:
+        if (r.has_error()) {
+            if (r.error().code == otterstax::error_code_t::timeout) {
                 send_error(mysql_error::ER_QUERY_TIMEOUT, "Query exceeded execution limit");
-                return;
-            case cv_wrapper::Status::Error:
-                send_error(mysql_error::ER_SYNTAX_ERROR, shared_data->error_message());
-                return;
+            } else {
+                send_error(mysql_error::ER_SYNTAX_ERROR, r.error().what);
+            }
+            return;
         }
+
+        session_payload sdata_result = r.take_value();
 
         if (sdata_result.chunk.column_count() == 0) {
             send_packet(build_ok(writer_, sequence_id_, sdata_result.chunk.size()));

@@ -1,7 +1,7 @@
 set(SCHEDULER_HEADERS
     scheduler.hpp
     schema_utils.hpp
-    result.hpp
+    session_data.hpp
     worker.hpp
 )
 

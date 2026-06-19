@@ -11,11 +11,10 @@
 #include "../../integration/otterbrix/otterbrix_manager.hpp"
 #include "../../integration/sql/connection_manager.hpp"
 #include "../../otterbrix/config.hpp"
-#include "../../scheduler/result.hpp"
+#include "../../scheduler/session_data.hpp"
 #include "../../scheduler/scheduler.hpp"
 #include "../../utility/table_info.hpp"
 #include "../common/asio_future_bridge.hpp"
-#include "utility/pipeline_error.hpp"
 
 #include <boost/mysql/results.hpp>
 #include <components/log/log.hpp>

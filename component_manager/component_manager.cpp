@@ -8,6 +8,8 @@
 #include <algorithm>
 #include <thread>
 
+constexpr size_t MAX_THROUGHPUT = 1000; // MAX_THROUGHPUT is the maximum number of messages an actor will process before yielding to the scheduler. Setting it to a high value (or to std::numeric_limits<size_t>::max()) means actors will yield only when they have no more messages to process, which can improve performance for actors that process many messages in bursts but can lead to starvation of other actors if one actor receives a continuous stream of messages.
+
 ComponentManager::ComponentManager(const configuration::config& config)
     : otterbrix_(otterbrix::make_otterbrix(config))
     , resource_(otterbrix_->dispatcher()->resource())
@@ -60,7 +62,7 @@ ComponentManager::ComponentManager(const configuration::config& config)
         // thread; queries shard onto workers by session hash (id % worker_count).
         const std::size_t worker_count = std::max<std::size_t>(2, std::thread::hardware_concurrency());
         az_scheduler_ =
-            std::make_unique<actor_zeta::scheduler::sharing_scheduler>(worker_count, /*max_throughput*/ 1000);
+            std::make_unique<actor_zeta::scheduler::sharing_scheduler>(worker_count, MAX_THROUGHPUT);
         az_scheduler_->start();
 
         scheduler_ = actor_zeta::spawn<Scheduler>(resource_,

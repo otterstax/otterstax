@@ -18,10 +18,7 @@
 #include <exception>
 
 using namespace components;
-using otterstax::error_code_t;
-using otterstax::error_tag_t;
-using otterstax::pipeline_error;
-using otterstax::result;
+using core::error_code_t;
 
 Worker::Worker(std::pmr::memory_resource* res,
                std::size_t self_index,
@@ -67,7 +64,7 @@ actor_zeta::behavior_t Worker::behavior(actor_zeta::mailbox::message* msg) {
 // ─── Entry-point coroutines ───────────────────────────────────────────────────
 // Each entry point is wrapped in try/catch: the parser and the otterbrix engine
 // can throw, but an exception must never escape an actor (codex rule 9) — it is
-// converted to a typed pipeline_error and returned through the future.
+// converted to a core::error_t and returned through the future.
 
 actor_zeta::unique_future<Worker::session_result>
 Worker::execute(session_hash_t id, std::string sql) {
@@ -79,9 +76,8 @@ Worker::execute(session_hash_t id, std::string sql) {
         auto parsed = parser_->parse(sql);
         if (parsed.has_error()) {
             log_->error("Failed to parse SQL: {}", sql);
-            co_return pipeline_error{error_code_t::parse_error,
-                                     error_tag_t::scheduler,
-                                     std::string{parsed.error().what.c_str()}};
+            co_return core::error_t{error_code_t::sql_parse_error,
+                              std::pmr::string{parsed.error().what.c_str()}};
         }
 
         auto data = std::move(parsed.value());
@@ -97,9 +93,8 @@ Worker::execute(session_hash_t id, std::string sql) {
                                                              std::move(data));
             auto catalog_result = co_await std::move(catalog_future);
             if (catalog_result.has_error()) {
-                co_return pipeline_error{error_code_t::catalog_error,
-                                         error_tag_t::scheduler,
-                                         std::string{catalog_result.error().what.c_str()}};
+                co_return core::error_t{error_code_t::schema_error,
+                                  std::pmr::string{catalog_result.error().what.c_str()}};
             }
             update_metadata(id, std::move(catalog_result.value()));
         } else {
@@ -109,17 +104,15 @@ Worker::execute(session_hash_t id, std::string sql) {
 
         auto data_ptr = get_statement(id);
         if (!data_ptr) {
-            co_return pipeline_error{error_code_t::session_error,
-                                     error_tag_t::scheduler,
-                                     "No needed metadata found, unable to DoGet."};
+            co_return core::error_t{error_code_t::other_error,
+                              std::pmr::string{"No needed metadata found, unable to DoGet."}};
         }
 
         auto backend = get_backend_type(id);
         log_->debug("Worker::execute routing to backend_type: {}", static_cast<int>(backend));
         if (backend == backend_type_t::Unknown) {
-            co_return pipeline_error{error_code_t::backend_unknown,
-                                     error_tag_t::scheduler,
-                                     "Unknown backend type, cannot execute"};
+            co_return core::error_t{error_code_t::other_error,
+                              std::pmr::string{"backend_unknown: Unknown backend type, cannot execute"}};
         }
 
         if (backend == backend_type_t::MySQL || backend == backend_type_t::Mixed) {
@@ -129,9 +122,8 @@ Worker::execute(session_hash_t id, std::string sql) {
                                                          std::move(data_ptr));
             auto sql_result = co_await std::move(sql_future);
             if (sql_result.has_error()) {
-                co_return pipeline_error{error_code_t::query_error,
-                                         error_tag_t::sql_connection_manager,
-                                         std::string{sql_result.error().what.c_str()}};
+                co_return core::error_t{error_code_t::other_error,
+                                  std::pmr::string{sql_result.error().what.c_str()}};
             }
             data_ptr = std::move(sql_result.value());
 
@@ -142,9 +134,8 @@ Worker::execute(session_hash_t id, std::string sql) {
                                                            std::move(data_ptr));
                 auto pg_result = co_await std::move(pg_future);
                 if (pg_result.has_error()) {
-                    co_return pipeline_error{error_code_t::query_error,
-                                             error_tag_t::pg_connection_manager,
-                                             std::string{pg_result.error().what.c_str()}};
+                    co_return core::error_t{error_code_t::other_error,
+                                      std::pmr::string{pg_result.error().what.c_str()}};
                 }
                 data_ptr = std::move(pg_result.value());
 
@@ -154,9 +145,8 @@ Worker::execute(session_hash_t id, std::string sql) {
                                                            std::move(data_ptr));
                 auto ch_result = co_await std::move(ch_future);
                 if (ch_result.has_error()) {
-                    co_return pipeline_error{error_code_t::query_error,
-                                             error_tag_t::ch_connection_manager,
-                                             std::string{ch_result.error().what.c_str()}};
+                    co_return core::error_t{error_code_t::other_error,
+                                      std::pmr::string{ch_result.error().what.c_str()}};
                 }
                 data_ptr = std::move(ch_result.value());
             }
@@ -167,9 +157,8 @@ Worker::execute(session_hash_t id, std::string sql) {
                                                        std::move(data_ptr));
             auto pg_result = co_await std::move(pg_future);
             if (pg_result.has_error()) {
-                co_return pipeline_error{error_code_t::query_error,
-                                         error_tag_t::pg_connection_manager,
-                                         std::string{pg_result.error().what.c_str()}};
+                co_return core::error_t{error_code_t::other_error,
+                                  std::pmr::string{pg_result.error().what.c_str()}};
             }
             data_ptr = std::move(pg_result.value());
         } else if (backend == backend_type_t::ClickHouse) {
@@ -179,9 +168,8 @@ Worker::execute(session_hash_t id, std::string sql) {
                                                        std::move(data_ptr));
             auto ch_result = co_await std::move(ch_future);
             if (ch_result.has_error()) {
-                co_return pipeline_error{error_code_t::query_error,
-                                         error_tag_t::ch_connection_manager,
-                                         std::string{ch_result.error().what.c_str()}};
+                co_return core::error_t{error_code_t::other_error,
+                                  std::pmr::string{ch_result.error().what.c_str()}};
             }
             data_ptr = std::move(ch_result.value());
         }
@@ -192,18 +180,18 @@ Worker::execute(session_hash_t id, std::string sql) {
                                                    std::move(data_ptr->otterbrix_params));
         auto cursor = co_await std::move(ot_future);
         if (!cursor->is_success()) {
-            co_return pipeline_error{error_code_t::query_error,
-                                     error_tag_t::otterbrix_manager,
-                                     "Otterbrix execution failed: " + std::string{cursor->get_error().what.c_str()}};
+            co_return core::error_t{error_code_t::other_error,
+                              std::pmr::string{"Otterbrix execution failed: "} +
+                                  std::pmr::string{cursor->get_error().what.c_str()}};
         }
 
         auto& meta = get_metadata(id);
         session_payload payload{std::move(meta.schema), std::move(cursor->chunk_data()), 0, meta.tag};
         metadata_map_.erase(id);
-        co_return std::make_unique<session_payload>(std::move(payload));
+        co_return std::move(payload);
     } catch (const std::exception& e) {
         log_->error("Worker::execute caught exception: {}", e.what());
-        co_return pipeline_error{error_code_t::internal_error, error_tag_t::scheduler, std::string{e.what()}};
+        co_return core::error_t{error_code_t::other_error, std::pmr::string{e.what()}};
     }
 }
 
@@ -214,16 +202,14 @@ Worker::execute_statement(session_hash_t id) {
     try {
         const auto backend_type = get_backend_type(id);
         if (backend_type == backend_type_t::Unknown) {
-            co_return pipeline_error{error_code_t::backend_unknown,
-                                     error_tag_t::scheduler,
-                                     "Backend type is unknown, cannot execute statement."};
+            co_return core::error_t{error_code_t::other_error,
+                              std::pmr::string{"backend_unknown: Backend type is unknown, cannot execute statement."}};
         }
 
         auto data_ptr = get_statement(id);
         if (!data_ptr) {
-            co_return pipeline_error{error_code_t::session_error,
-                                     error_tag_t::scheduler,
-                                     "No needed metadata found, unable to DoGet."};
+            co_return core::error_t{error_code_t::other_error,
+                              std::pmr::string{"No needed metadata found, unable to DoGet."}};
         }
 
         if (backend_type == backend_type_t::MySQL || backend_type == backend_type_t::Mixed) {
@@ -233,9 +219,8 @@ Worker::execute_statement(session_hash_t id) {
                                                          std::move(data_ptr));
             auto sql_result = co_await std::move(sql_future);
             if (sql_result.has_error()) {
-                co_return pipeline_error{error_code_t::query_error,
-                                         error_tag_t::sql_connection_manager,
-                                         std::string{sql_result.error().what.c_str()}};
+                co_return core::error_t{error_code_t::other_error,
+                                  std::pmr::string{sql_result.error().what.c_str()}};
             }
             data_ptr = std::move(sql_result.value());
 
@@ -246,9 +231,8 @@ Worker::execute_statement(session_hash_t id) {
                                                            std::move(data_ptr));
                 auto pg_result = co_await std::move(pg_future);
                 if (pg_result.has_error()) {
-                    co_return pipeline_error{error_code_t::query_error,
-                                             error_tag_t::pg_connection_manager,
-                                             std::string{pg_result.error().what.c_str()}};
+                    co_return core::error_t{error_code_t::other_error,
+                                      std::pmr::string{pg_result.error().what.c_str()}};
                 }
                 data_ptr = std::move(pg_result.value());
 
@@ -258,9 +242,8 @@ Worker::execute_statement(session_hash_t id) {
                                                            std::move(data_ptr));
                 auto ch_result = co_await std::move(ch_future);
                 if (ch_result.has_error()) {
-                    co_return pipeline_error{error_code_t::query_error,
-                                             error_tag_t::ch_connection_manager,
-                                             std::string{ch_result.error().what.c_str()}};
+                    co_return core::error_t{error_code_t::other_error,
+                                      std::pmr::string{ch_result.error().what.c_str()}};
                 }
                 data_ptr = std::move(ch_result.value());
             }
@@ -271,9 +254,8 @@ Worker::execute_statement(session_hash_t id) {
                                                        std::move(data_ptr));
             auto pg_result = co_await std::move(pg_future);
             if (pg_result.has_error()) {
-                co_return pipeline_error{error_code_t::query_error,
-                                         error_tag_t::pg_connection_manager,
-                                         std::string{pg_result.error().what.c_str()}};
+                co_return core::error_t{error_code_t::other_error,
+                                  std::pmr::string{pg_result.error().what.c_str()}};
             }
             data_ptr = std::move(pg_result.value());
         } else if (backend_type == backend_type_t::ClickHouse) {
@@ -283,9 +265,8 @@ Worker::execute_statement(session_hash_t id) {
                                                        std::move(data_ptr));
             auto ch_result = co_await std::move(ch_future);
             if (ch_result.has_error()) {
-                co_return pipeline_error{error_code_t::query_error,
-                                         error_tag_t::ch_connection_manager,
-                                         std::string{ch_result.error().what.c_str()}};
+                co_return core::error_t{error_code_t::other_error,
+                                  std::pmr::string{ch_result.error().what.c_str()}};
             }
             data_ptr = std::move(ch_result.value());
         }
@@ -296,18 +277,18 @@ Worker::execute_statement(session_hash_t id) {
                                                    std::move(data_ptr->otterbrix_params));
         auto cursor = co_await std::move(ot_future);
         if (!cursor->is_success()) {
-            co_return pipeline_error{error_code_t::query_error,
-                                     error_tag_t::otterbrix_manager,
-                                     "Otterbrix execution failed: " + std::string{cursor->get_error().what.c_str()}};
+            co_return core::error_t{error_code_t::other_error,
+                              std::pmr::string{"Otterbrix execution failed: "} +
+                                  std::pmr::string{cursor->get_error().what.c_str()}};
         }
 
         auto& meta = get_metadata(id);
         session_payload payload{std::move(meta.schema), std::move(cursor->chunk_data()), 0, meta.tag};
         metadata_map_.erase(id);
-        co_return std::make_unique<session_payload>(std::move(payload));
+        co_return std::move(payload);
     } catch (const std::exception& e) {
         log_->error("Worker::execute_statement caught exception: {}", e.what());
-        co_return pipeline_error{error_code_t::internal_error, error_tag_t::scheduler, std::string{e.what()}};
+        co_return core::error_t{error_code_t::other_error, std::pmr::string{e.what()}};
     }
 }
 
@@ -323,15 +304,15 @@ Worker::execute_prepared_statement(session_hash_t id,
             binder.bind(i + 1, parameters.at(i));
         }
         if (auto bind_res = binder.finalize(); bind_res.has_error()) {
-            co_return pipeline_error{error_code_t::bind_error,
-                                     error_tag_t::scheduler,
-                                     "Argument binding failed: " + std::string{bind_res.error().what.c_str()}};
+            co_return core::error_t{error_code_t::invalid_parameter,
+                              std::pmr::string{"Argument binding failed: "} +
+                                  std::pmr::string{bind_res.error().what.c_str()}};
         }
 
         co_return co_await execute_statement(id);
     } catch (const std::exception& e) {
         log_->error("Worker::execute_prepared_statement caught exception: {}", e.what());
-        co_return pipeline_error{error_code_t::internal_error, error_tag_t::scheduler, std::string{e.what()}};
+        co_return core::error_t{error_code_t::other_error, std::pmr::string{e.what()}};
     }
 }
 
@@ -344,9 +325,8 @@ Worker::prepare_schema(session_hash_t id, std::string sql) {
 
         auto parsed = parser_->parse(sql);
         if (parsed.has_error()) {
-            co_return pipeline_error{error_code_t::parse_error,
-                                     error_tag_t::scheduler,
-                                     std::string{parsed.error().what.c_str()}};
+            co_return core::error_t{error_code_t::sql_parse_error,
+                              std::pmr::string{parsed.error().what.c_str()}};
         }
 
         auto parsed_data = std::move(parsed.value());
@@ -358,9 +338,8 @@ Worker::prepare_schema(session_hash_t id, std::string sql) {
                                                              std::move(parsed_data));
             auto catalog_result = co_await std::move(catalog_future);
             if (catalog_result.has_error()) {
-                co_return pipeline_error{error_code_t::catalog_error,
-                                         error_tag_t::scheduler,
-                                         std::string{catalog_result.error().what.c_str()}};
+                co_return core::error_t{error_code_t::schema_error,
+                                  std::pmr::string{catalog_result.error().what.c_str()}};
             }
             auto data = std::move(catalog_result.value());
 
@@ -396,9 +375,8 @@ Worker::prepare_schema(session_hash_t id, std::string sql) {
                                                             std::move(data));
             auto schema_result = co_await std::move(schema_future);
             if (schema_result.has_error()) {
-                co_return pipeline_error{error_code_t::schema_error,
-                                         error_tag_t::otterbrix_manager,
-                                         std::string{schema_result.error().what.c_str()}};
+                co_return core::error_t{error_code_t::schema_error,
+                                  std::pmr::string{schema_result.error().what.c_str()}};
             }
             auto [cursor, data_back] = std::move(schema_result.value());
             co_return finish_schema_value(id, std::move(cursor), std::move(data_back));
@@ -410,7 +388,7 @@ Worker::prepare_schema(session_hash_t id, std::string sql) {
         co_return finish_schema_value(id, std::move(cursor), std::move(metadata_map_[id].query_data_ptr));
     } catch (const std::exception& e) {
         log_->error("Worker::prepare_schema caught exception: {}", e.what());
-        co_return pipeline_error{error_code_t::internal_error, error_tag_t::scheduler, std::string{e.what()}};
+        co_return core::error_t{error_code_t::other_error, std::pmr::string{e.what()}};
     }
 }
 
@@ -420,9 +398,7 @@ Worker::session_result Worker::finish_schema_value(session_hash_t id,
                                                    cursor::cursor_t_ptr cursor,
                                                    ParsedQueryDataPtr data) {
     if (cursor->is_error()) {
-        return pipeline_error{error_code_t::schema_error,
-                              error_tag_t::scheduler,
-                              std::string{cursor->get_error().what.c_str()}};
+        return core::error_t{error_code_t::schema_error, std::pmr::string{cursor->get_error().what.c_str()}};
     }
     types::complex_logical_type schema;
     if (cursor->size()) {
@@ -431,7 +407,7 @@ Worker::session_result Worker::finish_schema_value(session_hash_t id,
     const size_t param_cnt = data->otterbrix_params->parameters_count;
     const NodeTag tag = data->tag;
     update_metadata(id, std::move(data), schema);
-    return std::make_unique<session_payload>(std::move(schema), data_chunk_t{resource(), {}, 0}, param_cnt, tag);
+    return session_payload{std::move(schema), data_chunk_t{resource(), {}, 0}, param_cnt, tag};
 }
 
 void Worker::update_metadata(session_hash_t id,

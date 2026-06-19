@@ -7,9 +7,8 @@
 #include <actor-zeta/scheduler/sharing_scheduler.hpp>
 #include <components/log/log.hpp>
 
-#include "scheduler/result.hpp"
+#include "scheduler/session_data.hpp"
 #include "scheduler/worker.hpp"
-#include "utility/pipeline_error.hpp"
 #include "utility/session.hpp"
 
 #include <atomic>
@@ -40,7 +39,7 @@ public:
     using is_cooperative_actor_type = void; // Required by actor_zeta::send() concept
     template<typename T>
     using unique_future = actor_zeta::unique_future<T>;
-    using session_result = otterstax::result<session_payload>;
+    using session_result = core::result_wrapper_t<session_payload>;
 
     // Stateless parser factory: a plain function pointer (NOT std::function —
     // codex rule 14) so production passes &make_parser and tests pass

@@ -80,7 +80,7 @@ namespace frontend::postgres {
         session_id id;
         auto [needs_sched, fut] = actor_zeta::send(scheduler_, &Scheduler::execute, id.hash(), query);
         (void) needs_sched; // sending to the Scheduler event-loop always returns needs_sched=false
-        otterstax::result<session_payload> r{std::make_unique<session_payload>(resource_)};
+        core::result_wrapper_t<session_payload> r{resource_};
         boost::asio::io_context io;
         boost::asio::co_spawn(
             io,
@@ -91,18 +91,18 @@ namespace frontend::postgres {
         io.run();
 
         if (r.has_error()) {
-            if (r.error().code == otterstax::error_code_t::timeout) {
+            if (r.error().what.starts_with("timeout")) {
                 send_error_response(sql_state::QUERY_CANCELED, "Query exceeded execution limit");
             } else {
                 // may be a transaction block, handle them separately
                 // todo: psycopg2's PREPARE & EXECUTE
-                try_handle_transaction(std::move(query), r.error().what);
+                try_handle_transaction(std::move(query), std::string{r.error().what.c_str()});
             }
             return;
         }
 
         // handle Ok
-        session_payload sdata_result = r.take_value();
+        session_payload sdata_result = std::move(r.value());
         int32_t rows_cnt = sdata_result.chunk.size();
         std::vector<std::vector<uint8_t>> response;
         if (sdata_result.chunk.column_count() > 0) {
@@ -204,7 +204,7 @@ namespace frontend::postgres {
         session_id id;
         auto [needs_sched, fut] = actor_zeta::send(scheduler_, &Scheduler::prepare_schema, id.hash(), query);
         (void) needs_sched; // sending to the Scheduler event-loop always returns needs_sched=false
-        otterstax::result<session_payload> r{std::make_unique<session_payload>(resource_)};
+        core::result_wrapper_t<session_payload> r{resource_};
         boost::asio::io_context io;
         boost::asio::co_spawn(
             io,
@@ -215,15 +215,15 @@ namespace frontend::postgres {
         io.run();
 
         if (r.has_error()) {
-            if (r.error().code == otterstax::error_code_t::timeout) {
+            if (r.error().what.starts_with("timeout")) {
                 send_error_response(sql_state::QUERY_CANCELED, "Query exceeded execution limit");
             } else {
-                send_error_response(sql_state::SYNTAX_ERROR, "Syntax error: " + r.error().what);
+                send_error_response(sql_state::SYNTAX_ERROR, "Syntax error: " + std::string{r.error().what.c_str()});
             }
             return;
         }
 
-        session_payload result = r.take_value();
+        session_payload result = std::move(r.value());
         log_->debug("[Connection {}] PARSE stmt: query: \"{}\", param_cnt={}",
                     connection_id_,
                     query,
@@ -457,7 +457,7 @@ namespace frontend::postgres {
                                                    stmt.stmt_session,
                                                    std::move(portal_meta.portal));
         (void) needs_sched; // sending to the Scheduler event-loop always returns needs_sched=false
-        otterstax::result<session_payload> r{std::make_unique<session_payload>(resource_)};
+        core::result_wrapper_t<session_payload> r{resource_};
         boost::asio::io_context io;
         boost::asio::co_spawn(
             io,
@@ -468,15 +468,15 @@ namespace frontend::postgres {
         io.run();
 
         if (r.has_error()) {
-            if (r.error().code == otterstax::error_code_t::timeout) {
+            if (r.error().what.starts_with("timeout")) {
                 send_error_response(sql_state::QUERY_CANCELED, "Query exceeded execution limit");
             } else {
-                send_error_response(sql_state::SYNTAX_ERROR, "Syntax error: " + r.error().what);
+                send_error_response(sql_state::SYNTAX_ERROR, "Syntax error: " + std::string{r.error().what.c_str()});
             }
             return;
         }
 
-        session_payload sdata_result = r.take_value();
+        session_payload sdata_result = std::move(r.value());
 
         // TODO: PortalSuspended
         int32_t rows_cnt = sdata_result.chunk.size();

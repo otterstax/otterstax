@@ -7,10 +7,11 @@
 #include <components/log/log.hpp>
 
 #include "otterbrix/parser/parser.hpp"
-#include "scheduler/result.hpp"
+#include "scheduler/session_data.hpp"
 #include "scheduler/schema_utils.hpp"
-#include "utility/pipeline_error.hpp"
 #include "utility/session.hpp"
+
+#include <core/result_wrapper.hpp>
 
 #include <memory>
 #include <memory_resource>
@@ -26,7 +27,7 @@ class Worker final : public actor_zeta::basic_actor<Worker> {
 public:
     template<typename T>
     using unique_future = actor_zeta::unique_future<T>;
-    using session_result = otterstax::result<session_payload>;
+    using session_result = core::result_wrapper_t<session_payload>;
 
     Worker(std::pmr::memory_resource* res,
            std::size_t self_index,

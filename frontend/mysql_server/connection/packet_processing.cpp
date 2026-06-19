@@ -199,7 +199,7 @@ namespace frontend::mysql {
         // todo: one execute() call for simplicity - use computed schema for text_resultset columns
         auto [needs_sched, fut] = actor_zeta::send(scheduler_, &Scheduler::execute, id.hash(), query);
         (void) needs_sched; // sending to the Scheduler event-loop always returns needs_sched=false
-        otterstax::result<session_payload> r{std::make_unique<session_payload>(resource_)};
+        core::result_wrapper_t<session_payload> r{resource_};
         boost::asio::io_context io;
         boost::asio::co_spawn(
             io,
@@ -210,17 +210,17 @@ namespace frontend::mysql {
         io.run();
 
         if (r.has_error()) {
-            if (r.error().code == otterstax::error_code_t::timeout) {
+            if (r.error().what.starts_with("timeout")) {
                 send_error(mysql_error::ER_QUERY_TIMEOUT, "Query exceeded execution limit");
             } else {
                 // all connectors send "SET NAMES utf8mb4" and "SET AUTOCOMMIT=0" after auth, handle them separately
-                try_fix_variable_set_query(query, r.error().what);
+                try_fix_variable_set_query(query, std::string{r.error().what.c_str()});
             }
             return;
         }
 
         // handle Ok
-        session_payload sdata_result = r.take_value();
+        session_payload sdata_result = std::move(r.value());
         // empty db & table in metadata (not critical, but may be improved)
         if (sdata_result.chunk.column_count() == 0) {
             send_packet(build_ok(writer_, sequence_id_, sdata_result.chunk.size()));
@@ -296,7 +296,7 @@ namespace frontend::mysql {
         session_id id;
         auto [needs_sched, fut] = actor_zeta::send(scheduler_, &Scheduler::prepare_schema, id.hash(), query);
         (void) needs_sched; // sending to the Scheduler event-loop always returns needs_sched=false
-        otterstax::result<session_payload> r{std::make_unique<session_payload>(resource_)};
+        core::result_wrapper_t<session_payload> r{resource_};
         boost::asio::io_context io;
         boost::asio::co_spawn(
             io,
@@ -307,16 +307,16 @@ namespace frontend::mysql {
         io.run();
 
         if (r.has_error()) {
-            if (r.error().code == otterstax::error_code_t::timeout) {
+            if (r.error().what.starts_with("timeout")) {
                 send_error(mysql_error::ER_QUERY_TIMEOUT, "Query exceeded execution limit");
             } else {
                 // ? case - postgres will not allow
-                try_fix_prepared_stmt(query, r.error().what);
+                try_fix_prepared_stmt(query, std::string{r.error().what.c_str()});
             }
             return;
         }
 
-        session_payload result = r.take_value();
+        session_payload result = std::move(r.value());
         std::vector<std::vector<uint8_t>> packets;
 
         uint16_t column_cnt = result.schema != types::logical_type::NA ? result.schema.child_types().size() : 0;
@@ -497,7 +497,7 @@ namespace frontend::mysql {
         auto [needs_sched, fut] =
             actor_zeta::send(scheduler_, &Scheduler::execute_prepared_statement, id, std::move(param_values));
         (void) needs_sched; // sending to the Scheduler event-loop always returns needs_sched=false
-        otterstax::result<session_payload> r{std::make_unique<session_payload>(resource_)};
+        core::result_wrapper_t<session_payload> r{resource_};
         boost::asio::io_context io;
         boost::asio::co_spawn(
             io,
@@ -508,15 +508,15 @@ namespace frontend::mysql {
         io.run();
 
         if (r.has_error()) {
-            if (r.error().code == otterstax::error_code_t::timeout) {
+            if (r.error().what.starts_with("timeout")) {
                 send_error(mysql_error::ER_QUERY_TIMEOUT, "Query exceeded execution limit");
             } else {
-                send_error(mysql_error::ER_SYNTAX_ERROR, r.error().what);
+                send_error(mysql_error::ER_SYNTAX_ERROR, std::string{r.error().what.c_str()});
             }
             return;
         }
 
-        session_payload sdata_result = r.take_value();
+        session_payload sdata_result = std::move(r.value());
 
         if (sdata_result.chunk.column_count() == 0) {
             send_packet(build_ok(writer_, sequence_id_, sdata_result.chunk.size()));

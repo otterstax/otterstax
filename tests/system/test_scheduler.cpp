@@ -7,7 +7,7 @@
 #include "integration/otterbrix/otterbrix_manager.hpp"
 #include "integration/postgresql/connection_manager.hpp"
 #include "integration/sql/connection_manager.hpp"
-#include "scheduler/result.hpp"
+#include "scheduler/session_data.hpp"
 #include "scheduler/scheduler.hpp"
 
 #include "../mock/ch_db_connector.hpp"
@@ -18,7 +18,6 @@
 #include "../mock/sql_db_connector.hpp"
 
 #include "utility/logger.hpp"
-#include "utility/pipeline_error.hpp"
 
 #include <actor-zeta.hpp>
 #include <actor-zeta/scheduler/sharing_scheduler.hpp>
@@ -60,11 +59,11 @@ namespace {
     // of signalling a shared_session_payload. Drive that future from the test
     // thread through the working-tree asio bridge (async_await_future: poll over
     // is_ready()/failed()/take_ready(); no blocking get(), no cancel()).
-    otterstax::result<session_payload>
-    await_session(actor_zeta::unique_future<otterstax::result<session_payload>> fut,
+    core::result_wrapper_t<session_payload>
+    await_session(actor_zeta::unique_future<core::result_wrapper_t<session_payload>> fut,
                   std::chrono::milliseconds timeout,
                   std::pmr::memory_resource* resource) {
-        otterstax::result<session_payload> r{std::make_unique<session_payload>(resource)};
+        core::result_wrapper_t<session_payload> r{resource};
         boost::asio::io_context local;
         boost::asio::co_spawn(
             local,
@@ -129,7 +128,7 @@ TEST_CASE("base test case") {
     auto r = await_session(std::move(fut), 5000ms, resource);
     std::cout << "[Main thread] " << std::this_thread::get_id() << " check data" << std::endl;
     REQUIRE(!r.has_error());
-    auto sp = r.take_value();
+    auto sp = std::move(r.value());
     REQUIRE(sp.chunk.size() == 2);
 
     az_scheduler->stop();
@@ -511,7 +510,7 @@ TEST_CASE("Cross-backend JOIN detection test case") {
     // The original assertion was `status() != cv_wrapper::Status::Unknown`: the
     // backend WAS resolved. The result<> equivalent is that we did not fail with
     // a backend_unknown error (success, or any other typed error, is acceptable).
-    REQUIRE_FALSE((r.has_error() && r.error().code == otterstax::error_code_t::backend_unknown));
+    REQUIRE_FALSE((r.has_error() && r.error().what.starts_with("backend_unknown")));
 
     az_scheduler->stop();
 }
@@ -568,7 +567,7 @@ TEST_CASE("return empty test case") {
     auto r = await_session(std::move(fut), 5000ms, resource);
     std::cout << "[Main thread] " << std::this_thread::get_id() << " check data" << std::endl;
     REQUIRE(!r.has_error());
-    auto sp = r.take_value();
+    auto sp = std::move(r.value());
     REQUIRE(sp.chunk.empty() == true);
 
     az_scheduler->stop();

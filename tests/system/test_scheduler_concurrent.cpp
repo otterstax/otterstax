@@ -7,7 +7,7 @@
 #include "integration/otterbrix/otterbrix_manager.hpp"
 #include "integration/postgresql/connection_manager.hpp"
 #include "integration/sql/connection_manager.hpp"
-#include "scheduler/result.hpp"
+#include "scheduler/session_data.hpp"
 #include "scheduler/scheduler.hpp"
 #include "utility/wait_barrier.hpp"
 
@@ -19,7 +19,6 @@
 #include "../mock/sql_db_connector.hpp"
 
 #include "utility/logger.hpp"
-#include "utility/pipeline_error.hpp"
 
 #include <actor-zeta.hpp>
 #include <actor-zeta/scheduler/sharing_scheduler.hpp>
@@ -68,11 +67,11 @@ namespace {
     // working-tree bridge (frontend/common/asio_future_bridge.hpp) exposes
     // async_await_future, an exception-free poll over the 1.2.0 future API
     // (is_ready()/failed()/take_ready() — no blocking get(), no cancel()).
-    otterstax::result<session_payload>
-    await_session(actor_zeta::unique_future<otterstax::result<session_payload>> fut,
+    core::result_wrapper_t<session_payload>
+    await_session(actor_zeta::unique_future<core::result_wrapper_t<session_payload>> fut,
                   std::chrono::milliseconds timeout,
                   std::pmr::memory_resource* resource) {
-        otterstax::result<session_payload> r{std::make_unique<session_payload>(resource)};
+        core::result_wrapper_t<session_payload> r{resource};
         boost::asio::io_context local;
         boost::asio::co_spawn(
             local,
@@ -145,7 +144,7 @@ TEST_CASE("scheduler handles N parallel sessions without hanging") {
 
     const std::string sql = "SELECT 1 AS test";
 
-    std::vector<actor_zeta::unique_future<otterstax::result<session_payload>>> futs;
+    std::vector<actor_zeta::unique_future<core::result_wrapper_t<session_payload>>> futs;
     futs.reserve(N);
 
     auto start = std::chrono::steady_clock::now();
@@ -157,7 +156,7 @@ TEST_CASE("scheduler handles N parallel sessions without hanging") {
                            .second);
     }
 
-    std::vector<otterstax::result<session_payload>> results;
+    std::vector<core::result_wrapper_t<session_payload>> results;
     results.reserve(N);
     for (size_t i = 0; i < N; ++i) {
         results.push_back(await_session(std::move(futs[i]), WAIT_TIMEOUT, resource));
@@ -247,7 +246,7 @@ TEST_CASE("slow MySQL connector does not starve other sessions") {
         std::chrono::duration_cast<std::chrono::milliseconds>(baseline_end - baseline_start).count();
 
     // SESSIONS in parallel.
-    std::vector<actor_zeta::unique_future<otterstax::result<session_payload>>> futs;
+    std::vector<actor_zeta::unique_future<core::result_wrapper_t<session_payload>>> futs;
     futs.reserve(SESSIONS);
     auto parallel_start = std::chrono::steady_clock::now();
     for (size_t i = 0; i < SESSIONS; ++i) {
@@ -257,7 +256,7 @@ TEST_CASE("slow MySQL connector does not starve other sessions") {
                                         std::string("SELECT 1"))
                            .second);
     }
-    std::vector<otterstax::result<session_payload>> results;
+    std::vector<core::result_wrapper_t<session_payload>> results;
     results.reserve(SESSIONS);
     for (size_t i = 0; i < SESSIONS; ++i) {
         results.push_back(await_session(std::move(futs[i]), WAIT_TIMEOUT, resource));

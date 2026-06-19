@@ -15,9 +15,8 @@
 #include "transaction_manager.hpp"
 
 #include "frontend/common/asio_future_bridge.hpp"
-#include "scheduler/result.hpp"
+#include "scheduler/session_data.hpp"
 #include "scheduler/scheduler.hpp"
-#include "utility/pipeline_error.hpp"
 #include "utility/session.hpp"
 
 #include <actor-zeta.hpp>

@@ -14,12 +14,16 @@
 #include "../packet/packet_writer.hpp"
 #include "../resultset/mysql_resultset.hpp"
 
+#include "frontend/common/asio_future_bridge.hpp"
+#include "scheduler/session_data.hpp"
 #include "scheduler/scheduler.hpp"
 #include "utility/session.hpp"
-#include "utility/session_payload.hpp"
 
 #include <actor-zeta.hpp>
 #include <boost/asio.hpp>
+#include <boost/asio/co_spawn.hpp>
+#include <boost/asio/detached.hpp>
+#include <boost/asio/io_context.hpp>
 #include <components/sql/parser/parser.h>
 #include <components/sql/transformer/utils.hpp>
 #include <iostream>

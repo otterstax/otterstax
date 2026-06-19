@@ -23,6 +23,7 @@
 class ComponentManager {
 public:
     explicit ComponentManager(const configuration::config& config);
+    ~ComponentManager();
     std::pmr::memory_resource* getResource();
     std::string getLogPath();
     std::shared_ptr<mysql::ConnectorManager> db_connection_manager() const;
@@ -55,6 +56,11 @@ private:
     std::unique_ptr<db::ClickhouseManager, actor_zeta::pmr::deleter_t> ch_connection_manager_actor_{
         nullptr,
         actor_zeta::pmr::deleter_t{getResource()}};
+    // The work-sharing thread pool that drives the Worker actors. Declared before
+    // scheduler_ so it outlives it: scheduler_ (workers + event loop) is destroyed
+    // first, the (already-stopped) pool after. Stopped in ~ComponentManager before
+    // any actor is destroyed.
+    std::unique_ptr<actor_zeta::scheduler::sharing_scheduler> az_scheduler_{nullptr};
     std::unique_ptr<Scheduler, actor_zeta::pmr::deleter_t> scheduler_{nullptr,
                                                                       actor_zeta::pmr::deleter_t{getResource()}};
 };

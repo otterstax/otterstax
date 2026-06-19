@@ -4,68 +4,68 @@
 #pragma once
 
 #include <actor-zeta.hpp>
+#include <actor-zeta/scheduler/sharing_scheduler.hpp>
 #include <components/log/log.hpp>
 
-#include "otterbrix/operators/execute_plan.hpp"
-#include "otterbrix/parser/parser.hpp"
-#include "otterbrix/query_generation/sql_query_generator.hpp"
-#include "otterbrix/translators/input/mysql_to_chunk.hpp"
-#include "otterbrix/translators/output/chunk_to_arrow.hpp"
-#include "schema_utils.hpp"
-#include "utility/cv_wrapper.hpp"
+#include "scheduler/session_data.hpp"
+#include "scheduler/worker.hpp"
 #include "utility/session.hpp"
-#include "utility/session_payload.hpp"
 
-#include <core/result_wrapper.hpp>
-
+#include <atomic>
+#include <boost/lockfree/queue.hpp>
 #include <condition_variable>
-#include <iostream>
 #include <memory>
 #include <memory_resource>
 #include <mutex>
-#include <string>
-#include <unordered_map>
-#include <unordered_set>
-#include <vector>
+#include <thread>
 
-// Forward declarations
-namespace mysql {
-    class ConnectorManager;
-    class CatalogManager;
-} // namespace mysql
-namespace pg {
-    class ConnectorManager;
-}
-namespace db {
-    class MySQLManager;
-    class PostgressManager;
-    class OtterbrixManager;
-} // namespace db
-
+// Scheduler — a thin session-affinity router over a pool of Worker actors,
+// modelled on otterbrix's services::dispatcher::manager_dispatcher_t.
+//
+// Two structural pieces:
+//   * the worker pool: N Worker actors spawned on the actor-zeta sharing_scheduler;
+//     a query keyed by session_hash always routes to workers_[id % N] (sticky), so
+//     prepared-statement state stays on one Worker and no state is shared (rules 10, 12).
+//   * the event loop: enqueue_impl (any sender thread) only delivers into the
+//     lock-free inbox_ and wakes loop_thread_; ALL behaviour processing — coroutine
+//     creation, continuation resume — happens on loop_thread_. This decouples the
+//     asio frontend threads from the work and removes the inline-pump yield-spin.
+//
+// Each handler is a coroutine that forwards to a Worker and co_returns the Worker's
+// result (future-of-future passthrough); the frontend awaits the resulting future
+// through frontend/common/asio_future_bridge.hpp.
 class Scheduler final : public actor_zeta::actor::actor_mixin<Scheduler> {
 public:
     using is_cooperative_actor_type = void; // Required by actor_zeta::send() concept
     template<typename T>
     using unique_future = actor_zeta::unique_future<T>;
+    using session_result = core::result_wrapper_t<session_payload>;
+
+    // Stateless parser factory: a plain function pointer (NOT std::function —
+    // codex rule 14) so production passes &make_parser and tests pass
+    // &make_mock_parser. Each Worker builds its own parser instance from it, so
+    // no parser object is shared between actors (rule 10).
+    using parser_factory_fn = parser_ptr (*)(std::pmr::memory_resource*);
 
     Scheduler(std::pmr::memory_resource* res,
-              std::unique_ptr<IParser> parser,
+              actor_zeta::scheduler_raw scheduler,
+              std::size_t worker_count,
+              parser_factory_fn parser_factory,
               actor_zeta::address_t sql_connection_manager,
               actor_zeta::address_t pg_connection_manager,
               actor_zeta::address_t ch_connection_manager,
               actor_zeta::address_t otterbrix_manager,
               actor_zeta::address_t catalog_manager);
+    ~Scheduler();
 
     std::pmr::memory_resource* resource() const noexcept { return resource_; }
 
-    /// entry-point handler coroutines
-    actor_zeta::unique_future<void> execute(session_hash_t id, shared_session_payload sdata, std::string sql);
-    actor_zeta::unique_future<void> execute_statement(session_hash_t id, shared_session_payload sdata);
-    actor_zeta::unique_future<void>
+    unique_future<session_result> execute(session_hash_t id, std::string sql);
+    unique_future<session_result> execute_statement(session_hash_t id);
+    unique_future<session_result>
     execute_prepared_statement(session_hash_t id,
-                               std::pmr::vector<components::types::logical_value_t> parameters,
-                               shared_session_payload sdata);
-    actor_zeta::unique_future<void> prepare_schema(session_hash_t id, shared_session_payload sdata, std::string sql);
+                               std::pmr::vector<components::types::logical_value_t> parameters);
+    unique_future<session_result> prepare_schema(session_hash_t id, std::string sql);
 
     using dispatch_traits = actor_zeta::dispatch_traits<&Scheduler::execute,
                                                         &Scheduler::execute_statement,
@@ -74,44 +74,31 @@ public:
 
     actor_zeta::behavior_t behavior(actor_zeta::mailbox::message* msg);
 
+    // Delivery-only: push into the lock-free inbox and wake loop_thread_. All
+    // processing happens on loop_thread_ (otterbrix dispatcher event-loop model).
     std::pair<bool, actor_zeta::detail::enqueue_result> enqueue_impl(actor_zeta::mailbox::message_ptr msg);
 
 private:
-    struct metadata_t {
-        components::types::complex_logical_type schema;
-        ParsedQueryDataPtr query_data_ptr;
-        NodeTag tag;
-        backend_type_t backend_type{backend_type_t::Unknown};
+    // One in-flight message in the event loop. The behavior coroutine holds a raw
+    // pointer into pending_msg across suspension, so pending_msg must outlive it.
+    struct in_flight_entry_t {
+        actor_zeta::mailbox::message_ptr pending_msg{};
+        actor_zeta::behavior_t behavior{};
     };
 
     std::pmr::memory_resource* resource_;
-    std::unordered_map<session_hash_t, shared_session_payload> shared_data_map_;
+    actor_zeta::scheduler_raw scheduler_;
     log_t log_;
-    std::unordered_map<session_hash_t, metadata_t> metadata_map_;
 
-    /// helper (extracted from old get_otterbrix_schema_finish)
-    void finish_schema(session_hash_t id, components::cursor::cursor_t_ptr cursor, ParsedQueryDataPtr data);
+    std::pmr::vector<std::unique_ptr<Worker, actor_zeta::pmr::deleter_t>> workers_;
+    std::pmr::vector<actor_zeta::address_t> worker_addresses_;
 
-    /// session management (unchanged)
-    void register_session(session_hash_t id, shared_session_payload sdata);
-    void update_metadata(session_hash_t id, ParsedQueryDataPtr metadata, types::complex_logical_type schema = {});
-    void complete_session(session_hash_t id, session_payload data, flightsql_session_type type);
-    void complete_session_on_error(session_hash_t id, std::string error_msg);
-    ParsedQueryDataPtr get_statement(session_hash_t id);
-    const metadata_t& get_metadata(session_hash_t id) const;
-    bool session_exists(session_hash_t id) const;
-    shared_session_payload get_session_payload(session_hash_t id) const;
-    void set_backend_type_otterbrix(session_hash_t id);
-    backend_type_t get_backend_type(session_hash_t id) const;
-
-    std::unique_ptr<IParser> parser_;
-    actor_zeta::address_t sql_connection_manager_;
-    actor_zeta::address_t pg_connection_manager_;
-    actor_zeta::address_t ch_connection_manager_;
-    actor_zeta::address_t otterbrix_manager_;
-    actor_zeta::address_t catalog_manager_;
-
-    mutable OTX_LOCKABLE_N(std::mutex, data_map_mtx_, "Scheduler::data_map_mtx");
-    OTX_LOCKABLE_N(std::mutex, mutex_, "Scheduler::mutex");
-    actor_zeta::behavior_t current_behavior_;
+    // Event-loop machinery: enqueue_impl delivers into inbox_ + notifies pump_cv_;
+    // loop_thread_ owns all processing. mutex_/pump_cv_ guard only the loop's idle
+    // sleep (infra synchronisation, not a data lock — codex rule 12).
+    std::thread loop_thread_;
+    std::atomic<bool> loop_running_{true};
+    boost::lockfree::queue<actor_zeta::mailbox::message*> inbox_{128};
+    std::mutex mutex_;
+    std::condition_variable pump_cv_;
 };

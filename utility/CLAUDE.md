@@ -29,14 +29,6 @@ if (sdata->status() == cv_wrapper::Status::Ok) { auto p = sdata->get_result(); }
 
 `shared_flight_data` is the older alias for the same pattern (now `shared_session_payload`); both exist during migration.
 
-### `result.hpp`
-
-`otterstax::result<T>` = `result_t<pipeline_error, T>` — a move-only Either type. Construct with a value for success or a `pipeline_error` for failure. Use `result.has_error()` / `result.value()` / `result.take_value()`. Use `convert_error<U>()` to propagate an error into a different result type without touching the value.
-
-### `pipeline_error.hpp`
-
-`pipeline_error` — the error type used throughout the actor pipeline. Implements `basic_error<ErrorCode, ErrorTag>`.
-
 ### `session.hpp`
 
 `session_hash_t` — the type alias for query session IDs threaded through all actors.

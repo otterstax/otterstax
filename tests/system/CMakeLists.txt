@@ -3,6 +3,7 @@ project(test_system)
 set(${PROJECT_NAME}_SOURCES
     main.cpp
     test_scheduler.cpp
+    test_scheduler_concurrent.cpp
     test_logging.cpp
     test_external_registration.cpp
     test_engine_join_behavior.cpp

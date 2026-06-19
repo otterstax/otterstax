@@ -14,5 +14,13 @@ mutex:cv_wrapper_t
 # boost::lockfree freelist tagged-pointer reuse: a designed-in speculative read
 # discarded by the ABA-protected CAS — correct but not expressible to TSAN.
 # The engine's actor inboxes and the buffer-pool eviction queue sit on
-# boost::lockfree::queue.
+# boost::lockfree::queue (including the Scheduler event-loop inbox_).
 race:boost::lockfree
+
+# Test mocks (tests/mock/parser.hpp, mock/otterbrix.hpp, mock/*_db_connector.hpp)
+# print debug lines to std::cout. With the Scheduler→Worker pool these now run on
+# several pool threads concurrently and race on the shared std::cout stream. This
+# is mock-only noise — production logging goes through thread-safe spdlog — and the
+# interleaved output is harmless.
+race:std::__1::__put_character_sequence
+race:std::__1::ios_base::width

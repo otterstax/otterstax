@@ -67,13 +67,16 @@ find_package(Arrow REQUIRED)
 find_package(otterbrix REQUIRED COMPONENTS log)
 find_package(actor-zeta REQUIRED)
 find_package(Catch2 2.13.7 REQUIRED)
-find_package(Boost 1.87.0 REQUIRED COMPONENTS
+find_package(Boost 1.88.0 REQUIRED COMPONENTS
     asio
     beast
     json
     program_options
     mysql
 )
+find_package(gRPC REQUIRED)
+find_package(Protobuf REQUIRED)
+find_package(asio-grpc REQUIRED)
 find_package(PostgreSQL REQUIRED)
 find_package(yaml-cpp REQUIRED)
 find_package(clickhouse-cpp REQUIRED)
@@ -141,7 +144,7 @@ target_link_libraries(
     # one of them pulls (e.g. integration/s3/s3_manager.o, referenced solely by
     # the Scheduler). RESCAN groups them (--start-group/--end-group) so the
     # linker re-pulls until the cycle is fully resolved.
-    "$<LINK_GROUP:RESCAN,flight_sql_server,common_server,mysql_server,postgres_server,catalog,connectors,s3,file,api_server,component_manager,integration,otterbrix_local,scheduler>"
+    "$<LINK_GROUP:RESCAN,flight_sql_server,common_server,mysql_server,postgres_server,spark_connect_server,catalog,connectors,s3,file,api_server,component_manager,integration,otterbrix_local,scheduler>"
     config::config
     arrow::arrow
     Boost::boost

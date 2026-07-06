@@ -18,6 +18,7 @@
 #include "frontend/flight_sql_server/server.hpp"
 #include "frontend/mysql_server/mysql_server.hpp"
 #include "frontend/postgres_server/postgres_server.hpp"
+#include "frontend/spark_connect_server/spark_connect_server.hpp"
 #include "otterbrix/config.hpp"
 #include "config/config.hpp"
 #include "utility/tracy_profiler.hpp"
@@ -136,6 +137,20 @@ int main(int argc, char* argv[]) {
     frontend::postgres::postgres_server postgres(postgres_config);
     postgres.start();
 
+    // Configure Spark Connect server
+    frontend::spark::SparkConnectServerConfig spark_config{
+        .host = server_config.spark_connect.host,
+        .port = server_config.spark_connect.port,
+        .resource = cmanager.getResource(),
+        .scheduler_address = cmanager.scheduler_address(),
+        .catalog_address = cmanager.catalog_address(),
+    };
+
+    log->info("Spark Connect Server running on port {}...", spark_config.port);
+    OTX_MESSAGE_L("startup: spark connect server starting");
+    frontend::spark::spark_connect_server spark_server(spark_config);
+    spark_server.start();
+
     // Start the Flight SQL server. Serve() blocks until SIGTERM is received
     // (registered via SetShutdownOnSignals inside Start()).
     OTX_MESSAGE_L("startup: flightsql server starting");
@@ -158,6 +173,9 @@ int main(int argc, char* argv[]) {
 
         postgres.stop();
         OTX_MESSAGE_L("shutdown: postgres server stopped");
+
+        spark_server.stop();
+        OTX_MESSAGE_L("shutdown: spark connect server stopped");
 
         log->info("Graceful shutdown complete.");
         OTX_MESSAGE_L("shutdown: complete");

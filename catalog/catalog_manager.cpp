@@ -80,6 +80,20 @@ namespace {
         return core::error_t(core::error_code_t::schema_error, std::move(msg));
     }
 
+    // Maps the connection-registry enum to the parser-level backend_type_t used
+    // by the Spark Connect catalog relations (and the rest of the pipeline).
+    backend_type_t to_backend_type(catalog_ext::ConnectionType ct) {
+        switch (ct) {
+            case catalog_ext::ConnectionType::MySQL:
+                return backend_type_t::MySQL;
+            case catalog_ext::ConnectionType::PostgreSQL:
+                return backend_type_t::PostgreSQL;
+            case catalog_ext::ConnectionType::ClickHouse:
+                return backend_type_t::ClickHouse;
+        }
+        return backend_type_t::Unknown;
+    }
+
 } // namespace
 
 namespace mysql {
@@ -170,6 +184,12 @@ namespace mysql {
             co_await actor_zeta::dispatch(this, &CatalogManager::remove_connection_schema, msg);
         } else if (cmd == actor_zeta::msg_id<CatalogManager, &CatalogManager::get_tables>) {
             co_await actor_zeta::dispatch(this, &CatalogManager::get_tables, msg);
+        } else if (cmd == actor_zeta::msg_id<CatalogManager, &CatalogManager::list_connections>) {
+            co_await actor_zeta::dispatch(this, &CatalogManager::list_connections, msg);
+        } else if (cmd == actor_zeta::msg_id<CatalogManager, &CatalogManager::list_tables>) {
+            co_await actor_zeta::dispatch(this, &CatalogManager::list_tables, msg);
+        } else if (cmd == actor_zeta::msg_id<CatalogManager, &CatalogManager::table_exists>) {
+            co_await actor_zeta::dispatch(this, &CatalogManager::table_exists, msg);
         }
     }
 
@@ -958,6 +978,57 @@ namespace mysql {
         });
 
         sdata->set_result(std::move(data));
+        co_return;
+    }
+
+    actor_zeta::unique_future<void>
+    CatalogManager::list_connections(shared_data<std::pmr::vector<catalog_ext::connection_info_t>> sdata) {
+        OTX_ZONE_N("catalog::list_connections");
+        std::pmr::vector<catalog_ext::connection_info_t> data(resource());
+        {
+            std::lock_guard lock(connection_registry_mtx_);
+            data.reserve(connection_registry_.size());
+            for (const auto& [uuid, info] : connection_registry_) {
+                data.push_back(catalog_ext::connection_info_t{uuid, to_backend_type(info.type)});
+            }
+        }
+        sdata->set_result(std::move(data));
+        co_return;
+    }
+
+    actor_zeta::unique_future<void>
+    CatalogManager::list_tables(std::string alias, shared_data<std::pmr::vector<table_info>> sdata) {
+        OTX_ZONE_N("catalog::list_tables");
+        std::pmr::vector<table_info> data(resource());
+        store_.for_each([&](const qualified_name_t& name,
+                            components::catalog::oid_t /*oid*/,
+                            const types::complex_logical_type& schema) {
+            if (name.unique_identifier != alias) {
+                return;
+            }
+            data.emplace_back(name);
+            data.back().schema = types::complex_logical_type::create_struct(
+                "",
+                std::pmr::vector<types::complex_logical_type>(schema.child_types().begin(),
+                                                              schema.child_types().end(),
+                                                              resource()));
+        });
+        sdata->set_result(std::move(data));
+        co_return;
+    }
+
+    actor_zeta::unique_future<void>
+    CatalogManager::table_exists(std::string alias, std::string table, shared_data<bool> sdata) {
+        OTX_ZONE_N("catalog::table_exists");
+        bool found = false;
+        store_.for_each([&](const qualified_name_t& name,
+                            components::catalog::oid_t /*oid*/,
+                            const types::complex_logical_type& /*schema*/) {
+            if (!found && name.unique_identifier == alias && name.collection == table) {
+                found = true;
+            }
+        });
+        sdata->set_result(found);
         co_return;
     }
 

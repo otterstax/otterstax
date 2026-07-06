@@ -1,0 +1,103 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2025-2026  OtterStax
+//
+// Unary RPC handler: AnalyzePlan.
+//
+// Dispatches the Schema variant through the Scheduler (prepare_schema →
+// to_spark_schema → release_session) and returns canned answers for the
+// remaining variants (spark_version, explain, is_local, is_streaming,
+// input_files, …). All variants end with rpc.finish(response, OK); error
+// paths use finish_with_error.
+
+#include "service.hpp"
+
+#include "await_future.hpp"
+#include "plan_translator/type_converter.hpp"
+#include "scheduler/scheduler.hpp"
+#include "utility/session.hpp"
+#include "utility/session_payload.hpp"
+
+#include <grpcpp/status.h>
+
+#include <string>
+#include <utility>
+
+namespace frontend::spark {
+
+boost::asio::awaitable<void, agrpc::GrpcExecutor>
+SparkConnectServiceImpl::handle_analyze_plan(
+    agrpc::ServerRPC<&sc::SparkConnectService::AsyncService::RequestAnalyzePlan>& rpc,
+    sc::AnalyzePlanRequest& request) {
+
+    sc::AnalyzePlanResponse response;
+    response.set_session_id(request.session_id());
+
+    switch (request.analyze_case()) {
+        case sc::AnalyzePlanRequest::kSchema: {
+            const auto& plan = request.schema().plan();
+            if (!plan.has_command() || !plan.command().has_sql_command()) {
+                co_await rpc.finish_with_error(grpc::Status(
+                    grpc::StatusCode::UNIMPLEMENTED,
+                    "Schema analysis for Relation plans not yet implemented"));
+                co_return;
+            }
+
+            std::string sql = plan.command().sql_command().sql();
+
+            session_id id;
+            const auto hash = id.hash();
+
+            auto prepare_fut = std::move(
+                actor_zeta::send(scheduler_address_,
+                                 &Scheduler::prepare_schema,
+                                 hash,
+                                 std::move(sql))
+                    .second);
+
+            auto prepare_result =
+                co_await await_future<session_payload>(std::move(prepare_fut));
+
+            if (prepare_result.has_error()) {
+                co_await rpc.finish_with_error(grpc::Status(
+                    grpc::StatusCode::INTERNAL,
+                    prepare_result.error().what.c_str()));
+                co_return;
+            }
+
+            *response.mutable_schema()->mutable_schema() =
+                to_spark_schema(prepare_result.value().schema);
+
+            // Fire-and-forget: release the ephemeral schema-prep session so the
+            // Scheduler's metadata_map_ entry is cleaned up.
+            [[maybe_unused]] auto release = actor_zeta::send(
+                scheduler_address_, &Scheduler::release_session, hash);
+            break;
+        }
+        case sc::AnalyzePlanRequest::kSparkVersion:
+            response.mutable_spark_version()->set_version("4.0.0");
+            break;
+        case sc::AnalyzePlanRequest::kExplain:
+            response.mutable_explain()->set_explain_string("EXPLAIN not supported");
+            break;
+        case sc::AnalyzePlanRequest::kIsLocal:
+            response.mutable_is_local()->set_is_local(false);
+            break;
+        case sc::AnalyzePlanRequest::kIsStreaming:
+            response.mutable_is_streaming()->set_is_streaming(false);
+            break;
+        case sc::AnalyzePlanRequest::kInputFiles:
+            // Empty files list.
+            break;
+        default:
+            // For all other variants (tree_string, ddl_parse, same_semantics,
+            // semantic_hash, persist, unpersist, get_storage_level, json_to_ddl,
+            // ANALYZE_NOT_SET) set a minimal valid oneof to avoid the
+            // "No analyze result found!" client-side error.
+            response.mutable_is_local()->set_is_local(false);
+            break;
+    }
+
+    co_await rpc.finish(response, grpc::Status::OK);
+}
+
+}  // namespace frontend::spark

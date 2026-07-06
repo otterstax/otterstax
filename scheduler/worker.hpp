@@ -64,11 +64,15 @@ public:
     execute_prepared_statement(session_hash_t id,
                                std::pmr::vector<components::types::logical_value_t> parameters);
     unique_future<session_result> prepare_schema(session_hash_t id, std::string sql);
+    unique_future<void> release_session(session_hash_t id);
+    unique_future<session_result> execute_plan(session_hash_t id, ParsedQueryDataPtr data);
 
     using dispatch_traits = actor_zeta::dispatch_traits<&Worker::execute,
                                                         &Worker::execute_statement,
                                                         &Worker::execute_prepared_statement,
-                                                        &Worker::prepare_schema>;
+                                                        &Worker::prepare_schema,
+                                                        &Worker::release_session,
+                                                        &Worker::execute_plan>;
 
     actor_zeta::behavior_t behavior(actor_zeta::mailbox::message* msg);
 

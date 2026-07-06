@@ -65,6 +65,10 @@ actor_zeta::behavior_t Worker::behavior(actor_zeta::mailbox::message* msg) {
         co_await actor_zeta::dispatch(this, &Worker::execute_prepared_statement, msg);
     } else if (cmd == actor_zeta::msg_id<Worker, &Worker::prepare_schema>) {
         co_await actor_zeta::dispatch(this, &Worker::prepare_schema, msg);
+    } else if (cmd == actor_zeta::msg_id<Worker, &Worker::release_session>) {
+        co_await actor_zeta::dispatch(this, &Worker::release_session, msg);
+    } else if (cmd == actor_zeta::msg_id<Worker, &Worker::execute_plan>) {
+        co_await actor_zeta::dispatch(this, &Worker::execute_plan, msg);
     }
 }
 
@@ -528,6 +532,134 @@ Worker::handle_external_statement(session_hash_t id, const otterstax::external::
     // payload — the frontend turns this into a 0-row result.
     metadata_map_.erase(id);
     co_return session_payload{resource()};
+}
+
+actor_zeta::unique_future<void>
+Worker::release_session(session_hash_t id) {
+    metadata_map_.erase(id);
+    co_return;
+}
+
+actor_zeta::unique_future<Worker::session_result>
+Worker::execute_plan(session_hash_t id, ParsedQueryDataPtr data) {
+    assert(id % worker_count_ == self_index_);
+    Timer timer("Worker::execute_plan", log_);
+    try {
+        log_->info("Worker::execute_plan called");
+
+        bool has_external_nodes = data->otterbrix_params && data->otterbrix_params->external_nodes_count > 0;
+        if (!has_external_nodes) {
+            set_backend_type_otterbrix(id);
+        }
+
+        if (has_external_nodes && get_backend_type(id) == backend_type_t::Unknown) {
+            auto [ns_cat, catalog_future] = actor_zeta::send(catalog_manager_,
+                                                             &mysql::CatalogManager::update_backend_type,
+                                                             id,
+                                                             std::move(data));
+            auto catalog_result = co_await std::move(catalog_future);
+            if (catalog_result.has_error()) {
+                co_return core::error_t{error_code_t::schema_error,
+                                  std::pmr::string{catalog_result.error().what.c_str()}};
+            }
+            update_metadata(id, std::move(catalog_result.value()));
+        } else {
+            data->backend_type = backend_type_t::Otterbrix;
+            update_metadata(id, std::move(data));
+        }
+
+        auto data_ptr = get_statement(id);
+        if (!data_ptr) {
+            co_return core::error_t{error_code_t::other_error,
+                              std::pmr::string{"No needed metadata found, unable to DoGet."}};
+        }
+
+        auto backend = get_backend_type(id);
+        log_->debug("Worker::execute_plan routing to backend_type: {}", static_cast<int>(backend));
+        if (backend == backend_type_t::Unknown) {
+            co_return core::error_t{error_code_t::other_error,
+                              std::pmr::string{"backend_unknown: Unknown backend type, cannot execute"}};
+        }
+
+        if (backend == backend_type_t::MySQL || backend == backend_type_t::Mixed) {
+            auto [ns_sql, sql_future] = actor_zeta::send(sql_connection_manager_,
+                                                         &db::MySQLManager::execute,
+                                                         id,
+                                                         std::move(data_ptr));
+            auto sql_result = co_await std::move(sql_future);
+            if (sql_result.has_error()) {
+                co_return core::error_t{error_code_t::other_error,
+                                  std::pmr::string{sql_result.error().what.c_str()}};
+            }
+            data_ptr = std::move(sql_result.value());
+
+            if (backend == backend_type_t::Mixed) {
+                auto [ns_pg, pg_future] = actor_zeta::send(pg_connection_manager_,
+                                                           &db::PostgressManager::execute,
+                                                           id,
+                                                           std::move(data_ptr));
+                auto pg_result = co_await std::move(pg_future);
+                if (pg_result.has_error()) {
+                    co_return core::error_t{error_code_t::other_error,
+                                      std::pmr::string{pg_result.error().what.c_str()}};
+                }
+                data_ptr = std::move(pg_result.value());
+
+                auto [ns_ch, ch_future] = actor_zeta::send(ch_connection_manager_,
+                                                           &db::ClickhouseManager::execute,
+                                                           id,
+                                                           std::move(data_ptr));
+                auto ch_result = co_await std::move(ch_future);
+                if (ch_result.has_error()) {
+                    co_return core::error_t{error_code_t::other_error,
+                                      std::pmr::string{ch_result.error().what.c_str()}};
+                }
+                data_ptr = std::move(ch_result.value());
+            }
+        } else if (backend == backend_type_t::PostgreSQL) {
+            auto [ns_pg, pg_future] = actor_zeta::send(pg_connection_manager_,
+                                                       &db::PostgressManager::execute,
+                                                       id,
+                                                       std::move(data_ptr));
+            auto pg_result = co_await std::move(pg_future);
+            if (pg_result.has_error()) {
+                co_return core::error_t{error_code_t::other_error,
+                                  std::pmr::string{pg_result.error().what.c_str()}};
+            }
+            data_ptr = std::move(pg_result.value());
+        } else if (backend == backend_type_t::ClickHouse) {
+            auto [ns_ch, ch_future] = actor_zeta::send(ch_connection_manager_,
+                                                       &db::ClickhouseManager::execute,
+                                                       id,
+                                                       std::move(data_ptr));
+            auto ch_result = co_await std::move(ch_future);
+            if (ch_result.has_error()) {
+                co_return core::error_t{error_code_t::other_error,
+                                  std::pmr::string{ch_result.error().what.c_str()}};
+            }
+            data_ptr = std::move(ch_result.value());
+        }
+
+        auto [ns_ot, ot_future] = actor_zeta::send(otterbrix_manager_,
+                                                   &db::OtterbrixManager::execute,
+                                                   id,
+                                                   std::move(data_ptr->otterbrix_params));
+        auto cursor = co_await std::move(ot_future);
+        if (!cursor->is_success()) {
+            co_return core::error_t{error_code_t::other_error,
+                              std::pmr::string{"Otterbrix execution failed: "} +
+                                  std::pmr::string{cursor->get_error().what.c_str()}};
+        }
+
+        auto& meta = get_metadata(id);
+        session_payload payload{std::move(meta.schema), std::move(cursor->chunk_data()), 0, meta.tag};
+        metadata_map_.erase(id);
+        co_return std::move(payload);
+    } catch (const std::exception& e) {
+        log_->error("Worker::execute_plan caught exception: {}", e.what());
+        metadata_map_.erase(id);
+        co_return core::error_t{error_code_t::other_error, std::pmr::string{e.what()}};
+    }
 }
 
 // ─── Helpers (per-worker, no locks) ─────────────────────────────────────────

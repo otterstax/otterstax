@@ -4,16 +4,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Role
 
-`frontend/` implements the three wire-protocol servers. Each server accepts client connections, receives SQL, dispatches to the `Scheduler` actor, and streams results back.
+`frontend/` implements the four wire-protocol servers. Each server accepts client connections, receives SQL, dispatches to the `Scheduler` actor, and streams results back.
 
 ## Structure
 
 ```
 frontend/
-├── common/               — shared CRTP base server + connection base
-├── flight_sql_server/    — Apache Arrow FlightSQL (port 8815)
-├── mysql_server/         — MySQL wire protocol (port 8816)
-└── postgres_server/      — PostgreSQL wire protocol (port 8817)
+├── common/                — shared CRTP base server + connection base
+├── flight_sql_server/     — Apache Arrow FlightSQL (port 8815)
+├── mysql_server/          — MySQL wire protocol (port 8816)
+├── postgres_server/       — PostgreSQL wire protocol (port 8817)
+└── spark_connect_server/  — Spark Connect gRPC / asio-grpc (port 15002)
 ```
 
 ## Common Layer (`frontend/common/`)
@@ -55,5 +56,56 @@ Packet encoding/decoding lives in `{mysql,postgres}_server/packet/` and `{mysql,
 | FlightSQL | 8815 | `flight_sql_server` |
 | MySQL | 8816 | `mysql_server` |
 | PostgreSQL | 8817 | `postgres_server` |
+| Spark Connect | 15002 | `spark_connect_server` |
 
 Ports are hardcoded in `main.cpp` and in the `config.yml` / `compose.yml` files.
+
+## Spark Connect (`spark_connect_server/`)
+
+Spark Connect gRPC server using asio-grpc (Boost.Asio coroutines). PySpark clients connect via `sc://host:15002`.
+
+### Architecture — Hybrid Path B
+
+- **`spark.sql("...")`** (Command.sql_command) → SQL pass-through → `Scheduler::execute(hash, sql)`
+- **DataFrame ops** (Relation tree: filter/select/join/...) → **Path B**: `relation_to_plan` translates Spark Relation tree **directly** to Otterbrix logical plan (`node_ptr`), bypassing SQL generation + re-parse → `Scheduler::execute_plan(hash, ParsedQueryDataPtr)`
+- **SQL-leaf in Relation** (`spark.sql("...").filter()`) → Variant A: SQL leaf parsed via GreenplumParser, node_ptr wrapped in outer aggregate
+- **Window functions** → `INVALID_ARGUMENT` error (Otterbrix transformer drops `OVER`)
+- **Catalog** (`spark.catalog.listDatabases()` etc.) → CatalogManager via `catalog_relations`
+
+### Key Files
+
+| File | Role |
+|------|------|
+| `service.{hpp,cpp}` | `SparkConnectServiceImpl` — frozen interface, N GrpcContexts (multi-core), 10 RPCs |
+| `service_execute_plan.cpp` | ExecutePlan handler (hybrid dispatch, ArrowBatch IPC stream, `result_complete`) |
+| `service_analyze_plan.cpp` | AnalyzePlan (schema via `prepare_schema` or `execute_plan`, `release_session` cleanup) |
+| `service_misc.cpp` | Config/ReleaseExecute/Reattach/Interrupt/... |
+| `plan_translator/relation_to_plan.{hpp,cpp}` | Spark Relation → Otterbrix `node_ptr` (Path B core) |
+| `plan_translator/expression_to_plan.{hpp,cpp}` | Spark Expression → Otterbrix `expression_ptr` |
+| `plan_translator/type_converter.{hpp,cpp}` | `logical_type` → spark `DataType` |
+| `result_encoder.{hpp,cpp}` | Otterbrix `to_arrow_array` → `ImportRecordBatch` → `MakeStreamWriter` → IPC stream |
+| `await_future.hpp` | Variant D — `agrpc::Alarm` adaptive backoff, `GrpcExecutor` awaitable |
+| `catalog_relations.{hpp,cpp}` | ListDatabases/ListTables/TableExists via CatalogManager |
+
+### Scheduler additions
+
+- `release_session(session_hash_t)` — `metadata_map_` cleanup for AnalyzePlan (in `dispatch_traits` + `behavior()` of both Scheduler and Worker)
+- `execute_plan(session_hash_t, ParsedQueryDataPtr)` — Path B entry point (pre-built plan, self-cleaning)
+
+### Result encoding
+
+Each `ExecutePlanResponse.arrow_batch.data` is a complete Arrow IPC **stream** (Schema message + RecordBatch + EOS), produced via:
+```
+otterbrix to_arrow_array/to_arrow_schema → arrow::ImportSchema → ImportRecordBatch
+→ MakeStreamWriter → WriteRecordBatch → Close → bytes
+```
+
+### Dependencies
+
+- `asio-grpc/3.5.0` with `backend=boost` (GrpcContext = Boost.Asio executor)
+- `grpc/1.69.0` (asio-grpc 3.x requires ≥1.67.1)
+- Vendored 9 proto files from Apache Spark v4.0.0 (`proto/spark/connect/`)
+
+### Limitations
+
+See `UNSUPPORTED.md` — Window, UDFs, Streaming, LocalRelation (inline Arrow), ML, Python operators.

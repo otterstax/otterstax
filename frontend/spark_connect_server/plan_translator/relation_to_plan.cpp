@@ -574,9 +574,17 @@ node_result translate_relation(const sc::Relation& rel,
                               "Spark Hint has no input relation",
                               resource);
         }
-        case sc::Relation::kSql:
-            return unsupported("Spark SQL relation (variant A) requires the GreenplumParser — not yet wired into Path B",
-                               resource);
+        case sc::Relation::kSql: {
+            const auto& sql_rel = rel.sql();
+            auto parser = make_parser(resource);
+            auto parse_result = parser->parse(sql_rel.query());
+            if (parse_result.has_error()) {
+                return make_error(core::error_code_t::sql_parse_error,
+                                  parse_result.error().what.c_str(), resource);
+            }
+            auto& parsed = parse_result.value();
+            return cl::node_ptr{std::move(parsed->otterbrix_params->node)};
+        }
         case sc::Relation::kLocalRelation:
             return unsupported("Spark LocalRelation is not supported", resource);
         case sc::Relation::kCachedLocalRelation:

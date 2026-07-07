@@ -12,10 +12,11 @@
 #include "service.hpp"
 
 #include "await_future.hpp"
+#include "plan_translator/relation_to_plan.hpp"
 #include "plan_translator/type_converter.hpp"
 #include "scheduler/scheduler.hpp"
+#include "scheduler/session_data.hpp"
 #include "utility/session.hpp"
-#include "utility/session_payload.hpp"
 
 #include <grpcpp/status.h>
 
@@ -35,42 +36,72 @@ SparkConnectServiceImpl::handle_analyze_plan(
     switch (request.analyze_case()) {
         case sc::AnalyzePlanRequest::kSchema: {
             const auto& plan = request.schema().plan();
-            if (!plan.has_command() || !plan.command().has_sql_command()) {
+
+            if (plan.has_command() && plan.command().has_sql_command()) {
+                std::string sql = plan.command().sql_command().sql();
+
+                session_id id;
+                const auto hash = id.hash();
+
+                auto prepare_fut = std::move(
+                    actor_zeta::send(scheduler_address_,
+                                     &Scheduler::prepare_schema,
+                                     hash,
+                                     std::move(sql))
+                        .second);
+
+                auto prepare_result =
+                    co_await await_future<session_payload>(std::move(prepare_fut));
+
+                if (prepare_result.has_error()) {
+                    co_await rpc.finish_with_error(grpc::Status(
+                        grpc::StatusCode::INTERNAL,
+                        prepare_result.error().what.c_str()));
+                    co_return;
+                }
+
+                *response.mutable_schema()->mutable_schema() =
+                    to_spark_schema(prepare_result.value().schema);
+
+                [[maybe_unused]] auto release = actor_zeta::send(
+                    scheduler_address_, &Scheduler::release_session, hash);
+            } else if (plan.has_root()) {
+                auto plan_result = relation_to_plan(plan, resource_);
+                if (plan_result.has_error()) {
+                    co_await rpc.finish_with_error(grpc::Status(
+                        grpc::StatusCode::INVALID_ARGUMENT,
+                        plan_result.error().what.c_str()));
+                    co_return;
+                }
+
+                session_id id;
+                const auto hash = id.hash();
+
+                auto exec_fut = std::move(
+                    actor_zeta::send(scheduler_address_,
+                                     &Scheduler::execute_plan,
+                                     hash,
+                                     std::move(plan_result.value().parsed_data))
+                        .second);
+
+                auto exec_result =
+                    co_await await_future<session_payload>(std::move(exec_fut));
+
+                if (exec_result.has_error()) {
+                    co_await rpc.finish_with_error(grpc::Status(
+                        grpc::StatusCode::INTERNAL,
+                        exec_result.error().what.c_str()));
+                    co_return;
+                }
+
+                *response.mutable_schema()->mutable_schema() =
+                    to_spark_schema(exec_result.value().schema);
+            } else {
                 co_await rpc.finish_with_error(grpc::Status(
-                    grpc::StatusCode::UNIMPLEMENTED,
-                    "Schema analysis for Relation plans not yet implemented"));
+                    grpc::StatusCode::INVALID_ARGUMENT,
+                    "Schema analysis requires a Plan with a command or root relation"));
                 co_return;
             }
-
-            std::string sql = plan.command().sql_command().sql();
-
-            session_id id;
-            const auto hash = id.hash();
-
-            auto prepare_fut = std::move(
-                actor_zeta::send(scheduler_address_,
-                                 &Scheduler::prepare_schema,
-                                 hash,
-                                 std::move(sql))
-                    .second);
-
-            auto prepare_result =
-                co_await await_future<session_payload>(std::move(prepare_fut));
-
-            if (prepare_result.has_error()) {
-                co_await rpc.finish_with_error(grpc::Status(
-                    grpc::StatusCode::INTERNAL,
-                    prepare_result.error().what.c_str()));
-                co_return;
-            }
-
-            *response.mutable_schema()->mutable_schema() =
-                to_spark_schema(prepare_result.value().schema);
-
-            // Fire-and-forget: release the ephemeral schema-prep session so the
-            // Scheduler's metadata_map_ entry is cleaned up.
-            [[maybe_unused]] auto release = actor_zeta::send(
-                scheduler_address_, &Scheduler::release_session, hash);
             break;
         }
         case sc::AnalyzePlanRequest::kSparkVersion:

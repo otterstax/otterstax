@@ -14,6 +14,7 @@
 #include <arrow/status.h>       // Status
 
 #include <exception>
+#include <string>
 #include <string_view>
 #include <utility>
 
@@ -59,7 +60,7 @@ struct c_array_guard {
 }  // namespace
 
 core::result_wrapper_t<EncodedBatch>
-encode_arrow_batch(const ct::complex_logical_type& /*schema*/,
+encode_arrow_batch(const ct::complex_logical_type& schema,
                    const cv::data_chunk_t& chunk,
                    int64_t start_offset,
                    std::pmr::memory_resource* resource) {
@@ -67,11 +68,27 @@ encode_arrow_batch(const ct::complex_logical_type& /*schema*/,
         c_schema_guard schema_guard;
         c_array_guard array_guard;
 
+        // otterbrix's to_arrow_schema derives each Arrow field name via
+        // complex_logical_type::alias(), which dereferences the type's extension_
+        // with NO null guard — an unaliased (leaf) type therefore crashes it.
+        // Ensure every field is named: prefer the authoritative struct field names
+        // carried by `schema`, else a stable "colN" fallback.
+        std::pmr::vector<ct::complex_logical_type> field_types(chunk.types(), resource);
+        const bool named_schema = schema.type() == ct::logical_type::STRUCT &&
+                                  schema.child_types().size() == field_types.size();
+        for (size_t i = 0; i < field_types.size(); ++i) {
+            if (named_schema && schema.child_types()[i].has_alias()) {
+                field_types[i].set_alias(schema.child_types()[i].alias());
+            } else if (!field_types[i].has_alias()) {
+                field_types[i].set_alias("col" + std::to_string(i));
+            }
+        }
+
         // Otterbrix C ABI converters. to_arrow_array's signature takes a
         // non-const reference even though it only reads from the chunk (it
         // forwards into non-const vector_t accessors); casting away const here
         // is therefore safe.
-        ca::to_arrow_schema(&schema_guard.value, chunk.types());
+        ca::to_arrow_schema(&schema_guard.value, field_types);
         ca::to_arrow_array(const_cast<cv::data_chunk_t&>(chunk), &array_guard.value);
 
         // ImportSchema / ImportRecordBatch consume their C structs on success

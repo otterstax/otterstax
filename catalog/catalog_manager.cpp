@@ -238,9 +238,8 @@ namespace mysql {
                 // tables either.
                 auto node_type = (*entry.node)->type();
                 if (node_type == logical_plan::node_type::create_collection_t ||
-                    node_type == logical_plan::node_type::drop_collection_t ||
                     node_type == logical_plan::node_type::create_index_t ||
-                    node_type == logical_plan::node_type::drop_index_t ||
+                    node_type == logical_plan::node_type::drop_t ||
                     node_type == logical_plan::node_type::unused) {
                     continue;
                 }
@@ -307,9 +306,8 @@ namespace mysql {
                 }
                 auto node_type = (*entry.node)->type();
                 if (node_type == logical_plan::node_type::create_collection_t ||
-                    node_type == logical_plan::node_type::drop_collection_t ||
                     node_type == logical_plan::node_type::create_index_t ||
-                    node_type == logical_plan::node_type::drop_index_t ||
+                    node_type == logical_plan::node_type::drop_t ||
                     node_type == logical_plan::node_type::unused) {
                     // CREATE targets do not exist yet; DROP needs no schema;
                     // subquery stubs (schema_node_t) are computed, not remote.

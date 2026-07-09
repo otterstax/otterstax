@@ -33,11 +33,11 @@ namespace frontend::postgres {
     };
 
     struct command_complete_tag {
-        static command_complete_tag simple_command(NodeTag node, int32_t rows = 0);
-        static command_complete_tag select(int32_t rows = 0);
-        static command_complete_tag insert(int32_t rows = 0);
-        static command_complete_tag update(int32_t rows = 0);
-        static command_complete_tag delete_rows(int32_t rows = 0);
+        static command_complete_tag simple_command(NodeTag node, int64_t rows = 0);
+        static command_complete_tag select(int64_t rows = 0);
+        static command_complete_tag insert(int64_t rows = 0);
+        static command_complete_tag update(int64_t rows = 0);
+        static command_complete_tag delete_rows(int64_t rows = 0);
         static command_complete_tag begin();
         static command_complete_tag commit();
         static command_complete_tag rollback();

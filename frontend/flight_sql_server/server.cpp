@@ -22,8 +22,6 @@
 #include <boost/asio/detached.hpp>
 #include <boost/asio/io_context.hpp>
 
-#include <tuple>
-
 #include <boost/mysql/results.hpp>
 #include <spdlog/spdlog.h>
 
@@ -128,8 +126,9 @@ SimpleFlightSQLServer::GetFlightInfoStatement(const arrow::flight::ServerCallCon
     auto ticket = EncodeTransactionQuery({query, command.transaction_id, id.hash()}).ValueOrDie();
     log_->debug("[GetFlightInfoStatement] Encoded ticket, sending to scheduler...");
 
-    auto [needs_sched, fut] = actor_zeta::send(scheduler_address_, &Scheduler::prepare_schema, id.hash(), query);
-    (void) needs_sched; // sending to the Scheduler event-loop always returns needs_sched=false
+    // sending to the Scheduler event-loop always returns needs_sched=false
+    [[maybe_unused]] auto [needs_sched, fut] =
+        actor_zeta::send(scheduler_address_, &Scheduler::prepare_schema, id.hash(), query);
     log_->debug("[GetFlightInfoStatement] Waiting for response...");
     core::result_wrapper_t<session_payload> r{resource_};
     boost::asio::io_context io;
@@ -174,9 +173,9 @@ SimpleFlightSQLServer::DoGetStatement(const arrow::flight::ServerCallContext& co
                     query,
                     session_hash,
                     transaction_id);
-        auto [needs_sched, fut] =
+        // sending to the Scheduler event-loop always returns needs_sched=false
+        [[maybe_unused]] auto [needs_sched, fut] =
             actor_zeta::send(scheduler_address_, &Scheduler::execute_statement, session_hash);
-        (void) needs_sched; // sending to the Scheduler event-loop always returns needs_sched=false
         core::result_wrapper_t<session_payload> r{resource_};
         boost::asio::io_context io;
         boost::asio::co_spawn(
@@ -189,9 +188,9 @@ SimpleFlightSQLServer::DoGetStatement(const arrow::flight::ServerCallContext& co
 
         if (!r.has_error()) {
             session_payload sdata_result = std::move(r.value());
-            log_->debug("[DOGET] Scheduler finished successfully, rows size: {}", sdata_result.chunk.size());
+            log_->debug("[DOGET] Scheduler finished successfully, rows size: {}", sdata_result.size());
             auto schema = to_arrow_schema(sdata_result.schema);
-            auto batch_reader = ChunkBatchReader::Make(std::move(schema), std::move(sdata_result.chunk)).ValueOrDie();
+            auto batch_reader = ChunkBatchReader::Make(std::move(schema), std::move(sdata_result.chunks)).ValueOrDie();
             log_->trace("[ARROW FLIGHT SERVER] Send data");
             return std::make_unique<arrow::flight::RecordBatchStream>(batch_reader);
         } else if (r.error().what.starts_with("timeout")) {
@@ -239,7 +238,8 @@ SimpleFlightSQLServer::DoGetTables(const arrow::flight::ServerCallContext& conte
     }
 
     auto shared_data = create_cv_wrapper(std::pmr::vector<table_info>(resource_));
-    std::ignore = actor_zeta::send(catalog_address_, &mysql::CatalogManager::get_tables, command, shared_data);
+    [[maybe_unused]] auto [needs_sched, sent_fut] =
+        actor_zeta::send(catalog_address_, &mysql::CatalogManager::get_tables, command, shared_data);
     shared_data->wait_for(cv_wrapper::DEFAULT_TIMEOUT);
     auto sdata_result = shared_data->get_result();
 
@@ -292,9 +292,9 @@ SimpleFlightSQLServer::DoPutCommandStatementUpdate(const arrow::flight::ServerCa
         // Log the received ticket, assuming the query is stored in the ticket
         log_->debug("Received query in ticket: {} Id: {}", command.query, command.transaction_id);
         session_id id;
-        auto [needs_sched, fut] =
+        // sending to the Scheduler event-loop always returns needs_sched=false
+        [[maybe_unused]] auto [needs_sched, fut] =
             actor_zeta::send(scheduler_address_, &Scheduler::execute, id.hash(), command.query);
-        (void) needs_sched; // sending to the Scheduler event-loop always returns needs_sched=false
         core::result_wrapper_t<session_payload> r{resource_};
         boost::asio::io_context io;
         boost::asio::co_spawn(
@@ -308,7 +308,7 @@ SimpleFlightSQLServer::DoPutCommandStatementUpdate(const arrow::flight::ServerCa
         int64_t affected_rows = 0;
 
         if (!r.has_error()) {
-            affected_rows = std::move(r.value()).chunk.size();
+            affected_rows = std::move(r.value()).size();
             log_->debug("[DoPutCommandStatementUpdate] Scheduler finished successfully, rows size: {}", affected_rows);
             log_->debug("[DoPutCommandStatementUpdate] Affected rows: {}", affected_rows);
             log_->trace("[ARROW FLIGHT SERVER] Send data");

@@ -87,6 +87,7 @@ foreach(_proto ${SPARK_PROTO_FILES})
 
     add_custom_command(
         OUTPUT ${_outputs}
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${SPARK_GENERATED_DIR}/${_rel_dir}"
         COMMAND $<TARGET_FILE:protobuf::protoc>
             "--proto_path=${SPARK_PROTO_ROOT}"
             "--proto_path=${_protobuf_include_dir}"

@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.15)
 project(otterstax)
 
+set(CMAKE_POLICY_DEFAULT_CMP0167 NEW)
+
 set(CMAKE_VERBOSE_MAKEFILE TRUE)
 set(CMAKE_CXX_STANDARD 20 CACHE STRING "The C++ standard whose features are requested." FORCE)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -74,7 +76,6 @@ find_package(Boost 1.88.0 REQUIRED COMPONENTS
     program_options
     mysql
 )
-find_package(gRPC REQUIRED)
 find_package(Protobuf REQUIRED)
 find_package(asio-grpc REQUIRED)
 find_package(PostgreSQL REQUIRED)

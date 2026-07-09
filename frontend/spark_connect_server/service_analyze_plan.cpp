@@ -18,7 +18,7 @@
 #include "scheduler/session_data.hpp"
 #include "utility/session.hpp"
 
-#include <grpcpp/status.h>
+#include <grpcpp/support/status.h>
 
 #include <string>
 #include <utility>
@@ -38,7 +38,12 @@ SparkConnectServiceImpl::handle_analyze_plan(
             const auto& plan = request.schema().plan();
 
             if (plan.has_command() && plan.command().has_sql_command()) {
-                std::string sql = plan.command().sql_command().sql();
+                // Spark Connect 4.0 carries the query in SqlCommand.input (a SQL
+                // relation); the flat SqlCommand.sql is deprecated / empty in 4.0.
+                const auto& sql_command = plan.command().sql_command();
+                std::string sql = (sql_command.has_input() && sql_command.input().has_sql())
+                                       ? sql_command.input().sql().query()
+                                       : sql_command.sql();
 
                 session_id id;
                 const auto hash = id.hash();

@@ -19,7 +19,6 @@
 #include <memory_resource>
 #include <optional>
 #include <string>
-#include <tuple>
 #include <utility>
 
 namespace frontend::spark {
@@ -64,7 +63,9 @@ ct::complex_logical_type boolean_column(std::string_view alias) {
 // schema (top-level STRUCT) from the chunk's own column types.
 session_payload make_payload(cv::data_chunk_t&& chunk) {
     auto schema = ct::complex_logical_type::create_struct("", chunk.types());
-    return session_payload{std::move(schema), std::move(chunk), 0, NodeTag::T_Null};
+    std::pmr::vector<cv::data_chunk_t> chunks(chunk.resource());
+    chunks.push_back(std::move(chunk));
+    return session_payload{std::move(schema), std::move(chunks), 0, NodeTag::T_Null};
 }
 
 // --- Actor round-trip helpers -------------------------------------------
@@ -77,7 +78,7 @@ fetch_list_connections(actor_zeta::address_t catalog_address,
                        std::pmr::vector<catalog_ext::connection_info_t>& out,
                        std::pmr::memory_resource* resource) {
     auto sdata = create_cv_wrapper(std::pmr::vector<catalog_ext::connection_info_t>(resource));
-    std::ignore =
+    [[maybe_unused]] auto send_result =
         actor_zeta::send(catalog_address, &mysql::CatalogManager::list_connections, sdata);
     sdata->wait_for(cv_wrapper::DEFAULT_TIMEOUT);
     if (sdata->status() != cv_wrapper::Status::Ok) {
@@ -94,10 +95,11 @@ fetch_list_tables(actor_zeta::address_t catalog_address,
                   std::pmr::vector<table_info>& out,
                   std::pmr::memory_resource* resource) {
     auto sdata = create_cv_wrapper(std::pmr::vector<table_info>(resource));
-    std::ignore = actor_zeta::send(catalog_address,
-                                   &mysql::CatalogManager::list_tables,
-                                   std::string(alias),
-                                   sdata);
+    [[maybe_unused]] auto send_result =
+        actor_zeta::send(catalog_address,
+                         &mysql::CatalogManager::list_tables,
+                         std::string(alias),
+                         sdata);
     sdata->wait_for(cv_wrapper::DEFAULT_TIMEOUT);
     if (sdata->status() != cv_wrapper::Status::Ok) {
         return core::error_t{core::error_code_t::other_error,
@@ -114,11 +116,12 @@ fetch_table_exists(actor_zeta::address_t catalog_address,
                    bool& out,
                    std::pmr::memory_resource* resource) {
     auto sdata = create_cv_wrapper(false);
-    std::ignore = actor_zeta::send(catalog_address,
-                                   &mysql::CatalogManager::table_exists,
-                                   std::string(alias),
-                                   std::string(table),
-                                   sdata);
+    [[maybe_unused]] auto send_result =
+        actor_zeta::send(catalog_address,
+                         &mysql::CatalogManager::table_exists,
+                         std::string(alias),
+                         std::string(table),
+                         sdata);
     sdata->wait_for(cv_wrapper::DEFAULT_TIMEOUT);
     if (sdata->status() != cv_wrapper::Status::Ok) {
         return core::error_t{core::error_code_t::other_error,

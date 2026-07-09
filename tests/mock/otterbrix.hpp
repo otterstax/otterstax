@@ -12,13 +12,19 @@
 // TODO figure out how to mock cursor
 class SimpleMockOtterbrixManager : public IDataManager {
 public:
-    SimpleMockOtterbrixManager(mock_config config = {})
-        : config_(config) {
-        std::cout << "Mock otterbrix_manager created with config: " << std::endl;
+    // multi_chunk_rows > 0 switches execute_plan into a multi-chunk mode that
+    // returns a cursor whose result is that many rows split into
+    // ceil(N/1024) chunks of <=1024 rows each. Default 0 keeps the original
+    // single-chunk behavior untouched.
+    SimpleMockOtterbrixManager(mock_config config = {}, size_t multi_chunk_rows = 0)
+        : config_(config)
+        , multi_chunk_rows_(multi_chunk_rows) {
+        std::cout << "Mock OtterbrixManager created with config: " << std::endl;
         std::cout << "can_throw: " << config_.can_throw << std::endl;
         std::cout << "return_empty: " << config_.return_empty << std::endl;
         std::cout << "wait_time: " << config_.wait_time.count() << " milliseconds" << std::endl;
         std::cout << "error_message: " << config_.error_message << std::endl;
+        std::cout << "multi_chunk_rows: " << multi_chunk_rows_ << std::endl;
     }
 
     components::cursor::cursor_t_ptr execute_plan(OtterbrixStatementPtr& otterbrix_params) override {
@@ -35,6 +41,28 @@ public:
             std::cout << "Mock otterbrix_manager returning empty cursor." << std::endl;
             return components::cursor::make_cursor(config_.resource,
                                                    components::vector::data_chunk_t{config_.resource, {}, 0});
+        }
+
+        if (multi_chunk_rows_ > 0) {
+            // Emulate the b1 cursor contract: a result of multi_chunk_rows_ rows
+            // is delivered as ceil(N/1024) chunks of <=1024 rows each, never one
+            // oversized chunk. The chunks are schema-less (0 columns) on purpose —
+            // this repro only exercises the payload carrying the chunk vector and
+            // the total row count end-to-end through the scheduler.
+            constexpr size_t max_chunk_rows = 1024;
+            std::pmr::vector<components::vector::data_chunk_t> chunks(config_.resource);
+            size_t remaining = multi_chunk_rows_;
+            while (remaining > 0) {
+                const size_t rows = remaining < max_chunk_rows ? remaining : max_chunk_rows;
+                std::pmr::vector<components::types::complex_logical_type> types(config_.resource);
+                components::vector::data_chunk_t chunk{config_.resource, types, rows};
+                chunk.set_cardinality(rows);
+                chunks.push_back(std::move(chunk));
+                remaining -= rows;
+            }
+            std::cout << "Mock OtterbrixManager returning multi-chunk cursor: " << multi_chunk_rows_
+                      << " rows across " << chunks.size() << " chunks." << std::endl;
+            return components::cursor::make_cursor(config_.resource, std::move(chunks));
         }
 
         assert(otterbrix_params->node->type() == logical_plan::node_type::data_t &&
@@ -86,5 +114,6 @@ public:
 
 private:
     mock_config config_;
+    size_t multi_chunk_rows_{0};
     components::catalog::oid_t next_oid_{components::catalog::FIRST_USER_OID};
 };

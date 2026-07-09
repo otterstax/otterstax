@@ -18,9 +18,12 @@ ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
 ENV PYSPARK_PYTHON=python3
 
 ARG PYSPARK_VERSION=4.0.0
+# pyspark[connect] pulls the full Spark Connect client stack the test scripts need:
+# pandas, pyarrow, grpcio, grpcio-status, googleapis-common-protos, numpy.
 RUN pip install --no-cache-dir \
-    pyspark==${PYSPARK_VERSION} \
+    "pyspark[connect]==${PYSPARK_VERSION}" \
     pyarrow \
+    "pandas>=2.0.0" \
     flightsql-dbapi \
     pymysql \
     mysql-connector-python \

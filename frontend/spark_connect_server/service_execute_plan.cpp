@@ -57,7 +57,12 @@ SparkConnectServiceImpl::handle_execute_plan(
 
     if (plan.has_command() && plan.command().has_sql_command()) {
         // Path A: SQL pass-through — spark.sql("...").
-        const std::string& sql = plan.command().sql_command().sql();
+        // Spark Connect 4.0 carries the query in SqlCommand.input (a SQL relation);
+        // the flat SqlCommand.sql string is deprecated and left empty by 4.0 clients.
+        const auto& sql_command = plan.command().sql_command();
+        const std::string& sql = (sql_command.has_input() && sql_command.input().has_sql())
+                                     ? sql_command.input().sql().query()
+                                     : sql_command.sql();
         auto [needs_sched, fut] = actor_zeta::send(scheduler_address_,
                                                     &Scheduler::execute, hash, sql);
         result = co_await await_future<session_payload>(std::move(fut));
@@ -87,33 +92,44 @@ SparkConnectServiceImpl::handle_execute_plan(
     }
 
     session_payload payload = std::move(result.value());
-    const int64_t offset = 0;
 
-    auto encoded = encode_arrow_batch(payload.schema, payload.chunk, offset, resource_);
-    if (encoded.has_error()) {
-        grpc::Status status(grpc::StatusCode::INTERNAL, encoded.error().what.c_str());
-        co_await rpc.finish(status);
-        co_return;
+    // Stream one Arrow IPC batch per result chunk. b1 caps each data_chunk at
+    // 1024 rows, so a large result arrives across several chunks; the schema and
+    // operation_id ride only on the first response. Empty chunks are not skipped,
+    // preserving the always-at-least-one-batch behaviour PySpark expects.
+    int64_t start_offset = 0;
+    bool first = true;
+    for (auto& ch : payload.chunks) {
+        auto encoded = encode_arrow_batch(payload.schema, ch, start_offset, resource_);
+        if (encoded.has_error()) {
+            grpc::Status status(grpc::StatusCode::INTERNAL, encoded.error().what.c_str());
+            co_await rpc.finish(status);
+            co_return;
+        }
+
+        // Build the data response: envelope + (first-only) schema + ArrowBatch.
+        sc::ExecutePlanResponse response;
+        stamp_response(response, spark_session_id);
+        if (first) {
+            if (!request.operation_id().empty()) {
+                response.set_operation_id(request.operation_id());
+            }
+            if (payload.schema.type() == components::types::logical_type::STRUCT) {
+                *response.mutable_schema() = to_spark_schema(payload.schema);
+            }
+            first = false;
+        }
+
+        EncodedBatch& encoded_batch = encoded.value();
+        auto* batch = response.mutable_arrow_batch();
+        batch->set_data(std::move(encoded_batch.data));
+        batch->set_row_count(encoded_batch.row_count);
+        batch->set_start_offset(encoded_batch.start_offset);
+
+        co_await rpc.write(response);
+
+        start_offset += encoded_batch.row_count;
     }
-
-    // Build the data response: envelope + schema + ArrowBatch.
-    sc::ExecutePlanResponse response;
-    stamp_response(response, spark_session_id);
-    if (!request.operation_id().empty()) {
-        response.set_operation_id(request.operation_id());
-    }
-
-    if (payload.schema.type() == components::types::logical_type::STRUCT) {
-        *response.mutable_schema() = to_spark_schema(payload.schema);
-    }
-
-    EncodedBatch& encoded_batch = encoded.value();
-    auto* batch = response.mutable_arrow_batch();
-    batch->set_data(std::move(encoded_batch.data));
-    batch->set_row_count(encoded_batch.row_count);
-    batch->set_start_offset(encoded_batch.start_offset);
-
-    co_await rpc.write(response);
 
     // ResultComplete terminator — required by PySpark to consider the stream done.
     sc::ExecutePlanResponse complete_response;
@@ -144,7 +160,7 @@ void SparkConnectServiceImpl::stamp_response(sc::ExecutePlanResponse& resp,
 }
 
 std::pmr::string SparkConnectServiceImpl::generate_response_id() const {
-    static thread_local std::mt19937_64 gen{std::random_device{}()};
+    std::mt19937_64 gen{std::random_device{}()};
     const std::uint64_t hi = gen();
     const std::uint64_t lo = gen();
     char buf[37];

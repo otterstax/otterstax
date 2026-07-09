@@ -6,8 +6,6 @@
 #include "utility/tracy_memory_resource.hpp"
 #include "utility/tracy_profiler.hpp"
 
-#include <tuple>
-
 using namespace components;
 using namespace components::sql;
 
@@ -78,8 +76,8 @@ namespace frontend::postgres {
     void postgres_connection::handle_query(std::string query) {
         OTX_ZONE_N("pg::handle_query");
         session_id id;
-        auto [needs_sched, fut] = actor_zeta::send(scheduler_, &Scheduler::execute, id.hash(), query);
-        (void) needs_sched; // sending to the Scheduler event-loop always returns needs_sched=false
+        // sending to the Scheduler event-loop always returns needs_sched=false
+        [[maybe_unused]] auto [needs_sched, fut] = actor_zeta::send(scheduler_, &Scheduler::execute, id.hash(), query);
         core::result_wrapper_t<session_payload> r{resource_};
         boost::asio::io_context io;
         boost::asio::co_spawn(
@@ -103,13 +101,15 @@ namespace frontend::postgres {
 
         // handle Ok
         session_payload sdata_result = std::move(r.value());
-        int32_t rows_cnt = sdata_result.chunk.size();
+        int64_t rows_cnt = sdata_result.size();
         std::vector<std::vector<uint8_t>> response;
-        if (sdata_result.chunk.column_count() > 0) {
+        if (sdata_result.column_count() > 0) {
             postgres_resultset result(writer_);
-            result.add_chunk_columns(sdata_result.chunk); // default text encoding
-            for (size_t i = 0; i < rows_cnt; i++) {
-                result.add_row(sdata_result.chunk, i);
+            result.add_chunk_columns(sdata_result.chunks.front()); // default text encoding
+            for (auto& ch : sdata_result.chunks) {
+                for (size_t i = 0; i < ch.size(); ++i) {
+                    result.add_row(ch, i);
+                }
             }
             response = postgres_resultset::build_packets(std::move(result));
         }
@@ -202,8 +202,9 @@ namespace frontend::postgres {
         }
 
         session_id id;
-        auto [needs_sched, fut] = actor_zeta::send(scheduler_, &Scheduler::prepare_schema, id.hash(), query);
-        (void) needs_sched; // sending to the Scheduler event-loop always returns needs_sched=false
+        // sending to the Scheduler event-loop always returns needs_sched=false
+        [[maybe_unused]] auto [needs_sched, fut] =
+            actor_zeta::send(scheduler_, &Scheduler::prepare_schema, id.hash(), query);
         core::result_wrapper_t<session_payload> r{resource_};
         boost::asio::io_context io;
         boost::asio::co_spawn(
@@ -452,11 +453,11 @@ namespace frontend::postgres {
 
         auto& portal_meta = it->second;
         auto& stmt = portal_meta.statement.get();
-        auto [needs_sched, fut] = actor_zeta::send(scheduler_,
-                                                   &Scheduler::execute_prepared_statement,
-                                                   stmt.stmt_session,
-                                                   std::move(portal_meta.portal));
-        (void) needs_sched; // sending to the Scheduler event-loop always returns needs_sched=false
+        // sending to the Scheduler event-loop always returns needs_sched=false
+        [[maybe_unused]] auto [needs_sched, fut] = actor_zeta::send(scheduler_,
+                                                                    &Scheduler::execute_prepared_statement,
+                                                                    stmt.stmt_session,
+                                                                    std::move(portal_meta.portal));
         core::result_wrapper_t<session_payload> r{resource_};
         boost::asio::io_context io;
         boost::asio::co_spawn(
@@ -479,24 +480,33 @@ namespace frontend::postgres {
         session_payload sdata_result = std::move(r.value());
 
         // TODO: PortalSuspended
-        int32_t rows_cnt = sdata_result.chunk.size();
-        if (limit != 0) {
-            rows_cnt = std::min(static_cast<uint64_t>(limit), sdata_result.chunk.size());
-        }
+        int64_t rows_cnt = 0;
+        size_t emitted = 0;
 
         std::vector<std::vector<uint8_t>> response;
-        if (sdata_result.chunk.column_count() > 0) {
+        if (sdata_result.column_count() > 0) {
             postgres_resultset result(writer_, stmt.is_schema_known_);
             if (!stmt.is_schema_known_) {
-                result.add_chunk_columns(sdata_result.chunk);
+                result.add_chunk_columns(sdata_result.chunks.front());
             }
             result.add_encoding(stmt.format);
 
-            for (size_t i = 0; i < rows_cnt; i++) {
-                result.add_row(sdata_result.chunk, i);
+            for (auto& ch : sdata_result.chunks) {
+                size_t n = ch.size();
+                if (limit != 0) {
+                    n = std::min<size_t>(n, static_cast<size_t>(limit) - emitted);
+                }
+                for (size_t i = 0; i < n; ++i) {
+                    result.add_row(ch, i);
+                }
+                emitted += n;
+                if (limit != 0 && emitted >= static_cast<size_t>(limit)) {
+                    break;
+                }
             }
             response = postgres_resultset::build_packets(std::move(result));
         }
+        rows_cnt = static_cast<int64_t>(emitted);
         response.emplace_back(
             build_command_complete(writer_, command_complete_tag::simple_command(sdata_result.tag, rows_cnt)));
         send_packet_merged(std::move(response));

@@ -824,7 +824,7 @@ bool relation_contains_window(const sc::Relation& rel) {
                 return relation_contains_window(rel.drop().input());
             }
             return false;
-        case sc::Relation::kToDF:
+        case sc::Relation::kToDf:
             if (rel.to_df().has_input()) {
                 return relation_contains_window(rel.to_df().input());
             }
@@ -985,12 +985,14 @@ relation_to_plan(const sc::Plan& plan, std::pmr::memory_resource* resource) {
     if (plan.op_type_case() != sc::Plan::kRoot) {
         return make_error(core::error_code_t::unimplemented_yet,
                           "Spark Connect Command execution is not supported in Path B",
-                          resource);
+                          resource)
+            .convert_error<TranslationResult>();
     }
     if (!plan.has_root()) {
         return make_error(core::error_code_t::invalid_parameter,
                           "Spark Plan has no root relation",
-                          resource);
+                          resource)
+            .convert_error<TranslationResult>();
     }
 
     const auto& root_rel = plan.root();
@@ -998,7 +1000,8 @@ relation_to_plan(const sc::Plan& plan, std::pmr::memory_resource* resource) {
     if (relation_contains_window(root_rel)) {
         return make_error(core::error_code_t::unimplemented_yet,
                           "Spark window expressions are not supported in Path B",
-                          resource);
+                          resource)
+            .convert_error<TranslationResult>();
     }
 
     auto params = cl::make_parameter_node(resource);
@@ -1017,7 +1020,7 @@ relation_to_plan(const sc::Plan& plan, std::pmr::memory_resource* resource) {
         cl::execution_plan_t(resource, root_node, params),
         cst::transform_result::parameter_map_t{resource},
         cst::transform_result::insert_map_t{resource},
-        cv::data_chunk_t(resource, std::pmr::vector<ct::complex_logical_type>{resource}));
+        cst::transform_result::insert_rows_t(resource));
 
     auto statement = std::make_unique<OtterbrixStatement>(
         std::pmr::vector<std::pmr::vector<external_entry_t>>{resource},

@@ -30,6 +30,10 @@ find yourself reaching for `create_cv_wrapper` to bridge an actor result to a
 frontend, you're almost certainly fighting the new architecture — use the
 future instead.
 
+### `session_payload.hpp`
+
+`session_payload` holds the output of a completed query: `schema` (`complex_logical_type`), `chunk` (`data_chunk_t`), `parameter_count`, and `NodeTag`. `shared_session_payload` = `shared_data<session_payload>`.
+
 ### `session.hpp`
 
 `session_hash_t` — the type alias for query session IDs threaded through all actors.

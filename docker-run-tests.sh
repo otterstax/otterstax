@@ -237,9 +237,9 @@ if [ -n "${IMAGE_TAG}" ]; then
     # CI / sanitizer path: test-otterstax image is pre-built with specific
     # build-args (e.g. ENABLE_ASAN / ENABLE_TSAN) by the workflow
     echo "ℹ️  IMAGE_TAG=${IMAGE_TAG} set; skipping test-otterstax build"
-    compose build test-client minio-init
+    compose build test-client test-spark-client minio-init
 else
-    compose build test-client test-otterstax minio-init
+    compose build test-client test-spark-client test-otterstax minio-init
 fi
 
 echo "✅ Previous containers and volumes removed"
@@ -585,7 +585,10 @@ if $TRACY_SEP; then
     [ $SEP_FAILED -gt 0 ] && TEST_RC=1 || TEST_RC=0
 else
     # Standard mode: run all tests in a single container via the startup script.
-    compose run --rm --use-aliases test-client bash -c "/app/startup.sh"
+    # Use test-spark-client (a superset of test-client: adds OpenJDK + pyspark) so
+    # the Spark Connect E2E tests run alongside the rest of the suite — startup.sh
+    # runs them only when `import pyspark` succeeds (skipped in the plain client).
+    compose run --rm --use-aliases test-spark-client bash -c "/app/startup.sh"
     TEST_RC=$?
 fi
 

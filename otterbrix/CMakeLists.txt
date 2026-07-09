@@ -62,6 +62,10 @@ target_link_libraries(otterbrix_local PUBLIC
     actor-zeta::actor-zeta
     PostgreSQL::PostgreSQL
     clickhouse-cpp-lib::clickhouse-cpp-lib
+    # parser.cpp calls schema_utils::make_node_schema_raw (defined in `scheduler`).
+    # Declare it so the linker orders `scheduler` after `otterbrix_local` — GNU ld
+    # (Linux) resolves static-lib symbols strictly by order, unlike macOS ld64.
+    scheduler
 )
 
 if(ENABLE_TRACY)

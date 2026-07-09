@@ -33,7 +33,7 @@ TEST_CASE("a13 join output keeps both join key columns") {
     if (c && !c->is_error()) {
         std::cout << "type_data count=" << c->type_data().size() << " names:";
         for (auto& t : c->type_data()) std::cout << " '" << t.alias() << "'";
-        std::cout << "\nchunk columns=" << c->chunk_data().data.size() << " cardinality=" << c->chunk_data().size()
+        std::cout << "\nchunk columns=" << c->chunks().front().data.size() << " cardinality=" << c->size()
                   << "\n";
     }
 }

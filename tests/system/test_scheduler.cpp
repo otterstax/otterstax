@@ -131,7 +131,7 @@ TEST_CASE("base test case") {
     std::cout << "[Main thread] " << std::this_thread::get_id() << " check data" << std::endl;
     REQUIRE(!r.has_error());
     auto sp = std::move(r.value());
-    REQUIRE(sp.chunk.size() == 2);
+    REQUIRE(sp.size() == 2);
 
     az_scheduler->stop();
 }
@@ -377,7 +377,7 @@ public:
                                            logical_plan::make_parameter_node(resource)),
             sql::transform::transform_result::parameter_map_t{resource},
             sql::transform::transform_result::insert_map_t{resource},
-            data_chunk_t(resource, {}));
+            sql::transform::transform_result::insert_rows_t(resource));
 
         auto parsed = std::make_unique<ParsedQueryData>(
             std::make_unique<OtterbrixStatement>(std::pmr::vector<std::pmr::vector<external_entry_t>>{resource},
@@ -582,7 +582,71 @@ TEST_CASE("return empty test case") {
     std::cout << "[Main thread] " << std::this_thread::get_id() << " check data" << std::endl;
     REQUIRE(!r.has_error());
     auto sp = std::move(r.value());
-    REQUIRE(sp.chunk.empty() == true);
+    REQUIRE(sp.empty() == true);
+
+    az_scheduler->stop();
+}
+
+// Regression for the latent >1024-row truncation: b1's cursor delivers a result
+// as a batch of <=1024-row chunks (never one oversized chunk). The mock returns
+// N=2500 rows split into ceil(2500/1024)=3 chunks; the whole vector must ride
+// through the scheduler into the session_payload without losing rows.
+TEST_CASE("multi-chunk result carries all rows through the scheduler") {
+    using namespace std::chrono_literals;
+
+    constexpr size_t N = 2500;
+
+    otterbrix::otterbrix_ptr otterbrix = init_otterbrix();
+    auto resource = otterbrix->dispatcher()->resource();
+    assert(resource);
+
+    auto az_scheduler = make_az_scheduler();
+
+    auto otterbrix_manager = actor_zeta::spawn<db::OtterbrixManager>(
+        resource,
+        std::make_unique<SimpleMockOtterbrixManager>(mock_config{.resource = resource}, N));
+    auto catalog_manager = actor_zeta::spawn<mysql::CatalogManager>(resource, otterbrix_manager->address());
+    auto mysql_conn_manager =
+        std::make_shared<mysql::ConnectorManager>(catalog_manager->address(), mysql_mock_connector_factory(resource));
+    auto pg_conn_manager =
+        std::make_shared<pg::ConnectorManager>(catalog_manager->address(), pg_mock_connector_factory(resource));
+
+    // Register connector managers with catalog manager
+    catalog_manager->set_mysql_connector_manager(mysql_conn_manager);
+    catalog_manager->set_pg_connector_manager(pg_conn_manager);
+
+    auto mysql_connection_manager = actor_zeta::spawn<db::MySQLManager>(resource, mysql_conn_manager);
+    auto pg_connection_manager = actor_zeta::spawn<db::PostgressManager>(resource, pg_conn_manager);
+    auto ch_conn_manager =
+        std::make_shared<ch::ConnectorManager>(catalog_manager->address(), ch_mock_connector_factory(resource));
+    catalog_manager->set_ch_connector_manager(ch_conn_manager);
+    auto ch_connection_manager = actor_zeta::spawn<db::ClickhouseManager>(resource, ch_conn_manager);
+
+    mysql_conn_manager->addConnection(boost::mysql::connect_params{}, "1");
+    mysql_conn_manager->addConnection(boost::mysql::connect_params{}, "2");
+
+    auto scheduler = actor_zeta::spawn<Scheduler>(resource,
+                                                  az_scheduler.get(),
+                                                  worker_count(),
+                                                  &make_mock_parser,
+                                                  mysql_connection_manager->address(),
+                                                  pg_connection_manager->address(),
+                                                  ch_connection_manager->address(),
+                                                  otterbrix_manager->address(),
+                                                  catalog_manager->address());
+    assert(scheduler);
+    std::string sql = "SELECT 1 AS test";
+    session_hash_t id = 1;
+    std::cout << "[Main thread] " << std::this_thread::get_id() << std::endl;
+    auto [ns, fut] = actor_zeta::send(scheduler->address(), &Scheduler::execute, id, sql);
+    auto r = await_session(std::move(fut), 5000ms, resource);
+    std::cout << "[Main thread] " << std::this_thread::get_id() << " check data" << std::endl;
+    REQUIRE(!r.has_error());
+    auto sp = std::move(r.value());
+    // No row loss across the chunk boundary, and the result really did arrive as
+    // multiple chunks (would be 1 under a naive chunks().front()-only payload).
+    REQUIRE(sp.size() == N);
+    REQUIRE(sp.chunks.size() >= 3);
 
     az_scheduler->stop();
 }

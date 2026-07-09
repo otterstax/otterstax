@@ -11,7 +11,7 @@
 
 #include "service.hpp"
 
-#include <grpcpp/status.h>
+#include <grpcpp/support/status.h>
 
 #include <string>
 #include <unordered_map>

@@ -170,7 +170,7 @@ TEST_CASE("scheduler handles N parallel sessions without hanging") {
     for (size_t i = 0; i < N; ++i) {
         INFO("session " << i);
         REQUIRE_FALSE(results[i].has_error());
-        REQUIRE(results[i].value().chunk.size() == 2);
+        REQUIRE(results[i].value().size() == 2);
     }
 
     auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();

@@ -317,6 +317,16 @@ namespace mysql {
                 if (conn_type_opt.has_value() && conn_type_opt.value() != catalog_ext::ConnectionType::PostgreSQL) {
                     // ignore schema qualifier if not postgres
                     target.name.schema = "";
+                } else if (target.name.schema.empty() && pg_conn_manager_ &&
+                           pg_conn_manager_->hasConnection(target.name.unique_identifier)) {
+                    // Spark Path B (relation_to_plan::populate_external_nodes) rebuilds
+                    // external-node names from aggregate nodes that carry no schema, so a
+                    // PostgreSQL table registered under "public" would miss the
+                    // schema-sensitive store key. Restore the connection's schema, using
+                    // the same rule as registration (discover_connection_schemas).
+                    auto conn_params = pg_conn_manager_->conn_params(target.name.unique_identifier);
+                    target.name.schema =
+                        (conn_params && !conn_params->schema.empty()) ? conn_params->schema : "public";
                 }
                 if (store_.find(target.name) == components::catalog::INVALID_OID) {
                     auto err = co_await add_connection_schema(target.name);

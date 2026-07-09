@@ -99,8 +99,19 @@ SparkConnectServiceImpl::handle_analyze_plan(
                     co_return;
                 }
 
-                *response.mutable_schema()->mutable_schema() =
-                    to_spark_schema(exec_result.value().schema);
+                const session_payload& payload = exec_result.value();
+                if (payload.schema.type() == components::types::logical_type::STRUCT) {
+                    *response.mutable_schema()->mutable_schema() = to_spark_schema(payload.schema);
+                } else if (!payload.chunks.empty()) {
+                    // execute_plan (Path B) leaves payload.schema at its default
+                    // (logical_type::NA) — it never computes an output schema. The real
+                    // column types/names live on the result chunk, the same source the
+                    // ExecutePlan Arrow encoder reads, so df.schema matches df.collect().
+                    *response.mutable_schema()->mutable_schema() =
+                        to_spark_schema(payload.chunks.front().types());
+                } else {
+                    *response.mutable_schema()->mutable_schema() = to_spark_schema(payload.schema);
+                }
             } else {
                 co_await rpc.finish_with_error(grpc::Status(
                     grpc::StatusCode::INVALID_ARGUMENT,

@@ -124,9 +124,17 @@ using namespace components::types;
 ::spark::connect::DataType to_spark_schema(const std::pmr::vector<complex_logical_type>& columns) {
     ::spark::connect::DataType result;
     auto* structure = result.mutable_struct_();
-    for (const auto& column : columns) {
+    for (size_t i = 0; i < columns.size(); ++i) {
+        const auto& column = columns[i];
         auto* field = structure->add_fields();
-        field->set_name(column.alias());
+        // complex_logical_type::alias() dereferences extension_ with no null guard
+        // and crashes on an unaliased (leaf) type, so fall back to a stable "colN"
+        // name — mirroring the Arrow encoder (result_encoder.cpp).
+        if (column.has_alias()) {
+            field->set_name(column.alias());
+        } else {
+            field->set_name("col" + std::to_string(i));
+        }
         *field->mutable_data_type() = to_spark_data_type(column);
         field->set_nullable(true);
     }

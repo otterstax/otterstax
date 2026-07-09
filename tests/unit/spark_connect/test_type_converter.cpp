@@ -112,3 +112,23 @@ TEST_CASE("type_converter: schema from flat column vector") {
     CHECK(schema.struct_().fields(0).name() == "k");
     CHECK(schema.struct_().fields(1).name() == "v");
 }
+
+TEST_CASE("type_converter: schema from flat column vector falls back to colN for unaliased columns") {
+    std::pmr::synchronized_pool_resource pool;
+    auto* resource = &pool;
+
+    std::pmr::vector<ct::complex_logical_type> columns{resource};
+    // An unaliased leaf type: complex_logical_type::alias() dereferences a null
+    // extension_ and crashes, so to_spark_schema must fall back to a stable colN.
+    // This is the shape execute_plan's result chunk carries for a Path-B .schema.
+    columns.push_back(ct::complex_logical_type{ct::logical_type::BIGINT});
+    auto named = ct::complex_logical_type{ct::logical_type::DOUBLE};
+    named.set_alias("price");
+    columns.push_back(named);
+
+    auto schema = frontend::spark::to_spark_schema(columns);
+    REQUIRE(schema.kind_case() == sc::DataType::kStruct);
+    REQUIRE(schema.struct_().fields_size() == 2);
+    CHECK(schema.struct_().fields(0).name() == "col0");
+    CHECK(schema.struct_().fields(1).name() == "price");
+}

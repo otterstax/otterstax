@@ -161,6 +161,28 @@ TEST_CASE("relation_to_plan: Filter with ExpressionString predicate (raw SQL)") 
     CHECK(pmap.begin()->second.value<int64_t>() == 0);
 }
 
+TEST_CASE("relation_to_plan: SQL relation binds its constants into the shared params") {
+    std::pmr::synchronized_pool_resource pool;
+    auto* resource = &pool;
+
+    sc::Plan plan;
+    // PySpark 4.0 sends spark.sql("...") as a Relation{kSql} root (Path B). Its
+    // constants must be materialised into the plan's shared parameter node, or
+    // execution fails with "value getter: parameter not bound".
+    plan.mutable_root()->mutable_sql()->set_query("SELECT * FROM t WHERE x > 100");
+
+    auto result = frontend::spark::relation_to_plan(plan, resource);
+    REQUIRE_FALSE(result.has_error());
+
+    auto& parsed = result.value().parsed_data;
+    REQUIRE(parsed != nullptr);
+    REQUIRE(parsed->otterbrix_params->params_node != nullptr);
+
+    const auto& pmap = parsed->otterbrix_params->params_node->parameters().parameters;
+    REQUIRE(pmap.size() == 1);
+    CHECK(pmap.begin()->second.value<int64_t>() == 100);
+}
+
 // ── Join ────────────────────────────────────────────────────────────────────────
 
 TEST_CASE("relation_to_plan: Join using_columns builds an equi-compare in key form") {

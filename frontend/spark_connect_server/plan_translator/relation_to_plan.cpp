@@ -622,15 +622,14 @@ node_result translate_relation(const sc::Relation& rel,
                               resource);
         }
         case sc::Relation::kSql: {
-            const auto& sql_rel = rel.sql();
-            auto parser = make_parser(resource);
-            auto parse_result = parser->parse(sql_rel.query());
-            if (parse_result.has_error()) {
-                return make_error(core::error_code_t::sql_parse_error,
-                                  parse_result.error().what.c_str(), resource);
-            }
-            auto& parsed = parse_result.value();
-            return cl::node_ptr{std::move(parsed->otterbrix_params->node)};
+            // Route the leaf SQL through parse_fragment so its constants land in
+            // the SHARED `params` node. A bare parse() keeps only the node and
+            // discards the sub-plan's parameter node, so a WHERE/HAVING constant
+            // later surfaces as "value getter: parameter not bound" at execution.
+            // External nodes are rebuilt from the node tree by
+            // populate_external_nodes, so the parser's own external-node analysis
+            // is not needed here.
+            return make_parser(resource)->parse_fragment(rel.sql().query(), params);
         }
         case sc::Relation::kLocalRelation:
             return unsupported("Spark LocalRelation is not supported", resource);

@@ -87,6 +87,7 @@ run_test "FlightSQL Schema (MySQL backend)" "test_schema_flightsql_client_mysql_
 run_test "FlightSQL Schema (PostgreSQL backend)" "test_schema_flightsql_client_pg_backend.py"
 run_test "FlightSQL Schema (ClickHouse backend)" "test_schema_flightsql_client_ch_backend.py"
 run_test "Cross-backend Schema" "test_schema_cross_backend.py"
+run_test "Cross-backend JOIN Schema" "test_schema_cross_backend_join.py"
 
 # Functional tests
 run_test "FlightSQL Client (MySQL backend)" "test_flightsql_client_mysql_backend.py"
@@ -101,7 +102,7 @@ run_test "PostgreSQL Client (ClickHouse backend)" "test_pg_client_ch_backend.py"
 run_test "FlightSQL Client (MySQL backend, mutable)" "test_flightsql_client_mysql_backend_mutable.py"
 
 # Cross-backend JOIN tests
-run_test "Cross-backend Queries (MySQL wire)" "test_cross_backend_queries.py"
+run_test "Cross-backend Queries (MySQL wire)" "test_cross_backend_queries_mysql.py"
 run_test "Cross-backend Queries (PostgreSQL wire)" "test_cross_backend_queries_pg.py"
 
 # Concurrency tests (sync-code regression net)

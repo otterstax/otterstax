@@ -413,6 +413,12 @@ public:
                   << std::endl;
         return parsed;
     }
+
+    core::result_wrapper_t<components::logical_plan::node_ptr>
+    parse_fragment(const std::string&, components::logical_plan::parameter_node_ptr) override {
+        return core::error_t{core::error_code_t::unimplemented_yet,
+                             "CrossBackendMockParser: parse_fragment not implemented"};
+    }
 };
 
 // Stateless factory for the cross-backend test: each Worker builds its own

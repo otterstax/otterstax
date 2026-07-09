@@ -131,6 +131,24 @@ cl::node_ptr ensure_aggregate_wrapper(cl::node_ptr node, std::pmr::memory_resour
     return wrapper;
 }
 
+// Depth-first search for the first match_t node in a freshly-parsed fragment:
+// the transformer wraps a WHERE predicate as aggregate -> ... -> match.
+cl::node_ptr find_match_node(const cl::node_ptr& node) {
+    if (!node) {
+        return nullptr;
+    }
+    if (node->type() == cl::node_type::match_t) {
+        return node;
+    }
+    for (const auto& child : node->children()) {
+        auto found = find_match_node(child);
+        if (found) {
+            return found;
+        }
+    }
+    return nullptr;
+}
+
 cl::join_type map_join_type(sc::Join::JoinType jt) {
     switch (jt) {
         case sc::Join::JOIN_TYPE_INNER:
@@ -225,14 +243,40 @@ node_result translate_filter(const sc::Filter& filter,
     auto input_node = ensure_aggregate_wrapper(input_res.value(), resource);
     auto names = get_names(input_node);
 
-    auto cond = expression_to_plan(filter.condition(), params, resource);
-    if (cond.has_error()) {
-        return cond.convert_error<cl::node_ptr>();
+    ce::expression_ptr predicate;
+    if (filter.condition().expr_type_case() == sc::Expression::kExpressionString) {
+        // PySpark's .filter("<sql>") sends the predicate as a raw SQL string
+        // (Expression.ExpressionString), not a structured tree. Route it through
+        // the real parser, materialising constants into the shared `params` node,
+        // so the predicate lands in the executable transformer form
+        // compare(key_t, parameter_id_t). The structured expression_to_plan path
+        // would instead emit a compare(expression, expression) that neither the
+        // remote SQL generator nor the local value-getter can evaluate.
+        std::string sql{"SELECT * FROM __otterstax_filter__ WHERE "};
+        sql += filter.condition().expression_string().expression();
+        auto frag = make_parser(resource)->parse_fragment(sql, params);
+        if (frag.has_error()) {
+            return frag;  // same result type (node_ptr) — forward the error as-is
+        }
+        auto match_node = find_match_node(frag.value());
+        if (!match_node || match_node->expressions().empty()) {
+            return make_error(core::error_code_t::unimplemented_yet,
+                              "Spark filter string did not translate to a predicate",
+                              resource);
+        }
+        predicate = match_node->expressions().front();
+    } else {
+        auto cond = expression_to_plan(filter.condition(), params, resource);
+        if (cond.has_error()) {
+            return cond.convert_error<cl::node_ptr>();
+        }
+        predicate = cond.value();
     }
+
     auto match = cl::make_node_match(resource,
                                      core::dbname_t{names.dbname},
                                      core::relname_t{names.relname},
-                                     cond.value());
+                                     predicate);
     input_node->append_child(match);
     return input_node;
 }
@@ -395,23 +439,26 @@ node_result translate_join(const sc::Join& join,
         }
         join_node->append_expression(cond.value());
     } else if (join.using_columns_size() > 0) {
+        // Emit the equi-join predicate in the executable transformer form
+        // compare(key_t, key_t) — a key_t implicitly converts to param_storage.
+        // The former compare(get_field_scalar, get_field_scalar) shape is not
+        // evaluable by the remote SQL generator or the local value-getter.
+        // The keys MUST carry a side (left/right): the join value-getter selects
+        // the input chunk by key.side(), and the validator rejects an
+        // undefined-side key whose bare name occurs in both inputs as ambiguous.
+        // The validator stamps key.path() from side+schema afterwards.
         if (join.using_columns_size() == 1) {
-            const auto& col = join.using_columns(0);
-            auto left_key = ce::key_t(resource, std::string_view(col));
-            auto right_key = ce::key_t(resource, std::string_view(col));
-            ce::expression_ptr left_expr = ce::make_scalar_expression(resource, ce::scalar_type::get_field, left_key);
-            ce::expression_ptr right_expr = ce::make_scalar_expression(resource, ce::scalar_type::get_field, right_key);
+            ce::key_t left_key(resource, std::string_view(join.using_columns(0)), ce::side_t::left);
+            ce::key_t right_key(resource, std::string_view(join.using_columns(0)), ce::side_t::right);
             join_node->append_expression(
-                ce::make_compare_expression(resource, ce::compare_type::eq, left_expr, right_expr));
+                ce::make_compare_expression(resource, ce::compare_type::eq, left_key, right_key));
         } else {
             auto and_expr = ce::make_compare_union_expression(resource, ce::compare_type::union_and);
             for (const auto& col : join.using_columns()) {
-                auto left_key = ce::key_t(resource, std::string_view(col));
-                auto right_key = ce::key_t(resource, std::string_view(col));
-                ce::expression_ptr left_expr = ce::make_scalar_expression(resource, ce::scalar_type::get_field, left_key);
-                ce::expression_ptr right_expr = ce::make_scalar_expression(resource, ce::scalar_type::get_field, right_key);
+                ce::key_t left_key(resource, std::string_view(col), ce::side_t::left);
+                ce::key_t right_key(resource, std::string_view(col), ce::side_t::right);
                 and_expr->append_child(
-                    ce::make_compare_expression(resource, ce::compare_type::eq, left_expr, right_expr));
+                    ce::make_compare_expression(resource, ce::compare_type::eq, left_key, right_key));
             }
             join_node->append_expression(and_expr);
         }
@@ -1013,7 +1060,9 @@ relation_to_plan(const sc::Plan& plan, std::pmr::memory_resource* resource) {
 
     auto root_node = ensure_aggregate_wrapper(root_result.value(), resource);
 
-    const auto param_count = static_cast<size_t>(params->next_id());
+    // Non-mutating count of materialised parameters (next_id() would advance the
+    // shared counter as a side effect of reading it).
+    const auto param_count = params->parameters().parameters.size();
 
     auto binder = cst::transform_result(
         resource,

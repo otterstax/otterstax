@@ -9,6 +9,8 @@
 #include <components/logical_plan/forward.hpp>  // node_type
 #include <components/logical_plan/node_limit.hpp>
 #include <components/logical_plan/node.hpp>
+#include <components/expressions/compare_expression.hpp>
+#include <components/types/logical_value.hpp>
 
 #include "otterbrix/parser/parser.hpp"  // ParsedQueryData
 #include "types/otterbrix.hpp"          // OtterbrixStatement / external_entry_t
@@ -22,6 +24,7 @@ namespace {
 
 namespace sc = ::spark::connect;
 namespace cl = components::logical_plan;
+namespace ce = components::expressions;
 
 // Builds a Read.NamedTable plan for `identifier`.
 sc::Plan make_read_plan(const std::string& identifier) {
@@ -115,6 +118,85 @@ TEST_CASE("relation_to_plan: Filter with condition") {
     REQUIRE(children.size() == 1);
     CHECK(children[0]->type() == cl::node_type::match_t);
     CHECK(children[0]->expressions().size() == 1);
+}
+
+TEST_CASE("relation_to_plan: Filter with ExpressionString predicate (raw SQL)") {
+    std::pmr::synchronized_pool_resource pool;
+    auto* resource = &pool;
+
+    sc::Plan plan;
+    auto* filter = plan.mutable_root()->mutable_filter();
+    *filter->mutable_input() = make_read_relation("db1.t1");
+    // condition arrives as a raw SQL string, as PySpark's .filter("budget > 0")
+    // sends it (Expression.ExpressionString), not a structured expression tree.
+    filter->mutable_condition()->mutable_expression_string()->set_expression("budget > 0");
+
+    auto result = frontend::spark::relation_to_plan(plan, resource);
+    REQUIRE_FALSE(result.has_error());
+
+    auto& parsed = result.value().parsed_data;
+    REQUIRE(parsed != nullptr);
+    REQUIRE(parsed->otterbrix_params->node != nullptr);
+
+    const auto& children = parsed->otterbrix_params->node->children();
+    REQUIRE(children.size() == 1);
+    REQUIRE(children[0]->type() == cl::node_type::match_t);
+    REQUIRE(children[0]->expressions().size() == 1);
+
+    // The predicate must be in the executable transformer form: a plain key on
+    // the field side and a bound parameter (neither a raw key nor a nested
+    // expression) on the value side — NOT the non-executable Spark shape
+    // compare(get_field_scalar, constant_scalar).
+    const auto& pred = children[0]->expressions()[0];
+    const auto* cmp = static_cast<const ce::compare_expression_t*>(pred.get());
+    CHECK(cmp->type() == ce::compare_type::gt);
+    CHECK(ce::is_key(cmp->left()));
+    CHECK_FALSE(ce::is_key(cmp->right()));
+    CHECK_FALSE(ce::is_expr(cmp->right()));
+
+    // The constant 0 was materialised into the SHARED parameter node (single
+    // id-space), so remote SQL generation / local execution can resolve it.
+    const auto& pmap = parsed->otterbrix_params->params_node->parameters().parameters;
+    REQUIRE(pmap.size() == 1);
+    CHECK(pmap.begin()->second.value<int64_t>() == 0);
+}
+
+// ── Join ────────────────────────────────────────────────────────────────────────
+
+TEST_CASE("relation_to_plan: Join using_columns builds an equi-compare in key form") {
+    std::pmr::synchronized_pool_resource pool;
+    auto* resource = &pool;
+
+    sc::Plan plan;
+    auto* join = plan.mutable_root()->mutable_join();
+    *join->mutable_left() = make_read_relation("db1.a");
+    *join->mutable_right() = make_read_relation("db1.b");
+    join->set_join_type(sc::Join::JOIN_TYPE_INNER);
+    join->add_using_columns("campaign_id");
+
+    auto result = frontend::spark::relation_to_plan(plan, resource);
+    REQUIRE_FALSE(result.has_error());
+
+    auto& parsed = result.value().parsed_data;
+    REQUIRE(parsed != nullptr);
+    const auto& children = parsed->otterbrix_params->node->children();
+    REQUIRE(children.size() == 1);
+    REQUIRE(children[0]->type() == cl::node_type::join_t);
+    REQUIRE(children[0]->expressions().size() == 1);
+
+    const auto& cond = children[0]->expressions()[0];
+    const auto* cmp = static_cast<const ce::compare_expression_t*>(cond.get());
+    CHECK(cmp->type() == ce::compare_type::eq);
+    // Executable transformer form: both operands are plain keys, not get_field
+    // scalar expressions (which neither the remote generator nor the local
+    // value-getter can evaluate).
+    REQUIRE(ce::is_key(cmp->left()));
+    REQUIRE(ce::is_key(cmp->right()));
+    // The keys must carry opposite sides — the join value-getter selects the
+    // input chunk by key.side(), and an undefined-side bare key that occurs in
+    // both inputs is rejected as ambiguous by the validator.
+    CHECK(ce::as_key(cmp->left()).side() == ce::side_t::left);
+    CHECK(ce::as_key(cmp->right()).side() == ce::side_t::right);
 }
 
 // ── Project ───────────────────────────────────────────────────────────────────

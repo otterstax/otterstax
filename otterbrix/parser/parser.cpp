@@ -13,6 +13,7 @@
 
 #include <algorithm>
 
+#include <components/logical_plan/execution_plan.hpp>
 #include <components/logical_plan/node_aggregate.hpp>
 #include <components/logical_plan/node_catalog_resolve.hpp>
 #include <components/logical_plan/node_drop.hpp>
@@ -385,6 +386,48 @@ core::result_wrapper_t<ParsedQueryDataPtr> GreenplumParser::parse(const std::str
         return core::error_t{core::error_code_t::sql_parse_error, e.what()};
     } catch (...) {
         log_->error("parse: caught unknown exception");
+        return core::error_t{core::error_code_t::sql_parse_error, std::pmr::string{"syntax error", resource_}};
+    }
+}
+
+core::result_wrapper_t<logical_plan::node_ptr>
+GreenplumParser::parse_fragment(const std::string& sql, logical_plan::parameter_node_ptr shared_params) {
+    OTX_ZONE_N("otterbrix::parse_fragment");
+    log_->info("parse_fragment: starting for: {}", sql.substr(0, 100));
+    try {
+        tracy_memory_resource arena_mr(resource_, "parser::arena");
+        std::pmr::monotonic_buffer_resource arena_resource(&arena_mr);
+        sql::transform::transformer transformer(resource_);
+
+        auto* raw = raw_parser(&arena_resource, sql.c_str());
+        if (!raw || list_length(raw) == 0) {
+            log_->error("parse_fragment: raw_parser returned no statements for SQL: {}", sql.substr(0, 100));
+            return core::error_t{core::error_code_t::sql_parse_error,
+                                 std::pmr::string{"syntax error", resource_}};
+        }
+        ::Node* res = reinterpret_cast<::Node*>(linitial(raw));
+        otterstax::parser::promote_three_part_qualifiers(res);
+
+        // Feed the caller's parameter node through the transformer's
+        // execution_plan path so every constant lands in the shared id-space.
+        // The 3-arg ctor seeds sub_queries with {nullptr}; the transformer
+        // (mirroring its own single-arg transform) expects an empty sub_queries
+        // at transform time and appends the result itself, so clear it first —
+        // otherwise the stray null breaks the sub_query/result invariant.
+        logical_plan::execution_plan_t plan(resource_, nullptr, shared_params);
+        plan.sub_queries.clear();
+        auto node = transformer.transform(sql::transform::pg_cell_to_node_cast(res), &plan);
+        if (!node) {
+            log_->error("parse_fragment: transformer returned null root node — unsupported statement");
+            return core::error_t{core::error_code_t::unimplemented_yet,
+                                 std::pmr::string{"Unsupported node type", resource_}};
+        }
+        return node;
+    } catch (const std::exception& e) {
+        log_->error("parse_fragment: caught exception: {}", e.what());
+        return core::error_t{core::error_code_t::sql_parse_error, e.what()};
+    } catch (...) {
+        log_->error("parse_fragment: caught unknown exception");
         return core::error_t{core::error_code_t::sql_parse_error, std::pmr::string{"syntax error", resource_}};
     }
 }

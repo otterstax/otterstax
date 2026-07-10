@@ -231,11 +231,11 @@ def test_cross_backend_join_schema(host='0.0.0.0', mysql_port=8816):
         mysql_count = cursor.fetchone()[0]
         print(f"✓ MySQL campaigns table: {mysql_count} rows")
         
-        # Check for matching campaign_ids
+        # Check for matching campaign_ids (JOIN instead of IN-subquery)
         cursor.execute("""
             SELECT COUNT(DISTINCT p.campaign_id)
             FROM products.pgdb.public.products p
-            WHERE p.campaign_id IN (SELECT campaign_id FROM campaigns.db1.schema.campaigns)
+            JOIN campaigns.db1.schema.campaigns c ON p.campaign_id = c.campaign_id
         """)
         matching_count = cursor.fetchone()[0]
         print(f"✓ Products with matching campaigns: {matching_count}")

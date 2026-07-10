@@ -22,7 +22,7 @@ RUN apt update && \
     apt clean && \
     rm -rf /var/lib/apt/lists/*
 
-RUN    pip3 install --no-cache-dir conan==2.20.0 pytest==6.2.5 cmake
+RUN    pip3 install --no-cache-dir conan==2.21.0 pytest==6.2.5 cmake
 
 # Create conan directory and set permissions for vscode user
 RUN mkdir -p /conan && chown -R vscode:vscode /conan

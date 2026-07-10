@@ -176,7 +176,7 @@ BENCHMARK(BM_pipeline_three_backend);
 // ── table_reference ───────────────────────────────────────────────────────────
 
 static void BM_table_reference_mysql(benchmark::State& state) {
-    collection_full_name_t name{"bill", "orders"};
+    qualified_name_t name{"bill", "orders"};
     for (auto _ : state) {
         auto ref = sql_gen::table_reference(name, backend_type_t::MySQL);
         benchmark::DoNotOptimize(ref);
@@ -185,7 +185,7 @@ static void BM_table_reference_mysql(benchmark::State& state) {
 BENCHMARK(BM_table_reference_mysql);
 
 static void BM_table_reference_pg(benchmark::State& state) {
-    collection_full_name_t name{"shop", "products"};
+    qualified_name_t name{"shop", "products"};
     for (auto _ : state) {
         auto ref = sql_gen::table_reference(name, backend_type_t::PostgreSQL);
         benchmark::DoNotOptimize(ref);
@@ -194,7 +194,7 @@ static void BM_table_reference_pg(benchmark::State& state) {
 BENCHMARK(BM_table_reference_pg);
 
 static void BM_table_reference_ch(benchmark::State& state) {
-    collection_full_name_t name{"events", "sessions"};
+    qualified_name_t name{"events", "sessions"};
     for (auto _ : state) {
         auto ref = sql_gen::table_reference(name, backend_type_t::ClickHouse);
         benchmark::DoNotOptimize(ref);

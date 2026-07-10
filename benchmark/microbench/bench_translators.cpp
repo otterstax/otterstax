@@ -56,7 +56,7 @@ clickhouse::Block make_ch_block(int rows) {
 
 // Build a flat STRUCT type with N integer columns for schema-conversion benchmarks.
 complex_logical_type make_wide_struct(int ncols) {
-    std::vector<complex_logical_type> fields;
+    std::pmr::vector<complex_logical_type> fields;
     fields.reserve(ncols);
     for (int i = 0; i < ncols; ++i) {
         fields.emplace_back(logical_type::INTEGER);
@@ -127,9 +127,10 @@ BENCHMARK(BM_ch_to_chunk_multiblock_10k);
 
 // Schema extraction only (no row data).
 static void BM_ch_to_struct(benchmark::State& state) {
+    auto* res  = std::pmr::get_default_resource();
     auto block = make_ch_block(0); // zero rows, schema present
     for (auto _ : state) {
-        auto s = tsl::ch_to_struct(block);
+        auto s = tsl::ch_to_struct(res, block);
         benchmark::DoNotOptimize(s);
     }
 }
@@ -183,9 +184,10 @@ BENCHMARK(BM_mysql_type_mapping_all);
 // test_pg_to_chunk.cpp).  This measures the schema-dispatch overhead alone.
 
 static void BM_pg_to_struct(benchmark::State& state) {
-    PGresult* r = PQmakeEmptyPGresult(nullptr, PGRES_TUPLES_OK);
+    auto*     res = std::pmr::get_default_resource();
+    PGresult* r   = PQmakeEmptyPGresult(nullptr, PGRES_TUPLES_OK);
     for (auto _ : state) {
-        auto s = tsl::pg_to_struct(r);
+        auto s = tsl::pg_to_struct(res, r);
         benchmark::DoNotOptimize(s);
     }
     PQclear(r);
@@ -279,7 +281,7 @@ BENCHMARK(BM_chunk_to_arrow_schema_vec_50col);
 static void BM_chunk_to_arrow_full_100(benchmark::State& state) {
     auto* res = std::pmr::get_default_resource();
     auto block = make_ch_block(100);
-    auto schema = to_arrow_schema(tsl::ch_to_struct(block));
+    auto schema = to_arrow_schema(tsl::ch_to_struct(res, block));
     for (auto _ : state) {
         auto chunk = tsl::ch_to_chunk(res, block);
         auto reader = ChunkBatchReader::Make(schema, std::move(chunk)).ValueOrDie();
@@ -295,7 +297,7 @@ BENCHMARK(BM_chunk_to_arrow_full_100);
 static void BM_chunk_to_arrow_full_1k(benchmark::State& state) {
     auto* res = std::pmr::get_default_resource();
     auto block = make_ch_block(1000);
-    auto schema = to_arrow_schema(tsl::ch_to_struct(block));
+    auto schema = to_arrow_schema(tsl::ch_to_struct(res, block));
     for (auto _ : state) {
         auto chunk = tsl::ch_to_chunk(res, block);
         auto reader = ChunkBatchReader::Make(schema, std::move(chunk)).ValueOrDie();
@@ -311,7 +313,7 @@ BENCHMARK(BM_chunk_to_arrow_full_1k);
 static void BM_chunk_to_arrow_full_10k(benchmark::State& state) {
     auto* res = std::pmr::get_default_resource();
     auto block = make_ch_block(10000);
-    auto schema = to_arrow_schema(tsl::ch_to_struct(block));
+    auto schema = to_arrow_schema(tsl::ch_to_struct(res, block));
     for (auto _ : state) {
         auto chunk = tsl::ch_to_chunk(res, block);
         auto reader = ChunkBatchReader::Make(schema, std::move(chunk)).ValueOrDie();

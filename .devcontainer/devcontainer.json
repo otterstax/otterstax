@@ -35,7 +35,8 @@
 	"mounts": [
 		"source=${env:HOME}/.bash_history,target=/home/vscode/.bash_history,type=bind,consistency=cached",
 		"source=${env:HOME}/.zsh_history,target=/home/vscode/.zsh_history,type=bind,consistency=cached",
-		"source=conan_cache,target=/conan,type=volume,consistency=cached"
+		"source=conan_cache,target=/conan,type=volume,consistency=cached",
+		"source=/Users/sergei/dev/otter-work/otterbrix,target=/workspaces/otterbrix-local,type=bind,consistency=cached"
 	],
 
 	// Configure tool-specific properties.

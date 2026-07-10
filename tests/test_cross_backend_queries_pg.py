@@ -4,7 +4,7 @@
 """
 Cross-backend INNER JOIN tests via PostgreSQL wire protocol (port 8817).
 
-Same query set as test_cross_backend_queries.py but issued over the PostgreSQL
+Same query set as test_cross_backend_queries_mysql.py but issued over the PostgreSQL
 wire protocol. Running both lets you isolate frontend-specific issues.
 
 Covers:

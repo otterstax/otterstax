@@ -39,15 +39,17 @@ namespace {
     }
 } // namespace
 
-namespace http_server {
+namespace conn::api_server {
     Session::Session(tcp::socket socket,
                      std::shared_ptr<mysql::ConnectorManager> mysql_conn_manager,
                      std::shared_ptr<pg::ConnectorManager> pg_conn_manager,
-                     std::shared_ptr<ch::ConnectorManager> ch_conn_manager)
+                     std::shared_ptr<ch::ConnectorManager> ch_conn_manager,
+                     actor_zeta::address_t s3_manager)
         : socket_(std::move(socket))
         , mysql_conn_manager_(std::move(mysql_conn_manager))
         , pg_conn_manager_(std::move(pg_conn_manager))
-        , ch_conn_manager_(std::move(ch_conn_manager)) {}
+        , ch_conn_manager_(std::move(ch_conn_manager))
+        , s3_manager_(std::move(s3_manager)) {}
 
     void Session::start() { read_request(); }
 
@@ -72,7 +74,6 @@ namespace http_server {
             response_.set(http::field::content_type, "application/json");
             response_.body() = R"({"status": "healthy", "timestamp": ")" + get_current_timestamp() + "\"}";
             response_.content_length(response_.body().size());
-            // Health check OK
         } else if (request_.method() == http::verb::post && request_.target() == "/add_connection") {
             OTX_ZONE_N("http::add_connection");
             try {
@@ -121,7 +122,6 @@ namespace http_server {
                     .username = json_body.at("username").as_string().c_str(),
                     .password = json_body.at("password").as_string().c_str(),
                     .database = json_body.at("database").as_string().c_str(),
-                    // schema is optional, defaults to "public"
                     .schema = json_body.as_object().contains("schema") ? json_body.at("schema").as_string().c_str()
                                                                        : "public",
                     .table = json_body.at("table").as_string().c_str(),
@@ -265,6 +265,68 @@ namespace http_server {
                 response_.result(http::status::bad_request);
                 response_.body() = std::string("ERROR: ") + e.what();
             }
+        } else if (request_.method() == http::verb::get && request_.target() == "/s3/add_credentials") {
+            try {
+                auto json_body = boost::json::parse(request_.body()).as_object();
+                for (const auto& key : {"alias", "access_key", "secret_key"}) {
+                    if (!json_body.contains(key)) {
+                        response_.result(http::status::bad_request);
+                        response_.body() = std::string("Missing key: ") + key;
+                        write_response();
+                        return;
+                    }
+                }
+                s3::connect_params params{
+                    .region        = json_body.contains("region")
+                                         ? std::string(json_body.at("region").as_string()) : "",
+                    .access_key    = std::string(json_body.at("access_key").as_string()),
+                    .secret_key    = std::string(json_body.at("secret_key").as_string()),
+                    .session_token = json_body.contains("session_token")
+                                         ? std::string(json_body.at("session_token").as_string()) : "",
+                    .endpoint      = json_body.contains("endpoint")
+                                         ? std::string(json_body.at("endpoint").as_string()) : "",
+                    .alias         = std::string(json_body.at("alias").as_string()),
+                };
+                auto fut = actor_zeta::send(s3_manager_, &s3::ConnectorManager::add_credentials, session_id().hash(), std::move(params));
+                auto result = std::move(fut.second).take_ready();
+                if (!result.has_error()) {
+                    response_.result(http::status::ok);
+                    response_.set(http::field::content_type, "application/json");
+                    response_.body() = std::string("S3 credentials added");
+                } else {
+                    response_.result(http::status::internal_server_error);
+                    response_.body() = std::string(result.error().what.c_str());
+                }
+                response_.content_length(response_.body().size());
+            } catch (const std::exception& e) {
+                response_.result(http::status::bad_request);
+                response_.body() = std::string("ERROR: ") + e.what();
+            }
+        } else if (request_.method() == http::verb::post && request_.target() == "/s3/remove_credentials") {
+            try {
+                auto json_body = boost::json::parse(request_.body()).as_object();
+                if (!json_body.contains("alias")) {
+                    response_.result(http::status::bad_request);
+                    response_.body() = std::string("Missing key: alias");
+                    write_response();
+                    return;
+                }
+                std::string alias = std::string(json_body.at("alias").as_string());
+                auto fut = actor_zeta::send(s3_manager_, &s3::ConnectorManager::remove_credentials, session_id().hash(), std::move(alias));
+                auto result = std::move(fut.second).take_ready();
+                if (!result.has_error()) {
+                    response_.result(http::status::ok);
+                    response_.set(http::field::content_type, "application/json");
+                    response_.body() = std::string("S3 credentials removed");
+                } else {
+                    response_.result(http::status::internal_server_error);
+                    response_.body() = std::string(result.error().what.c_str());
+                }
+                response_.content_length(response_.body().size());
+            } catch (const std::exception& e) {
+                response_.result(http::status::bad_request);
+                response_.body() = std::string("ERROR: ") + e.what();
+            }
         } else {
             response_.result(http::status::not_found);
             response_.body() = "Resource not found";
@@ -285,12 +347,14 @@ namespace http_server {
                    unsigned short port,
                    std::shared_ptr<mysql::ConnectorManager> mysql_conn_manager,
                    std::shared_ptr<pg::ConnectorManager> pg_conn_manager,
-                   std::shared_ptr<ch::ConnectorManager> ch_conn_manager)
+                   std::shared_ptr<ch::ConnectorManager> ch_conn_manager,
+                   actor_zeta::address_t s3_manager)
         : ioc_(ioc)
         , acceptor_(ioc, tcp::endpoint(tcp::v4(), port))
         , mysql_conn_manager_(std::move(mysql_conn_manager))
         , pg_conn_manager_(std::move(pg_conn_manager))
-        , ch_conn_manager_(std::move(ch_conn_manager)) {
+        , ch_conn_manager_(std::move(ch_conn_manager))
+        , s3_manager_(std::move(s3_manager)) {
         accept();
     }
 
@@ -298,9 +362,13 @@ namespace http_server {
         acceptor_.async_accept([this](beast::error_code ec, tcp::socket socket) {
             OTX_ZONE_N("http::accept");
             if (!ec)
-                std::make_shared<Session>(std::move(socket), mysql_conn_manager_, pg_conn_manager_, ch_conn_manager_)
+                std::make_shared<Session>(std::move(socket),
+                                          mysql_conn_manager_,
+                                          pg_conn_manager_,
+                                          ch_conn_manager_,
+                                          s3_manager_)
                     ->start();
             accept();
         });
     }
-} // namespace http_server
+} // namespace conn::api_server

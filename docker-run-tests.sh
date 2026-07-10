@@ -237,9 +237,9 @@ if [ -n "${IMAGE_TAG}" ]; then
     # CI / sanitizer path: test-otterstax image is pre-built with specific
     # build-args (e.g. ENABLE_ASAN / ENABLE_TSAN) by the workflow
     echo "ℹ️  IMAGE_TAG=${IMAGE_TAG} set; skipping test-otterstax build"
-    compose build test-client
+    compose build test-client minio-init
 else
-    compose build test-client test-otterstax
+    compose build test-client test-otterstax minio-init
 fi
 
 echo "✅ Previous containers and volumes removed"
@@ -248,6 +248,10 @@ echo ""
 echo "=== Step 2: Starting databases ==="
 echo ""
 compose up -d mariadb1 mariadb2 postgres1 clickhouse1
+
+# MinIO for the s3 external-table tests; minio-init seeds test-bucket then exits.
+echo "🪣 Starting MinIO + seeding test-bucket..."
+compose up -d minio minio-init
 
 echo ""
 echo "=== Step 3: Waiting for databases to be ready ==="
@@ -355,6 +359,22 @@ wait_for_database_init mariadb2 user2 password2 db2 impressions
 wait_for_pg_table postgres1 pguser pgdb products
 wait_for_ch_table clickhouse1 chuser chpassword chdb orders
 
+# Wait for the one-shot minio-init to finish seeding test-bucket so the s3
+# external-table tests find their fixtures. It exits after seeding.
+echo "🕒 Waiting for MinIO bucket seeding to complete..."
+for i in {1..60}; do
+    status=$(docker inspect test-minio-init --format '{{.State.Status}}' 2>/dev/null || echo "missing")
+    if [ "$status" = "exited" ]; then
+        echo "✅ MinIO test-bucket seeded"
+        break
+    fi
+    sleep 2
+    if [ $i -eq 60 ]; then
+        echo "⚠️  minio-init did not finish in time; s3 tests may retry"
+        compose logs minio-init | tail -10 2>/dev/null || true
+    fi
+done
+
 echo ""
 echo "=== Step 7: Starting otterstax ==="
 echo ""
@@ -433,6 +453,7 @@ if $TRACY_SEP; then
         "FlightSQL Schema (PostgreSQL backend):test_schema_flightsql_client_pg_backend.py"
         "FlightSQL Schema (ClickHouse backend):test_schema_flightsql_client_ch_backend.py"
         "Cross-backend Schema:test_schema_cross_backend.py"
+        "Cross-backend JOIN Schema:test_schema_cross_backend_join.py"
         "FlightSQL Client (MySQL backend):test_flightsql_client_mysql_backend.py"
         "FlightSQL Client (PostgreSQL backend):test_flightsql_client_pg_backend.py"
         "FlightSQL Client (ClickHouse backend):test_flightsql_client_ch_backend.py"
@@ -443,8 +464,17 @@ if $TRACY_SEP; then
         "MySQL Client (ClickHouse backend):test_mysql_client_ch_backend.py"
         "PostgreSQL Client (ClickHouse backend):test_pg_client_ch_backend.py"
         "FlightSQL Client (MySQL backend, mutable):test_flightsql_client_mysql_backend_mutable.py"
-        "Cross-backend Queries (MySQL wire):test_cross_backend_queries.py"
+        "Cross-backend Queries (MySQL wire):test_cross_backend_queries_mysql.py"
         "Cross-backend Queries (PostgreSQL wire):test_cross_backend_queries_pg.py"
+        "Schema MySQL Client (file external):test_schema_mysql_file.py"
+        "Schema MySQL Client (s3 external):test_schema_mysql_s3.py"
+        "MySQL Client (file external):test_mysql_file.py"
+        "MySQL Client (file external, ndjson):test_mysql_file_ndjson.py"
+        "MySQL Client (s3 external):test_mysql_s3.py"
+        "MySQL Client (JOIN sql ⋈ s3 parquet → s3 csv):test_mysql_join_sql_s3_to_s3.py"
+        "MySQL Client (JOIN otterbrix-local ⋈ s3 parquet):test_mysql_join_otb_local_s3.py"
+        "MySQL Client (JOIN sql backend ⋈ otterbrix-local, string key):test_mysql_join_otb_local_backend.py"
+        "MySQL Client (JOIN s3 parquet ⋈ file csv ⋈ otterbrix-local):test_mysql_join_otb_local_s3_file.py"
     )
 
     SEP_PASSED=0

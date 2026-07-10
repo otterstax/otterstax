@@ -61,7 +61,7 @@ namespace ch {
         }
     }
 
-    std::string ConnectorManager::addConnection(http_server::ChConnectionParams connection_param) {
+    std::string ConnectorManager::addConnection(conn::api_server::ChConnectionParams connection_param) {
         OTX_ZONE_N("ch::ConnectorManager::addConnection(http)");
         connect_params params;
         log_->debug("Try add ClickHouse connection with alias: {}", connection_param.alias);

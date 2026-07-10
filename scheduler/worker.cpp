@@ -4,10 +4,13 @@
 #include "worker.hpp"
 
 #include "catalog/catalog_manager.hpp"
+#include "connectors/file/manager.hpp"
 #include "integration/clickhouse/connection_manager.hpp"
 #include "integration/otterbrix/otterbrix_manager.hpp"
 #include "integration/postgresql/connection_manager.hpp"
+#include "integration/s3/s3_manager.hpp"
 #include "integration/sql/connection_manager.hpp"
+#include "otterbrix/parser/grammar_extention/external_node.hpp"
 #include "utility/logger.hpp"
 #include "utility/timer.hpp"
 
@@ -28,7 +31,9 @@ Worker::Worker(std::pmr::memory_resource* res,
                actor_zeta::address_t pg_connection_manager,
                actor_zeta::address_t ch_connection_manager,
                actor_zeta::address_t otterbrix_manager,
-               actor_zeta::address_t catalog_manager)
+               actor_zeta::address_t catalog_manager,
+               actor_zeta::address_t s3_manager,
+               actor_zeta::address_t file_manager)
     : actor_zeta::basic_actor<Worker>(res)
     , resource_(res)
     , self_index_(self_index)
@@ -40,6 +45,8 @@ Worker::Worker(std::pmr::memory_resource* res,
     , ch_connection_manager_(ch_connection_manager)
     , otterbrix_manager_(otterbrix_manager)
     , catalog_manager_(catalog_manager)
+    , s3_manager_(s3_manager)
+    , file_manager_(file_manager)
     , metadata_map_(res) {
     assert(log_.is_valid());
     assert(res != nullptr);
@@ -81,6 +88,15 @@ Worker::execute(session_hash_t id, std::string sql) {
         }
 
         auto data = std::move(parsed.value());
+
+        // CREATE EXTERNAL TABLE / COPY ... TO parse into an external_node_t
+        // (tagged `unused`). Route to the file/s3 managers before the normal
+        // backend path, which cannot execute this node.
+        if (auto* ext = dynamic_cast<otterstax::external::external_node_t*>(data->otterbrix_params->node.get())) {
+            log_->debug("Worker::execute: external-table statement, routing to file/s3 manager");
+            co_return co_await handle_external_statement(id, *ext);
+        }
+
         bool has_external_nodes = data->otterbrix_params && data->otterbrix_params->external_nodes_count > 0;
         if (!has_external_nodes) {
             set_backend_type_otterbrix(id);
@@ -212,6 +228,13 @@ Worker::execute_statement(session_hash_t id) {
                               std::pmr::string{"No needed metadata found, unable to DoGet."}};
         }
 
+        // External-table statements (prepared via prepare_schema) carry an
+        // external_node_t; route to the file/s3 managers, bypassing backend routing.
+        if (auto* ext = dynamic_cast<otterstax::external::external_node_t*>(data_ptr->otterbrix_params->node.get())) {
+            log_->debug("Worker::execute_statement: external-table statement, routing to file/s3 manager");
+            co_return co_await handle_external_statement(id, *ext);
+        }
+
         if (backend_type == backend_type_t::MySQL || backend_type == backend_type_t::Mixed) {
             auto [ns_sql, sql_future] = actor_zeta::send(sql_connection_manager_,
                                                          &db::MySQLManager::execute,
@@ -331,6 +354,16 @@ Worker::prepare_schema(session_hash_t id, std::string sql) {
 
         auto parsed_data = std::move(parsed.value());
 
+        // CREATE EXTERNAL TABLE / COPY ... TO has no preparable result schema; it
+        // also lands on a `unused`-tagged node that must not reach the
+        // schema_node_t static_cast below. Stash an empty schema; the work runs
+        // in DoGet (execute_statement).
+        if (dynamic_cast<otterstax::external::external_node_t*>(parsed_data->otterbrix_params->node.get())) {
+            log_->debug("Worker::prepare_schema: external-table statement, returning empty schema");
+            parsed_data->backend_type = backend_type_t::Otterbrix;
+            co_return finish_schema_value(id, cursor::make_cursor(resource()), std::move(parsed_data));
+        }
+
         if (parsed_data->otterbrix_params->external_nodes_count) {
             auto [ns_cat, catalog_future] = actor_zeta::send(catalog_manager_,
                                                              &mysql::CatalogManager::get_catalog_schema,
@@ -390,6 +423,111 @@ Worker::prepare_schema(session_hash_t id, std::string sql) {
         log_->error("Worker::prepare_schema caught exception: {}", e.what());
         co_return core::error_t{error_code_t::other_error, std::pmr::string{e.what()}};
     }
+}
+
+// ─── External-table dispatch (CREATE EXTERNAL TABLE / COPY ... TO) ──────────
+// Both forms parse into an otterstax::external::external_node_t. The s3 / file
+// managers do the actual ingestion or export — neither lands on the regular
+// backend / otterbrix execute path. DDL and COPY produce no rows, so success
+// returns an empty session_payload.
+
+actor_zeta::unique_future<Worker::session_result>
+Worker::handle_external_statement(session_hash_t id, const otterstax::external::external_node_t& ext) {
+    OTX_ZONE_N("Worker::handle_external_statement");
+    using otterstax::external::external_op_t;
+    const bool s3 = ext.is_s3();
+
+    if (ext.op() == external_op_t::create_external_table) {
+        // CREATE EXTERNAL TABLE — load the file/object into the engine table.
+        if (s3) {
+            auto [ns_s3, fut] = actor_zeta::send(s3_manager_,
+                                                 &db::S3Manager::download,
+                                                 id,
+                                                 ext.s3_alias(),
+                                                 ext.object_path(),
+                                                 ext.database(),
+                                                 ext.table());
+            auto r = co_await std::move(fut);
+            if (r.has_error()) {
+                co_return core::error_t{error_code_t::other_error,
+                                  std::pmr::string{"CREATE EXTERNAL TABLE failed: "} +
+                                      std::pmr::string{r.error().what.c_str()}};
+            }
+        } else {
+            conn::file::FileAddParams params;
+            params.database = ext.database();
+            params.table = ext.table();
+            params.path = ext.location();
+            params.format = ext.format().empty() ? std::string{"auto"} : ext.format();
+            auto [ns_file, fut] = actor_zeta::send(file_manager_,
+                                                   &conn::file::FileManager::add_file,
+                                                   id,
+                                                   std::move(params));
+            auto r = co_await std::move(fut);
+            if (r.has_error() || !r.value()) {
+                const std::pmr::string why = r.has_error()
+                                                 ? std::pmr::string{r.error().what.c_str()}
+                                                 : std::pmr::string{"add_file returned false"};
+                co_return core::error_t{error_code_t::other_error,
+                                  std::pmr::string{"CREATE EXTERNAL TABLE failed: "} + why};
+            }
+        }
+    } else {
+        // COPY (<select>) TO — parse the inner query, then export its result.
+        if (ext.inner_sql().empty()) {
+            co_return core::error_t{error_code_t::other_error,
+                              std::pmr::string{"COPY ... TO: missing inner query"}};
+        }
+        auto inner = parser_->parse(ext.inner_sql());
+        if (inner.has_error()) {
+            co_return core::error_t{error_code_t::sql_parse_error,
+                              std::pmr::string{"COPY ... TO: "} +
+                                  std::pmr::string{inner.error().what.c_str()}};
+        }
+        auto statement = std::move(inner.value()->otterbrix_params);
+
+        if (s3) {
+            auto [ns_s3, fut] = actor_zeta::send(s3_manager_,
+                                                 &db::S3Manager::upload,
+                                                 id,
+                                                 ext.s3_alias(),
+                                                 ext.object_path(),
+                                                 std::move(statement));
+            auto r = co_await std::move(fut);
+            if (r.has_error()) {
+                co_return core::error_t{error_code_t::other_error,
+                                  std::pmr::string{"COPY ... TO failed: "} +
+                                      std::pmr::string{r.error().what.c_str()}};
+            }
+        } else {
+            const conn::file::FileFormat fmt = conn::file::resolve_format(ext.format(), ext.location());
+            if (fmt == conn::file::FileFormat::Unknown) {
+                co_return core::error_t{error_code_t::other_error,
+                                  std::pmr::string{"COPY ... TO: cannot determine file format for '"} +
+                                      std::pmr::string{ext.location().c_str()} + std::pmr::string{"'"}};
+            }
+            conn::file::FileMetadata meta;
+            meta.statement = std::move(statement);
+            meta.path = ext.location();
+            meta.format = fmt;
+            auto [ns_file, fut] = actor_zeta::send(file_manager_,
+                                                   &conn::file::FileManager::dump_file,
+                                                   id,
+                                                   std::move(meta));
+            auto r = co_await std::move(fut);
+            if (r.has_error()) {
+                co_return core::error_t{error_code_t::other_error,
+                                  std::pmr::string{"COPY ... TO failed: "} +
+                                      std::pmr::string{r.error().what.c_str()}};
+            }
+        }
+    }
+
+    // Successful DDL / COPY: clear any stashed session metadata (prepare_schema
+    // would have inserted an entry for the unused-node) and return an empty
+    // payload — the frontend turns this into a 0-row result.
+    metadata_map_.erase(id);
+    co_return session_payload{resource()};
 }
 
 // ─── Helpers (per-worker, no locks) ─────────────────────────────────────────

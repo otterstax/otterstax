@@ -27,9 +27,17 @@ BUILD_JOBS=0
 IMAGE_TAG="${IMAGE_TAG:-bench}"
 FORCE_REBUILD=false   # set by --rebuild or --clear; bypasses image-existence check
 CLEAR=false           # set by --clear; removes images and volumes before building
+EXTERNAL_ENABLED=false  # set when any external_* test is selected (adds MinIO + fixtures)
 
-TESTS=(simple_select complex_select join_same_instance join_cross_engine join_all)
-BENCH_FILTER=()   # populated by --bench; empty = run all tests
+# external_* are opt-in via --bench: they need generated fixtures + MinIO, which
+# only spin up when selected.  They cover s3/file loading, internal joins and
+# dumps — no cross-backend / JOIN ALL workloads.
+DEFAULT_TESTS=(simple_select complex_select join_same_instance join_cross_engine join_all)
+ALL_TESTS=("${DEFAULT_TESTS[@]}"
+           external_load external_join external_dump
+           external_join_cross external_join_all)
+TESTS=("${DEFAULT_TESTS[@]}")
+BENCH_FILTER=()   # populated by --bench; empty = run default tests
 # arrow is excluded by default: OtterStax FlightSQL serializer crashes on JOIN
 # result sets > ~1000 rows.  Re-add with --frontend arrow once the bug is fixed.
 ALL_FRONTENDS=(mysql postgres arrow)
@@ -58,8 +66,12 @@ Options:
                       May be repeated. Default: mysql postgres.
                       arrow is excluded by default (FlightSQL JOIN bug — see CLAUDE.md).
   --bench T           Test(s) to run: simple_select | complex_select |
-                      join_same_instance | join_cross_engine | join_all
-                      May be repeated. Default: all tests.
+                      join_same_instance | join_cross_engine | join_all |
+                      external_load | external_join | external_dump |
+                      external_join_cross | external_join_all
+                      May be repeated. Default: the five cross-backend tests.
+                      external_* (s3/file: load, internal joins, dump) are opt-in
+                      and auto-start MinIO + generate fixtures. mysql/postgres only.
   --out-dir DIR       Root directory for result files
                       (default: benchmark_results/<YYYYMMDD_HHMMSS>)
 
@@ -180,13 +192,18 @@ fi
 
 if [ ${#BENCH_FILTER[@]} -gt 0 ]; then
     _filtered=()
-    for _t in "${TESTS[@]}"; do
+    for _t in "${ALL_TESTS[@]}"; do
         for _b in "${BENCH_FILTER[@]}"; do
             [ "$_t" = "$_b" ] && { _filtered+=("$_t"); break; }
         done
     done
     TESTS=("${_filtered[@]}")
 fi
+
+# External tests pull in MinIO + generated fixtures; detect once up front.
+for _t in "${TESTS[@]}"; do
+    case "$_t" in external_*) EXTERNAL_ENABLED=true ;; esac
+done
 
 # Auto-cap BUILD_JOBS when the user did not set -j explicitly.
 # C++ compilation peaks at ~1.5 GB per parallel job.  With Docker's memory
@@ -229,10 +246,14 @@ else
 fi
 
 _compose_backends() {
-    $COMPOSE_CMD -f "$BENCH_DIR/compose_backends.yml" "$@"
+    local _files=(-f "$BENCH_DIR/compose_backends.yml")
+    # External tests need a seeded MinIO alongside the DB backends.
+    $EXTERNAL_ENABLED && _files+=(-f "$BENCH_DIR/compose_minio.yml")
+    $COMPOSE_CMD "${_files[@]}" "$@"
 }
 _compose_otterstax() {
     local _files=(-f "$BENCH_DIR/compose_backends.yml" -f "$BENCH_DIR/compose_benchmark.yml")
+    $EXTERNAL_ENABLED && _files+=(-f "$BENCH_DIR/compose_minio.yml")
     # When --perf is active, include the perf overlay to add SYS_ADMIN/PERFMON
     # capabilities and disable seccomp on bench-otterstax so perf_event_open works.
     $ENABLE_PERF && _files+=(-f "$BENCH_DIR/compose_benchmark_perf.yml")
@@ -375,6 +396,32 @@ _register_connections() {
     _post_conn "$ch_url" \
         '{"alias":"ch2","host":"bench_clickhouse2","port":"9000","username":"chuser","password":"chpassword","database":"benchch2","table":""}' \
         "ch2"
+
+    $EXTERNAL_ENABLED && _register_s3_credentials
+}
+
+# ---------------------------------------------------------------------------
+# Helper: register the bench MinIO alias for s3 external tables.
+# GET /s3/add_credentials carries a JSON body (see connection_server.cpp);
+# the alias/bucket/endpoint must match benchmarks/external_common.py.
+# ---------------------------------------------------------------------------
+_register_s3_credentials() {
+    local url="http://bench_otterstax:8085/s3/add_credentials"
+    local payload='{"alias":"bench_minio","access_key":"minioadmin","secret_key":"minioadmin","region":"us-east-1","endpoint":"bench_minio:9000"}'
+    echo "Registering s3 credentials (bench_minio)..."
+    for ((attempt=1; attempt<=10; attempt++)); do
+        code=$(docker run --rm --network=bench_net benchmark-client:latest \
+                   curl -s -o /dev/null -w "%{http_code}" -X GET "$url" \
+                   -H "Content-Type: application/json" -d "$payload" 2>/dev/null)
+        if [ "$code" = "200" ] || [ "$code" = "201" ]; then
+            echo "  Registered s3 alias 'bench_minio'"
+            return 0
+        fi
+        echo "  s3 creds: HTTP $code ($attempt/10) — retrying..."
+        sleep 2
+    done
+    echo "  ERROR: failed to register s3 credentials"
+    return 1
 }
 
 # ---------------------------------------------------------------------------
@@ -568,6 +615,23 @@ if $ENABLE_PERF; then
 fi
 
 # ---------------------------------------------------------------------------
+# Step 1b: Generate s3/file external-table fixtures (only when needed)
+# Must happen before `up` so MinIO seeds the bucket and bench-otterstax mounts
+# the fixtures.  Written to benchmark/data/fixtures on the host (bind-mounted).
+# ---------------------------------------------------------------------------
+if $EXTERNAL_ENABLED; then
+    echo ""
+    echo "=== Step 1b: Generating external-table fixtures ==="
+    echo ""
+    mkdir -p "$BENCH_DIR/data/fixtures"
+    docker run --rm \
+        -v "$BENCH_DIR/data/fixtures:/app/data/fixtures" \
+        -e PYTHONUNBUFFERED=1 \
+        benchmark-client:latest \
+        python /app/data/generate_external_fixtures.py --out /app/data/fixtures
+fi
+
+# ---------------------------------------------------------------------------
 # Step 2: Start backend databases
 # ---------------------------------------------------------------------------
 echo ""
@@ -587,6 +651,7 @@ _wait_db_healthy bench_postgres1
 _wait_db_healthy bench_postgres2
 _wait_db_healthy bench_clickhouse1
 _wait_db_healthy bench_clickhouse2
+$EXTERNAL_ENABLED && _wait_db_healthy bench_minio
 
 echo "Giving databases extra time to stabilise..."
 sleep 5

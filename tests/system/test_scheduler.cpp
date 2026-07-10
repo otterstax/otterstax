@@ -119,7 +119,9 @@ TEST_CASE("base test case") {
                                                   pg_connection_manager->address(),
                                                   ch_connection_manager->address(),
                                                   otterbrix_manager->address(),
-                                                  catalog_manager->address());
+                                                  catalog_manager->address(),
+                                                  actor_zeta::address_t::empty_address(),
+                                                  actor_zeta::address_t::empty_address());
     assert(scheduler);
     std::string sql = "SELECT 1 AS test";
     session_id id; // Use session_id type for consistency
@@ -174,7 +176,9 @@ TEST_CASE("Error in connector test case") {
                                                   pg_connection_manager->address(),
                                                   ch_connection_manager->address(),
                                                   otterbrix_manager->address(),
-                                                  catalog_manager->address());
+                                                  catalog_manager->address(),
+                                                  actor_zeta::address_t::empty_address(),
+                                                  actor_zeta::address_t::empty_address());
     assert(scheduler);
     std::string sql = "SELECT 1 AS test";
     session_hash_t id = 1;
@@ -228,7 +232,9 @@ TEST_CASE("Error in otterbrix test case") {
                                                   pg_connection_manager->address(),
                                                   ch_connection_manager->address(),
                                                   otterbrix_manager->address(),
-                                                  catalog_manager->address());
+                                                  catalog_manager->address(),
+                                                  actor_zeta::address_t::empty_address(),
+                                                  actor_zeta::address_t::empty_address());
     assert(scheduler);
     std::string sql = "SELECT 1 AS test";
     session_hash_t id = 1;
@@ -281,7 +287,9 @@ TEST_CASE("Error in scheduler test case") {
                                                   pg_connection_manager->address(),
                                                   ch_connection_manager->address(),
                                                   otterbrix_manager->address(),
-                                                  catalog_manager->address());
+                                                  catalog_manager->address(),
+                                                  actor_zeta::address_t::empty_address(),
+                                                  actor_zeta::address_t::empty_address());
     assert(scheduler);
     std::string sql = "SELECT 1 AS test";
     session_hash_t id = 1;
@@ -335,7 +343,9 @@ TEST_CASE("Error in otterbrix + sql connector test case") {
                                                   pg_connection_manager->address(),
                                                   ch_connection_manager->address(),
                                                   otterbrix_manager->address(),
-                                                  catalog_manager->address());
+                                                  catalog_manager->address(),
+                                                  actor_zeta::address_t::empty_address(),
+                                                  actor_zeta::address_t::empty_address());
     assert(scheduler);
     std::string sql = "SELECT 1 AS test";
     session_hash_t id = 1;
@@ -461,7 +471,7 @@ TEST_CASE("Cross-backend JOIN detection test case") {
     mysql_conn_manager->addConnection(boost::mysql::connect_params{}, "campaigns");
 
     // For PostgreSQL, use the single-parameter overload
-    http_server::PgConnectionParams pg_params;
+    conn::api_server::PgConnectionParams pg_params;
     pg_params.alias = "products";
     pg_params.host = "localhost";
     pg_params.port = "5432";
@@ -482,7 +492,9 @@ TEST_CASE("Cross-backend JOIN detection test case") {
                                                   pg_connection_manager->address(),
                                                   ch_connection_manager->address(),
                                                   otterbrix_manager->address(),
-                                                  catalog_manager->address());
+                                                  catalog_manager->address(),
+                                                  actor_zeta::address_t::empty_address(),
+                                                  actor_zeta::address_t::empty_address());
     assert(scheduler);
 
     std::string sql = "SELECT * FROM products.pgdb.public.products p JOIN campaigns.db1.schema.campaigns c ON "
@@ -558,7 +570,9 @@ TEST_CASE("return empty test case") {
                                                   pg_connection_manager->address(),
                                                   ch_connection_manager->address(),
                                                   otterbrix_manager->address(),
-                                                  catalog_manager->address());
+                                                  catalog_manager->address(),
+                                                  actor_zeta::address_t::empty_address(),
+                                                  actor_zeta::address_t::empty_address());
     assert(scheduler);
     std::string sql = "SELECT 1 AS test";
     session_hash_t id = 1;
@@ -635,7 +649,7 @@ namespace {
             catalog_manager->set_pg_connector_manager(pg_conn_manager);
             catalog_manager->set_ch_connector_manager(ch_conn_manager);
 
-            http_server::PgConnectionParams pg_params;
+            conn::api_server::PgConnectionParams pg_params;
             pg_params.alias = "products";
             pg_params.host = "localhost";
             pg_params.port = "5432";

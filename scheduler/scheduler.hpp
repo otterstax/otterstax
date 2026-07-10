@@ -47,6 +47,10 @@ public:
     // no parser object is shared between actors (rule 10).
     using parser_factory_fn = parser_ptr (*)(std::pmr::memory_resource*);
 
+    // s3_manager / file_manager addresses are forwarded as-is to every Worker so
+    // CREATE EXTERNAL TABLE and COPY ... TO statements (parsed as
+    // otterstax::external::external_node_t) can be routed to db::S3Manager or
+    // conn::file::FileManager from inside the Worker pipeline.
     Scheduler(std::pmr::memory_resource* res,
               actor_zeta::scheduler_raw scheduler,
               std::size_t worker_count,
@@ -55,7 +59,9 @@ public:
               actor_zeta::address_t pg_connection_manager,
               actor_zeta::address_t ch_connection_manager,
               actor_zeta::address_t otterbrix_manager,
-              actor_zeta::address_t catalog_manager);
+              actor_zeta::address_t catalog_manager,
+              actor_zeta::address_t s3_manager,
+              actor_zeta::address_t file_manager);
     ~Scheduler();
 
     std::pmr::memory_resource* resource() const noexcept { return resource_; }

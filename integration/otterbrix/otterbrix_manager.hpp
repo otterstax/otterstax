@@ -15,6 +15,9 @@
 #include <components/table/column_definition.hpp>
 #include <core/result_wrapper.hpp>
 
+#include <components/table/column_definition.hpp>
+#include <components/vector/data_chunk.hpp>
+
 #include <memory_resource>
 #include <mutex>
 #include <string>
@@ -55,11 +58,18 @@ namespace db {
         // Drops the engine database "<db_name>" together with all collections.
         actor_zeta::unique_future<core::result_wrapper_t<bool>> drop_external_database(std::string db_name);
 
+        actor_zeta::unique_future<core::result_wrapper_t<bool>> create_table(session_hash_t id,
+                                                                             std::string database,
+                                                                             std::string table,
+                                                                             components::vector::data_chunk_t chunk);
+
         using dispatch_traits = actor_zeta::dispatch_traits<&OtterbrixManager::execute,
                                                             &OtterbrixManager::get_schema,
+                                                            &OtterbrixManager::create_table,
                                                             &OtterbrixManager::register_external_database,
                                                             &OtterbrixManager::register_external_table,
                                                             &OtterbrixManager::drop_external_database>;
+
 
         actor_zeta::behavior_t behavior(actor_zeta::mailbox::message* msg);
 

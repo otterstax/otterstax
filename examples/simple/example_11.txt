@@ -1,0 +1,3 @@
+COPY (SELECT * FROM ext.events_s3 WHERE value > 100)
+    TO 's3://test-bucket/exports/high_value_events.csv'
+    WITH (s3_alias = 's3', format = 'csv');

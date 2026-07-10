@@ -6,7 +6,21 @@
 
 #include "utility/logger.hpp"
 
+#include <arrow/filesystem/s3fs.h>
+
 #include <filesystem>
+
+// FileManager/S3Manager construction (reachable via the Scheduler stack) calls
+// arrow::fs::EnsureS3Initialized() transitively. Arrow requires a matching
+// FinalizeS3() before exit or it warns and may segfault during static teardown.
+struct S3Finalizer : Catch::TestEventListenerBase {
+    using TestEventListenerBase::TestEventListenerBase;
+    void testRunEnded(Catch::TestRunStats const&) override {
+        if (arrow::fs::IsS3Initialized())
+            (void) arrow::fs::FinalizeS3();
+    }
+};
+CATCH_REGISTER_LISTENER(S3Finalizer)
 
 // Several system tests construct GreenplumParser (and other components that
 // log through get_logger) directly; the named loggers must exist before the

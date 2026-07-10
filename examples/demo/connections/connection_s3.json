@@ -1,0 +1,7 @@
+{
+    "alias": "demo_s3",
+    "access_key": "minioadmin",
+    "secret_key": "minioadmin",
+    "region": "us-east-1",
+    "endpoint": "demo-minio:9000"
+}

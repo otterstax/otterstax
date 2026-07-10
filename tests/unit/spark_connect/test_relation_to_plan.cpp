@@ -9,6 +9,7 @@
 #include <components/logical_plan/forward.hpp>  // node_type
 #include <components/logical_plan/node_limit.hpp>
 #include <components/logical_plan/node.hpp>
+#include <components/logical_plan/node_data.hpp>
 #include <components/expressions/compare_expression.hpp>
 #include <components/types/logical_value.hpp>
 
@@ -219,6 +220,37 @@ TEST_CASE("relation_to_plan: Join using_columns builds an equi-compare in key fo
     // both inputs is rejected as ambiguous by the validator.
     CHECK(ce::as_key(cmp->left()).side() == ce::side_t::left);
     CHECK(ce::as_key(cmp->right()).side() == ce::side_t::right);
+}
+
+// ── Range ─────────────────────────────────────────────────────────────────────
+
+TEST_CASE("relation_to_plan: Range materialises a single column named id") {
+    std::pmr::synchronized_pool_resource pool;
+    auto* resource = &pool;
+
+    sc::Plan plan;
+    auto* range = plan.mutable_root()->mutable_range();
+    range->set_start(0);
+    range->set_end(10);
+    range->set_step(1);
+
+    auto result = frontend::spark::relation_to_plan(plan, resource);
+    REQUIRE_FALSE(result.has_error());
+
+    auto& parsed = result.value().parsed_data;
+    REQUIRE(parsed != nullptr);
+    const auto& children = parsed->otterbrix_params->node->children();
+    REQUIRE(children.size() == 1);
+    REQUIRE(children[0]->type() == cl::node_type::data_t);
+
+    // spark.range emits exactly one LongType column named "id". The alias is
+    // load-bearing: an anonymous column (extension_ == nullptr) crashes the engine's
+    // plan validator, which reads col.type.alias() without a has_alias() guard.
+    const auto* data_node = static_cast<const cl::node_data_t*>(children[0].get());
+    const auto col_types = data_node->data_chunk().types();
+    REQUIRE(col_types.size() == 1);
+    CHECK(col_types[0].has_alias());
+    CHECK(std::string(col_types[0].alias()) == "id");
 }
 
 // ── Project ───────────────────────────────────────────────────────────────────

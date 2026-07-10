@@ -559,8 +559,14 @@ node_result translate_range(const sc::Range& range,
         return unsupported("Spark Range exceeds maximum materialization size (1024 rows)", resource);
     }
 
+    // spark.range emits a single LongType column named "id". The name is
+    // load-bearing: the engine's plan validator reads col.type.alias() without a
+    // has_alias() guard, so an anonymous BIGINT (extension_ == nullptr) makes
+    // alias() dereference null -> server SIGSEGV during validate_schema.
     std::pmr::vector<ct::complex_logical_type> types{resource};
-    types.push_back(ct::complex_logical_type{ct::logical_type::BIGINT});
+    auto id_col = ct::complex_logical_type{ct::logical_type::BIGINT};
+    id_col.set_alias("id");
+    types.push_back(id_col);
     cv::data_chunk_t chunk(resource, types);
 
     uint64_t row = 0;

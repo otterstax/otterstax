@@ -423,6 +423,8 @@ conaninfo.txt
 ./build
 .vscode
 *.wal
+wal/
+log/
 *.txt.user
 
 # AI

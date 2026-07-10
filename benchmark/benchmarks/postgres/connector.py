@@ -21,3 +21,13 @@ def make_fetch_factory(host, port):
         return fetch
 
     return make_fetch
+
+
+def connect(host, port):
+    """Persistent autocommit connection for the external-table benchmarks
+    (external_load / external_join / external_dump run one statement per call)."""
+    conn = psycopg2.connect(
+        host=host, port=port, user="testuser", password="testpass", dbname="default"
+    )
+    conn.autocommit = True
+    return conn

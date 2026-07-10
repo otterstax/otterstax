@@ -4,6 +4,7 @@
 #include "chunk_to_arrow.hpp"
 
 #include "utility/tracy_profiler.hpp"
+#include <arrow/builder.h>
 
 using namespace components::vector;
 using namespace components::types;
@@ -82,4 +83,70 @@ std::shared_ptr<arrow::Schema> to_arrow_schema(const components::types::complex_
     }
 
     return arrow::schema(std::move(field_vector));
+}
+
+std::shared_ptr<arrow::RecordBatch> chunk_to_record_batch(const data_chunk_t& chunk) {
+    const auto types = chunk.types();
+    const auto schema = to_arrow_schema(types);
+    const auto nrows  = static_cast<int64_t>(chunk.size());
+    const size_t ncols = static_cast<size_t>(chunk.column_count());
+
+    arrow::ArrayVector arrays;
+    arrays.reserve(ncols);
+
+#define BUILD_COL(Builder, cpp_type)                                        \
+    {                                                                        \
+        arrow::Builder b;                                                    \
+        for (int64_t r = 0; r < nrows; r++) {                               \
+            auto v = chunk.value(static_cast<uint64_t>(c),                  \
+                                 static_cast<uint64_t>(r));                  \
+            if (v.is_null()) (void)b.AppendNull();                          \
+            else             (void)b.Append(v.value<cpp_type>());           \
+        }                                                                    \
+        std::shared_ptr<arrow::Array> arr;                                   \
+        (void)b.Finish(&arr);                                                \
+        arrays.push_back(std::move(arr));                                    \
+        break;                                                               \
+    }
+
+    for (size_t c = 0; c < ncols; c++) {
+        switch (types[c].to_physical_type()) {
+            case physical_type::BOOL:   BUILD_COL(BooleanBuilder, bool)
+            case physical_type::INT8:   BUILD_COL(Int8Builder,    int8_t)
+            case physical_type::INT16:  BUILD_COL(Int16Builder,   int16_t)
+            case physical_type::INT32:  BUILD_COL(Int32Builder,   int32_t)
+            case physical_type::INT64:  BUILD_COL(Int64Builder,   int64_t)
+            case physical_type::UINT8:  BUILD_COL(UInt8Builder,   uint8_t)
+            case physical_type::UINT16: BUILD_COL(UInt16Builder,  uint16_t)
+            case physical_type::UINT32: BUILD_COL(UInt32Builder,  uint32_t)
+            case physical_type::UINT64: BUILD_COL(UInt64Builder,  uint64_t)
+            case physical_type::FLOAT:  BUILD_COL(FloatBuilder,   float)
+            case physical_type::DOUBLE: BUILD_COL(DoubleBuilder,  double)
+            case physical_type::STRING: {
+                arrow::StringBuilder b;
+                for (int64_t r = 0; r < nrows; r++) {
+                    auto v = chunk.value(static_cast<uint64_t>(c),
+                                        static_cast<uint64_t>(r));
+                    if (v.is_null()) (void)b.AppendNull();
+                    else             (void)b.Append(v.value<const std::string&>());
+                }
+                std::shared_ptr<arrow::Array> arr;
+                (void)b.Finish(&arr);
+                arrays.push_back(std::move(arr));
+                break;
+            }
+            default: {
+                arrow::NullBuilder b;
+                (void)b.AppendNulls(nrows);
+                std::shared_ptr<arrow::Array> arr;
+                (void)b.Finish(&arr);
+                arrays.push_back(std::move(arr));
+                break;
+            }
+        }
+    }
+
+#undef BUILD_COL
+
+    return arrow::RecordBatch::Make(schema, nrows, std::move(arrays));
 }

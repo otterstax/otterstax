@@ -3,7 +3,7 @@
 #include <iostream>
 #include <string>
 
-namespace http_server {
+namespace conn::api_server {
 
     struct ChConnectionParams {
         std::string alias;
@@ -26,4 +26,4 @@ namespace http_server {
         return os;
     }
 
-} // namespace http_server
+} // namespace conn::api_server

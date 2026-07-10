@@ -20,7 +20,7 @@ RUN apt update && \
     apt clean && \
     rm -rf /var/lib/apt/lists/*
 
-RUN pip3 install --no-cache-dir conan==2.15.0 'cmake<4.0' && \
+RUN pip3 install --no-cache-dir conan==2.21.0 'cmake<4.0' && \
      conan profile detect --force && \
      conan remote add otterbrix http://conan.otterbrix.com
 
@@ -109,6 +109,7 @@ COPY ./component_manager ./component_manager
 COPY ./scheduler ./scheduler
 COPY ./types ./types
 COPY ./utility ./utility
+COPY ./cmake ./cmake
 COPY ./main.cpp ./main.cpp
 COPY ./CMakeLists.txt ./CMakeLists.txt
 COPY ./tests ./tests
@@ -145,6 +146,12 @@ RUN if [ "${WITH_TRACY}" != "true" ]; then \
     else \
         echo "Skipping tests: Tracy build (headless Docker, no profiler attached)"; \
     fi
+
+# External-table fixtures baked into the image so the file/s3 tests work in CI
+# runners where the docker daemon cannot see the host workspace (DinD / sibling
+# containers). Kept after the build so editing fixtures does not invalidate the
+# expensive build layers.
+COPY ./tests/minio/fixtures /fixtures
 
 # Tracy profiler port (active only when built with --build-arg WITH_TRACY=true)
 EXPOSE 8086

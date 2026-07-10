@@ -12,6 +12,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Build and run unit tests
-        run: |
-          docker build -f Dockerfile.test -t otterstax-test .
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.test
+          push: false
+          load: false
+          tags: otterstax-test
+          cache-from: type=gha,scope=release
+          cache-to: type=gha,mode=max,scope=release

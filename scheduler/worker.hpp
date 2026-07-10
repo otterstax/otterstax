@@ -17,6 +17,21 @@
 #include <memory_resource>
 #include <unordered_map>
 
+// Forward declarations for the external-table (CREATE EXTERNAL TABLE / COPY ... TO)
+// dispatch path. The full types live in integration/s3, connectors/file, and
+// otterbrix/parser/grammar_extention; pulling them in here would force every
+// translation unit that includes scheduler/worker.hpp to drag in Arrow's S3
+// filesystem and the parser AST, which is wasteful (rules 10 / 14).
+namespace db {
+    class S3Manager;
+}
+namespace conn::file {
+    class FileManager;
+}
+namespace otterstax::external {
+    class external_node_t;
+}
+
 // One execution lane of the Scheduler worker pool. A Worker is a cooperative
 // actor driven by the actor-zeta sharing_scheduler; the Scheduler routes every
 // session (by session_hash) to a single Worker, so each Worker owns its session
@@ -37,7 +52,9 @@ public:
            actor_zeta::address_t pg_connection_manager,
            actor_zeta::address_t ch_connection_manager,
            actor_zeta::address_t otterbrix_manager,
-           actor_zeta::address_t catalog_manager);
+           actor_zeta::address_t catalog_manager,
+           actor_zeta::address_t s3_manager,
+           actor_zeta::address_t file_manager);
 
     std::pmr::memory_resource* resource() const noexcept { return resource_; }
 
@@ -73,7 +90,15 @@ private:
     actor_zeta::address_t ch_connection_manager_;
     actor_zeta::address_t otterbrix_manager_;
     actor_zeta::address_t catalog_manager_;
+    actor_zeta::address_t s3_manager_;   // db::S3Manager (s3 external tables / COPY)
+    actor_zeta::address_t file_manager_; // conn::file::FileManager (local external tables / COPY)
     std::pmr::unordered_map<session_hash_t, metadata_t> metadata_map_;
+
+    // Routes a parsed external-table statement (CREATE EXTERNAL TABLE / COPY ... TO)
+    // to the s3 or file manager. The DDL/COPY itself produces no rows, so this
+    // returns an empty session_payload on success.
+    unique_future<session_result>
+    handle_external_statement(session_hash_t id, const otterstax::external::external_node_t& ext);
 
     void update_metadata(session_hash_t id,
                          ParsedQueryDataPtr metadata,

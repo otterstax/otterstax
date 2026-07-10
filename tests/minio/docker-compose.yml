@@ -1,0 +1,94 @@
+# Two standalone MinIO (S3-compatible) services for testing the conn::s3
+# connector against more than one endpoint / alias at once.
+#
+#   docker compose -f tests/minio/docker-compose.yml up -d
+#
+# ┌─────────┬──────────────────────┬──────────────┬───────────────┐
+# │ service │ S3 API (host)        │ console      │ bucket        │
+# ├─────────┼──────────────────────┼──────────────┼───────────────┤
+# │ minio1  │ http://localhost:9000│ :9001        │ test-bucket-1 │
+# │ minio2  │ http://localhost:9010│ :9011        │ test-bucket-2 │
+# └─────────┴──────────────────────┴──────────────┴───────────────┘
+#
+# In-network the endpoints are minio1:9000 and minio2:9000.
+# Both use the same credentials: minioadmin / minioadmin (region us-east-1).
+# Each bucket is pre-seeded from ./fixtures by its `*-init` container.
+
+x-minio: &minio-base
+  image: minio/minio:latest
+  command: server /data --console-address ":9001"
+  environment:
+    MINIO_ROOT_USER: minioadmin
+    MINIO_ROOT_PASSWORD: minioadmin
+  healthcheck:
+    test: ["CMD", "mc", "ready", "local"]
+    interval: 5s
+    timeout: 5s
+    retries: 20
+    start_period: 5s
+  networks:
+    - minio_network
+
+x-init: &init-base
+  image: minio/mc:latest
+  volumes:
+    - ./fixtures:/fixtures:ro
+  networks:
+    - minio_network
+
+services:
+  minio1:
+    <<: *minio-base
+    container_name: test-minio1
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio1_data:/data
+
+  minio2:
+    <<: *minio-base
+    container_name: test-minio2
+    ports:
+      - "9010:9000"
+      - "9011:9001"
+    volumes:
+      - minio2_data:/data
+
+  minio1-init:
+    <<: *init-base
+    container_name: test-minio1-init
+    depends_on:
+      minio1:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set m http://minio1:9000 minioadmin minioadmin;
+      mc mb --ignore-existing m/test-bucket-1;
+      mc anonymous set download m/test-bucket-1;
+      mc cp --recursive /fixtures/ m/test-bucket-1/;
+      echo 'minio1 ready: test-bucket-1 seeded';
+      "
+
+  minio2-init:
+    <<: *init-base
+    container_name: test-minio2-init
+    depends_on:
+      minio2:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set m http://minio2:9000 minioadmin minioadmin;
+      mc mb --ignore-existing m/test-bucket-2;
+      mc anonymous set download m/test-bucket-2;
+      mc cp --recursive /fixtures/ m/test-bucket-2/;
+      echo 'minio2 ready: test-bucket-2 seeded';
+      "
+
+networks:
+  minio_network:
+    driver: bridge
+
+volumes:
+  minio1_data:
+  minio2_data:

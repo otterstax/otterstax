@@ -1,3 +1,7 @@
+add_subdirectory(s3)
+add_subdirectory(file)
+add_subdirectory(api_server)
+
 set(CONNECTORS_HEADERS
     mysql/connector.hpp
     mysql/manager.hpp
@@ -7,7 +11,6 @@ set(CONNECTORS_HEADERS
     clickhouse/types.hpp
     clickhouse/connector.hpp
     clickhouse/manager.hpp
-    api_connections/connection_server.hpp
     api_connections/pg_connection_config.hpp
     api_connections/ch_connection_config.hpp
 )
@@ -19,7 +22,6 @@ set(CONNECTORS_SOURCES
     postgresql/manager.cpp
     clickhouse/connector.cpp
     clickhouse/manager.cpp
-    api_connections/connection_server.cpp
 )
 
 add_library(connectors
@@ -36,6 +38,9 @@ target_link_libraries(connectors PUBLIC
     arrow::arrow
     PostgreSQL::PostgreSQL
     clickhouse-cpp-lib::clickhouse-cpp-lib
+    s3
+    file
+    api_server
 )
 
 target_include_directories(connectors PUBLIC

@@ -44,7 +44,7 @@ namespace ch {
         void stop();
 
         std::string addConnection(connect_params connection_param, const std::string& uuid);
-        std::string addConnection(http_server::ChConnectionParams connection_param);
+        std::string addConnection(conn::api_server::ChConnectionParams connection_param);
         void removeConnection(const std::string& uuid);
 
         template<typename Callable>

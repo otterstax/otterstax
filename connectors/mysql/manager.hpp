@@ -48,7 +48,7 @@ namespace mysql {
         // TODO add query for adding and removing connections
         // TODO this is not thread safe!!!
         std::string addConnection(bm::connect_params connection_param, const std::string& uuid);
-        std::string addConnection(http_server::ConnectionParams connection_param);
+        std::string addConnection(conn::api_server::ConnectionParams connection_param);
         void removeConnection(const std::string& uuid);
 
         template<typename Callable>

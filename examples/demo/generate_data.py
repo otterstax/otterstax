@@ -21,6 +21,11 @@ INIT_DIR = SCRIPT_DIR / "init"
 (INIT_DIR / "mariadb").mkdir(parents=True, exist_ok=True)
 (INIT_DIR / "postgres").mkdir(parents=True, exist_ok=True)
 (INIT_DIR / "clickhouse").mkdir(parents=True, exist_ok=True)
+# S3 fixtures — seeded into MinIO by the `demo-minio-init` compose service for
+# steps 7-9. Living under `init/` keeps them covered by the existing .gitignore
+# rule and means `up.sh` blows them away alongside the other backend init data.
+S3_DIR = INIT_DIR / "s3"
+S3_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # Generation parameters
@@ -442,4 +447,58 @@ print(f"""
    orders in spike day (04-18..04-19): {sum(1 for o in orders if WINDOW_SPIKE[0] <= o['ts'] < WINDOW_SPIKE[1])}
    sessions with traffic_source='campaign': {sum(1 for s in sessions if s['traffic_source']=='campaign')}
    sessions in EU ship_addr:                {sum(1 for s in sessions if s['ship_country'] in ('DE','FR','IT','ES','NL'))}
+""")
+
+
+# ── S3 fixtures for steps 7-9 ────────────────────────────────────────────────
+# Two tiny tables seeded into MinIO at `s3://demo-bucket/`:
+#   regions.csv   — 6-row dimension (region_id, country, region_name)
+#   promos.parquet — 12-row fact     (region_id, promo_code, discount_pct)
+# step_7 / step_8 load them as engine-internal tables; step_9 JOINs them and
+# COPYs the result back out to s3://demo-bucket/exports/promos_by_region.csv.
+
+import csv as _csv
+
+regions = [
+    (1, "US", "North America East"),
+    (2, "US", "North America West"),
+    (3, "DE", "EU Central"),
+    (4, "IL", "Middle East"),
+    (5, "JP", "Asia Pacific"),
+    (6, "BR", "South America"),
+]
+with open(S3_DIR / "regions.csv", "w", newline="") as fh:
+    w = _csv.writer(fh)
+    w.writerow(["region_id", "country", "region_name"])
+    for row in regions:
+        w.writerow(row)
+
+# Two promo codes per region, seeded discount percentages — deterministic so
+# step_9's ORDER BY output is stable across reruns.
+promos = []
+for rid, country, _ in regions:
+    promos.append((rid, f"{country}-SPRING25", round(5.0 + rid * 1.5, 2)))
+    promos.append((rid, f"{country}-WINTER25", round(8.0 + rid * 1.0, 2)))
+
+try:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    table = pa.table({
+        "region_id":    pa.array([p[0] for p in promos], pa.int64()),
+        "promo_code":   pa.array([p[1] for p in promos], pa.string()),
+        "discount_pct": pa.array([p[2] for p in promos], pa.float64()),
+    })
+    pq.write_table(table, S3_DIR / "promos.parquet")
+    parquet_note = f"   {S3_DIR / 'promos.parquet'}   promos={len(promos)} (pyarrow / snappy by default)"
+except ImportError:
+    parquet_note = (
+        f"   ⚠️  pyarrow not installed — skipped {S3_DIR / 'promos.parquet'}.\n"
+        f"      Install with `pip install pyarrow` (already a transitive dep of the "
+        f"otterstax integration suite) so step_8 has something to read."
+    )
+
+print(f"""✅ S3 demo fixtures written:
+   {S3_DIR / 'regions.csv'}        regions={len(regions)}
+{parquet_note}
 """)

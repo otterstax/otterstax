@@ -57,6 +57,23 @@ ComponentManager::ComponentManager(const configuration::config& config)
     }
 
     {
+        OTX_ZONE_N("ComponentManager::spawn_s3");
+        s3_manager_ = actor_zeta::spawn<conn::s3::ConnectorManager>(resource_);
+        assert(s3_manager_ != nullptr && "s3 manager must not be null");
+
+        file_manager_ = actor_zeta::spawn<conn::file::FileManager>(resource_,
+                                                                         otterbrix_manager_->address());
+        assert(file_manager_ != nullptr && "file manager must not be null");
+
+        // Integration S3 manager orchestrates the raw s3 + file connectors; the
+        // Scheduler routes s3 CREATE EXTERNAL TABLE / COPY statements to it.
+        s3_integration_manager_ = actor_zeta::spawn<db::S3Manager>(resource_,
+                                                                   s3_manager_->address(),
+                                                                   file_manager_->address());
+        assert(s3_integration_manager_ != nullptr && "s3 integration manager must not be null");
+    }
+
+    {
         OTX_ZONE_N("ComponentManager::spawn_scheduler");
         // Work-sharing thread pool for the Worker actors: one Worker per pool
         // thread; queries shard onto workers by session hash (id % worker_count).
@@ -73,7 +90,9 @@ ComponentManager::ComponentManager(const configuration::config& config)
                                                    pg_connection_manager_->address(),
                                                    ch_connection_manager_actor_->address(),
                                                    otterbrix_manager_->address(),
-                                                   catalog_manager_->address());
+                                                   catalog_manager_->address(),
+                                                   s3_integration_manager_->address(),
+                                                   file_manager_->address());
         assert(scheduler_ != nullptr && "scheduler must not be null");
     }
 
@@ -116,3 +135,7 @@ actor_zeta::address_t ComponentManager::otterbrix_manager_address() const { retu
 actor_zeta::address_t ComponentManager::sql_connection_manager_address() const { return sql_connection_manager_->address(); }
 
 actor_zeta::address_t ComponentManager::pg_connection_manager_address() const { return pg_connection_manager_->address(); }
+
+actor_zeta::address_t ComponentManager::file_manager_address() const { return file_manager_->address(); }
+
+actor_zeta::address_t ComponentManager::s3_manager_address() const { return s3_manager_->address(); }

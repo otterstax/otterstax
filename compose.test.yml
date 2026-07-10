@@ -103,11 +103,17 @@ services:
         condition: service_healthy
       clickhouse1:
         condition: service_healthy
+      minio:
+        condition: service_healthy
     expose:
       - "8815"
       - "8085"
     ports:
       - "8086:8086"
+    # Fixtures used by the file/s3 external-table tests are baked into the
+    # Dockerfile.test image at /fixtures (see the COPY near the end of that
+    # Dockerfile). Bind-mounting them from the host workspace breaks in DinD
+    # CI runners where the docker daemon cannot see the runner's filesystem.
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8085/health"]
       interval: 5s
@@ -118,6 +124,50 @@ services:
       test_app_network:
         aliases:
           - test-otterstax
+
+  # MinIO (S3-compatible) backend for the s3 external-table tests. Mirrors the
+  # standalone stack in tests/minio/docker-compose.yml, on the test network.
+  minio:
+    image: minio/minio:latest
+    container_name: test-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    expose:
+      - "9000"
+      - "9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
+    networks:
+      - test_app_network
+    restart: unless-stopped
+
+  # One-shot job: create + seed test-bucket from the shared fixtures, then exit.
+  # Fixtures are baked into the image (see tests/minio/Dockerfile.fixtures) so
+  # the seeding works in DinD CI runners that cannot bind-mount the workspace.
+  minio-init:
+    build:
+      context: .
+      dockerfile: tests/minio/Dockerfile.fixtures
+    container_name: test-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set m http://minio:9000 minioadmin minioadmin;
+      mc mb --ignore-existing m/test-bucket;
+      mc anonymous set download m/test-bucket;
+      mc cp --recursive /fixtures/ m/test-bucket/;
+      echo 'minio ready: test-bucket seeded';
+      "
+    networks:
+      - test_app_network
 
   test-client:
     build:

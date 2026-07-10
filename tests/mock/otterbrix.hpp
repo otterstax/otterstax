@@ -14,7 +14,7 @@ class SimpleMockOtterbrixManager : public IDataManager {
 public:
     SimpleMockOtterbrixManager(mock_config config = {})
         : config_(config) {
-        std::cout << "Mock OtterbrixManager created with config: " << std::endl;
+        std::cout << "Mock otterbrix_manager created with config: " << std::endl;
         std::cout << "can_throw: " << config_.can_throw << std::endl;
         std::cout << "return_empty: " << config_.return_empty << std::endl;
         std::cout << "wait_time: " << config_.wait_time.count() << " milliseconds" << std::endl;
@@ -32,14 +32,14 @@ public:
         std::this_thread::sleep_for(config_.wait_time); // Simulate some processing delay
 
         if (config_.return_empty) {
-            std::cout << "Mock OtterbrixManager returning empty cursor." << std::endl;
+            std::cout << "Mock otterbrix_manager returning empty cursor." << std::endl;
             return components::cursor::make_cursor(config_.resource,
                                                    components::vector::data_chunk_t{config_.resource, {}, 0});
         }
 
         assert(otterbrix_params->node->type() == logical_plan::node_type::data_t &&
-               "Data should not be empty in mock OtterbrixManager");
-        std::cout << "Mock OtterbrixManager: plan executed successfully." << std::endl;
+               "Data should not be empty in mock otterbrix_manager");
+        std::cout << "Mock otterbrix_manager: plan executed successfully." << std::endl;
 
         auto& chunk =
             const_cast<data_chunk_t&>(static_cast<logical_plan::node_data_t&>(*otterbrix_params->node).data_chunk());
@@ -72,6 +72,16 @@ public:
         std::cout << "Mock OtterbrixManager: create_collection: " << database << "." << collection << std::endl;
         out_oid = next_oid_++;
         return cursor::make_cursor(config_.resource);
+    }
+
+    components::cursor::cursor_t_ptr create_database(const std::string&) override {
+        return cursor::make_cursor(std::pmr::get_default_resource());
+    }
+
+    components::cursor::cursor_t_ptr insert_data(const std::string&, const std::string&,
+                                                 std::vector<components::table::column_definition_t>,
+                                                 components::vector::data_chunk_t) override {
+        return cursor::make_cursor(std::pmr::get_default_resource());
     }
 
 private:

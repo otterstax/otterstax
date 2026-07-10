@@ -6,6 +6,9 @@
 #include <components/catalog/catalog_oids.hpp>
 #include <components/cursor/cursor.hpp>
 #include <components/table/column_definition.hpp>
+#include <components/logical_plan/node_insert.hpp>
+#include <components/table/column_definition.hpp>
+#include <components/vector/data_chunk.hpp>
 #include <otterbrix/otterbrix.hpp>
 
 #include "otterbrix/translators/input/mysql_to_chunk.hpp"
@@ -28,6 +31,11 @@ public:
                       const std::string& collection,
                       std::vector<components::table::column_definition_t> columns,
                       components::catalog::oid_t& out_oid) = 0;
+    virtual components::cursor::cursor_t_ptr create_database(const std::string& database) = 0;
+    virtual components::cursor::cursor_t_ptr insert_data(const std::string& database,
+                                                         const std::string& collection,
+                                                         std::vector<components::table::column_definition_t> columns,
+                                                         components::vector::data_chunk_t data) = 0;
 };
 
 class OtterbrixDataManager : public IDataManager {
@@ -42,6 +50,11 @@ public:
                       const std::string& collection,
                       std::vector<components::table::column_definition_t> columns,
                       components::catalog::oid_t& out_oid) override;
+    components::cursor::cursor_t_ptr create_database(const std::string& database) override;
+    components::cursor::cursor_t_ptr insert_data(const std::string& database,
+                                                 const std::string& collection,
+                                                 std::vector<components::table::column_definition_t> columns,
+                                                 components::vector::data_chunk_t data) override;
 
 private:
     otterbrix::otterbrix_ptr otterbrix_;

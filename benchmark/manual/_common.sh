@@ -7,21 +7,24 @@ BENCH_DIR="$(cd "$MANUAL_DIR/.." && pwd)"
 REPO_ROOT="$(cd "$BENCH_DIR/.." && pwd)"
 
 IMAGE_TAG="${IMAGE_TAG:-bench}"
+# Set to true (via start_service.sh --external) to add a seeded MinIO so the
+# s3/file external_* benchmarks can run in the manual flow.
+EXTERNAL_ENABLED="${EXTERNAL_ENABLED:-false}"
 
 _compose_backends() {
-    docker compose \
-        -f "$BENCH_DIR/compose_backends.yml" \
-        -p bench \
-        "$@"
+    local _files=(-f "$BENCH_DIR/compose_backends.yml")
+    [ "$EXTERNAL_ENABLED" = "true" ] && _files+=(-f "$BENCH_DIR/compose_minio.yml")
+    docker compose "${_files[@]}" -p bench "$@"
 }
 
 _compose_otterstax() {
-    docker compose \
-        -f "$BENCH_DIR/compose_backends.yml" \
-        -f "$BENCH_DIR/compose_benchmark.yml" \
-        -f "$BENCH_DIR/compose_manual.yml" \
-        -p bench \
-        "$@"
+    local _files=(
+        -f "$BENCH_DIR/compose_backends.yml"
+        -f "$BENCH_DIR/compose_benchmark.yml"
+        -f "$BENCH_DIR/compose_manual.yml"
+    )
+    [ "$EXTERNAL_ENABLED" = "true" ] && _files+=(-f "$BENCH_DIR/compose_minio.yml")
+    docker compose "${_files[@]}" -p bench "$@"
 }
 
 _wait_db_healthy() {
@@ -101,6 +104,39 @@ _register_connections() {
         "ch2"
 }
 
+# Register the bench MinIO alias for the s3 external-table benchmarks.
+# Alias/bucket/endpoint must match benchmarks/external_common.py + compose_minio.yml.
+_register_s3_credentials() {
+    local url="http://bench_otterstax:8085/s3/add_credentials"
+    local payload='{"alias":"bench_minio","access_key":"minioadmin","secret_key":"minioadmin","region":"us-east-1","endpoint":"bench_minio:9000"}'
+    echo "Registering s3 credentials (bench_minio)..."
+    for attempt in 1 2 3 4 5 6 7 8 9 10; do
+        code=$(docker run --rm --network=bench_net benchmark-client:latest \
+                   curl -s -o /dev/null -w "%{http_code}" -X GET "$url" \
+                   -H "Content-Type: application/json" -d "$payload" 2>/dev/null)
+        if [ "$code" = "200" ] || [ "$code" = "201" ]; then
+            echo "  Registered s3 alias 'bench_minio'"
+            return 0
+        fi
+        echo "  s3 creds: HTTP $code ($attempt/10) — retrying..."
+        sleep 2
+    done
+    echo "  ERROR: failed to register s3 credentials" >&2
+    return 1
+}
+
+# Generate the s3/file external-table fixtures into benchmark/data/fixtures.
+_generate_external_fixtures() {
+    echo "Generating external-table fixtures..."
+    mkdir -p "$BENCH_DIR/data/fixtures"
+    docker run --rm \
+        -v "$BENCH_DIR/data/fixtures:/app/data/fixtures" \
+        -v "$BENCH_DIR/bench.yaml:/app/bench.yaml:ro" \
+        -e PYTHONUNBUFFERED=1 \
+        benchmark-client:latest \
+        python /app/data/generate_external_fixtures.py --out /app/data/fixtures
+}
+
 _frontend_port() {
     case "$1" in
         mysql)    echo 8816 ;;
@@ -110,6 +146,11 @@ _frontend_port() {
     esac
 }
 
-ALL_TESTS=(simple_select complex_select join_same_instance join_cross_engine join_all)
+# DEFAULT_TESTS run by default; external_* are opt-in (need MinIO via --external)
+# but remain valid --bench values.
+DEFAULT_TESTS=(simple_select complex_select join_same_instance join_cross_engine join_all)
+ALL_TESTS=("${DEFAULT_TESTS[@]}"
+           external_load external_join external_dump
+           external_join_cross external_join_all)
 ALL_FRONTENDS=(mysql postgres arrow)
 DEFAULT_FRONTENDS=(mysql postgres)

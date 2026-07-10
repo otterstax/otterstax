@@ -229,9 +229,12 @@ TEST_CASE("generate_query: stringstream overload produces the same output") {
 
 TEST_CASE("replace_qualifiers: 3-part qualifier treated as db.schema.collection (uid promoted)") {
     // prepare_sql promotes the first segment to uid when only 3 parts are present.
+    // Scoped arena: libotterbrix_sql's parse tree allocates through this resource
+    // and is never explicitly freed — get_default_resource would leak it (LSAN).
+    std::pmr::monotonic_buffer_resource arena;
     auto r = otterstax::parser::prepare_sql(
         "SELECT id FROM (SELECT id FROM mysql.bill.orders WHERE status = 'paid') o;",
-        std::pmr::get_default_resource());
+        &arena);
 
     REQUIRE(r.stubs.size() == 1);
     auto out = sql_gen::replace_qualifiers(r.stubs[0].raw_sql, r.stubs[0].qualifiers, backend_type_t::MySQL);
@@ -241,11 +244,12 @@ TEST_CASE("replace_qualifiers: 3-part qualifier treated as db.schema.collection 
 }
 
 TEST_CASE("replace_qualifiers: multiple qualifiers in one stub") {
+    std::pmr::monotonic_buffer_resource arena;
     auto r = otterstax::parser::prepare_sql(
         "SELECT * FROM ("
         "SELECT id FROM mysql.db.sc.t1 UNION ALL SELECT id FROM mysql.db.sc.t2"
         ") u;",
-        std::pmr::get_default_resource());
+        &arena);
 
     REQUIRE(r.stubs.size() == 1);
     auto out = sql_gen::replace_qualifiers(r.stubs[0].raw_sql, r.stubs[0].qualifiers, backend_type_t::MySQL);

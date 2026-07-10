@@ -87,6 +87,7 @@ run_test "FlightSQL Schema (MySQL backend)" "test_schema_flightsql_client_mysql_
 run_test "FlightSQL Schema (PostgreSQL backend)" "test_schema_flightsql_client_pg_backend.py"
 run_test "FlightSQL Schema (ClickHouse backend)" "test_schema_flightsql_client_ch_backend.py"
 run_test "Cross-backend Schema" "test_schema_cross_backend.py"
+run_test "Cross-backend JOIN Schema" "test_schema_cross_backend_join.py"
 
 # Functional tests
 run_test "FlightSQL Client (MySQL backend)" "test_flightsql_client_mysql_backend.py"
@@ -101,7 +102,7 @@ run_test "PostgreSQL Client (ClickHouse backend)" "test_pg_client_ch_backend.py"
 run_test "FlightSQL Client (MySQL backend, mutable)" "test_flightsql_client_mysql_backend_mutable.py"
 
 # Cross-backend JOIN tests
-run_test "Cross-backend Queries (MySQL wire)" "test_cross_backend_queries.py"
+run_test "Cross-backend Queries (MySQL wire)" "test_cross_backend_queries_mysql.py"
 run_test "Cross-backend Queries (PostgreSQL wire)" "test_cross_backend_queries_pg.py"
 
 # Concurrency tests (sync-code regression net)
@@ -110,6 +111,17 @@ run_test "Concurrency" "test_concurrency.py"
 # Stress tests are gated behind OTTERSTAX_RUN_STRESS=1; the script no-ops fast
 # when unset, so it's cheap to always invoke it here.
 run_test "Stress (optional)" "test_stress.py"
+
+# External-table (s3/file grammar extension) tests over the MySQL wire
+run_test "Schema MySQL Client (file external, all formats)" "test_schema_mysql_file.py"
+run_test "Schema MySQL Client (s3 external, all formats)" "test_schema_mysql_s3.py"
+run_test "MySQL Client (file external, all formats)" "test_mysql_file.py"
+run_test "MySQL Client (file external, ndjson)" "test_mysql_file_ndjson.py"
+run_test "MySQL Client (s3 external, all formats)" "test_mysql_s3.py"
+run_test "MySQL Client (JOIN sql-backend ⋈ s3 parquet → s3 csv)" "test_mysql_join_sql_s3_to_s3.py"
+run_test "MySQL Client (JOIN otterbrix-local ⋈ s3 parquet)" "test_mysql_join_otb_local_s3.py"
+run_test "MySQL Client (JOIN sql backend ⋈ otterbrix-local, string key)" "test_mysql_join_otb_local_backend.py"
+run_test "MySQL Client (JOIN s3 parquet ⋈ file csv ⋈ otterbrix-local)" "test_mysql_join_otb_local_s3_file.py"
 
 echo ""
 echo "========================================="

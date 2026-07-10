@@ -19,3 +19,13 @@ group_b:
   orders_per_product: 1          # ~5k orders total  (≈ 5 per campaign)
   events_per_campaign: 4         # ~4k events  total
   batch_size: 1000
+
+# External-table fixtures (s3/file benchmarks: external_load, external_join,
+# external_dump).  Written to data/fixtures/ by generate_external_fixtures.py.
+# num_campaigns defaults to group_a so campaign_id space matches the backends;
+# regions ⋈ web_events is the internal-join workload.
+external:
+  num_campaigns: 1000            # share campaign_id space with group_a
+  regions_per_campaign: 4        # regions.parquet  -> ~4k rows
+  events_per_campaign: 20        # web_events.csv   -> ~20k rows
+  # regions ⋈ web_events on campaign_id -> 4 × 20 × num_campaigns = ~80k rows

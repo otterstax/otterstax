@@ -25,3 +25,13 @@ def make_fetch_factory(host, port):
         return fetch
 
     return make_fetch
+
+
+def connect(host, port):
+    """External-table benchmarks (external_load / external_join / external_dump)
+    drive CREATE EXTERNAL TABLE / COPY ... TO, which the s3/file test suite only
+    exercises over the MySQL/PostgreSQL wire.  The FlightSQL DDL path is not
+    covered, so fail fast instead of silently producing misleading numbers."""
+    raise NotImplementedError(
+        "external-table benchmarks support the mysql and postgres frontends only"
+    )

@@ -1,0 +1,7 @@
+# Tiny mc image variant that ships the external-table fixtures baked in at
+# /fixtures, so the minio-init compose job can seed test-bucket without
+# relying on a host bind mount (which is invisible to the docker daemon in
+# DinD / sibling-container CI runners like Gitea act_runner).
+FROM minio/mc:latest
+
+COPY tests/minio/fixtures /fixtures

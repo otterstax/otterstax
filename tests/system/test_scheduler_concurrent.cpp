@@ -128,8 +128,10 @@ TEST_CASE("scheduler handles N parallel sessions without hanging") {
     auto ch_connection_manager = actor_zeta::spawn<db::ClickhouseManager>(resource, ch_conn_manager);
 
     // The current Scheduler ctor takes (resource, az_scheduler, worker_count,
-    // parser_factory, 5 actor addresses); each Worker builds its own parser from
-    // the injected factory — tests pass &make_mock_parser.
+    // parser_factory, 5 actor addresses + s3 + file); each Worker builds its
+    // own parser from the injected factory — tests pass &make_mock_parser. The
+    // s3/file managers are empty here because the mock pipeline does not exercise
+    // CREATE EXTERNAL TABLE / COPY ... TO statements.
     auto scheduler = actor_zeta::spawn<Scheduler>(
         resource,
         az_scheduler.get(),
@@ -139,7 +141,9 @@ TEST_CASE("scheduler handles N parallel sessions without hanging") {
         pg_connection_manager->address(),
         ch_connection_manager->address(),
         otterbrix_manager->address(),
-        catalog_manager->address());
+        catalog_manager->address(),
+        actor_zeta::address_t::empty_address(),
+        actor_zeta::address_t::empty_address());
     REQUIRE(scheduler != nullptr);
 
     const std::string sql = "SELECT 1 AS test";
@@ -227,7 +231,9 @@ TEST_CASE("slow MySQL connector does not starve other sessions") {
         pg_connection_manager->address(),
         ch_connection_manager->address(),
         otterbrix_manager->address(),
-        catalog_manager->address());
+        catalog_manager->address(),
+        actor_zeta::address_t::empty_address(),
+        actor_zeta::address_t::empty_address());
     REQUIRE(scheduler != nullptr);
 
     // Baseline: time for a single session.

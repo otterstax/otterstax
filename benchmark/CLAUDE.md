@@ -109,9 +109,14 @@ Results land in `benchmark_results/<YYYYMMDD_HHMMSS>/`.
 ```text
 --repetitions N     Reps per sub-test (default: 10)
 --frontend F        mysql | postgres | arrow  (repeatable; default: mysql postgres)
---bench T [T ...]   Test(s) to run (space-separated; default: all five tests).
+--bench T [T ...]   Test(s) to run (space-separated; default: the five
+                    cross-backend tests).
                     Values: simple_select complex_select join_same_instance
                             join_cross_engine join_all
+                            external_load external_join external_dump
+                    external_* (s3/file) are opt-in: selecting any of them
+                    auto-starts MinIO, generates fixtures, registers the
+                    bench_minio s3 alias. mysql/postgres frontends only.
 --out-dir DIR       Result root (default: benchmark_results/<timestamp>)
 --rebuild           Force image rebuild even if images exist
 --clear             Remove images + DB volumes, then rebuild from scratch
@@ -230,22 +235,27 @@ benchmark/
 ├── compose_backends.yml         # 6 DB containers (bench_net)
 ├── compose_benchmark.yml        # OtterStax container; publishes :8086 to host
 ├── compose_manual.yml           # Overlay: also publishes 8085/8815/8816/8817
+├── compose_minio.yml            # Overlay: MinIO + seed job for external_* tests
 ├── Dockerfile.benchmark         # Python image: data init + benchmark scripts
 ├── data/
 │   ├── init_data.py             # Creates tables and inserts Faker data in all 6 DBs
+│   ├── generate_external_fixtures.py  # Writes s3/file fixtures from bench.yaml `external:`
+│   ├── fixtures/                # Generated regions.parquet/web_events.csv/campaigns.ndjson
 │   └── requirements.txt         # Python deps for the benchmark image
 ├── benchmarks/
 │   ├── common.py                # Timing, stats, result serialisation, write_db_info
 │   ├── queries.py               # All SQL strings (shared across all frontends)
-│   ├── mysql/connector.py       # mysql-connector-python, port 8816
-│   ├── postgres/connector.py    # psycopg2, port 8817
+│   ├── external_common.py       # External-table runner (load/join/dump) + external_main
+│   ├── mysql/connector.py       # mysql-connector-python, port 8816 (+ connect())
+│   ├── postgres/connector.py    # psycopg2, port 8817 (+ connect())
 │   ├── arrow/connector.py       # flightsql-dbapi, port 8815  ← disabled by default
 │   └── {mysql,postgres,arrow}/  # One .py file per test category
 │       ├── simple_select.py
 │       ├── complex_select.py
 │       ├── join_same_instance.py
 │       ├── join_cross_engine.py
-│       └── join_all.py
+│       ├── join_all.py
+│       └── external_{load,join,dump,join_cross,join_all}.py  # s3/file (mysql + postgres)
 ├── manual/
 │   ├── _common.sh               # Shared helpers sourced by all manual scripts
 │   ├── start_service.sh         # Start DBs + OtterStax, register connections
@@ -270,8 +280,14 @@ Two independent database groups sharing `campaign_id` 1–1000:
 Group A is used by: simple_select, complex_select, join_same_instance (camp×imp), join_all.
 Group B is used by: simple_select, complex_select, join_same_instance (prod×ord), join_cross_engine.
 
+The `external:` block sizes the s3/file fixtures (see "External-table tests"
+below); it shares the same `campaign_id` space as Group A but its data lives in
+generated files, not the DB backends.
+
 Changing `bench.yaml` requires rebuilding the client image (`--rebuild` or `--clear`)
-because `bench.yaml` is baked into the image at build time.
+because `bench.yaml` is baked into the image at build time. (External fixtures
+are the exception — they are bind-mounted, so editing `external:` only requires
+re-running an `external_*` benchmark, which regenerates them.)
 
 ## Test categories
 
@@ -285,6 +301,81 @@ because `bench.yaml` is baked into the image at build time.
 
 `join_all` is slow because OtterStax fetches all ~60 k Group A rows regardless of the
 `WHERE campaign_id <= 50` filter — there is no predicate pushdown to backends.
+
+## External-table tests (s3/file)
+
+Three opt-in workloads that exercise the `CREATE EXTERNAL TABLE` / `COPY ... TO`
+grammar extensions — **loading, internal joins and dumps only; no cross-backend
+or JOIN ALL shapes.** Each runs both a local-file (`/fixtures` mount) and an s3
+(seeded MinIO) source, so file vs s3 are directly comparable in the sub-test
+breakdown.
+
+| Test            | Workload                                                        | Sub-tests |
+|-----------------|-----------------------------------------------------------------|-----------|
+| `external_load` | `CREATE EXTERNAL TABLE` — load a fixture (table DROPped between reps for a cold load) | `{file,s3}_{parquet,csv,ndjson}` |
+| `external_join` | `regions`(parquet) ⋈ `web_events`(csv) on `campaign_id` — **internal** otterbrix-on-otterbrix join (both sides loaded in untimed setup) | `{file,s3}_join` |
+| `external_dump` | `COPY (SELECT * FROM <loaded>) TO <target>` — writer + upload (source loaded once, untimed) | `{file,s3}_{parquet,csv,ndjson}` |
+| `external_join_cross` | external `regions` (s3/file) ⋈ otterbrix-internal `weights` (`CREATE TABLE`+`INSERT`) — the supported s3-join shape from `tests/test_mysql_join_otb_local_s3.py` | `{file,s3}_cross` |
+| `external_join_all` | s3 parquet `regions` ⋈ file csv `web_events` ⋈ internal `weights`, all on `campaign_id` — three origins joined at once | `s3parquet_filecsv_internal` |
+
+`external_join_cross` / `external_join_all` deliberately load every side into
+otterbrix-internal storage first (external load + a hand-built `bigint` engine
+table). A direct backend.campaign_id (int32) ⋈ s3.campaign_id (int64) silently
+returns zero rows (the JOIN-key width trap in `FIX_JOIN.md` / `tests/CLAUDE.md`),
+so the benchmarks follow the staged shape the tests use. `weights` covers
+campaign_id 1..min(200, max) — bounded join cardinality regardless of fixture
+scale.
+
+Selecting any `external_*` test makes `run_benchmark.sh`:
+
+1. Generate fixtures into `benchmark/data/fixtures/` via `data/generate_external_fixtures.py`
+   (a container run of `benchmark-client`, before the stack comes up).
+2. Add `compose_minio.yml` to the backend + otterstax compose sets (MinIO +
+   a one-shot that seeds `bench-bucket` from the same fixtures).
+3. Register the `bench_minio` s3 alias through `GET /s3/add_credentials` after
+   OtterStax starts (folded into `_register_connections`).
+
+The `file` and `s3` sources read the **identical** fixtures: bench-otterstax
+mounts `data/fixtures` at `/fixtures`, and MinIO is seeded from the same dir.
+
+```bash
+# All five external tests, both frontends
+./benchmark/scripts/run_benchmark.sh \
+  --bench external_load external_join external_dump external_join_cross external_join_all \
+  --repetitions 5
+
+# Just the s3-join shapes, mysql wire
+./benchmark/scripts/run_benchmark.sh --frontend mysql --bench external_join_cross external_join_all
+```
+
+Manual flow: start with `--external` so MinIO + fixtures + s3 alias are ready,
+then select the tests:
+
+```bash
+./benchmark/manual/start_service.sh --external
+./benchmark/manual/run_bench.sh \
+  --bench external_load external_join external_dump external_join_cross external_join_all
+```
+
+### External fixtures (`data/generate_external_fixtures.py`)
+
+Benchmark-scale sibling of `tests/minio/fixtures/generate_external_fixtures.py`,
+sized from the `external:` block in `bench.yaml`. `num_campaigns` defaults to
+`group_a`, so the fixtures share the backend `campaign_id` space (they could
+JOIN the backends, but the benchmarks deliberately keep joins internal).
+
+| File              | Format  | Rows                                   | Columns (all ints are int64) |
+|-------------------|---------|----------------------------------------|------------------------------|
+| `regions.parquet` | parquet | `num_campaigns × regions_per_campaign` | region_id, campaign_id, region_name, country, population, ad_spend |
+| `web_events.csv`  | csv     | `num_campaigns × events_per_campaign`  | event_id, campaign_id, product_id, event_type, session_seconds, value |
+| `campaigns.ndjson`| ndjson  | `num_campaigns`                        | campaign_id, campaign_name, budget, status |
+
+`regions ⋈ web_events` keys on int64 `campaign_id` on both sides — no width
+mismatch (the silent zero-row JOIN trap when int32 meets int64). Defaults:
+`regions_per_campaign=4`, `events_per_campaign=20` → ~4 k / ~20 k rows and an
+~80 k-row internal join. Editing `bench.yaml` requires regenerating fixtures
+(automatic on the next external run; the `benchmark-client` image is unaffected
+because fixtures are bind-mounted, not baked in).
 
 ## Tracy profiling
 

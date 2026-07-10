@@ -69,7 +69,7 @@ namespace mysql {
     }
 
     // TODO not threadsafe!!!
-    std::string ConnectorManager::addConnection(http_server::ConnectionParams connection_param) {
+    std::string ConnectorManager::addConnection(conn::api_server::ConnectionParams connection_param) {
         OTX_ZONE_N("mysql::ConnectorManager::addConnection(http)");
         boost::mysql::connect_params params;
         log_->debug("Try add connection with alias: {}", connection_param.alias);

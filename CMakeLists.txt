@@ -11,6 +11,10 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_L
     set(CMAKE_CXX_FLAGS "-fcoroutines")
 endif()
 
+# Project cmake modules (e.g. vendored otterbrix_parser_extension.cmake used by
+# the SQL grammar extensions under otterbrix/parser/grammar_extention/).
+list(APPEND CMAKE_MODULE_PATH ${CMAKE_SOURCE_DIR}/cmake)
+
 # Load all shared deps from the local lib/ dir next to the binary.
 # CMAKE_INSTALL_RPATH is used at both build and install time (BUILD_WITH_INSTALL_RPATH),
 # overriding CMake's default behavior of embedding absolute conan cache paths.
@@ -131,16 +135,13 @@ add_library(lib_${PROJECT_NAME} INTERFACE
 
 target_link_libraries(
     lib_${PROJECT_NAME} INTERFACE
-    flight_sql_server
-    common_server
-    mysql_server
-    postgres_server
-    catalog
-    connectors
-    component_manager
-    integration
-    otterbrix_local
-    scheduler
+    # These internal static libs cross-reference each other (e.g. scheduler uses
+    # integration handlers while integration/otterbrix_local use scheduler's
+    # schema_utils), so a single left-to-right link pass can miss objects only
+    # one of them pulls (e.g. integration/s3/s3_manager.o, referenced solely by
+    # the Scheduler). RESCAN groups them (--start-group/--end-group) so the
+    # linker re-pulls until the cycle is fully resolved.
+    "$<LINK_GROUP:RESCAN,flight_sql_server,common_server,mysql_server,postgres_server,catalog,connectors,s3,file,api_server,component_manager,integration,otterbrix_local,scheduler>"
     config::config
     arrow::arrow
     Boost::boost

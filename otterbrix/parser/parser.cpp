@@ -3,6 +3,8 @@
 
 #include "parser.hpp"
 
+#include "grammar_extention/file/file_extension.hpp"
+#include "grammar_extention/s3/s3_extension.hpp"
 #include "name_resolution.hpp"
 #include "scheduler/schema_utils.hpp"
 #include "subquery_extractor.hpp"
@@ -273,6 +275,15 @@ GreenplumParser::GreenplumParser(std::pmr::memory_resource* resource)
     , log_(get_logger(logger_tag::PARSER)) {
     assert(resource_ != nullptr && "memory resource must not be null");
     assert(log_.is_valid());
+
+    // Register the s3/file DDL extensions once; raw_parser/transformer below
+    // consult them only for statements the core grammar rejects.
+    auto s3_added = registry_.add(make_s3_extension());
+    assert(!s3_added.has_error() && "failed to register s3 parser extension");
+    (void)s3_added;
+    auto file_added = registry_.add(make_file_extension());
+    assert(!file_added.has_error() && "failed to register file parser extension");
+    (void)file_added;
 }
 
 core::result_wrapper_t<ParsedQueryDataPtr> GreenplumParser::parse(const std::string& sql) {
@@ -281,7 +292,7 @@ core::result_wrapper_t<ParsedQueryDataPtr> GreenplumParser::parse(const std::str
     try {
         tracy_memory_resource arena_mr(resource_, "parser::arena");
         std::pmr::monotonic_buffer_resource arena_resource(&arena_mr);
-        sql::transform::transformer transformer(resource_);
+        sql::transform::transformer transformer(resource_, nullptr, &registry_);
 
         ::Node* reusable_root = nullptr;
         auto extraction = otterstax::parser::prepare_sql(sql, &arena_resource, &reusable_root);
@@ -295,7 +306,8 @@ core::result_wrapper_t<ParsedQueryDataPtr> GreenplumParser::parse(const std::str
             res = reusable_root;
         } else {
             log_->trace("parse: calling raw_parser on modified SQL");
-            auto* raw = raw_parser(&arena_resource, extraction.modified_sql.c_str());
+            // 3-arg form: consult the s3/file extensions for core-rejected DDL.
+            auto* raw = raw_parser(&arena_resource, extraction.modified_sql.c_str(), registry_);
             if (!raw || list_length(raw) == 0) {
                 // raw_parser returns null on a syntax error and an EMPTY list
                 // for input with no statements (e.g. "") — linitial on an

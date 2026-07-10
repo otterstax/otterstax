@@ -9,6 +9,7 @@
 #include <otterbrix/otterbrix.hpp>
 
 #include <components/logical_plan/node_data.hpp>
+#include <components/sql/parser/extension.hpp>
 #include <components/sql/transformer/transform_result.hpp>
 #include <core/result_wrapper.hpp>
 
@@ -64,6 +65,11 @@ public:
 private:
     std::pmr::memory_resource* resource_;
     log_t log_;
+    // s3/file DDL extensions (CREATE EXTERNAL TABLE / COPY ... TO). Core SQL is
+    // parsed first; only core-rejected statements reach these, whose transform
+    // yields an otterstax::external::external_node_t. Passed to both raw_parser
+    // (3-arg) and the transformer.
+    components::sql::parser::parser_extension_registry_t registry_;
 };
 
 using parser_ptr = std::unique_ptr<IParser>;

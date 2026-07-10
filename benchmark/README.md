@@ -80,7 +80,8 @@ Run everything end-to-end — builds images if needed, starts databases, initial
 data, runs all benchmarks, and writes results.
 
 ```bash
-# Default: mysql + postgres frontends, all 5 tests, 10 reps each
+# Default: mysql + postgres frontends, the 5 cross-backend tests, 10 reps each
+# (external_* s3/file tests are opt-in — see "External-table tests" below)
 ./benchmark/scripts/run_benchmark.sh
 
 # Quick smoke test
@@ -193,6 +194,60 @@ elapsed_ms : 45.2
 
 > **Note:** `join_all` is slow because OtterStax fetches entire tables and filters
 > in-process — there is no predicate pushdown to backends.
+
+---
+
+## External-table tests (s3/file)
+
+Five opt-in workloads that exercise the `CREATE EXTERNAL TABLE` / `COPY ... TO`
+grammar extensions. Each runs both a local-file (`/fixtures` mount) and an s3
+(seeded MinIO) source, so file vs s3 are directly comparable in the sub-test
+breakdown. `mysql` and `postgres` frontends only — `arrow` is excluded by the
+same JOIN serialisation bug as the default test set.
+
+| Test                  | Workload                                                                                | Sub-tests |
+|-----------------------|-----------------------------------------------------------------------------------------|-----------|
+| `external_load`       | `CREATE EXTERNAL TABLE` — table dropped between reps to time a cold load                | `{file,s3}_{parquet,csv,ndjson}` |
+| `external_join`       | `regions`(parquet) ⋈ `web_events`(csv) on `campaign_id` — internal otterbrix-on-otterbrix join | `{file,s3}_join` |
+| `external_dump`       | `COPY (SELECT * FROM <loaded>) TO <target>` — writer + upload                           | `{file,s3}_{parquet,csv,ndjson}` |
+| `external_join_cross` | external `regions` ⋈ otterbrix-internal `weights` (`CREATE TABLE` + `INSERT`)           | `{file,s3}_cross` |
+| `external_join_all`   | s3 parquet `regions` ⋈ file csv `web_events` ⋈ internal `weights`, all on `campaign_id` | `s3parquet_filecsv_internal` |
+
+`external_join_cross` / `external_join_all` deliberately load every side into
+otterbrix-internal storage (external load + a hand-built `bigint` engine table).
+A direct backend.int32 ⋈ s3.int64 JOIN silently returns zero rows
+([`FIX_JOIN.md`](../FIX_JOIN.md)), so the benchmarks follow the same staged
+shape the python tests use.
+
+Selecting any `external_*` test automatically:
+
+1. Generates fixtures into `benchmark/data/fixtures/` via `data/generate_external_fixtures.py`.
+2. Adds `compose_minio.yml` to the stack (MinIO + a one-shot that seeds `bench-bucket`).
+3. Registers the `bench_minio` s3 alias via `GET /s3/add_credentials`.
+
+```bash
+# All five external tests, both frontends
+./benchmark/scripts/run_benchmark.sh \
+  --bench external_load external_join external_dump external_join_cross external_join_all \
+  --repetitions 5
+
+# Just the s3-join shapes, mysql wire
+./benchmark/scripts/run_benchmark.sh --frontend mysql \
+  --bench external_join_cross external_join_all
+```
+
+Manual flow: start with `--external` so MinIO + fixtures + s3 alias are ready
+before `run_bench.sh` selects the tests:
+
+```bash
+./benchmark/manual/start_service.sh --external
+./benchmark/manual/run_bench.sh \
+  --bench external_load external_join external_dump external_join_cross external_join_all
+```
+
+Fixture sizes come from the `external:` block in `bench.yaml` (defaults:
+`regions.parquet` ≈ 4 k rows, `web_events.csv` ≈ 20 k rows, `campaigns.ndjson` =
+`num_campaigns`). All `int` columns are int64 to avoid the JOIN-key width trap.
 
 ---
 

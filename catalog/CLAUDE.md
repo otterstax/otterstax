@@ -27,6 +27,28 @@ Despite the `mysql::` namespace the class handles all three backend types.
 - `connection_registry_` (`unordered_map<uuid, ConnectionInfo>`) — guarded by `connection_registry_mtx_`; the sole source of truth for which UUID maps to which backend type
 - Three `ConnectorManager` shared_ptrs set via setters after construction (circular reference avoided — catalog is constructed first, managers pass catalog's address to their own constructors)
 
+## Backend-type classification (`update_backend_type_impl`)
+
+`update_backend_type_impl` iterates `data->otterbrix_params->external_nodes`
+and sets `data->backend_type` from what it finds:
+
+- ≥ 2 distinct registered backend connections present → `Mixed`.
+- Exactly one registered backend present → that backend (`MySQL`,
+  `PostgreSQL`, or `ClickHouse`).
+- No registered backend, but the plan root is `join_t` / `intersect_t` /
+  `union_t` (the `has_otterbrix_nodes` term) → `Otterbrix`.
+- Otherwise → unknown / error.
+
+**Backend ⋈ otterbrix-internal isn't `Mixed`.** The parser drops local tables
+from `external_nodes` (`otterbrix/parser/parser.cpp:212` — empty
+`unique_identifier` skipped) so the catalog only sees the registered backend
+side. The query is classified as that single backend type. The backend
+manager fetches its slice, inlines it as `node_raw_data`, and the
+`OtterbrixManager` resolves the still-symbolic local-table nodes via their
+stamped `table_oid` (set on `target.oid` here) before running the JOIN.
+`examples/demo/sql/step_4.sql` is the live demo of this — see also
+`FIX_JOIN.md`.
+
 ## Gotcha: DAY/SECOND macro clash
 
 `catalog_manager.hpp` does `#undef DAY` and `#undef SECOND` after including the Otterbrix parser but before including Arrow. This is required because the Otterbrix parser defines these as macros that collide with Arrow's symbol names. Do not remove these undefs.

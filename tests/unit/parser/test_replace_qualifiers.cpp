@@ -10,8 +10,12 @@
 #include <string>
 
 namespace {
+    // See test_subquery_extractor.cpp:prep — must use a scoped arena, otherwise
+    // libotterbrix_sql's parse-tree allocations leak through the default
+    // (new_delete) resource and LSAN fails the test.
     otterstax::parser::extraction_result_t prep(const std::string& sql) {
-        return otterstax::parser::prepare_sql(sql, std::pmr::get_default_resource());
+        std::pmr::monotonic_buffer_resource arena;
+        return otterstax::parser::prepare_sql(sql, &arena);
     }
 
     std::string render(const otterstax::parser::subquery_stub_t& stub, backend_type_t backend) {

@@ -22,7 +22,9 @@ Scheduler::Scheduler(std::pmr::memory_resource* res,
                      actor_zeta::address_t pg_connection_manager,
                      actor_zeta::address_t ch_connection_manager,
                      actor_zeta::address_t otterbrix_manager,
-                     actor_zeta::address_t catalog_manager)
+                     actor_zeta::address_t catalog_manager,
+                     actor_zeta::address_t s3_manager,
+                     actor_zeta::address_t file_manager)
     : resource_(res)
     , scheduler_(scheduler)
     , log_(get_logger(logger_tag::SCHEDULER))
@@ -36,7 +38,10 @@ Scheduler::Scheduler(std::pmr::memory_resource* res,
 
     // Each Worker owns its own parser instance — no shared objects between actors
     // (codex rule 10). The factory is a plain function pointer (rule 14: no
-    // std::function); the built parser is moved into the Worker.
+    // std::function); the built parser is moved into the Worker. s3/file manager
+    // addresses are forwarded so each Worker can dispatch external-table
+    // statements (CREATE EXTERNAL TABLE / COPY ... TO) without touching shared
+    // state.
     workers_.reserve(worker_count);
     worker_addresses_.reserve(worker_count);
     for (std::size_t i = 0; i < worker_count; ++i) {
@@ -48,7 +53,9 @@ Scheduler::Scheduler(std::pmr::memory_resource* res,
                                                 pg_connection_manager,
                                                 ch_connection_manager,
                                                 otterbrix_manager,
-                                                catalog_manager);
+                                                catalog_manager,
+                                                s3_manager,
+                                                file_manager);
         worker_addresses_.push_back(worker->address());
         workers_.push_back(std::move(worker));
     }

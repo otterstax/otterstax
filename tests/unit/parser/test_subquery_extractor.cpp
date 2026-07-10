@@ -15,7 +15,17 @@ using otterstax::parser::prepare_sql;
 namespace {
     std::string stub_id(int n) { return std::string(k_stub_prefix) + std::to_string(n); }
 
-    extraction_result_t prep(std::string_view sql) { return prepare_sql(sql, std::pmr::get_default_resource()); }
+    // The Postgres grammar wrapped in libotterbrix_sql allocates parse-tree nodes
+    // through the supplied memory_resource and never tracks per-call cleanup —
+    // it relies on the caller passing an arena that dies at end of parse. Using
+    // the default (new_delete) resource leaks the full parse tree (LSAN trips).
+    // Mirror parser.cpp:294 and discard a monotonic arena per call; the
+    // `extraction_result_t` return is by-value (std::string / std::vector) and
+    // does not point into the arena.
+    extraction_result_t prep(std::string_view sql) {
+        std::pmr::monotonic_buffer_resource arena;
+        return prepare_sql(sql, &arena);
+    }
 } // namespace
 
 TEST_CASE("subquery in FROM") {

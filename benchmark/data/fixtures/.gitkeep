@@ -1,0 +1,3 @@
+# Generated external-table benchmark fixtures land here
+# (regions.parquet, web_events.csv, campaigns.ndjson)
+# Produced by data/generate_external_fixtures.py at benchmark time.

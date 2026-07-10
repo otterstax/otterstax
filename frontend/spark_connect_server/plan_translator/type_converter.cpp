@@ -26,15 +26,21 @@ using namespace components::types;
         case logical_type::BOOLEAN:
             result.mutable_boolean();
             break;
+        // Spark has no unsigned integer types; map each to the same-size signed
+        // Spark type (matches the result encoder's schema re-tag).
+        case logical_type::UTINYINT:
         case logical_type::TINYINT:
             result.mutable_byte();
             break;
+        case logical_type::USMALLINT:
         case logical_type::SMALLINT:
             result.mutable_short_();
             break;
+        case logical_type::UINTEGER:
         case logical_type::INTEGER:
             result.mutable_integer();
             break;
+        case logical_type::UBIGINT:
         case logical_type::BIGINT:
             result.mutable_long_();
             break;

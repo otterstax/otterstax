@@ -28,6 +28,26 @@ namespace ca = components::vector::arrow;
 
 using encode_result = core::result_wrapper_t<EncodedBatch>;
 
+// Spark (and Arrow-for-Spark) has no unsigned integer types — but the engine
+// produces them (e.g. COUNT() yields UBIGINT). Map each to the SAME-SIZE signed
+// type: the column buffers are bit-identical, so re-tagging the Arrow schema and
+// letting ImportRecordBatch reinterpret the buffers preserves the values (all
+// non-negative aggregate results, well within the signed range).
+ct::logical_type spark_signed_type(ct::logical_type t) {
+    switch (t) {
+        case ct::logical_type::UTINYINT:
+            return ct::logical_type::TINYINT;
+        case ct::logical_type::USMALLINT:
+            return ct::logical_type::SMALLINT;
+        case ct::logical_type::UINTEGER:
+            return ct::logical_type::INTEGER;
+        case ct::logical_type::UBIGINT:
+            return ct::logical_type::BIGINT;
+        default:
+            return t;
+    }
+}
+
 encode_result make_error(core::error_code_t code,
                          std::string_view what,
                          std::pmr::memory_resource* resource) {
@@ -77,11 +97,25 @@ encode_arrow_batch(const ct::complex_logical_type& schema,
         const bool named_schema = schema.type() == ct::logical_type::STRUCT &&
                                   schema.child_types().size() == field_types.size();
         for (size_t i = 0; i < field_types.size(); ++i) {
+            // Resolve the field name BEFORE any type remap below (rebuilding the
+            // type drops the alias): authoritative struct names win, else keep the
+            // chunk's own alias, else a stable colN.
+            std::string name;
             if (named_schema && schema.child_types()[i].has_alias()) {
-                field_types[i].set_alias(schema.child_types()[i].alias());
-            } else if (!field_types[i].has_alias()) {
-                field_types[i].set_alias("col" + std::to_string(i));
+                name = schema.child_types()[i].alias();
+            } else if (field_types[i].has_alias()) {
+                name = field_types[i].alias();
+            } else {
+                name = "col" + std::to_string(i);
             }
+
+            // Re-tag unsigned integer columns as signed so pyspark accepts the
+            // schema (Spark has no unsigned types); the buffers are unchanged.
+            const ct::logical_type signed_lt = spark_signed_type(field_types[i].type());
+            if (signed_lt != field_types[i].type()) {
+                field_types[i] = ct::complex_logical_type{signed_lt};
+            }
+            field_types[i].set_alias(name);
         }
 
         // Otterbrix C ABI converters. to_arrow_array's signature takes a

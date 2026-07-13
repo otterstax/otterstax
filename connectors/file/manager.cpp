@@ -183,16 +183,18 @@ actor_zeta::unique_future<core::result_wrapper_t<std::string>> FileManager::dump
                                   ? temporary_path(file_metadata.path)
                                   : file_metadata.path;
 
-        const auto& chunk = cursor->chunk_data();
+        // b1/b2 cursors return the result as a vector of <=1024-row chunks (never
+        // combined into one); write them all via the multi-chunk writer overloads.
+        const auto& chunks = cursor->chunks();
         switch (file_metadata.format) {
             case FileFormat::Parquet:
-                tsl::chunk_to_parquet(chunk, out_path);
+                tsl::chunk_to_parquet(chunks, out_path);
                 break;
             case FileFormat::CSV:
-                tsl::chunk_to_csv(chunk, out_path);
+                tsl::chunk_to_csv(chunks, out_path);
                 break;
             case FileFormat::NDJSON:
-                tsl::chunk_to_ndjson(chunk, out_path);
+                tsl::chunk_to_ndjson(chunks, out_path);
                 break;
             default:
                 co_return core::error_t(core::error_code_t::other_error,

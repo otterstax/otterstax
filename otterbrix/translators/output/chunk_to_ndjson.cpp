@@ -7,7 +7,9 @@
 #include <components/types/types.hpp>
 
 #include <fstream>
+#include <memory_resource>
 #include <string>
+#include <vector>
 
 namespace tsl {
 
@@ -70,6 +72,32 @@ void chunk_to_ndjson(const components::vector::data_chunk_t& chunk, const std::s
             out << value_to_json(val);
         }
         out << "}\n";
+    }
+
+    if (!out.good())
+        throw std::runtime_error("chunk_to_json: write error for: " + path);
+}
+
+void chunk_to_ndjson(const std::pmr::vector<components::vector::data_chunk_t>& chunks,
+                     const std::string& path) {
+    std::ofstream out(path);
+    if (!out)
+        throw std::runtime_error("chunk_to_json: cannot open output: " + path);
+
+    for (const auto& chunk : chunks) {
+        const auto types = chunk.types();
+        const size_t ncols = static_cast<size_t>(chunk.column_count());
+        const size_t nrows = static_cast<size_t>(chunk.size());
+        for (size_t r = 0; r < nrows; r++) {
+            out << '{';
+            for (size_t c = 0; c < ncols; c++) {
+                if (c > 0) out << ',';
+                out << '"' << types[c].alias() << '"' << ':';
+                auto val = chunk.value(static_cast<uint64_t>(c), static_cast<uint64_t>(r));
+                out << value_to_json(val);
+            }
+            out << "}\n";
+        }
     }
 
     if (!out.good())

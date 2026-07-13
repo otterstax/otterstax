@@ -51,7 +51,7 @@ class OtterStax(ConanFile):
         self.requires("benchmark/1.6.1")
         self.requires("zlib/1.3.1")
         self.requires("bzip2/1.0.8")
-        self.requires("otterbrix/1.0.0b2-rc-1")
+        self.requires("otterbrix/1.0.0b2-rc-1#1843c85c6f8388cebf3a94081f63376e")
         self.requires("magic_enum/0.8.1")
         self.requires("actor-zeta/1.2.0@")
         self.requires("libpq/15.4")

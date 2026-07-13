@@ -639,7 +639,9 @@ TEST_CASE("multi-chunk result carries all rows through the scheduler") {
                                                   pg_connection_manager->address(),
                                                   ch_connection_manager->address(),
                                                   otterbrix_manager->address(),
-                                                  catalog_manager->address());
+                                                  catalog_manager->address(),
+                                                  actor_zeta::address_t::empty_address(),
+                                                  actor_zeta::address_t::empty_address());
     assert(scheduler);
     std::string sql = "SELECT 1 AS test";
     session_hash_t id = 1;

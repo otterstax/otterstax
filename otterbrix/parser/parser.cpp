@@ -6,7 +6,7 @@
 #include "grammar_extention/file/file_extension.hpp"
 #include "grammar_extention/s3/s3_extension.hpp"
 #include "name_resolution.hpp"
-#include "scheduler/schema_utils.hpp"
+#include "otterbrix/schema/schema_utils.hpp"
 #include "subquery_extractor.hpp"
 #include "utility/tracy_memory_resource.hpp"
 #include "utility/tracy_profiler.hpp"
@@ -276,14 +276,18 @@ GreenplumParser::GreenplumParser(std::pmr::memory_resource* resource)
     assert(resource_ != nullptr && "memory resource must not be null");
     assert(log_.is_valid());
 
-    // Register the s3/file DDL extensions once; raw_parser/transformer below
-    // consult them only for statements the core grammar rejects.
+    // Register the s3/file/kafka DDL extensions once into the shared registry;
+    // raw_parser/transformer below consult them only for statements the core
+    // grammar rejects.
     auto s3_added = registry_.add(make_s3_extension());
     assert(!s3_added.has_error() && "failed to register s3 parser extension");
     (void)s3_added;
     auto file_added = registry_.add(make_file_extension());
     assert(!file_added.has_error() && "failed to register file parser extension");
     (void)file_added;
+    auto kafka_added = registry_.add(make_kafka_extension());
+    assert(!kafka_added.has_error() && "failed to register kafka parser extension");
+    (void)kafka_added;
 }
 
 core::result_wrapper_t<ParsedQueryDataPtr> GreenplumParser::parse(const std::string& sql) {
@@ -306,7 +310,7 @@ core::result_wrapper_t<ParsedQueryDataPtr> GreenplumParser::parse(const std::str
             res = reusable_root;
         } else {
             log_->trace("parse: calling raw_parser on modified SQL");
-            // 3-arg form: consult the s3/file extensions for core-rejected DDL.
+            // 3-arg form: consult the s3/file/kafka extensions for core-rejected DDL.
             auto* raw = raw_parser(&arena_resource, extraction.modified_sql.c_str(), registry_);
             if (!raw || list_length(raw) == 0) {
                 // raw_parser returns null on a syntax error and an EMPTY list

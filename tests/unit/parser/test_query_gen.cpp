@@ -5,7 +5,7 @@
 #include "otterbrix/parser/parser.hpp"
 #include "otterbrix/parser/subquery_extractor.hpp"
 #include "otterbrix/query_generation/sql_query_generator.hpp"
-#include "scheduler/schema_utils.hpp"
+#include "otterbrix/schema/schema_utils.hpp"
 
 #include <catch2/catch.hpp>
 

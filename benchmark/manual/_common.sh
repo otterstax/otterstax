@@ -10,10 +10,14 @@ IMAGE_TAG="${IMAGE_TAG:-bench}"
 # Set to true (via start_service.sh --external) to add a seeded MinIO so the
 # s3/file external_* benchmarks can run in the manual flow.
 EXTERNAL_ENABLED="${EXTERNAL_ENABLED:-false}"
+# Set to true (via start_service.sh --kafka) to add a redpanda broker + a seeded
+# topic so the kafka_* benchmarks can run in the manual flow.
+KAFKA_ENABLED="${KAFKA_ENABLED:-false}"
 
 _compose_backends() {
     local _files=(-f "$BENCH_DIR/compose_backends.yml")
     [ "$EXTERNAL_ENABLED" = "true" ] && _files+=(-f "$BENCH_DIR/compose_minio.yml")
+    [ "$KAFKA_ENABLED" = "true" ] && _files+=(-f "$BENCH_DIR/compose_kafka.yml")
     docker compose "${_files[@]}" -p bench "$@"
 }
 
@@ -24,6 +28,7 @@ _compose_otterstax() {
         -f "$BENCH_DIR/compose_manual.yml"
     )
     [ "$EXTERNAL_ENABLED" = "true" ] && _files+=(-f "$BENCH_DIR/compose_minio.yml")
+    [ "$KAFKA_ENABLED" = "true" ] && _files+=(-f "$BENCH_DIR/compose_kafka.yml")
     docker compose "${_files[@]}" -p bench "$@"
 }
 
@@ -137,6 +142,31 @@ _generate_external_fixtures() {
         python /app/data/generate_external_fixtures.py --out /app/data/fixtures
 }
 
+# Generate the kafka JSON dataset into benchmark/data/fixtures.
+# Uses the image-baked /app/bench.yaml (NOT the host file) so the row count/topic
+# match what the runner reads — editing the kafka block needs --rebuild, the same
+# contract as the rest of bench.yaml.
+_generate_kafka_fixtures() {
+    echo "Generating kafka JSON dataset..."
+    mkdir -p "$BENCH_DIR/data/fixtures"
+    docker run --rm \
+        -v "$BENCH_DIR/data/fixtures:/app/data/fixtures" \
+        -e PYTHONUNBUFFERED=1 \
+        benchmark-client:latest \
+        python /app/data/generate_kafka_fixtures.py --out /app/data/fixtures
+}
+
+# Seed the kafka topic from the generated dataset (once, after the broker is up).
+_seed_kafka() {
+    echo "Seeding kafka topic..."
+    docker run --rm --network=bench_net \
+        -v "$BENCH_DIR/data/fixtures:/fixtures:ro" \
+        -e PYTHONUNBUFFERED=1 \
+        benchmark-client:latest \
+        python /app/data/seed_kafka.py --broker bench_kafka:9092 \
+        --file /fixtures/kafka_events.ndjson
+}
+
 _frontend_port() {
     case "$1" in
         mysql)    echo 8816 ;;
@@ -151,6 +181,7 @@ _frontend_port() {
 DEFAULT_TESTS=(simple_select complex_select join_same_instance join_cross_engine join_all)
 ALL_TESTS=("${DEFAULT_TESTS[@]}"
            external_load external_join external_dump
-           external_join_cross external_join_all)
+           external_join_cross external_join_all
+           kafka_ingest kafka_produce kafka_stream)
 ALL_FRONTENDS=(mysql postgres arrow)
 DEFAULT_FRONTENDS=(mysql postgres)

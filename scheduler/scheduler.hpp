@@ -61,7 +61,11 @@ public:
               actor_zeta::address_t otterbrix_manager,
               actor_zeta::address_t catalog_manager,
               actor_zeta::address_t s3_manager,
-              actor_zeta::address_t file_manager);
+              actor_zeta::address_t file_manager,
+              // Optional: production (component_manager) passes the KafkaManager;
+              // tests that don't exercise Kafka omit it (Workers never send to an
+              // empty address unless a kafka_node_t is parsed).
+              actor_zeta::address_t kafka_manager = actor_zeta::address_t::empty_address());
     ~Scheduler();
 
     std::pmr::memory_resource* resource() const noexcept { return resource_; }

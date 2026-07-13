@@ -502,3 +502,65 @@ print(f"""✅ S3 demo fixtures written:
    {S3_DIR / 'regions.csv'}        regions={len(regions)}
 {parquet_note}
 """)
+
+
+# ── Kafka fixtures for the streaming demo (examples/demo/kafka/) ──────────────
+# Two live order-event topics, seeded into redpanda by examples/demo/kafka/seed.py.
+#   demo_orders_live  — the main event feed (features 1-6)
+#   demo_orders_intl  — a second feed used only by the fan-in demo (feature 7)
+# customer_id is drawn from customers that ALSO appear in ch.ev.sessions, so the
+# kafka ⋈ ClickHouse ⋈ Postgres JOIN returns real rows. Every join key is a
+# string (UUID) — a string key sidesteps the int32/int64 width footgun the
+# top-level CLAUDE.md warns about.
+
+KAFKA_DIR = INIT_DIR / "kafka"
+KAFKA_DIR.mkdir(parents=True, exist_ok=True)
+
+import json as _json
+
+# Customers that have at least one session — guarantees the ClickHouse join
+# (sessions.user_id = customer_id) matches for every kafka event.
+_session_customer_ids = sorted({s["user_id"] for s in sessions})
+
+# Skew toward 'paid' so both the WHERE status='paid' stream and the plain
+# ingestion have plenty to show, while keeping a couple of other statuses.
+KAFKA_STATUSES = ["paid"] * 6 + ["pending"] * 2 + ["refunded"] * 2
+KAFKA_CHANNELS = ["web", "mobile", "email", "social"]
+
+
+def make_events(n: int, rng_seed: int) -> list:
+    rng = random.Random(SEED + rng_seed)
+    out = []
+    for _ in range(n):
+        out.append({
+            "event_id":    new_uuid(),
+            "customer_id": rng.choice(_session_customer_ids),
+            "amount":      round(rng.uniform(10, 500), 2),
+            "qty":         rng.randint(1, 5),
+            "status":      rng.choice(KAFKA_STATUSES),
+            "channel":     rng.choice(KAFKA_CHANNELS),
+        })
+    return out
+
+
+N_KAFKA_MAIN = 40
+N_KAFKA_INTL = 25
+orders_live = make_events(N_KAFKA_MAIN, 1)
+orders_intl = make_events(N_KAFKA_INTL, 2)
+
+
+def write_ndjson(path: Path, rows: list) -> None:
+    with open(path, "w") as fh:
+        for r in rows:
+            fh.write(_json.dumps(r) + "\n")
+
+
+write_ndjson(KAFKA_DIR / "orders_live.ndjson", orders_live)
+write_ndjson(KAFKA_DIR / "orders_intl.ndjson", orders_intl)
+
+_paid_main = sum(1 for e in orders_live if e["status"] == "paid")
+print(f"""✅ Kafka demo fixtures written:
+   {KAFKA_DIR / 'orders_live.ndjson'}   events={len(orders_live)} (paid={_paid_main})
+   {KAFKA_DIR / 'orders_intl.ndjson'}   events={len(orders_intl)}
+   distinct customer_ids referenced: {len({e['customer_id'] for e in orders_live + orders_intl})} (all have ch sessions)
+""")

@@ -232,6 +232,25 @@ The two `*_create` registry benchmarks are dominated by the core-parser-rejectio
 
 ---
 
+### `bench_kafka_translators.cpp`
+
+The Kafka value-conversion hot paths (`integration/kafka/detail/kafka_reader.cpp`),
+broker-free. These are the per-batch conversions the SOURCE poller and STREAM
+worker run for every Kafka message; the end-to-end `kafka_*` benchmarks time them
+behind a live broker, this isolates the pure CPU cost. Dataset mirrors
+`kafka_ingest`: 5 primitive columns (id/campaign_id/ts BIGINT, event_type STRING,
+amount DOUBLE).
+
+| Benchmark | Rows | Path |
+|-----------|------|------|
+| `BM_json_to_chunk/{1000,10000,100000}` | 1 k / 10 k / 100 k | JSON payloads → `data_chunk_t` (ingest inner loop) |
+| `BM_chunk_to_json/{1000,10000,100000}` | 1 k / 10 k / 100 k | `data_chunk_t` → JSON payloads (stream/produce inner loop) |
+
+Both report `items_per_second` (rows/s). `data_chunk_t` is move-only, so
+`BM_chunk_to_json` builds the chunk once outside the loop (`chunk_to_json` takes it
+by const ref). Links `kafka_runtime` (a separate `target_link_libraries` call in
+`CMakeLists.txt`, which also brings `kafka_grammar` for `kafka_column_t`).
+
 ## What is NOT benchmarkable at this level
 
 | Function | Reason | Covered by |

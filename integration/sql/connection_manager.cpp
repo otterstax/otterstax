@@ -4,8 +4,8 @@
 #include "connection_manager.hpp"
 
 #include "otterbrix/query_generation/sql_query_generator.hpp"
+#include "otterbrix/schema/schema_utils.hpp"
 #include "otterbrix/translators/input/mysql_to_chunk.hpp"
-#include "scheduler/schema_utils.hpp"
 #include "utility/cv_wrapper.hpp"
 #include "utility/logger.hpp"
 #include "utility/tracy_profiler.hpp"
@@ -15,8 +15,7 @@
 
 using namespace db;
 
-MySQLManager::MySQLManager(std::pmr::memory_resource* res,
-                                           std::shared_ptr<mysql::ConnectorManager> connector_manager)
+MySQLManager::MySQLManager(std::pmr::memory_resource* res, std::shared_ptr<mysql::ConnectorManager> connector_manager)
     : resource_(res)
     , connector_manager_(std::move(connector_manager))
     , log_(get_logger(logger_tag::SQL_CONNECTION_MANAGER)) {
@@ -27,8 +26,7 @@ MySQLManager::MySQLManager(std::pmr::memory_resource* res,
     connector_manager_->start();
 }
 
-std::pair<bool, actor_zeta::detail::enqueue_result>
-MySQLManager::enqueue_impl(actor_zeta::mailbox::message_ptr msg) {
+std::pair<bool, actor_zeta::detail::enqueue_result> MySQLManager::enqueue_impl(actor_zeta::mailbox::message_ptr msg) {
     OTX_ZONE_N("MySQLManager::enqueue_impl");
     std::lock_guard guard(mutex_);
     current_behavior_ = behavior(msg.get());
@@ -55,8 +53,8 @@ actor_zeta::behavior_t MySQLManager::behavior(actor_zeta::mailbox::message* msg)
     }
 }
 
-actor_zeta::unique_future<core::result_wrapper_t<ParsedQueryDataPtr>>
-MySQLManager::execute(session_hash_t id, ParsedQueryDataPtr data) {
+actor_zeta::unique_future<core::result_wrapper_t<ParsedQueryDataPtr>> MySQLManager::execute(session_hash_t id,
+                                                                                            ParsedQueryDataPtr data) {
     OTX_ZONE_N("MySQLManager::execute");
     assert(data);
     try {
@@ -116,10 +114,8 @@ MySQLManager::execute(session_hash_t id, ParsedQueryDataPtr data) {
                 if (node->type() == logical_plan::node_type::unused) {
                     auto& sn = static_cast<schema_utils::schema_node_t&>(*node);
                     if (sn.has_raw_sql()) {
-                        generated_queries.emplace_back(sql_gen::replace_qualifiers(
-                            sn.raw_sql(),
-                            sn.qualifiers(),
-                            backend_type_t::MySQL));
+                        generated_queries.emplace_back(
+                            sql_gen::replace_qualifiers(sn.raw_sql(), sn.qualifiers(), backend_type_t::MySQL));
                     } else {
                         generated_queries.emplace_back(
                             sql_gen::generate_query(sn.agg_node(),
@@ -167,9 +163,8 @@ MySQLManager::execute(session_hash_t id, ParsedQueryDataPtr data) {
         log_->debug("execute finished");
         co_return std::move(data);
     } catch (const boost::mysql::error_with_diagnostics& err) {
-        std::string error_msg =
-            "MySQLManager::execute caught boost::mysql exception: " + std::string(err.what()) +
-            ", server diagnostics: " + std::string(err.get_diagnostics().server_message());
+        std::string error_msg = "MySQLManager::execute caught boost::mysql exception: " + std::string(err.what()) +
+                                ", server diagnostics: " + std::string(err.get_diagnostics().server_message());
         log_->error("execute caught boost::mysql::error_with_diagnostics: {}, error code: {}, server diagnostics: {}",
                     err.what(),
                     err.code().value(),

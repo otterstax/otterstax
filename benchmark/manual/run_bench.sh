@@ -11,7 +11,9 @@
 #                   Values: simple_select complex_select join_same_instance
 #                           join_cross_engine join_all
 #                           external_load external_join external_dump
-#                   (external_* require ./start_service.sh --external)
+#                           kafka_ingest kafka_produce kafka_stream
+#                   (external_* require ./start_service.sh --external;
+#                    kafka_* require ./start_service.sh --kafka)
 #   --repetitions N Reps per test (default: 3)
 #   --out-dir DIR   Output directory (default: benchmark_manual/<YYYYMMDD_HHMMSS>)
 set -e

@@ -4,16 +4,18 @@
 #pragma once
 
 #include "catalog/catalog_manager.hpp"
-#include "connectors/mysql/manager.hpp"
-#include "connectors/postgresql/manager.hpp"
 #include "connectors/clickhouse/manager.hpp"
 #include "connectors/file/manager.hpp"
+#include "connectors/mysql/manager.hpp"
+#include "connectors/postgresql/manager.hpp"
 #include "connectors/s3/manager.hpp"
+#include "integration/clickhouse/connection_manager.hpp"
+#include "integration/kafka/kafka_manager.hpp"
+#include "integration/otterbrix/otterbrix_engine.hpp"
 #include "integration/otterbrix/otterbrix_manager.hpp"
+#include "integration/postgresql/connection_manager.hpp"
 #include "integration/s3/s3_manager.hpp"
 #include "integration/sql/connection_manager.hpp"
-#include "integration/postgresql/connection_manager.hpp"
-#include "integration/clickhouse/connection_manager.hpp"
 #include "scheduler/scheduler.hpp"
 
 #include <actor-zeta.hpp>
@@ -39,8 +41,9 @@ public:
     actor_zeta::address_t pg_connection_manager_address() const;
     actor_zeta::address_t file_manager_address() const;
     actor_zeta::address_t s3_manager_address() const;
+
 private:
-    otterbrix::otterbrix_ptr otterbrix_{nullptr};
+    db::otterbrix_engine_ptr engine_{nullptr};
     std::pmr::memory_resource* resource_{nullptr};
     std::string log_path_;
     std::shared_ptr<mysql::ConnectorManager> db_connector_manager_{nullptr};
@@ -50,6 +53,9 @@ private:
         nullptr,
         actor_zeta::pmr::deleter_t{getResource()}};
     std::unique_ptr<db::OtterbrixManager, actor_zeta::pmr::deleter_t> otterbrix_manager_{
+        nullptr,
+        actor_zeta::pmr::deleter_t{getResource()}};
+    std::unique_ptr<otterstax::kafka::KafkaManager, actor_zeta::pmr::deleter_t> kafka_manager_{
         nullptr,
         actor_zeta::pmr::deleter_t{getResource()}};
     std::unique_ptr<db::MySQLManager, actor_zeta::pmr::deleter_t> sql_connection_manager_{
@@ -69,11 +75,14 @@ private:
     std::unique_ptr<Scheduler, actor_zeta::pmr::deleter_t> scheduler_{nullptr,
                                                                       actor_zeta::pmr::deleter_t{getResource()}};
     std::unique_ptr<conn::file::FileManager, actor_zeta::pmr::deleter_t> file_manager_{
-        nullptr, actor_zeta::pmr::deleter_t{getResource()}};
+        nullptr,
+        actor_zeta::pmr::deleter_t{getResource()}};
     std::unique_ptr<conn::s3::ConnectorManager, actor_zeta::pmr::deleter_t> s3_manager_{
-        nullptr, actor_zeta::pmr::deleter_t{getResource()}};
+        nullptr,
+        actor_zeta::pmr::deleter_t{getResource()}};
     // Integration-layer S3 orchestrator (download→add_file / dump_file→upload),
     // wrapping the raw conn::s3 + conn::file managers. Routed to by the Scheduler.
     std::unique_ptr<db::S3Manager, actor_zeta::pmr::deleter_t> s3_integration_manager_{
-        nullptr, actor_zeta::pmr::deleter_t{getResource()}};
+        nullptr,
+        actor_zeta::pmr::deleter_t{getResource()}};
 };

@@ -37,10 +37,10 @@
 
 namespace {
 
-otterbrix::otterbrix_ptr init_otterbrix(const std::string& data_dir) {
+db::otterbrix_engine_ptr init_otterbrix(const std::string& data_dir) {
     auto config = configuration::config::create_config(data_dir);
     initialize_all_loggers(config.log.path.string());
-    return otterbrix::make_otterbrix(std::move(config));
+    return db::make_otterbrix_engine(std::move(config));
 }
 
 void write_test_parquet(const std::string& path) {
@@ -117,7 +117,7 @@ TEST_CASE("FileManager: parquet ingestion and SELECT") {
     std::filesystem::remove_all(data_dir);
     write_test_parquet(parquet);
 
-    otterbrix::otterbrix_ptr otterbrix = init_otterbrix(data_dir);
+    db::otterbrix_engine_ptr otterbrix = init_otterbrix(data_dir);
     auto resource = otterbrix->dispatcher()->resource();
 
     auto otterbrix_manager =
@@ -166,7 +166,7 @@ TEST_CASE("FileManager: csv ingestion and SELECT") {
     std::filesystem::remove_all(data_dir);
     write_test_csv(csv);
 
-    otterbrix::otterbrix_ptr otterbrix = init_otterbrix(data_dir);
+    db::otterbrix_engine_ptr otterbrix = init_otterbrix(data_dir);
     auto resource = otterbrix->dispatcher()->resource();
 
     auto otterbrix_manager =
@@ -213,7 +213,7 @@ TEST_CASE("FileManager: ndjson ingestion and SELECT") {
     std::filesystem::remove_all(data_dir);
     write_test_ndjson(ndjson);
 
-    otterbrix::otterbrix_ptr otterbrix = init_otterbrix(data_dir);
+    db::otterbrix_engine_ptr otterbrix = init_otterbrix(data_dir);
     auto resource = otterbrix->dispatcher()->resource();
 
     auto otterbrix_manager =
@@ -267,7 +267,7 @@ TEST_CASE("FileManager: parquet dump and re-read") {
     std::filesystem::remove(out);
     write_test_parquet(parquet);
 
-    otterbrix::otterbrix_ptr otterbrix = init_otterbrix(data_dir);
+    db::otterbrix_engine_ptr otterbrix = init_otterbrix(data_dir);
     auto resource = otterbrix->dispatcher()->resource();
 
     auto otterbrix_manager =
@@ -348,7 +348,7 @@ TEST_CASE("FileManager: csv dump and re-read") {
     std::filesystem::remove(out);
     write_test_csv(csv);
 
-    otterbrix::otterbrix_ptr otterbrix = init_otterbrix(data_dir);
+    db::otterbrix_engine_ptr otterbrix = init_otterbrix(data_dir);
     auto resource = otterbrix->dispatcher()->resource();
 
     auto otterbrix_manager =
@@ -410,7 +410,7 @@ TEST_CASE("FileManager: ndjson dump and re-read") {
     std::filesystem::remove(out);
     write_test_ndjson(ndjson);
 
-    otterbrix::otterbrix_ptr otterbrix = init_otterbrix(data_dir);
+    db::otterbrix_engine_ptr otterbrix = init_otterbrix(data_dir);
     auto resource = otterbrix->dispatcher()->resource();
 
     auto otterbrix_manager =
@@ -470,7 +470,7 @@ namespace {
 
 struct scheduler_stack {
     actor_zeta::address_t      scheduler;
-    otterbrix::otterbrix_ptr   otterbrix;
+    db::otterbrix_engine_ptr   otterbrix;
     std::pmr::memory_resource* resource;
 };
 
@@ -508,7 +508,7 @@ template<typename Fn>
 void with_scheduler_stack(const std::string& data_dir, Fn&& body) {
     std::filesystem::remove_all(data_dir);
 
-    otterbrix::otterbrix_ptr otterbrix = init_otterbrix(data_dir);
+    db::otterbrix_engine_ptr otterbrix = init_otterbrix(data_dir);
     auto resource = otterbrix->dispatcher()->resource();
 
     auto az_scheduler = make_az_scheduler();

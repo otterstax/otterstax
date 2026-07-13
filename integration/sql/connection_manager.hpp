@@ -8,7 +8,7 @@
 
 #include "connectors/mysql/manager.hpp"
 #include "otterbrix/parser/parser.hpp"
-#include "scheduler/schema_utils.hpp"
+#include "otterbrix/schema/schema_utils.hpp"
 #include "utility/session.hpp"
 #include "utility/tracy_profiler.hpp"
 
@@ -26,8 +26,7 @@ namespace db {
         template<typename T>
         using unique_future = actor_zeta::unique_future<T>;
 
-        MySQLManager(std::pmr::memory_resource* res,
-                             std::shared_ptr<mysql::ConnectorManager> connector_manager);
+        MySQLManager(std::pmr::memory_resource* res, std::shared_ptr<mysql::ConnectorManager> connector_manager);
 
         std::pmr::memory_resource* resource() const noexcept { return resource_; }
 

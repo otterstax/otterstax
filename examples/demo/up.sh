@@ -50,8 +50,8 @@ python ./generate_data.py
 # --- 2. Bring up containers ---
 echo ""
 if $LOCAL; then
-    echo "=== 2. Starting demo backends + MinIO only (bench/local mode) ==="
-    $COMPOSE_CMD -f compose.yml up -d demo-mariadb demo-postgres demo-clickhouse demo-minio demo-minio-init
+    echo "=== 2. Starting demo backends + MinIO + Kafka only (bench/local mode) ==="
+    $COMPOSE_CMD -f compose.yml up -d demo-mariadb demo-postgres demo-clickhouse demo-minio demo-minio-init demo-kafka
 else
     echo "=== 2. Starting full demo stack (compose.yml --profile full) ==="
     $COMPOSE_CMD --profile full -f compose.yml up -d --build
@@ -61,9 +61,9 @@ fi
 echo ""
 echo "=== 3. Waiting for healthy containers ==="
 if $LOCAL; then
-    WAIT_SVCS="demo-mariadb demo-postgres demo-clickhouse demo-minio"
+    WAIT_SVCS="demo-mariadb demo-postgres demo-clickhouse demo-minio demo-kafka"
 else
-    WAIT_SVCS="demo-mariadb demo-postgres demo-clickhouse demo-minio demo-otterstax"
+    WAIT_SVCS="demo-mariadb demo-postgres demo-clickhouse demo-minio demo-kafka demo-otterstax"
 fi
 for svc in $WAIT_SVCS; do
     echo -n "   $svc"
@@ -104,9 +104,11 @@ cat <<'EOF'
   ClickHouse: localhost:3204   user=demo pass=demo db=ev
   MinIO:      localhost:3206   user=minioadmin pass=minioadmin bucket=demo-bucket
               (console: http://localhost:3207)
+  Kafka:      localhost:19093  (redpanda; streaming demo broker)
 
-  Now start your local otterstax server:
-    ./build/server --port-flight 8815 --port-mysql 8816 --port-postgres 8817 --port-http 8085
+  Now start your local otterstax server (ports default to 8815/8816/8817/8085
+  from config.yaml; no --port flags — this build takes only --config):
+    ./build/Release/server
 
   Then register connections (in another terminal once server is up):
     examples/demo/connections/add_connections.sh    --local
@@ -114,6 +116,12 @@ cat <<'EOF'
 
   Run all demo queries (steps 1-9, incl. s3 load + dump):
     examples/demo/run-queries.sh
+
+  Run the Kafka streaming act — step by step (source ingestion, JOIN kafka⋈ch⋈pg,
+  stream, fan-in); walk them in order:
+    examples/demo/kafka/1_ingestion/run.sh --local
+    examples/demo/kafka/2_join/run.sh      --local
+    …  (see examples/demo/kafka/README.md; or run_all.sh --local for a smoke test)
 
   Tear down with: examples/demo/down.sh
 ================================================================================
@@ -149,6 +157,11 @@ cat <<'EOF'
 
   Or all at once:
     examples/demo/run-queries.sh
+
+  Run the Kafka streaming act — step by step (see examples/demo/kafka/README.md):
+    examples/demo/kafka/1_ingestion/run.sh
+    examples/demo/kafka/2_join/run.sh
+    …  (or examples/demo/kafka/run_all.sh for a smoke test)
 
   After running steps 3a-3b / 7-8 (which create otter.warehouses / otter.regions /
   otter.promos), run cleanup before re-doing the demo:

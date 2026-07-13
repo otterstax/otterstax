@@ -29,3 +29,15 @@ external:
   regions_per_campaign: 4        # regions.parquet  -> ~4k rows
   events_per_campaign: 20        # web_events.csv   -> ~20k rows
   # regions ⋈ web_events on campaign_id -> 4 × 20 × num_campaigns = ~80k rows
+
+# Kafka SOURCE-ingestion benchmark (kafka_ingest).  A JSON dataset is generated
+# (data/generate_kafka_fixtures.py -> kafka_events.ndjson) and seeded into a
+# Kafka topic at bring-up (compose_kafka.yml -> data/seed_kafka.py).  The bench
+# then CREATE SOURCEs over that topic (OFFSET_RESET='earliest') and times how
+# fast the poller ingests every row into the local kafka.<src> table.  Columns
+# are primitive only — json_to_chunk supports INT/BIGINT/DOUBLE/STRING/BOOL.
+# num_records is BOTH the produced count and the expected ingest count, so it is
+# baked into the client image (change it -> --rebuild, like the other blocks).
+kafka:
+  num_records: 50000             # rows produced into the topic == expected ingest count
+  topic: bench_events            # topic the seed job creates + fills

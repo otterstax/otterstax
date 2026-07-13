@@ -8,7 +8,7 @@
 
 #include "connectors/postgresql/manager.hpp"
 #include "otterbrix/parser/parser.hpp"
-#include "scheduler/schema_utils.hpp"
+#include "otterbrix/schema/schema_utils.hpp"
 #include "utility/session.hpp"
 #include "utility/tracy_profiler.hpp"
 
@@ -33,7 +33,7 @@ namespace db {
 
         /// handler coroutine — ONLY fetches data, does NOT perform JOIN
         actor_zeta::unique_future<core::result_wrapper_t<ParsedQueryDataPtr>> execute(session_hash_t id,
-                                                                                       ParsedQueryDataPtr data);
+                                                                                      ParsedQueryDataPtr data);
 
         using dispatch_traits = actor_zeta::dispatch_traits<&PostgressManager::execute>;
 

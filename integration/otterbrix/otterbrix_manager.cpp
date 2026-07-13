@@ -4,7 +4,7 @@
 #include "otterbrix_manager.hpp"
 
 #include "otterbrix/query_generation/sql_query_generator.hpp"
-#include "scheduler/schema_utils.hpp"
+#include "otterbrix/schema/schema_utils.hpp"
 #include "utility/logger.hpp"
 #include "utility/tracy_profiler.hpp"
 
@@ -89,6 +89,11 @@ OtterbrixManager::register_external_database(std::string db_name) {
         log_->debug("register_external_database: creating engine database {}", db_name);
         auto cursor = data_manager_->execute_sql(sql_gen::create_database_statement(db_name));
         if (!cursor || cursor->is_error()) {
+            if (cursor && cursor->get_error().type == core::error_code_t::database_already_exists) {
+                log_->debug("register_external_database: engine database {} already exists, reusing", db_name);
+                co_return true;
+            }
+
             std::string what = cursor ? std::string{cursor->get_error().what.c_str()} : std::string{"null cursor"};
             log_->error("register_external_database: CREATE DATABASE {} failed: {}", db_name, what);
             co_return core::error_t(

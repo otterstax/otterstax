@@ -16,7 +16,7 @@
 #include "otterbrix/parser/parser.hpp"  // ParsedQueryData
 #include "types/otterbrix.hpp"          // OtterbrixStatement / external_entry_t
 
-#include <catch2/catch.hpp>
+#include <catch2/catch_all.hpp>
 
 #include <memory_resource>
 #include <string>

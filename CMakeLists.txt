@@ -68,7 +68,7 @@ endif()
 find_package(Arrow REQUIRED)
 find_package(otterbrix REQUIRED COMPONENTS log)
 find_package(actor-zeta REQUIRED)
-find_package(Catch2 2.13.7 REQUIRED)
+find_package(Catch2 3 REQUIRED)
 find_package(Boost 1.88.0 REQUIRED COMPONENTS
     asio
     beast

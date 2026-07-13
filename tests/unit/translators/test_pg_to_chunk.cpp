@@ -14,7 +14,7 @@
 
 #include "otterbrix/translators/input/pg_to_chunk.hpp"
 
-#include <catch2/catch.hpp>
+#include <catch2/catch_all.hpp>
 
 #include <libpq-fe.h>
 

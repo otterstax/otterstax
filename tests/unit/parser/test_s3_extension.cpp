@@ -7,7 +7,7 @@
 // otterbrix parser registry (raw_parser) — mirroring otterbrix's own
 // components/sql/test/test_parser_extension.cpp.
 
-#include <catch2/catch.hpp>
+#include <catch2/catch_all.hpp>
 
 #include <cstring>
 #include <memory_resource>

@@ -7,7 +7,7 @@
 
 #include <components/types/types.hpp>
 
-#include <catch2/catch.hpp>
+#include <catch2/catch_all.hpp>
 
 #include <memory_resource>
 #include <string>

@@ -1,5 +1,5 @@
 // Reproduce the cross-backend GROUP BY segfault in-process.
-#include <catch2/catch.hpp>
+#include <catch2/catch_all.hpp>
 
 #include "otterbrix/parser/parser.hpp"
 #include "otterbrix/query_generation/sql_query_generator.hpp"

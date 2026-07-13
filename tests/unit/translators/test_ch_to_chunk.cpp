@@ -3,7 +3,7 @@
 
 #include "otterbrix/translators/input/ch_to_chunk.hpp"
 
-#include <catch2/catch.hpp>
+#include <catch2/catch_all.hpp>
 
 #include <clickhouse/columns/numeric.h>
 #include <clickhouse/columns/string.h>

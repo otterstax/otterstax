@@ -1,5 +1,5 @@
 #include "otterbrix/config.hpp"
-#include <catch2/catch.hpp>
+#include <catch2/catch_all.hpp>
 #include <iostream>
 #include <otterbrix/otterbrix.hpp>
 

@@ -7,7 +7,7 @@
 #include "otterbrix/query_generation/sql_query_generator.hpp"
 #include "scheduler/schema_utils.hpp"
 
-#include <catch2/catch.hpp>
+#include <catch2/catch_all.hpp>
 
 #include <components/logical_plan/node.hpp>
 #include <memory_resource>

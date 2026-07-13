@@ -6,7 +6,7 @@
 #include "otterbrix/parser/subquery_extractor.hpp"
 #include "scheduler/schema_utils.hpp"
 
-#include <catch2/catch.hpp>
+#include <catch2/catch_all.hpp>
 #include <components/logical_plan/forward.hpp>
 #include <components/logical_plan/node.hpp>
 #include <core/result_wrapper.hpp>

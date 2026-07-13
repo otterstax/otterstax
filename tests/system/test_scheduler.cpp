@@ -27,7 +27,7 @@
 #include <core/result_wrapper.hpp>
 #include <otterbrix/otterbrix.hpp>
 
-#include <catch2/catch.hpp>
+#include <catch2/catch_all.hpp>
 #include <chrono>
 #include <thread>
 #include <tuple>

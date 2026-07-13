@@ -6,7 +6,7 @@
 // carrying the fields the Scheduler routes on. (The end-to-end routing through
 // the file/s3 managers is exercised by the system / minio tests.)
 
-#include <catch2/catch.hpp>
+#include <catch2/catch_all.hpp>
 
 #include "otterbrix/parser/grammar_extention/external_node.hpp"
 #include "otterbrix/parser/parser.hpp"

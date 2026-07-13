@@ -42,7 +42,7 @@ class OtterStax(ConanFile):
         self.requires("fmt/11.1.3")
         self.requires("spdlog/1.15.1")
         self.requires("msgpack-cxx/4.1.1")
-        self.requires("catch2/2.13.7")
+        self.requires("catch2/2.13.7", override=True)
         self.requires("grpc/1.69.0")
         self.requires("asio-grpc/3.5.0")
         self.requires("gflags/2.2.2", override=True)

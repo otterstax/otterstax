@@ -349,10 +349,6 @@ TEST_CASE("kafka offsets: write_offsets / parse_offsets roundtrip with max-per-p
 }
 
 TEST_CASE("kafka poller: CREATE SOURCE starts a poller, DROP/teardown join cleanly") {
-    if constexpr (TSAN_ENABLED) {
-        return; // TODO: remove TSAN skip after otterbrix bump
-    }
-
     std::filesystem::remove_all("/tmp/otterstax_kafka_poller");
     auto cfg = make_create_config("/tmp/otterstax_kafka_poller");
     auto engine = db::make_otterbrix_engine(cfg);

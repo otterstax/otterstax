@@ -122,6 +122,15 @@ run_test "MySQL Client (JOIN sql-backend ⋈ s3 parquet → s3 csv)" "test_mysql
 run_test "MySQL Client (JOIN otterbrix-local ⋈ s3 parquet)" "test_mysql_join_otb_local_s3.py"
 run_test "MySQL Client (JOIN sql backend ⋈ otterbrix-local, string key)" "test_mysql_join_otb_local_backend.py"
 run_test "MySQL Client (JOIN s3 parquet ⋈ file csv ⋈ otterbrix-local)" "test_mysql_join_otb_local_s3_file.py"
+# Kafka integration tests
+run_test "Kafka SOURCE Ingestion (PostgreSQL wire)" "test_kafka_source_ingestion.py"
+run_test "Kafka SOURCE Exactly-Once (PostgreSQL wire)" "test_kafka_exactly_once_source.py"
+run_test "Kafka INSERT-Produce (PostgreSQL wire)" "test_kafka_insert_produce.py"
+run_test "Kafka Continuous STREAM (PostgreSQL wire)" "test_kafka_stream.py"
+run_test "Kafka STREAM Exactly-Once (PostgreSQL wire)" "test_kafka_exactly_once.py"
+run_test "Kafka STREAM Write / INSERT VALUES (PostgreSQL wire)" "test_kafka_stream_write.py"
+# NB: test_kafka_crash_recovery.py is deliberately NOT here — it is native-only
+# (owns the server via Popen kill/restart). Its docker/CI variant is a separate task.
 
 echo ""
 echo "========================================="

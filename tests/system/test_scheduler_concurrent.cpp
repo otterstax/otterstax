@@ -37,11 +37,11 @@
 
 namespace {
 
-    otterbrix::otterbrix_ptr init_otterbrix() {
+    db::otterbrix_engine_ptr init_otterbrix() {
         auto config = configuration::config::default_config();
         auto log_path = config.log.path.string();
         initialize_all_loggers(log_path);
-        return otterbrix::make_otterbrix(std::move(config));
+        return db::make_otterbrix_engine(std::move(config));
     }
 
     auto mysql_mock_connector_factory_slow(std::pmr::memory_resource* resource,
@@ -94,7 +94,7 @@ TEST_CASE("scheduler handles N parallel sessions without hanging") {
     constexpr size_t N = 32;
     constexpr auto WAIT_TIMEOUT = 60000ms;
 
-    otterbrix::otterbrix_ptr otterbrix = init_otterbrix();
+    db::otterbrix_engine_ptr otterbrix = init_otterbrix();
     auto resource = otterbrix->dispatcher()->resource();
     REQUIRE(resource != nullptr);
 
@@ -192,7 +192,7 @@ TEST_CASE("slow MySQL connector does not starve other sessions") {
     constexpr size_t SESSIONS = 4;
     constexpr auto WAIT_TIMEOUT = 30000ms;
 
-    otterbrix::otterbrix_ptr otterbrix = init_otterbrix();
+    db::otterbrix_engine_ptr otterbrix = init_otterbrix();
     auto resource = otterbrix->dispatcher()->resource();
     REQUIRE(resource != nullptr);
 

@@ -22,7 +22,7 @@ using components::types::logical_type;
 TEST_CASE("external registration: engine stamps pg_class oid on create") {
     std::filesystem::remove_all("/tmp/otterstax_test_registration");
     auto cfg = make_create_config("/tmp/otterstax_test_registration");
-    auto inst = otterbrix::make_otterbrix(cfg);
+    auto inst = db::make_otterbrix_engine(cfg);
     auto manager = make_otterbrix_manager(inst);
 
     auto db_cursor = manager->execute_sql("CREATE DATABASE \"11111111-2222-3333-4444-555555555555\";");

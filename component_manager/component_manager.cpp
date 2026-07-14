@@ -8,11 +8,12 @@
 #include <algorithm>
 #include <thread>
 
-constexpr size_t MAX_THROUGHPUT = 1000; // MAX_THROUGHPUT is the maximum number of messages an actor will process before yielding to the scheduler. Setting it to a high value (or to std::numeric_limits<size_t>::max()) means actors will yield only when they have no more messages to process, which can improve performance for actors that process many messages in bursts but can lead to starvation of other actors if one actor receives a continuous stream of messages.
+constexpr size_t MAX_THROUGHPUT =
+    1000; // MAX_THROUGHPUT is the maximum number of messages an actor will process before yielding to the scheduler. Setting it to a high value (or to std::numeric_limits<size_t>::max()) means actors will yield only when they have no more messages to process, which can improve performance for actors that process many messages in bursts but can lead to starvation of other actors if one actor receives a continuous stream of messages.
 
 ComponentManager::ComponentManager(const configuration::config& config)
-    : otterbrix_(otterbrix::make_otterbrix(config))
-    , resource_(otterbrix_->dispatcher()->resource())
+    : engine_(new db::otterbrix_engine_t(config))
+    , resource_(engine_->dispatcher()->resource())
     , log_path_(config.log.path.c_str()) {
     OTX_ZONE_N("ComponentManager::init");
 
@@ -24,9 +25,13 @@ ComponentManager::ComponentManager(const configuration::config& config)
         OTX_ZONE_N("ComponentManager::spawn_catalog");
         // OtterbrixManager must exist before CatalogManager: the catalog registers
         // external table schemas in the engine through the OtterbrixManager actor.
-        otterbrix_manager_ =
-            actor_zeta::spawn<db::OtterbrixManager>(resource_, make_otterbrix_manager(otterbrix_));
+        otterbrix_manager_ = actor_zeta::spawn<db::OtterbrixManager>(resource_, make_otterbrix_manager(engine_));
         assert(otterbrix_manager_ != nullptr && "otterbrix manager must not be null");
+
+        kafka_manager_ = actor_zeta::spawn<otterstax::kafka::KafkaManager>(resource_,
+                                                                           engine_->engine_dispatcher_address(),
+                                                                           /*start_pollers=*/true);
+        assert(kafka_manager_ != nullptr && "kafka manager must not be null");
 
         catalog_manager_ = actor_zeta::spawn<mysql::CatalogManager>(resource_, otterbrix_manager_->address());
         assert(catalog_manager_ != nullptr && "catalog manager must not be null");
@@ -43,16 +48,13 @@ ComponentManager::ComponentManager(const configuration::config& config)
 
     {
         OTX_ZONE_N("ComponentManager::spawn_managers");
-        sql_connection_manager_ =
-            actor_zeta::spawn<db::MySQLManager>(resource_, db_connector_manager_);
+        sql_connection_manager_ = actor_zeta::spawn<db::MySQLManager>(resource_, db_connector_manager_);
         assert(sql_connection_manager_ != nullptr && "sql connection manager must not be null");
 
-        pg_connection_manager_ =
-            actor_zeta::spawn<db::PostgressManager>(resource_, pg_connector_manager_);
+        pg_connection_manager_ = actor_zeta::spawn<db::PostgressManager>(resource_, pg_connector_manager_);
         assert(pg_connection_manager_ != nullptr && "pg connection manager must not be null");
 
-        ch_connection_manager_actor_ =
-            actor_zeta::spawn<db::ClickhouseManager>(resource_, ch_connector_manager_);
+        ch_connection_manager_actor_ = actor_zeta::spawn<db::ClickhouseManager>(resource_, ch_connector_manager_);
         assert(ch_connection_manager_actor_ != nullptr && "ch connection manager must not be null");
     }
 
@@ -61,15 +63,13 @@ ComponentManager::ComponentManager(const configuration::config& config)
         s3_manager_ = actor_zeta::spawn<conn::s3::ConnectorManager>(resource_);
         assert(s3_manager_ != nullptr && "s3 manager must not be null");
 
-        file_manager_ = actor_zeta::spawn<conn::file::FileManager>(resource_,
-                                                                         otterbrix_manager_->address());
+        file_manager_ = actor_zeta::spawn<conn::file::FileManager>(resource_, otterbrix_manager_->address());
         assert(file_manager_ != nullptr && "file manager must not be null");
 
         // Integration S3 manager orchestrates the raw s3 + file connectors; the
         // Scheduler routes s3 CREATE EXTERNAL TABLE / COPY statements to it.
-        s3_integration_manager_ = actor_zeta::spawn<db::S3Manager>(resource_,
-                                                                   s3_manager_->address(),
-                                                                   file_manager_->address());
+        s3_integration_manager_ =
+            actor_zeta::spawn<db::S3Manager>(resource_, s3_manager_->address(), file_manager_->address());
         assert(s3_integration_manager_ != nullptr && "s3 integration manager must not be null");
     }
 
@@ -78,21 +78,21 @@ ComponentManager::ComponentManager(const configuration::config& config)
         // Work-sharing thread pool for the Worker actors: one Worker per pool
         // thread; queries shard onto workers by session hash (id % worker_count).
         const std::size_t worker_count = std::max<std::size_t>(2, std::thread::hardware_concurrency());
-        az_scheduler_ =
-            std::make_unique<actor_zeta::scheduler::sharing_scheduler>(worker_count, MAX_THROUGHPUT);
+        az_scheduler_ = std::make_unique<actor_zeta::scheduler::sharing_scheduler>(worker_count, MAX_THROUGHPUT);
         az_scheduler_->start();
 
         scheduler_ = actor_zeta::spawn<Scheduler>(resource_,
-                                                   az_scheduler_.get(),
-                                                   worker_count,
-                                                   &make_parser,
-                                                   sql_connection_manager_->address(),
-                                                   pg_connection_manager_->address(),
-                                                   ch_connection_manager_actor_->address(),
-                                                   otterbrix_manager_->address(),
-                                                   catalog_manager_->address(),
-                                                   s3_integration_manager_->address(),
-                                                   file_manager_->address());
+                                                  az_scheduler_.get(),
+                                                  worker_count,
+                                                  &make_parser,
+                                                  sql_connection_manager_->address(),
+                                                  pg_connection_manager_->address(),
+                                                  ch_connection_manager_actor_->address(),
+                                                  otterbrix_manager_->address(),
+                                                  catalog_manager_->address(),
+                                                  s3_integration_manager_->address(),
+                                                  file_manager_->address(),
+                                                  kafka_manager_->address());
         assert(scheduler_ != nullptr && "scheduler must not be null");
     }
 
@@ -102,6 +102,11 @@ ComponentManager::ComponentManager(const configuration::config& config)
         pg_connector_manager_->start();
         ch_connector_manager_->start();
     }
+
+    // relaunch persisted Kafka when the full actor graph and worker pool are up
+    // doing this in the KafkaManager ctor races the half-initialised engine
+    // (the poller starts before the scheduler/executor pool)
+    kafka_manager_->recover();
 }
 
 ComponentManager::~ComponentManager() {
@@ -120,7 +125,9 @@ std::pmr::memory_resource* ComponentManager::getResource() {
 
 std::string ComponentManager::getLogPath() { return log_path_; }
 
-std::shared_ptr<mysql::ConnectorManager> ComponentManager::db_connection_manager() const { return db_connector_manager_; }
+std::shared_ptr<mysql::ConnectorManager> ComponentManager::db_connection_manager() const {
+    return db_connector_manager_;
+}
 
 std::shared_ptr<pg::ConnectorManager> ComponentManager::pg_connection_manager() const { return pg_connector_manager_; }
 
@@ -132,9 +139,13 @@ actor_zeta::address_t ComponentManager::catalog_address() const { return catalog
 
 actor_zeta::address_t ComponentManager::otterbrix_manager_address() const { return otterbrix_manager_->address(); }
 
-actor_zeta::address_t ComponentManager::sql_connection_manager_address() const { return sql_connection_manager_->address(); }
+actor_zeta::address_t ComponentManager::sql_connection_manager_address() const {
+    return sql_connection_manager_->address();
+}
 
-actor_zeta::address_t ComponentManager::pg_connection_manager_address() const { return pg_connection_manager_->address(); }
+actor_zeta::address_t ComponentManager::pg_connection_manager_address() const {
+    return pg_connection_manager_->address();
+}
 
 actor_zeta::address_t ComponentManager::file_manager_address() const { return file_manager_->address(); }
 

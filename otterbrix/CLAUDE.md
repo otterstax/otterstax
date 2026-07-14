@@ -27,6 +27,15 @@ the `Worker` (behind the `Scheduler` router) routes via
 `Worker::handle_external_statement`. See
 [`parser/grammar_extention/CLAUDE.md`](parser/grammar_extention/CLAUDE.md) for the
 extension recipe and `cmake/otterbrix_parser_extension.cmake` for the build helper.
+#### `parser/grammar_extension/kafka/`
+
+The Kafka DDL grammar extension (library `kafka_grammar`): a self-contained
+flex+bison pair (`kafka_yy` prefix, isolated from the core parser) producing a
+`kafka_node_t` for `CREATE/DROP SOURCE/STREAM`, registered into `GreenplumParser`
+via `make_kafka_extension()`. Also defines `kafka_write_target` (detects
+`INSERT INTO kafka.<obj>`) and `kafka_stream_source` / `kafka_find_aggregate`
+(stream plan helpers). Namespace `otterstax::kafka`. The Kafka **runtime** that
+consumes these nodes lives in `integration/kafka/` — see its CLAUDE.md.
 
 ### `query_generation/`
 

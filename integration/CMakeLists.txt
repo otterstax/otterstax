@@ -1,4 +1,7 @@
+add_subdirectory(kafka)
+
 set(DB_INTEGRATION_HEADERS
+    otterbrix/otterbrix_engine.hpp
     otterbrix/otterbrix_manager.hpp
     sql/connection_manager.hpp
     postgresql/connection_manager.hpp
@@ -7,6 +10,7 @@ set(DB_INTEGRATION_HEADERS
 )
 
 set(DB_INTEGRATION_SOURCES
+    otterbrix/otterbrix_engine.cpp
     otterbrix/otterbrix_manager.cpp
     sql/connection_manager.cpp
     postgresql/connection_manager.cpp

@@ -114,9 +114,13 @@ Results land in `benchmark_results/<YYYYMMDD_HHMMSS>/`.
                     Values: simple_select complex_select join_same_instance
                             join_cross_engine join_all
                             external_load external_join external_dump
+                            kafka_ingest
                     external_* (s3/file) are opt-in: selecting any of them
                     auto-starts MinIO, generates fixtures, registers the
                     bench_minio s3 alias. mysql/postgres frontends only.
+                    kafka_ingest is opt-in too: it auto-starts a redpanda broker,
+                    generates a JSON dataset, and seeds it into a topic. No REST
+                    registration (the broker is named in CREATE SOURCE directly).
 --out-dir DIR       Result root (default: benchmark_results/<timestamp>)
 --rebuild           Force image rebuild even if images exist
 --clear             Remove images + DB volumes, then rebuild from scratch
@@ -236,16 +240,20 @@ benchmark/
 ├── compose_benchmark.yml        # OtterStax container; publishes :8086 to host
 ├── compose_manual.yml           # Overlay: also publishes 8085/8815/8816/8817
 ├── compose_minio.yml            # Overlay: MinIO + seed job for external_* tests
-├── Dockerfile.benchmark         # Python image: data init + benchmark scripts
+├── compose_kafka.yml            # Overlay: redpanda broker for kafka_ingest (seed is a run_benchmark.sh step, not a service)
+├── Dockerfile.benchmark         # Python image: data init + benchmark scripts (+ confluent-kafka)
 ├── data/
 │   ├── init_data.py             # Creates tables and inserts Faker data in all 6 DBs
 │   ├── generate_external_fixtures.py  # Writes s3/file fixtures from bench.yaml `external:`
-│   ├── fixtures/                # Generated regions.parquet/web_events.csv/campaigns.ndjson
+│   ├── generate_kafka_fixtures.py     # Writes kafka_events.ndjson from bench.yaml `kafka:`
+│   ├── seed_kafka.py            # Creates the topic + produces the ndjson (run once at bring-up)
+│   ├── fixtures/                # Generated regions.parquet/web_events.csv/campaigns.ndjson/kafka_events.ndjson
 │   └── requirements.txt         # Python deps for the benchmark image
 ├── benchmarks/
 │   ├── common.py                # Timing, stats, result serialisation, write_db_info
 │   ├── queries.py               # All SQL strings (shared across all frontends)
 │   ├── external_common.py       # External-table runner (load/join/dump) + external_main
+│   ├── kafka_common.py          # Kafka runners (kafka_ingest/produce/stream) + sql_* builders + kafka_main
 │   ├── mysql/connector.py       # mysql-connector-python, port 8816 (+ connect())
 │   ├── postgres/connector.py    # psycopg2, port 8817 (+ connect())
 │   ├── arrow/connector.py       # flightsql-dbapi, port 8815  ← disabled by default
@@ -255,7 +263,8 @@ benchmark/
 │       ├── join_same_instance.py
 │       ├── join_cross_engine.py
 │       ├── join_all.py
-│       └── external_{load,join,dump,join_cross,join_all}.py  # s3/file (mysql + postgres)
+│       ├── external_{load,join,dump,join_cross,join_all}.py  # s3/file (mysql + postgres)
+│       └── kafka_{ingest,produce,stream}.py  # Kafka bench (mysql + postgres; thin, call kafka_main)
 ├── manual/
 │   ├── _common.sh               # Shared helpers sourced by all manual scripts
 │   ├── start_service.sh         # Start DBs + OtterStax, register connections
@@ -376,6 +385,102 @@ mismatch (the silent zero-row JOIN trap when int32 meets int64). Defaults:
 ~80 k-row internal join. Editing `bench.yaml` requires regenerating fixtures
 (automatic on the next external run; the `benchmark-client` image is unaffected
 because fixtures are bind-mounted, not baked in).
+
+## Kafka benchmarks (`kafka_ingest` / `kafka_produce` / `kafka_stream`)
+
+Three opt-in tests exercising the Kafka **runtime** (`integration/kafka/` — the
+`KafkaManager` actor + librdkafka consumer/poller/producer). Split by feature the
+way `external_load`/`external_join`/`external_dump` are (one test = one feature =
+one result file). All share the redpanda broker + the pre-seeded topic, brought
+up by the `external_*` opt-in pattern (redpanda is the analogue of MinIO; the
+topic is seeded at bring-up the way the s3 bucket is).
+
+| Test / sub-test | Workload |
+|-----------------|----------|
+| `kafka_ingest` / `ingest_alo` | SOURCE ingest throughput, at-least-once. Each rep `CREATE SOURCE`s over the pre-seeded topic with a **fresh** name (group_id defaults to `otterstax_<name>` + `OFFSET_RESET='earliest'` ⇒ each rep is an independent cold re-ingest), then polls `count(*)` until every row lands. `elapsed` = CREATE SOURCE → full ingest; txt reports `rec/s`. |
+| `kafka_ingest` / `ingest_eos` | Same, with `TRANSACTIONAL=true`. The alo↔eos delta is the cost of exactly-once (each batch is a `BEGIN → insert(data) → upsert(offsets) → COMMIT` engine transaction). |
+| `kafka_produce` / `produce` | Write path — `INSERT INTO kafka.<src> VALUES <PRODUCE_ROWS rows>` publishes the batch to the object's topic; the timed statement is one transactional produce+flush. |
+| `kafka_stream` / `stream` | Continuous-query throughput — `CREATE STREAM AS SELECT ... FROM <src>` (pass-all filter, output count == num_records), then drain the stream's output topic until every row has flowed through (poll → transform → produce). Needs a broker consumer, so the runner imports `confluent-kafka`. |
+
+```bash
+# all three kafka tests, both default frontends
+./benchmark/scripts/run_benchmark.sh --bench kafka_ingest kafka_produce kafka_stream --repetitions 5
+
+# just ingest, postgres only
+./benchmark/scripts/run_benchmark.sh --frontend postgres --bench kafka_ingest
+
+# manual flow: bring up broker + seed once, then run interactively (+ Tracy)
+./benchmark/manual/start_service.sh --kafka
+./benchmark/manual/run_bench.sh --bench kafka_ingest kafka_produce kafka_stream
+```
+
+Selecting any `kafka_*` test makes `run_benchmark.sh`:
+
+1. Generate the JSON dataset into `benchmark/data/fixtures/kafka_events.ndjson`
+   via `data/generate_kafka_fixtures.py` (Step 1c, sized from `bench.yaml` `kafka:`).
+2. Add `compose_kafka.yml` (the `bench_kafka` redpanda broker) to the backend +
+   otterstax compose sets, and wait for it healthy.
+3. Seed the topic **once** with `data/seed_kafka.py` (Step 3b, an explicit
+   `docker run` — NOT a compose one-shot, so `_ensure_otterstax`'s backend `up -d`
+   on a mid-run restart can't re-produce and double the topic; Kafka produce is
+   not idempotent, unlike MinIO's `mc cp`).
+
+The runner (`benchmarks/kafka_common.py`, driven by the thin
+`benchmarks/{mysql,postgres}/kafka_{ingest,produce,stream}.py`) issues SQL to
+OtterStax over the wire; `kafka_stream` additionally drains the output topic to
+count rows. Every Kafka statement is built by a `sql_*` helper at the top of
+`kafka_common.py`. The broker address OtterStax uses is embedded in
+`CREATE SOURCE ... BOOTSTRAP_SERVERS='bench_kafka:9092'`.
+
+**First `kafka_*` run needs a client-image rebuild.** `seed_kafka.py` and the
+stream runner import `confluent-kafka`, added to `Dockerfile.benchmark`. If a
+imports `confluent-kafka`, added to `Dockerfile.benchmark`. If a
+`benchmark-client:latest` image from before this change is still cached,
+run once with `--rebuild` (or `--clear`) so the seed step doesn't fail with
+`ModuleNotFoundError: confluent_kafka`.
+
+### Dataset (`data/generate_kafka_fixtures.py`)
+
+Primitive columns only — `json_to_chunk` supports exactly
+INTEGER / BIGINT / DOUBLE / STRING / BOOLEAN:
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `id` | BIGINT | sequential 0..num_records-1 (distinct) |
+| `campaign_id` | BIGINT | 1..1000 (shares the group_a campaign_id space) |
+| `event_type` | STRING | view / click / purchase |
+| `amount` | DOUBLE | named `amount` (not `value`) to dodge the reserved word in SELECT |
+| `ts` | BIGINT | monotonic epoch-ms |
+
+Sized from `bench.yaml`:
+
+```yaml
+kafka:
+  num_records: 50000     # rows produced == expected ingest count (baked into the client image — --rebuild after editing)
+  topic: bench_events
+```
+
+### Standalone / local run (no docker harness)
+
+The runner and the seed/generate scripts take `--local` / `--broker`, so the
+whole thing runs against a hand-started redpanda + a local Debug server without
+the docker image build:
+
+```bash
+BENCH_YAML=/path/to/bench.yaml python benchmark/data/generate_kafka_fixtures.py --out /tmp/fx
+BENCH_YAML=/path/to/bench.yaml python benchmark/data/seed_kafka.py --broker 127.0.0.1:19092 --file /tmp/fx/kafka_events.ndjson
+# ... start ./build/Debug/server ...
+BENCH_YAML=/path/to/bench.yaml python benchmark/benchmarks/postgres/kafka_ingest.py --local --repetitions 5 --out-dir /tmp/out/postgres
+```
+
+### Hot-path instrumentation
+
+The Kafka runtime carries `OTX_ZONE_N` zones (`utility/tracy_profiler.hpp`) on
+every actor handler and the per-batch consume/convert/insert/produce hot path
+(`KafkaManager::execute/produce/…`, `kafka::json_to_chunk`,
+`kafka::poller::ingest_*`, `kafka::consumer::poll_batch`, `kafka::producer::*`),
+so `--tracy` / `--tracy-sep` capture the ingestion pipeline the same as the query
+path. The macros are no-ops unless the image is built with Tracy.
 
 ## Tracy profiling
 

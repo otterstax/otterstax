@@ -86,3 +86,14 @@ Run a single Python test file:
 python -m pytest tests/test_flightsql_client_mysql_backend.py -v
 ```
 (Requires live Docker stack — run `docker compose up -d` first and register connections via `add_connections_maria_db.sh`.)
+
+### Convention: one class, each case an explicit `test_*` method
+
+**Do NOT cram every scenario into one giant `main()` with inline blocks — it is unreadable.** Structure an integration test file as a single class whose cases are named methods. Reference: `test_pg_client_pg_backend.py` and the `test_kafka_*.py` family.
+
+- One `class <Name>Test` per file; connection params / topic names / fixtures in `__init__` (read `--local` host via `config.py`).
+- `setup(self)` creates the shared objects (CREATE TABLE/SOURCE/STREAM, produce seed data); `cleanup(self)` drops them and closes the connection.
+- **Each test case is its own `def test_<behaviour>(self)` with a one-line docstring** — one observable behaviour per method, named for what it asserts.
+- Shared helpers (`create_topic`, `consume`, `assert_equal`, …) are methods on the class, not free functions duplicated inline.
+- `run_all_tests(self)`: `try: setup(); test_a(); test_b(); finally: cleanup()`. **Let exceptions propagate** — do not `except: print("fail")` and swallow, or the green ALL-PASSED banner will lie (a real bug in some older tests).
+- `main_test()` parses `--local`, runs `run_all_tests()`, prints the pass/fail banner, returns `0`/`1`; `sys.exit(main_test())` at the bottom.

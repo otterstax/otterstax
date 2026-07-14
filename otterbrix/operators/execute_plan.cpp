@@ -15,13 +15,12 @@
 using namespace components;
 
 static std::string to_lower(std::string s) {
-    std::transform(s.begin(), s.end(), s.begin(),
-                   [](unsigned char c) { return std::tolower(c); });
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return std::tolower(c); });
     return s;
 }
 
-OtterbrixDataManager::OtterbrixDataManager(otterbrix::otterbrix_ptr otterbrix)
-    : otterbrix_(otterbrix) {}
+OtterbrixDataManager::OtterbrixDataManager(otterbrix::base_otterbrix_t* engine)
+    : otterbrix_(engine) {}
 
 components::cursor::cursor_t_ptr OtterbrixDataManager::execute_plan(OtterbrixStatementPtr& otterbrix_params) {
     OTX_ZONE_N("otterbrix::execute_plan");
@@ -55,15 +54,15 @@ components::cursor::cursor_t_ptr OtterbrixDataManager::get_schema(const Otterbri
                                                            std::pmr::vector<types::complex_logical_type>(resource)));
             continue;
         }
-        auto cursor = otterbrix_->dispatcher()->execute_sql(otterbrix::session_id_t(),
-                                                            "SELECT * FROM " + database + "." + collection +
-                                                                " LIMIT 0;");
+        auto cursor =
+            otterbrix_->dispatcher()->execute_sql(otterbrix::session_id_t(),
+                                                  "SELECT * FROM " + database + "." + collection + " LIMIT 0;");
         if (!cursor) {
             return cursor::make_cursor(
                 resource,
-                core::error_t(core::error_code_t::other_error,
-                              std::pmr::string{"get_schema: null cursor for " + database + "." + collection,
-                                               resource}));
+                core::error_t(
+                    core::error_code_t::other_error,
+                    std::pmr::string{"get_schema: null cursor for " + database + "." + collection, resource}));
         }
         if (cursor->is_error()) {
             return cursor;
@@ -91,12 +90,9 @@ OtterbrixDataManager::create_collection(const std::string& database,
     // pg_catalog is not reachable via plain SQL SELECT.
     out_oid = components::catalog::INVALID_OID;
     auto* resource = otterbrix_->dispatcher()->resource();
-    auto create = logical_plan::make_node_create_collection(resource,
-                                                            core::relname_t{collection},
-                                                            std::move(columns),
-                                                            {});
-    logical_plan::node_ptr node =
-        sql::transform::maybe_wrap_with_catalog_resolve_namespace(resource, database, create);
+    auto create =
+        logical_plan::make_node_create_collection(resource, core::relname_t{collection}, std::move(columns), {});
+    logical_plan::node_ptr node = sql::transform::maybe_wrap_with_catalog_resolve_namespace(resource, database, create);
     auto cursor = otterbrix_->dispatcher()->execute_plan(
         otterbrix::session_id_t(),
         logical_plan::execution_plan_t{resource, node, logical_plan::make_parameter_node(resource)});
@@ -112,23 +108,22 @@ components::cursor::cursor_t_ptr OtterbrixDataManager::create_database(const std
     // a13 removed wrapper_dispatcher_t::create_database(); route CREATE DATABASE
     // through execute_sql (the same path as register_external_database) so the
     // transformer applies the catalog-resolve wrapping.
-    auto cur = otterbrix_->dispatcher()->execute_sql(otterbrix::session_id_t(),
-                                                     "CREATE DATABASE " + to_lower(database) + ";");
-    if (cur && cur->is_error() &&
-        cur->get_error().type == core::error_code_t::database_already_exists) {
+    auto cur =
+        otterbrix_->dispatcher()->execute_sql(otterbrix::session_id_t(), "CREATE DATABASE " + to_lower(database) + ";");
+    if (cur && cur->is_error() && cur->get_error().type == core::error_code_t::database_already_exists) {
         return cursor::make_cursor(otterbrix_->dispatcher()->resource());
     }
     return cur;
 }
 
-components::cursor::cursor_t_ptr OtterbrixDataManager::insert_data(
-    const std::string& database,
-    const std::string& collection,
-    std::vector<components::table::column_definition_t> columns,
-    components::vector::data_chunk_t data) {
+components::cursor::cursor_t_ptr
+OtterbrixDataManager::insert_data(const std::string& database,
+                                  const std::string& collection,
+                                  std::vector<components::table::column_definition_t> columns,
+                                  components::vector::data_chunk_t data) {
     OTX_ZONE_N("otterbrix::insert_data");
 
-    const std::string db  = to_lower(database);
+    const std::string db = to_lower(database);
     const std::string col = to_lower(collection);
     auto* res = otterbrix_->dispatcher()->resource();
     const otterbrix::session_id_t session;

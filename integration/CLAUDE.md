@@ -14,6 +14,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | `postgresql/` | `db::PostgressManager` | `pg::ConnectorManager` |
 | `clickhouse/` | `db::ClickHouseManager` | `ch::ConnectorManager` |
 | `otterbrix/` | `db::OtterbrixManager` | `IDataManager` (wraps `otterbrix::otterbrix_ptr`) |
+| `kafka/` | `otterstax::kafka::KafkaManager` | librdkafka consumer/producer threads + Kafka SOURCE/STREAM objects (NOT a remote-DB connector — own runtime; has its own CLAUDE.md) |
 
 ## Execution Pattern
 

@@ -6,16 +6,23 @@ Everything demo-related lives in this folder (`examples/demo/`). Paths below are
 
 ## What the demo shows
 
-OtterStax is a federated SQL engine. The demo registers three real backends and
-one S3-compatible object store —
+OtterStax is a federated SQL engine. The demo registers three real backends, one
+S3-compatible object store, and a Kafka broker —
 
 - **MariaDB** (`mysql.bill`) — orders, invoices (ACID transactions)
 - **PostgreSQL** (`pg.shop`) — customers (with ENUM tier), products
 - **ClickHouse** (`ch.ev`) — sessions (with nested struct columns, columnar OLAP)
 - **MinIO** (`s3_alias = 'demo_s3'`) — single bucket `demo-bucket` for the
   external-table demo (steps 7-9)
+- **Kafka / redpanda** (`demo-kafka`, host `127.0.0.1:19093`) — live order-event
+  topics for the streaming act (`kafka/`, separate from steps 1-9)
 
 — and runs nine SQL files (`sql/step_1.sql` … `sql/step_9.sql`) that all go through OtterStax via the **PostgreSQL wire protocol on port 8817**. Each file is a single SQL statement that JOINs across two or three backends, defines local engine tables, or exercises the s3 external-table path. Step 3 defines local types and a local `otter.warehouses` table inside the engine; steps 7-9 load two files from MinIO into the engine and dump a JOIN result back out as CSV.
+
+The **Kafka streaming act** is a separate, step-by-step tour under `kafka/`
+(source ingestion, the `kafka ⋈ ClickHouse ⋈ Postgres` federated JOIN, the
+write path, continuous streams, and fan-in) — see `kafka/README.md`. It needs
+the `demo-kafka` broker (started by `up.sh`) and the pg/ch connections.
 
 Demo SQL uses the **3-part** qualifier form `<alias>.<db>.<tbl>` (e.g. `mysql.bill.orders`, `pg.shop.customers`, `ch.ev.sessions`). The parser promotes 3-part to its internal 4-part shape automatically, then `sql_gen::table_reference` emits backend-native qualifiers (`db.tbl` for MySQL/CH, `schema.tbl` for PG). External tables live under the `otter` engine database (`otter.regions`, `otter.promos`) — same database created by step_3a, so the cleanup script tears them down together.
 
@@ -62,14 +69,17 @@ The OtterStax HTTP API and the three wire ports are host-published:
 
 ```bash
 examples/demo/up.sh --local
-# in another terminal:
-./build/server --port-flight 8815 --port-mysql 8816 --port-postgres 8817 --port-http 8085
+# in another terminal (ports come from config.yaml defaults 8815/8816/8817/8085;
+# this build takes only --config, NOT --port-* flags):
+./build/Release/server
 # then:
 examples/demo/connections/add_connections.sh    --local
 examples/demo/connections/add_s3_credentials.sh --local
+# and, for the Kafka act:
+examples/demo/kafka/1_ingestion/run.sh --local   # … then 2_join, 3_produce, …
 ```
 
-Bench mode starts the three backends + MinIO + `demo-minio-init` (no `otterstax_app` container). You run the engine binary yourself. The `--local` flag selects the `_local` JSON variants, which point to `localhost:3201/3202/3204/3206` (host-published backend + minio ports), which is what a local server can reach.
+Bench mode starts the three backends + MinIO + `demo-minio-init` + `demo-kafka` (no `otterstax_app` container). You run the engine binary yourself. The `--local` flag selects the `_local` JSON variants, which point to `localhost:3201/3202/3204/3206` (host-published backend + minio ports), which is what a local server can reach; the Kafka act's `--local` points the SQL at the broker's published listener `127.0.0.1:19093`.
 
 ## Run the demo steps
 
@@ -158,9 +168,11 @@ All paths relative to `examples/demo/`:
 | `up.sh [--local]` | main entry point — full docker (default) or bench mode (`--local`) |
 | `down.sh` | tear down containers and wipe volumes (incl. the MinIO bucket) |
 | `run-queries.sh` | run all `sql/step_*.sql` files in order against the PG wire (works for both modes) |
-| `generate_data.py` | seeds init SQL files into `init/{mariadb,postgres,clickhouse}/` AND s3 fixtures into `init/s3/` |
+| `generate_data.py` | seeds init SQL files into `init/{mariadb,postgres,clickhouse}/`, s3 fixtures into `init/s3/`, AND kafka fixtures into `init/kafka/` |
 | `init/{mariadb,postgres,clickhouse}/init.sql` | generated init scripts (gitignored) |
 | `init/s3/{regions.csv,promos.parquet}` | generated S3 fixtures (gitignored); seeded into `demo-bucket` by the `demo-minio-init` compose service |
+| `init/kafka/{orders_live,orders_intl}.ndjson` | generated Kafka fixtures (gitignored); produced onto topics by `kafka/lib/seed.py` |
+| `kafka/` | the Kafka streaming act — step folders (`1_ingestion`…`6_teardown`), `run_all.sh`, `lib/` helpers; see `kafka/README.md` |
 | `connections/connection_*.json` | backend / s3 payloads (docker-DNS hostnames: `demo-mariadb`, `demo-minio`, …) |
 | `connections/connection_*_local.json` | backend / s3 payloads (host-published ports for local binary: 3201/3202/3204/3206) |
 | `connections/add_connections.sh [--local]` | POST mysql + pg + ch connections to otterstax HTTP API |

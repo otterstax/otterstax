@@ -6,11 +6,13 @@
 #include "catalog/catalog_manager.hpp"
 #include "connectors/file/manager.hpp"
 #include "integration/clickhouse/connection_manager.hpp"
+#include "integration/kafka/kafka_manager.hpp"
 #include "integration/otterbrix/otterbrix_manager.hpp"
 #include "integration/postgresql/connection_manager.hpp"
 #include "integration/s3/s3_manager.hpp"
 #include "integration/sql/connection_manager.hpp"
 #include "otterbrix/parser/grammar_extention/external_node.hpp"
+#include "otterbrix/parser/grammar_extension/kafka/kafka_node.hpp"
 #include "utility/logger.hpp"
 #include "utility/timer.hpp"
 
@@ -33,7 +35,8 @@ Worker::Worker(std::pmr::memory_resource* res,
                actor_zeta::address_t otterbrix_manager,
                actor_zeta::address_t catalog_manager,
                actor_zeta::address_t s3_manager,
-               actor_zeta::address_t file_manager)
+               actor_zeta::address_t file_manager,
+               actor_zeta::address_t kafka_manager)
     : actor_zeta::basic_actor<Worker>(res)
     , resource_(res)
     , self_index_(self_index)
@@ -47,6 +50,7 @@ Worker::Worker(std::pmr::memory_resource* res,
     , catalog_manager_(catalog_manager)
     , s3_manager_(s3_manager)
     , file_manager_(file_manager)
+    , kafka_manager_(kafka_manager)
     , metadata_map_(res) {
     assert(log_.is_valid());
     assert(res != nullptr);
@@ -95,6 +99,67 @@ Worker::execute(session_hash_t id, std::string sql) {
         if (auto* ext = dynamic_cast<otterstax::external::external_node_t*>(data->otterbrix_params->node.get())) {
             log_->debug("Worker::execute: external-table statement, routing to file/s3 manager");
             co_return co_await handle_external_statement(id, *ext);
+        }
+
+        // Kafka DDL (CREATE/DROP SOURCE/STREAM) parses into a kafka_node_t (tagged
+        // `unused`, like schema_node_t). Detect it and route to the KafkaManager
+        // before the backend/schema path. Result is the Worker's session_result, so
+        // we co_return the payload directly (no cv signalling in the new model).
+        if (auto* kafka_node =
+                dynamic_cast<otterstax::kafka::kafka_node_t*>(data->otterbrix_params->node.get())) {
+            log_->debug("Worker::execute: kafka DDL detected, routing to kafka_manager");
+            otterstax::kafka::kafka_node_ptr node{kafka_node}; // shares ownership with the plan
+            auto [ns_k, kafka_future] =
+                actor_zeta::send(kafka_manager_, &otterstax::kafka::KafkaManager::execute, id, std::move(node));
+            auto cursor = co_await std::move(kafka_future);
+            if (!cursor || cursor->is_error()) {
+                co_return core::error_t{error_code_t::other_error,
+                                  std::pmr::string{"Kafka DDL failed: "} +
+                                      std::pmr::string{cursor ? cursor->get_error().what.c_str() : "null cursor"}};
+            }
+            co_return session_payload{resource()};
+        }
+
+        // Plain-SQL `INSERT INTO kafka.<obj>` is a write to a kafka object: publish
+        // the rows to the topic via the KafkaManager producer instead of writing an
+        // engine table.
+        if (auto write = otterstax::kafka::kafka_write_target(data->otterbrix_params->node)) {
+            // INSERT ... SELECT into a kafka object is a continuous ksqlDB "INSERT INTO
+            // query" (persistent fan-in into an existing stream), NOT a one-shot
+            // produce of a source-table snapshot. Route it to KafkaManager, which sets
+            // up a dedicated continuous worker; hand it the raw SQL so it (and restart
+            // recovery) can compile the SELECT itself.
+            if (write->source_is_select) {
+                log_->debug("Worker::execute: kafka INSERT INTO '{}' SELECT, routing to insert-query setup",
+                            write->relname);
+                auto [ns_ki, ki_future] = actor_zeta::send(kafka_manager_,
+                                                           &otterstax::kafka::KafkaManager::add_stream_insert,
+                                                           id,
+                                                           std::move(write->relname),
+                                                           std::string{sql});
+                auto cursor = co_await std::move(ki_future);
+                if (!cursor || cursor->is_error()) {
+                    co_return core::error_t{error_code_t::other_error,
+                                      std::pmr::string{"Kafka INSERT INTO ... SELECT failed: "} +
+                                          std::pmr::string{cursor ? cursor->get_error().what.c_str() : "null cursor"}};
+                }
+                co_return session_payload{resource()};
+            }
+
+            log_->debug("Worker::execute: kafka write to '{}', routing to kafka_manager produce",
+                        write->relname);
+            auto [ns_kw, kw_future] = actor_zeta::send(kafka_manager_,
+                                                       &otterstax::kafka::KafkaManager::produce,
+                                                       id,
+                                                       std::move(write->relname),
+                                                       std::move(write->source));
+            auto cursor = co_await std::move(kw_future);
+            if (!cursor || cursor->is_error()) {
+                co_return core::error_t{error_code_t::other_error,
+                                  std::pmr::string{"Kafka write failed: "} +
+                                      std::pmr::string{cursor ? cursor->get_error().what.c_str() : "null cursor"}};
+            }
+            co_return session_payload{resource()};
         }
 
         bool has_external_nodes = data->otterbrix_params && data->otterbrix_params->external_nodes_count > 0;
@@ -362,6 +427,13 @@ Worker::prepare_schema(session_hash_t id, std::string sql) {
             log_->debug("Worker::prepare_schema: external-table statement, returning empty schema");
             parsed_data->backend_type = backend_type_t::Otterbrix;
             co_return finish_schema_value(id, cursor::make_cursor(resource()), std::move(parsed_data));
+        }
+
+        // A kafka_node_t is also tagged `unused`; it must not reach the schema_node_t
+        // path below. Kafka DDL has no preparable result schema — reject it.
+        if (dynamic_cast<otterstax::kafka::kafka_node_t*>(parsed_data->otterbrix_params->node.get())) {
+            co_return core::error_t{error_code_t::other_error,
+                              std::pmr::string{"Kafka DDL statements cannot be prepared"}};
         }
 
         if (parsed_data->otterbrix_params->external_nodes_count) {

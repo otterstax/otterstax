@@ -3,11 +3,13 @@
 #include <iostream>
 #include <otterbrix/otterbrix.hpp>
 
+#include "integration/otterbrix/otterbrix_engine.hpp" // db::make_otterbrix_engine
+
 // a13 JOIN output keeps BOTH join key columns (id, x, id, y) — the computed
 // federated schema dedups by name, and ChunkBatchReader keeps the first.
 TEST_CASE("a13 join output keeps both join key columns") {
     auto cfg = make_create_config("/tmp/otterstax_join_probe");
-    auto inst = otterbrix::make_otterbrix(cfg);
+    auto inst = db::make_otterbrix_engine(cfg);
     auto* d = inst->dispatcher();
     auto run = [&](const char* q) {
         auto c = d->execute_sql(otterbrix::session_id_t(), q);
@@ -40,7 +42,7 @@ TEST_CASE("a13 join output keeps both join key columns") {
 
 TEST_CASE("engine string group by on real tables") {
     auto cfg = make_create_config("/tmp/otterstax_strgrp_probe");
-    auto inst = otterbrix::make_otterbrix(cfg);
+    auto inst = db::make_otterbrix_engine(cfg);
     auto* d = inst->dispatcher();
     auto run = [&](const char* q) {
         auto c = d->execute_sql(otterbrix::session_id_t(), q);
@@ -68,7 +70,7 @@ TEST_CASE("engine string group by on real tables") {
 // programmatic node_data plan in test_mixed_plan_engine.cpp.
 TEST_CASE("engine string group by via pure SQL fallback shapes") {
     auto cfg = make_create_config("/tmp/otterstax_sqlgrp_probe");
-    auto inst = otterbrix::make_otterbrix(cfg);
+    auto inst = db::make_otterbrix_engine(cfg);
     auto* d = inst->dispatcher();
     auto run = [&](const char* tag, const char* q) {
         auto c = d->execute_sql(otterbrix::session_id_t(), q);

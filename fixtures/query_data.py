@@ -18,7 +18,7 @@ from tabulate import tabulate
 
 # Connection parameters for the first MariaDB server (campaigns)
 # Default: localhost connections (for direct access)
-CAMPAIGNS_DB_HOST = "0.0.0.0"
+CAMPAIGNS_DB_HOST = "127.0.0.1"
 CAMPAIGNS_DB_PORT = 3101
 CAMPAIGNS_DB_USER = "user1"
 CAMPAIGNS_DB_PASSWORD = "password1"
@@ -26,7 +26,7 @@ CAMPAIGNS_DB_NAME = "db1"
 
 # Connection parameters for the second MariaDB server (impressions)
 # Default: localhost connections (for direct access)
-IMPRESSIONS_DB_HOST = "0.0.0.0"
+IMPRESSIONS_DB_HOST = "127.0.0.1"
 IMPRESSIONS_DB_PORT = 3102
 IMPRESSIONS_DB_USER = "user2"
 IMPRESSIONS_DB_PASSWORD = "password2"
@@ -34,7 +34,7 @@ IMPRESSIONS_DB_NAME = "db2"
 
 # Connection parameters for PostgreSQL server (products)
 # Default: localhost connection (for direct access)
-POSTGRES_DB_HOST = "0.0.0.0"
+POSTGRES_DB_HOST = "127.0.0.1"
 POSTGRES_DB_PORT = 3103
 POSTGRES_DB_USER = "pguser"
 POSTGRES_DB_PASSWORD = "pgpassword"
@@ -42,7 +42,7 @@ POSTGRES_DB_NAME = "pgdb"
 
 # Connection parameters for ClickHouse server (orders)
 # Default: localhost connections
-CLICKHOUSE_DB_HOST = "0.0.0.0"
+CLICKHOUSE_DB_HOST = "127.0.0.1"
 CLICKHOUSE_DB_PORT = 3104
 CLICKHOUSE_DB_USER = "chuser"
 CLICKHOUSE_DB_PASSWORD = "chpassword"

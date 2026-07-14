@@ -12,10 +12,10 @@
 #include "connectors/clickhouse/manager.hpp"
 #include "otterbrix/parser/parser.hpp"
 #include "otterbrix/query_generation/sql_query_generator.hpp"
+#include "otterbrix/schema/schema_utils.hpp"
 #include "otterbrix/translators/input/ch_to_chunk.hpp"
 #include "otterbrix/translators/input/mysql_to_complex.hpp"
 #include "otterbrix/translators/input/pg_to_chunk.hpp"
-#include "scheduler/schema_utils.hpp"
 #include "utility/cv_wrapper.hpp"
 #include "utility/session.hpp"
 #include "utility/table_info.hpp"
@@ -77,9 +77,8 @@ namespace mysql {
         std::pmr::memory_resource* resource() const noexcept { return resource_; }
 
         // Connection type management
-        void registerConnection(const std::string& uuid,
-                                catalog_ext::ConnectionType type,
-                                const qualified_name_t& name);
+        void
+        registerConnection(const std::string& uuid, catalog_ext::ConnectionType type, const qualified_name_t& name);
         void unregisterConnection(const std::string& uuid);
         std::optional<catalog_ext::ConnectionType> getConnectionType(const std::string& uuid) const;
         bool hasConnection(const std::string& uuid) const;

@@ -1,3 +1,5 @@
+add_subdirectory(parser/grammar_extension/kafka)
+
 set(OTTERBRIX_HEADERS
     config.hpp
     translators/input/mysql_to_chunk.hpp
@@ -17,6 +19,7 @@ set(OTTERBRIX_HEADERS
     parser/parser.hpp
     parser/subquery_extractor.hpp
     query_generation/sql_query_generator.hpp
+    schema/schema_utils.hpp
 )
 
 set(OTTERBRIX_SOURCES
@@ -38,6 +41,7 @@ set(OTTERBRIX_SOURCES
     parser/parser.cpp
     parser/subquery_extractor.cpp
     query_generation/sql_query_generator.cpp
+    schema/schema_utils.cpp
 )
 
 # SQL grammar extensions (s3 / file): each builds its own flex+bison grammar via
@@ -62,6 +66,7 @@ target_link_libraries(otterbrix_local PUBLIC
     actor-zeta::actor-zeta
     PostgreSQL::PostgreSQL
     clickhouse-cpp-lib::clickhouse-cpp-lib
+    kafka_grammar
 )
 
 if(ENABLE_TRACY)

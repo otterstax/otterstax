@@ -4,7 +4,7 @@
 #include "otterbrix/parser/name_resolution.hpp"
 #include "otterbrix/parser/parser.hpp"
 #include "otterbrix/parser/subquery_extractor.hpp"
-#include "scheduler/schema_utils.hpp"
+#include "otterbrix/schema/schema_utils.hpp"
 
 #include <catch2/catch.hpp>
 #include <components/logical_plan/forward.hpp>

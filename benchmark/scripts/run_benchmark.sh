@@ -28,6 +28,7 @@ IMAGE_TAG="${IMAGE_TAG:-bench}"
 FORCE_REBUILD=false   # set by --rebuild or --clear; bypasses image-existence check
 CLEAR=false           # set by --clear; removes images and volumes before building
 EXTERNAL_ENABLED=false  # set when any external_* test is selected (adds MinIO + fixtures)
+KAFKA_ENABLED=false     # set when any kafka_* test is selected (adds redpanda + seeds a topic)
 
 # external_* are opt-in via --bench: they need generated fixtures + MinIO, which
 # only spin up when selected.  They cover s3/file loading, internal joins and
@@ -35,7 +36,8 @@ EXTERNAL_ENABLED=false  # set when any external_* test is selected (adds MinIO +
 DEFAULT_TESTS=(simple_select complex_select join_same_instance join_cross_engine join_all)
 ALL_TESTS=("${DEFAULT_TESTS[@]}"
            external_load external_join external_dump
-           external_join_cross external_join_all)
+           external_join_cross external_join_all
+           kafka_ingest kafka_produce kafka_stream)
 TESTS=("${DEFAULT_TESTS[@]}")
 BENCH_FILTER=()   # populated by --bench; empty = run default tests
 # arrow is excluded by default: OtterStax FlightSQL serializer crashes on JOIN
@@ -68,10 +70,15 @@ Options:
   --bench T           Test(s) to run: simple_select | complex_select |
                       join_same_instance | join_cross_engine | join_all |
                       external_load | external_join | external_dump |
-                      external_join_cross | external_join_all
+                      external_join_cross | external_join_all |
+                      kafka_ingest | kafka_produce | kafka_stream
                       May be repeated. Default: the five cross-backend tests.
                       external_* (s3/file: load, internal joins, dump) are opt-in
                       and auto-start MinIO + generate fixtures. mysql/postgres only.
+                      kafka_* are opt-in and auto-start redpanda + seed a JSON
+                      topic: kafka_ingest (SOURCE ingest, at-least-once + EOS),
+                      kafka_produce (INSERT VALUES write path), kafka_stream
+                      (continuous-query throughput).
   --out-dir DIR       Root directory for result files
                       (default: benchmark_results/<YYYYMMDD_HHMMSS>)
 
@@ -200,9 +207,13 @@ if [ ${#BENCH_FILTER[@]} -gt 0 ]; then
     TESTS=("${_filtered[@]}")
 fi
 
-# External tests pull in MinIO + generated fixtures; detect once up front.
+# External tests pull in MinIO + generated fixtures; kafka tests pull in redpanda
+# + a seeded topic.  Detect once up front.
 for _t in "${TESTS[@]}"; do
-    case "$_t" in external_*) EXTERNAL_ENABLED=true ;; esac
+    case "$_t" in
+        external_*) EXTERNAL_ENABLED=true ;;
+        kafka_*)    KAFKA_ENABLED=true ;;
+    esac
 done
 
 # Auto-cap BUILD_JOBS when the user did not set -j explicitly.
@@ -249,11 +260,14 @@ _compose_backends() {
     local _files=(-f "$BENCH_DIR/compose_backends.yml")
     # External tests need a seeded MinIO alongside the DB backends.
     $EXTERNAL_ENABLED && _files+=(-f "$BENCH_DIR/compose_minio.yml")
+    # Kafka tests need a redpanda broker alongside the DB backends.
+    $KAFKA_ENABLED && _files+=(-f "$BENCH_DIR/compose_kafka.yml")
     $COMPOSE_CMD "${_files[@]}" "$@"
 }
 _compose_otterstax() {
     local _files=(-f "$BENCH_DIR/compose_backends.yml" -f "$BENCH_DIR/compose_benchmark.yml")
     $EXTERNAL_ENABLED && _files+=(-f "$BENCH_DIR/compose_minio.yml")
+    $KAFKA_ENABLED && _files+=(-f "$BENCH_DIR/compose_kafka.yml")
     # When --perf is active, include the perf overlay to add SYS_ADMIN/PERFMON
     # capabilities and disable seccomp on bench-otterstax so perf_event_open works.
     $ENABLE_PERF && _files+=(-f "$BENCH_DIR/compose_benchmark_perf.yml")
@@ -632,6 +646,23 @@ if $EXTERNAL_ENABLED; then
 fi
 
 # ---------------------------------------------------------------------------
+# Step 1c: Generate the Kafka JSON dataset (only when a kafka_* test is selected)
+# Written to data/fixtures on the host (bind-mounted); seeded into the topic in
+# Step 3b after the broker is healthy.
+# ---------------------------------------------------------------------------
+if $KAFKA_ENABLED; then
+    echo ""
+    echo "=== Step 1c: Generating Kafka JSON dataset ==="
+    echo ""
+    mkdir -p "$BENCH_DIR/data/fixtures"
+    docker run --rm \
+        -v "$BENCH_DIR/data/fixtures:/app/data/fixtures" \
+        -e PYTHONUNBUFFERED=1 \
+        benchmark-client:latest \
+        python /app/data/generate_kafka_fixtures.py --out /app/data/fixtures
+fi
+
+# ---------------------------------------------------------------------------
 # Step 2: Start backend databases
 # ---------------------------------------------------------------------------
 echo ""
@@ -652,6 +683,7 @@ _wait_db_healthy bench_postgres2
 _wait_db_healthy bench_clickhouse1
 _wait_db_healthy bench_clickhouse2
 $EXTERNAL_ENABLED && _wait_db_healthy bench_minio
+$KAFKA_ENABLED && _wait_db_healthy bench_kafka
 
 echo "Giving databases extra time to stabilise..."
 sleep 5
@@ -666,6 +698,24 @@ echo ""
 docker run --rm --network=bench_net \
     benchmark-client:latest \
     python /app/data/init_data.py
+
+# ---------------------------------------------------------------------------
+# Step 3b: Seed the Kafka topic (only when a kafka_* test is selected)
+# Explicit one-shot (NOT a compose service) so it runs exactly once — see
+# compose_kafka.yml for why re-seeding on a mid-run restart must be avoided.
+# ---------------------------------------------------------------------------
+if $KAFKA_ENABLED; then
+    echo ""
+    echo "=== Step 3b: Seeding Kafka topic ==="
+    echo ""
+    docker run --rm --network=bench_net \
+        -v "$BENCH_DIR/data/fixtures:/fixtures:ro" \
+        -e PYTHONUNBUFFERED=1 \
+        benchmark-client:latest \
+        python /app/data/seed_kafka.py \
+        --broker bench_kafka:9092 \
+        --file /fixtures/kafka_events.ndjson
+fi
 
 # ---------------------------------------------------------------------------
 # Step 4: Start OtterStax

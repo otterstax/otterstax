@@ -313,6 +313,14 @@ otterbrix-internal — shadow of `external_join_all` benchmark), all driven by
 | `utility/` | (header-only) | `session_payload`, `session`, `pipeline_error`, logger, profiler |
 | `cmake/` | (helper macros) | `otterbrix_parser_extension.cmake` — builds the s3/file flex+bison grammar extensions |
 | `tests/` | `test_system`, `test_unit_*`, `test_mysql_front` | Catch2 tests + python integration suite under `tests/test_*.py` |
+| `integration/` | `integration` | Actor wrappers bridging Scheduler ↔ ConnectorManagers |
+| `integration/kafka/` | `kafka_runtime` | `KafkaManager` actor + `detail/` impl (consumer/producer/poller/stream/reader); Kafka SOURCE/STREAM objects, librdkafka |
+| `otterbrix/` | `otterbrix_local` | Parser, SQL generator, translators, plan execution |
+| `otterbrix/parser/grammar_extension/kafka/` | `kafka_grammar` | Kafka DDL parser extension (flex+bison): `kafka_node_t`, `kafka_write_target` |
+| `scheduler/` | `scheduler` | Query routing actor (`Scheduler`) + schema computation utilities |
+| `frontend/` | `flight_sql_server`, `mysql_server`, `postgres_server` | Wire-protocol frontends |
+| `utility/` | (header-only) | `cv_wrapper`, `session_payload`, `result_t`, `pipeline_error`, logger |
+| `tests/` | `test_system`, `test_unit_*`, `test_mysql_front` | Catch2 tests |
 
 ## Known Constraints
 

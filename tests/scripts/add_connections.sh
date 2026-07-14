@@ -6,7 +6,7 @@ HOST="test-otterstax"
 while [[ $# -gt 0 ]]; do
     case $1 in
         --local)
-            HOST="0.0.0.0"
+            HOST="127.0.0.1"
             shift
             ;;
         *)

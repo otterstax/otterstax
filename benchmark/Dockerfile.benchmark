@@ -11,6 +11,7 @@ RUN pip install --no-cache-dir --timeout 120 --retries 5 \
     pyarrow \
     pymysql \
     clickhouse-driver \
+    confluent-kafka \
     faker \
     pyyaml
 

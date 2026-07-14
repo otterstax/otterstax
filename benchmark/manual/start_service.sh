@@ -17,6 +17,10 @@
 #                external_load / external_join / external_dump / external_join_cross /
 #                external_join_all benchmarks can run (registers the bench_minio
 #                s3 alias). Adds compose_minio.yml.
+#   --kafka      Also start a redpanda broker, generate the JSON dataset and seed
+#                it into the topic so the kafka_ingest / kafka_produce / kafka_stream
+#                benchmarks can run. Adds compose_kafka.yml. No REST registration
+#                (the broker is named in CREATE SOURCE directly).
 #   --no-init    Skip benchmark data initialisation (reuse existing data).
 #   --rebuild    Force rebuild of both Docker images (otterstax_app + benchmark-client)
 #                even if they already exist. Use after C++ source changes.
@@ -50,6 +54,7 @@ BUILD_JOBS=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --external)     EXTERNAL_ENABLED=true; shift ;;
+        --kafka)        KAFKA_ENABLED=true; shift ;;
         --no-init)      SKIP_INIT=true; shift ;;
         --rebuild)      FORCE_REBUILD=true; shift ;;
         --perf)         ENABLE_PERF=true; shift ;;
@@ -114,6 +119,7 @@ if $ENABLE_PERF; then
             -f "$BENCH_DIR/compose_benchmark_perf.yml"
         )
         [ "$EXTERNAL_ENABLED" = "true" ] && _files+=(-f "$BENCH_DIR/compose_minio.yml")
+        [ "$KAFKA_ENABLED" = "true" ] && _files+=(-f "$BENCH_DIR/compose_kafka.yml")
         docker compose "${_files[@]}" -p bench "$@"
     }
 fi
@@ -174,6 +180,13 @@ if $EXTERNAL_ENABLED; then
     _generate_external_fixtures
 fi
 
+# Generate the kafka dataset before `up` so it is ready to seed once the broker is up.
+if $KAFKA_ENABLED; then
+    echo ""
+    echo "=== Generating kafka JSON dataset ==="
+    _generate_kafka_fixtures
+fi
+
 # Ensure bench_net exists (created by compose_backends.yml on first up)
 echo ""
 echo "=== Starting backend databases ==="
@@ -186,8 +199,17 @@ _wait_db_healthy bench_postgres2
 _wait_db_healthy bench_clickhouse1
 _wait_db_healthy bench_clickhouse2
 $EXTERNAL_ENABLED && _wait_db_healthy bench_minio
+$KAFKA_ENABLED && _wait_db_healthy bench_kafka
 echo "Giving databases extra time to stabilise..."
 sleep 5
+
+# Seed the kafka topic once, now that the broker is healthy (an explicit run, not
+# a compose service — see compose_kafka.yml for why re-seeding must be avoided).
+if $KAFKA_ENABLED; then
+    echo ""
+    echo "=== Seeding kafka topic ==="
+    _seed_kafka
+fi
 
 if ! $SKIP_INIT; then
     echo ""
@@ -250,6 +272,11 @@ if $EXTERNAL_ENABLED; then
 echo " s3/file ready   → MinIO seeded (alias bench_minio, bucket bench-bucket)"
 echo "   external bench: ./benchmark/manual/run_bench.sh \\"
 echo "                    --bench external_load external_join external_dump external_join_cross external_join_all"
+fi
+if $KAFKA_ENABLED; then
+echo " kafka ready     → redpanda up (bench_kafka:9092), topic seeded"
+echo "   kafka bench   : ./benchmark/manual/run_bench.sh \\"
+echo "                    --bench kafka_ingest kafka_produce kafka_stream"
 fi
 echo " Run benchmarks : ./benchmark/manual/run_bench.sh"
 echo " Run a query    : ./benchmark/manual/run_query.sh --frontend mysql query.sql"

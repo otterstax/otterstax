@@ -3,7 +3,7 @@
 
 #include "otterbrix/parser/parser.hpp"
 #include "otterbrix/query_generation/sql_query_generator.hpp"
-#include "scheduler/schema_utils.hpp"
+#include "otterbrix/schema/schema_utils.hpp"
 
 #include <components/logical_plan/node_aggregate.hpp>
 #include <iostream>
@@ -139,7 +139,7 @@ TEST_CASE("mixed plan with node_data executes in engine", "[engine-group-by-stri
     }
 
     auto cfg = make_create_config("/tmp/otterstax_mixed_probe");
-    auto inst = otterbrix::make_otterbrix(cfg);
+    auto inst = db::make_otterbrix_engine(cfg);
     auto manager = make_otterbrix_manager(inst);
     std::cout << "executing mixed plan in engine...\n";
     auto cursor = manager->execute_plan(data->otterbrix_params);
@@ -204,7 +204,7 @@ static void run_mixed_variant(const char* tag, const char* sql, bool string_name
         }
     }
     auto cfg = make_create_config(std::string("/tmp/otterstax_mp_") + tag);
-    auto inst = otterbrix::make_otterbrix(cfg);
+    auto inst = db::make_otterbrix_engine(cfg);
     auto manager = make_otterbrix_manager(inst);
     std::cout << "[" << tag << "] executing...\n";
     auto cursor = manager->execute_plan(data->otterbrix_params);
@@ -321,7 +321,7 @@ TEST_CASE("pure engine: group by string key over node_data", "[engine-group-by-s
     REQUIRE(swapped == 2);
 
     auto cfg = make_create_config("/tmp/otterstax_pure_engine_probe");
-    auto inst = otterbrix::make_otterbrix(cfg);
+    auto inst = db::make_otterbrix_engine(cfg);
     auto cursor = inst->dispatcher()->execute_plan(
         otterbrix::session_id_t(),
         components::logical_plan::execution_plan_t{resource, root, binder.params_ptr()});

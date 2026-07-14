@@ -1,3 +1,5 @@
+add_subdirectory(grammar_extension/kafka)
+
 project(test_parser)
 
 set(${PROJECT_NAME}_SOURCES

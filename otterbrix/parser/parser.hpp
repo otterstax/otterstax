@@ -6,6 +6,8 @@
 #include "types/otterbrix.hpp"
 #include "utility/logger.hpp"
 
+#include "otterbrix/parser/grammar_extension/kafka/kafka_extension.hpp"
+
 #include <otterbrix/otterbrix.hpp>
 
 #include <components/logical_plan/node_data.hpp>
@@ -65,10 +67,10 @@ public:
 private:
     std::pmr::memory_resource* resource_;
     log_t log_;
-    // s3/file DDL extensions (CREATE EXTERNAL TABLE / COPY ... TO). Core SQL is
-    // parsed first; only core-rejected statements reach these, whose transform
-    // yields an otterstax::external::external_node_t. Passed to both raw_parser
-    // (3-arg) and the transformer.
+    // One shared registry for all DDL parser extensions: s3/file (CREATE EXTERNAL
+    // TABLE / COPY ... TO → external_node_t) and kafka (CREATE/DROP SOURCE/STREAM
+    // → kafka_node_t). Core SQL is parsed first; only core-rejected statements
+    // reach these. Passed to both raw_parser (3-arg) and the transformer.
     components::sql::parser::parser_extension_registry_t registry_;
 };
 

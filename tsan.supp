@@ -34,3 +34,22 @@ race:std::__1::ios_base::width
 # (file + buffer overloads) and shows up in test_unit_translators.
 race:arrow::BackgroundGenerator
 race:arrow::Result
+
+# Same class of arrow-internal teardown race, CSV/Parquet flavour. The
+# TableReader drives conversion through arrow's global CPU thread pool behind
+# an arrow::Future; during reader teardown that future's shared state (control
+# block) is released on an arrow worker thread (std::_Sp_counted_base::_M_release,
+# inside libarrow) while the main thread is still parked in FutureImpl::Wait().
+# Both racing accesses are in libarrow — the only otterstax frame is the
+# csv_to_chunk caller of Wait(). Hit by csv_to_chunk (test_file_ingestion /
+# "FileManager: csv dump and re-read" in test_system).
+race:arrow::FutureImpl
+
+# librdkafka's rk_terminate flag: rd_kafka_destroy() sets it, its background
+# thread (rd_kafka_thread_main) polls it to exit — harmless (monotonic flag,
+# atomic on x86). librdkafka's rdatomic.h writes it non-atomically but reads it
+# atomically, so TSAN flags the handshake; third-party static lib, suppress by name.
+race:rd_atomic32_set
+race:rd_atomic32_get
+race:rd_atomic64_set
+race:rd_atomic64_get

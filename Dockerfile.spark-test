@@ -62,7 +62,7 @@ COPY ./tests/test_mysql_client_ch_backend.py .
 COPY ./tests/test_pg_client_ch_backend.py .
 
 # Cross-backend JOIN tests
-COPY ./tests/test_cross_backend_queries.py .
+COPY ./tests/test_cross_backend_queries_mysql.py .
 COPY ./tests/test_cross_backend_queries_pg.py .
 
 # Spark Connect E2E tests

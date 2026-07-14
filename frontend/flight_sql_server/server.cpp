@@ -48,20 +48,6 @@ inline void clear_directory(const configuration::config& config) {
     std::filesystem::create_directories(config.disk.path);
 }
 
-template<typename T>
-struct QueryHandleWaiter {
-    std::vector<std::future<T>> futures;
-    std::vector<T> results;
-    void wait() {
-        for (auto& future : futures) {
-            auto result = future.get();
-            // Received from DB rows
-            results.push_back(std::move(result));
-        }
-        // Finished
-    }
-};
-
 // Create a Ticket that combines a SQL query, transaction ID, and session hash.
 arrow::Result<arrow::flight::Ticket> EncodeTransactionQuery(TicketData data) {
     std::string transaction_query = data.sql_query;

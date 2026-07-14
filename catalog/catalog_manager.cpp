@@ -589,7 +589,7 @@ namespace mysql {
 
                 try {
                     auto future = mysql_conn_manager_->executeQuery(uuid, list_tables_query, list_handler);
-                    if (auto err = std::move(future.get()).release(); err.contains_error()) {
+                    if (auto err = get_or_throw(future).release(); err.contains_error()) {
                         co_return err;
                     }
                 } catch (const std::exception& e) {
@@ -625,7 +625,7 @@ namespace mysql {
                     std::string schema_query = make_schema_probe_query(resource(), table_name_obj, backend_type_t::MySQL);
                     try {
                         auto future = mysql_conn_manager_->executeQuery(uuid, schema_query, schema_handler);
-                        if (auto err = std::move(future.get()).release(); err.contains_error()) {
+                        if (auto err = get_or_throw(future).release(); err.contains_error()) {
                             log_->error("discover_connection_schemas: failed to fetch schema for {}.{}: {}",
                                         name.database,
                                         table_name,
@@ -659,7 +659,7 @@ namespace mysql {
 
             try {
                 auto future = mysql_conn_manager_->executeQuery(uuid, query, schema_handler);
-                co_return std::move(future.get()).release();
+                co_return get_or_throw(future).release();
             } catch (const std::exception& e) {
                 log_->error("discover_connection_schemas: failed to query MySQL schema for {}", name.to_string());
                 co_return core::error_t(
@@ -717,7 +717,7 @@ namespace mysql {
 
                 try {
                     auto future = pg_conn_manager_->executeQuery(uuid, list_tables_query, list_handler);
-                    if (auto err = std::move(future.get()).release(); err.contains_error()) {
+                    if (auto err = get_or_throw(future).release(); err.contains_error()) {
                         co_return err;
                     }
                 } catch (const std::exception& e) {
@@ -755,7 +755,7 @@ namespace mysql {
                         make_schema_probe_query(resource(), full_table_name, backend_type_t::PostgreSQL);
                     try {
                         auto future = pg_conn_manager_->executeQuery(uuid, schema_query, schema_handler);
-                        if (auto err = std::move(future.get()).release(); err.contains_error()) {
+                        if (auto err = get_or_throw(future).release(); err.contains_error()) {
                             log_->error("discover_connection_schemas: failed to fetch schema for {}.{}: {}",
                                         full_table_name.schema,
                                         full_table_name.collection,
@@ -793,7 +793,7 @@ namespace mysql {
 
                 try {
                     auto future = pg_conn_manager_->executeQuery(uuid, schema_query, schema_handler);
-                    co_return std::move(future.get()).release();
+                    co_return get_or_throw(future).release();
                 } catch (const std::exception& e) {
                     log_->error("discover_connection_schemas: failed to query schema for {}.{}",
                                 pg_name.schema,
@@ -832,7 +832,7 @@ namespace mysql {
                             schema_query);
                 try {
                     auto future = ch_conn_manager_->executeQuery(uuid, schema_query, schema_handler);
-                    co_return std::move(future.get()).release();
+                    co_return get_or_throw(future).release();
                 } catch (const std::exception& e) {
                     log_->error("discover_connection_schemas: failed to query schema for {}.{}",
                                 ch_database,
@@ -874,7 +874,7 @@ namespace mysql {
 
             try {
                 auto future = ch_conn_manager_->executeQuery(uuid, list_tables_query, list_handler);
-                if (auto err = std::move(future.get()).release(); err.contains_error()) {
+                if (auto err = get_or_throw(future).release(); err.contains_error()) {
                     co_return err;
                 }
             } catch (const std::exception& e) {
@@ -916,7 +916,7 @@ namespace mysql {
                     make_schema_probe_query(resource(), table_name_obj, backend_type_t::ClickHouse);
                 try {
                     auto future = ch_conn_manager_->executeQuery(uuid, schema_query, schema_handler);
-                    if (auto err = std::move(future.get()).release(); err.contains_error()) {
+                    if (auto err = get_or_throw(future).release(); err.contains_error()) {
                         log_->error("discover_connection_schemas: failed to fetch schema for {}.{}: {}",
                                     ch_database,
                                     table_name,

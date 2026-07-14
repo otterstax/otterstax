@@ -22,6 +22,7 @@
 #include "connectors/api_connections/ch_connection_config.hpp"
 #include "utility/cv_wrapper.hpp"
 #include "utility/thread_pool_manager.hpp"
+#include "utility/wait_barrier.hpp"
 
 #include <components/expressions/compare_expression.hpp>
 
@@ -49,8 +50,9 @@ namespace ch {
 
         template<typename Callable>
         requires std::invocable<Callable, const std::vector<clickhouse::Block>&>
-            std::future<std::invoke_result_t<Callable, const std::vector<clickhouse::Block>&>>
+            std::future<query_outcome<std::invoke_result_t<Callable, const std::vector<clickhouse::Block>&>>>
             executeQuery(const std::string& uuid, std::string_view query, Callable handler) {
+            using result_t = std::invoke_result_t<Callable, const std::vector<clickhouse::Block>&>;
             OTX_ZONE_N("ch::ConnectorManager::executeQuery");
             auto conn = connections_.find(uuid);
             if (conn == connections_.end()) {
@@ -69,7 +71,18 @@ namespace ch {
                     throw std::runtime_error("Failed to reconnect. Error message: " + std::string(e.what()));
                 }
             }
-            return co_spawn(thread_pool_manager_.ctx(), conn->second->runQuery(query, handler), asio::use_future);
+            // Marshal any connector error into a value ON the io thread — never ship a live
+            // std::exception across the io->consumer boundary (boost.asio use_future captures +
+            // destroys the exception_ptr on the io thread, racing future.get(); TSAN race under
+            // boost 1.88). The consumer rethrows from the copied string on its own thread.
+            auto guarded = [](awaitable<result_t> inner) -> awaitable<query_outcome<result_t>> {
+                try {
+                    co_return query_outcome<result_t>{co_await std::move(inner), {}};
+                } catch (const std::exception& e) {
+                    co_return query_outcome<result_t>{result_t{}, std::string{e.what()}};
+                }
+            }(conn->second->runQuery(query, handler));
+            return co_spawn(thread_pool_manager_.ctx(), std::move(guarded), asio::use_future);
         }
 
         size_t totalConnections() const noexcept;

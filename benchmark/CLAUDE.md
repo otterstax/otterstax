@@ -166,7 +166,9 @@ After the script exits, all ports are published to the host:
 | MySQL wire       | `localhost:8816`   |
 | PostgreSQL wire  | `localhost:8817`   |
 | FlightSQL/Arrow  | `localhost:8815`   |
-| HTTP conn API    | `localhost:8085`   |
+
+Connections are read from `benchmark/config.yaml` at server startup (mounted
+into `bench_otterstax` by `compose_benchmark.yml`) — there is no HTTP conn API.
 
 Open Tracy and connect to `localhost:8086` at any time while the service is running.
 
@@ -238,7 +240,7 @@ benchmark/
 ├── CLAUDE.md                    # This file
 ├── compose_backends.yml         # 6 DB containers (bench_net)
 ├── compose_benchmark.yml        # OtterStax container; publishes :8086 to host
-├── compose_manual.yml           # Overlay: also publishes 8085/8815/8816/8817
+├── compose_manual.yml           # Overlay: also publishes 8815/8816/8817 to host
 ├── compose_minio.yml            # Overlay: MinIO + seed job for external_* tests
 ├── compose_kafka.yml            # Overlay: redpanda broker for kafka_ingest (seed is a run_benchmark.sh step, not a service)
 ├── Dockerfile.benchmark         # Python image: data init + benchmark scripts (+ confluent-kafka)
@@ -341,8 +343,10 @@ Selecting any `external_*` test makes `run_benchmark.sh`:
    (a container run of `benchmark-client`, before the stack comes up).
 2. Add `compose_minio.yml` to the backend + otterstax compose sets (MinIO +
    a one-shot that seeds `bench-bucket` from the same fixtures).
-3. Register the `bench_minio` s3 alias through `GET /s3/add_credentials` after
-   OtterStax starts (folded into `_register_connections`).
+
+The `bench_minio` s3 alias itself is declared in `benchmark/config.yaml`
+(the `s3:` section) and registered at server startup like the six DB backends —
+no runtime registration step.
 
 The `file` and `s3` sources read the **identical** fixtures: bench-otterstax
 mounts `data/fixtures` at `/fixtures`, and MinIO is seeded from the same dir.
@@ -566,9 +570,10 @@ OtterStax fetches entire tables from each backend and filters in-process (OtterB
 
 ### Connection aliases required
 
-Every backend must be registered by alias (`mysql1`, `mysql2`, `pg1`, `pg2`, `ch1`, `ch2`)
-before running queries. `run_benchmark.sh` and `start_service.sh` both do this
-automatically. To re-register manually, call `_register_connections` from `manual/_common.sh`.
+Every backend is registered by alias (`mysql1`, `mysql2`, `pg1`, `pg2`, `ch1`, `ch2`)
+at server startup from `benchmark/config.yaml` (mounted into `bench_otterstax`).
+There is no runtime registration API — to change the registered aliases, edit that
+file and restart the stack.
 
 ## Common issues
 

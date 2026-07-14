@@ -1,0 +1,39 @@
+# Tiny-test server config — three MySQL aliases against a local backend. Point
+# the server at this file with:
+#   ./build/server --config examples/simple/example_connetion/tiny_tests/config.yaml
+
+service:
+  flight_sql:
+    host: "0.0.0.0"
+    port: 8815
+  mysql:
+    port: 8816
+  postgres:
+    port: 8817
+  connection_retry:
+    max_attempts: 10
+    delay_ms: 2000
+
+connections:
+  mysql:
+    - alias: logins
+      host: 127.0.0.1
+      port: ""
+      username: test_user
+      password: test
+      database: my_database
+      table: ""
+    - alias: users
+      host: 127.0.0.1
+      port: ""
+      username: test_user
+      password: test
+      database: my_database
+      table: ""
+    - alias: salaries
+      host: 127.0.0.1
+      port: ""
+      username: test_user
+      password: test
+      database: my_database_2
+      table: ""

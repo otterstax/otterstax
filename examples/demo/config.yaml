@@ -1,0 +1,51 @@
+# Demo server config — docker mode (otterstax runs inside the compose network,
+# backends addressed by docker-DNS names). Mounted into the demo-otterstax
+# container at the server's default config path and read once at startup.
+
+service:
+  flight_sql:
+    host: "0.0.0.0"
+    port: 8815
+  mysql:
+    port: 8816
+  postgres:
+    port: 8817
+  connection_retry:
+    max_attempts: 10
+    delay_ms: 2000
+
+connections:
+  mysql:
+    - alias: mysql
+      host: demo-mariadb
+      port: "3306"
+      username: demo
+      password: demo
+      database: bill
+      table: ""
+
+  postgresql:
+    - alias: pg
+      host: demo-postgres
+      port: "5432"
+      username: demo
+      password: demo
+      database: shop
+      schema: shop
+      table: ""
+
+  clickhouse:
+    - alias: ch
+      host: demo-clickhouse
+      port: "9000"
+      username: demo
+      password: demo
+      database: ev
+      table: ""
+
+  s3:
+    - alias: demo_s3
+      access_key: minioadmin
+      secret_key: minioadmin
+      region: us-east-1
+      endpoint: demo-minio:9000

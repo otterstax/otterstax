@@ -142,7 +142,7 @@ target_link_libraries(
     # one of them pulls (e.g. integration/s3/s3_manager.o, referenced solely by
     # the Scheduler). RESCAN groups them (--start-group/--end-group) so the
     # linker re-pulls until the cycle is fully resolved.
-    "$<LINK_GROUP:RESCAN,flight_sql_server,common_server,mysql_server,postgres_server,catalog,connectors,s3,file,api_server,component_manager,integration,otterbrix_local,scheduler,kafka_grammar,kafka_runtime>"
+    "$<LINK_GROUP:RESCAN,flight_sql_server,common_server,mysql_server,postgres_server,catalog,connectors,s3,file,component_manager,integration,otterbrix_local,scheduler,kafka_grammar,kafka_runtime>"
     config::config
     arrow::arrow
     Boost::boost

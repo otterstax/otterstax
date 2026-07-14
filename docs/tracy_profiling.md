@@ -102,7 +102,7 @@ Open the saved file later in the GUI: **File → Open → trace.tracy**
 | 2 | Rebuilds Docker images (`test-otterstax`, `test-client`) |
 | 3 | Starts all four databases (MariaDB ×2, PostgreSQL, ClickHouse) |
 | 4–6 | Waits for each DB to be healthy, creates test data, verifies tables |
-| 7 | Starts `test-otterstax`, waits for its `/health` endpoint |
+| 7 | Starts `test-otterstax`, waits for its FlightSQL wire port (8815) to accept connections |
 | 7b | *(Tracy only)* starts `tracy-capture` in background on the host |
 | 8 | Runs the test suite inside `test-client` |
 | 8b | *(Tracy only)* stops `tracy-capture`, flushes and reports file path |

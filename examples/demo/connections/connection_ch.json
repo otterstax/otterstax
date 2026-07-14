@@ -1,9 +1,0 @@
-{
-    "alias": "ch",
-    "host": "demo-clickhouse",
-    "port": "9000",
-    "username": "demo",
-    "password": "demo",
-    "database": "ev",
-    "table": ""
-}

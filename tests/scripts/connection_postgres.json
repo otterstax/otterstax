@@ -1,9 +1,0 @@
-{
-    "alias": "products",
-    "host": "postgres1",
-    "port": "5432",
-    "username": "pguser",
-    "password": "pgpassword",
-    "database": "pgdb",
-    "table": ""
-}

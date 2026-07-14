@@ -341,16 +341,18 @@ _wait_db_healthy() {
 }
 
 # ---------------------------------------------------------------------------
-# Helper: poll OtterStax /health from inside the bench_net network
+# Helper: poll the OtterStax MySQL wire port from inside the bench_net network.
+# There is no HTTP health port anymore — connections load at startup from the
+# mounted connection config file.
 # ---------------------------------------------------------------------------
 _wait_otterstax() {
     local retries=120
     local delay=2
-    echo "Waiting for OtterStax /health..."
+    echo "Waiting for OtterStax wire port (8816)..."
     for ((i=1; i<=retries; i++)); do
         if docker run --rm --network=bench_net benchmark-client:latest \
-               curl -s -f http://bench_otterstax:8085/health >/dev/null 2>&1; then
-            echo "  OtterStax healthy"
+               python -c "import socket; socket.create_connection(('bench_otterstax', 8816), 2)" >/dev/null 2>&1; then
+            echo "  OtterStax ready"
             return 0
         fi
         echo "  not ready ($i/$retries)"
@@ -362,80 +364,19 @@ _wait_otterstax() {
 }
 
 # ---------------------------------------------------------------------------
-# Helper: register the six connection aliases with OtterStax
+# Helper: connections are registered from the mounted connection config file
+# (benchmark/config.yaml) at server startup — no runtime API. Kept as a
+# no-op so the call sites below need no change.
 # ---------------------------------------------------------------------------
 _register_connections() {
-    local host="bench_otterstax"
-    local mysql_url="http://${host}:8085/add_connection"
-    local pg_url="http://${host}:8085/add_pg_connection"
-    local ch_url="http://${host}:8085/add_ch_connection"
-
-    _post_conn() {
-        local url=$1 payload=$2 alias=$3
-        local resp code body
-        for ((attempt=1; attempt<=5; attempt++)); do
-            resp=$(docker run --rm --network=bench_net benchmark-client:latest \
-                       curl -s -w "\n%{http_code}" -X POST "$url" \
-                       -H "Content-Type: application/json" \
-                       -d "$payload" 2>/dev/null)
-            code=$(echo "$resp" | tail -n1)
-            body=$(echo "$resp" | sed '$d')
-            if [ "$code" = "200" ] || [ "$code" = "201" ]; then
-                echo "  Registered '$alias': $body"
-                return 0
-            fi
-            echo "  '$alias': HTTP $code ($attempt/5) — retrying..."
-            sleep 2
-        done
-        echo "  ERROR: failed to register '$alias'"
-        return 1
-    }
-
-    echo "Registering connections..."
-    _post_conn "$mysql_url" \
-        '{"alias":"mysql1","host":"bench_mariadb1","port":"3306","username":"user1","password":"password1","database":"benchdb1","table":""}' \
-        "mysql1"
-    _post_conn "$mysql_url" \
-        '{"alias":"mysql2","host":"bench_mariadb2","port":"3306","username":"user2","password":"password2","database":"benchdb2","table":""}' \
-        "mysql2"
-    _post_conn "$pg_url" \
-        '{"alias":"pg1","host":"bench_postgres1","port":"5432","username":"pguser","password":"pgpassword","database":"benchpg1","table":""}' \
-        "pg1"
-    _post_conn "$pg_url" \
-        '{"alias":"pg2","host":"bench_postgres2","port":"5432","username":"pguser","password":"pgpassword","database":"benchpg2","table":""}' \
-        "pg2"
-    _post_conn "$ch_url" \
-        '{"alias":"ch1","host":"bench_clickhouse1","port":"9000","username":"chuser","password":"chpassword","database":"benchch1","table":""}' \
-        "ch1"
-    _post_conn "$ch_url" \
-        '{"alias":"ch2","host":"bench_clickhouse2","port":"9000","username":"chuser","password":"chpassword","database":"benchch2","table":""}' \
-        "ch2"
-
+    echo "Connections read from benchmark/config.yaml at startup (no runtime registration)."
     $EXTERNAL_ENABLED && _register_s3_credentials
 }
 
-# ---------------------------------------------------------------------------
-# Helper: register the bench MinIO alias for s3 external tables.
-# GET /s3/add_credentials carries a JSON body (see connection_server.cpp);
-# the alias/bucket/endpoint must match benchmarks/external_common.py.
-# ---------------------------------------------------------------------------
+# The bench MinIO s3 alias ('bench_minio') is likewise declared in
+# benchmark/config.yaml and registered at startup. No-op here.
 _register_s3_credentials() {
-    local url="http://bench_otterstax:8085/s3/add_credentials"
-    local payload='{"alias":"bench_minio","access_key":"minioadmin","secret_key":"minioadmin","region":"us-east-1","endpoint":"bench_minio:9000"}'
-    echo "Registering s3 credentials (bench_minio)..."
-    for ((attempt=1; attempt<=10; attempt++)); do
-        code=$(docker run --rm --network=bench_net benchmark-client:latest \
-                   curl -s -o /dev/null -w "%{http_code}" -X GET "$url" \
-                   -H "Content-Type: application/json" -d "$payload" 2>/dev/null)
-        if [ "$code" = "200" ] || [ "$code" = "201" ]; then
-            echo "  Registered s3 alias 'bench_minio'"
-            return 0
-        fi
-        echo "  s3 creds: HTTP $code ($attempt/10) — retrying..."
-        sleep 2
-    done
-    echo "  ERROR: failed to register s3 credentials"
-    return 1
+    echo "s3 alias 'bench_minio' read from benchmark/config.yaml at startup."
 }
 
 # ---------------------------------------------------------------------------
@@ -455,7 +396,7 @@ _start_otterstax() {
 # ---------------------------------------------------------------------------
 _ensure_otterstax() {
     if docker run --rm --network=bench_net benchmark-client:latest \
-           curl -s -f http://bench_otterstax:8085/health >/dev/null 2>&1; then
+           python -c "import socket; socket.create_connection(('bench_otterstax', 8816), 2)" >/dev/null 2>&1; then
         return 0
     fi
     echo "  WARNING: OtterStax unhealthy — restarting..."

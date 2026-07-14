@@ -8,7 +8,7 @@
 
 #include "otterbrix/parser/parser.hpp"
 #include "scheduler/session_data.hpp"
-#include "scheduler/schema_utils.hpp"
+#include "otterbrix/schema/schema_utils.hpp"
 #include "utility/session.hpp"
 
 #include <core/result_wrapper.hpp>
@@ -54,7 +54,8 @@ public:
            actor_zeta::address_t otterbrix_manager,
            actor_zeta::address_t catalog_manager,
            actor_zeta::address_t s3_manager,
-           actor_zeta::address_t file_manager);
+           actor_zeta::address_t file_manager,
+           actor_zeta::address_t kafka_manager);
 
     std::pmr::memory_resource* resource() const noexcept { return resource_; }
 
@@ -92,6 +93,7 @@ private:
     actor_zeta::address_t catalog_manager_;
     actor_zeta::address_t s3_manager_;   // db::S3Manager (s3 external tables / COPY)
     actor_zeta::address_t file_manager_; // conn::file::FileManager (local external tables / COPY)
+    actor_zeta::address_t kafka_manager_;
     std::pmr::unordered_map<session_hash_t, metadata_t> metadata_map_;
 
     // Routes a parsed external-table statement (CREATE EXTERNAL TABLE / COPY ... TO)

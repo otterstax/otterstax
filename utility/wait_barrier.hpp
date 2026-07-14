@@ -19,4 +19,23 @@ struct QueryHandleWaiter {
         }
         // Finished
     }
+
+    // unlike std::async, asio futures do NOT block on destruction
+    ~QueryHandleWaiter() {
+        for (auto& future : futures) {
+            if (future.valid()) {
+                try {
+                    future.wait();
+                } catch (...) {
+                    // never propagate out of a destructor
+                }
+            }
+        }
+    }
+
+    QueryHandleWaiter() = default;
+    QueryHandleWaiter(const QueryHandleWaiter&) = delete;
+    QueryHandleWaiter& operator=(const QueryHandleWaiter&) = delete;
+    QueryHandleWaiter(QueryHandleWaiter&&) = delete;
+    QueryHandleWaiter& operator=(QueryHandleWaiter&&) = delete;
 };

@@ -85,6 +85,31 @@ services:
       - test_app_network
     restart: unless-stopped
 
+  kafka:
+    image: redpandadata/redpanda:v25.3.15
+    container_name: test-kafka
+    command:
+      - redpanda
+      - start
+      - --mode=dev-container
+      - --smp=1
+      - --default-log-level=warn
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr=internal://kafka:9092,external://127.0.0.1:19092
+    expose:
+      - "9092"
+    ports:
+      - "19092:19092"
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true'"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+    networks:
+      - test_app_network
+    restart: unless-stopped
+
   test-otterstax:
     image: otterstax_app:${IMAGE_TAG:-latest}
     build:
@@ -104,6 +129,8 @@ services:
       clickhouse1:
         condition: service_healthy
       minio:
+        condition: service_healthy
+      kafka:
         condition: service_healthy
     expose:
       - "8815"
@@ -182,6 +209,8 @@ services:
       postgres1:
         condition: service_healthy
       clickhouse1:
+        condition: service_healthy
+      kafka:
         condition: service_healthy
     volumes:
       - mariadb1_init:/app/mariadb1_init    # Mount SAME volumes as MariaDB

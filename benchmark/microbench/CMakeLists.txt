@@ -8,6 +8,7 @@ add_executable(otterstax_bench
     bench_parser.cpp
     bench_query_gen.cpp
     bench_grammar_extension.cpp
+    bench_kafka_translators.cpp
 )
 
 target_include_directories(otterstax_bench PRIVATE ${CMAKE_SOURCE_DIR})
@@ -36,3 +37,8 @@ set_target_properties(otterstax_bench PROPERTIES
     BUILD_RPATH "${CMAKE_BINARY_DIR}/lib"
     INSTALL_RPATH "${CMAKE_BINARY_DIR}/lib")
 target_link_options(otterstax_bench PRIVATE "-Wl,--disable-new-dtags")
+
+# kafka_runtime provides json_to_chunk / chunk_to_json for bench_kafka_translators
+# (and transitively kafka_grammar for kafka_column_t). Kept as its own call so the
+# diff stays clear of the Arrow-target line above.
+target_link_libraries(otterstax_bench PRIVATE kafka_runtime)

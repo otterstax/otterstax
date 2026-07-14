@@ -17,6 +17,8 @@ include(default)
 [settings]
 otterbrix/*:compiler.version=12
 actor-zeta/*:compiler.version=12
+# SEGFAULT at thread start, TSAN ships no interceptors for C11 threads
+librdkafka/*:compiler.version=12
 
 # -Wno-error=tsan: actor-zeta's cooperative_actor shutdown uses
 # std::atomic_thread_fence, which TSAN does not model; gcc-12's -Wtsan flags
@@ -31,3 +33,10 @@ otterbrix/*:tools.build:exelinkflags=["-fsanitize=thread"]
 actor-zeta/*:tools.build:cxxflags=["-fsanitize=thread", "-g", "-fno-omit-frame-pointer", "-Wno-error=tsan"]
 actor-zeta/*:tools.build:sharedlinkflags=["-fsanitize=thread"]
 actor-zeta/*:tools.build:exelinkflags=["-fsanitize=thread"]
+
+# librdkafka core is C, cflags are mandatory
+librdkafka/*:tools.build:compiler_executables={"c": "gcc-12", "cpp": "g++-12"}
+librdkafka/*:tools.build:cflags=["-fsanitize=thread", "-g", "-fno-omit-frame-pointer"]
+librdkafka/*:tools.build:cxxflags=["-fsanitize=thread", "-g", "-fno-omit-frame-pointer"]
+librdkafka/*:tools.build:sharedlinkflags=["-fsanitize=thread"]
+librdkafka/*:tools.build:exelinkflags=["-fsanitize=thread"]

@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2025-2026  OtterStax
+#
+# Kafka broker (redpanda) for the kafka_ingest benchmark — added to the backend +
+# otterstax compose sets only when a kafka_* test is selected (see run_benchmark.sh).
+# Mirrors the `kafka` service in compose.test.yml.
+#
+# Only the broker lives here.  The topic is seeded by an explicit `docker run` of
+# data/seed_kafka.py in run_benchmark.sh, NOT a compose one-shot: a seed service
+# would be re-run by _ensure_otterstax's backend `up -d` on a mid-run restart and
+# double the topic (Kafka produce is not idempotent, unlike MinIO's `mc cp`).
+# bench-otterstax reaches the broker at bench_kafka:9092; 19092 is only for
+# host-run (--local) debugging.
+
+services:
+  bench_kafka:
+    image: redpandadata/redpanda:v25.3.15
+    container_name: bench_kafka
+    command:
+      - redpanda
+      - start
+      - --mode=dev-container
+      - --smp=1
+      - --default-log-level=warn
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr=internal://bench_kafka:9092,external://127.0.0.1:19092
+    expose:
+      - "9092"
+    ports:
+      - "19092:19092"
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true'"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+    networks:
+      - bench_net
+    restart: unless-stopped
+
+networks:
+  bench_net:
+    name: bench_net
+    external: true

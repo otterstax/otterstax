@@ -247,7 +247,7 @@ echo "✅ Previous containers and volumes removed"
 echo ""
 echo "=== Step 2: Starting databases ==="
 echo ""
-compose up -d mariadb1 mariadb2 postgres1 clickhouse1
+compose up -d mariadb1 mariadb2 postgres1 clickhouse1 kafka
 
 # MinIO for the s3 external-table tests; minio-init seeds test-bucket then exits.
 echo "🪣 Starting MinIO + seeding test-bucket..."
@@ -475,6 +475,12 @@ if $TRACY_SEP; then
         "MySQL Client (JOIN otterbrix-local ⋈ s3 parquet):test_mysql_join_otb_local_s3.py"
         "MySQL Client (JOIN sql backend ⋈ otterbrix-local, string key):test_mysql_join_otb_local_backend.py"
         "MySQL Client (JOIN s3 parquet ⋈ file csv ⋈ otterbrix-local):test_mysql_join_otb_local_s3_file.py"
+        "Kafka SOURCE Ingestion (PostgreSQL wire):test_kafka_source_ingestion.py"
+        "Kafka SOURCE Exactly-Once (PostgreSQL wire):test_kafka_exactly_once_source.py"
+        "Kafka INSERT-Produce (PostgreSQL wire):test_kafka_insert_produce.py"
+        "Kafka Continuous STREAM (PostgreSQL wire):test_kafka_stream.py"
+        "Kafka STREAM Exactly-Once (PostgreSQL wire):test_kafka_exactly_once.py"
+        "Kafka STREAM Write / INSERT VALUES (PostgreSQL wire):test_kafka_stream_write.py"
     )
 
     SEP_PASSED=0
@@ -587,6 +593,46 @@ else
     # Standard mode: run all tests in a single container via the startup script.
     compose run --rm --use-aliases test-client bash -c "/app/startup.sh"
     TEST_RC=$?
+fi
+
+if ! $ENABLE_TRACY && [ "${ENABLE_ASAN:-OFF}" != "ON" ] && [ "${ENABLE_TSAN:-OFF}" != "ON" ]; then
+    echo ""
+    echo "=== Step 8c: Kafka crash-recovery (exactly-once through kill -9) ==="
+    echo ""
+
+    echo "♻️  Recreating test-otterstax for a clean data dir..."
+    compose rm -sf test-otterstax >/dev/null 2>&1 || true
+    compose up -d test-otterstax
+
+    echo "🕒 Waiting for otterstax to be healthy..."
+    _crash_ready=false
+    for ((i=1;i<=WAIT_RETRIES;i++)); do
+        if compose_exec test-otterstax curl -s -f http://localhost:8085/health >/dev/null 2>&1; then
+            echo "✅ Otterstax is healthy"
+            _crash_ready=true
+            break
+        fi
+        sleep ${WAIT_SLEEP}
+    done
+
+    if ! $_crash_ready; then
+        echo "❌ otterstax not healthy before crash test"
+        compose logs test-otterstax | tail -30
+        TEST_RC=1
+    else
+        compose run --rm --use-aliases \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            test-client python test_kafka_crash_recovery.py --docker-container test_otterstax_app
+        _crash_rc=$?
+        if [ $_crash_rc -eq 0 ]; then
+            echo "✅ PASSED: Kafka crash-recovery"
+        else
+            echo "❌ FAILED: Kafka crash-recovery (exit code $_crash_rc)"
+            echo "--- otterstax logs (last 40 lines) ---"
+            compose logs test-otterstax 2>/dev/null | tail -40
+            TEST_RC=1
+        fi
+    fi
 fi
 
 echo ""

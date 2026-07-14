@@ -50,9 +50,12 @@ RUN if [ "$TSAN_DEPS" = "true" ]; then \
 # the devcontainer preset layout exactly.
 WORKDIR /app
 COPY conanfile.py tsan-deps.profile ./
+COPY cmake/conan-hooks/hook_librdkafka_c11threads_off.py ./conan-hooks/
 RUN if [ "$TSAN_DEPS" = "true" ]; then \
+        mkdir -p /root/.conan2/extensions/hooks && \
+        cp ./conan-hooks/hook_librdkafka_c11threads_off.py /root/.conan2/extensions/hooks/ && \
         conan install conanfile.py --build missing \
-            --build="otterbrix/*" --build="actor-zeta/*" \
+            --build="otterbrix/*" --build="actor-zeta/*" --build="librdkafka/*" \
             -pr:h ./tsan-deps.profile \
             -s build_type=${BUILD_TYPE} \
             -s compiler.cppstd=gnu20 \

@@ -56,6 +56,7 @@ class OtterStax(ConanFile):
         self.requires("libpq/15.4")
         self.requires("yaml-cpp/0.7.0")
         self.requires("clickhouse-cpp/2.6.1")
+        self.requires("librdkafka/2.14.2")
 
     def config_options(self):
         if self.settings.os == "Windows":

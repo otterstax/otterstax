@@ -24,7 +24,8 @@ Scheduler::Scheduler(std::pmr::memory_resource* res,
                      actor_zeta::address_t otterbrix_manager,
                      actor_zeta::address_t catalog_manager,
                      actor_zeta::address_t s3_manager,
-                     actor_zeta::address_t file_manager)
+                     actor_zeta::address_t file_manager,
+                     actor_zeta::address_t kafka_manager)
     : resource_(res)
     , scheduler_(scheduler)
     , log_(get_logger(logger_tag::SCHEDULER))
@@ -55,7 +56,8 @@ Scheduler::Scheduler(std::pmr::memory_resource* res,
                                                 otterbrix_manager,
                                                 catalog_manager,
                                                 s3_manager,
-                                                file_manager);
+                                                file_manager,
+                                                kafka_manager);
         worker_addresses_.push_back(worker->address());
         workers_.push_back(std::move(worker));
     }

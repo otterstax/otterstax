@@ -4,8 +4,8 @@
 #include "connection_manager.hpp"
 
 #include "otterbrix/query_generation/sql_query_generator.hpp"
+#include "otterbrix/schema/schema_utils.hpp"
 #include "otterbrix/translators/input/ch_to_chunk.hpp"
-#include "scheduler/schema_utils.hpp"
 #include "utility/cv_wrapper.hpp"
 #include "utility/logger.hpp"
 #include "utility/tracy_profiler.hpp"
@@ -54,8 +54,8 @@ actor_zeta::behavior_t ClickhouseManager::behavior(actor_zeta::mailbox::message*
     }
 }
 
-actor_zeta::unique_future<core::result_wrapper_t<ParsedQueryDataPtr>> ClickhouseManager::execute(session_hash_t id,
-                                                                                                 ParsedQueryDataPtr data) {
+actor_zeta::unique_future<core::result_wrapper_t<ParsedQueryDataPtr>>
+ClickhouseManager::execute(session_hash_t id, ParsedQueryDataPtr data) {
     OTX_ZONE_N("ClickhouseManager::execute");
     assert(data);
     try {

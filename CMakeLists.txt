@@ -77,6 +77,7 @@ find_package(Boost 1.87.0 REQUIRED COMPONENTS
 find_package(PostgreSQL REQUIRED)
 find_package(yaml-cpp REQUIRED)
 find_package(clickhouse-cpp REQUIRED)
+find_package(RdKafka REQUIRED)
 if(ENABLE_TRACY)
     find_package(Tracy REQUIRED)
     add_compile_definitions(TRACY_ENABLE)
@@ -141,7 +142,7 @@ target_link_libraries(
     # one of them pulls (e.g. integration/s3/s3_manager.o, referenced solely by
     # the Scheduler). RESCAN groups them (--start-group/--end-group) so the
     # linker re-pulls until the cycle is fully resolved.
-    "$<LINK_GROUP:RESCAN,flight_sql_server,common_server,mysql_server,postgres_server,catalog,connectors,s3,file,api_server,component_manager,integration,otterbrix_local,scheduler>"
+    "$<LINK_GROUP:RESCAN,flight_sql_server,common_server,mysql_server,postgres_server,catalog,connectors,s3,file,api_server,component_manager,integration,otterbrix_local,scheduler,kafka_grammar,kafka_runtime>"
     config::config
     arrow::arrow
     Boost::boost

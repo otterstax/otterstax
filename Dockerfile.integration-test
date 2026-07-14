@@ -6,6 +6,7 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y \
     build-essential \
     curl \
+    docker.io \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies including Faker
@@ -19,7 +20,8 @@ RUN pip install --no-cache-dir \
     clickhouse-driver \
     tabulate \
     faker \
-    requests
+    requests \
+    confluent-kafka
 
 # Copy application files. All top-level tests/*.py (helpers + test_*.py) are
 # pulled in via a single wildcard so a newly-added test doesn't need a matching

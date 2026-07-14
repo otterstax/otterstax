@@ -1,13 +1,11 @@
 set(SCHEDULER_HEADERS
     scheduler.hpp
-    schema_utils.hpp
     session_data.hpp
     worker.hpp
 )
 
 set(SCHEDULER_SOURCES
     scheduler.cpp
-    schema_utils.cpp
     worker.cpp
 )
 
@@ -27,6 +25,7 @@ target_link_libraries(scheduler PUBLIC
     # queue (header-only via Boost::boost); link the thread runtime explicitly so
     # the scheduler library is self-contained rather than relying on the parent.
     Threads::Threads
+    otterbrix_local
 )
 
 target_include_directories(scheduler PUBLIC

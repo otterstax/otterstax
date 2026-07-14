@@ -4,9 +4,9 @@
 #include "connection_server.hpp"
 #include <optional>
 
-#include "ch_connection_config.hpp"
-#include "connection_config.hpp"
-#include "pg_connection_config.hpp"
+#include "../api_connections/ch_connection_config.hpp"
+#include "../api_connections/connection_config.hpp"
+#include "../api_connections/pg_connection_config.hpp"
 #include "utility/tracy_profiler.hpp"
 
 namespace {

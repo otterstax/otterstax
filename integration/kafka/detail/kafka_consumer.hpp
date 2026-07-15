@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include "kafka_producer.hpp"
+
 #include <core/result_wrapper.hpp>
 
 #include <chrono>
@@ -17,7 +19,6 @@ namespace RdKafka {
 } // namespace RdKafka
 
 namespace otterstax::kafka::detail {
-    class kafka_producer_t;
     struct offset_rebalance_cb;
 
     struct kafka_record_t {
@@ -58,15 +59,15 @@ namespace otterstax::kafka::detail {
         // Exactly-once: add this batch's positions (last offset + 1 per partition) to
         // `producer`'s open transaction, tagged with this consumer's group metadata, so
         // the produce and the source-offset advance commit atomically. All RdKafka
-        // pointers are owned and freed here. Throws on a transaction error
-        void send_offsets_to_transaction(kafka_producer_t& producer,
-                                         const std::vector<kafka_record_t>& batch,
-                                         std::chrono::milliseconds timeout);
+        // pointers are owned and freed here
+        [[nodiscard]] kafka_txn_result send_offsets_to_transaction(kafka_producer_t& producer,
+                                                                   const std::vector<kafka_record_t>& batch,
+                                                                   std::chrono::milliseconds timeout);
 
         // Exactly-once abort recovery: rewind the in-memory fetch position to the start
         // of `batch` so it is re-delivered next poll (consume() already moved past it,
-        // but an aborted txn never advanced the broker offset). Throws on a seek error
-        void seek_to_batch_start(const std::vector<kafka_record_t>& batch);
+        // but an aborted txn never advanced the broker offset)
+        [[nodiscard]] core::error_t seek_to_batch_start(const std::vector<kafka_record_t>& batch);
 
     private:
         kafka_consumer_t(std::unique_ptr<offset_rebalance_cb> rebalance_cb,

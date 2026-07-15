@@ -103,9 +103,10 @@ namespace otterstax::kafka::detail {
                         components::session::session_id_t session,
                         const std::string& sql);
 
-    // Parse core SQL to an execution_plan_t without executing (throws on a parse error)
-    components::logical_plan::execution_plan_t kafka_parse_plan(std::pmr::memory_resource* resource,
-                                                                const std::string& sql);
+    // Parse core SQL to an execution_plan_t without executing. The SQL parser is a
+    // throwing third-party boundary — that is contained here and surfaced as an error
+    core::result_wrapper_t<components::logical_plan::execution_plan_t>
+    kafka_parse_plan(std::pmr::memory_resource* resource, const std::string& sql);
 
     // Send a pre-built execution_plan_t to the dispatcher
     actor_zeta::unique_future<components::cursor::cursor_t_ptr>

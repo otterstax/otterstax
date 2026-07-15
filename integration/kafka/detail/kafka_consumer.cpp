@@ -2,6 +2,7 @@
 // Copyright 2025-2026  OtterStax
 
 #include "kafka_consumer.hpp"
+#include "kafka_const.hpp"
 #include "kafka_producer.hpp"
 #include "utility/tracy_profiler.hpp"
 
@@ -10,12 +11,9 @@
 #include <algorithm>
 #include <map>
 #include <memory>
-#include <stdexcept>
 
 namespace otterstax::kafka::detail {
     namespace {
-        constexpr int SEEK_TIMEOUT_MS = 5000;
-
         core::error_t consumer_error(const std::string& msg) {
             return core::error_t(core::error_code_t::other_error, std::pmr::string("kafka consumer: " + msg));
         }
@@ -97,7 +95,7 @@ namespace otterstax::kafka::detail {
         OTX_ZONE_N("kafka::consumer::poll_batch");
         std::vector<kafka_record_t> batch;
         batch.reserve(max_records);
-        const int timeout_ms = static_cast<int>(timeout.count());
+        const auto timeout_ms = to_ms(timeout);
 
         while (batch.size() < max_records) {
             std::unique_ptr<RdKafka::Message> msg(consumer_->consume(timeout_ms));
@@ -123,12 +121,12 @@ namespace otterstax::kafka::detail {
         }
     }
 
-    void kafka_consumer_t::send_offsets_to_transaction(kafka_producer_t& producer,
-                                                       const std::vector<kafka_record_t>& batch,
-                                                       std::chrono::milliseconds timeout) {
+    kafka_txn_result kafka_consumer_t::send_offsets_to_transaction(kafka_producer_t& producer,
+                                                                   const std::vector<kafka_record_t>& batch,
+                                                                   std::chrono::milliseconds timeout) {
         OTX_ZONE_N("kafka::consumer::send_offsets_to_transaction");
         if (batch.empty()) {
-            return;
+            return kafka_txn_result{};
         }
 
         std::map<int32_t, int64_t> next_offset;
@@ -146,17 +144,17 @@ namespace otterstax::kafka::detail {
 
         struct offsets_guard {
             std::vector<RdKafka::TopicPartition*>& v;
-            ~offsets_guard() { RdKafka::TopicPartition::destroy(v); } // free on every path incl. throw
+            ~offsets_guard() { RdKafka::TopicPartition::destroy(v); } // free on every return path
         } guard{offsets};
 
         std::unique_ptr<RdKafka::ConsumerGroupMetadata> group_metadata(consumer_->groupMetadata());
-        producer.send_offsets_to_transaction(offsets, group_metadata.get(), timeout); // throws on txn error
+        return producer.send_offsets_to_transaction(offsets, group_metadata.get(), timeout);
     }
 
-    void kafka_consumer_t::seek_to_batch_start(const std::vector<kafka_record_t>& batch) {
+    core::error_t kafka_consumer_t::seek_to_batch_start(const std::vector<kafka_record_t>& batch) {
         OTX_ZONE_N("kafka::consumer::seek_to_batch_start");
         if (batch.empty()) {
-            return;
+            return core::error_t::no_error();
         }
         // Rewind each partition to the first offset consumed in this batch — where we
         // would have resumed had the transaction committed
@@ -169,9 +167,10 @@ namespace otterstax::kafka::detail {
         }
         for (const auto& [partition, offset] : first_offset) {
             std::unique_ptr<RdKafka::TopicPartition> tp(RdKafka::TopicPartition::create(topic_, partition, offset));
-            if (auto err = consumer_->seek(*tp, SEEK_TIMEOUT_MS); err != RdKafka::ERR_NO_ERROR) {
-                throw std::runtime_error("kafka consumer: seek '" + topic_ + "' failed: " + RdKafka::err2str(err));
+            if (auto err = consumer_->seek(*tp, to_ms(SEEK_TIMEOUT)); err != RdKafka::ERR_NO_ERROR) {
+                return consumer_error("seek '" + topic_ + "' failed: " + RdKafka::err2str(err));
             }
         }
+        return core::error_t::no_error();
     }
 } // namespace otterstax::kafka::detail

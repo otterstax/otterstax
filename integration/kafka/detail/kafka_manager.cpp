@@ -2,6 +2,7 @@
 // Copyright 2025-2026  OtterStax
 
 #include "integration/kafka/kafka_manager.hpp"
+#include "kafka_const.hpp"
 #include "kafka_poller.hpp"
 #include "kafka_producer.hpp"
 #include "kafka_reader.hpp"
@@ -28,10 +29,6 @@
 namespace otterstax::kafka {
     using namespace components;
     using namespace detail;
-
-    namespace {
-        constexpr std::chrono::microseconds LOOP_IDLE_STEP{100};
-    } // namespace
 
     KafkaManager::KafkaManager(std::pmr::memory_resource* resource,
                                actor_zeta::address_t engine_dispatcher_address,

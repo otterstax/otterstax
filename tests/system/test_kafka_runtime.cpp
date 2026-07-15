@@ -459,8 +459,9 @@ TEST_CASE("kafka stream node-swap: aggregate(empty)+raw_data applies the SELECT"
     // (empty relname) so the parsed match+select chains over the raw_data batch
     {
         auto plan = otterstax::kafka::detail::kafka_parse_plan(resource, "SELECT id, name FROM kafka.s WHERE id > 2;");
-        REQUIRE_FALSE(plan.sub_queries.empty());
-        auto stream_src = otterstax::kafka::kafka_stream_source(resource, plan.sub_queries.back());
+        REQUIRE_FALSE(plan.has_error());
+        REQUIRE_FALSE(plan.value().sub_queries.empty());
+        auto stream_src = otterstax::kafka::kafka_stream_source(resource, plan.value().sub_queries.back());
         REQUIRE(stream_src);
         CHECK(stream_src->source_relname == "s");
         CHECK(stream_src->operators.size() == 2); // $match + $select
@@ -474,7 +475,7 @@ TEST_CASE("kafka stream node-swap: aggregate(empty)+raw_data applies the SELECT"
         auto cursor = drive_until_ready(
             otterstax::kafka::detail::kafka_execute(addr,
                                                     resource,
-                                                    lp::execution_plan_t{resource, agg, plan.parameters}));
+                                                    lp::execution_plan_t{resource, agg, plan.value().parameters}));
         REQUIRE(cursor);
         REQUIRE_FALSE(cursor->is_error());
         CHECK(cursor->size() == 3); // id 3,4,5 survive WHERE id > 2 (operators re-homed)
@@ -758,10 +759,14 @@ TEST_CASE("kafka stream write: SELECT output schema is derived; INSERT routes to
             {"name", ty::complex_logical_type(ty::logical_type::STRING_LITERAL)}};
         auto schema_of = [&](const std::string& sql) {
             auto plan = otterstax::kafka::detail::kafka_parse_plan(resource, sql);
-            REQUIRE_FALSE(plan.sub_queries.empty());
-            const auto* agg = otterstax::kafka::kafka_find_aggregate(plan.sub_queries.back());
+            REQUIRE_FALSE(plan.has_error());
+            REQUIRE_FALSE(plan.value().sub_queries.empty());
+            const auto* agg = otterstax::kafka::kafka_find_aggregate(plan.value().sub_queries.back());
             REQUIRE(agg != nullptr);
-            return otterstax::kafka::detail::stream_output_schema(resource, *agg, plan.parameters.get(), source_cols);
+            return otterstax::kafka::detail::stream_output_schema(resource,
+                                                                  *agg,
+                                                                  plan.value().parameters.get(),
+                                                                  source_cols);
         };
 
         auto proj = schema_of("SELECT id, name FROM kafka.s WHERE id > 2;");

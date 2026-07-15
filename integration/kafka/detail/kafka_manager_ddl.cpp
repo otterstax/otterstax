@@ -83,7 +83,7 @@ namespace otterstax::kafka {
 
     actor_zeta::unique_future<cursor::cursor_t_ptr> KafkaManager::execute(session_hash_t id, kafka_node_ptr node) {
         OTX_ZONE_N("KafkaManager::execute");
-        log_->debug("execute id {}: kafka op {} name {}", id, static_cast<int>(node->op()), node->name());
+        log_->debug("execute id {}: kafka op {} name {}", id, static_cast<int32_t>(node->op()), node->name());
         try {
             switch (node->op()) {
                 case kafka_op::create_source:
@@ -157,24 +157,25 @@ namespace otterstax::kafka {
 
     actor_zeta::unique_future<cursor::cursor_t_ptr> KafkaManager::handle_create_stream(kafka_node_ptr node) {
         // STREAM is a continuous query (no user table); its schema is the SELECT's
-        // output columns. The local try turns any parse/schema failure into a DDL error
-        std::vector<kafka_column_t> stream_columns;
-        try {
-            auto plan = kafka_parse_plan(resource_, node->as_select());
-            const auto* agg = plan.sub_queries.empty() ? nullptr : kafka_find_aggregate(plan.sub_queries.back());
-            if (!agg) {
-                throw std::runtime_error("stream SELECT has no aggregate/source table");
-            }
-            const auto src_it = registry_.find(agg->relname().t);
-            if (src_it == registry_.end()) {
-                throw std::runtime_error("unknown source '" + agg->relname().t + "'");
-            }
-            stream_columns = stream_output_schema(resource_, *agg, plan.parameters.get(), src_it->second.columns);
-        } catch (const std::exception& e) {
-            co_return error_cursor(resource_,
-                                   core::error_code_t::other_error,
-                                   std::string{"kafka: stream SELECT invalid: "} + e.what());
+        // output columns. Any parse/schema failure becomes a DDL error
+        auto invalid = [&](const std::string& why) {
+            return error_cursor(resource_, core::error_code_t::other_error, "kafka: stream SELECT invalid: " + why);
+        };
+        auto plan = kafka_parse_plan(resource_, node->as_select());
+        if (plan.has_error()) {
+            co_return invalid(plan.error().what.c_str());
         }
+        const auto* agg =
+            plan.value().sub_queries.empty() ? nullptr : kafka_find_aggregate(plan.value().sub_queries.back());
+        if (!agg) {
+            co_return invalid("SELECT has no aggregate/source table");
+        }
+        const auto src_it = registry_.find(agg->relname().t);
+        if (src_it == registry_.end()) {
+            co_return invalid("unknown source '" + agg->relname().t + "'");
+        }
+        auto stream_columns =
+            stream_output_schema(resource_, *agg, plan.value().parameters.get(), src_it->second.columns);
 
         registry_[node->name()] = kafka_object_t{node->op(), stream_columns, node->options(), node->as_select()};
         log_->info("kafka: registered stream '{}' ({} output columns)", node->name(), stream_columns.size());

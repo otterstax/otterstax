@@ -2,7 +2,9 @@
 // Copyright 2025-2026  OtterStax
 
 #include "kafka_poller.hpp"
+#include "kafka_const.hpp"
 #include "kafka_reader.hpp"
+#include "utility/logger.hpp"
 #include "utility/tracy_profiler.hpp"
 
 #include <components/session/session.hpp>
@@ -18,10 +20,6 @@
 namespace otterstax::kafka::detail {
     namespace {
         // The poller has its own thread and therefore parks between is_ready checks
-        constexpr std::chrono::microseconds ENGINE_POLL_STEP{100};
-        constexpr std::size_t MAX_BATCH = 500;
-        constexpr std::chrono::milliseconds POLL_TIMEOUT{200};
-
         bool drive_ok(actor_zeta::unique_future<components::cursor::cursor_t_ptr> future) {
             while (!future.is_ready()) {
                 std::this_thread::sleep_for(ENGINE_POLL_STEP);
@@ -117,13 +115,19 @@ namespace otterstax::kafka::detail {
         }
 
         if (!ok) {
-            // Roll back + rewind so the batch is reprocessed next poll (no broker
-            // commit — the offsets table is the source of truth)
+            get_logger(logger_tag::KAFKA_MANAGER)
+                ->error("kafka poller: transactional batch for '{}.{}' failed; rolling back + rewinding {} record(s)",
+                        database_,
+                        table_,
+                        batch.size());
             std::ignore = drive_ok(kafka_query_session(dispatcher_address_, resource_, session, "ROLLBACK;"));
-            try {
-                consumer_.seek_to_batch_start(batch);
-            } catch (const std::exception&) {
-                // A failed seek is non-fatal — restart's table-seek still resumes
+            // A failed seek is non-fatal — restart's table-seek still resumes
+            if (auto error = consumer_.seek_to_batch_start(batch); error.contains_error()) {
+                get_logger(logger_tag::KAFKA_MANAGER)
+                    ->error("kafka poller: seek after rollback failed for '{}.{}': {}",
+                            database_,
+                            table_,
+                            error.what.c_str());
             }
         }
         // EOS path: deliberately NO consumer_.commit() — the offsets table is truth

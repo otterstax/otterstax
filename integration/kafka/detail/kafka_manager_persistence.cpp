@@ -2,6 +2,7 @@
 // Copyright 2025-2026  OtterStax
 
 #include "integration/kafka/kafka_manager.hpp"
+#include "kafka_const.hpp"
 #include "kafka_poller.hpp"
 #include "kafka_producer.hpp"
 #include "kafka_reader.hpp"
@@ -31,7 +32,7 @@ namespace otterstax::kafka {
         // Drive a dispatcher reply to completion on this (non-loop) thread
         cursor::cursor_t_ptr drive(actor_zeta::unique_future<cursor::cursor_t_ptr> future) {
             while (!future.is_ready()) {
-                std::this_thread::sleep_for(std::chrono::microseconds(100));
+                std::this_thread::sleep_for(ENGINE_POLL_STEP);
             }
             return std::move(future).take_ready();
         }
@@ -183,22 +184,24 @@ namespace otterstax::kafka {
             if (m.kind != "stream") {
                 continue;
             }
-            std::vector<kafka_column_t> stream_columns;
-            try {
-                auto plan = kafka_parse_plan(resource_, m.as_select);
-                const auto* agg = plan.sub_queries.empty() ? nullptr : kafka_find_aggregate(plan.sub_queries.back());
-                if (!agg) {
-                    throw std::runtime_error("stream SELECT has no aggregate/source");
-                }
-                const auto src_it = registry_.find(agg->relname().t);
-                if (src_it == registry_.end()) {
-                    throw std::runtime_error("unknown source '" + agg->relname().t + "'");
-                }
-                stream_columns = stream_output_schema(resource_, *agg, plan.parameters.get(), src_it->second.columns);
-            } catch (const std::exception& e) {
-                log_->warn("kafka: recover stream '{}': {}, skipping", m.name, e.what());
+            auto plan = kafka_parse_plan(resource_, m.as_select);
+            if (plan.has_error()) {
+                log_->warn("kafka: recover stream '{}': {}, skipping", m.name, plan.error().what.c_str());
                 continue;
             }
+            const auto* agg =
+                plan.value().sub_queries.empty() ? nullptr : kafka_find_aggregate(plan.value().sub_queries.back());
+            if (!agg) {
+                log_->warn("kafka: recover stream '{}': SELECT has no aggregate/source, skipping", m.name);
+                continue;
+            }
+            const auto src_it = registry_.find(agg->relname().t);
+            if (src_it == registry_.end()) {
+                log_->warn("kafka: recover stream '{}': unknown source '{}', skipping", m.name, agg->relname().t);
+                continue;
+            }
+            auto stream_columns =
+                stream_output_schema(resource_, *agg, plan.value().parameters.get(), src_it->second.columns);
             registry_[m.name] =
                 kafka_object_t{kafka_op::create_stream, std::move(stream_columns), make_options(m), m.as_select};
             launch_stream(m.name);
@@ -211,31 +214,33 @@ namespace otterstax::kafka {
             if (m.kind != "insert") {
                 continue;
             }
-            std::string sink;
-            std::vector<kafka_column_t> out_columns;
-            try {
-                auto plan = kafka_parse_plan(resource_, m.as_select);
-                if (plan.sub_queries.empty()) {
-                    throw std::runtime_error("persisted INSERT compiled to an empty plan");
-                }
-                auto write = kafka_write_target(plan.sub_queries.back());
-                if (!write) {
-                    throw std::runtime_error("persisted INSERT has no kafka target");
-                }
-                sink = write->relname;
-                const auto* agg = kafka_find_aggregate(plan.sub_queries.back());
-                if (!agg) {
-                    throw std::runtime_error("persisted INSERT has no source table");
-                }
-                const auto src_it = registry_.find(agg->relname().t);
-                if (src_it == registry_.end()) {
-                    throw std::runtime_error("unknown source '" + agg->relname().t + "'");
-                }
-                out_columns = stream_output_schema(resource_, *agg, plan.parameters.get(), src_it->second.columns);
-            } catch (const std::exception& e) {
-                log_->warn("kafka: recover insert-query '{}': {}, skipping", m.name, e.what());
+            auto plan = kafka_parse_plan(resource_, m.as_select);
+            if (plan.has_error()) {
+                log_->warn("kafka: recover insert-query '{}': {}, skipping", m.name, plan.error().what.c_str());
                 continue;
             }
+            if (plan.value().sub_queries.empty()) {
+                log_->warn("kafka: recover insert-query '{}': compiled to an empty plan, skipping", m.name);
+                continue;
+            }
+            auto write = kafka_write_target(plan.value().sub_queries.back());
+            if (!write) {
+                log_->warn("kafka: recover insert-query '{}': no kafka target, skipping", m.name);
+                continue;
+            }
+            const std::string sink = write->relname;
+            const auto* agg = kafka_find_aggregate(plan.value().sub_queries.back());
+            if (!agg) {
+                log_->warn("kafka: recover insert-query '{}': no source table, skipping", m.name);
+                continue;
+            }
+            const auto src_it = registry_.find(agg->relname().t);
+            if (src_it == registry_.end()) {
+                log_->warn("kafka: recover insert-query '{}': unknown source '{}', skipping", m.name, agg->relname().t);
+                continue;
+            }
+            auto out_columns =
+                stream_output_schema(resource_, *agg, plan.value().parameters.get(), src_it->second.columns);
             registry_[m.name] =
                 kafka_object_t{kafka_op::create_stream, std::move(out_columns), make_options(m), m.as_select};
             stream_insert_queries_[sink].push_back(m.name);
@@ -298,71 +303,70 @@ namespace otterstax::kafka {
         if (it == registry_.end()) {
             return;
         }
-        try {
-            // Compile the captured SELECT once; extract the source table + operators
-            auto plan = kafka_parse_plan(resource_, it->second.as_select);
-            if (plan.sub_queries.empty()) {
-                throw std::runtime_error("stream SELECT compiled to an empty plan");
-            }
-            auto stream_src = kafka_stream_source(resource_, plan.sub_queries.back());
-            if (!stream_src) {
-                throw std::runtime_error("stream SELECT has no source table");
-            }
-            // The source must already be in registry_ (recover() does sources first)
-            auto src_it = registry_.find(stream_src->source_relname);
-            if (src_it == registry_.end()) {
-                throw std::runtime_error("unknown source '" + stream_src->source_relname + "'");
-            }
-            const auto& src_opts = src_it->second.options;
-            const auto src_topic = src_opts.find("kafka_topic");
-            const auto src_bootstrap = src_opts.find("bootstrap_servers");
-            if (src_topic == src_opts.end() || src_bootstrap == src_opts.end()) {
-                throw std::runtime_error("source '" + stream_src->source_relname +
-                                         "' has no KAFKA_TOPIC/BOOTSTRAP_SERVERS");
-            }
-            const auto& opts = it->second.options;
-            const auto out_topic = opts.find("kafka_topic");
-            const auto out_bootstrap = opts.find("bootstrap_servers");
-            if (out_topic == opts.end() || out_bootstrap == opts.end()) {
-                throw std::runtime_error("stream has no KAFKA_TOPIC/BOOTSTRAP_SERVERS");
-            }
-            const auto gid = opts.find("group_id");
-            const std::string group_id = gid != opts.end() ? gid->second : ("otterstax_stream_" + name);
-            const auto ores = opts.find("offset_reset");
-            const std::string offset_reset = ores != opts.end() ? ores->second : "earliest";
-            // TRANSACTIONAL already validated at CREATE STREAM (DDL); 'true' -> a stable
-            // transactional id (exactly-once producer). Value stored verbatim, so fold
-            std::string transactional_id;
-            if (const auto t = opts.find("transactional"); t != opts.end()) {
-                std::string value = t->second;
-                std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
-                    return static_cast<char>(std::tolower(c));
-                });
-                if (value == "true") {
-                    transactional_id = "otterstax_stream_" + name;
-                }
-            }
-
-            auto consumer =
-                kafka_consumer_t::create({src_bootstrap->second, src_topic->second, group_id, offset_reset, {}});
-            if (consumer.has_error()) {
-                log_->error("kafka: stream '{}' consumer failed: {}", name, consumer.error().what.c_str());
-                return;
-            }
-            auto producer = kafka_producer_t::create({out_bootstrap->second, out_topic->second, transactional_id});
-            if (producer.has_error()) {
-                log_->error("kafka: stream '{}' producer failed: {}", name, producer.error().what.c_str());
-                return;
-            }
-            streams_[name] = std::make_unique<kafka_stream_t>(
-                dispatcher_address_,
-                resource_,
-                stream_transform_t{src_it->second.columns, std::move(stream_src->operators), plan.parameters},
-                std::move(consumer.value()),
-                std::move(producer.value()));
-            log_->info("kafka: started stream '{}' ({} -> {})", name, src_topic->second, out_topic->second);
-        } catch (const std::exception& e) {
-            log_->error("kafka: stream start failed for '{}': {}", name, e.what());
+        auto start_failed = [&](const std::string& why) {
+            log_->error("kafka: stream start failed for '{}': {}", name, why);
+        };
+        // Compile the captured SELECT once; extract the source table + operators
+        auto plan = kafka_parse_plan(resource_, it->second.as_select);
+        if (plan.has_error()) {
+            return start_failed(plan.error().what.c_str());
         }
+        if (plan.value().sub_queries.empty()) {
+            return start_failed("stream SELECT compiled to an empty plan");
+        }
+        auto stream_src = kafka_stream_source(resource_, plan.value().sub_queries.back());
+        if (!stream_src) {
+            return start_failed("stream SELECT has no source table");
+        }
+        // The source must already be in registry_ (recover() does sources first)
+        auto src_it = registry_.find(stream_src->source_relname);
+        if (src_it == registry_.end()) {
+            return start_failed("unknown source '" + stream_src->source_relname + "'");
+        }
+        const auto& src_opts = src_it->second.options;
+        const auto src_topic = src_opts.find("kafka_topic");
+        const auto src_bootstrap = src_opts.find("bootstrap_servers");
+        if (src_topic == src_opts.end() || src_bootstrap == src_opts.end()) {
+            return start_failed("source '" + stream_src->source_relname + "' has no KAFKA_TOPIC/BOOTSTRAP_SERVERS");
+        }
+        const auto& opts = it->second.options;
+        const auto out_topic = opts.find("kafka_topic");
+        const auto out_bootstrap = opts.find("bootstrap_servers");
+        if (out_topic == opts.end() || out_bootstrap == opts.end()) {
+            return start_failed("stream has no KAFKA_TOPIC/BOOTSTRAP_SERVERS");
+        }
+        const auto gid = opts.find("group_id");
+        const std::string group_id = gid != opts.end() ? gid->second : ("otterstax_stream_" + name);
+        const auto ores = opts.find("offset_reset");
+        const std::string offset_reset = ores != opts.end() ? ores->second : "earliest";
+        // TRANSACTIONAL already validated at CREATE STREAM (DDL); 'true' -> a stable
+        // transactional id (exactly-once producer). Value stored verbatim, so fold
+        std::string transactional_id;
+        if (const auto t = opts.find("transactional"); t != opts.end()) {
+            std::string value = t->second;
+            std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+                return static_cast<char>(std::tolower(c));
+            });
+            if (value == "true") {
+                transactional_id = "otterstax_stream_" + name;
+            }
+        }
+
+        auto consumer =
+            kafka_consumer_t::create({src_bootstrap->second, src_topic->second, group_id, offset_reset, {}});
+        if (consumer.has_error()) {
+            return start_failed(std::string{"consumer failed: "} + consumer.error().what.c_str());
+        }
+        auto producer = kafka_producer_t::create({out_bootstrap->second, out_topic->second, transactional_id});
+        if (producer.has_error()) {
+            return start_failed(std::string{"producer failed: "} + producer.error().what.c_str());
+        }
+        streams_[name] = std::make_unique<kafka_stream_t>(
+            dispatcher_address_,
+            resource_,
+            stream_transform_t{src_it->second.columns, std::move(stream_src->operators), plan.value().parameters},
+            std::move(consumer.value()),
+            std::move(producer.value()));
+        log_->info("kafka: started stream '{}' ({} -> {})", name, src_topic->second, out_topic->second);
     }
 } // namespace otterstax::kafka

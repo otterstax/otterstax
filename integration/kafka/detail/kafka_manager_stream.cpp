@@ -2,6 +2,7 @@
 // Copyright 2025-2026  OtterStax
 
 #include "integration/kafka/kafka_manager.hpp"
+#include "kafka_const.hpp"
 #include "kafka_poller.hpp"
 #include "kafka_producer.hpp"
 #include "kafka_reader.hpp"
@@ -101,29 +102,34 @@ namespace otterstax::kafka {
                         std::pmr::string{std::string{"kafka: "} + producer_r.error().what.c_str(), resource_}));
             }
             kafka_producer_t& producer = *producer_r.value();
-            try {
-                // Atomic batch: the whole VALUES set is one Kafka transaction. On any
-                // error, abort (best-effort) and surface it — nothing partial is visible
-                producer.begin_transaction();
-                try {
-                    for (const auto& payload : payloads) {
-                        producer.produce(payload);
-                    }
-                    producer.commit_transaction(std::chrono::seconds(10)); // flushes + commits atomically
-                } catch (...) {
-                    try {
-                        producer.abort_transaction(std::chrono::seconds(10));
-                    } catch (...) {
-                        // abort itself failed — the txn will be fenced/timed out; rethrow the original
-                    }
-                    throw;
-                }
-            } catch (const std::exception& e) {
-                log_->error("kafka: produce to '{}' failed: {}", relname, e.what());
-                co_return cursor::make_cursor(
+            // Atomic batch: the whole VALUES set is one Kafka transaction. On any error,
+            // abort (best-effort) and surface it — nothing partial is visible
+            auto failed = [&](const char* what) {
+                log_->error("kafka: produce to '{}' failed: {}", relname, what);
+                return cursor::make_cursor(
                     resource_,
                     core::error_t(core::error_code_t::other_error,
-                                  std::pmr::string{std::string{"kafka: produce failed: "} + e.what(), resource_}));
+                                  std::pmr::string{std::string{"kafka: produce failed: "} + what, resource_}));
+            };
+            auto abort = [&] {
+                // abort itself failing is not actionable — the txn gets fenced/timed out
+                if (auto status = producer.abort_transaction(TXN_TIMEOUT); !status.ok()) {
+                    log_->error("kafka: abort after a failed produce to '{}': {}", relname, status.error.what.c_str());
+                }
+            };
+
+            if (auto status = producer.begin_transaction(); !status.ok()) {
+                co_return failed(status.error.what.c_str()); // never opened — nothing to abort
+            }
+            for (const auto& payload : payloads) {
+                if (auto error = producer.produce(payload); error.contains_error()) {
+                    abort();
+                    co_return failed(error.what.c_str());
+                }
+            }
+            if (auto status = producer.commit_transaction(TXN_TIMEOUT); !status.ok()) { // flushes + commits atomically
+                abort();
+                co_return failed(status.error.what.c_str());
             }
             log_->info("kafka: produced {} record(s) to '{}' (topic '{}')", payloads.size(), relname, topic_it->second);
             co_return cursor::make_cursor(resource_);
@@ -172,27 +178,28 @@ namespace otterstax::kafka {
 
             // Compile the INSERT once: find the SELECT's source (a known kafka object)
             // and compute the output schema for the union guard
-            std::vector<kafka_column_t> out_columns;
-            std::string source_relname;
-            try {
-                auto plan = kafka_parse_plan(resource_, insert_sql);
-                const auto* agg = plan.sub_queries.empty() ? nullptr : kafka_find_aggregate(plan.sub_queries.back());
-                if (!agg) {
-                    throw std::runtime_error("INSERT ... SELECT has no source table");
-                }
-                source_relname = agg->relname().t;
-                const auto src_it = registry_.find(source_relname);
-                if (src_it == registry_.end()) {
-                    throw std::runtime_error("unknown source '" + source_relname + "'");
-                }
-                out_columns = stream_output_schema(resource_, *agg, plan.parameters.get(), src_it->second.columns);
-            } catch (const std::exception& e) {
-                co_return cursor::make_cursor(
+            auto invalid = [&](const std::string& why) {
+                return cursor::make_cursor(
                     resource_,
                     core::error_t(core::error_code_t::other_error,
-                                  std::pmr::string{std::string{"kafka: INSERT INTO ... SELECT invalid: "} + e.what(),
-                                                   resource_}));
+                                  std::pmr::string{"kafka: INSERT INTO ... SELECT invalid: " + why, resource_}));
+            };
+            auto plan = kafka_parse_plan(resource_, insert_sql);
+            if (plan.has_error()) {
+                co_return invalid(plan.error().what.c_str());
             }
+            const auto* agg =
+                plan.value().sub_queries.empty() ? nullptr : kafka_find_aggregate(plan.value().sub_queries.back());
+            if (!agg) {
+                co_return invalid("SELECT has no source table");
+            }
+            const std::string source_relname = agg->relname().t;
+            const auto src_it = registry_.find(source_relname);
+            if (src_it == registry_.end()) {
+                co_return invalid("unknown source '" + source_relname + "'");
+            }
+            auto out_columns =
+                stream_output_schema(resource_, *agg, plan.value().parameters.get(), src_it->second.columns);
 
             // Union guard: the query's output must be positionally type-compatible with
             // the stream's schema, or the shared output topic gets incompatible records

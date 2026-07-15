@@ -2,7 +2,9 @@
 // Copyright 2025-2026  OtterStax
 
 #include "kafka_stream.hpp"
+#include "kafka_const.hpp"
 #include "kafka_reader.hpp"
+#include "utility/logger.hpp"
 #include "utility/tracy_profiler.hpp"
 
 #include <components/logical_plan/execution_plan.hpp>
@@ -15,15 +17,6 @@
 namespace otterstax::kafka::detail {
 
     using namespace components;
-
-    namespace {
-        constexpr std::size_t MAX_BATCH = 500;
-        constexpr std::chrono::milliseconds POLL_TIMEOUT{200};
-        constexpr std::chrono::milliseconds FLUSH_TIMEOUT{10000};
-        constexpr std::chrono::milliseconds TXN_TIMEOUT{30000};
-        // Dedicated thread, nothing to do while the engine transforms the batch → park between is_ready checks
-        constexpr std::chrono::microseconds ENGINE_POLL_STEP{100};
-    } // namespace
 
     kafka_stream_t::kafka_stream_t(actor_zeta::address_t dispatcher_address,
                                    std::pmr::memory_resource* resource,
@@ -83,36 +76,88 @@ namespace otterstax::kafka::detail {
                 }
             }
 
+            auto log = get_logger(logger_tag::KAFKA_MANAGER);
             if (producer_.transactional()) {
                 // Exactly-once: produce + advance the source offsets in ONE txn. On
-                // failure, abort + rewind so the batch is reprocessed (a failing batch
-                // retries indefinitely — never skip; a poison-pill DLQ is a follow-up)
-                try {
-                    producer_.begin_transaction();
-                    for (const auto& payload : out_payloads) {
-                        producer_.produce(payload);
+                // failure, rewind so the batch is reprocessed (a failing batch retries
+                // indefinitely — never skip; a poison-pill DLQ is a follow-up)
+                auto log_txn = [&](const char* stage, const kafka_txn_result& status) {
+                    log->error("kafka stream: {} failed for batch of {} (fatal={} retriable={} requires_abort={}): {}",
+                               stage,
+                               records.size(),
+                               status.fatal,
+                               status.retriable,
+                               status.requires_abort,
+                               status.error.what.c_str());
+                };
+                auto rewind = [&] {
+                    if (auto error = consumer_.seek_to_batch_start(records); error.contains_error()) {
+                        log->error("kafka stream: rewind to the batch start failed: {}", error.what.c_str());
                     }
-                    consumer_.send_offsets_to_transaction(producer_, records, TXN_TIMEOUT);
-                    producer_.commit_transaction(TXN_TIMEOUT);
-                } catch (const std::exception&) {
-                    try {
-                        producer_.abort_transaction(TXN_TIMEOUT);
-                        consumer_.seek_to_batch_start(records); // reprocess, don't skip
-                    } catch (const std::exception&) {
+                };
+                auto abort_and_rewind = [&] {
+                    if (auto status = producer_.abort_transaction(TXN_TIMEOUT); !status.ok()) {
+                        log_txn("abort_transaction", status);
+                    }
+                    rewind();
+                };
+
+                if (auto status = producer_.begin_transaction(); !status.ok()) {
+                    log_txn("begin_transaction", status);
+                    rewind(); // nothing to abort — the transaction never opened
+                    continue;
+                }
+                core::error_t produce_error = core::error_t::no_error();
+                for (const auto& payload : out_payloads) {
+                    produce_error = producer_.produce(payload);
+                    if (produce_error.contains_error()) {
+                        break;
                     }
                 }
+                if (produce_error.contains_error()) {
+                    log->error("kafka stream: produce failed for batch of {}: {}",
+                               records.size(),
+                               produce_error.what.c_str());
+                    abort_and_rewind();
+                    continue;
+                }
+                if (auto status = consumer_.send_offsets_to_transaction(producer_, records, TXN_TIMEOUT);
+                    !status.ok()) {
+                    log_txn("send_offsets_to_transaction", status);
+                    abort_and_rewind();
+                    continue;
+                }
+                // A commit timeout is RETRIABLE — the transaction is still in flight, so
+                // the contract is to call commit AGAIN (aborting here would wedge the
+                // producer, which is the crash-recovery stall we hit). Only a
+                // non-retriable failure falls through to abort + reprocess
+                for (;;) {
+                    auto status = producer_.commit_transaction(TXN_TIMEOUT);
+                    if (status.ok()) {
+                        break;
+                    }
+                    if (status.retriable && !stop_.load(std::memory_order_relaxed)) {
+                        log_txn("commit_transaction (retriable, resuming)", status);
+                        continue;
+                    }
+                    log_txn("commit_transaction", status);
+                    abort_and_rewind();
+                    break;
+                }
             } else {
-                // At-least-once: produce (no-loss flush), then commit offsets
-                try {
-                    for (const auto& payload : out_payloads) {
-                        producer_.produce(payload);
+                // At-least-once: produce (no-loss flush), then commit offsets. A produce
+                // error is surfaced but the source offset still advances below, so a
+                // failed batch is not retried
+                for (const auto& payload : out_payloads) {
+                    if (auto error = producer_.produce(payload); error.contains_error()) {
+                        log->error("kafka stream: produce failed: {}", error.what.c_str());
+                        break;
                     }
-                    if (!out_payloads.empty()) {
-                        producer_.flush(FLUSH_TIMEOUT);
+                }
+                if (!out_payloads.empty()) {
+                    if (auto error = producer_.flush(FLUSH_TIMEOUT); error.contains_error()) {
+                        log->error("kafka stream: flush failed: {}", error.what.c_str());
                     }
-                } catch (const std::exception&) {
-                    // transient produce error; the source offset is still committed
-                    // below, so a failed batch is not retried (at-least-once)
                 }
                 consumer_.commit();
             }

@@ -2,11 +2,12 @@
 // Copyright 2025-2026  OtterStax
 
 #include "kafka_producer.hpp"
+#include "kafka_const.hpp"
 #include "utility/tracy_profiler.hpp"
 
 #include <librdkafka/rdkafkacpp.h>
 
-#include <stdexcept>
+#include <thread>
 
 namespace otterstax::kafka::detail {
     namespace {
@@ -14,15 +15,19 @@ namespace otterstax::kafka::detail {
             return core::error_t(core::error_code_t::other_error, std::pmr::string(("kafka producer: " + msg).c_str()));
         }
 
-        // Runtime txn helpers still surface librdkafka failures as exceptions (the
-        // caller's per-batch backstop converts them); create() reports setup failures
-        // through result_wrapper_t instead
-        void check_txn_error(RdKafka::Error* error, const char* what) {
-            if (error) {
-                const std::string msg = std::string("kafka producer: ") + what + " failed: " + error->str();
-                delete error;
-                throw std::runtime_error(msg);
+        // Consume librdkafka's Error (nullptr == success) into a value, keeping its
+        // classification — the EOS contract rides on fatal/retriable/requires_abort
+        kafka_txn_result to_txn_result(RdKafka::Error* error, const char* what) {
+            if (!error) {
+                return kafka_txn_result{};
             }
+            kafka_txn_result result;
+            result.fatal = error->is_fatal();
+            result.retriable = error->is_retriable();
+            result.requires_abort = error->txn_requires_abort();
+            result.error = producer_error(std::string(what) + " failed: " + error->str());
+            delete error;
+            return result;
         }
     } // namespace
 
@@ -48,10 +53,21 @@ namespace otterstax::kafka::detail {
             return producer_error("create failed: " + errstr);
         }
         if (transactional) {
-            if (RdKafka::Error* err = producer->init_transactions(10000)) {
-                const std::string msg = std::string("init_transactions failed: ") + err->str();
-                delete err;
-                return producer_error(msg);
+            // A retriable init_transactions failure means the operation is still
+            // running broker-side ("retry call to resume") — a single shot that loses
+            // the PID-fencing race made launch_stream() return silently and wedged
+            // fan-in crash-recovery, so keep resuming until the deadline
+            const auto init_deadline = std::chrono::steady_clock::now() + TXN_INIT_DEADLINE;
+            for (;;) {
+                auto init = to_txn_result(producer->init_transactions(to_ms(TXN_INIT_TIMEOUT)), "init_transactions");
+                if (init.ok()) {
+                    break;
+                }
+                if (init.retriable && std::chrono::steady_clock::now() < init_deadline) {
+                    std::this_thread::sleep_for(TXN_INIT_BACKOFF);
+                    continue;
+                }
+                return init.error;
             }
         }
         return kafka_producer_t(std::move(producer), std::move(config.topic), transactional);
@@ -69,11 +85,11 @@ namespace otterstax::kafka::detail {
 
     kafka_producer_t::~kafka_producer_t() {
         if (producer_) {
-            producer_->flush(5000); // best-effort drain before the handle is destroyed
+            producer_->flush(to_ms(PRODUCER_DRAIN_TIMEOUT));
         }
     }
 
-    void kafka_producer_t::produce(const std::string& payload) {
+    core::error_t kafka_producer_t::produce(const std::string& payload) {
         const RdKafka::ErrorCode err = producer_->produce(topic_,
                                                           RdKafka::Topic::PARTITION_UA,   // partitioner chooses
                                                           RdKafka::Producer::RK_MSG_COPY, // copy payload
@@ -84,40 +100,41 @@ namespace otterstax::kafka::detail {
                                                           /*timestamp*/ 0,
                                                           /*msg_opaque*/ nullptr);
         if (err != RdKafka::ERR_NO_ERROR) {
-            throw std::runtime_error("kafka producer: produce to '" + topic_ + "' failed: " + RdKafka::err2str(err));
+            return producer_error("produce to '" + topic_ + "' failed: " + RdKafka::err2str(err));
         }
         producer_->poll(0); // serve delivery reports without blocking
+        return core::error_t::no_error();
     }
 
-    void kafka_producer_t::flush(std::chrono::milliseconds timeout) {
+    core::error_t kafka_producer_t::flush(std::chrono::milliseconds timeout) {
         OTX_ZONE_N("kafka::producer::flush");
-        const RdKafka::ErrorCode err = producer_->flush(static_cast<int>(timeout.count()));
+        const RdKafka::ErrorCode err = producer_->flush(to_ms(timeout));
         if (err != RdKafka::ERR_NO_ERROR) {
-            throw std::runtime_error("kafka producer: flush '" + topic_ + "' failed: " + RdKafka::err2str(err));
+            return producer_error("flush '" + topic_ + "' failed: " + RdKafka::err2str(err));
         }
+        return core::error_t::no_error();
     }
 
-    void kafka_producer_t::begin_transaction() {
+    kafka_txn_result kafka_producer_t::begin_transaction() {
         OTX_ZONE_N("kafka::producer::begin_transaction");
-        check_txn_error(producer_->begin_transaction(), "begin_transaction");
+        return to_txn_result(producer_->begin_transaction(), "begin_transaction");
     }
 
-    void kafka_producer_t::send_offsets_to_transaction(const std::vector<RdKafka::TopicPartition*>& offsets,
-                                                       const RdKafka::ConsumerGroupMetadata* group_metadata,
-                                                       std::chrono::milliseconds timeout) {
+    kafka_txn_result kafka_producer_t::send_offsets_to_transaction(const std::vector<RdKafka::TopicPartition*>& offsets,
+                                                                   const RdKafka::ConsumerGroupMetadata* group_metadata,
+                                                                   std::chrono::milliseconds timeout) {
         OTX_ZONE_N("kafka::producer::send_offsets_to_transaction");
-        check_txn_error(
-            producer_->send_offsets_to_transaction(offsets, group_metadata, static_cast<int>(timeout.count())),
-            "send_offsets_to_transaction");
+        return to_txn_result(producer_->send_offsets_to_transaction(offsets, group_metadata, to_ms(timeout)),
+                             "send_offsets_to_transaction");
     }
 
-    void kafka_producer_t::commit_transaction(std::chrono::milliseconds timeout) {
+    kafka_txn_result kafka_producer_t::commit_transaction(std::chrono::milliseconds timeout) {
         OTX_ZONE_N("kafka::producer::commit_transaction");
-        check_txn_error(producer_->commit_transaction(static_cast<int>(timeout.count())), "commit_transaction");
+        return to_txn_result(producer_->commit_transaction(to_ms(timeout)), "commit_transaction");
     }
 
-    void kafka_producer_t::abort_transaction(std::chrono::milliseconds timeout) {
+    kafka_txn_result kafka_producer_t::abort_transaction(std::chrono::milliseconds timeout) {
         OTX_ZONE_N("kafka::producer::abort_transaction");
-        check_txn_error(producer_->abort_transaction(static_cast<int>(timeout.count())), "abort_transaction");
+        return to_txn_result(producer_->abort_transaction(to_ms(timeout)), "abort_transaction");
     }
 } // namespace otterstax::kafka::detail

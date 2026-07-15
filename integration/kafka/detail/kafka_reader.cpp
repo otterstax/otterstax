@@ -407,19 +407,26 @@ namespace otterstax::kafka::detail {
             .second;
     }
 
-    logical_plan::execution_plan_t kafka_parse_plan(std::pmr::memory_resource* resource, const std::string& sql) {
+    core::result_wrapper_t<logical_plan::execution_plan_t> kafka_parse_plan(std::pmr::memory_resource* resource,
+                                                                            const std::string& sql) {
         OTX_ZONE_N("kafka::kafka_parse_plan");
         using namespace components::sql::transform;
         components::sql::parser::parser_extension_registry_t registry;
         std::pmr::monotonic_buffer_resource arena(resource);
-        void* parse_result = linitial(raw_parser(&arena, sql.c_str(), registry)); // may throw
+        void* parse_result = nullptr;
+        try {
+            parse_result = linitial(raw_parser(&arena, sql.c_str(), registry));
+        } catch (const std::exception& exception) {
+            return core::error_t(core::error_code_t::sql_parse_error, std::pmr::string{exception.what(), resource});
+        }
         if (!parse_result) {
-            throw std::runtime_error("kafka stream: parser returned null");
+            return core::error_t(core::error_code_t::sql_parse_error,
+                                 std::pmr::string{"kafka: parser returned null", resource});
         }
         transformer local_transformer(resource, sql.c_str(), &registry);
         auto result = local_transformer.transform(pg_cell_to_node_cast(parse_result)).finalize();
         if (result.has_error()) {
-            throw std::runtime_error(std::string("kafka stream: transform failed: ") + result.error().what.c_str());
+            return result.error();
         }
         return std::move(result.value());
     }

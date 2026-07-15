@@ -4,6 +4,7 @@ add_library(kafka_runtime
     detail/kafka_manager_ddl.cpp
     detail/kafka_manager_persistence.cpp
     detail/kafka_manager_stream.cpp
+    detail/kafka_const.hpp
     detail/kafka_consumer.hpp
     detail/kafka_consumer.cpp
     detail/kafka_producer.hpp

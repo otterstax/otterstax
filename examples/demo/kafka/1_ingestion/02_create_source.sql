@@ -5,9 +5,6 @@
 -- INSERT and the offset advance commit atomically in one engine transaction,
 -- with the offsets table (not the broker group) as the source of truth, so a
 -- crash mid-batch never duplicates or drops a record.
---
--- :broker is supplied by the step runner (demo-kafka:9092 in docker mode,
--- 127.0.0.1:19093 with --local). DROP IF EXISTS keeps the step re-runnable.
 \echo '>>> CREATE SOURCE orders_live  (Kafka topic → SQL table, exactly-once)'
 
 DROP SOURCE IF EXISTS orders_live;

@@ -37,6 +37,23 @@ namespace otterstax::kafka {
             return c ? std::string{c->get_error().what.c_str()} : std::string{"null cursor"};
         }
 
+        // Report the outcome of a best-effort kafka.__sources row delete on DROP. The
+        // delete is not load-bearing: the object is already gone from
+        // registry_/pollers_, and recover() skips any orphan row whose backing table
+        // no longer exists. On a fresh engine's FIRST teardown the engine's DELETE
+        // validation can spuriously return table_not_exists for kafka.__sources even
+        // though the row is removed (verified: kafka.__sources ends empty). Swallow
+        // exactly that benign code; surface anything else at error.
+        void log_forget_meta_error(const log_t& log, const std::string& name, const cursor::cursor_t_ptr& d) {
+            if (!d || !d->is_error()) {
+                return;
+            }
+            if (d->get_error().type == core::error_code_t::table_not_exists) {
+                return;
+            }
+            log->error("kafka: delete __sources row for '{}' failed: {}", name, d->get_error().what.c_str());
+        }
+
         core::result_wrapper_t<bool> parse_transactional(const std::optional<std::string>& value) {
             if (!value) {
                 return false;
@@ -215,12 +232,27 @@ namespace otterstax::kafka {
                                                                   drop);
         auto cursor = co_await send_plan(
             logical_plan::execution_plan_t{resource_, plan_node, logical_plan::make_parameter_node(resource_)});
-        registry_.erase(node->name());
-        // Drop its persisted __sources row (bookkeeping — a failure doesn't fail the
-        // DROP; the backing table is already gone)
-        if (auto d = co_await delete_source_meta(node->name()); d && d->is_error()) {
-            log_->error("kafka: delete __sources row for '{}' failed: {}", node->name(), d->get_error().what.c_str());
+
+        auto drop_offsets = logical_plan::make_node_drop_collection(resource_);
+        logical_plan::node_ptr offsets_node =
+            sql::transform::maybe_wrap_with_catalog_resolve_table(resource_,
+                                                                  std::string{KAFKA_DATABASE_NAME},
+                                                                  node->name() + "__offsets",
+                                                                  drop_offsets);
+        if (auto off = co_await send_plan(logical_plan::execution_plan_t{resource_,
+                                                                         offsets_node,
+                                                                         logical_plan::make_parameter_node(resource_)});
+            off && off->is_error()) {
+            log_->debug("kafka: drop offsets table for '{}' (non-fatal): {}",
+                        node->name(),
+                        off->get_error().what.c_str());
         }
+
+        registry_.erase(node->name());
+        // Drop its persisted __sources row (best-effort bookkeeping — a failure does
+        // not fail the DROP; the backing table is already gone). log_forget_meta_error
+        // deliberately swallows the engine's spurious first-teardown table_not_exists.
+        log_forget_meta_error(log_, node->name(), co_await delete_source_meta(node->name()));
         if (cursor && cursor->is_error() && !node->if_exists()) {
             co_return cursor;
         }

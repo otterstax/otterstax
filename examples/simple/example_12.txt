@@ -1,5 +1,0 @@
-SELECT r.region_name, r.country, e.event_type, e.value
-FROM ext.regions r JOIN
-     ext.events_s3 e ON r.campaign_id = e.campaign_id
-WHERE r.population > 500000
-ORDER BY e.value DESC;

@@ -1,2 +1,0 @@
-CREATE EXTERNAL TABLE ext.regions
-    WITH (location = '/fixtures/regions.parquet', format = 'parquet');

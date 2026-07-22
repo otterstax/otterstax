@@ -135,6 +135,7 @@ services:
     expose:
       - "8815"
       - "8085"
+      - "15002"
     ports:
       - "8086:8086"
     # Fixtures used by the file/s3 external-table tests are baked into the
@@ -214,6 +215,37 @@ services:
         condition: service_healthy
     volumes:
       - mariadb1_init:/app/mariadb1_init    # Mount SAME volumes as MariaDB
+      - mariadb2_init:/app/mariadb2_init
+      - postgres_init:/app/postgres_init
+      - clickhouse_init:/app/clickhouse_init
+      - ./tests/logs:/app/logs
+    networks:
+      - test_app_network
+    dns_search: ""
+
+  # Spark Connect E2E test client. Identical to test-client but builds from
+  # Dockerfile.spark-test, which layers OpenJDK 17 + pyspark on top of the
+  # python:3.12-slim base so the test_spark_client_*.py scripts can run.
+  # Shares test_app_network and reaches the Spark Connect server at
+  # test-otterstax:15002.
+  test-spark-client:
+    build:
+      context: .
+      dockerfile: Dockerfile.spark-test
+    container_name: test-spark-client
+    depends_on:
+      test-otterstax:
+        condition: service_healthy
+      mariadb1:
+        condition: service_healthy
+      mariadb2:
+        condition: service_healthy
+      postgres1:
+        condition: service_healthy
+      clickhouse1:
+        condition: service_healthy
+    volumes:
+      - mariadb1_init:/app/mariadb1_init
       - mariadb2_init:/app/mariadb2_init
       - postgres_init:/app/postgres_init
       - clickhouse_init:/app/clickhouse_init

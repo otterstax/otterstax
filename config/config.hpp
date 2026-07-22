@@ -25,6 +25,11 @@ struct PostgresConfig {
     uint16_t port = 8817;
 };
 
+struct SparkConnectConfig {
+    std::string host = "0.0.0.0";
+    uint16_t port = 15002;
+};
+
 struct ConnectionManagerConfig {
     uint16_t port = 8085;
 };
@@ -33,6 +38,7 @@ struct ServiceConfig {
     FlightSqlConfig flight_sql;
     MysqlConfig mysql;
     PostgresConfig postgres;
+    SparkConnectConfig spark_connect;
     ConnectionManagerConfig connection_manager;
     std::string connection_config_path;
 };
@@ -47,6 +53,7 @@ private:
     static FlightSqlConfig parseFlightSqlConfig(const YAML::Node& config);
     static MysqlConfig parseMysqlConfig(const YAML::Node& config);
     static PostgresConfig parsePostgresConfig(const YAML::Node& config);
+    static SparkConnectConfig parseSparkConnectConfig(const YAML::Node& config);
     static ConnectionManagerConfig parseConnectionManagerConfig(const YAML::Node& config);
 };
 

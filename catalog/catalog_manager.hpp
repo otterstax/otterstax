@@ -57,6 +57,15 @@ namespace catalog_ext {
 
     using discovered_tables_t = std::pmr::vector<discovered_table_t>;
 
+    // Spark Connect catalog relations: one entry per registered connection
+    // alias, returned by CatalogManager::list_connections (drives
+    // spark.catalog.listDatabases()). `backend_type` mirrors backend_type_t so
+    // the Spark driver can map each "database" to its physical backend.
+    struct connection_info_t {
+        std::string alias;
+        backend_type_t backend_type;
+    };
+
 } // namespace catalog_ext
 
 namespace mysql {
@@ -97,11 +106,26 @@ namespace mysql {
         actor_zeta::unique_future<void> get_tables(arrow::flight::sql::GetTables command,
                                                    shared_data<std::pmr::vector<table_info>> sdata);
 
+        // --- Spark Connect catalog accessors -------------------------------
+        // Each follows the get_tables handler contract: actor handler, result
+        // delivered through a shared_data cv_wrapper, no exceptions thrown.
+        actor_zeta::unique_future<void>
+        list_connections(shared_data<std::pmr::vector<catalog_ext::connection_info_t>> sdata);
+
+        actor_zeta::unique_future<void>
+        list_tables(std::string alias, shared_data<std::pmr::vector<table_info>> sdata);
+
+        actor_zeta::unique_future<void>
+        table_exists(std::string alias, std::string table, shared_data<bool> sdata);
+
         using dispatch_traits = actor_zeta::dispatch_traits<&CatalogManager::get_catalog_schema,
                                                             &CatalogManager::update_backend_type,
                                                             &CatalogManager::add_connection_schema,
                                                             &CatalogManager::remove_connection_schema,
-                                                            &CatalogManager::get_tables>;
+                                                            &CatalogManager::get_tables,
+                                                            &CatalogManager::list_connections,
+                                                            &CatalogManager::list_tables,
+                                                            &CatalogManager::table_exists>;
 
         actor_zeta::behavior_t behavior(actor_zeta::mailbox::message* msg);
 

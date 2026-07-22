@@ -46,6 +46,10 @@ ServiceConfig ConfigReader::load(const std::string& config_path) {
         server_config.postgres = parsePostgresConfig(config["postgres"]);
     }
 
+    if (config["spark_connect"]) {
+        server_config.spark_connect = parseSparkConnectConfig(config["spark_connect"]);
+    }
+
     if (config["connection_manager"]) {
         server_config.connection_manager = parseConnectionManagerConfig(config["connection_manager"]);
     }
@@ -60,6 +64,7 @@ ServiceConfig ConfigReader::load(const std::string& config_path) {
     log_->debug("Flight SQL: {}:{} ", server_config.flight_sql.host, server_config.flight_sql.port);
     log_->debug("MySQL port: {}", server_config.mysql.port);
     log_->debug("Postgres port: {}", server_config.postgres.port);
+    log_->debug("Spark Connect: {}:{}", server_config.spark_connect.host, server_config.spark_connect.port);
     log_->debug("Connection Manager port: {}", server_config.connection_manager.port);
     log_->debug("Connection config path: {}", server_config.connection_config_path);
 
@@ -98,6 +103,20 @@ PostgresConfig ConfigReader::parsePostgresConfig(const YAML::Node& config) {
     }
 
     return postgres_config;
+}
+
+SparkConnectConfig ConfigReader::parseSparkConnectConfig(const YAML::Node& config) {
+    SparkConnectConfig spark_config;
+
+    if (config["host"]) {
+        spark_config.host = config["host"].as<std::string>();
+    }
+
+    if (config["port"]) {
+        spark_config.port = static_cast<uint16_t>(config["port"].as<int>());
+    }
+
+    return spark_config;
 }
 
 ConnectionManagerConfig ConfigReader::parseConnectionManagerConfig(const YAML::Node& config) {

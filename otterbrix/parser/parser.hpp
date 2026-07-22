@@ -56,6 +56,17 @@ public:
     virtual ~IParser() = default;
 
     virtual core::result_wrapper_t<ParsedQueryDataPtr> parse(const std::string& sql) = 0;
+
+    // Parses `sql` and returns the transformed logical-plan root, appending any
+    // constant parameters into `shared_params` (a single shared id-space) via
+    // the transformer's execution_plan path. Lighter than parse(): performs no
+    // external-node analysis — intended for synthesizing a sub-plan whose
+    // fragment (e.g. a WHERE predicate) is re-grafted into an outer plan. The
+    // caller owns `shared_params`; its id counter continues, so the appended
+    // ids never collide with parameters already in the outer plan.
+    virtual core::result_wrapper_t<components::logical_plan::node_ptr>
+    parse_fragment(const std::string& sql,
+                   components::logical_plan::parameter_node_ptr shared_params) = 0;
 };
 
 class GreenplumParser : public IParser {
@@ -63,6 +74,10 @@ public:
     explicit GreenplumParser(std::pmr::memory_resource* resource);
 
     core::result_wrapper_t<ParsedQueryDataPtr> parse(const std::string& sql) override;
+
+    core::result_wrapper_t<components::logical_plan::node_ptr>
+    parse_fragment(const std::string& sql,
+                   components::logical_plan::parameter_node_ptr shared_params) override;
 
 private:
     std::pmr::memory_resource* resource_;

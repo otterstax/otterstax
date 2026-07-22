@@ -11,7 +11,7 @@
 #include <unordered_map>
 
 #include <components/logical_plan/node_aggregate.hpp>
-#include <components/logical_plan/node_catalog_resolve_table.hpp>
+#include <components/logical_plan/node_catalog_resolve.hpp>
 #include <components/logical_plan/node_insert.hpp>
 #include <components/logical_plan/node_match.hpp>
 #include <components/logical_plan/node_select.hpp>
@@ -130,20 +130,23 @@ namespace otterstax::kafka {
         if (!root) {
             return std::nullopt;
         }
-        const logical_plan::node_catalog_resolve_table_t* resolve = nullptr;
+        const logical_plan::node_catalog_resolve_t* resolve = nullptr;
         const logical_plan::node_insert_t* insert = nullptr;
         // Inspect only root + its direct children: the write's target
-        // catalog_resolve_table and the insert_t are siblings under the wrapping
-        // sequence_t, while the source's own resolve nodes live deeper (under the
-        // insert) — so a SELECT source's tables can't be mistaken for the target
+        // catalog_resolve (kind == table) and the insert_t are siblings under the
+        // wrapping sequence_t, while the source's own resolve nodes live deeper
+        // (under the insert) — so a SELECT source's tables can't be mistaken for
+        // the target
         auto inspect = [&](const logical_plan::node_t* n) {
-            if (auto* rt = dynamic_cast<const logical_plan::node_catalog_resolve_table_t*>(n)) {
+            if (n->type() == logical_plan::node_type::catalog_resolve_t &&
+                static_cast<const logical_plan::node_catalog_resolve_t*>(n)->kind() ==
+                    logical_plan::resolve_kind::table) {
                 if (!resolve) {
-                    resolve = rt;
+                    resolve = static_cast<const logical_plan::node_catalog_resolve_t*>(n);
                 }
-            } else if (auto* ins = dynamic_cast<const logical_plan::node_insert_t*>(n)) {
+            } else if (n->type() == logical_plan::node_type::insert_t) {
                 if (!insert) {
-                    insert = ins;
+                    insert = static_cast<const logical_plan::node_insert_t*>(n);
                 }
             }
         };

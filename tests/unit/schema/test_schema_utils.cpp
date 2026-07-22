@@ -4,7 +4,7 @@
 #include "otterbrix/schema/schema_utils.hpp"
 #include "otterbrix/translators/input/mysql_to_chunk.hpp"
 
-#include <catch2/catch.hpp>
+#include <catch2/catch_all.hpp>
 #include <components/logical_plan/node_data.hpp>
 #include <components/sql/parser/parser.h>
 #include <components/sql/transformer/transformer.hpp>

@@ -267,7 +267,7 @@ Worker::execute(session_hash_t id, std::string sql) {
         }
 
         auto& meta = get_metadata(id);
-        session_payload payload{std::move(meta.schema), std::move(cursor->chunk_data()), 0, meta.tag};
+        session_payload payload{std::move(meta.schema), std::move(cursor->chunks()), 0, meta.tag};
         metadata_map_.erase(id);
         co_return std::move(payload);
     } catch (const std::exception& e) {
@@ -371,7 +371,7 @@ Worker::execute_statement(session_hash_t id) {
         }
 
         auto& meta = get_metadata(id);
-        session_payload payload{std::move(meta.schema), std::move(cursor->chunk_data()), 0, meta.tag};
+        session_payload payload{std::move(meta.schema), std::move(cursor->chunks()), 0, meta.tag};
         metadata_map_.erase(id);
         co_return std::move(payload);
     } catch (const std::exception& e) {
@@ -617,7 +617,9 @@ Worker::session_result Worker::finish_schema_value(session_hash_t id,
     const size_t param_cnt = data->otterbrix_params->parameters_count;
     const NodeTag tag = data->tag;
     update_metadata(id, std::move(data), schema);
-    return session_payload{std::move(schema), data_chunk_t{resource(), {}, 0}, param_cnt, tag};
+    std::pmr::vector<components::vector::data_chunk_t> chunks(resource());
+    chunks.emplace_back(resource(), std::pmr::vector<components::types::complex_logical_type>{resource()}, 0);
+    return session_payload{std::move(schema), std::move(chunks), param_cnt, tag};
 }
 
 void Worker::update_metadata(session_hash_t id,

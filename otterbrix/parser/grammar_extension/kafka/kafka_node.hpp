@@ -106,7 +106,7 @@ namespace otterstax::kafka {
     // If `root` is a plain-SQL INSERT whose target table lives in the kafka
     // database, return its target + source; else std::nullopt. The transformer
     // wraps a write as a sequence_t whose *direct* children are the target
-    // catalog_resolve_table_t and the insert_t (the source's own resolve nodes
+    // catalog_resolve (kind == table) and the insert_t (the source's own resolve nodes
     // sit deeper, under the insert), so only root + its direct children are
     // inspected — `INSERT INTO kafka.a SELECT FROM kafka.b` resolves to `a`.
     std::optional<kafka_write_t> kafka_write_target(const components::logical_plan::node_ptr& root);

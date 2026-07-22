@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2025-2026  OtterStax
 
-#define CATCH_CONFIG_RUNNER
-#include <catch2/catch.hpp>
+#include <catch2/catch_all.hpp>
 
 #include "utility/logger.hpp"
 
@@ -13,8 +12,8 @@
 // FileManager/S3Manager construction (reachable via the Scheduler stack) calls
 // arrow::fs::EnsureS3Initialized() transitively. Arrow requires a matching
 // FinalizeS3() before exit or it warns and may segfault during static teardown.
-struct S3Finalizer : Catch::TestEventListenerBase {
-    using TestEventListenerBase::TestEventListenerBase;
+struct S3Finalizer : Catch::EventListenerBase {
+    using EventListenerBase::EventListenerBase;
     void testRunEnded(Catch::TestRunStats const&) override {
         if (arrow::fs::IsS3Initialized())
             (void) arrow::fs::FinalizeS3();

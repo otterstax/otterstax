@@ -80,9 +80,11 @@ namespace otterstax::kafka {
 
             // This path runs only the source subplan (no backing-table write), so the
             // engine never type-checks the rows — reject a batch that wouldn't round-trip
-            // into the declared schema rather than publish junk to the topic
-            const auto& chunk = cursor->chunk_data();
-            if (!chunk_matches_columns(resource_, chunk, it->second.columns)) {
+            // into the declared schema rather than publish junk to the topic.
+            // b1/b2: the result spans multiple <=1024-row chunks (never combined) —
+            // validate and serialize ALL of them or rows are silently dropped.
+            const auto& chunks = cursor->chunks();
+            if (!chunk_matches_columns(resource_, chunks, it->second.columns)) {
                 co_return cursor::make_cursor(
                     resource_,
                     core::error_t(core::error_code_t::other_error,
@@ -92,7 +94,7 @@ namespace otterstax::kafka {
                                                    resource_}));
             }
 
-            const auto payloads = chunk_to_json(chunk);
+            const auto payloads = chunk_to_json(chunks);
             auto producer_r = ensure_producer(relname, bootstrap_it->second, topic_it->second);
             if (producer_r.has_error()) {
                 co_return cursor::make_cursor(

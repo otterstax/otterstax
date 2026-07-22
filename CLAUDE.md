@@ -307,20 +307,14 @@ otterbrix-internal — shadow of `external_join_all` benchmark), all driven by
 | `connectors/` | `connectors`, `s3`, `file`, `api_server` | Raw DB connections (Boost.MySQL, libpq, clickhouse-cpp), S3 (Arrow `S3FileSystem`), local-file ingestion, HTTP connection API |
 | `catalog/` | `catalog` | Schema discovery + connection type registry (`CatalogManager`) |
 | `integration/` | `integration` | Actor wrappers bridging Worker ↔ ConnectorManagers (incl. `db::S3Manager`) |
+| `integration/kafka/` | `kafka_runtime` | `KafkaManager` actor + `detail/` impl (consumer/producer/poller/stream/reader); Kafka SOURCE/STREAM objects, librdkafka |
 | `otterbrix/` | `otterbrix_local` (+ `otterbrix_s3_extension`, `otterbrix_file_extension`) | Parser, SQL generator, translators, plan execution, grammar extensions for `CREATE EXTERNAL TABLE` / `COPY ... TO` |
+| `otterbrix/parser/grammar_extension/kafka/` | `kafka_grammar` | Kafka DDL parser extension (flex+bison): `kafka_node_t`, `kafka_write_target` |
 | `scheduler/` | `scheduler` | `Scheduler` router + `Worker` pool (full parse→catalog→backend→otterbrix pipeline, including external-statement dispatch) + schema computation utilities |
 | `frontend/` | `flight_sql_server`, `mysql_server`, `postgres_server` | Wire-protocol frontends (await `Scheduler` futures via `asio_future_bridge.hpp`) |
 | `utility/` | (header-only) | `session_payload`, `session`, `pipeline_error`, logger, profiler |
 | `cmake/` | (helper macros) | `otterbrix_parser_extension.cmake` — builds the s3/file flex+bison grammar extensions |
 | `tests/` | `test_system`, `test_unit_*`, `test_mysql_front` | Catch2 tests + python integration suite under `tests/test_*.py` |
-| `integration/` | `integration` | Actor wrappers bridging Scheduler ↔ ConnectorManagers |
-| `integration/kafka/` | `kafka_runtime` | `KafkaManager` actor + `detail/` impl (consumer/producer/poller/stream/reader); Kafka SOURCE/STREAM objects, librdkafka |
-| `otterbrix/` | `otterbrix_local` | Parser, SQL generator, translators, plan execution |
-| `otterbrix/parser/grammar_extension/kafka/` | `kafka_grammar` | Kafka DDL parser extension (flex+bison): `kafka_node_t`, `kafka_write_target` |
-| `scheduler/` | `scheduler` | Query routing actor (`Scheduler`) + schema computation utilities |
-| `frontend/` | `flight_sql_server`, `mysql_server`, `postgres_server` | Wire-protocol frontends |
-| `utility/` | (header-only) | `cv_wrapper`, `session_payload`, `result_t`, `pipeline_error`, logger |
-| `tests/` | `test_system`, `test_unit_*`, `test_mysql_front` | Catch2 tests |
 
 ## Known Constraints
 
@@ -331,7 +325,8 @@ otterbrix-internal — shadow of `external_join_all` benchmark), all driven by
 
 ## Critical Dependency Versions
 
-- Otterbrix 1.0.0a13-rc-3 (custom Conan remote: `http://conan.otterbrix.com`)
-- Arrow 21.0.0 (with `with_flight_sql=True`, `with_s3=True`, `with_parquet=True`, `with_csv=True`, `with_json=True`, plus snappy/brotli/zlib/lz4/zstd compression codecs)
-- Boost 1.87.0
+- Otterbrix 1.0.0b2-rc-1 (custom Conan remote: `http://conan.otterbrix.com`; pinned by recipe revision in `conanfile.py`)
+- Arrow 24.0.0 (with `with_flight_sql=True`, `with_s3=True`, `with_parquet=True`, `with_csv=True`, `with_json=True`, plus snappy/brotli/zlib/lz4/zstd compression codecs)
+- Boost 1.88.0
 - actor-zeta 1.2.0
+- Catch2 3.15.2 (v3 — `find_package(Catch2 3)` required by the otterbrix recipe)

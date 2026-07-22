@@ -1,8 +1,5 @@
 set(API_SERVER_HEADERS
     connection_server.hpp
-    connection_config.hpp
-    pg_connection_config.hpp
-    ch_connection_config.hpp
 )
 
 set(API_SERVER_SOURCES

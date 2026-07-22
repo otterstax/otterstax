@@ -30,7 +30,7 @@
 #include <arrow/io/file.h>
 #include <parquet/arrow/writer.h>
 
-#include <catch2/catch.hpp>
+#include <catch2/catch_all.hpp>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -144,7 +144,7 @@ TEST_CASE("FileManager: parquet ingestion and SELECT") {
 
     REQUIRE(cur->is_success());
     REQUIRE(cur->size() == 5);
-    REQUIRE(cur->chunk_data().column_count() == 2);
+    REQUIRE(cur->chunks().front().column_count() == 2);
 
     // Destroy otterbrix before removing data_dir: the destructor runs a disk
     // checkpoint that writes to data_dir; removing it first causes a SIGSEGV.
@@ -193,7 +193,7 @@ TEST_CASE("FileManager: csv ingestion and SELECT") {
 
     REQUIRE(cur->is_success());
     REQUIRE(cur->size() == 5);
-    REQUIRE(cur->chunk_data().column_count() == 2);
+    REQUIRE(cur->chunks().front().column_count() == 2);
 
     cur.reset();
     file_manager.reset();
@@ -240,7 +240,7 @@ TEST_CASE("FileManager: ndjson ingestion and SELECT") {
 
     REQUIRE(cur->is_success());
     REQUIRE(cur->size() == 5);
-    REQUIRE(cur->chunk_data().column_count() == 2);
+    REQUIRE(cur->chunks().front().column_count() == 2);
 
     cur.reset();
     file_manager.reset();

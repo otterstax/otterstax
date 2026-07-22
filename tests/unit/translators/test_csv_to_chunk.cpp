@@ -3,7 +3,7 @@
 
 #include "otterbrix/translators/input/csv_to_chunk.hpp"
 
-#include <catch2/catch.hpp>
+#include <catch2/catch_all.hpp>
 
 #include <cstdint>
 #include <filesystem>

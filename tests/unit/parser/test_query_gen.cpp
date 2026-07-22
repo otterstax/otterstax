@@ -7,7 +7,7 @@
 #include "otterbrix/query_generation/sql_query_generator.hpp"
 #include "otterbrix/schema/schema_utils.hpp"
 
-#include <catch2/catch.hpp>
+#include <catch2/catch_all.hpp>
 
 #include <components/logical_plan/node.hpp>
 #include <memory_resource>
@@ -130,6 +130,71 @@ TEST_CASE("generate_query: MySQL node produces db.collection reference") {
     REQUIRE(sql.find("`bill`.`orders`") != std::string::npos);
     // 4-part qualifier must not leak into the generated SQL
     REQUIRE(sql.find("mysql.bill.schema.orders") == std::string::npos);
+}
+
+TEST_CASE("generate_query: LIMIT is pushed down to the remote backend SQL") {
+    auto* resource = std::pmr::get_default_resource();
+    GreenplumParser parser(resource);
+
+    auto parsed = parse_or_die(parser, "SELECT * FROM mysql.bill.schema.orders LIMIT 5;");
+
+    auto nodes = flat_externals(parsed);
+    auto mysql_node = find_by_uid(nodes, "mysql");
+    REQUIRE(mysql_node.node);
+    REQUIRE_FALSE(is_raw_sql_stub(mysql_node.node));
+
+    const auto& params = parsed->otterbrix_params->params_node->parameters();
+    auto sql = sql_gen::generate_query(mysql_node.node,
+                                       &params,
+                                       backend_type_t::MySQL,
+                                       mysql_node.target,
+                                       batch_targets_of(parsed, mysql_node));
+
+    // Regression: generate_select ignored the node_limit_t child, so remote
+    // backends fetched every row. The LIMIT must reach the pushed-down SQL.
+    REQUIRE_FALSE(sql.empty());
+    REQUIRE(sql.find("LIMIT 5") != std::string::npos);
+}
+
+TEST_CASE("generate_query: LIMIT with OFFSET is pushed down") {
+    auto* resource = std::pmr::get_default_resource();
+    GreenplumParser parser(resource);
+
+    auto parsed = parse_or_die(parser, "SELECT * FROM mysql.bill.schema.orders LIMIT 5 OFFSET 2;");
+
+    auto nodes = flat_externals(parsed);
+    auto mysql_node = find_by_uid(nodes, "mysql");
+    REQUIRE(mysql_node.node);
+
+    const auto& params = parsed->otterbrix_params->params_node->parameters();
+    auto sql = sql_gen::generate_query(mysql_node.node,
+                                       &params,
+                                       backend_type_t::MySQL,
+                                       mysql_node.target,
+                                       batch_targets_of(parsed, mysql_node));
+
+    REQUIRE(sql.find("LIMIT 5") != std::string::npos);
+    REQUIRE(sql.find("OFFSET 2") != std::string::npos);
+}
+
+TEST_CASE("generate_query: no LIMIT clause when the query has none") {
+    auto* resource = std::pmr::get_default_resource();
+    GreenplumParser parser(resource);
+
+    auto parsed = parse_or_die(parser, "SELECT * FROM mysql.bill.schema.orders WHERE id > 0;");
+
+    auto nodes = flat_externals(parsed);
+    auto mysql_node = find_by_uid(nodes, "mysql");
+    REQUIRE(mysql_node.node);
+
+    const auto& params = parsed->otterbrix_params->params_node->parameters();
+    auto sql = sql_gen::generate_query(mysql_node.node,
+                                       &params,
+                                       backend_type_t::MySQL,
+                                       mysql_node.target,
+                                       batch_targets_of(parsed, mysql_node));
+
+    REQUIRE(sql.find("LIMIT") == std::string::npos);
 }
 
 TEST_CASE("generate_query: PostgreSQL node produces schema.collection reference") {

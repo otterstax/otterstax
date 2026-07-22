@@ -11,15 +11,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ### `session_payload.hpp`
 
 `session_payload` holds the output of a completed query: `schema`
-(`complex_logical_type`), `chunk` (`data_chunk_t`), `parameter_count`, and
-`NodeTag`. With the Scheduler→Worker pool, frontends receive the payload
+(`complex_logical_type`), `chunks` (`std::pmr::vector<data_chunk_t>` — the
+b1+ engine caps each chunk at 1024 rows, so a result spans multiple chunks;
+`size()`/`column_count()`/`empty()` accessors span the whole vector),
+`parameter_count`, and `NodeTag`. With the Scheduler→Worker pool, frontends
+receive the payload
 through a typed future
 (`actor_zeta::unique_future<core::result_wrapper_t<session_payload>>`) returned
 by `Scheduler::execute` — *not* through the old `shared_session_payload`
 push-CV interface. The poll-side bridge lives at
 `frontend/common/asio_future_bridge.hpp`.
 
-### `cv_wrapper.hpp` / `shared_flight_data.hpp` (legacy, off the hot path)
+### `cv_wrapper.hpp` (legacy, off the hot path)
 
 `cv_wrapper_t<T>` and `shared_data<T>` are still present for a handful of
 legacy callers (notably the connector retry / reconnect path and a few
@@ -63,6 +66,12 @@ get free per-query timings in DEBUG builds.
 
 ### `wait_barrier.hpp`
 
-A lightweight latch used by some shutdown paths (notably the `ComponentManager`
-teardown when stopping the actor-zeta `sharing_scheduler` before destroying the
-`Scheduler`). Not on the query pipeline.
+`query_outcome<T>` + `get_or_throw()` + `QueryHandleWaiter<T>` — marshal
+connector results across the io_context worker → consumer thread boundary as
+plain values. A live exception must never cross that boundary (boost.asio
+`use_future` races the exception_ptr destruction against the consumer's
+`future.get()`; TSAN data race surfaced by boost 1.88), so connectors capture
+errors into `query_outcome::error` on the io thread and consumers rethrow via
+`get_or_throw()`/`QueryHandleWaiter::wait()` on their own thread.
+`QueryHandleWaiter`'s destructor drains unconsumed futures (asio futures do
+not block on destruction, unlike `std::async`).

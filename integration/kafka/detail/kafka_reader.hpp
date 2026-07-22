@@ -33,10 +33,19 @@ namespace otterstax::kafka::detail {
     // Inverse of json_to_chunk. Pure
     std::vector<std::string> chunk_to_json(const components::vector::data_chunk_t& chunk);
 
+    // Multi-chunk overload: b1/b2 cursors return a result as a vector of
+    // <=1024-row chunks (never combined). Serializes every chunk's rows, in order.
+    std::vector<std::string> chunk_to_json(const std::pmr::vector<components::vector::data_chunk_t>& chunks);
+
     // True iff every row of `chunk` round-trips through `declared` (chunk_to_json ->
     // json_to_chunk). produce() uses it, since that path skips engine type-checking
     bool chunk_matches_columns(std::pmr::memory_resource* resource,
                                const components::vector::data_chunk_t& chunk,
+                               const std::vector<kafka_column_t>& declared);
+
+    // Multi-chunk overload: every chunk of the batch must round-trip.
+    bool chunk_matches_columns(std::pmr::memory_resource* resource,
+                               const std::pmr::vector<components::vector::data_chunk_t>& chunks,
                                const std::vector<kafka_column_t>& declared);
 
     // A STREAM's output schema = its SELECT's projection applied to `source_columns`

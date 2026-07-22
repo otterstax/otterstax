@@ -22,13 +22,13 @@ The system uses `ComponentManager` (`component_manager/`) as the central orchest
 
 ### Session-Based Query Execution Flow
 1. Frontend receives query → generates unique `session_hash_t`
-2. Frontend spawns async task, registers `shared_flight_data` with Scheduler
+2. Frontend spawns async task, registers `shared_session_payload` with Scheduler
 3. Scheduler parses SQL → determines if Otterbrix-local or federated remote query
 4. For federated: dispatches to `SqlConnectionManager` → `ConnectorManager` → MySQL
 5. Results translated through `translators/` (MySQL results → Arrow format)
-6. Completed data signaled via condition variable in `shared_flight_data`
+6. Completed data signaled via condition variable in `shared_session_payload`
 
-**Session Management**: Use `utility/shared_flight_data.hpp` wrapper with CV for async wait/signal between components.
+**Session Management**: Use `utility/session_payload.hpp` (`shared_session_payload`, a `cv_wrapper`-wrapped payload) with CV for async wait/signal between components.
 
 ### Federated Query Pattern (Critical!)
 Queries use **connection aliases** as database names:

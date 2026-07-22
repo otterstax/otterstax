@@ -18,18 +18,23 @@ set_target_properties(${PROJECT_NAME} PROPERTIES
     INSTALL_RPATH "$ORIGIN/../../lib:$ORIGIN/../..:$ORIGIN"
 )
 
+# GNU ld spells whole-archive inclusion --whole-archive; ld64 spells it -force_load
+if(APPLE)
+    set(${PROJECT_NAME}_WHOLE_ARCHIVE -Wl,-force_load,$<TARGET_FILE:otterbrix_local>)
+else()
+    set(${PROJECT_NAME}_WHOLE_ARCHIVE
+        -Wl,--whole-archive $<TARGET_FILE:otterbrix_local> -Wl,--no-whole-archive)
+endif()
+
 target_link_libraries(
     ${PROJECT_NAME} PRIVATE
     lib_otterstax
     file
-    -Wl,--whole-archive $<TARGET_FILE:otterbrix_local> -Wl,--no-whole-archive
+    ${${PROJECT_NAME}_WHOLE_ARCHIVE}
     actor-zeta::actor-zeta
     otterbrix::otterbrix
     Catch2::Catch2
     otterbrix_log
 )
 
-#otterstax_discover_tests(${PROJECT_NAME})
-include(CTest)
-include(Catch)
-catch_discover_tests(${PROJECT_NAME})
+otterstax_discover_tests(${PROJECT_NAME})

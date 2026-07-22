@@ -3,7 +3,7 @@
 
 #include "otterbrix/translators/input/ch_to_chunk.hpp"
 
-#include <catch2/catch.hpp>
+#include <catch2/catch_all.hpp>
 
 #include <clickhouse/columns/numeric.h>
 #include <clickhouse/columns/string.h>
@@ -100,8 +100,8 @@ TEST_CASE("ch_to_chunk: Float64 column values round-trip") {
     auto chunk = tsl::ch_to_chunk(res, block);
 
     REQUIRE(chunk.size() == 2);
-    REQUIRE(chunk.value(0, 0).value<double>() == Approx(1.5));
-    REQUIRE(chunk.value(0, 1).value<double>() == Approx(2.5));
+    REQUIRE(chunk.value(0, 0).value<double>() == Catch::Approx(1.5));
+    REQUIRE(chunk.value(0, 1).value<double>() == Catch::Approx(2.5));
 }
 
 TEST_CASE("ch_to_chunk: String column values round-trip") {

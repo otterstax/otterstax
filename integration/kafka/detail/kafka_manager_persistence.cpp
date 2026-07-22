@@ -135,16 +135,17 @@ namespace otterstax::kafka {
             bool transactional;
         };
         std::vector<meta_t> metas;
-        const auto& chunk = cursor->chunk_data();
-        for (std::uint64_t row = 0; row < chunk.size(); ++row) {
-            metas.push_back(meta_t{std::string{chunk.value(0, row).value<std::string_view>()},
-                                   std::string{chunk.value(1, row).value<std::string_view>()},
-                                   std::string{chunk.value(2, row).value<std::string_view>()},
-                                   std::string{chunk.value(3, row).value<std::string_view>()},
-                                   std::string{chunk.value(4, row).value<std::string_view>()},
-                                   std::string{chunk.value(5, row).value<std::string_view>()},
-                                   std::string{chunk.value(7, row).value<std::string_view>()},
-                                   chunk.value(6, row).value<std::string_view>() == "true"});
+        // b1/b2: iterate the cursor's chunk-spanning row space (value()/size()); a
+        // registry of >1024 objects would otherwise lose everything past chunk 0.
+        for (std::uint64_t row = 0; row < cursor->size(); ++row) {
+            metas.push_back(meta_t{std::string{cursor->value(0, row).value<std::string_view>()},
+                                   std::string{cursor->value(1, row).value<std::string_view>()},
+                                   std::string{cursor->value(2, row).value<std::string_view>()},
+                                   std::string{cursor->value(3, row).value<std::string_view>()},
+                                   std::string{cursor->value(4, row).value<std::string_view>()},
+                                   std::string{cursor->value(5, row).value<std::string_view>()},
+                                   std::string{cursor->value(7, row).value<std::string_view>()},
+                                   cursor->value(6, row).value<std::string_view>() == "true"});
         }
 
         auto make_options = [](const meta_t& m) {

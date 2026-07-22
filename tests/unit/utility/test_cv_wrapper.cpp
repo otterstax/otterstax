@@ -4,7 +4,7 @@
 #include "utility/cv_wrapper.hpp"
 #include "utility/tsan_helper.hpp"
 
-#include <catch2/catch.hpp>
+#include <catch2/catch_all.hpp>
 #include <chrono>
 #include <iostream>
 #include <thread>

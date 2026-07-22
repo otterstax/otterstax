@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2025-2026  OtterStax
 
-#include <catch2/catch.hpp>
+#include <catch2/catch_all.hpp>
 
 #include <components/cursor/cursor.hpp>
 #include <components/logical_plan/execution_plan.hpp>
@@ -68,9 +68,9 @@ TEST_CASE("kafka dry: CREATE/DROP SOURCE materialises tables, STREAM does not") 
         if (!cursor || cursor->is_error()) {
             return false;
         }
-        const auto& chunk = cursor->chunk_data();
-        for (std::uint64_t row = 0; row < chunk.size(); ++row) {
-            if (std::string{chunk.value(0, row).value<std::string_view>()} == name) {
+        // b1/b2: cursor->value() spans the <=1024-row chunks of the result
+        for (std::uint64_t row = 0; row < cursor->size(); ++row) {
+            if (std::string{cursor->value(0, row).value<std::string_view>()} == name) {
                 return true;
             }
         }
@@ -179,9 +179,9 @@ TEST_CASE("kafka insert-query: INSERT INTO stream SELECT registers + persists, D
                                                                     "SELECT name, kind FROM kafka.__sources;"));
         int n = 0;
         if (cursor && !cursor->is_error()) {
-            const auto& chunk = cursor->chunk_data();
-            for (std::uint64_t row = 0; row < chunk.size(); ++row) {
-                if (std::string{chunk.value(1, row).value<std::string_view>()} == kind) {
+            // b1/b2: cursor->value() spans the <=1024-row chunks of the result
+            for (std::uint64_t row = 0; row < cursor->size(); ++row) {
+                if (std::string{cursor->value(1, row).value<std::string_view>()} == kind) {
                     ++n;
                 }
             }

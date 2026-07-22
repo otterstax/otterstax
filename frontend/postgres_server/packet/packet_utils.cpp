@@ -20,7 +20,7 @@ namespace frontend::postgres {
     command_complete_tag::command_complete_tag(std::string tag)
         : tag(std::move(tag)) {}
 
-    command_complete_tag command_complete_tag::simple_command(NodeTag node, int32_t rows) {
+    command_complete_tag command_complete_tag::simple_command(NodeTag node, int64_t rows) {
         switch (node) {
             case T_CreateStmt:
                 return {"CREATE TABLE"};
@@ -46,10 +46,10 @@ namespace frontend::postgres {
                 return {"COMMAND"};
         }
     }
-    command_complete_tag command_complete_tag::select(int32_t rows) { return {"SELECT " + std::to_string(rows)}; }
-    command_complete_tag command_complete_tag::insert(int32_t rows) { return {"INSERT 0 " + std::to_string(rows)}; }
-    command_complete_tag command_complete_tag::update(int32_t rows) { return {"UPDATE " + std::to_string(rows)}; }
-    command_complete_tag command_complete_tag::delete_rows(int32_t rows) { return {"DELETE " + std::to_string(rows)}; }
+    command_complete_tag command_complete_tag::select(int64_t rows) { return {"SELECT " + std::to_string(rows)}; }
+    command_complete_tag command_complete_tag::insert(int64_t rows) { return {"INSERT 0 " + std::to_string(rows)}; }
+    command_complete_tag command_complete_tag::update(int64_t rows) { return {"UPDATE " + std::to_string(rows)}; }
+    command_complete_tag command_complete_tag::delete_rows(int64_t rows) { return {"DELETE " + std::to_string(rows)}; }
     command_complete_tag command_complete_tag::begin() { return {"BEGIN"}; }
     command_complete_tag command_complete_tag::commit() { return {"COMMIT"}; }
     command_complete_tag command_complete_tag::rollback() { return {"ROLLBACK"}; }

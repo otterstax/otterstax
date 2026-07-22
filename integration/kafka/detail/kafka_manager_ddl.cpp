@@ -9,7 +9,7 @@
 #include "utility/logger.hpp"
 #include "utility/tracy_profiler.hpp"
 
-#include <components/logical_plan/node_drop_collection.hpp>
+#include <components/logical_plan/node_drop.hpp>
 #include <components/logical_plan/param_storage.hpp>
 #include <components/sql/transformer/utils.hpp>
 #include <components/table/column_definition.hpp>
@@ -207,7 +207,7 @@ namespace otterstax::kafka {
     actor_zeta::unique_future<cursor::cursor_t_ptr> KafkaManager::handle_drop_source(kafka_node_ptr node) {
         pollers_.erase(node->name()); // stop the ingestion poller before dropping its table
 
-        auto drop = logical_plan::make_node_drop_collection(resource_);
+        auto drop = logical_plan::make_node_drop(resource_, logical_plan::drop_target_kind::collection);
         logical_plan::node_ptr plan_node =
             sql::transform::maybe_wrap_with_catalog_resolve_table(resource_,
                                                                   std::string{KAFKA_DATABASE_NAME},

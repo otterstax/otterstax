@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.15)
 project(otterstax)
 
+set(CMAKE_POLICY_DEFAULT_CMP0167 NEW)
+
 set(CMAKE_VERBOSE_MAKEFILE TRUE)
 set(CMAKE_CXX_STANDARD 20 CACHE STRING "The C++ standard whose features are requested." FORCE)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -21,7 +23,10 @@ list(APPEND CMAKE_MODULE_PATH ${CMAKE_SOURCE_DIR}/cmake)
 # The patchelf step in conanfile.py generate() adds $ORIGIN to every copied .so in lib/,
 # so each library can also find its own siblings — covering transitive deps through
 # RPATH-less Conan packages (e.g. boost) without requiring DT_RPATH inheritance.
-set(CMAKE_INSTALL_RPATH "$ORIGIN/lib:$ORIGIN")
+# $ORIGIN = Linux ld.so, @loader_path = macOS dyld; each ignores the other.
+# Semicolon-separated CMake list: colons inside one entry survive on ELF but
+# become a single bogus LC_RPATH on macOS.
+set(CMAKE_INSTALL_RPATH "$ORIGIN/lib;$ORIGIN;@loader_path/lib;@loader_path")
 set(CMAKE_BUILD_WITH_INSTALL_RPATH ON)
 
 # Set spdlog active level (can be overridden via -DSPDLOG_ACTIVE_LEVEL=...)
@@ -66,8 +71,8 @@ endif()
 find_package(Arrow REQUIRED)
 find_package(otterbrix REQUIRED COMPONENTS log)
 find_package(actor-zeta REQUIRED)
-find_package(Catch2 2.13.7 REQUIRED)
-find_package(Boost 1.87.0 REQUIRED COMPONENTS
+find_package(Catch2 3 REQUIRED)
+find_package(Boost 1.88.0 REQUIRED COMPONENTS
     asio
     beast
     json
@@ -134,15 +139,28 @@ add_library(lib_${PROJECT_NAME} INTERFACE
 
 # set_property(TARGET otterbrix_${PROJECT_NAME} PROPERTY EXPORT_NAME ${PROJECT_NAME})
 
+# These internal static libs cross-reference each other (e.g. scheduler uses
+# integration handlers while integration/otterbrix_local use scheduler's
+# schema_utils), so a single left-to-right link pass can miss objects only
+# one of them pulls (e.g. integration/s3/s3_manager.o, referenced solely by
+# the Scheduler). RESCAN groups them (--start-group/--end-group) so the
+# linker re-pulls until the cycle is fully resolved. Apple's ld64 rejects
+# LINK_GROUP:RESCAN for CXX and does not need it — it re-searches archives
+# until no new symbols resolve.
+set(OTTERSTAX_INTERNAL_LIBS
+    flight_sql_server common_server mysql_server postgres_server catalog
+    connectors s3 file api_server component_manager integration otterbrix_local
+    scheduler kafka_grammar kafka_runtime)
+if(APPLE)
+    set(OTTERSTAX_LINK_GROUP ${OTTERSTAX_INTERNAL_LIBS})
+else()
+    list(JOIN OTTERSTAX_INTERNAL_LIBS "," _otterstax_internal_libs_csv)
+    set(OTTERSTAX_LINK_GROUP "$<LINK_GROUP:RESCAN,${_otterstax_internal_libs_csv}>")
+endif()
+
 target_link_libraries(
     lib_${PROJECT_NAME} INTERFACE
-    # These internal static libs cross-reference each other (e.g. scheduler uses
-    # integration handlers while integration/otterbrix_local use scheduler's
-    # schema_utils), so a single left-to-right link pass can miss objects only
-    # one of them pulls (e.g. integration/s3/s3_manager.o, referenced solely by
-    # the Scheduler). RESCAN groups them (--start-group/--end-group) so the
-    # linker re-pulls until the cycle is fully resolved.
-    "$<LINK_GROUP:RESCAN,flight_sql_server,common_server,mysql_server,postgres_server,catalog,connectors,s3,file,api_server,component_manager,integration,otterbrix_local,scheduler,kafka_grammar,kafka_runtime>"
+    ${OTTERSTAX_LINK_GROUP}
     config::config
     arrow::arrow
     Boost::boost

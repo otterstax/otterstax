@@ -447,6 +447,9 @@ clickhouse_data/
 init/
 fixtures/init/
 tests/init/
+# quick-start ships its init data as committed static files (zero-prep `docker compose up`)
+!examples/quick_start/init/
+!examples/quick_start/init/**
 tests/mariadb1/
 tests/mariadb2/
 tests/mariadb3/

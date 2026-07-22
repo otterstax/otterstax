@@ -381,6 +381,10 @@ actor_zeta::behavior_t Worker::behavior(actor_zeta::mailbox::message* msg) {
         co_await actor_zeta::dispatch(this, &Worker::prepare_schema, msg);
     } else if (cmd == actor_zeta::msg_id<Worker, &Worker::close_statement>) {
         co_await actor_zeta::dispatch(this, &Worker::close_statement, msg);
+    } else if (cmd == actor_zeta::msg_id<Worker, &Worker::execute_plan>) {
+        co_await actor_zeta::dispatch(this, &Worker::execute_plan, msg);
+    } else if (cmd == actor_zeta::msg_id<Worker, &Worker::prepare_plan>) {
+        co_await actor_zeta::dispatch(this, &Worker::prepare_plan, msg);
     }
 }
 
@@ -481,6 +485,11 @@ actor_zeta::unique_future<Worker::session_result> Worker::execute(session_hash_t
         co_return session_payload{resource()};
     }
 
+    co_return co_await classify_and_run(id, std::move(data));
+}
+
+actor_zeta::unique_future<Worker::session_result> Worker::classify_and_run(session_hash_t id,
+                                                                           ParsedQueryDataPtr data) {
     if (auto guard = co_await guard_database_ddl(*data); guard.contains_error()) {
         co_return std::move(guard);
     }
@@ -504,7 +513,7 @@ actor_zeta::unique_future<Worker::session_result> Worker::execute(session_hash_t
     auto it = metadata_map_.find(id);
     assert(it != metadata_map_.end() && "update_metadata stores the entry it was just given");
     const auto backend = it->second.backend_type;
-    log_->debug("Worker::execute routing to backend_type: {}", static_cast<int>(backend));
+    log_->debug("Worker::classify_and_run routing to backend_type: {}", static_cast<int>(backend));
     if (backend == backend_type_t::Unknown) {
         co_return make_error(resource(),
                              error_code_t::schema_error,
@@ -632,6 +641,11 @@ actor_zeta::unique_future<Worker::session_result> Worker::prepare_schema(session
         }
     }
 
+    co_return co_await describe_parsed(id, std::move(parsed_data));
+}
+
+actor_zeta::unique_future<Worker::session_result> Worker::describe_parsed(session_hash_t id,
+                                                                          ParsedQueryDataPtr parsed_data) {
     if (auto guard = co_await guard_database_ddl(*parsed_data); guard.contains_error()) {
         co_return std::move(guard);
     }
@@ -876,6 +890,47 @@ actor_zeta::unique_future<Worker::session_result> Worker::close_statement(sessio
     // session that was never prepared changes nothing.
     metadata_map_.erase(id);
     co_return session_payload{resource()};
+}
+
+actor_zeta::unique_future<Worker::session_result> Worker::execute_plan(session_hash_t id, ParsedQueryDataPtr data) {
+    assert(id % worker_count_ == self_index_);
+    Timer timer("Worker::execute_plan", log_);
+    erase_on_exit_t erase_entry{metadata_map_, id};
+
+    {
+        OTX_ZONE_N("Worker::execute_plan");
+        if (!data || !data->otterbrix_params || !data->otterbrix_params->node) {
+            co_return make_error(resource(), error_code_t::invalid_parameter, "execute_plan: no plan to execute");
+        }
+        // Grammar-extension roots (CREATE EXTERNAL TABLE, COPY ... TO, kafka
+        // DDL) come from SQL text only; a pre-built plan is a query.
+        if (data->extension_kind != extension_kind_t::none) {
+            co_return make_error(resource(),
+                                 error_code_t::invalid_parameter,
+                                 "execute_plan: extension statements are not accepted");
+        }
+    }
+
+    co_return co_await classify_and_run(id, std::move(data));
+}
+
+actor_zeta::unique_future<Worker::session_result> Worker::prepare_plan(session_hash_t id, ParsedQueryDataPtr data) {
+    assert(id % worker_count_ == self_index_);
+    Timer timer("Worker::prepare_plan", log_);
+
+    {
+        OTX_ZONE_N("Worker::prepare_plan");
+        if (!data || !data->otterbrix_params || !data->otterbrix_params->node) {
+            co_return make_error(resource(), error_code_t::invalid_parameter, "prepare_plan: no plan to describe");
+        }
+        if (data->extension_kind != extension_kind_t::none) {
+            co_return make_error(resource(),
+                                 error_code_t::invalid_parameter,
+                                 "prepare_plan: extension statements are not accepted");
+        }
+    }
+
+    co_return co_await describe_parsed(id, std::move(data));
 }
 
 // ─── Backend dispatch + engine execution ─────────────────────────────────────

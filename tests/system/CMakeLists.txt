@@ -32,6 +32,9 @@ set(${PROJECT_NAME}_SOURCES
     test_frontend_connection_lifetime.cpp
     test_frontend_malformed_packet.cpp
     test_frontend_accept_retry.cpp
+    test_spark_plan_execution.cpp
+    test_prepare_plan.cpp
+    test_constant_aggregates.cpp
 )
 
 add_executable(${PROJECT_NAME} ${${PROJECT_NAME}_SOURCES})
@@ -49,6 +52,7 @@ endif()
 target_link_libraries(
     ${PROJECT_NAME} PRIVATE
     lib_otterstax
+    spark_connect_server
     file
     ${${PROJECT_NAME}_WHOLE_ARCHIVE}
     actor-zeta::actor-zeta

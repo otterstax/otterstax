@@ -83,6 +83,21 @@ public:
 
     core::result_wrapper_t<ParsedQueryDataPtr> parse(const std::string& sql) override;
 
+    // Parses `sql` — exactly one SELECT — and returns the transformed plan
+    // root, binding every constant into `shared_params`: the caller's
+    // parameter node, whose id counter continues, so the fragment's ids never
+    // collide with those already in the caller's plan. For a host that builds
+    // a plan itself and grafts SQL into it (the Spark Connect translator: a
+    // spark.sql() leaf, a filter string). No external-node analysis: `names`
+    // receives the full name of every table the statement reads, as parse()
+    // collects them, for the caller to resolve the returned nodes against. A
+    // statement that lowers a sub-query is refused: the sub-plan would be
+    // dropped with the rest of the fragment's execution plan.
+    core::result_wrapper_t<components::logical_plan::node_ptr>
+    parse_fragment(const std::string& sql,
+                   components::logical_plan::parameter_node_ptr shared_params,
+                   otterstax::names::name_registry_t& names);
+
 private:
     std::pmr::memory_resource* resource_;
     log_t log_;

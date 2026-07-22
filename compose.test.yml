@@ -136,6 +136,7 @@ services:
       - "8815"
       - "8816"
       - "8817"
+      - "15002"
     ports:
       - "8086:8086"
     # Fixtures used by the file/s3 external-table tests are baked into the
@@ -221,6 +222,34 @@ services:
       - mariadb2_init:/app/mariadb2_init
       - postgres_init:/app/postgres_init
       - clickhouse_init:/app/clickhouse_init
+      - ./tests/logs:/app/logs
+    networks:
+      - test_app_network
+    dns_search: ""
+
+  # PySpark client compatibility matrix (Dockerfile.spark-test): every released
+  # PySpark Connect client against the Spark Connect frontend (port 15002), run
+  # by docker-run-tests.sh after the standard suite. CI pre-builds the image
+  # and passes its tag in SPARK_CLIENT_IMAGE.
+  test-spark-client:
+    image: ${SPARK_CLIENT_IMAGE:-otterstax_spark_client:latest}
+    build:
+      context: .
+      dockerfile: Dockerfile.spark-test
+    depends_on:
+      mariadb1:
+        condition: service_healthy
+      mariadb2:
+        condition: service_healthy
+      postgres1:
+        condition: service_healthy
+      clickhouse1:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      test-otterstax:
+        condition: service_healthy
+    volumes:
       - ./tests/logs:/app/logs
     networks:
       - test_app_network

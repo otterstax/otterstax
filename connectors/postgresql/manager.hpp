@@ -75,20 +75,35 @@ namespace pg {
             // std::exception across the io->consumer boundary (boost.asio use_future captures +
             // destroys the exception_ptr on the io thread, racing future.get(); TSAN race under
             // boost 1.88). The consumer rethrows from the copied string on its own thread.
-            // NOTE: co_return of a braced aggregate whose initializer contains a
-            // co_await double-destroys the aggregate's members under gcc
-            // (glibc "free(): invalid pointer" on the error string); clang is
-            // unaffected. Build a named local and co_return it instead.
-            auto guarded = [](awaitable<result_t> inner) -> awaitable<query_outcome<result_t>> {
+            // NOTE: returning a non-trivial type through gcc's coroutine
+            // return-value machinery + asio::use_future bitwise-copies the value
+            // out of the coroutine frame (an SSO std::string ends up pointing
+            // into the freed frame -> glibc "free(): invalid pointer"; ASAN
+            // bad-free). Both the braced-aggregate and named-local co_return
+            // forms miscompile under gcc-11 at -O0. Sidestep the machinery:
+            // marshal through an explicit std::promise owned OUTSIDE the frame —
+            // set_value() is an ordinary call inside the coroutine body, so the
+            // move into the shared state is plain, well-defined code. clang was
+            // never affected, which is why macOS runs stayed green.
+            auto prom = std::make_shared<std::promise<query_outcome<result_t>>>();
+            auto fut = prom->get_future();
+            // prom rides as a coroutine PARAMETER (copied into the frame), NOT a
+            // lambda capture: the closure temporary dies at the end of this full
+            // expression while the suspended coroutine would still reference it.
+            auto guarded = [](std::shared_ptr<std::promise<query_outcome<result_t>>> p,
+                              awaitable<result_t> inner) -> awaitable<void> {
                 query_outcome<result_t> out{};
                 try {
                     out.value = co_await std::move(inner);
                 } catch (const std::exception& e) {
                     out.error = e.what();
+                } catch (...) {
+                    out.error = "unknown connector error";
                 }
-                co_return out;
-            }(conn->second->runQuery(query, handler));
-            return co_spawn(thread_pool_manager_.ctx(), std::move(guarded), asio::use_future);
+                p->set_value(std::move(out));
+            }(prom, conn->second->runQuery(query, handler));
+            co_spawn(thread_pool_manager_.ctx(), std::move(guarded), asio::detached);
+            return fut;
         }
 
         size_t totalConnections() const noexcept;

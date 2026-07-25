@@ -67,7 +67,12 @@ namespace ch {
                 try {
                     conn->second->tryReconnect();
                 } catch (const std::exception& e) {
-                    notify_connection_removed(uuid);
+                    // A transient reconnect failure must NOT tear down global state:
+                    // notify_connection_removed unregisters this uid's external database
+                    // from the ENGINE catalog while other sessions' in-flight plans still
+                    // reference it — under parallel load they then die with a misleading
+                    // "database does not exist" (the TSAN concurrency failure). Only an
+                    // explicit removeConnection() unregisters; here we fail THIS query only.
                     throw std::runtime_error("Failed to reconnect. Error message: " + std::string(e.what()));
                 }
             }

@@ -56,6 +56,17 @@ endif()
 if (ENABLE_ASAN)
     add_compile_options(-O0 -g -fno-omit-frame-pointer -fsanitize=address)
     add_link_options(-fsanitize=address)
+    # otterbrix's core/pmr.hpp switches base_otterbrix_t's by-value member type
+    # on the CONSUMER's __SANITIZE_ADDRESS__ (resource_tracer_t=128B vs
+    # synchronized_pool_resource=136B on x86 gcc-11), so an ASAN-built app sees
+    # the class 8 bytes shorter than the non-ASAN engine .so and lays
+    # otterbrix_engine_t's intrusive refcount on top of the lib's
+    # wrapper_dispatcher_ slot (refcount=1 clobbers the pointer's low dword —
+    # the 0x…0001 garbage-this crashes in every ASAN ctest). The macro is
+    # informational only — undefining it does NOT disable instrumentation, it
+    # just makes our TUs see the same layout as the engine. Remove once the
+    # engine stops keying public ABI off consumer sanitizer macros.
+    add_compile_options(-U__SANITIZE_ADDRESS__)
 endif()
 
 if (ENABLE_TSAN)

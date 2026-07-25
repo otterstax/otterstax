@@ -75,12 +75,18 @@ namespace pg {
             // std::exception across the io->consumer boundary (boost.asio use_future captures +
             // destroys the exception_ptr on the io thread, racing future.get(); TSAN race under
             // boost 1.88). The consumer rethrows from the copied string on its own thread.
+            // NOTE: co_return of a braced aggregate whose initializer contains a
+            // co_await double-destroys the aggregate's members under gcc
+            // (glibc "free(): invalid pointer" on the error string); clang is
+            // unaffected. Build a named local and co_return it instead.
             auto guarded = [](awaitable<result_t> inner) -> awaitable<query_outcome<result_t>> {
+                query_outcome<result_t> out{};
                 try {
-                    co_return query_outcome<result_t>{co_await std::move(inner), {}};
+                    out.value = co_await std::move(inner);
                 } catch (const std::exception& e) {
-                    co_return query_outcome<result_t>{result_t{}, std::string{e.what()}};
+                    out.error = e.what();
                 }
+                co_return out;
             }(conn->second->runQuery(query, handler));
             return co_spawn(thread_pool_manager_.ctx(), std::move(guarded), asio::use_future);
         }

@@ -12,6 +12,7 @@
 #include <components/logical_plan/node_aggregate.hpp>
 #include <components/logical_plan/node_delete.hpp>
 #include <components/logical_plan/node_insert.hpp>
+#include <components/logical_plan/node_limit.hpp>
 #include <components/logical_plan/node_match.hpp>
 #include <components/logical_plan/param_storage.hpp>
 #include <components/sql/parser/extension.hpp>
@@ -354,7 +355,15 @@ namespace otterstax::kafka::detail {
             expressions::make_compare_expression(resource, expressions::compare_type::eq, column_key, value_param);
         auto match =
             logical_plan::make_node_match(resource, core::dbname_t{database}, core::relname_t{relname}, predicate);
-        auto del = logical_plan::make_node_delete_many(resource, match);
+        // b2-rc-2: make_node_delete_many -> make_node_delete(match, limit);
+        // unlimit() keeps the delete-all-matching semantics
+        auto del = logical_plan::make_node_delete(
+            resource,
+            match,
+            logical_plan::make_node_limit(resource,
+                                          core::dbname_t{database},
+                                          core::relname_t{relname},
+                                          logical_plan::limit_t::unlimit()));
         // constraint_resolve_kind::referencing mirrors transform_delete (FK cascade to
         // children); __sources has no FKs, so it is a no-op wrap here
         logical_plan::node_ptr node =

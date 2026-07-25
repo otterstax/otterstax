@@ -47,12 +47,15 @@ TEST_CASE("kafka dry: CREATE/DROP SOURCE materialises tables, STREAM does not") 
     GreenplumParser parser(resource);
     auto kafka_mgr = actor_zeta::spawn<KafkaManager>(resource, engine->engine_dispatcher_address());
 
-    // Probe a table's schema via LIMIT 0; the engine fills type_data even on an
-    // empty result. is_error() on the returned cursor == table absent
+    // Probe a table's schema via a plain SELECT: since b2-rc-2 a LIMIT plan
+    // (even LIMIT 1) short-circuits over an empty table and returns a bare
+    // cursor (no type_data, zero-column chunk), while an unlimited scan fills
+    // type_data on the empty result. Tables stay empty in this dry test, so
+    // the full scan is free. is_error() on the returned cursor == table absent
     auto probe = [&](const std::string& qualified) {
         return drive_until_ready(otterstax::kafka::detail::kafka_query(engine->engine_dispatcher_address(),
                                                                        resource,
-                                                                       "SELECT * FROM " + qualified + " LIMIT 0;"));
+                                                                       "SELECT * FROM " + qualified + ";"));
     };
     auto run_kafka = [&](kafka_node_ptr node) {
         auto [_, fut] =

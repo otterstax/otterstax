@@ -1046,8 +1046,9 @@ namespace sql_gen {
                     default:
                         // type/sequence/view/macro never reach the generator (local-only);
                         // kept as the file's throw-caught-at-actor-boundary contract (decision Q1).
+                        // b2-rc-2 dropped the free to_string(node_type) helper
                         throw std::logic_error("incorrect drop kind for generate_query: " +
-                                               to_string(node->type()));
+                                               std::to_string(static_cast<int>(node->type())));
                 }
                 break;
             }
@@ -1063,7 +1064,8 @@ namespace sql_gen {
                 generate_update(stream, reinterpret_cast<const node_update_ptr&>(node), parameters, backend, target);
                 break;
             default:
-                throw std::logic_error("incorrect node type for generate_query: " + to_string(node->type()));
+                throw std::logic_error("incorrect node type for generate_query: " +
+                                       std::to_string(static_cast<int>(node->type())));
         }
     }
 

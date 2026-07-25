@@ -160,15 +160,24 @@ namespace otterstax::kafka {
             return o;
         };
 
-        // Pass 1 — SOURCEs. Columns aren't persisted: re-read from the backing table
-        // catalog (SELECT * LIMIT 0)
+        // Pass 1 — SOURCEs. Columns aren't persisted: re-read from the backing
+        // table. b2-rc-2: LIMIT plans over an EMPTY table short-circuit to a
+        // bare cursor (no type_data) — a LIMIT-0 probe would silently drop any
+        // source whose backing table is empty at restart. LIMIT 1 bounds the
+        // probe on populated tables; bare-but-not-error means the table is
+        // empty, so the unlimited re-read is free.
         for (const auto& m : metas) {
             if (m.kind != "source") {
                 continue;
             }
             auto schema_cursor =
-                drive(kafka_query(dispatcher_address_, resource_, "SELECT * FROM kafka." + m.name + " LIMIT 0;"));
+                drive(kafka_query(dispatcher_address_, resource_, "SELECT * FROM kafka." + m.name + " LIMIT 1;"));
             auto columns = columns_from_cursor(schema_cursor);
+            if (columns.empty() && schema_cursor && !schema_cursor->is_error()) {
+                schema_cursor =
+                    drive(kafka_query(dispatcher_address_, resource_, "SELECT * FROM kafka." + m.name + ";"));
+                columns = columns_from_cursor(schema_cursor);
+            }
             if (columns.empty()) {
                 // Backing table gone (e.g. a dropped source whose __sources row lingers)
                 log_->warn("kafka: recover source '{}': no backing-table schema, skipping", m.name);

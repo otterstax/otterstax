@@ -197,6 +197,78 @@ TEST_CASE("generate_query: no LIMIT clause when the query has none") {
     REQUIRE(sql.find("LIMIT") == std::string::npos);
 }
 
+// b2-rc-2's grammar accepts DML LIMIT (DELETE/UPDATE ... LIMIT n) and attaches
+// a node_limit_t child. Regression: the generator used to ignore it, silently
+// deleting/updating every matching remote row.
+TEST_CASE("generate_query: DELETE ... LIMIT reaches MySQL SQL, throws for PostgreSQL") {
+    auto* resource = std::pmr::get_default_resource();
+    GreenplumParser parser(resource);
+
+    auto parsed = parse_or_die(parser, "DELETE FROM mysql.bill.schema.orders WHERE id > 0 LIMIT 5;");
+
+    auto nodes = flat_externals(parsed);
+    auto mysql_node = find_by_uid(nodes, "mysql");
+    REQUIRE(mysql_node.node);
+
+    const auto& params = parsed->otterbrix_params->params_node->parameters();
+    auto sql = sql_gen::generate_query(mysql_node.node,
+                                       &params,
+                                       backend_type_t::MySQL,
+                                       mysql_node.target,
+                                       batch_targets_of(parsed, mysql_node));
+    REQUIRE(sql.find("LIMIT 5") != std::string::npos);
+
+    REQUIRE_THROWS(sql_gen::generate_query(mysql_node.node,
+                                           &params,
+                                           backend_type_t::PostgreSQL,
+                                           mysql_node.target,
+                                           batch_targets_of(parsed, mysql_node)));
+}
+
+TEST_CASE("generate_query: UPDATE ... LIMIT reaches MySQL SQL, throws for PostgreSQL") {
+    auto* resource = std::pmr::get_default_resource();
+    GreenplumParser parser(resource);
+
+    auto parsed = parse_or_die(parser, "UPDATE mysql.bill.schema.orders SET name = 'x' WHERE id > 0 LIMIT 3;");
+
+    auto nodes = flat_externals(parsed);
+    auto mysql_node = find_by_uid(nodes, "mysql");
+    REQUIRE(mysql_node.node);
+
+    const auto& params = parsed->otterbrix_params->params_node->parameters();
+    auto sql = sql_gen::generate_query(mysql_node.node,
+                                       &params,
+                                       backend_type_t::MySQL,
+                                       mysql_node.target,
+                                       batch_targets_of(parsed, mysql_node));
+    REQUIRE(sql.find("LIMIT 3") != std::string::npos);
+
+    REQUIRE_THROWS(sql_gen::generate_query(mysql_node.node,
+                                           &params,
+                                           backend_type_t::PostgreSQL,
+                                           mysql_node.target,
+                                           batch_targets_of(parsed, mysql_node)));
+}
+
+TEST_CASE("generate_query: DELETE without LIMIT emits no LIMIT clause") {
+    auto* resource = std::pmr::get_default_resource();
+    GreenplumParser parser(resource);
+
+    auto parsed = parse_or_die(parser, "DELETE FROM mysql.bill.schema.orders WHERE id > 0;");
+
+    auto nodes = flat_externals(parsed);
+    auto mysql_node = find_by_uid(nodes, "mysql");
+    REQUIRE(mysql_node.node);
+
+    const auto& params = parsed->otterbrix_params->params_node->parameters();
+    auto sql = sql_gen::generate_query(mysql_node.node,
+                                       &params,
+                                       backend_type_t::MySQL,
+                                       mysql_node.target,
+                                       batch_targets_of(parsed, mysql_node));
+    REQUIRE(sql.find("LIMIT") == std::string::npos);
+}
+
 TEST_CASE("generate_query: PostgreSQL node produces schema.collection reference") {
     auto* resource = std::pmr::get_default_resource();
     GreenplumParser parser(resource);

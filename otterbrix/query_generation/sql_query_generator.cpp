@@ -767,10 +767,20 @@ namespace {
                          backend_type_t backend,
                          const otterstax::names::resolved_target_t& target) {
         node_match_ptr match = nullptr;
+        node_limit_ptr limit = nullptr;
         for (const auto& child : node->children()) {
             if (child->type() == node_type::match_t) {
                 match = reinterpret_cast<const node_match_ptr&>(child);
+            } else if (child->type() == node_type::limit_t) {
+                limit = reinterpret_cast<const node_limit_ptr&>(child);
             }
+        }
+        // b2-rc-2's grammar accepts DELETE ... LIMIT n (transformer attaches a
+        // limit child). Only MySQL can express single-table DELETE ... LIMIT;
+        // silently dropping it would delete every matching remote row.
+        const bool has_dml_limit = limit && limit->limit().limit() >= 0;
+        if (has_dml_limit && backend != backend_type_t::MySQL) {
+            throw std::logic_error("DELETE ... LIMIT is not supported for this backend");
         }
         stream << "DELETE FROM ";
         stream << sql_gen::table_reference(target.name, backend);
@@ -785,6 +795,9 @@ namespace {
                                   reinterpret_cast<const compare_expression_ptr&>(match->expressions().front()),
                                   parameters,
                                   backend);
+        }
+        if (has_dml_limit) {
+            stream << " LIMIT " << limit->limit().limit();
         }
     }
 
@@ -869,10 +882,20 @@ namespace {
                          backend_type_t backend,
                          const otterstax::names::resolved_target_t& target) {
         node_match_ptr match = nullptr;
+        node_limit_ptr limit = nullptr;
         for (const auto& child : node->children()) {
             if (child->type() == node_type::match_t) {
                 match = reinterpret_cast<const node_match_ptr&>(child);
+            } else if (child->type() == node_type::limit_t) {
+                limit = reinterpret_cast<const node_limit_ptr&>(child);
             }
+        }
+        // b2-rc-2's grammar accepts UPDATE ... LIMIT n (transformer attaches a
+        // limit child). Only MySQL can express single-table UPDATE ... LIMIT;
+        // silently dropping it would update every matching remote row.
+        const bool has_dml_limit = limit && limit->limit().limit() >= 0;
+        if (has_dml_limit && backend != backend_type_t::MySQL) {
+            throw std::logic_error("UPDATE ... LIMIT is not supported for this backend");
         }
         stream << "UPDATE " << sql_gen::table_reference(target.name, backend) << " ";
         bool comma = false;
@@ -894,6 +917,9 @@ namespace {
                                   reinterpret_cast<const compare_expression_ptr&>(match->expressions().front()),
                                   parameters,
                                   backend);
+        }
+        if (has_dml_limit) {
+            stream << " LIMIT " << limit->limit().limit();
         }
     }
 

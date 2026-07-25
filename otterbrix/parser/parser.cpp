@@ -340,6 +340,16 @@ core::result_wrapper_t<ParsedQueryDataPtr> GreenplumParser::parse(const std::str
         otterstax::parser::collect_qualified_names(res, registry);
 
         auto tag = nodeTag(res);
+        // b2-rc-2's transformer lowers EXPLAIN to the INNER statement's plan and
+        // stamps the explain mode on the transform_result's private plan — which
+        // this pipeline discards (execute_plan.cpp rebuilds a fresh
+        // execution_plan_t). Without this guard "EXPLAIN DELETE ..." would
+        // silently EXECUTE the inner statement. Reject up front (rc-1 behavior).
+        if (tag == T_ExplainStmt) {
+            log_->error("parse: EXPLAIN is not supported by OtterStax");
+            return core::error_t{core::error_code_t::unimplemented_yet,
+                                 std::pmr::string{"EXPLAIN is not supported by OtterStax", resource_}};
+        }
         log_->trace("parse: calling transformer.transform");
         auto binder = transformer.transform(sql::transform::pg_cell_to_node_cast(res));
         log_->trace("parse: transformer.transform complete");

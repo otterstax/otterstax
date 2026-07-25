@@ -737,7 +737,7 @@ TEST_CASE("otterbrix get_schema: sequence-rooted SELECT resolves columns") {
     auto* resource = inst->dispatcher()->resource();
 
     {
-        // Local engine table the LIMIT 0 schema probe resolves against.
+        // Local engine table the get_schema dependency probe resolves against.
         auto setup = make_otterbrix_manager(inst);
         auto db_cursor = setup->execute_sql("CREATE DATABASE db1;");
         REQUIRE(db_cursor);

@@ -217,10 +217,9 @@ namespace otterstax::names {
                                      "CREATE DATABASE is local by grammar and must not be resolved",
                                      resource}};
             }
-            // DML and table-level DDL nodes carry no names; resolve the target
-            // table from the FIRST catalog_resolve (kind==table) sibling via the
-            // resolve_from_sibling lambda above. drop_index carries a SECOND
-            // resolve_table for the index itself — the table one comes first.
+            // Target table comes from the sibling resolve (resolve_from_sibling
+            // above). drop_index carries a SECOND resolve_table for the index
+            // itself — the table one comes first, so the scan picks the right one.
             case node_type::create_index_t:
             case node_type::insert_t:
             case node_type::update_t:

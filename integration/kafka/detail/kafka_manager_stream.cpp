@@ -81,7 +81,7 @@ namespace otterstax::kafka {
             // This path runs only the source subplan (no backing-table write), so the
             // engine never type-checks the rows — reject a batch that wouldn't round-trip
             // into the declared schema rather than publish junk to the topic.
-            // b1/b2: the result spans multiple <=1024-row chunks (never combined) —
+            // The result spans multiple <=1024-row chunks (never combined) —
             // validate and serialize ALL of them or rows are silently dropped.
             const auto& chunks = cursor->chunks();
             if (!chunk_matches_columns(resource_, chunks, it->second.columns)) {

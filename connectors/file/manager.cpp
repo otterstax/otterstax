@@ -183,7 +183,7 @@ actor_zeta::unique_future<core::result_wrapper_t<std::string>> FileManager::dump
                                   ? temporary_path(file_metadata.path)
                                   : file_metadata.path;
 
-        // b1/b2 cursors return the result as a vector of <=1024-row chunks (never
+        // Engine cursors return the result as a vector of <=1024-row chunks (never
         // combined into one); write them all via the multi-chunk writer overloads.
         const auto& chunks = cursor->chunks();
         switch (file_metadata.format) {

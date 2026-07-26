@@ -47,11 +47,11 @@ TEST_CASE("kafka dry: CREATE/DROP SOURCE materialises tables, STREAM does not") 
     GreenplumParser parser(resource);
     auto kafka_mgr = actor_zeta::spawn<KafkaManager>(resource, engine->engine_dispatcher_address());
 
-    // Probe a table's schema via a plain SELECT: since b2-rc-2 a LIMIT plan
-    // (even LIMIT 1) short-circuits over an empty table and returns a bare
-    // cursor (no type_data, zero-column chunk), while an unlimited scan fills
-    // type_data on the empty result. Tables stay empty in this dry test, so
-    // the full scan is free. is_error() on the returned cursor == table absent
+    // Probe a table's schema via a plain SELECT: a LIMIT plan (even LIMIT 1)
+    // short-circuits over an empty table and returns a bare cursor (no
+    // type_data, zero-column chunk), while an unlimited scan fills type_data
+    // on the empty result. Tables stay empty in this dry test, so the full
+    // scan is free. is_error() on the returned cursor == table absent
     auto probe = [&](const std::string& qualified) {
         return drive_until_ready(otterstax::kafka::detail::kafka_query(engine->engine_dispatcher_address(),
                                                                        resource,
@@ -71,7 +71,7 @@ TEST_CASE("kafka dry: CREATE/DROP SOURCE materialises tables, STREAM does not") 
         if (!cursor || cursor->is_error()) {
             return false;
         }
-        // b1/b2: cursor->value() spans the <=1024-row chunks of the result
+        // cursor->value() spans the <=1024-row chunks of the result
         for (std::uint64_t row = 0; row < cursor->size(); ++row) {
             if (std::string{cursor->value(0, row).value<std::string_view>()} == name) {
                 return true;
@@ -182,7 +182,7 @@ TEST_CASE("kafka insert-query: INSERT INTO stream SELECT registers + persists, D
                                                                     "SELECT name, kind FROM kafka.__sources;"));
         int n = 0;
         if (cursor && !cursor->is_error()) {
-            // b1/b2: cursor->value() spans the <=1024-row chunks of the result
+            // cursor->value() spans the <=1024-row chunks of the result
             for (std::uint64_t row = 0; row < cursor->size(); ++row) {
                 if (std::string{cursor->value(1, row).value<std::string_view>()} == kind) {
                     ++n;

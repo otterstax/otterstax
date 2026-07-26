@@ -33,8 +33,8 @@ namespace otterstax::kafka::detail {
     // Inverse of json_to_chunk. Pure
     std::vector<std::string> chunk_to_json(const components::vector::data_chunk_t& chunk);
 
-    // Multi-chunk overload: b1/b2 cursors return a result as a vector of
-    // <=1024-row chunks (never combined). Serializes every chunk's rows, in order.
+    // Multi-chunk overload: cursors return a result as a vector of <=1024-row
+    // chunks (never combined). Serializes every chunk's rows, in order.
     std::vector<std::string> chunk_to_json(const std::pmr::vector<components::vector::data_chunk_t>& chunks);
 
     // True iff every row of `chunk` round-trips through `declared` (chunk_to_json ->

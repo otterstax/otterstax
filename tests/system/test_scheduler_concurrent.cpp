@@ -294,7 +294,7 @@ TEST_CASE("QueryHandleWaiter propagates future exceptions") {
     waiter.futures.push_back(good.get_future());
     waiter.futures.push_back(bad.get_future());
 
-    // Connector errors now arrive as a value (query_outcome::error), not a future
+    // Connector errors arrive as a value (query_outcome::error), not a future
     // exception (utility/wait_barrier.hpp — avoids the boost.asio use_future TSAN race);
     // wait() rethrows on the consumer thread when an outcome carries a non-empty error.
     good.set_value(query_outcome<int>{42, {}});

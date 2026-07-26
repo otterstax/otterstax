@@ -10,7 +10,7 @@
 #include <memory_resource>
 #include <vector>
 
-// b1: cursor results arrive as a batch of <=DEFAULT_VECTOR_CAPACITY chunks
+// Cursor results arrive as a batch of <=DEFAULT_VECTOR_CAPACITY chunks
 // (components::cursor::cursor_t::chunks(), never combined into one). The payload
 // carries them as a vector and exposes row-level accessors that span chunks.
 // Always holds >=1 chunk (possibly empty) so front()/column_count() are defined.

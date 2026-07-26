@@ -135,7 +135,7 @@ namespace otterstax::kafka {
             bool transactional;
         };
         std::vector<meta_t> metas;
-        // b1/b2: iterate the cursor's chunk-spanning row space (value()/size()); a
+        // Iterate the cursor's chunk-spanning row space (value()/size()); a
         // registry of >1024 objects would otherwise lose everything past chunk 0.
         for (std::uint64_t row = 0; row < cursor->size(); ++row) {
             metas.push_back(meta_t{std::string{cursor->value(0, row).value<std::string_view>()},
@@ -161,7 +161,7 @@ namespace otterstax::kafka {
         };
 
         // Pass 1 — SOURCEs. Columns aren't persisted: re-read from the backing
-        // table. b2-rc-2: LIMIT plans over an EMPTY table short-circuit to a
+        // table. The engine short-circuits LIMIT plans over an EMPTY table to a
         // bare cursor (no type_data) — a LIMIT-0 probe would silently drop any
         // source whose backing table is empty at restart. LIMIT 1 bounds the
         // probe on populated tables; bare-but-not-error means the table is

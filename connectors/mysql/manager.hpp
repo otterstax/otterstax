@@ -75,8 +75,8 @@ namespace mysql {
                     // notify_connection_removed unregisters this uid's external database
                     // from the ENGINE catalog while other sessions' in-flight plans still
                     // reference it — under parallel load they then die with a misleading
-                    // "database does not exist" (the TSAN concurrency failure). Only an
-                    // explicit removeConnection() unregisters; here we fail THIS query only.
+                    // "database does not exist". Only an explicit removeConnection()
+                    // unregisters; here we fail THIS query only.
                     throw std::runtime_error("Failed to reconnect. Error message: " + std::string(e.what()));
                 }
             }
@@ -92,8 +92,8 @@ namespace mysql {
             // forms miscompile under gcc-11 at -O0. Sidestep the machinery:
             // marshal through an explicit std::promise owned OUTSIDE the frame —
             // set_value() is an ordinary call inside the coroutine body, so the
-            // move into the shared state is plain, well-defined code. clang was
-            // never affected, which is why macOS runs stayed green.
+            // move into the shared state is plain, well-defined code. clang is
+            // unaffected.
             auto prom = std::make_shared<std::promise<query_outcome<result_t>>>();
             auto fut = prom->get_future();
             // prom rides as a coroutine PARAMETER (copied into the frame), NOT a

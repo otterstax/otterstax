@@ -130,7 +130,7 @@ namespace otterstax::kafka::detail {
             boost::json::object obj;
             for (std::uint64_t col = 0; col < chunk.column_count(); ++col) {
                 const auto& col_type = chunk.data[col].type();
-                // b1/b2: alias() on an alias-less type derefs a null extension —
+                // alias() on an alias-less type derefs a null extension —
                 // guard like stream_output_schema/columns_from_cursor below. A
                 // "colN" key can never match a declared column name, so an
                 // alias-less batch fails the chunk_matches_columns round-trip
@@ -355,7 +355,6 @@ namespace otterstax::kafka::detail {
             expressions::make_compare_expression(resource, expressions::compare_type::eq, column_key, value_param);
         auto match =
             logical_plan::make_node_match(resource, core::dbname_t{database}, core::relname_t{relname}, predicate);
-        // b2-rc-2: make_node_delete_many -> make_node_delete(match, limit);
         // unlimit() keeps the delete-all-matching semantics
         auto del = logical_plan::make_node_delete(
             resource,
@@ -385,7 +384,7 @@ namespace otterstax::kafka::detail {
         if (!cursor || cursor->is_error()) {
             return result;
         }
-        // b1/b2: the result arrives as a batch of <=1024-row chunks; cursor->value()
+        // The result arrives as a batch of <=1024-row chunks; cursor->value()
         // spans them, so iterate the cursor's global row space directly.
         for (std::uint64_t row = 0; row < cursor->size(); ++row) {
             const int32_t partition = cursor->value(0, row).value<int32_t>();

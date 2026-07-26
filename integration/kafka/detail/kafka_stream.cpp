@@ -72,7 +72,6 @@ namespace otterstax::kafka::detail {
                 }
                 auto cursor = std::move(future).take_ready();
                 if (cursor && !cursor->is_error() && cursor->size() > 0) {
-                    // b1/b2 multi-chunk result: serialize every chunk of the batch
                     out_payloads = chunk_to_json(cursor->chunks());
                 }
             }

@@ -775,7 +775,7 @@ namespace {
                 limit = reinterpret_cast<const node_limit_ptr&>(child);
             }
         }
-        // b2-rc-2's grammar accepts DELETE ... LIMIT n (transformer attaches a
+        // The grammar accepts DELETE ... LIMIT n (transformer attaches a
         // limit child). Only MySQL can express single-table DELETE ... LIMIT;
         // silently dropping it would delete every matching remote row.
         const bool has_dml_limit = limit && limit->limit().limit() >= 0;
@@ -890,7 +890,7 @@ namespace {
                 limit = reinterpret_cast<const node_limit_ptr&>(child);
             }
         }
-        // b2-rc-2's grammar accepts UPDATE ... LIMIT n (transformer attaches a
+        // The grammar accepts UPDATE ... LIMIT n (transformer attaches a
         // limit child). Only MySQL can express single-table UPDATE ... LIMIT;
         // silently dropping it would update every matching remote row.
         const bool has_dml_limit = limit && limit->limit().limit() >= 0;
@@ -1071,8 +1071,7 @@ namespace sql_gen {
                         break;
                     default:
                         // type/sequence/view/macro never reach the generator (local-only);
-                        // kept as the file's throw-caught-at-actor-boundary contract (decision Q1).
-                        // b2-rc-2 dropped the free to_string(node_type) helper
+                        // throwing follows the file's throw-caught-at-actor-boundary contract.
                         throw std::logic_error("incorrect drop kind for generate_query: " +
                                                std::to_string(static_cast<int>(node->type())));
                 }

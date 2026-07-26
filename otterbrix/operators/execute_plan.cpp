@@ -37,9 +37,8 @@ components::cursor::cursor_t_ptr OtterbrixDataManager::get_schema(const Otterbri
     // Otterbrix get internal collection schema.
     //
     // a13 removed wrapper_dispatcher_t::get_schema(); instead probe every
-    // dependency with a bounded query (LIMIT 1, with an unlimited fallback for
-    // empty tables — b2-rc-2 LIMIT plans over empty tables return no
-    // type_data). The input vector is
+    // dependency with a bounded query (LIMIT 1, falling back to an unlimited
+    // read for empty tables — see the probe below). The input vector is
     // already in dependency-index order (built by OtterbrixManager), so
     // result->type_data()[i] is the STRUCT schema of dependency i — the
     // layout schema_utils::compute_* consumers index into.
@@ -55,7 +54,7 @@ components::cursor::cursor_t_ptr OtterbrixDataManager::get_schema(const Otterbri
                                                            std::pmr::vector<types::complex_logical_type>(resource)));
             continue;
         }
-        // b2-rc-2: LIMIT plans over an EMPTY table short-circuit to a bare
+        // The engine's LIMIT plans over an EMPTY table short-circuit to a bare
         // cursor (no type_data) — an empty local dependency would contribute a
         // zero-column schema to mixed-query JOIN typing. LIMIT 1 bounds the
         // probe on populated tables; bare-but-not-error means the table is

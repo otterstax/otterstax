@@ -14,8 +14,8 @@ class SimpleMockOtterbrixManager : public IDataManager {
 public:
     // multi_chunk_rows > 0 switches execute_plan into a multi-chunk mode that
     // returns a cursor whose result is that many rows split into
-    // ceil(N/1024) chunks of <=1024 rows each. Default 0 keeps the original
-    // single-chunk behavior untouched.
+    // ceil(N/1024) chunks of <=1024 rows each. Default 0 keeps the plain
+    // single-chunk behavior.
     SimpleMockOtterbrixManager(mock_config config = {}, size_t multi_chunk_rows = 0)
         : config_(config)
         , multi_chunk_rows_(multi_chunk_rows) {
@@ -44,7 +44,7 @@ public:
         }
 
         if (multi_chunk_rows_ > 0) {
-            // Emulate the b1 cursor contract: a result of multi_chunk_rows_ rows
+            // Emulate the engine's cursor contract: a result of multi_chunk_rows_ rows
             // is delivered as ceil(N/1024) chunks of <=1024 rows each, never one
             // oversized chunk. The chunks are schema-less (0 columns) on purpose —
             // this repro only exercises the payload carrying the chunk vector and

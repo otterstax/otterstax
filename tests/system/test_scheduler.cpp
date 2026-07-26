@@ -586,10 +586,10 @@ TEST_CASE("return empty test case") {
     az_scheduler->stop();
 }
 
-// Regression for the latent >1024-row truncation: b1's cursor delivers a result
-// as a batch of <=1024-row chunks (never one oversized chunk). The mock returns
-// N=2500 rows split into ceil(2500/1024)=3 chunks; the whole vector must ride
-// through the scheduler into the session_payload without losing rows.
+// Regression for the latent >1024-row truncation: the engine's cursor delivers a
+// result as a batch of <=1024-row chunks (never one oversized chunk). The mock
+// returns N=2500 rows split into ceil(2500/1024)=3 chunks; the whole vector must
+// ride through the scheduler into the session_payload without losing rows.
 TEST_CASE("multi-chunk result carries all rows through the scheduler") {
     using namespace std::chrono_literals;
 

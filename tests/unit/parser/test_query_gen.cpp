@@ -197,7 +197,7 @@ TEST_CASE("generate_query: no LIMIT clause when the query has none") {
     REQUIRE(sql.find("LIMIT") == std::string::npos);
 }
 
-// b2-rc-2's grammar accepts DML LIMIT (DELETE/UPDATE ... LIMIT n) and attaches
+// The grammar accepts DML LIMIT (DELETE/UPDATE ... LIMIT n) and attaches
 // a node_limit_t child. Regression: the generator used to ignore it, silently
 // deleting/updating every matching remote row.
 TEST_CASE("generate_query: DELETE ... LIMIT reaches MySQL SQL, throws for PostgreSQL") {

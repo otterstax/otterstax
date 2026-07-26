@@ -24,10 +24,9 @@ librdkafka/*:compiler.version=12
 # std::atomic_thread_fence, which TSAN does not model; gcc-12's -Wtsan flags
 # it and the engine builds with -Werror. Keep it a visible warning until the
 # fences are replaced with atomic operations upstream.
-# -Wno-error=restrict: gcc-12 false positive (PR105329 family) on
-# `const char* + std::string&&` in the engine's b2-rc-2
-# services/collection/explain/explain_plan.cpp:60; the engine builds with
-# -Werror. Visible warning until fixed upstream.
+# -Wno-error=restrict: gcc-12 false positive (GCC PR105329 family) on
+# `const char* + std::string&&` in the engine's explain_plan.cpp; the
+# engine builds with -Werror. Visible warning until fixed upstream.
 [conf]
 otterbrix/*:tools.build:compiler_executables={"c": "gcc-12", "cpp": "g++-12"}
 actor-zeta/*:tools.build:compiler_executables={"c": "gcc-12", "cpp": "g++-12"}

@@ -15,6 +15,15 @@
 
 namespace otterstax::catalog {
 
+    // qualified_name_t only defaults ==/<=> — the engine provides no hash for
+    // it, so supply one locally.
+    struct collection_name_hash {
+        inline std::size_t operator()(const qualified_name_t& key) const {
+            return std::hash<std::string>()(key.unique_identifier) ^ std::hash<std::string>()(key.database) ^
+                   std::hash<std::string>()(key.schema) ^ std::hash<std::string>()(key.collection);
+        }
+    };
+
     // Actor-confined registry of external table schemas, keyed by the engine
     // pg_class OID assigned at registration time. Single writer (CatalogManager
     // actor); intentionally has NO internal locking.

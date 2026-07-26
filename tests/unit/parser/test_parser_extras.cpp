@@ -5,7 +5,7 @@
 #include "otterbrix/parser/subquery_extractor.hpp"
 #include "otterbrix/schema/schema_utils.hpp"
 
-#include <catch2/catch.hpp>
+#include <catch2/catch_all.hpp>
 
 #include <components/logical_plan/node.hpp>
 #include <memory_resource>

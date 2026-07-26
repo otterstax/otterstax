@@ -14,7 +14,8 @@
 #include <algorithm>
 
 #include <components/logical_plan/node_aggregate.hpp>
-#include <components/logical_plan/node_catalog_resolve_table.hpp>
+#include <components/logical_plan/node_catalog_resolve.hpp>
+#include <components/logical_plan/node_drop.hpp>
 #include <components/logical_plan/node_function.hpp>
 #include <components/sql/parser/parser.h>
 #include <components/sql/transformer/utils.hpp>
@@ -93,9 +94,7 @@ static constexpr bool is_valid_external(logical_plan::node_type type) {
         case logical_plan::node_type::create_index_t:
         case logical_plan::node_type::data_t: // Questionable
         case logical_plan::node_type::delete_t:
-        case logical_plan::node_type::drop_collection_t:
-        case logical_plan::node_type::drop_database_t:
-        case logical_plan::node_type::drop_index_t:
+        case logical_plan::node_type::drop_t:
         case logical_plan::node_type::insert_t:
         case logical_plan::node_type::update_t:
             return true;
@@ -104,18 +103,21 @@ static constexpr bool is_valid_external(logical_plan::node_type type) {
     }
 }
 
-static constexpr bool is_mutable(logical_plan::node_type type) {
-    switch (type) {
+static bool is_mutable(const logical_plan::node_t& node) {
+    switch (node.type()) {
         case logical_plan::node_type::create_collection_t:
         case logical_plan::node_type::create_database_t:
         case logical_plan::node_type::create_index_t:
-        case logical_plan::node_type::drop_collection_t:
-        case logical_plan::node_type::drop_database_t:
-        case logical_plan::node_type::drop_index_t:
         case logical_plan::node_type::insert_t:
         case logical_plan::node_type::update_t:
         case logical_plan::node_type::delete_t:
             return true;
+        case logical_plan::node_type::drop_t: {
+            const auto k = static_cast<const logical_plan::node_drop_t&>(node).kind();
+            return k == logical_plan::drop_target_kind::collection ||
+                   k == logical_plan::drop_target_kind::database ||
+                   k == logical_plan::drop_target_kind::index;
+        }
         default:
             return false;
     }
@@ -135,13 +137,14 @@ static bool carries_table_reference(const logical_plan::node_t& node) {
         case logical_plan::node_type::delete_t:
         case logical_plan::node_type::create_collection_t:
         case logical_plan::node_type::create_index_t:
-        case logical_plan::node_type::drop_collection_t:
-        case logical_plan::node_type::drop_index_t:
             // Names live on the catalog_resolve_* sibling(s) inside the
             // wrapping node_sequence_t; node_names() reads them via seq_ctx.
             return true;
+        case logical_plan::node_type::drop_t: {
+            const auto k = static_cast<const logical_plan::node_drop_t&>(node).kind();
+            return k == logical_plan::drop_target_kind::collection || k == logical_plan::drop_target_kind::index;
+        }
         case logical_plan::node_type::create_database_t:
-        case logical_plan::node_type::drop_database_t:
             // No alias is grammatically possible — local by construction.
             return false;
         default:
@@ -163,13 +166,16 @@ resolve_dml_from_name(std::pmr::memory_resource* resource,
     }
     size_t resolve_tables_seen = 0;
     for (const auto& child : seq_ctx->children()) {
-        if (!child || child->type() != logical_plan::node_type::catalog_resolve_table_t) {
+        if (!child || child->type() != logical_plan::node_type::catalog_resolve_t) {
+            continue;
+        }
+        const auto& resolve = static_cast<const logical_plan::node_catalog_resolve_t&>(*child);
+        if (resolve.kind() != logical_plan::resolve_kind::table) {
             continue;
         }
         if (++resolve_tables_seen < 2) {
             continue;
         }
-        const auto& resolve = static_cast<const logical_plan::node_catalog_resolve_table_t&>(*child);
         return otterstax::names::resolve_table_name(resource, registry, resolve.dbname(), resolve.relname());
     }
     return qualified_name_t{};
@@ -215,7 +221,9 @@ get_external_nodes(std::pmr::memory_resource* resource,
                 // UPDATE...FROM / DELETE...USING source, or the index of a
                 // DROP INDEX (its first resolve_table is the indexed table).
                 if (type == logical_plan::node_type::update_t || type == logical_plan::node_type::delete_t ||
-                    type == logical_plan::node_type::drop_index_t) {
+                    (type == logical_plan::node_type::drop_t &&
+                     static_cast<const logical_plan::node_drop_t&>(**n.ptr).kind() ==
+                         logical_plan::drop_target_kind::index)) {
                     auto from_resolved = resolve_dml_from_name(resource, registry, seq_ctx);
                     if (from_resolved.has_error()) {
                         return from_resolved.error();
@@ -245,7 +253,7 @@ get_external_nodes(std::pmr::memory_resource* resource,
                 ++size;
             }
         }
-        bool mutable_node = is_mutable(type);
+        bool mutable_node = is_mutable(**n.ptr);
         if (mutable_node) {
             external_nodes.emplace_back();
         }
@@ -332,6 +340,16 @@ core::result_wrapper_t<ParsedQueryDataPtr> GreenplumParser::parse(const std::str
         otterstax::parser::collect_qualified_names(res, registry);
 
         auto tag = nodeTag(res);
+        // The transformer lowers EXPLAIN to the INNER statement's plan and
+        // stamps the explain mode on the transform_result's private plan — which
+        // this pipeline discards (execute_plan.cpp rebuilds a fresh
+        // execution_plan_t). Without this guard "EXPLAIN DELETE ..." would
+        // silently EXECUTE the inner statement, so reject up front.
+        if (tag == T_ExplainStmt) {
+            log_->error("parse: EXPLAIN is not supported by OtterStax");
+            return core::error_t{core::error_code_t::unimplemented_yet,
+                                 std::pmr::string{"EXPLAIN is not supported by OtterStax", resource_}};
+        }
         log_->trace("parse: calling transformer.transform");
         auto binder = transformer.transform(sql::transform::pg_cell_to_node_cast(res));
         log_->trace("parse: transformer.transform complete");

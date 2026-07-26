@@ -4,8 +4,8 @@
 #include "name_resolution.hpp"
 
 #include <components/logical_plan/node_aggregate.hpp>
-#include <components/logical_plan/node_catalog_resolve_namespace.hpp>
-#include <components/logical_plan/node_catalog_resolve_table.hpp>
+#include <components/logical_plan/node_catalog_resolve.hpp>
+#include <components/logical_plan/node_drop.hpp>
 #include <components/logical_plan/node_create_collection.hpp>
 #include <components/logical_plan/node_group.hpp>
 #include <components/logical_plan/node_having.hpp>
@@ -108,6 +108,38 @@ namespace otterstax::names {
         std::string_view db;
         std::string_view rel;
 
+        // Shared sibling-resolve: DML + table-level DDL nodes carry no names; the
+        // transformer wraps them in a node_sequence_t whose FIRST catalog_resolve
+        // (kind==table) sibling carries the target table. Returns an error_t on
+        // failure, else sets db/rel and returns nullopt.
+        auto resolve_from_sibling = [&]() -> std::optional<core::error_t> {
+            if (seq_ctx == nullptr) {
+                return core::error_t{
+                    core::error_code_t::invalid_parameter,
+                    std::pmr::string{"DML/DDL node requires its wrapping node_sequence_t context (seq_ctx) "
+                                     "to resolve the target table name",
+                                     resource}};
+            }
+            const components::logical_plan::node_catalog_resolve_t* resolve = nullptr;
+            for (const auto& child : seq_ctx->children()) {
+                if (child && child->type() == node_type::catalog_resolve_t &&
+                    static_cast<const components::logical_plan::node_catalog_resolve_t&>(*child).kind() ==
+                        components::logical_plan::resolve_kind::table) {
+                    resolve = static_cast<const components::logical_plan::node_catalog_resolve_t*>(child.get());
+                    break;
+                }
+            }
+            if (resolve == nullptr) {
+                return core::error_t{
+                    core::error_code_t::invalid_parameter,
+                    std::pmr::string{"DML/DDL sequence context carries no catalog_resolve (table) sibling",
+                                     resource}};
+            }
+            db = resolve->dbname();
+            rel = resolve->relname();
+            return std::nullopt;
+        };
+
         // Per-type (dbname, relname) extraction mirroring the engine's
         // enrich per-type switch.
         switch (node.type()) {
@@ -163,17 +195,17 @@ namespace otterstax::names {
                 rel = d.relname();
                 if (seq_ctx != nullptr) {
                     for (const auto& child : seq_ctx->children()) {
-                        if (child && child->type() == node_type::catalog_resolve_namespace_t) {
-                            db = static_cast<const components::logical_plan::node_catalog_resolve_namespace_t&>(*child)
-                                     .dbname();
+                        if (child && child->type() == node_type::catalog_resolve_t &&
+                            static_cast<const components::logical_plan::node_catalog_resolve_t&>(*child).kind() ==
+                                components::logical_plan::resolve_kind::namespace_) {
+                            db = static_cast<const components::logical_plan::node_catalog_resolve_t&>(*child).dbname();
                             break;
                         }
                     }
                 }
                 break;
             }
-            case node_type::create_database_t:
-            case node_type::drop_database_t: {
+            case node_type::create_database_t: {
                 // Database-level DDL can never carry a connection alias — the
                 // grammar's `database_name` is a single ColId — so these
                 // statements are always local. The parser filters them out
@@ -182,44 +214,43 @@ namespace otterstax::names {
                 return core::error_t{
                     core::error_code_t::invalid_parameter,
                     std::pmr::string{"database-level DDL carries no alias-qualifiable name; "
-                                     "CREATE/DROP DATABASE is local by grammar and must not be resolved",
+                                     "CREATE DATABASE is local by grammar and must not be resolved",
                                      resource}};
             }
-            // DML and table-level DDL nodes carry no names; the transformer
-            // wraps them in a node_sequence_t whose FIRST
-            // node_catalog_resolve_table_t carries the target table.
-            // (drop_index carries a SECOND resolve_table for the index itself
-            // — the table one comes first, so the sibling scan below picks
-            // the right one.)
+            // Target table comes from the sibling resolve (resolve_from_sibling
+            // above). drop_index carries a SECOND resolve_table for the index
+            // itself — the table one comes first, so the scan picks the right one.
             case node_type::create_index_t:
-            case node_type::drop_collection_t:
-            case node_type::drop_index_t:
             case node_type::insert_t:
             case node_type::update_t:
             case node_type::delete_t: {
-                if (seq_ctx == nullptr) {
-                    return core::error_t{
-                        core::error_code_t::invalid_parameter,
-                        std::pmr::string{"DML/DDL node requires its wrapping node_sequence_t context (seq_ctx) "
-                                         "to resolve the target table name",
-                                         resource}};
+                if (auto err = resolve_from_sibling()) {
+                    return *err;
                 }
-                const components::logical_plan::node_catalog_resolve_table_t* resolve = nullptr;
-                for (const auto& child : seq_ctx->children()) {
-                    if (child && child->type() == node_type::catalog_resolve_table_t) {
-                        resolve =
-                            static_cast<const components::logical_plan::node_catalog_resolve_table_t*>(child.get());
+                break;
+            }
+            case node_type::drop_t: {
+                switch (static_cast<const components::logical_plan::node_drop_t&>(node).kind()) {
+                    case components::logical_plan::drop_target_kind::database:
+                        // Database-level DDL is always local by grammar; the parser
+                        // filters it before resolution — reaching here is a contract violation.
+                        return core::error_t{
+                            core::error_code_t::invalid_parameter,
+                            std::pmr::string{"database-level DDL carries no alias-qualifiable name; "
+                                             "DROP DATABASE is local by grammar and must not be resolved",
+                                             resource}};
+                    case components::logical_plan::drop_target_kind::collection:
+                    case components::logical_plan::drop_target_kind::index:
+                        if (auto err = resolve_from_sibling()) {
+                            return *err;
+                        }
                         break;
-                    }
+                    default:
+                        // type/sequence/view/macro carry no alias-qualifiable table name.
+                        return core::error_t{
+                            core::error_code_t::invalid_parameter,
+                            std::pmr::string{"node type carries no table name to resolve", resource}};
                 }
-                if (resolve == nullptr) {
-                    return core::error_t{
-                        core::error_code_t::invalid_parameter,
-                        std::pmr::string{"DML/DDL sequence context carries no node_catalog_resolve_table_t sibling",
-                                         resource}};
-                }
-                db = resolve->dbname();
-                rel = resolve->relname();
                 break;
             }
             case node_type::unused: {

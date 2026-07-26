@@ -12,6 +12,7 @@
 #include <components/logical_plan/node_aggregate.hpp>
 #include <components/logical_plan/node_delete.hpp>
 #include <components/logical_plan/node_insert.hpp>
+#include <components/logical_plan/node_limit.hpp>
 #include <components/logical_plan/node_match.hpp>
 #include <components/logical_plan/param_storage.hpp>
 #include <components/sql/parser/extension.hpp>
@@ -24,6 +25,7 @@
 #include <services/dispatcher/dispatcher.hpp>
 
 #include <algorithm>
+#include <iterator>
 #include <map>
 #include <optional>
 
@@ -128,7 +130,14 @@ namespace otterstax::kafka::detail {
             boost::json::object obj;
             for (std::uint64_t col = 0; col < chunk.column_count(); ++col) {
                 const auto& col_type = chunk.data[col].type();
-                const std::string key = col_type.alias();
+                // alias() on an alias-less type derefs a null extension —
+                // guard like stream_output_schema/columns_from_cursor below. A
+                // "colN" key can never match a declared column name, so an
+                // alias-less batch fails the chunk_matches_columns round-trip
+                // (nothing produced) instead of segfaulting mid-produce.
+                const std::string key = col_type.has_alias()
+                                            ? std::string{col_type.alias()}
+                                            : "col" + std::to_string(col);
                 if (chunk.data[col].is_null(row)) {
                     obj[key] = nullptr;
                     continue;
@@ -176,6 +185,27 @@ namespace otterstax::kafka::detail {
         // object's topic
         const auto payloads = chunk_to_json(chunk);
         return json_to_chunk(resource, declared, payloads).size() == chunk.size();
+    }
+
+    std::vector<std::string> chunk_to_json(const std::pmr::vector<vector::data_chunk_t>& chunks) {
+        OTX_ZONE_N("kafka::chunk_to_json_multi");
+        std::vector<std::string> out;
+        for (const auto& chunk : chunks) {
+            auto part = chunk_to_json(chunk);
+            out.insert(out.end(), std::make_move_iterator(part.begin()), std::make_move_iterator(part.end()));
+        }
+        return out;
+    }
+
+    bool chunk_matches_columns(std::pmr::memory_resource* resource,
+                               const std::pmr::vector<vector::data_chunk_t>& chunks,
+                               const std::vector<kafka_column_t>& declared) {
+        for (const auto& chunk : chunks) {
+            if (!chunk_matches_columns(resource, chunk, declared)) {
+                return false;
+            }
+        }
+        return true;
     }
 
     std::vector<kafka_column_t> stream_output_schema(std::pmr::memory_resource* resource,
@@ -325,7 +355,14 @@ namespace otterstax::kafka::detail {
             expressions::make_compare_expression(resource, expressions::compare_type::eq, column_key, value_param);
         auto match =
             logical_plan::make_node_match(resource, core::dbname_t{database}, core::relname_t{relname}, predicate);
-        auto del = logical_plan::make_node_delete_many(resource, match);
+        // unlimit() keeps the delete-all-matching semantics
+        auto del = logical_plan::make_node_delete(
+            resource,
+            match,
+            logical_plan::make_node_limit(resource,
+                                          core::dbname_t{database},
+                                          core::relname_t{relname},
+                                          logical_plan::limit_t::unlimit()));
         // constraint_resolve_kind::referencing mirrors transform_delete (FK cascade to
         // children); __sources has no FKs, so it is a no-op wrap here
         logical_plan::node_ptr node =
@@ -347,10 +384,11 @@ namespace otterstax::kafka::detail {
         if (!cursor || cursor->is_error()) {
             return result;
         }
-        const auto& chunk = cursor->chunk_data();
-        for (std::uint64_t row = 0; row < chunk.size(); ++row) {
-            const int32_t partition = chunk.value(0, row).value<int32_t>();
-            const int64_t offset = chunk.value(1, row).value<int64_t>();
+        // The result arrives as a batch of <=1024-row chunks; cursor->value()
+        // spans them, so iterate the cursor's global row space directly.
+        for (std::uint64_t row = 0; row < cursor->size(); ++row) {
+            const int32_t partition = cursor->value(0, row).value<int32_t>();
+            const int64_t offset = cursor->value(1, row).value<int64_t>();
             auto it = result.find(partition);
             if (it == result.end() || offset > it->second) {
                 result[partition] = offset;

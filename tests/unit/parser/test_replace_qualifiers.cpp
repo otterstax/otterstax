@@ -4,7 +4,7 @@
 #include "otterbrix/parser/subquery_extractor.hpp"
 #include "otterbrix/query_generation/sql_query_generator.hpp"
 
-#include <catch2/catch.hpp>
+#include <catch2/catch_all.hpp>
 
 #include <memory_resource>
 #include <string>

@@ -72,7 +72,7 @@ namespace otterstax::kafka::detail {
                 }
                 auto cursor = std::move(future).take_ready();
                 if (cursor && !cursor->is_error() && cursor->size() > 0) {
-                    out_payloads = chunk_to_json(cursor->chunk_data());
+                    out_payloads = chunk_to_json(cursor->chunks());
                 }
             }
 

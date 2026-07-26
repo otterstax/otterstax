@@ -15,7 +15,4 @@ target_link_libraries(
     Catch2::Catch2
 )
 
-#otterstax_discover_tests(${PROJECT_NAME})
-include(CTest)
-include(Catch)
-catch_discover_tests(${PROJECT_NAME})
+otterstax_discover_tests(${PROJECT_NAME})

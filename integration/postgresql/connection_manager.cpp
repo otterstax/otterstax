@@ -106,10 +106,15 @@ PostgressManager::execute(session_hash_t id, ParsedQueryDataPtr data) {
                     }
                 }
 
-                // Also skip if connector doesn't have this connection
+                // A node attributed to this backend with no live connection must fail
+                // THIS query: silently skipping leaves the node symbolic, and the engine
+                // later dies with a misleading "database does not exist" (mid-flight
+                // deregistration race). Nothing downstream can handle the node either.
                 if (!connector_manager_->hasConnection(uid)) {
-                    log_->debug("execute: Skipping node with unknown UID: {}", uid);
-                    continue;
+                    log_->error("execute: no PostgreSQL connection registered for UID: {}", uid);
+                    co_return core::error_t(core::error_code_t::other_error,
+                                            std::pmr::string{("no PostgreSQL connection registered for '" + uid + "'").c_str(),
+                                                             resource()});
                 }
 
                 processed_indices.push_back(i);

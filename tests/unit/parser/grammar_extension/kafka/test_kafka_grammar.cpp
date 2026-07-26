@@ -6,7 +6,7 @@
 // a parser error, non-kafka SQL must fall through to the core parser, and the
 // transform stage must lower the AST into an otterstax::kafka::kafka_node_t.
 
-#include <catch2/catch.hpp>
+#include <catch2/catch_all.hpp>
 
 #include <memory_resource>
 #include <string>

@@ -3,7 +3,7 @@
 
 #include "otterbrix/translators/output/chunk_to_arrow.hpp"
 
-#include <catch2/catch.hpp>
+#include <catch2/catch_all.hpp>
 
 #include <arrow/api.h>
 

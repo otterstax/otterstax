@@ -135,16 +135,17 @@ namespace otterstax::kafka {
             bool transactional;
         };
         std::vector<meta_t> metas;
-        const auto& chunk = cursor->chunk_data();
-        for (std::uint64_t row = 0; row < chunk.size(); ++row) {
-            metas.push_back(meta_t{std::string{chunk.value(0, row).value<std::string_view>()},
-                                   std::string{chunk.value(1, row).value<std::string_view>()},
-                                   std::string{chunk.value(2, row).value<std::string_view>()},
-                                   std::string{chunk.value(3, row).value<std::string_view>()},
-                                   std::string{chunk.value(4, row).value<std::string_view>()},
-                                   std::string{chunk.value(5, row).value<std::string_view>()},
-                                   std::string{chunk.value(7, row).value<std::string_view>()},
-                                   chunk.value(6, row).value<std::string_view>() == "true"});
+        // Iterate the cursor's chunk-spanning row space (value()/size()); a
+        // registry of >1024 objects would otherwise lose everything past chunk 0.
+        for (std::uint64_t row = 0; row < cursor->size(); ++row) {
+            metas.push_back(meta_t{std::string{cursor->value(0, row).value<std::string_view>()},
+                                   std::string{cursor->value(1, row).value<std::string_view>()},
+                                   std::string{cursor->value(2, row).value<std::string_view>()},
+                                   std::string{cursor->value(3, row).value<std::string_view>()},
+                                   std::string{cursor->value(4, row).value<std::string_view>()},
+                                   std::string{cursor->value(5, row).value<std::string_view>()},
+                                   std::string{cursor->value(7, row).value<std::string_view>()},
+                                   cursor->value(6, row).value<std::string_view>() == "true"});
         }
 
         auto make_options = [](const meta_t& m) {
@@ -159,15 +160,24 @@ namespace otterstax::kafka {
             return o;
         };
 
-        // Pass 1 — SOURCEs. Columns aren't persisted: re-read from the backing table
-        // catalog (SELECT * LIMIT 0)
+        // Pass 1 — SOURCEs. Columns aren't persisted: re-read from the backing
+        // table. The engine short-circuits LIMIT plans over an EMPTY table to a
+        // bare cursor (no type_data) — a LIMIT-0 probe would silently drop any
+        // source whose backing table is empty at restart. LIMIT 1 bounds the
+        // probe on populated tables; bare-but-not-error means the table is
+        // empty, so the unlimited re-read is free.
         for (const auto& m : metas) {
             if (m.kind != "source") {
                 continue;
             }
             auto schema_cursor =
-                drive(kafka_query(dispatcher_address_, resource_, "SELECT * FROM kafka." + m.name + " LIMIT 0;"));
+                drive(kafka_query(dispatcher_address_, resource_, "SELECT * FROM kafka." + m.name + " LIMIT 1;"));
             auto columns = columns_from_cursor(schema_cursor);
+            if (columns.empty() && schema_cursor && !schema_cursor->is_error()) {
+                schema_cursor =
+                    drive(kafka_query(dispatcher_address_, resource_, "SELECT * FROM kafka." + m.name + ";"));
+                columns = columns_from_cursor(schema_cursor);
+            }
             if (columns.empty()) {
                 // Backing table gone (e.g. a dropped source whose __sources row lingers)
                 log_->warn("kafka: recover source '{}': no backing-table schema, skipping", m.name);

@@ -3,7 +3,7 @@
 
 #include "otterbrix/translators/input/mysql_to_complex.hpp"
 
-#include <catch2/catch.hpp>
+#include <catch2/catch_all.hpp>
 
 using boost::mysql::column_type;
 using namespace components::types;

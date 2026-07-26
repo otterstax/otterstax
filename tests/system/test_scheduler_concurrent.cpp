@@ -28,7 +28,7 @@
 #include <core/result_wrapper.hpp>
 #include <otterbrix/otterbrix.hpp>
 
-#include <catch2/catch.hpp>
+#include <catch2/catch_all.hpp>
 #include <chrono>
 #include <future>
 #include <stdexcept>
@@ -170,7 +170,7 @@ TEST_CASE("scheduler handles N parallel sessions without hanging") {
     for (size_t i = 0; i < N; ++i) {
         INFO("session " << i);
         REQUIRE_FALSE(results[i].has_error());
-        REQUIRE(results[i].value().chunk.size() == 2);
+        REQUIRE(results[i].value().size() == 2);
     }
 
     auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
@@ -289,13 +289,16 @@ TEST_CASE("slow MySQL connector does not starve other sessions") {
 TEST_CASE("QueryHandleWaiter propagates future exceptions") {
     QueryHandleWaiter<int> waiter;
 
-    std::promise<int> good;
-    std::promise<int> bad;
+    std::promise<query_outcome<int>> good;
+    std::promise<query_outcome<int>> bad;
     waiter.futures.push_back(good.get_future());
     waiter.futures.push_back(bad.get_future());
 
-    good.set_value(42);
-    bad.set_exception(std::make_exception_ptr(std::runtime_error("simulated DB failure")));
+    // Connector errors arrive as a value (query_outcome::error), not a future
+    // exception (utility/wait_barrier.hpp — avoids the boost.asio use_future TSAN race);
+    // wait() rethrows on the consumer thread when an outcome carries a non-empty error.
+    good.set_value(query_outcome<int>{42, {}});
+    bad.set_value(query_outcome<int>{0, "simulated DB failure"});
 
     REQUIRE_THROWS_AS(waiter.wait(), std::runtime_error);
 }

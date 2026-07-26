@@ -61,6 +61,8 @@ RUN if [ "$TSAN_DEPS" = "true" ]; then \
             -s compiler.cppstd=gnu20 \
             -s 'clickhouse-cpp/*:compiler.cppstd=17' \
             -s 'abseil/*:compiler.cppstd=17' \
+            -s 'protobuf/*:compiler.cppstd=17' \
+            -s 're2/*:compiler.cppstd=17' \
             -s 'grpc/*:compiler.cppstd=17'; \
     elif [ "$WITH_TRACY" = "true" ]; then \
         conan install conanfile.py --build missing \
@@ -68,6 +70,8 @@ RUN if [ "$TSAN_DEPS" = "true" ]; then \
             -s compiler.cppstd=gnu20 \
             -s 'clickhouse-cpp/*:compiler.cppstd=17' \
             -s 'abseil/*:compiler.cppstd=17' \
+            -s 'protobuf/*:compiler.cppstd=17' \
+            -s 're2/*:compiler.cppstd=17' \
             -s 'grpc/*:compiler.cppstd=17' \
             -o "&:with_tracy=True"; \
     else \
@@ -76,6 +80,8 @@ RUN if [ "$TSAN_DEPS" = "true" ]; then \
             -s compiler.cppstd=gnu20 \
             -s 'clickhouse-cpp/*:compiler.cppstd=17' \
             -s 'abseil/*:compiler.cppstd=17' \
+            -s 'protobuf/*:compiler.cppstd=17' \
+            -s 're2/*:compiler.cppstd=17' \
             -s 'grpc/*:compiler.cppstd=17'; \
     fi
 

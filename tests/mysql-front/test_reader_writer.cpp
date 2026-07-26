@@ -4,7 +4,7 @@
 #include "frontend/mysql_server/packet/packet_reader.hpp"
 #include "frontend/mysql_server/packet/packet_writer.hpp"
 
-#include <catch2/catch.hpp>
+#include <catch2/catch_all.hpp>
 
 using namespace frontend::mysql;
 

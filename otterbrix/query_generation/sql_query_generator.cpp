@@ -16,10 +16,9 @@
 #include <components/logical_plan/node_create_index.hpp>
 #include <components/logical_plan/node_data.hpp>
 #include <components/logical_plan/node_delete.hpp>
-#include <components/logical_plan/node_drop_collection.hpp>
-#include <components/logical_plan/node_drop_database.hpp>
-#include <components/logical_plan/node_drop_index.hpp>
+#include <components/logical_plan/node_drop.hpp>
 #include <components/logical_plan/node_group.hpp>
+#include <components/logical_plan/node_limit.hpp>
 #include <components/logical_plan/node_insert.hpp>
 #include <components/logical_plan/node_match.hpp>
 #include <components/logical_plan/node_select.hpp>
@@ -527,6 +526,7 @@ namespace {
         node_group_ptr group = nullptr;
         node_match_ptr match = nullptr;
         node_sort_ptr sort = nullptr;
+        node_limit_ptr limit = nullptr;
         for (const auto& child : node->children()) {
             switch (child->type()) {
                 case node_type::select_t:
@@ -540,6 +540,9 @@ namespace {
                     break;
                 case node_type::sort_t:
                     sort = reinterpret_cast<const node_sort_ptr&>(child);
+                    break;
+                case node_type::limit_t:
+                    limit = reinterpret_cast<const node_limit_ptr&>(child);
                     break;
                 default:
                     break;
@@ -701,6 +704,16 @@ namespace {
                 }
             }
         }
+        // limit / offset — push the node_limit_t child down to the backend so a
+        // remote SELECT ... LIMIT n returns n rows (unlimited sentinel is -1).
+        {
+            if (limit && limit->limit().limit() >= 0) {
+                stream << " LIMIT " << limit->limit().limit();
+                if (limit->limit().offset() > 0) {
+                    stream << " OFFSET " << limit->limit().offset();
+                }
+            }
+        }
     }
 
     void generate_create_collection(std::stringstream& stream,
@@ -754,10 +767,20 @@ namespace {
                          backend_type_t backend,
                          const otterstax::names::resolved_target_t& target) {
         node_match_ptr match = nullptr;
+        node_limit_ptr limit = nullptr;
         for (const auto& child : node->children()) {
             if (child->type() == node_type::match_t) {
                 match = reinterpret_cast<const node_match_ptr&>(child);
+            } else if (child->type() == node_type::limit_t) {
+                limit = reinterpret_cast<const node_limit_ptr&>(child);
             }
+        }
+        // The grammar accepts DELETE ... LIMIT n (transformer attaches a
+        // limit child). Only MySQL can express single-table DELETE ... LIMIT;
+        // silently dropping it would delete every matching remote row.
+        const bool has_dml_limit = limit && limit->limit().limit() >= 0;
+        if (has_dml_limit && backend != backend_type_t::MySQL) {
+            throw std::logic_error("DELETE ... LIMIT is not supported for this backend");
         }
         stream << "DELETE FROM ";
         stream << sql_gen::table_reference(target.name, backend);
@@ -772,6 +795,9 @@ namespace {
                                   reinterpret_cast<const compare_expression_ptr&>(match->expressions().front()),
                                   parameters,
                                   backend);
+        }
+        if (has_dml_limit) {
+            stream << " LIMIT " << limit->limit().limit();
         }
     }
 
@@ -856,10 +882,20 @@ namespace {
                          backend_type_t backend,
                          const otterstax::names::resolved_target_t& target) {
         node_match_ptr match = nullptr;
+        node_limit_ptr limit = nullptr;
         for (const auto& child : node->children()) {
             if (child->type() == node_type::match_t) {
                 match = reinterpret_cast<const node_match_ptr&>(child);
+            } else if (child->type() == node_type::limit_t) {
+                limit = reinterpret_cast<const node_limit_ptr&>(child);
             }
+        }
+        // The grammar accepts UPDATE ... LIMIT n (transformer attaches a
+        // limit child). Only MySQL can express single-table UPDATE ... LIMIT;
+        // silently dropping it would update every matching remote row.
+        const bool has_dml_limit = limit && limit->limit().limit() >= 0;
+        if (has_dml_limit && backend != backend_type_t::MySQL) {
+            throw std::logic_error("UPDATE ... LIMIT is not supported for this backend");
         }
         stream << "UPDATE " << sql_gen::table_reference(target.name, backend) << " ";
         bool comma = false;
@@ -881,6 +917,9 @@ namespace {
                                   reinterpret_cast<const compare_expression_ptr&>(match->expressions().front()),
                                   parameters,
                                   backend);
+        }
+        if (has_dml_limit) {
+            stream << " LIMIT " << limit->limit().limit();
         }
     }
 
@@ -1019,15 +1058,25 @@ namespace sql_gen {
             case node_type::delete_t:
                 generate_delete(stream, reinterpret_cast<const node_delete_ptr&>(node), parameters, backend, target);
                 break;
-            case node_type::drop_collection_t:
-                generate_drop_collection(stream, target.name, backend);
+            case node_type::drop_t: {
+                switch (reinterpret_cast<const node_drop_ptr&>(node)->kind()) {
+                    case drop_target_kind::collection:
+                        generate_drop_collection(stream, target.name, backend);
+                        break;
+                    case drop_target_kind::database:
+                        generate_drop_database(stream, target.name, backend);
+                        break;
+                    case drop_target_kind::index:
+                        generate_drop_index(stream, target, backend);
+                        break;
+                    default:
+                        // type/sequence/view/macro never reach the generator (local-only);
+                        // throwing follows the file's throw-caught-at-actor-boundary contract.
+                        throw std::logic_error("incorrect drop kind for generate_query: " +
+                                               std::to_string(static_cast<int>(node->type())));
+                }
                 break;
-            case node_type::drop_database_t:
-                generate_drop_database(stream, target.name, backend);
-                break;
-            case node_type::drop_index_t:
-                generate_drop_index(stream, target, backend);
-                break;
+            }
             case node_type::insert_t:
                 generate_insert(stream,
                                 reinterpret_cast<const node_insert_ptr&>(node),
@@ -1040,7 +1089,8 @@ namespace sql_gen {
                 generate_update(stream, reinterpret_cast<const node_update_ptr&>(node), parameters, backend, target);
                 break;
             default:
-                throw std::logic_error("incorrect node type for generate_query: " + to_string(node->type()));
+                throw std::logic_error("incorrect node type for generate_query: " +
+                                       std::to_string(static_cast<int>(node->type())));
         }
     }
 

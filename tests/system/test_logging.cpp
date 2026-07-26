@@ -2,7 +2,7 @@
 // Copyright 2025-2026  OtterStax
 
 #include "utility/logger.hpp"
-#include <catch2/catch.hpp>
+#include <catch2/catch_all.hpp>
 #include <iostream>
 
 TEST_CASE("logging is configured", "[.skip]") {

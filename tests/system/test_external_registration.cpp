@@ -5,7 +5,7 @@
 // pg_class oid onto the create node during execute_plan — that is the only
 // channel for reading the oid back (pg_catalog is not reachable via plain SQL
 // SELECT).
-#include <catch2/catch.hpp>
+#include <catch2/catch_all.hpp>
 
 #include <components/table/column_definition.hpp>
 #include <components/types/types.hpp>

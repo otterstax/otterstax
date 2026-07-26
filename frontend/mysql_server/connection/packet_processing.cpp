@@ -6,8 +6,6 @@
 #include "utility/tracy_memory_resource.hpp"
 #include "utility/tracy_profiler.hpp"
 
-#include <tuple>
-
 using namespace components;
 using namespace components::sql;
 
@@ -197,8 +195,9 @@ namespace frontend::mysql {
         OTX_ZONE_N("mysql::handle_query");
         session_id id;
         // todo: one execute() call for simplicity - use computed schema for text_resultset columns
-        auto [needs_sched, fut] = actor_zeta::send(scheduler_, &Scheduler::execute, id.hash(), query);
-        (void) needs_sched; // sending to the Scheduler event-loop always returns needs_sched=false
+        // sending to the Scheduler event-loop always returns needs_sched=false
+        [[maybe_unused]] auto [needs_sched, fut] =
+            actor_zeta::send(scheduler_, &Scheduler::execute, id.hash(), query);
         core::result_wrapper_t<session_payload> r{resource_};
         boost::asio::io_context io;
         boost::asio::co_spawn(
@@ -222,15 +221,17 @@ namespace frontend::mysql {
         // handle Ok
         session_payload sdata_result = std::move(r.value());
         // empty db & table in metadata (not critical, but may be improved)
-        if (sdata_result.chunk.column_count() == 0) {
-            send_packet(build_ok(writer_, sequence_id_, sdata_result.chunk.size()));
+        if (sdata_result.column_count() == 0) {
+            send_packet(build_ok(writer_, sequence_id_, sdata_result.size()));
             return;
         }
 
         mysql_resultset result(writer_, result_encoding::TEXT);
-        result.add_chunk_columns(sdata_result.chunk);
-        for (size_t i = 0; i < sdata_result.chunk.size(); i++) {
-            result.add_row(sdata_result.chunk, i);
+        result.add_chunk_columns(sdata_result.chunks.front());
+        for (auto& ch : sdata_result.chunks) {
+            for (size_t i = 0; i < ch.size(); ++i) {
+                result.add_row(ch, i);
+            }
         }
 
         send_resultset(std::move(result));
@@ -294,8 +295,9 @@ namespace frontend::mysql {
     void mysql_connection::handle_prepared_stmt(std::string query) {
         OTX_ZONE_N("mysql::handle_prepared_stmt");
         session_id id;
-        auto [needs_sched, fut] = actor_zeta::send(scheduler_, &Scheduler::prepare_schema, id.hash(), query);
-        (void) needs_sched; // sending to the Scheduler event-loop always returns needs_sched=false
+        // sending to the Scheduler event-loop always returns needs_sched=false
+        [[maybe_unused]] auto [needs_sched, fut] =
+            actor_zeta::send(scheduler_, &Scheduler::prepare_schema, id.hash(), query);
         core::result_wrapper_t<session_payload> r{resource_};
         boost::asio::io_context io;
         boost::asio::co_spawn(
@@ -494,9 +496,9 @@ namespace frontend::mysql {
     void mysql_connection::handle_execute_stmt(session_hash_t id,
                                                std::pmr::vector<types::logical_value_t> param_values) {
         OTX_ZONE_N("mysql::handle_execute_stmt");
-        auto [needs_sched, fut] =
+        // sending to the Scheduler event-loop always returns needs_sched=false
+        [[maybe_unused]] auto [needs_sched, fut] =
             actor_zeta::send(scheduler_, &Scheduler::execute_prepared_statement, id, std::move(param_values));
-        (void) needs_sched; // sending to the Scheduler event-loop always returns needs_sched=false
         core::result_wrapper_t<session_payload> r{resource_};
         boost::asio::io_context io;
         boost::asio::co_spawn(
@@ -518,15 +520,17 @@ namespace frontend::mysql {
 
         session_payload sdata_result = std::move(r.value());
 
-        if (sdata_result.chunk.column_count() == 0) {
-            send_packet(build_ok(writer_, sequence_id_, sdata_result.chunk.size()));
+        if (sdata_result.column_count() == 0) {
+            send_packet(build_ok(writer_, sequence_id_, sdata_result.size()));
             return;
         }
 
         mysql_resultset result(writer_, result_encoding::BINARY);
-        result.add_chunk_columns(sdata_result.chunk);
-        for (size_t i = 0; i < sdata_result.chunk.size(); i++) {
-            result.add_row(sdata_result.chunk, i);
+        result.add_chunk_columns(sdata_result.chunks.front());
+        for (auto& ch : sdata_result.chunks) {
+            for (size_t i = 0; i < ch.size(); ++i) {
+                result.add_row(ch, i);
+            }
         }
 
         send_resultset(std::move(result));

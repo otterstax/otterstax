@@ -132,7 +132,8 @@ namespace otterstax::kafka {
         // SOURCE and never relaunch its poller (the engine recovers the backing
         // tables but nothing restarts ingestion). We persist each object's options
         // to a kafka.__sources table; on startup recover() reads it back, re-reads
-        // the columns from the recovered backing table's catalog (SELECT * LIMIT 0),
+        // the columns from the recovered backing table (LIMIT-1 probe with an
+        // unlimited fallback — LIMIT plans over empty tables return no metadata),
         // rebuilds registry_, and relaunches the pollers (Phase 2 table-seek then
         // resumes from kafka.<src>__offsets). Columns are NOT stored — the catalog
         // is their single source of truth

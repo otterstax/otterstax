@@ -505,7 +505,8 @@ print(f"""✅ S3 demo fixtures written:
 
 
 # ── Kafka fixtures for the streaming demo (examples/demo/kafka/) ──────────────
-# Two live order-event topics, seeded into redpanda by examples/demo/kafka/seed.py.
+# Two live order-event topics, seeded into redpanda by the `seed` helper in
+# examples/demo/kafka/lib/_common.sh (rpk produce inside the demo-kafka container).
 #   demo_orders_live  — the main event feed (features 1-6)
 #   demo_orders_intl  — a second feed used only by the fan-in demo (feature 7)
 # customer_id is drawn from customers that ALSO appear in ch.ev.sessions, so the

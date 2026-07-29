@@ -7,7 +7,9 @@
 #   MySQL wire    → localhost:8816
 #   PostgreSQL    → localhost:8817
 #   FlightSQL     → localhost:8815
-#   HTTP conn API → localhost:8085
+#
+# Connections are read from benchmark/config.yaml at server startup (there
+# is no HTTP management port).
 #
 # Usage:
 #   ./benchmark/manual/start_service.sh [--no-init] [--rebuild] [--perf] [--perf-alloc] [--tracy] [-j N] [--image-tag TAG]
@@ -260,7 +262,6 @@ fi
 echo " MySQL wire      → localhost:8816  (user=testuser pass=testpass)"
 echo " PostgreSQL      → localhost:8817  (user=testuser pass=testpass)"
 echo " FlightSQL       → localhost:8815"
-echo " HTTP conn API   → localhost:8085"
 echo ""
 if $ENABLE_PERF; then
 echo " perf recording  → stop_service.sh will save:"

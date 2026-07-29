@@ -47,38 +47,22 @@ run_test() {
     fi
 }
 
-# Wait for otterstax to be healthy
+# Wait for otterstax to be ready. There is no HTTP management port anymore —
+# connections are registered from the baked-in config.yaml
+# at server startup, so we just wait for a wire port to accept connections.
 echo ""
 echo "========================================="
 echo "Waiting for OtterStax to be ready..."
 echo "========================================="
-./http_healthcheck.sh
+./wait_for_otterstax.sh
 
 if [ $? -ne 0 ]; then
-    echo "❌ OtterStax health check failed!"
+    echo "❌ OtterStax readiness check failed!"
     exit 1
 fi
 
-# Run connection setup script with retries
-echo ""
-echo "========================================="
-echo "Adding connections..."
-echo "========================================="
-./add_connections.sh
-
-# Add PostgreSQL connection (extra attempt)
-echo "Adding PostgreSQL connection (extra attempt)..."
-curl -X POST "http://test-otterstax:8085/add_pg_connection" \
-    -H "Content-Type: application/json" \
-    -d @connection_postgres.json || echo "PostgreSQL connection may already exist"
-
-# Add ClickHouse connection (extra attempt)
-echo "Adding ClickHouse connection (extra attempt)..."
-curl -X POST "http://test-otterstax:8085/add_ch_connection" \
-    -H "Content-Type: application/json" \
-    -d @connection_clickhouse.json || echo "ClickHouse connection may already exist"
-
-# Give server time to register connections
+# Give the server a moment to finish registering the connections read from the
+# connection config file at startup.
 echo "Waiting for connections to register..."
 sleep 3
 

@@ -1,9 +1,12 @@
 set(config_HEADERS
     config.hpp
+    connections/connection_config.hpp
+    connections/connection_config_reader.hpp
 )
 
 set(config_SOURCES
     config.cpp
+    connections/connection_config_reader.cpp
 )
 
 add_library(config

@@ -127,7 +127,9 @@ registers the six connection aliases. All ports are published to the host:
 | MySQL wire     | `localhost:8816` |
 | PostgreSQL     | `localhost:8817` |
 | FlightSQL      | `localhost:8815` |
-| HTTP conn API  | `localhost:8085` |
+
+Connections are read from `benchmark/config.yaml` at server startup (there
+is no HTTP management port).
 
 On subsequent starts, skip data re-initialisation:
 
@@ -223,7 +225,9 @@ Selecting any `external_*` test automatically:
 
 1. Generates fixtures into `benchmark/data/fixtures/` via `data/generate_external_fixtures.py`.
 2. Adds `compose_minio.yml` to the stack (MinIO + a one-shot that seeds `bench-bucket`).
-3. Registers the `bench_minio` s3 alias via `GET /s3/add_credentials`.
+
+The `bench_minio` s3 alias is declared in `benchmark/config.yaml` and
+registered at server startup (no runtime registration step).
 
 ```bash
 # All five external tests, both frontends

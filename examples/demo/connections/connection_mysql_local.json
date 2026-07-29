@@ -1,9 +1,0 @@
-{
-    "alias": "mysql",
-    "host": "127.0.0.1",
-    "port": "3201",
-    "username": "demo",
-    "password": "demo",
-    "database": "bill",
-    "table": ""
-}

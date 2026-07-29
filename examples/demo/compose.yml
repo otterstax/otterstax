@@ -1,4 +1,4 @@
-# Demo-only compose. Runs on separate ports (3201-3205, 8085/8815-8817) so
+# Demo-only compose. Runs on separate ports (3201-3207, 8815-8817) so
 # it can coexist with the main compose.yml / compose.test.yml if anything's
 # running.
 #
@@ -172,12 +172,17 @@ services:
       demo-kafka:
         condition: service_healthy
     ports:
-      - "8085:8085"    # HTTP connection-manager
       - "8815:8815"    # FlightSQL
       - "8816:8816"    # MySQL wire
       - "8817:8817"    # PostgreSQL wire
+    volumes:
+      # Single config file (server settings + connections). Mounted onto the
+      # server's default config path (config.yaml, relative to WORKDIR
+      # /app/build/Release). Uses docker-DNS hostnames for otterstax-in-docker.
+      - ./config.yaml:/app/build/Release/config.yaml:ro
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:8085/health"]
+      # No HTTP management port anymore — probe the PostgreSQL wire port instead.
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/localhost/8817' || exit 1"]
       interval: 5s
       timeout: 5s
       retries: 30

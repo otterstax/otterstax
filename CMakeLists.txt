@@ -157,7 +157,7 @@ add_library(lib_${PROJECT_NAME} INTERFACE
 # until no new symbols resolve.
 set(OTTERSTAX_INTERNAL_LIBS
     flight_sql_server common_server mysql_server postgres_server catalog
-    connectors s3 file api_server component_manager integration otterbrix_local
+    connectors s3 file component_manager integration otterbrix_local
     scheduler kafka_grammar kafka_runtime)
 if(APPLE)
     set(OTTERSTAX_LINK_GROUP ${OTTERSTAX_INTERNAL_LIBS})
@@ -168,6 +168,14 @@ endif()
 
 target_link_libraries(
     lib_${PROJECT_NAME} INTERFACE
+    # These internal static libs cross-reference each other (e.g. scheduler uses
+    # integration handlers while integration/otterbrix_local use scheduler's
+    # schema_utils), so a single left-to-right link pass can miss objects only
+    # one of them pulls (e.g. integration/s3/s3_manager.o, referenced solely by
+    # the Scheduler). RESCAN groups them (--start-group/--end-group) so the
+    # linker re-pulls until the cycle is fully resolved. Apple's ld has no
+    # LINK_GROUP generator expression, so OTTERSTAX_LINK_GROUP degrades to the
+    # plain library list there.
     ${OTTERSTAX_LINK_GROUP}
     config::config
     arrow::arrow

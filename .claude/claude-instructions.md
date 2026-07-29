@@ -2,7 +2,7 @@
 
 ## Architecture Overview
 
-This is a **federated SQL query engine** that exposes multiple frontend protocols (Apache Arrow FlightSQL, MySQL wire protocol, HTTP API) over a unified backend integrating:
+This is a **federated SQL query engine** that exposes multiple frontend protocols (Apache Arrow FlightSQL, MySQL wire protocol, PostgreSQL wire protocol) over a unified backend integrating:
 - **Otterbrix**: The core query execution engine (external dependency)
 - **MariaDB/MySQL pools**: Remote database connectors for federated queries
 - **Actor-based concurrency**: Using `actor-zeta` for message-passing between components
@@ -37,8 +37,10 @@ SELECT * FROM campaigns.db1.schema.campaigns
 JOIN impressions.db2.schema.impressions ON campaigns.id = impressions.id
 ```
 - `campaigns` and `impressions` are **connection aliases** (not databases!)
-- Each alias maps to a registered MySQL connection (see `examples/simple/example_connetion/*.json`)
-- Register connections via HTTP API: `POST localhost:8085/add_connection` with JSON payload
+- Each alias maps to a connection declared in the `connections:` section of the
+  single `config.yaml` (see `examples/simple/example_connetion/config.yaml`)
+- Connections are read once at server startup from that file (default `config.yaml`,
+  override with `--config PATH`). There is no runtime add/remove API.
 
 ### Parser and Query Generation
 - `otterbrix/parser/parser.hpp`: Wraps Otterbrix SQL parser as `IParser` interface
@@ -46,6 +48,31 @@ JOIN impressions.db2.schema.impressions ON campaigns.id = impressions.id
 - **External nodes**: Query plans mark nodes requiring remote execution (see `OtterbrixStatement::external_nodes`)
 
 ## Development Workflows
+
+### Build resources — CHECK RAM + THREADS FIRST (avoid OOM)
+
+**Before any build (local or Docker), cap parallelism to available RAM.** Each
+compile job needs **~1.5–2 GB**; blindly using `-j nproc` OOM-kills the compiler
+(`c++: ... Killed`) or fails a Docker build with `ResourceExhausted`. Docker
+Desktop's VM RAM is usually much smaller than the host's, so check the Docker
+limit, not just `nproc`:
+
+```bash
+nproc                                                   # host CPUs (macOS: sysctl -n hw.ncpu)
+docker info --format '{{.NCPU}} CPUs / {{.MemTotal}} B' # what Docker builds actually get
+```
+
+Choose `JOBS = min(nCPU, floor(RAM_MB / 1536))` (~1.5 GB/job). Then pass it:
+`cmake --build ... --parallel <JOBS>`, `docker build --build-arg BUILD_JOBS=<JOBS>`,
+`./docker-run-tests.sh -j <JOBS>`. The benchmark scripts auto-cap with this
+formula when `-j` is omitted. Example: an 8 GB Docker VM ⇒ 5 jobs even on 14 CPUs.
+
+**Verified on this machine:** the default `-j nproc` OOMs the Docker build
+(`ResourceExhausted: cannot allocate memory`) — it dies partway through, so the
+`ctest`/integration steps never run and the failure looks unrelated to your
+change. `-j 4` builds cleanly. Always run:
+`docker build --build-arg BUILD_JOBS=4 -f Dockerfile.test -t otterstax-test .`
+and `./docker-run-tests.sh -j 4` (unit: 194 pass, integration: 27 pass at -j 4).
 
 ### Building & Running (Docker-First)
 ```bash
@@ -57,20 +84,22 @@ docker compose up           # Runs app + 3 MariaDB instances
 conan install conanfile.py --build missing -s build_type=Release
 cmake -S . -B build/Release \
   -DCMAKE_TOOLCHAIN_FILE=build/Release/generators/conan_toolchain.cmake
+# --parallel N: N = min(nproc, floor(RAM_MB/1536)) — see "Build resources" above
 /usr/local/bin/cmake --build /workspaces/otterstax/build/Release --parallel 5 --
 ```
 
 ### Testing (Critical Setup Steps)
 ```bash
-# Use docker-run-tests.sh - it handles volume initialization timing issues
+# Use docker-run-tests.sh - it handles volume initialization timing issues.
+# Cap build jobs to RAM to avoid OOM: ./docker-run-tests.sh -j <JOBS>
 chmod +x ./docker-run-tests.sh
 ./docker-run-tests.sh
 
 # Manual test workflow:
 1. fixtures/generate_data.py          # Creates MariaDB init SQL scripts
-2. docker compose up -d                # Starts services
-3. examples/simple/example_connetion/add_connections.sh                  # Registers connections
-4. python examples/simple/flight_sql_example.py examples/simple/example_1.txt  # Executes federated query
+2. docker compose up -d                # Starts services (connections read from
+                                       #   scripts/database/config.yaml at startup)
+3. python examples/simple/flight_sql_example.py examples/simple/example_1.txt  # Executes federated query
 ```
 
 **Testing Anti-Pattern**: Docker volumes (`mariadb*_init`) can lag on cold starts. The test script includes `wait_for_database_init()` with 120-sec timeout - respect this when writing integration tests.
@@ -102,7 +131,7 @@ auto result = co_await std::move(future);
 ### Namespace Organization
 - `mysqlc::` - MySQL connector/catalog management
 - `mysql_front::` - MySQL protocol frontend implementation
-- `http_server::` - HTTP API for connection management
+- `config::` - single config.yaml reader (server settings + connections; startup connection registration)
 - `db_conn::` - Database integration actors (Otterbrix/SQL managers)
 
 ### Thread Safety Notes
@@ -140,7 +169,7 @@ auto result = co_await std::move(future);
 ### Port Assignments (Hardcoded)
 - 8815: FlightSQL server
 - 8816: MySQL wire protocol
-- 8085: HTTP connection management API
+- 8817: PostgreSQL wire protocol
 - 3101-3103: MariaDB test instances
 
 ### Known Limitations (from TODOs)

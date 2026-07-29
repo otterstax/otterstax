@@ -12,6 +12,7 @@ All C++ tests use Catch2 and are built with `-DBUILD_TESTS=ON`.
 | `tests/unit/parser/` | `test_parser` | Subquery extractor, qualifier rewriter, SQL generator, and the s3/file grammar extensions (parse stage, registry routing, transform → `external_node_t`, trailing-`;` tolerance) |
 | `tests/unit/schema/` | `test_unit_schema` | `schema_utils` namespace |
 | `tests/unit/utility/` | `test_unit_utility` | `session` helpers (the old `cv_wrapper` is gone — frontends await futures via `frontend/common/asio_future_bridge.hpp` instead) |
+| `tests/unit/config/` | `test_unit_config` | `config::parse_connections` (the `connections:` node → descriptor structs; null/missing node, missing sections, pg `schema` default, optional s3 fields, order) and `config::ConfigReader` (full `config.yaml`: ports + embedded connections, defaults when file missing, no-`connections:` section, malformed-YAML throw). Links `config::config`; `main.cpp` calls `initialize_all_loggers` so the `Config` logger exists |
 | `tests/mysql-front/` | `test_mysql_front` | MySQL protocol reader/writer, result-set encoding |
 
 Python integration tests in `tests/` (e.g. `test_flightsql_client_mysql_backend.py`) run against live Docker containers via `docker-run-tests.sh`.
@@ -58,7 +59,7 @@ External-table tests (s3/file grammar extension) over the MySQL wire — driven 
 - `test_mysql_join_otb_local_backend.py` — backend on the LEFT, otterbrix-internal `CREATE TABLE` on the RIGHT, JOIN on a STRING key. Mirrors the shape `examples/demo/sql/step_4.sql` runs in the live demo: backend manager fetches the sql slice through the existing single-backend dispatch and inlines it as `raw_data`; the engine resolves the symbolic local side by its stamped `table_oid` and JOINs them in-process. The string JOIN key avoids the int width sensitivity called out in FIX_JOIN.md.
 - `test_mysql_join_otb_local_s3_file.py` — three-origin JOIN: s3 parquet `regions` ⋈ local file csv `web_events` ⋈ otterbrix-internal `weights` (`CREATE TABLE`+`INSERT VALUES`), all on `campaign_id` (int64 on every side). Smaller-scale shadow of the `external_join_all` benchmark — catches regressions in the "everything resolved to engine-internal" multi-source JOIN before the benchmark suite runs.
 
-Fixtures live in `tests/minio/fixtures/` (regenerable by `generate_external_fixtures.py`; needs `pyarrow` + `faker`). The python suite uses the single-bucket MinIO in `compose.test.yml` (mount `/fixtures` for local-file mode, `GET /s3/add_credentials` registers MinIO for s3 mode). The standalone two-MinIO debug stack under `tests/minio/` (`docker-compose.yml`, `manual_run.sh`, `s3cmd.sh`) is unrelated to the suite — see `tests/minio/CLAUDE.md`.
+Fixtures live in `tests/minio/fixtures/` (regenerable by `generate_external_fixtures.py`; needs `pyarrow` + `faker`). The python suite uses the single-bucket MinIO in `compose.test.yml` (mount `/fixtures` for local-file mode; for s3 mode the `miniotest` alias is registered at server startup from the baked-in `tests/scripts/config.yaml`, so `ExternalTableTester.ensure_credentials()` is now a no-op). The standalone two-MinIO debug stack under `tests/minio/` (`docker-compose.yml`, `manual_run.sh`, `s3cmd.sh`) is unrelated to the suite — see `tests/minio/CLAUDE.md`.
 
 **JOIN-key width sensitivity** is the common gotcha in the JOIN tests
 above. The engine silently returns zero rows when an equi-JOIN compares an
@@ -85,7 +86,7 @@ Run a single Python test file:
 ```bash
 python -m pytest tests/test_flightsql_client_mysql_backend.py -v
 ```
-(Requires live Docker stack — run `docker compose up -d` first and register connections via `add_connections_maria_db.sh`.)
+(Requires live Docker stack — run `docker compose -f compose.test.yml up -d` first. Connections are baked into the otterstax image from `tests/scripts/config.yaml` and registered at startup; no manual registration step.)
 
 ### Convention: one class, each case an explicit `test_*` method
 
@@ -97,3 +98,4 @@ python -m pytest tests/test_flightsql_client_mysql_backend.py -v
 - Shared helpers (`create_topic`, `consume`, `assert_equal`, …) are methods on the class, not free functions duplicated inline.
 - `run_all_tests(self)`: `try: setup(); test_a(); test_b(); finally: cleanup()`. **Let exceptions propagate** — do not `except: print("fail")` and swallow, or the green ALL-PASSED banner will lie (a real bug in some older tests).
 - `main_test()` parses `--local`, runs `run_all_tests()`, prints the pass/fail banner, returns `0`/`1`; `sys.exit(main_test())` at the bottom.
+(Requires live Docker stack — run `docker compose -f compose.test.yml up -d` first. Connections are baked into the otterstax image from `tests/scripts/config.yaml` and registered at startup; no manual registration step.)

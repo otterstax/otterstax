@@ -17,6 +17,7 @@
 #include "integration/s3/s3_manager.hpp"
 #include "integration/sql/connection_manager.hpp"
 #include "scheduler/scheduler.hpp"
+#include "config/connections/connection_config.hpp"
 
 #include <actor-zeta.hpp>
 #include <otterbrix/otterbrix.hpp>
@@ -42,6 +43,14 @@ public:
     actor_zeta::address_t file_manager_address() const;
     actor_zeta::address_t s3_manager_address() const;
 
+    // Register every remote backend and s3 alias described by the connection
+    // config (parsed from the config file at startup) with the corresponding
+    // connector managers. This is the sole entry point for registering
+    // connections — there is no runtime add/remove API. Entries that fail
+    // required-field validation are skipped; opening a backend is retried per
+    // `retry` (mysql/pg/ch connect eagerly and may need to wait on a slow DB).
+    void register_connections(const config::ConnectionsConfig& connections,
+                              const config::ConnectionRetryConfig& retry = {});
 private:
     db::otterbrix_engine_ptr engine_{nullptr};
     std::pmr::memory_resource* resource_{nullptr};

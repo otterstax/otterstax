@@ -42,7 +42,7 @@ Full docker is the default; choose `--local` only if the user explicitly asks to
 - Docker daemon running. If the current user can't reach `/var/run/docker.sock`, the scripts auto-fall-back to `sudo -n docker`. If `sudo -n` is not configured, ask the user to either add themselves to the `docker` group or enable passwordless sudo.
 - Python 3 with `faker` (always) and `pyarrow` (for `step_8` — written via `pq.write_table` in `generate_data.py`). If pyarrow is missing the script prints a warning and skips `init/s3/promos.parquet`; step_8 will then fail with "External table is not registered". The scripts auto-`source ../../.venv/bin/activate` if a project venv exists.
 - `psql` client on the host (used to drive the demo SQL files).
-- Ports 3201, 3202, 3204, 3205, 3206, 3207, 8085, 8815, 8816, 8817 free on the host. 3206/3207 are the MinIO S3 API + console.
+- Ports 3201, 3202, 3204, 3205, 3206, 3207, 8815, 8816, 8817 free on the host. 3206/3207 are the MinIO S3 API + console.
 
 ## Mode A: full docker (`examples/demo/up.sh`)
 
@@ -55,12 +55,11 @@ This does, in order:
 1. `python examples/demo/generate_data.py` — writes `examples/demo/init/{mariadb,postgres,clickhouse}/init.sql` with seeded data (correlated IDs across backends, time windows aligned to demo predicates) **and** writes `examples/demo/init/s3/{regions.csv,promos.parquet}` (6 rows + 12 rows) for steps 7-9.
 2. `docker compose -f examples/demo/compose.yml --profile full up -d --build` — starts MariaDB + PostgreSQL + ClickHouse + MinIO + the `demo-minio-init` one-shot (which `mc mb demo-bucket && mc cp /fixtures/ m/demo-bucket/`) + the `otterstax_app` container.
 3. Polls each container's healthcheck (up to 3 minutes). `demo-minio-init` exits cleanly once seeding finishes; it's not polled.
-4. POSTs the three connection JSONs (`examples/demo/connections/connection_{mysql,pg,ch}.json`) to `http://localhost:8085` and **GETs** `/s3/add_credentials` with `connection_s3.json` to register the `demo_s3` alias (`/s3/add_credentials` is a GET-with-body in `connection_server.cpp`). All four JSONs use docker-DNS hostnames (`demo-mariadb`, `demo-minio`, etc), which is what otterstax-in-docker needs.
+4. Connections require no registration step: `examples/demo/config.yaml` (docker-DNS hostnames: `demo-mariadb`, `demo-minio`, …) is mounted into the `demo-otterstax` container by `compose.yml` and read once at startup — server settings, the mysql/pg/ch backends **and** the `demo_s3` alias all come from that one file.
 5. Prints the `psql` invocation lines.
 
-The OtterStax HTTP API and the three wire ports are host-published:
+The three wire ports are host-published:
 
-- HTTP (connection mgmt): `http://localhost:8085`
 - PG wire: `localhost:8817` ← the demo uses this
 - MySQL wire: `localhost:8816`
 - FlightSQL: `localhost:8815`
@@ -69,21 +68,18 @@ The OtterStax HTTP API and the three wire ports are host-published:
 
 ```bash
 examples/demo/up.sh --local
-# in another terminal (ports come from config.yaml defaults 8815/8816/8817/8085;
-# this build takes only --config, NOT --port-* flags):
-./build/Release/server
-# then:
-examples/demo/connections/add_connections.sh    --local
-examples/demo/connections/add_s3_credentials.sh --local
+# in another terminal — a single config.yaml with the host-published ports:
+./build/server --config examples/demo/config_local.yaml
+# connections (mysql/pg/ch/s3) are read from that same file at startup — no separate step
 # and, for the Kafka act:
 examples/demo/kafka/1_ingestion/run.sh --local   # … then 2_join, 3_produce, …
 ```
 
-Bench mode starts the three backends + MinIO + `demo-minio-init` + `demo-kafka` (no `otterstax_app` container). You run the engine binary yourself. The `--local` flag selects the `_local` JSON variants, which point to `localhost:3201/3202/3204/3206` (host-published backend + minio ports), which is what a local server can reach; the Kafka act's `--local` points the SQL at the broker's published listener `127.0.0.1:19093`.
+Bench mode starts the three backends + MinIO + `demo-minio-init` + `demo-kafka` (no `otterstax_app` container). You run the engine binary yourself, pointing `--config` at `examples/demo/config_local.yaml` — its `connections:` section uses the `localhost:3201/3202/3204/3206` (host-published backend + minio ports) variant, which is what a local server can reach. The Kafka act's `--local` points the SQL at the broker's published listener `127.0.0.1:19093`.
 
 ## Run the demo steps
 
-Once connections are registered, run each step against the PG wire:
+Once the server is up (connections load from the config file at startup), run each step against the PG wire:
 
 ```bash
 psql -h localhost -p 8817 -U demo demo -f examples/demo/sql/step_1.sql
@@ -137,6 +133,10 @@ runs of step_9 overwrite it. A full reset with `examples/demo/down.sh` wipes
 the MinIO container along with the rest (the bucket is recreated by
 `demo-minio-init` on the next `up`).
 
+The Kafka act is re-runnable in place — each step's `DROP SOURCE IF EXISTS …
+CREATE SOURCE …` (and `DROP STREAM …`) re-creates its objects cleanly, so you can
+replay `run_all.sh` (or an individual step) without recreating otterstax.
+
 ## Tear down
 
 ```bash
@@ -153,10 +153,10 @@ examples/demo/down.sh
 | `CREATE DATABASE otter ... already exists` on rerun | Step 3a persists state | Run `examples/demo/sql/cleanup.sql` or `examples/demo/down.sh && examples/demo/up.sh`. |
 | `psql: error: server closed the connection unexpectedly` | otterstax crashed mid-query | `docker logs demo-otterstax | tail -50`. Cross-backend ARRAY queries and some struct cases are known to crash; demo SQL avoids these but custom queries may hit them. |
 | `er_table_exists_error` on test data | State from previous run leaked into backend volumes | `examples/demo/down.sh` then bring up fresh. |
-| `Otterbrix execution failed: database does not exist` | Query routed to local engine that doesn't know the external alias | Make sure all three connections were registered — re-run `examples/demo/connections/add_connections.sh` (or `--local` in bench mode). |
-| `External table is not registered: …` from step 7/8/9 | The `demo_s3` alias was never registered against this server instance | Run `examples/demo/connections/add_s3_credentials.sh` (or `--local`). |
+| `Otterbrix execution failed: database does not exist` | Query routed to local engine that doesn't know the external alias | Check the config file (`config.yaml` / `config_local.yaml`) `connections:` section has all three backends and restart the server — connections load only at startup. |
+| `External table is not registered: …` from step 7/8/9 | The `demo_s3` alias was not in the config file this server read | Add the `s3:` `demo_s3` entry under `connections:` and restart the server. |
 | Step 8 fails with `External table is not registered` and `init/s3/promos.parquet` is missing | `pyarrow` not installed when `generate_data.py` ran | `pip install pyarrow` and re-run `python examples/demo/generate_data.py`, then `docker compose -f examples/demo/compose.yml up -d demo-minio-init` to re-seed. |
-| Step 9 hangs or returns `Cannot reach minio:9000` from inside the server | s3 endpoint mismatch (docker vs local payload) | In docker mode the alias points at `demo-minio:9000`; in bench mode it points at `localhost:3206`. Re-register with the matching `--local` flag. |
+| Step 9 hangs or returns `Cannot reach minio:9000` from inside the server | s3 endpoint mismatch (docker vs local config) | In docker mode the alias points at `demo-minio:9000`; in bench mode it points at `localhost:3206`. Use the matching config file (`config.yaml` vs `config_local.yaml`) and restart the server. |
 
 ## File reference
 
@@ -171,12 +171,10 @@ All paths relative to `examples/demo/`:
 | `generate_data.py` | seeds init SQL files into `init/{mariadb,postgres,clickhouse}/`, s3 fixtures into `init/s3/`, AND kafka fixtures into `init/kafka/` |
 | `init/{mariadb,postgres,clickhouse}/init.sql` | generated init scripts (gitignored) |
 | `init/s3/{regions.csv,promos.parquet}` | generated S3 fixtures (gitignored); seeded into `demo-bucket` by the `demo-minio-init` compose service |
-| `init/kafka/{orders_live,orders_intl}.ndjson` | generated Kafka fixtures (gitignored); produced onto topics by `kafka/lib/seed.py` |
+| `init/kafka/{orders_live,orders_intl}.ndjson` | generated Kafka fixtures (gitignored); produced onto topics by the `seed` helper in `kafka/lib/_common.sh` (rpk inside the demo-kafka container) |
 | `kafka/` | the Kafka streaming act — step folders (`1_ingestion`…`6_teardown`), `run_all.sh`, `lib/` helpers; see `kafka/README.md` |
-| `connections/connection_*.json` | backend / s3 payloads (docker-DNS hostnames: `demo-mariadb`, `demo-minio`, …) |
-| `connections/connection_*_local.json` | backend / s3 payloads (host-published ports for local binary: 3201/3202/3204/3206) |
-| `connections/add_connections.sh [--local]` | POST mysql + pg + ch connections to otterstax HTTP API |
-| `connections/add_s3_credentials.sh [--local]` | GET-with-body `/s3/add_credentials` to register the `demo_s3` alias |
+| `config.yaml` | single config file for docker mode (server settings + connections; docker-DNS hostnames `demo-mariadb`, `demo-minio`, …); mounted into the container, read at startup |
+| `config_local.yaml` | single config file for bench/local mode (host-published ports: 3201/3202/3204/3206) — pass with `--config` |
 | `sql/step_*.sql` | the actual demo queries — `step_7` / `step_8` load from s3, `step_9` JOINs and dumps back |
 | `sql/cleanup.sql` | drops the s3-loaded tables and the `otter` engine database |
 

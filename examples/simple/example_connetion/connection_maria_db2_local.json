@@ -1,9 +1,0 @@
-{
-    "alias": "impressions",
-    "host": "127.0.0.1",
-    "port": "3102",
-    "username": "user2",
-    "password": "password2",
-    "database": "db2",
-    "table": ""
-}

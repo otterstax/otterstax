@@ -1,0 +1,69 @@
+# OtterStax server configuration — the single config file.
+#
+# Holds both the wire-server settings (under `service:`) and, under
+# `connections:`, every remote backend and s3 alias. Read once at startup
+# (default path: config.yaml, relative to the server's working directory;
+# override with --config PATH). The `connections:` section is the single source
+# of truth for connections — there is no runtime add/remove API. Edit and
+# restart to change them.
+
+service:
+  flight_sql:
+    host: "0.0.0.0"
+    port: 8815
+
+  # Wire-protocol server ports. NB: these are the ports OtterStax listens on —
+  # not to be confused with the backends under `connections:` (same names,
+  # different meaning).
+  mysql:
+    port: 8816
+  postgres:
+    port: 8817
+
+  # Startup retry policy for opening remote backend connections (mysql/postgresql/
+  # clickhouse connect eagerly and may need to wait on a still-booting DB).
+  # max_attempts <= 1 means a single attempt (no retry). s3 aliases are only
+  # stored, so they are not retried.
+  connection_retry:
+    max_attempts: 10
+    delay_ms: 2000
+
+# Remote backends + s3 aliases. All sections are optional. `port` is a string;
+# postgresql `schema` defaults to "public"; s3 region/session_token/endpoint are
+# optional. The `alias` is the outermost qualifier in federated SQL
+# (alias.db.schema.table) and the s3_alias used by CREATE EXTERNAL TABLE / COPY.
+connections:
+  mysql:
+    - alias: mysql
+      host: demo-mariadb
+      port: "3306"
+      username: demo
+      password: demo
+      database: bill
+      table: ""
+
+  postgresql:
+    - alias: pg
+      host: demo-postgres
+      port: "5432"
+      username: demo
+      password: demo
+      database: shop
+      schema: shop
+      table: ""
+
+  clickhouse:
+    - alias: ch
+      host: demo-clickhouse
+      port: "9000"
+      username: demo
+      password: demo
+      database: ev
+      table: ""
+
+  s3:
+    - alias: demo_s3
+      access_key: minioadmin
+      secret_key: minioadmin
+      region: us-east-1
+      endpoint: demo-minio:9000

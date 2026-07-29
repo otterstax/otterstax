@@ -1,0 +1,51 @@
+# Demo server config — bench/local mode (otterstax runs as a local binary,
+# backends addressed via host-published ports). Run from the repo root:
+#   ./build/server --config examples/demo/config_local.yaml
+
+service:
+  flight_sql:
+    host: "0.0.0.0"
+    port: 8815
+  mysql:
+    port: 8816
+  postgres:
+    port: 8817
+  connection_retry:
+    max_attempts: 10
+    delay_ms: 2000
+
+connections:
+  mysql:
+    - alias: mysql
+      host: localhost
+      port: "3201"
+      username: demo
+      password: demo
+      database: bill
+      table: ""
+
+  postgresql:
+    - alias: pg
+      host: localhost
+      port: "3202"
+      username: demo
+      password: demo
+      database: shop
+      schema: shop
+      table: ""
+
+  clickhouse:
+    - alias: ch
+      host: localhost
+      port: "3204"
+      username: demo
+      password: demo
+      database: ev
+      table: ""
+
+  s3:
+    - alias: demo_s3
+      access_key: minioadmin
+      secret_key: minioadmin
+      region: us-east-1
+      endpoint: localhost:3206

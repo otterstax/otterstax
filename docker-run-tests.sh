@@ -380,10 +380,12 @@ echo "=== Step 7: Starting otterstax ==="
 echo ""
 compose up -d test-otterstax
 
-# Wait for otterstax to be healthy with retry logic
+# Wait for otterstax to be healthy with retry logic. There is no HTTP management
+# port anymore — probe the FlightSQL wire port (8815) instead. Connections are
+# registered from the baked-in connection config at startup.
 echo "🕒 Waiting for otterstax to be healthy..."
 for ((i=1;i<=WAIT_RETRIES;i++)); do
-    if compose_exec test-otterstax curl -s -f http://localhost:8085/health >/dev/null 2>&1; then
+    if compose_exec test-otterstax bash -c 'timeout 2 bash -c "</dev/tcp/localhost/8815"' >/dev/null 2>&1; then
         echo "✅ Otterstax is healthy"
         break
     fi
@@ -409,9 +411,9 @@ if $ENABLE_TRACY && ! $TRACY_SEP; then
         timeout 2 bash -c '</dev/tcp/localhost/8086' 2>/dev/null \
             && echo 'Port 8086 OPEN — Tracy IS listening' \
             || echo 'Port 8086 CLOSED — Tracy is NOT listening'
-        timeout 2 bash -c '</dev/tcp/localhost/8085' 2>/dev/null \
-            && echo 'Port 8085 OPEN (health port sanity check OK)' \
-            || echo 'Port 8085 CLOSED (health port — unexpected)'
+        timeout 2 bash -c '</dev/tcp/localhost/8815' 2>/dev/null \
+            && echo 'Port 8815 OPEN (FlightSQL wire sanity check OK)' \
+            || echo 'Port 8815 CLOSED (FlightSQL wire — unexpected)'
     " 2>/dev/null || echo "(exec failed)"
     echo "📋 Tracy port check (nc from host via exposed port):"
     nc -z -w 2 localhost 8086 2>/dev/null && echo "Port 8086 reachable from host" || echo "Port 8086 NOT reachable from host"
@@ -501,7 +503,7 @@ if $TRACY_SEP; then
         echo "⏳ Waiting for otterstax to be healthy..."
         _skip=false
         for ((i=1;i<=WAIT_RETRIES;i++)); do
-            if compose_exec test-otterstax curl -s -f http://localhost:8085/health >/dev/null 2>&1; then
+            if compose_exec test-otterstax bash -c 'timeout 2 bash -c "</dev/tcp/localhost/8815"' >/dev/null 2>&1; then
                 echo "✅ Otterstax healthy"
                 break
             fi
@@ -517,16 +519,9 @@ if $TRACY_SEP; then
         done
         if $_skip; then continue; fi
 
-        # Add all database connections.
-        compose run --rm --use-aliases test-client bash -c "
-            cd /app
-            ./add_connections.sh
-            curl -s -X POST 'http://test-otterstax:8085/add_pg_connection' \
-                -H 'Content-Type: application/json' -d @connection_postgres.json >/dev/null 2>&1 || true
-            curl -s -X POST 'http://test-otterstax:8085/add_ch_connection' \
-                -H 'Content-Type: application/json' -d @connection_clickhouse.json >/dev/null 2>&1 || true
-            sleep 3
-        "
+        # Connections are baked into the otterstax image (tests/scripts/config.yaml)
+        # and registered from that file at startup — nothing to add here. The
+        # fresh restart above re-registers them automatically.
 
         # Start a dedicated tracy-capture sidecar for this test.
         SEP_CAPTURE="tracy-sep-${PROJECT_NAME}-$$-$((SEP_PASSED + SEP_FAILED))"
@@ -607,7 +602,7 @@ if ! $ENABLE_TRACY && [ "${ENABLE_ASAN:-OFF}" != "ON" ] && [ "${ENABLE_TSAN:-OFF
     echo "🕒 Waiting for otterstax to be healthy..."
     _crash_ready=false
     for ((i=1;i<=WAIT_RETRIES;i++)); do
-        if compose_exec test-otterstax curl -s -f http://localhost:8085/health >/dev/null 2>&1; then
+        if compose_exec test-otterstax bash -c 'exec 3<>/dev/tcp/localhost/8815' >/dev/null 2>&1; then
             echo "✅ Otterstax is healthy"
             _crash_ready=true
             break
@@ -620,10 +615,14 @@ if ! $ENABLE_TRACY && [ "${ENABLE_ASAN:-OFF}" != "ON" ] && [ "${ENABLE_TSAN:-OFF
         compose logs test-otterstax | tail -30
         TEST_RC=1
     else
+        # `set -e` is active: a non-zero exit here would abort the script before
+        # the log dump + Step 9 cleanup below (leaving containers running). Capture
+        # the rc via `|| _crash_rc=$?` so failure is handled, not fatal.
+        _crash_rc=0
         compose run --rm --use-aliases \
             -v /var/run/docker.sock:/var/run/docker.sock \
-            test-client python test_kafka_crash_recovery.py --docker-container test_otterstax_app
-        _crash_rc=$?
+            test-client python test_kafka_crash_recovery.py --docker-container test_otterstax_app \
+            || _crash_rc=$?
         if [ $_crash_rc -eq 0 ]; then
             echo "✅ PASSED: Kafka crash-recovery"
         else

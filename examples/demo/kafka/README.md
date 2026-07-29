@@ -29,8 +29,9 @@ broker, and (in docker mode) registers the pg/ch connections the JOIN needs:
 ```bash
 examples/demo/up.sh            # full docker
 # — or —
-examples/demo/up.sh --local    # bench mode; then start the server yourself and:
-examples/demo/connections/add_connections.sh --local
+examples/demo/up.sh --local    # bench mode; then start the server yourself:
+./build/server --config examples/demo/config_local.yaml
+# connections (mysql/pg/ch/s3) load from that config file at startup — no HTTP step
 ```
 
 ## Run it — step by step (for a live demo)
@@ -63,9 +64,11 @@ kafka/
   README.md
   run_all.sh                 # chain every step, non-interactive
   lib/
-    _common.sh               # broker addressing + psql/pause/wait helpers
-    seed.py    --topic T [--fixture F] [--reset]   # bring up / reset a topic
-    consume.py --topic T [--count N] [--timeout S] # drain a topic, print it
+    _common.sh               # broker addressing + psql/pause/wait + seed/consume
+                             #   seed  --topic T [--fixture F] [--reset]  (create + produce)
+                             #   consume --topic T [--timeout S]          (drain, print)
+                             #   both shell out to `rpk` inside the demo-kafka container,
+                             #   so there is no host-side Kafka client dependency
   <n>_<name>/                # one folder per step (1_ingestion, 2_join, …)
     run.sh                   # walk this step's sub-steps (pausing for [Enter])
     NN_*.sql | NN_*.sh       # the individual sub-steps

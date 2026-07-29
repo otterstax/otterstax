@@ -29,7 +29,116 @@ OtterStax runs several protocol servers concurrently:
 | FlightSQL  | 8815          | Apache Arrow FlightSQL protocol |
 | MySQL      | 8816          | MySQL wire protocol |
 | PostgreSQL | 8817          | PostgreSQL wire protocol |
-| HTTP       | 8085          | Connection manager REST API |
+
+Server settings and all remote backends / S3 aliases live in a **single
+`config.yaml`** and are read once at server startup (see
+[Connection configuration](#connection-configuration)).
+
+## Connection configuration
+
+There is a **single config file, `config.yaml`**. It holds the wire-server
+settings and, under a `connections:` section, all remote backends (MariaDB/MySQL,
+PostgreSQL, ClickHouse) and S3 aliases. It is read **once at server startup**; the
+`connections:` section is the single source of truth for connections —
+**there is no runtime add/remove/update API**. To change connections, edit
+`config.yaml` and restart the server.
+
+### Locating the file
+
+The path is passed with `--config PATH` and defaults to `config.yaml`, resolved
+**relative to the server's working directory**:
+
+```bash
+./build/server --config path/to/config.yaml
+```
+
+In the provided Docker images the server runs from `/app/build/Release` with no
+`--config`, so it reads `/app/build/Release/config.yaml` — the compose files
+bind-mount a stack-specific `config.yaml` onto that path (and `Dockerfile.test`
+bakes one in for the integration tests). A missing file means the server starts
+with default ports and no connections.
+
+### File format
+
+```yaml
+service:
+  flight_sql:
+    host: "0.0.0.0"
+    port: 8815
+  mysql:
+    port: 8816          # wire-server port (NOT a backend)
+  postgres:
+    port: 8817          # wire-server port (NOT a backend)
+  connection_retry:     # optional; startup retry for opening backends
+    max_attempts: 10    #   default 1 (one-shot)
+    delay_ms: 2000      #   default 1000
+
+connections:
+  mysql:
+    - alias: mysql      # outermost qualifier in federated SQL: mysql.bill.<table>
+      host: demo-mariadb
+      port: "3306"      # note: port is a string; optional (empty → driver default)
+      username: demo
+      password: demo
+      database: bill
+      table: ""
+
+  postgresql:
+    - alias: pg
+      host: demo-postgres
+      port: "5432"
+      username: demo
+      password: demo
+      database: shop
+      schema: shop      # optional, defaults to "public"
+      table: ""
+
+  clickhouse:
+    - alias: ch
+      host: demo-clickhouse
+      port: "9000"
+      username: demo
+      password: demo
+      database: ev
+      table: ""
+
+  s3:
+    - alias: demo_s3    # referenced by CREATE EXTERNAL TABLE / COPY ... TO via s3_alias=
+      access_key: minioadmin
+      secret_key: minioadmin
+      region: us-east-1         # optional
+      endpoint: demo-minio:9000 # optional; switches to http + path-style (MinIO)
+```
+
+Wire-server settings live under the top-level `service:` node so
+`service.mysql`/`service.postgres` (wire-server ports) never collide with the
+backends under `connections:`. All `connections:` sections are optional; each
+backend requires `alias`/`host`/`username`/`database` (`port`/`table` optional).
+An entry missing a required field **aborts startup** (fail-fast — the config must
+be fixed), as does malformed YAML. A missing file means the server starts with no
+registered connections. A *valid* connection whose backend is unreachable is
+retried per `service.connection_retry` and, if still down, logged without
+aborting startup (the other backends and local engine stay usable).
+
+### Using an alias
+
+Once registered, an alias is the outermost database qualifier in federated SQL:
+
+```sql
+SELECT * FROM mysql.bill.orders
+JOIN pg.shop.customers ON mysql.bill.orders.customer_id = pg.shop.customers.id;
+```
+
+and the `s3_alias` for external tables:
+
+```sql
+CREATE EXTERNAL TABLE otter.regions
+    WITH (s3_alias = 'demo_s3', location = 's3://demo-bucket/regions.csv', format = 'csv');
+```
+
+Ready-made `config.yaml` files ship with each runnable stack: `examples/demo/`,
+`examples/simple/example_connetion/`, `tests/scripts/`, `scripts/database/`, and
+`benchmark/` (plus a template at the repo root).
 
 ## S3 / file external tables
 
@@ -69,14 +178,16 @@ COPY (SELECT * FROM db.t) TO 's3://bucket/exported/out.csv'
   its slice into the engine as `raw_data` and the JOIN runs in-process. (See
   the deep-dive in [`CLAUDE.md`](CLAUDE.md#working-join-shapes) for the
   width-of-the-JOIN-key footgun to keep in mind.)
-- **S3 credentials**: register a named alias via the REST API once per
-  process, then reference it through `s3_alias=...`:
+- **S3 credentials**: declare a named alias in the `connections.s3:` section of
+  `config.yaml`, then reference it through `s3_alias=...`:
 
-  ```bash
-  curl -X GET http://localhost:8085/s3/add_credentials \
-       -H 'Content-Type: application/json' \
-       -d '{"alias":"minio1","access_key":"…","secret_key":"…",
-            "region":"us-east-1","endpoint":"minio:9000"}'
+  ```yaml
+  s3:
+    - alias: minio1
+      access_key: "…"
+      secret_key: "…"
+      region: us-east-1
+      endpoint: minio:9000
   ```
 
   The `endpoint` field switches the underlying Arrow S3 client to http +
@@ -120,11 +231,10 @@ python fixtures/generate_data.py
 docker compose up
 ```
 
-3. (Optional) Add example database connections used by clients:
-
-```bash
-examples/simple/example_connetion/add_connections.sh
-```
+3. Configure database connections. The `docker compose up` stack mounts
+   `scripts/database/config.yaml` into the server; edit its `connections:`
+   section to point at your backends and s3 aliases, then restart the server —
+   connections are read only at startup (there is no runtime registration step).
 
 4. Run example queries using the Python client:
 
@@ -252,7 +362,7 @@ never deleted automatically; each run creates a new timestamped sub-directory.
 otterstax/
 ├── frontend/           # Protocol servers (FlightSQL, MySQL, PostgreSQL)
 ├── catalog/            # Metadata catalog + connection type registry
-├── connectors/         # MySQL / PG / ClickHouse / S3 / file connectors + HTTP API
+├── connectors/         # MySQL / PG / ClickHouse / S3 / file connectors
 ├── component_manager/  # Component lifecycle management
 ├── config/             # Configuration loading and runtime settings
 ├── integration/        # Actor wrappers bridging Scheduler ↔ connectors (incl. S3Manager)

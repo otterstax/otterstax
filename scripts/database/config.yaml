@@ -1,0 +1,51 @@
+# Server config for the manual/dev stack (root compose.yml). Mounted into the
+# otterstax_app container at the server's default config path and read once at
+# startup. Backends are addressed by docker-DNS names on the compose network.
+
+service:
+  flight_sql:
+    host: "0.0.0.0"
+    port: 8815
+  mysql:
+    port: 8816
+  postgres:
+    port: 8817
+  connection_retry:
+    max_attempts: 10
+    delay_ms: 2000
+
+connections:
+  mysql:
+    - alias: campaigns
+      host: mariadb1
+      port: "3306"
+      username: user1
+      password: password1
+      database: db1
+      table: ""
+    - alias: impressions
+      host: mariadb2
+      port: "3306"
+      username: user2
+      password: password2
+      database: db2
+      table: ""
+
+  postgresql:
+    - alias: products
+      host: postgres1
+      port: "5432"
+      username: pguser
+      password: pgpassword
+      database: pgdb
+      schema: public
+      table: ""
+
+  clickhouse:
+    - alias: chtest
+      host: clickhouse1
+      port: "9000"
+      username: chuser
+      password: chpassword
+      database: chdb
+      table: ""

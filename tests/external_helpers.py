@@ -26,10 +26,8 @@ MinIO credentials through the HTTP API.
 
 import argparse
 import sys
-import time
 
 import mysql.connector
-import requests
 
 import config
 
@@ -81,38 +79,21 @@ class ExternalTableTester:
             "user": "testuser",
             "password": "testpass",
         }
-        self.http_base = f"http://{self.host}:{config.HTTP_PORT}"
         self._created = []  # (db, table) pairs to drop on cleanup
 
     # ── connection ───────────────────────────────────────────────────────────
     def connect(self):
         return mysql.connector.connect(**self.conn_cfg)
 
-    # ── s3 credential registration (no-op for the file source) ───────────────
+    # ── s3 credential registration ───────────────────────────────────────────
     def ensure_credentials(self):
+        # No-op. There is no runtime credential API anymore — the '{alias}' s3
+        # alias is registered from the server's connection config file at startup
+        # (tests/scripts/config.yaml, baked into the otterstax image). Kept
+        # as a no-op so existing test call sites need no change.
         if self.source != "s3":
             return
-        body = {
-            "alias": S3_ALIAS,
-            "access_key": S3_ACCESS_KEY,
-            "secret_key": S3_SECRET_KEY,
-            "region": S3_REGION,
-            "endpoint": S3_ENDPOINT,
-        }
-        last = None
-        for attempt in range(1, 16):
-            try:
-                # GET with a JSON body (see connection_server.cpp /s3/add_credentials).
-                resp = requests.request("GET", f"{self.http_base}/s3/add_credentials", json=body, timeout=10)
-                if resp.status_code == 200:
-                    print(f"Registered s3 credentials for alias '{S3_ALIAS}'")
-                    return
-                last = f"HTTP {resp.status_code}: {resp.text}"
-            except Exception as exc:  # noqa: BLE001
-                last = str(exc)
-            print(f"  s3 credential registration not ready, retrying ({attempt}/15)... [{last}]")
-            time.sleep(2)
-        raise RuntimeError(f"Failed to register s3 credentials: {last}")
+        print(f"Using pre-registered s3 alias '{S3_ALIAS}' (from startup connection config)")
 
     # ── SQL fragment builders ────────────────────────────────────────────────
     def _source_location(self, filename):

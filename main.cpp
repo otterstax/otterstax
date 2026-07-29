@@ -8,12 +8,10 @@
 #include <vector>
 
 #include <arrow/util/logging.h>
-#include <boost/asio.hpp>
 #include <boost/program_options.hpp>
 #include <spdlog/spdlog.h>
 
 #include "component_manager/component_manager.hpp"
-#include "connectors/api_server/connection_server.hpp"
 #include "connectors/mysql/connector.hpp"
 #include "frontend/flight_sql_server/server.hpp"
 #include "frontend/mysql_server/mysql_server.hpp"
@@ -66,7 +64,10 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
-    // Load server configuration from YAML file
+    // Load server configuration from the single YAML config file. This carries
+    // both the wire-server settings and, under `connections:`, every remote
+    // backend and s3 alias — the single source of truth for connections. There
+    // is no runtime add/remove API.
     config::ServiceConfig server_config;
     try {
         config::ConfigReader reader;
@@ -76,7 +77,9 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-
+    // Register the connections read from the config file with the connector
+    // managers (opens the backend connections / stores the s3 aliases).
+    cmanager.register_connections(server_config.connections, server_config.connection_retry);
 
     // Configure the Flight SQL server
     Config config{
@@ -88,27 +91,6 @@ int main(int argc, char* argv[]) {
     };
 
     SimpleFlightSQLServer server(config);
-
-    // The io_context must live in main scope so we can stop it from outside
-    // the thread on shutdown — otherwise ctx.run() blocks the jthread join.
-    asio::io_context http_ctx;
-
-    // Start the HTTP server in a separate thread
-    std::jthread server_thread([mysql_conn_manager = cmanager.db_connection_manager(),
-                                pg_conn_manager = cmanager.pg_connection_manager(),
-                                ch_conn_manager = cmanager.ch_connection_manager(),
-                                s3_manager = cmanager.s3_manager_address(),
-                                http_port = server_config.connection_manager.port,
-                                &http_ctx]() {
-        OTX_ZONE_N("http_server::thread");
-        conn::api_server::Server http(http_ctx, http_port, mysql_conn_manager, pg_conn_manager, ch_conn_manager,
-                                      s3_manager);
-        auto log = get_logger(logger_tag::Main);
-        log->info("HTTP Server running on port {}...", http_port);
-        OTX_MESSAGE_L("http_server: running");
-        http_ctx.run();
-        OTX_MESSAGE_L("http_server: stopped");
-    });
 
     // Configure MySQL server
     frontend::frontend_server_config mysql_config{
@@ -142,17 +124,13 @@ int main(int argc, char* argv[]) {
     arrow::Status status = server.Start();
 
     // Serve() returned — graceful shutdown sequence.
-    // Stop the HTTP io_context first so ctx.run() returns and the jthread can
-    // join cleanly. Then stop the wire-protocol frontends explicitly before
-    // their destructors run, giving Tracy a clean window to flush the profile.
+    // Stop the wire-protocol frontends explicitly before their destructors run,
+    // giving Tracy a clean window to flush the profile.
     {
         OTX_ZONE_N("server::shutdown");
         OTX_MESSAGE_L("shutdown: initiated");
 
         log->info("Shutdown initiated — stopping all servers...");
-        http_ctx.stop();
-        OTX_MESSAGE_L("shutdown: http server stopped");
-
         mysql.stop();
         OTX_MESSAGE_L("shutdown: mysql server stopped");
 

@@ -9,7 +9,6 @@ HOST_LOCAL = "127.0.0.1"
 MYSQL_PORT = 8816
 PG_PORT = 8817
 FLIGHT_PORT = 8815
-HTTP_PORT = 8085
 
 # ClickHouse backend
 CH_ALIAS = "chtest"

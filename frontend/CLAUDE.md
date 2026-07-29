@@ -56,4 +56,4 @@ Packet encoding/decoding lives in `{mysql,postgres}_server/packet/` and `{mysql,
 | MySQL | 8816 | `mysql_server` |
 | PostgreSQL | 8817 | `postgres_server` |
 
-Ports are hardcoded in `main.cpp` and in the `config.yml` / `compose.yml` files.
+Ports are hardcoded in `main.cpp` and in the `config.yaml` / `compose.yml` files.

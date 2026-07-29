@@ -57,13 +57,25 @@ namespace mysql {
                         e.code().value(),
                         e.what(),
                         e.get_diagnostics().server_message());
-            connections_[uuid]->close();
-            connections_.erase(uuid);
+            // make_connector_()/connect() may throw before a live connector is
+            // stored (operator[] then leaves a null entry). Guard the close() so
+            // a failed add logs + rethrows instead of dereferencing null — the
+            // caller (register_connections) then retries per connection_retry.
+            if (auto it = connections_.find(uuid); it != connections_.end()) {
+                if (it->second) {
+                    it->second->close();
+                }
+                connections_.erase(it);
+            }
             throw std::runtime_error("Add connection asio error: " + std::string(e.what()));
         } catch (const std::exception& e) {
             log_->error("Error: {}", e.what());
-            connections_[uuid]->close();
-            connections_.erase(uuid);
+            if (auto it = connections_.find(uuid); it != connections_.end()) {
+                if (it->second) {
+                    it->second->close();
+                }
+                connections_.erase(it);
+            }
             throw std::runtime_error("Add connection common error: " + std::string(e.what()));
         }
     }

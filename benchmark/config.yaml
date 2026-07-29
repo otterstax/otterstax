@@ -1,0 +1,77 @@
+# Benchmark server config. Mounted into the bench_otterstax container (see
+# compose_benchmark.yml) at the server's default config path and read once at
+# startup — overrides any config.yaml baked into the image. Aliases/hosts must
+# match benchmark/manual/_common.sh, run_benchmark.sh, run_stress_benchmarks.sh,
+# and benchmarks/queries.py.
+
+service:
+  flight_sql:
+    host: "0.0.0.0"
+    port: 8815
+  mysql:
+    port: 8816
+  postgres:
+    port: 8817
+  connection_retry:
+    max_attempts: 10
+    delay_ms: 2000
+
+connections:
+  mysql:
+    - alias: mysql1
+      host: bench_mariadb1
+      port: "3306"
+      username: user1
+      password: password1
+      database: benchdb1
+      table: ""
+    - alias: mysql2
+      host: bench_mariadb2
+      port: "3306"
+      username: user2
+      password: password2
+      database: benchdb2
+      table: ""
+
+  postgresql:
+    - alias: pg1
+      host: bench_postgres1
+      port: "5432"
+      username: pguser
+      password: pgpassword
+      database: benchpg1
+      schema: public
+      table: ""
+    - alias: pg2
+      host: bench_postgres2
+      port: "5432"
+      username: pguser
+      password: pgpassword
+      database: benchpg2
+      schema: public
+      table: ""
+
+  clickhouse:
+    - alias: ch1
+      host: bench_clickhouse1
+      port: "9000"
+      username: chuser
+      password: chpassword
+      database: benchch1
+      table: ""
+    - alias: ch2
+      host: bench_clickhouse2
+      port: "9000"
+      username: chuser
+      password: chpassword
+      database: benchch2
+      table: ""
+
+  # Used only by the external_* (s3) benchmarks; harmless when they are not run
+  # (add_credentials just stores the alias — it does not open a connection).
+  s3:
+    - alias: bench_minio
+      access_key: minioadmin
+      secret_key: minioadmin
+      region: us-east-1
+      endpoint: bench_minio:9000

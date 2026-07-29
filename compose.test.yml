@@ -134,15 +134,19 @@ services:
         condition: service_healthy
     expose:
       - "8815"
-      - "8085"
+      - "8816"
+      - "8817"
     ports:
       - "8086:8086"
     # Fixtures used by the file/s3 external-table tests are baked into the
     # Dockerfile.test image at /fixtures (see the COPY near the end of that
     # Dockerfile). Bind-mounting them from the host workspace breaks in DinD
     # CI runners where the docker daemon cannot see the runner's filesystem.
+    # Connections are likewise baked into the image (tests/scripts/config.yaml
+    # → config.yaml) and read once at startup.
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8085/health"]
+      # No HTTP management port anymore — probe the FlightSQL wire port instead.
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/localhost/8815' || exit 1"]
       interval: 5s
       timeout: 10s
       retries: 30

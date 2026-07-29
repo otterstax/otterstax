@@ -4,7 +4,122 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Project Is
 
-OtterStax is a federated SQL query server. Clients connect via MySQL wire protocol (8816), PostgreSQL wire protocol (8817), or Apache Arrow FlightSQL (8815). Queries are either executed locally by the Otterbrix engine or dispatched to registered remote database backends (MariaDB/MySQL, PostgreSQL, ClickHouse). A REST API on port 8085 manages remote connections at runtime.
+OtterStax is a federated SQL query server. Clients connect via MySQL wire protocol (8816), PostgreSQL wire protocol (8817), or Apache Arrow FlightSQL (8815). Queries are either executed locally by the Otterbrix engine or dispatched to registered remote database backends (MariaDB/MySQL, PostgreSQL, ClickHouse). There is a **single config file** (`config.yaml`) that holds the wire-server settings and, under a `connections:` section, every remote backend and s3 alias — read once at startup. That `connections:` section is the single source of truth for connections; there is no runtime add/remove API.
+
+## Connection Config
+
+Everything lives in **one YAML file, `config.yaml`** — the wire-server settings
+and, under `connections:`, every remote backend and s3 alias. It is **read once
+at server startup**; the `connections:` section is the single source of truth for
+connections. There is **no runtime add/remove/update API** (the old HTTP server on
+port 8085 was removed). To change connections, edit `config.yaml` and restart the
+server. See `config/CLAUDE.md` for the full config-layer reference.
+
+### The file and how it is located
+
+The path comes from the `--config PATH` flag (default `config.yaml`), resolved
+**relative to the server's working directory**. In containers the server runs from
+`WORKDIR /app/build/Release` with no `--config`, so at runtime it reads
+`/app/build/Release/config.yaml`, provided either by:
+
+- **baking** it into the image (`Dockerfile.test` `COPY`s the test `config.yaml`
+  there), or
+- **bind-mounting** a stack-specific `config.yaml` onto that path (compose files)
+  — a mount overrides anything baked in.
+
+A missing file → the server starts with default ports and no connections.
+
+### File format
+
+```yaml
+service:
+  flight_sql: { host: "0.0.0.0", port: 8815 }
+  mysql:      { port: 8816 }      # wire-server port (NOT a backend)
+  postgres:   { port: 8817 }      # wire-server port (NOT a backend)
+  connection_retry: { max_attempts: 10, delay_ms: 2000 }
+
+connections:
+  mysql:
+    - { alias: mysql, host: demo-mariadb, port: "3306", username: demo, password: demo, database: bill, table: "" }
+  postgresql:
+    - { alias: pg, host: demo-postgres, port: "5432", username: demo, password: demo, database: shop, schema: shop, table: "" }
+  clickhouse:
+    - { alias: ch, host: demo-clickhouse, port: "9000", username: demo, password: demo, database: ev, table: "" }
+  s3:
+    - { alias: demo_s3, access_key: minioadmin, secret_key: minioadmin, region: us-east-1, endpoint: demo-minio:9000 }
+```
+
+Wire-server settings live under the top-level `service:` node so
+`service.mysql`/`service.postgres` (**wire-server ports**) never collide with the
+backends under `connections:` (`connections.mysql`/`connections.postgresql`) —
+different nesting. All `connections:` sections are optional (missing → empty).
+`port` is an **optional string** (empty → driver default). `schema` defaults to
+`public`. s3 `region`/`session_token`/`endpoint` are optional; malformed YAML
+aborts startup. `service.connection_retry` (optional; default `max_attempts: 1`,
+`delay_ms: 1000` = one-shot) sets how many times startup retries opening a slow
+backend. The `alias` is the outermost qualifier in federated SQL
+(`SELECT ... FROM alias.db.schema.table ...`) and the `s3_alias` referenced by
+`CREATE EXTERNAL TABLE` / `COPY ... TO`.
+
+### Flow through the code
+
+```text
+main.cpp
+  → config::ConfigReader.load(config.yaml)      → ServiceConfig { ports…, ConnectionsConfig connections }
+        (internally: parse_connections(config["connections"]) → plain descriptor structs)
+        (parse_connections validates every entry → throws on an incomplete one →
+         startup aborts before any connector is touched)
+  → ComponentManager::register_connections(server_config.connections, server_config.connection_retry)
+       mysql/pg/ch: ConnectorManager::addConnection(conn::api_server::*Params)   — opens the connector,
+                    retried up to connection_retry.max_attempts (delay_ms between tries)
+       s3         : actor send &conn::s3::ConnectorManager::add_credentials      — stores the alias (no retry)
+```
+
+- Parsing + validation live in the `config` target (`config/`), which has **no
+  connector dependencies** — `parse_connections` produces plain
+  `config::ConnectionsConfig` descriptor structs held inside `ServiceConfig` and
+  **throws (via `validation_error`) on any incomplete entry**, so an invalid
+  connection aborts startup rather than coming up half-configured.
+- Registration lives in `ComponentManager::register_connections` (it owns the
+  connector managers), converting the pre-validated descriptors → connector param
+  structs. Opening a backend is best-effort: it is retried up to
+  `connection_retry.max_attempts`, and a backend that is still unreachable logs an
+  error but does not abort startup (the other backends and local engine stay up).
+
+### Where each stack's config.yaml lives
+
+| Stack | File | Delivery |
+|-------|------|----------|
+| repo default / template | `config.yaml` (repo root) | not baked; copy/mount it or pass `--config` |
+| demo (`examples/demo/`) | `config.yaml` / `config_local.yaml` (`--local`) | mounted by `examples/demo/compose.yml` |
+| integration tests | `tests/scripts/config.yaml` | baked by `Dockerfile.test` |
+| root manual stack | `scripts/database/config.yaml` | mounted by `compose.yml` |
+| benchmarks | `benchmark/config.yaml` | mounted by `benchmark/compose_benchmark.yml` |
+| examples/simple | `examples/simple/example_connetion/config{,_local}.yaml` | pass `--config <file>` |
+
+Unit tests: `tests/unit/config/` (`test_unit_config`).
+
+## Build resources — avoid OOM (check RAM + threads first)
+
+**Before building (local or in Docker), size the parallelism to available RAM.**
+Compiling otterbrix/Arrow TUs needs **~1.5–2 GB per job**; running `-j nproc`
+blindly is the #1 cause of OOM kills (`c++: internal compiler error: Killed`) and
+Docker BuildKit `ResourceExhausted` failures — especially in Docker Desktop where
+the VM's RAM is far smaller than the host's.
+
+- **Check first:**
+  - Host: `nproc` (Linux) / `sysctl -n hw.ncpu` (macOS); RAM via `free -g` / `sysctl -n hw.memsize`.
+  - **Docker** (what matters for image builds): `docker info --format '{{.NCPU}} CPUs / {{.MemTotal}} bytes'`. Docker Desktop's default is often 2–8 GB regardless of host RAM.
+- **Pick jobs:** `JOBS = min(nCPU, floor(RAM_MB / 1536))` (≈1.5 GB/job). Example: a
+  Docker VM with 8 GB → `floor(8192/1536)=5` jobs even on a 14-CPU host.
+- **Apply it:**
+  - Local: `cmake --build build/Release --parallel <JOBS>`
+  - `docker build --build-arg BUILD_JOBS=<JOBS> -f Dockerfile.test ...`
+  - `./docker-run-tests.sh -j <JOBS>`
+  - `./benchmark/scripts/run_benchmark.sh` / `run_stress_benchmarks.sh` already
+    **auto-cap** to this formula when `-j` is omitted (see `run_benchmark.sh`).
+- If a build still gets `Killed`/`ResourceExhausted`, halve `JOBS` or raise the
+  Docker Desktop memory limit (Settings → Resources).
 
 ## Build Commands
 
@@ -43,12 +158,15 @@ cmake -S . -B build/Release -DSPDLOG_ACTIVE_LEVEL=SPDLOG_LEVEL_DEBUG ...
 
 ## Docker Workflows
 
+> Cap build parallelism to Docker's RAM to avoid OOM — see **Build resources**
+> above. Pass `-j <JOBS>` / `--build-arg BUILD_JOBS=<JOBS>` on the commands below.
+
 ```bash
 # Run all integration tests (handles DB startup timing)
-chmod +x ./docker-run-tests.sh && ./docker-run-tests.sh
+chmod +x ./docker-run-tests.sh && ./docker-run-tests.sh -j 5
 
 # Build containerized unit tests
-docker build -f Dockerfile.test -t otterstax-test .
+docker build -f Dockerfile.test --build-arg BUILD_JOBS=5 -t otterstax-test .
 
 # Full stack for manual testing
 python fixtures/generate_data.py
@@ -130,7 +248,7 @@ Connection aliases act as the outermost database name qualifier:
 SELECT * FROM alias1.db.schema.table JOIN alias2.db.schema.table2 ON ...
 ```
 
-`alias1`/`alias2` are registered via `POST :8085/add_connection`.
+`alias1`/`alias2` are the aliases registered in the connection config file (see **Connection Config** above).
 
 ## Profiling Instrumentation (Tracy) — MANDATORY
 
@@ -233,8 +351,9 @@ Implementation entry points:
 - **Integration actors** — `integration/s3/s3_manager.{hpp,cpp}` orchestrates
   download/upload by composing the raw s3 connector with `FileManager` (so
   COPY ... TO 's3://...' is a single round-trip).
-- **REST API** — `GET :8085/s3/add_credentials` registers a named s3 alias
-  (`alias`, `access_key`, `secret_key`, `region`, `endpoint`) used by the
+- **Connection config** — s3 aliases are declared in the `connections.s3:`
+  section of `config.yaml` (`alias`, `access_key`, `secret_key`, `region`,
+  `endpoint`) and registered at startup. The alias is then used by the
   `s3_alias` option on `CREATE EXTERNAL TABLE` / `COPY ... TO`.
 
 ### Working JOIN shapes
@@ -304,7 +423,8 @@ otterbrix-internal — shadow of `external_join_all` benchmark), all driven by
 
 | Directory | CMake target | Role |
 | --------- | ------------ | ---- |
-| `connectors/` | `connectors`, `s3`, `file`, `api_server` | Raw DB connections (Boost.MySQL, libpq, clickhouse-cpp), S3 (Arrow `S3FileSystem`), local-file ingestion, HTTP connection API |
+| `connectors/` | `connectors`, `s3`, `file` | Raw DB connections (Boost.MySQL, libpq, clickhouse-cpp), S3 (Arrow `S3FileSystem`), local-file ingestion. `api_connections/` holds the `conn::api_server::*Params` structs consumed by `addConnection` |
+| `config/` | `config` | Single `config.yaml` reader — wire-server settings + `connections:` section (single source of truth for backend/s3 connections). See `config/CLAUDE.md` |
 | `catalog/` | `catalog` | Schema discovery + connection type registry (`CatalogManager`) |
 | `integration/` | `integration` | Actor wrappers bridging Worker ↔ ConnectorManagers (incl. `db::S3Manager`) |
 | `otterbrix/` | `otterbrix_local` (+ `otterbrix_s3_extension`, `otterbrix_file_extension`) | Parser, SQL generator, translators, plan execution, grammar extensions for `CREATE EXTERNAL TABLE` / `COPY ... TO` |

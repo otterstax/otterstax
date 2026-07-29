@@ -59,9 +59,9 @@ fi
 QUERY_FILE="$(cd "$(dirname "$QUERY_FILE")" && pwd)/$(basename "$QUERY_FILE")"
 [ -z "$QUERY_NAME" ] && QUERY_NAME="$(basename "${QUERY_FILE%.sql}")"
 
-# Verify OtterStax is reachable
+# Verify OtterStax is reachable (probe the MySQL wire port — no HTTP health port)
 if ! docker run --rm --network=bench_net benchmark-client:latest \
-       curl -s -f http://bench_otterstax:8085/health >/dev/null 2>&1; then
+       python -c "import socket; socket.create_connection(('bench_otterstax', 8816), 2)" >/dev/null 2>&1; then
     echo "ERROR: OtterStax is not running. Start it first:" >&2
     echo "  ./benchmark/manual/start_service.sh" >&2
     exit 1

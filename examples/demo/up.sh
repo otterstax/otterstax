@@ -9,7 +9,10 @@
 #   PG  wire   localhost:8817   (psql -h localhost -p 8817 -U demo demo)
 #   MySQL wire localhost:8816
 #   FlightSQL  localhost:8815
-#   HTTP API   localhost:8085   (POST /add_connection, GET /health)
+#
+# Connections are no longer registered over HTTP — they are read once at server
+# startup from the single config file (config.yaml, mounted into the container
+# by compose.yml). Edit that file and restart to change them.
 
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
@@ -83,14 +86,10 @@ for svc in $WAIT_SVCS; do
     done
 done
 
-# --- 4. Register connections (full mode only) ---
-if ! $LOCAL; then
-    echo ""
-    echo "=== 4. Registering demo connections (mysql, pg, ch, s3) ==="
-    # otterstax runs INSIDE the docker network — use docker-DNS JSONs (no --local).
-    ./connections/add_connections.sh
-    ./connections/add_s3_credentials.sh
-fi
+# --- 4. Connections ---
+# In full mode, config.yaml is mounted into the otterstax container and read at
+# startup (server settings + connections) — nothing to register here. In local
+# mode you start the server yourself pointing at config_local.yaml (see below).
 
 # --- 5. Print usage ---
 if $LOCAL; then
@@ -106,13 +105,12 @@ cat <<'EOF'
               (console: http://localhost:3207)
   Kafka:      localhost:19093  (redpanda; streaming demo broker)
 
-  Now start your local otterstax server (ports default to 8815/8816/8817/8085
-  from config.yaml; no --port flags — this build takes only --config):
-    ./build/Release/server
+  Now start your local otterstax server (single config file with the
+  host-published backend ports + connections):
+    ./build/server --config examples/demo/config_local.yaml
 
-  Then register connections (in another terminal once server is up):
-    examples/demo/connections/add_connections.sh    --local
-    examples/demo/connections/add_s3_credentials.sh --local
+  Connections (mysql/pg/ch/s3) load from that same file at startup — no
+  separate registration step.
 
   Run all demo queries (steps 1-9, incl. s3 load + dump):
     examples/demo/run-queries.sh
@@ -137,7 +135,6 @@ cat <<'EOF'
 
   Other wires:
     mysql -h localhost -P 8816 -u demo -pdemo
-    HTTP API:  http://localhost:8085
     MinIO console: http://localhost:3207  (user=minioadmin pass=minioadmin)
 
   Run demo SQL files step-by-step (paths relative to repo root):

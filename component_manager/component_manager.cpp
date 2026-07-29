@@ -5,7 +5,14 @@
 #include "utility/logger.hpp"
 #include "utility/tracy_profiler.hpp"
 
+#include "connectors/api_connections/connection_config.hpp"
+#include "connectors/api_connections/pg_connection_config.hpp"
+#include "connectors/api_connections/ch_connection_config.hpp"
+#include "connectors/s3/s3_connect_params.hpp"
+#include "utility/session.hpp"
+
 #include <algorithm>
+#include <chrono>
 #include <thread>
 
 constexpr size_t MAX_THROUGHPUT =
@@ -150,3 +157,107 @@ actor_zeta::address_t ComponentManager::pg_connection_manager_address() const {
 actor_zeta::address_t ComponentManager::file_manager_address() const { return file_manager_->address(); }
 
 actor_zeta::address_t ComponentManager::s3_manager_address() const { return s3_manager_->address(); }
+
+void ComponentManager::register_connections(const config::ConnectionsConfig& connections,
+                                            const config::ConnectionRetryConfig& retry) {
+    OTX_ZONE_N("ComponentManager::register_connections");
+    auto log = get_logger(logger_tag::Main);
+
+    // Backends may accept connections a moment after their container is reported
+    // healthy (a startup race we hit with ClickHouse in the demo). Registration
+    // is one-shot at startup — there is no runtime retry API — so retry per the
+    // configured policy (service.connection_retry), mirroring the retry the old
+    // HTTP add-connection scripts had.
+    const int max_attempts = std::max(1, retry.max_attempts);
+    const auto retry_delay = std::chrono::milliseconds(std::max(0, retry.delay_ms));
+    auto with_retry = [&](const char* kind, const std::string& alias, auto&& add) {
+        for (int attempt = 1; attempt <= max_attempts; ++attempt) {
+            try {
+                add();
+                log->info("Registered {} connection '{}'", kind, alias);
+                return;
+            } catch (const std::exception& e) {
+                if (attempt == max_attempts) {
+                    log->error("Failed to register {} connection '{}' after {} attempt(s): {}",
+                               kind, alias, max_attempts, e.what());
+                    return;
+                }
+                log->warn("{} connection '{}' not ready ({}/{}): {} — retrying in {} ms...",
+                          kind, alias, attempt, max_attempts, e.what(), retry_delay.count());
+                std::this_thread::sleep_for(retry_delay);
+            }
+        }
+    };
+
+    // Descriptors are already validated at parse time (parse_connections throws
+    // on an incomplete entry, aborting startup), so here we only open them.
+    for (const auto& c : connections.mysql) {
+        with_retry("MySQL", c.alias, [&] {
+            db_connector_manager_->addConnection(conn::api_server::ConnectionParams{
+                .alias = c.alias,
+                .host = c.host,
+                .port = c.port,
+                .username = c.username,
+                .password = c.password,
+                .database = c.database,
+                .table = c.table,
+            });
+        });
+    }
+
+    for (const auto& c : connections.postgresql) {
+        with_retry("PostgreSQL", c.alias, [&] {
+            pg_connector_manager_->addConnection(conn::api_server::PgConnectionParams{
+                .alias = c.alias,
+                .host = c.host,
+                .port = c.port,
+                .username = c.username,
+                .password = c.password,
+                .database = c.database,
+                .schema = c.schema,
+                .table = c.table,
+            });
+        });
+    }
+
+    for (const auto& c : connections.clickhouse) {
+        with_retry("ClickHouse", c.alias, [&] {
+            ch_connector_manager_->addConnection(conn::api_server::ChConnectionParams{
+                .alias = c.alias,
+                .host = c.host,
+                .port = c.port,
+                .username = c.username,
+                .password = c.password,
+                .database = c.database,
+                .table = c.table,
+            });
+        });
+    }
+
+    for (const auto& c : connections.s3) {
+        // s3 aliases are only stored (no eager network open), so a single attempt
+        // is enough — retry would not help a stored-credential failure.
+        try {
+            conn::s3::connect_params params{
+                .region = c.region,
+                .access_key = c.access_key,
+                .secret_key = c.secret_key,
+                .session_token = c.session_token,
+                .endpoint = c.endpoint,
+                .alias = c.alias,
+            };
+            auto fut = actor_zeta::send(s3_manager_->address(),
+                                        &conn::s3::ConnectorManager::add_credentials,
+                                        session_id().hash(),
+                                        std::move(params));
+            auto result = std::move(fut.second).take_ready();
+            if (result.has_error()) {
+                log->error("Failed to register s3 alias '{}': {}", c.alias, result.error().what.c_str());
+            } else {
+                log->info("Registered s3 alias '{}' (endpoint='{}')", c.alias, c.endpoint);
+            }
+        } catch (const std::exception& e) {
+            log->error("Failed to register s3 alias '{}': {}", c.alias, e.what());
+        }
+    }
+}

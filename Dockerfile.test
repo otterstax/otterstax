@@ -156,6 +156,13 @@ RUN if [ "${WITH_TRACY}" != "true" ]; then \
 # expensive build layers.
 COPY ./tests/minio/fixtures /fixtures
 
+# Single config file (server settings + connections) baked into the image at the
+# server's default config path (config.yaml, relative to WORKDIR
+# /app/build/${BUILD_TYPE}). Read once at startup — the single source of truth
+# for the integration-test backends/s3 alias (docker-DNS hostnames on the test
+# network). Baking rather than bind-mounting so it works in DinD CI runners.
+COPY ./tests/scripts/config.yaml ./config.yaml
+
 # Tracy profiler port (active only when built with --build-arg WITH_TRACY=true)
 EXPOSE 8086
 

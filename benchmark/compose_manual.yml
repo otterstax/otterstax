@@ -7,7 +7,9 @@
 #   • MySQL clients can connect on localhost:8816
 #   • PostgreSQL clients can connect on localhost:8817
 #   • Arrow/FlightSQL clients can connect on localhost:8815
-#   • HTTP connection API is reachable on localhost:8085
+#
+# Connections are read from the mounted connection config file at startup
+# (see compose_benchmark.yml) — there is no HTTP management port.
 #
 # Usage (applied on top of compose_benchmark.yml):
 #   docker compose -f compose_benchmark.yml -f compose_manual.yml -p bench up -d bench-otterstax
@@ -15,7 +17,6 @@
 services:
   bench-otterstax:
     ports:
-      - "8085:8085"
       - "8815:8815"
       - "8816:8816"
       - "8817:8817"

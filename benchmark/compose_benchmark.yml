@@ -28,7 +28,6 @@ services:
       - "8815"
       - "8816"
       - "8817"
-      - "8085"
     ports:
       - "8086:8086"
     volumes:
@@ -37,8 +36,13 @@ services:
       # The `file` source reads these directly; the `s3` source reads the same
       # files seeded into MinIO (compose_minio.yml).  Empty for non-external runs.
       - ./data/fixtures:/fixtures:ro
+      # Single config file (server settings + 6 backends + bench_minio s3 alias).
+      # Read once at startup — overrides the config.yaml baked into the image.
+      # Mounted onto the server's default config path (WORKDIR /app/build/Release).
+      - ./config.yaml:/app/build/Release/config.yaml:ro
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8085/health"]
+      # No HTTP management port anymore — probe the MySQL wire port instead.
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/localhost/8816' || exit 1"]
       interval: 5s
       timeout: 10s
       retries: 30

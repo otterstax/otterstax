@@ -189,6 +189,12 @@ __pycache__
 pyvenv.cfg
 .venv
 pip-selfcheck.json
+
+# The unanchored virtualenv patterns above ([Bb]in/[Ll]ib/[S]cripts/…) also match
+# nested project dirs of the same name. Keep the demo's Kafka helper lib tracked
+# (it is a real source dir, not a venv): sourced by every examples/demo/kafka step.
+!examples/demo/kafka/lib/
+!examples/demo/kafka/lib/**
 ### Ninja template
 .ninja_deps
 .ninja_log

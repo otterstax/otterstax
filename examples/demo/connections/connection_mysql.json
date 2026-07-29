@@ -1,9 +1,0 @@
-{
-    "alias": "mysql",
-    "host": "demo-mariadb",
-    "port": "3306",
-    "username": "demo",
-    "password": "demo",
-    "database": "bill",
-    "table": ""
-}

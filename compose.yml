@@ -105,12 +105,17 @@ services:
       - postgres1
       - clickhouse1
     ports:
-      - "0.0.0.0:8085:8085"
+      # 8815 FlightSQL / 8816 MySQL wire / 8086 Tracy. Connections are read from
+      # the connection config file at startup (there is no HTTP management port).
       - "0.0.0.0:8815:8815"
       - "0.0.0.0:8816:8816"
       - "0.0.0.0:8086:8086"
     volumes:
       - ./app_data:/app/data
+      # Single config file (server settings + connections, docker-DNS hostnames).
+      # Mounted onto the server's default config path (config.yaml, relative to
+      # WORKDIR /app/build/Release).
+      - ./scripts/database/config.yaml:/app/build/Release/config.yaml:ro
     networks:
       - app_network
 

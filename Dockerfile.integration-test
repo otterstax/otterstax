@@ -2,11 +2,26 @@ FROM python:3.12-slim-bookworm
 
 WORKDIR /app
 
-# Install system dependencies including Faker
+# Install system dependencies
 RUN apt-get update && apt-get install -y \
     build-essential \
+    ca-certificates \
     curl \
-    docker.io \
+    gnupg \
+    && rm -rf /var/lib/apt/lists/*
+
+# Docker CLI (current) from Docker's official apt repo. The Kafka crash-recovery
+# test (test_kafka_crash_recovery.py) drives `docker start`/`kill` against the
+# HOST daemon via the mounted /var/run/docker.sock. Debian's `docker.io` package
+# ships an old CLI (API 1.41) that a modern Docker Desktop daemon (min API 1.44)
+# rejects — so install docker-ce-cli, which tracks the current API.
+RUN install -m 0755 -d /etc/apt/keyrings \
+    && curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc \
+    && chmod a+r /etc/apt/keyrings/docker.asc \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian bookworm stable" \
+       > /etc/apt/sources.list.d/docker.list \
+    && apt-get update \
+    && apt-get install -y docker-ce-cli \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies including Faker
@@ -31,8 +46,7 @@ RUN pip install --no-cache-dir \
 COPY ./tests/scripts .
 COPY ./tests/*.py .
 
-RUN chmod +x /app/http_healthcheck.sh
-RUN chmod +x /app/add_connections.sh
+RUN chmod +x /app/wait_for_otterstax.sh
 RUN chmod +x /app/startup.sh
 
 # Create directories where volumes will be mounted

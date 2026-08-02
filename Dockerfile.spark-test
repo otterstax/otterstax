@@ -1,0 +1,60 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2025-2026  OtterStax
+#
+# Test client image with PySpark + JVM for Spark Connect (port 15002) E2E tests.
+# Mirrors Dockerfile.integration-test (flat /app layout, runs startup.sh) but adds
+# OpenJDK 17 + pyspark so the test_spark_client_*.py scripts can run alongside
+# the rest of the suite.
+
+FROM python:3.12-slim-bookworm
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    curl \
+    openjdk-17-jre-headless \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+ENV PYSPARK_PYTHON=python3
+
+ARG PYSPARK_VERSION=4.0.0
+# pyspark[connect] pulls the full Spark Connect client stack the test scripts need:
+# pandas, pyarrow, grpcio, grpcio-status, googleapis-common-protos, numpy.
+RUN pip install --no-cache-dir \
+    "pyspark[connect]==${PYSPARK_VERSION}" \
+    pyarrow \
+    "pandas>=2.0.0" \
+    flightsql-dbapi \
+    pymysql \
+    # Pinned: 26.x connect-time SELECT @@… probes break the server parser
+    # (see Dockerfile.integration-test).
+    mysql-connector-python==9.7.0 \
+    "psycopg[binary]" \
+    psycopg2-binary \
+    clickhouse-driver \
+    tabulate \
+    faker \
+    requests \
+    confluent-kafka
+
+WORKDIR /app
+
+# Copy application files (same flat layout as Dockerfile.integration-test so
+# startup.sh and run_test resolve every script by bare filename). Wholesale
+# *.py copy like Dockerfile.integration-test — an explicit per-file list goes
+# stale as tests are added; startup.sh remains the source of truth for which
+# tests actually run.
+COPY ./tests/scripts .
+COPY ./tests/*.py .
+
+RUN chmod +x /app/http_healthcheck.sh
+RUN chmod +x /app/add_connections.sh
+RUN chmod +x /app/startup.sh
+
+# Create directories where volumes will be mounted
+RUN mkdir -p /app/mariadb1_init
+RUN mkdir -p /app/mariadb2_init
+RUN mkdir -p /app/postgres_init
+RUN mkdir -p /app/clickhouse_init
+
+CMD ["./startup.sh"]

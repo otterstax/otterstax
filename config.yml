@@ -18,6 +18,11 @@ postgres:
   # PostgreSQL connector server configuration
   port: 8817
 
+spark_connect:
+  # Spark Connect server configuration (gRPC, asio-grpc)
+  host: "0.0.0.0"
+  port: 15002
+
 connection_manager:
   # HTTP Connection Manager server configuration
   port: 8085

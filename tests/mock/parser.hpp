@@ -66,6 +66,13 @@ public:
         return parsed;
     }
 
+    core::result_wrapper_t<components::logical_plan::node_ptr>
+    parse_fragment(const std::string& sql, components::logical_plan::parameter_node_ptr /*shared_params*/) override {
+        std::cout << "MockParser: parse_fragment SQL: " << sql << std::endl;
+        return core::error_t{core::error_code_t::unimplemented_yet,
+                             std::pmr::string{"SimpleMockParser: parse_fragment not implemented", config_.resource}};
+    }
+
 private:
     mock_config config_;
 };

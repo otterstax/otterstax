@@ -105,6 +105,20 @@ run_test "FlightSQL Client (MySQL backend, mutable)" "test_flightsql_client_mysq
 run_test "Cross-backend Queries (MySQL wire)" "test_cross_backend_queries_mysql.py"
 run_test "Cross-backend Queries (PostgreSQL wire)" "test_cross_backend_queries_pg.py"
 
+# Spark Connect E2E tests — only runnable in an image that ships pyspark + a JVM
+# (Dockerfile.spark-test). The plain integration-test client skips these.
+echo ""
+echo "========================================="
+echo "=== Spark Connect tests ==="
+echo "========================================="
+if python -c "import pyspark" 2>/dev/null; then
+    run_test "Spark Client (MySQL backend)" "test_spark_client_mysql_backend.py"
+    run_test "Spark Client (PostgreSQL backend)" "test_spark_client_pg_backend.py"
+    run_test "Spark Client (Cross-backend)" "test_spark_client_cross_backend.py"
+else
+    echo "⚠️  Skipping Spark Connect tests (pyspark not installed in this image)"
+fi
+
 # Concurrency tests (sync-code regression net)
 run_test "Concurrency" "test_concurrency.py"
 

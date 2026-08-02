@@ -44,6 +44,7 @@ class OtterStax(ConanFile):
         self.requires("msgpack-cxx/4.1.1")
         self.requires("catch2/3.15.1")
         self.requires("grpc/1.69.0")
+        self.requires("asio-grpc/3.5.0")
         self.requires("gflags/2.2.2", override=True)
         self.requires("aws-sdk-cpp/1.11.352", override=True)
         self.requires("abseil/20250127.0", override=True)
@@ -103,6 +104,7 @@ class OtterStax(ConanFile):
         self.options["actor-zeta/*"].exceptions_disable = False
         self.options["actor-zeta/*"].rtti_disable = False
 
+        self.options["asio-grpc/*"].backend = "boost"
 
     def generate(self):
         tc = CMakeToolchain(self)

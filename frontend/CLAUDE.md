@@ -4,16 +4,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Role
 
-`frontend/` implements the three wire-protocol servers. Each server accepts client connections, receives SQL, dispatches to the `Scheduler` actor, and streams results back.
+`frontend/` implements the four wire-protocol servers. Each server accepts client connections, receives SQL, dispatches to the `Scheduler` actor, and streams results back.
 
 ## Structure
 
 ```
 frontend/
-├── common/               — shared CRTP base server + connection base
-├── flight_sql_server/    — Apache Arrow FlightSQL (port 8815)
-├── mysql_server/         — MySQL wire protocol (port 8816)
-└── postgres_server/      — PostgreSQL wire protocol (port 8817)
+├── common/                — shared CRTP base server + connection base
+├── flight_sql_server/     — Apache Arrow FlightSQL (port 8815)
+├── mysql_server/          — MySQL wire protocol (port 8816)
+├── postgres_server/       — PostgreSQL wire protocol (port 8817)
+└── spark_connect_server/  — Spark Connect gRPC / asio-grpc (port 15002)
 ```
 
 ## Common Layer (`frontend/common/`)
@@ -55,5 +56,18 @@ Packet encoding/decoding lives in `{mysql,postgres}_server/packet/` and `{mysql,
 | FlightSQL | 8815 | `flight_sql_server` |
 | MySQL | 8816 | `mysql_server` |
 | PostgreSQL | 8817 | `postgres_server` |
+| Spark Connect | 15002 | `spark_connect_server` |
 
 Ports are hardcoded in `main.cpp` and in the `config.yml` / `compose.yml` files.
+
+## Spark Connect (`spark_connect_server/`)
+
+Spark Connect gRPC server using asio-grpc (Boost.Asio coroutines). PySpark clients connect via `sc://host:15002`.
+
+- **`spark.sql("...")`** → SQL pass-through → `Scheduler::execute`
+- **DataFrame ops** (filter/select/join/...) → Path B: `relation_to_plan` translates Spark Relation → Otterbrix `node_ptr` directly → `Scheduler::execute_plan`
+- **Window functions** → `INVALID_ARGUMENT` error (see `UNSUPPORTED.md`)
+
+Key files: `service_execute_plan.cpp` (ExecutePlan handler), `plan_translator/relation_to_plan.cpp` (Path B core), `result_encoder.cpp` (Arrow IPC stream), `await_future.hpp` (agrpc::Alarm adaptive backoff).
+
+Scheduler additions: `execute_plan(hash, ParsedQueryDataPtr)` — Path B entry; `release_session(hash)` — AnalyzePlan cleanup.

@@ -176,6 +176,10 @@ actor_zeta::behavior_t Scheduler::behavior(actor_zeta::mailbox::message* msg) {
         co_await actor_zeta::dispatch(this, &Scheduler::execute_prepared_statement, msg);
     } else if (cmd == actor_zeta::msg_id<Scheduler, &Scheduler::prepare_schema>) {
         co_await actor_zeta::dispatch(this, &Scheduler::prepare_schema, msg);
+    } else if (cmd == actor_zeta::msg_id<Scheduler, &Scheduler::release_session>) {
+        co_await actor_zeta::dispatch(this, &Scheduler::release_session, msg);
+    } else if (cmd == actor_zeta::msg_id<Scheduler, &Scheduler::execute_plan>) {
+        co_await actor_zeta::dispatch(this, &Scheduler::execute_plan, msg);
     }
 }
 
@@ -217,6 +221,26 @@ actor_zeta::unique_future<Scheduler::session_result>
 Scheduler::prepare_schema(session_hash_t id, std::string sql) {
     const auto idx = id % workers_.size();
     auto [needs_sched, fut] = actor_zeta::send(worker_addresses_[idx], &Worker::prepare_schema, id, std::move(sql));
+    if (needs_sched) {
+        scheduler_->enqueue(workers_[idx].get());
+    }
+    co_return co_await std::move(fut);
+}
+
+actor_zeta::unique_future<void>
+Scheduler::release_session(session_hash_t id) {
+    const auto idx = id % workers_.size();
+    auto [needs_sched, fut] = actor_zeta::send(worker_addresses_[idx], &Worker::release_session, id);
+    if (needs_sched) {
+        scheduler_->enqueue(workers_[idx].get());
+    }
+    co_return co_await std::move(fut);
+}
+
+actor_zeta::unique_future<Scheduler::session_result>
+Scheduler::execute_plan(session_hash_t id, ParsedQueryDataPtr data) {
+    const auto idx = id % workers_.size();
+    auto [needs_sched, fut] = actor_zeta::send(worker_addresses_[idx], &Worker::execute_plan, id, std::move(data));
     if (needs_sched) {
         scheduler_->enqueue(workers_[idx].get());
     }

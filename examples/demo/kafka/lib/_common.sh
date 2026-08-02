@@ -8,7 +8,7 @@
 #                                      -v broker=<SQL_BROKER> for CREATE SOURCE/STREAM
 #   wait_rows <table_expr> <n> [s]   — poll SELECT count(*) FROM <table_expr> until >= n
 #   seed  --topic T [--fixture F] [--reset]   — (re)create a topic + produce a fixture
-#   consume --topic T [--timeout S]           — drain a topic to stdout
+#   consume --topic T [--timeout S] [--min N] — wait for >=N records, then drain
 #
 # seed/consume shell out to `rpk` inside the demo-kafka (redpanda) container, so
 # there is no host-side Kafka client dependency. The SQL broker address embedded
@@ -35,7 +35,7 @@ fi
 KAFKA_CONTAINER="${KAFKA_CONTAINER:-demo-kafka}"
 
 # ── PG wire (host-published in both modes) ───────────────────────────────────
-PGHOST_="${PGHOST_:-localhost}"
+PGHOST_="${PGHOST_:-127.0.0.1}"
 PGPORT_="${PGPORT_:-8817}"
 PGUSER_="${PGUSER_:-demo}"
 PGDB_="${PGDB_:-demo}"
@@ -127,19 +127,39 @@ seed() {
     fi
 }
 
-# consume --topic <T> [--timeout <S>]
+# topic_hwm <T> — sum of the high-watermarks across a topic's partitions (the
+# number of records currently in the topic). Empty/absent topic → 0.
+topic_hwm() {
+    _rpk topic describe "$1" -p 2>/dev/null \
+        | awk '$1 ~ /^[0-9]+$/ { sum += $NF } END { print sum + 0 }'
+}
+
+# consume --topic <T> [--timeout <S>] [--min <N>]
+# The STREAM / fan-in workers produce asynchronously, so first WAIT (up to
+# --timeout) until the topic holds at least --min records (default 1), then drain
+# the backlog with `-o :end` — which reads up to the current high-watermark and
+# exits cleanly. (A plain `-o start` bounded by an external `timeout` gets
+# SIGTERM'd, and rpk's block-buffered stdout is DISCARDED on the kill — which
+# printed nothing even when records existed.)
 consume() {
-    local topic="" timeout_s=12
+    local topic="" timeout_s=12 min=1
     while [ $# -gt 0 ]; do
         case "$1" in
             --topic)   topic="$2"; shift 2 ;;
             --timeout) timeout_s="$2"; shift 2 ;;
+            --min)     min="$2"; shift 2 ;;
             *) shift ;;
         esac
     done
     [ -z "${topic}" ] && { echo "consume: --topic required" >&2; return 1; }
-    echo "${CYAN}    consume ${topic}  (up to ${timeout_s}s)${RESET}"
-    # -o start = from the beginning; timeout bounds the stream for the demo.
-    timeout "${timeout_s}" ${_DOCKER} exec "${KAFKA_CONTAINER}" \
-        rpk topic consume "${topic}" -o start -f '%v\n' 2>/dev/null || true
+
+    local deadline=$(( $(date +%s) + timeout_s )) hwm=0
+    while [ "$(date +%s)" -lt "${deadline}" ]; do
+        hwm="$(topic_hwm "${topic}")"
+        [ "${hwm:-0}" -ge "${min}" ] 2>/dev/null && break
+        sleep 1
+    done
+    echo "${CYAN}    consume ${topic}  (${hwm:-0} record(s))${RESET}"
+    # -o :end = from the start up to the current high-watermark, then exit.
+    _rpk topic consume "${topic}" -o ':end' -f '%v\n' 2>/dev/null || true
 }

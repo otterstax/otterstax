@@ -14,7 +14,10 @@ RUN pip install --no-cache-dir \
     pyarrow \
     flightsql-dbapi \
     pymysql \
-    mysql-connector-python \
+    # Pinned: 9.x is the last line whose connect-time handshake avoids
+    # SELECT @@… system-variable probes the server's parser does not support
+    # (26.x broke every MySQL-wire test at connect with 1149 "@@" errors).
+    mysql-connector-python==9.7.0 \
     "psycopg[binary]" \
     psycopg2-binary \
     clickhouse-driver \

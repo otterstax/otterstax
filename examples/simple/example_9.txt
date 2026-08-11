@@ -1,4 +1,0 @@
-CREATE EXTERNAL TABLE ext.events_s3
-    WITH (s3_alias = 's3',
-          location = 's3://test-bucket/web_events.csv',
-          format   = 'csv');

@@ -21,6 +21,7 @@
 #include <components/logical_plan/node_drop_index.hpp>
 #include <components/logical_plan/node_group.hpp>
 #include <components/logical_plan/node_insert.hpp>
+#include <components/logical_plan/node_limit.hpp>
 #include <components/logical_plan/node_match.hpp>
 #include <components/logical_plan/node_select.hpp>
 #include <components/logical_plan/node_sort.hpp>
@@ -527,6 +528,7 @@ namespace {
         node_group_ptr group = nullptr;
         node_match_ptr match = nullptr;
         node_sort_ptr sort = nullptr;
+        node_limit_ptr limit = nullptr;
         for (const auto& child : node->children()) {
             switch (child->type()) {
                 case node_type::select_t:
@@ -540,6 +542,9 @@ namespace {
                     break;
                 case node_type::sort_t:
                     sort = reinterpret_cast<const node_sort_ptr&>(child);
+                    break;
+                case node_type::limit_t:
+                    limit = reinterpret_cast<const node_limit_ptr&>(child);
                     break;
                 default:
                     break;
@@ -698,6 +703,21 @@ namespace {
                     write_key(stream, sort_expr->key(), backend);
                     stream << (sort_expr->order() == sort_order::desc ? " DESC" : " ASC");
                     comma = true;
+                }
+            }
+        }
+        // limit / offset — pushed down to the backend. For a single-backend
+        // passthrough (SELECT ... LIMIT n) this makes the backend apply the
+        // limit instead of returning the whole table. The limit node is only a
+        // child of the (sub)query it belongs to, so this never over-limits a
+        // per-backend slice of a federated JOIN. `LIMIT n [OFFSET m]` parses on
+        // MySQL/PostgreSQL/ClickHouse alike. An offset with no limit is left for
+        // the engine (avoids emitting OFFSET-without-LIMIT, invalid on MySQL).
+        {
+            if (limit && limit->limit().limit() >= 0) {
+                stream << " LIMIT " << limit->limit().limit();
+                if (limit->limit().offset() > 0) {
+                    stream << " OFFSET " << limit->limit().offset();
                 }
             }
         }

@@ -96,15 +96,33 @@ namespace frontend::postgres {
                 }
 
                 auto msg_length = merge_data_bytes<uint32_t, endian::BIG>(read_buffer_, 0);
-                std::cout << "Initial message length: " + std::to_string(msg_length) << std::endl;
+                log_->trace("[Connection {}] initial message length: {}", connection_id_, msg_length);
 
                 if (msg_length < 4 || msg_length > MAX_PACKET_SIZE) {
                     send_error_response(sql_state::PROTOCOL_VIOLATION,
-                                        "Invalid message length: " + std::to_string(length),
+                                        "Invalid message length: " + std::to_string(msg_length),
                                         error_severity::fatal());
                     return;
                 }
                 msg_length -= 4; // length includes itself
+
+                // read_buffer_ is constructed at READ_BUFFER_SIZE (4096) and, unlike
+                // frontend_connection::read_packet_payload, was never grown here. The
+                // checks above admit any length up to MAX_PACKET_SIZE (2GB-1), so the
+                // async_read below wrote past the end of the heap allocation, with both
+                // length and contents controlled by an unauthenticated peer.
+                if (msg_length > MAX_BUFFER_SIZE) {
+                    handle_out_of_resources_error("Initial message too large");
+                    return;
+                }
+                if (msg_length > read_buffer_.size()) {
+                    try {
+                        read_buffer_.resize(msg_length);
+                    } catch (const std::bad_alloc&) {
+                        handle_out_of_resources_error("Out of memory");
+                        return;
+                    }
+                }
 
                 boost::asio::async_read(
                     socket_,

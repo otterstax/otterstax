@@ -4,10 +4,12 @@
 #pragma once
 
 #include <chrono>
+#include <memory_resource>
 #include <string>
 
 struct mock_config {
-    std::pmr::memory_resource* resource = nullptr;
+    // No default: every mock allocates on the resource its test hands it.
+    std::pmr::memory_resource* resource;
     bool can_throw = false;
     bool return_empty = false;
     std::chrono::milliseconds wait_time = std::chrono::milliseconds(50);

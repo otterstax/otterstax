@@ -58,7 +58,7 @@ namespace {
 
 TEST_CASE("kafka grammar: CREATE SOURCE") {
     auto registry = kafka_registry();
-    std::pmr::monotonic_buffer_resource arena;
+    std::pmr::monotonic_buffer_resource arena(std::pmr::new_delete_resource());
 
     auto* stmt = kafka_stmt(
         raw_parser(&arena,
@@ -85,7 +85,7 @@ TEST_CASE("kafka grammar: CREATE SOURCE") {
 
 TEST_CASE("kafka grammar: VARCHAR length is accepted and ignored") {
     auto registry = kafka_registry();
-    std::pmr::monotonic_buffer_resource arena;
+    std::pmr::monotonic_buffer_resource arena(std::pmr::new_delete_resource());
 
     auto* stmt = kafka_stmt(raw_parser(&arena, "CREATE SOURCE s (name VARCHAR(255)) WITH (KAFKA_TOPIC='t')", registry));
     REQUIRE(stmt != nullptr);
@@ -96,7 +96,7 @@ TEST_CASE("kafka grammar: VARCHAR length is accepted and ignored") {
 
 TEST_CASE("kafka grammar: CREATE STREAM captures the embedded query verbatim") {
     auto registry = kafka_registry();
-    std::pmr::monotonic_buffer_resource arena;
+    std::pmr::monotonic_buffer_resource arena(std::pmr::new_delete_resource());
 
     SECTION("with options before AS") {
         auto* stmt = kafka_stmt(raw_parser(&arena,
@@ -126,7 +126,7 @@ TEST_CASE("kafka grammar: CREATE STREAM captures the embedded query verbatim") {
 
 TEST_CASE("kafka grammar: DROP variants") {
     auto registry = kafka_registry();
-    std::pmr::monotonic_buffer_resource arena;
+    std::pmr::monotonic_buffer_resource arena(std::pmr::new_delete_resource());
 
     SECTION("DROP SOURCE") {
         auto* stmt = kafka_stmt(raw_parser(&arena, "DROP SOURCE orders;", registry));
@@ -147,7 +147,7 @@ TEST_CASE("kafka grammar: DROP variants") {
 
 TEST_CASE("kafka grammar: keywords are case-insensitive") {
     auto registry = kafka_registry();
-    std::pmr::monotonic_buffer_resource arena;
+    std::pmr::monotonic_buffer_resource arena(std::pmr::new_delete_resource());
 
     auto* stmt = kafka_stmt(raw_parser(&arena, "create source S (a int) with (kafka_topic='t')", registry));
     REQUIRE(stmt != nullptr);
@@ -158,7 +158,7 @@ TEST_CASE("kafka grammar: keywords are case-insensitive") {
 
 TEST_CASE("kafka grammar: non-kafka SQL is not claimed") {
     auto registry = kafka_registry();
-    std::pmr::monotonic_buffer_resource arena;
+    std::pmr::monotonic_buffer_resource arena(std::pmr::new_delete_resource());
 
     SECTION("plain SELECT stays core") {
         auto* tree = raw_parser(&arena, "SELECT * FROM t;", registry);
@@ -174,7 +174,7 @@ TEST_CASE("kafka grammar: non-kafka SQL is not claimed") {
 
 TEST_CASE("kafka grammar: malformed kafka statements raise a parse error") {
     auto registry = kafka_registry();
-    std::pmr::monotonic_buffer_resource arena;
+    std::pmr::monotonic_buffer_resource arena(std::pmr::new_delete_resource());
 
     CHECK_THROWS_AS(raw_parser(&arena, "CREATE SOURCE orders", registry), parser_exception_t);
     CHECK_THROWS_AS(raw_parser(&arena, "CREATE STREAM s", registry), parser_exception_t);
@@ -184,9 +184,43 @@ TEST_CASE("kafka grammar: malformed kafka statements raise a parse error") {
                     parser_exception_t);
 }
 
+TEST_CASE("kafka grammar: only JSON-ingestible column types are accepted") {
+    auto registry = kafka_registry();
+    std::pmr::monotonic_buffer_resource arena(std::pmr::new_delete_resource());
+    using components::types::logical_type;
+    using otterstax::kafka::map_column_type;
+
+    // The five types the JSON reader/writer can carry
+    REQUIRE(map_column_type("INT").has_value());
+    CHECK(map_column_type("INT")->type() == logical_type::INTEGER);
+    CHECK(map_column_type("integer")->type() == logical_type::INTEGER);
+    CHECK(map_column_type("BIGINT")->type() == logical_type::BIGINT);
+    CHECK(map_column_type("DOUBLE")->type() == logical_type::DOUBLE);
+    CHECK(map_column_type("BOOLEAN")->type() == logical_type::BOOLEAN);
+    CHECK(map_column_type("bool")->type() == logical_type::BOOLEAN);
+    CHECK(map_column_type("VARCHAR")->type() == logical_type::STRING_LITERAL);
+    CHECK(map_column_type("TEXT")->type() == logical_type::STRING_LITERAL);
+
+    // Otterbrix types with no JSON mapping: a source declared with one would ingest
+    // nothing, so CREATE rejects it instead of creating a table nobody can fill
+    CHECK_FALSE(map_column_type("SMALLINT").has_value());
+    CHECK_FALSE(map_column_type("TINYINT").has_value());
+    CHECK_FALSE(map_column_type("FLOAT").has_value());
+    CHECK_FALSE(map_column_type("REAL").has_value());
+    CHECK_FALSE(map_column_type("uuid").has_value());
+    CHECK_FALSE(map_column_type("timestamp").has_value());
+
+    CHECK_THROWS_AS(raw_parser(&arena, "CREATE SOURCE s (a SMALLINT) WITH (KAFKA_TOPIC='t')", registry),
+                    parser_exception_t);
+    CHECK_THROWS_AS(raw_parser(&arena, "CREATE SOURCE s (a FLOAT) WITH (KAFKA_TOPIC='t')", registry),
+                    parser_exception_t);
+    CHECK_THROWS_AS(raw_parser(&arena, "CREATE SOURCE s (a UUID) WITH (KAFKA_TOPIC='t')", registry),
+                    parser_exception_t);
+}
+
 TEST_CASE("kafka grammar: transform lowers to a kafka_node_t") {
     auto registry = kafka_registry();
-    std::pmr::monotonic_buffer_resource arena;
+    std::pmr::monotonic_buffer_resource arena(std::pmr::new_delete_resource());
 
     auto* node = reinterpret_cast<Node*>(linitial(raw_parser(&arena,
                                                              "CREATE SOURCE orders (id BIGINT, note VARCHAR) "
@@ -200,10 +234,10 @@ TEST_CASE("kafka grammar: transform lowers to a kafka_node_t") {
 
     auto plan = result.node_ptr();
     REQUIRE(plan != nullptr);
+    // The kafka extension is the only producer of a node_type::unused root here
     REQUIRE(plan->type() == lp::node_type::unused);
 
-    auto* kn = dynamic_cast<otterstax::kafka::kafka_node_t*>(plan.get());
-    REQUIRE(kn != nullptr);
+    auto* kn = static_cast<otterstax::kafka::kafka_node_t*>(plan.get());
     CHECK(kn->op() == otterstax::kafka::kafka_op::create_source);
     CHECK(kn->name() == "orders");
 
@@ -222,7 +256,7 @@ TEST_CASE("kafka grammar: transform lowers to a kafka_node_t") {
 
 TEST_CASE("kafka grammar: transform folds identifiers, preserves topic case") {
     auto registry = kafka_registry();
-    std::pmr::monotonic_buffer_resource arena;
+    std::pmr::monotonic_buffer_resource arena(std::pmr::new_delete_resource());
 
     auto* node = reinterpret_cast<Node*>(linitial(
         raw_parser(&arena, "CREATE SOURCE OrDeRs (Id BIGINT, Amount DOUBLE) WITH (Kafka_Topic='MyTopic')", registry)));
@@ -232,8 +266,9 @@ TEST_CASE("kafka grammar: transform folds identifiers, preserves topic case") {
     auto result = tr.transform(*node);
     REQUIRE_FALSE(result.has_error());
 
-    auto* kn = dynamic_cast<otterstax::kafka::kafka_node_t*>(result.node_ptr().get());
-    REQUIRE(kn != nullptr);
+    REQUIRE(result.node_ptr() != nullptr);
+    REQUIRE(result.node_ptr()->type() == lp::node_type::unused);
+    auto* kn = static_cast<otterstax::kafka::kafka_node_t*>(result.node_ptr().get());
     // object + column identifiers fold to lower
     CHECK(kn->name() == "orders");
     REQUIRE(kn->columns().size() == 2);
@@ -246,7 +281,7 @@ TEST_CASE("kafka grammar: transform folds identifiers, preserves topic case") {
 
 TEST_CASE("kafka grammar: transform of a DROP node") {
     auto registry = kafka_registry();
-    std::pmr::monotonic_buffer_resource arena;
+    std::pmr::monotonic_buffer_resource arena(std::pmr::new_delete_resource());
 
     auto* node = reinterpret_cast<Node*>(linitial(raw_parser(&arena, "DROP STREAM IF EXISTS s", registry)));
     REQUIRE(nodeTag(node) == T_ExtensionNode);
@@ -255,8 +290,9 @@ TEST_CASE("kafka grammar: transform of a DROP node") {
     auto result = tr.transform(*node);
     REQUIRE_FALSE(result.has_error());
 
-    auto* kn = dynamic_cast<otterstax::kafka::kafka_node_t*>(result.node_ptr().get());
-    REQUIRE(kn != nullptr);
+    REQUIRE(result.node_ptr() != nullptr);
+    REQUIRE(result.node_ptr()->type() == lp::node_type::unused);
+    auto* kn = static_cast<otterstax::kafka::kafka_node_t*>(result.node_ptr().get());
     CHECK(kn->op() == otterstax::kafka::kafka_op::drop_stream);
     CHECK(kn->if_exists());
     CHECK(kn->columns().empty());

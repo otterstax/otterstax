@@ -1,9 +1,11 @@
 set(S3_HEADERS
     s3_connect_params.hpp
+    s3_subsystem.hpp
     manager.hpp
 )
 
 set(S3_SOURCES
+    s3_subsystem.cpp
     manager.cpp
 )
 

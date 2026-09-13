@@ -20,30 +20,30 @@
 #include <vector>
 
 namespace otterstax::kafka::detail {
-    // Rebuild a source's declared columns from a `SELECT * ... LIMIT 0` schema cursor
-    // (used on restart — the catalog survives, our registry doesn't). Empty on error
-    std::vector<kafka_column_t> columns_from_cursor(const components::cursor::cursor_t_ptr& cursor);
-
     // JSON message values -> data_chunk_t with `columns`. A payload that isn't a JSON
-    // object, misses a column, or has a wrong-typed value is dropped. Pure
+    // object, misses a column, or has a value that does not fit the column (wrong
+    // JSON kind, integer outside the column's range) is dropped with a logged
+    // error; a JSON null is a SQL NULL. Never throws. Pure apart from the log
     components::vector::data_chunk_t json_to_chunk(std::pmr::memory_resource* resource,
                                                    const std::vector<kafka_column_t>& columns,
                                                    const std::vector<std::string>& payloads);
 
-    // Inverse of json_to_chunk. Pure
-    std::vector<std::string> chunk_to_json(const components::vector::data_chunk_t& chunk);
+    // Inverse of json_to_chunk over a whole result: cursors return rows as a vector
+    // of <=1024-row chunks (never combined). Serializes every chunk's rows, in
+    // order, one JSON object per row keyed by column alias. Pure.
+    // A column whose type has no JSON encoding — anything but the five a SOURCE can
+    // declare plus the UBIGINT a COUNT projects — is a conversion_failure naming the
+    // column, never a null written in its place: such a null ingests back as a SQL
+    // NULL, so the loss would survive the round-trip guard below and reach the topic
+    core::result_wrapper_t<std::vector<std::string>>
+    chunk_to_json(std::pmr::memory_resource* resource,
+                  const std::pmr::vector<components::vector::data_chunk_t>& chunks);
 
-    // Multi-chunk overload: cursors return a result as a vector of <=1024-row
-    // chunks (never combined). Serializes every chunk's rows, in order.
-    std::vector<std::string> chunk_to_json(const std::pmr::vector<components::vector::data_chunk_t>& chunks);
-
-    // True iff every row of `chunk` round-trips through `declared` (chunk_to_json ->
-    // json_to_chunk). produce() uses it, since that path skips engine type-checking
-    bool chunk_matches_columns(std::pmr::memory_resource* resource,
-                               const components::vector::data_chunk_t& chunk,
-                               const std::vector<kafka_column_t>& declared);
-
-    // Multi-chunk overload: every chunk of the batch must round-trip.
+    // True iff every row of every chunk round-trips through `declared`
+    // (chunk_to_json -> json_to_chunk): same column count, every column aliased
+    // with a declared name, every value ingestible as the declared type. A chunk the
+    // writer cannot serialize does not round-trip either. The write paths
+    // (produce(), the STREAM worker) use it, since they skip engine type-checking
     bool chunk_matches_columns(std::pmr::memory_resource* resource,
                                const std::pmr::vector<components::vector::data_chunk_t>& chunks,
                                const std::vector<kafka_column_t>& declared);
@@ -71,8 +71,9 @@ namespace otterstax::kafka::detail {
                          const std::string& relname,
                          components::vector::data_chunk_t chunk);
 
-    // DELETE rows of db.<relname> where STRING `column` == `value`. Hand-built
-    // node_delete + resolve wrap (a DELETE string through kafka_query crashes the engine)
+    // DELETE rows of db.<relname> where STRING `column` == `value`, as the plan
+    // shape the SQL transformer emits for a DELETE (node_delete over node_match,
+    // resolve-wrapped); `value` is bound as a parameter, never spliced into SQL
     actor_zeta::unique_future<components::cursor::cursor_t_ptr>
     kafka_delete_where_eq(actor_zeta::address_t dispatcher_address,
                           std::pmr::memory_resource* resource,

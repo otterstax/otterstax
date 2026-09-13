@@ -279,7 +279,8 @@ def test_mixed_protocols_parallel(cfg, rounds=8):
 
 def test_backend_disconnect_recovery(cfg):
     """Pause backend container mid-query, verify the server reports a clean
-    error within cv_wrapper::DEFAULT_TIMEOUT and recovers afterwards.
+    error within the frontend's await deadline (asio_future_bridge
+    DEFAULT_TIMEOUT) and recovers afterwards.
 
     This test only runs when OTTERSTAX_RUN_DISRUPTION=1 because it shells out
     to `docker compose` and requires access to the host docker socket.

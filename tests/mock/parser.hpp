@@ -16,7 +16,7 @@
 
 class SimpleMockParser : public IParser {
 public:
-    SimpleMockParser(mock_config config = {})
+    SimpleMockParser(mock_config config)
         : config_(std::move(config)) {
         std::cout << "MockParser created with config:" << std::endl;
         std::cout << "can_throw: " << config_.can_throw << std::endl;

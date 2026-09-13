@@ -165,7 +165,7 @@ check_database_tables() {
 
     echo "📊 Tables in $database ($container):"
     # Check if it's a PostgreSQL container
-    if [[ "$container" == *"postgres" ]]; then
+    if [[ "$container" == *"postgres"* ]]; then
         compose_exec $container psql -U $user -d $database -c "\dt" 2>/dev/null || echo "❌ Failed to connect to PostgreSQL"
     # Check if it's a ClickHouse container
     elif [[ "$container" == *"clickhouse"* ]]; then
@@ -586,8 +586,13 @@ if $TRACY_SEP; then
     [ $SEP_FAILED -gt 0 ] && TEST_RC=1 || TEST_RC=0
 else
     # Standard mode: run all tests in a single container via the startup script.
-    compose run --rm --use-aliases test-client bash -c "/app/startup.sh"
-    TEST_RC=$?
+    # `set -e` is active: a non-zero exit here would abort the script on this
+    # very line — before `TEST_RC=$?` could read it, before Step 8c below and
+    # before the Step 9 cleanup, leaving the whole stack up. Capture the rc via
+    # `|| TEST_RC=$?` (the shape Step 8c and the Tracy branch already use) so a
+    # failed test is handled, not fatal.
+    TEST_RC=0
+    compose run --rm --use-aliases test-client bash -c "/app/startup.sh" || TEST_RC=$?
 fi
 
 if ! $ENABLE_TRACY && [ "${ENABLE_ASAN:-OFF}" != "ON" ] && [ "${ENABLE_TSAN:-OFF}" != "ON" ]; then
@@ -686,3 +691,9 @@ compose down --volumes --remove-orphans
 rm -rf .volumes 2>/dev/null || true
 
 echo "✅ Tests completed."
+
+# Report the suite's verdict to the caller. Until the `|| TEST_RC=$?` above, a
+# failed test aborted the script here via `set -e`, so CI saw a non-zero exit by
+# accident; now that the failure is captured rather than fatal, the exit status
+# has to be set explicitly, or a red suite would be reported green.
+exit $TEST_RC

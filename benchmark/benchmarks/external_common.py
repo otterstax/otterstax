@@ -28,7 +28,8 @@ MinIO bucket) so file vs s3 are directly comparable:
 
 The join keys are int64 on every side (parquet/csv loaders emit int64; the
 engine table declares `campaign_id bigint`) — a direct backend.campaign_id
-(int32) ⋈ s3.campaign_id (int64) silently drops all rows (see FIX_JOIN.md), so
+(int32) ⋈ s3.campaign_id (int64) silently drops all rows (see tests/CLAUDE.md,
+"JOIN-key width sensitivity"), so
 these benchmarks deliberately resolve every side to otterbrix-internal storage
 first, exactly like the tests they are modelled on.
 

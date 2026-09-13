@@ -3,6 +3,7 @@
 
 #include "connector.hpp"
 
+#include "errors.hpp"
 #include "utility/logger.hpp"
 #include "utility/tracy_profiler.hpp"
 #include <functional>
@@ -12,13 +13,15 @@
 
 namespace pg {
 
-    Connector::Connector(connect_params params, std::string alias)
+    Connector::Connector(std::pmr::memory_resource* resource, connect_params params, std::string alias)
         : log_(get_logger(logger_tag::CONNECTOR))
+        , resource_(resource)
         , conn_(nullptr)
         , params_{std::move(params)}
         , status_{Status::Created}
         , alias_{std::move(alias)} {
         assert(log_.is_valid());
+        assert(resource_ != nullptr);
     }
 
     connect_params Connector::params() const noexcept { return params_; }
@@ -37,7 +40,25 @@ namespace pg {
 
     Connector::~Connector() { close(); }
 
-    void Connector::connect() {
+    core::error_t Connector::query_error(const PGresult* result, std::string_view query) const {
+        const char* sqlstate = PQresultErrorField(result, PG_DIAG_SQLSTATE);
+        const char* message = PQresultErrorMessage(result);
+        const std::string_view state = sqlstate ? sqlstate : "";
+        std::string what = "[Run query] Alias: " + alias_ + " query [" + std::string(query) + "] failed";
+        if (!state.empty()) {
+            what += " (SQLSTATE " + std::string(state) + ")";
+        }
+        what += ": ";
+        what += message ? message : "no server message";
+        log_->error(what);
+        return core::error_t(classify_sqlstate(state), std::pmr::string{what.c_str(), resource_});
+    }
+
+    core::error_t Connector::connection_error(std::string_view what) const {
+        return core::error_t(core::error_code_t::io_error, std::pmr::string{what.data(), what.size(), resource_});
+    }
+
+    core::error_t Connector::connect() {
         OTX_ZONE_N("pg::Connector::connect");
         std::string conn_str = params_.connection_string();
         log_->debug("Alias: {} connecting with: host={} port={} dbname={}",
@@ -48,11 +69,11 @@ namespace pg {
         if (PQstatus(conn_.get()) != CONNECTION_OK) {
             std::string err = PQerrorMessage(conn_.get());
             log_->debug("Alias: {} connect failed: {}", alias_, err);
-            tryReconnect();
-            return;
+            return tryReconnect();
         }
         status_ = Status::Connected;
         log_->debug("Alias: {} connected successfully", alias_);
+        return core::error_t::no_error();
     }
 
     bool Connector::isConnected() {
@@ -76,10 +97,10 @@ namespace pg {
         return true;
     }
 
-    void Connector::tryReconnect() {
+    core::error_t Connector::tryReconnect() {
         OTX_ZONE_N("pg::Connector::tryReconnect");
         if (status_ == Status::Connected) {
-            return;
+            return core::error_t::no_error();
         }
         status_ = Status::Disconnected;
         size_t attempts = 0;
@@ -94,7 +115,7 @@ namespace pg {
             if (PQstatus(conn_.get()) == CONNECTION_OK) {
                 log_->debug("Alias: {} Reconnect success", alias_);
                 status_ = Status::Connected;
-                return;
+                return core::error_t::no_error();
             }
 
             std::string err = PQerrorMessage(conn_.get());
@@ -107,7 +128,7 @@ namespace pg {
         std::string error = "[Connector] Alias: " + alias_ + " connect failed " +
                             std::string(PQerrorMessage(conn_.get()));
         log_->error(error);
-        throw std::runtime_error(error);
+        return connection_error(error);
     }
 
     bool Connector::isClosed() const noexcept { return status_ == Status::Closed; }

@@ -7,10 +7,10 @@
 #include "kafka_producer.hpp"
 #include "kafka_reader.hpp"
 #include "kafka_stream.hpp"
+#include "otterbrix/operators/schema_probe.hpp"
 #include "utility/logger.hpp"
 #include "utility/tracy_profiler.hpp"
 
-#include <components/logical_plan/param_storage.hpp>
 #include <components/table/column_definition.hpp>
 
 #include <algorithm>
@@ -37,6 +37,31 @@ namespace otterstax::kafka {
             return std::move(future).take_ready();
         }
 
+        // pg_class identity of database.relation, asked of the engine: the namespace
+        // by name, then the relation by name within it. This is what tells a base
+        // table from a VIEW — the column probe cannot, since the engine answers a
+        // VIEW with its body's columns
+        core::result_wrapper_t<schema_probe::relation_t> probe_relation_kind(actor_zeta::address_t dispatcher_address,
+                                                                             std::pmr::memory_resource* resource,
+                                                                             const std::string& database,
+                                                                             const std::string& relation) {
+            OTX_ZONE_N("kafka::probe_relation_kind");
+            auto namespace_probe = schema_probe::make_namespace_probe(resource, database);
+            auto namespace_oid = schema_probe::read_namespace_oid(
+                namespace_probe,
+                drive(kafka_execute(dispatcher_address, resource, namespace_probe.execution_plan(resource))),
+                resource);
+            if (namespace_oid.has_error()) {
+                return namespace_oid.convert_error<schema_probe::relation_t>();
+            }
+            auto relation_probe = schema_probe::make_relation_probe(resource, database, relation);
+            return schema_probe::read_relation(
+                relation_probe,
+                drive(kafka_execute(dispatcher_address, resource, relation_probe.execution_plan(resource))),
+                namespace_oid.value(),
+                resource);
+        }
+
         // Stored per-partition offsets for table-seek resume; empty -> broker-group resume
         std::map<int32_t, int64_t> read_committed_offsets(actor_zeta::address_t dispatcher_address,
                                                           std::pmr::memory_resource* resource,
@@ -58,7 +83,7 @@ namespace otterstax::kafka {
         cols.emplace_back("offset_reset", types::complex_logical_type(types::logical_type::STRING_LITERAL));
         cols.emplace_back("transactional", types::complex_logical_type(types::logical_type::STRING_LITERAL));
         cols.emplace_back("as_select", types::complex_logical_type(types::logical_type::STRING_LITERAL));
-        return create_table("__sources", std::move(cols));
+        return create_table("__sources", std::move(cols), /*if_not_exists*/ true);
     }
 
     actor_zeta::unique_future<cursor::cursor_t_ptr> KafkaManager::persist_source_meta(const std::string& name,
@@ -118,11 +143,12 @@ namespace otterstax::kafka {
             return; // broker-free unit tests don't run pollers, nothing to relaunch
         }
         // No __sources table (first start / none created) → error cursor → nothing to do
+        const std::string kafka_db{KAFKA_DATABASE_NAME};
         auto cursor = drive(
             kafka_query(dispatcher_address_,
                         resource_,
-                        "SELECT name, kind, topic, bootstrap, group_id, offset_reset, transactional, as_select FROM "
-                        "kafka.__sources;"));
+                        "SELECT name, kind, topic, bootstrap, group_id, offset_reset, transactional, as_select FROM " +
+                            kafka_db + ".__sources;"));
         if (!cursor || cursor->is_error()) {
             return;
         }
@@ -135,17 +161,17 @@ namespace otterstax::kafka {
             bool transactional;
         };
         std::vector<meta_t> metas;
-        // Iterate the cursor's chunk-spanning row space (value()/size()); a
-        // registry of >1024 objects would otherwise lose everything past chunk 0.
-        for (std::uint64_t row = 0; row < cursor->size(); ++row) {
-            metas.push_back(meta_t{std::string{cursor->value(0, row).value<std::string_view>()},
-                                   std::string{cursor->value(1, row).value<std::string_view>()},
-                                   std::string{cursor->value(2, row).value<std::string_view>()},
-                                   std::string{cursor->value(3, row).value<std::string_view>()},
-                                   std::string{cursor->value(4, row).value<std::string_view>()},
-                                   std::string{cursor->value(5, row).value<std::string_view>()},
-                                   std::string{cursor->value(7, row).value<std::string_view>()},
-                                   cursor->value(6, row).value<std::string_view>() == "true"});
+        // The result is a batch of <=1024-row chunks: every chunk is read (a
+        // registry past the first chunk is not lost), each through its own row
+        // space rather than a per-cell chunk scan
+        for (const auto& chunk : cursor->chunks()) {
+            for (std::uint64_t row = 0; row < chunk.size(); ++row) {
+                auto text = [&](std::uint64_t col) {
+                    return std::string{chunk.value(col, row).value<std::string_view>()};
+                };
+                metas.push_back(
+                    meta_t{text(0), text(1), text(2), text(3), text(4), text(5), text(7), text(6) == "true"});
+            }
         }
 
         auto make_options = [](const meta_t& m) {
@@ -161,26 +187,54 @@ namespace otterstax::kafka {
         };
 
         // Pass 1 — SOURCEs. Columns aren't persisted: re-read from the backing
-        // table. The engine short-circuits LIMIT plans over an EMPTY table to a
-        // bare cursor (no type_data) — a LIMIT-0 probe would silently drop any
-        // source whose backing table is empty at restart. LIMIT 1 bounds the
-        // probe on populated tables; bare-but-not-error means the table is
-        // empty, so the unlimited re-read is free.
+        // table through the engine-side schema probe, whose answer comes off the
+        // validated plan rather than row data, so an empty table has the same
+        // schema as a populated one. The probe nodes are read only after the
+        // engine's reply future is ready: the engine stamps them during validation
+        // and never touches them after replying, so the read is sequenced after
+        // the last write
         for (const auto& m : metas) {
             if (m.kind != "source") {
                 continue;
             }
-            auto schema_cursor =
-                drive(kafka_query(dispatcher_address_, resource_, "SELECT * FROM kafka." + m.name + " LIMIT 1;"));
-            auto columns = columns_from_cursor(schema_cursor);
-            if (columns.empty() && schema_cursor && !schema_cursor->is_error()) {
-                schema_cursor =
-                    drive(kafka_query(dispatcher_address_, resource_, "SELECT * FROM kafka." + m.name + ";"));
-                columns = columns_from_cursor(schema_cursor);
+            auto probe = schema_probe::make_table_probe(resource_, kafka_db, m.name);
+            auto schema_cursor = drive(kafka_execute(dispatcher_address_, resource_, probe.execution_plan(resource_)));
+            auto read = schema_probe::read_columns(probe, schema_cursor, resource_);
+            if (read.has_error()) {
+                // Only a missing backing table (a dropped source whose __sources row
+                // lingers) is a skip; any other engine failure is reported as such
+                const auto code = read.error().type;
+                if (code == core::error_code_t::table_not_exists || code == core::error_code_t::database_not_exists) {
+                    log_->warn("kafka: recover source '{}': backing table is gone, skipping", m.name);
+                } else {
+                    log_->error("kafka: recover source '{}': schema probe failed (code {}): {}; skipping",
+                                m.name,
+                                static_cast<int32_t>(code),
+                                read.error().what.c_str());
+                }
+                continue;
+            }
+            auto identity = probe_relation_kind(dispatcher_address_, resource_, kafka_db, m.name);
+            if (identity.has_error()) {
+                log_->error("kafka: recover source '{}': pg_catalog probe failed (code {}): {}; skipping",
+                            m.name,
+                            static_cast<int32_t>(identity.error().type),
+                            identity.error().what.c_str());
+                continue;
+            }
+            if (identity.value().relkind == catalog::relkind::view ||
+                identity.value().relkind == catalog::relkind::materialized_view) {
+                // A SOURCE is backed by a base table the poller inserts into; a VIEW
+                // under its name cannot be ingested into
+                log_->error("kafka: recover source '{}': backing relation is a VIEW, not a table; skipping", m.name);
+                continue;
+            }
+            std::vector<kafka_column_t> columns;
+            for (const auto& col : read.value().columns) {
+                columns.push_back(kafka_column_t{col.has_alias() ? std::string{col.alias()} : std::string{}, col});
             }
             if (columns.empty()) {
-                // Backing table gone (e.g. a dropped source whose __sources row lingers)
-                log_->warn("kafka: recover source '{}': no backing-table schema, skipping", m.name);
+                log_->error("kafka: recover source '{}': backing table has no columns, skipping", m.name);
                 continue;
             }
             registry_[m.name] =
@@ -371,12 +425,14 @@ namespace otterstax::kafka {
         if (producer.has_error()) {
             return start_failed(std::string{"producer failed: "} + producer.error().what.c_str());
         }
-        streams_[name] = std::make_unique<kafka_stream_t>(
-            dispatcher_address_,
-            resource_,
-            stream_transform_t{src_it->second.columns, std::move(stream_src->operators), plan.value().parameters},
-            std::move(consumer.value()),
-            std::move(producer.value()));
+        streams_[name] = std::make_unique<kafka_stream_t>(dispatcher_address_,
+                                                          resource_,
+                                                          stream_transform_t{src_it->second.columns,
+                                                                             std::move(stream_src->operators),
+                                                                             plan.value().parameters,
+                                                                             it->second.columns},
+                                                          std::move(consumer.value()),
+                                                          std::move(producer.value()));
         log_->info("kafka: started stream '{}' ({} -> {})", name, src_topic->second, out_topic->second);
     }
 } // namespace otterstax::kafka

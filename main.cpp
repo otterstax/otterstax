@@ -2,6 +2,7 @@
 // Copyright 2025-2026  OtterStax
 
 #include <memory>
+#include <memory_resource>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -13,23 +14,27 @@
 
 #include "component_manager/component_manager.hpp"
 #include "connectors/mysql/connector.hpp"
+#include "connectors/s3/s3_subsystem.hpp"
 #include "frontend/flight_sql_server/server.hpp"
 #include "frontend/mysql_server/mysql_server.hpp"
 #include "frontend/postgres_server/postgres_server.hpp"
 #include "otterbrix/config.hpp"
 #include "config/config.hpp"
+#include "utility/logger.hpp"
 #include "utility/tracy_profiler.hpp"
 
 namespace po = boost::program_options;
+
+namespace {
+    // Engine data dir; the server's own logs live there too.
+    constexpr const char* DATA_DIR = "/tmp/test_collection_sql/base";
+} // namespace
 
 int main(int argc, char* argv[]) {
 
     // Logging
     arrow::util::ArrowLog::StartArrowLog("server", arrow::util::ArrowLogLevel::ARROW_DEBUG);
-
-    // Create component manager
-    OTX_MESSAGE_L("startup: creating component manager");
-    ComponentManager cmanager(make_create_config("/tmp/test_collection_sql/base"));
+    initialize_all_loggers(DATA_DIR);
 
     auto log = get_logger(logger_tag::Main);
     log->info("Starting server...");
@@ -67,19 +72,38 @@ int main(int argc, char* argv[]) {
     // Load server configuration from the single YAML config file. This carries
     // both the wire-server settings and, under `connections:`, every remote
     // backend and s3 alias — the single source of truth for connections. There
-    // is no runtime add/remove API.
-    config::ServiceConfig server_config;
-    try {
-        config::ConfigReader reader;
-        server_config = reader.load(config_path);
-    } catch (const std::exception& e) {
-        log->error("Failed to load configuration: {}", e.what());
+    // is no runtime add/remove API. An invalid file aborts startup here, before
+    // the engine, any actor, connection or frontend exists — nothing is torn
+    // down on this path.
+    std::pmr::synchronized_pool_resource startup_resource(std::pmr::new_delete_resource());
+    config::ConfigReader reader(&startup_resource);
+    auto loaded = reader.load(config_path);
+    if (loaded.has_error()) {
+        log->error("Failed to load configuration: {}", loaded.error().what.c_str());
         return 1;
     }
+    config::ServiceConfig server_config = std::move(loaded.value());
+
+    // ComponentManager spawns the s3 connector actor, which initialises Arrow's
+    // S3 subsystem; the process owes Arrow a FinalizeS3 before exit on every
+    // path below, including the aborted-startup returns. Declared before the
+    // manager so it finalizes after the whole actor graph is gone.
+    conn::s3::subsystem_finalizer_t finalize_s3(get_logger(logger_tag::S3_MANAGER));
+
+    // Create component manager
+    OTX_MESSAGE_L("startup: creating component manager");
+    ComponentManager cmanager(make_create_config(DATA_DIR));
 
     // Register the connections read from the config file with the connector
-    // managers (opens the backend connections / stores the s3 aliases).
-    cmanager.register_connections(server_config.connections, server_config.connection_retry);
+    // managers (opens the backend connections / stores the s3 aliases). A
+    // backend that is down is skipped with a logged error; a descriptor the
+    // backend cannot accept is a configuration error and the server does not
+    // start with it.
+    if (auto registered = cmanager.register_connections(server_config.connections, server_config.connection_retry);
+        registered.contains_error()) {
+        log->error("Invalid connection configuration: {}", registered.what.c_str());
+        return 1;
+    }
 
     // Configure the Flight SQL server
     Config config{
@@ -97,6 +121,8 @@ int main(int argc, char* argv[]) {
         .resource = cmanager.getResource(),
         .port = server_config.mysql.port,
         .scheduler = cmanager.scheduler_address(),
+        .read_timeout = std::chrono::seconds(frontend::CONNECTION_TIMEOUT_SEC),
+        .accept_retry_delay = std::chrono::milliseconds(frontend::ACCEPT_RETRY_DELAY_MS),
     };
 
     // Start MySQL server
@@ -110,6 +136,8 @@ int main(int argc, char* argv[]) {
         .resource = cmanager.getResource(),
         .port = server_config.postgres.port,
         .scheduler = cmanager.scheduler_address(),
+        .read_timeout = std::chrono::seconds(frontend::CONNECTION_TIMEOUT_SEC),
+        .accept_retry_delay = std::chrono::milliseconds(frontend::ACCEPT_RETRY_DELAY_MS),
     };
 
     // Start Postgres server

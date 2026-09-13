@@ -59,7 +59,7 @@ parser_extension_registry_t make_registry() {
 // the no-terminator cases further down.
 
 TEST_CASE("s3: CREATE EXTERNAL TABLE is parsed into the AST") {
-    std::pmr::monotonic_buffer_resource arena;
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     const auto* s = s3_parse_ok(&arena,
                                 "CREATE EXTERNAL TABLE s3.trades WITH ("
                                 "  s3_alias = 'my_s3_alias',"
@@ -75,7 +75,7 @@ TEST_CASE("s3: CREATE EXTERNAL TABLE is parsed into the AST") {
 }
 
 TEST_CASE("s3: COPY (SELECT ...) TO captures the inner query and target") {
-    std::pmr::monotonic_buffer_resource arena;
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     const auto* s = s3_parse_ok(&arena,
                                 "COPY (SELECT * FROM s3.trades) TO 's3://bucket/trades2.parquet'"
                                 " WITH ( s3_alias = 'my_s3_alias', format = 'parquet' );");
@@ -87,7 +87,7 @@ TEST_CASE("s3: COPY (SELECT ...) TO captures the inner query and target") {
 }
 
 TEST_CASE("s3: COPY inner query survives a ')' inside a string literal") {
-    std::pmr::monotonic_buffer_resource arena;
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     const auto* s = s3_parse_ok(&arena,
                                 "COPY (SELECT * FROM s3.trades WHERE name = 'a)b') TO 's3://b/o.parquet'"
                                 " WITH ( format = 'csv' );");
@@ -98,7 +98,7 @@ TEST_CASE("s3: COPY inner query survives a ')' inside a string literal") {
 }
 
 TEST_CASE("s3: COPY requires the WITH (...) clause") {
-    std::pmr::monotonic_buffer_resource arena;
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     // WITH is mandatory in our COPY syntax — without it the statement is rejected
     // (and the core parser would claim a bare COPY ... TO as its own CopyStmt).
     auto res = s3_ext::parse(&arena, "COPY (SELECT * FROM s3.trades) TO 's3://b/o.parquet';");
@@ -106,14 +106,14 @@ TEST_CASE("s3: COPY requires the WITH (...) clause") {
 }
 
 TEST_CASE("s3: an omitted format option resolves to nullptr") {
-    std::pmr::monotonic_buffer_resource arena;
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     const auto* s = s3_parse_ok(&arena, "CREATE EXTERNAL TABLE s3.t WITH (s3_alias='a', location='s3://b/d.parquet');");
     CHECK(s->format == nullptr);
     CHECK(ceq(s->s3_alias, "a"));
 }
 
 TEST_CASE("s3: a malformed statement is claimed as an error") {
-    std::pmr::monotonic_buffer_resource arena;
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto res = s3_ext::parse(&arena, "CREATE EXTERNAL TABLE s3.t WITH (location=);");
     CHECK(res.has_error());
 }
@@ -121,7 +121,7 @@ TEST_CASE("s3: a malformed statement is claimed as an error") {
 TEST_CASE("s3: trailing ';' is optional — no-terminator form also parses") {
     // mysql.connector / psycopg2 strip the terminator before send, so the
     // grammar must accept both forms; opt_semicolon → ( /*empty*/ | ';' ).
-    std::pmr::monotonic_buffer_resource arena;
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     const auto* c = s3_parse_ok(
         &arena,
         "CREATE EXTERNAL TABLE s3.t WITH (s3_alias='a', location='s3://b/d.parquet', format='parquet')");
@@ -134,7 +134,7 @@ TEST_CASE("s3: trailing ';' is optional — no-terminator form also parses") {
 }
 
 TEST_CASE("s3: core SQL and local-path statements are not claimed") {
-    std::pmr::monotonic_buffer_resource arena;
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
 
     auto plain = s3_ext::parse(&arena, "SELECT 1");
     CHECK_FALSE(plain.has_error());
@@ -149,7 +149,7 @@ TEST_CASE("s3: core SQL and local-path statements are not claimed") {
 // ── registry routing through raw_parser ─────────────────────────────────────
 
 TEST_CASE("s3 registry: an s3 statement is routed to the s3 extension") {
-    std::pmr::monotonic_buffer_resource arena;
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto registry = make_registry();
     auto* tree = raw_parser(&arena, "CREATE EXTERNAL TABLE s3.trades WITH (location='s3://b/d.parquet');", registry);
     REQUIRE(tree != NIL);
@@ -160,7 +160,7 @@ TEST_CASE("s3 registry: an s3 statement is routed to the s3 extension") {
 }
 
 TEST_CASE("s3 registry: core SQL is claimed by neither extension") {
-    std::pmr::monotonic_buffer_resource arena;
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto registry = make_registry();
     auto* tree = raw_parser(&arena, "SELECT 1", registry);
     REQUIRE(tree != NIL);
@@ -168,7 +168,7 @@ TEST_CASE("s3 registry: core SQL is claimed by neither extension") {
 }
 
 TEST_CASE("s3 registry: a malformed external statement surfaces a parser error") {
-    std::pmr::monotonic_buffer_resource arena;
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto registry = make_registry();
     CHECK_THROWS_AS(raw_parser(&arena, "CREATE EXTERNAL TABLE s3.t WITH (location=);", registry), parser_exception_t);
 }
@@ -176,7 +176,7 @@ TEST_CASE("s3 registry: a malformed external statement surfaces a parser error")
 // ── transform stage (lowers to an external_node_t the Scheduler routes) ──────
 
 TEST_CASE("s3 transform: ExtensionNode lowers to an external_node_t") {
-    std::pmr::monotonic_buffer_resource arena;
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto registry = make_registry();
     auto* node = reinterpret_cast<Node*>(linitial(
         raw_parser(&arena, "CREATE EXTERNAL TABLE s3.t WITH (s3_alias='a', location='s3://b/d.parquet');", registry)));
@@ -186,8 +186,10 @@ TEST_CASE("s3 transform: ExtensionNode lowers to an external_node_t") {
     auto result = tr.transform(*node);
     REQUIRE_FALSE(result.has_error());
     REQUIRE(result.node_ptr() != nullptr);
-    auto* ext = dynamic_cast<otterstax::external::external_node_t*>(result.node_ptr().get());
-    REQUIRE(ext != nullptr);
+    // external_node_t is tagged node_type::unused; nothing else the extension
+    // transform produces carries that tag.
+    REQUIRE(result.node_ptr()->type() == components::logical_plan::node_type::unused);
+    auto* ext = static_cast<otterstax::external::external_node_t*>(result.node_ptr().get());
     CHECK(ext->op() == otterstax::external::external_op_t::create_external_table);
     CHECK(ext->is_s3());
     CHECK(ext->object_path() == "b/d.parquet");

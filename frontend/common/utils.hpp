@@ -11,9 +11,11 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <random>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace frontend {
@@ -24,15 +26,18 @@ namespace frontend {
         BIG
     };
 
+    // The byte-merging helpers below read data[pos, pos + N) unchecked: the
+    // caller has the bytes — a header read to its exact size, or a
+    // packet_reader whose check_bounds passed. Nothing here throws.
     template<typename T, size_t ByteIndex>
     constexpr T read_nth_byte_le(const std::vector<uint8_t>& data, size_t pos) {
-        return static_cast<T>(data.at(pos + ByteIndex)) << (ByteIndex * 8);
+        return static_cast<T>(data[pos + ByteIndex]) << (ByteIndex * 8);
     }
 
     template<typename T, size_t ByteIndex, size_t N>
     constexpr T read_nth_byte_be(const std::vector<uint8_t>& data, size_t pos) {
         constexpr size_t shift = (N - 1 - ByteIndex) * 8;
-        return static_cast<T>(data.at(pos + ByteIndex)) << shift;
+        return static_cast<T>(data[pos + ByteIndex]) << shift;
     }
 
     template<size_t ByteIndex>
@@ -101,13 +106,20 @@ namespace frontend {
         return push_nth_bytes<T, sizeof(T), Order>(payload, value);
     }
 
+    // The wire type of a result column, nullopt for a logical type the protocol
+    // has no type for (UHUGEINT, DATE, TIMESTAMP, UNKNOWN, ...). Nothing throws:
+    // an unmapped column is refused by the connection with a protocol error
+    // (see find_unsupported_column in resultset_utils.hpp).
     namespace mysql {
-        field_type get_field_type(components::types::logical_type log_type);
+        std::optional<field_type> get_field_type(components::types::logical_type log_type);
     } // namespace mysql
 
     namespace postgres {
-        field_type get_field_type(components::types::logical_type log_type);
+        std::optional<field_type> get_field_type(components::types::logical_type log_type);
     } // namespace postgres
+
+    // The enumerator's name, for error messages ("HUGEINT", "UNKNOWN").
+    std::string_view logical_type_name(components::types::logical_type type);
 
     std::vector<uint8_t> generate_backend_key(size_t size);
 

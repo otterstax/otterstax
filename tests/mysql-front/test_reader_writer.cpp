@@ -2,6 +2,7 @@
 // Copyright 2025-2026  OtterStax
 
 #include "frontend/mysql_server/packet/packet_reader.hpp"
+#include "frontend/mysql_server/packet/packet_utils.hpp"
 #include "frontend/mysql_server/packet/packet_writer.hpp"
 
 #include <catch2/catch_all.hpp>
@@ -251,11 +252,23 @@ TEST_CASE("packet_reader: length encoded integers") {
         REQUIRE(reader.read_length_encoded_integer() == 0xFFFFFFFF);
     }
 
-    SECTION("NULL value throws exception") {
+    SECTION("NULL marker is an invalid_marker fault, not a value") {
         std::vector<uint8_t> data = {0xFB};
         packet_reader reader(std::move(data));
 
-        REQUIRE_THROWS_AS(reader.read_length_encoded_integer(), std::runtime_error);
+        reader.read_length_encoded_integer();
+        REQUIRE_FALSE(reader.ok());
+        REQUIRE(reader.fault() == frontend::packet_fault::invalid_marker);
+        REQUIRE(reader.remaining() == 1);
+    }
+
+    SECTION("0xFF marker is an invalid_marker fault") {
+        std::vector<uint8_t> data = {0xFF, 1, 2};
+        packet_reader reader(std::move(data));
+
+        reader.read_length_encoded_integer();
+        REQUIRE(reader.fault() == frontend::packet_fault::invalid_marker);
+        REQUIRE(reader.remaining() == 3);
     }
 }
 
@@ -281,28 +294,149 @@ TEST_CASE("packet_reader: utility") {
     }
 }
 
+// A read past the end of the packet is reported through the reader's fault
+// state, never thrown: the connection turns it into a protocol error.
 TEST_CASE("packet_reader: error handling") {
-    SECTION("read beyond bounds throws exception") {
+    SECTION("read beyond bounds is an underflow fault") {
         std::vector<uint8_t> data = {1, 2};
         packet_reader reader(std::move(data));
 
         reader.read_uint8(); // OK
         reader.read_uint8(); // OK
-        REQUIRE_THROWS_AS(reader.read_uint8(), std::out_of_range);
+        REQUIRE(reader.ok());
+        reader.read_uint8();
+        REQUIRE_FALSE(reader.ok());
+        REQUIRE(reader.fault() == frontend::packet_fault::underflow);
     }
 
     SECTION("read_uint16_le beyond bounds") {
         std::vector<uint8_t> data = {1};
         packet_reader reader(std::move(data));
 
-        REQUIRE_THROWS_AS(reader.read_uint16(), std::out_of_range);
+        reader.read_uint16();
+        REQUIRE(reader.fault() == frontend::packet_fault::underflow);
+        REQUIRE(reader.remaining() == 1);
     }
 
     SECTION("skip_bytes beyond bounds") {
         std::vector<uint8_t> data = {1, 2, 3};
         packet_reader reader(std::move(data));
 
-        REQUIRE_THROWS_AS(reader.skip_bytes(5), std::out_of_range);
+        reader.skip_bytes(5);
+        REQUIRE(reader.fault() == frontend::packet_fault::underflow);
+        REQUIRE(reader.remaining() == 3);
+    }
+}
+
+TEST_CASE("packet_reader: every primitive reports an underflow on a truncated buffer") {
+    // Each primitive on a buffer one byte short of what it needs: the value is
+    // not data, the fault is set, and the position has not moved.
+    SECTION("read_uint8 on an empty buffer") {
+        packet_reader reader(std::vector<uint8_t>{});
+        reader.read_uint8();
+        REQUIRE(reader.fault() == frontend::packet_fault::underflow);
+        REQUIRE(reader.remaining() == 0);
+    }
+
+    SECTION("read_int16 / read_uint16") {
+        packet_reader a(std::vector<uint8_t>{0x01});
+        a.read_int16();
+        REQUIRE(a.fault() == frontend::packet_fault::underflow);
+        packet_reader b(std::vector<uint8_t>{0x01});
+        b.read_uint16();
+        REQUIRE(b.fault() == frontend::packet_fault::underflow);
+    }
+
+    SECTION("read_int32 / read_uint32") {
+        packet_reader a(std::vector<uint8_t>{1, 2, 3});
+        a.read_int32();
+        REQUIRE(a.fault() == frontend::packet_fault::underflow);
+        REQUIRE(a.remaining() == 3);
+        packet_reader b(std::vector<uint8_t>{1, 2, 3});
+        b.read_uint32();
+        REQUIRE(b.fault() == frontend::packet_fault::underflow);
+    }
+
+    SECTION("read_int64 / read_uint64") {
+        packet_reader a(std::vector<uint8_t>{1, 2, 3, 4, 5, 6, 7});
+        a.read_int64();
+        REQUIRE(a.fault() == frontend::packet_fault::underflow);
+        REQUIRE(a.remaining() == 7);
+        packet_reader b(std::vector<uint8_t>{1, 2, 3, 4, 5, 6, 7});
+        b.read_uint64();
+        REQUIRE(b.fault() == frontend::packet_fault::underflow);
+    }
+
+    SECTION("read_string_null without a terminator") {
+        packet_reader reader(std::vector<uint8_t>{'a', 'b', 'c'});
+        REQUIRE(reader.read_string_null().empty());
+        REQUIRE(reader.fault() == frontend::packet_fault::underflow);
+        REQUIRE(reader.remaining() == 3);
+    }
+
+    SECTION("read_string_null on an empty buffer") {
+        packet_reader reader(std::vector<uint8_t>{});
+        reader.read_string_null();
+        REQUIRE(reader.fault() == frontend::packet_fault::underflow);
+    }
+
+    SECTION("read_string_eof never faults") {
+        packet_reader reader(std::vector<uint8_t>{});
+        REQUIRE(reader.read_string_eof().empty());
+        REQUIRE(reader.ok());
+    }
+
+    SECTION("length-encoded integer markers without their payload") {
+        packet_reader two(std::vector<uint8_t>{0xFC, 0x01});
+        two.read_length_encoded_integer();
+        REQUIRE(two.fault() == frontend::packet_fault::underflow);
+        REQUIRE(two.remaining() == 2);
+
+        packet_reader three(std::vector<uint8_t>{0xFD, 0x01, 0x02});
+        three.read_length_encoded_integer();
+        REQUIRE(three.fault() == frontend::packet_fault::underflow);
+        REQUIRE(three.remaining() == 3);
+
+        packet_reader eight(std::vector<uint8_t>{0xFE, 1, 2, 3, 4, 5, 6, 7});
+        eight.read_length_encoded_integer();
+        REQUIRE(eight.fault() == frontend::packet_fault::underflow);
+        REQUIRE(eight.remaining() == 8);
+
+        packet_reader empty(std::vector<uint8_t>{});
+        empty.read_length_encoded_integer();
+        REQUIRE(empty.fault() == frontend::packet_fault::underflow);
+    }
+
+    SECTION("length-encoded string longer than the buffer") {
+        packet_reader reader(std::vector<uint8_t>{5, 'a', 'b'});
+        REQUIRE(reader.read_length_encoded_string().empty());
+        REQUIRE(reader.fault() == frontend::packet_fault::underflow);
+        REQUIRE(reader.remaining() == 3);
+    }
+
+    SECTION("length-encoded string whose 8-byte length would overflow the bounds arithmetic") {
+        packet_reader reader(std::vector<uint8_t>{0xFE, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 'x'});
+        REQUIRE(reader.read_length_encoded_string().empty());
+        REQUIRE(reader.fault() == frontend::packet_fault::underflow);
+    }
+
+    SECTION("the fault is sticky: a later in-bounds read fails too") {
+        packet_reader reader(std::vector<uint8_t>{1, 2, 3});
+        reader.read_uint32();
+        REQUIRE(reader.fault() == frontend::packet_fault::underflow);
+        reader.read_uint8();
+        REQUIRE(reader.fault() == frontend::packet_fault::underflow);
+        REQUIRE(reader.remaining() == 3);
+        reader.skip_bytes(1);
+        REQUIRE(reader.remaining() == 3);
+    }
+
+    SECTION("an exact fit is not a fault") {
+        packet_reader reader(std::vector<uint8_t>{1, 2, 3, 4, 5, 6, 7, 8, 'a', 0});
+        REQUIRE(reader.read_uint64() == 0x0807060504030201ULL);
+        REQUIRE(reader.read_string_null() == "a");
+        REQUIRE(reader.ok());
+        REQUIRE(reader.remaining() == 0);
     }
 }
 
@@ -326,4 +460,24 @@ TEST_CASE("round-trip writer -> reader") {
     REQUIRE(reader.read_length_encoded_integer() == 300);
     REQUIRE(reader.read_length_encoded_string() == "world");
     REQUIRE(reader.remaining() == 0);
+}
+
+// An OK packet carries affected_rows and last_insert_id as length-encoded
+// integers; a single byte holds a count only up to 250 (0xFB..0xFF are markers).
+TEST_CASE("build_ok: affected rows are a length-encoded integer") {
+    for (uint64_t affected : {uint64_t{0}, uint64_t{250}, uint64_t{251}, uint64_t{1000}, uint64_t{2000}, uint64_t{70000}}) {
+        packet_writer writer;
+        auto packet = build_ok(writer, 1, affected);
+
+        std::vector<uint8_t> payload(packet.begin() + 4, packet.end());
+        packet_reader reader(std::move(payload));
+
+        REQUIRE(reader.read_uint8() == 0x00);                      // OK header
+        REQUIRE(reader.read_length_encoded_integer() == affected); // affected_rows
+        REQUIRE(reader.read_length_encoded_integer() == 0);        // last_insert_id
+        REQUIRE(reader.read_uint16() == 2);                        // SERVER_STATUS_AUTOCOMMIT
+        REQUIRE(reader.read_uint16() == 0);                        // warnings
+        REQUIRE(reader.remaining() == 0);
+        REQUIRE(reader.ok());
+    }
 }

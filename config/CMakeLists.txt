@@ -1,5 +1,6 @@
 set(config_HEADERS
     config.hpp
+    yaml_scalar.hpp
     connections/connection_config.hpp
     connections/connection_config_reader.hpp
 )

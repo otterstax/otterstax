@@ -4,17 +4,20 @@
 #pragma once
 
 #include <components/vector/data_chunk.hpp>
+#include <core/result_wrapper.hpp>
 
 #include <memory_resource>
 #include <string>
 
 namespace tsl {
 
-void chunk_to_ndjson(const components::vector::data_chunk_t& chunk, const std::string& path);
-
-// Multi-chunk overload: engine cursors return a result as a vector of <=1024-row
-// chunks (never combined). Writes every chunk into a single output file.
-void chunk_to_ndjson(const std::pmr::vector<components::vector::data_chunk_t>& chunks,
-                     const std::string& path);
+// Writes every chunk of an engine result (a run of <=DEFAULT_VECTOR_CAPACITY-row
+// chunks, never combined) into a single NDJSON file at `path`, one object per
+// row, in order. Columns must be named flat scalars (see writable_columns.hpp).
+// Error messages are owned by `res`; the value is true on success.
+[[nodiscard]] core::result_wrapper_t<bool>
+chunk_to_ndjson(std::pmr::memory_resource* res,
+                const std::pmr::vector<components::vector::data_chunk_t>& chunks,
+                const std::string& path);
 
 } // namespace tsl

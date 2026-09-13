@@ -3,20 +3,19 @@
 
 #include <catch2/catch_all.hpp>
 
+#include "connectors/s3/s3_subsystem.hpp"
 #include "utility/logger.hpp"
-
-#include <arrow/filesystem/s3fs.h>
 
 #include <filesystem>
 
 // FileManager/S3Manager construction (reachable via the Scheduler stack) calls
 // arrow::fs::EnsureS3Initialized() transitively. Arrow requires a matching
-// FinalizeS3() before exit or it warns and may segfault during static teardown.
+// FinalizeS3() before exit or it warns and may segfault during static teardown;
+// the same guard the server's main.cpp holds does it once the run is over.
 struct S3Finalizer : Catch::EventListenerBase {
     using EventListenerBase::EventListenerBase;
     void testRunEnded(Catch::TestRunStats const&) override {
-        if (arrow::fs::IsS3Initialized())
-            (void) arrow::fs::FinalizeS3();
+        conn::s3::subsystem_finalizer_t finalize_s3(get_logger(logger_tag::S3_MANAGER));
     }
 };
 CATCH_REGISTER_LISTENER(S3Finalizer)

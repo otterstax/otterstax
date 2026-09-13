@@ -94,8 +94,8 @@ namespace otterstax::kafka {
         std::pair<bool, actor_zeta::detail::enqueue_result> enqueue_impl(actor_zeta::mailbox::message_ptr msg);
 
     private:
-        // Kafka binding for one registered object — drives the poller/producer
-        // (and continuous query for streams) in later sub-steps
+        // Kafka binding for one registered object — what the poller/producer (and
+        // the continuous query of a stream) are launched from
         struct kafka_object_t {
             kafka_op op;
             std::vector<kafka_column_t> columns;
@@ -117,10 +117,19 @@ namespace otterstax::kafka {
         // CREATE DATABASE "kafka" IF NOT EXISTS — idempotent across restarts
         actor_zeta::unique_future<components::cursor::cursor_t_ptr> ensure_database();
 
-        // CREATE TABLE kafka.<name> (columns). Non-coroutine (returns the send()
-        // future); the caller co_awaits
+        // CREATE TABLE kafka.<name> (columns) [IF NOT EXISTS]. Non-coroutine
+        // (returns the send() future); the caller co_awaits
         actor_zeta::unique_future<components::cursor::cursor_t_ptr>
-        create_table(const std::string& name, std::vector<components::table::column_definition_t> columns);
+        create_table(const std::string& name,
+                     std::vector<components::table::column_definition_t> columns,
+                     bool if_not_exists);
+        // DROP TABLE kafka.<name>. Non-coroutine (returns the send() future); a
+        // missing table is reported by the engine as table_not_exists
+        actor_zeta::unique_future<components::cursor::cursor_t_ptr> drop_table(const std::string& name);
+        // Drop a SOURCE's backing table and its __offsets table. The backing table's
+        // result decides the outcome; an absent __offsets table is not an error
+        // (a half-created source must still be removable)
+        actor_zeta::unique_future<components::cursor::cursor_t_ptr> drop_source_tables(const std::string& name);
 
         // Lazily open (and cache) the topic producer for a kafka object; returns the
         // cached producer or an error if the broker connection could not be opened
@@ -132,17 +141,20 @@ namespace otterstax::kafka {
         // SOURCE and never relaunch its poller (the engine recovers the backing
         // tables but nothing restarts ingestion). We persist each object's options
         // to a kafka.__sources table; on startup recover() reads it back, re-reads
-        // the columns from the recovered backing table (LIMIT-1 probe with an
-        // unlimited fallback — LIMIT plans over empty tables return no metadata),
-        // rebuilds registry_, and relaunches the pollers (Phase 2 table-seek then
-        // resumes from kafka.<src>__offsets). Columns are NOT stored — the catalog
-        // is their single source of truth
+        // the columns from the recovered backing table through the engine-side
+        // schema probe (otterbrix/operators/schema_probe.hpp — the answer comes off
+        // the validated plan, so an empty table has a schema too), rebuilds
+        // registry_, and relaunches the pollers (Phase 2 table-seek then resumes
+        // from kafka.<src>__offsets). Columns are NOT stored — the catalog is their
+        // single source of truth
 
         // CREATE TABLE kafka.__sources IF NOT EXISTS (idempotent across restarts)
         actor_zeta::unique_future<components::cursor::cursor_t_ptr> ensure_sources_table();
-        // co_await ensure_sources_table() once per process (idempotent guard)
+        // co_await ensure_sources_table() once per process (idempotent guard).
+        // Returns an error cursor when the table could not be ensured — a CREATE
+        // that cannot persist its metadata must fail rather than come up unrecoverable
         actor_zeta::unique_future<components::cursor::cursor_t_ptr> ensure_sources_table_once();
-        // INSERT one object's options into kafka.__sources (called after register)
+        // INSERT one object's options into kafka.__sources (called before register)
         // Returns the engine future — co_awaited inside execute (NOT spun, so it
         // composes with the handler coroutine)
         actor_zeta::unique_future<components::cursor::cursor_t_ptr> persist_source_meta(const std::string& name,

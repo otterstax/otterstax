@@ -3,16 +3,21 @@
 
 #include "name_resolution.hpp"
 
+#include "utility/tracy_profiler.hpp"
+
 #include <components/logical_plan/node_aggregate.hpp>
-#include <components/logical_plan/node_catalog_resolve.hpp>
-#include <components/logical_plan/node_drop.hpp>
 #include <components/logical_plan/node_create_collection.hpp>
+#include <components/logical_plan/node_create_index.hpp>
+#include <components/logical_plan/node_delete.hpp>
+#include <components/logical_plan/node_drop.hpp>
 #include <components/logical_plan/node_group.hpp>
 #include <components/logical_plan/node_having.hpp>
+#include <components/logical_plan/node_insert.hpp>
 #include <components/logical_plan/node_join.hpp>
 #include <components/logical_plan/node_limit.hpp>
 #include <components/logical_plan/node_match.hpp>
 #include <components/logical_plan/node_sort.hpp>
+#include <components/logical_plan/node_update.hpp>
 
 #include <cassert>
 
@@ -57,10 +62,9 @@ namespace otterstax::names {
     }
 
     void name_registry_t::add(qualified_name_t name) {
-        // Mirror the transformer's rangevar_to_qualified_name folding:
-        // dbname = (catalogname non-empty ? catalogname : schemaname).
-        const std::string& key_db = name.database.empty() ? name.schema : name.database;
-        auto key = make_key_(key_db, name.collection);
+        // Keyed by the dbname the transformer stamps: the RangeVar's catalogname,
+        // which the grammar fills for every qualified name.
+        auto key = make_key_(name.database, name.collection);
         auto it = entries_.find(key);
         if (it == entries_.end()) {
             entries_.emplace(std::move(key), std::move(name));
@@ -89,6 +93,7 @@ namespace otterstax::names {
                                                                 const name_registry_t& reg,
                                                                 std::string_view dbname,
                                                                 std::string_view relname) {
+        OTX_ZONE_N("names::resolve_table_name");
         const auto* full_name = reg.find(dbname, relname);
         if (full_name == nullptr) {
             if (reg.collided(dbname, relname)) {
@@ -101,47 +106,21 @@ namespace otterstax::names {
         return *full_name;
     }
 
-    core::result_wrapper_t<qualified_name_t>
-    node_names(const node_t& node, const name_registry_t& reg, const node_t* seq_ctx) {
+// The drop-kind switch below is exhaustive on purpose: a kind the engine adds
+// later must be classified here before the build passes, instead of silently
+// falling through a default branch.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic error "-Wswitch"
+
+    core::result_wrapper_t<qualified_name_t> node_names(const node_t& node, const name_registry_t& reg) {
+        OTX_ZONE_N("names::node_names");
         auto* resource = node.resource();
 
         std::string_view db;
         std::string_view rel;
 
-        // Shared sibling-resolve: DML + table-level DDL nodes carry no names; the
-        // transformer wraps them in a node_sequence_t whose FIRST catalog_resolve
-        // (kind==table) sibling carries the target table. Returns an error_t on
-        // failure, else sets db/rel and returns nullopt.
-        auto resolve_from_sibling = [&]() -> std::optional<core::error_t> {
-            if (seq_ctx == nullptr) {
-                return core::error_t{
-                    core::error_code_t::invalid_parameter,
-                    std::pmr::string{"DML/DDL node requires its wrapping node_sequence_t context (seq_ctx) "
-                                     "to resolve the target table name",
-                                     resource}};
-            }
-            const components::logical_plan::node_catalog_resolve_t* resolve = nullptr;
-            for (const auto& child : seq_ctx->children()) {
-                if (child && child->type() == node_type::catalog_resolve_t &&
-                    static_cast<const components::logical_plan::node_catalog_resolve_t&>(*child).kind() ==
-                        components::logical_plan::resolve_kind::table) {
-                    resolve = static_cast<const components::logical_plan::node_catalog_resolve_t*>(child.get());
-                    break;
-                }
-            }
-            if (resolve == nullptr) {
-                return core::error_t{
-                    core::error_code_t::invalid_parameter,
-                    std::pmr::string{"DML/DDL sequence context carries no catalog_resolve (table) sibling",
-                                     resource}};
-            }
-            db = resolve->dbname();
-            rel = resolve->relname();
-            return std::nullopt;
-        };
-
         // Per-type (dbname, relname) extraction mirroring the engine's
-        // enrich per-type switch.
+        // enrich per-type switch: every node names its own target.
         switch (node.type()) {
             case node_type::aggregate_t: {
                 const auto& d = static_cast<const components::logical_plan::node_aggregate_t&>(node);
@@ -186,23 +165,12 @@ namespace otterstax::names {
                 break;
             }
             case node_type::create_collection_t: {
-                // CREATE TABLE: the node carries only relname; the database
-                // name lives on the node_catalog_resolve_namespace_t sibling.
-                // An unqualified `CREATE TABLE t` has no such sibling (seq_ctx
-                // may even be nullptr) — db stays empty and the registry hit
-                // is the local `("", rel)` entry.
+                // CREATE TABLE: the database as written — empty for an
+                // unqualified `CREATE TABLE t`, whose registry hit is then the
+                // local `("", rel)` entry.
                 const auto& d = static_cast<const components::logical_plan::node_create_collection_t&>(node);
+                db = d.dbname();
                 rel = d.relname();
-                if (seq_ctx != nullptr) {
-                    for (const auto& child : seq_ctx->children()) {
-                        if (child && child->type() == node_type::catalog_resolve_t &&
-                            static_cast<const components::logical_plan::node_catalog_resolve_t&>(*child).kind() ==
-                                components::logical_plan::resolve_kind::namespace_) {
-                            db = static_cast<const components::logical_plan::node_catalog_resolve_t&>(*child).dbname();
-                            break;
-                        }
-                    }
-                }
                 break;
             }
             case node_type::create_database_t: {
@@ -211,26 +179,38 @@ namespace otterstax::names {
                 // statements are always local. The parser filters them out
                 // before resolution (carries_table_reference); reaching this
                 // switch is a contract violation.
-                return core::error_t{
-                    core::error_code_t::invalid_parameter,
-                    std::pmr::string{"database-level DDL carries no alias-qualifiable name; "
-                                     "CREATE DATABASE is local by grammar and must not be resolved",
-                                     resource}};
+                return core::error_t{core::error_code_t::invalid_parameter,
+                                     std::pmr::string{"database-level DDL carries no alias-qualifiable name; "
+                                                      "CREATE DATABASE is local by grammar and must not be resolved",
+                                                      resource}};
             }
-            // Target table comes from the sibling resolve (resolve_from_sibling
-            // above). drop_index carries a SECOND resolve_table for the index
-            // itself — the table one comes first, so the scan picks the right one.
-            case node_type::create_index_t:
-            case node_type::insert_t:
-            case node_type::update_t:
+            case node_type::create_index_t: {
+                const auto& d = static_cast<const components::logical_plan::node_create_index_t&>(node);
+                db = d.dbname();
+                rel = d.relname();
+                break;
+            }
+            case node_type::insert_t: {
+                const auto& d = static_cast<const components::logical_plan::node_insert_t&>(node);
+                db = d.dbname();
+                rel = d.relname();
+                break;
+            }
+            case node_type::update_t: {
+                const auto& d = static_cast<const components::logical_plan::node_update_t&>(node);
+                db = d.dbname();
+                rel = d.relname();
+                break;
+            }
             case node_type::delete_t: {
-                if (auto err = resolve_from_sibling()) {
-                    return *err;
-                }
+                const auto& d = static_cast<const components::logical_plan::node_delete_t&>(node);
+                db = d.dbname();
+                rel = d.relname();
                 break;
             }
             case node_type::drop_t: {
-                switch (static_cast<const components::logical_plan::node_drop_t&>(node).kind()) {
+                const auto& d = static_cast<const components::logical_plan::node_drop_t&>(node);
+                switch (d.kind()) {
                     case components::logical_plan::drop_target_kind::database:
                         // Database-level DDL is always local by grammar; the parser
                         // filters it before resolution — reaching here is a contract violation.
@@ -239,17 +219,20 @@ namespace otterstax::names {
                             std::pmr::string{"database-level DDL carries no alias-qualifiable name; "
                                              "DROP DATABASE is local by grammar and must not be resolved",
                                              resource}};
+                    // DROP INDEX: relname() is the indexed table; the index
+                    // name travels apart (index_name()).
                     case components::logical_plan::drop_target_kind::collection:
                     case components::logical_plan::drop_target_kind::index:
-                        if (auto err = resolve_from_sibling()) {
-                            return *err;
-                        }
+                        db = d.dbname();
+                        rel = d.relname();
                         break;
-                    default:
-                        // type/sequence/view/macro carry no alias-qualifiable table name.
-                        return core::error_t{
-                            core::error_code_t::invalid_parameter,
-                            std::pmr::string{"node type carries no table name to resolve", resource}};
+                    case components::logical_plan::drop_target_kind::type:
+                    case components::logical_plan::drop_target_kind::sequence:
+                    case components::logical_plan::drop_target_kind::view:
+                    case components::logical_plan::drop_target_kind::macro:
+                        // Engine-local objects: no alias-qualifiable table name.
+                        return core::error_t{core::error_code_t::invalid_parameter,
+                                             std::pmr::string{"node type carries no table name to resolve", resource}};
                 }
                 break;
             }
@@ -265,5 +248,7 @@ namespace otterstax::names {
 
         return resolve_table_name(resource, reg, db, rel);
     }
+
+#pragma GCC diagnostic pop
 
 } // namespace otterstax::names

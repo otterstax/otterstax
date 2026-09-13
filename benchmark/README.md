@@ -218,7 +218,7 @@ same JOIN serialisation bug as the default test set.
 `external_join_cross` / `external_join_all` deliberately load every side into
 otterbrix-internal storage (external load + a hand-built `bigint` engine table).
 A direct backend.int32 ⋈ s3.int64 JOIN silently returns zero rows
-([`FIX_JOIN.md`](../FIX_JOIN.md)), so the benchmarks follow the same staged
+("JOIN-key width sensitivity" in `tests/CLAUDE.md`), so the benchmarks follow the same staged
 shape the python tests use.
 
 Selecting any `external_*` test automatically:

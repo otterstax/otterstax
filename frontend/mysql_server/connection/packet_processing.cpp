@@ -83,6 +83,12 @@ namespace frontend::mysql {
             log_->info("[Connection {}] AUTH: plugin='{}'", connection_id_, auth_plugin);
         }
 
+        // A string above without its terminator: none of the values read is data.
+        if (!reader.ok()) {
+            send_malformed_packet_error("Malformed HandshakeResponse packet");
+            return;
+        }
+
         // skip auth
         state_ = connection_state::COMMAND;
         log_->info("[Connection {}] AUTH: Success -> COMMAND state", connection_id_);
@@ -147,6 +153,10 @@ namespace frontend::mysql {
                 uint32_t stmt_id = reader.read_uint32();
                 uint8_t flags = reader.read_uint8();
                 reader.read_uint32(); // iteration count - always 1, ignore
+                if (!reader.ok()) {
+                    send_malformed_packet_error("Malformed COM_STMT_EXECUTE packet");
+                    break;
+                }
 
                 auto it_stmt = statement_id_map_.find(stmt_id);
                 if (it_stmt == statement_id_map_.end()) {
@@ -162,14 +172,14 @@ namespace frontend::mysql {
                            num_params);
 
                 if (num_params == 0) {
-                    handle_execute_stmt(it_stmt->second.stmt_session, {});
+                    handle_execute_stmt(it_stmt->second, std::pmr::vector<types::logical_value_t>{resource_});
                     break;
                 }
 
                 if (auto param_values =
                         handle_execute_params(stmt_id, num_params, it_stmt->second.param_types, std::move(reader));
                     !param_values.empty()) {
-                    handle_execute_stmt(it_stmt->second.stmt_session, std::move(param_values));
+                    handle_execute_stmt(it_stmt->second, std::move(param_values));
                 }
                 break;
             }
@@ -177,7 +187,20 @@ namespace frontend::mysql {
                 packet_reader reader(std::move(payload));
                 reader.read_uint8(); // skip [0x25] - COM_STMT_CLOSE
                 uint32_t stmt_id = reader.read_uint32();
-                statement_id_map_.erase(stmt_id);
+                if (!reader.ok()) {
+                    // The command has no response by protocol; the ERR packet
+                    // stands for the close that follows it.
+                    send_malformed_packet_error("Malformed COM_STMT_CLOSE packet");
+                    break;
+                }
+                if (auto it = statement_id_map_.find(stmt_id); it != statement_id_map_.end()) {
+                    // The worker keeps an unexecuted statement until it is closed;
+                    // an executed one it has already dropped (consumed).
+                    if (!it->second.consumed) {
+                        close_stmt_on_worker(it->second.stmt_session, "COM_STMT_CLOSE");
+                    }
+                    statement_id_map_.erase(it);
+                }
                 read_packet(); // nothing is sent to client, read next
                 break;
             }
@@ -198,18 +221,10 @@ namespace frontend::mysql {
         // sending to the Scheduler event-loop always returns needs_sched=false
         [[maybe_unused]] auto [needs_sched, fut] =
             actor_zeta::send(scheduler_, &Scheduler::execute, id.hash(), query);
-        core::result_wrapper_t<session_payload> r{resource_};
-        boost::asio::io_context io;
-        boost::asio::co_spawn(
-            io,
-            [&]() -> boost::asio::awaitable<void> {
-                r = co_await otterstax::async_await_future<session_payload>(std::move(fut));
-            },
-            boost::asio::detached);
-        io.run();
+        auto r = otterstax::await_future_blocking<session_payload>(std::move(fut), resource_);
 
         if (r.has_error()) {
-            if (r.error().what.starts_with("timeout")) {
+            if (r.error().type == otterstax::AWAIT_TIMEOUT_CODE) {
                 send_error(mysql_error::ER_QUERY_TIMEOUT, "Query exceeded execution limit");
             } else {
                 // all connectors send "SET NAMES utf8mb4" and "SET AUTOCOMMIT=0" after auth, handle them separately
@@ -223,6 +238,14 @@ namespace frontend::mysql {
         // empty db & table in metadata (not critical, but may be improved)
         if (sdata_result.column_count() == 0) {
             send_packet(build_ok(writer_, sequence_id_, sdata_result.size()));
+            return;
+        }
+
+        // A column the text resultset cannot encode is an error packet, not a
+        // dropped connection.
+        if (auto bad = find_unsupported_column<frontend_type::MYSQL>(sdata_result.chunks.front(),
+                                                                    {result_encoding::TEXT})) {
+            send_error(mysql_error::ER_NOT_SUPPORTED_YET, unsupported_column_message<frontend_type::MYSQL>(*bad));
             return;
         }
 
@@ -298,18 +321,10 @@ namespace frontend::mysql {
         // sending to the Scheduler event-loop always returns needs_sched=false
         [[maybe_unused]] auto [needs_sched, fut] =
             actor_zeta::send(scheduler_, &Scheduler::prepare_schema, id.hash(), query);
-        core::result_wrapper_t<session_payload> r{resource_};
-        boost::asio::io_context io;
-        boost::asio::co_spawn(
-            io,
-            [&]() -> boost::asio::awaitable<void> {
-                r = co_await otterstax::async_await_future<session_payload>(std::move(fut));
-            },
-            boost::asio::detached);
-        io.run();
+        auto r = otterstax::await_future_blocking<session_payload>(std::move(fut), resource_);
 
         if (r.has_error()) {
-            if (r.error().what.starts_with("timeout")) {
+            if (r.error().type == otterstax::AWAIT_TIMEOUT_CODE) {
                 send_error(mysql_error::ER_QUERY_TIMEOUT, "Query exceeded execution limit");
             } else {
                 // ? case - postgres will not allow
@@ -322,6 +337,20 @@ namespace frontend::mysql {
         std::vector<std::vector<uint8_t>> packets;
 
         uint16_t column_cnt = result.schema != types::logical_type::NA ? result.schema.child_types().size() : 0;
+
+        // COM_STMT_EXECUTE answers a binary resultset: a column the binary
+        // encoder cannot carry is refused here, and the statement the worker
+        // has just stored is released — no execute will ever consume it.
+        if (column_cnt) {
+            if (auto bad = find_unsupported_column<frontend_type::MYSQL>(result.schema.child_types(),
+                                                                        {result_encoding::BINARY})) {
+                close_stmt_on_worker(id.hash(), "COM_STMT_PREPARE refused");
+                send_error(mysql_error::ER_NOT_SUPPORTED_YET,
+                           unsupported_column_message<frontend_type::MYSQL>(*bad));
+                return;
+            }
+        }
+
         packets.reserve(4 + column_cnt + result.parameter_count);
         log_->info("[Connection {}] COM_STMT_PREPARE: id={} column_cnt={} param_cnt={}",
                    connection_id_,
@@ -330,8 +359,10 @@ namespace frontend::mysql {
                    result.parameter_count);
         packets.push_back(
             build_stmt_prepare_ok(writer_, sequence_id_++, next_statement_id_, column_cnt, result.parameter_count));
+        // `query` is the text the worker accepted (a `?` statement arrives here
+        // already rewritten to `$n`), so it is the text a re-prepare must use.
         statement_id_map_.emplace(next_statement_id_++,
-                                  prepared_stmt_meta(resource_, id.hash(), result.parameter_count));
+                                  prepared_stmt_meta(resource_, id.hash(), std::move(query), result.parameter_count));
 
         // params
         if (result.parameter_count) {
@@ -345,7 +376,14 @@ namespace frontend::mysql {
         // columns
         if (column_cnt) {
             for (auto& column : result.schema.child_types()) {
-                column_definition_41 col(column.alias(), get_field_type(column.type()));
+                auto wire_type = get_field_type(column.type());
+                assert(wire_type.has_value() && "COM_STMT_PREPARE: column types were checked above");
+                // A column without a name (SELECT 1) has no alias in the prepared
+                // schema, and alias() has no null guard for such a type; it goes
+                // out with the empty name an executed result gives it.
+                column_definition_41 col(column.has_alias() ? column.alias() : std::string{}, *wire_type);
+                // A DECIMAL column announces its own scale and display length.
+                apply_decimal_metadata(col, column);
                 packets.push_back(column_definition_41::write_packet(std::move(col), writer_, sequence_id_++));
             }
             packets.push_back(build_eof(writer_, sequence_id_++));
@@ -408,6 +446,14 @@ namespace frontend::mysql {
                 uint16_t t = reader.read_uint16();
                 param_types.push_back(t);
             }
+        }
+
+        // Checked before the types are used: a type read past the end is 0
+        // (MYSQL_TYPE_DECIMAL), which would be refused as unsupported instead.
+        if (!reader.ok()) {
+            param_types.clear();
+            send_malformed_packet_error("Malformed COM_STMT_EXECUTE packet: parameter types");
+            return {};
         }
 
         if (param_types.size() != num_params) {
@@ -490,27 +536,84 @@ namespace frontend::mysql {
             }
         }
 
+        if (!reader.ok()) {
+            send_malformed_packet_error("Malformed COM_STMT_EXECUTE packet: parameter values");
+            return {};
+        }
+
         return param_values;
     }
 
-    void mysql_connection::handle_execute_stmt(session_hash_t id,
-                                               std::pmr::vector<types::logical_value_t> param_values) {
-        OTX_ZONE_N("mysql::handle_execute_stmt");
+    bool mysql_connection::reprepare_stmt(prepared_stmt_meta& stmt) {
+        OTX_ZONE_N("mysql::reprepare_stmt");
+        session_id id;
         // sending to the Scheduler event-loop always returns needs_sched=false
         [[maybe_unused]] auto [needs_sched, fut] =
-            actor_zeta::send(scheduler_, &Scheduler::execute_prepared_statement, id, std::move(param_values));
-        core::result_wrapper_t<session_payload> r{resource_};
-        boost::asio::io_context io;
-        boost::asio::co_spawn(
-            io,
-            [&]() -> boost::asio::awaitable<void> {
-                r = co_await otterstax::async_await_future<session_payload>(std::move(fut));
-            },
-            boost::asio::detached);
-        io.run();
+            actor_zeta::send(scheduler_, &Scheduler::prepare_schema, id.hash(), std::string{stmt.sql.c_str()});
+        auto r = otterstax::await_future_blocking<session_payload>(std::move(fut), resource_);
 
         if (r.has_error()) {
-            if (r.error().what.starts_with("timeout")) {
+            if (r.error().type == otterstax::AWAIT_TIMEOUT_CODE) {
+                send_error(mysql_error::ER_QUERY_TIMEOUT, "Query exceeded execution limit");
+            } else {
+                send_error(mysql_error::ER_UNKNOWN_ERROR, std::string{r.error().what.c_str()});
+            }
+            return false;
+        }
+
+        if (r.value().parameter_count != stmt.parameter_count) {
+            send_error(mysql_error::ER_UNKNOWN_STMT_HANDLER,
+                       "Prepared statement changed its parameter count on re-prepare: " +
+                           std::to_string(r.value().parameter_count) + " out of " +
+                           std::to_string(stmt.parameter_count));
+            return false;
+        }
+
+        stmt.stmt_session = id.hash();
+        stmt.consumed = false;
+        return true;
+    }
+
+    void mysql_connection::close_stmt_on_worker(session_hash_t stmt_session, const char* reason) {
+        // sending to the Scheduler event-loop always returns needs_sched=false
+        [[maybe_unused]] auto [needs_sched, fut] =
+            actor_zeta::send(scheduler_, &Scheduler::close_statement, stmt_session);
+        auto r = otterstax::await_future_blocking<session_payload>(std::move(fut), resource_);
+        if (r.has_error()) {
+            log_->warn("[Connection {}] {}: close_statement failed: {}", connection_id_, reason, r.error().what);
+        }
+    }
+
+    void mysql_connection::finish_impl() {
+        OTX_ZONE_N("mysql::finish_impl");
+        // The worker keeps an unexecuted statement until it is closed; an
+        // executed one it has already dropped (consumed).
+        for (const auto& entry : statement_id_map_) {
+            if (!entry.second.consumed) {
+                close_stmt_on_worker(entry.second.stmt_session, "connection finish");
+            }
+        }
+        statement_id_map_.clear();
+    }
+
+    void mysql_connection::handle_execute_stmt(prepared_stmt_meta& stmt,
+                                               std::pmr::vector<types::logical_value_t> param_values) {
+        OTX_ZONE_N("mysql::handle_execute_stmt");
+        if (stmt.consumed && !reprepare_stmt(stmt)) {
+            return;
+        }
+        // The worker drops the statement on every exit path of the execution.
+        stmt.consumed = true;
+
+        // sending to the Scheduler event-loop always returns needs_sched=false
+        [[maybe_unused]] auto [needs_sched, fut] = actor_zeta::send(scheduler_,
+                                                                    &Scheduler::execute_prepared_statement,
+                                                                    stmt.stmt_session,
+                                                                    std::move(param_values));
+        auto r = otterstax::await_future_blocking<session_payload>(std::move(fut), resource_);
+
+        if (r.has_error()) {
+            if (r.error().type == otterstax::AWAIT_TIMEOUT_CODE) {
                 send_error(mysql_error::ER_QUERY_TIMEOUT, "Query exceeded execution limit");
             } else {
                 send_error(mysql_error::ER_SYNTAX_ERROR, std::string{r.error().what.c_str()});
@@ -522,6 +625,14 @@ namespace frontend::mysql {
 
         if (sdata_result.column_count() == 0) {
             send_packet(build_ok(writer_, sequence_id_, sdata_result.size()));
+            return;
+        }
+
+        // The executed columns may differ from the prepared schema (a
+        // parameterized statement has none at prepare time): checked again.
+        if (auto bad = find_unsupported_column<frontend_type::MYSQL>(sdata_result.chunks.front(),
+                                                                    {result_encoding::BINARY})) {
+            send_error(mysql_error::ER_NOT_SUPPORTED_YET, unsupported_column_message<frontend_type::MYSQL>(*bad));
             return;
         }
 

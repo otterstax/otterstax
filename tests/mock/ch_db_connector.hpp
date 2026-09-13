@@ -14,7 +14,7 @@ namespace ch {
 
     class MockConnector : public ch::IConnector {
     public:
-        explicit MockConnector(mock_config config = {}, std::string alias = "ch_mock_connector")
+        explicit MockConnector(mock_config config, std::string alias = "ch_mock_connector")
             : config_(std::move(config))
             , alias_(std::move(alias)) {
             std::cout << "CH MockConnector created with alias: " << alias_ << std::endl;
@@ -26,13 +26,16 @@ namespace ch {
 
         void close() override { std::cout << "CH MockConnector closed." << std::endl; }
 
-        void connect() override { std::cout << "CH MockConnector connected." << std::endl; }
+        core::error_t connect() override {
+            std::cout << "CH MockConnector connected." << std::endl;
+            return core::error_t::no_error();
+        }
 
         bool isConnected() override { return true; }
 
-        void tryReconnect() override {
+        core::error_t tryReconnect() override {
             std::cout << "CH MockConnector trying to reconnect." << std::endl;
-            connect();
+            return connect();
         }
 
         bool isClosed() const noexcept override { return false; }
@@ -54,9 +57,12 @@ namespace ch {
             return result;
         }
 
-        asio::awaitable<std::unique_ptr<data_chunk_t>>
+        // The data overloads throw when configured to: that models a driver or
+        // translator exception raised inside the coroutine on the io thread, which
+        // executeQuery must hand back as an io_error value.
+        asio::awaitable<core::result_wrapper_t<std::unique_ptr<data_chunk_t>>>
         runQuery(std::string_view query,
-                 std::function<std::unique_ptr<data_chunk_t>(const std::vector<clickhouse::Block>&)> handler) override {
+                 otterstax::function_ref_t<std::unique_ptr<data_chunk_t>(const select_result_t&)> handler) override {
             std::cout << "CH MockConnector running query: " << query << std::endl;
 
             if (config_.can_throw) {
@@ -69,9 +75,8 @@ namespace ch {
             co_return std::make_unique<data_chunk_t>(get_chunk());
         }
 
-        asio::awaitable<int64_t>
-        runQuery(std::string_view query,
-                 std::function<int64_t(const std::vector<clickhouse::Block>&)> handler) override {
+        asio::awaitable<core::result_wrapper_t<int64_t>>
+        runQuery(std::string_view query, otterstax::function_ref_t<int64_t(const select_result_t&)> handler) override {
             std::cout << "CH MockConnector running update query: " << query << std::endl;
             if (config_.can_throw) {
                 std::string error_message =
@@ -81,10 +86,14 @@ namespace ch {
             co_return 42;
         }
 
-        asio::awaitable<otterstax::asio_error_t> runQuery(
-            std::string_view query,
-            std::function<otterstax::asio_error_t(const std::vector<clickhouse::Block>&)> handler) override {
-            throw std::runtime_error("Unimplemented");
+        // Metadata overload (ClickhouseManager::discover: named types and the
+        // schema probe): a coroutine reporting the failure as a value, the same
+        // channel a real connector uses.
+        asio::awaitable<core::error_t>
+        runQuery(std::string_view query,
+                 otterstax::function_ref_t<otterstax::asio_error_t(const select_result_t&)> handler) override {
+            co_return core::error_t(core::error_code_t::unimplemented_yet,
+                                    std::pmr::string{"ch MockConnector: runQuery is unimplemented", config_.resource});
         }
 
     private:
@@ -94,9 +103,8 @@ namespace ch {
 
 } // namespace ch
 
-inline auto ch_mock_connector_factory(std::pmr::memory_resource* resource) {
-    return [resource](ch::connect_params, std::string alias) {
-        std::cout << "Creating CH MockConnector." << std::endl;
-        return std::make_unique<ch::MockConnector>(mock_config{.resource = resource}, std::move(alias));
-    };
+inline std::unique_ptr<ch::IConnector>
+ch_mock_connector_factory(std::pmr::memory_resource* resource, ch::connect_params, std::string alias) {
+    std::cout << "Creating CH MockConnector." << std::endl;
+    return std::make_unique<ch::MockConnector>(mock_config{.resource = resource}, std::move(alias));
 }

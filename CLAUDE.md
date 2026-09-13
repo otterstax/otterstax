@@ -65,10 +65,15 @@ backend. The `alias` is the outermost qualifier in federated SQL
 
 ```text
 main.cpp
-  → config::ConfigReader.load(config.yaml)      → ServiceConfig { ports…, ConnectionsConfig connections }
-        (internally: parse_connections(config["connections"]) → plain descriptor structs)
-        (parse_connections validates every entry → throws on an incomplete one →
-         startup aborts before any connector is touched)
+  → config::ConfigReader.load(config.yaml)      → result_wrapper_t<ServiceConfig> { ports…, ConnectionsConfig connections }
+        (internally: parse_connections(config["connections"], resource) → plain descriptor structs)
+        (parse_connections validates every entry → the first incomplete one is returned as
+         core::error_t{invalid_parameter} → main logs it and returns 1 before the engine, any actor
+         or connector exists — ComponentManager is constructed only after the config is accepted)
+  → conn::s3::subsystem_finalizer_t            — declared before ComponentManager: the s3 actor it spawns
+                                                 initialises Arrow S3, and the process must FinalizeS3
+                                                 after the actor graph is gone on every exit path
+  → ComponentManager(make_create_config(...))   → engine + actor graph + worker pool
   → ComponentManager::register_connections(server_config.connections, server_config.connection_retry)
        mysql/pg/ch: ConnectorManager::addConnection(conn::api_server::*Params)   — opens the connector,
                     retried up to connection_retry.max_attempts (delay_ms between tries)
@@ -78,8 +83,13 @@ main.cpp
 - Parsing + validation live in the `config` target (`config/`), which has **no
   connector dependencies** — `parse_connections` produces plain
   `config::ConnectionsConfig` descriptor structs held inside `ServiceConfig` and
-  **throws (via `validation_error`) on any incomplete entry**, so an invalid
-  connection aborts startup rather than coming up half-configured.
+  **returns `core::error_t{invalid_parameter}` (built from `validation_error`)
+  for the first incomplete entry, malformed port or non-scalar field**; a file
+  that is not YAML is a `conversion_failure`. Nothing in `config/` throws: the
+  yaml-cpp calls are the only throwing sites and each is converted where it is
+  made (`config/yaml_scalar.hpp`, `YAML::LoadFile` in `ConfigReader::load`).
+  `main.cpp` logs the error and returns 1, so an invalid connection aborts
+  startup rather than coming up half-configured.
 - Registration lives in `ComponentManager::register_connections` (it owns the
   connector managers), converting the pre-validated descriptors → connector param
   structs. Opening a backend is best-effort: it is retried up to
@@ -140,17 +150,28 @@ cmake -S . -B build/Release -DBUILD_TESTS=ON \
   -DCMAKE_TOOLCHAIN_FILE=build/Release/generators/conan_toolchain.cmake
 /usr/local/bin/cmake --build /workspaces/otterstax/build/Release --parallel 5 --
 
-# Run a single test binary (Catch2)
-./build/Release/test_system          # tests/system
-./build/Release/test_unit_schema     # tests/unit/schema
-./build/Release/test_unit_utility    # tests/unit/utility
-./build/Release/test_mysql_front     # tests/mysql-front
+# Run a single test binary (Catch2) — binaries sit under build/Release/tests/<dir>/
+./build/Release/tests/system/test_system                    # tests/system
+./build/Release/tests/unit/parser/test_parser               # tests/unit/parser
+./build/Release/tests/unit/schema/test_schema               # tests/unit/schema
+./build/Release/tests/unit/utility/test_utils               # tests/unit/utility
+./build/Release/tests/unit/translators/test_unit_translators
+./build/Release/tests/unit/config/test_unit_config
+./build/Release/tests/unit/parser/grammar_extension/kafka/test_kafka_grammar
+./build/Release/tests/mysql-front/test_mysql_front          # tests/mysql-front
 
 # Build with sanitizers (not both at once)
 cmake -S . -B build/Release -DENABLE_ASAN=ON -DBUILD_TESTS=ON \
   -DCMAKE_TOOLCHAIN_FILE=build/Release/generators/conan_toolchain.cmake
 cmake -S . -B build/Release -DENABLE_TSAN=ON -DBUILD_TESTS=ON \
   -DCMAKE_TOOLCHAIN_FILE=build/Release/generators/conan_toolchain.cmake
+# ASAN caveat: the engine's core/pmr.hpp keys a public class layout off the
+# consumer's __SANITIZE_ADDRESS__, so an ASAN build undefines that macro
+# (CMakeLists.txt) to match the non-ASAN Conan engine package. That workaround
+# is valid only while the engine is built without ASAN — an ASAN-built engine
+# would need the macro left defined. The CI sanitizer workflows also export
+# ENABLE_ASAN/ENABLE_TSAN to docker-run-tests.sh, which skips the Kafka
+# crash-recovery (kill -9) step under sanitizers.
 
 # Adjust log verbosity (default ERROR)
 cmake -S . -B build/Release -DSPDLOG_ACTIVE_LEVEL=SPDLOG_LEVEL_DEBUG ...
@@ -216,9 +237,11 @@ The Scheduler is a session-affinity router over a pool of `Worker` actors
 keyed by `session_hash_t` always lands on `workers_[id % N]`. The Scheduler's
 own thread runs an otterbrix-style event loop: `enqueue_impl` (any sender
 thread) only pushes into a lock-free inbox and signals a CV; all coroutine
-work happens on the loop thread. Frontends never block on a `cv_wrapper` —
-they hold the future returned by `Scheduler::execute` and poll it from the
+work happens on the loop thread. Frontends never block on shared state — they
+hold the future returned by `Scheduler::execute` and poll it from the
 per-connection asio executor through `frontend/common/asio_future_bridge.hpp`.
+That bridge is the only supported way to pick up an actor result; the
+`cv_wrapper` condvar handoff it replaced has been deleted.
 
 ### Key Types
 
@@ -268,6 +291,21 @@ Rules:
 - Add `OTX_ZONE_N("Scope::function")` as the **first statement** of the function body,
   using a stable, qualified name (e.g. `"Worker::execute"`, `"catalog::get_catalog_schema"`,
   `"sql_gen::generate_query"`, `"parser::prepare_sql"`).
+- **Exception — coroutine handlers that can resume on another thread.** When a handler's
+  coroutine can suspend at a `co_await` and resume on another thread, or interleave with
+  other coroutines on one thread (`Worker` on the `sharing_scheduler`, the `Scheduler`
+  event loop), open the zone as the first statement of a nested block
+  `{ OTX_ZONE_N("Scope::function"); ... }` that closes before the first `co_await`.
+  Tracy requires a zone to end on the thread that began it, in LIFO order; a zone spanning
+  a suspension point breaks both and corrupts the capture. Only `assert`s, objects that
+  must live for the whole coroutine (`Timer`, `erase_on_exit_t`) and the variables the
+  block fills (the `unique_future`, the parsed query data) may precede that block; the
+  awaited actor instruments its own work. A handler of an actor whose `enqueue_impl`
+  drives the coroutine to completion on the sender's thread (e.g. `CatalogManager`,
+  `S3Manager`, `FileManager`) keeps the zone as its first statement even across
+  `co_await`: the awaited call runs nested on the same thread. If such an actor moves off
+  that synchronous path, its handlers fall under this exception. See
+  `scheduler/CLAUDE.md`, "Tracy zones in coroutines".
 - The macros compile to **no-ops** unless Tracy is enabled, so there is no release-build cost.
 
 Do NOT instrument:
@@ -389,8 +427,8 @@ error, just an empty result. The two width footguns to watch for:
   stage the backend slice into a local `bigint` table first
   (`tests/test_mysql_join_sql_s3_to_s3.py` does the staging path). Joining on
   a string key avoids the issue entirely, which is what `step_4.sql` and
-  `tests/test_mysql_join_otb_local_backend.py` do. See `FIX_JOIN.md` for the
-  full diagnosis.
+  `tests/test_mysql_join_otb_local_backend.py` do. The test-side conventions
+  are in `tests/CLAUDE.md`, "JOIN-key width sensitivity".
 
 ### Round-trip example
 
@@ -426,27 +464,27 @@ otterbrix-internal — shadow of `external_join_all` benchmark), all driven by
 | `connectors/` | `connectors`, `s3`, `file` | Raw DB connections (Boost.MySQL, libpq, clickhouse-cpp), S3 (Arrow `S3FileSystem`), local-file ingestion. `api_connections/` holds the `conn::api_server::*Params` structs consumed by `addConnection` |
 | `config/` | `config` | Single `config.yaml` reader — wire-server settings + `connections:` section (single source of truth for backend/s3 connections). See `config/CLAUDE.md` |
 | `catalog/` | `catalog` | Schema discovery + connection type registry (`CatalogManager`) |
-| `integration/` | `integration` | Actor wrappers bridging Worker ↔ ConnectorManagers (incl. `db::S3Manager`) |
+| `integration/` | `integration` | Actor wrappers bridging Worker ↔ ConnectorManagers (incl. `db::S3Manager`); each backend actor is the sole driver of its ConnectorManager and answers the catalog's `discover` |
 | `integration/kafka/` | `kafka_runtime` | `KafkaManager` actor + `detail/` impl (consumer/producer/poller/stream/reader); Kafka SOURCE/STREAM objects, librdkafka |
 | `otterbrix/` | `otterbrix_local` (+ `otterbrix_s3_extension`, `otterbrix_file_extension`) | Parser, SQL generator, translators, plan execution, grammar extensions for `CREATE EXTERNAL TABLE` / `COPY ... TO` |
 | `otterbrix/parser/grammar_extension/kafka/` | `kafka_grammar` | Kafka DDL parser extension (flex+bison): `kafka_node_t`, `kafka_write_target` |
 | `scheduler/` | `scheduler` | `Scheduler` router + `Worker` pool (full parse→catalog→backend→otterbrix pipeline, including external-statement dispatch) + schema computation utilities |
 | `frontend/` | `flight_sql_server`, `mysql_server`, `postgres_server` | Wire-protocol frontends (await `Scheduler` futures via `asio_future_bridge.hpp`) |
-| `utility/` | (header-only) | `session_payload`, `session`, `pipeline_error`, logger, profiler |
+| `utility/` | (header-only) | `session`, `wait_barrier` (connector error marshalling), `asio_error`, `table_info`, logger, profiler |
 | `cmake/` | (helper macros) | `otterbrix_parser_extension.cmake` — builds the s3/file flex+bison grammar extensions |
-| `tests/` | `test_system`, `test_unit_*`, `test_mysql_front` | Catch2 tests + python integration suite under `tests/test_*.py` |
+| `tests/` | `test_system`, `test_parser`, `test_schema`, `test_utils`, `test_unit_translators`, `test_unit_config`, `test_kafka_grammar`, `test_mysql_front` | Catch2 tests + python integration suite under `tests/test_*.py` (binary names are the `project()` names in `tests/*/CMakeLists.txt`; see `tests/CLAUDE.md`) |
 
 ## Known Constraints
 
-- `ConnectorManager::addConnection/removeConnection` is **not thread-safe** (see TODOs in `connectors/mysql/manager.hpp:44-45`)
-- One query per connection at a time (`integration/sql/connection_manager.cpp:81`)
-- Array types support only single dimension (`otterbrix/query_generation/sql_query_generator.cpp:70`)
+- `ConnectorManager::addConnection` is the only write to a connector registry and runs on the startup thread before any query reaches the integration actor that drives the manager (`connectors/mysql/manager.hpp`); there is no remove path
+- One query per connection at a time: each alias owns a single `boost::mysql::any_connection` and nothing serializes overlapping statements on it (`Connector::runQuery_` in `connectors/mysql/connector.hpp`; the pg/ch connectors are shaped the same way)
+- Array types support only single dimension (see the `TODO: multiple dimentions array` in `write_column_def`, `otterbrix/query_generation/sql_query_generator.cpp`)
 - Docker MariaDB volumes lag on cold start — `docker-run-tests.sh` has a 120 s wait
 
 ## Critical Dependency Versions
 
-- Otterbrix 1.0.0b2-rc-1 (custom Conan remote: `http://conan.otterbrix.com`; pinned by recipe revision in `conanfile.py`)
+- Otterbrix 1.0.0b2-rc-2 (custom Conan remote: `http://conan.otterbrix.com`; pinned by recipe revision in `conanfile.py`)
 - Arrow 24.0.0 (with `with_flight_sql=True`, `with_s3=True`, `with_parquet=True`, `with_csv=True`, `with_json=True`, plus snappy/brotli/zlib/lz4/zstd compression codecs)
 - Boost 1.88.0
 - actor-zeta 1.2.0
-- Catch2 3.15.2 (v3 — `find_package(Catch2 3)` required by the otterbrix recipe)
+- Catch2 3.15.1 (v3 — `find_package(Catch2 3)` required by the otterbrix recipe)

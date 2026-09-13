@@ -19,8 +19,13 @@ RUN apt update && \
     apt clean && \
     rm -rf /var/lib/apt/lists/*
 
+# cmake.org answers 403 to conan's HTTP client, so the conancenter cmake binary
+# recipe cannot be fetched; the pip-installed cmake is declared as the platform
+# tool_requires of the build profile instead (it satisfies the recipes' <4 range).
 RUN pip3 install --no-cache-dir conan==2.21.0 'cmake<4.0' && \
      conan profile detect --force && \
+     printf '\n[platform_tool_requires]\ncmake/%s\n' "$(cmake --version | head -1 | awk '{print $3}')" \
+         >> "$(conan profile path default)" && \
      conan remote add otterbrix http://conan.otterbrix.com
 
 RUN rm /bin/sh && ln -s /bin/bash /bin/sh
@@ -36,6 +41,8 @@ RUN if [ "$WITH_TRACY" = "true" ]; then \
             -s compiler.cppstd=20 \
             -s 'clickhouse-cpp/*:compiler.cppstd=17' \
             -s 'abseil/*:compiler.cppstd=17' \
+            -s 'protobuf/*:compiler.cppstd=17' \
+            -s 're2/*:compiler.cppstd=17' \
             -s 'grpc/*:compiler.cppstd=17' \
             -o "&:with_tracy=True"; \
     else \
@@ -44,6 +51,8 @@ RUN if [ "$WITH_TRACY" = "true" ]; then \
             -s compiler.cppstd=20 \
             -s 'clickhouse-cpp/*:compiler.cppstd=17' \
             -s 'abseil/*:compiler.cppstd=17' \
+            -s 'protobuf/*:compiler.cppstd=17' \
+            -s 're2/*:compiler.cppstd=17' \
             -s 'grpc/*:compiler.cppstd=17'; \
     fi
 

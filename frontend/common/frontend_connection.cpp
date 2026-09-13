@@ -3,6 +3,8 @@
 
 #include "frontend_connection.hpp"
 
+#include <utility>
+
 namespace {
     inline bool is_user_disconnect(const boost::system::error_code& ec) {
         return ec == boost::asio::error::eof || ec == boost::asio::error::connection_reset;
@@ -12,11 +14,16 @@ namespace {
 namespace frontend {
     frontend_connection::frontend_connection(boost::asio::io_context& ctx,
                                              uint32_t connection_id,
-                                             std::function<void()> on_close)
-        : socket_(ctx)
+                                             connection_close_sink& close_sink,
+                                             size_t slot,
+                                             std::chrono::milliseconds read_timeout)
+        : socket_(boost::asio::make_strand(ctx))
         , connection_id_(connection_id)
-        , close_callback_(std::move(on_close))
-        , read_buffer_(READ_BUFFER_SIZE) {}
+        , close_sink_(&close_sink)
+        , slot_(slot)
+        , read_buffer_(READ_BUFFER_SIZE)
+        , read_timeout_(read_timeout)
+        , read_timer_(socket_.get_executor()) {}
 
     boost::asio::ip::tcp::socket& frontend_connection::socket() { return socket_; }
 
@@ -27,48 +34,96 @@ namespace frontend {
     }
 
     void frontend_connection::start() {
-        logger()->info("[Connection {}] START: Client connected", connection_id_);
-        start_impl();
+        boost::asio::post(socket_.get_executor(), safe_callback([this] {
+                              logger()->info("[Connection {}] START: Client connected", connection_id_);
+                              start_impl();
+                          }));
     }
 
     void frontend_connection::finish() {
         bool expected = false;
-        if (!closing_.compare_exchange_strong(expected, true)) {
+        if (!finish_requested_.compare_exchange_strong(expected, true)) {
             return;
         }
 
-        boost::asio::post(socket_.get_executor(), [this] {
-            logger()->info("[Connection {}] FINISH", connection_id_);
+        // The posted close is itself a pending operation: the connection cannot
+        // be released before it has run, and closed_ is set only by it.
+        boost::asio::post(socket_.get_executor(), safe_callback([this] {
+                              logger()->info("[Connection {}] FINISH", connection_id_);
+                              closed_ = true;
 
-            boost::system::error_code ec;
-            socket_.close(ec);
+                              boost::system::error_code ec;
+                              socket_.close(ec);
+                              read_timer_.cancel();
+                          }));
+    }
 
-            if (close_callback_) {
-                auto cb = std::move(close_callback_);
-                close_callback_ = nullptr;
-                cb();
+    void frontend_connection::complete_operation() {
+        if (pending_ops_.fetch_sub(1, std::memory_order_acq_rel) == 1 && closed_) {
+            release();
+        }
+    }
+
+    void frontend_connection::release() {
+        // Releases what the connection holds on the Scheduler (unexecuted
+        // prepared statements); the connection is whole here and nothing else
+        // of it is queued anywhere.
+        finish_impl();
+
+        // The sink destroys this connection from inside the call, so nothing
+        // touches members after it.
+        if (auto* sink = std::exchange(close_sink_, nullptr)) {
+            sink->release_connection_slot(slot_);
+        }
+    }
+
+    void frontend_connection::arm_read_timeout(const char* stage) {
+        const uint64_t generation = ++read_timer_generation_;
+        read_timer_.expires_after(read_timeout_);
+        read_timer_.async_wait(safe_callback([this, stage, generation](boost::system::error_code ec) {
+            if (!ec && generation == read_timer_generation_) {
+                logger()->warn("[Connection {}] READ: {} timeout, disconnecting", connection_id_, stage);
+                finish();
             }
-        });
+        }));
+    }
+
+    void frontend_connection::cancel_read_timeout() {
+        ++read_timer_generation_;
+        read_timer_.cancel();
+    }
+
+    bool frontend_connection::ensure_read_buffer(uint32_t size) {
+        if (size > MAX_BUFFER_SIZE) {
+            handle_out_of_resources_error("Payload too large");
+            return false;
+        }
+
+        if (size > read_buffer_.size()) {
+            try {
+                read_buffer_.resize(size);
+            } catch (const std::bad_alloc&) {
+                handle_out_of_resources_error("Out of memory");
+                return false;
+            }
+        }
+        return true;
     }
 
     void frontend_connection::read_packet() {
         logger()->debug("[Connection {}] READ: Starting header read", connection_id_);
 
-        auto timer = std::make_shared<boost::asio::steady_timer>(socket_.get_executor(),
-                                                                 std::chrono::seconds(CONNECTION_TIMEOUT_SEC));
-        timer->async_wait([this](boost::system::error_code ec) {
-            if (!ec) {
-                logger()->warn("[Connection {}] READ: timeout, disconnecting", connection_id_);
-                finish();
-            }
-        });
+        arm_read_timeout("header");
 
         uint32_t header_length = get_header_size();
         boost::asio::async_read(
             socket_,
             boost::asio::buffer(read_buffer_.data(), header_length),
-            safe_callback([this, timer, header_length](boost::system::error_code ec, std::size_t length) {
-                timer->cancel();
+            safe_callback([this, header_length](boost::system::error_code ec, std::size_t length) {
+                cancel_read_timeout();
+                if (closed_) {
+                    return;
+                }
 
                 if (ec || length < header_length) {
                     if (is_user_disconnect(ec)) {
@@ -87,39 +142,26 @@ namespace frontend {
 
     void frontend_connection::read_packet_payload(std::vector<uint8_t> header) {
         uint32_t payload_length = get_packet_size(header);
-        if (!validate_payload_size(payload_length)) {
+        if (!validate_payload_size(header, payload_length)) {
             return;
         }
 
-        if (payload_length > MAX_BUFFER_SIZE) {
-            handle_out_of_resources_error("Payload too large");
+        if (!ensure_read_buffer(payload_length)) {
             return;
         }
 
-        if (payload_length > read_buffer_.size()) {
-            try {
-                read_buffer_.resize(payload_length);
-            } catch (const std::bad_alloc&) {
-                handle_out_of_resources_error("Out of memory");
-                return;
-            }
-        }
-
-        auto timer = std::make_shared<boost::asio::steady_timer>(socket_.get_executor(),
-                                                                 std::chrono::seconds(CONNECTION_TIMEOUT_SEC));
-        timer->async_wait([this](boost::system::error_code ec) {
-            if (!ec) {
-                logger()->warn("[Connection {}] READ: Payload timeout, disconnecting", connection_id_);
-                finish();
-            }
-        });
+        arm_read_timeout("payload");
 
         boost::asio::async_read(
             socket_,
             boost::asio::buffer(read_buffer_.data(), payload_length),
-            safe_callback([this, head = std::move(header), payload_length, timer](boost::system::error_code ec,
-                                                                                  std::size_t length) {
-                timer->cancel();
+            safe_callback([this, head = std::move(header), payload_length](boost::system::error_code ec,
+                                                                           std::size_t length) {
+                cancel_read_timeout();
+                if (closed_) {
+                    return;
+                }
+
                 if (ec || length != payload_length) {
                     if (is_user_disconnect(ec)) {
                         logger()->info("[Connection {}] READ: Client disconnected during payload", connection_id_);
@@ -141,16 +183,18 @@ namespace frontend {
         boost::asio::async_write(
             socket_,
             boost::asio::buffer(send_buffer_),
-            [this, continue_reading](boost::system::error_code ec, std::size_t bytes_sent) {
+            safe_callback([this, continue_reading](boost::system::error_code ec, std::size_t bytes_sent) {
                 if (ec) {
-                    logger()->error("[Connection {}] SEND: failed: {}", connection_id_, ec.message());
+                    if (!closed_) {
+                        logger()->error("[Connection {}] SEND: failed: {}", connection_id_, ec.message());
+                    }
                     finish(); // todo: resend logic?
                 } else {
                     if (continue_reading) {
                         read_packet();
                     }
                 }
-            });
+            }));
     }
 
     void frontend_connection::send_packet_merged(std::vector<std::vector<uint8_t>> packets) {
@@ -169,16 +213,18 @@ namespace frontend {
 
         boost::asio::async_write(socket_,
                                  boost::asio::buffer(send_buffer_),
-                                 [this](boost::system::error_code ec, std::size_t bytes) {
+                                 safe_callback([this](boost::system::error_code ec, std::size_t bytes) {
                                      if (ec) {
-                                         std::cerr << "[Connection " << connection_id_
-                                                   << "] ERROR: Failed to send merged packets:" << ec.message()
-                                                   << std::endl;
+                                         if (!closed_) {
+                                             std::cerr << "[Connection " << connection_id_
+                                                       << "] ERROR: Failed to send merged packets:" << ec.message()
+                                                       << std::endl;
+                                         }
                                          finish();
                                      } else {
                                          read_packet();
                                      }
-                                 });
+                                 }));
     }
 
     void
@@ -188,13 +234,18 @@ namespace frontend {
             return;
         }
 
-        auto current_packet = std::make_shared<std::vector<uint8_t>>(packets[index]);
+        // The packet being written lives in send_buffer_ until the completion
+        // runs; `packets` travels inside the handler for the next round.
+        send_buffer_ = packets[index];
         boost::asio::async_write(socket_,
-                                 boost::asio::buffer(*current_packet),
-                                 safe_callback([this, packets = std::move(packets), index, attempt, current_packet](
+                                 boost::asio::buffer(send_buffer_),
+                                 safe_callback([this, packets = std::move(packets), index, attempt](
                                                    boost::system::error_code ec,
-                                                   std::size_t) {
+                                                   std::size_t) mutable {
                                      if (ec) {
+                                         if (closed_) {
+                                             return;
+                                         }
                                          logger()->error("[Connection {}] ERROR: Sequential packet was lost {}",
                                                          connection_id_,
                                                          ec.message());

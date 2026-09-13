@@ -3,6 +3,9 @@
 
 #include "chunk_to_parquet.hpp"
 #include "chunk_to_arrow.hpp"
+#include "otterbrix/translators/error.hpp"
+
+#include "utility/tracy_profiler.hpp"
 
 #undef DAY
 #undef SECOND
@@ -17,52 +20,43 @@
 
 namespace tsl {
 
-void chunk_to_parquet(const components::vector::data_chunk_t& chunk, const std::string& path) {
-    auto batch = chunk_to_record_batch(chunk);
-
-    auto table_result = arrow::Table::FromRecordBatches({batch});
-    if (!table_result.ok())
-        throw std::runtime_error("chunk_to_parquet: FromRecordBatches failed: " +
-                                 table_result.status().ToString());
-
-    auto sink_result = arrow::io::FileOutputStream::Open(path);
-    if (!sink_result.ok())
-        throw std::runtime_error("chunk_to_parquet: cannot open output: " +
-                                 sink_result.status().ToString());
-
-    auto status = parquet::arrow::WriteTable(
-        **table_result, arrow::default_memory_pool(), *sink_result, /*chunk_size=*/1024);
-    if (!status.ok())
-        throw std::runtime_error("chunk_to_parquet: WriteTable failed: " + status.ToString());
-
-    if (!(*sink_result)->Close().ok())
-        throw std::runtime_error("chunk_to_parquet: Close failed");
-}
-
-void chunk_to_parquet(const std::pmr::vector<components::vector::data_chunk_t>& chunks,
-                      const std::string& path) {
+core::result_wrapper_t<bool> chunk_to_parquet(std::pmr::memory_resource* res,
+                                              const std::pmr::vector<components::vector::data_chunk_t>& chunks,
+                                              const std::string& path) {
+    OTX_ZONE_N("tsl::chunk_to_parquet");
+    // Arrow's table API takes a std::vector of batches.
     std::vector<std::shared_ptr<arrow::RecordBatch>> batches;
     batches.reserve(chunks.size());
-    for (const auto& chunk : chunks)
-        batches.push_back(chunk_to_record_batch(chunk));
+    for (const auto& chunk : chunks) {
+        auto batch = chunk_to_record_batch(res, chunk);
+        if (batch.has_error()) {
+            return batch.convert_error<bool>();
+        }
+        batches.push_back(std::move(batch.value()));
+    }
 
     auto table_result = arrow::Table::FromRecordBatches(batches);
-    if (!table_result.ok())
-        throw std::runtime_error("chunk_to_parquet: FromRecordBatches failed: " +
-                                 table_result.status().ToString());
+    if (!table_result.ok()) {
+        return arrow_error(res, core::error_code_t::conversion_failure,
+                           "chunk_to_parquet: FromRecordBatches failed", table_result.status());
+    }
 
     auto sink_result = arrow::io::FileOutputStream::Open(path);
-    if (!sink_result.ok())
-        throw std::runtime_error("chunk_to_parquet: cannot open output: " +
-                                 sink_result.status().ToString());
+    if (!sink_result.ok()) {
+        return arrow_error(res, core::error_code_t::io_error,
+                           "chunk_to_parquet: cannot open output", sink_result.status());
+    }
 
     auto status = parquet::arrow::WriteTable(
         **table_result, arrow::default_memory_pool(), *sink_result, /*chunk_size=*/1024);
-    if (!status.ok())
-        throw std::runtime_error("chunk_to_parquet: WriteTable failed: " + status.ToString());
+    if (!status.ok()) {
+        return arrow_error(res, core::error_code_t::io_error, "chunk_to_parquet: WriteTable failed", status);
+    }
 
-    if (!(*sink_result)->Close().ok())
-        throw std::runtime_error("chunk_to_parquet: Close failed");
+    if (auto closed = (*sink_result)->Close(); !closed.ok()) {
+        return arrow_error(res, core::error_code_t::io_error, "chunk_to_parquet: Close failed", closed);
+    }
+    return true;
 }
 
 } // namespace tsl

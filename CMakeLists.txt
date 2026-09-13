@@ -1,4 +1,5 @@
-cmake_minimum_required(VERSION 3.15)
+# 3.24: $<LINK_GROUP:RESCAN> (internal static libs below) is not available earlier.
+cmake_minimum_required(VERSION 3.24)
 project(otterstax)
 
 set(CMAKE_POLICY_DEFAULT_CMP0167 NEW)
@@ -61,8 +62,11 @@ if (ENABLE_ASAN)
     # non-ASAN engine .so disagree on the class layout (size skew → corrupted
     # `this` crashes at runtime). The macro is informational only — undefining
     # it does NOT disable instrumentation, it just makes our TUs see the same
-    # layout as the engine. Remove once the engine stops keying public ABI off
-    # consumer sanitizer macros.
+    # layout as the engine. This holds only while the engine package itself is
+    # built without ASAN (the Conan packages are): an ASAN-built engine takes the
+    # other branch and this undefine would skew the layout instead of fixing it.
+    # Remove once the engine stops keying public ABI off consumer sanitizer
+    # macros.
     add_compile_options(-U__SANITIZE_ADDRESS__)
 endif()
 
@@ -126,7 +130,6 @@ add_subdirectory(scheduler)
 set(${PROJECT_NAME}_HEADERS
 
         utility/timer.hpp
-        utility/cv_wrapper.hpp
         utility/tsan_helper.hpp
         utility/tracy_profiler.hpp
         utility/tracy_memory_resource.hpp
@@ -168,14 +171,6 @@ endif()
 
 target_link_libraries(
     lib_${PROJECT_NAME} INTERFACE
-    # These internal static libs cross-reference each other (e.g. scheduler uses
-    # integration handlers while integration/otterbrix_local use scheduler's
-    # schema_utils), so a single left-to-right link pass can miss objects only
-    # one of them pulls (e.g. integration/s3/s3_manager.o, referenced solely by
-    # the Scheduler). RESCAN groups them (--start-group/--end-group) so the
-    # linker re-pulls until the cycle is fully resolved. Apple's ld has no
-    # LINK_GROUP generator expression, so OTTERSTAX_LINK_GROUP degrades to the
-    # plain library list there.
     ${OTTERSTAX_LINK_GROUP}
     config::config
     arrow::arrow

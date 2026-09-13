@@ -5,6 +5,7 @@ import mysql.connector
 import pymysql
 import sys
 import json
+import struct
 import argparse
 from contextlib import contextmanager
 
@@ -142,6 +143,111 @@ class client:
 
             self.assert_floating_equal(upd, -29.999999)
 
+    def test_float_column_reads_back_the_stored_value(self):
+        """A FLOAT column comes back as the float32 the backend holds, not a rounding of it.
+
+        MariaDB stores 64647.54 as the nearest float32, 64647.5390625. Its text
+        protocol renders a FLOAT column with six significant digits ("64647.5"),
+        so a connector reading rows over COM_QUERY hands back a value 0.04 off
+        the stored one while SUM() over the same column is exact — the
+        inconsistency test_crud_queries trips over. The connector must read
+        the rows over the binary protocol, where the float travels as its four
+        bytes.
+        """
+        table = f"{self.test_database}.{self.test_table}"
+        stored = struct.unpack('f', struct.pack('f', 64647.54))[0]
+
+        with self.mysql_connector_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(f"insert into {table} (_id, campaign_name, campaign_length, budget) values (%s, %s, %s, %s)",
+                           (gen_id(100), 'Campaign Float Exact', 1, 64647.54))
+            cursor.execute(f"select budget from {table} where _id = %s", (gen_id(100),))
+            self.assert_floating_equal(cursor.fetchall()[0][0], stored, msg="FLOAT column read back rounded")
+            cursor.execute(f"delete from {table} where _id = %s", (gen_id(100),))
+
+    def test_remote_dml_row_counts(self):
+        """A REMOTE DML must report the rows the backend touched.
+
+        boost.mysql carries the count in the statement's OK packet, not in the
+        result set; nothing read it, so every remote INSERT/UPDATE/DELETE came
+        back as 0 affected rows over the MySQL wire while really having changed
+        the backend. Both drivers are checked: mysql-connector-python and
+        PyMySQL read `rowcount` from the same OK packet but frame their packets
+        differently.
+        """
+        table = f"{self.test_database}.{self.test_table}"
+
+        with self.pymysql_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                f"insert into {table} (_id, campaign_name, campaign_length, budget) values "
+                f"('{gen_id(90)}', 'Counted Alpha', 7, 11.0), "
+                f"('{gen_id(91)}', 'Counted Beta', 7, 12.0)")
+            self.assert_equal(cursor.rowcount, 2, "remote INSERT affected rows (PyMySQL)")
+
+            cursor.execute(f"update {table} set budget = 13.0 where campaign_length = 7")
+            self.assert_equal(cursor.rowcount, 2, "remote UPDATE affected rows (PyMySQL)")
+
+            cursor.execute(f"delete from {table} where _id = '{gen_id(91)}'")
+            self.assert_equal(cursor.rowcount, 1, "remote DELETE affected rows (PyMySQL)")
+
+            # Matching nothing must report 0 — the count is read, not invented.
+            cursor.execute(f"delete from {table} where campaign_length = 4242")
+            self.assert_equal(cursor.rowcount, 0, "remote DELETE matching nothing (PyMySQL)")
+
+        with self.mysql_connector_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                f"insert into {table} (_id, campaign_name, campaign_length, budget) values "
+                f"('{gen_id(92)}', 'Counted Gamma', 8, 14.0)")
+            self.assert_equal(cursor.rowcount, 1, "remote INSERT affected rows (mysql-connector)")
+
+            cursor.execute(f"delete from {table} where campaign_length in (7, 8)")
+            self.assert_equal(cursor.rowcount, 2, "remote DELETE affected rows (mysql-connector)")
+
+    def test_remote_dml_row_counts_span_chunks(self):
+        """A remote UPDATE/DELETE over 2000 rows reports 2000, not a chunk's worth.
+
+        The affected count crosses the actor graph in a payload whose size IS
+        the count, and the engine caps a chunk at 1024 rows — a carrier clamped
+        to one chunk reports 1024 (or breaks) for anything larger. COM_QUERY and
+        COM_STMT_EXECUTE both read the count off the same OK packet.
+        """
+        table = f"{self.test_database}.{self.test_table}"
+        bulk_rows = 2000
+        batch = 1000
+        first = 10000
+        bulk_length = 4242          # no other row uses this campaign_length
+
+        with self.pymysql_connection() as conn:                 # COM_QUERY
+            cursor = conn.cursor()
+            for start in range(0, bulk_rows, batch):
+                values = ", ".join(
+                    f"('{gen_id(first + i)}', 'Bulk {i}', {bulk_length}, {float(i)})"
+                    for i in range(start, start + batch))
+                cursor.execute(f"insert into {table} (_id, campaign_name, campaign_length, budget) values {values}")
+                self.assert_equal(cursor.rowcount, batch, f"bulk remote INSERT batch at {start}")
+
+            cursor.execute(f"select count(_id) from {table} where campaign_length = {bulk_length}")
+            self.assert_equal(int(cursor.fetchall()[0][0]), bulk_rows, "bulk rows must be on the backend")
+
+            # MariaDB counts the rows an UPDATE changed, not the rows it matched
+            # (CLIENT_FOUND_ROWS is not requested), so the new value must be one
+            # no bulk row holds — the bulk budgets are 0.0 .. 1999.0.
+            cursor.execute(f"update {table} set budget = -1.0 where campaign_length = {bulk_length}")
+            self.assert_equal(cursor.rowcount, bulk_rows, "COM_QUERY remote UPDATE over 2000 rows")
+
+        with self.mysql_connector_connection() as conn:         # COM_STMT_EXECUTE
+            cursor = conn.cursor(prepared=True)
+            cursor.execute(f"update {table} set budget = ? where campaign_length = ?", (-2.0, bulk_length))
+            self.assert_equal(cursor.rowcount, bulk_rows, "COM_STMT_EXECUTE remote UPDATE over 2000 rows")
+
+            cursor.execute(f"delete from {table} where campaign_length = ?", (bulk_length,))
+            self.assert_equal(cursor.rowcount, bulk_rows, "COM_STMT_EXECUTE remote DELETE over 2000 rows")
+
+            cursor.execute(f"select count(_id) from {table} where campaign_length = ?", (bulk_length,))
+            self.assert_equal(int(cursor.fetchall()[0][0]), 0, "every bulk row must be gone")
+
     def test_character_encoding(self):
         with self.pymysql_connection() as conn:
             cursor = conn.cursor()
@@ -206,18 +312,25 @@ class client:
 
                 update_query = f"update {self.test_database}.{self.test_table} set budget = ? where _id = ?"
                 cursor.execute(update_query, (budget + 100.5, gen_id(10)))
+                # COM_STMT_EXECUTE answers a DML with an OK packet; its
+                # affected_rows must be the backend's count, not 0.
+                self.assert_equal(cursor.rowcount, 1, "COM_STMT_EXECUTE remote UPDATE affected rows")
                 cursor.execute(query, (gen_id(10),))
                 self.assert_floating_equal(cursor.fetchall()[0][0], budget + 100.5, msg="budget should increase by 100.5")
 
                 insert_query = f"insert into {self.test_database}.{self.test_table}(_id, campaign_name, campaign_length, budget) values (?, ?, ?, ?)"
                 new_id = gen_id(99)
                 cursor.execute(insert_query, (new_id, "Campaign Agree Recently", 40, budget + 100.5))
+                self.assert_equal(cursor.rowcount, 1, "COM_STMT_EXECUTE remote INSERT affected rows")
 
                 cursor.execute(f"select campaign_name from {self.test_database}.{self.test_table} where _id = ?", (new_id,))
                 self.assert_equal(cursor.fetchall()[0][0], "Campaign Agree Recently", "Inserted name mismatch")
-                
+
                 delete_query = f"delete from {self.test_database}.{self.test_table} where _id = ?"
                 cursor.execute(delete_query, (new_id,))
+                self.assert_equal(cursor.rowcount, 1, "COM_STMT_EXECUTE remote DELETE affected rows")
+                cursor.execute(delete_query, (new_id,))
+                self.assert_equal(cursor.rowcount, 0, "COM_STMT_EXECUTE remote DELETE matching nothing")
                 cursor.execute(f"select count(_id) as cnt from {self.test_database}.{self.test_table} where _id = ?", (new_id,))
                 self.assert_equal(cursor.fetchall()[0][0], 0, "Row was not deleted")
                 
@@ -230,6 +343,45 @@ class client:
 
         except Exception as e:
             raise ValueError("Prepared queries threw something: " + str(e))
+
+    def test_backend_error_carries_server_message(self):
+        """A statement MariaDB refuses surfaces MariaDB's verdict, not a transport error.
+
+        DROP TABLE needs no registered schema, so the statement reaches the
+        backend untouched and MariaDB answers 1051 "Unknown table". The
+        connector keeps that server message and classifies the code from the
+        server's error (table_not_exists, never io_error / other_error); on the
+        wire the text is what proves the verdict came from the server, since a
+        transport failure carries "connect failed" instead. COM_STMT_EXECUTE
+        takes the same path twice: a statement that failed once is prepared
+        again transparently, so the second run reports the backend again and
+        never the Worker's re-prepare demand.
+        """
+        missing = f"{self.test_database}.no_such_table_{gen_id(404)}"
+
+        def refused(cursor):
+            try:
+                cursor.execute(f"drop table {missing}")
+            except mysql.connector.Error as e:
+                return str(e)
+            raise AssertionError("DROP TABLE of a table the backend does not have must fail")
+
+        with self.mysql_connector_connection() as conn:
+            message = refused(conn.cursor())
+            assert "Unknown table" in message, f"MariaDB's verdict is missing from: {message}"
+            assert "no_such_table" in message, f"the refused table is not named in: {message}"
+            assert "connect failed" not in message, f"a transport error was reported instead: {message}"
+
+            # The connection is still usable after the backend refused a statement.
+            cursor = conn.cursor()
+            cursor.execute(f"select count(_id) as cnt from {self.test_database}.{self.test_table}")
+            cursor.fetchall()
+
+            prepared = conn.cursor(prepared=True)
+            for attempt in (1, 2):
+                message = refused(prepared)
+                assert "Unknown table" in message, f"COM_STMT_EXECUTE attempt {attempt}: {message}"
+                assert "re-prepared" not in message, f"re-prepare leaked to the client on attempt {attempt}: {message}"
 
     def cleanup_test_data(self):
         try:
@@ -247,13 +399,20 @@ class client:
         try:
             self.test_basic_connection()
             self.test_crud_queries()
+            self.test_float_column_reads_back_the_stored_value()
+            self.test_remote_dml_row_counts()
+            self.test_remote_dml_row_counts_span_chunks()
             self.test_character_encoding()
             self.test_protocol_capability_flags()
             self.test_prepared_queries()
+            self.test_backend_error_carries_server_message()
             print("\033[92mTest success.\033[0m")
         except Exception as e:
             print(f"\033[91mAn error occurred: {e}\033[0m")
             print("\033[91mTest fails.\033[0m")
+            # Without this the banner lies: main_test() still returns 0 and CI stays
+            # green while every assertion in this file is effectively decorative.
+            raise
         finally:
             self.cleanup_test_data()
             print("Test completed.")

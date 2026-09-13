@@ -7,11 +7,16 @@
 
 #include <components/logical_plan/node_aggregate.hpp>
 #include <iostream>
+#include <memory_resource>
 
 using namespace components;
 
 TEST_CASE("cross-backend GROUP BY downstream calls") {
-    auto* resource = std::pmr::get_default_resource();
+    // Scoped arena, declared first so it outlives every object below. No engine
+    // runs in this case — only the parser, generator and schema helpers — so
+    // everything allocates from the test thread.
+    std::pmr::synchronized_pool_resource case_arena(std::pmr::new_delete_resource());
+    auto* resource = &case_arena;
     GreenplumParser parser(resource);
     const char* sql = R"(
         SELECT c.campaign_name,
@@ -55,8 +60,10 @@ TEST_CASE("cross-backend GROUP BY downstream calls") {
                                              &data->otterbrix_params->params_node->parameters(),
                                              backend_type_t::MySQL,
                                              target,
-                                             nodes[b]);
-            std::cout << "  SQL: " << q << "\n";
+                                             nodes[b],
+                                             resource);
+            REQUIRE_FALSE(q.has_error());
+            std::cout << "  SQL: " << q.value() << "\n";
             std::cout << "  calling aggregate_filter_schema...\n";
             auto initial_schema =
                 schema_utils::aggregate_filter_schema(agg, data->otterbrix_params->params_node.get(), schema_types);
@@ -80,7 +87,11 @@ TEST_CASE("cross-backend GROUP BY downstream calls") {
 // dereferences null when the GROUP BY key is a table-qualified STRING column
 // over raw node_data chunks (key extraction yields NA -> NA-typed result
 TEST_CASE("mixed plan with node_data executes in engine", "[engine-group-by-string]") {
-    auto* resource = std::pmr::get_default_resource();
+    // Scoped arena, declared first so it outlives every object below
+    // (engine included). Synchronized: the engine dispatcher may allocate
+    // from it off the test thread.
+    std::pmr::synchronized_pool_resource case_arena;
+    auto* resource = &case_arena;
     GreenplumParser parser(resource);
     const char* sql = R"(
         SELECT c.campaign_name,
@@ -152,7 +163,11 @@ TEST_CASE("mixed plan with node_data executes in engine", "[engine-group-by-stri
 }
 
 static void run_mixed_variant(const char* tag, const char* sql, bool string_names, bool double_price) {
-    auto* resource = std::pmr::get_default_resource();
+    // Scoped arena, declared first so it outlives every object below
+    // (engine included). Synchronized: the engine dispatcher may allocate
+    // from it off the test thread.
+    std::pmr::synchronized_pool_resource case_arena;
+    auto* resource = &case_arena;
     GreenplumParser parser(resource);
     auto result = parser.parse(sql);
     REQUIRE_FALSE(result.has_error());
@@ -232,7 +247,11 @@ TEST_CASE("mixed plan group by string key", "[engine-group-by-string]") {
 #include <components/sql/transformer/utils.hpp>
 
 TEST_CASE("pure engine: group by string key over node_data", "[engine-group-by-string]") {
-    auto* resource = std::pmr::get_default_resource();
+    // Scoped arena, declared first so it outlives every object below
+    // (engine included). Synchronized: the engine dispatcher may allocate
+    // from it off the test thread.
+    std::pmr::synchronized_pool_resource case_arena;
+    auto* resource = &case_arena;
 
     const char* sql = R"(
         SELECT c.campaign_name, COUNT(p.product_id) as product_count, AVG(p.price) as avg_product_price
@@ -327,4 +346,131 @@ TEST_CASE("pure engine: group by string key over node_data", "[engine-group-by-s
         components::logical_plan::execution_plan_t{resource, root, binder.params_ptr()});
     std::cout << "pure engine execute: err=" << (cursor ? cursor->is_error() : true) << "\n";
     REQUIRE(cursor);
+}
+
+// Engine defect D1: a backend slice (node_raw_data, exactly what a
+// ConnectorManager substitutes) JOINed against a LOCAL table on a struct-field
+// key, with a WHERE predicate on the local side that leaves no rows, hands
+// operator_join_t::build_layout_ zero build chunks and it dereferences null.
+// Without the predicate an empty table scans as one empty chunk; with a plain
+// column as the key the same predicate is survived. Pure engine — no live
+// backend. The demo's step_4 is this shape.
+//
+// Four separate TEST_CASEs, not SECTIONs: a SIGSEGV aborts the process, and
+// each variant must be attributable on its own.
+#include <filesystem>
+
+namespace {
+
+    // The customers slice a PostgreSQL backend returns: Ann in Berlin, Bob in Tel Aviv.
+    components::vector::data_chunk_t make_customers_slice(std::pmr::memory_resource* resource) {
+        std::pmr::vector<components::types::complex_logical_type> cols(resource);
+        for (const char* n : {"name", "addr_city"}) {
+            cols.emplace_back(components::types::logical_type::STRING_LITERAL);
+            cols.back().set_alias(n);
+        }
+        components::vector::data_chunk_t chunk(resource, cols, 2);
+        chunk.set_value(0, 0, components::types::logical_value_t(resource, std::string("Ann")));
+        chunk.set_value(1, 0, components::types::logical_value_t(resource, std::string("Berlin")));
+        chunk.set_value(0, 1, components::types::logical_value_t(resource, std::string("Bob")));
+        chunk.set_value(1, 1, components::types::logical_value_t(resource, std::string("Tel Aviv")));
+        chunk.set_cardinality(2);
+        return chunk;
+    }
+
+    // Local otter.warehouses in the demo's step_3a shape (ENUM + two composites +
+    // bigints); `seed_rows` adds the single warehouse BER-1 located in Berlin.
+    // The external slot is replaced by the customers slice and the plan runs in
+    // the engine; a correct engine returns `expected_rows` without an error.
+    void run_backend_join_over_local_composite(const char* tag, const char* sql, bool seed_rows, size_t expected_rows) {
+        // Scoped arena, declared first so it outlives every object below
+        // (engine included). Synchronized: the engine dispatcher may allocate
+        // from it off the test thread.
+        std::pmr::synchronized_pool_resource case_arena(std::pmr::new_delete_resource());
+        auto* resource = &case_arena;
+
+        // Engine state persists across runs: start from an empty data_dir.
+        const std::string data_dir = std::string("/tmp/otterstax_join_d1_") + tag;
+        std::filesystem::remove_all(data_dir);
+        auto cfg = make_create_config(data_dir);
+        auto inst = db::make_otterbrix_engine(cfg);
+        auto manager = make_otterbrix_manager(inst);
+
+        for (const char* ddl : {"CREATE DATABASE otter;",
+                                "CREATE TYPE tier_t AS ENUM('bronze','silver','gold');",
+                                "CREATE TYPE address_t AS (city STRING, country STRING, zip STRING);",
+                                "CREATE TYPE spec_t AS (weight_1 INT, weight_2 INT, weight_3 INT, weight_4 INT, "
+                                "weight_5 INT, weight_6 INT, primary_barcode STRING, secondary_barcode STRING, "
+                                "photo STRING);",
+                                "CREATE TABLE otter.warehouses (warehouse_id STRING, code STRING, tier tier_t, "
+                                "location address_t, spec spec_t, priority_high BIGINT, priority_med BIGINT, "
+                                "priority_low BIGINT);"}) {
+            auto c = manager->execute_sql(ddl);
+            REQUIRE(c);
+            INFO("ddl: " << ddl << " err: " << (c->is_error() ? c->get_error().what.c_str() : ""));
+            REQUIRE_FALSE(c->is_error());
+        }
+        if (seed_rows) {
+            auto c = manager->execute_sql(
+                "INSERT INTO otter.warehouses (warehouse_id, code, tier, location, priority_high) VALUES "
+                "('w-1', 'BER-1', 'silver', ROW('Berlin','DE','10115'), 1);");
+            REQUIRE(c);
+            INFO("seed err: " << (c->is_error() ? c->get_error().what.c_str() : ""));
+            REQUIRE_FALSE(c->is_error());
+        }
+
+        GreenplumParser parser(resource);
+        auto parsed = parser.parse(sql);
+        REQUIRE_FALSE(parsed.has_error());
+        auto data = std::move(parsed.value());
+
+        auto& nodes = data->otterbrix_params->external_nodes;
+        size_t substituted = 0;
+        for (auto& batch : nodes) {
+            for (auto& entry : batch) {
+                *entry.node = components::logical_plan::make_node_raw_data(resource, make_customers_slice(resource));
+                ++substituted;
+            }
+        }
+        REQUIRE(substituted == 1);
+
+        auto cursor = manager->execute_plan(data->otterbrix_params);
+        REQUIRE(cursor);
+        INFO("join err: " << (cursor->is_error() ? cursor->get_error().what.c_str() : ""));
+        REQUIRE_FALSE(cursor->is_error());
+        REQUIRE(cursor->size() == expected_rows);
+    }
+
+    // Struct field access on the JOIN key and the demo's local-side predicate (step_4).
+    constexpr const char* k_d1_join_struct_key = "SELECT c.name, w.code FROM pg.shop.public.customers c "
+                                                 "INNER JOIN otter.warehouses w ON c.addr_city = (w.location).city "
+                                                 "WHERE (w.location).country IN ('DE','IL','US');";
+    // Plain column on the JOIN key; the same build side and predicate, no struct access in the key.
+    constexpr const char* k_d1_join_plain_key = "SELECT c.name, w.code FROM pg.shop.public.customers c "
+                                                "INNER JOIN otter.warehouses w ON c.addr_city = w.code "
+                                                "WHERE (w.location).country IN ('DE','IL','US');";
+
+} // namespace
+
+// No warehouse: the predicate leaves the build side with zero chunks.
+TEST_CASE("D1: backend slice JOIN local composite table on struct key over empty local table",
+          "[engine-defect-d1]") {
+    run_backend_join_over_local_composite("struct_empty", k_d1_join_struct_key, false, 0);
+}
+
+// BER-1 is located in Berlin, DE: Ann matches, Bob does not.
+TEST_CASE("D1: backend slice JOIN local composite table on struct key over seeded local table",
+          "[engine-defect-d1]") {
+    run_backend_join_over_local_composite("struct_seeded", k_d1_join_struct_key, true, 1);
+}
+
+TEST_CASE("D1: backend slice JOIN local composite table on plain key over empty local table",
+          "[engine-defect-d1]") {
+    run_backend_join_over_local_composite("plain_empty", k_d1_join_plain_key, false, 0);
+}
+
+// The code 'BER-1' is no customer's city: the JOIN runs to completion with no match.
+TEST_CASE("D1: backend slice JOIN local composite table on plain key over seeded local table",
+          "[engine-defect-d1]") {
+    run_backend_join_over_local_composite("plain_seeded", k_d1_join_plain_key, true, 0);
 }

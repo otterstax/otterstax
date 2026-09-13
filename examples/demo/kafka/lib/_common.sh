@@ -9,7 +9,8 @@
 #                                      -v broker=<SQL_BROKER> for CREATE SOURCE/STREAM
 #   wait_rows <table_expr> <n> [s]   — poll SELECT count(*) FROM <table_expr> until >= n
 #   seed  --topic T [--fixture F] [--reset]   — (re)create a topic + produce a fixture
-#   consume --topic T [--timeout S]           — drain a topic to stdout
+#   topic_hwm <T>                    — records currently in a topic (0 when absent)
+#   consume --topic T [--timeout S] [--min N]  — wait for >=N records, then drain
 #
 # Every helper that can fail prints a red ❌ line on stderr and returns non-zero.
 # A step's run.sh stops on the first failure (`helper … || exit $?`) and
@@ -255,30 +256,50 @@ seed() {
     fi
 }
 
-# consume --topic <T> [--timeout <S>]
-# Streams the topic from the start for S seconds; the consumer never exits on
-# its own, so reaching the timeout is the normal end. Returns 1 when rpk fails
-# before that (no container, unknown topic) or when no record arrived.
+# topic_hwm <T> — sum of the high-watermarks across a topic's partitions (the
+# number of records currently in the topic). Empty/absent topic → 0.
+topic_hwm() {
+    _rpk topic describe "$1" -p 2>/dev/null \
+        | awk '$1 ~ /^[0-9]+$/ { sum += $NF } END { print sum + 0 }'
+}
+
+# consume --topic <T> [--timeout <S>] [--min <N>]
+# The STREAM / fan-in workers produce asynchronously, so first WAIT (up to
+# --timeout) until the topic holds at least --min records (default 1), then drain
+# the backlog with `-o :end` — which reads up to the current high-watermark and
+# exits cleanly. A plain `-o start` bounded by an external timeout gets SIGTERM'd,
+# and rpk's block-buffered stdout is DISCARDED on the kill, which printed nothing
+# even when records existed.
+# Returns 1 when rpk fails (no container, unknown topic) or when the topic never
+# reached --min records within the timeout.
 consume() {
-    local topic="" timeout_s=12
+    local topic="" timeout_s=12 min=1
     while [ $# -gt 0 ]; do
         case "$1" in
             --topic)   topic="$2"; shift 2 ;;
             --timeout) timeout_s="$2"; shift 2 ;;
+            --min)     min="$2"; shift 2 ;;
             *) shift ;;
         esac
     done
     [ -z "${topic}" ] && { fail "consume: --topic required"; return 1; }
-    echo "${CYAN}    consume ${topic}  (up to ${timeout_s}s)${RESET}"
+
+    local deadline=$(( $(date +%s) + timeout_s )) hwm=0
+    while [ "$(date +%s)" -lt "${deadline}" ]; do
+        hwm="$(topic_hwm "${topic}")"
+        [ "${hwm:-0}" -ge "${min}" ] 2>/dev/null && break
+        sleep 1
+    done
+    echo "${CYAN}    consume ${topic}  (${hwm:-0} record(s))${RESET}"
+
     local outf errf rc n
     outf="$(mktemp)"
     errf="$(mktemp)"
-    # -o start = from the beginning; the timeout bounds the stream for the demo.
-    _with_timeout "${timeout_s}" ${_DOCKER} exec "${KAFKA_CONTAINER}" \
-        rpk topic consume "${topic}" -o start -f '%v\n' 2>"${errf}" | tee "${outf}"
+    # -o :end = from the start up to the current high-watermark, then exit.
+    _rpk topic consume "${topic}" -o ':end' -f '%v\n' 2>"${errf}" | tee "${outf}"
     rc=${PIPESTATUS[0]}
     n="$(grep -c . "${outf}")"
-    if [ "${rc}" -ne 0 ] && [ "${rc}" -ne 124 ]; then
+    if [ "${rc}" -ne 0 ]; then
         fail "consume ${topic}: rpk failed (exit ${rc})"
         _indent "$(cat "${errf}")"
         rm -f "${outf}" "${errf}"
@@ -286,7 +307,7 @@ consume() {
     fi
     rm -f "${outf}" "${errf}"
     if [ "${n}" -eq 0 ]; then
-        fail "consume ${topic}: no record arrived within ${timeout_s}s"
+        fail "consume ${topic}: no record arrived within ${timeout_s}s (needed ≥ ${min})"
         return 1
     fi
     echo "${DIM}    ${n} records read from ${topic}${RESET}"

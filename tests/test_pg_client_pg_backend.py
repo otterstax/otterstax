@@ -157,8 +157,132 @@ class client:
             result = cursor.fetchall()[0][0]
             self.assert_equal(result, 1, msg="Should have 1 Mixed category")
 
+    def test_remote_dml_row_counts(self):
+        """Test 3: a REMOTE DML must report the rows the backend touched.
+
+        The count for a backend statement is not in the result set — libpq puts
+        it in the command tag and boost.mysql in the OK packet. Nothing read it,
+        so every remote INSERT/UPDATE/DELETE came back as 0 rows while really
+        having changed the backend. Asserted on three wire shapes: psycopg2 goes
+        through simple query, psycopg3-with-parameters through Bind/Execute on
+        the unnamed statement, and `prepare=True` through a NAMED statement that
+        is Parsed once and Executed repeatedly (the worker drops a statement
+        after it ran, so every later Execute is a re-prepare).
+        """
+        table = f"{self.test_database}.{self.test_table}"
+
+        with self.psycopg2_connection() as conn:          # simple query protocol
+            cursor = conn.cursor()
+            cursor.execute(
+                f"INSERT INTO {table} (_id, product_name, price, category) VALUES "
+                f"('{gen_id(90)}', 'Counted Alpha', 11.0, 'Counted'), "
+                f"('{gen_id(91)}', 'Counted Beta', 12.0, 'Counted')")
+            self.assert_equal(cursor.rowcount, 2, "simple-protocol remote INSERT row count")
+            self.assert_equal(cursor.statusmessage, "INSERT 0 2", "simple-protocol remote INSERT tag")
+
+            cursor.execute(f"UPDATE {table} SET price = 13.0 WHERE category = 'Counted'")
+            self.assert_equal(cursor.rowcount, 2, "simple-protocol remote UPDATE row count")
+            self.assert_equal(cursor.statusmessage, "UPDATE 2", "simple-protocol remote UPDATE tag")
+
+            cursor.execute(f"DELETE FROM {table} WHERE _id = '{gen_id(91)}'")
+            self.assert_equal(cursor.rowcount, 1, "simple-protocol remote DELETE row count")
+            self.assert_equal(cursor.statusmessage, "DELETE 1", "simple-protocol remote DELETE tag")
+
+            # A statement matching nothing must report 0 — the count is read, not invented.
+            cursor.execute(f"DELETE FROM {table} WHERE category = 'NoSuchCategory'")
+            self.assert_equal(cursor.rowcount, 0, "remote DELETE matching nothing")
+            self.assert_equal(cursor.statusmessage, "DELETE 0", "remote DELETE matching nothing tag")
+
+        with self.psycopg3_connection(prepare=False) as conn:   # extended protocol
+            cursor = conn.cursor()
+            cursor.execute(
+                f"INSERT INTO {table} (_id, product_name, price, category) VALUES (%s, %s, %s, %s)",
+                (gen_id(92), 'Counted Gamma', 14.0, 'Counted3'))
+            self.assert_equal(cursor.rowcount, 1, "extended-protocol remote INSERT row count")
+            self.assert_equal(cursor.statusmessage, "INSERT 0 1", "extended-protocol remote INSERT tag")
+
+            cursor.execute(f"UPDATE {table} SET price = %s WHERE _id = %s", (15.0, gen_id(92)))
+            self.assert_equal(cursor.rowcount, 1, "extended-protocol remote UPDATE row count")
+            self.assert_equal(cursor.statusmessage, "UPDATE 1", "extended-protocol remote UPDATE tag")
+
+            cursor.execute(f"DELETE FROM {table} WHERE _id = %s", (gen_id(92),))
+            self.assert_equal(cursor.rowcount, 1, "extended-protocol remote DELETE row count")
+            self.assert_equal(cursor.statusmessage, "DELETE 1", "extended-protocol remote DELETE tag")
+
+        with self.psycopg3_connection(prepare=True) as conn:    # named statements
+            cursor = conn.cursor()
+            insert = f"INSERT INTO {table} (_id, product_name, price, category) VALUES (%s, %s, %s, %s)"
+            cursor.execute(insert, (gen_id(93), 'Counted Delta', 16.0, 'Counted'), prepare=True)
+            self.assert_equal(cursor.rowcount, 1, "named-statement remote INSERT row count")
+            self.assert_equal(cursor.statusmessage, "INSERT 0 1", "named-statement remote INSERT tag")
+            cursor.execute(insert, (gen_id(94), 'Counted Epsilon', 17.0, 'Counted'), prepare=True)
+            self.assert_equal(cursor.rowcount, 1, "named-statement remote INSERT row count (re-executed)")
+
+            update = f"UPDATE {table} SET price = %s WHERE _id = %s"
+            cursor.execute(update, (18.0, gen_id(93)), prepare=True)
+            self.assert_equal(cursor.rowcount, 1, "named-statement remote UPDATE row count")
+            self.assert_equal(cursor.statusmessage, "UPDATE 1", "named-statement remote UPDATE tag")
+            cursor.execute(update, (19.0, gen_id(94)), prepare=True)
+            self.assert_equal(cursor.rowcount, 1, "named-statement remote UPDATE row count (re-executed)")
+
+            delete = f"DELETE FROM {table} WHERE _id = %s"
+            cursor.execute(delete, (gen_id(93),), prepare=True)
+            self.assert_equal(cursor.rowcount, 1, "named-statement remote DELETE row count")
+            self.assert_equal(cursor.statusmessage, "DELETE 1", "named-statement remote DELETE tag")
+            cursor.execute(delete, (gen_id(94),), prepare=True)
+            self.assert_equal(cursor.rowcount, 1, "named-statement remote DELETE row count (re-executed)")
+            cursor.execute(delete, (gen_id(94),), prepare=True)
+            self.assert_equal(cursor.rowcount, 0, "named-statement remote DELETE matching nothing")
+
+        # Leave the table as test_crud_queries left it.
+        with self.psycopg2_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(f"DELETE FROM {table} WHERE category = 'Counted'")
+            self.assert_equal(cursor.rowcount, 1, "the one remaining Counted row")
+
+    def test_remote_dml_row_counts_span_chunks(self):
+        """Test 4: a remote UPDATE/DELETE over 2000 rows reports 2000, not a chunk's worth.
+
+        The affected count crosses the actor graph in a payload whose size IS
+        the count, and the engine caps a chunk at 1024 rows — a carrier clamped
+        to one chunk reports 1024 (or breaks) for anything larger.
+        """
+        table = f"{self.test_database}.{self.test_table}"
+        bulk_rows = 2000
+        batch = 1000
+        first = 10000
+
+        with self.psycopg2_connection() as conn:          # simple query protocol
+            cursor = conn.cursor()
+            for start in range(0, bulk_rows, batch):
+                values = ", ".join(
+                    f"('{gen_id(first + i)}', 'Bulk {i}', {float(i)}, 'Bulk')"
+                    for i in range(start, start + batch))
+                cursor.execute(f"INSERT INTO {table} (_id, product_name, price, category) VALUES {values}")
+                self.assert_equal(cursor.rowcount, batch, f"bulk remote INSERT batch at {start}")
+
+            cursor.execute(f"SELECT COUNT(_id) FROM {table} WHERE category = 'Bulk'")
+            self.assert_equal(cursor.fetchall()[0][0], bulk_rows, "bulk rows must be on the backend")
+
+            cursor.execute(f"UPDATE {table} SET price = 1.0 WHERE category = 'Bulk'")
+            self.assert_equal(cursor.rowcount, bulk_rows, "simple-protocol remote UPDATE over 2000 rows")
+            self.assert_equal(cursor.statusmessage, f"UPDATE {bulk_rows}", "remote UPDATE tag over 2000 rows")
+
+        with self.psycopg3_connection(prepare=False) as conn:   # extended protocol
+            cursor = conn.cursor()
+            cursor.execute(f"UPDATE {table} SET price = %s WHERE category = %s", (2.0, 'Bulk'))
+            self.assert_equal(cursor.rowcount, bulk_rows, "extended-protocol remote UPDATE over 2000 rows")
+            self.assert_equal(cursor.statusmessage, f"UPDATE {bulk_rows}", "remote UPDATE tag over 2000 rows")
+
+            cursor.execute(f"DELETE FROM {table} WHERE category = %s", ('Bulk',))
+            self.assert_equal(cursor.rowcount, bulk_rows, "extended-protocol remote DELETE over 2000 rows")
+            self.assert_equal(cursor.statusmessage, f"DELETE {bulk_rows}", "remote DELETE tag over 2000 rows")
+
+            cursor.execute(f"SELECT COUNT(_id) FROM {table} WHERE category = %s", ('Bulk',))
+            self.assert_equal(cursor.fetchall()[0][0], 0, "every bulk row must be gone")
+
     def test_character_encoding(self):
-        """Test 3: Character encoding with psycopg2"""
+        """Test 5: Character encoding with psycopg2"""
         with self.psycopg2_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
@@ -194,7 +318,7 @@ class client:
                 print(string[0])
 
     def test_protocol_capability_flags(self):
-        """Test 4: Protocol capability flags with psycopg v3"""
+        """Test 6: Protocol capability flags with psycopg v3"""
         with self.psycopg3_connection(False) as conn:
             connection_info = {
                 "server_version": conn.info.server_version,
@@ -211,7 +335,7 @@ class client:
                 raise ValueError("Failed to get encoding")
 
     def test_prepared_queries_psycopg3(self):
-        """Test 6: Prepared statements with psycopg v3 using %s placeholders"""
+        """Test 7: Prepared statements with psycopg v3 using %s placeholders"""
         try:
             with self.psycopg3_connection(True) as conn:
                 query = f"SELECT price FROM {self.test_database}.{self.test_table} WHERE _id = %s"
@@ -253,6 +377,8 @@ class client:
         try:
             self.test_basic_connection()
             self.test_crud_queries()
+            self.test_remote_dml_row_counts()
+            self.test_remote_dml_row_counts_span_chunks()
             self.test_character_encoding()
             self.test_protocol_capability_flags()
             self.test_prepared_queries_psycopg3()
@@ -260,6 +386,9 @@ class client:
         except Exception as e:
             print(f"\033[91mAn error occurred: {e}\033[0m")
             print("\033[91mTest fails.\033[0m")
+            # Without this the banner lies: main_test() still returns 0 and CI stays
+            # green while every assertion in this file is effectively decorative.
+            raise
         finally:
             self.cleanup_test_data()
             print("Test completed.")

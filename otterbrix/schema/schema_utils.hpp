@@ -18,6 +18,7 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace schema_utils {
@@ -39,12 +40,18 @@ namespace schema_utils {
                                components::types::complex_logical_type&& schema,
                                components::logical_plan::node_aggregate_t&& agg_node);
 
+        // raw_sql and qualifiers are copied into `resource`.
         schema_node_t(std::pmr::memory_resource* resource,
                       const qualified_name_t& name,
-                      std::string raw_sql,
-                      std::vector<otterstax::parser::qualifier_rewrite_t> qualifiers);
+                      std::string_view raw_sql,
+                      const std::pmr::vector<otterstax::parser::qualifier_rewrite_t>& qualifiers);
 
         const components::types::complex_logical_type& schema() const;
+        // The schema a backend answered for this stub (ClickhouseManager::describe).
+        // Filled in place: a raw-SQL stub must keep the text and qualifiers the
+        // execute path still generates its statement from, so the node is never
+        // rebuilt to carry a schema.
+        void set_schema(components::types::complex_logical_type&& schema);
         const components::logical_plan::node_aggregate_ptr agg_node();
 
         // Qualified name of the external table/subquery this node stands in
@@ -53,8 +60,10 @@ namespace schema_utils {
         const qualified_name_t& name() const noexcept { return name_; }
 
         bool has_raw_sql() const noexcept { return raw_sql_.has_value(); }
-        const std::string& raw_sql() const noexcept { return *raw_sql_; }
-        const std::vector<otterstax::parser::qualifier_rewrite_t>& qualifiers() const noexcept { return qualifiers_; }
+        const std::pmr::string& raw_sql() const noexcept { return *raw_sql_; }
+        const std::pmr::vector<otterstax::parser::qualifier_rewrite_t>& qualifiers() const noexcept {
+            return qualifiers_;
+        }
 
     private:
         components::expressions::hash_t hash_impl() const final;
@@ -63,8 +72,8 @@ namespace schema_utils {
         qualified_name_t name_;
         components::types::complex_logical_type schema_;
         components::logical_plan::node_aggregate_ptr agg_node_;
-        std::optional<std::string> raw_sql_;
-        std::vector<otterstax::parser::qualifier_rewrite_t> qualifiers_;
+        std::optional<std::pmr::string> raw_sql_;
+        std::pmr::vector<otterstax::parser::qualifier_rewrite_t> qualifiers_;
     };
 
     using node_schema_ptr = boost::intrusive_ptr<schema_node_t>;
@@ -75,8 +84,8 @@ namespace schema_utils {
 
     node_schema_ptr make_node_schema_raw(std::pmr::memory_resource* resource,
                                          const qualified_name_t& name,
-                                         std::string raw_sql,
-                                         std::vector<otterstax::parser::qualifier_rewrite_t> qualifiers);
+                                         std::string_view raw_sql,
+                                         const std::pmr::vector<otterstax::parser::qualifier_rewrite_t>& qualifiers);
 
     // in terms of relational algebra - do projection, rename and aggregation of schema
     components::types::complex_logical_type
@@ -96,6 +105,11 @@ namespace schema_utils {
                         components::cursor::cursor_t_ptr catalog,
                         const std::pmr::map<qualified_name_t, size_t>& dependencies);
 
-    components::types::complex_logical_type merge_schemas(const components::types::complex_logical_type& sch1,
-                                                          const components::types::complex_logical_type& sch2);
+    // The two sides of a join as one schema: the left side's columns in their own
+    // order, then the right side's, a name already taken not taken twice. The
+    // order is what a frontend's RowDescription names and a client decodes by, so
+    // the arguments are the two sides as they are — swapping them is a different
+    // answer.
+    components::types::complex_logical_type merge_schemas(const components::types::complex_logical_type& left,
+                                                          const components::types::complex_logical_type& right);
 } // namespace schema_utils

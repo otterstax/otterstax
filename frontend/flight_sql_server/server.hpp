@@ -44,6 +44,14 @@ struct TicketData {
     session_hash_t session_hash;
 };
 
+// Ticket layout: `<sql>:<transaction_id>:<session_hash>`. The SQL text may
+// itself contain ':' (`SELECT 1::int`), so the ticket is split from the END:
+// the last divider bounds the session hash, the one before it the transaction
+// id. Transaction ids are issued by this server only, never by the client, and
+// carry no ':'.
+arrow::Result<arrow::flight::Ticket> EncodeTransactionQuery(TicketData data);
+arrow::Result<TicketData> DecodeTransactionQuery(const std::string& ticket);
+
 class SimpleFlightSQLServer : public arrow::flight::sql::FlightSqlServerBase {
 public:
     explicit SimpleFlightSQLServer(const Config& config);
@@ -62,11 +70,14 @@ public:
     DoGetTables(const arrow::flight::ServerCallContext& context, const arrow::flight::sql::GetTables& command) override;
     arrow::Result<int64_t> DoPutCommandStatementUpdate(const arrow::flight::ServerCallContext& context,
                                                        const arrow::flight::sql::StatementUpdate& command) override;
+    // Resolves the listen location, binds and serves. A host/port the transport
+    // rejects comes back as a Status here instead of aborting in the constructor.
     arrow::Status Start();
 
 private:
     log_t log_;
-    arrow::flight::Location location_;
+    std::string host_;
+    int port_;
     std::pmr::memory_resource* resource_{nullptr};
     actor_zeta::address_t catalog_address_;
     actor_zeta::address_t scheduler_address_;

@@ -9,7 +9,11 @@
 #include <actor-zeta.hpp>
 #include <core/result_wrapper.hpp>
 #include <components/log/log.hpp>
+#include <functional>
+#include <memory_resource>
+#include <mutex>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -21,35 +25,37 @@ public:
     template<typename T>
     using unique_future = actor_zeta::unique_future<T>;
 
-    explicit ConnectorManager(std::pmr::memory_resource* res, const std::string& s3_download_path = "/tmp/otterstax_s3_cache/");
+    // s3_download_path is the staging directory for downloaded objects; it must
+    // not be empty — there is no runtime fallback.
+    explicit ConnectorManager(std::pmr::memory_resource* res,
+                              std::string_view s3_download_path = "/tmp/otterstax_s3_cache/");
 
     std::pmr::memory_resource* resource() const noexcept { return resource_; }
 
     /// Store credentials under params.alias; overwrites if alias already exists.
+    /// Errors: invalid_parameter (empty alias / access_key / secret_key).
     actor_zeta::unique_future<core::result_wrapper_t<bool>>
     add_credentials(session_hash_t id, connect_params params);
 
-    /// Remove credentials stored under alias; errors if alias is unknown.
-    actor_zeta::unique_future<core::result_wrapper_t<bool>>
-    remove_credentials(session_hash_t id, std::string alias);
-
-
     /// List objects under s3_path (non-recursive). s3_path is "bucket/prefix".
-    actor_zeta::unique_future<core::result_wrapper_t<std::vector<std::string>>>
+    /// Errors: do_not_exists (unknown alias), io_error (S3 failure).
+    actor_zeta::unique_future<core::result_wrapper_t<std::pmr::vector<std::pmr::string>>>
     list(session_hash_t id, std::string alias, std::string s3_path);
 
     /// Download one S3 object (s3_path is "bucket/key") into s3_download_path_
-    /// under a timestamped filename; returns the resulting local file path.
-    actor_zeta::unique_future<core::result_wrapper_t<std::string>>
+    /// under a timestamped filename; returns the resulting local file path. A
+    /// failed transfer leaves no file behind.
+    /// Errors: do_not_exists (unknown alias), io_error (S3 or local failure).
+    actor_zeta::unique_future<core::result_wrapper_t<std::pmr::string>>
     download(session_hash_t id, std::string alias, std::string s3_path);
 
     /// Upload local_path to s3_path ("bucket/key").
+    /// Errors: do_not_exists (unknown alias), io_error (S3 or local failure).
     actor_zeta::unique_future<core::result_wrapper_t<bool>>
     upload(session_hash_t id, std::string alias, std::string s3_path, std::string local_path);
 
     using dispatch_traits = actor_zeta::dispatch_traits<
         &ConnectorManager::add_credentials,
-        &ConnectorManager::remove_credentials,
         &ConnectorManager::list,
         &ConnectorManager::download,
         &ConnectorManager::upload>;
@@ -59,12 +65,21 @@ public:
     enqueue_impl(actor_zeta::mailbox::message_ptr msg);
 
 private:
+    // Aliases arrive as std::string message payloads; the transparent hash lets
+    // the store be probed by string_view without materialising a pmr key.
+    struct alias_hash {
+        using is_transparent = void;
+        std::size_t operator()(std::string_view alias) const noexcept { return std::hash<std::string_view>{}(alias); }
+    };
+    using credentials_store_t =
+        std::pmr::unordered_map<std::pmr::string, connect_params, alias_hash, std::equal_to<>>;
+
     std::pmr::memory_resource*                      resource_;
     log_t                                           log_;
     std::mutex                                      mutex_;
     actor_zeta::behavior_t                          current_behavior_;
-    std::unordered_map<std::string, connect_params> credentials_store_;
-    std::string s3_download_path_;
+    credentials_store_t                             credentials_store_;
+    std::pmr::string                                s3_download_path_;
 };
 
 } // namespace conn::s3

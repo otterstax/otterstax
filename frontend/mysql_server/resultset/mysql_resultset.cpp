@@ -25,7 +25,16 @@ namespace frontend::mysql {
         // todo: document containing null will cause column def to be null instead of underlying type
         // solution: catalog usage
         for (const auto& column : chunk.data) {
-            column_definition_41 col(column.type().alias(), get_field_type(column.type().type()));
+            auto wire_type = get_field_type(column.type().type());
+            // The connection checks every column with find_unsupported_column
+            // before it builds a resultset.
+            assert(wire_type.has_value() && "mysql_resultset: column type has no MySQL type");
+            // An executed column without a name (SELECT 1 UNION ALL SELECT 2)
+            // can carry a type with no alias, and alias() has no null guard for
+            // such a type; it goes out with the empty name.
+            column_definition_41 col(column.type().has_alias() ? column.type().alias() : std::string{}, *wire_type);
+            // A DECIMAL column announces its own scale and display length.
+            apply_decimal_metadata(col, column.type());
             col.schema = database_;
             col.table = table_;
             col.org_table = table_;
@@ -94,17 +103,13 @@ namespace frontend::mysql {
         auto& writer = writer_.get();
         size_t len = std::min(chunk.data.size(), column_defs_.size());
         for (size_t i = 0; i < len; ++i) {
+            // Emptiness is per cell, and a column of any type can hold one; a
+            // column whose type is NA answers is_null for every row of it.
             if (chunk.data[i].is_null(row_index)) {
                 writer.write_null();
                 continue;
             }
-
-            const auto type = chunk.data[i].type().type();
-            if (type == components::types::logical_type::NA) {
-                writer.write_null();
-            } else {
-                writer.write_length_encoded_string(encode_to_text(chunk, i, row_index));
-            }
+            writer.write_length_encoded_string(encode_to_text(chunk, i, row_index));
         }
     }
 
@@ -127,11 +132,20 @@ namespace frontend::mysql {
         const size_t num_cols = std::min(chunk.data.size(), column_defs_.size());
         writer.write_uint8(BINARY_RESULTSET_ROW_HEADER); // header
 
+        // The bitmap answers for the cells of THIS row: a NULL is the cell being
+        // empty, which a column of any type can be — not the column's type being
+        // NA (a column typed NA is null in every row, which is_null answers too).
+        // A bit left clear for an empty cell sends the untouched slot's bytes as
+        // a value, and the client reads a NULL as 0.
         std::vector<uint8_t> null_bitmap(null_bitmap_size(num_cols), 0);
         for (size_t i = 0; i < num_cols; ++i) {
-            if (chunk.data[i].type().type() == components::types::logical_type::NA) {
-                const size_t bit = i + 2; // offset of 2 is required in ResultsetRow
-                null_bitmap[bit / 8] |= (1 << (bit % 8));
+            if (chunk.data[i].is_null(row_index)) {
+                // A ResultsetRow reserves the first two bit positions, so the bit
+                // of column i is i + 2 — the offset boost.mysql reads it back at
+                // (binary_row_null_bitmap_offset), and the same 2 that widens the
+                // bitmap in null_bitmap_size above.
+                const size_t bit = i + 2;
+                null_bitmap[bit / 8] |= static_cast<uint8_t>(1u << (bit % 8));
             }
         }
 
@@ -139,8 +153,14 @@ namespace frontend::mysql {
             writer.write_uint8(b);
         }
 
-        // data follows
+        // Data follows, for the cells that have any: a NULL is carried by its
+        // bitmap bit alone. Writing value bytes behind a set bit would shift
+        // every field after it — the reader takes the next field from where this
+        // one ended, and for a NULL it consumes nothing.
         for (size_t i = 0; i < num_cols; ++i) {
+            if (chunk.data[i].is_null(row_index)) {
+                continue;
+            }
             encode_to_binary<frontend_type::MYSQL>(writer, chunk, i, row_index);
         }
     }

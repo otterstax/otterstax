@@ -144,7 +144,7 @@ BENCHMARK(BM_parse_three_backend_join);
 static void BM_prepare_sql_simple(benchmark::State& state) {
     std::pmr::unsynchronized_pool_resource pool;
     for (auto _ : state) {
-        auto r = otterstax::parser::prepare_sql(kSimpleSelect, &pool);
+        auto r = otterstax::parser::prepare_sql(kSimpleSelect, &pool, &pool);
         benchmark::DoNotOptimize(r);
     }
 }
@@ -155,7 +155,7 @@ BENCHMARK(BM_prepare_sql_simple);
 static void BM_prepare_sql_cross_backend(benchmark::State& state) {
     std::pmr::unsynchronized_pool_resource pool;
     for (auto _ : state) {
-        auto r = otterstax::parser::prepare_sql(kCrossBackend, &pool);
+        auto r = otterstax::parser::prepare_sql(kCrossBackend, &pool, &pool);
         benchmark::DoNotOptimize(r);
     }
 }
@@ -164,7 +164,7 @@ BENCHMARK(BM_prepare_sql_cross_backend);
 static void BM_prepare_sql_subquery(benchmark::State& state) {
     std::pmr::unsynchronized_pool_resource pool;
     for (auto _ : state) {
-        auto r = otterstax::parser::prepare_sql(kSubquery, &pool);
+        auto r = otterstax::parser::prepare_sql(kSubquery, &pool, &pool);
         benchmark::DoNotOptimize(r);
     }
 }
@@ -173,7 +173,7 @@ BENCHMARK(BM_prepare_sql_subquery);
 static void BM_prepare_sql_complex_select(benchmark::State& state) {
     std::pmr::unsynchronized_pool_resource pool;
     for (auto _ : state) {
-        auto r = otterstax::parser::prepare_sql(kComplexSelect, &pool);
+        auto r = otterstax::parser::prepare_sql(kComplexSelect, &pool, &pool);
         benchmark::DoNotOptimize(r);
     }
 }
@@ -183,7 +183,7 @@ BENCHMARK(BM_prepare_sql_complex_select);
 static void BM_prepare_sql_three_backend(benchmark::State& state) {
     std::pmr::unsynchronized_pool_resource pool;
     for (auto _ : state) {
-        auto r = otterstax::parser::prepare_sql(kThreeBackendJoin, &pool);
+        auto r = otterstax::parser::prepare_sql(kThreeBackendJoin, &pool, &pool);
         benchmark::DoNotOptimize(r);
     }
 }

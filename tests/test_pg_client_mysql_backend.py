@@ -4,6 +4,7 @@
 import sys
 import psycopg2
 import psycopg
+import struct
 import argparse
 from contextlib import contextmanager
 
@@ -160,8 +161,111 @@ class client:
 
             self.assert_floating_equal(upd, -29.999999)
 
+    def test_float_column_reads_back_the_stored_value(self):
+        """A FLOAT column comes back as the float32 the backend holds, not a rounding of it.
+
+        MariaDB stores 64647.54 as the nearest float32, 64647.5390625. Its text
+        protocol renders a FLOAT column with six significant digits ("64647.5"),
+        so a connector reading rows over COM_QUERY hands back a value 0.04 off
+        the stored one while SUM() over the same column is exact — the
+        inconsistency test_crud_queries trips over. The connector must read
+        the rows over the binary protocol, where the float travels as its four
+        bytes.
+        """
+        table = f"{self.test_database}.{self.test_table}"
+        stored = struct.unpack('f', struct.pack('f', 64647.54))[0]
+
+        with self.psycopg2_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(f"INSERT INTO {table} (_id, campaign_name, campaign_length, budget) VALUES (%s, %s, %s, %s)",
+                           (gen_id(100), 'Campaign Float Exact', 1, 64647.54))
+            cursor.execute(f"SELECT budget FROM {table} WHERE _id = %s", (gen_id(100),))
+            self.assert_floating_equal(cursor.fetchall()[0][0], stored, msg="FLOAT column read back rounded")
+            cursor.execute(f"DELETE FROM {table} WHERE _id = %s", (gen_id(100),))
+
+    def test_remote_dml_row_counts(self):
+        """Test 3: a REMOTE DML on the MySQL backend must report the rows it touched.
+
+        Over the PG wire the count ends up in the CommandComplete tag, but it
+        originates in boost.mysql's OK packet — the MySQL manager must read it
+        and the PG frontend must forward it unchanged. Asserted on three wire
+        shapes: psycopg2 (simple query), psycopg3 with parameters (unnamed
+        statement, Bind/Execute) and `prepare=True` (named statement, Parsed
+        once and Executed repeatedly through re-prepare).
+        """
+        table = f"{self.test_database}.{self.test_table}"
+
+        with self.psycopg2_connection() as conn:          # simple query protocol
+            cursor = conn.cursor()
+            cursor.execute(
+                f"INSERT INTO {table} (_id, campaign_name, campaign_length, budget) VALUES "
+                f"('{gen_id(90)}', 'Counted Alpha', 7, 11.0), "
+                f"('{gen_id(91)}', 'Counted Beta', 7, 12.0)")
+            self.assert_equal(cursor.rowcount, 2, "simple-protocol remote INSERT row count")
+            self.assert_equal(cursor.statusmessage, "INSERT 0 2", "simple-protocol remote INSERT tag")
+
+            cursor.execute(f"UPDATE {table} SET budget = 13.0 WHERE campaign_length = 7")
+            self.assert_equal(cursor.rowcount, 2, "simple-protocol remote UPDATE row count")
+            self.assert_equal(cursor.statusmessage, "UPDATE 2", "simple-protocol remote UPDATE tag")
+
+            cursor.execute(f"DELETE FROM {table} WHERE _id = '{gen_id(91)}'")
+            self.assert_equal(cursor.rowcount, 1, "simple-protocol remote DELETE row count")
+            self.assert_equal(cursor.statusmessage, "DELETE 1", "simple-protocol remote DELETE tag")
+
+            # A statement matching nothing must report 0 — the count is read, not invented.
+            cursor.execute(f"DELETE FROM {table} WHERE campaign_length = 4242")
+            self.assert_equal(cursor.rowcount, 0, "remote DELETE matching nothing")
+            self.assert_equal(cursor.statusmessage, "DELETE 0", "remote DELETE matching nothing tag")
+
+        with self.psycopg3_connection(prepare=False) as conn:   # extended protocol
+            cursor = conn.cursor()
+            cursor.execute(
+                f"INSERT INTO {table} (_id, campaign_name, campaign_length, budget) VALUES (%s, %s, %s, %s)",
+                (gen_id(92), 'Counted Gamma', 8, 14.0))
+            self.assert_equal(cursor.rowcount, 1, "extended-protocol remote INSERT row count")
+            self.assert_equal(cursor.statusmessage, "INSERT 0 1", "extended-protocol remote INSERT tag")
+
+            cursor.execute(f"UPDATE {table} SET budget = %s WHERE _id = %s", (15.0, gen_id(92)))
+            self.assert_equal(cursor.rowcount, 1, "extended-protocol remote UPDATE row count")
+            self.assert_equal(cursor.statusmessage, "UPDATE 1", "extended-protocol remote UPDATE tag")
+
+            cursor.execute(f"DELETE FROM {table} WHERE _id = %s", (gen_id(92),))
+            self.assert_equal(cursor.rowcount, 1, "extended-protocol remote DELETE row count")
+            self.assert_equal(cursor.statusmessage, "DELETE 1", "extended-protocol remote DELETE tag")
+
+        with self.psycopg3_connection(prepare=True) as conn:    # named statements
+            cursor = conn.cursor()
+            insert = f"INSERT INTO {table} (_id, campaign_name, campaign_length, budget) VALUES (%s, %s, %s, %s)"
+            cursor.execute(insert, (gen_id(93), 'Counted Delta', 9, 16.0), prepare=True)
+            self.assert_equal(cursor.rowcount, 1, "named-statement remote INSERT row count")
+            self.assert_equal(cursor.statusmessage, "INSERT 0 1", "named-statement remote INSERT tag")
+            cursor.execute(insert, (gen_id(94), 'Counted Epsilon', 9, 17.0), prepare=True)
+            self.assert_equal(cursor.rowcount, 1, "named-statement remote INSERT row count (re-executed)")
+
+            update = f"UPDATE {table} SET budget = %s WHERE campaign_length = %s"
+            cursor.execute(update, (18.0, 9), prepare=True)
+            self.assert_equal(cursor.rowcount, 2, "named-statement remote UPDATE row count")
+            self.assert_equal(cursor.statusmessage, "UPDATE 2", "named-statement remote UPDATE tag")
+            cursor.execute(update, (19.0, 9), prepare=True)
+            self.assert_equal(cursor.rowcount, 2, "named-statement remote UPDATE row count (re-executed)")
+
+            delete = f"DELETE FROM {table} WHERE _id = %s"
+            cursor.execute(delete, (gen_id(93),), prepare=True)
+            self.assert_equal(cursor.rowcount, 1, "named-statement remote DELETE row count")
+            self.assert_equal(cursor.statusmessage, "DELETE 1", "named-statement remote DELETE tag")
+            cursor.execute(delete, (gen_id(94),), prepare=True)
+            self.assert_equal(cursor.rowcount, 1, "named-statement remote DELETE row count (re-executed)")
+            cursor.execute(delete, (gen_id(94),), prepare=True)
+            self.assert_equal(cursor.rowcount, 0, "named-statement remote DELETE matching nothing")
+
+        # Leave the table as test_crud_queries left it.
+        with self.psycopg2_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(f"DELETE FROM {table} WHERE campaign_length = 7")
+            self.assert_equal(cursor.rowcount, 1, "the one remaining Counted row")
+
     def test_character_encoding(self):
-        """Test 3: Character encoding with psycopg2"""
+        """Test 4: Character encoding with psycopg2"""
         with self.psycopg2_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
@@ -197,7 +301,7 @@ class client:
                 print(string[0])
 
     def test_protocol_capability_flags(self):
-        """Test 4: Protocol capability flags with psycopg v3"""
+        """Test 5: Protocol capability flags with psycopg v3"""
         with self.psycopg3_connection(False) as conn:
             connection_info = {
                 "server_version": conn.info.server_version,
@@ -252,17 +356,48 @@ class client:
         except Exception as e:
             raise ValueError(f"Cleanup error {e}")
 
+    def test_backend_error_carries_server_message(self):
+        """A statement MariaDB refuses surfaces MariaDB's verdict on the PG wire too.
+
+        Same shape as the MySQL-wire case: DROP TABLE of a table the backend
+        does not have is routed to the backend without a registered schema,
+        MariaDB answers 1051 "Unknown table", and that text — not a transport
+        failure — is what the ErrorResponse carries.
+        """
+        missing = f"{self.test_database}.no_such_table_{gen_id(404)}"
+        with self.psycopg2_connection() as conn:
+            cursor = conn.cursor()
+            try:
+                cursor.execute(f"drop table {missing}")
+            except psycopg2.Error as e:
+                message = str(e)
+            else:
+                raise AssertionError("DROP TABLE of a table the backend does not have must fail")
+            assert "Unknown table" in message, f"MariaDB's verdict is missing from: {message}"
+            assert "no_such_table" in message, f"the refused table is not named in: {message}"
+            assert "connect failed" not in message, f"a transport error was reported instead: {message}"
+
+            # The connection is still usable after the backend refused a statement.
+            cursor.execute(f"select count(_id) as cnt from {self.test_database}.{self.test_table}")
+            cursor.fetchall()
+
     def run_all_tests(self):
         try:
             self.test_basic_connection()
             self.test_crud_queries()
+            self.test_float_column_reads_back_the_stored_value()
+            self.test_remote_dml_row_counts()
             self.test_character_encoding()
             self.test_protocol_capability_flags()
             self.test_prepared_queries_psycopg3()
+            self.test_backend_error_carries_server_message()
             print("\033[92mTest success.\033[0m")
         except Exception as e:
             print(f"\033[91mAn error occurred: {e}\033[0m")
             print("\033[91mTest fails.\033[0m")
+            # Without this the banner lies: main_test() still returns 0 and CI stays
+            # green while every assertion in this file is effectively decorative.
+            raise
         finally:
             self.cleanup_test_data()
             print("Test completed.")

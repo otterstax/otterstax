@@ -13,19 +13,19 @@
 // with their PostgreSQL types, the data path answers rows of the same shape.
 
 #include "catalog/catalog_manager.hpp"
-#include "frontend/flight_sql_server/batch_reader.hpp"
+#include "frontend/flight_sql/chunk_to_ipc.hpp"
+#include "frontend/flight_sql/ipc/ipc_reader.hpp"
+#include "frontend/flight_sql/ipc/ipc_writer.hpp"
 #include "integration/clickhouse/connection_manager.hpp"
 #include "integration/postgresql/connection_manager.hpp"
 #include "integration/sql/connection_manager.hpp"
 #include "otterbrix/schema/schema_utils.hpp"
-#include "otterbrix/translators/output/chunk_to_arrow.hpp"
 #include "scheduler_stack.hpp"
 #include "test_helpers.hpp"
 
 #include "../mock/mock_config.hpp"
 #include "../mock/otterbrix.hpp"
 
-#include <arrow/api.h>
 #include <catch2/catch_all.hpp>
 #include <clickhouse/columns/nullable.h>
 #include <clickhouse/columns/numeric.h>
@@ -358,19 +358,13 @@ namespace {
         return sql;
     }
 
-    std::vector<std::shared_ptr<arrow::RecordBatch>> drain(ChunkBatchReader& reader) {
-        std::vector<std::shared_ptr<arrow::RecordBatch>> batches;
-        while (true) {
-            std::shared_ptr<arrow::RecordBatch> batch;
-            auto status = reader.ReadNext(&batch);
-            INFO("ReadNext: " << status.ToString());
-            REQUIRE(status.ok());
-            if (!batch) {
-                break;
-            }
-            batches.push_back(std::move(batch));
-        }
-        return batches;
+    // writer + reader round-trip: the values a client would decode.
+    std::vector<std::vector<flight::ipc::Value>>
+    decode_batch(const flight::ipc::RecordBatch& batch) {
+        const auto message = flight::ipc::serialize_record_batch(batch);
+        return flight::ipc::decode_record_batch(*batch.schema,
+                                                message.bare_message.data(), message.bare_message.size(),
+                                                message.body.data(), message.body.size());
     }
 
 } // namespace
@@ -429,14 +423,11 @@ TEST_CASE("single-backend prepare_schema: DoGet streams the backend rows under t
     auto prepared = prepare_scheduler_sql(s, stmt, from_table("SELECT product_id, product_name, price"));
     require_prepared_columns(prepared, {0, 2, 3});
 
-    auto converted = to_arrow_schema(s.resource, prepared.value().schema);
-    INFO("arrow schema error: " << converted.error().what.c_str());
-    REQUIRE_FALSE(converted.has_error());
-    auto flight_schema = converted.value();
-    REQUIRE(flight_schema->num_fields() == 3);
-    REQUIRE(flight_schema->field(0)->type()->id() == arrow::Type::INT32);
-    REQUIRE(flight_schema->field(1)->type()->id() == arrow::Type::STRING);
-    REQUIRE(flight_schema->field(2)->type()->id() == arrow::Type::DOUBLE);
+    auto flight_schema = flight::conv::schema_to_ipc(prepared.value().schema);
+    REQUIRE(flight_schema->fields.size() == 3);
+    REQUIRE(flight_schema->fields[0]->type->id == flight::ipc::TypeId::Int32);
+    REQUIRE(flight_schema->fields[1]->type->id == flight::ipc::TypeId::Utf8);
+    REQUIRE(flight_schema->fields[2]->type->id == flight::ipc::TypeId::Float64);
 
     auto executed = execute_scheduler_statement(s, stmt);
     INFO("execute error: " << executed.error().what.c_str());
@@ -444,20 +435,18 @@ TEST_CASE("single-backend prepare_schema: DoGet streams the backend rows under t
     REQUIRE(executed.value().size() == 2);
     REQUIRE(executed.value().column_count() == 3);
 
-    auto reader = ChunkBatchReader::Make(flight_schema, std::move(executed.value().chunks));
-    REQUIRE(reader.ok());
-    auto batches = drain(**reader);
+    auto batches = flight::conv::chunks_to_ipc(executed.value(), flight_schema);
     REQUIRE(batches.size() == 1);
-    const auto& batch = *batches.front();
-    REQUIRE(batch.schema()->Equals(*flight_schema));
-    REQUIRE(batch.num_rows() == 2);
-    REQUIRE(batch.ValidateFull().ok());
-    REQUIRE(std::static_pointer_cast<arrow::Int32Array>(batch.column(0))->Value(0) == 1);
-    REQUIRE(std::static_pointer_cast<arrow::Int32Array>(batch.column(0))->Value(1) == 2);
-    REQUIRE(std::static_pointer_cast<arrow::StringArray>(batch.column(1))->GetString(0) == "widget");
-    REQUIRE(std::static_pointer_cast<arrow::StringArray>(batch.column(1))->GetString(1) == "gadget");
-    REQUIRE(std::static_pointer_cast<arrow::DoubleArray>(batch.column(2))->Value(0) == 9.5);
-    REQUIRE(std::static_pointer_cast<arrow::DoubleArray>(batch.column(2))->Value(1) == 19.25);
+    const auto& batch = batches.front();
+    REQUIRE(batch.schema.get() == flight_schema.get());
+    REQUIRE(batch.num_rows == 2);
+    const auto rows = decode_batch(batch);
+    REQUIRE(std::get<std::int64_t>(rows[0][0]) == 1);
+    REQUIRE(std::get<std::int64_t>(rows[1][0]) == 2);
+    REQUIRE(std::get<std::string>(rows[0][1]) == "widget");
+    REQUIRE(std::get<std::string>(rows[1][1]) == "gadget");
+    REQUIRE(std::get<double>(rows[0][2]) == 9.5);
+    REQUIRE(std::get<double>(rows[1][2]) == 19.25);
 }
 
 // ── ClickHouse: the prepared schema is the backend's answer ──────────────────
@@ -936,7 +925,7 @@ namespace {
                                           const std::string& sql,
                                           std::string_view alias,
                                           components::types::logical_type expected,
-                                          arrow::Type::type arrow_type) {
+                                          flight::ipc::TypeId arrow_type) {
         auto prepared = prepare_scheduler_sql(s, stmt, sql);
         INFO("prepare: " << (prepared.has_error() ? prepared.error().what.c_str() : "ok"));
         REQUIRE_FALSE(prepared.has_error());
@@ -955,17 +944,12 @@ namespace {
         REQUIRE(column_types.size() == 1);
         REQUIRE(column_types[0] == schema.child_types()[0]);
 
-        auto flight_schema = to_arrow_schema(s.resource, schema);
-        INFO("arrow schema: " << (flight_schema.has_error() ? flight_schema.error().what.c_str() : "ok"));
-        REQUIRE_FALSE(flight_schema.has_error());
-        REQUIRE(flight_schema.value()->field(0)->type()->id() == arrow_type);
-        auto reader = ChunkBatchReader::Make(flight_schema.value(), std::move(executed.value().chunks));
-        REQUIRE(reader.ok());
-        auto batches = drain(**reader);
+        auto flight_schema = flight::conv::schema_to_ipc(schema);
+        REQUIRE(flight_schema->fields[0]->type->id == arrow_type);
+        auto batches = flight::conv::chunks_to_ipc(executed.value(), flight_schema);
         REQUIRE_FALSE(batches.empty());
         for (const auto& batch : batches) {
-            REQUIRE(batch->schema()->Equals(*flight_schema.value()));
-            REQUIRE(batch->ValidateFull().ok());
+            REQUIRE(batch.schema.get() == flight_schema.get());
         }
     }
 
@@ -1137,7 +1121,7 @@ TEST_CASE("ClickHouse prepare_schema: COUNT(*) AS n is prepared and streamed as 
                                      ch_from("SELECT COUNT(*) AS n"),
                                      "n",
                                      components::types::logical_type::UBIGINT,
-                                     arrow::Type::UINT64);
+                                     flight::ipc::TypeId::UInt64);
     REQUIRE(ch_probe_queries().size() == 1);
     REQUIRE(ch_probe_queries().front() == ch_probe_of(ch_data_queries().front()));
 }
@@ -1151,7 +1135,7 @@ TEST_CASE("ClickHouse prepare_schema: score + 1 AS score is prepared and streame
                                      ch_from("SELECT score + 1 AS score"),
                                      "score",
                                      components::types::logical_type::BIGINT,
-                                     arrow::Type::INT64);
+                                     flight::ipc::TypeId::Int64);
 }
 
 TEST_CASE("ClickHouse prepare_schema: length(name) AS name is prepared and streamed as the same UBIGINT column",
@@ -1163,7 +1147,7 @@ TEST_CASE("ClickHouse prepare_schema: length(name) AS name is prepared and strea
                                      ch_from("SELECT length(name) AS name"),
                                      "name",
                                      components::types::logical_type::UBIGINT,
-                                     arrow::Type::UINT64);
+                                     flight::ipc::TypeId::UInt64);
 }
 
 TEST_CASE("ClickHouse prepare_schema: a probe the backend refuses fails the prepare with the backend's error",
@@ -1824,7 +1808,7 @@ namespace {
                                           const std::string& sql,
                                           std::string_view alias,
                                           components::types::logical_type expected,
-                                          arrow::Type::type arrow_type) {
+                                          flight::ipc::TypeId arrow_type) {
         auto prepared = prepare_scheduler_sql(s, stmt, sql);
         INFO("prepare: " << (prepared.has_error() ? prepared.error().what.c_str() : "ok"));
         REQUIRE_FALSE(prepared.has_error());
@@ -1840,17 +1824,12 @@ namespace {
         REQUIRE(column_types.size() == 1);
         REQUIRE(column_types[0] == schema.child_types()[0]);
 
-        auto flight_schema = to_arrow_schema(s.resource, schema);
-        INFO("arrow schema: " << (flight_schema.has_error() ? flight_schema.error().what.c_str() : "ok"));
-        REQUIRE_FALSE(flight_schema.has_error());
-        REQUIRE(flight_schema.value()->field(0)->type()->id() == arrow_type);
-        auto reader = ChunkBatchReader::Make(flight_schema.value(), std::move(executed.value().chunks));
-        REQUIRE(reader.ok());
-        auto batches = drain(**reader);
+        auto flight_schema = flight::conv::schema_to_ipc(schema);
+        REQUIRE(flight_schema->fields[0]->type->id == arrow_type);
+        auto batches = flight::conv::chunks_to_ipc(executed.value(), flight_schema);
         REQUIRE_FALSE(batches.empty());
         for (const auto& batch : batches) {
-            REQUIRE(batch->schema()->Equals(*flight_schema.value()));
-            REQUIRE(batch->ValidateFull().ok());
+            REQUIRE(batch.schema.get() == flight_schema.get());
         }
     }
 
@@ -2034,7 +2013,7 @@ TEST_CASE("MySQL prepare_schema: score + 1 AS score is prepared and streamed as 
                                      my_from("SELECT score + 1 AS score"),
                                      "score",
                                      components::types::logical_type::BIGINT,
-                                     arrow::Type::INT64);
+                                     flight::ipc::TypeId::Int64);
     REQUIRE(my_probe_queries().size() == 1);
     REQUIRE(my_probe_queries().front() == aliased_probe_of(my_data_queries().front()));
 }
@@ -2520,7 +2499,7 @@ namespace {
                                           const std::string& sql,
                                           std::string_view alias,
                                           components::types::logical_type expected,
-                                          arrow::Type::type arrow_type) {
+                                          flight::ipc::TypeId arrow_type) {
         auto prepared = prepare_scheduler_sql(s, stmt, sql);
         INFO("prepare: " << (prepared.has_error() ? prepared.error().what.c_str() : "ok"));
         REQUIRE_FALSE(prepared.has_error());
@@ -2536,17 +2515,12 @@ namespace {
         REQUIRE(column_types.size() == 1);
         REQUIRE(column_types[0] == schema.child_types()[0]);
 
-        auto flight_schema = to_arrow_schema(s.resource, schema);
-        INFO("arrow schema: " << (flight_schema.has_error() ? flight_schema.error().what.c_str() : "ok"));
-        REQUIRE_FALSE(flight_schema.has_error());
-        REQUIRE(flight_schema.value()->field(0)->type()->id() == arrow_type);
-        auto reader = ChunkBatchReader::Make(flight_schema.value(), std::move(executed.value().chunks));
-        REQUIRE(reader.ok());
-        auto batches = drain(**reader);
+        auto flight_schema = flight::conv::schema_to_ipc(schema);
+        REQUIRE(flight_schema->fields[0]->type->id == arrow_type);
+        auto batches = flight::conv::chunks_to_ipc(executed.value(), flight_schema);
         REQUIRE_FALSE(batches.empty());
         for (const auto& batch : batches) {
-            REQUIRE(batch->schema()->Equals(*flight_schema.value()));
-            REQUIRE(batch->ValidateFull().ok());
+            REQUIRE(batch.schema.get() == flight_schema.get());
         }
     }
 
@@ -2702,7 +2676,7 @@ TEST_CASE("PostgreSQL prepare_schema: length(name) AS name is prepared and strea
                                      pg_from("SELECT length(name) AS name"),
                                      "name",
                                      components::types::logical_type::INTEGER,
-                                     arrow::Type::INT32);
+                                     flight::ipc::TypeId::Int32);
     REQUIRE(pg_probe_queries().size() == 1);
     REQUIRE(pg_probe_queries().front() == aliased_probe_of(pg_data_queries().front()));
 }

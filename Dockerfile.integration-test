@@ -1,3 +1,14 @@
+# The Go harness (tests/flightsql_go, driven by tests/flightsql_e2e/
+# test_go_driver.py) is PREBUILT in its own stage: arrow-go's module tree is
+# heavy, and building it inline would re-download it on every python-test
+# edit. The stage is cached by go.mod/go.sum alone.
+FROM golang:1.26-bookworm AS goharness
+WORKDIR /src
+COPY ./tests/flightsql_go/go.mod ./tests/flightsql_go/go.sum ./
+RUN go mod download
+COPY ./tests/flightsql_go/main.go ./
+RUN CGO_ENABLED=0 go build -o /out/flightsql_go .
+
 FROM python:3.12-slim-bookworm
 
 WORKDIR /app
@@ -28,6 +39,14 @@ RUN install -m 0755 -d /etc/apt/keyrings \
 RUN pip install --no-cache-dir \
     pyarrow \
     flightsql-dbapi \
+    # The FlightSQL e2e suite (tests/flightsql_e2e) drives the ORIGINAL Apache
+    # drivers: adbc-driver-flightsql (Go/gRPC-Go) and pyarrow (above); the
+    # protobuf stubs of the Flight messages are pre-generated next to the
+    # suite, grpcio tools are only needed to regenerate them.
+    adbc-driver-flightsql \
+    pytest \
+    grpcio \
+    grpcio-tools \
     pymysql \
     # Pinned: 9.x is the last line whose connect-time handshake avoids
     # SELECT @@… system-variable probes the server's parser does not support;
@@ -43,13 +62,20 @@ RUN pip install --no-cache-dir \
     requests \
     confluent-kafka
 
+# The prebuilt Go harness from its stage; a Go toolchain is NOT shipped in
+# this image — the test runs the binary (go run stays the host-side fallback).
+COPY --from=goharness /out/flightsql_go /usr/local/bin/flightsql_go
+
 # Copy application files. All top-level tests/*.py (helpers + test_*.py) are
 # pulled in via a single wildcard so a newly-added test doesn't need a matching
 # COPY line — startup.sh remains the source of truth for which tests actually
 # run. Subdirectories (scripts/, system/, unit/, minio/, mock/, mysql-front/)
-# are intentionally excluded by the *.py glob.
+# are intentionally excluded by the *.py glob — except the FlightSQL e2e suite
+# and its Go harness, which docker-run-tests.sh runs via pytest / the binary.
 COPY ./tests/scripts .
 COPY ./tests/*.py .
+COPY ./tests/flightsql_e2e ./flightsql_e2e
+COPY ./tests/flightsql_go ./flightsql_go
 
 RUN chmod +x /app/wait_for_otterstax.sh
 RUN chmod +x /app/startup.sh

@@ -159,7 +159,7 @@ add_library(lib_${PROJECT_NAME} INTERFACE
 # LINK_GROUP:RESCAN for CXX and does not need it — it re-searches archives
 # until no new symbols resolve.
 set(OTTERSTAX_INTERNAL_LIBS
-    flight_sql_server common_server mysql_server postgres_server catalog
+    flight_sql common_server mysql_server postgres_server catalog
     connectors s3 file component_manager integration otterbrix_local
     scheduler kafka_grammar kafka_runtime)
 if(APPLE)

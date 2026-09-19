@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Project Is
 
-OtterStax is a federated SQL query server. Clients connect via MySQL wire protocol (8816), PostgreSQL wire protocol (8817), or Apache Arrow FlightSQL (8815). Queries are either executed locally by the Otterbrix engine or dispatched to registered remote database backends (MariaDB/MySQL, PostgreSQL, ClickHouse). There is a **single config file** (`config.yaml`) that holds the wire-server settings and, under a `connections:` section, every remote backend and s3 alias — read once at startup. That `connections:` section is the single source of truth for connections; there is no runtime add/remove API.
+OtterStax is a federated SQL query server. Clients connect via MySQL wire protocol (8816), PostgreSQL wire protocol (8817), or Arrow Flight SQL (8815 — served by an in-house implementation, no Arrow Flight dependency). Queries are either executed locally by the Otterbrix engine or dispatched to registered remote database backends (MariaDB/MySQL, PostgreSQL, ClickHouse). There is a **single config file** (`config.yaml`) that holds the wire-server settings and, under a `connections:` section, every remote backend and s3 alias — read once at startup. That `connections:` section is the single source of truth for connections; there is no runtime add/remove API.
 
 ## Connection Config
 
@@ -469,7 +469,7 @@ otterbrix-internal — shadow of `external_join_all` benchmark), all driven by
 | `otterbrix/` | `otterbrix_local` (+ `otterbrix_s3_extension`, `otterbrix_file_extension`) | Parser, SQL generator, translators, plan execution, grammar extensions for `CREATE EXTERNAL TABLE` / `COPY ... TO` |
 | `otterbrix/parser/grammar_extension/kafka/` | `kafka_grammar` | Kafka DDL parser extension (flex+bison): `kafka_node_t`, `kafka_write_target` |
 | `scheduler/` | `scheduler` | `Scheduler` router + `Worker` pool (full parse→catalog→backend→otterbrix pipeline, including external-statement dispatch) + schema computation utilities |
-| `frontend/` | `flight_sql_server`, `mysql_server`, `postgres_server` | Wire-protocol frontends (await `Scheduler` futures via `asio_future_bridge.hpp`) |
+| `frontend/` | `flight_sql`, `mysql_server`, `postgres_server` | Wire-protocol frontends (await `Scheduler` futures via `asio_future_bridge.hpp`). `flight_sql/` is the in-house Flight SQL server: asio-grpc handlers over gRPC + a vendored Arrow IPC on flatbuffers — no Arrow Flight dependency. |
 | `utility/` | (header-only) | `session`, `wait_barrier` (connector error marshalling), `asio_error`, `table_info`, logger, profiler |
 | `cmake/` | (helper macros) | `otterbrix_parser_extension.cmake` — builds the s3/file flex+bison grammar extensions |
 | `tests/` | `test_system`, `test_parser`, `test_schema`, `test_utils`, `test_unit_translators`, `test_unit_config`, `test_kafka_grammar`, `test_mysql_front` | Catch2 tests + python integration suite under `tests/test_*.py` (binary names are the `project()` names in `tests/*/CMakeLists.txt`; see `tests/CLAUDE.md`) |

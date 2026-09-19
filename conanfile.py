@@ -37,6 +37,8 @@ class OtterStax(ConanFile):
         if self.options.with_tracy:
             self.requires("tracy/0.13.1")
         self.requires("arrow/24.0.0")
+        self.requires("asio-grpc/3.7.0")
+        self.requires("flatbuffers/25.9.23")
         self.requires("openssl/3.0.13")
         self.requires("boost/1.88.0", override=True)
         self.requires("fmt/11.1.3")
@@ -74,19 +76,19 @@ class OtterStax(ConanFile):
         if self.options.with_tracy:
             self.options["tracy/*"].on_demand = False
         self.options["gflags/*"].shared = True
+        # standalone asio (not boost) — the rpc layer is written against it
+        self.options["asio-grpc/*"].backend = "asio"
 
-        self.options["arrow/*"].with_flight_sql = True
+        self.options["arrow/*"].with_flight_sql = False
         self.options["arrow/*"].shared = True
-        self.options["arrow/*"].with_protobuf = True
-        self.options["arrow/*"].with_grpc = True
-        self.options["arrow/*"].with_flight_rpc = True
+        self.options["arrow/*"].with_protobuf = False
+        self.options["arrow/*"].with_grpc = False
+        self.options["arrow/*"].with_flight_rpc = False
         self.options["arrow/*"].with_brotli = True
         self.options["arrow/*"].with_zlib = True
         self.options["arrow/*"].with_lz4 = True
         self.options["arrow/*"].with_snappy = True
         self.options["arrow/*"].with_zstd = True
-        self.options["arrow/*"].with_gflags = True
-        self.options["arrow/*"].use_system_gflags = True
         self.options["arrow/*"].with_parquet = True
         self.options["arrow/*"].with_csv = True
         self.options["arrow/*"].with_json = True

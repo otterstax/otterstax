@@ -12,7 +12,9 @@
 // execute() answers an earlier slot's failure writes into slots that are still alive.
 
 #include "catalog/catalog_manager.hpp"
-#include "frontend/flight_sql_server/batch_reader.hpp"
+#include "frontend/flight_sql/chunk_to_ipc.hpp"
+#include "frontend/flight_sql/ipc/ipc_reader.hpp"
+#include "frontend/flight_sql/ipc/ipc_writer.hpp"
 #include "integration/clickhouse/connection_manager.hpp"
 #include "integration/otterbrix/otterbrix_manager.hpp"
 #include "integration/postgresql/connection_manager.hpp"
@@ -20,7 +22,6 @@
 #include "otterbrix/schema/schema_utils.hpp"
 #include "otterbrix/translators/input/affected_rows_carrier.hpp"
 #include "otterbrix/translators/input/mysql_to_chunk.hpp"
-#include "otterbrix/translators/output/chunk_to_arrow.hpp"
 #include "scheduler_stack.hpp"
 #include "test_helpers.hpp"
 
@@ -30,7 +31,6 @@
 #include "../mock/sql_db_connector.hpp"
 
 #include <actor-zeta.hpp>
-#include <arrow/api.h>
 #include <catch2/catch_all.hpp>
 #include <clickhouse/columns/array.h>
 #include <clickhouse/columns/nullable.h>
@@ -1318,17 +1318,16 @@ TEST_CASE("ClickHouse prepare_schema: AVG(score) AS score is prepared and stream
     REQUIRE(column_types[0].type() == schema.child_types()[0].type());
     REQUIRE(executed.value().chunks.front().value(0, 0).value<double>() == ch_average_score);
 
-    auto flight_schema = to_arrow_schema(s.resource, schema);
-    INFO("arrow schema: " << (flight_schema.has_error() ? flight_schema.error().what.c_str() : "ok"));
-    REQUIRE_FALSE(flight_schema.has_error());
-    auto reader = ChunkBatchReader::Make(flight_schema.value(), std::move(executed.value().chunks));
-    REQUIRE(reader.ok());
-    std::shared_ptr<arrow::RecordBatch> batch;
-    REQUIRE((*reader)->ReadNext(&batch).ok());
-    REQUIRE(batch);
-    REQUIRE(batch->schema()->Equals(*flight_schema.value()));
-    REQUIRE(batch->ValidateFull().ok());
-    REQUIRE(std::static_pointer_cast<arrow::DoubleArray>(batch->column(0))->Value(0) == ch_average_score);
+    auto flight_schema = flight::conv::schema_to_ipc(schema);
+    auto batches = flight::conv::chunks_to_ipc(executed.value(), flight_schema);
+    REQUIRE(batches.size() == 1);
+    REQUIRE(batches[0].schema.get() == flight_schema.get());
+    const auto message = flight::ipc::serialize_record_batch(batches[0]);
+    const auto rows = flight::ipc::decode_record_batch(*flight_schema,
+                                                       message.bare_message.data(), message.bare_message.size(),
+                                                       message.body.data(), message.body.size());
+    REQUIRE(rows.size() == 1);
+    REQUIRE(std::get<double>(rows[0][0]) == ch_average_score);
 }
 
 // The control: base columns whose system.columns types shape them — a named Tuple, an Array of

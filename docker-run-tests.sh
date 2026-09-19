@@ -595,6 +595,24 @@ else
     compose run --rm --use-aliases test-client bash -c "/app/startup.sh" || TEST_RC=$?
 fi
 
+echo ""
+echo "=== Step 8a: FlightSQL e2e against the original drivers ==="
+echo ""
+
+# pyarrow / ADBC / the Go database/sql driver against the custom Flight SQL
+# frontend — the wire contract the original Apache clients see. The suite
+# seeds and drops its own database over the wire.
+_flightsql_e2e_rc=0
+compose run --rm --use-aliases test-client bash -c "cd /app && python -m pytest flightsql_e2e -v" || _flightsql_e2e_rc=$?
+if [ $_flightsql_e2e_rc -eq 0 ]; then
+    echo "✅ PASSED: FlightSQL e2e (original drivers)"
+else
+    echo "❌ FAILED: FlightSQL e2e (exit code $_flightsql_e2e_rc)"
+    echo "--- otterstax logs (last 20 lines) ---"
+    compose logs test-otterstax 2>/dev/null | tail -20
+    TEST_RC=1
+fi
+
 if ! $ENABLE_TRACY && [ "${ENABLE_ASAN:-OFF}" != "ON" ] && [ "${ENABLE_TSAN:-OFF}" != "ON" ]; then
     echo ""
     echo "=== Step 8c: Kafka crash-recovery (exactly-once through kill -9) ==="

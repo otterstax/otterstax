@@ -665,7 +665,7 @@ namespace mysql {
     }
 
     actor_zeta::unique_future<core::result_wrapper_t<std::pmr::vector<table_info>>>
-    CatalogManager::get_tables(arrow::flight::sql::GetTables command) {
+    CatalogManager::get_tables(catalog_ext::get_tables_command_t command) {
         OTX_ZONE_N("catalog::get_tables");
         std::pmr::vector<table_info> data(resource());
 

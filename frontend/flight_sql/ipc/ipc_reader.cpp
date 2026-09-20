@@ -245,13 +245,6 @@ std::vector<Value> decode_column(const Type& type, const std::uint8_t* body,
 
 } // namespace
 
-SchemaPtr parse_schema_message(const std::uint8_t* data, std::size_t size) {
-    const auto* message = fb::GetMessage(data);
-    if (message->header_type() != fb::MessageHeader::Schema) {
-        throw std::runtime_error("flight::ipc: expected schema message");
-    }
-    return schema_from_fb(message->header_as_Schema());
-}
 
 std::vector<std::vector<Value>> decode_record_batch(const Schema& schema,
                                                     const std::uint8_t* message,

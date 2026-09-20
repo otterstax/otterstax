@@ -3,6 +3,8 @@
 
 #include "flight_server.hpp"
 
+#include "../scheduler_engine.hpp"
+
 #include <agrpc/register_awaitable_rpc_handler.hpp>
 
 #include <core/commands.hpp>
@@ -157,7 +159,8 @@ asio::awaitable<void> FlightServer::handle_do_action(auto& rpc, fp::Action& requ
             co_return;
         }
     } else if (request.type() == "CancelQuery") {
-        // Queries are instantaneous — nothing to cancel; answer cancelled=false honestly.
+        // Queries run to completion — nothing to cancel; answer the
+        // unspecified result honestly.
         fps::ActionCancelQueryResult cancel_result;
         cancel_result.set_result(fps::ActionCancelQueryResult::CANCEL_RESULT_UNSPECIFIED);
         google::protobuf::Any result_any;

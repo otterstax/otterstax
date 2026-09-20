@@ -136,7 +136,6 @@ namespace flight::engine {
     std::pair<session_hash_t, session_payload> SchedulerEngine::prepare_fresh(const std::string& sql) {
         OTX_ZONE_N("flight::SchedulerEngine::prepare_fresh");
         session_id id;
-        // sending to the Scheduler event-loop always returns needs_sched=false
         [[maybe_unused]] auto [needs_sched, fut] =
             actor_zeta::send(scheduler_, &Scheduler::prepare_schema, id.hash(), sql);
         auto r = otterstax::await_future_blocking<session_payload>(std::move(fut), resource_);
@@ -156,7 +155,6 @@ namespace flight::engine {
                                     std::to_string(prepared_payload.parameter_count) +
                                     " parameter(s), got " + std::to_string(parameters.size()));
         }
-        // sending to the Scheduler event-loop always returns needs_sched=false
         [[maybe_unused]] auto [needs_sched, fut] =
             actor_zeta::send(scheduler_, &Scheduler::execute_prepared_statement, id, std::move(parameters));
         auto r = otterstax::await_future_blocking<session_payload>(std::move(fut), resource_);
@@ -170,7 +168,6 @@ namespace flight::engine {
         if (id == 0) {
             return;
         }
-        // sending to the Scheduler event-loop always returns needs_sched=false
         [[maybe_unused]] auto [needs_sched, fut] =
             actor_zeta::send(scheduler_, &Scheduler::close_statement, id);
         auto closed = otterstax::await_future_blocking<session_payload>(std::move(fut), resource_);
@@ -183,14 +180,13 @@ namespace flight::engine {
 
     core::QueryResult SchedulerEngine::execute(const std::string& query) {
         OTX_ZONE_N("flight::SchedulerEngine::execute");
-        // Two-phase, the way the old Arrow-based frontend served
-        // GetFlightInfo + DoGet: `Scheduler::execute` hands back the rows but
-        // an EMPTY payload schema (only the prepare path resolves one), so the
+        // Two-phase: `Scheduler::execute` hands back the rows but an EMPTY
+        // payload schema (only the prepare path resolves one), so the
         // statement is prepared first — its payload carries the result schema
         // — and executed under the same session id. A statement that is not a
-        // SELECT (DDL/DML) passes through the same path and answers an empty
-        // dataset: the python flightsql client drives EVERYTHING through the
-        // query RPC, exactly as it did against the old server.
+        // SELECT (DDL/DML) takes the same path and answers an empty dataset:
+        // the python flightsql client drives EVERYTHING through the query
+        // RPC.
         const auto [id, prepared_payload] = prepare_fresh(query);
         if (prepared_payload.tag == NodeTag::T_SelectStmt) {
             if (prepared_payload.parameter_count > 0) {
@@ -207,7 +203,6 @@ namespace flight::engine {
             }
         }
 
-        // sending to the Scheduler event-loop always returns needs_sched=false
         [[maybe_unused]] auto [needs_sched, fut] =
             actor_zeta::send(scheduler_, &Scheduler::execute_statement, id);
         auto r = otterstax::await_future_blocking<session_payload>(std::move(fut), resource_);
@@ -311,7 +306,6 @@ namespace flight::engine {
         // (Catalogs / DbSchemas / Tables / TableTypes) reads this answer.
         catalog_ext::get_tables_command_t command;
         command.include_schema = true;
-        // sending to the Scheduler event-loop always returns needs_sched=false
         [[maybe_unused]] auto [needs_sched, fut] =
             actor_zeta::send(catalog_, &mysql::CatalogManager::get_tables, std::move(command));
         auto r = otterstax::await_future_blocking<std::pmr::vector<table_info>>(std::move(fut), resource_);
@@ -319,18 +313,13 @@ namespace flight::engine {
             engine_error(r.error(), "reading table metadata");
         }
 
+        // The tables ride as the project's own table_info (qualified name +
+        // engine schema); the IPC schema of a table is built where the
+        // metadata batches are assembled (commands.cpp).
         for (const auto& table : r.value()) {
-            core::TableInfo info;
-            info.catalog = table.name.database.c_str();
-            info.db_schema = table.name.schema.c_str();
-            info.name = table.name.collection.c_str();
-            info.type = catalog_ext::table_type_name;
-            if (table.schema.type() == logical_type::STRUCT) {
-                info.schema = conv::schema_to_ipc(table.schema);
-            }
-            metadata.catalogs.push_back(info.catalog);
-            metadata.db_schemas.push_back(info.db_schema);
-            metadata.tables.push_back(std::move(info));
+            metadata.catalogs.push_back(table.name.database.c_str());
+            metadata.db_schemas.push_back(table.name.schema.c_str());
+            metadata.tables.emplace_back(table);
         }
         metadata.table_types.emplace_back(catalog_ext::table_type_name);
         return metadata;

@@ -9,7 +9,6 @@
 #include "array.hpp"
 
 #include <cstdint>
-#include <optional>
 #include <string>
 #include <variant>
 #include <vector>
@@ -20,10 +19,6 @@ namespace flight::ipc {
 using Value = std::variant<std::monostate, bool, std::int64_t, std::uint64_t, double,
                             std::string>;
 
-// Parse a bare Message(header=Schema) -> our schema model.
-// Returns a nullptr-field for unsupported types (a field with a nullptr type
-// is the caller's error to report).
-SchemaPtr parse_schema_message(const std::uint8_t* data, std::size_t size);
 
 // Decode a RecordBatch: bare Message(header=RecordBatch) + body -> value rows.
 // Supports scalars (bool/int*/uint*/float*/utf8/binary) at the top level;

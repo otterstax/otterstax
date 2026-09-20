@@ -161,7 +161,6 @@ int main(int argc, char* argv[]) {
     }
     flight.run();
 
-    // run() returned — graceful shutdown sequence.
     // Stop the wire-protocol frontends explicitly before their destructors run,
     // giving Tracy a clean window to flush the profile.
     {

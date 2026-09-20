@@ -3,25 +3,82 @@
 
 #pragma once
 
-// Flight SQL core: ticket manager and FlightInfo/FlightData assembly.
+// Flight SQL core: the protocol/engine exchange shapes, the ticket manager
+// and the FlightInfo/FlightData assembly. There is no engine interface on
+// purpose — the server has exactly one engine, and FlightSqlCore owns it
+// (a flight::engine::SchedulerEngine, held through a forward declaration).
 
 #include "auth.hpp"
-#include "engine.hpp"
 
+#include "utility/table_info.hpp"
+
+// The engine's postgres-derived headers #define ERROR (a pg error code,
+// pg_type_definitions.h), which collides with FlightSql's generated
+// SetSessionOptionsResult.ErrorValue enum member — the same clash class as
+// the parser's DAY/SECOND the catalog already undefs for arrow. The guard is
+// prepended to the GENERATED headers themselves (patch_pb_undef.cmake), so
+// no TU's include order decides whether the protocol compiles.
 #include <Flight.grpc.pb.h>
 #include <ipc/array.hpp>
+#include <ipc/ipc_reader.hpp>
 #include <ipc/ipc_writer.hpp>
 
+#include <cstdint>
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
+namespace flight::engine {
+    class SchedulerEngine; // the one engine this server has
+}
+
 namespace flight::core {
 
 namespace fp = arrow::flight::protocol;
+
+// Execution error: maps to INVALID_ARGUMENT + message text.
+struct EngineError : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
+struct QueryResult {
+    ipc::SchemaPtr schema; // always VALID, possibly empty (no result set)
+    std::vector<ipc::RecordBatch> batches;
+};
+
+// The tables the metadata commands answer with: the PROJECT's table_info
+// (qualified name + engine schema), not a protocol-side twin — the schema is
+// converted to IPC where the metadata batches are built (commands.cpp).
+struct EngineMetadata {
+    std::vector<std::string> catalogs;
+    std::vector<std::string> db_schemas; // for CommandGetDbSchemas (simplified: not bound to the catalog filter)
+    std::vector<table_info> tables;
+    std::vector<std::string> table_types;
+};
+
+// A prepared query: text + the result and parameter schemas.
+struct Prepared {
+    std::string query;
+    ipc::SchemaPtr dataset_schema;   // empty for update
+    ipc::SchemaPtr parameter_schema; // one field per '?'
+
+    // Opaque engine-side resource handle (the Worker's prepared-statement
+    // session). The engine fills it in prepare(); the protocol layer never
+    // interprets it, it only carries it back to the engine. Empty when the
+    // engine holds no per-handle resource.
+    std::string engine_handle;
+};
+
+// Bound parameters: rows of values (a row = a vector with one entry per parameter).
+using BoundParams = std::vector<std::vector<ipc::Value>>;
+
+// SQL-LIKE matcher (% — any sequence, _ — one character).
+// No escaping; a ""/NULL pattern does not filter.
+[[nodiscard]] bool like_match(std::string_view text, std::string_view pattern);
 
 // A materialized query result (fully in memory for now).
 struct CachedResult {
@@ -39,10 +96,11 @@ struct PreparedStatementState {
 
 class FlightSqlCore {
   public:
-    FlightSqlCore(AuthService auth, std::unique_ptr<IEngine> engine);
+    FlightSqlCore(AuthService auth, std::unique_ptr<engine::SchedulerEngine> engine);
+    ~FlightSqlCore(); // the engine is held through a forward declaration
 
     AuthService& auth() { return auth_; }
-    IEngine& engine() { return *engine_; }
+    engine::SchedulerEngine& engine() { return *engine_; }
 
     // Prepared statements
     grpc::Status create_prepared(const std::string& query, std::string* handle_out);
@@ -64,7 +122,7 @@ class FlightSqlCore {
 
   private:
     AuthService auth_;
-    std::unique_ptr<IEngine> engine_;
+    std::unique_ptr<engine::SchedulerEngine> engine_;
     mutable std::mutex mutex_;
     // A ticket lives from GetFlightInfo to DoGet (seconds), but the server is
     // long-lived: an unbounded list of materialized results leaks. Keep at

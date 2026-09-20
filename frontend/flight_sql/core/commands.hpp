@@ -6,14 +6,14 @@
 // Flight SQL command parsing (the Any in FlightDescriptor.cmd / the DoPut
 // descriptor) and result assembly (including the fixed metadata schemas).
 
-#include "engine.hpp"
 #include <core/core.hpp>
 
 namespace flight::core {
 
 // Execute the descriptor's command: a SELECT or a metadata request.
+// (engine is core.engine() — passed explicitly to keep the call sites explicit.)
 // ticket_out receives the registered result ticket (for GetFlightInfo/GetSchema).
-grpc::Status execute_descriptor(FlightSqlCore& core, IEngine& engine,
+grpc::Status execute_descriptor(FlightSqlCore& core, engine::SchedulerEngine& engine,
                                 const arrow::flight::protocol::FlightDescriptor& descriptor,
                                 std::string* ticket_out);
 

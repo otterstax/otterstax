@@ -51,7 +51,6 @@ func main() {
 	check(err, "open")
 	defer dbh.Close()
 
-	// Seed: a leftover database of an aborted run is dropped first.
 	dropBestEffort(dbh, "DROP TABLE "+db+".numbers")
 	dropBestEffort(dbh, "DROP DATABASE "+db)
 	exec(dbh, "CREATE DATABASE "+db)

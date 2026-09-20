@@ -3,6 +3,8 @@
 
 #include "core.hpp"
 
+#include "../scheduler_engine.hpp"
+
 #include <stdexcept>
 
 namespace flight::core {
@@ -17,9 +19,11 @@ std::string new_ticket_id(std::uint64_t counter) {
 
 } // namespace
 
-FlightSqlCore::FlightSqlCore(AuthService auth, std::unique_ptr<IEngine> engine)
+FlightSqlCore::FlightSqlCore(AuthService auth, std::unique_ptr<engine::SchedulerEngine> engine)
     : auth_(std::move(auth)),
       engine_(std::move(engine)) {}
+
+FlightSqlCore::~FlightSqlCore() = default;
 
 std::string FlightSqlCore::register_result(ipc::SchemaPtr schema,
                                            std::vector<ipc::RecordBatch> batches) {

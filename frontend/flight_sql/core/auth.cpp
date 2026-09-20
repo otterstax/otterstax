@@ -131,7 +131,7 @@ grpc::Status AuthService::handshake(grpc::ServerContext& ctx,
 }
 
 bool AuthService::authorize(const grpc::ServerContext& ctx) const {
-    if (!credentials_.has_value()) return true; // anonymous server
+    if (!credentials_.has_value()) return true;
     auto auth = header_value(ctx, kAuthHeader);
     if (!auth.has_value()) return false;
     if (!auth->starts_with(kBearerPrefix)) return false;

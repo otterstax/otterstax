@@ -5,8 +5,8 @@
 
 // The DECIMAL/HUGEINT carrying rules shared by every consumer that turns an
 // engine payload into a wide-type carrier (arrow decimal128 for the file
-// writers and the old Arrow path, the custom Flight SQL IPC for its batches):
-// which logical types travel as a fixed-point unscaled integer, the
+// writers, the custom Flight SQL IPC for its batches): which logical types
+// travel as a fixed-point unscaled integer, the
 // (precision, scale) they declare, and how the stored integer is read back at
 // the width its precision needs.
 

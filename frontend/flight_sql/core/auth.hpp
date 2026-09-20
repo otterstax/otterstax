@@ -36,7 +36,6 @@ class AuthService {
     // Verify Authorization: Bearer on a regular RPC.
     [[nodiscard]] bool authorize(const grpc::ServerContext& ctx) const;
 
-    [[nodiscard]] bool anonymous_allowed() const { return !credentials_.has_value(); }
 
   private:
     std::optional<std::pair<std::string, std::string>> credentials_;

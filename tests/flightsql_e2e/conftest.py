@@ -49,14 +49,13 @@ def server_uri(request):
 
 @pytest.fixture(scope="session")
 def gen_path():
-    """Path to the python Flight/FlightSql protobuf stubs."""
     path = os.path.join(HERE, "gen")
     if not os.path.exists(os.path.join(path, "Flight_pb2.py")):
         os.makedirs(path, exist_ok=True)
         subprocess.check_call(
             [sys.executable, "-m", "grpc_tools.protoc",
              f"-I{FORMAT_DIR}",
-             f"--python_out={path}", f"--grpc_python_out={path}",
+             f"--python_out={path}",
              os.path.join(FORMAT_DIR, "Flight.proto"),
              os.path.join(FORMAT_DIR, "FlightSql.proto")])
     return path

@@ -25,7 +25,6 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
-#include <memory>
 #include <memory_resource>
 #include <string>
 #include <string_view>
@@ -353,7 +352,7 @@ TEST_CASE("FlightSQL contract: a parameterized SELECT is prepared from the engin
         REQUIRE(schema.child_types()[1].type() == components::types::logical_type::INTEGER);
 
         // The schema converts like any other, into the fields the rows will
-        // carry; the parameters ride their own utf8 schema, one field per '?'
+        // carry; the parameters ride their own schema, one int64 field per parameter
         auto flight_schema = flight::conv::schema_to_ipc(schema);
         REQUIRE(flight_schema->fields.size() == 2);
         REQUIRE(flight_schema->fields[0]->type->id == TypeId::Int32);

@@ -28,7 +28,7 @@ if not os.path.exists(os.path.join(GEN, "Flight_pb2.py")):
     subprocess.check_call(
         [sys.executable, "-m", "grpc_tools.protoc",
          f"-I{os.path.join(ROOT, 'frontend/flight_sql/format')}",
-         f"--python_out={GEN}", f"--grpc_python_out={GEN}",
+         f"--python_out={GEN}",
          os.path.join(ROOT, "frontend/flight_sql/format/Flight.proto"),
          os.path.join(ROOT, "frontend/flight_sql/format/FlightSql.proto")])
 sys.path.insert(0, GEN)
@@ -123,7 +123,7 @@ class TestPyArrowFlightClient:
         table = run_select(seeded, sql("SELECT * FROM {db}.numbers"))
         assert table.num_rows == 16
         names = table.column("name").to_pylist()
-        assert names[3] is None  # the NULL is in place
+        assert names[3] is None
         assert names[0] == "row-0"
 
     def test_limit_slicing(self, seeded):

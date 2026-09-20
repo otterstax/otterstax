@@ -106,22 +106,23 @@ written as asio-grpc coroutines (`rpc/flight_server.cpp`) over the vendored
 `Flight.proto` / `FlightSql.proto` (`format/`), with a vendored Arrow IPC
 implementation on flatbuffers (`ipc/`: writer + reader, dissociated mode —
 schema first in `data_header`, batches after). The protocol core
-(`core/`) owns the ticket registry and the prepared statements; the engine
-boundary is the synchronous `IEngine` interface (`core/engine.hpp`),
-implemented by `scheduler_engine.cpp` over the Scheduler/Worker pool (every
-Scheduler call awaited through the common `asio_future_bridge`, the same
-bridge the wire frontends use).
+(`core/`) owns the ticket registry, the prepared statements and the engine
+itself — there is no engine interface: the server has exactly one engine, and
+`FlightSqlCore` owns it (`scheduler_engine.*`, over the Scheduler/Worker
+pool; every Scheduler call awaited through the common `asio_future_bridge`,
+the same bridge the wire frontends use). The exchange shapes live in
+`core/core.hpp` next to their only consumers; the metadata carries the
+PROJECT's `table_info` (utility/table_info.hpp), not a protocol twin.
 
 Layers: `flight_sql_proto` (generated protobuf + gRPC stubs), `flight_sql_flatbuf`
 (flatc-generated Arrow format headers), `flight_sql_ipc` (IPC model + writer/
 reader), `flight_sql_core` (commands, auth, ticket manager) and `flight_sql`
 (the server: rpc handlers + `SchedulerEngine` + `chunk_to_ipc`).
 
-- **GetFlightInfo / GetSchema materialize the result** (afs model): the engine
+- **GetFlightInfo / GetSchema materialize the result**: the engine
   runs the query, the result is cached under an opaque ticket
   (`otterstax-tickets/<n>-<hash>`), DoGet streams the cached batches. There is
-  no two-phase prepare/ticket handshake — the old `TicketData` /
-  `EncodeTransactionQuery` are gone. The ticket cache is bounded (1024, FIFO
+  no two-phase prepare/ticket handshake. The ticket cache is bounded (1024, FIFO
   eviction): a ticket lives from GetFlightInfo to DoGet (seconds), but the
   server is long-lived.
 - **`chunk_to_ipc`** converts `session_payload` (schema + chunks) to the IPC
@@ -138,7 +139,7 @@ reader), `flight_sql_core` (commands, auth, ticket manager) and `flight_sql`
   read with the in-house IPC reader), execute. Worker statements are
   single-use, so every execution re-prepares under a fresh session id and
   closes the CreatePreparedStatement session; `ClosePreparedStatement` calls
-  `IEngine::close_prepared` so a never-executed statement releases its Worker
+  `SchedulerEngine::close_prepared` so a never-executed statement releases its Worker
   entry. The parameter schema handed out is int64 fields `$1..$N` (the model
   the reference drivers bind against); the adapter re-types whatever arrives
   the way a text protocol frontend types its literals (int64 → double → bool
@@ -158,7 +159,7 @@ reader), `flight_sql_core` (commands, auth, ticket manager) and `flight_sql`
   `UNIMPLEMENTED`; IPC compression (lz4/zstd) is not supported — clients do
   not send it by default.
 
-Acceptance: `tests/mysql-front/test_chunk_to_ipc.cpp` (the converter),
+Acceptance: `tests/unit/flightsql/test_chunk_to_ipc.cpp` (the converter),
 `tests/unit/flightsql/test_ipc.cpp` (the IPC bytes), `tests/system/
 test_flightsql_schema_contract.cpp` (the GetFlightInfo/DoGet contract through
 a real Scheduler stack), and `tests/flightsql_e2e/` — the original Apache

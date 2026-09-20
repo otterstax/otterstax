@@ -134,7 +134,6 @@ TEST_CASE("ipc: a decimal128 column serializes with precision and scale in the s
     REQUIRE(msg.body[0] == 0x39);
     REQUIRE(msg.body[1] == 0x30);
 
-    // the schema flatbuffer declares the decimal
     const auto* message = fb::GetMessage(msg.bare_message.data());
     REQUIRE(message->header_type() == fb::MessageHeader::RecordBatch);
 }
@@ -156,26 +155,4 @@ TEST_CASE("ipc: schema message declares decimal precision and scale") {
     REQUIRE(decimal->precision() == 38);
     REQUIRE(decimal->scale() == 10);
     REQUIRE(decimal->bitWidth() == 128);
-}
-
-TEST_CASE("ipc: a slice of a decimal column keeps 16-byte slots aligned") {
-    // HUGEINT rides decimal128(38, 0); slicing the batch (LIMIT-style) must
-    // keep every slot whole — a misaligned width would shift the digits.
-    std::vector<std::uint8_t> slots;
-    for (int i = 0; i < 4; ++i) {
-        for (int b = 0; b < 16; ++b) {
-            slots.push_back(static_cast<std::uint8_t>(i == b ? 0xFF : 0));
-        }
-    }
-    auto column = ai::make_fixed_width_column(ai::decimal128_type(38, 0), 4, 0, {}, std::move(slots));
-    auto schema = ai::make_schema({std::make_shared<ai::Field>("wide", true, ai::decimal128_type(38, 0))});
-    ai::RecordBatch batch{schema, {column}, 4};
-
-    auto sliced = ai::slice_batch(batch, 1, 2);
-    REQUIRE(sliced.num_rows == 2);
-    REQUIRE(sliced.columns[0].buffers[1].size() == 2 * 16);
-    // the second value's marker byte (index 1 inside its slot) and the
-    // third's (index 2) are the slice's own positions now
-    REQUIRE(sliced.columns[0].buffers[1][1] == 0xFF);
-    REQUIRE(sliced.columns[0].buffers[1][18] == 0xFF);
 }

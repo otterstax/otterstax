@@ -52,14 +52,12 @@ void put_le(std::vector<std::uint8_t>& out, T v) {
 struct BitmapBuilder {
     std::vector<std::uint8_t> bytes;
     std::int64_t bits = 0;
-    std::int64_t set_bits = 0;
 
     void append(bool v) {
         const std::size_t byte = static_cast<std::size_t>(bits / 8);
         if (byte >= bytes.size()) bytes.push_back(0);
         if (v) {
             bytes[byte] |= static_cast<std::uint8_t>(1u << (bits % 8));
-            ++set_bits;
         }
         ++bits;
     }
@@ -76,7 +74,7 @@ struct PrimitiveBuilder {
     void append(const std::optional<T>& v) {
         if (!v.has_value()) {
             bits.append(false);
-            put_le<T>(data, T{}); // slot placeholder
+            put_le<T>(data, T{});
             ++nulls;
         } else {
             bits.append(true);
@@ -289,20 +287,6 @@ inline ArrayData make_struct_column(TypePtr type, std::int64_t length, std::int6
     return out;
 }
 
-// Slice of a column [offset, offset+length) — for LIMIT-style truncation.
-// Buffers/offsets are rebuilt correctly; list/map/union children are left
-// as is (their offsets keep pointing inside the child).
-ArrayData slice_array(const ArrayData& arr, std::int64_t offset, std::int64_t length);
 
-inline RecordBatch slice_batch(const RecordBatch& batch, std::int64_t offset, std::int64_t length) {
-    RecordBatch out;
-    out.schema = batch.schema;
-    out.num_rows = length;
-    out.columns.reserve(batch.columns.size());
-    for (const auto& col : batch.columns) {
-        out.columns.push_back(slice_array(col, offset, length));
-    }
-    return out;
-}
 
 } // namespace flight::ipc

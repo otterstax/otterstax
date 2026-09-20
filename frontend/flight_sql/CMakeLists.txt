@@ -7,8 +7,7 @@
 #   flight_sql_ipc     - Arrow IPC model + writer/reader
 #   flight_sql_core    - Flight SQL protocol core (commands, auth, tickets)
 #   flight_sql         - the server itself: rpc handlers + engine adapter
-#                        (built from scheduler_engine.cpp/chunk_to_ipc.cpp;
-#                        added once those sources exist)
+#                        (scheduler_engine.cpp / chunk_to_ipc.cpp)
 
 find_package(gRPC CONFIG REQUIRED)
 find_package(protobuf CONFIG REQUIRED)
@@ -82,15 +81,26 @@ add_custom_command(
             -I${ARROW_FORMAT_DIR}
             ${ARROW_FORMAT_DIR}/Flight.proto
             ${ARROW_FORMAT_DIR}/FlightSql.proto
+    # Prepend the engine-macro guard (#undef ERROR) to the generated headers —
+    # see patch_pb_undef.cmake.
+    COMMAND ${CMAKE_COMMAND} -DIN=${GEN_PROTO_DIR}/Flight.pb.h
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/patch_pb_undef.cmake
+    COMMAND ${CMAKE_COMMAND} -DIN=${GEN_PROTO_DIR}/Flight.grpc.pb.h
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/patch_pb_undef.cmake
+    COMMAND ${CMAKE_COMMAND} -DIN=${GEN_PROTO_DIR}/FlightSql.pb.h
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/patch_pb_undef.cmake
+    COMMAND ${CMAKE_COMMAND} -DIN=${GEN_PROTO_DIR}/FlightSql.grpc.pb.h
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/patch_pb_undef.cmake
     DEPENDS ${ARROW_FORMAT_DIR}/Flight.proto ${ARROW_FORMAT_DIR}/FlightSql.proto
-    COMMENT "protoc: Flight.proto, FlightSql.proto"
+            ${CMAKE_CURRENT_SOURCE_DIR}/patch_pb_undef.cmake
+    COMMENT "protoc: Flight.proto, FlightSql.proto (+ engine-macro guard)"
     VERBATIM)
 
 add_library(flight_sql_proto STATIC ${PROTO_SRCS})
 target_include_directories(flight_sql_proto PUBLIC ${GEN_PROTO_DIR})
 target_link_libraries(flight_sql_proto PUBLIC protobuf::libprotobuf gRPC::grpc++)
 
-set(FBS_FILES Schema.fbs Message.fbs File.fbs Tensor.fbs SparseTensor.fbs)
+set(FBS_FILES Schema.fbs Message.fbs Tensor.fbs SparseTensor.fbs)
 set(FBS_GENERATED "")
 set(FBS_DEPENDS "")
 foreach(_f ${FBS_FILES})
@@ -131,8 +141,12 @@ add_library(flight_sql_core
     core/core.cpp
     core/commands.cpp
     core/auth.cpp)
-target_include_directories(flight_sql_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(flight_sql_core PUBLIC flight_sql_ipc flight_sql_proto)
+target_include_directories(flight_sql_core PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    # repo root, for utility/table_info.hpp the metadata carries
+    ${CMAKE_CURRENT_SOURCE_DIR}/../..)
+# table_info's headers (qualified_name_t) come with the engine package
+target_link_libraries(flight_sql_core PRIVATE otterbrix::otterbrix PUBLIC flight_sql_ipc flight_sql_proto)
 
 # ---------------------------------------------------------------------------
 # The Flight SQL server: rpc handlers + the Scheduler engine adapter

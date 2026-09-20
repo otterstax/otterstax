@@ -5,14 +5,12 @@
 
 // Engine payload (schema + data chunks) -> Flight SQL IPC model.
 //
-// This is the chunk_to_record_batch of the old Arrow-based FlightSQL
-// frontend, retargeted at the in-house Arrow IPC: the same column mapping
-// (the logical type decides DECIMAL; the scale rides in the type), the same
-// name-based column-to-field matching (the n-th chunk column named X feeds
-// the n-th schema field named X), the same refusals (nested types, unnamed
-// columns) — reported as core::EngineError instead of an Arrow Status.
+// The logical type decides DECIMAL (the scale rides in the type);
+// column-to-field matching is by name (the n-th chunk column named X feeds
+// the n-th schema field named X); nested types and unnamed columns are
+// refused with core::EngineError.
 
-#include "core/engine.hpp"
+#include "core/core.hpp"
 #include "ipc/array.hpp"
 #include "ipc/types.hpp"
 #include "scheduler/session_data.hpp"

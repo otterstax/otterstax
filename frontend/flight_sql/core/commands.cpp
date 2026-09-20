@@ -3,6 +3,11 @@
 
 #include "commands.hpp"
 
+#include "../chunk_to_ipc.hpp"
+#include "../scheduler_engine.hpp"
+
+#include "catalog/catalog_manager.hpp"
+
 #include <FlightSql.pb.h>
 #include <google/protobuf/any.pb.h>
 
@@ -199,7 +204,7 @@ ai::RecordBatch build_sql_info_result(const std::vector<SqlInfoRow>& rows) {
     return batch;
 }
 
-std::vector<SqlInfoRow> sql_info_rows(const IEngine& engine) {
+std::vector<SqlInfoRow> sql_info_rows(const engine::SchedulerEngine& engine) {
     std::vector<SqlInfoRow> rows;
     auto str = [&](std::uint32_t n, std::string v) {
         rows.push_back(SqlInfoRow{n, 0, std::move(v)});
@@ -270,18 +275,19 @@ ai::RecordBatch tables_batch(const fps::CommandGetTables& cmd, const EngineMetad
     std::vector<std::optional<std::string>> schema_bytes;
     const auto& table_filter = cmd.table_name_filter_pattern();
     for (const auto& t : md.tables) {
-        if (!table_filter.empty() && !like_match(t.name, table_filter)) continue;
+        if (!table_filter.empty() && !like_match(t.name.collection.c_str(), table_filter)) continue;
         bool type_ok = cmd.table_types().empty();
         for (const auto& tt : cmd.table_types()) {
-            if (tt == t.type) type_ok = true;
+            if (tt == catalog_ext::table_type_name) type_ok = true;
         }
         if (!type_ok) continue;
-        catalogs.push_back(t.catalog);
-        schemas.push_back(t.db_schema);
-        names.push_back(t.name);
-        types.push_back(t.type);
+        catalogs.push_back(t.name.database.c_str());
+        schemas.push_back(t.name.schema.c_str());
+        names.push_back(t.name.collection.c_str());
+        types.push_back(std::string{catalog_ext::table_type_name});
         if (cmd.include_schema()) {
-            auto bytes = ai::schema_ipc_bytes(*t.schema);
+            auto ipc_schema = conv::schema_to_ipc(t.schema);
+            auto bytes = ai::schema_ipc_bytes(*ipc_schema);
             schema_bytes.push_back(std::string{bytes.begin(), bytes.end()});
         } else {
             schema_bytes.push_back(std::string{});
@@ -345,7 +351,7 @@ bool like_match(std::string_view text, std::string_view pattern) {
     return p == pattern.size();
 }
 
-grpc::Status execute_descriptor(FlightSqlCore& core, IEngine& engine,
+grpc::Status execute_descriptor(FlightSqlCore& core, engine::SchedulerEngine& engine,
                                 const fp::FlightDescriptor& descriptor,
                                 std::string* ticket_out) {
     google::protobuf::Any any;
@@ -407,7 +413,7 @@ grpc::Status execute_descriptor(FlightSqlCore& core, IEngine& engine,
             result.schema = table_types_schema();
             result.batches.push_back(table_types_batch(engine.metadata()));
         } else if (any.Is<fps::CommandGetPrimaryKeys>()) {
-            // v1: no primary keys — an empty result with the spec's schema
+            // No primary-key support — an empty result with the spec's schema
             result.schema = primary_keys_schema();
         } else if (any.Is<fps::CommandGetExportedKeys>() || any.Is<fps::CommandGetImportedKeys>() ||
                    any.Is<fps::CommandGetCrossReference>()) {

@@ -4,17 +4,31 @@
 #pragma once
 
 // The Flight SQL wire server: grpc::Server + asio-grpc GrpcContext driven on
-// N threads, bridged into FlightSqlCore over the Scheduler engine adapter.
+// N threads, bridged into FlightSqlCore over its SchedulerEngine.
 //
-// What the old Arrow-based frontend's Start()/Serve() did, with two
-// differences the custom core brings: the GrpcContext may run on several
-// threads (IEngine blocks its calling thread for the length of a query, so
-// one thread would serialize the server), and shutdown is ours to drive —
+// Two properties of the custom core: the GrpcContext may run on several
+// threads (the engine blocks its calling thread for the length of a query,
+// so one thread would serialize the server), and shutdown is ours to drive —
 // a signal (SIGTERM/SIGINT) stops the grpc server and the GrpcContext, and
 // run() returns, handing the process back to the common shutdown sequence.
 
+#include "core/core.hpp"
+#include "rpc/flight_server.hpp"
+
+#include "utility/logger.hpp"
+
+#include <agrpc/grpc_context.hpp>
+
+#include <asio/io_context.hpp>
+#include <asio/signal_set.hpp>
+#include <grpcpp/server.h>
+
+#include <atomic>
+#include <csignal>
 #include <memory_resource>
 #include <string>
+#include <thread>
+#include <vector>
 
 #include <actor-zeta.hpp>
 
@@ -26,7 +40,7 @@ namespace flight::server {
         std::pmr::memory_resource* resource = nullptr;
         actor_zeta::address_t scheduler_address;
         actor_zeta::address_t catalog_address;
-        // GrpcContext::run() thread count; the queries block their calling
+        // GrpcContext::run() thread count; the engine blocks its calling
         // thread (see scheduler_engine.hpp), so this is the server's
         // concurrency for in-flight queries.
         std::size_t threads = 1;
@@ -53,8 +67,22 @@ namespace flight::server {
         void stop();
 
     private:
-        struct impl_t;
-        impl_t* impl_ = nullptr;
+        log_t log_;
+        std::string address_;
+        std::size_t threads_ = 1;
+
+        core::FlightSqlCore core_;
+        rpc::FlightServer flight_server_;
+        std::unique_ptr<agrpc::GrpcContext> grpc_context_;
+        std::unique_ptr<grpc::Server> server_;
+
+        // Signals are the shutdown trigger; they run on their own io_context
+        // so the GrpcContext threads never wait on them.
+        asio::io_context signal_io_;
+        std::unique_ptr<asio::signal_set> signals_;
+        std::thread signal_thread_;
+        std::vector<std::thread> run_threads_;
+        std::atomic<bool> stopped_{false};
     };
 
 } // namespace flight::server

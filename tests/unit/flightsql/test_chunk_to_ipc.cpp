@@ -143,7 +143,6 @@ TEST_CASE("chunk_to_ipc: nulls travel as nulls") {
     REQUIRE(rows[0][1].index() == 0); // null
     REQUIRE(std::get<std::string>(rows[1][1]) == "x");
 
-    // the validity bitmap is present exactly on the column with nulls
     REQUIRE(batches[0].columns[0].null_count == 1);
     REQUIRE(batches[0].columns[1].null_count == 1);
 }

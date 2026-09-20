@@ -33,8 +33,5 @@ struct RecordBatchMessage {
 // Serialize a single batch. data_header for DoGet = bare_message, data_body = body.
 RecordBatchMessage serialize_record_batch(const RecordBatch& batch);
 
-// Full IPC stream (schema message + all batches) — for golden tests with pyarrow.
-std::vector<std::uint8_t> write_ipc_stream(const Schema& schema,
-                                           const std::vector<RecordBatch>& batches);
 
 } // namespace flight::ipc

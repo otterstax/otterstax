@@ -3,28 +3,25 @@
 
 #pragma once
 
-// The IEngine adapter over the Scheduler/Worker pool: what the old
-// Arrow-based FlightSQL frontend did with Scheduler::execute /
-// prepare_schema / execute_prepared_statement, expressed against the
-// synchronous IEngine contract of the custom Flight SQL core.
+// The engine side of the Flight SQL server: Scheduler::execute /
+// prepare_schema / execute_prepared_statement wrapped as the one engine
+// FlightSqlCore owns.
 //
-// IEngine is called from inside an asio-grpc coroutine, and every Scheduler
-// call is awaited with frontend/common/asio_future_bridge.hpp's
+// The engine is called from inside an asio-grpc coroutine, and every
+// Scheduler call is awaited with frontend/common/asio_future_bridge.hpp's
 // await_future_blocking — the same bridge the wire frontends use. The gRPC
 // server runs its GrpcContext on N threads (see server.cpp), so one blocked
 // query does not stall the others.
 
-#include "core/engine.hpp"
+#include "core/core.hpp"
 
 #include "scheduler/session_data.hpp"
 #include "utility/session.hpp"
 
 #include <actor-zeta.hpp>
 
-#include <cstddef>
 #include <memory_resource>
 #include <string>
-#include <unordered_map>
 #include <utility>
 
 class Scheduler;
@@ -35,32 +32,32 @@ namespace mysql {
 
 namespace flight::engine {
 
-    class SchedulerEngine final : public core::IEngine {
+    class SchedulerEngine final {
     public:
         SchedulerEngine(actor_zeta::address_t scheduler,
                         actor_zeta::address_t catalog,
                         std::pmr::memory_resource* resource);
 
-        // IEngine — SELECT-like queries and DML by text.
-        core::QueryResult execute(const std::string& query) override;
-        std::int64_t execute_update(const std::string& query) override;
+        // SELECT-like queries and DML by text.
+        core::QueryResult execute(const std::string& query);
+        std::int64_t execute_update(const std::string& query);
 
-        // IEngine — prepared statements. A Worker's stored statement is
-        // single-use, so every execution re-prepares under a fresh session
-        // id and binds the parameters on it (the pattern the MySQL and PG
-        // frontends follow); the session the CreatePreparedStatement prepare
-        // left on the Worker is closed right after.
-        core::Prepared prepare(const std::string& query) override;
+        // Prepared statements. A Worker's stored statement is single-use, so
+        // every execution re-prepares under a fresh session id and binds the
+        // parameters on it (the pattern the MySQL and PG frontends follow);
+        // the session the CreatePreparedStatement prepare left on the Worker
+        // is closed right after.
+        core::Prepared prepare(const std::string& query);
         core::QueryResult execute_prepared(const core::Prepared& prepared,
-                                           const core::BoundParams& params) override;
+                                           const core::BoundParams& params);
         std::int64_t execute_update_prepared(const core::Prepared& prepared,
-                                             const core::BoundParams& params) override;
-        void close_prepared(const core::Prepared& prepared) override;
+                                             const core::BoundParams& params);
+        void close_prepared(const core::Prepared& prepared);
 
-        // IEngine — metadata (Catalogs / DbSchemas / Tables / TableTypes).
-        core::EngineMetadata metadata() override;
+        // Metadata (Catalogs / DbSchemas / Tables / TableTypes).
+        core::EngineMetadata metadata();
 
-        std::string dialect_name() const override;
+        std::string dialect_name() const;
 
     private:
         // Scheduler::execute + await; throws core::EngineError.

@@ -21,46 +21,17 @@ namespace flight::conv {
 
     namespace {
 
-        // alias() asserts on a column that carries no alias (an unnamed
-        // expression), so the presence check comes first; Arrow itself names
-        // such a field with the empty string.
-        std::string field_name(const complex_logical_type& t) {
-            return t.has_alias() ? t.alias() : std::string{};
-        }
-
-        // Arrow has no 128-bit integer type. decimal128 is its only 128-bit
-        // integral carrier, and 38 is the widest precision it declares; scale 0
-        // keeps the value an integer rather than a fixed-point number.
-        constexpr int32_t hugeint_precision = 38;
-
-        // The (precision, scale) the column's values are declared under. A
-        // DECIMAL carries its own; a HUGEINT has none of its own and rides the
-        // widest precision decimal128 declares, at scale 0.
-        struct decimal_spec {
-            std::int32_t precision;
-            std::int32_t scale;
-        };
-
-        decimal_spec spec_of(const complex_logical_type& t) {
-            if (t.type() == logical_type::DECIMAL) {
-                const auto* extension = t.extension_as<decimal_logical_type_extension>();
-                return {static_cast<std::int32_t>(extension->width()),
-                        static_cast<std::int32_t>(extension->scale())};
-            }
-            return {hugeint_precision, 0};
-        }
-
-        // The two logical types whose values travel as a decimal128: the
-        // engine's fixed-point DECIMAL, and HUGEINT for want of a 128-bit
-        // integer type on the Arrow side.
-        bool travels_as_decimal(const complex_logical_type& t) {
-            return t.type() == logical_type::DECIMAL || t.type() == logical_type::HUGEINT;
-        }
+        // The DECIMAL/HUGEINT carrying rules and the field-naming guard live
+        // in decimal_carrier.hpp, shared with the Arrow converter.
+        using tsl::decimal_spec;
+        using tsl::field_name;
+        using tsl::hugeint_precision;
+        using tsl::spec_of;
+        using tsl::travels_as_decimal;
 
         // The ipc type of one column; throws core::EngineError on a logical
         // type with no mapping. Nested types (STRUCT / LIST / ARRAY) are
-        // refused here — the record batch stream encodes scalars only, the
-        // same contract the old Arrow-based frontend enforced.
+        // refused — the record batch stream encodes scalars only.
         ipc::TypePtr ipc_type_of(const complex_logical_type& t) {
             if (travels_as_decimal(t)) {
                 const auto spec = spec_of(t);
@@ -86,7 +57,7 @@ namespace flight::conv {
                     // refused rather than reinterpreted. (A DECIMAL of this
                     // width was decided above, by its logical type.)
                     if (t.type() == logical_type::HUGEINT) {
-                        return ipc::decimal128_type(tsl::hugeint_precision, 0);
+                        return ipc::decimal128_type(hugeint_precision, 0);
                     }
                     break;
                 default:
@@ -96,36 +67,6 @@ namespace flight::conv {
                                     std::to_string(static_cast<int>(t.type())) + " (physical type " +
                                     std::to_string(static_cast<int>(t.to_physical_type())) +
                                     "), which has no Arrow mapping");
-        }
-
-        // 10^p for p in 0..38 — the decimal128 precision window, as int128.
-        types::int128_t pow10(std::int32_t p) {
-            types::int128_t v = 1;
-            for (std::int32_t i = 0; i < p; ++i) {
-                v *= 10;
-            }
-            return v;
-        }
-
-        // The engine keeps a DECIMAL's unscaled integer at the width its
-        // precision needs, so it is read back at that same width and
-        // sign-extended; a HUGEINT is already 128 bits wide.
-        types::int128_t decimal_raw(const complex_logical_type& type, const logical_value_t& value,
-                                    const std::string& column_name) {
-            const auto stored_as = type.to_physical_type();
-            switch (stored_as) {
-                case physical_type::INT16:
-                    return static_cast<types::int128_t>(value.value<std::int16_t>());
-                case physical_type::INT32:
-                    return static_cast<types::int128_t>(value.value<std::int32_t>());
-                case physical_type::INT64:
-                    return static_cast<types::int128_t>(value.value<std::int64_t>());
-                case physical_type::INT128:
-                    return value.value<types::int128_t>();
-                default:
-                    throw core::EngineError("chunk_to_ipc: column '" + column_name +
-                                            "' is stored at a width no decimal carrier reads");
-            }
         }
 
         // A decimal128 column: validity bitmap + 16-byte little-endian slots of
@@ -144,7 +85,7 @@ namespace flight::conv {
                 const auto v = chunk.value(col, r);
                 if (v.is_null()) {
                     validity.append(false);
-                    data.resize(data.size() + 16, 0); // slot placeholder
+                    data.resize(data.size() + 16, 0);
                     ++nulls;
                     continue;
                 }
@@ -178,17 +119,8 @@ namespace flight::conv {
                 ipc::detail::put_le(data, absl::Int128High64(raw));
             }
 
-            ipc::ArrayData out;
-            out.type = field_type;
-            out.length = static_cast<std::int64_t>(rows);
-            out.null_count = nulls;
-            if (nulls > 0) {
-                out.buffers.push_back(std::move(validity.bytes));
-            } else {
-                out.buffers.emplace_back();
-            }
-            out.buffers.push_back(std::move(data));
-            return out;
+            return ipc::make_fixed_width_column(field_type, static_cast<std::int64_t>(rows), nulls,
+                                                std::move(validity.bytes), std::move(data));
         }
 
         template <typename T>
@@ -279,7 +211,7 @@ namespace flight::conv {
 
         for (const auto& chunk : payload.chunks) {
             if (chunk.empty()) {
-                // skip empty chunks but keep scanning for trailing data
+                // an empty chunk is not end-of-stream — keep scanning
                 continue;
             }
             if (auto writable = tsl::validate_writable_columns(resource, chunk, "chunk_to_ipc");

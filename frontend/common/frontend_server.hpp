@@ -42,7 +42,6 @@ namespace frontend {
             : resource_(config.resource)
             , thread_pool_manager_(config.pool_size)
             , acceptor_(thread_pool_manager_.ctx(), {boost::asio::ip::tcp::v4(), config.port})
-            , rejector_socket_(thread_pool_manager_.ctx())
             , reject_packet_(DerivedConnection::build_too_many_connections_error())
             , accept_retry_timer_(thread_pool_manager_.ctx())
             , next_connection_id_(1)
@@ -71,26 +70,25 @@ namespace frontend {
             thread_pool_manager_.start();
         }
 
-        // Once stopped_ is set, stop() owns every pooled connection: it finishes
-        // each of them itself and the accept handler no longer touches the pool
-        // (see accept_connections). finish() closes the socket on the
-        // connection's strand and the last aborted completion releases the
-        // slot; the pool is joined only after all of those have run.
+        // A pooled connection always holds a socket that was already accepted:
+        // the socket of an accept in flight belongs to asio until admit() is
+        // handed it, so nothing here can close it under the accept.
         void stop() {
             bool expected = false;
             if (!stopped_.compare_exchange_strong(expected, true)) {
                 return;
             }
 
-            boost::system::error_code ec;
-            acceptor_.cancel(ec);
-            acceptor_.close(ec);
-            rejector_socket_.close(ec);
-
             {
                 std::lock_guard lock(pool_mutex_);
-                // A pending accept retry completes with operation_aborted and
-                // does not re-arm, so the join below does not wait out its pause.
+                // The accept chain arms under the same lock, so the acceptor is
+                // never closed in the middle of an arm on a pool thread.
+                boost::system::error_code ec;
+                acceptor_.cancel(ec);
+                acceptor_.close(ec);
+                // A pending retry completes with operation_aborted and does not
+                // re-arm, so the join below does not wait out its pause; the
+                // socket it holds for a client closes with it.
                 accept_retry_timer_.cancel();
                 for (auto& conn : connection_pool_) {
                     if (conn) {
@@ -105,117 +103,105 @@ namespace frontend {
     private:
         static constexpr size_t MAX_CONNECTIONS = 1000;
 
+        // The accept chain: one accept in flight at a time, re-armed only from
+        // its own completions (admit(), an accept error, the retry pause).
         void accept_connections() {
-            // The acceptor is closed: an accept re-armed on it completes at once
-            // with an error, and re-arming from that completion would spin the
-            // pool threads forever.
-            if (stopped_.load(std::memory_order_acquire)) {
-                return;
-            }
-            // The slot this iteration takes; the catch hands it back when the
-            // connection for it was never built.
-            std::optional<size_t> slot_opt;
             try {
-                slot_opt = acquire_connection_slot();
-                if (!slot_opt) {
-                    acceptor_.async_accept(rejector_socket_, [this](boost::system::error_code ec) {
-                        if (!ec) {
-                            reject_connection();
-                        }
-                        accept_connections();
-                    });
-                    return;
-                }
-
-                const size_t index = *slot_opt;
-                // The slot is written and the accept armed under the pool lock:
-                // stop() finishes pooled connections under the same lock, so the
-                // fresh connection cannot be finished (and its slot released)
-                // between being pooled and having its socket handed to the
-                // acceptor.
+                // stop() sets stopped_ and closes the acceptor under this lock, so
+                // an accept is armed on an open acceptor or not at all. Re-arming
+                // on a closed one would complete at once with an error and spin the
+                // pool threads forever.
                 std::lock_guard lock(pool_mutex_);
-                connection_pool_[index] = std::make_unique<DerivedConnection>(resource_,
-                                                                              thread_pool_manager_.ctx(),
-                                                                              next_connection_id_.fetch_add(1),
-                                                                              scheduler_,
-                                                                              *this,
-                                                                              index,
-                                                                              read_timeout_);
-
-                acceptor_.async_accept(connection_pool_[index]->socket(), [this, index](boost::system::error_code ec) {
-                    {
-                        std::lock_guard lock(pool_mutex_);
-                        // stop() sets stopped_ before it takes this lock to finish
-                        // every pooled connection, so a handler that sees it set
-                        // leaves the slot to stop(): releasing it here would destroy
-                        // a connection whose finish is already posted.
-                        if (stopped_.load(std::memory_order_acquire)) {
-                            return;
-                        }
-                        if (!ec) {
-                            log_->debug("Connection accepted (slot {})", index);
-                            connection_pool_[index]->start();
-                        } else {
-                            // The connection closes itself through finish(): the
-                            // completion of its last pending operation releases the
-                            // slot, the only path that destroys a pooled connection.
-                            connection_pool_[index]->finish();
-                        }
-                    }
-                    accept_connections();
-                });
-            } catch (const std::exception& e) {
-                log_->error("Fatal connection error: {}", e.what());
-                // The pause is armed under the pool lock and only while stopped_
-                // is clear: stop() cancels the timer under the same lock after
-                // setting stopped_, so a retry is either cancelled by it or never
-                // armed. The chain is the only user of the timer and re-arms it
-                // only from its own completions, so no wait is pending here.
-                std::lock_guard lock(pool_mutex_);
-                // A slot whose connection was never built is empty but taken:
-                // left so, MAX_CONNECTIONS failures fill the pool and every later
-                // client is refused. A connection that was built (async_accept
-                // itself threw) stays pooled until stop() finishes it.
-                if (slot_opt && !connection_pool_[*slot_opt]) {
-                    available_slots_.push(*slot_opt);
-                }
                 if (stopped_.load(std::memory_order_acquire)) {
                     return;
                 }
-                accept_retry_timer_.expires_after(accept_retry_delay_);
-                accept_retry_timer_.async_wait([this](boost::system::error_code ec) {
-                    // Cancelled by stop(); accept_connections() itself returns
-                    // once stopped_ is set.
-                    if (ec == boost::asio::error::operation_aborted) {
-                        return;
-                    }
-                    accept_connections();
-                });
+                acceptor_.async_accept(boost::asio::make_strand(thread_pool_manager_.ctx()),
+                                       [this](boost::system::error_code ec, boost::asio::ip::tcp::socket socket) {
+                                           if (ec) {
+                                               accept_connections();
+                                               return;
+                                           }
+                                           admit(std::move(socket));
+                                       });
+            } catch (const std::exception& e) {
+                log_->error("Fatal connection error: {}", e.what());
+                std::lock_guard lock(pool_mutex_);
+                pause_chain([this] { accept_connections(); });
             }
         }
 
-        // One rejection is in flight at a time (the rejector socket is re-armed
-        // only from this completion), so the packet lives in reject_packet_.
-        void reject_connection() {
-            boost::asio::async_write(rejector_socket_,
-                                     boost::asio::buffer(reject_packet_),
-                                     [this](boost::system::error_code ec, std::size_t) {
-                                         boost::system::error_code close_ec;
-                                         rejector_socket_.close(close_ec);
+        void admit(boost::asio::ip::tcp::socket socket) {
+            std::optional<size_t> slot;
+            try {
+                // stop() finishes pooled connections under this lock, so one pooled after it would never be finished.
+                std::lock_guard lock(pool_mutex_);
+                if (stopped_.load(std::memory_order_acquire)) {
+                    return;
+                }
+                slot = acquire_connection_slot();
+                if (!slot) {
+                    reject(std::move(socket));
+                } else {
+                    connection_pool_[*slot] = std::make_unique<DerivedConnection>(resource_,
+                                                                                  std::move(socket),
+                                                                                  next_connection_id_.fetch_add(1),
+                                                                                  scheduler_,
+                                                                                  *this,
+                                                                                  *slot,
+                                                                                  read_timeout_);
+                    log_->debug("Connection accepted (slot {})", *slot);
+                    connection_pool_[*slot]->start();
+                }
+            } catch (const std::exception& e) {
+                log_->error("Fatal connection error: {}", e.what());
+                std::lock_guard lock(pool_mutex_);
+                // A slot whose connection was never built is empty but taken:
+                // left so, MAX_CONNECTIONS failures fill the pool and every later
+                // client is refused. A connection that was built stays pooled
+                // until stop() finishes it.
+                if (slot && !connection_pool_[*slot]) {
+                    available_slots_.push(*slot);
+                }
+                pause_chain([this, socket = std::move(socket)]() mutable {
+                    if (socket.is_open()) {
+                        admit(std::move(socket));
+                    } else {
+                        accept_connections();
+                    }
+                });
+                return;
+            }
+            accept_connections();
+        }
 
+        // The caller MUST hold pool_mutex_
+        template<typename Resume>
+        void pause_chain(Resume resume) {
+            if (stopped_.load(std::memory_order_acquire)) {
+                return;
+            }
+            accept_retry_timer_.expires_after(accept_retry_delay_);
+            accept_retry_timer_.async_wait([resume = std::move(resume)](boost::system::error_code ec) mutable {
+                if (ec != boost::asio::error::operation_aborted) {
+                    resume();
+                }
+            });
+        }
+
+        void reject(boost::asio::ip::tcp::socket socket) {
+            auto owned = std::make_unique<boost::asio::ip::tcp::socket>(std::move(socket));
+            auto& target = *owned;
+            boost::asio::async_write(target,
+                                     boost::asio::buffer(reject_packet_),
+                                     [this, owned = std::move(owned)](boost::system::error_code ec, std::size_t) {
                                          if (ec) {
                                              log_->error("Failed to send rejection packet: {}", ec.message());
                                          }
-                                         if (close_ec) {
-                                             log_->error("Failed to close rejector socket: {}", close_ec.message());
-                                         }
-                                         accept_connections();
                                      });
         }
 
+        // The caller MUST hold pool_mutex_
         std::optional<size_t> acquire_connection_slot() {
-            std::lock_guard lock(pool_mutex_);
-
             if (!available_slots_.empty()) {
                 size_t slot = available_slots_.front();
                 available_slots_.pop();
@@ -245,8 +231,7 @@ namespace frontend {
         std::pmr::memory_resource* resource_;
         thread_pool_manager thread_pool_manager_;
         boost::asio::ip::tcp::acceptor acceptor_;
-        boost::asio::ip::tcp::socket rejector_socket_;
-        std::vector<uint8_t> reject_packet_;
+        const std::vector<uint8_t> reject_packet_;
         // The pause of the accept chain after an exception (one chain, re-armed
         // only from its own completions, so one timer). Armed and cancelled under
         // pool_mutex_; declared after thread_pool_manager_, whose io_context it

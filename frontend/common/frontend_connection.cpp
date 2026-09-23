@@ -12,20 +12,18 @@ namespace {
 } // namespace
 
 namespace frontend {
-    frontend_connection::frontend_connection(boost::asio::io_context& ctx,
+    frontend_connection::frontend_connection(boost::asio::ip::tcp::socket&& socket,
                                              uint32_t connection_id,
                                              connection_close_sink& close_sink,
                                              size_t slot,
                                              std::chrono::milliseconds read_timeout)
-        : socket_(boost::asio::make_strand(ctx))
+        : socket_(std::move(socket))
         , connection_id_(connection_id)
         , close_sink_(&close_sink)
         , slot_(slot)
         , read_buffer_(READ_BUFFER_SIZE)
         , read_timeout_(read_timeout)
         , read_timer_(socket_.get_executor()) {}
-
-    boost::asio::ip::tcp::socket& frontend_connection::socket() { return socket_; }
 
     log_t& frontend_connection::logger() {
         auto& log = get_logger_impl();

@@ -59,6 +59,10 @@ namespace {
                                     int cycles,
                                     int clients_per_cycle,
                                     Attach&& attach) {
+        // How far past the deadline a missed close is chased before giving up.
+        constexpr auto LATE_PROBE = std::chrono::seconds(25);
+        long long worst_close_ms = 0;
+
         for (int i = 0; i < cycles; ++i) {
             Server server(make_config<Server>(stack, PRODUCTION_TIMEOUT));
             server.start();
@@ -70,10 +74,31 @@ namespace {
             }
 
             server.stop();
+            INFO("cycle " << i << " of " << cycles << ", pool status " << static_cast<int>(server.status()));
             REQUIRE(server.status() == thread_pool_status::STOPPED);
-            for (auto& client : clients) {
-                REQUIRE(client->wait_for_close());
+
+            for (int c = 0; c < clients_per_cycle; ++c) {
+                const auto started = std::chrono::steady_clock::now();
+                const bool closed = clients[c]->wait_for_close();
+                const auto took_ms = since_ms(started);
+                if (closed) {
+                    worst_close_ms = took_ms > worst_close_ms ? took_ms : worst_close_ms;
+                } else {
+                    const auto late_started = std::chrono::steady_clock::now();
+                    const bool closed_late = clients[c]->wait_for_close(LATE_PROBE);
+                    UNSCOPED_INFO("late probe: " << (closed_late ? "closed" : "STILL OPEN") << " after a further "
+                                                 << since_ms(late_started) << "ms");
+                }
+                INFO("cycle " << i << ", client " << c << " of " << clients_per_cycle << ", close took " << took_ms
+                              << "ms, slowest so far " << worst_close_ms << "ms");
+                REQUIRE(closed);
             }
+        }
+
+        // Half the budget: anything above that passed on borrowed time.
+        const auto budget_ms = std::chrono::milliseconds(SERVER_REACTION).count();
+        if (worst_close_ms > budget_ms / 2) {
+            WARN("slowest successful close was " << worst_close_ms << "ms of a " << budget_ms << "ms budget");
         }
     }
 

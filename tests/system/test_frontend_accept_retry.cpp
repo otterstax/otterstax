@@ -2,22 +2,23 @@
 // Copyright 2025-2026  OtterStax
 //
 // The accept chain's pause after an exception. frontend_server builds the
-// connection for the next accept inside accept_connections(); when that throws,
-// the catch arms a one-shot retry timer (frontend_server_config::accept_retry_delay)
-// whose completion runs accept_connections() again. There is one accept chain —
-// it is re-armed only from its own completions — so after the pause the server
-// must be accepting again, and stop() while the retry is still pending must
-// return (the pool join must not wait on a retry that re-arms) without a
-// completion touching the server after it is gone. A failed construction must
-// also hand back the pool slot it was taken for: otherwise MAX_CONNECTIONS
-// failures leave every slot empty but taken, and the server refuses every client
-// as "too many connections" from then on.
+// connection for an accepted client in admit(); when that throws, the catch arms
+// a one-shot retry timer (frontend_server_config::accept_retry_delay) that holds
+// the client's socket and admits it again. There is one accept chain — it is
+// re-armed only from its own completions — so after the pause the same client
+// must be served and the server must be accepting again, and stop() while the
+// retry is still pending must return (the pool join must not wait on a retry
+// that re-arms) and close that client, without a completion touching the server
+// after it is gone. A failed construction must also hand back the pool slot it
+// was taken for: otherwise MAX_CONNECTIONS failures leave every slot empty but
+// taken, and the server refuses every client as "too many connections" from
+// then on.
 //
 // The connection is the real mysql_connection behind a constructor that throws
 // on the armed construction attempts, before any part of the connection exists:
-// the throw comes out of std::make_unique in accept_connections() exactly where a
-// failing allocation or socket setup would. An accepted client is served the real
-// MySQL handshake (raw_wire_client.hpp).
+// the throw comes out of std::make_unique in admit() exactly where a failing
+// allocation would. An accepted client is served the real MySQL handshake
+// (raw_wire_client.hpp).
 
 #include "frontend/mysql_server/mysql_server.hpp"
 #include "raw_wire_client.hpp"
@@ -56,8 +57,7 @@ namespace {
 
     // Construction attempts since the last arm_failures(); attempts numbered
     // [failing_first, failing_last] throw. One server under test at a time is
-    // the only thing constructing connections, from the test thread (start())
-    // or a pool thread (an accept completion).
+    // the only thing constructing connections, on a pool thread (admit()).
     std::atomic<int> construction_attempts{0};
     std::atomic<int> failing_first{0};
     std::atomic<int> failing_last{-1};
@@ -80,14 +80,14 @@ namespace {
     class throwing_connection : public frontend::mysql::mysql_connection {
     public:
         throwing_connection(std::pmr::memory_resource* resource,
-                            boost::asio::io_context& ctx,
+                            boost::asio::ip::tcp::socket&& socket,
                             uint32_t connection_id,
                             actor_zeta::address_t scheduler,
                             frontend::connection_close_sink& close_sink,
                             size_t slot,
                             std::chrono::milliseconds read_timeout)
             : mysql_connection(count_construction(resource),
-                               ctx,
+                               std::move(socket),
                                connection_id,
                                scheduler,
                                close_sink,
@@ -148,7 +148,7 @@ namespace {
     // ---- scenarios ----------------------------------------------------------
 
     // Attempts [first_failing, first_failing + failures) throw; every client is
-    // still accepted and served the handshake, the one whose accept the failing
+    // still accepted and served the handshake, the one the failing
     // constructions were for only after `failures` retry pauses.
     void accept_resumes_after_failures(const otterstax::test::scheduler_stack& stack,
                                        int first_failing,
@@ -156,18 +156,16 @@ namespace {
                                        int clients_count) {
         arm_failures(first_failing, failures);
         retry_server server(make_config(stack, RETRY_PAUSE));
-        // Construction attempt 1 runs in start(), attempt c + 2 in the accept
-        // completion of client c: the first failure is triggered by start() when
-        // first_failing is 1, else by the accept of client first_failing - 2, and
-        // client first_failing - 1 is the one kept waiting.
-        const int triggering_client = first_failing - 2;
+        // Client c's first construction attempt is attempt c + 1, made when its
+        // accept completes; a failing attempt is retried for the same client, so
+        // every failure falls on client first_failing - 1.
         const int delayed_client = first_failing - 1;
         auto failures_from = std::chrono::steady_clock::now();
         server.start();
 
         std::vector<std::unique_ptr<raw_client>> clients;
         for (int c = 0; c < clients_count; ++c) {
-            if (c == triggering_client) {
+            if (c == delayed_client) {
                 failures_from = std::chrono::steady_clock::now();
             }
             clients.push_back(std::make_unique<raw_client>(server.local_port()));
@@ -188,21 +186,23 @@ namespace {
         }
     }
 
-    // Every construction from attempt `first_failing` on throws, so the retry
-    // timer is pending (or its completion is re-arming it) whenever stop() comes;
-    // `first_failing - 1` clients are accepted first and must be closed by stop().
-    void stop_with_retry_pending(const otterstax::test::scheduler_stack& stack, int cycles, int first_failing) {
+    // `served` clients are served, then one more connects whose construction
+    // keeps throwing, so the retry that holds its socket is pending (or its
+    // completion is admitting it again) whenever stop() comes. stop() must
+    // return and close every client, the one never served included.
+    void stop_with_retry_pending(const otterstax::test::scheduler_stack& stack, int cycles, int served) {
         for (int i = 0; i < cycles; ++i) {
-            arm_failures(first_failing, ALWAYS);
+            arm_failures(served + 1, ALWAYS);
             std::vector<std::unique_ptr<raw_client>> clients;
             {
                 retry_server server(make_config(stack, RETRY_PAUSE));
                 server.start();
-                for (int c = 1; c < first_failing; ++c) {
+                for (int c = 0; c < served; ++c) {
                     clients.push_back(std::make_unique<raw_client>(server.local_port()));
                     mysql_handshake(*clients.back());
                 }
-                REQUIRE(wait_for_attempts(first_failing));
+                clients.push_back(std::make_unique<raw_client>(server.local_port()));
+                REQUIRE(wait_for_attempts(served + 1));
 
                 const auto stop_started = std::chrono::steady_clock::now();
                 stop_within_patience(server);
@@ -218,8 +218,8 @@ namespace {
     }
 
     // Every failing construction was for a pool slot. `failures` of them in a
-    // row, more than the pool has slots: the client that connects meanwhile is
-    // accepted by the first construction that succeeds and gets the MySQL
+    // row, more than the pool has slots, all for the one client that connects:
+    // it is admitted by the first construction that succeeds and gets the MySQL
     // handshake, not the too-many-connections refusal (an ERR packet) of a pool
     // whose slots all stayed taken by connections that were never built.
     void client_served_after_more_failures_than_slots(const otterstax::test::scheduler_stack& stack, int failures) {
@@ -253,12 +253,12 @@ namespace {
 
 } // namespace
 
-TEST_CASE("frontend_server: accept resumes after the retry pause when the construction in start() throws") {
+TEST_CASE("frontend_server: accept resumes after the retry pause when the construction for the first client throws") {
     otterstax::test::scheduler_stack_owner owner("/tmp/otterstax_frontend_accept_retry_start", &make_parser);
     accept_resumes_after_failures(owner.stack(), 1, 1, 3);
 }
 
-TEST_CASE("frontend_server: accept resumes after the retry pause when a construction on a pool thread throws") {
+TEST_CASE("frontend_server: accept resumes after the retry pause when the construction for a later client throws") {
     otterstax::test::scheduler_stack_owner owner("/tmp/otterstax_frontend_accept_retry_pool", &make_parser);
     accept_resumes_after_failures(owner.stack(), 2, 1, 3);
 }
@@ -268,14 +268,14 @@ TEST_CASE("frontend_server: accept resumes after three consecutive construction 
     accept_resumes_after_failures(owner.stack(), 2, 3, 3);
 }
 
-TEST_CASE("frontend_server: stop() with the retry pending after the construction in start() threw twenty times over") {
+TEST_CASE("frontend_server: stop() with the retry pending for a client never served twenty times over") {
     otterstax::test::scheduler_stack_owner owner("/tmp/otterstax_frontend_accept_retry_stop_start", &make_parser);
-    stop_with_retry_pending(owner.stack(), 20, 1);
+    stop_with_retry_pending(owner.stack(), 20, 0);
 }
 
 TEST_CASE("frontend_server: stop() with the retry pending and a client attached twenty times over") {
     otterstax::test::scheduler_stack_owner owner("/tmp/otterstax_frontend_accept_retry_stop_pool", &make_parser);
-    stop_with_retry_pending(owner.stack(), 20, 2);
+    stop_with_retry_pending(owner.stack(), 20, 1);
 }
 
 TEST_CASE("frontend_server: a client is served after more construction failures than the pool has slots") {

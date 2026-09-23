@@ -35,7 +35,7 @@ namespace frontend::postgres {
         using portal_t = std::pmr::vector<components::types::logical_value_t>;
 
         postgres_connection(std::pmr::memory_resource* resource,
-                            boost::asio::io_context& ctx,
+                            boost::asio::ip::tcp::socket&& socket,
                             uint32_t connection_id,
                             actor_zeta::address_t scheduler,
                             connection_close_sink& close_sink,

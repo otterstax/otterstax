@@ -162,7 +162,7 @@ WORKDIR /app/build/${BUILD_TYPE}
 # Docker container (no profiler server attached). Non-Tracy CI builds run all tests.
 ARG WITH_TRACY=false
 RUN if [ "${WITH_TRACY}" != "true" ]; then \
-        ctest -C ${BUILD_TYPE} -V --output-on-failure --timeout 120; \
+        ctest -C ${BUILD_TYPE} --output-on-failure --timeout 120; \
     else \
         echo "Skipping tests: Tracy build (headless Docker, no profiler attached)"; \
     fi

@@ -19,7 +19,7 @@ frontend/
 ## Common Layer (`frontend/common/`)
 
 `frontend_server<DerivedConnection>` is a CRTP template that manages a connection pool (max 1000 slots), a `thread_pool_manager` (Boost.Asio), and async accept/reject logic. `DerivedConnection` must implement:
-- `socket()` — returns the underlying TCP socket
+- a constructor `(std::pmr::memory_resource*, tcp::socket&& accepted, uint32_t id, actor_zeta::address_t scheduler, connection_close_sink&, size_t slot, std::chrono::milliseconds read_timeout)` — it takes over a socket that is already accepted and already on its own strand
 - `start()` — begins protocol handshake
 - `finish()` — signals clean shutdown
 - `static build_too_many_connections_error()` — protocol-specific rejection packet
@@ -31,7 +31,8 @@ interface (`release_connection_slot(slot)`), which `frontend_server` implements
 to free the pool slot — a plain virtual call, no type-erased callback.
 
 **Connection lifetime (`frontend_connection`).** Each connection's socket runs
-on its own asio strand (`make_strand(ctx)`), so every completion and every
+on its own asio strand — the acceptor accepts into a socket created on
+`make_strand(ctx)` and the connection takes it over — so every completion and every
 touch of the connection's members after construction happens on that strand,
 one at a time (`start()` posts `start_impl` there). Every asio operation the
 connection starts — read, write, the idle timer, a posted lambda — goes
@@ -57,35 +58,45 @@ of this over raw client sockets: `stop()` with attached clients, the idle
 timeout, a client dropping the socket mid-read, an oversize startup message.
 
 **Shutdown contract (`frontend_server::stop()`).** `stop()` sets `stopped_`,
-closes the acceptor, then finishes every pooled connection under `pool_mutex_`
-and joins the pool. `finish()` closes the socket on the connection's strand and
-the completion of the last pending operation releases the slot — the only path
-that destroys a pooled connection; the accept handler never releases a slot
-directly (on an accept error it calls `finish()` on the pooled connection).
-Once `stopped_` is set the accept handler leaves the pool alone and
-`accept_connections()` does not re-arm: an accept re-armed on the closed
+then under `pool_mutex_` closes the acceptor, cancels the accept retry timer and
+finishes every pooled connection, and joins the pool. `finish()` closes the
+socket on the connection's strand and the completion of the last pending
+operation releases the slot — the only path that destroys a pooled connection.
+A connection exists only for a socket that was already accepted: the accept
+chain (`accept_connections()`) accepts into a socket asio creates on a fresh
+strand and hands it to `admit()`, which pools a connection for it or refuses
+the client. So `stop()` never touches a socket an accept is still writing
+into — asio assigns the accepted descriptor to the peer socket on the io thread
+before it calls the handler, and closing a pre-built connection's socket under
+a pending accept was a data race (TSAN: `do_assign` against `close`). The accept
+is armed, and `admit()` pools, under `pool_mutex_` after checking `stopped_`:
+once it is set nothing is armed or pooled — an accept re-armed on the closed
 acceptor completes at once with an error, and re-arming from there spins the
-pool threads forever (join never returns) while racing `stop()`'s finish loop
-on the same slots (use-after-free: SIGSEGV or `bad_executor`). The slot write
-and the `async_accept` that takes the connection's socket run under the same
-lock. When building the connection for the next accept throws, the catch in
-`accept_connections()` pauses the chain on the member `accept_retry_timer_`
-for `frontend_server_config::accept_retry_delay` (no default; `main.cpp` passes
-`ACCEPT_RETRY_DELAY_MS`, 100 ms) — there is one accept chain, re-armed only
-from its own completions, so one timer serves it and nothing is heap-shared.
-The same catch, under `pool_mutex_`, hands back the slot the iteration took
-when its connection was never built (the slot is still empty): left taken,
-`MAX_CONNECTIONS` failures would fill the pool and every later client would get
-the too-many-connections refusal. A connection that was built before the throw
-(`async_accept` itself threw) stays pooled until `stop()` finishes it. The pause is armed under `pool_mutex_` only while `stopped_` is
-clear, and `stop()` cancels the timer under the same lock before joining the
-pool: a pending retry completes with `operation_aborted` and does not re-arm,
-and the join does not wait out the pause. `local_port()` answers the bound port
-(tests bind port 0). `tests/system/test_frontend_shutdown.cpp` pins this with
-start/stop cycles on both servers; `tests/system/test_frontend_accept_retry.cpp`
-pins the retry (a connection whose constructor throws on chosen attempts: accept
-resumes after the pause, `stop()` with the retry pending returns, a client is
-served after more failures than the pool has slots).
+pool threads forever. A refusal (pool full) owns its socket: it writes the
+too-many-connections packet (`reject_packet_`, read-only) and the socket closes
+when the write completes, so any number can be in flight and none shares state
+with the chain. When building the connection throws, the catch in `admit()`
+hands back the slot it took (still empty — left taken, `MAX_CONNECTIONS`
+failures would fill the pool and every later client would be refused) and
+pauses the chain on the member `accept_retry_timer_` for
+`frontend_server_config::accept_retry_delay` (no default; `main.cpp` passes
+`ACCEPT_RETRY_DELAY_MS`, 100 ms). The pause holds the client's socket and then
+admits the same client again: the constructors take the socket by rvalue
+reference, so a throw before the base connection took it leaves it with the
+server, and the client is served late rather than dropped. There is one accept
+chain, re-armed only from its own completions, so one timer serves it. The
+pause is armed under `pool_mutex_` only while `stopped_` is clear, and `stop()`
+cancels the timer under the same lock: a pending retry completes with
+`operation_aborted`, does not re-arm, and the socket it holds closes with it.
+`local_port()` answers the bound port (tests bind port 0).
+`tests/system/test_frontend_shutdown.cpp` pins this with start/stop cycles on
+both servers; `tests/system/test_frontend_accept_retry.cpp` pins the retry (a
+connection whose constructor throws on chosen attempts: the client the failures
+were for is served after the pauses and the chain keeps accepting, `stop()` with
+the retry pending returns and closes the waiting client, a client is served
+after more failures than the pool has slots);
+`tests/system/test_frontend_connection_lifetime.cpp` pins `stop()` with clients
+attached, which is where TSAN saw both races.
 
 `asio_future_bridge.hpp` is the universal sink between the Scheduler/Worker pool
 (which hands back `actor_zeta::unique_future`s) and the per-connection asio

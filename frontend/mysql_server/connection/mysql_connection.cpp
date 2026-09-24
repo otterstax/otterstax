@@ -9,13 +9,13 @@ using namespace components::sql;
 
 namespace frontend::mysql {
     mysql_connection::mysql_connection(std::pmr::memory_resource* resource,
-                                       boost::asio::io_context& ctx,
+                                       boost::asio::ip::tcp::socket&& socket,
                                        uint32_t connection_id,
                                        actor_zeta::address_t scheduler,
                                        connection_close_sink& close_sink,
                                        size_t slot,
                                        std::chrono::milliseconds read_timeout)
-        : frontend_connection(ctx, connection_id, close_sink, slot, read_timeout)
+        : frontend_connection(std::move(socket), connection_id, close_sink, slot, read_timeout)
         , resource_(resource)
         , statement_id_map_(resource_)
         , sequence_id_(0)

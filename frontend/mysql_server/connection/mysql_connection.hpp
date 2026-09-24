@@ -31,7 +31,7 @@ namespace frontend::mysql {
     class mysql_connection : public frontend_connection {
     public:
         mysql_connection(std::pmr::memory_resource* resource,
-                         boost::asio::io_context& ctx,
+                         boost::asio::ip::tcp::socket&& socket,
                          uint32_t connection_id,
                          actor_zeta::address_t scheduler,
                          connection_close_sink& close_sink,

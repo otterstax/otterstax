@@ -27,6 +27,12 @@ namespace otterstax::test::wire {
     // Upper bound on how long the server may take to act on a trigger.
     constexpr auto SERVER_REACTION = std::chrono::seconds(5);
 
+    // Milliseconds since `from`, for the diagnostics that accompany a missed deadline.
+    inline long long since_ms(std::chrono::steady_clock::time_point from) {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - from)
+            .count();
+    }
+
     // A blocking client on its own io_context; nothing here touches the server's pool.
     class raw_client {
     public:
@@ -60,8 +66,14 @@ namespace otterstax::test::wire {
 
         // True when the server closed the connection within the deadline. Bytes
         // the server sends before closing (a FATAL error packet) are drained.
+        // A false return has two unrelated causes — the deadline ran out with the
+        // socket still open, or the read failed with something that is not a
+        // close. The caller only sees `false`, so each path says which it was.
+        // UNSCOPED_INFO, not INFO: this frame is gone by the time the caller's
+        // REQUIRE reports, and a scoped message would go with it.
         bool wait_for_close(std::chrono::milliseconds deadline = SERVER_REACTION) {
-            const auto until = std::chrono::steady_clock::now() + deadline;
+            const auto started = std::chrono::steady_clock::now();
+            const auto until = started + deadline;
             uint8_t drain[256];
             for (;;) {
                 boost::system::error_code result;
@@ -76,12 +88,16 @@ namespace otterstax::test::wire {
                 if (!done) {
                     socket_.cancel();
                     ctx_.run();
+                    UNSCOPED_INFO("wait_for_close: deadline of " << deadline.count() << "ms expired, socket still "
+                                                                 << "open after " << since_ms(started) << "ms");
                     return false;
                 }
                 if (result == boost::asio::error::eof || result == boost::asio::error::connection_reset) {
                     return true;
                 }
                 if (result) {
+                    UNSCOPED_INFO("wait_for_close: read failed after " << since_ms(started)
+                                                                       << "ms, not a close: " << result.message());
                     return false;
                 }
             }

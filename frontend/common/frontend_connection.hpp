@@ -41,7 +41,7 @@ namespace frontend {
     // handler that names `this` is still queued.
     class frontend_connection {
     public:
-        frontend_connection(boost::asio::io_context& ctx,
+        frontend_connection(boost::asio::ip::tcp::socket&& socket,
                             uint32_t connection_id,
                             connection_close_sink& close_sink,
                             size_t slot,
@@ -54,7 +54,6 @@ namespace frontend {
         frontend_connection& operator=(const frontend_connection&) = delete;
         frontend_connection& operator=(frontend_connection&&) = delete;
 
-        boost::asio::ip::tcp::socket& socket();
         log_t& logger();
 
         // Runs start_impl on the connection's strand.

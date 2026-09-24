@@ -3,6 +3,7 @@ project(test_schema)
 set(${PROJECT_NAME}_SOURCES
     main.cpp
     test_schema_utils.cpp
+    test_schema_probe.cpp
 )
 
 add_executable(${PROJECT_NAME} ${${PROJECT_NAME}_SOURCES})

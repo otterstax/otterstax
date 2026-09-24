@@ -6,6 +6,23 @@
 namespace frontend::postgres {
     inline constexpr int32_t POSTGRES_NULL = -1;
 
+    bool same_wire_shape(const std::pmr::vector<components::types::complex_logical_type>& described,
+                         const components::vector::data_chunk_t& executed) {
+        if (described.size() != executed.column_count()) {
+            return false;
+        }
+        for (size_t i = 0; i < described.size(); ++i) {
+            // Both sides are asked the same question, so a type the wire maps
+            // to nothing compares equal to itself and differs from every mapped
+            // OID; such a column is refused before any row is built anyway
+            // (find_unsupported_column).
+            if (get_field_type(described[i].type()) != get_field_type(executed.data[i].type().type())) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     postgres_resultset::postgres_resultset(packet_writer& writer, bool datarow_only)
         : format_()
         , field_desc_()
@@ -21,24 +38,37 @@ namespace frontend::postgres {
         field_desc_.reserve(chunk.data.size());
         for (const auto& column : chunk.data) {
             // same warning as with mysql, but worse, there's no NULL type in postgres (will infer TEXT type)
-            field_desc_.emplace_back(column.type().alias(), get_field_type(column.type().type()));
+            auto wire_type = get_field_type(column.type().type());
+            // The connection checks every column with find_unsupported_column
+            // before it builds a resultset.
+            assert(wire_type.has_value() && "postgres_resultset: column type has no PostgreSQL type");
+            // An executed column without a name (SELECT 1 UNION ALL SELECT 2)
+            // can carry a type with no alias, and alias() has no null guard for
+            // such a type; it goes out with the empty name.
+            field_desc_.emplace_back(column.type().has_alias() ? column.type().alias() : std::string{}, *wire_type);
         }
         format_.emplace_back(encoding);
     }
 
     void postgres_resultset::add_row(const components::vector::data_chunk_t& chunk, size_t row_index) {
         size_t len = datarow_only_ ? chunk.data.size() : std::min(chunk.data.size(), field_desc_.size());
-        int32_t estimated_size = 0;
 
-        std::vector<int32_t> binary_sizes;
-        binary_sizes.reserve(len);
+        // Only the reserve is computed here. The length a binary field states in
+        // front of its bytes is taken where it is written, below: a NULL cell
+        // writes the -1 length and no bytes, so a list of sizes walked in
+        // parallel with the writing loop hands every binary field after a NULL
+        // one the wrong column's length — and a DataRow field is framed by that
+        // length, so the row would desynchronise rather than merely mis-state a
+        // value.
+        size_t estimated_size = 0;
         for (size_t i = 0; i < len; ++i) {
-            int32_t sz;
+            if (chunk.data[i].is_null(row_index)) {
+                continue; // the -1 length alone, counted with the prefixes below
+            }
             if (auto f = get_format_code(format_, i); f && *f == result_encoding::BINARY) {
-                sz = estimate_binary_field_size<frontend_type::POSTGRES>(chunk, i, row_index);
-                binary_sizes.push_back(sz);
+                estimated_size += estimate_binary_field_size<frontend_type::POSTGRES>(chunk, i, row_index);
             } else {
-                sz = estimate_text_field_size<frontend_type::POSTGRES>(chunk, i, row_index);
+                estimated_size += estimate_text_field_size<frontend_type::POSTGRES>(chunk, i, row_index);
             }
         }
 
@@ -46,7 +76,6 @@ namespace frontend::postgres {
         writer.reserve_payload(2 + 4 * len + estimated_size);
         writer.write_int16(len); // # of columns
 
-        size_t bin_cnt = 0;
         for (size_t i = 0; i < len; ++i) {
             if (chunk.data[i].is_null(row_index)) {
                 writer.write_int32(POSTGRES_NULL); // no data follows
@@ -54,7 +83,7 @@ namespace frontend::postgres {
             }
 
             if (auto f = get_format_code(format_, i); f && *f == result_encoding::BINARY) {
-                writer.write_int32(binary_sizes[bin_cnt++]);
+                writer.write_int32(estimate_binary_field_size<frontend_type::POSTGRES>(chunk, i, row_index));
                 encode_to_binary<frontend_type::POSTGRES>(writer, chunk, i, row_index);
             } else {
                 auto str = encode_to_text(chunk, i, row_index);

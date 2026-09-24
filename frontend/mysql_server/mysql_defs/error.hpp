@@ -33,6 +33,7 @@ namespace frontend::mysql {
         ER_SYNTAX_ERROR = 1149,             // Syntax error
         ER_EMPTY_QUERY = 1065,              // Query was empty
         ER_UNKNOWN_STMT_HANDLER = 1243,     // Unknown prepared statement handler
+        ER_NOT_SUPPORTED_YET = 1235,        // A result column type the wire cannot encode
         ER_QUERY_TIMEOUT = 3024,
     };
 

@@ -9,7 +9,7 @@
 #
 # All three keys are int64 (parquet/csv loaders emit int64; `weights.campaign_id`
 # is declared bigint) to sidestep the silent zero-row JOIN trap documented in
-# FIX_JOIN.md.
+# tests/CLAUDE.md, "JOIN-key width sensitivity".
 
 import sys
 
@@ -67,7 +67,8 @@ def run(local=False):
 
         # ── 3. weights — plain CREATE TABLE + INSERT VALUES ─────────────────
         # bigint matches the int64 the parquet/csv loaders expose, so the
-        # equi-JOIN doesn't silently drop rows (FIX_JOIN.md).
+        # equi-JOIN doesn't silently drop rows (tests/CLAUDE.md, "JOIN-key
+        # width sensitivity").
         cur.execute(
             f"CREATE TABLE {INTERNAL_DB}.weights ("
             f"  campaign_id bigint,"

@@ -56,11 +56,13 @@ namespace kafka_ext {
         }
 
         // Semantic guard the grammar can't express: every declared column type
-        // must map to an otterbrix logical type, since transform relies on it.
+        // must map to a JSON-ingestible otterbrix logical type, since transform and
+        // the message reader rely on it.
         const auto* stmt = static_cast<const kafka_grammar::kafka_stmt*>(reinterpret_cast<ExtensionNode*>(root)->data);
         for (const auto* col = stmt->columns; col != nullptr; col = col->next) {
             if (!otterstax::kafka::map_column_type(col->type).has_value()) {
-                const std::string message = std::string{"kafka: unknown column type '"} + std::string(col->type) + "'";
+                const std::string message = std::string{"kafka: unsupported column type '"} + std::string(col->type) +
+                                            "' (supported: INT, BIGINT, DOUBLE, BOOLEAN, VARCHAR)";
                 return core::error_t(core::error_code_t::sql_parse_error, std::pmr::string{message.c_str(), resource});
             }
         }

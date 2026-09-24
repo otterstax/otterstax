@@ -20,8 +20,13 @@ RUN apt update && \
     apt clean && \
     rm -rf /var/lib/apt/lists/*
 
+# cmake.org answers 403 to conan's HTTP client, so the conancenter cmake binary
+# recipe cannot be fetched; the pip-installed cmake is declared as the platform
+# tool_requires of the build profile instead (it satisfies the recipes' <4 range).
 RUN pip3 install --no-cache-dir conan==2.21.0 'cmake<4.0' && \
      conan profile detect --force && \
+     printf '\n[platform_tool_requires]\ncmake/%s\n' "$(cmake --version | head -1 | awk '{print $3}')" \
+         >> "$(conan profile path default)" && \
      conan remote add otterbrix http://conan.otterbrix.com
 
 RUN rm /bin/sh && ln -s /bin/bash /bin/sh
@@ -61,6 +66,8 @@ RUN if [ "$TSAN_DEPS" = "true" ]; then \
             -s compiler.cppstd=gnu20 \
             -s 'clickhouse-cpp/*:compiler.cppstd=17' \
             -s 'abseil/*:compiler.cppstd=17' \
+            -s 'protobuf/*:compiler.cppstd=17' \
+            -s 're2/*:compiler.cppstd=17' \
             -s 'grpc/*:compiler.cppstd=17'; \
     elif [ "$WITH_TRACY" = "true" ]; then \
         conan install conanfile.py --build missing \
@@ -68,6 +75,8 @@ RUN if [ "$TSAN_DEPS" = "true" ]; then \
             -s compiler.cppstd=gnu20 \
             -s 'clickhouse-cpp/*:compiler.cppstd=17' \
             -s 'abseil/*:compiler.cppstd=17' \
+            -s 'protobuf/*:compiler.cppstd=17' \
+            -s 're2/*:compiler.cppstd=17' \
             -s 'grpc/*:compiler.cppstd=17' \
             -o "&:with_tracy=True"; \
     else \
@@ -76,6 +85,8 @@ RUN if [ "$TSAN_DEPS" = "true" ]; then \
             -s compiler.cppstd=gnu20 \
             -s 'clickhouse-cpp/*:compiler.cppstd=17' \
             -s 'abseil/*:compiler.cppstd=17' \
+            -s 'protobuf/*:compiler.cppstd=17' \
+            -s 're2/*:compiler.cppstd=17' \
             -s 'grpc/*:compiler.cppstd=17'; \
     fi
 
@@ -116,10 +127,15 @@ COPY ./cmake ./cmake
 COPY ./main.cpp ./main.cpp
 COPY ./CMakeLists.txt ./CMakeLists.txt
 COPY ./tests ./tests
+# Only what BUILD_BENCHMARKS=ON compiles; the compose/scripts half of benchmark/ stays out.
+COPY ./benchmark/CMakeLists.txt ./benchmark/CMakeLists.txt
+COPY ./benchmark/microbench ./benchmark/microbench
 COPY ./tsan.supp ./tsan.supp
 
 ARG ENABLE_ASAN=OFF
 ARG ENABLE_TSAN=OFF
+# ON compiles benchmark/microbench (otterstax_bench) as well; nothing runs it.
+ARG BUILD_BENCHMARKS=OFF
 
 # TSAN suppressions for known-bad third-party code (spdlog in libotterbrix_log.so).
 # Only takes effect in TSAN builds; plain Release / ASAN ignore it.
@@ -133,6 +149,7 @@ RUN _jobs=$([ "${BUILD_JOBS}" = "0" ] && nproc || echo "${BUILD_JOBS}") && \
         -DCMAKE_TOOLCHAIN_FILE=build/${BUILD_TYPE}/generators/conan_toolchain.cmake \
         -DCMAKE_BUILD_TYPE=${BUILD_TYPE} \
         -DBUILD_TESTS=ON \
+        -DBUILD_BENCHMARKS=${BUILD_BENCHMARKS} \
         -DENABLE_ASAN=${ENABLE_ASAN} \
         -DENABLE_TSAN=${ENABLE_TSAN} \
         -DENABLE_TRACY=${_tracy} \
@@ -145,7 +162,7 @@ WORKDIR /app/build/${BUILD_TYPE}
 # Docker container (no profiler server attached). Non-Tracy CI builds run all tests.
 ARG WITH_TRACY=false
 RUN if [ "${WITH_TRACY}" != "true" ]; then \
-        ctest -C ${BUILD_TYPE} -V --output-on-failure --timeout 120; \
+        ctest -C ${BUILD_TYPE} --output-on-failure --timeout 120; \
     else \
         echo "Skipping tests: Tracy build (headless Docker, no profiler attached)"; \
     fi

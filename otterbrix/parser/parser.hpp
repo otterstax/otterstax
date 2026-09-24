@@ -16,6 +16,7 @@
 #include <core/result_wrapper.hpp>
 
 #include <memory_resource>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -29,6 +30,17 @@ enum class backend_type_t : uint8_t {
     ClickHouse = 5
 };
 
+// Which grammar extension claimed the statement. The extension roots
+// (external_node_t, kafka_node_t) are all node_type::unused, as is the
+// schema_node_t stub, so the plan root's type cannot tell them apart; the
+// parser records the claiming extension here from the ExtensionNode envelope
+// and the Worker routes on it with a static_cast.
+enum class extension_kind_t : uint8_t {
+    none = 0,
+    external = 1, // s3 / file: CREATE EXTERNAL TABLE, COPY (...) TO
+    kafka = 2     // kafka DDL
+};
+
 struct ParsedQueryData {
     explicit ParsedQueryData(OtterbrixStatementPtr otterbrix_params,
                              components::sql::transform::transform_result&& binder,
@@ -39,6 +51,8 @@ struct ParsedQueryData {
     OtterbrixStatementPtr otterbrix_params;
 
     NodeTag tag;
+
+    extension_kind_t extension_kind{extension_kind_t::none};
 
     backend_type_t backend_type{backend_type_t::Unknown}; // Set by CatalogManager during get_catalog_schema
 
@@ -61,6 +75,11 @@ public:
 class GreenplumParser : public IParser {
 public:
     explicit GreenplumParser(std::pmr::memory_resource* resource);
+    // Starts from `seed` (a host's own extensions); the built-in s3/file/kafka
+    // extensions are registered on top of it. A name collision between the two
+    // sets is not a degraded parser: every parse() then fails with the
+    // registration error.
+    GreenplumParser(std::pmr::memory_resource* resource, components::sql::parser::parser_extension_registry_t seed);
 
     core::result_wrapper_t<ParsedQueryDataPtr> parse(const std::string& sql) override;
 
@@ -72,6 +91,9 @@ private:
     // → kafka_node_t). Core SQL is parsed first; only core-rejected statements
     // reach these. Passed to both raw_parser (3-arg) and the transformer.
     components::sql::parser::parser_extension_registry_t registry_;
+    // The constructor has no error channel; a failed extension registration is
+    // kept here and reported by parse(), so the failure is never silent.
+    std::optional<core::error_t> registration_error_;
 };
 
 using parser_ptr = std::unique_ptr<IParser>;

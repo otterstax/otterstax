@@ -18,14 +18,16 @@
 #include "types.hpp"
 #include "otterbrix/translators/input/pg_to_chunk.hpp"
 #include "utility/asio_error.hpp"
+#include "utility/function_ref.hpp"
 #include "utility/tracy_profiler.hpp"
+#include "utility/wait_barrier.hpp"
 #include <otterbrix/otterbrix.hpp>
 
 #include <concepts>
 #include <coroutine>
 #include <exception>
-#include <functional>
 #include <memory>
+#include <memory_resource>
 #include <string>
 
 namespace pg {
@@ -51,77 +53,90 @@ namespace pg {
     };
     using PGConnPtr = std::unique_ptr<PGconn, PGConnDeleter>;
 
+    // Every failure a connector can report travels as a core::error_t value:
+    // connect()/tryReconnect() return it, and each runQuery overload resolves to
+    // the marshaled outcome of its handler (see otterstax::query_result_t).
+    // runQuery takes the handler as a non-owning otterstax::function_ref_t: the
+    // callable must outlive the returned awaitable. ConnectorManager::executeQuery
+    // binds the copy otterstax::run_with_owned_handler keeps in its frame.
     class IConnector {
     public:
         virtual ~IConnector() = default;
         virtual Status status() const noexcept = 0;
         virtual connect_params params() const noexcept = 0;
         virtual void close() = 0;
-        virtual void connect() = 0;
+        virtual core::error_t connect() = 0;
         virtual bool isConnected() = 0;
-        virtual void tryReconnect() = 0;
+        virtual core::error_t tryReconnect() = 0;
         virtual bool isClosed() const noexcept = 0;
         virtual std::string alias() const noexcept = 0;
 
-        virtual asio::awaitable<std::unique_ptr<data_chunk_t>>
+        virtual asio::awaitable<core::result_wrapper_t<std::unique_ptr<data_chunk_t>>>
         runQuery(std::string_view query,
-                 std::function<std::unique_ptr<data_chunk_t>(PGresult*)> handler) = 0;
-        virtual asio::awaitable<int64_t>
+                 otterstax::function_ref_t<std::unique_ptr<data_chunk_t>(PGresult*)> handler) = 0;
+        virtual asio::awaitable<core::result_wrapper_t<int64_t>>
         runQuery(std::string_view query,
-                 std::function<int64_t(PGresult*)> handler) = 0;
-        virtual asio::awaitable<otterstax::asio_error_t>
+                 otterstax::function_ref_t<int64_t(PGresult*)> handler) = 0;
+        virtual asio::awaitable<core::error_t>
         runQuery(std::string_view query,
-                 std::function<otterstax::asio_error_t(PGresult*)> handler) = 0;
+                 otterstax::function_ref_t<otterstax::asio_error_t(PGresult*)> handler) = 0;
     };
 
     class Connector : public IConnector {
     public:
-        Connector(connect_params params, std::string alias = "");
+        Connector(std::pmr::memory_resource* resource, connect_params params, std::string alias = "");
         Status status() const noexcept override;
         connect_params params() const noexcept override;
         void close() override;
         ~Connector() override;
-        void connect() override;
+        core::error_t connect() override;
         bool isConnected() override;
-        void tryReconnect() override;
+        core::error_t tryReconnect() override;
         bool isClosed() const noexcept override;
         std::string alias() const noexcept override;
 
-        asio::awaitable<std::unique_ptr<data_chunk_t>>
+        asio::awaitable<core::result_wrapper_t<std::unique_ptr<data_chunk_t>>>
         runQuery(std::string_view query,
-                 std::function<std::unique_ptr<data_chunk_t>(PGresult*)> handler) override {
+                 otterstax::function_ref_t<std::unique_ptr<data_chunk_t>(PGresult*)> handler) override {
             return runQuery_(query, handler);
         }
-        asio::awaitable<int64_t>
+        asio::awaitable<core::result_wrapper_t<int64_t>>
         runQuery(std::string_view query,
-                 std::function<int64_t(PGresult*)> handler) override {
+                 otterstax::function_ref_t<int64_t(PGresult*)> handler) override {
             return runQuery_(query, handler);
         }
-        asio::awaitable<otterstax::asio_error_t>
+        asio::awaitable<core::error_t>
         runQuery(std::string_view query,
-                 std::function<otterstax::asio_error_t(PGresult*)> handler) override {
+                 otterstax::function_ref_t<otterstax::asio_error_t(PGresult*)> handler) override {
             return runQuery_(query, handler);
         }
 
     private:
         log_t log_;
 
+        // The backend's verdict on a statement, classified by SQLSTATE (errors.hpp)
+        // and carrying the server message so the frontend can show what the server
+        // said.
+        core::error_t query_error(const PGresult* result, std::string_view query) const;
+        core::error_t connection_error(std::string_view what) const;
+
         template<typename Callable>
         requires std::invocable<Callable, PGresult*>
-            asio::awaitable<std::invoke_result_t<Callable, PGresult*>>
+            asio::awaitable<otterstax::query_result_t<std::invoke_result_t<Callable, PGresult*>>>
             runQuery_(std::string_view query, Callable handler) {
             OTX_ZONE_N("pg::Connector::runQuery");
+            using result_t = std::invoke_result_t<Callable, PGresult*>;
             if (status_ != Status::Connected) {
                 std::string err = "[Run query] Connector with alias: " + alias_ + " is not connected";
                 log_->error(err);
-                throw std::runtime_error(err);
+                co_return connection_error(err);
             }
 
             // Check connection status
             if (PQstatus(conn_.get()) != CONNECTION_OK) {
                 std::string err = "[Run query] Connector with alias: " + alias_ + " connection check failed";
                 log_->error(err);
-                throw std::runtime_error(err);
+                co_return connection_error(err);
             }
 
             log_->debug("Alias: {} query: {}", alias_, query);
@@ -132,28 +147,29 @@ namespace pg {
             if (!result) {
                 std::string err = "[Run query] Alias: " + alias_ + " query execution failed: null result";
                 log_->error(err);
-                throw std::runtime_error(err);
+                co_return connection_error(err);
             }
 
             ExecStatusType status = PQresultStatus(result.get());
             if (status != PGRES_TUPLES_OK && status != PGRES_COMMAND_OK) {
-                std::string err = "[Run query] Alias: " + alias_ + " query [" + std::string(query) +
-                                  "] failed: " + std::string(PQerrorMessage(conn_.get()));
-                log_->error(err);
-                throw std::runtime_error(err);
+                co_return query_error(result.get(), query);
             }
 
-            co_return handler(result.get());
+            co_return otterstax::as_query_result<result_t>(handler(result.get()));
         }
 
     private:
+        std::pmr::memory_resource* resource_;
         PGConnPtr conn_;
         connect_params params_;
         Status status_;
         std::string alias_;
     };
 
-    using connector_factory =
-        std::function<std::unique_ptr<IConnector>(connect_params, std::string)>;
+    // Stateless connector factory: a plain function pointer (NOT std::function),
+    // so production passes &make_pg_connector and tests pass their own free
+    // function. The leading memory_resource owns every core::error_t message the
+    // connector produces on the io thread.
+    using connector_factory = std::unique_ptr<IConnector> (*)(std::pmr::memory_resource*, connect_params, std::string);
 
 } // namespace pg

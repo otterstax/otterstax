@@ -159,7 +159,7 @@ services:
   # MinIO (S3-compatible) backend for the s3 external-table tests. Mirrors the
   # standalone stack in tests/minio/docker-compose.yml, on the test network.
   minio:
-    image: minio/minio:latest
+    image: quay.io/minio/minio:latest
     container_name: test-minio
     command: server /data --console-address ":9001"
     environment:

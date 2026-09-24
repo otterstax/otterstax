@@ -33,7 +33,8 @@
 //
 // Each handler is a coroutine that forwards to a Worker and co_returns the Worker's
 // result (future-of-future passthrough); the frontend awaits the resulting future
-// through frontend/common/asio_future_bridge.hpp.
+// through frontend/common/asio_future_bridge.hpp. Nothing in a handler throws:
+// errors travel as core::error_t inside the Worker's result.
 class Scheduler final : public actor_zeta::actor::actor_mixin<Scheduler> {
 public:
     using is_cooperative_actor_type = void; // Required by actor_zeta::send() concept
@@ -76,11 +77,13 @@ public:
     execute_prepared_statement(session_hash_t id,
                                std::pmr::vector<components::types::logical_value_t> parameters);
     unique_future<session_result> prepare_schema(session_hash_t id, std::string sql);
+    unique_future<session_result> close_statement(session_hash_t id);
 
     using dispatch_traits = actor_zeta::dispatch_traits<&Scheduler::execute,
                                                         &Scheduler::execute_statement,
                                                         &Scheduler::execute_prepared_statement,
-                                                        &Scheduler::prepare_schema>;
+                                                        &Scheduler::prepare_schema,
+                                                        &Scheduler::close_statement>;
 
     actor_zeta::behavior_t behavior(actor_zeta::mailbox::message* msg);
 
@@ -89,6 +92,12 @@ public:
     std::pair<bool, actor_zeta::detail::enqueue_result> enqueue_impl(actor_zeta::mailbox::message_ptr msg);
 
 private:
+    // Hands one message to the session's Worker (`workers_[id % N]`) and returns
+    // the Worker's future for the handler to await. Synchronous on purpose: the
+    // handler's Tracy zone lives here, on one thread, closed before the await.
+    template<typename Method, typename... Args>
+    unique_future<session_result> route(Method method, session_hash_t id, Args&&... args);
+
     // One in-flight message in the event loop. The behavior coroutine holds a raw
     // pointer into pending_msg across suspension, so pending_msg must outlive it.
     struct in_flight_entry_t {

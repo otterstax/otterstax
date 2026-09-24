@@ -83,6 +83,28 @@ def validate_by_request(client, test_name, test_query, expected_schema):
     print(f"✅ {test_name} PASSED")
     print(f"{'='*70}")
 
+def expect_refused_at_get_flight_info(client, test_name, test_query, *needles):
+    """GetFlightInfo must fail with a message naming the cause; no ticket is issued."""
+    print(f"\n{'='*70}")
+    print(f"TEST: {test_name}")
+    print(f"{'='*70}")
+    print(f"Query: {test_query}")
+    print(f"{'-'*70}")
+    try:
+        client.execute(test_query)
+    except pa.ArrowException as e:
+        message = str(e)
+        for needle in needles:
+            if needle not in message:
+                raise AssertionError(
+                    f"GetFlightInfo error for {test_query!r} does not mention {needle!r}: {message}")
+        print(f"  refused as expected: {message.splitlines()[0]}")
+        print(f"\n{'='*70}")
+        print(f"✅ {test_name} PASSED")
+        print(f"{'='*70}")
+        return
+    raise AssertionError(f"GetFlightInfo accepted {test_query!r}; it must be refused")
+
 # This script is designed to test the functionality of the FlightSQLServer
 def main(local=False):
     # Select host based on local flag
@@ -117,12 +139,13 @@ def main(local=False):
     print(f"\n{'='*70}")
     print("TEST SUITE: FlightSQL PostgreSQL Backend")
     print(f"{'='*70}")
-    print("Total tests: 5")
+    print("Total tests: 6")
     print("  1. Simple SELECT")
     print("  2. SELECT with WHERE clause")
     print("  3. SELECT with ORDER BY")
     print("  4. SELECT with numeric filter")
     print("  5. SELECT with LIMIT")
+    print("  6. Parameterized SELECT refused by GetFlightInfo")
     print(f"{'='*70}")
 
     # Test query 1: Simple SELECT from products table
@@ -154,6 +177,13 @@ def main(local=False):
         'price': pa.float64()
     }
     validate_by_request(client, "Test 5: SELECT with LIMIT", test_query_5, expected_schema_limit)
+
+    # Test query 6: the projection of a remote SELECT is resolved by the catalog
+    # whatever its parameters, but GetFlightInfoStatement binds nothing, so a
+    # `$1` placeholder is refused before a ticket exists.
+    test_query_6 = "SELECT product_id, price FROM products.pgdb.public.products WHERE product_id = $1;"
+    expect_refused_at_get_flight_info(client, "Test 6: Parameterized SELECT refused by GetFlightInfo",
+                                      test_query_6, "unbound parameter")
 
 
 def main_test():

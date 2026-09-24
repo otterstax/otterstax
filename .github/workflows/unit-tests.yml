@@ -23,5 +23,9 @@ jobs:
           push: false
           load: false
           tags: otterstax-test
+          # Build-only coverage for benchmark/microbench: the benchmark binary is
+          # compiled and linked alongside the tests but never run here.
+          build-args: |
+            BUILD_BENCHMARKS=ON
           cache-from: type=gha,scope=release
           cache-to: type=gha,mode=max,scope=release

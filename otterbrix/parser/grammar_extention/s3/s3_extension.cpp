@@ -6,6 +6,7 @@
 #include "s3_ast.hpp"
 #include "s3_gram.hpp"
 #include "s3_scan.h"
+#include "utility/tracy_profiler.hpp"
 
 #include <cassert>
 #include <cctype>
@@ -104,6 +105,7 @@ namespace s3_ext {
     using namespace components::sql::parser;
 
     parse_extension_result_t parse(std::pmr::memory_resource* resource, const std::string& query) {
+        OTX_ZONE_N("s3_ext::parse");
         // Cheap claim check: only CREATE EXTERNAL TABLE / COPY are ours. The
         // core parser already ran and rejected this query, so we never see a
         // statement the core grammar accepts.
@@ -172,6 +174,7 @@ namespace s3_ext {
     components::logical_plan::node_ptr transform(std::pmr::memory_resource* resource,
                                                  ExtensionNode* node,
                                                  components::logical_plan::parameter_node_t* /*params*/) {
+        OTX_ZONE_N("s3_ext::transform");
         // The transformer routes by extension_id, so this only ever runs for our nodes.
         assert(node->extension_id != nullptr && std::string_view(node->extension_id) == "s3");
 

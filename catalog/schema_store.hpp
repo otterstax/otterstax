@@ -8,12 +8,28 @@
 #include <components/types/types.hpp>
 #include <core/result_wrapper.hpp>
 
+#include "utility/connection_uid.hpp" // hash_combine
+
 #include <memory_resource>
 #include <string_view>
 #include <unordered_map>
 #include <vector>
 
 namespace otterstax::catalog {
+
+    // qualified_name_t only defaults ==/<=> — the engine provides no hash for
+    // it, so supply one locally. Order-sensitive (hash_combine, not XOR): the
+    // four parts are plain strings with no disjoint value spaces — a database
+    // and a schema, or a schema and a table, may legitimately share a name —
+    // and a plain XOR cancels equal fields to zero and ignores their order,
+    // collapsing whole families of keys onto one bucket.
+    struct collection_name_hash {
+        inline std::size_t operator()(const qualified_name_t& key) const {
+            std::size_t seed = 0;
+            hash_combine(seed, key.unique_identifier, key.database, key.schema, key.collection);
+            return seed;
+        }
+    };
 
     // Actor-confined registry of external table schemas, keyed by the engine
     // pg_class OID assigned at registration time. Single writer (CatalogManager
@@ -37,11 +53,6 @@ namespace otterstax::catalog {
 
         // nullptr on miss.
         const components::types::complex_logical_type* schema_by_oid(components::catalog::oid_t oid) const;
-
-        // All oids whose name.unique_identifier equals `uid`.
-        std::pmr::vector<components::catalog::oid_t> oids_by_uid(std::string_view uid) const;
-
-        void erase(components::catalog::oid_t oid);
 
         // fn(const qualified_name_t&, components::catalog::oid_t,
         //    const components::types::complex_logical_type&)

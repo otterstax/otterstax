@@ -1,6 +1,7 @@
 add_subdirectory(kafka)
 
 set(DB_INTEGRATION_HEADERS
+    prepare_probe.hpp
     otterbrix/otterbrix_engine.hpp
     otterbrix/otterbrix_manager.hpp
     sql/connection_manager.hpp

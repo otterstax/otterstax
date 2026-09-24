@@ -35,7 +35,7 @@
 #   define OTX_ZONE_N(name)
 #   define OTX_FRAME()
 #   define OTX_FRAME_N(name)
-#   define OTX_PLOT(name, val)   (void)(val)
+#   define OTX_PLOT(name, val)   static_cast<void>(val)
 #   define OTX_MESSAGE_L(msg)
 #   define OTX_MESSAGE(msg)
 

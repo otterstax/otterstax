@@ -15,6 +15,7 @@
 
 #include <memory>
 #include <memory_resource>
+#include <string>
 #include <unordered_map>
 
 // Forward declarations for the external-table (CREATE EXTERNAL TABLE / COPY ... TO)
@@ -38,6 +39,15 @@ namespace otterstax::external {
 // metadata exclusively — no shared state, no locks (codex rules 10, 12). Each
 // Worker carries its own parser instance (rule 10: no shared objects between
 // actors).
+//
+// Prepared-statement lifecycle: prepare_schema stores the parsed statement under
+// its session hash; the first execute_statement / execute_prepared_statement
+// consumes it — the entry is erased on every exit path, success or error — and
+// any later execute on that session answers invalid_parameter ("prepared
+// statement must be re-prepared"). close_statement erases an entry the frontend
+// will never execute; it is idempotent (an unknown or consumed session closes
+// with success). Errors travel as core::error_t; the only try/catch sits
+// directly around IParser::parse.
 class Worker final : public actor_zeta::basic_actor<Worker> {
 public:
     template<typename T>
@@ -65,11 +75,13 @@ public:
     execute_prepared_statement(session_hash_t id,
                                std::pmr::vector<components::types::logical_value_t> parameters);
     unique_future<session_result> prepare_schema(session_hash_t id, std::string sql);
+    unique_future<session_result> close_statement(session_hash_t id);
 
     using dispatch_traits = actor_zeta::dispatch_traits<&Worker::execute,
                                                         &Worker::execute_statement,
                                                         &Worker::execute_prepared_statement,
-                                                        &Worker::prepare_schema>;
+                                                        &Worker::prepare_schema,
+                                                        &Worker::close_statement>;
 
     actor_zeta::behavior_t behavior(actor_zeta::mailbox::message* msg);
 
@@ -96,21 +108,37 @@ private:
     actor_zeta::address_t kafka_manager_;
     std::pmr::unordered_map<session_hash_t, metadata_t> metadata_map_;
 
+    // The parser boundary: the one place that may throw, converted to error_t
+    // on the spot. Also rejects a parse that produced no plan.
+    core::result_wrapper_t<ParsedQueryDataPtr> parse_sql(const std::string& sql);
+
+    // Backend slices first (each inlines its rows as node_raw_data), then the
+    // engine; the result is built from the session's stored schema/tag.
+    unique_future<session_result>
+    run_pipeline(session_hash_t id, ParsedQueryDataPtr data_ptr, backend_type_t backend);
+
+    // CREATE DATABASE / DROP DATABASE are engine-local by grammar, but the
+    // engine also hosts one database per connection uid (the mirrored remote
+    // schema) and the kafka object database. The catalog owns those names and
+    // refuses them (invalid_parameter) before the statement reaches the
+    // engine; any other statement passes with no_error.
+    unique_future<core::error_t> guard_database_ddl(const ParsedQueryData& data);
+
     // Routes a parsed external-table statement (CREATE EXTERNAL TABLE / COPY ... TO)
-    // to the s3 or file manager. The DDL/COPY itself produces no rows, so this
-    // returns an empty session_payload on success.
+    // to the s3 or file manager. The DDL/COPY itself produces no rows, so both
+    // return an empty session_payload on success.
     unique_future<session_result>
     handle_external_statement(session_hash_t id, const otterstax::external::external_node_t& ext);
+    unique_future<session_result>
+    load_external_table(session_hash_t id, const otterstax::external::external_node_t& ext);
+    unique_future<session_result> copy_to(session_hash_t id, const otterstax::external::external_node_t& ext);
 
     void update_metadata(session_hash_t id,
                          ParsedQueryDataPtr metadata,
                          components::types::complex_logical_type schema = {});
-    void set_backend_type_otterbrix(session_hash_t id);
-    backend_type_t get_backend_type(session_hash_t id) const;
-    ParsedQueryDataPtr get_statement(session_hash_t id);
-    const metadata_t& get_metadata(session_hash_t id) const;
 
     session_result finish_schema_value(session_hash_t id,
                                        components::cursor::cursor_t_ptr cursor,
                                        ParsedQueryDataPtr data);
+    session_result take_payload(session_hash_t id, components::cursor::cursor_t& cursor);
 };

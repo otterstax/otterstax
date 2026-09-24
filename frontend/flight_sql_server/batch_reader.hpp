@@ -16,10 +16,11 @@
 
 class ChunkBatchReader : public arrow::RecordBatchReader {
 public:
-    ChunkBatchReader(std::shared_ptr<arrow::Schema> schema, components::vector::data_chunk_t chunk);
+    ChunkBatchReader(std::shared_ptr<arrow::Schema> schema,
+                     std::pmr::vector<components::vector::data_chunk_t> chunks);
 
-    static arrow::Result<std::shared_ptr<ChunkBatchReader>> Make(std::shared_ptr<arrow::Schema> schema,
-                                                                 components::vector::data_chunk_t chunk);
+    static arrow::Result<std::shared_ptr<ChunkBatchReader>>
+    Make(std::shared_ptr<arrow::Schema> schema, std::pmr::vector<components::vector::data_chunk_t> chunks);
 
     std::shared_ptr<arrow::Schema> schema() const override;
 
@@ -27,6 +28,6 @@ public:
 
 private:
     std::shared_ptr<arrow::Schema> schema_ptr_;
-    components::vector::data_chunk_t chunk_;
-    bool used{false};
+    std::pmr::vector<components::vector::data_chunk_t> chunks_;
+    size_t next_{0};
 };

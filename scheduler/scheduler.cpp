@@ -5,6 +5,7 @@
 
 #include "otterbrix/parser/parser.hpp"
 #include "utility/logger.hpp"
+#include "utility/tracy_profiler.hpp"
 
 #include <actor-zeta.hpp>
 
@@ -176,27 +177,42 @@ actor_zeta::behavior_t Scheduler::behavior(actor_zeta::mailbox::message* msg) {
         co_await actor_zeta::dispatch(this, &Scheduler::execute_prepared_statement, msg);
     } else if (cmd == actor_zeta::msg_id<Scheduler, &Scheduler::prepare_schema>) {
         co_await actor_zeta::dispatch(this, &Scheduler::prepare_schema, msg);
+    } else if (cmd == actor_zeta::msg_id<Scheduler, &Scheduler::close_statement>) {
+        co_await actor_zeta::dispatch(this, &Scheduler::close_statement, msg);
     }
 }
 
 // ─── Handlers: route by session hash to a Worker, forward the Worker's future ──
+// Tracy zones are per-thread and strictly nested; the loop thread interleaves
+// these coroutines, so a zone spanning the co_await would close out of order.
+// Each handler therefore zones only its synchronous part — the routing inside
+// route() — and awaits outside of it.
 
+template<typename Method, typename... Args>
 actor_zeta::unique_future<Scheduler::session_result>
-Scheduler::execute(session_hash_t id, std::string sql) {
+Scheduler::route(Method method, session_hash_t id, Args&&... args) {
     const auto idx = id % workers_.size();
-    auto [needs_sched, fut] = actor_zeta::send(worker_addresses_[idx], &Worker::execute, id, std::move(sql));
+    auto [needs_sched, fut] = actor_zeta::send(worker_addresses_[idx], method, id, std::forward<Args>(args)...);
     if (needs_sched) {
         scheduler_->enqueue(workers_[idx].get());
+    }
+    return std::move(fut);
+}
+
+actor_zeta::unique_future<Scheduler::session_result> Scheduler::execute(session_hash_t id, std::string sql) {
+    unique_future<session_result> fut;
+    {
+        OTX_ZONE_N("Scheduler::execute");
+        fut = route(&Worker::execute, id, std::move(sql));
     }
     co_return co_await std::move(fut);
 }
 
-actor_zeta::unique_future<Scheduler::session_result>
-Scheduler::execute_statement(session_hash_t id) {
-    const auto idx = id % workers_.size();
-    auto [needs_sched, fut] = actor_zeta::send(worker_addresses_[idx], &Worker::execute_statement, id);
-    if (needs_sched) {
-        scheduler_->enqueue(workers_[idx].get());
+actor_zeta::unique_future<Scheduler::session_result> Scheduler::execute_statement(session_hash_t id) {
+    unique_future<session_result> fut;
+    {
+        OTX_ZONE_N("Scheduler::execute_statement");
+        fut = route(&Worker::execute_statement, id);
     }
     co_return co_await std::move(fut);
 }
@@ -204,21 +220,28 @@ Scheduler::execute_statement(session_hash_t id) {
 actor_zeta::unique_future<Scheduler::session_result>
 Scheduler::execute_prepared_statement(session_hash_t id,
                                       std::pmr::vector<components::types::logical_value_t> parameters) {
-    const auto idx = id % workers_.size();
-    auto [needs_sched, fut] =
-        actor_zeta::send(worker_addresses_[idx], &Worker::execute_prepared_statement, id, std::move(parameters));
-    if (needs_sched) {
-        scheduler_->enqueue(workers_[idx].get());
+    unique_future<session_result> fut;
+    {
+        OTX_ZONE_N("Scheduler::execute_prepared_statement");
+        fut = route(&Worker::execute_prepared_statement, id, std::move(parameters));
     }
     co_return co_await std::move(fut);
 }
 
-actor_zeta::unique_future<Scheduler::session_result>
-Scheduler::prepare_schema(session_hash_t id, std::string sql) {
-    const auto idx = id % workers_.size();
-    auto [needs_sched, fut] = actor_zeta::send(worker_addresses_[idx], &Worker::prepare_schema, id, std::move(sql));
-    if (needs_sched) {
-        scheduler_->enqueue(workers_[idx].get());
+actor_zeta::unique_future<Scheduler::session_result> Scheduler::prepare_schema(session_hash_t id, std::string sql) {
+    unique_future<session_result> fut;
+    {
+        OTX_ZONE_N("Scheduler::prepare_schema");
+        fut = route(&Worker::prepare_schema, id, std::move(sql));
+    }
+    co_return co_await std::move(fut);
+}
+
+actor_zeta::unique_future<Scheduler::session_result> Scheduler::close_statement(session_hash_t id) {
+    unique_future<session_result> fut;
+    {
+        OTX_ZONE_N("Scheduler::close_statement");
+        fut = route(&Worker::close_statement, id);
     }
     co_return co_await std::move(fut);
 }

@@ -41,9 +41,9 @@ namespace otterstax::kafka {
     //
     // It is tagged components::logical_plan::node_type::unused — mirroring
     // schema_utils::schema_node_t — and is NEVER handed to the otterbrix engine
-    // The Scheduler detects it via dynamic_cast<kafka_node_t*> on the plan root
-    // (before the schema/execute path that assumes an `unused` node is a
-    // schema_node_t) and routes it to the kafka runtime
+    // The Worker recognises it on the plan root (before the schema/execute path
+    // that assumes an `unused` node is a schema_node_t) and routes it to the
+    // kafka runtime
     class kafka_node_t final : public components::logical_plan::node_t {
     public:
         kafka_node_t(std::pmr::memory_resource* resource, kafka_op op, std::string name);
@@ -79,8 +79,9 @@ namespace otterstax::kafka {
 
     using kafka_node_ptr = boost::intrusive_ptr<kafka_node_t>;
 
-    // Maps a (case-insensitive) SQL type keyword to an otterbrix logical type
-    // std::nullopt for an unrecognized type
+    // Maps a (case-insensitive) SQL type keyword to an otterbrix logical type.
+    // Only the JSON-ingestible types are accepted (INTEGER, BIGINT, DOUBLE, BOOLEAN,
+    // STRING_LITERAL); std::nullopt for anything else, which CREATE rejects
     std::optional<components::types::complex_logical_type> map_column_type(std::string_view type_name);
 
     // Lowers a parsed kafka AST statement into a kafka_node_t built on `resource`
@@ -106,7 +107,7 @@ namespace otterstax::kafka {
     // If `root` is a plain-SQL INSERT whose target table lives in the kafka
     // database, return its target + source; else std::nullopt. The transformer
     // wraps a write as a sequence_t whose *direct* children are the target
-    // catalog_resolve_table_t and the insert_t (the source's own resolve nodes
+    // catalog_resolve (kind == table) and the insert_t (the source's own resolve nodes
     // sit deeper, under the insert), so only root + its direct children are
     // inspected — `INSERT INTO kafka.a SELECT FROM kafka.b` resolves to `a`.
     std::optional<kafka_write_t> kafka_write_target(const components::logical_plan::node_ptr& root);
@@ -121,12 +122,17 @@ namespace otterstax::kafka {
     };
 
     // Find the first aggregate_t in a parsed SELECT plan and return its source
-    // relname + operator children; std::nullopt if there is no aggregate. The
-    // operators are RE-HOMED to an empty dbname/relname (rebuilt, reusing their
-    // expressions) so they chain over a node_raw_data substitution — a parsed
-    // operator keeps its source table's relname, which otherwise stops it from
-    // picking up the raw_data rows. (match_t/select_t handled; other operator
-    // types are returned as-is.)
+    // relname + operator children; std::nullopt if there is no aggregate. EVERY
+    // child is carried: the SELECT list rides in the group_t and the select_t is
+    // what the validator moves it into when the query is not grouped — an operator
+    // left out changes the projection. The operators are RE-HOMED to an empty
+    // dbname/relname (rebuilt, reusing their expressions) so they chain over a
+    // node_raw_data substitution — a parsed operator keeps its source table's
+    // relname, which otherwise stops it from picking up the raw_data rows and
+    // makes every batch resolve a table the swapped plan never reads.
+    // (match/select/group and the ORDER BY / LIMIT / HAVING tail are rebuilt — every
+    // operator type the transformer names the source table on; any other type is
+    // returned as-is.)
     std::optional<kafka_stream_plan_t> kafka_stream_source(std::pmr::memory_resource* resource,
                                                            const components::logical_plan::node_ptr& root);
 

@@ -3,81 +3,115 @@
 
 #include "catalog_manager.hpp"
 
+#include "integration/clickhouse/connection_manager.hpp"
 #include "integration/otterbrix/otterbrix_manager.hpp"
+#include "integration/postgresql/connection_manager.hpp"
+#include "integration/sql/connection_manager.hpp"
+#include "otterbrix/parser/grammar_extension/kafka/kafka_node.hpp"
 #include "utility/tracy_profiler.hpp"
 
 #include <components/logical_plan/identifier_types.hpp>
+#include <components/logical_plan/node_drop.hpp>
 #include <components/table/column_definition.hpp>
 
+#include <algorithm>
+#include <cctype>
+#include <string_view>
 #include <thread>
 
 using namespace components;
 
 namespace {
 
-    // Single-quoted SQL string literal for the handwritten discovery list
-    // queries (information_schema / system.tables): embedded quotes doubled.
-    // Lives here because these are the only handwritten queries left — every
-    // per-table probe goes through sql_gen::generate_query.
-    std::string escape_sql_literal(const std::string& value) {
-        std::string out;
-        out.reserve(value.size() + 2);
-        out.push_back('\'');
-        for (char c : value) {
-            if (c == '\'') {
-                out.push_back('\'');
-            }
-            out.push_back(c);
-        }
-        out.push_back('\'');
-        return out;
+    // result_wrapper_t only exposes its error by const reference, and a plain
+    // error_t copy re-allocates the message on the default resource. Rebuild
+    // the error on the actor's own resource instead.
+    core::error_t copy_error(std::pmr::memory_resource* resource, const core::error_t& err) {
+        return core::error_t(err.type, std::pmr::string{err.what.c_str(), resource});
     }
 
-    // Backend-dialect schema probe (SELECT * FROM <table> WHERE 1 = 0) built
-    // through the regular plan-driven generator — the single quoting point.
-    // The always-false predicate is two bound parameters, so no fake column
-    // identifier appears in the generated SQL.
-    std::string make_schema_probe_query(std::pmr::memory_resource* resource,
-                                        const qualified_name_t& name,
-                                        backend_type_t backend) {
-        logical_plan::parameter_node_t param(resource);
-        auto node = logical_plan::make_node_aggregate(resource,
-                                                      core::uid_t{name.unique_identifier},
-                                                      core::dbname_t{name.database},
-                                                      core::relname_t{name.collection});
-        node->append_child(logical_plan::make_node_match(
-            resource,
-            core::dbname_t{name.database},
-            core::relname_t{name.collection},
-            expressions::make_compare_expression(resource,
-                                                 expressions::compare_type::eq,
-                                                 param.add_parameter(types::logical_value_t(resource, 1)),
-                                                 param.add_parameter(types::logical_value_t(resource, 0)))));
-
-        otterstax::names::resolved_target_t probe_target{components::catalog::INVALID_OID, name, {}};
-        std::pmr::vector<external_entry_t> empty_batch{resource};
-        return sql_gen::generate_query(node, &param.parameters(), backend, probe_target, empty_batch);
+    core::error_t make_error(std::pmr::memory_resource* resource, core::error_code_t code, const std::string& what) {
+        return core::error_t(code, std::pmr::string{what.c_str(), resource});
     }
 
-    // §2.1: per-table discovery failures are collected and folded into one
-    // hard error naming the failure count and the first few tables.
-    core::error_t make_discovery_error(std::pmr::memory_resource* resource,
-                                       const std::pmr::vector<std::pmr::string>& failed_tables) {
-        constexpr size_t max_named = 3;
-        std::pmr::string msg{resource};
-        msg.append("Schema discovery failed for ");
-        msg.append(std::to_string(failed_tables.size()).c_str());
-        msg.append(" table(s): ");
-        for (size_t i = 0; i < failed_tables.size() && i < max_named; ++i) {
-            if (i != 0) {
-                msg.append(", ");
+    // True when the external entry's node needs no registered schema: CREATE
+    // targets a table that does not exist yet, DROP removes one, and a subquery
+    // stub (schema_node_t, node_type::unused) names no relation to register —
+    // its schema is the backend's, which ClickhouseManager::describe writes
+    // into the stub at prepare. Of the drop kinds only DROP TABLE and
+    // DROP INDEX carry an alias-qualified name (the parser's
+    // carries_table_reference); any other kind inside external_nodes is a
+    // contract violation, not a target to skip.
+    core::result_wrapper_t<bool> is_schema_exempt(std::pmr::memory_resource* resource,
+                                                  const logical_plan::node_t& node) {
+        switch (node.type()) {
+            case logical_plan::node_type::create_collection_t:
+            case logical_plan::node_type::create_index_t:
+            case logical_plan::node_type::unused:
+                return true;
+            case logical_plan::node_type::drop_t: {
+                const auto kind = static_cast<const logical_plan::node_drop_t&>(node).kind();
+                if (kind == logical_plan::drop_target_kind::collection ||
+                    kind == logical_plan::drop_target_kind::index) {
+                    return true;
+                }
+                return make_error(resource,
+                                  core::error_code_t::invalid_parameter,
+                                  "External DROP target of kind " + std::to_string(static_cast<int>(kind)) +
+                                      " carries no alias-qualified table name");
             }
-            msg.append(failed_tables[i]);
+            default:
+                return false;
         }
-        if (failed_tables.size() > max_named) {
-            msg.append(", ...");
+    }
+
+    // ASCII case-insensitive equality: identifiers reach the engine lower-cased
+    // unless quoted, while a connection uid keeps its configured spelling.
+    bool iequals(std::string_view lhs, std::string_view rhs) {
+        return lhs.size() == rhs.size() &&
+               std::equal(lhs.begin(), lhs.end(), rhs.begin(), [](unsigned char a, unsigned char b) {
+                   return std::tolower(a) == std::tolower(b);
+               });
+    }
+
+    // SQL LIKE over the whole value: `%` matches any run, `_` one character,
+    // everything else literally (no escape character — FlightSQL patterns
+    // define none). Case-sensitive, like the names it filters.
+    bool like_match(std::string_view pattern, std::string_view value) {
+        size_t p = 0;
+        size_t v = 0;
+        size_t star_p = std::string_view::npos;
+        size_t star_v = 0;
+        while (v < value.size()) {
+            if (p < pattern.size() && pattern[p] == '%') {
+                star_p = p++;
+                star_v = v;
+            } else if (p < pattern.size() && (pattern[p] == '_' || pattern[p] == value[v])) {
+                ++p;
+                ++v;
+            } else if (star_p != std::string_view::npos) {
+                p = star_p + 1;
+                v = ++star_v;
+            } else {
+                return false;
+            }
         }
-        return core::error_t(core::error_code_t::schema_error, std::move(msg));
+        while (p < pattern.size() && pattern[p] == '%') {
+            ++p;
+        }
+        return p == pattern.size();
+    }
+
+    const char* backend_name(catalog_ext::ConnectionType type) {
+        switch (type) {
+            case catalog_ext::ConnectionType::MySQL:
+                return "MySQL";
+            case catalog_ext::ConnectionType::PostgreSQL:
+                return "PostgreSQL";
+            case catalog_ext::ConnectionType::ClickHouse:
+                return "ClickHouse";
+        }
+        return "unknown";
     }
 
 } // namespace
@@ -88,53 +122,34 @@ namespace mysql {
         , log_(get_logger(logger_tag::CATALOG_MANAGER))
         , store_(res)
         , otterbrix_manager_(std::move(otterbrix_manager))
-        , registered_dbs_(res)
-        , mysql_conn_manager_(nullptr)
-        , pg_conn_manager_(nullptr)
-        , ch_conn_manager_(nullptr) {
+        , mysql_manager_(actor_zeta::address_t::empty_address())
+        , pg_manager_(actor_zeta::address_t::empty_address())
+        , ch_manager_(actor_zeta::address_t::empty_address())
+        , connection_registry_(res) {
         assert(log_.is_valid());
         assert(res != nullptr);
         log_->info("CatalogManager initialized successfully");
     }
 
-    void CatalogManager::set_mysql_connector_manager(std::shared_ptr<ConnectorManager> mysql_conn_manager) {
-        mysql_conn_manager_ = std::move(mysql_conn_manager);
+    void CatalogManager::set_backend_managers(actor_zeta::address_t mysql_manager,
+                                              actor_zeta::address_t pg_manager,
+                                              actor_zeta::address_t ch_manager) {
+        mysql_manager_ = std::move(mysql_manager);
+        pg_manager_ = std::move(pg_manager);
+        ch_manager_ = std::move(ch_manager);
     }
 
-    void CatalogManager::set_pg_connector_manager(std::shared_ptr<pg::ConnectorManager> pg_conn_manager) {
-        pg_conn_manager_ = std::move(pg_conn_manager);
-    }
-
-    void CatalogManager::set_ch_connector_manager(std::shared_ptr<ch::ConnectorManager> ch_conn_manager) {
-        ch_conn_manager_ = std::move(ch_conn_manager);
-    }
-
-    void CatalogManager::registerConnection(const std::string& uuid,
-                                            catalog_ext::ConnectionType type,
-                                            const qualified_name_t& name) {
-        std::lock_guard lock(connection_registry_mtx_);
-        connection_registry_[uuid] = catalog_ext::ConnectionInfo{uuid, type, name};
+    void CatalogManager::registerConnection(const std::string& uuid, catalog_ext::ConnectionType type) {
+        connection_registry_.insert_or_assign(std::pmr::string{uuid.c_str(), resource()}, type);
         log_->debug("Registered connection: {} with type: {}", uuid, static_cast<int>(type));
     }
 
-    void CatalogManager::unregisterConnection(const std::string& uuid) {
-        std::lock_guard lock(connection_registry_mtx_);
-        connection_registry_.erase(uuid);
-        log_->debug("Unregistered connection: {}", uuid);
-    }
-
     std::optional<catalog_ext::ConnectionType> CatalogManager::getConnectionType(const std::string& uuid) const {
-        std::lock_guard lock(connection_registry_mtx_);
-        auto it = connection_registry_.find(uuid);
+        auto it = connection_registry_.find(std::pmr::string{uuid.c_str(), resource()});
         if (it != connection_registry_.end()) {
-            return it->second.type;
+            return it->second;
         }
         return std::nullopt;
-    }
-
-    bool CatalogManager::hasConnection(const std::string& uuid) const {
-        std::lock_guard lock(connection_registry_mtx_);
-        return connection_registry_.contains(uuid);
     }
 
     std::pair<bool, actor_zeta::detail::enqueue_result>
@@ -166,8 +181,8 @@ namespace mysql {
             co_await actor_zeta::dispatch(this, &CatalogManager::update_backend_type, msg);
         } else if (cmd == actor_zeta::msg_id<CatalogManager, &CatalogManager::add_connection_schema>) {
             co_await actor_zeta::dispatch(this, &CatalogManager::add_connection_schema, msg);
-        } else if (cmd == actor_zeta::msg_id<CatalogManager, &CatalogManager::remove_connection_schema>) {
-            co_await actor_zeta::dispatch(this, &CatalogManager::remove_connection_schema, msg);
+        } else if (cmd == actor_zeta::msg_id<CatalogManager, &CatalogManager::check_database_ownership>) {
+            co_await actor_zeta::dispatch(this, &CatalogManager::check_database_ownership, msg);
         } else if (cmd == actor_zeta::msg_id<CatalogManager, &CatalogManager::get_tables>) {
             co_await actor_zeta::dispatch(this, &CatalogManager::get_tables, msg);
         }
@@ -179,10 +194,16 @@ namespace mysql {
         log_->debug("update_backend_type_impl: start updating backend type for query with external nodes count {}",
                     static_cast<int>(data->otterbrix_params->external_nodes.size()));
 
+        // Classification runs exactly once per parsed statement: the Worker
+        // stores the classified data and never sends it back, so a statement
+        // that already carries a backend type is a caller contract violation.
         if (data->backend_type != backend_type_t::Unknown) {
-            log_->error("update_backend_type_impl: Backend type is already set to {}, cannot update",
+            log_->error("update_backend_type_impl: backend type is already set to {}",
                         static_cast<int>(data->backend_type));
-            return std::move(data); // Return original data without setting backend type
+            return make_error(resource(),
+                              core::error_code_t::invalid_parameter,
+                              "Backend type is already classified as " +
+                                  std::to_string(static_cast<int>(data->backend_type)));
         }
 
         bool has_mysql = false;
@@ -210,18 +231,12 @@ namespace mysql {
                     }
                 }
 
-                // DDL targets are exempt from OID stamping: CREATE targets a
-                // table that does not exist yet, DROP removes one — neither
-                // needs a registered schema to be routed. Subquery stubs
-                // (schema_node_t, node_type::unused) are placeholders whose
-                // schema is computed from the subquery plan — not remote
-                // tables either.
-                auto node_type = (*entry.node)->type();
-                if (node_type == logical_plan::node_type::create_collection_t ||
-                    node_type == logical_plan::node_type::drop_collection_t ||
-                    node_type == logical_plan::node_type::create_index_t ||
-                    node_type == logical_plan::node_type::drop_index_t ||
-                    node_type == logical_plan::node_type::unused) {
+                auto exempt = is_schema_exempt(resource(), **entry.node);
+                if (exempt.has_error()) {
+                    log_->error("update_backend_type_impl: {}", exempt.error().what.c_str());
+                    return copy_error(resource(), exempt.error());
+                }
+                if (exempt.value()) {
                     continue;
                 }
 
@@ -231,10 +246,9 @@ namespace mysql {
                     if (!name.unique_identifier.empty()) {
                         log_->error("update_backend_type_impl: no registered schema for external table {}",
                                     name.to_string());
-                        return core::error_t(
-                            core::error_code_t::table_not_exists,
-                            std::pmr::string{("External table is not registered: " + name.to_string()).c_str(),
-                                             resource()});
+                        return make_error(resource(),
+                                          core::error_code_t::table_not_exists,
+                                          "External table is not registered: " + name.to_string());
                     }
                     // No connection uid — local Otterbrix table, resolved by the engine itself.
                 } else {
@@ -266,15 +280,17 @@ namespace mysql {
             } else {
                 log_->error(
                     "update_backend_type_impl: Can't determine backend type: no connections found for external nodes");
-                return std::move(data);
+                return make_error(resource(),
+                                  core::error_code_t::schema_error,
+                                  "Cannot determine backend type: no registered connection for the external nodes");
             }
         }
         log_->debug("update_backend_type_impl: determined backend_type = {}", static_cast<int>(data->backend_type));
         return std::move(data);
     }
 
-    actor_zeta::unique_future<core::error_t>
-    CatalogManager::ensure_external_targets_registered(ParsedQueryData& data) {
+    actor_zeta::unique_future<core::error_t> CatalogManager::ensure_external_targets_registered(ParsedQueryData& data) {
+        OTX_ZONE_N("catalog::ensure_external_targets_registered");
         // Normalize names and lazily register external tables the engine does
         // not know yet (e.g. created at runtime by a previous DDL statement).
         // Must run BEFORE update_backend_type_impl: OID stamping there requires
@@ -285,14 +301,12 @@ namespace mysql {
                 if (target.name.unique_identifier.empty()) {
                     continue;
                 }
-                auto node_type = (*entry.node)->type();
-                if (node_type == logical_plan::node_type::create_collection_t ||
-                    node_type == logical_plan::node_type::drop_collection_t ||
-                    node_type == logical_plan::node_type::create_index_t ||
-                    node_type == logical_plan::node_type::drop_index_t ||
-                    node_type == logical_plan::node_type::unused) {
-                    // CREATE targets do not exist yet; DROP needs no schema;
-                    // subquery stubs (schema_node_t) are computed, not remote.
+                auto exempt = is_schema_exempt(resource(), **entry.node);
+                if (exempt.has_error()) {
+                    log_->error("ensure_external_targets_registered: {}", exempt.error().what.c_str());
+                    co_return copy_error(resource(), exempt.error());
+                }
+                if (exempt.value()) {
                     continue;
                 }
                 auto conn_type_opt = getConnectionType(target.name.unique_identifier);
@@ -301,9 +315,19 @@ namespace mysql {
                     target.name.schema = "";
                 }
                 if (store_.find(target.name) == components::catalog::INVALID_OID) {
-                    auto err = co_await add_connection_schema(target.name);
+                    // The registry is the only source of a uid's backend here:
+                    // a uid it does not know was never registered by a
+                    // connector manager, so there is no backend to probe.
+                    if (!conn_type_opt.has_value()) {
+                        log_->error("ensure_external_targets_registered: no registered connection for uid {}",
+                                    target.name.unique_identifier);
+                        co_return make_error(resource(),
+                                             core::error_code_t::do_not_exists,
+                                             "No registered connection for uuid: " + target.name.unique_identifier);
+                    }
+                    auto err = co_await register_tables(target.name, conn_type_opt.value());
                     if (err.contains_error()) {
-                        co_return err;
+                        co_return std::move(err);
                     }
                 }
             }
@@ -321,18 +345,10 @@ namespace mysql {
         }
         auto impl_result = update_backend_type_impl(std::move(data));
         if (impl_result.has_error()) {
-            log_->error("update_backend_type: {}", impl_result.error().what);
+            log_->error("update_backend_type: {}", impl_result.error().what.c_str());
             co_return std::move(impl_result);
         }
         auto updated_data = std::move(impl_result.value());
-        if (updated_data->backend_type == backend_type_t::Unknown) {
-            log_->error("update_backend_type: Backend type is unknown after update_backend_type_impl, cannot proceed");
-            co_return core::error_t(
-                core::error_code_t::schema_error,
-                std::pmr::string{"Backend type is unknown after update_backend_type_impl, cannot proceed",
-                                 resource()});
-        }
-
         log_->debug("update_backend_type: determined backend_type = {}", static_cast<int>(updated_data->backend_type));
         co_return std::move(updated_data);
     }
@@ -347,24 +363,17 @@ namespace mysql {
 
         auto impl_result = update_backend_type_impl(std::move(data));
         if (impl_result.has_error()) {
-            log_->error("get_catalog_schema: {}", impl_result.error().what);
+            log_->error("get_catalog_schema: {}", impl_result.error().what.c_str());
             co_return std::move(impl_result);
         }
         auto updated_data = std::move(impl_result.value());
-        if (updated_data->backend_type == backend_type_t::Unknown) {
-            log_->error("get_catalog_schema: Backend type is unknown after update_backend_type_impl, cannot proceed");
-            co_return core::error_t(
-                core::error_code_t::schema_error,
-                std::pmr::string{"Backend type is unknown after update_backend_type_impl, cannot proceed",
-                                 resource()});
-        }
 
         log_->debug(
             "get_catalog_schema: start getting catalog schema for query with external nodes count {}, backend type {}",
             static_cast<int>(updated_data->otterbrix_params->external_nodes.size()),
             static_cast<int>(updated_data->backend_type));
 
-        // a13 transformer output wraps table-referencing statements in a
+        // The transformer wraps table-referencing statements in a
         // node_sequence_t whose data-producing node is the LAST child;
         // planner-emitted sequences order children differently but never
         // reach this path. Unwrap before the aggregate check below.
@@ -372,9 +381,9 @@ namespace mysql {
         if (schema_root->type() == logical_plan::node_type::sequence_t) {
             if (schema_root->children().empty()) {
                 log_->error("get_catalog_schema: sequence node has no children, cannot resolve schema");
-                co_return core::error_t(
-                    core::error_code_t::schema_error,
-                    std::pmr::string{"Sequence node has no children, cannot resolve schema", resource()});
+                co_return make_error(resource(),
+                                     core::error_code_t::schema_error,
+                                     "Sequence node has no children, cannot resolve schema");
             }
             schema_root = schema_root->children().back().get();
         }
@@ -394,11 +403,9 @@ namespace mysql {
                     if (struct_schema == nullptr) {
                         log_->error("get_catalog_schema: no schema registered for external table {}",
                                     target.name.to_string());
-                        co_return core::error_t(
-                            core::error_code_t::schema_error,
-                            std::pmr::string{
-                                ("No schema registered for external table: " + target.name.to_string()).c_str(),
-                                resource()});
+                        co_return make_error(resource(),
+                                             core::error_code_t::schema_error,
+                                             "No schema registered for external table: " + target.name.to_string());
                     }
 
                     const auto& agg = static_cast<logical_plan::node_aggregate_t&>(*(*node));
@@ -422,63 +429,110 @@ namespace mysql {
         co_return std::move(updated_data);
     }
 
-    actor_zeta::unique_future<core::error_t> CatalogManager::add_connection_schema(qualified_name_t name) {
+    actor_zeta::unique_future<core::error_t> CatalogManager::add_connection_schema(qualified_name_t name,
+                                                                                   catalog_ext::ConnectionType type) {
         OTX_ZONE_N("catalog::add_connection_schema");
+        // One uid belongs to exactly one backend: the registry entry made by a
+        // previous registration is authoritative, and a message naming another
+        // backend for the same uid is a wiring error, not a re-registration.
+        auto registered = getConnectionType(name.unique_identifier);
+        if (registered.has_value() && registered.value() != type) {
+            log_->error("add_connection_schema: uid {} is registered as {}, not {}",
+                        name.unique_identifier,
+                        backend_name(registered.value()),
+                        backend_name(type));
+            co_return make_error(resource(),
+                                 core::error_code_t::invalid_parameter,
+                                 "Connection '" + name.unique_identifier + "' is registered as " +
+                                     backend_name(registered.value()) + ", not " + backend_name(type));
+        }
+        co_return co_await register_tables(name, type);
+    }
+
+    actor_zeta::unique_future<core::error_t> CatalogManager::register_tables(const qualified_name_t& name,
+                                                                             catalog_ext::ConnectionType type) {
+        OTX_ZONE_N("catalog::register_tables");
         const std::string uuid = name.unique_identifier;
 
-        // Determine connection type by checking which ConnectorManager has this connection.
-        catalog_ext::ConnectionType conn_type;
-        if (mysql_conn_manager_ && mysql_conn_manager_->hasConnection(uuid)) {
-            conn_type = catalog_ext::ConnectionType::MySQL;
-            log_->debug("add_connection_schema: detected MySQL connection for uuid: {}", uuid);
-        } else if (pg_conn_manager_ && pg_conn_manager_->hasConnection(uuid)) {
-            conn_type = catalog_ext::ConnectionType::PostgreSQL;
-            log_->debug("add_connection_schema: detected PostgreSQL connection for uuid: {}", uuid);
-        } else if (ch_conn_manager_ && ch_conn_manager_->hasConnection(uuid)) {
-            conn_type = catalog_ext::ConnectionType::ClickHouse;
-            log_->debug("add_connection_schema: detected ClickHouse connection for uuid: {}", uuid);
-        } else {
-            log_->error("add_connection_schema: no connector manager has connection with uuid: {}", uuid);
-            co_return core::error_t(
-                core::error_code_t::missing_field,
-                std::pmr::string{("No connector manager found for uuid: " + uuid).c_str(), resource()});
-        }
-
         // Step 1: probe the remote backend and collect per-table STRUCT schemas.
-        catalog_ext::discovered_tables_t tables(resource());
-        if (auto err = co_await discover_connection_schemas(name, conn_type, tables); err.contains_error()) {
-            co_return err;
+        auto discovered = co_await discover_connection_schemas(name, type);
+        if (discovered.has_error()) {
+            co_return copy_error(resource(), discovered.error());
+        }
+        auto& tables = discovered.value();
+
+        // A mirrored column is defined by its name, so a discovered column without
+        // one fails the whole registration before the engine is touched. Its type
+        // may carry no alias at all, and alias() has no null guard for such a type.
+        for (const auto& table : tables) {
+            const auto& fields = table.schema.child_types();
+            for (size_t i = 0; i < fields.size(); ++i) {
+                if (!fields[i].has_alias()) {
+                    const std::string what = "Discovered table '" + table.name.to_string() +
+                                             "' has a column without a name at position " + std::to_string(i);
+                    log_->error("add_connection_schema: {}", what);
+                    co_return make_error(resource(), core::error_code_t::schema_error, what);
+                }
+            }
         }
 
-        registerConnection(uuid, conn_type, name);
-
-        // Step 2: make sure the per-connection engine database exists (one per uid).
-        std::pmr::string uid_key{uuid.c_str(), resource()};
-        if (!registered_dbs_.contains(uid_key)) {
+        // Step 2: the uid's first registration in this process makes the
+        // per-connection engine database exist. The registry says whether it
+        // is the first: a uid enters it only once its tables are mirrored, so a
+        // failed attempt repeats this step. A database the engine already held
+        // is the mirror a previous run left on this data dir; every mirror in
+        // it that this discovery did not return is dropped before the
+        // discovered ones are reconciled table by table.
+        if (!getConnectionType(uuid).has_value()) {
             auto [db_sched, db_future] =
                 actor_zeta::send(otterbrix_manager_, &db::OtterbrixManager::register_external_database, uuid);
             auto db_result = co_await std::move(db_future);
             if (db_result.has_error()) {
                 log_->error("add_connection_schema: failed to create engine database for uid {}: {}",
                             uuid,
-                            db_result.error().what);
-                co_return core::error_t(
-                    core::error_code_t::schema_error,
-                    std::pmr::string{("Failed to create engine database for uid '" + uuid +
-                                      "': " + db_result.error().what.c_str())
-                                         .c_str(),
-                                     resource()});
+                            db_result.error().what.c_str());
+                co_return make_error(resource(),
+                                     core::error_code_t::schema_error,
+                                     "Failed to create engine database for uid '" + uuid +
+                                         "': " + db_result.error().what.c_str());
             }
-            registered_dbs_.insert(uid_key);
+            const bool created = db_result.value();
+            if (!created) {
+                std::pmr::vector<qualified_name_t> live(resource());
+                live.reserve(tables.size());
+                for (const auto& table : tables) {
+                    live.push_back(table.name);
+                }
+                auto [stale_sched, stale_future] = actor_zeta::send(
+                    otterbrix_manager_, &db::OtterbrixManager::drop_stale_external_tables, uuid, std::move(live));
+                auto stale_result = co_await std::move(stale_future);
+                if (stale_result.has_error()) {
+                    log_->error("add_connection_schema: failed to drop the stale mirrors of uid {}: {}",
+                                uuid,
+                                stale_result.error().what.c_str());
+                    co_return make_error(resource(),
+                                         core::error_code_t::schema_error,
+                                         "Failed to drop the stale mirrors of uid '" + uuid +
+                                             "': " + stale_result.error().what.c_str());
+                }
+                log_->info("add_connection_schema: uid {} reuses its engine database; {} stale mirror(s) dropped",
+                           uuid,
+                           stale_result.value());
+            }
         }
 
-        // Step 3: register each discovered table in the engine catalog and mirror it locally.
+        // Step 3: register each discovered table in the engine catalog and
+        // mirror it locally. The engine side reconciles a mirror a previous run
+        // left (register_external_table); the OID it answers is the one the
+        // engine holds, created or restored.
         for (auto& table : tables) {
             if (store_.find(table.name) != components::catalog::INVALID_OID) {
                 log_->info("add_connection_schema: table {} already registered, skipping", table.name.to_string());
                 continue;
             }
 
+            // std::vector: the engine's make_node_create_collection takes the
+            // column definitions by std::vector.
             const auto& fields = table.schema.child_types();
             std::vector<components::table::column_definition_t> columns;
             columns.reserve(fields.size());
@@ -494,456 +548,149 @@ namespace mysql {
             if (tbl_result.has_error()) {
                 log_->error("add_connection_schema: failed to register external table {}: {}",
                             table.name.to_string(),
-                            tbl_result.error().what);
-                co_return core::error_t(
-                    core::error_code_t::schema_error,
-                    std::pmr::string{("Failed to register external table '" + table.name.to_string() +
-                                      "': " + tbl_result.error().what.c_str())
-                                         .c_str(),
-                                     resource()});
+                            tbl_result.error().what.c_str());
+                co_return make_error(resource(),
+                                     core::error_code_t::schema_error,
+                                     "Failed to register external table '" + table.name.to_string() +
+                                         "': " + tbl_result.error().what.c_str());
             }
 
             auto oid = tbl_result.value();
             if (auto err = store_.put(oid, table.name, std::move(table.schema)); err.contains_error()) {
                 log_->error("add_connection_schema: failed to store schema for table {}: {}",
                             table.name.to_string(),
-                            err.what);
-                co_return err;
+                            err.what.c_str());
+                // The engine already holds the collection; without its mirror
+                // in the store it would resolve nowhere, so the registration is
+                // undone before the failure is reported. A failed undo is
+                // reported on top of the original error, never in its place.
+                auto [drop_sched, drop_future] =
+                    actor_zeta::send(otterbrix_manager_, &db::OtterbrixManager::drop_external_table, table.name);
+                auto drop_result = co_await std::move(drop_future);
+                if (drop_result.has_error()) {
+                    log_->error("add_connection_schema: failed to undo the engine registration of {}: {}",
+                                table.name.to_string(),
+                                drop_result.error().what.c_str());
+                    err.what.append("; undo failed: ");
+                    err.what.append(drop_result.error().what);
+                }
+                co_return std::move(err);
             }
             log_->info("add_connection_schema: registered {} with oid {}", table.name.to_string(), oid);
         }
 
+        // The uid becomes routable only once its tables are mirrored: a failure
+        // above leaves the registry unchanged, so the next statement naming the
+        // uid retries discovery instead of resolving against a missing schema.
+        registerConnection(uuid, type);
         co_return core::error_t::no_error();
     }
 
-    // Discovery only — engine registration and the connection-type registry
-    // update happen in add_connection_schema. Coroutine: every connector
-    // future is consumed at the top level of this body (one query in flight
-    // per connection at a time); result handlers never issue queries
-    // themselves. Unified contract: empty `name.collection` → discover every
-    // table of the configured database/schema; non-empty → that single table.
-    actor_zeta::unique_future<core::error_t>
-    CatalogManager::discover_connection_schemas(const qualified_name_t& name,
-                                                catalog_ext::ConnectionType conn_type,
-                                                catalog_ext::discovered_tables_t& out) {
-        OTX_ZONE_N("catalog::discover_connection_schemas");
-        const std::string& uuid = name.unique_identifier;
-
-        if (conn_type == catalog_ext::ConnectionType::MySQL) {
-            // MySQL: query schema using boost::mysql
-            if (name.collection.empty()) {
-                // Whole-database discovery via information_schema.
-                if (name.database.empty()) {
-                    log_->error("discover_connection_schemas: no MySQL database configured for uuid {}", uuid);
-                    co_return core::error_t(
-                        core::error_code_t::missing_field,
-                        std::pmr::string{
-                            ("Cannot discover MySQL schema: no database configured for uuid: " + uuid).c_str(),
-                            resource()});
-                }
-
-                // Phase 1: list table names — one query, consumed here; the
-                // handler only collects names and never issues queries itself.
-                std::string list_tables_query =
-                    "SELECT table_name FROM information_schema.tables WHERE table_schema = " +
-                    escape_sql_literal(name.database) + " AND table_type = 'BASE TABLE';";
-                log_->debug("discover_connection_schemas: empty table, querying information_schema: \"{}\"",
-                            list_tables_query);
-
-                std::pmr::vector<std::pmr::string> table_names(resource());
-                auto list_handler = [&table_names](const boost::mysql::results& result) -> otterstax::asio_error_t {
-                    for (auto row : result.rows()) {
-                        auto view = row.at(0).as_string();
-                        table_names.emplace_back(view.data(), view.size());
-                    }
-                    return otterstax::asio_error_t{};
-                };
-
-                try {
-                    auto future = mysql_conn_manager_->executeQuery(uuid, list_tables_query, list_handler);
-                    if (auto err = std::move(future.get()).release(); err.contains_error()) {
-                        co_return err;
-                    }
-                } catch (const std::exception& e) {
-                    log_->error("discover_connection_schemas: failed to query table list from MySQL database {}",
-                                name.database);
-                    co_return core::error_t(
-                        core::error_code_t::missing_field,
-                        std::pmr::string{(std::string("Failed to list MySQL tables: ") + e.what()).c_str(),
-                                         resource()});
-                }
-                log_->info("discover_connection_schemas: found {} tables in MySQL database {}",
-                           table_names.size(),
-                           name.database);
-
-                // Phase 2: probe each table sequentially at coroutine top
-                // level — the connection is free between queries. Any failed
-                // table fails the whole discovery (§2.1).
-                std::pmr::vector<std::pmr::string> failed_tables(resource());
-                for (const auto& tn : table_names) {
-                    std::string table_name{tn.c_str(), tn.size()};
-                    log_->debug("discover_connection_schemas: processing MySQL table {}", table_name);
-
-                    qualified_name_t table_name_obj(uuid, name.database, "", table_name);
-                    auto schema_handler =
-                        [this, table_name_obj, &out](const boost::mysql::results& result) -> otterstax::asio_error_t {
-                        auto schema_struct = tsl::mysql_to_struct(resource(), result.meta());
-                        out.push_back(catalog_ext::discovered_table_t{table_name_obj, std::move(schema_struct)});
-                        log_->info("discover_connection_schemas: schema discovered for: {}",
-                                   table_name_obj.to_string());
-                        return otterstax::asio_error_t{};
-                    };
-
-                    std::string schema_query = make_schema_probe_query(resource(), table_name_obj, backend_type_t::MySQL);
-                    try {
-                        auto future = mysql_conn_manager_->executeQuery(uuid, schema_query, schema_handler);
-                        if (auto err = std::move(future.get()).release(); err.contains_error()) {
-                            log_->error("discover_connection_schemas: failed to fetch schema for {}.{}: {}",
-                                        name.database,
-                                        table_name,
-                                        err.what.c_str());
-                            failed_tables.emplace_back((name.database + "." + table_name).c_str());
-                        }
-                    } catch (const std::exception& e) {
-                        log_->error("discover_connection_schemas: failed to query schema for {}.{}: {}",
-                                    name.database,
-                                    table_name,
-                                    e.what());
-                        failed_tables.emplace_back((name.database + "." + table_name).c_str());
-                    }
-                }
-                if (!failed_tables.empty()) {
-                    co_return make_discovery_error(resource(), failed_tables);
-                }
-                co_return core::error_t::no_error();
-            }
-
-            // Single-table probe.
-            auto schema_handler = [this, &name, &out](const boost::mysql::results& result) -> otterstax::asio_error_t {
-                auto schema_struct = tsl::mysql_to_struct(resource(), result.meta());
-                out.push_back(catalog_ext::discovered_table_t{name, std::move(schema_struct)});
-                log_->info("discover_connection_schemas: schema discovered for: {}", name.to_string());
-                return otterstax::asio_error_t{};
-            };
-
-            std::string query = make_schema_probe_query(resource(), name, backend_type_t::MySQL);
-            log_->debug("discover_connection_schemas: Generated MySQL Query: \"{}\"", query);
-
-            try {
-                auto future = mysql_conn_manager_->executeQuery(uuid, query, schema_handler);
-                co_return std::move(future.get()).release();
-            } catch (const std::exception& e) {
-                log_->error("discover_connection_schemas: failed to query MySQL schema for {}", name.to_string());
-                co_return core::error_t(
-                    core::error_code_t::missing_field,
-                    std::pmr::string{(std::string("MySQL schema query failed: ") + e.what()).c_str(), resource()});
-            }
-        } else if (conn_type == catalog_ext::ConnectionType::PostgreSQL) {
-            // PostgreSQL: query schema using libpq
-            // Get the actual schema and table from connection params
-            // The 'name' parameter may have unique_identifier in schema field (for catalog lookups)
-            // We need the real PostgreSQL schema (e.g., "public") for query generation
-            auto conn_params = pg_conn_manager_->conn_params(uuid);
-            qualified_name_t pg_name;
-            if (conn_params) {
-                // Use connection params for the correct database/schema; the
-                // requested collection (when given) selects the single table.
-                pg_name = qualified_name_t(uuid,
-                                           conn_params->database,
-                                           conn_params->schema.empty() ? "public" : conn_params->schema,
-                                           name.collection.empty() ? conn_params->table : name.collection);
-                log_->debug("discover_connection_schemas: using conn_params - schema={}, table={}",
-                            pg_name.schema,
-                            pg_name.collection);
-            } else {
-                pg_name = qualified_name_t(name.unique_identifier,
-                                           name.database,
-                                           name.schema.empty() ? "public" : name.schema,
-                                           name.collection);
-                log_->debug("discover_connection_schemas: no conn_params, using name - schema={}, table={}",
-                            pg_name.schema,
-                            pg_name.collection);
-            }
-
-            pg_conn_manager_->fetch_enum_types(uuid);
-            auto pg_enum_oids = pg_conn_manager_->enums_for(uuid);
-
-            // If table is empty, fetch all tables from the schema
-            if (pg_name.collection.empty()) {
-                // Phase 1: list table names — one query, consumed here; the
-                // handler only collects names and never issues queries itself.
-                std::string list_tables_query =
-                    "SELECT table_name FROM information_schema.tables WHERE table_schema = " +
-                    escape_sql_literal(pg_name.schema) + " AND table_type = 'BASE TABLE';";
-                log_->debug("discover_connection_schemas: empty table, querying information_schema: \"{}\"",
-                            list_tables_query);
-
-                std::pmr::vector<std::pmr::string> table_names(resource());
-                auto list_handler = [&table_names](PGresult* result) -> otterstax::asio_error_t {
-                    int num_tables = PQntuples(result);
-                    for (int i = 0; i < num_tables; ++i) {
-                        table_names.emplace_back(PQgetvalue(result, i, 0));
-                    }
-                    return otterstax::asio_error_t{};
-                };
-
-                try {
-                    auto future = pg_conn_manager_->executeQuery(uuid, list_tables_query, list_handler);
-                    if (auto err = std::move(future.get()).release(); err.contains_error()) {
-                        co_return err;
-                    }
-                } catch (const std::exception& e) {
-                    log_->error("discover_connection_schemas: failed to query table list from schema {}",
-                                pg_name.schema);
-                    co_return core::error_t(
-                        core::error_code_t::missing_field,
-                        std::pmr::string{(std::string("Failed to list tables: ") + e.what()).c_str(), resource()});
-                }
-                log_->info("discover_connection_schemas: found {} tables in schema {}",
-                           table_names.size(),
-                           pg_name.schema);
-
-                // Phase 2: probe each table sequentially at coroutine top
-                // level — the connection is free between queries. Any failed
-                // table fails the whole discovery (§2.1).
-                std::pmr::vector<std::pmr::string> failed_tables(resource());
-                for (const auto& table_name : table_names) {
-                    log_->debug("discover_connection_schemas: processing table {}", table_name);
-
-                    qualified_name_t full_table_name = pg_name;
-                    full_table_name.collection = std::string{table_name.c_str(), table_name.size()};
-
-                    auto schema_handler = [this, full_table_name, pg_enum_oids, &out](
-                                              PGresult* schema_result) -> otterstax::asio_error_t {
-                        auto schema_struct = tsl::pg_to_struct(resource(), schema_result, pg_enum_oids);
-                        out.push_back(catalog_ext::discovered_table_t{full_table_name, std::move(schema_struct)});
-                        log_->info("discover_connection_schemas: schema discovered for: {}.{}",
-                                   full_table_name.schema,
-                                   full_table_name.collection);
-                        return otterstax::asio_error_t{};
-                    };
-
-                    std::string schema_query =
-                        make_schema_probe_query(resource(), full_table_name, backend_type_t::PostgreSQL);
-                    try {
-                        auto future = pg_conn_manager_->executeQuery(uuid, schema_query, schema_handler);
-                        if (auto err = std::move(future.get()).release(); err.contains_error()) {
-                            log_->error("discover_connection_schemas: failed to fetch schema for {}.{}: {}",
-                                        full_table_name.schema,
-                                        full_table_name.collection,
-                                        err.what.c_str());
-                            failed_tables.emplace_back(
-                                (full_table_name.schema + "." + full_table_name.collection).c_str());
-                        }
-                    } catch (const std::exception& e) {
-                        log_->error("discover_connection_schemas: failed to query schema for {}.{}: {}",
-                                    full_table_name.schema,
-                                    full_table_name.collection,
-                                    e.what());
-                        failed_tables.emplace_back(
-                            (full_table_name.schema + "." + full_table_name.collection).c_str());
-                    }
-                }
-                if (!failed_tables.empty()) {
-                    co_return make_discovery_error(resource(), failed_tables);
-                }
-                co_return core::error_t::no_error();
-            } else {
-                // Fetch schema for a single specific table
-                auto schema_handler =
-                    [this, pg_name, pg_enum_oids, &out](PGresult* schema_result) -> otterstax::asio_error_t {
-                    auto schema_struct = tsl::pg_to_struct(resource(), schema_result, pg_enum_oids);
-                    out.push_back(catalog_ext::discovered_table_t{pg_name, std::move(schema_struct)});
-                    log_->info("discover_connection_schemas: schema discovered for: {}.{}",
-                               pg_name.schema,
-                               pg_name.collection);
-                    return otterstax::asio_error_t{};
-                };
-
-                std::string schema_query = make_schema_probe_query(resource(), pg_name, backend_type_t::PostgreSQL);
-                log_->debug("discover_connection_schemas: querying single table schema: \"{}\"", schema_query);
-
-                try {
-                    auto future = pg_conn_manager_->executeQuery(uuid, schema_query, schema_handler);
-                    co_return std::move(future.get()).release();
-                } catch (const std::exception& e) {
-                    log_->error("discover_connection_schemas: failed to query schema for {}.{}",
-                                pg_name.schema,
-                                pg_name.collection);
-                    co_return core::error_t(
-                        core::error_code_t::missing_field,
-                        std::pmr::string{(std::string("Failed to fetch table schema: ") + e.what()).c_str(),
-                                         resource()});
-                }
-            }
+    actor_zeta::unique_future<core::error_t> CatalogManager::check_database_ownership(std::string dbname) {
+        OTX_ZONE_N("catalog::check_database_ownership");
+        // The registry is the authority: a uid is entered there only once its
+        // tables are mirrored, which is exactly the state a user CREATE/DROP
+        // DATABASE would corrupt.
+        std::string_view owner;
+        if (iequals(dbname, otterstax::kafka::KAFKA_DATABASE_NAME)) {
+            owner = otterstax::kafka::KAFKA_DATABASE_NAME;
         } else {
-            // ClickHouse: query schema using clickhouse-cpp native protocol
-            auto conn_params = ch_conn_manager_->conn_params(uuid);
-            std::string ch_database = conn_params ? conn_params->database : "default";
-
-            if (!name.collection.empty()) {
-                // Single-table probe.
-                std::string table_name = name.collection;
-                ch_conn_manager_->fetch_named_types(uuid, ch_database, table_name);
-                qualified_name_t table_name_obj(uuid, ch_database, "", table_name);
-
-                auto schema_handler =
-                    [this, table_name_obj, ch_database, table_name, &out](
-                        const std::vector<clickhouse::Block>& schema_blocks) -> otterstax::asio_error_t {
-                    const clickhouse::Block& schema_block =
-                        schema_blocks.empty() ? clickhouse::Block{} : schema_blocks[0];
-                    auto schema_struct = tsl::ch_to_struct(resource(), schema_block);
-                    out.push_back(catalog_ext::discovered_table_t{table_name_obj, std::move(schema_struct)});
-                    log_->info("discover_connection_schemas: schema discovered for: {}.{}", ch_database, table_name);
-                    return otterstax::asio_error_t{};
-                };
-
-                std::string schema_query =
-                    make_schema_probe_query(resource(), table_name_obj, backend_type_t::ClickHouse);
-                log_->debug("discover_connection_schemas: querying single ClickHouse table schema: \"{}\"",
-                            schema_query);
-                try {
-                    auto future = ch_conn_manager_->executeQuery(uuid, schema_query, schema_handler);
-                    co_return std::move(future.get()).release();
-                } catch (const std::exception& e) {
-                    log_->error("discover_connection_schemas: failed to query schema for {}.{}",
-                                ch_database,
-                                table_name);
-                    co_return core::error_t(
-                        core::error_code_t::missing_field,
-                        std::pmr::string{(std::string("Failed to fetch ClickHouse table schema: ") + e.what()).c_str(),
-                                         resource()});
+            for (const auto& entry : connection_registry_) {
+                if (iequals(dbname, entry.first)) {
+                    owner = entry.first;
+                    break;
                 }
             }
-
-            // Phase 1: list table names — the handler only collects names and
-            // never issues queries itself.
-            std::string list_tables_query =
-                "SELECT name FROM system.tables WHERE database = " + escape_sql_literal(ch_database);
-            log_->debug("discover_connection_schemas: querying ClickHouse tables: \"{}\"", list_tables_query);
-
-            std::pmr::vector<std::pmr::string> table_names(resource());
-            auto list_handler = [this, &table_names](
-                                    const std::vector<clickhouse::Block>& blocks) -> otterstax::asio_error_t {
-                for (const auto& block : blocks) {
-                    if (block.GetRowCount() == 0)
-                        continue;
-
-                    auto name_col = block[0]->As<clickhouse::ColumnString>();
-                    if (!name_col) {
-                        return core::error_t(
-                            core::error_code_t::missing_field,
-                            std::pmr::string{"Failed to read table names from ClickHouse", resource()});
-                    }
-
-                    for (size_t i = 0; i < block.GetRowCount(); ++i) {
-                        auto view = name_col->At(i);
-                        table_names.emplace_back(view.data(), view.size());
-                    }
-                }
-                return otterstax::asio_error_t{};
-            };
-
-            try {
-                auto future = ch_conn_manager_->executeQuery(uuid, list_tables_query, list_handler);
-                if (auto err = std::move(future.get()).release(); err.contains_error()) {
-                    co_return err;
-                }
-            } catch (const std::exception& e) {
-                log_->error("discover_connection_schemas: failed to query table list from ClickHouse database {}",
-                            ch_database);
-                co_return core::error_t(
-                    core::error_code_t::missing_field,
-                    std::pmr::string{(std::string("Failed to list ClickHouse tables: ") + e.what()).c_str(),
-                                     resource()});
-            }
-            log_->info("discover_connection_schemas: found {} tables in ClickHouse database {}",
-                       table_names.size(),
-                       ch_database);
-
-            // Phase 2: probe each table sequentially at coroutine top level —
-            // fetch_named_types and the schema probe both run while the
-            // connection is otherwise idle. Any failed table fails the whole
-            // discovery (§2.1).
-            std::pmr::vector<std::pmr::string> failed_tables(resource());
-            for (const auto& tn : table_names) {
-                std::string table_name{tn.c_str(), tn.size()};
-                log_->debug("discover_connection_schemas: processing ClickHouse table {}", table_name);
-
-                ch_conn_manager_->fetch_named_types(uuid, ch_database, table_name);
-                qualified_name_t table_name_obj(uuid, ch_database, "", table_name);
-
-                auto schema_handler =
-                    [this, table_name_obj, ch_database, table_name, &out](
-                        const std::vector<clickhouse::Block>& schema_blocks) -> otterstax::asio_error_t {
-                    const clickhouse::Block& schema_block =
-                        schema_blocks.empty() ? clickhouse::Block{} : schema_blocks[0];
-                    auto schema_struct = tsl::ch_to_struct(resource(), schema_block);
-                    out.push_back(catalog_ext::discovered_table_t{table_name_obj, std::move(schema_struct)});
-                    log_->info("discover_connection_schemas: schema discovered for: {}.{}", ch_database, table_name);
-                    return otterstax::asio_error_t{};
-                };
-
-                std::string schema_query =
-                    make_schema_probe_query(resource(), table_name_obj, backend_type_t::ClickHouse);
-                try {
-                    auto future = ch_conn_manager_->executeQuery(uuid, schema_query, schema_handler);
-                    if (auto err = std::move(future.get()).release(); err.contains_error()) {
-                        log_->error("discover_connection_schemas: failed to fetch schema for {}.{}: {}",
-                                    ch_database,
-                                    table_name,
-                                    err.what.c_str());
-                        failed_tables.emplace_back((ch_database + "." + table_name).c_str());
-                    }
-                } catch (const std::exception& e) {
-                    log_->error("discover_connection_schemas: failed to query schema for {}.{}: {}",
-                                ch_database,
-                                table_name,
-                                e.what());
-                    failed_tables.emplace_back((ch_database + "." + table_name).c_str());
-                }
-            }
-            if (!failed_tables.empty()) {
-                co_return make_discovery_error(resource(), failed_tables);
-            }
+        }
+        if (owner.empty()) {
             co_return core::error_t::no_error();
         }
+        log_->error("check_database_ownership: database '{}' is owned by connection '{}'", dbname, owner);
+        std::pmr::string what{resource()};
+        what.append("database '");
+        what.append(dbname);
+        what.append("' is owned by connection '");
+        what.append(owner);
+        what.push_back('\'');
+        co_return core::error_t(core::error_code_t::invalid_parameter, std::move(what));
     }
 
-    actor_zeta::unique_future<void> CatalogManager::remove_connection_schema(std::string uuid) {
-        OTX_ZONE_N("catalog::remove_connection_schema");
-        std::pmr::string uid_key{uuid.c_str(), resource()};
-        if (registered_dbs_.erase(uid_key) > 0) {
-            auto [drop_sched, drop_future] =
-                actor_zeta::send(otterbrix_manager_, &db::OtterbrixManager::drop_external_database, uuid);
-            auto drop_result = co_await std::move(drop_future);
-            if (drop_result.has_error()) {
-                log_->error("remove_connection_schema: failed to drop engine database {}: {}",
-                            uuid,
-                            drop_result.error().what);
+    // Discovery is a message to the backend actor that owns the connector
+    // manager; the catalog awaits its reply and never touches a connector
+    // itself. The reply is settled by the time send() returns (the backend
+    // actors run their handlers to completion on the sending thread), so the
+    // co_await below never suspends across another catalog message.
+    actor_zeta::unique_future<core::result_wrapper_t<catalog_ext::discovered_tables_t>>
+    CatalogManager::discover_connection_schemas(const qualified_name_t& name, catalog_ext::ConnectionType conn_type) {
+        OTX_ZONE_N("catalog::discover_connection_schemas");
+        const actor_zeta::address_t* backend = nullptr;
+        switch (conn_type) {
+            case catalog_ext::ConnectionType::MySQL:
+                backend = &mysql_manager_;
+                break;
+            case catalog_ext::ConnectionType::PostgreSQL:
+                backend = &pg_manager_;
+                break;
+            case catalog_ext::ConnectionType::ClickHouse:
+                backend = &ch_manager_;
+                break;
+        }
+        if (backend == nullptr || !*backend) {
+            log_->error("discover_connection_schemas: no {} backend manager registered (uid {})",
+                        backend_name(conn_type),
+                        name.unique_identifier);
+            co_return make_error(resource(),
+                                 core::error_code_t::do_not_exists,
+                                 std::string{"No "} + backend_name(conn_type) +
+                                     " backend manager is registered for uid: " + name.unique_identifier);
+        }
+
+        switch (conn_type) {
+            case catalog_ext::ConnectionType::MySQL: {
+                auto [needs_sched, future] = actor_zeta::send(*backend, &db::MySQLManager::discover, name);
+                co_return co_await std::move(future);
+            }
+            case catalog_ext::ConnectionType::PostgreSQL: {
+                auto [needs_sched, future] = actor_zeta::send(*backend, &db::PostgressManager::discover, name);
+                co_return co_await std::move(future);
+            }
+            case catalog_ext::ConnectionType::ClickHouse: {
+                auto [needs_sched, future] = actor_zeta::send(*backend, &db::ClickhouseManager::discover, name);
+                co_return co_await std::move(future);
             }
         }
-
-        for (auto oid : store_.oids_by_uid(uuid)) {
-            store_.erase(oid);
-        }
-        co_return;
+        co_return make_error(resource(),
+                             core::error_code_t::invalid_parameter,
+                             "Unknown backend type for uid: " + name.unique_identifier);
     }
 
-    actor_zeta::unique_future<void> CatalogManager::get_tables(arrow::flight::sql::GetTables command,
-                                                               shared_data<std::pmr::vector<table_info>> sdata) {
+    actor_zeta::unique_future<core::result_wrapper_t<std::pmr::vector<table_info>>>
+    CatalogManager::get_tables(arrow::flight::sql::GetTables command) {
         OTX_ZONE_N("catalog::get_tables");
         std::pmr::vector<table_info> data(resource());
+
+        // Every mirrored entry is a base table; a type filter that does not
+        // name that type matches nothing.
+        if (!command.table_types.empty() &&
+            std::find(command.table_types.begin(), command.table_types.end(), catalog_ext::table_type_name) ==
+                command.table_types.end()) {
+            co_return std::move(data);
+        }
 
         store_.for_each([&](const qualified_name_t& name,
                             components::catalog::oid_t /*oid*/,
                             const types::complex_logical_type& schema) {
-            // FlightSQL filter mapping: db_schema_filter_pattern matches the
-            // schema part, command.catalog matches the database part.
-            if (command.db_schema_filter_pattern && name.schema != command.db_schema_filter_pattern.value()) {
+            // FlightSQL filter mapping: command.catalog is an exact match on
+            // the database part; the schema and table patterns are LIKE.
+            if (command.catalog && name.database != command.catalog.value()) {
                 return;
             }
-            if (command.catalog && name.database != command.catalog.value()) {
+            if (command.db_schema_filter_pattern &&
+                !like_match(command.db_schema_filter_pattern.value(), name.schema)) {
+                return;
+            }
+            if (command.table_name_filter_pattern &&
+                !like_match(command.table_name_filter_pattern.value(), name.collection)) {
                 return;
             }
 
@@ -957,8 +704,7 @@ namespace mysql {
             }
         });
 
-        sdata->set_result(std::move(data));
-        co_return;
+        co_return std::move(data);
     }
 
 } // namespace mysql

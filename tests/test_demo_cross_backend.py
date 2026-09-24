@@ -2,19 +2,22 @@
 # Copyright 2025-2026  OtterStax
 
 """
-End-to-end integration test for the six demo queries with all three backends
+End-to-end integration test for demo steps 1-6 with all three backends
 (mysql.bill, pg.shop, ch.ev) live.
 
-Reads SQL from `demo/*.sql` — single source of truth shared with the
-interactive psql session. If you change a query in demo/, the test changes
+Reads SQL from `examples/demo/sql/*.sql` — single source of truth shared with
+the interactive psql session. If you change a query there, the test changes
 with it.
 
 Pre-conditions:
-  * Demo backends are up and seeded (./demo-up.sh OR ./demo-bench-up.sh +
-    local server).
-  * Connections registered (mysql / pg / ch aliases).
-  * For step 3 to be re-runnable, run cleanup.sql or restart the server
-    between runs (otterbrix DROP DATABASE has no IF EXISTS).
+  * Demo backends are up and seeded: `examples/demo/up.sh` (full docker) or
+    `examples/demo/up.sh --local` plus a local server started with
+    `--config examples/demo/config_local.yaml`.
+  * The mysql / pg / ch aliases come from that config file at server startup.
+  * Seed data is `examples/demo/generate_data.py` with its fixed SEED — the
+    exact row count asserted for step 4 depends on it.
+  * The `otter` database from step 3a is dropped by cleanup.sql in the finally
+    block, so consecutive runs need no manual reset.
 
 Run:
     python tests/test_demo_cross_backend.py [--local]
@@ -29,7 +32,14 @@ import psycopg
 
 import config
 
-DEMO_DIR = Path(__file__).resolve().parent.parent / "demo"
+DEMO_DIR = Path(__file__).resolve().parent.parent / "examples" / "demo" / "sql"
+
+# Gold customers seeded into a warehouse city (Tel Aviv / Berlin / New York) by
+# generate_data.py under SEED = 42; each such city has exactly one warehouse in
+# step_3b, so step 4 yields one row per customer. Matches the "Expected rows"
+# column for step 4 in examples/demo/CLAUDE.md.
+STEP4_EXPECTED_ROWS = 14
+STEP4_WAREHOUSE_CITIES = {"Tel Aviv", "Berlin", "New York"}
 
 
 def make_conn(local: bool) -> psycopg.Connection:
@@ -118,15 +128,26 @@ def step_4(conn):
     print("\n-- step 4: struct.* + JOIN ON struct field + ENUM cast")
     rows = run(conn, load_sql("step_4.sql"))
     assert len(rows) > 0, "step 4: no rows — check gold-customer-in-warehouse-city seeding"
-    # Columns: name + addr.* (city, country, zip) + warehouse + location.* = 8.
+    # Columns: name, tier, customer_city, customer_country, warehouse,
+    # warehouse_city, warehouse_country, warehouse_zip = 8.
     assert len(rows[0]) == 8, f"step 4: expected 8 columns, got {len(rows[0])}"
-    # City of customer must equal city of joined warehouse.
     for r in rows:
-        c_city, w_city = r[1], r[5]
+        name, tier, c_city, c_country, warehouse, w_city, w_country, w_zip = r
+        # WHERE c.tier = 'gold'::tier_t
+        assert tier == "gold", f"step 4: WHERE tier = 'gold' violated for {name!r}: {tier!r}"
+        # JOIN ON c.addr_city = (w.location).city
         assert c_city == w_city, f"step 4: JOIN-by-city violated: {c_city!r} != {w_city!r}"
-    # ORDER BY (c.addr).city — verify non-decreasing.
-    cities = [r[1] for r in rows]
+        assert w_city in STEP4_WAREHOUSE_CITIES, f"step 4: unknown warehouse city {w_city!r}"
+        # (w.location).country IN ('DE','IL','US') — every seeded warehouse qualifies.
+        assert w_country in ("DE", "IL", "US"), f"step 4: warehouse country {w_country!r} outside IN list"
+    # ORDER BY c.addr_city — verify non-decreasing.
+    cities = [r[2] for r in rows]
     assert cities == sorted(cities), "step 4: cities not sorted ASC"
+    # The backend slice (gold customers) is fetched by the PG manager and
+    # JOINed in-engine against the three warehouses: exactly one row per gold
+    # customer living in a warehouse city.
+    assert len(rows) == STEP4_EXPECTED_ROWS, \
+        f"step 4: expected {STEP4_EXPECTED_ROWS} gold-customer × warehouse rows, got {len(rows)}"
     print(f"  ✓ step 4: {len(rows)} gold-customer × warehouse rows")
 
 

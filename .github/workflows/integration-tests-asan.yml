@@ -32,4 +32,8 @@ jobs:
       - name: Run integration tests
         env:
           IMAGE_TAG: ci-asan-${{ github.sha }}
+          # docker-run-tests.sh gates the Kafka crash-recovery step (kill -9 of
+          # the server) on the sanitizer flags; the build-arg alone is not visible
+          # to the script.
+          ENABLE_ASAN: "ON"
         run: ./docker-run-tests.sh

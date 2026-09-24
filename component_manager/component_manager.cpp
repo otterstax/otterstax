@@ -2,6 +2,7 @@
 // Copyright 2025-2026  OtterStax
 
 #include "component_manager.hpp"
+#include "connection_retry.hpp"
 #include "utility/logger.hpp"
 #include "utility/tracy_profiler.hpp"
 
@@ -20,11 +21,10 @@ constexpr size_t MAX_THROUGHPUT =
 
 ComponentManager::ComponentManager(const configuration::config& config)
     : engine_(new db::otterbrix_engine_t(config))
-    , resource_(engine_->dispatcher()->resource())
-    , log_path_(config.log.path.c_str()) {
+    , resource_(engine_->dispatcher()->resource()) {
     OTX_ZONE_N("ComponentManager::init");
 
-    initialize_all_loggers(log_path_);
+    initialize_all_loggers(config.log.path.c_str());
 
     assert(resource_ != nullptr && "memory resource must not be null");
 
@@ -43,26 +43,38 @@ ComponentManager::ComponentManager(const configuration::config& config)
         catalog_manager_ = actor_zeta::spawn<mysql::CatalogManager>(resource_, otterbrix_manager_->address());
         assert(catalog_manager_ != nullptr && "catalog manager must not be null");
 
-        db_connector_manager_ = std::make_shared<mysql::ConnectorManager>(catalog_manager_->address());
-        catalog_manager_->set_mysql_connector_manager(db_connector_manager_); // cyclic dependency
+        db_connector_manager_ = std::make_unique<mysql::ConnectorManager>(
+            resource_, catalog_manager_->address(), &mysql::make_mysql_connector);
 
-        pg_connector_manager_ = std::make_shared<pg::ConnectorManager>(catalog_manager_->address());
-        catalog_manager_->set_pg_connector_manager(pg_connector_manager_);
+        pg_connector_manager_ =
+            std::make_unique<pg::ConnectorManager>(resource_, catalog_manager_->address(), &pg::make_pg_connector);
 
-        ch_connector_manager_ = std::make_shared<ch::ConnectorManager>(catalog_manager_->address());
-        catalog_manager_->set_ch_connector_manager(ch_connector_manager_);
+        ch_connector_manager_ =
+            std::make_unique<ch::ConnectorManager>(resource_, catalog_manager_->address(), &ch::make_ch_connector);
     }
 
     {
         OTX_ZONE_N("ComponentManager::spawn_managers");
-        sql_connection_manager_ = actor_zeta::spawn<db::MySQLManager>(resource_, db_connector_manager_);
+        // Each integration actor starts the io pool of the connector manager it
+        // wraps, so the pools are running before register_connections opens the
+        // first backend. Nothing else starts them.
+        sql_connection_manager_ = actor_zeta::spawn<db::MySQLManager>(resource_, db_connector_manager_.get());
         assert(sql_connection_manager_ != nullptr && "sql connection manager must not be null");
 
-        pg_connection_manager_ = actor_zeta::spawn<db::PostgressManager>(resource_, pg_connector_manager_);
+        pg_connection_manager_ = actor_zeta::spawn<db::PostgressManager>(resource_, pg_connector_manager_.get());
         assert(pg_connection_manager_ != nullptr && "pg connection manager must not be null");
 
-        ch_connection_manager_actor_ = actor_zeta::spawn<db::ClickhouseManager>(resource_, ch_connector_manager_);
+        ch_connection_manager_actor_ = actor_zeta::spawn<db::ClickhouseManager>(resource_, ch_connector_manager_.get());
         assert(ch_connection_manager_actor_ != nullptr && "ch connection manager must not be null");
+
+        // The integration actors are the sole drivers of their connector
+        // managers; the catalog reaches a backend only through them (schema
+        // discovery is a message), which is why it learns their addresses
+        // rather than the managers themselves. cyclic dependency: the managers
+        // were built with the catalog's address above.
+        catalog_manager_->set_backend_managers(sql_connection_manager_->address(),
+                                               pg_connection_manager_->address(),
+                                               ch_connection_manager_actor_->address());
     }
 
     {
@@ -103,13 +115,6 @@ ComponentManager::ComponentManager(const configuration::config& config)
         assert(scheduler_ != nullptr && "scheduler must not be null");
     }
 
-    {
-        OTX_ZONE_N("ComponentManager::start_connectors");
-        db_connector_manager_->start();
-        pg_connector_manager_->start();
-        ch_connector_manager_->start();
-    }
-
     // relaunch persisted Kafka when the full actor graph and worker pool are up
     // doing this in the KafkaManager ctor races the half-initialised engine
     // (the poller starts before the scheduler/executor pool)
@@ -130,134 +135,138 @@ std::pmr::memory_resource* ComponentManager::getResource() {
     return resource_;
 }
 
-std::string ComponentManager::getLogPath() { return log_path_; }
-
-std::shared_ptr<mysql::ConnectorManager> ComponentManager::db_connection_manager() const {
-    return db_connector_manager_;
-}
-
-std::shared_ptr<pg::ConnectorManager> ComponentManager::pg_connection_manager() const { return pg_connector_manager_; }
-
-std::shared_ptr<ch::ConnectorManager> ComponentManager::ch_connection_manager() const { return ch_connector_manager_; }
-
 actor_zeta::address_t ComponentManager::scheduler_address() const { return scheduler_->address(); }
 
 actor_zeta::address_t ComponentManager::catalog_address() const { return catalog_manager_->address(); }
 
-actor_zeta::address_t ComponentManager::otterbrix_manager_address() const { return otterbrix_manager_->address(); }
-
-actor_zeta::address_t ComponentManager::sql_connection_manager_address() const {
-    return sql_connection_manager_->address();
-}
-
-actor_zeta::address_t ComponentManager::pg_connection_manager_address() const {
-    return pg_connection_manager_->address();
-}
-
-actor_zeta::address_t ComponentManager::file_manager_address() const { return file_manager_->address(); }
-
-actor_zeta::address_t ComponentManager::s3_manager_address() const { return s3_manager_->address(); }
-
-void ComponentManager::register_connections(const config::ConnectionsConfig& connections,
-                                            const config::ConnectionRetryConfig& retry) {
+core::error_t ComponentManager::register_connections(const config::ConnectionsConfig& connections,
+                                                     const config::ConnectionRetryConfig& retry) {
     OTX_ZONE_N("ComponentManager::register_connections");
     auto log = get_logger(logger_tag::Main);
 
     // Backends may accept connections a moment after their container is reported
     // healthy (a startup race we hit with ClickHouse in the demo). Registration
-    // is one-shot at startup — there is no runtime retry API — so retry per the
-    // configured policy (service.connection_retry), mirroring the retry the old
-    // HTTP add-connection scripts had.
+    // is one-shot at startup — there is no runtime retry API — so opening a
+    // backend retries per the configured policy (service.connection_retry).
     const int max_attempts = std::max(1, retry.max_attempts);
     const auto retry_delay = std::chrono::milliseconds(std::max(0, retry.delay_ms));
-    auto with_retry = [&](const char* kind, const std::string& alias, auto&& add) {
-        for (int attempt = 1; attempt <= max_attempts; ++attempt) {
-            try {
-                add();
-                log->info("Registered {} connection '{}'", kind, alias);
-                return;
-            } catch (const std::exception& e) {
-                if (attempt == max_attempts) {
-                    log->error("Failed to register {} connection '{}' after {} attempt(s): {}",
-                               kind, alias, max_attempts, e.what());
-                    return;
-                }
-                log->warn("{} connection '{}' not ready ({}/{}): {} — retrying in {} ms...",
-                          kind, alias, attempt, max_attempts, e.what(), retry_delay.count());
-                std::this_thread::sleep_for(retry_delay);
-            }
-        }
+    auto sleep_for = [](std::chrono::milliseconds delay) { std::this_thread::sleep_for(delay); };
+    // Re-homes the helper's verdict onto the engine resource, which outlives the
+    // caller's handling of it.
+    auto rejected = [this](const core::result_wrapper_t<bool>& opened) {
+        return core::error_t(opened.error().type, std::pmr::string{opened.error().what.c_str(), resource_});
     };
 
-    // Descriptors are already validated at parse time (parse_connections throws
-    // on an incomplete entry, aborting startup), so here we only open them.
     for (const auto& c : connections.mysql) {
-        with_retry("MySQL", c.alias, [&] {
-            db_connector_manager_->addConnection(conn::api_server::ConnectionParams{
-                .alias = c.alias,
-                .host = c.host,
-                .port = c.port,
-                .username = c.username,
-                .password = c.password,
-                .database = c.database,
-                .table = c.table,
-            });
-        });
+        auto opened = otterstax::startup::open_with_retry(
+            log,
+            "MySQL",
+            c.alias,
+            max_attempts,
+            retry_delay,
+            [&] {
+                return db_connector_manager_->addConnection(conn::api_server::ConnectionParams{
+                    .alias = c.alias,
+                    .host = c.host,
+                    .port = c.port,
+                    .username = c.username,
+                    .password = c.password,
+                    .database = c.database,
+                    .table = c.table,
+                });
+            },
+            sleep_for);
+        if (opened.has_error()) {
+            return rejected(opened);
+        }
     }
 
     for (const auto& c : connections.postgresql) {
-        with_retry("PostgreSQL", c.alias, [&] {
-            pg_connector_manager_->addConnection(conn::api_server::PgConnectionParams{
-                .alias = c.alias,
-                .host = c.host,
-                .port = c.port,
-                .username = c.username,
-                .password = c.password,
-                .database = c.database,
-                .schema = c.schema,
-                .table = c.table,
-            });
-        });
+        auto opened = otterstax::startup::open_with_retry(
+            log,
+            "PostgreSQL",
+            c.alias,
+            max_attempts,
+            retry_delay,
+            [&] {
+                return pg_connector_manager_->addConnection(conn::api_server::PgConnectionParams{
+                    .alias = c.alias,
+                    .host = c.host,
+                    .port = c.port,
+                    .username = c.username,
+                    .password = c.password,
+                    .database = c.database,
+                    .schema = c.schema,
+                    .table = c.table,
+                });
+            },
+            sleep_for);
+        if (opened.has_error()) {
+            return rejected(opened);
+        }
     }
 
     for (const auto& c : connections.clickhouse) {
-        with_retry("ClickHouse", c.alias, [&] {
-            ch_connector_manager_->addConnection(conn::api_server::ChConnectionParams{
-                .alias = c.alias,
-                .host = c.host,
-                .port = c.port,
-                .username = c.username,
-                .password = c.password,
-                .database = c.database,
-                .table = c.table,
-            });
-        });
+        auto opened = otterstax::startup::open_with_retry(
+            log,
+            "ClickHouse",
+            c.alias,
+            max_attempts,
+            retry_delay,
+            [&] {
+                return ch_connector_manager_->addConnection(conn::api_server::ChConnectionParams{
+                    .alias = c.alias,
+                    .host = c.host,
+                    .port = c.port,
+                    .username = c.username,
+                    .password = c.password,
+                    .database = c.database,
+                    .table = c.table,
+                });
+            },
+            sleep_for);
+        if (opened.has_error()) {
+            return rejected(opened);
+        }
     }
 
     for (const auto& c : connections.s3) {
-        // s3 aliases are only stored (no eager network open), so a single attempt
-        // is enough — retry would not help a stored-credential failure.
-        try {
-            conn::s3::connect_params params{
-                .region = c.region,
-                .access_key = c.access_key,
-                .secret_key = c.secret_key,
-                .session_token = c.session_token,
-                .endpoint = c.endpoint,
-                .alias = c.alias,
-            };
-            auto fut = actor_zeta::send(s3_manager_->address(),
-                                        &conn::s3::ConnectorManager::add_credentials,
-                                        session_id().hash(),
-                                        std::move(params));
-            auto result = std::move(fut.second).take_ready();
-            if (result.has_error()) {
-                log->error("Failed to register s3 alias '{}': {}", c.alias, result.error().what.c_str());
-            } else {
-                log->info("Registered s3 alias '{}' (endpoint='{}')", c.alias, c.endpoint);
-            }
-        } catch (const std::exception& e) {
-            log->error("Failed to register s3 alias '{}': {}", c.alias, e.what());
+        // An s3 alias is only stored — no network is touched — so the only way
+        // storing it can fail is the descriptor itself, which no retry fixes.
+        conn::s3::connect_params params{
+            .region = std::pmr::string{std::string_view{c.region}, resource_},
+            .access_key = std::pmr::string{std::string_view{c.access_key}, resource_},
+            .secret_key = std::pmr::string{std::string_view{c.secret_key}, resource_},
+            .session_token = std::pmr::string{std::string_view{c.session_token}, resource_},
+            .endpoint = std::pmr::string{std::string_view{c.endpoint}, resource_},
+            .alias = std::pmr::string{std::string_view{c.alias}, resource_},
+        };
+        auto [needs_sched, stored] = actor_zeta::send(s3_manager_->address(),
+                                                      &conn::s3::ConnectorManager::add_credentials,
+                                                      session_id().hash(),
+                                                      std::move(params));
+        // The s3 actor runs its handler to completion on the sending thread, so
+        // the future is settled once send() returns; anything else means the
+        // alias was not stored.
+        if (stored.failed()) {
+            log->error("Failed to register s3 alias '{}': actor rejected the request", c.alias);
+            return core::error_t(
+                core::error_code_t::io_error,
+                std::pmr::string{("s3 alias '" + c.alias + "': actor rejected the request").c_str(), resource_});
         }
+        if (!stored.is_ready()) {
+            log->error("Failed to register s3 alias '{}': actor did not settle the request", c.alias);
+            return core::error_t(
+                core::error_code_t::io_error,
+                std::pmr::string{("s3 alias '" + c.alias + "': actor did not settle the request").c_str(),
+                                 resource_});
+        }
+        auto result = std::move(stored).take_ready();
+        if (result.has_error()) {
+            log->error("Failed to register s3 alias '{}': {}", c.alias, result.error().what.c_str());
+            return rejected(result);
+        }
+        log->info("Registered s3 alias '{}' (endpoint='{}')", c.alias, c.endpoint);
     }
+    return core::error_t::no_error();
 }

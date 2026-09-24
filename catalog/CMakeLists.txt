@@ -1,10 +1,12 @@
 set(CATALOG_HEADERS
     catalog_manager.hpp
+    discovery.hpp
     schema_store.hpp
 )
 
 set(CATALOG_SOURCES
     catalog_manager.cpp
+    discovery.cpp
     schema_store.cpp
 )
 

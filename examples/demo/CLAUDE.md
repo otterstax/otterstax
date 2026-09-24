@@ -108,7 +108,7 @@ Each step is a single SELECT (or DDL/INSERT for 3a/3b, DDL/COPY for 7/8/9). Expe
 | 3b | local | INSERT 3 rows with `ROW(...)` composite values | 3 rows affected |
 | 3c | local | `(struct).field` projection + `IS NULL` on STRUCT field | 1 row (TLV-1) |
 | 3d | mysql, pg, ch | Three-backend JOIN with `(ch.props).channel` struct access | varies |
-| 4 | pg (ENUM), local (STRUCT) | **Backend ⋈ otterbrix-internal in a single statement** — canonical positive example for this shape (see top-level `CLAUDE.md` "Working JOIN shapes" and `FIX_JOIN.md`). Backend manager fetches the customers slice, otterbrix engine JOINs that against engine-resident warehouses. Plus ENUM cast `'gold'::tier_t` + struct field JOIN key | 14 rows |
+| 4 | pg (ENUM), local (STRUCT) | **Backend ⋈ otterbrix-internal in a single statement** — canonical positive example for this shape (see top-level `CLAUDE.md`, "Working JOIN shapes" and "JOIN-key type widths must agree"). Backend manager fetches the customers slice, otterbrix engine JOINs that against engine-resident warehouses. Plus ENUM cast `'gold'::tier_t` + struct field JOIN key | 14 rows |
 | 5 | pg, ch, mysql | DISTINCT + nested `((s.props).geo).ip` | varies |
 | 6 | mysql, pg, ch | CASE WHEN inside SUM + HAVING + LEFT JOIN inside subquery | a few rows |
 | 7 | s3 | `CREATE EXTERNAL TABLE otter.regions` from `s3://demo-bucket/regions.csv` (csv) | no rows, structural |
@@ -136,6 +136,9 @@ the MinIO container along with the rest (the bucket is recreated by
 The Kafka act is re-runnable in place — each step's `DROP SOURCE IF EXISTS …
 CREATE SOURCE …` (and `DROP STREAM …`) re-creates its objects cleanly, so you can
 replay `run_all.sh` (or an individual step) without recreating otterstax.
+Every Kafka step script exits non-zero on its first failed sub-step. `run_all.sh`
+checks the PG wire first and stops at the first failed step, so its
+`✅ Kafka act complete` means every step succeeded (details in `kafka/README.md`).
 
 ## Tear down
 

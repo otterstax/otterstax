@@ -3,6 +3,9 @@
 
 #include "csv_to_chunk.hpp"
 #include "arrow_to_chunk.hpp"
+#include "otterbrix/translators/error.hpp"
+
+#include "utility/tracy_profiler.hpp"
 
 // Clash between otterbrix parser and arrow
 #undef DAY
@@ -19,9 +22,9 @@ namespace tsl {
 using components::vector::data_chunk_t;
 
 namespace {
-    data_chunk_t read_csv(std::pmr::memory_resource* res,
-                          const std::shared_ptr<arrow::io::InputStream>& input,
-                          char delimiter, bool has_header) {
+    core::result_wrapper_t<data_chunk_t> read_csv(std::pmr::memory_resource* res,
+                                                  const std::shared_ptr<arrow::io::InputStream>& input,
+                                                  char delimiter, bool has_header) {
         auto read_opts = arrow::csv::ReadOptions::Defaults();
         read_opts.use_threads = false;
 
@@ -37,32 +40,41 @@ namespace {
         auto reader_result = arrow::csv::TableReader::Make(
             arrow::io::IOContext(arrow::default_memory_pool()),
             input, read_opts, parse_opts, convert_opts);
-        if (!reader_result.ok())
-            throw std::runtime_error("CSV reader creation failed: " +
-                                     reader_result.status().ToString());
+        if (!reader_result.ok()) {
+            return arrow_error(res, core::error_code_t::conversion_failure,
+                               "csv_to_chunk: reader creation failed", reader_result.status());
+        }
 
         auto table_result = (*reader_result)->Read();
-        if (!table_result.ok())
-            throw std::runtime_error("CSV read failed: " + table_result.status().ToString());
+        if (!table_result.ok()) {
+            return arrow_error(res, core::error_code_t::conversion_failure,
+                               "csv_to_chunk: read failed", table_result.status());
+        }
 
-        auto batches = (*table_result)->CombineChunksToBatch();
-        if (!batches.ok())
-            throw std::runtime_error("CSV combine batches failed: " + batches.status().ToString());
+        auto batch = (*table_result)->CombineChunksToBatch();
+        if (!batch.ok()) {
+            return arrow_error(res, core::error_code_t::conversion_failure,
+                               "csv_to_chunk: combine batches failed", batch.status());
+        }
 
-        return arrow_to_chunk(res, *batches);
+        return arrow_to_chunk(res, *batch);
     }
 } // namespace
 
-data_chunk_t csv_to_chunk(std::pmr::memory_resource* res, const std::string& file_path,
-                           char delimiter, bool has_header) {
+core::result_wrapper_t<data_chunk_t> csv_to_chunk(std::pmr::memory_resource* res, const std::string& file_path,
+                                                  char delimiter, bool has_header) {
+    OTX_ZONE_N("tsl::csv_to_chunk(file)");
     auto file_result = arrow::io::ReadableFile::Open(file_path);
-    if (!file_result.ok())
-        throw std::runtime_error("Cannot open CSV file: " + file_result.status().ToString());
+    if (!file_result.ok()) {
+        return arrow_error(res, core::error_code_t::io_error,
+                           "csv_to_chunk: cannot open file", file_result.status());
+    }
     return read_csv(res, *file_result, delimiter, has_header);
 }
 
-data_chunk_t csv_to_chunk(std::pmr::memory_resource* res, const uint8_t* data, size_t size,
-                           char delimiter, bool has_header) {
+core::result_wrapper_t<data_chunk_t> csv_to_chunk(std::pmr::memory_resource* res, const uint8_t* data, size_t size,
+                                                  char delimiter, bool has_header) {
+    OTX_ZONE_N("tsl::csv_to_chunk(buffer)");
     auto buffer = std::make_shared<arrow::Buffer>(data, static_cast<int64_t>(size));
     auto input = std::make_shared<arrow::io::BufferReader>(buffer);
     return read_csv(res, input, delimiter, has_header);

@@ -8,10 +8,13 @@
 //   output : chunk_to_csv  / chunk_to_ndjson / chunk_to_parquet
 //
 // Input benchmarks use the in-memory buffer overloads so only the parse +
-// data_chunk_t construction is measured (no disk I/O). Output benchmarks write to
-// a temp file — chunk_to_* only expose a file-path API — so their timings include
-// the filesystem write. The source data_chunk_t is built once outside the loop
-// (data_chunk_t is move-only, but chunk_to_* take it by const ref so it is reused).
+// data_chunk_t construction is measured (no disk I/O). Each iteration gets a
+// fresh arena: a monotonic arena never frees, so a single arena for the whole
+// run would grow without bound and time page faults instead of the parser.
+// Output benchmarks write to a temp file — chunk_to_* only expose a file-path
+// API — so their timings include the filesystem write. The source data_chunk_t
+// is built once outside the loop (data_chunk_t is move-only, but chunk_to_* take
+// the batch by const ref so it is reused).
 
 #include "otterbrix/translators/input/csv_to_chunk.hpp"
 #include "otterbrix/translators/input/ndjson_to_chunk.hpp"
@@ -34,6 +37,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory_resource>
+#include <vector>
 #include <string>
 
 using components::vector::data_chunk_t;
@@ -77,9 +81,19 @@ std::shared_ptr<arrow::Buffer> make_parquet_buffer(int n) {
     return sink->Finish().ValueOrDie();
 }
 
-data_chunk_t make_chunk(std::pmr::memory_resource* res, int n) {
+// The one-element batch every output benchmark writes: `n` rows built through the
+// CSV input translator. A failed load aborts the benchmark rather than timing a
+// write of nothing.
+std::pmr::vector<data_chunk_t> make_batch(std::pmr::memory_resource* res, int n, benchmark::State& state) {
     const std::string csv = make_csv(n);
-    return tsl::csv_to_chunk(res, reinterpret_cast<const uint8_t*>(csv.data()), csv.size());
+    auto loaded = tsl::csv_to_chunk(res, reinterpret_cast<const uint8_t*>(csv.data()), csv.size());
+    std::pmr::vector<data_chunk_t> chunks(res);
+    if (loaded.has_error()) {
+        state.SkipWithError(loaded.error().what.c_str());
+        return chunks;
+    }
+    chunks.push_back(std::move(loaded.value()));
+    return chunks;
 }
 
 } // namespace
@@ -87,11 +101,11 @@ data_chunk_t make_chunk(std::pmr::memory_resource* res, int n) {
 // ── input: csv_to_chunk ───────────────────────────────────────────────────────
 
 static void BM_csv_to_chunk(benchmark::State& state) {
-    auto* res = std::pmr::get_default_resource();
     const std::string csv = make_csv(static_cast<int>(state.range(0)));
     const auto* data = reinterpret_cast<const uint8_t*>(csv.data());
     for (auto _ : state) {
-        auto chunk = tsl::csv_to_chunk(res, data, csv.size());
+        std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
+        auto chunk = tsl::csv_to_chunk(&arena, data, csv.size());
         benchmark::DoNotOptimize(chunk);
     }
     state.SetItemsProcessed(state.iterations() * state.range(0));
@@ -101,11 +115,11 @@ BENCHMARK(BM_csv_to_chunk)->Arg(1000)->Arg(10000);
 // ── input: ndjson_to_chunk ────────────────────────────────────────────────────
 
 static void BM_ndjson_to_chunk(benchmark::State& state) {
-    auto* res = std::pmr::get_default_resource();
     const std::string json = make_ndjson(static_cast<int>(state.range(0)));
     const auto* data = reinterpret_cast<const uint8_t*>(json.data());
     for (auto _ : state) {
-        auto chunk = tsl::ndjson_to_chunk(res, data, json.size());
+        std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
+        auto chunk = tsl::ndjson_to_chunk(&arena, data, json.size());
         benchmark::DoNotOptimize(chunk);
     }
     state.SetItemsProcessed(state.iterations() * state.range(0));
@@ -115,10 +129,10 @@ BENCHMARK(BM_ndjson_to_chunk)->Arg(1000)->Arg(10000);
 // ── input: parquet_to_chunk ───────────────────────────────────────────────────
 
 static void BM_parquet_to_chunk(benchmark::State& state) {
-    auto* res = std::pmr::get_default_resource();
     auto buf = make_parquet_buffer(static_cast<int>(state.range(0)));
     for (auto _ : state) {
-        auto chunk = tsl::parquet_to_chunk(res, buf->data(), static_cast<size_t>(buf->size()));
+        std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
+        auto chunk = tsl::parquet_to_chunk(&arena, buf->data(), static_cast<size_t>(buf->size()));
         benchmark::DoNotOptimize(chunk);
     }
     state.SetItemsProcessed(state.iterations() * state.range(0));
@@ -128,11 +142,13 @@ BENCHMARK(BM_parquet_to_chunk)->Arg(1000)->Arg(10000);
 // ── output: chunk_to_csv (includes file write) ────────────────────────────────
 
 static void BM_chunk_to_csv(benchmark::State& state) {
-    auto* res = std::pmr::get_default_resource();
-    auto chunk = make_chunk(res, static_cast<int>(state.range(0)));
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
+    auto* res = &arena;
+    const auto chunks = make_batch(res, static_cast<int>(state.range(0)), state);
     const std::string path = "/tmp/otterstax_bench_chunk_to_csv.csv";
     for (auto _ : state) {
-        tsl::chunk_to_csv(chunk, path);
+        auto written = tsl::chunk_to_csv(res, chunks, path);
+        benchmark::DoNotOptimize(written);
     }
     state.SetItemsProcessed(state.iterations() * state.range(0));
     std::filesystem::remove(path);
@@ -142,11 +158,13 @@ BENCHMARK(BM_chunk_to_csv)->Arg(1000)->Arg(10000);
 // ── output: chunk_to_ndjson (includes file write) ─────────────────────────────
 
 static void BM_chunk_to_ndjson(benchmark::State& state) {
-    auto* res = std::pmr::get_default_resource();
-    auto chunk = make_chunk(res, static_cast<int>(state.range(0)));
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
+    auto* res = &arena;
+    const auto chunks = make_batch(res, static_cast<int>(state.range(0)), state);
     const std::string path = "/tmp/otterstax_bench_chunk_to_ndjson.ndjson";
     for (auto _ : state) {
-        tsl::chunk_to_ndjson(chunk, path);
+        auto written = tsl::chunk_to_ndjson(res, chunks, path);
+        benchmark::DoNotOptimize(written);
     }
     state.SetItemsProcessed(state.iterations() * state.range(0));
     std::filesystem::remove(path);
@@ -156,11 +174,13 @@ BENCHMARK(BM_chunk_to_ndjson)->Arg(1000)->Arg(10000);
 // ── output: chunk_to_parquet (includes file write) ────────────────────────────
 
 static void BM_chunk_to_parquet(benchmark::State& state) {
-    auto* res = std::pmr::get_default_resource();
-    auto chunk = make_chunk(res, static_cast<int>(state.range(0)));
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
+    auto* res = &arena;
+    const auto chunks = make_batch(res, static_cast<int>(state.range(0)), state);
     const std::string path = "/tmp/otterstax_bench_chunk_to_parquet.parquet";
     for (auto _ : state) {
-        tsl::chunk_to_parquet(chunk, path);
+        auto written = tsl::chunk_to_parquet(res, chunks, path);
+        benchmark::DoNotOptimize(written);
     }
     state.SetItemsProcessed(state.iterations() * state.range(0));
     std::filesystem::remove(path);

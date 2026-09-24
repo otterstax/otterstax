@@ -9,16 +9,12 @@
 // JOIN keeps both key columns under the same name, a column Arrow cannot
 // carry is refused where the schema is produced (before any ticket exists),
 // and a statement whose schema is not resolved at prepare is recognisable as
-// such. The batches are verified through the IPC reader — the same bytes a
-// client decodes.
+// such. The batches go through the project's own chunk_to_record_batch
+// — the same converter the file paths use.
 
 #include "scheduler_stack.hpp"
 
-#include "frontend/flight_sql/chunk_to_ipc.hpp"
-#include "frontend/flight_sql/ipc/ipc_reader.hpp"
-#include "frontend/flight_sql/ipc/ipc_writer.hpp"
-
-#include <absl/numeric/int128.h>
+#include "otterbrix/translators/output/chunk_to_arrow.hpp"
 
 #include <catch2/catch_all.hpp>
 
@@ -30,9 +26,6 @@
 #include <string_view>
 #include <vector>
 
-using flight::core::EngineError;
-using flight::ipc::RecordBatch;
-using flight::ipc::TypeId;
 using otterstax::test::execute_scheduler_statement;
 using otterstax::test::prepare_scheduler_sql;
 using otterstax::test::run_scheduler_sql;
@@ -68,21 +61,20 @@ namespace {
         return n;
     }
 
-    // writer + reader round-trip: the values a client would decode.
-    std::vector<std::vector<flight::ipc::Value>> decode(const RecordBatch& batch) {
-        const auto message = flight::ipc::serialize_record_batch(batch);
-        return flight::ipc::decode_record_batch(*batch.schema,
-                                                message.bare_message.data(), message.bare_message.size(),
-                                                message.body.data(), message.body.size());
-    }
-
-    // The unscaled integer a decimal128 slot carries, as int128.
-    components::types::int128_t decimal_slot(const RecordBatch& batch, int column, int64_t row) {
-        const auto& buffer = batch.columns[column].buffers[1];
-        std::uint64_t low = 0, high = 0;
-        std::memcpy(&low, buffer.data() + static_cast<std::size_t>(row) * 16, sizeof(low));
-        std::memcpy(&high, buffer.data() + static_cast<std::size_t>(row) * 16 + 8, sizeof(high));
-        return absl::MakeInt128(static_cast<std::int64_t>(high), low);
+    std::vector<std::shared_ptr<arrow::RecordBatch>>
+    to_batches(const scheduler_stack& s, const session_payload& payload,
+               const std::shared_ptr<arrow::Schema>& schema) {
+        std::vector<std::shared_ptr<arrow::RecordBatch>> batches;
+        for (const auto& chunk : payload.chunks) {
+            if (chunk.empty()) {
+                continue;
+            }
+            auto batch = chunk_to_record_batch(s.resource, chunk);
+            INFO("chunk_to_record_batch: " << (batch.has_error() ? batch.error().what.c_str() : "ok"));
+            REQUIRE_FALSE(batch.has_error());
+            batches.push_back(std::move(batch.value()));
+        }
+        return batches;
     }
 
     bool mentions(const char* what, std::string_view text) {
@@ -110,8 +102,10 @@ TEST_CASE("FlightSQL contract: a local JOIN streams both key columns under the p
         REQUIRE(count_named(schema, "x") == 1);
         REQUIRE(count_named(schema, "y") == 1);
 
-        auto flight_schema = flight::conv::schema_to_ipc(schema);
-        REQUIRE(flight_schema->fields.size() == 4);
+        auto flight_schema = to_arrow_schema(s.resource, schema);
+        INFO("arrow schema error: " << (flight_schema.has_error() ? flight_schema.error().what.c_str() : "ok"));
+        REQUIRE_FALSE(flight_schema.has_error());
+        REQUIRE(flight_schema.value()->num_fields() == 4);
 
         // DoGet: the rows come back with the prepared schema, and the batches
         // are built over that schema — never over one re-derived from the
@@ -124,19 +118,19 @@ TEST_CASE("FlightSQL contract: a local JOIN streams both key columns under the p
         REQUIRE(executed.value().schema.type() == components::types::logical_type::STRUCT);
         REQUIRE(executed.value().schema.child_types().size() == 4);
 
-        auto batches = flight::conv::chunks_to_ipc(executed.value(), flight_schema);
+        auto batches = to_batches(s, executed.value(), flight_schema.value());
         REQUIRE(batches.size() == 1);
-        const auto& batch = batches.front();
-        REQUIRE(batch.schema.get() == flight_schema.get());
-        REQUIRE(batch.columns.size() == 4);
-        REQUIRE(batch.num_rows == 2);
+        const auto& batch = *batches.front();
+        REQUIRE(batch.schema()->Equals(*flight_schema.value()));
+        REQUIRE(batch.num_columns() == 4);
+        REQUIRE(batch.num_rows() == 2);
 
         // Every field is fed from its own chunk column: the second `id` is b's
         // key, not a copy of a's and not an empty array.
         std::vector<int> id_cols;
         int x_col = -1, y_col = -1;
         for (int i = 0; i < 4; ++i) {
-            const std::string name = flight_schema->fields[i]->name;
+            const std::string& name = flight_schema.value()->field(i)->name();
             if (name == "id") {
                 id_cols.push_back(i);
             } else if (name == "x") {
@@ -149,13 +143,13 @@ TEST_CASE("FlightSQL contract: a local JOIN streams both key columns under the p
         REQUIRE(x_col >= 0);
         REQUIRE(y_col >= 0);
 
-        const auto rows = decode(batch);
+        const auto ids0 = std::static_pointer_cast<arrow::Int32Array>(batch.column(id_cols[0]));
+        const auto xs = std::static_pointer_cast<arrow::Int32Array>(batch.column(x_col));
+        const auto ids1 = std::static_pointer_cast<arrow::Int32Array>(batch.column(id_cols[1]));
+        const auto ys = std::static_pointer_cast<arrow::Int32Array>(batch.column(y_col));
         std::vector<std::array<std::int64_t, 4>> sorted;
-        for (const auto& row : rows) {
-            sorted.push_back({std::get<std::int64_t>(row[id_cols[0]]),
-                              std::get<std::int64_t>(row[x_col]),
-                              std::get<std::int64_t>(row[id_cols[1]]),
-                              std::get<std::int64_t>(row[y_col])});
+        for (int64_t r = 0; r < batch.num_rows(); ++r) {
+            sorted.push_back({ids0->Value(r), xs->Value(r), ids1->Value(r), ys->Value(r)});
         }
         std::sort(sorted.begin(), sorted.end());
         REQUIRE(sorted[0] == std::array<std::int64_t, 4>{1, 10, 1, 100});
@@ -184,12 +178,9 @@ TEST_CASE("FlightSQL contract: a column without an Arrow mapping is refused wher
             REQUIRE(big.alias() == "big");
             REQUIRE(big.to_physical_type() == components::types::physical_type::UINT128);
 
-            try {
-                flight::conv::schema_to_ipc(schema);
-                FAIL("expected the UHUGEINT column to be refused");
-            } catch (const EngineError& e) {
-                REQUIRE(mentions(e.what(), "big"));
-            }
+            auto converted = to_arrow_schema(s.resource, schema);
+            REQUIRE(converted.has_error());
+            REQUIRE(std::string_view{converted.error().what.c_str()}.find("big") != std::string_view::npos);
         }
 
         SECTION("the mappable columns of the same table still stream") {
@@ -199,16 +190,18 @@ TEST_CASE("FlightSQL contract: a column without an Arrow mapping is refused wher
             auto prepared = prepare_scheduler_sql(s, stmt, "SELECT id FROM fdb.uhuge;");
             INFO("prepare error: " << prepared.error().what.c_str());
             REQUIRE_FALSE(prepared.has_error());
-            auto flight_schema = flight::conv::schema_to_ipc(prepared.value().schema);
-            REQUIRE(flight_schema->fields.size() == 1);
-            REQUIRE(flight_schema->fields[0]->type->id == TypeId::Int32);
+            auto flight_schema = to_arrow_schema(s.resource, prepared.value().schema);
+            INFO("arrow schema error: " << (flight_schema.has_error() ? flight_schema.error().what.c_str() : "ok"));
+            REQUIRE_FALSE(flight_schema.has_error());
+            REQUIRE(flight_schema.value()->num_fields() == 1);
+            REQUIRE(flight_schema.value()->field(0)->type()->id() == arrow::Type::INT32);
 
             auto executed = execute_scheduler_statement(s, stmt);
             INFO("execute error: " << executed.error().what.c_str());
             REQUIRE_FALSE(executed.has_error());
             REQUIRE(executed.value().size() == 0);
 
-            REQUIRE(flight::conv::chunks_to_ipc(executed.value(), flight_schema).empty());
+            REQUIRE(to_batches(s, executed.value(), flight_schema.value()).empty());
         }
     });
 }
@@ -235,17 +228,21 @@ TEST_CASE("FlightSQL contract: a HUGEINT column is carried, not refused") {
 
         // Arrow has no 128-bit integer type; decimal128(38, 0) is the carrier, and
         // GetFlightInfo hands out exactly this schema for DoGet to stream under.
-        auto flight_schema = flight::conv::schema_to_ipc(schema);
-        REQUIRE(flight_schema->fields.size() == 1);
-        REQUIRE(flight_schema->fields[0]->name == "big");
-        REQUIRE(flight_schema->fields[0]->type->id == TypeId::Decimal128);
-        REQUIRE(flight_schema->fields[0]->type->precision == 38);
-        REQUIRE(flight_schema->fields[0]->type->scale == 0);
+        auto flight_schema = to_arrow_schema(s.resource, schema);
+        INFO("arrow schema error: " << (flight_schema.has_error() ? flight_schema.error().what.c_str() : "ok"));
+        REQUIRE_FALSE(flight_schema.has_error());
+        REQUIRE(flight_schema.value()->num_fields() == 1);
+        REQUIRE(flight_schema.value()->field(0)->name() == "big");
+        REQUIRE(flight_schema.value()->field(0)->type()->id() == arrow::Type::DECIMAL128);
+        const auto* decimal = static_cast<const arrow::Decimal128Type*>(
+            flight_schema.value()->field(0)->type().get());
+        REQUIRE(decimal->precision() == 38);
+        REQUIRE(decimal->scale() == 0);
 
         auto executed = execute_scheduler_statement(s, stmt);
         INFO("execute error: " << executed.error().what.c_str());
         REQUIRE_FALSE(executed.has_error());
-        REQUIRE(flight::conv::chunks_to_ipc(executed.value(), flight_schema).empty());
+        REQUIRE(to_batches(s, executed.value(), flight_schema.value()).empty());
     });
 }
 
@@ -271,17 +268,21 @@ TEST_CASE("FlightSQL contract: a DECIMAL column is carried with its scale") {
         // 1.2345 arrived as 12345 under a schema with nowhere to put the point back. 38 is
         // both the engine's widest precision and decimal128's, so even the widest DECIMAL
         // the engine can declare is carried rather than refused.
-        auto flight_schema = flight::conv::schema_to_ipc(schema);
-        REQUIRE(flight_schema->fields.size() == 1);
-        REQUIRE(flight_schema->fields[0]->name == "amount");
-        REQUIRE(flight_schema->fields[0]->type->id == TypeId::Decimal128);
-        REQUIRE(flight_schema->fields[0]->type->precision == 38);
-        REQUIRE(flight_schema->fields[0]->type->scale == 10);
+        auto flight_schema = to_arrow_schema(s.resource, schema);
+        INFO("arrow schema error: " << (flight_schema.has_error() ? flight_schema.error().what.c_str() : "ok"));
+        REQUIRE_FALSE(flight_schema.has_error());
+        REQUIRE(flight_schema.value()->num_fields() == 1);
+        REQUIRE(flight_schema.value()->field(0)->name() == "amount");
+        REQUIRE(flight_schema.value()->field(0)->type()->id() == arrow::Type::DECIMAL128);
+        const auto* declared = static_cast<const arrow::Decimal128Type*>(
+            flight_schema.value()->field(0)->type().get());
+        REQUIRE(declared->precision() == 38);
+        REQUIRE(declared->scale() == 10);
 
         auto executed = execute_scheduler_statement(s, stmt);
         INFO("execute error: " << executed.error().what.c_str());
         REQUIRE_FALSE(executed.has_error());
-        REQUIRE(flight::conv::chunks_to_ipc(executed.value(), flight_schema).empty());
+        REQUIRE(to_batches(s, executed.value(), flight_schema.value()).empty());
     });
 }
 
@@ -302,24 +303,22 @@ TEST_CASE("FlightSQL contract: the DoGet stream carries a DECIMAL value with its
     chunk.set_value(0, 1, components::types::logical_value_t::create_decimal(res, types[0], int64_t{-12345}));
     chunk.set_value(0, 2, components::types::logical_value_t{res, nullptr});
 
-    auto flight_schema = flight::conv::schema_to_ipc(
-        components::types::complex_logical_type::create_struct("", std::pmr::vector<components::types::complex_logical_type>{types, res}));
+    auto flight_schema = to_arrow_schema(
+        res,
+        components::types::complex_logical_type::create_struct(
+            "", std::pmr::vector<components::types::complex_logical_type>{types, res}));
+    REQUIRE_FALSE(flight_schema.has_error());
 
-    std::pmr::vector<components::vector::data_chunk_t> chunks(res);
-    chunks.push_back(std::move(chunk));
-    session_payload payload{components::types::complex_logical_type::create_struct(
-                                "", std::pmr::vector<components::types::complex_logical_type>{types, res}),
-                            std::move(chunks), 0, NodeTag::T_SelectStmt};
-    auto batches = flight::conv::chunks_to_ipc(payload, flight_schema);
-    REQUIRE(batches.size() == 1);
-    const auto& batch = batches.front();
-    REQUIRE(batch.schema.get() == flight_schema.get());
-    REQUIRE(batch.num_rows == 3);
-    REQUIRE(batch.columns[0].null_count == 1);
-    REQUIRE(decimal_slot(batch, 0, 0) == 12345);
-    REQUIRE(decimal_slot(batch, 0, 1) == -12345);
-    // a null slot is the validity bitmap's business; its bytes stay zeroed
-    REQUIRE(decimal_slot(batch, 0, 2) == 0);
+    auto converted = chunk_to_record_batch(res, chunk);
+    REQUIRE_FALSE(converted.has_error());
+    const auto& batch = *converted.value();
+    REQUIRE(batch.schema()->Equals(*flight_schema.value()));
+    REQUIRE(batch.num_rows() == 3);
+    REQUIRE(batch.column(0)->null_count() == 1);
+    const auto& values = static_cast<const arrow::Decimal128Array&>(*batch.column(0));
+    REQUIRE(values.FormatValue(0) == "1.2345");
+    REQUIRE(values.FormatValue(1) == "-1.2345");
+    REQUIRE(values.IsNull(2));
 }
 
 TEST_CASE("FlightSQL contract: a parameterized SELECT is prepared from the engine's own columns") {
@@ -353,12 +352,10 @@ TEST_CASE("FlightSQL contract: a parameterized SELECT is prepared from the engin
 
         // The schema converts like any other, into the fields the rows will
         // carry; the parameters ride their own schema, one int64 field per parameter
-        auto flight_schema = flight::conv::schema_to_ipc(schema);
-        REQUIRE(flight_schema->fields.size() == 2);
-        REQUIRE(flight_schema->fields[0]->type->id == TypeId::Int32);
-        REQUIRE(flight_schema->fields[1]->type->id == TypeId::Int32);
-        auto parameter_schema = flight::conv::parameter_ipc_schema(prepared.value().parameter_count);
-        REQUIRE(parameter_schema->fields.size() == 1);
-        REQUIRE(parameter_schema->fields[0]->type->id == TypeId::Int64);
+        auto flight_schema = to_arrow_schema(s.resource, schema);
+        REQUIRE_FALSE(flight_schema.has_error());
+        REQUIRE(flight_schema.value()->num_fields() == 2);
+        REQUIRE(flight_schema.value()->field(0)->type()->id() == arrow::Type::INT32);
+        REQUIRE(flight_schema.value()->field(1)->type()->id() == arrow::Type::INT32);
     });
 }

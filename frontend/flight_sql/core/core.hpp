@@ -4,13 +4,19 @@
 #pragma once
 
 // Flight SQL core: the protocol/engine exchange shapes, the ticket manager
-// and the FlightInfo/FlightData assembly. There is no engine interface on
-// purpose — the server has exactly one engine, and FlightSqlCore owns it
-// (a flight::engine::SchedulerEngine, held through a forward declaration).
+// and the FlightInfo/FlightData assembly. The data plane rides the PROJECT's
+// arrow core — the same types and serializers the file translators use
+// (tsl::chunk_to_record_batch in, arrow::ipc payloads out) — with no
+// wire-protocol layer of our own. There is no engine interface on purpose —
+// the server has exactly one engine, and FlightSqlCore owns it (a
+// flight::engine::SchedulerEngine, held through a forward declaration).
 
 #include "auth.hpp"
 
 #include "utility/table_info.hpp"
+
+#include <arrow/api.h>
+#include <arrow/ipc/writer.h>
 
 // The engine's postgres-derived headers #define ERROR (a pg error code,
 // pg_type_definitions.h), which collides with FlightSql's generated
@@ -18,11 +24,11 @@
 // the parser's DAY/SECOND the catalog already undefs for arrow. The guard is
 // prepended to the GENERATED headers themselves (patch_pb_undef.cmake), so
 // no TU's include order decides whether the protocol compiles.
+#undef ERROR
 #include <Flight.grpc.pb.h>
-#include <ipc/array.hpp>
-#include <ipc/ipc_reader.hpp>
-#include <ipc/ipc_writer.hpp>
+#undef ERROR
 
+#include <atomic>
 #include <cstdint>
 #include <deque>
 #include <memory>
@@ -46,25 +52,26 @@ struct EngineError : std::runtime_error {
 };
 
 struct QueryResult {
-    ipc::SchemaPtr schema; // always VALID, possibly empty (no result set)
-    std::vector<ipc::RecordBatch> batches;
+    // Always a VALID (possibly empty) schema; batches carry the rows.
+    std::shared_ptr<arrow::Schema> schema;
+    std::vector<std::shared_ptr<arrow::RecordBatch>> batches;
 };
 
 // The tables the metadata commands answer with: the PROJECT's table_info
-// (qualified name + engine schema), not a protocol-side twin — the schema is
-// converted to IPC where the metadata batches are built (commands.cpp).
+// (qualified name + engine schema); the arrow schema of a table is built
+// where the metadata batches are assembled (commands.cpp).
 struct EngineMetadata {
     std::vector<std::string> catalogs;
     std::vector<std::string> db_schemas; // for CommandGetDbSchemas (simplified: not bound to the catalog filter)
-    std::vector<table_info> tables;
+    std::pmr::vector<table_info> tables;
     std::vector<std::string> table_types;
 };
 
 // A prepared query: text + the result and parameter schemas.
 struct Prepared {
     std::string query;
-    ipc::SchemaPtr dataset_schema;   // empty for update
-    ipc::SchemaPtr parameter_schema; // one field per '?'
+    std::shared_ptr<arrow::Schema> dataset_schema;   // null for update
+    std::shared_ptr<arrow::Schema> parameter_schema; // one field per '?'
 
     // Opaque engine-side resource handle (the Worker's prepared-statement
     // session). The engine fills it in prepare(); the protocol layer never
@@ -73,18 +80,26 @@ struct Prepared {
     std::string engine_handle;
 };
 
-// Bound parameters: rows of values (a row = a vector with one entry per parameter).
-using BoundParams = std::vector<std::vector<ipc::Value>>;
+// Bound parameters: the DoPut batches as the client sent them (the engine
+// adapter reads rows out of them through the project's tsl::arrow_to_chunk).
+using BoundParams = std::vector<std::shared_ptr<arrow::RecordBatch>>;
 
 // SQL-LIKE matcher (% — any sequence, _ — one character).
 // No escaping; a ""/NULL pattern does not filter.
 [[nodiscard]] bool like_match(std::string_view text, std::string_view pattern);
 
-// A materialized query result (fully in memory for now).
+// One DoGet-ready batch message: the bare flatbuffer header (data_header) and
+// the aligned body buffers (data_body), as arrow::ipc produced them.
+struct BatchPayload {
+    std::string metadata; // bare Message(header=RecordBatch)
+    std::string body;
+};
+
+// A materialized query result, already serialized for the wire.
 struct CachedResult {
-    ipc::SchemaPtr schema;
-    std::vector<std::uint8_t> schema_message;                 // bare flatbuffer Message(Schema)
-    std::vector<ipc::RecordBatchMessage> batch_messages;      // ready for DoGet
+    std::string schema_ipc;     // encapsulated schema (FlightInfo.schema / SchemaResult)
+    std::string schema_message; // the same schema as a BARE message: DoGet's first FlightData
+    std::vector<BatchPayload> batches; // ready for DoGet (bare headers, like IpcPayload.metadata)
     std::int64_t total_rows = 0;
 };
 
@@ -109,8 +124,9 @@ class FlightSqlCore {
                                  PreparedStatementState const** out) const;
     grpc::Status prepared_bind(const std::string& handle, BoundParams rows);
 
-    // Materialize a result and register a ticket for it.
-    std::string register_result(ipc::SchemaPtr schema, std::vector<ipc::RecordBatch> batches);
+    // Serialize a result and register a ticket for it.
+    std::string register_result(const std::shared_ptr<arrow::Schema>& schema,
+                                std::vector<std::shared_ptr<arrow::RecordBatch>> batches);
 
     // Build FlightInfo for a ticket (NOT_FOUND when the ticket is unknown).
     grpc::Status make_flight_info(const fp::FlightDescriptor& descriptor, const std::string& ticket,

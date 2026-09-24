@@ -5,7 +5,10 @@
 
 // The engine side of the Flight SQL server: Scheduler::execute /
 // prepare_schema / execute_prepared_statement wrapped as the one engine
-// FlightSqlCore owns.
+// FlightSqlCore owns. Every conversion goes through the project's own
+// translators (to_arrow_schema / chunk_to_record_batch /
+// arrow_to_chunk) — the same ones the file paths use; there is no
+// flight-specific data-plane code.
 //
 // The engine is called from inside an asio-grpc coroutine, and every
 // Scheduler call is awaited with frontend/common/asio_future_bridge.hpp's
@@ -23,11 +26,16 @@
 #include <memory_resource>
 #include <string>
 #include <utility>
+#include <vector>
 
 class Scheduler;
 
 namespace mysql {
     class CatalogManager;
+}
+
+namespace components::types {
+    class logical_value_t;
 }
 
 namespace flight::engine {
@@ -37,6 +45,8 @@ namespace flight::engine {
         SchedulerEngine(actor_zeta::address_t scheduler,
                         actor_zeta::address_t catalog,
                         std::pmr::memory_resource* resource);
+
+        std::pmr::memory_resource* resource() const noexcept { return resource_; }
 
         // SELECT-like queries and DML by text.
         core::QueryResult execute(const std::string& query);
@@ -66,6 +76,9 @@ namespace flight::engine {
         std::pair<session_hash_t, session_payload> prepare_fresh(const std::string& sql);
         // Re-prepare + execute_prepared_statement with one parameter row.
         session_payload run_prepared(const std::string& sql, const core::BoundParams& params);
+        // The DoPut batches -> engine parameter rows (tsl::arrow_to_chunk).
+        std::pmr::vector<std::pmr::vector<components::types::logical_value_t>>
+        to_param_rows(const core::BoundParams& params);
         // Best-effort Scheduler::close_statement (idempotent on the Worker).
         void close_quietly(session_hash_t id);
 

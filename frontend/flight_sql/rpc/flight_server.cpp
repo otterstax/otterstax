@@ -7,15 +7,70 @@
 
 #include <agrpc/register_awaitable_rpc_handler.hpp>
 
+#include <arrow/io/memory.h>
+#include <arrow/ipc/reader.h>
+#include <arrow/ipc/writer.h>
+
 #include <core/commands.hpp>
 
 #include <google/protobuf/any.pb.h>
 #include <google/protobuf/empty.pb.h>
 #include <FlightSql.pb.h>
 
+#include <cstdint>
+#include <cstring>
 #include <exception>
+#include <string>
+#include <vector>
 
 namespace flight::rpc {
+
+namespace {
+
+// Flight's dissociated IPC: the client sends each message as a bare
+// flatbuffer in data_header (no continuation framing), with its body in
+// data_body. arrow's RecordBatchStreamReader wants a regular encapsulated
+// stream, so each message is re-wrapped: continuation + u32 length + padded
+// metadata + body — the only serialization glue this server owns.
+void append_encapsulated(std::string& out, const std::string& header, const std::string& body) {
+    const auto pad8 = [](std::size_t v) { return (v + 7) / 8 * 8; };
+    std::size_t meta_len = pad8(header.size());
+    out.append("\xff\xff\xff\xff", 4);
+    const std::uint32_t len = static_cast<std::uint32_t>(meta_len);
+    out.push_back(static_cast<char>(len));
+    out.push_back(static_cast<char>(len >> 8));
+    out.push_back(static_cast<char>(len >> 16));
+    out.push_back(static_cast<char>(len >> 24));
+    out.append(header);
+    out.append(meta_len - header.size(), '\0');
+    out.append(body);
+}
+
+// DoPut-bind batches -> arrow RecordBatches (the parameters as the client
+// sent them; the engine adapter reads rows through tsl::arrow_to_chunk).
+std::vector<std::shared_ptr<arrow::RecordBatch>> read_bind_batches(const std::string& stream) {
+    auto buffer = std::make_shared<arrow::Buffer>(
+        reinterpret_cast<const std::uint8_t*>(stream.data()), static_cast<std::int64_t>(stream.size()));
+    auto reader = arrow::ipc::RecordBatchStreamReader::Open(
+        std::make_shared<arrow::io::BufferReader>(buffer));
+    if (!reader.ok()) {
+        throw std::runtime_error("bind stream: " + reader.status().ToString());
+    }
+    std::vector<std::shared_ptr<arrow::RecordBatch>> batches;
+    while (true) {
+        auto batch = (*reader)->Next();
+        if (!batch.ok()) {
+            throw std::runtime_error("bind stream: " + batch.status().ToString());
+        }
+        if (!*batch) {
+            break; // end of stream
+        }
+        batches.push_back(*batch);
+    }
+    return batches;
+}
+
+} // namespace
 
 namespace {
 
@@ -34,9 +89,8 @@ struct RethrowFirstArg {
 using AsyncService = fp::FlightService::AsyncService;
 namespace fps = arrow::flight::protocol::sql;
 
-void fill_flight_data(const std::vector<std::uint8_t>& bare_header,
-                      const std::vector<std::uint8_t>& body, fp::FlightData* out) {
-    out->set_data_header(bare_header.data(), bare_header.size());
+void fill_flight_data(std::string_view header, std::string_view body, fp::FlightData* out) {
+    out->set_data_header(header.data(), header.size());
     if (!body.empty()) {
         out->set_data_body(body.data(), body.size());
     }
@@ -124,13 +178,21 @@ asio::awaitable<void> FlightServer::handle_do_action(auto& rpc, fp::Action& requ
             co_return;
         }
         create_result.set_prepared_statement_handle(handle);
-        if (state->prepared.dataset_schema) {
-            const auto bytes = ipc::schema_ipc_bytes(*state->prepared.dataset_schema);
-            create_result.set_dataset_schema(bytes.data(), bytes.size());
+        const auto schema_bytes = [](const std::shared_ptr<arrow::Schema>& schema,
+                                     std::string* out) -> bool {
+            if (!schema) return false;
+            auto bytes = arrow::ipc::SerializeSchema(*schema);
+            if (!bytes.ok()) return false;
+            out->assign(reinterpret_cast<const char*>((*bytes)->data()),
+                        static_cast<std::size_t>((*bytes)->size()));
+            return true;
+        };
+        std::string bytes;
+        if (schema_bytes(state->prepared.dataset_schema, &bytes)) {
+            create_result.set_dataset_schema(bytes);
         }
-        if (state->prepared.parameter_schema) {
-            const auto bytes = ipc::schema_ipc_bytes(*state->prepared.parameter_schema);
-            create_result.set_parameter_schema(bytes.data(), bytes.size());
+        if (schema_bytes(state->prepared.parameter_schema, &bytes)) {
+            create_result.set_parameter_schema(bytes);
         }
         google::protobuf::Any result_any;
         result_any.PackFrom(create_result);
@@ -278,9 +340,9 @@ asio::awaitable<void> FlightServer::handle_do_get(auto& rpc, fp::Ticket& request
             co_return; // the client is gone
         }
     }
-    for (const auto& batch : cached->batch_messages) {
+    for (const auto& batch : cached->batches) {
         fp::FlightData data;
-        fill_flight_data(batch.bare_message, batch.body, &data);
+        fill_flight_data(batch.metadata, batch.body, &data);
         if (!co_await rpc.write(data)) {
             co_return;
         }
@@ -300,9 +362,7 @@ asio::awaitable<void> FlightServer::handle_do_put(auto& rpc) {
     core::DoPutCommand command;
     grpc::Status command_status = grpc::Status::OK;
 
-    ipc::FlightDataSink sink;
-    core::BoundParams bound_rows;
-    std::vector<std::vector<ipc::Value>> rows;
+    std::string bind_stream;
 
     // An update (Statement/PreparedStatement) carries nothing but the command
     // descriptor, and clients read the PutResult BEFORE closing their side
@@ -322,20 +382,15 @@ asio::awaitable<void> FlightServer::handle_do_put(auto& rpc) {
             }
         }
         if (command.kind == core::DoPutKind::PreparedBind) {
-            try {
-                const auto& header = data.data_header();
-                const auto& body = data.data_body();
-                if (sink.feed(reinterpret_cast<const std::uint8_t*>(header.data()),
-                              header.size(),
-                              reinterpret_cast<const std::uint8_t*>(body.data()),
-                              body.size(), rows)) {
-                    for (auto& r : rows) bound_rows.push_back(std::move(r));
-                    rows.clear();
-                }
-            } catch (const std::exception& e) {
-                command_status = {grpc::StatusCode::INVALID_ARGUMENT, e.what()};
-                break;
-            }
+            append_encapsulated(bind_stream, data.data_header(), data.data_body());
+        }
+    }
+    core::BoundParams bound_rows;
+    if (command.kind == core::DoPutKind::PreparedBind && command_status.ok()) {
+        try {
+            bound_rows = read_bind_batches(bind_stream);
+        } catch (const std::exception& e) {
+            command_status = {grpc::StatusCode::INVALID_ARGUMENT, e.what()};
         }
     }
     if (!command_status.ok()) {

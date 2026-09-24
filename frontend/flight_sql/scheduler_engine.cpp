@@ -3,17 +3,16 @@
 
 #include "scheduler_engine.hpp"
 
-#include "chunk_to_ipc.hpp"
-
 #include "catalog/catalog_manager.hpp"
 #include "frontend/common/asio_future_bridge.hpp"
+#include "otterbrix/translators/input/arrow_to_chunk.hpp"
+#include "otterbrix/translators/output/chunk_to_arrow.hpp"
+#include "otterbrix/translators/output/writable_columns.hpp"
 #include "scheduler/scheduler.hpp"
 #include "utility/logger.hpp"
 #include "utility/session.hpp"
 #include "utility/tracy_profiler.hpp"
 
-#include <charconv>
-#include <memory_resource>
 #include <string>
 #include <vector>
 
@@ -25,7 +24,7 @@ namespace flight::engine {
 
         // Every error leaving the adapter is an EngineError: the Flight SQL
         // core maps it to INVALID_ARGUMENT with the text attached.
-        // `::core` — the global namespace; a bare `core` here would resolve
+        // `::core` is the global namespace; a bare `core` here would resolve
         // to our own flight::core.
         [[noreturn]] void engine_error(const ::core::error_t& error, const char* stage) {
             if (error.type == otterstax::AWAIT_TIMEOUT_CODE) {
@@ -34,70 +33,47 @@ namespace flight::engine {
             throw core::EngineError(std::string{"Error while "} + stage + ": " + error.what.c_str());
         }
 
-        // One bound parameter row -> engine values. The parameter schema the
-        // server hands out is utf8 (parameter types are not resolved at
-        // prepare time), so a string value is re-typed the way a text protocol
-        // frontend types its literals: an integer it parses as one, then a
-        // double, then a bool, else it stays text.
-        std::pmr::vector<logical_value_t> to_engine_params(std::pmr::memory_resource* resource,
-                                                           const core::BoundParams& rows) {
-            std::pmr::vector<logical_value_t> params(resource);
-            if (rows.empty()) {
-                return params;
-            }
-            const auto& row = rows.front();
-            params.reserve(row.size());
-            for (const auto& value : row) {
-                switch (value.index()) {
-                    case 0: // monostate = NULL
-                        params.emplace_back(resource, nullptr);
-                        break;
-                    case 1:
-                        params.emplace_back(resource, std::get<bool>(value));
-                        break;
-                    case 2:
-                        params.emplace_back(resource, std::get<std::int64_t>(value));
-                        break;
-                    case 3:
-                        params.emplace_back(resource, std::get<std::uint64_t>(value));
-                        break;
-                    case 4:
-                        params.emplace_back(resource, std::get<double>(value));
-                        break;
-                    default: {
-                        const std::string& text = std::get<std::string>(value);
-                        std::int64_t i = 0;
-                        auto [int_end, int_ec] = std::from_chars(text.data(), text.data() + text.size(), i);
-                        if (int_ec == std::errc{} && int_end == text.data() + text.size()) {
-                            params.emplace_back(resource, i);
-                            break;
-                        }
-                        double d = 0;
-                        auto [dbl_end, dbl_ec] = std::from_chars(text.data(), text.data() + text.size(), d);
-                        if (dbl_ec == std::errc{} && dbl_end == text.data() + text.size()) {
-                            params.emplace_back(resource, d);
-                            break;
-                        }
-                        if (text == "true" || text == "t") {
-                            params.emplace_back(resource, true);
-                            break;
-                        }
-                        if (text == "false" || text == "f") {
-                            params.emplace_back(resource, false);
-                            break;
-                        }
-                        params.emplace_back(resource, std::string{text});
-                        break;
-                    }
+        // The schema handed out is the stream's contract: a row-producing
+        // statement whose columns the batch stream cannot encode (a nested
+        // STRUCT/LIST) is refused before a ticket exists, exactly where the
+        // old Arrow-based frontend refused it.
+        void check_stream_encodable(const arrow::Schema& schema) {
+            for (const auto& field : schema.fields()) {
+                if (arrow::is_nested(field->type()->id())) {
+                    throw core::EngineError("the record batch stream encodes scalar columns only: column '" +
+                                            field->name() + "' has nested type " +
+                                            field->type()->ToString());
                 }
             }
-            return params;
         }
 
-        // The prepared-statement session the CreatePreparedStatement prepare
-        // left on a Worker, closed when the statement is executed (the
-        // execution re-prepares under its own fresh session) or closed
-        // outright; 0 when the engine holds nothing.
+        core::QueryResult to_query_result(std::pmr::memory_resource* resource,
+                                          session_payload& payload) {
+            core::QueryResult result;
+            auto schema = to_arrow_schema(resource, payload.schema);
+            if (schema.has_error()) {
+                throw core::EngineError(schema.error().what.c_str());
+            }
+            check_stream_encodable(*schema.value());
+            result.schema = std::move(schema.value());
+            for (auto& chunk : payload.chunks) {
+                if (chunk.empty()) {
+                    // an empty chunk is not end-of-stream — keep scanning
+                    continue;
+                }
+                auto batch = chunk_to_record_batch(resource, chunk);
+                if (batch.has_error()) {
+                    throw core::EngineError(batch.error().what.c_str());
+                }
+                result.batches.push_back(std::move(batch.value()));
+            }
+            return result;
+        }
+
+        // The prepared session the CreatePreparedStatement prepare left on a
+        // Worker, closed when the statement is executed (the execution
+        // re-prepares under its own fresh session) or closed outright; 0 when
+        // the engine holds nothing.
         session_hash_t handle_of(const core::Prepared& prepared) {
             if (prepared.engine_handle.empty()) {
                 return 0;
@@ -136,6 +112,7 @@ namespace flight::engine {
     std::pair<session_hash_t, session_payload> SchedulerEngine::prepare_fresh(const std::string& sql) {
         OTX_ZONE_N("flight::SchedulerEngine::prepare_fresh");
         session_id id;
+        // sending to the Scheduler event-loop always returns needs_sched=false
         [[maybe_unused]] auto [needs_sched, fut] =
             actor_zeta::send(scheduler_, &Scheduler::prepare_schema, id.hash(), sql);
         auto r = otterstax::await_future_blocking<session_payload>(std::move(fut), resource_);
@@ -145,18 +122,57 @@ namespace flight::engine {
         return {id.hash(), std::move(r.value())};
     }
 
+    std::pmr::vector<std::pmr::vector<components::types::logical_value_t>>
+    SchedulerEngine::to_param_rows(const core::BoundParams& params) {
+        std::pmr::vector<std::pmr::vector<components::types::logical_value_t>> rows(resource_);
+        for (const auto& batch : params) {
+            if (!batch || batch->num_rows() == 0) {
+                continue;
+            }
+            // The project's own reader: an arrow batch -> engine chunk; each
+            // chunk cell IS a logical_value_t, which is what the binder takes.
+            auto converted = tsl::arrow_to_chunk(resource_, batch);
+            if (converted.has_error()) {
+                throw core::EngineError(converted.error().what.c_str());
+            }
+            const auto& chunk = converted.value();
+            for (std::size_t r = 0; r < chunk.size(); ++r) {
+                std::pmr::vector<components::types::logical_value_t> row(resource_);
+                row.reserve(chunk.column_count());
+                for (std::size_t c = 0; c < chunk.column_count(); ++c) {
+                    row.push_back(chunk.value(c, r));
+                }
+                rows.push_back(std::move(row));
+            }
+        }
+        return rows;
+    }
+
     session_payload SchedulerEngine::run_prepared(const std::string& sql, const core::BoundParams& params) {
         OTX_ZONE_N("flight::SchedulerEngine::run_prepared");
         auto [id, prepared_payload] = prepare_fresh(sql);
-        auto parameters = to_engine_params(resource_, params);
-        if (prepared_payload.parameter_count > 0 && parameters.size() != prepared_payload.parameter_count) {
+        auto parameters = to_param_rows(params);
+        if (prepared_payload.parameter_count > 0 &&
+            parameters.size() != 1 && !parameters.empty()) {
+            // executemany goes row-by-row upstream; a single run takes one row
+            close_quietly(id);
+            throw core::EngineError("prepared statement takes one parameter row per execution, got " +
+                                    std::to_string(parameters.size()));
+        }
+        if (prepared_payload.parameter_count > 0 &&
+            (parameters.empty() || parameters.front().size() != prepared_payload.parameter_count)) {
             close_quietly(id);
             throw core::EngineError("prepared statement takes " +
                                     std::to_string(prepared_payload.parameter_count) +
-                                    " parameter(s), got " + std::to_string(parameters.size()));
+                                    " parameter(s), got " +
+                                    std::to_string(parameters.empty() ? 0 : parameters.front().size()));
         }
+        auto bound = parameters.empty()
+                         ? std::pmr::vector<components::types::logical_value_t>{resource_}
+                         : std::move(parameters.front());
+        // sending to the Scheduler event-loop always returns needs_sched=false
         [[maybe_unused]] auto [needs_sched, fut] =
-            actor_zeta::send(scheduler_, &Scheduler::execute_prepared_statement, id, std::move(parameters));
+            actor_zeta::send(scheduler_, &Scheduler::execute_prepared_statement, id, std::move(bound));
         auto r = otterstax::await_future_blocking<session_payload>(std::move(fut), resource_);
         if (r.has_error()) {
             engine_error(r.error(), "executing the prepared statement");
@@ -168,6 +184,7 @@ namespace flight::engine {
         if (id == 0) {
             return;
         }
+        // sending to the Scheduler event-loop always returns needs_sched=false
         [[maybe_unused]] auto [needs_sched, fut] =
             actor_zeta::send(scheduler_, &Scheduler::close_statement, id);
         auto closed = otterstax::await_future_blocking<session_payload>(std::move(fut), resource_);
@@ -203,6 +220,7 @@ namespace flight::engine {
             }
         }
 
+        // sending to the Scheduler event-loop always returns needs_sched=false
         [[maybe_unused]] auto [needs_sched, fut] =
             actor_zeta::send(scheduler_, &Scheduler::execute_statement, id);
         auto r = otterstax::await_future_blocking<session_payload>(std::move(fut), resource_);
@@ -211,15 +229,12 @@ namespace flight::engine {
         }
         session_payload payload = std::move(r.value());
 
-        core::QueryResult result;
-        // Always a VALID (possibly empty) schema: a null SchemaPtr would
-        // dereference in the IPC serializer when the ticket is registered.
-        result.schema = conv::schema_to_ipc(payload.schema);
-        if (payload.column_count() > 0) {
-            result.batches = conv::chunks_to_ipc(payload, result.schema);
+        if (payload.column_count() == 0) {
+            // DDL / DML over the query RPC: no result set, no rows. Always a
+            // VALID (empty) schema: a null one would fail downstream.
+            return core::QueryResult{arrow::schema({}), {}};
         }
-        // no columns: DDL / DML over the query RPC — no result set, no rows
-        return result;
+        return to_query_result(resource_, payload);
     }
 
     std::int64_t SchedulerEngine::execute_update(const std::string& query) {
@@ -243,9 +258,24 @@ namespace flight::engine {
                 close_quietly(id);
                 throw core::EngineError("the result schema of the statement could not be resolved");
             }
-            prepared.dataset_schema = conv::schema_to_ipc(payload.schema);
+            auto converted = to_arrow_schema(resource_, payload.schema);
+            if (converted.has_error()) {
+                close_quietly(id);
+                throw core::EngineError(converted.error().what.c_str());
+            }
+            check_stream_encodable(*converted.value());
+            prepared.dataset_schema = std::move(converted.value());
         }
-        prepared.parameter_schema = conv::parameter_ipc_schema(payload.parameter_count);
+        // int64 "$N" parameters: the model the reference drivers bind against
+        // (arrow-go refuses to coerce a typed value into a utf8 field).
+        if (payload.parameter_count > 0) {
+            std::vector<std::shared_ptr<arrow::Field>> fields;
+            fields.reserve(payload.parameter_count);
+            for (std::size_t i = 0; i < payload.parameter_count; ++i) {
+                fields.push_back(arrow::field("$" + std::to_string(i + 1), arrow::int64(), true));
+            }
+            prepared.parameter_schema = arrow::schema(std::move(fields));
+        }
         return prepared;
     }
 
@@ -254,21 +284,17 @@ namespace flight::engine {
         OTX_ZONE_N("flight::SchedulerEngine::execute_prepared");
         // The first bound row answers; an executemany of a SELECT has no
         // single result to stream.
-        core::QueryResult result;
         try {
             auto payload = run_prepared(prepared.query, params);
-            // Always a VALID (possibly empty) schema; see execute().
-            result.schema = conv::schema_to_ipc(payload.schema);
-            if (payload.column_count() > 0) {
-                result.batches = conv::chunks_to_ipc(payload, result.schema);
+            if (payload.column_count() == 0) {
+                // DDL/DML over the prepared path — an empty dataset
+                return core::QueryResult{arrow::schema({}), {}};
             }
-            // no columns: DDL/DML over the prepared path — an empty dataset
+            return to_query_result(resource_, payload);
         } catch (...) {
             close_quietly(handle_of(prepared));
             throw;
         }
-        close_quietly(handle_of(prepared));
-        return result;
     }
 
     std::int64_t SchedulerEngine::execute_update_prepared(const core::Prepared& prepared,
@@ -281,8 +307,9 @@ namespace flight::engine {
             } else {
                 // executemany: one execution per bound row, the affected
                 // counts sum (the ADBC executemany contract for updates).
-                for (const auto& row : params) {
-                    affected += static_cast<std::int64_t>(run_prepared(prepared.query, {row}).size());
+                for (const auto& batch : params) {
+                    affected += static_cast<std::int64_t>(
+                        run_prepared(prepared.query, {batch}).size());
                 }
             }
         } catch (...) {
@@ -306,6 +333,7 @@ namespace flight::engine {
         // (Catalogs / DbSchemas / Tables / TableTypes) reads this answer.
         catalog_ext::get_tables_command_t command;
         command.include_schema = true;
+        // sending to the Scheduler event-loop always returns needs_sched=false
         [[maybe_unused]] auto [needs_sched, fut] =
             actor_zeta::send(catalog_, &mysql::CatalogManager::get_tables, std::move(command));
         auto r = otterstax::await_future_blocking<std::pmr::vector<table_info>>(std::move(fut), resource_);
@@ -314,7 +342,7 @@ namespace flight::engine {
         }
 
         // The tables ride as the project's own table_info (qualified name +
-        // engine schema); the IPC schema of a table is built where the
+        // engine schema); the arrow schema of a table is built where the
         // metadata batches are assembled (commands.cpp).
         for (const auto& table : r.value()) {
             metadata.catalogs.push_back(table.name.database.c_str());

@@ -5,6 +5,8 @@
 
 #include "../scheduler_engine.hpp"
 
+#include <arrow/io/memory.h>
+
 #include <stdexcept>
 
 namespace flight::core {
@@ -25,15 +27,50 @@ FlightSqlCore::FlightSqlCore(AuthService auth, std::unique_ptr<engine::Scheduler
 
 FlightSqlCore::~FlightSqlCore() = default;
 
-std::string FlightSqlCore::register_result(ipc::SchemaPtr schema,
-                                           std::vector<ipc::RecordBatch> batches) {
+std::string FlightSqlCore::register_result(const std::shared_ptr<arrow::Schema>& schema,
+                                           std::vector<std::shared_ptr<arrow::RecordBatch>> batches) {
     CachedResult cached;
-    cached.schema = schema;
-    cached.schema_message = ipc::serialize_schema_message(*schema);
-    for (const auto& batch : batches) {
-        cached.total_rows += batch.num_rows;
-        cached.batch_messages.push_back(ipc::serialize_record_batch(batch));
+    auto schema_bytes = arrow::ipc::SerializeSchema(*schema);
+    if (!schema_bytes.ok()) {
+        throw EngineError("serializing the result schema: " + schema_bytes.status().ToString());
     }
+    cached.schema_ipc.assign(reinterpret_cast<const char*>((*schema_bytes)->data()),
+                             static_cast<std::size_t>((*schema_bytes)->size()));
+    // SerializeSchema answers an ENCAPSULATED message (continuation + u32
+    // length); DoGet's first FlightData carries the same schema as a BARE
+    // message — like the batch headers beside it — so the framing is stripped
+    // (8 bytes; the flatbuffer itself is already zero-padded to 8 inside).
+    constexpr std::size_t kFramingBytes = 8;
+    cached.schema_message = cached.schema_ipc.substr(kFramingBytes);
+
+    const auto options = arrow::ipc::IpcWriteOptions::Defaults();
+    for (const auto& batch : batches) {
+        arrow::ipc::IpcPayload payload;
+        auto status = arrow::ipc::GetRecordBatchPayload(*batch, options, &payload);
+        if (!status.ok()) {
+            throw EngineError("serializing a record batch: " + status.ToString());
+        }
+        BatchPayload out;
+        out.metadata.assign(reinterpret_cast<const char*>(payload.metadata->data()),
+                            static_cast<std::size_t>(payload.metadata->size()));
+        // The body buffers arrive UNALIGNED — the 8-byte alignment (and the
+        // buffer offsets the Message metadata declares) is applied by the
+        // stream writer, which we do not use: pad each buffer here, or every
+        // buffer after the first lands at a wrong offset and a later read
+        // overruns the body ("File too short").
+        for (const auto& buffer : payload.body_buffers) {
+            if (!buffer) {
+                continue; // an absent optional buffer
+            }
+            out.body.append(reinterpret_cast<const char*>(buffer->data()),
+                            static_cast<std::size_t>(buffer->size()));
+            const auto pad = (8 - (static_cast<std::size_t>(buffer->size()) % 8)) % 8;
+            out.body.append(pad, '\0');
+        }
+        cached.total_rows += batch->num_rows();
+        cached.batches.push_back(std::move(out));
+    }
+
     const std::string ticket = new_ticket_id(ticket_counter_.fetch_add(1));
     std::lock_guard lock(mutex_);
     results_[ticket] = std::move(cached);
@@ -57,8 +94,7 @@ grpc::Status FlightSqlCore::make_flight_info(const fp::FlightDescriptor& descrip
     out->set_total_records(cached->total_rows);
     out->set_ordered(false);
     // Encapsulated schema (continuation+len+flatbuffer)
-    out->set_schema(ipc::schema_ipc_bytes(*cached->schema).data(),
-                    ipc::schema_ipc_bytes(*cached->schema).size());
+    out->set_schema(cached->schema_ipc.data(), cached->schema_ipc.size());
     return grpc::Status::OK;
 }
 
@@ -66,8 +102,7 @@ grpc::Status FlightSqlCore::make_schema_result(const std::string& ticket,
                                                fp::SchemaResult* out) const {
     CachedResult const* cached;
     if (const auto st = lookup(ticket, &cached); !st.ok()) return st;
-    const auto bytes = ipc::schema_ipc_bytes(*cached->schema);
-    out->set_schema(bytes.data(), bytes.size());
+    out->set_schema(cached->schema_ipc.data(), cached->schema_ipc.size());
     return grpc::Status::OK;
 }
 

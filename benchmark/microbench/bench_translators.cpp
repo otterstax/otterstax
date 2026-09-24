@@ -6,7 +6,7 @@
 //   pg_to_struct       — PGresult* schema → complex_logical_type (schema only)
 //   merge_schemas      — merge multiple column-schema vectors into one
 //   chunk_to_arrow     — data_chunk_t schema → arrow::Schema (both overloads)
-//   chunks_to_ipc      — data_chunk_t → Flight SQL IPC batch (full data pipeline)
+//   chunk_to_record_batch + ipc payload — the Flight SQL data pipeline
 //
 // mysql_to_chunk with real row data cannot be benchmarked at unit level:
 // boost::mysql::results requires live wire-protocol data for its ROWS. pg_to_chunk
@@ -18,8 +18,6 @@
 #include "otterbrix/translators/input/mysql_to_chunk.hpp"
 #include "otterbrix/translators/input/pg_to_chunk.hpp"
 #include "otterbrix/translators/output/chunk_to_arrow.hpp"
-#include "frontend/flight_sql/chunk_to_ipc.hpp"
-#include "frontend/flight_sql/ipc/ipc_writer.hpp"
 
 #include <benchmark/benchmark.h>
 
@@ -288,96 +286,100 @@ BENCHMARK(BM_chunk_to_arrow_schema_vec_50col);
 // includes both ch_to_chunk and the IPC serialisation; use BM_ch_to_chunk_* to
 // isolate the former.
 
-flight::ipc::SchemaPtr ipc_schema_or_skip(benchmark::State& state,
-                                          const complex_logical_type& struct_t) {
-    try {
-        return flight::conv::schema_to_ipc(struct_t);
-    } catch (const std::exception& e) {
-        state.SkipWithError(e.what());
+std::shared_ptr<arrow::Schema> arrow_schema_or_skip(benchmark::State& state,
+                                                    std::pmr::memory_resource* res,
+                                                    const complex_logical_type& struct_t) {
+    auto converted = to_arrow_schema(res, struct_t);
+    if (converted.has_error()) {
+        state.SkipWithError(converted.error().what.c_str());
         return nullptr;
     }
+    return std::move(converted.value());
 }
 
-static void BM_chunk_to_ipc_full_100(benchmark::State& state) {
+static void BM_flight_wire_full_100(benchmark::State& state) {
     auto* res = std::pmr::new_delete_resource();
     auto block = make_ch_block(100);
     auto struct_t = tsl::ch_to_struct(res, block);
-    auto schema = ipc_schema_or_skip(state, struct_t);
+    auto schema = arrow_schema_or_skip(state, res, struct_t);
     if (!schema) {
         return;
     }
+    const auto options = arrow::ipc::IpcWriteOptions::Defaults();
     for (auto _ : state) {
         auto converted = tsl::ch_to_chunk(res, block);
         if (converted.has_error()) {
             state.SkipWithError(converted.error().what.c_str());
             break;
         }
-        std::pmr::vector<data_chunk_t> chunks(res);
-        chunks.push_back(std::move(converted.value()));
-        session_payload payload{struct_t, std::move(chunks), 0, NodeTag::T_SelectStmt};
-        auto batches = flight::conv::chunks_to_ipc(payload, schema);
-        for (const auto& batch : batches) {
-            auto message = flight::ipc::serialize_record_batch(batch);
-            benchmark::DoNotOptimize(message.bare_message);
-            benchmark::DoNotOptimize(message.body);
+        auto batch = chunk_to_record_batch(res, converted.value());
+        if (batch.has_error()) {
+            state.SkipWithError(batch.error().what.c_str());
+            break;
         }
+        arrow::ipc::IpcPayload payload;
+        auto status = arrow::ipc::GetRecordBatchPayload(*batch.value(), options, &payload);
+        benchmark::DoNotOptimize(status);
+        benchmark::DoNotOptimize(payload.metadata);
     }
     state.SetItemsProcessed(state.iterations() * 100);
 }
-BENCHMARK(BM_chunk_to_ipc_full_100);
+BENCHMARK(BM_flight_wire_full_100);
 
-static void BM_chunk_to_ipc_full_1k(benchmark::State& state) {
+static void BM_flight_wire_full_1k(benchmark::State& state) {
     auto* res = std::pmr::new_delete_resource();
     auto block = make_ch_block(1000);
     auto struct_t = tsl::ch_to_struct(res, block);
-    auto schema = ipc_schema_or_skip(state, struct_t);
+    auto schema = arrow_schema_or_skip(state, res, struct_t);
     if (!schema) {
         return;
     }
+    const auto options = arrow::ipc::IpcWriteOptions::Defaults();
     for (auto _ : state) {
         auto converted = tsl::ch_to_chunk(res, block);
         if (converted.has_error()) {
             state.SkipWithError(converted.error().what.c_str());
             break;
         }
-        std::pmr::vector<data_chunk_t> chunks(res);
-        chunks.push_back(std::move(converted.value()));
-        session_payload payload{struct_t, std::move(chunks), 0, NodeTag::T_SelectStmt};
-        auto batches = flight::conv::chunks_to_ipc(payload, schema);
-        for (const auto& batch : batches) {
-            auto message = flight::ipc::serialize_record_batch(batch);
-            benchmark::DoNotOptimize(message.bare_message);
-            benchmark::DoNotOptimize(message.body);
+        auto batch = chunk_to_record_batch(res, converted.value());
+        if (batch.has_error()) {
+            state.SkipWithError(batch.error().what.c_str());
+            break;
         }
+        arrow::ipc::IpcPayload payload;
+        auto status = arrow::ipc::GetRecordBatchPayload(*batch.value(), options, &payload);
+        benchmark::DoNotOptimize(status);
+        benchmark::DoNotOptimize(payload.metadata);
     }
     state.SetItemsProcessed(state.iterations() * 1000);
 }
-BENCHMARK(BM_chunk_to_ipc_full_1k);
+BENCHMARK(BM_flight_wire_full_1k);
 
-static void BM_chunk_to_ipc_full_10k(benchmark::State& state) {
+static void BM_flight_wire_full_10k(benchmark::State& state) {
     auto* res = std::pmr::new_delete_resource();
     auto block = make_ch_block(10000);
     auto struct_t = tsl::ch_to_struct(res, block);
-    auto schema = ipc_schema_or_skip(state, struct_t);
+    auto schema = arrow_schema_or_skip(state, res, struct_t);
     if (!schema) {
         return;
     }
+    const auto options = arrow::ipc::IpcWriteOptions::Defaults();
     for (auto _ : state) {
         auto converted = tsl::ch_to_chunk(res, block);
         if (converted.has_error()) {
             state.SkipWithError(converted.error().what.c_str());
             break;
         }
-        std::pmr::vector<data_chunk_t> chunks(res);
-        chunks.push_back(std::move(converted.value()));
-        session_payload payload{struct_t, std::move(chunks), 0, NodeTag::T_SelectStmt};
-        auto batches = flight::conv::chunks_to_ipc(payload, schema);
-        for (const auto& batch : batches) {
-            auto message = flight::ipc::serialize_record_batch(batch);
-            benchmark::DoNotOptimize(message.bare_message);
-            benchmark::DoNotOptimize(message.body);
+        auto batch = chunk_to_record_batch(res, converted.value());
+        if (batch.has_error()) {
+            state.SkipWithError(batch.error().what.c_str());
+            break;
         }
+        arrow::ipc::IpcPayload payload;
+        auto status = arrow::ipc::GetRecordBatchPayload(*batch.value(), options, &payload);
+        benchmark::DoNotOptimize(status);
+        benchmark::DoNotOptimize(payload.metadata);
     }
     state.SetItemsProcessed(state.iterations() * 10000);
 }
-BENCHMARK(BM_chunk_to_ipc_full_10k);
+BENCHMARK(BM_flight_wire_full_10k);

@@ -38,7 +38,6 @@ class OtterStax(ConanFile):
             self.requires("tracy/0.13.1")
         self.requires("arrow/24.0.0")
         self.requires("asio-grpc/3.7.0")
-        self.requires("flatbuffers/25.9.23")
         self.requires("openssl/3.0.13")
         self.requires("boost/1.88.0", override=True)
         self.requires("fmt/11.1.3")
@@ -46,20 +45,15 @@ class OtterStax(ConanFile):
         self.requires("msgpack-cxx/4.1.1")
         self.requires("catch2/3.15.1")
         self.requires("grpc/1.69.0")
-        self.requires("gflags/2.2.2", override=True)
         self.requires("aws-sdk-cpp/1.11.352", override=True)
         self.requires("abseil/20250127.0", override=True)
         # otterbrix b2-rc-3 pins re2/20240702 while grpc 1.69 pins re2/20250722 —
         # unify on grpc's (newer) pin; re2's API is stable across the two.
         self.requires("re2/20250722", override=True)
-        # grpc requires c-ares/[>=1.19.1 <2], and arrow's package_id follows the c-ares it
-        # resolves to through grpc; pin the version the arrow binary is built against.
         self.requires("c-ares/1.34.6", override=True)
         self.requires("benchmark/1.6.1")
         self.requires("zlib/1.3.1")
         self.requires("bzip2/1.0.8")
-        # Pinned to the recipe revision published on the otterbrix remote, so every
-        # build resolves the same engine package (headers and ABI included).
         self.requires("otterbrix/1.0.0b2-rc-3#87ab253cd44870f2caf7c739e3e85ae6")
         self.requires("magic_enum/0.8.1")
         self.requires("actor-zeta/1.2.0@")
@@ -75,15 +69,10 @@ class OtterStax(ConanFile):
     def configure(self):
         if self.options.with_tracy:
             self.options["tracy/*"].on_demand = False
-        self.options["gflags/*"].shared = True
         # standalone asio (not boost) — the rpc layer is written against it
         self.options["asio-grpc/*"].backend = "asio"
 
-        self.options["arrow/*"].with_flight_sql = False
         self.options["arrow/*"].shared = True
-        self.options["arrow/*"].with_protobuf = False
-        self.options["arrow/*"].with_grpc = False
-        self.options["arrow/*"].with_flight_rpc = False
         self.options["arrow/*"].with_brotli = True
         self.options["arrow/*"].with_zlib = True
         self.options["arrow/*"].with_lz4 = True

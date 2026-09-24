@@ -3,25 +3,29 @@
 
 #include "commands.hpp"
 
-#include "../chunk_to_ipc.hpp"
 #include "../scheduler_engine.hpp"
 
 #include "catalog/catalog_manager.hpp"
+#include "otterbrix/translators/output/chunk_to_arrow.hpp"
+
+#include <arrow/array/builder_base.h>
+#include <arrow/array/builder_binary.h>
+#include <arrow/array/builder_nested.h>
+#include <arrow/array/builder_primitive.h>
+#include <arrow/io/memory.h>
 
 #include <FlightSql.pb.h>
 #include <google/protobuf/any.pb.h>
 
-#include <map>
+#include <memory>
+#include <vector>
 
 namespace flight::core {
 
 namespace fp = arrow::flight::protocol;
 namespace fps = arrow::flight::protocol::sql;
-namespace ai = ipc;
 
 namespace {
-
-constexpr const char* kAnyPrefix = "type.googleapis.com/arrow.flight.protocol.sql.";
 
 grpc::Status invalid_argument(std::string_view what) {
     return {grpc::StatusCode::INVALID_ARGUMENT, std::string{what}};
@@ -29,49 +33,102 @@ grpc::Status invalid_argument(std::string_view what) {
 
 // --- fixed metadata schemas (Flight SQL spec) -------------------------------
 
-ai::SchemaPtr catalogs_schema() {
-    return ai::make_schema({std::make_shared<ai::Field>("catalog_name", false, ai::utf8_type())});
+std::shared_ptr<arrow::Schema> catalogs_schema() {
+    return arrow::schema(std::vector<std::shared_ptr<arrow::Field>>{arrow::field("catalog_name", arrow::utf8(), false)});
 }
 
-ai::SchemaPtr db_schemas_schema() {
-    return ai::make_schema({
-        std::make_shared<ai::Field>("catalog_name", true, ai::utf8_type()),
-        std::make_shared<ai::Field>("db_schema_name", false, ai::utf8_type()),
+std::shared_ptr<arrow::Schema> db_schemas_schema() {
+    return arrow::schema(std::vector<std::shared_ptr<arrow::Field>>{
+        arrow::field("catalog_name", arrow::utf8(), true),
+        arrow::field("db_schema_name", arrow::utf8(), false),
     });
 }
 
-ai::SchemaPtr tables_schema() {
-    return ai::make_schema({
-        std::make_shared<ai::Field>("catalog_name", true, ai::utf8_type()),
-        std::make_shared<ai::Field>("db_schema_name", true, ai::utf8_type()),
-        std::make_shared<ai::Field>("table_name", false, ai::utf8_type()),
-        std::make_shared<ai::Field>("table_type", false, ai::utf8_type()),
-        std::make_shared<ai::Field>("table_schema", false, ai::binary_type()),
+std::shared_ptr<arrow::Schema> tables_schema() {
+    return arrow::schema(std::vector<std::shared_ptr<arrow::Field>>{
+        arrow::field("catalog_name", arrow::utf8(), true),
+        arrow::field("db_schema_name", arrow::utf8(), true),
+        arrow::field("table_name", arrow::utf8(), false),
+        arrow::field("table_type", arrow::utf8(), false),
+        arrow::field("table_schema", arrow::binary(), false),
     });
 }
 
-ai::SchemaPtr table_types_schema() {
-    return ai::make_schema({std::make_shared<ai::Field>("table_type", false, ai::utf8_type())});
+std::shared_ptr<arrow::Schema> table_types_schema() {
+    return arrow::schema(std::vector<std::shared_ptr<arrow::Field>>{arrow::field("table_type", arrow::utf8(), false)});
 }
 
-ai::SchemaPtr sql_info_schema() {
-    // value: dense_union<string, bool, int64, int32, list<string>, map<int32, list<int32>>
-    auto string_list = ai::list_type(std::make_shared<ai::Field>("data", true, ai::utf8_type()));
-    auto map_value = ai::list_type(std::make_shared<ai::Field>("data", true, ai::int32_type()));
-    auto map_t = ai::map_type(ai::int32_type(), map_value);
-    return ai::make_schema({
-        std::make_shared<ai::Field>("info_name", false, ai::uint32_type()),
-        std::make_shared<ai::Field>(
-            "value", false,
-            ai::dense_union_type({
-                std::make_shared<ai::Field>("string_value", true, ai::utf8_type()),
-                std::make_shared<ai::Field>("bool_value", true, ai::bool_type()),
-                std::make_shared<ai::Field>("bigint_value", true, ai::int64_type()),
-                std::make_shared<ai::Field>("int32_bitmask", true, ai::int32_type()),
-                std::make_shared<ai::Field>("string_list", true, string_list),
-                std::make_shared<ai::Field>("int32_to_int32_list_map", true, map_t),
-            })),
-        std::make_shared<ai::Field>("row_count", true, ai::int64_type()),
+// value: dense_union<string, bool, int64, int32, list<string>, map<int32, list<int32>>
+std::shared_ptr<arrow::Schema> sql_info_schema() {
+    auto string_list = arrow::list(arrow::field("data", arrow::utf8(), true));
+    auto map_value = arrow::list(arrow::field("data", arrow::int32(), true));
+    auto map_t = arrow::map(arrow::int32(), map_value);
+    auto value = arrow::dense_union(std::vector<std::shared_ptr<arrow::Field>>{
+        arrow::field("string_value", arrow::utf8(), true),
+        arrow::field("bool_value", arrow::boolean(), true),
+        arrow::field("bigint_value", arrow::int64(), true),
+        arrow::field("int32_bitmask", arrow::int32(), true),
+        arrow::field("string_list", string_list, true),
+        arrow::field("int32_to_int32_list_map", map_t, true),
+    });
+    return arrow::schema(std::vector<std::shared_ptr<arrow::Field>>{
+        arrow::field("info_name", arrow::uint32(), false),
+        arrow::field("value", value, false),
+        arrow::field("row_count", arrow::int64(), true),
+    });
+}
+
+std::shared_ptr<arrow::Schema> primary_keys_schema() {
+    return arrow::schema(std::vector<std::shared_ptr<arrow::Field>>{
+        arrow::field("catalog_name", arrow::utf8(), true),
+        arrow::field("db_schema_name", arrow::utf8(), true),
+        arrow::field("table_name", arrow::utf8(), false),
+        arrow::field("column_name", arrow::utf8(), false),
+        arrow::field("key_name", arrow::utf8(), true),
+        arrow::field("key_sequence", arrow::int32(), false),
+    });
+}
+
+std::shared_ptr<arrow::Schema> foreign_keys_schema() {
+    // Shared by Imported/Exported/CrossReference
+    return arrow::schema(std::vector<std::shared_ptr<arrow::Field>>{
+        arrow::field("pk_catalog_name", arrow::utf8(), true),
+        arrow::field("pk_db_schema_name", arrow::utf8(), true),
+        arrow::field("pk_table_name", arrow::utf8(), false),
+        arrow::field("pk_column_name", arrow::utf8(), false),
+        arrow::field("fk_catalog_name", arrow::utf8(), true),
+        arrow::field("fk_db_schema_name", arrow::utf8(), true),
+        arrow::field("fk_table_name", arrow::utf8(), false),
+        arrow::field("fk_column_name", arrow::utf8(), false),
+        arrow::field("key_sequence", arrow::int32(), false),
+        arrow::field("fk_key_name", arrow::utf8(), true),
+        arrow::field("pk_key_name", arrow::utf8(), true),
+        arrow::field("update_rule", arrow::uint8(), false),
+        arrow::field("delete_rule", arrow::uint8(), false),
+    });
+}
+
+std::shared_ptr<arrow::Schema> xdbc_type_info_schema() {
+    return arrow::schema(std::vector<std::shared_ptr<arrow::Field>>{
+        arrow::field("type_name", arrow::utf8(), false),
+        arrow::field("data_type", arrow::int32(), false),
+        arrow::field("column_size", arrow::int32(), true),
+        arrow::field("literal_prefix", arrow::utf8(), true),
+        arrow::field("literal_suffix", arrow::utf8(), true),
+        arrow::field("create_params", arrow::list(arrow::field("data", arrow::utf8(), true)), true),
+        arrow::field("nullable", arrow::int32(), true),
+        arrow::field("case_sensitive", arrow::boolean(), true),
+        arrow::field("searchable", arrow::int32(), true),
+        arrow::field("unsigned_attribute", arrow::boolean(), true),
+        arrow::field("fixed_prec_scale", arrow::boolean(), true),
+        arrow::field("auto_increment", arrow::boolean(), true),
+        arrow::field("local_type_name", arrow::utf8(), true),
+        arrow::field("minimum_scale", arrow::int32(), true),
+        arrow::field("maximum_scale", arrow::int32(), true),
+        arrow::field("sql_data_type", arrow::int32(), true),
+        arrow::field("datetime_subcode", arrow::int32(), true),
+        arrow::field("num_prec_radix", arrow::int32(), true),
+        arrow::field("interval_precision", arrow::int32(), true),
     });
 }
 
@@ -85,124 +142,6 @@ struct SqlInfoRow {
     std::int64_t i64 = 0;
     std::int32_t i32 = 0;
 };
-
-// An empty list column of the given list type (validity+offsets+an empty child).
-ai::ArrayData empty_list_column(ai::TypePtr type) {
-    const auto& child_type = type->children.at(0)->type;
-    ai::ArrayData child = child_type->id == ai::TypeId::Utf8
-                              ? ai::make_utf8_column(child_type, {})
-                              : ai::make_primitive_column<std::int32_t>(child_type, {});
-    return ai::make_list_column(type, {}, std::move(child));
-}
-
-// An empty map column: validity+offsets+an empty struct{key,value}.
-ai::ArrayData empty_map_column(ai::TypePtr type) {
-    const auto entries_type = type->children.at(0)->type; // struct{key,value}
-    const auto& key_type = entries_type->children.at(0)->type;
-    const auto& value_type = entries_type->children.at(1)->type;
-    ai::ArrayData keys = ai::make_primitive_column<std::int32_t>(key_type, {});
-    ai::ArrayData values =
-        value_type->id == ai::TypeId::List ? empty_list_column(value_type) : ai::make_primitive_column<std::int32_t>(value_type, {});
-    ai::ArrayData entries = ai::make_struct_column(entries_type, 0, 0, {std::move(keys), std::move(values)});
-    return ai::make_map_column(type, {}, std::move(entries));
-}
-
-ai::SchemaPtr primary_keys_schema() {
-    return ai::make_schema({
-        std::make_shared<ai::Field>("catalog_name", true, ai::utf8_type()),
-        std::make_shared<ai::Field>("db_schema_name", true, ai::utf8_type()),
-        std::make_shared<ai::Field>("table_name", false, ai::utf8_type()),
-        std::make_shared<ai::Field>("column_name", false, ai::utf8_type()),
-        std::make_shared<ai::Field>("key_name", true, ai::utf8_type()),
-        std::make_shared<ai::Field>("key_sequence", false, ai::int32_type()),
-    });
-}
-
-ai::SchemaPtr foreign_keys_schema() {
-    // Shared by Imported/Exported/CrossReference
-    return ai::make_schema({
-        std::make_shared<ai::Field>("pk_catalog_name", true, ai::utf8_type()),
-        std::make_shared<ai::Field>("pk_db_schema_name", true, ai::utf8_type()),
-        std::make_shared<ai::Field>("pk_table_name", false, ai::utf8_type()),
-        std::make_shared<ai::Field>("pk_column_name", false, ai::utf8_type()),
-        std::make_shared<ai::Field>("fk_catalog_name", true, ai::utf8_type()),
-        std::make_shared<ai::Field>("fk_db_schema_name", true, ai::utf8_type()),
-        std::make_shared<ai::Field>("fk_table_name", false, ai::utf8_type()),
-        std::make_shared<ai::Field>("fk_column_name", false, ai::utf8_type()),
-        std::make_shared<ai::Field>("key_sequence", false, ai::int32_type()),
-        std::make_shared<ai::Field>("fk_key_name", true, ai::utf8_type()),
-        std::make_shared<ai::Field>("pk_key_name", true, ai::utf8_type()),
-        std::make_shared<ai::Field>("update_rule", false, ai::uint8_type()),
-        std::make_shared<ai::Field>("delete_rule", false, ai::uint8_type()),
-    });
-}
-
-ai::SchemaPtr xdbc_type_info_schema() {
-    return ai::make_schema({
-        std::make_shared<ai::Field>("type_name", false, ai::utf8_type()),
-        std::make_shared<ai::Field>("data_type", false, ai::int32_type()),
-        std::make_shared<ai::Field>("column_size", true, ai::int32_type()),
-        std::make_shared<ai::Field>("literal_prefix", true, ai::utf8_type()),
-        std::make_shared<ai::Field>("literal_suffix", true, ai::utf8_type()),
-        std::make_shared<ai::Field>("create_params", true, ai::list_type(
-                                            std::make_shared<ai::Field>("data", true, ai::utf8_type()))),
-        std::make_shared<ai::Field>("nullable", true, ai::int32_type()),
-        std::make_shared<ai::Field>("case_sensitive", true, ai::bool_type()),
-        std::make_shared<ai::Field>("searchable", true, ai::int32_type()),
-        std::make_shared<ai::Field>("unsigned_attribute", true, ai::bool_type()),
-        std::make_shared<ai::Field>("fixed_prec_scale", true, ai::bool_type()),
-        std::make_shared<ai::Field>("auto_increment", true, ai::bool_type()),
-        std::make_shared<ai::Field>("local_type_name", true, ai::utf8_type()),
-        std::make_shared<ai::Field>("minimum_scale", true, ai::int32_type()),
-        std::make_shared<ai::Field>("maximum_scale", true, ai::int32_type()),
-        std::make_shared<ai::Field>("sql_data_type", true, ai::int32_type()),
-        std::make_shared<ai::Field>("datetime_subcode", true, ai::int32_type()),
-        std::make_shared<ai::Field>("num_prec_radix", true, ai::int32_type()),
-        std::make_shared<ai::Field>("interval_precision", true, ai::int32_type()),
-    });
-}
-
-ai::RecordBatch build_sql_info_result(const std::vector<SqlInfoRow>& rows) {
-    auto schema = sql_info_schema();
-    const auto& union_type = schema->fields[1]->type;
-    const auto& list_variant_type = union_type->children[4]->type;  // string_list
-    const auto& map_variant_type = union_type->children[5]->type;   // int32_to_int32_list_map
-    std::vector<std::optional<std::uint32_t>> names;
-    std::vector<std::int8_t> type_ids;
-    std::vector<std::int32_t> offsets;
-    std::vector<std::optional<std::string>> string_vals;
-    std::vector<std::optional<bool>> bool_vals;
-    std::vector<std::optional<std::int64_t>> i64_vals;
-    std::vector<std::optional<std::int32_t>> i32_vals;
-    std::int32_t counts[4] = {}; // one counter per variant
-    for (const auto& row : rows) {
-        names.push_back(row.name);
-        type_ids.push_back(static_cast<std::int8_t>(row.variant));
-        offsets.push_back(counts[row.variant]++);
-        switch (row.variant) {
-            case 0: string_vals.push_back(row.str); break;
-            case 1: bool_vals.push_back(row.b); break;
-            case 2: i64_vals.push_back(row.i64); break;
-            case 3: i32_vals.push_back(row.i32); break;
-        }
-    }
-    ai::ArrayData value = ai::make_dense_union_column(
-        union_type, type_ids, offsets,
-        {ai::make_utf8_column(ai::utf8_type(), string_vals),
-         ai::make_primitive_column(ai::bool_type(), bool_vals),
-         ai::make_primitive_column<std::int64_t>(ai::int64_type(), i64_vals),
-         ai::make_primitive_column<std::int32_t>(ai::int32_type(), i32_vals),
-         empty_list_column(list_variant_type),
-         empty_map_column(map_variant_type)});
-    // row_count: nullable, all null (no value given)
-    std::vector<std::optional<std::int64_t>> rc_vals(rows.size(), std::nullopt);
-    ai::ArrayData rc = ai::make_primitive_column<std::int64_t>(ai::int64_type(), rc_vals);
-    ai::RecordBatch batch{schema,
-                          {ai::make_primitive_column<std::uint32_t>(ai::uint32_type(), names),
-                           std::move(value), std::move(rc)},
-                          static_cast<std::int64_t>(rows.size())};
-    return batch;
-}
 
 std::vector<SqlInfoRow> sql_info_rows(const engine::SchedulerEngine& engine) {
     std::vector<SqlInfoRow> rows;
@@ -224,7 +163,7 @@ std::vector<SqlInfoRow> sql_info_rows(const engine::SchedulerEngine& engine) {
     constexpr std::uint32_t kIdentifierQuoteChar = 504;
     constexpr std::uint32_t kAllTablesSelectable = 506;
     str(kServerName, "otterstax");
-    str(kServerVersion, "0.1.0");
+    str(kServerVersion, "1.0.0");
     str(kServerArrowVersion, "21.0.0");
     boolean(kServerReadOnly, false);
     boolean(kServerSql, true);
@@ -240,39 +179,123 @@ std::vector<SqlInfoRow> sql_info_rows(const engine::SchedulerEngine& engine) {
     return rows;
 }
 
-// --- metadata results -------------------------------------------------------
+std::shared_ptr<arrow::RecordBatch> build_sql_info_result(const std::vector<SqlInfoRow>& rows) {
+    auto* pool = arrow::default_memory_pool();
+    arrow::UInt32Builder names(pool);
+    arrow::Int64Builder row_counts(pool);
+    // A dense union's values live in its CHILD builders: Append(id) selects
+    // the variant, then the value is appended to that child — appending to a
+    // builder that is not the child leaves the child empty and the union's
+    // offsets point past its length (an INVALID array).
+    arrow::DenseUnionBuilder value(pool);
+    const int kString = value.AppendChild(std::make_shared<arrow::StringBuilder>(pool), "string_value");
+    const int kBool = value.AppendChild(std::make_shared<arrow::BooleanBuilder>(pool), "bool_value");
+    const int kInt64 = value.AppendChild(std::make_shared<arrow::Int64Builder>(pool), "bigint_value");
+    const int kInt32 = value.AppendChild(std::make_shared<arrow::Int32Builder>(pool), "int32_bitmask");
+    // The list/map variants stay empty arrays — a valid dense union whose
+    // slots are simply never selected.
+    value.AppendChild(std::make_shared<arrow::ListBuilder>(
+                          pool, std::make_shared<arrow::StringBuilder>(pool)),
+                      "string_list");
+    value.AppendChild(std::make_shared<arrow::MapBuilder>(
+                          pool, std::make_shared<arrow::Int32Builder>(pool),
+                          std::make_shared<arrow::ListBuilder>(
+                              pool, std::make_shared<arrow::Int32Builder>(pool))),
+                      "int32_to_int32_list_map");
 
-ai::RecordBatch catalogs_batch(const EngineMetadata& md) {
-    std::vector<std::optional<std::string>> vals;
-    for (const auto& c : md.catalogs) vals.push_back(c);
-    return ai::RecordBatch{catalogs_schema(),
-                           {ai::make_utf8_column(ai::utf8_type(), vals)},
-                           static_cast<std::int64_t>(vals.size())};
+    for (const auto& row : rows) {
+        names.Append(row.name);
+        switch (row.variant) {
+            case 0:
+                value.Append(static_cast<std::int8_t>(kString));
+                static_cast<arrow::StringBuilder*>(value.child_builder(kString).get())
+                    ->Append(row.str);
+                break;
+            case 1:
+                value.Append(static_cast<std::int8_t>(kBool));
+                static_cast<arrow::BooleanBuilder*>(value.child_builder(kBool).get())
+                    ->Append(row.b);
+                break;
+            case 2:
+                value.Append(static_cast<std::int8_t>(kInt64));
+                static_cast<arrow::Int64Builder*>(value.child_builder(kInt64).get())
+                    ->Append(row.i64);
+                break;
+            default:
+                value.Append(static_cast<std::int8_t>(kInt32));
+                static_cast<arrow::Int32Builder*>(value.child_builder(kInt32).get())
+                    ->Append(row.i32);
+                break;
+        }
+        row_counts.AppendNull(); // value not specified
+    }
+
+    auto status_of = [](const arrow::Status& st, const char* what) {
+        if (!st.ok()) {
+            throw EngineError(std::string{"SqlInfo batch: "} + what + ": " + st.ToString());
+        }
+    };
+    std::shared_ptr<arrow::Array> name_array;
+    std::shared_ptr<arrow::Array> value_array;
+    std::shared_ptr<arrow::Array> count_array;
+    status_of(names.Finish(&name_array), "info_name");
+    status_of(value.Finish(&value_array), "value");
+    status_of(row_counts.Finish(&count_array), "row_count");
+    return arrow::RecordBatch::Make(sql_info_schema(), static_cast<std::int64_t>(rows.size()),
+                                    {std::move(name_array), std::move(value_array),
+                                     std::move(count_array)});
 }
 
-ai::RecordBatch db_schemas_batch(const fps::CommandGetDbSchemas& cmd, const EngineMetadata& md) {
-    std::vector<std::optional<std::string>> catalogs;
-    std::vector<std::optional<std::string>> schemas;
+// --- metadata results --------------------------------------------------------
+
+std::shared_ptr<arrow::RecordBatch> catalogs_batch(const EngineMetadata& md) {
+    auto* pool = arrow::default_memory_pool();
+    arrow::StringBuilder builder(pool);
+    for (const auto& c : md.catalogs) {
+        builder.Append(c);
+    }
+    std::shared_ptr<arrow::Array> array;
+    if (!builder.Finish(&array).ok()) {
+        throw EngineError("catalogs batch");
+    }
+    return arrow::RecordBatch::Make(catalogs_schema(),
+                                    static_cast<std::int64_t>(md.catalogs.size()),
+                                    {std::move(array)});
+}
+
+std::shared_ptr<arrow::RecordBatch> db_schemas_batch(const fps::CommandGetDbSchemas& cmd, const EngineMetadata& md) {
+    auto* pool = arrow::default_memory_pool();
+    arrow::StringBuilder catalogs(pool);
+    arrow::StringBuilder schemas(pool);
     const std::string filter = cmd.db_schema_filter_pattern().empty()
                                    ? std::string{}
                                    : cmd.db_schema_filter_pattern();
     for (const auto& s : md.db_schemas) {
         if (!filter.empty() && !like_match(s, filter)) continue;
-        catalogs.push_back(md.catalogs.empty() ? std::optional<std::string>{} : md.catalogs[0]);
-        schemas.push_back(s);
+        if (md.catalogs.empty()) {
+            catalogs.AppendNull();
+        } else {
+            catalogs.Append(md.catalogs[0]);
+        }
+        schemas.Append(s);
     }
-    return ai::RecordBatch{db_schemas_schema(),
-                           {ai::make_utf8_column(ai::utf8_type(), catalogs),
-                            ai::make_utf8_column(ai::utf8_type(), schemas)},
-                           static_cast<std::int64_t>(schemas.size())};
+    std::shared_ptr<arrow::Array> catalog_array;
+    std::shared_ptr<arrow::Array> schema_array;
+    if (!catalogs.Finish(&catalog_array).ok() || !schemas.Finish(&schema_array).ok()) {
+        throw EngineError("db_schemas batch");
+    }
+    const auto rows = schema_array->length();
+    return arrow::RecordBatch::Make(db_schemas_schema(), rows,
+                                    {std::move(catalog_array), std::move(schema_array)});
 }
 
-ai::RecordBatch tables_batch(const fps::CommandGetTables& cmd, const EngineMetadata& md) {
-    std::vector<std::optional<std::string>> catalogs;
-    std::vector<std::optional<std::string>> schemas;
-    std::vector<std::optional<std::string>> names;
-    std::vector<std::optional<std::string>> types;
-    std::vector<std::optional<std::string>> schema_bytes;
+std::shared_ptr<arrow::RecordBatch> tables_batch(const fps::CommandGetTables& cmd, const EngineMetadata& md) {
+    auto* pool = arrow::default_memory_pool();
+    arrow::StringBuilder catalogs(pool);
+    arrow::StringBuilder schemas(pool);
+    arrow::StringBuilder names(pool);
+    arrow::StringBuilder types(pool);
+    arrow::BinaryBuilder schema_bytes(pool);
     const auto& table_filter = cmd.table_name_filter_pattern();
     for (const auto& t : md.tables) {
         if (!table_filter.empty() && !like_match(t.name.collection.c_str(), table_filter)) continue;
@@ -281,41 +304,65 @@ ai::RecordBatch tables_batch(const fps::CommandGetTables& cmd, const EngineMetad
             if (tt == catalog_ext::table_type_name) type_ok = true;
         }
         if (!type_ok) continue;
-        catalogs.push_back(t.name.database.c_str());
-        schemas.push_back(t.name.schema.c_str());
-        names.push_back(t.name.collection.c_str());
-        types.push_back(std::string{catalog_ext::table_type_name});
+        catalogs.Append(t.name.database.c_str());
+        schemas.Append(t.name.schema.c_str());
+        names.Append(t.name.collection.c_str());
+        types.Append(std::string{catalog_ext::table_type_name});
         if (cmd.include_schema()) {
-            auto ipc_schema = conv::schema_to_ipc(t.schema);
-            auto bytes = ai::schema_ipc_bytes(*ipc_schema);
-            schema_bytes.push_back(std::string{bytes.begin(), bytes.end()});
+            // The table's arrow schema, through the project converter the file
+            // paths use; a column the wire cannot carry leaves the cell NULL.
+            auto converted = to_arrow_schema(std::pmr::new_delete_resource(), t.schema);
+            if (converted.has_error()) {
+                schema_bytes.AppendNull();
+                continue;
+            }
+            auto bytes = arrow::ipc::SerializeSchema(*converted.value());
+            if (!bytes.ok()) {
+                throw EngineError("tables batch schema: " + bytes.status().ToString());
+            }
+            schema_bytes.Append(reinterpret_cast<const std::uint8_t*>((*bytes)->data()),
+                                static_cast<std::int32_t>((*bytes)->size()));
         } else {
-            schema_bytes.push_back(std::string{});
+            schema_bytes.AppendNull();
         }
     }
-    ai::RecordBatch batch{tables_schema(),
-                          {ai::make_utf8_column(ai::utf8_type(), catalogs),
-                           ai::make_utf8_column(ai::utf8_type(), schemas),
-                           ai::make_utf8_column(ai::utf8_type(), names),
-                           ai::make_utf8_column(ai::utf8_type(), types),
-                           ai::make_utf8_column(ai::binary_type(), schema_bytes)},
-                          static_cast<std::int64_t>(names.size())};
-    return batch;
+    std::shared_ptr<arrow::Array> catalog_array;
+    std::shared_ptr<arrow::Array> schema_array;
+    std::shared_ptr<arrow::Array> name_array;
+    std::shared_ptr<arrow::Array> type_array;
+    std::shared_ptr<arrow::Array> bytes_array;
+    if (!catalogs.Finish(&catalog_array).ok() || !schemas.Finish(&schema_array).ok() ||
+        !names.Finish(&name_array).ok() || !types.Finish(&type_array).ok() ||
+        !schema_bytes.Finish(&bytes_array).ok()) {
+        throw EngineError("tables batch");
+    }
+    const auto rows = name_array->length();
+    return arrow::RecordBatch::Make(tables_schema(), rows,
+                                    {std::move(catalog_array), std::move(schema_array),
+                                     std::move(name_array), std::move(type_array),
+                                     std::move(bytes_array)});
 }
 
-ai::RecordBatch table_types_batch(const EngineMetadata& md) {
-    std::vector<std::optional<std::string>> vals;
-    for (const auto& t : md.table_types) vals.push_back(t);
-    return ai::RecordBatch{table_types_schema(),
-                           {ai::make_utf8_column(ai::utf8_type(), vals)},
-                           static_cast<std::int64_t>(vals.size())};
+std::shared_ptr<arrow::RecordBatch> table_types_batch(const EngineMetadata& md) {
+    auto* pool = arrow::default_memory_pool();
+    arrow::StringBuilder builder(pool);
+    for (const auto& t : md.table_types) {
+        builder.Append(t);
+    }
+    std::shared_ptr<arrow::Array> array;
+    if (!builder.Finish(&array).ok()) {
+        throw EngineError("table_types batch");
+    }
+    return arrow::RecordBatch::Make(table_types_schema(),
+                                    static_cast<std::int64_t>(md.table_types.size()),
+                                    {std::move(array)});
 }
 
 template <typename Command>
 grpc::Status unpack(const fp::FlightDescriptor& descriptor, Command* out) {
     google::protobuf::Any any;
     if (!any.ParseFromString(descriptor.cmd()) ||
-        any.type_url().find(kAnyPrefix) == std::string::npos) {
+        any.type_url().find("type.googleapis.com/arrow.flight.protocol.sql.") == std::string::npos) {
         return invalid_argument("flight-sql: malformed command Any");
     }
     if (!any.Is<Command>()) {
@@ -431,9 +478,7 @@ grpc::Status execute_descriptor(FlightSqlCore& core, engine::SchedulerEngine& en
         return {grpc::StatusCode::INTERNAL, std::string{e.what()}};
     }
 
-    *ticket_out = core.register_result(result.schema ? std::move(result.schema)
-                                                      : ai::make_schema({}),
-                                       std::move(result.batches));
+    *ticket_out = core.register_result(result.schema, std::move(result.batches));
     return grpc::Status::OK;
 }
 

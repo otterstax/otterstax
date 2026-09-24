@@ -21,8 +21,12 @@ import time
 import pytest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-FORMAT_DIR = os.path.join(ROOT, "frontend", "flight_sql", "format")
+FORMAT_DIR = next((d for d in (
+    # a checkout:  <repo>/tests/flightsql_e2e -> <repo>/frontend/flight_sql/format
+    os.path.join(HERE, "..", "..", "frontend", "flight_sql", "format"),
+    # the test-client image:  /app/flightsql_e2e -> /app/frontend/flight_sql/format
+    os.path.join(HERE, "..", "frontend", "flight_sql", "format"),
+) if os.path.exists(os.path.join(d, "Flight.proto"))), None)
 
 sys.path.insert(0, os.path.dirname(HERE))
 import config  # noqa: E402

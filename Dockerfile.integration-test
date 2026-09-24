@@ -76,6 +76,9 @@ COPY ./tests/scripts .
 COPY ./tests/*.py .
 COPY ./tests/flightsql_e2e ./flightsql_e2e
 COPY ./tests/flightsql_go ./flightsql_go
+# The .proto the python stubs regenerate from (the same source the server
+# compiles) — without it the gen/ regeneration inside the container breaks.
+COPY ./frontend/flight_sql/format ./frontend/flight_sql/format
 
 RUN chmod +x /app/wait_for_otterstax.sh
 RUN chmod +x /app/startup.sh

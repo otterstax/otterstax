@@ -78,12 +78,19 @@ public:
                                std::pmr::vector<components::types::logical_value_t> parameters);
     unique_future<session_result> prepare_schema(session_hash_t id, std::string sql);
     unique_future<session_result> close_statement(session_hash_t id);
+    // Pre-built plans (the Spark Connect frontend translates a DataFrame
+    // relation straight into a logical plan): execute runs it like a parsed
+    // statement, prepare describes its result schema without running it.
+    unique_future<session_result> execute_plan(session_hash_t id, ParsedQueryDataPtr data);
+    unique_future<session_result> prepare_plan(session_hash_t id, ParsedQueryDataPtr data);
 
     using dispatch_traits = actor_zeta::dispatch_traits<&Scheduler::execute,
                                                         &Scheduler::execute_statement,
                                                         &Scheduler::execute_prepared_statement,
                                                         &Scheduler::prepare_schema,
-                                                        &Scheduler::close_statement>;
+                                                        &Scheduler::close_statement,
+                                                        &Scheduler::execute_plan,
+                                                        &Scheduler::prepare_plan>;
 
     actor_zeta::behavior_t behavior(actor_zeta::mailbox::message* msg);
 

@@ -29,9 +29,21 @@ jobs:
           cache-from: type=gha,scope=asan
           cache-to: type=gha,mode=max,scope=asan
 
+      - name: Build Spark client matrix image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.spark-test
+          push: false
+          load: true
+          tags: otterstax_spark_client:ci-${{ github.sha }}
+          cache-from: type=gha,scope=spark-client
+          cache-to: type=gha,mode=max,scope=spark-client
+
       - name: Run integration tests
         env:
           IMAGE_TAG: ci-asan-${{ github.sha }}
+          SPARK_CLIENT_IMAGE: otterstax_spark_client:ci-${{ github.sha }}
           # docker-run-tests.sh gates the Kafka crash-recovery step (kill -9 of
           # the server) on the sanitizer flags; the build-arg alone is not visible
           # to the script.

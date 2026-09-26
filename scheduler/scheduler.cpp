@@ -179,6 +179,10 @@ actor_zeta::behavior_t Scheduler::behavior(actor_zeta::mailbox::message* msg) {
         co_await actor_zeta::dispatch(this, &Scheduler::prepare_schema, msg);
     } else if (cmd == actor_zeta::msg_id<Scheduler, &Scheduler::close_statement>) {
         co_await actor_zeta::dispatch(this, &Scheduler::close_statement, msg);
+    } else if (cmd == actor_zeta::msg_id<Scheduler, &Scheduler::execute_plan>) {
+        co_await actor_zeta::dispatch(this, &Scheduler::execute_plan, msg);
+    } else if (cmd == actor_zeta::msg_id<Scheduler, &Scheduler::prepare_plan>) {
+        co_await actor_zeta::dispatch(this, &Scheduler::prepare_plan, msg);
     }
 }
 
@@ -242,6 +246,26 @@ actor_zeta::unique_future<Scheduler::session_result> Scheduler::close_statement(
     {
         OTX_ZONE_N("Scheduler::close_statement");
         fut = route(&Worker::close_statement, id);
+    }
+    co_return co_await std::move(fut);
+}
+
+actor_zeta::unique_future<Scheduler::session_result> Scheduler::execute_plan(session_hash_t id,
+                                                                             ParsedQueryDataPtr data) {
+    unique_future<session_result> fut;
+    {
+        OTX_ZONE_N("Scheduler::execute_plan");
+        fut = route(&Worker::execute_plan, id, std::move(data));
+    }
+    co_return co_await std::move(fut);
+}
+
+actor_zeta::unique_future<Scheduler::session_result> Scheduler::prepare_plan(session_hash_t id,
+                                                                             ParsedQueryDataPtr data) {
+    unique_future<session_result> fut;
+    {
+        OTX_ZONE_N("Scheduler::prepare_plan");
+        fut = route(&Worker::prepare_plan, id, std::move(data));
     }
     co_return co_await std::move(fut);
 }

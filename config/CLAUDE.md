@@ -51,10 +51,14 @@ the value above (`yaml_scalar.hpp` for `as<T>()`, `ConfigReader::load` for
 ## Types
 
 - `config::ServiceConfig` — `{ FlightSqlConfig flight_sql; MysqlConfig mysql;
-  PostgresConfig postgres; ConnectionRetryConfig connection_retry;
-  ConnectionsConfig connections; }`. The `flight_sql`/`mysql`/`postgres`/
-  `connection_retry` fields come from the top-level `service:` node; `connections`
-  from the `connections:` node of the same file.
+  PostgresConfig postgres; SparkConnectConfig spark_connect;
+  ConnectionRetryConfig connection_retry; ConnectionsConfig connections; }`. The
+  `flight_sql`/`mysql`/`postgres`/`spark_connect`/`connection_retry` fields come
+  from the top-level `service:` node; `connections` from the `connections:` node
+  of the same file.
+- `config::SparkConnectConfig` — `{ std::string host = "0.0.0.0";
+  uint16_t port = 15002; }`: the listen address `main.cpp` hands to the Spark
+  Connect gRPC server (`frontend::spark::SparkConnectServerConfig`).
 - `config::ConnectionRetryConfig` — `{ int max_attempts = 1; int delay_ms = 1000; }`
   (plain data, lives in `connections/connection_config.hpp`). Startup retry policy
   for opening backend connections. `max_attempts <= 1` = single attempt.
@@ -68,11 +72,12 @@ the value above (`yaml_scalar.hpp` for `as<T>()`, `ConfigReader::load` for
 
 - `ConfigReader(resource)` / `ConfigReader::load(path)` →
   `core::result_wrapper_t<ServiceConfig>`. Reads the whole file: parses the
-  `service:` node for `flight_sql`/`mysql`/`postgres` ports and
-  `connection_retry` (each scalar through `yaml_scalar<T>`), then delegates the
-  `connections:` node to `parse_connections`. A missing file is the default
-  `ServiceConfig` (a warning, not an error). Every failure is logged once under
-  the `Config` logger and returned.
+  `service:` node for `flight_sql`/`mysql`/`postgres` ports, the `spark_connect`
+  host and port (`parseSparkConnectConfig`) and `connection_retry` (each scalar
+  through `yaml_scalar<T>`), then delegates the `connections:` node to
+  `parse_connections`. A missing file is the default `ServiceConfig` (a warning,
+  not an error). Every failure is logged once under the `Config` logger and
+  returned.
 - `parse_connections(const YAML::Node&, std::pmr::memory_resource*)` (a free
   function in `connections/connection_config_reader.cpp`) →
   `core::result_wrapper_t<ConnectionsConfig>`. A null/missing node → empty
@@ -136,6 +141,7 @@ service:
   flight_sql: { host: "0.0.0.0", port: 8815 }
   mysql:      { port: 8816 }        # wire-server port
   postgres:   { port: 8817 }        # wire-server port
+  spark_connect: { host: "0.0.0.0", port: 15002 }   # Spark Connect gRPC server
   connection_retry: { max_attempts: 10, delay_ms: 2000 }
 
 connections:
@@ -152,7 +158,9 @@ connections:
 `port` is an **optional string** (empty → driver default; otherwise a decimal
 integer in 1..65535, anything else aborts startup). `schema` defaults to
 `public`. s3 `region`/`session_token`/`endpoint` are optional. `connection_retry`
-is optional (defaults to `max_attempts: 1`, `delay_ms: 1000` = one-shot).
+is optional (defaults to `max_attempts: 1`, `delay_ms: 1000` = one-shot), and so
+is `spark_connect` (defaults to `0.0.0.0:15002`, either key alone overriding its
+own default).
 Malformed YAML → the server aborts startup (`conversion_failure` from `load`).
 
 Wire-server settings live under the top-level `service:` node so they never
@@ -191,6 +199,8 @@ malformed port or a non-scalar field**, empty `table`/omitted `port` allowed),
 `validation_error` (required-field checks, optional port, port range/format, s3
 keys), and `ConfigReader` (whole `config.yaml`: `service.*` ports +
 `connection_retry` + embedded connections, defaults when file missing, retry
-defaults, no-`connections:` section, **malformed YAML → `conversion_failure`, a
-non-integer service port / an invalid connection or port →
+defaults, the `spark_connect` host/port and their `0.0.0.0:15002` default when
+the node is absent, no-`connections:` section, **malformed YAML →
+`conversion_failure`, a non-integer service port (`service.mysql.port`,
+`service.spark_connect.port`) / an invalid connection or port →
 `invalid_parameter`**). Nothing is asserted to throw.

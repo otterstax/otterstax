@@ -32,16 +32,19 @@ All return `unique_future<core::result_wrapper_t<session_payload>>`:
 
 | Handler | Caller | Purpose |
 |---------|--------|---------|
-| `execute(id, sql)` | FlightSQL/MySQL/PG frontend | Full query: parse → schema → dispatch → translate |
+| `execute(id, sql)` | FlightSQL/MySQL/PG/Spark frontend | Full query: parse → schema → dispatch → translate |
 | `execute_statement(id)` | Frontend (prepared stmt execute) | Execute a previously prepared statement |
 | `execute_prepared_statement(id, params)` | Frontend | Bind parameters then execute |
 | `prepare_schema(id, sql)` | Frontend (prepare phase) | Parse + schema-only, no execution |
-| `close_statement(id)` | Frontend (statement close / refused prepare) | Drop a prepared statement that will not be executed; idempotent |
+| `close_statement(id)` | Frontend (statement close / refused prepare / Spark describe) | Drop a prepared statement that will not be executed; idempotent |
+| `execute_plan(id, data)` | Spark frontend (DataFrame) | `execute` of a pre-built plan (`ParsedQueryDataPtr`): no parse |
+| `prepare_plan(id, data)` | Spark frontend (`df.schema`) | `prepare_schema` of a pre-built plan: schema only, no execution |
 
 Frontends await the returned future via `frontend/common/asio_future_bridge.hpp`
-(`async_await_future` polls `take_ready()`); no result is ever pushed to a
-frontend through a condvar. The Scheduler's own `pump_cv_` is infrastructure:
-it only wakes `loop_thread_` when the inbox is non-empty.
+(`async_await_future` polls `take_ready()`; the Spark Connect frontend uses its
+gRPC form, `frontend/spark_connect_server/await_future.hpp`); no result is ever
+pushed to a frontend through a condvar. The Scheduler's own `pump_cv_` is
+infrastructure: it only wakes `loop_thread_` when the inbox is non-empty.
 
 ## Worker pipeline
 
@@ -59,23 +62,43 @@ Callee errors keep their code; the Worker only prefixes the text.
 
 ### Prepared-statement lifecycle
 
-`prepare_schema` stores the parsed statement in `metadata_map_[id]`. The entry
-is single-use: the first `execute_statement` / `execute_prepared_statement`
-moves the plan out, runs it, and erases the entry on **every** exit path
-(success, backend error, engine error, bind error). Any later execute on that
-session — and an execute on a session that was never prepared — answers
-`core::error_code_t::invalid_parameter` with the text
+`prepare_schema` (and `prepare_plan`) stores the parsed statement in
+`metadata_map_[id]`. The entry is single-use: the first `execute_statement` /
+`execute_prepared_statement` moves the plan out, runs it, and erases the entry
+on **every** exit path (success, backend error, engine error, bind error). Any
+later execute on that session — and an execute on a session that was never
+prepared — answers `core::error_code_t::invalid_parameter` with the text
 `prepared statement must be re-prepared`; the frontend prepares again.
 `close_statement` erases the entry of a statement that will never be executed
 (MySQL `COM_STMT_CLOSE`, PG `Close`/re-`Parse` under the same name, a FlightSQL
 `GetFlightInfoStatement` refused after the prepare, a MySQL `COM_STMT_PREPARE`
-refused for an unencodable column) and answers an empty `session_payload`; it
-is idempotent — a consumed, already closed or never prepared session closes
-with success. A wire connection that ends (quit/terminate, socket drop,
-protocol error, timeout, server stop) closes every statement it left
-unexecuted from `frontend_connection::finish()` (`finish_impl`), so an entry
-outlives its connection only if that close message failed (logged by the
-frontend).
+refused for an unencodable column, a Spark `AnalyzePlan` schema request or
+`spark.catalog.listColumns`, which only describe) and answers an empty
+`session_payload`; it is idempotent — a consumed, already closed or never
+prepared session closes with success. A wire connection that ends
+(quit/terminate, socket drop, protocol error, timeout, server stop) closes every
+statement it left unexecuted from `frontend_connection::finish()`
+(`finish_impl`), so an entry outlives its connection only if that close message
+failed (logged by the frontend).
+
+### Pre-built plans (`execute_plan` / `prepare_plan`)
+
+The Spark Connect frontend translates a DataFrame into a `ParsedQueryData`
+itself, so these two entry points skip `parse_sql` and join the SQL ones where
+parsing ends. `execute` and `execute_plan` share `classify_and_run` (the
+database-DDL guard, then classification — by the catalog when the plan has
+external nodes, `Otterbrix` otherwise — then `run_pipeline`); `prepare_schema`
+and `prepare_plan` share `describe_parsed` (the database-DDL guard, then the
+result schema from the plan and its `LIMIT 0` probes — the engine's, the
+backends' `describe` — without executing the statement). `execute_plan` erases
+the session's entry on every exit path, like `execute`; `prepare_plan` stores
+it, like `prepare_schema`, until an execute or `close_statement` (the Spark
+`AnalyzePlan` closes it at once). Both refuse a missing plan and a
+grammar-extension root (`extension_kind` set — CREATE EXTERNAL TABLE, COPY and
+Kafka DDL come from SQL text only) with `invalid_parameter` before the shared
+tail. `tests/system/test_prepare_plan.cpp` pins that `prepare_plan` describes a
+parsed remote SELECT with one describe probe and no data query, and that
+`execute_plan` answers the rows `execute` answers for the same SQL.
 
 ### Database-level DDL guard
 
@@ -83,11 +106,14 @@ frontend).
 be attached), but the engine also hosts one database per registered connection
 uid — the mirrored remote schema — and the kafka object database. `DROP
 DATABASE` is CASCADE, so such a statement would tear down the mirror while the
-catalog kept resolving against it. `Worker::guard_database_ddl` runs on all
-three entry points (`execute`, `execute_statement`, `prepare_schema`): it reads
-the target name from the plan (`node_create_database_t::dbname()`, or the
-`catalog_resolve` sibling of a `drop_t(database)` inside the wrapping
-sequence) and asks `CatalogManager::check_database_ownership`, which answers
+catalog kept resolving against it. `Worker::guard_database_ddl` runs on every
+entry point that runs or describes a plan — `execute` and `execute_plan` (in
+their shared `classify_and_run`), `execute_statement` (which
+`execute_prepared_statement` ends in), `prepare_schema` and `prepare_plan` (in
+their shared `describe_parsed`): it reads the target name from the plan
+(`node_create_database_t::dbname()`, or the `catalog_resolve` sibling of a
+`drop_t(database)` inside the wrapping sequence) and asks
+`CatalogManager::check_database_ownership`, which answers
 `invalid_parameter` (`database '<name>' is owned by connection '<uid>'`) for a
 uid or `kafka`, matched case-insensitively. The refusal happens before the
 statement reaches the engine, so the mirror and the catalog store stay intact.
@@ -143,7 +169,8 @@ claimed the statement, which is what separates it from a `schema_node_t` stub
 sharing the same `unused` node type — and route it through
 `Worker::handle_external_statement` **before** the backend/schema logic (which
 cannot execute this node and would otherwise mis-`static_cast` an `unused` root
-to a `schema_node_t`):
+to a `schema_node_t`; `execute_plan` / `prepare_plan` refuse such a root
+instead):
 
 - create → `db::S3Manager::download` (s3://) or `conn::file::FileManager::add_file` (local) — loads into `db.table`
 - copy → parse `inner_sql`, then `db::S3Manager::upload` / `conn::file::FileManager::dump_file`

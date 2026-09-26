@@ -29,10 +29,16 @@ struct PostgresConfig {
     uint16_t port = 8817;
 };
 
+struct SparkConnectConfig {
+    std::string host = "0.0.0.0";
+    uint16_t port = 15002;
+};
+
 struct ServiceConfig {
     FlightSqlConfig flight_sql;
     MysqlConfig mysql;
     PostgresConfig postgres;
+    SparkConnectConfig spark_connect;
     // Startup retry policy for opening backend connections (from `service.connection_retry`).
     ConnectionRetryConfig connection_retry;
     // Remote backends + s3 aliases parsed from the `connections:` section of the
@@ -61,6 +67,8 @@ private:
                                                                 std::pmr::memory_resource* resource);
     static core::result_wrapper_t<PostgresConfig> parsePostgresConfig(const YAML::Node& config,
                                                                       std::pmr::memory_resource* resource);
+    static core::result_wrapper_t<SparkConnectConfig> parseSparkConnectConfig(const YAML::Node& config,
+                                                                              std::pmr::memory_resource* resource);
     static core::result_wrapper_t<ConnectionRetryConfig> parseConnectionRetryConfig(const YAML::Node& config,
                                                                                     std::pmr::memory_resource* resource);
 };

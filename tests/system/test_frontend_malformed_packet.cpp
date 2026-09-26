@@ -559,6 +559,28 @@ TEST_CASE("malformed packet: postgres StartupMessage with an unterminated parame
     server.stop();
 }
 
+TEST_CASE("malformed packet: postgres StartupMessage length out of range is FATAL 08P01 naming the announced length") {
+    otterstax::test::scheduler_stack_owner owner("/tmp/otterstax_frontend_malformed_pg_startup_length", &make_parser);
+    frontend::postgres::postgres_server server(make_config<frontend::postgres::postgres_server>(owner.stack()));
+    server.start();
+
+    SECTION("a length below the length field itself") {
+        raw_client client(server.local_port());
+        client.write({0x00, 0x00, 0x00, 0x02});
+        REQUIRE(pg_expect_fatal_protocol_violation(client) == "Invalid message length: 2");
+    }
+
+    SECTION("a length above MAX_PACKET_SIZE") {
+        raw_client client(server.local_port());
+        client.write({0x80, 0x00, 0x00, 0x00});
+        REQUIRE(pg_expect_fatal_protocol_violation(client) == "Invalid message length: 2147483648");
+    }
+
+    raw_client next(server.local_port());
+    pg_startup(next);
+    server.stop();
+}
+
 TEST_CASE("malformed packet: postgres ReadyForQuery is T inside an explicit transaction and E once an error failed it") {
     otterstax::test::scheduler_stack_owner owner("/tmp/otterstax_frontend_malformed_pg_transaction", &make_parser);
     frontend::postgres::postgres_server server(make_config<frontend::postgres::postgres_server>(owner.stack()));

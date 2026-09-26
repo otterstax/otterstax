@@ -573,3 +573,82 @@ core::result_wrapper_t<ParsedQueryDataPtr> GreenplumParser::parse(const std::str
 
     return result;
 }
+
+core::result_wrapper_t<logical_plan::node_ptr>
+GreenplumParser::parse_fragment(const std::string& sql,
+                                logical_plan::parameter_node_ptr shared_params,
+                                otterstax::names::name_registry_t& names) {
+    OTX_ZONE_N("otterbrix::parse_fragment");
+    log_->info("parse_fragment: starting for: {}", std::string_view{sql}.substr(0, 100));
+    if (registration_error_) {
+        log_->error("parse_fragment: parser extensions are not registered: {}", registration_error_->what.c_str());
+        return core::error_t{registration_error_->type, std::pmr::string{registration_error_->what, resource_}};
+    }
+
+    tracy_memory_resource arena_mr(resource_, "parser::arena");
+    std::pmr::monotonic_buffer_resource arena_resource(&arena_mr);
+
+    // The tree and the transformer read the same text: the transformer slices
+    // clause text out of it by the offsets the grammar recorded. It outlives
+    // the transform below.
+    const std::pmr::string text{sql.data(), sql.size(), resource_};
+    auto raw = run_raw_parser(&arena_resource, resource_, text, registry_);
+    if (raw.has_error()) {
+        log_->error("parse_fragment: raw_parser failed: {}", raw.error().what.c_str());
+        return raw.convert_error<logical_plan::node_ptr>();
+    }
+    const size_t statement_count = list_length(raw.value());
+    if (statement_count == 0) {
+        log_->error("parse_fragment: raw_parser returned no statements for SQL: {}",
+                    std::string_view{sql}.substr(0, 100));
+        return core::error_t{core::error_code_t::sql_parse_error, std::pmr::string{"syntax error", resource_}};
+    }
+    if (statement_count > 1) {
+        log_->error("parse_fragment: {} statements in one fragment", statement_count);
+        return core::error_t{core::error_code_t::unimplemented_yet,
+                             std::pmr::string{"multiple statements in one query are not supported", resource_}};
+    }
+    auto* res = reinterpret_cast<::Node*>(linitial(raw.value()));
+    if (nodeTag(res) != T_SelectStmt) {
+        log_->error("parse_fragment: the fragment is not a SELECT");
+        return core::error_t{core::error_code_t::unimplemented_yet,
+                             std::pmr::string{"a SQL fragment must be a single SELECT statement", resource_}};
+    }
+    otterstax::parser::promote_three_part_qualifiers(res);
+    // The full names (uid.db.schema.rel) come off the promoted raw tree, before
+    // the transformer folds every table down to (uid, db, rel), as in parse().
+    otterstax::parser::collect_qualified_names(resource_, res, names);
+
+    sql::transform::transformer transformer(resource_, text.c_str(), &registry_);
+    // The 3-arg execution_plan_t seeds sub_queries with the root it is given;
+    // the 2-arg transform appends only the sub-queries it lowers, so the plan
+    // starts empty and whatever is in it afterwards is a sub-query.
+    logical_plan::execution_plan_t plan(resource_, nullptr, std::move(shared_params));
+    plan.sub_queries.clear();
+    // run_transform's fence, for the 2-arg transform the fragment needs: the
+    // engine helpers the transformer calls may throw.
+    core::result_wrapper_t<logical_plan::node_ptr> transformed{nullptr};
+    try {
+        transformed = transformer.transform(sql::transform::pg_cell_to_node_cast(res), &plan);
+    } catch (const std::exception& e) {
+        log_->error("parse_fragment: transformer threw: {}", e.what());
+        return core::error_t{core::error_code_t::sql_parse_error, std::pmr::string{e.what(), resource_}};
+    }
+    if (transformed.has_error()) {
+        log_->error("parse_fragment: transformer error: {}", transformed.error().what.c_str());
+        return core::error_t{transformed.error().type, std::pmr::string{transformed.error().what, resource_}};
+    }
+    if (!transformed.value()) {
+        log_->error("parse_fragment: transformer returned null root node — unsupported statement");
+        return core::error_t{core::error_code_t::unimplemented_yet,
+                             std::pmr::string{"Unsupported node type", resource_}};
+    }
+    // A sub-query runs as a plan of its own ahead of the main one; the caller
+    // keeps only the root returned here, so it would vanish without a trace.
+    if (!plan.sub_queries.empty()) {
+        log_->error("parse_fragment: the fragment lowers {} sub-query plan(s)", plan.sub_queries.size());
+        return core::error_t{core::error_code_t::unimplemented_yet,
+                             std::pmr::string{"sub-queries are not supported in a SQL fragment", resource_}};
+    }
+    return transformed.value();
+}

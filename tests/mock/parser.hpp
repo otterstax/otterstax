@@ -16,7 +16,7 @@
 
 class SimpleMockParser : public IParser {
 public:
-    SimpleMockParser(mock_config config = {})
+    SimpleMockParser(mock_config config)
         : config_(std::move(config)) {
         std::cout << "MockParser created with config:" << std::endl;
         std::cout << "can_throw: " << config_.can_throw << std::endl;
@@ -46,7 +46,7 @@ public:
                 logical_plan::make_parameter_node(config_.resource)),
             sql::transform::transform_result::parameter_map_t{config_.resource},
             sql::transform::transform_result::insert_map_t{config_.resource},
-            data_chunk_t(config_.resource, {}));
+            sql::transform::transform_result::insert_rows_t(config_.resource));
         auto parsed = std::make_unique<ParsedQueryData>(
             std::make_unique<OtterbrixStatement>(std::pmr::vector<std::pmr::vector<external_entry_t>>{config_.resource},
                                                  binder.params_ptr(),

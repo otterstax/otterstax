@@ -5,11 +5,26 @@
 
 #include "utils.hpp"
 #include <cstdint>
-#include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace frontend {
+    // Why a read failed. The state is sticky: the first fault is kept and every
+    // later read fails with it, so a caller may check once after a group of
+    // reads. A failed read moves nothing and its returned value is not data.
+    enum class packet_fault : uint8_t
+    {
+        none,
+        // Fewer bytes are left than the field needs (a NUL-terminated string
+        // without its terminator included).
+        underflow,
+        // A byte that is no length-encoded-integer prefix (0xFB NULL, 0xFF).
+        invalid_marker,
+    };
+
+    // Decodes one client packet. Nothing here throws: a packet shorter than
+    // the fields read from it is reported through fault(), and the connection
+    // answers a protocol error.
     class packet_reader_base {
     public:
         packet_reader_base(std::vector<uint8_t> data);
@@ -32,10 +47,17 @@ namespace frontend {
         void skip_bytes(size_t n);
         size_t remaining() const;
 
+        bool ok() const;
+        packet_fault fault() const;
+
     protected:
-        void check_bounds(size_t needed) const;
+        // True when `needed` bytes are left and no read has failed; false
+        // records the underflow.
+        bool check_bounds(size_t needed);
+        void set_fault(packet_fault fault);
 
         std::vector<uint8_t> data_;
         size_t pos_;
+        packet_fault fault_;
     };
 } // namespace frontend

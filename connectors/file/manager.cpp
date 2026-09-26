@@ -12,6 +12,7 @@
 #include "otterbrix/translators/output/chunk_to_parquet.hpp"
 #include "otterbrix/translators/output/chunk_to_csv.hpp"
 #include "otterbrix/translators/output/chunk_to_ndjson.hpp"
+#include "otterbrix/translators/error.hpp"
 
 #include <ctime>
 #include <filesystem>
@@ -34,6 +35,44 @@ std::string temporary_path(const std::string& path) {
     const std::filesystem::path src{path};
     return (src.parent_path() /
             (std::string{ts} + "_" + src.filename().string())).string();
+}
+
+// Translate the file at params.path into a chunk in the format resolved from
+// params.format or, failing that, the path's extension.
+core::result_wrapper_t<components::vector::data_chunk_t> load_chunk(std::pmr::memory_resource* res,
+                                                                    const FileAddParams& params) {
+    switch (resolve_format(params.format, params.path)) {
+        case FileFormat::Parquet:
+            return tsl::parquet_to_chunk(res, params.path);
+        case FileFormat::CSV: {
+            const char delim = params.csv_delimiter.empty() ? ',' : params.csv_delimiter[0];
+            return tsl::csv_to_chunk(res, params.path, delim, params.csv_header);
+        }
+        case FileFormat::NDJSON:
+            return tsl::ndjson_to_chunk(res, params.path);
+        case FileFormat::Unknown:
+            break;
+    }
+    return tsl::make_error(res,
+                           core::error_code_t::invalid_parameter,
+                           "FileManager::add_file: cannot determine format for: " + params.path);
+}
+
+core::result_wrapper_t<bool> write_chunks(std::pmr::memory_resource* res,
+                                          FileFormat format,
+                                          const std::pmr::vector<components::vector::data_chunk_t>& chunks,
+                                          const std::string& path) {
+    switch (format) {
+        case FileFormat::Parquet:
+            return tsl::chunk_to_parquet(res, chunks, path);
+        case FileFormat::CSV:
+            return tsl::chunk_to_csv(res, chunks, path);
+        case FileFormat::NDJSON:
+            return tsl::chunk_to_ndjson(res, chunks, path);
+        case FileFormat::Unknown:
+            break;
+    }
+    return tsl::make_error(res, core::error_code_t::invalid_parameter, "FileManager::dump_file: unknown format");
 }
 
 } // namespace
@@ -79,69 +118,26 @@ actor_zeta::unique_future<core::result_wrapper_t<bool>> FileManager::add_file(se
     log_->trace("FileManager::add_file with params:\n Database: {}\n Table: {}\n Path: {}\n Format: {}",
                 params.database, params.table, params.path, params.format);
 
-    try {
-        // Resolve format
-        FileFormat fmt = resolve_format(params.format, params.path);
-
-        if (fmt == FileFormat::Unknown) {
-            log_->error("add_file: cannot determine format for: {}", params.path);
-            co_return core::error_t(
-                core::error_code_t::other_error,
-                std::pmr::string{("FileManager::add_file: cannot determine format for: " + params.path).c_str(),
-                                 resource()});
-        }
-
-        // Translate file → data_chunk_t
-        components::vector::data_chunk_t chunk = [&] {
-            switch (fmt) {
-                case FileFormat::Parquet:
-                    return tsl::parquet_to_chunk(resource_, params.path);
-                case FileFormat::CSV: {
-                    char delim = params.csv_delimiter.empty() ? ',' : params.csv_delimiter[0];
-                    return tsl::csv_to_chunk(resource_, params.path, delim, params.csv_header);
-                }
-                case FileFormat::NDJSON:{
-                    return tsl::ndjson_to_chunk(resource_, params.path);
-                }
-                default:{
-                    log_->error("add_file: cannot determine format for: {}", params.path);
-                    throw std::runtime_error("FileManager::add_file: cannot determine format for: " + params.path);
-                }
-                    
-            }
-        }();
-
-        auto fut = actor_zeta::send(otterbrix_manager_,
-                                    &db::OtterbrixManager::create_table,
-                                    id,
-                                    std::move(params.database),
-                                    std::move(params.table),
-                                    std::move(chunk));
-        auto result = co_await std::move(fut.second);
-        if (result.has_error()) {
-            log_->error("add_file: create_table failed: {}",
-                                         result.error().what);
-            co_return core::error_t(
-                core::error_code_t::other_error,
-                std::pmr::string{("FileManager::add_file: create_table failed: " +
-                                  std::string{result.error().what.c_str()})
-                                     .c_str(),
-                                 resource()});
-        }
-
-        log_->debug("add_file: loaded {} into {}.{}", params.path, params.database, params.table);
-        co_return true;
-
-    } catch (const std::exception& e) {
-        log_->error("add_file caught exception: {}", e.what());
-        co_return core::error_t(
-            core::error_code_t::other_error,
-            std::pmr::string{("FileManager::add_file: " + std::string{e.what()}).c_str(), resource()});
-    } catch (...) {
-        log_->error("add_file caught unknown exception");
-        co_return core::error_t(core::error_code_t::other_error,
-                                std::pmr::string{"FileManager::add_file: unknown exception", resource()});
+    auto loaded = load_chunk(resource_, params);
+    if (loaded.has_error()) {
+        log_->error("add_file: {}", loaded.error().what);
+        co_return loaded.convert_error<bool>();
     }
+
+    auto fut = actor_zeta::send(otterbrix_manager_,
+                                &db::OtterbrixManager::create_table,
+                                id,
+                                std::move(params.database),
+                                std::move(params.table),
+                                std::move(loaded.value()));
+    auto result = co_await std::move(fut.second);
+    if (result.has_error()) {
+        log_->error("add_file: create_table failed: {}", result.error().what);
+        co_return std::move(result);
+    }
+
+    log_->debug("add_file: loaded {} into {}.{}", params.path, params.database, params.table);
+    co_return true;
 }
 
 actor_zeta::unique_future<core::result_wrapper_t<std::string>> FileManager::dump_file(session_hash_t id, FileMetadata file_metadata) {
@@ -151,7 +147,7 @@ actor_zeta::unique_future<core::result_wrapper_t<std::string>> FileManager::dump
         log_->error("dump_file: input arguments are invalid: Path: '{}', statement: {}",
                     file_metadata.path, file_metadata.statement ? "set" : "null");
         co_return core::error_t(
-            core::error_code_t::other_error,
+            core::error_code_t::invalid_parameter,
             std::pmr::string{("FileManager::dump_file: input arguments are invalid: Path: '" +
                               std::string{file_metadata.path} + "', statement: " +
                               (file_metadata.statement ? "set" : "null"))
@@ -159,55 +155,42 @@ actor_zeta::unique_future<core::result_wrapper_t<std::string>> FileManager::dump
                              resource()});
     }
 
-    try {
-        // Execute the pre-parsed statement; its result chunk is what we dump.
-        auto fut = actor_zeta::send(otterbrix_manager_,
-                                    &db::OtterbrixManager::execute,
-                                    id,
-                                    std::move(file_metadata.statement));
-        auto cursor = co_await std::move(fut.second);
-        if (!cursor || !cursor->is_success()) {
-            const std::string why = (cursor && cursor->is_error())
-                                        ? std::string{cursor->get_error().what.c_str()}
-                                        : std::string{"cursor error"};
-            log_->error("dump_file: execute failed: {}", why);
-            co_return core::error_t(core::error_code_t::other_error,
-                                    std::pmr::string{("FileManager::dump_file: execute failed: " + why).c_str(),
-                                                     resource()});
-        }
-
-        // Temporary dumps (e.g. S3 upload staging) get a timestamp-prefixed
-        // basename in the same directory so they never clobber an existing file;
-        // otherwise the table is written to the exact path requested.
-        const auto out_path = file_metadata.is_temporary
-                                  ? temporary_path(file_metadata.path)
-                                  : file_metadata.path;
-
-        const auto& chunk = cursor->chunk_data();
-        switch (file_metadata.format) {
-            case FileFormat::Parquet:
-                tsl::chunk_to_parquet(chunk, out_path);
-                break;
-            case FileFormat::CSV:
-                tsl::chunk_to_csv(chunk, out_path);
-                break;
-            case FileFormat::NDJSON:
-                tsl::chunk_to_ndjson(chunk, out_path);
-                break;
-            default:
-                co_return core::error_t(core::error_code_t::other_error,
-                                        std::pmr::string{"FileManager::dump_file: unknown format", resource()});
-        }
-
-        log_->debug("dump_file: wrote {}", out_path);
-        co_return out_path;
-
-    } catch (const std::exception& e) {
-        log_->error("dump_file caught exception: {}", e.what());
-        co_return core::error_t(
-            core::error_code_t::other_error,
-            std::pmr::string{("FileManager::dump_file: " + std::string{e.what()}).c_str(), resource()});
+    // Execute the pre-parsed statement; its result chunk is what we dump.
+    auto fut = actor_zeta::send(otterbrix_manager_,
+                                &db::OtterbrixManager::execute,
+                                id,
+                                std::move(file_metadata.statement));
+    auto cursor = co_await std::move(fut.second);
+    if (!cursor || !cursor->is_success()) {
+        // The engine's verdict is kept: its code and message, re-homed on this
+        // actor's resource. A cursor with no error at all is an engine contract
+        // violation and can only be reported as other_error.
+        const bool engine_error = cursor && cursor->is_error();
+        const std::string why = engine_error ? std::string{cursor->get_error().what.c_str()}
+                                             : std::string{"cursor error"};
+        log_->error("dump_file: execute failed: {}", why);
+        co_return core::error_t(engine_error ? cursor->get_error().type : core::error_code_t::other_error,
+                                std::pmr::string{("FileManager::dump_file: execute failed: " + why).c_str(),
+                                                 resource()});
     }
+
+    // Temporary dumps (e.g. S3 upload staging) get a timestamp-prefixed
+    // basename in the same directory so they never clobber an existing file;
+    // otherwise the table is written to the exact path requested.
+    const auto out_path = file_metadata.is_temporary
+                              ? temporary_path(file_metadata.path)
+                              : file_metadata.path;
+
+    // Engine cursors return the result as a vector of <=1024-row chunks (never
+    // combined into one); the writers take the whole run.
+    auto written = write_chunks(resource_, file_metadata.format, cursor->chunks(), out_path);
+    if (written.has_error()) {
+        log_->error("dump_file: {}", written.error().what);
+        co_return written.convert_error<std::string>();
+    }
+
+    log_->debug("dump_file: wrote {}", out_path);
+    co_return out_path;
 }
 
 } // namespace conn::file

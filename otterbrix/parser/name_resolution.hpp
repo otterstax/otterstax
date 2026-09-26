@@ -21,19 +21,21 @@ namespace otterstax::names {
     // (uid.db.schema.rel) collected from the raw AST pre-pass, where
     // RangeVar still carries uid/catalogname/schemaname/relname.
     //
-    // The key rule MUST mirror the transformer's rangevar_to_qualified_name
-    // folding:
-    //   key_db = name.database non-empty ? name.database : name.schema
-    //   key    = key_db + '\0' + name.collection
-    // so whatever (dbname, relname) the transformer stamped on a node looks
-    // up the full name registered from the raw AST.
+    // The key rule MUST agree with the dbname the transformer stamps on nodes
+    // (rangevar_to_qualified_name: the RangeVar's catalogname, not folded):
+    //   key = name.database + '\0' + name.collection
+    // The grammar puts the database of every qualified name into catalogname
+    // and fills schemaname only together with it, so whatever (dbname, relname)
+    // the transformer stamped on a node looks up the full name registered from
+    // the raw AST.
     class name_registry_t {
     public:
         explicit name_registry_t(std::pmr::memory_resource* resource);
 
-        // Registers a full name under its folded key. If two DIFFERENT full
-        // names fold onto the same key, the FIRST entry is kept and the key
-        // is recorded as collided; find() on a collided key returns nullptr.
+        // Registers a full name under its (database, collection) key. If two
+        // DIFFERENT full names fall onto the same key, the FIRST entry is kept
+        // and the key is recorded as collided; find() on a collided key returns
+        // nullptr.
         void add(qualified_name_t name);
 
         // Returns nullptr on a miss OR when the key is ambiguous (collided).
@@ -53,9 +55,10 @@ namespace otterstax::names {
         std::pmr::unordered_set<std::pmr::string> collisions_;
     };
 
-    // One resolved table target of an external node. `from_name` stays empty
-    // unless the statement references a secondary table
-    // (UPDATE ... FROM / DELETE ... USING).
+    // One resolved table target of an external node. `from_name` is the second
+    // name a statement targets: the index of a DROP INDEX, or — as the
+    // generator reads it — the secondary table of UPDATE ... FROM /
+    // DELETE ... USING. Empty otherwise.
     struct resolved_target_t {
         components::catalog::oid_t oid{components::catalog::INVALID_OID};
         qualified_name_t name;
@@ -64,29 +67,24 @@ namespace otterstax::names {
 
     // Resolves a bare (dbname, relname) pair through `reg`, producing exactly
     // the same errors node_names() does (ambiguous_name on a key collision,
-    // table_not_exists on a miss). Used by the parser for the secondary table
-    // of UPDATE ... FROM / DELETE ... USING, where the caller reads the second
-    // node_catalog_resolve_table_t sibling itself.
+    // table_not_exists on a miss). Used by the parser for the index of a
+    // DROP INDEX, which the node names apart from its table.
     core::result_wrapper_t<qualified_name_t> resolve_table_name(std::pmr::memory_resource* resource,
                                                                 const name_registry_t& reg,
                                                                 std::string_view dbname,
                                                                 std::string_view relname);
 
-    // Extracts the (dbname, relname) pair from a logical-plan node (per-type
+    // Extracts the (dbname, relname) pair a logical-plan node names (per-type
     // switch mirroring the engine's enrich pass), then resolves it through
     // `reg` to the original full qualified name (preserving uid + schema).
     //
-    // DML and table-level DDL nodes carry no names; their target table lives
-    // on the FIRST node_catalog_resolve_table_t sibling inside the wrapping
-    // node_sequence_t — pass that sequence as `seq_ctx`. create_collection_t
-    // carries relname itself and its database name on a
-    // node_catalog_resolve_namespace_t sibling (absent for unqualified
-    // `CREATE TABLE t` — then db is empty / local). Errors: seq_ctx == nullptr
-    // where a resolve sibling is required, database-level DDL (always local,
-    // must not be resolved), and node_type::unused (otterstax schema_node_t —
-    // resolved by the caller).
+    // Every node names its own target: DML and table-level DDL nodes their
+    // target table (a DROP INDEX its indexed table), create_collection_t its
+    // database as written (empty for an unqualified `CREATE TABLE t` — then
+    // the local entry). Errors: database-level DDL (always local, must not be
+    // resolved) and node_type::unused (otterstax schema_node_t — resolved by
+    // the caller).
     core::result_wrapper_t<qualified_name_t> node_names(const components::logical_plan::node_t& node,
-                                                        const name_registry_t& reg,
-                                                        const components::logical_plan::node_t* seq_ctx);
+                                                        const name_registry_t& reg);
 
 } // namespace otterstax::names

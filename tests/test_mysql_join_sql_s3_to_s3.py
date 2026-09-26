@@ -13,7 +13,8 @@
 #   5. CREATE EXTERNAL TABLE over the dumped csv to read it back and verify
 #      the row count + campaign_id set.
 #
-# Why the staging step is still here (FIX_JOIN.md has the full story):
+# Why the staging step is still here (tests/CLAUDE.md, "JOIN-key width
+# sensitivity", has the full story):
 # A direct `JOIN MariaDB.campaigns ⋈ engine.regions ON campaign_id` is a plan
 # shape the engine DOES support (see examples/demo/sql/step_4.sql, which runs
 # exactly this shape against PG every demo run and returns 14 rows). The

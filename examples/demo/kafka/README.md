@@ -57,6 +57,23 @@ for a `*.sql` one pass the broker, e.g.
 examples/demo/kafka/run_all.sh [--local]        # no pauses
 ```
 
+`run_all.sh` first checks that the otterstax PG wire answers `SELECT 1`
+(`localhost:8817`) and exits 1 with a ❌ line when it does not. It then stops at
+the first failing step and exits with that step's code
+(`❌ Kafka act failed at step …`). `✅ Kafka act complete` is printed only when
+every step succeeded.
+
+Each step's `run.sh` makes the same server check and stops at its first failed
+sub-step with a non-zero exit. A sub-step fails on:
+
+- a psql error — `ON_ERROR_STOP=1`; psql exits 2 for a lost connection, 3 for a failed statement;
+- a `wait_rows` timeout, which prints the expected and the observed row count;
+- an `rpk` error while seeding a topic;
+- a `consume` that fails or reads no record.
+
+A failed run leaves its Kafka objects in place. The steps are re-runnable, and
+`6_teardown/run.sh` drops the objects.
+
 ## Layout
 
 ```
@@ -64,7 +81,8 @@ kafka/
   README.md
   run_all.sh                 # chain every step, non-interactive
   lib/
-    _common.sh               # broker addressing + psql/pause/wait + seed/consume
+    _common.sh               # broker addressing + server check + psql/pause/wait + seed/consume
+                             #   every helper prints ❌ and returns non-zero on failure
                              #   seed  --topic T [--fixture F] [--reset]  (create + produce)
                              #   consume --topic T [--timeout S]          (drain, print)
                              #   both shell out to `rpk` inside the demo-kafka container,

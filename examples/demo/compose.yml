@@ -88,7 +88,7 @@ services:
   # S3-compatible object store used by steps 7-9. Single bucket seeded with
   # the fixtures `examples/demo/generate_data.py` writes into `init/s3/`.
   demo-minio:
-    image: minio/minio:latest
+    image: quay.io/minio/minio:latest
     container_name: demo-minio
     command: server /data --console-address ":9001"
     environment:
@@ -135,7 +135,7 @@ services:
 
   # One-shot init: create the bucket and upload the demo fixtures, then exit.
   demo-minio-init:
-    image: minio/mc:latest
+    image: quay.io/minio/mc:latest
     container_name: demo-minio-init
     depends_on:
       demo-minio:

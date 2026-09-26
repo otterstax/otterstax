@@ -32,11 +32,14 @@ endif()
 # sets LD_LIBRARY_PATH from a glob of all conan lib dirs, which can resolve a
 # different (minimal) libarrow first. Pin an absolute DT_RPATH to the build lib
 # dir (where the correct shared libs are staged) and use --disable-new-dtags so
-# DT_RPATH takes precedence over LD_LIBRARY_PATH.
+# DT_RPATH takes precedence over LD_LIBRARY_PATH. The flag is GNU ld's; Apple's
+# linker rejects it and dyld has no LD_LIBRARY_PATH precedence problem to solve.
 set_target_properties(otterstax_bench PROPERTIES
     BUILD_RPATH "${CMAKE_BINARY_DIR}/lib"
     INSTALL_RPATH "${CMAKE_BINARY_DIR}/lib")
-target_link_options(otterstax_bench PRIVATE "-Wl,--disable-new-dtags")
+if(NOT APPLE)
+    target_link_options(otterstax_bench PRIVATE "-Wl,--disable-new-dtags")
+endif()
 
 # kafka_runtime provides json_to_chunk / chunk_to_json for bench_kafka_translators
 # (and transitively kafka_grammar for kafka_column_t). Kept as its own call so the

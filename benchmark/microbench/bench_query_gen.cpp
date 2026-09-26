@@ -29,7 +29,7 @@
 namespace {
 
 otterstax::parser::extraction_result_t prep(const char* sql) {
-    return otterstax::parser::prepare_sql(sql, std::pmr::get_default_resource());
+    return otterstax::parser::prepare_sql(sql, std::pmr::new_delete_resource(), std::pmr::new_delete_resource());
 }
 
 // All SQL fixtures use the subquery form required by prepare_sql.  Stubs are
@@ -77,7 +77,10 @@ static void BM_replace_qualifiers_mysql(benchmark::State& state) {
     assert(!r.stubs.empty());
     const auto& stub = r.stubs[0];
     for (auto _ : state) {
-        auto out = sql_gen::replace_qualifiers(stub.raw_sql, stub.qualifiers, backend_type_t::MySQL);
+        auto out = sql_gen::replace_qualifiers(stub.raw_sql,
+                                               stub.qualifiers,
+                                               backend_type_t::MySQL,
+                                               std::pmr::new_delete_resource());
         benchmark::DoNotOptimize(out);
     }
 }
@@ -89,7 +92,10 @@ static void BM_replace_qualifiers_pg(benchmark::State& state) {
     assert(r.stubs.size() >= 2);
     const auto& stub = r.stubs.back();
     for (auto _ : state) {
-        auto out = sql_gen::replace_qualifiers(stub.raw_sql, stub.qualifiers, backend_type_t::PostgreSQL);
+        auto out = sql_gen::replace_qualifiers(stub.raw_sql,
+                                               stub.qualifiers,
+                                               backend_type_t::PostgreSQL,
+                                               std::pmr::new_delete_resource());
         benchmark::DoNotOptimize(out);
     }
 }
@@ -100,7 +106,10 @@ static void BM_replace_qualifiers_ch(benchmark::State& state) {
     assert(!r.stubs.empty());
     const auto& stub = r.stubs[0];
     for (auto _ : state) {
-        auto out = sql_gen::replace_qualifiers(stub.raw_sql, stub.qualifiers, backend_type_t::ClickHouse);
+        auto out = sql_gen::replace_qualifiers(stub.raw_sql,
+                                               stub.qualifiers,
+                                               backend_type_t::ClickHouse,
+                                               std::pmr::new_delete_resource());
         benchmark::DoNotOptimize(out);
     }
 }
@@ -108,10 +117,11 @@ BENCHMARK(BM_replace_qualifiers_ch);
 
 // No-op: zero qualifier rewrites in the list.
 static void BM_replace_qualifiers_empty(benchmark::State& state) {
-    std::vector<otterstax::parser::qualifier_rewrite_t> no_quals;
+    std::pmr::vector<otterstax::parser::qualifier_rewrite_t> no_quals{std::pmr::new_delete_resource()};
     const std::string sql = "SELECT id, name FROM orders WHERE status = 'active'";
     for (auto _ : state) {
-        auto out = sql_gen::replace_qualifiers(sql, no_quals, backend_type_t::MySQL);
+        auto out =
+            sql_gen::replace_qualifiers(sql, no_quals, backend_type_t::MySQL, std::pmr::new_delete_resource());
         benchmark::DoNotOptimize(out);
     }
 }
@@ -124,11 +134,12 @@ BENCHMARK(BM_replace_qualifiers_empty);
 static void BM_pipeline_mysql_single_source(benchmark::State& state) {
     std::pmr::unsynchronized_pool_resource pool;
     for (auto _ : state) {
-        auto r = otterstax::parser::prepare_sql(kMysqlOnlySql, &pool);
+        auto r = otterstax::parser::prepare_sql(kMysqlOnlySql, &pool, &pool);
         assert(!r.stubs.empty());
         auto out = sql_gen::replace_qualifiers(r.stubs[0].raw_sql,
                                                r.stubs[0].qualifiers,
-                                               backend_type_t::MySQL);
+                                               backend_type_t::MySQL,
+                                               std::pmr::new_delete_resource());
         benchmark::DoNotOptimize(out);
     }
 }
@@ -137,14 +148,16 @@ BENCHMARK(BM_pipeline_mysql_single_source);
 static void BM_pipeline_cross_backend(benchmark::State& state) {
     std::pmr::unsynchronized_pool_resource pool;
     for (auto _ : state) {
-        auto r = otterstax::parser::prepare_sql(kCrossBackendSql, &pool);
+        auto r = otterstax::parser::prepare_sql(kCrossBackendSql, &pool, &pool);
         assert(r.stubs.size() >= 2);
         auto out0 = sql_gen::replace_qualifiers(r.stubs[0].raw_sql,
                                                 r.stubs[0].qualifiers,
-                                                backend_type_t::MySQL);
+                                                backend_type_t::MySQL,
+                                                std::pmr::new_delete_resource());
         auto out1 = sql_gen::replace_qualifiers(r.stubs[1].raw_sql,
                                                 r.stubs[1].qualifiers,
-                                                backend_type_t::PostgreSQL);
+                                                backend_type_t::PostgreSQL,
+                                                std::pmr::new_delete_resource());
         benchmark::DoNotOptimize(out0);
         benchmark::DoNotOptimize(out1);
     }
@@ -155,17 +168,20 @@ BENCHMARK(BM_pipeline_cross_backend);
 static void BM_pipeline_three_backend(benchmark::State& state) {
     std::pmr::unsynchronized_pool_resource pool;
     for (auto _ : state) {
-        auto r = otterstax::parser::prepare_sql(kThreeBackendSql, &pool);
+        auto r = otterstax::parser::prepare_sql(kThreeBackendSql, &pool, &pool);
         assert(r.stubs.size() >= 3);
         auto out0 = sql_gen::replace_qualifiers(r.stubs[0].raw_sql,
                                                 r.stubs[0].qualifiers,
-                                                backend_type_t::MySQL);
+                                                backend_type_t::MySQL,
+                                                std::pmr::new_delete_resource());
         auto out1 = sql_gen::replace_qualifiers(r.stubs[1].raw_sql,
                                                 r.stubs[1].qualifiers,
-                                                backend_type_t::PostgreSQL);
+                                                backend_type_t::PostgreSQL,
+                                                std::pmr::new_delete_resource());
         auto out2 = sql_gen::replace_qualifiers(r.stubs[2].raw_sql,
                                                 r.stubs[2].qualifiers,
-                                                backend_type_t::ClickHouse);
+                                                backend_type_t::ClickHouse,
+                                                std::pmr::new_delete_resource());
         benchmark::DoNotOptimize(out0);
         benchmark::DoNotOptimize(out1);
         benchmark::DoNotOptimize(out2);
@@ -178,7 +194,7 @@ BENCHMARK(BM_pipeline_three_backend);
 static void BM_table_reference_mysql(benchmark::State& state) {
     qualified_name_t name{"bill", "orders"};
     for (auto _ : state) {
-        auto ref = sql_gen::table_reference(name, backend_type_t::MySQL);
+        auto ref = sql_gen::table_reference(name, backend_type_t::MySQL, std::pmr::new_delete_resource());
         benchmark::DoNotOptimize(ref);
     }
 }
@@ -187,7 +203,7 @@ BENCHMARK(BM_table_reference_mysql);
 static void BM_table_reference_pg(benchmark::State& state) {
     qualified_name_t name{"shop", "products"};
     for (auto _ : state) {
-        auto ref = sql_gen::table_reference(name, backend_type_t::PostgreSQL);
+        auto ref = sql_gen::table_reference(name, backend_type_t::PostgreSQL, std::pmr::new_delete_resource());
         benchmark::DoNotOptimize(ref);
     }
 }
@@ -196,7 +212,7 @@ BENCHMARK(BM_table_reference_pg);
 static void BM_table_reference_ch(benchmark::State& state) {
     qualified_name_t name{"events", "sessions"};
     for (auto _ : state) {
-        auto ref = sql_gen::table_reference(name, backend_type_t::ClickHouse);
+        auto ref = sql_gen::table_reference(name, backend_type_t::ClickHouse, std::pmr::new_delete_resource());
         benchmark::DoNotOptimize(ref);
     }
 }

@@ -22,13 +22,18 @@ The system uses `ComponentManager` (`component_manager/`) as the central orchest
 
 ### Session-Based Query Execution Flow
 1. Frontend receives query → generates unique `session_hash_t`
-2. Frontend spawns async task, registers `shared_flight_data` with Scheduler
-3. Scheduler parses SQL → determines if Otterbrix-local or federated remote query
+2. Frontend calls `Scheduler::execute` (and friends), which returns
+   `actor_zeta::unique_future<core::result_wrapper_t<session_payload>>`
+3. Scheduler routes by session hash → a `Worker` parses SQL and determines if the
+   query is Otterbrix-local or federated remote
 4. For federated: dispatches to `SqlConnectionManager` → `ConnectorManager` → MySQL
-5. Results translated through `translators/` (MySQL results → Arrow format)
-6. Completed data signaled via condition variable in `shared_flight_data`
+5. Results translated through `otterbrix/translators/` (backend results → `data_chunk_t`)
+6. The connection awaits the future through
+   `frontend/common/asio_future_bridge.hpp` — polled on the per-connection asio
+   executor, no blocking get and no condition variable
 
-**Session Management**: Use `utility/shared_flight_data.hpp` wrapper with CV for async wait/signal between components.
+**Session Management**: the payload type is `session_payload` in
+`scheduler/session_data.hpp`, carried by value through the typed future.
 
 ### Federated Query Pattern (Critical!)
 Queries use **connection aliases** as database names:
@@ -135,7 +140,7 @@ auto result = co_await std::move(future);
 - `db_conn::` - Database integration actors (Otterbrix/SQL managers)
 
 ### Thread Safety Notes
-- `ConnectorManager::addConnection/removeConnection` is **NOT thread-safe** (see TODOs in `connectors/mysql/mysql_manager.hpp:44-45`)
+- `ConnectorManager::addConnection` is the only write to a connector registry and runs on the startup thread before any query reaches the integration actor that drives the manager; there is no remove path
 - `Scheduler` uses `std::mutex data_map_mtx_` for session map access
 - Boost.MySQL connections run on `thread_pool_manager` io_context
 
@@ -161,10 +166,11 @@ auto result = co_await std::move(future);
 ## Dependencies & Constraints
 
 ### Critical External Dependencies
-- **Otterbrix 1.0.0a10-rc-10**: Custom Conan remote at `https://conan.otterbrix.com`
-- **Arrow 19.0.1** with FlightSQL support (must set `with_flight_sql=True`)
-- **Boost 1.87.0**: Required for C++20 coroutines in MySQL connector
-- **actor-zeta 1.1.1**: Custom actor framework with C++20 coroutines (not Akka/CAF)
+- **Otterbrix 1.0.0b2-rc-2**: Custom Conan remote at `https://conan.otterbrix.com`, pinned by recipe revision in `conanfile.py`
+- **Arrow 24.0.0** with FlightSQL support (must set `with_flight_sql=True`)
+- **Boost 1.88.0**: Required for C++20 coroutines in MySQL connector
+- **actor-zeta 1.2.0**: Custom actor framework with C++20 coroutines (not Akka/CAF)
+- **Catch2 3.15.1**: v3 API (`catch2/catch_all.hpp`, `find_package(Catch2 3)`)
 
 ### Port Assignments (Hardcoded)
 - 8815: FlightSQL server
@@ -174,7 +180,7 @@ auto result = co_await std::move(future);
 
 ### Known Limitations (from TODOs)
 - No connection pool timeout handling (see `connectors/mysql/mysql_connector.hpp:115`)
-- Single query per connection limitation (`db_integration/sql/connection_manager.cpp:81`)
+- Single query per connection limitation: one `boost::mysql::any_connection` per alias, no serialization of overlapping statements (`connectors/mysql/connector.hpp`)
 - Array types only support single dimension (`otterbrix/query_generation/sql_query_generator.cpp:70`)
 
 ## Anti-Patterns to Avoid

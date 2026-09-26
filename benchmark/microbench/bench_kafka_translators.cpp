@@ -49,28 +49,40 @@ namespace {
 } // namespace
 
 // ── json_to_chunk: parse a batch of JSON payloads into a data_chunk_t ──────────
+// A fresh arena per iteration: a monotonic arena never frees, so one arena for
+// the whole run would grow without bound and time the allocator's page faults
+// instead of the parser.
 static void BM_json_to_chunk(benchmark::State& state) {
-    auto* res = std::pmr::get_default_resource();
     const auto columns = make_columns();
     const auto payloads = make_payloads(static_cast<int>(state.range(0)));
     for (auto _ : state) {
-        auto chunk = otterstax::kafka::detail::json_to_chunk(res, columns, payloads);
+        std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
+        auto chunk = otterstax::kafka::detail::json_to_chunk(&arena, columns, payloads);
         benchmark::DoNotOptimize(chunk);
     }
     state.SetItemsProcessed(state.iterations() * state.range(0));
 }
 BENCHMARK(BM_json_to_chunk)->Arg(1000)->Arg(10000)->Arg(100000);
 
+// ── chunk_to_json: serialise a batch of chunks back to JSON payloads ───────────
+// data_chunk_t is move-only, so the batch is built once outside the loop;
+// chunk_to_json takes it by const reference and the run is what a cursor hands
+// the produce path (every chunk of the result, in order).
 static void BM_chunk_to_json(benchmark::State& state) {
-    auto* res = std::pmr::get_default_resource();
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
+    auto* res = &arena;
     const auto columns = make_columns();
     const auto payloads = make_payloads(static_cast<int>(state.range(0)));
 
-    // data_chunk_t is move-only; build it once outside the loop (chunk_to_json
-    auto chunk = otterstax::kafka::detail::json_to_chunk(res, columns, payloads);
+    std::pmr::vector<components::vector::data_chunk_t> chunks(res);
+    chunks.push_back(otterstax::kafka::detail::json_to_chunk(res, columns, payloads));
     for (auto _ : state) {
-        auto out = otterstax::kafka::detail::chunk_to_json(chunk);
-        benchmark::DoNotOptimize(out);
+        auto out = otterstax::kafka::detail::chunk_to_json(res, chunks);
+        if (out.has_error()) {
+            state.SkipWithError(out.error().what.c_str());
+            break;
+        }
+        benchmark::DoNotOptimize(out.value());
     }
     state.SetItemsProcessed(state.iterations() * state.range(0));
 }

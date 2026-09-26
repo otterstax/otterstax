@@ -9,11 +9,13 @@ using namespace components::sql;
 
 namespace frontend::mysql {
     mysql_connection::mysql_connection(std::pmr::memory_resource* resource,
-                                       boost::asio::io_context& ctx,
+                                       boost::asio::ip::tcp::socket&& socket,
                                        uint32_t connection_id,
                                        actor_zeta::address_t scheduler,
-                                       std::function<void()> on_close)
-        : frontend_connection(ctx, connection_id, std::move(on_close))
+                                       connection_close_sink& close_sink,
+                                       size_t slot,
+                                       std::chrono::milliseconds read_timeout)
+        : frontend_connection(std::move(socket), connection_id, close_sink, slot, read_timeout)
         , resource_(resource)
         , statement_id_map_(resource_)
         , sequence_id_(0)
@@ -29,8 +31,11 @@ namespace frontend::mysql {
 
     mysql_connection::prepared_stmt_meta::prepared_stmt_meta(std::pmr::memory_resource* resource,
                                                              session_hash_t stmt_session,
+                                                             std::string sql,
                                                              uint32_t parameter_count)
         : stmt_session(stmt_session)
+        , sql(sql.c_str(), sql.size(), resource)
+        , consumed(false)
         , parameter_count(parameter_count)
         , param_types(resource) {}
 
@@ -49,7 +54,7 @@ namespace frontend::mysql {
         return merge_n_bytes<uint32_t, 3, endian::LITTLE>(header, 0);
     }
 
-    bool mysql_connection::validate_payload_size(uint32_t& size) { return true; }
+    bool mysql_connection::validate_payload_size(const std::vector<uint8_t>& header, uint32_t& size) { return true; }
 
     void mysql_connection::handle_network_read_error(std::string description) {
         send_error(mysql_error::ER_NET_READ_ERROR, std::move(description));
@@ -60,16 +65,21 @@ namespace frontend::mysql {
     }
 
     void mysql_connection::send_handshake() {
-        auto handshake = build_handshake_10(writer_, connection_id_, generate_backend_key(AUTH_DATA_FULL_LENGTH));
+        // The packet is written from send_buffer_, which outlives the write.
+        send_buffer_ = build_handshake_10(writer_, connection_id_, generate_backend_key(AUTH_DATA_FULL_LENGTH));
         sequence_id_++;
 
         // todo: count rounds & break if too many
         boost::asio::async_write(
             socket_,
-            boost::asio::buffer(std::move(handshake)),
+            boost::asio::buffer(send_buffer_),
             safe_callback([this](boost::system::error_code ec, std::size_t bytes_sent) {
                 if (ec) {
-                    log_->error("[Connection {}] HANDSHAKE failed, disconnecting: {}", connection_id_, ec.message());
+                    if (!closed()) {
+                        log_->error("[Connection {}] HANDSHAKE failed, disconnecting: {}",
+                                    connection_id_,
+                                    ec.message());
+                    }
                     finish();
                 } else {
                     log_->info("[Connection {}] HANDSHAKE: sent {} bytes", connection_id_, bytes_sent);
@@ -94,7 +104,10 @@ namespace frontend::mysql {
                 sequence_id_ = 1;
                 break;
             case connection_state::HANDSHAKE:
-                throw std::logic_error("Impossible connection state during packet sequence: HANDSHAKE");
+                // The server writes the handshake and moves to AUTH before it
+                // reads anything, so no packet can be handled in this state.
+                send_error(mysql_error::ER_SEQUENCE_ERROR, "Packet received before the server handshake");
+                return;
         }
 
         if (!sequence_valid) {
@@ -126,5 +139,18 @@ namespace frontend::mysql {
                    message,
                    static_cast<int>(sequence_id_));
         send_packet(build_error(writer_, sequence_id_++, error_code, std::move(message)));
+    }
+
+    void mysql_connection::send_malformed_packet_error(std::string message) {
+        log_->warn("[Connection {}] ERROR: malformed packet, disconnecting: msg='{}' seq={}",
+                   connection_id_,
+                   message,
+                   static_cast<int>(sequence_id_));
+        // The write is initiated before the close is posted, so the ERR packet
+        // reaches the client ahead of the FIN (the same order the PG frontend
+        // relies on for a FATAL ErrorResponse).
+        send_packet(build_error(writer_, sequence_id_++, mysql_error::ER_MALFORMED_PACKET, std::move(message)),
+                    false);
+        finish();
     }
 } // namespace frontend::mysql

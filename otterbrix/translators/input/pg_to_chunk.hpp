@@ -4,6 +4,7 @@
 #pragma once
 
 #include <otterbrix/otterbrix.hpp>
+#include <core/result_wrapper.hpp>
 
 // Clash between otterbrix parser and arrow
 #undef DAY
@@ -30,8 +31,13 @@ namespace tsl {
     };
     using pg_enum_oid_map = std::unordered_map<unsigned int, pg_enum_descriptor>;
 
-    data_chunk_t pg_to_chunk(std::pmr::memory_resource* res, PGresult* result);
-    data_chunk_t pg_to_chunk(std::pmr::memory_resource* res, PGresult* result, const pg_enum_oid_map& enum_oids);
+    // A result with columns becomes a chunk of its tuples; a column-less result
+    // (DML) becomes the column-less affected-row carrier (affected_rows_carrier.hpp)
+    // read from the command tag. A counting tag that carries no valid number is
+    // conversion_failure; the message is owned by `res`.
+    core::result_wrapper_t<data_chunk_t> pg_to_chunk(std::pmr::memory_resource* res, PGresult* result);
+    core::result_wrapper_t<data_chunk_t>
+    pg_to_chunk(std::pmr::memory_resource* res, PGresult* result, const pg_enum_oid_map& enum_oids);
 
     // Extract schema from PGresult (similar to mysql_to_struct)
     components::types::complex_logical_type pg_to_struct(std::pmr::memory_resource* res, PGresult* result);

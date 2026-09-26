@@ -5,13 +5,14 @@
 namespace frontend::postgres {
     void pipeline_state::begin_pipeline() { in_pipeline_ = true; }
 
-    void pipeline_state::set_error() {
+    bool pipeline_state::set_error() {
         if (in_pipeline_) {
             has_error_ = true;
         }
+        return in_pipeline_;
     }
 
-    bool pipeline_state::has_error() { return has_error_; }
+    bool pipeline_state::has_error() const { return has_error_; }
 
     void pipeline_state::end_pipeline() {
         in_pipeline_ = false;

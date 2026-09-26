@@ -1,0 +1,61 @@
+# Quick-start server config. OtterStax runs inside the compose network and
+# addresses the backends by their docker-DNS names. Mounted into the
+# qs-otterstax container at the server's default config path and read once at
+# startup. Only the PostgreSQL wire (8817) is published to the host — see
+# compose.yml. Edit this file and restart to change connections.
+
+service:
+  flight_sql:
+    host: "0.0.0.0"
+    port: 8815
+  mysql:
+    port: 8816
+  postgres:
+    port: 8817
+  connection_retry:
+    max_attempts: 15
+    delay_ms: 2000
+
+connections:
+  postgresql:
+    - alias: pgshop
+      host: qs-postgres-shop
+      port: "5432"
+      username: demo
+      password: demo
+      database: shop
+      schema: shop
+      table: ""
+    - alias: pgcat
+      host: qs-postgres-catalog
+      port: "5432"
+      username: demo
+      password: demo
+      database: catalog
+      schema: catalog
+      table: ""
+
+  mysql:
+    - alias: sales
+      host: qs-mariadb
+      port: "3306"
+      username: demo
+      password: demo
+      database: ops
+      table: ""
+
+  clickhouse:
+    - alias: web
+      host: qs-clickhouse
+      port: "9000"
+      username: demo
+      password: demo
+      database: analytics
+      table: ""
+
+  s3:
+    - alias: qs_s3
+      access_key: minioadmin
+      secret_key: minioadmin
+      region: us-east-1
+      endpoint: qs-minio:9000

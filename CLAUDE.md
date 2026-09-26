@@ -499,7 +499,7 @@ otterbrix-internal — shadow of `external_join_all` benchmark), all driven by
 
 ## Critical Dependency Versions
 
-- Otterbrix 1.0.0b2-rc-3 (custom Conan remote: `http://conan.otterbrix.com`; pinned by recipe revision in `conanfile.py`)
+- Otterbrix 1.0.0b2-rc-3 (custom Conan remote: `https://conan.otterbrix.com`; pinned by recipe revision in `conanfile.py`)
 - Arrow 24.0.0 (with `with_s3=True`, `with_parquet=True`, `with_csv=True`, `with_json=True`, plus snappy/brotli/zlib/lz4/zstd compression codecs)
 - Boost 1.88.0
 - actor-zeta 1.2.0

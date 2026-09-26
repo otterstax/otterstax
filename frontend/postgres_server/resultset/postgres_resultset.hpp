@@ -13,6 +13,18 @@
 #include <string>
 
 namespace frontend::postgres {
+    // True when an executed chunk goes out under exactly the wire shape
+    // `described` was announced as: the same number of columns, each under the
+    // same type OID. It is what an Execute checks before it streams rows under
+    // a RowDescription the client was given before Bind.
+    //
+    // Names are not compared. A DataRow is decoded by position and type, and an
+    // executed column legitimately carries a name the prepared schema had none
+    // for — a set operation's column, a column of a SELECT over a VIEW — so a
+    // name is no part of the shape the client decodes by.
+    bool same_wire_shape(const std::pmr::vector<components::types::complex_logical_type>& described,
+                         const components::vector::data_chunk_t& executed);
+
     class postgres_resultset {
     public:
         postgres_resultset(packet_writer& writer, bool datarow_only = false);

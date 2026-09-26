@@ -16,7 +16,11 @@ namespace frontend::postgres {
         std::vector<std::vector<uint8_t>> handle_rollback_to_savepoint(packet_writer& writer, std::string name);
         std::vector<std::vector<uint8_t>> handle_release_savepoint(packet_writer& writer, std::string name);
 
+        // The status ReadyForQuery carries: 'I' outside a block, 'T' inside
+        // one, 'E' once an error failed it.
         transaction_status get_transaction_status() const;
+        // An error inside an open block fails it ('E' until ROLLBACK or COMMIT
+        // ends it); outside a block there is nothing to fail.
         void mark_failed();
 
     private:

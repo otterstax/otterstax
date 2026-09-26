@@ -3,12 +3,15 @@ add_subdirectory(file)
 
 set(CONNECTORS_HEADERS
     mysql/connector.hpp
+    mysql/errors.hpp
     mysql/manager.hpp
     postgresql/types.hpp
     postgresql/connector.hpp
+    postgresql/errors.hpp
     postgresql/manager.hpp
     clickhouse/types.hpp
     clickhouse/connector.hpp
+    clickhouse/errors.hpp
     clickhouse/manager.hpp
     api_connections/connection_config.hpp
     api_connections/pg_connection_config.hpp

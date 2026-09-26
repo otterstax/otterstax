@@ -1,1 +1,0 @@
-INSERT INTO campaigns.db1.schema.temp_table (temp_int) VALUES (8888);

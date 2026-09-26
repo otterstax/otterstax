@@ -12,6 +12,7 @@
 
 #include <components/logical_plan/node_create_collection.hpp>
 #include <components/logical_plan/node_create_database.hpp>
+#include <components/logical_plan/node_drop.hpp>
 #include <components/logical_plan/param_storage.hpp>
 #include <components/sql/transformer/utils.hpp>
 #include <components/table/column_definition.hpp>
@@ -161,25 +162,34 @@ namespace otterstax::kafka {
         auto create = logical_plan::make_node_create_database(resource_,
                                                               core::dbname_t{std::string{KAFKA_DATABASE_NAME}},
                                                               /*if_not_exists*/ true);
-        logical_plan::node_ptr node =
-            sql::transform::maybe_wrap_with_catalog_resolve_namespace(resource_,
-                                                                      std::string{KAFKA_DATABASE_NAME},
-                                                                      create);
-        return send_plan(logical_plan::execution_plan_t{resource_, node, logical_plan::make_parameter_node(resource_)});
+        return send_plan(
+            logical_plan::execution_plan_t{resource_, create, logical_plan::make_parameter_node(resource_)});
     }
 
-    actor_zeta::unique_future<cursor::cursor_t_ptr>
-    KafkaManager::create_table(const std::string& name, std::vector<table::column_definition_t> columns) {
+    actor_zeta::unique_future<cursor::cursor_t_ptr> KafkaManager::create_table(
+        const std::string& name,
+        std::vector<table::column_definition_t> columns,
+        bool if_not_exists) {
         OTX_ZONE_N("KafkaManager::create_table");
         for (auto& col : columns) {
             col.type().set_alias(col.name());
         }
-        auto create =
-            logical_plan::make_node_create_collection(resource_, core::relname_t{name}, std::move(columns), {});
+        auto create = logical_plan::make_node_create_collection(resource_,
+                                                                core::relname_t{name},
+                                                                std::move(columns),
+                                                                {},
+                                                                if_not_exists);
         logical_plan::node_ptr node =
-            sql::transform::maybe_wrap_with_catalog_resolve_namespace(resource_,
-                                                                      std::string{KAFKA_DATABASE_NAME},
-                                                                      create);
+            sql::transform::name_catalog_target(std::string{KAFKA_DATABASE_NAME}, std::string{}, create);
+        return send_plan(logical_plan::execution_plan_t{resource_, node, logical_plan::make_parameter_node(resource_)});
+    }
+
+    actor_zeta::unique_future<cursor::cursor_t_ptr> KafkaManager::drop_table(const std::string& name) {
+        OTX_ZONE_N("KafkaManager::drop_table");
+        auto drop = logical_plan::make_node_drop(resource_, logical_plan::drop_target_kind::collection);
+        // A source's tables go together with whatever depends on them
+        drop->set_behavior(components::catalog::drop_behavior_t::cascade_);
+        logical_plan::node_ptr node = sql::transform::name_catalog_target(std::string{KAFKA_DATABASE_NAME}, name, drop);
         return send_plan(logical_plan::execution_plan_t{resource_, node, logical_plan::make_parameter_node(resource_)});
     }
 } // namespace otterstax::kafka

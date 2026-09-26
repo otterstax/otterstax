@@ -1,5 +1,6 @@
 set(COMPONENT_MANAGER_HEADERS
     component_manager.hpp
+    connection_retry.hpp
 )
 
 set(COMPONENT_MANAGER_SOURCES

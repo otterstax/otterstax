@@ -84,6 +84,29 @@ run_test "PostgreSQL Client (PostgreSQL backend)" "test_pg_client_pg_backend.py"
 run_test "MySQL Client (ClickHouse backend)" "test_mysql_client_ch_backend.py"
 run_test "PostgreSQL Client (ClickHouse backend)" "test_pg_client_ch_backend.py"
 run_test "FlightSQL Client (MySQL backend, mutable)" "test_flightsql_client_mysql_backend_mutable.py"
+# Row counts for LOCAL otterbrix DML — the extended-protocol path counted rows
+# written to the wire, of which a DML has none. Remote-DML counts are asserted
+# inside the two *_client_*_backend tests above.
+run_test "PostgreSQL Client (otterbrix-local DML row counts)" "test_pg_client_otb_local_dml.py"
+# >1024-row results (the engine caps a chunk at 1024) on every wire and writer:
+# PG simple + extended, MySQL text + binary (COM_STMT_EXECUTE), FlightSQL DoGet,
+# COPY ... TO local file and s3:// (count and row-by-row content).
+run_test "Multi-chunk results (PG, MySQL, FlightSQL wires; COPY ... TO file/s3)" "test_multichunk_frontends.py"
+# FlightSQL GetFlightInfo/DoGet contract over otterbrix-internal tables: the
+# stream carries the schema prepare resolved (a local JOIN keeps both key
+# columns), and a schema FlightInfo cannot hand out ($1 placeholder, DECIMAL
+# wider than 64 bits, HUGEINT) is refused before a ticket exists.
+run_test "FlightSQL Client (otterbrix-local schema contract)" "test_flightsql_client_otb_local.py"
+# The PG extended protocol on the raw wire (no client library in between):
+# Execute row limits / PortalSuspended, ParameterDescription, a named
+# statement executed twice and after a failure, Bind refusing a malformed
+# literal before BindComplete, binary result format codes in RowDescription.
+run_test "PostgreSQL extended protocol (raw wire)" "test_pg_extended_protocol.py"
+# The MySQL protocol on the raw wire: a result column the wire cannot encode
+# (hugeint) is an ERR packet naming it, not a dropped connection, for
+# COM_QUERY and COM_STMT_PREPARE; a statement prepared and abandoned at
+# COM_QUIT / socket drop leaves the server serving.
+run_test "MySQL wire protocol (raw socket)" "test_mysql_wire_protocol.py"
 
 # Cross-backend JOIN tests
 run_test "Cross-backend Queries (MySQL wire)" "test_cross_backend_queries_mysql.py"

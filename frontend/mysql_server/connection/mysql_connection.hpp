@@ -21,9 +21,6 @@
 
 #include <actor-zeta.hpp>
 #include <boost/asio.hpp>
-#include <boost/asio/co_spawn.hpp>
-#include <boost/asio/detached.hpp>
-#include <boost/asio/io_context.hpp>
 #include <components/sql/parser/parser.h>
 #include <components/sql/transformer/utils.hpp>
 #include <iostream>
@@ -34,17 +31,25 @@ namespace frontend::mysql {
     class mysql_connection : public frontend_connection {
     public:
         mysql_connection(std::pmr::memory_resource* resource,
-                         boost::asio::io_context& ctx,
+                         boost::asio::ip::tcp::socket&& socket,
                          uint32_t connection_id,
                          actor_zeta::address_t scheduler,
-                         std::function<void()> on_close);
+                         connection_close_sink& close_sink,
+                         size_t slot,
+                         std::chrono::milliseconds read_timeout);
 
         struct prepared_stmt_meta {
             prepared_stmt_meta(std::pmr::memory_resource* resource,
                                session_hash_t stmt_session,
+                               std::string sql,
                                uint32_t parameter_count);
 
             session_hash_t stmt_session;
+            // The worker keeps a prepared statement for exactly one execution,
+            // successful or not; every later COM_STMT_EXECUTE prepares this text
+            // again under a fresh session before executing.
+            std::pmr::string sql;
+            bool consumed;
             uint32_t parameter_count;
             std::pmr::vector<uint16_t> param_types;
         };
@@ -53,11 +58,14 @@ namespace frontend::mysql {
 
     protected:
         void start_impl() override;
+        // Closes on the Worker every prepared statement the client left
+        // unexecuted (COM_QUIT, socket drop, protocol error, timeout).
+        void finish_impl() override;
 
         log_t& get_logger_impl() override;
         uint32_t get_header_size() const override;
         uint32_t get_packet_size(const std::vector<uint8_t>& header) const override;
-        bool validate_payload_size(uint32_t& size) override;
+        bool validate_payload_size(const std::vector<uint8_t>& header, uint32_t& size) override;
 
         void handle_packet(std::vector<uint8_t> header, std::vector<uint8_t> payload) override;
         void handle_network_read_error(std::string description) override;
@@ -86,10 +94,20 @@ namespace frontend::mysql {
                               size_t num_params,
                               std::pmr::vector<uint16_t>& param_types,
                               packet_reader&& reader);
-        void handle_execute_stmt(session_hash_t id, std::pmr::vector<components::types::logical_value_t> param_values);
+        // Prepares the statement text again once the worker has consumed it.
+        // Returns false after sending the error to the client.
+        bool reprepare_stmt(prepared_stmt_meta& stmt);
+        // Drops an unexecuted statement on the Worker; a failure is logged only.
+        void close_stmt_on_worker(session_hash_t stmt_session, const char* reason);
+        void handle_execute_stmt(prepared_stmt_meta& stmt,
+                                 std::pmr::vector<components::types::logical_value_t> param_values);
 
         void send_resultset(mysql_resultset&& result);
         void send_error(mysql_error error_code, std::string message);
+        // ERR 1835 (ER_MALFORMED_PACKET) followed by the close of the
+        // connection: a packet shorter than the fields its command carries
+        // leaves nothing this client sends trustworthy.
+        void send_malformed_packet_error(std::string message);
 
         std::pmr::memory_resource* resource_;
         std::pmr::unordered_map<uint32_t, prepared_stmt_meta> statement_id_map_;

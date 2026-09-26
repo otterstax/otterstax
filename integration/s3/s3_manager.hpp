@@ -14,6 +14,7 @@
 #include <memory_resource>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <utility>
 
 namespace db {
@@ -23,24 +24,29 @@ namespace db {
         template<typename T>
         using unique_future = actor_zeta::unique_future<T>;
 
+        // s3_upload_path is the staging directory for dumped query results; it
+        // must not be empty — there is no runtime fallback.
         S3Manager(std::pmr::memory_resource* res,
                   actor_zeta::address_t s3_connector,
                   actor_zeta::address_t file_manager,
-                  std::string s3_upload_path = "/tmp/otterstax_s3_upload/");
+                  std::string_view s3_upload_path = "/tmp/otterstax_s3_upload/");
 
         std::pmr::memory_resource* resource() const noexcept { return resource_; }
 
-        actor_zeta::unique_future<core::result_wrapper_t<std::pair<bool, std::string>>>
+        // Every handler keeps the callee's error code (s3 connector / file
+        // manager) and only prefixes the message, so the Worker can report the
+        // real cause (do_not_exists, invalid_parameter, io_error, ...).
+        actor_zeta::unique_future<core::result_wrapper_t<std::pair<bool, std::pmr::string>>>
         download(session_hash_t id, std::string alias, std::string s3_path,
                  std::string database, std::string table);
 
         // Executes `statement` and uploads its result to s3_path. The query is
         // parsed upstream (e.g. the inner SELECT of COPY (...) TO 's3://...').
-        actor_zeta::unique_future<core::result_wrapper_t<std::pair<bool, std::string>>>
+        actor_zeta::unique_future<core::result_wrapper_t<std::pair<bool, std::pmr::string>>>
         upload(session_hash_t id, std::string alias, std::string s3_path,
                OtterbrixStatementPtr statement);
 
-        actor_zeta::unique_future<core::result_wrapper_t<std::pair<bool, std::string>>>
+        actor_zeta::unique_future<core::result_wrapper_t<std::pair<bool, std::pmr::string>>>
         ls(session_hash_t id, std::string alias, std::string s3_path);
 
         using dispatch_traits = actor_zeta::dispatch_traits<&S3Manager::download,
@@ -55,7 +61,7 @@ namespace db {
         std::pmr::memory_resource* resource_;
         actor_zeta::address_t      s3_connector_;
         actor_zeta::address_t      file_manager_;
-        std::string                s3_upload_path_;
+        std::pmr::string           s3_upload_path_;
         log_t                      log_;
         OTX_LOCKABLE_N(std::mutex, mutex_, "S3Manager::mutex");
         actor_zeta::behavior_t     current_behavior_;

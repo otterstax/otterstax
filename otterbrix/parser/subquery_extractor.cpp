@@ -3,6 +3,8 @@
 
 #include "subquery_extractor.hpp"
 
+#include "utility/tracy_profiler.hpp"
+
 #include <components/sql/parser/nodes/parsenodes.h>
 #include <components/sql/parser/nodes/primnodes.h>
 #include <components/sql/parser/parser.h>
@@ -29,9 +31,10 @@ namespace otterstax::parser {
         // quotes and paren nesting, return the (open, close) positions of
         // the OUTERMOST `(...)` pair that contains `interior`. The AST guarantees
         // we're looking at a real RangeSubselect
-        std::pair<int, int> find_outermost_containing_paren(std::string_view sql, int interior) {
+        std::pair<int, int>
+        find_outermost_containing_paren(std::pmr::memory_resource* resource, std::string_view sql, int interior) {
             std::pair<int, int> best{-1, -1};
-            std::vector<int> stack;
+            std::pmr::vector<int> stack{resource};
             bool in_single = false;
             bool in_double = false;
             size_t i = 0;
@@ -95,17 +98,10 @@ namespace otterstax::parser {
             return best;
         }
 
-        std::string trim(std::string s) {
-            auto first = s.find_first_not_of(" \t\n\r");
-            auto last = s.find_last_not_of(" \t\n\r");
-            if (first == std::string::npos) {
-                return {};
-            }
-            return s.substr(first, last - first + 1);
-        }
-
-        std::string first_segment(RangeVar* rv) {
-            return (rv->uid && rv->uid[0] != '\0') ? std::string{rv->uid} : std::string{};
+        // A view into the raw parse tree: valid as long as the arena it was
+        // parsed into.
+        std::string_view first_segment(RangeVar* rv) {
+            return (rv->uid && rv->uid[0] != '\0') ? std::string_view{rv->uid} : std::string_view{};
         }
 
         // Generic RangeVar walk shared by collect_qualifiers_in_subtree and
@@ -234,17 +230,19 @@ namespace otterstax::parser {
         struct subquery_location_t {
             int paren_open;
             int paren_close;
-            std::string source_uid;
+            // Points into the raw parse tree (first_segment); rewrite_with_stubs
+            // copies it into the stub while the arena is still alive.
+            std::string_view source_uid;
             bool inside_join = false;
             Node* select_stmt = nullptr; // RangeSubselect's inner SelectStmt — for qualifier walk
         };
 
-        std::string cstr_or_empty(const char* s) { return (s && s[0] != '\0') ? s : ""; }
+        const char* cstr_or_empty(const char* s) { return (s && s[0] != '\0') ? s : ""; }
 
         void collect_qualifiers_in_subtree(Node* node,
                                            std::string_view sql,
                                            int offset_base,
-                                           std::vector<qualifier_rewrite_t>& out) {
+                                           std::pmr::vector<qualifier_rewrite_t>& out) {
             for_each_range_var(node, [sql, offset_base, &out](RangeVar* rv) {
                 if (rv->location < 0 || !rv->relname || rv->relname[0] == '\0') {
                     return;
@@ -276,7 +274,7 @@ namespace otterstax::parser {
 
         void collect_subqueries(Node* node,
                                 std::string_view sql,
-                                std::vector<subquery_location_t>& out,
+                                std::pmr::vector<subquery_location_t>& out,
                                 bool inside_join = false) {
             if (!node) {
                 return;
@@ -309,7 +307,8 @@ namespace otterstax::parser {
                     if (!inside || inside->location < 0) {
                         break;
                     }
-                    auto [open_pos, close_pos] = find_outermost_containing_paren(sql, inside->location);
+                    auto [open_pos, close_pos] =
+                        find_outermost_containing_paren(out.get_allocator().resource(), sql, inside->location);
                     if (open_pos < 0) {
                         break;
                     }
@@ -327,29 +326,33 @@ namespace otterstax::parser {
             }
         }
 
-        extraction_result_t rewrite_with_stubs(std::string_view sql, std::vector<subquery_location_t> subs) {
-            extraction_result_t result;
+        extraction_result_t rewrite_with_stubs(std::pmr::memory_resource* resource,
+                                               std::string_view sql,
+                                               std::pmr::vector<subquery_location_t> subs) {
+            extraction_result_t result{std::pmr::string{resource}, std::pmr::vector<subquery_stub_t>{resource}};
             // left-to-right so stub_ids match the SQL reading order.
             std::sort(subs.begin(), subs.end(), [](const auto& a, const auto& b) {
                 return a.paren_open < b.paren_open;
             });
 
-            std::string out;
+            std::pmr::string out{resource};
             out.reserve(sql.size() + subs.size() * 64);
+            // No reallocation: every stub stays where it was built, on `resource`.
+            result.stubs.reserve(subs.size());
             int last = 0;
             int counter = 0;
             for (const auto& sub : subs) {
                 out.append(sql.substr(last, sub.paren_open - last));
 
-                std::string stub_id{k_stub_prefix};
+                std::pmr::string stub_id{k_stub_prefix, resource};
                 stub_id += std::to_string(counter++);
 
-                std::string body = std::string(sql.substr(sub.paren_open + 1, sub.paren_close - sub.paren_open - 1));
+                const std::string_view body = sql.substr(sub.paren_open + 1, sub.paren_close - sub.paren_open - 1);
 
-                subquery_stub_t stub;
-                stub.stub_id = stub_id;
-                stub.source_uid = sub.source_uid;
-                stub.raw_sql = std::move(body);
+                subquery_stub_t stub{std::pmr::string{stub_id, resource},
+                                     std::pmr::string{sub.source_uid, resource},
+                                     std::pmr::string{body, resource},
+                                     std::pmr::vector<qualifier_rewrite_t>{resource}};
                 collect_qualifiers_in_subtree(sub.select_stmt, sql, sub.paren_open + 1, stub.qualifiers);
 
                 // if in JOIN - plain stub
@@ -429,11 +432,14 @@ namespace otterstax::parser {
         // RangeVars, so the generic walker cannot see them. The part-splitting
         // below must mirror the engine's transform_drop so the registry key
         // (db, rel) matches the (dbname, relname) the transformer stamps on
-        // the catalog_resolve_table_t sibling. Only the first object is
-        // registered — transform_drop consumes only objects.front() too.
-        // removeTypes other than TABLE/INDEX transform into node types never
-        // classified external, so they need no registry entries.
-        void register_drop_stmt_names(DropStmt* stmt, otterstax::names::name_registry_t& out) {
+        // the catalog_resolve (kind==table) sibling. A DROP with several
+        // objects is rejected by parse() before resolution, so only the
+        // single object is registered. removeTypes other than TABLE/INDEX
+        // transform into drop kinds never classified external, so they need
+        // no registry entries.
+        void register_drop_stmt_names(std::pmr::memory_resource* resource,
+                                      DropStmt* stmt,
+                                      otterstax::names::name_registry_t& out) {
             if (!stmt || !stmt->objects || stmt->objects->lst.empty()) {
                 return;
             }
@@ -441,7 +447,8 @@ namespace otterstax::parser {
             if (!name_list) {
                 return;
             }
-            std::vector<std::string> parts;
+            // Pointers into the raw parse tree; qualified_name_t copies them.
+            std::pmr::vector<const char*> parts{resource};
             for (auto& cell : name_list->lst) {
                 const char* s = strVal(cell.data);
                 parts.emplace_back(s ? s : "");
@@ -499,9 +506,12 @@ namespace otterstax::parser {
         }
     } // namespace
 
-    void collect_qualified_names(::Node* root, otterstax::names::name_registry_t& out) {
+    void collect_qualified_names(std::pmr::memory_resource* resource,
+                                 ::Node* root,
+                                 otterstax::names::name_registry_t& out) {
+        OTX_ZONE_N("parser::collect_qualified_names");
         if (root && nodeTag(root) == T_DropStmt) {
-            register_drop_stmt_names(reinterpret_cast<DropStmt*>(root), out);
+            register_drop_stmt_names(resource, reinterpret_cast<DropStmt*>(root), out);
             return;
         }
         for_each_range_var(root, [&out](RangeVar* rv) {
@@ -518,42 +528,48 @@ namespace otterstax::parser {
         });
     }
 
-    extraction_result_t
-    prepare_sql(std::string_view sql, std::pmr::memory_resource* arena, ::Node** out_root_if_unmodified) {
+    extraction_result_t prepare_sql(std::string_view sql,
+                                    std::pmr::memory_resource* arena,
+                                    std::pmr::memory_resource* resource,
+                                    ::Node** out_root_if_unmodified) {
+        OTX_ZONE_N("parser::prepare_sql");
         if (out_root_if_unmodified) {
             *out_root_if_unmodified = nullptr;
         }
 
         ::List* raw = nullptr;
         try {
-            raw = raw_parser(arena, std::string(sql).c_str());
+            raw = raw_parser(arena, std::pmr::string{sql, resource}.c_str());
         } catch (...) {
-            return {std::string{sql}, {}};
+            return {std::pmr::string{sql, resource}, std::pmr::vector<subquery_stub_t>{resource}};
         }
 
-        if (!raw) {
-            return {std::string{sql}, {}};
+        // Extraction only makes sense for exactly one statement: linitial on
+        // an empty list is undefined behaviour, and a multi-statement input is
+        // left untouched for parse() to reject.
+        if (!raw || list_length(raw) != 1) {
+            return {std::pmr::string{sql, resource}, std::pmr::vector<subquery_stub_t>{resource}};
         }
 
         auto* root = reinterpret_cast<Node*>(linitial(raw));
         if (!root) {
-            return {std::string{sql}, {}};
+            return {std::pmr::string{sql, resource}, std::pmr::vector<subquery_stub_t>{resource}};
         }
 
         promote_three_part_qualifiers(root);
-        std::vector<subquery_location_t> subs;
+        std::pmr::vector<subquery_location_t> subs{resource};
         collect_subqueries(root, sql, subs);
         subs.erase(std::remove_if(subs.begin(), subs.end(), [](const auto& s) { return s.source_uid.empty(); }),
                    subs.end());
 
         if (!subs.empty()) {
-            return rewrite_with_stubs(sql, std::move(subs));
+            return rewrite_with_stubs(resource, sql, std::move(subs));
         }
 
         if (out_root_if_unmodified) {
             *out_root_if_unmodified = root;
         }
-        return {std::string{sql}, {}};
+        return {std::pmr::string{sql, resource}, std::pmr::vector<subquery_stub_t>{resource}};
     }
 
 } // namespace otterstax::parser

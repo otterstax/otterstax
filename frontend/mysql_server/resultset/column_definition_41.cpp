@@ -3,6 +3,8 @@
 
 #include "column_definition_41.hpp"
 
+#include <cassert>
+
 namespace frontend::mysql {
     constexpr uint8_t COLUMN_DEF_FIXED_FIELDS_SIZE = 0x0C;
 
@@ -86,10 +88,32 @@ namespace frontend::mysql {
                 column_length = 8;
                 charset = character_set::BINARY;
                 break;
+            case field_type::MYSQL_TYPE_NEWDECIMAL:
+                // A numeric column, so the binary charset as every other number
+                // above. The length stands for the widest DECIMAL the engine can
+                // build until apply_decimal_metadata puts the column's own
+                // (width, scale) here.
+                column_length = components::types::DECIMAL_MAX_WIDTH + 2;
+                charset = character_set::BINARY;
+                break;
             default:
                 column_length = 255;
                 charset = character_set::UTF8_GENERAL_CI;
                 break;
         }
+    }
+
+    void apply_decimal_metadata(column_definition_41& column, const components::types::complex_logical_type& type) {
+        if (type.type() != components::types::logical_type::DECIMAL) {
+            return;
+        }
+        const auto* extension = type.extension_as<components::types::decimal_logical_type_extension>();
+        // A DECIMAL always carries its (width, scale): create_decimal is the only
+        // way to build one.
+        assert(extension != nullptr && "apply_decimal_metadata: a DECIMAL column without its extension");
+        column.decimals = extension->scale();
+        // The digits, the sign, and the point when there is a fractional part —
+        // the display length MySQL reports for DECIMAL(width, scale).
+        column.column_length = extension->width() + 1u + (extension->scale() > 0 ? 1u : 0u);
     }
 } // namespace frontend::mysql

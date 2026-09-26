@@ -6,20 +6,20 @@
 //   pg_to_struct       — PGresult* schema → complex_logical_type (schema only)
 //   merge_schemas      — merge multiple column-schema vectors into one
 //   chunk_to_arrow     — data_chunk_t schema → arrow::Schema (both overloads)
-//   ChunkBatchReader   — data_chunk_t → arrow::RecordBatch (full data pipeline)
-//   mysql_to_complex   — single column-type mapping (called once per column per query)
+//   chunk_to_record_batch + ipc payload — the Flight SQL data pipeline
 //
-// mysql_to_chunk and pg_to_chunk with real row data cannot be benchmarked at unit
-// level: boost::mysql::results requires live wire-protocol data, and libpq has no
-// public API to insert synthetic rows into a PGresult.  Those paths are exercised
-// by the system tests.
+// mysql_to_chunk with real row data cannot be benchmarked at unit level:
+// boost::mysql::results requires live wire-protocol data for its ROWS. pg_to_chunk
+// rows can be manufactured through PQsetResultAttrs/PQsetvalue
+// (tests/unit/translators/pg_result_fixture.cpp); this suite measures only its
+// schema dispatch.
 
 #include "otterbrix/translators/input/ch_to_chunk.hpp"
 #include "otterbrix/translators/input/mysql_to_chunk.hpp"
-#include "otterbrix/translators/input/mysql_to_complex.hpp"
 #include "otterbrix/translators/input/pg_to_chunk.hpp"
 #include "otterbrix/translators/output/chunk_to_arrow.hpp"
-#include "frontend/flight_sql_server/batch_reader.hpp"
+
+#include <arrow/ipc/writer.h>
 
 #include <benchmark/benchmark.h>
 
@@ -33,7 +33,6 @@
 
 using namespace components::types;
 using namespace components::vector;
-using boost::mysql::column_type;
 
 namespace {
 
@@ -56,7 +55,7 @@ clickhouse::Block make_ch_block(int rows) {
 
 // Build a flat STRUCT type with N integer columns for schema-conversion benchmarks.
 complex_logical_type make_wide_struct(int ncols) {
-    std::pmr::vector<complex_logical_type> fields;
+    std::pmr::vector<complex_logical_type> fields(std::pmr::new_delete_resource());
     fields.reserve(ncols);
     for (int i = 0; i < ncols; ++i) {
         fields.emplace_back(logical_type::INTEGER);
@@ -65,15 +64,32 @@ complex_logical_type make_wide_struct(int ncols) {
     return complex_logical_type::create_struct("", std::move(fields));
 }
 
+// A schema the translator cannot map to Arrow skips the benchmark (nullptr, run
+// marked with the error) instead of measuring a stream that could never start.
+std::shared_ptr<arrow::Schema> arrow_schema_or_skip(benchmark::State& state,
+                                                    std::pmr::memory_resource* res,
+                                                    const complex_logical_type& struct_t) {
+    auto converted = to_arrow_schema(res, struct_t);
+    if (converted.has_error()) {
+        state.SkipWithError(converted.error().what.c_str());
+        return nullptr;
+    }
+    return std::move(converted.value());
+}
+
 } // namespace
 
 // ── ch_to_chunk ──────────────────────────────────────────────────────────────
 
 static void BM_ch_to_chunk_100(benchmark::State& state) {
-    auto* res = std::pmr::get_default_resource();
+    auto* res = std::pmr::new_delete_resource();
     auto block = make_ch_block(100);
     for (auto _ : state) {
         auto chunk = tsl::ch_to_chunk(res, block);
+        if (chunk.has_error()) {
+            state.SkipWithError(chunk.error().what.c_str());
+            break;
+        }
         benchmark::DoNotOptimize(chunk);
     }
     state.SetItemsProcessed(state.iterations() * 100);
@@ -81,10 +97,14 @@ static void BM_ch_to_chunk_100(benchmark::State& state) {
 BENCHMARK(BM_ch_to_chunk_100);
 
 static void BM_ch_to_chunk_1k(benchmark::State& state) {
-    auto* res = std::pmr::get_default_resource();
+    auto* res = std::pmr::new_delete_resource();
     auto block = make_ch_block(1000);
     for (auto _ : state) {
         auto chunk = tsl::ch_to_chunk(res, block);
+        if (chunk.has_error()) {
+            state.SkipWithError(chunk.error().what.c_str());
+            break;
+        }
         benchmark::DoNotOptimize(chunk);
     }
     state.SetItemsProcessed(state.iterations() * 1000);
@@ -92,10 +112,14 @@ static void BM_ch_to_chunk_1k(benchmark::State& state) {
 BENCHMARK(BM_ch_to_chunk_1k);
 
 static void BM_ch_to_chunk_10k(benchmark::State& state) {
-    auto* res = std::pmr::get_default_resource();
+    auto* res = std::pmr::new_delete_resource();
     auto block = make_ch_block(10000);
     for (auto _ : state) {
         auto chunk = tsl::ch_to_chunk(res, block);
+        if (chunk.has_error()) {
+            state.SkipWithError(chunk.error().what.c_str());
+            break;
+        }
         benchmark::DoNotOptimize(chunk);
     }
     state.SetItemsProcessed(state.iterations() * 10000);
@@ -103,10 +127,14 @@ static void BM_ch_to_chunk_10k(benchmark::State& state) {
 BENCHMARK(BM_ch_to_chunk_10k);
 
 static void BM_ch_to_chunk_100k(benchmark::State& state) {
-    auto* res = std::pmr::get_default_resource();
+    auto* res = std::pmr::new_delete_resource();
     auto block = make_ch_block(100000);
     for (auto _ : state) {
         auto chunk = tsl::ch_to_chunk(res, block);
+        if (chunk.has_error()) {
+            state.SkipWithError(chunk.error().what.c_str());
+            break;
+        }
         benchmark::DoNotOptimize(chunk);
     }
     state.SetItemsProcessed(state.iterations() * 100000);
@@ -115,10 +143,14 @@ BENCHMARK(BM_ch_to_chunk_100k);
 
 // Multi-block: two blocks of 5 000 rows each = 10 000 total.
 static void BM_ch_to_chunk_multiblock_10k(benchmark::State& state) {
-    auto* res = std::pmr::get_default_resource();
+    auto* res = std::pmr::new_delete_resource();
     std::vector<clickhouse::Block> blocks{make_ch_block(5000), make_ch_block(5000)};
     for (auto _ : state) {
         auto chunk = tsl::ch_to_chunk(res, blocks);
+        if (chunk.has_error()) {
+            state.SkipWithError(chunk.error().what.c_str());
+            break;
+        }
         benchmark::DoNotOptimize(chunk);
     }
     state.SetItemsProcessed(state.iterations() * 10000);
@@ -127,7 +159,7 @@ BENCHMARK(BM_ch_to_chunk_multiblock_10k);
 
 // Schema extraction only (no row data).
 static void BM_ch_to_struct(benchmark::State& state) {
-    auto* res  = std::pmr::get_default_resource();
+    auto* res  = std::pmr::new_delete_resource();
     auto block = make_ch_block(0); // zero rows, schema present
     for (auto _ : state) {
         auto s = tsl::ch_to_struct(res, block);
@@ -141,7 +173,7 @@ BENCHMARK(BM_ch_to_struct);
 static void BM_chunk_to_arrow_schema_10col(benchmark::State& state) {
     auto struct_t = make_wide_struct(10);
     for (auto _ : state) {
-        auto schema = to_arrow_schema(struct_t);
+        auto schema = to_arrow_schema(std::pmr::new_delete_resource(), struct_t);
         benchmark::DoNotOptimize(schema);
     }
 }
@@ -150,41 +182,17 @@ BENCHMARK(BM_chunk_to_arrow_schema_10col);
 static void BM_chunk_to_arrow_schema_50col(benchmark::State& state) {
     auto struct_t = make_wide_struct(50);
     for (auto _ : state) {
-        auto schema = to_arrow_schema(struct_t);
+        auto schema = to_arrow_schema(std::pmr::new_delete_resource(), struct_t);
         benchmark::DoNotOptimize(schema);
     }
 }
 BENCHMARK(BM_chunk_to_arrow_schema_50col);
 
-// ── mysql_to_complex (called once per column per query) ────────────────────
-
-static void BM_mysql_type_mapping_all(benchmark::State& state) {
-    static const std::vector<std::pair<column_type, bool>> cases = {
-        {column_type::tinyint,  false}, {column_type::tinyint,   true},
-        {column_type::smallint, false}, {column_type::smallint,  true},
-        {column_type::int_,     false}, {column_type::int_,      true},
-        {column_type::bigint,   false}, {column_type::bigint,    true},
-        {column_type::float_,   false}, {column_type::double_,   false},
-        {column_type::bit,      false},
-        {column_type::varchar,  false}, {column_type::blob,      false},
-    };
-    for (auto _ : state) {
-        for (auto& [ct, us] : cases) {
-            auto t = tsl::mysql_to_complex(ct, us);
-            benchmark::DoNotOptimize(t);
-        }
-    }
-    state.SetItemsProcessed(state.iterations() * static_cast<int64_t>(cases.size()));
-}
-BENCHMARK(BM_mysql_type_mapping_all);
-
 // ── pg_to_struct (schema extraction only) ────────────────────────────────────
-// Row-level pg_to_chunk is not benchmarkable at unit level: libpq provides no
-// public API to insert synthetic rows into a PGresult (see tests/unit/translators/
-// test_pg_to_chunk.cpp).  This measures the schema-dispatch overhead alone.
+// Measures the schema-dispatch overhead alone on an empty PGresult.
 
 static void BM_pg_to_struct(benchmark::State& state) {
-    auto*     res = std::pmr::get_default_resource();
+    auto*     res = std::pmr::new_delete_resource();
     PGresult* r   = PQmakeEmptyPGresult(nullptr, PGRES_TUPLES_OK);
     for (auto _ : state) {
         auto s = tsl::pg_to_struct(res, r);
@@ -244,84 +252,125 @@ BENCHMARK(BM_merge_schemas_5x6col);
 // the overload called from the MySQL and PostgreSQL frontend result-set writers.
 
 static void BM_chunk_to_arrow_schema_vec_10col(benchmark::State& state) {
-    std::pmr::vector<complex_logical_type> types;
+    std::pmr::vector<complex_logical_type> types(std::pmr::new_delete_resource());
     types.reserve(10);
     for (int i = 0; i < 10; ++i) {
         types.emplace_back(logical_type::INTEGER);
         types.back().set_alias("col_" + std::to_string(i));
     }
     for (auto _ : state) {
-        auto schema = to_arrow_schema(types);
+        auto schema = to_arrow_schema(std::pmr::new_delete_resource(), types);
         benchmark::DoNotOptimize(schema);
     }
 }
 BENCHMARK(BM_chunk_to_arrow_schema_vec_10col);
 
 static void BM_chunk_to_arrow_schema_vec_50col(benchmark::State& state) {
-    std::pmr::vector<complex_logical_type> types;
+    std::pmr::vector<complex_logical_type> types(std::pmr::new_delete_resource());
     types.reserve(50);
     for (int i = 0; i < 50; ++i) {
         types.emplace_back(logical_type::INTEGER);
         types.back().set_alias("col_" + std::to_string(i));
     }
     for (auto _ : state) {
-        auto schema = to_arrow_schema(types);
+        auto schema = to_arrow_schema(std::pmr::new_delete_resource(), types);
         benchmark::DoNotOptimize(schema);
     }
 }
 BENCHMARK(BM_chunk_to_arrow_schema_vec_50col);
 
-// ── ChunkBatchReader::ReadNext (full data chunk → Arrow RecordBatch) ─────────
-// This is the hot path for every result delivered via the FlightSQL frontend.
-// data_chunk_t is not copyable, so the ClickHouse block is kept outside the loop
-// and ch_to_chunk is re-run each iteration.  The reported time therefore includes
-// both ch_to_chunk and the Arrow serialisation; use BM_ch_to_chunk_* to isolate
-// the former.
+// ── chunks_to_ipc (full data chunk → Flight SQL IPC batch) ───────────────────
+// This is the hot path for every result delivered via the FlightSQL frontend:
+// the chunk run converts to the IPC model and the batches serialize to the
+// messages DoGet streams. data_chunk_t is not copyable, so the ClickHouse block
+// is kept outside the loop and ch_to_chunk is re-run each iteration, its chunk
+// handed to the converter as a one-element payload. The reported time therefore
+// includes both ch_to_chunk and the IPC serialisation; use BM_ch_to_chunk_* to
+// isolate the former.
 
-static void BM_chunk_to_arrow_full_100(benchmark::State& state) {
-    auto* res = std::pmr::get_default_resource();
+static void BM_flight_wire_full_100(benchmark::State& state) {
+    auto* res = std::pmr::new_delete_resource();
     auto block = make_ch_block(100);
-    auto schema = to_arrow_schema(tsl::ch_to_struct(res, block));
+    auto struct_t = tsl::ch_to_struct(res, block);
+    auto schema = arrow_schema_or_skip(state, res, struct_t);
+    if (!schema) {
+        return;
+    }
+    const auto options = arrow::ipc::IpcWriteOptions::Defaults();
     for (auto _ : state) {
-        auto chunk = tsl::ch_to_chunk(res, block);
-        auto reader = ChunkBatchReader::Make(schema, std::move(chunk)).ValueOrDie();
-        std::shared_ptr<arrow::RecordBatch> batch;
-        auto status = reader->ReadNext(&batch);
+        auto converted = tsl::ch_to_chunk(res, block);
+        if (converted.has_error()) {
+            state.SkipWithError(converted.error().what.c_str());
+            break;
+        }
+        auto batch = chunk_to_record_batch(res, converted.value());
+        if (batch.has_error()) {
+            state.SkipWithError(batch.error().what.c_str());
+            break;
+        }
+        arrow::ipc::IpcPayload payload;
+        auto status = arrow::ipc::GetRecordBatchPayload(*batch.value(), options, &payload);
         benchmark::DoNotOptimize(status);
-        benchmark::DoNotOptimize(batch);
+        benchmark::DoNotOptimize(payload.metadata);
     }
     state.SetItemsProcessed(state.iterations() * 100);
 }
-BENCHMARK(BM_chunk_to_arrow_full_100);
+BENCHMARK(BM_flight_wire_full_100);
 
-static void BM_chunk_to_arrow_full_1k(benchmark::State& state) {
-    auto* res = std::pmr::get_default_resource();
+static void BM_flight_wire_full_1k(benchmark::State& state) {
+    auto* res = std::pmr::new_delete_resource();
     auto block = make_ch_block(1000);
-    auto schema = to_arrow_schema(tsl::ch_to_struct(res, block));
+    auto struct_t = tsl::ch_to_struct(res, block);
+    auto schema = arrow_schema_or_skip(state, res, struct_t);
+    if (!schema) {
+        return;
+    }
+    const auto options = arrow::ipc::IpcWriteOptions::Defaults();
     for (auto _ : state) {
-        auto chunk = tsl::ch_to_chunk(res, block);
-        auto reader = ChunkBatchReader::Make(schema, std::move(chunk)).ValueOrDie();
-        std::shared_ptr<arrow::RecordBatch> batch;
-        auto status = reader->ReadNext(&batch);
+        auto converted = tsl::ch_to_chunk(res, block);
+        if (converted.has_error()) {
+            state.SkipWithError(converted.error().what.c_str());
+            break;
+        }
+        auto batch = chunk_to_record_batch(res, converted.value());
+        if (batch.has_error()) {
+            state.SkipWithError(batch.error().what.c_str());
+            break;
+        }
+        arrow::ipc::IpcPayload payload;
+        auto status = arrow::ipc::GetRecordBatchPayload(*batch.value(), options, &payload);
         benchmark::DoNotOptimize(status);
-        benchmark::DoNotOptimize(batch);
+        benchmark::DoNotOptimize(payload.metadata);
     }
     state.SetItemsProcessed(state.iterations() * 1000);
 }
-BENCHMARK(BM_chunk_to_arrow_full_1k);
+BENCHMARK(BM_flight_wire_full_1k);
 
-static void BM_chunk_to_arrow_full_10k(benchmark::State& state) {
-    auto* res = std::pmr::get_default_resource();
+static void BM_flight_wire_full_10k(benchmark::State& state) {
+    auto* res = std::pmr::new_delete_resource();
     auto block = make_ch_block(10000);
-    auto schema = to_arrow_schema(tsl::ch_to_struct(res, block));
+    auto struct_t = tsl::ch_to_struct(res, block);
+    auto schema = arrow_schema_or_skip(state, res, struct_t);
+    if (!schema) {
+        return;
+    }
+    const auto options = arrow::ipc::IpcWriteOptions::Defaults();
     for (auto _ : state) {
-        auto chunk = tsl::ch_to_chunk(res, block);
-        auto reader = ChunkBatchReader::Make(schema, std::move(chunk)).ValueOrDie();
-        std::shared_ptr<arrow::RecordBatch> batch;
-        auto status = reader->ReadNext(&batch);
+        auto converted = tsl::ch_to_chunk(res, block);
+        if (converted.has_error()) {
+            state.SkipWithError(converted.error().what.c_str());
+            break;
+        }
+        auto batch = chunk_to_record_batch(res, converted.value());
+        if (batch.has_error()) {
+            state.SkipWithError(batch.error().what.c_str());
+            break;
+        }
+        arrow::ipc::IpcPayload payload;
+        auto status = arrow::ipc::GetRecordBatchPayload(*batch.value(), options, &payload);
         benchmark::DoNotOptimize(status);
-        benchmark::DoNotOptimize(batch);
+        benchmark::DoNotOptimize(payload.metadata);
     }
     state.SetItemsProcessed(state.iterations() * 10000);
 }
-BENCHMARK(BM_chunk_to_arrow_full_10k);
+BENCHMARK(BM_flight_wire_full_10k);

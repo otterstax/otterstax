@@ -21,21 +21,29 @@ namespace otterstax::parser {
         qualified_name_t name;
     };
 
+    // Every string and container is allocated from the resource prepare_sql
+    // was given. A copy must name its resource explicitly: a pmr container
+    // copy-constructed without one takes the process default resource.
     struct subquery_stub_t {
-        std::string stub_id;
-        std::string source_uid;
-        std::string raw_sql;
+        std::pmr::string stub_id;
+        std::pmr::string source_uid;
+        std::pmr::string raw_sql;
 
-        std::vector<qualifier_rewrite_t> qualifiers;
+        std::pmr::vector<qualifier_rewrite_t> qualifiers;
     };
 
     struct extraction_result_t {
-        std::string modified_sql;
-        std::vector<subquery_stub_t> stubs;
+        std::pmr::string modified_sql;
+        std::pmr::vector<subquery_stub_t> stubs;
     };
 
-    extraction_result_t
-    prepare_sql(std::string_view sql, std::pmr::memory_resource* arena, ::Node** out_root_if_unmodified = nullptr);
+    // `arena` receives the raw parse tree (*out_root_if_unmodified points into
+    // it); `resource` owns the returned extraction, which never points into
+    // the arena.
+    extraction_result_t prepare_sql(std::string_view sql,
+                                    std::pmr::memory_resource* arena,
+                                    std::pmr::memory_resource* resource,
+                                    ::Node** out_root_if_unmodified = nullptr);
 
     void promote_three_part_qualifiers(::Node* root);
 
@@ -43,8 +51,10 @@ namespace otterstax::parser {
     // fully-qualified name (uid.catalogname.schemaname.relname) of EVERY
     // RangeVar — uid-qualified AND local — plus DROP TABLE / DROP INDEX name
     // lists, so the transformed logical plan's (dbname, relname) pairs can be
-    // resolved back to full names.
-    void collect_qualified_names(::Node* root, otterstax::names::name_registry_t& out);
+    // resolved back to full names. `resource` backs the walk's scratch storage.
+    void collect_qualified_names(std::pmr::memory_resource* resource,
+                                 ::Node* root,
+                                 otterstax::names::name_registry_t& out);
 
     constexpr std::string_view k_stub_prefix = "__otterstax_subq_";
 

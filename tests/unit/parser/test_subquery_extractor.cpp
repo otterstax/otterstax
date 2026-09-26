@@ -3,7 +3,7 @@
 
 #include "otterbrix/parser/subquery_extractor.hpp"
 
-#include <catch2/catch.hpp>
+#include <catch2/catch_all.hpp>
 
 #include <memory_resource>
 #include <string>
@@ -20,11 +20,11 @@ namespace {
     // it relies on the caller passing an arena that dies at end of parse. Using
     // the default (new_delete) resource leaks the full parse tree (LSAN trips).
     // Mirror parser.cpp:294 and discard a monotonic arena per call; the
-    // `extraction_result_t` return is by-value (std::string / std::vector) and
-    // does not point into the arena.
+    // `extraction_result_t` return is allocated from the separate result
+    // resource (new_delete here) and does not point into the arena.
     extraction_result_t prep(std::string_view sql) {
-        std::pmr::monotonic_buffer_resource arena;
-        return prepare_sql(sql, &arena);
+        std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
+        return prepare_sql(sql, &arena, std::pmr::new_delete_resource());
     }
 } // namespace
 
@@ -35,7 +35,7 @@ TEST_CASE("subquery in FROM") {
 
     REQUIRE(r.stubs.size() == 1);
     REQUIRE(r.stubs[0].source_uid == "mysql");
-    REQUIRE(r.stubs[0].stub_id == stub_id(0));
+    REQUIRE(std::string_view{r.stubs[0].stub_id} == stub_id(0));
 
     SECTION("source uid first") { REQUIRE(r.modified_sql.find("mysql.subq.subq." + stub_id(0)) != std::string::npos); }
 
@@ -76,9 +76,9 @@ TEST_CASE("subqueries from different sources") {
 
     REQUIRE(r.stubs.size() == 2);
     REQUIRE(r.stubs[0].source_uid == "ch");
-    REQUIRE(r.stubs[0].stub_id == stub_id(0));
+    REQUIRE(std::string_view{r.stubs[0].stub_id} == stub_id(0));
     REQUIRE(r.stubs[1].source_uid == "mysql");
-    REQUIRE(r.stubs[1].stub_id == stub_id(1));
+    REQUIRE(std::string_view{r.stubs[1].stub_id} == stub_id(1));
 
     REQUIRE(r.stubs[0].raw_sql.find("FROM ch.ev.sessions") != std::string::npos);
     REQUIRE(r.stubs[1].raw_sql.find("FROM mysql.bill.orders") != std::string::npos);
@@ -159,6 +159,31 @@ TEST_CASE("DDL/DML untouched") {
         auto r = prep("UPDATE mysql.bill.orders SET status = 'paid';");
         REQUIRE(r.stubs.empty());
     }
+}
+
+TEST_CASE("input without a statement is returned untouched") {
+    // The grammar yields an empty statement list for these; extraction has
+    // nothing to walk and must not read a first statement that is not there.
+    SECTION("lone terminator") {
+        auto r = prep(";");
+        REQUIRE(r.stubs.empty());
+        REQUIRE(r.modified_sql == ";");
+    }
+    SECTION("comment only") {
+        auto r = prep("-- c");
+        REQUIRE(r.stubs.empty());
+        REQUIRE(r.modified_sql == "-- c");
+    }
+}
+
+TEST_CASE("several statements are returned untouched for parse() to reject") {
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
+    ::Node* root = nullptr;
+    auto r = prepare_sql("SELECT * FROM (SELECT id FROM mysql.bill.orders) o; SELECT 2;", &arena, &arena, &root);
+    REQUIRE(r.stubs.empty());
+    REQUIRE(r.modified_sql == "SELECT * FROM (SELECT id FROM mysql.bill.orders) o; SELECT 2;");
+    // No reusable root either: the caller re-parses and sees the full list.
+    REQUIRE(root == nullptr);
 }
 
 TEST_CASE("local references") {

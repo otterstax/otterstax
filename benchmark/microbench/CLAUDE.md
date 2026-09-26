@@ -31,7 +31,7 @@ Synthetic block: 3 columns — Int32 `id`, Float64 `score`, String `name`.
 |-----------|-------|
 | `BM_pg_to_struct` | Empty `PGresult*` (0 cols, 0 rows) — measures dispatch overhead only |
 
-**Why no row data:** libpq has no public API to insert synthetic rows into a `PGresult` without a live wire-protocol connection. Row-level `pg_to_chunk` is exercised by the system tests (`tests/system/`).
+**Why no row data:** the suite measures schema dispatch only. Row-level `pg_to_chunk` is unit-tested on manufactured results (`tests/unit/translators/pg_result_fixture.cpp`, via `PQsetResultAttrs`/`PQsetvalue`) and exercised end to end by the system tests (`tests/system/`).
 
 #### `merge_schemas` — unify multiple column-schema vectors
 
@@ -65,15 +65,19 @@ The vector overload is the one called by the MySQL and PostgreSQL wire-protocol 
 
 This is the hot path for every query result delivered over the FlightSQL frontend. The schema is pre-built outside the loop; `ch_to_chunk` runs inside the loop because `data_chunk_t` is not copyable (move-only). **The reported time therefore includes both `ch_to_chunk` and the Arrow builder pass.** Use `BM_ch_to_chunk_*` to isolate the former.
 
-#### `mysql_to_complex` — MySQL column-type mapping
+#### MySQL column-type mapping — no separate benchmark
 
-| Benchmark | Notes |
-|-----------|-------|
-| `BM_mysql_type_mapping_all` | All 13 type/signedness combinations in one iteration |
+The MySQL mapping has one table (`to_local_translator`, internal to
+`mysql_to_chunk.cpp`): each arm names both the engine type a column is read as and
+the reader that writes its values, so there is no standalone enum → type function
+to measure. It is exercised once per column per query by `mysql_to_chunk` and by
+`tsl::mysql_to_struct`, the schema discovery reads off the same table.
 
-`tsl::mysql_to_complex` is called once per column per query when the MySQL connector builds its translator table. The batch exercises every branch of the switch.
-
-**Why no `mysql_to_chunk`:** `boost::mysql::results` must be populated via the live wire protocol; no test-construction API exists. Row-level MySQL translation is covered by system tests.
+**Why no `mysql_to_chunk`:** a `boost::mysql::results` carrying ROWS must be
+populated via the live wire protocol. Its column definitions alone can be
+manufactured through `boost::mysql::detail::access`
+(`tests/unit/translators/test_mysql_types.cpp`), which is what the type table is
+pinned with; row-level MySQL translation is covered by system tests.
 
 ---
 
@@ -185,7 +189,7 @@ Mirrors the exact runtime sequence: one `prepare_sql` call followed by one `repl
 
 #### `table_reference` — backend-specific table name formatting
 
-Measures `sql_gen::table_reference(qualified_name_t, backend_type_t)` in isolation. Called once per table per query to produce `db.table` (MySQL) or `schema.table` (PG/CH) references.
+Measures `sql_gen::table_reference(qualified_name_t, backend_type_t, memory_resource*)` in isolation. Called once per table per query to produce `db.table` (MySQL/CH) or `schema.table` (PG) references.
 
 | Benchmark | Backend |
 |-----------|---------|
@@ -256,7 +260,7 @@ by const ref). Links `kafka_runtime` (a separate `target_link_libraries` call in
 | Function | Reason | Covered by |
 |----------|--------|------------|
 | `tsl::mysql_to_chunk` | `boost::mysql::results` requires live wire data | System tests |
-| `tsl::pg_to_chunk` (with rows) | libpq has no public row-insertion API for synthetic `PGresult` | System tests |
+| `tsl::pg_to_chunk` (with rows) | not benchmarked; rows are manufactured only in the unit tests (`pg_result_fixture.cpp`) | Unit + system tests |
 | `sql_gen::generate_query` | Requires Otterbrix logical-plan `node_ptr`, not exposed at unit level | System tests |
 | `ChunkBatchReader::ReadNext` in isolation | `data_chunk_t` is non-copyable; `ch_to_chunk` is bundled in the loop | `BM_ch_to_chunk_*` for input, `BM_chunk_to_arrow_full_*` for combined |
 
@@ -266,7 +270,7 @@ by const ref). Links `kafka_runtime` (a separate `target_link_libraries` call in
 
 ### Translator benchmark (`bench_translators.cpp`)
 
-1. Use `make_ch_block(N)` + `tsl::ch_to_chunk(res, block)` to get a synthetic `data_chunk_t`.
+1. Use `make_ch_block(N)` + `tsl::ch_to_chunk(res, block)` to get a synthetic `data_chunk_t`. It answers `core::result_wrapper_t<data_chunk_t>` (`conversion_failure` for a value with no reading as its column's type): check `has_error()` and end the run with `state.SkipWithError(result.error().what.c_str())` before taking `value()`, as the `BM_ch_to_chunk_*` benchmarks do. The overload with named-type overrides applies an override only to a wire column that represents its type (see `otterbrix/CLAUDE.md`).
 2. `data_chunk_t` is **non-copyable**. If you need N iterations over the same data, either hold a `clickhouse::Block` outside the loop and call `ch_to_chunk` inside, or redesign to avoid copies.
 3. If the benchmark needs `GreenplumParser` (e.g., testing a path that touches the parser), include `utility/logger.hpp` and add a `LoggerInit` guard as in `bench_parser.cpp` — the parser requires named spdlog loggers to be registered.
 

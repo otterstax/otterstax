@@ -22,19 +22,14 @@ namespace frontend::postgres {
     }
 
     std::vector<std::vector<uint8_t>> transaction_manager::handle_commit(packet_writer& writer) {
-        if (state_ == transaction_status::TRANSACTION_ERROR) {
-            return {
-                build_error_response(writer,
-                                     sql_state::IN_FAILED_SQL_TRANSACTION,
-                                     "Current transaction is aborted, commands ignored until end of transaction block",
-                                     error_severity::error()),
-                build_ready_for_query(writer, state_)};
-        }
-
-        // successful in postgres (even if were IDLE)
+        // As in PostgreSQL, COMMIT of a failed block ends it as a rollback
+        // (tag ROLLBACK, no error), and COMMIT outside a block succeeds.
+        const bool failed = state_ == transaction_status::TRANSACTION_ERROR;
         state_ = transaction_status::IDLE;
         savepoints_.clear();
-        return {build_command_complete(writer, command_complete_tag::commit()), build_ready_for_query(writer, state_)};
+        return {build_command_complete(writer,
+                                       failed ? command_complete_tag::rollback() : command_complete_tag::commit()),
+                build_ready_for_query(writer, state_)};
     }
 
     std::vector<std::vector<uint8_t>> transaction_manager::handle_rollback(packet_writer& writer) {
@@ -112,5 +107,9 @@ namespace frontend::postgres {
 
     transaction_status transaction_manager::get_transaction_status() const { return state_; }
 
-    void transaction_manager::mark_failed() { state_ = transaction_status::TRANSACTION_ERROR; }
+    void transaction_manager::mark_failed() {
+        if (state_ == transaction_status::IN_TRANSACTION) {
+            state_ = transaction_status::TRANSACTION_ERROR;
+        }
+    }
 } // namespace frontend::postgres

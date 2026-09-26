@@ -7,8 +7,11 @@
 #include "integration/otterbrix/otterbrix_manager.hpp"
 #include "integration/postgresql/connection_manager.hpp"
 #include "integration/sql/connection_manager.hpp"
+#include "otterbrix/schema/schema_utils.hpp"
 #include "scheduler/session_data.hpp"
 #include "scheduler/scheduler.hpp"
+#include "scheduler_stack.hpp"
+#include "test_helpers.hpp"
 #include "utility/wait_barrier.hpp"
 
 #include "../mock/ch_db_connector.hpp"
@@ -25,62 +28,132 @@
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/detached.hpp>
 #include <boost/asio/io_context.hpp>
+#include <clickhouse/columns/numeric.h>
+#include <clickhouse/columns/string.h>
+#include <components/logical_plan/node_data.hpp>
 #include <core/result_wrapper.hpp>
 #include <otterbrix/otterbrix.hpp>
 
-#include <catch2/catch.hpp>
+#include <catch2/catch_all.hpp>
 #include <chrono>
 #include <future>
 #include <stdexcept>
+#include <string>
 #include <thread>
 #include <vector>
 
 namespace {
+    // Worker pool, session-future bridge and pool sizing are the ones every
+    // system test shares (scheduler_stack.hpp); the default-config engine, the
+    // mock MySQL connect params and the future polling come from test_helpers.hpp.
+    using otterstax::test::await_session;
+    using otterstax::test::init_default_test_otterbrix;
+    using otterstax::test::make_az_scheduler;
+    using otterstax::test::mock_connect_params;
+    using otterstax::test::poll_until_ready;
+    using otterstax::test::worker_pool_size;
 
-    db::otterbrix_engine_ptr init_otterbrix() {
-        auto config = configuration::config::default_config();
-        auto log_path = config.log.path.string();
-        initialize_all_loggers(log_path);
-        return db::make_otterbrix_engine(std::move(config));
+    // connector_factory is a plain function pointer, so the delay is a
+    // namespace constant rather than captured state.
+    constexpr auto SLOW_WAIT = std::chrono::milliseconds(300);
+
+    std::unique_ptr<mysql::IConnector> mysql_mock_connector_factory_slow(std::pmr::memory_resource* resource,
+                                                                        boost::asio::io_context&,
+                                                                        boost::mysql::connect_params,
+                                                                        std::string alias) {
+        return std::make_unique<mysql::MockConnector>(mock_config{.resource = resource, .wait_time = SLOW_WAIT},
+                                                      std::move(alias));
     }
 
-    auto mysql_mock_connector_factory_slow(std::pmr::memory_resource* resource,
-                                           std::chrono::milliseconds wait_time) {
-        return [resource, wait_time](boost::asio::io_context&,
-                                     boost::mysql::connect_params,
-                                     std::string alias) {
-            return std::make_unique<mysql::MockConnector>(
-                mock_config{.resource = resource, .wait_time = wait_time},
-                std::move(alias));
-        };
+    // How long a test thread polls a cross-actor future; poll_until_ready
+    // asserts nothing, so it is safe off the main thread.
+    constexpr auto THREAD_POLL_TIMEOUT = std::chrono::seconds(30);
+
+    // What a test thread records about one message it sent: Catch2 assertions
+    // are not thread-safe, so the verdicts are checked after the join.
+    struct thread_verdict {
+        bool ok{false};
+        std::string what;
+        size_t rows{0};
+    };
+
+    // The single external slot of the mock parser's statement, rewritten as a
+    // schema node carrying raw backend SQL — what the catalog produces for a
+    // SELECT — so a backend actor's execute runs it against uid "1".
+    ParsedQueryDataPtr raw_select_statement(std::pmr::memory_resource* resource) {
+        SimpleMockParser parser(mock_config{.resource = resource});
+        auto parsed = parser.parse("SELECT 1");
+        if (parsed.has_error()) {
+            return nullptr;
+        }
+        auto data = std::move(parsed.value());
+        auto& slot = data->otterbrix_params->external_nodes.front().front();
+        *slot.node = schema_utils::make_node_schema_raw(resource, slot.target.name, "SELECT 1", {});
+        return data;
     }
 
-    std::unique_ptr<actor_zeta::scheduler::sharing_scheduler> make_az_scheduler() {
-        auto sched = std::make_unique<actor_zeta::scheduler::sharing_scheduler>(
-            std::max<std::size_t>(2, std::thread::hardware_concurrency()),
-            /*max_throughput*/ 1000);
-        sched->start();
-        return sched;
+    const data_chunk_t* fetched_slot(const ParsedQueryDataPtr& data) {
+        const auto& slot = data->otterbrix_params->external_nodes.front().front();
+        if ((*slot.node)->type() != components::logical_plan::node_type::data_t) {
+            return nullptr;
+        }
+        return &static_cast<const components::logical_plan::node_data_t&>(**slot.node).data_chunk();
     }
 
-    // Drive a Scheduler-returned actor-zeta future from a test thread. The
-    // working-tree bridge (frontend/common/asio_future_bridge.hpp) exposes
-    // async_await_future, an exception-free poll over the 1.2.0 future API
-    // (is_ready()/failed()/take_ready() — no blocking get(), no cancel()).
-    core::result_wrapper_t<session_payload>
-    await_session(actor_zeta::unique_future<core::result_wrapper_t<session_payload>> fut,
-                  std::chrono::milliseconds timeout,
-                  std::pmr::memory_resource* resource) {
-        core::result_wrapper_t<session_payload> r{resource};
-        boost::asio::io_context local;
-        boost::asio::co_spawn(
-            local,
-            [&]() -> boost::asio::awaitable<void> {
-                r = co_await otterstax::async_await_future(std::move(fut), timeout);
-            },
-            boost::asio::detached);
-        local.run();
-        return r;
+    // ClickHouse connector for the concurrency case: every metadata query
+    // (named types, schema probe) is answered with a 0-row header block, every
+    // data query with no blocks.
+    clickhouse::Block ch_header_block() {
+        clickhouse::Block block;
+        block.AppendColumn("id", std::make_shared<clickhouse::ColumnInt32>());
+        block.AppendColumn("name", std::make_shared<clickhouse::ColumnString>());
+        return block;
+    }
+
+    class ch_header_connector final : public ch::IConnector {
+    public:
+        ch_header_connector(ch::connect_params params, std::string alias)
+            : params_(std::move(params))
+            , alias_(std::move(alias)) {}
+
+        ch::Status status() const noexcept override { return ch::Status::Connected; }
+        ch::connect_params params() const noexcept override { return params_; }
+        void close() override {}
+        core::error_t connect() override { return core::error_t::no_error(); }
+        bool isConnected() override { return true; }
+        core::error_t tryReconnect() override { return core::error_t::no_error(); }
+        bool isClosed() const noexcept override { return false; }
+        std::string alias() const noexcept override { return alias_; }
+
+        boost::asio::awaitable<core::result_wrapper_t<std::unique_ptr<data_chunk_t>>>
+        runQuery(std::string_view,
+                 otterstax::function_ref_t<std::unique_ptr<data_chunk_t>(const ch::select_result_t&)> handler)
+            override {
+            ch::select_result_t outcome;
+            co_return handler(outcome);
+        }
+
+        boost::asio::awaitable<core::result_wrapper_t<int64_t>>
+        runQuery(std::string_view, otterstax::function_ref_t<int64_t(const ch::select_result_t&)>) override {
+            co_return int64_t{0};
+        }
+
+        boost::asio::awaitable<core::error_t>
+        runQuery(std::string_view,
+                 otterstax::function_ref_t<otterstax::asio_error_t(const ch::select_result_t&)> handler) override {
+            ch::select_result_t probe;
+            probe.blocks.push_back(ch_header_block());
+            co_return otterstax::as_query_result<otterstax::asio_error_t>(handler(probe));
+        }
+
+    private:
+        ch::connect_params params_;
+        std::string alias_;
+    };
+
+    std::unique_ptr<ch::IConnector>
+    ch_header_connector_factory(std::pmr::memory_resource*, ch::connect_params params, std::string alias) {
+        return std::make_unique<ch_header_connector>(std::move(params), std::move(alias));
     }
 
 } // namespace
@@ -94,7 +167,7 @@ TEST_CASE("scheduler handles N parallel sessions without hanging") {
     constexpr size_t N = 32;
     constexpr auto WAIT_TIMEOUT = 60000ms;
 
-    db::otterbrix_engine_ptr otterbrix = init_otterbrix();
+    db::otterbrix_engine_ptr otterbrix = init_default_test_otterbrix();
     auto resource = otterbrix->dispatcher()->resource();
     REQUIRE(resource != nullptr);
 
@@ -109,23 +182,23 @@ TEST_CASE("scheduler handles N parallel sessions without hanging") {
                                                     mock_config{.resource = resource}));
     auto catalog_manager = actor_zeta::spawn<mysql::CatalogManager>(resource, otterbrix_manager->address());
     auto mysql_conn_manager =
-        std::make_shared<mysql::ConnectorManager>(catalog_manager->address(),
-                                                  mysql_mock_connector_factory(resource));
+        std::make_unique<mysql::ConnectorManager>(resource, catalog_manager->address(), &mysql_mock_connector_factory);
     auto pg_conn_manager =
-        std::make_shared<pg::ConnectorManager>(catalog_manager->address(), pg_mock_connector_factory(resource));
-
-    catalog_manager->set_mysql_connector_manager(mysql_conn_manager);
-    catalog_manager->set_pg_connector_manager(pg_conn_manager);
-
-    mysql_conn_manager->addConnection(boost::mysql::connect_params{}, "1");
-    mysql_conn_manager->addConnection(boost::mysql::connect_params{}, "2");
-
-    auto mysql_connection_manager = actor_zeta::spawn<db::MySQLManager>(resource, mysql_conn_manager);
-    auto pg_connection_manager = actor_zeta::spawn<db::PostgressManager>(resource, pg_conn_manager);
+        std::make_unique<pg::ConnectorManager>(resource, catalog_manager->address(), &pg_mock_connector_factory);
     auto ch_conn_manager =
-        std::make_shared<ch::ConnectorManager>(catalog_manager->address(), ch_mock_connector_factory(resource));
-    catalog_manager->set_ch_connector_manager(ch_conn_manager);
-    auto ch_connection_manager = actor_zeta::spawn<db::ClickhouseManager>(resource, ch_conn_manager);
+        std::make_unique<ch::ConnectorManager>(resource, catalog_manager->address(), &ch_mock_connector_factory);
+
+    // The integration actors start the connector thread pools and are the
+    // catalog's route to a backend; addConnection needs both.
+    auto mysql_connection_manager = actor_zeta::spawn<db::MySQLManager>(resource, mysql_conn_manager.get());
+    auto pg_connection_manager = actor_zeta::spawn<db::PostgressManager>(resource, pg_conn_manager.get());
+    auto ch_connection_manager = actor_zeta::spawn<db::ClickhouseManager>(resource, ch_conn_manager.get());
+    catalog_manager->set_backend_managers(mysql_connection_manager->address(),
+                                          pg_connection_manager->address(),
+                                          ch_connection_manager->address());
+
+    REQUIRE_FALSE(mysql_conn_manager->addConnection(mock_connect_params(), "1").has_error());
+    REQUIRE_FALSE(mysql_conn_manager->addConnection(mock_connect_params(), "2").has_error());
 
     // The current Scheduler ctor takes (resource, az_scheduler, worker_count,
     // parser_factory, 5 actor addresses + s3 + file); each Worker builds its
@@ -135,7 +208,7 @@ TEST_CASE("scheduler handles N parallel sessions without hanging") {
     auto scheduler = actor_zeta::spawn<Scheduler>(
         resource,
         az_scheduler.get(),
-        std::max<std::size_t>(2, std::thread::hardware_concurrency()),
+        worker_pool_size(),
         &make_mock_parser,
         mysql_connection_manager->address(),
         pg_connection_manager->address(),
@@ -170,7 +243,7 @@ TEST_CASE("scheduler handles N parallel sessions without hanging") {
     for (size_t i = 0; i < N; ++i) {
         INFO("session " << i);
         REQUIRE_FALSE(results[i].has_error());
-        REQUIRE(results[i].value().chunk.size() == 2);
+        REQUIRE(results[i].value().size() == 2);
     }
 
     auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
@@ -188,11 +261,10 @@ TEST_CASE("scheduler handles N parallel sessions without hanging") {
 TEST_CASE("slow MySQL connector does not starve other sessions") {
     using namespace std::chrono_literals;
 
-    constexpr auto SLOW_WAIT = 300ms;
     constexpr size_t SESSIONS = 4;
     constexpr auto WAIT_TIMEOUT = 30000ms;
 
-    db::otterbrix_engine_ptr otterbrix = init_otterbrix();
+    db::otterbrix_engine_ptr otterbrix = init_default_test_otterbrix();
     auto resource = otterbrix->dispatcher()->resource();
     REQUIRE(resource != nullptr);
 
@@ -203,29 +275,28 @@ TEST_CASE("slow MySQL connector does not starve other sessions") {
                                                 std::make_unique<SimpleMockOtterbrixManager>(
                                                     mock_config{.resource = resource}));
     auto catalog_manager = actor_zeta::spawn<mysql::CatalogManager>(resource, otterbrix_manager->address());
-    auto mysql_conn_manager =
-        std::make_shared<mysql::ConnectorManager>(catalog_manager->address(),
-                                                  mysql_mock_connector_factory_slow(resource, SLOW_WAIT));
+    auto mysql_conn_manager = std::make_unique<mysql::ConnectorManager>(resource,
+                                                                        catalog_manager->address(),
+                                                                        &mysql_mock_connector_factory_slow);
     auto pg_conn_manager =
-        std::make_shared<pg::ConnectorManager>(catalog_manager->address(), pg_mock_connector_factory(resource));
-
-    catalog_manager->set_mysql_connector_manager(mysql_conn_manager);
-    catalog_manager->set_pg_connector_manager(pg_conn_manager);
-
-    mysql_conn_manager->addConnection(boost::mysql::connect_params{}, "1");
-    mysql_conn_manager->addConnection(boost::mysql::connect_params{}, "2");
-
-    auto mysql_connection_manager = actor_zeta::spawn<db::MySQLManager>(resource, mysql_conn_manager);
-    auto pg_connection_manager = actor_zeta::spawn<db::PostgressManager>(resource, pg_conn_manager);
+        std::make_unique<pg::ConnectorManager>(resource, catalog_manager->address(), &pg_mock_connector_factory);
     auto ch_conn_manager =
-        std::make_shared<ch::ConnectorManager>(catalog_manager->address(), ch_mock_connector_factory(resource));
-    catalog_manager->set_ch_connector_manager(ch_conn_manager);
-    auto ch_connection_manager = actor_zeta::spawn<db::ClickhouseManager>(resource, ch_conn_manager);
+        std::make_unique<ch::ConnectorManager>(resource, catalog_manager->address(), &ch_mock_connector_factory);
+
+    auto mysql_connection_manager = actor_zeta::spawn<db::MySQLManager>(resource, mysql_conn_manager.get());
+    auto pg_connection_manager = actor_zeta::spawn<db::PostgressManager>(resource, pg_conn_manager.get());
+    auto ch_connection_manager = actor_zeta::spawn<db::ClickhouseManager>(resource, ch_conn_manager.get());
+    catalog_manager->set_backend_managers(mysql_connection_manager->address(),
+                                          pg_connection_manager->address(),
+                                          ch_connection_manager->address());
+
+    REQUIRE_FALSE(mysql_conn_manager->addConnection(mock_connect_params(), "1").has_error());
+    REQUIRE_FALSE(mysql_conn_manager->addConnection(mock_connect_params(), "2").has_error());
 
     auto scheduler = actor_zeta::spawn<Scheduler>(
         resource,
         az_scheduler.get(),
-        std::max<std::size_t>(2, std::thread::hardware_concurrency()),
+        worker_pool_size(),
         &make_mock_parser,
         mysql_connection_manager->address(),
         pg_connection_manager->address(),
@@ -284,18 +355,213 @@ TEST_CASE("slow MySQL connector does not starve other sessions") {
     az_scheduler->stop();
 }
 
-// QueryHandleWaiter (utility/wait_barrier.hpp) iterates futures with .get(),
-// which must propagate exceptions rather than block forever.
-TEST_CASE("QueryHandleWaiter propagates future exceptions") {
-    QueryHandleWaiter<int> waiter;
+// The PostgreSQL actor's ENUM cache is written by discovery (the catalog's
+// add_connection_schema, re-run here for an already registered table) and read
+// by execute. Both are messages to the same actor, so senders on different
+// threads are serialised by its mailbox and the io-thread query only hands a
+// value back — the invariant ThreadSanitizer checks while the two interleave.
+TEST_CASE("PostgressManager: parallel execute and re-discovery share no unsynchronised state") {
+    constexpr size_t THREADS = 8;
+    constexpr size_t ROUNDS = 6;
 
-    std::promise<int> good;
-    std::promise<int> bad;
+    auto* resource = std::pmr::new_delete_resource();
+    auto otterbrix_manager = actor_zeta::spawn<db::OtterbrixManager>(
+        resource,
+        std::make_unique<SimpleMockOtterbrixManager>(mock_config{.resource = resource}));
+    auto catalog_manager = actor_zeta::spawn<mysql::CatalogManager>(resource, otterbrix_manager->address());
+    auto pg_conn_manager =
+        std::make_unique<pg::ConnectorManager>(resource, catalog_manager->address(), &pg_mock_connector_factory, 2);
+    auto pg_manager = actor_zeta::spawn<db::PostgressManager>(resource, pg_conn_manager.get());
+    catalog_manager->set_backend_managers(actor_zeta::address_t::empty_address(),
+                                          pg_manager->address(),
+                                          actor_zeta::address_t::empty_address());
+
+    // uid "1" is what the mock parser stamps on its external node.
+    conn::api_server::PgConnectionParams pg_params;
+    pg_params.alias = "1";
+    pg_params.host = "localhost";
+    pg_params.port = "5432";
+    pg_params.username = "user";
+    pg_params.password = "pass";
+    pg_params.database = "pgdb";
+    pg_params.schema = "public";
+    pg_params.table = "t";
+    REQUIRE_FALSE(pg_conn_manager->addConnection(pg_params).has_error());
+
+    std::vector<thread_verdict> verdicts(THREADS * ROUNDS);
+    {
+        std::vector<std::jthread> threads;
+        threads.reserve(THREADS);
+        for (size_t t = 0; t < THREADS; ++t) {
+            threads.emplace_back([&, t] {
+                for (size_t r = 0; r < ROUNDS; ++r) {
+                    auto& verdict = verdicts[t * ROUNDS + r];
+                    if (t % 2 == 0) {
+                        auto data = raw_select_statement(resource);
+                        if (!data) {
+                            verdict.what = "mock parse failed";
+                            continue;
+                        }
+                        auto [needs_sched, future] = actor_zeta::send(pg_manager->address(),
+                                                                      &db::PostgressManager::execute,
+                                                                      static_cast<session_hash_t>(t * ROUNDS + r + 1),
+                                                                      std::move(data));
+                        if (!poll_until_ready(future, THREAD_POLL_TIMEOUT)) {
+                            verdict.what = "execute did not settle";
+                            continue;
+                        }
+                        auto result = std::move(future).take_ready();
+                        if (result.has_error()) {
+                            verdict.what = std::string{result.error().what.c_str()};
+                            continue;
+                        }
+                        const auto* rows = fetched_slot(result.value());
+                        if (rows == nullptr) {
+                            verdict.what = "slot was not fetched";
+                            continue;
+                        }
+                        verdict.rows = rows->size();
+                        verdict.ok = true;
+                    } else {
+                        auto [needs_sched, future] =
+                            actor_zeta::send(catalog_manager->address(),
+                                             &mysql::CatalogManager::add_connection_schema,
+                                             qualified_name_t{"1", "pgdb", "public", "t"},
+                                             catalog_ext::ConnectionType::PostgreSQL);
+                        if (!poll_until_ready(future, THREAD_POLL_TIMEOUT)) {
+                            verdict.what = "add_connection_schema did not settle";
+                            continue;
+                        }
+                        auto err = std::move(future).take_ready();
+                        if (err.contains_error()) {
+                            verdict.what = std::string{err.what.c_str()};
+                            continue;
+                        }
+                        verdict.ok = true;
+                    }
+                }
+            });
+        }
+    }
+
+    for (size_t t = 0; t < THREADS; ++t) {
+        for (size_t r = 0; r < ROUNDS; ++r) {
+            const auto& verdict = verdicts[t * ROUNDS + r];
+            INFO("thread " << t << " round " << r << ": " << verdict.what);
+            REQUIRE(verdict.ok);
+            if (t % 2 == 0) {
+                REQUIRE(verdict.rows == 2);
+            }
+        }
+    }
+}
+
+// Same shape for the ClickHouse actor: discovery rewrites the per-table
+// named-type overrides that execute copies into its converter.
+TEST_CASE("ClickhouseManager: parallel execute and re-discovery share no unsynchronised state") {
+    constexpr size_t THREADS = 8;
+    constexpr size_t ROUNDS = 6;
+
+    auto* resource = std::pmr::new_delete_resource();
+    auto otterbrix_manager = actor_zeta::spawn<db::OtterbrixManager>(
+        resource,
+        std::make_unique<SimpleMockOtterbrixManager>(mock_config{.resource = resource}));
+    auto catalog_manager = actor_zeta::spawn<mysql::CatalogManager>(resource, otterbrix_manager->address());
+    auto ch_conn_manager =
+        std::make_unique<ch::ConnectorManager>(resource, catalog_manager->address(), &ch_header_connector_factory, 2);
+    auto ch_manager = actor_zeta::spawn<db::ClickhouseManager>(resource, ch_conn_manager.get());
+    catalog_manager->set_backend_managers(actor_zeta::address_t::empty_address(),
+                                          actor_zeta::address_t::empty_address(),
+                                          ch_manager->address());
+
+    ch::connect_params params;
+    params.host = "localhost";
+    params.database = "ev";
+    params.table = "1";
+    REQUIRE_FALSE(ch_conn_manager->addConnection(params, "1").has_error());
+
+    std::vector<thread_verdict> verdicts(THREADS * ROUNDS);
+    {
+        std::vector<std::jthread> threads;
+        threads.reserve(THREADS);
+        for (size_t t = 0; t < THREADS; ++t) {
+            threads.emplace_back([&, t] {
+                for (size_t r = 0; r < ROUNDS; ++r) {
+                    auto& verdict = verdicts[t * ROUNDS + r];
+                    if (t % 2 == 0) {
+                        auto data = raw_select_statement(resource);
+                        if (!data) {
+                            verdict.what = "mock parse failed";
+                            continue;
+                        }
+                        auto [needs_sched, future] = actor_zeta::send(ch_manager->address(),
+                                                                      &db::ClickhouseManager::execute,
+                                                                      static_cast<session_hash_t>(t * ROUNDS + r + 1),
+                                                                      std::move(data));
+                        if (!poll_until_ready(future, THREAD_POLL_TIMEOUT)) {
+                            verdict.what = "execute did not settle";
+                            continue;
+                        }
+                        auto result = std::move(future).take_ready();
+                        if (result.has_error()) {
+                            verdict.what = std::string{result.error().what.c_str()};
+                            continue;
+                        }
+                        if (fetched_slot(result.value()) == nullptr) {
+                            verdict.what = "slot was not fetched";
+                            continue;
+                        }
+                        verdict.ok = true;
+                    } else {
+                        auto [needs_sched, future] =
+                            actor_zeta::send(catalog_manager->address(),
+                                             &mysql::CatalogManager::add_connection_schema,
+                                             qualified_name_t{"1", "ev", "", "1"},
+                                             catalog_ext::ConnectionType::ClickHouse);
+                        if (!poll_until_ready(future, THREAD_POLL_TIMEOUT)) {
+                            verdict.what = "add_connection_schema did not settle";
+                            continue;
+                        }
+                        auto err = std::move(future).take_ready();
+                        if (err.contains_error()) {
+                            verdict.what = std::string{err.what.c_str()};
+                            continue;
+                        }
+                        verdict.ok = true;
+                    }
+                }
+            });
+        }
+    }
+
+    for (size_t t = 0; t < THREADS; ++t) {
+        for (size_t r = 0; r < ROUNDS; ++r) {
+            const auto& verdict = verdicts[t * ROUNDS + r];
+            INFO("thread " << t << " round " << r << ": " << verdict.what);
+            REQUIRE(verdict.ok);
+        }
+    }
+}
+
+// QueryHandleWaiter (utility/wait_barrier.hpp) iterates futures with .get(),
+// which must surface a failure rather than block forever.
+TEST_CASE("QueryHandleWaiter propagates future errors") {
+    auto* resource = std::pmr::new_delete_resource();
+    otterstax::QueryHandleWaiter<int> waiter{resource};
+
+    std::promise<core::result_wrapper_t<int>> good;
+    std::promise<core::result_wrapper_t<int>> bad;
     waiter.futures.push_back(good.get_future());
     waiter.futures.push_back(bad.get_future());
 
+    // Connector errors arrive as a value (core::error_t inside result_wrapper_t),
+    // not a future exception (utility/wait_barrier.hpp — avoids the boost.asio
+    // use_future TSAN race); wait() hands that error back on the consumer thread
+    // instead of throwing, which is why the result is [[nodiscard]].
     good.set_value(42);
-    bad.set_exception(std::make_exception_ptr(std::runtime_error("simulated DB failure")));
+    bad.set_value(core::error_t(core::error_code_t::io_error, std::pmr::string{"simulated DB failure", resource}));
 
-    REQUIRE_THROWS_AS(waiter.wait(), std::runtime_error);
+    auto barrier = waiter.wait();
+    REQUIRE(barrier.has_error());
+    REQUIRE(std::string{barrier.error().what.c_str()} == "simulated DB failure");
 }

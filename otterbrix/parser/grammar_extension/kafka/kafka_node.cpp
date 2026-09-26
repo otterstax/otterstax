@@ -11,10 +11,13 @@
 #include <unordered_map>
 
 #include <components/logical_plan/node_aggregate.hpp>
-#include <components/logical_plan/node_catalog_resolve_table.hpp>
+#include <components/logical_plan/node_group.hpp>
+#include <components/logical_plan/node_having.hpp>
 #include <components/logical_plan/node_insert.hpp>
+#include <components/logical_plan/node_limit.hpp>
 #include <components/logical_plan/node_match.hpp>
 #include <components/logical_plan/node_select.hpp>
+#include <components/logical_plan/node_sort.hpp>
 #include <components/sql/transformer/utils.hpp>
 
 using namespace components;
@@ -53,18 +56,13 @@ namespace otterstax::kafka {
 
         // Map ksql/SQL type keywords onto otterbrix's canonical (pg-internal) type
         // names, then defer to the core get_logical_type() so the actual
-        // logical_type assignment stays the single source of truth (and tracks any
-        // new otterbrix types for free). A name that is already canonical (e.g
-        // "uuid", "int4") falls through to get_logical_type() unchanged
+        // logical_type assignment stays the single source of truth. A name that is
+        // already canonical (e.g. "int4") falls through to get_logical_type() unchanged
         static const std::unordered_map<std::string, std::string> sql_alias = {
             {"int", "int4"},
             {"integer", "int4"},
             {"bigint", "int8_t"},
-            {"smallint", "int2"},
-            {"tinyint", "tinyint"},
             {"double", "float8"},
-            {"float", "float4"},
-            {"real", "float4"},
             {"boolean", "bool"},
             {"bool", "bool"},
             {"varchar", "string"},
@@ -77,11 +75,19 @@ namespace otterstax::kafka {
             canonical = it->second;
         }
 
-        const types::logical_type type = sql::transform::get_logical_type(canonical);
-        if (type == types::logical_type::UNKNOWN) {
-            return std::nullopt;
+        // Only the types the JSON reader (json_to_chunk) and writer (chunk_to_json)
+        // carry are declarable: a column of any other type could never be filled
+        // from a message, so it is rejected at CREATE rather than ingesting nothing
+        switch (sql::transform::get_logical_type(canonical)) {
+            case types::logical_type::INTEGER:
+            case types::logical_type::BIGINT:
+            case types::logical_type::DOUBLE:
+            case types::logical_type::BOOLEAN:
+            case types::logical_type::STRING_LITERAL:
+                return types::complex_logical_type(sql::transform::get_logical_type(canonical));
+            default:
+                return std::nullopt;
         }
-        return types::complex_logical_type(type);
     }
 
     kafka_node_ptr lower_to_node(std::pmr::memory_resource* resource, const kafka_grammar::kafka_stmt& stmt) {
@@ -130,20 +136,15 @@ namespace otterstax::kafka {
         if (!root) {
             return std::nullopt;
         }
-        const logical_plan::node_catalog_resolve_table_t* resolve = nullptr;
         const logical_plan::node_insert_t* insert = nullptr;
-        // Inspect only root + its direct children: the write's target
-        // catalog_resolve_table and the insert_t are siblings under the wrapping
-        // sequence_t, while the source's own resolve nodes live deeper (under the
-        // insert) — so a SELECT source's tables can't be mistaken for the target
+        // Inspect only root + its direct children: the insert_t is the root or the
+        // consumer child of a wrapping sequence_t and names its own target, while a
+        // SELECT source's tables live deeper (under the insert) — so they can't be
+        // mistaken for the target
         auto inspect = [&](const logical_plan::node_t* n) {
-            if (auto* rt = dynamic_cast<const logical_plan::node_catalog_resolve_table_t*>(n)) {
-                if (!resolve) {
-                    resolve = rt;
-                }
-            } else if (auto* ins = dynamic_cast<const logical_plan::node_insert_t*>(n)) {
+            if (n->type() == logical_plan::node_type::insert_t) {
                 if (!insert) {
-                    insert = ins;
+                    insert = static_cast<const logical_plan::node_insert_t*>(n);
                 }
             }
         };
@@ -151,7 +152,7 @@ namespace otterstax::kafka {
         for (const auto& child : root->children()) {
             inspect(child.get());
         }
-        if (!insert || !resolve || resolve->dbname() != KAFKA_DATABASE_NAME) {
+        if (!insert || insert->dbname() != KAFKA_DATABASE_NAME) {
             return std::nullopt;
         }
         if (insert->children().empty()) {
@@ -162,7 +163,7 @@ namespace otterstax::kafka {
         // the latter a continuous INSERT INTO query — the caller routes on this
         auto source = insert->children().front();
         const bool source_is_select = source->type() != logical_plan::node_type::data_t;
-        return kafka_write_t{resolve->relname(), std::move(source), source_is_select};
+        return kafka_write_t{insert->relname(), std::move(source), source_is_select};
     }
 
     namespace {
@@ -170,8 +171,8 @@ namespace otterstax::kafka {
             if (!n) {
                 return nullptr;
             }
-            if (auto* agg = dynamic_cast<const logical_plan::node_aggregate_t*>(n)) {
-                return agg;
+            if (n->type() == logical_plan::node_type::aggregate_t) {
+                return static_cast<const logical_plan::node_aggregate_t*>(n);
             }
             for (const auto& child : n->children()) {
                 if (auto* found = find_first_aggregate(child.get())) {
@@ -186,7 +187,11 @@ namespace otterstax::kafka {
         // Rebuild a parsed operator with an empty dbname/relname (reusing its
         // expressions) so it chains over a node_raw_data substitution; a parsed
         // operator keeps its source table's relname, which stops it from picking up
-        // the raw_data rows. match_t/select_t handled; others pass through
+        // the raw_data rows and makes every batch re-resolve a table the swapped
+        // plan never reads. EVERY operator type the transformer names its source
+        // table on is rebuilt here — match/select/group and the ORDER BY / LIMIT /
+        // HAVING tail — because the engine collects a catalog lookup for each one
+        // (services/dispatcher/enrich_logical_plan.cpp, target_names_of)
         logical_plan::node_ptr rehome_operator(std::pmr::memory_resource* resource,
                                                const logical_plan::node_ptr& op) {
             if (op->type() == logical_plan::node_type::match_t) {
@@ -196,6 +201,38 @@ namespace otterstax::kafka {
             }
             if (op->type() == logical_plan::node_type::select_t) {
                 auto rehomed = logical_plan::make_node_select(resource, {}, {});
+                rehomed->append_expressions(op->expressions());
+                return rehomed;
+            }
+            if (op->type() == logical_plan::node_type::group_t) {
+                auto rehomed = logical_plan::make_node_group(resource, {}, {});
+                rehomed->append_expressions(op->expressions());
+                // The HAVING helpers sit at the tail of that list and are addressed by
+                // count, not by name: a rebuilt group that forgot how many there are
+                // would project them as output columns
+                rehomed->internal_aggregate_count =
+                    static_cast<const logical_plan::node_group_t*>(op.get())->internal_aggregate_count;
+                return rehomed;
+            }
+            if (op->type() == logical_plan::node_type::sort_t) {
+                const auto* sort = static_cast<const logical_plan::node_sort_t*>(op.get());
+                auto rehomed = logical_plan::make_node_sort(resource, {}, {}, sort->expressions());
+                rehomed->set_read_cap(sort->read_cap());
+                return rehomed;
+            }
+            if (op->type() == logical_plan::node_type::limit_t) {
+                // The window IS the node's state — an empty-named limit still cuts the batch
+                return logical_plan::make_node_limit(
+                    resource,
+                    {},
+                    {},
+                    static_cast<const logical_plan::node_limit_t*>(op.get())->limit());
+            }
+            if (op->type() == logical_plan::node_type::having_t) {
+                // A having carries no counter of its own: the predicate rides in the
+                // expression list (the engine reads its first entry), so the whole list
+                // is carried rather than that one entry
+                auto rehomed = logical_plan::make_node_having(resource, {}, {}, expressions::expression_ptr{});
                 rehomed->append_expressions(op->expressions());
                 return rehomed;
             }

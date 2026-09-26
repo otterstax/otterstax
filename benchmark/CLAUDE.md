@@ -332,7 +332,7 @@ breakdown.
 `external_join_cross` / `external_join_all` deliberately load every side into
 otterbrix-internal storage first (external load + a hand-built `bigint` engine
 table). A direct backend.campaign_id (int32) ⋈ s3.campaign_id (int64) silently
-returns zero rows (the JOIN-key width trap in `FIX_JOIN.md` / `tests/CLAUDE.md`),
+returns zero rows (the JOIN-key width trap: `tests/CLAUDE.md`, "JOIN-key width sensitivity"),
 so the benchmarks follow the staged shape the tests use. `weights` covers
 campaign_id 1..min(200, max) — bounded join cardinality regardless of fixture
 scale.

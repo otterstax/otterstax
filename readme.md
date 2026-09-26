@@ -250,7 +250,7 @@ python examples/simple/flight_sql_example.py examples/simple/example_1.txt
 pip install "conan>=2.0"
 conan profile detect --force
 # (optional) add Otterbrix remote if required by your conanfile
-# conan remote add otterbrix http://conan.otterbrix.com
+# conan remote add otterbrix https://conan.otterbrix.com
 ```
 
 2. Create build directory and install dependencies:

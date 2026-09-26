@@ -144,11 +144,11 @@ namespace frontend::postgres {
                 }
 
                 auto msg_length = merge_data_bytes<uint32_t, endian::BIG>(read_buffer_, 0);
-                std::cout << "Initial message length: " + std::to_string(msg_length) << std::endl;
+                log_->trace("[Connection {}] initial message length: {}", connection_id_, msg_length);
 
                 if (msg_length < 4 || msg_length > MAX_PACKET_SIZE) {
                     send_error_response(sql_state::PROTOCOL_VIOLATION,
-                                        "Invalid message length: " + std::to_string(length),
+                                        "Invalid message length: " + std::to_string(msg_length),
                                         error_severity::fatal());
                     return;
                 }

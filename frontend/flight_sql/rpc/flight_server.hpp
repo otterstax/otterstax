@@ -9,10 +9,11 @@
 
 #include <agrpc/grpc_context.hpp>
 
-#include <asio/awaitable.hpp>
+#include <boost/asio/awaitable.hpp>
 
 namespace flight::rpc {
 
+namespace asio = boost::asio;
 namespace fp = arrow::flight::protocol;
 
 // Registers the FlightService RPC handlers and bridges them into FlightSqlCore.

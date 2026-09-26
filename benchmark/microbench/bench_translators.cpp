@@ -19,6 +19,8 @@
 #include "otterbrix/translators/input/pg_to_chunk.hpp"
 #include "otterbrix/translators/output/chunk_to_arrow.hpp"
 
+#include <arrow/ipc/writer.h>
+
 #include <benchmark/benchmark.h>
 
 #include <clickhouse/columns/numeric.h>
@@ -285,17 +287,6 @@ BENCHMARK(BM_chunk_to_arrow_schema_vec_50col);
 // handed to the converter as a one-element payload. The reported time therefore
 // includes both ch_to_chunk and the IPC serialisation; use BM_ch_to_chunk_* to
 // isolate the former.
-
-std::shared_ptr<arrow::Schema> arrow_schema_or_skip(benchmark::State& state,
-                                                    std::pmr::memory_resource* res,
-                                                    const complex_logical_type& struct_t) {
-    auto converted = to_arrow_schema(res, struct_t);
-    if (converted.has_error()) {
-        state.SkipWithError(converted.error().what.c_str());
-        return nullptr;
-    }
-    return std::move(converted.value());
-}
 
 static void BM_flight_wire_full_100(benchmark::State& state) {
     auto* res = std::pmr::new_delete_resource();

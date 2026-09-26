@@ -19,8 +19,8 @@
 
 #include <agrpc/grpc_context.hpp>
 
-#include <asio/io_context.hpp>
-#include <asio/signal_set.hpp>
+#include <boost/asio/io_context.hpp>
+#include <boost/asio/signal_set.hpp>
 #include <grpcpp/server.h>
 
 #include <atomic>
@@ -33,6 +33,8 @@
 #include <actor-zeta.hpp>
 
 namespace flight::server {
+
+    namespace asio = boost::asio;
 
     struct config_t {
         std::string host;

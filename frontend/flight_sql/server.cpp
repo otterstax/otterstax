@@ -38,7 +38,11 @@ namespace flight::server {
     bool flight_sql_server::start() {
         OTX_ZONE_N("flight::flight_sql_server::start");
         grpc::ServerBuilder builder;
-        grpc_context_ = std::make_unique<agrpc::GrpcContext>(builder.AddCompletionQueue());
+        // run() drives the context from threads_ threads. asio-grpc allows that only for a
+        // context built with a concurrency hint above one, and only then does stop() wake
+        // every thread: built without it, the other threads stayed blocked in the completion
+        // queue and run() never returned on SIGTERM.
+        grpc_context_ = std::make_unique<agrpc::GrpcContext>(builder.AddCompletionQueue(), threads_);
         builder.AddListeningPort(address_, grpc::InsecureServerCredentials());
         builder.RegisterService(&flight_server_.service());
         server_ = builder.BuildAndStart();

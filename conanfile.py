@@ -69,8 +69,7 @@ class OtterStax(ConanFile):
     def configure(self):
         if self.options.with_tracy:
             self.options["tracy/*"].on_demand = False
-        # standalone asio (not boost) — the rpc layer is written against it
-        self.options["asio-grpc/*"].backend = "asio"
+        self.options["asio-grpc/*"].backend = "boost"
 
         self.options["arrow/*"].shared = True
         self.options["arrow/*"].with_brotli = True

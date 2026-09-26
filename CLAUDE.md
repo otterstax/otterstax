@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Project Is
 
-OtterStax is a federated SQL query server. Clients connect via MySQL wire protocol (8816), PostgreSQL wire protocol (8817), or Arrow Flight SQL (8815 — served by an in-house implementation, no Arrow Flight dependency). Queries are either executed locally by the Otterbrix engine or dispatched to registered remote database backends (MariaDB/MySQL, PostgreSQL, ClickHouse). There is a **single config file** (`config.yaml`) that holds the wire-server settings and, under a `connections:` section, every remote backend and s3 alias — read once at startup. That `connections:` section is the single source of truth for connections; there is no runtime add/remove API.
+OtterStax is a federated SQL query server. Clients connect via MySQL wire protocol (8816), PostgreSQL wire protocol (8817), Arrow Flight SQL (8815 — served by an in-house implementation, no Arrow Flight dependency), or Spark Connect (15002 — gRPC, for PySpark clients: `spark.sql()`, DataFrame operations, `spark.catalog`). Queries are either executed locally by the Otterbrix engine or dispatched to registered remote database backends (MariaDB/MySQL, PostgreSQL, ClickHouse). There is a **single config file** (`config.yaml`) that holds the wire-server settings and, under a `connections:` section, every remote backend and s3 alias — read once at startup. That `connections:` section is the single source of truth for connections; there is no runtime add/remove API.
 
 ## Connection Config
 
@@ -36,6 +36,7 @@ service:
   flight_sql: { host: "0.0.0.0", port: 8815 }
   mysql:      { port: 8816 }      # wire-server port (NOT a backend)
   postgres:   { port: 8817 }      # wire-server port (NOT a backend)
+  spark_connect: { host: "0.0.0.0", port: 15002 }   # Spark Connect gRPC server
   connection_retry: { max_attempts: 10, delay_ms: 2000 }
 
 connections:
@@ -157,6 +158,7 @@ cmake -S . -B build/Release -DBUILD_TESTS=ON \
 ./build/Release/tests/unit/utility/test_utils               # tests/unit/utility
 ./build/Release/tests/unit/translators/test_unit_translators
 ./build/Release/tests/unit/config/test_unit_config
+./build/Release/tests/unit/spark_connect/test_unit_spark_connect
 ./build/Release/tests/unit/parser/grammar_extension/kafka/test_kafka_grammar
 ./build/Release/tests/mysql-front/test_mysql_front          # tests/mysql-front
 
@@ -218,7 +220,7 @@ All components are actor-zeta actors (`actor_mixin` for the Scheduler,
 typed coroutine futures. The flow for every query:
 
 ```text
-Frontend (MySQL/PG/FlightSQL)
+Frontend (MySQL/PG/FlightSQL/Spark Connect)
   → Scheduler::execute()          — thin router, hashes session_hash → Worker
   → Worker::execute()             — owns the parser, runs the full pipeline
   → CatalogManager                — resolve schemas, set backend type on ParsedQueryData
@@ -232,6 +234,16 @@ Frontend (MySQL/PG/FlightSQL)
   → frontend awaits via asio_future_bridge → sends response
 ```
 
+The Spark Connect frontend enters this pipeline two ways. SQL text goes through
+`Scheduler::execute` like the other frontends: a `spark.sql()` statement that is
+not a query runs at once, while a query is handed back to the client unrun (as
+its SQL relation) and runs when the client acts on its DataFrame
+(`prepare_schema` for `df.schema`). A DataFrame — translated into an otterbrix
+logical plan inside the frontend (`frontend/spark_connect_server/plan_translator/`)
+— goes through `Scheduler::execute_plan`, or `Scheduler::prepare_plan` for
+`df.schema` (described, never executed). Both plan entry points join the Worker
+where parsing ends (`scheduler/CLAUDE.md`).
+
 The Scheduler is a session-affinity router over a pool of `Worker` actors
 (spawned on an `actor_zeta::scheduler::sharing_scheduler`); every session
 keyed by `session_hash_t` always lands on `workers_[id % N]`. The Scheduler's
@@ -239,8 +251,10 @@ own thread runs an otterbrix-style event loop: `enqueue_impl` (any sender
 thread) only pushes into a lock-free inbox and signals a CV; all coroutine
 work happens on the loop thread. Frontends never block on shared state — they
 hold the future returned by `Scheduler::execute` and poll it from the
-per-connection asio executor through `frontend/common/asio_future_bridge.hpp`.
-That bridge is the only supported way to pick up an actor result; the
+per-connection asio executor through `frontend/common/asio_future_bridge.hpp`
+(the Spark Connect handlers, which run on an `agrpc::GrpcExecutor`, through its
+gRPC form, `frontend/spark_connect_server/await_future.hpp`). That bridge, in
+either form, is the only supported way to pick up an actor result; the
 `cv_wrapper` condvar handoff it replaced has been deleted.
 
 ### Key Types
@@ -469,10 +483,10 @@ otterbrix-internal — shadow of `external_join_all` benchmark), all driven by
 | `otterbrix/` | `otterbrix_local` (+ `otterbrix_s3_extension`, `otterbrix_file_extension`) | Parser, SQL generator, translators, plan execution, grammar extensions for `CREATE EXTERNAL TABLE` / `COPY ... TO` |
 | `otterbrix/parser/grammar_extension/kafka/` | `kafka_grammar` | Kafka DDL parser extension (flex+bison): `kafka_node_t`, `kafka_write_target` |
 | `scheduler/` | `scheduler` | `Scheduler` router + `Worker` pool (full parse→catalog→backend→otterbrix pipeline, including external-statement dispatch) + schema computation utilities |
-| `frontend/` | `flight_sql`, `mysql_server`, `postgres_server` | Wire-protocol frontends (await `Scheduler` futures via `asio_future_bridge.hpp`). `flight_sql/` is the in-house Flight SQL server: asio-grpc handlers over gRPC, the data plane on the project's arrow core (`arrow::ipc` + `tsl::*` translators) — no Arrow Flight dependency. |
+| `frontend/` | `flight_sql`, `mysql_server`, `postgres_server`, `spark_connect_server` | Wire-protocol frontends (await `Scheduler` futures via `asio_future_bridge.hpp`). `flight_sql/` is the in-house Flight SQL server: asio-grpc handlers over gRPC, the data plane on the project's arrow core (`arrow::ipc` + `tsl::*` translators) — no Arrow Flight dependency. The Spark Connect gRPC server (asio-grpc; `spark.sql()` through `Scheduler::execute`, DataFrame plans through `Scheduler::execute_plan`, awaited via `await_future.hpp`). See `frontend/CLAUDE.md` |
 | `utility/` | (header-only) | `session`, `wait_barrier` (connector error marshalling), `asio_error`, `table_info`, logger, profiler |
 | `cmake/` | (helper macros) | `otterbrix_parser_extension.cmake` — builds the s3/file flex+bison grammar extensions |
-| `tests/` | `test_system`, `test_parser`, `test_schema`, `test_utils`, `test_unit_translators`, `test_unit_config`, `test_kafka_grammar`, `test_mysql_front` | Catch2 tests + python integration suite under `tests/test_*.py` (binary names are the `project()` names in `tests/*/CMakeLists.txt`; see `tests/CLAUDE.md`) |
+| `tests/` | `test_system`, `test_parser`, `test_schema`, `test_utils`, `test_unit_translators`, `test_unit_config`, `test_unit_spark_connect`, `test_kafka_grammar`, `test_mysql_front` | Catch2 tests + python integration suite under `tests/test_*.py` (the `test_spark_client_*.py` files run in the PySpark client matrix, `Dockerfile.spark-test`; binary names are the `project()` names in `tests/*/CMakeLists.txt`; see `tests/CLAUDE.md`) |
 
 ## Known Constraints
 
@@ -480,11 +494,16 @@ otterbrix-internal — shadow of `external_join_all` benchmark), all driven by
 - One query per connection at a time: each alias owns a single `boost::mysql::any_connection` and nothing serializes overlapping statements on it (`Connector::runQuery_` in `connectors/mysql/connector.hpp`; the pg/ch connectors are shaped the same way)
 - Array types support only single dimension (see the `TODO: multiple dimentions array` in `write_column_def`, `otterbrix/query_generation/sql_query_generator.cpp`)
 - Docker MariaDB volumes lag on cold start — `docker-run-tests.sh` has a 120 s wait
+- Engine (rc-3): an aggregate whose arguments are all constants is wrong over a **local** engine table — `SELECT count(1)` / `sum(1)` over a 3-row table answers 1, and 1 per group, and `count(1)` over no rows crashes the process — because `execution_dag_t::run` evaluates an all-constant node over one row per chunk (engine `components/execution_dag/execution_dag.cpp:972-995`). `OtterbrixDataManager::execute_plan` (`otterbrix/operators/execute_plan.cpp`) guards every plan the engine runs, SQL and Spark alike: `count(<non-NULL literal>)` becomes `COUNT(*)`, any other aggregate over constants is refused as `unimplemented_yet` (`sum() over a constant argument is not supported`). Backend mirrors are unaffected (`COUNT(1)` is pushed to the backend). The request to the engine is `docs/otterbrix_request_constant_aggregates.md`
+- Engine (rc-3): `avg` and `sum` answer their input's type (`compute/kernels/aggregate.cpp`, `same_type_resolver`) and accumulate in it, so over a **local** engine table `avg` of an integer column drops the fraction (`avg(bigint)` over 1, 2, 3, 4, 6 answers 3) and `avg` / `sum` of a SMALLINT or INTEGER column overflow past its range. Backend mirrors are unaffected (the backend computes them). The Spark frontend averages its argument cast to DOUBLE, as Spark's `Average` does; the SQL path waits for the engine (`docs/otterbrix_request_avg_integer_division.md`)
 
 ## Critical Dependency Versions
 
 - Otterbrix 1.0.0b2-rc-3 (custom Conan remote: `http://conan.otterbrix.com`; pinned by recipe revision in `conanfile.py`)
-- Arrow 24.0.0 (with `with_flight_sql=True`, `with_s3=True`, `with_parquet=True`, `with_csv=True`, `with_json=True`, plus snappy/brotli/zlib/lz4/zstd compression codecs)
+- Arrow 24.0.0 (with `with_s3=True`, `with_parquet=True`, `with_csv=True`, `with_json=True`, plus snappy/brotli/zlib/lz4/zstd compression codecs)
 - Boost 1.88.0
 - actor-zeta 1.2.0
 - Catch2 3.15.1 (v3 — `find_package(Catch2 3)` required by the otterbrix recipe)
+- asio-grpc 3.7.0 (`backend=boost` in `conanfile.py`) over gRPC 1.69.0 — the Spark Connect server
+- Spark Connect protocol 4.2.0 — the protos are vendored from apache/spark v4.2.0 into `frontend/spark_connect_server/proto/spark/connect/`; the server answers `SparkVersion` 4.2.0
+- PySpark clients 3.5.0–4.2.0 — every released client (20 versions) runs the E2E matrix (`Dockerfile.spark-test`, see `tests/CLAUDE.md`)

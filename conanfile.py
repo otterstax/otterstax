@@ -37,7 +37,6 @@ class OtterStax(ConanFile):
         if self.options.with_tracy:
             self.requires("tracy/0.13.1")
         self.requires("arrow/24.0.0")
-        self.requires("asio-grpc/3.7.0")
         self.requires("openssl/3.0.13")
         self.requires("boost/1.88.0", override=True)
         self.requires("fmt/11.1.3")
@@ -45,6 +44,7 @@ class OtterStax(ConanFile):
         self.requires("msgpack-cxx/4.1.1")
         self.requires("catch2/3.15.1")
         self.requires("grpc/1.69.0")
+        self.requires("asio-grpc/3.7.0")
         self.requires("aws-sdk-cpp/1.11.352", override=True)
         self.requires("abseil/20250127.0", override=True)
         # otterbrix b2-rc-3 pins re2/20240702 while grpc 1.69 pins re2/20250722 —
@@ -69,7 +69,6 @@ class OtterStax(ConanFile):
     def configure(self):
         if self.options.with_tracy:
             self.options["tracy/*"].on_demand = False
-        self.options["asio-grpc/*"].backend = "boost"
 
         self.options["arrow/*"].shared = True
         self.options["arrow/*"].with_brotli = True
@@ -98,6 +97,7 @@ class OtterStax(ConanFile):
         self.options["actor-zeta/*"].exceptions_disable = False
         self.options["actor-zeta/*"].rtti_disable = False
 
+        self.options["asio-grpc/*"].backend = "boost"
 
     def generate(self):
         tc = CMakeToolchain(self)

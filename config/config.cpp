@@ -75,6 +75,13 @@ core::result_wrapper_t<ServiceConfig> ConfigReader::load(const std::string& conf
             }
             server_config.postgres = postgres.value();
         }
+        if (service["spark_connect"]) {
+            auto spark_connect = parseSparkConnectConfig(service["spark_connect"], resource_);
+            if (spark_connect.has_error()) {
+                return failed(spark_connect.error());
+            }
+            server_config.spark_connect = std::move(spark_connect.value());
+        }
         if (service["connection_retry"]) {
             auto retry = parseConnectionRetryConfig(service["connection_retry"], resource_);
             if (retry.has_error()) {
@@ -98,6 +105,7 @@ core::result_wrapper_t<ServiceConfig> ConfigReader::load(const std::string& conf
     log_->debug("Flight SQL: {}:{} ", server_config.flight_sql.host, server_config.flight_sql.port);
     log_->debug("MySQL port: {}", server_config.mysql.port);
     log_->debug("Postgres port: {}", server_config.postgres.port);
+    log_->debug("Spark Connect: {}:{}", server_config.spark_connect.host, server_config.spark_connect.port);
     log_->debug("Connection retry: {} attempt(s), {} ms delay",
                 server_config.connection_retry.max_attempts,
                 server_config.connection_retry.delay_ms);
@@ -161,6 +169,29 @@ core::result_wrapper_t<PostgresConfig> ConfigReader::parsePostgresConfig(const Y
     }
 
     return postgres_config;
+}
+
+core::result_wrapper_t<SparkConnectConfig> ConfigReader::parseSparkConnectConfig(const YAML::Node& config,
+                                                                                 std::pmr::memory_resource* resource) {
+    SparkConnectConfig spark_config;
+
+    if (config["host"]) {
+        auto host = yaml_scalar<std::string>(config["host"], "service.spark_connect.host", resource);
+        if (host.has_error()) {
+            return host.convert_error<SparkConnectConfig>();
+        }
+        spark_config.host = std::move(host.value());
+    }
+
+    if (config["port"]) {
+        auto port = yaml_scalar<int>(config["port"], "service.spark_connect.port", resource);
+        if (port.has_error()) {
+            return port.convert_error<SparkConnectConfig>();
+        }
+        spark_config.port = static_cast<uint16_t>(port.value());
+    }
+
+    return spark_config;
 }
 
 core::result_wrapper_t<ConnectionRetryConfig> ConfigReader::parseConnectionRetryConfig(

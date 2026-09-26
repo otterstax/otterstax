@@ -46,7 +46,9 @@ namespace otterstax::external {
 // any later execute on that session answers invalid_parameter ("prepared
 // statement must be re-prepared"). close_statement erases an entry the frontend
 // will never execute; it is idempotent (an unknown or consumed session closes
-// with success). Errors travel as core::error_t; the only try/catch sits
+// with success). execute_plan / prepare_plan take a pre-built plan (the Spark
+// Connect frontend) in place of SQL text and follow execute / prepare_schema
+// from the point where parsing ends. Errors travel as core::error_t; the only try/catch sits
 // directly around IParser::parse.
 class Worker final : public actor_zeta::basic_actor<Worker> {
 public:
@@ -76,12 +78,16 @@ public:
                                std::pmr::vector<components::types::logical_value_t> parameters);
     unique_future<session_result> prepare_schema(session_hash_t id, std::string sql);
     unique_future<session_result> close_statement(session_hash_t id);
+    unique_future<session_result> execute_plan(session_hash_t id, ParsedQueryDataPtr data);
+    unique_future<session_result> prepare_plan(session_hash_t id, ParsedQueryDataPtr data);
 
     using dispatch_traits = actor_zeta::dispatch_traits<&Worker::execute,
                                                         &Worker::execute_statement,
                                                         &Worker::execute_prepared_statement,
                                                         &Worker::prepare_schema,
-                                                        &Worker::close_statement>;
+                                                        &Worker::close_statement,
+                                                        &Worker::execute_plan,
+                                                        &Worker::prepare_plan>;
 
     actor_zeta::behavior_t behavior(actor_zeta::mailbox::message* msg);
 
@@ -111,6 +117,16 @@ private:
     // The parser boundary: the one place that may throw, converted to error_t
     // on the spot. Also rejects a parse that produced no plan.
     core::result_wrapper_t<ParsedQueryDataPtr> parse_sql(const std::string& sql);
+
+    // What execute and execute_plan share once the statement is parsed: the
+    // database-DDL guard, classification (catalog or engine), then run_pipeline.
+    // The caller owns the entry's erase guard.
+    unique_future<session_result> classify_and_run(session_hash_t id, ParsedQueryDataPtr data);
+
+    // What prepare_schema and prepare_plan share once the statement is parsed:
+    // the result schema from the plan and the backends' describe probes,
+    // without executing the statement; the entry stays for execute or close.
+    unique_future<session_result> describe_parsed(session_hash_t id, ParsedQueryDataPtr parsed_data);
 
     // Backend slices first (each inlines its rows as node_raw_data), then the
     // engine; the result is built from the session's stored schema/tag.

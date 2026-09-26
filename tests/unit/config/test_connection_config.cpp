@@ -578,3 +578,78 @@ connections:
 )";
     CHECK(load_error(write_temp(yaml)).type == core::error_code_t::invalid_parameter);
 }
+
+// ── ConfigReader: service.spark_connect (the Spark Connect gRPC server) ──────
+
+TEST_CASE("ConfigReader: parses the spark_connect host and port") {
+    const std::string yaml = R"(
+service:
+  flight_sql:
+    host: "127.0.0.1"
+    port: 9815
+  mysql:
+    port: 9816
+  postgres:
+    port: 9817
+  spark_connect:
+    host: "127.0.0.2"
+    port: 16002
+  connection_retry:
+    max_attempts: 7
+    delay_ms: 500
+connections:
+  mysql:
+    - alias: m1
+      host: h
+      port: "3306"
+      username: u
+      password: p
+      database: d
+      table: ""
+)";
+    auto cfg = load_ok(write_temp(yaml));
+
+    CHECK(cfg.spark_connect.host == "127.0.0.2");
+    CHECK(cfg.spark_connect.port == 16002);
+
+    // The neighbouring service settings and the connections are read as before.
+    CHECK(cfg.flight_sql.port == 9815);
+    CHECK(cfg.mysql.port == 9816);
+    CHECK(cfg.postgres.port == 9817);
+    CHECK(cfg.connection_retry.max_attempts == 7);
+    REQUIRE(cfg.connections.mysql.size() == 1);
+    CHECK(cfg.connections.mysql[0].alias == "m1");
+}
+
+TEST_CASE("ConfigReader: spark_connect defaults to 0.0.0.0:15002 when its node is absent") {
+    SECTION("a service node without spark_connect") {
+        const std::string yaml = R"(
+service:
+  mysql:
+    port: 8816
+)";
+        auto cfg = load_ok(write_temp(yaml));
+        CHECK(cfg.spark_connect.host == "0.0.0.0");
+        CHECK(cfg.spark_connect.port == 15002);
+    }
+
+    SECTION("no config file at all") {
+        auto cfg = load_ok("/nonexistent/config.yaml");
+        CHECK(cfg.spark_connect.host == "0.0.0.0");
+        CHECK(cfg.spark_connect.port == 15002);
+    }
+}
+
+TEST_CASE("ConfigReader: a spark_connect port that is not an integer is an error naming the field") {
+    // Read through yaml_scalar like every service value: the refusal is a
+    // value, not an exception leaving the reader.
+    const std::string yaml = R"(
+service:
+  spark_connect:
+    host: "0.0.0.0"
+    port: abc
+)";
+    auto err = load_error(write_temp(yaml));
+    CHECK(err.type == core::error_code_t::invalid_parameter);
+    CHECK(mentions(err, "service.spark_connect.port"));
+}

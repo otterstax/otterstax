@@ -11,6 +11,9 @@ service:
     port: 8816
   postgres:
     port: 8817
+  spark_connect:
+    host: "0.0.0.0"
+    port: 15002
   connection_retry:
     max_attempts: 10
     delay_ms: 2000
@@ -56,4 +59,4 @@ connections:
       access_key: minioadmin
       secret_key: minioadmin
       region: us-east-1
-      endpoint: minio:9000
+      endpoint: rustfs:9000

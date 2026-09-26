@@ -91,6 +91,8 @@ find_package(Boost 1.88.0 REQUIRED COMPONENTS
     program_options
     mysql
 )
+find_package(Protobuf REQUIRED)
+find_package(asio-grpc REQUIRED)
 find_package(PostgreSQL REQUIRED)
 find_package(yaml-cpp REQUIRED)
 find_package(clickhouse-cpp REQUIRED)
@@ -159,9 +161,9 @@ add_library(lib_${PROJECT_NAME} INTERFACE
 # LINK_GROUP:RESCAN for CXX and does not need it — it re-searches archives
 # until no new symbols resolve.
 set(OTTERSTAX_INTERNAL_LIBS
-    flight_sql common_server mysql_server postgres_server catalog
-    connectors s3 file component_manager integration otterbrix_local
-    scheduler kafka_grammar kafka_runtime)
+    flight_sql common_server mysql_server postgres_server
+    spark_connect_server catalog connectors s3 file component_manager
+    integration otterbrix_local scheduler kafka_grammar kafka_runtime)
 if(APPLE)
     set(OTTERSTAX_LINK_GROUP ${OTTERSTAX_INTERNAL_LIBS})
 else()

@@ -233,13 +233,21 @@ if $ENABLE_TRACY; then
     export WITH_TRACY=true
 fi
 
+# CI path: the Spark client matrix image (Dockerfile.spark-test) is pre-built
+# by the workflow and its tag passed in SPARK_CLIENT_IMAGE.
+SPARK_CLIENT_BUILD="test-spark-client"
+if [ -n "${SPARK_CLIENT_IMAGE}" ]; then
+    echo "ℹ️  SPARK_CLIENT_IMAGE=${SPARK_CLIENT_IMAGE} set; skipping test-spark-client build"
+    SPARK_CLIENT_BUILD=""
+fi
+
 if [ -n "${IMAGE_TAG}" ]; then
     # CI / sanitizer path: test-otterstax image is pre-built with specific
     # build-args (e.g. ENABLE_ASAN / ENABLE_TSAN) by the workflow
     echo "ℹ️  IMAGE_TAG=${IMAGE_TAG} set; skipping test-otterstax build"
-    compose build test-client minio-init
+    compose build test-client rustfs-init $SPARK_CLIENT_BUILD
 else
-    compose build test-client test-otterstax minio-init
+    compose build test-client test-otterstax rustfs-init $SPARK_CLIENT_BUILD
 fi
 
 echo "✅ Previous containers and volumes removed"
@@ -249,9 +257,9 @@ echo "=== Step 2: Starting databases ==="
 echo ""
 compose up -d mariadb1 mariadb2 postgres1 clickhouse1 kafka
 
-# MinIO for the s3 external-table tests; minio-init seeds test-bucket then exits.
-echo "🪣 Starting MinIO + seeding test-bucket..."
-compose up -d minio minio-init
+# RustFS for the s3 external-table tests; rustfs-init seeds test-bucket then exits.
+echo "🪣 Starting RustFS + seeding test-bucket..."
+compose up -d rustfs rustfs-init
 
 echo ""
 echo "=== Step 3: Waiting for databases to be ready ==="
@@ -359,19 +367,19 @@ wait_for_database_init mariadb2 user2 password2 db2 impressions
 wait_for_pg_table postgres1 pguser pgdb products
 wait_for_ch_table clickhouse1 chuser chpassword chdb orders
 
-# Wait for the one-shot minio-init to finish seeding test-bucket so the s3
+# Wait for the one-shot rustfs-init to finish seeding test-bucket so the s3
 # external-table tests find their fixtures. It exits after seeding.
-echo "🕒 Waiting for MinIO bucket seeding to complete..."
+echo "🕒 Waiting for RustFS bucket seeding to complete..."
 for i in {1..60}; do
-    status=$(docker inspect test-minio-init --format '{{.State.Status}}' 2>/dev/null || echo "missing")
+    status=$(docker inspect test-rustfs-init --format '{{.State.Status}}' 2>/dev/null || echo "missing")
     if [ "$status" = "exited" ]; then
-        echo "✅ MinIO test-bucket seeded"
+        echo "✅ RustFS test-bucket seeded"
         break
     fi
     sleep 2
     if [ $i -eq 60 ]; then
-        echo "⚠️  minio-init did not finish in time; s3 tests may retry"
-        compose logs minio-init | tail -10 2>/dev/null || true
+        echo "⚠️  rustfs-init did not finish in time; s3 tests may retry"
+        compose logs rustfs-init | tail -10 2>/dev/null || true
     fi
 done
 
@@ -657,6 +665,24 @@ fi
 #        fi
 #    fi
 #fi
+
+echo ""
+echo "=== Step 8d: Spark Connect client matrix ==="
+echo ""
+# Every released PySpark client (Dockerfile.spark-test) against the Spark
+# Connect frontend, after the standard suite in either mode — `compose run`
+# brings test-otterstax back up when the Tracy-Sep loop left it removed.
+# `set -e` is active: capture the rc so a failure is reported, not fatal.
+_spark_rc=0
+compose run --rm --use-aliases test-spark-client /app/run_spark_matrix.sh || _spark_rc=$?
+if [ $_spark_rc -eq 0 ]; then
+    echo "✅ PASSED: Spark Connect client matrix"
+else
+    echo "❌ FAILED: Spark Connect client matrix (exit code $_spark_rc)"
+    echo "--- otterstax logs (last 40 lines) ---"
+    compose logs test-otterstax 2>/dev/null | tail -40
+    TEST_RC=1
+fi
 
 echo ""
 echo "=== Test run exit code: $TEST_RC ==="

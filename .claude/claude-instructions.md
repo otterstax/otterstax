@@ -43,7 +43,7 @@ JOIN impressions.db2.schema.impressions ON campaigns.id = impressions.id
 ```
 - `campaigns` and `impressions` are **connection aliases** (not databases!)
 - Each alias maps to a connection declared in the `connections:` section of the
-  single `config.yaml` (see `examples/simple/example_connetion/config.yaml`)
+  single `config.yaml` (see `scripts/database/config.yaml`)
 - Connections are read once at server startup from that file (default `config.yaml`,
   override with `--config PATH`). There is no runtime add/remove API.
 
@@ -104,7 +104,7 @@ chmod +x ./docker-run-tests.sh
 1. fixtures/generate_data.py          # Creates MariaDB init SQL scripts
 2. docker compose up -d                # Starts services (connections read from
                                        #   scripts/database/config.yaml at startup)
-3. python examples/simple/flight_sql_example.py examples/simple/example_1.txt  # Executes federated query
+3. psql -h localhost -p 8817 -U test test     # Executes federated queries over the PostgreSQL wire
 ```
 
 **Testing Anti-Pattern**: Docker volumes (`mariadb*_init`) can lag on cold starts. The test script includes `wait_for_database_init()` with 120-sec timeout - respect this when writing integration tests.

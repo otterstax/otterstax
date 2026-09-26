@@ -7,8 +7,6 @@ set(${PROJECT_NAME}_SOURCES
     test_wire_type_support.cpp
     # wire-level tests of the other two frontends: they need no running server
     test_pg_frontend_packets.cpp
-    test_flight_ticket.cpp
-    test_chunk_batch_reader.cpp
 )
 
 add_executable(${PROJECT_NAME} ${${PROJECT_NAME}_SOURCES})

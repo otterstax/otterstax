@@ -238,7 +238,7 @@ namespace {
         }
 
         // Sorted "<db>.<schema>.<table>" of every row get_tables returns.
-        std::vector<std::string> list_tables(const arrow::flight::sql::GetTables& command) {
+        std::vector<std::string> list_tables(const catalog_ext::get_tables_command_t& command) {
             auto [needs_sched, future] =
                 actor_zeta::send(catalog->address(), &mysql::CatalogManager::get_tables, command);
             wait_until_ready(future);
@@ -277,8 +277,8 @@ namespace {
         std::vector<std::string> statements;
     };
 
-    arrow::flight::sql::GetTables get_tables_command() {
-        arrow::flight::sql::GetTables command;
+    catalog_ext::get_tables_command_t get_tables_command() {
+        catalog_ext::get_tables_command_t command;
         command.include_schema = false;
         return command;
     }

@@ -284,7 +284,7 @@ TEST_CASE("PostgressManager::discover: a failed ENUM query refuses the registrat
     REQUIRE_FALSE(connector_manager->hasConnection("shop"));
 
     auto [needs_sched, future] =
-        actor_zeta::send(catalog_manager->address(), &mysql::CatalogManager::get_tables, arrow::flight::sql::GetTables{});
+        actor_zeta::send(catalog_manager->address(), &mysql::CatalogManager::get_tables, catalog_ext::get_tables_command_t{});
     wait_until_ready(future);
     auto listed = std::move(future).take_ready();
     REQUIRE_FALSE(listed.has_error());

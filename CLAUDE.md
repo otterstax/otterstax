@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Project Is
 
-OtterStax is a federated SQL query server. Clients connect via MySQL wire protocol (8816), PostgreSQL wire protocol (8817), Apache Arrow FlightSQL (8815), or Spark Connect (15002 — gRPC, for PySpark clients: `spark.sql()`, DataFrame operations, `spark.catalog`). Queries are either executed locally by the Otterbrix engine or dispatched to registered remote database backends (MariaDB/MySQL, PostgreSQL, ClickHouse). There is a **single config file** (`config.yaml`) that holds the wire-server settings and, under a `connections:` section, every remote backend and s3 alias — read once at startup. That `connections:` section is the single source of truth for connections; there is no runtime add/remove API.
+OtterStax is a federated SQL query server. Clients connect via MySQL wire protocol (8816), PostgreSQL wire protocol (8817), Arrow Flight SQL (8815 — served by an in-house implementation, no Arrow Flight dependency), or Spark Connect (15002 — gRPC, for PySpark clients: `spark.sql()`, DataFrame operations, `spark.catalog`). Queries are either executed locally by the Otterbrix engine or dispatched to registered remote database backends (MariaDB/MySQL, PostgreSQL, ClickHouse). There is a **single config file** (`config.yaml`) that holds the wire-server settings and, under a `connections:` section, every remote backend and s3 alias — read once at startup. That `connections:` section is the single source of truth for connections; there is no runtime add/remove API.
 
 ## Connection Config
 
@@ -483,7 +483,7 @@ otterbrix-internal — shadow of `external_join_all` benchmark), all driven by
 | `otterbrix/` | `otterbrix_local` (+ `otterbrix_s3_extension`, `otterbrix_file_extension`) | Parser, SQL generator, translators, plan execution, grammar extensions for `CREATE EXTERNAL TABLE` / `COPY ... TO` |
 | `otterbrix/parser/grammar_extension/kafka/` | `kafka_grammar` | Kafka DDL parser extension (flex+bison): `kafka_node_t`, `kafka_write_target` |
 | `scheduler/` | `scheduler` | `Scheduler` router + `Worker` pool (full parse→catalog→backend→otterbrix pipeline, including external-statement dispatch) + schema computation utilities |
-| `frontend/` | `flight_sql_server`, `mysql_server`, `postgres_server`, `spark_connect_server` | Wire-protocol frontends (await `Scheduler` futures via `asio_future_bridge.hpp`) and the Spark Connect gRPC server (asio-grpc; `spark.sql()` through `Scheduler::execute`, DataFrame plans through `Scheduler::execute_plan`, awaited via `await_future.hpp`). See `frontend/CLAUDE.md` |
+| `frontend/` | `flight_sql`, `mysql_server`, `postgres_server`, `spark_connect_server` | Wire-protocol frontends (await `Scheduler` futures via `asio_future_bridge.hpp`). `flight_sql/` is the in-house Flight SQL server: asio-grpc handlers over gRPC, the data plane on the project's arrow core (`arrow::ipc` + `tsl::*` translators) — no Arrow Flight dependency. The Spark Connect gRPC server (asio-grpc; `spark.sql()` through `Scheduler::execute`, DataFrame plans through `Scheduler::execute_plan`, awaited via `await_future.hpp`). See `frontend/CLAUDE.md` |
 | `utility/` | (header-only) | `session`, `wait_barrier` (connector error marshalling), `asio_error`, `table_info`, logger, profiler |
 | `cmake/` | (helper macros) | `otterbrix_parser_extension.cmake` — builds the s3/file flex+bison grammar extensions |
 | `tests/` | `test_system`, `test_parser`, `test_schema`, `test_utils`, `test_unit_translators`, `test_unit_config`, `test_unit_spark_connect`, `test_kafka_grammar`, `test_mysql_front` | Catch2 tests + python integration suite under `tests/test_*.py` (the `test_spark_client_*.py` files run in the PySpark client matrix, `Dockerfile.spark-test`; binary names are the `project()` names in `tests/*/CMakeLists.txt`; see `tests/CLAUDE.md`) |
@@ -500,7 +500,7 @@ otterbrix-internal — shadow of `external_join_all` benchmark), all driven by
 ## Critical Dependency Versions
 
 - Otterbrix 1.0.0b2-rc-3 (custom Conan remote: `http://conan.otterbrix.com`; pinned by recipe revision in `conanfile.py`)
-- Arrow 24.0.0 (with `with_flight_sql=True`, `with_s3=True`, `with_parquet=True`, `with_csv=True`, `with_json=True`, plus snappy/brotli/zlib/lz4/zstd compression codecs)
+- Arrow 24.0.0 (with `with_s3=True`, `with_parquet=True`, `with_csv=True`, `with_json=True`, plus snappy/brotli/zlib/lz4/zstd compression codecs)
 - Boost 1.88.0
 - actor-zeta 1.2.0
 - Catch2 3.15.1 (v3 — `find_package(Catch2 3)` required by the otterbrix recipe)

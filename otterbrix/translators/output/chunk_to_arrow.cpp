@@ -2,6 +2,7 @@
 // Copyright 2025-2026  OtterStax
 
 #include "chunk_to_arrow.hpp"
+#include "decimal_carrier.hpp"
 #include "otterbrix/translators/error.hpp"
 #include "writable_columns.hpp"
 
@@ -18,39 +19,13 @@ namespace {
     using arrow_type_result = core::result_wrapper_t<std::shared_ptr<arrow::DataType>>;
     using arrow_schema_result = core::result_wrapper_t<std::shared_ptr<arrow::Schema>>;
 
-    // alias() asserts on a column that carries no alias (an unnamed expression), so the
-    // presence check comes first; Arrow itself names such a field with the empty string.
-    std::string field_name(const types::complex_logical_type& t) {
-        return t.has_alias() ? t.alias() : std::string{};
-    }
-
-    // Arrow has no 128-bit integer type. decimal128 is its only 128-bit integral carrier, and
-    // 38 is the widest precision it declares; scale 0 keeps the value an integer rather than a
-    // fixed-point number. The schema and the builder must name the same type, hence the shared
-    // constant.
-    constexpr int32_t hugeint_precision = 38;
-
-    // The (precision, scale) the column's values are declared under. A DECIMAL carries its
-    // own; a HUGEINT has none of its own and rides the widest precision decimal128 declares,
-    // at scale 0, which leaves the value an integer.
-    struct decimal_spec {
-        int32_t precision;
-        int32_t scale;
-    };
-
-    decimal_spec spec_of(const types::complex_logical_type& t) {
-        if (t.type() == types::logical_type::DECIMAL) {
-            const auto* extension = t.extension_as<types::decimal_logical_type_extension>();
-            return {static_cast<int32_t>(extension->width()), static_cast<int32_t>(extension->scale())};
-        }
-        return {hugeint_precision, 0};
-    }
-
-    // The two logical types whose values travel as a decimal128: the engine's fixed-point
-    // DECIMAL, and HUGEINT for want of a 128-bit integer type on the Arrow side.
-    bool travels_as_decimal(const types::complex_logical_type& t) {
-        return t.type() == types::logical_type::DECIMAL || t.type() == types::logical_type::HUGEINT;
-    }
+    // The DECIMAL/HUGEINT carrying rules live in decimal_carrier.hpp, shared
+    // with the custom Flight SQL IPC converter (chunk_to_ipc).
+    using tsl::decimal_spec;
+    using tsl::field_name;
+    using tsl::hugeint_precision;
+    using tsl::spec_of;
+    using tsl::travels_as_decimal;
 
     // Recursive over nested types; the zone sits on the two public entry points.
     arrow_type_result arrow_type_from_logical(std::pmr::memory_resource* res, const types::complex_logical_type& t) {
@@ -312,26 +287,14 @@ core::result_wrapper_t<arrow::Decimal128> to_arrow_decimal(std::pmr::memory_reso
     // The engine keeps a DECIMAL's unscaled integer at the width its precision needs, so it is
     // read back at that same width and sign-extended; reading a narrower one as int128 would
     // take the neighbouring bytes with it. A HUGEINT is already 128 bits wide.
-    types::int128_t raw = 0;
-    switch (stored_as) {
-        case types::physical_type::INT16:
-            raw = static_cast<types::int128_t>(value.value<int16_t>());
-            break;
-        case types::physical_type::INT32:
-            raw = static_cast<types::int128_t>(value.value<int32_t>());
-            break;
-        case types::physical_type::INT64:
-            raw = static_cast<types::int128_t>(value.value<int64_t>());
-            break;
-        case types::physical_type::INT128:
-            raw = value.value<types::int128_t>();
-            break;
-        default:
-            return tsl::make_error(res,
-                                   core::error_code_t::conversion_failure,
-                                   std::string{scope} + ": column '" + std::string{column_name} +
-                                       "' is stored at a width no decimal carrier reads");
+    const auto raw_storage = tsl::read_unscaled_decimal(type, value);
+    if (!raw_storage.has_value()) {
+        return tsl::make_error(res,
+                               core::error_code_t::conversion_failure,
+                               std::string{scope} + ": column '" + std::string{column_name} +
+                                   "' is stored at a width no decimal carrier reads");
     }
+    const types::int128_t raw = *raw_storage;
 
     // ±Infinity and NaN are ordinary payloads of the storage integer — the extremes of its
     // range — and decimal128 has no representation for any of the three, so carrying one would

@@ -327,7 +327,7 @@ namespace {
 
         // Sorted table names the catalog lists for the uid's database.
         std::vector<std::string> listed_tables() {
-            arrow::flight::sql::GetTables command;
+            catalog_ext::get_tables_command_t command;
             command.include_schema = false;
             auto [needs_sched, future] =
                 actor_zeta::send(catalog_->address(), &mysql::CatalogManager::get_tables, command);

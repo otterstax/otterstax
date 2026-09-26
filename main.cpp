@@ -8,14 +8,13 @@
 #include <thread>
 #include <vector>
 
-#include <arrow/util/logging.h>
 #include <boost/program_options.hpp>
 #include <spdlog/spdlog.h>
 
 #include "component_manager/component_manager.hpp"
 #include "connectors/mysql/connector.hpp"
 #include "connectors/s3/s3_subsystem.hpp"
-#include "frontend/flight_sql_server/server.hpp"
+#include "frontend/flight_sql/server.hpp"
 #include "frontend/mysql_server/mysql_server.hpp"
 #include "frontend/postgres_server/postgres_server.hpp"
 #include "frontend/spark_connect_server/spark_connect_server.hpp"
@@ -34,7 +33,6 @@ namespace {
 int main(int argc, char* argv[]) {
 
     // Logging
-    arrow::util::ArrowLog::StartArrowLog("server", arrow::util::ArrowLogLevel::ARROW_DEBUG);
     initialize_all_loggers(DATA_DIR);
 
     auto log = get_logger(logger_tag::Main);
@@ -106,16 +104,21 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Configure the Flight SQL server
-    Config config{
+    // Configure the Flight SQL server. The custom Flight SQL wire protocol
+    // (asio-grpc over gRPC): the engine adapter blocks its calling gRPC
+    // thread for the length of a query, so the thread count is what bounds
+    // the server's in-flight queries — one query thread per Worker thread,
+    // the same sizing ComponentManager uses for the Worker pool.
+    flight::server::config_t flight_config{
         .host = server_config.flight_sql.host,
         .port = server_config.flight_sql.port,
         .resource = cmanager.getResource(),
-        .catalog_address = cmanager.catalog_address(),
         .scheduler_address = cmanager.scheduler_address(),
+        .catalog_address = cmanager.catalog_address(),
+        .threads = std::max<std::size_t>(2, std::thread::hardware_concurrency()),
     };
 
-    SimpleFlightSQLServer server(config);
+    flight::server::flight_sql_server flight(flight_config);
 
     // Configure MySQL server
     frontend::frontend_server_config mysql_config{
@@ -160,12 +163,19 @@ int main(int argc, char* argv[]) {
     frontend::spark::spark_connect_server spark_server(spark_config);
     spark_server.start();
 
-    // Start the Flight SQL server. Serve() blocks until SIGTERM is received
-    // (registered via SetShutdownOnSignals inside Start()).
+    // Start the Flight SQL server and block on it until SIGTERM/SIGINT —
+    // the signal stops the grpc server and the GrpcContext, run() returns
+    // and the graceful shutdown sequence below runs.
     OTX_MESSAGE_L("startup: flightsql server starting");
-    arrow::Status status = server.Start();
+    if (!flight.start()) {
+        log->error("FlightSQL server failed to start on {}:{}", flight_config.host, flight_config.port);
+        mysql.stop();
+        postgres.stop();
+        spark_server.stop();
+        return -1;
+    }
+    flight.run();
 
-    // Serve() returned — graceful shutdown sequence.
     // Stop the wire-protocol frontends explicitly before their destructors run,
     // giving Tracy a clean window to flush the profile.
     {
@@ -186,10 +196,6 @@ int main(int argc, char* argv[]) {
         OTX_MESSAGE_L("shutdown: complete");
     }
 
-    if (!status.ok()) {
-        log->error("FlightSQL server error: {}", status.ToString());
-        return -1;
-    }
     return 0;
 }
 

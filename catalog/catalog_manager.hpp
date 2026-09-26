@@ -18,7 +18,6 @@
 #undef DAY
 #undef SECOND
 
-#include "arrow/flight/sql/server.h"
 #include "utility/logger.hpp"
 #include <actor-zeta.hpp>
 #include <components/types/types.hpp>
@@ -27,8 +26,10 @@
 #include <memory_resource>
 #include <mutex>
 #include <optional>
+#include <string>
 #include <string_view>
 #include <unordered_map>
+#include <vector>
 
 namespace catalog_ext {
 
@@ -36,6 +37,19 @@ namespace catalog_ext {
     // is the FlightSQL `table_type` it is listed under and the only value the
     // GetTables `table_types` filter can match.
     inline constexpr std::string_view table_type_name = "TABLE";
+
+    // The GetTables metadata command: the Flight SQL CommandGetTables filters
+    // decoupled from any wire-protocol library. `catalog` is an exact match on
+    // the database part; the two *_filter_pattern fields are SQL LIKE patterns
+    // (% and _); a non-empty `table_types` lists anything only if it names
+    // `table_type_name`.
+    struct get_tables_command_t {
+        std::optional<std::string> catalog;
+        std::optional<std::string> db_schema_filter_pattern;
+        std::optional<std::string> table_name_filter_pattern;
+        std::vector<std::string> table_types;
+        bool include_schema = false;
+    };
 
 } // namespace catalog_ext
 
@@ -99,7 +113,7 @@ namespace mysql {
         // and table parts; a non-empty `table_types` must name
         // catalog_ext::table_type_name for anything to be listed.
         actor_zeta::unique_future<core::result_wrapper_t<std::pmr::vector<table_info>>>
-        get_tables(arrow::flight::sql::GetTables command);
+        get_tables(catalog_ext::get_tables_command_t command);
 
         using dispatch_traits = actor_zeta::dispatch_traits<&CatalogManager::get_catalog_schema,
                                                             &CatalogManager::update_backend_type,

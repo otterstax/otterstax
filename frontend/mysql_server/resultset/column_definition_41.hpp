@@ -7,6 +7,8 @@
 #include "../mysql_defs/field_type.hpp"
 #include "../packet/length_encoded.hpp"
 #include "../packet/packet_writer.hpp"
+
+#include <components/types/types.hpp>
 #include <string>
 
 namespace frontend::mysql {
@@ -37,5 +39,13 @@ namespace frontend::mysql {
 
         void init_type(field_type type);
     };
+
+    // Fills in what a NEWDECIMAL column definition says about itself: `decimals`
+    // is the scale of the column (the field's documented meaning — the number of
+    // decimals, as 0x1F is used for float and double above), and the length is
+    // the digits plus room for the sign and the point. Both are fixed-size
+    // fields, so this never changes the packet size. Called for every column: a
+    // type that is not a DECIMAL is left exactly as init_type set it.
+    void apply_decimal_metadata(column_definition_41& column, const components::types::complex_logical_type& type);
 
 } // namespace frontend::mysql

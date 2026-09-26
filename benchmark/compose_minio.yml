@@ -14,7 +14,7 @@
 
 services:
   bench_minio:
-    image: minio/minio:latest
+    image: quay.io/minio/minio:latest
     container_name: bench_minio
     command: server /data --console-address ":9001"
     environment:
@@ -35,7 +35,7 @@ services:
 
   # One-shot: create + seed bench-bucket from the generated fixtures, then exit.
   bench_minio_init:
-    image: minio/mc:latest
+    image: quay.io/minio/mc:latest
     container_name: bench_minio_init
     depends_on:
       bench_minio:

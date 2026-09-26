@@ -3,6 +3,7 @@
 # ClickHouse OLAP history and a Postgres reference table. Needs STEP 1's
 # orders_live source and the pg/ch connections (loaded at startup from config.yaml).
 cd "$(dirname "$0")"; source ../lib/_common.sh
+require_server || exit 1
 
 title "STEP 2  ·  federated JOIN — Kafka ⋈ ClickHouse ⋈ Postgres (one query)"
-pause; psql_run 01_join.sql
+pause; psql_run 01_join.sql || exit $?

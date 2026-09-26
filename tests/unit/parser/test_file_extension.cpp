@@ -7,7 +7,7 @@
 // otterbrix parser registry (raw_parser) — mirroring otterbrix's own
 // components/sql/test/test_parser_extension.cpp.
 
-#include <catch2/catch.hpp>
+#include <catch2/catch_all.hpp>
 
 #include <cstring>
 #include <memory_resource>
@@ -59,7 +59,7 @@ parser_extension_registry_t make_registry() {
 // the no-terminator cases further down.
 
 TEST_CASE("file: CREATE EXTERNAL TABLE (local path) is parsed into the AST") {
-    std::pmr::monotonic_buffer_resource arena;
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     const auto* s = file_parse_ok(
         &arena, "CREATE EXTERNAL TABLE file.trades WITH (location='/data/trades.parquet', format='parquet');");
     CHECK(s->kind == file_ext::file_stmt_kind::create_external_table);
@@ -70,7 +70,7 @@ TEST_CASE("file: CREATE EXTERNAL TABLE (local path) is parsed into the AST") {
 }
 
 TEST_CASE("file: COPY (SELECT ...) TO local path captures the inner query") {
-    std::pmr::monotonic_buffer_resource arena;
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     const auto* s = file_parse_ok(&arena,
                                   "COPY (SELECT * FROM file.trades) TO '/data/out.csv' WITH ( format = 'csv' );");
     CHECK(s->kind == file_ext::file_stmt_kind::copy_to);
@@ -80,7 +80,7 @@ TEST_CASE("file: COPY (SELECT ...) TO local path captures the inner query") {
 }
 
 TEST_CASE("file: COPY requires the WITH (...) clause") {
-    std::pmr::monotonic_buffer_resource arena;
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     // WITH is mandatory in our COPY syntax — without it the statement is rejected
     // (and the core parser would claim a bare COPY ... TO as its own CopyStmt).
     auto res = file_ext::parse(&arena, "COPY (SELECT * FROM file.t) TO '/data/out.parquet';");
@@ -88,13 +88,13 @@ TEST_CASE("file: COPY requires the WITH (...) clause") {
 }
 
 TEST_CASE("file: an omitted format option resolves to nullptr") {
-    std::pmr::monotonic_buffer_resource arena;
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     const auto* s = file_parse_ok(&arena, "CREATE EXTERNAL TABLE file.t WITH (location='/data/d.parquet');");
     CHECK(s->format == nullptr);
 }
 
 TEST_CASE("file: a malformed statement is claimed as an error") {
-    std::pmr::monotonic_buffer_resource arena;
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto res = file_ext::parse(&arena, "CREATE EXTERNAL TABLE file.t WITH (format=);");
     CHECK(res.has_error());
 }
@@ -102,7 +102,7 @@ TEST_CASE("file: a malformed statement is claimed as an error") {
 TEST_CASE("file: trailing ';' is optional — no-terminator form also parses") {
     // mysql.connector / psycopg2 strip the terminator before send, so the
     // grammar must accept both forms; opt_semicolon → ( /*empty*/ | ';' ).
-    std::pmr::monotonic_buffer_resource arena;
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     const auto* c = file_parse_ok(
         &arena, "CREATE EXTERNAL TABLE file.t WITH (location='/data/d.parquet', format='parquet')");
     CHECK(c->kind == file_ext::file_stmt_kind::create_external_table);
@@ -113,7 +113,7 @@ TEST_CASE("file: trailing ';' is optional — no-terminator form also parses") {
 }
 
 TEST_CASE("file: core SQL and s3:// statements are not claimed") {
-    std::pmr::monotonic_buffer_resource arena;
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
 
     auto plain = file_ext::parse(&arena, "SELECT 1");
     CHECK_FALSE(plain.has_error());
@@ -128,7 +128,7 @@ TEST_CASE("file: core SQL and s3:// statements are not claimed") {
 // ── registry routing through raw_parser ─────────────────────────────────────
 
 TEST_CASE("file registry: a local-path statement is routed to the file extension") {
-    std::pmr::monotonic_buffer_resource arena;
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto registry = make_registry();
     // The WITH ( ... = ... ) clause is required: the core parser accepts a bare
     // `COPY (SELECT ...) TO 'file'` as its own CopyStmt, so without it the
@@ -145,7 +145,7 @@ TEST_CASE("file registry: a local-path statement is routed to the file extension
 // ── transform stage (lowers to an external_node_t the Scheduler routes) ──────
 
 TEST_CASE("file transform: ExtensionNode lowers to an external_node_t") {
-    std::pmr::monotonic_buffer_resource arena;
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto registry = make_registry();
     auto* node = reinterpret_cast<Node*>(
         linitial(raw_parser(&arena, "CREATE EXTERNAL TABLE file.t WITH (location='/data/d.parquet');", registry)));
@@ -155,8 +155,10 @@ TEST_CASE("file transform: ExtensionNode lowers to an external_node_t") {
     auto result = tr.transform(*node);
     REQUIRE_FALSE(result.has_error());
     REQUIRE(result.node_ptr() != nullptr);
-    auto* ext = dynamic_cast<otterstax::external::external_node_t*>(result.node_ptr().get());
-    REQUIRE(ext != nullptr);
+    // external_node_t is tagged node_type::unused; nothing else the extension
+    // transform produces carries that tag.
+    REQUIRE(result.node_ptr()->type() == components::logical_plan::node_type::unused);
+    auto* ext = static_cast<otterstax::external::external_node_t*>(result.node_ptr().get());
     CHECK(ext->op() == otterstax::external::external_op_t::create_external_table);
     CHECK_FALSE(ext->is_s3());
     CHECK(ext->location() == "/data/d.parquet");

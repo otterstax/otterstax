@@ -31,7 +31,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Run mc in a container attached to the MinIO network, with $HERE mounted at /work.
 mc() {
   docker run --rm --network "$NETWORK" -v "$HERE:/work" -w /work \
-    --entrypoint /bin/sh minio/mc:latest -c \
+    --entrypoint /bin/sh quay.io/minio/mc:latest -c \
     "mc alias set local $ENDPOINT $ACCESS_KEY $SECRET_KEY >/dev/null && mc $*"
 }
 

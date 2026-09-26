@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2025-2026  OtterStax
+#
+# PySpark client compatibility matrix: every released PySpark Connect client
+# side by side, each running tests/test_spark_client_*.py against the OtterStax
+# Spark Connect frontend (port 15002) via run_spark_matrix.sh. The Connect
+# client is pure Python — no JVM. Layout (see install_spark_clients.sh):
+#   /opt/pyspark/<version>/   one client per version
+#   /opt/pyspark/venv-<set>/  the dependencies: venv-3.5, venv-4.0, venv-4.1-4.2
+#   /opt/pyspark/manifest     "<version> <python>" — what the matrix runs
+
+FROM python:3.12-slim-bookworm
+
+# pyspark 3.5.x supports Python 3.8-3.11 only; bookworm ships 3.11.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.11 \
+    python3.11-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG SPARK_CLIENT_VERSIONS="3.5.0 3.5.1 3.5.2 3.5.3 3.5.4 3.5.5 3.5.6 3.5.7 3.5.8 3.5.9 4.0.0 4.0.1 4.0.2 4.0.3 4.0.4 4.1.0 4.1.1 4.1.2 4.1.3 4.2.0"
+
+COPY tests/scripts/install_spark_clients.sh /tmp/install_spark_clients.sh
+RUN bash /tmp/install_spark_clients.sh ${SPARK_CLIENT_VERSIONS} \
+    && rm /tmp/install_spark_clients.sh
+
+WORKDIR /app
+
+COPY tests/config.py tests/test_spark_client_*.py ./
+COPY tests/scripts/wait_for_otterstax.sh tests/scripts/run_spark_matrix.sh ./
+RUN chmod +x wait_for_otterstax.sh run_spark_matrix.sh
+
+CMD ["./run_spark_matrix.sh"]

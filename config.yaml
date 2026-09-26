@@ -20,6 +20,11 @@ service:
   postgres:
     port: 8817
 
+  # Spark Connect (gRPC) server — PySpark clients connect to sc://<host>:15002.
+  spark_connect:
+    host: "0.0.0.0"
+    port: 15002
+
   # Startup retry policy for opening remote backend connections (mysql/postgresql/
   # clickhouse connect eagerly and may need to wait on a still-booting DB).
   # max_attempts <= 1 means a single attempt (no retry). s3 aliases are only

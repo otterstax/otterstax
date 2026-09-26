@@ -21,7 +21,7 @@ other (and would JOIN the MariaDB/PG/CH backends, which share campaign_id).
 
 `source="file"` reads local paths mounted into the otterstax container
 (``/fixtures/...``); `source="s3"` reads ``s3://<bucket>/...`` after registering
-MinIO credentials through the HTTP API.
+RustFS credentials through the HTTP API.
 """
 
 import argparse
@@ -58,10 +58,10 @@ DATASETS = [
 # regions(4/campaign) ⋈ web_events(100/campaign) on campaign_id over 50 campaigns.
 JOIN_ROWS = NUM_CAMPAIGNS * REGIONS_PER_CAMPAIGN * EVENTS_PER_CAMPAIGN  # 20000
 
-# In-container view of the seeded MinIO + fixture mount (see compose.test.yml).
+# In-container view of the seeded RustFS + fixture mount (see compose.test.yml).
 S3_ALIAS = "miniotest"
 S3_BUCKET = "test-bucket"
-S3_ENDPOINT = "minio:9000"
+S3_ENDPOINT = "rustfs:9000"
 S3_ACCESS_KEY = "minioadmin"
 S3_SECRET_KEY = "minioadmin"
 S3_REGION = "us-east-1"

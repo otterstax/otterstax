@@ -1,5 +1,8 @@
-cmake_minimum_required(VERSION 3.15)
+# 3.24: $<LINK_GROUP:RESCAN> (internal static libs below) is not available earlier.
+cmake_minimum_required(VERSION 3.24)
 project(otterstax)
+
+set(CMAKE_POLICY_DEFAULT_CMP0167 NEW)
 
 set(CMAKE_VERBOSE_MAKEFILE TRUE)
 set(CMAKE_CXX_STANDARD 20 CACHE STRING "The C++ standard whose features are requested." FORCE)
@@ -21,7 +24,10 @@ list(APPEND CMAKE_MODULE_PATH ${CMAKE_SOURCE_DIR}/cmake)
 # The patchelf step in conanfile.py generate() adds $ORIGIN to every copied .so in lib/,
 # so each library can also find its own siblings — covering transitive deps through
 # RPATH-less Conan packages (e.g. boost) without requiring DT_RPATH inheritance.
-set(CMAKE_INSTALL_RPATH "$ORIGIN/lib:$ORIGIN")
+# $ORIGIN = Linux ld.so, @loader_path = macOS dyld; each ignores the other.
+# Semicolon-separated CMake list: colons inside one entry survive on ELF but
+# become a single bogus LC_RPATH on macOS.
+set(CMAKE_INSTALL_RPATH "$ORIGIN/lib;$ORIGIN;@loader_path/lib;@loader_path")
 set(CMAKE_BUILD_WITH_INSTALL_RPATH ON)
 
 # Set spdlog active level (can be overridden via -DSPDLOG_ACTIVE_LEVEL=...)
@@ -51,6 +57,17 @@ endif()
 if (ENABLE_ASAN)
     add_compile_options(-O0 -g -fno-omit-frame-pointer -fsanitize=address)
     add_link_options(-fsanitize=address)
+    # otterbrix's core/pmr.hpp switches base_otterbrix_t's by-value member type
+    # on the CONSUMER's __SANITIZE_ADDRESS__, so an ASAN-built app and the
+    # non-ASAN engine .so disagree on the class layout (size skew → corrupted
+    # `this` crashes at runtime). The macro is informational only — undefining
+    # it does NOT disable instrumentation, it just makes our TUs see the same
+    # layout as the engine. This holds only while the engine package itself is
+    # built without ASAN (the Conan packages are): an ASAN-built engine takes the
+    # other branch and this undefine would skew the layout instead of fixing it.
+    # Remove once the engine stops keying public ABI off consumer sanitizer
+    # macros.
+    add_compile_options(-U__SANITIZE_ADDRESS__)
 endif()
 
 if (ENABLE_TSAN)
@@ -66,14 +83,16 @@ endif()
 find_package(Arrow REQUIRED)
 find_package(otterbrix REQUIRED COMPONENTS log)
 find_package(actor-zeta REQUIRED)
-find_package(Catch2 2.13.7 REQUIRED)
-find_package(Boost 1.87.0 REQUIRED COMPONENTS
+find_package(Catch2 3 REQUIRED)
+find_package(Boost 1.88.0 REQUIRED COMPONENTS
     asio
     beast
     json
     program_options
     mysql
 )
+find_package(Protobuf REQUIRED)
+find_package(asio-grpc REQUIRED)
 find_package(PostgreSQL REQUIRED)
 find_package(yaml-cpp REQUIRED)
 find_package(clickhouse-cpp REQUIRED)
@@ -113,7 +132,6 @@ add_subdirectory(scheduler)
 set(${PROJECT_NAME}_HEADERS
 
         utility/timer.hpp
-        utility/cv_wrapper.hpp
         utility/tsan_helper.hpp
         utility/tracy_profiler.hpp
         utility/tracy_memory_resource.hpp
@@ -134,15 +152,28 @@ add_library(lib_${PROJECT_NAME} INTERFACE
 
 # set_property(TARGET otterbrix_${PROJECT_NAME} PROPERTY EXPORT_NAME ${PROJECT_NAME})
 
+# These internal static libs cross-reference each other (e.g. scheduler uses
+# integration handlers while integration/otterbrix_local use scheduler's
+# schema_utils), so a single left-to-right link pass can miss objects only
+# one of them pulls (e.g. integration/s3/s3_manager.o, referenced solely by
+# the Scheduler). RESCAN groups them (--start-group/--end-group) so the
+# linker re-pulls until the cycle is fully resolved. Apple's ld64 rejects
+# LINK_GROUP:RESCAN for CXX and does not need it — it re-searches archives
+# until no new symbols resolve.
+set(OTTERSTAX_INTERNAL_LIBS
+    flight_sql common_server mysql_server postgres_server
+    spark_connect_server catalog connectors s3 file component_manager
+    integration otterbrix_local scheduler kafka_grammar kafka_runtime)
+if(APPLE)
+    set(OTTERSTAX_LINK_GROUP ${OTTERSTAX_INTERNAL_LIBS})
+else()
+    list(JOIN OTTERSTAX_INTERNAL_LIBS "," _otterstax_internal_libs_csv)
+    set(OTTERSTAX_LINK_GROUP "$<LINK_GROUP:RESCAN,${_otterstax_internal_libs_csv}>")
+endif()
+
 target_link_libraries(
     lib_${PROJECT_NAME} INTERFACE
-    # These internal static libs cross-reference each other (e.g. scheduler uses
-    # integration handlers while integration/otterbrix_local use scheduler's
-    # schema_utils), so a single left-to-right link pass can miss objects only
-    # one of them pulls (e.g. integration/s3/s3_manager.o, referenced solely by
-    # the Scheduler). RESCAN groups them (--start-group/--end-group) so the
-    # linker re-pulls until the cycle is fully resolved.
-    "$<LINK_GROUP:RESCAN,flight_sql_server,common_server,mysql_server,postgres_server,catalog,connectors,s3,file,component_manager,integration,otterbrix_local,scheduler,kafka_grammar,kafka_runtime>"
+    ${OTTERSTAX_LINK_GROUP}
     config::config
     arrow::arrow
     Boost::boost

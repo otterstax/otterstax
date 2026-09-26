@@ -460,3 +460,6 @@ fixtures/init/mariadb1/init.sql
 /tracy_profiles/
 /benchmark_results/
 /benchmark_manual/
+
+# Go module of the Flight SQL e2e harness, which the *.mod patterns above would hide
+!tests/flightsql_go/go.mod

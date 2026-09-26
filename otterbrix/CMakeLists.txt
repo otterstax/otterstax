@@ -3,18 +3,22 @@ add_subdirectory(parser/grammar_extension/kafka)
 set(OTTERBRIX_HEADERS
     config.hpp
     translators/input/mysql_to_chunk.hpp
-    translators/input/mysql_to_complex.hpp
     translators/input/pg_to_chunk.hpp
     translators/input/ch_to_chunk.hpp
     translators/input/arrow_to_chunk.hpp
     translators/input/parquet_to_chunk.hpp
     translators/input/csv_to_chunk.hpp
     translators/input/ndjson_to_chunk.hpp
+    translators/input/affected_rows_carrier.hpp
+    translators/input/chunk_windows.hpp
+    translators/error.hpp
     translators/output/chunk_to_arrow.hpp
     translators/output/chunk_to_parquet.hpp
     translators/output/chunk_to_csv.hpp
     translators/output/chunk_to_ndjson.hpp
+    translators/output/writable_columns.hpp
     operators/execute_plan.hpp
+    operators/schema_probe.hpp
     parser/name_resolution.hpp
     parser/parser.hpp
     parser/subquery_extractor.hpp
@@ -24,13 +28,13 @@ set(OTTERBRIX_HEADERS
 
 set(OTTERBRIX_SOURCES
     translators/input/mysql_to_chunk.cpp
-    translators/input/mysql_to_complex.cpp
     translators/input/pg_to_chunk.cpp
     translators/input/ch_to_chunk.cpp
     translators/input/arrow_to_chunk.cpp
     translators/input/parquet_to_chunk.cpp
     translators/input/csv_to_chunk.cpp
     translators/input/ndjson_to_chunk.cpp
+    translators/input/chunk_windows.cpp
     translators/output/chunk_to_arrow.cpp
     translators/output/chunk_to_parquet.cpp
     translators/output/chunk_to_csv.cpp

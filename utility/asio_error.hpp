@@ -9,18 +9,16 @@
 
 namespace otterstax {
 
-    // Tiny wrapper around core::error_t with a public default constructor.
+    // Return type of the error-only connector handlers (schema discovery,
+    // metadata probes): a query whose outcome IS the error and carries no payload.
     //
-    // WHY: asio::co_spawn (used by all three backend connectors via
-    // ConnectorManager::executeQuery → co_spawn(... use_future)) requires the
-    // result type T to be default-constructible — asio internally does
-    // `T()` when materializing exception completions. core::error_t's default
-    // ctor is private (only error_t::no_error() is public), which makes it
-    // unsuitable as the awaitable's result type directly.
-    //
-    // This wrapper exists solely as the awaitable result type for runQuery
-    // overloads and the corresponding handler return type. Callers should
-    // unwrap to plain core::error_t at their boundary via .release().
+    // It is a distinct type on purpose. `query_result_t` in wait_barrier.hpp
+    // keys off it to marshal such a query as a bare core::error_t instead of a
+    // result_wrapper_t<core::error_t> that would carry the same failure twice, and
+    // the public default constructor spells "no error" for a handler that has
+    // nothing to report — core::error_t's own default constructor is private.
+    // The connector unwraps it to plain core::error_t via .release() before the
+    // outcome leaves the io thread.
     struct asio_error_t {
         core::error_t error;
 

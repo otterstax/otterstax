@@ -20,6 +20,7 @@
 #include "config/connections/connection_config.hpp"
 
 #include <actor-zeta.hpp>
+#include <core/result_wrapper.hpp>
 #include <otterbrix/otterbrix.hpp>
 
 #include <memory_resource>
@@ -31,33 +32,31 @@ public:
     explicit ComponentManager(const configuration::config& config);
     ~ComponentManager();
     std::pmr::memory_resource* getResource();
-    std::string getLogPath();
-    std::shared_ptr<mysql::ConnectorManager> db_connection_manager() const;
-    std::shared_ptr<pg::ConnectorManager> pg_connection_manager() const;
-    std::shared_ptr<ch::ConnectorManager> ch_connection_manager() const;
     actor_zeta::address_t scheduler_address() const;
     actor_zeta::address_t catalog_address() const;
-    actor_zeta::address_t otterbrix_manager_address() const;
-    actor_zeta::address_t sql_connection_manager_address() const;
-    actor_zeta::address_t pg_connection_manager_address() const;
-    actor_zeta::address_t file_manager_address() const;
-    actor_zeta::address_t s3_manager_address() const;
 
     // Register every remote backend and s3 alias described by the connection
     // config (parsed from the config file at startup) with the corresponding
     // connector managers. This is the sole entry point for registering
-    // connections — there is no runtime add/remove API. Entries that fail
-    // required-field validation are skipped; opening a backend is retried per
-    // `retry` (mysql/pg/ch connect eagerly and may need to wait on a slow DB).
-    void register_connections(const config::ConnectionsConfig& connections,
-                              const config::ConnectionRetryConfig& retry = {});
+    // connections — there is no runtime add/remove API. Every descriptor was
+    // validated for completeness by parse_connections before it reaches this
+    // point. Opening a backend is best-effort: it is retried per `retry`
+    // (mysql/pg/ch connect eagerly and may need to wait on a slow DB) and a
+    // backend that stays unreachable is logged and skipped. A descriptor the
+    // backend rejects outright (invalid_parameter) or an s3 alias that cannot be
+    // stored is a configuration error, returned so startup aborts.
+    [[nodiscard]] core::error_t register_connections(const config::ConnectionsConfig& connections,
+                                                     const config::ConnectionRetryConfig& retry);
+
 private:
     db::otterbrix_engine_ptr engine_{nullptr};
     std::pmr::memory_resource* resource_{nullptr};
-    std::string log_path_;
-    std::shared_ptr<mysql::ConnectorManager> db_connector_manager_{nullptr};
-    std::shared_ptr<pg::ConnectorManager> pg_connector_manager_{nullptr};
-    std::shared_ptr<ch::ConnectorManager> ch_connector_manager_{nullptr};
+    // Sole owner of the three connector managers. Everyone else — the catalog
+    // actor and the three integration actors — holds a non-owning pointer, and
+    // is declared BELOW so it is destroyed first.
+    std::unique_ptr<mysql::ConnectorManager> db_connector_manager_{nullptr};
+    std::unique_ptr<pg::ConnectorManager> pg_connector_manager_{nullptr};
+    std::unique_ptr<ch::ConnectorManager> ch_connector_manager_{nullptr};
     std::unique_ptr<mysql::CatalogManager, actor_zeta::pmr::deleter_t> catalog_manager_{
         nullptr,
         actor_zeta::pmr::deleter_t{getResource()}};

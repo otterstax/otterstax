@@ -106,7 +106,7 @@ main.cpp
 | integration tests | `tests/scripts/config.yaml` | baked by `Dockerfile.test` |
 | root manual stack | `scripts/database/config.yaml` | mounted by `compose.yml` |
 | benchmarks | `benchmark/config.yaml` | mounted by `benchmark/compose_benchmark.yml` |
-| examples/simple | `examples/simple/example_connetion/config{,_local}.yaml` | pass `--config <file>` |
+| quick start (`examples/quick_start/`) | `examples/quick_start/config.yaml` | mounted by `examples/quick_start/compose.yml` |
 
 Unit tests: `tests/unit/config/` (`test_unit_config`).
 

@@ -137,7 +137,7 @@ CREATE EXTERNAL TABLE otter.regions
 ```
 
 Ready-made `config.yaml` files ship with each runnable stack: `examples/demo/`,
-`examples/simple/example_connetion/`, `tests/scripts/`, `scripts/database/`, and
+`examples/quick_start/`, `tests/scripts/`, `scripts/database/`, and
 `benchmark/` (plus a template at the repo root).
 
 ## S3 / file external tables
@@ -236,10 +236,10 @@ docker compose up
    section to point at your backends and s3 aliases, then restart the server —
    connections are read only at startup (there is no runtime registration step).
 
-4. Run example queries using the Python client:
+4. Run example queries over the PostgreSQL wire:
 
 ```bash
-python examples/simple/flight_sql_example.py examples/simple/example_1.txt
+psql -h localhost -p 8817 -U test test
 ```
 
 3. (Optional) Add example database connections used by clients:
@@ -370,7 +370,7 @@ otterstax/
 ├── scheduler/          # Query routing actor
 ├── cmake/              # Build helpers (parser-extension macro)
 ├── tests/              # Catch2 C++ tests + python integration suite
-├── examples/           # Demo stack (examples/demo/) + simple client examples (examples/simple/)
+├── examples/           # Demo stack (examples/demo/) + quick start (examples/quick_start/)
 └── fixtures/           # Test data generation
 ```
 

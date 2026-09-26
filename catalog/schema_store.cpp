@@ -46,23 +46,4 @@ namespace otterstax::catalog {
         return it == by_oid_.end() ? nullptr : &it->second.schema;
     }
 
-    std::pmr::vector<components::catalog::oid_t> schema_store_t::oids_by_uid(std::string_view uid) const {
-        std::pmr::vector<components::catalog::oid_t> oids(resource_);
-        for (const auto& [oid, entry] : by_oid_) {
-            if (entry.name.unique_identifier == uid) {
-                oids.push_back(oid);
-            }
-        }
-        return oids;
-    }
-
-    void schema_store_t::erase(components::catalog::oid_t oid) {
-        auto it = by_oid_.find(oid);
-        if (it == by_oid_.end()) {
-            return;
-        }
-        by_name_.erase(it->second.name);
-        by_oid_.erase(it);
-    }
-
 } // namespace otterstax::catalog

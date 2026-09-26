@@ -447,6 +447,9 @@ clickhouse_data/
 init/
 fixtures/init/
 tests/init/
+# quick-start ships its init data as committed static files (zero-prep `docker compose up`)
+!examples/quick_start/init/
+!examples/quick_start/init/**
 tests/mariadb1/
 tests/mariadb2/
 tests/mariadb3/
@@ -457,3 +460,6 @@ fixtures/init/mariadb1/init.sql
 /tracy_profiles/
 /benchmark_results/
 /benchmark_manual/
+
+# Go module of the Flight SQL e2e harness, which the *.mod patterns above would hide
+!tests/flightsql_go/go.mod

@@ -24,6 +24,19 @@
 #include <vector>
 
 namespace db {
+
+    // Per-uid manifest of the external tables mirrored into the uid's engine
+    // database: the collection `<uid>.<external_manifest_collection>`, one row
+    // (external_manifest_column STRING = encoded collection name) per mirror.
+    // It exists because the engine's pg_class is not readable through SQL, so
+    // it is the only record of which mirrors a previous run left behind; a
+    // registration writes its row BEFORE creating the collection and a drop
+    // deletes it AFTER dropping, so the manifest is always a superset of the
+    // mirrors that exist. No encoded mirror name can collide with it: an
+    // encoded name always carries two ':' separators.
+    inline constexpr const char* external_manifest_collection = "__otterstax_tables";
+    inline constexpr const char* external_manifest_column = "collection";
+
     class OtterbrixManager final : public actor_zeta::actor::actor_mixin<OtterbrixManager> {
     public:
         using is_cooperative_actor_type = void; // Required by actor_zeta::send() concept
@@ -45,18 +58,38 @@ namespace db {
 
         // Registration channel: mirrors external (remote-backend) tables into the
         // engine pg_catalog so the planner can resolve them by OID.
-        // Creates the engine database "<db_name>" (one per connection uid).
+        // Makes the engine database "<db_name>" (one per connection uid) and
+        // its manifest exist. Answers `true` when the database was created and
+        // `false` when the engine already held it: the catalog's
+        // check_database_ownership keeps user DDL off a uid's name, so an
+        // existing database of that name is this connection's mirror from a
+        // previous run over the same data dir, to be reconciled, not refused.
+        // The one exception is a data dir written before that guard existed,
+        // where a user database of the uid's name is taken for the mirror.
         actor_zeta::unique_future<core::result_wrapper_t<bool>> register_external_database(std::string db_name);
 
-        // Creates the engine collection for the external table `name` — the
-        // connection uid becomes the engine database, the remaining qualifiers
-        // are folded into the encoded collection name — and reads back its
-        // pg_class OID.
+        // Makes the engine collection for the external table `name` — the
+        // connection uid is the engine database, the remaining qualifiers fold
+        // into the encoded collection name — carry exactly `columns`, and
+        // answers its pg_class OID: an absent collection is created; a present
+        // one with the same column names and types is reused under its
+        // restored OID; a present one with another schema is dropped and
+        // recreated (logged). The manifest row is written first.
         actor_zeta::unique_future<core::result_wrapper_t<components::catalog::oid_t>>
         register_external_table(qualified_name_t name, std::vector<components::table::column_definition_t> columns);
 
-        // Drops the engine database "<db_name>" together with all collections.
-        actor_zeta::unique_future<core::result_wrapper_t<bool>> drop_external_database(std::string db_name);
+        // Drops the engine collection register_external_table made for `name`
+        // and its manifest row, so the catalog can undo a registration it could
+        // not mirror: an external table present in the engine catalog but
+        // absent from the catalog's store would resolve nowhere.
+        actor_zeta::unique_future<core::result_wrapper_t<bool>> drop_external_table(qualified_name_t name);
+
+        // Drops every mirror the uid's manifest lists that `live` — the tables
+        // the current discovery returned — does not name, manifest row
+        // included; a manifest row whose collection is already gone is deleted
+        // alone. Answers the number of manifest rows removed.
+        actor_zeta::unique_future<core::result_wrapper_t<size_t>>
+        drop_stale_external_tables(std::string db_name, std::pmr::vector<qualified_name_t> live);
 
         actor_zeta::unique_future<core::result_wrapper_t<bool>> create_table(session_hash_t id,
                                                                              std::string database,
@@ -68,7 +101,8 @@ namespace db {
                                                             &OtterbrixManager::create_table,
                                                             &OtterbrixManager::register_external_database,
                                                             &OtterbrixManager::register_external_table,
-                                                            &OtterbrixManager::drop_external_database>;
+                                                            &OtterbrixManager::drop_external_table,
+                                                            &OtterbrixManager::drop_stale_external_tables>;
 
 
         actor_zeta::behavior_t behavior(actor_zeta::mailbox::message* msg);
@@ -81,5 +115,17 @@ namespace db {
         log_t log_;
         OTX_LOCKABLE_N(std::mutex, mutex_, "OtterbrixManager::mutex");
         actor_zeta::behavior_t current_behavior_;
+
+        // Manifest of `db_name`: the manifest collection created when absent,
+        // reused when the engine already holds it.
+        core::error_t ensure_manifest(const std::string& db_name);
+        // Encoded collection names the manifest of `db_name` lists.
+        core::result_wrapper_t<std::pmr::vector<std::pmr::string>> read_manifest(const std::string& db_name);
+        // The manifest row of `collection` written exactly once: any row it
+        // already has is deleted first.
+        core::error_t write_manifest_row(const std::string& db_name, const std::string& collection);
+        core::error_t delete_manifest_row(const std::string& db_name, const std::string& collection);
+        // DROP TABLE of one engine collection; the engine's verdict as is.
+        core::error_t drop_collection(const std::string& db_name, const std::string& collection);
     };
 } // namespace db

@@ -22,10 +22,12 @@ namespace frontend::mysql {
     build_ok(packet_writer& writer, uint8_t sequence_id, uint64_t affected_rows, server_status_flags_t server_flags) {
         writer.reserve_payload(OK_PAYLOAD_SIZE);
         writer.write_uint8(OK_PACKET_HEADER); // OK header
-        writer.write_uint8(static_cast<uint8_t>(affected_rows));
-        writer.write_uint8(0x00);          // last insert-id
-        writer.write_uint16(server_flags); // status flags (autocommit)
-        writer.write_uint16(0x0000);       // warnings
+        // Both counts are length-encoded: a single byte carries at most 250,
+        // and 0xFB..0xFF in that position are the NULL / int-size markers.
+        writer.write_length_encoded_integer(affected_rows);
+        writer.write_length_encoded_integer(0); // last insert-id
+        writer.write_uint16(server_flags);      // status flags (autocommit)
+        writer.write_uint16(0x0000);            // warnings
         return writer.build_from_payload(sequence_id);
     }
 
@@ -65,6 +67,7 @@ namespace frontend::mysql {
             case mysql_error::ER_DB_DROP_EXISTS:
             case mysql_error::ER_TABLE_EXISTS_ERROR:
             case mysql_error::ER_UNKNOWN_STMT_HANDLER:
+            case mysql_error::ER_NOT_SUPPORTED_YET:
                 sql_state = sql_state::COMMAND_ERROR;
                 break;
             case mysql_error::ER_CON_COUNT_ERROR:

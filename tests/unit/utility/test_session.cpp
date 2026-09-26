@@ -3,7 +3,7 @@
 
 #include "utility/session.hpp"
 
-#include <catch2/catch.hpp>
+#include <catch2/catch_all.hpp>
 #include <iostream>
 
 TEST_CASE("session: base test") {

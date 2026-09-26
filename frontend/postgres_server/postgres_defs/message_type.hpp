@@ -34,6 +34,7 @@ namespace frontend::postgres {
             inline constexpr char BIND_COMPLETE = '2';
             inline constexpr char CLOSE_COMPLETE = '3';
             inline constexpr char NO_DATA_MSG = 'n';
+            inline constexpr char PARAMETER_DESCRIPTION = 't';
             inline constexpr char PORTAL_SUSPENDED = 's';
             inline constexpr char COPY_IN_RESPONSE = 'G';
             inline constexpr char COPY_OUT_RESPONSE = 'H';

@@ -6,6 +6,7 @@
 #include "file_ast.hpp"
 #include "file_gram.hpp"
 #include "file_scan.h"
+#include "utility/tracy_profiler.hpp"
 
 #include <cassert>
 #include <cctype>
@@ -99,6 +100,7 @@ namespace file_ext {
     using namespace components::sql::parser;
 
     parse_extension_result_t parse(std::pmr::memory_resource* resource, const std::string& query) {
+        OTX_ZONE_N("file_ext::parse");
         std::string inner_sql;
         std::string scrubbed = query;
 
@@ -159,6 +161,7 @@ namespace file_ext {
     components::logical_plan::node_ptr transform(std::pmr::memory_resource* resource,
                                                  ExtensionNode* node,
                                                  components::logical_plan::parameter_node_t* /*params*/) {
+        OTX_ZONE_N("file_ext::transform");
         assert(node->extension_id != nullptr && std::string_view(node->extension_id) == "file");
 
         // Lower the parsed statement into an external_node_t the Scheduler routes

@@ -1,0 +1,235 @@
+# Quick-start demo — one command brings up the whole federated stack:
+#
+#     cd examples/quick_start && docker compose up -d
+#
+# Two independent PostgreSQL backends + one MariaDB + one ClickHouse + MinIO
+# (S3) + Kafka + OtterStax. Everything is seeded from the committed files under
+# init/ (databases from init/<engine>/init.sql, s3 objects from init/s3/*, kafka
+# events from init/kafka/orders.ndjson). Named volumes keep the DB/s3 data across
+# restarts; a full `docker compose down -v` wipes them and the next `up` rebuilds
+# identical data from those same files. The Kafka broker is ephemeral (re-seeded
+# on every `up`).
+#
+# Only the PostgreSQL wire (8817) is published — the demo is driven entirely
+# with psql. See README.md.
+#
+# Host ports: 3310-3317 (backends + MinIO), 19094 (Kafka, optional), 8817
+# (OtterStax PG wire). Chosen to not collide with examples/demo/ (3201-3207,
+# 19093) — but the 8817 wire port is shared, so do not run this and the demo at
+# the same time.
+
+services:
+
+  qs-postgres-shop:
+    image: postgres:15
+    container_name: qs-postgres-shop
+    environment:
+      POSTGRES_USER: demo
+      POSTGRES_PASSWORD: demo
+      POSTGRES_DB: postgres        # init.sql does CREATE DATABASE shop; \c shop
+    ports:
+      - "3311:5432"
+    volumes:
+      - ./init/postgres_shop:/docker-entrypoint-initdb.d
+      - qs_pg_shop_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U demo -d shop"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 30s
+    networks: [quickstart_net]
+
+  qs-postgres-catalog:
+    image: postgres:15
+    container_name: qs-postgres-catalog
+    environment:
+      POSTGRES_USER: demo
+      POSTGRES_PASSWORD: demo
+      POSTGRES_DB: postgres        # init.sql does CREATE DATABASE catalog; \c catalog
+    ports:
+      - "3312:5432"
+    volumes:
+      - ./init/postgres_catalog:/docker-entrypoint-initdb.d
+      - qs_pg_catalog_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U demo -d catalog"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 30s
+    networks: [quickstart_net]
+
+  qs-mariadb:
+    image: mariadb:latest
+    container_name: qs-mariadb
+    environment:
+      MYSQL_ROOT_PASSWORD: root_password
+      MYSQL_DATABASE: ops
+      MYSQL_USER: demo
+      MYSQL_PASSWORD: demo
+    ports:
+      - "3310:3306"
+    volumes:
+      - ./init/mariadb:/docker-entrypoint-initdb.d
+      - qs_mariadb_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mariadb-admin", "ping", "-h", "localhost", "-u", "demo", "-pdemo"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 30s
+    networks: [quickstart_net]
+
+  qs-clickhouse:
+    image: clickhouse/clickhouse-server:23.8
+    container_name: qs-clickhouse
+    environment:
+      CLICKHOUSE_DB: analytics
+      CLICKHOUSE_USER: demo
+      CLICKHOUSE_PASSWORD: demo
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    ports:
+      - "3313:9000"    # native TCP
+      - "3314:8123"    # HTTP
+    volumes:
+      - ./init/clickhouse:/docker-entrypoint-initdb.d
+      - qs_ch_data:/var/lib/clickhouse
+    healthcheck:
+      test: ["CMD-SHELL", "clickhouse-client --user demo --password demo --query 'SELECT count() FROM analytics.pageviews' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    networks: [quickstart_net]
+
+  qs-minio:
+    image: minio/minio:latest
+    container_name: qs-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "3316:9000"   # S3 API
+      - "3317:9001"   # console
+    volumes:
+      - qs_minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
+    networks: [quickstart_net]
+
+  # One-shot: create the bucket and (re)upload the committed s3 fixtures, then
+  # exit. Idempotent — runs on every `up`, re-seeds anything a wiped volume lost.
+  qs-minio-init:
+    image: minio/mc:latest
+    container_name: qs-minio-init
+    depends_on:
+      qs-minio:
+        condition: service_healthy
+    volumes:
+      - ./init/s3:/fixtures:ro
+    # Seed the three source objects on every `up`. Also clear any `exports/`
+    # left in the persisted volume from a previous run — that prefix is demo
+    # output (written by example 7's COPY), so a fresh start must not show it.
+    entrypoint: >
+      sh -c "
+        mc alias set m http://qs-minio:9000 minioadmin minioadmin;
+        mc mb --ignore-existing m/quickstart-bucket;
+        mc rm --recursive --force m/quickstart-bucket/exports/ 2>/dev/null;
+        mc cp --recursive /fixtures/ m/quickstart-bucket/;
+        echo 'quickstart-bucket seeded (exports cleared).';
+      "
+    networks: [quickstart_net]
+
+  # Kafka broker (redpanda) for the streaming examples (Kafka section in README.md).
+  # otterstax reaches it in-network at qs-kafka:9092; the external listener on 19094
+  # is only for optional host-side `rpk`/debugging — psql never needs it. No data
+  # volume: the broker is ephemeral and re-seeded on every `up` by qs-kafka-init.
+  qs-kafka:
+    image: redpandadata/redpanda:v25.3.15
+    container_name: qs-kafka
+    command:
+      - redpanda
+      - start
+      - --mode=dev-container
+      - --smp=1
+      - --default-log-level=warn
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19094
+      - --advertise-kafka-addr=internal://qs-kafka:9092,external://127.0.0.1:19094
+    ports:
+      - "19094:19094"
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true'"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+      start_period: 20s
+    networks: [quickstart_net]
+
+  # One-shot: (re)create the topics and produce the committed order events, then
+  # exit. Idempotent — delete+create+produce on every `up` gives exactly the 40
+  # committed events regardless of prior state. qs_orders is the input feed;
+  # qs_orders_paid is the (empty) output topic the CREATE STREAM (K4) writes to.
+  qs-kafka-init:
+    image: redpandadata/redpanda:v25.3.15
+    container_name: qs-kafka-init
+    depends_on:
+      qs-kafka:
+        condition: service_healthy
+    volumes:
+      - ./init/kafka:/fixtures:ro
+    entrypoint: >
+      sh -c "
+        rpk -X brokers=qs-kafka:9092 topic delete qs_orders qs_orders_paid 2>/dev/null || true;
+        rpk -X brokers=qs-kafka:9092 topic create qs_orders qs_orders_paid -p 1 || true;
+        rpk -X brokers=qs-kafka:9092 topic produce qs_orders < /fixtures/orders.ndjson;
+        echo 'kafka seeded: qs_orders produced.';
+      "
+    networks: [quickstart_net]
+
+  qs-otterstax:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: otterstax_app:latest
+    container_name: qs-otterstax
+    depends_on:
+      qs-postgres-shop:
+        condition: service_healthy
+      qs-postgres-catalog:
+        condition: service_healthy
+      qs-mariadb:
+        condition: service_healthy
+      qs-clickhouse:
+        condition: service_healthy
+      qs-minio:
+        condition: service_healthy
+      qs-kafka:
+        condition: service_healthy
+    ports:
+      - "8817:8817"    # PostgreSQL wire — the only published frontend
+    volumes:
+      - ./config.yaml:/app/build/Release/config.yaml:ro
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/localhost/8817' || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+    networks: [quickstart_net]
+
+networks:
+  quickstart_net:
+    driver: bridge
+
+volumes:
+  qs_pg_shop_data:
+  qs_pg_catalog_data:
+  qs_mariadb_data:
+  qs_ch_data:
+  qs_minio_data:

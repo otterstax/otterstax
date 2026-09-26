@@ -35,4 +35,23 @@ namespace otterstax::kafka::detail {
     inline constexpr std::chrono::milliseconds FLUSH_TIMEOUT{10000};         // at-least-once produce flush
     inline constexpr std::chrono::milliseconds PRODUCER_DRAIN_TIMEOUT{5000}; // best-effort drain in the producer dtor
     inline constexpr std::chrono::milliseconds SEEK_TIMEOUT{5000};           // consumer seek (rewind on abort)
+
+    // A batch that fails (engine error, schema mismatch, produce failure) is rewound
+    // and retried, never skipped. The retry pauses grow exponentially from
+    // BATCH_RETRY_BACKOFF_MIN, capped at BATCH_RETRY_BACKOFF_MAX, so a persistently
+    // failing batch does not spin the worker thread or flood the engine/log
+    inline constexpr std::chrono::milliseconds BATCH_RETRY_BACKOFF_MIN{200};
+    inline constexpr std::chrono::milliseconds BATCH_RETRY_BACKOFF_MAX{10000};
+    // Slice of one retry pause between stop_ checks, so a worker being stopped
+    // never waits out the whole (capped) pause
+    inline constexpr std::chrono::milliseconds BATCH_RETRY_SLEEP_STEP{50};
+
+    // Pause before the next attempt after `consecutive_failures` failed batches
+    inline constexpr std::chrono::milliseconds batch_retry_backoff(unsigned consecutive_failures) noexcept {
+        std::chrono::milliseconds pause = BATCH_RETRY_BACKOFF_MIN;
+        for (unsigned i = 1; i < consecutive_failures && pause < BATCH_RETRY_BACKOFF_MAX; ++i) {
+            pause *= 2;
+        }
+        return pause < BATCH_RETRY_BACKOFF_MAX ? pause : BATCH_RETRY_BACKOFF_MAX;
+    }
 } // namespace otterstax::kafka::detail

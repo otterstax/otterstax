@@ -4,6 +4,7 @@
 """ClickHouse backend tests via MySQL wire protocol (port 8816)."""
 
 import sys
+import time
 import argparse
 import mysql.connector
 from contextlib import contextmanager
@@ -108,11 +109,66 @@ class client:
             print(f"  Top campaign: id={campaign_id}, orders={order_count},"
                   f" avg_amount={float(avg_amount):.2f}, total_qty={total_qty}")
 
+    def test_ch_remote_dml_row_counts(self):
+        """A remote DML on ClickHouse reports what the server can count, in the OK packet.
+
+        The native protocol carries no affected-row count in any block: an
+        INSERT's rows arrive only as Progress.written_rows, which the connector
+        sums, so INSERT reports them. A lightweight DELETE and ALTER ... UPDATE
+        are mutations applied outside the statement's pipeline and report 0 —
+        the count is read, never invented. The rows themselves must still be
+        gone / changed afterwards. Mirror of the PG-wire case in
+        test_pg_client_ch_backend.py; here the count is the OK packet's
+        affected_rows, which mysql.connector exposes as rowcount.
+        """
+        ids = [990101, 990102, 990103]
+        # The generator has no IN list; a closed range names the same rows.
+        counted = f"order_id >= {ids[0]} AND order_id <= {ids[-1]}"
+        with self.mysql_connection() as conn:
+            cur = conn.cursor()
+            try:
+                cur.execute(
+                    f"INSERT INTO {_ORDERS}"
+                    f" (order_id, campaign_id, product_id, customer_name, order_date, quantity, total_amount)"
+                    f" VALUES"
+                    f" ({ids[0]}, 1, 1, 'Counted One', '2026-01-01 00:00:00', 1, 1.5),"
+                    f" ({ids[1]}, 1, 1, 'Counted Two', '2026-01-01 00:00:00', 2, 2.5),"
+                    f" ({ids[2]}, 1, 1, 'Counted Three', '2026-01-01 00:00:00', 3, 3.5)"
+                )
+                self.assert_equal(cur.rowcount, 3, "remote ClickHouse INSERT affected_rows")
+
+                cur.execute(f"SELECT order_id FROM {_ORDERS} WHERE {counted} ORDER BY order_id")
+                self.assert_equal([r[0] for r in cur.fetchall()], ids, "inserted rows are readable")
+
+                # ALTER TABLE ... UPDATE is a mutation: it reports 0 and lands
+                # asynchronously, so the change is polled for, not assumed.
+                cur.execute(f"UPDATE {_ORDERS} SET quantity = 99 WHERE order_id = {ids[0]}")
+                self.assert_equal(cur.rowcount, 0, "remote ClickHouse UPDATE (mutation) affected_rows")
+                deadline = time.monotonic() + 30
+                quantity = None
+                while time.monotonic() < deadline:
+                    cur.execute(f"SELECT quantity FROM {_ORDERS} WHERE order_id = {ids[0]}")
+                    quantity = cur.fetchall()[0][0]
+                    if quantity == 99:
+                        break
+                    time.sleep(0.2)
+                self.assert_equal(quantity, 99, "mutation must have been applied")
+
+                cur.execute(f"DELETE FROM {_ORDERS} WHERE {counted}")
+                self.assert_equal(cur.rowcount, 0, "remote ClickHouse lightweight DELETE affected_rows")
+
+                cur.execute(f"SELECT COUNT(order_id) FROM {_ORDERS} WHERE {counted}")
+                self.assert_equal(cur.fetchall()[0][0], 0, "lightweight DELETE hides the rows at once")
+                print("  INSERT 3 / UPDATE 0 / DELETE 0 affected_rows on ClickHouse ✓")
+            finally:
+                cur.execute(f"DELETE FROM {_ORDERS} WHERE {counted}")
+
     def run_all_tests(self):
         self.test_ch_select()
         self.test_ch_select_with_where()
         self.test_ch_order_by()
         self.test_ch_aggregation()
+        self.test_ch_remote_dml_row_counts()
 
 
 def main_test():

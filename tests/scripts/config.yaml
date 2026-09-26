@@ -59,4 +59,4 @@ connections:
       access_key: minioadmin
       secret_key: minioadmin
       region: us-east-1
-      endpoint: minio:9000
+      endpoint: rustfs:9000

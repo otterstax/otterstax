@@ -48,9 +48,10 @@ void append_encapsulated(std::string& out, const std::string& header, const std:
 
 // DoPut-bind batches -> arrow RecordBatches (the parameters as the client
 // sent them; the engine adapter reads rows through tsl::arrow_to_chunk).
-std::vector<std::shared_ptr<arrow::RecordBatch>> read_bind_batches(const std::string& stream) {
-    auto buffer = std::make_shared<arrow::Buffer>(
-        reinterpret_cast<const std::uint8_t*>(stream.data()), static_cast<std::int64_t>(stream.size()));
+// The batches are zero-copy slices of the stream and outlive the DoPut call
+// (prepared_bind keeps them), so the buffer takes ownership of the bytes.
+std::vector<std::shared_ptr<arrow::RecordBatch>> read_bind_batches(std::string stream) {
+    auto buffer = arrow::Buffer::FromString(std::move(stream));
     auto reader = arrow::ipc::RecordBatchStreamReader::Open(
         std::make_shared<arrow::io::BufferReader>(buffer));
     if (!reader.ok()) {
@@ -388,7 +389,7 @@ asio::awaitable<void> FlightServer::handle_do_put(auto& rpc) {
     core::BoundParams bound_rows;
     if (command.kind == core::DoPutKind::PreparedBind && command_status.ok()) {
         try {
-            bound_rows = read_bind_batches(bind_stream);
+            bound_rows = read_bind_batches(std::move(bind_stream));
         } catch (const std::exception& e) {
             command_status = {grpc::StatusCode::INVALID_ARGUMENT, e.what()};
         }

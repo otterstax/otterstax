@@ -26,7 +26,7 @@ RUN pip3 install --no-cache-dir conan==2.21.0 'cmake<4.0' && \
      conan profile detect --force && \
      printf '\n[platform_tool_requires]\ncmake/%s\n' "$(cmake --version | head -1 | awk '{print $3}')" \
          >> "$(conan profile path default)" && \
-     conan remote add otterbrix http://conan.otterbrix.com
+     conan remote add otterbrix https://conan.otterbrix.com
 
 RUN rm /bin/sh && ln -s /bin/bash /bin/sh
 

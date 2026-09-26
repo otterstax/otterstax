@@ -1,3 +1,0 @@
-COPY (SELECT * FROM ext.regions WHERE population > 1000000)
-    TO '/tmp/big_regions.csv'
-    WITH (format = 'csv');

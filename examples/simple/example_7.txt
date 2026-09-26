@@ -1,4 +1,0 @@
-SELECT * FROM campaigns.db1.schema.campaigns JOIN
-campaigns.db1.schema.campaigns ON
-campaign_id = campaign_id
-WHERE campaigns.campaign_length > 30;

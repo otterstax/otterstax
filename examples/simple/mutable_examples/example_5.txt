@@ -1,1 +1,0 @@
-DELETE FROM campaigns.db1.schema.temp_table WHERE temp_int >= 8888;

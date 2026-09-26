@@ -166,7 +166,7 @@ auto result = co_await std::move(future);
 ## Dependencies & Constraints
 
 ### Critical External Dependencies
-- **Otterbrix 1.0.0b2-rc-2**: Custom Conan remote at `http://conan.otterbrix.com`, pinned by recipe revision in `conanfile.py`
+- **Otterbrix 1.0.0b2-rc-2**: Custom Conan remote at `https://conan.otterbrix.com`, pinned by recipe revision in `conanfile.py`
 - **Arrow 24.0.0** with FlightSQL support (must set `with_flight_sql=True`)
 - **Boost 1.88.0**: Required for C++20 coroutines in MySQL connector
 - **actor-zeta 1.2.0**: Custom actor framework with C++20 coroutines (not Akka/CAF)

@@ -58,14 +58,14 @@ namespace db {
 
         // Registration channel: mirrors external (remote-backend) tables into the
         // engine pg_catalog so the planner can resolve them by OID.
-        // Makes the engine database "<db_name>" (one per connection uid) and
-        // its manifest exist. Answers `true` when the database was created and
-        // `false` when the engine already held it: the catalog's
-        // check_database_ownership keeps user DDL off a uid's name, so an
-        // existing database of that name is this connection's mirror from a
-        // previous run over the same data dir, to be reconciled, not refused.
-        // The one exception is a data dir written before that guard existed,
-        // where a user database of the uid's name is taken for the mirror.
+        // Makes the engine database "<db_name>" (one per connection uid) exist
+        // with its manifest. Answers `true` when the database was created and
+        // `false` when the engine already held it with a manifest: this
+        // connection's mirror from a previous run over the same data dir, to be
+        // reconciled. A database of that name without a manifest is not a
+        // mirror — a local database created while the name was no alias, or
+        // before its connection first registered — and is refused with
+        // database_already_exists rather than taken over.
         actor_zeta::unique_future<core::result_wrapper_t<bool>> register_external_database(std::string db_name);
 
         // Makes the engine collection for the external table `name` — the
@@ -116,9 +116,11 @@ namespace db {
         OTX_LOCKABLE_N(std::mutex, mutex_, "OtterbrixManager::mutex");
         actor_zeta::behavior_t current_behavior_;
 
-        // Manifest of `db_name`: the manifest collection created when absent,
-        // reused when the engine already holds it.
-        core::error_t ensure_manifest(const std::string& db_name);
+        // Whether `db_name` holds the manifest, which only a mirror does.
+        core::result_wrapper_t<bool> has_manifest(const std::string& db_name);
+        // The manifest collection of a database register_external_database
+        // has just created.
+        core::error_t create_manifest(const std::string& db_name);
         // Encoded collection names the manifest of `db_name` lists.
         core::result_wrapper_t<std::pmr::vector<std::pmr::string>> read_manifest(const std::string& db_name);
         // The manifest row of `collection` written exactly once: any row it

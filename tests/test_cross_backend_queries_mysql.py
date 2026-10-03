@@ -48,7 +48,7 @@ def test_mysql_pg_joins(cfg):
     rows = run_query(cfg, """
         SELECT p.product_id, p.product_name, p.price, c.campaign_name
         FROM products.pgdb.public.products p
-        JOIN campaigns.db1.schema.campaigns c ON p.campaign_id = c.campaign_id
+        JOIN campaigns.db1.campaigns c ON p.campaign_id = c.campaign_id
         LIMIT 10
     """)
     assert len(rows) > 0, "PG JOIN MySQL returned no rows"
@@ -60,7 +60,7 @@ def test_mysql_pg_joins(cfg):
     print("\n-- Test 2: campaigns (MySQL) INNER JOIN products (PG)")
     rows = run_query(cfg, """
         SELECT c.campaign_name, c.budget, p.product_name, p.price
-        FROM campaigns.db1.schema.campaigns c
+        FROM campaigns.db1.campaigns c
         JOIN products.pgdb.public.products p ON c.campaign_id = p.campaign_id
         LIMIT 10
     """)
@@ -74,7 +74,7 @@ def test_mysql_pg_joins(cfg):
     rows = run_query(cfg, """
         SELECT p.product_name, p.price, c.campaign_name, c.budget
         FROM products.pgdb.public.products p
-        JOIN campaigns.db1.schema.campaigns c ON p.campaign_id = c.campaign_id
+        JOIN campaigns.db1.campaigns c ON p.campaign_id = c.campaign_id
         WHERE p.price > 100
         LIMIT 10
     """)
@@ -88,7 +88,7 @@ def test_mysql_pg_joins(cfg):
         SELECT c.campaign_name,
                COUNT(p.product_id) as product_count,
                AVG(p.price) as avg_product_price
-        FROM campaigns.db1.schema.campaigns c
+        FROM campaigns.db1.campaigns c
         INNER JOIN products.pgdb.public.products p ON c.campaign_id = p.campaign_id
         GROUP BY c.campaign_name
         ORDER BY product_count DESC
@@ -111,8 +111,8 @@ def test_mysql_ch_joins(cfg):
     print("\n-- Test 1: campaigns (MySQL) INNER JOIN orders (CH)")
     rows = run_query(cfg, """
         SELECT c.campaign_name, o.order_id, o.customer_name, o.total_amount
-        FROM campaigns.db1.schema.campaigns c
-        INNER JOIN chtest.chdb.schema.orders o ON c.campaign_id = o.campaign_id
+        FROM campaigns.db1.campaigns c
+        INNER JOIN chtest.chdb.orders o ON c.campaign_id = o.campaign_id
         LIMIT 20
     """)
     assert len(rows) > 0, "MySQL+CH JOIN returned no rows"
@@ -132,7 +132,7 @@ def test_pg_ch_joins(cfg):
     rows = run_query(cfg, """
         SELECT p.product_name, p.price, o.order_id, o.quantity, o.total_amount
         FROM products.pgdb.public.products p
-        INNER JOIN chtest.chdb.schema.orders o ON p.product_id = o.product_id
+        INNER JOIN chtest.chdb.orders o ON p.product_id = o.product_id
         LIMIT 20
     """)
     assert len(rows) > 0, "PG+CH JOIN returned no rows"
@@ -152,9 +152,9 @@ def test_triple_join(cfg):
     rows = run_query(cfg, """
         SELECT c.campaign_name, p.product_name, p.category,
                o.customer_name, o.total_amount
-        FROM campaigns.db1.schema.campaigns c
+        FROM campaigns.db1.campaigns c
         INNER JOIN products.pgdb.public.products p ON c.campaign_id = p.campaign_id
-        INNER JOIN chtest.chdb.schema.orders o ON p.product_id = o.product_id
+        INNER JOIN chtest.chdb.orders o ON p.product_id = o.product_id
         LIMIT 20
     """)
     assert len(rows) > 0, "MySQL+PG+CH triple JOIN returned no rows"

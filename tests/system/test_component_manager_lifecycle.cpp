@@ -24,7 +24,7 @@ TEST_CASE("ComponentManager: constructed and destroyed unstarted on a fresh data
         std::filesystem::remove_all(dir);
         REQUIRE_FALSE(std::filesystem::exists(dir));
         {
-            ComponentManager cmanager(make_create_config(dir));
+            ComponentManager cmanager(make_create_config(dir), config::ConnectionsConfig{});
             REQUIRE(cmanager.getResource() != nullptr);
             REQUIRE(cmanager.scheduler_address());
             REQUIRE(cmanager.catalog_address());

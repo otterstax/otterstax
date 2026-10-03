@@ -13,6 +13,7 @@
 #include "test_helpers.hpp"
 #include "types/otterbrix.hpp"
 
+#include "../mock/aliases.hpp"
 #include "../mock/mock_config.hpp"
 #include "../mock/otterbrix.hpp"
 
@@ -107,8 +108,7 @@ namespace {
         core::error_code_t on_insert_;
     };
 
-    core::result_wrapper_t<bool> run_register_external_database(db::OtterbrixManager& manager,
-                                                                const std::string& uid) {
+    core::result_wrapper_t<bool> run_register_external_database(db::OtterbrixManager& manager, const std::string& uid) {
         auto [needs_sched, future] =
             actor_zeta::send(manager.address(), &db::OtterbrixManager::register_external_database, uid);
         wait_until_ready(future);
@@ -117,11 +117,14 @@ namespace {
 
     // A data manager whose engine already holds every database: CREATE
     // DATABASE answers database_already_exists, as the real engine does for a
-    // uid's mirror database restored from a previous run's data dir.
+    // database restored from a previous run's data dir. With `mirror` the
+    // database holds the mirror manifest, as a previous run's mirror does;
+    // without it, it is a local database of the same name.
     class existing_database_data_manager final : public SimpleMockOtterbrixManager {
     public:
-        explicit existing_database_data_manager(mock_config config)
-            : SimpleMockOtterbrixManager(config) {}
+        existing_database_data_manager(mock_config config, bool mirror)
+            : SimpleMockOtterbrixManager(config)
+            , mirror_(mirror) {}
 
         components::cursor::cursor_t_ptr execute_sql(const std::string&) override {
             return components::cursor::make_cursor(
@@ -129,6 +132,19 @@ namespace {
                 core::error_t(core::error_code_t::database_already_exists,
                               std::pmr::string{"database already exists", resource()}));
         }
+
+        components::cursor::cursor_t_ptr describe_collection(const std::string& database,
+                                                             const std::string& collection,
+                                                             components::catalog::oid_t& out_oid) override {
+            if (mirror_ && collection == db::external_manifest_collection) {
+                out_oid = 1;
+                return components::cursor::make_cursor(resource());
+            }
+            return SimpleMockOtterbrixManager::describe_collection(database, collection, out_oid);
+        }
+
+    private:
+        bool mirror_;
     };
 
     core::result_wrapper_t<bool> run_drop_external_table(db::OtterbrixManager& manager, qualified_name_t name) {
@@ -316,7 +332,7 @@ TEST_CASE("OtterbrixManager::execute: an exception at the engine boundary is an 
 
 TEST_CASE("dml_without_returning: only INSERT/UPDATE/DELETE without RETURNING qualify") {
     std::pmr::synchronized_pool_resource arena(std::pmr::new_delete_resource());
-    GreenplumParser parser(&arena);
+    GreenplumParser parser(&arena, no_aliases());
     auto plan_of = [&](const char* sql) {
         auto parsed = parser.parse(sql);
         INFO(sql << " -> " << (parsed.has_error() ? parsed.error().what.c_str() : "ok"));
@@ -340,7 +356,7 @@ TEST_CASE("dml_without_returning: only INSERT/UPDATE/DELETE without RETURNING qu
 
 TEST_CASE("row_producing_statement: SELECT and RETURNING DML answer rows and nothing else does") {
     std::pmr::synchronized_pool_resource arena(std::pmr::new_delete_resource());
-    GreenplumParser parser(&arena);
+    GreenplumParser parser(&arena, no_aliases());
     auto plan_of = [&](const char* sql) {
         auto parsed = parser.parse(sql);
         INFO(sql << " -> " << (parsed.has_error() ? parsed.error().what.c_str() : "ok"));
@@ -370,12 +386,14 @@ TEST_CASE("row_producing_statement: SELECT and RETURNING DML answer rows and not
 
     // A backend slice inlined as raw data and a missing plan answer no rows here:
     // the shape of a fetched slice is the translator's contract, not the engine's.
-    REQUIRE(row_producing_statement(components::logical_plan::make_node_raw_data(
-                &arena, data_chunk_t{&arena, no_columns(&arena), 0})) == nullptr);
+    REQUIRE(row_producing_statement(
+                components::logical_plan::make_node_raw_data(&arena, data_chunk_t{&arena, no_columns(&arena), 0})) ==
+            nullptr);
     REQUIRE(row_producing_statement(components::logical_plan::node_ptr{}) == nullptr);
     // A bare aggregate node (no resolve wrapper) is the same statement.
-    REQUIRE(std::string{row_producing_statement(components::logical_plan::make_node_aggregate(
-                &arena, core::dbname_t{"db"}, core::relname_t{"t"}))} == "SELECT");
+    REQUIRE(std::string{row_producing_statement(
+                components::logical_plan::make_node_aggregate(&arena, core::dbname_t{"db"}, core::relname_t{"t"}))} ==
+            "SELECT");
 }
 
 TEST_CASE("capture_remote_dml_count: records a column-less DML result and nothing else") {
@@ -407,19 +425,31 @@ TEST_CASE("capture_remote_dml_count: records a column-less DML result and nothin
     }
 }
 
-// The uid's name is guarded against user DDL, so a database the engine already
-// holds under it is this connection's mirror from a previous run: reused, and
-// answered as not created.
-TEST_CASE("OtterbrixManager::register_external_database: an existing database is reused as the mirror") {
+// A database the engine already holds with the mirror manifest is this
+// connection's mirror from a previous run: reused, and answered as not created.
+TEST_CASE("OtterbrixManager::register_external_database: an existing mirror is reused") {
     std::pmr::synchronized_pool_resource arena(std::pmr::new_delete_resource());
     auto manager = actor_zeta::spawn<db::OtterbrixManager>(
         &arena,
-        std::make_unique<existing_database_data_manager>(mock_config{.resource = &arena}));
+        std::make_unique<existing_database_data_manager>(mock_config{.resource = &arena}, /*mirror=*/true));
 
     auto registered = run_register_external_database(*manager, "shop");
 
     REQUIRE_FALSE(registered.has_error());
     REQUIRE(registered.value() == false);
+}
+
+TEST_CASE("OtterbrixManager::register_external_database: an existing database without the manifest is refused") {
+    std::pmr::synchronized_pool_resource arena(std::pmr::new_delete_resource());
+    auto manager = actor_zeta::spawn<db::OtterbrixManager>(
+        &arena,
+        std::make_unique<existing_database_data_manager>(mock_config{.resource = &arena}, /*mirror=*/false));
+
+    auto registered = run_register_external_database(*manager, "shop");
+
+    REQUIRE(registered.has_error());
+    REQUIRE(registered.error().type == core::error_code_t::database_already_exists);
+    REQUIRE(std::string{registered.error().what.c_str()}.find("shop") != std::string::npos);
 }
 
 // Any other engine verdict on the database is the failure it names.
@@ -529,8 +559,7 @@ TEST_CASE("OtterbrixManager::drop_external_table: the engine's verdict is return
     std::pmr::synchronized_pool_resource arena(std::pmr::new_delete_resource());
     auto manager = actor_zeta::spawn<db::OtterbrixManager>(
         &arena,
-        std::make_unique<refusing_data_manager>(mock_config{.resource = &arena},
-                                                core::error_code_t::table_not_exists));
+        std::make_unique<refusing_data_manager>(mock_config{.resource = &arena}, core::error_code_t::table_not_exists));
 
     auto dropped = run_drop_external_table(*manager, qualified_name_t("shop", "pgdb", "public", "orders"));
 

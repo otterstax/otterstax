@@ -53,6 +53,16 @@ instance (no shared parser between actors — codex rule 10) and a per-worker
 `metadata_map_` (`session_hash → metadata_t`). The map is unguarded because the
 sticky routing guarantees a single Worker handles all messages for a session.
 
+The parser comes from `Scheduler::parser_factory_fn` — a plain function pointer
+`parser_ptr (*)(std::pmr::memory_resource*, const otterstax::names::alias_registry_t&)`
+— called once per Worker with the Worker's resource and the connection aliases
+the Scheduler was constructed with. Every parser reads table references against
+that one `alias_registry_t` (`otterbrix/parser/alias_registry.hpp`), built from
+the config by `ComponentManager`, which owns it and outlives the Scheduler. Rule
+10 is about parser instances and mutable state: an immutable registry read by
+every Worker through a `const&` does not break it. A stack in a test holds its
+own registry (`tests/mock/aliases.hpp`: `make_aliases`, `no_aliases()`).
+
 Errors travel as `core::error_t` inside the future; nothing in a handler
 throws and no handler wraps its body in try/catch. The one call that may
 throw is `IParser::parse` (the engine's raw parser sits behind it, and test
@@ -115,7 +125,7 @@ their shared `describe_parsed`): it reads the target name from the plan
 `drop_t(database)` inside the wrapping sequence) and asks
 `CatalogManager::check_database_ownership`, which answers
 `invalid_parameter` (`database '<name>' is owned by connection '<uid>'`) for a
-uid or `kafka`, matched case-insensitively. The refusal happens before the
+configured alias — registered yet or not — or `kafka`, matched case-insensitively. The refusal happens before the
 statement reaches the engine, so the mirror and the catalog store stay intact.
 A `DROP DATABASE` root that names no database is refused the same way.
 
@@ -249,4 +259,4 @@ Bind, describes a portal from the result that portal actually answers, and
 refuses an `Execute` whose result does not match what was described
 (`frontend/CLAUDE.md`, "PostgreSQL extended query specifics").
 Acceptance: `tests/system/test_single_backend_prepare_schema.cpp`, tag
-`[ch-describe-routing]`.
+`[describe-routing]`.

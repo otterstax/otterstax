@@ -64,7 +64,13 @@ namespace otterstax::names {
     void name_registry_t::add(qualified_name_t name) {
         // Keyed by the dbname the transformer stamps: the RangeVar's catalogname,
         // which the grammar fills for every qualified name.
-        auto key = make_key_(name.database, name.collection);
+        const std::string key_db = name.database;
+        const std::string key_rel = name.collection;
+        add(key_db, key_rel, std::move(name));
+    }
+
+    void name_registry_t::add(std::string_view key_db, std::string_view key_rel, qualified_name_t name) {
+        auto key = make_key_(key_db, key_rel);
         auto it = entries_.find(key);
         if (it == entries_.end()) {
             entries_.emplace(std::move(key), std::move(name));

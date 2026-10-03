@@ -59,8 +59,11 @@ different nesting. All `connections:` sections are optional (missing → empty).
 aborts startup. `service.connection_retry` (optional; default `max_attempts: 1`,
 `delay_ms: 1000` = one-shot) sets how many times startup retries opening a slow
 backend. The `alias` is the outermost qualifier in federated SQL
-(`SELECT ... FROM alias.db.schema.table ...`) and the `s3_alias` referenced by
-`CREATE EXTERNAL TABLE` / `COPY ... TO`.
+(`SELECT ... FROM alias.db.table ...`, see **Federated Query Syntax**) and the
+`s3_alias` referenced by `CREATE EXTERNAL TABLE` / `COPY ... TO`. A backend alias
+(mysql / postgresql / clickhouse) must be an unquoted SQL identifier
+(`[a-z_][a-z0-9_]*`) and name one connection across the three sections —
+anything else aborts startup.
 
 ### Flow through the code
 
@@ -279,13 +282,42 @@ Every handler is listed in the actor's `dispatch_traits` alias and the `behavior
 
 ### Federated Query Syntax
 
-Connection aliases act as the outermost database name qualifier:
+A table behind a configured connection is named after its alias (see
+**Connection Config** above):
 
 ```sql
-SELECT * FROM alias1.db.schema.table JOIN alias2.db.schema.table2 ON ...
+SELECT * FROM my.bill.orders o JOIN pg.shop.customers c ON ...   -- alias.db.table
+SELECT * FROM pg.shop.public.customers                            -- alias.db.schema.table
 ```
 
-`alias1`/`alias2` are the aliases registered in the connection config file (see **Connection Config** above).
+One function reads every table reference — `otterstax::names::canonical_table_name`
+(`otterbrix/parser/alias_registry.hpp`), used by the SQL parser and the Spark
+translator alike, for SELECT, JOIN, derived tables and every DML/DDL target and
+source. The parser rewrites each federated name to the canonical four segments
+`alias.db.schema.table` before the engine transformer sees it:
+
+- **Three segments `a.b.c`** are federated only when `a` is a configured alias;
+  otherwise they are a local `db.schema.table`, and a local table has no schema
+  (`invalid_parameter`, write `db.table`). One or two segments are always local;
+  `alias.table` is refused (`invalid_parameter`).
+- **PostgreSQL** pins the database and the schema to the connection (`database`,
+  `schema` in the config): another database is `invalid_parameter`, another
+  schema `unimplemented_yet` (one schema per alias — configure a second alias for
+  another schema).
+- **MySQL / ClickHouse** have no schema level: the database is free and goes into
+  the backend SQL, a schema segment is `invalid_parameter` (write `alias.db.table`).
+- **Columns** may be qualified by the table, `db.table`, the FROM alias, or the
+  five-segment `alias.db.schema.table.col`; `alias.db.table.col` names no FROM
+  element (`table_not_exists`).
+- **Errors** name the table canonically (`pg.shop.public.orders`), not as written.
+- **Not reached** by the rewrite: a CTE body and a subquery inside an expression
+  (WHERE, SELECT list, HAVING) — a federated name there is read as a local one.
+- An alias and a local engine database share one namespace (the alias's mirror
+  is an engine database of that name): `CREATE/DROP DATABASE <alias>` is refused,
+  and an alias does not register over an existing local database.
+
+The rows `tests/system/test_name_canonicalization.cpp` (`[names]`) pin each rule
+by what reaches the backend.
 
 ## Profiling Instrumentation (Tracy) — MANDATORY
 
@@ -492,6 +524,7 @@ otterbrix-internal — shadow of `external_join_all` benchmark), all driven by
 
 - `ConnectorManager::addConnection` is the only write to a connector registry and runs on the startup thread before any query reaches the integration actor that drives the manager (`connectors/mysql/manager.hpp`); there is no remove path
 - One query per connection at a time: each alias owns a single `boost::mysql::any_connection` and nothing serializes overlapping statements on it (`Connector::runQuery_` in `connectors/mysql/connector.hpp`; the pg/ch connectors are shaped the same way)
+- A subquery inside an expression is dropped: the engine transformer lowers `WHERE x IN (SELECT …)` (and likely `EXISTS` / a scalar subquery) into a plan of its own in `execution_plan_t::sub_queries`, while `GreenplumParser::parse` keeps only the main plan (`binder.node_ptr()`) and `OtterbrixDataManager::execute_plan` runs that alone — the statement answers without the subquery's rows and without an error, even over local tables
 - Array types support only single dimension (see the `TODO: multiple dimentions array` in `write_column_def`, `otterbrix/query_generation/sql_query_generator.cpp`)
 - Docker MariaDB volumes lag on cold start — `docker-run-tests.sh` has a 120 s wait
 - Engine (rc-3): an aggregate whose arguments are all constants is wrong over a **local** engine table — `SELECT count(1)` / `sum(1)` over a 3-row table answers 1, and 1 per group, and `count(1)` over no rows crashes the process — because `execution_dag_t::run` evaluates an all-constant node over one row per chunk (engine `components/execution_dag/execution_dag.cpp:972-995`). `OtterbrixDataManager::execute_plan` (`otterbrix/operators/execute_plan.cpp`) guards every plan the engine runs, SQL and Spark alike: `count(<non-NULL literal>)` becomes `COUNT(*)`, any other aggregate over constants is refused as `unimplemented_yet` (`sum() over a constant argument is not supported`). Backend mirrors are unaffected (`COUNT(1)` is pushed to the backend). The request to the engine is `docs/otterbrix_request_constant_aggregates.md`

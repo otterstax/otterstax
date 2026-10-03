@@ -96,7 +96,7 @@ void write_test_ndjson(const std::string& path) {
 // "SELECT * FROM <db>.<tbl>" plan to reproduce the old whole-table dump.
 OtterbrixStatementPtr select_all(std::pmr::memory_resource* res,
                                  const std::string& db, const std::string& tbl) {
-    auto parser = make_parser(res);
+    auto parser = make_parser(res, no_aliases());
     auto parsed = parser->parse("SELECT * FROM " + db + "." + tbl + ";");
     REQUIRE_FALSE(parsed.has_error());
     return std::move(parsed.value()->otterbrix_params);

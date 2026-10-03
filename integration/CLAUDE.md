@@ -179,12 +179,14 @@ The catalog mirrors remote tables into the engine through four handlers; the uid
 the engine database, the remaining qualifiers fold into the encoded collection name
 `<db>:<schema>:<table>` (`encode_external_collection`, one-way by design).
 
-- `register_external_database(uid)` — creates the uid's database, or reuses the one
-  the engine restored from a previous run's data dir (`false`); the name is guarded
-  against user DDL (`CatalogManager::check_database_ownership`), the one exception
-  being a data dir written before that guard existed. Either way it makes the uid's
-  **manifest** exist: the collection `<uid>.__otterstax_tables`, one `collection`
-  STRING row per mirror. The manifest exists because on rc-2 the engine's `pg_class`
+- `register_external_database(uid)` — creates the uid's database together with its
+  **manifest** (`create_manifest`): the collection `<uid>.__otterstax_tables`, one
+  `collection` STRING row per mirror. A database the engine already holds is reused
+  (`false`) only when it holds the manifest (`has_manifest`) — the mirror a previous
+  run left on this data dir; one without it is a local database of the alias's name
+  and is refused with `database_already_exists`. The manifest is written only into a
+  database this call created, so a crash between the two creates leaves a database
+  the next start refuses (after the engine bump the two go into one transaction). The manifest exists because on rc-2 the engine's `pg_class`
   is not readable through SQL (named projections fail, `SELECT *` answers a 1×1
   result), so it is the only record of which mirrors a previous run left behind.
 - `register_external_table(name, columns)` — writes the manifest row FIRST (a crash

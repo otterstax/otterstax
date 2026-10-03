@@ -71,7 +71,7 @@ namespace frontend::spark {
                                                                  plan.root().sql().query())
                                                     .second);
                     } else if (plan.has_root()) {
-                        auto plan_result = relation_to_plan(plan, resource_);
+                        auto plan_result = relation_to_plan(plan, resource_, aliases_);
                         if (plan_result.has_error()) {
                             refusal =
                                 grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, plan_result.error().what.c_str());

@@ -128,9 +128,9 @@ Each benchmark reuses one `GreenplumParser` instance across iterations (the pars
 | `BM_parse_complex_select` | Aggregation, single backend | `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT` |
 | `BM_parse_three_backend_join` | 3-backend JOIN (MySQL × PG × CH) | `INNER JOIN × 2`, `WHERE`, `LIMIT` |
 
-#### `otterstax::parser::prepare_sql()` — subquery extraction + qualifier promotion
+#### `otterstax::parser::prepare_sql()` — subquery extraction + name canonicalization
 
-`prepare_sql` only produces stubs for SQL that contains subqueries wrapped in parentheses. Flat JOINs with 4-part table names go through a different scheduler path and produce 0 stubs.
+`prepare_sql` only produces stubs for SQL that contains subqueries wrapped in parentheses. Flat JOINs over federated table names go through a different scheduler path and produce 0 stubs.
 
 | Benchmark | SQL | Stubs produced |
 |-----------|-----|----------------|
@@ -140,7 +140,7 @@ Each benchmark reuses one `GreenplumParser` instance across iterations (the pars
 | `BM_prepare_sql_complex_select` | Aggregation, single-backend | 0 |
 | `BM_prepare_sql_three_backend` | MySQL × PG × CH flat JOIN | 0 (flat JOIN, no stubs) |
 
-The `cross_backend` and `three_backend` prepare_sql benchmarks measure the parsing + promote pass on realistic multi-backend SQL even though those queries happen to produce 0 stubs (the stub path fires only when subqueries are present in the SQL).
+The `cross_backend` and `three_backend` prepare_sql benchmarks measure the parsing + canonicalization pass (against the fixtures' alias registry `bench_aliases()`: `mysql`, `pg`, `ch`) on realistic multi-backend SQL even though those queries happen to produce 0 stubs (the stub path fires only when subqueries are present in the SQL).
 
 ---
 
@@ -154,13 +154,13 @@ SQL qualifier rewriting and table reference formatting, exercised via `sql_gen::
 
 ```sql
 -- correct: subquery in parentheses → produces a stub
-SELECT * FROM (SELECT id FROM mysql.bill.schema.orders WHERE ...) o
+SELECT * FROM (SELECT id FROM mysql.bill.orders WHERE ...) o
 
 -- wrong: flat table reference → produces 0 stubs
-SELECT id FROM mysql.bill.schema.orders WHERE ...
+SELECT id FROM mysql.bill.orders WHERE ...
 ```
 
-`prepare_sql` produces `subquery_stub_t` objects only for SQL-level subqueries (`T_RangeSubselect` AST nodes). Flat JOINs with 4-part names never generate stubs and must not be used in `replace_qualifiers` benchmarks.
+`prepare_sql` produces `subquery_stub_t` objects only for SQL-level subqueries (`T_RangeSubselect` AST nodes). Flat JOINs over federated names never generate stubs and must not be used in `replace_qualifiers` benchmarks.
 
 Stub ordering follows left-to-right position of the opening parenthesis in the SQL string.
 
@@ -283,7 +283,7 @@ by const ref). Links `kafka_runtime` (a separate `target_link_libraries` call in
 
 ### Query-generation benchmark (`bench_query_gen.cpp`)
 
-1. SQL that feeds `replace_qualifiers` must contain **SQL-level subqueries** (i.e., `(SELECT ... FROM alias.db.schema.table ...)` wrapped in parentheses). Flat JOINs produce 0 stubs and must not be used.
+1. SQL that feeds `replace_qualifiers` must contain **SQL-level subqueries** (i.e., `(SELECT ... FROM alias.db.table ...)` wrapped in parentheses). Flat JOINs produce 0 stubs and must not be used.
 2. Stub ordering is left-to-right by paren position — the first `(` in the SQL string produces `stubs[0]`.
 3. To verify stub count and ordering for new SQL, run the matching unit test pattern in `tests/unit/parser/test_subquery_extractor.cpp`, or write a one-off Catch2 test.
 4. Pre-extract stubs outside the timing loop for isolated `replace_qualifiers` benchmarks; include `prepare_sql` inside the loop only for pipeline benchmarks.

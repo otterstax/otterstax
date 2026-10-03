@@ -45,7 +45,7 @@ from pyspark.sql import functions as F
 
 import config
 
-CAMPAIGNS = "campaigns.db1.schema.campaigns"  # MySQL: campaign_id, campaign_name, campaign_length, budget
+CAMPAIGNS = "campaigns.db1.campaigns"  # MySQL: campaign_id, campaign_name, campaign_length, budget
 PRODUCTS = "products.pgdb.public.products"    # PostgreSQL: product_id, campaign_id, product_name, price, category
 
 # The local table: (id, grp, amount), the last row twice so distinct() has a row to drop.

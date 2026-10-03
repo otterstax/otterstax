@@ -2,6 +2,7 @@
 // Copyright 2025-2026  OtterStax
 
 #include "otterbrix/parser/parser.hpp"
+#include "test_aliases.hpp"
 #include "otterbrix/parser/subquery_extractor.hpp"
 #include "otterbrix/schema/schema_utils.hpp"
 
@@ -35,7 +36,7 @@ size_t flat_count(const ParsedQueryDataPtr& parsed) {
 TEST_CASE("parse: empty string returns error") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
     auto r = parser.parse("");
     REQUIRE(r.has_error());
 }
@@ -43,7 +44,7 @@ TEST_CASE("parse: empty string returns error") {
 TEST_CASE("parse: a lone ';' has no statement and is a parse error") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
     // The grammar accepts the input but yields an empty statement list; there
     // is nothing to plan, so it must surface as sql_parse_error rather than
     // being read as a statement.
@@ -55,7 +56,7 @@ TEST_CASE("parse: a lone ';' has no statement and is a parse error") {
 TEST_CASE("parse: a comment-only input has no statement and is a parse error") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
     auto r = parser.parse("-- c");
     REQUIRE(r.has_error());
     REQUIRE(r.error().type == core::error_code_t::sql_parse_error);
@@ -64,7 +65,7 @@ TEST_CASE("parse: a comment-only input has no statement and is a parse error") {
 TEST_CASE("parse: invalid SQL syntax returns error") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
     auto r = parser.parse("SELECTT * FORM nowhere");
     REQUIRE(r.has_error());
 }
@@ -72,7 +73,7 @@ TEST_CASE("parse: invalid SQL syntax returns error") {
 TEST_CASE("parse: incomplete statement returns error") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
     // Note: a bare "SELECT" is VALID in the PostgreSQL grammar (empty target
     // list), so an actually incomplete statement is used here.
     auto r = parser.parse("SELECT id FROM");
@@ -84,7 +85,7 @@ TEST_CASE("parse: incomplete statement returns error") {
 TEST_CASE("parse: SELECT sets T_SelectStmt tag") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
     auto parsed = parse_or_die(parser, "SELECT id, name FROM orders WHERE id = 1;");
     REQUIRE(parsed->tag == NodeTag::T_SelectStmt);
 }
@@ -92,7 +93,7 @@ TEST_CASE("parse: SELECT sets T_SelectStmt tag") {
 TEST_CASE("parse: INSERT sets T_InsertStmt tag") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
     auto parsed = parse_or_die(parser, "INSERT INTO orders (id, name) VALUES (1, 'test');");
     REQUIRE(parsed->tag == NodeTag::T_InsertStmt);
 }
@@ -100,7 +101,7 @@ TEST_CASE("parse: INSERT sets T_InsertStmt tag") {
 TEST_CASE("parse: UPDATE sets T_UpdateStmt tag") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
     auto parsed = parse_or_die(parser, "UPDATE orders SET name = 'x' WHERE id = 1;");
     REQUIRE(parsed->tag == NodeTag::T_UpdateStmt);
 }
@@ -108,7 +109,7 @@ TEST_CASE("parse: UPDATE sets T_UpdateStmt tag") {
 TEST_CASE("parse: DELETE sets T_DeleteStmt tag") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
     auto parsed = parse_or_die(parser, "DELETE FROM orders WHERE id = 1;");
     REQUIRE(parsed->tag == NodeTag::T_DeleteStmt);
 }
@@ -118,7 +119,7 @@ TEST_CASE("parse: DELETE sets T_DeleteStmt tag") {
 TEST_CASE("parse: no placeholders → parameters_count == 0") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
     auto parsed = parse_or_die(parser, "SELECT id FROM orders WHERE status = 'active';");
     REQUIRE(parsed->otterbrix_params->parameters_count == 0);
 }
@@ -126,7 +127,7 @@ TEST_CASE("parse: no placeholders → parameters_count == 0") {
 TEST_CASE("parse: one placeholder → parameters_count == 1") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
     auto parsed = parse_or_die(parser, "SELECT id FROM orders WHERE id = $1;");
     REQUIRE(parsed->otterbrix_params->parameters_count == 1);
 }
@@ -134,7 +135,7 @@ TEST_CASE("parse: one placeholder → parameters_count == 1") {
 TEST_CASE("parse: two placeholders → parameters_count == 2") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
     auto parsed = parse_or_die(parser, "SELECT id FROM orders WHERE id = $1 AND status = $2;");
     REQUIRE(parsed->otterbrix_params->parameters_count == 2);
 }
@@ -144,7 +145,7 @@ TEST_CASE("parse: two placeholders → parameters_count == 2") {
 TEST_CASE("parse: external_nodes_count matches flat node count") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     auto parsed = parse_or_die(
         parser,
@@ -164,7 +165,7 @@ TEST_CASE("parse: external_nodes_count matches flat node count") {
 TEST_CASE("parse: same UID in two tables → two batches, one node each") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     auto parsed = parse_or_die(
         parser,
@@ -187,7 +188,7 @@ TEST_CASE("parse: same UID in two tables → two batches, one node each") {
 TEST_CASE("parse: different UIDs in two tables → one batch, two nodes") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     auto parsed = parse_or_die(
         parser,
@@ -206,7 +207,7 @@ TEST_CASE("parse: different UIDs in two tables → one batch, two nodes") {
 TEST_CASE("parse: same parser handles multiple successive calls correctly") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     auto r1 = parse_or_die(parser, "SELECT id FROM orders;");
     auto r2 = parse_or_die(parser, "SELECT name FROM products WHERE id = 1;");
@@ -220,7 +221,7 @@ TEST_CASE("parse: same parser handles multiple successive calls correctly") {
 TEST_CASE("parse: error then success on same parser instance") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     REQUIRE(parser.parse("NOT VALID SQL !!").has_error());
     auto parsed = parse_or_die(parser, "SELECT id FROM orders;");

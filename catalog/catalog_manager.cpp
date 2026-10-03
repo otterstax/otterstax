@@ -15,7 +15,6 @@
 #include <components/table/column_definition.hpp>
 
 #include <algorithm>
-#include <cctype>
 #include <string_view>
 #include <thread>
 
@@ -65,15 +64,6 @@ namespace {
         }
     }
 
-    // ASCII case-insensitive equality: identifiers reach the engine lower-cased
-    // unless quoted, while a connection uid keeps its configured spelling.
-    bool iequals(std::string_view lhs, std::string_view rhs) {
-        return lhs.size() == rhs.size() &&
-               std::equal(lhs.begin(), lhs.end(), rhs.begin(), [](unsigned char a, unsigned char b) {
-                   return std::tolower(a) == std::tolower(b);
-               });
-    }
-
     // SQL LIKE over the whole value: `%` matches any run, `_` one character,
     // everything else literally (no escape character — FlightSQL patterns
     // define none). Case-sensitive, like the names it filters.
@@ -117,7 +107,9 @@ namespace {
 } // namespace
 
 namespace mysql {
-    CatalogManager::CatalogManager(std::pmr::memory_resource* res, actor_zeta::address_t otterbrix_manager)
+    CatalogManager::CatalogManager(std::pmr::memory_resource* res,
+                                   actor_zeta::address_t otterbrix_manager,
+                                   const otterstax::names::alias_registry_t& aliases)
         : resource_(res)
         , log_(get_logger(logger_tag::CATALOG_MANAGER))
         , store_(res)
@@ -125,6 +117,7 @@ namespace mysql {
         , mysql_manager_(actor_zeta::address_t::empty_address())
         , pg_manager_(actor_zeta::address_t::empty_address())
         , ch_manager_(actor_zeta::address_t::empty_address())
+        , aliases_(aliases)
         , connection_registry_(res) {
         assert(log_.is_valid());
         assert(res != nullptr);
@@ -310,10 +303,6 @@ namespace mysql {
                     continue;
                 }
                 auto conn_type_opt = getConnectionType(target.name.unique_identifier);
-                if (conn_type_opt.has_value() && conn_type_opt.value() != catalog_ext::ConnectionType::PostgreSQL) {
-                    // ignore schema qualifier if not postgres
-                    target.name.schema = "";
-                }
                 if (store_.find(target.name) == components::catalog::INVALID_OID) {
                     // The registry is the only source of a uid's backend here:
                     // a uid it does not know was never registered by a
@@ -492,7 +481,7 @@ namespace mysql {
                             uuid,
                             db_result.error().what.c_str());
                 co_return make_error(resource(),
-                                     core::error_code_t::schema_error,
+                                     db_result.error().type,
                                      "Failed to create engine database for uid '" + uuid +
                                          "': " + db_result.error().what.c_str());
             }
@@ -503,8 +492,10 @@ namespace mysql {
                 for (const auto& table : tables) {
                     live.push_back(table.name);
                 }
-                auto [stale_sched, stale_future] = actor_zeta::send(
-                    otterbrix_manager_, &db::OtterbrixManager::drop_stale_external_tables, uuid, std::move(live));
+                auto [stale_sched, stale_future] = actor_zeta::send(otterbrix_manager_,
+                                                                    &db::OtterbrixManager::drop_stale_external_tables,
+                                                                    uuid,
+                                                                    std::move(live));
                 auto stale_result = co_await std::move(stale_future);
                 if (stale_result.has_error()) {
                     log_->error("add_connection_schema: failed to drop the stale mirrors of uid {}: {}",
@@ -588,29 +579,15 @@ namespace mysql {
 
     actor_zeta::unique_future<core::error_t> CatalogManager::check_database_ownership(std::string dbname) {
         OTX_ZONE_N("catalog::check_database_ownership");
-        // The registry is the authority: a uid is entered there only once its
-        // tables are mirrored, which is exactly the state a user CREATE/DROP
-        // DATABASE would corrupt.
-        std::string_view owner;
-        if (iequals(dbname, otterstax::kafka::KAFKA_DATABASE_NAME)) {
-            owner = otterstax::kafka::KAFKA_DATABASE_NAME;
-        } else {
-            for (const auto& entry : connection_registry_) {
-                if (iequals(dbname, entry.first)) {
-                    owner = entry.first;
-                    break;
-                }
-            }
-        }
-        if (owner.empty()) {
+        if (dbname != otterstax::kafka::KAFKA_DATABASE_NAME && aliases_.find(dbname) == nullptr) {
             co_return core::error_t::no_error();
         }
-        log_->error("check_database_ownership: database '{}' is owned by connection '{}'", dbname, owner);
+        log_->error("check_database_ownership: database '{}' is owned by connection '{}'", dbname, dbname);
         std::pmr::string what{resource()};
         what.append("database '");
         what.append(dbname);
         what.append("' is owned by connection '");
-        what.append(owner);
+        what.append(dbname);
         what.push_back('\'');
         co_return core::error_t(core::error_code_t::invalid_parameter, std::move(what));
     }

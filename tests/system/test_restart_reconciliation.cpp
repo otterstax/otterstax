@@ -49,6 +49,10 @@ namespace {
 
     constexpr const char* kUid = "shop";
     constexpr const char* kSchema = "public";
+    const otterstax::names::alias_registry_t& shop_aliases() {
+        static const auto aliases = make_aliases({{kUid, backend_type_t::PostgreSQL, "pgdb", kSchema}});
+        return aliases;
+    }
 
     constexpr Oid kInt4Oid = 23;
     constexpr Oid kFloat8Oid = 701;
@@ -267,7 +271,7 @@ namespace {
             , resource_(otterbrix_->dispatcher()->resource())
             , az_scheduler_(make_az_scheduler())
             , otb_mgr_(actor_zeta::spawn<db::OtterbrixManager>(resource_, make_otterbrix_manager(otterbrix_)))
-            , catalog_(actor_zeta::spawn<mysql::CatalogManager>(resource_, otb_mgr_->address()))
+            , catalog_(actor_zeta::spawn<mysql::CatalogManager>(resource_, otb_mgr_->address(), shop_aliases()))
             , pg_conn_(std::make_unique<pg::ConnectorManager>(resource_,
                                                               catalog_->address(),
                                                               &catalog_pg_factory,
@@ -308,7 +312,7 @@ namespace {
         // The engine OID the catalog stamps on a SELECT over `table` — what the
         // store holds for it.
         components::catalog::oid_t stamped_oid(const std::string& table) {
-            auto parser = make_parser(resource_);
+            auto parser = make_parser(resource_, shop_aliases());
             auto parsed = parser->parse("SELECT * FROM " + std::string{kUid} + ".pgdb." + kSchema + "." + table + ";");
             REQUIRE_FALSE(parsed.has_error());
             auto [needs_sched, future] = actor_zeta::send(catalog_->address(),
@@ -400,6 +404,7 @@ namespace {
                                                 az_scheduler_.get(),
                                                 worker_pool_size(),
                                                 &make_parser,
+                                                shop_aliases(),
                                                 actor_zeta::address_t::empty_address(), // sql
                                                 pg_mgr_->address(),
                                                 actor_zeta::address_t::empty_address(), // ch

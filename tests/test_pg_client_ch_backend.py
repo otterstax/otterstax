@@ -11,7 +11,7 @@ from contextlib import contextmanager
 
 import config
 
-_ORDERS = f"{config.CH_ALIAS}.{config.CH_DATABASE}.schema.orders"
+_ORDERS = f"{config.CH_ALIAS}.{config.CH_DATABASE}.orders"
 
 
 class client:

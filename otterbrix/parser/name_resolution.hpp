@@ -38,6 +38,13 @@ namespace otterstax::names {
         // nullptr.
         void add(qualified_name_t name);
 
+        // Registers `name` under a key other than its own (database,
+        // collection): the (dbname, relname) the transformer stamps on a node
+        // whose written name it reads differently from the canonical one — a
+        // DROP of a three-segment federated table, whose node carries the
+        // alias as its dbname.
+        void add(std::string_view key_db, std::string_view key_rel, qualified_name_t name);
+
         // Returns nullptr on a miss OR when the key is ambiguous (collided).
         // The caller turns nullptr into a resolution error; there are NO
         // fallback lookups. Use collided() to distinguish ambiguity from a

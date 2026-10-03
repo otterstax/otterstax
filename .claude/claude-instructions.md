@@ -38,8 +38,8 @@ The system uses `ComponentManager` (`component_manager/`) as the central orchest
 ### Federated Query Pattern (Critical!)
 Queries use **connection aliases** as database names:
 ```sql
-SELECT * FROM campaigns.db1.schema.campaigns
-JOIN impressions.db2.schema.impressions ON campaigns.id = impressions.id
+SELECT * FROM campaigns.db1.campaigns
+JOIN impressions.db2.impressions ON campaigns.id = impressions.id
 ```
 - `campaigns` and `impressions` are **connection aliases** (not databases!)
 - Each alias maps to a connection declared in the `connections:` section of the

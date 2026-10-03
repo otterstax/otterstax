@@ -6,6 +6,7 @@
 #include "types/otterbrix.hpp"
 #include "utility/logger.hpp"
 
+#include "otterbrix/parser/alias_registry.hpp"
 #include "otterbrix/parser/grammar_extension/kafka/kafka_extension.hpp"
 
 #include <otterbrix/otterbrix.hpp>
@@ -74,12 +75,14 @@ public:
 
 class GreenplumParser : public IParser {
 public:
-    explicit GreenplumParser(std::pmr::memory_resource* resource);
+    GreenplumParser(std::pmr::memory_resource* resource, const otterstax::names::alias_registry_t& aliases);
     // Starts from `seed` (a host's own extensions); the built-in s3/file/kafka
     // extensions are registered on top of it. A name collision between the two
     // sets is not a degraded parser: every parse() then fails with the
     // registration error.
-    GreenplumParser(std::pmr::memory_resource* resource, components::sql::parser::parser_extension_registry_t seed);
+    GreenplumParser(std::pmr::memory_resource* resource,
+                    const otterstax::names::alias_registry_t& aliases,
+                    components::sql::parser::parser_extension_registry_t seed);
 
     core::result_wrapper_t<ParsedQueryDataPtr> parse(const std::string& sql) override;
 
@@ -100,6 +103,7 @@ public:
 
 private:
     std::pmr::memory_resource* resource_;
+    const otterstax::names::alias_registry_t& aliases_;
     log_t log_;
     // One shared registry for all DDL parser extensions: s3/file (CREATE EXTERNAL
     // TABLE / COPY ... TO → external_node_t) and kafka (CREATE/DROP SOURCE/STREAM
@@ -113,6 +117,6 @@ private:
 
 using parser_ptr = std::unique_ptr<IParser>;
 
-inline parser_ptr make_parser(std::pmr::memory_resource* resource) {
-    return std::make_unique<GreenplumParser>(resource);
+inline parser_ptr make_parser(std::pmr::memory_resource* resource, const otterstax::names::alias_registry_t& aliases) {
+    return std::make_unique<GreenplumParser>(resource, aliases);
 }

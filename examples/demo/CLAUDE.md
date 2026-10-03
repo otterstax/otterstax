@@ -24,7 +24,7 @@ The **Kafka streaming act** is a separate, step-by-step tour under `kafka/`
 write path, continuous streams, and fan-in) — see `kafka/README.md`. It needs
 the `demo-kafka` broker (started by `up.sh`) and the pg/ch connections.
 
-Demo SQL uses the **3-part** qualifier form `<alias>.<db>.<tbl>` (e.g. `mysql.bill.orders`, `pg.shop.customers`, `ch.ev.sessions`). The parser promotes 3-part to its internal 4-part shape automatically, then `sql_gen::table_reference` emits backend-native qualifiers (`db.tbl` for MySQL/CH, `schema.tbl` for PG). External tables live under the `otter` engine database (`otter.regions`, `otter.promos`) — same database created by step_3a, so the cleanup script tears them down together.
+Demo SQL uses the **3-part** qualifier form `<alias>.<db>.<tbl>` (e.g. `mysql.bill.orders`, `pg.shop.customers`, `ch.ev.sessions`). The parser rewrites a 3-part name behind a configured alias to its canonical 4-part shape — the PostgreSQL schema comes from the connection's `schema` in `config.yaml`, MySQL/CH have none — then `sql_gen::table_reference` emits backend-native qualifiers (`db.tbl` for MySQL/CH, `schema.tbl` for PG). See the root `CLAUDE.md`, "Federated Query Syntax". External tables live under the `otter` engine database (`otter.regions`, `otter.promos`) — same database created by step_3a, so the cleanup script tears them down together.
 
 ## Pick a mode
 

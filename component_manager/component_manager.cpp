@@ -6,9 +6,9 @@
 #include "utility/logger.hpp"
 #include "utility/tracy_profiler.hpp"
 
+#include "connectors/api_connections/ch_connection_config.hpp"
 #include "connectors/api_connections/connection_config.hpp"
 #include "connectors/api_connections/pg_connection_config.hpp"
-#include "connectors/api_connections/ch_connection_config.hpp"
 #include "connectors/s3/s3_connect_params.hpp"
 #include "utility/session.hpp"
 
@@ -19,9 +19,26 @@
 constexpr size_t MAX_THROUGHPUT =
     1000; // MAX_THROUGHPUT is the maximum number of messages an actor will process before yielding to the scheduler. Setting it to a high value (or to std::numeric_limits<size_t>::max()) means actors will yield only when they have no more messages to process, which can improve performance for actors that process many messages in bursts but can lead to starvation of other actors if one actor receives a continuous stream of messages.
 
-ComponentManager::ComponentManager(const configuration::config& config)
+namespace {
+    otterstax::names::alias_registry_t make_alias_registry(const config::ConnectionsConfig& connections) {
+        otterstax::names::alias_registry_t aliases;
+        for (const auto& connection : connections.mysql) {
+            aliases.add(connection.alias, {backend_type_t::MySQL, connection.database, {}});
+        }
+        for (const auto& connection : connections.postgresql) {
+            aliases.add(connection.alias, {backend_type_t::PostgreSQL, connection.database, connection.schema});
+        }
+        for (const auto& connection : connections.clickhouse) {
+            aliases.add(connection.alias, {backend_type_t::ClickHouse, connection.database, {}});
+        }
+        return aliases;
+    }
+} // namespace
+
+ComponentManager::ComponentManager(const configuration::config& config, const config::ConnectionsConfig& connections)
     : engine_(new db::otterbrix_engine_t(config))
-    , resource_(engine_->dispatcher()->resource()) {
+    , resource_(engine_->dispatcher()->resource())
+    , aliases_(make_alias_registry(connections)) {
     OTX_ZONE_N("ComponentManager::init");
 
     initialize_all_loggers(config.log.path.c_str());
@@ -40,11 +57,12 @@ ComponentManager::ComponentManager(const configuration::config& config)
                                                                            /*start_pollers=*/true);
         assert(kafka_manager_ != nullptr && "kafka manager must not be null");
 
-        catalog_manager_ = actor_zeta::spawn<mysql::CatalogManager>(resource_, otterbrix_manager_->address());
+        catalog_manager_ = actor_zeta::spawn<mysql::CatalogManager>(resource_, otterbrix_manager_->address(), aliases_);
         assert(catalog_manager_ != nullptr && "catalog manager must not be null");
 
-        db_connector_manager_ = std::make_unique<mysql::ConnectorManager>(
-            resource_, catalog_manager_->address(), &mysql::make_mysql_connector);
+        db_connector_manager_ = std::make_unique<mysql::ConnectorManager>(resource_,
+                                                                          catalog_manager_->address(),
+                                                                          &mysql::make_mysql_connector);
 
         pg_connector_manager_ =
             std::make_unique<pg::ConnectorManager>(resource_, catalog_manager_->address(), &pg::make_pg_connector);
@@ -104,6 +122,7 @@ ComponentManager::ComponentManager(const configuration::config& config)
                                                   az_scheduler_.get(),
                                                   worker_count,
                                                   &make_parser,
+                                                  aliases_,
                                                   sql_connection_manager_->address(),
                                                   pg_connection_manager_->address(),
                                                   ch_connection_manager_actor_->address(),
@@ -258,8 +277,7 @@ core::error_t ComponentManager::register_connections(const config::ConnectionsCo
             log->error("Failed to register s3 alias '{}': actor did not settle the request", c.alias);
             return core::error_t(
                 core::error_code_t::io_error,
-                std::pmr::string{("s3 alias '" + c.alias + "': actor did not settle the request").c_str(),
-                                 resource_});
+                std::pmr::string{("s3 alias '" + c.alias + "': actor did not settle the request").c_str(), resource_});
         }
         auto result = std::move(stored).take_ready();
         if (result.has_error()) {

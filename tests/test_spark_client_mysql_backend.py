@@ -31,7 +31,7 @@ def main(local=False):
     print(f"# Spark Connect Client - MySQL Backend Tests")
     print(f"{'#'*70}")
     print(f"Connecting to Spark Connect server at: sc://{host}:{port}")
-    print(f"Target: MySQL backend (campaigns.db1.schema.campaigns)")
+    print(f"Target: MySQL backend (campaigns.db1.campaigns)")
     print(f"{'#'*70}\n")
 
     spark = SparkSession.builder.remote(f"sc://{host}:{port}").getOrCreate()
@@ -52,7 +52,7 @@ def main(local=False):
     print(f"\n{'='*70}")
     print("Running: Test 1 - spark.sql() SQL pass-through")
     print(f"{'='*70}")
-    df = spark.sql("SELECT * FROM campaigns.db1.schema.campaigns LIMIT 5")
+    df = spark.sql("SELECT * FROM campaigns.db1.campaigns LIMIT 5")
     rows = df.collect()
     assert len(rows) == 5, f"Expected 5 rows, got {len(rows)}"
     print(f"  ✅ Got {len(rows)} rows")
@@ -63,7 +63,7 @@ def main(local=False):
     print(f"\n{'='*70}")
     print("Running: Test 2 - DataFrame.filter().select() (Path B)")
     print(f"{'='*70}")
-    df2 = (spark.sql("SELECT * FROM campaigns.db1.schema.campaigns")
+    df2 = (spark.sql("SELECT * FROM campaigns.db1.campaigns")
            .filter("budget > 0")
            .select("campaign_name", "budget"))
     rows2 = df2.collect()

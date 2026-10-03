@@ -173,23 +173,24 @@ namespace {
 
 } // namespace
 
-core::error_t OtterbrixManager::ensure_manifest(const std::string& db_name) {
-    OTX_ZONE_N("OtterbrixManager::ensure_manifest");
-    // Probed before it is created: on rc-2 a repeated CREATE TABLE of an
-    // existing collection is not an error, so the engine's create verdict
-    // cannot tell a fresh manifest from a restored one.
+core::result_wrapper_t<bool> OtterbrixManager::has_manifest(const std::string& db_name) {
+    OTX_ZONE_N("OtterbrixManager::has_manifest");
     components::catalog::oid_t oid = components::catalog::INVALID_OID;
     auto described = at_engine_boundary(resource(), [&] {
         return data_manager_->describe_collection(db_name, external_manifest_collection, oid);
     });
     if (!failed(described)) {
-        return core::error_t::no_error();
+        return true;
     }
-    if (!described || described->get_error().type != core::error_code_t::table_not_exists) {
-        return engine_failure(resource(),
-                              described,
-                              "Failed to probe the mirror manifest of database '" + db_name + "'");
+    if (described && described->get_error().type == core::error_code_t::table_not_exists) {
+        return false;
     }
+    return engine_failure(resource(), described, "Failed to probe the mirror manifest of database '" + db_name + "'");
+}
+
+core::error_t OtterbrixManager::create_manifest(const std::string& db_name) {
+    OTX_ZONE_N("OtterbrixManager::create_manifest");
+    components::catalog::oid_t oid = components::catalog::INVALID_OID;
     std::vector<components::table::column_definition_t> columns;
     columns.emplace_back(external_manifest_column,
                          components::types::complex_logical_type(components::types::logical_type::STRING_LITERAL));
@@ -201,7 +202,7 @@ core::error_t OtterbrixManager::ensure_manifest(const std::string& db_name) {
                               cursor,
                               "Failed to create the mirror manifest of database '" + db_name + "'");
     }
-    log_->debug("ensure_manifest: created {}.{}", db_name, external_manifest_collection);
+    log_->debug("create_manifest: created {}.{}", db_name, external_manifest_collection);
     return core::error_t::no_error();
 }
 
@@ -290,23 +291,32 @@ OtterbrixManager::register_external_database(std::string db_name) {
     auto cursor = at_engine_boundary(resource(), [&] {
         return data_manager_->execute_sql(sql_gen::create_database_statement(db_name));
     });
-    bool created = true;
-    if (failed(cursor)) {
-        // The name is guarded against user DDL, so the database the engine
-        // already holds is the mirror a previous run left on this data dir.
-        if (!cursor || cursor->get_error().type != core::error_code_t::database_already_exists) {
-            auto error = engine_failure(resource(), cursor, "Failed to create engine database '" + db_name + "'");
-            log_->error("register_external_database: {}", error.what.c_str());
-            co_return std::move(error);
+    if (!failed(cursor)) {
+        if (auto err = create_manifest(db_name); err.contains_error()) {
+            log_->error("register_external_database: {}", err.what.c_str());
+            co_return std::move(err);
         }
-        log_->info("register_external_database: engine database {} exists from a previous run, reusing it", db_name);
-        created = false;
+        co_return true;
     }
-    if (auto err = ensure_manifest(db_name); err.contains_error()) {
-        log_->error("register_external_database: {}", err.what.c_str());
-        co_return std::move(err);
+    if (!cursor || cursor->get_error().type != core::error_code_t::database_already_exists) {
+        auto error = engine_failure(resource(), cursor, "Failed to create engine database '" + db_name + "'");
+        log_->error("register_external_database: {}", error.what.c_str());
+        co_return std::move(error);
     }
-    co_return created;
+    auto mirrored = has_manifest(db_name);
+    if (mirrored.has_error()) {
+        log_->error("register_external_database: {}", mirrored.error().what.c_str());
+        co_return std::move(mirrored.error());
+    }
+    if (!mirrored.value()) {
+        const std::string what = "engine database '" + db_name + "' exists and is not the mirror of connection '" +
+                                 db_name + "': a local database holds the connection's name";
+        log_->error("register_external_database: {}", what);
+        co_return core::error_t(core::error_code_t::database_already_exists,
+                                std::pmr::string{what.c_str(), resource()});
+    }
+    log_->info("register_external_database: engine database {} exists from a previous run, reusing it", db_name);
+    co_return false;
 }
 
 actor_zeta::unique_future<core::result_wrapper_t<components::catalog::oid_t>>

@@ -2,6 +2,7 @@
 // Copyright 2025-2026  OtterStax
 
 #include "otterbrix/parser/subquery_extractor.hpp"
+#include "test_aliases.hpp"
 
 #include <catch2/catch_all.hpp>
 
@@ -24,7 +25,9 @@ namespace {
     // resource (new_delete here) and does not point into the arena.
     extraction_result_t prep(std::string_view sql) {
         std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
-        return prepare_sql(sql, &arena, std::pmr::new_delete_resource());
+        auto prepared = prepare_sql(sql, test_aliases(), &arena, std::pmr::new_delete_resource());
+        REQUIRE_FALSE(prepared.has_error());
+        return std::move(prepared.value());
     }
 } // namespace
 
@@ -141,9 +144,9 @@ TEST_CASE("cross-source SELECT") {
 }
 
 TEST_CASE("single-source SELECT") {
-    auto r = prep("SELECT id, name FROM mysql.bill.schema.orders WHERE ts >= '2026-04-18' LIMIT 10;");
+    auto r = prep("SELECT id, name FROM mysql.bill.orders WHERE ts >= '2026-04-18' LIMIT 10;");
     REQUIRE(r.stubs.empty());
-    REQUIRE(r.modified_sql.find("mysql.bill.schema.orders") != std::string::npos);
+    REQUIRE(r.modified_sql.find("mysql.bill.orders") != std::string::npos);
 }
 
 TEST_CASE("DDL/DML untouched") {
@@ -179,7 +182,10 @@ TEST_CASE("input without a statement is returned untouched") {
 TEST_CASE("several statements are returned untouched for parse() to reject") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     ::Node* root = nullptr;
-    auto r = prepare_sql("SELECT * FROM (SELECT id FROM mysql.bill.orders) o; SELECT 2;", &arena, &arena, &root);
+    auto prepared =
+        prepare_sql("SELECT * FROM (SELECT id FROM mysql.bill.orders) o; SELECT 2;", test_aliases(), &arena, &arena, &root);
+    REQUIRE_FALSE(prepared.has_error());
+    const auto& r = prepared.value();
     REQUIRE(r.stubs.empty());
     REQUIRE(r.modified_sql == "SELECT * FROM (SELECT id FROM mysql.bill.orders) o; SELECT 2;");
     // No reusable root either: the caller re-parses and sees the full list.

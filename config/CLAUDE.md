@@ -41,6 +41,7 @@ Nothing in `config/` throws. Every entry point returns a
 | a `service.*` value that cannot be read as its type (`port: abc`) | `invalid_parameter` | the field (`service.mysql.port`) |
 | a connection field that is not a scalar (`host: [a, b]`) | `invalid_parameter` | the section + entry position + field |
 | an incomplete connection entry, or a malformed backend port | `invalid_parameter` | the section + `alias='…'` + the missing field / bad port |
+| a backend alias that is not an unquoted SQL identifier (`[a-z_][a-z0-9_]*`), or one another backend entry already uses | `invalid_parameter` | the section + `alias='…'` + the rule, or the section that already uses it |
 
 The yaml-cpp calls (`YAML::LoadFile`, `Node::as<T>()`) are the only throwing
 sites; each is wrapped in a try/catch exactly where it is made and converted to
@@ -94,6 +95,14 @@ the value above (`yaml_scalar.hpp` for `as<T>()`, `ConfigReader::load` for
   `otterstax::parse_port` from `utility/parse_port.hpp`, the same rule the
   connectors apply); `alias/access_key/secret_key` for s3. `parse_connections`
   turns a non-empty result into its `invalid_parameter`.
+- After every entry is complete, `parse_connections` checks the backend aliases
+  (mysql / postgresql / clickhouse) together: the alias is the first segment of
+  a federated table name, written unquoted in SQL, so it must be what the lexer
+  folds an unquoted identifier to — `[a-z_][a-z0-9_]*`; an upper-case letter, a
+  dot, a dash or a leading digit would be unreachable. One alias on two backend
+  entries — within a section or across two — is two readings of one name. s3
+  aliases are a separate namespace (a string literal in `s3_alias = '…'`) and
+  are not checked here.
 
 ## Startup flow
 
@@ -195,7 +204,9 @@ rules).
 `tests/unit/config/` (`test_unit_config`) covers `parse_connections` (field
 parsing, null/missing node, missing sections, pg `schema` default, optional s3
 fields, order preservation, **`invalid_parameter` on an incomplete entry, a
-malformed port or a non-scalar field**, empty `table`/omitted `port` allowed),
+malformed port or a non-scalar field**, empty `table`/omitted `port` allowed, the
+`[names]` table of backend aliases: duplicates within and across sections, an
+upper-case letter, a dot, a dash, a leading digit),
 `validation_error` (required-field checks, optional port, port range/format, s3
 keys), and `ConfigReader` (whole `config.yaml`: `service.*` ports +
 `connection_retry` + embedded connections, defaults when file missing, retry

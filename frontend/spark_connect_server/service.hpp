@@ -11,6 +11,8 @@
 
 #pragma once
 
+#include "otterbrix/parser/alias_registry.hpp"
+
 #include <actor-zeta.hpp>
 #include <agrpc/grpc_context.hpp>
 #include <agrpc/grpc_executor.hpp>
@@ -46,6 +48,7 @@ namespace frontend::spark {
         uint16_t port = 15002;
         std::pmr::memory_resource* resource{nullptr};
         actor_zeta::address_t scheduler_address;
+        const otterstax::names::alias_registry_t* aliases{nullptr};
     };
 
     // ---------------------------------------------------------------------------
@@ -70,7 +73,9 @@ namespace frontend::spark {
     // a SELECT of the core grammar is a query; anything else (DDL, DML, CREATE
     // EXTERNAL TABLE / COPY, Kafka DDL) is a command. A statement that does not
     // parse is the parser's error, its message on `resource`.
-    core::result_wrapper_t<sql_statement_t> classify_sql(const std::string& sql, std::pmr::memory_resource* resource);
+    core::result_wrapper_t<sql_statement_t> classify_sql(const std::string& sql,
+                                                         std::pmr::memory_resource* resource,
+                                                         const otterstax::names::alias_registry_t& aliases);
 
     // What a SqlCommand whose statement is a query answers with (Spark's
     // SqlCommandResult for a statement that is not a command): the command's input
@@ -105,6 +110,7 @@ namespace frontend::spark {
     private:
         // Configuration
         std::pmr::memory_resource* resource_;
+        const otterstax::names::alias_registry_t& aliases_;
         actor_zeta::address_t scheduler_address_;
         log_t log_;
 

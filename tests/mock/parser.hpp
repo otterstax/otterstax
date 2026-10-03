@@ -70,12 +70,13 @@ private:
     mock_config config_;
 };
 
-inline parser_ptr make_mock_parser(std::pmr::memory_resource* resource) {
+inline parser_ptr make_mock_parser(std::pmr::memory_resource* resource, const otterstax::names::alias_registry_t&) {
     return std::make_unique<SimpleMockParser>(mock_config({.resource = resource}));
 }
 
 // Stateless factory variant for the "parser throws" path: each Worker gets a
 // SimpleMockParser whose parse() throws "SimpleMockParser: exception in parse".
-inline parser_ptr make_throwing_mock_parser(std::pmr::memory_resource* resource) {
+inline parser_ptr make_throwing_mock_parser(std::pmr::memory_resource* resource,
+                                            const otterstax::names::alias_registry_t&) {
     return std::make_unique<SimpleMockParser>(mock_config({.resource = resource, .can_throw = true}));
 }

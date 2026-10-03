@@ -16,6 +16,7 @@
 #include "otterbrix/schema/schema_utils.hpp"
 #include "test_helpers.hpp"
 
+#include "../mock/aliases.hpp"
 #include "../mock/mock_config.hpp"
 #include "../mock/otterbrix.hpp"
 #include "../mock/parser.hpp"
@@ -218,7 +219,7 @@ namespace {
             , otterbrix_manager(actor_zeta::spawn<db::OtterbrixManager>(
                   res,
                   std::make_unique<SimpleMockOtterbrixManager>(mock_config{.resource = res})))
-            , catalog_manager(actor_zeta::spawn<mysql::CatalogManager>(res, otterbrix_manager->address()))
+            , catalog_manager(actor_zeta::spawn<mysql::CatalogManager>(res, otterbrix_manager->address(), no_aliases()))
             , connector_manager(
                   std::make_unique<ch::ConnectorManager>(res, catalog_manager->address(), &ch_recording_factory, 2))
             , manager(actor_zeta::spawn<db::ClickhouseManager>(res, connector_manager.get())) {
@@ -263,7 +264,7 @@ TEST_CASE("PostgressManager::discover: a failed ENUM query refuses the registrat
     auto otterbrix_manager = actor_zeta::spawn<db::OtterbrixManager>(
         resource,
         std::make_unique<SimpleMockOtterbrixManager>(mock_config{.resource = resource}));
-    auto catalog_manager = actor_zeta::spawn<mysql::CatalogManager>(resource, otterbrix_manager->address());
+    auto catalog_manager = actor_zeta::spawn<mysql::CatalogManager>(resource, otterbrix_manager->address(), no_aliases());
     auto connector_manager =
         std::make_unique<pg::ConnectorManager>(resource, catalog_manager->address(), &pg_enum_failing_factory, 2);
     auto manager = actor_zeta::spawn<db::PostgressManager>(resource, connector_manager.get());

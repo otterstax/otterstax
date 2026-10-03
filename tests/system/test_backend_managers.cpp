@@ -207,7 +207,7 @@ namespace {
             , otterbrix_manager(actor_zeta::spawn<db::OtterbrixManager>(
                   res,
                   std::make_unique<SimpleMockOtterbrixManager>(mock_config{.resource = res})))
-            , catalog_manager(actor_zeta::spawn<mysql::CatalogManager>(res, otterbrix_manager->address()))
+            , catalog_manager(actor_zeta::spawn<mysql::CatalogManager>(res, otterbrix_manager->address(), no_aliases()))
             , connector_manager(
                   std::make_unique<mysql::ConnectorManager>(res, catalog_manager->address(), factory, 2))
             , manager(actor_zeta::spawn<db::MySQLManager>(res, connector_manager.get())) {
@@ -559,6 +559,10 @@ TEST_CASE("MySQLManager::execute: a converter still running when an earlier slot
 namespace {
 
     constexpr const char* kNotNullUid = "nulls";
+    const otterstax::names::alias_registry_t& nulls_aliases() {
+        static const auto aliases = make_aliases({{kNotNullUid, backend_type_t::PostgreSQL, "pgdb", "public"}});
+        return aliases;
+    }
     constexpr size_t not_null_rows = 2000;
     constexpr Oid kNotNullInt4Oid = 23;
     constexpr Oid kNotNullTextOid = 25;
@@ -682,7 +686,7 @@ namespace {
             , resource_(otterbrix_->dispatcher()->resource())
             , az_scheduler_(otterstax::test::make_az_scheduler())
             , otb_mgr_(actor_zeta::spawn<db::OtterbrixManager>(resource_, make_otterbrix_manager(otterbrix_)))
-            , catalog_(actor_zeta::spawn<mysql::CatalogManager>(resource_, otb_mgr_->address()))
+            , catalog_(actor_zeta::spawn<mysql::CatalogManager>(resource_, otb_mgr_->address(), nulls_aliases()))
             , pg_conn_(std::make_unique<pg::ConnectorManager>(resource_, catalog_->address(), factory, 1))
             , pg_mgr_(actor_zeta::spawn<db::PostgressManager>(resource_, pg_conn_.get()))
             , scheduler_(spawn_scheduler()) {}
@@ -728,6 +732,7 @@ namespace {
                                                 az_scheduler_.get(),
                                                 otterstax::test::worker_pool_size(),
                                                 &make_parser,
+                                                nulls_aliases(),
                                                 actor_zeta::address_t::empty_address(), // sql
                                                 pg_mgr_->address(),
                                                 actor_zeta::address_t::empty_address(), // ch
@@ -866,7 +871,11 @@ TEST_CASE("engine alone: a literal INSERT with a NULL past the first chunk of a 
 namespace {
 
     constexpr const char* kChUid = "chx";
-    constexpr const char* kChEvents = "chx.chdb.schema.events";
+    constexpr const char* kChEvents = "chx.chdb.events";
+    const otterstax::names::alias_registry_t& chx_aliases() {
+        static const auto aliases = make_aliases({{kChUid, backend_type_t::ClickHouse, "chdb"}});
+        return aliases;
+    }
     constexpr size_t ch_event_rows = 2500;
     // The rows of the first data block; the second holds the rest, so the block boundary falls inside
     // an engine chunk.
@@ -1107,7 +1116,7 @@ namespace {
             , resource_(otterbrix_->dispatcher()->resource())
             , az_scheduler_(otterstax::test::make_az_scheduler())
             , otb_mgr_(actor_zeta::spawn<db::OtterbrixManager>(resource_, make_otterbrix_manager(otterbrix_)))
-            , catalog_(actor_zeta::spawn<mysql::CatalogManager>(resource_, otb_mgr_->address()))
+            , catalog_(actor_zeta::spawn<mysql::CatalogManager>(resource_, otb_mgr_->address(), chx_aliases()))
             , ch_conn_(std::make_unique<ch::ConnectorManager>(resource_, catalog_->address(), &events_ch_factory, 1))
             , ch_mgr_(actor_zeta::spawn<db::ClickhouseManager>(resource_, ch_conn_.get()))
             , scheduler_(spawn_scheduler()) {}
@@ -1148,6 +1157,7 @@ namespace {
                                                 az_scheduler_.get(),
                                                 otterstax::test::worker_pool_size(),
                                                 &make_parser,
+                                                chx_aliases(),
                                                 actor_zeta::address_t::empty_address(), // sql
                                                 actor_zeta::address_t::empty_address(), // pg
                                                 ch_mgr_->address(),

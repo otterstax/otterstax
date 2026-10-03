@@ -81,43 +81,21 @@ namespace frontend::spark {
             return parts;
         }
 
-        struct table_ref {
-            std::string uid;
-            std::string dbname;
-            std::string schema;
-            std::string relname;
-        };
-
-        table_ref parse_table_identifier(std::string_view ident, std::pmr::memory_resource* resource) {
+        qualified_name_t written_table_name(std::string_view ident, std::pmr::memory_resource* resource) {
             const auto parts = split_identifier(ident, resource);
-            table_ref ref;
+            const auto part = [&parts](std::size_t i) { return std::string(parts[i].begin(), parts[i].end()); };
             switch (parts.size()) {
                 case 0:
-                    break;
+                    return {};
                 case 1:
-                    ref.relname = std::string(parts[0].begin(), parts[0].end());
-                    break;
+                    return qualified_name_t("", "", "", part(0));
                 case 2:
-                    ref.dbname = std::string(parts[0].begin(), parts[0].end());
-                    ref.relname = std::string(parts[1].begin(), parts[1].end());
-                    break;
+                    return qualified_name_t("", part(0), "", part(1));
                 case 3:
-                    // `alias.db.table`, read as the SQL path reads three parts
-                    // (promote_three_part_qualifiers): the connection alias, the
-                    // database, the table, the database standing in for the schema.
-                    ref.uid = std::string(parts[0].begin(), parts[0].end());
-                    ref.dbname = std::string(parts[1].begin(), parts[1].end());
-                    ref.schema = std::string(parts[1].begin(), parts[1].end());
-                    ref.relname = std::string(parts[2].begin(), parts[2].end());
-                    break;
+                    return qualified_name_t("", part(0), part(1), part(2));
                 default:
-                    ref.uid = std::string(parts[0].begin(), parts[0].end());
-                    ref.dbname = std::string(parts[1].begin(), parts[1].end());
-                    ref.schema = std::string(parts[2].begin(), parts[2].end());
-                    ref.relname = std::string(parts[3].begin(), parts[3].end());
-                    break;
+                    return qualified_name_t(part(0), part(1), part(2), part(3));
             }
-            return ref;
         }
 
         struct db_rel_names {
@@ -189,13 +167,15 @@ namespace frontend::spark {
 
         // What the translation of one relation_to_plan() call shares.
         struct translation_ctx_t {
-            explicit translation_ctx_t(std::pmr::memory_resource* resource)
+            translation_ctx_t(std::pmr::memory_resource* resource, const otterstax::names::alias_registry_t& aliases)
                 : resource(resource)
+                , aliases(aliases)
                 , params(cl::make_parameter_node(resource))
-                , parser(resource)
+                , parser(resource, aliases)
                 , read_schemas(resource) {}
 
             std::pmr::memory_resource* resource;
+            const otterstax::names::alias_registry_t& aliases;
             // The plan's one parameter node: every literal gets its id here, the
             // constants of parsed SQL fragments included.
             cl::parameter_node_ptr params;
@@ -596,16 +576,24 @@ namespace frontend::spark {
             }
             switch (read.read_type_case()) {
                 case sc::Read::kNamedTable: {
-                    auto ref = parse_table_identifier(read.named_table().unparsed_identifier(), resource);
+                    auto canonical = otterstax::names::canonical_table_name(
+                        resource,
+                        ctx.aliases,
+                        written_table_name(read.named_table().unparsed_identifier(), resource));
+                    if (canonical.has_error()) {
+                        return canonical.convert_error<cl::node_ptr>();
+                    }
+                    const auto& ref = canonical.value();
                     cl::node_ptr node;
-                    if (ref.uid.empty()) {
-                        node =
-                            cl::make_node_aggregate(resource, core::dbname_t{ref.dbname}, core::relname_t{ref.relname});
+                    if (ref.unique_identifier.empty()) {
+                        node = cl::make_node_aggregate(resource,
+                                                       core::dbname_t{ref.database},
+                                                       core::relname_t{ref.collection});
                     } else {
                         node = cl::make_node_aggregate(resource,
-                                                       core::uid_t{ref.uid},
-                                                       core::dbname_t{ref.dbname},
-                                                       core::relname_t{ref.relname});
+                                                       core::uid_t{ref.unique_identifier},
+                                                       core::dbname_t{ref.database},
+                                                       core::relname_t{ref.collection});
                         ctx.read_schemas.push_back(
                             read_schema_t{node.get(),
                                           std::pmr::string{ref.schema.data(), ref.schema.size(), resource}});
@@ -1468,7 +1456,8 @@ namespace frontend::spark {
     } // namespace
 
     core::result_wrapper_t<TranslationResult> relation_to_plan(const sc::Plan& plan,
-                                                               std::pmr::memory_resource* resource) {
+                                                               std::pmr::memory_resource* resource,
+                                                               const otterstax::names::alias_registry_t& aliases) {
         OTX_ZONE_N("spark::relation_to_plan");
         if (plan.op_type_case() != sc::Plan::kRoot) {
             return make_error(core::error_code_t::unimplemented_yet,
@@ -1490,7 +1479,7 @@ namespace frontend::spark {
                 .convert_error<TranslationResult>();
         }
 
-        translation_ctx_t ctx{resource};
+        translation_ctx_t ctx{resource, aliases};
 
         auto root_result = translate_relation(root_rel, ctx);
         if (root_result.has_error()) {

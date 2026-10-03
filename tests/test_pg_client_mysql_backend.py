@@ -29,7 +29,7 @@ class client:
             'password': 'testpass',
             'dbname': 'campaigns',
         }
-        self.test_database = 'campaigns.db1.schema'
+        self.test_database = 'campaigns.db1'
         self.test_table = 'postgresql_test_table'
         self.test_encoding_table = 'postgresql_test_encoding'
 

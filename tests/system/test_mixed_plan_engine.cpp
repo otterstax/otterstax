@@ -1,6 +1,7 @@
 // Reproduce the cross-backend GROUP BY segfault in-process.
 #include <catch2/catch_all.hpp>
 
+#include "../mock/aliases.hpp"
 #include "otterbrix/parser/parser.hpp"
 #include "otterbrix/query_generation/sql_query_generator.hpp"
 #include "otterbrix/schema/schema_utils.hpp"
@@ -11,18 +12,28 @@
 
 using namespace components;
 
+// The connections the statements below name, as config.yaml declares them.
+static const otterstax::names::alias_registry_t& mixed_aliases() {
+    static const auto aliases = make_aliases({
+        {"campaigns", backend_type_t::MySQL, "db1"},
+        {"products", backend_type_t::PostgreSQL, "pgdb", "public"},
+        {"pg", backend_type_t::PostgreSQL, "shop", "public"},
+    });
+    return aliases;
+}
+
 TEST_CASE("cross-backend GROUP BY downstream calls") {
     // Scoped arena, declared first so it outlives every object below. No engine
     // runs in this case — only the parser, generator and schema helpers — so
     // everything allocates from the test thread.
     std::pmr::synchronized_pool_resource case_arena(std::pmr::new_delete_resource());
     auto* resource = &case_arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, mixed_aliases());
     const char* sql = R"(
         SELECT c.campaign_name,
                COUNT(p.product_id) as product_count,
                AVG(p.price) as avg_product_price
-        FROM campaigns.db1.schema.campaigns c
+        FROM campaigns.db1.campaigns c
         INNER JOIN products.pgdb.public.products p ON p.campaign_id = c.campaign_id
         GROUP BY c.campaign_name
         ORDER BY product_count DESC;)";
@@ -92,12 +103,12 @@ TEST_CASE("mixed plan with node_data executes in engine", "[engine-group-by-stri
     // from it off the test thread.
     std::pmr::synchronized_pool_resource case_arena;
     auto* resource = &case_arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, mixed_aliases());
     const char* sql = R"(
         SELECT c.campaign_name,
                COUNT(p.product_id) as product_count,
                AVG(p.price) as avg_product_price
-        FROM campaigns.db1.schema.campaigns c
+        FROM campaigns.db1.campaigns c
         INNER JOIN products.pgdb.public.products p ON p.campaign_id = c.campaign_id
         GROUP BY c.campaign_name
         ORDER BY product_count DESC;)";
@@ -168,7 +179,7 @@ static void run_mixed_variant(const char* tag, const char* sql, bool string_name
     // from it off the test thread.
     std::pmr::synchronized_pool_resource case_arena;
     auto* resource = &case_arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, mixed_aliases());
     auto result = parser.parse(sql);
     REQUIRE_FALSE(result.has_error());
     auto data = std::move(result.value());
@@ -228,7 +239,7 @@ static void run_mixed_variant(const char* tag, const char* sql, bool string_name
 
 static const char* k_groupby_sql = R"(
     SELECT c.campaign_name, COUNT(p.product_id) as product_count, AVG(p.price) as avg_product_price
-    FROM campaigns.db1.schema.campaigns c
+    FROM campaigns.db1.campaigns c
     INNER JOIN products.pgdb.public.products p ON p.campaign_id = c.campaign_id
     GROUP BY c.campaign_name ORDER BY product_count DESC;)";
 
@@ -419,7 +430,7 @@ namespace {
             REQUIRE_FALSE(c->is_error());
         }
 
-        GreenplumParser parser(resource);
+        GreenplumParser parser(resource, mixed_aliases());
         auto parsed = parser.parse(sql);
         REQUIRE_FALSE(parsed.has_error());
         auto data = std::move(parsed.value());

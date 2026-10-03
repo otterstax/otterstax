@@ -14,6 +14,8 @@
 
 #include "scheduler_stack.hpp"
 
+#include "../mock/aliases.hpp"
+
 #include "frontend/spark_connect_server/plan_translator/relation_to_plan.hpp"
 
 #include <spark/connect/base.pb.h>
@@ -191,7 +193,7 @@ namespace {
     run_plan(const scheduler_stack& s, session_hash_t id, const sc::Relation& root) {
         sc::Plan plan;
         *plan.mutable_root() = root;
-        auto translated = frontend::spark::relation_to_plan(plan, s.resource);
+        auto translated = frontend::spark::relation_to_plan(plan, s.resource, no_aliases());
         if (translated.has_error()) {
             return translated.convert_error<session_payload>();
         }

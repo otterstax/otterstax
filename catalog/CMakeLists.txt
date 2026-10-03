@@ -16,6 +16,7 @@ add_library(catalog
 )
 
 target_link_libraries(catalog PUBLIC
+    otterbrix_local
     Boost::boost
     otterbrix::otterbrix
     otterbrix_log

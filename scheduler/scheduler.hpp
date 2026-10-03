@@ -46,7 +46,7 @@ public:
     // codex rule 14) so production passes &make_parser and tests pass
     // &make_mock_parser. Each Worker builds its own parser instance from it, so
     // no parser object is shared between actors (rule 10).
-    using parser_factory_fn = parser_ptr (*)(std::pmr::memory_resource*);
+    using parser_factory_fn = parser_ptr (*)(std::pmr::memory_resource*, const otterstax::names::alias_registry_t&);
 
     // s3_manager / file_manager addresses are forwarded as-is to every Worker so
     // CREATE EXTERNAL TABLE and COPY ... TO statements (parsed as
@@ -56,6 +56,7 @@ public:
               actor_zeta::scheduler_raw scheduler,
               std::size_t worker_count,
               parser_factory_fn parser_factory,
+              const otterstax::names::alias_registry_t& aliases,
               actor_zeta::address_t sql_connection_manager,
               actor_zeta::address_t pg_connection_manager,
               actor_zeta::address_t ch_connection_manager,

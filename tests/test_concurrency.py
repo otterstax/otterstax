@@ -46,7 +46,7 @@ def make_config(local: bool):
         'flight_port': 8815,
         'user': 'testuser',
         'password': 'testpass',
-        'mysql_db': 'campaigns.db1.schema',
+        'mysql_db': 'campaigns.db1',
         'pg_db': 'products',                       # dbname for psycopg
         'pg_schema': 'products.pgdb.public',       # qualified-name prefix
     }
@@ -148,8 +148,8 @@ def test_slow_query_does_not_block_others(cfg):
     print("\n[slow_query_does_not_block_others]")
 
     heavy_sql = (
-        "SELECT * FROM campaigns.db1.schema.campaigns "
-        "JOIN impressions.db2.schema.impressions "
+        "SELECT * FROM campaigns.db1.campaigns "
+        "JOIN impressions.db2.impressions "
         "ON campaigns.campaign_id = impressions.campaign_id "
         "WHERE campaigns.campaign_length > 30 "
         "ORDER BY impressions.clicks DESC")
@@ -201,8 +201,8 @@ def test_isolation_across_backends(cfg):
     print("\n[isolation_across_backends]")
 
     heavy_sql = (
-        "SELECT * FROM campaigns.db1.schema.campaigns "
-        "JOIN impressions.db2.schema.impressions "
+        "SELECT * FROM campaigns.db1.campaigns "
+        "JOIN impressions.db2.impressions "
         "ON campaigns.campaign_id = impressions.campaign_id "
         "WHERE campaigns.campaign_length > 30 "
         "ORDER BY impressions.clicks DESC")

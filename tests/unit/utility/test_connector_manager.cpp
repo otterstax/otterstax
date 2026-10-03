@@ -18,6 +18,7 @@
 #include "connectors/postgresql/manager.hpp"
 #include "integration/otterbrix/otterbrix_manager.hpp"
 #include "integration/sql/connection_manager.hpp"
+#include "tests/mock/aliases.hpp"
 #include "tests/mock/ch_db_connector.hpp"
 #include "tests/mock/otterbrix.hpp"
 #include "tests/mock/pg_db_connector.hpp"
@@ -143,7 +144,7 @@ namespace {
             , otterbrix_manager(actor_zeta::spawn<db::OtterbrixManager>(
                   res,
                   std::make_unique<SimpleMockOtterbrixManager>(mock_config{.resource = res})))
-            , catalog_manager(actor_zeta::spawn<mysql::CatalogManager>(res, otterbrix_manager->address()))
+            , catalog_manager(actor_zeta::spawn<mysql::CatalogManager>(res, otterbrix_manager->address(), no_aliases()))
             , manager(std::make_unique<mysql::ConnectorManager>(res, catalog_manager->address(), factory, 2))
             , manager_actor(nullptr, actor_zeta::pmr::deleter_t{res}) {}
 
@@ -326,7 +327,7 @@ TEST_CASE("pg addConnection: a malformed port is invalid_parameter and registers
     auto otterbrix_manager = actor_zeta::spawn<db::OtterbrixManager>(
         resource,
         std::make_unique<SimpleMockOtterbrixManager>(mock_config{.resource = resource}));
-    auto catalog_manager = actor_zeta::spawn<mysql::CatalogManager>(resource, otterbrix_manager->address());
+    auto catalog_manager = actor_zeta::spawn<mysql::CatalogManager>(resource, otterbrix_manager->address(), no_aliases());
     pg::ConnectorManager manager{resource, catalog_manager->address(), &pg_mock_connector_factory, 2};
 
     for (const char* port : {"0", "70000", "-5432", "5432x"}) {
@@ -352,7 +353,7 @@ TEST_CASE("ch addConnection: a malformed port is invalid_parameter and registers
     auto otterbrix_manager = actor_zeta::spawn<db::OtterbrixManager>(
         resource,
         std::make_unique<SimpleMockOtterbrixManager>(mock_config{.resource = resource}));
-    auto catalog_manager = actor_zeta::spawn<mysql::CatalogManager>(resource, otterbrix_manager->address());
+    auto catalog_manager = actor_zeta::spawn<mysql::CatalogManager>(resource, otterbrix_manager->address(), no_aliases());
     ch::ConnectorManager manager{resource, catalog_manager->address(), &ch_mock_connector_factory, 2};
 
     for (const char* port : {"0", "65536", "-9000", "9000.0"}) {

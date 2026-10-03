@@ -45,7 +45,7 @@ from pyspark.sql import SparkSession
 
 import config
 
-CAMPAIGNS = "campaigns.db1.schema.campaigns"  # MySQL: campaign_id, campaign_name, campaign_length, budget
+CAMPAIGNS = "campaigns.db1.campaigns"  # MySQL: campaign_id, campaign_name, campaign_length, budget
 PRODUCTS = "products.pgdb.public.products"    # PostgreSQL: product_id, campaign_id, product_name, price, category
 
 # A derived table over each mirror. Sums of two-decimal prices never equal

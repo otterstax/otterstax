@@ -91,7 +91,7 @@ int main(int argc, char* argv[]) {
 
     // Create component manager
     OTX_MESSAGE_L("startup: creating component manager");
-    ComponentManager cmanager(make_create_config(DATA_DIR));
+    ComponentManager cmanager(make_create_config(DATA_DIR), server_config.connections);
 
     // Register the connections read from the config file with the connector
     // managers (opens the backend connections / stores the s3 aliases). A
@@ -156,6 +156,7 @@ int main(int argc, char* argv[]) {
         .port = server_config.spark_connect.port,
         .resource = cmanager.getResource(),
         .scheduler_address = cmanager.scheduler_address(),
+        .aliases = &cmanager.aliases(),
     };
 
     log->info("Spark Connect Server running on port {}...", spark_config.port);

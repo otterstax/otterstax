@@ -12,6 +12,7 @@
 #include "integration/sql/connection_manager.hpp"
 #include "test_helpers.hpp"
 
+#include "../mock/aliases.hpp"
 #include "../mock/ch_db_connector.hpp"
 #include "../mock/mock_config.hpp"
 #include "../mock/otterbrix.hpp"
@@ -34,8 +35,19 @@
 #include <vector>
 
 namespace {
-
     using otterstax::test::wait_until_ready;
+
+    const otterstax::names::alias_registry_t& catalog_aliases() {
+        static const auto aliases = make_aliases({
+            {"products", backend_type_t::PostgreSQL, "pgdb", "public"},
+            {"shop", backend_type_t::PostgreSQL, "pgdb", "public"},
+            {"crm", backend_type_t::PostgreSQL, "crmdb", "sales"},
+            {"pgalias", backend_type_t::PostgreSQL, "pgdb", "public"},
+            {"ev_alias", backend_type_t::ClickHouse, "ev"},
+            {"offline", backend_type_t::MySQL, "db"},
+        });
+        return aliases;
+    }
 
     // ClickHouse connector whose schema-discovery overload replays a fixed set of
     // blocks — an empty vector reproduces a probe that produced no header block.
@@ -55,8 +67,7 @@ namespace {
         bool isClosed() const noexcept override { return false; }
         std::string alias() const noexcept override { return alias_; }
 
-        boost::asio::awaitable<core::result_wrapper_t<std::unique_ptr<components::vector::data_chunk_t>>>
-        runQuery(
+        boost::asio::awaitable<core::result_wrapper_t<std::unique_ptr<components::vector::data_chunk_t>>> runQuery(
             std::string_view,
             otterstax::function_ref_t<std::unique_ptr<components::vector::data_chunk_t>(const ch::select_result_t&)>)
             override {
@@ -116,8 +127,7 @@ namespace {
         bool isClosed() const noexcept override { return false; }
         std::string alias() const noexcept override { return alias_; }
 
-        boost::asio::awaitable<core::result_wrapper_t<std::unique_ptr<components::vector::data_chunk_t>>>
-        runQuery(
+        boost::asio::awaitable<core::result_wrapper_t<std::unique_ptr<components::vector::data_chunk_t>>> runQuery(
             std::string_view,
             otterstax::function_ref_t<std::unique_ptr<components::vector::data_chunk_t>(const ch::select_result_t&)>)
             override {
@@ -181,7 +191,7 @@ namespace {
                         ch::connector_factory ch_factory)
             : resource(res)
             , otterbrix_manager(actor_zeta::spawn<db::OtterbrixManager>(res, std::move(engine)))
-            , catalog(actor_zeta::spawn<mysql::CatalogManager>(res, otterbrix_manager->address()))
+            , catalog(actor_zeta::spawn<mysql::CatalogManager>(res, otterbrix_manager->address(), catalog_aliases()))
             , mysql_conn(std::make_unique<mysql::ConnectorManager>(res,
                                                                    catalog->address(),
                                                                    &mysql_mock_connector_factory,
@@ -282,7 +292,6 @@ namespace {
         command.include_schema = false;
         return command;
     }
-
 } // namespace
 
 // ── escape_sql_literal ───────────────────────────────────────────────────────
@@ -413,7 +422,7 @@ TEST_CASE("catalog update_backend_type: classifying an already classified statem
     catalog_fixture fx(resource);
     fx.add_pg("products", "pgdb", "public", "products");
 
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, catalog_aliases());
     auto parsed = parser.parse("SELECT id, name FROM products.pgdb.public.products;");
     REQUIRE_FALSE(parsed.has_error());
 
@@ -432,7 +441,7 @@ TEST_CASE("catalog update_backend_type: DROP TABLE needs no registered schema an
     catalog_fixture fx(resource);
     fx.add_pg("products", "pgdb", "public", "products");
 
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, catalog_aliases());
 
     SECTION("registered table") {
         auto parsed = parser.parse("DROP TABLE products.pgdb.public.products;");
@@ -459,7 +468,7 @@ TEST_CASE("catalog update_backend_type: only collection/index drop kinds may car
     catalog_fixture fx(resource);
     fx.add_pg("products", "pgdb", "public", "products");
 
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, catalog_aliases());
 
     auto with_drop_kind = [&](components::logical_plan::drop_target_kind kind) {
         auto parsed = parser.parse("DROP TABLE products.pgdb.public.products;");
@@ -608,8 +617,8 @@ TEST_CASE("catalog add_connection_schema: a uid keeps the backend it was registe
     catalog_fixture fx(resource);
     fx.add_pg("shop", "pgdb", "public", "orders");
 
-    auto err = fx.add_connection_schema(qualified_name_t("shop", "pgdb", "", "orders"),
-                                        catalog_ext::ConnectionType::MySQL);
+    auto err =
+        fx.add_connection_schema(qualified_name_t("shop", "pgdb", "", "orders"), catalog_ext::ConnectionType::MySQL);
     REQUIRE(err.contains_error());
     REQUIRE(err.type == core::error_code_t::invalid_parameter);
     REQUIRE(fx.list_tables(get_tables_command()) == std::vector<std::string>{"pgdb.public.orders"});
@@ -659,30 +668,31 @@ TEST_CASE("catalog add_connection_schema: a table the store cannot mirror is dro
 
     REQUIRE(added.has_error());
     REQUIRE(added.error().type == core::error_code_t::already_exists);
-    REQUIRE(recorder->statements ==
-            std::vector<std::string>{"CREATE DATABASE \"shop\"",
-                                     "CREATE DATABASE \"crm\"",
-                                     "DROP TABLE \"crm\".\"crmdb:sales:customers\""});
+    REQUIRE(recorder->statements == std::vector<std::string>{"CREATE DATABASE \"shop\"",
+                                                             "CREATE DATABASE \"crm\"",
+                                                             "DROP TABLE \"crm\".\"crmdb:sales:customers\""});
     REQUIRE_FALSE(fx.pg_conn->hasConnection("crm"));
     REQUIRE(fx.list_tables(get_tables_command()) == std::vector<std::string>{"pgdb.public.orders"});
 }
 
-// The engine database named after a connection uid holds that connection's
+// The engine database named after a connection alias holds that connection's
 // mirror, and the kafka object database belongs to the KafkaManager; a user
-// database-level DDL on either name is refused. Unquoted identifiers reach the
-// engine lower-cased, so the match ignores case.
-TEST_CASE("catalog check_database_ownership: connection uids and the kafka database are owned names") {
+// database-level DDL on either name is refused. A configured alias owns its
+// name before its connection registers.
+TEST_CASE("catalog check_database_ownership: connection aliases and the kafka database are owned names") {
     auto* resource = std::pmr::new_delete_resource();
     catalog_fixture fx(resource);
-    fx.add_pg("PgAlias", "pgdb", "public", "orders");
+    fx.add_pg("pgalias", "pgdb", "public", "orders");
 
-    for (const char* owned : {"PgAlias", "pgalias", "PGALIAS", "kafka", "KAFKA"}) {
+    for (const char* owned : {"pgalias", "offline", "kafka"}) {
         INFO("database name = " << owned);
         auto verdict = fx.check_database_ownership(owned);
         REQUIRE(verdict.contains_error());
         REQUIRE(verdict.type == core::error_code_t::invalid_parameter);
     }
 
-    REQUIRE_FALSE(fx.check_database_ownership("orders").contains_error());
-    REQUIRE_FALSE(fx.check_database_ownership("pgdb").contains_error());
+    for (const char* free : {"orders", "pgdb", "PgAlias", "PGALIAS", "KAFKA"}) {
+        INFO("database name = " << free);
+        REQUIRE_FALSE(fx.check_database_ownership(free).contains_error());
+    }
 }

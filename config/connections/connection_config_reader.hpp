@@ -21,8 +21,10 @@ namespace config {
 // empty config, so the server still starts with no remote backends registered.
 // Every entry is validated before the config is returned: the first incomplete
 // entry, malformed port or field that is not a scalar is an invalid_parameter
-// whose message names the section and the entry. `resource` owns the error
-// message.
+// whose message names the section and the entry, and so is a backend alias
+// (mysql / postgresql / clickhouse) that is not an unquoted SQL identifier
+// ([a-z_][a-z0-9_]*) or that another backend entry already uses. `resource`
+// owns the error message.
 core::result_wrapper_t<ConnectionsConfig> parse_connections(const YAML::Node& connections_node,
                                                             std::pmr::memory_resource* resource);
 

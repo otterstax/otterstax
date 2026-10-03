@@ -9,6 +9,7 @@
 #include <catch2/catch_all.hpp>
 
 #include "otterbrix/parser/grammar_extention/external_node.hpp"
+#include "test_aliases.hpp"
 #include "otterbrix/parser/parser.hpp"
 
 #include <memory_resource>
@@ -30,7 +31,7 @@ namespace {
 
 TEST_CASE("external: CREATE EXTERNAL TABLE on a local path lowers to external_node_t") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
-    GreenplumParser parser(&arena);
+    GreenplumParser parser(&arena, test_aliases());
     auto r = parser.parse(
         "CREATE EXTERNAL TABLE file.people WITH (location = '/tmp/people.parquet', format = 'parquet')");
     REQUIRE_FALSE(r.has_error());
@@ -48,7 +49,7 @@ TEST_CASE("external: CREATE EXTERNAL TABLE on a local path lowers to external_no
 
 TEST_CASE("external: CREATE EXTERNAL TABLE on an s3 URI lowers to external_node_t") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
-    GreenplumParser parser(&arena);
+    GreenplumParser parser(&arena, test_aliases());
     auto r = parser.parse("CREATE EXTERNAL TABLE s3.trades WITH ("
                           "  s3_alias = 'minio1', location = 's3://bucket/trades.parquet', format = 'parquet')");
     REQUIRE_FALSE(r.has_error());
@@ -64,7 +65,7 @@ TEST_CASE("external: CREATE EXTERNAL TABLE on an s3 URI lowers to external_node_
 
 TEST_CASE("external: COPY (...) TO a local path captures the inner query") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
-    GreenplumParser parser(&arena);
+    GreenplumParser parser(&arena, test_aliases());
     auto r = parser.parse("COPY (SELECT * FROM file.people) TO '/tmp/out.csv' WITH (format = 'csv')");
     REQUIRE_FALSE(r.has_error());
 
@@ -78,7 +79,7 @@ TEST_CASE("external: COPY (...) TO a local path captures the inner query") {
 
 TEST_CASE("external: COPY (...) TO an s3 URI captures the inner query and alias") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
-    GreenplumParser parser(&arena);
+    GreenplumParser parser(&arena, test_aliases());
     auto r = parser.parse(
         "COPY (SELECT 1) TO 's3://bucket/out.parquet' WITH (s3_alias = 'minio1', format = 'parquet')");
     REQUIRE_FALSE(r.has_error());
@@ -94,7 +95,7 @@ TEST_CASE("external: COPY (...) TO an s3 URI captures the inner query and alias"
 
 TEST_CASE("external: a plain SELECT is not claimed by the extensions") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
-    GreenplumParser parser(&arena);
+    GreenplumParser parser(&arena, test_aliases());
     auto r = parser.parse("SELECT 1 AS x");
     REQUIRE_FALSE(r.has_error());
     CHECK(as_external(r.value()->otterbrix_params->node) == nullptr);
@@ -105,7 +106,7 @@ TEST_CASE("external: a plain SELECT is not claimed by the extensions") {
 // which extension claimed the statement; the Worker routes on that record.
 TEST_CASE("external: the claiming extension is recorded on ParsedQueryData") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
-    GreenplumParser parser(&arena);
+    GreenplumParser parser(&arena, test_aliases());
 
     SECTION("file extension") {
         auto r = parser.parse("CREATE EXTERNAL TABLE file.t WITH (location = '/tmp/a.parquet')");
@@ -135,7 +136,7 @@ TEST_CASE("external: the claiming extension is recorded on ParsedQueryData") {
 
 TEST_CASE("external: the format option is optional (auto-detected downstream)") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
-    GreenplumParser parser(&arena);
+    GreenplumParser parser(&arena, test_aliases());
     auto r = parser.parse("CREATE EXTERNAL TABLE file.t WITH (location = '/tmp/a.parquet')");
     REQUIRE_FALSE(r.has_error());
 
@@ -148,7 +149,7 @@ TEST_CASE("external: the format option is optional (auto-detected downstream)") 
 
 TEST_CASE("external: a malformed external statement surfaces a parse error (no crash)") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
-    GreenplumParser parser(&arena);
+    GreenplumParser parser(&arena, test_aliases());
     // Claimed by the s3 extension (CREATE EXTERNAL TABLE + WITH) but the option
     // value is missing — the extension grammar rejects it; GreenplumParser must
     // turn the thrown parser_exception_t into a clean error result.

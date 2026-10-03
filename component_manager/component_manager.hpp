@@ -4,6 +4,7 @@
 #pragma once
 
 #include "catalog/catalog_manager.hpp"
+#include "config/connections/connection_config.hpp"
 #include "connectors/clickhouse/manager.hpp"
 #include "connectors/file/manager.hpp"
 #include "connectors/mysql/manager.hpp"
@@ -17,7 +18,6 @@
 #include "integration/s3/s3_manager.hpp"
 #include "integration/sql/connection_manager.hpp"
 #include "scheduler/scheduler.hpp"
-#include "config/connections/connection_config.hpp"
 
 #include <actor-zeta.hpp>
 #include <core/result_wrapper.hpp>
@@ -29,11 +29,12 @@
 
 class ComponentManager {
 public:
-    explicit ComponentManager(const configuration::config& config);
+    ComponentManager(const configuration::config& config, const config::ConnectionsConfig& connections);
     ~ComponentManager();
     std::pmr::memory_resource* getResource();
     actor_zeta::address_t scheduler_address() const;
     actor_zeta::address_t catalog_address() const;
+    const otterstax::names::alias_registry_t& aliases() const noexcept { return aliases_; }
 
     // Register every remote backend and s3 alias described by the connection
     // config (parsed from the config file at startup) with the corresponding
@@ -51,6 +52,8 @@ public:
 private:
     db::otterbrix_engine_ptr engine_{nullptr};
     std::pmr::memory_resource* resource_{nullptr};
+    // Read by every Worker's parser; declared before scheduler_ so it outlives it.
+    otterstax::names::alias_registry_t aliases_;
     // Sole owner of the three connector managers. Everyone else — the catalog
     // actor and the three integration actors — holds a non-owning pointer, and
     // is declared BELOW so it is destroyed first.

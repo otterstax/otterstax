@@ -180,7 +180,7 @@ TEST_CASE("scheduler handles N parallel sessions without hanging") {
         actor_zeta::spawn<db::OtterbrixManager>(resource,
                                                 std::make_unique<SimpleMockOtterbrixManager>(
                                                     mock_config{.resource = resource}));
-    auto catalog_manager = actor_zeta::spawn<mysql::CatalogManager>(resource, otterbrix_manager->address());
+    auto catalog_manager = actor_zeta::spawn<mysql::CatalogManager>(resource, otterbrix_manager->address(), no_aliases());
     auto mysql_conn_manager =
         std::make_unique<mysql::ConnectorManager>(resource, catalog_manager->address(), &mysql_mock_connector_factory);
     auto pg_conn_manager =
@@ -210,6 +210,7 @@ TEST_CASE("scheduler handles N parallel sessions without hanging") {
         az_scheduler.get(),
         worker_pool_size(),
         &make_mock_parser,
+        no_aliases(),
         mysql_connection_manager->address(),
         pg_connection_manager->address(),
         ch_connection_manager->address(),
@@ -274,7 +275,7 @@ TEST_CASE("slow MySQL connector does not starve other sessions") {
         actor_zeta::spawn<db::OtterbrixManager>(resource,
                                                 std::make_unique<SimpleMockOtterbrixManager>(
                                                     mock_config{.resource = resource}));
-    auto catalog_manager = actor_zeta::spawn<mysql::CatalogManager>(resource, otterbrix_manager->address());
+    auto catalog_manager = actor_zeta::spawn<mysql::CatalogManager>(resource, otterbrix_manager->address(), no_aliases());
     auto mysql_conn_manager = std::make_unique<mysql::ConnectorManager>(resource,
                                                                         catalog_manager->address(),
                                                                         &mysql_mock_connector_factory_slow);
@@ -298,6 +299,7 @@ TEST_CASE("slow MySQL connector does not starve other sessions") {
         az_scheduler.get(),
         worker_pool_size(),
         &make_mock_parser,
+        no_aliases(),
         mysql_connection_manager->address(),
         pg_connection_manager->address(),
         ch_connection_manager->address(),
@@ -368,7 +370,7 @@ TEST_CASE("PostgressManager: parallel execute and re-discovery share no unsynchr
     auto otterbrix_manager = actor_zeta::spawn<db::OtterbrixManager>(
         resource,
         std::make_unique<SimpleMockOtterbrixManager>(mock_config{.resource = resource}));
-    auto catalog_manager = actor_zeta::spawn<mysql::CatalogManager>(resource, otterbrix_manager->address());
+    auto catalog_manager = actor_zeta::spawn<mysql::CatalogManager>(resource, otterbrix_manager->address(), no_aliases());
     auto pg_conn_manager =
         std::make_unique<pg::ConnectorManager>(resource, catalog_manager->address(), &pg_mock_connector_factory, 2);
     auto pg_manager = actor_zeta::spawn<db::PostgressManager>(resource, pg_conn_manager.get());
@@ -466,7 +468,7 @@ TEST_CASE("ClickhouseManager: parallel execute and re-discovery share no unsynch
     auto otterbrix_manager = actor_zeta::spawn<db::OtterbrixManager>(
         resource,
         std::make_unique<SimpleMockOtterbrixManager>(mock_config{.resource = resource}));
-    auto catalog_manager = actor_zeta::spawn<mysql::CatalogManager>(resource, otterbrix_manager->address());
+    auto catalog_manager = actor_zeta::spawn<mysql::CatalogManager>(resource, otterbrix_manager->address(), no_aliases());
     auto ch_conn_manager =
         std::make_unique<ch::ConnectorManager>(resource, catalog_manager->address(), &ch_header_connector_factory, 2);
     auto ch_manager = actor_zeta::spawn<db::ClickhouseManager>(resource, ch_conn_manager.get());

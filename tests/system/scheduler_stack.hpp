@@ -22,6 +22,7 @@
 #include "integration/otterbrix/otterbrix_manager.hpp"
 #include "integration/s3/s3_manager.hpp"
 #include "otterbrix/operators/execute_plan.hpp"
+#include "../mock/aliases.hpp"
 #include "otterbrix/parser/parser.hpp"
 #include "scheduler/scheduler.hpp"
 #include "scheduler/session_data.hpp"
@@ -106,7 +107,7 @@ namespace otterstax::test {
             , resource_(otterbrix_->dispatcher()->resource())
             , az_scheduler_(make_az_scheduler())
             , otb_mgr_(actor_zeta::spawn<db::OtterbrixManager>(resource_, make_otterbrix_manager(otterbrix_)))
-            , catalog_(actor_zeta::spawn<mysql::CatalogManager>(resource_, otb_mgr_->address()))
+            , catalog_(actor_zeta::spawn<mysql::CatalogManager>(resource_, otb_mgr_->address(), no_aliases()))
             , file_mgr_(actor_zeta::spawn<conn::file::FileManager>(resource_, otb_mgr_->address()))
             , s3_conn_(actor_zeta::spawn<conn::s3::ConnectorManager>(resource_))
             , s3_mgr_(actor_zeta::spawn<db::S3Manager>(resource_, s3_conn_->address(), file_mgr_->address()))
@@ -114,6 +115,7 @@ namespace otterstax::test {
                                                       az_scheduler_.get(),
                                                       worker_pool_size(),
                                                       parser_factory,
+                                                      no_aliases(),
                                                       actor_zeta::address_t::empty_address(), // sql
                                                       actor_zeta::address_t::empty_address(), // pg
                                                       actor_zeta::address_t::empty_address(), // ch

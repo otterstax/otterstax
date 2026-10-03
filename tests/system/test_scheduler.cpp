@@ -59,7 +59,7 @@ TEST_CASE("base test case") {
     auto otterbrix_manager = actor_zeta::spawn<db::OtterbrixManager>(
         resource,
         std::make_unique<SimpleMockOtterbrixManager>(mock_config{.resource = resource}));
-    auto catalog_manager = actor_zeta::spawn<mysql::CatalogManager>(resource, otterbrix_manager->address());
+    auto catalog_manager = actor_zeta::spawn<mysql::CatalogManager>(resource, otterbrix_manager->address(), no_aliases());
     auto mysql_conn_manager = std::make_unique<mysql::ConnectorManager>(resource,
                                                                         catalog_manager->address(),
                                                                         &mysql_mock_connector_factory);
@@ -87,6 +87,7 @@ TEST_CASE("base test case") {
                                                   az_scheduler.get(),
                                                   worker_pool_size(),
                                                   &make_mock_parser,
+                                                  no_aliases(),
                                                   mysql_connection_manager->address(),
                                                   pg_connection_manager->address(),
                                                   ch_connection_manager->address(),
@@ -120,7 +121,7 @@ TEST_CASE("Error in connector test case") {
     auto otterbrix_manager = actor_zeta::spawn<db::OtterbrixManager>(
         resource,
         std::make_unique<SimpleMockOtterbrixManager>(mock_config{.resource = resource}));
-    auto catalog_manager = actor_zeta::spawn<mysql::CatalogManager>(resource, otterbrix_manager->address());
+    auto catalog_manager = actor_zeta::spawn<mysql::CatalogManager>(resource, otterbrix_manager->address(), no_aliases());
     auto mysql_conn_manager = std::make_unique<mysql::ConnectorManager>(resource,
                                                                         catalog_manager->address(),
                                                                         &mysql_mock_connector_factory_throw);
@@ -145,6 +146,7 @@ TEST_CASE("Error in connector test case") {
                                                   az_scheduler.get(),
                                                   worker_pool_size(),
                                                   &make_mock_parser,
+                                                  no_aliases(),
                                                   mysql_connection_manager->address(),
                                                   pg_connection_manager->address(),
                                                   ch_connection_manager->address(),
@@ -177,7 +179,7 @@ TEST_CASE("Error in otterbrix test case") {
     auto otterbrix_manager = actor_zeta::spawn<db::OtterbrixManager>(
         resource,
         std::make_unique<SimpleMockOtterbrixManager>(mock_config{.resource = resource, .can_throw = true}));
-    auto catalog_manager = actor_zeta::spawn<mysql::CatalogManager>(resource, otterbrix_manager->address());
+    auto catalog_manager = actor_zeta::spawn<mysql::CatalogManager>(resource, otterbrix_manager->address(), no_aliases());
     auto mysql_conn_manager = std::make_unique<mysql::ConnectorManager>(resource,
                                                                         catalog_manager->address(),
                                                                         &mysql_mock_connector_factory);
@@ -202,6 +204,7 @@ TEST_CASE("Error in otterbrix test case") {
                                                   az_scheduler.get(),
                                                   worker_pool_size(),
                                                   &make_mock_parser,
+                                                  no_aliases(),
                                                   mysql_connection_manager->address(),
                                                   pg_connection_manager->address(),
                                                   ch_connection_manager->address(),
@@ -234,7 +237,7 @@ TEST_CASE("Error in scheduler test case") {
     auto otterbrix_manager = actor_zeta::spawn<db::OtterbrixManager>(
         resource,
         std::make_unique<SimpleMockOtterbrixManager>(mock_config{.resource = resource}));
-    auto catalog_manager = actor_zeta::spawn<mysql::CatalogManager>(resource, otterbrix_manager->address());
+    auto catalog_manager = actor_zeta::spawn<mysql::CatalogManager>(resource, otterbrix_manager->address(), no_aliases());
     auto mysql_conn_manager = std::make_unique<mysql::ConnectorManager>(resource,
                                                                         catalog_manager->address(),
                                                                         &mysql_mock_connector_factory);
@@ -260,6 +263,7 @@ TEST_CASE("Error in scheduler test case") {
                                                   az_scheduler.get(),
                                                   worker_pool_size(),
                                                   &make_throwing_mock_parser,
+                                                  no_aliases(),
                                                   mysql_connection_manager->address(),
                                                   pg_connection_manager->address(),
                                                   ch_connection_manager->address(),
@@ -292,7 +296,7 @@ TEST_CASE("Error in otterbrix + sql connector test case") {
     auto otterbrix_manager = actor_zeta::spawn<db::OtterbrixManager>(
         resource,
         std::make_unique<SimpleMockOtterbrixManager>(mock_config{.resource = resource, .can_throw = true}));
-    auto catalog_manager = actor_zeta::spawn<mysql::CatalogManager>(resource, otterbrix_manager->address());
+    auto catalog_manager = actor_zeta::spawn<mysql::CatalogManager>(resource, otterbrix_manager->address(), no_aliases());
     auto mysql_conn_manager = std::make_unique<mysql::ConnectorManager>(resource,
                                                                         catalog_manager->address(),
                                                                         &mysql_mock_connector_factory_throw);
@@ -317,6 +321,7 @@ TEST_CASE("Error in otterbrix + sql connector test case") {
                                                   az_scheduler.get(),
                                                   worker_pool_size(),
                                                   &make_mock_parser,
+                                                  no_aliases(),
                                                   mysql_connection_manager->address(),
                                                   pg_connection_manager->address(),
                                                   ch_connection_manager->address(),
@@ -396,7 +401,8 @@ public:
 // Stateless factory for the cross-backend test: each Worker builds its own
 // CrossBackendMockParser (a plain function pointer, the Scheduler's
 // parser_factory_fn shape).
-inline parser_ptr make_cross_backend_mock_parser(std::pmr::memory_resource*) {
+inline parser_ptr make_cross_backend_mock_parser(std::pmr::memory_resource*,
+                                                 const otterstax::names::alias_registry_t&) {
     return std::make_unique<CrossBackendMockParser>();
 }
 
@@ -427,7 +433,7 @@ TEST_CASE("Cross-backend JOIN detection test case") {
     auto otterbrix_manager = actor_zeta::spawn<db::OtterbrixManager>(
         resource,
         std::make_unique<CrossBackendMockOtterbrixManager>(resource));
-    auto catalog_manager = actor_zeta::spawn<mysql::CatalogManager>(resource, otterbrix_manager->address());
+    auto catalog_manager = actor_zeta::spawn<mysql::CatalogManager>(resource, otterbrix_manager->address(), no_aliases());
     auto mysql_conn_manager = std::make_unique<mysql::ConnectorManager>(resource,
                                                                         catalog_manager->address(),
                                                                         &mysql_mock_connector_factory);
@@ -468,6 +474,7 @@ TEST_CASE("Cross-backend JOIN detection test case") {
                                                   az_scheduler.get(),
                                                   worker_pool_size(),
                                                   &make_cross_backend_mock_parser,
+                                                  no_aliases(),
                                                   mysql_conn_manager_actor->address(),
                                                   pg_connection_manager->address(),
                                                   ch_connection_manager->address(),
@@ -477,7 +484,7 @@ TEST_CASE("Cross-backend JOIN detection test case") {
                                                   actor_zeta::address_t::empty_address());
     assert(scheduler);
 
-    std::string sql = "SELECT * FROM products.pgdb.public.products p JOIN campaigns.db1.schema.campaigns c ON "
+    std::string sql = "SELECT * FROM products.pgdb.public.products p JOIN campaigns.db1.campaigns c ON "
                       "p.campaign_id = c.campaign_id";
     session_hash_t id = 1;
 
@@ -519,7 +526,7 @@ TEST_CASE("return empty test case") {
     auto otterbrix_manager = actor_zeta::spawn<db::OtterbrixManager>(
         resource,
         std::make_unique<SimpleMockOtterbrixManager>(mock_config{.resource = resource, .return_empty = true}));
-    auto catalog_manager = actor_zeta::spawn<mysql::CatalogManager>(resource, otterbrix_manager->address());
+    auto catalog_manager = actor_zeta::spawn<mysql::CatalogManager>(resource, otterbrix_manager->address(), no_aliases());
     // Use return_empty connector so MySQL returns empty results
     auto mysql_conn_manager = std::make_unique<mysql::ConnectorManager>(resource,
                                                                         catalog_manager->address(),
@@ -545,6 +552,7 @@ TEST_CASE("return empty test case") {
                                                   az_scheduler.get(),
                                                   worker_pool_size(),
                                                   &make_mock_parser,
+                                                  no_aliases(),
                                                   mysql_connection_manager->address(),
                                                   pg_connection_manager->address(),
                                                   ch_connection_manager->address(),
@@ -584,7 +592,7 @@ TEST_CASE("multi-chunk result carries all rows through the scheduler") {
     auto otterbrix_manager = actor_zeta::spawn<db::OtterbrixManager>(
         resource,
         std::make_unique<SimpleMockOtterbrixManager>(mock_config{.resource = resource}, N));
-    auto catalog_manager = actor_zeta::spawn<mysql::CatalogManager>(resource, otterbrix_manager->address());
+    auto catalog_manager = actor_zeta::spawn<mysql::CatalogManager>(resource, otterbrix_manager->address(), no_aliases());
     auto mysql_conn_manager = std::make_unique<mysql::ConnectorManager>(resource,
                                                                         catalog_manager->address(),
                                                                         &mysql_mock_connector_factory);
@@ -609,6 +617,7 @@ TEST_CASE("multi-chunk result carries all rows through the scheduler") {
                                                   az_scheduler.get(),
                                                   worker_pool_size(),
                                                   &make_mock_parser,
+                                                  no_aliases(),
                                                   mysql_connection_manager->address(),
                                                   pg_connection_manager->address(),
                                                   ch_connection_manager->address(),
@@ -671,6 +680,12 @@ namespace {
 
     using otterstax::test::wait_until_ready;
 
+    // The connection catalog_schema_fixture registers, as config.yaml declares it.
+    const otterstax::names::alias_registry_t& products_aliases() {
+        static const auto aliases = make_aliases({{"products", backend_type_t::PostgreSQL, "pgdb", "public"}});
+        return aliases;
+    }
+
     // Catalog actor graph with mocked connectors and a registered PostgreSQL
     // connection "products" (pgdb/public/products) — shared by the
     // sequence-unwrap catalog test cases below.
@@ -699,7 +714,7 @@ namespace {
             , mysql_connection_manager(nullptr, actor_zeta::pmr::deleter_t{res})
             , pg_connection_manager(nullptr, actor_zeta::pmr::deleter_t{res})
             , ch_connection_manager(nullptr, actor_zeta::pmr::deleter_t{res}) {
-            catalog_manager = actor_zeta::spawn<mysql::CatalogManager>(res, otterbrix_manager->address());
+            catalog_manager = actor_zeta::spawn<mysql::CatalogManager>(res, otterbrix_manager->address(), products_aliases());
             mysql_conn_manager = std::make_unique<mysql::ConnectorManager>(res,
                                                                            catalog_manager->address(),
                                                                            &mysql_mock_connector_factory);
@@ -783,7 +798,7 @@ TEST_CASE("otterbrix get_schema: sequence-rooted SELECT resolves columns") {
         REQUIRE_FALSE(create_cursor->is_error());
     }
 
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, products_aliases());
     auto parsed = parser.parse("SELECT campaign_name, budget FROM db1.campaigns;");
     REQUIRE_FALSE(parsed.has_error());
     auto data = std::move(parsed.value());
@@ -836,7 +851,7 @@ TEST_CASE("otterbrix get_schema: non-aggregate plans keep the empty-schema contr
     auto otterbrix_manager = actor_zeta::spawn<db::OtterbrixManager>(
         resource,
         std::make_unique<SimpleMockOtterbrixManager>(mock_config{.resource = resource}));
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, products_aliases());
 
     SECTION("non-sequence non-aggregate root -> empty schema, no error") {
         auto parsed = parser.parse("SELECT campaign_name FROM db1.campaigns;");
@@ -907,7 +922,7 @@ TEST_CASE("catalog get_catalog_schema: sequence-rooted SELECT rewrites the exter
     auto resource = otterbrix->dispatcher()->resource();
     catalog_schema_fixture fx(resource);
 
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, products_aliases());
     auto parsed = parser.parse("SELECT id, name FROM products.pgdb.public.products;");
     REQUIRE_FALSE(parsed.has_error());
     auto data = std::move(parsed.value());
@@ -946,7 +961,7 @@ TEST_CASE("catalog get_catalog_schema: non-aggregate plans keep the empty-schema
     db::otterbrix_engine_ptr otterbrix = init_default_test_otterbrix();
     auto resource = otterbrix->dispatcher()->resource();
     catalog_schema_fixture fx(resource);
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, products_aliases());
 
     SECTION("sequence whose last child is not an aggregate (CREATE) -> empty schema, no error") {
         auto parsed = parser.parse("CREATE TABLE products.pgdb.public.newtable (id INT);");

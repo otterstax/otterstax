@@ -56,34 +56,34 @@ def main(local=False):
         'temp_int': pa.int64()
     }
 
-    test_query_1 = "CREATE TABLE campaigns.db1.schema.temp_table (temp_int int);"
+    test_query_1 = "CREATE TABLE campaigns.db1.temp_table (temp_int int);"
     validate_by_request(client, test_query_1, expected_schema)
 
-    test_query_2 = "INSERT INTO campaigns.db1.schema.temp_table (temp_int) VALUES (8888);"
+    test_query_2 = "INSERT INTO campaigns.db1.temp_table (temp_int) VALUES (8888);"
     validate_by_request(client, test_query_2, expected_schema)
 
-    test_query_3 = "INSERT INTO campaigns.db1.schema.temp_table (temp_int) \
+    test_query_3 = "INSERT INTO campaigns.db1.temp_table (temp_int) \
 VALUES (1), (2), (3), (4);"
     validate_by_request(client, test_query_3, expected_schema)
 
-    test_query_4 = "UPDATE campaigns.db1.schema.temp_table SET temp_int = temp_int * 1000 WHERE temp_int < 1000;"
+    test_query_4 = "UPDATE campaigns.db1.temp_table SET temp_int = temp_int * 1000 WHERE temp_int < 1000;"
     validate_by_request(client, test_query_4, expected_schema)
 
-    test_query_5 = "DELETE FROM campaigns.db1.schema.temp_table WHERE temp_int >= 8888;"
+    test_query_5 = "DELETE FROM campaigns.db1.temp_table WHERE temp_int >= 8888;"
     validate_by_request(client, test_query_5, expected_schema)
 
-    test_query_6 = "INSERT INTO campaigns.db1.schema.temp_table (temp_int) \
-SELECT * FROM campaigns.db1.schema.temp_table \
+    test_query_6 = "INSERT INTO campaigns.db1.temp_table (temp_int) \
+SELECT * FROM campaigns.db1.temp_table \
 WHERE temp_int = 1000;"
     validate_by_request(client, test_query_6, expected_schema)
 
-    test_query_7 = "CREATE INDEX temp_index ON campaigns.db1.schema.temp_table (temp_int);"
+    test_query_7 = "CREATE INDEX temp_index ON campaigns.db1.temp_table (temp_int);"
     validate_by_request(client, test_query_7, expected_schema)
 
-    test_query_8 = "DROP INDEX campaigns.db1.schema.temp_table.temp_index;"
+    test_query_8 = "DROP INDEX campaigns.db1.temp_table.temp_index;"
     validate_by_request(client, test_query_8, expected_schema)
 
-    test_query_9 = "DROP TABLE campaigns.db1.schema.temp_table;"
+    test_query_9 = "DROP TABLE campaigns.db1.temp_table;"
     validate_by_request(client, test_query_9, expected_schema)
 
 def main_test():

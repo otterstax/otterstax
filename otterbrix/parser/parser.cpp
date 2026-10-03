@@ -41,24 +41,19 @@ namespace {
                     continue;
                 }
                 // A stub is an aggregate whose relname is the generated stub id.
-                const std::string& relname =
-                    static_cast<const logical_plan::node_aggregate_t&>(*node_ref).relname().t;
+                const std::string& relname = static_cast<const logical_plan::node_aggregate_t&>(*node_ref).relname().t;
                 if (relname.size() < otterstax::parser::k_stub_prefix.size() ||
-                    relname.compare(0,
-                                    otterstax::parser::k_stub_prefix.size(),
-                                    otterstax::parser::k_stub_prefix) != 0) {
+                    relname.compare(0, otterstax::parser::k_stub_prefix.size(), otterstax::parser::k_stub_prefix) !=
+                        0) {
                     continue;
                 }
 
                 bool is_outer_aggregate = false;
                 for (const auto& child : node_ref->children()) {
                     auto t = child->type();
-                    if (t == logical_plan::node_type::select_t ||
-                        t == logical_plan::node_type::match_t  ||
-                        t == logical_plan::node_type::sort_t   ||
-                        t == logical_plan::node_type::limit_t  ||
-                        t == logical_plan::node_type::group_t  ||
-                        t == logical_plan::node_type::having_t) {
+                    if (t == logical_plan::node_type::select_t || t == logical_plan::node_type::match_t ||
+                        t == logical_plan::node_type::sort_t || t == logical_plan::node_type::limit_t ||
+                        t == logical_plan::node_type::group_t || t == logical_plan::node_type::having_t) {
                         is_outer_aggregate = true;
                         break;
                     }
@@ -256,9 +251,28 @@ static bool is_plain_table_source(const logical_plan::node_t& node) {
             relname.compare(0, otterstax::parser::k_stub_prefix.size(), otterstax::parser::k_stub_prefix) != 0);
 }
 
+static core::result_wrapper_t<qualified_name_t> target_name(std::pmr::memory_resource* resource,
+                                                            const otterstax::names::name_registry_t& registry,
+                                                            const otterstax::names::alias_registry_t& aliases,
+                                                            const logical_plan::node_t& node) {
+    if (node.type() == logical_plan::node_type::aggregate_t) {
+        const auto& leaf = static_cast<const logical_plan::node_aggregate_t&>(node);
+        const std::string& rel = leaf.relname().t;
+        if (!rel.starts_with(otterstax::parser::k_stub_prefix)) {
+            const std::string& uid = leaf.uid().t;
+            if (uid.empty()) {
+                return qualified_name_t(std::string{}, leaf.dbname().t, std::string{}, rel);
+            }
+            return otterstax::names::federated_name(resource, aliases, uid, leaf.dbname().t, rel);
+        }
+    }
+    return otterstax::names::node_names(node, registry);
+}
+
 static core::result_wrapper_t<size_t>
 get_external_nodes(std::pmr::memory_resource* resource,
                    const otterstax::names::name_registry_t& registry,
+                   const otterstax::names::alias_registry_t& aliases,
                    logical_plan::node_ptr& node,
                    std::pmr::vector<std::pmr::vector<external_entry_t>>& external_nodes) {
     OTX_ZONE_N("otterbrix::get_external_nodes");
@@ -278,7 +292,7 @@ get_external_nodes(std::pmr::memory_resource* resource,
         // it is generated as part of this statement, never fetched on its own.
         size_t pushed_down_source = k_no_source_child;
         if (is_valid_external(**n.ptr) && carries_table_reference(**n.ptr)) {
-            auto resolved = otterstax::names::node_names(**n.ptr, registry);
+            auto resolved = target_name(resource, registry, aliases, **n.ptr);
             if (resolved.has_error()) {
                 return resolved.convert_error<size_t>();
             }
@@ -309,7 +323,7 @@ get_external_nodes(std::pmr::memory_resource* resource,
                 } else if (type == logical_plan::node_type::update_t || type == logical_plan::node_type::delete_t) {
                     const size_t source = dml_source_child(**n.ptr);
                     if (source != k_no_source_child && is_plain_table_source(*(*n.ptr)->children()[source])) {
-                        auto source_resolved = otterstax::names::node_names(*(*n.ptr)->children()[source], registry);
+                        auto source_resolved = target_name(resource, registry, aliases, *(*n.ptr)->children()[source]);
                         if (source_resolved.has_error()) {
                             return source_resolved.convert_error<size_t>();
                         }
@@ -372,12 +386,14 @@ ParsedQueryData::ParsedQueryData(OtterbrixStatementPtr otterbrix_params,
 
 components::sql::transform::transform_result& ParsedQueryData::binder() { return binder_; }
 
-GreenplumParser::GreenplumParser(std::pmr::memory_resource* resource)
-    : GreenplumParser(resource, components::sql::parser::parser_extension_registry_t{}) {}
+GreenplumParser::GreenplumParser(std::pmr::memory_resource* resource, const otterstax::names::alias_registry_t& aliases)
+    : GreenplumParser(resource, aliases, components::sql::parser::parser_extension_registry_t{}) {}
 
 GreenplumParser::GreenplumParser(std::pmr::memory_resource* resource,
+                                 const otterstax::names::alias_registry_t& aliases,
                                  components::sql::parser::parser_extension_registry_t seed)
     : resource_(resource)
+    , aliases_(aliases)
     , log_(get_logger(logger_tag::PARSER))
     , registry_(std::move(seed)) {
     assert(resource_ != nullptr && "memory resource must not be null");
@@ -417,7 +433,12 @@ core::result_wrapper_t<ParsedQueryDataPtr> GreenplumParser::parse(const std::str
     ::Node* reusable_root = nullptr;
     // The extraction lives on resource_, the AST on the per-parse arena; the
     // stubs are copied onto resource_ again by swap_stubs_into_schema_nodes.
-    auto extraction = otterstax::parser::prepare_sql(sql, &arena_resource, resource_, &reusable_root);
+    auto prepared = otterstax::parser::prepare_sql(sql, aliases_, &arena_resource, resource_, &reusable_root);
+    if (prepared.has_error()) {
+        log_->error("parse: {}", prepared.error().what.c_str());
+        return prepared.convert_error<ParsedQueryDataPtr>();
+    }
+    auto extraction = std::move(prepared.value());
     log_->trace("parse: prepare_sql produced {} stub(s), modified SQL: {}",
                 extraction.stubs.size(),
                 std::string_view{extraction.modified_sql}.substr(0, 200));
@@ -449,7 +470,11 @@ core::result_wrapper_t<ParsedQueryDataPtr> GreenplumParser::parse(const std::str
                                  std::pmr::string{"multiple statements in one query are not supported", resource_}};
         }
         res = reinterpret_cast<::Node*>(linitial(raw.value()));
-        otterstax::parser::promote_three_part_qualifiers(res);
+        if (auto refused = otterstax::parser::canonicalize_names(&arena_resource, resource_, aliases_, res);
+            refused.contains_error()) {
+            log_->error("parse: {}", refused.what.c_str());
+            return refused;
+        }
     }
 
     auto tag = nodeTag(res);
@@ -490,11 +515,15 @@ core::result_wrapper_t<ParsedQueryDataPtr> GreenplumParser::parse(const std::str
     }
 
     // Collect every RangeVar's full name (uid.db.schema.rel) from the
-    // promoted raw AST — including the stub RangeVars
+    // canonicalized raw AST — including the stub RangeVars
     // (`<uid>.subq.subq.__otterstax_subq_N`) injected by prepare_sql —
     // before the transformer folds names down to (dbname, relname).
     otterstax::names::name_registry_t registry(&arena_resource);
-    otterstax::parser::collect_qualified_names(resource_, res, registry);
+    if (auto refused = otterstax::parser::collect_qualified_names(resource_, aliases_, res, registry);
+        refused.contains_error()) {
+        log_->error("parse: {}", refused.what.c_str());
+        return refused;
+    }
 
     // The transformer stores a CHECK expression and a VIEW body as the verbatim
     // text the user wrote, sliced out of the statement by the byte offsets the
@@ -559,6 +588,7 @@ core::result_wrapper_t<ParsedQueryDataPtr> GreenplumParser::parse(const std::str
 
     auto external_count = get_external_nodes(resource_,
                                              registry,
+                                             aliases_,
                                              result->otterbrix_params->node,
                                              result->otterbrix_params->external_nodes);
     if (external_count.has_error()) {
@@ -614,10 +644,19 @@ GreenplumParser::parse_fragment(const std::string& sql,
         return core::error_t{core::error_code_t::unimplemented_yet,
                              std::pmr::string{"a SQL fragment must be a single SELECT statement", resource_}};
     }
-    otterstax::parser::promote_three_part_qualifiers(res);
-    // The full names (uid.db.schema.rel) come off the promoted raw tree, before
-    // the transformer folds every table down to (uid, db, rel), as in parse().
-    otterstax::parser::collect_qualified_names(resource_, res, names);
+    if (auto refused = otterstax::parser::canonicalize_names(&arena_resource, resource_, aliases_, res);
+        refused.contains_error()) {
+        log_->error("parse_fragment: {}", refused.what.c_str());
+        return refused;
+    }
+    // The full names (uid.db.schema.rel) come off the canonicalized raw tree,
+    // before the transformer folds every table down to (uid, db, rel), as in
+    // parse().
+    if (auto refused = otterstax::parser::collect_qualified_names(resource_, aliases_, res, names);
+        refused.contains_error()) {
+        log_->error("parse_fragment: {}", refused.what.c_str());
+        return refused;
+    }
 
     sql::transform::transformer transformer(resource_, text.c_str(), &registry_);
     // The 3-arg execution_plan_t seeds sub_queries with the root it is given;

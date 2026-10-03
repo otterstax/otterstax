@@ -55,8 +55,11 @@ using otterstax::test::scheduler_stack;
 using otterstax::test::worker_pool_size;
 
 namespace {
-
     constexpr const char* kUid = "planpg";
+    const otterstax::names::alias_registry_t& planpg_aliases() {
+        static const auto aliases = make_aliases({{kUid, backend_type_t::PostgreSQL, "pgdb", "public"}});
+        return aliases;
+    }
     // Every column of the one remote table, in backend order: the projection
     // the mock answers the describe probe and the data query with.
     constexpr std::string_view kSql = "SELECT id, name, price FROM planpg.pgdb.public.items;";
@@ -226,7 +229,7 @@ namespace {
             , resource_(otterbrix_->dispatcher()->resource())
             , az_scheduler_(make_az_scheduler())
             , otb_mgr_(actor_zeta::spawn<db::OtterbrixManager>(resource_, make_otterbrix_manager(otterbrix_)))
-            , catalog_(actor_zeta::spawn<mysql::CatalogManager>(resource_, otb_mgr_->address()))
+            , catalog_(actor_zeta::spawn<mysql::CatalogManager>(resource_, otb_mgr_->address(), planpg_aliases()))
             , pg_conn_(std::make_unique<pg::ConnectorManager>(resource_,
                                                               catalog_->address(),
                                                               &recording_pg_factory,
@@ -273,6 +276,7 @@ namespace {
                                                 az_scheduler_.get(),
                                                 worker_pool_size(),
                                                 &make_parser,
+                                                planpg_aliases(),
                                                 actor_zeta::address_t::empty_address(), // sql
                                                 pg_mgr_->address(),
                                                 actor_zeta::address_t::empty_address(), // ch
@@ -368,7 +372,6 @@ namespace {
     }
 
 #pragma GCC diagnostic pop
-
 } // namespace
 
 TEST_CASE("Scheduler::prepare_plan: a parsed remote SELECT is described and never executed") {
@@ -385,7 +388,7 @@ TEST_CASE("Scheduler::prepare_plan: a parsed remote SELECT is described and neve
     REQUIRE_FALSE(close_scheduler_statement(s, by_sql).has_error());
 
     reset_queries();
-    GreenplumParser parser(s.resource);
+    GreenplumParser parser(s.resource, planpg_aliases());
     const session_hash_t by_plan = 9901;
     auto prepared = prepare_scheduler_plan(s, by_plan, parse_plan(parser, kSql));
     INFO("prepare_plan: " << (prepared.has_error() ? prepared.error().what.c_str() : "ok"));
@@ -420,7 +423,7 @@ TEST_CASE("Scheduler::execute_plan: a parsed remote SELECT returns the rows exec
     INFO("execute: " << (by_sql.has_error() ? by_sql.error().what.c_str() : "ok"));
     REQUIRE_FALSE(by_sql.has_error());
 
-    GreenplumParser parser(s.resource);
+    GreenplumParser parser(s.resource, planpg_aliases());
     auto by_plan = execute_scheduler_plan(s, 9921, parse_plan(parser, kSql));
     INFO("execute_plan: " << (by_plan.has_error() ? by_plan.error().what.c_str() : "ok"));
     REQUIRE_FALSE(by_plan.has_error());
@@ -447,7 +450,7 @@ TEST_CASE("spark.sql classification: the parse tells a query from a command and 
     // A SELECT over the remote table is a query, and classifying it asked the
     // backend nothing: no data query, not even a describe probe.
     reset_queries();
-    auto query = frontend::spark::classify_sql(std::string{kSql}, s.resource);
+    auto query = frontend::spark::classify_sql(std::string{kSql}, s.resource, planpg_aliases());
     INFO("classify_sql(query): " << (query.has_error() ? query.error().what.c_str() : "ok"));
     REQUIRE_FALSE(query.has_error());
     CHECK(query.value() == frontend::spark::sql_statement_t::query);
@@ -457,7 +460,7 @@ TEST_CASE("spark.sql classification: the parse tells a query from a command and 
     // An INSERT is a command, and classifying it writes nothing: the row is
     // written by the one execute ExecutePlan sends for it.
     const std::string insert = "INSERT INTO plandb.t (id) VALUES (2);";
-    auto command = frontend::spark::classify_sql(insert, s.resource);
+    auto command = frontend::spark::classify_sql(insert, s.resource, planpg_aliases());
     INFO("classify_sql(insert): " << (command.has_error() ? command.error().what.c_str() : "ok"));
     REQUIRE_FALSE(command.has_error());
     CHECK(command.value() == frontend::spark::sql_statement_t::command);
@@ -556,7 +559,7 @@ TEST_CASE("spark plan shapes: classify_sql calls only a SELECT of the core gramm
     using frontend::spark::sql_statement_t;
     std::pmr::synchronized_pool_resource pool;
     const auto kind_of = [&pool](const std::string& sql) {
-        auto kind = frontend::spark::classify_sql(sql, &pool);
+        auto kind = frontend::spark::classify_sql(sql, &pool, planpg_aliases());
         INFO(sql << ": " << (kind.has_error() ? kind.error().what.c_str() : "ok"));
         REQUIRE_FALSE(kind.has_error());
         return kind.value();
@@ -577,10 +580,10 @@ TEST_CASE("spark plan shapes: classify_sql calls only a SELECT of the core gramm
                   "VALUE_FORMAT='JSON', BOOTSTRAP_SERVERS='localhost:9092')") == sql_statement_t::command);
 
     // A statement the parser refuses is its error, message included.
-    auto broken = frontend::spark::classify_sql("SELEC 1", &pool);
+    auto broken = frontend::spark::classify_sql("SELEC 1", &pool, planpg_aliases());
     REQUIRE(broken.has_error());
     CHECK_FALSE(std::string_view{broken.error().what.c_str()}.empty());
-    auto explain = frontend::spark::classify_sql("EXPLAIN SELECT 1", &pool);
+    auto explain = frontend::spark::classify_sql("EXPLAIN SELECT 1", &pool, planpg_aliases());
     REQUIRE(explain.has_error());
     CHECK(std::string_view{explain.error().what.c_str()}.find("EXPLAIN") != std::string_view::npos);
 }

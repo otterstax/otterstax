@@ -115,8 +115,8 @@ def main(local=False):
     }
 
     # Test 1: Basic JOIN with WHERE and ORDER BY (from examples/simple/example_2.txt)
-    test_query_1 = """SELECT * FROM campaigns.db1.schema.campaigns JOIN
-impressions.db2.schema.impressions ON
+    test_query_1 = """SELECT * FROM campaigns.db1.campaigns JOIN
+impressions.db2.impressions ON
 campaigns.campaign_id = impressions.campaign_id
 WHERE campaigns.campaign_length > 30
 ORDER BY impressions.clicks DESC;"""
@@ -124,8 +124,8 @@ ORDER BY impressions.clicks DESC;"""
     validate_by_request(client, "Test 1: Basic JOIN (example_2)", test_query_1, expected_schema_join)
 
     # Test 2: JOIN with complex WHERE (from examples/simple/example_1.txt)
-    test_query_2 = """SELECT * FROM campaigns.db1.schema.campaigns JOIN
-impressions.db2.schema.impressions ON
+    test_query_2 = """SELECT * FROM campaigns.db1.campaigns JOIN
+impressions.db2.impressions ON
 campaigns.campaign_id = impressions.campaign_id AND campaign_length > 30
 WHERE budget > 80000 OR budget < 90000
 ORDER BY clicks;"""
@@ -133,13 +133,13 @@ ORDER BY clicks;"""
     validate_by_request(client, "Test 2: JOIN with complex WHERE (example_1)", test_query_2, expected_schema_join)
 
     # Test 3: Simple SELECT from single table
-    test_query_3 = "SELECT * FROM campaigns.db1.schema.campaigns WHERE campaign_length > 30;"
+    test_query_3 = "SELECT * FROM campaigns.db1.campaigns WHERE campaign_length > 30;"
 
     validate_by_request(client, "Test 3: Simple SELECT from single table", test_query_3, expected_schema_campaigns)
 
     # Test 4: Simple JOIN (from examples/simple/example_2.txt)
-    test_query_4 = """SELECT * FROM campaigns.db1.schema.campaigns JOIN
-impressions.db2.schema.impressions ON
+    test_query_4 = """SELECT * FROM campaigns.db1.campaigns JOIN
+impressions.db2.impressions ON
 campaigns.campaign_id = impressions.campaign_id
 WHERE campaigns.campaign_length > 30
 ORDER BY impressions.clicks DESC;"""
@@ -147,8 +147,8 @@ ORDER BY impressions.clicks DESC;"""
     validate_by_request(client, "Test 4: Simple JOIN (example_2)", test_query_4, expected_schema_join)
 
     # Test 5: JOIN with AND condition (from examples/simple/example_1.txt)
-    test_query_5 = """SELECT * FROM campaigns.db1.schema.campaigns JOIN
-impressions.db2.schema.impressions ON
+    test_query_5 = """SELECT * FROM campaigns.db1.campaigns JOIN
+impressions.db2.impressions ON
 campaigns.campaign_id = impressions.campaign_id AND campaign_length > 30
 WHERE budget > 80000 OR budget < 90000
 ORDER BY clicks;"""
@@ -156,20 +156,20 @@ ORDER BY clicks;"""
     validate_by_request(client, "Test 5: JOIN with AND condition (example_1)", test_query_5, expected_schema_join)
 
     # Test 6: JOIN with multiple conditions (from examples/simple/example_5.txt)
-    test_query_6 = """SELECT * FROM campaigns.db1.schema.campaigns JOIN
-impressions.db2.schema.impressions ON
+    test_query_6 = """SELECT * FROM campaigns.db1.campaigns JOIN
+impressions.db2.impressions ON
 campaigns.campaign_id = impressions.campaign_id AND campaign_length > 80 AND clicks > 200
 WHERE budget > 80000 OR budget < 90000;"""
 
     validate_by_request(client, "Test 6: JOIN with multiple conditions (example_5)", test_query_6, expected_schema_join)
 
     # Test 7: Simple SELECT from single table (from examples/simple/example_3.txt)
-    test_query_7 = "SELECT * FROM campaigns.db1.schema.campaigns WHERE campaign_length > 30;"
+    test_query_7 = "SELECT * FROM campaigns.db1.campaigns WHERE campaign_length > 30;"
 
     validate_by_request(client, "Test 7: Simple SELECT (example_3)", test_query_7, expected_schema_campaigns)
 
     # Test 8: SELECT from impressions table (from examples/simple/example_4.txt)
-    test_query_8 = "SELECT * FROM impressions.db2.schema.impressions WHERE clicks > 200;"
+    test_query_8 = "SELECT * FROM impressions.db2.impressions WHERE clicks > 200;"
 
     validate_by_request(client, "Test 8: SELECT from impressions (example_4)", test_query_8, expected_schema_impressions)
 

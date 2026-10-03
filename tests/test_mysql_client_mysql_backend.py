@@ -27,7 +27,7 @@ class client:
             'user': 'testuser',
             'password': 'testpass',
         }
-        self.test_database = 'campaigns.db1.schema'
+        self.test_database = 'campaigns.db1'
         self.test_table = 'mysql_test_table'
         self.test_encoding_table = 'mysql_test_encoding'
 

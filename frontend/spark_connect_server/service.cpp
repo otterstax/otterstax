@@ -46,10 +46,16 @@ namespace frontend::spark {
         using FetchErrorDetailsRPC = agrpc::ServerRPC<&SCS::AsyncService::RequestFetchErrorDetails>;
         using AddArtifactsRPC = agrpc::ServerRPC<&SCS::AsyncService::RequestAddArtifacts>;
 
+        const otterstax::names::alias_registry_t& required_aliases(const SparkConnectServerConfig& config) {
+            assert(config.aliases != nullptr && "the connection aliases must be given");
+            return *config.aliases;
+        }
+
     } // namespace
 
     SparkConnectServiceImpl::SparkConnectServiceImpl(const SparkConnectServerConfig& config)
         : resource_(config.resource)
+        , aliases_(required_aliases(config))
         , scheduler_address_(config.scheduler_address)
         , log_(get_logger(logger_tag::SPARK_CONNECT_SERVER))
         , grpc_contexts_(config.resource)

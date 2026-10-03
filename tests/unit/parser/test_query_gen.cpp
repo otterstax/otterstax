@@ -2,6 +2,7 @@
 // Copyright 2025-2026  OtterStax
 
 #include "otterbrix/parser/name_resolution.hpp"
+#include "test_aliases.hpp"
 #include "otterbrix/parser/parser.hpp"
 #include "otterbrix/parser/subquery_extractor.hpp"
 #include "otterbrix/query_generation/sql_query_generator.hpp"
@@ -130,7 +131,7 @@ core::error_code_t error_for(GreenplumParser& parser,
 
 // Hand-built plans: the parser is not the only producer of plan nodes, and a
 // hand-built node pins one exact shape without depending on transformer details.
-const qualified_name_t orders_name{"mysql", "bill", "schema", "orders"};
+const qualified_name_t orders_name{"mysql", "bill", "", "orders"};
 
 otterstax::names::resolved_target_t orders_target() {
     return otterstax::names::resolved_target_t{components::catalog::INVALID_OID, orders_name, {}};
@@ -229,12 +230,12 @@ TEST_CASE("table_reference: an empty name is invalid_parameter in every dialect"
 TEST_CASE("generate_query: MySQL node produces db.collection reference") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     auto parsed = parse_or_die(
         parser,
         "SELECT o.id, p.name "
-        "FROM mysql.bill.schema.orders o "
+        "FROM mysql.bill.orders o "
         "INNER JOIN pg.shop.shop.products p ON o.product_id = p.id;");
 
     auto nodes = flat_externals(parsed);
@@ -255,15 +256,15 @@ TEST_CASE("generate_query: MySQL node produces db.collection reference") {
     REQUIRE_FALSE(sql.empty());
     REQUIRE(sql.find("`bill`.`orders`") != std::string::npos);
     // 4-part qualifier must not leak into the generated SQL
-    REQUIRE(sql.find("mysql.bill.schema.orders") == std::string::npos);
+    REQUIRE(sql.find("mysql.bill.orders") == std::string::npos);
 }
 
 TEST_CASE("generate_query: LIMIT is pushed down to the remote backend SQL") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
-    auto parsed = parse_or_die(parser, "SELECT * FROM mysql.bill.schema.orders LIMIT 5;");
+    auto parsed = parse_or_die(parser, "SELECT * FROM mysql.bill.orders LIMIT 5;");
 
     auto nodes = flat_externals(parsed);
     auto mysql_node = find_by_uid(nodes, "mysql");
@@ -288,9 +289,9 @@ TEST_CASE("generate_query: LIMIT is pushed down to the remote backend SQL") {
 TEST_CASE("generate_query: LIMIT with OFFSET is pushed down") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
-    auto parsed = parse_or_die(parser, "SELECT * FROM mysql.bill.schema.orders LIMIT 5 OFFSET 2;");
+    auto parsed = parse_or_die(parser, "SELECT * FROM mysql.bill.orders LIMIT 5 OFFSET 2;");
 
     auto nodes = flat_externals(parsed);
     auto mysql_node = find_by_uid(nodes, "mysql");
@@ -312,9 +313,9 @@ TEST_CASE("generate_query: LIMIT with OFFSET is pushed down") {
 TEST_CASE("generate_query: no LIMIT clause when the query has none") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
-    auto parsed = parse_or_die(parser, "SELECT * FROM mysql.bill.schema.orders WHERE id > 0;");
+    auto parsed = parse_or_die(parser, "SELECT * FROM mysql.bill.orders WHERE id > 0;");
 
     auto nodes = flat_externals(parsed);
     auto mysql_node = find_by_uid(nodes, "mysql");
@@ -342,9 +343,9 @@ TEST_CASE("generate_query: no LIMIT clause when the query has none") {
 TEST_CASE("generate_query: bare OFFSET is pushed down (PostgreSQL)") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
-    auto parsed = parse_or_die(parser, "SELECT * FROM mysql.bill.schema.orders OFFSET 10;");
+    auto parsed = parse_or_die(parser, "SELECT * FROM mysql.bill.orders OFFSET 10;");
 
     auto nodes = flat_externals(parsed);
     auto node = find_by_uid(nodes, "mysql");
@@ -368,9 +369,9 @@ TEST_CASE("generate_query: bare OFFSET is pushed down (PostgreSQL)") {
 TEST_CASE("generate_query: bare OFFSET is pushed down (MySQL)") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
-    auto parsed = parse_or_die(parser, "SELECT * FROM mysql.bill.schema.orders OFFSET 10;");
+    auto parsed = parse_or_die(parser, "SELECT * FROM mysql.bill.orders OFFSET 10;");
 
     auto nodes = flat_externals(parsed);
     auto node = find_by_uid(nodes, "mysql");
@@ -397,12 +398,12 @@ TEST_CASE("generate_query: bare OFFSET is pushed down (MySQL)") {
 TEST_CASE("generate_query: bare OFFSET is pushed down (ClickHouse)") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     // ClickHouse adds limit+offset without saturating: the MySQL sentinel would
     // overflow to zero rows, so it must get the bare OFFSET.
     auto sql =
-        sql_for(parser, "SELECT * FROM mysql.bill.schema.orders OFFSET 10;", backend_type_t::ClickHouse, resource);
+        sql_for(parser, "SELECT * FROM mysql.bill.orders OFFSET 10;", backend_type_t::ClickHouse, resource);
     REQUIRE(sql.find(" OFFSET 10;") != std::string::npos);
     REQUIRE(sql.find("LIMIT") == std::string::npos);
 }
@@ -410,11 +411,11 @@ TEST_CASE("generate_query: bare OFFSET is pushed down (ClickHouse)") {
 TEST_CASE("generate_query: LIMIT ALL OFFSET n keeps the OFFSET") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     // LIMIT ALL parses to A_Const/T_Null, which leaves limit_ at the unlimit
     // sentinel — the same node shape as a bare OFFSET.
-    auto parsed = parse_or_die(parser, "SELECT * FROM mysql.bill.schema.orders LIMIT ALL OFFSET 7;");
+    auto parsed = parse_or_die(parser, "SELECT * FROM mysql.bill.orders LIMIT ALL OFFSET 7;");
 
     auto nodes = flat_externals(parsed);
     auto node = find_by_uid(nodes, "mysql");
@@ -435,9 +436,9 @@ TEST_CASE("generate_query: LIMIT ALL OFFSET n keeps the OFFSET") {
 TEST_CASE("generate_query: LIMIT ALL OFFSET n for ClickHouse and MySQL") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
-    const std::string query = "SELECT * FROM mysql.bill.schema.orders LIMIT ALL OFFSET 7;";
+    const std::string query = "SELECT * FROM mysql.bill.orders LIMIT ALL OFFSET 7;";
 
     auto ch = sql_for(parser, query, backend_type_t::ClickHouse, resource);
     REQUIRE(ch.find(" OFFSET 7;") != std::string::npos);
@@ -450,10 +451,10 @@ TEST_CASE("generate_query: LIMIT ALL OFFSET n for ClickHouse and MySQL") {
 TEST_CASE("generate_query: OFFSET 0 emits no limit clause at all") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     // Degenerate (-1, 0) node: nothing to push down on any backend.
-    auto parsed = parse_or_die(parser, "SELECT * FROM mysql.bill.schema.orders OFFSET 0;");
+    auto parsed = parse_or_die(parser, "SELECT * FROM mysql.bill.orders OFFSET 0;");
 
     auto nodes = flat_externals(parsed);
     auto node = find_by_uid(nodes, "mysql");
@@ -475,10 +476,10 @@ TEST_CASE("generate_query: OFFSET 0 emits no limit clause at all") {
 TEST_CASE("generate_query: LIMIT 0 emits LIMIT 0") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     // Pins the >= 0 boundary the bug class lives on: LIMIT 0 is a real window.
-    auto parsed = parse_or_die(parser, "SELECT * FROM mysql.bill.schema.orders LIMIT 0;");
+    auto parsed = parse_or_die(parser, "SELECT * FROM mysql.bill.orders LIMIT 0;");
 
     auto nodes = flat_externals(parsed);
     auto node = find_by_uid(nodes, "mysql");
@@ -535,10 +536,10 @@ TEST_CASE("generate_query: negative OFFSET is invalid_parameter, not silently dr
 TEST_CASE("generate_query: HAVING is pushed down to the remote backend SQL") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     auto parsed = parse_or_die(parser,
-                               "SELECT category, SUM(price) AS total FROM mysql.bill.schema.orders "
+                               "SELECT category, SUM(price) AS total FROM mysql.bill.orders "
                                "GROUP BY category HAVING SUM(price) > 100;");
 
     auto nodes = flat_externals(parsed);
@@ -564,10 +565,10 @@ TEST_CASE("generate_query: HAVING is pushed down to the remote backend SQL") {
 TEST_CASE("generate_query: HAVING renders between GROUP BY and ORDER BY / LIMIT") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     auto parsed = parse_or_die(parser,
-                               "SELECT category, COUNT(*) AS cnt FROM mysql.bill.schema.orders "
+                               "SELECT category, COUNT(*) AS cnt FROM mysql.bill.orders "
                                "GROUP BY category HAVING COUNT(*) > 2 ORDER BY category ASC LIMIT 5;");
 
     auto nodes = flat_externals(parsed);
@@ -596,11 +597,11 @@ TEST_CASE("generate_query: HAVING renders between GROUP BY and ORDER BY / LIMIT"
 TEST_CASE("generate_query: no HAVING clause when the query has none") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     // Negative control: a plain GROUP BY must not grow a bare HAVING.
     auto parsed = parse_or_die(parser,
-                               "SELECT category, SUM(price) AS total FROM mysql.bill.schema.orders "
+                               "SELECT category, SUM(price) AS total FROM mysql.bill.orders "
                                "GROUP BY category;");
 
     auto nodes = flat_externals(parsed);
@@ -628,13 +629,13 @@ TEST_CASE("generate_query: no HAVING clause when the query has none") {
 TEST_CASE("generate_query: HAVING spells the aggregate call — full statement per backend") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
-    const std::string query = "SELECT category, SUM(price) AS total FROM mysql.bill.schema.orders "
+    const std::string query = "SELECT category, SUM(price) AS total FROM mysql.bill.orders "
                               "GROUP BY category HAVING SUM(price) > 100;";
 
     REQUIRE(sql_for(parser, query, backend_type_t::PostgreSQL, resource) ==
-            "SELECT \"category\", SUM(\"price\") AS \"total\" FROM \"schema\".\"orders\" "
+            "SELECT \"category\", SUM(\"price\") AS \"total\" FROM \"public\".\"orders\" "
             "GROUP BY \"category\" HAVING SUM(\"price\") > 100;");
     REQUIRE(sql_for(parser, query, backend_type_t::MySQL, resource) ==
             "SELECT `category`, SUM(`price`) AS `total` FROM `bill`.`orders` "
@@ -647,23 +648,23 @@ TEST_CASE("generate_query: HAVING spells the aggregate call — full statement p
 TEST_CASE("generate_query: aggregate only in HAVING stays out of the SELECT list") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     auto sql = sql_for(parser,
-                       "SELECT category FROM mysql.bill.schema.orders GROUP BY category HAVING SUM(price) > 100;",
+                       "SELECT category FROM mysql.bill.orders GROUP BY category HAVING SUM(price) > 100;",
                        backend_type_t::PostgreSQL,
                        resource);
-    REQUIRE(sql == "SELECT \"category\" FROM \"schema\".\"orders\" GROUP BY \"category\" HAVING SUM(\"price\") > 100;");
+    REQUIRE(sql == "SELECT \"category\" FROM \"public\".\"orders\" GROUP BY \"category\" HAVING SUM(\"price\") > 100;");
     REQUIRE(sql.find("__having_") == std::string::npos);
 }
 
 TEST_CASE("generate_query: arithmetic over an aggregate in HAVING is rendered, not dropped") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     auto sql = sql_for(parser,
-                       "SELECT category, SUM(price) AS total FROM mysql.bill.schema.orders "
+                       "SELECT category, SUM(price) AS total FROM mysql.bill.orders "
                        "GROUP BY category HAVING SUM(price) * 2 > 100;",
                        backend_type_t::PostgreSQL,
                        resource);
@@ -678,10 +679,10 @@ TEST_CASE("generate_query: two aggregates of one function with different argumen
           "[engine-defect-having]") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     auto sql = sql_for(parser,
-                       "SELECT category, SUM(a) AS sa, SUM(b) AS sb FROM mysql.bill.schema.orders "
+                       "SELECT category, SUM(a) AS sa, SUM(b) AS sb FROM mysql.bill.orders "
                        "GROUP BY category HAVING SUM(b) > 1;",
                        backend_type_t::PostgreSQL,
                        resource);
@@ -696,10 +697,10 @@ TEST_CASE("generate_query: two aggregates of one function with different argumen
 TEST_CASE("generate_query: string parameter is escaped for PostgreSQL") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     // SQL-level '' is one apostrophe: the parameter value is O'Brien.
-    auto parsed = parse_or_die(parser, "SELECT * FROM mysql.bill.schema.orders WHERE note = 'O''Brien';");
+    auto parsed = parse_or_die(parser, "SELECT * FROM mysql.bill.orders WHERE note = 'O''Brien';");
 
     auto nodes = flat_externals(parsed);
     auto node = find_by_uid(nodes, "mysql");
@@ -721,9 +722,9 @@ TEST_CASE("generate_query: string parameter is escaped for PostgreSQL") {
 TEST_CASE("generate_query: string parameter is escaped for ClickHouse") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
-    auto parsed = parse_or_die(parser, "SELECT * FROM mysql.bill.schema.orders WHERE note = 'O''Brien';");
+    auto parsed = parse_or_die(parser, "SELECT * FROM mysql.bill.orders WHERE note = 'O''Brien';");
 
     auto nodes = flat_externals(parsed);
     auto node = find_by_uid(nodes, "mysql");
@@ -744,9 +745,9 @@ TEST_CASE("generate_query: string parameter is escaped for ClickHouse") {
 TEST_CASE("generate_query: string parameter is escaped for MySQL too") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
-    auto parsed = parse_or_die(parser, "SELECT * FROM mysql.bill.schema.orders WHERE note = 'O''Brien';");
+    auto parsed = parse_or_die(parser, "SELECT * FROM mysql.bill.orders WHERE note = 'O''Brien';");
 
     auto nodes = flat_externals(parsed);
     auto node = find_by_uid(nodes, "mysql");
@@ -913,17 +914,17 @@ TEST_CASE("generate_values: a backend without a dialect is invalid_parameter") {
 TEST_CASE("generate_query: string parameter is escaped in UPDATE SET and in a SELECT constant") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     auto set_sql = sql_for(parser,
-                           "UPDATE mysql.bill.schema.orders SET name = 'O''Brien' WHERE id > 0;",
+                           "UPDATE mysql.bill.orders SET name = 'O''Brien' WHERE id > 0;",
                            backend_type_t::PostgreSQL,
                            resource);
     REQUIRE(set_sql.find("SET \"name\" = 'O''Brien'") != std::string::npos);
     REQUIRE(set_sql.find("'O'Brien'") == std::string::npos);
 
     auto select_sql =
-        sql_for(parser, "SELECT 'O''Brien' AS n FROM mysql.bill.schema.orders;", backend_type_t::PostgreSQL, resource);
+        sql_for(parser, "SELECT 'O''Brien' AS n FROM mysql.bill.orders;", backend_type_t::PostgreSQL, resource);
     REQUIRE(select_sql.find("SELECT 'O''Brien' AS \"n\" FROM") != std::string::npos);
 }
 
@@ -1024,33 +1025,33 @@ TEST_CASE("generate_query: an empty target name is invalid_parameter and never a
 TEST_CASE("generate_query: arithmetic in the SELECT list is rendered with its alias") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
-    auto sql = sql_for(parser, "SELECT a + 1 AS x FROM mysql.bill.schema.orders;", backend_type_t::MySQL, resource);
+    auto sql = sql_for(parser, "SELECT a + 1 AS x FROM mysql.bill.orders;", backend_type_t::MySQL, resource);
     REQUIRE(sql == "SELECT (`a` + 1) AS `x` FROM `bill`.`orders`;");
 
     auto nested =
-        sql_for(parser, "SELECT (a + 1) * 2 AS x FROM mysql.bill.schema.orders;", backend_type_t::PostgreSQL, resource);
-    REQUIRE(nested == "SELECT ((\"a\" + 1) * 2) AS \"x\" FROM \"schema\".\"orders\";");
+        sql_for(parser, "SELECT (a + 1) * 2 AS x FROM mysql.bill.orders;", backend_type_t::PostgreSQL, resource);
+    REQUIRE(nested == "SELECT ((\"a\" + 1) * 2) AS \"x\" FROM \"public\".\"orders\";");
 }
 
 TEST_CASE("generate_query: arithmetic operand in WHERE is rendered, not dropped") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     auto sql =
-        sql_for(parser, "SELECT * FROM mysql.bill.schema.orders WHERE a + 1 = 2;", backend_type_t::MySQL, resource);
+        sql_for(parser, "SELECT * FROM mysql.bill.orders WHERE a + 1 = 2;", backend_type_t::MySQL, resource);
     REQUIRE(sql == "SELECT * FROM `bill`.`orders` WHERE (`a` + 1) = 2;");
 }
 
 TEST_CASE("generate_query: aggregate over an expression keeps its argument") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     auto sql = sql_for(parser,
-                       "SELECT SUM(price * qty) AS s FROM mysql.bill.schema.orders;",
+                       "SELECT SUM(price * qty) AS s FROM mysql.bill.orders;",
                        backend_type_t::MySQL,
                        resource);
     REQUIRE(sql.find("SUM((`price` * `qty`)) AS `s`") != std::string::npos);
@@ -1060,10 +1061,10 @@ TEST_CASE("generate_query: aggregate over an expression keeps its argument") {
 TEST_CASE("generate_query: COUNT(DISTINCT col) keeps DISTINCT") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     auto sql = sql_for(parser,
-                       "SELECT COUNT(DISTINCT category) AS c FROM mysql.bill.schema.orders;",
+                       "SELECT COUNT(DISTINCT category) AS c FROM mysql.bill.orders;",
                        backend_type_t::PostgreSQL,
                        resource);
     REQUIRE(sql.find("COUNT(DISTINCT \"category\") AS \"c\"") != std::string::npos);
@@ -1072,20 +1073,20 @@ TEST_CASE("generate_query: COUNT(DISTINCT col) keeps DISTINCT") {
 TEST_CASE("generate_query: SELECT DISTINCT is pushed down") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     auto sql =
-        sql_for(parser, "SELECT DISTINCT category FROM mysql.bill.schema.orders;", backend_type_t::MySQL, resource);
+        sql_for(parser, "SELECT DISTINCT category FROM mysql.bill.orders;", backend_type_t::MySQL, resource);
     REQUIRE(sql == "SELECT DISTINCT `category` FROM `bill`.`orders`;");
 }
 
 TEST_CASE("generate_query: DISTINCT ON is PostgreSQL-only") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     const std::string query =
-        "SELECT DISTINCT ON (category) category, price FROM mysql.bill.schema.orders ORDER BY category;";
+        "SELECT DISTINCT ON (category) category, price FROM mysql.bill.orders ORDER BY category;";
 
     auto pg = sql_for(parser, query, backend_type_t::PostgreSQL, resource);
     REQUIRE(pg.find("SELECT DISTINCT ON (\"category\") \"category\", \"price\" FROM") != std::string::npos);
@@ -1120,16 +1121,16 @@ TEST_CASE("generate_query: GROUP BY over an expression is rendered") {
 TEST_CASE("generate_query: IS NULL / IS NOT NULL are rendered") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     auto is_null = sql_for(parser,
-                           "SELECT * FROM mysql.bill.schema.orders WHERE note IS NULL;",
+                           "SELECT * FROM mysql.bill.orders WHERE note IS NULL;",
                            backend_type_t::PostgreSQL,
                            resource);
-    REQUIRE(is_null =="SELECT * FROM \"schema\".\"orders\" WHERE \"note\" IS NULL;");
+    REQUIRE(is_null =="SELECT * FROM \"public\".\"orders\" WHERE \"note\" IS NULL;");
 
     auto is_not_null = sql_for(parser,
-                               "SELECT * FROM mysql.bill.schema.orders WHERE note IS NOT NULL;",
+                               "SELECT * FROM mysql.bill.orders WHERE note IS NOT NULL;",
                                backend_type_t::MySQL,
                                resource);
     REQUIRE(is_not_null == "SELECT * FROM `bill`.`orders` WHERE `note` IS NOT NULL;");
@@ -1138,10 +1139,10 @@ TEST_CASE("generate_query: IS NULL / IS NOT NULL are rendered") {
 TEST_CASE("generate_query: NOT renders as NOT (...), never the PostgreSQL-only !( form") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     for (auto backend : {backend_type_t::MySQL, backend_type_t::PostgreSQL, backend_type_t::ClickHouse}) {
-        auto sql = sql_for(parser, "SELECT * FROM mysql.bill.schema.orders WHERE NOT (id > 0);", backend, resource);
+        auto sql = sql_for(parser, "SELECT * FROM mysql.bill.orders WHERE NOT (id > 0);", backend, resource);
         INFO("backend = " << static_cast<int>(backend) << " sql = " << sql);
         REQUIRE(sql.find("WHERE NOT (") != std::string::npos);
         REQUIRE(sql.find("!(") == std::string::npos);
@@ -1151,32 +1152,32 @@ TEST_CASE("generate_query: NOT renders as NOT (...), never the PostgreSQL-only !
 TEST_CASE("generate_query: LIKE is rendered as LIKE and never as a regular expression") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     // The engine lowers LIKE to regexp_like(subject, pattern, flags) whose
     // parameter carries the LIKE pattern itself, not a regular expression: a
     // regex spelling (`~`, REGEXP, match()) would read `%` and `_` literally and
     // match nothing.
-    const std::string query = "SELECT * FROM mysql.bill.schema.orders WHERE name LIKE 'a%';";
+    const std::string query = "SELECT * FROM mysql.bill.orders WHERE name LIKE 'a%';";
     REQUIRE(sql_for(parser, query, backend_type_t::PostgreSQL, resource) ==
-            "SELECT * FROM \"schema\".\"orders\" WHERE \"name\" LIKE 'a%';");
+            "SELECT * FROM \"public\".\"orders\" WHERE \"name\" LIKE 'a%';");
     REQUIRE(sql_for(parser, query, backend_type_t::MySQL, resource) ==
             "SELECT * FROM `bill`.`orders` WHERE `name` LIKE 'a%';");
     REQUIRE(sql_for(parser, query, backend_type_t::ClickHouse, resource) ==
             "SELECT * FROM `bill`.`orders` WHERE `name` LIKE 'a%';");
 
     // Negation is the `n` flag, not a wrapping NOT, so it stays one predicate.
-    const std::string negated = "SELECT * FROM mysql.bill.schema.orders WHERE name NOT LIKE 'a%';";
+    const std::string negated = "SELECT * FROM mysql.bill.orders WHERE name NOT LIKE 'a%';";
     REQUIRE(sql_for(parser, negated, backend_type_t::PostgreSQL, resource) ==
-            "SELECT * FROM \"schema\".\"orders\" WHERE \"name\" NOT LIKE 'a%';");
+            "SELECT * FROM \"public\".\"orders\" WHERE \"name\" NOT LIKE 'a%';");
     REQUIRE(sql_for(parser, negated, backend_type_t::MySQL, resource) ==
             "SELECT * FROM `bill`.`orders` WHERE `name` NOT LIKE 'a%';");
 
     // MySQL has no ILIKE: LOWER() on both sides is case-insensitive whatever the
     // column collation.
-    const std::string icase = "SELECT * FROM mysql.bill.schema.orders WHERE name ILIKE 'a%';";
+    const std::string icase = "SELECT * FROM mysql.bill.orders WHERE name ILIKE 'a%';";
     REQUIRE(sql_for(parser, icase, backend_type_t::PostgreSQL, resource) ==
-            "SELECT * FROM \"schema\".\"orders\" WHERE \"name\" ILIKE 'a%';");
+            "SELECT * FROM \"public\".\"orders\" WHERE \"name\" ILIKE 'a%';");
     REQUIRE(sql_for(parser, icase, backend_type_t::ClickHouse, resource) ==
             "SELECT * FROM `bill`.`orders` WHERE `name` ILIKE 'a%';");
     REQUIRE(sql_for(parser, icase, backend_type_t::MySQL, resource) ==
@@ -1213,7 +1214,7 @@ TEST_CASE("generate_query: ARRAY literal per dialect") {
 
     auto pg = generate_manual(node, params, backend_type_t::PostgreSQL, resource);
     REQUIRE_FALSE(pg.has_error());
-    REQUIRE(pg.value() == "SELECT * FROM \"schema\".\"orders\" WHERE \"tags\" = ARRAY[1, 2];");
+    REQUIRE(pg.value() == "SELECT * FROM \"public\".\"orders\" WHERE \"tags\" = ARRAY[1, 2];");
 
     auto ch = generate_manual(node, params, backend_type_t::ClickHouse, resource);
     REQUIRE_FALSE(ch.has_error());
@@ -1229,9 +1230,9 @@ TEST_CASE("generate_query: ARRAY literal per dialect") {
 TEST_CASE("generate_query: NULLS FIRST / LAST reach the backend") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
-    const std::string query = "SELECT * FROM mysql.bill.schema.orders ORDER BY category ASC NULLS FIRST;";
+    const std::string query = "SELECT * FROM mysql.bill.orders ORDER BY category ASC NULLS FIRST;";
 
     auto pg = sql_for(parser, query, backend_type_t::PostgreSQL, resource);
     REQUIRE(pg.find("ORDER BY \"category\" ASC NULLS FIRST;") != std::string::npos);
@@ -1245,7 +1246,7 @@ TEST_CASE("generate_query: NULLS FIRST / LAST reach the backend") {
     REQUIRE(mysql.find("ORDER BY `category` IS NULL DESC, `category` ASC;") != std::string::npos);
 
     auto last = sql_for(parser,
-                        "SELECT * FROM mysql.bill.schema.orders ORDER BY category DESC NULLS LAST;",
+                        "SELECT * FROM mysql.bill.orders ORDER BY category DESC NULLS LAST;",
                         backend_type_t::MySQL,
                         resource);
     REQUIRE(last.find("ORDER BY `category` IS NULL ASC, `category` DESC;") != std::string::npos);
@@ -1259,9 +1260,9 @@ TEST_CASE("generate_query: NULLS FIRST / LAST reach the backend") {
 TEST_CASE("generate_query: DELETE ... LIMIT reaches MySQL SQL, returns unimplemented_yet for PostgreSQL") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
-    auto parsed = parse_or_die(parser, "DELETE FROM mysql.bill.schema.orders WHERE id > 0 LIMIT 5;");
+    auto parsed = parse_or_die(parser, "DELETE FROM mysql.bill.orders WHERE id > 0 LIMIT 5;");
 
     auto nodes = flat_externals(parsed);
     auto mysql_node = find_by_uid(nodes, "mysql");
@@ -1289,9 +1290,9 @@ TEST_CASE("generate_query: DELETE ... LIMIT reaches MySQL SQL, returns unimpleme
 TEST_CASE("generate_query: UPDATE ... LIMIT reaches MySQL SQL, returns unimplemented_yet for PostgreSQL") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
-    auto parsed = parse_or_die(parser, "UPDATE mysql.bill.schema.orders SET name = 'x' WHERE id > 0 LIMIT 3;");
+    auto parsed = parse_or_die(parser, "UPDATE mysql.bill.orders SET name = 'x' WHERE id > 0 LIMIT 3;");
 
     auto nodes = flat_externals(parsed);
     auto mysql_node = find_by_uid(nodes, "mysql");
@@ -1319,14 +1320,14 @@ TEST_CASE("generate_query: UPDATE ... LIMIT reaches MySQL SQL, returns unimpleme
 TEST_CASE("generate_query: DELETE / UPDATE ... LIMIT return unimplemented_yet for ClickHouse") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     REQUIRE(error_for(parser,
-                      "DELETE FROM mysql.bill.schema.orders WHERE id > 0 LIMIT 5;",
+                      "DELETE FROM mysql.bill.orders WHERE id > 0 LIMIT 5;",
                       backend_type_t::ClickHouse,
                       resource) == core::error_code_t::unimplemented_yet);
     REQUIRE(error_for(parser,
-                      "UPDATE mysql.bill.schema.orders SET name = 'x' WHERE id > 0 LIMIT 3;",
+                      "UPDATE mysql.bill.orders SET name = 'x' WHERE id > 0 LIMIT 3;",
                       backend_type_t::ClickHouse,
                       resource) == core::error_code_t::unimplemented_yet);
 }
@@ -1334,9 +1335,9 @@ TEST_CASE("generate_query: DELETE / UPDATE ... LIMIT return unimplemented_yet fo
 TEST_CASE("generate_query: DELETE without LIMIT emits no LIMIT clause") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
-    auto parsed = parse_or_die(parser, "DELETE FROM mysql.bill.schema.orders WHERE id > 0;");
+    auto parsed = parse_or_die(parser, "DELETE FROM mysql.bill.orders WHERE id > 0;");
 
     auto nodes = flat_externals(parsed);
     auto mysql_node = find_by_uid(nodes, "mysql");
@@ -1356,21 +1357,21 @@ TEST_CASE("generate_query: DELETE without LIMIT emits no LIMIT clause") {
 TEST_CASE("generate_query: DELETE without WHERE emits no WHERE clause") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     // The transformer attaches a match-everything predicate; on the backend
     // that is the absence of WHERE, not a dangling one.
-    auto sql = sql_for(parser, "DELETE FROM mysql.bill.schema.orders;", backend_type_t::MySQL, resource);
+    auto sql = sql_for(parser, "DELETE FROM mysql.bill.orders;", backend_type_t::MySQL, resource);
     REQUIRE(sql == "DELETE FROM `bill`.`orders`;");
 }
 
 TEST_CASE("generate_query: UPDATE emits SET once with comma-separated assignments") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     auto sql = sql_for(parser,
-                       "UPDATE mysql.bill.schema.orders SET a = 1, b = 2 WHERE id > 0;",
+                       "UPDATE mysql.bill.orders SET a = 1, b = 2 WHERE id > 0;",
                        backend_type_t::MySQL,
                        resource);
     REQUIRE(sql == "UPDATE `bill`.`orders` SET `a` = 1, `b` = 2 WHERE `id` > 0;");
@@ -1382,10 +1383,10 @@ TEST_CASE("generate_query: UPDATE emits SET once with comma-separated assignment
 TEST_CASE("generate_query: UPDATE for ClickHouse is the ALTER TABLE ... UPDATE mutation") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     auto sql = sql_for(parser,
-                       "UPDATE mysql.bill.schema.orders SET a = 1, b = 2 WHERE id > 0;",
+                       "UPDATE mysql.bill.orders SET a = 1, b = 2 WHERE id > 0;",
                        backend_type_t::ClickHouse,
                        resource);
     REQUIRE(sql == "ALTER TABLE `bill`.`orders` UPDATE `a` = 1, `b` = 2 WHERE `id` > 0;");
@@ -1398,26 +1399,26 @@ TEST_CASE("generate_query: UPDATE for ClickHouse is the ALTER TABLE ... UPDATE m
 TEST_CASE("generate_query: DELETE / UPDATE without WHERE spell the mandatory ClickHouse filter as WHERE 1") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
-    REQUIRE(sql_for(parser, "DELETE FROM mysql.bill.schema.orders;", backend_type_t::ClickHouse, resource) ==
+    REQUIRE(sql_for(parser, "DELETE FROM mysql.bill.orders;", backend_type_t::ClickHouse, resource) ==
             "DELETE FROM `bill`.`orders` WHERE 1;");
-    REQUIRE(sql_for(parser, "UPDATE mysql.bill.schema.orders SET a = 1;", backend_type_t::ClickHouse, resource) ==
+    REQUIRE(sql_for(parser, "UPDATE mysql.bill.orders SET a = 1;", backend_type_t::ClickHouse, resource) ==
             "ALTER TABLE `bill`.`orders` UPDATE `a` = 1 WHERE 1;");
-    REQUIRE(sql_for(parser, "UPDATE mysql.bill.schema.orders SET a = 1;", backend_type_t::MySQL, resource) ==
+    REQUIRE(sql_for(parser, "UPDATE mysql.bill.orders SET a = 1;", backend_type_t::MySQL, resource) ==
             "UPDATE `bill`.`orders` SET `a` = 1;");
-    REQUIRE(sql_for(parser, "UPDATE mysql.bill.schema.orders SET a = 1;", backend_type_t::PostgreSQL, resource) ==
-            "UPDATE \"schema\".\"orders\" SET \"a\" = 1;");
+    REQUIRE(sql_for(parser, "UPDATE mysql.bill.orders SET a = 1;", backend_type_t::PostgreSQL, resource) ==
+            "UPDATE \"public\".\"orders\" SET \"a\" = 1;");
 }
 
 TEST_CASE("generate_query: UPDATE SET operators are spelled per dialect") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     // `^` is power in PostgreSQL but XOR in MySQL; ClickHouse has neither
     // operator, only functions.
-    const std::string power = "UPDATE mysql.bill.schema.orders SET a = a ^ 2 WHERE id > 0;";
+    const std::string power = "UPDATE mysql.bill.orders SET a = a ^ 2 WHERE id > 0;";
     REQUIRE(sql_for(parser, power, backend_type_t::PostgreSQL, resource).find("SET \"a\" = (\"a\" ^ 2)") !=
             std::string::npos);
     REQUIRE(sql_for(parser, power, backend_type_t::MySQL, resource).find("SET `a` = POWER(`a`, 2)") !=
@@ -1427,18 +1428,18 @@ TEST_CASE("generate_query: UPDATE SET operators are spelled per dialect") {
     REQUIRE(sql_for(parser, power, backend_type_t::ClickHouse, resource).find("UPDATE `a` = pow(`a`, 2)") !=
             std::string::npos);
 
-    const std::string xor_op = "UPDATE mysql.bill.schema.orders SET a = a # 3 WHERE id > 0;";
+    const std::string xor_op = "UPDATE mysql.bill.orders SET a = a # 3 WHERE id > 0;";
     REQUIRE(sql_for(parser, xor_op, backend_type_t::PostgreSQL, resource).find("(\"a\" # 3)") != std::string::npos);
     REQUIRE(sql_for(parser, xor_op, backend_type_t::MySQL, resource).find("(`a` ^ 3)") != std::string::npos);
     REQUIRE(sql_for(parser, xor_op, backend_type_t::ClickHouse, resource).find("bitXor(`a`, 3)") !=
             std::string::npos);
 
-    const std::string shift = "UPDATE mysql.bill.schema.orders SET a = a << 1 WHERE id > 0;";
+    const std::string shift = "UPDATE mysql.bill.orders SET a = a << 1 WHERE id > 0;";
     REQUIRE(sql_for(parser, shift, backend_type_t::MySQL, resource).find("(`a` << 1)") != std::string::npos);
     REQUIRE(sql_for(parser, shift, backend_type_t::ClickHouse, resource).find("bitShiftLeft(`a`, 1)") !=
             std::string::npos);
 
-    const std::string sqrt = "UPDATE mysql.bill.schema.orders SET a = |/ a WHERE id > 0;";
+    const std::string sqrt = "UPDATE mysql.bill.orders SET a = |/ a WHERE id > 0;";
     REQUIRE(sql_for(parser, sqrt, backend_type_t::PostgreSQL, resource).find("SQRT(\"a\")") != std::string::npos);
     REQUIRE(sql_for(parser, sqrt, backend_type_t::MySQL, resource).find("SQRT(`a`)") != std::string::npos);
     REQUIRE(sql_for(parser, sqrt, backend_type_t::ClickHouse, resource).find("sqrt(`a`)") != std::string::npos);
@@ -1447,25 +1448,25 @@ TEST_CASE("generate_query: UPDATE SET operators are spelled per dialect") {
 TEST_CASE("generate_query: DELETE ... USING with a resolved second table per dialect") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     // The plan keeps the USING source as a child of the delete node, and the
     // parser resolves that child into the slot's from_name — which is what
     // makes the statement one two-table DELETE on the backend.
     auto parsed =
-        parse_or_die(parser, "DELETE FROM mysql.bill.schema.orders USING mysql.bill.schema.other WHERE id > 0;");
+        parse_or_die(parser, "DELETE FROM mysql.bill.orders USING mysql.bill.other WHERE id > 0;");
     auto nodes = flat_externals(parsed);
     auto slot = find_by_uid(nodes, "mysql");
     REQUIRE(slot.node);
     REQUIRE(slot.node->type() == node_type::delete_t);
     const auto& target = slot.target;
-    REQUIRE(target.from_name == qualified_name_t{"mysql", "bill", "schema", "other"});
+    REQUIRE(target.from_name == qualified_name_t{"mysql", "bill", "", "other"});
     const auto& params = parsed->otterbrix_params->params_node->parameters();
     const auto& batch = batch_targets_of(parsed, slot);
 
     auto pg = sql_gen::generate_query(slot.node, &params, backend_type_t::PostgreSQL, target, batch, resource);
     REQUIRE_FALSE(pg.has_error());
-    REQUIRE(pg.value() == "DELETE FROM \"schema\".\"orders\" USING \"schema\".\"other\" WHERE \"id\" > 0;");
+    REQUIRE(pg.value() == "DELETE FROM \"public\".\"orders\" USING \"public\".\"other\" WHERE \"id\" > 0;");
 
     // MySQL's multi-table form names the table rows are deleted from before FROM
     // and every table it reads after it.
@@ -1481,16 +1482,16 @@ TEST_CASE("generate_query: DELETE ... USING with a resolved second table per dia
 TEST_CASE("generate_query: DELETE ... USING together with LIMIT is unimplemented_yet") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     auto parsed = parse_or_die(
         parser,
-        "DELETE FROM mysql.bill.schema.orders USING mysql.bill.schema.other WHERE id > 0 LIMIT 5;");
+        "DELETE FROM mysql.bill.orders USING mysql.bill.other WHERE id > 0 LIMIT 5;");
     auto nodes = flat_externals(parsed);
     auto slot = find_by_uid(nodes, "mysql");
     REQUIRE(slot.node);
     auto target = slot.target;
-    target.from_name = qualified_name_t{"mysql", "bill", "schema", "other"};
+    target.from_name = qualified_name_t{"mysql", "bill", "", "other"};
     const auto& params = parsed->otterbrix_params->params_node->parameters();
 
     // MySQL's multi-table DELETE takes no LIMIT.
@@ -1507,27 +1508,27 @@ TEST_CASE("generate_query: DELETE ... USING together with LIMIT is unimplemented
 TEST_CASE("generate_query: UPDATE ... FROM with a resolved second table per dialect") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     // The plan keeps the FROM source as a child of the update node, and the
     // parser resolves that child into the slot's from_name — which is what
     // makes the statement one two-table UPDATE on the backend.
     auto parsed = parse_or_die(
         parser,
-        "UPDATE mysql.bill.schema.orders SET name = 'x' FROM mysql.bill.schema.other WHERE id > 0;");
+        "UPDATE mysql.bill.orders SET name = 'x' FROM mysql.bill.other WHERE id > 0;");
     auto nodes = flat_externals(parsed);
     auto slot = find_by_uid(nodes, "mysql");
     REQUIRE(slot.node);
     REQUIRE(slot.node->type() == node_type::update_t);
     const auto& target = slot.target;
-    REQUIRE(target.from_name == qualified_name_t{"mysql", "bill", "schema", "other"});
+    REQUIRE(target.from_name == qualified_name_t{"mysql", "bill", "", "other"});
     const auto& params = parsed->otterbrix_params->params_node->parameters();
     const auto& batch = batch_targets_of(parsed, slot);
 
     auto pg = sql_gen::generate_query(slot.node, &params, backend_type_t::PostgreSQL, target, batch, resource);
     REQUIRE_FALSE(pg.has_error());
     REQUIRE(pg.value() ==
-            "UPDATE \"schema\".\"orders\" SET \"name\" = 'x' FROM \"schema\".\"other\" WHERE \"id\" > 0;");
+            "UPDATE \"public\".\"orders\" SET \"name\" = 'x' FROM \"public\".\"other\" WHERE \"id\" > 0;");
 
     // MySQL's multi-table form names every table before SET, and the assigned
     // column carries the target's qualifier: a name the target does not have
@@ -1545,7 +1546,7 @@ TEST_CASE("generate_query: UPDATE ... FROM with a resolved second table per dial
 TEST_CASE("generate_query: DELETE ... USING with an unresolved source sub-plan is refused") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     // The engine keeps the USING source as a child sub-plan of the delete node.
     // The parser resolves a second name only for a PLAIN table source; a join
@@ -1554,7 +1555,7 @@ TEST_CASE("generate_query: DELETE ... USING with an unresolved source sub-plan i
     // cannot be expressed on the backend; emitting a single-table DELETE would
     // delete the wrong rows.
     auto parsed = parse_or_die(parser,
-                               "DELETE FROM mysql.bill.schema.orders USING mysql.bill.schema.other "
+                               "DELETE FROM mysql.bill.orders USING mysql.bill.other "
                                "WHERE orders.id = other.id;");
     auto nodes = flat_externals(parsed);
     flat_external_t slot;
@@ -1583,13 +1584,13 @@ TEST_CASE("generate_query: DELETE ... USING with an unresolved source sub-plan i
 TEST_CASE("generate_query: CREATE TABLE is qualified and typed per dialect") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
-    const std::string query = "CREATE TABLE mysql.bill.schema.t (id BIGINT, ok BOOLEAN);";
+    const std::string query = "CREATE TABLE mysql.bill.t (id BIGINT, ok BOOLEAN);";
     REQUIRE(sql_for(parser, query, backend_type_t::MySQL, resource) ==
             "CREATE TABLE `bill`.`t` (`id` bigint, `ok` boolean);");
     REQUIRE(sql_for(parser, query, backend_type_t::PostgreSQL, resource) ==
-            "CREATE TABLE \"schema\".\"t\" (\"id\" int8, \"ok\" boolean);");
+            "CREATE TABLE \"public\".\"t\" (\"id\" int8, \"ok\" boolean);");
     REQUIRE(sql_for(parser, query, backend_type_t::ClickHouse, resource) ==
             "CREATE TABLE `bill`.`t` (`id` Int64, `ok` Bool);");
 }
@@ -1614,11 +1615,11 @@ TEST_CASE("generate_query: CREATE TABLE column without a name is invalid_paramet
 TEST_CASE("generate_query: DROP TABLE is qualified per dialect") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
-    const std::string query = "DROP TABLE mysql.bill.schema.t;";
+    const std::string query = "DROP TABLE mysql.bill.t;";
     REQUIRE(sql_for(parser, query, backend_type_t::MySQL, resource) == "DROP TABLE `bill`.`t`;");
-    REQUIRE(sql_for(parser, query, backend_type_t::PostgreSQL, resource) == "DROP TABLE \"schema\".\"t\";");
+    REQUIRE(sql_for(parser, query, backend_type_t::PostgreSQL, resource) == "DROP TABLE \"public\".\"t\";");
     REQUIRE(sql_for(parser, query, backend_type_t::ClickHouse, resource) == "DROP TABLE `bill`.`t`;");
 }
 
@@ -1629,7 +1630,7 @@ TEST_CASE("generate_query: DROP INDEX per dialect") {
 
     node_ptr node = make_node_drop(resource, drop_target_kind::index);
     auto target = orders_target();
-    target.from_name = qualified_name_t{"mysql", "bill", "schema", "idx_orders_id"};
+    target.from_name = qualified_name_t{"mysql", "bill", "", "idx_orders_id"};
 
     auto mysql = generate_manual(node, params, backend_type_t::MySQL, resource, target);
     REQUIRE_FALSE(mysql.has_error());
@@ -1637,7 +1638,7 @@ TEST_CASE("generate_query: DROP INDEX per dialect") {
 
     auto pg = generate_manual(node, params, backend_type_t::PostgreSQL, resource, target);
     REQUIRE_FALSE(pg.has_error());
-    REQUIRE(pg.value() == "DROP INDEX \"schema\".\"idx_orders_id\";");
+    REQUIRE(pg.value() == "DROP INDEX \"public\".\"idx_orders_id\";");
 
     auto ch = generate_manual(node, params, backend_type_t::ClickHouse, resource, target);
     REQUIRE_FALSE(ch.has_error());
@@ -1663,7 +1664,7 @@ TEST_CASE("generate_query: CREATE INDEX is qualified; ClickHouse is unimplemente
 
     auto pg = generate_manual(node, params, backend_type_t::PostgreSQL, resource);
     REQUIRE_FALSE(pg.has_error());
-    REQUIRE(pg.value() == "CREATE INDEX \"idx_orders_id\" ON \"schema\".\"orders\" (\"id\");");
+    REQUIRE(pg.value() == "CREATE INDEX \"idx_orders_id\" ON \"public\".\"orders\" (\"id\");");
 
     auto ch = generate_manual(node, params, backend_type_t::ClickHouse, resource);
     REQUIRE(ch.has_error());
@@ -1689,12 +1690,12 @@ TEST_CASE("generate_query: unsupported node type and drop kind are unimplemented
 TEST_CASE("generate_query: PostgreSQL node produces schema.collection reference") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     auto parsed = parse_or_die(
         parser,
         "SELECT o.id, p.name "
-        "FROM mysql.bill.schema.orders o "
+        "FROM mysql.bill.orders o "
         "INNER JOIN pg.shop.shop.products p ON o.product_id = p.id;");
 
     auto nodes = flat_externals(parsed);
@@ -1720,7 +1721,7 @@ TEST_CASE("generate_query: PostgreSQL node produces schema.collection reference"
 TEST_CASE("generate_query: same node, different backends produce different references") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     auto parsed = parse_or_die(
         parser,
@@ -1752,11 +1753,11 @@ TEST_CASE("generate_query: same node, different backends produce different refer
 TEST_CASE("generate_query: stringstream overload produces the same output") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     auto parsed = parse_or_die(
         parser,
-        "SELECT o.id FROM mysql.bill.schema.orders o "
+        "SELECT o.id FROM mysql.bill.orders o "
         "INNER JOIN pg.shop.shop.products p ON o.id = p.id;");
 
     auto nodes = flat_externals(parsed);
@@ -1791,14 +1792,17 @@ TEST_CASE("generate_query: stringstream overload produces the same output") {
 // ── replace_qualifiers edge cases not covered in test_replace_qualifiers.cpp ──
 
 TEST_CASE("replace_qualifiers: 3-part qualifier treated as db.schema.collection (uid promoted)") {
-    // prepare_sql promotes the first segment to uid when only 3 parts are present.
+    // prepare_sql reads the first of three segments as the alias it names.
     // Scoped arena: libotterbrix_sql's parse tree allocates through this resource
     // and is never explicitly freed — get_default_resource would leak it (LSAN).
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
-    auto r = otterstax::parser::prepare_sql(
+    auto prepared = otterstax::parser::prepare_sql(
         "SELECT id FROM (SELECT id FROM mysql.bill.orders WHERE status = 'paid') o;",
+        test_aliases(),
         &arena,
         &arena);
+    REQUIRE_FALSE(prepared.has_error());
+    const auto& r = prepared.value();
 
     REQUIRE(r.stubs.size() == 1);
     auto rendered =
@@ -1812,12 +1816,15 @@ TEST_CASE("replace_qualifiers: 3-part qualifier treated as db.schema.collection 
 
 TEST_CASE("replace_qualifiers: multiple qualifiers in one stub") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
-    auto r = otterstax::parser::prepare_sql(
+    auto prepared = otterstax::parser::prepare_sql(
         "SELECT * FROM ("
-        "SELECT id FROM mysql.db.sc.t1 UNION ALL SELECT id FROM mysql.db.sc.t2"
+        "SELECT id FROM mysql.db.t1 UNION ALL SELECT id FROM mysql.db.t2"
         ") u;",
+        test_aliases(),
         &arena,
         &arena);
+    REQUIRE_FALSE(prepared.has_error());
+    const auto& r = prepared.value();
 
     REQUIRE(r.stubs.size() == 1);
     auto rendered =
@@ -1827,8 +1834,8 @@ TEST_CASE("replace_qualifiers: multiple qualifiers in one stub") {
     // Both 4-part names rewritten
     REQUIRE(out.find("`db`.`t1`") != std::string::npos);
     REQUIRE(out.find("`db`.`t2`") != std::string::npos);
-    REQUIRE(out.find("mysql.db.sc.t1") == std::string::npos);
-    REQUIRE(out.find("mysql.db.sc.t2") == std::string::npos);
+    REQUIRE(out.find("mysql.db.t1") == std::string::npos);
+    REQUIRE(out.find("mysql.db.t2") == std::string::npos);
 }
 
 // ── Characterization: whole outcomes pinned byte for byte ─────────────────────
@@ -1955,7 +1962,7 @@ void check_set_values(GreenplumParser& parser,
                       std::pmr::memory_resource* resource) {
     for (const auto& c : cases) {
         check_dialects(parser,
-                       std::string{"UPDATE mysql.bill.schema.orders SET a = "} + c.value + " WHERE id = 1;",
+                       std::string{"UPDATE mysql.bill.orders SET a = "} + c.value + " WHERE id = 1;",
                        c.expected,
                        resource);
     }
@@ -2038,7 +2045,7 @@ void check_manual_dialects(const node_ptr& node,
 // as each dialect spells it.
 dialect_outcomes_t set_a_is(const std::string& mysql, const std::string& pg, const std::string& ch) {
     return dialect_outcomes_t{sql_is("UPDATE `bill`.`orders` SET `a` = " + mysql + " WHERE `id` = 1;"),
-                              sql_is("UPDATE \"schema\".\"orders\" SET \"a\" = " + pg + " WHERE \"id\" = 1;"),
+                              sql_is("UPDATE \"public\".\"orders\" SET \"a\" = " + pg + " WHERE \"id\" = 1;"),
                               sql_is("ALTER TABLE `bill`.`orders` UPDATE `a` = " + ch + " WHERE `id` = 1;")};
 }
 
@@ -2046,7 +2053,7 @@ dialect_outcomes_t set_a_is(const std::string& mysql, const std::string& pg, con
 // the three dialects; ClickHouse spells the missing predicate as WHERE 1.
 dialect_outcomes_t manual_set_a_is(const std::string& mysql, const std::string& pg, const std::string& ch) {
     return dialect_outcomes_t{sql_is("UPDATE `bill`.`orders` SET `a` = " + mysql + ";"),
-                              sql_is("UPDATE \"schema\".\"orders\" SET \"a\" = " + pg + ";"),
+                              sql_is("UPDATE \"public\".\"orders\" SET \"a\" = " + pg + ";"),
                               sql_is("ALTER TABLE `bill`.`orders` UPDATE `a` = " + ch + " WHERE 1;")};
 }
 
@@ -2063,7 +2070,7 @@ dialect_outcomes_t generate_refuses_everywhere(core::error_code_t code, const st
 TEST_CASE("characterization: UPDATE SET constants and NULL per dialect") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     check_set_values(parser,
                      {
@@ -2082,9 +2089,9 @@ TEST_CASE("characterization: UPDATE SET constants and NULL per dialect") {
 
     check_dialects(
         parser,
-        "UPDATE mysql.bill.schema.orders SET i = 1, s = 'x', n = NULL, d = 2.5 WHERE id = 7;",
+        "UPDATE mysql.bill.orders SET i = 1, s = 'x', n = NULL, d = 2.5 WHERE id = 7;",
         {sql_is("UPDATE `bill`.`orders` SET `i` = 1, `s` = 'x', `n` = NULL, `d` = 2.5 WHERE `id` = 7;"),
-         sql_is("UPDATE \"schema\".\"orders\" SET \"i\" = 1, \"s\" = 'x', \"n\" = NULL, \"d\" = 2.5 WHERE \"id\" = 7;"),
+         sql_is("UPDATE \"public\".\"orders\" SET \"i\" = 1, \"s\" = 'x', \"n\" = NULL, \"d\" = 2.5 WHERE \"id\" = 7;"),
          sql_is("ALTER TABLE `bill`.`orders` UPDATE `i` = 1, `s` = 'x', `n` = NULL, `d` = 2.5 WHERE `id` = 7;")},
         resource);
 }
@@ -2092,9 +2099,9 @@ TEST_CASE("characterization: UPDATE SET constants and NULL per dialect") {
 TEST_CASE("characterization: UPDATE SET bound parameters per dialect") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
-    const std::string sql = "UPDATE mysql.bill.schema.orders SET note = $1, qty = $2 WHERE id = $3;";
+    const std::string sql = "UPDATE mysql.bill.orders SET note = $1, qty = $2 WHERE id = $3;";
     auto bound = [&](backend_type_t backend) {
         auto parsed = parse_or_die(parser, sql);
         auto& binder = parsed->binder();
@@ -2109,12 +2116,12 @@ TEST_CASE("characterization: UPDATE SET bound parameters per dialect") {
     CHECK(bound(backend_type_t::MySQL) ==
           sql_is("UPDATE `bill`.`orders` SET `note` = 'it''s a \\\\ path', `qty` = 5 WHERE `id` = 7;"));
     CHECK(bound(backend_type_t::PostgreSQL) ==
-          sql_is("UPDATE \"schema\".\"orders\" SET \"note\" = 'it''s a \\ path', \"qty\" = 5 WHERE \"id\" = 7;"));
+          sql_is("UPDATE \"public\".\"orders\" SET \"note\" = 'it''s a \\ path', \"qty\" = 5 WHERE \"id\" = 7;"));
     CHECK(bound(backend_type_t::ClickHouse) ==
           sql_is("ALTER TABLE `bill`.`orders` UPDATE `note` = 'it''s a \\\\ path', `qty` = 5 WHERE `id` = 7;"));
 
     auto null_bound = [&](backend_type_t backend) {
-        auto parsed = parse_or_die(parser, "UPDATE mysql.bill.schema.orders SET note = $1 WHERE id = $2;");
+        auto parsed = parse_or_die(parser, "UPDATE mysql.bill.orders SET note = $1 WHERE id = $2;");
         auto& binder = parsed->binder();
         binder.bind(1, logical_value_t{resource, logical_type::NA});
         binder.bind(2, logical_value_t{resource, std::int64_t{7}});
@@ -2125,7 +2132,7 @@ TEST_CASE("characterization: UPDATE SET bound parameters per dialect") {
     };
     CHECK(null_bound(backend_type_t::MySQL) == sql_is("UPDATE `bill`.`orders` SET `note` = NULL WHERE `id` = 7;"));
     CHECK(null_bound(backend_type_t::PostgreSQL) ==
-          sql_is("UPDATE \"schema\".\"orders\" SET \"note\" = NULL WHERE \"id\" = 7;"));
+          sql_is("UPDATE \"public\".\"orders\" SET \"note\" = NULL WHERE \"id\" = 7;"));
     CHECK(null_bound(backend_type_t::ClickHouse) ==
           sql_is("ALTER TABLE `bill`.`orders` UPDATE `note` = NULL WHERE `id` = 7;"));
 
@@ -2140,7 +2147,7 @@ TEST_CASE("characterization: UPDATE SET bound parameters per dialect") {
 TEST_CASE("characterization: UPDATE SET arithmetic with parentheses per dialect") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     check_set_values(parser,
                      {
@@ -2163,7 +2170,7 @@ TEST_CASE("characterization: UPDATE SET arithmetic with parentheses per dialect"
 TEST_CASE("characterization: UPDATE SET operators and functions written as SQL per dialect") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     const auto parse_error = core::error_code_t::sql_parse_error;
     const auto unsupported = core::error_code_t::unimplemented_yet;
@@ -2171,11 +2178,11 @@ TEST_CASE("characterization: UPDATE SET operators and functions written as SQL p
     // function, so each pair below has one outcome.
     const dialect_outcomes_t cbrt_outcome{
         generate_refuses(unsupported, "cube root is not supported by this backend"),
-        sql_is("UPDATE \"schema\".\"orders\" SET \"a\" = cbrt(\"a\") WHERE \"id\" = 1;"),
+        sql_is("UPDATE \"public\".\"orders\" SET \"a\" = cbrt(\"a\") WHERE \"id\" = 1;"),
         sql_is("ALTER TABLE `bill`.`orders` UPDATE `a` = cbrt(`a`) WHERE `id` = 1;")};
     const dialect_outcomes_t factorial_outcome{
         generate_refuses(unsupported, "factorial is not supported by this backend"),
-        sql_is("UPDATE \"schema\".\"orders\" SET \"a\" = factorial(\"a\") WHERE \"id\" = 1;"),
+        sql_is("UPDATE \"public\".\"orders\" SET \"a\" = factorial(\"a\") WHERE \"id\" = 1;"),
         generate_refuses(unsupported, "factorial is not supported by this backend")};
     check_set_values(
         parser,
@@ -2217,7 +2224,7 @@ TEST_CASE("characterization: UPDATE SET operators and functions written as SQL p
 TEST_CASE("characterization: length is pushed down as each dialect's byte-counting spelling") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     // The engine's own length counts bytes, so each dialect is given the spelling
     // that counts bytes there rather than the one that shares the name: PostgreSQL
@@ -2231,9 +2238,9 @@ TEST_CASE("characterization: length is pushed down as each dialect's byte-counti
                      resource);
 
     check_dialects(parser,
-                   "SELECT length(name) AS n FROM mysql.bill.schema.orders;",
+                   "SELECT length(name) AS n FROM mysql.bill.orders;",
                    {sql_is("SELECT OCTET_LENGTH(`name`) AS `n` FROM `bill`.`orders`;"),
-                    sql_is("SELECT OCTET_LENGTH(\"name\") AS \"n\" FROM \"schema\".\"orders\";"),
+                    sql_is("SELECT OCTET_LENGTH(\"name\") AS \"n\" FROM \"public\".\"orders\";"),
                     sql_is("SELECT length(`name`) AS `n` FROM `bill`.`orders`;")},
                    resource);
 }
@@ -2276,12 +2283,12 @@ TEST_CASE("characterization: every UPDATE SET expression kind per dialect") {
     cases.push_back({"cbrt",
                      math("cbrt"),
                      {generate_refuses(unsupported, "cube root is not supported by this backend"),
-                      sql_is("UPDATE \"schema\".\"orders\" SET \"a\" = cbrt(\"a\");"),
+                      sql_is("UPDATE \"public\".\"orders\" SET \"a\" = cbrt(\"a\");"),
                       sql_is("ALTER TABLE `bill`.`orders` UPDATE `a` = cbrt(`a`) WHERE 1;")}});
     cases.push_back({"factorial",
                      math("factorial"),
                      {generate_refuses(unsupported, "factorial is not supported by this backend"),
-                      sql_is("UPDATE \"schema\".\"orders\" SET \"a\" = factorial(\"a\");"),
+                      sql_is("UPDATE \"public\".\"orders\" SET \"a\" = factorial(\"a\");"),
                       generate_refuses(unsupported, "factorial is not supported by this backend")}});
     cases.push_back({"abs", math("abs"), manual_set_a_is("ABS(`a`)", "ABS(\"a\")", "abs(`a`)")});
     cases.push_back(
@@ -2350,19 +2357,19 @@ TEST_CASE("characterization: every UPDATE SET expression kind per dialect") {
 TEST_CASE("characterization: UPDATE ... FROM through the parser per dialect") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     // Records the outcome of the whole chain. The parser resolves the FROM
     // source — a plain table — into the slot's from_name, so a source on the
     // target's own backend is pushed down as ONE two-table statement; only
     // ClickHouse, whose mutation names a single table, refuses it.
     check_dialects(parser,
-                   "UPDATE mysql.bill.schema.orders SET name = 'x' FROM mysql.bill.schema.other "
+                   "UPDATE mysql.bill.orders SET name = 'x' FROM mysql.bill.other "
                    "WHERE orders.id = other.id;",
                    {sql_is("UPDATE `bill`.`orders`, `bill`.`other` SET `bill`.`orders`.`name` = 'x' "
                            "WHERE `bill`.`orders`.`id` = `bill`.`other`.`id`;"),
-                    sql_is("UPDATE \"schema\".\"orders\" SET \"name\" = 'x' FROM \"schema\".\"other\" "
-                           "WHERE \"schema\".\"orders\".\"id\" = \"schema\".\"other\".\"id\";"),
+                    sql_is("UPDATE \"public\".\"orders\" SET \"name\" = 'x' FROM \"public\".\"other\" "
+                           "WHERE \"public\".\"orders\".\"id\" = \"public\".\"other\".\"id\";"),
                     generate_refuses(core::error_code_t::unimplemented_yet,
                                      "a second table is not supported for ClickHouse on UPDATE")},
                    resource);
@@ -2370,7 +2377,7 @@ TEST_CASE("characterization: UPDATE ... FROM through the parser per dialect") {
     // which the backend does not have, so the engine has to join it. ClickHouse
     // refuses on the second table before the backend of the source is looked at.
     check_dialects(parser,
-                   "UPDATE mysql.bill.schema.orders SET name = 'x' FROM other WHERE orders.id = other.id;",
+                   "UPDATE mysql.bill.orders SET name = 'x' FROM other WHERE orders.id = other.id;",
                    {generate_refuses(core::error_code_t::unimplemented_yet,
                                      "the FROM / USING source is not on the same backend as the target of UPDATE"),
                     generate_refuses(core::error_code_t::unimplemented_yet,
@@ -2383,18 +2390,18 @@ TEST_CASE("characterization: UPDATE ... FROM through the parser per dialect") {
 TEST_CASE("characterization: DELETE ... USING through the parser per dialect") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     // Records the outcome of the whole chain. The parser resolves the USING
     // source — a plain table — into the slot's from_name, so a source on the
     // target's own backend is pushed down as ONE two-table statement; only
     // ClickHouse, whose mutation names a single table, refuses it.
     check_dialects(parser,
-                   "DELETE FROM mysql.bill.schema.orders USING mysql.bill.schema.other WHERE orders.id = other.id;",
+                   "DELETE FROM mysql.bill.orders USING mysql.bill.other WHERE orders.id = other.id;",
                    {sql_is("DELETE `bill`.`orders` FROM `bill`.`orders`, `bill`.`other` "
                            "WHERE `bill`.`orders`.`id` = `bill`.`other`.`id`;"),
-                    sql_is("DELETE FROM \"schema\".\"orders\" USING \"schema\".\"other\" "
-                           "WHERE \"schema\".\"orders\".\"id\" = \"schema\".\"other\".\"id\";"),
+                    sql_is("DELETE FROM \"public\".\"orders\" USING \"public\".\"other\" "
+                           "WHERE \"public\".\"orders\".\"id\" = \"public\".\"other\".\"id\";"),
                     generate_refuses(core::error_code_t::unimplemented_yet,
                                      "a second table is not supported for ClickHouse on DELETE")},
                    resource);
@@ -2402,7 +2409,7 @@ TEST_CASE("characterization: DELETE ... USING through the parser per dialect") {
     // which the backend does not have, so the engine has to join it. ClickHouse
     // refuses on the second table before the backend of the source is looked at.
     check_dialects(parser,
-                   "DELETE FROM mysql.bill.schema.orders USING other WHERE orders.id = other.id;",
+                   "DELETE FROM mysql.bill.orders USING other WHERE orders.id = other.id;",
                    {generate_refuses(core::error_code_t::unimplemented_yet,
                                      "the FROM / USING source is not on the same backend as the target of DELETE"),
                     generate_refuses(core::error_code_t::unimplemented_yet,
@@ -2415,12 +2422,12 @@ TEST_CASE("characterization: DELETE ... USING through the parser per dialect") {
 TEST_CASE("characterization: UPDATE ... FROM pushed down with the source resolved") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     auto parsed = parse_or_die(parser,
-                               "UPDATE mysql.bill.schema.orders SET name = other.name "
-                               "FROM mysql.bill.schema.other WHERE orders.id = other.id;");
-    const qualified_name_t same_backend{"mysql", "bill", "schema", "other"};
+                               "UPDATE mysql.bill.orders SET name = other.name "
+                               "FROM mysql.bill.other WHERE orders.id = other.id;");
+    const qualified_name_t same_backend{"mysql", "bill", "", "other"};
 
     // PostgreSQL names the source in FROM, MySQL in the multi-table form; both
     // take the join condition from WHERE, exactly as the plan does (the engine
@@ -2429,8 +2436,8 @@ TEST_CASE("characterization: UPDATE ... FROM pushed down with the source resolve
     // target: on MySQL an unqualified name the target does not have would resolve
     // against the source table and the statement would write there.
     CHECK(outcome_with_source(parsed, same_backend, backend_type_t::PostgreSQL, resource) ==
-          sql_is("UPDATE \"schema\".\"orders\" SET \"name\" = \"schema\".\"other\".\"name\" "
-                 "FROM \"schema\".\"other\" WHERE \"schema\".\"orders\".\"id\" = \"schema\".\"other\".\"id\";"));
+          sql_is("UPDATE \"public\".\"orders\" SET \"name\" = \"public\".\"other\".\"name\" "
+                 "FROM \"public\".\"other\" WHERE \"public\".\"orders\".\"id\" = \"public\".\"other\".\"id\";"));
     CHECK(outcome_with_source(parsed, same_backend, backend_type_t::MySQL, resource) ==
           sql_is("UPDATE `bill`.`orders`, `bill`.`other` SET `bill`.`orders`.`name` = `bill`.`other`.`name` "
                  "WHERE `bill`.`orders`.`id` = `bill`.`other`.`id`;"));
@@ -2453,14 +2460,14 @@ TEST_CASE("characterization: UPDATE ... FROM pushed down with the source resolve
           cross_backend);
     // The resolved name must be the table the plan actually reads.
     CHECK(outcome_with_source(parsed,
-                              qualified_name_t{"mysql", "bill", "schema", "elsewhere"},
+                              qualified_name_t{"mysql", "bill", "", "elsewhere"},
                               backend_type_t::MySQL,
                               resource) ==
           generate_refuses(core::error_code_t::invalid_parameter,
                            "the resolved FROM / USING table is not the table the plan reads on UPDATE"));
     // Target and source being one table needs aliases, which are not generated.
     CHECK(outcome_with_source(parsed,
-                              qualified_name_t{"mysql", "bill", "schema", "orders"},
+                              qualified_name_t{"mysql", "bill", "", "orders"},
                               backend_type_t::MySQL,
                               resource) ==
           generate_refuses(core::error_code_t::unimplemented_yet,
@@ -2470,19 +2477,19 @@ TEST_CASE("characterization: UPDATE ... FROM pushed down with the source resolve
 TEST_CASE("characterization: DELETE ... USING pushed down with the source resolved") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     auto parsed = parse_or_die(parser,
-                               "DELETE FROM mysql.bill.schema.orders USING mysql.bill.schema.other "
+                               "DELETE FROM mysql.bill.orders USING mysql.bill.other "
                                "WHERE orders.id = other.id;");
-    const qualified_name_t same_backend{"mysql", "bill", "schema", "other"};
+    const qualified_name_t same_backend{"mysql", "bill", "", "other"};
 
     // PostgreSQL's USING, and MySQL's multi-table DELETE, which names the table
     // rows are deleted from before FROM and every table it reads after it; both
     // take the join condition from WHERE.
     CHECK(outcome_with_source(parsed, same_backend, backend_type_t::PostgreSQL, resource) ==
-          sql_is("DELETE FROM \"schema\".\"orders\" USING \"schema\".\"other\" "
-                 "WHERE \"schema\".\"orders\".\"id\" = \"schema\".\"other\".\"id\";"));
+          sql_is("DELETE FROM \"public\".\"orders\" USING \"public\".\"other\" "
+                 "WHERE \"public\".\"orders\".\"id\" = \"public\".\"other\".\"id\";"));
     CHECK(outcome_with_source(parsed, same_backend, backend_type_t::MySQL, resource) ==
           sql_is("DELETE `bill`.`orders` FROM `bill`.`orders`, `bill`.`other` "
                  "WHERE `bill`.`orders`.`id` = `bill`.`other`.`id`;"));
@@ -2500,26 +2507,26 @@ TEST_CASE("characterization: DELETE ... USING pushed down with the source resolv
 TEST_CASE("characterization: DROP INDEX and CREATE INDEX through the parser per dialect") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     const auto ch_refusal =
         generate_refuses(core::error_code_t::unimplemented_yet, "CREATE INDEX is not supported for ClickHouse");
     check_dialects(parser,
-                   "DROP INDEX mysql.bill.schema.orders.idx_orders_id;",
+                   "DROP INDEX mysql.bill.orders.idx_orders_id;",
                    {sql_is("DROP INDEX `idx_orders_id` ON `bill`.`orders`;"),
-                    sql_is("DROP INDEX \"schema\".\"idx_orders_id\";"),
+                    sql_is("DROP INDEX \"public\".\"idx_orders_id\";"),
                     sql_is("ALTER TABLE `bill`.`orders` DROP INDEX `idx_orders_id`;")},
                    resource);
     check_dialects(parser,
-                   "CREATE INDEX idx_orders_id ON mysql.bill.schema.orders (id);",
+                   "CREATE INDEX idx_orders_id ON mysql.bill.orders (id);",
                    {sql_is("CREATE INDEX `idx_orders_id` ON `bill`.`orders` (`id`);"),
-                    sql_is("CREATE INDEX \"idx_orders_id\" ON \"schema\".\"orders\" (\"id\");"),
+                    sql_is("CREATE INDEX \"idx_orders_id\" ON \"public\".\"orders\" (\"id\");"),
                     ch_refusal},
                    resource);
     check_dialects(parser,
-                   "CREATE INDEX idx_orders_id_name ON mysql.bill.schema.orders (id, name);",
+                   "CREATE INDEX idx_orders_id_name ON mysql.bill.orders (id, name);",
                    {sql_is("CREATE INDEX `idx_orders_id_name` ON `bill`.`orders` (`id`, `name`);"),
-                    sql_is("CREATE INDEX \"idx_orders_id_name\" ON \"schema\".\"orders\" (\"id\", \"name\");"),
+                    sql_is("CREATE INDEX \"idx_orders_id_name\" ON \"public\".\"orders\" (\"id\", \"name\");"),
                     ch_refusal},
                    resource);
 }
@@ -2527,42 +2534,42 @@ TEST_CASE("characterization: DROP INDEX and CREATE INDEX through the parser per 
 TEST_CASE("characterization: constant WHERE predicates per dialect") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     check_dialects(parser,
-                   "SELECT * FROM mysql.bill.schema.orders WHERE true;",
+                   "SELECT * FROM mysql.bill.orders WHERE true;",
                    {sql_is("SELECT * FROM `bill`.`orders`;"),
-                    sql_is("SELECT * FROM \"schema\".\"orders\";"),
+                    sql_is("SELECT * FROM \"public\".\"orders\";"),
                     sql_is("SELECT * FROM `bill`.`orders`;")},
                    resource);
     check_dialects(parser,
-                   "SELECT * FROM mysql.bill.schema.orders WHERE false;",
+                   "SELECT * FROM mysql.bill.orders WHERE false;",
                    {sql_is("SELECT * FROM `bill`.`orders` WHERE FALSE;"),
-                    sql_is("SELECT * FROM \"schema\".\"orders\" WHERE FALSE;"),
+                    sql_is("SELECT * FROM \"public\".\"orders\" WHERE FALSE;"),
                     sql_is("SELECT * FROM `bill`.`orders` WHERE FALSE;")},
                    resource);
     check_dialects(parser,
-                   "SELECT * FROM mysql.bill.schema.orders WHERE 1 = 0;",
+                   "SELECT * FROM mysql.bill.orders WHERE 1 = 0;",
                    {sql_is("SELECT * FROM `bill`.`orders` WHERE 1 = 0;"),
-                    sql_is("SELECT * FROM \"schema\".\"orders\" WHERE 1 = 0;"),
+                    sql_is("SELECT * FROM \"public\".\"orders\" WHERE 1 = 0;"),
                     sql_is("SELECT * FROM `bill`.`orders` WHERE 1 = 0;")},
                    resource);
     check_dialects(parser,
-                   "DELETE FROM mysql.bill.schema.orders WHERE true;",
+                   "DELETE FROM mysql.bill.orders WHERE true;",
                    {sql_is("DELETE FROM `bill`.`orders`;"),
-                    sql_is("DELETE FROM \"schema\".\"orders\";"),
+                    sql_is("DELETE FROM \"public\".\"orders\";"),
                     sql_is("DELETE FROM `bill`.`orders` WHERE 1;")},
                    resource);
     check_dialects(parser,
-                   "DELETE FROM mysql.bill.schema.orders WHERE false;",
+                   "DELETE FROM mysql.bill.orders WHERE false;",
                    {sql_is("DELETE FROM `bill`.`orders` WHERE FALSE;"),
-                    sql_is("DELETE FROM \"schema\".\"orders\" WHERE FALSE;"),
+                    sql_is("DELETE FROM \"public\".\"orders\" WHERE FALSE;"),
                     sql_is("DELETE FROM `bill`.`orders` WHERE FALSE;")},
                    resource);
     check_dialects(parser,
-                   "UPDATE mysql.bill.schema.orders SET a = 1 WHERE false;",
+                   "UPDATE mysql.bill.orders SET a = 1 WHERE false;",
                    {sql_is("UPDATE `bill`.`orders` SET `a` = 1 WHERE FALSE;"),
-                    sql_is("UPDATE \"schema\".\"orders\" SET \"a\" = 1 WHERE FALSE;"),
+                    sql_is("UPDATE \"public\".\"orders\" SET \"a\" = 1 WHERE FALSE;"),
                     sql_is("ALTER TABLE `bill`.`orders` UPDATE `a` = 1 WHERE FALSE;")},
                    resource);
 }
@@ -2570,11 +2577,11 @@ TEST_CASE("characterization: constant WHERE predicates per dialect") {
 TEST_CASE("characterization: CREATE TABLE and CREATE INDEX on an alias route to one external slot") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     const std::string sql = GENERATE(Catch::Generators::as<std::string>{},
-                                     "CREATE TABLE mysql.bill.schema.t (id BIGINT, qty BIGINT);",
-                                     "CREATE INDEX idx_orders_id ON mysql.bill.schema.orders (id);");
+                                     "CREATE TABLE mysql.bill.t (id BIGINT, qty BIGINT);",
+                                     "CREATE INDEX idx_orders_id ON mysql.bill.orders (id);");
     CAPTURE(sql);
     auto parsed = parse_or_die(parser, sql);
     auto nodes = flat_externals(parsed);
@@ -2582,5 +2589,5 @@ TEST_CASE("characterization: CREATE TABLE and CREATE INDEX on an alias route to 
     REQUIRE(nodes.size() == 1);
     REQUIRE(nodes[0].target.name.unique_identifier == "mysql");
     REQUIRE(nodes[0].target.name.database == "bill");
-    REQUIRE(nodes[0].target.name.schema == "schema");
+    REQUIRE(nodes[0].target.name.schema.empty());
 }

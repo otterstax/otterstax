@@ -20,68 +20,72 @@
 // spdlog::shutdown() is registered via atexit to avoid a race between the
 // spdlog background-flush thread and static destructors at process exit.
 namespace {
-struct LoggerInit {
-    LoggerInit() {
-        initialize_all_loggers("/tmp/bench_logs");
-        spdlog::set_level(spdlog::level::off);
-        std::atexit([] { spdlog::shutdown(); });
-    }
-};
-static const LoggerInit logger_init;
+    struct LoggerInit {
+        LoggerInit() {
+            initialize_all_loggers("/tmp/bench_logs");
+            spdlog::set_level(spdlog::level::off);
+            std::atexit([] { spdlog::shutdown(); });
+        }
+    };
+    static const LoggerInit logger_init;
 } // namespace
 
 // GreenplumParser is stateless between parse() calls, so one instance is
 // constructed once and reused across all iterations of a benchmark.
 
 namespace {
+    const otterstax::names::alias_registry_t& bench_aliases() {
+        static const auto aliases = [] {
+            otterstax::names::alias_registry_t registry;
+            registry.add("mysql", {backend_type_t::MySQL, "bill", ""});
+            registry.add("pg", {backend_type_t::PostgreSQL, "shop", "shop"});
+            registry.add("ch", {backend_type_t::ClickHouse, "ev", ""});
+            return registry;
+        }();
+        return aliases;
+    }
 
-const char* kSimpleSelect = "SELECT id, name, status FROM orders WHERE status = 'active'";
+    const char* kSimpleSelect = "SELECT id, name, status FROM orders WHERE status = 'active'";
 
-const char* kJoin3Table =
-    "SELECT o.id, p.name, c.email "
-    "FROM mysql.bill.schema.orders o "
-    "INNER JOIN mysql.bill.schema.products p ON o.product_id = p.id "
-    "INNER JOIN mysql.bill.schema.customers c ON o.customer_id = c.id";
+    const char* kJoin3Table = "SELECT o.id, p.name, c.email "
+                              "FROM mysql.bill.orders o "
+                              "INNER JOIN mysql.bill.products p ON o.product_id = p.id "
+                              "INNER JOIN mysql.bill.customers c ON o.customer_id = c.id";
 
-const char* kCrossBackend =
-    "SELECT o.id, p.name "
-    "FROM mysql.bill.schema.orders o "
-    "INNER JOIN pg.shop.shop.products p ON o.product_id = p.id";
+    const char* kCrossBackend = "SELECT o.id, p.name "
+                                "FROM mysql.bill.orders o "
+                                "INNER JOIN pg.shop.shop.products p ON o.product_id = p.id";
 
-const char* kSubquery =
-    "SELECT category, total "
-    "FROM (SELECT category, SUM(amount) AS total "
-    "      FROM mysql.bill.schema.transactions "
-    "      GROUP BY category) sub "
-    "WHERE total > 1000";
+    const char* kSubquery = "SELECT category, total "
+                            "FROM (SELECT category, SUM(amount) AS total "
+                            "      FROM mysql.bill.transactions "
+                            "      GROUP BY category) sub "
+                            "WHERE total > 1000";
 
-// Mirrors the complex_select end-to-end benchmark: GROUP BY + HAVING + ORDER BY + LIMIT.
-const char* kComplexSelect =
-    "SELECT campaign_id, COUNT(*) AS impressions, SUM(cost) AS total_cost "
-    "FROM mysql.bill.schema.impressions "
-    "WHERE status = 'active' "
-    "GROUP BY campaign_id "
-    "HAVING COUNT(*) > 100 "
-    "ORDER BY total_cost DESC "
-    "LIMIT 1000";
+    // Mirrors the complex_select end-to-end benchmark: GROUP BY + HAVING + ORDER BY + LIMIT.
+    const char* kComplexSelect = "SELECT campaign_id, COUNT(*) AS impressions, SUM(cost) AS total_cost "
+                                 "FROM mysql.bill.impressions "
+                                 "WHERE status = 'active' "
+                                 "GROUP BY campaign_id "
+                                 "HAVING COUNT(*) > 100 "
+                                 "ORDER BY total_cost DESC "
+                                 "LIMIT 1000";
 
-// Three-backend cross-engine join: MySQL × PostgreSQL × ClickHouse.
-// Produces three stubs in prepare_sql — the worst-case qualifier-rewriting path.
-const char* kThreeBackendJoin =
-    "SELECT o.id, p.name, e.session_id "
-    "FROM mysql.bill.schema.orders o "
-    "INNER JOIN pg.shop.shop.products p ON o.product_id = p.id "
-    "INNER JOIN ch.ev.schema.events e ON o.campaign_id = e.campaign_id "
-    "WHERE o.status = 'active' "
-    "LIMIT 500";
-
+    // Three-backend cross-engine join: MySQL × PostgreSQL × ClickHouse.
+    // Produces three stubs in prepare_sql — the worst-case qualifier-rewriting path.
+    const char* kThreeBackendJoin = "SELECT o.id, p.name, e.session_id "
+                                    "FROM mysql.bill.orders o "
+                                    "INNER JOIN pg.shop.shop.products p ON o.product_id = p.id "
+                                    "INNER JOIN ch.ev.events e ON o.campaign_id = e.campaign_id "
+                                    "WHERE o.status = 'active' "
+                                    "LIMIT 500";
 } // namespace
 
 // ── GreenplumParser::parse() ─────────────────────────────────────────────────
 
 static void BM_parse_simple_select(benchmark::State& state) {
     std::pmr::unsynchronized_pool_resource pool;
-    GreenplumParser parser(&pool);
+    GreenplumParser parser(&pool, bench_aliases());
     for (auto _ : state) {
         auto r = parser.parse(kSimpleSelect);
         benchmark::DoNotOptimize(r);
@@ -91,7 +95,7 @@ BENCHMARK(BM_parse_simple_select);
 
 static void BM_parse_join_3table(benchmark::State& state) {
     std::pmr::unsynchronized_pool_resource pool;
-    GreenplumParser parser(&pool);
+    GreenplumParser parser(&pool, bench_aliases());
     for (auto _ : state) {
         auto r = parser.parse(kJoin3Table);
         benchmark::DoNotOptimize(r);
@@ -101,7 +105,7 @@ BENCHMARK(BM_parse_join_3table);
 
 static void BM_parse_cross_backend(benchmark::State& state) {
     std::pmr::unsynchronized_pool_resource pool;
-    GreenplumParser parser(&pool);
+    GreenplumParser parser(&pool, bench_aliases());
     for (auto _ : state) {
         auto r = parser.parse(kCrossBackend);
         benchmark::DoNotOptimize(r);
@@ -111,7 +115,7 @@ BENCHMARK(BM_parse_cross_backend);
 
 static void BM_parse_subquery(benchmark::State& state) {
     std::pmr::unsynchronized_pool_resource pool;
-    GreenplumParser parser(&pool);
+    GreenplumParser parser(&pool, bench_aliases());
     for (auto _ : state) {
         auto r = parser.parse(kSubquery);
         benchmark::DoNotOptimize(r);
@@ -121,7 +125,7 @@ BENCHMARK(BM_parse_subquery);
 
 static void BM_parse_complex_select(benchmark::State& state) {
     std::pmr::unsynchronized_pool_resource pool;
-    GreenplumParser parser(&pool);
+    GreenplumParser parser(&pool, bench_aliases());
     for (auto _ : state) {
         auto r = parser.parse(kComplexSelect);
         benchmark::DoNotOptimize(r);
@@ -131,7 +135,7 @@ BENCHMARK(BM_parse_complex_select);
 
 static void BM_parse_three_backend_join(benchmark::State& state) {
     std::pmr::unsynchronized_pool_resource pool;
-    GreenplumParser parser(&pool);
+    GreenplumParser parser(&pool, bench_aliases());
     for (auto _ : state) {
         auto r = parser.parse(kThreeBackendJoin);
         benchmark::DoNotOptimize(r);
@@ -144,7 +148,7 @@ BENCHMARK(BM_parse_three_backend_join);
 static void BM_prepare_sql_simple(benchmark::State& state) {
     std::pmr::unsynchronized_pool_resource pool;
     for (auto _ : state) {
-        auto r = otterstax::parser::prepare_sql(kSimpleSelect, &pool, &pool);
+        auto r = otterstax::parser::prepare_sql(kSimpleSelect, bench_aliases(), &pool, &pool);
         benchmark::DoNotOptimize(r);
     }
 }
@@ -155,7 +159,7 @@ BENCHMARK(BM_prepare_sql_simple);
 static void BM_prepare_sql_cross_backend(benchmark::State& state) {
     std::pmr::unsynchronized_pool_resource pool;
     for (auto _ : state) {
-        auto r = otterstax::parser::prepare_sql(kCrossBackend, &pool, &pool);
+        auto r = otterstax::parser::prepare_sql(kCrossBackend, bench_aliases(), &pool, &pool);
         benchmark::DoNotOptimize(r);
     }
 }
@@ -164,7 +168,7 @@ BENCHMARK(BM_prepare_sql_cross_backend);
 static void BM_prepare_sql_subquery(benchmark::State& state) {
     std::pmr::unsynchronized_pool_resource pool;
     for (auto _ : state) {
-        auto r = otterstax::parser::prepare_sql(kSubquery, &pool, &pool);
+        auto r = otterstax::parser::prepare_sql(kSubquery, bench_aliases(), &pool, &pool);
         benchmark::DoNotOptimize(r);
     }
 }
@@ -173,7 +177,7 @@ BENCHMARK(BM_prepare_sql_subquery);
 static void BM_prepare_sql_complex_select(benchmark::State& state) {
     std::pmr::unsynchronized_pool_resource pool;
     for (auto _ : state) {
-        auto r = otterstax::parser::prepare_sql(kComplexSelect, &pool, &pool);
+        auto r = otterstax::parser::prepare_sql(kComplexSelect, bench_aliases(), &pool, &pool);
         benchmark::DoNotOptimize(r);
     }
 }
@@ -183,7 +187,7 @@ BENCHMARK(BM_prepare_sql_complex_select);
 static void BM_prepare_sql_three_backend(benchmark::State& state) {
     std::pmr::unsynchronized_pool_resource pool;
     for (auto _ : state) {
-        auto r = otterstax::parser::prepare_sql(kThreeBackendJoin, &pool, &pool);
+        auto r = otterstax::parser::prepare_sql(kThreeBackendJoin, bench_aliases(), &pool, &pool);
         benchmark::DoNotOptimize(r);
     }
 }

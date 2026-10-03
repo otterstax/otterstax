@@ -28,7 +28,7 @@ def make_config(local: bool):
         'mysql_port': 8816,
         'user': 'testuser',
         'password': 'testpass',
-        'mysql_db': 'campaigns.db1.schema',
+        'mysql_db': 'campaigns.db1',
     }
 
 

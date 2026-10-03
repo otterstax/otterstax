@@ -94,13 +94,15 @@ namespace frontend::spark {
 
 #pragma GCC diagnostic pop
 
-    core::result_wrapper_t<sql_statement_t> classify_sql(const std::string& sql, std::pmr::memory_resource* resource) {
+    core::result_wrapper_t<sql_statement_t> classify_sql(const std::string& sql,
+                                                         std::pmr::memory_resource* resource,
+                                                         const otterstax::names::alias_registry_t& aliases) {
         OTX_ZONE_N("spark::classify_sql");
         // The engine's raw parser sits behind GreenplumParser::parse; as in
         // Worker::parse_sql, the catch is confined to this one call and turns
         // whatever it throws into sql_parse_error.
         try {
-            GreenplumParser parser(resource);
+            GreenplumParser parser(resource, aliases);
             auto parsed = parser.parse(sql);
             if (parsed.has_error()) {
                 return parsed.convert_error<sql_statement_t>();
@@ -173,7 +175,7 @@ namespace frontend::spark {
                 if (sql_command.has_input() && !sql_command.input().has_sql()) {
                     refusal = grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
                                            "spark.sql() over DataFrame arguments is not supported");
-                } else if (auto kind = classify_sql(sql_command_text(sql_command), resource_); kind.has_error()) {
+                } else if (auto kind = classify_sql(sql_command_text(sql_command), resource_, aliases_); kind.has_error()) {
                     refusal = grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, kind.error().what.c_str());
                 } else if (kind.value() == sql_statement_t::query) {
                     answer = answer_t::sql_query;
@@ -211,7 +213,7 @@ namespace frontend::spark {
                             .second);
                 } else if (!is_empty_local_relation(show.input())) {
                     show_input = show_string_input_plan(show);
-                    auto plan_result = relation_to_plan(show_input, resource_);
+                    auto plan_result = relation_to_plan(show_input, resource_, aliases_);
                     if (plan_result.has_error()) {
                         answer = answer_t::refused;
                         refusal = grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, plan_result.error().what.c_str());
@@ -225,7 +227,7 @@ namespace frontend::spark {
                 }
             } else {
                 // Path B: DataFrame -> Otterbrix logical plan.
-                auto plan_result = relation_to_plan(plan, resource_);
+                auto plan_result = relation_to_plan(plan, resource_, aliases_);
                 if (plan_result.has_error()) {
                     refusal = grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, plan_result.error().what.c_str());
                 } else {

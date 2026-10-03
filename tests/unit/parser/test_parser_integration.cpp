@@ -2,6 +2,7 @@
 // Copyright 2025-2026  OtterStax
 
 #include "otterbrix/parser/name_resolution.hpp"
+#include "test_aliases.hpp"
 #include "otterbrix/parser/parser.hpp"
 #include "otterbrix/parser/subquery_extractor.hpp"
 #include "otterbrix/schema/schema_utils.hpp"
@@ -66,11 +67,11 @@ TEST_CASE("integration: 4-part qualifier in cross-source JOIN") {
     // would leak it (LSAN).
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     auto parsed = parse_or_die(
         parser,
-        "SELECT * FROM mysql.bill.schema.orders o INNER JOIN pg.shop.shop.products p ON o.product_id = p.id;");
+        "SELECT * FROM mysql.bill.orders o INNER JOIN pg.shop.shop.products p ON o.product_id = p.id;");
 
     auto nodes = external_nodes_flat(parsed);
     REQUIRE(nodes.size() == 2);
@@ -95,7 +96,7 @@ TEST_CASE("integration: 4-part qualifier untouched") {
     // would leak it (LSAN).
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     auto parsed =
         parse_or_die(parser,
@@ -119,7 +120,7 @@ TEST_CASE("integration: no external_node") {
     // would leak it (LSAN).
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     auto parsed = parse_or_die(parser, "SELECT id FROM demo_warehouses;");
     REQUIRE(parsed->otterbrix_params->external_nodes_count == 0);
@@ -135,7 +136,7 @@ TEST_CASE("integration: no external_node") {
 TEST_CASE("integration: DROP DATABASE is local — no external nodes") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     auto parsed = parse_or_die(parser, "DROP DATABASE db1;");
     REQUIRE(parsed->otterbrix_params->external_nodes_count == 0);
@@ -144,7 +145,7 @@ TEST_CASE("integration: DROP DATABASE is local — no external nodes") {
 TEST_CASE("integration: DROP DATABASE rejects an alias qualifier") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     // The engine grammar spells the target as `database_name: ColId` — a single
     // identifier — so an alias-qualified DROP DATABASE cannot parse. This is what
@@ -156,7 +157,7 @@ TEST_CASE("integration: DROP DATABASE rejects an alias qualifier") {
 TEST_CASE("integration: DROP TABLE keeps its alias-qualified external node") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     // A collection-kind DROP with an alias qualifier routes to its backend.
     auto parsed = parse_or_die(parser, "DROP TABLE conn1.db1.public.t;");
@@ -169,7 +170,7 @@ TEST_CASE("integration: DROP TABLE keeps its alias-qualified external node") {
 TEST_CASE("integration: DROP INDEX with an alias resolves the table and the index") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     // The leading parts name the indexed table, the trailing part the index; the
     // external slot carries the table as `name` and the index as `from_name`,
@@ -197,7 +198,7 @@ TEST_CASE("integration: DROP INDEX with an alias resolves the table and the inde
 TEST_CASE("integration: UPDATE ... FROM resolves its source into the DML slot") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     auto parsed = parse_or_die(
         parser,
@@ -218,7 +219,7 @@ TEST_CASE("integration: UPDATE ... FROM resolves its source into the DML slot") 
 TEST_CASE("integration: DELETE ... USING resolves its source into the DML slot") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     auto parsed = parse_or_die(
         parser,
@@ -239,7 +240,7 @@ TEST_CASE("integration: DELETE ... USING resolves its source into the DML slot")
 TEST_CASE("integration: UPDATE ... FROM a local table resolves to a uid-less source") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     auto parsed =
         parse_or_die(parser, "UPDATE conn1.db1.public.orders SET name = 'x' FROM other WHERE orders.id = other.id;");
@@ -258,7 +259,7 @@ TEST_CASE("integration: UPDATE ... FROM a local table resolves to a uid-less sou
 TEST_CASE("integration: DELETE ... USING a subquery source keeps the source as its own slot") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     auto parsed = parse_or_die(parser,
                                "DELETE FROM conn1.db1.public.orders USING "
@@ -275,7 +276,7 @@ TEST_CASE("integration: DELETE ... USING a subquery source keeps the source as i
 TEST_CASE("integration: DROP TABLE without an alias is local and closes the batch") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     // Control for the local-kind cases below: a mutable local DROP produces no
     // external node but still opens a fresh batch, which survives as a single
@@ -289,7 +290,7 @@ TEST_CASE("integration: DROP TABLE without an alias is local and closes the batc
 TEST_CASE("integration: DROP VIEW / SEQUENCE / TYPE / FUNCTION are local and not mutable") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     const std::string sql = GENERATE(Catch::Generators::as<std::string>{},
                                      "DROP VIEW v;",
@@ -308,7 +309,7 @@ TEST_CASE("integration: DROP VIEW / SEQUENCE / TYPE / FUNCTION are local and not
 TEST_CASE("integration: DROP of several objects in one statement is rejected") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     // The transformer lowers only the first object; accepting the list would
     // silently leave the rest in place.
@@ -322,7 +323,7 @@ TEST_CASE("integration: DROP of several objects in one statement is rejected") {
 TEST_CASE("integration: several statements in one query are rejected") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     // parse() builds exactly one plan; a trailing statement must fail loudly
     // rather than vanish.
@@ -339,7 +340,7 @@ TEST_CASE("integration: several statements in one query are rejected") {
 TEST_CASE("integration: EXPLAIN SELECT is rejected") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     auto result = parser.parse("EXPLAIN SELECT id FROM orders;");
     REQUIRE(result.has_error());
@@ -349,7 +350,7 @@ TEST_CASE("integration: EXPLAIN SELECT is rejected") {
 TEST_CASE("integration: EXPLAIN DELETE is rejected, not executed") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     auto result = parser.parse("EXPLAIN DELETE FROM orders WHERE id = 1;");
     REQUIRE(result.has_error());
@@ -361,7 +362,7 @@ TEST_CASE("integration: EXPLAIN DELETE is rejected, not executed") {
 TEST_CASE("integration: SAVEPOINT / ROLLBACK TO / RELEASE are refused") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     const std::string sql = GENERATE(Catch::Generators::as<std::string>{},
                                      "SAVEPOINT sp1;",
@@ -380,7 +381,7 @@ TEST_CASE("integration: SAVEPOINT / ROLLBACK TO / RELEASE are refused") {
 TEST_CASE("integration: BEGIN / COMMIT / ROLLBACK parse") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     // Control for the refusal above: plain transaction control is lowered.
     const std::string sql = GENERATE(Catch::Generators::as<std::string>{}, "BEGIN;", "COMMIT;", "ROLLBACK;");
@@ -408,7 +409,7 @@ TEST_CASE("integration: a failed extension registration fails every parse()") {
     // silently missing.
     components::sql::parser::parser_extension_registry_t seed;
     REQUIRE_FALSE(seed.add(components::sql::parser::parser_extension_t{"s3", &claim_nothing}).has_error());
-    GreenplumParser parser(resource, std::move(seed));
+    GreenplumParser parser(resource, test_aliases(), std::move(seed));
 
     auto result = parser.parse("SELECT id FROM orders;");
     REQUIRE(result.has_error());
@@ -421,11 +422,11 @@ TEST_CASE("integration: derived table into schema_node") {
     // would leak it (LSAN).
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     auto parsed = parse_or_die(parser,
                                "SELECT p.category, COUNT(*) FROM ("
-                               "SELECT product_id FROM mysql.bill.schema.orders WHERE ts >= '2026-04-18'"
+                               "SELECT product_id FROM mysql.bill.orders WHERE ts >= '2026-04-18'"
                                ") o INNER JOIN pg.shop.shop.products p ON p.id = o.product_id "
                                "GROUP BY p.category;");
 
@@ -439,7 +440,7 @@ TEST_CASE("integration: derived table into schema_node") {
 
     REQUIRE(is_schema_node_with_raw_sql(mysql_stub.node));
     const auto& raw = static_cast<const schema_utils::schema_node_t&>(*mysql_stub.node).raw_sql();
-    REQUIRE(raw.find("FROM mysql.bill.schema.orders") != std::string::npos);
+    REQUIRE(raw.find("FROM mysql.bill.orders") != std::string::npos);
     REQUIRE(raw.find("ts >= '2026-04-18'") != std::string::npos);
     REQUIRE_FALSE(static_cast<const schema_utils::schema_node_t&>(*mysql_stub.node).qualifiers().empty());
 
@@ -456,7 +457,7 @@ TEST_CASE("integration: qualified + local untouched") {
     // would leak it (LSAN).
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     auto parsed = parse_or_die(parser,
                                "SELECT c.name FROM pg.shop.shop.customers c "
@@ -478,14 +479,14 @@ TEST_CASE("integration: cross-source subqueries") {
     // would leak it (LSAN).
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource);
+    GreenplumParser parser(resource, test_aliases());
 
     auto parsed =
         parse_or_die(parser,
                      "SELECT c.name FROM pg.shop.shop.customers c "
-                     "INNER JOIN (SELECT user_id FROM ch.ev.schema.sessions WHERE ts >= '2026-04-12') s "
+                     "INNER JOIN (SELECT user_id FROM ch.ev.sessions WHERE ts >= '2026-04-12') s "
                      "  ON s.user_id = c.id "
-                     "INNER JOIN (SELECT customer_id FROM mysql.bill.schema.orders WHERE ts >= '2026-04-12') o "
+                     "INNER JOIN (SELECT customer_id FROM mysql.bill.orders WHERE ts >= '2026-04-12') o "
                      "  ON o.customer_id = c.id;");
 
     auto nodes = external_nodes_flat(parsed);
@@ -505,6 +506,6 @@ TEST_CASE("integration: cross-source subqueries") {
 
     const auto& ch_raw = static_cast<const schema_utils::schema_node_t&>(*ch_stub.node).raw_sql();
     const auto& mysql_raw = static_cast<const schema_utils::schema_node_t&>(*mysql_stub.node).raw_sql();
-    REQUIRE(ch_raw.find("FROM ch.ev.schema.sessions") != std::string::npos);
-    REQUIRE(mysql_raw.find("FROM mysql.bill.schema.orders") != std::string::npos);
+    REQUIRE(ch_raw.find("FROM ch.ev.sessions") != std::string::npos);
+    REQUIRE(mysql_raw.find("FROM mysql.bill.orders") != std::string::npos);
 }

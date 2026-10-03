@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstring>
 #include <regex>
 #include <set>
 #include <string>
@@ -104,13 +105,10 @@ namespace otterstax::parser {
             return (rv->uid && rv->uid[0] != '\0') ? std::string_view{rv->uid} : std::string_view{};
         }
 
-        // Generic RangeVar walk shared by collect_qualifiers_in_subtree and
-        // collect_qualified_names. DropStmt names are NOT RangeVars (string
-        // lists) — they are handled by register_drop_stmt_names.
-        //
-        // NOTE: promote_three_part_qualifiers keeps its own select-only walk
-        // on purpose — promoting 3-part DML relations (`db.schema.tbl`) to
-        // `uid=db` would misclassify plain DML targets as federated.
+        // Generic RangeVar walk shared by canonicalize_names,
+        // collect_qualifiers_in_subtree and collect_qualified_names. DropStmt
+        // names are NOT RangeVars (string lists) — they are handled by
+        // register_drop_stmt_names.
         template<typename F>
         void for_each_range_var(Node* node, F&& fn) {
             if (!node) {
@@ -238,6 +236,16 @@ namespace otterstax::parser {
         };
 
         const char* cstr_or_empty(const char* s) { return (s && s[0] != '\0') ? s : ""; }
+
+        char* arena_c_str(std::pmr::memory_resource* arena, std::string_view text) {
+            if (text.empty()) {
+                return nullptr;
+            }
+            auto* copy = static_cast<char*>(arena->allocate(text.size() + 1, alignof(char)));
+            std::memcpy(copy, text.data(), text.size());
+            copy[text.size()] = '\0';
+            return copy;
+        }
 
         void collect_qualifiers_in_subtree(Node* node,
                                            std::string_view sql,
@@ -378,53 +386,35 @@ namespace otterstax::parser {
         }
     } // namespace
 
-    void promote_three_part_qualifiers(::Node* node) {
-        if (!node) {
-            return;
-        }
-        switch (nodeTag(node)) {
-            case T_SelectStmt: {
-                auto* stmt = reinterpret_cast<SelectStmt*>(node);
-                if (stmt->fromClause) {
-                    for (auto& cell : stmt->fromClause->lst) {
-                        promote_three_part_qualifiers(reinterpret_cast<::Node*>(cell.data));
-                    }
-                }
-                if (stmt->larg) {
-                    promote_three_part_qualifiers(reinterpret_cast<::Node*>(stmt->larg));
-                }
-                if (stmt->rarg) {
-                    promote_three_part_qualifiers(reinterpret_cast<::Node*>(stmt->rarg));
-                }
-                break;
+    core::error_t canonicalize_names(std::pmr::memory_resource* arena,
+                                     std::pmr::memory_resource* resource,
+                                     const otterstax::names::alias_registry_t& aliases,
+                                     ::Node* root) {
+        OTX_ZONE_N("parser::canonicalize_names");
+        core::error_t refused = core::error_t::no_error();
+        for_each_range_var(root, [&](RangeVar* rv) {
+            if (refused.contains_error() || !rv->relname || rv->relname[0] == '\0') {
+                return;
             }
-            case T_JoinExpr: {
-                auto* j = reinterpret_cast<JoinExpr*>(node);
-                promote_three_part_qualifiers(reinterpret_cast<::Node*>(j->larg));
-                promote_three_part_qualifiers(reinterpret_cast<::Node*>(j->rarg));
-                break;
+            auto canonical = otterstax::names::canonical_table_name(resource,
+                                                                    aliases,
+                                                                    qualified_name_t(cstr_or_empty(rv->uid),
+                                                                                     cstr_or_empty(rv->catalogname),
+                                                                                     cstr_or_empty(rv->schemaname),
+                                                                                     cstr_or_empty(rv->relname)));
+            if (canonical.has_error()) {
+                refused = core::error_t{canonical.error().type, std::pmr::string{canonical.error().what, resource}};
+                return;
             }
-            case T_RangeSubselect: {
-                auto* rs = reinterpret_cast<RangeSubselect*>(node);
-                promote_three_part_qualifiers(reinterpret_cast<::Node*>(rs->subquery));
-                break;
+            const auto& name = canonical.value();
+            if (name.unique_identifier.empty()) {
+                return;
             }
-            case T_RangeVar: {
-                auto* rv = reinterpret_cast<RangeVar*>(node);
-                const bool has_uid = rv->uid && rv->uid[0] != '\0';
-                const bool has_catalog = rv->catalogname && rv->catalogname[0] != '\0';
-                const bool has_schema = rv->schemaname && rv->schemaname[0] != '\0';
-                const bool has_rel = rv->relname && rv->relname[0] != '\0';
-                if (!has_uid && has_catalog && has_schema && has_rel) {
-                    // 3-part `<a>.<b>.<c>` → uid=a, catalog=b, schema=b (dup), rel=c.
-                    rv->uid = rv->catalogname;
-                    rv->catalogname = rv->schemaname;
-                }
-                break;
-            }
-            default:
-                break;
-        }
+            rv->uid = arena_c_str(arena, name.unique_identifier);
+            rv->catalogname = arena_c_str(arena, name.database);
+            rv->schemaname = arena_c_str(arena, name.schema);
+        });
+        return refused;
     }
 
     namespace {
@@ -437,15 +427,16 @@ namespace otterstax::parser {
         // single object is registered. removeTypes other than TABLE/INDEX
         // transform into drop kinds never classified external, so they need
         // no registry entries.
-        void register_drop_stmt_names(std::pmr::memory_resource* resource,
-                                      DropStmt* stmt,
-                                      otterstax::names::name_registry_t& out) {
+        core::error_t register_drop_stmt_names(std::pmr::memory_resource* resource,
+                                               const otterstax::names::alias_registry_t& aliases,
+                                               DropStmt* stmt,
+                                               otterstax::names::name_registry_t& out) {
             if (!stmt || !stmt->objects || stmt->objects->lst.empty()) {
-                return;
+                return core::error_t::no_error();
             }
             auto* name_list = reinterpret_cast<List*>(stmt->objects->lst.front().data);
             if (!name_list) {
-                return;
+                return core::error_t::no_error();
             }
             // Pointers into the raw parse tree; qualified_name_t copies them.
             std::pmr::vector<const char*> parts{resource};
@@ -453,66 +444,92 @@ namespace otterstax::parser {
                 const char* s = strVal(cell.data);
                 parts.emplace_back(s ? s : "");
             }
+            // The table the DROP names, read against the aliases like any
+            // RangeVar, under the (dbname, relname) transform_drop stamps for
+            // this arity — a three-segment federated name keeps the alias as
+            // its dbname there. A DROP INDEX registers its index beside it:
+            // the wrapping sequence resolves the table first and the index
+            // second, and each lookup must recover the full name (the uid in
+            // particular).
+            auto register_target = [&](const qualified_name_t& written,
+                                       const char* key_db,
+                                       const char* key_rel,
+                                       const char* index) -> core::error_t {
+                auto canonical = otterstax::names::canonical_table_name(resource, aliases, written);
+                if (canonical.has_error()) {
+                    return core::error_t{canonical.error().type, std::pmr::string{canonical.error().what, resource}};
+                }
+                if (index != nullptr) {
+                    auto index_name = canonical.value();
+                    index_name.collection = index;
+                    out.add(key_db, index, std::move(index_name));
+                }
+                out.add(key_db, key_rel, std::move(canonical.value()));
+                return core::error_t::no_error();
+            };
             switch (stmt->removeType) {
                 case OBJECT_TABLE:
                     // rel | db.rel | db.schema.rel | uid.db.schema.rel
                     switch (parts.size()) {
                         case 1:
-                            out.add(qualified_name_t("", "", "", parts[0]));
-                            break;
+                            return register_target(qualified_name_t("", "", "", parts[0]), "", parts[0], nullptr);
                         case 2:
-                            out.add(qualified_name_t("", parts[0], "", parts[1]));
-                            break;
+                            return register_target(qualified_name_t("", parts[0], "", parts[1]),
+                                                   parts[0],
+                                                   parts[1],
+                                                   nullptr);
                         case 3:
-                            out.add(qualified_name_t("", parts[0], parts[1], parts[2]));
-                            break;
+                            return register_target(qualified_name_t("", parts[0], parts[1], parts[2]),
+                                                   parts[0],
+                                                   parts[2],
+                                                   nullptr);
                         case 4:
-                            out.add(qualified_name_t(parts[0], parts[1], parts[2], parts[3]));
-                            break;
+                            return register_target(qualified_name_t(parts[0], parts[1], parts[2], parts[3]),
+                                                   parts[1],
+                                                   parts[3],
+                                                   nullptr);
                         default:
                             // transform_drop rejects other arities with a
                             // parse error before resolution runs.
-                            break;
+                            return core::error_t::no_error();
                     }
-                    break;
                 case OBJECT_INDEX:
                     // Trailing part is the index name; the leading parts are
                     // the parent table: db.rel.idx | db.schema.rel.idx |
                     // uid.db.schema.rel.idx (transform_drop has no 1-part
-                    // table form for indexes). Both the table AND the index
-                    // get entries: the wrapping sequence resolves the table
-                    // first and the index second, and each lookup must recover
-                    // the full name (the uid in particular).
+                    // table form for indexes).
                     switch (parts.size()) {
                         case 3:
-                            out.add(qualified_name_t("", parts[0], "", parts[1]));
-                            out.add(qualified_name_t("", parts[0], "", parts[2]));
-                            break;
+                            return register_target(qualified_name_t("", parts[0], "", parts[1]),
+                                                   parts[0],
+                                                   parts[1],
+                                                   parts[2]);
                         case 4:
-                            out.add(qualified_name_t("", parts[0], parts[1], parts[2]));
-                            out.add(qualified_name_t("", parts[0], parts[1], parts[3]));
-                            break;
+                            return register_target(qualified_name_t("", parts[0], parts[1], parts[2]),
+                                                   parts[0],
+                                                   parts[2],
+                                                   parts[3]);
                         case 5:
-                            out.add(qualified_name_t(parts[0], parts[1], parts[2], parts[3]));
-                            out.add(qualified_name_t(parts[0], parts[1], parts[2], parts[4]));
-                            break;
+                            return register_target(qualified_name_t(parts[0], parts[1], parts[2], parts[3]),
+                                                   parts[1],
+                                                   parts[3],
+                                                   parts[4]);
                         default:
-                            break;
+                            return core::error_t::no_error();
                     }
-                    break;
                 default:
-                    break;
+                    return core::error_t::no_error();
             }
         }
     } // namespace
 
-    void collect_qualified_names(std::pmr::memory_resource* resource,
-                                 ::Node* root,
-                                 otterstax::names::name_registry_t& out) {
+    core::error_t collect_qualified_names(std::pmr::memory_resource* resource,
+                                          const otterstax::names::alias_registry_t& aliases,
+                                          ::Node* root,
+                                          otterstax::names::name_registry_t& out) {
         OTX_ZONE_N("parser::collect_qualified_names");
         if (root && nodeTag(root) == T_DropStmt) {
-            register_drop_stmt_names(resource, reinterpret_cast<DropStmt*>(root), out);
-            return;
+            return register_drop_stmt_names(resource, aliases, reinterpret_cast<DropStmt*>(root), out);
         }
         for_each_range_var(root, [&out](RangeVar* rv) {
             if (!rv->relname || rv->relname[0] == '\0') {
@@ -526,37 +543,44 @@ namespace otterstax::parser {
                                      cstr_or_empty(rv->schemaname),
                                      cstr_or_empty(rv->relname)));
         });
+        return core::error_t::no_error();
     }
 
-    extraction_result_t prepare_sql(std::string_view sql,
-                                    std::pmr::memory_resource* arena,
-                                    std::pmr::memory_resource* resource,
-                                    ::Node** out_root_if_unmodified) {
+    core::result_wrapper_t<extraction_result_t> prepare_sql(std::string_view sql,
+                                                            const otterstax::names::alias_registry_t& aliases,
+                                                            std::pmr::memory_resource* arena,
+                                                            std::pmr::memory_resource* resource,
+                                                            ::Node** out_root_if_unmodified) {
         OTX_ZONE_N("parser::prepare_sql");
         if (out_root_if_unmodified) {
             *out_root_if_unmodified = nullptr;
         }
+        auto unmodified = [&] {
+            return extraction_result_t{std::pmr::string{sql, resource}, std::pmr::vector<subquery_stub_t>{resource}};
+        };
 
         ::List* raw = nullptr;
         try {
             raw = raw_parser(arena, std::pmr::string{sql, resource}.c_str());
         } catch (...) {
-            return {std::pmr::string{sql, resource}, std::pmr::vector<subquery_stub_t>{resource}};
+            return unmodified();
         }
 
         // Extraction only makes sense for exactly one statement: linitial on
         // an empty list is undefined behaviour, and a multi-statement input is
         // left untouched for parse() to reject.
         if (!raw || list_length(raw) != 1) {
-            return {std::pmr::string{sql, resource}, std::pmr::vector<subquery_stub_t>{resource}};
+            return unmodified();
         }
 
         auto* root = reinterpret_cast<Node*>(linitial(raw));
         if (!root) {
-            return {std::pmr::string{sql, resource}, std::pmr::vector<subquery_stub_t>{resource}};
+            return unmodified();
         }
 
-        promote_three_part_qualifiers(root);
+        if (auto refused = canonicalize_names(arena, resource, aliases, root); refused.contains_error()) {
+            return refused;
+        }
         std::pmr::vector<subquery_location_t> subs{resource};
         collect_subqueries(root, sql, subs);
         subs.erase(std::remove_if(subs.begin(), subs.end(), [](const auto& s) { return s.source_uid.empty(); }),
@@ -569,7 +593,7 @@ namespace otterstax::parser {
         if (out_root_if_unmodified) {
             *out_root_if_unmodified = root;
         }
-        return {std::pmr::string{sql, resource}, std::pmr::vector<subquery_stub_t>{resource}};
+        return unmodified();
     }
 
 } // namespace otterstax::parser

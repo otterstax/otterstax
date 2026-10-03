@@ -18,6 +18,25 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `backend_type_t` enum is defined here because it must be visible to both the parser and all downstream actors.
 
+`GreenplumParser(resource, aliases)` reads every table name against the configured
+connections — `otterstax::names::alias_registry_t` (`parser/alias_registry.hpp`),
+held by reference; there is no constructor without one. The rule lives in one
+function, `canonical_table_name`: three segments `a.b.c` are federated only behind
+a registered alias (schema = the connection's for PostgreSQL, none for MySQL /
+ClickHouse), a local reference names no schema, a slot the connection pins must
+match — refused otherwise. `parse()` runs it as a pass over the raw tree before the
+engine transformer (`canonicalize_names`, `parser/subquery_extractor.cpp`: every
+`RangeVar` of FROM, JOIN, derived tables, DML targets and sources, CREATE TABLE /
+INDEX — not a CTE body, not a subquery inside an expression), records every full
+name by `(db, rel)` for the write and DDL targets whose plan nodes carry no uid
+(`collect_qualified_names` → `name_registry_t`), and after the transformer names
+each external node: a read leaf by `federated_name(uid, db, rel)`, a write or DDL
+target through the registry. The Spark translator calls the same
+`canonical_table_name`. Only the main plan of the transformer is kept
+(`binder.node_ptr()`): a subquery the transformer lowers into
+`execution_plan_t::sub_queries` never reaches the engine (root `CLAUDE.md`, Known
+Constraints).
+
 `parser/grammar_extention/` — pluggable parser extensions registered with the
 core parser registry. Two ship by default: `s3/` and `file/`, both adding the
 `CREATE EXTERNAL TABLE` and `COPY (...) TO ...` syntax. Each extension is a flex

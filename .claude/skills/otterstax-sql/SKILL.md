@@ -72,11 +72,15 @@ otterbrix engine. Some features only survive the engine path.
 | Form | Pattern |
 |---|---|
 | 3-part | `<alias>.<db>.<tbl>` |
-| 4-part | `<alias>.<db>.<schema>.<tbl>` |
+| 4-part | `<alias>.<db>.<schema>.<tbl>` — PostgreSQL only, the schema must be the connection's |
 
 `<alias>` = a connection declared under `connections:` in `config.yaml`. The
-parser promotes 3-part to its 4-part shape, then emits backend-native qualifiers
-(`db.tbl` for MySQL/CH, `schema.tbl` for PG).
+parser reads 3-part as federated only when the first part is a configured alias
+(PostgreSQL takes the schema from the connection; MySQL/ClickHouse have none, so a
+4-part name on them is refused), rewrites it to the 4-part shape, then emits
+backend-native qualifiers (`db.tbl` for MySQL/CH, `schema.tbl` for PG). A 3-part
+name without an alias is a local `db.schema.tbl` and refused — local tables have no
+schema. `<alias>.<tbl>` is refused too.
 
 ### SELECT / read
 

@@ -46,8 +46,8 @@ namespace {
     // `workers_[id % N]`, so the counter is per-worker and deterministic.
     class throwing_on_second_parser final : public IParser {
     public:
-        explicit throwing_on_second_parser(std::pmr::memory_resource* resource)
-            : inner_(make_parser(resource)) {}
+        throwing_on_second_parser(std::pmr::memory_resource* resource, const otterstax::names::alias_registry_t& aliases)
+            : inner_(make_parser(resource, aliases)) {}
 
         core::result_wrapper_t<ParsedQueryDataPtr> parse(const std::string& sql) override {
             if (++calls_ == 2) {
@@ -61,8 +61,9 @@ namespace {
         int calls_{0};
     };
 
-    parser_ptr make_second_call_throwing_parser(std::pmr::memory_resource* resource) {
-        return std::make_unique<throwing_on_second_parser>(resource);
+    parser_ptr make_second_call_throwing_parser(std::pmr::memory_resource* resource,
+                                                const otterstax::names::alias_registry_t& aliases) {
+        return std::make_unique<throwing_on_second_parser>(resource, aliases);
     }
 
     // Deliberately outside the std::exception hierarchy: a catch clause written
@@ -74,7 +75,7 @@ namespace {
         core::result_wrapper_t<ParsedQueryDataPtr> parse(const std::string&) override { throw not_an_exception{}; }
     };
 
-    parser_ptr make_non_std_throwing_parser(std::pmr::memory_resource*) {
+    parser_ptr make_non_std_throwing_parser(std::pmr::memory_resource*, const otterstax::names::alias_registry_t&) {
         return std::make_unique<throwing_non_std_parser>();
     }
 

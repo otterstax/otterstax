@@ -15,6 +15,7 @@
 #include "test_helpers.hpp"
 #include "types/otterbrix.hpp"
 
+#include "../mock/aliases.hpp"
 #include "../mock/mock_config.hpp"
 #include "../mock/otterbrix.hpp"
 #include "../mock/parser.hpp"
@@ -124,7 +125,7 @@ namespace {
             , otterbrix_manager(actor_zeta::spawn<db::OtterbrixManager>(
                   res,
                   std::make_unique<SimpleMockOtterbrixManager>(mock_config{.resource = res})))
-            , catalog_manager(actor_zeta::spawn<mysql::CatalogManager>(res, otterbrix_manager->address()))
+            , catalog_manager(actor_zeta::spawn<mysql::CatalogManager>(res, otterbrix_manager->address(), no_aliases()))
             , connector_manager(std::make_unique<ch::ConnectorManager>(res, catalog_manager->address(), factory, 2))
             , manager(actor_zeta::spawn<db::ClickhouseManager>(res, connector_manager.get())) {
             catalog_manager->set_backend_managers(actor_zeta::address_t::empty_address(),

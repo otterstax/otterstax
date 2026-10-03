@@ -71,7 +71,7 @@ def test_cross_backend_join_schema(host='0.0.0.0', mysql_port=8816):
         SELECT p.product_id, p.product_name, p.price, p.category,
                c.campaign_id, c.campaign_name, c.campaign_length, c.budget
         FROM products.pgdb.public.products p
-        JOIN campaigns.db1.schema.campaigns c ON p.campaign_id = c.campaign_id
+        JOIN campaigns.db1.campaigns c ON p.campaign_id = c.campaign_id
         LIMIT 10
     """
     
@@ -128,7 +128,7 @@ def test_cross_backend_join_schema(host='0.0.0.0', mysql_port=8816):
     
     query = """
         SELECT c.campaign_name, COUNT(p.product_id) as product_count, AVG(p.price) as avg_price
-        FROM campaigns.db1.schema.campaigns c
+        FROM campaigns.db1.campaigns c
         JOIN products.pgdb.public.products p ON c.campaign_id = p.campaign_id
         GROUP BY c.campaign_name
         ORDER BY product_count DESC
@@ -175,7 +175,7 @@ def test_cross_backend_join_schema(host='0.0.0.0', mysql_port=8816):
     query = """
         SELECT p.product_id, p.product_name, c.campaign_name, c.budget
         FROM products.pgdb.public.products p
-        JOIN campaigns.db1.schema.campaigns c ON p.campaign_id = c.campaign_id
+        JOIN campaigns.db1.campaigns c ON p.campaign_id = c.campaign_id
         WHERE p.price > 100 AND c.budget > 80000
         ORDER BY p.price DESC
         LIMIT 5
@@ -227,7 +227,7 @@ def test_cross_backend_join_schema(host='0.0.0.0', mysql_port=8816):
         print(f"\n✓ PostgreSQL products table: {pg_count} rows")
         
         # Check MySQL table
-        cursor.execute("SELECT COUNT(*) FROM campaigns.db1.schema.campaigns")
+        cursor.execute("SELECT COUNT(*) FROM campaigns.db1.campaigns")
         mysql_count = cursor.fetchone()[0]
         print(f"✓ MySQL campaigns table: {mysql_count} rows")
         
@@ -235,7 +235,7 @@ def test_cross_backend_join_schema(host='0.0.0.0', mysql_port=8816):
         cursor.execute("""
             SELECT COUNT(DISTINCT p.campaign_id)
             FROM products.pgdb.public.products p
-            JOIN campaigns.db1.schema.campaigns c ON p.campaign_id = c.campaign_id
+            JOIN campaigns.db1.campaigns c ON p.campaign_id = c.campaign_id
         """)
         matching_count = cursor.fetchone()[0]
         print(f"✓ Products with matching campaigns: {matching_count}")

@@ -31,6 +31,7 @@
 using otterstax::test::await_session;
 using otterstax::test::execute_scheduler_statement;
 using otterstax::test::init_fresh_test_otterbrix;
+using otterstax::test::init_test_otterbrix;
 using otterstax::test::make_az_scheduler;
 using otterstax::test::prepare_scheduler_sql;
 using otterstax::test::run_scheduler_sql_payload;
@@ -42,7 +43,21 @@ namespace {
     // The uid is deliberately mixed-case: the mirror database is created with
     // this exact spelling, while an unquoted `DROP DATABASE shopdb` reaches the
     // Worker lower-cased. Only a case-insensitive match protects both forms.
-    constexpr const char* kUid = "ShopDb";
+    constexpr const char* kUid = "shopdb";
+    // A configured connection whose backend is down: it never registers.
+    constexpr const char* kOfflineUid = "offline";
+    const otterstax::names::alias_registry_t& shop_aliases() {
+        static const auto aliases = make_aliases({
+            {kUid, backend_type_t::MySQL, "db"},
+            {kOfflineUid, backend_type_t::MySQL, "db"},
+        });
+        return aliases;
+    }
+    // The connection the restarted engine registers over the user's database.
+    const otterstax::names::alias_registry_t& legacy_aliases() {
+        static const auto aliases = make_aliases({{"legacy", backend_type_t::MySQL, "db"}});
+        return aliases;
+    }
     constexpr const char* kReprepare = "prepared statement must be re-prepared";
 
     using otterstax::test::wait_until_ready;
@@ -61,7 +76,7 @@ namespace {
             , resource_(otterbrix_->dispatcher()->resource())
             , az_scheduler_(make_az_scheduler())
             , otb_mgr_(actor_zeta::spawn<db::OtterbrixManager>(resource_, make_otterbrix_manager(otterbrix_)))
-            , catalog_(actor_zeta::spawn<mysql::CatalogManager>(resource_, otb_mgr_->address()))
+            , catalog_(actor_zeta::spawn<mysql::CatalogManager>(resource_, otb_mgr_->address(), shop_aliases()))
             , mysql_conn_(std::make_unique<mysql::ConnectorManager>(resource_,
                                                                     catalog_->address(),
                                                                     &mysql_mock_connector_factory,
@@ -122,6 +137,7 @@ namespace {
                                                 az_scheduler_.get(),
                                                 worker_pool_size(),
                                                 &make_parser,
+                                                shop_aliases(),
                                                 mysql_mgr_->address(),
                                                 actor_zeta::address_t::empty_address(), // pg
                                                 actor_zeta::address_t::empty_address(), // ch
@@ -151,6 +167,11 @@ namespace {
                 "database '" + dbname + "' is owned by connection '" + owner + "'");
     }
 
+    void require_ok(const core::result_wrapper_t<session_payload>& r) {
+        INFO(r.error().what.c_str());
+        REQUIRE_FALSE(r.has_error());
+    }
+
 } // namespace
 
 TEST_CASE("database ownership: DROP DATABASE <uid> is refused and the mirror survives") {
@@ -162,10 +183,11 @@ TEST_CASE("database ownership: DROP DATABASE <uid> is refused and the mirror sur
         require_owned_by(run_scheduler_sql_payload(s, id++, "DROP DATABASE shopdb;"), "shopdb", kUid);
     }
     SECTION("quoted identifier in the uid's own spelling") {
-        require_owned_by(run_scheduler_sql_payload(s, id++, "DROP DATABASE \"ShopDb\";"), kUid, kUid);
+        require_owned_by(run_scheduler_sql_payload(s, id++, "DROP DATABASE \"shopdb\";"), kUid, kUid);
     }
-    SECTION("quoted identifier in another case") {
-        require_owned_by(run_scheduler_sql_payload(s, id++, "DROP DATABASE \"SHOPDB\";"), "SHOPDB", kUid);
+    SECTION("quoted identifier in another case is another database") {
+        require_ok(run_scheduler_sql_payload(s, id++, "CREATE DATABASE \"SHOPDB\";"));
+        require_ok(run_scheduler_sql_payload(s, id++, "DROP DATABASE \"SHOPDB\";"));
     }
 
     REQUIRE(owner.engine_create_uid_database() == core::error_code_t::database_already_exists);
@@ -178,8 +200,11 @@ TEST_CASE("database ownership: CREATE DATABASE <uid> is refused") {
     session_hash_t id = 9420;
 
     require_owned_by(run_scheduler_sql_payload(s, id++, "CREATE DATABASE shopdb;"), "shopdb", kUid);
-    require_owned_by(run_scheduler_sql_payload(s, id++, "CREATE DATABASE \"ShopDb\";"), kUid, kUid);
+    require_owned_by(run_scheduler_sql_payload(s, id++, "CREATE DATABASE \"shopdb\";"), kUid, kUid);
     require_owned_by(run_scheduler_sql_payload(s, id++, "CREATE DATABASE IF NOT EXISTS shopdb;"), "shopdb", kUid);
+    // A configured alias owns its name before its connection registers: a
+    // database made while the backend is down would block its mirror later.
+    require_owned_by(run_scheduler_sql_payload(s, id++, "CREATE DATABASE offline;"), kOfflineUid, kOfflineUid);
 
     REQUIRE(owner.engine_create_uid_database() == core::error_code_t::database_already_exists);
 }
@@ -192,7 +217,8 @@ TEST_CASE("database ownership: the kafka object database is refused without a Ka
 
     require_owned_by(run_scheduler_sql_payload(s, id++, "DROP DATABASE " + kafka + ";"), kafka, kafka);
     require_owned_by(run_scheduler_sql_payload(s, id++, "CREATE DATABASE " + kafka + ";"), kafka, kafka);
-    require_owned_by(run_scheduler_sql_payload(s, id++, "DROP DATABASE \"KAFKA\";"), "KAFKA", kafka);
+    require_ok(run_scheduler_sql_payload(s, id++, "CREATE DATABASE \"KAFKA\";"));
+    require_ok(run_scheduler_sql_payload(s, id++, "DROP DATABASE \"KAFKA\";"));
 }
 
 TEST_CASE("database ownership: the prepared path is guarded at prepare time") {
@@ -235,5 +261,45 @@ TEST_CASE("database ownership: a user database passes the guard on both paths") 
     // The guard itself is a pure lookup: a free name is free before and after.
     REQUIRE_FALSE(owner.catalog_verdict("userdb").contains_error());
     REQUIRE(owner.catalog_verdict("shopdb").contains_error());
-    REQUIRE(owner.catalog_verdict("SHOPDB").contains_error());
+    REQUIRE_FALSE(owner.catalog_verdict("SHOPDB").contains_error());
+}
+
+TEST_CASE("database ownership: a user database of the alias name is not adopted as its mirror on restart") {
+    const std::string data_dir = "/tmp/test_db_owner_adopt_local";
+    std::filesystem::remove_all(data_dir);
+    const auto run = [](const db::otterbrix_engine_ptr& engine, const std::string& sql) {
+        session_id sid;
+        auto cur = engine->dispatcher()->execute_sql(sid, sql);
+        REQUIRE(cur);
+        INFO(sql << ": " << (cur->is_error() ? cur->get_error().what.c_str() : "ok"));
+        REQUIRE_FALSE(cur->is_error());
+        return cur;
+    };
+    {
+        auto engine = init_test_otterbrix(data_dir);
+        run(engine, "CREATE DATABASE legacy;");
+        run(engine, "CREATE TABLE legacy.t (id INT);");
+        run(engine, "INSERT INTO legacy.t (id) VALUES (7);");
+    }
+    {
+        auto engine = init_test_otterbrix(data_dir);
+        auto* resource = engine->dispatcher()->resource();
+        auto otb_mgr = actor_zeta::spawn<db::OtterbrixManager>(resource, make_otterbrix_manager(engine));
+        auto catalog = actor_zeta::spawn<mysql::CatalogManager>(resource, otb_mgr->address(), legacy_aliases());
+        auto conn =
+            std::make_unique<mysql::ConnectorManager>(resource, catalog->address(), &mysql_mock_connector_factory, 1);
+        auto mgr = actor_zeta::spawn<db::MySQLManager>(resource, conn.get());
+        catalog->set_backend_managers(mgr->address(),
+                                      actor_zeta::address_t::empty_address(),
+                                      actor_zeta::address_t::empty_address());
+
+        boost::mysql::connect_params params;
+        params.database = "db";
+        auto added = conn->addConnection(params, "legacy");
+
+        CHECK(run(engine, "SELECT id FROM legacy.t;")->size() == 1);
+        REQUIRE(added.has_error());
+        CHECK(added.error().type == core::error_code_t::database_already_exists);
+    }
+    std::filesystem::remove_all(data_dir);
 }

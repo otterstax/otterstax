@@ -22,7 +22,8 @@ namespace frontend::spark {
     };
 
     core::result_wrapper_t<TranslationResult> relation_to_plan(const ::spark::connect::Plan& plan,
-                                                               std::pmr::memory_resource* resource);
+                                                               std::pmr::memory_resource* resource,
+                                                               const otterstax::names::alias_registry_t& aliases);
 
     bool contains_window(const ::spark::connect::Relation& rel);
 

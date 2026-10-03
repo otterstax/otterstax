@@ -25,6 +25,7 @@ set(${PROJECT_NAME}_SOURCES
     test_restart_reconciliation.cpp
     test_flightsql_schema_contract.cpp
     test_single_backend_prepare_schema.cpp
+    test_name_canonicalization.cpp
     test_otterbrix_manager.cpp
     test_s3_errors.cpp
     test_component_manager_lifecycle.cpp

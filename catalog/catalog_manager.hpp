@@ -7,6 +7,7 @@
 
 #include "catalog/discovery.hpp"
 #include "catalog/schema_store.hpp"
+#include "otterbrix/parser/alias_registry.hpp"
 #include "otterbrix/parser/parser.hpp"
 #include "otterbrix/query_generation/sql_query_generator.hpp"
 #include "otterbrix/schema/schema_utils.hpp"
@@ -62,8 +63,12 @@ namespace mysql {
 
         // `otterbrix_manager` is the address of db::OtterbrixManager — the
         // registration channel through which external table schemas are
-        // mirrored into the engine pg_catalog.
-        CatalogManager(std::pmr::memory_resource* res, actor_zeta::address_t otterbrix_manager);
+        // mirrored into the engine pg_catalog. `aliases` are the configured
+        // connections, read-only after startup; the owner of the catalog keeps
+        // them alive.
+        CatalogManager(std::pmr::memory_resource* res,
+                       actor_zeta::address_t otterbrix_manager,
+                       const otterstax::names::alias_registry_t& aliases);
 
         // The three backend integration actors (db::MySQLManager,
         // db::PostgressManager, db::ClickhouseManager). Each one is the sole
@@ -93,16 +98,16 @@ namespace mysql {
                                                                        catalog_ext::ConnectionType type);
 
         // Guard for database-level DDL: the engine database named after a
-        // registered connection uid holds that connection's mirrored tables,
+        // configured connection alias holds that connection's mirrored tables,
         // and the kafka object database belongs to the KafkaManager. A user
         // CREATE DATABASE / DROP DATABASE on such a name would desynchronise
-        // the mirror (dead OIDs in the store; a user database taken for the
-        // mirror on the next start, which reuses a database of the uid's
-        // name), so the Worker asks here before the statement reaches the
-        // engine.
-        // Matching is case-insensitive: an unquoted identifier reaches the
-        // engine lower-cased while the mirror database keeps the uid's exact
-        // spelling. Answers invalid_parameter for an owned name.
+        // the mirror or take the alias's name, so the Worker asks here before
+        // the statement reaches the engine. Every configured alias owns its
+        // name, its backend reachable or not: a database created while the
+        // backend is down would block the mirror once it comes up.
+        // Matching is case-insensitive: a configured alias is lower-case, and a
+        // quoted spelling of it is refused too. Answers invalid_parameter for an
+        // owned name.
         actor_zeta::unique_future<core::error_t> check_database_ownership(std::string dbname);
 
         // The FlightSQL GetTables listing travels back as a value through the
@@ -136,6 +141,7 @@ namespace mysql {
         actor_zeta::address_t mysql_manager_;
         actor_zeta::address_t pg_manager_;
         actor_zeta::address_t ch_manager_;
+        const otterstax::names::alias_registry_t& aliases_;
         OTX_LOCKABLE_N(std::mutex, mutex_, "CatalogManager::mutex");
         actor_zeta::behavior_t current_behavior_;
 

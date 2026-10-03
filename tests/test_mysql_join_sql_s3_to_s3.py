@@ -50,7 +50,7 @@ JOIN_CAMPAIGN_IDS = (1, 2, 3)
 EXPECTED_JOIN_ROWS = len(JOIN_CAMPAIGN_IDS) * 4
 
 # Source: campaigns lives in MariaDB1 (alias 'campaigns', db 'db1', schema 'schema').
-SQL_BACKEND_TABLE = "campaigns.db1.schema.campaigns"
+SQL_BACKEND_TABLE = "campaigns.db1.campaigns"
 
 # Otterbrix-internal database. Used for BOTH the parquet-loaded regions and the
 # persisted JOIN result — CREATE EXTERNAL TABLE auto-creates the database, then

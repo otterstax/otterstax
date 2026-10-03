@@ -19,6 +19,7 @@ set(OTTERBRIX_HEADERS
     translators/output/writable_columns.hpp
     operators/execute_plan.hpp
     operators/schema_probe.hpp
+    parser/alias_registry.hpp
     parser/name_resolution.hpp
     parser/parser.hpp
     parser/subquery_extractor.hpp
@@ -41,6 +42,7 @@ set(OTTERBRIX_SOURCES
     translators/output/chunk_to_ndjson.cpp
     translators/internal/doc_to_chunk.cpp
     operators/execute_plan.cpp
+    parser/alias_registry.cpp
     parser/name_resolution.cpp
     parser/parser.cpp
     parser/subquery_extractor.cpp

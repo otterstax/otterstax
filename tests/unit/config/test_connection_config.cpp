@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2025-2026  OtterStax
 
-#include "config/connections/connection_config_reader.hpp"
 #include "config/config.hpp"
+#include "config/connections/connection_config_reader.hpp"
 
 #include <catch2/catch_all.hpp>
 #include <yaml-cpp/yaml.h>
@@ -13,65 +13,59 @@
 #include <memory_resource>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace {
+    std::pmr::memory_resource* resource() { return std::pmr::new_delete_resource(); }
 
-std::pmr::memory_resource* resource() {
-    return std::pmr::new_delete_resource();
-}
+    // Parse a YAML string and return its top-level `connections` node.
+    YAML::Node connections_node(const std::string& yaml) { return YAML::Load(yaml)["connections"]; }
 
-// Parse a YAML string and return its top-level `connections` node.
-YAML::Node connections_node(const std::string& yaml) {
-    return YAML::Load(yaml)["connections"];
-}
+    // parse_connections on a node that must be accepted; the descriptors it produced.
+    config::ConnectionsConfig parse_ok(const YAML::Node& node) {
+        auto parsed = config::parse_connections(node, resource());
+        REQUIRE_FALSE(parsed.has_error());
+        return std::move(parsed.value());
+    }
 
-// parse_connections on a node that must be accepted; the descriptors it produced.
-config::ConnectionsConfig parse_ok(const YAML::Node& node) {
-    auto parsed = config::parse_connections(node, resource());
-    REQUIRE_FALSE(parsed.has_error());
-    return std::move(parsed.value());
-}
+    // parse_connections on a node that must be rejected; the error it produced.
+    core::error_t parse_error(const YAML::Node& node) {
+        auto parsed = config::parse_connections(node, resource());
+        REQUIRE(parsed.has_error());
+        return parsed.error();
+    }
 
-// parse_connections on a node that must be rejected; the error it produced.
-core::error_t parse_error(const YAML::Node& node) {
-    auto parsed = config::parse_connections(node, resource());
-    REQUIRE(parsed.has_error());
-    return parsed.error();
-}
+    // ConfigReader::load on a file that must be accepted; the whole ServiceConfig.
+    config::ServiceConfig load_ok(const std::string& path) {
+        config::ConfigReader reader{resource()};
+        auto loaded = reader.load(path);
+        REQUIRE_FALSE(loaded.has_error());
+        return std::move(loaded.value());
+    }
 
-// ConfigReader::load on a file that must be accepted; the whole ServiceConfig.
-config::ServiceConfig load_ok(const std::string& path) {
-    config::ConfigReader reader{resource()};
-    auto loaded = reader.load(path);
-    REQUIRE_FALSE(loaded.has_error());
-    return std::move(loaded.value());
-}
+    // ConfigReader::load on a file that must be rejected; the error it produced.
+    core::error_t load_error(const std::string& path) {
+        config::ConfigReader reader{resource()};
+        auto loaded = reader.load(path);
+        REQUIRE(loaded.has_error());
+        return loaded.error();
+    }
 
-// ConfigReader::load on a file that must be rejected; the error it produced.
-core::error_t load_error(const std::string& path) {
-    config::ConfigReader reader{resource()};
-    auto loaded = reader.load(path);
-    REQUIRE(loaded.has_error());
-    return loaded.error();
-}
+    bool mentions(const core::error_t& error, std::string_view text) {
+        return std::string_view{error.what.data(), error.what.size()}.find(text) != std::string_view::npos;
+    }
 
-bool mentions(const core::error_t& error, std::string_view text) {
-    return std::string_view{error.what.data(), error.what.size()}.find(text) != std::string_view::npos;
-}
-
-// Write `content` to a unique temp file and return its path (used for the
-// whole-file ConfigReader tests).
-std::string write_temp(const std::string& content) {
-    static std::atomic<int> counter{0};
-    auto path = std::filesystem::temp_directory_path() /
-                ("otterstax_cfg_" + std::to_string(counter++) + ".yaml");
-    std::ofstream out(path);
-    out << content;
-    out.close();
-    return path.string();
-}
-
-}  // namespace
+    // Write `content` to a unique temp file and return its path (used for the
+    // whole-file ConfigReader tests).
+    std::string write_temp(const std::string& content) {
+        static std::atomic<int> counter{0};
+        auto path = std::filesystem::temp_directory_path() / ("otterstax_cfg_" + std::to_string(counter++) + ".yaml");
+        std::ofstream out(path);
+        out << content;
+        out.close();
+        return path.string();
+    }
+} // namespace
 
 // ── parse_connections (the `connections:` subtree) ───────────────────────────
 
@@ -171,7 +165,7 @@ connections:
 }
 
 TEST_CASE("parse_connections: null/missing node yields an empty config") {
-    YAML::Node absent;  // null node
+    YAML::Node absent; // null node
     auto cfg = parse_ok(absent);
     CHECK(cfg.mysql.empty());
     CHECK(cfg.postgresql.empty());
@@ -251,6 +245,48 @@ connections:
     CHECK(cfg.mysql[0].alias == "a");
     CHECK(cfg.mysql[1].alias == "b");
     CHECK(cfg.mysql[2].alias == "c");
+}
+
+TEST_CASE("parse_connections: a backend alias is reachable from SQL and names one connection", "[names]") {
+    struct row_t {
+        const char* name;
+        std::string entries;
+        bool accepted;
+    };
+    const std::string my = R"({ host: h, port: "3306", username: u, password: p, database: d, table: "" })";
+    const auto entry = [](const char* alias, const std::string& fields) {
+        return "    - { alias: " + std::string{alias} + ", " + fields.substr(2);
+    };
+    const std::string pg = R"({ host: h, port: "5432", username: u, password: p, database: d, schema: s, table: "" })";
+    const std::string ch = R"({ host: h, port: "9000", username: u, password: p, database: d, table: "" })";
+    const std::vector<row_t> rows{
+        {"distinct lower-case aliases across sections",
+         "  mysql:\n" + entry("shop", my) + "\n  postgresql:\n" + entry("pg_2", pg) + "\n  clickhouse:\n" +
+             entry("ch", ch) + "\n",
+         true},
+        {"same alias in two sections",
+         "  mysql:\n" + entry("shop", my) + "\n  postgresql:\n" + entry("shop", pg) + "\n",
+         false},
+        {"same alias twice in one section", "  clickhouse:\n" + entry("ch", ch) + "\n" + entry("ch", ch) + "\n", false},
+        {"alias with an upper-case letter", "  postgresql:\n" + entry("Shop", pg) + "\n", false},
+        {"alias with a dot", "  postgresql:\n" + entry("pg.main", pg) + "\n", false},
+        {"alias with a dash", "  mysql:\n" + entry("my-shop", my) + "\n", false},
+        {"alias starting with a digit", "  clickhouse:\n" + entry("1ch", ch) + "\n", false},
+        {"alias starting with an underscore", "  mysql:\n" + entry("_shop2", my) + "\n", true},
+    };
+    for (const auto& row : rows) {
+        DYNAMIC_SECTION(row.name) {
+            const std::string yaml = "connections:\n" + row.entries;
+            INFO(yaml);
+            auto parsed = config::parse_connections(connections_node(yaml), resource());
+            if (row.accepted) {
+                REQUIRE_FALSE(parsed.has_error());
+            } else {
+                REQUIRE(parsed.has_error());
+                CHECK(parsed.error().type == core::error_code_t::invalid_parameter);
+            }
+        }
+    }
 }
 
 TEST_CASE("parse_connections: an incomplete connection aborts parsing (fail-fast)") {
@@ -520,7 +556,7 @@ service:
 }
 
 TEST_CASE("ConfigReader: malformed YAML is an error") {
-    const std::string yaml = "service: [ {port: }";  // unbalanced flow mapping
+    const std::string yaml = "service: [ {port: }"; // unbalanced flow mapping
     auto err = load_error(write_temp(yaml));
     CHECK(err.type == core::error_code_t::conversion_failure);
     CHECK(mentions(err, "configuration file"));

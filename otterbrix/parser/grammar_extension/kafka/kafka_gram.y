@@ -11,7 +11,10 @@
  * Grammar (informal):
  *   CREATE SOURCE <name> (<col> <type>, ...) WITH (<k>=<v>, ...)
  *   CREATE STREAM <name> [WITH (...)] AS <raw select>
- *   DROP   SOURCE|STREAM [IF EXISTS] <name>
+ *   DROP   SOURCE|STREAM [IF EXISTS] <name> [CASCADE | RESTRICT]   (default RESTRICT)
+ *
+ * CASCADE and RESTRICT are unreserved, as in PostgreSQL: they are keywords only
+ * where a drop behaviour may stand, and stay usable as an object or column name.
  *
  *-------------------------------------------------------------------------
  */
@@ -42,13 +45,16 @@
 }
 
 %token KW_CREATE KW_DROP KW_SOURCE KW_STREAM KW_WITH KW_AS KW_IF KW_EXISTS
+/* Unreserved keywords: the scanner hands over their source text, so used as a name
+   they keep its case exactly like an IDENT (folded to lower in transform) */
+%token <str> KW_CASCADE KW_RESTRICT
 %token <str> IDENT SCONST ICONST RAW_SELECT
 
 %type <stmt>    statement create_source create_stream drop_stmt
 %type <column>  column_list column_def
-%type <str>     type_name option_value
+%type <str>     type_name option_value name
 %type <option>  with_clause opt_with option_list option
-%type <boolean> opt_if_exists
+%type <boolean> opt_if_exists opt_drop_behavior
 
 %%
 
@@ -71,7 +77,7 @@ statement:
     ;
 
 create_source:
-    KW_CREATE KW_SOURCE IDENT '(' column_list ')' with_clause {
+    KW_CREATE KW_SOURCE name '(' column_list ')' with_clause {
         $$ = kafka_grammar::make_stmt(resource,
                                       kafka_grammar::stmt_kind::create_source,
                                       kafka_grammar::object_kind::source,
@@ -82,7 +88,7 @@ create_source:
     ;
 
 create_stream:
-    KW_CREATE KW_STREAM IDENT opt_with KW_AS RAW_SELECT {
+    KW_CREATE KW_STREAM name opt_with KW_AS RAW_SELECT {
         $$ = kafka_grammar::make_stmt(resource,
                                       kafka_grammar::stmt_kind::create_stream,
                                       kafka_grammar::object_kind::stream,
@@ -93,19 +99,21 @@ create_stream:
     ;
 
 drop_stmt:
-      KW_DROP KW_SOURCE opt_if_exists IDENT {
+      KW_DROP KW_SOURCE opt_if_exists name opt_drop_behavior {
         $$ = kafka_grammar::make_stmt(resource,
                                       kafka_grammar::stmt_kind::drop_object,
                                       kafka_grammar::object_kind::source,
                                       $4);
         $$->if_exists = $3;
+        $$->cascade = $5;
       }
-    | KW_DROP KW_STREAM opt_if_exists IDENT {
+    | KW_DROP KW_STREAM opt_if_exists name opt_drop_behavior {
         $$ = kafka_grammar::make_stmt(resource,
                                       kafka_grammar::stmt_kind::drop_object,
                                       kafka_grammar::object_kind::stream,
                                       $4);
         $$->if_exists = $3;
+        $$->cascade = $5;
       }
     ;
 
@@ -114,13 +122,27 @@ opt_if_exists:
     | KW_IF KW_EXISTS  { $$ = true; }
     ;
 
+/* RESTRICT is the default, as in PostgreSQL */
+opt_drop_behavior:
+      /* empty */      { $$ = false; }
+    | KW_RESTRICT      { $$ = false; }
+    | KW_CASCADE       { $$ = true; }
+    ;
+
+/* An object or column name: an identifier or one of the unreserved keywords */
+name:
+      IDENT            { $$ = $1; }
+    | KW_CASCADE       { $$ = $1; }
+    | KW_RESTRICT      { $$ = $1; }
+    ;
+
 column_list:
       column_def                  { $$ = $1; }
     | column_def ',' column_list  { $1->next = $3; $$ = $1; }
     ;
 
 column_def:
-    IDENT type_name {
+    name type_name {
         $$ = kafka_grammar::make_column(resource, $1, $2);
     }
     ;

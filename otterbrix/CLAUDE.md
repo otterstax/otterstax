@@ -31,7 +31,8 @@ extension recipe and `cmake/otterbrix_parser_extension.cmake` for the build help
 
 The Kafka DDL grammar extension (library `kafka_grammar`): a self-contained
 flex+bison pair (`kafka_yy` prefix, isolated from the core parser) producing a
-`kafka_node_t` for `CREATE/DROP SOURCE/STREAM`, registered into `GreenplumParser`
+`kafka_node_t` for `CREATE/DROP SOURCE/STREAM` (DROP takes `[IF EXISTS] <name>
+[CASCADE | RESTRICT]`, RESTRICT by default — `kafka_node_t::cascade()`), registered into `GreenplumParser`
 via `make_kafka_extension()`. Also defines `kafka_write_target` (detects
 `INSERT INTO kafka.<obj>`) and `kafka_stream_source` / `kafka_find_aggregate`
 (stream plan helpers). Namespace `otterstax::kafka`. The Kafka **runtime** that

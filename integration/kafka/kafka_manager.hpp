@@ -10,6 +10,7 @@
 #include <components/cursor/cursor.hpp>
 #include <components/log/log.hpp>
 #include <components/logical_plan/execution_plan.hpp>
+#include <components/catalog/results/ddl_result.hpp>
 #include <components/table/column_definition.hpp>
 #include <core/result_wrapper.hpp>
 
@@ -86,6 +87,12 @@ namespace otterstax::kafka {
         // Drives the dispatcher directly (no actor mailbox), safe to call inline
         void recover();
 
+        // Test seam: whether an ingestion poller is registered for source `name`.
+        // Reads pollers_ off the actor loop without a lock, so call it only while
+        // no message is in flight (after the reply future of the last send was
+        // driven to ready — the reply publishes the loop's writes)
+        bool has_poller(const std::string& name) const { return pollers_.count(name) != 0; }
+
         using dispatch_traits = actor_zeta::
             dispatch_traits<&KafkaManager::execute, &KafkaManager::produce, &KafkaManager::add_stream_insert>;
 
@@ -101,6 +108,16 @@ namespace otterstax::kafka {
             std::vector<kafka_column_t> columns;
             std::unordered_map<std::string, std::string> options;
             std::string as_select; // streams only
+            // Streams and INSERT INTO queries: the kafka object their SELECT reads
+            // (the SELECT's FROM). Empty for a SOURCE. What DROP ... RESTRICT asks
+            // about and DROP ... CASCADE follows
+            std::string source;
+        };
+
+        // A stream or INSERT INTO query that reads another kafka object
+        struct reader_t {
+            std::string name;
+            bool insert_query; // false: a STREAM
         };
 
         // Async hand-off of a finished plan to the engine's manager_dispatcher_t
@@ -123,13 +140,42 @@ namespace otterstax::kafka {
         create_table(const std::string& name,
                      std::vector<components::table::column_definition_t> columns,
                      bool if_not_exists);
-        // DROP TABLE kafka.<name>. Non-coroutine (returns the send() future); a
-        // missing table is reported by the engine as table_not_exists
-        actor_zeta::unique_future<components::cursor::cursor_t_ptr> drop_table(const std::string& name);
-        // Drop a SOURCE's backing table and its __offsets table. The backing table's
-        // result decides the outcome; an absent __offsets table is not an error
-        // (a half-created source must still be removable)
-        actor_zeta::unique_future<components::cursor::cursor_t_ptr> drop_source_tables(const std::string& name);
+        // DROP TABLE kafka.<name> RESTRICT | CASCADE. Non-coroutine (returns the
+        // send() future); a missing table is reported by the engine as
+        // table_not_exists, a RESTRICT drop under a dependent VIEW as other_error
+        actor_zeta::unique_future<components::cursor::cursor_t_ptr>
+        drop_table(const std::string& name, components::catalog::drop_behavior_t behavior);
+        // Drop a SOURCE's backing table with `behavior`, then — only when that
+        // drop succeeded or found no table — its internal __offsets table
+        // (always CASCADE). Answers the backing table's result: a refused or
+        // failed drop leaves both tables as they were. A failed __offsets drop is
+        // logged, never answered: the source is gone by then, and an absent
+        // __offsets table is not an error (a half-created source must still be
+        // removable)
+        actor_zeta::unique_future<components::cursor::cursor_t_ptr>
+        drop_source_tables(const std::string& name, components::catalog::drop_behavior_t behavior);
+
+        // The streams and INSERT INTO queries outside `name`'s own set (the object
+        // itself plus, for a STREAM, its INSERT INTO queries) that read an object
+        // of that set, sorted by name — what DROP ... RESTRICT refuses over
+        std::vector<reader_t> blocking_readers(const std::string& name) const;
+        // Every stream-like object DROP ... CASCADE of `name` takes: `name`'s own
+        // set and, transitively, every reader of an object already taken together
+        // with that reader's own set. `name` itself is included only when it is a
+        // stream-like object (not a SOURCE)
+        std::vector<std::string> cascade_closure(const std::string& name) const;
+        // Stop + forget stream-like objects (worker, registry, producer, INSERT
+        // query bookkeeping) and delete their kafka.__sources rows. A row that
+        // cannot be deleted is logged — the object is already stopped and
+        // unregistered, and recover() deletes a row whose source is gone
+        actor_zeta::unique_future<components::cursor::cursor_t_ptr>
+        forget_stream_objects(std::vector<std::string> names);
+        // The RESTRICT refusal of DROP SOURCE `name` by the engine, its dependent
+        // named: the oid in the engine's DETAIL resolved through pg_class /
+        // pg_namespace. Falls back to the engine's own message when the oid
+        // cannot be resolved
+        actor_zeta::unique_future<components::cursor::cursor_t_ptr>
+        describe_restrict_refusal(const std::string& name, components::cursor::cursor_t_ptr refused);
 
         // Lazily open (and cache) the topic producer for a kafka object; returns the
         // cached producer or an error if the broker connection could not be opened

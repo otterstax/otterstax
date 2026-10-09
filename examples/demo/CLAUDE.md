@@ -134,7 +134,9 @@ the MinIO container along with the rest (the bucket is recreated by
 `demo-minio-init` on the next `up`).
 
 The Kafka act is re-runnable in place — each step's `DROP SOURCE IF EXISTS …
-CREATE SOURCE …` (and `DROP STREAM …`) re-creates its objects cleanly, so you can
+CASCADE; CREATE SOURCE …` (and `DROP STREAM …`) re-creates its objects cleanly
+(CASCADE because DROP SOURCE is RESTRICT by default and refuses while a stream or
+fan-in query of a later step still reads the source), so you can
 replay `run_all.sh` (or an individual step) without recreating otterstax.
 Every Kafka step script exits non-zero on its first failed sub-step. `run_all.sh`
 checks the PG wire first and stops at the first failed step, so its

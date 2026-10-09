@@ -128,6 +128,7 @@ namespace otterstax::kafka {
             node->set_as_select(std::string(stmt.as_select));
         }
         node->set_if_exists(stmt.if_exists);
+        node->set_cascade(stmt.cascade);
 
         return node;
     }

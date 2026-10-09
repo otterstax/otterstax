@@ -523,7 +523,7 @@ Declare the source (broker is the in-network `qs-kafka:9092`):
 
 ```bash
 psql -h localhost -p 8817 -U demo demo <<'SQL'
-DROP SOURCE IF EXISTS qs_orders;
+DROP SOURCE IF EXISTS qs_orders CASCADE;
 CREATE SOURCE qs_orders (
     event_id VARCHAR, customer_id VARCHAR, product_id VARCHAR,
     amount DOUBLE, status VARCHAR, channel VARCHAR

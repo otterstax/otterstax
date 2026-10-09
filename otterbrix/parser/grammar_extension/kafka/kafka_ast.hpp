@@ -44,6 +44,7 @@ namespace kafka_grammar {
         with_option* options;       // WITH (...) options, else nullptr
         std::pmr::string as_select; // CREATE STREAM ... AS <raw sql>, else empty
         bool if_exists;             // DROP ... IF EXISTS
+        bool cascade;               // DROP ... CASCADE (false: RESTRICT, the default)
     };
 
     inline kafka_stmt*
@@ -55,6 +56,7 @@ namespace kafka_grammar {
                                      nullptr,
                                      nullptr,
                                      std::pmr::string(resource),
+                                     false,
                                      false};
     }
 

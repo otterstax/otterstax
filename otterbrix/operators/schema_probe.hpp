@@ -237,7 +237,8 @@ namespace otterstax::schema_probe {
             if (row_namespace != namespace_oid) {
                 continue;
             }
-            const auto kind = cursor->value(kind_column.value(), row).value<std::string_view>();
+            // Copied out at once: value() answers a temporary the view would outlive
+            const std::string kind{cursor->value(kind_column.value(), row).value<std::string_view>()};
             if (kind.empty()) {
                 return detail::probe_error(resource,
                                            core::error_code_t::schema_error,

@@ -285,6 +285,7 @@ namespace otterstax::kafka {
             obj.options["transactional"] = "true";
         }
         obj.as_select = insert_sql;
+        obj.source = source_relname;
         registry_[query_name] = std::move(obj);
 
         // Launch the continuous worker (no-op unless start_pollers_) and remember it

@@ -65,6 +65,10 @@ namespace otterstax::kafka {
         bool if_exists() const noexcept { return if_exists_; }
         void set_if_exists(bool value) noexcept { if_exists_ = value; }
 
+        // DROP ... CASCADE; false is RESTRICT, the default when neither is written
+        bool cascade() const noexcept { return cascade_; }
+        void set_cascade(bool value) noexcept { cascade_ = value; }
+
     private:
         components::expressions::hash_t hash_impl() const final;
         std::string to_string_impl() const final;
@@ -75,6 +79,7 @@ namespace otterstax::kafka {
         std::unordered_map<std::string, std::string> options_;
         std::string as_select_;
         bool if_exists_ = false;
+        bool cascade_ = false;
     };
 
     using kafka_node_ptr = boost::intrusive_ptr<kafka_node_t>;

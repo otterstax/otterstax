@@ -11,6 +11,7 @@
 #include <memory_resource>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <vector>
 
 #include <components/logical_plan/node.hpp>
@@ -142,7 +143,93 @@ TEST_CASE("kafka grammar: DROP variants") {
         REQUIRE(stmt != nullptr);
         CHECK(stmt->obj == kafka_grammar::object_kind::stream);
         CHECK(stmt->if_exists);
+        CHECK_FALSE(stmt->cascade);
     }
+}
+
+TEST_CASE("kafka grammar: DROP SOURCE and DROP STREAM take CASCADE or RESTRICT") {
+    auto registry = kafka_registry();
+    std::pmr::monotonic_buffer_resource arena(std::pmr::new_delete_resource());
+
+    struct case_t {
+        const char* sql;
+        kafka_grammar::object_kind obj;
+        bool if_exists;
+        bool cascade;
+    };
+    const case_t cases[] = {
+        // RESTRICT is the default, written or not
+        {"DROP SOURCE orders", kafka_grammar::object_kind::source, false, false},
+        {"DROP SOURCE orders RESTRICT", kafka_grammar::object_kind::source, false, false},
+        {"DROP SOURCE orders CASCADE;", kafka_grammar::object_kind::source, false, true},
+        {"DROP SOURCE IF EXISTS orders CASCADE", kafka_grammar::object_kind::source, true, true},
+        {"DROP SOURCE IF EXISTS orders RESTRICT;", kafka_grammar::object_kind::source, true, false},
+        {"drop source orders cascade", kafka_grammar::object_kind::source, false, true},
+        {"DROP STREAM orders", kafka_grammar::object_kind::stream, false, false},
+        {"DROP STREAM orders RESTRICT", kafka_grammar::object_kind::stream, false, false},
+        {"DROP STREAM orders CASCADE", kafka_grammar::object_kind::stream, false, true},
+        {"DROP STREAM IF EXISTS orders CASCADE;", kafka_grammar::object_kind::stream, true, true},
+        {"DROP STREAM IF EXISTS orders Restrict", kafka_grammar::object_kind::stream, true, false},
+    };
+    for (const auto& c : cases) {
+        INFO(c.sql);
+        auto* stmt = kafka_stmt(raw_parser(&arena, c.sql, registry));
+        REQUIRE(stmt != nullptr);
+        CHECK(stmt->kind == kafka_grammar::stmt_kind::drop_object);
+        CHECK(stmt->obj == c.obj);
+        CHECK(std::string_view(stmt->name) == "orders");
+        CHECK(stmt->if_exists == c.if_exists);
+        CHECK(stmt->cascade == c.cascade);
+    }
+}
+
+TEST_CASE("kafka grammar: CASCADE and RESTRICT stay usable as names") {
+    auto registry = kafka_registry();
+    std::pmr::monotonic_buffer_resource arena(std::pmr::new_delete_resource());
+
+    // Unreserved, as in PostgreSQL: a keyword only where a drop behaviour stands
+    {
+        auto* stmt = kafka_stmt(raw_parser(&arena, "DROP SOURCE cascade", registry));
+        REQUIRE(stmt != nullptr);
+        CHECK(std::string_view(stmt->name) == "cascade");
+        CHECK_FALSE(stmt->cascade);
+    }
+    {
+        auto* stmt = kafka_stmt(raw_parser(&arena, "DROP STREAM restrict CASCADE", registry));
+        REQUIRE(stmt != nullptr);
+        CHECK(std::string_view(stmt->name) == "restrict");
+        CHECK(stmt->cascade);
+    }
+    {
+        // Used as a name it keeps its source text, like any identifier (the
+        // transform folds both to lower)
+        auto* stmt = kafka_stmt(raw_parser(&arena, "DROP SOURCE Cascade RESTRICT", registry));
+        REQUIRE(stmt != nullptr);
+        CHECK(std::string_view(stmt->name) == "Cascade");
+        auto* ident = kafka_stmt(raw_parser(&arena, "DROP SOURCE Orders RESTRICT", registry));
+        REQUIRE(ident != nullptr);
+        CHECK(std::string_view(ident->name) == "Orders");
+    }
+    {
+        auto* stmt =
+            kafka_stmt(raw_parser(&arena, "CREATE SOURCE cascade (restrict INT) WITH (KAFKA_TOPIC='t')", registry));
+        REQUIRE(stmt != nullptr);
+        CHECK(std::string_view(stmt->name) == "cascade");
+        REQUIRE(stmt->columns != nullptr);
+        CHECK(std::string_view(stmt->columns->name) == "restrict");
+    }
+}
+
+TEST_CASE("kafka grammar: a DROP with a bad drop behaviour is refused") {
+    auto registry = kafka_registry();
+    std::pmr::monotonic_buffer_resource arena(std::pmr::new_delete_resource());
+
+    CHECK_THROWS_AS(raw_parser(&arena, "DROP SOURCE orders CASCADES", registry), parser_exception_t);
+    CHECK_THROWS_AS(raw_parser(&arena, "DROP SOURCE orders CASCADE RESTRICT", registry), parser_exception_t);
+    CHECK_THROWS_AS(raw_parser(&arena, "DROP SOURCE orders RESTRICT CASCADE", registry), parser_exception_t);
+    CHECK_THROWS_AS(raw_parser(&arena, "DROP STREAM orders CASCADE CASCADE", registry), parser_exception_t);
+    CHECK_THROWS_AS(raw_parser(&arena, "DROP STREAM orders FORCE", registry), parser_exception_t);
+    CHECK_THROWS_AS(raw_parser(&arena, "DROP STREAM CASCADE IF EXISTS orders", registry), parser_exception_t);
 }
 
 TEST_CASE("kafka grammar: keywords are case-insensitive") {
@@ -307,5 +394,32 @@ TEST_CASE("kafka grammar: transform of a DROP node") {
     auto* kn = static_cast<otterstax::kafka::kafka_node_t*>(root.get());
     CHECK(kn->op() == otterstax::kafka::kafka_op::drop_stream);
     CHECK(kn->if_exists());
+    CHECK_FALSE(kn->cascade()); // RESTRICT by default
     CHECK(kn->columns().empty());
+}
+
+TEST_CASE("kafka grammar: transform of a DROP ... CASCADE node") {
+    auto registry = kafka_registry();
+    std::pmr::monotonic_buffer_resource arena(std::pmr::new_delete_resource());
+
+    for (const auto& [sql, op, cascade] :
+         {std::tuple{"DROP SOURCE s CASCADE", otterstax::kafka::kafka_op::drop_source, true},
+          std::tuple{"DROP SOURCE s RESTRICT", otterstax::kafka::kafka_op::drop_source, false},
+          std::tuple{"DROP STREAM IF EXISTS s CASCADE", otterstax::kafka::kafka_op::drop_stream, true}}) {
+        INFO(sql);
+        auto* node = reinterpret_cast<Node*>(linitial(raw_parser(&arena, sql, registry)));
+        REQUIRE(nodeTag(node) == T_ExtensionNode);
+        components::sql::transform::transformer tr(&arena, nullptr, &registry);
+        auto result = tr.transform(*node);
+        REQUIRE_FALSE(result.has_error());
+        auto finalized = result.finalize();
+        REQUIRE_FALSE(finalized.has_error());
+        const auto root = finalized.value().sub_queries.back();
+        REQUIRE(root != nullptr);
+        REQUIRE(root->type() == lp::node_type::unused);
+        auto* kn = static_cast<otterstax::kafka::kafka_node_t*>(root.get());
+        CHECK(kn->op() == op);
+        CHECK(kn->name() == "s");
+        CHECK(kn->cascade() == cascade);
+    }
 }

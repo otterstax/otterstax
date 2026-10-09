@@ -184,11 +184,13 @@ namespace otterstax::kafka {
         return send_plan(logical_plan::execution_plan_t{resource_, node, logical_plan::make_parameter_node(resource_)});
     }
 
-    actor_zeta::unique_future<cursor::cursor_t_ptr> KafkaManager::drop_table(const std::string& name) {
+    actor_zeta::unique_future<cursor::cursor_t_ptr>
+    KafkaManager::drop_table(const std::string& name, components::catalog::drop_behavior_t behavior) {
         OTX_ZONE_N("KafkaManager::drop_table");
         auto drop = logical_plan::make_node_drop(resource_, logical_plan::drop_target_kind::collection);
-        // A source's tables go together with whatever depends on them
-        drop->set_behavior(components::catalog::drop_behavior_t::cascade_);
+        // RESTRICT refuses while a VIEW (or another normal dependent) reads the
+        // table; CASCADE drops those dependents with it
+        drop->set_behavior(behavior);
         logical_plan::node_ptr node = sql::transform::name_catalog_target(core::dbname_t{std::string{KAFKA_DATABASE_NAME}},
                                                                           core::relname_t{name},
                                                                           drop);

@@ -22,6 +22,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace otterstax::kafka {
@@ -186,6 +187,31 @@ namespace otterstax::kafka {
             return o;
         };
 
+        // Every name with a __sources row, and the sources whose backing table is
+        // gone (a DROP SOURCE whose row delete failed). A stream or INSERT INTO
+        // query whose source is one of those, or has no row at all, is dangling:
+        // its row is deleted rather than skipped on every restart (and silently
+        // re-attached to an unrelated source re-created under the name)
+        std::unordered_set<std::string> persisted;
+        for (const auto& m : metas) {
+            persisted.insert(m.name);
+        }
+        std::unordered_set<std::string> dead;
+        auto is_dead = [&](const std::string& object) {
+            return dead.count(object) != 0 || persisted.count(object) == 0;
+        };
+        auto delete_dangling = [&](const char* what, const std::string& object, const std::string& reason) {
+            if (auto d = drive(delete_source_meta(object)); !d || d->is_error()) {
+                log_->error("kafka: recover {} '{}': {}; deleting its __sources row failed: {}",
+                            what,
+                            object,
+                            reason,
+                            d ? d->get_error().what.c_str() : "null cursor");
+                return;
+            }
+            log_->warn("kafka: recover {} '{}': {}; deleted its __sources row", what, object, reason);
+        };
+
         // Pass 1 — SOURCEs. Columns aren't persisted: re-read from the backing
         // table through the engine-side schema probe, whose answer comes off the
         // validated plan rather than row data, so an empty table has the same
@@ -206,6 +232,7 @@ namespace otterstax::kafka {
                 const auto code = read.error().type;
                 if (code == core::error_code_t::table_not_exists || code == core::error_code_t::database_not_exists) {
                     log_->warn("kafka: recover source '{}': backing table is gone, skipping", m.name);
+                    dead.insert(m.name);
                 } else {
                     log_->error("kafka: recover source '{}': schema probe failed (code {}): {}; skipping",
                                 m.name,
@@ -237,13 +264,24 @@ namespace otterstax::kafka {
                 log_->error("kafka: recover source '{}': backing table has no columns, skipping", m.name);
                 continue;
             }
-            registry_[m.name] =
-                kafka_object_t{kafka_op::create_source, std::move(columns), make_options(m), std::string{}};
+            registry_[m.name] = kafka_object_t{kafka_op::create_source,
+                                               std::move(columns),
+                                               make_options(m),
+                                               std::string{},
+                                               std::string{}};
             launch_source_poller(m.name, m.transactional);
             log_->info("kafka: recovered source '{}' (transactional={})", m.name, m.transactional);
         }
 
-        // Pass 2 — STREAMs (source now in registry_; recompute the output schema)
+        // Pass 2 — STREAMs (recompute the output schema over the source's columns).
+        // A stream can read another stream, so streams are recovered in rounds
+        // until none becomes resolvable: the order of the __sources rows does not
+        // decide whether a stream comes back
+        struct pending_stream_t {
+            const meta_t* meta;
+            std::string source;
+        };
+        std::vector<pending_stream_t> pending;
         for (const auto& m : metas) {
             if (m.kind != "stream") {
                 continue;
@@ -259,17 +297,51 @@ namespace otterstax::kafka {
                 log_->warn("kafka: recover stream '{}': SELECT has no aggregate/source, skipping", m.name);
                 continue;
             }
-            const auto src_it = registry_.find(agg->target().collection.t);
-            if (src_it == registry_.end()) {
-                log_->warn("kafka: recover stream '{}': unknown source '{}', skipping", m.name, agg->target().collection.t);
-                continue;
+            pending.push_back(pending_stream_t{&m, agg->target().collection.t});
+        }
+        for (bool progress = true; progress;) {
+            progress = false;
+            for (auto it = pending.begin(); it != pending.end();) {
+                const auto src_it = registry_.find(it->source);
+                if (src_it == registry_.end()) {
+                    ++it;
+                    continue;
+                }
+                const meta_t& m = *it->meta;
+                auto plan = kafka_parse_plan(resource_, m.as_select); // parsed above, so it parses again
+                const auto* agg = kafka_find_aggregate(plan.value().sub_queries.back());
+                auto stream_columns =
+                    stream_output_schema(resource_, *agg, plan.value().parameters.get(), src_it->second.columns);
+                registry_[m.name] = kafka_object_t{kafka_op::create_stream,
+                                                   std::move(stream_columns),
+                                                   make_options(m),
+                                                   m.as_select,
+                                                   it->source};
+                launch_stream(m.name);
+                log_->info("kafka: recovered stream '{}' (transactional={})", m.name, m.transactional);
+                it = pending.erase(it);
+                progress = true;
             }
-            auto stream_columns =
-                stream_output_schema(resource_, *agg, plan.value().parameters.get(), src_it->second.columns);
-            registry_[m.name] =
-                kafka_object_t{kafka_op::create_stream, std::move(stream_columns), make_options(m), m.as_select};
-            launch_stream(m.name);
-            log_->info("kafka: recovered stream '{}' (transactional={})", m.name, m.transactional);
+        }
+        // What is left reads an object that did not come back. Dead when that
+        // object is gone (transitively: a stream over a dangling stream dangles too)
+        for (bool grew = true; grew;) {
+            grew = false;
+            for (const auto& p : pending) {
+                if (dead.count(p.meta->name) == 0 && is_dead(p.source)) {
+                    dead.insert(p.meta->name);
+                    grew = true;
+                }
+            }
+        }
+        for (const auto& p : pending) {
+            if (dead.count(p.meta->name) != 0) {
+                delete_dangling("stream", p.meta->name, "source '" + p.source + "' is gone");
+            } else {
+                log_->warn("kafka: recover stream '{}': source '{}' was not recovered, skipping",
+                           p.meta->name,
+                           p.source);
+            }
         }
 
         // Pass 3 — INSERT INTO queries. Target stream + SELECT source are re-derived
@@ -298,15 +370,26 @@ namespace otterstax::kafka {
                 log_->warn("kafka: recover insert-query '{}': no source table, skipping", m.name);
                 continue;
             }
-            const auto src_it = registry_.find(agg->target().collection.t);
+            const std::string source = agg->target().collection.t;
+            if (is_dead(sink)) {
+                delete_dangling("insert-query", m.name, "target stream '" + sink + "' is gone");
+                continue;
+            }
+            const auto src_it = registry_.find(source);
             if (src_it == registry_.end()) {
-                log_->warn("kafka: recover insert-query '{}': unknown source '{}', skipping", m.name, agg->target().collection.t);
+                if (is_dead(source)) {
+                    delete_dangling("insert-query", m.name, "source '" + source + "' is gone");
+                } else {
+                    log_->warn("kafka: recover insert-query '{}': source '{}' was not recovered, skipping",
+                               m.name,
+                               source);
+                }
                 continue;
             }
             auto out_columns =
                 stream_output_schema(resource_, *agg, plan.value().parameters.get(), src_it->second.columns);
             registry_[m.name] =
-                kafka_object_t{kafka_op::create_stream, std::move(out_columns), make_options(m), m.as_select};
+                kafka_object_t{kafka_op::create_stream, std::move(out_columns), make_options(m), m.as_select, source};
             stream_insert_queries_[sink].push_back(m.name);
             launch_stream(m.name);
             log_->info("kafka: recovered INSERT INTO query '{}' into stream '{}' (transactional={})",

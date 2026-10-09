@@ -45,18 +45,87 @@ Library: `kafka_runtime` (links `kafka_grammar` + `otterbrix_local`).
   consumer group + producer txn id) and `launch_stream`s it, so it is driven
   exactly like a `CREATE STREAM`. Target must be a STREAM (a SELECT into a SOURCE
   is rejected); exactly-once is inherited from the stream's `TRANSACTIONAL`.
-- Owns `registry_` (name → `kafka_object_t{op, columns, options, as_select}`) plus
+- Owns `registry_` (name → `kafka_object_t{op, columns, options, as_select,
+  source}` — `source` is the object a stream's / INSERT query's SELECT reads) plus
   `pollers_` / `producers_` / `streams_` maps, and `stream_insert_queries_`
   (stream → its INSERT-query names, for DROP-time cleanup). `start_pollers_` ctor
   flag is FALSE by default so broker-free unit tests stay thread-free;
   component_manager passes TRUE. `recover()` (called by component_manager after
   init) replays `kafka.__sources` in three passes — sources, streams, then INSERT
   INTO queries (`kind='insert'`, sink + source re-derived from the persisted SQL).
+  Streams are recovered in rounds until none becomes resolvable, so a stream over
+  another stream comes back whatever the row order. A stream or INSERT query that
+  is **dangling** — its source (or, for an INSERT query, its target stream) has no
+  `__sources` row, or is a source whose backing table is gone, or is itself a
+  dangling stream — has its `__sources` row deleted (logged at warn) instead of
+  being skipped on every restart and silently re-attached to an unrelated object
+  re-created under the name. One whose source merely failed to recover (a probe
+  error, a VIEW under the name) is only skipped, as before; so is a source row
+  whose backing table is gone.
   A source's columns are not persisted: they are re-read from its backing table
   through the shared engine-side schema probe (`otterbrix/operators/schema_probe.hpp`,
   the same helper behind `OtterbrixDataManager::get_schema`), so an empty table
   recovers with the same schema as a populated one; a missing backing table is
   skipped, a VIEW under the source's name is refused.
+
+## DROP semantics (`DROP SOURCE|STREAM [IF EXISTS] <name> [CASCADE | RESTRICT]`)
+
+RESTRICT is the default, as in PostgreSQL/Materialize. The grammar carries the
+choice as `kafka_node_t::cascade()`; `CASCADE`/`RESTRICT` are unreserved (still
+usable as object/column names, keeping their source text like any identifier).
+Dependents come from two places:
+
+- **Kafka side** — streams and INSERT INTO queries read a source's (or a stream's)
+  *topic*, so the engine does not know them. `blocking_readers(name)` lists the
+  registry entries whose `source` is the object or one of its own INSERT queries;
+  `cascade_closure(name)` follows readers transitively (each dropped stream takes
+  its own INSERT queries).
+- **Engine side** — VIEWs (and other normal `pg_depend` dependents) over
+  `kafka.<source>`; the backing table is dropped with `drop_behavior_t::restrict_`
+  or `cascade_`.
+
+`DROP SOURCE s` (RESTRICT):
+0. a name registered as a stream or INSERT INTO query → `invalid_parameter`
+   `kafka: 'st' is a stream, not a source; use DROP STREAM` (with or without IF
+   EXISTS — a stream has no table, so the absent-table path would forget it);
+1. any Kafka-side reader → `other_error` `kafka: cannot drop source 's': insert
+   query 'm__insert__0', stream 'st' depend on it; use DROP SOURCE s CASCADE`,
+   before anything is stopped (`IF EXISTS` does not forgive it);
+2. the poller is stopped and `kafka.s` dropped RESTRICT. A refusal relaunches the
+   poller and keeps registry, `__sources` row and `kafka.s__offsets` untouched; the
+   engine's DETAIL oid is resolved through `pg_catalog.pg_class` +
+   `pg_namespace` (`describe_restrict_refusal`, the oid spelled as a number into
+   `kafka_query`) → `kafka: cannot drop source 's': view kafka.v depends on it
+   (and possibly other objects); use DROP SOURCE s CASCADE` — the engine reports
+   only its first dependent. If the oid cannot be resolved, or the engine's wording
+   is not recognised, or the drop failed for another reason, the answer is the
+   engine's own message after the same `kafka: cannot drop source 's': ` prefix,
+   with the engine's code (`other_error` for the refusal). A missing table without
+   IF EXISTS keeps the engine's bare `collection does not exist: kafka.s`
+   (`table_not_exists`);
+3. only after `kafka.s` is gone (or absent) is `kafka.s__offsets` dropped — always
+   CASCADE: it is internal, and a VIEW someone put over it must not strand a
+   source whose table is already gone. A failed offsets drop is logged, not
+   answered (a later `DROP SOURCE IF EXISTS s` removes the leftover);
+4. registry / producer / poller (a concurrent refused DROP of the same source may
+   have relaunched it meanwhile) / `__sources` row cleanup.
+
+`DROP SOURCE s CASCADE`: the same, minus the refusals; `kafka.s` is dropped CASCADE
+(dependent views go, recursively), then `__offsets`, then every stream / INSERT
+query of `cascade_closure` is stopped and forgotten (`forget_stream_objects`:
+worker, registry, producer, INSERT bookkeeping, then their `__sources` rows), then
+the source's own cleanup. **Mid-way failure:** the backing-table drop is the only
+step that can refuse; until it succeeds nothing is changed (poller relaunched).
+After it, the in-memory steps cannot fail; a failed `__offsets` drop or
+`__sources` row delete is logged and the DROP stands — `recover()` deletes a
+leftover reader row (dangling) and skips a leftover source row.
+
+`DROP STREAM x`: `do_not_exists` unless `IF EXISTS`; a SOURCE name is
+`invalid_parameter`. RESTRICT refuses (`other_error`, `kafka: cannot drop stream
+'x': stream 'y' depends on it; use DROP STREAM x CASCADE`) when another stream or
+INSERT query reads FROM it (a stream's output topic can be another stream's
+source). The stream's own INSERT INTO queries (it is their sink) go with it in both
+modes. CASCADE drops `cascade_closure(x)`.
 
 ## detail/ (the implementation)
 
@@ -88,8 +157,20 @@ a `kafka_node_t` plan root → `KafkaManager::execute`; else `kafka_write_target
   or a wrong-kind value rejects the message with a logged reason.
 - DDL validates its options (`TRANSACTIONAL`) before any side effect; CREATE fails
   (and rolls its tables back) when the `kafka.__sources` metadata row cannot be
-  written; DROP SOURCE drops `<name>__offsets` too and forgets the object only
-  after a successful drop (`IF EXISTS` forgives only a missing table).
+  written; DROP is RESTRICT by default and refuses over Kafka-side readers or
+  engine dependents before changing anything, drops `<name>__offsets` only after
+  the backing table is gone, and forgets the object only then (`IF EXISTS`
+  forgives only a missing object, never a dependent) — see "DROP semantics".
+- **Known races (pre-existing, not addressed).** The manager's loop interleaves
+  coroutines at every `co_await`, so DDL on related objects is not serialised:
+  a `CREATE STREAM` / `INSERT INTO … SELECT` over a source that a concurrent
+  `DROP SOURCE … CASCADE` is dropping can register after the closure was taken and
+  outlive its source (until `recover()` deletes it as dangling); a `__sources` row
+  write/delete is not atomic with the in-memory registry (a crash or failed delete
+  between them leaves a row `recover()` must reconcile); and `recover()` pass 3
+  launches an INSERT INTO query whose target stream has a row but failed to
+  recover. Two concurrent DROPs of one source are safe: the success path erases
+  any poller the refused one relaunched.
 - **Actor-isolation exception: `recover()` reads the probe's plan after the engine
   replied.** For each SOURCE, `recover()` sends `probe.execution_plan(resource_)` to
   the engine's dispatcher actor and waits for the reply future (`drive`). Then

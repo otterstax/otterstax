@@ -83,7 +83,9 @@ def sql_insert_values(src, rows):
 
 
 def sql_count(src):        return f"SELECT count(*) FROM kafka.{src}"
-def sql_drop_source(src):  return f"DROP SOURCE {src}"
+def sql_drop_source(src, cascade=False):
+    # DROP SOURCE is RESTRICT by default: it refuses while a stream reads the source
+    return f"DROP SOURCE {src}" + (" CASCADE" if cascade else "")
 def sql_drop_stream(name): return f"DROP STREAM {name}"
 
 
@@ -162,7 +164,7 @@ def _consume_count(broker, topic, expected, timeout_s):
 def _ingest_source(conn, src, topic, broker, expected, transactional):
     """CREATE SOURCE over the pre-seeded topic; block until `expected` rows land.
     Returns (elapsed_ms, rows); raises on timeout."""
-    _exec(conn, sql_drop_source(src), ignore=True)  # clear a leftover, untimed
+    _exec(conn, sql_drop_source(src, cascade=True), ignore=True)  # clear a leftover (and its readers), untimed
     t0 = time.perf_counter()
     _exec(conn, sql_create_source(src, topic, broker, transactional))
     deadline, rows = t0 + INGEST_TIMEOUT_S, 0

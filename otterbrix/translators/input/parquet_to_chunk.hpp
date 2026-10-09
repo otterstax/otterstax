@@ -2,7 +2,7 @@
 // Copyright 2025-2026  OtterStax
 
 #pragma once
-#include <otterbrix/otterbrix.hpp>
+#include <integration/cpp/otterbrix.hpp>
 #include <core/result_wrapper.hpp>
 
 // Clash between otterbrix parser and arrow

@@ -68,7 +68,7 @@ namespace mysql {
         // the MySQL backend actor that owns this manager. The catalog answers
         // synchronously, and a connection whose schema could not be registered
         // is unusable for federated SQL, so it is closed and dropped here.
-        qualified_name_t name(uuid, connection_param.database, "", "");
+        qualified_name_t name(core::uid_t{uuid}, core::dbname_t{connection_param.database}, core::schema_t{}, core::relname_t{});
         auto [needs_sched, registered] = actor_zeta::send(catalog_manager_,
                                                           &mysql::CatalogManager::add_connection_schema,
                                                           std::move(name),

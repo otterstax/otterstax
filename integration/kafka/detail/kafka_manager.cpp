@@ -180,7 +180,7 @@ namespace otterstax::kafka {
                                                                 {},
                                                                 if_not_exists);
         logical_plan::node_ptr node =
-            sql::transform::name_catalog_target(std::string{KAFKA_DATABASE_NAME}, std::string{}, create);
+            sql::transform::name_catalog_target(core::dbname_t{std::string{KAFKA_DATABASE_NAME}}, core::relname_t{name}, create);
         return send_plan(logical_plan::execution_plan_t{resource_, node, logical_plan::make_parameter_node(resource_)});
     }
 
@@ -189,7 +189,9 @@ namespace otterstax::kafka {
         auto drop = logical_plan::make_node_drop(resource_, logical_plan::drop_target_kind::collection);
         // A source's tables go together with whatever depends on them
         drop->set_behavior(components::catalog::drop_behavior_t::cascade_);
-        logical_plan::node_ptr node = sql::transform::name_catalog_target(std::string{KAFKA_DATABASE_NAME}, name, drop);
+        logical_plan::node_ptr node = sql::transform::name_catalog_target(core::dbname_t{std::string{KAFKA_DATABASE_NAME}},
+                                                                          core::relname_t{name},
+                                                                          drop);
         return send_plan(logical_plan::execution_plan_t{resource_, node, logical_plan::make_parameter_node(resource_)});
     }
 } // namespace otterstax::kafka

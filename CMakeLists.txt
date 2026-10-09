@@ -81,7 +81,7 @@ endif()
 
 # Find the Conan packages
 find_package(Arrow REQUIRED)
-find_package(otterbrix REQUIRED COMPONENTS log)
+find_package(otterbrix REQUIRED)
 find_package(actor-zeta REQUIRED)
 find_package(Catch2 3 REQUIRED)
 find_package(Boost 1.88.0 REQUIRED COMPONENTS
@@ -201,7 +201,6 @@ add_executable(server main.cpp)
 target_link_libraries(server
     PRIVATE
     lib_${PROJECT_NAME}
-    otterbrix_log
     )
 
 # Unit tests

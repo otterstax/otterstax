@@ -9,7 +9,7 @@
 
 #include <components/table/column_definition.hpp>
 #include <components/types/types.hpp>
-#include <otterbrix/otterbrix.hpp>
+#include <integration/cpp/otterbrix.hpp>
 
 #include "otterbrix/config.hpp"
 #include "otterbrix/operators/execute_plan.hpp"
@@ -141,12 +141,13 @@ TEST_CASE("external registration: insert_data fills a table in its own database 
 
     auto first = manager->insert_data("mixdb", "t", id_name_columns(), id_name_rows(resource, 1, 3));
     require_ok(first);
-    REQUIRE(first->size() == 3);
+    // The engine answers a write with its affected-row count and no rows.
+    REQUIRE(first->affected_rows() == 3);
 
     // A database that does not exist: the rows are refused and nothing is created.
     require_error(manager->insert_data("nodb", "t", id_name_columns(), id_name_rows(resource, 100, 1)),
-                  core::error_code_t::table_not_exists,
-                  "INSERT target collection does not exist");
+                  core::error_code_t::database_not_exists,
+                  "database \"nodb\" does not exist");
     require_error(manager->execute_sql("SELECT * FROM nodb.t;"),
                   core::error_code_t::database_not_exists,
                   "database does not exist: nodb");
@@ -154,7 +155,7 @@ TEST_CASE("external registration: insert_data fills a table in its own database 
     // The same collection name in another database is a separate table.
     auto other = manager->insert_data("otherdb", "t", id_name_columns(), id_name_rows(resource, 100, 1));
     require_ok(other);
-    REQUIRE(other->size() == 1);
+    REQUIRE(other->affected_rows() == 1);
 
     // A second insert_data of an existing table is refused, and the table keeps
     // only the rows of the first load.
@@ -187,7 +188,7 @@ TEST_CASE("external registration: insert_data loads a dropped table again") {
 
     auto reloaded = manager->insert_data("mixdb", "t", id_name_columns(), id_name_rows(resource, 200, 2));
     require_ok(reloaded);
-    REQUIRE(reloaded->size() == 2);
+    REQUIRE(reloaded->affected_rows() == 2);
 
     auto rows = manager->execute_sql("SELECT id, name FROM mixdb.t ORDER BY id;");
     require_ok(rows);

@@ -38,7 +38,11 @@ namespace logger_tag {
     inline constexpr std::string_view Config = "Config";
 } // namespace logger_tag
 
-inline log_t get_logger(std::string_view tag) { return get_logger(std::string(tag)); }
+// The engine no longer keeps a registry of named loggers (each engine owns its
+// log, components/log/log.hpp make_log); OtterStax's named loggers live in
+// spdlog's own registry, filled by initialize_logger below. A tag nobody
+// initialized answers an invalid log_t, as the engine's lookup used to.
+inline log_t get_logger(std::string_view tag) { return log_t(spdlog::get(std::string(tag))); }
 
 // from otterbrix, we need to make a new named logger, not the default one
 inline log_t initialize_logger(std::string name, std::string prefix) {

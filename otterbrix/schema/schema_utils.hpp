@@ -29,7 +29,8 @@ namespace schema_utils {
     // folds any schema qualifier into dbname, so the aggregate carries only
     // (uid, dbname, relname).
     inline qualified_name_t agg_key(const components::logical_plan::node_aggregate_t& node) {
-        return qualified_name_t{node.uid().t, node.dbname().t, schema_name_t{}, node.relname().t};
+        const auto& target = node.target();
+        return qualified_name_t{target.unique_identifier, target.database, core::schema_t{}, target.collection};
     }
 
     // used during schema computation, replaces external nodes in main node (like node_raw_data does during execute())

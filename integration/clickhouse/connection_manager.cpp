@@ -88,7 +88,7 @@ ClickhouseManager::generate_slot_statement(const logical_plan::node_ptr& node,
                                            const logical_plan::storage_parameters* parameters) {
     OTX_ZONE_N("ClickhouseManager::generate_slot_statement");
     slot_statement_t statement;
-    statement.table = target.name.collection;
+    statement.table = target.name.collection.t;
     if (node->type() == logical_plan::node_type::unused) {
         auto& stub = static_cast<schema_utils::schema_node_t&>(*node);
         if (stub.has_raw_sql()) {
@@ -99,7 +99,7 @@ ClickhouseManager::generate_slot_statement(const logical_plan::node_ptr& node,
             }
             statement.sql = std::move(rendered.value());
             if (!stub.qualifiers().empty()) {
-                statement.table = stub.qualifiers().front().name.collection;
+                statement.table = stub.qualifiers().front().name.collection.t;
             }
             return std::move(statement);
         }
@@ -187,14 +187,14 @@ const ClickhouseManager::named_types_t* ClickhouseManager::named_types_for(const
 actor_zeta::unique_future<core::result_wrapper_t<catalog_ext::discovered_tables_t>>
 ClickhouseManager::discover(qualified_name_t scope) {
     OTX_ZONE_N("ClickhouseManager::discover");
-    const std::string& uuid = scope.unique_identifier;
-    if (scope.database.empty()) {
+    const std::string& uuid = scope.unique_identifier.t;
+    if (scope.database.t.empty()) {
         log_->error("discover: no ClickHouse database configured for uuid {}", uuid);
         co_return make_error(resource(),
                              core::error_code_t::missing_field,
                              "Cannot discover ClickHouse schema: no database configured for uuid: " + uuid);
     }
-    const std::string& database = scope.database;
+    const std::string& database = scope.database.t;
 
     catalog_ext::discovered_tables_t out(resource());
     // Named types first, then the `WHERE 1 = 0` probe, which answers with the
@@ -211,19 +211,19 @@ ClickhouseManager::discover(qualified_name_t scope) {
             std::pmr::string{table_name.c_str(), resource()},
             overrides);
 
-        qualified_name_t table(uuid, database, "", table_name);
+        qualified_name_t table(core::uid_t{uuid}, core::dbname_t{database}, core::schema_t{}, core::relname_t{table_name});
         auto schema_handler = [this, table, overrides, &out](const ch::select_result_t& probe_result)
             -> otterstax::asio_error_t {
             const auto& schema_blocks = probe_result.blocks;
             if (schema_blocks.empty() || schema_blocks[0].GetColumnCount() == 0) {
                 return make_error(resource(),
                                   core::error_code_t::schema_error,
-                                  "ClickHouse schema probe returned no columns for " + table.database + "." +
-                                      table.collection);
+                                  "ClickHouse schema probe returned no columns for " + table.database.t + "." +
+                                      table.collection.t);
             }
             auto schema_struct = tsl::ch_to_struct(resource(), schema_blocks[0], overrides);
             out.push_back(catalog_ext::discovered_table_t{table, std::move(schema_struct)});
-            log_->info("discover: schema discovered for: {}.{}", table.database, table.collection);
+            log_->info("discover: schema discovered for: {}.{}", table.database.t, table.collection.t);
             return otterstax::asio_error_t{};
         };
         auto probe_query = otterstax::catalog::make_schema_probe_query(resource(), table, backend_type_t::ClickHouse);
@@ -234,8 +234,8 @@ ClickhouseManager::discover(qualified_name_t scope) {
         return connector_manager_->executeQuery(uuid, probe_query.value(), schema_handler).get();
     };
 
-    if (!scope.collection.empty()) {
-        if (auto err = probe(scope.collection); err.contains_error()) {
+    if (!scope.collection.t.empty()) {
+        if (auto err = probe(scope.collection.t); err.contains_error()) {
             co_return std::move(err);
         }
         co_return std::move(out);
@@ -327,7 +327,7 @@ ClickhouseManager::execute(session_hash_t id, ParsedQueryDataPtr data) {
 
             auto& node = *batch_nodes[i].node;
             const auto& target = batch_nodes[i].target;
-            const auto& uid = target.name.unique_identifier;
+            const auto& uid = target.name.unique_identifier.t;
             log_->trace("UID: {}", uid);
 
             // A data_t slot was already fetched by another backend's manager.
@@ -431,7 +431,7 @@ ClickhouseManager::execute(session_hash_t id, ParsedQueryDataPtr data) {
             // the query without one has broken that contract, and a plan slot
             // cannot be filled from nothing.
             if (!chunk_ptr) {
-                const auto& uid = batch_nodes[i].target.name.unique_identifier;
+                const auto& uid = batch_nodes[i].target.name.unique_identifier.t;
                 if (conversion_errors[j].has_value()) {
                     log_->error("execute result[{}]: backend '{}' result conversion failed: {}",
                                 j,
@@ -506,7 +506,7 @@ ClickhouseManager::describe(session_hash_t id, ParsedQueryDataPtr data) {
         for (size_t i = 0; i < batch_nodes.size(); i++) {
             auto& node = *batch_nodes[i].node;
             const auto& target = batch_nodes[i].target;
-            const auto& uid = target.name.unique_identifier;
+            const auto& uid = target.name.unique_identifier.t;
 
             // Only a stub carries a schema the backend can fill: the catalog's,
             // made of an aggregate slot, or the parser's, holding the raw SQL of

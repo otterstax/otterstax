@@ -154,11 +154,15 @@ TEST_CASE("file transform: ExtensionNode lowers to an external_node_t") {
     components::sql::transform::transformer tr(&arena, nullptr, &registry);
     auto result = tr.transform(*node);
     REQUIRE_FALSE(result.has_error());
-    REQUIRE(result.node_ptr() != nullptr);
+    // The plan is reached only through finalize().
+    auto finalized = result.finalize();
+    REQUIRE_FALSE(finalized.has_error());
+    const auto root = finalized.value().sub_queries.back();
+    REQUIRE(root != nullptr);
     // external_node_t is tagged node_type::unused; nothing else the extension
     // transform produces carries that tag.
-    REQUIRE(result.node_ptr()->type() == components::logical_plan::node_type::unused);
-    auto* ext = static_cast<otterstax::external::external_node_t*>(result.node_ptr().get());
+    REQUIRE(root->type() == components::logical_plan::node_type::unused);
+    auto* ext = static_cast<otterstax::external::external_node_t*>(root.get());
     CHECK(ext->op() == otterstax::external::external_op_t::create_external_table);
     CHECK_FALSE(ext->is_s3());
     CHECK(ext->location() == "/data/d.parquet");

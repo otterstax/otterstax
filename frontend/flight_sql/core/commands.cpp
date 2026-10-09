@@ -298,15 +298,15 @@ std::shared_ptr<arrow::RecordBatch> tables_batch(const fps::CommandGetTables& cm
     arrow::BinaryBuilder schema_bytes(pool);
     const auto& table_filter = cmd.table_name_filter_pattern();
     for (const auto& t : md.tables) {
-        if (!table_filter.empty() && !like_match(t.name.collection.c_str(), table_filter)) continue;
+        if (!table_filter.empty() && !like_match(t.name.collection.t.c_str(), table_filter)) continue;
         bool type_ok = cmd.table_types().empty();
         for (const auto& tt : cmd.table_types()) {
             if (tt == catalog_ext::table_type_name) type_ok = true;
         }
         if (!type_ok) continue;
-        catalogs.Append(t.name.database.c_str());
-        schemas.Append(t.name.schema.c_str());
-        names.Append(t.name.collection.c_str());
+        catalogs.Append(t.name.database.t.c_str());
+        schemas.Append(t.name.schema.t.c_str());
+        names.Append(t.name.collection.t.c_str());
         types.Append(std::string{catalog_ext::table_type_name});
         if (cmd.include_schema()) {
             // The table's arrow schema, through the project converter the file

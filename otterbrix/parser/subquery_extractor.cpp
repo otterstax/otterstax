@@ -237,14 +237,12 @@ namespace otterstax::parser {
 
         const char* cstr_or_empty(const char* s) { return (s && s[0] != '\0') ? s : ""; }
 
-        char* arena_c_str(std::pmr::memory_resource* arena, std::string_view text) {
-            if (text.empty()) {
-                return nullptr;
-            }
-            auto* copy = static_cast<char*>(arena->allocate(text.size() + 1, alignof(char)));
-            std::memcpy(copy, text.data(), text.size());
-            copy[text.size()] = '\0';
-            return copy;
+        // The four name parts as the raw tree spells them.
+        qualified_name_t make_name(const char* uid, const char* database, const char* schema, const char* relation) {
+            return qualified_name_t{core::uid_t{std::string{uid}},
+                                    core::dbname_t{std::string{database}},
+                                    core::schema_t{std::string{schema}},
+                                    core::relname_t{std::string{relation}}};
         }
 
         void collect_qualifiers_in_subtree(Node* node,
@@ -270,10 +268,10 @@ namespace otterstax::parser {
                 }
                 q.length = abs_end - rv->location;
 
-                q.name = qualified_name_t(cstr_or_empty(rv->uid),
-                                          cstr_or_empty(rv->catalogname),
-                                          cstr_or_empty(rv->schemaname),
-                                          cstr_or_empty(rv->relname));
+                q.name = make_name(cstr_or_empty(rv->uid),
+                                   cstr_or_empty(rv->catalogname),
+                                   cstr_or_empty(rv->schemaname),
+                                   cstr_or_empty(rv->relname));
                 if (q.start >= 0 && q.length > 0) {
                     out.push_back(std::move(q));
                 }
@@ -472,22 +470,17 @@ namespace otterstax::parser {
                     // rel | db.rel | db.schema.rel | uid.db.schema.rel
                     switch (parts.size()) {
                         case 1:
-                            return register_target(qualified_name_t("", "", "", parts[0]), "", parts[0], nullptr);
+                            out.add(make_name("", "", "", parts[0]));
+                            break;
                         case 2:
-                            return register_target(qualified_name_t("", parts[0], "", parts[1]),
-                                                   parts[0],
-                                                   parts[1],
-                                                   nullptr);
+                            out.add(make_name("", parts[0], "", parts[1]));
+                            break;
                         case 3:
-                            return register_target(qualified_name_t("", parts[0], parts[1], parts[2]),
-                                                   parts[0],
-                                                   parts[2],
-                                                   nullptr);
+                            out.add(make_name("", parts[0], parts[1], parts[2]));
+                            break;
                         case 4:
-                            return register_target(qualified_name_t(parts[0], parts[1], parts[2], parts[3]),
-                                                   parts[1],
-                                                   parts[3],
-                                                   nullptr);
+                            out.add(make_name(parts[0], parts[1], parts[2], parts[3]));
+                            break;
                         default:
                             // transform_drop rejects other arities with a
                             // parse error before resolution runs.
@@ -500,20 +493,17 @@ namespace otterstax::parser {
                     // table form for indexes).
                     switch (parts.size()) {
                         case 3:
-                            return register_target(qualified_name_t("", parts[0], "", parts[1]),
-                                                   parts[0],
-                                                   parts[1],
-                                                   parts[2]);
+                            out.add(make_name("", parts[0], "", parts[1]));
+                            out.add(make_name("", parts[0], "", parts[2]));
+                            break;
                         case 4:
-                            return register_target(qualified_name_t("", parts[0], parts[1], parts[2]),
-                                                   parts[0],
-                                                   parts[2],
-                                                   parts[3]);
+                            out.add(make_name("", parts[0], parts[1], parts[2]));
+                            out.add(make_name("", parts[0], parts[1], parts[3]));
+                            break;
                         case 5:
-                            return register_target(qualified_name_t(parts[0], parts[1], parts[2], parts[3]),
-                                                   parts[1],
-                                                   parts[3],
-                                                   parts[4]);
+                            out.add(make_name(parts[0], parts[1], parts[2], parts[3]));
+                            out.add(make_name(parts[0], parts[1], parts[2], parts[4]));
+                            break;
                         default:
                             return core::error_t::no_error();
                     }
@@ -538,10 +528,10 @@ namespace otterstax::parser {
             // Register EVERY RangeVar — including local (uid-less) ones — so
             // a registry hit with an empty unique_identifier marks a LOCAL
             // (otterbrix) table, while a miss is a real resolution error.
-            out.add(qualified_name_t(cstr_or_empty(rv->uid),
-                                     cstr_or_empty(rv->catalogname),
-                                     cstr_or_empty(rv->schemaname),
-                                     cstr_or_empty(rv->relname)));
+            out.add(make_name(cstr_or_empty(rv->uid),
+                              cstr_or_empty(rv->catalogname),
+                              cstr_or_empty(rv->schemaname),
+                              cstr_or_empty(rv->relname)));
         });
         return core::error_t::no_error();
     }

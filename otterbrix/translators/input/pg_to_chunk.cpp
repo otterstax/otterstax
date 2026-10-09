@@ -7,6 +7,7 @@
 
 #include "utility/tracy_profiler.hpp"
 
+#include <algorithm>
 #include <charconv>
 #include <cstring>
 #include <string_view>
@@ -190,6 +191,22 @@ namespace tsl {
             }
         }
 
+        // The enum value whose entry is named `key`, or NA for a key the type
+        // does not list — what the engine's create_enum(key) answered before it
+        // was dropped (the entries carry the ordinal and the name as alias).
+        types::logical_value_t
+        enum_value_of(std::pmr::memory_resource* resource, const types::complex_logical_type& type, std::string_view key) {
+            const auto* extension = static_cast<const types::enum_logical_type_extension*>(type.extension());
+            const auto& entries = extension->entries();
+            auto it = std::find_if(entries.begin(), entries.end(), [key](const types::logical_value_t& entry) {
+                return entry.type().alias() == key;
+            });
+            if (it == entries.end()) {
+                return types::logical_value_t{resource, types::complex_logical_type{types::logical_type::NA}};
+            }
+            return types::logical_value_t::create_enum(resource, type, it->value<int32_t>());
+        }
+
         void set_enum(data_chunk_t& chunk,
                       PGresult* result,
                       int row_index,
@@ -202,7 +219,7 @@ namespace tsl {
             const char* val = PQgetvalue(result, row_index, column_index);
             chunk.set_value(column_index,
                             row_index,
-                            types::logical_value_t::create_enum(chunk.resource(), type, std::string_view(val)));
+                            enum_value_of(chunk.resource(), type, std::string_view(val)));
         }
 
         struct value_translator_t {

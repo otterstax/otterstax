@@ -59,7 +59,6 @@ target_link_libraries(
     actor-zeta::actor-zeta
     otterbrix::otterbrix
     Catch2::Catch2
-    otterbrix_log
 )
 
 otterstax_discover_tests(${PROJECT_NAME})

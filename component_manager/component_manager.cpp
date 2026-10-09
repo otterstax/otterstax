@@ -19,26 +19,9 @@
 constexpr size_t MAX_THROUGHPUT =
     1000; // MAX_THROUGHPUT is the maximum number of messages an actor will process before yielding to the scheduler. Setting it to a high value (or to std::numeric_limits<size_t>::max()) means actors will yield only when they have no more messages to process, which can improve performance for actors that process many messages in bursts but can lead to starvation of other actors if one actor receives a continuous stream of messages.
 
-namespace {
-    otterstax::names::alias_registry_t make_alias_registry(const config::ConnectionsConfig& connections) {
-        otterstax::names::alias_registry_t aliases;
-        for (const auto& connection : connections.mysql) {
-            aliases.add(connection.alias, {backend_type_t::MySQL, connection.database, {}});
-        }
-        for (const auto& connection : connections.postgresql) {
-            aliases.add(connection.alias, {backend_type_t::PostgreSQL, connection.database, connection.schema});
-        }
-        for (const auto& connection : connections.clickhouse) {
-            aliases.add(connection.alias, {backend_type_t::ClickHouse, connection.database, {}});
-        }
-        return aliases;
-    }
-} // namespace
-
-ComponentManager::ComponentManager(const configuration::config& config, const config::ConnectionsConfig& connections)
-    : engine_(new db::otterbrix_engine_t(config))
-    , resource_(engine_->dispatcher()->resource())
-    , aliases_(make_alias_registry(connections)) {
+ComponentManager::ComponentManager(const configuration::config& config)
+    : engine_(db::make_otterbrix_engine(config))
+    , resource_(engine_->dispatcher()->resource()) {
     OTX_ZONE_N("ComponentManager::init");
 
     initialize_all_loggers(config.log.path.c_str());

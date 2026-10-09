@@ -249,9 +249,9 @@ namespace otterstax::kafka {
         if (!agg) {
             co_return invalid("SELECT has no aggregate/source table");
         }
-        const auto src_it = registry_.find(agg->relname().t);
+        const auto src_it = registry_.find(agg->target().collection.t);
         if (src_it == registry_.end()) {
-            co_return invalid("unknown source '" + agg->relname().t + "'");
+            co_return invalid("unknown source '" + agg->target().collection.t + "'");
         }
         auto stream_columns =
             stream_output_schema(resource_, *agg, plan.value().parameters.get(), src_it->second.columns);

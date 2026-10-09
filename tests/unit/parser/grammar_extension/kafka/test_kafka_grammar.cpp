@@ -231,8 +231,12 @@ TEST_CASE("kafka grammar: transform lowers to a kafka_node_t") {
     components::sql::transform::transformer tr(&arena, nullptr, &registry);
     auto result = tr.transform(*node);
     REQUIRE_FALSE(result.has_error());
+    // The plan is reached only through finalize().
+    auto finalized = result.finalize();
+    REQUIRE_FALSE(finalized.has_error());
+    const auto root = finalized.value().sub_queries.back();
 
-    auto plan = result.node_ptr();
+    auto plan = root;
     REQUIRE(plan != nullptr);
     // The kafka extension is the only producer of a node_type::unused root here
     REQUIRE(plan->type() == lp::node_type::unused);
@@ -265,10 +269,14 @@ TEST_CASE("kafka grammar: transform folds identifiers, preserves topic case") {
     components::sql::transform::transformer tr(&arena, nullptr, &registry);
     auto result = tr.transform(*node);
     REQUIRE_FALSE(result.has_error());
+    // The plan is reached only through finalize().
+    auto finalized = result.finalize();
+    REQUIRE_FALSE(finalized.has_error());
+    const auto root = finalized.value().sub_queries.back();
 
-    REQUIRE(result.node_ptr() != nullptr);
-    REQUIRE(result.node_ptr()->type() == lp::node_type::unused);
-    auto* kn = static_cast<otterstax::kafka::kafka_node_t*>(result.node_ptr().get());
+    REQUIRE(root != nullptr);
+    REQUIRE(root->type() == lp::node_type::unused);
+    auto* kn = static_cast<otterstax::kafka::kafka_node_t*>(root.get());
     // object + column identifiers fold to lower
     CHECK(kn->name() == "orders");
     REQUIRE(kn->columns().size() == 2);
@@ -289,10 +297,14 @@ TEST_CASE("kafka grammar: transform of a DROP node") {
     components::sql::transform::transformer tr(&arena, nullptr, &registry);
     auto result = tr.transform(*node);
     REQUIRE_FALSE(result.has_error());
+    // The plan is reached only through finalize().
+    auto finalized = result.finalize();
+    REQUIRE_FALSE(finalized.has_error());
+    const auto root = finalized.value().sub_queries.back();
 
-    REQUIRE(result.node_ptr() != nullptr);
-    REQUIRE(result.node_ptr()->type() == lp::node_type::unused);
-    auto* kn = static_cast<otterstax::kafka::kafka_node_t*>(result.node_ptr().get());
+    REQUIRE(root != nullptr);
+    REQUIRE(root->type() == lp::node_type::unused);
+    auto* kn = static_cast<otterstax::kafka::kafka_node_t*>(root.get());
     CHECK(kn->op() == otterstax::kafka::kafka_op::drop_stream);
     CHECK(kn->if_exists());
     CHECK(kn->columns().empty());

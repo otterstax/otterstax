@@ -63,15 +63,15 @@ namespace pg {
         // For PostgreSQL: use schema.table format
         // qualified_name_t(database, schema, collection) -> database.schema, with unique_identifier=uuid
         // We need to store: uuid=alias, database, schema, table
-        qualified_name_t name(uuid,
-                                    connection_param.database,
-                                    connection_param.schema.empty() ? "public" : connection_param.schema,
-                                    connection_param.table);
+        qualified_name_t name(core::uid_t{uuid},
+                              core::dbname_t{connection_param.database},
+                              core::schema_t{connection_param.schema.empty() ? "public" : connection_param.schema},
+                              core::relname_t{connection_param.table});
         log_->debug("Creating collection_full_name: uid={}, db={}, schema={}, table={}",
-                    name.unique_identifier,
-                    name.database,
-                    name.schema,
-                    name.collection);
+                    name.unique_identifier.t,
+                    name.database.t,
+                    name.schema.t,
+                    name.collection.t);
         // The catalog answers synchronously (running the probes through the
         // PostgreSQL backend actor that owns this manager), and a connection
         // whose schema could not be registered is unusable for federated SQL,

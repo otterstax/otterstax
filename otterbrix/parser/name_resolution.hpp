@@ -11,10 +11,32 @@
 #include <memory_resource>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 
+// The engine's qualified_name_t lost its defaulted ordering; OtterStax keys
+// std::map's by it (the schema dependency maps), so the ordering it had —
+// lexicographic over (unique_identifier, database, schema, collection) — is
+// restored here. Declared in the global namespace, qualified_name_t's own, so
+// std::less finds it by ADL.
+inline bool operator<(const qualified_name_t& lhs, const qualified_name_t& rhs) {
+    return std::tie(lhs.unique_identifier.t, lhs.database.t, lhs.schema.t, lhs.collection.t) <
+           std::tie(rhs.unique_identifier.t, rhs.database.t, rhs.schema.t, rhs.collection.t);
+}
+
 namespace otterstax::names {
+
+    // A table as OtterStax messages name it: `<database>.<collection>`, or
+    // `NonCollectionData` for an empty name — the spelling of the engine's
+    // qualified_name_t::to_string() before it began to spell every slot
+    // (uid.db.schema.rel). The messages keep the spelling they had.
+    inline std::string display_name(const qualified_name_t& name) {
+        if (name.empty()) {
+            return "NonCollectionData";
+        }
+        return name.database.t + "." + name.collection.t;
+    }
 
     // Registry mapping the (dbname, relname) pair carried on transformed
     // logical-plan nodes back to the original fully-qualified table name

@@ -12,7 +12,7 @@
 #include "utility/logger.hpp"
 
 #include <boost/mysql/connect_params.hpp>
-#include <otterbrix/otterbrix.hpp>
+#include <integration/cpp/otterbrix.hpp>
 
 #include <catch2/catch_all.hpp>
 

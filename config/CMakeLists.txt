@@ -32,7 +32,6 @@ target_link_libraries(config
 # Ensure otterbrix logging headers (components/log) are available to config
 target_link_libraries(config
     PUBLIC
-    otterbrix_log
     otterbrix::otterbrix
 )
 

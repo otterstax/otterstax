@@ -81,7 +81,7 @@ namespace otterstax::kafka::detail {
             std::vector<std::string> out_payloads;
             auto chunk = json_to_chunk(resource_, source_columns_, payloads);
             if (chunk.size() > 0) {
-                auto agg = logical_plan::make_node_aggregate(resource_, {}, {});
+                auto agg = logical_plan::make_node_aggregate(resource_, qualified_name_t{});
                 agg->append_child(logical_plan::make_node_raw_data(resource_, std::move(chunk)));
                 for (const auto& op : operators_) {
                     agg->append_child(logical_plan::node_ptr(op)); // copy: keep operators_ intact

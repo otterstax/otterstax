@@ -130,9 +130,9 @@ namespace otterstax::schema_probe {
                 components::expressions::compare_type::eq,
                 components::expressions::key_t{resource, column, components::expressions::side_t::left},
                 bound);
-            auto aggregate = make_node_aggregate(resource, core::dbname_t{catalog_db}, core::relname_t{catalog_rel});
-            aggregate->append_child(
-                make_node_match(resource, core::dbname_t{catalog_db}, core::relname_t{catalog_rel}, predicate));
+            const qualified_name_t target{core::dbname_t{catalog_db}, core::relname_t{catalog_rel}};
+            auto aggregate = make_node_aggregate(resource, target);
+            aggregate->append_child(make_node_match(resource, target, predicate));
             return probe_t{std::move(aggregate), std::move(params), std::move(subject)};
         }
 
@@ -144,9 +144,9 @@ namespace otterstax::schema_probe {
                                     const std::string& database,
                                     const std::string& collection) {
         using namespace components::logical_plan;
-        auto aggregate = make_node_aggregate(resource, core::dbname_t{database}, core::relname_t{collection});
-        aggregate->append_child(
-            make_node_limit(resource, core::dbname_t{database}, core::relname_t{collection}, limit_t{0}));
+        auto aggregate =
+            make_node_aggregate(resource, qualified_name_t{core::dbname_t{database}, core::relname_t{collection}});
+        aggregate->append_child(make_node_limit(resource, limit_t{0}));
         return probe_t{std::move(aggregate),
                        make_parameter_node(resource),
                        detail::qualified(resource, database, collection)};

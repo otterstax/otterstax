@@ -8,7 +8,7 @@
 #include <components/logical_plan/node_insert.hpp>
 #include <components/table/column_definition.hpp>
 #include <components/vector/data_chunk.hpp>
-#include <otterbrix/otterbrix.hpp>
+#include <integration/cpp/otterbrix.hpp>
 
 #include "integration/otterbrix/otterbrix_engine.hpp" // db::otterbrix_engine_ptr + otterbrix::base_otterbrix_t
 #include "otterbrix/translators/input/mysql_to_chunk.hpp"

@@ -1,7 +1,7 @@
 #include "otterbrix/config.hpp"
 #include <catch2/catch_all.hpp>
 #include <iostream>
-#include <otterbrix/otterbrix.hpp>
+#include <integration/cpp/otterbrix.hpp>
 
 #include "integration/otterbrix/otterbrix_engine.hpp" // db::make_otterbrix_engine
 

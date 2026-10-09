@@ -325,14 +325,14 @@ TEST_CASE("ClickhouseManager::discover: a rediscovered table carries the backend
 
     // First discovery: system.columns says String, the probe block is a String
     // column — a plain string column either way.
-    auto first = stack.discover(qualified_name_t{"1", "ev", "", "events"});
+    auto first = stack.discover(qualified_name_t{core::uid_t{"1"}, core::dbname_t{"ev"}, core::schema_t{}, core::relname_t{"events"}});
     REQUIRE_FALSE(first.has_error());
     REQUIRE(column_t_type(first.value()) == components::types::logical_type::STRING_LITERAL);
 
     // The backend now reports a named tuple for the same column: the override
     // must shape the discovered schema, and the entry seen first must not win.
     g_ch_type_variant.store(1);
-    auto second = stack.discover(qualified_name_t{"1", "ev", "", "events"});
+    auto second = stack.discover(qualified_name_t{core::uid_t{"1"}, core::dbname_t{"ev"}, core::schema_t{}, core::relname_t{"events"}});
     REQUIRE_FALSE(second.has_error());
     REQUIRE(column_t_type(second.value()) == components::types::logical_type::STRUCT);
 

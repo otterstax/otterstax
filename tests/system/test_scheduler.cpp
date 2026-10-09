@@ -27,7 +27,7 @@
 #include <boost/asio/detached.hpp>
 #include <boost/asio/io_context.hpp>
 #include <core/result_wrapper.hpp>
-#include <otterbrix/otterbrix.hpp>
+#include <integration/cpp/otterbrix.hpp>
 
 #include <catch2/catch_all.hpp>
 #include <chrono>
@@ -345,22 +345,20 @@ public:
 
         auto resource = std::pmr::new_delete_resource();
 
-        auto binder = sql::transform::transform_result(
+        auto node = logical_plan::make_node_aggregate(
             resource,
-            logical_plan::execution_plan_t(resource,
-                                           logical_plan::make_node_aggregate(resource,
-                                                                             core::uid_t{"result"},
-                                                                             core::dbname_t{"db"},
-                                                                             core::relname_t{"result_table"}),
-                                           logical_plan::make_parameter_node(resource)),
-            sql::transform::transform_result::parameter_map_t{resource},
-            sql::transform::transform_result::insert_map_t{resource},
-            sql::transform::transform_result::insert_rows_t(resource));
+            qualified_name_t{core::uid_t{"result"}, core::dbname_t{"db"}, core::schema_t{}, core::relname_t{"result_table"}});
+        auto params = logical_plan::make_parameter_node(resource);
+        auto binder = sql::transform::transform_result(resource,
+                                                       logical_plan::execution_plan_t(resource, node, params),
+                                                       sql::transform::transform_result::parameter_map_t{resource},
+                                                       sql::transform::transform_result::insert_map_t{resource},
+                                                       sql::transform::transform_result::insert_rows_t(resource));
 
         auto parsed = std::make_unique<ParsedQueryData>(
             std::make_unique<OtterbrixStatement>(std::pmr::vector<std::pmr::vector<external_entry_t>>{resource},
-                                                 binder.params_ptr(),
-                                                 binder.node_ptr(),
+                                                 std::move(params),
+                                                 std::move(node),
                                                  2), // 2 external nodes
             std::move(binder),
             NodeTag::T_SelectStmt);
@@ -377,13 +375,13 @@ public:
         parsed->otterbrix_params->external_nodes.back().push_back(
             external_entry_t{&parsed->otterbrix_params->node,
                              otterstax::names::resolved_target_t{components::catalog::INVALID_OID,
-                                                                 qualified_name_t{"campaigns", "", "", "campaigns"},
+                                                                 qualified_name_t{core::uid_t{"campaigns"}, core::dbname_t{}, core::schema_t{}, core::relname_t{"campaigns"}},
                                                                  {}}});
         parsed->otterbrix_params->external_nodes.emplace_back();
         parsed->otterbrix_params->external_nodes.back().push_back(
             external_entry_t{&parsed->otterbrix_params->node,
                              otterstax::names::resolved_target_t{components::catalog::INVALID_OID,
-                                                                 qualified_name_t{"products", "pgdb", "public", "products"},
+                                                                 qualified_name_t{core::uid_t{"products"}, core::dbname_t{"pgdb"}, core::schema_t{"public"}, core::relname_t{"products"}},
                                                                  {}}});
         parsed->otterbrix_params->external_nodes_count = 2;
 

@@ -118,10 +118,9 @@ namespace schema_utils {
         : logical_plan::node_t(resource, logical_plan::node_type::unused)
         , name_(name)
         , schema_()
-        , agg_node_(logical_plan::make_node_aggregate(resource,
-                                                      core::uid_t{name.unique_identifier},
-                                                      core::dbname_t{name.database},
-                                                      core::relname_t{name.collection}))
+        , agg_node_(logical_plan::make_node_aggregate(
+              resource,
+              qualified_name_t{name.unique_identifier, name.database, core::schema_t{}, name.collection}))
         , raw_sql_(std::pmr::string{raw_sql, resource})
         , qualifiers_(qualifiers, resource) {}
 
@@ -322,7 +321,7 @@ namespace schema_utils {
             return cursor::make_cursor(node.resource(),
                                        core::error_t(core::error_code_t::schema_error,
                                                      std::pmr::string{("OtterBrix collection is missing in catalog " +
-                                                                       node.dbname().t + "." + node.relname().t)
+                                                                       node.target().database.t + "." + node.target().collection.t)
                                                                           .c_str(),
                                                                       node.resource()}));
         }

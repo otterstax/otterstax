@@ -64,14 +64,12 @@ namespace otterstax::catalog {
     make_schema_probe_query(std::pmr::memory_resource* resource, const qualified_name_t& name, backend_type_t backend) {
         OTX_ZONE_N("catalog::make_schema_probe_query");
         logical_plan::parameter_node_t param(resource);
-        auto node = logical_plan::make_node_aggregate(resource,
-                                                      core::uid_t{name.unique_identifier},
-                                                      core::dbname_t{name.database},
-                                                      core::relname_t{name.collection});
+        auto node = logical_plan::make_node_aggregate(
+            resource,
+            qualified_name_t{name.unique_identifier, name.database, core::schema_t{}, name.collection});
         node->append_child(logical_plan::make_node_match(
             resource,
-            core::dbname_t{name.database},
-            core::relname_t{name.collection},
+            qualified_name_t{name.database, name.collection},
             expressions::make_compare_expression(resource,
                                                  expressions::compare_type::eq,
                                                  param.add_parameter(types::logical_value_t(resource, 1)),

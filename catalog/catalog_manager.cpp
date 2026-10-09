@@ -10,7 +10,7 @@
 #include "otterbrix/parser/grammar_extension/kafka/kafka_node.hpp"
 #include "utility/tracy_profiler.hpp"
 
-#include <components/logical_plan/identifier_types.hpp>
+#include <components/base/identifier_types.hpp>
 #include <components/logical_plan/node_drop.hpp>
 #include <components/table/column_definition.hpp>
 
@@ -216,18 +216,18 @@ namespace mysql {
                 const auto& name = target.name;
 
                 // Determine backend type for this node
-                auto conn_type_opt = getConnectionType(name.unique_identifier);
+                auto conn_type_opt = getConnectionType(name.unique_identifier.t);
                 if (conn_type_opt.has_value()) {
                     auto conn_type = conn_type_opt.value();
                     if (conn_type == catalog_ext::ConnectionType::MySQL) {
                         has_mysql = true;
-                        data->node_backend_types[name.unique_identifier] = backend_type_t::MySQL;
+                        data->node_backend_types[name.unique_identifier.t] = backend_type_t::MySQL;
                     } else if (conn_type == catalog_ext::ConnectionType::PostgreSQL) {
                         has_pg = true;
-                        data->node_backend_types[name.unique_identifier] = backend_type_t::PostgreSQL;
+                        data->node_backend_types[name.unique_identifier.t] = backend_type_t::PostgreSQL;
                     } else if (conn_type == catalog_ext::ConnectionType::ClickHouse) {
                         has_ch = true;
-                        data->node_backend_types[name.unique_identifier] = backend_type_t::ClickHouse;
+                        data->node_backend_types[name.unique_identifier.t] = backend_type_t::ClickHouse;
                     }
                 }
 
@@ -243,12 +243,12 @@ namespace mysql {
                 // Stamp the engine OID resolved at registration time.
                 auto oid = store_.find(name);
                 if (oid == components::catalog::INVALID_OID) {
-                    if (!name.unique_identifier.empty()) {
+                    if (!name.unique_identifier.t.empty()) {
                         log_->error("update_backend_type_impl: no registered schema for external table {}",
-                                    name.to_string());
+                                    otterstax::names::display_name(name));
                         return make_error(resource(),
                                           core::error_code_t::table_not_exists,
-                                          "External table is not registered: " + name.to_string());
+                                          "External table is not registered: " + otterstax::names::display_name(name));
                     }
                     // No connection uid — local Otterbrix table, resolved by the engine itself.
                 } else {
@@ -298,7 +298,7 @@ namespace mysql {
         for (auto& batch : data.otterbrix_params->external_nodes) {
             for (auto& entry : batch) {
                 auto& target = entry.target;
-                if (target.name.unique_identifier.empty()) {
+                if (target.name.unique_identifier.t.empty()) {
                     continue;
                 }
                 auto exempt = is_schema_exempt(resource(), **entry.node);
@@ -309,7 +309,7 @@ namespace mysql {
                 if (exempt.value()) {
                     continue;
                 }
-                auto conn_type_opt = getConnectionType(target.name.unique_identifier);
+                auto conn_type_opt = getConnectionType(target.name.unique_identifier.t);
                 if (conn_type_opt.has_value() && conn_type_opt.value() != catalog_ext::ConnectionType::PostgreSQL) {
                     // ignore schema qualifier if not postgres
                     target.name.schema = "";
@@ -320,10 +320,10 @@ namespace mysql {
                     // connector manager, so there is no backend to probe.
                     if (!conn_type_opt.has_value()) {
                         log_->error("ensure_external_targets_registered: no registered connection for uid {}",
-                                    target.name.unique_identifier);
+                                    target.name.unique_identifier.t);
                         co_return make_error(resource(),
                                              core::error_code_t::do_not_exists,
-                                             "No registered connection for uuid: " + target.name.unique_identifier);
+                                             "No registered connection for uuid: " + target.name.unique_identifier.t);
                     }
                     auto err = co_await register_tables(target.name, conn_type_opt.value());
                     if (err.contains_error()) {
@@ -402,10 +402,10 @@ namespace mysql {
                     const auto* struct_schema = store_.schema_by_oid(target.oid);
                     if (struct_schema == nullptr) {
                         log_->error("get_catalog_schema: no schema registered for external table {}",
-                                    target.name.to_string());
+                                    otterstax::names::display_name(target.name));
                         co_return make_error(resource(),
                                              core::error_code_t::schema_error,
-                                             "No schema registered for external table: " + target.name.to_string());
+                                             "No schema registered for external table: " + otterstax::names::display_name(target.name));
                     }
 
                     const auto& agg = static_cast<logical_plan::node_aggregate_t&>(*(*node));
@@ -435,15 +435,15 @@ namespace mysql {
         // One uid belongs to exactly one backend: the registry entry made by a
         // previous registration is authoritative, and a message naming another
         // backend for the same uid is a wiring error, not a re-registration.
-        auto registered = getConnectionType(name.unique_identifier);
+        auto registered = getConnectionType(name.unique_identifier.t);
         if (registered.has_value() && registered.value() != type) {
             log_->error("add_connection_schema: uid {} is registered as {}, not {}",
-                        name.unique_identifier,
+                        name.unique_identifier.t,
                         backend_name(registered.value()),
                         backend_name(type));
             co_return make_error(resource(),
                                  core::error_code_t::invalid_parameter,
-                                 "Connection '" + name.unique_identifier + "' is registered as " +
+                                 "Connection '" + name.unique_identifier.t + "' is registered as " +
                                      backend_name(registered.value()) + ", not " + backend_name(type));
         }
         co_return co_await register_tables(name, type);
@@ -452,7 +452,7 @@ namespace mysql {
     actor_zeta::unique_future<core::error_t> CatalogManager::register_tables(const qualified_name_t& name,
                                                                              catalog_ext::ConnectionType type) {
         OTX_ZONE_N("catalog::register_tables");
-        const std::string uuid = name.unique_identifier;
+        const std::string uuid = name.unique_identifier.t;
 
         // Step 1: probe the remote backend and collect per-table STRUCT schemas.
         auto discovered = co_await discover_connection_schemas(name, type);
@@ -468,7 +468,7 @@ namespace mysql {
             const auto& fields = table.schema.child_types();
             for (size_t i = 0; i < fields.size(); ++i) {
                 if (!fields[i].has_alias()) {
-                    const std::string what = "Discovered table '" + table.name.to_string() +
+                    const std::string what = "Discovered table '" + otterstax::names::display_name(table.name) +
                                              "' has a column without a name at position " + std::to_string(i);
                     log_->error("add_connection_schema: {}", what);
                     co_return make_error(resource(), core::error_code_t::schema_error, what);
@@ -527,7 +527,7 @@ namespace mysql {
         // engine holds, created or restored.
         for (auto& table : tables) {
             if (store_.find(table.name) != components::catalog::INVALID_OID) {
-                log_->info("add_connection_schema: table {} already registered, skipping", table.name.to_string());
+                log_->info("add_connection_schema: table {} already registered, skipping", otterstax::names::display_name(table.name));
                 continue;
             }
 
@@ -547,18 +547,18 @@ namespace mysql {
             auto tbl_result = co_await std::move(tbl_future);
             if (tbl_result.has_error()) {
                 log_->error("add_connection_schema: failed to register external table {}: {}",
-                            table.name.to_string(),
+                            otterstax::names::display_name(table.name),
                             tbl_result.error().what.c_str());
                 co_return make_error(resource(),
                                      core::error_code_t::schema_error,
-                                     "Failed to register external table '" + table.name.to_string() +
+                                     "Failed to register external table '" + otterstax::names::display_name(table.name) +
                                          "': " + tbl_result.error().what.c_str());
             }
 
             auto oid = tbl_result.value();
             if (auto err = store_.put(oid, table.name, std::move(table.schema)); err.contains_error()) {
                 log_->error("add_connection_schema: failed to store schema for table {}: {}",
-                            table.name.to_string(),
+                            otterstax::names::display_name(table.name),
                             err.what.c_str());
                 // The engine already holds the collection; without its mirror
                 // in the store it would resolve nowhere, so the registration is
@@ -569,14 +569,14 @@ namespace mysql {
                 auto drop_result = co_await std::move(drop_future);
                 if (drop_result.has_error()) {
                     log_->error("add_connection_schema: failed to undo the engine registration of {}: {}",
-                                table.name.to_string(),
+                                otterstax::names::display_name(table.name),
                                 drop_result.error().what.c_str());
                     err.what.append("; undo failed: ");
                     err.what.append(drop_result.error().what);
                 }
                 co_return std::move(err);
             }
-            log_->info("add_connection_schema: registered {} with oid {}", table.name.to_string(), oid);
+            log_->info("add_connection_schema: registered {} with oid {}", otterstax::names::display_name(table.name), oid);
         }
 
         // The uid becomes routable only once its tables are mirrored: a failure
@@ -638,11 +638,11 @@ namespace mysql {
         if (backend == nullptr || !*backend) {
             log_->error("discover_connection_schemas: no {} backend manager registered (uid {})",
                         backend_name(conn_type),
-                        name.unique_identifier);
+                        name.unique_identifier.t);
             co_return make_error(resource(),
                                  core::error_code_t::do_not_exists,
                                  std::string{"No "} + backend_name(conn_type) +
-                                     " backend manager is registered for uid: " + name.unique_identifier);
+                                     " backend manager is registered for uid: " + name.unique_identifier.t);
         }
 
         switch (conn_type) {
@@ -661,7 +661,7 @@ namespace mysql {
         }
         co_return make_error(resource(),
                              core::error_code_t::invalid_parameter,
-                             "Unknown backend type for uid: " + name.unique_identifier);
+                             "Unknown backend type for uid: " + name.unique_identifier.t);
     }
 
     actor_zeta::unique_future<core::result_wrapper_t<std::pmr::vector<table_info>>>
@@ -682,15 +682,15 @@ namespace mysql {
                             const types::complex_logical_type& schema) {
             // FlightSQL filter mapping: command.catalog is an exact match on
             // the database part; the schema and table patterns are LIKE.
-            if (command.catalog && name.database != command.catalog.value()) {
+            if (command.catalog && name.database.t != command.catalog.value()) {
                 return;
             }
             if (command.db_schema_filter_pattern &&
-                !like_match(command.db_schema_filter_pattern.value(), name.schema)) {
+                !like_match(command.db_schema_filter_pattern.value(), name.schema.t)) {
                 return;
             }
             if (command.table_name_filter_pattern &&
-                !like_match(command.table_name_filter_pattern.value(), name.collection)) {
+                !like_match(command.table_name_filter_pattern.value(), name.collection.t)) {
                 return;
             }
 

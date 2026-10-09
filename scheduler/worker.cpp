@@ -108,7 +108,7 @@ namespace {
         }
         if (root->type() == logical_plan::node_type::create_database_t) {
             const auto& create = static_cast<const logical_plan::node_create_database_t&>(*root);
-            return std::pmr::string{std::string_view{create.dbname()}, resource};
+            return std::pmr::string{std::string_view{create.target().database.t}, resource};
         }
         if (root->type() != logical_plan::node_type::drop_t) {
             return std::pmr::string{resource};
@@ -117,10 +117,10 @@ namespace {
         if (drop.kind() != logical_plan::drop_target_kind::database) {
             return std::pmr::string{resource};
         }
-        if (drop.dbname().empty()) {
+        if (drop.target().database.t.empty()) {
             return make_error(resource, error_code_t::invalid_parameter, "DROP DATABASE names no database");
         }
-        return std::pmr::string{std::string_view{drop.dbname()}, resource};
+        return std::pmr::string{std::string_view{drop.target().database.t}, resource};
     }
 
     // The relations a plan reads, as the dependency map the schema computation
@@ -192,21 +192,21 @@ namespace {
                 if (insert.returning().empty()) {
                     return {};
                 }
-                return {&insert.returning(), &insert.dbname(), &insert.relname()};
+                return {&insert.returning(), &insert.target().database.t, &insert.target().collection.t};
             }
             case logical_plan::node_type::update_t: {
                 const auto& update = static_cast<const logical_plan::node_update_t&>(*statement);
                 if (update.returning().empty() || joins_a_source(update)) {
                     return {};
                 }
-                return {&update.returning(), &update.dbname(), &update.relname()};
+                return {&update.returning(), &update.target().database.t, &update.target().collection.t};
             }
             case logical_plan::node_type::delete_t: {
                 const auto& remove = static_cast<const logical_plan::node_delete_t&>(*statement);
                 if (remove.returning().empty() || joins_a_source(remove)) {
                     return {};
                 }
-                return {&remove.returning(), &remove.dbname(), &remove.relname()};
+                return {&remove.returning(), &remove.target().database.t, &remove.target().collection.t};
             }
             default:
                 return {};
@@ -415,6 +415,14 @@ actor_zeta::unique_future<Worker::session_result> Worker::execute(session_hash_t
             co_return forward_error(resource(), parsed.error(), "");
         }
         data = std::move(parsed.value());
+        // A direct execute has no Bind: a statement with placeholders would otherwise reach the
+        // engine (or a backend) carrying the parser's placeholder values.
+        if (data->awaiting_bind) {
+            co_return make_error(resource(),
+                                 error_code_t::invalid_parameter,
+                                 "statement has " + std::to_string(data->binder().parameter_count()) +
+                                     " parameter(s) and no values bound; prepare and bind it");
+        }
     }
 
     // CREATE EXTERNAL TABLE / COPY ... TO and Kafka DDL land on extension root
@@ -540,12 +548,12 @@ actor_zeta::unique_future<Worker::session_result> Worker::execute_statement(sess
         data_ptr = std::move(it->second.query_data_ptr);
         // A statement with placeholders runs only after execute_prepared_statement
         // has bound every one of them; executed without that Bind, the plan would
-        // reach the engine carrying unbound parameters.
-        if (auto& binder = data_ptr->binder(); !binder.all_bound()) {
+        // reach the engine carrying the parser's placeholder values.
+        if (data_ptr->awaiting_bind) {
             co_return make_error(resource(),
                                  error_code_t::invalid_parameter,
                                  "prepared statement executed without binding its " +
-                                     std::to_string(binder.parameter_count()) + " parameter(s)");
+                                     std::to_string(data_ptr->binder().parameter_count()) + " parameter(s)");
         }
     }
 
@@ -585,13 +593,24 @@ Worker::execute_prepared_statement(session_hash_t id, std::pmr::vector<types::lo
         }
         auto& data = *it->second.query_data_ptr;
         auto& binder = data.binder();
+        // The parser bound placeholders to $1..$N to reach the plan, so the binder
+        // reads as fully bound whatever arrives here: a Bind that leaves a `$n`
+        // without a value is refused here, as finalize() refuses it.
+        if (data.awaiting_bind && parameters.size() < binder.parameter_count()) {
+            std::string missing = "Not all parameters were bound:";
+            for (size_t id = parameters.size() + 1; id <= binder.parameter_count(); ++id) {
+                missing += " $" + std::to_string(id);
+            }
+            co_return make_error(resource(), error_code_t::sql_parse_error, "Argument binding failed: " + missing);
+        }
         for (size_t i = 0; i < parameters.size(); ++i) {
             binder.bind(i + 1, std::move(parameters[i]));
         }
         // finalize() is the only door onto the statement's catalog lookups, and a
-        // parameterized statement passes through it HERE rather than at parse
-        // time: the parser leaves it unfinalized while any `$n` is unbound (an
-        // early finalize records the failure and breaks every later bind). The
+        // parameterized statement takes them over HERE rather than at parse time:
+        // the parser finalized it over placeholder values only to reach its plan.
+        // This second finalize re-writes the client's values into the same
+        // parameter node (and an INSERT's row chunk) the statement holds. The
         // plan it answers is dropped — every execution site builds its own from
         // (node, params), because a backend manager may have replaced the root —
         // but the lookups are a sibling of that root and travel no other way, so
@@ -604,6 +623,7 @@ Worker::execute_prepared_statement(session_hash_t id, std::pmr::vector<types::lo
             co_return forward_error(resource(), bind_res.error(), "Argument binding failed: ");
         }
         data.otterbrix_params->catalog_resolves = bind_res.value().catalog_resolves;
+        data.awaiting_bind = false;
     }
 
     co_return co_await execute_statement(id);
@@ -1086,6 +1106,11 @@ Worker::copy_to(session_hash_t id, const otterstax::external::external_node_t& e
         auto inner = parse_sql(ext.inner_sql());
         if (inner.has_error()) {
             co_return forward_error(resource(), inner.error(), "COPY ... TO: ");
+        }
+        if (inner.value()->awaiting_bind) {
+            co_return make_error(resource(),
+                                 error_code_t::invalid_parameter,
+                                 "COPY ... TO: the inner query has parameters and no values bound");
         }
         statement = std::move(inner.value()->otterbrix_params);
 

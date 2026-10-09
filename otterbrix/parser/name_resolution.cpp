@@ -64,7 +64,7 @@ namespace otterstax::names {
     void name_registry_t::add(qualified_name_t name) {
         // Keyed by the dbname the transformer stamps: the RangeVar's catalogname,
         // which the grammar fills for every qualified name.
-        auto key = make_key_(name.database, name.collection);
+        auto key = make_key_(name.database.t, name.collection.t);
         auto it = entries_.find(key);
         if (it == entries_.end()) {
             entries_.emplace(std::move(key), std::move(name));
@@ -124,53 +124,59 @@ namespace otterstax::names {
         switch (node.type()) {
             case node_type::aggregate_t: {
                 const auto& d = static_cast<const components::logical_plan::node_aggregate_t&>(node);
-                db = d.dbname().t; // core::dbname_t — strong typedef over std::string
-                rel = d.relname().t;
+                db = d.target().database.t;
+                rel = d.target().collection.t;
                 break;
             }
             case node_type::match_t: {
                 const auto& d = static_cast<const components::logical_plan::node_match_t&>(node);
-                db = d.dbname();
-                rel = d.relname();
+                db = d.target().database.t;
+                rel = d.target().collection.t;
                 break;
             }
             case node_type::group_t: {
                 const auto& d = static_cast<const components::logical_plan::node_group_t&>(node);
-                db = d.dbname();
-                rel = d.relname();
+                db = d.target().database.t;
+                rel = d.target().collection.t;
                 break;
             }
             case node_type::sort_t: {
                 const auto& d = static_cast<const components::logical_plan::node_sort_t&>(node);
-                db = d.dbname();
-                rel = d.relname();
+                db = d.target().database.t;
+                rel = d.target().collection.t;
                 break;
             }
             case node_type::join_t: {
                 const auto& d = static_cast<const components::logical_plan::node_join_t&>(node);
-                db = d.dbname();
-                rel = d.relname();
+                db = d.target().database.t;
+                rel = d.target().collection.t;
                 break;
             }
             case node_type::limit_t: {
                 const auto& d = static_cast<const components::logical_plan::node_limit_t&>(node);
-                db = d.dbname();
-                rel = d.relname();
+                db = d.target().database.t;
+                rel = d.target().collection.t;
                 break;
             }
             case node_type::having_t: {
                 const auto& d = static_cast<const components::logical_plan::node_having_t&>(node);
-                db = d.dbname();
-                rel = d.relname();
+                db = d.target().database.t;
+                rel = d.target().collection.t;
                 break;
             }
             case node_type::create_collection_t: {
                 // CREATE TABLE: the database as written — empty for an
                 // unqualified `CREATE TABLE t`, whose registry hit is then the
-                // local `("", rel)` entry.
+                // local `("", rel)` entry. The transformer stamps `public` on
+                // an unqualified CREATE (its default_public namespace policy),
+                // while the raw AST registered the name as written, so a
+                // `public` nobody wrote reads as the empty database it was.
                 const auto& d = static_cast<const components::logical_plan::node_create_collection_t&>(node);
-                db = d.dbname();
-                rel = d.relname();
+                db = d.target().database.t;
+                rel = d.target().collection.t;
+                if (db == "public" && reg.find(db, rel) == nullptr && !reg.collided(db, rel)) {
+                    db = std::string_view{};
+                }
                 break;
             }
             case node_type::create_database_t: {
@@ -186,26 +192,26 @@ namespace otterstax::names {
             }
             case node_type::create_index_t: {
                 const auto& d = static_cast<const components::logical_plan::node_create_index_t&>(node);
-                db = d.dbname();
-                rel = d.relname();
+                db = d.target().database.t;
+                rel = d.target().collection.t;
                 break;
             }
             case node_type::insert_t: {
                 const auto& d = static_cast<const components::logical_plan::node_insert_t&>(node);
-                db = d.dbname();
-                rel = d.relname();
+                db = d.target().database.t;
+                rel = d.target().collection.t;
                 break;
             }
             case node_type::update_t: {
                 const auto& d = static_cast<const components::logical_plan::node_update_t&>(node);
-                db = d.dbname();
-                rel = d.relname();
+                db = d.target().database.t;
+                rel = d.target().collection.t;
                 break;
             }
             case node_type::delete_t: {
                 const auto& d = static_cast<const components::logical_plan::node_delete_t&>(node);
-                db = d.dbname();
-                rel = d.relname();
+                db = d.target().database.t;
+                rel = d.target().collection.t;
                 break;
             }
             case node_type::drop_t: {
@@ -223,12 +229,13 @@ namespace otterstax::names {
                     // name travels apart (index_name()).
                     case components::logical_plan::drop_target_kind::collection:
                     case components::logical_plan::drop_target_kind::index:
-                        db = d.dbname();
-                        rel = d.relname();
+                        db = d.target().database.t;
+                        rel = d.target().collection.t;
                         break;
                     case components::logical_plan::drop_target_kind::type:
                     case components::logical_plan::drop_target_kind::sequence:
                     case components::logical_plan::drop_target_kind::view:
+                    case components::logical_plan::drop_target_kind::materialized_view:
                     case components::logical_plan::drop_target_kind::macro:
                         // Engine-local objects: no alias-qualifiable table name.
                         return core::error_t{core::error_code_t::invalid_parameter,

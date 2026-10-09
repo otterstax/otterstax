@@ -198,7 +198,7 @@ namespace otterstax::kafka {
         if (!agg) {
             co_return invalid("SELECT has no source table");
         }
-        const std::string source_relname = agg->relname().t;
+        const std::string source_relname = agg->target().collection.t;
         const auto src_it = registry_.find(source_relname);
         if (src_it == registry_.end()) {
             co_return invalid("unknown source '" + source_relname + "'");

@@ -128,7 +128,7 @@ namespace frontend::spark {
         db_rel_names get_names(const cl::node_ptr& node) {
             if (node && node->type() == cl::node_type::aggregate_t) {
                 const auto& agg = static_cast<const cl::node_aggregate_t&>(*node);
-                return {std::string(agg.dbname().t), std::string(agg.relname().t)};
+                return {agg.target().database.t, agg.target().collection.t};
             }
             return {"", ""};
         }
@@ -137,8 +137,7 @@ namespace frontend::spark {
             if (node && node->type() == cl::node_type::aggregate_t) {
                 return node;
             }
-            auto wrapper =
-                cl::make_node_aggregate(resource, core::dbname_t{std::string{}}, core::relname_t{std::string{}});
+            auto wrapper = cl::make_node_aggregate(resource, qualified_name_t{});
             wrapper->append_child(node);
             return wrapper;
         }
@@ -325,8 +324,7 @@ namespace frontend::spark {
         // the external slot: its clauses are pushed to the backend, its rows inlined,
         // and the outer aggregate runs in the engine.
         cl::node_ptr derive(cl::node_ptr node, std::pmr::memory_resource* resource) {
-            auto outer =
-                cl::make_node_aggregate(resource, core::dbname_t{std::string{}}, core::relname_t{std::string{}});
+            auto outer = cl::make_node_aggregate(resource, qualified_name_t{});
             outer->append_child(std::move(node));
             return outer;
         }
@@ -550,11 +548,9 @@ namespace frontend::spark {
                 node = derive(std::move(node), resource);
             }
             auto names = get_names(node);
-            auto group =
-                cl::make_node_group(resource, core::dbname_t{names.dbname}, core::relname_t{names.relname}, exprs);
+            auto group = cl::make_node_group(resource, exprs);
             node->append_child(group);
-            node->append_child(
-                cl::make_node_select(resource, core::dbname_t{names.dbname}, core::relname_t{names.relname}));
+            node->append_child(cl::make_node_select(resource));
             return node;
         }
 
@@ -570,12 +566,12 @@ namespace frontend::spark {
                 return core::error_t::no_error();
             }
             if (node->type() == cl::node_type::aggregate_t &&
-                !static_cast<const cl::node_aggregate_t&>(*node).uid().t.empty()) {
+                !node->target().unique_identifier.t.empty()) {
                 auto resolved = otterstax::names::node_names(*node, names);
                 if (resolved.has_error()) {
                     return core::error_on(ctx.resource, resolved.error());
                 }
-                const auto& schema = resolved.value().schema;
+                const auto& schema = resolved.value().schema.t;
                 ctx.read_schemas.push_back(
                     read_schema_t{node.get(), std::pmr::string{schema.data(), schema.size(), ctx.resource}});
             }
@@ -599,13 +595,15 @@ namespace frontend::spark {
                     auto ref = parse_table_identifier(read.named_table().unparsed_identifier(), resource);
                     cl::node_ptr node;
                     if (ref.uid.empty()) {
-                        node =
-                            cl::make_node_aggregate(resource, core::dbname_t{ref.dbname}, core::relname_t{ref.relname});
+                        node = cl::make_node_aggregate(
+                            resource,
+                            qualified_name_t{core::dbname_t{ref.dbname}, core::relname_t{ref.relname}});
                     } else {
                         node = cl::make_node_aggregate(resource,
-                                                       core::uid_t{ref.uid},
-                                                       core::dbname_t{ref.dbname},
-                                                       core::relname_t{ref.relname});
+                                                       qualified_name_t{core::uid_t{ref.uid},
+                                                                        core::dbname_t{ref.dbname},
+                                                                        core::schema_t{},
+                                                                        core::relname_t{ref.relname}});
                         ctx.read_schemas.push_back(
                             read_schema_t{node.get(),
                                           std::pmr::string{ref.schema.data(), ref.schema.size(), resource}});
@@ -628,9 +626,7 @@ namespace frontend::spark {
                 }
                 input_node = ensure_aggregate_wrapper(input_res.value(), ctx.resource);
             } else {
-                input_node = cl::make_node_aggregate(ctx.resource,
-                                                     core::dbname_t{std::string{}},
-                                                     core::relname_t{std::string{}});
+                input_node = cl::make_node_aggregate(ctx.resource, qualified_name_t{});
             }
 
             // A lone `*` projects the input as it is.
@@ -714,8 +710,9 @@ namespace frontend::spark {
             }
 
             auto names = get_names(input_node);
-            auto match =
-                cl::make_node_match(resource, core::dbname_t{names.dbname}, core::relname_t{names.relname}, predicate);
+            auto match = cl::make_node_match(resource,
+                                             qualified_name_t{core::dbname_t{names.dbname}, core::relname_t{names.relname}},
+                                             predicate);
             input_node->append_child(match);
             return input_node;
         }
@@ -750,8 +747,7 @@ namespace frontend::spark {
                 }
                 sort_exprs.push_back(sort_expr.value());
             }
-            auto sort_node =
-                cl::make_node_sort(resource, core::dbname_t{names.dbname}, core::relname_t{names.relname}, sort_exprs);
+            auto sort_node = cl::make_node_sort(resource, sort_exprs);
             input_node->append_child(sort_node);
             return input_node;
         }
@@ -770,10 +766,7 @@ namespace frontend::spark {
             }
             auto names = get_names(input_node);
 
-            auto limit_node = cl::make_node_limit(resource,
-                                                  core::dbname_t{names.dbname},
-                                                  core::relname_t{names.relname},
-                                                  cl::limit_t{limit.limit()});
+            auto limit_node = cl::make_node_limit(resource, cl::limit_t{limit.limit()});
             input_node->append_child(limit_node);
             return input_node;
         }
@@ -793,10 +786,7 @@ namespace frontend::spark {
             auto names = get_names(input_node);
 
             auto unlim = cl::limit_t::unlimit();
-            auto limit_node = cl::make_node_limit(resource,
-                                                  core::dbname_t{names.dbname},
-                                                  core::relname_t{names.relname},
-                                                  cl::limit_t{unlim.limit(), offset.offset()});
+            auto limit_node = cl::make_node_limit(resource, cl::limit_t{unlim.limit(), offset.offset()});
             input_node->append_child(limit_node);
             return input_node;
         }
@@ -840,8 +830,7 @@ namespace frontend::spark {
                 return right_res;
             }
 
-            auto join_node =
-                cl::make_node_join(resource, core::dbname_t{std::string{}}, core::relname_t{std::string{}}, jt);
+            auto join_node = cl::make_node_join(resource, jt);
             join_node->append_child(left_res.value());
             join_node->append_child(right_res.value());
 
@@ -883,8 +872,7 @@ namespace frontend::spark {
                 join_node->append_expression(ce::make_compare_expression(resource, ce::compare_type::all_true));
             }
 
-            auto wrapper =
-                cl::make_node_aggregate(resource, core::dbname_t{std::string{}}, core::relname_t{std::string{}});
+            auto wrapper = cl::make_node_aggregate(resource, qualified_name_t{});
             wrapper->append_child(join_node);
             return wrapper;
         }
@@ -915,8 +903,7 @@ namespace frontend::spark {
             bool is_all = set_op.has_is_all() && set_op.is_all();
             auto union_node = cl::make_node_union(resource, left_res.value(), right_res.value(), is_all);
 
-            auto wrapper =
-                cl::make_node_aggregate(resource, core::dbname_t{std::string{}}, core::relname_t{std::string{}});
+            auto wrapper = cl::make_node_aggregate(resource, qualified_name_t{});
             wrapper->append_child(union_node);
             return wrapper;
         }
@@ -1003,8 +990,7 @@ namespace frontend::spark {
             chunk.set_cardinality(row);
 
             auto data_node = cl::make_node_raw_data(resource, std::move(chunk));
-            auto wrapper =
-                cl::make_node_aggregate(resource, core::dbname_t{std::string{}}, core::relname_t{std::string{}});
+            auto wrapper = cl::make_node_aggregate(resource, qualified_name_t{});
             wrapper->append_child(data_node);
             return wrapper;
         }
@@ -1140,12 +1126,12 @@ namespace frontend::spark {
 
                 if (node->type() == cl::node_type::aggregate_t) {
                     const auto& agg = static_cast<const cl::node_aggregate_t&>(*node);
-                    const std::string& uid_str = agg.uid().t;
+                    const std::string& uid_str = agg.target().unique_identifier.t;
                     if (!uid_str.empty()) {
-                        qualified_name_t name{uid_str,
-                                              std::string(agg.dbname().t),
-                                              read_schema_of(read_schemas, node.get()),
-                                              std::string(agg.relname().t)};
+                        qualified_name_t name{agg.target().unique_identifier,
+                                              agg.target().database,
+                                              core::schema_t{read_schema_of(read_schemas, node.get())},
+                                              agg.target().collection};
 
                         auto it = std::find_if(external_nodes[entry.batch_index].begin(),
                                                external_nodes[entry.batch_index].end(),
@@ -1499,6 +1485,10 @@ namespace frontend::spark {
 
         auto root_node = ensure_aggregate_wrapper(root_result.value(), resource);
 
+        // The statement holds the root and the parameter node the binder's plan is
+        // built over: a translated plan is never bound, so nothing re-writes them.
+        auto params_node = ctx.params;
+        auto statement_root = root_node;
         auto binder = cst::transform_result(resource,
                                             cl::execution_plan_t(resource, root_node, ctx.params),
                                             cst::transform_result::parameter_map_t{resource},
@@ -1510,8 +1500,8 @@ namespace frontend::spark {
         // statement). Every literal of a translated plan is bound, so it is 0.
         auto statement =
             std::make_unique<OtterbrixStatement>(std::pmr::vector<std::pmr::vector<external_entry_t>>{resource},
-                                                 binder.params_ptr(),
-                                                 binder.node_ptr(),
+                                                 std::move(params_node),
+                                                 std::move(statement_root),
                                                  0,
                                                  binder.parameter_count());
 

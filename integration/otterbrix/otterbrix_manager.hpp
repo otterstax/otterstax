@@ -18,6 +18,7 @@
 #include <components/table/column_definition.hpp>
 #include <components/vector/data_chunk.hpp>
 
+#include <map>
 #include <memory_resource>
 #include <mutex>
 #include <string>

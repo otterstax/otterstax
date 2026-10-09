@@ -59,7 +59,7 @@ namespace {
         std::pmr::map<qualified_name_t, size_t> dep(std::pmr::new_delete_resource());
         for (size_t i = 1; i <= n; ++i) {
             std::string name = "test" + std::to_string(i);
-            dep.emplace(qualified_name_t("", std::move(name)), i - 1);
+            dep.emplace(qualified_name_t(core::dbname_t{}, core::relname_t{std::move(name)}), i - 1);
         }
 
         return dep;
@@ -257,7 +257,7 @@ TEST_CASE("aggregate: a described sub-query stub types the projection above it")
 
     std::pmr::vector<otterstax::parser::qualifier_rewrite_t> no_qualifiers(resource);
     auto stub = make_node_schema_raw(resource,
-                                     qualified_name_t("ch", "subq", "", "__otterstax_subq_0"),
+                                     qualified_name_t(core::uid_t{"ch"}, core::dbname_t{"subq"}, core::schema_t{}, core::relname_t{"__otterstax_subq_0"}),
                                      "SELECT toString(id) AS id FROM ch.db.schema.t",
                                      no_qualifiers);
     agg.append_child(stub);

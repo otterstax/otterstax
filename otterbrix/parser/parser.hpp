@@ -8,7 +8,7 @@
 
 #include "otterbrix/parser/grammar_extension/kafka/kafka_extension.hpp"
 
-#include <otterbrix/otterbrix.hpp>
+#include <integration/cpp/otterbrix.hpp>
 
 #include <components/logical_plan/node_data.hpp>
 #include <components/sql/parser/extension.hpp>
@@ -53,6 +53,12 @@ struct ParsedQueryData {
     NodeTag tag;
 
     extension_kind_t extension_kind{extension_kind_t::none};
+
+    // True while the statement's `$n` hold the placeholders the parser bound to
+    // reach its plan (GreenplumParser::parse): the binder reads as fully bound,
+    // but no client value has been bound yet. Cleared by the Worker once
+    // execute_prepared_statement has bound and finalized the real values.
+    bool awaiting_bind{false};
 
     backend_type_t backend_type{backend_type_t::Unknown}; // Set by CatalogManager during get_catalog_schema
 

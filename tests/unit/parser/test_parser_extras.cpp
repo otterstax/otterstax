@@ -180,8 +180,8 @@ TEST_CASE("parse: same UID in two tables → two batches, one node each") {
 
     // Both nodes must carry the same uid (each external entry carries its
     // resolved target — nodes themselves no longer carry names)
-    REQUIRE(parsed->otterbrix_params->external_nodes[0][0].target.name.unique_identifier == "uid1");
-    REQUIRE(parsed->otterbrix_params->external_nodes[1][0].target.name.unique_identifier == "uid1");
+    REQUIRE(parsed->otterbrix_params->external_nodes[0][0].target.name.unique_identifier.t == "uid1");
+    REQUIRE(parsed->otterbrix_params->external_nodes[1][0].target.name.unique_identifier.t == "uid1");
 }
 
 TEST_CASE("parse: different UIDs in two tables → one batch, two nodes") {

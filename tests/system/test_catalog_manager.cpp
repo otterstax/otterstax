@@ -246,7 +246,7 @@ namespace {
             REQUIRE_FALSE(result.has_error());
             std::vector<std::string> names;
             for (const auto& table : result.value()) {
-                names.push_back(table.name.database + "." + table.name.schema + "." + table.name.collection);
+                names.push_back(table.name.database.t + "." + table.name.schema.t + "." + table.name.collection.t);
             }
             std::sort(names.begin(), names.end());
             return names;
@@ -581,7 +581,7 @@ TEST_CASE("catalog add_connection_schema: PostgreSQL connection without a schema
     auto added = fx.pg_conn->addConnection(params, "noschema");
     REQUIRE_FALSE(added.has_error());
 
-    auto err = fx.add_connection_schema(qualified_name_t("noschema", "pgdb", "", "orders"),
+    auto err = fx.add_connection_schema(qualified_name_t(core::uid_t{"noschema"}, core::dbname_t{"pgdb"}, core::schema_t{}, core::relname_t{"orders"}),
                                         catalog_ext::ConnectionType::PostgreSQL);
     REQUIRE(err.contains_error());
     REQUIRE(err.type == core::error_code_t::missing_field);
@@ -596,7 +596,7 @@ TEST_CASE("catalog add_connection_schema: unknown uid is an error, not a silent 
                       catalog_ext::ConnectionType::PostgreSQL,
                       catalog_ext::ConnectionType::ClickHouse}) {
         INFO("backend type = " << static_cast<int>(type));
-        auto err = fx.add_connection_schema(qualified_name_t("ghost", "db", "public", "t"), type);
+        auto err = fx.add_connection_schema(qualified_name_t(core::uid_t{"ghost"}, core::dbname_t{"db"}, core::schema_t{"public"}, core::relname_t{"t"}), type);
         REQUIRE(err.contains_error());
         REQUIRE(err.type == core::error_code_t::do_not_exists);
     }
@@ -608,7 +608,7 @@ TEST_CASE("catalog add_connection_schema: a uid keeps the backend it was registe
     catalog_fixture fx(resource);
     fx.add_pg("shop", "pgdb", "public", "orders");
 
-    auto err = fx.add_connection_schema(qualified_name_t("shop", "pgdb", "", "orders"),
+    auto err = fx.add_connection_schema(qualified_name_t(core::uid_t{"shop"}, core::dbname_t{"pgdb"}, core::schema_t{}, core::relname_t{"orders"}),
                                         catalog_ext::ConnectionType::MySQL);
     REQUIRE(err.contains_error());
     REQUIRE(err.type == core::error_code_t::invalid_parameter);

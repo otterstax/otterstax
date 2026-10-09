@@ -74,7 +74,7 @@ flat_external_t find_by_uid(
     const std::vector<flat_external_t>& nodes,
     const std::string& uid) {
     for (const auto& n : nodes)
-        if (n.node && n.target.name.unique_identifier == uid)
+        if (n.node && n.target.name.unique_identifier.t == uid)
             return n;
     return {};
 }
@@ -130,22 +130,22 @@ core::error_code_t error_for(GreenplumParser& parser,
 
 // Hand-built plans: the parser is not the only producer of plan nodes, and a
 // hand-built node pins one exact shape without depending on transformer details.
-const qualified_name_t orders_name{"mysql", "bill", "schema", "orders"};
+const qualified_name_t orders_name{core::uid_t{"mysql"}, core::dbname_t{"bill"}, core::schema_t{"schema"}, core::relname_t{"orders"}};
 
 otterstax::names::resolved_target_t orders_target() {
     return otterstax::names::resolved_target_t{components::catalog::INVALID_OID, orders_name, {}};
 }
 
 node_match_ptr orders_match(std::pmr::memory_resource* resource, const expression_ptr& predicate) {
-    return make_node_match(resource, core::dbname_t{"bill"}, core::relname_t{"orders"}, predicate);
+    return make_node_match(resource, qualified_name_t{core::dbname_t{"bill"}, core::relname_t{"orders"}}, predicate);
 }
 
 node_limit_ptr orders_limit(std::pmr::memory_resource* resource, const limit_t& limit) {
-    return make_node_limit(resource, core::dbname_t{"bill"}, core::relname_t{"orders"}, limit);
+    return make_node_limit(resource, limit);
 }
 
 node_aggregate_ptr orders_select(std::pmr::memory_resource* resource) {
-    return make_node_aggregate(resource, core::dbname_t{"bill"}, core::relname_t{"orders"});
+    return make_node_aggregate(resource, qualified_name_t{core::dbname_t{"bill"}, core::relname_t{"orders"}});
 }
 
 core::result_wrapper_t<std::string>
@@ -172,14 +172,14 @@ std::string single_value_literal(const std::string& values_sql) {
 // ── sql_gen::table_reference ──────────────────────────────────────────────────
 
 TEST_CASE("table_reference: MySQL uses database.collection") {
-    qualified_name_t name{"bill", "", "orders"};
+    qualified_name_t name{core::dbname_t{"bill"}, core::schema_t{}, core::relname_t{"orders"}};
     auto ref = sql_gen::table_reference(name, backend_type_t::MySQL, std::pmr::new_delete_resource());
     REQUIRE_FALSE(ref.has_error());
     REQUIRE(ref.value() == "`bill`.`orders`");
 }
 
 TEST_CASE("table_reference: PostgreSQL uses schema.collection") {
-    qualified_name_t name{"", "public", "products"};
+    qualified_name_t name{core::dbname_t{}, core::schema_t{"public"}, core::relname_t{"products"}};
     auto ref = sql_gen::table_reference(name, backend_type_t::PostgreSQL, std::pmr::new_delete_resource());
     REQUIRE_FALSE(ref.has_error());
     REQUIRE(ref.value() == "\"public\".\"products\"");
@@ -187,7 +187,7 @@ TEST_CASE("table_reference: PostgreSQL uses schema.collection") {
 
 TEST_CASE("table_reference: ClickHouse uses database.collection (same as MySQL)") {
     // ClickHouse has no schema level: table_reference emits database.collection.
-    qualified_name_t name{"events", "", "sessions"};
+    qualified_name_t name{core::dbname_t{"events"}, core::schema_t{}, core::relname_t{"sessions"}};
     auto ref = sql_gen::table_reference(name, backend_type_t::ClickHouse, std::pmr::new_delete_resource());
     REQUIRE_FALSE(ref.has_error());
     REQUIRE(ref.value() == "`events`.`sessions`");
@@ -195,7 +195,7 @@ TEST_CASE("table_reference: ClickHouse uses database.collection (same as MySQL)"
 
 TEST_CASE("table_reference: 2-arg constructor, MySQL") {
     // 2-arg ctor sets database=bill, collection=orders, schema=""
-    qualified_name_t name{"bill", "orders"};
+    qualified_name_t name{core::dbname_t{"bill"}, core::relname_t{"orders"}};
     auto ref = sql_gen::table_reference(name, backend_type_t::MySQL, std::pmr::new_delete_resource());
     REQUIRE_FALSE(ref.has_error());
     REQUIRE(ref.value() == "`bill`.`orders`");
@@ -204,7 +204,7 @@ TEST_CASE("table_reference: 2-arg constructor, MySQL") {
 // Unknown and Mixed are routing verdicts and Otterbrix is the local engine; a
 // reference in any of them would be a guessed spelling sent to a backend.
 TEST_CASE("table_reference: a backend without a SQL dialect is invalid_parameter") {
-    qualified_name_t name{"bill", "", "orders"};
+    qualified_name_t name{core::dbname_t{"bill"}, core::schema_t{}, core::relname_t{"orders"}};
     for (auto backend : {backend_type_t::Unknown, backend_type_t::Mixed, backend_type_t::Otterbrix}) {
         INFO("backend = " << static_cast<int>(backend));
         auto ref = sql_gen::table_reference(name, backend, std::pmr::new_delete_resource());
@@ -1100,7 +1100,7 @@ TEST_CASE("generate_query: GROUP BY over an expression is rendered") {
     parameter_node_t params(resource);
 
     auto node = orders_select(resource);
-    auto group = make_node_group(resource, core::dbname_t{"bill"}, core::relname_t{"orders"});
+    auto group = make_node_group(resource);
     auto bucket = make_scalar_expression(resource, scalar_type::add);
     bucket->append_param(components::expressions::key_t{resource, "a"});
     bucket->append_param(params.add_parameter(logical_value_t{resource, 1}));
@@ -1459,7 +1459,7 @@ TEST_CASE("generate_query: DELETE ... USING with a resolved second table per dia
     REQUIRE(slot.node);
     REQUIRE(slot.node->type() == node_type::delete_t);
     const auto& target = slot.target;
-    REQUIRE(target.from_name == qualified_name_t{"mysql", "bill", "schema", "other"});
+    REQUIRE(target.from_name == qualified_name_t{core::uid_t{"mysql"}, core::dbname_t{"bill"}, core::schema_t{"schema"}, core::relname_t{"other"}});
     const auto& params = parsed->otterbrix_params->params_node->parameters();
     const auto& batch = batch_targets_of(parsed, slot);
 
@@ -1490,7 +1490,7 @@ TEST_CASE("generate_query: DELETE ... USING together with LIMIT is unimplemented
     auto slot = find_by_uid(nodes, "mysql");
     REQUIRE(slot.node);
     auto target = slot.target;
-    target.from_name = qualified_name_t{"mysql", "bill", "schema", "other"};
+    target.from_name = qualified_name_t{core::uid_t{"mysql"}, core::dbname_t{"bill"}, core::schema_t{"schema"}, core::relname_t{"other"}};
     const auto& params = parsed->otterbrix_params->params_node->parameters();
 
     // MySQL's multi-table DELETE takes no LIMIT.
@@ -1520,7 +1520,7 @@ TEST_CASE("generate_query: UPDATE ... FROM with a resolved second table per dial
     REQUIRE(slot.node);
     REQUIRE(slot.node->type() == node_type::update_t);
     const auto& target = slot.target;
-    REQUIRE(target.from_name == qualified_name_t{"mysql", "bill", "schema", "other"});
+    REQUIRE(target.from_name == qualified_name_t{core::uid_t{"mysql"}, core::dbname_t{"bill"}, core::schema_t{"schema"}, core::relname_t{"other"}});
     const auto& params = parsed->otterbrix_params->params_node->parameters();
     const auto& batch = batch_targets_of(parsed, slot);
 
@@ -1629,7 +1629,7 @@ TEST_CASE("generate_query: DROP INDEX per dialect") {
 
     node_ptr node = make_node_drop(resource, drop_target_kind::index);
     auto target = orders_target();
-    target.from_name = qualified_name_t{"mysql", "bill", "schema", "idx_orders_id"};
+    target.from_name = qualified_name_t{core::uid_t{"mysql"}, core::dbname_t{"bill"}, core::schema_t{"schema"}, core::relname_t{"idx_orders_id"}};
 
     auto mysql = generate_manual(node, params, backend_type_t::MySQL, resource, target);
     REQUIRE_FALSE(mysql.has_error());
@@ -1653,7 +1653,7 @@ TEST_CASE("generate_query: CREATE INDEX is qualified; ClickHouse is unimplemente
     auto* resource = &arena;
     parameter_node_t params(resource);
 
-    auto index = make_node_create_index(resource, core::indexname_t{std::string{"idx_orders_id"}});
+    auto index = make_node_create_index(resource, core::indexname_t{std::string{"idx_orders_id"}}, index_type::single);
     index->keys().emplace_back(resource, "id");
     node_ptr node = index;
 
@@ -2006,7 +2006,9 @@ expression_ptr call_of(std::pmr::memory_resource* resource,
     if (second) {
         args.emplace_back(param_storage{second});
     }
-    return make_function_expression(resource, std::move(name), std::move(args));
+    return make_function_expression(resource,
+                                    function_qualified_name_t{core::function_name_t{std::move(name)}},
+                                    std::move(args));
 }
 
 // UPDATE bill.orders SET <updates> with no predicate and no LIMIT.
@@ -2420,7 +2422,7 @@ TEST_CASE("characterization: UPDATE ... FROM pushed down with the source resolve
     auto parsed = parse_or_die(parser,
                                "UPDATE mysql.bill.schema.orders SET name = other.name "
                                "FROM mysql.bill.schema.other WHERE orders.id = other.id;");
-    const qualified_name_t same_backend{"mysql", "bill", "schema", "other"};
+    const qualified_name_t same_backend{core::uid_t{"mysql"}, core::dbname_t{"bill"}, core::schema_t{"schema"}, core::relname_t{"other"}};
 
     // PostgreSQL names the source in FROM, MySQL in the multi-table form; both
     // take the join condition from WHERE, exactly as the plan does (the engine
@@ -2446,21 +2448,21 @@ TEST_CASE("characterization: UPDATE ... FROM pushed down with the source resolve
         generate_refuses(core::error_code_t::unimplemented_yet,
                          "the FROM / USING source is not on the same backend as the target of UPDATE");
     CHECK(outcome_with_source(parsed,
-                              qualified_name_t{"pg", "shop", "shop", "other"},
+                              qualified_name_t{core::uid_t{"pg"}, core::dbname_t{"shop"}, core::schema_t{"shop"}, core::relname_t{"other"}},
                               backend_type_t::MySQL,
                               resource) == cross_backend);
-    CHECK(outcome_with_source(parsed, qualified_name_t{"", "bill", "", "other"}, backend_type_t::MySQL, resource) ==
+    CHECK(outcome_with_source(parsed, qualified_name_t{core::uid_t{}, core::dbname_t{"bill"}, core::schema_t{}, core::relname_t{"other"}}, backend_type_t::MySQL, resource) ==
           cross_backend);
     // The resolved name must be the table the plan actually reads.
     CHECK(outcome_with_source(parsed,
-                              qualified_name_t{"mysql", "bill", "schema", "elsewhere"},
+                              qualified_name_t{core::uid_t{"mysql"}, core::dbname_t{"bill"}, core::schema_t{"schema"}, core::relname_t{"elsewhere"}},
                               backend_type_t::MySQL,
                               resource) ==
           generate_refuses(core::error_code_t::invalid_parameter,
                            "the resolved FROM / USING table is not the table the plan reads on UPDATE"));
     // Target and source being one table needs aliases, which are not generated.
     CHECK(outcome_with_source(parsed,
-                              qualified_name_t{"mysql", "bill", "schema", "orders"},
+                              qualified_name_t{core::uid_t{"mysql"}, core::dbname_t{"bill"}, core::schema_t{"schema"}, core::relname_t{"orders"}},
                               backend_type_t::MySQL,
                               resource) ==
           generate_refuses(core::error_code_t::unimplemented_yet,
@@ -2475,7 +2477,7 @@ TEST_CASE("characterization: DELETE ... USING pushed down with the source resolv
     auto parsed = parse_or_die(parser,
                                "DELETE FROM mysql.bill.schema.orders USING mysql.bill.schema.other "
                                "WHERE orders.id = other.id;");
-    const qualified_name_t same_backend{"mysql", "bill", "schema", "other"};
+    const qualified_name_t same_backend{core::uid_t{"mysql"}, core::dbname_t{"bill"}, core::schema_t{"schema"}, core::relname_t{"other"}};
 
     // PostgreSQL's USING, and MySQL's multi-table DELETE, which names the table
     // rows are deleted from before FROM and every table it reads after it; both
@@ -2490,7 +2492,7 @@ TEST_CASE("characterization: DELETE ... USING pushed down with the source resolv
           generate_refuses(core::error_code_t::unimplemented_yet,
                            "a second table is not supported for ClickHouse on DELETE"));
     CHECK(outcome_with_source(parsed,
-                              qualified_name_t{"pg", "shop", "shop", "other"},
+                              qualified_name_t{core::uid_t{"pg"}, core::dbname_t{"shop"}, core::schema_t{"shop"}, core::relname_t{"other"}},
                               backend_type_t::PostgreSQL,
                               resource) ==
           generate_refuses(core::error_code_t::unimplemented_yet,
@@ -2580,7 +2582,7 @@ TEST_CASE("characterization: CREATE TABLE and CREATE INDEX on an alias route to 
     auto nodes = flat_externals(parsed);
     REQUIRE(parsed->otterbrix_params->external_nodes_count == 1);
     REQUIRE(nodes.size() == 1);
-    REQUIRE(nodes[0].target.name.unique_identifier == "mysql");
-    REQUIRE(nodes[0].target.name.database == "bill");
-    REQUIRE(nodes[0].target.name.schema == "schema");
+    REQUIRE(nodes[0].target.name.unique_identifier.t == "mysql");
+    REQUIRE(nodes[0].target.name.database.t == "bill");
+    REQUIRE(nodes[0].target.name.schema.t == "schema");
 }

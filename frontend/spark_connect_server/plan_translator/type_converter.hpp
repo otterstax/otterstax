@@ -11,7 +11,7 @@
 
 #include <spark/connect/types.pb.h>
 
-#include <otterbrix/otterbrix.hpp>
+#include <integration/cpp/otterbrix.hpp>
 
 #include <memory_resource>
 

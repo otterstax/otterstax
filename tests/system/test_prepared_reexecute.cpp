@@ -29,7 +29,9 @@
 using otterstax::test::close_scheduler_statement;
 using otterstax::test::execute_scheduler_prepared;
 using otterstax::test::execute_scheduler_statement;
+using otterstax::test::engine_row_count;
 using otterstax::test::prepare_scheduler_sql;
+using otterstax::test::run_scheduler_sql_payload;
 using otterstax::test::scheduler_stack;
 using otterstax::test::seed_people_bulk;
 using otterstax::test::with_scheduler_stack;
@@ -215,5 +217,25 @@ TEST_CASE("prepared statement: a parameterized statement that is closed unbound 
         std::pmr::vector<components::types::logical_value_t> params{s.resource};
         params.emplace_back(s.resource, std::int64_t{2});
         require_reprepare(execute_scheduler_prepared(s, stmt, std::move(params)));
+    });
+}
+
+// A direct execute has no Bind step: a statement with placeholders is refused
+// before it reaches the engine, instead of running with the parser's
+// placeholder values (an INSERT would write NULLs, a LIMIT $1 would read 0).
+TEST_CASE("direct execute: a statement with placeholders and no Bind is refused") {
+    with_scheduler_stack("/tmp/test_direct_execute_unbound", [](scheduler_stack s) {
+        session_hash_t id = 9900;
+        seed_people_bulk(s, id, 3);
+
+        for (const char* sql : {"INSERT INTO dmldb.people (id, name) VALUES ($1, $2);",
+                                "SELECT id, name FROM dmldb.people LIMIT $1;"}) {
+            INFO(sql);
+            auto r = run_scheduler_sql_payload(s, id++, sql);
+            REQUIRE(r.has_error());
+            REQUIRE(r.error().type == core::error_code_t::invalid_parameter);
+            REQUIRE(std::string{r.error().what.c_str()}.find("no values bound") != std::string::npos);
+        }
+        REQUIRE(engine_row_count(s, "dmldb", "people") == 3);
     });
 }

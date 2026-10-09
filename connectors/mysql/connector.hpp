@@ -29,7 +29,7 @@
 #include "utility/function_ref.hpp"
 #include "utility/tracy_profiler.hpp"
 #include "utility/wait_barrier.hpp"
-#include <otterbrix/otterbrix.hpp>
+#include <integration/cpp/otterbrix.hpp>
 
 #include <concepts>
 #include <coroutine>

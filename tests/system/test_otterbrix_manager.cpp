@@ -257,7 +257,7 @@ TEST_CASE("OtterbrixManager::execute: a column-less result of a SELECT plan is a
         auto statement = std::make_unique<OtterbrixStatement>(
             std::pmr::vector<std::pmr::vector<external_entry_t>>{&arena},
             components::logical_plan::make_parameter_node(&arena),
-            components::logical_plan::make_node_aggregate(&arena, core::dbname_t{"db"}, core::relname_t{"t"}),
+            components::logical_plan::make_node_aggregate(&arena, qualified_name_t{core::dbname_t{"db"}, core::relname_t{"t"}}),
             0);
         auto cursor = run_execute(*manager, std::move(statement));
         REQUIRE(cursor);
@@ -375,7 +375,7 @@ TEST_CASE("row_producing_statement: SELECT and RETURNING DML answer rows and not
     REQUIRE(row_producing_statement(components::logical_plan::node_ptr{}) == nullptr);
     // A bare aggregate node (no resolve wrapper) is the same statement.
     REQUIRE(std::string{row_producing_statement(components::logical_plan::make_node_aggregate(
-                &arena, core::dbname_t{"db"}, core::relname_t{"t"}))} == "SELECT");
+                &arena, qualified_name_t{core::dbname_t{"db"}, core::relname_t{"t"}}))} == "SELECT");
 }
 
 TEST_CASE("capture_remote_dml_count: records a column-less DML result and nothing else") {
@@ -391,7 +391,7 @@ TEST_CASE("capture_remote_dml_count: records a column-less DML result and nothin
     }
     SECTION("a SELECT slot is data, not an affected count") {
         components::logical_plan::node_ptr node =
-            components::logical_plan::make_node_aggregate(&arena, core::dbname_t{"db"}, core::relname_t{"t"});
+            components::logical_plan::make_node_aggregate(&arena, qualified_name_t{core::dbname_t{"db"}, core::relname_t{"t"}});
         capture_remote_dml_count(*statement, node, count_only);
         REQUIRE(statement->remote_affected_rows == OtterbrixStatement::no_remote_dml);
     }
@@ -518,7 +518,7 @@ TEST_CASE("OtterbrixManager::drop_external_table: drops the encoded engine colle
     auto* recorder = engine.get();
     auto manager = actor_zeta::spawn<db::OtterbrixManager>(&arena, std::move(engine));
 
-    auto dropped = run_drop_external_table(*manager, qualified_name_t("shop", "pgdb", "public", "orders"));
+    auto dropped = run_drop_external_table(*manager, qualified_name_t(core::uid_t{"shop"}, core::dbname_t{"pgdb"}, core::schema_t{"public"}, core::relname_t{"orders"}));
 
     REQUIRE_FALSE(dropped.has_error());
     REQUIRE(dropped.value() == true);
@@ -532,7 +532,7 @@ TEST_CASE("OtterbrixManager::drop_external_table: the engine's verdict is return
         std::make_unique<refusing_data_manager>(mock_config{.resource = &arena},
                                                 core::error_code_t::table_not_exists));
 
-    auto dropped = run_drop_external_table(*manager, qualified_name_t("shop", "pgdb", "public", "orders"));
+    auto dropped = run_drop_external_table(*manager, qualified_name_t(core::uid_t{"shop"}, core::dbname_t{"pgdb"}, core::schema_t{"public"}, core::relname_t{"orders"}));
 
     REQUIRE(dropped.has_error());
     REQUIRE(dropped.error().type == core::error_code_t::table_not_exists);

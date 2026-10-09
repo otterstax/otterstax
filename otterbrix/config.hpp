@@ -3,7 +3,7 @@
 
 #pragma once
 
-#include <otterbrix/otterbrix.hpp>
+#include <integration/cpp/otterbrix.hpp>
 
 inline configuration::config make_create_config(const std::filesystem::path& path) {
     auto config = configuration::config::default_config();

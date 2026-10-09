@@ -84,12 +84,12 @@ namespace {
     // the original qualified name, so no decode function exists.
     std::string encode_external_collection(const qualified_name_t& name) {
         std::string encoded;
-        encoded.reserve(name.database.size() + name.schema.size() + name.collection.size() + 2);
-        encoded += name.database;
+        encoded.reserve(name.database.t.size() + name.schema.t.size() + name.collection.t.size() + 2);
+        encoded += name.database.t;
         encoded += ':';
-        encoded += name.schema;
+        encoded += name.schema.t;
         encoded += ':';
-        encoded += name.collection;
+        encoded += name.collection.t;
         return encoded;
     }
 
@@ -313,9 +313,9 @@ actor_zeta::unique_future<core::result_wrapper_t<components::catalog::oid_t>>
 OtterbrixManager::register_external_table(qualified_name_t name,
                                           std::vector<components::table::column_definition_t> columns) {
     OTX_ZONE_N("OtterbrixManager::register_external_table");
-    const std::string& encoded_db = name.unique_identifier;
+    const std::string& encoded_db = name.unique_identifier.t;
     const std::string encoded_collection = encode_external_collection(name);
-    log_->debug("register_external_table: registering {} as {}.{}", name.to_string(), encoded_db, encoded_collection);
+    log_->debug("register_external_table: registering {} as {}.{}", otterstax::names::display_name(name), encoded_db, encoded_collection);
 
     // Manifest first: a crash between the two leaves a row without a
     // collection, which the next run resolves; the reverse would leave a
@@ -333,12 +333,12 @@ OtterbrixManager::register_external_table(qualified_name_t name,
         if (failed(create_cursor)) {
             return engine_failure(resource(),
                                   create_cursor,
-                                  "Failed to register external table '" + name.to_string() + "'");
+                                  "Failed to register external table '" + otterstax::names::display_name(name) + "'");
         }
         if (oid == components::catalog::INVALID_OID) {
             return core::error_t(
                 core::error_code_t::schema_error,
-                std::pmr::string{("Engine did not assign an oid for external table '" + name.to_string() + "'").c_str(),
+                std::pmr::string{("Engine did not assign an oid for external table '" + otterstax::names::display_name(name) + "'").c_str(),
                                  resource()});
         }
         return oid;
@@ -358,7 +358,7 @@ OtterbrixManager::register_external_table(qualified_name_t name,
         if (!describe_cursor || describe_cursor->get_error().type != core::error_code_t::table_not_exists) {
             auto error = engine_failure(resource(),
                                         describe_cursor,
-                                        "Failed to probe the engine for external table '" + name.to_string() + "'");
+                                        "Failed to probe the engine for external table '" + otterstax::names::display_name(name) + "'");
             log_->error("register_external_table: {}", error.what.c_str());
             co_return std::move(error);
         }
@@ -367,25 +367,25 @@ OtterbrixManager::register_external_table(qualified_name_t name,
             log_->error("register_external_table: {}", created.error().what.c_str());
             co_return std::move(created);
         }
-        log_->debug("register_external_table: {} registered with oid {}", name.to_string(), created.value());
+        log_->debug("register_external_table: {} registered with oid {}", otterstax::names::display_name(name), created.value());
         co_return created.value();
     }
     if (describe_cursor->type_data().size() != 1 || present_oid == components::catalog::INVALID_OID) {
         log_->error("register_external_table: the engine described {} without a schema or an oid", encoded_collection);
         co_return core::error_t(core::error_code_t::schema_error,
                                 std::pmr::string{("Engine described the existing mirror of external table '" +
-                                                  name.to_string() + "' without a schema or an oid")
+                                                  otterstax::names::display_name(name) + "' without a schema or an oid")
                                                      .c_str(),
                                                  resource()});
     }
     if (same_columns(columns, describe_cursor->type_data().front().child_types())) {
         log_->info("register_external_table: {} exists from a previous run with the same columns, reusing oid {}",
-                   name.to_string(),
+                   otterstax::names::display_name(name),
                    present_oid);
         co_return present_oid;
     }
     log_->warn("register_external_table: {} exists from a previous run with another schema, recreating it",
-               name.to_string());
+               otterstax::names::display_name(name));
     if (auto err = drop_collection(encoded_db, encoded_collection); err.contains_error()) {
         log_->error("register_external_table: {}", err.what.c_str());
         co_return std::move(err);
@@ -395,21 +395,21 @@ OtterbrixManager::register_external_table(qualified_name_t name,
         log_->error("register_external_table: {}", recreated.error().what.c_str());
         co_return std::move(recreated);
     }
-    log_->debug("register_external_table: {} recreated with oid {}", name.to_string(), recreated.value());
+    log_->debug("register_external_table: {} recreated with oid {}", otterstax::names::display_name(name), recreated.value());
     co_return recreated.value();
 }
 
 actor_zeta::unique_future<core::result_wrapper_t<bool>> OtterbrixManager::drop_external_table(qualified_name_t name) {
     OTX_ZONE_N("OtterbrixManager::drop_external_table");
-    const std::string& encoded_db = name.unique_identifier;
+    const std::string& encoded_db = name.unique_identifier.t;
     const std::string encoded_collection = encode_external_collection(name);
     log_->debug("drop_external_table: dropping {} registered as {}.{}",
-                name.to_string(),
+                otterstax::names::display_name(name),
                 encoded_db,
                 encoded_collection);
     if (auto err = drop_collection(encoded_db, encoded_collection); err.contains_error()) {
         auto error = core::error_t(err.type,
-                                   std::pmr::string{("Failed to drop external table '" + name.to_string() + "': " +
+                                   std::pmr::string{("Failed to drop external table '" + otterstax::names::display_name(name) + "': " +
                                                      err.what.c_str())
                                                         .c_str(),
                                                     resource()});
@@ -497,16 +497,17 @@ actor_zeta::unique_future<components::cursor::cursor_t_ptr> OtterbrixManager::ex
         // columns is an affected count. The plan root says which one the
         // statement owes, and the engine's result is held to it both ways.
         const bool has_columns = cursor_data->column_count() > 0;
-        if (has_columns && dml_without_returning(params->node)) {
-            // A no-RETURNING DML reports only its affected-row count, and the engine
-            // encodes it as the CARDINALITY of a carrier: insert/update build that
-            // carrier column-less, DELETE builds it from the table's storage types
-            // without ever writing a value into them. Those columns are allocated
-            // vectors, so every frontend would branch on column_count() > 0 and
-            // serialise cardinality-many rows of never-initialised heap. Keep the
-            // count, drop the columns.
-            cursor_data =
-                cursor::make_cursor(resource(), make_affected_count_carrier(resource(), cursor_data->size()));
+        if (dml_without_returning(params->node)) {
+            // A no-RETURNING DML reports only its affected-row count. The engine
+            // answers it on the cursor (affected_rows(), is_write()) with no rows;
+            // every frontend reads the count as the CARDINALITY of a column-less
+            // carrier, so the count is put into that shape here. A cursor that does
+            // not say it is a write keeps the older encoding, the cardinality of the
+            // rows it carries, with any columns dropped: they would be serialised as
+            // cardinality-many rows of never-initialised values.
+            const size_t affected =
+                cursor_data->is_write() ? static_cast<size_t>(cursor_data->affected_rows()) : cursor_data->size();
+            cursor_data = cursor::make_cursor(resource(), make_affected_count_carrier(resource(), affected));
         } else if (const char* kind = row_producing_statement(params->node); !has_columns && kind != nullptr) {
             // A SELECT / RETURNING whose result has no columns would reach the
             // client as "N rows affected". The engine produces such a result for
@@ -609,8 +610,8 @@ OtterbrixManager::get_schema(session_hash_t id,
         // tables (non-empty uid) are resolved through the CatalogManager, and
         // unnamed wrapper aggregates carry no table at all — both keep their
         // positional slot as an empty entry.
-        if (name.unique_identifier.empty() && !name.collection.empty()) {
-            params[index] = std::make_pair(name.database, name.collection);
+        if (name.unique_identifier.t.empty() && !name.collection.t.empty()) {
+            params[index] = std::make_pair(name.database.t, name.collection.t);
         }
     }
 

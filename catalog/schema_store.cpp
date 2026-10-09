@@ -3,6 +3,8 @@
 
 #include "schema_store.hpp"
 
+#include "otterbrix/parser/name_resolution.hpp"
+
 #include <cassert>
 
 namespace otterstax::catalog {
@@ -29,7 +31,7 @@ namespace otterstax::catalog {
         if (by_name_.contains(name)) {
             return core::error_t(
                 core::error_code_t::already_exists,
-                std::pmr::string{("schema_store: name already registered: " + name.to_string()).c_str(), resource_});
+                std::pmr::string{("schema_store: name already registered: " + otterstax::names::display_name(name)).c_str(), resource_});
         }
         by_name_.emplace(name, oid);
         by_oid_.emplace(oid, entry_t{std::move(name), std::move(struct_schema)});

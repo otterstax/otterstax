@@ -345,8 +345,8 @@ namespace flight::engine {
         // engine schema); the arrow schema of a table is built where the
         // metadata batches are assembled (commands.cpp).
         for (const auto& table : r.value()) {
-            metadata.catalogs.push_back(table.name.database.c_str());
-            metadata.db_schemas.push_back(table.name.schema.c_str());
+            metadata.catalogs.push_back(table.name.database.t.c_str());
+            metadata.db_schemas.push_back(table.name.schema.t.c_str());
             metadata.tables.emplace_back(table);
         }
         metadata.table_types.emplace_back(catalog_ext::table_type_name);

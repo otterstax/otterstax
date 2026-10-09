@@ -1015,18 +1015,18 @@ TEST_CASE("malformed packet: postgres RowDescription of an executed column witho
         REQUIRE(pg_row_description_names(messages[2].payload) == names);
     }
 
-    SECTION("simple Query over a VIEW") {
-        for (const char* ddl : {"CREATE DATABASE unnamed_db;", "CREATE VIEW unnamed_db.v AS SELECT 1;"}) {
-            client.write(pg_frame('Q', cstr(ddl)));
-            pg_require_no_error(pg_read_until_ready(client), ddl);
-        }
-        client.write(pg_frame('Q', cstr("SELECT * FROM unnamed_db.v;")));
+    SECTION("simple Query: a VIEW over an unnamed column is refused") {
+        // The engine binds a view at creation and refuses an output column without a name
+        // ("view column 1 has no name; name it with AS"), so no such view can exist; the
+        // refusal comes back as an ordinary ErrorResponse and the connection keeps serving.
+        client.write(pg_frame('Q', cstr("CREATE DATABASE unnamed_db;")));
+        pg_require_no_error(pg_read_until_ready(client), "CREATE DATABASE unnamed_db;");
+        client.write(pg_frame('Q', cstr("CREATE VIEW unnamed_db.v AS SELECT 1;")));
         const auto messages = pg_read_until_ready(client);
-        pg_require_no_error(messages, "SELECT * FROM unnamed_db.v");
         const auto kinds = pg_message_kinds(messages);
-        REQUIRE(kinds.front() == 'T');
-        REQUIRE(kinds.size() >= 3);
-        REQUIRE(kinds.substr(kinds.size() - 2) == "CZ");
+        REQUIRE(kinds == "EZ");
+        REQUIRE(pg_error_field(messages[0].payload, 'S') == "ERROR");
+        REQUIRE(pg_error_field(messages[0].payload, 'M').find("has no name") != std::string::npos);
     }
 
     pg_expect_query_served(client);

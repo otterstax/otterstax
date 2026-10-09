@@ -164,14 +164,10 @@ namespace {
         ParsedQueryDataPtr delete_statement() {
             auto data = statement();
             auto match = components::logical_plan::make_node_match(
-                resource,
-                core::dbname_t{"db"},
-                core::relname_t{"orders"},
+                resource, qualified_name_t{core::dbname_t{"db"}, core::relname_t{"orders"}},
                 components::expressions::make_compare_expression(resource,
                                                                  components::expressions::compare_type::all_true));
             auto limit = components::logical_plan::make_node_limit(resource,
-                                                                   core::dbname_t{"db"},
-                                                                   core::relname_t{"orders"},
                                                                    components::logical_plan::limit_t::unlimit());
             auto& slot = data->otterbrix_params->external_nodes.front().front();
             *slot.node = components::logical_plan::make_node_delete(resource, match, limit);

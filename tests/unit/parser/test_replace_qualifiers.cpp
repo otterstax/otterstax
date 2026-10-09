@@ -103,7 +103,7 @@ TEST_CASE("empty qualifiers") {
 TEST_CASE("a qualifier slot outside the SQL text is an error, not a skipped rewrite") {
     auto* resource = std::pmr::new_delete_resource();
     const std::string sql = "SELECT id FROM mysql.bill.schema.orders";
-    const qualified_name_t name("mysql", "bill", "schema", "orders");
+    const qualified_name_t name(core::uid_t{"mysql"}, core::dbname_t{"bill"}, core::schema_t{"schema"}, core::relname_t{"orders"});
 
     SECTION("end past the text") {
         std::pmr::vector<otterstax::parser::qualifier_rewrite_t> quals{resource};
@@ -145,7 +145,7 @@ TEST_CASE("a qualifier without a dialect or a name is an error and never a guess
 
     SECTION("backend without a SQL dialect") {
         std::pmr::vector<otterstax::parser::qualifier_rewrite_t> quals{resource};
-        quals.push_back({15, 24, qualified_name_t("mysql", "bill", "schema", "orders")});
+        quals.push_back({15, 24, qualified_name_t(core::uid_t{"mysql"}, core::dbname_t{"bill"}, core::schema_t{"schema"}, core::relname_t{"orders"})});
         for (auto backend : {backend_type_t::Unknown, backend_type_t::Mixed, backend_type_t::Otterbrix}) {
             INFO("backend = " << static_cast<int>(backend));
             auto out = sql_gen::replace_qualifiers(sql, quals, backend, resource);

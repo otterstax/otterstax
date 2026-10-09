@@ -259,9 +259,9 @@ namespace otterstax::kafka {
                 log_->warn("kafka: recover stream '{}': SELECT has no aggregate/source, skipping", m.name);
                 continue;
             }
-            const auto src_it = registry_.find(agg->relname().t);
+            const auto src_it = registry_.find(agg->target().collection.t);
             if (src_it == registry_.end()) {
-                log_->warn("kafka: recover stream '{}': unknown source '{}', skipping", m.name, agg->relname().t);
+                log_->warn("kafka: recover stream '{}': unknown source '{}', skipping", m.name, agg->target().collection.t);
                 continue;
             }
             auto stream_columns =
@@ -298,9 +298,9 @@ namespace otterstax::kafka {
                 log_->warn("kafka: recover insert-query '{}': no source table, skipping", m.name);
                 continue;
             }
-            const auto src_it = registry_.find(agg->relname().t);
+            const auto src_it = registry_.find(agg->target().collection.t);
             if (src_it == registry_.end()) {
-                log_->warn("kafka: recover insert-query '{}': unknown source '{}', skipping", m.name, agg->relname().t);
+                log_->warn("kafka: recover insert-query '{}': unknown source '{}', skipping", m.name, agg->target().collection.t);
                 continue;
             }
             auto out_columns =

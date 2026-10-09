@@ -6,7 +6,7 @@
 #include <iostream>
 
 TEST_CASE("logging is configured", "[.skip]") {
-    auto log = get_logger();
+    log_t log(spdlog::default_logger());
 
     // Emit a couple of log lines at common levels
     log->info("LoggingTest: info message");

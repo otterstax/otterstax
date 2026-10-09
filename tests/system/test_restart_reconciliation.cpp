@@ -336,7 +336,7 @@ namespace {
             REQUIRE_FALSE(listed.has_error());
             std::vector<std::string> names;
             for (const auto& table : listed.value()) {
-                names.push_back(table.name.collection);
+                names.push_back(table.name.collection.t);
             }
             std::sort(names.begin(), names.end());
             return names;

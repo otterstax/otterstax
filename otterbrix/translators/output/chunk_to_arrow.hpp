@@ -7,7 +7,7 @@
 
 #include <arrow/api.h>
 
-#include <otterbrix/otterbrix.hpp>
+#include <integration/cpp/otterbrix.hpp>
 
 #include <memory_resource>
 #include <string_view>

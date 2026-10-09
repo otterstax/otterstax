@@ -41,8 +41,7 @@ namespace {
                     continue;
                 }
                 // A stub is an aggregate whose relname is the generated stub id.
-                const std::string& relname =
-                    static_cast<const logical_plan::node_aggregate_t&>(*node_ref).relname().t;
+                const std::string& relname = node_ref->target().collection.t;
                 if (relname.size() < otterstax::parser::k_stub_prefix.size() ||
                     relname.compare(0,
                                     otterstax::parser::k_stub_prefix.size(),
@@ -127,6 +126,7 @@ static bool drop_targets_table(logical_plan::drop_target_kind kind) {
         case logical_plan::drop_target_kind::type:
         case logical_plan::drop_target_kind::sequence:
         case logical_plan::drop_target_kind::view:
+        case logical_plan::drop_target_kind::materialized_view:
         case logical_plan::drop_target_kind::macro:
             return false;
     }
@@ -145,6 +145,7 @@ static bool drop_is_mutable(logical_plan::drop_target_kind kind) {
         case logical_plan::drop_target_kind::type:
         case logical_plan::drop_target_kind::sequence:
         case logical_plan::drop_target_kind::view:
+        case logical_plan::drop_target_kind::materialized_view:
         case logical_plan::drop_target_kind::macro:
             return false;
     }
@@ -194,7 +195,7 @@ static bool is_mutable(const logical_plan::node_t& node) {
 static bool carries_table_reference(const logical_plan::node_t& node) {
     switch (node.type()) {
         case logical_plan::node_type::aggregate_t:
-            return !static_cast<const logical_plan::node_aggregate_t&>(node).relname().t.empty();
+            return !node.target().collection.t.empty();
         case logical_plan::node_type::insert_t:
         case logical_plan::node_type::update_t:
         case logical_plan::node_type::delete_t:
@@ -246,7 +247,7 @@ static bool is_plain_table_source(const logical_plan::node_t& node) {
     if (node.type() != logical_plan::node_type::aggregate_t || !node.children().empty()) {
         return false;
     }
-    const std::string& relname = static_cast<const logical_plan::node_aggregate_t&>(node).relname().t;
+    const std::string& relname = node.target().collection.t;
     // A subquery stub is a childless aggregate too, but it names no backend
     // table: swap_stubs_into_schema_nodes still has to replace it with the
     // extracted raw SQL, and it only reaches the stub through a slot of its
@@ -285,7 +286,7 @@ get_external_nodes(std::pmr::memory_resource* resource,
             qualified_name_t name = std::move(resolved.value());
             // An empty unique_identifier marks a LOCAL (otterbrix) table —
             // not external, not an error.
-            if (!name.unique_identifier.empty()) {
+            if (!name.unique_identifier.t.empty()) {
                 qualified_name_t from_name;
                 // The second name the statement targets. A DROP INDEX names the
                 // indexed table (`name`) and, apart from it, the index. An
@@ -301,7 +302,10 @@ get_external_nodes(std::pmr::memory_resource* resource,
                         logical_plan::drop_target_kind::index) {
                     const auto& drop = static_cast<const logical_plan::node_drop_t&>(**n.ptr);
                     auto index_resolved =
-                        otterstax::names::resolve_table_name(resource, registry, drop.dbname(), drop.index_name());
+                        otterstax::names::resolve_table_name(resource,
+                                                             registry,
+                                                             drop.target().database.t,
+                                                             drop.index_name().t);
                     if (index_resolved.has_error()) {
                         return index_resolved.convert_error<size_t>();
                     }
@@ -522,15 +526,47 @@ core::result_wrapper_t<ParsedQueryDataPtr> GreenplumParser::parse(const std::str
         return core::error_t{error.type, std::pmr::string{error.what, resource_}};
     }
 
-    auto node = binder.node_ptr();
+    // The transformer hands the plan out only through finalize(), and finalize()
+    // answers only once every `$n` is bound: an early finalize records the
+    // failure and breaks every later bind. A statement that still carries
+    // placeholders is therefore finalized here over PLACEHOLDER values bound to
+    // $1..$N — the ids execute_prepared_statement binds — to reach its root and
+    // parameter node. The binder keeps both (the plan it answers shares them),
+    // so the real Bind later re-binds and re-finalizes the SAME objects in
+    // place: the parameter node, an INSERT's bound row chunk, a deferred LIMIT.
+    // A NULL placeholder pins no INSERT column type; anything else takes an
+    // integer, the one value a deferred LIMIT / OFFSET accepts.
+    const size_t param_cnt = binder.parameter_count();
+    const bool awaiting_bind = !binder.all_bound();
+    if (awaiting_bind) {
+        for (size_t id = 1; id <= param_cnt; ++id) {
+            if (tag == T_InsertStmt) {
+                binder.bind(id, types::logical_value_t(resource_, types::complex_logical_type{types::logical_type::NA}));
+            } else {
+                binder.bind(id, types::logical_value_t(resource_, std::int64_t{0}));
+            }
+        }
+    }
+    auto finalized = binder.finalize();
+    if (finalized.has_error()) {
+        log_->error("parse: finalize failed: {}", finalized.error().what.c_str());
+        return finalized.convert_error<ParsedQueryDataPtr>();
+    }
+    auto& plan = finalized.value();
+    logical_plan::node_ptr node = plan.sub_queries.empty() ? nullptr : plan.sub_queries.back();
     if (!node) {
         log_->error("parse: transformer returned null root node — unsupported statement");
         return core::error_t{core::error_code_t::unimplemented_yet,
                              std::pmr::string{"Unsupported node type", resource_}};
     }
-
-    const size_t param_cnt = binder.parameter_count();
-    auto params = binder.params_ptr();
+    auto params = plan.parameters;
+    // Until Bind the statement's parameter node holds no value, as the binder
+    // left it before: the placeholders must not read as bound values to anyone
+    // looking before then (the SQL generator refuses a plan with an unbound `$n`).
+    // The real finalize writes every value — literals included — back.
+    if (awaiting_bind && params) {
+        static_cast<void>(params->take_parameters());
+    }
 
     log_->trace("parse: building ParsedQueryData, param_count={}", param_cnt);
     ParsedQueryDataPtr result = std::make_unique<ParsedQueryData>(
@@ -542,19 +578,15 @@ core::result_wrapper_t<ParsedQueryDataPtr> GreenplumParser::parse(const std::str
         std::move(binder),
         tag);
     result->extension_kind = extension_kind;
+    result->awaiting_bind = awaiting_bind;
 
     // Take over the catalog lookups the transformer registered (see
     // OtterbrixStatement::catalog_resolves for why they cannot travel with the
-    // plan root). finalize() is the only door onto them, and it opens exactly
-    // when every parameter is bound: a statement that still carries placeholders
-    // is finalized later, by the Worker, once Bind has filled them.
-    if (auto& bound = result->binder(); bound.all_bound()) {
-        auto finalized = bound.finalize();
-        if (finalized.has_error()) {
-            log_->error("parse: finalize failed: {}", finalized.error().what.c_str());
-            return finalized.convert_error<ParsedQueryDataPtr>();
-        }
-        result->otterbrix_params->catalog_resolves = finalized.value().catalog_resolves;
+    // plan root). finalize() is the only door onto them; a statement that still
+    // carries placeholders takes them over later, by the Worker, once Bind has
+    // filled them.
+    if (!awaiting_bind) {
+        result->otterbrix_params->catalog_resolves = plan.catalog_resolves;
     }
 
     auto external_count = get_external_nodes(resource_,

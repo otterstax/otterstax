@@ -103,7 +103,7 @@ MySQLManager::generate_slot_statement(const components::logical_plan::node_ptr& 
 actor_zeta::unique_future<core::result_wrapper_t<catalog_ext::discovered_tables_t>>
 MySQLManager::discover(qualified_name_t scope) {
     OTX_ZONE_N("MySQLManager::discover");
-    const std::string& uuid = scope.unique_identifier;
+    const std::string& uuid = scope.unique_identifier.t;
     catalog_ext::discovered_tables_t out(resource());
 
     auto probe = [this, &out, &uuid](const qualified_name_t& table) -> core::error_t {
@@ -118,7 +118,7 @@ MySQLManager::discover(qualified_name_t scope) {
                 return make_error(resource(), schema_struct.error().type, schema_struct.error().what.c_str());
             }
             out.push_back(catalog_ext::discovered_table_t{table, std::move(schema_struct.value())});
-            log_->info("discover: schema discovered for: {}", table.to_string());
+            log_->info("discover: schema discovered for: {}", otterstax::names::display_name(table));
             return otterstax::asio_error_t{};
         };
         auto probe_query = otterstax::catalog::make_schema_probe_query(resource(), table, backend_type_t::MySQL);
@@ -129,7 +129,7 @@ MySQLManager::discover(qualified_name_t scope) {
         return connector_manager_->executeQuery(uuid, probe_query.value(), schema_handler).get();
     };
 
-    if (!scope.collection.empty()) {
+    if (!scope.collection.t.empty()) {
         if (auto err = probe(scope); err.contains_error()) {
             co_return std::move(err);
         }
@@ -137,7 +137,7 @@ MySQLManager::discover(qualified_name_t scope) {
     }
 
     // Whole-database discovery via information_schema.
-    if (scope.database.empty()) {
+    if (scope.database.t.empty()) {
         log_->error("discover: no MySQL database configured for uuid {}", uuid);
         co_return make_error(resource(),
                              core::error_code_t::missing_field,
@@ -145,7 +145,7 @@ MySQLManager::discover(qualified_name_t scope) {
     }
 
     auto list_tables_query =
-        otterstax::catalog::make_list_tables_query(resource(), backend_type_t::MySQL, scope.database);
+        otterstax::catalog::make_list_tables_query(resource(), backend_type_t::MySQL, scope.database.t);
     log_->debug("discover: querying information_schema: \"{}\"", list_tables_query.c_str());
 
     std::pmr::vector<std::pmr::string> table_names(resource());
@@ -160,19 +160,19 @@ MySQLManager::discover(qualified_name_t scope) {
         err.contains_error()) {
         co_return std::move(err);
     }
-    log_->info("discover: found {} tables in MySQL database {}", table_names.size(), scope.database);
+    log_->info("discover: found {} tables in MySQL database {}", table_names.size(), scope.database.t);
 
     // Probe each table sequentially — the connection is free between queries.
     std::pmr::vector<std::pmr::string> failed_tables(resource());
     for (const auto& tn : table_names) {
         std::string table_name{tn.c_str(), tn.size()};
-        qualified_name_t table(uuid, scope.database, "", table_name);
+        qualified_name_t table(scope.unique_identifier, scope.database, core::schema_t{}, core::relname_t{table_name});
         if (auto err = probe(table); err.contains_error()) {
             log_->error("discover: failed to fetch schema for {}.{}: {}",
-                        scope.database,
+                        scope.database.t,
                         table_name,
                         err.what.c_str());
-            failed_tables.emplace_back((scope.database + "." + table_name).c_str());
+            failed_tables.emplace_back((scope.database.t + "." + table_name).c_str());
         }
     }
     if (!failed_tables.empty()) {
@@ -222,7 +222,7 @@ actor_zeta::unique_future<core::result_wrapper_t<ParsedQueryDataPtr>> MySQLManag
 
             auto& node = *batch_nodes[i].node;
             const auto& target = batch_nodes[i].target;
-            const auto& uid = target.name.unique_identifier;
+            const auto& uid = target.name.unique_identifier.t;
             log_->trace("UID: {}", uid);
 
             // A data_t slot was already fetched by another backend's manager.
@@ -298,7 +298,7 @@ actor_zeta::unique_future<core::result_wrapper_t<ParsedQueryDataPtr>> MySQLManag
             // the query without one has broken that contract, and a plan slot
             // cannot be filled from nothing.
             if (!chunk_ptr) {
-                const auto& uid = batch_nodes[i].target.name.unique_identifier;
+                const auto& uid = batch_nodes[i].target.name.unique_identifier.t;
                 if (conversion_errors[j].has_value()) {
                     log_->error("execute result[{}]: backend '{}' result conversion failed: {}",
                                 j,
@@ -372,7 +372,7 @@ MySQLManager::describe(session_hash_t id, ParsedQueryDataPtr data) {
         for (size_t i = 0; i < batch_nodes.size(); i++) {
             auto& node = *batch_nodes[i].node;
             const auto& target = batch_nodes[i].target;
-            const auto& uid = target.name.unique_identifier;
+            const auto& uid = target.name.unique_identifier.t;
 
             // Only a stub carries a schema the backend can fill: the catalog's,
             // made of an aggregate slot, or the parser's, holding the raw SQL of

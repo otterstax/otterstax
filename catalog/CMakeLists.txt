@@ -18,7 +18,6 @@ add_library(catalog
 target_link_libraries(catalog PUBLIC
     Boost::boost
     otterbrix::otterbrix
-    otterbrix_log
     actor-zeta::actor-zeta
     arrow::arrow
     PostgreSQL::PostgreSQL

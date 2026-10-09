@@ -192,7 +192,7 @@ BENCHMARK(BM_pipeline_three_backend);
 // ── table_reference ───────────────────────────────────────────────────────────
 
 static void BM_table_reference_mysql(benchmark::State& state) {
-    qualified_name_t name{"bill", "orders"};
+    qualified_name_t name{core::dbname_t{"bill"}, core::relname_t{"orders"}};
     for (auto _ : state) {
         auto ref = sql_gen::table_reference(name, backend_type_t::MySQL, std::pmr::new_delete_resource());
         benchmark::DoNotOptimize(ref);
@@ -201,7 +201,7 @@ static void BM_table_reference_mysql(benchmark::State& state) {
 BENCHMARK(BM_table_reference_mysql);
 
 static void BM_table_reference_pg(benchmark::State& state) {
-    qualified_name_t name{"shop", "products"};
+    qualified_name_t name{core::dbname_t{"shop"}, core::relname_t{"products"}};
     for (auto _ : state) {
         auto ref = sql_gen::table_reference(name, backend_type_t::PostgreSQL, std::pmr::new_delete_resource());
         benchmark::DoNotOptimize(ref);
@@ -210,7 +210,7 @@ static void BM_table_reference_pg(benchmark::State& state) {
 BENCHMARK(BM_table_reference_pg);
 
 static void BM_table_reference_ch(benchmark::State& state) {
-    qualified_name_t name{"events", "sessions"};
+    qualified_name_t name{core::dbname_t{"events"}, core::relname_t{"sessions"}};
     for (auto _ : state) {
         auto ref = sql_gen::table_reference(name, backend_type_t::ClickHouse, std::pmr::new_delete_resource());
         benchmark::DoNotOptimize(ref);

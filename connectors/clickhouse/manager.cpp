@@ -61,12 +61,15 @@ namespace ch {
         connections_[uuid] = std::move(connector);
 
         // ClickHouse: no schema level, use database.table
-        qualified_name_t name(uuid, connection_param.database, "", connection_param.table);
+        qualified_name_t name(core::uid_t{uuid},
+                              core::dbname_t{connection_param.database},
+                              core::schema_t{},
+                              core::relname_t{connection_param.table});
         log_->debug("Creating collection_full_name: uid={}, db={}, schema={}, table={}",
-                    name.unique_identifier,
-                    name.database,
-                    name.schema,
-                    name.collection);
+                    name.unique_identifier.t,
+                    name.database.t,
+                    name.schema.t,
+                    name.collection.t);
         // The catalog answers synchronously (running the probes through the
         // ClickHouse backend actor that owns this manager), and a connection
         // whose schema could not be registered is unusable for federated SQL,

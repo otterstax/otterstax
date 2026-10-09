@@ -165,8 +165,8 @@ core::result_wrapper_t<tsl::pg_enum_oid_map> PostgressManager::fetch_enum_types(
 actor_zeta::unique_future<core::result_wrapper_t<catalog_ext::discovered_tables_t>>
 PostgressManager::discover(qualified_name_t scope) {
     OTX_ZONE_N("PostgressManager::discover");
-    const std::string& uuid = scope.unique_identifier;
-    if (scope.schema.empty()) {
+    const std::string& uuid = scope.unique_identifier.t;
+    if (scope.schema.t.empty()) {
         log_->error("discover: no PostgreSQL schema configured for uuid {}", uuid);
         co_return make_error(resource(),
                              core::error_code_t::missing_field,
@@ -187,7 +187,7 @@ PostgressManager::discover(qualified_name_t scope) {
         auto schema_handler = [this, table, pg_enum_oids, &out](PGresult* schema_result) -> otterstax::asio_error_t {
             auto schema_struct = tsl::pg_to_struct(resource(), schema_result, pg_enum_oids);
             out.push_back(catalog_ext::discovered_table_t{table, std::move(schema_struct)});
-            log_->info("discover: schema discovered for: {}.{}", table.schema, table.collection);
+            log_->info("discover: schema discovered for: {}.{}", table.schema.t, table.collection.t);
             return otterstax::asio_error_t{};
         };
         auto probe_query =
@@ -199,7 +199,7 @@ PostgressManager::discover(qualified_name_t scope) {
         return connector_manager_->executeQuery(uuid, probe_query.value(), schema_handler).get();
     };
 
-    if (!scope.collection.empty()) {
+    if (!scope.collection.t.empty()) {
         if (auto err = probe(scope); err.contains_error()) {
             co_return std::move(err);
         }
@@ -208,7 +208,7 @@ PostgressManager::discover(qualified_name_t scope) {
 
     // Whole-schema discovery via information_schema.
     auto list_tables_query =
-        otterstax::catalog::make_list_tables_query(resource(), backend_type_t::PostgreSQL, scope.schema);
+        otterstax::catalog::make_list_tables_query(resource(), backend_type_t::PostgreSQL, scope.schema.t);
     log_->debug("discover: querying information_schema: \"{}\"", list_tables_query.c_str());
 
     std::pmr::vector<std::pmr::string> table_names(resource());
@@ -223,7 +223,7 @@ PostgressManager::discover(qualified_name_t scope) {
         err.contains_error()) {
         co_return std::move(err);
     }
-    log_->info("discover: found {} tables in schema {}", table_names.size(), scope.schema);
+    log_->info("discover: found {} tables in schema {}", table_names.size(), scope.schema.t);
 
     // Probe each table sequentially — the connection is free between queries.
     std::pmr::vector<std::pmr::string> failed_tables(resource());
@@ -232,10 +232,10 @@ PostgressManager::discover(qualified_name_t scope) {
         table.collection = std::string{tn.c_str(), tn.size()};
         if (auto err = probe(table); err.contains_error()) {
             log_->error("discover: failed to fetch schema for {}.{}: {}",
-                        table.schema,
-                        table.collection,
+                        table.schema.t,
+                        table.collection.t,
                         err.what.c_str());
-            failed_tables.emplace_back((table.schema + "." + table.collection).c_str());
+            failed_tables.emplace_back((table.schema.t + "." + table.collection.t).c_str());
         }
     }
     if (!failed_tables.empty()) {
@@ -285,7 +285,7 @@ PostgressManager::execute(session_hash_t id, ParsedQueryDataPtr data) {
 
             auto& node = *batch_nodes[i].node;
             const auto& target = batch_nodes[i].target;
-            const auto& uid = target.name.unique_identifier;
+            const auto& uid = target.name.unique_identifier.t;
             log_->trace("UID: {}", uid);
 
             // A data_t slot was already fetched by another backend's manager.
@@ -374,7 +374,7 @@ PostgressManager::execute(session_hash_t id, ParsedQueryDataPtr data) {
             // the query without one has broken that contract, and a plan slot
             // cannot be filled from nothing.
             if (!chunk_ptr) {
-                const auto& uid = batch_nodes[i].target.name.unique_identifier;
+                const auto& uid = batch_nodes[i].target.name.unique_identifier.t;
                 if (conversion_errors[j].has_value()) {
                     log_->error("execute result[{}]: backend '{}' result conversion failed: {}",
                                 j,
@@ -449,7 +449,7 @@ PostgressManager::describe(session_hash_t id, ParsedQueryDataPtr data) {
         for (size_t i = 0; i < batch_nodes.size(); i++) {
             auto& node = *batch_nodes[i].node;
             const auto& target = batch_nodes[i].target;
-            const auto& uid = target.name.unique_identifier;
+            const auto& uid = target.name.unique_identifier.t;
 
             // Only a stub carries a schema the backend can fill: the catalog's,
             // made of an aggregate slot, or the parser's, holding the raw SQL of

@@ -389,9 +389,10 @@ OtterbrixDataManager::create_collection(const std::string& database,
     auto* resource = otterbrix_->dispatcher()->resource();
     auto create =
         logical_plan::make_node_create_collection(resource, core::relname_t{collection}, std::move(columns), {});
-    // create_collection carries only the relname: the database is named on the
-    // node and registered as the plan's namespace lookup.
-    logical_plan::node_ptr node = sql::transform::name_catalog_target(database, {}, create);
+    // The database is named on the node's target together with the relname,
+    // and registered as the plan's namespace lookup.
+    logical_plan::node_ptr node =
+        sql::transform::name_catalog_target(core::dbname_t{database}, core::relname_t{collection}, create);
     logical_plan::execution_plan_t plan{resource, node, logical_plan::make_parameter_node(resource)};
     sql::transform::register_catalog_resolve_namespace(resource, &plan.catalog_resolves, database);
     auto cursor = otterbrix_->dispatcher()->execute_plan(otterbrix::session_id_t(), std::move(plan));
@@ -449,10 +450,10 @@ OtterbrixDataManager::insert_data(const std::string& database,
         return error_cursor(res, probed.error());
     }
 
-    // create_collection carries only the relname; the database is named on the
-    // node and registered as the plan's namespace lookup (mirrors create_collection()).
+    // The database is named on the node's target together with the relname, and
+    // registered as the plan's namespace lookup (mirrors create_collection()).
     auto create = logical_plan::make_node_create_collection(res, core::relname_t{col}, std::move(columns), {});
-    auto cc_node = sql::transform::name_catalog_target(db, {}, create);
+    auto cc_node = sql::transform::name_catalog_target(core::dbname_t{db}, core::relname_t{col}, create);
     logical_plan::execution_plan_t create_plan{res, cc_node, logical_plan::make_parameter_node(res)};
     sql::transform::register_catalog_resolve_namespace(res, &create_plan.catalog_resolves, db);
     auto created = otterbrix_->dispatcher()->execute_plan(session, std::move(create_plan));
@@ -484,7 +485,8 @@ components::cursor::cursor_t_ptr OtterbrixDataManager::insert_rows(const std::st
     auto insert = logical_plan::make_node_insert(res,
                                                  tsl::split_to_capacity(res, std::move(data)),
                                                  std::pmr::vector<components::expressions::key_t>(res));
-    auto insert_node = sql::transform::name_catalog_target(database, collection, insert);
+    auto insert_node =
+        sql::transform::name_catalog_target(core::dbname_t{database}, core::relname_t{collection}, insert);
     logical_plan::execution_plan_t plan{res, insert_node, logical_plan::make_parameter_node(res)};
     sql::transform::register_catalog_resolve_table(res,
                                                    &plan.catalog_resolves,
@@ -511,16 +513,11 @@ components::cursor::cursor_t_ptr OtterbrixDataManager::delete_rows(const std::st
     expressions::key_t column_key(res, column, expressions::side_t::left);
     auto predicate =
         expressions::make_compare_expression(res, expressions::compare_type::eq, column_key, value_param);
-    auto match =
-        logical_plan::make_node_match(res, core::dbname_t{database}, core::relname_t{collection}, predicate);
-    auto del = logical_plan::make_node_delete(
-        res,
-        match,
-        logical_plan::make_node_limit(res,
-                                      core::dbname_t{database},
-                                      core::relname_t{collection},
-                                      logical_plan::limit_t::unlimit()));
-    logical_plan::node_ptr node = sql::transform::name_catalog_target(database, collection, del);
+    const qualified_name_t target{core::dbname_t{database}, core::relname_t{collection}};
+    auto match = logical_plan::make_node_match(res, target, predicate);
+    auto del =
+        logical_plan::make_node_delete(res, match, logical_plan::make_node_limit(res, logical_plan::limit_t::unlimit()));
+    logical_plan::node_ptr node = sql::transform::name_catalog_target(target.database, target.collection, del);
     logical_plan::execution_plan_t plan{res, node, std::move(params)};
     // DELETE is checked against the constraints that REFERENCE the target.
     sql::transform::register_catalog_resolve_table(res,

@@ -476,7 +476,7 @@ TEST_CASE("kafka stream node-swap: aggregate(empty)+raw_data applies the SELECT"
 
     // Passthrough: aggregate(empty)+[raw_data] returns the batch unchanged
     {
-        auto agg = lp::make_node_aggregate(resource, {}, {});
+        auto agg = lp::make_node_aggregate(resource, qualified_name_t{});
         agg->append_child(lp::make_node_raw_data(resource, stream_batch()));
         auto cursor = drive_until_ready(otterstax::kafka::detail::kafka_execute(
             addr,
@@ -508,11 +508,11 @@ TEST_CASE("kafka stream node-swap: aggregate(empty)+raw_data applies the SELECT"
         CHECK(stream_src->operators[1]->expressions().size() == 2); // id, name
         // Every carried operator is re-homed: one still naming `kafka.s` would both
         // miss the raw_data rows and make each batch resolve a table it never reads
-        CHECK(static_cast<const lp::node_match_t*>(stream_src->operators[0].get())->relname().empty());
-        CHECK(static_cast<const lp::node_group_t*>(stream_src->operators[1].get())->relname().empty());
-        CHECK(static_cast<const lp::node_select_t*>(stream_src->operators[2].get())->relname().t.empty());
+        CHECK(static_cast<const lp::node_match_t*>(stream_src->operators[0].get())->target().collection.t.empty());
+        CHECK(static_cast<const lp::node_group_t*>(stream_src->operators[1].get())->target().collection.t.empty());
+        CHECK(static_cast<const lp::node_select_t*>(stream_src->operators[2].get())->target().collection.t.empty());
 
-        auto agg = lp::make_node_aggregate(resource, {}, {});
+        auto agg = lp::make_node_aggregate(resource, qualified_name_t{});
         agg->append_child(
             lp::make_node_raw_data(resource, otterstax::kafka::detail::json_to_chunk(resource, cols, payloads)));
         for (const auto& op : stream_src->operators) {
@@ -588,7 +588,7 @@ TEST_CASE("kafka stream node-swap: the ORDER BY / LIMIT / HAVING tail is re-home
         CHECK(stream_src->source_relname == "s");
 
         swap_result_t out;
-        auto agg = lp::make_node_aggregate(resource, {}, {});
+        auto agg = lp::make_node_aggregate(resource, qualified_name_t{});
         agg->append_child(
             lp::make_node_raw_data(resource, otterstax::kafka::detail::json_to_chunk(resource, cols, payloads)));
         for (const auto& op : stream_src->operators) {
@@ -1040,7 +1040,7 @@ TEST_CASE("kafka stream: a COUNT column is declared and produced as the type the
     // runs per batch: aggregate(empty) + [raw_data(batch), <re-homed operators>]
     auto stream_src = otterstax::kafka::kafka_stream_source(resource, plan.value().sub_queries.back());
     REQUIRE(stream_src);
-    auto swapped = lp::make_node_aggregate(resource, {}, {});
+    auto swapped = lp::make_node_aggregate(resource, qualified_name_t{});
     swapped->append_child(lp::make_node_raw_data(
         resource,
         kd::json_to_chunk(
@@ -1768,9 +1768,10 @@ TEST_CASE("kafka recover: a source's columns are read from the catalog, for an e
 }
 
 // A VIEW over a source's backing table does not hold the source back. Records
-// the current outcome: DROP SOURCE neither cascades to the view nor is refused
-// by it; the view is left behind, fails while the table is gone and reads again
-// once a source of the same name is created.
+// the current outcome: DROP SOURCE drops the backing table with CASCADE, and the
+// engine (since views are bound at creation, with dependencies) drops the
+// dependent view with it; a source re-created under the same name does not
+// bring the view back.
 TEST_CASE("kafka drop: DROP SOURCE with a dependent VIEW") {
     std::filesystem::remove_all("/tmp/otterstax_kafka_drop_view");
     auto cfg = make_create_config("/tmp/otterstax_kafka_drop_view");
@@ -1823,7 +1824,7 @@ TEST_CASE("kafka drop: DROP SOURCE with a dependent VIEW") {
     }
     require_error(query("SELECT * FROM kafka.v;"),
                   core::error_code_t::table_not_exists,
-                  "collection does not exist: kafka.s");
+                  "collection does not exist: kafka.v");
     {
         namespace lp = components::logical_plan;
         namespace ty = components::types;
@@ -1843,11 +1844,7 @@ TEST_CASE("kafka drop: DROP SOURCE with a dependent VIEW") {
     CHECK_FALSE(run_kafka(parse_kafka(parser, "DROP SOURCE IF EXISTS s;"))->is_error());
 
     REQUIRE_FALSE(run_kafka(parse_kafka(parser, create_source))->is_error());
-    {
-        auto rows = query("SELECT * FROM kafka.v;");
-        REQUIRE_FALSE(rows->is_error());
-        CHECK(rows->size() == 0);
-        CHECK(rows->type_data().size() == 2);
-    }
-    CHECK_FALSE(query("DROP VIEW kafka.v;")->is_error());
+    require_error(query("SELECT * FROM kafka.v;"),
+                  core::error_code_t::table_not_exists,
+                  "collection does not exist: kafka.v");
 }

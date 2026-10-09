@@ -499,10 +499,10 @@ otterbrix-internal — shadow of `external_join_all` benchmark), all driven by
 
 ## Critical Dependency Versions
 
-- Otterbrix 1.0.0b2-rc-3 (custom Conan remote: `https://conan.otterbrix.com`; pinned by recipe revision in `conanfile.py`)
+- Otterbrix `1.0.0b2-embedding.46fba865` — a **local** Conan package built from otterbrix branch `feat/otterstax-embedding` (`conan create . --version 1.0.0b2-embedding.46fba865 -pr:h profiles/release -pr:b default -o "otterbrix/*:shared=True"`), pinned by recipe revision in `conanfile.py`; it replaces the `1.0.0b2-rc-3` remote package until otterbrix cuts a release tag from that branch (see `docs/proposals/otterbrix-embedding.md`, OTB-tag). Docker images cannot fetch it from the remote yet
 - Arrow 24.0.0 (with `with_s3=True`, `with_parquet=True`, `with_csv=True`, `with_json=True`, plus snappy/brotli/zlib/lz4/zstd compression codecs)
 - Boost 1.88.0
-- actor-zeta 1.2.0
+- actor-zeta 2.0.0 (required by the otterbrix package; no blocking `unique_future::get()/wait()`, no `co_await` on a future outside an actor coroutine)
 - Catch2 3.15.1 (v3 — `find_package(Catch2 3)` required by the otterbrix recipe)
 - asio-grpc 3.7.0 (`backend=boost` in `conanfile.py`) over gRPC 1.69.0 — the Spark Connect server
 - Spark Connect protocol 4.2.0 — the protos are vendored from apache/spark v4.2.0 into `frontend/spark_connect_server/proto/spark/connect/`; the server answers `SparkVersion` 4.2.0

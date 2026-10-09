@@ -51,7 +51,7 @@ TEST_CASE("subquery in FROM") {
     SECTION("preserve original qualifier") {
         REQUIRE(r.stubs[0].raw_sql.find("FROM mysql.bill.orders") != std::string::npos);
         REQUIRE_FALSE(r.stubs[0].qualifiers.empty());
-        REQUIRE(r.stubs[0].qualifiers[0].name.unique_identifier == "mysql");
+        REQUIRE(r.stubs[0].qualifiers[0].name.unique_identifier.t == "mysql");
     }
 }
 
@@ -122,7 +122,7 @@ TEST_CASE("qualifier inside subquery") {
     REQUIRE(r.stubs[0].source_uid == "cluster01");
     REQUIRE(r.stubs[0].raw_sql.find("FROM cluster01.mysql.bill.invoices") != std::string::npos);
     REQUIRE_FALSE(r.stubs[0].qualifiers.empty());
-    REQUIRE(r.stubs[0].qualifiers[0].name.unique_identifier == "cluster01");
+    REQUIRE(r.stubs[0].qualifiers[0].name.unique_identifier.t == "cluster01");
 }
 
 TEST_CASE("nested subquery") {

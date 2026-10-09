@@ -33,7 +33,6 @@ target_link_libraries(
     # dependency of this binary, not just a transitive include.
     Boost::boost
     Catch2::Catch2
-    otterbrix_log
 )
 
 if(ENABLE_TRACY)

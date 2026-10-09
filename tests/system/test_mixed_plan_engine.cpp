@@ -54,7 +54,7 @@ TEST_CASE("cross-backend GROUP BY downstream calls") {
                 continue;
             }
             auto agg = static_cast<logical_plan::node_aggregate_t&>(**node);
-            auto schema_types = target.name.collection == "campaigns" ? campaigns_cols : products_cols;
+            auto schema_types = target.name.collection.t == "campaigns" ? campaigns_cols : products_cols;
             std::cout << "  calling generate_query...\n";
             auto q = sql_gen::generate_query(*node,
                                              &data->otterbrix_params->params_node->parameters(),
@@ -81,7 +81,7 @@ TEST_CASE("cross-backend GROUP BY downstream calls") {
 #include "otterbrix/operators/execute_plan.hpp"
 #include <components/logical_plan/node_data.hpp>
 #include <components/vector/data_chunk.hpp>
-#include <otterbrix/otterbrix.hpp>
+#include <integration/cpp/otterbrix.hpp>
 
 // Engine defect (otterbrix a13-rc-1): operator_group_t fallback aggregation
 // dereferences null when the GROUP BY key is a table-qualified STRING column
@@ -92,6 +92,11 @@ TEST_CASE("mixed plan with node_data executes in engine", "[engine-group-by-stri
     // from it off the test thread.
     std::pmr::synchronized_pool_resource case_arena;
     auto* resource = &case_arena;
+    // The engine is opened before the plan exists and so outlives it: running a
+    // plan stamps engine-owned functions into its expressions, which a plan
+    // destroyed after the engine would free into a resource already gone.
+    auto cfg = make_create_config("/tmp/otterstax_mixed_probe");
+    auto inst = db::make_otterbrix_engine(cfg);
     GreenplumParser parser(resource);
     const char* sql = R"(
         SELECT c.campaign_name,
@@ -137,7 +142,7 @@ TEST_CASE("mixed plan with node_data executes in engine", "[engine-group-by-stri
     for (size_t b = 0; b < nodes.size(); ++b) {
         for (size_t i = 0; i < nodes[b].size(); ++i) {
             auto& target = nodes[b][i].target;
-            auto chunk = target.name.collection == "campaigns"
+            auto chunk = target.name.collection.t == "campaigns"
                              ? make_chunk({{"campaign_id", types::logical_type::INTEGER},
                                            {"campaign_name", types::logical_type::STRING_LITERAL},
                                            {"budget", types::logical_type::DOUBLE}})
@@ -149,8 +154,6 @@ TEST_CASE("mixed plan with node_data executes in engine", "[engine-group-by-stri
         }
     }
 
-    auto cfg = make_create_config("/tmp/otterstax_mixed_probe");
-    auto inst = db::make_otterbrix_engine(cfg);
     auto manager = make_otterbrix_manager(inst);
     std::cout << "executing mixed plan in engine...\n";
     auto cursor = manager->execute_plan(data->otterbrix_params);
@@ -168,6 +171,11 @@ static void run_mixed_variant(const char* tag, const char* sql, bool string_name
     // from it off the test thread.
     std::pmr::synchronized_pool_resource case_arena;
     auto* resource = &case_arena;
+    // The engine is opened before the plan exists and so outlives it: running a
+    // plan stamps engine-owned functions into its expressions, which a plan
+    // destroyed after the engine would free into a resource already gone.
+    auto cfg = make_create_config(std::string("/tmp/otterstax_mp_") + tag);
+    auto inst = db::make_otterbrix_engine(cfg);
     GreenplumParser parser(resource);
     auto result = parser.parse(sql);
     REQUIRE_FALSE(result.has_error());
@@ -207,7 +215,7 @@ static void run_mixed_variant(const char* tag, const char* sql, bool string_name
     for (size_t b = 0; b < nodes.size(); ++b) {
         for (size_t i = 0; i < nodes[b].size(); ++i) {
             auto& target = nodes[b][i].target;
-            auto chunk = target.name.collection == "campaigns"
+            auto chunk = target.name.collection.t == "campaigns"
                              ? make_chunk({{"campaign_id", lt::INTEGER},
                                            {"campaign_name", string_names ? lt::STRING_LITERAL : lt::INTEGER},
                                            {"budget", lt::DOUBLE}})
@@ -218,8 +226,6 @@ static void run_mixed_variant(const char* tag, const char* sql, bool string_name
             *nodes[b][i].node = components::logical_plan::make_node_raw_data(resource, std::move(chunk));
         }
     }
-    auto cfg = make_create_config(std::string("/tmp/otterstax_mp_") + tag);
-    auto inst = db::make_otterbrix_engine(cfg);
     auto manager = make_otterbrix_manager(inst);
     std::cout << "[" << tag << "] executing...\n";
     auto cursor = manager->execute_plan(data->otterbrix_params);
@@ -252,6 +258,11 @@ TEST_CASE("pure engine: group by string key over node_data", "[engine-group-by-s
     // from it off the test thread.
     std::pmr::synchronized_pool_resource case_arena;
     auto* resource = &case_arena;
+    // The engine is opened before the plan exists and so outlives it: running a
+    // plan stamps engine-owned functions into its expressions, which a plan
+    // destroyed after the engine would free into a resource already gone.
+    auto cfg = make_create_config("/tmp/otterstax_pure_engine_probe");
+    auto inst = db::make_otterbrix_engine(cfg);
 
     const char* sql = R"(
         SELECT c.campaign_name, COUNT(p.product_id) as product_count, AVG(p.price) as avg_product_price
@@ -268,7 +279,10 @@ TEST_CASE("pure engine: group by string key over node_data", "[engine-group-by-s
     components::sql::transform::transformer transformer(resource);
     auto binder = transformer.transform(components::sql::transform::pg_cell_to_node_cast(res));
     REQUIRE_FALSE(binder.has_error());
-    auto root = binder.node_ptr();
+    auto finalized = binder.finalize();
+    REQUIRE_FALSE(finalized.has_error());
+    auto root = finalized.value().sub_queries.back();
+    auto root_params = finalized.value().parameters;
     REQUIRE(root);
 
     auto make_chunk = [&](std::initializer_list<std::pair<const char*, components::types::logical_type>> names) {
@@ -311,7 +325,7 @@ TEST_CASE("pure engine: group by string key over node_data", "[engine-group-by-s
         walk.pop_front();
         for (auto& child : n->children()) {
             if (child && child->type() == components::logical_plan::node_type::aggregate_t) {
-                const auto& rel = static_cast<const components::logical_plan::node_aggregate_t&>(*child).relname().t;
+                const auto& rel = static_cast<const components::logical_plan::node_aggregate_t&>(*child).target().collection.t;
                 if (rel == "campaigns") {
                     child =
                         components::logical_plan::make_node_raw_data(resource,
@@ -339,11 +353,9 @@ TEST_CASE("pure engine: group by string key over node_data", "[engine-group-by-s
     }
     REQUIRE(swapped == 2);
 
-    auto cfg = make_create_config("/tmp/otterstax_pure_engine_probe");
-    auto inst = db::make_otterbrix_engine(cfg);
     auto cursor = inst->dispatcher()->execute_plan(
         otterbrix::session_id_t(),
-        components::logical_plan::execution_plan_t{resource, root, binder.params_ptr()});
+        components::logical_plan::execution_plan_t{resource, root, root_params});
     std::cout << "pure engine execute: err=" << (cursor ? cursor->is_error() : true) << "\n";
     REQUIRE(cursor);
 }

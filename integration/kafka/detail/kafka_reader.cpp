@@ -342,7 +342,9 @@ namespace otterstax::kafka::detail {
         // share a transaction
         auto insert = logical_plan::make_node_insert(resource, std::move(chunk));
         logical_plan::execution_plan_t plan{resource,
-                                            sql::transform::name_catalog_target(database, relname, insert),
+                                            sql::transform::name_catalog_target(core::dbname_t{database},
+                                                                                core::relname_t{relname},
+                                                                                insert),
                                             logical_plan::make_parameter_node(resource)};
         sql::transform::register_catalog_resolve_table(resource,
                                                        &plan.catalog_resolves,
@@ -431,17 +433,14 @@ namespace otterstax::kafka::detail {
         expressions::key_t column_key(resource, column, expressions::side_t::left);
         auto predicate =
             expressions::make_compare_expression(resource, expressions::compare_type::eq, column_key, value_param);
-        auto match =
-            logical_plan::make_node_match(resource, core::dbname_t{database}, core::relname_t{relname}, predicate);
+        const qualified_name_t target{core::dbname_t{database}, core::relname_t{relname}};
+        auto match = logical_plan::make_node_match(resource, target, predicate);
         // unlimit() keeps the delete-all-matching semantics
         auto del = logical_plan::make_node_delete(resource,
                                                   match,
-                                                  logical_plan::make_node_limit(resource,
-                                                                                core::dbname_t{database},
-                                                                                core::relname_t{relname},
-                                                                                logical_plan::limit_t::unlimit()));
+                                                  logical_plan::make_node_limit(resource, logical_plan::limit_t::unlimit()));
         logical_plan::execution_plan_t plan{resource,
-                                            sql::transform::name_catalog_target(database, relname, del),
+                                            sql::transform::name_catalog_target(target.database, target.collection, del),
                                             std::move(params)};
         // constraint_resolve_kind::referencing mirrors transform_delete (FK cascade to
         // children); __sources has no FKs, so the gather finds nothing here

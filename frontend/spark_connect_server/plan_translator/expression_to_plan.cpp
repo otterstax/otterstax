@@ -638,7 +638,9 @@ namespace frontend::spark {
                         }
                         fargs.push_back(child.value());
                     }
-                    return ce::make_function_expression(resource, ascii_lower_std(name), std::move(fargs));
+                    return ce::make_function_expression(resource,
+                                                        function_qualified_name_t{core::function_name_t{ascii_lower_std(name)}},
+                                                        std::move(fargs));
                 }
             }
             return unsupported("unsupported Spark function kind", resource);

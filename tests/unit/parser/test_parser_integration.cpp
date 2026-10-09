@@ -46,7 +46,7 @@ namespace {
 
     flat_external_t find_by_uid(const std::vector<flat_external_t>& nodes, const std::string& uid) {
         auto it = std::find_if(nodes.begin(), nodes.end(), [&uid](const auto& n) {
-            return n.target.name.unique_identifier == uid;
+            return n.target.name.unique_identifier.t == uid;
         });
         return it != nodes.end() ? *it : flat_external_t{};
     }
@@ -83,10 +83,10 @@ TEST_CASE("integration: 4-part qualifier in cross-source JOIN") {
     REQUIRE_FALSE(is_schema_node_with_raw_sql(mysql_node.node));
     REQUIRE_FALSE(is_schema_node_with_raw_sql(pg_node.node));
 
-    REQUIRE(mysql_node.target.name.database == "bill");
-    REQUIRE(mysql_node.target.name.collection == "orders");
-    REQUIRE(pg_node.target.name.schema == "shop");
-    REQUIRE(pg_node.target.name.collection == "products");
+    REQUIRE(mysql_node.target.name.database.t == "bill");
+    REQUIRE(mysql_node.target.name.collection.t == "orders");
+    REQUIRE(pg_node.target.name.schema.t == "shop");
+    REQUIRE(pg_node.target.name.collection.t == "products");
 }
 
 TEST_CASE("integration: 4-part qualifier untouched") {
@@ -107,10 +107,10 @@ TEST_CASE("integration: 4-part qualifier untouched") {
     auto n2 = find_by_uid(nodes, "uid2");
     REQUIRE(n1.node);
     REQUIRE(n2.node);
-    REQUIRE(n1.target.name.database == "db1");
-    REQUIRE(n1.target.name.schema == "sch1");
-    REQUIRE(n1.target.name.collection == "test1");
-    REQUIRE(n2.target.name.collection == "test2");
+    REQUIRE(n1.target.name.database.t == "db1");
+    REQUIRE(n1.target.name.schema.t == "sch1");
+    REQUIRE(n1.target.name.collection.t == "test1");
+    REQUIRE(n2.target.name.collection.t == "test2");
 }
 
 TEST_CASE("integration: no external_node") {
@@ -163,7 +163,7 @@ TEST_CASE("integration: DROP TABLE keeps its alias-qualified external node") {
 
     auto nodes = external_nodes_flat(parsed);
     REQUIRE(nodes.size() == 1);
-    REQUIRE(nodes[0].target.name.unique_identifier == "conn1");
+    REQUIRE(nodes[0].target.name.unique_identifier.t == "conn1");
 }
 
 TEST_CASE("integration: DROP INDEX with an alias resolves the table and the index") {
@@ -179,13 +179,13 @@ TEST_CASE("integration: DROP INDEX with an alias resolves the table and the inde
     auto nodes = external_nodes_flat(parsed);
     REQUIRE(nodes.size() == 1);
     REQUIRE(nodes[0].node->type() == components::logical_plan::node_type::drop_t);
-    REQUIRE(nodes[0].target.name.unique_identifier == "conn1");
-    REQUIRE(nodes[0].target.name.database == "db1");
-    REQUIRE(nodes[0].target.name.schema == "public");
-    REQUIRE(nodes[0].target.name.collection == "t");
-    REQUIRE(nodes[0].target.from_name.unique_identifier == "conn1");
-    REQUIRE(nodes[0].target.from_name.database == "db1");
-    REQUIRE(nodes[0].target.from_name.collection == "idx");
+    REQUIRE(nodes[0].target.name.unique_identifier.t == "conn1");
+    REQUIRE(nodes[0].target.name.database.t == "db1");
+    REQUIRE(nodes[0].target.name.schema.t == "public");
+    REQUIRE(nodes[0].target.name.collection.t == "t");
+    REQUIRE(nodes[0].target.from_name.unique_identifier.t == "conn1");
+    REQUIRE(nodes[0].target.from_name.database.t == "db1");
+    REQUIRE(nodes[0].target.from_name.collection.t == "idx");
 }
 
 // The FROM / USING source of an UPDATE / DELETE is a child sub-plan of the DML
@@ -207,12 +207,12 @@ TEST_CASE("integration: UPDATE ... FROM resolves its source into the DML slot") 
     REQUIRE(nodes.size() == 1);
     REQUIRE(parsed->otterbrix_params->external_nodes_count == 1);
     REQUIRE(nodes[0].node->type() == components::logical_plan::node_type::update_t);
-    REQUIRE(nodes[0].target.name.unique_identifier == "conn1");
-    REQUIRE(nodes[0].target.name.collection == "orders");
-    REQUIRE(nodes[0].target.from_name.unique_identifier == "conn1");
-    REQUIRE(nodes[0].target.from_name.database == "db1");
-    REQUIRE(nodes[0].target.from_name.schema == "public");
-    REQUIRE(nodes[0].target.from_name.collection == "other");
+    REQUIRE(nodes[0].target.name.unique_identifier.t == "conn1");
+    REQUIRE(nodes[0].target.name.collection.t == "orders");
+    REQUIRE(nodes[0].target.from_name.unique_identifier.t == "conn1");
+    REQUIRE(nodes[0].target.from_name.database.t == "db1");
+    REQUIRE(nodes[0].target.from_name.schema.t == "public");
+    REQUIRE(nodes[0].target.from_name.collection.t == "other");
 }
 
 TEST_CASE("integration: DELETE ... USING resolves its source into the DML slot") {
@@ -228,9 +228,9 @@ TEST_CASE("integration: DELETE ... USING resolves its source into the DML slot")
     REQUIRE(nodes.size() == 1);
     REQUIRE(parsed->otterbrix_params->external_nodes_count == 1);
     REQUIRE(nodes[0].node->type() == components::logical_plan::node_type::delete_t);
-    REQUIRE(nodes[0].target.name.collection == "orders");
-    REQUIRE(nodes[0].target.from_name.unique_identifier == "conn1");
-    REQUIRE(nodes[0].target.from_name.collection == "other");
+    REQUIRE(nodes[0].target.name.collection.t == "orders");
+    REQUIRE(nodes[0].target.from_name.unique_identifier.t == "conn1");
+    REQUIRE(nodes[0].target.from_name.collection.t == "other");
 }
 
 // A local source resolves too — to a name with no uid. The slot carries it so
@@ -246,8 +246,8 @@ TEST_CASE("integration: UPDATE ... FROM a local table resolves to a uid-less sou
 
     auto nodes = external_nodes_flat(parsed);
     REQUIRE(nodes.size() == 1);
-    REQUIRE(nodes[0].target.from_name.unique_identifier.empty());
-    REQUIRE(nodes[0].target.from_name.collection == "other");
+    REQUIRE(nodes[0].target.from_name.unique_identifier.t.empty());
+    REQUIRE(nodes[0].target.from_name.collection.t == "other");
 }
 
 // Only a plain table is pushed down. A subquery source is a childless aggregate
@@ -269,7 +269,7 @@ TEST_CASE("integration: DELETE ... USING a subquery source keeps the source as i
     auto del = find_by_uid(nodes, "conn1");
     REQUIRE(del.node);
     REQUIRE(del.node->type() == components::logical_plan::node_type::delete_t);
-    REQUIRE(del.target.from_name.collection.empty());
+    REQUIRE(del.target.from_name.collection.t.empty());
 }
 
 TEST_CASE("integration: DROP TABLE without an alias is local and closes the batch") {
@@ -447,7 +447,7 @@ TEST_CASE("integration: derived table into schema_node") {
     REQUIRE(static_cast<const schema_utils::schema_node_t&>(*mysql_stub.node).name() == mysql_stub.target.name);
 
     REQUIRE_FALSE(is_schema_node_with_raw_sql(pg_real.node));
-    REQUIRE(pg_real.target.name.schema == "shop");
+    REQUIRE(pg_real.target.name.schema.t == "shop");
 }
 
 TEST_CASE("integration: qualified + local untouched") {
@@ -464,12 +464,12 @@ TEST_CASE("integration: qualified + local untouched") {
 
     auto nodes = external_nodes_flat(parsed);
     REQUIRE(nodes.size() == 1);
-    REQUIRE(nodes[0].target.name.unique_identifier == "pg");
+    REQUIRE(nodes[0].target.name.unique_identifier.t == "pg");
 
     // It's a real aggregate, NOT a wrapped raw_sql — proves wrap was skipped.
     REQUIRE_FALSE(is_schema_node_with_raw_sql(nodes[0].node));
-    REQUIRE(nodes[0].target.name.schema == "shop");
-    REQUIRE(nodes[0].target.name.collection == "customers");
+    REQUIRE(nodes[0].target.name.schema.t == "shop");
+    REQUIRE(nodes[0].target.name.collection.t == "customers");
 }
 
 TEST_CASE("integration: cross-source subqueries") {

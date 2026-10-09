@@ -229,8 +229,8 @@ namespace {
     const cl::node_ptr& derived_inner(const cl::node_ptr& root) {
         REQUIRE(root->type() == cl::node_type::aggregate_t);
         const auto& outer = static_cast<const cl::node_aggregate_t&>(*root);
-        CHECK(outer.dbname().t.empty());
-        CHECK(outer.relname().t.empty());
+        CHECK(outer.target().database.t.empty());
+        CHECK(outer.target().collection.t.empty());
         REQUIRE_FALSE(root->children().empty());
         REQUIRE(root->children().front()->type() == cl::node_type::aggregate_t);
         return root->children().front();
@@ -280,11 +280,11 @@ TEST_CASE("relation_to_plan: Read.NamedTable federated alias.db.schema.table") {
     REQUIRE(parsed->otterbrix_params->external_nodes[0].size() == 1);
 
     const auto& target = parsed->otterbrix_params->external_nodes[0][0].target;
-    CHECK(target.name.unique_identifier == "alias1");
-    CHECK(target.name.collection == "table1");
+    CHECK(target.name.unique_identifier.t == "alias1");
+    CHECK(target.name.collection.t == "table1");
     // A PostgreSQL table is mirrored under its schema: the external name keeps
     // the one the identifier named.
-    CHECK(target.name.schema == "sch1");
+    CHECK(target.name.schema.t == "sch1");
 }
 
 TEST_CASE("relation_to_plan: Read.NamedTable reads one to four name parts as the SQL path does") {
@@ -315,9 +315,9 @@ TEST_CASE("relation_to_plan: Read.NamedTable reads one to four name parts as the
         const auto& statement = *result.value().parsed_data->otterbrix_params;
         REQUIRE(statement.node->type() == cl::node_type::aggregate_t);
         const auto& agg = static_cast<const cl::node_aggregate_t&>(*statement.node);
-        CHECK(agg.uid().t == expected.uid);
-        CHECK(agg.dbname().t == expected.database);
-        CHECK(agg.relname().t == expected.table);
+        CHECK(agg.target().unique_identifier.t == expected.uid);
+        CHECK(agg.target().database.t == expected.database);
+        CHECK(agg.target().collection.t == expected.table);
         if (std::string_view{expected.uid}.empty()) {
             // A local table: the engine resolves it, nothing is external.
             CHECK(statement.external_nodes_count == 0);
@@ -327,10 +327,10 @@ TEST_CASE("relation_to_plan: Read.NamedTable reads one to four name parts as the
         REQUIRE(statement.external_nodes.size() == 1);
         REQUIRE(statement.external_nodes[0].size() == 1);
         const auto& name = statement.external_nodes[0][0].target.name;
-        CHECK(name.unique_identifier == expected.uid);
-        CHECK(name.database == expected.database);
-        CHECK(name.schema == expected.schema);
-        CHECK(name.collection == expected.table);
+        CHECK(name.unique_identifier.t == expected.uid);
+        CHECK(name.database.t == expected.database);
+        CHECK(name.schema.t == expected.schema);
+        CHECK(name.collection.t == expected.table);
     }
 }
 
@@ -462,10 +462,10 @@ TEST_CASE("relation_to_plan: SQL relation keeps the schema of an external table 
     // The leaf's aggregate names (a, pgdb, t) only; a PostgreSQL table is
     // mirrored under its schema, which comes back from the leaf's parse tree.
     const auto& name = statement.external_nodes[0][0].target.name;
-    CHECK(name.unique_identifier == "a");
-    CHECK(name.database == "pgdb");
-    CHECK(name.schema == "public");
-    CHECK(name.collection == "t");
+    CHECK(name.unique_identifier.t == "a");
+    CHECK(name.database.t == "pgdb");
+    CHECK(name.schema.t == "public");
+    CHECK(name.collection.t == "t");
 }
 
 // ── Join ────────────────────────────────────────────────────────────────────────
@@ -966,7 +966,7 @@ TEST_CASE("relation_to_plan: a remote read under a derived table stays the exter
     REQUIRE_FALSE(result.has_error());
     const auto& statement = *result.value().parsed_data->otterbrix_params;
     CHECK(child_kinds(statement.node) == "aggregate,match");
-    CHECK(static_cast<const cl::node_aggregate_t&>(*statement.node).uid().t.empty());
+    CHECK(static_cast<const cl::node_aggregate_t&>(*statement.node).target().unique_identifier.t.empty());
     const auto& inner = derived_inner(statement.node);
     CHECK(child_kinds(inner) == "limit");
 
@@ -975,8 +975,8 @@ TEST_CASE("relation_to_plan: a remote read under a derived table stays the exter
     REQUIRE(statement.external_nodes[0].size() == 1);
     const auto& slot = statement.external_nodes[0][0];
     CHECK(slot.node->get() == inner.get());
-    CHECK(slot.target.name.unique_identifier == "a");
-    CHECK(slot.target.name.schema == "sch1");
+    CHECK(slot.target.name.unique_identifier.t == "a");
+    CHECK(slot.target.name.schema.t == "sch1");
 }
 
 TEST_CASE("relation_to_plan: unionByName is refused") {

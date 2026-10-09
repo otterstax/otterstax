@@ -15,7 +15,7 @@
 
 #include <components/table/column_definition.hpp>
 #include <components/types/types.hpp>
-#include <otterbrix/otterbrix.hpp>
+#include <integration/cpp/otterbrix.hpp>
 
 #include <filesystem>
 #include <string>

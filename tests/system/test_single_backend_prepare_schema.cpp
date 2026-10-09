@@ -2808,7 +2808,7 @@ namespace {
     const schema_utils::schema_node_t* stub_of_uid(const ParsedQueryData& data, std::string_view uid) {
         for (const auto& batch : data.otterbrix_params->external_nodes) {
             for (const auto& slot : batch) {
-                if (slot.target.name.unique_identifier != uid) {
+                if (slot.target.name.unique_identifier.t != uid) {
                     continue;
                 }
                 if ((*slot.node)->type() != components::logical_plan::node_type::unused) {

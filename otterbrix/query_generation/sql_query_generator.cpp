@@ -177,13 +177,13 @@ namespace {
             ctx.fail(core::error_code_t::invalid_parameter, "table reference: the table name is empty");
             return;
         }
-        std::string_view qualifier{name.database};
+        std::string_view qualifier{name.database.t};
         if (ctx.backend == backend_type_t::PostgreSQL) {
-            qualifier = name.schema.empty() ? std::string_view{"public"} : std::string_view{name.schema};
+            qualifier = name.schema.t.empty() ? std::string_view{"public"} : std::string_view{name.schema.t};
         }
         quote_ident(stream, qualifier, ctx.backend);
         stream << '.';
-        quote_ident(stream, name.collection, ctx.backend);
+        quote_ident(stream, name.collection.t, ctx.backend);
     }
 
     // Emit a (possibly multi-part) expression key. key_t carries identifier
@@ -1615,7 +1615,7 @@ namespace {
     // this wight cause problems with connections
     void generate_create_database(std::stringstream& stream, const qualified_name_t& name, backend_type_t backend) {
         stream << "CREATE DATABASE ";
-        quote_ident(stream, name.database, backend);
+        quote_ident(stream, name.database.t, backend);
     }
 
     void generate_create_index(std::stringstream& stream,
@@ -1633,7 +1633,7 @@ namespace {
             return;
         }
         stream << "CREATE INDEX ";
-        quote_ident(stream, node->name(), ctx.backend);
+        quote_ident(stream, node->indexname().t, ctx.backend);
         stream << " ON ";
         write_table_reference(stream, name, ctx);
         stream << " (";
@@ -1656,14 +1656,14 @@ namespace {
     // this wight cause problems with connections
     void generate_drop_database(std::stringstream& stream, const qualified_name_t& name, backend_type_t backend) {
         stream << "DROP DATABASE ";
-        quote_ident(stream, name.database, backend);
+        quote_ident(stream, name.database.t, backend);
     }
 
     // target.name is the indexed table; target.from_name carries the index.
     void generate_drop_index(std::stringstream& stream,
                              const otterstax::names::resolved_target_t& target,
                              gen_ctx_t& ctx) {
-        if (target.from_name.collection.empty()) {
+        if (target.from_name.collection.t.empty()) {
             ctx.fail(core::error_code_t::invalid_parameter, "DROP INDEX without an index name");
             return;
         }
@@ -1674,21 +1674,21 @@ namespace {
                 // its own qualified name; there is no ON clause.
                 stream << "DROP INDEX ";
                 quote_ident(stream,
-                            target.name.schema.empty() ? std::string_view{"public"}
-                                                       : std::string_view{target.name.schema},
+                            target.name.schema.t.empty() ? std::string_view{"public"}
+                                                       : std::string_view{target.name.schema.t},
                             backend);
                 stream << ".";
-                quote_ident(stream, target.from_name.collection, backend);
+                quote_ident(stream, target.from_name.collection.t, backend);
                 return;
             case backend_type_t::ClickHouse:
                 stream << "ALTER TABLE ";
                 write_table_reference(stream, target.name, ctx);
                 stream << " DROP INDEX ";
-                quote_ident(stream, target.from_name.collection, backend);
+                quote_ident(stream, target.from_name.collection.t, backend);
                 return;
             default:
                 stream << "DROP INDEX ";
-                quote_ident(stream, target.from_name.collection, backend);
+                quote_ident(stream, target.from_name.collection.t, backend);
                 stream << " ON ";
                 write_table_reference(stream, target.name, ctx);
                 return;
@@ -1740,7 +1740,7 @@ namespace {
                          const otterstax::names::resolved_target_t& target,
                          std::string_view statement,
                          gen_ctx_t& ctx) {
-        const bool with_source = !target.from_name.collection.empty();
+        const bool with_source = !target.from_name.collection.t.empty();
         if (parts.source_count > 1) {
             ctx.fail(core::error_code_t::invalid_parameter,
                      "more than one source sub-plan on one statement: ",
@@ -1813,8 +1813,8 @@ namespace {
         }
         const auto& source = static_cast<const node_aggregate_t&>(*parts.source);
         const std::string& source_db =
-            target.from_name.database.empty() ? target.from_name.schema : target.from_name.database;
-        if (source.relname().t != target.from_name.collection || source.dbname().t != source_db) {
+            target.from_name.database.t.empty() ? target.from_name.schema.t : target.from_name.database.t;
+        if (source.target().collection != target.from_name.collection || source.target().database.t != source_db) {
             ctx.fail(core::error_code_t::invalid_parameter,
                      "the resolved FROM / USING table is not the table the plan reads on ",
                      std::string{statement});
@@ -1862,7 +1862,7 @@ namespace {
             return;
         }
         const backend_type_t backend = ctx.backend;
-        const bool with_source = !target.from_name.collection.empty();
+        const bool with_source = !target.from_name.collection.t.empty();
         // The plan joins target and source on the WHERE predicate alone (the
         // engine builds the cross join and filters it), so the generated form is
         // the one that also takes its join condition from WHERE: PostgreSQL's
@@ -1913,7 +1913,7 @@ namespace {
             return;
         }
         const backend_type_t backend = ctx.backend;
-        const bool with_source = !target.from_name.collection.empty();
+        const bool with_source = !target.from_name.collection.t.empty();
         if (backend == backend_type_t::ClickHouse) {
             // ClickHouse has no UPDATE statement: an in-place update is the
             // ALTER TABLE ... UPDATE mutation, which takes the same assignments

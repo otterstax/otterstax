@@ -5,7 +5,7 @@
 
 #include "otterbrix/parser/name_resolution.hpp"
 
-#include <otterbrix/otterbrix.hpp>
+#include <integration/cpp/otterbrix.hpp>
 
 #include <components/logical_plan/node_catalog_resolve.hpp>
 #include <components/logical_plan/node_data.hpp>
@@ -217,6 +217,8 @@ make_affected_count_carrier(std::pmr::memory_resource* resource, size_t affected
     return carrier;
 }
 
-using OtterbrixSchemaParams = std::pmr::vector<std::pair<database_name_t, collection_name_t>>;
+// (database, relation) pairs to probe; plain strings, as the engine's identifier
+// aliases these used to be are strong types now.
+using OtterbrixSchemaParams = std::pmr::vector<std::pair<std::string, std::string>>;
 
 using OtterbrixStatementPtr = std::unique_ptr<OtterbrixStatement>;

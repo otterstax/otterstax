@@ -32,7 +32,7 @@
 #include <clickhouse/columns/string.h>
 #include <components/logical_plan/node_data.hpp>
 #include <core/result_wrapper.hpp>
-#include <otterbrix/otterbrix.hpp>
+#include <integration/cpp/otterbrix.hpp>
 
 #include <catch2/catch_all.hpp>
 #include <chrono>
@@ -426,7 +426,7 @@ TEST_CASE("PostgressManager: parallel execute and re-discovery share no unsynchr
                         auto [needs_sched, future] =
                             actor_zeta::send(catalog_manager->address(),
                                              &mysql::CatalogManager::add_connection_schema,
-                                             qualified_name_t{"1", "pgdb", "public", "t"},
+                                             qualified_name_t{core::uid_t{"1"}, core::dbname_t{"pgdb"}, core::schema_t{"public"}, core::relname_t{"t"}},
                                              catalog_ext::ConnectionType::PostgreSQL);
                         if (!poll_until_ready(future, THREAD_POLL_TIMEOUT)) {
                             verdict.what = "add_connection_schema did not settle";
@@ -516,7 +516,7 @@ TEST_CASE("ClickhouseManager: parallel execute and re-discovery share no unsynch
                         auto [needs_sched, future] =
                             actor_zeta::send(catalog_manager->address(),
                                              &mysql::CatalogManager::add_connection_schema,
-                                             qualified_name_t{"1", "ev", "", "1"},
+                                             qualified_name_t{core::uid_t{"1"}, core::dbname_t{"ev"}, core::schema_t{}, core::relname_t{"1"}},
                                              catalog_ext::ConnectionType::ClickHouse);
                         if (!poll_until_ready(future, THREAD_POLL_TIMEOUT)) {
                             verdict.what = "add_connection_schema did not settle";

@@ -3,8 +3,11 @@
 # Activated in sanitizer builds via TSAN_OPTIONS=suppressions=/app/tsan.supp
 # (see Dockerfile.test).
 
-# otterbrix bundles spdlog, which double-locks its periodic_worker mutex during destruction.
-called_from_lib:libotterbrix_log.so
+# spdlog double-locks its periodic_worker mutex during destruction; the mutex is
+# created under initialize_all_loggers. The old called_from_lib:libotterbrix_log.so
+# entry is gone: the engine package now ships a single libotterbrix.so (no
+# per-component libs), and a called_from_lib on it would mute every report from
+# the whole engine.
 mutex:initialize_all_loggers
 
 # boost::lockfree freelist tagged-pointer reuse: a designed-in speculative read

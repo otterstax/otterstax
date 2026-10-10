@@ -463,3 +463,9 @@ fixtures/init/mariadb1/init.sql
 
 # Go module of the Flight SQL e2e harness, which the *.mod patterns above would hide
 !tests/flightsql_go/go.mod
+
+# TEMPORARY (OTB-tag): local-only conan recipes archived for Docker builds by
+# scripts/conan/export_local_packages.sh. The directory itself stays tracked
+# (.gitkeep) so `COPY .conan-local/` works in every build context.
+.conan-local/*
+!.conan-local/.gitkeep

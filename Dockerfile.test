@@ -56,10 +56,36 @@ RUN if [ "$TSAN_DEPS" = "true" ]; then \
 WORKDIR /app
 COPY conanfile.py tsan-deps.profile ./
 COPY cmake/conan-hooks/hook_librdkafka_c11threads_off.py ./conan-hooks/
-RUN if [ "$TSAN_DEPS" = "true" ]; then \
+# TEMPORARY (OTB-tag, docs/proposals/otterbrix-embedding.md): the pinned
+# otterbrix/1.0.0b2-embedding.* and actor-zeta/2.0.0 exist only in the
+# developer's local Conan cache. scripts/conan/export_local_packages.sh (run by
+# docker-run-tests.sh and the benchmark scripts) archives their recipes +
+# sources into .conan-local/local_recipes.tgz; when that archive is in the build
+# context it is restored here and both packages are built from source. Without
+# it (e.g. once an official tag is on the remote) the install falls back to the
+# remotes unchanged. The directory is tracked (.gitkeep), so the COPY never fails.
+COPY .conan-local/ /tmp/conan-local/
+# BUILD_JOBS caps conan's from-source builds too (tools.build:jobs): otterbrix
+# needs ~1.5-2 GB per job — see CLAUDE.md "Build resources". BUILD_JOBS=0 means
+# min(nproc, MemTotal_MB / 1536) of the build VM, never a bare nproc.
+RUN _local_build=() && \
+    if [ -f /tmp/conan-local/local_recipes.tgz ]; then \
+        conan cache restore /tmp/conan-local/local_recipes.tgz && \
+        _local_build=(--build="otterbrix/*" --build="actor-zeta/*"); \
+    fi && \
+    rm -rf /tmp/conan-local && \
+    _jobs="${BUILD_JOBS}" && \
+    if [ "$_jobs" = "0" ]; then \
+        _mem_jobs=$(( $(awk '/^MemTotal:/ {print int($2/1024)}' /proc/meminfo) / 1536 )) && \
+        if [ "$_mem_jobs" -lt 1 ]; then _mem_jobs=1; fi && \
+        _jobs=$(( $(nproc) < _mem_jobs ? $(nproc) : _mem_jobs )); \
+    fi && \
+    echo "conan from-source build jobs: ${_jobs}" && \
+    _jobs_conf=(-c "tools.build:jobs=${_jobs}") && \
+    if [ "$TSAN_DEPS" = "true" ]; then \
         mkdir -p /root/.conan2/extensions/hooks && \
         cp ./conan-hooks/hook_librdkafka_c11threads_off.py /root/.conan2/extensions/hooks/ && \
-        conan install conanfile.py --build missing \
+        conan install conanfile.py --build missing "${_jobs_conf[@]}" \
             --build="otterbrix/*" --build="actor-zeta/*" --build="librdkafka/*" \
             -pr:h ./tsan-deps.profile \
             -s build_type=${BUILD_TYPE} \
@@ -70,7 +96,7 @@ RUN if [ "$TSAN_DEPS" = "true" ]; then \
             -s 're2/*:compiler.cppstd=17' \
             -s 'grpc/*:compiler.cppstd=17'; \
     elif [ "$WITH_TRACY" = "true" ]; then \
-        conan install conanfile.py --build missing \
+        conan install conanfile.py --build missing "${_local_build[@]}" "${_jobs_conf[@]}" \
             -s build_type=${BUILD_TYPE} \
             -s compiler.cppstd=gnu20 \
             -s 'clickhouse-cpp/*:compiler.cppstd=17' \
@@ -80,7 +106,7 @@ RUN if [ "$TSAN_DEPS" = "true" ]; then \
             -s 'grpc/*:compiler.cppstd=17' \
             -o "&:with_tracy=True"; \
     else \
-        conan install conanfile.py --build missing \
+        conan install conanfile.py --build missing "${_local_build[@]}" "${_jobs_conf[@]}" \
             -s build_type=${BUILD_TYPE} \
             -s compiler.cppstd=gnu20 \
             -s 'clickhouse-cpp/*:compiler.cppstd=17' \
@@ -101,7 +127,12 @@ RUN if [ "$WITH_PERF" = "true" ]; then \
 fi
 
 # Build tracy-capture CLI when Tracy is enabled
-RUN _jobs=$([ "${BUILD_JOBS}" = "0" ] && nproc || echo "${BUILD_JOBS}") && \
+RUN _jobs="${BUILD_JOBS}" && \
+    if [ "$_jobs" = "0" ]; then \
+        _mem_jobs=$(( $(awk '/^MemTotal:/ {print int($2/1024)}' /proc/meminfo) / 1536 )) && \
+        if [ "$_mem_jobs" -lt 1 ]; then _mem_jobs=1; fi && \
+        _jobs=$(( $(nproc) < _mem_jobs ? $(nproc) : _mem_jobs )); \
+    fi && \
     if [ "$WITH_TRACY" = "true" ]; then \
         curl -L https://github.com/wolfpld/tracy/archive/refs/tags/v0.13.1.tar.gz \
             | tar xz -C /tmp && \
@@ -137,11 +168,16 @@ ARG ENABLE_TSAN=OFF
 # ON compiles benchmark/microbench (otterstax_bench) as well; nothing runs it.
 ARG BUILD_BENCHMARKS=OFF
 
-# TSAN suppressions for known-bad third-party code (spdlog in libotterbrix_log.so).
+# TSAN suppressions for known-bad third-party code (see tsan.supp).
 # Only takes effect in TSAN builds; plain Release / ASAN ignore it.
 ENV TSAN_OPTIONS="suppressions=/app/tsan.supp"
 
-RUN _jobs=$([ "${BUILD_JOBS}" = "0" ] && nproc || echo "${BUILD_JOBS}") && \
+RUN _jobs="${BUILD_JOBS}" && \
+    if [ "$_jobs" = "0" ]; then \
+        _mem_jobs=$(( $(awk '/^MemTotal:/ {print int($2/1024)}' /proc/meminfo) / 1536 )) && \
+        if [ "$_mem_jobs" -lt 1 ]; then _mem_jobs=1; fi && \
+        _jobs=$(( $(nproc) < _mem_jobs ? $(nproc) : _mem_jobs )); \
+    fi && \
     _tracy=$([ "${WITH_TRACY}" = "true" ] && echo "ON" || echo "OFF") && \
     _perf=$([ "${WITH_PERF}" = "true" ] && echo "ON" || echo "OFF") && \
     _cc=$([ "${TSAN_DEPS}" = "true" ] && echo "-DCMAKE_C_COMPILER=gcc-12 -DCMAKE_CXX_COMPILER=g++-12" || echo "") && \

@@ -213,6 +213,61 @@ docker compose up
 ./benchmark/manual/stop_service.sh             # stop (saves perf.data if active)
 ```
 
+### TEMPORARY: local otterbrix / actor-zeta recipes in Docker builds (until OTB-tag)
+
+`conanfile.py` pins `otterbrix/1.0.0b2-embedding.46fba865#66a161bad0259c1280d2a132e32e8bb3`
+and `actor-zeta/2.0.0`. Neither is on a conan remote, they exist only in the
+developer's local Conan cache (see **Critical Dependency Versions**). Docker images
+therefore get them from an archive in the build context:
+
+```bash
+# Host side: archive their recipes + sources (no binaries: a macOS binary is
+# useless in a Linux image) into .conan-local/local_recipes.tgz (git-ignored).
+# Rewritten only when the ref#revision list changes, so Docker's layer cache holds.
+scripts/conan/export_local_packages.sh            # --force to rewrite anyway
+docker build -f Dockerfile.test --build-arg BUILD_JOBS=5 -t otterstax-test .
+```
+
+- `docker-run-tests.sh` (when it builds `test-otterstax`, i.e. no `IMAGE_TAG`),
+  `benchmark/scripts/run_benchmark.sh`, `benchmark/stress/run_stress_benchmarks.sh`,
+  `benchmark/manual/start_service.sh` and `examples/demo/up.sh` run the script
+  before they build an image. A package that is not in the local cache is a
+  WARNING, not an error: the script prints the `conan create` command that builds
+  it, archives whatever is local (or keeps an existing archive), exits 0, and the
+  image resolves the rest from the remotes. That is the normal state after OTB-tag.
+  Without a local or remote package the failure surfaces in the image's
+  `conan install`. The script exits 1 only on real errors (no `conan` and no
+  archive, or a failed save), and the callers treat that as fatal.
+  A plain `docker build` / `docker compose up --build` (`compose.yml`,
+  `examples/quick_start`, `benchmark/compose_benchmark.yml`) does not run it, so
+  run it by hand first.
+- `Dockerfile` and `Dockerfile.test` `COPY .conan-local/` (the directory is tracked
+  through `.conan-local/.gitkeep`, so the COPY never fails). When
+  `local_recipes.tgz` is present they `conan cache restore` it and add
+  `--build="otterbrix/*" --build="actor-zeta/*"` to every `conan install` branch.
+  The TSAN branch had those flags already. Without the archive the install falls
+  back to the remotes. `BUILD_JOBS` is also passed as `-c tools.build:jobs=N`:
+  otterbrix built from source is the heaviest step of the image, so size it with
+  **Build resources**. `BUILD_JOBS=0` (the `Dockerfile.test` and compose default)
+  no longer means a bare `nproc`: every build RUN in both Dockerfiles resolves it to
+  `min(nproc, MemTotal_MB / 1536)` read from the build VM's `/proc/meminfo`.
+  With no `-j`, `docker-run-tests.sh` and `benchmark/manual/start_service.sh` also
+  cap the jobs on the host side to Docker's RAM, the way `run_benchmark.sh` does.
+  The root `Dockerfile` takes `BUILD_JOBS` (default 5) too.
+- **CI is not covered.** The GitHub workflows (`unit-tests.yml`,
+  `integration-tests{,-asan,-tsan}.yml`) build `Dockerfile.test` from a clean
+  checkout with no archive, so they cannot resolve the pinned otterbrix until OTB-tag lands.
+- `.dockerignore` keeps `build/`, `cmake-build-*`, `.git` and the result/profile
+  directories out of the build context. It must not exclude `.conan-local/`.
+
+**Removing it once OTB-tag lands** (an official otterbrix tag, plus actor-zeta
+2.0.0, on `conan.otterbrix.com`): point `conanfile.py` at the tag, then delete
+`scripts/conan/`, `.conan-local/`, the `.conan-local` block in `.gitignore` and
+`.dockerignore`, the `COPY .conan-local/` + restore lines and the `_local_build`
+array in `Dockerfile` / `Dockerfile.test`, and the `export_local_packages.sh` calls in
+`docker-run-tests.sh`, the three benchmark scripts and `examples/demo/up.sh`. Keep
+the `tools.build:jobs` wiring and the job auto-cap.
+
 ## Architecture Overview
 
 All components are actor-zeta actors (`actor_mixin` for the Scheduler,
@@ -499,7 +554,7 @@ otterbrix-internal — shadow of `external_join_all` benchmark), all driven by
 
 ## Critical Dependency Versions
 
-- Otterbrix `1.0.0b2-embedding.46fba865` — a **local** Conan package built from otterbrix branch `feat/otterstax-embedding` (`conan create . --version 1.0.0b2-embedding.46fba865 -pr:h profiles/release -pr:b default -o "otterbrix/*:shared=True"`), pinned by recipe revision in `conanfile.py`; it replaces the `1.0.0b2-rc-3` remote package until otterbrix cuts a release tag from that branch (see `docs/proposals/otterbrix-embedding.md`, OTB-tag). Docker images cannot fetch it from the remote yet
+- Otterbrix `1.0.0b2-embedding.46fba865` — a **local** Conan package built from otterbrix branch `feat/otterstax-embedding` (`conan create . --version 1.0.0b2-embedding.46fba865 -pr:h profiles/release -pr:b default -o "otterbrix/*:shared=True"`), pinned by recipe revision in `conanfile.py`; it replaces the `1.0.0b2-rc-3` remote package until otterbrix cuts a release tag from that branch (see `docs/proposals/otterbrix-embedding.md`, OTB-tag). Docker images cannot fetch it from the remote yet, so they build it (and actor-zeta) from source out of the recipe archive written by `scripts/conan/export_local_packages.sh`. See **Docker Workflows**, "TEMPORARY: local otterbrix / actor-zeta recipes". The package ships a single `libotterbrix.so`; the per-component libs such as `libotterbrix_log.so` are gone, and so is their `tsan.supp` entry
 - Arrow 24.0.0 (with `with_s3=True`, `with_parquet=True`, `with_csv=True`, `with_json=True`, plus snappy/brotli/zlib/lz4/zstd compression codecs)
 - Boost 1.88.0
 - actor-zeta 2.0.0 (required by the otterbrix package; no blocking `unique_future::get()/wait()`, no `co_await` on a future outside an actor coroutine)

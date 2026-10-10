@@ -5,6 +5,10 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONFAULTHANDLER=1
 
 ARG WITH_TRACY=false
+# Parallel jobs for the conan from-source builds (tools.build:jobs) and the
+# otterstax build. otterbrix needs ~1.5-2 GB per job — see CLAUDE.md
+# "Build resources" before raising it. 0 = min(nproc, MemTotal_MB / 1536).
+ARG BUILD_JOBS=5
 
 RUN apt update && \
     apt upgrade -y && \
@@ -35,8 +39,27 @@ RUN rm /bin/sh && ln -s /bin/bash /bin/sh
 # devcontainer preset layout exactly.
 WORKDIR /app
 COPY conanfile.py .
-RUN if [ "$WITH_TRACY" = "true" ]; then \
-        conan install conanfile.py --build missing \
+# TEMPORARY (OTB-tag, docs/proposals/otterbrix-embedding.md): restore the
+# local-only otterbrix/actor-zeta recipes archived by
+# scripts/conan/export_local_packages.sh and build them from source; without the
+# archive the install falls back to the remotes. See Dockerfile.test.
+COPY .conan-local/ /tmp/conan-local/
+RUN _local_build=() && \
+    if [ -f /tmp/conan-local/local_recipes.tgz ]; then \
+        conan cache restore /tmp/conan-local/local_recipes.tgz && \
+        _local_build=(--build="otterbrix/*" --build="actor-zeta/*"); \
+    fi && \
+    rm -rf /tmp/conan-local && \
+    _jobs="${BUILD_JOBS}" && \
+    if [ "$_jobs" = "0" ]; then \
+        _mem_jobs=$(( $(awk '/^MemTotal:/ {print int($2/1024)}' /proc/meminfo) / 1536 )) && \
+        if [ "$_mem_jobs" -lt 1 ]; then _mem_jobs=1; fi && \
+        _jobs=$(( $(nproc) < _mem_jobs ? $(nproc) : _mem_jobs )); \
+    fi && \
+    echo "conan from-source build jobs: ${_jobs}" && \
+    _jobs_conf=(-c "tools.build:jobs=${_jobs}") && \
+    if [ "$WITH_TRACY" = "true" ]; then \
+        conan install conanfile.py --build missing "${_local_build[@]}" "${_jobs_conf[@]}" \
             -s build_type=Release \
             -s compiler.cppstd=20 \
             -s 'clickhouse-cpp/*:compiler.cppstd=17' \
@@ -46,7 +69,7 @@ RUN if [ "$WITH_TRACY" = "true" ]; then \
             -s 'grpc/*:compiler.cppstd=17' \
             -o "&:with_tracy=True"; \
     else \
-        conan install conanfile.py --build missing \
+        conan install conanfile.py --build missing "${_local_build[@]}" "${_jobs_conf[@]}" \
             -s build_type=Release \
             -s compiler.cppstd=20 \
             -s 'clickhouse-cpp/*:compiler.cppstd=17' \
@@ -81,10 +104,16 @@ COPY ./cmake ./cmake
 COPY ./main.cpp ./main.cpp
 COPY ./CMakeLists.txt ./CMakeLists.txt
 
-RUN cmake -S . -B build/Release \
+RUN _jobs="${BUILD_JOBS}" && \
+    if [ "$_jobs" = "0" ]; then \
+        _mem_jobs=$(( $(awk '/^MemTotal:/ {print int($2/1024)}' /proc/meminfo) / 1536 )) && \
+        if [ "$_mem_jobs" -lt 1 ]; then _mem_jobs=1; fi && \
+        _jobs=$(( $(nproc) < _mem_jobs ? $(nproc) : _mem_jobs )); \
+    fi && \
+    cmake -S . -B build/Release \
         -DCMAKE_TOOLCHAIN_FILE=build/Release/generators/conan_toolchain.cmake \
         -DCMAKE_BUILD_TYPE=Release && \
-    cmake --build build/Release --target all -- -j 5
+    cmake --build build/Release --target all -- -j${_jobs}
 
 # Tracy profiler port (active only when built with --build-arg WITH_TRACY=true)
 EXPOSE 8086

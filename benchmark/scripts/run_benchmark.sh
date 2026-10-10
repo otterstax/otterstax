@@ -545,6 +545,9 @@ fi
 
 if $FORCE_REBUILD || ! _image_exists "otterstax_app:${IMAGE_TAG}"; then
     echo "Building otterstax_app:${IMAGE_TAG} ..."
+    # TEMPORARY (OTB-tag): archive the local-only otterbrix/actor-zeta recipes
+    # into .conan-local/ for Dockerfile.test; fails with instructions if absent.
+    "$REPO_ROOT/scripts/conan/export_local_packages.sh"
     docker build -t "otterstax_app:${IMAGE_TAG}" \
         -f "$REPO_ROOT/Dockerfile.test" \
         --build-arg WITH_TRACY="${WITH_TRACY:-false}" \
@@ -560,6 +563,9 @@ if $ENABLE_PERF; then
     if ! docker run --rm --entrypoint sh "otterstax_app:${IMAGE_TAG}" \
            -c 'command -v perf >/dev/null 2>&1'; then
         echo "  perf not found in image — rebuilding with perf tools..."
+        # TEMPORARY (OTB-tag): archive the local-only otterbrix/actor-zeta recipes
+        # into .conan-local/ for Dockerfile.test; fails with instructions if absent.
+        "$REPO_ROOT/scripts/conan/export_local_packages.sh"
         docker build -t "otterstax_app:${IMAGE_TAG}" \
             -f "$REPO_ROOT/Dockerfile.test" \
             --build-arg WITH_TRACY="${WITH_TRACY:-false}" \

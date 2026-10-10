@@ -38,7 +38,7 @@
 #                Rebuilds the image whenever --tracy is specified.
 #                Connect the Tracy GUI to localhost:8086 after the service starts.
 #                No capture is started — Tracy GUI must be opened manually.
-#   -j N         Parallel cmake jobs for the otterstax_app build (default: nproc).
+#   -j N         Parallel jobs for the otterstax_app build (default: min(Docker CPUs, Docker RAM MB / 1536)).
 #   --image-tag  OtterStax image tag (default: bench, or bench-tracy with --tracy).
 set -e
 
@@ -73,6 +73,19 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# With no -j, cap the image build to Docker's RAM (~1.5 GB per job; otterbrix
+# builds from source in the image) — same formula as run_benchmark.sh and
+# CLAUDE.md "Build resources". Dockerfile.test applies it again for BUILD_JOBS=0.
+if [ "$BUILD_JOBS" = "0" ]; then
+    _docker_mem_mb=$(docker info --format '{{.MemTotal}}' 2>/dev/null \
+                     | awk '{printf "%d", $1/1048576}')
+    _docker_cpus=$(docker info --format '{{.NCPU}}' 2>/dev/null || echo 1)
+    _mem_jobs=$(( ${_docker_mem_mb:-2048} / 1536 ))
+    [ "$_mem_jobs" -lt 1 ] && _mem_jobs=1
+    BUILD_JOBS=$(( _docker_cpus < _mem_jobs ? _docker_cpus : _mem_jobs ))
+    echo "Auto build jobs: ${BUILD_JOBS} (Docker: ${_docker_cpus} CPUs, ${_docker_mem_mb:-?} MB RAM)"
+fi
+
 if $ENABLE_TRACY; then
     export WITH_TRACY=true
     # Use a dedicated tag so Tracy and non-Tracy builds coexist.
@@ -81,6 +94,9 @@ if $ENABLE_TRACY; then
         IMAGE_TAG="bench-tracy"
     fi
     echo "Building otterstax_app:${IMAGE_TAG} with Tracy enabled..."
+    # TEMPORARY (OTB-tag): archive the local-only otterbrix/actor-zeta recipes
+    # into .conan-local/ for Dockerfile.test; fails with instructions if absent.
+    "$REPO_ROOT/scripts/conan/export_local_packages.sh"
     docker build -t "otterstax_app:${IMAGE_TAG}" \
         -f "$REPO_ROOT/Dockerfile.test" \
         --build-arg WITH_TRACY=true \
@@ -89,6 +105,9 @@ if $ENABLE_TRACY; then
         "$REPO_ROOT"
 elif $FORCE_REBUILD; then
     echo "Building otterstax_app:${IMAGE_TAG} ..."
+    # TEMPORARY (OTB-tag): archive the local-only otterbrix/actor-zeta recipes
+    # into .conan-local/ for Dockerfile.test; fails with instructions if absent.
+    "$REPO_ROOT/scripts/conan/export_local_packages.sh"
     docker build -t "otterstax_app:${IMAGE_TAG}" \
         -f "$REPO_ROOT/Dockerfile.test" \
         --build-arg WITH_PERF="${ENABLE_PERF}" \
@@ -106,6 +125,9 @@ if $ENABLE_PERF; then
     if ! docker run --rm --entrypoint sh "otterstax_app:${IMAGE_TAG}" \
            -c 'command -v perf >/dev/null 2>&1'; then
         echo "  perf not found in image — rebuilding with perf tools..."
+        # TEMPORARY (OTB-tag): archive the local-only otterbrix/actor-zeta recipes
+        # into .conan-local/ for Dockerfile.test; fails with instructions if absent.
+        "$REPO_ROOT/scripts/conan/export_local_packages.sh"
         docker build -t "otterstax_app:${IMAGE_TAG}" \
             -f "$REPO_ROOT/Dockerfile.test" \
             --build-arg WITH_PERF=true \

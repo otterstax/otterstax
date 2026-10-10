@@ -57,17 +57,6 @@ endif()
 if (ENABLE_ASAN)
     add_compile_options(-O0 -g -fno-omit-frame-pointer -fsanitize=address)
     add_link_options(-fsanitize=address)
-    # otterbrix's core/pmr.hpp switches base_otterbrix_t's by-value member type
-    # on the CONSUMER's __SANITIZE_ADDRESS__, so an ASAN-built app and the
-    # non-ASAN engine .so disagree on the class layout (size skew → corrupted
-    # `this` crashes at runtime). The macro is informational only — undefining
-    # it does NOT disable instrumentation, it just makes our TUs see the same
-    # layout as the engine. This holds only while the engine package itself is
-    # built without ASAN (the Conan packages are): an ASAN-built engine takes the
-    # other branch and this undefine would skew the layout instead of fixing it.
-    # Remove once the engine stops keying public ABI off consumer sanitizer
-    # macros.
-    add_compile_options(-U__SANITIZE_ADDRESS__)
 endif()
 
 if (ENABLE_TSAN)

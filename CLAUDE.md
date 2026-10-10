@@ -167,11 +167,17 @@ cmake -S . -B build/Release -DENABLE_ASAN=ON -DBUILD_TESTS=ON \
   -DCMAKE_TOOLCHAIN_FILE=build/Release/generators/conan_toolchain.cmake
 cmake -S . -B build/Release -DENABLE_TSAN=ON -DBUILD_TESTS=ON \
   -DCMAKE_TOOLCHAIN_FILE=build/Release/generators/conan_toolchain.cmake
-# ASAN caveat: the engine's core/pmr.hpp keys a public class layout off the
-# consumer's __SANITIZE_ADDRESS__, so an ASAN build undefines that macro
-# (CMakeLists.txt) to match the non-ASAN Conan engine package. That workaround
-# is valid only while the engine is built without ASAN — an ASAN-built engine
-# would need the macro left defined. The CI sanitizer workflows also export
+# ASAN note: the engine's public headers no longer key any class layout off the
+# consumer's sanitizer macros (core/pmr.hpp: one otterbrix_resource /
+# arena_resource_t layout in every build; the ASAN backing store is picked when
+# the engine library itself is built), so an ASAN app links the non-ASAN Conan
+# engine package as is — no macro workaround. Engine-internal memory errors are
+# only caught with an ASAN-built engine. On macOS (libc++ annotates containers
+# under ASAN) run with ASAN_OPTIONS=detect_container_overflow=0: containers our
+# instrumented code annotates are freed by the uninstrumented engine back into its
+# pool, and actor-zeta coroutine frames later carved from that pool trip stale
+# annotations (false positives). LeakSanitizer is unsupported on Apple Silicon.
+# The CI sanitizer workflows also export
 # ENABLE_ASAN/ENABLE_TSAN to docker-run-tests.sh, which skips the Kafka
 # crash-recovery (kill -9) step under sanitizers.
 

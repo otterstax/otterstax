@@ -30,7 +30,8 @@ Options:
   --tracy-sep     Enable per-test Tracy profiling. Each test gets its own capture
                   file; otterstax is restarted between tests for a clean disconnect.
                   Output: tracy_profiles/<timestamp>/<test_name>.tracy
-  -j N            Parallel jobs for Docker image build (default: nproc inside container)
+  -j N            Parallel jobs for the Docker image build, conan from-source deps
+                  included (default: min(Docker CPUs, Docker RAM MB / 1536))
   -h, --help      Show this help message and exit
 
 Notes:
@@ -224,6 +225,31 @@ echo ""
 compose down --volumes --remove-orphans 2>/dev/null || true
 # Clean up init directories to ensure fresh data
 rm -rf init/mariadb1/* init/mariadb2/* init/postgres/* init/clickhouse/* 2>/dev/null || true
+
+# TEMPORARY (OTB-tag, docs/proposals/otterbrix-embedding.md): the pinned
+# otterbrix/actor-zeta packages exist only in the local Conan cache, so archive
+# their recipes into .conan-local/ for Dockerfile.test to restore. Only needed
+# when this script builds test-otterstax itself (no IMAGE_TAG).
+if [ -z "${IMAGE_TAG}" ]; then
+    if ! "$SCRIPT_DIR/scripts/conan/export_local_packages.sh"; then
+        echo "❌ Cannot provide the local otterbrix/actor-zeta Conan recipes to the image build." >&2
+        echo "   Fix the error above, then re-run (or run scripts/conan/export_local_packages.sh by hand)." >&2
+        exit 1
+    fi
+    # otterbrix + actor-zeta now build from source inside the image (~1.5-2 GB
+    # per job): with no -j, cap the jobs to Docker's RAM like run_benchmark.sh
+    # does (CLAUDE.md "Build resources") instead of nproc.
+    if [ "$BUILD_JOBS" = "0" ]; then
+        _docker_mem_mb=$(docker info --format '{{.MemTotal}}' 2>/dev/null \
+                         | awk '{printf "%d", $1/1048576}')
+        _docker_cpus=$(docker info --format '{{.NCPU}}' 2>/dev/null || echo 1)
+        _mem_jobs=$(( ${_docker_mem_mb:-2048} / 1536 ))
+        [ "$_mem_jobs" -lt 1 ] && _mem_jobs=1
+        BUILD_JOBS=$(( _docker_cpus < _mem_jobs ? _docker_cpus : _mem_jobs ))
+        export BUILD_JOBS
+        echo "ℹ️  Auto build jobs: ${BUILD_JOBS} (Docker: ${_docker_cpus} CPUs, ${_docker_mem_mb:-?} MB RAM)"
+    fi
+fi
 
 # Rebuild Docker images to pick up latest script changes
 echo "🔨 Rebuilding Docker images..."

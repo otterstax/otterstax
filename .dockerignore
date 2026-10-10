@@ -1,0 +1,17 @@
+# Keep the build context small: no Dockerfile COPYs any of these, and the host
+# build tree alone is gigabytes.
+.git
+.idea
+.vscode
+build
+cmake-build-*
+benchmark_results
+benchmark_manual
+tracy_profiles
+logs
+log
+wal
+
+# NOT ignored on purpose: .conan-local/ carries the local-only otterbrix /
+# actor-zeta recipes (scripts/conan/export_local_packages.sh) that Dockerfile and
+# Dockerfile.test restore — TEMPORARY until OTB-tag.

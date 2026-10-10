@@ -9,6 +9,7 @@
 #include <core/result_wrapper.hpp>
 
 #include <memory_resource>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <tuple>
@@ -69,12 +70,22 @@ namespace otterstax::names {
         // True when two different full names folded onto this key.
         bool collided(std::string_view dbname, std::string_view relname) const;
 
+        // The target of a CREATE TABLE exactly as the raw AST wrote it. The
+        // transformer stamps `public` on the create node of an unqualified
+        // `CREATE TABLE t` (its default_public namespace policy), so the node
+        // alone cannot tell `t` from `public.t`; node_names() resolves the
+        // create node by the database recorded here instead. Set once per
+        // statement by collect_qualified_names; nullptr when none was recorded.
+        void set_create_target(qualified_name_t written);
+        const qualified_name_t* create_target() const;
+
     private:
         std::pmr::string make_key_(std::string_view dbname, std::string_view relname) const;
 
         std::pmr::memory_resource* resource_;
         std::pmr::unordered_map<std::pmr::string, qualified_name_t> entries_;
         std::pmr::unordered_set<std::pmr::string> collisions_;
+        std::optional<qualified_name_t> create_target_;
     };
 
     // One resolved table target of an external node. `from_name` is the second
@@ -102,10 +113,12 @@ namespace otterstax::names {
     //
     // Every node names its own target: DML and table-level DDL nodes their
     // target table (a DROP INDEX its indexed table), create_collection_t its
-    // database as written (empty for an unqualified `CREATE TABLE t` — then
-    // the local entry). Errors: database-level DDL (always local, must not be
-    // resolved) and node_type::unused (otterstax schema_node_t — resolved by
-    // the caller).
+    // database as written — read off name_registry_t::create_target(), never
+    // off the `public` the transformer stamps on an unqualified name — so an
+    // unqualified `CREATE TABLE t` resolves to the local `("", t)` entry even
+    // when a backend database named `public` registered `("public", t)`.
+    // Errors: database-level DDL (always local, must not be resolved) and
+    // node_type::unused (otterstax schema_node_t — resolved by the caller).
     core::result_wrapper_t<qualified_name_t> node_names(const components::logical_plan::node_t& node,
                                                         const name_registry_t& reg);
 

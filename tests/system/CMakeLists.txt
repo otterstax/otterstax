@@ -35,6 +35,7 @@ set(${PROJECT_NAME}_SOURCES
     test_spark_plan_execution.cpp
     test_prepare_plan.cpp
     test_constant_aggregates.cpp
+    test_subquery_plan.cpp
 )
 
 add_executable(${PROJECT_NAME} ${${PROJECT_NAME}_SOURCES})

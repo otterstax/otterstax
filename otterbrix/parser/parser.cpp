@@ -367,6 +367,53 @@ get_external_nodes(std::pmr::memory_resource* resource,
     return size;
 }
 
+// True when a node of the tree names a table on a registered backend. A
+// sub-query's names are not in the registry (the raw-AST walk does not enter
+// WHERE / HAVING / select-list expressions) and never three-part-promoted, so
+// they are read off the plan as the transformer stamped them: OtterStax spells a
+// backend table `<alias>.<db>.<table>` (database + schema stamped) or
+// `<alias>.<db>.<schema>.<table>` (uid stamped), a local one `<table>` or
+// `<db>.<table>`, which stamp neither.
+static bool names_backend_table(const logical_plan::node_t& node) {
+    const auto& target = node.target();
+    if (!target.collection.t.empty() && (!target.unique_identifier.t.empty() || !target.schema.t.empty())) {
+        return true;
+    }
+    return std::any_of(node.children().begin(), node.children().end(), [](const logical_plan::node_ptr& child) {
+        return child && names_backend_table(*child);
+    });
+}
+
+// The flattened sub-queries run only inside the engine, in the same plan as the
+// statement (OtterbrixStatement::sub_queries). A statement that also reads a
+// backend is refused: run wholly on one backend, its generated SQL would name the
+// sub-query's result parameter, which nobody fills (the generator refuses it as
+// an unbound parameter); joined with a local table, the backend slice is fetched
+// and the engine runs the rest without the sub-query — wrong rows, no error. A
+// sub-query naming a backend table is refused too: the engine would read its
+// empty mirror of that table, again answering wrong rows without an error.
+static core::error_t refuse_federated_sub_queries(std::pmr::memory_resource* resource,
+                                                  const OtterbrixStatement& statement) {
+    OTX_ZONE_N("otterbrix::refuse_federated_sub_queries");
+    if (statement.sub_queries.empty()) {
+        return core::error_t::no_error();
+    }
+    if (statement.external_nodes_count != 0) {
+        return core::error_t{core::error_code_t::unimplemented_yet,
+                             std::pmr::string{"a sub-query in a statement that reads a registered backend "
+                                              "is not supported",
+                                              resource}};
+    }
+    for (const auto& sub_query : statement.sub_queries) {
+        if (sub_query && names_backend_table(*sub_query)) {
+            return core::error_t{core::error_code_t::unimplemented_yet,
+                                 std::pmr::string{"a sub-query that reads a registered backend is not supported",
+                                                  resource}};
+        }
+    }
+    return core::error_t::no_error();
+}
+
 ParsedQueryData::ParsedQueryData(OtterbrixStatementPtr otterbrix_params,
                                  components::sql::transform::transform_result&& binder,
                                  NodeTag tag)
@@ -553,6 +600,12 @@ core::result_wrapper_t<ParsedQueryDataPtr> GreenplumParser::parse(const std::str
         return finalized.convert_error<ParsedQueryDataPtr>();
     }
     auto& plan = finalized.value();
+    // The last sub-query is the statement; the ones before it are the
+    // `IN (SELECT ...)` / `EXISTS (SELECT ...)` / scalar sub-queries the
+    // transformer flattened out of it, which the engine runs first and binds
+    // into the parameters the statement reads. They travel with the statement
+    // (OtterbrixStatement::sub_queries); dropping them would leave those
+    // parameters unfilled and the statement answering wrong rows.
     logical_plan::node_ptr node = plan.sub_queries.empty() ? nullptr : plan.sub_queries.back();
     if (!node) {
         log_->error("parse: transformer returned null root node — unsupported statement");
@@ -579,6 +632,16 @@ core::result_wrapper_t<ParsedQueryDataPtr> GreenplumParser::parse(const std::str
         tag);
     result->extension_kind = extension_kind;
     result->awaiting_bind = awaiting_bind;
+    if (plan.sub_queries.size() > 1) {
+        auto& statement = *result->otterbrix_params;
+        statement.sub_queries = std::pmr::vector<logical_plan::node_ptr>(plan.sub_queries.begin(),
+                                                                         plan.sub_queries.end() - 1,
+                                                                         resource_);
+        statement.sub_query_results =
+            std::pmr::vector<logical_plan::id_result_mapping>(plan.sub_query_results.begin(),
+                                                              plan.sub_query_results.end(),
+                                                              resource_);
+    }
 
     // Take over the catalog lookups the transformer registered (see
     // OtterbrixStatement::catalog_resolves for why they cannot travel with the
@@ -599,6 +662,11 @@ core::result_wrapper_t<ParsedQueryDataPtr> GreenplumParser::parse(const std::str
     }
     result->otterbrix_params->external_nodes_count = external_count.value();
     log_->info("parse: external_nodes_count={}", result->otterbrix_params->external_nodes_count);
+
+    if (auto refused = refuse_federated_sub_queries(resource_, *result->otterbrix_params); refused.contains_error()) {
+        log_->error("parse: {}", refused.what.c_str());
+        return refused;
+    }
 
     swap_stubs_into_schema_nodes(resource_, result->otterbrix_params->external_nodes, extraction.stubs);
     log_->trace("parse: swap_stubs_into_schema_nodes complete");

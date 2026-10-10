@@ -89,6 +89,12 @@ namespace otterstax::names {
         return collisions_.find(make_key_(dbname, relname)) != collisions_.end();
     }
 
+    void name_registry_t::set_create_target(qualified_name_t written) { create_target_ = std::move(written); }
+
+    const qualified_name_t* name_registry_t::create_target() const {
+        return create_target_ ? &*create_target_ : nullptr;
+    }
+
     core::result_wrapper_t<qualified_name_t> resolve_table_name(std::pmr::memory_resource* resource,
                                                                 const name_registry_t& reg,
                                                                 std::string_view dbname,
@@ -169,13 +175,25 @@ namespace otterstax::names {
                 // unqualified `CREATE TABLE t`, whose registry hit is then the
                 // local `("", rel)` entry. The transformer stamps `public` on
                 // an unqualified CREATE (its default_public namespace policy),
-                // while the raw AST registered the name as written, so a
-                // `public` nobody wrote reads as the empty database it was.
+                // so the stamp cannot tell `t` from `public.t`: the database
+                // comes from the raw AST's RangeVar, recorded on the registry.
+                // Guessing from the registry instead would send `t` to a
+                // backend whose database is literally named `public`, once any
+                // `<alias>.public.t` registered `("public", t)`.
                 const auto& d = static_cast<const components::logical_plan::node_create_collection_t&>(node);
                 db = d.target().database.t;
                 rel = d.target().collection.t;
-                if (db == "public" && reg.find(db, rel) == nullptr && !reg.collided(db, rel)) {
-                    db = std::string_view{};
+                const auto* written = reg.create_target();
+                if (written != nullptr && written->collection.t == rel) {
+                    db = written->database.t;
+                } else if (db == "public") {
+                    // A plan whose raw AST was not seen: a stamped `public` is
+                    // the default, never a reason to pick a backend's entry.
+                    const auto* entry = reg.find(db, rel);
+                    if ((entry == nullptr && !reg.collided(db, rel)) ||
+                        (entry != nullptr && !entry->unique_identifier.t.empty())) {
+                        db = std::string_view{};
+                    }
                 }
                 break;
             }

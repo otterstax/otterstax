@@ -508,3 +508,161 @@ TEST_CASE("integration: cross-source subqueries") {
     REQUIRE(ch_raw.find("FROM ch.ev.schema.sessions") != std::string::npos);
     REQUIRE(mysql_raw.find("FROM mysql.bill.schema.orders") != std::string::npos);
 }
+
+// ---------------------------------------------------------------------------
+// CREATE TABLE target: the database as written, not the stamped `public`.
+//
+// The transformer stamps `public` on the create node of an unqualified
+// `CREATE TABLE t`; the target is resolved by the database the RangeVar wrote
+// (name_registry_t::create_target), so a backend database literally named
+// `public` cannot claim it.
+// ---------------------------------------------------------------------------
+
+namespace {
+    // Parses a statement that must stay local (no external slot).
+    void require_local(GreenplumParser& parser, const std::string& sql) {
+        auto parsed = parse_or_die(parser, sql);
+        INFO(sql);
+        CHECK(parsed->otterbrix_params->external_nodes_count == 0);
+        CHECK(external_nodes_flat(parsed).empty());
+    }
+
+    qualified_name_t full_name(std::string uid, std::string db, std::string schema, std::string rel) {
+        return qualified_name_t{core::uid_t{std::move(uid)},
+                                core::dbname_t{std::move(db)},
+                                core::schema_t{std::move(schema)},
+                                core::relname_t{std::move(rel)}};
+    }
+} // namespace
+
+TEST_CASE("integration: CREATE TABLE without a database is local") {
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
+    GreenplumParser parser(&arena);
+    require_local(parser, "CREATE TABLE t (id bigint);");
+}
+
+TEST_CASE("integration: CREATE TABLE public.t is local") {
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
+    GreenplumParser parser(&arena);
+    require_local(parser, "CREATE TABLE public.t (id bigint);");
+}
+
+TEST_CASE("integration: CREATE TABLE db.t is local") {
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
+    GreenplumParser parser(&arena);
+    require_local(parser, "CREATE TABLE db.t (id bigint);");
+}
+
+TEST_CASE("integration: CREATE TABLE on an alias is one external slot") {
+    // A DDL / DML target names its alias in four parts: three are
+    // db.schema.table there (promote_three_part_qualifiers promotes FROM only).
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
+    GreenplumParser parser(&arena);
+    auto parsed = parse_or_die(parser, "CREATE TABLE mysql.public.public.t (id bigint);");
+    auto nodes = external_nodes_flat(parsed);
+    REQUIRE(nodes.size() == 1);
+    CHECK(nodes[0].target.name.unique_identifier.t == "mysql");
+    CHECK(nodes[0].target.name.database.t == "public");
+    CHECK(nodes[0].target.name.collection.t == "t");
+}
+
+TEST_CASE("integration: unqualified CREATE TABLE stays local next to a backend database named public") {
+    // The registry a statement over `mysql.public.t` builds holds
+    // ("public", "t") with uid mysql. The create node of `CREATE TABLE t`
+    // carries the stamped `public` and used to hit that entry, routing the
+    // CREATE to alias mysql. (CREATE TABLE ... AS SELECT, the statement that
+    // would put both names in one registry, is refused by the engine — pinned
+    // below — so the registry is assembled by hand.)
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
+    GreenplumParser parser(&arena);
+    auto parsed = parse_or_die(parser, "CREATE TABLE t (id bigint);");
+    const auto& create = *parsed->otterbrix_params->node;
+    REQUIRE(create.type() == components::logical_plan::node_type::create_collection_t);
+    REQUIRE(create.target().database.t == "public");
+
+    SECTION("written unqualified: the local entry") {
+        otterstax::names::name_registry_t registry(&arena);
+        registry.add(full_name("mysql", "public", "public", "t"));
+        registry.add(full_name("", "", "", "t"));
+        registry.set_create_target(full_name("", "", "", "t"));
+        auto resolved = otterstax::names::node_names(create, registry);
+        REQUIRE_FALSE(resolved.has_error());
+        CHECK(resolved.value().unique_identifier.t.empty());
+        CHECK(resolved.value().database.t.empty());
+    }
+    SECTION("no raw-AST record: a stamped public never picks a backend entry") {
+        otterstax::names::name_registry_t registry(&arena);
+        registry.add(full_name("mysql", "public", "public", "t"));
+        registry.add(full_name("", "", "", "t"));
+        auto resolved = otterstax::names::node_names(create, registry);
+        REQUIRE_FALSE(resolved.has_error());
+        CHECK(resolved.value().unique_identifier.t.empty());
+    }
+    SECTION("written mysql.public.t: the backend entry") {
+        otterstax::names::name_registry_t registry(&arena);
+        registry.add(full_name("mysql", "public", "public", "t"));
+        registry.set_create_target(full_name("mysql", "public", "public", "t"));
+        auto resolved = otterstax::names::node_names(create, registry);
+        REQUIRE_FALSE(resolved.has_error());
+        CHECK(resolved.value().unique_identifier.t == "mysql");
+    }
+}
+
+TEST_CASE("integration: CREATE TABLE AS SELECT over a backend table is refused") {
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
+    GreenplumParser parser(&arena);
+    auto result = parser.parse("CREATE TABLE t AS SELECT * FROM mysql.public.t;");
+    REQUIRE(result.has_error());
+    CHECK(std::string{result.error().what.c_str()}.find("CREATE TABLE AS") != std::string::npos);
+}
+
+TEST_CASE("integration: INSERT into an unqualified table is local") {
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
+    GreenplumParser parser(&arena);
+    require_local(parser, "INSERT INTO t (id) VALUES (1);");
+    require_local(parser, "INSERT INTO db.t (id) VALUES (1);");
+    auto parsed = parse_or_die(parser, "INSERT INTO mysql.public.public.t (id) VALUES (1);");
+    auto nodes = external_nodes_flat(parsed);
+    REQUIRE(nodes.size() == 1);
+    CHECK(nodes[0].target.name.unique_identifier.t == "mysql");
+}
+
+// ---------------------------------------------------------------------------
+// Flattened sub-queries travel with the statement.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("integration: IN sub-query over local tables is carried with the statement") {
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
+    GreenplumParser parser(&arena);
+    auto parsed = parse_or_die(parser, "SELECT * FROM sq.t WHERE id IN (SELECT id FROM sq.u);");
+    const auto& statement = *parsed->otterbrix_params;
+    CHECK(statement.external_nodes_count == 0);
+    REQUIRE(statement.sub_queries.size() == 1);
+    REQUIRE(statement.sub_query_results.size() == 1);
+    CHECK(statement.sub_queries.front()->target().collection.t == "u");
+    CHECK(statement.node->target().collection.t == "t");
+}
+
+TEST_CASE("integration: a statement without a sub-query carries none") {
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
+    GreenplumParser parser(&arena);
+    auto parsed = parse_or_die(parser, "SELECT * FROM sq.t WHERE id IN (1, 2);");
+    CHECK(parsed->otterbrix_params->sub_queries.empty());
+    CHECK(parsed->otterbrix_params->sub_query_results.empty());
+}
+
+TEST_CASE("integration: a sub-query next to a backend table is refused") {
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
+    GreenplumParser parser(&arena);
+    for (const char* sql : {"SELECT * FROM mysql.db.t WHERE id IN (SELECT id FROM sq.u);",
+                            "SELECT * FROM sq.t WHERE id IN (SELECT id FROM mysql.db.u);",
+                            "SELECT * FROM sq.t WHERE id IN (SELECT id FROM mysql.db.sch.u);",
+                            "SELECT * FROM sq.t WHERE EXISTS (SELECT id FROM mysql.db.u);",
+                            "SELECT * FROM sq.t WHERE id = (SELECT max(id) FROM mysql.db.u);"}) {
+        INFO(sql);
+        auto result = parser.parse(sql);
+        REQUIRE(result.has_error());
+        CHECK(result.error().type == core::error_code_t::unimplemented_yet);
+        CHECK(std::string{result.error().what.c_str()}.find("sub-query") != std::string::npos);
+    }
+}

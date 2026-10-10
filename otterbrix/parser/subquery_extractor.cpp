@@ -522,6 +522,18 @@ namespace otterstax::parser {
             register_drop_stmt_names(resource, reinterpret_cast<DropStmt*>(root), out);
             return;
         }
+        // The CREATE TABLE target as written: the create node carries the
+        // `public` the transformer stamps on an unqualified name, so only the
+        // RangeVar tells whether a database was written at all.
+        if (root && nodeTag(root) == T_CreateStmt) {
+            const auto* rv = reinterpret_cast<CreateStmt*>(root)->relation;
+            if (rv && rv->relname && rv->relname[0] != '\0') {
+                out.set_create_target(make_name(cstr_or_empty(rv->uid),
+                                                cstr_or_empty(rv->catalogname),
+                                                cstr_or_empty(rv->schemaname),
+                                                cstr_or_empty(rv->relname)));
+            }
+        }
         for_each_range_var(root, [&out](RangeVar* rv) {
             if (!rv->relname || rv->relname[0] == '\0') {
                 return;

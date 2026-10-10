@@ -7,6 +7,7 @@
 
 #include <integration/cpp/otterbrix.hpp>
 
+#include <components/logical_plan/execution_plan.hpp>
 #include <components/logical_plan/node_catalog_resolve.hpp>
 #include <components/logical_plan/node_data.hpp>
 #include <components/logical_plan/node_delete.hpp>
@@ -78,6 +79,26 @@ struct OtterbrixStatement {
     // erases it on execute, so no second run ever sees slots another run stamped.
     // A multi-use prepared entry would have to clone these per execution.
     components::logical_plan::catalog_resolves_t catalog_resolves;
+
+    // The sub-queries the transformer flattened out of the statement — an
+    // `IN (SELECT ...)`, `EXISTS (SELECT ...)` or scalar `(SELECT ...)` —
+    // in the order the engine runs them, all AHEAD of `node`, together with the
+    // mapping that binds each one's compacted result into the parameter `node`
+    // reads it from (`sub_query_results[i]` belongs to `sub_queries[i]`).
+    //
+    // Like `catalog_resolves` they are siblings of the root in the engine's
+    // `execution_plan_t`, so a plan rebuilt from (node, params) carries none:
+    // the engine would run `node` against a result parameter nobody filled and
+    // answer wrong rows without an error. Every execution site therefore puts
+    // them back (otterbrix/operators/execute_plan.cpp, statement_plan). Only a
+    // statement that runs entirely in the engine carries any — the parser refuses
+    // a sub-query in a statement that reads a registered backend.
+    //
+    // Known limitation: describing a parameterized statement (Worker's
+    // plan_dependencies + the federated schema computation) walks `node` only,
+    // so a scalar sub-query in the SELECT list describes as NA until executed.
+    std::pmr::vector<components::logical_plan::node_ptr> sub_queries;
+    std::pmr::vector<components::logical_plan::id_result_mapping> sub_query_results;
 };
 
 // Record the affected-row count of a fully-remote DML at the one moment it is

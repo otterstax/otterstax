@@ -7,6 +7,10 @@ name: Sync to Gitea
 # command is in the Gitea PR description) before it is merged there.
 # One way only: nothing comes back from Gitea.
 #
+# A PR labelled "no copy gitea" is not copied, by a merge or a manual run alike: set
+# the label before merging. To copy it after all, remove the label and run the
+# workflow manually with its number.
+#
 # Setup:
 #   environment gitea-sync (deployment branches: main only)
 #     secret   GITEA_TOKEN  Gitea access token, scope "repository: read and write",
@@ -53,6 +57,7 @@ jobs:
           AFTER: ${{ github.sha }}
           INPUT_PR: ${{ inputs.pr }}
           INPUT_FORCE: ${{ inputs.force }}
+          SKIP_LABEL: no copy gitea
           GITEA_URL: ${{ vars.GITEA_URL }}
           GITEA_REPO: ${{ vars.GITEA_REPO || 'otterstax/otterstax' }}
           GITEA_TOKEN: ${{ secrets.GITEA_TOKEN }}
@@ -93,6 +98,10 @@ jobs:
             pr=$(gh api "repos/$REPO/pulls/$n")
             if [ "$(jq -r .merged_at <<<"$pr")" = null ] || [ "$(jq -r .base.ref <<<"$pr")" != main ]; then
               echo "::warning::#$n is not merged into main, skipped"
+              continue
+            fi
+            if jq -e --arg label "$SKIP_LABEL" 'any(.labels[]; (.name | ascii_downcase) == ($label | ascii_downcase))' <<<"$pr" >/dev/null; then
+              echo "#$n: labelled '$SKIP_LABEL', not copied"
               continue
             fi
             branch="github/pr-$n"

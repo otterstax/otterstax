@@ -94,15 +94,45 @@ namespace {
         return payload_of(std::move(types), std::move(chunk), resource);
     }
 
+    struct remote_row {
+        std::string_view uid;
+        std::string_view database;
+        std::string_view schema;
+        std::string_view table;
+        std::string_view remote_database;
+    };
+
+    // What `SELECT uid, database_name, schema_name, table_name, remote_database
+    // FROM federation.remote_tables` answers.
+    session_payload remote_tables_result(std::initializer_list<remote_row> input, std::pmr::memory_resource* resource) {
+        std::pmr::vector<ct::complex_logical_type> types(resource);
+        for (const char* name : {"uid", "database_name", "schema_name", "table_name", "remote_database"}) {
+            types.emplace_back(ct::logical_type::STRING_LITERAL, name);
+        }
+        cv::data_chunk_t chunk(resource, types);
+        uint64_t at = 0;
+        for (const auto& row : input) {
+            chunk.set_value(0, at, row.uid);
+            chunk.set_value(1, at, row.database);
+            chunk.set_value(2, at, row.schema);
+            chunk.set_value(3, at, row.table);
+            chunk.set_value(4, at, row.remote_database);
+            ++at;
+        }
+        chunk.set_cardinality(at);
+        return payload_of(std::move(types), std::move(chunk), resource);
+    }
+
+    session_payload no_remote_tables(std::pmr::memory_resource* resource) { return remote_tables_result({}, resource); }
+
     session_payload fixture_namespaces(std::pmr::memory_resource* resource) {
         return namespaces_result({{1, "pg_catalog"},
                                   {2, "public"},
                                   {3, "information_schema"},
                                   {16384, "shop"},
-                                  {16390, "mysql"},
-                                  {16400, "pg"},
                                   {16410, "kafka"},
-                                  {16420, "empty_db"}},
+                                  {16420, "empty_db"},
+                                  {16430, "federation"}},
                                  resource);
     }
 
@@ -114,10 +144,6 @@ namespace {
                                {16387, "orders_by_day", 16384, "v"},
                                {16388, "orders_id_seq", 16384, "S"},
                                {16389, "loose", 0, "r"},
-                               {16391, "__otterstax_tables", 16390, "r"},
-                               {16392, "bill::payments", 16390, "r"},
-                               {16401, "__otterstax_tables", 16400, "r"},
-                               {16402, "shop:public:products", 16400, "r"},
                                {16411, "__sources", 16410, "r"},
                                {16412, "clicks", 16410, "r"},
                                {16413, "clicks__offsets", 16410, "r"},
@@ -125,13 +151,22 @@ namespace {
                                {16422, "daily", 16384, "m"},
                                {16423, "docs", 16384, "g"},
                                {16424, "add_one", 16384, "F"},
-                               {16425, "shadow", 2, "r"}},
+                               {16425, "shadow", 2, "r"},
+                               {16431, "remote_tables", 16430, "r"},
+                               {16432, "remote_columns", 16430, "r"}},
                               ct::logical_type::UINTEGER,
                               resource);
     }
 
     rows::catalog_view_t fixture_view(std::pmr::memory_resource* resource) {
-        auto loaded = rows::read_catalog(fixture_namespaces(resource), fixture_classes(resource), resource);
+        // The remote tables of a MySQL connection `mysql` (database bill) and a
+        // PostgreSQL connection `pg` (database shop, schema public).
+        auto loaded = rows::read_catalog(fixture_namespaces(resource),
+                                         fixture_classes(resource),
+                                         remote_tables_result({{"mysql", "bill", "", "payments", "bill"},
+                                                               {"pg", "", "public", "products", "shop"}},
+                                                              resource),
+                                         resource);
         REQUIRE_FALSE(loaded.has_error());
         return std::move(loaded.value());
     }
@@ -214,8 +249,8 @@ TEST_CASE("spark catalog: tables are classified and the internal ones hidden") {
     const auto view = fixture_view(&pool);
 
     // Sorted by database, then name. Hidden: system rows, the index, the
-    // sequence, the composite type, the macro, a table in `public`, both
-    // mirror manifests and the Kafka bookkeeping tables.
+    // sequence, the composite type, the macro, a table in `public`, the
+    // federation metadata tables and the Kafka bookkeeping tables.
     REQUIRE(view.tables.size() == 8);
 
     const auto& loose = view.tables[0];
@@ -229,14 +264,14 @@ TEST_CASE("spark catalog: tables are classified and the internal ones hidden") {
     CHECK(clicks.name == "clicks");
     CHECK(parts_of(clicks.qualifier) == std::vector<std::string>{"kafka"});
 
-    // MySQL / ClickHouse mirror `<db>::<table>`: [alias, db].
+    // A MySQL / ClickHouse remote table: [alias, db].
     const auto& payments = view.tables[2];
     CHECK(payments.database == "mysql");
     CHECK(payments.name == "payments");
     CHECK(parts_of(payments.qualifier) == std::vector<std::string>{"mysql", "bill"});
     CHECK_FALSE(payments.is_view);
 
-    // PostgreSQL mirror `<db>:<schema>:<table>`: [alias, db, schema].
+    // A PostgreSQL remote table: [alias, db, schema].
     const auto& products = view.tables[3];
     CHECK(products.database == "pg");
     CHECK(products.name == "products");
@@ -275,7 +310,8 @@ TEST_CASE("spark catalog: columns are found by name and an OID may be any intege
     chunk.set_cardinality(1);
     const auto classes = payload_of(std::move(types), std::move(chunk), resource);
 
-    auto loaded = rows::read_catalog(namespaces_result({{16384, "shop"}}, resource), classes, resource);
+    auto loaded =
+        rows::read_catalog(namespaces_result({{16384, "shop"}}, resource), classes, no_remote_tables(resource), resource);
     REQUIRE_FALSE(loaded.has_error());
     REQUIRE(loaded.value().tables.size() == 1);
     CHECK(loaded.value().tables[0].database == "shop");
@@ -285,7 +321,7 @@ TEST_CASE("spark catalog: columns are found by name and an OID may be any intege
 TEST_CASE("spark catalog: unreadable pg_catalog rows are a schema_error") {
     std::pmr::synchronized_pool_resource pool;
     auto* resource = &pool;
-    const auto namespaces = namespaces_result({{16384, "shop"}, {16390, "mysql"}}, resource);
+    const auto namespaces = namespaces_result({{16384, "shop"}}, resource);
 
     SECTION("a missing column") {
         std::pmr::vector<ct::complex_logical_type> types(resource);
@@ -295,8 +331,10 @@ TEST_CASE("spark catalog: unreadable pg_catalog rows are a schema_error") {
         chunk.set_value(0, 0, uint32_t{16385});
         chunk.set_value(1, 0, std::string_view{"orders"});
         chunk.set_cardinality(1);
-        auto loaded =
-            rows::read_catalog(namespaces, payload_of(std::move(types), std::move(chunk), resource), resource);
+        auto loaded = rows::read_catalog(namespaces,
+                                         payload_of(std::move(types), std::move(chunk), resource),
+                                         no_remote_tables(resource),
+                                         resource);
         REQUIRE(loaded.has_error());
         CHECK(loaded.error().type == core::error_code_t::schema_error);
     }
@@ -304,18 +342,18 @@ TEST_CASE("spark catalog: unreadable pg_catalog rows are a schema_error") {
     SECTION("a NULL oid") {
         auto classes = classes_result({{16385, "orders", 16384, "r"}}, ct::logical_type::UINTEGER, resource);
         classes.chunks.front().data[0].set_null(0, true);
-        auto loaded = rows::read_catalog(namespaces, classes, resource);
+        auto loaded = rows::read_catalog(namespaces, classes, no_remote_tables(resource), resource);
         REQUIRE(loaded.has_error());
         CHECK(loaded.error().type == core::error_code_t::schema_error);
     }
 
-    SECTION("a mirror name that is not <db>:<schema>:<table>") {
-        auto loaded = rows::read_catalog(
-            namespaces,
-            classes_result({{16391, "__otterstax_tables", 16390, "r"}, {16392, "payments", 16390, "r"}},
-                           ct::logical_type::UINTEGER,
-                           resource),
-            resource);
+    SECTION("a remote table without a name") {
+        auto remote = remote_tables_result({{"mysql", "bill", "", "payments", "bill"}}, resource);
+        remote.chunks.front().data[3].set_null(0, true);
+        auto loaded = rows::read_catalog(namespaces,
+                                         classes_result({{16385, "orders", 16384, "r"}}, ct::logical_type::UINTEGER, resource),
+                                         remote,
+                                         resource);
         REQUIRE(loaded.has_error());
         CHECK(loaded.error().type == core::error_code_t::schema_error);
     }
@@ -331,6 +369,7 @@ TEST_CASE("spark catalog: a table whose database was dropped between the two rea
                                      classes_result({{16385, "orders", 16500, "r"}, {16386, "items", 16384, "r"}},
                                                     ct::logical_type::UINTEGER,
                                                     resource),
+                                     no_remote_tables(resource),
                                      resource);
     REQUIRE_FALSE(loaded.has_error());
     REQUIRE(loaded.value().tables.size() == 1);
@@ -413,13 +452,11 @@ TEST_CASE("spark catalog: getTable answers one table or says why not") {
     REQUIRE(not_there.has_error());
     CHECK(not_there.error().type == core::error_code_t::table_not_exists);
 
-    // Two mirrored databases of one connection, each with a `t`.
+    // Two databases of one connection, each with a `t`.
     auto loaded = rows::read_catalog(
-        namespaces_result({{16390, "mysql"}}, resource),
-        classes_result(
-            {{16391, "__otterstax_tables", 16390, "r"}, {16392, "db1::t", 16390, "r"}, {16393, "db2::t", 16390, "r"}},
-            ct::logical_type::UINTEGER,
-            resource),
+        namespaces_result({}, resource),
+        classes_result({}, ct::logical_type::UINTEGER, resource),
+        remote_tables_result({{"mysql", "db1", "", "t", "db1"}, {"mysql", "db2", "", "t", "db2"}}, resource),
         resource);
     REQUIRE_FALSE(loaded.has_error());
     CHECK(rows::find_tables(loaded.value(), "t", "mysql", resource).size() == 2);

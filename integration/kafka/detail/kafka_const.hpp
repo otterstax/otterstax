@@ -14,7 +14,7 @@ namespace otterstax::kafka::detail {
         return static_cast<std::int32_t>(timeout.count());
     }
 
-    // Worker loops (poller + stream)
+    // Background loops (poller + stream)
     inline constexpr std::size_t MAX_BATCH = 500;                     // records per poll -> one transaction
     inline constexpr std::chrono::milliseconds POLL_TIMEOUT{200};     // consumer poll wait before re-checking stop_
     inline constexpr std::chrono::microseconds ENGINE_POLL_STEP{100}; // park while an engine future is not ready

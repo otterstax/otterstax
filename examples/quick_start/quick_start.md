@@ -60,7 +60,7 @@ top-level `CLAUDE.md`. `amount`/`price`/`unit_cost` are doubles; timestamps are
 
 ```text
                        ┌─────────────────────────── OtterStax ───────────────────────────┐
-   psql :8817  ─────►  │  PostgreSQL wire (8817)   →  Scheduler → Worker → Catalog        │
+   psql :8817  ─────►  │  PostgreSQL wire (8817)   →  query session → Catalog → engine    │
                        │                                    │                              │
                        │        federated dispatch ─────────┼───────────────┐             │
                        └────────────────────────────────────┼───────────────┼─────────────┘

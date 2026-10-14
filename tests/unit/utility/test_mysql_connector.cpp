@@ -158,8 +158,9 @@ namespace {
     public:
         enum class after_ok
         {
-            serve_commands, // answer COM_PING, close on COM_QUIT / EOF
-            reset_socket    // drop the client (RST) shortly after the OK, before any command
+            serve_commands,   // answer COM_PING, close on COM_QUIT / EOF
+            reset_socket,     // drop the client (RST) shortly after the OK, before any command
+            swallow_commands  // read every command and never answer one (a backend that hangs)
         };
 
         explicit fake_mysql_server(after_ok mode, std::string expected_user)
@@ -193,6 +194,8 @@ namespace {
         size_t resets() const noexcept { return resets_.load(); }
         // Commands other than COM_PING / COM_QUIT.
         size_t unexpected_commands() const noexcept { return unexpected_commands_.load(); }
+        // Commands read and left unanswered (after_ok::swallow_commands).
+        size_t swallowed() const noexcept { return swallowed_.load(); }
 
         // True once `predicate` holds, false at the deadline.
         template<typename Predicate>
@@ -289,6 +292,10 @@ namespace {
                 if (ec || command.empty() || command[0] == COM_QUIT) {
                     break;
                 }
+                if (mode_ == after_ok::swallow_commands) {
+                    ++swallowed_;
+                    continue;
+                }
                 if (command[0] != COM_PING) {
                     ++unexpected_commands_;
                     break;
@@ -311,6 +318,7 @@ namespace {
         std::atomic<size_t> unexpected_users_{0};
         std::atomic<size_t> resets_{0};
         std::atomic<size_t> unexpected_commands_{0};
+        std::atomic<size_t> swallowed_{0};
         std::jthread thread_;
     };
 
@@ -431,5 +439,52 @@ TEST_CASE("mysql Connector: destroying a connector whose server went away does n
         // std::terminate, which is why this case is separate from the one above.
     }
 
+    pool.stop();
+}
+
+TEST_CASE("mysql Connector: cancel() aborts a statement the server never answers") {
+    fake_mysql_server server{fake_mysql_server::after_ok::swallow_commands, std::string(USER)};
+    thread_pool_manager pool{pool_threads()};
+    pool.start();
+    auto* resource = std::pmr::new_delete_resource();
+
+    auto connector = mysql::make_mysql_connector(resource, pool.ctx(), params_for(server.port()), "hung");
+    REQUIRE_FALSE(connector->connect().contains_error());
+
+    // The statement as ConnectorManager::executeQuery spawns it: its ping is read and never
+    // answered, so the statement waits for good.
+    auto handler = [](const boost::mysql::results&) -> otterstax::asio_error_t { return otterstax::asio_error_t{}; };
+    auto running = otterstax::spawn_marshaled<otterstax::asio_error_t>(
+        pool.ctx(),
+        otterstax::run_with_owned_handler<otterstax::asio_error_t, const boost::mysql::results&>(*connector,
+                                                                                                 "SELECT 1",
+                                                                                                 handler),
+        resource);
+    REQUIRE(server.wait_until([&server] { return server.swallowed() == 1; }));
+    REQUIRE(running.wait_for(100ms) == std::future_status::timeout);
+
+    // From another thread, as the connector manager's shutdown does it.
+    const auto started = std::chrono::steady_clock::now();
+    connector->cancel();
+    REQUIRE(running.wait_for(5s) == std::future_status::ready);
+    CHECK(std::chrono::steady_clock::now() - started < 5s);
+    const auto outcome = running.get();
+    REQUIRE(outcome.contains_error());
+    CHECK(outcome.type == core::error_code_t::io_error);
+
+    // A cancelled connector refuses what follows without touching the connection.
+    auto next = otterstax::spawn_marshaled<otterstax::asio_error_t>(
+        pool.ctx(),
+        otterstax::run_with_owned_handler<otterstax::asio_error_t, const boost::mysql::results&>(*connector,
+                                                                                                 "SELECT 2",
+                                                                                                 handler),
+        resource);
+    REQUIRE(next.wait_for(5s) == std::future_status::ready);
+    const auto refused = next.get();
+    REQUIRE(refused.contains_error());
+    CHECK(std::string{refused.what.c_str()}.find("was cancelled") != std::string::npos);
+    CHECK(server.swallowed() == 1);
+
+    connector.reset();
     pool.stop();
 }

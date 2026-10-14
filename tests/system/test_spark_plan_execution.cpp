@@ -3,16 +3,16 @@
 //
 // Spark Connect DataFrame plans (Path B) over the real engine. Each case builds
 // the spark::connect::Plan a PySpark client sends, translates it with
-// frontend::spark::relation_to_plan and runs it through Scheduler::execute_plan
+// frontend::spark::relation_to_plan and runs it through query_session_t::execute_plan
 // the way the ExecutePlan RPC does, then checks the ROWS it answers rather than
 // the shape of the plan: a plan the translator shapes wrongly is one the engine
 // answers wrongly, refuses, or never reaches.
 //
-// The tables are created and filled through Scheduler::execute SQL. Every case
+// The tables are created and filled through query_session_t::execute SQL. Every case
 // owns its engine (a data dir of its own, removed with the stack) and its own
 // database.
 
-#include "scheduler_stack.hpp"
+#include "session_stack.hpp"
 
 #include "frontend/spark_connect_server/plan_translator/relation_to_plan.hpp"
 
@@ -32,9 +32,10 @@
 #include <utility>
 
 using otterstax::test::await_session;
-using otterstax::test::run_scheduler_sql;
-using otterstax::test::scheduler_stack;
-using otterstax::test::with_scheduler_stack;
+using otterstax::test::run_session_sql;
+using otterstax::test::run_session_sql_payload;
+using otterstax::test::session_stack;
+using otterstax::test::with_session_stack;
 
 namespace {
 
@@ -43,9 +44,9 @@ namespace {
 
     using direction_t = sc::Expression::SortOrder::SortDirection;
 
-    void run_or_fail(const scheduler_stack& s, session_hash_t id, const std::string& sql) {
+    void run_or_fail(const session_stack& s, session_hash_t id, const std::string& sql) {
         std::string err;
-        const bool ok = run_scheduler_sql(s, id, sql, err);
+        const bool ok = run_session_sql(s, id, sql, err);
         INFO(sql << ": " << err);
         REQUIRE(ok);
     }
@@ -53,7 +54,7 @@ namespace {
     // <db>.sales: six rows over three regions whose sums and means are exact
     // integers (north 10 + 30 + 50, south 20 + 60, east 40), then `extra_rows`.
     void
-    seed_sales(const scheduler_stack& s, session_hash_t& id, const std::string& db, const std::string& extra_rows) {
+    seed_sales(const session_stack& s, session_hash_t& id, const std::string& db, const std::string& extra_rows) {
         run_or_fail(s, id++, "CREATE DATABASE " + db + ";");
         run_or_fail(s, id++, "CREATE TABLE " + db + ".sales (id bigint, region string, amount bigint);");
         run_or_fail(s,
@@ -184,23 +185,25 @@ namespace {
         return rel;
     }
 
-    // relation_to_plan, then Scheduler::execute_plan awaited through the asio
+    // relation_to_plan, then query_session_t::execute_plan awaited through the asio
     // bridge: the ExecutePlan RPC's path. A translation refusal comes back as the
     // error it is.
     core::result_wrapper_t<session_payload>
-    run_plan(const scheduler_stack& s, session_hash_t id, const sc::Relation& root) {
+    run_plan(const session_stack& s, session_hash_t id, const sc::Relation& root) {
         sc::Plan plan;
         *plan.mutable_root() = root;
         auto translated = frontend::spark::relation_to_plan(plan, s.resource);
         if (translated.has_error()) {
             return translated.convert_error<session_payload>();
         }
-        auto [needs_sched, future] =
-            actor_zeta::send(s.scheduler, &Scheduler::execute_plan, id, std::move(translated.value().parsed_data));
+        auto [needs_sched, future] = actor_zeta::send(s.session,
+                                                      &otterstax::session::query_session_t::execute_plan,
+                                                      otterstax::test::stmt(id),
+                                                      std::move(translated.value().parsed_data));
         return await_session(std::move(future), std::chrono::milliseconds(10000), s.resource);
     }
 
-    session_payload run_plan_or_fail(const scheduler_stack& s, session_hash_t id, const sc::Relation& root) {
+    session_payload run_plan_or_fail(const session_stack& s, session_hash_t id, const sc::Relation& root) {
         auto result = run_plan(s, id, root);
         INFO("plan error: " << result.error().what.c_str());
         REQUIRE_FALSE(result.has_error());
@@ -267,7 +270,7 @@ namespace {
 } // namespace
 
 TEST_CASE("Spark plan: Read and Project answer every row under the projected names", "[spark-plan]") {
-    with_scheduler_stack("/tmp/test_spark_plan_project", [](scheduler_stack s) {
+    with_session_stack("/tmp/test_spark_plan_project", [](session_stack s) {
         session_hash_t id = 12100;
         seed_sales(s, id, "spark_project", "");
         const auto sales = read_table("spark_project.sales");
@@ -294,7 +297,7 @@ TEST_CASE("Spark plan: Read and Project answer every row under the projected nam
 }
 
 TEST_CASE("Spark plan: structured filters keep exactly the matching rows", "[spark-plan]") {
-    with_scheduler_stack("/tmp/test_spark_plan_filter", [](scheduler_stack s) {
+    with_session_stack("/tmp/test_spark_plan_filter", [](session_stack s) {
         session_hash_t id = 12200;
         seed_sales(s, id, "spark_filter", "");
         const auto sales = read_table("spark_filter.sales");
@@ -347,7 +350,7 @@ TEST_CASE("Spark plan: structured filters keep exactly the matching rows", "[spa
 }
 
 TEST_CASE("Spark plan: groupBy agg answers one row per group with count sum and avg", "[spark-plan]") {
-    with_scheduler_stack("/tmp/test_spark_plan_aggregate", [](scheduler_stack s) {
+    with_session_stack("/tmp/test_spark_plan_aggregate", [](session_stack s) {
         session_hash_t id = 12300;
         seed_sales(s, id, "spark_agg", "");
 
@@ -412,10 +415,11 @@ TEST_CASE("Spark plan: groupBy agg answers one row per group with count sum and 
 }
 
 TEST_CASE("Spark plan: avg of an integer column answers DOUBLE and keeps the fraction", "[spark-plan]") {
-    with_scheduler_stack("/tmp/test_spark_plan_avg_fraction", [](scheduler_stack s) {
+    with_session_stack("/tmp/test_spark_plan_avg_fraction", [](session_stack s) {
         session_hash_t id = 12350;
         // east becomes 40 and 45, a mean of 42.5; all seven rows average 255 / 7. The
-        // engine's avg over BIGINT would answer 42 and 36.
+        // SQL path's AVG over the BIGINT column answers the same DOUBLE means: the
+        // engine's avg widens an integer argument and answers DOUBLE.
         seed_sales(s, id, "spark_avg", ", (7, 'east', 45)");
         const auto sales = read_table("spark_avg.sales");
 
@@ -451,11 +455,27 @@ TEST_CASE("Spark plan: avg of an integer column answers DOUBLE and keeps the fra
             run_plan_or_fail(s, id++, aggregate(sales, {}, {aliased(call("avg", {column("amount")}), "mean")}));
         REQUIRE(overall.size() == 1);
         CHECK(mean_of(overall, "") == Catch::Approx(255.0 / 7.0));
+
+        // spark.sql("SELECT region, avg(amount) AS mean ... GROUP BY region"): the
+        // same means through query_session_t::execute.
+        auto sql_per_region = run_session_sql_payload(
+            s, id++, "SELECT region, avg(amount) AS mean FROM spark_avg.sales GROUP BY region;");
+        INFO("sql error: " << (sql_per_region.has_error() ? sql_per_region.error().what.c_str() : "ok"));
+        REQUIRE_FALSE(sql_per_region.has_error());
+        REQUIRE(sql_per_region.value().size() == 3);
+        CHECK(mean_of(sql_per_region.value(), "east") == Catch::Approx(42.5));
+        CHECK(mean_of(sql_per_region.value(), "north") == Catch::Approx(30.0));
+        CHECK(mean_of(sql_per_region.value(), "south") == Catch::Approx(40.0));
+        auto sql_overall = run_session_sql_payload(s, id++, "SELECT avg(amount) AS mean FROM spark_avg.sales;");
+        INFO("sql error: " << (sql_overall.has_error() ? sql_overall.error().what.c_str() : "ok"));
+        REQUIRE_FALSE(sql_overall.has_error());
+        REQUIRE(sql_overall.value().size() == 1);
+        CHECK(mean_of(sql_overall.value(), "") == Catch::Approx(255.0 / 7.0));
     });
 }
 
 TEST_CASE("Spark plan: orderBy then limit answers the top rows with Spark NULL placement", "[spark-plan]") {
-    with_scheduler_stack("/tmp/test_spark_plan_sort_limit", [](scheduler_stack s) {
+    with_session_stack("/tmp/test_spark_plan_sort_limit", [](session_stack s) {
         session_hash_t id = 12400;
         // A row without an amount: Spark sorts NULLs first ascending and last
         // descending, the opposite of the SQL default.
@@ -489,7 +509,7 @@ TEST_CASE("Spark plan: orderBy then limit answers the top rows with Spark NULL p
 }
 
 TEST_CASE("Spark plan: filter after orderBy and select after limit keep the sorted rows", "[spark-plan]") {
-    with_scheduler_stack("/tmp/test_spark_plan_commuting", [](scheduler_stack s) {
+    with_session_stack("/tmp/test_spark_plan_commuting", [](session_stack s) {
         session_hash_t id = 12600;
         seed_sales(s, id, "spark_commute", "");
         const auto by_amount_desc =
@@ -514,7 +534,7 @@ TEST_CASE("Spark plan: filter after orderBy and select after limit keep the sort
 }
 
 TEST_CASE("Spark plan: crossJoin of two small tables answers every pair", "[spark-plan]") {
-    with_scheduler_stack("/tmp/test_spark_plan_cross_join", [](scheduler_stack s) {
+    with_session_stack("/tmp/test_spark_plan_cross_join", [](session_stack s) {
         session_hash_t id = 12500;
         run_or_fail(s, id++, "CREATE DATABASE spark_cross;");
         run_or_fail(s, id++, "CREATE TABLE spark_cross.colors (color string);");
@@ -557,7 +577,7 @@ TEST_CASE("Spark plan: crossJoin of two small tables answers every pair", "[spar
 }
 
 TEST_CASE("Spark plan: df.count() and groupBy().agg(count(lit(1))) count every row", "[spark-plan]") {
-    with_scheduler_stack("/tmp/test_spark_plan_count_literal", [](scheduler_stack s) {
+    with_session_stack("/tmp/test_spark_plan_count_literal", [](session_stack s) {
         session_hash_t id = 12700;
         run_or_fail(s, id++, "CREATE DATABASE spark_count;");
         run_or_fail(s, id++, "CREATE TABLE spark_count.items (id bigint, grp string);");
@@ -582,7 +602,7 @@ TEST_CASE("Spark plan: df.count() and groupBy().agg(count(lit(1))) count every r
 }
 
 TEST_CASE("Spark plan: an operation on a finished select distinct or aggregate reads a derived table", "[spark-plan]") {
-    with_scheduler_stack("/tmp/test_spark_plan_derived", [](scheduler_stack s) {
+    with_session_stack("/tmp/test_spark_plan_derived", [](session_stack s) {
         session_hash_t id = 12800;
         seed_sales(s, id, "spark_derived", "");
         const auto sales = read_table("spark_derived.sales");
@@ -615,7 +635,7 @@ TEST_CASE("Spark plan: an operation on a finished select distinct or aggregate r
 }
 
 TEST_CASE("Spark plan: a limit on a limit keeps the smaller window", "[spark-plan]") {
-    with_scheduler_stack("/tmp/test_spark_plan_window", [](scheduler_stack s) {
+    with_session_stack("/tmp/test_spark_plan_window", [](session_stack s) {
         session_hash_t id = 12900;
         seed_sales(s, id, "spark_window", "");
         const auto by_amount_desc =

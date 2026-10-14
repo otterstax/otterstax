@@ -45,6 +45,20 @@ clickhouse::Block make_block_3col(int rows) {
     return block;
 }
 
+// The system.columns types `named`, keyed by column name, by the result position of `block`'s
+// columns: what the ClickHouse backend hands ch_to_chunk for a read of a table's columns under their
+// own names (ClickhouseManager::declared_types_for).
+std::vector<std::optional<std::string>> by_position(const clickhouse::Block& block,
+                                                     const std::unordered_map<std::string, std::string>& named) {
+    std::vector<std::optional<std::string>> out(block.GetColumnCount());
+    for (size_t col = 0; col < out.size(); ++col) {
+        if (const auto it = named.find(block.GetColumnName(col)); it != named.end()) {
+            out[col] = it->second;
+        }
+    }
+    return out;
+}
+
 } // namespace
 
 TEST_CASE("ch_to_struct: schema extraction for primitive types") {
@@ -53,7 +67,7 @@ TEST_CASE("ch_to_struct: schema extraction for primitive types") {
     block.AppendColumn("score", std::make_shared<clickhouse::ColumnFloat64>());
     block.AppendColumn("label", std::make_shared<clickhouse::ColumnString>());
 
-    auto s = tsl::ch_to_struct(std::pmr::new_delete_resource(), block);
+    auto s = tsl::ch_to_struct(std::pmr::new_delete_resource(), block, {});
 
     REQUIRE(s.type() == logical_type::STRUCT);
     REQUIRE(s.child_types().size() == 3);
@@ -69,7 +83,7 @@ TEST_CASE("ch_to_struct: schema extraction for primitive types") {
 }
 
 TEST_CASE("ch_to_struct: empty block produces empty STRUCT") {
-    auto s = tsl::ch_to_struct(std::pmr::new_delete_resource(), clickhouse::Block{});
+    auto s = tsl::ch_to_struct(std::pmr::new_delete_resource(), clickhouse::Block{}, {});
     REQUIRE(s.type() == logical_type::STRUCT);
     REQUIRE(s.child_types().empty());
 }
@@ -78,7 +92,7 @@ TEST_CASE("ch_to_chunk: single block, correct cardinality and column count") {
     auto* res = std::pmr::new_delete_resource();
     auto block = make_block_3col(5);
 
-    auto converted = tsl::ch_to_chunk(res, block);
+    auto converted = tsl::ch_to_chunk(res, {block}, {});
     REQUIRE_FALSE(converted.has_error());
     const auto& chunk = converted.value();
 
@@ -96,7 +110,7 @@ TEST_CASE("ch_to_chunk: Int32 column values round-trip") {
     clickhouse::Block block;
     block.AppendColumn("x", col);
 
-    auto converted = tsl::ch_to_chunk(res, block);
+    auto converted = tsl::ch_to_chunk(res, {block}, {});
     REQUIRE_FALSE(converted.has_error());
     const auto& chunk = converted.value();
 
@@ -115,7 +129,7 @@ TEST_CASE("ch_to_chunk: Float64 column values round-trip") {
     clickhouse::Block block;
     block.AppendColumn("val", col);
 
-    auto converted = tsl::ch_to_chunk(res, block);
+    auto converted = tsl::ch_to_chunk(res, {block}, {});
     REQUIRE_FALSE(converted.has_error());
     const auto& chunk = converted.value();
 
@@ -133,7 +147,7 @@ TEST_CASE("ch_to_chunk: String column values round-trip") {
     clickhouse::Block block;
     block.AppendColumn("msg", col);
 
-    auto converted = tsl::ch_to_chunk(res, block);
+    auto converted = tsl::ch_to_chunk(res, {block}, {});
     REQUIRE_FALSE(converted.has_error());
     const auto& chunk = converted.value();
 
@@ -144,7 +158,7 @@ TEST_CASE("ch_to_chunk: String column values round-trip") {
 
 TEST_CASE("ch_to_chunk: empty block produces empty chunk") {
     auto* res = std::pmr::new_delete_resource();
-    auto converted = tsl::ch_to_chunk(res, clickhouse::Block{});
+    auto converted = tsl::ch_to_chunk(res, {clickhouse::Block{}}, {});
     REQUIRE_FALSE(converted.has_error());
     const auto& chunk = converted.value();
     REQUIRE(chunk.size() == 0);
@@ -156,7 +170,7 @@ TEST_CASE("ch_to_chunk: multi-block vector merges row counts") {
 
     auto b1 = make_block_3col(3);
     auto b2 = make_block_3col(4);
-    auto converted = tsl::ch_to_chunk(res, std::vector<clickhouse::Block>{b1, b2});
+    auto converted = tsl::ch_to_chunk(res, std::vector<clickhouse::Block>{b1, b2}, {});
     REQUIRE_FALSE(converted.has_error());
     const auto& chunk = converted.value();
 
@@ -170,7 +184,7 @@ TEST_CASE("ch_to_chunk: multi-block with empty blocks ignored") {
     auto b1 = make_block_3col(2);
     clickhouse::Block empty{};
     auto b2 = make_block_3col(3);
-    auto converted = tsl::ch_to_chunk(res, std::vector<clickhouse::Block>{b1, empty, b2});
+    auto converted = tsl::ch_to_chunk(res, std::vector<clickhouse::Block>{b1, empty, b2}, {});
     REQUIRE_FALSE(converted.has_error());
     const auto& chunk = converted.value();
 
@@ -190,7 +204,7 @@ TEST_CASE("ch_to_chunk: a String override over an Int32 wire column keeps the co
     std::unordered_map<std::string, std::string> overrides;
     overrides["payload"] = "String";
 
-    auto converted = tsl::ch_to_chunk(res, block, overrides);
+    auto converted = tsl::ch_to_chunk(res, {block}, by_position(block, overrides));
     REQUIRE_FALSE(converted.has_error());
     const auto& chunk = converted.value();
 
@@ -204,7 +218,7 @@ TEST_CASE("ch_to_struct: Int64 and UInt32 columns") {
     block.AppendColumn("big",      std::make_shared<clickhouse::ColumnInt64>());
     block.AppendColumn("unsigned", std::make_shared<clickhouse::ColumnUInt32>());
 
-    auto s = tsl::ch_to_struct(std::pmr::new_delete_resource(), block);
+    auto s = tsl::ch_to_struct(std::pmr::new_delete_resource(), block, {});
 
     REQUIRE(s.child_types()[0].type() == logical_type::BIGINT);
     REQUIRE(s.child_types()[1].type() == logical_type::UINTEGER);
@@ -363,7 +377,7 @@ TEST_CASE("ch_to_chunk characterization: column type and value per wire type cod
     auto block = make_scalar_block();
 
     SECTION("single block") {
-        auto converted = tsl::ch_to_chunk(res, block);
+        auto converted = tsl::ch_to_chunk(res, {block}, {});
         REQUIRE_FALSE(converted.has_error());
         const auto& chunk = converted.value();
         REQUIRE(chunk.size() == 1);
@@ -371,7 +385,7 @@ TEST_CASE("ch_to_chunk characterization: column type and value per wire type cod
         require_scalar_values(chunk, 0);
     }
     SECTION("multi block") {
-        auto converted = tsl::ch_to_chunk(res, std::vector<clickhouse::Block>{block, clickhouse::Block{}, block});
+        auto converted = tsl::ch_to_chunk(res, std::vector<clickhouse::Block>{block, clickhouse::Block{}, block}, {});
         REQUIRE_FALSE(converted.has_error());
         const auto& chunk = converted.value();
         REQUIRE(chunk.size() == 2);
@@ -392,7 +406,7 @@ TEST_CASE("ch_to_chunk characterization: Nullable columns keep the nested type a
     b2.AppendColumn("s", make_nullable<clickhouse::ColumnString, std::string>({"y", std::nullopt}));
 
     SECTION("single block") {
-        auto converted = tsl::ch_to_chunk(res, b1);
+        auto converted = tsl::ch_to_chunk(res, {b1}, {});
         REQUIRE_FALSE(converted.has_error());
         const auto& chunk = converted.value();
         REQUIRE(chunk.size() == 2);
@@ -404,7 +418,7 @@ TEST_CASE("ch_to_chunk characterization: Nullable columns keep the nested type a
         REQUIRE(chunk.value(1, 1).value<std::string_view>() == "x");
     }
     SECTION("multi block") {
-        auto converted = tsl::ch_to_chunk(res, std::vector<clickhouse::Block>{b1, b2});
+        auto converted = tsl::ch_to_chunk(res, std::vector<clickhouse::Block>{b1, b2}, {});
         REQUIRE_FALSE(converted.has_error());
         const auto& chunk = converted.value();
         REQUIRE(chunk.size() == 4);
@@ -433,7 +447,7 @@ TEST_CASE("ch_to_chunk characterization: scalar named-type override keeps the pr
     const std::unordered_map<std::string, std::string> overrides{{"v", "Nullable(Int64)"},
                                                                  {"w", "LowCardinality(String)"}};
 
-    auto converted = tsl::ch_to_chunk(res, block, overrides);
+    auto converted = tsl::ch_to_chunk(res, {block}, by_position(block, overrides));
     REQUIRE_FALSE(converted.has_error());
     const auto& chunk = converted.value();
 
@@ -463,7 +477,8 @@ TEST_CASE("ch_to_chunk characterization: Tuple override reads a STRUCT column") 
     };
 
     SECTION("single block") {
-        auto converted = tsl::ch_to_chunk(res, make_tuple_block(1, {"a", std::nullopt}), overrides);
+        const auto block = make_tuple_block(1, {"a", std::nullopt});
+        auto converted = tsl::ch_to_chunk(res, {block}, by_position(block, overrides));
         REQUIRE_FALSE(converted.has_error());
         const auto& chunk = converted.value();
         REQUIRE(chunk.size() == 2);
@@ -478,10 +493,9 @@ TEST_CASE("ch_to_chunk characterization: Tuple override reads a STRUCT column") 
         REQUIRE(row1.children()[1].is_null());
     }
     SECTION("multi block") {
-        auto converted = tsl::ch_to_chunk(
-            res,
-            std::vector<clickhouse::Block>{make_tuple_block(1, {"a"}), make_tuple_block(10, {std::nullopt, "c"})},
-            overrides);
+        const std::vector<clickhouse::Block> blocks{make_tuple_block(1, {"a"}),
+                                                    make_tuple_block(10, {std::nullopt, "c"})};
+        auto converted = tsl::ch_to_chunk(res, blocks, by_position(blocks.front(), overrides));
         REQUIRE_FALSE(converted.has_error());
         const auto& chunk = converted.value();
         REQUIRE(chunk.size() == 3);
@@ -583,7 +597,8 @@ TEST_CASE("ch_to_chunk: Array override reads every row's elements across block b
     };
 
     SECTION("single block") {
-        auto converted = tsl::ch_to_chunk(res, make_array_block(nums, tags), overrides);
+        const auto block = make_array_block(nums, tags);
+        auto converted = tsl::ch_to_chunk(res, {block}, by_position(block, overrides));
         REQUIRE_FALSE(converted.has_error());
         require_rows(converted.value());
     }
@@ -592,7 +607,7 @@ TEST_CASE("ch_to_chunk: Array override reads every row's elements across block b
         const std::vector<clickhouse::Block> blocks{make_array_block({nums[0]}, {tags[0]}),
                                                     clickhouse::Block{},
                                                     make_array_block({nums[1], nums[2]}, {tags[1], tags[2]})};
-        auto converted = tsl::ch_to_chunk(res, blocks, overrides);
+        auto converted = tsl::ch_to_chunk(res, blocks, by_position(blocks.front(), overrides));
         REQUIRE_FALSE(converted.has_error());
         require_rows(converted.value());
     }
@@ -641,14 +656,15 @@ TEST_CASE("ch_to_chunk: Date and Date32 columns read the calendar day the wire c
     };
 
     SECTION("single block") {
-        auto converted = tsl::ch_to_chunk(res, make_date_block(0, 3));
+        auto converted = tsl::ch_to_chunk(res, {make_date_block(0, 3)}, {});
         REQUIRE_FALSE(converted.has_error());
         require_rows(converted.value());
     }
     SECTION("multi block") {
         auto converted = tsl::ch_to_chunk(
             res,
-            std::vector<clickhouse::Block>{make_date_block(0, 1), clickhouse::Block{}, make_date_block(1, 3)});
+            std::vector<clickhouse::Block>{make_date_block(0, 1), clickhouse::Block{}, make_date_block(1, 3)},
+            {});
         REQUIRE_FALSE(converted.has_error());
         require_rows(converted.value());
     }
@@ -699,14 +715,15 @@ namespace {
                                   const RequireRows& require_rows) {
         auto* res = std::pmr::new_delete_resource();
         SECTION("single block") {
-            auto converted = tsl::ch_to_chunk(res, make_block(0, rows), overrides);
+            const auto block = make_block(0, rows);
+            auto converted = tsl::ch_to_chunk(res, {block}, by_position(block, overrides));
             INFO((converted.has_error() ? converted.error().what.c_str() : "converted"));
             REQUIRE_FALSE(converted.has_error());
             require_rows(converted.value());
         }
         SECTION("split blocks") {
             const std::vector<clickhouse::Block> blocks{make_block(0, 1), clickhouse::Block{}, make_block(1, rows)};
-            auto converted = tsl::ch_to_chunk(res, blocks, overrides);
+            auto converted = tsl::ch_to_chunk(res, blocks, by_position(blocks.front(), overrides));
             INFO((converted.has_error() ? converted.error().what.c_str() : "converted"));
             REQUIRE_FALSE(converted.has_error());
             require_rows(converted.value());
@@ -726,10 +743,13 @@ namespace {
             REQUIRE(converted.error().type == core::error_code_t::conversion_failure);
             REQUIRE(std::string_view{converted.error().what}.find(column) != std::string_view::npos);
         };
-        SECTION("single block") { require_failure(tsl::ch_to_chunk(res, make_block(0, rows), overrides)); }
+        SECTION("single block") {
+            const auto block = make_block(0, rows);
+            require_failure(tsl::ch_to_chunk(res, {block}, by_position(block, overrides)));
+        }
         SECTION("split blocks") {
             const std::vector<clickhouse::Block> blocks{make_block(0, 1), clickhouse::Block{}, make_block(1, rows)};
-            require_failure(tsl::ch_to_chunk(res, blocks, overrides));
+            require_failure(tsl::ch_to_chunk(res, blocks, by_position(blocks.front(), overrides)));
         }
     }
 
@@ -1193,22 +1213,12 @@ TEST_CASE("ch_to_chunk: Array override is a LIST of each row's own length") {
 // Wire types the engine has no scalar type for are STRING columns holding their text — with or
 // without the system.columns type discovery keeps as the override — and discovery registers those
 // columns as STRING. DateTime64 and Time64 print the column's precision, with the wall clock in UTC
-// (the column's timezone is not applied, as for DateTime); a Decimal keeps its scale's digits.
+// (the column's timezone is not applied, as for DateTime). A Decimal is the engine's DECIMAL (below).
 TEST_CASE("ch_to_chunk: wire types without a numeric mapping are read as their text") {
     auto* res = std::pmr::new_delete_resource();
-    clickhouse::Int128 decimal38_max = 1;
-    for (int digit = 0; digit < 38; ++digit) {
-        decimal38_max *= 10;
-    }
-    decimal38_max -= 1;
-    const std::string decimal38_max_text = std::string(28, '9') + "." + std::string(10, '9');
-
     const std::vector<int64_t> dt64_3{1704164645123, -1};
     const std::vector<int64_t> dt64_0{0, 86399};
     const std::vector<int64_t> dt64_6{1704164645000001, -1000000};
-    const std::vector<clickhouse::Int128> dec_9_2{12345, -5};
-    const std::vector<clickhouse::Int128> dec_38_10{decimal38_max, -decimal38_max};
-    const std::vector<clickhouse::Int128> dec_18_0{-42, 0};
     const std::vector<int8_t> enum8{1, 2};
     const std::vector<int16_t> enum16{-300, 300};
     const std::vector<std::string> ip4{"192.168.0.1", "0.0.0.0"};
@@ -1228,9 +1238,6 @@ TEST_CASE("ch_to_chunk: wire types without a numeric mapping are read as their t
         {"dt64_3", "DateTime64(3)", {"2024-01-02 03:04:05.123", "1969-12-31 23:59:59.999"}},
         {"dt64_0", "DateTime64(0)", {"1970-01-01 00:00:00", "1970-01-01 23:59:59"}},
         {"dt64_6", "DateTime64(6, 'Europe/Moscow')", {"2024-01-02 03:04:05.000001", "1969-12-31 23:59:59.000000"}},
-        {"dec_9_2", "Decimal(9, 2)", {"123.45", "-0.05"}},
-        {"dec_38_10", "Decimal(38, 10)", {decimal38_max_text, "-" + decimal38_max_text}},
-        {"dec_18_0", "Decimal(18, 0)", {"-42", "0"}},
         {"e8", "Enum8('red' = 1, 'green' = 2)", {"red", "green"}},
         {"e16", "Enum16('neg' = -300, 'pos' = 300)", {"neg", "pos"}},
         {"ip4", "IPv4", {"192.168.0.1", "0.0.0.0"}},
@@ -1251,13 +1258,6 @@ TEST_CASE("ch_to_chunk: wire types without a numeric mapping are read as their t
             }
             return column;
         };
-        auto decimal = [&](size_t precision, size_t scale, const std::vector<clickhouse::Int128>& values) {
-            auto column = std::make_shared<clickhouse::ColumnDecimal>(precision, scale);
-            for (size_t row = first; row < last; ++row) {
-                column->Append(values[row]);
-            }
-            return column;
-        };
         auto e8 = std::make_shared<clickhouse::ColumnEnum8>(clickhouse::Type::CreateEnum8({{"red", 1}, {"green", 2}}));
         auto e16 =
             std::make_shared<clickhouse::ColumnEnum16>(clickhouse::Type::CreateEnum16({{"neg", -300}, {"pos", 300}}));
@@ -1270,9 +1270,6 @@ TEST_CASE("ch_to_chunk: wire types without a numeric mapping are read as their t
         block.AppendColumn("dt64_3", datetime64(3, "", dt64_3));
         block.AppendColumn("dt64_0", datetime64(0, "", dt64_0));
         block.AppendColumn("dt64_6", datetime64(6, "Europe/Moscow", dt64_6));
-        block.AppendColumn("dec_9_2", decimal(9, 2, dec_9_2));
-        block.AppendColumn("dec_38_10", decimal(38, 10, dec_38_10));
-        block.AppendColumn("dec_18_0", decimal(18, 0, dec_18_0));
         block.AppendColumn("e8", e8);
         block.AppendColumn("e16", e16);
         block.AppendColumn("ip4", make_column<clickhouse::ColumnIPv4>(rows_of(ip4, first, last)));
@@ -1314,7 +1311,7 @@ TEST_CASE("ch_to_chunk: wire types without a numeric mapping are read as their t
         const auto block = make_block(0, 2);
         for (const auto* overrides : std::initializer_list<const overrides_t*>{&no_overrides, &named_types}) {
             const auto schema = tsl::ch_to_struct(res, block, *overrides);
-            auto converted = tsl::ch_to_chunk(res, block, *overrides);
+            auto converted = tsl::ch_to_chunk(res, {block}, by_position(block, *overrides));
             INFO((converted.has_error() ? converted.error().what.c_str() : "converted"));
             REQUIRE_FALSE(converted.has_error());
             const auto types = converted.value().types();
@@ -1325,6 +1322,97 @@ TEST_CASE("ch_to_chunk: wire types without a numeric mapping are read as their t
                 REQUIRE(schema.child_types()[col] == types[col]);
             }
         }
+    }
+}
+
+// A Decimal(P, S) of at most 38 digits (Decimal32 / 64 / 128 included) is the engine's DECIMAL(P, S)
+// holding the unscaled integer the wire carries — every digit, the largest Decimal(38, 10) too —
+// with and without the system.columns type, and discovery registers the same DECIMAL(P, S).
+TEST_CASE("ch_to_chunk: a Decimal of at most 38 digits is the engine's DECIMAL of its precision and scale") {
+    auto* res = std::pmr::new_delete_resource();
+    clickhouse::Int128 decimal38_max = 1;
+    for (int digit = 0; digit < 38; ++digit) {
+        decimal38_max *= 10;
+    }
+    decimal38_max -= 1;
+    struct decimal_column_t {
+        const char* name;
+        const char* named_type;
+        size_t precision;
+        size_t scale;
+        std::vector<clickhouse::Int128> values;
+    };
+    const std::vector<decimal_column_t> expected{
+        {"dec_9_2", "Decimal(9, 2)", 9, 2, {12345, -5}},
+        {"dec_38_10", "Decimal(38, 10)", 38, 10, {decimal38_max, -decimal38_max}},
+        {"dec_18_0", "Nullable(Decimal(18, 0))", 18, 0, {-42, 0}},
+        {"dec64_4", "Decimal64(4)", 18, 4, {1, -10000}},
+    };
+    auto make_block = [&](size_t first, size_t last) {
+        clickhouse::Block block;
+        for (const auto& column : expected) {
+            auto values = std::make_shared<clickhouse::ColumnDecimal>(column.precision, column.scale);
+            for (size_t row = first; row < last; ++row) {
+                values->Append(column.values[row]);
+            }
+            block.AppendColumn(column.name, values);
+        }
+        return block;
+    };
+    auto require_decimals = [&](const data_chunk_t& chunk) {
+        REQUIRE(chunk.size() == 2);
+        const auto types = chunk.types();
+        REQUIRE(types.size() == expected.size());
+        for (size_t col = 0; col < expected.size(); ++col) {
+            CAPTURE(expected[col].name);
+            REQUIRE(types[col].alias() == expected[col].name);
+            REQUIRE(types[col].type() == logical_type::DECIMAL);
+            const auto* spec = types[col].extension_as<decimal_logical_type_extension>();
+            REQUIRE(spec->width() == expected[col].precision);
+            REQUIRE(spec->scale() == expected[col].scale);
+            for (size_t row = 0; row < 2; ++row) {
+                require_written(chunk, col, row);
+                const auto value = chunk.value(col, row);
+                const components::types::int128_t unscaled =
+                    spec->stored_as() == physical_type::INT32   ? components::types::int128_t{value.value<int32_t>()}
+                    : spec->stored_as() == physical_type::INT64 ? components::types::int128_t{value.value<int64_t>()}
+                                                                : value.value<components::types::int128_t>();
+                REQUIRE(unscaled == expected[col].values[row]);
+            }
+        }
+    };
+    overrides_t named_types;
+    for (const auto& column : expected) {
+        named_types.emplace(column.name, column.named_type);
+    }
+    const overrides_t no_overrides;
+    SECTION("without overrides") { convert_single_and_split(make_block, 2, no_overrides, require_decimals); }
+    SECTION("under the system.columns types") {
+        convert_single_and_split(make_block, 2, named_types, require_decimals);
+    }
+    SECTION("the schema discovery registers is the chunk's") {
+        const auto block = make_block(0, 2);
+        const auto schema = tsl::ch_to_struct(res, block, named_types);
+        auto converted = tsl::ch_to_chunk(res, {block}, by_position(block, named_types));
+        REQUIRE_FALSE(converted.has_error());
+        const auto types = converted.value().types();
+        REQUIRE(schema.child_types().size() == types.size());
+        for (size_t col = 0; col < types.size(); ++col) {
+            REQUIRE(schema.child_types()[col] == types[col]);
+        }
+    }
+    // `SUM(price) AS price` answers Decimal(38, 2) under a Decimal(9, 2) column's name: that is not
+    // the column, and the result keeps the wire's DECIMAL(38, 2).
+    SECTION("a result column of another width under a Decimal column's name") {
+        clickhouse::Block block;
+        auto values = std::make_shared<clickhouse::ColumnDecimal>(38, 2);
+        values->Append(clickhouse::Int128{30});
+        block.AppendColumn("dec_9_2", values);
+        auto converted = tsl::ch_to_chunk(res, {block}, by_position(block, named_types));
+        REQUIRE_FALSE(converted.has_error());
+        const auto type = converted.value().types().front();
+        REQUIRE(type.type() == logical_type::DECIMAL);
+        REQUIRE(type.extension_as<decimal_logical_type_extension>()->width() == 38);
     }
 }
 
@@ -1479,7 +1567,8 @@ TEST_CASE("ch_to_struct of a statement's header block is the chunk types of its 
     REQUIRE(header.child_types()[3].child_types()[0].alias() == "a");
     REQUIRE(header.child_types()[3].child_types()[1].alias() == "b");
 
-    auto converted = tsl::ch_to_chunk(res, std::vector<clickhouse::Block>{make_block(3), make_block(2)}, overrides);
+    const std::vector<clickhouse::Block> blocks{make_block(3), make_block(2)};
+    auto converted = tsl::ch_to_chunk(res, blocks, by_position(blocks.front(), overrides));
     INFO(converted.error().what.c_str());
     REQUIRE_FALSE(converted.has_error());
     const auto& chunk = converted.value();
@@ -1494,4 +1583,60 @@ TEST_CASE("ch_to_struct of a statement's header block is the chunk types of its 
     REQUIRE(chunk.value(1, 0).value<int64_t>() == 3000000000LL);
     REQUIRE(chunk.value(2, 2).value<uint64_t>() == 4);
     REQUIRE(chunk.value(3, 1).children()[1].is_null());
+}
+
+// The declared types by result position (a pushed-down statement, whose columns come from several
+// tables under names of the statement's own): each applies to the column at its position when the
+// wire column represents it, whatever the column is called; a position without one, or past the
+// vector, is the wire's type.
+TEST_CASE("ch_to_chunk: declared types by position apply to the column at that position") {
+    auto* res = std::pmr::new_delete_resource();
+    auto flags = std::make_shared<clickhouse::ColumnUInt8>();
+    flags->Append(1);
+    flags->Append(0);
+    auto ids = std::make_shared<clickhouse::ColumnInt32>();
+    ids->Append(10);
+    ids->Append(20);
+    auto labels = std::make_shared<clickhouse::ColumnString>();
+    labels->Append("a");
+    labels->Append("b");
+    auto rec = std::make_shared<clickhouse::ColumnTuple>(std::vector<clickhouse::ColumnRef>{ids, labels});
+    auto plain = std::make_shared<clickhouse::ColumnUInt8>();
+    plain->Append(7);
+    plain->Append(8);
+    auto tail = std::make_shared<clickhouse::ColumnUInt8>();
+    tail->Append(1);
+    tail->Append(1);
+    clickhouse::Block block;
+    // Names no base table has: a name-keyed override would find none of them.
+    block.AppendColumn("ok_1", flags);
+    block.AppendColumn("t1.rec", rec);
+    block.AppendColumn("n", plain);
+    block.AppendColumn("past", tail);
+    const std::vector<std::optional<std::string>> declared{"Bool", "Tuple(id Int32, label String)", std::nullopt};
+
+    auto converted = tsl::ch_to_chunk(res, std::vector<clickhouse::Block>{block}, declared);
+    REQUIRE_FALSE(converted.has_error());
+    const auto& chunk = converted.value();
+    REQUIRE(chunk.size() == 2);
+    CHECK(chunk.types()[0].type() == logical_type::BOOLEAN);
+    CHECK(chunk.value(0, 0).value<bool>());
+    CHECK_FALSE(chunk.value(0, 1).value<bool>());
+    REQUIRE(chunk.types()[1].type() == logical_type::STRUCT);
+    REQUIRE(chunk.types()[1].child_types().size() == 2);
+    CHECK(chunk.types()[1].child_types()[0].alias() == "id");
+    CHECK(chunk.types()[1].child_types()[1].alias() == "label");
+    CHECK(chunk.value(1, 1).children()[1].value<std::string_view>() == "b");
+    CHECK(chunk.types()[2].type() == logical_type::UTINYINT);
+    CHECK(chunk.types()[3].type() == logical_type::UTINYINT);
+
+    // A declared type the wire column does not represent is not applied (UInt16 is no Bool).
+    auto wide = std::make_shared<clickhouse::ColumnUInt16>();
+    wide->Append(300);
+    clickhouse::Block other;
+    other.AppendColumn("ok", wide);
+    auto kept =
+        tsl::ch_to_chunk(res, std::vector<clickhouse::Block>{other}, std::vector<std::optional<std::string>>{"Bool"});
+    REQUIRE_FALSE(kept.has_error());
+    CHECK(kept.value().types()[0].type() == logical_type::USMALLINT);
 }

@@ -3,7 +3,7 @@
 //
 // Verifies the s3/file grammar extensions are registered in GreenplumParser and
 // that CREATE EXTERNAL TABLE / COPY (...) TO lower into an external_node_t
-// carrying the fields the Scheduler routes on. (The end-to-end routing through
+// carrying the fields the query session routes on. (The end-to-end routing through
 // the file/s3 managers is exercised by the system / minio tests.)
 
 #include <catch2/catch_all.hpp>
@@ -102,7 +102,7 @@ TEST_CASE("external: a plain SELECT is not claimed by the extensions") {
 }
 
 // The three extension roots share node_type::unused, so the parser records
-// which extension claimed the statement; the Worker routes on that record.
+// which extension claimed the statement; the query session routes on that record.
 TEST_CASE("external: the claiming extension is recorded on ParsedQueryData") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     GreenplumParser parser(&arena);

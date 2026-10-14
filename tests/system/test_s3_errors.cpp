@@ -13,6 +13,7 @@
 #include "utility/session.hpp"
 
 #include <actor-zeta.hpp>
+#include <components/session/session.hpp>
 #include <core/result_wrapper.hpp>
 
 #include <catch2/catch_all.hpp>
@@ -77,7 +78,7 @@ TEST_CASE("s3 connector: add_credentials rejects an empty alias or empty keys as
     download_dir dir{"otterstax_s3_errors_add"};
     auto* resource = std::pmr::new_delete_resource();
     auto s3 = actor_zeta::spawn<conn::s3::ConnectorManager>(resource, dir.path);
-    const auto id = session_id().hash();
+    const auto id = components::session::session_id_t().hash();
 
     SECTION("empty alias") {
         auto params = valid_params(resource, "");
@@ -144,7 +145,7 @@ TEST_CASE("s3 connector: list / download / upload on an unknown alias fail with 
     download_dir dir{"otterstax_s3_errors_unknown"};
     auto* resource = std::pmr::new_delete_resource();
     auto s3 = actor_zeta::spawn<conn::s3::ConnectorManager>(resource, dir.path);
-    const auto id = session_id().hash();
+    const auto id = components::session::session_id_t().hash();
 
     auto listed = settled(actor_zeta::send(s3->address(),
                                            &conn::s3::ConnectorManager::list,
@@ -180,7 +181,7 @@ TEST_CASE("s3 connector: a transfer Arrow refuses is io_error and leaves no file
     download_dir dir{"otterstax_s3_errors_io"};
     auto* resource = std::pmr::new_delete_resource();
     auto s3 = actor_zeta::spawn<conn::s3::ConnectorManager>(resource, dir.path);
-    const auto id = session_id().hash();
+    const auto id = components::session::session_id_t().hash();
 
     auto stored = settled(actor_zeta::send(s3->address(),
                                            &conn::s3::ConnectorManager::add_credentials,
@@ -224,7 +225,7 @@ TEST_CASE("S3Manager: forwards the connector's error code instead of flattening 
                                                 s3->address(),
                                                 actor_zeta::address_t::empty_address(),
                                                 dir.path);
-    const auto id = session_id().hash();
+    const auto id = components::session::session_id_t().hash();
 
     SECTION("download on an unknown alias is do_not_exists and names the alias") {
         auto r = settled(actor_zeta::send(mgr->address(),

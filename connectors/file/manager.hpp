@@ -4,6 +4,7 @@
 #pragma once
 
 #include <components/log/log.hpp>
+#include <components/session/session.hpp>
 #include "utility/tracy_profiler.hpp"
 #include "utility/thread_pool_manager.hpp"
 #include "utility/session.hpp"
@@ -23,7 +24,10 @@ class FileManager final : public actor_zeta::actor::actor_mixin<FileManager> {
         template<typename T>
         using unique_future = actor_zeta::unique_future<T>;
 
-        FileManager(std::pmr::memory_resource* res, actor_zeta::address_t otterbrix_manager);
+        // `engine_dispatcher`: the embedded engine's dispatcher
+        // (runtime::engine_t::dispatcher_address()). Loads and COPY reads run on
+        // the file manager's own engine session.
+        FileManager(std::pmr::memory_resource* res, actor_zeta::address_t engine_dispatcher);
 
         std::pmr::memory_resource* resource() const noexcept { return resource_; }
 
@@ -43,7 +47,8 @@ class FileManager final : public actor_zeta::actor::actor_mixin<FileManager> {
 
     private:
         std::pmr::memory_resource* resource_;
-        actor_zeta::address_t otterbrix_manager_;
+        actor_zeta::address_t engine_dispatcher_;
+        components::session::session_id_t engine_session_;
         log_t log_;
         OTX_LOCKABLE_N(std::mutex, mutex_, "FileManager::mutex");
         actor_zeta::behavior_t current_behavior_;

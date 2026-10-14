@@ -102,11 +102,11 @@ namespace frontend::spark {
                     ref.relname = std::string(parts[1].begin(), parts[1].end());
                     break;
                 case 3:
-                    // `alias.db.table`, read as the SQL path reads three parts
-                    // (promote_three_part_qualifiers): the connection alias, the
-                    // database, the table, the database standing in for the schema.
-                    ref.uid = std::string(parts[0].begin(), parts[0].end());
-                    ref.dbname = std::string(parts[1].begin(), parts[1].end());
+                    // `a.b.c`, read as the SQL path reads three parts:
+                    // database.schema.table. `alias.db.table` names a remote table
+                    // (the database slot is the connection alias), which the engine
+                    // resolves through the federation.
+                    ref.dbname = std::string(parts[0].begin(), parts[0].end());
                     ref.schema = std::string(parts[1].begin(), parts[1].end());
                     ref.relname = std::string(parts[2].begin(), parts[2].end());
                     break;
@@ -178,21 +178,12 @@ namespace frontend::spark {
             }
         }
 
-        // The schema a Read.NamedTable named for an external table. The aggregate
-        // carries only (uid, db, rel), and a PostgreSQL table is mirrored under its
-        // schema, so populate_external_nodes puts the schema back into the name.
-        struct read_schema_t {
-            const cl::node_t* node;
-            std::pmr::string schema;
-        };
-
         // What the translation of one relation_to_plan() call shares.
         struct translation_ctx_t {
             explicit translation_ctx_t(std::pmr::memory_resource* resource)
                 : resource(resource)
                 , params(cl::make_parameter_node(resource))
-                , parser(resource)
-                , read_schemas(resource) {}
+                , parser(resource) {}
 
             std::pmr::memory_resource* resource;
             // The plan's one parameter node: every literal gets its id here, the
@@ -200,7 +191,6 @@ namespace frontend::spark {
             cl::parameter_node_ptr params;
             // Parses spark.sql() leaves and filter strings (parse_fragment).
             GreenplumParser parser;
-            std::pmr::vector<read_schema_t> read_schemas;
         };
 
         // A DataFrame operation that stacks a clause onto the aggregate below it.
@@ -320,9 +310,9 @@ namespace frontend::spark {
         // T_RangeSubselect): the outer aggregate names no table, the validator takes
         // the inner one's output as its input schema (validate_logical_plan.cpp, the
         // aggregate's data child) and the planner runs the inner plan as its source.
-        // A remote read stays the inner aggregate, so populate_external_nodes makes it
-        // the external slot: its clauses are pushed to the backend, its rows inlined,
-        // and the outer aggregate runs in the engine.
+        // A remote read stays the inner aggregate: the engine resolves its name, and
+        // the federation's pushdown rule sends the inner block to the backend as one
+        // statement where it can; the outer aggregate runs in the engine.
         cl::node_ptr derive(cl::node_ptr node, std::pmr::memory_resource* resource) {
             auto outer = cl::make_node_aggregate(resource, qualified_name_t{});
             outer->append_child(std::move(node));
@@ -554,35 +544,6 @@ namespace frontend::spark {
             return node;
         }
 
-        // The schema of every external table a spark.sql() leaf reads. The transformer
-        // folds a table down to (uid, db, rel) on its aggregate, so the schema is
-        // resolved back from the names the leaf's own parse tree registered, the way
-        // the parser's get_external_nodes resolves a node — an ambiguous name is its
-        // error here as well.
-        core::error_t record_leaf_schemas(const cl::node_ptr& node,
-                                          const otterstax::names::name_registry_t& names,
-                                          translation_ctx_t& ctx) {
-            if (!node) {
-                return core::error_t::no_error();
-            }
-            if (node->type() == cl::node_type::aggregate_t &&
-                !node->target().unique_identifier.t.empty()) {
-                auto resolved = otterstax::names::node_names(*node, names);
-                if (resolved.has_error()) {
-                    return core::error_on(ctx.resource, resolved.error());
-                }
-                const auto& schema = resolved.value().schema.t;
-                ctx.read_schemas.push_back(
-                    read_schema_t{node.get(), std::pmr::string{schema.data(), schema.size(), ctx.resource}});
-            }
-            for (const auto& child : node->children()) {
-                if (auto error = record_leaf_schemas(child, names, ctx); error.contains_error()) {
-                    return error;
-                }
-            }
-            return core::error_t::no_error();
-        }
-
         node_result translate_relation(const sc::Relation& rel, translation_ctx_t& ctx);
 
         node_result translate_read(const sc::Read& read, translation_ctx_t& ctx) {
@@ -592,23 +553,14 @@ namespace frontend::spark {
             }
             switch (read.read_type_case()) {
                 case sc::Read::kNamedTable: {
+                    // The name as the SQL path hands it to the engine; a remote one is
+                    // resolved there, through the federation.
                     auto ref = parse_table_identifier(read.named_table().unparsed_identifier(), resource);
-                    cl::node_ptr node;
-                    if (ref.uid.empty()) {
-                        node = cl::make_node_aggregate(
-                            resource,
-                            qualified_name_t{core::dbname_t{ref.dbname}, core::relname_t{ref.relname}});
-                    } else {
-                        node = cl::make_node_aggregate(resource,
-                                                       qualified_name_t{core::uid_t{ref.uid},
-                                                                        core::dbname_t{ref.dbname},
-                                                                        core::schema_t{},
-                                                                        core::relname_t{ref.relname}});
-                        ctx.read_schemas.push_back(
-                            read_schema_t{node.get(),
-                                          std::pmr::string{ref.schema.data(), ref.schema.size(), resource}});
-                    }
-                    return node;
+                    return cl::node_ptr{cl::make_node_aggregate(resource,
+                                                                qualified_name_t{core::uid_t{ref.uid},
+                                                                                 core::dbname_t{ref.dbname},
+                                                                                 core::schema_t{ref.schema},
+                                                                                 core::relname_t{ref.relname}})};
                 }
                 case sc::Read::kDataSource:
                     return unsupported("Spark DataSource reads are not supported", resource);
@@ -659,9 +611,8 @@ namespace frontend::spark {
                 // a structured comparison as well.
                 std::string sql{"SELECT * FROM __otterstax_filter__ WHERE "};
                 sql += filter.condition().expression_string().expression();
-                // Only the predicate is kept, so the fragment's table names are not needed.
-                otterstax::names::name_registry_t fragment_names{resource};
-                auto frag = ctx.parser.parse_fragment(sql, ctx.params, fragment_names);
+                // Only the predicate is kept.
+                auto frag = ctx.parser.parse_fragment(sql, ctx.params);
                 if (frag.has_error()) {
                     return frag; // same result type (node_ptr) — forward the error as-is
                 }
@@ -1035,19 +986,8 @@ namespace frontend::spark {
                     // the SHARED `params` node. A bare parse() keeps only the node and
                     // discards the sub-plan's parameter node, so a WHERE/HAVING constant
                     // later surfaces as "value getter: parameter not bound" at execution.
-                    // External nodes are rebuilt from the node tree by
-                    // populate_external_nodes, so the parser's own external-node analysis
-                    // is not needed here — only the schemas the leaf named, which its
-                    // nodes no longer carry.
-                    otterstax::names::name_registry_t leaf_names{resource};
-                    auto leaf = ctx.parser.parse_fragment(rel.sql().query(), ctx.params, leaf_names);
-                    if (leaf.has_error()) {
-                        return leaf;
-                    }
-                    if (auto error = record_leaf_schemas(leaf.value(), leaf_names, ctx); error.contains_error()) {
-                        return node_result{std::move(error)};
-                    }
-                    return leaf;
+                    // The leaf's table names stay as written: the engine resolves them.
+                    return ctx.parser.parse_fragment(rel.sql().query(), ctx.params);
                 }
                 case sc::Relation::kLocalRelation:
                     return unsupported("Spark LocalRelation is not supported", resource);
@@ -1090,80 +1030,6 @@ namespace frontend::spark {
                 default:
                     return unsupported("unsupported or unset Spark Relation type", resource);
             }
-        }
-
-        // The schema translate_read recorded for `node`, empty when it named none.
-        std::string read_schema_of(const std::pmr::vector<read_schema_t>& read_schemas, const cl::node_t* node) {
-            for (const auto& entry : read_schemas) {
-                if (entry.node == node) {
-                    return std::string(entry.schema.begin(), entry.schema.end());
-                }
-            }
-            return std::string{};
-        }
-
-        size_t populate_external_nodes(std::pmr::memory_resource* resource,
-                                       cl::node_ptr& root,
-                                       std::pmr::vector<std::pmr::vector<external_entry_t>>& external_nodes,
-                                       const std::pmr::vector<read_schema_t>& read_schemas) {
-            struct lookup_entry {
-                cl::node_ptr* ptr;
-                size_t batch_index;
-            };
-
-            external_nodes.emplace_back();
-            size_t count = 0;
-            std::pmr::deque<lookup_entry> queue{resource};
-            queue.push_back({&root, 0});
-
-            while (!queue.empty()) {
-                auto entry = queue.front();
-                queue.pop_front();
-                auto& node = *entry.ptr;
-                if (!node) {
-                    continue;
-                }
-
-                if (node->type() == cl::node_type::aggregate_t) {
-                    const auto& agg = static_cast<const cl::node_aggregate_t&>(*node);
-                    const std::string& uid_str = agg.target().unique_identifier.t;
-                    if (!uid_str.empty()) {
-                        qualified_name_t name{agg.target().unique_identifier,
-                                              agg.target().database,
-                                              core::schema_t{read_schema_of(read_schemas, node.get())},
-                                              agg.target().collection};
-
-                        auto it = std::find_if(external_nodes[entry.batch_index].begin(),
-                                               external_nodes[entry.batch_index].end(),
-                                               [&name](const external_entry_t& e) {
-                                                   return e.target.name.unique_identifier == name.unique_identifier;
-                                               });
-                        if (it != external_nodes[entry.batch_index].end()) {
-                            ++entry.batch_index;
-                            if (external_nodes.size() == entry.batch_index) {
-                                external_nodes.emplace_back();
-                            }
-                        }
-
-                        external_nodes[entry.batch_index].push_back(
-                            external_entry_t{entry.ptr,
-                                             otterstax::names::resolved_target_t{components::catalog::INVALID_OID,
-                                                                                 std::move(name),
-                                                                                 qualified_name_t{}}});
-                        ++count;
-                    }
-                }
-
-                auto& children_vec = node->children();
-                for (size_t i = 0; i < children_vec.size(); ++i) {
-                    queue.push_back({&children_vec[i], entry.batch_index});
-                }
-            }
-
-            if (external_nodes.back().empty()) {
-                external_nodes.erase(external_nodes.end() - 1);
-            }
-            return count;
         }
 
         bool expr_contains_window(const sc::Expression& expr);
@@ -1498,16 +1364,9 @@ namespace frontend::spark {
         // parameters_count is the number of unbound `$n` placeholders, as the
         // parser reports it (a positive one makes the describe path refuse the
         // statement). Every literal of a translated plan is bound, so it is 0.
-        auto statement =
-            std::make_unique<OtterbrixStatement>(std::pmr::vector<std::pmr::vector<external_entry_t>>{resource},
-                                                 std::move(params_node),
-                                                 std::move(statement_root),
-                                                 0,
-                                                 binder.parameter_count());
-
-        auto ext_count =
-            populate_external_nodes(resource, statement->node, statement->external_nodes, ctx.read_schemas);
-        statement->external_nodes_count = ext_count;
+        auto statement = std::make_unique<OtterbrixStatement>(std::move(params_node),
+                                                              std::move(statement_root),
+                                                              binder.parameter_count());
 
         auto parsed = std::make_unique<ParsedQueryData>(std::move(statement), std::move(binder), NodeTag::T_SelectStmt);
 

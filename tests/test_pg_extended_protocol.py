@@ -30,9 +30,9 @@ the exact message sequence the server answers with:
     oid): ErrorResponse 0A000 "cached plan must not change result type", as
     PostgreSQL answers, and not one row under the shape the client holds.
   * A named statement executed twice, and again after a failed execution: the
-    Worker keeps a prepared statement for one execution only, so the frontend
+    query session keeps a prepared statement for one execution only, so the frontend
     prepares it again under the hood; a second Execute must never surface the
-    Worker's "must be re-prepared" verdict.
+    session's "must be re-prepared" verdict.
   * An error inside an extended-query pipeline (Parse, Bind, Describe,
     Execute): ErrorResponse alone, the rest of the pipeline is discarded, and
     the Sync answers the one ReadyForQuery — never two. A failed simple Query
@@ -61,10 +61,10 @@ the exact message sequence the server answers with:
     RowDescription, on the simple Query and on the Execute of a portal the
     client never described alike.
   * A named statement parsed but never executed, then Terminate or a socket
-    drop: the connection's teardown releases it on the Worker
-    (Scheduler::close_statement) and the server keeps accepting and serving
+    drop: the connection's teardown releases it on the query session
+    (the connection closes its query session) and the server keeps accepting and serving
     connections. The release is not visible on the wire — the case proves the
-    teardown path completes (no crash, no wedged pool slot), not the Worker-
+    teardown path completes (no crash, no wedged pool slot), not the session-
     side erasure.
   * A message truncated inside its fields after startup (an Execute cut
     before its row limit, a Query without its terminator): ErrorResponse with
@@ -657,7 +657,7 @@ class PgExtendedProtocolTest:
         # bigint column is refused when the INSERT runs ("insert_node: can not
         # convert data column[0] type to table type"), not at Parse, whose
         # prepare of a DML statement does not touch the engine. The failure must
-        # be the engine's verdict both times, never the Worker's re-prepare
+        # be the engine's verdict both times, never the session's re-prepare
         # demand.
         w.parse("failing", f"INSERT INTO {DB}.{TABLE} (id, name) VALUES ('not a number', 'row_x')")
         w.sync()

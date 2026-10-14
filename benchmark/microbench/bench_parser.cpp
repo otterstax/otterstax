@@ -3,10 +3,8 @@
 //
 // Google Benchmark targets for SQL parsing:
 //   GreenplumParser::parse()  — full parse + logical-plan construction
-//   otterstax::parser::prepare_sql() — subquery extraction / qualifier promotion
 
 #include "otterbrix/parser/parser.hpp"
-#include "otterbrix/parser/subquery_extractor.hpp"
 #include "utility/logger.hpp"
 
 #include <benchmark/benchmark.h>
@@ -65,8 +63,8 @@ const char* kComplexSelect =
     "ORDER BY total_cost DESC "
     "LIMIT 1000";
 
-// Three-backend cross-engine join: MySQL × PostgreSQL × ClickHouse.
-// Produces three stubs in prepare_sql — the worst-case qualifier-rewriting path.
+// Three-backend cross-engine join: MySQL × PostgreSQL × ClickHouse — three
+// remote names on one plan, the widest statement the parser carries whole.
 const char* kThreeBackendJoin =
     "SELECT o.id, p.name, e.session_id "
     "FROM mysql.bill.schema.orders o "
@@ -138,53 +136,3 @@ static void BM_parse_three_backend_join(benchmark::State& state) {
     }
 }
 BENCHMARK(BM_parse_three_backend_join);
-
-// ── otterstax::parser::prepare_sql() ─────────────────────────────────────────
-
-static void BM_prepare_sql_simple(benchmark::State& state) {
-    std::pmr::unsynchronized_pool_resource pool;
-    for (auto _ : state) {
-        auto r = otterstax::parser::prepare_sql(kSimpleSelect, &pool, &pool);
-        benchmark::DoNotOptimize(r);
-    }
-}
-BENCHMARK(BM_prepare_sql_simple);
-
-// prepare_sql is most interesting when the SQL contains 4-part qualifiers that
-// need to be extracted into stubs: that triggers the subquery-rewriting path.
-static void BM_prepare_sql_cross_backend(benchmark::State& state) {
-    std::pmr::unsynchronized_pool_resource pool;
-    for (auto _ : state) {
-        auto r = otterstax::parser::prepare_sql(kCrossBackend, &pool, &pool);
-        benchmark::DoNotOptimize(r);
-    }
-}
-BENCHMARK(BM_prepare_sql_cross_backend);
-
-static void BM_prepare_sql_subquery(benchmark::State& state) {
-    std::pmr::unsynchronized_pool_resource pool;
-    for (auto _ : state) {
-        auto r = otterstax::parser::prepare_sql(kSubquery, &pool, &pool);
-        benchmark::DoNotOptimize(r);
-    }
-}
-BENCHMARK(BM_prepare_sql_subquery);
-
-static void BM_prepare_sql_complex_select(benchmark::State& state) {
-    std::pmr::unsynchronized_pool_resource pool;
-    for (auto _ : state) {
-        auto r = otterstax::parser::prepare_sql(kComplexSelect, &pool, &pool);
-        benchmark::DoNotOptimize(r);
-    }
-}
-BENCHMARK(BM_prepare_sql_complex_select);
-
-// Three-backend: produces three stubs, exercising the multi-backend split path.
-static void BM_prepare_sql_three_backend(benchmark::State& state) {
-    std::pmr::unsynchronized_pool_resource pool;
-    for (auto _ : state) {
-        auto r = otterstax::parser::prepare_sql(kThreeBackendJoin, &pool, &pool);
-        benchmark::DoNotOptimize(r);
-    }
-}
-BENCHMARK(BM_prepare_sql_three_backend);

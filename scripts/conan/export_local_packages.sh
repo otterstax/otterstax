@@ -6,25 +6,24 @@
 # feat/otterstax-embedding and the package is on https://conan.otterbrix.com
 # (OTB-tag, docs/proposals/otterbrix-embedding.md).
 #
-# conanfile.py pins otterbrix/1.0.0b2-embedding.<sha> and actor-zeta/2.0.0,
-# which exist only in the developer's LOCAL Conan cache, so a Docker image
-# build cannot fetch them. This script archives their RECIPES and SOURCES
-# (no binaries: a macOS binary is useless in a Linux image) with
-# `conan cache save` into the build context:
+# conanfile.py pins otterbrix/1.0.0b2-embedding.<sha>, which exists only in
+# the developer's LOCAL Conan cache, so a Docker image build cannot fetch it.
+# This script archives its RECIPE and SOURCES (no binaries: a macOS binary is
+# useless in a Linux image) with `conan cache save` into the build context:
 #
 #   .conan-local/local_recipes.tgz    the archive (git-ignored)
-#   .conan-local/local_recipes.refs   the exact ref#revision list it holds
+#   .conan-local/local_recipes.refs   the exact ref#revision it holds
 #
 # Dockerfile / Dockerfile.test `conan cache restore` the archive when it is
-# present and build both packages from source (--build="otterbrix/*"
-# --build="actor-zeta/*"). With no archive they fall back to the remotes.
+# present and build otterbrix from source (--build="otterbrix/*"). With no
+# archive they fall back to the remotes. actor-zeta/2.0.0 is NOT archived: it
+# is on the conan remote (conan.otterbrix.com) like any other dependency.
 #
-# The refs are read from conanfile.py (the otterbrix pin including its recipe
-# revision; actor-zeta at the latest revision in the local cache, which is
-# what a host `conan install` resolves). The archive is rewritten only when
-# that ref list changes (or with --force): `conan cache save` is not
-# byte-reproducible, and a new archive would invalidate the Docker layer cache
-# and rebuild otterbrix from source.
+# The ref is read from conanfile.py (the otterbrix pin including its recipe
+# revision; the latest revision in the local cache if it is not pinned). The
+# archive is rewritten only when that ref changes (or with --force): `conan
+# cache save` is not byte-reproducible, and a new archive would invalidate the
+# Docker layer cache and rebuild otterbrix from source.
 #
 # A ref that is not in the local cache is a WARNING (the image then resolves it
 # from the remotes, as it will after OTB-tag); the script exits 1 only on real
@@ -46,7 +45,7 @@ FORCE=false
 for arg in "$@"; do
     case "$arg" in
         --force) FORCE=true ;;
-        -h|--help) sed -n '5,34p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '5,32p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "export_local_packages: unknown option: $arg" >&2; exit 2 ;;
     esac
 done
@@ -54,27 +53,20 @@ done
 die() { echo "export_local_packages: ERROR: $*" >&2; exit 1; }
 note() { echo "export_local_packages: $*"; }
 
-# self.requires("otterbrix/<version>#<rrev>") / self.requires("actor-zeta/<version>")
-_required_ref() {
-    sed -nE "s/.*requires\(\"($1\/[^\"]+)\".*/\1/p" "$REPO_ROOT/conanfile.py" | head -1
-}
-OTTERBRIX_REF="$(_required_ref otterbrix)"
-ACTOR_ZETA_REF="$(_required_ref actor-zeta)"
-[ -n "$OTTERBRIX_REF" ]  || die "no otterbrix requirement found in conanfile.py"
-[ -n "$ACTOR_ZETA_REF" ] || die "no actor-zeta requirement found in conanfile.py"
+# self.requires("otterbrix/<version>#<rrev>")
+OTTERBRIX_REF="$(sed -nE 's/.*requires\("(otterbrix\/[^"]+)".*/\1/p' "$REPO_ROOT/conanfile.py" | head -1)"
+[ -n "$OTTERBRIX_REF" ] || die "no otterbrix requirement found in conanfile.py"
 # no pinned revision → take the latest one in the local cache
-[[ "$ACTOR_ZETA_REF" == *"#"* ]] || ACTOR_ZETA_REF="${ACTOR_ZETA_REF}#latest"
-[[ "$OTTERBRIX_REF"  == *"#"* ]] || OTTERBRIX_REF="${OTTERBRIX_REF}#latest"
+[[ "$OTTERBRIX_REF" == *"#"* ]] || OTTERBRIX_REF="${OTTERBRIX_REF}#latest"
 
 _build_hint() {
     local version="${OTTERBRIX_REF#otterbrix/}"; version="${version%%#*}"
     cat >&2 <<EOF
 
-  To build the local packages (see docs/proposals/otterbrix-embedding.md):
+  To build the local package (see docs/proposals/otterbrix-embedding.md):
     cd <otterbrix checkout> && git checkout ${version##*.}
     conan create . --version ${version} -pr:h profiles/release -pr:b default -o "otterbrix/*:shared=True"
-  (actor-zeta/2.0.0 is pulled into the local cache by that build, or by
-   'conan create' from the actor-zeta recipe.) Then re-run:
+  (its actor-zeta/2.0.0 comes from the conan remote.) Then re-run:
     scripts/conan/export_local_packages.sh
 EOF
 }
@@ -84,7 +76,7 @@ if ! command -v "$CONAN" >/dev/null 2>&1; then
         note "'$CONAN' not found on the host; reusing the existing $ARCHIVE ($(tr '\n' ' ' < "$STAMP" 2>/dev/null))"
         exit 0
     fi
-    die "'$CONAN' not found on the host and $ARCHIVE does not exist — the Docker image cannot get ${OTTERBRIX_REF%%#*} / ${ACTOR_ZETA_REF%%#*} (they are not on the conan remote)."
+    die "'$CONAN' not found on the host and $ARCHIVE does not exist — the Docker image cannot get ${OTTERBRIX_REF%%#*} (it is not on the conan remote)."
 fi
 
 TMP="$(mktemp -d)"
@@ -107,29 +99,17 @@ PY
 }
 
 OTB_RESOLVED="$(_resolve "$OTTERBRIX_REF" "$TMP/otterbrix.json")"
-AZ_RESOLVED="$(_resolve "$ACTOR_ZETA_REF" "$TMP/actor-zeta.json")"
 
-# Keep whatever is in the local cache; a ref that is not local is left to the
-# remotes (that is the normal state once OTB-tag lands), so it is a warning,
-# never a failure — exit 1 is kept for real errors (no conan, save failed).
-PRESENT_LISTS=()
-NEW_REFS=""
-for pair in "otterbrix:$OTB_RESOLVED:$OTTERBRIX_REF" "actor-zeta:$AZ_RESOLVED:$ACTOR_ZETA_REF"; do
-    name="${pair%%:*}"; rest="${pair#*:}"; resolved="${rest%%:*}"; wanted="${rest#*:}"
-    if [ -n "$resolved" ]; then
-        PRESENT_LISTS+=(-l "$TMP/$name.json")
-        NEW_REFS="${NEW_REFS:+$NEW_REFS
-}$resolved"
-    else
-        echo "export_local_packages: WARNING: $wanted is not in the local Conan cache ($("$CONAN" config home)); the image build will try the conan remotes for it." >&2
-    fi
-done
-
+# A ref that is not local is left to the remotes (that is the normal state once
+# OTB-tag lands), so it is a warning, never a failure — exit 1 is kept for real
+# errors (no conan, save failed).
+NEW_REFS="$OTB_RESOLVED"
 if [ -z "$NEW_REFS" ]; then
+    echo "export_local_packages: WARNING: $OTTERBRIX_REF is not in the local Conan cache ($("$CONAN" config home)); the image build will try the conan remotes for it." >&2
     if [ -f "$ARCHIVE" ]; then
         note "WARNING: reusing the existing $ARCHIVE ($(tr '\n' ' ' < "$STAMP" 2>/dev/null))"
     else
-        echo "export_local_packages: WARNING: no archive written; if these packages are not on a remote yet, the image build will fail resolving them." >&2
+        echo "export_local_packages: WARNING: no archive written; if the package is not on a remote yet, the image build will fail resolving it." >&2
         _build_hint
     fi
     exit 0
@@ -140,13 +120,10 @@ if ! $FORCE && [ -f "$ARCHIVE" ] && [ -f "$STAMP" ] && [ "$(cat "$STAMP")" = "$N
     exit 0
 fi
 
-note "saving recipes + sources of: $(echo "$NEW_REFS" | tr '\n' ' ')"
-"$CONAN" pkglist merge "${PRESENT_LISTS[@]}" --format=json > "$TMP/pkglist.json" \
-    || die "conan pkglist merge failed"
+note "saving recipe + sources of: $NEW_REFS"
 # Recipe-level package list (no ':*') → recipe export + export_sources + the
-# source folder; binaries are left out on purpose. No --no-source: the source
-# folder lets the image build actor-zeta without re-downloading its tarball.
-"$CONAN" cache save -l "$TMP/pkglist.json" --file "$TMP/local_recipes.tgz" >/dev/null \
+# source folder; binaries are left out on purpose.
+"$CONAN" cache save -l "$TMP/otterbrix.json" --file "$TMP/local_recipes.tgz" >/dev/null \
     || die "conan cache save failed"
 
 mkdir -p "$OUT_DIR"

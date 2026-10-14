@@ -3,10 +3,7 @@
 
 #include "connection_manager.hpp"
 
-#include "integration/prepare_probe.hpp"
-#include "otterbrix/query_generation/sql_query_generator.hpp"
-#include "otterbrix/schema/schema_utils.hpp"
-#include "otterbrix/translators/input/chunk_windows.hpp"
+#include "otterbrix/translators/error.hpp"
 #include "otterbrix/translators/input/pg_to_chunk.hpp"
 #include "utility/logger.hpp"
 #include "utility/tracy_profiler.hpp"
@@ -15,29 +12,25 @@
 #include <charconv>
 #include <optional>
 #include <string_view>
-#include <thread>
 
 using namespace db;
 
 namespace {
 
-    core::error_t make_error(std::pmr::memory_resource* resource, core::error_code_t code, const std::string& what) {
-        return core::error_t(code, std::pmr::string{what.c_str(), resource});
-    }
+    // pg_type.oid of bytea.
+    constexpr Oid bytea_oid = 17;
 
-    // result_wrapper_t only exposes its error by const reference; rebuild it on
-    // this actor's resource instead of copying it onto the default one.
-    core::error_t copy_error(std::pmr::memory_resource* resource, const core::error_t& err) {
-        return core::error_t(err.type, std::pmr::string{err.what.c_str(), resource});
-    }
+    using tsl::make_error;
 
 } // namespace
 
-PostgressManager::PostgressManager(std::pmr::memory_resource* res, pg::ConnectorManager* connector_manager)
+PostgressManager::PostgressManager(std::pmr::memory_resource* res,
+                                   pg::ConnectorManager* connector_manager,
+                                   statement_executor_t::pool_t* statements)
     : resource_(res)
     , connector_manager_(connector_manager)
     , log_(get_logger(logger_tag::PG_CONNECTION_MANAGER))
-    , enums_(res) {
+    , statements_(statements) {
     assert(log_.is_valid());
     assert(res != nullptr);
     assert(connector_manager_ != nullptr);
@@ -46,64 +39,18 @@ PostgressManager::PostgressManager(std::pmr::memory_resource* res, pg::Connector
     connector_manager_->start();
 }
 
-std::pair<bool, actor_zeta::detail::enqueue_result>
-PostgressManager::enqueue_impl(actor_zeta::mailbox::message_ptr msg) {
-    OTX_ZONE_N("PostgressManager::enqueue_impl");
-    std::lock_guard guard(mutex_);
-    current_behavior_ = behavior(msg.get());
+// The connector manager first refuses new statements and aborts the running ones
+// (shutdown), so statements_ (the last data member), which waits for the
+// statements still queued, waits a bounded time.
+PostgressManager::~PostgressManager() { connector_manager_->shutdown(); }
 
-    while (current_behavior_.is_busy()) {
-        if (current_behavior_.is_awaited_ready()) {
-            auto cont = current_behavior_.take_awaited_continuation();
-            if (cont) {
-                cont.resume();
-            }
-        } else {
-            std::this_thread::yield();
-        }
+std::optional<tsl::pg_enum_oid_map> PostgressManager::enums_of(const std::string& uid) const {
+    std::shared_lock guard(enums_mutex_);
+    auto it = enums_.find(uid);
+    if (it == enums_.end()) {
+        return std::nullopt;
     }
-
-    return {false, actor_zeta::detail::enqueue_result::success};
-}
-
-actor_zeta::behavior_t PostgressManager::behavior(actor_zeta::mailbox::message* msg) {
-    OTX_ZONE_N("PostgressManager::behavior");
-    auto cmd = msg->command();
-    if (cmd == actor_zeta::msg_id<PostgressManager, &PostgressManager::execute>) {
-        co_await actor_zeta::dispatch(this, &PostgressManager::execute, msg);
-    } else if (cmd == actor_zeta::msg_id<PostgressManager, &PostgressManager::discover>) {
-        co_await actor_zeta::dispatch(this, &PostgressManager::discover, msg);
-    } else if (cmd == actor_zeta::msg_id<PostgressManager, &PostgressManager::describe>) {
-        co_await actor_zeta::dispatch(this, &PostgressManager::describe, msg);
-    }
-}
-
-// What the slot holds decides the text: a raw-SQL subquery stub is its text with
-// the qualifiers rewritten for PostgreSQL, the catalog's aggregate stub and a
-// plan node are generated. execute runs this statement and describe probes its
-// header, so both see one text.
-core::result_wrapper_t<std::string>
-PostgressManager::generate_slot_statement(const components::logical_plan::node_ptr& node,
-                                          const otterstax::names::resolved_target_t& target,
-                                          const std::pmr::vector<external_entry_t>& batch,
-                                          const components::logical_plan::storage_parameters* parameters) {
-    OTX_ZONE_N("PostgressManager::generate_slot_statement");
-    if (node->type() == logical_plan::node_type::unused) {
-        auto& stub = static_cast<schema_utils::schema_node_t&>(*node);
-        if (stub.has_raw_sql()) {
-            return sql_gen::replace_qualifiers(stub.raw_sql(),
-                                               stub.qualifiers(),
-                                               backend_type_t::PostgreSQL,
-                                               resource());
-        }
-        return sql_gen::generate_query(stub.agg_node(),
-                                       parameters,
-                                       backend_type_t::PostgreSQL,
-                                       target,
-                                       batch,
-                                       resource());
-    }
-    return sql_gen::generate_query(node, parameters, backend_type_t::PostgreSQL, target, batch, resource());
+    return it->second;
 }
 
 core::result_wrapper_t<tsl::pg_enum_oid_map> PostgressManager::fetch_enum_types(const std::string& uuid) {
@@ -116,7 +63,7 @@ core::result_wrapper_t<tsl::pg_enum_oid_map> PostgressManager::fetch_enum_types(
         "ORDER BY t.oid, e.enumsortorder;";
 
     // Filled on the io thread, read here after get(): the handler only sees
-    // this frame, never the actor's cache.
+    // this frame, never the backend's cache.
     tsl::pg_enum_oid_map map;
     auto handler = [this, &map](PGresult* result) -> otterstax::asio_error_t {
         if (result == nullptr) {
@@ -157,18 +104,51 @@ core::result_wrapper_t<tsl::pg_enum_oid_map> PostgressManager::fetch_enum_types(
     return std::move(map);
 }
 
+core::result_wrapper_t<std::unordered_map<std::string, std::vector<std::string>>>
+PostgressManager::fetch_primary_keys(const std::string& uuid, const std::string& schema, const std::string& table) {
+    OTX_ZONE_N("PostgressManager::fetch_primary_keys");
+    const auto query = otterstax::catalog::make_primary_keys_query(resource(), schema, table);
+    // Filled on the io thread, read here after get().
+    std::unordered_map<std::string, std::vector<std::string>> keys;
+    auto handler = [this, &keys](PGresult* result) -> otterstax::asio_error_t {
+        if (result == nullptr) {
+            return make_error(resource(), core::error_code_t::io_error, "the primary key query produced no result");
+        }
+        const int rows = PQntuples(result);
+        if (rows != 0 && PQnfields(result) != 2) {
+            return make_error(resource(),
+                              core::error_code_t::schema_error,
+                              "the primary key query answered " + std::to_string(PQnfields(result)) +
+                                  " columns instead of (relname, attname)");
+        }
+        for (int i = 0; i < rows; ++i) {
+            // pg_class.relname and pg_attribute.attname are NOT NULL.
+            assert(!PQgetisnull(result, i, 0) && !PQgetisnull(result, i, 1));
+            keys[PQgetvalue(result, i, 0)].emplace_back(PQgetvalue(result, i, 1));
+        }
+        return otterstax::asio_error_t{};
+    };
+    if (auto err = connector_manager_->executeQuery(uuid, query, handler).get(); err.contains_error()) {
+        log_->error("fetch_primary_keys: query failed for uuid={}: {}", uuid, err.what.c_str());
+        return std::move(err);
+    }
+    return std::move(keys);
+}
+
 // Every connector future is consumed at the top level of this body (one query
 // in flight per connection at a time); the result handlers only collect and
 // never issue queries themselves. The handlers capture frame locals by
 // reference: they run on the io thread while this thread waits in get(), and
 // the future's hand-off orders the handler's writes before the reads below.
-actor_zeta::unique_future<core::result_wrapper_t<catalog_ext::discovered_tables_t>>
-PostgressManager::discover(qualified_name_t scope) {
+core::result_wrapper_t<otterstax::federation::discovered_tables_t> PostgressManager::discover(const qualified_name_t& scope) {
     OTX_ZONE_N("PostgressManager::discover");
+    // One discovery at a time: each publishes the metadata it read (the cache below) only after its
+    // queries, so two running at once could leave the older reading in place of the newer one.
+    std::lock_guard guard(mutex_);
     const std::string& uuid = scope.unique_identifier.t;
     if (scope.schema.t.empty()) {
         log_->error("discover: no PostgreSQL schema configured for uuid {}", uuid);
-        co_return make_error(resource(),
+        return make_error(resource(),
                              core::error_code_t::missing_field,
                              "Cannot discover PostgreSQL schema: no schema configured for uuid: " + uuid);
     }
@@ -177,23 +157,60 @@ PostgressManager::discover(qualified_name_t scope) {
     // once the query succeeded; the probes below decode enum columns with it.
     auto enums = fetch_enum_types(uuid);
     if (enums.has_error()) {
-        co_return copy_error(resource(), enums.error());
+        return core::error_on(resource(), enums.error());
     }
     const tsl::pg_enum_oid_map pg_enum_oids = std::move(enums.value());
-    enums_.insert_or_assign(std::pmr::string{uuid.c_str(), resource()}, pg_enum_oids);
+    {
+        std::unique_lock enums_guard(enums_mutex_);
+        enums_.insert_or_assign(uuid, pg_enum_oids);
+    }
 
-    catalog_ext::discovered_tables_t out(resource());
-    auto probe = [this, &out, &uuid, &pg_enum_oids](const qualified_name_t& table) -> core::error_t {
-        auto schema_handler = [this, table, pg_enum_oids, &out](PGresult* schema_result) -> otterstax::asio_error_t {
+    // The primary keys of the scope, one query: a row the engine picked is
+    // changed on the backend by its key.
+    auto fetched_keys = fetch_primary_keys(uuid, scope.schema.t, scope.collection.t);
+    if (fetched_keys.has_error()) {
+        return core::error_on(resource(), fetched_keys.error());
+    }
+    const auto primary_keys = std::move(fetched_keys.value());
+
+    otterstax::federation::discovered_tables_t out(resource());
+    auto probe = [this, &out, &uuid, &pg_enum_oids, &primary_keys](const qualified_name_t& table) -> core::error_t {
+        const auto key = primary_keys.find(table.collection.t);
+        auto schema_handler = [this,
+                               table,
+                               pg_enum_oids,
+                               primary_key = key == primary_keys.end() ? std::vector<std::string>{} : key->second,
+                               &out](PGresult* schema_result) -> otterstax::asio_error_t {
             auto schema_struct = tsl::pg_to_struct(resource(), schema_result, pg_enum_oids);
-            out.push_back(catalog_ext::discovered_table_t{table, std::move(schema_struct)});
+            // A key with a bytea column names no row the federation can write back
+            // (the engine holds its raw bytes as a STRING_LITERAL, which no character
+            // literal names; a NUL byte ends the query text), and goes whole: the table
+            // then has no key. pg_to_chunk reads bytea by its type oid.
+            std::vector<std::string> binary_columns;
+            for (int column = 0; column < PQnfields(schema_result); ++column) {
+                if (PQftype(schema_result, column) == bytea_oid) {
+                    binary_columns.emplace_back(PQfname(schema_result, column));
+                }
+            }
+            auto usable_key = primary_key;
+            const bool inexact_key =
+                std::any_of(usable_key.begin(), usable_key.end(), [&binary_columns](const std::string& column) {
+                    return std::find(binary_columns.begin(), binary_columns.end(), column) != binary_columns.end();
+                });
+            if (inexact_key) {
+                usable_key.clear();
+                log_->info("discover: {}.{} has a bytea primary key column: its rows are not changed one by one",
+                           table.schema.t,
+                           table.collection.t);
+            }
+            out.push_back(otterstax::federation::discovered_table_t{table, std::move(schema_struct), std::move(usable_key)});
             log_->info("discover: schema discovered for: {}.{}", table.schema.t, table.collection.t);
             return otterstax::asio_error_t{};
         };
         auto probe_query =
             otterstax::catalog::make_schema_probe_query(resource(), table, backend_type_t::PostgreSQL);
         if (probe_query.has_error()) {
-            return copy_error(resource(), probe_query.error());
+            return core::error_on(resource(), probe_query.error());
         }
         log_->debug("discover: generated PostgreSQL probe: \"{}\"", probe_query.value());
         return connector_manager_->executeQuery(uuid, probe_query.value(), schema_handler).get();
@@ -201,9 +218,9 @@ PostgressManager::discover(qualified_name_t scope) {
 
     if (!scope.collection.t.empty()) {
         if (auto err = probe(scope); err.contains_error()) {
-            co_return std::move(err);
+            return std::move(err);
         }
-        co_return std::move(out);
+        return std::move(out);
     }
 
     // Whole-schema discovery via information_schema.
@@ -221,7 +238,7 @@ PostgressManager::discover(qualified_name_t scope) {
     };
     if (auto err = connector_manager_->executeQuery(uuid, list_tables_query, list_handler).get();
         err.contains_error()) {
-        co_return std::move(err);
+        return std::move(err);
     }
     log_->info("discover: found {} tables in schema {}", table_names.size(), scope.schema.t);
 
@@ -239,294 +256,106 @@ PostgressManager::discover(qualified_name_t scope) {
         }
     }
     if (!failed_tables.empty()) {
-        co_return otterstax::catalog::make_discovery_error(resource(), failed_tables);
+        return otterstax::catalog::make_discovery_error(resource(), failed_tables);
     }
-    co_return std::move(out);
+    return std::move(out);
 }
 
-actor_zeta::unique_future<core::result_wrapper_t<ParsedQueryDataPtr>>
-PostgressManager::execute(session_hash_t id, ParsedQueryDataPtr data) {
-    OTX_ZONE_N("PostgressManager::execute");
-    assert(data);
-    assert(data->otterbrix_params);
-    log_->debug("execute started, id hash: {}", id);
-
-    const auto* parameters = &data->otterbrix_params->params_node->parameters();
-
-    log_->debug("execute Total execute queries: {}", data->otterbrix_params->external_nodes_count);
-    log_->debug("execute Execute batches: {}", data->otterbrix_params->external_nodes.size());
-    size_t counter = 0;
-    auto& batches = data->otterbrix_params->external_nodes;
-    // Batches are processed back to front (innermost dependencies first).
-    for (size_t batch = batches.size(); batch-- > 0;) {
-        OTX_ZONE_N("PostgressManager::batch");
-        auto& batch_nodes = batches[batch];
-        log_->debug("execute Current batch size: {}", batch_nodes.size());
-        std::pmr::vector<std::string> generated_queries(resource());
-        generated_queries.reserve(batch_nodes.size());
-        // A converter that cannot produce a chunk records why in its slot; the
-        // slots are reserved up front so the io-thread handlers keep stable
-        // pointers, and they are read only after the waiter drained every
-        // future. Declared before the waiter, so they are destroyed after its
-        // drain: a co_return that leaves queries in flight — the first failure
-        // wait() reports, or an error while the batch is still being dispatched —
-        // still has converters writing here.
-        std::pmr::vector<std::optional<core::error_t>> conversion_errors(resource());
-        conversion_errors.reserve(batch_nodes.size());
-        // unique_ptr because data_chunk_t has no default constructor.
-        otterstax::QueryHandleWaiter<std::unique_ptr<components::vector::data_chunk_t>> wait_guard{resource()};
-        // Order inside a batch does not matter. For a mixed backend, nodes that
-        // belong to another backend are skipped, so the slots this manager filled
-        // are tracked by index.
-        std::pmr::vector<size_t> processed_indices(resource());
-        for (size_t i = 0; i < batch_nodes.size(); i++) {
-            OTX_ZONE_N("PostgressManager::node_dispatch");
-            log_->trace("Execute query: {}", ++counter);
-
-            auto& node = *batch_nodes[i].node;
-            const auto& target = batch_nodes[i].target;
-            const auto& uid = target.name.unique_identifier.t;
-            log_->trace("UID: {}", uid);
-
-            // A data_t slot was already fetched by another backend's manager.
-            if (node->type() == logical_plan::node_type::data_t) {
-                log_->debug("execute: Skipping already processed node with UID: {}", uid);
-                continue;
-            }
-
-            if (data->backend_type == backend_type_t::Mixed) {
-                auto it_backend = data->node_backend_types.find(uid);
-                if (it_backend != data->node_backend_types.end() &&
-                    it_backend->second != backend_type_t::PostgreSQL) {
-                    log_->debug("execute: Skipping non-PostgreSQL node with UID: {}", uid);
-                    continue;
-                }
-            }
-
-            // A node attributed to this backend with no live connection must fail
-            // THIS query: silently skipping leaves the node symbolic, and the engine
-            // later dies with a misleading "database does not exist" (mid-flight
-            // deregistration race). Nothing downstream can handle the node either.
-            if (!connector_manager_->hasConnection(uid)) {
-                log_->error("execute: no PostgreSQL connection registered for UID: {}", uid);
-                co_return core::error_t(
-                    core::error_code_t::do_not_exists,
-                    std::pmr::string{("no PostgreSQL connection registered for '" + uid + "'").c_str(), resource()});
-            }
-
-            processed_indices.push_back(i);
-
-            auto statement = generate_slot_statement(node, target, batch_nodes, parameters);
-            if (statement.has_error()) {
-                log_->error("execute: SQL generation failed: {}", statement.error().what.c_str());
-                co_return statement.convert_error<ParsedQueryDataPtr>();
-            }
-            generated_queries.emplace_back(std::move(statement.value()));
-            log_->debug("execute Generated PostgreSQL Query: \"{}\"", generated_queries.back());
-            // Discovery always leaves an entry for the uid it probed, so a
-            // missing one means this uid never went through registration and
-            // its enum columns could not be decoded.
-            auto enum_it = enums_.find(std::pmr::string{uid.c_str(), resource()});
-            if (enum_it == enums_.end()) {
-                log_->error("execute: no ENUM metadata discovered for PostgreSQL connection '{}'", uid);
-                co_return core::error_t(
-                    core::error_code_t::do_not_exists,
-                    std::pmr::string{("no ENUM metadata discovered for PostgreSQL connection '" + uid + "'").c_str(),
-                                     resource()});
-            }
-            // Copied into the handler: the io thread must not read actor state.
-            auto enum_oids = enum_it->second;
-            conversion_errors.emplace_back();
-            auto* conversion_error = &conversion_errors.back();
-            auto data_converter =
-                [this, enum_oids, conversion_error](PGresult* result) -> std::unique_ptr<data_chunk_t> {
-                auto converted = tsl::pg_to_chunk(this->resource(), result, enum_oids);
-                if (converted.has_error()) {
-                    conversion_error->emplace(converted.error().type,
-                                              std::pmr::string{converted.error().what.c_str(), this->resource()});
-                    return nullptr;
-                }
-                return std::make_unique<data_chunk_t>(std::move(converted.value()));
-            };
-            wait_guard.futures.push_back(
-                connector_manager_->executeQuery(uid, generated_queries.back(), data_converter));
-        }
-
-        if (processed_indices.empty()) {
-            log_->debug("execute: No PostgreSQL nodes in this batch");
-            continue;
-        }
-
-        // wait() returns the first failure as a value; `results` then holds only
-        // the successes before it, so returning here keeps the positional
-        // results[j] loop below in bounds.
-        if (auto barrier = wait_guard.wait(); barrier.has_error()) {
-            log_->error("execute: backend query failed: {}", barrier.error().what.c_str());
-            co_return barrier.convert_error<ParsedQueryDataPtr>();
-        }
-        log_->debug("execute Run Query Success! results count: {}", wait_guard.results.size());
-        assert(generated_queries.size() == processed_indices.size());
-        for (size_t j = 0; j < processed_indices.size(); j++) {
-            OTX_ZONE_N("PostgressManager::to_chunk");
-            const size_t i = processed_indices[j];
-            auto& chunk_ptr = wait_guard.results[j];
-            // The converter always allocates a chunk; a connector that resolved
-            // the query without one has broken that contract, and a plan slot
-            // cannot be filled from nothing.
-            if (!chunk_ptr) {
-                const auto& uid = batch_nodes[i].target.name.unique_identifier.t;
-                if (conversion_errors[j].has_value()) {
-                    log_->error("execute result[{}]: backend '{}' result conversion failed: {}",
-                                j,
-                                uid,
-                                conversion_errors[j]->what.c_str());
-                    co_return std::move(*conversion_errors[j]);
-                }
-                log_->error("execute result[{}]: backend '{}' returned no result chunk", j, uid);
-                co_return core::error_t(
-                    core::error_code_t::other_error,
-                    std::pmr::string{("PostgreSQL backend '" + uid + "' returned no result chunk").c_str(),
-                                     resource()});
-            }
-            log_->debug("execute result[{}]: chunk size={}", j, chunk_ptr->size());
-            auto tmp = std::move(*chunk_ptr);
-            // The slot being replaced is still typed: if it IS the statement's
-            // own DML node, the whole statement ran on the backend and `tmp`'s
-            // cardinality is its affected-row count. Record it now — one line
-            // below it becomes a data_t, and from then on a fully-remote DML
-            // and a fully-remote SELECT are indistinguishable.
-            capture_remote_dml_count(*data->otterbrix_params, *batch_nodes[i].node, tmp);
-            // The engine takes at most DEFAULT_VECTOR_CAPACITY rows per chunk:
-            // a wider result set goes in as a run of such chunks (a count
-            // carrier stays whole).
-            auto data_node =
-                logical_plan::make_node_raw_data(resource(), tsl::split_to_capacity(resource(), std::move(tmp)));
-            *batch_nodes[i].node = data_node;
-        }
-    }
-    log_->debug("execute finished");
-    co_return std::move(data);
+core::error_t PostgressManager::execute_ddl(const std::string& uid, const std::string& sql) {
+    OTX_ZONE_N("PostgressManager::execute_ddl");
+    log_->debug("execute_ddl on {}: \"{}\"", uid, sql);
+    auto handler = [](PGresult*) -> otterstax::asio_error_t { return otterstax::asio_error_t{}; };
+    return connector_manager_->executeQuery(uid, sql, handler).get();
 }
 
-// Like execute, this body never co_awaits: every connector future is consumed
-// with get() on this thread, so the zone spans the handler. The header handler
-// captures frame locals by reference — it runs on the io thread while this
-// thread waits in get(), and the future's hand-off orders its writes before the
-// reads below.
-actor_zeta::unique_future<core::result_wrapper_t<ParsedQueryDataPtr>>
-PostgressManager::describe(session_hash_t id, ParsedQueryDataPtr data) {
-    OTX_ZONE_N("PostgressManager::describe");
-    assert(data);
-    assert(data->otterbrix_params);
-    log_->debug("describe started, id hash: {}", id);
-
-    // An extension root (CREATE EXTERNAL TABLE, kafka DDL) is `unused` like a
-    // stub and the Worker keeps it away from the schema path; one arriving here
-    // is a routing error, and reading it as a stub would be undefined.
-    if (data->extension_kind != extension_kind_t::none) {
-        co_return make_error(resource(),
-                             core::error_code_t::invalid_parameter,
-                             "describe: an extension statement has no PostgreSQL result schema");
-    }
-    // The binder takes every parameter of a parameterized statement out of the
-    // plan — the `$n` placeholders and the literals alike — and returns them at
-    // finalize, so before Bind there is no statement to generate, hence nothing
-    // to ask the backend. The schema of such a statement is known once its
-    // parameters are bound; a type read off the plan instead would be the guess
-    // this handler exists to replace.
-    if (const size_t unbound = data->otterbrix_params->parameters_count; unbound > 0) {
-        log_->debug("describe: statement carries {} unbound parameter(s), no probe", unbound);
-        co_return make_error(resource(),
-                             core::error_code_t::unimplemented_yet,
-                             "the result schema of a PostgreSQL statement with " + std::to_string(unbound) +
-                                 " unbound parameter(s) is known only once they are bound");
-    }
-
-    const auto* parameters = &data->otterbrix_params->params_node->parameters();
-    auto& batches = data->otterbrix_params->external_nodes;
-    for (size_t batch = batches.size(); batch-- > 0;) {
-        auto& batch_nodes = batches[batch];
-        for (size_t i = 0; i < batch_nodes.size(); i++) {
-            auto& node = *batch_nodes[i].node;
-            const auto& target = batch_nodes[i].target;
-            const auto& uid = target.name.unique_identifier.t;
-
-            // Only a stub carries a schema the backend can fill: the catalog's,
-            // made of an aggregate slot, or the parser's, holding the raw SQL of
-            // a lifted-out sub-query. Any other slot (a DDL/DML target, a
-            // data_t) has none.
-            if (node->type() != logical_plan::node_type::unused) {
-                continue;
-            }
-            auto& stub = static_cast<schema_utils::schema_node_t&>(*node);
-            if (data->backend_type == backend_type_t::Mixed) {
-                auto it_backend = data->node_backend_types.find(uid);
-                if (it_backend != data->node_backend_types.end() &&
-                    it_backend->second != backend_type_t::PostgreSQL) {
-                    continue;
+actor_zeta::unique_future<core::error_t>
+PostgressManager::scan(std::pmr::memory_resource* resource,
+                       otterstax::federation::scan_request_t request,
+                       std::shared_ptr<otterstax::federation::scan_rows_t> rows) {
+    OTX_ZONE_N("PostgressManager::scan");
+    actor_zeta::promise<core::error_t> promise(resource);
+    auto future = promise.get_future();
+    statements_.post([this, request = std::move(request), rows = std::move(rows), promise = std::move(promise)]() mutable {
+        OTX_ZONE_N("PostgressManager::scan::run");
+        promise.set_value(answer_of(
+            [&]() -> core::error_t {
+                // The ENUM labels the discovery of the uid read: pg_to_chunk decodes
+                // an enum column by its type oid. A uid without them never went
+                // through discovery.
+                auto enums = enums_of(request.uid);
+                if (!enums) {
+                    return make_error(resource_,
+                                      core::error_code_t::do_not_exists,
+                                      "no PostgreSQL ENUM metadata for connection '" + request.uid +
+                                          "': it was never discovered");
                 }
-            }
-            if (!connector_manager_->hasConnection(uid)) {
-                log_->error("describe: no PostgreSQL connection registered for UID: {}", uid);
-                co_return make_error(resource(),
-                                     core::error_code_t::do_not_exists,
-                                     "no PostgreSQL connection registered for '" + uid + "'");
-            }
-            // Discovery always leaves an entry for the uid it probed, so a
-            // missing one means this uid never went through registration and its
-            // enum columns could not be decoded — the same rule execute applies.
-            auto enum_it = enums_.find(std::pmr::string{uid.c_str(), resource()});
-            if (enum_it == enums_.end()) {
-                log_->error("describe: no ENUM metadata discovered for PostgreSQL connection '{}'", uid);
-                co_return make_error(resource(),
-                                     core::error_code_t::do_not_exists,
-                                     "no ENUM metadata discovered for PostgreSQL connection '" + uid + "'");
-            }
-
-            auto statement = generate_slot_statement(node, target, batch_nodes, parameters);
-            if (statement.has_error()) {
-                log_->error("describe: SQL generation failed: {}", statement.error().what.c_str());
-                co_return statement.convert_error<ParsedQueryDataPtr>();
-            }
-            // The wrap, its cost and what it cannot carry: prepare_probe.hpp.
-            const std::string probe = make_prepare_probe(statement.value(), backend_type_t::PostgreSQL);
-            log_->debug("describe: probing \"{}\"", probe);
-
-            // Copied into the handler: the io thread must not read actor state.
-            auto enum_oids = enum_it->second;
-            std::optional<components::types::complex_logical_type> header;
-            auto header_handler = [this, enum_oids, &header](PGresult* result) -> otterstax::asio_error_t {
-                if (result == nullptr) {
-                    return make_error(resource(),
-                                      core::error_code_t::io_error,
-                                      "the prepare probe produced no result");
+                std::optional<core::error_t> conversion;
+                auto handler = [this, &conversion, &enums](PGresult* result)
+                    -> std::unique_ptr<components::vector::data_chunk_t> {
+                    auto converted = tsl::pg_to_chunk(resource_, result, *enums);
+                    if (converted.has_error()) {
+                        conversion.emplace(core::error_on(resource_, converted.error()));
+                        return nullptr;
+                    }
+                    return std::make_unique<components::vector::data_chunk_t>(std::move(converted.value()));
+                };
+                log_->debug("scan on {}: \"{}\"", request.uid, request.sql);
+                auto outcome = connector_manager_->executeQuery(request.uid, request.sql, handler).get();
+                if (outcome.has_error()) {
+                    return core::error_on(resource_, outcome.error());
                 }
-                // A row-producing statement is answered with its
-                // RowDescription whether or not a row follows it; a result
-                // without fields describes nothing and is reported below.
-                if (PQnfields(result) == 0) {
-                    return otterstax::asio_error_t{};
+                if (!outcome.value()) {
+                    return conversion ? std::move(*conversion)
+                                      : make_error(resource_,
+                                                   core::error_code_t::other_error,
+                                                   "PostgreSQL backend '" + request.uid +
+                                                       "' returned no result chunk");
                 }
-                header.emplace(tsl::pg_to_struct(this->resource(), result, enum_oids));
-                return otterstax::asio_error_t{};
-            };
-            if (auto err = connector_manager_->executeQuery(uid, probe, header_handler).get(); err.contains_error()) {
-                log_->error("describe: probe failed for UID {}: {}", uid, err.what.c_str());
-                co_return std::move(err);
-            }
-            if (!header.has_value()) {
-                log_->error("describe: probe answered without columns: \"{}\"", probe);
-                co_return make_error(resource(),
-                                     core::error_code_t::schema_error,
-                                     "PostgreSQL answered the prepare probe without columns: " + probe);
-            }
-            log_->debug("describe: {} column(s) described for UID {}", header->child_types().size(), uid);
-            // Filled in place rather than rebuilt: a raw-SQL stub must keep the
-            // text and qualifiers execute generates its statement from, and the
-            // slot and the plan hold the one node either way.
-            stub.set_schema(std::move(*header));
-        }
-    }
-    log_->debug("describe finished");
-    co_return std::move(data);
+                rows->chunks.push_back(std::move(*outcome.value()));
+                return core::error_t::no_error();
+            },
+            [this, &request](std::string_view what) {
+                return make_error(resource_,
+                                  core::error_code_t::io_error,
+                                  "PostgreSQL backend '" + request.uid + "' read failed: " + std::string{what});
+            }));
+    });
+    return future;
+}
+
+actor_zeta::unique_future<otterstax::federation::write_result_t>
+PostgressManager::write(std::pmr::memory_resource* resource, otterstax::federation::write_request_t request) {
+    OTX_ZONE_N("PostgressManager::write");
+    actor_zeta::promise<otterstax::federation::write_result_t> promise(resource);
+    auto future = promise.get_future();
+    statements_.post([this, request = std::move(request), promise = std::move(promise)]() mutable {
+        OTX_ZONE_N("PostgressManager::write::run");
+        promise.set_value(answer_of(
+            [&]() -> otterstax::federation::write_result_t {
+                // The command tag's count (INSERT 0 n / UPDATE n / DELETE n).
+                auto handler = [](PGresult* result) -> int64_t {
+                    const char* tuples = result == nullptr ? nullptr : PQcmdTuples(result);
+                    if (tuples == nullptr || *tuples == '\0') {
+                        return 0;
+                    }
+                    int64_t count = 0;
+                    const std::string_view text{tuples};
+                    std::from_chars(text.data(), text.data() + text.size(), count);
+                    return count;
+                };
+                log_->debug("write on {}: \"{}\"", request.uid, request.sql);
+                auto outcome = connector_manager_->executeQuery(request.uid, request.sql, handler).get();
+                if (outcome.has_error()) {
+                    return otterstax::federation::write_result_t{core::error_on(resource_, outcome.error())};
+                }
+                return otterstax::federation::write_result_t{static_cast<std::uint64_t>(outcome.value())};
+            },
+            [this, &request](std::string_view what) {
+                return otterstax::federation::write_result_t{
+                    make_error(resource_,
+                               core::error_code_t::io_error,
+                               "PostgreSQL backend '" + request.uid + "' write failed: " + std::string{what})};
+            }));
+    });
+    return future;
 }

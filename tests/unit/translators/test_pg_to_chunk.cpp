@@ -2,12 +2,11 @@
 // Copyright 2025-2026  OtterStax
 
 // PGresult objects are manufactured without a connection: tuples through libpq's
-// public PQsetResultAttrs / PQsetvalue, command tags through the layout header
-// (see pg_result_fixture.cpp). Both pg_to_chunk overloads are exercised on every
-// shape, since the enum overload is the one the integration layer calls.
+// public PQsetResultAttrs / PQsetvalue (see pg_result_fixture.cpp). Both
+// pg_to_chunk overloads are exercised on every shape, since the enum overload is
+// the one the integration layer calls.
 
 #include "otterbrix/translators/input/pg_to_chunk.hpp"
-#include "counting_resource.hpp"
 #include "pg_result_fixture.hpp"
 
 #include <catch2/catch_all.hpp>
@@ -19,8 +18,6 @@
 #include <string_view>
 
 using namespace components::types;
-using otterstax::test::counting_resource;
-using otterstax::test::make_command_result;
 using otterstax::test::make_tuples_result;
 using otterstax::test::pg_column;
 using otterstax::test::pg_result_guard;
@@ -130,108 +127,104 @@ TEST_CASE("pg_to_chunk: tuples are converted by column type, NULL cells stay NUL
     });
 }
 
-// ── DML: the affected-row count travels in the command tag ────────────────────
+// ── NUMERIC ─────────────────────────────────────────────────────────────────
 
-TEST_CASE("pg_to_chunk: a DML command tag becomes a column-less chunk carrying the affected-row count") {
-    pg_result_guard g(make_command_result("UPDATE 7"));
-    REQUIRE(PQnfields(g.get()) == 0);
-    REQUIRE(PQntuples(g.get()) == 0);
-    auto* res = std::pmr::new_delete_resource();
+namespace {
 
-    for_both_overloads(res, g.get(), [](auto& converted) {
-        REQUIRE_FALSE(converted.has_error());
-        REQUIRE(converted.value().column_count() == 0);
-        REQUIRE(converted.value().size() == 7);
-    });
-}
+    constexpr Oid NUMERICOID = 1700;
 
-TEST_CASE("pg_to_chunk: an INSERT tag carries the count after the oid") {
-    pg_result_guard g(make_command_result("INSERT 0 12"));
-    auto* res = std::pmr::new_delete_resource();
+    // NUMERIC(p, s)'s type modifier, as PostgreSQL sends it in the row description.
+    constexpr int numeric_typmod(int precision, int scale) { return ((precision << 16) | (scale & 0x7ff)) + 4; }
 
-    for_both_overloads(res, g.get(), [](auto& converted) {
-        REQUIRE_FALSE(converted.has_error());
-        REQUIRE(converted.value().column_count() == 0);
-        REQUIRE(converted.value().size() == 12);
-    });
-}
-
-TEST_CASE("pg_to_chunk: a statement that counts nothing reports zero affected rows") {
-    pg_result_guard g(make_command_result("CREATE TABLE"));
-    auto* res = std::pmr::new_delete_resource();
-
-    for_both_overloads(res, g.get(), [](auto& converted) {
-        REQUIRE_FALSE(converted.has_error());
-        REQUIRE(converted.value().column_count() == 0);
-        REQUIRE(converted.value().size() == 0);
-    });
-}
-
-// A DML routinely touches more rows than DEFAULT_VECTOR_CAPACITY (1024). The
-// carrier has no columns, so nothing per row may be allocated for it.
-TEST_CASE("pg_to_chunk: a DML affecting more than 1024 rows keeps the count without per-row allocation") {
-    constexpr std::uint64_t affected = 5000;
-    pg_result_guard g(make_command_result("DELETE 5000"));
-
-    SECTION("overload without enum map") {
-        counting_resource res{std::pmr::new_delete_resource()};
-        auto converted = tsl::pg_to_chunk(&res, g.get());
-        REQUIRE_FALSE(converted.has_error());
-        REQUIRE(converted.value().column_count() == 0);
-        REQUIRE(converted.value().size() == affected);
-        INFO("bytes allocated for the carrier: " << res.allocated_bytes());
-        REQUIRE(res.allocated_bytes() < affected);
+    components::types::int128_t unscaled_of(const logical_value_t& value) {
+        switch (value.type().to_physical_type()) {
+            case physical_type::INT16:
+                return value.value<int16_t>();
+            case physical_type::INT32:
+                return value.value<int32_t>();
+            case physical_type::INT64:
+                return value.value<int64_t>();
+            default:
+                return value.value<components::types::int128_t>();
+        }
     }
-    SECTION("overload with enum map") {
-        counting_resource res{std::pmr::new_delete_resource()};
-        tsl::pg_enum_oid_map empty_map;
-        auto converted = tsl::pg_to_chunk(&res, g.get(), empty_map);
+
+} // namespace
+
+// NUMERIC(p, s) of at most 38 digits is the engine's DECIMAL(p, s) holding every digit PostgreSQL
+// printed — the discovery's schema and the executed chunk alike; NaN, which a constrained NUMERIC
+// takes, is the engine's DECIMAL NaN; a NULL is NULL.
+TEST_CASE("pg_to_chunk: NUMERIC of at most 38 digits is the engine's DECIMAL of its precision and scale") {
+    auto* res = std::pmr::new_delete_resource();
+    pg_result_guard g(make_tuples_result({{"price", NUMERICOID, numeric_typmod(12, 2)},
+                                          {"wide", NUMERICOID, numeric_typmod(38, 10)},
+                                          {"whole", NUMERICOID, numeric_typmod(5, 0)}},
+                                         {{"1234.50", "1234567890123456789012345678.0123456789", "-42"},
+                                          {"-0.05", "-0.0000000001", "0"},
+                                          {"NaN", nullptr, "99999"}}));
+    const auto schema = tsl::pg_to_struct(res, g.get());
+    for_both_overloads(res, g.get(), [&](core::result_wrapper_t<components::vector::data_chunk_t>& converted) {
         REQUIRE_FALSE(converted.has_error());
-        REQUIRE(converted.value().column_count() == 0);
-        REQUIRE(converted.value().size() == affected);
-        INFO("bytes allocated for the carrier: " << res.allocated_bytes());
-        REQUIRE(res.allocated_bytes() < affected);
-    }
-}
-
-// A counting tag whose number is unreadable is a protocol violation; reading it
-// as 0 would report "0 rows affected" for a statement that did change rows.
-TEST_CASE("pg_to_chunk: a counting tag with a non-numeric count is an error, not zero") {
-    pg_result_guard g(make_command_result("UPDATE abc"));
-    auto* res = std::pmr::new_delete_resource();
-
-    for_both_overloads(res, g.get(), [](auto& converted) {
-        REQUIRE(converted.has_error());
-        REQUIRE(converted.error().type == core::error_code_t::conversion_failure);
-        REQUIRE(std::string_view{converted.error().what.c_str()}.find("UPDATE abc") != std::string_view::npos);
+        const auto& chunk = converted.value();
+        const auto types = chunk.types();
+        REQUIRE(types.size() == 3);
+        const std::vector<std::pair<int, int>> specs{{12, 2}, {38, 10}, {5, 0}};
+        for (size_t col = 0; col < 3; ++col) {
+            REQUIRE(types[col].type() == logical_type::DECIMAL);
+            const auto* spec = types[col].extension_as<decimal_logical_type_extension>();
+            REQUIRE(spec->width() == specs[col].first);
+            REQUIRE(spec->scale() == specs[col].second);
+            REQUIRE(schema.child_types()[col] == types[col]);
+        }
+        REQUIRE(unscaled_of(chunk.value(0, 0)) == 123450);
+        REQUIRE(unscaled_of(chunk.value(0, 1)) == -5);
+        const auto* price = types[0].extension_as<decimal_logical_type_extension>();
+        REQUIRE(unscaled_of(chunk.value(0, 2)) == decimal_special::not_a_number(price->stored_as()));
+        components::types::int128_t wide = 0;
+        for (char digit : std::string_view{"12345678901234567890123456780123456789"}) {
+            wide = wide * 10 + (digit - '0');
+        }
+        REQUIRE(unscaled_of(chunk.value(1, 0)) == wide);
+        REQUIRE(unscaled_of(chunk.value(1, 1)) == -1);
+        REQUIRE(chunk.value(1, 2).is_null());
+        REQUIRE(unscaled_of(chunk.value(2, 0)) == -42);
+        REQUIRE(unscaled_of(chunk.value(2, 2)) == 99999);
     });
 }
 
-TEST_CASE("pg_to_chunk: a counting tag with no count at all is an error, not zero") {
-    pg_result_guard g(make_command_result("DELETE "));
+// A NUMERIC no DECIMAL(p, s) holds without rounding or overflowing is its exact text: the
+// unconstrained NUMERIC (each value keeps its own scale — also what PostgreSQL answers for
+// SUM(bigint) / AVG(...)), one wider than 38 digits, one whose scale lies outside 0..p
+// (PostgreSQL 15). Never DOUBLE, which rounds every value past 15 digits.
+TEST_CASE("pg_to_chunk: a NUMERIC wider than the engine's DECIMAL is carried as its exact text") {
     auto* res = std::pmr::new_delete_resource();
-
-    for_both_overloads(res, g.get(), [](auto& converted) {
-        REQUIRE(converted.has_error());
-        REQUIRE(converted.error().type == core::error_code_t::conversion_failure);
+    pg_result_guard g(make_tuples_result({{"free", NUMERICOID},
+                                          {"wide", NUMERICOID, numeric_typmod(50, 2)},
+                                          {"negative_scale", NUMERICOID, numeric_typmod(5, -2)}},
+                                         {{"0.333333333333333333333333", "123456789012345678901234567890123456789012345678.90", "12300"},
+                                          {"7", "-1.00", "-100"}}));
+    const auto schema = tsl::pg_to_struct(res, g.get());
+    for_both_overloads(res, g.get(), [&](core::result_wrapper_t<components::vector::data_chunk_t>& converted) {
+        REQUIRE_FALSE(converted.has_error());
+        const auto& chunk = converted.value();
+        for (size_t col = 0; col < 3; ++col) {
+            REQUIRE(chunk.types()[col].type() == logical_type::STRING_LITERAL);
+            REQUIRE(schema.child_types()[col].type() == logical_type::STRING_LITERAL);
+        }
+        REQUIRE(chunk.value(0, 0).value<std::string_view>() == "0.333333333333333333333333");
+        REQUIRE(chunk.value(1, 0).value<std::string_view>() == "123456789012345678901234567890123456789012345678.90");
+        REQUIRE(chunk.value(2, 1).value<std::string_view>() == "-100");
     });
 }
 
-TEST_CASE("pg_to_chunk: a count that does not fit in 64 bits is an error, not a wrapped value") {
-    pg_result_guard g(make_command_result("INSERT 0 99999999999999999999999"));
+// A NUMERIC(p, s) value the declared DECIMAL cannot hold (a server that broke its own typmod) is a
+// conversion_failure naming the column, never a value cut down to fit.
+TEST_CASE("pg_to_chunk: a NUMERIC value past its declared precision is conversion_failure") {
     auto* res = std::pmr::new_delete_resource();
-
-    for_both_overloads(res, g.get(), [](auto& converted) {
+    pg_result_guard g(make_tuples_result({{"price", NUMERICOID, numeric_typmod(4, 2)}}, {{"123.45"}}));
+    for_both_overloads(res, g.get(), [&](core::result_wrapper_t<components::vector::data_chunk_t>& converted) {
         REQUIRE(converted.has_error());
         REQUIRE(converted.error().type == core::error_code_t::conversion_failure);
+        REQUIRE(std::string{converted.error().what.c_str()}.find("price") != std::string::npos);
     });
-}
-
-TEST_CASE("pg_to_chunk: the error message lives on the caller's resource") {
-    pg_result_guard g(make_command_result("UPDATE abc"));
-    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
-
-    auto converted = tsl::pg_to_chunk(&arena, g.get());
-    REQUIRE(converted.has_error());
-    REQUIRE(converted.error().what.get_allocator().resource() == &arena);
 }

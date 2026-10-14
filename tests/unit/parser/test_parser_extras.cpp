@@ -2,8 +2,6 @@
 // Copyright 2025-2026  OtterStax
 
 #include "otterbrix/parser/parser.hpp"
-#include "otterbrix/parser/subquery_extractor.hpp"
-#include "otterbrix/schema/schema_utils.hpp"
 
 #include <catch2/catch_all.hpp>
 
@@ -19,13 +17,6 @@ ParsedQueryDataPtr parse_or_die(GreenplumParser& p, const std::string& sql) {
     auto r = p.parse(sql);
     REQUIRE_FALSE(r.has_error());
     return std::move(r.value());
-}
-
-size_t flat_count(const ParsedQueryDataPtr& parsed) {
-    size_t n = 0;
-    for (const auto& batch : parsed->otterbrix_params->external_nodes)
-        n += batch.size();
-    return n;
 }
 
 } // namespace
@@ -139,68 +130,6 @@ TEST_CASE("parse: two placeholders → parameters_count == 2") {
     REQUIRE(parsed->otterbrix_params->parameters_count == 2);
 }
 
-// ── external_nodes_count consistency ─────────────────────────────────────────
-
-TEST_CASE("parse: external_nodes_count matches flat node count") {
-    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
-    auto* resource = &arena;
-    GreenplumParser parser(resource);
-
-    auto parsed = parse_or_die(
-        parser,
-        "SELECT o.id, p.name "
-        "FROM uid1.db1.sch1.orders o "
-        "INNER JOIN uid2.db2.sch2.products p ON o.product_id = p.id;");
-
-    REQUIRE(parsed->otterbrix_params->external_nodes_count == flat_count(parsed));
-    REQUIRE(parsed->otterbrix_params->external_nodes_count == 2);
-}
-
-// ── Same-UID batching ─────────────────────────────────────────────────────────
-// When two tables share a unique_identifier, get_external_nodes() places them
-// in separate batches so the scheduler can issue two sequential round-trips
-// to the same connection.
-
-TEST_CASE("parse: same UID in two tables → two batches, one node each") {
-    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
-    auto* resource = &arena;
-    GreenplumParser parser(resource);
-
-    auto parsed = parse_or_die(
-        parser,
-        "SELECT a.id, b.name "
-        "FROM uid1.db1.sch1.table_a a "
-        "INNER JOIN uid1.db1.sch1.table_b b ON a.id = b.id;");
-
-    // Two external nodes from the same uid → two separate batches
-    REQUIRE(parsed->otterbrix_params->external_nodes_count == 2);
-    REQUIRE(parsed->otterbrix_params->external_nodes.size() == 2);
-    REQUIRE(parsed->otterbrix_params->external_nodes[0].size() == 1);
-    REQUIRE(parsed->otterbrix_params->external_nodes[1].size() == 1);
-
-    // Both nodes must carry the same uid (each external entry carries its
-    // resolved target — nodes themselves no longer carry names)
-    REQUIRE(parsed->otterbrix_params->external_nodes[0][0].target.name.unique_identifier.t == "uid1");
-    REQUIRE(parsed->otterbrix_params->external_nodes[1][0].target.name.unique_identifier.t == "uid1");
-}
-
-TEST_CASE("parse: different UIDs in two tables → one batch, two nodes") {
-    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
-    auto* resource = &arena;
-    GreenplumParser parser(resource);
-
-    auto parsed = parse_or_die(
-        parser,
-        "SELECT a.id, b.name "
-        "FROM uid1.db1.sch1.table_a a "
-        "INNER JOIN uid2.db2.sch2.table_b b ON a.id = b.id;");
-
-    REQUIRE(parsed->otterbrix_params->external_nodes_count == 2);
-    // Different UIDs do not collide: both nodes fit in a single batch
-    REQUIRE(parsed->otterbrix_params->external_nodes.size() == 1);
-    REQUIRE(parsed->otterbrix_params->external_nodes[0].size() == 2);
-}
-
 // ── Statefulness: parser instance reuse ──────────────────────────────────────
 
 TEST_CASE("parse: same parser handles multiple successive calls correctly") {
@@ -211,8 +140,8 @@ TEST_CASE("parse: same parser handles multiple successive calls correctly") {
     auto r1 = parse_or_die(parser, "SELECT id FROM orders;");
     auto r2 = parse_or_die(parser, "SELECT name FROM products WHERE id = 1;");
 
-    REQUIRE(r1->otterbrix_params->external_nodes_count == 0);
-    REQUIRE(r2->otterbrix_params->external_nodes_count == 0);
+    REQUIRE(r1->sql == "SELECT id FROM orders;");
+    REQUIRE(r2->sql == "SELECT name FROM products WHERE id = 1;");
     REQUIRE(r1->tag == NodeTag::T_SelectStmt);
     REQUIRE(r2->tag == NodeTag::T_SelectStmt);
 }

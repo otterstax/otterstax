@@ -2,7 +2,7 @@
 // Copyright 2025-2026  OtterStax
 //
 // The FlightSQL contract between GetFlightInfo and DoGet, driven through the
-// real Scheduler→Worker→engine stack the way the frontend drives it:
+// real query session → engine stack the way the frontend drives it:
 // GetFlightInfo hands out the schema prepare_schema resolved from the plan,
 // and DoGet builds the record batches over that same schema. Nothing is
 // re-derived from the result chunks, so the two RPCs can never disagree — a
@@ -12,7 +12,7 @@
 // such. The batches go through the project's own chunk_to_record_batch
 // — the same converter the file paths use.
 
-#include "scheduler_stack.hpp"
+#include "session_stack.hpp"
 
 #include "otterbrix/translators/output/chunk_to_arrow.hpp"
 
@@ -26,24 +26,24 @@
 #include <string_view>
 #include <vector>
 
-using otterstax::test::execute_scheduler_statement;
-using otterstax::test::prepare_scheduler_sql;
-using otterstax::test::run_scheduler_sql;
-using otterstax::test::scheduler_stack;
-using otterstax::test::with_scheduler_stack;
+using otterstax::test::execute_session_statement;
+using otterstax::test::prepare_session_sql;
+using otterstax::test::run_session_sql;
+using otterstax::test::session_stack;
+using otterstax::test::with_session_stack;
 
 namespace {
 
-    void run_or_fail(const scheduler_stack& s, session_hash_t id, const std::string& sql) {
+    void run_or_fail(const session_stack& s, session_hash_t id, const std::string& sql) {
         std::string err;
-        const bool ok = run_scheduler_sql(s, id, sql, err);
+        const bool ok = run_session_sql(s, id, sql, err);
         INFO(sql << ": " << err);
         REQUIRE(ok);
     }
 
     // Two INT tables sharing the key name, so a `SELECT *` JOIN result carries
     // `id` twice.
-    void seed_join_tables(const scheduler_stack& s, session_hash_t& id) {
+    void seed_join_tables(const session_stack& s, session_hash_t& id) {
         run_or_fail(s, id++, "CREATE DATABASE fdb;");
         run_or_fail(s, id++, "CREATE TABLE fdb.a (id INT, x INT);");
         run_or_fail(s, id++, "CREATE TABLE fdb.b (id INT, y INT);");
@@ -62,7 +62,7 @@ namespace {
     }
 
     std::vector<std::shared_ptr<arrow::RecordBatch>>
-    to_batches(const scheduler_stack& s, const session_payload& payload,
+    to_batches(const session_stack& s, const session_payload& payload,
                const std::shared_ptr<arrow::Schema>& schema) {
         std::vector<std::shared_ptr<arrow::RecordBatch>> batches;
         for (const auto& chunk : payload.chunks) {
@@ -84,14 +84,14 @@ namespace {
 } // namespace
 
 TEST_CASE("FlightSQL contract: a local JOIN streams both key columns under the prepared schema") {
-    with_scheduler_stack("/tmp/test_flightsql_contract_join", [](scheduler_stack s) {
+    with_session_stack("/tmp/test_flightsql_contract_join", [](session_stack s) {
         session_hash_t id = 9500;
         seed_join_tables(s, id);
         const session_hash_t stmt = id++;
 
         // GetFlightInfo: the schema is the one the engine's plan validation
         // stamps at prepare — duplicate names included.
-        auto prepared = prepare_scheduler_sql(s, stmt, "SELECT * FROM fdb.a JOIN fdb.b ON a.id = b.id;");
+        auto prepared = prepare_session_sql(s, stmt, "SELECT * FROM fdb.a JOIN fdb.b ON a.id = b.id;");
         INFO("prepare error: " << prepared.error().what.c_str());
         REQUIRE_FALSE(prepared.has_error());
         REQUIRE(prepared.value().tag == T_SelectStmt);
@@ -110,7 +110,7 @@ TEST_CASE("FlightSQL contract: a local JOIN streams both key columns under the p
         // DoGet: the rows come back with the prepared schema, and the batches
         // are built over that schema — never over one re-derived from the
         // chunks.
-        auto executed = execute_scheduler_statement(s, stmt);
+        auto executed = execute_session_statement(s, stmt);
         INFO("execute error: " << executed.error().what.c_str());
         REQUIRE_FALSE(executed.has_error());
         REQUIRE(executed.value().size() == 2);
@@ -158,14 +158,14 @@ TEST_CASE("FlightSQL contract: a local JOIN streams both key columns under the p
 }
 
 TEST_CASE("FlightSQL contract: a column without an Arrow mapping is refused where the schema is produced") {
-    with_scheduler_stack("/tmp/test_flightsql_contract_unmappable", [](scheduler_stack s) {
+    with_session_stack("/tmp/test_flightsql_contract_unmappable", [](session_stack s) {
         session_hash_t id = 9600;
         run_or_fail(s, id++, "CREATE DATABASE fdb;");
 
         SECTION("a UHUGEINT column names the column in the error") {
             run_or_fail(s, id++, "CREATE TABLE fdb.uhuge (id INT, big uhugeint);");
 
-            auto prepared = prepare_scheduler_sql(s, id++, "SELECT big FROM fdb.uhuge;");
+            auto prepared = prepare_session_sql(s, id++, "SELECT big FROM fdb.uhuge;");
             INFO("prepare error: " << prepared.error().what.c_str());
             REQUIRE_FALSE(prepared.has_error());
             const auto& schema = prepared.value().schema;
@@ -187,7 +187,7 @@ TEST_CASE("FlightSQL contract: a column without an Arrow mapping is refused wher
             run_or_fail(s, id++, "CREATE TABLE fdb.uhuge (id INT, big uhugeint);");
             const session_hash_t stmt = id++;
 
-            auto prepared = prepare_scheduler_sql(s, stmt, "SELECT id FROM fdb.uhuge;");
+            auto prepared = prepare_session_sql(s, stmt, "SELECT id FROM fdb.uhuge;");
             INFO("prepare error: " << prepared.error().what.c_str());
             REQUIRE_FALSE(prepared.has_error());
             auto flight_schema = to_arrow_schema(s.resource, prepared.value().schema);
@@ -196,7 +196,7 @@ TEST_CASE("FlightSQL contract: a column without an Arrow mapping is refused wher
             REQUIRE(flight_schema.value()->num_fields() == 1);
             REQUIRE(flight_schema.value()->field(0)->type()->id() == arrow::Type::INT32);
 
-            auto executed = execute_scheduler_statement(s, stmt);
+            auto executed = execute_session_statement(s, stmt);
             INFO("execute error: " << executed.error().what.c_str());
             REQUIRE_FALSE(executed.has_error());
             REQUIRE(executed.value().size() == 0);
@@ -207,13 +207,13 @@ TEST_CASE("FlightSQL contract: a column without an Arrow mapping is refused wher
 }
 
 TEST_CASE("FlightSQL contract: a HUGEINT column is carried, not refused") {
-    with_scheduler_stack("/tmp/test_flightsql_contract_hugeint", [](scheduler_stack s) {
+    with_session_stack("/tmp/test_flightsql_contract_hugeint", [](session_stack s) {
         session_hash_t id = 9650;
         run_or_fail(s, id++, "CREATE DATABASE hdb;");
         run_or_fail(s, id++, "CREATE TABLE hdb.huge (id INT, big hugeint);");
 
         const session_hash_t stmt = id++;
-        auto prepared = prepare_scheduler_sql(s, stmt, "SELECT big FROM hdb.huge;");
+        auto prepared = prepare_session_sql(s, stmt, "SELECT big FROM hdb.huge;");
         INFO("prepare error: " << prepared.error().what.c_str());
         REQUIRE_FALSE(prepared.has_error());
         const auto& schema = prepared.value().schema;
@@ -239,7 +239,7 @@ TEST_CASE("FlightSQL contract: a HUGEINT column is carried, not refused") {
         REQUIRE(decimal->precision() == 38);
         REQUIRE(decimal->scale() == 0);
 
-        auto executed = execute_scheduler_statement(s, stmt);
+        auto executed = execute_session_statement(s, stmt);
         INFO("execute error: " << executed.error().what.c_str());
         REQUIRE_FALSE(executed.has_error());
         REQUIRE(to_batches(s, executed.value(), flight_schema.value()).empty());
@@ -247,13 +247,13 @@ TEST_CASE("FlightSQL contract: a HUGEINT column is carried, not refused") {
 }
 
 TEST_CASE("FlightSQL contract: a DECIMAL column is carried with its scale") {
-    with_scheduler_stack("/tmp/test_flightsql_contract_decimal", [](scheduler_stack s) {
+    with_session_stack("/tmp/test_flightsql_contract_decimal", [](session_stack s) {
         session_hash_t id = 9660;
         run_or_fail(s, id++, "CREATE DATABASE ddb;");
         run_or_fail(s, id++, "CREATE TABLE ddb.money (id INT, amount decimal(38, 10));");
 
         const session_hash_t stmt = id++;
-        auto prepared = prepare_scheduler_sql(s, stmt, "SELECT amount FROM ddb.money;");
+        auto prepared = prepare_session_sql(s, stmt, "SELECT amount FROM ddb.money;");
         INFO("prepare error: " << prepared.error().what.c_str());
         REQUIRE_FALSE(prepared.has_error());
         const auto& schema = prepared.value().schema;
@@ -279,7 +279,7 @@ TEST_CASE("FlightSQL contract: a DECIMAL column is carried with its scale") {
         REQUIRE(declared->precision() == 38);
         REQUIRE(declared->scale() == 10);
 
-        auto executed = execute_scheduler_statement(s, stmt);
+        auto executed = execute_session_statement(s, stmt);
         INFO("execute error: " << executed.error().what.c_str());
         REQUIRE_FALSE(executed.has_error());
         REQUIRE(to_batches(s, executed.value(), flight_schema.value()).empty());
@@ -322,7 +322,7 @@ TEST_CASE("FlightSQL contract: the DoGet stream carries a DECIMAL value with its
 }
 
 TEST_CASE("FlightSQL contract: a parameterized SELECT is prepared from the engine's own columns") {
-    with_scheduler_stack("/tmp/test_flightsql_contract_params", [](scheduler_stack s) {
+    with_session_stack("/tmp/test_flightsql_contract_params", [](session_stack s) {
         session_hash_t id = 9700;
         run_or_fail(s, id++, "CREATE DATABASE fdb;");
         run_or_fail(s, id++, "CREATE TABLE fdb.a (id INT, x INT);");
@@ -335,7 +335,7 @@ TEST_CASE("FlightSQL contract: a parameterized SELECT is prepared from the engin
         // will arrive under. The parameterized statement belongs to the
         // prepared-statement RPCs, which bind through DoPut; the schema here
         // is what CreatePreparedStatement hands out as the dataset schema.
-        auto prepared = prepare_scheduler_sql(s, id++, "SELECT id, x FROM fdb.a WHERE id = $1;");
+        auto prepared = prepare_session_sql(s, id++, "SELECT id, x FROM fdb.a WHERE id = $1;");
         INFO("prepare error: " << prepared.error().what.c_str());
         REQUIRE_FALSE(prepared.has_error());
         REQUIRE(prepared.value().tag == T_SelectStmt);

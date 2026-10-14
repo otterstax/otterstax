@@ -2,6 +2,14 @@
 #
 # Activated in sanitizer builds via TSAN_OPTIONS=suppressions=/app/tsan.supp
 # (see Dockerfile.test).
+#
+# A dependency that synchronizes through std::atomic / its own mutexes is built
+# with -fsanitize=thread instead of being suppressed here (tsan-deps.profile):
+# otterbrix, actor-zeta, librdkafka, and gRPC with abseil, protobuf and re2 —
+# the Spark Connect server's event-engine pool frees on one thread what another
+# allocated, and uninstrumented that was 548 false races in test_system. A
+# suppression by their frames would also hide a race between otterstax code and
+# one of their threads, so none is added for them.
 
 # spdlog double-locks its periodic_worker mutex during destruction; the mutex is
 # created under initialize_all_loggers. The old called_from_lib:libotterbrix_log.so
@@ -13,11 +21,11 @@ mutex:initialize_all_loggers
 # boost::lockfree freelist tagged-pointer reuse: a designed-in speculative read
 # discarded by the ABA-protected CAS — correct but not expressible to TSAN.
 # The engine's actor inboxes and the buffer-pool eviction queue sit on
-# boost::lockfree::queue (including the Scheduler event-loop inbox_).
+# boost::lockfree::queue (the actor mailboxes).
 race:boost::lockfree
 
-# Test mocks (tests/mock/parser.hpp, mock/otterbrix.hpp, mock/*_db_connector.hpp)
-# print debug lines to std::cout. With the Scheduler→Worker pool these now run on
+# Test mocks (tests/mock/parser.hpp, mock/*_db_connector.hpp) print debug
+# lines to std::cout. With query sessions on the sessions pool these run on
 # several pool threads concurrently and race on the shared std::cout stream. This
 # is mock-only noise — production logging goes through thread-safe spdlog — and the
 # interleaved output is harmless.
@@ -43,6 +51,17 @@ race:arrow::Result
 # csv_to_chunk caller of Wait(). Hit by csv_to_chunk (test_file_ingestion /
 # "FileManager: csv dump and re-read" in test_system).
 race:arrow::FutureImpl
+# The parquet flavour of the same teardown: the task RandomAccessFile::ReadAsync
+# submits to the I/O pool (an arrow::internal::FnOnce<void()>::FnImpl over
+# std::_Bind<ContinueFuture(Future<shared_ptr<Buffer>>, ReadAsync's lambda)>,
+# arrow/io/interfaces.cc) is destroyed on an arrow I/O thread — the write is
+# operator delete in that FnImpl's destructor — while the thread that read the
+# file still polls the future's state atomically (libarrow, uninstrumented; the
+# reader's stack is not restored). Matched on that one destructor only: a frame
+# of FnOnce in general sits at the base of every task of every arrow pool, and
+# would mute any race inside one. Hit intermittently by parquet_to_chunk
+# (test_file_ingestion in test_system).
+race:arrow::internal::FnOnce<void*>::FnImpl<std::_Bind<arrow::detail::ContinueFuture*arrow::io::RandomAccessFile::ReadAsync(*)::{lambda()*>::~FnImpl
 
 # librdkafka's rk_terminate flag: rd_kafka_destroy() sets it, its background
 # thread (rd_kafka_thread_main) polls it to exit — harmless (monotonic flag,

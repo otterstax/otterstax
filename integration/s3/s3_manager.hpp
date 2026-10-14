@@ -34,7 +34,7 @@ namespace db {
         std::pmr::memory_resource* resource() const noexcept { return resource_; }
 
         // Every handler keeps the callee's error code (s3 connector / file
-        // manager) and only prefixes the message, so the Worker can report the
+        // manager) and only prefixes the message, so the query session can report the
         // real cause (do_not_exists, invalid_parameter, io_error, ...).
         actor_zeta::unique_future<core::result_wrapper_t<std::pair<bool, std::pmr::string>>>
         download(session_hash_t id, std::string alias, std::string s3_path,

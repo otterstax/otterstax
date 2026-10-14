@@ -1,11 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2025-2026  OtterStax
 
-#include "otterbrix/parser/name_resolution.hpp"
 #include "otterbrix/parser/parser.hpp"
-#include "otterbrix/parser/subquery_extractor.hpp"
 #include "otterbrix/query_generation/sql_query_generator.hpp"
-#include "otterbrix/schema/schema_utils.hpp"
 
 #include <catch2/catch_all.hpp>
 
@@ -29,6 +26,7 @@
 #include <components/types/logical_value.hpp>
 
 #include <cstdint>
+#include <limits>
 #include <memory_resource>
 #include <ostream>
 #include <string>
@@ -48,49 +46,100 @@ ParsedQueryDataPtr parse_or_die(GreenplumParser& p, const std::string& sql) {
     return std::move(r.value());
 }
 
-// One external slot: node + its parser-resolved target + owning batch index.
+// One statement the generator can be asked for: the plan node (a query block's aggregate, or the
+// DML / DDL root) and what it names — the table as written (the uid slot kept), and the second
+// table of an INSERT ... SELECT / UPDATE ... FROM / DELETE ... USING, or the index of DROP INDEX.
 struct flat_external_t {
     components::logical_plan::node_ptr node;
-    otterstax::names::resolved_target_t target;
-    size_t batch{0};
+    sql_gen::statement_target_t target;
 };
 
-// Collect all external nodes from all batches into a flat list.
-std::vector<flat_external_t> flat_externals(const ParsedQueryDataPtr& parsed) {
-    std::vector<flat_external_t> out;
-    const auto& nodes = parsed->otterbrix_params->external_nodes;
-    for (size_t batch = 0; batch < nodes.size(); ++batch) {
-        for (size_t i = 0; i < nodes[batch].size(); ++i) {
-            // Every external slot must carry a plan-node reference.
-            REQUIRE(nodes[batch][i].node != nullptr);
-            out.push_back(flat_external_t{*nodes[batch][i].node, nodes[batch][i].target, batch});
+// The first plain-table source under `node` (an aggregate naming a relation).
+qualified_name_t source_of(const components::logical_plan::node_ptr& node) {
+    for (const auto& child : node->children()) {
+        if (child && child->type() == node_type::aggregate_t && !child->target().collection.t.empty()) {
+            return child->target();
         }
     }
+    return {};
+}
+
+void collect_slots(const components::logical_plan::node_ptr& node, std::vector<flat_external_t>& out) {
+    if (!node) {
+        return;
+    }
+    if (node->type() == node_type::aggregate_t && !node->target().collection.t.empty()) {
+        out.push_back(flat_external_t{node, sql_gen::statement_target_t{node->target()}});
+    }
+    for (const auto& child : node->children()) {
+        collect_slots(child, out);
+    }
+}
+
+// Every statement of `parsed` the generator can be asked for: the root when it is a DML / DDL
+// statement, then every query block in plan order.
+std::vector<flat_external_t> flat_externals(const ParsedQueryDataPtr& parsed) {
+    std::vector<flat_external_t> out;
+    const auto& root = parsed->otterbrix_params->node;
+    switch (root->type()) {
+        case node_type::insert_t:
+        case node_type::update_t:
+        case node_type::delete_t:
+            out.push_back(flat_external_t{root, sql_gen::statement_target_t{root->target(), source_of(root)}});
+            break;
+        case node_type::create_collection_t:
+        case node_type::create_index_t:
+            out.push_back(flat_external_t{root, sql_gen::statement_target_t{parsed->ddl_target}});
+            break;
+        case node_type::drop_t: {
+            const auto& drop = static_cast<const node_drop_t&>(*root);
+            qualified_name_t name = parsed->ddl_target.collection.t.empty() ? drop.target() : parsed->ddl_target;
+            qualified_name_t index;
+            if (drop.kind() == drop_target_kind::index) {
+                index = qualified_name_t{name.unique_identifier,
+                                         name.database,
+                                         name.schema,
+                                         core::relname_t{std::string{drop.index_name().t}}};
+            }
+            out.push_back(flat_external_t{root, sql_gen::statement_target_t{name, index}});
+            break;
+        }
+        default:
+            break;
+    }
+    for (const auto& sub_query : parsed->otterbrix_params->sub_queries) {
+        collect_slots(sub_query, out);
+    }
+    collect_slots(root, out);
     return out;
 }
 
-// Find the first node whose unique_identifier matches uid.
+// The first statement whose table names the connection `uid`. A DML root keeps database, schema
+// and table on its node (the engine's transformer has no slot for the uid of a DML target), so it
+// is the DML root that answers when no query block names the uid.
 flat_external_t find_by_uid(
     const std::vector<flat_external_t>& nodes,
     const std::string& uid) {
+    if (!nodes.empty() && nodes.front().node) {
+        switch (nodes.front().node->type()) {
+            case node_type::insert_t:
+            case node_type::update_t:
+            case node_type::delete_t: {
+                // The statement was written against `uid`: its target names it.
+                auto slot = nodes.front();
+                if (slot.target.name.unique_identifier.t.empty()) {
+                    slot.target.name.unique_identifier.t = uid;
+                }
+                return slot;
+            }
+            default:
+                break;
+        }
+    }
     for (const auto& n : nodes)
         if (n.node && n.target.name.unique_identifier.t == uid)
             return n;
     return {};
-}
-
-// The external entries of the batch a flat slot came from — generate_query
-// uses their targets to resolve the inner SELECT table of INSERT ... SELECT.
-const std::pmr::vector<external_entry_t>&
-batch_targets_of(const ParsedQueryDataPtr& parsed, const flat_external_t& slot) {
-    return parsed->otterbrix_params->external_nodes[slot.batch];
-}
-
-// Returns true when the node is a schema_node_t that carries raw SQL (stub path).
-bool is_raw_sql_stub(const components::logical_plan::node_ptr& n) {
-    if (!n || n->type() != components::logical_plan::node_type::unused)
-        return false;
-    return static_cast<const schema_utils::schema_node_t&>(*n).has_raw_sql();
 }
 
 // generate_query for the external slot of `parsed` registered under `uid`.
@@ -102,7 +151,7 @@ core::result_wrapper_t<std::string> generate_for(const ParsedQueryDataPtr& parse
     auto slot = find_by_uid(nodes, uid);
     REQUIRE(slot.node);
     const auto& params = parsed->otterbrix_params->params_node->parameters();
-    return sql_gen::generate_query(slot.node, &params, backend, slot.target, batch_targets_of(parsed, slot), resource);
+    return sql_gen::generate_query(slot.node, &params, backend, slot.target, resource);
 }
 
 // Parse + generate for the `mysql` slot; the generated statement must succeed.
@@ -132,8 +181,8 @@ core::error_code_t error_for(GreenplumParser& parser,
 // hand-built node pins one exact shape without depending on transformer details.
 const qualified_name_t orders_name{core::uid_t{"mysql"}, core::dbname_t{"bill"}, core::schema_t{"schema"}, core::relname_t{"orders"}};
 
-otterstax::names::resolved_target_t orders_target() {
-    return otterstax::names::resolved_target_t{components::catalog::INVALID_OID, orders_name, {}};
+sql_gen::statement_target_t orders_target() {
+    return sql_gen::statement_target_t{orders_name};
 }
 
 node_match_ptr orders_match(std::pmr::memory_resource* resource, const expression_ptr& predicate) {
@@ -153,9 +202,8 @@ generate_manual(const node_ptr& node,
                 const parameter_node_t& params,
                 backend_type_t backend,
                 std::pmr::memory_resource* resource,
-                const otterstax::names::resolved_target_t& target = orders_target()) {
-    std::pmr::vector<external_entry_t> empty_batch{resource};
-    return sql_gen::generate_query(node, &params.parameters(), backend, target, empty_batch, resource);
+                const sql_gen::statement_target_t& target = orders_target()) {
+    return sql_gen::generate_query(node, &params.parameters(), backend, target, resource);
 }
 
 // The single literal of `VALUES (<literal>)`.
@@ -167,60 +215,49 @@ std::string single_value_literal(const std::string& values_sql) {
     return values_sql.substr(open + 1, close - open - 1);
 }
 
+// The VALUES list sql_gen::generate_insert_rows writes for `chunk` (every column, in order): the
+// literals the federation's insert sink sends.
+core::result_wrapper_t<std::string> insert_values(const components::vector::data_chunk_t& chunk,
+                                                  backend_type_t backend,
+                                                  std::pmr::memory_resource* resource) {
+    std::vector<std::string> columns;
+    std::vector<std::size_t> indexes;
+    for (std::size_t i = 0; i < chunk.column_count(); ++i) {
+        columns.push_back("c" + std::to_string(i));
+        indexes.push_back(i);
+    }
+    auto sql = sql_gen::generate_insert_rows(backend,
+                                             qualified_name_t{core::dbname_t{"db"}, core::schema_t{"db"}, core::relname_t{"t"}},
+                                             columns,
+                                             indexes,
+                                             chunk,
+                                             resource);
+    if (sql.has_error()) {
+        return sql;
+    }
+    const auto at = sql.value().find(" VALUES ");
+    REQUIRE(at != std::string::npos);
+    return sql.value().substr(at + 1);
+}
+
+// The one literal of a one-column, one-row chunk holding `value`.
+core::result_wrapper_t<std::string> literal_of(const components::types::logical_value_t& value,
+                                               backend_type_t backend,
+                                               std::pmr::memory_resource* resource) {
+    std::pmr::vector<components::types::complex_logical_type> fields(resource);
+    fields.push_back(value.type());
+    components::vector::data_chunk_t chunk(resource, fields);
+    chunk.set_value(0, 0, value);
+    chunk.set_cardinality(1);
+    auto values = insert_values(chunk, backend, resource);
+    if (values.has_error()) {
+        return values;
+    }
+    return single_value_literal(values.value());
+}
+
 } // namespace
 
-// ── sql_gen::table_reference ──────────────────────────────────────────────────
-
-TEST_CASE("table_reference: MySQL uses database.collection") {
-    qualified_name_t name{core::dbname_t{"bill"}, core::schema_t{}, core::relname_t{"orders"}};
-    auto ref = sql_gen::table_reference(name, backend_type_t::MySQL, std::pmr::new_delete_resource());
-    REQUIRE_FALSE(ref.has_error());
-    REQUIRE(ref.value() == "`bill`.`orders`");
-}
-
-TEST_CASE("table_reference: PostgreSQL uses schema.collection") {
-    qualified_name_t name{core::dbname_t{}, core::schema_t{"public"}, core::relname_t{"products"}};
-    auto ref = sql_gen::table_reference(name, backend_type_t::PostgreSQL, std::pmr::new_delete_resource());
-    REQUIRE_FALSE(ref.has_error());
-    REQUIRE(ref.value() == "\"public\".\"products\"");
-}
-
-TEST_CASE("table_reference: ClickHouse uses database.collection (same as MySQL)") {
-    // ClickHouse has no schema level: table_reference emits database.collection.
-    qualified_name_t name{core::dbname_t{"events"}, core::schema_t{}, core::relname_t{"sessions"}};
-    auto ref = sql_gen::table_reference(name, backend_type_t::ClickHouse, std::pmr::new_delete_resource());
-    REQUIRE_FALSE(ref.has_error());
-    REQUIRE(ref.value() == "`events`.`sessions`");
-}
-
-TEST_CASE("table_reference: 2-arg constructor, MySQL") {
-    // 2-arg ctor sets database=bill, collection=orders, schema=""
-    qualified_name_t name{core::dbname_t{"bill"}, core::relname_t{"orders"}};
-    auto ref = sql_gen::table_reference(name, backend_type_t::MySQL, std::pmr::new_delete_resource());
-    REQUIRE_FALSE(ref.has_error());
-    REQUIRE(ref.value() == "`bill`.`orders`");
-}
-
-// Unknown and Mixed are routing verdicts and Otterbrix is the local engine; a
-// reference in any of them would be a guessed spelling sent to a backend.
-TEST_CASE("table_reference: a backend without a SQL dialect is invalid_parameter") {
-    qualified_name_t name{core::dbname_t{"bill"}, core::schema_t{}, core::relname_t{"orders"}};
-    for (auto backend : {backend_type_t::Unknown, backend_type_t::Mixed, backend_type_t::Otterbrix}) {
-        INFO("backend = " << static_cast<int>(backend));
-        auto ref = sql_gen::table_reference(name, backend, std::pmr::new_delete_resource());
-        REQUIRE(ref.has_error());
-        REQUIRE(ref.error().type == core::error_code_t::invalid_parameter);
-    }
-}
-
-TEST_CASE("table_reference: an empty name is invalid_parameter in every dialect") {
-    for (auto backend : {backend_type_t::MySQL, backend_type_t::PostgreSQL, backend_type_t::ClickHouse}) {
-        INFO("backend = " << static_cast<int>(backend));
-        auto ref = sql_gen::table_reference(qualified_name_t{}, backend, std::pmr::new_delete_resource());
-        REQUIRE(ref.has_error());
-        REQUIRE(ref.error().type == core::error_code_t::invalid_parameter);
-    }
-}
 
 // ── sql_gen::generate_query ───────────────────────────────────────────────────
 // generate_query() is called on logical-plan nodes that are NOT raw-SQL stubs.
@@ -240,14 +277,12 @@ TEST_CASE("generate_query: MySQL node produces db.collection reference") {
     auto nodes = flat_externals(parsed);
     auto mysql_node = find_by_uid(nodes, "mysql");
     REQUIRE(mysql_node.node);
-    REQUIRE_FALSE(is_raw_sql_stub(mysql_node.node));
 
     const auto& params = parsed->otterbrix_params->params_node->parameters();
     auto gen = sql_gen::generate_query(mysql_node.node,
                                        &params,
                                        backend_type_t::MySQL,
-                                       mysql_node.target,
-                                       batch_targets_of(parsed, mysql_node), resource);
+                                       mysql_node.target, resource);
     REQUIRE_FALSE(gen.has_error());
     const auto& sql = gen.value();
 
@@ -268,14 +303,12 @@ TEST_CASE("generate_query: LIMIT is pushed down to the remote backend SQL") {
     auto nodes = flat_externals(parsed);
     auto mysql_node = find_by_uid(nodes, "mysql");
     REQUIRE(mysql_node.node);
-    REQUIRE_FALSE(is_raw_sql_stub(mysql_node.node));
 
     const auto& params = parsed->otterbrix_params->params_node->parameters();
     auto gen = sql_gen::generate_query(mysql_node.node,
                                        &params,
                                        backend_type_t::MySQL,
-                                       mysql_node.target,
-                                       batch_targets_of(parsed, mysql_node), resource);
+                                       mysql_node.target, resource);
     REQUIRE_FALSE(gen.has_error());
     const auto& sql = gen.value();
 
@@ -300,8 +333,7 @@ TEST_CASE("generate_query: LIMIT with OFFSET is pushed down") {
     auto gen = sql_gen::generate_query(mysql_node.node,
                                        &params,
                                        backend_type_t::MySQL,
-                                       mysql_node.target,
-                                       batch_targets_of(parsed, mysql_node), resource);
+                                       mysql_node.target, resource);
     REQUIRE_FALSE(gen.has_error());
     const auto& sql = gen.value();
 
@@ -324,8 +356,7 @@ TEST_CASE("generate_query: no LIMIT clause when the query has none") {
     auto gen = sql_gen::generate_query(mysql_node.node,
                                        &params,
                                        backend_type_t::MySQL,
-                                       mysql_node.target,
-                                       batch_targets_of(parsed, mysql_node), resource);
+                                       mysql_node.target, resource);
     REQUIRE_FALSE(gen.has_error());
     const auto& sql = gen.value();
 
@@ -349,14 +380,12 @@ TEST_CASE("generate_query: bare OFFSET is pushed down (PostgreSQL)") {
     auto nodes = flat_externals(parsed);
     auto node = find_by_uid(nodes, "mysql");
     REQUIRE(node.node);
-    REQUIRE_FALSE(is_raw_sql_stub(node.node));
 
     const auto& params = parsed->otterbrix_params->params_node->parameters();
     auto gen = sql_gen::generate_query(node.node,
                                        &params,
                                        backend_type_t::PostgreSQL,
-                                       node.target,
-                                       batch_targets_of(parsed, node), resource);
+                                       node.target, resource);
     REQUIRE_FALSE(gen.has_error());
     const auto& sql = gen.value();
 
@@ -380,8 +409,7 @@ TEST_CASE("generate_query: bare OFFSET is pushed down (MySQL)") {
     auto gen = sql_gen::generate_query(node.node,
                                        &params,
                                        backend_type_t::MySQL,
-                                       node.target,
-                                       batch_targets_of(parsed, node), resource);
+                                       node.target, resource);
     REQUIRE_FALSE(gen.has_error());
     const auto& sql = gen.value();
 
@@ -424,8 +452,7 @@ TEST_CASE("generate_query: LIMIT ALL OFFSET n keeps the OFFSET") {
     auto gen = sql_gen::generate_query(node.node,
                                        &params,
                                        backend_type_t::PostgreSQL,
-                                       node.target,
-                                       batch_targets_of(parsed, node), resource);
+                                       node.target, resource);
     REQUIRE_FALSE(gen.has_error());
     const auto& sql = gen.value();
 
@@ -463,8 +490,7 @@ TEST_CASE("generate_query: OFFSET 0 emits no limit clause at all") {
     auto gen = sql_gen::generate_query(node.node,
                                        &params,
                                        backend_type_t::MySQL,
-                                       node.target,
-                                       batch_targets_of(parsed, node), resource);
+                                       node.target, resource);
     REQUIRE_FALSE(gen.has_error());
     const auto& sql = gen.value();
 
@@ -488,8 +514,7 @@ TEST_CASE("generate_query: LIMIT 0 emits LIMIT 0") {
     auto gen = sql_gen::generate_query(node.node,
                                        &params,
                                        backend_type_t::MySQL,
-                                       node.target,
-                                       batch_targets_of(parsed, node), resource);
+                                       node.target, resource);
     REQUIRE_FALSE(gen.has_error());
     const auto& sql = gen.value();
 
@@ -544,14 +569,12 @@ TEST_CASE("generate_query: HAVING is pushed down to the remote backend SQL") {
     auto nodes = flat_externals(parsed);
     auto node = find_by_uid(nodes, "mysql");
     REQUIRE(node.node);
-    REQUIRE_FALSE(is_raw_sql_stub(node.node));
 
     const auto& params = parsed->otterbrix_params->params_node->parameters();
     auto gen = sql_gen::generate_query(node.node,
                                        &params,
                                        backend_type_t::MySQL,
-                                       node.target,
-                                       batch_targets_of(parsed, node), resource);
+                                       node.target, resource);
     REQUIRE_FALSE(gen.has_error());
     const auto& sql = gen.value();
 
@@ -578,8 +601,7 @@ TEST_CASE("generate_query: HAVING renders between GROUP BY and ORDER BY / LIMIT"
     auto gen = sql_gen::generate_query(node.node,
                                        &params,
                                        backend_type_t::PostgreSQL,
-                                       node.target,
-                                       batch_targets_of(parsed, node), resource);
+                                       node.target, resource);
     REQUIRE_FALSE(gen.has_error());
     const auto& sql = gen.value();
 
@@ -611,8 +633,7 @@ TEST_CASE("generate_query: no HAVING clause when the query has none") {
     auto gen = sql_gen::generate_query(node.node,
                                        &params,
                                        backend_type_t::MySQL,
-                                       node.target,
-                                       batch_targets_of(parsed, node), resource);
+                                       node.target, resource);
     REQUIRE_FALSE(gen.has_error());
     const auto& sql = gen.value();
 
@@ -709,8 +730,7 @@ TEST_CASE("generate_query: string parameter is escaped for PostgreSQL") {
     auto gen = sql_gen::generate_query(node.node,
                                        &params,
                                        backend_type_t::PostgreSQL,
-                                       node.target,
-                                       batch_targets_of(parsed, node), resource);
+                                       node.target, resource);
     REQUIRE_FALSE(gen.has_error());
     const auto& sql = gen.value();
 
@@ -733,8 +753,7 @@ TEST_CASE("generate_query: string parameter is escaped for ClickHouse") {
     auto gen = sql_gen::generate_query(node.node,
                                        &params,
                                        backend_type_t::ClickHouse,
-                                       node.target,
-                                       batch_targets_of(parsed, node), resource);
+                                       node.target, resource);
     REQUIRE_FALSE(gen.has_error());
     const auto& sql = gen.value();
 
@@ -756,8 +775,7 @@ TEST_CASE("generate_query: string parameter is escaped for MySQL too") {
     auto gen = sql_gen::generate_query(node.node,
                                        &params,
                                        backend_type_t::MySQL,
-                                       node.target,
-                                       batch_targets_of(parsed, node), resource);
+                                       node.target, resource);
     REQUIRE_FALSE(gen.has_error());
     const auto& sql = gen.value();
 
@@ -767,47 +785,28 @@ TEST_CASE("generate_query: string parameter is escaped for MySQL too") {
     REQUIRE(sql.find("'O'Brien'") == std::string::npos);
 }
 
-TEST_CASE("generate_values: apostrophes are escaped on every backend") {
+TEST_CASE("generate_insert_rows: apostrophes are escaped on every backend") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-
-    std::pmr::vector<components::types::complex_logical_type> fields(resource);
-    fields.emplace_back(components::types::logical_type::STRING_LITERAL, "note");
-
-    components::vector::data_chunk_t chunk(resource, fields);
-    chunk.set_value(0, 0, components::types::logical_value_t{resource, "O'Brien"});
-    chunk.set_cardinality(1);
-
     for (auto backend : {backend_type_t::MySQL, backend_type_t::PostgreSQL, backend_type_t::ClickHouse}) {
-        std::stringstream ss;
-        auto err = sql_gen::generate_values(ss, chunk, backend, resource);
         INFO("backend = " << static_cast<int>(backend));
-        REQUIRE_FALSE(err.contains_error());
-        REQUIRE(ss.str().find("'O''Brien'") != std::string::npos);
-        REQUIRE(ss.str().find("'O'Brien'") == std::string::npos);
+        auto literal = literal_of(components::types::logical_value_t{resource, "O'Brien"}, backend, resource);
+        REQUIRE_FALSE(literal.has_error());
+        REQUIRE(literal.value() == "'O''Brien'");
     }
 }
 
-// MySQL (default sql_mode) and ClickHouse read a backslash as an escape: an
-// unescaped trailing backslash swallows the closing quote, and `\'` opens the
-// literal to injection. PostgreSQL (standard_conforming_strings) reads it
+// MySQL (default sql_mode; a connection under NO_BACKSLASH_ESCAPES is refused at discovery) and
+// ClickHouse read a backslash as an escape: an unescaped trailing backslash swallows the closing
+// quote, and `\'` opens the literal to injection. PostgreSQL (standard_conforming_strings) reads it
 // literally, where doubling it would change the value.
-TEST_CASE("generate_values: backslash is escaped per dialect") {
+TEST_CASE("generate_insert_rows: backslash is escaped per dialect") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-
-    std::pmr::vector<components::types::complex_logical_type> fields(resource);
-    fields.emplace_back(components::types::logical_type::STRING_LITERAL, "note");
-
-    components::vector::data_chunk_t chunk(resource, fields);
-    chunk.set_cardinality(1);
-
     auto render = [&](const char* value, backend_type_t backend) {
-        chunk.set_value(0, 0, components::types::logical_value_t{resource, value});
-        std::stringstream ss;
-        auto err = sql_gen::generate_values(ss, chunk, backend, resource);
-        REQUIRE_FALSE(err.contains_error());
-        return single_value_literal(ss.str());
+        auto literal = literal_of(components::types::logical_value_t{resource, value}, backend, resource);
+        REQUIRE_FALSE(literal.has_error());
+        return literal.value();
     };
 
     REQUIRE(render("a\\", backend_type_t::MySQL) == "'a\\\\'");
@@ -819,7 +818,7 @@ TEST_CASE("generate_values: backslash is escaped per dialect") {
     REQUIRE(render("\\' OR 1=1 -- ", backend_type_t::PostgreSQL) == "'\\'' OR 1=1 -- '");
 }
 
-TEST_CASE("generate_values: TINYINT and UTINYINT render as numbers, not characters") {
+TEST_CASE("generate_insert_rows: TINYINT and UTINYINT render as numbers, not characters") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
 
@@ -832,82 +831,118 @@ TEST_CASE("generate_values: TINYINT and UTINYINT render as numbers, not characte
     chunk.set_value(1, 0, components::types::logical_value_t{resource, uint8_t{200}});
     chunk.set_cardinality(1);
 
-    std::stringstream ss;
-    auto err = sql_gen::generate_values(ss, chunk, backend_type_t::MySQL, resource);
-    REQUIRE_FALSE(err.contains_error());
-    REQUIRE(ss.str() == "VALUES (65, 200)");
+    auto values = insert_values(chunk, backend_type_t::MySQL, resource);
+    REQUIRE_FALSE(values.has_error());
+    REQUIRE(values.value() == "VALUES (65, 200)");
 
     // 39 is the apostrophe: streamed as a char it would open a literal.
     chunk.set_value(0, 0, components::types::logical_value_t{resource, int8_t{39}});
-    std::stringstream quote;
-    err = sql_gen::generate_values(quote, chunk, backend_type_t::MySQL, resource);
-    REQUIRE_FALSE(err.contains_error());
-    REQUIRE(quote.str() == "VALUES (39, 200)");
+    values = insert_values(chunk, backend_type_t::MySQL, resource);
+    REQUIRE_FALSE(values.has_error());
+    REQUIRE(values.value() == "VALUES (39, 200)");
 }
 
-TEST_CASE("generate_values: FLOAT and DOUBLE literals round-trip exactly") {
+TEST_CASE("generate_insert_rows: FLOAT and DOUBLE literals round-trip exactly") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-
-    std::pmr::vector<components::types::complex_logical_type> fields(resource);
-    fields.emplace_back(components::types::logical_type::DOUBLE, "d");
-    components::vector::data_chunk_t doubles(resource, fields);
-    doubles.set_cardinality(1);
-
     for (double value : {0.1, 1234567.125, 1e-7, 3.141592653589793, -2.5e300}) {
-        doubles.set_value(0, 0, components::types::logical_value_t{resource, value});
-        std::stringstream ss;
-        auto err = sql_gen::generate_values(ss, doubles, backend_type_t::PostgreSQL, resource);
-        REQUIRE_FALSE(err.contains_error());
-        INFO("literal: " << ss.str());
-        REQUIRE(std::stod(single_value_literal(ss.str())) == value);
+        auto literal = literal_of(components::types::logical_value_t{resource, value}, backend_type_t::PostgreSQL, resource);
+        REQUIRE_FALSE(literal.has_error());
+        INFO("literal: " << literal.value());
+        REQUIRE(std::stod(literal.value()) == value);
     }
-
-    std::pmr::vector<components::types::complex_logical_type> float_fields(resource);
-    float_fields.emplace_back(components::types::logical_type::FLOAT, "f");
-    components::vector::data_chunk_t floats(resource, float_fields);
-    floats.set_cardinality(1);
-
     for (float value : {0.1f, 1234.5678f, 1e-7f, 3.1415927f}) {
-        floats.set_value(0, 0, components::types::logical_value_t{resource, value});
-        std::stringstream ss;
-        auto err = sql_gen::generate_values(ss, floats, backend_type_t::MySQL, resource);
-        REQUIRE_FALSE(err.contains_error());
-        INFO("literal: " << ss.str());
-        REQUIRE(std::stof(single_value_literal(ss.str())) == value);
+        auto literal = literal_of(components::types::logical_value_t{resource, value}, backend_type_t::MySQL, resource);
+        REQUIRE_FALSE(literal.has_error());
+        INFO("literal: " << literal.value());
+        REQUIRE(std::stof(literal.value()) == value);
     }
 }
 
-TEST_CASE("generate_values: an unsupported value type is unimplemented_yet, not broken SQL") {
+// NaN and the infinities are PostgreSQL's quoted float literals and ClickHouse's nan / inf; MySQL
+// has none, and says so as unimplemented_yet (the federation's operators then leave the statement
+// to the engine).
+TEST_CASE("generate_insert_rows: a non-finite double is spelled where the dialect has a literal") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-
-    std::pmr::vector<components::types::complex_logical_type> fields(resource);
-    fields.emplace_back(components::types::logical_type::DATE, "d");
-    components::vector::data_chunk_t chunk(resource, fields);
-    chunk.set_value(0, 0, components::types::logical_value_t{resource, core::date::date_t{core::date::days{1}}});
-    chunk.set_cardinality(1);
-
-    std::stringstream ss;
-    auto err = sql_gen::generate_values(ss, chunk, backend_type_t::MySQL, resource);
-    REQUIRE(err.contains_error());
-    REQUIRE(err.type == core::error_code_t::unimplemented_yet);
+    const double inf = std::numeric_limits<double>::infinity();
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    auto pg = literal_of(components::types::logical_value_t{resource, nan}, backend_type_t::PostgreSQL, resource);
+    REQUIRE_FALSE(pg.has_error());
+    CHECK(pg.value() == "'NaN'::float8");
+    pg = literal_of(components::types::logical_value_t{resource, -inf}, backend_type_t::PostgreSQL, resource);
+    REQUIRE_FALSE(pg.has_error());
+    CHECK(pg.value() == "'-Infinity'::float8");
+    auto ch = literal_of(components::types::logical_value_t{resource, inf}, backend_type_t::ClickHouse, resource);
+    REQUIRE_FALSE(ch.has_error());
+    CHECK(ch.value() == "inf");
+    auto mysql = literal_of(components::types::logical_value_t{resource, inf}, backend_type_t::MySQL, resource);
+    REQUIRE(mysql.has_error());
+    CHECK(mysql.error().type == core::error_code_t::unimplemented_yet);
 }
 
-TEST_CASE("generate_values: a backend without a dialect is invalid_parameter") {
+// A DECIMAL is its exact text: a numeric literal on PostgreSQL / MySQL, a Decimal of its scale on
+// ClickHouse (which reads a bare decimal literal as Float64).
+TEST_CASE("generate_insert_rows: a DECIMAL is written exactly in each dialect") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
+    const auto type = components::types::complex_logical_type::create_decimal(resource, 18, 4);
+    REQUIRE_FALSE(type.has_error());
+    const auto value =
+        components::types::logical_value_t::create_decimal(resource, type.value(), std::int64_t{-1234567});
+    auto mysql = literal_of(value, backend_type_t::MySQL, resource);
+    REQUIRE_FALSE(mysql.has_error());
+    CHECK(mysql.value() == "-123.4567");
+    auto pg = literal_of(value, backend_type_t::PostgreSQL, resource);
+    REQUIRE_FALSE(pg.has_error());
+    CHECK(pg.value() == "-123.4567");
+    auto ch = literal_of(value, backend_type_t::ClickHouse, resource);
+    REQUIRE_FALSE(ch.has_error());
+    CHECK(ch.value() == "toDecimal128('-123.4567', 4)");
+}
 
-    std::pmr::vector<components::types::complex_logical_type> fields(resource);
-    fields.emplace_back(components::types::logical_type::INTEGER, "i");
-    components::vector::data_chunk_t chunk(resource, fields);
-    chunk.set_value(0, 0, components::types::logical_value_t{resource, 1});
-    chunk.set_cardinality(1);
+TEST_CASE("generate_insert_rows: DATE and TIMESTAMP are typed literals, TIME has none on ClickHouse") {
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
+    auto* resource = &arena;
+    // 2000-01-02 (the engine's epoch is 2000-01-01).
+    const components::types::logical_value_t date{resource, core::date::date_t{core::date::days{1}}};
+    // 2000-01-01 01:00:00.5
+    const components::types::logical_value_t timestamp{
+        resource,
+        core::date::timestamp_t{core::date::microseconds{3600LL * 1000000 + 500000}}};
+    const components::types::logical_value_t time{resource, core::date::time_t{core::date::microseconds{3600LL * 1000000}}};
+    for (auto backend : {backend_type_t::MySQL, backend_type_t::PostgreSQL}) {
+        INFO("backend = " << static_cast<int>(backend));
+        auto d = literal_of(date, backend, resource);
+        REQUIRE_FALSE(d.has_error());
+        CHECK(d.value() == "DATE '2000-01-02'");
+        auto ts = literal_of(timestamp, backend, resource);
+        REQUIRE_FALSE(ts.has_error());
+        CHECK(ts.value() == "TIMESTAMP '2000-01-01 01:00:00.5'");
+        auto t = literal_of(time, backend, resource);
+        REQUIRE_FALSE(t.has_error());
+        CHECK(t.value() == "TIME '01:00:00'");
+    }
+    auto d = literal_of(date, backend_type_t::ClickHouse, resource);
+    REQUIRE_FALSE(d.has_error());
+    CHECK(d.value() == "toDate('2000-01-02')");
+    auto ts = literal_of(timestamp, backend_type_t::ClickHouse, resource);
+    REQUIRE_FALSE(ts.has_error());
+    // In UTC, as ch_to_chunk reads every DateTime / DateTime64.
+    CHECK(ts.value() == "toDateTime64('2000-01-01 01:00:00.5', 6, 'UTC')");
+    auto t = literal_of(time, backend_type_t::ClickHouse, resource);
+    REQUIRE(t.has_error());
+    CHECK(t.error().type == core::error_code_t::unimplemented_yet);
+}
 
-    std::stringstream ss;
-    auto err = sql_gen::generate_values(ss, chunk, backend_type_t::Unknown, resource);
-    REQUIRE(err.contains_error());
-    REQUIRE(err.type == core::error_code_t::invalid_parameter);
+TEST_CASE("generate_insert_rows: an unsupported value type is unimplemented_yet, not broken SQL") {
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
+    auto* resource = &arena;
+    auto literal = literal_of(components::types::logical_value_t{resource, core::date::interval_t{}},
+                              backend_type_t::MySQL,
+                              resource);
+    REQUIRE(literal.has_error());
+    REQUIRE(literal.error().type == core::error_code_t::unimplemented_yet);
 }
 
 TEST_CASE("generate_query: string parameter is escaped in UPDATE SET and in a SELECT constant") {
@@ -936,7 +971,7 @@ TEST_CASE("generate_query: unsupported parameter type in WHERE fails the stateme
     auto* resource = &arena;
     parameter_node_t params(resource);
 
-    auto id = params.add_parameter(logical_value_t{resource, core::date::date_t{core::date::days{1}}});
+    auto id = params.add_parameter(logical_value_t{resource, core::date::interval_t{}});
     auto node = orders_select(resource);
     node->append_child(
         orders_match(resource, make_compare_expression(resource, compare_type::eq, components::expressions::key_t{resource, "d"}, id)));
@@ -951,7 +986,7 @@ TEST_CASE("generate_query: unsupported parameter type in UPDATE SET fails the st
     auto* resource = &arena;
     parameter_node_t params(resource);
 
-    auto id = params.add_parameter(logical_value_t{resource, core::date::date_t{core::date::days{1}}});
+    auto id = params.add_parameter(logical_value_t{resource, core::date::interval_t{}});
     // An assignment is the value expression itself, named by the column it
     // assigns: here the value is the bound parameter.
     std::pmr::vector<expression_ptr> updates{resource};
@@ -984,27 +1019,13 @@ TEST_CASE("generate_query: unbound parameter is invalid_parameter, never NULL") 
     REQUIRE(gen.error().type == core::error_code_t::invalid_parameter);
 }
 
-TEST_CASE("generate_query: a backend without a dialect is invalid_parameter") {
-    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
-    auto* resource = &arena;
-    parameter_node_t params(resource);
-
-    auto node = orders_select(resource);
-    for (auto backend : {backend_type_t::Unknown, backend_type_t::Mixed, backend_type_t::Otterbrix}) {
-        auto gen = generate_manual(node, params, backend, resource);
-        INFO("backend = " << static_cast<int>(backend));
-        REQUIRE(gen.has_error());
-        REQUIRE(gen.error().type == core::error_code_t::invalid_parameter);
-    }
-}
-
 // A statement whose target has no name has no table to name on the backend;
 // a placeholder identifier would reach the backend as an unknown table.
 TEST_CASE("generate_query: an empty target name is invalid_parameter and never a placeholder table") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
     parameter_node_t params(resource);
-    const otterstax::names::resolved_target_t nameless{components::catalog::INVALID_OID, qualified_name_t{}, {}};
+    const sql_gen::statement_target_t nameless{qualified_name_t{}};
 
     node_ptr drop = make_node_drop(resource, drop_target_kind::collection);
     node_ptr select = orders_select(resource);
@@ -1251,6 +1272,85 @@ TEST_CASE("generate_query: NULLS FIRST / LAST reach the backend") {
     REQUIRE(last.find("ORDER BY `category` IS NULL ASC, `category` DESC;") != std::string::npos);
 }
 
+// Without NULLS FIRST / LAST the engine places NULLs last ascending and first descending
+// (PostgreSQL's rule); every dialect is told so: MySQL sorts NULL as the smallest value, ClickHouse
+// puts it last both ways.
+TEST_CASE("generate_query: the engine's default NULL placement is spelled out per dialect") {
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
+    auto* resource = &arena;
+    GreenplumParser parser(resource);
+
+    const std::string query = "SELECT * FROM mysql.bill.schema.orders ORDER BY category, price DESC;";
+    CHECK(sql_for(parser, query, backend_type_t::PostgreSQL, resource).find(
+              R"(ORDER BY "category" ASC NULLS LAST, "price" DESC NULLS FIRST;)") != std::string::npos);
+    CHECK(sql_for(parser, query, backend_type_t::ClickHouse, resource)
+              .find("ORDER BY `category` ASC NULLS LAST, `price` DESC NULLS FIRST;") != std::string::npos);
+    CHECK(sql_for(parser, query, backend_type_t::MySQL, resource)
+              .find("ORDER BY `category` IS NULL ASC, `category` ASC, `price` IS NULL DESC, `price` DESC;") !=
+          std::string::npos);
+}
+
+// ── one row by its primary key (the federation's row-change sink) ─────────────
+
+TEST_CASE("generate_update_row / generate_delete_row: a row is named by every primary key column alone") {
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
+    auto* resource = &arena;
+    const qualified_name_t table{core::dbname_t{"bill"}, core::schema_t{"bill"}, core::relname_t{"Stock"}};
+    const std::vector<std::string> columns{"Region", "Seq", "Price", "Note"};
+    const std::vector<std::size_t> key{1, 0}; // (Seq, Region)
+    const std::vector<logical_value_t> before{logical_value_t{resource, std::string{"eu"}},
+                                              logical_value_t{resource, std::int64_t{7}},
+                                              logical_value_t{resource, 0.1},
+                                              logical_value_t{resource, components::types::logical_type::NA}};
+    auto after = before;
+    after[2] = logical_value_t{resource, 2.5};
+
+    auto mysql = sql_gen::generate_update_row(backend_type_t::MySQL, table, columns, key, before, after, resource);
+    REQUIRE_FALSE(mysql.has_error());
+    CHECK(mysql.value() == "UPDATE `bill`.`Stock` SET `Price` = 2.5 WHERE `Seq` = 7 AND `Region` = 'eu'");
+    auto pg = sql_gen::generate_update_row(backend_type_t::PostgreSQL, table, columns, key, before, after, resource);
+    REQUIRE_FALSE(pg.has_error());
+    CHECK(pg.value() == R"(UPDATE "bill"."Stock" SET "Price" = 2.5 WHERE "Seq" = 7 AND "Region" = 'eu')");
+
+    // Nothing changed: the key column is set to itself, so the statement still names the row.
+    auto same = sql_gen::generate_update_row(backend_type_t::MySQL, table, columns, key, before, before, resource);
+    REQUIRE_FALSE(same.has_error());
+    CHECK(same.value() == "UPDATE `bill`.`Stock` SET `Seq` = 7 WHERE `Seq` = 7 AND `Region` = 'eu'");
+
+    auto removed = sql_gen::generate_delete_row(backend_type_t::PostgreSQL, table, columns, key, before, resource);
+    REQUIRE_FALSE(removed.has_error());
+    CHECK(removed.value() == R"(DELETE FROM "bill"."Stock" WHERE "Seq" = 7 AND "Region" = 'eu')");
+}
+
+TEST_CASE("generate_update_row / generate_delete_row: refusals") {
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
+    auto* resource = &arena;
+    const qualified_name_t table{core::dbname_t{"bill"}, core::schema_t{"bill"}, core::relname_t{"t"}};
+    const std::vector<std::string> columns{"id", "v"};
+    const std::vector<logical_value_t> row{logical_value_t{resource, std::int64_t{1}},
+                                           logical_value_t{resource, std::int64_t{2}}};
+    const std::vector<std::size_t> key{0};
+
+    auto ch = sql_gen::generate_delete_row(backend_type_t::ClickHouse, table, columns, key, row, resource);
+    REQUIRE(ch.has_error());
+    CHECK(ch.error().type == core::error_code_t::unimplemented_yet);
+
+    auto keyless = sql_gen::generate_delete_row(backend_type_t::MySQL, table, columns, {}, row, resource);
+    REQUIRE(keyless.has_error());
+    CHECK(keyless.error().type == core::error_code_t::invalid_parameter);
+
+    const std::vector<logical_value_t> null_key{logical_value_t{resource, components::types::logical_type::NA},
+                                                logical_value_t{resource, std::int64_t{2}}};
+    auto nulled = sql_gen::generate_update_row(backend_type_t::PostgreSQL, table, columns, key, null_key, row, resource);
+    REQUIRE(nulled.has_error());
+    CHECK(nulled.error().type == core::error_code_t::invalid_parameter);
+
+    const std::vector<std::size_t> past{5};
+    auto beyond = sql_gen::generate_delete_row(backend_type_t::MySQL, table, columns, past, row, resource);
+    REQUIRE(beyond.has_error());
+    CHECK(beyond.error().type == core::error_code_t::invalid_parameter);
+}
+
 // ── DML ───────────────────────────────────────────────────────────────────────
 
 // The grammar accepts DML LIMIT (DELETE/UPDATE ... LIMIT n) and attaches
@@ -1271,8 +1371,7 @@ TEST_CASE("generate_query: DELETE ... LIMIT reaches MySQL SQL, returns unimpleme
     auto gen = sql_gen::generate_query(mysql_node.node,
                                        &params,
                                        backend_type_t::MySQL,
-                                       mysql_node.target,
-                                       batch_targets_of(parsed, mysql_node), resource);
+                                       mysql_node.target, resource);
     REQUIRE_FALSE(gen.has_error());
     const auto& sql = gen.value();
     REQUIRE(sql.find("LIMIT 5") != std::string::npos);
@@ -1280,8 +1379,7 @@ TEST_CASE("generate_query: DELETE ... LIMIT reaches MySQL SQL, returns unimpleme
     auto rejected = sql_gen::generate_query(mysql_node.node,
                                            &params,
                                            backend_type_t::PostgreSQL,
-                                           mysql_node.target,
-                                           batch_targets_of(parsed, mysql_node), resource);
+                                           mysql_node.target, resource);
     REQUIRE(rejected.has_error());
     REQUIRE(rejected.error().type == core::error_code_t::unimplemented_yet);
 }
@@ -1301,8 +1399,7 @@ TEST_CASE("generate_query: UPDATE ... LIMIT reaches MySQL SQL, returns unimpleme
     auto gen = sql_gen::generate_query(mysql_node.node,
                                        &params,
                                        backend_type_t::MySQL,
-                                       mysql_node.target,
-                                       batch_targets_of(parsed, mysql_node), resource);
+                                       mysql_node.target, resource);
     REQUIRE_FALSE(gen.has_error());
     const auto& sql = gen.value();
     REQUIRE(sql.find("LIMIT 3") != std::string::npos);
@@ -1310,8 +1407,7 @@ TEST_CASE("generate_query: UPDATE ... LIMIT reaches MySQL SQL, returns unimpleme
     auto rejected = sql_gen::generate_query(mysql_node.node,
                                            &params,
                                            backend_type_t::PostgreSQL,
-                                           mysql_node.target,
-                                           batch_targets_of(parsed, mysql_node), resource);
+                                           mysql_node.target, resource);
     REQUIRE(rejected.has_error());
     REQUIRE(rejected.error().type == core::error_code_t::unimplemented_yet);
 }
@@ -1346,8 +1442,7 @@ TEST_CASE("generate_query: DELETE without LIMIT emits no LIMIT clause") {
     auto gen = sql_gen::generate_query(mysql_node.node,
                                        &params,
                                        backend_type_t::MySQL,
-                                       mysql_node.target,
-                                       batch_targets_of(parsed, mysql_node), resource);
+                                       mysql_node.target, resource);
     REQUIRE_FALSE(gen.has_error());
     const auto& sql = gen.value();
     REQUIRE(sql.find("LIMIT") == std::string::npos);
@@ -1388,7 +1483,7 @@ TEST_CASE("generate_query: UPDATE for ClickHouse is the ALTER TABLE ... UPDATE m
                        "UPDATE mysql.bill.schema.orders SET a = 1, b = 2 WHERE id > 0;",
                        backend_type_t::ClickHouse,
                        resource);
-    REQUIRE(sql == "ALTER TABLE `bill`.`orders` UPDATE `a` = 1, `b` = 2 WHERE `id` > 0;");
+    REQUIRE(sql == "ALTER TABLE `bill`.`orders` UPDATE `a` = 1, `b` = 2 WHERE `id` > 0 SETTINGS mutations_sync = 2;");
 }
 
 // Both ClickHouse forms — lightweight DELETE and ALTER ... UPDATE — are a
@@ -1403,7 +1498,7 @@ TEST_CASE("generate_query: DELETE / UPDATE without WHERE spell the mandatory Cli
     REQUIRE(sql_for(parser, "DELETE FROM mysql.bill.schema.orders;", backend_type_t::ClickHouse, resource) ==
             "DELETE FROM `bill`.`orders` WHERE 1;");
     REQUIRE(sql_for(parser, "UPDATE mysql.bill.schema.orders SET a = 1;", backend_type_t::ClickHouse, resource) ==
-            "ALTER TABLE `bill`.`orders` UPDATE `a` = 1 WHERE 1;");
+            "ALTER TABLE `bill`.`orders` UPDATE `a` = 1 WHERE 1 SETTINGS mutations_sync = 2;");
     REQUIRE(sql_for(parser, "UPDATE mysql.bill.schema.orders SET a = 1;", backend_type_t::MySQL, resource) ==
             "UPDATE `bill`.`orders` SET `a` = 1;");
     REQUIRE(sql_for(parser, "UPDATE mysql.bill.schema.orders SET a = 1;", backend_type_t::PostgreSQL, resource) ==
@@ -1449,8 +1544,8 @@ TEST_CASE("generate_query: DELETE ... USING with a resolved second table per dia
     auto* resource = &arena;
     GreenplumParser parser(resource);
 
-    // The plan keeps the USING source as a child of the delete node, and the
-    // parser resolves that child into the slot's from_name — which is what
+    // The plan keeps the USING source as a child of the delete node; the
+    // pushdown rule hands its name over as the second table — which is what
     // makes the statement one two-table DELETE on the backend.
     auto parsed =
         parse_or_die(parser, "DELETE FROM mysql.bill.schema.orders USING mysql.bill.schema.other WHERE id > 0;");
@@ -1461,19 +1556,18 @@ TEST_CASE("generate_query: DELETE ... USING with a resolved second table per dia
     const auto& target = slot.target;
     REQUIRE(target.from_name == qualified_name_t{core::uid_t{"mysql"}, core::dbname_t{"bill"}, core::schema_t{"schema"}, core::relname_t{"other"}});
     const auto& params = parsed->otterbrix_params->params_node->parameters();
-    const auto& batch = batch_targets_of(parsed, slot);
 
-    auto pg = sql_gen::generate_query(slot.node, &params, backend_type_t::PostgreSQL, target, batch, resource);
+    auto pg = sql_gen::generate_query(slot.node, &params, backend_type_t::PostgreSQL, target, resource);
     REQUIRE_FALSE(pg.has_error());
     REQUIRE(pg.value() == "DELETE FROM \"schema\".\"orders\" USING \"schema\".\"other\" WHERE \"id\" > 0;");
 
     // MySQL's multi-table form names the table rows are deleted from before FROM
     // and every table it reads after it.
-    auto mysql = sql_gen::generate_query(slot.node, &params, backend_type_t::MySQL, target, batch, resource);
+    auto mysql = sql_gen::generate_query(slot.node, &params, backend_type_t::MySQL, target, resource);
     REQUIRE_FALSE(mysql.has_error());
     REQUIRE(mysql.value() == "DELETE `bill`.`orders` FROM `bill`.`orders`, `bill`.`other` WHERE `id` > 0;");
 
-    auto ch = sql_gen::generate_query(slot.node, &params, backend_type_t::ClickHouse, target, batch, resource);
+    auto ch = sql_gen::generate_query(slot.node, &params, backend_type_t::ClickHouse, target, resource);
     REQUIRE(ch.has_error());
     REQUIRE(ch.error().type == core::error_code_t::unimplemented_yet);
 }
@@ -1498,7 +1592,6 @@ TEST_CASE("generate_query: DELETE ... USING together with LIMIT is unimplemented
                                        &params,
                                        backend_type_t::MySQL,
                                        target,
-                                       batch_targets_of(parsed, slot),
                                        resource);
     REQUIRE(gen.has_error());
     REQUIRE(gen.error().type == core::error_code_t::unimplemented_yet);
@@ -1509,8 +1602,8 @@ TEST_CASE("generate_query: UPDATE ... FROM with a resolved second table per dial
     auto* resource = &arena;
     GreenplumParser parser(resource);
 
-    // The plan keeps the FROM source as a child of the update node, and the
-    // parser resolves that child into the slot's from_name — which is what
+    // The plan keeps the FROM source as a child of the update node; the
+    // pushdown rule hands its name over as the second table — which is what
     // makes the statement one two-table UPDATE on the backend.
     auto parsed = parse_or_die(
         parser,
@@ -1522,9 +1615,8 @@ TEST_CASE("generate_query: UPDATE ... FROM with a resolved second table per dial
     const auto& target = slot.target;
     REQUIRE(target.from_name == qualified_name_t{core::uid_t{"mysql"}, core::dbname_t{"bill"}, core::schema_t{"schema"}, core::relname_t{"other"}});
     const auto& params = parsed->otterbrix_params->params_node->parameters();
-    const auto& batch = batch_targets_of(parsed, slot);
 
-    auto pg = sql_gen::generate_query(slot.node, &params, backend_type_t::PostgreSQL, target, batch, resource);
+    auto pg = sql_gen::generate_query(slot.node, &params, backend_type_t::PostgreSQL, target, resource);
     REQUIRE_FALSE(pg.has_error());
     REQUIRE(pg.value() ==
             "UPDATE \"schema\".\"orders\" SET \"name\" = 'x' FROM \"schema\".\"other\" WHERE \"id\" > 0;");
@@ -1532,12 +1624,12 @@ TEST_CASE("generate_query: UPDATE ... FROM with a resolved second table per dial
     // MySQL's multi-table form names every table before SET, and the assigned
     // column carries the target's qualifier: a name the target does not have
     // would otherwise resolve against the source and be written there.
-    auto mysql = sql_gen::generate_query(slot.node, &params, backend_type_t::MySQL, target, batch, resource);
+    auto mysql = sql_gen::generate_query(slot.node, &params, backend_type_t::MySQL, target, resource);
     REQUIRE_FALSE(mysql.has_error());
     REQUIRE(mysql.value() ==
             "UPDATE `bill`.`orders`, `bill`.`other` SET `bill`.`orders`.`name` = 'x' WHERE `id` > 0;");
 
-    auto ch = sql_gen::generate_query(slot.node, &params, backend_type_t::ClickHouse, target, batch, resource);
+    auto ch = sql_gen::generate_query(slot.node, &params, backend_type_t::ClickHouse, target, resource);
     REQUIRE(ch.has_error());
     REQUIRE(ch.error().type == core::error_code_t::unimplemented_yet);
 }
@@ -1572,7 +1664,6 @@ TEST_CASE("generate_query: DELETE ... USING with an unresolved source sub-plan i
                                        &params,
                                        backend_type_t::PostgreSQL,
                                        target,
-                                       batch_targets_of(parsed, slot),
                                        resource);
     REQUIRE(gen.has_error());
     REQUIRE(gen.error().type == core::error_code_t::unimplemented_yet);
@@ -1700,14 +1791,12 @@ TEST_CASE("generate_query: PostgreSQL node produces schema.collection reference"
     auto nodes = flat_externals(parsed);
     auto pg_node = find_by_uid(nodes, "pg");
     REQUIRE(pg_node.node);
-    REQUIRE_FALSE(is_raw_sql_stub(pg_node.node));
 
     const auto& params = parsed->otterbrix_params->params_node->parameters();
     auto gen = sql_gen::generate_query(pg_node.node,
                                        &params,
                                        backend_type_t::PostgreSQL,
-                                       pg_node.target,
-                                       batch_targets_of(parsed, pg_node), resource);
+                                       pg_node.target, resource);
     REQUIRE_FALSE(gen.has_error());
     const auto& sql = gen.value();
 
@@ -1734,101 +1823,17 @@ TEST_CASE("generate_query: same node, different backends produce different refer
     auto mysql_sql = sql_gen::generate_query(n1.node,
                                              &params,
                                              backend_type_t::MySQL,
-                                             n1.target,
-                                             batch_targets_of(parsed, n1), resource);
+                                             n1.target, resource);
     auto pg_sql    = sql_gen::generate_query(n1.node,
                                              &params,
                                              backend_type_t::PostgreSQL,
-                                             n1.target,
-                                             batch_targets_of(parsed, n1), resource);
+                                             n1.target, resource);
 
     REQUIRE_FALSE(mysql_sql.has_error());
     REQUIRE_FALSE(pg_sql.has_error());
     // MySQL: `db1`.`test1`   PG: "sch1"."test1"
     REQUIRE(mysql_sql.value().find("`db1`.`test1`")   != std::string::npos);
     REQUIRE(pg_sql.value().find("\"sch1\".\"test1\"") != std::string::npos);
-}
-
-TEST_CASE("generate_query: stringstream overload produces the same output") {
-    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
-    auto* resource = &arena;
-    GreenplumParser parser(resource);
-
-    auto parsed = parse_or_die(
-        parser,
-        "SELECT o.id FROM mysql.bill.schema.orders o "
-        "INNER JOIN pg.shop.shop.products p ON o.id = p.id;");
-
-    auto nodes = flat_externals(parsed);
-    auto mysql_node = find_by_uid(nodes, "mysql");
-    REQUIRE(mysql_node.node);
-
-    const auto& params = parsed->otterbrix_params->params_node->parameters();
-
-    // String overload
-    auto sql_str = sql_gen::generate_query(mysql_node.node,
-                                           &params,
-                                           backend_type_t::MySQL,
-                                           mysql_node.target,
-                                           batch_targets_of(parsed, mysql_node), resource);
-
-    // Stream overload
-    std::stringstream ss;
-    auto stream_err = sql_gen::generate_query(ss,
-                                              mysql_node.node,
-                                              &params,
-                                              backend_type_t::MySQL,
-                                              mysql_node.target,
-                                              batch_targets_of(parsed, mysql_node), resource);
-    REQUIRE_FALSE(stream_err.contains_error());
-
-    // The string overload appends the statement terminator; the stream
-    // overload emits the bare statement so callers can keep composing.
-    REQUIRE_FALSE(sql_str.has_error());
-    REQUIRE(sql_str.value() == ss.str() + ";");
-}
-
-// ── replace_qualifiers edge cases not covered in test_replace_qualifiers.cpp ──
-
-TEST_CASE("replace_qualifiers: 3-part qualifier treated as db.schema.collection (uid promoted)") {
-    // prepare_sql promotes the first segment to uid when only 3 parts are present.
-    // Scoped arena: libotterbrix_sql's parse tree allocates through this resource
-    // and is never explicitly freed — get_default_resource would leak it (LSAN).
-    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
-    auto r = otterstax::parser::prepare_sql(
-        "SELECT id FROM (SELECT id FROM mysql.bill.orders WHERE status = 'paid') o;",
-        &arena,
-        &arena);
-
-    REQUIRE(r.stubs.size() == 1);
-    auto rendered =
-        sql_gen::replace_qualifiers(r.stubs[0].raw_sql, r.stubs[0].qualifiers, backend_type_t::MySQL, &arena);
-    REQUIRE_FALSE(rendered.has_error());
-    const std::string& out = rendered.value();
-    // After rewrite the 3-part name becomes quoted db.collection for MySQL
-    REQUIRE(out.find("FROM `bill`.`orders`") != std::string::npos);
-    REQUIRE(out.find("mysql.bill.orders") == std::string::npos);
-}
-
-TEST_CASE("replace_qualifiers: multiple qualifiers in one stub") {
-    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
-    auto r = otterstax::parser::prepare_sql(
-        "SELECT * FROM ("
-        "SELECT id FROM mysql.db.sc.t1 UNION ALL SELECT id FROM mysql.db.sc.t2"
-        ") u;",
-        &arena,
-        &arena);
-
-    REQUIRE(r.stubs.size() == 1);
-    auto rendered =
-        sql_gen::replace_qualifiers(r.stubs[0].raw_sql, r.stubs[0].qualifiers, backend_type_t::MySQL, &arena);
-    REQUIRE_FALSE(rendered.has_error());
-    const std::string& out = rendered.value();
-    // Both 4-part names rewritten
-    REQUIRE(out.find("`db`.`t1`") != std::string::npos);
-    REQUIRE(out.find("`db`.`t2`") != std::string::npos);
-    REQUIRE(out.find("mysql.db.sc.t1") == std::string::npos);
-    REQUIRE(out.find("mysql.db.sc.t2") == std::string::npos);
 }
 
 // ── Characterization: whole outcomes pinned byte for byte ─────────────────────
@@ -1895,7 +1900,7 @@ outcome_t outcome_of_parsed(const ParsedQueryDataPtr& parsed,
     REQUIRE(slot.node);
     const auto& params = parsed->otterbrix_params->params_node->parameters();
     return outcome_of_generation(
-        sql_gen::generate_query(slot.node, &params, backend, slot.target, batch_targets_of(parsed, slot), resource));
+        sql_gen::generate_query(slot.node, &params, backend, slot.target, resource));
 }
 
 outcome_t outcome_of(GreenplumParser& parser,
@@ -1925,7 +1930,7 @@ outcome_t outcome_with_source(const ParsedQueryDataPtr& parsed,
     target.from_name = source;
     const auto& params = parsed->otterbrix_params->params_node->parameters();
     return outcome_of_generation(
-        sql_gen::generate_query(slot.node, &params, backend, target, batch_targets_of(parsed, slot), resource));
+        sql_gen::generate_query(slot.node, &params, backend, target, resource));
 }
 
 struct dialect_outcomes_t {
@@ -2041,7 +2046,7 @@ void check_manual_dialects(const node_ptr& node,
 dialect_outcomes_t set_a_is(const std::string& mysql, const std::string& pg, const std::string& ch) {
     return dialect_outcomes_t{sql_is("UPDATE `bill`.`orders` SET `a` = " + mysql + " WHERE `id` = 1;"),
                               sql_is("UPDATE \"schema\".\"orders\" SET \"a\" = " + pg + " WHERE \"id\" = 1;"),
-                              sql_is("ALTER TABLE `bill`.`orders` UPDATE `a` = " + ch + " WHERE `id` = 1;")};
+                              sql_is("ALTER TABLE `bill`.`orders` UPDATE `a` = " + ch + " WHERE `id` = 1 SETTINGS mutations_sync = 2;")};
 }
 
 // The hand-built `UPDATE bill.orders SET a = <value>` without a predicate on
@@ -2049,7 +2054,7 @@ dialect_outcomes_t set_a_is(const std::string& mysql, const std::string& pg, con
 dialect_outcomes_t manual_set_a_is(const std::string& mysql, const std::string& pg, const std::string& ch) {
     return dialect_outcomes_t{sql_is("UPDATE `bill`.`orders` SET `a` = " + mysql + ";"),
                               sql_is("UPDATE \"schema\".\"orders\" SET \"a\" = " + pg + ";"),
-                              sql_is("ALTER TABLE `bill`.`orders` UPDATE `a` = " + ch + " WHERE 1;")};
+                              sql_is("ALTER TABLE `bill`.`orders` UPDATE `a` = " + ch + " WHERE 1 SETTINGS mutations_sync = 2;")};
 }
 
 dialect_outcomes_t parse_refuses_everywhere(core::error_code_t code, const std::string& what) {
@@ -2087,7 +2092,7 @@ TEST_CASE("characterization: UPDATE SET constants and NULL per dialect") {
         "UPDATE mysql.bill.schema.orders SET i = 1, s = 'x', n = NULL, d = 2.5 WHERE id = 7;",
         {sql_is("UPDATE `bill`.`orders` SET `i` = 1, `s` = 'x', `n` = NULL, `d` = 2.5 WHERE `id` = 7;"),
          sql_is("UPDATE \"schema\".\"orders\" SET \"i\" = 1, \"s\" = 'x', \"n\" = NULL, \"d\" = 2.5 WHERE \"id\" = 7;"),
-         sql_is("ALTER TABLE `bill`.`orders` UPDATE `i` = 1, `s` = 'x', `n` = NULL, `d` = 2.5 WHERE `id` = 7;")},
+         sql_is("ALTER TABLE `bill`.`orders` UPDATE `i` = 1, `s` = 'x', `n` = NULL, `d` = 2.5 WHERE `id` = 7 SETTINGS mutations_sync = 2;")},
         resource);
 }
 
@@ -2113,7 +2118,7 @@ TEST_CASE("characterization: UPDATE SET bound parameters per dialect") {
     CHECK(bound(backend_type_t::PostgreSQL) ==
           sql_is("UPDATE \"schema\".\"orders\" SET \"note\" = 'it''s a \\ path', \"qty\" = 5 WHERE \"id\" = 7;"));
     CHECK(bound(backend_type_t::ClickHouse) ==
-          sql_is("ALTER TABLE `bill`.`orders` UPDATE `note` = 'it''s a \\\\ path', `qty` = 5 WHERE `id` = 7;"));
+          sql_is("ALTER TABLE `bill`.`orders` UPDATE `note` = 'it''s a \\\\ path', `qty` = 5 WHERE `id` = 7 SETTINGS mutations_sync = 2;"));
 
     auto null_bound = [&](backend_type_t backend) {
         auto parsed = parse_or_die(parser, "UPDATE mysql.bill.schema.orders SET note = $1 WHERE id = $2;");
@@ -2129,7 +2134,7 @@ TEST_CASE("characterization: UPDATE SET bound parameters per dialect") {
     CHECK(null_bound(backend_type_t::PostgreSQL) ==
           sql_is("UPDATE \"schema\".\"orders\" SET \"note\" = NULL WHERE \"id\" = 7;"));
     CHECK(null_bound(backend_type_t::ClickHouse) ==
-          sql_is("ALTER TABLE `bill`.`orders` UPDATE `note` = NULL WHERE `id` = 7;"));
+          sql_is("ALTER TABLE `bill`.`orders` UPDATE `note` = NULL WHERE `id` = 7 SETTINGS mutations_sync = 2;"));
 
     // Generated before any Bind.
     check_dialects(parser,
@@ -2174,7 +2179,7 @@ TEST_CASE("characterization: UPDATE SET operators and functions written as SQL p
     const dialect_outcomes_t cbrt_outcome{
         generate_refuses(unsupported, "cube root is not supported by this backend"),
         sql_is("UPDATE \"schema\".\"orders\" SET \"a\" = cbrt(\"a\") WHERE \"id\" = 1;"),
-        sql_is("ALTER TABLE `bill`.`orders` UPDATE `a` = cbrt(`a`) WHERE `id` = 1;")};
+        sql_is("ALTER TABLE `bill`.`orders` UPDATE `a` = cbrt(`a`) WHERE `id` = 1 SETTINGS mutations_sync = 2;")};
     const dialect_outcomes_t factorial_outcome{
         generate_refuses(unsupported, "factorial is not supported by this backend"),
         sql_is("UPDATE \"schema\".\"orders\" SET \"a\" = factorial(\"a\") WHERE \"id\" = 1;"),
@@ -2279,7 +2284,7 @@ TEST_CASE("characterization: every UPDATE SET expression kind per dialect") {
                      math("cbrt"),
                      {generate_refuses(unsupported, "cube root is not supported by this backend"),
                       sql_is("UPDATE \"schema\".\"orders\" SET \"a\" = cbrt(\"a\");"),
-                      sql_is("ALTER TABLE `bill`.`orders` UPDATE `a` = cbrt(`a`) WHERE 1;")}});
+                      sql_is("ALTER TABLE `bill`.`orders` UPDATE `a` = cbrt(`a`) WHERE 1 SETTINGS mutations_sync = 2;")}});
     cases.push_back({"factorial",
                      math("factorial"),
                      {generate_refuses(unsupported, "factorial is not supported by this backend"),
@@ -2565,11 +2570,11 @@ TEST_CASE("characterization: constant WHERE predicates per dialect") {
                    "UPDATE mysql.bill.schema.orders SET a = 1 WHERE false;",
                    {sql_is("UPDATE `bill`.`orders` SET `a` = 1 WHERE FALSE;"),
                     sql_is("UPDATE \"schema\".\"orders\" SET \"a\" = 1 WHERE FALSE;"),
-                    sql_is("ALTER TABLE `bill`.`orders` UPDATE `a` = 1 WHERE FALSE;")},
+                    sql_is("ALTER TABLE `bill`.`orders` UPDATE `a` = 1 WHERE FALSE SETTINGS mutations_sync = 2;")},
                    resource);
 }
 
-TEST_CASE("characterization: CREATE TABLE and CREATE INDEX on an alias route to one external slot") {
+TEST_CASE("characterization: CREATE TABLE and CREATE INDEX on an alias keep their written target") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
     GreenplumParser parser(resource);
@@ -2580,9 +2585,303 @@ TEST_CASE("characterization: CREATE TABLE and CREATE INDEX on an alias route to 
     CAPTURE(sql);
     auto parsed = parse_or_die(parser, sql);
     auto nodes = flat_externals(parsed);
-    REQUIRE(parsed->otterbrix_params->external_nodes_count == 1);
     REQUIRE(nodes.size() == 1);
     REQUIRE(nodes[0].target.name.unique_identifier.t == "mysql");
     REQUIRE(nodes[0].target.name.database.t == "bill");
     REQUIRE(nodes[0].target.name.schema.t == "schema");
+}
+
+// ── the validated tree's numeric casts (the federation's pushdown) ─────────────
+
+namespace {
+
+    // A statement of the validated tree over bill.orders, whose columns `columns` types.
+    outcome_t validated_outcome(const node_ptr& node,
+                                const parameter_node_t& params,
+                                backend_type_t backend,
+                                const sql_gen::column_map_t& columns,
+                                std::pmr::memory_resource* resource) {
+        auto target = orders_target();
+        target.columns = &columns;
+        sql_gen::generation_options_t options;
+        options.validated = true;
+        return outcome_of_generation(
+            sql_gen::generate_query(node, &params.parameters(), backend, target, resource, options));
+    }
+
+    void check_validated(const node_ptr& node,
+                         const parameter_node_t& params,
+                         const sql_gen::column_map_t& columns,
+                         const dialect_outcomes_t& expected,
+                         std::pmr::memory_resource* resource) {
+        CHECK(validated_outcome(node, params, backend_type_t::MySQL, columns, resource) == expected.mysql);
+        CHECK(validated_outcome(node, params, backend_type_t::PostgreSQL, columns, resource) == expected.pg);
+        CHECK(validated_outcome(node, params, backend_type_t::ClickHouse, columns, resource) == expected.ch);
+    }
+
+    expression_ptr cast_to(std::pmr::memory_resource* resource, param_storage operand, complex_logical_type type) {
+        return make_cast_expression(resource,
+                                    std::move(operand),
+                                    std::move(type),
+                                    components::casts::cast_t{},
+                                    components::casts::cast_kind::cast);
+    }
+
+    param_storage column_operand(std::pmr::memory_resource* resource, const char* name) {
+        return param_storage{components::expressions::key_t{resource, name}};
+    }
+
+    // DELETE FROM bill.orders WHERE <predicate>.
+    node_ptr orders_delete_where(std::pmr::memory_resource* resource, const expression_ptr& predicate) {
+        return make_node_delete(resource, orders_match(resource, predicate), orders_limit(resource, limit_t::unlimit()));
+    }
+
+    const std::string unfaithful_cast =
+        "this numeric CAST has no spelling in the backend's dialect that range-checks and rounds as the engine does";
+
+} // namespace
+
+TEST_CASE("validated: a user's numeric CAST is written in each dialect and never dropped") {
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
+    auto* resource = &arena;
+    parameter_node_t params(resource);
+    const sql_gen::column_map_t columns{{"a", {"a", logical_type::INTEGER}},
+                                        {"b", {"b", logical_type::INTEGER}},
+                                        {"price", {"price", logical_type::DOUBLE}}};
+    const complex_logical_type double_type{logical_type::DOUBLE};
+
+    SECTION("CAST(a AS DOUBLE) / CAST(b AS DOUBLE) divides as DOUBLE, not as integers") {
+        auto quotient = calculate(resource,
+                                  scalar_type::divide,
+                                  cast_to(resource, column_operand(resource, "a"), double_type),
+                                  cast_to(resource, column_operand(resource, "b"), double_type));
+        quotient->set_result_type(double_type);
+        check_validated(orders_update_of_a(resource, quotient),
+                        params,
+                        columns,
+                        manual_set_a_is("(CAST(`a` AS DOUBLE) / CAST(`b` AS DOUBLE))",
+                                        "(CAST(\"a\" AS float8) / CAST(\"b\" AS float8))",
+                                        "(CAST(`a` AS Float64) / CAST(`b` AS Float64))"),
+                        resource);
+    }
+    SECTION("a widening CAST under arithmetic is written: the product is computed at the wider type") {
+        auto product = calculate(resource,
+                                 scalar_type::multiply,
+                                 cast_to(resource, column_operand(resource, "a"), complex_logical_type{logical_type::BIGINT}),
+                                 read_key(resource, "b"));
+        check_validated(orders_update_of_a(resource, product),
+                        params,
+                        columns,
+                        manual_set_a_is("(CAST(`a` AS SIGNED) * `b`)",
+                                        "(CAST(\"a\" AS int8) * \"b\")",
+                                        "(CAST(`a` AS Int64) * `b`)"),
+                        resource);
+    }
+    SECTION("an integer into a DECIMAL that holds it is spelled with its width and scale") {
+        auto decimal = complex_logical_type::create_decimal(resource, 12, 2);
+        REQUIRE_FALSE(decimal.has_error());
+        auto widened = cast_to(resource, column_operand(resource, "a"), decimal.value());
+        check_validated(orders_update_of_a(resource, widened),
+                        params,
+                        columns,
+                        manual_set_a_is("CAST(`a` AS DECIMAL(12, 2))",
+                                        "CAST(\"a\" AS numeric(12, 2))",
+                                        "CAST(`a` AS Decimal(12, 2))"),
+                        resource);
+    }
+    SECTION("a narrowing CAST is PostgreSQL's alone: MySQL and ClickHouse neither range-check nor round alike") {
+        auto narrowed = cast_to(resource, column_operand(resource, "price"), complex_logical_type{logical_type::INTEGER});
+        check_validated(orders_update_of_a(resource, narrowed),
+                        params,
+                        columns,
+                        {generate_refuses(core::error_code_t::unimplemented_yet, unfaithful_cast),
+                         sql_is("UPDATE \"schema\".\"orders\" SET \"a\" = CAST(\"price\" AS int4);"),
+                         generate_refuses(core::error_code_t::unimplemented_yet, unfaithful_cast)},
+                        resource);
+    }
+}
+
+TEST_CASE("validated: a comparison drops only a lossless numeric CAST") {
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
+    auto* resource = &arena;
+    parameter_node_t params(resource);
+    const auto five = params.add_parameter(logical_value_t{resource, std::int64_t{5}});
+    const auto one = params.add_parameter(logical_value_t{resource, std::int64_t{1}});
+    const sql_gen::column_map_t columns{{"a", {"a", logical_type::INTEGER}},
+                                        {"price", {"price", logical_type::DOUBLE}}};
+
+    SECTION("CAST(a AS BIGINT) = 5 over an INTEGER column is a = 5: the validator's cast changes no value") {
+        auto predicate = make_compare_expression(
+            resource,
+            compare_type::eq,
+            param_storage{cast_to(resource, column_operand(resource, "a"), complex_logical_type{logical_type::BIGINT})},
+            param_storage{five});
+        check_validated(orders_delete_where(resource, predicate),
+                        params,
+                        columns,
+                        {sql_is("DELETE FROM `bill`.`orders` WHERE `a` = 5;"),
+                         sql_is("DELETE FROM \"schema\".\"orders\" WHERE \"a\" = 5;"),
+                         sql_is("DELETE FROM `bill`.`orders` WHERE `a` = 5;")},
+                        resource);
+    }
+    SECTION("CAST(price AS INTEGER) = 1 keeps the cast where it is written and is refused elsewhere") {
+        auto predicate = make_compare_expression(
+            resource,
+            compare_type::eq,
+            param_storage{
+                cast_to(resource, column_operand(resource, "price"), complex_logical_type{logical_type::INTEGER})},
+            param_storage{one});
+        check_validated(orders_delete_where(resource, predicate),
+                        params,
+                        columns,
+                        {generate_refuses(core::error_code_t::unimplemented_yet, unfaithful_cast),
+                         sql_is("DELETE FROM \"schema\".\"orders\" WHERE CAST(\"price\" AS int4) = 1;"),
+                         generate_refuses(core::error_code_t::unimplemented_yet, unfaithful_cast)},
+                        resource);
+    }
+    SECTION("an integer compared as DOUBLE keeps its cast: a 64-bit integer is not exact as a double") {
+        auto predicate = make_compare_expression(
+            resource,
+            compare_type::gt,
+            param_storage{cast_to(resource, column_operand(resource, "a"), complex_logical_type{logical_type::DOUBLE})},
+            param_storage{five});
+        check_validated(orders_delete_where(resource, predicate),
+                        params,
+                        columns,
+                        {sql_is("DELETE FROM `bill`.`orders` WHERE CAST(`a` AS DOUBLE) > 5;"),
+                         sql_is("DELETE FROM \"schema\".\"orders\" WHERE CAST(\"a\" AS float8) > 5;"),
+                         sql_is("DELETE FROM `bill`.`orders` WHERE CAST(`a` AS Float64) > 5;")},
+                        resource);
+    }
+}
+
+TEST_CASE("generate_query: unary minus over a negative literal never writes two minus signs together") {
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
+    auto* resource = &arena;
+    parameter_node_t params(resource);
+    const auto minus_five = params.add_parameter(logical_value_t{resource, std::int64_t{-5}});
+    const auto minus_half = params.add_parameter(logical_value_t{resource, -0.5});
+    // `--` opens a line comment in every dialect: `(--5)` would swallow the rest of the statement.
+    check_manual_dialects(
+        orders_update_of_a(resource, calculate(resource, scalar_type::unary_minus, read_parameter(resource, minus_five), nullptr)),
+        params,
+        manual_set_a_is("(- -5)", "(- -5)", "(- -5)"),
+        resource);
+    check_manual_dialects(
+        orders_update_of_a(resource, calculate(resource, scalar_type::unary_minus, read_parameter(resource, minus_half), nullptr)),
+        params,
+        manual_set_a_is("(- -0.5)", "(- -0.5)", "(- -0.5)"),
+        resource);
+}
+
+TEST_CASE("validated: the pushdown probe leaves a CAST of a value it cannot type to the generation with values") {
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
+    auto* resource = &arena;
+    parameter_node_t params(resource);
+    const auto value = params.add_parameter(logical_value_t{resource, 1.5});
+    const sql_gen::column_map_t columns{{"a", {"a", logical_type::INTEGER}}};
+    auto predicate = make_compare_expression(
+        resource,
+        compare_type::eq,
+        param_storage{components::expressions::key_t{resource, "a"}},
+        param_storage{cast_to(resource, param_storage{value}, complex_logical_type{logical_type::INTEGER})});
+    auto target = orders_target();
+    target.columns = &columns;
+    sql_gen::generation_options_t probe;
+    probe.validated = true;
+    probe.placeholders = true;
+    sql_gen::generation_options_t with_values;
+    with_values.validated = true;
+    const auto node = orders_delete_where(resource, predicate);
+    // The probe: a statement may be possible.
+    auto probed = sql_gen::generate_query(node, &params.parameters(), backend_type_t::MySQL, target, resource, probe);
+    REQUIRE_FALSE(probed.has_error());
+    CHECK(probed.value() == "DELETE FROM `bill`.`orders` WHERE `a` = ?;");
+    // With the value: a DOUBLE narrowed to INTEGER, which MySQL's CAST does not do as the engine does.
+    auto generated =
+        sql_gen::generate_query(node, &params.parameters(), backend_type_t::MySQL, target, resource, with_values);
+    REQUIRE(generated.has_error());
+    CHECK(generated.error().type == core::error_code_t::unimplemented_yet);
+    // PostgreSQL narrows as the engine does.
+    auto on_pg =
+        sql_gen::generate_query(node, &params.parameters(), backend_type_t::PostgreSQL, target, resource, with_values);
+    REQUIRE_FALSE(on_pg.has_error());
+    CHECK(on_pg.value() == "DELETE FROM \"schema\".\"orders\" WHERE \"a\" = CAST(1.5 AS int4);");
+}
+
+// A bound DECIMAL cast into another DECIMAL: narrowing by the types (scale 3 into 2), but a value
+// the cast leaves as it is (12.300 is 12.30) is a lossless cast for this statement, which every
+// dialect writes; a value it would round (12.345) stays PostgreSQL's alone, whose numeric cast
+// rounds as the engine does.
+TEST_CASE("validated: a bound DECIMAL cast into a DECIMAL that keeps its value is lossless") {
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
+    auto* resource = &arena;
+    parameter_node_t params(resource);
+    auto from = complex_logical_type::create_decimal(resource, 5, 3);
+    auto to = complex_logical_type::create_decimal(resource, 4, 2);
+    REQUIRE_FALSE(from.has_error());
+    REQUIRE_FALSE(to.has_error());
+    const auto kept = params.add_parameter(logical_value_t::create_decimal(resource, from.value(), 12300));
+    const auto rounded = params.add_parameter(logical_value_t::create_decimal(resource, from.value(), 12345));
+    const auto overflowing = params.add_parameter(logical_value_t::create_decimal(resource, from.value(), 99990));
+    const sql_gen::column_map_t columns{{"a", {"a", logical_type::INTEGER}}};
+
+    SECTION("12.300 into DECIMAL(4, 2)") {
+        check_validated(orders_update_of_a(resource, cast_to(resource, param_storage{kept}, to.value())),
+                        params,
+                        columns,
+                        manual_set_a_is("CAST(12.300 AS DECIMAL(4, 2))",
+                                        "CAST(12.300 AS numeric(4, 2))",
+                                        "CAST(toDecimal128('12.300', 3) AS Decimal(4, 2))"),
+                        resource);
+    }
+    SECTION("12.345 into DECIMAL(4, 2)") {
+        check_validated(orders_update_of_a(resource, cast_to(resource, param_storage{rounded}, to.value())),
+                        params,
+                        columns,
+                        {generate_refuses(core::error_code_t::unimplemented_yet, unfaithful_cast),
+                         sql_is("UPDATE \"schema\".\"orders\" SET \"a\" = CAST(12.345 AS numeric(4, 2));"),
+                         generate_refuses(core::error_code_t::unimplemented_yet, unfaithful_cast)},
+                        resource);
+    }
+    SECTION("12.300 into DECIMAL(3, 2): no digit dropped, but past the width") {
+        auto narrow = complex_logical_type::create_decimal(resource, 3, 2);
+        REQUIRE_FALSE(narrow.has_error());
+        check_validated(orders_update_of_a(resource, cast_to(resource, param_storage{kept}, narrow.value())),
+                        params,
+                        columns,
+                        {generate_refuses(core::error_code_t::unimplemented_yet, unfaithful_cast),
+                         sql_is("UPDATE \"schema\".\"orders\" SET \"a\" = CAST(12.300 AS numeric(3, 2));"),
+                         generate_refuses(core::error_code_t::unimplemented_yet, unfaithful_cast)},
+                        resource);
+    }
+    SECTION("99.990 into DECIMAL(4, 2): the largest value it holds") {
+        check_validated(orders_update_of_a(resource, cast_to(resource, param_storage{overflowing}, to.value())),
+                        params,
+                        columns,
+                        {sql_is("UPDATE `bill`.`orders` SET `a` = CAST(99.990 AS DECIMAL(4, 2));"),
+                         sql_is("UPDATE \"schema\".\"orders\" SET \"a\" = CAST(99.990 AS numeric(4, 2));"),
+                         sql_is("ALTER TABLE `bill`.`orders` UPDATE `a` = CAST(toDecimal128('99.990', 3) AS "
+                                "Decimal(4, 2)) WHERE 1 SETTINGS mutations_sync = 2;")},
+                        resource);
+    }
+}
+
+// MySQL's DECIMAL takes at most 30 fraction digits: a lossless CAST into DECIMAL(38, 31) (a SMALLINT
+// has 5 integer digits, the target 7) has no MySQL spelling and stays with the engine.
+TEST_CASE("validated: a CAST into a DECIMAL of more than 30 fraction digits is refused on MySQL") {
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
+    auto* resource = &arena;
+    parameter_node_t params(resource);
+    const sql_gen::column_map_t columns{{"s", {"s", logical_type::SMALLINT}}};
+    auto wide = complex_logical_type::create_decimal(resource, 38, 31);
+    REQUIRE_FALSE(wide.has_error());
+    check_validated(orders_update_of_a(resource, cast_to(resource, column_operand(resource, "s"), wide.value())),
+                    params,
+                    columns,
+                    {generate_refuses(core::error_code_t::unimplemented_yet, unfaithful_cast),
+                     sql_is("UPDATE \"schema\".\"orders\" SET \"a\" = CAST(\"s\" AS numeric(38, 31));"),
+                     sql_is("ALTER TABLE `bill`.`orders` UPDATE `a` = CAST(`s` AS Decimal(38, 31)) WHERE 1 "
+                            "SETTINGS mutations_sync = 2;")},
+                    resource);
 }

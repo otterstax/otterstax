@@ -93,6 +93,8 @@ namespace frontend::postgres {
                 return delete_rows(rows);
             case T_DropStmt:
                 return {"DROP"};
+            case T_VariableSetStmt:
+                return {"SET"};
             default:
                 return {"COMMAND"};
         }
@@ -106,6 +108,9 @@ namespace frontend::postgres {
     command_complete_tag command_complete_tag::rollback() { return {"ROLLBACK"}; }
     command_complete_tag command_complete_tag::savepoint() { return {"SAVEPOINT"}; }
     command_complete_tag command_complete_tag::release() { return {"RELEASE"}; }
+    command_complete_tag command_complete_tag::deallocate(bool all) {
+        return {all ? "DEALLOCATE ALL" : "DEALLOCATE"};
+    }
 
     std::optional<frontend::result_encoding> get_format_code(const std::vector<frontend::result_encoding>& format,
                                                              size_t i) {

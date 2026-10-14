@@ -1,16 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2025-2026  OtterStax
 //
-// Scheduler::prepare_plan and Scheduler::execute_plan: the entry points a
+// query_session_t::prepare_plan and execute_plan: the entry points a
 // pre-built plan takes instead of SQL text. The Spark Connect frontend
 // translates a DataFrame straight into a logical plan; AnalyzePlan answers
 // df.schema through prepare_plan, ExecutePlan runs the plan through
 // execute_plan. prepare_plan must DESCRIBE the plan and never run it — a schema
 // request that executed its statement would read the backend's rows on every
-// df.schema. Driven through the real Scheduler→Worker→catalog stack over a
-// typed PostgreSQL mock connector that records its describe probes apart from
-// its data queries; the plan is built by the real GreenplumParser, the parse
-// the Worker applies to SQL text.
+// df.schema. Driven through a real query session → engine stack over a typed
+// PostgreSQL mock connector (its table discovered at startup into the
+// federation metadata) that records any LIMIT-0 probe apart from its data
+// queries; the plan is built by the real GreenplumParser, the parse the session
+// applies to SQL text. A describe asks the backend nothing: the engine types
+// the plan from federation.remote_columns.
 //
 // spark.sql() is told apart the same way — without running anything: the
 // frontend parses the statement (classify_sql), hands a query back to the
@@ -19,11 +21,10 @@
 // and result relation, a SQL relation without arguments, the empty
 // LocalRelation, the name of an unsupported command) are pinned last.
 
-#include "catalog/catalog_manager.hpp"
 #include "frontend/spark_connect_server/service.hpp"
 #include "integration/postgresql/connection_manager.hpp"
 #include "otterbrix/parser/parser.hpp"
-#include "scheduler_stack.hpp"
+#include "session_stack.hpp"
 
 #include <catch2/catch_all.hpp>
 #include <google/protobuf/util/message_differencer.h>
@@ -43,16 +44,13 @@
 #include <vector>
 
 using otterstax::test::await_session;
-using otterstax::test::close_scheduler_statement;
+using otterstax::test::close_session_statement;
 using otterstax::test::engine_row_count;
-using otterstax::test::execute_scheduler_statement;
-using otterstax::test::init_fresh_test_otterbrix;
-using otterstax::test::make_az_scheduler;
-using otterstax::test::prepare_scheduler_sql;
-using otterstax::test::run_scheduler_sql;
-using otterstax::test::run_scheduler_sql_payload;
-using otterstax::test::scheduler_stack;
-using otterstax::test::worker_pool_size;
+using otterstax::test::execute_session_statement;
+using otterstax::test::prepare_session_sql;
+using otterstax::test::run_session_sql;
+using otterstax::test::run_session_sql_payload;
+using otterstax::test::session_stack;
 
 namespace {
 
@@ -90,8 +88,8 @@ namespace {
 
     const std::array<item_row, 2> kRows{{{1, "widget", 9.5}, {2, "gadget", 19.25}}};
 
-    // The wrap the Worker has the backend describe a statement with
-    // (db::make_prepare_probe).
+    // The shape of a LIMIT-0 describe probe wrapped around a statement: a
+    // prepare must never send one (the engine describes the statement).
     constexpr std::string_view kProbePrefix = "SELECT * FROM (";
 
     // Shared with the connector through file-scope state (connector_factory is
@@ -212,89 +210,38 @@ namespace {
         return std::make_unique<recording_pg_connector>(resource, std::move(params), std::move(alias));
     }
 
-    // Real engine, real parser, real catalog; the PostgreSQL connection is the
-    // recording mock registered under kUid with its single table discovered
-    // eagerly.
+    // Real engine, real parser; the PostgreSQL connection is the recording
+    // mock configured under kUid, its single table discovered at startup; the
+    // stack's default session over it.
     class plan_stack_owner {
     public:
-        // Member order is construction order: every actor is spawned after the
-        // ones whose addresses it takes, and the pmr deleters carry the engine's
-        // resource, so the members are initialised here rather than assigned.
         explicit plan_stack_owner(const std::string& data_dir)
-            : data_dir_(data_dir)
-            , otterbrix_(init_fresh_test_otterbrix(data_dir_))
-            , resource_(otterbrix_->dispatcher()->resource())
-            , az_scheduler_(make_az_scheduler())
-            , otb_mgr_(actor_zeta::spawn<db::OtterbrixManager>(resource_, make_otterbrix_manager(otterbrix_)))
-            , catalog_(actor_zeta::spawn<mysql::CatalogManager>(resource_, otb_mgr_->address()))
-            , pg_conn_(std::make_unique<pg::ConnectorManager>(resource_,
-                                                              catalog_->address(),
-                                                              &recording_pg_factory,
-                                                              /*pool_size*/ 1))
-            , pg_mgr_(actor_zeta::spawn<db::PostgressManager>(resource_, pg_conn_.get()))
-            , scheduler_(spawn_scheduler()) {}
-
-        plan_stack_owner(const plan_stack_owner&) = delete;
-        plan_stack_owner& operator=(const plan_stack_owner&) = delete;
-
-        ~plan_stack_owner() {
-            scheduler_.reset();
-            pg_mgr_.reset();
-            pg_conn_.reset();
-            catalog_.reset();
-            otb_mgr_.reset();
-            az_scheduler_->stop();
-            otterbrix_.reset();
-            std::filesystem::remove_all(data_dir_);
+            : owner_(data_dir, options()) {
+            reset_queries();
         }
 
-        scheduler_stack stack() const { return scheduler_stack{scheduler_->address(), otterbrix_, resource_}; }
+        session_stack stack() const { return owner_.stack(); }
 
     private:
-        std::unique_ptr<Scheduler, actor_zeta::pmr::deleter_t> spawn_scheduler() {
-            catalog_->set_backend_managers(actor_zeta::address_t::empty_address(),
-                                           pg_mgr_->address(),
-                                           actor_zeta::address_t::empty_address());
-
-            conn::api_server::PgConnectionParams params;
-            params.alias = kUid;
-            params.host = "localhost";
-            params.port = "5432";
-            params.username = "user";
-            params.password = "pass";
-            params.database = "pgdb";
-            params.schema = "public";
-            params.table = "items";
-            auto added = pg_conn_->addConnection(params);
-            INFO("addConnection: " << (added.has_error() ? added.error().what.c_str() : "ok"));
-            REQUIRE_FALSE(added.has_error());
-
-            return actor_zeta::spawn<Scheduler>(resource_,
-                                                az_scheduler_.get(),
-                                                worker_pool_size(),
-                                                &make_parser,
-                                                actor_zeta::address_t::empty_address(), // sql
-                                                pg_mgr_->address(),
-                                                actor_zeta::address_t::empty_address(), // ch
-                                                otb_mgr_->address(),
-                                                catalog_->address(),
-                                                actor_zeta::address_t::empty_address(),  // s3
-                                                actor_zeta::address_t::empty_address()); // file
+        static otterstax::test::stack_options_t options() {
+            otterstax::test::stack_options_t options;
+            options.connectors.postgres = &recording_pg_factory;
+            options.connections.postgresql.push_back(config::PgConnectionDesc{.alias = kUid,
+                                                                              .host = "localhost",
+                                                                              .port = "5432",
+                                                                              .username = "user",
+                                                                              .password = "pass",
+                                                                              .database = "pgdb",
+                                                                              .schema = "public",
+                                                                              .table = "items"});
+            return options;
         }
 
-        std::string data_dir_;
-        db::otterbrix_engine_ptr otterbrix_;
-        std::pmr::memory_resource* resource_{nullptr};
-        std::unique_ptr<actor_zeta::scheduler::sharing_scheduler> az_scheduler_;
-        std::unique_ptr<db::OtterbrixManager, actor_zeta::pmr::deleter_t> otb_mgr_;
-        std::unique_ptr<mysql::CatalogManager, actor_zeta::pmr::deleter_t> catalog_;
-        std::unique_ptr<pg::ConnectorManager> pg_conn_;
-        std::unique_ptr<db::PostgressManager, actor_zeta::pmr::deleter_t> pg_mgr_;
-        std::unique_ptr<Scheduler, actor_zeta::pmr::deleter_t> scheduler_;
+        otterstax::test::session_stack_owner owner_;
     };
 
-    // The plan a pre-built-plan frontend hands the Scheduler, parsed the way
-    // the Worker parses SQL text.
+    // The plan a pre-built-plan frontend hands the session, parsed the way the
+    // session parses SQL text.
     ParsedQueryDataPtr parse_plan(GreenplumParser& parser, std::string_view sql) {
         auto parsed = parser.parse(std::string{sql});
         INFO("parse: " << (parsed.has_error() ? parsed.error().what.c_str() : "ok"));
@@ -303,14 +250,20 @@ namespace {
     }
 
     core::result_wrapper_t<session_payload>
-    prepare_scheduler_plan(const scheduler_stack& s, session_hash_t id, ParsedQueryDataPtr plan) {
-        auto [ns, fut] = actor_zeta::send(s.scheduler, &Scheduler::prepare_plan, id, std::move(plan));
+    prepare_plan_on(const session_stack& s, session_hash_t id, ParsedQueryDataPtr plan) {
+        auto [ns, fut] = actor_zeta::send(s.session,
+                                          &otterstax::session::query_session_t::prepare_plan,
+                                          otterstax::test::stmt(id),
+                                          std::move(plan));
         return await_session(std::move(fut), std::chrono::milliseconds(10000), s.resource);
     }
 
     core::result_wrapper_t<session_payload>
-    execute_scheduler_plan(const scheduler_stack& s, session_hash_t id, ParsedQueryDataPtr plan) {
-        auto [ns, fut] = actor_zeta::send(s.scheduler, &Scheduler::execute_plan, id, std::move(plan));
+    execute_plan_on(const session_stack& s, session_hash_t id, ParsedQueryDataPtr plan) {
+        auto [ns, fut] = actor_zeta::send(s.session,
+                                          &otterstax::session::query_session_t::execute_plan,
+                                          otterstax::test::stmt(id),
+                                          std::move(plan));
         return await_session(std::move(fut), std::chrono::milliseconds(10000), s.resource);
     }
 
@@ -371,57 +324,57 @@ namespace {
 
 } // namespace
 
-TEST_CASE("Scheduler::prepare_plan: a parsed remote SELECT is described and never executed") {
+TEST_CASE("prepare_plan: a parsed remote SELECT is described and never executed") {
     plan_stack_owner owner("/tmp/test_prepare_plan_describe");
     auto s = owner.stack();
 
     // The same statement as SQL text through prepare_schema: what the plan's
     // description must equal.
     const session_hash_t by_sql = 9900;
-    auto reference = prepare_scheduler_sql(s, by_sql, std::string{kSql});
+    auto reference = prepare_session_sql(s, by_sql, std::string{kSql});
     INFO("prepare_schema: " << (reference.has_error() ? reference.error().what.c_str() : "ok"));
     REQUIRE_FALSE(reference.has_error());
     require_item_schema(reference.value().schema);
-    REQUIRE_FALSE(close_scheduler_statement(s, by_sql).has_error());
+    REQUIRE_FALSE(close_session_statement(s, by_sql).has_error());
 
     reset_queries();
     GreenplumParser parser(s.resource);
     const session_hash_t by_plan = 9901;
-    auto prepared = prepare_scheduler_plan(s, by_plan, parse_plan(parser, kSql));
+    auto prepared = prepare_plan_on(s, by_plan, parse_plan(parser, kSql));
     INFO("prepare_plan: " << (prepared.has_error() ? prepared.error().what.c_str() : "ok"));
     REQUIRE_FALSE(prepared.has_error());
     REQUIRE(prepared.value().tag == T_SelectStmt);
     REQUIRE(prepared.value().parameter_count == 0);
     require_item_schema(prepared.value().schema);
 
-    // Described by the backend's LIMIT-0 probe, never run: no row came back and
-    // the data path was not taken.
+    // Described by the engine from the federation metadata, never run: no row
+    // came back, the data path was not taken and the backend was not asked.
     REQUIRE(prepared.value().empty());
     INFO("data queries: " << data_queries().size());
     REQUIRE(data_queries().empty());
-    REQUIRE(probe_queries().size() == 1);
+    REQUIRE(probe_queries().empty());
 
-    // The prepare left the statement on its Worker; close_statement releases it,
+    // The prepare left the statement in its session; close_statement releases it,
     // after which the session has nothing left to execute.
-    auto closed = close_scheduler_statement(s, by_plan);
+    auto closed = close_session_statement(s, by_plan);
     INFO("close_statement: " << (closed.has_error() ? closed.error().what.c_str() : "ok"));
     REQUIRE_FALSE(closed.has_error());
-    auto executed = execute_scheduler_statement(s, by_plan);
+    auto executed = execute_session_statement(s, by_plan);
     REQUIRE(executed.has_error());
     REQUIRE(executed.error().type == core::error_code_t::invalid_parameter);
     REQUIRE(data_queries().empty());
 }
 
-TEST_CASE("Scheduler::execute_plan: a parsed remote SELECT returns the rows execute returns for its SQL") {
+TEST_CASE("execute_plan: a parsed remote SELECT returns the rows execute returns for its SQL") {
     plan_stack_owner owner("/tmp/test_prepare_plan_execute");
     auto s = owner.stack();
 
-    auto by_sql = run_scheduler_sql_payload(s, 9920, std::string{kSql});
+    auto by_sql = run_session_sql_payload(s, 9920, std::string{kSql});
     INFO("execute: " << (by_sql.has_error() ? by_sql.error().what.c_str() : "ok"));
     REQUIRE_FALSE(by_sql.has_error());
 
     GreenplumParser parser(s.resource);
-    auto by_plan = execute_scheduler_plan(s, 9921, parse_plan(parser, kSql));
+    auto by_plan = execute_plan_on(s, 9921, parse_plan(parser, kSql));
     INFO("execute_plan: " << (by_plan.has_error() ? by_plan.error().what.c_str() : "ok"));
     REQUIRE_FALSE(by_plan.has_error());
 
@@ -439,7 +392,7 @@ TEST_CASE("spark.sql classification: the parse tells a query from a command and 
     std::string err;
     for (const char* setup :
          {"CREATE DATABASE plandb;", "CREATE TABLE plandb.t (id bigint);", "INSERT INTO plandb.t (id) VALUES (1);"}) {
-        const bool ran = run_scheduler_sql(s, id++, setup, err);
+        const bool ran = run_session_sql(s, id++, setup, err);
         INFO(setup << ": " << err);
         REQUIRE(ran);
     }
@@ -462,7 +415,7 @@ TEST_CASE("spark.sql classification: the parse tells a query from a command and 
     REQUIRE_FALSE(command.has_error());
     CHECK(command.value() == frontend::spark::sql_statement_t::command);
     CHECK(engine_row_count(s, "plandb", "t") == 1);
-    const bool inserted = run_scheduler_sql(s, id++, insert, err);
+    const bool inserted = run_session_sql(s, id++, insert, err);
     INFO("INSERT: " << err);
     REQUIRE(inserted);
     CHECK(engine_row_count(s, "plandb", "t") == 2);

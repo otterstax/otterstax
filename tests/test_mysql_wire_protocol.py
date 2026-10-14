@@ -27,11 +27,11 @@ and asserts on the exact packets the server answers with:
     result without columns is exactly what the frontend answers with an OK
     packet (a DML), so neither shape may degrade into one.
   * A prepared statement left unexecuted at COM_QUIT, or at a socket drop
-    without COM_QUIT: the connection's teardown releases it on the Worker
-    (Scheduler::close_statement) and the server keeps accepting and serving
+    without COM_QUIT: the connection's teardown releases it on the query session
+    (the connection closes its query session) and the server keeps accepting and serving
     connections. The release itself is not visible on the wire — this case
     proves the teardown path completes (no crash, no wedged pool slot), not
-    the Worker-side erasure.
+    the session-side erasure.
 
 Everything runs against otterbrix-internal tables, so no backend is involved.
 """

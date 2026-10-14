@@ -3,8 +3,8 @@
 //
 // The engine takes at most DEFAULT_VECTOR_CAPACITY (1024) rows per data_chunk_t, while every input
 // translator builds a whole result — a backend result set, a file — as ONE chunk.
-// tsl::split_to_capacity cuts it into the run of <=1024-row chunks the engine is handed: the
-// backend managers' node_raw_data substitution and OtterbrixDataManager::insert_rows.
+// tsl::split_to_capacity cuts it into the run of <=1024-row chunks the engine is handed by
+// otterstax::engine::insert_rows (the file / s3 load).
 //
 // Every row-producing source here yields 2500 rows, so the run is 1024 + 1024 + 452. The rows on
 // both sides of both window boundaries keep their values and their NULLs: a window that restarted
@@ -13,16 +13,13 @@
 
 #include "otterbrix/translators/input/chunk_windows.hpp"
 
-#include "otterbrix/translators/input/affected_rows_carrier.hpp"
 #include "otterbrix/translators/input/arrow_to_chunk.hpp"
 #include "otterbrix/translators/input/ch_to_chunk.hpp"
 #include "otterbrix/translators/input/csv_to_chunk.hpp"
-#include "otterbrix/translators/input/mysql_to_chunk.hpp"
 #include "otterbrix/translators/input/ndjson_to_chunk.hpp"
 #include "otterbrix/translators/input/parquet_to_chunk.hpp"
 #include "otterbrix/translators/input/pg_to_chunk.hpp"
 
-#include "counting_resource.hpp"
 #include "pg_result_fixture.hpp"
 #include "rows_chunk.hpp"
 
@@ -34,13 +31,6 @@
 #include <arrow/api.h>
 #include <arrow/io/memory.h>
 #include <parquet/arrow/writer.h>
-
-#include <boost/mysql/detail/access.hpp>
-#include <boost/mysql/detail/ok_view.hpp>
-#include <boost/mysql/detail/resultset_encoding.hpp>
-#include <boost/mysql/diagnostics.hpp>
-#include <boost/mysql/metadata_mode.hpp>
-#include <boost/mysql/results.hpp>
 
 #include <clickhouse/columns/array.h>
 #include <clickhouse/columns/nullable.h>
@@ -60,8 +50,6 @@
 
 using components::vector::data_chunk_t;
 using components::vector::DEFAULT_VECTOR_CAPACITY;
-using otterstax::test::counting_resource;
-using otterstax::test::make_command_result;
 using otterstax::test::make_rows_chunk;
 using otterstax::test::make_tuples_result;
 using otterstax::test::pg_result_guard;
@@ -159,17 +147,6 @@ namespace {
             }
             REQUIRE(cell.chunk->value(2, cell.row).value<double>() == static_cast<double>(row) * 0.5);
         }
-    }
-
-    // A results holding nothing but an OK packet — what boost.mysql produces for INSERT/UPDATE/DELETE.
-    boost::mysql::results make_dml_results(std::uint64_t affected_rows) {
-        boost::mysql::results r;
-        auto& impl = boost::mysql::detail::access::get_impl(r);
-        impl.reset(boost::mysql::detail::resultset_encoding::text, boost::mysql::metadata_mode::minimal);
-        boost::mysql::diagnostics diag;
-        auto ec = impl.on_head_ok_packet(boost::mysql::detail::ok_view{affected_rows, 0, 0, 0, {}}, diag);
-        REQUIRE(!ec);
-        return r;
     }
 
     clickhouse::Block make_ch_block(size_t first_row, size_t rows) {
@@ -434,7 +411,7 @@ TEST_CASE("split_to_capacity: 2500 rows over two ClickHouse blocks become 1024 +
     std::pmr::unsynchronized_pool_resource arena{std::pmr::new_delete_resource()};
     // The block boundary (1500) falls inside a window, not on one.
     const std::vector<clickhouse::Block> blocks{make_ch_block(0, 1500), make_ch_block(1500, wide_rows - 1500)};
-    auto converted = tsl::ch_to_chunk(&arena, blocks);
+    auto converted = tsl::ch_to_chunk(&arena, blocks, {});
     REQUIRE_FALSE(converted.has_error());
     REQUIRE(converted.value().size() == wide_rows);
 
@@ -457,13 +434,15 @@ TEST_CASE("split_to_capacity: 2500 rows over two ClickHouse blocks become 1024 +
 // way the engine's raw-data operator adopts it.
 TEST_CASE("split_to_capacity: 2500 ClickHouse rows with LIST and STRUCT columns keep every row's elements and fields") {
     std::pmr::unsynchronized_pool_resource arena{std::pmr::new_delete_resource()};
-    const std::unordered_map<std::string, std::string> overrides{{"nums", "Array(Nullable(Int32))"},
-                                                                 {"tags", "Array(Nullable(String))"},
-                                                                 {"rec", "Tuple(a Int32, b Nullable(String))"}};
+    // The system.columns types of (id, nums, tags, rec), by result position.
+    const std::vector<std::optional<std::string>> declared{std::nullopt,
+                                                           "Array(Nullable(Int32))",
+                                                           "Array(Nullable(String))",
+                                                           "Tuple(a Int32, b Nullable(String))"};
     // The block boundary (1500) falls inside a window, not on one.
     const std::vector<clickhouse::Block> blocks{make_ch_nested_block(0, 1500),
                                                 make_ch_nested_block(1500, wide_rows - 1500)};
-    auto converted = tsl::ch_to_chunk(&arena, blocks, overrides);
+    auto converted = tsl::ch_to_chunk(&arena, blocks, declared);
     INFO((converted.has_error() ? converted.error().what.c_str() : "converted"));
     REQUIRE_FALSE(converted.has_error());
     REQUIRE(converted.value().size() == wide_rows);
@@ -551,52 +530,5 @@ TEST_CASE("split_to_capacity: a chunk within the bound is handed on as it is") {
         REQUIRE(run.size() == 1);
         REQUIRE(run.front().column_count() == 2);
         REQUIRE(run.front().size() == 0);
-    }
-}
-
-// The count of a DML travels as one column-less chunk whose cardinality IS the count, read whole by
-// capture_remote_dml_count; windows of it would be zero-column chunks, the pipeline's drain
-// sentinel. It is handed on whole, still without a per-row buffer.
-TEST_CASE("split_to_capacity: a DML count carrier over more than 1024 rows is handed on whole") {
-    constexpr std::uint64_t affected = 5000;
-
-    SECTION("MySQL OK packet") {
-        counting_resource res{std::pmr::new_delete_resource()};
-        auto converted = tsl::mysql_to_chunk(&res, make_dml_results(affected));
-        REQUIRE_FALSE(converted.has_error());
-
-        auto run = tsl::split_to_capacity(&res, std::move(converted.value()));
-
-        REQUIRE(run.size() == 1);
-        REQUIRE(run.front().column_count() == 0);
-        REQUIRE(run.front().size() == affected);
-        INFO("bytes allocated for the carrier and its run: " << res.allocated_bytes());
-        REQUIRE(res.allocated_bytes() < affected);
-    }
-    SECTION("PostgreSQL command tag") {
-        counting_resource res{std::pmr::new_delete_resource()};
-        pg_result_guard g(make_command_result("DELETE 5000"));
-        const tsl::pg_enum_oid_map no_enums;
-        auto converted = tsl::pg_to_chunk(&res, g.get(), no_enums);
-        REQUIRE_FALSE(converted.has_error());
-
-        auto run = tsl::split_to_capacity(&res, std::move(converted.value()));
-
-        REQUIRE(run.size() == 1);
-        REQUIRE(run.front().column_count() == 0);
-        REQUIRE(run.front().size() == affected);
-        INFO("bytes allocated for the carrier and its run: " << res.allocated_bytes());
-        REQUIRE(res.allocated_bytes() < affected);
-    }
-    SECTION("ClickHouse written rows") {
-        counting_resource res{std::pmr::new_delete_resource()};
-
-        auto run = tsl::split_to_capacity(&res, tsl::make_affected_rows_carrier(&res, affected));
-
-        REQUIRE(run.size() == 1);
-        REQUIRE(run.front().column_count() == 0);
-        REQUIRE(run.front().size() == affected);
-        INFO("bytes allocated for the carrier and its run: " << res.allocated_bytes());
-        REQUIRE(res.allocated_bytes() < affected);
     }
 }

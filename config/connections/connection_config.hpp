@@ -9,8 +9,9 @@
 namespace config {
 
 // Plain-data descriptors for the connection config file. These carry no
-// connector dependencies; the ComponentManager converts them into the
-// connector-specific parameter structs when it registers connections at
+// connector dependencies; remote_backends_t::open (backends) and
+// backends::register_s3_aliases (s3) convert them into the
+// connector-specific parameter structs when they register connections at
 // startup.
 
 struct MysqlConnectionDesc {
@@ -21,6 +22,7 @@ struct MysqlConnectionDesc {
     std::string password;
     std::string database;
     std::string table;
+    int pool_size = 1;  // optional; connections kept open to the backend, >= 1
 };
 
 struct PgConnectionDesc {
@@ -32,6 +34,7 @@ struct PgConnectionDesc {
     std::string database;
     std::string schema{"public"};  // PostgreSQL schema, defaults to "public"
     std::string table;
+    int pool_size = 1;  // optional; connections kept open to the backend, >= 1
 };
 
 struct ChConnectionDesc {
@@ -42,6 +45,7 @@ struct ChConnectionDesc {
     std::string password;
     std::string database;
     std::string table;
+    int pool_size = 1;  // optional; connections kept open to the backend, >= 1
 };
 
 struct S3CredentialDesc {

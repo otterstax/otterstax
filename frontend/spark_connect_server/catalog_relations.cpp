@@ -2,8 +2,8 @@
 // Copyright 2025-2026  OtterStax
 //
 // spark.catalog from the engine's own catalog. handle_catalog_relation reads
-// pg_catalog.pg_class and pg_catalog.pg_namespace with SQL through the
-// Scheduler, catalog_rows turns them into what Spark sees and lays the answer
+// pg_catalog.pg_class and pg_catalog.pg_namespace with SQL through the Spark
+// session's query session, catalog_rows turns them into what Spark sees and lays the answer
 // out the way PySpark reads it (catalog_rows.hpp), and listColumns prepares the
 // table's `SELECT *` for its columns.
 
@@ -11,15 +11,17 @@
 #include "catalog_rows.hpp"
 
 // Protobuf first, like every Spark TU: the engine's parser headers the
-// Scheduler pulls in define macros such as DAY and SECOND.
+// query session pulls in define macros such as DAY and SECOND.
 #include <spark/connect/catalog.pb.h>
 #include <spark/connect/types.pb.h>
 
 #include <google/protobuf/descriptor.h>
 
 #include "await_future.hpp"
+#include "catalog/introspection.hpp"
+#include "otterbrix/federation/metadata.hpp"
 #include "plan_translator/type_converter.hpp"
-#include "scheduler/scheduler.hpp"
+#include "session/query_session.hpp"
 #include "utility/tracy_profiler.hpp"
 
 #include <components/catalog/catalog_oids.hpp>
@@ -27,9 +29,12 @@
 #include <components/vector/data_chunk.hpp>
 #include <core/result_wrapper.hpp>
 
+#include <boost/scope/scope_exit.hpp>
+
 #include <algorithm>
 #include <cassert>
 #include <charconv>
+#include <chrono>
 #include <cstdint>
 #include <initializer_list>
 #include <optional>
@@ -58,15 +63,6 @@ namespace frontend::spark {
     namespace catalog_rows {
 
         namespace {
-
-            // Names owned elsewhere: the mirror manifest is
-            // db::external_manifest_collection (integration/otterbrix), the
-            // Kafka database and its bookkeeping tables are KafkaManager's
-            // (integration/kafka).
-            constexpr std::string_view manifest_table = "__otterstax_tables";
-            constexpr std::string_view kafka_database = "kafka";
-            constexpr std::string_view kafka_sources_table = "__sources";
-            constexpr std::string_view kafka_offsets_suffix = "__offsets";
 
             struct class_row_t {
                 uint32_t oid;
@@ -399,6 +395,7 @@ namespace frontend::spark {
 
         core::result_wrapper_t<catalog_view_t> read_catalog(const session_payload& namespaces,
                                                             const session_payload& classes,
+                                                            const session_payload& remote_tables,
                                                             std::pmr::memory_resource* resource) {
             OTX_ZONE_N("spark::catalog::read_catalog");
             using components::catalog::FIRST_USER_OID;
@@ -460,23 +457,15 @@ namespace frontend::spark {
                 }
             }
 
-            // A mirror database is the one that holds the mirror manifest.
-            std::pmr::unordered_set<uint32_t> mirror_namespaces(resource);
-            for (const auto& row : class_rows) {
-                if (row.oid >= FIRST_USER_OID && row.name == manifest_table) {
-                    mirror_namespaces.insert(row.namespace_oid);
-                }
-            }
-
             catalog_view_t view(resource);
             view.databases.emplace_back(default_database);
             for (const auto& [oid, name] : namespace_names) {
-                if (oid >= FIRST_USER_OID) {
+                // The federation metadata database is owned elsewhere
+                // (otterbrix/federation/metadata.hpp).
+                if (oid >= FIRST_USER_OID && name != otterstax::federation::metadata_database) {
                     view.databases.emplace_back(name);
                 }
             }
-            std::sort(view.databases.begin(), view.databases.end());
-            view.databases.erase(std::unique(view.databases.begin(), view.databases.end()), view.databases.end());
 
             for (const auto& row : class_rows) {
                 const bool is_table = row.kind == 'r' || row.kind == 'g';
@@ -504,40 +493,60 @@ namespace frontend::spark {
                     continue;
                 }
                 const std::string_view database = found->second;
-                entry.database = database;
-                if (mirror_namespaces.contains(row.namespace_oid)) {
-                    if (row.name == manifest_table) {
-                        continue;
-                    }
-                    // <db> ':' <schema> ':' <table>, the schema empty for MySQL / ClickHouse.
-                    const size_t first = row.name.find(':');
-                    const size_t second =
-                        first == std::string_view::npos ? std::string_view::npos : row.name.find(':', first + 1);
-                    if (second == std::string_view::npos) {
-                        return make_error(resource,
-                                          core::error_code_t::schema_error,
-                                          "spark.catalog: mirror table '",
-                                          row.name,
-                                          "' of database '",
-                                          database,
-                                          "' is not named <db>:<schema>:<table>");
-                    }
-                    const std::string_view schema = row.name.substr(first + 1, second - first - 1);
-                    entry.qualifier.emplace_back(database);
-                    entry.qualifier.emplace_back(row.name.substr(0, first));
-                    if (!schema.empty()) {
-                        entry.qualifier.emplace_back(schema);
-                    }
-                    entry.name = row.name.substr(second + 1);
-                } else {
-                    if (database == kafka_database &&
-                        (row.name == kafka_sources_table || row.name.ends_with(kafka_offsets_suffix))) {
-                        continue;
-                    }
-                    entry.qualifier.emplace_back(database);
+                if (otterstax::catalog::is_internal_table(database, row.name)) {
+                    continue;
                 }
+                entry.database = database;
+                entry.qualifier.emplace_back(database);
                 view.tables.push_back(std::move(entry));
             }
+
+            // The remote tables the federation knows, listed under their connection:
+            // namespace [alias, db] for MySQL / ClickHouse, [alias, db, schema] for
+            // PostgreSQL — the name the SQL path resolves.
+            for (const auto& chunk : remote_tables.chunks) {
+                if (chunk.size() == 0) {
+                    continue;
+                }
+                const auto* uid = column_named(chunk, "uid");
+                const auto* database = column_named(chunk, "database_name");
+                const auto* schema = column_named(chunk, "schema_name");
+                const auto* table = column_named(chunk, "table_name");
+                const auto* remote_database = column_named(chunk, "remote_database");
+                if (uid == nullptr || database == nullptr || schema == nullptr || table == nullptr ||
+                    remote_database == nullptr) {
+                    return make_error(resource,
+                                      core::error_code_t::schema_error,
+                                      "spark.catalog: federation.remote_tables answered without its key columns");
+                }
+                for (uint64_t row = 0; row < chunk.size(); ++row) {
+                    const auto uid_value = read_text(*uid, row);
+                    const auto table_value = read_text(*table, row);
+                    if (!uid_value || !table_value) {
+                        return make_error(resource,
+                                          core::error_code_t::schema_error,
+                                          "spark.catalog: federation.remote_tables holds a NULL uid / table_name");
+                    }
+                    const auto database_value = read_text(*database, row).value_or(std::string_view{});
+                    const auto schema_value = read_text(*schema, row).value_or(std::string_view{});
+                    table_entry_t entry{std::pmr::string{*uid_value, resource},
+                                        std::pmr::string{*table_value, resource},
+                                        std::pmr::vector<std::pmr::string>{resource},
+                                        false};
+                    entry.qualifier.emplace_back(*uid_value);
+                    if (!schema_value.empty()) {
+                        entry.qualifier.emplace_back(read_text(*remote_database, row).value_or(std::string_view{}));
+                        entry.qualifier.emplace_back(schema_value);
+                    } else {
+                        entry.qualifier.emplace_back(database_value);
+                    }
+                    view.databases.emplace_back(*uid_value);
+                    view.tables.push_back(std::move(entry));
+                }
+            }
+            std::sort(view.databases.begin(), view.databases.end());
+            view.databases.erase(std::unique(view.databases.begin(), view.databases.end()), view.databases.end());
+
             std::sort(view.tables.begin(), view.tables.end(), [](const table_entry_t& lhs, const table_entry_t& rhs) {
                 if (lhs.database != rhs.database) {
                     return lhs.database < rhs.database;
@@ -744,9 +753,6 @@ namespace frontend::spark {
 
         namespace rows = catalog_rows;
 
-        constexpr std::string_view namespace_query = "SELECT oid, nspname FROM pg_catalog.pg_namespace";
-        constexpr std::string_view class_query = "SELECT oid, relname, relnamespace, relkind FROM pg_catalog.pg_class";
-
         template<typename Operation>
         std::optional<std::string_view> db_name_of(const Operation& operation) {
             if (!operation.has_db_name()) {
@@ -784,22 +790,55 @@ namespace frontend::spark {
                               " is not supported");
         }
 
-        // Scheduler::execute of `sql` on the session's Worker.
+        using query_session_t = otterstax::session::query_session_t;
+        using session_future = query_session_t::unique_future<query_session_t::session_result>;
+
+        // One request of the operation, queued on the query session of the
+        // Spark session `id` by `send` under the registry's lock and awaited
+        // outside it, the step in work until the wait ends; a session closed
+        // meanwhile answers connection_closed.
+        template<typename Send>
         boost::asio::awaitable<core::result_wrapper_t<session_payload>, agrpc::GrpcExecutor>
-        run_sql(actor_zeta::address_t scheduler,
-                session_hash_t session,
+        run_step(idle_session_registry_t<otterstax::session::session_ptr>& sessions,
+                 const std::string& id,
+                 Send send,
+                 std::pmr::memory_resource* resource) {
+            session_future future;
+            if (!sessions.begin(id, std::chrono::steady_clock::now(), [&](query_session_t& target) {
+                    future = send(target);
+                })) {
+                co_return make_error(resource,
+                                     core::error_code_t::connection_closed,
+                                     "the Spark session was closed");
+            }
+            boost::scope::scope_exit step_done([&] { sessions.finish(id, std::chrono::steady_clock::now()); });
+            co_return co_await await_future<session_payload>(std::move(future), resource);
+        }
+
+        // query_session_t::execute of `sql` in the Spark session's query session.
+        boost::asio::awaitable<core::result_wrapper_t<session_payload>, agrpc::GrpcExecutor>
+        run_sql(idle_session_registry_t<otterstax::session::session_ptr>& sessions,
+                const std::string& id,
+                otterstax::session::statement_id_t statement,
                 std::string_view sql,
                 std::pmr::memory_resource* resource) {
-            auto future = actor_zeta::send(scheduler, &Scheduler::execute, session, std::string{sql}).second;
-            co_return co_await await_future<session_payload>(std::move(future), resource);
+            co_return co_await run_step(
+                sessions,
+                id,
+                [&](query_session_t& target) {
+                    return actor_zeta::send(target.address(), &query_session_t::execute, statement, std::string{sql})
+                        .second;
+                },
+                resource);
         }
 
     } // namespace
 
     boost::asio::awaitable<core::result_wrapper_t<session_payload>, agrpc::GrpcExecutor>
     handle_catalog_relation(const ::spark::connect::Catalog& catalog,
-                            actor_zeta::address_t scheduler,
-                            session_hash_t session,
+                            idle_session_registry_t<otterstax::session::session_ptr>& sessions,
+                            const std::string& session_id,
+                            otterstax::session::statement_id_t statement,
                             std::pmr::memory_resource* resource) {
         using C = ::spark::connect::Catalog;
         assert(resource != nullptr && "handle_catalog_relation: memory resource must not be null");
@@ -828,17 +867,23 @@ namespace frontend::spark {
         // pg_class first: a namespace one of its rows names is then missing
         // from pg_namespace only when a DROP DATABASE between the two reads
         // took the table with it (read_catalog).
-        auto classes = co_await run_sql(scheduler, session, class_query, resource);
+        auto classes = co_await run_sql(sessions, session_id, statement, otterstax::catalog::classes_sql, resource);
         if (classes.has_error()) {
             co_return forward_error(resource, classes.error(), "spark.catalog: reading pg_catalog.pg_class failed: ");
         }
-        auto namespaces = co_await run_sql(scheduler, session, namespace_query, resource);
+        auto namespaces = co_await run_sql(sessions, session_id, statement, otterstax::catalog::namespaces_sql, resource);
         if (namespaces.has_error()) {
             co_return forward_error(resource,
                                     namespaces.error(),
                                     "spark.catalog: reading pg_catalog.pg_namespace failed: ");
         }
-        auto loaded = rows::read_catalog(namespaces.value(), classes.value(), resource);
+        auto remote_tables = co_await run_sql(sessions, session_id, statement, otterstax::catalog::remote_tables_sql, resource);
+        if (remote_tables.has_error()) {
+            co_return forward_error(resource,
+                                    remote_tables.error(),
+                                    "spark.catalog: reading federation.remote_tables failed: ");
+        }
+        auto loaded = rows::read_catalog(namespaces.value(), classes.value(), remote_tables.value(), resource);
         if (loaded.has_error()) {
             co_return loaded.convert_error<session_payload>();
         }
@@ -872,20 +917,32 @@ namespace frontend::spark {
         }
 
         // listColumns: the columns of the table's prepared `SELECT *`. The
-        // prepare leaves the statement on the session's Worker, so it is closed
-        // whatever the prepare answered.
+        // prepare leaves the statement in the session, so it is closed whatever
+        // the prepare answered.
         assert(catalog.cat_type_case() == C::kListColumns);
         const auto& operation = catalog.list_columns();
         auto table = rows::resolve_table(view, operation.table_name(), db_name_of(operation), resource);
         if (table.has_error()) {
             co_return table.convert_error<session_payload>();
         }
-        auto prepare_future =
-            actor_zeta::send(scheduler, &Scheduler::prepare_schema, session, rows::select_all_query(*table.value()))
-                .second;
-        auto prepared = co_await await_future<session_payload>(std::move(prepare_future), resource);
-        auto close_future = actor_zeta::send(scheduler, &Scheduler::close_statement, session).second;
-        auto closed = co_await await_future<session_payload>(std::move(close_future), resource);
+        auto prepared = co_await run_step(
+            sessions,
+            session_id,
+            [&](query_session_t& target) {
+                return actor_zeta::send(target.address(),
+                                        &query_session_t::prepare_schema,
+                                        statement,
+                                        rows::select_all_query(*table.value()))
+                    .second;
+            },
+            resource);
+        auto closed = co_await run_step(
+            sessions,
+            session_id,
+            [&](query_session_t& target) {
+                return actor_zeta::send(target.address(), &query_session_t::close_statement, statement).second;
+            },
+            resource);
         if (prepared.has_error()) {
             co_return forward_error(resource, prepared.error(), "spark.catalog: describing the columns failed: ");
         }

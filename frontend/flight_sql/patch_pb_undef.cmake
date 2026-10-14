@@ -10,7 +10,8 @@
 # reaches the generated header after any engine header would not parse it
 # ("expected unqualified-id before numeric constant"). Undefining the macro at
 # the top of every generated header makes the include order irrelevant, the
-# same way catalog_manager.hpp undefs the parser's DAY/SECOND for arrow.
+# same way otterbrix/translators/error.hpp undefs the parser's DAY/SECOND for
+# arrow.
 
 file(READ "${IN}" CONTENT)
 file(WRITE "${IN}" "#undef ERROR\n${CONTENT}")

@@ -29,19 +29,20 @@ venv_of() {
     esac
 }
 
-# Each set is the line's declared Connect requirements, plus two caps:
+# Each set is the line's declared Connect requirements, plus caps:
 #  - pandas<3: every line caps it in its own dev/requirements.txt;
 #  - protobuf on the major the line's *_pb2.py was generated for (3.5: protoc
 #    21.7 = python 4.21, 4.0: 5.28, 4.1/4.2: 6.33), the only pairing protobuf's
 #    cross-version guarantee covers and what the 4.x CI pins; unpinned, pip
-#    picks 7.x for every line.
+#    picks 7.x for every line;
+#  - 3.5 only: pyarrow<26 — 26.0 requires numpy 2, and 3.5 runs on numpy<2.
 create_venv() {
     local name=$1 python
     local -a deps
     case "$name" in
         3.5)     # pyspark 3.5 supports Python 3.8-3.11 and numpy<2 only
                  python=python3.11
-                 deps=(py4j==0.10.9.7 "numpy>=1.15,<2" "pandas>=1.0.5,<3" "pyarrow>=4.0.0"
+                 deps=(py4j==0.10.9.7 "numpy>=1.15,<2" "pandas>=1.0.5,<3" "pyarrow>=4.0.0,<26"
                        "grpcio>=1.56.0" "grpcio-status>=1.56.0"
                        "googleapis-common-protos>=1.56.4" "protobuf<5") ;;
         4.0)     python=python3.12

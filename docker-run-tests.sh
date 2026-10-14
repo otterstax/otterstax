@@ -227,17 +227,18 @@ compose down --volumes --remove-orphans 2>/dev/null || true
 rm -rf init/mariadb1/* init/mariadb2/* init/postgres/* init/clickhouse/* 2>/dev/null || true
 
 # TEMPORARY (OTB-tag, docs/proposals/otterbrix-embedding.md): the pinned
-# otterbrix/actor-zeta packages exist only in the local Conan cache, so archive
-# their recipes into .conan-local/ for Dockerfile.test to restore. Only needed
-# when this script builds test-otterstax itself (no IMAGE_TAG).
+# otterbrix package exists only in the local Conan cache, so archive its recipe
+# into .conan-local/ for Dockerfile.test to restore (actor-zeta comes from the
+# conan remote). Only needed when this script builds test-otterstax itself
+# (no IMAGE_TAG).
 if [ -z "${IMAGE_TAG}" ]; then
     if ! "$SCRIPT_DIR/scripts/conan/export_local_packages.sh"; then
-        echo "❌ Cannot provide the local otterbrix/actor-zeta Conan recipes to the image build." >&2
+        echo "❌ Cannot provide the local otterbrix Conan recipe to the image build." >&2
         echo "   Fix the error above, then re-run (or run scripts/conan/export_local_packages.sh by hand)." >&2
         exit 1
     fi
-    # otterbrix + actor-zeta now build from source inside the image (~1.5-2 GB
-    # per job): with no -j, cap the jobs to Docker's RAM like run_benchmark.sh
+    # otterbrix builds from source inside the image (~1.5-2 GB per job):
+    # with no -j, cap the jobs to Docker's RAM like run_benchmark.sh
     # does (CLAUDE.md "Build resources") instead of nproc.
     if [ "$BUILD_JOBS" = "0" ]; then
         _docker_mem_mb=$(docker info --format '{{.MemTotal}}' 2>/dev/null \
@@ -484,6 +485,8 @@ if $TRACY_SEP; then
     # Per-test Tracy capture: each test gets its own tracy-capture sidecar.
     # otterstax is restarted between tests so tracy-capture receives a clean TCP
     # disconnect and can finalise its .tracy file before the next test begins.
+    # The same files, in the same order, as the standard mode's
+    # tests/scripts/startup.sh — keep the two lists in step.
     TESTS=(
         "FlightSQL Schema (MySQL backend):test_schema_flightsql_client_mysql_backend.py"
         "FlightSQL Schema (PostgreSQL backend):test_schema_flightsql_client_pg_backend.py"
@@ -500,14 +503,26 @@ if $TRACY_SEP; then
         "MySQL Client (ClickHouse backend):test_mysql_client_ch_backend.py"
         "PostgreSQL Client (ClickHouse backend):test_pg_client_ch_backend.py"
         "FlightSQL Client (MySQL backend, mutable):test_flightsql_client_mysql_backend_mutable.py"
+        "PostgreSQL Client (otterbrix-local DML row counts):test_pg_client_otb_local_dml.py"
+        "Multi-chunk results (PG, MySQL, FlightSQL wires; COPY ... TO file/s3):test_multichunk_frontends.py"
+        "FlightSQL Client (otterbrix-local schema contract):test_flightsql_client_otb_local.py"
+        "PostgreSQL extended protocol (raw wire):test_pg_extended_protocol.py"
+        "MySQL wire protocol (raw socket):test_mysql_wire_protocol.py"
+        "Transactions (PostgreSQL wire):test_transactions_pg_wire.py"
+        "Transactions (MySQL wire):test_transactions_mysql_wire.py"
+        "FlightSQL Client (GetTables, BEGIN refused):test_flightsql_client_tables_and_transactions.py"
+        "Remote DML (row by row by primary key, four-part targets):test_remote_row_dml.py"
+        "Pushed JOINs (ClickHouse Bool, shared names, DISTINCT ON):test_pushed_joins.py"
         "Cross-backend Queries (MySQL wire):test_cross_backend_queries_mysql.py"
         "Cross-backend Queries (PostgreSQL wire):test_cross_backend_queries_pg.py"
-        "Schema MySQL Client (file external):test_schema_mysql_file.py"
-        "Schema MySQL Client (s3 external):test_schema_mysql_s3.py"
-        "MySQL Client (file external):test_mysql_file.py"
+        "Concurrency:test_concurrency.py"
+        "Stress (optional):test_stress.py"
+        "Schema MySQL Client (file external, all formats):test_schema_mysql_file.py"
+        "Schema MySQL Client (s3 external, all formats):test_schema_mysql_s3.py"
+        "MySQL Client (file external, all formats):test_mysql_file.py"
         "MySQL Client (file external, ndjson):test_mysql_file_ndjson.py"
-        "MySQL Client (s3 external):test_mysql_s3.py"
-        "MySQL Client (JOIN sql ⋈ s3 parquet → s3 csv):test_mysql_join_sql_s3_to_s3.py"
+        "MySQL Client (s3 external, all formats):test_mysql_s3.py"
+        "MySQL Client (JOIN sql-backend ⋈ s3 parquet → s3 csv):test_mysql_join_sql_s3_to_s3.py"
         "MySQL Client (JOIN otterbrix-local ⋈ s3 parquet):test_mysql_join_otb_local_s3.py"
         "MySQL Client (JOIN sql backend ⋈ otterbrix-local, string key):test_mysql_join_otb_local_backend.py"
         "MySQL Client (JOIN s3 parquet ⋈ file csv ⋈ otterbrix-local):test_mysql_join_otb_local_s3_file.py"

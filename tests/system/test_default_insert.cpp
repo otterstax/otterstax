@@ -5,8 +5,8 @@
 // engine fills the omitted column at storage_append from the column's
 // default_value(); OtterStax hands the CREATE TABLE and the INSERT to the
 // engine unchanged, so the same statements are run twice here — straight
-// against the engine (make_otterbrix_manager()->execute_sql) and through the
-// Scheduler→Worker stack — and the two must agree.
+// against the engine (its own transformer, straight to the dispatcher) and
+// through a query session — and the two must agree.
 //
 // The visible cases pin the shapes the engine gets right: a DEFAULT whose
 // literal type equals the column type (BIGINT/STRING/DOUBLE). The
@@ -18,10 +18,8 @@
 // 0 / "" instead of the DEFAULT with no error anywhere; the engine-alone case
 // is what tells an engine defect from an OtterStax one.
 
-#include "scheduler_stack.hpp"
+#include "session_stack.hpp"
 
-#include "otterbrix/config.hpp"
-#include "otterbrix/operators/execute_plan.hpp"
 
 #include <catch2/catch_all.hpp>
 
@@ -34,27 +32,24 @@
 #include <string>
 #include <string_view>
 
-using otterstax::test::run_scheduler_sql;
-using otterstax::test::run_scheduler_sql_payload;
-using otterstax::test::scheduler_stack;
-using otterstax::test::with_scheduler_stack;
+using otterstax::test::run_session_sql;
+using otterstax::test::run_session_sql_payload;
+using otterstax::test::session_stack;
+using otterstax::test::with_session_stack;
 
 namespace {
 
-    // The engine on its own: no parser, no Worker, no OtterbrixManager actor.
+    // The engine on its own: no query session, no parser of ours — SQL through
+    // the engine's own transformer, straight to its dispatcher.
     struct engine_direct {
-        db::otterbrix_engine_ptr engine;
-        data_manager_ptr manager;
+        otterstax::test::test_engine_t engine;
 
-        explicit engine_direct(const char* data_dir) {
-            std::filesystem::remove_all(data_dir);
-            engine = db::make_otterbrix_engine(make_create_config(data_dir));
-            manager = make_otterbrix_manager(engine);
-        }
+        explicit engine_direct(const char* data_dir)
+            : engine(data_dir) {}
 
         void run_all(std::initializer_list<const char*> statements) {
             for (const char* sql : statements) {
-                auto cursor = manager->execute_sql(sql);
+                auto cursor = engine.sql(sql);
                 INFO("statement: " << sql << " error: "
                                    << (cursor && cursor->is_error() ? cursor->get_error().what.c_str() : ""));
                 REQUIRE(cursor);
@@ -64,7 +59,7 @@ namespace {
 
         // The single row a one-row SELECT returns, as the engine's own cursor.
         components::cursor::cursor_t_ptr select_one(const char* sql) {
-            auto cursor = manager->execute_sql(sql);
+            auto cursor = engine.sql(sql);
             INFO("statement: " << sql << " error: "
                                << (cursor && cursor->is_error() ? cursor->get_error().what.c_str() : ""));
             REQUIRE(cursor);
@@ -74,19 +69,19 @@ namespace {
         }
     };
 
-    void run_all(const scheduler_stack& s, session_hash_t& id, std::initializer_list<const char*> statements) {
+    void run_all(const session_stack& s, session_hash_t& id, std::initializer_list<const char*> statements) {
         std::string err;
         for (const char* sql : statements) {
-            const bool ok = run_scheduler_sql(s, id++, sql, err);
+            const bool ok = run_session_sql(s, id++, sql, err);
             INFO("statement: " << sql << " error: " << err);
             REQUIRE(ok);
         }
     }
 
-    // The payload of a one-row SELECT through the scheduler stack; the row is
+    // The payload of a one-row SELECT through the session stack; the row is
     // chunks.front().
-    session_payload select_one(const scheduler_stack& s, session_hash_t& id, const std::string& sql) {
-        auto r = run_scheduler_sql_payload(s, id++, sql);
+    session_payload select_one(const session_stack& s, session_hash_t& id, const std::string& sql) {
+        auto r = run_session_sql_payload(s, id++, sql);
         INFO("statement: " << sql << " error: " << r.error().what.c_str());
         REQUIRE_FALSE(r.has_error());
         REQUIRE(r.value().size() == 1);
@@ -136,9 +131,9 @@ TEST_CASE("DEFAULT: engine alone stores same-typed DEFAULTs for omitted BIGINT /
     REQUIRE(cursor->value(2, 0).value<double>() == 1.5);
 }
 
-TEST_CASE("DEFAULT: the scheduler stack stores same-typed DEFAULTs for omitted BIGINT / STRING / DOUBLE columns",
+TEST_CASE("DEFAULT: the session stack stores same-typed DEFAULTs for omitted BIGINT / STRING / DOUBLE columns",
           "[default]") {
-    with_scheduler_stack("/tmp/test_default_insert_stack_same", [](scheduler_stack s) {
+    with_session_stack("/tmp/test_default_insert_stack_same", [](session_stack s) {
         session_hash_t id = 10100;
         run_all(s, id, k_same_type_defaults);
 
@@ -162,9 +157,9 @@ TEST_CASE("DEFAULT: engine alone — INT DEFAULT 7 omitted from the INSERT reads
     REQUIRE(n.value<int32_t>() == 7);
 }
 
-TEST_CASE("DEFAULT: the scheduler stack — INT DEFAULT 7 omitted from the INSERT reads back 7",
+TEST_CASE("DEFAULT: the session stack — INT DEFAULT 7 omitted from the INSERT reads back 7",
           "[engine-defect-default]") {
-    with_scheduler_stack("/tmp/test_default_insert_stack_int", [](scheduler_stack s) {
+    with_session_stack("/tmp/test_default_insert_stack_int", [](session_stack s) {
         session_hash_t id = 10120;
         run_all(s, id, k_int_default);
 
@@ -184,9 +179,9 @@ TEST_CASE("DEFAULT: engine alone — a composite column with a ROW(...) DEFAULT 
     require_trio_default(cursor->value(0, 0));
 }
 
-TEST_CASE("DEFAULT: the scheduler stack — a composite column with a ROW(...) DEFAULT is filled in when omitted",
+TEST_CASE("DEFAULT: the session stack — a composite column with a ROW(...) DEFAULT is filled in when omitted",
           "[engine-defect-default]") {
-    with_scheduler_stack("/tmp/test_default_insert_stack_row", [](scheduler_stack s) {
+    with_session_stack("/tmp/test_default_insert_stack_row", [](session_stack s) {
         session_hash_t id = 10140;
         run_all(s, id, k_row_default);
 

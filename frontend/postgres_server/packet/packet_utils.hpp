@@ -49,6 +49,8 @@ namespace frontend::postgres {
         static command_complete_tag rollback();
         static command_complete_tag savepoint();
         static command_complete_tag release();
+        // DEALLOCATE <name> answers "DEALLOCATE", DEALLOCATE ALL "DEALLOCATE ALL".
+        static command_complete_tag deallocate(bool all);
 
         std::string tag;
 

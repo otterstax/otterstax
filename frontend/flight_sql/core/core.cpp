@@ -3,33 +3,61 @@
 
 #include "core.hpp"
 
-#include "../scheduler_engine.hpp"
+#include "../session_engine.hpp"
+#include "frontend/common/utils.hpp"
+#include "utility/tracy_profiler.hpp"
 
 #include <arrow/io/memory.h>
 
+#include <cassert>
+#include <iterator>
+#include <optional>
+#include <string_view>
 #include <stdexcept>
+#include <tuple>
 
 namespace flight::core {
 
 namespace {
 
-std::string new_ticket_id(std::uint64_t counter) {
-    // An opaque identifier; the ticket's content is an internal handle only.
-    return "otterstax-tickets/" + std::to_string(counter) + "-" +
-           std::to_string(std::hash<std::string>{}(std::to_string(counter) + "otterstax"));
+constexpr std::string_view kTicketPrefix = "otterstax-tickets/";
+constexpr std::string_view kPreparedPrefix = "otterstax-prepared/";
+constexpr std::string_view kNotFoundTicket = "flight-sql: unknown, already redeemed or expired ticket";
+constexpr std::string_view kNotFoundPrepared = "flight-sql: unknown prepared statement handle";
+
+// `prefix` + kIdBytes of secure random hex: unguessable, so a ticket or a
+// handle cannot be enumerated by another client. nullopt without secure bytes.
+std::optional<std::string> new_id(std::string_view prefix) {
+    auto random = frontend::secure_random_hex(FlightSqlCore::kIdBytes);
+    if (!random.has_value()) {
+        return std::nullopt;
+    }
+    std::string id{prefix};
+    id += *random;
+    return id;
+}
+
+grpc::Status no_secure_id() {
+    return {grpc::StatusCode::UNAVAILABLE, "flight-sql: cannot generate a secure identifier"};
 }
 
 } // namespace
 
-FlightSqlCore::FlightSqlCore(AuthService auth, std::unique_ptr<engine::SchedulerEngine> engine)
+FlightSqlCore::FlightSqlCore(AuthService auth, std::unique_ptr<engine::SessionEngine> engine,
+                             ResultCacheLimits limits)
     : auth_(std::move(auth)),
-      engine_(std::move(engine)) {}
+      engine_(std::move(engine)),
+      limits_(limits) {
+    assert(limits_.results > 0 && "the cache holds at least the result just registered");
+}
 
 FlightSqlCore::~FlightSqlCore() = default;
 
-std::string FlightSqlCore::register_result(const std::shared_ptr<arrow::Schema>& schema,
-                                           std::vector<std::shared_ptr<arrow::RecordBatch>> batches) {
-    CachedResult cached;
+CachedResultPtr materialize(const std::shared_ptr<arrow::Schema>& schema,
+                            const std::vector<std::shared_ptr<arrow::RecordBatch>>& batches) {
+    OTX_ZONE_N("flight::materialize");
+    auto result = std::make_unique<CachedResult>();
+    CachedResult& cached = *result;
     auto schema_bytes = arrow::ipc::SerializeSchema(*schema);
     if (!schema_bytes.ok()) {
         throw EngineError("serializing the result schema: " + schema_bytes.status().ToString());
@@ -71,99 +99,189 @@ std::string FlightSqlCore::register_result(const std::shared_ptr<arrow::Schema>&
         cached.batches.push_back(std::move(out));
     }
 
-    const std::string ticket = new_ticket_id(ticket_counter_.fetch_add(1));
-    std::lock_guard lock(mutex_);
-    results_[ticket] = std::move(cached);
-    result_order_.push_back(ticket);
-    while (result_order_.size() > kMaxCachedResults) {
-        results_.erase(result_order_.front());
-        result_order_.pop_front();
+    cached.bytes = cached.schema_ipc.size() + cached.schema_message.size();
+    for (const auto& batch : cached.batches) {
+        cached.bytes += batch.metadata.size() + batch.body.size();
     }
-    return ticket;
+    return result;
 }
 
-grpc::Status FlightSqlCore::make_flight_info(const fp::FlightDescriptor& descriptor,
-                                             const std::string& ticket, fp::FlightInfo* out) const {
-    CachedResult const* cached;
-    if (const auto st = lookup(ticket, &cached); !st.ok()) return st;
-
+void make_flight_info(const fp::FlightDescriptor& descriptor, const CachedResult& result, fp::FlightInfo* out) {
     out->mutable_flight_descriptor()->CopyFrom(descriptor);
-    auto* endpoint = out->add_endpoint();
-    endpoint->mutable_ticket()->set_ticket(ticket);
-    // No Location is set: an empty list means "this same server" (the client's channel).
-    out->set_total_records(cached->total_rows);
+    // One endpoint, its ticket set by set_flight_ticket. No Location is set: an
+    // empty list means "this same server" (the client's channel).
+    out->add_endpoint();
+    out->set_total_records(result.total_rows);
     out->set_ordered(false);
     // Encapsulated schema (continuation+len+flatbuffer)
-    out->set_schema(cached->schema_ipc.data(), cached->schema_ipc.size());
+    out->set_schema(result.schema_ipc.data(), result.schema_ipc.size());
+}
+
+void set_flight_ticket(std::string ticket, fp::FlightInfo* out) {
+    assert(out->endpoint_size() == 1 && "make_flight_info adds the one endpoint");
+    out->mutable_endpoint(0)->mutable_ticket()->set_ticket(std::move(ticket));
+}
+
+grpc::Status FlightSqlCore::register_result(CachedResultPtr result, const std::string& owner,
+                                            std::string* ticket_out) {
+    OTX_ZONE_N("flight::register_result");
+    assert(result != nullptr);
+    assert(ticket_out != nullptr);
+    auto ticket = new_id(kTicketPrefix);
+    if (!ticket.has_value()) {
+        return no_secure_id();
+    }
+    const std::size_t bytes = result->bytes;
+    std::lock_guard lock(mutex_);
+    result_order_.push_back(*ticket);
+    // 128 random bits: a repeat is never expected; were it to happen it would
+    // overwrite nothing (emplace keeps the first) — refuse instead.
+    const bool inserted =
+        results_.emplace(*ticket, CacheEntry{std::move(result), owner, std::prev(result_order_.end())}).second;
+    if (!inserted) {
+        result_order_.pop_back();
+        return no_secure_id();
+    }
+    cached_bytes_ += bytes;
+    // The oldest go first; the result just registered (the back) stays.
+    while (results_.size() > 1 &&
+           (results_.size() > limits_.results || cached_bytes_ > limits_.bytes)) {
+        drop_locked(results_.find(result_order_.front()));
+    }
+    *ticket_out = std::move(*ticket);
     return grpc::Status::OK;
 }
 
-grpc::Status FlightSqlCore::make_schema_result(const std::string& ticket,
-                                               fp::SchemaResult* out) const {
-    CachedResult const* cached;
-    if (const auto st = lookup(ticket, &cached); !st.ok()) return st;
-    out->set_schema(cached->schema_ipc.data(), cached->schema_ipc.size());
-    return grpc::Status::OK;
-}
-
-grpc::Status FlightSqlCore::lookup(const std::string& ticket, CachedResult const** out) const {
+grpc::Status FlightSqlCore::take_result(const std::string& ticket, const std::string& owner, CachedResultPtr* out) {
+    OTX_ZONE_N("flight::take_result");
     std::lock_guard lock(mutex_);
     const auto it = results_.find(ticket);
-    if (it == results_.end()) {
-        return {grpc::StatusCode::NOT_FOUND, "flight-sql: unknown or expired ticket"};
+    // Another client's ticket is answered as an unknown one and stays cached.
+    if (it == results_.end() || it->second.owner != owner) {
+        return {grpc::StatusCode::NOT_FOUND, std::string{kNotFoundTicket}};
     }
-    *out = &it->second;
+    *out = drop_locked(it);
     return grpc::Status::OK;
 }
 
-grpc::Status FlightSqlCore::create_prepared(const std::string& query, std::string* handle_out) {
+CachedResultPtr FlightSqlCore::drop_locked(std::unordered_map<std::string, CacheEntry>::iterator it) {
+    assert(it != results_.end());
+    auto result = std::move(it->second.result);
+    cached_bytes_ -= result->bytes;
+    result_order_.erase(it->second.order);
+    results_.erase(it);
+    return result;
+}
+
+std::size_t FlightSqlCore::cached_results() const {
+    std::lock_guard lock(mutex_);
+    return results_.size();
+}
+
+std::size_t FlightSqlCore::cached_bytes() const {
+    std::lock_guard lock(mutex_);
+    return cached_bytes_;
+}
+
+grpc::Status FlightSqlCore::create_prepared(const std::string& query, const std::string& owner,
+                                            std::string* handle_out) {
+    OTX_ZONE_N("flight::create_prepared");
+    // The handle first: without secure bytes nothing is prepared.
+    auto handle = new_id(kPreparedPrefix);
+    if (!handle.has_value()) {
+        return no_secure_id();
+    }
     Prepared prepared;
+    otterstax::session::session_ptr session;
     try {
-        prepared = engine_->prepare(query);
+        std::tie(prepared, session) = engine_->prepare(query);
     } catch (const EngineError& e) {
         return {grpc::StatusCode::INVALID_ARGUMENT, e.what()};
     } catch (const std::exception& e) {
         return {grpc::StatusCode::INTERNAL, e.what()};
     }
-    const std::string handle = "otterstax-prepared/" + std::to_string(prepared_counter_.fetch_add(1));
     std::lock_guard lock(mutex_);
-    prepared_[handle] = PreparedStatementState{std::move(prepared), {}};
-    *handle_out = handle;
+    // A repeat of 128 random bits: never expected, never an overwrite (the
+    // entry not taken closes its session).
+    if (!prepared_.emplace(*handle, PreparedEntry{owner, PreparedStatementState{std::move(prepared), {}}, std::move(session)})
+             .second) {
+        return no_secure_id();
+    }
+    *handle_out = std::move(*handle);
     return grpc::Status::OK;
 }
 
-grpc::Status FlightSqlCore::close_prepared(const std::string& handle) {
+grpc::Status FlightSqlCore::close_prepared(const std::string& handle, const std::string& owner) {
+    OTX_ZONE_N("flight::close_prepared");
     std::lock_guard lock(mutex_);
     const auto it = prepared_.find(handle);
-    if (it == prepared_.end()) {
-        return {grpc::StatusCode::NOT_FOUND, "flight-sql: unknown prepared statement handle"};
+    if (it == prepared_.end() || it->second.owner != owner) {
+        return {grpc::StatusCode::NOT_FOUND, std::string{kNotFoundPrepared}};
     }
-    // Let the engine release its resource (e.g. a never-executed statement on
-    // a Worker) before the PreparedStatementState is destroyed.
-    engine_->close_prepared(it->second.prepared);
+    // Closes the statement's session under the lock, so no execution step can
+    // reach it any more; a statement it took runs to its end.
     prepared_.erase(it);
     return grpc::Status::OK;
 }
 
-grpc::Status FlightSqlCore::prepared_lookup(const std::string& handle,
-                                            PreparedStatementState const** out) const {
+grpc::Status FlightSqlCore::prepared_lookup(const std::string& handle, const std::string& owner,
+                                            PreparedStatementState* out) const {
     std::lock_guard lock(mutex_);
     const auto it = prepared_.find(handle);
-    if (it == prepared_.end()) {
-        return {grpc::StatusCode::NOT_FOUND, "flight-sql: unknown prepared statement handle"};
+    if (it == prepared_.end() || it->second.owner != owner) {
+        return {grpc::StatusCode::NOT_FOUND, std::string{kNotFoundPrepared}};
     }
-    *out = &it->second;
+    *out = it->second.state;
     return grpc::Status::OK;
 }
 
-grpc::Status FlightSqlCore::prepared_bind(const std::string& handle, BoundParams rows) {
+grpc::Status FlightSqlCore::prepared_bind(const std::string& handle, const std::string& owner, BoundParams rows) {
+    OTX_ZONE_N("flight::prepared_bind");
     std::lock_guard lock(mutex_);
     const auto it = prepared_.find(handle);
-    if (it == prepared_.end()) {
-        return {grpc::StatusCode::NOT_FOUND, "flight-sql: unknown prepared statement handle"};
+    if (it == prepared_.end() || it->second.owner != owner) {
+        return {grpc::StatusCode::NOT_FOUND, std::string{kNotFoundPrepared}};
     }
-    it->second.bound = std::move(rows);
+    // An execution that copied the old state keeps reading it.
+    it->second.state.bound = std::move(rows);
     return grpc::Status::OK;
+}
+
+template<typename Run>
+grpc::Status FlightSqlCore::run_prepared(const std::string& handle, const std::string& owner, Run run) {
+    PreparedStatementState state;
+    if (auto status = prepared_lookup(handle, owner, &state); !status.ok()) {
+        return status;
+    }
+    try {
+        run(state);
+    } catch (const EngineError& e) {
+        // Closed under the execution: a step that found no session, or a
+        // statement the closed session answered without running it.
+        std::lock_guard lock(mutex_);
+        if (!prepared_.contains(handle)) {
+            return {grpc::StatusCode::NOT_FOUND, std::string{kNotFoundPrepared}};
+        }
+        return {grpc::StatusCode::INVALID_ARGUMENT, e.what()};
+    } catch (const std::exception& e) {
+        return {grpc::StatusCode::INTERNAL, e.what()};
+    }
+    return grpc::Status::OK;
+}
+
+grpc::Status FlightSqlCore::execute_prepared(const std::string& handle, const std::string& owner, QueryResult* out) {
+    OTX_ZONE_N("flight::execute_prepared");
+    return run_prepared(handle, owner, [&](const PreparedStatementState& state) {
+        *out = engine_->execute_prepared(*this, handle, state.prepared, state.bound);
+    });
+}
+
+grpc::Status FlightSqlCore::execute_update_prepared(const std::string& handle, const std::string& owner,
+                                                    std::int64_t* out) {
+    OTX_ZONE_N("flight::execute_update_prepared");
+    return run_prepared(handle, owner, [&](const PreparedStatementState& state) {
+        *out = engine_->execute_update_prepared(*this, handle, state.prepared, state.bound);
+    });
 }
 
 } // namespace flight::core

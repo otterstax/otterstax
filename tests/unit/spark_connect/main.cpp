@@ -9,7 +9,7 @@
 
 // Path B's ExpressionString filter routes through GreenplumParser, which logs
 // through get_logger(logger_tag::PARSER); the named loggers must exist before
-// the first parse_fragment() call (in production ComponentManager initializes
+// the first parse_fragment() call (in production main.cpp initializes
 // them before any actor is spawned).
 int main(int argc, char* argv[]) {
     initialize_all_loggers((std::filesystem::temp_directory_path() / "otterstax-test-logs").string());

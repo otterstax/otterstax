@@ -9,21 +9,21 @@
 // synthetic rows. Defined in catalog_relations.cpp.
 //
 // What Spark sees (read_catalog):
-//   * a database is a user pg_namespace row (oid >= FIRST_USER_OID) — the
-//     connection alias of a mirror database, the name given to CREATE DATABASE
-//     otherwise — plus "default", which holds the tables created unqualified
-//     (relnamespace 0) and is the current database;
+//   * a database is a user pg_namespace row (oid >= FIRST_USER_OID) — the name
+//     given to CREATE DATABASE — a connection alias that has remote tables, and
+//     "default", which holds the tables created unqualified (relnamespace 0) and
+//     is the current database;
 //   * a table is a user pg_class row of kind r / g (tableType MANAGED) or v / m
-//     (VIEW) in one of those databases. Its namespace is chosen so that
-//     ".".join(namespace + [name]) is the name the SQL path resolves:
-//       mirror of a MySQL / ClickHouse table, `<db>::<table>`    [alias, db]
-//       mirror of a PostgreSQL table, `<db>:<schema>:<table>`    [alias, db, schema]
-//       table of database d                                      [d]
-//       table created unqualified                                []
-//     A mirror database is the one that holds the mirror manifest.
+//     (VIEW) in one of those databases, or a row of federation.remote_tables
+//     (MANAGED). Its namespace is chosen so that ".".join(namespace + [name]) is
+//     the name the SQL path resolves:
+//       remote MySQL / ClickHouse table                         [alias, db]
+//       remote PostgreSQL table                                 [alias, db, schema]
+//       table of database d                                     [d]
+//       table created unqualified                               []
 //   * hidden: system rows, indexes / sequences / composite types / macros, the
-//     mirror manifest `__otterstax_tables`, and the Kafka bookkeeping tables
-//     `kafka.__sources` / `kafka.<source>__offsets`.
+//     federation metadata database `federation` and its tables, and the Kafka
+//     bookkeeping tables `kafka.__sources` / `kafka.<source>__offsets`.
 //
 // PySpark reads every answer BY POSITION (3.5: pdf.iloc[..]; 4.x: table[i][j]),
 // so the column order below is the contract; the names are Spark's own. An
@@ -40,7 +40,7 @@
 // PySpark 3.5 reads the first six Column fields, 4.x all seven (isCluster).
 // description and locationUri are NULL: the engine keeps neither.
 
-#include "scheduler/session_data.hpp"
+#include "session/session_payload.hpp"
 
 #include <components/types/types.hpp>
 #include <core/result_wrapper.hpp>
@@ -78,13 +78,15 @@ namespace frontend::spark::catalog_rows {
     // The catalog from the results of
     //   SELECT oid, nspname FROM pg_catalog.pg_namespace
     //   SELECT oid, relname, relnamespace, relkind FROM pg_catalog.pg_class
+    //   SELECT uid, database_name, schema_name, table_name, remote_database
+    //     FROM federation.remote_tables
     // Columns are found by name; an OID may come in any integer type. A missing
-    // column, a NULL or mistyped cell, or a mirror name not spelled
-    // `<db>:<schema>:<table>` is a schema_error. pg_class is expected to be read
-    // first: a table whose namespace `namespaces` no longer holds was dropped
-    // with its database (DROP DATABASE cascades) and is not listed.
+    // column, or a NULL or mistyped cell, is a schema_error. pg_class is expected
+    // to be read first: a table whose namespace `namespaces` no longer holds was
+    // dropped with its database (DROP DATABASE cascades) and is not listed.
     core::result_wrapper_t<catalog_view_t> read_catalog(const session_payload& namespaces,
                                                         const session_payload& classes,
+                                                        const session_payload& remote_tables,
                                                         std::pmr::memory_resource* resource);
 
     // Spark's name pattern (StringUtils.filterPattern): trimmed, '|' separates

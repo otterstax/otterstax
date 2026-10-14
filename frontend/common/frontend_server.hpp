@@ -5,6 +5,7 @@
 
 #include "frontend_connection.hpp"
 #include "protocol_config.hpp"
+#include "session/session_factory.hpp"
 #include "utility/logger.hpp"
 #include "utility/thread_pool_manager.hpp"
 #include "utility/tracy_profiler.hpp"
@@ -23,7 +24,8 @@ namespace frontend {
     struct frontend_server_config {
         std::pmr::memory_resource* resource;
         uint16_t port;
-        actor_zeta::address_t scheduler;
+        // Opens the query session of every accepted connection; outlives the server.
+        otterstax::session::session_factory_t* sessions;
         // How long a connection waits for the next client bytes before it is
         // closed as idle. Production passes CONNECTION_TIMEOUT_SEC; there is no
         // default — a zero timeout is a configuration error (asserted).
@@ -32,11 +34,15 @@ namespace frontend {
         // Production passes ACCEPT_RETRY_DELAY_MS; no default — a zero delay is a
         // configuration error (asserted).
         std::chrono::milliseconds accept_retry_delay;
-        size_t pool_size = std::thread::hardware_concurrency();
+        // Threads of the server's asio pool (service.runtime.mysql_io /
+        // postgres_io, resolved by main.cpp). A connection holds one while
+        // its statement runs, so this bounds the statements in flight over the
+        // wire. No default — zero threads would serve nothing (asserted).
+        size_t pool_size;
     };
 
     template<typename DerivedConnection>
-    class frontend_server : public connection_close_sink {
+    class frontend_server {
     public:
         explicit frontend_server(const frontend_server_config& config)
             : resource_(config.resource)
@@ -45,15 +51,16 @@ namespace frontend {
             , reject_packet_(DerivedConnection::build_too_many_connections_error())
             , accept_retry_timer_(thread_pool_manager_.ctx())
             , next_connection_id_(1)
-            , scheduler_(config.scheduler)
+            , sessions_(config.sessions)
             , read_timeout_(config.read_timeout)
             , accept_retry_delay_(config.accept_retry_delay)
             , log_(get_logger(logger_tag::FRONTEND_SERVER)) {
             assert(log_.is_valid());
             assert(resource_ != nullptr && "memory resource must not be null");
-            assert(static_cast<bool>(scheduler_) && "scheduler address must not be null");
+            assert(sessions_ != nullptr && "the session factory must not be null");
             assert(read_timeout_.count() > 0 && "read timeout must be positive");
             assert(accept_retry_delay_.count() > 0 && "accept retry delay must be positive");
+            assert(config.pool_size > 0 && "a frontend server needs at least one thread");
             connection_pool_.reserve(MAX_CONNECTIONS);
         }
 
@@ -145,8 +152,8 @@ namespace frontend {
                     connection_pool_[*slot] = std::make_unique<DerivedConnection>(resource_,
                                                                                   std::move(socket),
                                                                                   next_connection_id_.fetch_add(1),
-                                                                                  scheduler_,
-                                                                                  *this,
+                                                                                  *sessions_,
+                                                                                  close_sink_,
                                                                                   *slot,
                                                                                   read_timeout_);
                     log_->debug("Connection accepted (slot {})", *slot);
@@ -216,9 +223,9 @@ namespace frontend {
             return std::nullopt;
         }
 
-        // connection_close_sink: called by a connection from its own executor
-        // when it closes; destroys the connection and frees the slot.
-        void release_connection_slot(size_t slot) override {
+        // Called by a connection from its own executor when it closes (through
+        // close_sink_); destroys the connection and frees the slot.
+        void release_connection_slot(size_t slot) {
             log_->debug("Connection closed (slot {})", slot);
             std::lock_guard lock(pool_mutex_);
 
@@ -238,7 +245,7 @@ namespace frontend {
         // runs on, so it is destroyed first.
         boost::asio::steady_timer accept_retry_timer_;
 
-        actor_zeta::address_t scheduler_;
+        otterstax::session::session_factory_t* sessions_;
         std::atomic<uint32_t> next_connection_id_;
         std::chrono::milliseconds read_timeout_;
         std::chrono::milliseconds accept_retry_delay_;
@@ -248,6 +255,23 @@ namespace frontend {
 
         mutable OTX_LOCKABLE_N(std::mutex, pool_mutex_, "frontend::pool_lock");
         std::atomic<bool> stopped_{false};
+
+        // The connections' close sink: a member, not a base class. The pool's
+        // threads run until stop() in the destructor's body, and a base class's
+        // vptr is rewritten as its destructor starts — before that body — so a
+        // connection's last completion would make its virtual call into an
+        // object whose dynamic type is changing (TSAN: data race on vptr). A
+        // member is destroyed only after the body has joined the pool.
+        class close_sink_t final : public connection_close_sink {
+        public:
+            explicit close_sink_t(frontend_server& server)
+                : server_(server) {}
+            void release_connection_slot(size_t slot) override { server_.release_connection_slot(slot); }
+
+        private:
+            frontend_server& server_;
+        };
+        close_sink_t close_sink_{*this};
     };
 
 } // namespace frontend

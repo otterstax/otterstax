@@ -8,7 +8,7 @@
 // one row whose one STRING column is named "show_string" (a 3.5 client reads it
 // by that name, a 4.x client by position). Spark's own server builds the string
 // in Dataset.showString; this is that rendering as Spark 4.2.0 has it, applied
-// to the rows the Scheduler returns for the ShowString's input:
+// to the rows the query session returns for the ShowString's input:
 //  - a cell reads as Spark's ToPrettyString spells it: NULL, true / false,
 //    integers in decimal, FLOAT / DOUBLE as Java's toString (the shortest digits
 //    that read back as the value; plain with at least one fractional digit for
@@ -29,7 +29,7 @@
 // A cell of any other type is a conversion_failure naming its column. Nothing
 // here throws.
 
-#include "scheduler/session_data.hpp"
+#include "session/session_payload.hpp"
 
 #include <components/types/types.hpp>
 #include <components/vector/data_chunk.hpp>

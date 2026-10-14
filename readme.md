@@ -363,11 +363,12 @@ otterstax/
 ├── frontend/           # Protocol servers (FlightSQL, MySQL, PostgreSQL)
 ├── catalog/            # Metadata catalog + connection type registry
 ├── connectors/         # MySQL / PG / ClickHouse / S3 / file connectors
-├── component_manager/  # Component lifecycle management
+├── runtime/            # runtime_t (memory + thread pools) and engine_t (embedded Otterbrix)
+├── backends/           # remote_backends_t (connectors, integration backends), s3 aliases, federation metadata
+├── session/            # query_session_t: one per client connection, the query pipeline
 ├── config/             # Configuration loading and runtime settings
-├── integration/        # Actor wrappers bridging Scheduler ↔ connectors (incl. S3Manager)
+├── integration/        # Actor wrappers bridging query sessions ↔ connectors (incl. S3Manager)
 ├── otterbrix/          # Otterbrix engine integration + s3/file grammar extensions
-├── scheduler/          # Query routing actor
 ├── cmake/              # Build helpers (parser-extension macro)
 ├── tests/              # Catch2 C++ tests + python integration suite
 ├── examples/           # Demo stack (examples/demo/) + simple client examples (examples/simple/)

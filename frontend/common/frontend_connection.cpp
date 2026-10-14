@@ -63,8 +63,8 @@ namespace frontend {
     }
 
     void frontend_connection::release() {
-        // Releases what the connection holds on the Scheduler (unexecuted
-        // prepared statements); the connection is whole here and nothing else
+        // Closes the connection's query session (its unexecuted prepared
+        // statements go with it); the connection is whole here and nothing else
         // of it is queued anywhere.
         finish_impl();
 

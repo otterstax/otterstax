@@ -6,6 +6,8 @@
 #include "errors.hpp"
 #include "utility/logger.hpp"
 #include "utility/tracy_profiler.hpp"
+#include <sys/socket.h>
+
 #include <functional>
 #include <memory>
 #include <string>
@@ -34,8 +36,27 @@ namespace pg {
         if (status_ != Status::Connected) {
             return;
         }
-        conn_.reset();
+        replace_connection(nullptr);
         status_ = Status::Closed;
+    }
+
+    void Connector::replace_connection(PGConnPtr next) noexcept {
+        std::lock_guard guard(conn_mutex_);
+        conn_ = std::move(next);
+    }
+
+    void Connector::cancel() noexcept {
+        OTX_ZONE_N("pg::Connector::cancel");
+        cancelled_.store(true, std::memory_order_release);
+        std::lock_guard guard(conn_mutex_);
+        if (!conn_) {
+            return;
+        }
+        // shutdown(2), not close(2): the descriptor stays libpq's (PQfinish closes it), so it cannot
+        // be reused under the thread blocked in PQexec, which wakes up to the EOF.
+        if (const int socket = PQsocket(conn_.get()); socket >= 0) {
+            ::shutdown(socket, SHUT_RDWR);
+        }
     }
 
     Connector::~Connector() { close(); }
@@ -64,7 +85,7 @@ namespace pg {
         log_->debug("Alias: {} connecting with: host={} port={} dbname={}",
                     alias_, params_.host, params_.port, params_.database);
 
-        conn_.reset(PQconnectdb(conn_str.c_str()));
+        replace_connection(PGConnPtr(PQconnectdb(conn_str.c_str())));
 
         if (PQstatus(conn_.get()) != CONNECTION_OK) {
             std::string err = PQerrorMessage(conn_.get());
@@ -110,7 +131,7 @@ namespace pg {
 
         do {
             log_->debug("Alias: {} Attempt: {}", alias_, attempts);
-            conn_.reset(PQconnectdb(conn_str.c_str()));
+            replace_connection(PGConnPtr(PQconnectdb(conn_str.c_str())));
 
             if (PQstatus(conn_.get()) == CONNECTION_OK) {
                 log_->debug("Alias: {} Reconnect success", alias_);

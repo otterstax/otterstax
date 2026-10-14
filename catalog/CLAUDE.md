@@ -4,130 +4,130 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Role
 
-`catalog/` contains a single actor: `mysql::CatalogManager`. It serves two purposes:
+`catalog/` (CMake target `catalog`) holds the catalog **building blocks** — pure functions and small
+types, no actor and no I/O. The engine's own catalog is the only catalog: remote servers, tables and
+columns are rows of ordinary engine tables in the database `federation` (layout:
+`otterbrix/federation/metadata.hpp`), and a remote name is answered by the federation's `need` /
+`decide` hooks (`otterbrix/federation/CLAUDE.md`). What lives here builds the plans that write those
+rows, decides when a statement's failure is a rediscovery, names the database names user DDL must
+leave alone, and turns the catalog rows into a table listing.
 
-1. **Schema resolution** — given a parsed query, resolves every external (remote-backend) table to the schema discovered at registration time, stamps the engine OID onto the plan node, and classifies the statement's `backend_type` so the Worker can route it.
-2. **External-table registration** — discovers table schemas on the remote backends and mirrors them into the engine `pg_catalog` (through `OtterbrixManager`) so the planner can resolve them by OID.
+| File | What |
+|------|------|
+| `discovery.hpp` | The handwritten discovery queries (the reply of a backend's `discover` is `federation::discovered_table_t` / `discovered_tables_t`, `otterbrix/federation/provider.hpp`) and `escape_sql_literal`; a backend's kind is `backend_type_t` (`otterbrix/backend_type.hpp`) everywhere |
+| `remote_metadata.hpp` | Plans that write the federation metadata (bootstrap, the rows of another backend kind, a discovery reply), the read of one remote table's spelling, the leftover-mirror probe / drop |
+| `remote_rediscovery.hpp` | The session's "does not exist / stale → rediscover → upsert → retry once" flow |
+| `ownership.hpp` | `check_database_ownership`: the names a CREATE / DROP DATABASE must leave alone |
+| `introspection.hpp` | The Flight SQL GetTables listing (`list_tables`) and the reads it is computed from |
 
-Despite the `mysql::` namespace the class handles all three backend types.
+Nothing here throws; every failure is a `core::result_wrapper_t` / `core::error_t` value.
 
-The catalog reaches a backend only through its integration actor: schema discovery is a `discover` message to `db::MySQLManager` / `db::PostgressManager` / `db::ClickhouseManager` (addresses set once through `CatalogManager::set_backend_managers`, which `ComponentManager` calls), and the catalog `co_await`s the reply — it never holds a connector manager and never blocks on a connector future.
+## Discovery (`discovery.hpp`)
 
-`catalog/discovery.hpp` holds what the catalog and those actors share: `catalog_ext::ConnectionType`, `discovered_table_t` / `discovered_tables_t` (the reply of `discover`), and the handwritten query builders. `otterstax::catalog::escape_sql_literal(resource, value, backend)` quotes the values embedded in the discovery list queries (`information_schema.tables` / `system.tables`) and in the ClickHouse named-types query (`make_named_types_query`, `system.columns`). It is dialect-aware: the apostrophe is doubled everywhere, and the backslash is doubled for MySQL and ClickHouse, where it is an escape character inside a literal. Every per-table probe goes through `sql_gen::generate_query` instead (`make_schema_probe_query`).
+A backend (`integration/{sql,postgresql,clickhouse}`, `federation::backend_t`) answers `discover(scope)`:
+empty `scope.collection` → every base table of the database (MySQL / ClickHouse) or schema
+(PostgreSQL), a list query then one probe per table; non-empty → that table. The metadata queries
+(PostgreSQL `pg_enum` and the primary keys of `make_primary_keys_query`, ClickHouse `system.columns`)
+are part of the discovery: their failure fails it. `federation::discovered_table_t::primary_key` holds the table's
+primary key columns (backend spelling, key order): MySQL reads them off the probe's column definitions
+(`PRI_KEY_FLAG`), PostgreSQL from `pg_index.indisprimary` (one query per discovery, in `indkey` order, a
+partitioned table's key being its parent's), ClickHouse has none (a sorting key names no row).
+Each backend's `discover` empties a key that has a column no literal the federation's row-change sink
+writes names exactly: a binary column (PostgreSQL `bytea`, MySQL
+`BINARY` / `VARBINARY` / `BLOB` / `GEOMETRY`; each actor names them from the probe's wire types — the
+engine holds such a value as a STRING_LITERAL of raw bytes) and a MySQL DECIMAL the engine holds as its
+text (wider than 38 digits, from the probe's column type and the discovered type: MySQL compares a
+DECIMAL column with a string literal as DOUBLE; PostgreSQL resolves the untyped literal to its NUMERIC
+and keeps such a key). A part of a key could name several rows — so the table has no key, and its rows
+are not changed one by one.
+`escape_sql_literal(resource, value, backend)` quotes the values embedded in the list queries
+(`information_schema.tables` / `system.tables`) and in `make_named_types_query`: the apostrophe is
+doubled everywhere, the backslash for MySQL and ClickHouse too. Every per-table probe goes through
+`sql_gen::generate_query` (`make_schema_probe_query`, `WHERE 1 = 0`).
 
-## Actor Handlers (`dispatch_traits`)
+Startup: `remote_backends_t::open` (`backends/`) runs the discovery of every configured connection and
+keeps a connection only when its reply can be recorded (`make_discovery_upsert` validates it); a
+connection whose discovery fails is removed from its connector manager and left out (logged).
+`backends::publish_federation_metadata` (`backends/backends.hpp`) writes the replies once the engine is open.
 
-| Method | Called by | Purpose |
-|--------|-----------|---------|
-| `update_backend_type` | `Worker::execute` (statements with external nodes) | Lazily registers unknown external tables, stamps OIDs, sets `backend_type`; classifying a statement that already carries a backend type is an `invalid_parameter` error |
-| `get_catalog_schema` | `Worker::prepare_schema` (extended-protocol prepare) | Same pre-pass as `update_backend_type`, then rewrites each external aggregate into a `schema_node_t` carrying the projected output schema |
-| `add_connection_schema(name, type)` | The three `ConnectorManager::addConnection` (eager, at startup; the message names the backend type, which the manager knows) and the catalog itself (lazily, from the pre-pass above, with the type from `connection_registry_` — a uid the registry does not know is `do_not_exists`) | Send `discover(name)` to the backend actor of `type`, register the discovered table(s) in the engine, mirror them in `store_`. A uid already registered under another type is `invalid_parameter`; a type whose backend actor address is empty is `do_not_exists`. See "Registration on a persisted data dir" below |
-| `get_tables` | FlightSQL frontend (`DoGetTables`) | List mirrored tables for the `GetTables` RPC. `catalog` is an exact match on the database part; `db_schema_filter_pattern` / `table_name_filter_pattern` are SQL LIKE patterns (`%`, `_`); a non-empty `table_types` lists anything only if it names `catalog_ext::table_type_name` (`"TABLE"`) |
-| `check_database_ownership` | `Worker::guard_database_ddl` (every `CREATE DATABASE` / `DROP DATABASE`, on all three Worker entry points) | Answers `invalid_parameter` (`database '<name>' is owned by connection '<uid>'`) when the name matches a uid in `connection_registry_` or `KAFKA_DATABASE_NAME`, case-insensitively — the engine database mirroring a connection must not be created or dropped by user DDL. Any other name passes with `no_error` |
+## Federation metadata (`remote_metadata.hpp`)
 
-There is no removal handler: connections are read once from `config.yaml` at startup and live for the process lifetime.
+Functions that BUILD execution plans; the caller runs them on one engine session, inside
+`BEGIN … COMMIT`, in order (plans are single-use):
 
-## State
+| Function | Plans |
+|----------|-------|
+| `make_metadata_bootstrap(resource)` | `CREATE DATABASE IF NOT EXISTS federation`, `CREATE TABLE IF NOT EXISTS` × 2 — idempotent, run at every start |
+| `make_other_kind_removal(resource, uid, kind)` | the `remote_tables` / `remote_columns` rows of the uid (folded to lower case, the key they are written under) written for another backend kind than `kind` removed — an alias that now names a server of another kind: those rows are keyed by database where the new kind keys by schema, or the reverse, so no discovery would replace them; run for every configured connection at startup |
+| `make_discovery_upsert(resource, kind, scope, tables)` | a `discover` reply → rows. Empty `scope.collection`: every row under the scope's database (MySQL / ClickHouse) or schema (PostgreSQL) is replaced, so a table the backend dropped disappears; named collection: that table's rows replaced (a reply without tables removes them). Columns: `column_name` lower case, `remote_column` the backend's spelling, `column_type` otterbrix's type spec (`components::catalog::encode_type_spec`; a built-in scalar by its pg_type name), `ordinal` 1-based, `key_position` the column's 1-based position in the primary key (0: not a key column). `schema_error` for a nameless column, two columns folding to one name or a primary key column that is not a column of the table, `conversion_failure` for a type the spec cannot carry; tables folding to one key keep the first |
+| `make_remote_table_read(resource, key)` | the rows of one remote table, its backend spelling among them (`remote_database`, `remote_schema`, `remote_table`; read by `with_remote_spelling`, `remote_rediscovery.hpp`) — what a rediscovery of a known table asks the backend for |
+| `make_legacy_mirror_probe(resource, uid)` / `make_legacy_mirror_drop(resource, uid)` | a database an older OtterStax kept per connection uid (its mirrors and the manifest `__otterstax_tables`): the probe answers rows when the manifest is there, the drop is `DROP DATABASE` of the uid (CASCADE). `publish_federation_metadata` runs them for every configured uid before writing the metadata, because such a database would capture the connection's remote names (G1) |
 
-- `otterstax::catalog::schema_store_t store_` — actor-confined mirror of external table schemas (qualified name + STRUCT, keyed by engine pg_class oid); the tables themselves are registered in the engine pg_catalog via `OtterbrixManager`, one engine database per connection uid
-- `connection_registry_` (`pmr::unordered_map<uid, ConnectionType>`) — private to the actor; a uid is entered only after `add_connection_schema` mirrored its tables, so a registry miss is what makes a registration the uid's first in this process (the one that runs `register_external_database` and the stale-mirror drop; a failed attempt repeats it). It drives the two catalog-internal decisions that need a backend type before the store is consulted: dropping the schema qualifier for non-PostgreSQL targets during the pre-pass, and `backend_type` classification. Nothing outside the catalog reads it — the Worker routes on the `backend_type` / `node_backend_types` the catalog writes onto `ParsedQueryData`
-- Three backend actor addresses (`set_backend_managers`, called by `ComponentManager` once the integration actors exist — the connector managers were built with the catalog's address first, hence the setter). The catalog holds no connector manager: the per-connection metadata a query needs (PostgreSQL ENUM oids, ClickHouse named types) is state of the actor that discovered it
-- No locking besides `mutex_` in `enqueue_impl`: every handler body runs to completion on the sender's thread under that mutex, so the registry and the store never see concurrent access. The `discover` reply is settled by the time `send` returns (the backend actors run their handlers to completion the same way), so the `co_await` on it never suspends across another catalog message
+The metadata database name `federation` is reserved: `config.yaml` refuses a connection alias
+`federation` in any case (`config/CLAUDE.md`), and `check_database_ownership` refuses user DDL on it.
 
-## Backend-type classification (`update_backend_type_impl`)
+## Rediscovery (`remote_rediscovery.hpp`)
 
-`update_backend_type_impl` iterates `data->otterbrix_params->external_nodes`
-and sets `data->backend_type` from what it finds:
+The query session's recovery (`query_session_t::run_on_engine`): a statement fails →
+`rediscovery_targets(error, names, registry)` answers the targets
+(`rediscovery_target_t{type, key, discovery_scope}`) when the error is a missing relation
+(`table_not_exists`, `database_not_exists`, or the engine's "schema … does not exist"
+`invalid_parameter`) or a stale remote schema (the storage's `schema_error` "… changed since it was
+discovered": a column of another type or another number of columns, of the scan or a pushed block) and a statement name resolves to a uid; the session
+retries a statement once, whatever the retry answers. `discovery_scope` is what the backend's
+`discover` takes: the uid in its config spelling, the database / schema / table as the statement wrote them (a quoted identifier keeps its
+case). For a table the metadata already holds, `with_remote_spelling(target, rows)` replaces the
+written spelling with the backend's (the rows `make_remote_table_read` read): a case-sensitive backend finds
+`Orders`, not `orders`. `make_rediscovery_plans(resource, target, reply)` turns the reply into upsert
+plans; an error reply keeps its code, an empty reply is `table_not_exists` — the session then reports
+the statement's original error.
 
-- ≥ 2 distinct registered backend connections present → `Mixed`.
-- Exactly one registered backend present → that backend (`MySQL`,
-  `PostgreSQL`, or `ClickHouse`).
-- No registered backend, but the plan root (`otterbrix_params->node`) is
-  `join_t` / `intersect_t` / `union_t` → `Otterbrix`.
-- Otherwise → `schema_error`.
+`rediscovery_claim_t::try_claim(key)` — a process-wide set of the keys being rediscovered: two
+sessions that miss the same table at once rediscover it once instead of each writing a copy of its
+rows (the second skips the discovery; its retry sees the rows if the first has written them by then). `decide` also reads a column recorded twice
+once (`otterbrix/federation/name_resolution.cpp`), so a row duplicated anyway never doubles a column.
 
-DDL targets are exempt from OID stamping and from lazy registration: `CREATE`
-targets a table that does not exist yet, `DROP TABLE` / `DROP INDEX` remove one.
-Those two are the only drop kinds the parser lets into `external_nodes`
-(`carries_table_reference`); any other drop kind there is an
-`invalid_parameter` error, not a target to skip. Subquery stubs
-(`schema_node_t`, `node_type::unused`) are exempt too: they name no relation to
-register, so there is nothing to stamp an OID onto. Their schema is the
-backend's: the `describe` handler of the backend that owns the slot — MySQL,
-PostgreSQL or ClickHouse — writes it into the stub at prepare
-(`integration/CLAUDE.md`); a stub nobody described carries `NA`.
+## Owned database names (`ownership.hpp`)
 
-**Backend ⋈ otterbrix-internal isn't `Mixed`.** The parser drops local tables
-from `external_nodes` (`otterbrix/parser/parser.cpp` — empty
-`unique_identifier` skipped) so the catalog only sees the registered backend
-side. The query is classified as that single backend type. The backend
-manager fetches its slice, inlines it as `node_raw_data`, and the
-`OtterbrixManager` resolves the still-symbolic local-table nodes via their
-stamped `table_oid` (set on `target.oid` here) before running the JOIN.
-`examples/demo/sql/step_4.sql` is the live demo of this.
+`CREATE DATABASE` / `DROP DATABASE` are engine-local by grammar; three kinds of name belong to
+OtterStax: a connection uid of the federation registry (an engine database of that name would capture
+the connection's remote names — the engine resolves its own catalog first), `kafka` (the Kafka object
+database) and `federation` (the metadata). `check_database_ownership(resource, name)` answers
+`invalid_parameter` `database '<name>' is owned by connection '<owner>'` for them, ASCII
+case-insensitively (an unquoted identifier reaches the engine lower-cased), the owner in its own
+spelling. The query session checks every CREATE / DROP DATABASE before it reaches the engine,
+on every entry point that runs or describes a plan.
 
-## Registration on a persisted data dir
+## Introspection (`introspection.hpp`)
 
-The engine restores its catalog from disk, so on a restart the uid's mirror
-database and its collections already exist when `add_connection_schema` runs.
-`register_tables` reconciles instead of refusing, on the uid's first
-registration in the process (registry miss):
-
-1. `OtterbrixManager::register_external_database(uid)` — creates the database,
-   or answers `false` when the engine already holds it: `check_database_ownership`
-   keeps user DDL off the name, so an existing database of the uid's name is
-   the previous run's mirror (the only exception is a data dir written before
-   the guard existed, where a user database of that name is taken for the
-   mirror).
-2. When it was reused, `OtterbrixManager::drop_stale_external_tables(uid, live)`
-   with the discovered names: every mirror the uid's manifest lists that the
-   discovery did not return is dropped.
-3. Per discovered table, `register_external_table` (unchanged call): the engine
-   side creates an absent collection, reuses a present one with the same column
-   names and types under its restored OID, and drops + recreates one whose
-   schema changed. The OID it answers — created or restored — is what `store_`
-   holds, exactly as for a fresh registration.
-
-The manifest, the engine-side probe and the encoding live in
-`integration/otterbrix/otterbrix_manager.*` (see `integration/CLAUDE.md`).
-`tests/system/test_restart_reconciliation.cpp` drives all three outcomes over
-a real engine restarted on the same data dir.
-
-## Discovery contract (`discover` on the backend actors)
-
-`discover_connection_schemas` picks the backend actor by `ConnectionType` and
-sends it `discover(name)`. Empty `name.collection` → every base table of the
-database/schema the name carries (list query, then one probe per table);
-non-empty → that single table. The name is the only input: the eager path
-builds it from the connect params in `addConnection`, the lazy path takes it
-from the statement. PostgreSQL needs a non-empty schema, MySQL and ClickHouse
-a non-empty database (`missing_field`) — there is no default. The metadata
-queries (PostgreSQL `pg_enum`, ClickHouse `system.columns`) are part of the
-discovery: their failure fails it. A ClickHouse probe that returns no header
-block, or a block without columns, is a `schema_error`; a column-less table is
-never registered. A discovered column without a name (a STRUCT field whose
-type has no alias) is a `schema_error` for the whole registration, checked in
-`register_tables` before the engine database is touched: a mirrored column is
-defined by its name, and the engine's `alias()` has no null guard. PostgreSQL
-and MySQL never answer one for a table; the check keeps a backend that does from
-killing the process during the startup registration. Any per-table failure fails
-the whole discovery.
+`list_tables(resource, command, namespaces, classes, attributes, remote_tables, remote_columns)` — the
+Flight SQL GetTables answer from five reads the frontend runs through a query session
+(`namespaces_sql`, `classes_sql`, `attributes_sql`, `remote_tables_sql`, `remote_columns_sql`): the
+engine's own tables (pg_catalog, named (database, "", table)) and the remote tables the federation
+knows (named (remote database, remote schema, table), schema empty for MySQL / ClickHouse — the
+spelling the old catalog listed). Hidden: system rows and namespaces, the federation metadata tables
+(`federation.*`) and the Kafka bookkeeping tables (`kafka.__sources`, `kafka.<source>__offsets`,
+`is_internal_table`). `get_tables_command_t`: with `include_schema` the columns ride as a STRUCT named
+by the engine's column names; the GetTables filters (catalog, the LIKE patterns, table types) are the
+Flight SQL frontend's, applied over the listing (`frontend/flight_sql/core/commands.cpp`). Every table
+is listed under `table_type_name` (`"TABLE"`). The Spark catalog
+(`frontend/spark_connect_server/catalog_rows.hpp`) reads the same rows its own way.
 
 ## Gotcha: DAY/SECOND macro clash
 
-`catalog_manager.hpp` does `#undef DAY` and `#undef SECOND` after including the Otterbrix parser but before including Arrow. This is required because the Otterbrix parser defines these as macros that collide with Arrow's symbol names. Do not remove these undefs.
+A file that includes the Otterbrix parser before Arrow must `#undef DAY` and `#undef SECOND` in
+between: the parser defines them as macros that collide with Arrow's symbol names.
 
 ## Tests
 
-`tests/system/test_catalog_manager.cpp` (`test_system`) drives the actor
-directly over mocked connectors: literal escaping, `GetTables` filters, the
-DDL/drop-kind exemptions, repeated classification, and the discovery error
-paths. `tests/system/test_scheduler.cpp` covers `get_catalog_schema` through
-the sequence-root unwrap. `tests/system/test_database_ownership_guard.cpp`
-drives `check_database_ownership` through a real Scheduler stack with a
-registered mock uid (refused DDL on every entry point, mirror intact).
-`tests/system/test_restart_reconciliation.cpp` registers a PostgreSQL mock
-connection, restarts the engine on the same data dir and registers again: the
-mirror database is reused and OIDs survive, a table whose backend schema
-changed is recreated with the new columns, a table the backend dropped is
-dropped from the engine and the manifest.
+`tests/system/test_catalog.cpp` (`test_system`): literal escaping, the GetTables listing over a real
+stack (remote and local tables, `include_schema`), the startup discovery error paths (a connection
+left out, nothing recorded), the owned names, remote DDL. `tests/system/test_restart_reconciliation.cpp`:
+the metadata over restarts (rows replaced, a changed schema read with its new columns, a dropped table
+gone, a leftover mirror database dropped) and the rediscovery of a table created or changed while the
+server runs, under the backend's spelling; a composite PostgreSQL key recorded in `indkey` order as
+`key_position` and naming the row a change writes. `tests/system/test_backend_discovery.cpp`: the MySQL
+key off `PRI_KEY_FLAG`, a VARBINARY key and a key over a DECIMAL read as text dropped. `tests/system/test_database_ownership_guard.cpp`: the
+guard through a session. `tests/federation/` (`test_federation`): the metadata plans (an alias that changed
+backend kind), the claim, the rediscovery flow over a real engine
+with fake backends (a stale schema of the scan and of a pushed block, a missing relation).

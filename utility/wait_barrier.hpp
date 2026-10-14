@@ -20,7 +20,6 @@
 #include <string_view>
 #include <type_traits>
 #include <utility>
-#include <vector>
 
 namespace otterstax {
 
@@ -176,7 +175,7 @@ namespace otterstax {
     // from here, on the io thread, with a reference to that copy, which lives until
     // the co_await below has completed. A caller may therefore pass a temporary or
     // a loop-local lambda; what the handler captures by reference is still the
-    // caller's to keep alive until the future settles (QueryHandleWaiter).
+    // caller's to keep alive until the future settles.
     //
     // runQuery's own frame is created inside marshal_outcome's try, so a throw from
     // that comes back as io_error. `connector` and `query` are borrowed: the
@@ -198,58 +197,5 @@ namespace otterstax {
         promise.set_value(query_result_t<R>{std::move(error)});
         return future;
     }
-
-    template<typename T>
-    struct QueryHandleWaiter {
-        std::pmr::vector<query_future_t<T>> futures;
-        std::pmr::vector<T> results;
-
-        explicit QueryHandleWaiter(std::pmr::memory_resource* resource)
-            : futures(resource)
-            , results(resource) {}
-
-        // Consume every future in order and return the FIRST error. On failure
-        // `results` holds only the values produced before it, so callers must bound
-        // their loops by results.size() — never by futures.size().
-        //
-        // [[nodiscard]]: the three integration managers index results[j]
-        // positionally right after this call; an ignored error would turn a backend
-        // failure into an out-of-bounds read in a Release build.
-        //
-        // The error is moved out via convert_error: result_wrapper_t::error() only
-        // hands back a const&, and BOTH copying an error_t and move-ASSIGNING a
-        // result_wrapper_t (debug builds copy-assign error_) re-home its pmr::string
-        // onto the default resource through
-        // polymorphic_allocator::select_on_container_copy_construction. Only
-        // constructing/returning a prvalue preserves the connector's resource.
-        [[nodiscard]] core::result_wrapper_t<bool> wait() {
-            for (auto& future : futures) {
-                auto outcome = future.get();
-                if (outcome.has_error()) {
-                    return outcome.template convert_error<bool>();
-                }
-                results.emplace_back(std::move(outcome.value()));
-            }
-            return true;
-        }
-
-        // Unlike std::async, these futures do NOT block on destruction. Draining is
-        // load-bearing: the connector handlers capture the caller's frame by
-        // reference, so an in-flight io-thread handler must not outlive the scope
-        // that spawned it. wait() returning early on the first error leaves the tail
-        // futures to this drain.
-        ~QueryHandleWaiter() {
-            for (auto& future : futures) {
-                if (future.valid()) {
-                    future.wait();
-                }
-            }
-        }
-
-        QueryHandleWaiter(const QueryHandleWaiter&) = delete;
-        QueryHandleWaiter& operator=(const QueryHandleWaiter&) = delete;
-        QueryHandleWaiter(QueryHandleWaiter&&) = delete;
-        QueryHandleWaiter& operator=(QueryHandleWaiter&&) = delete;
-    };
 
 } // namespace otterstax

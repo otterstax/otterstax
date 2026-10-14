@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <iostream>
 #include <string>
 
@@ -13,6 +14,9 @@ namespace conn::api_server {
         std::string password;
         std::string database;
         std::string table;
+        // Connections the manager keeps open to this backend (the config's
+        // `pool_size`); each statement checks one out (>= 1).
+        std::size_t pool_size{1};
     };
 
     inline std::ostream& operator<<(std::ostream& os, const ChConnectionParams& params) {
@@ -23,6 +27,7 @@ namespace conn::api_server {
         os << "Password: " << params.password << std::endl;
         os << "Database: " << params.database << std::endl;
         os << "Table: " << params.table << std::endl;
+        os << "Pool size: " << params.pool_size << std::endl;
         return os;
     }
 

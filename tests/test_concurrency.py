@@ -4,11 +4,11 @@
 # Concurrency tests for OtterStax.
 #
 # These tests exist to catch regressions related to synchronous code paths in
-# the server. Today the scheduler, per-backend connection managers and the
-# QueryHandleWaiter use a single mutex + a busy-wait spin loop, which serialises
-# actor messages. The tests below send multiple queries concurrently and
+# the server. Every client connection owns its own query session, but a
+# backend's discovery and remote DDL still run on the session's thread (the
+# PostgreSQL / ClickHouse discoveries one at a time, under one mutex). The tests below send multiple queries concurrently and
 # report wall-clock measurements. They do NOT assert ideal parallel speedup
-# (which would fail on the current codebase) — they assert that the server:
+# — they assert that the server:
 #
 #   * does not hang or deadlock,
 #   * does not drop sessions under contention,
@@ -194,9 +194,9 @@ def test_slow_query_does_not_block_others(cfg):
 def test_isolation_across_backends(cfg):
     """Heavy query on MySQL backend in parallel with simple query on PG backend.
 
-    Both queries traverse the same Scheduler actor. If the scheduler's
-    enqueue_impl mutex blocks dispatch, the PG client will wait behind the
-    MySQL client.
+    Both queries traverse the same server process, each on its own
+    connection's query session. If anything shared serialises them, the PG
+    client will wait behind the MySQL client.
     """
     print("\n[isolation_across_backends]")
 

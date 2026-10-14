@@ -164,7 +164,7 @@ namespace file_ext {
         OTX_ZONE_N("file_ext::transform");
         assert(node->extension_id != nullptr && std::string_view(node->extension_id) == "file");
 
-        // Lower the parsed statement into an external_node_t the Scheduler routes
+        // Lower the parsed statement into an external_node_t the query session routes
         // to the file manager. The file extension carries no s3_alias.
         const auto* stmt = static_cast<const file_stmt*>(node->data);
         const auto str = [](const char* s) { return s ? std::string{s} : std::string{}; };

@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "otterbrix/backend_type.hpp"
 #include "types/otterbrix.hpp"
 #include "utility/logger.hpp"
 
@@ -21,20 +22,11 @@
 #include <unordered_map>
 #include <vector>
 
-enum class backend_type_t : uint8_t {
-    Unknown = 0,
-    MySQL = 1,
-    PostgreSQL = 2,
-    Mixed = 3,
-    Otterbrix = 4, // No external nodes, but should be executed by otterbrix
-    ClickHouse = 5
-};
-
 // Which grammar extension claimed the statement. The extension roots
-// (external_node_t, kafka_node_t) are all node_type::unused, as is the
-// schema_node_t stub, so the plan root's type cannot tell them apart; the
+// (external_node_t, kafka_node_t) are both node_type::unused, so the plan
+// root's type cannot tell them apart; the
 // parser records the claiming extension here from the ExtensionNode envelope
-// and the Worker routes on it with a static_cast.
+// and the query session routes on it with a static_cast.
 enum class extension_kind_t : uint8_t {
     none = 0,
     external = 1, // s3 / file: CREATE EXTERNAL TABLE, COPY (...) TO
@@ -54,16 +46,28 @@ struct ParsedQueryData {
 
     extension_kind_t extension_kind{extension_kind_t::none};
 
+    // The SQL text the statement was parsed from (GreenplumParser::parse); empty
+    // for a plan a frontend built itself. The query session parses it again to
+    // run the statement a second time (a plan is single-use).
+    std::string sql;
+
+    // A table-level DDL statement's target (CREATE TABLE, CREATE INDEX, DROP
+    // TABLE, the indexed table of DROP INDEX) as written, every slot — the plan
+    // node keeps only database and table; empty otherwise and for a plan a
+    // frontend built itself.
+    qualified_name_t ddl_target;
+
+    // An INSERT / UPDATE / DELETE target written with a uid slot
+    // (uid.db.schema.table), every slot; empty otherwise. The engine's
+    // transformer keeps no uid on a DML target, so the query session runs such a
+    // statement on its backend directly (query_session_t::run_remote_dml).
+    qualified_name_t dml_target;
+
     // True while the statement's `$n` hold the placeholders the parser bound to
     // reach its plan (GreenplumParser::parse): the binder reads as fully bound,
-    // but no client value has been bound yet. Cleared by the Worker once
+    // but no client value has been bound yet. Cleared by the query session once
     // execute_prepared_statement has bound and finalized the real values.
     bool awaiting_bind{false};
-
-    backend_type_t backend_type{backend_type_t::Unknown}; // Set by CatalogManager during get_catalog_schema
-
-    // For mixed backend: maps connection UID to its backend type
-    std::unordered_map<std::string, backend_type_t> node_backend_types;
 
 private:
     components::sql::transform::transform_result binder_;
@@ -81,11 +85,6 @@ public:
 class GreenplumParser : public IParser {
 public:
     explicit GreenplumParser(std::pmr::memory_resource* resource);
-    // Starts from `seed` (a host's own extensions); the built-in s3/file/kafka
-    // extensions are registered on top of it. A name collision between the two
-    // sets is not a degraded parser: every parse() then fails with the
-    // registration error.
-    GreenplumParser(std::pmr::memory_resource* resource, components::sql::parser::parser_extension_registry_t seed);
 
     core::result_wrapper_t<ParsedQueryDataPtr> parse(const std::string& sql) override;
 
@@ -94,15 +93,12 @@ public:
     // parameter node, whose id counter continues, so the fragment's ids never
     // collide with those already in the caller's plan. For a host that builds
     // a plan itself and grafts SQL into it (the Spark Connect translator: a
-    // spark.sql() leaf, a filter string). No external-node analysis: `names`
-    // receives the full name of every table the statement reads, as parse()
-    // collects them, for the caller to resolve the returned nodes against. A
+    // spark.sql() leaf, a filter string). The fragment's table names stay as
+    // written; the engine resolves them, remote ones through the federation. A
     // statement that lowers a sub-query is refused: the sub-plan would be
     // dropped with the rest of the fragment's execution plan.
     core::result_wrapper_t<components::logical_plan::node_ptr>
-    parse_fragment(const std::string& sql,
-                   components::logical_plan::parameter_node_ptr shared_params,
-                   otterstax::names::name_registry_t& names);
+    parse_fragment(const std::string& sql, components::logical_plan::parameter_node_ptr shared_params);
 
 private:
     std::pmr::memory_resource* resource_;

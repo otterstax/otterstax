@@ -112,11 +112,12 @@ endif()
 add_subdirectory(frontend)
 add_subdirectory(catalog)
 add_subdirectory(connectors)
-add_subdirectory(component_manager)
 add_subdirectory(config)
 add_subdirectory(integration)
 add_subdirectory(otterbrix)
-add_subdirectory(scheduler)
+add_subdirectory(runtime)
+add_subdirectory(session)
+add_subdirectory(backends)
 
 set(${PROJECT_NAME}_HEADERS
 
@@ -141,18 +142,20 @@ add_library(lib_${PROJECT_NAME} INTERFACE
 
 # set_property(TARGET otterbrix_${PROJECT_NAME} PROPERTY EXPORT_NAME ${PROJECT_NAME})
 
-# These internal static libs cross-reference each other (e.g. scheduler uses
-# integration handlers while integration/otterbrix_local use scheduler's
-# schema_utils), so a single left-to-right link pass can miss objects only
-# one of them pulls (e.g. integration/s3/s3_manager.o, referenced solely by
-# the Scheduler). RESCAN groups them (--start-group/--end-group) so the
-# linker re-pulls until the cycle is fully resolved. Apple's ld64 rejects
-# LINK_GROUP:RESCAN for CXX and does not need it — it re-searches archives
-# until no new symbols resolve.
+# These internal static libs cross-reference each other (e.g. session uses
+# integration handlers while the catalog and the file connector use
+# otterbrix_local's engine requests), so a single left-to-right link pass can
+# miss objects only one of them pulls. RESCAN groups them
+# (--start-group/--end-group) so the linker re-pulls until the cycle is fully
+# resolved. Apple's ld64 rejects LINK_GROUP:RESCAN for CXX and does not need
+# it — it re-searches archives until no new symbols resolve. A static lib that
+# links a group member and is linked by one belongs in the group too (CMake
+# rejects such a dependency cycle through a LINK_GROUP): flight_sql_core uses
+# common_server (secure_random_bytes) and flight_sql uses flight_sql_core.
 set(OTTERSTAX_INTERNAL_LIBS
-    flight_sql common_server mysql_server postgres_server
-    spark_connect_server catalog connectors s3 file component_manager
-    integration otterbrix_local scheduler kafka_grammar kafka_runtime)
+    flight_sql flight_sql_core common_server mysql_server postgres_server
+    spark_connect_server catalog connectors s3 file backends session runtime
+    integration otterbrix_local otterstax_federation kafka_grammar kafka_runtime)
 if(APPLE)
     set(OTTERSTAX_LINK_GROUP ${OTTERSTAX_INTERNAL_LIBS})
 else()

@@ -243,55 +243,6 @@ TEST_CASE("aggregate: grouping-key markers and hidden HAVING outputs are not col
     REQUIRE(filtered.child_types()[1].type() == logical_type::UBIGINT);
 }
 
-// A federated sub-query the SQL generator cannot write is lifted out of the
-// statement as raw text, and the backend describes its result columns onto that
-// stub (ClickhouseManager::describe). The stub IS the input relation of the
-// aggregate above it — the transformer's derived-table wrapper, which names no
-// table — so the projection is resolved against the described columns. While the
-// stub is undescribed there is nothing to resolve against, and the schema stays
-// unanswered rather than being invented.
-TEST_CASE("aggregate: a described sub-query stub types the projection above it") {
-    auto* resource = std::pmr::new_delete_resource();
-    auto [node, params] = parse("SELECT id FROM test;");
-    auto& agg = static_cast<logical_plan::node_aggregate_t&>(*node);
-
-    std::pmr::vector<otterstax::parser::qualifier_rewrite_t> no_qualifiers(resource);
-    auto stub = make_node_schema_raw(resource,
-                                     qualified_name_t(core::uid_t{"ch"}, core::dbname_t{"subq"}, core::schema_t{}, core::relname_t{"__otterstax_subq_0"}),
-                                     "SELECT toString(id) AS id FROM ch.db.schema.t",
-                                     no_qualifiers);
-    agg.append_child(stub);
-
-    SECTION("undescribed: no columns to resolve the projection against") {
-        auto computed = compute_otterbrix_schema(agg,
-                                                 params.get(),
-                                                 cursor::make_cursor(resource),
-                                                 std::pmr::map<qualified_name_t, size_t>(resource));
-        REQUIRE(computed->is_error());
-    }
-
-    SECTION("described: the projection carries the backend's type") {
-        std::pmr::vector<complex_logical_type> described(resource);
-        described.emplace_back(logical_type::STRING_LITERAL);
-        described.back().set_alias("id");
-        stub->set_schema(complex_logical_type::create_struct("", described));
-
-        auto computed = compute_otterbrix_schema(agg,
-                                                 params.get(),
-                                                 cursor::make_cursor(resource),
-                                                 std::pmr::map<qualified_name_t, size_t>(resource));
-        REQUIRE_FALSE(computed->is_error());
-        REQUIRE(computed->type_data().size() == 1);
-        const auto& schema = computed->type_data()[0];
-        REQUIRE(schema.type() == logical_type::STRUCT);
-        REQUIRE(schema.child_types().size() == 1);
-        REQUIRE(schema.child_types()[0].alias() == "id");
-        // The base column `id` is a BIGINT in every catalog; the sub-query's is
-        // the backend's String, and that is the one the client is told.
-        REQUIRE(schema.child_types()[0].type() == logical_type::STRING_LITERAL);
-    }
-}
-
 // The merged order is a contract with the client: a RowDescription names the
 // columns in it and the client decodes the row by those positions. It is the
 // order SQL itself would name them in — the left side's columns in their own

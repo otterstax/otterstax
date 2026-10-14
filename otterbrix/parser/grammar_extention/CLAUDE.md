@@ -106,26 +106,25 @@ gracefully, so the registry-aware `raw_parser` does the real parse.
 
 `transform()` lowers each statement into an `otterstax::external::external_node_t` (defined header-only in
 `grammar_extention/external_node.hpp`, tagged `node_type::unused` like `schema_node_t`) carrying
-`op` (create/copy), database, table, location, s3_alias, format, inner_sql. The `Worker`
-(`scheduler/worker.cpp`) — sitting behind the `Scheduler` router in the Scheduler→Worker pool —
-detects it via `dynamic_cast` in `execute` / `execute_statement` / `prepare_schema` and routes through
-`Worker::handle_external_statement`:
+`op` (create/copy), database, table, location, s3_alias, format, inner_sql. The connection's query session
+(`session/query_session.cpp`) detects it through `ParsedQueryData::extension_kind` in `execute` /
+`execute_statement` / `prepare_schema` and routes by the node's op to `query_session_t::load_external_table` / `copy_to`:
 
 - **CREATE EXTERNAL TABLE** loads the file/object into the engine table — `db::S3Manager::download`
   (s3://) or `conn::file::FileManager::add_file` (local path).
 - **`COPY (<select>) TO`** parses `inner_sql` and exports the result — `db::S3Manager::upload` or
   `conn::file::FileManager::dump_file` (both take the pre-parsed `OtterbrixStatementPtr`, run via
-  `db::OtterbrixManager::execute`).
+  `otterstax::engine::execute_statement` on the file manager's own engine session).
 
 s3 vs local is decided by `external_node_t::is_s3()` (the location scheme). Tests:
 `tests/unit/parser/test_external_routing.cpp` (parse → node) and the
-`Scheduler: CREATE EXTERNAL TABLE + COPY ... TO` case in `tests/system/test_file_ingestion.cpp` (full
-local-file routing through the Worker pool); the s3 path is exercised by the hidden `tests/minio`
+`session: CREATE EXTERNAL TABLE + COPY ... TO` cases in `tests/system/test_file_ingestion.cpp` (full
+local-file routing through a query session); the s3 path is exercised by the hidden `tests/minio`
 integration tests.
 
 ## Known limitation
 
 The format option in `WITH (...)` is currently advisory — the managers auto-detect the format from the
-location's file extension. The `COPY` `inner_sql` is re-parsed by the Worker (`parser_->parse(ext.inner_sql())`)
-and executed locally (`db::OtterbrixManager::execute`), so cross-backend inner queries are not yet
+location's file extension. The `COPY` `inner_sql` is re-parsed by the query session (`parse_sql(ext.inner_sql())`)
+and executed locally (`otterstax::engine::execute_statement`, by the file manager), so cross-backend inner queries are not yet
 supported.

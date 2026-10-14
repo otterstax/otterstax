@@ -4,7 +4,7 @@
 #pragma once
 
 // The Flight SQL wire server: grpc::Server + asio-grpc GrpcContext driven on
-// N threads, bridged into FlightSqlCore over its SchedulerEngine.
+// N threads, bridged into FlightSqlCore over its SessionEngine.
 //
 // Two properties of the custom core: the GrpcContext may run on several
 // threads (the engine blocks its calling thread for the length of a query,
@@ -15,6 +15,7 @@
 #include "core/core.hpp"
 #include "rpc/flight_server.hpp"
 
+#include "session/session_factory.hpp"
 #include "utility/logger.hpp"
 
 #include <agrpc/grpc_context.hpp>
@@ -40,12 +41,15 @@ namespace flight::server {
         std::string host;
         int port = 0;
         std::pmr::memory_resource* resource = nullptr;
-        actor_zeta::address_t scheduler_address;
-        actor_zeta::address_t catalog_address;
-        // GrpcContext::run() thread count; the engine blocks its calling
-        // thread (see scheduler_engine.hpp), so this is the server's
-        // concurrency for in-flight queries.
-        std::size_t threads = 1;
+        // Opens the query sessions of the RPCs and prepared statements;
+        // outlives the server.
+        otterstax::session::session_factory_t* sessions = nullptr;
+        // GrpcContext::run() thread count (service.runtime.flight_sql_io,
+        // resolved by main.cpp); the engine blocks its calling thread (see
+        // session_engine.hpp), so this is the server's concurrency for
+        // in-flight queries. No default: zero threads would serve nothing
+        // (asserted).
+        std::size_t threads = 0;
     };
 
     class flight_sql_server final {

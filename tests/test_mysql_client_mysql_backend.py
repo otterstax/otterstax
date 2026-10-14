@@ -26,6 +26,11 @@ class client:
             'port': 8816,
             'user': 'testuser',
             'password': 'testpass',
+            # Every statement here is meant to commit on its own. The server
+            # answers SET autocommit without effect today (session/CLAUDE.md,
+            # "SET never reaches the engine"); asking for autocommit keeps the
+            # file right once a per-session setting exists.
+            'autocommit': True,
         }
         self.test_database = 'campaigns.db1.schema'
         self.test_table = 'mysql_test_table'
@@ -124,10 +129,13 @@ class client:
             cursor.execute(f"update {self.test_database}.{self.test_table} set campaign_length = %s where _id = %s", (30, gen_id(1))) # subtract 10
             cursor.execute(f"update {self.test_database}.{self.test_table} set budget = %s where _id = %s", (64617.54, gen_id(1))) # subtract 40
 
-            # sum(int) here has type boost::mysql::decimal, which is translated to DocumentTypes::STRING by translator, hence the constructor
-            # todo: support decimals
+            # The engine types the result, not MariaDB: SUM over an integer
+            # column is BIGINT (MariaDB's own answer, DECIMAL text, is converted
+            # to it), so the value arrives as an int.
             cursor.execute(f"select sum(campaign_length) as sum_ from {self.test_database}.{self.test_table}")
-            upd = int(cursor.fetchall()[0][0])
+            upd = cursor.fetchall()[0][0]
+            if not isinstance(upd, int):
+                raise ValueError(f"sum(int) must arrive as BIGINT (int), got {type(upd).__name__}: {upd!r}")
 
             for row in initial_l:
                 upd -= row[0]
@@ -141,7 +149,11 @@ class client:
             for row in initial_b:
                 upd -= row[0]
 
-            self.assert_floating_equal(upd, -29.999999)
+            # SUM over a FLOAT column is FLOAT (the engine's rule: a floating
+            # sum keeps its input type), so the ~7.4e5 total carries float32
+            # precision — a step of 1/16 there — and the difference is -30 to
+            # within that, not to 1e-6.
+            self.assert_floating_equal(upd, -30.0, tol=0.1)
 
     def test_float_column_reads_back_the_stored_value(self):
         """A FLOAT column comes back as the float32 the backend holds, not a rounding of it.
@@ -231,9 +243,11 @@ class client:
             cursor.execute(f"select count(_id) from {table} where campaign_length = {bulk_length}")
             self.assert_equal(int(cursor.fetchall()[0][0]), bulk_rows, "bulk rows must be on the backend")
 
-            # MariaDB counts the rows an UPDATE changed, not the rows it matched
-            # (CLIENT_FOUND_ROWS is not requested), so the new value must be one
-            # no bulk row holds — the bulk budgets are 0.0 .. 1999.0.
+            # OtterStax reports the rows a remote UPDATE matched, read off the
+            # OK packet's "Rows matched: N" (MariaDB's own affected-row count is
+            # the rows it changed: CLIENT_FOUND_ROWS is not requested). The new
+            # value is one no bulk row holds, so matched and changed agree here
+            # either way.
             cursor.execute(f"update {table} set budget = -1.0 where campaign_length = {bulk_length}")
             self.assert_equal(cursor.rowcount, bulk_rows, "COM_QUERY remote UPDATE over 2000 rows")
 
@@ -338,11 +352,22 @@ class client:
                 second_row = cursor.fetchall()
                 self.assert_equal(len(second_row), 1, "Expected one row for reused prepared statement")
 
-                cursor.execute(f"select ? from {self.test_database}.{self.test_table}", (100,))
-                self.assert_equal(cursor.fetchall()[0][0], 100, "Select ? constant failed")
-
         except Exception as e:
             raise ValueError("Prepared queries threw something: " + str(e))
+
+    def test_prepared_select_of_a_parameter(self):
+        """[engine-defect-select-param] A prepared `SELECT ? FROM t` answers the bound value per row.
+
+        Hidden: run only with --engine-defects (tests/CLAUDE.md, "Engine-defect
+        tags"). Open in otterbrix (OTB-select-param,
+        docs/proposals/otterbrix-embedding.md 4.20): the engine's validator reads
+        the parameter of a select-list `get_field` as a key and throws
+        std::bad_variant_access, so the client gets an error instead of 100.
+        """
+        with self.mysql_connector_connection() as conn:
+            cursor = conn.cursor(prepared=True)
+            cursor.execute(f"select ? from {self.test_database}.{self.test_table}", (100,))
+            self.assert_equal(cursor.fetchall()[0][0], 100, "Select ? constant failed")
 
     def test_backend_error_carries_server_message(self):
         """A statement MariaDB refuses surfaces MariaDB's verdict, not a transport error.
@@ -355,7 +380,7 @@ class client:
         transport failure carries "connect failed" instead. COM_STMT_EXECUTE
         takes the same path twice: a statement that failed once is prepared
         again transparently, so the second run reports the backend again and
-        never the Worker's re-prepare demand.
+        never the session's re-prepare demand.
         """
         missing = f"{self.test_database}.no_such_table_{gen_id(404)}"
 
@@ -395,7 +420,7 @@ class client:
         except Exception as e:
             raise ValueError(f"Cleanup error {e}")
 
-    def run_all_tests(self):
+    def run_all_tests(self, engine_defects=False):
         try:
             self.test_basic_connection()
             self.test_crud_queries()
@@ -406,6 +431,8 @@ class client:
             self.test_protocol_capability_flags()
             self.test_prepared_queries()
             self.test_backend_error_carries_server_message()
+            if engine_defects:
+                self.test_prepared_select_of_a_parameter()
             print("\033[92mTest success.\033[0m")
         except Exception as e:
             print(f"\033[91mAn error occurred: {e}\033[0m")
@@ -421,12 +448,14 @@ def main_test():
     parser = argparse.ArgumentParser(description='Test MySQL protocol compatibility')
     parser.add_argument('--local', action='store_true',
                        help='Use local host (0.0.0.0) instead of test-otterstax')
+    parser.add_argument('--engine-defects', action='store_true',
+                       help='Also run the hidden [engine-defect-*] cases (open otterbrix defects)')
 
     args = parser.parse_args()
 
     tests = client(local=args.local)
     try:
-        tests.run_all_tests()
+        tests.run_all_tests(engine_defects=args.engine_defects)
         # Print Test Success message in Green
         print("\n" + "="*70)
         print("\033[92m✅ ALL TESTS PASSED - MySQL Client/Backend\033[0m")

@@ -47,7 +47,7 @@ namespace otterstax::kafka {
         // start_pollers: when true, CREATE SOURCE also launches a background
         // ingestion poller per source (needs a reachable broker). Off by default
         // so broker-free unit/system tests don't spawn consumer threads;
-        // component_manager turns it on
+        // main.cpp turns it on in the server
         KafkaManager(std::pmr::memory_resource* resource,
                      actor_zeta::address_t engine_dispatcher_address,
                      bool start_pollers = false);
@@ -56,13 +56,13 @@ namespace otterstax::kafka {
         std::pmr::memory_resource* resource() const noexcept { return resource_; }
 
         // Handle one parsed kafka DDL statement. Returns an (empty) success
-        // cursor or an error cursor — the Scheduler completes the session off it
+        // cursor or an error cursor — the query session completes the session off it
         actor_zeta::unique_future<components::cursor::cursor_t_ptr> execute(session_hash_t id, kafka_node_ptr node);
 
         // Publish the rows of an `INSERT INTO kafka.<obj>` to the object's topic
         // `source` is the insert's source subplan, executed here to materialise the
         // rows (no table write); the object's poller re-ingests them. Returns an
-        // (empty) success cursor or an error cursor — the Scheduler completes off it
+        // (empty) success cursor or an error cursor — the query session completes off it
         actor_zeta::unique_future<components::cursor::cursor_t_ptr>
         produce(session_hash_t id, std::string relname, components::logical_plan::node_ptr source);
 
@@ -79,7 +79,7 @@ namespace otterstax::kafka {
         add_stream_insert(session_hash_t id, std::string stream, std::string insert_sql);
 
         // Relaunch persisted SOURCEs after an engine restart. Called
-        // by component_manager AFTER full init (scheduler/executor pool started); NOT
+        // by main.cpp AFTER full init (engine open, connections registered); NOT
         // from the ctor (which runs mid-spawn — a poller started that early races the
         // half-initialised engine). No-op unless start_pollers_. Reads kafka.__sources,
         // re-reads each backing table's columns from the catalog, rebuilds registry_,

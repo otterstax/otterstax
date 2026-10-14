@@ -31,10 +31,9 @@ namespace tsl {
     };
     using pg_enum_oid_map = std::unordered_map<unsigned int, pg_enum_descriptor>;
 
-    // A result with columns becomes a chunk of its tuples; a column-less result
-    // (DML) becomes the column-less affected-row carrier (affected_rows_carrier.hpp)
-    // read from the command tag. A counting tag that carries no valid number is
-    // conversion_failure; the message is owned by `res`.
+    // A SELECT's result becomes a chunk of its tuples (a DML's count is the
+    // backend's write, never read through here). A value with no reading as its
+    // column's type is conversion_failure; the message is owned by `res`.
     core::result_wrapper_t<data_chunk_t> pg_to_chunk(std::pmr::memory_resource* res, PGresult* result);
     core::result_wrapper_t<data_chunk_t>
     pg_to_chunk(std::pmr::memory_resource* res, PGresult* result, const pg_enum_oid_map& enum_oids);

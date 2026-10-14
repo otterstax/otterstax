@@ -35,9 +35,11 @@ ARG BUILD_TYPE=Release
 ARG WITH_TRACY=false
 ARG WITH_PERF=false
 ARG BUILD_JOBS=0
-# TSAN_DEPS=true rebuilds otterbrix + actor-zeta from source with
-# -fsanitize=thread (see tsan-deps.profile). Without it the prebuilt engine's
-# atomics are invisible to TSAN and the sanitizer job has no diagnostic power.
+# TSAN_DEPS=true rebuilds otterbrix + actor-zeta, librdkafka and gRPC with
+# abseil / protobuf / re2 from source with -fsanitize=thread (see
+# tsan-deps.profile; the code generators protoc / grpc_cpp_plugin come from a
+# plain build-context grpc / protobuf, so nothing instrumented runs at build time). Without it the prebuilt libraries' atomics are invisible
+# to TSAN and the sanitizer job has no diagnostic power.
 # It also switches all TSAN-instrumented code (deps and otterstax alike) to
 # g++-12: gcc-11's libtsan misses the pthread_cond_clockwait interceptor
 # (google/sanitizers#1259), yielding false "double lock" reports on every
@@ -57,13 +59,16 @@ WORKDIR /app
 COPY conanfile.py tsan-deps.profile ./
 COPY cmake/conan-hooks/hook_librdkafka_c11threads_off.py ./conan-hooks/
 # TEMPORARY (OTB-tag, docs/proposals/otterbrix-embedding.md): the pinned
-# otterbrix/1.0.0b2-embedding.* and actor-zeta/2.0.0 exist only in the
-# developer's local Conan cache. scripts/conan/export_local_packages.sh (run by
-# docker-run-tests.sh and the benchmark scripts) archives their recipes +
-# sources into .conan-local/local_recipes.tgz; when that archive is in the build
-# context it is restored here and both packages are built from source. Without
-# it (e.g. once an official tag is on the remote) the install falls back to the
-# remotes unchanged. The directory is tracked (.gitkeep), so the COPY never fails.
+# otterbrix/1.0.0b2-embedding.* exists only in the developer's local Conan
+# cache. scripts/conan/export_local_packages.sh (run by docker-run-tests.sh and
+# the benchmark scripts) archives its recipe + sources into
+# .conan-local/local_recipes.tgz; when that archive is in the build context it
+# is restored here and otterbrix is built from source. Without it (e.g. once an
+# official tag is on the remote) the install falls back to the remotes
+# unchanged. actor-zeta/2.0.0 is on the remote and resolves like any other
+# dependency (--build missing builds it where the remote has no binary). The
+# TSAN_DEPS branch builds otterbrix + actor-zeta from source regardless, to
+# instrument them. The directory is tracked (.gitkeep), so the COPY never fails.
 COPY .conan-local/ /tmp/conan-local/
 # BUILD_JOBS caps conan's from-source builds too (tools.build:jobs): otterbrix
 # needs ~1.5-2 GB per job — see CLAUDE.md "Build resources". BUILD_JOBS=0 means
@@ -71,7 +76,7 @@ COPY .conan-local/ /tmp/conan-local/
 RUN _local_build=() && \
     if [ -f /tmp/conan-local/local_recipes.tgz ]; then \
         conan cache restore /tmp/conan-local/local_recipes.tgz && \
-        _local_build=(--build="otterbrix/*" --build="actor-zeta/*"); \
+        _local_build=(--build="otterbrix/*"); \
     fi && \
     rm -rf /tmp/conan-local && \
     _jobs="${BUILD_JOBS}" && \
@@ -150,8 +155,9 @@ COPY ./connectors ./connectors
 COPY ./integration ./integration
 COPY ./frontend/ ./frontend
 COPY ./otterbrix ./otterbrix
-COPY ./component_manager ./component_manager
-COPY ./scheduler ./scheduler
+COPY ./runtime ./runtime
+COPY ./backends ./backends
+COPY ./session ./session
 COPY ./types ./types
 COPY ./utility ./utility
 COPY ./cmake ./cmake
@@ -196,11 +202,18 @@ WORKDIR /app/build/${BUILD_TYPE}
 
 # Tracy-enabled builds skip tests: Tracy's profiler init crashes in a headless
 # Docker container (no profiler server attached). Non-Tracy CI builds run all tests.
+# RUN_TESTS=false skips them too: a TSAN image built on arm64, whose instrumented
+# binaries cannot run under docker build's seccomp filter (personality
+# ADDR_NO_RANDOMIZE, see CLAUDE.md "The TSAN image") — its tests run in a
+# container started with --security-opt seccomp=unconfined instead.
 ARG WITH_TRACY=false
-RUN if [ "${WITH_TRACY}" != "true" ]; then \
-        ctest -C ${BUILD_TYPE} --output-on-failure --timeout 120; \
-    else \
+ARG RUN_TESTS=true
+RUN if [ "${WITH_TRACY}" = "true" ]; then \
         echo "Skipping tests: Tracy build (headless Docker, no profiler attached)"; \
+    elif [ "${RUN_TESTS}" != "true" ]; then \
+        echo "Skipping tests: RUN_TESTS=${RUN_TESTS}"; \
+    else \
+        ctest -C ${BUILD_TYPE} --output-on-failure --timeout 120; \
     fi
 
 # External-table fixtures baked into the image so the file/s3 tests work in CI

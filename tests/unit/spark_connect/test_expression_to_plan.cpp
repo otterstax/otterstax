@@ -205,9 +205,9 @@ TEST_CASE("expression_to_plan: avg averages its argument cast to DOUBLE") {
     auto* agg = static_cast<ce::aggregate_expression_t*>(out.get());
     CHECK(agg->function_name() == "avg");
     REQUIRE(agg->params().size() == 1);
-    // Spark's Average casts its input to DOUBLE; the engine's avg would keep a BIGINT
-    // column's type and drop the fraction. The column is the cast's key, as in the SQL
-    // transformer's avg(CAST(amount AS double)).
+    // Spark's Average casts its input to DOUBLE; the engine's avg answers DOUBLE for a
+    // BIGINT column already, but would keep a FLOAT or DECIMAL column's type. The column
+    // is the cast's key, as in the SQL transformer's avg(CAST(amount AS double)).
     REQUIRE(ce::is_expr(agg->params().front()));
     const auto& operand = ce::as_expr(agg->params().front());
     REQUIRE(operand->group() == ce::expression_group::cast);

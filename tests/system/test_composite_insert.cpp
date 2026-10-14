@@ -5,12 +5,12 @@
 // a NULL member — ROW(..., NULL) — through INSERT/UPDATE. The demo's step_3b
 // writes exactly this shape into the nine-field spec_t.
 //
-// Every statement goes through the Scheduler→Worker stack, the way a frontend
+// Every statement goes through the query-session stack, the way a frontend
 // drives it; the read-back is the payload the frontend would encode. The NULL
 // member is checked on the value itself: a struct column reads back as a
 // logical_value_t whose children() are the members.
 
-#include "scheduler_stack.hpp"
+#include "session_stack.hpp"
 
 #include <catch2/catch_all.hpp>
 
@@ -21,25 +21,25 @@
 #include <string>
 #include <string_view>
 
-using otterstax::test::run_scheduler_sql;
-using otterstax::test::run_scheduler_sql_payload;
-using otterstax::test::scheduler_stack;
-using otterstax::test::with_scheduler_stack;
+using otterstax::test::run_session_sql;
+using otterstax::test::run_session_sql_payload;
+using otterstax::test::session_stack;
+using otterstax::test::with_session_stack;
 
 namespace {
 
-    void run_all(const scheduler_stack& s, session_hash_t& id, std::initializer_list<const char*> statements) {
+    void run_all(const session_stack& s, session_hash_t& id, std::initializer_list<const char*> statements) {
         std::string err;
         for (const char* sql : statements) {
-            const bool ok = run_scheduler_sql(s, id++, sql, err);
+            const bool ok = run_session_sql(s, id++, sql, err);
             INFO("statement: " << sql << " error: " << err);
             REQUIRE(ok);
         }
     }
 
     // Result of a SELECT as one payload; a failed statement is a test failure.
-    session_payload select_payload(const scheduler_stack& s, session_hash_t& id, const std::string& sql) {
-        auto r = run_scheduler_sql_payload(s, id++, sql);
+    session_payload select_payload(const session_stack& s, session_hash_t& id, const std::string& sql) {
+        auto r = run_session_sql_payload(s, id++, sql);
         INFO("statement: " << sql << " error: " << r.error().what.c_str());
         REQUIRE_FALSE(r.has_error());
         return std::move(r.value());
@@ -63,7 +63,7 @@ namespace {
 
 TEST_CASE("E1: INSERT VALUES a ROW with a NULL last member into a three-member composite reads it back",
           "[engine-defect-e1]") {
-    with_scheduler_stack("/tmp/test_composite_insert_row_null", [](scheduler_stack s) {
+    with_session_stack("/tmp/test_composite_insert_row_null", [](session_stack s) {
         session_hash_t id = 9900;
         run_all(s, id, k_trio_schema);
         run_all(s, id, {"INSERT INTO cdb.t (id, v, note) VALUES (1, ROW(1, 'a', NULL), 'n1');"});
@@ -80,7 +80,7 @@ TEST_CASE("E1: INSERT VALUES a ROW with a NULL last member into a three-member c
 
 TEST_CASE("E1: INSERT with a partial column list writes the composite and leaves the omitted column NULL",
           "[engine-defect-e1]") {
-    with_scheduler_stack("/tmp/test_composite_insert_partial_columns", [](scheduler_stack s) {
+    with_session_stack("/tmp/test_composite_insert_partial_columns", [](session_stack s) {
         session_hash_t id = 9920;
         run_all(s, id, k_trio_schema);
         run_all(s, id, {"INSERT INTO cdb.t (id, v) VALUES (2, ROW(2, 'b', NULL));"});
@@ -99,7 +99,7 @@ TEST_CASE("E1: INSERT with a partial column list writes the composite and leaves
 }
 
 TEST_CASE("E1: INSERT ... SELECT copies a composite whose member is NULL", "[engine-defect-e1]") {
-    with_scheduler_stack("/tmp/test_composite_insert_insert_select", [](scheduler_stack s) {
+    with_session_stack("/tmp/test_composite_insert_insert_select", [](session_stack s) {
         session_hash_t id = 9940;
         run_all(s, id, k_trio_schema);
         run_all(s,
@@ -120,7 +120,7 @@ TEST_CASE("E1: INSERT ... SELECT copies a composite whose member is NULL", "[eng
 }
 
 TEST_CASE("E1: a nested ROW with a NULL member in the inner ROW keeps that NULL member", "[engine-defect-e1]") {
-    with_scheduler_stack("/tmp/test_composite_insert_nested", [](scheduler_stack s) {
+    with_session_stack("/tmp/test_composite_insert_nested", [](session_stack s) {
         session_hash_t id = 9960;
         run_all(s,
                 id,
@@ -144,7 +144,7 @@ TEST_CASE("E1: a nested ROW with a NULL member in the inner ROW keeps that NULL 
 
 TEST_CASE("E1: a composite column with a ROW(...) DEFAULT is filled in when omitted from the INSERT",
           "[engine-defect-e1]") {
-    with_scheduler_stack("/tmp/test_composite_insert_default", [](scheduler_stack s) {
+    with_session_stack("/tmp/test_composite_insert_default", [](session_stack s) {
         session_hash_t id = 9980;
         run_all(s,
                 id,
@@ -165,7 +165,7 @@ TEST_CASE("E1: a composite column with a ROW(...) DEFAULT is filled in when omit
 }
 
 TEST_CASE("E1: UPDATE SET c = a two-member ROW with a NULL member replaces the composite", "[engine-defect-e1]") {
-    with_scheduler_stack("/tmp/test_composite_insert_update", [](scheduler_stack s) {
+    with_session_stack("/tmp/test_composite_insert_update", [](session_stack s) {
         session_hash_t id = 10000;
         run_all(s,
                 id,
@@ -174,10 +174,10 @@ TEST_CASE("E1: UPDATE SET c = a two-member ROW with a NULL member replaces the c
                  "CREATE TABLE cdb.u (id BIGINT, c pair_t);",
                  "INSERT INTO cdb.u (id, c) VALUES (6, ROW(1, 'x'));"});
 
-        auto upd = run_scheduler_sql_payload(s, id++, "UPDATE cdb.u SET c = ROW(2, NULL) WHERE id = 6;");
+        auto upd = run_session_sql_payload(s, id++, "UPDATE cdb.u SET c = ROW(2, NULL) WHERE id = 6;");
         INFO("UPDATE error: " << upd.error().what.c_str());
         REQUIRE_FALSE(upd.has_error());
-        REQUIRE(upd.value().size() == 1);
+        REQUIRE(upd.value().affected_rows == 1);
 
         const auto payload = select_payload(s, id, "SELECT c FROM cdb.u WHERE id = 6;");
         const auto& row = single_row(payload);
@@ -191,7 +191,7 @@ TEST_CASE("E1: UPDATE SET c = a two-member ROW with a NULL member replaces the c
 // examples/demo/sql/step_3a_ddl.sql + step_3b_insert.sql + step_3c_select.sql.
 TEST_CASE("E1: demo step_3b — nine-member spec_t with a NULL photo in three rows — step_3c reads TLV-1 back",
           "[engine-defect-e1]") {
-    with_scheduler_stack("/tmp/test_composite_insert_demo_spec", [](scheduler_stack s) {
+    with_session_stack("/tmp/test_composite_insert_demo_spec", [](session_stack s) {
         session_hash_t id = 10020;
         run_all(s,
                 id,

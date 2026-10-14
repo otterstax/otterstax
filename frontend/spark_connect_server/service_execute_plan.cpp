@@ -23,7 +23,9 @@
 #include "service.hpp"
 
 #include "await_future.hpp"
+#include "session/statement_kind.hpp"
 #include "catalog_relations.hpp"
+#include "frontend/common/utils.hpp"
 #include "otterbrix/parser/parser.hpp"
 #include "plan_translator/relation_to_plan.hpp"
 #include "plan_translator/type_converter.hpp"
@@ -31,14 +33,16 @@
 #include "show_string.hpp"
 #include "utility/tracy_profiler.hpp"
 
-#include <scheduler/scheduler.hpp>
-#include <scheduler/session_data.hpp>
+#include <session/query_session.hpp>
+#include <session/session_payload.hpp>
 #include <utility/session.hpp>
+
+#include <boost/scope/scope_exit.hpp>
 
 #include <cstdint>
 #include <cstdio>
 #include <exception>
-#include <random>
+#include <optional>
 #include <utility>
 
 namespace frontend::spark {
@@ -48,14 +52,19 @@ namespace frontend::spark {
         // How ExecutePlan answers a plan; decided before the handler's first suspension.
         enum class answer_t
         {
-            refused,     // `refusal`, and nothing reaches the Scheduler
-            result,      // the Scheduler's result, streamed
+            refused,     // `refusal`, and nothing reaches the query session
+            result,      // the query session's result, streamed
             catalog,     // handle_catalog_relation's result, streamed
             empty,       // a result of no rows and no columns, streamed
             sql_query,   // a SqlCommand whose statement is a query: its SQL relation, unrun
-            sql_command, // any other SqlCommand, run once by the Scheduler: an empty LocalRelation
+            sql_command, // any other SqlCommand, run once by the query session: an empty LocalRelation
             show_string  // the rows of the ShowString's input, rendered and streamed as one row
         };
+
+        // No secure random bytes for a response id: the stream ends here.
+        grpc::Status no_response_id() {
+            return {grpc::StatusCode::UNAVAILABLE, "cannot generate a secure response id"};
+        }
 
     } // namespace
 
@@ -97,8 +106,14 @@ namespace frontend::spark {
     core::result_wrapper_t<sql_statement_t> classify_sql(const std::string& sql, std::pmr::memory_resource* resource) {
         OTX_ZONE_N("spark::classify_sql");
         // The engine's raw parser sits behind GreenplumParser::parse; as in
-        // Worker::parse_sql, the catch is confined to this one call and turns
+        // query_session_t::parse_sql, the catch is confined to this one call and turns
         // whatever it throws into sql_parse_error.
+        // A SET / RESET is a command the session answers without effect; the
+        // engine's transformer refuses most of its forms, so it is told by the
+        // raw statement before the parse.
+        if (otterstax::session::is_setting_statement(resource, sql)) {
+            return sql_statement_t::command;
+        }
         try {
             GreenplumParser parser(resource);
             auto parsed = parser.parse(sql);
@@ -143,23 +158,36 @@ namespace frontend::spark {
         const std::string& spark_session_id = request.session_id();
         const auto& plan = request.plan();
 
-        // OtterStax session id — its hash keys Scheduler worker routing.
-        session_id id;
-        const session_hash_t hash = id.hash();
+        // This request's statement id in the Spark session's query session (one
+        // engine session per Spark session). The request reaches the session
+        // step by step (spark_sessions_): a ReleaseSession racing it closes the
+        // session, the statement it took runs to its end, a later step is
+        // refused as closed.
+        otterstax::session::statement_id_t hash{};
 
         // The synchronous part of the dispatch — the pre-flight check, the choice of
         // answer, the translation of a DataFrame plan and the first request to the
-        // Scheduler — runs inside the handler's zone, which closes before the first
+        // session — runs inside the handler's zone, which closes before the first
         // co_await; a request refused there is answered after it. `show_input` is
         // the plan a ShowString's input is fetched with, kept for as long as the
         // request is.
         answer_t answer = answer_t::refused;
         grpc::Status refusal = grpc::Status::OK;
-        Scheduler::unique_future<Scheduler::session_result> fut;
+        query_session_t::unique_future<query_session_t::session_result> fut;
         sc::Plan show_input;
+        // The statement the request runs, chosen below: its text, or the plan a
+        // DataFrame translates to.
+        std::optional<std::string> statement;
+        ParsedQueryDataPtr statement_plan;
         {
             OTX_ZONE_N("SparkConnectServiceImpl::handle_execute_plan");
-            if (plan.has_root() && contains_window(plan.root())) {
+            if (!spark_sessions_.open_or_use(
+                    spark_session_id,
+                    std::chrono::steady_clock::now(),
+                    [&](query_session_t& session) { hash = session.next_statement(); },
+                    [this] { return sessions_->open(); })) {
+                refusal = session_closed_status(spark_session_id);
+            } else if (plan.has_root() && contains_window(plan.root())) {
                 // Pre-flight: reject Window functions before any actor work.
                 refusal = grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "Window functions not supported");
             } else if (plan.has_command() && plan.command().has_sql_command()) {
@@ -179,9 +207,7 @@ namespace frontend::spark {
                     answer = answer_t::sql_query;
                 } else {
                     answer = answer_t::sql_command;
-                    fut = std::move(
-                        actor_zeta::send(scheduler_address_, &Scheduler::execute, hash, sql_command_text(sql_command))
-                            .second);
+                    statement = sql_command_text(sql_command);
                 }
             } else if (plan.has_command()) {
                 refusal = grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, unsupported_command_message(plan.command()));
@@ -197,8 +223,7 @@ namespace frontend::spark {
                 // The relation a spark.sql() query answered with: the statement runs as
                 // SQL text, the way the wire frontends run it.
                 answer = answer_t::result;
-                fut = std::move(
-                    actor_zeta::send(scheduler_address_, &Scheduler::execute, hash, plan.root().sql().query()).second);
+                statement = plan.root().sql().query();
             } else if (plan.root().has_show_string()) {
                 // df.show(): the rows of the input, rendered below. A SQL input runs as
                 // SQL text, an empty LocalRelation has no rows to fetch, and any other
@@ -206,9 +231,7 @@ namespace frontend::spark {
                 const auto& show = plan.root().show_string();
                 answer = answer_t::show_string;
                 if (is_bare_sql(show.input())) {
-                    fut = std::move(
-                        actor_zeta::send(scheduler_address_, &Scheduler::execute, hash, show.input().sql().query())
-                            .second);
+                    statement = show.input().sql().query();
                 } else if (!is_empty_local_relation(show.input())) {
                     show_input = show_string_input_plan(show);
                     auto plan_result = relation_to_plan(show_input, resource_);
@@ -216,11 +239,7 @@ namespace frontend::spark {
                         answer = answer_t::refused;
                         refusal = grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, plan_result.error().what.c_str());
                     } else {
-                        fut = std::move(actor_zeta::send(scheduler_address_,
-                                                         &Scheduler::execute_plan,
-                                                         hash,
-                                                         std::move(plan_result.value().parsed_data))
-                                            .second);
+                        statement_plan = std::move(plan_result.value().parsed_data);
                     }
                 }
             } else {
@@ -230,15 +249,33 @@ namespace frontend::spark {
                     refusal = grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, plan_result.error().what.c_str());
                 } else {
                     answer = answer_t::result;
-                    fut = std::move(actor_zeta::send(scheduler_address_,
-                                                     &Scheduler::execute_plan,
-                                                     hash,
-                                                     std::move(plan_result.value().parsed_data))
-                                        .second);
+                    statement_plan = std::move(plan_result.value().parsed_data);
                 }
             }
+            // The statement chosen above, queued on the session.
+            if ((statement || statement_plan) &&
+                !spark_sessions_.begin(spark_session_id, std::chrono::steady_clock::now(), [&](query_session_t& session) {
+                    fut = statement_plan ? std::move(actor_zeta::send(session.address(),
+                                                                      &query_session_t::execute_plan,
+                                                                      hash,
+                                                                      std::move(statement_plan))
+                                                         .second)
+                                         : std::move(actor_zeta::send(session.address(),
+                                                                      &query_session_t::execute,
+                                                                      hash,
+                                                                      std::move(*statement))
+                                                         .second);
+                })) {
+                answer = answer_t::refused;
+                refusal = session_closed_status(spark_session_id);
+            }
         }
+        // A queued statement keeps the Spark session from expiring until the
+        // request ends, its answer awaited and sent (spark_sessions_.begin … finish).
+        boost::scope::scope_exit step_done(
+            [&] { spark_sessions_.finish(spark_session_id, std::chrono::steady_clock::now()); }, fut.valid());
         if (answer == answer_t::refused) {
+            co_await fail_refused(spark_session_id, refusal);
             co_await rpc.finish(refusal);
             co_return;
         }
@@ -251,13 +288,16 @@ namespace frontend::spark {
             } else {
                 auto executed = co_await await_future<session_payload>(std::move(fut), resource_);
                 if (executed.has_error()) {
-                    grpc::Status status(grpc::StatusCode::INTERNAL, executed.error().what.c_str());
-                    co_await rpc.finish(status);
+                    fail_unanswered(spark_session_id, executed.status());
+                    co_await rpc.finish(error_status(spark_session_id, executed.error()));
                     co_return;
                 }
                 response.mutable_sql_command_result()->mutable_relation()->mutable_local_relation();
             }
-            stamp_response(response, spark_session_id);
+            if (!stamp_response(response, spark_session_id)) {
+                co_await rpc.finish(no_response_id());
+                co_return;
+            }
             if (!request.operation_id().empty()) {
                 response.set_operation_id(request.operation_id());
             }
@@ -265,7 +305,10 @@ namespace frontend::spark {
 
             // ResultComplete terminator — required by PySpark to consider the stream done.
             sc::ExecutePlanResponse complete_response;
-            stamp_response(complete_response, spark_session_id);
+            if (!stamp_response(complete_response, spark_session_id)) {
+                co_await rpc.finish(no_response_id());
+                co_return;
+            }
             complete_response.mutable_result_complete();
             co_await rpc.write(complete_response);
 
@@ -277,16 +320,26 @@ namespace frontend::spark {
         // branch runs — as it stands, the answer to an empty LocalRelation: no rows,
         // no columns. session_payload is not default-constructible, so we seed the
         // result_wrapper_t with a resource-constructed empty payload.
-        core::result_wrapper_t<session_payload> result{resource_};
+        otterstax::awaited_t<session_payload> result{core::result_wrapper_t<session_payload>{resource_},
+                                                     otterstax::await_status_t::answered};
         if (answer == answer_t::catalog) {
-            result = co_await handle_catalog_relation(plan.root().catalog(), scheduler_address_, hash, resource_);
+            // The catalog reads await the session themselves, each reaching it
+            // as a step of this request; a timed-out read has nothing a COMMIT
+            // could publish.
+            result = otterstax::awaited_t<session_payload>{
+                co_await handle_catalog_relation(plan.root().catalog(),
+                                                 spark_sessions_,
+                                                 spark_session_id,
+                                                 hash,
+                                                 resource_),
+                otterstax::await_status_t::answered};
         } else if (fut.valid()) {
             result = co_await await_future<session_payload>(std::move(fut), resource_);
         }
 
         if (result.has_error()) {
-            grpc::Status status(grpc::StatusCode::INTERNAL, result.error().what.c_str());
-            co_await rpc.finish(status);
+            fail_unanswered(spark_session_id, result.status());
+            co_await rpc.finish(error_status(spark_session_id, result.error()));
             co_return;
         }
 
@@ -326,7 +379,10 @@ namespace frontend::spark {
 
             // Build the data response: envelope + (first-only) schema + ArrowBatch.
             sc::ExecutePlanResponse response;
-            stamp_response(response, spark_session_id);
+            if (!stamp_response(response, spark_session_id)) {
+                co_await rpc.finish(no_response_id());
+                co_return;
+            }
             if (first) {
                 if (!request.operation_id().empty()) {
                     response.set_operation_id(request.operation_id());
@@ -350,7 +406,10 @@ namespace frontend::spark {
 
         // ResultComplete terminator — required by PySpark to consider the stream done.
         sc::ExecutePlanResponse complete_response;
-        stamp_response(complete_response, spark_session_id);
+        if (!stamp_response(complete_response, spark_session_id)) {
+            co_await rpc.finish(no_response_id());
+            co_return;
+        }
         complete_response.mutable_result_complete();
         co_await rpc.write(complete_response);
 
@@ -372,26 +431,26 @@ namespace frontend::spark {
         co_await rpc.finish(status);
     }
 
-    void SparkConnectServiceImpl::stamp_response(sc::ExecutePlanResponse& resp, const std::string& session_id) {
+    bool SparkConnectServiceImpl::stamp_response(sc::ExecutePlanResponse& resp, const std::string& session_id) {
         resp.set_session_id(session_id);
-        const std::pmr::string response_id = generate_response_id();
-        resp.set_response_id(response_id.c_str());
+        auto response_id = generate_response_id();
+        if (!response_id.has_value()) {
+            return false;
+        }
+        resp.set_response_id(response_id->c_str());
+        return true;
     }
 
-    std::pmr::string SparkConnectServiceImpl::generate_response_id() const {
-        std::mt19937_64 gen{std::random_device{}()};
-        const std::uint64_t hi = gen();
-        const std::uint64_t lo = gen();
-        char buf[37];
-        std::snprintf(buf,
-                      sizeof(buf),
-                      "%08llx-%04llx-4%03llx-%04llx-%012llx",
-                      static_cast<unsigned long long>(hi & 0xffffffffULL),
-                      static_cast<unsigned long long>((hi >> 32) & 0xffffULL),
-                      static_cast<unsigned long long>(lo & 0xfffULL),
-                      static_cast<unsigned long long>((lo >> 12) & 0xffffULL),
-                      static_cast<unsigned long long>((lo >> 16) & 0xffffffffffffULL));
-        return std::pmr::string{buf, resource_};
+    std::optional<std::pmr::string> SparkConnectServiceImpl::generate_response_id() const {
+        // A version-4 UUID (base.proto: "an UUID string of the format
+        // 00112233-4455-6677-8899-aabbccddeeff") of 122 secure random bits. It
+        // was an mt19937_64 seeded per call with 32 bits of random_device: ids
+        // repeated after ~65k responses, and its version/variant bits were wrong.
+        auto uuid = frontend::secure_uuid_v4();
+        if (!uuid.has_value()) {
+            return std::nullopt;
+        }
+        return std::pmr::string{uuid->data(), uuid->size(), resource_};
     }
 
 } // namespace frontend::spark

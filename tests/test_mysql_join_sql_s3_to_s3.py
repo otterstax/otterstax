@@ -21,8 +21,8 @@
 # blocker on this particular path is the JOIN-key type width:
 #   - regions.parquet's campaign_id is int64 (parquet loader output).
 #   - MariaDB's campaigns.campaign_id is INT (int32), which `mysql_to_chunk`
-#     surfaces unchanged in the raw_data chunk it inlines for the backend
-#     slice.
+#     surfaces unchanged in the rows the federation's scan hands the engine
+#     for the backend table.
 # Equi-JOIN across int32 and int64 silently drops every row in otterbrix,
 # the same failure mode we already burnt-in for `int` vs `bigint` local
 # declarations against parquet. Staging the backend rows into a `bigint`

@@ -6,7 +6,7 @@ import argparse
 from flightsql import FlightSQLClient
 import pyarrow as pa
 
-def validate_by_request(client, test_name, test_query, expected_schema):
+def validate_by_request(client, test_name, test_query, expected_schema, expected_join_keys=()):
     print(f"\n{'='*60}")
     print(f"Running: {test_name}")
     print(f"{'='*60}")
@@ -26,8 +26,10 @@ def validate_by_request(client, test_name, test_query, expected_schema):
         print(f"Error [{test_name}]: No data received")
         sys.exit(1)
 
-    # 2. Validate schema and check sizes
-    for field in table.schema:
+    # 2. Validate schema and check sizes. Columns are read by position: SELECT *
+    # of a JOIN carries both sides' same-named key columns (two `campaign_id`),
+    # as PostgreSQL answers it, and the engine runs every federated JOIN.
+    for position, field in enumerate(table.schema):
         field_name = field.name
         field_type = field.type
 
@@ -42,7 +44,7 @@ def validate_by_request(client, test_name, test_query, expected_schema):
             raise TypeError(f"Field '{field_name}' has type {field_type}, expected {expected_schema[field_name]}")
 
         # Get the column data
-        column_data = table[field_name]
+        column_data = table.column(position)
 
         # Check size (rows)
         actual_size = len(column_data)
@@ -61,13 +63,19 @@ def validate_by_request(client, test_name, test_query, expected_schema):
         print(f"  Null count: {null_count}")
         print(f"  First 5 values: {column_data.to_pylist()[:5]}\n")
 
-    # 3. Alternative: Direct column access with checks
+    # 3. Every expected column is there (by name; a JOIN key once per side)
     for col_name in expected_schema.keys():
-        try:
-            col = table[col_name]
+        positions = table.schema.get_all_field_indices(col_name)
+        if not positions:
+            raise KeyError(f"Missing expected column: {col_name}")
+        for position in positions:
+            col = table.column(position)
             print(f"{col_name}: {len(col)} values | Type: {col.type}")
-        except KeyError:
-            print(f"Missing expected column: {col_name}")
+    if expected_join_keys:
+        for key in expected_join_keys:
+            count = len(table.schema.get_all_field_indices(key))
+            if count != 2:
+                raise ValueError(f"[{test_name}] JOIN key '{key}' expected once per side (2 columns), got {count}")
     
     print(f"✓ {test_name} PASSED")
 
@@ -121,7 +129,7 @@ campaigns.campaign_id = impressions.campaign_id
 WHERE campaigns.campaign_length > 30
 ORDER BY impressions.clicks DESC;"""
 
-    validate_by_request(client, "Test 1: Basic JOIN (example_2)", test_query_1, expected_schema_join)
+    validate_by_request(client, "Test 1: Basic JOIN (example_2)", test_query_1, expected_schema_join, ("campaign_id",))
 
     # Test 2: JOIN with complex WHERE (from examples/simple/example_1.txt)
     test_query_2 = """SELECT * FROM campaigns.db1.schema.campaigns JOIN
@@ -130,7 +138,7 @@ campaigns.campaign_id = impressions.campaign_id AND campaign_length > 30
 WHERE budget > 80000 OR budget < 90000
 ORDER BY clicks;"""
 
-    validate_by_request(client, "Test 2: JOIN with complex WHERE (example_1)", test_query_2, expected_schema_join)
+    validate_by_request(client, "Test 2: JOIN with complex WHERE (example_1)", test_query_2, expected_schema_join, ("campaign_id",))
 
     # Test 3: Simple SELECT from single table
     test_query_3 = "SELECT * FROM campaigns.db1.schema.campaigns WHERE campaign_length > 30;"
@@ -144,7 +152,7 @@ campaigns.campaign_id = impressions.campaign_id
 WHERE campaigns.campaign_length > 30
 ORDER BY impressions.clicks DESC;"""
 
-    validate_by_request(client, "Test 4: Simple JOIN (example_2)", test_query_4, expected_schema_join)
+    validate_by_request(client, "Test 4: Simple JOIN (example_2)", test_query_4, expected_schema_join, ("campaign_id",))
 
     # Test 5: JOIN with AND condition (from examples/simple/example_1.txt)
     test_query_5 = """SELECT * FROM campaigns.db1.schema.campaigns JOIN
@@ -153,7 +161,7 @@ campaigns.campaign_id = impressions.campaign_id AND campaign_length > 30
 WHERE budget > 80000 OR budget < 90000
 ORDER BY clicks;"""
 
-    validate_by_request(client, "Test 5: JOIN with AND condition (example_1)", test_query_5, expected_schema_join)
+    validate_by_request(client, "Test 5: JOIN with AND condition (example_1)", test_query_5, expected_schema_join, ("campaign_id",))
 
     # Test 6: JOIN with multiple conditions (from examples/simple/example_5.txt)
     test_query_6 = """SELECT * FROM campaigns.db1.schema.campaigns JOIN
@@ -161,7 +169,7 @@ impressions.db2.schema.impressions ON
 campaigns.campaign_id = impressions.campaign_id AND campaign_length > 80 AND clicks > 200
 WHERE budget > 80000 OR budget < 90000;"""
 
-    validate_by_request(client, "Test 6: JOIN with multiple conditions (example_5)", test_query_6, expected_schema_join)
+    validate_by_request(client, "Test 6: JOIN with multiple conditions (example_5)", test_query_6, expected_schema_join, ("campaign_id",))
 
     # Test 7: Simple SELECT from single table (from examples/simple/example_3.txt)
     test_query_7 = "SELECT * FROM campaigns.db1.schema.campaigns WHERE campaign_length > 30;"

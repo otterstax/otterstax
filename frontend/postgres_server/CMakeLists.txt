@@ -6,7 +6,6 @@ set(POSTGRES_SERVER_HEADERS
     packet/packet_writer.hpp
     packet/packet_utils.hpp
     connection/postgres_connection.hpp
-    connection/transaction_manager.hpp
     connection/pipeline_state.hpp
     postgres_server.hpp
     resultset/field_description.hpp
@@ -19,7 +18,6 @@ set(POSTGRES_SERVER_SOURCES
      packet/packet_utils.cpp
      connection/packet_processing.cpp
      connection/postgres_connection.cpp
-     connection/transaction_manager.cpp
      connection/pipeline_state.cpp
      resultset/field_description.cpp
      resultset/postgres_resultset.cpp

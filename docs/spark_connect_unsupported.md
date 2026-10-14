@@ -232,12 +232,14 @@ Rows reach PySpark as Arrow batches.
   `column '<name>' has a type the Spark Arrow batch cannot carry (logical type <n>)`.
 - `df.schema` reports every field as nullable. A column without a name is
   `col0`, `col1`, …; an unaliased aggregate is named by its function.
-- A local table's aggregates are computed by the engine (rc-3), which answers
-  `avg` and `sum` in their input's type: `sum` of a SMALLINT or INTEGER column
-  overflows past the type's range, and `avg` of an integer column in
-  `spark.sql()` drops the fraction. DataFrame `avg()` is exact (see
-  [Supported](#supported)). A backend table's aggregates are computed by the
-  backend.
+- A local table's aggregates are computed by the engine, which widens an
+  integer argument: `sum` of a signed integer column answers BIGINT (of an
+  unsigned one UBIGINT) and a total past that range is an error
+  (`sum overflow`), and `avg` of an integer column answers DOUBLE with its
+  fraction, in `spark.sql()` and DataFrame `avg()` alike. In `spark.sql()`
+  `avg` of a FLOAT column answers FLOAT and of a DECIMAL column DECIMAL;
+  DataFrame `avg()` answers DOUBLE for both (see [Supported](#supported)). A
+  backend table's aggregates are computed by the backend.
 - `df.schema` of a query whose result schema cannot be resolved is refused
   (`AnalyzePlan: the result schema of the statement could not be resolved`).
 

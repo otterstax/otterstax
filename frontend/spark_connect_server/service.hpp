@@ -4,12 +4,16 @@
 // Spark Connect frontend — gRPC service implementation interface.
 //
 // SparkConnectServiceImpl hosts an asio-grpc server (one GrpcContext event loop
-// per hardware thread). The RPC handler coroutines are declared here; their
+// per io thread, service.runtime.spark_connect_io). The RPC handler coroutines are declared here; their
 // bodies live in service_execute_plan.cpp / service_analyze_plan.cpp /
 // service_misc.cpp. service.cpp only wires up the server (constructor,
 // start()/stop(), RPC registration).
 
 #pragma once
+
+#include "frontend/common/asio_future_bridge.hpp"
+#include "session/session_factory.hpp"
+#include "spark_sessions.hpp"
 
 #include <actor-zeta.hpp>
 #include <agrpc/grpc_context.hpp>
@@ -26,11 +30,17 @@
 
 #include <boost/asio/awaitable.hpp>
 
+#include <chrono>
+#include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <memory_resource>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace frontend::spark {
@@ -45,7 +55,16 @@ namespace frontend::spark {
         std::string host = "0.0.0.0";
         uint16_t port = 15002;
         std::pmr::memory_resource* resource{nullptr};
-        actor_zeta::address_t scheduler_address;
+        // Opens the query session of every Spark session; outlives the server.
+        otterstax::session::session_factory_t* sessions{nullptr};
+        // A Spark session without an RPC for this long is closed (its query
+        // session with it); zero keeps sessions until ReleaseSession
+        // (`service.spark_connect.session_timeout_s`; Spark's own default is 60m).
+        std::chrono::milliseconds session_timeout{std::chrono::minutes(60)};
+        // One GrpcContext (and completion queue) per thread
+        // (service.runtime.spark_connect_io, resolved by main.cpp). No
+        // default: zero threads would serve nothing (asserted).
+        std::size_t io_threads{0};
     };
 
     // ---------------------------------------------------------------------------
@@ -101,12 +120,59 @@ namespace frontend::spark {
 
         void start();
         void stop();
+        // The port the server listens on once start() bound it — the one gRPC
+        // picked when the config asked for port 0; 0 before start or after a
+        // failed one.
+        [[nodiscard]] int local_port() const noexcept { return server_ ? bound_port_ : 0; }
 
     private:
+        using query_session_t = otterstax::session::query_session_t;
+
+        // How often the idle sessions are looked for (Spark's
+        // spark.connect.session.manager.maintenanceInterval).
+        static constexpr std::chrono::seconds kMaintenanceInterval{30};
+
+        // What an RPC naming a closed Spark session is answered: Spark's own
+        // INVALID_HANDLE.SESSION_CLOSED.
+        static grpc::Status session_closed_status(const std::string& id);
+        // What a session's error is answered: INTERNAL with its text — but a
+        // statement the session refused because it was closed under the RPC
+        // (connection_closed) is session_closed_status.
+        static grpc::Status error_status(const std::string& id, const core::error_t& error);
+        // A statement the bridge gave up on — timed out (it goes on running) or
+        // broken (no answer came back: the session never settled it) — fails an
+        // open block behind it (otterstax::unanswered_block_failure,
+        // query_session_t::fail_transaction, not awaited), so a COMMIT cannot
+        // publish what the client was told failed; as the MySQL
+        // (answer_await_failure) and PostgreSQL (send_error_response) frontends do.
+        void fail_unanswered(const std::string& id, otterstax::await_status_t status);
+        // A request refused before the session ran it (a statement classify_sql
+        // cannot parse, an unsupported plan): inside an explicit transaction it
+        // fails the block like any other error (query_session_t::fail_transaction,
+        // awaited, so the client's next statement sees the failed block).
+        boost::asio::awaitable<void, agrpc::GrpcExecutor> fail_refused(const std::string& id,
+                                                                       const grpc::Status& refusal);
+        // The maintenance thread: closes the sessions idle past the timeout.
+        void expire_idle_sessions(std::stop_token stop);
+
         // Configuration
         std::pmr::memory_resource* resource_;
-        actor_zeta::address_t scheduler_address_;
+        otterstax::session::session_factory_t* sessions_;
         log_t log_;
+        // The Spark sessions, each owning its query session (one engine session
+        // per Spark session, so its statements share a transaction). Every step
+        // of an RPC calls the registry itself: `open_or_use` (the Spark
+        // session's first RPC opens it) / `use` / `begin` … `finish` (a step
+        // whose answer the RPC awaits, finished by a scope guard however the
+        // wait ends). The step only queues a statement under the registry's
+        // lock; the answer is awaited outside, so a ReleaseSession or an expiry
+        // racing it closes the session: a statement the session took runs to
+        // its end, a later step is refused (session_closed_status).
+        idle_session_registry_t<otterstax::session::session_ptr> spark_sessions_;
+        std::mutex maintenance_mutex_;
+        std::condition_variable_any maintenance_wake_;
+        // Declared after what it reads: joined first.
+        std::jthread maintenance_;
 
         // gRPC server infrastructure (N GrpcContexts for multi-core scaling).
         // Declaration order matters: grpc_contexts_ must outlive threads_, and
@@ -117,6 +183,8 @@ namespace frontend::spark {
         std::pmr::vector<std::jthread> threads_;
         std::string host_;
         uint16_t port_;
+        std::size_t io_threads_;
+        int bound_port_{0};
         bool stopped_{false};
 
         // -----------------------------------------------------------------------
@@ -166,10 +234,12 @@ namespace frontend::spark {
         boost::asio::awaitable<void, agrpc::GrpcExecutor>
         handle_add_artifacts(agrpc::ServerRPC<&sc::SparkConnectService::AsyncService::RequestAddArtifacts>& rpc);
 
-        // Helpers — stamp common response envelope fields and mint response ids.
-        // Defined in service_execute_plan.cpp.
-        void stamp_response(sc::ExecutePlanResponse& resp, const std::string& session_id);
-        std::pmr::string generate_response_id() const;
+        // Helpers — stamp common response envelope fields and mint response ids
+        // (a random version-4 UUID, frontend::secure_uuid_v4). False / nullopt
+        // when no secure random bytes can be had: the handler finishes the RPC
+        // UNAVAILABLE. Defined in service_execute_plan.cpp.
+        [[nodiscard]] bool stamp_response(sc::ExecutePlanResponse& resp, const std::string& session_id);
+        std::optional<std::pmr::string> generate_response_id() const;
     };
 
 } // namespace frontend::spark

@@ -1,18 +1,14 @@
 add_subdirectory(kafka)
 
 set(DB_INTEGRATION_HEADERS
-    prepare_probe.hpp
-    otterbrix/otterbrix_engine.hpp
-    otterbrix/otterbrix_manager.hpp
     sql/connection_manager.hpp
     postgresql/connection_manager.hpp
     clickhouse/connection_manager.hpp
     s3/s3_manager.hpp
+    statement_executor.hpp
 )
 
 set(DB_INTEGRATION_SOURCES
-    otterbrix/otterbrix_engine.cpp
-    otterbrix/otterbrix_manager.cpp
     sql/connection_manager.cpp
     postgresql/connection_manager.cpp
     clickhouse/connection_manager.cpp
@@ -25,6 +21,10 @@ add_library(integration
 )
 
 target_link_libraries(integration PUBLIC
+    catalog
+    otterstax_federation
+    otterbrix_local
+    connectors
     Boost::boost
     otterbrix::otterbrix
     actor-zeta::actor-zeta

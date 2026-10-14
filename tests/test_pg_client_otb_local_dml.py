@@ -21,7 +21,7 @@ Three wire shapes are covered:
   * unnamed statement       — parameters, `prepare_threshold = None`
   * named statement         — `execute(..., prepare=True)`: Parse once under a
                               server-side name, then Bind/Execute it again and
-                              again. The worker drops a statement after it ran,
+                              again. The session drops a statement after it ran,
                               so the second Execute goes through re-prepare and
                               must still report its own count.
 
@@ -168,7 +168,7 @@ class LocalDmlRowCountTest:
                 cur.execute(insert, (20, "twenty"), prepare=True)
                 self.assert_equal(cur.rowcount, 1, "named-statement INSERT row count (first Execute)")
                 self.assert_equal(cur.statusmessage, "INSERT 0 1", "named-statement INSERT tag")
-                # Second Execute of the SAME statement name: the worker dropped
+                # Second Execute of the SAME statement name: the session dropped
                 # it after the first run, so this goes through re-prepare.
                 cur.execute(insert, (21, "twenty-one"), prepare=True)
                 self.assert_equal(cur.rowcount, 1, "named-statement INSERT row count (re-executed)")

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2025-2026  OtterStax
 
+#include "session_stack.hpp"
+
 #include <catch2/catch_all.hpp>
 
 #include <components/cursor/cursor.hpp>
@@ -18,9 +20,6 @@
 #include "integration/kafka/detail/kafka_poller.hpp"
 #include "integration/kafka/detail/kafka_reader.hpp"
 #include "integration/kafka/kafka_manager.hpp"
-#include "integration/otterbrix/otterbrix_engine.hpp"
-#include "otterbrix/config.hpp"
-#include "otterbrix/operators/execute_plan.hpp"
 #include "otterbrix/parser/parser.hpp"
 #include "utility/tsan_helper.hpp"
 
@@ -68,12 +67,11 @@ namespace {
 
 TEST_CASE("kafka dry: CREATE/DROP SOURCE materialises tables, STREAM does not") {
     std::filesystem::remove_all("/tmp/otterstax_kafka_dry");
-    auto cfg = make_create_config("/tmp/otterstax_kafka_dry");
-    auto engine = db::make_otterbrix_engine(cfg);
-    auto* resource = engine->dispatcher()->resource();
+    auto engine = std::make_unique<otterstax::test::test_engine_t>("/tmp/otterstax_kafka_dry");
+    auto* resource = engine->resource();
 
     GreenplumParser parser(resource);
-    auto kafka_mgr = actor_zeta::spawn<KafkaManager>(resource, engine->engine_dispatcher_address());
+    auto kafka_mgr = actor_zeta::spawn<KafkaManager>(resource, engine->dispatcher());
 
     // Probe a table's schema via a plain SELECT: a LIMIT plan (even LIMIT 1)
     // short-circuits over an empty table and returns a bare cursor (no
@@ -81,7 +79,7 @@ TEST_CASE("kafka dry: CREATE/DROP SOURCE materialises tables, STREAM does not") 
     // on the empty result. Tables stay empty in this dry test, so the full
     // scan is free. is_error() on the returned cursor == table absent
     auto probe = [&](const std::string& qualified) {
-        return drive_until_ready(otterstax::kafka::detail::kafka_query(engine->engine_dispatcher_address(),
+        return drive_until_ready(otterstax::kafka::detail::kafka_query(engine->dispatcher(),
                                                                        resource,
                                                                        "SELECT * FROM " + qualified + ";"));
     };
@@ -93,7 +91,7 @@ TEST_CASE("kafka dry: CREATE/DROP SOURCE materialises tables, STREAM does not") 
     // True iff kafka.__sources currently holds a row for `name` (the persisted
     // registry each CREATE writes and each DROP must remove)
     auto sources_has = [&](const std::string& name) {
-        auto cursor = drive_until_ready(otterstax::kafka::detail::kafka_query(engine->engine_dispatcher_address(),
+        auto cursor = drive_until_ready(otterstax::kafka::detail::kafka_query(engine->dispatcher(),
                                                                               resource,
                                                                               "SELECT name FROM kafka.__sources;"));
         if (!cursor || cursor->is_error()) {
@@ -195,12 +193,11 @@ TEST_CASE("kafka dry: CREATE/DROP SOURCE materialises tables, STREAM does not") 
 
 TEST_CASE("kafka insert-query: INSERT INTO stream SELECT registers + persists, DROP cleans up") {
     std::filesystem::remove_all("/tmp/otterstax_kafka_insert");
-    auto cfg = make_create_config("/tmp/otterstax_kafka_insert");
-    auto engine = db::make_otterbrix_engine(cfg);
-    auto* resource = engine->dispatcher()->resource();
+    auto engine = std::make_unique<otterstax::test::test_engine_t>("/tmp/otterstax_kafka_insert");
+    auto* resource = engine->resource();
 
     GreenplumParser parser(resource);
-    auto kafka_mgr = actor_zeta::spawn<KafkaManager>(resource, engine->engine_dispatcher_address());
+    auto kafka_mgr = actor_zeta::spawn<KafkaManager>(resource, engine->dispatcher());
 
     auto run_kafka = [&](kafka_node_ptr node) {
         auto [_, fut] =
@@ -218,7 +215,7 @@ TEST_CASE("kafka insert-query: INSERT INTO stream SELECT registers + persists, D
     // Count kafka.__sources rows of a given kind (source / stream / insert)
     auto kind_count = [&](const std::string& kind) {
         auto cursor =
-            drive_until_ready(otterstax::kafka::detail::kafka_query(engine->engine_dispatcher_address(),
+            drive_until_ready(otterstax::kafka::detail::kafka_query(engine->dispatcher(),
                                                                     resource,
                                                                     "SELECT name, kind FROM kafka.__sources;"));
         int n = 0;
@@ -295,12 +292,11 @@ TEST_CASE("kafka json: batch -> data_chunk drops malformed/incomplete rows") {
 
 TEST_CASE("kafka ingest: a json batch is inserted into the source table") {
     std::filesystem::remove_all("/tmp/otterstax_kafka_ingest");
-    auto cfg = make_create_config("/tmp/otterstax_kafka_ingest");
-    auto engine = db::make_otterbrix_engine(cfg);
-    auto* resource = engine->dispatcher()->resource();
+    auto engine = std::make_unique<otterstax::test::test_engine_t>("/tmp/otterstax_kafka_ingest");
+    auto* resource = engine->resource();
 
     GreenplumParser parser(resource);
-    auto kafka_mgr = actor_zeta::spawn<KafkaManager>(resource, engine->engine_dispatcher_address());
+    auto kafka_mgr = actor_zeta::spawn<KafkaManager>(resource, engine->dispatcher());
 
     auto src = parse_kafka(parser,
                            "CREATE SOURCE s (id INT, name VARCHAR) "
@@ -320,7 +316,7 @@ TEST_CASE("kafka ingest: a json batch is inserted into the source table") {
                                                          {R"({"id": 1, "name": "a"})", R"({"id": 2, "name": "b"})"});
     REQUIRE(chunk.size() == 2);
     {
-        auto cursor = drive_until_ready(otterstax::kafka::detail::kafka_insert(engine->engine_dispatcher_address(),
+        auto cursor = drive_until_ready(otterstax::kafka::detail::kafka_insert(engine->dispatcher(),
                                                                                resource,
                                                                                "kafka",
                                                                                "s",
@@ -330,7 +326,7 @@ TEST_CASE("kafka ingest: a json batch is inserted into the source table") {
     }
 
     auto rows = drive_until_ready(
-        otterstax::kafka::detail::kafka_query(engine->engine_dispatcher_address(), resource, "SELECT * FROM kafka.s;"));
+        otterstax::kafka::detail::kafka_query(engine->dispatcher(), resource, "SELECT * FROM kafka.s;"));
     REQUIRE(rows);
     REQUIRE_FALSE(rows->is_error());
     REQUIRE(rows->size() == 2);
@@ -338,12 +334,11 @@ TEST_CASE("kafka ingest: a json batch is inserted into the source table") {
 
 TEST_CASE("kafka offsets: write_offsets / parse_offsets roundtrip with max-per-partition") {
     std::filesystem::remove_all("/tmp/otterstax_kafka_offsets");
-    auto cfg = make_create_config("/tmp/otterstax_kafka_offsets");
-    auto engine = db::make_otterbrix_engine(cfg);
-    auto* resource = engine->dispatcher()->resource();
+    auto engine = std::make_unique<otterstax::test::test_engine_t>("/tmp/otterstax_kafka_offsets");
+    auto* resource = engine->resource();
 
     GreenplumParser parser(resource);
-    auto kafka_mgr = actor_zeta::spawn<KafkaManager>(resource, engine->engine_dispatcher_address());
+    auto kafka_mgr = actor_zeta::spawn<KafkaManager>(resource, engine->dispatcher());
 
     auto src = parse_kafka(parser,
                            "CREATE SOURCE s (id INT, name VARCHAR) "
@@ -357,7 +352,7 @@ TEST_CASE("kafka offsets: write_offsets / parse_offsets roundtrip with max-per-p
         REQUIRE_FALSE(cursor->is_error());
     }
 
-    auto addr = engine->engine_dispatcher_address();
+    auto addr = engine->dispatcher();
     // Read offsets via kafka_query — the exact path the poller uses on startup
     auto read = [&] {
         return otterstax::kafka::detail::parse_offsets(drive_until_ready(
@@ -395,13 +390,12 @@ TEST_CASE("kafka offsets: write_offsets / parse_offsets roundtrip with max-per-p
 
 TEST_CASE("kafka poller: CREATE SOURCE starts a poller, DROP/teardown join cleanly") {
     std::filesystem::remove_all("/tmp/otterstax_kafka_poller");
-    auto cfg = make_create_config("/tmp/otterstax_kafka_poller");
-    auto engine = db::make_otterbrix_engine(cfg);
-    auto* resource = engine->dispatcher()->resource();
+    auto engine = std::make_unique<otterstax::test::test_engine_t>("/tmp/otterstax_kafka_poller");
+    auto* resource = engine->resource();
 
     GreenplumParser parser(resource);
     auto kafka_mgr =
-        actor_zeta::spawn<KafkaManager>(resource, engine->engine_dispatcher_address(), /*start_pollers=*/true);
+        actor_zeta::spawn<KafkaManager>(resource, engine->dispatcher(), /*start_pollers=*/true);
 
     auto run_kafka = [&](kafka_node_ptr node) {
         auto [_, fut] =
@@ -447,13 +441,12 @@ TEST_CASE("kafka stream node-swap: aggregate(empty)+raw_data applies the SELECT"
     namespace ty = components::types;
 
     std::filesystem::remove_all("/tmp/otterstax_kafka_swap");
-    auto cfg = make_create_config("/tmp/otterstax_kafka_swap");
-    auto engine = db::make_otterbrix_engine(cfg);
-    auto* resource = engine->dispatcher()->resource();
-    auto addr = engine->engine_dispatcher_address();
+    auto engine = std::make_unique<otterstax::test::test_engine_t>("/tmp/otterstax_kafka_swap");
+    auto* resource = engine->resource();
+    auto addr = engine->dispatcher();
 
     GreenplumParser parser(resource);
-    auto kafka_mgr = actor_zeta::spawn<KafkaManager>(resource, engine->engine_dispatcher_address());
+    auto kafka_mgr = actor_zeta::spawn<KafkaManager>(resource, engine->dispatcher());
 
     // Create kafka.s so `SELECT ... FROM kafka.s` resolves at parse time
     {
@@ -556,13 +549,12 @@ TEST_CASE("kafka stream node-swap: the ORDER BY / LIMIT / HAVING tail is re-home
     namespace ty = components::types;
 
     std::filesystem::remove_all("/tmp/otterstax_kafka_swap_tail");
-    auto cfg = make_create_config("/tmp/otterstax_kafka_swap_tail");
-    auto engine = db::make_otterbrix_engine(cfg);
-    auto* resource = engine->dispatcher()->resource();
-    auto addr = engine->engine_dispatcher_address();
+    auto engine = std::make_unique<otterstax::test::test_engine_t>("/tmp/otterstax_kafka_swap_tail");
+    auto* resource = engine->resource();
+    auto addr = engine->dispatcher();
 
     GreenplumParser parser(resource);
-    auto kafka_mgr = actor_zeta::spawn<KafkaManager>(resource, engine->engine_dispatcher_address());
+    auto kafka_mgr = actor_zeta::spawn<KafkaManager>(resource, engine->dispatcher());
 
     // kafka.s has to exist for `FROM kafka.s` to resolve at parse time
     {
@@ -681,13 +673,12 @@ TEST_CASE("kafka stream node-swap: the ORDER BY / LIMIT / HAVING tail is re-home
 
 TEST_CASE("kafka txn: BEGIN/INSERT/INSERT/COMMIT on one session is atomic; ROLLBACK reverts") {
     std::filesystem::remove_all("/tmp/otterstax_kafka_txn");
-    auto cfg = make_create_config("/tmp/otterstax_kafka_txn");
-    auto engine = db::make_otterbrix_engine(cfg);
-    auto* resource = engine->dispatcher()->resource();
-    auto addr = engine->engine_dispatcher_address();
+    auto engine = std::make_unique<otterstax::test::test_engine_t>("/tmp/otterstax_kafka_txn");
+    auto* resource = engine->resource();
+    auto addr = engine->dispatcher();
 
     GreenplumParser parser(resource);
-    auto kafka_mgr = actor_zeta::spawn<KafkaManager>(resource, engine->engine_dispatcher_address());
+    auto kafka_mgr = actor_zeta::spawn<KafkaManager>(resource, engine->dispatcher());
 
     // CREATE SOURCE s -> kafka.s (id, name) + kafka.s__offsets (partition_id, committed_offset)
     {
@@ -710,7 +701,7 @@ TEST_CASE("kafka txn: BEGIN/INSERT/INSERT/COMMIT on one session is atomic; ROLLB
     };
     // Row count seen by a FRESH session (its own snapshot / autocommit).
     auto count = [&](const std::string& qualified) {
-        auto cur = drive_until_ready(otterstax::kafka::detail::kafka_query(engine->engine_dispatcher_address(),
+        auto cur = drive_until_ready(otterstax::kafka::detail::kafka_query(engine->dispatcher(),
                                                                            resource,
                                                                            "SELECT * FROM " + qualified + ";"));
         REQUIRE(cur);
@@ -751,10 +742,9 @@ TEST_CASE("kafka txn: BEGIN/INSERT/INSERT/COMMIT on one session is atomic; ROLLB
 
 TEST_CASE("kafka eos: node-based insert+offsets on one session are atomic; ROLLBACK reverts") {
     std::filesystem::remove_all("/tmp/otterstax_kafka_eos");
-    auto cfg = make_create_config("/tmp/otterstax_kafka_eos");
-    auto engine = db::make_otterbrix_engine(cfg);
-    auto* resource = engine->dispatcher()->resource();
-    auto addr = engine->engine_dispatcher_address();
+    auto engine = std::make_unique<otterstax::test::test_engine_t>("/tmp/otterstax_kafka_eos");
+    auto* resource = engine->resource();
+    auto addr = engine->dispatcher();
 
     GreenplumParser parser(resource);
     auto kafka_mgr = actor_zeta::spawn<KafkaManager>(resource, addr);
@@ -881,12 +871,11 @@ TEST_CASE("kafka produce: a schema-mismatched INSERT is rejected, nothing produc
     namespace ty = components::types;
 
     std::filesystem::remove_all("/tmp/otterstax_kafka_badinsert");
-    auto cfg = make_create_config("/tmp/otterstax_kafka_badinsert");
-    auto engine = db::make_otterbrix_engine(cfg);
-    auto* resource = engine->dispatcher()->resource();
+    auto engine = std::make_unique<otterstax::test::test_engine_t>("/tmp/otterstax_kafka_badinsert");
+    auto* resource = engine->resource();
 
     GreenplumParser parser(resource);
-    auto kafka_mgr = actor_zeta::spawn<KafkaManager>(resource, engine->engine_dispatcher_address());
+    auto kafka_mgr = actor_zeta::spawn<KafkaManager>(resource, engine->dispatcher());
 
     // CREATE SOURCE s (id INT, name VARCHAR) -> registry carries the declared columns
     {
@@ -937,12 +926,11 @@ TEST_CASE("kafka produce: a schema-mismatched INSERT is rejected, nothing produc
 TEST_CASE("kafka stream write: SELECT output schema is derived; INSERT routes to the stream") {
     namespace ty = components::types;
     std::filesystem::remove_all("/tmp/otterstax_kafka_streamwrite");
-    auto cfg = make_create_config("/tmp/otterstax_kafka_streamwrite");
-    auto engine = db::make_otterbrix_engine(cfg);
-    auto* resource = engine->dispatcher()->resource();
+    auto engine = std::make_unique<otterstax::test::test_engine_t>("/tmp/otterstax_kafka_streamwrite");
+    auto* resource = engine->resource();
 
     GreenplumParser parser(resource);
-    auto kafka_mgr = actor_zeta::spawn<KafkaManager>(resource, engine->engine_dispatcher_address());
+    auto kafka_mgr = actor_zeta::spawn<KafkaManager>(resource, engine->dispatcher());
 
     auto run = [&](kafka_node_ptr node) {
         REQUIRE(node);
@@ -1016,10 +1004,9 @@ TEST_CASE("kafka stream: a COUNT column is declared and produced as the type the
     namespace kd = otterstax::kafka::detail;
 
     std::filesystem::remove_all("/tmp/otterstax_kafka_count");
-    auto cfg = make_create_config("/tmp/otterstax_kafka_count");
-    auto engine = db::make_otterbrix_engine(cfg);
-    auto* resource = engine->dispatcher()->resource();
-    auto addr = engine->engine_dispatcher_address();
+    auto engine = std::make_unique<otterstax::test::test_engine_t>("/tmp/otterstax_kafka_count");
+    auto* resource = engine->resource();
+    auto addr = engine->dispatcher();
 
     GreenplumParser parser(resource);
     auto kafka_mgr = actor_zeta::spawn<KafkaManager>(resource, addr);
@@ -1196,10 +1183,9 @@ TEST_CASE("kafka json: chunk_to_json over more than 1024 rows keeps every row in
 
 TEST_CASE("kafka offsets: parse_offsets spans a result of more than 1024 rows") {
     std::filesystem::remove_all("/tmp/otterstax_kafka_offsets_multi");
-    auto cfg = make_create_config("/tmp/otterstax_kafka_offsets_multi");
-    auto engine = db::make_otterbrix_engine(cfg);
-    auto* resource = engine->dispatcher()->resource();
-    auto addr = engine->engine_dispatcher_address();
+    auto engine = std::make_unique<otterstax::test::test_engine_t>("/tmp/otterstax_kafka_offsets_multi");
+    auto* resource = engine->resource();
+    auto addr = engine->dispatcher();
 
     GreenplumParser parser(resource);
     auto kafka_mgr = actor_zeta::spawn<KafkaManager>(resource, addr);
@@ -1248,10 +1234,9 @@ TEST_CASE("kafka offsets: parse_offsets spans a result of more than 1024 rows") 
 
 TEST_CASE("kafka create: an invalid TRANSACTIONAL option is rejected before any side effect") {
     std::filesystem::remove_all("/tmp/otterstax_kafka_validate");
-    auto cfg = make_create_config("/tmp/otterstax_kafka_validate");
-    auto engine = db::make_otterbrix_engine(cfg);
-    auto* resource = engine->dispatcher()->resource();
-    auto addr = engine->engine_dispatcher_address();
+    auto engine = std::make_unique<otterstax::test::test_engine_t>("/tmp/otterstax_kafka_validate");
+    auto* resource = engine->resource();
+    auto addr = engine->dispatcher();
 
     GreenplumParser parser(resource);
     auto kafka_mgr = actor_zeta::spawn<KafkaManager>(resource, addr);
@@ -1325,10 +1310,9 @@ TEST_CASE("kafka create: an invalid TRANSACTIONAL option is rejected before any 
 
 TEST_CASE("kafka create: a failed __sources write fails CREATE SOURCE and rolls its tables back") {
     std::filesystem::remove_all("/tmp/otterstax_kafka_persist_fail");
-    auto cfg = make_create_config("/tmp/otterstax_kafka_persist_fail");
-    auto engine = db::make_otterbrix_engine(cfg);
-    auto* resource = engine->dispatcher()->resource();
-    auto addr = engine->engine_dispatcher_address();
+    auto engine = std::make_unique<otterstax::test::test_engine_t>("/tmp/otterstax_kafka_persist_fail");
+    auto* resource = engine->resource();
+    auto addr = engine->dispatcher();
 
     namespace kd = otterstax::kafka::detail;
     // A pre-existing kafka.__sources with the wrong shape: the manager's metadata
@@ -1376,10 +1360,9 @@ TEST_CASE("kafka create: a failed __sources write fails CREATE SOURCE and rolls 
 
 TEST_CASE("kafka drop: DROP SOURCE removes the offsets table; a missing source errors unless IF EXISTS") {
     std::filesystem::remove_all("/tmp/otterstax_kafka_drop");
-    auto cfg = make_create_config("/tmp/otterstax_kafka_drop");
-    auto engine = db::make_otterbrix_engine(cfg);
-    auto* resource = engine->dispatcher()->resource();
-    auto addr = engine->engine_dispatcher_address();
+    auto engine = std::make_unique<otterstax::test::test_engine_t>("/tmp/otterstax_kafka_drop");
+    auto* resource = engine->resource();
+    auto addr = engine->dispatcher();
 
     GreenplumParser parser(resource);
     auto kafka_mgr = actor_zeta::spawn<KafkaManager>(resource, addr);
@@ -1440,10 +1423,9 @@ TEST_CASE("kafka drop: DROP SOURCE removes the offsets table; a missing source e
 
 TEST_CASE("kafka poller: an at-least-once batch whose insert fails reports the engine error") {
     std::filesystem::remove_all("/tmp/otterstax_kafka_alo");
-    auto cfg = make_create_config("/tmp/otterstax_kafka_alo");
-    auto engine = db::make_otterbrix_engine(cfg);
-    auto* resource = engine->dispatcher()->resource();
-    auto addr = engine->engine_dispatcher_address();
+    auto engine = std::make_unique<otterstax::test::test_engine_t>("/tmp/otterstax_kafka_alo");
+    auto* resource = engine->resource();
+    auto addr = engine->dispatcher();
 
     GreenplumParser parser(resource);
     auto kafka_mgr = actor_zeta::spawn<KafkaManager>(resource, addr);
@@ -1484,10 +1466,9 @@ TEST_CASE("kafka poller: an at-least-once batch whose insert fails reports the e
 
 TEST_CASE("kafka poller: a failed exactly-once batch is rolled back and the session stays usable") {
     std::filesystem::remove_all("/tmp/otterstax_kafka_eos_fail");
-    auto cfg = make_create_config("/tmp/otterstax_kafka_eos_fail");
-    auto engine = db::make_otterbrix_engine(cfg);
-    auto* resource = engine->dispatcher()->resource();
-    auto addr = engine->engine_dispatcher_address();
+    auto engine = std::make_unique<otterstax::test::test_engine_t>("/tmp/otterstax_kafka_eos_fail");
+    auto* resource = engine->resource();
+    auto addr = engine->dispatcher();
 
     GreenplumParser parser(resource);
     auto kafka_mgr = actor_zeta::spawn<KafkaManager>(resource, addr);
@@ -1567,10 +1548,9 @@ TEST_CASE("kafka poller: a failed exactly-once batch is rolled back and the sess
 
 TEST_CASE("kafka recover: __sources rows past the first chunk are replayed, a missing backing table is skipped") {
     std::filesystem::remove_all("/tmp/otterstax_kafka_recover_multi");
-    auto cfg = make_create_config("/tmp/otterstax_kafka_recover_multi");
-    auto engine = db::make_otterbrix_engine(cfg);
-    auto* resource = engine->dispatcher()->resource();
-    auto addr = engine->engine_dispatcher_address();
+    auto engine = std::make_unique<otterstax::test::test_engine_t>("/tmp/otterstax_kafka_recover_multi");
+    auto* resource = engine->resource();
+    auto addr = engine->dispatcher();
     namespace kd = otterstax::kafka::detail;
     namespace lp = components::logical_plan;
     namespace ty = components::types;
@@ -1661,10 +1641,9 @@ TEST_CASE("kafka recover: __sources rows past the first chunk are replayed, a mi
 
 TEST_CASE("kafka recover: a source's columns are read from the catalog, for an empty and a populated table") {
     std::filesystem::remove_all("/tmp/otterstax_kafka_recover_columns");
-    auto cfg = make_create_config("/tmp/otterstax_kafka_recover_columns");
-    auto engine = db::make_otterbrix_engine(cfg);
-    auto* resource = engine->dispatcher()->resource();
-    auto addr = engine->engine_dispatcher_address();
+    auto engine = std::make_unique<otterstax::test::test_engine_t>("/tmp/otterstax_kafka_recover_columns");
+    auto* resource = engine->resource();
+    auto addr = engine->dispatcher();
     namespace kd = otterstax::kafka::detail;
     namespace lp = components::logical_plan;
     namespace ty = components::types;
@@ -1825,10 +1804,9 @@ namespace {
 // the view back.
 TEST_CASE("kafka drop: DROP SOURCE with a dependent VIEW") {
     std::filesystem::remove_all("/tmp/otterstax_kafka_drop_view");
-    auto cfg = make_create_config("/tmp/otterstax_kafka_drop_view");
-    auto engine = db::make_otterbrix_engine(cfg);
-    auto* resource = engine->dispatcher()->resource();
-    auto addr = engine->engine_dispatcher_address();
+    auto engine = std::make_unique<otterstax::test::test_engine_t>("/tmp/otterstax_kafka_drop_view");
+    auto* resource = engine->resource();
+    auto addr = engine->dispatcher();
     namespace kd = otterstax::kafka::detail;
 
     GreenplumParser parser(resource);
@@ -1918,10 +1896,9 @@ TEST_CASE("kafka drop: DROP SOURCE with a dependent VIEW") {
 // positions have to survive the refusal row for row.
 TEST_CASE("kafka drop: a refused DROP SOURCE leaves the offsets table intact") {
     std::filesystem::remove_all("/tmp/otterstax_kafka_drop_offsets_kept");
-    auto cfg = make_create_config("/tmp/otterstax_kafka_drop_offsets_kept");
-    auto engine = db::make_otterbrix_engine(cfg);
-    auto* resource = engine->dispatcher()->resource();
-    auto addr = engine->engine_dispatcher_address();
+    auto engine = std::make_unique<otterstax::test::test_engine_t>("/tmp/otterstax_kafka_drop_offsets_kept");
+    auto* resource = engine->resource();
+    auto addr = engine->dispatcher();
     namespace kd = otterstax::kafka::detail;
 
     GreenplumParser parser(resource);
@@ -1971,10 +1948,9 @@ TEST_CASE("kafka drop: a refused DROP SOURCE leaves the offsets table intact") {
 // stream's own INSERT INTO queries go with it under both.
 TEST_CASE("kafka drop: DROP SOURCE and DROP STREAM with dependent streams and INSERT INTO queries") {
     std::filesystem::remove_all("/tmp/otterstax_kafka_drop_readers");
-    auto cfg = make_create_config("/tmp/otterstax_kafka_drop_readers");
-    auto engine = db::make_otterbrix_engine(cfg);
-    auto* resource = engine->dispatcher()->resource();
-    auto addr = engine->engine_dispatcher_address();
+    auto engine = std::make_unique<otterstax::test::test_engine_t>("/tmp/otterstax_kafka_drop_readers");
+    auto* resource = engine->resource();
+    auto addr = engine->dispatcher();
 
     GreenplumParser parser(resource);
     auto kafka_mgr = actor_zeta::spawn<KafkaManager>(resource, addr);
@@ -2108,10 +2084,9 @@ TEST_CASE("kafka drop: DROP SOURCE and DROP STREAM with dependent streams and IN
 // __sources row at all; a stream over a dangling stream dangles too.
 TEST_CASE("kafka recover: dangling stream and INSERT INTO query rows are deleted") {
     std::filesystem::remove_all("/tmp/otterstax_kafka_recover_dangling");
-    auto cfg = make_create_config("/tmp/otterstax_kafka_recover_dangling");
-    auto engine = db::make_otterbrix_engine(cfg);
-    auto* resource = engine->dispatcher()->resource();
-    auto addr = engine->engine_dispatcher_address();
+    auto engine = std::make_unique<otterstax::test::test_engine_t>("/tmp/otterstax_kafka_recover_dangling");
+    auto* resource = engine->resource();
+    auto addr = engine->dispatcher();
     namespace kd = otterstax::kafka::detail;
 
     GreenplumParser parser(resource);
@@ -2194,10 +2169,9 @@ TEST_CASE("kafka recover: dangling stream and INSERT INTO query rows are deleted
 // KafkaManager::has_poller, the test seam over pollers_.
 TEST_CASE("kafka drop: a refused DROP SOURCE keeps its poller") {
     std::filesystem::remove_all("/tmp/otterstax_kafka_drop_poller");
-    auto cfg = make_create_config("/tmp/otterstax_kafka_drop_poller");
-    auto engine = db::make_otterbrix_engine(cfg);
-    auto* resource = engine->dispatcher()->resource();
-    auto addr = engine->engine_dispatcher_address();
+    auto engine = std::make_unique<otterstax::test::test_engine_t>("/tmp/otterstax_kafka_drop_poller");
+    auto* resource = engine->resource();
+    auto addr = engine->dispatcher();
 
     GreenplumParser parser(resource);
     auto kafka_mgr = actor_zeta::spawn<KafkaManager>(resource, addr, /*start_pollers=*/true);
@@ -2243,10 +2217,9 @@ TEST_CASE("kafka drop: a refused DROP SOURCE keeps its poller") {
 // a single pass in row order would meet it before its source.
 TEST_CASE("kafka recover: a stream over a stream is recovered whatever the row order") {
     std::filesystem::remove_all("/tmp/otterstax_kafka_recover_stream_chain");
-    auto cfg = make_create_config("/tmp/otterstax_kafka_recover_stream_chain");
-    auto engine = db::make_otterbrix_engine(cfg);
-    auto* resource = engine->dispatcher()->resource();
-    auto addr = engine->engine_dispatcher_address();
+    auto engine = std::make_unique<otterstax::test::test_engine_t>("/tmp/otterstax_kafka_recover_stream_chain");
+    auto* resource = engine->resource();
+    auto addr = engine->dispatcher();
     namespace kd = otterstax::kafka::detail;
     namespace ty = components::types;
 

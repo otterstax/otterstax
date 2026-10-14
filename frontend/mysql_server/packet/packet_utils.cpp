@@ -3,6 +3,8 @@
 
 #include "packet_utils.hpp"
 
+#include "../../common/utils.hpp"
+
 namespace frontend::mysql {
     constexpr size_t OK_PAYLOAD_SIZE = 7;
     constexpr uint8_t OK_PACKET_HEADER = 0x00;
@@ -97,6 +99,19 @@ namespace frontend::mysql {
         return writer.build_from_payload(sequence_id);
     }
 
+    std::optional<std::vector<uint8_t>> mysql_scramble() {
+        auto scramble = secure_random_bytes(AUTH_DATA_FULL_LENGTH);
+        if (scramble) {
+            for (auto& byte : *scramble) {
+                byte &= 0x7f;
+                if (byte == '\0' || byte == '$') {
+                    ++byte;
+                }
+            }
+        }
+        return scramble;
+    }
+
     std::vector<uint8_t> build_handshake_10(packet_writer& writer,
                                             uint32_t connection_id,
                                             std::vector<uint8_t> auth_data,
@@ -116,7 +131,8 @@ namespace frontend::mysql {
         uint32_t capabilities =
             CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION | CLIENT_PLUGIN_AUTH | CLIENT_CONNECT_WITH_DB;
         writer.write_uint16(capabilities & 0xFFFF);                               // lower 2 bytes
-        writer.write_uint8(static_cast<uint8_t>(character_set::UTF8_GENERAL_CI)); // character set
+        static_assert(SERVER_COLLATION_ID == static_cast<uint8_t>(character_set::UTF8MB4_BIN));
+        writer.write_uint8(SERVER_COLLATION_ID); // the server's collation (protocol_const.hpp)
         writer.write_uint16(flags);
         writer.write_uint16((capabilities >> 16) & 0xFFFF); // upper 2 bytes
         writer.write_uint8(AUTH_DATA_FULL_LENGTH + 1);      // + null terminator

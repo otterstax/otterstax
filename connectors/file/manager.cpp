@@ -5,7 +5,7 @@
 #include "utility/logger.hpp"
 #include "utility/tracy_profiler.hpp"
 #include "utility/session.hpp"
-#include "integration/otterbrix/otterbrix_manager.hpp"
+#include "otterbrix/operators/engine_requests.hpp"
 #include "otterbrix/translators/input/parquet_to_chunk.hpp"
 #include "otterbrix/translators/input/csv_to_chunk.hpp"
 #include "otterbrix/translators/input/ndjson_to_chunk.hpp"
@@ -77,12 +77,14 @@ core::result_wrapper_t<bool> write_chunks(std::pmr::memory_resource* res,
 
 } // namespace
 
-FileManager::FileManager(std::pmr::memory_resource* res, actor_zeta::address_t otterbrix_manager)
+FileManager::FileManager(std::pmr::memory_resource* res, actor_zeta::address_t engine_dispatcher)
     : resource_(res)
-    , otterbrix_manager_(std::move(otterbrix_manager))
+    , engine_dispatcher_(std::move(engine_dispatcher))
+    , engine_session_(components::session::session_id_t::generate_uid())
     , log_(get_logger(logger_tag::FILE_MANAGER)) {
     assert(log_.is_valid());
     assert(res != nullptr);
+    assert(static_cast<bool>(engine_dispatcher_) && "the file manager needs the engine dispatcher");
 }
 
 std::pair<bool, actor_zeta::detail::enqueue_result>
@@ -124,13 +126,15 @@ actor_zeta::unique_future<core::result_wrapper_t<bool>> FileManager::add_file(se
         co_return loaded.convert_error<bool>();
     }
 
-    auto fut = actor_zeta::send(otterbrix_manager_,
-                                &db::OtterbrixManager::create_table,
-                                id,
-                                std::move(params.database),
-                                std::move(params.table),
-                                std::move(loaded.value()));
-    auto result = co_await std::move(fut.second);
+    // The load runs on the file manager's own engine session, outside any
+    // client transaction (writes to files and S3 are not transactional yet).
+    auto fut = otterstax::engine::create_table(resource_,
+                                               engine_dispatcher_,
+                                               engine_session_,
+                                               params.database,
+                                               params.table,
+                                               std::move(loaded.value()));
+    auto result = co_await std::move(fut);
     if (result.has_error()) {
         log_->error("add_file: create_table failed: {}", result.error().what);
         co_return std::move(result);
@@ -156,11 +160,11 @@ actor_zeta::unique_future<core::result_wrapper_t<std::string>> FileManager::dump
     }
 
     // Execute the pre-parsed statement; its result chunk is what we dump.
-    auto fut = actor_zeta::send(otterbrix_manager_,
-                                &db::OtterbrixManager::execute,
-                                id,
-                                std::move(file_metadata.statement));
-    auto cursor = co_await std::move(fut.second);
+    auto fut = otterstax::engine::execute_statement(resource_,
+                                                    engine_dispatcher_,
+                                                    engine_session_,
+                                                    std::move(file_metadata.statement));
+    auto cursor = co_await std::move(fut);
     if (!cursor || !cursor->is_success()) {
         // The engine's verdict is kept: its code and message, re-homed on this
         // actor's resource. A cursor with no error at all is an engine contract

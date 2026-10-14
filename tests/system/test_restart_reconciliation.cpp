@@ -1,23 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2025-2026  OtterStax
 //
-// Registration of a connection on a data dir a previous run persisted. The
-// engine restores its catalog from disk, so the uid's mirror database and its
-// collections already exist when the catalog registers the connection again;
-// registration must reconcile against them instead of refusing: the database
-// is reused, a table whose columns still match keeps its engine OID, a table
-// whose backend schema changed is recreated, a table the backend no longer
-// has is dropped. Every run below is a fresh engine over the SAME data dir,
-// the way a server restart is, over a PostgreSQL mock connector whose table
-// catalog the test switches between runs.
+// The federation metadata over restarts and backend changes. Every start
+// discovers the configured connections again and replaces their rows in
+// federation.remote_tables / remote_columns (backends::publish_federation_metadata),
+// so a restart on the SAME data dir — the way a server restart is — sees the
+// backend as it is now: a table keeps answering, a table whose backend schema
+// changed is read with its new columns, a table the backend dropped is gone. A
+// mirror database an older OtterStax left under a connection's uid is dropped
+// at startup. While the server runs, a table created on the backend, or one
+// whose columns changed, is rediscovered by the statement that misses it and
+// that statement is retried once. Over a PostgreSQL mock connector whose table
+// catalog the test switches between (and during) runs.
 
-#include "catalog/catalog_manager.hpp"
-#include "integration/otterbrix/otterbrix_manager.hpp"
+#include "catalog/introspection.hpp"
 #include "integration/postgresql/connection_manager.hpp"
-#include "otterbrix/operators/execute_plan.hpp"
-#include "otterbrix/parser/parser.hpp"
-#include "otterbrix/query_generation/sql_query_generator.hpp"
-#include "scheduler_stack.hpp"
+#include "session_stack.hpp"
 #include "test_helpers.hpp"
 
 #include "../mock/mock_config.hpp"
@@ -36,14 +34,12 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <tuple>
 #include <utility>
 #include <vector>
 
-using otterstax::test::init_test_otterbrix;
-using otterstax::test::make_az_scheduler;
-using otterstax::test::run_scheduler_sql_payload;
-using otterstax::test::scheduler_stack;
-using otterstax::test::worker_pool_size;
+using otterstax::test::run_session_sql_payload;
+using otterstax::test::session_stack;
 
 namespace {
 
@@ -65,6 +61,8 @@ namespace {
     struct backend_table {
         std::string name;
         std::vector<backend_column> columns;
+        // The primary key's columns in key order (pg_index.indkey), empty for none.
+        std::vector<std::string> primary_key{};
     };
 
     backend_column int4(std::string name) {
@@ -91,6 +89,20 @@ namespace {
     std::vector<backend_table> backend_tables() {
         std::lock_guard guard(g_tables_mutex);
         return g_tables;
+    }
+
+    // The aliases whose backend refuses every connection (a server that is
+    // down), switched between runs like the table catalog.
+    std::vector<std::string> g_unreachable;
+
+    void set_unreachable(std::vector<std::string> aliases) {
+        std::lock_guard guard(g_tables_mutex);
+        g_unreachable = std::move(aliases);
+    }
+
+    bool unreachable(const std::string& alias) {
+        std::lock_guard guard(g_tables_mutex);
+        return std::find(g_unreachable.begin(), g_unreachable.end(), alias) != g_unreachable.end();
     }
 
     // The table a generated statement names: the PostgreSQL reference is
@@ -159,6 +171,38 @@ namespace {
         return result;
     }
 
+    // The rows of make_primary_keys_query: (relname, attname) per key column, in key order per
+    // table — what the query's ORDER BY relname, array_position(indkey, attnum) answers.
+    pg_result_ptr primary_keys_result(const std::vector<backend_table>& tables) {
+        auto result = empty_tuples();
+        PGresAttDesc attrs[2]{};
+        attrs[0].name = const_cast<char*>("relname");
+        attrs[1].name = const_cast<char*>("attname");
+        for (auto& attr : attrs) {
+            attr.typid = kVarcharOid;
+            attr.typlen = -1;
+            attr.atttypmod = -1;
+        }
+        PQsetResultAttrs(result.get(), 2, attrs);
+        int row = 0;
+        for (const auto& table : tables) {
+            for (const auto& column : table.primary_key) {
+                PQsetvalue(result.get(), row, 0, const_cast<char*>(table.name.c_str()), static_cast<int>(table.name.size()));
+                PQsetvalue(result.get(), row, 1, const_cast<char*>(column.c_str()), static_cast<int>(column.size()));
+                ++row;
+            }
+        }
+        return result;
+    }
+
+    // The writes the backend received (the federation's row-change statements), in order.
+    std::vector<std::string> g_writes;
+
+    std::vector<std::string> take_writes() {
+        std::lock_guard guard(g_tables_mutex);
+        return std::exchange(g_writes, {});
+    }
+
     constexpr std::size_t kBackendRows = 2;
 
     class catalog_pg_connector final : public pg::IConnector {
@@ -171,7 +215,13 @@ namespace {
         pg::Status status() const noexcept override { return pg::Status::Connected; }
         pg::connect_params params() const noexcept override { return params_; }
         void close() override {}
-        core::error_t connect() override { return core::error_t::no_error(); }
+        core::error_t connect() override {
+            if (unreachable(alias_)) {
+                return core::error_t(core::error_code_t::io_error,
+                                     std::pmr::string{"mock backend: connection refused", resource_});
+            }
+            return core::error_t::no_error();
+        }
         bool isConnected() override { return true; }
         core::error_t tryReconnect() override { return core::error_t::no_error(); }
         bool isClosed() const noexcept override { return false; }
@@ -203,18 +253,27 @@ namespace {
             co_return std::move(chunk);
         }
 
+        // A write names one row (the federation's row-change statement): recorded, one row changed.
         boost::asio::awaitable<core::result_wrapper_t<int64_t>>
-        runQuery(std::string_view, otterstax::function_ref_t<int64_t(PGresult*)>) override {
-            co_return int64_t{0};
+        runQuery(std::string_view query, otterstax::function_ref_t<int64_t(PGresult*)>) override {
+            {
+                std::lock_guard guard(g_tables_mutex);
+                g_writes.emplace_back(query);
+            }
+            co_return int64_t{1};
         }
 
-        // Discovery: no enums, the current table listing, the referenced table's
-        // attributes for a probe.
+        // Discovery: no enums, the tables' primary keys, the current table listing, the
+        // referenced table's attributes for a probe.
         boost::asio::awaitable<core::error_t>
         runQuery(std::string_view query,
                  otterstax::function_ref_t<otterstax::asio_error_t(PGresult*)> handler) override {
             if (query.find("pg_enum") != std::string_view::npos) {
                 auto result = empty_tuples();
+                co_return otterstax::as_query_result<otterstax::asio_error_t>(handler(result.get()));
+            }
+            if (query.find("indisprimary") != std::string_view::npos) {
+                auto result = primary_keys_result(backend_tables());
                 co_return otterstax::as_query_result<otterstax::asio_error_t>(handler(result.get()));
             }
             const auto tables = backend_tables();
@@ -254,169 +313,147 @@ namespace {
         return std::make_unique<catalog_pg_connector>(resource, std::move(params), std::move(alias));
     }
 
-    using otterstax::test::wait_until_ready;
-
     // One server run: a real engine over `data_dir` — which is NOT cleared, a
-    // restart sees what the previous run persisted — real parser and catalog,
-    // the PostgreSQL connection over the mock connector. Destroying the run
-    // checkpoints the engine, as a server shutdown does.
+    // restart sees what the previous run persisted — real parser, the
+    // PostgreSQL connection over the mock connector, opened and discovered at
+    // startup (whole schema). Destroying the run checkpoints the engine, as a
+    // server shutdown does.
     class server_run {
     public:
-        explicit server_run(const std::string& data_dir)
-            : otterbrix_(init_test_otterbrix(data_dir))
-            , resource_(otterbrix_->dispatcher()->resource())
-            , az_scheduler_(make_az_scheduler())
-            , otb_mgr_(actor_zeta::spawn<db::OtterbrixManager>(resource_, make_otterbrix_manager(otterbrix_)))
-            , catalog_(actor_zeta::spawn<mysql::CatalogManager>(resource_, otb_mgr_->address()))
-            , pg_conn_(std::make_unique<pg::ConnectorManager>(resource_,
-                                                              catalog_->address(),
-                                                              &catalog_pg_factory,
-                                                              /*pool_size*/ 1))
-            , pg_mgr_(actor_zeta::spawn<db::PostgressManager>(resource_, pg_conn_.get()))
-            , scheduler_(spawn_scheduler()) {}
+        // `configured` false: the run's config.yaml has no connection at all
+        // (the PostgreSQL one was taken out of it).
+        explicit server_run(const std::string& data_dir, bool configured = true)
+            : owner_(data_dir, options(configured)) {}
+
+        // The run's config.yaml names these PostgreSQL connections, each over
+        // database `pgdb` of the same mock backend.
+        server_run(const std::string& data_dir, const std::vector<std::string>& aliases)
+            : owner_(data_dir, options(aliases)) {}
 
         server_run(const server_run&) = delete;
         server_run& operator=(const server_run&) = delete;
 
-        ~server_run() {
-            scheduler_.reset();
-            pg_mgr_.reset();
-            pg_conn_.reset();
-            catalog_.reset();
-            otb_mgr_.reset();
-            az_scheduler_->stop();
-            otterbrix_.reset();
+        session_stack stack() const { return owner_.stack(); }
+        otterstax::test::test_engine_t& engine() { return owner_.engine(); }
+
+        // The uids of one federation metadata table.
+        std::vector<std::string> listed_uids(const std::string& table) {
+            auto cursor = owner_.engine().sql("SELECT uid FROM federation." + table + ";");
+            REQUIRE(cursor);
+            INFO((cursor->is_error() ? cursor->get_error().what.c_str() : "ok"));
+            REQUIRE_FALSE(cursor->is_error());
+            std::vector<std::string> uids;
+            for (const auto& chunk : cursor->chunks()) {
+                for (std::uint64_t row = 0; row < chunk.size(); ++row) {
+                    uids.emplace_back(chunk.value(0, row).value<std::string_view>());
+                }
+            }
+            return uids;
         }
 
-        // Registers the connection the way startup does: whole-schema discovery
-        // over the mock's current table catalog.
-        core::result_wrapper_t<std::string> register_connection() {
-            conn::api_server::PgConnectionParams params;
-            params.alias = kUid;
-            params.host = "localhost";
-            params.port = "5432";
-            params.username = "user";
-            params.password = "pass";
-            params.database = "pgdb";
-            params.schema = kSchema;
-            params.table = "";
-            return pg_conn_->addConnection(params);
-        }
-
-        scheduler_stack stack() const { return scheduler_stack{scheduler_->address(), otterbrix_, resource_}; }
-
-        // The engine OID the catalog stamps on a SELECT over `table` — what the
-        // store holds for it.
-        components::catalog::oid_t stamped_oid(const std::string& table) {
-            auto parser = make_parser(resource_);
-            auto parsed = parser->parse("SELECT * FROM " + std::string{kUid} + ".pgdb." + kSchema + "." + table + ";");
-            REQUIRE_FALSE(parsed.has_error());
-            auto [needs_sched, future] = actor_zeta::send(catalog_->address(),
-                                                          &mysql::CatalogManager::update_backend_type,
-                                                          session_hash_t{7},
-                                                          std::move(parsed.value()));
-            wait_until_ready(future);
-            auto classified = std::move(future).take_ready();
-            INFO("update_backend_type: " << (classified.has_error() ? classified.error().what.c_str() : "ok"));
-            REQUIRE_FALSE(classified.has_error());
-            const auto& slots = classified.value()->otterbrix_params->external_nodes;
-            REQUIRE(slots.size() == 1);
-            REQUIRE(slots.front().size() == 1);
-            return slots.front().front().target.oid;
-        }
-
-        // Sorted table names the catalog lists for the uid's database.
-        std::vector<std::string> listed_tables() {
-            catalog_ext::get_tables_command_t command;
-            command.include_schema = false;
-            auto [needs_sched, future] =
-                actor_zeta::send(catalog_->address(), &mysql::CatalogManager::get_tables, command);
-            wait_until_ready(future);
-            auto listed = std::move(future).take_ready();
+        // What the Flight SQL GetTables listing answers (catalog::list_tables
+        // over its five reads), as "database.schema.table".
+        std::vector<std::string> get_tables() {
+            auto read = [this](std::string_view sql) {
+                auto cursor = owner_.engine().sql(std::string{sql});
+                REQUIRE(cursor);
+                INFO(sql << ": " << (cursor->is_error() ? cursor->get_error().what.c_str() : "ok"));
+                REQUIRE_FALSE(cursor->is_error());
+                return cursor;
+            };
+            auto namespaces = read(otterstax::catalog::namespaces_sql);
+            auto classes = read(otterstax::catalog::classes_sql);
+            auto remote_tables = read(otterstax::catalog::remote_tables_sql);
+            otterstax::catalog::get_tables_command_t command;
+            auto listed = otterstax::catalog::list_tables(owner_.engine().resource(),
+                                                          command,
+                                                          namespaces->chunks(),
+                                                          classes->chunks(),
+                                                          nullptr,
+                                                          remote_tables->chunks(),
+                                                          nullptr);
             REQUIRE_FALSE(listed.has_error());
             std::vector<std::string> names;
             for (const auto& table : listed.value()) {
-                names.push_back(table.name.collection.t);
+                names.push_back(std::string{table.name.database.t.c_str()} + "." + table.name.schema.t.c_str() + "." +
+                                table.name.collection.t.c_str());
+            }
+            return names;
+        }
+
+        // Sorted table names the federation metadata holds for the uid.
+        std::vector<std::string> listed_tables() {
+            auto cursor = owner_.engine().sql("SELECT table_name FROM federation.remote_tables;");
+            REQUIRE(cursor);
+            INFO((cursor->is_error() ? cursor->get_error().what.c_str() : "ok"));
+            REQUIRE_FALSE(cursor->is_error());
+            std::vector<std::string> names;
+            for (const auto& chunk : cursor->chunks()) {
+                for (std::uint64_t row = 0; row < chunk.size(); ++row) {
+                    names.emplace_back(chunk.value(0, row).value<std::string_view>());
+                }
             }
             std::sort(names.begin(), names.end());
             return names;
         }
 
-        // An engine collection of the uid's database as the engine holds it:
-        // its pg_class oid and (name, type) columns. A collection the engine
-        // does not hold is a test failure here — absence is asserted through
-        // engine_verdict below.
-        struct engine_table {
-            components::catalog::oid_t oid;
-            std::vector<std::pair<std::string, components::types::logical_type>> columns;
-        };
-
-        engine_table engine_collection(const std::string& collection) {
-            components::catalog::oid_t oid = components::catalog::INVALID_OID;
-            auto cursor = make_otterbrix_manager(otterbrix_)->describe_collection(kUid, collection, oid);
+        // The (column_name, column_type) rows of a table, in ordinal order.
+        std::vector<std::pair<std::string, std::string>> listed_columns(const std::string& table) {
+            auto cursor = owner_.engine().sql("SELECT column_name, column_type FROM federation.remote_columns WHERE "
+                                              "table_name = '" +
+                                              table + "' ORDER BY ordinal;");
             REQUIRE(cursor);
-            INFO("describe_collection: " << (cursor->is_error() ? cursor->get_error().what.c_str() : "ok"));
+            INFO((cursor->is_error() ? cursor->get_error().what.c_str() : "ok"));
             REQUIRE_FALSE(cursor->is_error());
-            REQUIRE(cursor->type_data().size() == 1);
-            engine_table table{oid, {}};
-            for (const auto& column : cursor->type_data().front().child_types()) {
-                table.columns.emplace_back(column.alias(), column.type());
+            std::vector<std::pair<std::string, std::string>> columns;
+            for (const auto& chunk : cursor->chunks()) {
+                for (std::uint64_t row = 0; row < chunk.size(); ++row) {
+                    columns.emplace_back(chunk.value(0, row).value<std::string_view>(),
+                                         chunk.value(1, row).value<std::string_view>());
+                }
             }
-            return table;
-        }
-
-        // The engine's error code for describing a collection of the uid's
-        // database (table_not_exists for one that is gone).
-        core::error_code_t engine_verdict(const std::string& collection) {
-            components::catalog::oid_t oid = components::catalog::INVALID_OID;
-            auto cursor = make_otterbrix_manager(otterbrix_)->describe_collection(kUid, collection, oid);
-            REQUIRE(cursor);
-            REQUIRE(cursor->is_error());
-            return cursor->get_error().type;
-        }
-
-        // Sorted encoded collection names the uid's mirror manifest lists.
-        std::vector<std::string> manifest() {
-            auto cursor = make_otterbrix_manager(otterbrix_)->execute_sql(
-                sql_gen::select_column_statement(kUid, db::external_manifest_collection, db::external_manifest_column));
-            REQUIRE(cursor);
-            INFO("manifest: " << (cursor->is_error() ? cursor->get_error().what.c_str() : "ok"));
-            REQUIRE_FALSE(cursor->is_error());
-            std::vector<std::string> rows;
-            while (cursor->has_next()) {
-                cursor->advance();
-                rows.emplace_back(cursor->value(0).value<std::string_view>());
-            }
-            std::sort(rows.begin(), rows.end());
-            return rows;
+            return columns;
         }
 
     private:
-        std::unique_ptr<Scheduler, actor_zeta::pmr::deleter_t> spawn_scheduler() {
-            catalog_->set_backend_managers(actor_zeta::address_t::empty_address(),
-                                           pg_mgr_->address(),
-                                           actor_zeta::address_t::empty_address());
-            return actor_zeta::spawn<Scheduler>(resource_,
-                                                az_scheduler_.get(),
-                                                worker_pool_size(),
-                                                &make_parser,
-                                                actor_zeta::address_t::empty_address(), // sql
-                                                pg_mgr_->address(),
-                                                actor_zeta::address_t::empty_address(), // ch
-                                                otb_mgr_->address(),
-                                                catalog_->address(),
-                                                actor_zeta::address_t::empty_address(), // s3
-                                                actor_zeta::address_t::empty_address()); // file
+        // A restart sees what the previous run persisted: the directory is not
+        // wiped (data_dir_guard below owns it).
+        static otterstax::test::stack_options_t options(bool configured) {
+            otterstax::test::stack_options_t options;
+            options.connectors.postgres = &catalog_pg_factory;
+            options.fresh = false;
+            if (!configured) {
+                return options;
+            }
+            options.connections.postgresql.push_back(config::PgConnectionDesc{.alias = kUid,
+                                                                              .host = "localhost",
+                                                                              .port = "5432",
+                                                                              .username = "user",
+                                                                              .password = "pass",
+                                                                              .database = "pgdb",
+                                                                              .schema = kSchema,
+                                                                              .table = ""});
+            return options;
         }
 
-        db::otterbrix_engine_ptr otterbrix_;
-        std::pmr::memory_resource* resource_{nullptr};
-        std::unique_ptr<actor_zeta::scheduler::sharing_scheduler> az_scheduler_;
-        std::unique_ptr<db::OtterbrixManager, actor_zeta::pmr::deleter_t> otb_mgr_;
-        std::unique_ptr<mysql::CatalogManager, actor_zeta::pmr::deleter_t> catalog_;
-        std::unique_ptr<pg::ConnectorManager> pg_conn_;
-        std::unique_ptr<db::PostgressManager, actor_zeta::pmr::deleter_t> pg_mgr_;
-        std::unique_ptr<Scheduler, actor_zeta::pmr::deleter_t> scheduler_;
+        static otterstax::test::stack_options_t options(const std::vector<std::string>& aliases) {
+            otterstax::test::stack_options_t options;
+            options.connectors.postgres = &catalog_pg_factory;
+            options.fresh = false;
+            for (const auto& alias : aliases) {
+                options.connections.postgresql.push_back(config::PgConnectionDesc{.alias = alias,
+                                                                                  .host = "localhost",
+                                                                                  .port = "5432",
+                                                                                  .username = "user",
+                                                                                  .password = "pass",
+                                                                                  .database = "pgdb",
+                                                                                  .schema = kSchema,
+                                                                                  .table = ""});
+            }
+            return options;
+        }
+
+        otterstax::test::session_stack_owner owner_;
     };
 
     // The data dir of one test: cleared before the first run and after the last.
@@ -429,25 +466,18 @@ namespace {
         std::string path;
     };
 
-    std::string encoded(const std::string& table) { return "pgdb:" + std::string{kSchema} + ":" + table; }
-
     std::vector<backend_table> orders_and_customers() {
         return {backend_table{"orders", {int4("id"), varchar("name")}},
                 backend_table{"customers", {int4("id"), varchar("email")}}};
     }
 
-    void require_registered(const core::result_wrapper_t<std::string>& added) {
-        INFO("addConnection: " << (added.has_error() ? added.error().what.c_str() : "ok"));
-        REQUIRE_FALSE(added.has_error());
-    }
-
-    // SELECT * over the external table through the Scheduler: the mock's rows
+    // SELECT * over the external table through a session: the mock's rows
     // under the discovered columns.
-    void require_select_star(const scheduler_stack& s,
+    void require_select_star(const session_stack& s,
                              session_hash_t id,
                              const std::string& table,
                              std::size_t column_count) {
-        auto payload = run_scheduler_sql_payload(
+        auto payload = run_session_sql_payload(
             s, id, "SELECT * FROM " + std::string{kUid} + ".pgdb." + kSchema + "." + table + ";");
         INFO("SELECT: " << (payload.has_error() ? payload.error().what.c_str() : "ok"));
         REQUIRE_FALSE(payload.has_error());
@@ -457,51 +487,30 @@ namespace {
 
 } // namespace
 
-TEST_CASE("restart reconciliation: a persisted mirror database is reused and its tables keep their OIDs") {
+TEST_CASE("restart reconciliation: after a restart the remote tables are discovered again and keep answering") {
     data_dir_guard dir("/tmp/otterstax_restart_reconcile_reuse");
     set_backend_tables(orders_and_customers());
-
-    components::catalog::oid_t orders_oid = components::catalog::INVALID_OID;
-    components::catalog::oid_t customers_oid = components::catalog::INVALID_OID;
     {
         server_run first(dir.path);
-        require_registered(first.register_connection());
-        orders_oid = first.stamped_oid("orders");
-        customers_oid = first.stamped_oid("customers");
-        REQUIRE(orders_oid != components::catalog::INVALID_OID);
-        REQUIRE(customers_oid != components::catalog::INVALID_OID);
-        REQUIRE(orders_oid != customers_oid);
-        REQUIRE(first.engine_collection(encoded("orders")).oid == orders_oid);
-        REQUIRE(first.engine_collection(encoded("customers")).oid == customers_oid);
-        REQUIRE(first.manifest() == std::vector<std::string>{encoded("customers"), encoded("orders")});
+        REQUIRE(first.listed_tables() == std::vector<std::string>{"customers", "orders"});
+        require_select_star(first.stack(), 9490, "orders", 2);
     }
 
     server_run restarted(dir.path);
-    require_registered(restarted.register_connection());
-
-    // The store resolves both tables to the OIDs the engine restored.
-    REQUIRE(restarted.stamped_oid("orders") == orders_oid);
-    REQUIRE(restarted.stamped_oid("customers") == customers_oid);
-    REQUIRE(restarted.engine_collection(encoded("orders")).oid == orders_oid);
-    REQUIRE(restarted.engine_collection(encoded("customers")).oid == customers_oid);
-    REQUIRE(restarted.manifest() == std::vector<std::string>{encoded("customers"), encoded("orders")});
+    // The rows are replaced, not doubled.
     REQUIRE(restarted.listed_tables() == std::vector<std::string>{"customers", "orders"});
-
+    REQUIRE(restarted.listed_columns("orders") ==
+            std::vector<std::pair<std::string, std::string>>{{"id", "int4"}, {"name", "text"}});
     require_select_star(restarted.stack(), 9500, "orders", 2);
     require_select_star(restarted.stack(), 9501, "customers", 2);
 }
 
-TEST_CASE("restart reconciliation: a table whose backend schema changed is recreated with the new columns") {
+TEST_CASE("restart reconciliation: a table whose backend schema changed is read with the new columns") {
     data_dir_guard dir("/tmp/otterstax_restart_reconcile_recreate");
     set_backend_tables(orders_and_customers());
-
-    components::catalog::oid_t orders_oid = components::catalog::INVALID_OID;
-    components::catalog::oid_t customers_oid = components::catalog::INVALID_OID;
     {
         server_run first(dir.path);
-        require_registered(first.register_connection());
-        orders_oid = first.stamped_oid("orders");
-        customers_oid = first.stamped_oid("customers");
+        REQUIRE(first.listed_columns("orders").size() == 2);
     }
 
     // The backend gained a column on orders; customers is unchanged.
@@ -509,52 +518,238 @@ TEST_CASE("restart reconciliation: a table whose backend schema changed is recre
                         backend_table{"customers", {int4("id"), varchar("email")}}});
 
     server_run restarted(dir.path);
-    require_registered(restarted.register_connection());
-
-    const auto new_orders_oid = restarted.stamped_oid("orders");
-    REQUIRE(new_orders_oid != components::catalog::INVALID_OID);
-    REQUIRE(new_orders_oid != orders_oid);
-    REQUIRE(restarted.stamped_oid("customers") == customers_oid);
-
-    using components::types::logical_type;
-    const std::vector<std::pair<std::string, logical_type>> expected{{"id", logical_type::INTEGER},
-                                                                     {"name", logical_type::STRING_LITERAL},
-                                                                     {"price", logical_type::DOUBLE}};
-    const auto orders = restarted.engine_collection(encoded("orders"));
-    REQUIRE(orders.oid == new_orders_oid);
-    REQUIRE(orders.columns == expected);
-    REQUIRE(restarted.engine_collection(encoded("customers")).oid == customers_oid);
-    REQUIRE(restarted.manifest() == std::vector<std::string>{encoded("customers"), encoded("orders")});
-
+    REQUIRE(restarted.listed_columns("orders") ==
+            std::vector<std::pair<std::string, std::string>>{{"id", "int4"}, {"name", "text"}, {"price", "float8"}});
     require_select_star(restarted.stack(), 9520, "orders", 3);
+    require_select_star(restarted.stack(), 9521, "customers", 2);
 }
 
-TEST_CASE("restart reconciliation: a table the backend no longer has is dropped from the engine") {
+TEST_CASE("restart reconciliation: a table the backend no longer has is gone after a restart") {
     data_dir_guard dir("/tmp/otterstax_restart_reconcile_drop");
     set_backend_tables(orders_and_customers());
-
-    components::catalog::oid_t orders_oid = components::catalog::INVALID_OID;
     {
         server_run first(dir.path);
-        require_registered(first.register_connection());
-        orders_oid = first.stamped_oid("orders");
-        REQUIRE(first.manifest() == std::vector<std::string>{encoded("customers"), encoded("orders")});
+        REQUIRE(first.listed_tables() == std::vector<std::string>{"customers", "orders"});
     }
 
     // customers was dropped on the backend between the runs.
     set_backend_tables({backend_table{"orders", {int4("id"), varchar("name")}}});
 
     server_run restarted(dir.path);
-    require_registered(restarted.register_connection());
-
-    REQUIRE(restarted.stamped_oid("orders") == orders_oid);
-    REQUIRE(restarted.engine_collection(encoded("orders")).oid == orders_oid);
     REQUIRE(restarted.listed_tables() == std::vector<std::string>{"orders"});
-
-    // The dropped mirror is gone from the engine and from the manifest, not
-    // only from the store.
-    REQUIRE(restarted.engine_verdict(encoded("customers")) == core::error_code_t::table_not_exists);
-    REQUIRE(restarted.manifest() == std::vector<std::string>{encoded("orders")});
-
+    REQUIRE(restarted.listed_columns("customers").empty());
     require_select_star(restarted.stack(), 9540, "orders", 2);
+
+    // A statement naming it is a missing relation: rediscovered once, still
+    // not there, the statement's own error answered.
+    auto missing = run_session_sql_payload(restarted.stack(), 9541, "SELECT * FROM shop.pgdb.public.customers;");
+    REQUIRE(missing.has_error());
+    INFO(missing.error().what.c_str());
+    CHECK(std::string{missing.error().what.c_str()}.find("does not exist") != std::string::npos);
+}
+
+TEST_CASE("restart reconciliation: a connection taken out of the configuration leaves no metadata behind") {
+    data_dir_guard dir("/tmp/otterstax_restart_reconcile_unconfigured");
+    set_backend_tables(orders_and_customers());
+    {
+        server_run first(dir.path);
+        REQUIRE(first.listed_tables() == std::vector<std::string>{"customers", "orders"});
+        REQUIRE(first.get_tables() == std::vector<std::string>{"pgdb.public.customers", "pgdb.public.orders"});
+    }
+
+    // The next start's config.yaml no longer names the connection: its tables
+    // and their columns go, and no listing shows them.
+    server_run restarted(dir.path, /*configured=*/false);
+    CHECK(restarted.listed_uids("remote_tables").empty());
+    CHECK(restarted.listed_uids("remote_columns").empty());
+    CHECK(restarted.get_tables().empty());
+}
+
+// Two connections, then a restart whose config.yaml keeps one: the dropped
+// connection's rows go, the kept one's stay and it keeps answering.
+TEST_CASE("restart reconciliation: two connections then one keeps only the configured one") {
+    data_dir_guard dir("/tmp/otterstax_restart_reconcile_two_to_one");
+    set_backend_tables(orders_and_customers());
+    set_unreachable({});
+    {
+        server_run first(dir.path, std::vector<std::string>{kUid, "outlet"});
+        auto uids = first.listed_uids("remote_tables");
+        REQUIRE(uids.size() == 4);
+        std::sort(uids.begin(), uids.end());
+        uids.erase(std::unique(uids.begin(), uids.end()), uids.end());
+        REQUIRE(uids == std::vector<std::string>{"outlet", kUid});
+    }
+
+    server_run restarted(dir.path, std::vector<std::string>{kUid});
+    for (const auto& uid : restarted.listed_uids("remote_tables")) {
+        CHECK(uid == kUid);
+    }
+    for (const auto& uid : restarted.listed_uids("remote_columns")) {
+        CHECK(uid == kUid);
+    }
+    CHECK(restarted.listed_uids("remote_tables").size() == 2);
+    CHECK(restarted.get_tables() == std::vector<std::string>{"pgdb.public.customers", "pgdb.public.orders"});
+    require_select_star(restarted.stack(), 9550, "orders", 2);
+    auto gone = run_session_sql_payload(restarted.stack(), 9551, "SELECT * FROM outlet.pgdb.public.orders;");
+    CHECK(gone.has_error());
+}
+
+// A connection still in config.yaml whose backend is down at startup is left
+// out of the run (no connection opened; its statements fail at the
+// connection), but it is still configured: publish_federation_metadata keeps
+// the rows of its last discovery — the metadata is replaced
+// only by a discovery that answered — so the listings show its tables and the
+// next start that reaches the backend replaces them.
+TEST_CASE("restart reconciliation: a configured connection that is unreachable keeps its rows") {
+    data_dir_guard dir("/tmp/otterstax_restart_reconcile_unreachable");
+    set_backend_tables(orders_and_customers());
+    set_unreachable({});
+    {
+        server_run first(dir.path);
+        REQUIRE(first.listed_tables() == std::vector<std::string>{"customers", "orders"});
+    }
+
+    set_unreachable({kUid});
+    {
+        server_run down(dir.path);
+        CHECK(down.listed_uids("remote_tables") == std::vector<std::string>{kUid, kUid});
+        CHECK(down.listed_tables() == std::vector<std::string>{"customers", "orders"});
+        CHECK(down.listed_columns("orders").size() == 2);
+        CHECK(down.get_tables() == std::vector<std::string>{"pgdb.public.customers", "pgdb.public.orders"});
+        // The name resolves from the kept rows; the read fails at the
+        // connection, which was never opened — not as a missing table.
+        auto read = run_session_sql_payload(down.stack(), 9560, "SELECT * FROM shop.pgdb.public.orders;");
+        REQUIRE(read.has_error());
+        INFO(read.error().what.c_str());
+        CHECK(read.error().type != core::error_code_t::table_not_exists);
+    }
+
+    set_unreachable({});
+    server_run back(dir.path);
+    require_select_star(back.stack(), 9561, "orders", 2);
+}
+
+TEST_CASE("restart reconciliation: a mirror database an older OtterStax left under the uid is dropped at startup") {
+    data_dir_guard dir("/tmp/otterstax_restart_legacy_mirror");
+    set_backend_tables(orders_and_customers());
+    {
+        // What an older OtterStax left behind: the uid's database with its
+        // manifest and a mirror collection under the encoded name.
+        otterstax::test::test_engine_t old_run(dir.path, /*fresh=*/false);
+        for (const char* sql : {"CREATE DATABASE shop;",
+                                "CREATE TABLE shop.__otterstax_tables (collection string);",
+                                "CREATE TABLE shop.\"pgdb:public:orders\" (id int, name string);",
+                                "INSERT INTO shop.__otterstax_tables (collection) VALUES ('pgdb:public:orders');"}) {
+            auto cursor = old_run.sql(sql);
+            REQUIRE(cursor);
+            INFO(sql << ": " << (cursor->is_error() ? cursor->get_error().what.c_str() : "ok"));
+            REQUIRE_FALSE(cursor->is_error());
+        }
+    }
+
+    server_run upgraded(dir.path);
+    auto namespaces = upgraded.engine().sql("SELECT nspname FROM pg_catalog.pg_namespace;");
+    REQUIRE(namespaces);
+    REQUIRE_FALSE(namespaces->is_error());
+    for (const auto& chunk : namespaces->chunks()) {
+        for (std::uint64_t row = 0; row < chunk.size(); ++row) {
+            CHECK(chunk.value(0, row).value<std::string_view>() != "shop");
+        }
+    }
+    REQUIRE(upgraded.listed_tables() == std::vector<std::string>{"customers", "orders"});
+    require_select_star(upgraded.stack(), 9560, "orders", 2);
+}
+
+TEST_CASE("rediscovery: a table created on the backend while the server runs is found by one retry") {
+    data_dir_guard dir("/tmp/otterstax_rediscover_new_table");
+    set_backend_tables(orders_and_customers());
+    server_run run(dir.path);
+    REQUIRE(run.listed_tables() == std::vector<std::string>{"customers", "orders"});
+
+    set_backend_tables({backend_table{"orders", {int4("id"), varchar("name")}},
+                        backend_table{"customers", {int4("id"), varchar("email")}},
+                        backend_table{"fresh", {int4("id"), float8("score")}}});
+    require_select_star(run.stack(), 9580, "fresh", 2);
+    REQUIRE(run.listed_tables() == std::vector<std::string>{"customers", "fresh", "orders"});
+}
+
+TEST_CASE("rediscovery: a table whose columns changed while the server runs is read with the new ones") {
+    data_dir_guard dir("/tmp/otterstax_rediscover_changed_table");
+    set_backend_tables(orders_and_customers());
+    server_run run(dir.path);
+    require_select_star(run.stack(), 9600, "orders", 2);
+
+    // The scan answers three columns where two are declared: stale, rediscovered,
+    // the statement retried once.
+    set_backend_tables({backend_table{"orders", {int4("id"), varchar("name"), float8("price")}},
+                        backend_table{"customers", {int4("id"), varchar("email")}}});
+    require_select_star(run.stack(), 9601, "orders", 3);
+    REQUIRE(run.listed_columns("orders").size() == 3);
+}
+
+// A table the backend spells in mixed case is rediscovered under that spelling
+// (federation.remote_tables keeps it), not under the lower-case name the
+// statement wrote: a backend whose names are case-sensitive would not find the
+// lower-cased one.
+TEST_CASE("rediscovery: a stale table is rediscovered under the backend's own spelling") {
+    data_dir_guard dir("/tmp/otterstax_rediscover_spelling");
+    set_backend_tables({backend_table{"Mixed", {int4("id"), varchar("name")}}});
+    server_run run(dir.path);
+    REQUIRE(run.listed_tables() == std::vector<std::string>{"mixed"});
+    require_select_star(run.stack(), 9620, "mixed", 2);
+
+    // The mock answers a probe of `public.Mixed` only.
+    set_backend_tables({backend_table{"Mixed", {int4("id"), varchar("name"), float8("price")}}});
+    require_select_star(run.stack(), 9621, "mixed", 3);
+    REQUIRE(run.listed_columns("mixed").size() == 3);
+}
+
+TEST_CASE("primary key: a composite PostgreSQL key is recorded in key order and names the row a change writes") {
+    data_dir_guard dir("/tmp/otterstax_restart_reconcile_primary_key");
+    // PRIMARY KEY (b, a): the key order is not the column order.
+    set_backend_tables({backend_table{"orders", {int4("a"), int4("b"), varchar("name")}, {"b", "a"}},
+                        backend_table{"notes", {int4("id"), varchar("text")}}});
+    take_writes();
+    server_run run(dir.path);
+
+    auto keys = run.engine().sql("SELECT table_name, column_name, key_position FROM federation.remote_columns "
+                                 "ORDER BY table_name, ordinal;");
+    REQUIRE(keys);
+    INFO((keys->is_error() ? keys->get_error().what.c_str() : "ok"));
+    REQUIRE_FALSE(keys->is_error());
+    std::vector<std::tuple<std::string, std::string, std::int64_t>> recorded;
+    for (const auto& chunk : keys->chunks()) {
+        for (std::uint64_t row = 0; row < chunk.size(); ++row) {
+            recorded.emplace_back(chunk.value(0, row).value<std::string_view>(),
+                                  chunk.value(1, row).value<std::string_view>(),
+                                  chunk.value(2, row).value<std::int64_t>());
+        }
+    }
+    CHECK(recorded == std::vector<std::tuple<std::string, std::string, std::int64_t>>{{"notes", "id", 0},
+                                                                                      {"notes", "text", 0},
+                                                                                      {"orders", "a", 2},
+                                                                                      {"orders", "b", 1},
+                                                                                      {"orders", "name", 0}});
+
+    // A row the engine picks (the IN over a local table keeps the statement in the engine) is
+    // changed on the backend by its key, the key's columns in key order.
+    REQUIRE_FALSE(run.engine().sql("CREATE DATABASE loc;")->is_error());
+    REQUIRE_FALSE(run.engine().sql("CREATE TABLE loc.ids (id INT);")->is_error());
+    REQUIRE_FALSE(run.engine().sql("INSERT INTO loc.ids (id) VALUES (2);")->is_error());
+    auto updated = run.engine().sql(std::string{"UPDATE "} + kUid + "." + kSchema +
+                                    ".orders SET name = 'z' WHERE a IN (SELECT id FROM loc.ids);");
+    REQUIRE(updated);
+    INFO((updated->is_error() ? updated->get_error().what.c_str() : "ok"));
+    REQUIRE_FALSE(updated->is_error());
+    CHECK(updated->affected_rows() == 1);
+    CHECK(take_writes() ==
+          std::vector<std::string>{R"(UPDATE "public"."orders" SET "name" = 'z' WHERE "b" = 2 AND "a" = 2)"});
+
+    // A table without a key has no row a change could name: refused before anything is sent.
+    auto refused = run.engine().sql(std::string{"UPDATE "} + kUid + "." + kSchema +
+                                    ".notes SET text = 'z' WHERE id IN (SELECT id FROM loc.ids);");
+    REQUIRE(refused);
+    REQUIRE(refused->is_error());
+    CHECK(std::string{refused->get_error().what.c_str()}.find("has no primary key") != std::string::npos);
+    CHECK(take_writes().empty());
 }

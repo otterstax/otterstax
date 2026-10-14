@@ -107,6 +107,26 @@ run_test "PostgreSQL extended protocol (raw wire)" "test_pg_extended_protocol.py
 # COM_QUERY and COM_STMT_PREPARE; a statement prepared and abandoned at
 # COM_QUIT / socket drop leaves the server serving.
 run_test "MySQL wire protocol (raw socket)" "test_mysql_wire_protocol.py"
+# Local transactions with PostgreSQL semantics on both wires: ROLLBACK /
+# COMMIT seen from a second connection, 25P02 / refusals inside a failed
+# block, the extended-protocol BEGIN, SAVEPOINT refused (0A000 / 1235), SET
+# answered without effect (SET autocommit included, on every connection).
+run_test "Transactions (PostgreSQL wire)" "test_transactions_pg_wire.py"
+run_test "Transactions (MySQL wire)" "test_transactions_mysql_wire.py"
+# What MySQL drivers send on their own: @@variable selects, SHOW VARIABLES /
+# WARNINGS, MySQL SET forms answered by the frontend; NO_BACKSLASH_ESCAPES
+# honoured by PyMySQL; a server-side prepared `?` running as `$n`.
+run_test "MySQL driver housekeeping" "test_mysql_client_housekeeping.py"
+# Flight SQL: GetTables lists local and remote tables; BEGIN by text refused.
+run_test "FlightSQL Client (GetTables, BEGIN refused)" "test_flightsql_client_tables_and_transactions.py"
+# Remote DML through the engine: row by row by primary key (MariaDB, PG),
+# refused without a usable key and on ClickHouse; four-part targets; a
+# remote write inside BEGIN survives ROLLBACK.
+run_test "Remote DML (row by row by primary key, four-part targets)" "test_remote_row_dml.py"
+# JOINs of one server pushed as one statement: a ClickHouse JOIN reading the
+# second table's Bool (INNER and LEFT), ORDER BY a name both tables have +
+# LIMIT (ClickHouse, MariaDB), PostgreSQL DISTINCT ON over a JOIN.
+run_test "Pushed JOINs (ClickHouse Bool, shared names, DISTINCT ON)" "test_pushed_joins.py"
 
 # Cross-backend JOIN tests
 run_test "Cross-backend Queries (MySQL wire)" "test_cross_backend_queries_mysql.py"

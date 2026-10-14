@@ -2,22 +2,17 @@
 // Copyright 2025-2026  OtterStax
 //
 // Google Benchmark targets for SQL query generation:
-//   sql_gen::replace_qualifiers() — rewrites 4-part qualifiers in raw SQL stubs
-//   sql_gen::table_reference()    — formats a db.collection / schema.collection string
+//   sql_gen::generate_query() — the statement the federation's pushdown rule
+//                               sends to a backend for one query block
 //
-// Note on sql_gen::generate_query():
-//   generate_query() operates on logical-plan node_ptr objects produced by the
-//   Otterbrix optimizer's aggregation/join rewriter.  In production those nodes
-//   come from ParsedQueryData::otterbrix_params::external_nodes when the node
-//   type is NOT schema_node_t (i.e. when has_raw_sql() is false).  Constructing
-//   a synthetic node_ptr requires the Otterbrix logical-plan builder API, which
-//   is not exposed at unit level.  The generate_query path is therefore exercised
-//   by the system tests.  What IS measurable here is the prepare_sql + replace_qualifiers
-//   pipeline, which is the hot path for all single-backend and most cross-backend
-//   queries in production.
+// The query blocks come from GreenplumParser::parse(): the aggregate that reads
+// the remote table (its name carries the uid slot) with its clauses — what the
+// pushdown rule hands the generator. The rule generates over the engine's
+// validated tree; the parse tree here has the same shape before validation,
+// which is what the generator's own cost depends on. GreenplumParser needs the
+// named loggers: bench_parser.cpp registers them before main in this binary.
 
 #include "otterbrix/parser/parser.hpp"
-#include "otterbrix/parser/subquery_extractor.hpp"
 #include "otterbrix/query_generation/sql_query_generator.hpp"
 
 #include <benchmark/benchmark.h>
@@ -28,192 +23,70 @@
 
 namespace {
 
-otterstax::parser::extraction_result_t prep(const char* sql) {
-    return otterstax::parser::prepare_sql(sql, std::pmr::new_delete_resource(), std::pmr::new_delete_resource());
-}
+    // The first aggregate under (or at) `node` that reads a table of the connection `uid`.
+    components::logical_plan::node_ptr block_of(const components::logical_plan::node_ptr& node, const std::string& uid) {
+        if (!node) {
+            return nullptr;
+        }
+        if (node->type() == components::logical_plan::node_type::aggregate_t &&
+            node->target().unique_identifier.t == uid) {
+            return node;
+        }
+        for (const auto& child : node->children()) {
+            if (auto found = block_of(child, uid)) {
+                return found;
+            }
+        }
+        return nullptr;
+    }
 
-// All SQL fixtures use the subquery form required by prepare_sql.  Stubs are
-// only produced for SQL-level subqueries wrapped in parentheses; flat JOINs with
-// 4-part table names produce 0 stubs and are handled differently by the scheduler.
-// Ordering of subqueries in the SQL determines stub order (left-to-right by
-// paren_open position).
+    struct block_t {
+        ParsedQueryDataPtr parsed;
+        components::logical_plan::node_ptr node;
+    };
 
-// Single MySQL backend — produces 1 stub: stubs[0]=MySQL.
-const char* kMysqlOnlySql =
-    "SELECT * FROM ("
-    "SELECT id, name, status FROM mysql.bill.schema.orders WHERE status = 'active'"
-    ") o";
+    block_t parse_block(GreenplumParser& parser, const char* sql, const std::string& uid) {
+        auto parsed = parser.parse(sql);
+        assert(!parsed.has_error());
+        block_t block{std::move(parsed.value()), nullptr};
+        block.node = block_of(block.parsed->otterbrix_params->node, uid);
+        assert(block.node);
+        return block;
+    }
 
-// MySQL × PostgreSQL cross-backend — produces 2 stubs:
-//   stubs[0]=MySQL (first paren), stubs[1]=PostgreSQL (second paren).
-const char* kCrossBackendSql =
-    "SELECT o.product_id, p.category "
-    "FROM (SELECT product_id FROM mysql.bill.schema.orders WHERE status = 'active') o "
-    "INNER JOIN (SELECT id, category FROM pg.shop.shop.products) p ON p.id = o.product_id";
+    void bench_block(benchmark::State& state, const char* sql, const std::string& uid, backend_type_t backend) {
+        std::pmr::unsynchronized_pool_resource pool;
+        GreenplumParser parser(&pool);
+        auto block = parse_block(parser, sql, uid);
+        const auto& params = block.parsed->otterbrix_params->params_node->parameters();
+        const sql_gen::statement_target_t target{block.node->target()};
+        for (auto _ : state) {
+            auto out = sql_gen::generate_query(block.node, &params, backend, target, std::pmr::new_delete_resource());
+            benchmark::DoNotOptimize(out);
+        }
+    }
 
-// Single ClickHouse backend — produces 1 stub: stubs[0]=ClickHouse.
-const char* kChSql =
-    "SELECT * FROM ("
-    "SELECT session_id, ts FROM ch.ev.schema.sessions WHERE country = 'DE'"
-    ") s";
-
-// Three-backend: MySQL × PostgreSQL × ClickHouse — produces 3 stubs:
-//   stubs[0]=MySQL, stubs[1]=PostgreSQL, stubs[2]=ClickHouse.
-// replace_qualifiers must run once per backend — the worst-case
-// qualifier-rewriting path for a single client query.
-const char* kThreeBackendSql =
-    "SELECT o.product_id, p.category, e.session_id "
-    "FROM (SELECT product_id FROM mysql.bill.schema.orders WHERE status = 'active') o "
-    "INNER JOIN (SELECT id, category FROM pg.shop.shop.products) p ON p.id = o.product_id "
-    "INNER JOIN (SELECT session_id, campaign_id FROM ch.ev.schema.events WHERE country = 'DE') e "
-    "    ON o.product_id = e.campaign_id";
+    const char* kMysqlFilter = "SELECT id, name, status FROM mysql.bill.schema.orders WHERE status = 'active' "
+                               "ORDER BY id LIMIT 100";
+    const char* kPgAggregate = "SELECT category, count(*) AS n, sum(price) AS total FROM pg.shop.shop.products "
+                               "WHERE price > 10 GROUP BY category HAVING count(*) > 1";
+    const char* kChFilter = "SELECT session_id, ts FROM ch.ev.schema.sessions WHERE country = 'DE' AND ts > 100";
 
 } // namespace
 
-// ── replace_qualifiers ────────────────────────────────────────────────────────
+// ── generate_query ────────────────────────────────────────────────────────────
 
-static void BM_replace_qualifiers_mysql(benchmark::State& state) {
-    auto r = prep(kMysqlOnlySql);
-    assert(!r.stubs.empty());
-    const auto& stub = r.stubs[0];
-    for (auto _ : state) {
-        auto out = sql_gen::replace_qualifiers(stub.raw_sql,
-                                               stub.qualifiers,
-                                               backend_type_t::MySQL,
-                                               std::pmr::new_delete_resource());
-        benchmark::DoNotOptimize(out);
-    }
+static void BM_generate_query_mysql_filter(benchmark::State& state) {
+    bench_block(state, kMysqlFilter, "mysql", backend_type_t::MySQL);
 }
-BENCHMARK(BM_replace_qualifiers_mysql);
+BENCHMARK(BM_generate_query_mysql_filter);
 
-static void BM_replace_qualifiers_pg(benchmark::State& state) {
-    auto r = prep(kCrossBackendSql);
-    // The PG stub is the second stub in the cross-backend query.
-    assert(r.stubs.size() >= 2);
-    const auto& stub = r.stubs.back();
-    for (auto _ : state) {
-        auto out = sql_gen::replace_qualifiers(stub.raw_sql,
-                                               stub.qualifiers,
-                                               backend_type_t::PostgreSQL,
-                                               std::pmr::new_delete_resource());
-        benchmark::DoNotOptimize(out);
-    }
+static void BM_generate_query_pg_aggregate(benchmark::State& state) {
+    bench_block(state, kPgAggregate, "pg", backend_type_t::PostgreSQL);
 }
-BENCHMARK(BM_replace_qualifiers_pg);
+BENCHMARK(BM_generate_query_pg_aggregate);
 
-static void BM_replace_qualifiers_ch(benchmark::State& state) {
-    auto r = prep(kChSql);
-    assert(!r.stubs.empty());
-    const auto& stub = r.stubs[0];
-    for (auto _ : state) {
-        auto out = sql_gen::replace_qualifiers(stub.raw_sql,
-                                               stub.qualifiers,
-                                               backend_type_t::ClickHouse,
-                                               std::pmr::new_delete_resource());
-        benchmark::DoNotOptimize(out);
-    }
+static void BM_generate_query_ch_filter(benchmark::State& state) {
+    bench_block(state, kChFilter, "ch", backend_type_t::ClickHouse);
 }
-BENCHMARK(BM_replace_qualifiers_ch);
-
-// No-op: zero qualifier rewrites in the list.
-static void BM_replace_qualifiers_empty(benchmark::State& state) {
-    std::pmr::vector<otterstax::parser::qualifier_rewrite_t> no_quals{std::pmr::new_delete_resource()};
-    const std::string sql = "SELECT id, name FROM orders WHERE status = 'active'";
-    for (auto _ : state) {
-        auto out =
-            sql_gen::replace_qualifiers(sql, no_quals, backend_type_t::MySQL, std::pmr::new_delete_resource());
-        benchmark::DoNotOptimize(out);
-    }
-}
-BENCHMARK(BM_replace_qualifiers_empty);
-
-// ── Full parse + qualify pipeline ────────────────────────────────────────────
-// Measures prepare_sql (stub extraction) + replace_qualifiers in one shot,
-// mirroring the exact sequence executed for a single-source query at runtime.
-
-static void BM_pipeline_mysql_single_source(benchmark::State& state) {
-    std::pmr::unsynchronized_pool_resource pool;
-    for (auto _ : state) {
-        auto r = otterstax::parser::prepare_sql(kMysqlOnlySql, &pool, &pool);
-        assert(!r.stubs.empty());
-        auto out = sql_gen::replace_qualifiers(r.stubs[0].raw_sql,
-                                               r.stubs[0].qualifiers,
-                                               backend_type_t::MySQL,
-                                               std::pmr::new_delete_resource());
-        benchmark::DoNotOptimize(out);
-    }
-}
-BENCHMARK(BM_pipeline_mysql_single_source);
-
-static void BM_pipeline_cross_backend(benchmark::State& state) {
-    std::pmr::unsynchronized_pool_resource pool;
-    for (auto _ : state) {
-        auto r = otterstax::parser::prepare_sql(kCrossBackendSql, &pool, &pool);
-        assert(r.stubs.size() >= 2);
-        auto out0 = sql_gen::replace_qualifiers(r.stubs[0].raw_sql,
-                                                r.stubs[0].qualifiers,
-                                                backend_type_t::MySQL,
-                                                std::pmr::new_delete_resource());
-        auto out1 = sql_gen::replace_qualifiers(r.stubs[1].raw_sql,
-                                                r.stubs[1].qualifiers,
-                                                backend_type_t::PostgreSQL,
-                                                std::pmr::new_delete_resource());
-        benchmark::DoNotOptimize(out0);
-        benchmark::DoNotOptimize(out1);
-    }
-}
-BENCHMARK(BM_pipeline_cross_backend);
-
-// Three-backend: MySQL × PostgreSQL × ClickHouse — prepare_sql + 3 × replace_qualifiers.
-static void BM_pipeline_three_backend(benchmark::State& state) {
-    std::pmr::unsynchronized_pool_resource pool;
-    for (auto _ : state) {
-        auto r = otterstax::parser::prepare_sql(kThreeBackendSql, &pool, &pool);
-        assert(r.stubs.size() >= 3);
-        auto out0 = sql_gen::replace_qualifiers(r.stubs[0].raw_sql,
-                                                r.stubs[0].qualifiers,
-                                                backend_type_t::MySQL,
-                                                std::pmr::new_delete_resource());
-        auto out1 = sql_gen::replace_qualifiers(r.stubs[1].raw_sql,
-                                                r.stubs[1].qualifiers,
-                                                backend_type_t::PostgreSQL,
-                                                std::pmr::new_delete_resource());
-        auto out2 = sql_gen::replace_qualifiers(r.stubs[2].raw_sql,
-                                                r.stubs[2].qualifiers,
-                                                backend_type_t::ClickHouse,
-                                                std::pmr::new_delete_resource());
-        benchmark::DoNotOptimize(out0);
-        benchmark::DoNotOptimize(out1);
-        benchmark::DoNotOptimize(out2);
-    }
-}
-BENCHMARK(BM_pipeline_three_backend);
-
-// ── table_reference ───────────────────────────────────────────────────────────
-
-static void BM_table_reference_mysql(benchmark::State& state) {
-    qualified_name_t name{core::dbname_t{"bill"}, core::relname_t{"orders"}};
-    for (auto _ : state) {
-        auto ref = sql_gen::table_reference(name, backend_type_t::MySQL, std::pmr::new_delete_resource());
-        benchmark::DoNotOptimize(ref);
-    }
-}
-BENCHMARK(BM_table_reference_mysql);
-
-static void BM_table_reference_pg(benchmark::State& state) {
-    qualified_name_t name{core::dbname_t{"shop"}, core::relname_t{"products"}};
-    for (auto _ : state) {
-        auto ref = sql_gen::table_reference(name, backend_type_t::PostgreSQL, std::pmr::new_delete_resource());
-        benchmark::DoNotOptimize(ref);
-    }
-}
-BENCHMARK(BM_table_reference_pg);
-
-static void BM_table_reference_ch(benchmark::State& state) {
-    qualified_name_t name{core::dbname_t{"events"}, core::relname_t{"sessions"}};
-    for (auto _ : state) {
-        auto ref = sql_gen::table_reference(name, backend_type_t::ClickHouse, std::pmr::new_delete_resource());
-        benchmark::DoNotOptimize(ref);
-    }
-}
-BENCHMARK(BM_table_reference_ch);
+BENCHMARK(BM_generate_query_ch_filter);

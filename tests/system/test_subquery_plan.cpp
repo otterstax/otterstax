@@ -12,7 +12,7 @@
 // puts them back. Each statement is checked against the rows the engine answers
 // for the same SQL on its own, and against the rows it must answer.
 
-#include "scheduler_stack.hpp"
+#include "session_stack.hpp"
 
 #include <catch2/catch_all.hpp>
 
@@ -21,27 +21,27 @@
 #include <vector>
 
 using otterstax::test::engine_row_count;
-using otterstax::test::execute_scheduler_prepared;
-using otterstax::test::prepare_scheduler_sql;
-using otterstax::test::run_scheduler_prepared;
-using otterstax::test::run_scheduler_sql;
-using otterstax::test::run_scheduler_sql_payload;
-using otterstax::test::scheduler_stack;
-using otterstax::test::with_scheduler_stack;
+using otterstax::test::execute_session_prepared;
+using otterstax::test::prepare_session_sql;
+using otterstax::test::run_session_prepared;
+using otterstax::test::run_session_sql;
+using otterstax::test::run_session_sql_payload;
+using otterstax::test::session_stack;
+using otterstax::test::with_session_stack;
 
 namespace {
 
     using ids_t = std::vector<int64_t>;
 
-    void run_or_fail(const scheduler_stack& s, session_hash_t id, const std::string& sql) {
+    void run_or_fail(const session_stack& s, session_hash_t id, const std::string& sql) {
         std::string err;
-        const bool ok = run_scheduler_sql(s, id, sql, err);
+        const bool ok = run_session_sql(s, id, sql, err);
         INFO(sql << ": " << err);
         REQUIRE(ok);
     }
 
     // sq.t: ids 1..4; sq.u: ids 2 and 3.
-    void seed(const scheduler_stack& s, session_hash_t& id) {
+    void seed(const session_stack& s, session_hash_t& id) {
         run_or_fail(s, id++, "CREATE DATABASE sq;");
         run_or_fail(s, id++, "CREATE TABLE sq.t (id bigint, name string);");
         run_or_fail(s, id++, "CREATE TABLE sq.u (id bigint);");
@@ -59,15 +59,15 @@ namespace {
         return ids;
     }
 
-    // The ids `sql` answers through the Scheduler, after checking the engine
+    // The ids `sql` answers through a query session, after checking the engine
     // answers the same ids for the same SQL on its own.
-    ids_t ids_of(const scheduler_stack& s, session_hash_t id, const std::string& sql) {
-        auto direct = s.otterbrix->dispatcher()->execute_sql(otterbrix::session_id_t(), sql);
+    ids_t ids_of(const session_stack& s, session_hash_t id, const std::string& sql) {
+        auto direct = s.engine->sql(sql);
         REQUIRE(direct);
         INFO(sql << " (engine): " << (direct->is_error() ? direct->get_error().what.c_str() : ""));
         REQUIRE_FALSE(direct->is_error());
 
-        auto result = run_scheduler_sql_payload(s, id, sql);
+        auto result = run_session_sql_payload(s, id, sql);
         INFO(sql << ": " << (result.has_error() ? result.error().what.c_str() : ""));
         REQUIRE_FALSE(result.has_error());
         const auto ids = first_column(result.value().chunks);
@@ -78,7 +78,7 @@ namespace {
 } // namespace
 
 TEST_CASE("sub-query: IN EXISTS and scalar sub-queries over local tables", "[subquery]") {
-    with_scheduler_stack("/tmp/test_subquery_select", [](scheduler_stack s) {
+    with_session_stack("/tmp/test_subquery_select", [](session_stack s) {
         session_hash_t id = 14100;
         seed(s, id);
 
@@ -99,14 +99,14 @@ TEST_CASE("sub-query: IN EXISTS and scalar sub-queries over local tables", "[sub
 }
 
 TEST_CASE("sub-query: prepared statements carry their sub-queries", "[subquery]") {
-    with_scheduler_stack("/tmp/test_subquery_prepared", [](scheduler_stack s) {
+    with_session_stack("/tmp/test_subquery_prepared", [](session_stack s) {
         session_hash_t id = 14200;
         seed(s, id);
 
         // prepare_schema + execute_statement: the plan validated for its schema
         // and the plan executed both carry the sub-query.
         std::string prepare_err;
-        auto prepared = run_scheduler_prepared(s,
+        auto prepared = run_session_prepared(s,
                                                id++,
                                                "SELECT id FROM sq.t WHERE id IN (SELECT id FROM sq.u) ORDER BY id;",
                                                prepare_err);
@@ -116,7 +116,7 @@ TEST_CASE("sub-query: prepared statements carry their sub-queries", "[subquery]"
 
         // A `$n` inside the sub-query, bound at execute.
         const session_hash_t bound_id = id++;
-        auto parsed = prepare_scheduler_sql(s,
+        auto parsed = prepare_session_sql(s,
                                             bound_id,
                                             "SELECT id FROM sq.t WHERE id IN (SELECT id FROM sq.u WHERE id > $1) "
                                             "ORDER BY id;");
@@ -124,7 +124,7 @@ TEST_CASE("sub-query: prepared statements carry their sub-queries", "[subquery]"
         REQUIRE_FALSE(parsed.has_error());
         std::pmr::vector<components::types::logical_value_t> params(s.resource);
         params.emplace_back(s.resource, int64_t{2});
-        auto executed = execute_scheduler_prepared(s, bound_id, std::move(params));
+        auto executed = execute_session_prepared(s, bound_id, std::move(params));
         INFO((executed.has_error() ? executed.error().what.c_str() : ""));
         REQUIRE_FALSE(executed.has_error());
         CHECK(first_column(executed.value().chunks) == ids_t{3});
@@ -132,7 +132,7 @@ TEST_CASE("sub-query: prepared statements carry their sub-queries", "[subquery]"
 }
 
 TEST_CASE("sub-query: DML with an IN sub-query touches the selected rows", "[subquery]") {
-    with_scheduler_stack("/tmp/test_subquery_dml", [](scheduler_stack s) {
+    with_session_stack("/tmp/test_subquery_dml", [](session_stack s) {
         session_hash_t id = 14300;
         seed(s, id);
 

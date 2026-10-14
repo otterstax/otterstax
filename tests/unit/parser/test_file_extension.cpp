@@ -142,7 +142,7 @@ TEST_CASE("file registry: a local-path statement is routed to the file extension
     CHECK(extension_payload<s3_ext::s3_stmt>(tree, "s3") == nullptr);
 }
 
-// ── transform stage (lowers to an external_node_t the Scheduler routes) ──────
+// ── transform stage (lowers to an external_node_t the query session routes) ──────
 
 TEST_CASE("file transform: ExtensionNode lowers to an external_node_t") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};

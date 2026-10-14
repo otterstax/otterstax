@@ -54,6 +54,14 @@ namespace ch {
             fields.emplace_back(types::logical_type::STRING_LITERAL, "name");
             components::vector::data_chunk_t result(config_.resource, fields);
             result.set_cardinality(2);
+            // Defined values: the slice reaches a real engine, which copies and
+            // reads every cell.
+            for (uint64_t row = 0; row < 2; ++row) {
+                result.set_value(0, row, types::logical_value_t(config_.resource, static_cast<int32_t>(row + 1)));
+                result.set_value(1,
+                                 row,
+                                 types::logical_value_t(config_.resource, std::string{"name_" + std::to_string(row)}));
+            }
             return result;
         }
 

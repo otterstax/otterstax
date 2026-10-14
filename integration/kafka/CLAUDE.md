@@ -20,7 +20,7 @@ Library: `kafka_runtime` (links `kafka_grammar` + `otterbrix_local`).
 - `otterstax::kafka::detail` — the implementation in `detail/` (the RAII
   consumer/producer, the poller/stream threads, and the reader helpers). The
   manager `.cpp` does `using namespace detail;`; `kafka_manager.hpp` qualifies
-  members as `detail::kafka_*_t`. External code (scheduler, tests) reaches the
+  members as `detail::kafka_*_t`. External code (the query session, tests) reaches the
   helpers as `otterstax::kafka::detail::json_to_chunk` etc.
 
 ## KafkaManager (the actor)
@@ -50,8 +50,8 @@ Library: `kafka_runtime` (links `kafka_grammar` + `otterbrix_local`).
   `pollers_` / `producers_` / `streams_` maps, and `stream_insert_queries_`
   (stream → its INSERT-query names, for DROP-time cleanup). `start_pollers_` ctor
   flag is FALSE by default so broker-free unit tests stay thread-free;
-  component_manager passes TRUE. `recover()` (called by component_manager after
-  init) replays `kafka.__sources` in three passes — sources, streams, then INSERT
+  `main.cpp` spawns it with TRUE (the tests' stack with `stack_options_t::kafka_pollers`, FALSE by default). `recover()` (called
+  by `main.cpp` once the s3 aliases are registered and the federation metadata is published, before any client) replays `kafka.__sources` in three passes — sources, streams, then INSERT
   INTO queries (`kind='insert'`, sink + source re-derived from the persisted SQL).
   Streams are recovered in rounds until none becomes resolvable, so a stream over
   another stream comes back whatever the row order. A stream or INSERT query that
@@ -64,7 +64,7 @@ Library: `kafka_runtime` (links `kafka_grammar` + `otterbrix_local`).
   whose backing table is gone.
   A source's columns are not persisted: they are re-read from its backing table
   through the shared engine-side schema probe (`otterbrix/operators/schema_probe.hpp`,
-  the same helper behind `OtterbrixDataManager::get_schema`), so an empty table
+  the same helper behind the relation probe of `otterstax::engine::describe`), so an empty table
   recovers with the same schema as a populated one; a missing backing table is
   skipped, a VIEW under the source's name is refused.
 
@@ -139,7 +139,7 @@ modes. CASCADE drops `cascade_closure(x)`.
 
 ## Routing (who calls this)
 
-The `Worker` (`scheduler/worker.cpp`) detects Kafka work after parsing:
+The query session (`session/query_session.cpp`) detects Kafka work after parsing:
 a `kafka_node_t` plan root → `KafkaManager::execute`; else `kafka_write_target(node)`
 (an `INSERT INTO kafka.<obj>`) splits on `source_is_select` — a `VALUES` write
 (`node_raw_data` source) → `KafkaManager::produce` (one-shot), a `SELECT` source →
@@ -186,8 +186,7 @@ a `kafka_node_t` plan root → `KafkaManager::execute`; else `kafka_write_target
     caller's resource.
   - **What it rests on.** The guarantee depends on that ordering inside the engine; a
     continuation that writes to the plan after the reply, or a plan cache, would break
-    it silently. `OtterbrixDataManager::get_schema` and `describe_collection` rely on
-    the same protocol.
+    it silently. The relation probe of `otterstax::engine::describe` relies on the same protocol.
   - **Otterbrix rc-3.** The resolve metadata moves off the resolve nodes into
     `execution_plan_t::catalog_resolves`, and view expansion moves to
     `components::planner::expand_view_body`. `otterbrix/operators/schema_probe.hpp`

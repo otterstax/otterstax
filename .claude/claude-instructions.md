@@ -7,13 +7,23 @@ This is a **federated SQL query engine** that exposes multiple frontend protocol
 - **MariaDB/MySQL pools**: Remote database connectors for federated queries
 - **Actor-based concurrency**: Using `actor-zeta` for message-passing between components
 
-### Core Components (Component Manager Pattern)
+### Core Components (process modules)
 
-The system uses `ComponentManager` (`component_manager/`) as the central orchestrator spawning actor-based supervisors:
-- `CatalogManager`: Manages database/table schemas from registered connections
-- `Scheduler`: Routes queries to Otterbrix (local) or SQL connectors (remote)
-- `OtterbrixManager`: Wraps Otterbrix database operations
-- `SqlConnectionManager`: Delegates queries to MySQL connection pool
+`main.cpp` owns every part directly, builds them in order and destroys them in reverse:
+`runtime_t` (memory + thread pools) → `remote_backends_t` (connector managers, the
+MySQL / PostgreSQL / ClickHouse integration backends, startup discovery, the federation
+registry) → `engine_t` (the embedded Otterbrix engine, opened with the federation's
+hooks) → the S3 / file / Kafka actors (then `backends::register_s3_aliases` /
+`publish_federation_metadata`) → `session_factory_t` (its destructor drains the
+sessions and stops their pool) → the four servers (each stops in its destructor).
+- `catalog::` (`catalog/`): pure building blocks — remote tables are rows of the engine
+  database `federation`, resolved by the federation's `need` / `decide` hooks
+  (`otterbrix/federation/`)
+- `query_session_t`: one actor per client connection; parses, classifies and runs every
+  statement on the connection's own engine session (local or federated remote)
+- `otterstax::engine::*` (`otterbrix/operators/engine_requests.hpp`): free functions sent
+  straight to the engine dispatcher — there is no engine wrapper actor
+- `MySQLManager` / `PostgressManager` / `ClickhouseManager`: delegate queries to the connector pools
 - `ConnectorManager`: Manages async MySQL connections via Boost.MySQL
 
 **Critical Pattern**: All components communicate via `actor_zeta::send(address, &Actor::method, args...)` using `actor_zeta::address_t` handles and C++20 coroutines (`co_await`, `co_return`). Sessions are tracked by `session_hash_t` IDs.
@@ -22,18 +32,19 @@ The system uses `ComponentManager` (`component_manager/`) as the central orchest
 
 ### Session-Based Query Execution Flow
 1. Frontend receives query → generates unique `session_hash_t`
-2. Frontend calls `Scheduler::execute` (and friends), which returns
+2. Frontend sends `query_session_t::execute` (and friends) to its connection's session, which returns
    `actor_zeta::unique_future<core::result_wrapper_t<session_payload>>`
-3. Scheduler routes by session hash → a `Worker` parses SQL and determines if the
-   query is Otterbrix-local or federated remote
-4. For federated: dispatches to `SqlConnectionManager` → `ConnectorManager` → MySQL
+3. The session parses SQL and runs it on the engine (remote DDL and four-part DML
+   go to the backend directly)
+4. The engine resolves a remote table through the federation and reads / writes it
+   through the integration backend (`federation::backend_t`: `MySQLManager` → `ConnectorManager` → MySQL)
 5. Results translated through `otterbrix/translators/` (backend results → `data_chunk_t`)
 6. The connection awaits the future through
    `frontend/common/asio_future_bridge.hpp` — polled on the per-connection asio
    executor, no blocking get and no condition variable
 
 **Session Management**: the payload type is `session_payload` in
-`scheduler/session_data.hpp`, carried by value through the typed future.
+`session/session_payload.hpp`, carried by value through the typed future.
 
 ### Federated Query Pattern (Critical!)
 Queries use **connection aliases** as database names:
@@ -50,7 +61,7 @@ JOIN impressions.db2.schema.impressions ON campaigns.id = impressions.id
 ### Parser and Query Generation
 - `otterbrix/parser/parser.hpp`: Wraps Otterbrix SQL parser as `IParser` interface
 - `otterbrix/query_generation/sql_query_generator.cpp`: Generates SQL for remote databases from parsed logical plans
-- **External nodes**: Query plans mark nodes requiring remote execution (see `OtterbrixStatement::external_nodes`)
+- **Pushdown**: the federation's optimizer rule (`otterbrix/federation/rules/pushdown.hpp`) turns a query block over one remote table into one statement in the backend's dialect
 
 ## Development Workflows
 
@@ -122,8 +133,8 @@ chmod +x ./docker-run-tests.sh
 // Send message to actor (returns future for coroutine-based actors)
 auto [needs_sched, future] = actor_zeta::send(
     target_address,
-    &Scheduler::execute,  // Type-safe method pointer (no route enums)
-    session_id, shared_data, sql_query
+    &query_session_t::execute,  // Type-safe method pointer (no route enums)
+    statement_id, sql_query
 );
 auto result = co_await std::move(future);
 ```
@@ -134,15 +145,16 @@ auto result = co_await std::move(future);
 - Actors use `actor_mixin<T>` base class with inline message processing
 
 ### Namespace Organization
-- `mysqlc::` - MySQL connector/catalog management
+- `mysql::` / `pg::` / `ch::` - the connectors and their `ConnectorManager`s
 - `mysql_front::` - MySQL protocol frontend implementation
-- `config::` - single config.yaml reader (server settings + connections; startup connection registration)
-- `db_conn::` - Database integration actors (Otterbrix/SQL managers)
+- `config::` - single config.yaml reader (server settings + connections)
+- `db::` - integration backends (`MySQLManager`, `PostgressManager`, `ClickhouseManager`) and the `S3Manager` actor
+- `otterstax::federation` / `otterstax::catalog` / `otterstax::backends` - federation provider, catalog building blocks, process modules
 
 ### Thread Safety Notes
-- `ConnectorManager::addConnection` is the only write to a connector registry and runs on the startup thread before any query reaches the integration actor that drives the manager; there is no remove path
-- `Scheduler` uses `std::mutex data_map_mtx_` for session map access
-- Boost.MySQL connections run on `thread_pool_manager` io_context
+- `ConnectorManager::addConnection` / `removeConnection` are the only writes to a connector registry and run on the startup thread (`remote_backends_t::open`) before any query reaches the integration backend that drives the manager
+- Statements of one connection run one at a time on its `query_session_t` (the mailbox is the queue)
+- Each connector manager owns a `thread_pool_manager` io_context, sized by `service.runtime.connector_io`
 
 ## Common Tasks
 
@@ -153,9 +165,9 @@ auto result = co_await std::move(future);
 4. Callers use `actor_zeta::send(address, &Actor::method, args...)`
 
 ### Adding External Database Support
-1. Implement `IConnector` interface (see `connectors/mysql/mysql_connector.hpp`)
+1. Implement `IConnector` interface (see `connectors/mysql/connector.hpp`)
 2. Add factory function to `ConnectorManager` constructor
-3. Update `CatalogManager` schema discovery for new DB type
+3. Add an integration backend answering `discover` and implementing `federation::backend_t`, opened by `remote_backends_t::open`
 4. Add translator in `otterbrix/translators/input/` for result conversion
 
 ### Debugging Actor Messages
@@ -166,10 +178,10 @@ auto result = co_await std::move(future);
 ## Dependencies & Constraints
 
 ### Critical External Dependencies
-- **Otterbrix 1.0.0b2-rc-2**: Custom Conan remote at `https://conan.otterbrix.com`, pinned by recipe revision in `conanfile.py`
-- **Arrow 24.0.0** with FlightSQL support (must set `with_flight_sql=True`)
+- **Otterbrix 1.0.0b2-embedding.46fba865**: a local Conan package pinned by recipe revision in `conanfile.py` (see the root `CLAUDE.md`, Critical Dependency Versions)
+- **Arrow 24.0.0** (S3, parquet, csv, json; Flight SQL is served in-house, no Arrow Flight dependency)
 - **Boost 1.88.0**: Required for C++20 coroutines in MySQL connector
-- **actor-zeta 1.2.0**: Custom actor framework with C++20 coroutines (not Akka/CAF)
+- **actor-zeta 2.0.0**: Custom actor framework with C++20 coroutines (not Akka/CAF)
 - **Catch2 3.15.1**: v3 API (`catch2/catch_all.hpp`, `find_package(Catch2 3)`)
 
 ### Port Assignments (Hardcoded)
@@ -179,14 +191,13 @@ auto result = co_await std::move(future);
 - 3101-3103: MariaDB test instances
 
 ### Known Limitations (from TODOs)
-- No connection pool timeout handling (see `connectors/mysql/mysql_connector.hpp:115`)
-- Single query per connection limitation: one `boost::mysql::any_connection` per alias, no serialization of overlapping statements (`connectors/mysql/connector.hpp`)
+- A statement waits up to 60 s for a free pooled connection of its alias (`connectors/common/connection_pool.hpp`); `pool_size` per alias in `config.yaml`
 - Array types only support single dimension (`otterbrix/query_generation/sql_query_generator.cpp:70`)
 
 ## Anti-Patterns to Avoid
 
-1. **Don't** call `actor_zeta::spawn` outside `ComponentManager` - breaks lifecycle management
+1. **Don't** call `actor_zeta::spawn` outside the owner of the actor (`remote_backends_t`, `main.cpp` / the test stack for the S3 / file / Kafka actors, `session_factory_t`) - breaks lifecycle management
 2. **Don't** use `std::make_unique` for actors - use `actor_zeta::spawn` with pmr deleter
 3. **Don't** block on actor send() - actors communicate via coroutines and futures
-4. **Don't** access session maps without mutex locks in `Scheduler`
+4. **Don't** destroy a `query_session_t` directly - drop its `session_ptr` (close protocol, `session/CLAUDE.md`)
 5. **Don't** assume connection aliases are database names - they're logical identifiers for remote connections

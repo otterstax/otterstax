@@ -55,15 +55,15 @@ Two overloads exist; both are benchmarked:
 
 The vector overload is the one called by the MySQL and PostgreSQL wire-protocol frontend writers; the struct overload is used by the FlightSQL path.
 
-#### `ChunkBatchReader::ReadNext` — full `data_chunk_t` → Arrow `RecordBatch`
+#### Flight SQL data path — `data_chunk_t` → Arrow `RecordBatch` → IPC payload
 
 | Benchmark | Rows |
 |-----------|------|
-| `BM_chunk_to_arrow_full_100` | 100 |
-| `BM_chunk_to_arrow_full_1k` | 1 000 |
-| `BM_chunk_to_arrow_full_10k` | 10 000 |
+| `BM_flight_wire_full_100` | 100 |
+| `BM_flight_wire_full_1k` | 1 000 |
+| `BM_flight_wire_full_10k` | 10 000 |
 
-This is the hot path for every query result delivered over the FlightSQL frontend. The schema is pre-built outside the loop; `ch_to_chunk` runs inside the loop because `data_chunk_t` is not copyable (move-only). **The reported time therefore includes both `ch_to_chunk` and the Arrow builder pass.** Use `BM_ch_to_chunk_*` to isolate the former.
+This is the hot path for every query result delivered over the Flight SQL frontend: `chunk_to_record_batch`, then `arrow::ipc::GetRecordBatchPayload` (what `rpc/flight_server.cpp` frames into a DoGet message). The schema is pre-built outside the loop; `ch_to_chunk` runs inside the loop because `data_chunk_t` is not copyable (move-only). **The reported time therefore includes `ch_to_chunk`, the Arrow builder pass and the IPC serialization.** Use `BM_ch_to_chunk_*` to isolate the first.
 
 #### MySQL column-type mapping — no separate benchmark
 
@@ -113,7 +113,7 @@ Input benchmarks use the **buffer** overloads so only the parse + `data_chunk_t`
 
 ### `bench_parser.cpp`
 
-SQL parsing and subquery extraction.
+SQL parsing.
 
 #### `GreenplumParser::parse()` — full parse + logical-plan construction
 
@@ -128,74 +128,23 @@ Each benchmark reuses one `GreenplumParser` instance across iterations (the pars
 | `BM_parse_complex_select` | Aggregation, single backend | `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT` |
 | `BM_parse_three_backend_join` | 3-backend JOIN (MySQL × PG × CH) | `INNER JOIN × 2`, `WHERE`, `LIMIT` |
 
-#### `otterstax::parser::prepare_sql()` — subquery extraction + qualifier promotion
-
-`prepare_sql` only produces stubs for SQL that contains subqueries wrapped in parentheses. Flat JOINs with 4-part table names go through a different scheduler path and produce 0 stubs.
-
-| Benchmark | SQL | Stubs produced |
-|-----------|-----|----------------|
-| `BM_prepare_sql_simple` | Simple SELECT, no 4-part names | 0 (no-op rewrite) |
-| `BM_prepare_sql_cross_backend` | MySQL × PG flat JOIN | 0 (flat JOIN, no stubs) |
-| `BM_prepare_sql_subquery` | Single-backend subquery in FROM | 1 |
-| `BM_prepare_sql_complex_select` | Aggregation, single-backend | 0 |
-| `BM_prepare_sql_three_backend` | MySQL × PG × CH flat JOIN | 0 (flat JOIN, no stubs) |
-
-The `cross_backend` and `three_backend` prepare_sql benchmarks measure the parsing + promote pass on realistic multi-backend SQL even though those queries happen to produce 0 stubs (the stub path fires only when subqueries are present in the SQL).
-
 ---
 
 ### `bench_query_gen.cpp`
 
-SQL qualifier rewriting and table reference formatting, exercised via `sql_gen::replace_qualifiers` and `sql_gen::table_reference`.
+SQL generation for the backends, exercised via `sql_gen::generate_query`.
 
-#### SQL fixture design — subquery requirement
+#### `generate_query` — one query block per dialect
 
-**All SQL fixtures that feed `replace_qualifiers` must use the subquery form:**
+The query block (the aggregate that reads the remote table, with its clauses) is parsed once by
+`GreenplumParser` before the timing loop — the shape the federation's pushdown rule hands the
+generator (`otterbrix/federation/rules/pushdown.hpp`); only `generate_query` is timed.
 
-```sql
--- correct: subquery in parentheses → produces a stub
-SELECT * FROM (SELECT id FROM mysql.bill.schema.orders WHERE ...) o
-
--- wrong: flat table reference → produces 0 stubs
-SELECT id FROM mysql.bill.schema.orders WHERE ...
-```
-
-`prepare_sql` produces `subquery_stub_t` objects only for SQL-level subqueries (`T_RangeSubselect` AST nodes). Flat JOINs with 4-part names never generate stubs and must not be used in `replace_qualifiers` benchmarks.
-
-Stub ordering follows left-to-right position of the opening parenthesis in the SQL string.
-
-#### `replace_qualifiers` — per-backend qualifier rewriting (isolated)
-
-The stub is extracted once before the timing loop; only `replace_qualifiers` is timed.
-
-| Benchmark | Backend | SQL source | Stub index |
-|-----------|---------|------------|------------|
-| `BM_replace_qualifiers_mysql` | MySQL | `kMysqlOnlySql` | stubs[0] |
-| `BM_replace_qualifiers_pg` | PostgreSQL | `kCrossBackendSql` | stubs[1] (last) |
-| `BM_replace_qualifiers_ch` | ClickHouse | `kChSql` | stubs[0] |
-| `BM_replace_qualifiers_empty` | MySQL | local SQL (no qualifiers) | — |
-
-`BM_replace_qualifiers_empty` is the no-op baseline: zero qualifier rewrites, just the string copy.
-
-#### `pipeline` — `prepare_sql` + `replace_qualifiers` end-to-end
-
-Mirrors the exact runtime sequence: one `prepare_sql` call followed by one `replace_qualifiers` per backend stub. Both steps are inside the timing loop.
-
-| Benchmark | Backends | Stubs | SQL |
-|-----------|----------|-------|-----|
-| `BM_pipeline_mysql_single_source` | MySQL | 1 | `kMysqlOnlySql` |
-| `BM_pipeline_cross_backend` | MySQL + PG | 2 | `kCrossBackendSql` |
-| `BM_pipeline_three_backend` | MySQL + PG + CH | 3 | `kThreeBackendSql` |
-
-#### `table_reference` — backend-specific table name formatting
-
-Measures `sql_gen::table_reference(qualified_name_t, backend_type_t, memory_resource*)` in isolation. Called once per table per query to produce `db.table` (MySQL/CH) or `schema.table` (PG) references.
-
-| Benchmark | Backend |
-|-----------|---------|
-| `BM_table_reference_mysql` | MySQL |
-| `BM_table_reference_pg` | PostgreSQL |
-| `BM_table_reference_ch` | ClickHouse |
+| Benchmark | Backend | Block |
+|-----------|---------|-------|
+| `BM_generate_query_mysql_filter` | MySQL | projection, `WHERE`, `ORDER BY`, `LIMIT` |
+| `BM_generate_query_pg_aggregate` | PostgreSQL | `count` / `sum`, `WHERE`, `GROUP BY`, `HAVING` |
+| `BM_generate_query_ch_filter` | ClickHouse | projection, `WHERE` with `AND` |
 
 ---
 
@@ -261,8 +210,7 @@ by const ref). Links `kafka_runtime` (a separate `target_link_libraries` call in
 |----------|--------|------------|
 | `tsl::mysql_to_chunk` | `boost::mysql::results` requires live wire data | System tests |
 | `tsl::pg_to_chunk` (with rows) | not benchmarked; rows are manufactured only in the unit tests (`pg_result_fixture.cpp`) | Unit + system tests |
-| `sql_gen::generate_query` | Requires Otterbrix logical-plan `node_ptr`, not exposed at unit level | System tests |
-| `ChunkBatchReader::ReadNext` in isolation | `data_chunk_t` is non-copyable; `ch_to_chunk` is bundled in the loop | `BM_ch_to_chunk_*` for input, `BM_chunk_to_arrow_full_*` for combined |
+| `chunk_to_record_batch` in isolation | `data_chunk_t` is non-copyable; `ch_to_chunk` is bundled in the loop | `BM_ch_to_chunk_*` for input, `BM_flight_wire_full_*` for combined |
 
 ---
 
@@ -270,7 +218,7 @@ by const ref). Links `kafka_runtime` (a separate `target_link_libraries` call in
 
 ### Translator benchmark (`bench_translators.cpp`)
 
-1. Use `make_ch_block(N)` + `tsl::ch_to_chunk(res, block)` to get a synthetic `data_chunk_t`. It answers `core::result_wrapper_t<data_chunk_t>` (`conversion_failure` for a value with no reading as its column's type): check `has_error()` and end the run with `state.SkipWithError(result.error().what.c_str())` before taking `value()`, as the `BM_ch_to_chunk_*` benchmarks do. The overload with named-type overrides applies an override only to a wire column that represents its type (see `otterbrix/CLAUDE.md`).
+1. Use `make_ch_block(N)` + `tsl::ch_to_chunk(res, blocks, {})` (the block in a vector, no declared types) to get a synthetic `data_chunk_t`. It answers `core::result_wrapper_t<data_chunk_t>` (`conversion_failure` for a value with no reading as its column's type): check `has_error()` and end the run with `state.SkipWithError(result.error().what.c_str())` before taking `value()`, as the `BM_ch_to_chunk_*` benchmarks do. A declared type (by result position) applies only to a wire column that represents it (see `otterbrix/CLAUDE.md`).
 2. `data_chunk_t` is **non-copyable**. If you need N iterations over the same data, either hold a `clickhouse::Block` outside the loop and call `ch_to_chunk` inside, or redesign to avoid copies.
 3. If the benchmark needs `GreenplumParser` (e.g., testing a path that touches the parser), include `utility/logger.hpp` and add a `LoggerInit` guard as in `bench_parser.cpp` — the parser requires named spdlog loggers to be registered.
 
@@ -278,15 +226,17 @@ by const ref). Links `kafka_runtime` (a separate `target_link_libraries` call in
 
 1. Add a new `const char* kMySQL = "..."` fixture in the anonymous namespace.
 2. For `GreenplumParser::parse()` benchmarks: construct one `GreenplumParser` outside the loop (it is stateless and safe to reuse).
-3. For `prepare_sql` benchmarks: use `std::pmr::unsynchronized_pool_resource pool` outside the loop; allocations accumulate across iterations without being freed mid-loop (intentional — mirrors production behaviour).
-4. If the benchmark is about `prepare_sql` stub behaviour, verify the stub count first using the unit tests in `tests/unit/parser/test_subquery_extractor.cpp`.
+3. Use `std::pmr::unsynchronized_pool_resource pool` outside the loop for the parser's resource; allocations accumulate across iterations without being freed mid-loop (intentional — mirrors production behaviour).
 
 ### Query-generation benchmark (`bench_query_gen.cpp`)
 
-1. SQL that feeds `replace_qualifiers` must contain **SQL-level subqueries** (i.e., `(SELECT ... FROM alias.db.schema.table ...)` wrapped in parentheses). Flat JOINs produce 0 stubs and must not be used.
-2. Stub ordering is left-to-right by paren position — the first `(` in the SQL string produces `stubs[0]`.
-3. To verify stub count and ordering for new SQL, run the matching unit test pattern in `tests/unit/parser/test_subquery_extractor.cpp`, or write a one-off Catch2 test.
-4. Pre-extract stubs outside the timing loop for isolated `replace_qualifiers` benchmarks; include `prepare_sql` inside the loop only for pipeline benchmarks.
+1. Add the SQL as a `const char*` fixture: one query block over ONE remote table written with its
+   alias (`alias.db.schema.table`), the shape the federation's pushdown rule hands the generator.
+2. `parse_block(parser, sql, uid)` parses it once outside the timing loop and finds the aggregate
+   that reads the uid's table (`block_of`); `bench_block` times `sql_gen::generate_query` over it
+   with the block's own target (`statement_target_t{block.node->target()}`) and parameters.
+3. A JOIN or a statement over two servers is not one query block: the pushdown rule never sends it
+   whole, so it is not a generator benchmark.
 
 ---
 
@@ -294,6 +244,6 @@ by const ref). Links `kafka_runtime` (a separate `target_link_libraries` call in
 
 **Exit 139 (SIGSEGV at process exit):** The Greenplum SQL parser (`raw_parser()`) has global state that races with spdlog's file-sink destructor on process exit. All benchmarks complete before the crash fires. `run-bench.sh` tolerates exit 139 and repairs truncated JSON automatically. See `benchmark/CLAUDE.md` for details.
 
-**`assert` is compiled away in Release (`-DNDEBUG`).** The `assert(!r.stubs.empty())` guards in `bench_query_gen.cpp` do nothing in the production build. If you add a new benchmark that accesses `r.stubs[N]`, verify the stub count with the unit tests first — an out-of-bounds access in Release silently produces UB or a crash.
+**`assert` is compiled away in Release (`-DNDEBUG`).** The `assert(!parsed.has_error())` / `assert(block.node)` guards in `bench_query_gen.cpp`'s `parse_block` do nothing in the production build. Check a new fixture in a Debug build (or a one-off Catch2 test) first: a statement that does not parse, or whose block names another uid, dereferences null in Release.
 
 **`std::pmr::unsynchronized_pool_resource` accumulates allocations** across benchmark iterations (it only frees on destruction). This is intentional: it matches the production allocation pattern where the pool lives for the lifetime of one query. The pool object must be declared outside the state loop.

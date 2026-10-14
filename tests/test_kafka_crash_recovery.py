@@ -70,7 +70,7 @@ FANIN_BATCH = 1500                  # §5.3 fan-in: rows per source per batch (e
 PG_WAIT_S = 25
 DOCKER_PG_WAIT_S = 90   # docker start + WAL recover has more headroom than the native binary
 WAIT_S = 60
-# Hardcoded in main.cpp: ComponentManager(make_create_config("/tmp/test_collection_sql/base")).
+# The engine's default data_dir (config::DEFAULT_ENGINE_DATA_DIR, service.engine.data_dir unset): /tmp/test_collection_sql/base.
 DATA_DIR = "/tmp/test_collection_sql"
 
 

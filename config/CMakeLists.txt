@@ -25,11 +25,9 @@ target_include_directories(config
 target_link_libraries(config
     PUBLIC
     yaml-cpp::yaml-cpp
-    PRIVATE
-    spdlog::spdlog
 )
 
-# Ensure otterbrix logging headers (components/log) are available to config
+# The engine's core headers (core/result_wrapper.hpp, the error_t every reader answers)
 target_link_libraries(config
     PUBLIC
     otterbrix::otterbrix

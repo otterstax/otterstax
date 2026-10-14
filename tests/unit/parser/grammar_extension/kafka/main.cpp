@@ -8,7 +8,7 @@
 #include <filesystem>
 
 // The kafka transform reuses otterbrix's transformer, which logs through the
-// named loggers; initialize them before the first parse (ComponentManager does
+// named loggers; initialize them before the first parse (main.cpp does
 // this in production before any actor is spawned).
 int main(int argc, char* argv[]) {
     initialize_all_loggers((std::filesystem::temp_directory_path() / "otterstax-test-logs").string());

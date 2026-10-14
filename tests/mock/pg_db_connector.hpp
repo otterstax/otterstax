@@ -66,6 +66,14 @@ namespace pg {
             fields.emplace_back(types::logical_type::STRING_LITERAL, "name");
             components::vector::data_chunk_t result(config_.resource, fields);
             result.set_cardinality(2);
+            // Defined values: the slice reaches a real engine, which copies and
+            // reads every cell.
+            for (uint64_t row = 0; row < 2; ++row) {
+                result.set_value(0, row, types::logical_value_t(config_.resource, static_cast<int32_t>(row + 1)));
+                result.set_value(1,
+                                 row,
+                                 types::logical_value_t(config_.resource, std::string{"name_" + std::to_string(row)}));
+            }
             return result;
         }
 
@@ -101,15 +109,29 @@ namespace pg {
         }
 
         // Schema-discovery overload (PostgressManager::discover: the pg_enum
-        // metadata query and the schema probes). Always succeeds with an empty
-        // TUPLES_OK result so registration works regardless of the data-path
-        // throw configuration.
+        // metadata query, the table listing and the schema probes) and DDL.
+        // Always succeeds so startup opens the connection regardless of the
+        // data-path throw configuration: pg_enum answers no labels, the
+        // information_schema listing one table `table`, and a probe (or DDL)
+        // the header of the columns the data path answers (id int4, name
+        // varchar).
         asio::awaitable<core::error_t>
         runQuery(std::string_view query,
                  otterstax::function_ref_t<otterstax::asio_error_t(PGresult*)> handler) override {
-            std::cout << "PG MockConnector running schema query: " << query << std::endl;
             std::unique_ptr<PGresult, decltype(&PQclear)> result(PQmakeEmptyPGresult(nullptr, PGRES_TUPLES_OK),
                                                                  &PQclear);
+            if (query.find("pg_enum") != std::string_view::npos) {
+                co_return otterstax::as_query_result<otterstax::asio_error_t>(handler(result.get()));
+            }
+            if (query.find("information_schema") != std::string_view::npos) {
+                PGresAttDesc name{const_cast<char*>("table_name"), 0, 0, 0, 1043, -1, -1};
+                PQsetResultAttrs(result.get(), 1, &name);
+                PQsetvalue(result.get(), 0, 0, const_cast<char*>("table"), 5);
+                co_return otterstax::as_query_result<otterstax::asio_error_t>(handler(result.get()));
+            }
+            PGresAttDesc columns[2] = {{const_cast<char*>("id"), 0, 0, 0, 23, -1, -1},
+                                       {const_cast<char*>("name"), 0, 0, 0, 1043, -1, -1}};
+            PQsetResultAttrs(result.get(), 2, columns);
             co_return otterstax::as_query_result<otterstax::asio_error_t>(handler(result.get()));
         }
 

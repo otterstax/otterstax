@@ -78,6 +78,11 @@ class ExternalTableTester:
             "port": config.MYSQL_PORT,
             "user": "testuser",
             "password": "testpass",
+            # Every statement is meant to commit on its own; the server answers
+            # SET autocommit without effect today (session/CLAUDE.md), and
+            # asking for autocommit keeps that right once it has a per-session
+            # setting.
+            "autocommit": True,
         }
         self._created = []  # (db, table) pairs to drop on cleanup
 

@@ -9,16 +9,14 @@
 
 namespace tsl {
 
-    // The engine's chunk contract: a data_chunk_t it is handed — the raw data substituted for a
-    // backend slice (node_raw_data), the rows of an insert — holds at most DEFAULT_VECTOR_CAPACITY
-    // rows; a wider result is a run of such chunks sharing one column shape. The input translators
-    // build a whole backend result set or file as ONE chunk, so it is cut into that run where it
-    // enters the engine.
+    // The engine's chunk contract: a data_chunk_t it is handed — the rows of an insert (the file /
+    // s3 load) — holds at most DEFAULT_VECTOR_CAPACITY rows; a wider result is a run of such chunks
+    // sharing one column shape. The input translators build a whole file as ONE chunk, so it is cut
+    // into that run where it enters the engine. (A remote table's rows are handed out in windows by
+    // the federation's operators instead, otterbrix/federation.)
     //
     // A chunk within the bound is moved in as the only element. So is a column-less chunk,
-    // whatever its cardinality: that is the DML affected-row carrier (make_affected_rows_carrier),
-    // which capture_remote_dml_count reads whole, and a zero-column window is the engine
-    // pipeline's drain sentinel.
+    // whatever its cardinality: a zero-column window is the engine pipeline's drain sentinel.
     //
     // A wider chunk becomes consecutive windows of DEFAULT_VECTOR_CAPACITY rows, the last holding
     // the rest. Each window is data_chunk_t::partial_copy of its row range: it references the

@@ -3,7 +3,8 @@
 //
 // Unary RPC handler: AnalyzePlan.
 //
-// Dispatches the Schema variant through the Scheduler — prepare_schema for a SQL
+// Dispatches the Schema variant through the Spark session's query session —
+// prepare_schema for a SQL
 // command or a SQL relation without arguments, prepare_plan for a translated
 // DataFrame plan, both of which describe the statement without running it —
 // then closes the prepared statement (close_statement) and answers
@@ -18,13 +19,16 @@
 #include "await_future.hpp"
 #include "plan_translator/relation_to_plan.hpp"
 #include "plan_translator/type_converter.hpp"
-#include "scheduler/scheduler.hpp"
-#include "scheduler/session_data.hpp"
+#include "session/query_session.hpp"
+#include "session/session_payload.hpp"
 #include "utility/session.hpp"
 #include "utility/tracy_profiler.hpp"
 
 #include <grpcpp/support/status.h>
 
+#include <boost/scope/scope_exit.hpp>
+
+#include <optional>
 #include <string>
 #include <utility>
 
@@ -35,41 +39,47 @@ namespace frontend::spark {
         sc::AnalyzePlanRequest& request) {
         sc::AnalyzePlanResponse response;
 
-        // A Schema request prepares its statement under this session. The request
-        // is sent inside the handler's zone, which closes before the first co_await;
-        // the prepare is awaited — or a request refused inside the zone answered —
-        // after it.
-        session_id id;
-        const session_hash_t hash = id.hash();
+        // A Schema request prepares its statement in the Spark session's query
+        // session, which each step reaches through the registry (spark_sessions_).
+        // The request is sent inside the handler's zone, which closes before the
+        // first co_await; the prepare is awaited — or a request refused inside
+        // the zone answered — after it.
+        const std::string& spark_session_id = request.session_id();
+        otterstax::session::statement_id_t hash{};
         grpc::Status refusal = grpc::Status::OK;
-        Scheduler::unique_future<Scheduler::session_result> prepare_fut;
+        query_session_t::unique_future<query_session_t::session_result> prepare_fut;
+        // The statement the Schema request describes, chosen below: its text,
+        // or the plan a DataFrame translates to.
+        std::optional<std::string> statement;
+        ParsedQueryDataPtr statement_plan;
         {
             OTX_ZONE_N("SparkConnectServiceImpl::handle_analyze_plan");
-            response.set_session_id(request.session_id());
+            response.set_session_id(spark_session_id);
+            const bool reached = spark_sessions_.open_or_use(
+                spark_session_id,
+                std::chrono::steady_clock::now(),
+                [&](query_session_t& session) { hash = session.next_statement(); },
+                [this] { return sessions_->open(); });
+            if (!reached) {
+                refusal = session_closed_status(spark_session_id);
+            }
 
-            switch (request.analyze_case()) {
+            // An expired session analyzes nothing: the refusal answers below.
+            switch (!reached ? sc::AnalyzePlanRequest::ANALYZE_NOT_SET : request.analyze_case()) {
                 case sc::AnalyzePlanRequest::kSchema: {
                     const auto& plan = request.schema().plan();
 
                     if (plan.has_command() && plan.command().has_sql_command()) {
                         // Spark Connect 4.0 carries the query in SqlCommand.input (a SQL
                         // relation); the flat SqlCommand.sql is deprecated / empty in 4.0.
-                        prepare_fut = std::move(actor_zeta::send(scheduler_address_,
-                                                                 &Scheduler::prepare_schema,
-                                                                 hash,
-                                                                 sql_command_text(plan.command().sql_command()))
-                                                    .second);
+                        statement = sql_command_text(plan.command().sql_command());
                     } else if (plan.has_root() && is_empty_local_relation(plan.root())) {
                         // What a SQL command that is not a query answered with: no columns.
                         response.mutable_schema()->mutable_schema()->mutable_struct_();
                     } else if (plan.has_root() && is_bare_sql(plan.root())) {
                         // The relation a spark.sql() query answered with, described as
                         // SQL text, the way ExecutePlan runs it.
-                        prepare_fut = std::move(actor_zeta::send(scheduler_address_,
-                                                                 &Scheduler::prepare_schema,
-                                                                 hash,
-                                                                 plan.root().sql().query())
-                                                    .second);
+                        statement = plan.root().sql().query();
                     } else if (plan.has_root()) {
                         auto plan_result = relation_to_plan(plan, resource_);
                         if (plan_result.has_error()) {
@@ -78,11 +88,7 @@ namespace frontend::spark {
                         } else {
                             // Described, never executed: prepare_plan resolves the plan's
                             // result schema the way prepare_schema does for SQL text.
-                            prepare_fut = std::move(actor_zeta::send(scheduler_address_,
-                                                                     &Scheduler::prepare_plan,
-                                                                     hash,
-                                                                     std::move(plan_result.value().parsed_data))
-                                                        .second);
+                            statement_plan = std::move(plan_result.value().parsed_data);
                         }
                     } else {
                         refusal = grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
@@ -114,7 +120,27 @@ namespace frontend::spark {
                     response.mutable_is_local()->set_is_local(false);
                     break;
             }
+            // The statement chosen above, queued on the session.
+            if ((statement || statement_plan) &&
+                !spark_sessions_.begin(spark_session_id, std::chrono::steady_clock::now(), [&](query_session_t& session) {
+                    prepare_fut = statement_plan ? std::move(actor_zeta::send(session.address(),
+                                                                              &query_session_t::prepare_plan,
+                                                                              hash,
+                                                                              std::move(statement_plan))
+                                                                 .second)
+                                                 : std::move(actor_zeta::send(session.address(),
+                                                                              &query_session_t::prepare_schema,
+                                                                              hash,
+                                                                              std::move(*statement))
+                                                                 .second);
+                })) {
+                refusal = session_closed_status(spark_session_id);
+            }
         }
+        // A queued prepare keeps the Spark session from expiring until the
+        // request ends (spark_sessions_.begin … finish).
+        boost::scope::scope_exit prepare_done(
+            [&] { spark_sessions_.finish(spark_session_id, std::chrono::steady_clock::now()); }, prepare_fut.valid());
 
         if (!refusal.ok()) {
             co_await rpc.finish_with_error(refusal);
@@ -124,20 +150,27 @@ namespace frontend::spark {
         if (prepare_fut.valid()) {
             auto prepare_result = co_await await_future<session_payload>(std::move(prepare_fut), resource_);
             if (prepare_result.has_error()) {
-                co_await rpc.finish_with_error(
-                    grpc::Status(grpc::StatusCode::INTERNAL, prepare_result.error().what.c_str()));
+                co_await rpc.finish_with_error(error_status(spark_session_id, prepare_result.error()));
                 co_return;
             }
 
-            // The prepare stored the statement on its Worker for an execute that
-            // never comes: close it before answering. A failed close is logged; the
-            // answer is still the schema.
-            auto close_fut = std::move(actor_zeta::send(scheduler_address_, &Scheduler::close_statement, hash).second);
-            auto closed = co_await await_future<session_payload>(std::move(close_fut), resource_);
-            if (closed.has_error()) {
-                warn(log_,
-                     "AnalyzePlan: close_statement after the schema prepare failed: {}",
-                     closed.error().what.c_str());
+            // The prepare stored the statement in the session for an execute that
+            // never comes: close it before answering (a session closed meanwhile
+            // took the statement with it). A failed close is logged; the answer
+            // is still the schema.
+            query_session_t::unique_future<query_session_t::session_result> close_fut;
+            if (spark_sessions_.begin(spark_session_id, std::chrono::steady_clock::now(), [&](query_session_t& session) {
+                    close_fut = std::move(
+                        actor_zeta::send(session.address(), &query_session_t::close_statement, hash).second);
+                })) {
+                boost::scope::scope_exit close_done(
+                    [&] { spark_sessions_.finish(spark_session_id, std::chrono::steady_clock::now()); });
+                auto closed = co_await await_future<session_payload>(std::move(close_fut), resource_);
+                if (closed.has_error()) {
+                    warn(log_,
+                         "AnalyzePlan: close_statement after the schema prepare failed: {}",
+                         closed.error().what.c_str());
+                }
             }
 
             // A row-producing statement is described by the STRUCT of its columns;

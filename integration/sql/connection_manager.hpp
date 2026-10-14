@@ -8,89 +8,81 @@
 
 #include "catalog/discovery.hpp"
 #include "connectors/mysql/manager.hpp"
-#include "otterbrix/parser/parser.hpp"
-#include "otterbrix/schema/schema_utils.hpp"
+#include "integration/statement_executor.hpp"
+#include "otterbrix/federation/provider.hpp"
 #include "utility/session.hpp"
-#include "utility/tracy_profiler.hpp"
 
 #include <core/result_wrapper.hpp>
 
+#include <cstdint>
+#include <memory>
 #include <memory_resource>
-#include <mutex>
+#include <optional>
 #include <string>
+#include <string_view>
 
 namespace db {
-    class MySQLManager final : public actor_zeta::actor::actor_mixin<MySQLManager> {
-    public:
-        using is_cooperative_actor_type = void; // Required by actor_zeta::send() concept
-        template<typename T>
-        using unique_future = actor_zeta::unique_future<T>;
 
-        MySQLManager(std::pmr::memory_resource* res, mysql::ConnectorManager* connector_manager);
+    // The rows an UPDATE matched, out of the info of its OK packet. MySQL's affected-row count of an
+    // UPDATE is the rows it CHANGED (Boost.MySQL never sets CLIENT_FOUND_ROWS), while the engine,
+    // PostgreSQL and the row-by-row sink count the rows the statement matched (an UPDATE that sets a
+    // value to itself still counts its row). The info is the server's ER_UPDATE_INFO message —
+    // "Rows matched: N  Changed: M  Warnings: W" on MySQL and MariaDB alike — in the session's
+    // lc_messages language, so it is read by its numbers, not its words: exactly three, the first
+    // being the rows matched. nullopt for any other text.
+    std::optional<std::uint64_t> mysql_update_rows_matched(std::string_view info);
+
+    // The MySQL backend: the sole driver of the mysql::ConnectorManager after startup, and the
+    // federation's backend_t (otterbrix/federation/provider.hpp) for every MySQL connection:
+    //
+    //  - `discover`, the schema discovery of a scope, called by the remote backends module at startup
+    //    and by a query session's rediscovery; `execute_ddl`, one remote DDL statement of a query
+    //    session (CREATE / DROP TABLE, CREATE / DROP INDEX on an alias). Both run on the calling
+    //    thread until the backend answered.
+    //  - `scan` and `write`, called by the engine's executors for the operators of a remote table.
+    //    Each starts its statement on the statements pool (statement_executor.hpp: the runtime's
+    //    backends pool) — the connection checkout and the wait for the answer happen there, never on
+    //    the executor — translates the rows with tsl::mysql_to_chunk on the connector's io thread and
+    //    fulfils the operator's future.
+    //
+    // Thread-safe: the state every member reads (the connector manager's registry) is read-only
+    // after startup, and each statement checks a connection of its own out of the uid's pool.
+    class MySQLManager final : public otterstax::federation::backend_t {
+    public:
+        // `statements` runs the federation's statements (checkout + wait); it must keep running until
+        // this object is destroyed (statement_executor.hpp).
+        MySQLManager(std::pmr::memory_resource* res,
+                     mysql::ConnectorManager* connector_manager,
+                     statement_executor_t::pool_t* statements);
+        // Makes the connector manager refuse new statements and abort the running ones
+        // (mysql::ConnectorManager::shutdown), then waits for the statements still queued.
+        ~MySQLManager() override;
 
         std::pmr::memory_resource* resource() const noexcept { return resource_; }
 
-        /// handler coroutine
-        actor_zeta::unique_future<core::result_wrapper_t<ParsedQueryDataPtr>> execute(session_hash_t id,
-                                                                                      ParsedQueryDataPtr data);
+        // Schema discovery: empty `scope.collection` → every base table of `scope.database`
+        // (information_schema listing, then one probe per table); non-empty → that single table.
+        // Each table's primary key comes with its probe (the column definitions' PRI_KEY_FLAG).
+        // A per-table probe failure fails the whole discovery, and so does a connection whose
+        // sql_mode has NO_BACKSLASH_ESCAPES (the generated literals escape a backslash).
+        core::result_wrapper_t<otterstax::federation::discovered_tables_t> discover(const qualified_name_t& scope) override;
 
-        // Schema discovery for the catalog: empty `scope.collection` → every
-        // base table of `scope.database` (information_schema listing, then one
-        // probe per table); non-empty → that single table. Every connector
-        // future is consumed here, on this actor, so the connector manager has
-        // one driver. A per-table probe failure fails the whole discovery.
-        actor_zeta::unique_future<core::result_wrapper_t<catalog_ext::discovered_tables_t>>
-        discover(qualified_name_t scope);
+        // One DDL statement on `uid`, already in MySQL's dialect; the connector's error, code kept.
+        core::error_t execute_ddl(const std::string& uid, const std::string& sql) override;
 
-        // The prepared schema of the statement's MySQL slots, answered by the
-        // backend. For every schema_node_t stub — the catalog's, made of an
-        // aggregate slot, and the parser's, carrying the raw text of a lifted-out
-        // sub-query — the statement execute would run for it is generated by the
-        // same call, wrapped as a LIMIT-0 probe (prepare_probe.hpp) and run:
-        // MySQL sends a SELECT's column definitions ahead of its rows, so the
-        // answer carries the result's columns and their wire types, and the
-        // connection reads them in metadata_mode::full. The answer goes through
-        // tsl::mysql_to_chunk — the function that types execute's rows, which is
-        // the one table tsl::mysql_to_struct answers discovery from — so the
-        // prepared column types are the executed chunk's by construction, and a
-        // column type the translator cannot represent is the same
-        // conversion_failure execute answers for it.
-        // A raw-SQL stub's schema is filled in place, so the text and qualifiers
-        // execute generates from survive. A parameterized statement cannot be
-        // described before Bind — the binder holds every parameter, literals
-        // included, until finalize, so no SQL exists to probe with — and is
-        // unimplemented_yet, never a plan-derived guess. A probe the backend
-        // refuses is the connector's error, code kept; an answer without column
-        // metadata is schema_error. Nothing is cached: every prepare asks the
-        // backend. Sent by the Worker after CatalogManager::get_catalog_schema
-        // classified the statement; a Mixed statement's non-MySQL slots are
-        // skipped by their node_backend_types entry, as in execute.
-        actor_zeta::unique_future<core::result_wrapper_t<ParsedQueryDataPtr>> describe(session_hash_t id,
-                                                                                       ParsedQueryDataPtr data);
-
-        using dispatch_traits =
-            actor_zeta::dispatch_traits<&MySQLManager::execute, &MySQLManager::discover, &MySQLManager::describe>;
-
-        actor_zeta::behavior_t behavior(actor_zeta::mailbox::message* msg);
-
-        std::pair<bool, actor_zeta::detail::enqueue_result> enqueue_impl(actor_zeta::mailbox::message_ptr msg);
+        actor_zeta::unique_future<core::error_t>
+        scan(std::pmr::memory_resource* resource,
+             otterstax::federation::scan_request_t request,
+             std::shared_ptr<otterstax::federation::scan_rows_t> rows) override;
+        actor_zeta::unique_future<otterstax::federation::write_result_t>
+        write(std::pmr::memory_resource* resource, otterstax::federation::write_request_t request) override;
 
     private:
         std::pmr::memory_resource* resource_;
-        // Non-owning: ComponentManager owns it and outlives this actor. This
-        // actor is its only driver after startup (execute and discover both run
-        // here, serialised by mutex_).
+        // Non-owning: the remote backends module owns it and outlives this object.
         mysql::ConnectorManager* connector_manager_;
         log_t log_;
-        OTX_LOCKABLE_N(std::mutex, mutex_, "MySQLManager::mutex");
-        actor_zeta::behavior_t current_behavior_;
-
-        // The statement one slot sends to MySQL — shared by execute (which runs
-        // it) and describe (which probes its header), so both see one text.
-        core::result_wrapper_t<std::string>
-        generate_slot_statement(const components::logical_plan::node_ptr& node,
-                                const otterstax::names::resolved_target_t& target,
-                                const std::pmr::vector<external_entry_t>& batch,
-                                const components::logical_plan::storage_parameters* parameters);
+        // Last: destroyed first, it waits for the statements still queued.
+        statement_executor_t statements_;
     };
 } // namespace db

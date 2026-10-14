@@ -189,16 +189,21 @@ namespace otterstax::kafka {
     } // namespace
 
     actor_zeta::unique_future<cursor::cursor_t_ptr> KafkaManager::ensure_sources_table_once() {
-        OTX_ZONE_N("KafkaManager::ensure_sources_table_once");
-        if (!sources_table_ensured_) {
-            auto c = co_await ensure_sources_table(); // IF NOT EXISTS: a restart finds it already there
-            if (!c || c->is_error()) {
-                co_return error_cursor(resource_,
-                                       c ? c->get_error().type : core::error_code_t::other_error,
-                                       "kafka: ensure kafka.__sources failed: " + cursor_error(c));
+        {
+            // The loop interleaves its coroutines on one thread: the zone closes
+            // before the first co_await (root CLAUDE.md, Tracy).
+            OTX_ZONE_N("KafkaManager::ensure_sources_table_once");
+            if (sources_table_ensured_) {
+                co_return cursor::make_cursor(resource_);
             }
-            sources_table_ensured_ = true;
         }
+        auto c = co_await ensure_sources_table(); // IF NOT EXISTS: a restart finds it already there
+        if (!c || c->is_error()) {
+            co_return error_cursor(resource_,
+                                   c ? c->get_error().type : core::error_code_t::other_error,
+                                   "kafka: ensure kafka.__sources failed: " + cursor_error(c));
+        }
+        sources_table_ensured_ = true;
         co_return cursor::make_cursor(resource_);
     }
 
@@ -366,8 +371,12 @@ namespace otterstax::kafka {
     }
 
     actor_zeta::unique_future<cursor::cursor_t_ptr> KafkaManager::execute(session_hash_t id, kafka_node_ptr node) {
-        OTX_ZONE_N("KafkaManager::execute");
-        log_->debug("execute id {}: kafka op {} name {}", id, static_cast<int32_t>(node->op()), node->name());
+        {
+            // The loop interleaves its coroutines on one thread: the zone closes
+            // before the first co_await (root CLAUDE.md, Tracy).
+            OTX_ZONE_N("KafkaManager::execute");
+            log_->debug("execute id {}: kafka op {} name {}", id, static_cast<int32_t>(node->op()), node->name());
+        }
         switch (node->op()) {
             case kafka_op::create_source:
                 co_return co_await handle_create_source(std::move(node));
@@ -382,16 +391,21 @@ namespace otterstax::kafka {
     }
 
     actor_zeta::unique_future<cursor::cursor_t_ptr> KafkaManager::handle_create_source(kafka_node_ptr node) {
-        OTX_ZONE_N("KafkaManager::handle_create_source");
-        // Every option is validated before the first side effect, so a rejected
-        // statement leaves no table, registry entry or metadata row behind
-        auto txn = parse_transactional(resource_, node->option("TRANSACTIONAL"));
-        if (txn.has_error()) {
-            co_return error_cursor(resource_,
-                                   core::error_code_t::invalid_parameter,
-                                   "kafka: source '" + node->name() + "' " + txn.error().what.c_str());
+        bool transactional = false; // TRANSACTIONAL=true -> exactly-once ingestion
+        {
+            // The loop interleaves its coroutines on one thread: the zone closes
+            // before the first co_await (root CLAUDE.md, Tracy).
+            OTX_ZONE_N("KafkaManager::handle_create_source");
+            // Every option is validated before the first side effect, so a rejected
+            // statement leaves no table, registry entry or metadata row behind
+            auto txn = parse_transactional(resource_, node->option("TRANSACTIONAL"));
+            if (txn.has_error()) {
+                co_return error_cursor(resource_,
+                                       core::error_code_t::invalid_parameter,
+                                       "kafka: source '" + node->name() + "' " + txn.error().what.c_str());
+            }
+            transactional = txn.value();
         }
-        const bool transactional = txn.value(); // TRANSACTIONAL=true -> exactly-once ingestion
 
         // A SOURCE is a user-visible materialized table: the poller ingests its topic
         // into it, and INSERT produces to the topic
@@ -451,40 +465,51 @@ namespace otterstax::kafka {
     }
 
     actor_zeta::unique_future<cursor::cursor_t_ptr> KafkaManager::handle_create_stream(kafka_node_ptr node) {
-        OTX_ZONE_N("KafkaManager::handle_create_stream");
-        // Options are validated before the object is registered or persisted
-        auto txn = parse_transactional(resource_, node->option("TRANSACTIONAL"));
-        if (txn.has_error()) {
-            co_return error_cursor(resource_,
-                                   core::error_code_t::invalid_parameter,
-                                   "kafka: stream '" + node->name() + "' " + txn.error().what.c_str());
-        }
+        // What the statement needs after its first co_await, copied out of the
+        // registry: another coroutine of this loop may change it meanwhile.
+        bool transactional = false;
+        std::string source;
+        std::vector<kafka_column_t> stream_columns;
+        {
+            // The loop interleaves its coroutines on one thread: the zone closes
+            // before the first co_await (root CLAUDE.md, Tracy).
+            OTX_ZONE_N("KafkaManager::handle_create_stream");
+            // Options are validated before the object is registered or persisted
+            auto txn = parse_transactional(resource_, node->option("TRANSACTIONAL"));
+            if (txn.has_error()) {
+                co_return error_cursor(resource_,
+                                       core::error_code_t::invalid_parameter,
+                                       "kafka: stream '" + node->name() + "' " + txn.error().what.c_str());
+            }
+            transactional = txn.value();
 
-        // STREAM is a continuous query (no user table); its schema is the SELECT's
-        // output columns. Any parse/schema failure becomes a DDL error
-        auto invalid = [&](const std::string& why) {
-            return error_cursor(resource_,
-                                core::error_code_t::invalid_parameter,
-                                "kafka: stream SELECT invalid: " + why);
-        };
-        auto plan = kafka_parse_plan(resource_, node->as_select());
-        if (plan.has_error()) {
-            co_return invalid(plan.error().what.c_str());
-        }
-        const auto* agg =
-            plan.value().sub_queries.empty() ? nullptr : kafka_find_aggregate(plan.value().sub_queries.back());
-        if (!agg) {
-            co_return invalid("SELECT has no aggregate/source table");
-        }
-        const auto src_it = registry_.find(agg->target().collection.t);
-        if (src_it == registry_.end()) {
-            co_return invalid("unknown source '" + agg->target().collection.t + "'");
-        }
-        auto stream_columns =
-            stream_output_schema(resource_, *agg, plan.value().parameters.get(), src_it->second.columns);
-        if (const auto unnamed = unnamed_column(stream_columns)) {
-            co_return invalid("output column " + std::to_string(*unnamed + 1) +
-                              " has no name; alias it so the produced JSON can be keyed");
+            // STREAM is a continuous query (no user table); its schema is the SELECT's
+            // output columns. Any parse/schema failure becomes a DDL error
+            auto invalid = [&](const std::string& why) {
+                return error_cursor(resource_,
+                                    core::error_code_t::invalid_parameter,
+                                    "kafka: stream SELECT invalid: " + why);
+            };
+            auto plan = kafka_parse_plan(resource_, node->as_select());
+            if (plan.has_error()) {
+                co_return invalid(plan.error().what.c_str());
+            }
+            const auto* agg =
+                plan.value().sub_queries.empty() ? nullptr : kafka_find_aggregate(plan.value().sub_queries.back());
+            if (!agg) {
+                co_return invalid("SELECT has no aggregate/source table");
+            }
+            source = agg->target().collection.t;
+            const auto src_it = registry_.find(source);
+            if (src_it == registry_.end()) {
+                co_return invalid("unknown source '" + source + "'");
+            }
+            stream_columns =
+                stream_output_schema(resource_, *agg, plan.value().parameters.get(), src_it->second.columns);
+            if (const auto unnamed = unnamed_column(stream_columns)) {
+                co_return invalid("output column " + std::to_string(*unnamed + 1) +
+                                  " has no name; alias it so the produced JSON can be keyed");
+            }
         }
 
         // Persist so a restart relaunches it (source re-derived from as_select); a
@@ -498,7 +523,7 @@ namespace otterstax::kafka {
                                                   node->option("BOOTSTRAP_SERVERS").value_or(""),
                                                   node->option("GROUP_ID").value_or("otterstax_stream_" + node->name()),
                                                   node->option("OFFSET_RESET").value_or("earliest"),
-                                                  txn.value(),
+                                                  transactional,
                                                   node->as_select());
             !p || p->is_error()) {
             co_return error_cursor(resource_,
@@ -507,11 +532,8 @@ namespace otterstax::kafka {
                                        "' failed: " + cursor_error(p));
         }
 
-        registry_[node->name()] = kafka_object_t{node->op(),
-                                                 stream_columns,
-                                                 node->options(),
-                                                 node->as_select(),
-                                                 agg->target().collection.t};
+        registry_[node->name()] =
+            kafka_object_t{node->op(), stream_columns, node->options(), node->as_select(), source};
         log_->info("kafka: registered stream '{}' ({} output columns)", node->name(), stream_columns.size());
         launch_stream(node->name());
         co_return cursor::make_cursor(resource_);

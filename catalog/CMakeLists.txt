@@ -1,13 +1,17 @@
 set(CATALOG_HEADERS
-    catalog_manager.hpp
     discovery.hpp
-    schema_store.hpp
+    introspection.hpp
+    ownership.hpp
+    remote_metadata.hpp
+    remote_rediscovery.hpp
 )
 
 set(CATALOG_SOURCES
-    catalog_manager.cpp
     discovery.cpp
-    schema_store.cpp
+    introspection.cpp
+    ownership.cpp
+    remote_metadata.cpp
+    remote_rediscovery.cpp
 )
 
 add_library(catalog
@@ -16,6 +20,8 @@ add_library(catalog
 )
 
 target_link_libraries(catalog PUBLIC
+    otterstax_federation
+    otterbrix_local
     Boost::boost
     otterbrix::otterbrix
     actor-zeta::actor-zeta

@@ -13,6 +13,7 @@
 #include <memory_resource>
 #include <string>
 #include <string_view>
+#include <utility>
 
 namespace {
 
@@ -39,18 +40,16 @@ core::error_t parse_error(const YAML::Node& node) {
     return parsed.error();
 }
 
-// ConfigReader::load on a file that must be accepted; the whole ServiceConfig.
+// load_config on a file that must be accepted; the whole ServiceConfig.
 config::ServiceConfig load_ok(const std::string& path) {
-    config::ConfigReader reader{resource()};
-    auto loaded = reader.load(path);
+    auto loaded = config::load_config(resource(), path);
     REQUIRE_FALSE(loaded.has_error());
     return std::move(loaded.value());
 }
 
-// ConfigReader::load on a file that must be rejected; the error it produced.
+// load_config on a file that must be rejected; the error it produced.
 core::error_t load_error(const std::string& path) {
-    config::ConfigReader reader{resource()};
-    auto loaded = reader.load(path);
+    auto loaded = config::load_config(resource(), path);
     REQUIRE(loaded.has_error());
     return loaded.error();
 }
@@ -60,7 +59,7 @@ bool mentions(const core::error_t& error, std::string_view text) {
 }
 
 // Write `content` to a unique temp file and return its path (used for the
-// whole-file ConfigReader tests).
+// whole-file load_config tests).
 std::string write_temp(const std::string& content) {
     static std::atomic<int> counter{0};
     auto path = std::filesystem::temp_directory_path() /
@@ -432,9 +431,236 @@ TEST_CASE("validation_error: s3 requires access_key and secret_key") {
     CHECK(err2->find("secret_key") != std::string::npos);
 }
 
-// ── ConfigReader (whole config.yaml: service settings + connections) ─────────
+// ── pool_size (mysql / postgresql) ───────────────────────────────────────────
 
-TEST_CASE("ConfigReader: parses service ports, retry and the embedded connections") {
+TEST_CASE("parse_connections: pool_size defaults to 1 when omitted") {
+    const std::string yaml = R"(
+connections:
+  mysql:
+    - { alias: m, host: h, username: u, database: d }
+  postgresql:
+    - { alias: p, host: h, username: u, database: d }
+)";
+    auto cfg = parse_ok(connections_node(yaml));
+    REQUIRE(cfg.mysql.size() == 1);
+    REQUIRE(cfg.postgresql.size() == 1);
+    CHECK(cfg.mysql[0].pool_size == 1);
+    CHECK(cfg.postgresql[0].pool_size == 1);
+}
+
+TEST_CASE("parse_connections: pool_size is read for mysql and postgresql entries") {
+    const std::string yaml = R"(
+connections:
+  mysql:
+    - { alias: m1, host: h, username: u, database: d, pool_size: 4 }
+    - { alias: m2, host: h, username: u, database: d, pool_size: "2" }
+  postgresql:
+    - { alias: p, host: h, username: u, database: d, schema: s, pool_size: 8 }
+)";
+    auto cfg = parse_ok(connections_node(yaml));
+    CHECK(cfg.mysql[0].pool_size == 4);
+    CHECK(cfg.mysql[1].pool_size == 2);
+    CHECK(cfg.postgresql[0].pool_size == 8);
+    CHECK(cfg.postgresql[0].schema == "s");
+}
+
+TEST_CASE("parse_connections: a pool_size below 1 is invalid_parameter naming the entry") {
+    for (const char* value : {"0", "-1"}) {
+        INFO("pool_size " << value);
+        for (const char* section : {"mysql", "postgresql"}) {
+            INFO("section " << section);
+            const std::string yaml = std::string("connections:\n  ") + section +
+                                     ":\n    - { alias: bad, host: h, username: u, database: d, pool_size: " + value +
+                                     " }\n";
+            auto err = parse_error(connections_node(yaml));
+            CHECK(err.type == core::error_code_t::invalid_parameter);
+            CHECK(mentions(err, section));
+            CHECK(mentions(err, "alias='bad'"));
+            CHECK(mentions(err, "pool_size"));
+        }
+    }
+}
+
+TEST_CASE("parse_connections: a pool_size that is not an integer is invalid_parameter naming the field") {
+    for (const char* value : {"abc", "1.5", "[1, 2]", "{ n: 1 }", "99999999999"}) {
+        INFO("pool_size " << value);
+        const std::string yaml = std::string("connections:\n  mysql:\n") +
+                                 "    - { alias: bad, host: h, username: u, database: d, pool_size: " + value + " }\n";
+        auto err = parse_error(connections_node(yaml));
+        CHECK(err.type == core::error_code_t::invalid_parameter);
+        CHECK(mentions(err, "mysql"));
+        CHECK(mentions(err, "entry #1"));
+        CHECK(mentions(err, "pool_size"));
+    }
+}
+
+TEST_CASE("validation_error: pool_size must be at least 1") {
+    config::MysqlConnectionDesc m{.alias = "a", .host = "h", .username = "u", .database = "d", .pool_size = 0};
+    auto err = config::validation_error(m);
+    REQUIRE(err.has_value());
+    CHECK(err->find("pool_size") != std::string::npos);
+
+    config::PgConnectionDesc pg{.alias = "a", .host = "h", .username = "u", .database = "d", .pool_size = -3};
+    auto err2 = config::validation_error(pg);
+    REQUIRE(err2.has_value());
+    CHECK(err2->find("pool_size") != std::string::npos);
+
+    // A missing required field is still reported first.
+    config::MysqlConnectionDesc incomplete{.alias = "a", .host = "", .username = "u", .database = "d", .pool_size = 0};
+    auto err3 = config::validation_error(incomplete);
+    REQUIRE(err3.has_value());
+    CHECK(err3->find("host") != std::string::npos);
+
+    config::PgConnectionDesc ok{.alias = "a", .host = "h", .username = "u", .database = "d", .pool_size = 16};
+    CHECK_FALSE(config::validation_error(ok).has_value());
+}
+
+TEST_CASE("load_config: pool_size reaches the embedded connection descriptors") {
+    auto path = write_temp(R"(
+connections:
+  mysql:
+    - { alias: m, host: h, port: "3306", username: u, password: p, database: d, table: "", pool_size: 3 }
+  postgresql:
+    - { alias: pg, host: h, port: "5432", username: u, password: p, database: d, schema: s, table: "" }
+)");
+    auto cfg = load_ok(path);
+    REQUIRE(cfg.connections.mysql.size() == 1);
+    REQUIRE(cfg.connections.postgresql.size() == 1);
+    CHECK(cfg.connections.mysql[0].pool_size == 3);
+    CHECK(cfg.connections.postgresql[0].pool_size == 1);
+    std::filesystem::remove(path);
+}
+
+// ── the reserved alias `federation` ─────────────────────────────────────────
+
+TEST_CASE("parse_connections: the alias federation is refused in every section and any case") {
+    const std::string backend_fields = ", host: h, username: u, database: d }\n";
+    const std::string s3_fields = ", access_key: k, secret_key: s }\n";
+    for (const char* alias : {"federation", "Federation", "FEDERATION", "fEdErAtIoN"}) {
+        INFO("alias " << alias);
+        for (const char* section : {"mysql", "postgresql", "clickhouse", "s3"}) {
+            INFO("section " << section);
+            const std::string fields = std::string_view{section} == "s3" ? s3_fields : backend_fields;
+            const std::string yaml =
+                std::string("connections:\n  ") + section + ":\n    - { alias: " + alias + fields;
+            auto err = parse_error(connections_node(yaml));
+            CHECK(err.type == core::error_code_t::invalid_parameter);
+            CHECK(mentions(err, std::string("invalid ") + section + " connection"));
+            CHECK(mentions(err, std::string("alias='") + alias + "'"));
+            CHECK(mentions(err, "reserved"));
+        }
+    }
+}
+
+// `kafka` is the engine database of the Kafka objects: a connection under it
+// would capture kafka.<object>.
+TEST_CASE("parse_connections: the alias kafka is refused in every section and any case") {
+    const std::string backend_fields = ", host: h, username: u, database: d }\n";
+    const std::string s3_fields = ", access_key: k, secret_key: s }\n";
+    for (const char* alias : {"kafka", "Kafka", "KAFKA"}) {
+        INFO("alias " << alias);
+        for (const char* section : {"mysql", "postgresql", "clickhouse", "s3"}) {
+            INFO("section " << section);
+            const std::string fields = std::string_view{section} == "s3" ? s3_fields : backend_fields;
+            const std::string yaml =
+                std::string("connections:\n  ") + section + ":\n    - { alias: " + alias + fields;
+            auto err = parse_error(connections_node(yaml));
+            CHECK(err.type == core::error_code_t::invalid_parameter);
+            CHECK(mentions(err, std::string("alias='") + alias + "'"));
+            CHECK(mentions(err, "reserved"));
+            CHECK(mentions(err, "Kafka"));
+        }
+    }
+    // A name that only contains it is a name of its own.
+    auto cfg = parse_ok(connections_node("connections:\n  mysql:\n    - { alias: kafka2, host: h, username: u, database: d }\n"));
+    REQUIRE(cfg.mysql.size() == 1);
+    CHECK(cfg.mysql[0].alias == "kafka2");
+
+    config::PgConnectionDesc pg{.alias = "Kafka", .host = "h", .username = "u", .database = "d"};
+    auto err = config::validation_error(pg);
+    REQUIRE(err.has_value());
+    CHECK(err->find("reserved") != std::string::npos);
+}
+
+TEST_CASE("parse_connections: the reserved alias is refused after valid entries before it") {
+    const std::string yaml = R"(
+connections:
+  mysql:
+    - { alias: m, host: h, username: u, database: d }
+  postgresql:
+    - { alias: p, host: h, username: u, database: d }
+    - { alias: Federation, host: h, username: u, database: d }
+)";
+    auto err = parse_error(connections_node(yaml));
+    CHECK(err.type == core::error_code_t::invalid_parameter);
+    CHECK(mentions(err, "postgresql"));
+    CHECK(mentions(err, "alias='Federation'"));
+    CHECK(mentions(err, "reserved"));
+}
+
+TEST_CASE("parse_connections: an alias that only contains federation is accepted") {
+    const std::string yaml = R"(
+connections:
+  mysql:
+    - { alias: federation2, host: h, username: u, database: d }
+  postgresql:
+    - { alias: my_federation, host: h, username: u, database: d }
+  clickhouse:
+    - { alias: federatio, host: h, username: u, database: d }
+  s3:
+    - { alias: federations, access_key: k, secret_key: s }
+)";
+    auto cfg = parse_ok(connections_node(yaml));
+    REQUIRE(cfg.mysql.size() == 1);
+    CHECK(cfg.mysql[0].alias == "federation2");
+    CHECK(cfg.postgresql[0].alias == "my_federation");
+    CHECK(cfg.clickhouse[0].alias == "federatio");
+    CHECK(cfg.s3[0].alias == "federations");
+}
+
+TEST_CASE("validation_error: the reserved alias is reported after the missing fields") {
+    config::MysqlConnectionDesc m{.alias = "Federation", .host = "h", .username = "u", .database = "d"};
+    auto err = config::validation_error(m);
+    REQUIRE(err.has_value());
+    CHECK(err->find("reserved") != std::string::npos);
+
+    config::S3CredentialDesc s3{.alias = "FEDERATION", .access_key = "k", .secret_key = "s"};
+    auto err2 = config::validation_error(s3);
+    REQUIRE(err2.has_value());
+    CHECK(err2->find("reserved") != std::string::npos);
+
+    // An incomplete entry is reported as incomplete first.
+    config::ChConnectionDesc incomplete{.alias = "federation", .host = "", .username = "u", .database = "d"};
+    auto err3 = config::validation_error(incomplete);
+    REQUIRE(err3.has_value());
+    CHECK(err3->find("host") != std::string::npos);
+
+    // The reserved alias outranks a bad port.
+    config::PgConnectionDesc bad_port{.alias = "federation", .host = "h", .port = "abc", .username = "u", .database = "d"};
+    auto err4 = config::validation_error(bad_port);
+    REQUIRE(err4.has_value());
+    CHECK(err4->find("reserved") != std::string::npos);
+}
+
+TEST_CASE("load_config: a connection under the reserved alias aborts the load") {
+    auto path = write_temp(R"(
+service:
+  mysql: { port: 8816 }
+connections:
+  clickhouse:
+    - { alias: Federation, host: h, port: "9000", username: u, password: p, database: d, table: "" }
+)");
+    auto err = load_error(path);
+    CHECK(err.type == core::error_code_t::invalid_parameter);
+    CHECK(mentions(err, "clickhouse"));
+    CHECK(mentions(err, "alias='Federation'"));
+    CHECK(mentions(err, "reserved"));
+    std::filesystem::remove(path);
+}
+
+// ── load_config (whole config.yaml: service settings + connections) ─────────
+
+TEST_CASE("load_config: parses service ports, retry and the embedded connections") {
     const std::string yaml = R"(
 service:
   flight_sql:
@@ -481,7 +707,7 @@ connections:
     CHECK(cfg.connections.clickhouse.empty());
 }
 
-TEST_CASE("ConfigReader: defaults apply and connections are empty when file is missing") {
+TEST_CASE("load_config: defaults apply and connections are empty when file is missing") {
     auto cfg = load_ok("/nonexistent/config.yaml");
 
     CHECK(cfg.flight_sql.port == 8815);
@@ -495,7 +721,7 @@ TEST_CASE("ConfigReader: defaults apply and connections are empty when file is m
     CHECK(cfg.connections.s3.empty());
 }
 
-TEST_CASE("ConfigReader: retry defaults apply when the section is omitted") {
+TEST_CASE("load_config: retry defaults apply when the section is omitted") {
     const std::string yaml = R"(
 service:
   mysql:
@@ -507,7 +733,7 @@ service:
     CHECK(cfg.connection_retry.delay_ms == 1000);
 }
 
-TEST_CASE("ConfigReader: a config with no connections section yields empty connections") {
+TEST_CASE("load_config: a config with no connections section yields empty connections") {
     const std::string yaml = R"(
 service:
   mysql:
@@ -519,14 +745,14 @@ service:
     CHECK(cfg.connections.s3.empty());
 }
 
-TEST_CASE("ConfigReader: malformed YAML is an error") {
+TEST_CASE("load_config: malformed YAML is an error") {
     const std::string yaml = "service: [ {port: }";  // unbalanced flow mapping
     auto err = load_error(write_temp(yaml));
     CHECK(err.type == core::error_code_t::conversion_failure);
     CHECK(mentions(err, "configuration file"));
 }
 
-TEST_CASE("ConfigReader: a service port that is not an integer is an error naming the field") {
+TEST_CASE("load_config: a service port that is not an integer is an error naming the field") {
     // yaml-cpp refuses to read the text as an int; that refusal is a value, not
     // an exception leaving the reader.
     const std::string yaml = R"(
@@ -539,7 +765,58 @@ service:
     CHECK(mentions(err, "service.mysql.port"));
 }
 
-TEST_CASE("ConfigReader: aborts (returns an error) when a backend port is malformed") {
+TEST_CASE("load_config: a service port outside 1..65535 is an error naming the field") {
+    // Read as an integer in range: 70000 would otherwise be cut to 16 bits and
+    // listen on another port (4464).
+    for (const char* section : {"flight_sql", "mysql", "postgres", "spark_connect"}) {
+        INFO(section);
+        auto err = load_error(write_temp(std::string{"service:\n  "} + section + ":\n    port: 70000\n"));
+        CHECK(err.type == core::error_code_t::invalid_parameter);
+        CHECK(mentions(err, std::string{"service."} + section + ".port"));
+        CHECK(mentions(err, "out of range"));
+    }
+    auto zero = load_error(write_temp("service:\n  mysql:\n    port: 0\n"));
+    CHECK(zero.type == core::error_code_t::invalid_parameter);
+}
+
+TEST_CASE("load_config: a section that is not a mapping is an error naming it") {
+    // yaml-cpp throws on a subscript of a scalar; every section is checked to be
+    // a mapping before a key of it is read, so the throw never happens.
+    const std::pair<const char*, const char*> cases[] = {
+        {"service: 5\n", "'service'"},
+        {"service: [a, b]\n", "'service'"},
+        {"service:\n  mysql: 8816\n", "service.mysql"},
+        {"service:\n  postgres: 8817\n", "service.postgres"},
+        {"service:\n  flight_sql: 8815\n", "service.flight_sql"},
+        {"service:\n  spark_connect: 15002\n", "service.spark_connect"},
+        {"service:\n  connection_retry: 3\n", "service.connection_retry"},
+        {"service:\n  mysql: [8816]\n", "service.mysql"},
+        {"just a scalar\n", "(document)"},
+    };
+    for (const auto& [yaml, field] : cases) {
+        INFO(yaml);
+        auto err = load_error(write_temp(yaml));
+        CHECK(err.type == core::error_code_t::invalid_parameter);
+        CHECK(mentions(err, field));
+        CHECK(mentions(err, "expected a mapping"));
+    }
+    // An empty file is the defaults, as before.
+    auto cfg = load_ok(write_temp(""));
+    CHECK(cfg.mysql.port == 8816);
+}
+
+TEST_CASE("parse_connections: an entry that is a scalar is an error naming the entry") {
+    for (const char* section : {"mysql", "postgresql", "clickhouse", "s3"}) {
+        INFO(section);
+        auto err = parse_error(connections_node(std::string{"connections:\n  "} + section + ":\n    - just_a_name\n"));
+        CHECK(err.type == core::error_code_t::invalid_parameter);
+        CHECK(mentions(err, section));
+        CHECK(mentions(err, "entry #1"));
+        CHECK(mentions(err, "expected a mapping"));
+    }
+}
+
+TEST_CASE("load_config: aborts (returns an error) when a backend port is malformed") {
     // A port the connector could never open must stop the server at config
     // load, not surface as a failed open (or worse) at registration time.
     const std::string yaml = R"(
@@ -561,7 +838,7 @@ connections:
     CHECK(mentions(err, "port"));
 }
 
-TEST_CASE("ConfigReader: aborts (returns an error) when a connection is invalid") {
+TEST_CASE("load_config: aborts (returns an error) when a connection is invalid") {
     // A well-formed file with an incomplete backend must fail to load, so the
     // server never starts with a broken connection.
     const std::string yaml = R"(
@@ -579,9 +856,9 @@ connections:
     CHECK(load_error(write_temp(yaml)).type == core::error_code_t::invalid_parameter);
 }
 
-// ── ConfigReader: service.spark_connect (the Spark Connect gRPC server) ──────
+// ── load_config: service.spark_connect (the Spark Connect gRPC server) ──────
 
-TEST_CASE("ConfigReader: parses the spark_connect host and port") {
+TEST_CASE("load_config: parses the spark_connect host and port") {
     const std::string yaml = R"(
 service:
   flight_sql:
@@ -621,7 +898,7 @@ connections:
     CHECK(cfg.connections.mysql[0].alias == "m1");
 }
 
-TEST_CASE("ConfigReader: spark_connect defaults to 0.0.0.0:15002 when its node is absent") {
+TEST_CASE("load_config: spark_connect defaults to 0.0.0.0:15002 when its node is absent") {
     SECTION("a service node without spark_connect") {
         const std::string yaml = R"(
 service:
@@ -640,7 +917,7 @@ service:
     }
 }
 
-TEST_CASE("ConfigReader: a spark_connect port that is not an integer is an error naming the field") {
+TEST_CASE("load_config: a spark_connect port that is not an integer is an error naming the field") {
     // Read through yaml_scalar like every service value: the refusal is a
     // value, not an exception leaving the reader.
     const std::string yaml = R"(
@@ -652,4 +929,117 @@ service:
     auto err = load_error(write_temp(yaml));
     CHECK(err.type == core::error_code_t::invalid_parameter);
     CHECK(mentions(err, "service.spark_connect.port"));
+}
+
+// ── aliases: one connection per name ──────────────────────────────────────────
+
+// A backend alias is the connection uid a federated name starts with, and the
+// federation resolves it case-insensitively: a second backend under the same
+// alias (in any section, in any case) would leave one of the two unreachable
+// and record its tables under the other's uid. The uid keeps the backend it was
+// registered with because a config that would rebind it never loads.
+TEST_CASE("parse_connections: a backend alias taken twice is refused across sections and case") {
+    struct case_t {
+        const char* first_section;
+        const char* first_alias;
+        const char* second_section;
+        const char* second_alias;
+    };
+    for (const auto& c : {case_t{"mysql", "shop", "mysql", "shop"},
+                          case_t{"mysql", "shop", "postgresql", "shop"},
+                          case_t{"postgresql", "Shop", "clickhouse", "SHOP"},
+                          case_t{"mysql", "shop", "clickhouse", "sHoP"}}) {
+        INFO(c.first_section << " " << c.first_alias << " / " << c.second_section << " " << c.second_alias);
+        const std::string entry = ", host: h, username: u, database: d }\n";
+        std::string yaml = "connections:\n";
+        if (std::string_view{c.first_section} == c.second_section) {
+            yaml += std::string("  ") + c.first_section + ":\n    - { alias: " + c.first_alias + entry +
+                    "    - { alias: " + c.second_alias + entry;
+        } else {
+            yaml += std::string("  ") + c.first_section + ":\n    - { alias: " + c.first_alias + entry + "  " +
+                    c.second_section + ":\n    - { alias: " + c.second_alias + entry;
+        }
+        auto err = parse_error(connections_node(yaml));
+        CHECK(err.type == core::error_code_t::invalid_parameter);
+        CHECK(mentions(err, std::string("alias='") + c.second_alias + "'"));
+        CHECK(mentions(err, "already taken"));
+        CHECK(mentions(err, std::string(c.first_section) + " alias='" + c.first_alias + "'"));
+    }
+}
+
+TEST_CASE("parse_connections: an s3 alias is its own namespace and taken once") {
+    SECTION("an s3 alias equal to a backend alias is accepted") {
+        const std::string yaml = R"(
+connections:
+  mysql:
+    - { alias: lake, host: h, username: u, database: d }
+  s3:
+    - { alias: lake, access_key: k, secret_key: s }
+)";
+        auto cfg = parse_ok(connections_node(yaml));
+        CHECK(cfg.mysql.size() == 1);
+        CHECK(cfg.s3.size() == 1);
+    }
+    SECTION("two s3 entries under one alias are refused") {
+        const std::string yaml = R"(
+connections:
+  s3:
+    - { alias: lake, access_key: k, secret_key: s }
+    - { alias: lake, access_key: k2, secret_key: s2 }
+)";
+        auto err = parse_error(connections_node(yaml));
+        CHECK(err.type == core::error_code_t::invalid_parameter);
+        CHECK(mentions(err, "s3"));
+        CHECK(mentions(err, "alias='lake'"));
+        CHECK(mentions(err, "already taken"));
+    }
+    SECTION("s3 aliases differing in case are two aliases (looked up exactly)") {
+        const std::string yaml = R"(
+connections:
+  s3:
+    - { alias: lake, access_key: k, secret_key: s }
+    - { alias: LAKE, access_key: k2, secret_key: s2 }
+)";
+        CHECK(parse_ok(connections_node(yaml)).s3.size() == 2);
+    }
+}
+
+TEST_CASE("load_config: a backend alias taken twice aborts the load") {
+    auto path = write_temp(R"(
+connections:
+  mysql:
+    - { alias: shop, host: h, port: "3306", username: u, password: p, database: d, table: "" }
+  postgresql:
+    - { alias: SHOP, host: h, port: "5432", username: u, password: p, database: d, table: "" }
+)");
+    auto err = load_error(path);
+    CHECK(err.type == core::error_code_t::invalid_parameter);
+    CHECK(mentions(err, "alias='SHOP'"));
+    CHECK(mentions(err, "already taken"));
+    std::filesystem::remove(path);
+}
+
+// ── load_config: service.spark_connect.session_timeout_s ────────────────────
+
+TEST_CASE("load_config: the spark_connect session timeout defaults to Spark's 60 minutes") {
+    auto cfg = load_ok("/nonexistent/config.yaml");
+    CHECK(cfg.spark_connect.session_timeout_s == 3600);
+}
+
+TEST_CASE("load_config: the spark_connect session timeout is read and range-checked") {
+    SECTION("a value") {
+        auto cfg = load_ok(write_temp("service:\n  spark_connect: { session_timeout_s: 120 }\n"));
+        CHECK(cfg.spark_connect.session_timeout_s == 120);
+        CHECK(cfg.spark_connect.port == 15002);
+    }
+    SECTION("zero keeps sessions until ReleaseSession") {
+        auto cfg = load_ok(write_temp("service:\n  spark_connect: { session_timeout_s: 0 }\n"));
+        CHECK(cfg.spark_connect.session_timeout_s == 0);
+    }
+    for (const char* bad : {"-1", "abc", "1.5", "99999999999"}) {
+        INFO(bad);
+        auto err = load_error(write_temp(std::string("service:\n  spark_connect: { session_timeout_s: ") + bad + " }\n"));
+        CHECK(err.type == core::error_code_t::invalid_parameter);
+        CHECK(mentions(err, "service.spark_connect.session_timeout_s"));
+    }
 }

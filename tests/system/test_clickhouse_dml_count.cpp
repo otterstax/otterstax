@@ -3,47 +3,40 @@
 //
 // The ClickHouse native protocol never puts an affected-row count into a block:
 // the only signal is Progress.written_rows, which the connector sums and hands
-// to the manager beside the blocks. What is pinned here is how the manager
-// turns that number into the engine's count carrier — INSERT reports it,
-// a lightweight DELETE (a mutation) reports 0 whatever the server wrote, and a
-// SELECT slot is data, never a count.
+// to the manager beside the blocks. What is pinned here is how the manager,
+// as the federation's backend (federation::backend_t::write / scan), turns that
+// number into the statement's count — an INSERT reports it, a mutation
+// (ALTER TABLE ... UPDATE, a lightweight DELETE) reports 0 whatever the server
+// wrote, and a read is data, never a count — and the same through a session:
+// INSERT / DELETE on a remote ClickHouse table answer those counts.
 
-#include "catalog/catalog_manager.hpp"
+#include "backends/remote_backends.hpp"
 #include "integration/clickhouse/connection_manager.hpp"
-#include "integration/otterbrix/otterbrix_manager.hpp"
-#include "otterbrix/schema/schema_utils.hpp"
-#include "test_helpers.hpp"
-#include "types/otterbrix.hpp"
-
-#include "../mock/mock_config.hpp"
-#include "../mock/otterbrix.hpp"
-#include "../mock/parser.hpp"
+#include "otterbrix/federation/provider.hpp"
+#include "session_stack.hpp"
 
 #include <actor-zeta.hpp>
 #include <catch2/catch_all.hpp>
 #include <clickhouse/columns/numeric.h>
 #include <clickhouse/columns/string.h>
-#include <components/expressions/compare_expression.hpp>
-#include <components/logical_plan/node_data.hpp>
-#include <components/logical_plan/node_delete.hpp>
-#include <components/logical_plan/node_insert.hpp>
-#include <components/logical_plan/node_limit.hpp>
-#include <components/logical_plan/node_match.hpp>
 #include <components/vector/data_chunk.hpp>
 #include <core/result_wrapper.hpp>
 
-#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <memory_resource>
+#include <mutex>
 #include <string>
-#include <thread>
 #include <utility>
+#include <vector>
 
 namespace {
 
     using components::vector::data_chunk_t;
     using components::vector::DEFAULT_VECTOR_CAPACITY;
+    namespace fed = otterstax::federation;
+
+    constexpr const char* kUid = "events_ch";
 
     // A 0-row header block describing (id Int32, name String): what a
     // `WHERE 1 = 0` schema probe streams back.
@@ -54,9 +47,26 @@ namespace {
         return block;
     }
 
-    // Answers the catalog's discovery with the header block and every data
-    // query with no blocks at all plus `written_rows` of progress — the exact
-    // shape a DML statement produces on the wire.
+    // system.columns for that table: (name, type) rows.
+    clickhouse::Block named_types_block() {
+        auto names = std::make_shared<clickhouse::ColumnString>();
+        auto types = std::make_shared<clickhouse::ColumnString>();
+        names->Append("id");
+        types->Append("Int32");
+        names->Append("name");
+        types->Append("String");
+        clickhouse::Block block;
+        block.AppendColumn("name", names);
+        block.AppendColumn("type", types);
+        return block;
+    }
+
+    std::mutex g_mutex;
+    std::vector<std::string> g_statements;
+
+    // Answers the discovery with system.columns and the header block, and every
+    // data statement with no blocks at all plus `written_rows` of progress — the
+    // exact shape a DML statement produces on the wire.
     class counting_connector final : public ch::IConnector {
     public:
         counting_connector(ch::connect_params params, std::string alias, uint64_t written_rows)
@@ -74,24 +84,35 @@ namespace {
         std::string alias() const noexcept override { return alias_; }
 
         boost::asio::awaitable<core::result_wrapper_t<std::unique_ptr<data_chunk_t>>>
-        runQuery(std::string_view,
+        runQuery(std::string_view query,
                  otterstax::function_ref_t<std::unique_ptr<data_chunk_t>(const ch::select_result_t&)> handler)
             override {
+            {
+                std::lock_guard guard(g_mutex);
+                g_statements.emplace_back(query);
+            }
             ch::select_result_t outcome;
             outcome.written_rows = written_rows_;
             co_return handler(outcome);
         }
 
         boost::asio::awaitable<core::result_wrapper_t<int64_t>>
-        runQuery(std::string_view, otterstax::function_ref_t<int64_t(const ch::select_result_t&)>) override {
-            co_return int64_t{0};
+        runQuery(std::string_view query, otterstax::function_ref_t<int64_t(const ch::select_result_t&)> handler) override {
+            {
+                std::lock_guard guard(g_mutex);
+                g_statements.emplace_back(query);
+            }
+            ch::select_result_t outcome;
+            outcome.written_rows = written_rows_;
+            co_return handler(outcome);
         }
 
         boost::asio::awaitable<core::error_t>
-        runQuery(std::string_view,
+        runQuery(std::string_view query,
                  otterstax::function_ref_t<otterstax::asio_error_t(const ch::select_result_t&)> handler) override {
             ch::select_result_t probe;
-            probe.blocks.push_back(header_block());
+            probe.blocks.push_back(query.find("system.columns") != std::string_view::npos ? named_types_block()
+                                                                                          : header_block());
             co_return otterstax::as_query_result<otterstax::asio_error_t>(handler(probe));
         }
 
@@ -107,159 +128,110 @@ namespace {
         return std::make_unique<counting_connector>(std::move(params), std::move(alias), WrittenRows);
     }
 
-    using otterstax::test::wait_until_ready;
-
-    // Catalog + connector manager over `factory` + the ClickHouse integration
-    // actor. Connection "1" matches the uid SimpleMockParser stamps on its
-    // external node.
-    struct ch_stack {
-        std::pmr::memory_resource* resource;
-        std::unique_ptr<db::OtterbrixManager, actor_zeta::pmr::deleter_t> otterbrix_manager;
-        std::unique_ptr<mysql::CatalogManager, actor_zeta::pmr::deleter_t> catalog_manager;
-        std::unique_ptr<ch::ConnectorManager> connector_manager;
-        std::unique_ptr<db::ClickhouseManager, actor_zeta::pmr::deleter_t> manager;
-
-        ch_stack(std::pmr::memory_resource* res, ch::connector_factory factory)
-            : resource(res)
-            , otterbrix_manager(actor_zeta::spawn<db::OtterbrixManager>(
-                  res,
-                  std::make_unique<SimpleMockOtterbrixManager>(mock_config{.resource = res})))
-            , catalog_manager(actor_zeta::spawn<mysql::CatalogManager>(res, otterbrix_manager->address()))
-            , connector_manager(std::make_unique<ch::ConnectorManager>(res, catalog_manager->address(), factory, 2))
-            , manager(actor_zeta::spawn<db::ClickhouseManager>(res, connector_manager.get())) {
-            catalog_manager->set_backend_managers(actor_zeta::address_t::empty_address(),
-                                                  actor_zeta::address_t::empty_address(),
-                                                  manager->address());
-        }
-
-        void register_connection_one() {
-            ch::connect_params params;
-            params.table = "orders";
-            auto added = connector_manager->addConnection(std::move(params), "1");
-            INFO("addConnection: " << (added.has_error() ? added.error().what.c_str() : "ok"));
-            REQUIRE_FALSE(added.has_error());
-        }
-
-        ParsedQueryDataPtr statement() {
-            SimpleMockParser parser(mock_config{.resource = resource});
-            auto parsed = parser.parse("SELECT 1");
-            REQUIRE_FALSE(parsed.has_error());
-            return std::move(parsed.value());
-        }
-
-        // The statement's single external slot rewritten as INSERT ... VALUES (1).
-        ParsedQueryDataPtr insert_statement() {
-            auto data = statement();
-            std::pmr::vector<components::types::complex_logical_type> columns{resource};
-            columns.emplace_back(components::types::logical_type::INTEGER, "id");
-            data_chunk_t rows{resource, columns, 1};
-            rows.set_value(0, 0, components::types::logical_value_t{resource, int32_t{1}});
-            rows.set_cardinality(1);
-            auto& slot = data->otterbrix_params->external_nodes.front().front();
-            *slot.node = components::logical_plan::make_node_insert(resource, std::move(rows));
-            return data;
-        }
-
-        // The slot rewritten as a DELETE with no predicate.
-        ParsedQueryDataPtr delete_statement() {
-            auto data = statement();
-            auto match = components::logical_plan::make_node_match(
-                resource, qualified_name_t{core::dbname_t{"db"}, core::relname_t{"orders"}},
-                components::expressions::make_compare_expression(resource,
-                                                                 components::expressions::compare_type::all_true));
-            auto limit = components::logical_plan::make_node_limit(resource,
-                                                                   components::logical_plan::limit_t::unlimit());
-            auto& slot = data->otterbrix_params->external_nodes.front().front();
-            *slot.node = components::logical_plan::make_node_delete(resource, match, limit);
-            return data;
-        }
-
-        // The slot rewritten as a schema node carrying raw backend SQL — what
-        // the catalog produces for a SELECT.
-        ParsedQueryDataPtr select_statement() {
-            auto data = statement();
-            auto& slot = data->otterbrix_params->external_nodes.front().front();
-            *slot.node = schema_utils::make_node_schema_raw(resource, slot.target.name, "SELECT 1", {});
-            return data;
-        }
-
-        core::result_wrapper_t<ParsedQueryDataPtr> execute(ParsedQueryDataPtr data) {
-            auto [needs_sched, future] = actor_zeta::send(manager->address(),
-                                                          &db::ClickhouseManager::execute,
-                                                          session_hash_t{1},
-                                                          std::move(data));
-            wait_until_ready(future);
-            return std::move(future).take_ready();
-        }
-    };
-
-    const data_chunk_t& fetched_slot(const ParsedQueryDataPtr& data) {
-        const auto& slot = data->otterbrix_params->external_nodes.front().front();
-        REQUIRE((*slot.node)->type() == components::logical_plan::node_type::data_t);
-        return static_cast<const components::logical_plan::node_data_t&>(**slot.node).data_chunk();
+    config::ConnectionsConfig ch_connection() {
+        config::ConnectionsConfig connections;
+        connections.clickhouse.push_back(config::ChConnectionDesc{.alias = kUid, .host = "mock", .database = "ev", .table = "orders"});
+        return connections;
     }
+
+    // The remote backends alone (no engine), the ClickHouse connection open
+    // over `factory`.
+    struct ch_backends {
+        std::pmr::synchronized_pool_resource arena{std::pmr::new_delete_resource()};
+        // The backends pool the statements run on; outlives the backends.
+        otterstax::runtime::runtime_t runtime{otterstax::test::test_runtime_config()};
+        otterstax::backends::remote_backends_t remote;
+
+        explicit ch_backends(ch::connector_factory factory)
+            : remote(&arena,
+                     otterstax::backends::remote_backends_options_t{
+                         .connectors = otterstax::backends::connector_factories_t{.clickhouse = factory},
+                         .connector_threads = {2, 2, 2},
+                         .statements = runtime.backends_scheduler()}) {
+            auto opened = remote.open(ch_connection(), config::ConnectionRetryConfig{});
+            INFO(opened.what.c_str());
+            REQUIRE_FALSE(opened.contains_error());
+        }
+
+        fed::write_result_t write(fed::write_kind_t kind, std::string sql) {
+            return drive_until_ready(remote.clickhouse().write(&arena, fed::write_request_t{kKindUid, std::move(sql), kind}));
+        }
+
+        static constexpr const char* kKindUid = kUid;
+    };
 
 } // namespace
 
-TEST_CASE("ClickhouseManager::execute: a remote INSERT reports the server's written rows as its affected count") {
-    std::pmr::synchronized_pool_resource arena(std::pmr::new_delete_resource());
-    ch_stack stack(&arena, &counting_factory<3>);
-    stack.register_connection_one();
-
-    auto result = stack.execute(stack.insert_statement());
-
-    INFO("execute: " << (result.has_error() ? result.error().what.c_str() : "ok"));
-    REQUIRE_FALSE(result.has_error());
-    const auto& carrier = fetched_slot(result.value());
-    REQUIRE(carrier.column_count() == 0);
-    REQUIRE(carrier.size() == 3);
-    REQUIRE(result.value()->otterbrix_params->remote_affected_rows == 3);
+TEST_CASE("ClickhouseManager::write: an INSERT reports the server's written rows as its affected count") {
+    ch_backends backends(&counting_factory<3>);
+    auto written = backends.write(fed::write_kind_t::insert, "INSERT INTO `ev`.`orders` (`id`) VALUES (1);");
+    INFO((written.has_error() ? written.error().what.c_str() : "ok"));
+    REQUIRE_FALSE(written.has_error());
+    REQUIRE(written.value() == 3);
 }
 
-TEST_CASE("ClickhouseManager::execute: an INSERT writing more than one vector window keeps the whole count") {
-    std::pmr::synchronized_pool_resource arena(std::pmr::new_delete_resource());
-    constexpr uint64_t written = DEFAULT_VECTOR_CAPACITY * 2 + 452;
-    ch_stack stack(&arena, &counting_factory<written>);
-    stack.register_connection_one();
-
-    auto result = stack.execute(stack.insert_statement());
-
-    INFO("execute: " << (result.has_error() ? result.error().what.c_str() : "ok"));
-    REQUIRE_FALSE(result.has_error());
-    const auto& carrier = fetched_slot(result.value());
-    REQUIRE(carrier.column_count() == 0);
-    REQUIRE(carrier.size() == written);
-    REQUIRE(result.value()->otterbrix_params->remote_affected_rows == written);
+TEST_CASE("ClickhouseManager::write: an INSERT writing more than one vector window keeps the whole count") {
+    constexpr uint64_t rows = DEFAULT_VECTOR_CAPACITY * 2 + 452;
+    ch_backends backends(&counting_factory<rows>);
+    auto written = backends.write(fed::write_kind_t::insert, "INSERT INTO `ev`.`orders` (`id`) VALUES (1);");
+    REQUIRE_FALSE(written.has_error());
+    REQUIRE(written.value() == rows);
 }
 
-TEST_CASE("ClickhouseManager::execute: a lightweight DELETE reports 0 rows even when the server writes progress") {
-    std::pmr::synchronized_pool_resource arena(std::pmr::new_delete_resource());
+TEST_CASE("ClickhouseManager::write: a mutation reports 0 rows even when the server writes progress") {
     // A mutation rewrites whole parts: whatever written_rows the server ever
     // attributes to it is a part size, not the number of matched rows.
-    ch_stack stack(&arena, &counting_factory<5>);
-    stack.register_connection_one();
-
-    auto result = stack.execute(stack.delete_statement());
-
-    INFO("execute: " << (result.has_error() ? result.error().what.c_str() : "ok"));
-    REQUIRE_FALSE(result.has_error());
-    const auto& carrier = fetched_slot(result.value());
-    REQUIRE(carrier.column_count() == 0);
-    REQUIRE(carrier.size() == 0);
-    REQUIRE(result.value()->otterbrix_params->remote_affected_rows == 0);
+    ch_backends backends(&counting_factory<5>);
+    auto deleted = backends.write(fed::write_kind_t::delete_, "DELETE FROM `ev`.`orders` WHERE 1;");
+    REQUIRE_FALSE(deleted.has_error());
+    REQUIRE(deleted.value() == 0);
+    auto updated = backends.write(fed::write_kind_t::update, "ALTER TABLE `ev`.`orders` UPDATE `id` = 2 WHERE 1;");
+    REQUIRE_FALSE(updated.has_error());
+    REQUIRE(updated.value() == 0);
 }
 
-TEST_CASE("ClickhouseManager::execute: a SELECT slot is data — written rows never become an affected count") {
-    std::pmr::synchronized_pool_resource arena(std::pmr::new_delete_resource());
-    ch_stack stack(&arena, &counting_factory<3>);
-    stack.register_connection_one();
+TEST_CASE("ClickhouseManager::scan: a read is data — written rows never become rows") {
+    ch_backends backends(&counting_factory<3>);
+    auto rows = std::make_shared<fed::scan_rows_t>();
+    auto scanned = drive_until_ready(backends.remote.clickhouse().scan(
+        &backends.arena,
+        fed::scan_request_t{kUid, "SELECT `id`, `name` FROM `ev`.`orders`", {}},
+        rows));
+    INFO(scanned.what.c_str());
+    REQUIRE_FALSE(scanned.contains_error());
+    // No blocks came back: an empty result set, not three rows.
+    std::uint64_t total = 0;
+    for (const auto& chunk : rows->chunks) {
+        total += chunk.size();
+    }
+    REQUIRE(total == 0);
+}
 
-    auto result = stack.execute(stack.select_statement());
+TEST_CASE("ClickHouse DML through a session: INSERT answers written_rows and DELETE answers 0") {
+    {
+        std::lock_guard guard(g_mutex);
+        g_statements.clear();
+    }
+    otterstax::test::stack_options_t options;
+    options.connectors.clickhouse = &counting_factory<4>;
+    options.connections = ch_connection();
+    otterstax::test::session_stack_owner owner(otterstax::test::unique_test_dir("test_ch_dml_session"), options);
+    const auto s = owner.stack();
 
-    INFO("execute: " << (result.has_error() ? result.error().what.c_str() : "ok"));
-    REQUIRE_FALSE(result.has_error());
-    // No blocks came back, so the slot is an empty result set, not three rows.
-    const auto& rows = fetched_slot(result.value());
-    REQUIRE(rows.size() == 0);
-    REQUIRE(result.value()->otterbrix_params->remote_affected_rows == OtterbrixStatement::no_remote_dml);
+    auto inserted = otterstax::test::run_session_sql_payload(
+        s, 1, std::string{"INSERT INTO "} + kUid + ".ev.orders (id, name) VALUES (1, 'a'), (2, 'b');");
+    INFO((inserted.has_error() ? inserted.error().what.c_str() : "ok"));
+    REQUIRE_FALSE(inserted.has_error());
+    REQUIRE(inserted.value().column_count() == 0);
+    REQUIRE(inserted.value().reported_rows() == 4);
+
+    auto deleted =
+        otterstax::test::run_session_sql_payload(s, 2, std::string{"DELETE FROM "} + kUid + ".ev.orders WHERE id = 1;");
+    INFO((deleted.has_error() ? deleted.error().what.c_str() : "ok"));
+    REQUIRE_FALSE(deleted.has_error());
+    REQUIRE(deleted.value().reported_rows() == 0);
+
+    std::lock_guard guard(g_mutex);
+    REQUIRE(g_statements == std::vector<std::string>{"INSERT INTO `ev`.`orders` (`id`, `name`) VALUES (1, 'a'), (2, 'b');",
+                                                     "DELETE FROM `ev`.`orders` WHERE `id` = 1;"});
 }

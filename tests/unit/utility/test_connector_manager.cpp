@@ -5,27 +5,21 @@
 // injected connectors. Every failure is a VALUE on the returned future — an
 // unknown uuid, a closed connector, a failed reconnect, a pool that is not
 // running, an exception raised on the io thread — and none of them unregisters
-// the connection: the connection registry only changes through addConnection.
-//
-// The catalog actor answers add_connection_schema synchronously (its
-// enqueue_impl runs the handler on the sending thread), which is what lets
-// addConnection observe the registration outcome and refuse a connection whose
-// schema could not be registered.
+// the connection: the connection registry only changes through addConnection
+// and removeConnection (both on the startup thread; remote_backends_t removes a
+// connection whose discovery failed).
 
-#include "catalog/catalog_manager.hpp"
 #include "connectors/clickhouse/manager.hpp"
 #include "connectors/mysql/manager.hpp"
 #include "connectors/postgresql/manager.hpp"
-#include "integration/otterbrix/otterbrix_manager.hpp"
 #include "integration/sql/connection_manager.hpp"
 #include "tests/mock/ch_db_connector.hpp"
-#include "tests/mock/otterbrix.hpp"
 #include "tests/mock/pg_db_connector.hpp"
 #include "tests/mock/sql_db_connector.hpp"
+#include "tests/system/session_stack.hpp"
 
 #include <catch2/catch_all.hpp>
 
-#include <actor-zeta.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -41,9 +35,10 @@ namespace {
     using components::vector::data_chunk_t;
 
     // Connectors the mocks in tests/mock cannot model: each one stays healthy for
-    // the catalog's startup discovery (the asio_error_t overload) and changes its
-    // behaviour for every query after it — a backend that goes away right after
-    // registration.
+    // the startup discovery (the asio_error_t overload: the sql_mode check, then
+    // the information_schema listing, which answers no table and ends it) and
+    // changes its behaviour for every query after it — a backend that goes away
+    // right after registration.
     class stub_connector : public mysql::IConnector {
     public:
         stub_connector(std::pmr::memory_resource* resource, std::string alias)
@@ -69,10 +64,12 @@ namespace {
             co_return int64_t{0};
         }
         boost::asio::awaitable<core::error_t>
-        runQuery(std::string_view,
+        runQuery(std::string_view query,
                  otterstax::function_ref_t<otterstax::asio_error_t(const boost::mysql::results&)> handler) override {
             auto outcome = otterstax::as_query_result<otterstax::asio_error_t>(handler(mysql::mock_ok_results()));
-            discovered_ = true;
+            if (query.find("information_schema") != std::string_view::npos) {
+                discovered_ = true;
+            }
             co_return std::move(outcome);
         }
 
@@ -106,7 +103,7 @@ namespace {
         }
     };
 
-    // Refuses the catalog's discovery query.
+    // Refuses the discovery query.
     class undiscoverable_connector final : public stub_connector {
     public:
         using stub_connector::stub_connector;
@@ -126,33 +123,33 @@ namespace {
         return std::make_unique<Connector>(resource, std::move(alias));
     }
 
-    // Otterbrix mock + real CatalogManager + a mysql ConnectorManager over the
-    // given factory. The pool is NOT started here: tests decide, through
-    // start(), which spawns the MySQL integration actor — the manager's sole
-    // driver, whose constructor starts the pool and through which the catalog
-    // runs the registration's discovery.
+    // A mysql ConnectorManager over the given factory. The pool is NOT started
+    // here: tests decide, through start(), which builds the MySQL integration
+    // backend — the manager's sole driver, whose constructor starts the pool and
+    // which runs the discovery.
     struct mysql_stack {
         std::pmr::memory_resource* resource;
-        std::unique_ptr<db::OtterbrixManager, actor_zeta::pmr::deleter_t> otterbrix_manager;
-        std::unique_ptr<mysql::CatalogManager, actor_zeta::pmr::deleter_t> catalog_manager;
+        // The backends pool the backend's statements run on; outlives the backend.
+        otterstax::runtime::runtime_t runtime{otterstax::test::test_runtime_config()};
         std::unique_ptr<mysql::ConnectorManager> manager;
-        std::unique_ptr<db::MySQLManager, actor_zeta::pmr::deleter_t> manager_actor;
+        std::unique_ptr<db::MySQLManager> backend;
 
         mysql_stack(std::pmr::memory_resource* res, mysql::connector_factory factory)
             : resource(res)
-            , otterbrix_manager(actor_zeta::spawn<db::OtterbrixManager>(
-                  res,
-                  std::make_unique<SimpleMockOtterbrixManager>(mock_config{.resource = res})))
-            , catalog_manager(actor_zeta::spawn<mysql::CatalogManager>(res, otterbrix_manager->address()))
-            , manager(std::make_unique<mysql::ConnectorManager>(res, catalog_manager->address(), factory, 2))
-            , manager_actor(nullptr, actor_zeta::pmr::deleter_t{res}) {}
+            , manager(std::make_unique<mysql::ConnectorManager>(res, factory, 2)) {}
 
         void start() {
-            manager_actor = actor_zeta::spawn<db::MySQLManager>(resource, manager.get());
-            catalog_manager->set_backend_managers(manager_actor->address(),
-                                                  actor_zeta::address_t::empty_address(),
-                                                  actor_zeta::address_t::empty_address());
+            backend = std::make_unique<db::MySQLManager>(resource, manager.get(), runtime.backends_scheduler());
             REQUIRE(manager->status() == thread_pool_status::RUNNING);
+        }
+
+        // The startup discovery of `uid` (database "db"), as remote_backends_t runs
+        // it after addConnection; it must succeed.
+        void discover(const std::string& uid) {
+            auto reply = backend->discover(
+                qualified_name_t{core::uid_t{uid}, core::dbname_t{"db"}, core::schema_t{}, core::relname_t{}});
+            INFO((reply.has_error() ? reply.error().what.c_str() : "ok"));
+            REQUIRE_FALSE(reply.has_error());
         }
     };
 
@@ -218,6 +215,7 @@ TEST_CASE("mysql executeQuery: a closed connector is refused with io_error and s
 
     auto added = stack.manager->addConnection(named_db_params(),"closing");
     REQUIRE_FALSE(added.has_error());
+    stack.discover("closing");
 
     auto outcome = stack.manager->executeQuery("closing", "SELECT 1", &no_rows).get();
     REQUIRE(outcome.has_error());
@@ -233,6 +231,7 @@ TEST_CASE("mysql executeQuery: a failed reconnect fails only this query and keep
 
     auto added = stack.manager->addConnection(named_db_params(),"unreachable");
     REQUIRE_FALSE(added.has_error());
+    stack.discover("unreachable");
 
     auto first = stack.manager->executeQuery("unreachable", "SELECT 1", &no_rows).get();
     REQUIRE(first.has_error());
@@ -280,15 +279,23 @@ TEST_CASE("mysql addConnection: a pool that was never started is refused with io
     REQUIRE_FALSE(stack.manager->hasConnection("too-early"));
 }
 
-TEST_CASE("mysql addConnection: a failed schema registration is reported and the connection is not kept") {
+TEST_CASE("mysql discovery: a refused discovery is the reply's error and removeConnection drops the connection") {
     auto* resource = std::pmr::new_delete_resource();
     mysql_stack stack{resource, &make_stub<undiscoverable_connector>};
     stack.start();
 
-    auto added = stack.manager->addConnection(named_db_params(),"undiscoverable");
-    REQUIRE(added.has_error());
-    REQUIRE(added.error().type == core::error_code_t::io_error);
-    REQUIRE(std::string{added.error().what.c_str()} == "simulated discovery failure");
+    auto added = stack.manager->addConnection(named_db_params(), "undiscoverable");
+    REQUIRE_FALSE(added.has_error());
+    auto reply = stack.backend->discover(qualified_name_t{core::uid_t{"undiscoverable"},
+                                                          core::dbname_t{"db"},
+                                                          core::schema_t{},
+                                                          core::relname_t{}});
+    REQUIRE(reply.has_error());
+    REQUIRE(reply.error().type == core::error_code_t::io_error);
+    REQUIRE(std::string{reply.error().what.c_str()} == "simulated discovery failure");
+
+    // What remote_backends_t does with a connection whose discovery failed.
+    stack.manager->removeConnection("undiscoverable");
     REQUIRE_FALSE(stack.manager->hasConnection("undiscoverable"));
     REQUIRE(stack.manager->totalConnections() == 0);
 
@@ -323,11 +330,7 @@ TEST_CASE("mysql addConnection: a malformed port is invalid_parameter and regist
 
 TEST_CASE("pg addConnection: a malformed port is invalid_parameter and registers nothing") {
     auto* resource = std::pmr::new_delete_resource();
-    auto otterbrix_manager = actor_zeta::spawn<db::OtterbrixManager>(
-        resource,
-        std::make_unique<SimpleMockOtterbrixManager>(mock_config{.resource = resource}));
-    auto catalog_manager = actor_zeta::spawn<mysql::CatalogManager>(resource, otterbrix_manager->address());
-    pg::ConnectorManager manager{resource, catalog_manager->address(), &pg_mock_connector_factory, 2};
+    pg::ConnectorManager manager{resource, &pg_mock_connector_factory, 2};
 
     for (const char* port : {"0", "70000", "-5432", "5432x"}) {
         INFO("port '" << port << "'");
@@ -349,11 +352,7 @@ TEST_CASE("pg addConnection: a malformed port is invalid_parameter and registers
 
 TEST_CASE("ch addConnection: a malformed port is invalid_parameter and registers nothing") {
     auto* resource = std::pmr::new_delete_resource();
-    auto otterbrix_manager = actor_zeta::spawn<db::OtterbrixManager>(
-        resource,
-        std::make_unique<SimpleMockOtterbrixManager>(mock_config{.resource = resource}));
-    auto catalog_manager = actor_zeta::spawn<mysql::CatalogManager>(resource, otterbrix_manager->address());
-    ch::ConnectorManager manager{resource, catalog_manager->address(), &ch_mock_connector_factory, 2};
+    ch::ConnectorManager manager{resource, &ch_mock_connector_factory, 2};
 
     for (const char* port : {"0", "65536", "-9000", "9000.0"}) {
         INFO("port '" << port << "'");

@@ -80,7 +80,7 @@ Run everything end-to-end — builds images if needed, starts databases, initial
 data, runs all benchmarks, and writes results.
 
 ```bash
-# Default: mysql + postgres frontends, the 5 cross-backend tests, 10 reps each
+# Default: mysql + postgres + arrow frontends, the 5 cross-backend tests, 10 reps each
 # (external_* s3/file tests are opt-in — see "External-table tests" below)
 ./benchmark/scripts/run_benchmark.sh
 
@@ -204,8 +204,8 @@ elapsed_ms : 45.2
 Five opt-in workloads that exercise the `CREATE EXTERNAL TABLE` / `COPY ... TO`
 grammar extensions. Each runs both a local-file (`/fixtures` mount) and an s3
 (seeded MinIO) source, so file vs s3 are directly comparable in the sub-test
-breakdown. `mysql` and `postgres` frontends only — `arrow` is excluded by the
-same JOIN serialisation bug as the default test set.
+breakdown. `mysql` and `postgres` frontends only — there is no arrow script for
+them (the Flight SQL DDL path is not covered), so `run_benchmark.sh` skips arrow.
 
 | Test                  | Workload                                                                                | Sub-tests |
 |-----------------------|-----------------------------------------------------------------------------------------|-----------|
@@ -230,7 +230,7 @@ The `bench_minio` s3 alias is declared in `benchmark/config.yaml` and
 registered at server startup (no runtime registration step).
 
 ```bash
-# All five external tests, both frontends
+# All five external tests, mysql + postgres (arrow is skipped: no arrow script)
 ./benchmark/scripts/run_benchmark.sh \
   --bench external_load external_join external_dump external_join_cross external_join_all \
   --repetitions 5

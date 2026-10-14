@@ -24,7 +24,8 @@ namespace frontend::mysql {
         std::string name;      // column name (or alias)
         std::string org_name;  // original column name
 
-        character_set charset = character_set::UTF8_GENERAL_CI;
+        // Text: the server's collation (protocol_const.hpp, SERVER_COLLATION_ID).
+        character_set charset = character_set::UTF8MB4_BIN;
         field_type column_type = field_type::MYSQL_TYPE_NULL;
         uint32_t column_length = 0;
         uint16_t column_flags = 0;

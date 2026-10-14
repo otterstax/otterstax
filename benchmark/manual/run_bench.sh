@@ -6,7 +6,8 @@
 #   ./benchmark/manual/run_bench.sh [--frontend F]... [--bench T]... [--repetitions N] [--out-dir DIR]
 #
 # Options:
-#   --frontend F    mysql | postgres | arrow  (repeatable; default: mysql postgres)
+#   --frontend F    mysql | postgres | arrow  (repeatable; default: all three;
+#                   arrow has no external_* / kafka_* scripts — those are skipped)
 #   --bench T [T..] Test name(s) to run, space-separated (default: cross-backend tests).
 #                   Values: simple_select complex_select join_same_instance
 #                           join_cross_engine join_all
@@ -84,6 +85,7 @@ echo ""
 
 PASS=0
 FAIL=0
+SKIP=0
 
 for frontend in "${FRONTENDS[@]}"; do
     port="$(_frontend_port "$frontend")"
@@ -91,6 +93,11 @@ for frontend in "${FRONTENDS[@]}"; do
 
     for test in "${TESTS[@]}"; do
         echo "--- $frontend / $test ---"
+        if [ ! -f "$BENCH_DIR/benchmarks/$frontend/$test.py" ]; then
+            echo "  SKIP: $frontend/$test (no benchmarks/$frontend/$test.py)"
+            SKIP=$((SKIP + 1))
+            continue
+        fi
         set +e
         docker run --rm \
             --network=bench_net \
@@ -126,5 +133,5 @@ docker run --rm \
     python /app/scripts/generate_summary.py /results
 
 echo ""
-echo "=== Done: $PASS passed, $FAIL failed ==="
+echo "=== Done: $PASS passed, $FAIL failed, $SKIP skipped ==="
 echo "    Results: $OUT_DIR"

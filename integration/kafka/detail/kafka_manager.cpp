@@ -41,8 +41,9 @@ namespace otterstax::kafka {
         assert(resource_ != nullptr);
         assert(log_.is_valid());
         log_->info("KafkaManager initialized (pollers {})", start_pollers_ ? "on" : "off");
-        // recover() is NOT called here: the ctor runs mid-spawn, before the scheduler
-        // pool is up; component_manager calls it once everything is initialised
+        // recover() is NOT called here: the ctor runs mid-spawn, while main.cpp is
+        // still assembling the process; main calls it once the connections
+        // are registered and the federation metadata is published
         loop_thread_ = std::thread([this] {
             std::pmr::list<in_flight_entry_t> in_flight(resource_);
             while (loop_running_.load(std::memory_order_acquire)) {
@@ -150,7 +151,7 @@ namespace otterstax::kafka {
     }
 
     actor_zeta::unique_future<cursor::cursor_t_ptr> KafkaManager::send_plan(logical_plan::execution_plan_t plan) {
-        // Async channel into the engine's manager_dispatcher_t (as OtterbrixManager uses)
+        // Async channel into the engine's manager_dispatcher_t (as otterstax::engine requests do)
         return actor_zeta::otterbrix::send(dispatcher_address_,
                                            &services::dispatcher::manager_dispatcher_t::execute_plan,
                                            components::session::session_id_t(),

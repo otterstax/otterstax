@@ -84,8 +84,9 @@ std::shared_ptr<arrow::Schema> arrow_schema_or_skip(benchmark::State& state,
 static void BM_ch_to_chunk_100(benchmark::State& state) {
     auto* res = std::pmr::new_delete_resource();
     auto block = make_ch_block(100);
+    const std::vector<clickhouse::Block> blocks{block};
     for (auto _ : state) {
-        auto chunk = tsl::ch_to_chunk(res, block);
+        auto chunk = tsl::ch_to_chunk(res, blocks, {});
         if (chunk.has_error()) {
             state.SkipWithError(chunk.error().what.c_str());
             break;
@@ -99,8 +100,9 @@ BENCHMARK(BM_ch_to_chunk_100);
 static void BM_ch_to_chunk_1k(benchmark::State& state) {
     auto* res = std::pmr::new_delete_resource();
     auto block = make_ch_block(1000);
+    const std::vector<clickhouse::Block> blocks{block};
     for (auto _ : state) {
-        auto chunk = tsl::ch_to_chunk(res, block);
+        auto chunk = tsl::ch_to_chunk(res, blocks, {});
         if (chunk.has_error()) {
             state.SkipWithError(chunk.error().what.c_str());
             break;
@@ -114,8 +116,9 @@ BENCHMARK(BM_ch_to_chunk_1k);
 static void BM_ch_to_chunk_10k(benchmark::State& state) {
     auto* res = std::pmr::new_delete_resource();
     auto block = make_ch_block(10000);
+    const std::vector<clickhouse::Block> blocks{block};
     for (auto _ : state) {
-        auto chunk = tsl::ch_to_chunk(res, block);
+        auto chunk = tsl::ch_to_chunk(res, blocks, {});
         if (chunk.has_error()) {
             state.SkipWithError(chunk.error().what.c_str());
             break;
@@ -129,8 +132,9 @@ BENCHMARK(BM_ch_to_chunk_10k);
 static void BM_ch_to_chunk_100k(benchmark::State& state) {
     auto* res = std::pmr::new_delete_resource();
     auto block = make_ch_block(100000);
+    const std::vector<clickhouse::Block> blocks{block};
     for (auto _ : state) {
-        auto chunk = tsl::ch_to_chunk(res, block);
+        auto chunk = tsl::ch_to_chunk(res, blocks, {});
         if (chunk.has_error()) {
             state.SkipWithError(chunk.error().what.c_str());
             break;
@@ -146,7 +150,7 @@ static void BM_ch_to_chunk_multiblock_10k(benchmark::State& state) {
     auto* res = std::pmr::new_delete_resource();
     std::vector<clickhouse::Block> blocks{make_ch_block(5000), make_ch_block(5000)};
     for (auto _ : state) {
-        auto chunk = tsl::ch_to_chunk(res, blocks);
+        auto chunk = tsl::ch_to_chunk(res, blocks, {});
         if (chunk.has_error()) {
             state.SkipWithError(chunk.error().what.c_str());
             break;
@@ -162,7 +166,7 @@ static void BM_ch_to_struct(benchmark::State& state) {
     auto* res  = std::pmr::new_delete_resource();
     auto block = make_ch_block(0); // zero rows, schema present
     for (auto _ : state) {
-        auto s = tsl::ch_to_struct(res, block);
+        auto s = tsl::ch_to_struct(res, block, {});
         benchmark::DoNotOptimize(s);
     }
 }
@@ -291,14 +295,15 @@ BENCHMARK(BM_chunk_to_arrow_schema_vec_50col);
 static void BM_flight_wire_full_100(benchmark::State& state) {
     auto* res = std::pmr::new_delete_resource();
     auto block = make_ch_block(100);
-    auto struct_t = tsl::ch_to_struct(res, block);
+    const std::vector<clickhouse::Block> blocks{block};
+    auto struct_t = tsl::ch_to_struct(res, block, {});
     auto schema = arrow_schema_or_skip(state, res, struct_t);
     if (!schema) {
         return;
     }
     const auto options = arrow::ipc::IpcWriteOptions::Defaults();
     for (auto _ : state) {
-        auto converted = tsl::ch_to_chunk(res, block);
+        auto converted = tsl::ch_to_chunk(res, blocks, {});
         if (converted.has_error()) {
             state.SkipWithError(converted.error().what.c_str());
             break;
@@ -320,14 +325,15 @@ BENCHMARK(BM_flight_wire_full_100);
 static void BM_flight_wire_full_1k(benchmark::State& state) {
     auto* res = std::pmr::new_delete_resource();
     auto block = make_ch_block(1000);
-    auto struct_t = tsl::ch_to_struct(res, block);
+    const std::vector<clickhouse::Block> blocks{block};
+    auto struct_t = tsl::ch_to_struct(res, block, {});
     auto schema = arrow_schema_or_skip(state, res, struct_t);
     if (!schema) {
         return;
     }
     const auto options = arrow::ipc::IpcWriteOptions::Defaults();
     for (auto _ : state) {
-        auto converted = tsl::ch_to_chunk(res, block);
+        auto converted = tsl::ch_to_chunk(res, blocks, {});
         if (converted.has_error()) {
             state.SkipWithError(converted.error().what.c_str());
             break;
@@ -349,14 +355,15 @@ BENCHMARK(BM_flight_wire_full_1k);
 static void BM_flight_wire_full_10k(benchmark::State& state) {
     auto* res = std::pmr::new_delete_resource();
     auto block = make_ch_block(10000);
-    auto struct_t = tsl::ch_to_struct(res, block);
+    const std::vector<clickhouse::Block> blocks{block};
+    auto struct_t = tsl::ch_to_struct(res, block, {});
     auto schema = arrow_schema_or_skip(state, res, struct_t);
     if (!schema) {
         return;
     }
     const auto options = arrow::ipc::IpcWriteOptions::Defaults();
     for (auto _ : state) {
-        auto converted = tsl::ch_to_chunk(res, block);
+        auto converted = tsl::ch_to_chunk(res, blocks, {});
         if (converted.has_error()) {
             state.SkipWithError(converted.error().what.c_str());
             break;

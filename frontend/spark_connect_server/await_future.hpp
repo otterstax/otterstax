@@ -9,10 +9,11 @@
 // steady_timer. Exponential backoff (16µs -> 1ms cap) keeps latency low for
 // fast paths while yielding the completion-queue thread for longer work.
 //
-// The contract is the bridge's: the worker's result_wrapper_t<T> on success,
-// AWAIT_TIMEOUT_CODE at the deadline, AWAIT_FAILED_CODE when the actor runtime
-// closed the channel, the error text on the caller's resource. The future is
-// held BY MOVE; nothing here throws.
+// The contract is the bridge's: an otterstax::awaited_t — the worker's
+// result_wrapper_t<T>, or the bridge's own failure (the deadline reached, the
+// channel closed by the actor runtime) told apart by its status, never by an
+// error code — the error text on the caller's resource. The future is held BY
+// MOVE; nothing here throws.
 
 #pragma once
 
@@ -43,7 +44,7 @@ namespace frontend::spark {
     // Await an actor-zeta future from inside an asio-grpc coroutine running on
     // an agrpc::GrpcExecutor. `fut` is consumed (moved in).
     template<typename T>
-    asio::awaitable<core::result_wrapper_t<T>, agrpc::GrpcExecutor>
+    asio::awaitable<otterstax::awaited_t<T>, agrpc::GrpcExecutor>
     await_future(actor_zeta::unique_future<core::result_wrapper_t<T>> fut,
                  std::pmr::memory_resource* resource,
                  std::chrono::milliseconds timeout = otterstax::DEFAULT_TIMEOUT) {
@@ -54,8 +55,7 @@ namespace frontend::spark {
 
         while (!fut.is_ready() && !fut.failed()) {
             if (std::chrono::steady_clock::now() >= deadline) {
-                co_return core::result_wrapper_t<T>{
-                    core::error_t{otterstax::AWAIT_TIMEOUT_CODE, std::pmr::string{"await deadline reached", resource}}};
+                co_return otterstax::await_timed_out<T>(resource);
             }
             co_await alarm.wait(std::chrono::system_clock::now() +
                                 std::chrono::duration_cast<std::chrono::system_clock::duration>(delay));
@@ -63,10 +63,9 @@ namespace frontend::spark {
         }
 
         if (fut.failed()) {
-            co_return core::result_wrapper_t<T>{
-                core::error_t{otterstax::AWAIT_FAILED_CODE, std::pmr::string{fut.error().message().c_str(), resource}}};
+            co_return otterstax::await_broken<T>(resource, fut.error());
         }
-        co_return std::move(fut).take_ready();
+        co_return otterstax::awaited_t<T>{std::move(fut).take_ready(), otterstax::await_status_t::answered};
     }
 
 } // namespace frontend::spark

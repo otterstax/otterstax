@@ -3,7 +3,7 @@
 
 """FlightSQL over otterbrix-internal tables: the GetFlightInfo / DoGet contract.
 
-GetFlightInfoStatement hands out the schema the Worker resolved at prepare time
+GetFlightInfoStatement hands out the schema the query session resolved at prepare time
 and DoGetStatement streams record batches over exactly that schema; nothing is
 re-derived from the result rows. Two things follow and are asserted here:
 

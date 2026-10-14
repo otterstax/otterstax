@@ -27,8 +27,8 @@ namespace mysql {
         , resource_(resource)
         // A strand over the pool, not the bare io_context: it serializes the
         // two completion handlers of the deadline-bounded connect (see
-        // connectWithTimeout). Queries are unaffected — their coroutines are
-        // spawned on the io_context and carry its executor.
+        // connectWithTimeout), and a statement runs on it too (runQuery_), so
+        // cancel() can emit its signal there.
         , conn_(asio::make_strand(io_ctx))
         , params_{std::move(params)}
         , status_{Status::Created}
@@ -61,6 +61,24 @@ namespace mysql {
     }
 
     Connector::~Connector() { close(); }
+
+    core::error_t Connector::cancelled_error() const {
+        return connection_error("[Run query] Connector with alias: " + alias_ + " was cancelled");
+    }
+
+    void Connector::cancel() noexcept {
+        OTX_ZONE_N("mysql::Connector::cancel");
+        cancel_->requested.store(true, std::memory_order_release);
+        try {
+            // The signal belongs to the strand: the emission is posted there, after the store above,
+            // so a statement either sees `requested` before its next operation or is in one whose
+            // slot the emission reaches.
+            asio::post(conn_.get_executor(),
+                       [state = cancel_] { state->signal.emit(asio::cancellation_type::terminal); });
+        } catch (...) {
+            // Posting allocates; without the emission the statement still stops at its next check.
+        }
+    }
 
     asio::awaitable<core::error_t> Connector::asyncConnect_(bm::diagnostics& diag) {
         constexpr std::chrono::seconds connect_timeout{10};

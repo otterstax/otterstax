@@ -12,6 +12,6 @@ logs
 log
 wal
 
-# NOT ignored on purpose: .conan-local/ carries the local-only otterbrix /
-# actor-zeta recipes (scripts/conan/export_local_packages.sh) that Dockerfile and
-# Dockerfile.test restore — TEMPORARY until OTB-tag.
+# NOT ignored on purpose: .conan-local/ carries the local-only otterbrix recipe
+# (scripts/conan/export_local_packages.sh) that Dockerfile and Dockerfile.test
+# restore — TEMPORARY until OTB-tag.

@@ -12,13 +12,13 @@
 // StartupMessage and consume the reply up to ReadyForQuery — so that the
 // connection is parked in its command-read loop, timer armed, when the trigger
 // fires. The PG pipeline cases stop the server while the connection holds a
-// prepared statement the Worker still keeps, so its teardown sends
-// Scheduler::close_statement while stop() joins the pool.
+// prepared statement its query session still keeps, so its teardown closes
+// that session while stop() joins the pool.
 
 #include "frontend/mysql_server/mysql_server.hpp"
 #include "frontend/postgres_server/postgres_server.hpp"
 #include "raw_wire_client.hpp"
-#include "scheduler_stack.hpp"
+#include "session_stack.hpp"
 
 #include <catch2/catch_all.hpp>
 
@@ -40,12 +40,12 @@ namespace {
     constexpr auto SHORT_TIMEOUT = 300ms;
 
     template<typename Server>
-    frontend::frontend_server_config make_config(const otterstax::test::scheduler_stack& stack,
+    frontend::frontend_server_config make_config(const otterstax::test::session_stack& stack,
                                                  std::chrono::milliseconds read_timeout) {
         return frontend::frontend_server_config{
             .resource = stack.resource,
             .port = 0,
-            .scheduler = stack.scheduler,
+            .sessions = stack.sessions,
             .read_timeout = read_timeout,
             .accept_retry_delay = std::chrono::milliseconds(frontend::ACCEPT_RETRY_DELAY_MS),
             .pool_size = 4,
@@ -55,7 +55,7 @@ namespace {
     // ---- scenarios ----------------------------------------------------------
 
     template<typename Server, typename Attach>
-    void stop_with_attached_clients(const otterstax::test::scheduler_stack& stack,
+    void stop_with_attached_clients(const otterstax::test::session_stack& stack,
                                     int cycles,
                                     int clients_per_cycle,
                                     Attach&& attach) {
@@ -103,7 +103,7 @@ namespace {
     }
 
     template<typename Server, typename Attach>
-    void idle_timeout_closes(const otterstax::test::scheduler_stack& stack, int cycles, Attach&& attach) {
+    void idle_timeout_closes(const otterstax::test::session_stack& stack, int cycles, Attach&& attach) {
         Server server(make_config<Server>(stack, SHORT_TIMEOUT));
         server.start();
         for (int i = 0; i < cycles; ++i) {
@@ -121,7 +121,7 @@ namespace {
     }
 
     template<typename Server, typename Attach>
-    void client_drops_with_read_pending(const otterstax::test::scheduler_stack& stack, int cycles, Attach&& attach) {
+    void client_drops_with_read_pending(const otterstax::test::session_stack& stack, int cycles, Attach&& attach) {
         Server server(make_config<Server>(stack, PRODUCTION_TIMEOUT));
         server.start();
         for (int i = 0; i < cycles; ++i) {
@@ -145,12 +145,12 @@ namespace {
     // ---- PG extended query: a pipeline the client abandons ------------------
     //
     // The client drops its socket in the middle of an extended-query pipeline
-    // while the connection holds a prepared statement the Worker still keeps
+    // while the connection holds a prepared statement its session still keeps
     // (never executed), and the server stops at once: the connection's teardown
-    // (finish_impl) sends Scheduler::close_statement while stop() is joining the
+    // (finish_impl) closes the query session while stop() is joining the
     // pool. It is also the state a failed REQUIRE leaves when it unwinds a test
     // body: the client is destroyed first, then the server (stop() in its
-    // destructor), then the scheduler stack.
+    // destructor), then the session stack.
 
     std::vector<uint8_t> join_frames(std::initializer_list<std::vector<uint8_t>> frames) {
         std::vector<uint8_t> out;
@@ -203,7 +203,7 @@ namespace {
 
     // The client socket is closed before stop().
     template<typename Drop>
-    void pg_stop_after_client_drop(const otterstax::test::scheduler_stack& stack, int cycles, Drop&& drop) {
+    void pg_stop_after_client_drop(const otterstax::test::session_stack& stack, int cycles, Drop&& drop) {
         for (int i = 0; i < cycles; ++i) {
             frontend::postgres::postgres_server server(
                 make_config<frontend::postgres::postgres_server>(stack, PRODUCTION_TIMEOUT));
@@ -220,7 +220,7 @@ namespace {
 
     // stop() with the client still attached; the client then sees the close.
     template<typename Drop>
-    void pg_stop_with_client_attached(const otterstax::test::scheduler_stack& stack, int cycles, Drop&& drop) {
+    void pg_stop_with_client_attached(const otterstax::test::session_stack& stack, int cycles, Drop&& drop) {
         for (int i = 0; i < cycles; ++i) {
             frontend::postgres::postgres_server server(
                 make_config<frontend::postgres::postgres_server>(stack, PRODUCTION_TIMEOUT));
@@ -235,12 +235,12 @@ namespace {
     }
 
     // The destruction order of a failed REQUIRE's unwind, each cycle on a
-    // scheduler stack of its own: the client, the server (stop() in its
+    // session stack of its own: the client, the server (stop() in its
     // destructor), the stack.
     template<typename Drop>
     void pg_teardown_in_unwind_order(const std::string& data_dir, int cycles, Drop&& drop) {
         for (int i = 0; i < cycles; ++i) {
-            otterstax::test::scheduler_stack_owner owner(data_dir, &make_parser);
+            otterstax::test::session_stack_owner owner(data_dir);
             frontend::postgres::postgres_server server(
                 make_config<frontend::postgres::postgres_server>(owner.stack(), PRODUCTION_TIMEOUT));
             server.start();
@@ -253,55 +253,55 @@ namespace {
     // Cycles per pipeline shape: each one stops the server at whatever point of
     // the connection's work it has reached. Kept to seconds under ASAN.
     constexpr int PIPELINE_DROP_CYCLES = 50;
-    // Each cycle builds and tears down a scheduler stack of its own.
+    // Each cycle builds and tears down a session stack of its own.
     constexpr int UNWIND_ORDER_CYCLES = 5;
 
 } // namespace
 
 TEST_CASE("frontend_connection: mysql stop() with clients attached after the handshake") {
-    otterstax::test::scheduler_stack_owner owner("/tmp/otterstax_frontend_lifetime_mysql_stop", &make_parser);
+    otterstax::test::session_stack_owner owner("/tmp/otterstax_frontend_lifetime_mysql_stop");
     stop_with_attached_clients<frontend::mysql::mysql_server>(owner.stack(), 20, 3, &mysql_handshake);
 }
 
 TEST_CASE("frontend_connection: postgres stop() with clients attached after startup") {
-    otterstax::test::scheduler_stack_owner owner("/tmp/otterstax_frontend_lifetime_pg_stop", &make_parser);
+    otterstax::test::session_stack_owner owner("/tmp/otterstax_frontend_lifetime_pg_stop");
     stop_with_attached_clients<frontend::postgres::postgres_server>(owner.stack(), 20, 3, &pg_startup);
 }
 
 TEST_CASE("frontend_connection: postgres stop() with a silent client in the initial read") {
-    otterstax::test::scheduler_stack_owner owner("/tmp/otterstax_frontend_lifetime_pg_stop_silent", &make_parser);
+    otterstax::test::session_stack_owner owner("/tmp/otterstax_frontend_lifetime_pg_stop_silent");
     stop_with_attached_clients<frontend::postgres::postgres_server>(owner.stack(), 20, 3, &attach_silent);
 }
 
 TEST_CASE("frontend_connection: mysql idle read timeout closes the connection and frees the slot") {
-    otterstax::test::scheduler_stack_owner owner("/tmp/otterstax_frontend_lifetime_mysql_idle", &make_parser);
+    otterstax::test::session_stack_owner owner("/tmp/otterstax_frontend_lifetime_mysql_idle");
     idle_timeout_closes<frontend::mysql::mysql_server>(owner.stack(), 5, &mysql_handshake);
 }
 
 TEST_CASE("frontend_connection: postgres idle read timeout closes the connection and frees the slot") {
-    otterstax::test::scheduler_stack_owner owner("/tmp/otterstax_frontend_lifetime_pg_idle", &make_parser);
+    otterstax::test::session_stack_owner owner("/tmp/otterstax_frontend_lifetime_pg_idle");
     idle_timeout_closes<frontend::postgres::postgres_server>(owner.stack(), 5, &pg_startup);
 }
 
 TEST_CASE("frontend_connection: postgres initial-read timeout closes a silent client") {
-    otterstax::test::scheduler_stack_owner owner("/tmp/otterstax_frontend_lifetime_pg_idle_silent", &make_parser);
+    otterstax::test::session_stack_owner owner("/tmp/otterstax_frontend_lifetime_pg_idle_silent");
     idle_timeout_closes<frontend::postgres::postgres_server>(owner.stack(), 5, &attach_silent);
 }
 
 TEST_CASE("frontend_connection: mysql client drops the socket while a read is pending") {
-    otterstax::test::scheduler_stack_owner owner("/tmp/otterstax_frontend_lifetime_mysql_drop", &make_parser);
+    otterstax::test::session_stack_owner owner("/tmp/otterstax_frontend_lifetime_mysql_drop");
     client_drops_with_read_pending<frontend::mysql::mysql_server>(owner.stack(), 30, &mysql_handshake);
 }
 
 TEST_CASE("frontend_connection: postgres client drops the socket while a read is pending") {
-    otterstax::test::scheduler_stack_owner owner("/tmp/otterstax_frontend_lifetime_pg_drop", &make_parser);
+    otterstax::test::session_stack_owner owner("/tmp/otterstax_frontend_lifetime_pg_drop");
     client_drops_with_read_pending<frontend::postgres::postgres_server>(owner.stack(), 30, &pg_startup);
 }
 
 TEST_CASE("frontend_connection: postgres startup message larger than the read buffer is refused") {
     // A StartupMessage whose declared length exceeds the connection's 4 KiB read
     // buffer: the frontend must grow the buffer (or refuse), never read past it.
-    otterstax::test::scheduler_stack_owner owner("/tmp/otterstax_frontend_lifetime_pg_bigstartup", &make_parser);
+    otterstax::test::session_stack_owner owner("/tmp/otterstax_frontend_lifetime_pg_bigstartup");
     frontend::postgres::postgres_server server(
         make_config<frontend::postgres::postgres_server>(owner.stack(), PRODUCTION_TIMEOUT));
     server.start();
@@ -325,7 +325,7 @@ TEST_CASE("frontend_connection: postgres startup message larger than the read bu
 }
 
 TEST_CASE("frontend_connection: postgres stop() after the client drops a pipeline holding an unexecuted statement") {
-    otterstax::test::scheduler_stack_owner owner("/tmp/otterstax_frontend_lifetime_pg_pipeline_drop", &make_parser);
+    otterstax::test::session_stack_owner owner("/tmp/otterstax_frontend_lifetime_pg_pipeline_drop");
 
     SECTION("Parse Describe and Sync answered up to ParseComplete") {
         pg_stop_after_client_drop(owner.stack(), PIPELINE_DROP_CYCLES, &drop_after_parse_complete);
@@ -341,7 +341,7 @@ TEST_CASE("frontend_connection: postgres stop() after the client drops a pipelin
 }
 
 TEST_CASE("frontend_connection: postgres stop() with a client attached to a pipeline holding an unexecuted statement") {
-    otterstax::test::scheduler_stack_owner owner("/tmp/otterstax_frontend_lifetime_pg_pipeline_attached", &make_parser);
+    otterstax::test::session_stack_owner owner("/tmp/otterstax_frontend_lifetime_pg_pipeline_attached");
 
     SECTION("Parse Describe and Sync answered up to ParseComplete") {
         pg_stop_with_client_attached(owner.stack(), PIPELINE_DROP_CYCLES, &drop_after_parse_complete);

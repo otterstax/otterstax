@@ -34,7 +34,7 @@ namespace db {
         std::pmr::memory_resource* resource() const noexcept { return resource_; }
 
         // Every handler keeps the callee's error code (s3 connector / file
-        // manager) and only prefixes the message, so the Worker can report the
+        // manager) and only prefixes the message, so the query session can report the
         // real cause (do_not_exists, invalid_parameter, io_error, ...).
 
         // Loads s3_path ("bucket/key") into a new database.table. `format` is the

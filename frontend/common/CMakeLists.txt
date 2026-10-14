@@ -26,6 +26,8 @@ target_link_libraries(common_server PUBLIC
     Boost::boost
     otterbrix::otterbrix
     actor-zeta::actor-zeta
+    session
+    OpenSSL::Crypto  # secure_random_bytes (utils.cpp)
 )
 
 target_include_directories(common_server PUBLIC

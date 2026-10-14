@@ -49,6 +49,25 @@ namespace otterstax::catalog {
         return query;
     }
 
+    std::pmr::string make_primary_keys_query(std::pmr::memory_resource* resource,
+                                             std::string_view schema,
+                                             std::string_view table) {
+        OTX_ZONE_N("catalog::make_primary_keys_query");
+        std::pmr::string query{resource};
+        query.append("SELECT c.relname, a.attname FROM pg_catalog.pg_index i "
+                     "JOIN pg_catalog.pg_class c ON c.oid = i.indrelid "
+                     "JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace "
+                     "JOIN pg_catalog.pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) "
+                     "WHERE i.indisprimary AND n.nspname = ");
+        query.append(escape_sql_literal(resource, schema, backend_type_t::PostgreSQL));
+        if (!table.empty()) {
+            query.append(" AND c.relname = ");
+            query.append(escape_sql_literal(resource, table, backend_type_t::PostgreSQL));
+        }
+        query.append(" ORDER BY c.relname, array_position(i.indkey::int2[], a.attnum);");
+        return query;
+    }
+
     std::pmr::string
     make_named_types_query(std::pmr::memory_resource* resource, std::string_view database, std::string_view table) {
         OTX_ZONE_N("catalog::make_named_types_query");
@@ -75,9 +94,8 @@ namespace otterstax::catalog {
                                                  param.add_parameter(types::logical_value_t(resource, 1)),
                                                  param.add_parameter(types::logical_value_t(resource, 0)))));
 
-        otterstax::names::resolved_target_t probe_target{components::catalog::INVALID_OID, name, {}};
-        std::pmr::vector<external_entry_t> empty_batch{resource};
-        return sql_gen::generate_query(node, &param.parameters(), backend, probe_target, empty_batch, resource);
+        sql_gen::statement_target_t probe_target{name};
+        return sql_gen::generate_query(node, &param.parameters(), backend, probe_target, resource);
     }
 
     core::error_t make_discovery_error(std::pmr::memory_resource* resource,

@@ -8,17 +8,11 @@
 #
 #   FROM <backend>.<…> c JOIN <local_db>.<table> w ON <string-key>
 #
-# Mechanism (full citations in step_4's analysis):
-#   1. Parser drops the local table from `external_nodes`
-#      (otterbrix/parser/parser.cpp:212).
-#   2. `CatalogManager::update_backend_type_impl` sees only the backend → the
-#      query is classified as that single backend, not Mixed.
-#   3. The backend manager fetches just its slice (`generate_select` emits one
-#      table per FROM clause), substitutes the customers/campaigns node with
-#      `make_node_raw_data` (mirrors integration/sql/connection_manager.cpp:162),
-#      and hands the mutated plan to OtterbrixManager.
-#   4. The engine resolves the local side by its stamped `table_oid` against
-#      its own pg_catalog and JOINs raw_data ⋈ engine-resident rows.
+# Mechanism: the engine resolves the local table from its own catalog and the
+# backend table through the federation (otterbrix/federation: the uid-qualified
+# name answered from federation.remote_columns), reads the backend table through
+# its storage's scan (the JOIN is not pushed down: one side is local) and JOINs
+# the two in-process.
 #
 # The previously-disabled version of this test used a bigint JOIN key, which
 # silently dropped every row because of an int width mismatch between the
@@ -144,7 +138,7 @@ def run(local=False):
 
     print(f"  ✓ {SQL_BACKEND_TABLE} ⋈ {INTERNAL_DB}.{LOCAL_TABLE} "
           f"on campaign_name (string=string) → {len(rows)} rows; "
-          f"backend slice fetched, raw_data ⋈ engine-resident table executed in otterbrix")
+          f"backend table read through its federation scan, JOINed in the engine")
 
     conn.close()
     tester.cleanup()

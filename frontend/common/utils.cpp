@@ -3,6 +3,14 @@
 
 #include "utils.hpp"
 
+#include "utility/tracy_profiler.hpp"
+
+#include <openssl/rand.h>
+
+#include <algorithm>
+#include <cassert>
+#include <limits>
+
 namespace frontend {
     namespace mysql {
         std::optional<field_type> get_field_type(components::types::logical_type log_type) {
@@ -202,16 +210,61 @@ namespace frontend {
         return "<unlisted logical_type>";
     }
 
-    std::vector<uint8_t> generate_backend_key(size_t size) {
-        static std::random_device rd;
-        static std::mt19937 gen(rd());
-        std::vector<uint8_t> key(size);
-        std::uniform_int_distribution<uint8_t> dist_byte(0, 255);
-
-        for (size_t i = 0; i < size; ++i) {
-            key[i] = dist_byte(gen);
+    std::optional<std::vector<uint8_t>> secure_random_bytes(size_t size) {
+        OTX_ZONE_N("frontend::secure_random_bytes");
+        assert(size <= static_cast<size_t>(std::numeric_limits<int>::max()));
+        std::vector<uint8_t> bytes(size);
+        // OpenSSL's DRBG: thread-safe (a DRBG per thread since 1.1.1, reseeded
+        // from the OS and after fork), so concurrent handshakes share no state.
+        if (size > 0 && RAND_bytes(bytes.data(), static_cast<int>(size)) != 1) {
+            return std::nullopt;
         }
-        return key;
+        return bytes;
+    }
+
+    std::string hex_encode(const std::vector<uint8_t>& bytes) {
+        static constexpr char kHex[] = "0123456789abcdef";
+        std::string out;
+        out.reserve(bytes.size() * 2);
+        for (const uint8_t b : bytes) {
+            out.push_back(kHex[b >> 4]);
+            out.push_back(kHex[b & 0x0F]);
+        }
+        return out;
+    }
+
+    std::optional<std::string> secure_random_hex(size_t size) {
+        auto bytes = secure_random_bytes(size);
+        if (!bytes.has_value()) {
+            return std::nullopt;
+        }
+        return hex_encode(*bytes);
+    }
+
+    std::string uuid_v4_string(const std::array<uint8_t, 16>& bytes) {
+        std::vector<uint8_t> b(bytes.begin(), bytes.end());
+        b[6] = static_cast<uint8_t>((b[6] & 0x0F) | 0x40); // version 4
+        b[8] = static_cast<uint8_t>((b[8] & 0x3F) | 0x80); // variant 10xx (RFC 9562)
+        const std::string hex = hex_encode(b);
+        std::string out;
+        out.reserve(36);
+        out.append(hex, 0, 8).push_back('-');
+        out.append(hex, 8, 4).push_back('-');
+        out.append(hex, 12, 4).push_back('-');
+        out.append(hex, 16, 4).push_back('-');
+        out.append(hex, 20, 12);
+        return out;
+    }
+
+    std::optional<std::string> secure_uuid_v4() {
+        OTX_ZONE_N("frontend::secure_uuid_v4");
+        auto bytes = secure_random_bytes(16);
+        if (!bytes.has_value()) {
+            return std::nullopt;
+        }
+        std::array<uint8_t, 16> raw{};
+        std::copy(bytes->begin(), bytes->end(), raw.begin());
+        return uuid_v4_string(raw);
     }
 
     std::string hex_dump(const std::vector<uint8_t>& data, size_t max_bytes) {

@@ -6,6 +6,7 @@
 #include "utility/tracy_profiler.hpp"
 
 #include <components/expressions/function_expression.hpp>
+#include <components/logical_plan/node_join.hpp>
 #include <core/result_wrapper.hpp>
 
 #include <algorithm>
@@ -46,27 +47,7 @@ namespace {
                                            logical_plan::parameter_node_t* params,
                                            cursor::cursor_t_ptr catalog,
                                            const std::pmr::map<qualified_name_t, size_t>& dependencies) {
-        // A stub child IS this aggregate's input relation: the statement's FROM
-        // is a federated sub-query, whose columns the backend described onto the
-        // stub (ClickhouseManager::describe). The aggregate itself names no table
-        // then — it is the transformer's unnamed derived-table wrapper — so the
-        // catalog lookup below has nothing to answer with and the projection is
-        // resolved against the described columns instead. A stub no backend
-        // described carries no STRUCT and is left to that lookup, unchanged.
-        for (const auto& child : node.children()) {
-            if (child->type() != logical_plan::node_type::unused) {
-                continue;
-            }
-            const auto& stub = static_cast<const schema_utils::schema_node_t&>(*child);
-            if (stub.schema().type() != logical_type::STRUCT) {
-                continue;
-            }
-            const auto& fields = stub.schema().child_types();
-            std::pmr::vector<types::complex_logical_type> types_vec(fields.begin(), fields.end(), node.resource());
-            return schema_utils::aggregate_filter_schema(node, params, types_vec);
-        }
-
-        const qualified_name_t lookup_key = schema_utils::agg_key(node);
+        const qualified_name_t lookup_key = node.target();
         if (auto it = dependencies.find(lookup_key); it != dependencies.end()) {
             if (catalog->size() > it->second && catalog->type_data()[it->second].type() == logical_type::STRUCT) {
                 const auto& fields = catalog->type_data()[it->second].child_types();
@@ -86,10 +67,6 @@ namespace {
                                 cursor::cursor_t_ptr catalog,
                                 const std::pmr::map<qualified_name_t, size_t>& dependencies) {
         switch (node.type()) {
-            case logical_plan::node_type::unused: {
-                auto& schema = static_cast<const schema_utils::schema_node_t&>(node);
-                return schema.schema();
-            }
             case logical_plan::node_type::aggregate_t:
                 return compute_aggregate(static_cast<const logical_plan::node_aggregate_t&>(node),
                                          params,
@@ -99,54 +76,38 @@ namespace {
                 return logical_type::NA;
         }
     }
+
+    types::complex_logical_type compute_join_schema(const logical_plan::node_join_t& node,
+                                                    logical_plan::parameter_node_t* params,
+                                                    cursor::cursor_t_ptr catalog,
+                                                    const std::pmr::map<qualified_name_t, size_t>& dependencies) {
+        OTX_ZONE_N("schema_utils::compute_join_schema");
+        assert(node.children().size() == 2);
+
+        // A join node's children ARE its two inputs in SQL order: the transformer
+        // appends the left side first and the right side second, and for a
+        // left-deep tree the inner join node is the one it appends first
+        // (components/sql/transformer/impl/transform_select.cpp, join_dfs). Since
+        // merge_schemas keeps the order of what it is given, each side has to be
+        // passed as the side it is.
+        if (node.children().front()->type() == logical_plan::node_type::join_t) {
+            // recursion: the left side is itself a join
+            auto left = compute_join_schema(static_cast<const logical_plan::node_join_t&>(*node.children().front()),
+                                            params,
+                                            catalog,
+                                            dependencies);
+            auto right = compute_aggregate_or_schema(*node.children().back(), params, catalog, dependencies);
+            return schema_utils::merge_schemas(left, right);
+        }
+
+        // leaf
+        auto left = compute_aggregate_or_schema(*node.children().front(), params, catalog, dependencies);
+        auto right = compute_aggregate_or_schema(*node.children().back(), params, catalog, dependencies);
+        return schema_utils::merge_schemas(left, right);
+    }
 } // namespace
 
 namespace schema_utils {
-    schema_node_t::schema_node_t(const qualified_name_t& name,
-                                 complex_logical_type&& schema,
-                                 logical_plan::node_aggregate_t&& agg_node)
-        : logical_plan::node_t(agg_node.resource(), logical_plan::node_type::unused)
-        , name_(name)
-        , schema_(std::move(schema))
-        , agg_node_(new components::logical_plan::node_aggregate_t(std::move(agg_node)))
-        , qualifiers_(resource()) {}
-
-    schema_node_t::schema_node_t(std::pmr::memory_resource* resource,
-                                 const qualified_name_t& name,
-                                 std::string_view raw_sql,
-                                 const std::pmr::vector<otterstax::parser::qualifier_rewrite_t>& qualifiers)
-        : logical_plan::node_t(resource, logical_plan::node_type::unused)
-        , name_(name)
-        , schema_()
-        , agg_node_(logical_plan::make_node_aggregate(
-              resource,
-              qualified_name_t{name.unique_identifier, name.database, core::schema_t{}, name.collection}))
-        , raw_sql_(std::pmr::string{raw_sql, resource})
-        , qualifiers_(qualifiers, resource) {}
-
-    const complex_logical_type& schema_node_t::schema() const { return schema_; }
-
-    void schema_node_t::set_schema(complex_logical_type&& schema) { schema_ = std::move(schema); }
-
-    const components::logical_plan::node_aggregate_ptr schema_node_t::agg_node() { return agg_node_; }
-
-    expressions::hash_t schema_node_t::hash_impl() const { return 0; }
-
-    std::string schema_node_t::to_string_impl() const { return ""; }
-
-    node_schema_ptr make_node_schema(const qualified_name_t& name,
-                                     complex_logical_type&& schema,
-                                     logical_plan::node_aggregate_t&& agg_node) {
-        return {new schema_node_t(name, std::move(schema), std::move(agg_node))};
-    }
-
-    node_schema_ptr make_node_schema_raw(std::pmr::memory_resource* resource,
-                                         const qualified_name_t& name,
-                                         std::string_view raw_sql,
-                                         const std::pmr::vector<otterstax::parser::qualifier_rewrite_t>& qualifiers) {
-        return {new schema_node_t(resource, name, raw_sql, qualifiers)};
-    }
-
     complex_logical_type aggregate_filter_schema(const logical_plan::node_aggregate_t& node,
                                                  logical_plan::parameter_node_t* params,
                                                  const std::pmr::vector<complex_logical_type>& schema_types) {
@@ -209,28 +170,13 @@ namespace schema_utils {
                 // from its argument: UBIGINT, for COUNT(*) and COUNT(x) alike
                 // (aggregate.cpp:503 and :508, output_type::fixed(UBIGINT), with
                 // count_finalize at :401 writing through output.data<uint64_t>()). It is
-                // also the one kernel type that holds for the backends this same
-                // computation types statements for (CatalogManager::get_catalog_schema): a
-                // count is an unsigned 64-bit number on MySQL (BIGINT UNSIGNED, which
-                // mysql_to_chunk reads back as UBIGINT) and on ClickHouse (UInt64), and
-                // PostgreSQL's signed int8 carries the same non-negative value in the same
-                // width, so no wire is told a type that cannot hold what arrives.
+                // also the type a remote count is held to when it comes back
+                // (otterbrix/federation, conform_to_result).
                 return types::logical_type::UBIGINT;
             }
-            // SUM and AVG are deliberately NOT the engine's answer. Both kernels are
-            // output_type::computed(same_type_resolver(0)) as well (aggregate.cpp:443,
-            // :527): the engine sums and averages IN the argument's own type, so SUM over
-            // an INTEGER column is INTEGER and AVG over one is integer division. No backend
-            // agrees — MySQL's AVG is DOUBLE and its SUM of an integer column DECIMAL,
-            // PostgreSQL's sum(int4) is int8 and avg(int4) numeric — and this one
-            // computation has no way to tell which executor it is typing for. Narrowing
-            // them to the kernel rule would trade today's mismatch on the local engine for
-            // a worse one on every remote path: an INTEGER announced where a DOUBLE or an
-            // int8 arrives differs in width AND kind, where COUNT above differs only in
-            // signedness over the same 64-bit non-negative value. Until the type comes from
-            // whoever executes the statement — a prepare-time probe like
-            // ClickhouseManager::describe, or the backend threaded in here — these two stay
-            // the answer the remote paths were built on.
+            // SUM and AVG follow the engine's rule for an integer argument (Trino's): an
+            // integer sum is BIGINT, an average DOUBLE. A remote answer is held to the same
+            // types (otterbrix/federation, conform_to_result).
             if (fn == "sum") {
                 return types::logical_type::BIGINT;
             }
@@ -329,35 +275,6 @@ namespace schema_utils {
         std::pmr::vector<types::complex_logical_type> result_types(node.resource());
         result_types.emplace_back(std::move(schema));
         return cursor::make_cursor(node.resource(), std::move(result_types));
-    }
-
-    types::complex_logical_type compute_join_schema(const logical_plan::node_join_t& node,
-                                                    logical_plan::parameter_node_t* params,
-                                                    cursor::cursor_t_ptr catalog,
-                                                    const std::pmr::map<qualified_name_t, size_t>& dependencies) {
-        OTX_ZONE_N("schema_utils::compute_join_schema");
-        assert(node.children().size() == 2);
-
-        // A join node's children ARE its two inputs in SQL order: the transformer
-        // appends the left side first and the right side second, and for a
-        // left-deep tree the inner join node is the one it appends first
-        // (components/sql/transformer/impl/transform_select.cpp, join_dfs). Since
-        // merge_schemas keeps the order of what it is given, each side has to be
-        // passed as the side it is.
-        if (node.children().front()->type() == logical_plan::node_type::join_t) {
-            // recursion: the left side is itself a join
-            auto left = compute_join_schema(static_cast<const logical_plan::node_join_t&>(*node.children().front()),
-                                            params,
-                                            catalog,
-                                            dependencies);
-            auto right = compute_aggregate_or_schema(*node.children().back(), params, catalog, dependencies);
-            return merge_schemas(left, right);
-        }
-
-        // leaf
-        auto left = compute_aggregate_or_schema(*node.children().front(), params, catalog, dependencies);
-        auto right = compute_aggregate_or_schema(*node.children().back(), params, catalog, dependencies);
-        return merge_schemas(left, right);
     }
 
     complex_logical_type merge_schemas(const complex_logical_type& left, const complex_logical_type& right) {

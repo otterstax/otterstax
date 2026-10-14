@@ -5,10 +5,11 @@
 // picks up an actor result:
 //
 //   ok      -> the waiter really blocks until the producer answers
-//   timeout -> it gives up at the deadline, reports AWAIT_TIMEOUT_CODE
-//   error   -> a producer-side failure wakes it early and passes through as-is
+//   timeout -> it gives up at the deadline: status timed_out
+//   error   -> a producer-side failure wakes it early and passes through as-is,
+//              status answered whatever its code
 //   failed  -> actor-zeta's own failure channel (`promise::error`, also the
-//              cancellation channel) wakes it early as AWAIT_FAILED_CODE
+//              cancellation channel) wakes it early: status broken
 //
 // Every message the bridge creates lives on the resource the caller hands in.
 // Catch2 assertions are not thread-safe: the producer threads only record what
@@ -35,9 +36,10 @@ namespace {
     using payload_t = std::pmr::string;
     using result_t = core::result_wrapper_t<payload_t>;
     using future_t = actor_zeta::unique_future<result_t>;
+    using awaited_t = otterstax::awaited_t<payload_t>;
 
     // Drive the bridge exactly the way a frontend handler does.
-    result_t await_on_io(future_t fut, std::chrono::milliseconds timeout, std::pmr::memory_resource* resource) {
+    awaited_t await_on_io(future_t fut, std::chrono::milliseconds timeout, std::pmr::memory_resource* resource) {
         return otterstax::await_future_blocking<payload_t>(std::move(fut), resource, timeout);
     }
 
@@ -65,6 +67,7 @@ TEST_CASE("asio_future_bridge: ok") {
     auto result = await_on_io(std::move(fut), 5000ms, &resource);
     const auto duration = elapsed_ms_since(start);
 
+    REQUIRE(result.status() == otterstax::await_status_t::answered);
     REQUIRE_FALSE(result.has_error());
     REQUIRE(result.value() == "Hello, World!");
     // Really waited for the producer, and woke on it rather than on the deadline.
@@ -103,9 +106,11 @@ TEST_CASE("asio_future_bridge: timeout") {
     REQUIRE(consumer_was_gone.load());
 
     REQUIRE(result.has_error());
-    // The frontends branch on the code to report a timeout rather than a query
-    // error, so it is part of the contract — the message is not.
-    REQUIRE(result.error().type == otterstax::AWAIT_TIMEOUT_CODE);
+    // The frontends branch on the status to report a timeout rather than a
+    // query error, so it is part of the contract — the code and the message
+    // are not.
+    REQUIRE(result.timed_out());
+    REQUIRE(result.status() == otterstax::await_status_t::timed_out);
     REQUIRE(result.error().what.get_allocator().resource() == &resource);
     REQUIRE(duration >= 200);
     REQUIRE(duration < 260);
@@ -133,6 +138,8 @@ TEST_CASE("asio_future_bridge: error") {
     const auto duration = elapsed_ms_since(start);
 
     REQUIRE(result.has_error());
+    REQUIRE(result.status() == otterstax::await_status_t::answered);
+    REQUIRE_FALSE(result.timed_out());
     // The worker's error passes through untouched: same code, same message, and
     // the message still lives on the producer's resource (moved, never copied).
     REQUIRE(result.error().type == core::error_code_t::sql_parse_error);
@@ -167,18 +174,33 @@ TEST_CASE("asio_future_bridge: infra failure") {
     const auto duration = elapsed_ms_since(start);
 
     REQUIRE(result.has_error());
-    REQUIRE(result.error().type == otterstax::AWAIT_FAILED_CODE);
+    REQUIRE(result.status() == otterstax::await_status_t::broken);
+    REQUIRE_FALSE(result.timed_out());
     REQUIRE_FALSE(result.error().what.empty());
     REQUIRE(result.error().what.get_allocator().resource() == &resource);
     REQUIRE(duration >= 100);
     REQUIRE(duration < 180);
 }
 
-TEST_CASE("asio_future_bridge: timeout and infra failure are distinct codes") {
-    // A frontend maps the timeout to its protocol's "query cancelled" error and
-    // everything else to a generic failure, which only works while the two
-    // bridge codes differ from each other.
-    STATIC_REQUIRE(otterstax::AWAIT_TIMEOUT_CODE != otterstax::AWAIT_FAILED_CODE);
-    STATIC_REQUIRE(otterstax::AWAIT_TIMEOUT_CODE != core::error_code_t::other_error);
-    STATIC_REQUIRE(otterstax::AWAIT_TIMEOUT_CODE != core::error_code_t::none);
+// The engine answers with every code the bridge could pick for itself —
+// transaction_inactive among them (manager_dispatcher_t's BEGIN that reached no
+// transaction, txn_accumulate_msg) — so an engine answer carrying it must reach
+// the frontend as the engine's error, never as the bridge's timeout.
+TEST_CASE("asio_future_bridge: a worker error with any code is not a timeout") {
+    std::pmr::synchronized_pool_resource resource;
+    for (const auto code : {core::error_code_t::transaction_inactive,
+                            core::error_code_t::other_error,
+                            core::error_code_t::io_error,
+                            core::error_code_t::connection_closed}) {
+        actor_zeta::promise<result_t> producer{&resource};
+        auto fut = producer.get_future();
+        producer.set_value(result_t{core::error_t{code, std::pmr::string{"engine said no", &resource}}});
+
+        auto result = await_on_io(std::move(fut), 2000ms, &resource);
+        REQUIRE(result.status() == otterstax::await_status_t::answered);
+        REQUIRE_FALSE(result.timed_out());
+        REQUIRE(result.has_error());
+        REQUIRE(result.error().type == code);
+        REQUIRE(result.error().what == "engine said no");
+    }
 }

@@ -6,7 +6,11 @@
 #include "errors.hpp"
 #include "utility/logger.hpp"
 #include "utility/tracy_profiler.hpp"
+#include <clickhouse/base/socket.h>
 #include <clickhouse/exceptions.h>
+
+#include <sys/socket.h>
+
 #include <chrono>
 #include <functional>
 #include <memory>
@@ -24,7 +28,7 @@ namespace ch {
         // Pong Ping() waits for, every packet of a query. A backend that
         // accepted the connection and never answered therefore froze the
         // calling thread for good; at server start that is the startup thread
-        // inside ComponentManager::register_connections, and the wire-protocol
+        // inside remote_backends_t::open, and the wire-protocol
         // ports never came up. One bound for connect, recv and send: the 10 s
         // the MySQL connector gives a connect attempt. A running query does not
         // idle that long — the server sends a Progress packet every
@@ -69,7 +73,68 @@ namespace ch {
             return opts;
         }
 
+        // The driver's own socket, its descriptor recorded in the connector's slot for as long as it
+        // is open. Destroyed before clickhouse::Socket closes the descriptor, it clears the slot first.
+        class tracked_socket_t final : public clickhouse::Socket {
+        public:
+            tracked_socket_t(const clickhouse::NetworkAddress& address,
+                             const clickhouse::SocketTimeoutParams& timeouts,
+                             std::shared_ptr<Connector::socket_slot_t> slot)
+                : clickhouse::Socket(address, timeouts)
+                , slot_(std::move(slot)) {
+                std::lock_guard guard(slot_->mutex);
+                slot_->descriptor = static_cast<int>(handle_);
+            }
+
+            ~tracked_socket_t() override {
+                std::lock_guard guard(slot_->mutex);
+                if (slot_->descriptor == static_cast<int>(handle_)) {
+                    slot_->descriptor = -1;
+                }
+            }
+
+        private:
+            std::shared_ptr<Connector::socket_slot_t> slot_;
+        };
+
+        // The driver's plain TCP factory, building tracked sockets with the timeouts its own doConnect
+        // takes from the options (connect, recv, send); the base connect() still applies the socket
+        // options (keepalive, nodelay) to it.
+        class tracked_socket_factory_t final : public clickhouse::NonSecureSocketFactory {
+        public:
+            explicit tracked_socket_factory_t(std::shared_ptr<Connector::socket_slot_t> slot)
+                : slot_(std::move(slot)) {}
+
+        protected:
+            std::unique_ptr<clickhouse::Socket> doConnect(const clickhouse::NetworkAddress& address,
+                                                          const clickhouse::ClientOptions& opts) override {
+                const clickhouse::SocketTimeoutParams timeouts{opts.connection_connect_timeout,
+                                                               opts.connection_recv_timeout,
+                                                               opts.connection_send_timeout};
+                return std::make_unique<tracked_socket_t>(address, timeouts, slot_);
+            }
+
+        private:
+            std::shared_ptr<Connector::socket_slot_t> slot_;
+        };
+
     } // namespace
+
+    std::unique_ptr<clickhouse::Client> Connector::open_client() const {
+        return std::make_unique<clickhouse::Client>(client_options(params_),
+                                                    std::make_unique<tracked_socket_factory_t>(socket_));
+    }
+
+    void Connector::cancel() noexcept {
+        OTX_ZONE_N("ch::Connector::cancel");
+        cancelled_.store(true, std::memory_order_release);
+        std::lock_guard guard(socket_->mutex);
+        // shutdown(2), not close(2): the descriptor stays the driver's (its Socket closes it), so it
+        // cannot be reused under the thread blocked in recv(), which wakes up to the EOF.
+        if (socket_->descriptor >= 0) {
+            ::shutdown(socket_->descriptor, SHUT_RDWR);
+        }
+    }
 
     Connector::Connector(std::pmr::memory_resource* resource, connect_params params, std::string alias)
         : log_(get_logger(logger_tag::CONNECTOR))
@@ -137,7 +202,7 @@ namespace ch {
         // The constructor connects and completes the handshake; the Ping is the
         // first round trip over the session. Both are bounded by io_timeout.
         try {
-            client_ = std::make_unique<clickhouse::Client>(client_options(params_));
+            client_ = open_client();
             client_->Ping();
             status_ = Status::Connected;
             log_->debug("Alias: {} connected successfully", alias_);
@@ -185,7 +250,7 @@ namespace ch {
         do {
             log_->debug("Alias: {} Attempt: {}", alias_, attempts);
             try {
-                client_ = std::make_unique<clickhouse::Client>(client_options(params_));
+                client_ = open_client();
                 client_->Ping();
                 log_->debug("Alias: {} Reconnect success", alias_);
                 status_ = Status::Connected;

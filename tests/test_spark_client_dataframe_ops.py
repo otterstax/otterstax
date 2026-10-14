@@ -210,8 +210,8 @@ class SparkDataFrameOpsTest:
 
     def test_avg_keeps_the_fraction(self):
         """avg over the local table's BIGINT column answers the DOUBLE mean of the rows, fraction kept."""
-        # The rows are the reference: the engine's own AVG over BIGINT, which the SQL
-        # path runs, drops the fraction.
+        # The rows are the reference (the SQL path's AVG over the BIGINT column answers
+        # the same DOUBLE means: the engine widens an integer argument).
         amounts = [amount for _, _, amount in LOCAL_ROWS]
         got = self.local.agg(F.avg("amount").alias("mean")).collect()[0]["mean"]
         if not isinstance(got, float):

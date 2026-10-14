@@ -489,7 +489,7 @@ namespace otterstax::kafka::detail {
                                                                         const std::string& sql) {
         OTX_ZONE_N("kafka::kafka_query_session");
         // Parse core SQL to an execution_plan_t (no kafka extension needed) and
-        // hand off to the dispatcher on `session` — mirrors OtterbrixDataManager::
+        // hand off to the dispatcher on `session` — mirrors otterstax::engine::
         // execute_sql, but the caller owns the session so a sequence of calls on the
         // same session runs inside one engine transaction
         using namespace components::sql::transform;

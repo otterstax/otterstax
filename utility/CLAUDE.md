@@ -8,28 +8,23 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Key Types
 
-### `session_payload` — lives in `scheduler/session_data.hpp`, not here
+### `session_payload` — lives in `session/session_payload.hpp`, not here
 
-`session_payload` holds the output of a completed query: `schema`
+`session_payload` holds the output of a completed statement: `schema`
 (`complex_logical_type`), `chunks` (`std::pmr::vector<data_chunk_t>` — the
-b1+ engine caps each chunk at 1024 rows, so a result spans multiple chunks;
+engine caps each chunk at 1024 rows, so a result spans multiple chunks;
 `size()`/`column_count()`/`empty()` accessors span the whole vector),
-`parameter_count`, and `NodeTag`. With the Scheduler→Worker pool, frontends
-receive the payload
-through a typed future
-(`actor_zeta::unique_future<core::result_wrapper_t<session_payload>>`) returned
-by `Scheduler::execute`. The poll-side bridge lives at
-`frontend/common/asio_future_bridge.hpp`.
-
-A byte-identical dead copy used to sit in `utility/session_payload.hpp`,
-included by nothing and listed in no CMakeLists — two structs of the same name
-in the global namespace, i.e. an ODR trap waiting for the first TU to include
-both. It has been deleted; `scheduler/session_data.hpp` is the only definition.
+`parameter_count`, `NodeTag`, and `affected_rows` (a DML's count, from the
+engine cursor's `affected_rows()`); `reported_rows()` is `size()` for a result
+with columns and `affected_rows` otherwise. Frontends receive it through a typed
+future (`actor_zeta::unique_future<core::result_wrapper_t<session_payload>>`)
+returned by a send to their connection's `query_session_t`. The poll-side bridge
+lives at `frontend/common/asio_future_bridge.hpp`.
 
 ### `wait_barrier.hpp`
 
 `otterstax::query_result_t` / `as_query_result` / `spawn_marshaled` /
-`make_failed_future` / `QueryHandleWaiter` — the single point where a connector
+`make_failed_future` — the single point where a connector
 result crosses the io_context worker → consumer thread boundary. A live
 exception must never cross it (boost.asio's `use_future` destroys the captured
 `exception_ptr` on the io thread, racing the consumer's `get()`; TSAN race under
@@ -53,11 +48,9 @@ query, handler)` is the awaitable the three `executeQuery` spawn: the handler is
 by-value coroutine parameter, and the connector's virtual `runQuery` is called from
 that frame, on the io thread, with a `function_ref_t` to the copy — so the handler
 object lives exactly as long as the query, and a caller may pass a temporary or a
-loop-local lambda. `QueryHandleWaiter` takes the
-`memory_resource` its pmr `futures`/`results` live on; `wait()` is
-`[[nodiscard]]`: it returns the first failure instead of throwing, and its
-callers index `results` positionally. Its destructor drains unconsumed futures
-(asio futures do not block on destruction, unlike `std::async`).
+loop-local lambda. The futures `spawn_marshaled` answers do not block on
+destruction (unlike `std::async`): a caller whose handler captures its frame by
+reference waits on the future (`.get()`) before that frame ends.
 
 ### `function_ref.hpp`
 
@@ -77,15 +70,6 @@ in that coroutine's frame.
 `invalid_parameter`. Used by the three `ConnectorManager::addConnection`
 overloads.
 
-### `settled_future.hpp`
-
-`otterstax::take_settled_error(unique_future<core::error_t>, resource)` — picks
-up the outcome of an actor whose `enqueue_impl` runs the handler to completion on
-the sending thread (`CatalogManager`, `OtterbrixManager`): the future is settled
-when `actor_zeta::send` returns, so a non-settled future is reported as
-`io_error` rather than waited on. Used by `addConnection` to observe
-`add_connection_schema`.
-
 ### `cv_wrapper.hpp` — deleted
 
 `cv_wrapper_t<T>` / `shared_data<T>` (a `shared_ptr` of mutex + condvar, handed
@@ -100,7 +84,9 @@ supported way to hand shared mutable state to an actor — return a value.
 
 ### `session.hpp`
 
-`session_hash_t` — the type alias for query session IDs threaded through all actors.
+`session_hash_t` — the per-call id (`session::to_hash` of a query session's statement id) the
+file / s3 managers and Kafka take. Nothing else lives there: an engine
+session is `components::session::session_id_t`, included where it is used.
 
 ### `thread_pool_manager.hpp`
 
@@ -125,7 +111,7 @@ as its first statement — see the root `CLAUDE.md` Tracy section for the rule.
 ### `timer.hpp`
 
 `Timer` — RAII helper that logs `"<scope> took N µs"` at destruction through
-the provided `log_t`. Used by the `Worker` entry points
-(`Worker::execute`, `Worker::execute_statement`, `Worker::prepare_schema`) to
+the provided `log_t`. Used by the `query_session_t` entry points
+(`execute`, `execute_statement`, `prepare_schema`) to
 get free per-query timings in DEBUG builds.
 

@@ -10,6 +10,8 @@ set(MYSQL_SERVER_HEADERS
     packet/packet_reader.hpp
     packet/packet_writer.hpp
     packet/packet_utils.hpp
+    protocol/lexer.hpp
+    protocol/protocol_statement.hpp
     resultset/column_definition_41.hpp
     resultset/mysql_resultset.hpp
     connection/mysql_connection.hpp
@@ -22,6 +24,8 @@ set(MYSQL_SERVER_SOURCES
      packet/packet_reader.cpp
      packet/packet_writer.cpp
      packet/packet_utils.cpp
+     protocol/lexer.cpp
+     protocol/protocol_statement.cpp
      resultset/column_definition_41.cpp
      resultset/mysql_resultset.cpp
      connection/mysql_connection.cpp

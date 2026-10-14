@@ -16,6 +16,8 @@
 
 #include <cassert>
 #include <memory_resource>
+#include <optional>
+#include <string_view>
 #include <string>
 #include <vector>
 
@@ -42,6 +44,10 @@ namespace {
         std::string name;
         column_type type;
         bool is_unsigned = false;
+        // The column definition's display length and decimals: a DECIMAL(p, s) reports
+        // p (+1 for the point when s > 0, +1 for the sign unless UNSIGNED) and s.
+        unsigned length = 0;
+        unsigned decimals = 0;
     };
 
     // A completed text result set carrying `columns` and no rows: what the
@@ -49,7 +55,9 @@ namespace {
     // preceding the rows it has none of. metadata_mode::full is the mode the
     // real connection reads them in (connectors/mysql/connector.cpp); under
     // `minimal` the names would be gone.
-    boost::mysql::results make_results(const std::vector<my_col>& columns) {
+    // `rows`: text-protocol cells (nullopt: NULL), at most 250 bytes each.
+    boost::mysql::results make_results(const std::vector<my_col>& columns,
+                                       const std::vector<std::vector<std::optional<std::string>>>& rows = {}) {
         boost::mysql::results result;
         auto& impl = boost::mysql::detail::access::get_impl(result);
         impl.reset(boost::mysql::detail::resultset_encoding::text, boost::mysql::metadata_mode::full);
@@ -58,11 +66,36 @@ namespace {
             boost::mysql::detail::coldef_view coldef{};
             coldef.name = column.name;
             coldef.type = column.type;
+            coldef.column_length = column.length;
+            coldef.decimals = static_cast<std::uint8_t>(column.decimals);
             // The one flag the mapping reads back through metadata::is_unsigned().
             coldef.flags = column.is_unsigned ? boost::mysql::detail::column_flags::unsigned_ : 0;
             boost::mysql::diagnostics diag;
             [[maybe_unused]] auto meta_ec = impl.on_meta(coldef, diag);
             assert(!meta_ec && "typed MySQL result set: on_meta must not fail");
+        }
+        if (!rows.empty()) {
+            impl.on_row_batch_start();
+            std::vector<boost::mysql::field_view> storage;
+            std::vector<std::vector<std::uint8_t>> messages;
+            messages.reserve(rows.size());
+            for (const auto& row : rows) {
+                auto& message = messages.emplace_back();
+                for (const auto& value : row) {
+                    if (!value) {
+                        message.push_back(0xFB);
+                        continue;
+                    }
+                    message.push_back(static_cast<std::uint8_t>(value->size()));
+                    message.insert(message.end(), value->begin(), value->end());
+                }
+                [[maybe_unused]] auto row_ec =
+                    impl.on_row(boost::span<const std::uint8_t>(message.data(), message.size()),
+                                boost::mysql::detail::output_ref{},
+                                storage);
+                assert(!row_ec && "typed MySQL result set: on_row must not fail");
+            }
+            impl.on_row_batch_finish();
         }
         [[maybe_unused]] auto ok_ec = impl.on_row_ok_packet(boost::mysql::detail::ok_view{0, 0, 0, 0, {}});
         assert(!ok_ec && "typed MySQL result set: on_row_ok_packet must not fail");
@@ -187,7 +220,6 @@ TEST_CASE("mysql types: year is an integer") {
 }
 
 TEST_CASE("mysql types: string-mapped types") {
-    REQUIRE(discovered_type(column_type::decimal, false) == logical_type::STRING_LITERAL);
     REQUIRE(discovered_type(column_type::text, false) == logical_type::STRING_LITERAL);
     REQUIRE(discovered_type(column_type::char_, false) == logical_type::STRING_LITERAL);
     REQUIRE(discovered_type(column_type::varchar, false) == logical_type::STRING_LITERAL);
@@ -240,4 +272,88 @@ TEST_CASE("mysql types: a result set without columns has an empty schema") {
     REQUIRE_FALSE(schema.has_error());
     REQUIRE(schema.value().type() == logical_type::STRUCT);
     REQUIRE(schema.value().child_types().empty());
+}
+
+// ── DECIMAL ──────────────────────────────────────────────────────────────────
+
+namespace {
+
+    components::types::int128_t unscaled_of(const logical_value_t& value) {
+        switch (value.type().to_physical_type()) {
+            case physical_type::INT16:
+                return value.value<int16_t>();
+            case physical_type::INT32:
+                return value.value<int32_t>();
+            case physical_type::INT64:
+                return value.value<int64_t>();
+            default:
+                return value.value<components::types::int128_t>();
+        }
+    }
+
+} // namespace
+
+// DECIMAL(p, s) of at most 38 digits is the engine's DECIMAL(p, s), read off the column definition
+// (its display length and decimals; UNSIGNED drops the sign's place), every digit of the text the
+// wire sends kept — the discovery's schema and the executed chunk alike.
+TEST_CASE("mysql types: DECIMAL of at most 38 digits is the engine's DECIMAL of its precision and scale") {
+    auto* resource = std::pmr::new_delete_resource();
+    auto result = make_results({{"price", column_type::decimal, false, 12, 2},
+                                {"whole", column_type::decimal, false, 6, 0},
+                                {"wide", column_type::decimal, false, 40, 10},
+                                {"unsigned_price", column_type::decimal, true, 11, 2}},
+                               {{std::string{"12345678.12"}, std::string{"-42"},
+                                 std::string{"1234567890123456789012345678.0123456789"}, std::string{"0.05"}},
+                                {std::string{"-0.50"}, std::nullopt, std::string{"-0.0000000001"}, std::string{"99999999.99"}}});
+    auto chunk = tsl::mysql_to_chunk(resource, result);
+    auto schema = tsl::mysql_to_struct(resource, result);
+    INFO((chunk.has_error() ? chunk.error().what.c_str() : "converted"));
+    REQUIRE_FALSE(chunk.has_error());
+    REQUIRE_FALSE(schema.has_error());
+    const auto types = chunk.value().types();
+    const std::vector<std::pair<int, int>> specs{{10, 2}, {5, 0}, {38, 10}, {10, 2}};
+    for (size_t col = 0; col < specs.size(); ++col) {
+        CAPTURE(col);
+        REQUIRE(types[col].type() == logical_type::DECIMAL);
+        const auto* spec = types[col].extension_as<decimal_logical_type_extension>();
+        REQUIRE(spec->width() == specs[col].first);
+        REQUIRE(spec->scale() == specs[col].second);
+        REQUIRE(schema.value().child_types()[col] == types[col]);
+    }
+    const auto& rows = chunk.value();
+    REQUIRE(unscaled_of(rows.value(0, 0)) == 1234567812);
+    REQUIRE(unscaled_of(rows.value(0, 1)) == -50);
+    REQUIRE(unscaled_of(rows.value(1, 0)) == -42);
+    REQUIRE(rows.value(1, 1).is_null());
+    components::types::int128_t wide = 0;
+    for (char digit : std::string_view{"12345678901234567890123456780123456789"}) {
+        wide = wide * 10 + (digit - '0');
+    }
+    REQUIRE(unscaled_of(rows.value(2, 0)) == wide);
+    REQUIRE(unscaled_of(rows.value(2, 1)) == -1);
+    REQUIRE(unscaled_of(rows.value(3, 0)) == 5);
+    REQUIRE(unscaled_of(rows.value(3, 1)) == 9999999999);
+}
+
+// A DECIMAL wider than 38 digits (MySQL takes 65: DECIMAL(65, 30), and what it answers for SUM over
+// a wide DECIMAL) has no DECIMAL that holds it: it is carried as the exact text the wire sends.
+TEST_CASE("mysql types: a DECIMAL wider than 38 digits is carried as its exact text") {
+    auto* resource = std::pmr::new_delete_resource();
+    const std::string sixty_five = std::string(35, '9') + "." + std::string(30, '1');
+    auto result = make_results({{"huge", column_type::decimal, false, 67, 30}}, {{sixty_five}});
+    auto chunk = tsl::mysql_to_chunk(resource, result);
+    REQUIRE_FALSE(chunk.has_error());
+    REQUIRE(chunk.value().types().front().type() == logical_type::STRING_LITERAL);
+    REQUIRE(chunk.value().value(0, 0).value<std::string_view>() == sixty_five);
+    REQUIRE(discovered_type(column_type::decimal, false) == logical_type::STRING_LITERAL); // no precision reported
+}
+
+// A DECIMAL text the declared precision cannot hold is a conversion_failure naming the column.
+TEST_CASE("mysql types: a DECIMAL value past its declared precision is conversion_failure") {
+    auto* resource = std::pmr::new_delete_resource();
+    auto result = make_results({{"price", column_type::decimal, false, 6, 2}}, {{std::string{"1234.56"}}});
+    auto chunk = tsl::mysql_to_chunk(resource, result);
+    REQUIRE(chunk.has_error());
+    REQUIRE(chunk.error().type == core::error_code_t::conversion_failure);
+    REQUIRE(std::string{chunk.error().what.c_str()}.find("price") != std::string::npos);
 }

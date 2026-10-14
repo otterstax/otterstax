@@ -10,12 +10,11 @@
 
 // Logical-plan carrier for a parsed external-table statement (CREATE EXTERNAL
 // TABLE / COPY ... TO). Both the `s3` and `file` grammar-extension transforms
-// lower their AST into this single node type; the Scheduler classifies it
+// lower their AST into this single node type; the query session classifies it
 // (s3 vs local by location scheme, create vs copy by `op`) and routes to the
 // S3 / file managers.
 //
-// Tagged node_type::unused — like schema_utils::schema_node_t — so the engine
-// never tries to execute it. Header-only (all virtuals inline) so both the
+// Tagged node_type::unused so the engine never tries to execute it. Header-only (all virtuals inline) so both the
 // extension static libs and otterbrix_local can use it without a link edge.
 namespace otterstax::external {
 

@@ -8,7 +8,6 @@
 // transaction block status ReadyForQuery carries.
 
 #include "frontend/postgres_server/connection/pipeline_state.hpp"
-#include "frontend/postgres_server/connection/transaction_manager.hpp"
 #include "frontend/postgres_server/packet/packet_reader.hpp"
 #include "frontend/postgres_server/packet/packet_utils.hpp"
 #include "frontend/postgres_server/resultset/postgres_resultset.hpp"
@@ -60,24 +59,6 @@ namespace {
             columns.emplace_back(type, "c");
         }
         return columns;
-    }
-
-    // The status byte of a ReadyForQuery packet.
-    char ready_for_query_status(const std::vector<uint8_t>& packet) {
-        packet_reader r(packet);
-        check_header(r, message_type::backend::READY_FOR_QUERY, 1);
-        return static_cast<char>(r.read_uint8());
-    }
-
-    // The tag of a CommandComplete packet.
-    std::string command_tag(const std::vector<uint8_t>& packet) {
-        packet_reader r(packet);
-        REQUIRE(static_cast<char>(r.read_uint8()) == message_type::backend::COMMAND_COMPLETE);
-        r.read_int32();
-        auto tag = r.read_string_null();
-        REQUIRE(r.ok());
-        REQUIRE(r.remaining() == 0);
-        return tag;
     }
 
     // Reads one field of a RowDescription and returns its format code.
@@ -134,7 +115,7 @@ TEST_CASE("pg PortalSuspended: 's' with an empty payload") {
     REQUIRE(r.remaining() == 0);
 }
 
-// Close(statement) answers CloseComplete only: the Worker-side release of the
+// Close(statement) answers CloseComplete only: the query session-side release of the
 // statement's session is not visible on the wire.
 TEST_CASE("pg CloseComplete: '3' with an empty payload") {
     packet_writer w;
@@ -355,47 +336,6 @@ TEST_CASE("pg pipeline_state: an error outside a pipeline is answered at once an
     pipeline.end_pipeline();
     REQUIRE_FALSE(pipeline.set_error());
     REQUIRE_FALSE(pipeline.has_error());
-}
-
-// ReadyForQuery carries the transaction block's status, as in PostgreSQL: 'I'
-// outside a block, 'T' inside one, 'E' once an error failed it. An error
-// outside a block fails nothing; COMMIT of a failed block rolls it back.
-TEST_CASE("pg transaction_manager: an error fails an open transaction block only") {
-    packet_writer w;
-    transaction_manager tx;
-    REQUIRE(tx.get_transaction_status() == transaction_status::IDLE);
-    tx.mark_failed();
-    REQUIRE(tx.get_transaction_status() == transaction_status::IDLE);
-
-    auto begin = tx.handle_begin(w);
-    REQUIRE(begin.size() == 2);
-    REQUIRE(command_tag(begin[0]) == "BEGIN");
-    REQUIRE(ready_for_query_status(begin[1]) == 'T');
-
-    tx.mark_failed();
-    REQUIRE(tx.get_transaction_status() == transaction_status::TRANSACTION_ERROR);
-    tx.mark_failed(); // a second error changes nothing
-    REQUIRE(tx.get_transaction_status() == transaction_status::TRANSACTION_ERROR);
-
-    SECTION("COMMIT of the failed block rolls it back") {
-        auto commit = tx.handle_commit(w);
-        REQUIRE(commit.size() == 2);
-        REQUIRE(command_tag(commit[0]) == "ROLLBACK");
-        REQUIRE(ready_for_query_status(commit[1]) == 'I');
-        REQUIRE(tx.get_transaction_status() == transaction_status::IDLE);
-    }
-
-    SECTION("ROLLBACK ends the failed block") {
-        auto rollback = tx.handle_rollback(w);
-        REQUIRE(rollback.size() == 2);
-        REQUIRE(command_tag(rollback[0]) == "ROLLBACK");
-        REQUIRE(ready_for_query_status(rollback[1]) == 'I');
-        REQUIRE(tx.get_transaction_status() == transaction_status::IDLE);
-    }
-
-    // The next block starts clean.
-    auto again = tx.handle_begin(w);
-    REQUIRE(ready_for_query_status(again[1]) == 'T');
 }
 
 TEST_CASE("pg parse_text_parameter: an unbindable type is unimplemented_yet") {

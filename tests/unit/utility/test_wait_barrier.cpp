@@ -8,12 +8,7 @@
 // consumer as a VALUE: a value the handler produced, an error the connector
 // reported, an exception thrown on the io thread, and an io_context torn down
 // before the query ran all arrive through future.get() without an exception.
-// (2) QueryHandleWaiter::wait() fills `results` one-per-future, in order: three
-// ConnectorManagers index wait_guard.results[j] positionally right after the call
-// (integration/{sql,postgresql,clickhouse}/connection_manager.cpp), so anything
-// that breaks the one-per-future postcondition turns those subscripts into
-// out-of-bounds reads in a -O3 -DNDEBUG build, on exactly the backend-failure path.
-// (3) run_with_owned_handler owns a query's handler for as long as the query runs:
+// (2) run_with_owned_handler owns a query's handler for as long as the query runs:
 // the connector's runQuery sees it only through a non-owning function_ref_t.
 
 #include "utility/function_ref.hpp"
@@ -70,131 +65,6 @@ namespace {
     }
 
 } // namespace
-
-TEST_CASE("QueryHandleWaiter: wait() fills results one-per-future, in order") {
-    auto* resource = std::pmr::new_delete_resource();
-    otterstax::QueryHandleWaiter<int> waiter{resource};
-
-    std::promise<core::result_wrapper_t<int>> p0, p1, p2;
-    waiter.futures.push_back(p0.get_future());
-    waiter.futures.push_back(p1.get_future());
-    waiter.futures.push_back(p2.get_future());
-
-    // Complete out of order: wait() must preserve FUTURE order, not completion order.
-    p2.set_value(30);
-    p0.set_value(10);
-    p1.set_value(20);
-
-    auto barrier = waiter.wait();
-    REQUIRE_FALSE(barrier.has_error());
-
-    REQUIRE(waiter.results.size() == waiter.futures.size());
-    REQUIRE(waiter.results[0] == 10);
-    REQUIRE(waiter.results[1] == 20);
-    REQUIRE(waiter.results[2] == 30);
-}
-
-TEST_CASE("QueryHandleWaiter: every futures index has a matching results index") {
-    // The exact invariant the three managers rely on, written as a loop so a
-    // failure names the bad index. T is move-only here, like the real
-    // unique_ptr<data_chunk_t> payload.
-    auto* resource = std::pmr::new_delete_resource();
-    otterstax::QueryHandleWaiter<std::unique_ptr<std::string>> waiter{resource};
-
-    constexpr size_t N = 4;
-    std::vector<std::promise<core::result_wrapper_t<std::unique_ptr<std::string>>>> promises(N);
-    for (size_t i = 0; i < N; ++i) {
-        waiter.futures.push_back(promises[i].get_future());
-    }
-    for (size_t i = 0; i < N; ++i) {
-        promises[i].set_value(std::make_unique<std::string>("chunk" + std::to_string(i)));
-    }
-
-    auto barrier = waiter.wait();
-    REQUIRE_FALSE(barrier.has_error());
-
-    REQUIRE(waiter.results.size() == N);
-    for (size_t j = 0; j < waiter.futures.size(); ++j) {
-        INFO("index " << j);
-        REQUIRE(j < waiter.results.size());
-        REQUIRE(waiter.results[j] != nullptr);
-        REQUIRE(*waiter.results[j] == "chunk" + std::to_string(j));
-    }
-}
-
-TEST_CASE("QueryHandleWaiter: wait() reports the first error and leaves a results prefix") {
-    auto* resource = std::pmr::new_delete_resource();
-    otterstax::QueryHandleWaiter<int> waiter{resource};
-
-    std::promise<core::result_wrapper_t<int>> good, bad, never_read;
-    waiter.futures.push_back(good.get_future());
-    waiter.futures.push_back(bad.get_future());
-    waiter.futures.push_back(never_read.get_future());
-
-    // Connector errors arrive as a VALUE (core::error_t inside result_wrapper_t),
-    // never as a future exception — that is the io->consumer boundary contract in
-    // wait_barrier.hpp. wait() hands that error back on the consumer thread.
-    good.set_value(7);
-    bad.set_value(core::error_t(core::error_code_t::io_error, std::pmr::string{"simulated DB failure", resource}));
-    never_read.set_value(9);
-
-    auto barrier = waiter.wait();
-    REQUIRE(barrier.has_error());
-    REQUIRE(barrier.error().type == core::error_code_t::io_error);
-    REQUIRE(std::string{barrier.error().what.c_str()} == "simulated DB failure");
-
-    // results is a PREFIX: the third future was never consumed. Managers must
-    // therefore never index past results.size().
-    REQUIRE(waiter.results.size() == 1);
-    REQUIRE(waiter.results[0] == 7);
-    REQUIRE(waiter.results.size() < waiter.futures.size());
-}
-
-TEST_CASE("QueryHandleWaiter: futures and results live on the given memory_resource") {
-    // The containers must be pmr containers bound to the caller's resource — never
-    // the default resource — so a manager's arena owns every marshaled payload.
-    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
-    otterstax::QueryHandleWaiter<int> waiter{&arena};
-    REQUIRE(waiter.futures.get_allocator().resource() == &arena);
-    REQUIRE(waiter.results.get_allocator().resource() == &arena);
-}
-
-TEST_CASE("QueryHandleWaiter: the destructor waits for the futures wait() left unconsumed") {
-    // wait() returns at the first error, but the handlers behind the failed one
-    // may still be running on io threads with references into the caller's
-    // frame: the waiter must not go away before each of them has settled.
-    auto* resource = std::pmr::new_delete_resource();
-    std::atomic<bool> tail_settled{false};
-    std::thread producer;
-    {
-        otterstax::QueryHandleWaiter<int> waiter{resource};
-        // Declared after the waiter: should an assertion below fail before the
-        // producer takes the tail promise, the promises die first and the drain
-        // sees a broken promise instead of waiting forever.
-        std::promise<core::result_wrapper_t<int>> failed;
-        std::promise<core::result_wrapper_t<int>> tail;
-        waiter.futures.push_back(failed.get_future());
-        waiter.futures.push_back(tail.get_future());
-        failed.set_value(
-            core::error_t(core::error_code_t::io_error, std::pmr::string{"simulated DB failure", resource}));
-
-        auto barrier = waiter.wait();
-        REQUIRE(barrier.has_error());
-        REQUIRE(waiter.results.empty());
-        REQUIRE(waiter.futures[1].valid());
-
-        producer = std::thread{[promise = std::move(tail), &tail_settled]() mutable {
-            std::this_thread::sleep_for(std::chrono::milliseconds(200));
-            tail_settled.store(true);
-            promise.set_value(9);
-        }};
-    }
-    // Read before the join: only a destructor that blocked on the tail future
-    // lets the producer's store happen before this line.
-    const bool drained = tail_settled.load();
-    producer.join();
-    REQUIRE(drained);
-}
 
 TEST_CASE("make_failed_future: reports the error without touching an io_context") {
     auto* resource = std::pmr::new_delete_resource();

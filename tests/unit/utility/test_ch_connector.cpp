@@ -14,7 +14,7 @@
 // constructor waits for in Handshake(), and the Pong that Ping() waits for.
 // On the connector that is connect() (constructor + Ping) and isConnected()
 // (Ping). At server start connect() runs on the startup thread inside
-// ComponentManager::register_connections, so a silent ClickHouse kept the
+// remote_backends_t::open, so a silent ClickHouse kept the
 // wire-protocol ports from ever coming up.
 //
 // Also pinned: a query must not enter the driver's RetryGuard. With

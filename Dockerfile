@@ -40,14 +40,15 @@ RUN rm /bin/sh && ln -s /bin/bash /bin/sh
 WORKDIR /app
 COPY conanfile.py .
 # TEMPORARY (OTB-tag, docs/proposals/otterbrix-embedding.md): restore the
-# local-only otterbrix/actor-zeta recipes archived by
-# scripts/conan/export_local_packages.sh and build them from source; without the
-# archive the install falls back to the remotes. See Dockerfile.test.
+# local-only otterbrix recipe archived by scripts/conan/export_local_packages.sh
+# and build it from source; without the archive the install falls back to the
+# remotes. actor-zeta comes from the remote like any other dependency. See
+# Dockerfile.test.
 COPY .conan-local/ /tmp/conan-local/
 RUN _local_build=() && \
     if [ -f /tmp/conan-local/local_recipes.tgz ]; then \
         conan cache restore /tmp/conan-local/local_recipes.tgz && \
-        _local_build=(--build="otterbrix/*" --build="actor-zeta/*"); \
+        _local_build=(--build="otterbrix/*"); \
     fi && \
     rm -rf /tmp/conan-local && \
     _jobs="${BUILD_JOBS}" && \
@@ -96,8 +97,9 @@ COPY ./connectors ./connectors
 COPY ./integration ./integration
 COPY ./frontend/ ./frontend
 COPY ./otterbrix ./otterbrix
-COPY ./component_manager ./component_manager
-COPY ./scheduler ./scheduler
+COPY ./runtime ./runtime
+COPY ./backends ./backends
+COPY ./session ./session
 COPY ./types ./types
 COPY ./utility ./utility
 COPY ./cmake ./cmake

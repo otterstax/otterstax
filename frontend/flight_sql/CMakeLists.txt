@@ -6,7 +6,7 @@
 #   flight_sql_proto - generated Flight/FlightSql protobuf + gRPC stubs
 #   flight_sql_core  - Flight SQL protocol core (commands, auth, tickets)
 #   flight_sql       - the server itself: rpc handlers + engine adapter
-#                      (scheduler_engine.cpp; conversions via tsl::*)
+#                      (session_engine.cpp; conversions via tsl::*)
 
 find_package(gRPC CONFIG REQUIRED)
 find_package(protobuf CONFIG REQUIRED)
@@ -99,20 +99,24 @@ target_include_directories(flight_sql_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/../..)
 # table_info's headers (qualified_name_t) come with the engine package
 target_link_libraries(flight_sql_core
-    PRIVATE otterbrix::otterbrix
-    PUBLIC flight_sql_proto arrow::arrow)
+    PRIVATE
+        otterbrix::otterbrix
+        common_server    # frontend::secure_random_bytes: the bearer token (auth.cpp)
+        OpenSSL::Crypto  # SHA-256 + CRYPTO_memcmp: constant-time token checks (auth.cpp)
+    # session_ptr: a prepared statement's entry owns its query session (core.hpp)
+    PUBLIC flight_sql_proto arrow::arrow session)
 
 # ---------------------------------------------------------------------------
-# The Flight SQL server: rpc handlers + the Scheduler engine adapter
+# The Flight SQL server: rpc handlers + the query-session engine adapter
 # ---------------------------------------------------------------------------
 find_package(asio-grpc CONFIG REQUIRED)
 add_library(flight_sql
     server.cpp
     rpc/flight_server.cpp
-    scheduler_engine.cpp)
+    session_engine.cpp)
 target_include_directories(flight_sql PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
-    # repo root, for scheduler/catalog/utility headers the adapter includes
+    # repo root, for session/catalog/utility headers the adapter includes
     ${CMAKE_CURRENT_SOURCE_DIR}/../..)
 target_link_libraries(flight_sql
     PUBLIC
@@ -123,5 +127,5 @@ target_link_libraries(flight_sql
         gRPC::grpc++
         protobuf::libprotobuf
     PRIVATE
-        scheduler
+        session
         catalog)

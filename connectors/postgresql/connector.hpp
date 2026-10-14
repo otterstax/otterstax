@@ -23,11 +23,13 @@
 #include "utility/wait_barrier.hpp"
 #include <integration/cpp/otterbrix.hpp>
 
+#include <atomic>
 #include <concepts>
 #include <coroutine>
 #include <exception>
 #include <memory>
 #include <memory_resource>
+#include <mutex>
 #include <string>
 
 namespace pg {
@@ -70,6 +72,14 @@ namespace pg {
         virtual core::error_t tryReconnect() = 0;
         virtual bool isClosed() const noexcept = 0;
         virtual std::string alias() const noexcept = 0;
+        // Aborts the statement this connector runs, from any thread (the connector manager's
+        // shutdown): the connection's socket is shut down, so the blocking PQexec returns its
+        // "server closed the connection" error at once whatever state the server is in, and the
+        // connector refuses every later statement. Never blocks. The server notices the closed
+        // client when it next writes to it (or at client_connection_check_interval) and ends the
+        // statement then. The default does nothing: a connector that cannot abort (a test stub) lets
+        // its statement finish.
+        virtual void cancel() noexcept {}
 
         virtual asio::awaitable<core::result_wrapper_t<std::unique_ptr<data_chunk_t>>>
         runQuery(std::string_view query,
@@ -94,6 +104,7 @@ namespace pg {
         core::error_t tryReconnect() override;
         bool isClosed() const noexcept override;
         std::string alias() const noexcept override;
+        void cancel() noexcept override;
 
         asio::awaitable<core::result_wrapper_t<std::unique_ptr<data_chunk_t>>>
         runQuery(std::string_view query,
@@ -126,6 +137,9 @@ namespace pg {
             runQuery_(std::string_view query, Callable handler) {
             OTX_ZONE_N("pg::Connector::runQuery");
             using result_t = std::invoke_result_t<Callable, PGresult*>;
+            if (cancelled_.load(std::memory_order_acquire)) {
+                co_return connection_error("[Run query] Connector with alias: " + alias_ + " was cancelled");
+            }
             if (status_ != Status::Connected) {
                 std::string err = "[Run query] Connector with alias: " + alias_ + " is not connected";
                 log_->error(err);
@@ -159,7 +173,13 @@ namespace pg {
         }
 
     private:
+        // Replaces conn_ (and frees the one it held) under conn_mutex_, which cancel() takes to read
+        // the socket: the PGconn cancel() reaches is never one being freed.
+        void replace_connection(PGConnPtr next) noexcept;
+
         std::pmr::memory_resource* resource_;
+        std::mutex conn_mutex_;
+        std::atomic<bool> cancelled_{false};
         PGConnPtr conn_;
         connect_params params_;
         Status status_;

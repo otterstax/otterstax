@@ -21,7 +21,7 @@
 #include <core/result_wrapper.hpp>
 
 #include "otterbrix/parser/parser.hpp" // ParsedQueryData
-#include "types/otterbrix.hpp"         // OtterbrixStatement / external_entry_t
+#include "types/otterbrix.hpp"         // OtterbrixStatement
 
 #include <catch2/catch_all.hpp>
 
@@ -267,6 +267,23 @@ namespace {
                params->parameter(ce::as_parameter(cmp.right())).value<int64_t>() == value;
     }
 
+    // The first aggregate under (or at) `node` that names a remote table: its
+    // target carries the uid slot.
+    const cl::node_t* remote_read(const cl::node_ptr& node) {
+        if (!node) {
+            return nullptr;
+        }
+        if (node->type() == cl::node_type::aggregate_t && !node->target().unique_identifier.t.empty()) {
+            return node.get();
+        }
+        for (const auto& child : node->children()) {
+            if (const auto* found = remote_read(child)) {
+                return found;
+            }
+        }
+        return nullptr;
+    }
+
 } // namespace
 
 // ── Read.NamedTable ───────────────────────────────────────────────────────────
@@ -285,16 +302,13 @@ TEST_CASE("relation_to_plan: Read.NamedTable federated alias.db.schema.table") {
     REQUIRE(parsed->otterbrix_params->node != nullptr);
     CHECK(parsed->otterbrix_params->node->type() == cl::node_type::aggregate_t);
 
-    REQUIRE(parsed->otterbrix_params->external_nodes_count == 1);
-    REQUIRE(parsed->otterbrix_params->external_nodes.size() == 1);
-    REQUIRE(parsed->otterbrix_params->external_nodes[0].size() == 1);
-
-    const auto& target = parsed->otterbrix_params->external_nodes[0][0].target;
-    CHECK(target.name.unique_identifier.t == "alias1");
-    CHECK(target.name.collection.t == "table1");
-    // A PostgreSQL table is mirrored under its schema: the external name keeps
-    // the one the identifier named.
-    CHECK(target.name.schema.t == "sch1");
+    // The name rides whole on the read: the federation resolves it by its uid,
+    // a PostgreSQL table by the schema the identifier named.
+    const auto& target = parsed->otterbrix_params->node->target();
+    CHECK(target.unique_identifier.t == "alias1");
+    CHECK(target.database.t == "db1");
+    CHECK(target.collection.t == "table1");
+    CHECK(target.schema.t == "sch1");
 }
 
 TEST_CASE("relation_to_plan: Read.NamedTable reads one to four name parts as the SQL path does") {
@@ -308,13 +322,13 @@ TEST_CASE("relation_to_plan: Read.NamedTable reads one to four name parts as the
         const char* schema;
         const char* table;
     };
-    // One part is a table and two a local db.table; three behind a registered
-    // alias are alias.db.table with the connection's schema; four are
-    // alias.db.schema.table.
+    // One part is a table and two a local db.table; three are read as the
+    // engine reads them, database.schema.table — the federation takes the
+    // database slot of uid.db.table for the uid; four are alias.db.schema.table.
     const expected_name cases[] = {
         {"t1", "", "", "", "t1"},
         {"db1.t1", "", "db1", "", "t1"},
-        {"alias1.db1.t1", "alias1", "db1", "sch1", "t1"},
+        {"alias1.db1.t1", "", "alias1", "db1", "t1"},
         {"alias1.db1.sch1.t1", "alias1", "db1", "sch1", "t1"},
     };
     for (const auto& expected : cases) {
@@ -326,24 +340,12 @@ TEST_CASE("relation_to_plan: Read.NamedTable reads one to four name parts as the
         const auto& agg = static_cast<const cl::node_aggregate_t&>(*statement.node);
         CHECK(agg.target().unique_identifier.t == expected.uid);
         CHECK(agg.target().database.t == expected.database);
+        CHECK(agg.target().schema.t == expected.schema);
         CHECK(agg.target().collection.t == expected.table);
-        if (std::string_view{expected.uid}.empty()) {
-            // A local table: the engine resolves it, nothing is external.
-            CHECK(statement.external_nodes_count == 0);
-            continue;
-        }
-        REQUIRE(statement.external_nodes_count == 1);
-        REQUIRE(statement.external_nodes.size() == 1);
-        REQUIRE(statement.external_nodes[0].size() == 1);
-        const auto& name = statement.external_nodes[0][0].target.name;
-        CHECK(name.unique_identifier.t == expected.uid);
-        CHECK(name.database.t == expected.database);
-        CHECK(name.schema.t == expected.schema);
-        CHECK(name.collection.t == expected.table);
     }
 }
 
-TEST_CASE("relation_to_plan: Read.NamedTable without uid has no external nodes") {
+TEST_CASE("relation_to_plan: Read.NamedTable of a local db.table carries no uid") {
     std::pmr::synchronized_pool_resource pool;
     auto* resource = &pool;
 
@@ -355,8 +357,8 @@ TEST_CASE("relation_to_plan: Read.NamedTable without uid has no external nodes")
     auto& parsed = result.value().parsed_data;
     REQUIRE(parsed != nullptr);
     CHECK(parsed->otterbrix_params->node->type() == cl::node_type::aggregate_t);
-    REQUIRE(parsed->otterbrix_params->external_nodes_count == 0);
-    CHECK(parsed->otterbrix_params->external_nodes.empty());
+    CHECK(parsed->otterbrix_params->node->target().unique_identifier.t.empty());
+    CHECK(remote_read(parsed->otterbrix_params->node) == nullptr);
 }
 
 // ── Filter ────────────────────────────────────────────────────────────────────
@@ -465,13 +467,11 @@ TEST_CASE("relation_to_plan: SQL relation keeps the schema of an external table 
     auto result = frontend::spark::relation_to_plan(plan, resource, aliases);
     REQUIRE_FALSE(result.has_error());
     const auto& statement = *result.value().parsed_data->otterbrix_params;
-    REQUIRE(statement.external_nodes_count == 1);
-    REQUIRE(statement.external_nodes.size() == 1);
-    REQUIRE(statement.external_nodes[0].size() == 1);
 
-    // The leaf's aggregate names (a, pgdb, t) only; a PostgreSQL table is
-    // mirrored under its schema, which comes back from the leaf's parse tree.
-    const auto& name = statement.external_nodes[0][0].target.name;
+    // The leaf's read keeps every slot of the name it was written with.
+    const auto* read = remote_read(statement.node);
+    REQUIRE(read != nullptr);
+    const auto& name = read->target();
     CHECK(name.unique_identifier.t == "a");
     CHECK(name.database.t == "pgdb");
     CHECK(name.schema.t == "public");
@@ -963,7 +963,7 @@ TEST_CASE("relation_to_plan: reading a derived table through a renamed column is
     }
 }
 
-TEST_CASE("relation_to_plan: a remote read under a derived table stays the external slot") {
+TEST_CASE("relation_to_plan: a remote read under a derived table keeps its window in the same block") {
     std::pmr::synchronized_pool_resource pool;
     auto* resource = &pool;
 
@@ -980,13 +980,11 @@ TEST_CASE("relation_to_plan: a remote read under a derived table stays the exter
     const auto& inner = derived_inner(statement.node);
     CHECK(child_kinds(inner) == "limit");
 
-    REQUIRE(statement.external_nodes_count == 1);
-    REQUIRE(statement.external_nodes.size() == 1);
-    REQUIRE(statement.external_nodes[0].size() == 1);
-    const auto& slot = statement.external_nodes[0][0];
-    CHECK(slot.node->get() == inner.get());
-    CHECK(slot.target.name.unique_identifier.t == "a");
-    CHECK(slot.target.name.schema.t == "sch1");
+    // The inner block — the read and its window — is what the pushdown rule
+    // sends to the backend as one statement.
+    CHECK(remote_read(statement.node) == inner.get());
+    CHECK(inner->target().unique_identifier.t == "a");
+    CHECK(inner->target().schema.t == "sch1");
 }
 
 TEST_CASE("relation_to_plan: unionByName is refused") {

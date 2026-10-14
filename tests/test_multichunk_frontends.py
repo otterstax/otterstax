@@ -70,7 +70,7 @@ class MultiChunkFrontendTest:
         # external-table tests connect the same way (external_helpers.conn_cfg).
         self.mysql_conn = mysql.connector.connect(
             host=self.host, port=config.MYSQL_PORT,
-            user="testuser", password="testpass")
+            user="testuser", password="testpass", autocommit=True)
         cur = self.mysql_conn.cursor()
         cur.execute(
             f"CREATE EXTERNAL TABLE {DB}.{TABLE} "

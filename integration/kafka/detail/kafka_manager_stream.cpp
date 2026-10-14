@@ -43,24 +43,36 @@ namespace otterstax::kafka {
 
     actor_zeta::unique_future<cursor::cursor_t_ptr>
     KafkaManager::produce(session_hash_t id, std::string relname, logical_plan::node_ptr source) {
-        OTX_ZONE_N("KafkaManager::produce");
-        log_->debug("produce id {}: object {}", id, relname);
-        auto it = registry_.find(relname);
-        if (it == registry_.end()) {
-            co_return cursor::make_cursor(
-                resource_,
-                core::error_t(core::error_code_t::do_not_exists,
-                              std::pmr::string{"kafka: INSERT into unknown object '" + relname + "'", resource_}));
-        }
-        const auto& options = it->second.options;
-        const auto topic_it = options.find("kafka_topic");
-        const auto bootstrap_it = options.find("bootstrap_servers");
-        if (topic_it == options.end() || bootstrap_it == options.end()) {
-            co_return cursor::make_cursor(
-                resource_,
-                core::error_t(
-                    core::error_code_t::invalid_parameter,
-                    std::pmr::string{"kafka: '" + relname + "' has no KAFKA_TOPIC/BOOTSTRAP_SERVERS", resource_}));
+        // What the write needs after its first co_await, copied out of the
+        // registry: another coroutine of this loop may change it meanwhile.
+        std::vector<kafka_column_t> columns;
+        std::string topic;
+        std::string bootstrap;
+        {
+            // The loop interleaves its coroutines on one thread: the zone closes
+            // before the first co_await (root CLAUDE.md, Tracy).
+            OTX_ZONE_N("KafkaManager::produce");
+            log_->debug("produce id {}: object {}", id, relname);
+            auto it = registry_.find(relname);
+            if (it == registry_.end()) {
+                co_return cursor::make_cursor(
+                    resource_,
+                    core::error_t(core::error_code_t::do_not_exists,
+                                  std::pmr::string{"kafka: INSERT into unknown object '" + relname + "'", resource_}));
+            }
+            const auto& options = it->second.options;
+            const auto topic_it = options.find("kafka_topic");
+            const auto bootstrap_it = options.find("bootstrap_servers");
+            if (topic_it == options.end() || bootstrap_it == options.end()) {
+                co_return cursor::make_cursor(
+                    resource_,
+                    core::error_t(
+                        core::error_code_t::invalid_parameter,
+                        std::pmr::string{"kafka: '" + relname + "' has no KAFKA_TOPIC/BOOTSTRAP_SERVERS", resource_}));
+            }
+            columns = it->second.columns;
+            topic = topic_it->second;
+            bootstrap = bootstrap_it->second;
         }
 
         // Materialise the rows by executing the insert's source subplan — no
@@ -83,7 +95,7 @@ namespace otterstax::kafka {
         // The result spans multiple <=1024-row chunks (never combined) —
         // validate and serialize ALL of them or rows are silently dropped.
         const auto& chunks = cursor->chunks();
-        if (!chunk_matches_columns(resource_, chunks, it->second.columns)) {
+        if (!chunk_matches_columns(resource_, chunks, columns)) {
             co_return cursor::make_cursor(
                 resource_,
                 core::error_t(core::error_code_t::schema_error,
@@ -106,7 +118,7 @@ namespace otterstax::kafka {
                                                resource_}));
         }
         const auto& payloads = serialized.value();
-        auto producer_r = ensure_producer(relname, bootstrap_it->second, topic_it->second);
+        auto producer_r = ensure_producer(relname, bootstrap, topic);
         if (producer_r.has_error()) {
             co_return cursor::make_cursor(
                 resource_,
@@ -144,103 +156,116 @@ namespace otterstax::kafka {
             abort();
             co_return failed(status.error);
         }
-        log_->info("kafka: produced {} record(s) to '{}' (topic '{}')", payloads.size(), relname, topic_it->second);
+        log_->info("kafka: produced {} record(s) to '{}' (topic '{}')", payloads.size(), relname, topic);
         co_return cursor::make_cursor(resource_);
     }
 
     actor_zeta::unique_future<cursor::cursor_t_ptr>
     KafkaManager::add_stream_insert(session_hash_t id, std::string stream, std::string insert_sql) {
-        OTX_ZONE_N("KafkaManager::add_stream_insert");
-        log_->debug("add_stream_insert id {}: INSERT INTO stream '{}'", id, stream);
-
-        // Target must be a registered STREAM — continuous fan-in is stream-only
-        // (a SELECT into a SOURCE would be a silent one-shot snapshot)
-        auto sink_it = registry_.find(stream);
-        if (sink_it == registry_.end()) {
-            co_return cursor::make_cursor(
-                resource_,
-                core::error_t(core::error_code_t::do_not_exists,
-                              std::pmr::string{"kafka: INSERT INTO unknown object '" + stream + "'", resource_}));
-        }
-        if (sink_it->second.op != kafka_op::create_stream) {
-            co_return cursor::make_cursor(
-                resource_,
-                core::error_t(core::error_code_t::invalid_parameter,
-                              std::pmr::string{"kafka: INSERT INTO ... SELECT target '" + stream +
-                                                   "' is not a STREAM; continuous fan-in is only into a STREAM",
-                                               resource_}));
-        }
-        const auto& sink_opts = sink_it->second.options;
-        const auto out_topic = sink_opts.find("kafka_topic");
-        const auto out_bootstrap = sink_opts.find("bootstrap_servers");
-        if (out_topic == sink_opts.end() || out_bootstrap == sink_opts.end()) {
-            co_return cursor::make_cursor(
-                resource_,
-                core::error_t(core::error_code_t::invalid_parameter,
-                              std::pmr::string{"kafka: stream '" + stream + "' has no KAFKA_TOPIC/BOOTSTRAP_SERVERS",
-                                               resource_}));
-        }
-
-        // Compile the INSERT once: find the SELECT's source (a known kafka object)
-        // and compute the output schema for the union guard
-        auto invalid = [&](const std::string& why) {
-            return cursor::make_cursor(
-                resource_,
-                core::error_t(core::error_code_t::invalid_parameter,
-                              std::pmr::string{"kafka: INSERT INTO ... SELECT invalid: " + why, resource_}));
-        };
-        auto plan = kafka_parse_plan(resource_, insert_sql);
-        if (plan.has_error()) {
-            co_return invalid(plan.error().what.c_str());
-        }
-        const auto* agg =
-            plan.value().sub_queries.empty() ? nullptr : kafka_find_aggregate(plan.value().sub_queries.back());
-        if (!agg) {
-            co_return invalid("SELECT has no source table");
-        }
-        const std::string source_relname = agg->target().collection.t;
-        const auto src_it = registry_.find(source_relname);
-        if (src_it == registry_.end()) {
-            co_return invalid("unknown source '" + source_relname + "'");
-        }
-        auto out_columns =
-            stream_output_schema(resource_, *agg, plan.value().parameters.get(), src_it->second.columns);
-        for (std::size_t i = 0; i < out_columns.size(); ++i) {
-            if (out_columns[i].name.empty()) {
-                co_return invalid("output column " + std::to_string(i + 1) +
-                                  " has no name; alias it so the produced JSON can be keyed");
-            }
-        }
-
-        // Union guard: the query's output must be positionally type-compatible with
-        // the stream's schema, or the shared output topic gets incompatible records
-        if (!columns_type_compatible(out_columns, sink_it->second.columns)) {
-            co_return cursor::make_cursor(
-                resource_,
-                core::error_t(core::error_code_t::invalid_parameter,
-                              std::pmr::string{"kafka: INSERT INTO '" + stream +
-                                                   "' SELECT output does not match the stream's schema",
-                                               resource_}));
-        }
-
-        // Exactly-once is inherited from the target stream's TRANSACTIONAL option
+        // What the statement needs after its first co_await, copied out of the
+        // registry: another coroutine of this loop may change it meanwhile.
+        std::string out_topic;
+        std::string out_bootstrap;
+        std::string source_relname;
+        std::vector<kafka_column_t> out_columns;
         bool transactional = false;
-        if (const auto t = sink_opts.find("transactional"); t != sink_opts.end()) {
-            std::string value = t->second;
-            std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
-                return static_cast<char>(std::tolower(c));
-            });
-            transactional = (value == "true");
-        }
-
-        // An anonymous persistent query gets a unique internal name (own
-        // registry_/streams_/__sources entry, consumer group + producer txn id)
-        // The do-while skips any name a recovered query already holds
         std::string query_name;
-        do {
-            query_name = stream + "__insert__" + std::to_string(insert_query_seq_++);
-        } while (registry_.count(query_name) != 0 || streams_.count(query_name) != 0);
-        const std::string group_id = "otterstax_insert_" + query_name;
+        std::string group_id;
+        {
+            // The loop interleaves its coroutines on one thread: the zone closes
+            // before the first co_await (root CLAUDE.md, Tracy).
+            OTX_ZONE_N("KafkaManager::add_stream_insert");
+            log_->debug("add_stream_insert id {}: INSERT INTO stream '{}'", id, stream);
+
+            // Target must be a registered STREAM — continuous fan-in is stream-only
+            // (a SELECT into a SOURCE would be a silent one-shot snapshot)
+            auto sink_it = registry_.find(stream);
+            if (sink_it == registry_.end()) {
+                co_return cursor::make_cursor(
+                    resource_,
+                    core::error_t(core::error_code_t::do_not_exists,
+                                  std::pmr::string{"kafka: INSERT INTO unknown object '" + stream + "'", resource_}));
+            }
+            if (sink_it->second.op != kafka_op::create_stream) {
+                co_return cursor::make_cursor(
+                    resource_,
+                    core::error_t(core::error_code_t::invalid_parameter,
+                                  std::pmr::string{"kafka: INSERT INTO ... SELECT target '" + stream +
+                                                       "' is not a STREAM; continuous fan-in is only into a STREAM",
+                                                   resource_}));
+            }
+            const auto& sink_opts = sink_it->second.options;
+            const auto topic_it = sink_opts.find("kafka_topic");
+            const auto bootstrap_it = sink_opts.find("bootstrap_servers");
+            if (topic_it == sink_opts.end() || bootstrap_it == sink_opts.end()) {
+                co_return cursor::make_cursor(
+                    resource_,
+                    core::error_t(core::error_code_t::invalid_parameter,
+                                  std::pmr::string{"kafka: stream '" + stream + "' has no KAFKA_TOPIC/BOOTSTRAP_SERVERS",
+                                                   resource_}));
+            }
+            out_topic = topic_it->second;
+            out_bootstrap = bootstrap_it->second;
+
+            // Compile the INSERT once: find the SELECT's source (a known kafka object)
+            // and compute the output schema for the union guard
+            auto invalid = [&](const std::string& why) {
+                return cursor::make_cursor(
+                    resource_,
+                    core::error_t(core::error_code_t::invalid_parameter,
+                                  std::pmr::string{"kafka: INSERT INTO ... SELECT invalid: " + why, resource_}));
+            };
+            auto plan = kafka_parse_plan(resource_, insert_sql);
+            if (plan.has_error()) {
+                co_return invalid(plan.error().what.c_str());
+            }
+            const auto* agg =
+                plan.value().sub_queries.empty() ? nullptr : kafka_find_aggregate(plan.value().sub_queries.back());
+            if (!agg) {
+                co_return invalid("SELECT has no source table");
+            }
+            source_relname = agg->target().collection.t;
+            const auto src_it = registry_.find(source_relname);
+            if (src_it == registry_.end()) {
+                co_return invalid("unknown source '" + source_relname + "'");
+            }
+            out_columns =
+                stream_output_schema(resource_, *agg, plan.value().parameters.get(), src_it->second.columns);
+            for (std::size_t i = 0; i < out_columns.size(); ++i) {
+                if (out_columns[i].name.empty()) {
+                    co_return invalid("output column " + std::to_string(i + 1) +
+                                      " has no name; alias it so the produced JSON can be keyed");
+                }
+            }
+
+            // Union guard: the query's output must be positionally type-compatible with
+            // the stream's schema, or the shared output topic gets incompatible records
+            if (!columns_type_compatible(out_columns, sink_it->second.columns)) {
+                co_return cursor::make_cursor(
+                    resource_,
+                    core::error_t(core::error_code_t::invalid_parameter,
+                                  std::pmr::string{"kafka: INSERT INTO '" + stream +
+                                                       "' SELECT output does not match the stream's schema",
+                                                   resource_}));
+            }
+
+            // Exactly-once is inherited from the target stream's TRANSACTIONAL option
+            if (const auto t = sink_opts.find("transactional"); t != sink_opts.end()) {
+                std::string value = t->second;
+                std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+                    return static_cast<char>(std::tolower(c));
+                });
+                transactional = (value == "true");
+            }
+
+            // An anonymous persistent query gets a unique internal name (own
+            // registry_/streams_/__sources entry, consumer group + producer txn id)
+            // The do-while skips any name a recovered query already holds
+            do {
+                query_name = stream + "__insert__" + std::to_string(insert_query_seq_++);
+            } while (registry_.count(query_name) != 0 || streams_.count(query_name) != 0);
+            group_id = "otterstax_insert_" + query_name;
+        }
 
         // Persist first so a restart relaunches it (kind='insert'; topic/bootstrap =
         // the stream's OUT side; as_select carries the whole INSERT — the target
@@ -254,8 +279,8 @@ namespace otterstax::kafka {
         }
         if (auto persisted = co_await persist_source_meta(query_name,
                                                           "insert",
-                                                          out_topic->second,
-                                                          out_bootstrap->second,
+                                                          out_topic,
+                                                          out_bootstrap,
                                                           group_id,
                                                           "earliest",
                                                           transactional,
@@ -277,8 +302,8 @@ namespace otterstax::kafka {
         kafka_object_t obj;
         obj.op = kafka_op::create_stream;
         obj.columns = std::move(out_columns);
-        obj.options["kafka_topic"] = out_topic->second;
-        obj.options["bootstrap_servers"] = out_bootstrap->second;
+        obj.options["kafka_topic"] = out_topic;
+        obj.options["bootstrap_servers"] = out_bootstrap;
         obj.options["group_id"] = group_id;
         obj.options["offset_reset"] = "earliest";
         if (transactional) {

@@ -98,7 +98,8 @@ namespace frontend::mysql {
                 break;
             default:
                 column_length = 255;
-                charset = character_set::UTF8_GENERAL_CI;
+                // The handshake's collation: utf-8 text compared byte by byte.
+                charset = character_set::UTF8MB4_BIN;
                 break;
         }
     }

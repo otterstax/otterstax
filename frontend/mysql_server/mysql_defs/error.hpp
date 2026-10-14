@@ -35,6 +35,7 @@ namespace frontend::mysql {
         ER_UNKNOWN_STMT_HANDLER = 1243,     // Unknown prepared statement handler
         ER_NOT_SUPPORTED_YET = 1235,        // A result column type the wire cannot encode
         ER_QUERY_TIMEOUT = 3024,
+        ER_UNKNOWN_SYSTEM_VARIABLE = 1193, // SELECT @@<a variable the server does not have>
     };
 
     struct sql_state {

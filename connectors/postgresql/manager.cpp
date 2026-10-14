@@ -2,11 +2,9 @@
 // Copyright 2025-2026  OtterStax
 
 #include "manager.hpp"
-#include "catalog/catalog_manager.hpp"
 #include "utility/connection_uid.hpp"
 #include "utility/logger.hpp"
 #include "utility/parse_port.hpp"
-#include "utility/settled_future.hpp"
 #include "utility/tracy_profiler.hpp"
 
 
@@ -20,13 +18,11 @@ namespace pg {
     }
 
     ConnectorManager::ConnectorManager(std::pmr::memory_resource* resource,
-                                       actor_zeta::address_t catalog_manager,
                                        connector_factory make_connector,
-                                       size_t pool_size)
+                                       size_t io_threads)
         : resource_(resource)
         , log_(get_logger(logger_tag::CONNECTOR_MANAGER))
-        , thread_pool_manager_(pool_size)
-        , catalog_manager_(catalog_manager)
+        , thread_pool_manager_(io_threads)
         , make_connector_(make_connector) {
         assert(log_.is_valid());
         assert(resource_ != nullptr);
@@ -39,10 +35,31 @@ namespace pg {
 
     void ConnectorManager::stop() { thread_pool_manager_.stop(); }
 
+    void ConnectorManager::shutdown() noexcept {
+        OTX_ZONE_N("pg::ConnectorManager::shutdown");
+        if (stopping_.exchange(true, std::memory_order_acq_rel)) {
+            return;
+        }
+        // The registry is read-only after startup (addConnection / removeConnection), so walking it
+        // here races nothing; each pool locks its own state.
+        for (auto& [uuid, pool] : connections_) {
+            pool->close();
+            pool->for_each_in_use([](IConnector& connector) { connector.cancel(); });
+        }
+    }
+
     core::result_wrapper_t<std::string>
-    ConnectorManager::addConnection(connect_params connection_param, const std::string& uuid) {
+    ConnectorManager::addConnection(connect_params connection_param, const std::string& uuid, std::size_t pool_size) {
         OTX_ZONE_N("pg::ConnectorManager::addConnection");
-        // The catalog's discovery queries run on the pool's io_context; without a
+        if (pool_size == 0) {
+            log_->error("Add PostgreSQL connection {} failed: pool_size must be at least 1", uuid);
+            return core::error_t(
+                core::error_code_t::invalid_parameter,
+                std::pmr::string{("[PgConnectorManager::addConnection] pool_size of '" + uuid + "' must be at least 1")
+                                     .c_str(),
+                                 resource_});
+        }
+        // The discovery queries run on the pool's io_context; without a
         // running pool they would wait forever.
         if (thread_pool_manager_.status() != thread_pool_status::RUNNING) {
             log_->error("Add PostgreSQL connection {} failed: connector thread pool is not running", uuid);
@@ -52,46 +69,31 @@ namespace pg {
                                  resource_});
         }
 
-        log_->debug("Try add PostgreSQL connection with uuid: {}", uuid);
-        auto connector = make_connector_(resource_, connection_param, uuid);
-        if (auto err = connector->connect(); err.contains_error()) {
-            log_->error("Add PostgreSQL connection {} failed: {}", uuid, err.what);
-            return std::move(err);
+        log_->debug("Try add PostgreSQL connection with uuid: {} (pool_size {})", uuid, pool_size);
+        std::vector<std::unique_ptr<pg::IConnector>> connectors;
+        connectors.reserve(pool_size);
+        for (std::size_t i = 0; i < pool_size; ++i) {
+            auto connector = make_connector_(resource_, connection_param, uuid);
+            if (auto err = connector->connect(); err.contains_error()) {
+                log_->error("Add PostgreSQL connection {} failed (connection {} of {}): {}",
+                            uuid,
+                            i + 1,
+                            pool_size,
+                            err.what);
+                for (auto& opened : connectors) {
+                    opened->close();
+                }
+                return std::move(err);
+            }
+            connectors.push_back(std::move(connector));
         }
-        connections_[uuid] = std::move(connector);
-
-        // For PostgreSQL: use schema.table format
-        // qualified_name_t(database, schema, collection) -> database.schema, with unique_identifier=uuid
-        // We need to store: uuid=alias, database, schema, table
-        qualified_name_t name(core::uid_t{uuid},
-                              core::dbname_t{connection_param.database},
-                              core::schema_t{connection_param.schema.empty() ? "public" : connection_param.schema},
-                              core::relname_t{connection_param.table});
-        log_->debug("Creating collection_full_name: uid={}, db={}, schema={}, table={}",
-                    name.unique_identifier.t,
-                    name.database.t,
-                    name.schema.t,
-                    name.collection.t);
-        // The catalog answers synchronously (running the probes through the
-        // PostgreSQL backend actor that owns this manager), and a connection
-        // whose schema could not be registered is unusable for federated SQL,
-        // so it is closed and dropped here.
-        auto [needs_sched, registered] = actor_zeta::send(catalog_manager_,
-                                                          &mysql::CatalogManager::add_connection_schema,
-                                                          std::move(name),
-                                                          catalog_ext::ConnectionType::PostgreSQL);
-        if (auto err = otterstax::take_settled_error(std::move(registered), resource_); err.contains_error()) {
-            log_->error("Add PostgreSQL connection {} failed: schema registration: {}", uuid, err.what);
-            connections_[uuid]->close();
-            connections_.erase(uuid);
-            return std::move(err);
-        }
+        connections_[uuid] = std::make_unique<connection_pool>(std::move(connectors));
         return uuid;
     }
 
     core::result_wrapper_t<std::string>
     ConnectorManager::addConnection(conn::api_server::PgConnectionParams connection_param) {
-        OTX_ZONE_N("pg::ConnectorManager::addConnection(http)");
+        OTX_ZONE_N("pg::ConnectorManager::addConnection(params)");
         connect_params params;
         log_->debug("Try add PostgreSQL connection with alias: {}", connection_param.alias);
         log_->debug("Host: {}", connection_param.host);
@@ -114,10 +116,66 @@ namespace pg {
 
         log_->debug("Schema: {}, Table: {}", params.schema, params.table);
 
-        return addConnection(params, connection_param.alias);
+        return addConnection(params, connection_param.alias, connection_param.pool_size);
+    }
+
+    core::result_wrapper_t<connection_pool::handle_t> ConnectorManager::checkout_(const std::string& uuid,
+                                                                                 connection_pool& pool) {
+        OTX_ZONE_N("pg::ConnectorManager::checkout");
+        auto checked_out = pool.checkout_for(checkoutTimeout());
+        if (!checked_out) {
+            std::string what = "[PgConnectorManager::checkout] no free connection of '" + uuid + "' within " +
+                               std::to_string(checkoutTimeout().count()) + " ms (pool_size " +
+                               std::to_string(pool.size()) + ")";
+            log_->error(what);
+            return core::error_t(core::error_code_t::io_error, std::pmr::string{what.c_str(), resource_});
+        }
+        connection_pool::handle_t handle = std::move(*checked_out);
+        if (handle->status() == Status::Closed) {
+            log_->error("[PgConnectorManager::executeQuery] Connector is not connected");
+            return core::error_t(
+                core::error_code_t::io_error,
+                std::pmr::string{"[PgConnectorManager::executeQuery] Connector is not connected", resource_});
+        }
+        if (!handle->isConnected()) {
+            if (auto err = handle->tryReconnect(); err.contains_error()) {
+                return std::move(err);
+            }
+        }
+        return std::move(handle);
+    }
+
+    void ConnectorManager::setCheckoutTimeout(std::chrono::milliseconds timeout) noexcept {
+        checkout_timeout_ms_.store(timeout.count(), std::memory_order_relaxed);
+    }
+
+    std::chrono::milliseconds ConnectorManager::checkoutTimeout() const noexcept {
+        return std::chrono::milliseconds{checkout_timeout_ms_.load(std::memory_order_relaxed)};
     }
 
     size_t ConnectorManager::totalConnections() const noexcept { return connections_.size(); }
 
     bool ConnectorManager::hasConnection(const std::string& uuid) const noexcept { return connections_.contains(uuid); }
+
+    size_t ConnectorManager::poolSize(const std::string& uuid) const noexcept {
+        auto pool = connections_.find(uuid);
+        return pool == connections_.end() ? 0 : pool->second->size();
+    }
+
+    size_t ConnectorManager::idleConnections(const std::string& uuid) const {
+        auto pool = connections_.find(uuid);
+        return pool == connections_.end() ? 0 : pool->second->idle();
+    }
+
+
+    void ConnectorManager::removeConnection(const std::string& uuid) {
+        OTX_ZONE_N("pg::ConnectorManager::removeConnection");
+        auto it = connections_.find(uuid);
+        if (it == connections_.end()) {
+            return;
+        }
+        it->second->for_each_idle([](pg::IConnector& connector) { connector.close(); });
+        connections_.erase(it);
+    }
+
 } // namespace pg

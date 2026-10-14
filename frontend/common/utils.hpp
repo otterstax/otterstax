@@ -7,12 +7,12 @@
 #include "../postgres_server/postgres_defs/field_type.hpp"
 
 #include <components/types/types.hpp>
+#include <array>
 #include <cstdint>
 #include <iomanip>
 #include <iostream>
 #include <limits>
 #include <optional>
-#include <random>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -121,7 +121,31 @@ namespace frontend {
     // The enumerator's name, for error messages ("HUGEINT", "UNKNOWN").
     std::string_view logical_type_name(components::types::logical_type type);
 
-    std::vector<uint8_t> generate_backend_key(size_t size);
+    // `size` bytes from a cryptographically secure generator (OpenSSL RAND_bytes),
+    // or nullopt when it cannot produce them (no entropy source). Callable from
+    // any thread. What the wire servers hand out as secrets comes from it: the
+    // MySQL auth scramble and the PostgreSQL BackendKeyData secret, which a
+    // CancelRequest presents — a client that saw other connections' values must
+    // not be able to predict the next one (a shared std::mt19937 was both a data
+    // race between concurrent handshakes and predictable from its outputs).
+    std::optional<std::vector<uint8_t>> secure_random_bytes(size_t size);
+
+    // Lower-case hex of `bytes` (two characters a byte).
+    std::string hex_encode(const std::vector<uint8_t>& bytes);
+
+    // `size` bytes of secure_random_bytes as lower-case hex (2 * size
+    // characters), or nullopt when no secure bytes can be had. What the Flight
+    // SQL server names its tickets and prepared-statement handles with.
+    std::optional<std::string> secure_random_hex(size_t size);
+
+    // The RFC 9562 version-4 UUID string (`xxxxxxxx-xxxx-4xxx-Yxxx-xxxxxxxxxxxx`,
+    // lower case, Y one of 8 9 a b) made of these 16 bytes: the version and
+    // variant bits are set, the other 122 bits are the bytes' own.
+    std::string uuid_v4_string(const std::array<uint8_t, 16>& bytes);
+
+    // A random version-4 UUID from secure_random_bytes, or nullopt when no secure
+    // bytes can be had. The Spark Connect response ids.
+    std::optional<std::string> secure_uuid_v4();
 
     std::string hex_dump(const std::vector<uint8_t>& data, size_t max_bytes = 32);
 } // namespace frontend

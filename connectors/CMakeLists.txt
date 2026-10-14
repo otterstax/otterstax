@@ -16,6 +16,8 @@ set(CONNECTORS_HEADERS
     api_connections/connection_config.hpp
     api_connections/pg_connection_config.hpp
     api_connections/ch_connection_config.hpp
+    common/connection_pool.hpp
+    common/pooled_query.hpp
 )
 
 set(CONNECTORS_SOURCES

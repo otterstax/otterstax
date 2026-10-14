@@ -144,8 +144,12 @@ class client:
             cursor.execute(f"UPDATE {self.test_database}.{self.test_table} SET budget = %s WHERE _id = %s",
                            (64617.54, gen_id(1)))  # subtract 30
 
+            # The engine types the result, not MariaDB: SUM over an integer
+            # column is BIGINT (int8 on this wire), not MariaDB's DECIMAL text.
             cursor.execute(f"SELECT SUM(campaign_length) AS sum_ FROM {self.test_database}.{self.test_table}")
-            upd = int(cursor.fetchall()[0][0])
+            upd = cursor.fetchall()[0][0]
+            if not isinstance(upd, int):
+                raise ValueError(f"SUM(int) must arrive as BIGINT (int), got {type(upd).__name__}: {upd!r}")
 
             for row in initial_l:
                 upd -= row[0]
@@ -159,7 +163,11 @@ class client:
             for row in initial_b:
                 upd -= row[0]
 
-            self.assert_floating_equal(upd, -29.999999)
+            # SUM over a FLOAT column is FLOAT (the engine's rule: a floating
+            # sum keeps its input type), so the ~7.4e5 total carries float32
+            # precision — a step of 1/16 there — and the difference is -30 to
+            # within that, not to 1e-6.
+            self.assert_floating_equal(upd, -30.0, tol=0.1)
 
     def test_float_column_reads_back_the_stored_value(self):
         """A FLOAT column comes back as the float32 the backend holds, not a rounding of it.

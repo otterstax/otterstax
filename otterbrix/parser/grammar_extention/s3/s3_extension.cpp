@@ -178,7 +178,7 @@ namespace s3_ext {
         // The transformer routes by extension_id, so this only ever runs for our nodes.
         assert(node->extension_id != nullptr && std::string_view(node->extension_id) == "s3");
 
-        // Lower the parsed statement into an external_node_t the Scheduler routes
+        // Lower the parsed statement into an external_node_t the query session routes
         // to the S3 manager. nullptr option fields collapse to empty strings.
         const auto* stmt = static_cast<const s3_stmt*>(node->data);
         const auto str = [](const char* s) { return s ? std::string{s} : std::string{}; };

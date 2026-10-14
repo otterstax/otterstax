@@ -6,9 +6,9 @@ E2E test: Spark Connect (port 15002) frontend querying a MySQL/MariaDB backend.
 
 Exercises both supported execution paths through the OtterStax Spark Connect server:
   * Path A — spark.sql("...") passes the federated SQL string straight through to
-    the Scheduler, which resolves the `campaigns` alias to the MariaDB backend.
+    the query session, which resolves the `campaigns` alias to the MariaDB backend.
   * Path B — DataFrame ops (filter/select) build a logical plan in the
-    plan_translator and run through the same Scheduler pipeline.
+    plan_translator and run through the same query-session pipeline.
 
 Usage:
     python test_spark_client_mysql_backend.py            # docker (host=test-otterstax)

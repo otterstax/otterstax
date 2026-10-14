@@ -167,16 +167,19 @@ class TestADBCDriver:
             assert cur.fetch_arrow_table().num_rows == 1
             cur.close()
 
-    def test_get_objects(self, server_uri):
-        # The metadata mirrors the REGISTERED backends (the catalog store holds
-        # their mirrored tables): with backends up their databases answer as
-        # catalogs, without any the root catalog does. The test runs in both
-        # environments and asserts the answer's shape, not the deployment.
+    def test_get_objects(self, server_uri, seeded):
+        # The listing holds the engine's own tables beside the registered
+        # backends' (catalog/introspection.cpp: pg_catalog for the local ones,
+        # federation.remote_tables for the remote ones, the federation and
+        # Kafka bookkeeping tables hidden). So the suite's own database is a
+        # catalog whatever backends the deployment has.
         with adbc_dbapi.connect(server_uri) as conn:
             objects = conn.adbc_get_objects(depth="all").read_all()
             assert objects.num_rows >= 1
             catalogs = objects.column("catalog_name").to_pylist()
             assert all(isinstance(c, str) for c in catalogs)
+            assert CATALOG in catalogs, f"the local database {CATALOG!r} is not listed: {catalogs}"
+            assert "federation" not in catalogs, f"the federation metadata database is listed: {catalogs}"
 
     def test_get_info(self, server_uri):
         with adbc_dbapi.connect(server_uri) as conn:

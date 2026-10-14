@@ -133,7 +133,7 @@ target_link_libraries(spark_connect_server PUBLIC
     otterbrix::otterbrix
     actor-zeta::actor-zeta
     catalog
-    scheduler
+    session
 )
 
 target_include_directories(spark_connect_server PUBLIC

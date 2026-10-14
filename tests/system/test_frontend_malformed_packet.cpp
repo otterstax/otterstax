@@ -25,7 +25,7 @@
 #include "frontend/postgres_server/postgres_defs/error.hpp"
 #include "frontend/postgres_server/postgres_server.hpp"
 #include "raw_wire_client.hpp"
-#include "scheduler_stack.hpp"
+#include "session_stack.hpp"
 
 #include <catch2/catch_all.hpp>
 
@@ -103,11 +103,11 @@ namespace {
     }
 
     template<typename Server>
-    frontend::frontend_server_config make_config(const otterstax::test::scheduler_stack& stack) {
+    frontend::frontend_server_config make_config(const otterstax::test::session_stack& stack) {
         return frontend::frontend_server_config{
             .resource = stack.resource,
             .port = 0,
-            .scheduler = stack.scheduler,
+            .sessions = stack.sessions,
             .read_timeout = PRODUCTION_TIMEOUT,
             .accept_retry_delay = std::chrono::milliseconds(frontend::ACCEPT_RETRY_DELAY_MS),
             .pool_size = 4,
@@ -306,7 +306,7 @@ namespace {
 } // namespace
 
 TEST_CASE("malformed packet: mysql COM_STMT_EXECUTE shorter than its header is ERR 1835 then close") {
-    otterstax::test::scheduler_stack_owner owner("/tmp/otterstax_frontend_malformed_mysql_execute", &make_parser);
+    otterstax::test::session_stack_owner owner("/tmp/otterstax_frontend_malformed_mysql_execute");
     frontend::mysql::mysql_server server(make_config<frontend::mysql::mysql_server>(owner.stack()));
     server.start();
 
@@ -324,7 +324,7 @@ TEST_CASE("malformed packet: mysql COM_STMT_EXECUTE shorter than its header is E
 }
 
 TEST_CASE("malformed packet: mysql COM_STMT_CLOSE shorter than its statement id is ERR 1835 then close") {
-    otterstax::test::scheduler_stack_owner owner("/tmp/otterstax_frontend_malformed_mysql_close", &make_parser);
+    otterstax::test::session_stack_owner owner("/tmp/otterstax_frontend_malformed_mysql_close");
     frontend::mysql::mysql_server server(make_config<frontend::mysql::mysql_server>(owner.stack()));
     server.start();
 
@@ -343,8 +343,7 @@ TEST_CASE("malformed packet: mysql COM_STMT_CLOSE shorter than its statement id 
 // name an executed result gives the column — the one COM_QUERY shows — and the
 // connection keeps serving.
 TEST_CASE("malformed packet: mysql COM_STMT_PREPARE of a result column without a name answers its column definition") {
-    otterstax::test::scheduler_stack_owner owner("/tmp/otterstax_frontend_malformed_mysql_unnamed_column",
-                                                 &make_parser);
+    otterstax::test::session_stack_owner owner("/tmp/otterstax_frontend_malformed_mysql_unnamed_column");
     frontend::mysql::mysql_server server(make_config<frontend::mysql::mysql_server>(owner.stack()));
     server.start();
 
@@ -372,7 +371,7 @@ TEST_CASE("malformed packet: mysql COM_STMT_PREPARE of a result column without a
 }
 
 TEST_CASE("malformed packet: mysql HandshakeResponse41 with an unterminated user name is ERR 1835 then close") {
-    otterstax::test::scheduler_stack_owner owner("/tmp/otterstax_frontend_malformed_mysql_auth", &make_parser);
+    otterstax::test::session_stack_owner owner("/tmp/otterstax_frontend_malformed_mysql_auth");
     frontend::mysql::mysql_server server(make_config<frontend::mysql::mysql_server>(owner.stack()));
     server.start();
 
@@ -394,7 +393,7 @@ TEST_CASE("malformed packet: mysql HandshakeResponse41 with an unterminated user
 
 TEST_CASE("malformed packet: postgres Parse with an unterminated statement name is ERROR 08P01 and the connection "
           "stays usable") {
-    otterstax::test::scheduler_stack_owner owner("/tmp/otterstax_frontend_malformed_pg_parse", &make_parser);
+    otterstax::test::session_stack_owner owner("/tmp/otterstax_frontend_malformed_pg_parse");
     frontend::postgres::postgres_server server(make_config<frontend::postgres::postgres_server>(owner.stack()));
     server.start();
 
@@ -412,7 +411,7 @@ TEST_CASE("malformed packet: postgres Parse with an unterminated statement name 
 
 TEST_CASE("malformed packet: postgres Parse with truncated parameter types is ERROR 08P01 and the connection stays "
           "usable") {
-    otterstax::test::scheduler_stack_owner owner("/tmp/otterstax_frontend_malformed_pg_parse_types", &make_parser);
+    otterstax::test::session_stack_owner owner("/tmp/otterstax_frontend_malformed_pg_parse_types");
     frontend::postgres::postgres_server server(make_config<frontend::postgres::postgres_server>(owner.stack()));
     server.start();
 
@@ -432,7 +431,7 @@ TEST_CASE("malformed packet: postgres Parse with truncated parameter types is ER
 }
 
 TEST_CASE("malformed packet: postgres Bind with truncated format codes is ERROR 08P01 and the connection stays usable") {
-    otterstax::test::scheduler_stack_owner owner("/tmp/otterstax_frontend_malformed_pg_bind", &make_parser);
+    otterstax::test::session_stack_owner owner("/tmp/otterstax_frontend_malformed_pg_bind");
     frontend::postgres::postgres_server server(make_config<frontend::postgres::postgres_server>(owner.stack()));
     server.start();
 
@@ -448,7 +447,7 @@ TEST_CASE("malformed packet: postgres Bind with truncated format codes is ERROR 
 
 TEST_CASE("malformed packet: postgres Execute shorter than its row limit is ERROR 08P01 and the connection stays "
           "usable") {
-    otterstax::test::scheduler_stack_owner owner("/tmp/otterstax_frontend_malformed_pg_execute", &make_parser);
+    otterstax::test::session_stack_owner owner("/tmp/otterstax_frontend_malformed_pg_execute");
     frontend::postgres::postgres_server server(make_config<frontend::postgres::postgres_server>(owner.stack()));
     server.start();
 
@@ -464,7 +463,7 @@ TEST_CASE("malformed packet: postgres Execute shorter than its row limit is ERRO
 
 TEST_CASE("malformed packet: postgres Describe with an unterminated name is ERROR 08P01 and the connection stays "
           "usable") {
-    otterstax::test::scheduler_stack_owner owner("/tmp/otterstax_frontend_malformed_pg_describe", &make_parser);
+    otterstax::test::session_stack_owner owner("/tmp/otterstax_frontend_malformed_pg_describe");
     frontend::postgres::postgres_server server(make_config<frontend::postgres::postgres_server>(owner.stack()));
     server.start();
 
@@ -479,7 +478,7 @@ TEST_CASE("malformed packet: postgres Describe with an unterminated name is ERRO
 }
 
 TEST_CASE("malformed packet: postgres Close without its type byte is ERROR 08P01 and the connection stays usable") {
-    otterstax::test::scheduler_stack_owner owner("/tmp/otterstax_frontend_malformed_pg_close", &make_parser);
+    otterstax::test::session_stack_owner owner("/tmp/otterstax_frontend_malformed_pg_close");
     frontend::postgres::postgres_server server(make_config<frontend::postgres::postgres_server>(owner.stack()));
     server.start();
 
@@ -494,7 +493,7 @@ TEST_CASE("malformed packet: postgres Close without its type byte is ERROR 08P01
 
 TEST_CASE("malformed packet: postgres Query without its terminator is ERROR 08P01 + ReadyForQuery and the connection "
           "stays usable") {
-    otterstax::test::scheduler_stack_owner owner("/tmp/otterstax_frontend_malformed_pg_query", &make_parser);
+    otterstax::test::session_stack_owner owner("/tmp/otterstax_frontend_malformed_pg_query");
     frontend::postgres::postgres_server server(make_config<frontend::postgres::postgres_server>(owner.stack()));
     server.start();
 
@@ -529,7 +528,7 @@ TEST_CASE("malformed packet: postgres Query without its terminator is ERROR 08P0
 }
 
 TEST_CASE("malformed packet: postgres StartupMessage with an unterminated parameter is FATAL 08P01 then close") {
-    otterstax::test::scheduler_stack_owner owner("/tmp/otterstax_frontend_malformed_pg_startup", &make_parser);
+    otterstax::test::session_stack_owner owner("/tmp/otterstax_frontend_malformed_pg_startup");
     frontend::postgres::postgres_server server(make_config<frontend::postgres::postgres_server>(owner.stack()));
     server.start();
 
@@ -560,7 +559,7 @@ TEST_CASE("malformed packet: postgres StartupMessage with an unterminated parame
 }
 
 TEST_CASE("malformed packet: postgres ReadyForQuery is T inside an explicit transaction and E once an error failed it") {
-    otterstax::test::scheduler_stack_owner owner("/tmp/otterstax_frontend_malformed_pg_transaction", &make_parser);
+    otterstax::test::session_stack_owner owner("/tmp/otterstax_frontend_malformed_pg_transaction");
     frontend::postgres::postgres_server server(make_config<frontend::postgres::postgres_server>(owner.stack()));
     server.start();
 
@@ -600,7 +599,7 @@ TEST_CASE("malformed packet: postgres ReadyForQuery is T inside an explicit tran
 }
 
 TEST_CASE("malformed packet: postgres message of a type the protocol does not define is FATAL 08P01 then close") {
-    otterstax::test::scheduler_stack_owner owner("/tmp/otterstax_frontend_malformed_pg_unknown_type", &make_parser);
+    otterstax::test::session_stack_owner owner("/tmp/otterstax_frontend_malformed_pg_unknown_type");
     frontend::postgres::postgres_server server(make_config<frontend::postgres::postgres_server>(owner.stack()));
     server.start();
 
@@ -639,7 +638,7 @@ TEST_CASE("malformed packet: postgres message of a type the protocol does not de
 }
 
 TEST_CASE("malformed packet: postgres CopyData CopyDone and CopyFail outside COPY are ignored") {
-    otterstax::test::scheduler_stack_owner owner("/tmp/otterstax_frontend_malformed_pg_copy", &make_parser);
+    otterstax::test::session_stack_owner owner("/tmp/otterstax_frontend_malformed_pg_copy");
     frontend::postgres::postgres_server server(make_config<frontend::postgres::postgres_server>(owner.stack()));
     server.start();
 
@@ -662,7 +661,7 @@ TEST_CASE("malformed packet: postgres CopyData CopyDone and CopyFail outside COP
 }
 
 TEST_CASE("malformed packet: postgres message with bytes after its last field is ERROR 08P01 invalid message format") {
-    otterstax::test::scheduler_stack_owner owner("/tmp/otterstax_frontend_malformed_pg_tail", &make_parser);
+    otterstax::test::session_stack_owner owner("/tmp/otterstax_frontend_malformed_pg_tail");
     frontend::postgres::postgres_server server(make_config<frontend::postgres::postgres_server>(owner.stack()));
     server.start();
 
@@ -751,7 +750,7 @@ TEST_CASE("malformed packet: postgres message with bytes after its last field is
 // NULL — is answered without an ErrorResponse, so each handler reads its body
 // to the last byte (remaining() == 0).
 TEST_CASE("malformed packet: postgres well-formed messages of every type are read to their last byte") {
-    otterstax::test::scheduler_stack_owner owner("/tmp/otterstax_frontend_malformed_pg_well_formed", &make_parser);
+    otterstax::test::session_stack_owner owner("/tmp/otterstax_frontend_malformed_pg_well_formed");
     frontend::postgres::postgres_server server(make_config<frontend::postgres::postgres_server>(owner.stack()));
     server.start();
 
@@ -869,7 +868,7 @@ TEST_CASE("malformed packet: postgres well-formed messages of every type are rea
 // for such a type. Describe answers the name an executed result gives the
 // column — the one the simple Query shows — and the connection keeps serving.
 TEST_CASE("malformed packet: postgres Describe of a result column without a name answers RowDescription") {
-    otterstax::test::scheduler_stack_owner owner("/tmp/otterstax_frontend_malformed_pg_unnamed_column", &make_parser);
+    otterstax::test::session_stack_owner owner("/tmp/otterstax_frontend_malformed_pg_unnamed_column");
     frontend::postgres::postgres_server server(make_config<frontend::postgres::postgres_server>(owner.stack()));
     server.start();
 
@@ -925,8 +924,7 @@ TEST_CASE("malformed packet: postgres Describe of a result column without a name
 // COM_QUERY and the binary one of COM_STMT_EXECUTE name it with the name an
 // executed SELECT 1 gives its column, and the connection keeps serving.
 TEST_CASE("malformed packet: mysql resultset of an executed column without a name answers its column definition") {
-    otterstax::test::scheduler_stack_owner owner("/tmp/otterstax_frontend_malformed_mysql_unnamed_executed",
-                                                 &make_parser);
+    otterstax::test::session_stack_owner owner("/tmp/otterstax_frontend_malformed_mysql_unnamed_executed");
     frontend::mysql::mysql_server server(make_config<frontend::mysql::mysql_server>(owner.stack()));
     server.start();
 
@@ -973,7 +971,7 @@ TEST_CASE("malformed packet: mysql resultset of an executed column without a nam
 // an alias. Both name it as an executed SELECT 1 names its column. A SELECT
 // over a VIEW reaches the same RowDescription with such a column on rc-2.
 TEST_CASE("malformed packet: postgres RowDescription of an executed column without a name is served") {
-    otterstax::test::scheduler_stack_owner owner("/tmp/otterstax_frontend_malformed_pg_unnamed_executed", &make_parser);
+    otterstax::test::session_stack_owner owner("/tmp/otterstax_frontend_malformed_pg_unnamed_executed");
     frontend::postgres::postgres_server server(make_config<frontend::postgres::postgres_server>(owner.stack()));
     server.start();
 

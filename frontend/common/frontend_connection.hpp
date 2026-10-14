@@ -92,8 +92,9 @@ namespace frontend {
         // pending operation has completed and before the pool slot is released
         // — the only point every way of ending a connection (client
         // quit/terminate, socket drop, protocol error, read timeout, server
-        // stop) passes through. The Scheduler outlives the frontend servers, so
-        // a message sent from here has a live receiver.
+        // stop) passes through. The connection closes its query session here;
+        // a statement still running in it (the client gave up waiting) finishes
+        // and the session frees itself afterwards.
         virtual void finish_impl() = 0;
 
         virtual log_t& get_logger_impl() = 0;

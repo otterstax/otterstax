@@ -3,7 +3,7 @@
 
 #include "flight_server.hpp"
 
-#include "../scheduler_engine.hpp"
+#include "../session_engine.hpp"
 
 #include <agrpc/register_awaitable_rpc_handler.hpp>
 
@@ -150,6 +150,7 @@ asio::awaitable<void> FlightServer::handle_do_action(auto& rpc, fp::Action& requ
         co_await rpc.finish({grpc::StatusCode::UNAUTHENTICATED, "flight-sql: invalid bearer token"});
         co_return;
     }
+    const std::string client = core_.auth().client_of(rpc.context());
     google::protobuf::Any request_any;
     if (!request_any.ParseFromString(request.body())) {
         co_await rpc.finish({grpc::StatusCode::INVALID_ARGUMENT, "flight-sql: malformed action body"});
@@ -168,13 +169,13 @@ asio::awaitable<void> FlightServer::handle_do_action(auto& rpc, fp::Action& requ
             co_return;
         }
         std::string handle;
-        status = core_.create_prepared(req.query(), &handle);
+        status = core_.create_prepared(req.query(), client, &handle);
         if (!status.ok()) {
             co_await rpc.finish(status);
             co_return;
         }
-        core::PreparedStatementState const* state = nullptr;
-        if ((status = core_.prepared_lookup(handle, &state)); !status.ok()) {
+        core::PreparedStatementState state;
+        if ((status = core_.prepared_lookup(handle, client, &state)); !status.ok()) {
             co_await rpc.finish(status);
             co_return;
         }
@@ -189,10 +190,10 @@ asio::awaitable<void> FlightServer::handle_do_action(auto& rpc, fp::Action& requ
             return true;
         };
         std::string bytes;
-        if (schema_bytes(state->prepared.dataset_schema, &bytes)) {
+        if (schema_bytes(state.prepared.dataset_schema, &bytes)) {
             create_result.set_dataset_schema(bytes);
         }
-        if (schema_bytes(state->prepared.parameter_schema, &bytes)) {
+        if (schema_bytes(state.prepared.parameter_schema, &bytes)) {
             create_result.set_parameter_schema(bytes);
         }
         google::protobuf::Any result_any;
@@ -210,7 +211,7 @@ asio::awaitable<void> FlightServer::handle_do_action(auto& rpc, fp::Action& requ
                                  "flight-sql: expected ActionClosePreparedStatementRequest"});
             co_return;
         }
-        if ((status = core_.close_prepared(req.prepared_statement_handle())); !status.ok()) {
+        if ((status = core_.close_prepared(req.prepared_statement_handle(), client)); !status.ok()) {
             co_await rpc.finish(status);
             co_return;
         }
@@ -264,17 +265,22 @@ asio::awaitable<void> FlightServer::handle_get_flight_info(auto& rpc, fp::Flight
         co_await rpc.finish_with_error({grpc::StatusCode::UNAUTHENTICATED, "flight-sql: invalid bearer token"});
         co_return;
     }
-    std::string ticket;
-    if (const auto st = core::execute_descriptor(core_, core_.engine(), request, &ticket);
+    const std::string client = core_.auth().client_of(rpc.context());
+    core::CachedResultPtr result;
+    if (const auto st = core::execute_descriptor(core_, core_.engine(), request, client, &result);
         !st.ok()) {
         co_await rpc.finish_with_error(st);
         co_return;
     }
+    // Built before the cache takes the result; the ticket once it has.
     fp::FlightInfo info;
-    if (const auto st = core_.make_flight_info(request, ticket, &info); !st.ok()) {
+    core::make_flight_info(request, *result, &info);
+    std::string ticket;
+    if (const auto st = core_.register_result(std::move(result), client, &ticket); !st.ok()) {
         co_await rpc.finish_with_error(st);
         co_return;
     }
+    core::set_flight_ticket(std::move(ticket), &info);
     co_await rpc.finish(info, grpc::Status::OK);
 }
 
@@ -283,19 +289,24 @@ asio::awaitable<void> FlightServer::handle_poll_flight_info(auto& rpc, fp::Fligh
         co_await rpc.finish_with_error({grpc::StatusCode::UNAUTHENTICATED, "flight-sql: invalid bearer token"});
         co_return;
     }
+    const std::string client = core_.auth().client_of(rpc.context());
     // Queries run synchronously — return a completed PollInfo right away
     // (no flight_descriptor: the query is complete; progress = 1.0).
-    std::string ticket;
-    if (const auto st = core::execute_descriptor(core_, core_.engine(), request, &ticket);
+    core::CachedResultPtr result;
+    if (const auto st = core::execute_descriptor(core_, core_.engine(), request, client, &result);
         !st.ok()) {
         co_await rpc.finish_with_error(st);
         co_return;
     }
+    // Built before the cache takes the result; the ticket once it has.
     fp::FlightInfo info;
-    if (const auto st = core_.make_flight_info(request, ticket, &info); !st.ok()) {
+    core::make_flight_info(request, *result, &info);
+    std::string ticket;
+    if (const auto st = core_.register_result(std::move(result), client, &ticket); !st.ok()) {
         co_await rpc.finish_with_error(st);
         co_return;
     }
+    core::set_flight_ticket(std::move(ticket), &info);
     fp::PollInfo poll;
     *poll.mutable_info() = std::move(info);
     poll.set_progress(1.0);
@@ -307,17 +318,16 @@ asio::awaitable<void> FlightServer::handle_get_schema(auto& rpc, fp::FlightDescr
         co_await rpc.finish_with_error({grpc::StatusCode::UNAUTHENTICATED, "flight-sql: invalid bearer token"});
         co_return;
     }
-    std::string ticket;
-    if (const auto st = core::execute_descriptor(core_, core_.engine(), request, &ticket);
+    const std::string client = core_.auth().client_of(rpc.context());
+    // The result is described, never registered: GetSchema hands out no ticket.
+    core::CachedResultPtr materialized;
+    if (const auto st = core::execute_descriptor(core_, core_.engine(), request, client, &materialized);
         !st.ok()) {
         co_await rpc.finish_with_error(st);
         co_return;
     }
     fp::SchemaResult result;
-    if (const auto st = core_.make_schema_result(ticket, &result); !st.ok()) {
-        co_await rpc.finish_with_error(st);
-        co_return;
-    }
+    result.set_schema(materialized->schema_ipc.data(), materialized->schema_ipc.size());
     co_await rpc.finish(result, grpc::Status::OK);
 }
 
@@ -328,8 +338,10 @@ asio::awaitable<void> FlightServer::handle_do_get(auto& rpc, fp::Ticket& request
         co_await rpc.finish({grpc::StatusCode::UNAUTHENTICATED, "flight-sql: invalid bearer token"});
         co_return;
     }
-    core::CachedResult const* cached = nullptr;
-    if (const auto st = core_.lookup(request.ticket(), &cached); !st.ok()) {
+    const std::string client = core_.auth().client_of(rpc.context());
+    // Taken out of the cache (tickets are single use) and held for the stream.
+    core::CachedResultPtr cached;
+    if (const auto st = core_.take_result(request.ticket(), client, &cached); !st.ok()) {
         co_await rpc.finish(st);
         co_return;
     }
@@ -358,6 +370,7 @@ asio::awaitable<void> FlightServer::handle_do_put(auto& rpc) {
         co_await rpc.finish({grpc::StatusCode::UNAUTHENTICATED, "flight-sql: invalid bearer token"});
         co_return;
     }
+    const std::string client = core_.auth().client_of(rpc.context());
     fp::FlightData data;
     bool have_descriptor = false;
     core::DoPutCommand command;
@@ -413,15 +426,11 @@ asio::awaitable<void> FlightServer::handle_do_put(auto& rpc) {
                 break;
             }
             case core::DoPutKind::PreparedUpdate: {
-                core::PreparedStatementState const* state = nullptr;
-                if ((status = core_.prepared_lookup(command.handle, &state)); status.ok()) {
-                    record_count =
-                        core_.engine().execute_update_prepared(state->prepared, state->bound);
-                }
+                status = core_.execute_update_prepared(command.handle, client, &record_count);
                 break;
             }
             case core::DoPutKind::PreparedBind: {
-                status = core_.prepared_bind(command.handle, std::move(bound_rows));
+                status = core_.prepared_bind(command.handle, client, std::move(bound_rows));
                 break;
             }
         }

@@ -22,11 +22,13 @@
 #include "utility/wait_barrier.hpp"
 #include <integration/cpp/otterbrix.hpp>
 
+#include <atomic>
 #include <concepts>
 #include <coroutine>
 #include <exception>
 #include <memory>
 #include <memory_resource>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -73,6 +75,12 @@ namespace ch {
         virtual core::error_t tryReconnect() = 0;
         virtual bool isClosed() const noexcept = 0;
         virtual std::string alias() const noexcept = 0;
+        // Aborts the statement this connector runs, from any thread (the connector manager's
+        // shutdown): the driver's socket is shut down, so the blocking Execute throws at once and the
+        // statement answers io_error, and the connector refuses every later statement. Never blocks.
+        // The default does nothing: a connector that cannot abort (a test stub) lets its statement
+        // finish.
+        virtual void cancel() noexcept {}
 
         virtual asio::awaitable<core::result_wrapper_t<std::unique_ptr<data_chunk_t>>>
         runQuery(std::string_view query,
@@ -96,6 +104,15 @@ namespace ch {
         core::error_t tryReconnect() override;
         bool isClosed() const noexcept override;
         std::string alias() const noexcept override;
+        void cancel() noexcept override;
+
+        // The native descriptor of the driver's live socket, tracked so cancel() can shut it down
+        // from another thread: set when the driver's socket is created, cleared (under the same
+        // mutex) before it is closed, so shutdown never reaches a descriptor reused by someone else.
+        struct socket_slot_t {
+            std::mutex mutex;
+            int descriptor{-1};
+        };
 
         asio::awaitable<core::result_wrapper_t<std::unique_ptr<data_chunk_t>>>
         runQuery(std::string_view query,
@@ -129,6 +146,9 @@ namespace ch {
         runQuery_(std::string_view query, Callable handler) {
             OTX_ZONE_N("ch::Connector::runQuery");
             using result_t = std::invoke_result_t<Callable, const select_result_t&>;
+            if (cancelled_.load(std::memory_order_acquire)) {
+                co_return connection_error("[Run query] Connector with alias: " + alias_ + " was cancelled");
+            }
             if (status_ != Status::Connected) {
                 std::string err = "[Run query] Connector with alias: " + alias_ + " is not connected";
                 log_->error(err);
@@ -146,7 +166,12 @@ namespace ch {
         }
 
     private:
+        // A driver client over a socket factory that records its descriptor in socket_.
+        std::unique_ptr<clickhouse::Client> open_client() const;
+
         std::pmr::memory_resource* resource_;
+        std::shared_ptr<socket_slot_t> socket_{std::make_shared<socket_slot_t>()};
+        std::atomic<bool> cancelled_{false};
         std::unique_ptr<clickhouse::Client> client_;
         connect_params params_;
         Status status_;

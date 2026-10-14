@@ -58,7 +58,8 @@ namespace frontend::mysql {
     }
 
     std::vector<std::vector<uint8_t>> mysql_resultset::build_packets(mysql_resultset&& resultset,
-                                                                     uint8_t& sequence_id) {
+                                                                     uint8_t& sequence_id,
+                                                                     server_status_flags_t status) {
         std::vector<std::vector<uint8_t>> packets;
         packets.reserve(1 + resultset.column_defs_.size() + 1 + resultset.encoded_rows_.size() + 1);
 
@@ -74,7 +75,7 @@ namespace frontend::mysql {
         }
 
         // EOF after columns
-        packets.emplace_back(build_eof(writer, sequence_id++));
+        packets.emplace_back(build_eof(writer, sequence_id++, 0, status));
 
         // rows
         for (auto&& row : resultset.encoded_rows_) {
@@ -83,7 +84,7 @@ namespace frontend::mysql {
         }
 
         // Final EOF packet
-        packets.emplace_back(build_eof(writer, sequence_id++));
+        packets.emplace_back(build_eof(writer, sequence_id++, 0, status));
         return packets;
     }
 

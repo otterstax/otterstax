@@ -166,7 +166,7 @@ class client:
         having changed the backend. Asserted on three wire shapes: psycopg2 goes
         through simple query, psycopg3-with-parameters through Bind/Execute on
         the unnamed statement, and `prepare=True` through a NAMED statement that
-        is Parsed once and Executed repeatedly (the worker drops a statement
+        is Parsed once and Executed repeatedly (the session drops a statement
         after it ran, so every later Execute is a re-prepare).
         """
         table = f"{self.test_database}.{self.test_table}"

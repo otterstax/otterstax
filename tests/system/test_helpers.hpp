@@ -1,18 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2025-2026  OtterStax
 //
-// Helpers shared by the system tests that build an actor graph by hand rather
-// than through scheduler_stack_owner: polling a cross-actor future from a plain
-// thread, a default-config engine, and the connect params a mock MySQL
-// connection needs to register with the catalog.
+// Helpers shared by the system tests that build part of an actor graph by
+// hand rather than through session_stack_owner: polling a cross-actor future
+// from a plain thread.
 
 #pragma once
 
-#include "integration/otterbrix/otterbrix_manager.hpp"
 #include "utility/logger.hpp"
-
-#include <boost/mysql/connect_params.hpp>
-#include <integration/cpp/otterbrix.hpp>
 
 #include <catch2/catch_all.hpp>
 
@@ -39,25 +34,6 @@ namespace otterstax::test {
     void wait_until_ready(Future& future) {
         using namespace std::chrono_literals;
         REQUIRE(poll_until_ready(future, 10s));
-    }
-
-    // A default-config engine (no data directory), for tests that never persist
-    // anything — unlike scheduler_stack.hpp's init_test_otterbrix.
-    inline db::otterbrix_engine_ptr init_default_test_otterbrix() {
-        auto config = configuration::config::default_config();
-        initialize_all_loggers(config.log.path.string());
-        return db::make_otterbrix_engine(std::move(config));
-    }
-
-    // addConnection keeps a MySQL connection only if the catalog could register
-    // its schema, and whole-database discovery needs a database name — so the
-    // mock connection names one. The mock answers the table listing with zero
-    // rows, so registration succeeds with no tables; a table a statement
-    // references is then registered lazily on its first query.
-    inline boost::mysql::connect_params mock_connect_params() {
-        boost::mysql::connect_params params;
-        params.database = "db";
-        return params;
     }
 
 } // namespace otterstax::test

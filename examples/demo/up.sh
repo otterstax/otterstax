@@ -58,7 +58,7 @@ if $LOCAL; then
 else
     echo "=== 2. Starting full demo stack (compose.yml --profile full) ==="
     # TEMPORARY (OTB-tag): the otterstax_app image needs the local-only
-    # otterbrix/actor-zeta recipes archived into .conan-local/ (see Dockerfile).
+    # otterbrix recipe archived into .conan-local/ (see Dockerfile).
     ../../scripts/conan/export_local_packages.sh || exit 1
     $COMPOSE_CMD --profile full -f compose.yml up -d --build
 fi

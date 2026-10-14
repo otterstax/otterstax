@@ -33,9 +33,12 @@ def make_config(local: bool):
 
 
 def _connect(cfg):
+    # Each write is meant to commit on its own and be counted from another
+    # connection (SET autocommit is answered without effect today).
     return mysql.connector.connect(
         host=cfg['host'], port=cfg['mysql_port'],
         user=cfg['user'], password=cfg['password'],
+        autocommit=True,
     )
 
 

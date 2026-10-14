@@ -12,11 +12,11 @@
 #include "../postgres_defs/message_type.hpp"
 #include "../resultset/postgres_resultset.hpp"
 #include "pipeline_state.hpp"
-#include "transaction_manager.hpp"
 
 #include "frontend/common/asio_future_bridge.hpp"
-#include "scheduler/session_data.hpp"
-#include "scheduler/scheduler.hpp"
+#include "session/session_factory.hpp"
+#include "session/session_payload.hpp"
+#include "session/statement_kind.hpp"
 #include "utility/session.hpp"
 
 #include <actor-zeta.hpp>
@@ -25,6 +25,7 @@
 #include <components/sql/transformer/utils.hpp>
 #include <components/types/types.hpp>
 #include <iostream>
+#include <memory>
 #include <optional>
 #include <random>
 #include <regex>
@@ -37,24 +38,25 @@ namespace frontend::postgres {
         postgres_connection(std::pmr::memory_resource* resource,
                             boost::asio::ip::tcp::socket&& socket,
                             uint32_t connection_id,
-                            actor_zeta::address_t scheduler,
+                            otterstax::session::session_factory_t& sessions,
                             connection_close_sink& close_sink,
                             size_t slot,
                             std::chrono::milliseconds read_timeout);
 
         struct prepared_stmt_meta {
             prepared_stmt_meta(std::pmr::memory_resource* resource,
-                               session_hash_t stmt_session,
+                               otterstax::session::statement_id_t stmt_session,
                                std::string sql,
                                uint32_t parameter_count,
                                components::types::complex_logical_type schema,
                                std::pmr::vector<field_type> specified_types,
                                NodeTag tag);
 
-            session_hash_t stmt_session;
-            // The worker keeps a prepared statement for exactly one execution,
+            // The statement's id in the connection's query session.
+            otterstax::session::statement_id_t stmt_session;
+            // The session keeps a prepared statement for exactly one execution,
             // successful or not; every later Execute prepares this text again
-            // under a fresh session before executing.
+            // under a fresh statement id before executing.
             std::pmr::string sql;
             bool consumed;
             uint32_t parameter_count;
@@ -70,17 +72,27 @@ namespace frontend::postgres {
             std::pmr::vector<std::string> portal_names;
             // Describe(statement) already gave the client a RowDescription.
             bool described;
+            // A DEALLOCATE prepared through Parse (psycopg's pipeline sends
+            // DEALLOCATE ALL so): the frontend runs it at Execute, the session
+            // never holds it (`stmt_session` names nothing there).
+            std::optional<otterstax::session::deallocate_statement_t> deallocate;
+            // COMMIT / ROLLBACK (session::is_transaction_exit_statement): the only
+            // statement a Bind takes in an aborted block, as in PostgreSQL.
+            bool transaction_exit = false;
         };
+        // Shared with the portals bound from it: DEALLOCATE drops the statement
+        // and leaves its portals open, as PostgreSQL does.
+        using statement_ptr = std::shared_ptr<prepared_stmt_meta>;
 
         // Result format codes belong to the Bind that created the portal, and so
         // does the executed result: an Execute with a row limit stops at the
         // limit (PortalSuspended) and the next Execute on the same portal
         // continues from `emitted` without running the statement again.
         struct portal_meta {
-            portal_meta(portal_t params, prepared_stmt_meta& statement, std::vector<result_encoding> format);
+            portal_meta(portal_t params, statement_ptr statement, std::vector<result_encoding> format);
 
             portal_t params;
-            std::reference_wrapper<prepared_stmt_meta> statement;
+            statement_ptr statement;
             std::vector<result_encoding> format;
             // Describe(portal) already gave the client a RowDescription.
             bool described;
@@ -92,8 +104,8 @@ namespace frontend::postgres {
 
     protected:
         void start_impl() override;
-        // Closes on the Worker every prepared statement the client left
-        // unexecuted (Terminate, socket drop, FATAL error, timeout).
+        // Closes the connection's query session (Terminate, socket drop, FATAL
+        // error, timeout): its prepared statements go with it.
         void finish_impl() override;
 
         log_t& get_logger_impl() override;
@@ -120,12 +132,42 @@ namespace frontend::postgres {
         void handle_startup_message(int32_t protocol_version, packet_reader& reader);
         void handle_ssl_decline(packet_reader& reader);
         void handle_query(std::string query);
-        // Answers a transaction statement of a simple Query from
-        // transaction_manager: one the engine ran (`error` empty: BEGIN,
-        // COMMIT, ROLLBACK) or one it refused as "Unsupported node type"
-        // (SAVEPOINT, ROLLBACK TO, RELEASE). Any other refusal goes out as the
-        // engine's error.
-        void try_handle_transaction(std::string query, std::string error);
+        // DEALLOCATE [PREPARE] <name> | ALL on the simple-query route: run_deallocate,
+        // then CommandComplete DEALLOCATE / DEALLOCATE ALL and ReadyForQuery.
+        void handle_deallocate(otterstax::session::deallocate_statement_t statement);
+        // Drops the named statement, or every named one, as PostgreSQL's
+        // DEALLOCATE does: the session entry is released, the portals bound
+        // from it stay open. An unknown name is 26000 and a failed block refuses
+        // it with 25P02, as PostgreSQL does. Returns false after sending the
+        // ErrorResponse.
+        bool run_deallocate(const otterstax::session::deallocate_statement_t& statement);
+
+        // Every session call is awaited here: the bridge, plus the end of a
+        // pending failure once an answer shows the session ran it.
+        otterstax::awaited_t<session_payload>
+        await_session(actor_zeta::unique_future<otterstax::session::query_session_t::session_result> fut);
+        // The block is failed ('E'): the session's, or a failure sent to it and
+        // not yet seen applied.
+        bool block_aborted() const;
+        // 25P02 for what an aborted block refuses before it reaches the session
+        // (PostgreSQL's exec_parse_message / exec_bind_message): every statement
+        // but a transaction exit.
+        void refuse_in_aborted_block();
+        // The ReadyForQuery status: the session's transaction block ('I' / 'T' /
+        // 'E'), 'E' too while a failure sent to it is pending. One source for
+        // the simple and the extended route alike.
+        transaction_status ready_status() const;
+        // The answer a COMMIT of a failed block is given
+        // (query_session_t::ended_failed_block): the engine rolled the block
+        // back and it has ended, so no rows and the ROLLBACK tag, as PostgreSQL
+        // answers it.
+        session_payload rollback_payload() const;
+        // A session failure as an ErrorResponse: the bridge's timeout (told by
+        // the await's status, never by a code) 57014,
+        // a statement refused in a failed block 25P02, one the engine does not
+        // support (SAVEPOINT among them) 0A000, any other `prefix` + the text as
+        // 42601.
+        void send_session_error(const otterstax::awaited_t<session_payload>& answer, std::string_view prefix);
 
         void handle_parse(std::string stmt, std::string query, int16_t num_params, packet_reader&& reader);
         void handle_bind(std::string stmt,
@@ -137,7 +179,12 @@ namespace frontend::postgres {
         void handle_close(describe_close_arg type, std::string name);
         void handle_describe(describe_close_arg type, std::string name);
 
+        // Close / a Parse replacing a statement: the statement with its portals,
+        // or the portal.
         void do_close(describe_close_arg type, std::string name);
+        // Forgets the named statement and releases its session entry; its
+        // portals are left alone (they hold the statement).
+        void drop_statement(const std::string& name);
         // Appends a RowDescription (with the given result format codes) for a
         // resolved schema, NoData otherwise; `described` is set to whether a
         // RowDescription went out — only then does the client know the row
@@ -147,7 +194,7 @@ namespace frontend::postgres {
                                        const std::vector<result_encoding>& format,
                                        std::vector<std::vector<uint8_t>>& packets,
                                        bool& described);
-        // Prepares the statement text again once the worker has consumed it.
+        // Prepares the statement text again once the session has consumed it.
         // Returns false after sending the error to the client.
         bool reprepare_stmt(prepared_stmt_meta& stmt);
         // Runs the portal's statement and stores the result in the portal.
@@ -160,12 +207,16 @@ namespace frontend::postgres {
                                  error_severity severity = error_severity::error());
 
         std::pmr::memory_resource* resource_;
-        std::pmr::unordered_map<std::string, prepared_stmt_meta> statement_name_map_;
+        std::pmr::unordered_map<std::string, statement_ptr> statement_name_map_;
         std::pmr::unordered_map<std::string, portal_meta> portals_;
         packet_writer writer_;
-        actor_zeta::address_t scheduler_;
+        // The connection's query session: one engine session, its transaction
+        // and its prepared statements. Closed in finish_impl.
+        otterstax::session::session_ptr session_;
         std::vector<uint8_t> backend_secret_key_;
-        transaction_manager transaction_man_;
+        // A failure reported to the session (fail_transaction) and not yet seen
+        // applied: an open block is reported failed meanwhile.
+        bool failure_pending_{false};
         pipeline_state pipeline_;
         bool use_protocol_3_2_;
         log_t log_;

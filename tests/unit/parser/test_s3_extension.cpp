@@ -173,7 +173,7 @@ TEST_CASE("s3 registry: a malformed external statement surfaces a parser error")
     CHECK_THROWS_AS(raw_parser(&arena, "CREATE EXTERNAL TABLE s3.t WITH (location=);", registry), parser_exception_t);
 }
 
-// ── transform stage (lowers to an external_node_t the Scheduler routes) ──────
+// ── transform stage (lowers to an external_node_t the query session routes) ──────
 
 TEST_CASE("s3 transform: ExtensionNode lowers to an external_node_t") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};

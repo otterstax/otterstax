@@ -37,7 +37,7 @@ namespace frontend::postgres {
     postgres_connection::postgres_connection(std::pmr::memory_resource* resource,
                                              boost::asio::ip::tcp::socket&& socket,
                                              uint32_t connection_id,
-                                             actor_zeta::address_t scheduler,
+                                             otterstax::session::session_factory_t& sessions,
                                              connection_close_sink& close_sink,
                                              size_t slot,
                                              std::chrono::milliseconds read_timeout)
@@ -45,18 +45,17 @@ namespace frontend::postgres {
         , resource_(resource)
         , statement_name_map_(resource_)
         , portals_(resource_)
-        , scheduler_(scheduler)
-        , transaction_man_()
+        , session_(sessions.open())
         , pipeline_()
         , use_protocol_3_2_(false)
         , log_(get_logger(logger_tag::POSTGRES_CONNECTION)) {
         assert(log_.is_valid());
         assert(resource_ != nullptr && "memory resource must not be null");
-        assert(static_cast<bool>(scheduler_) && "scheduler address must not be null");
+        assert(session_ != nullptr && "every connection has a query session");
     }
 
     postgres_connection::prepared_stmt_meta::prepared_stmt_meta(std::pmr::memory_resource* resource,
-                                                                session_hash_t stmt_session,
+                                                                otterstax::session::statement_id_t stmt_session,
                                                                 std::string sql,
                                                                 uint32_t parameter_count,
                                                                 components::types::complex_logical_type schema,
@@ -70,13 +69,14 @@ namespace frontend::postgres {
         , tag(tag)
         , specified_types(std::move(specified_types))
         , portal_names(resource)
-        , described(false) {}
+        , described(false)
+        , deallocate() {}
 
     postgres_connection::portal_meta::portal_meta(portal_t params,
-                                                  prepared_stmt_meta& statement,
+                                                  statement_ptr statement,
                                                   std::vector<result_encoding> format)
         : params(std::move(params))
-        , statement(statement)
+        , statement(std::move(statement))
         , format(std::move(format))
         , described(false)
         , result()
@@ -244,7 +244,7 @@ namespace frontend::postgres {
 
                 if (query.empty()) {
                     send_packet_merged({build_empty_query_response(writer_),
-                                        build_ready_for_query(writer_, transaction_man_.get_transaction_status())});
+                                        build_ready_for_query(writer_, ready_status())});
                     break;
                 }
 
@@ -426,7 +426,7 @@ namespace frontend::postgres {
                     send_error_response(sql_state::PROTOCOL_VIOLATION, INVALID_MESSAGE_FORMAT);
                     return;
                 }
-                send_packet(build_ready_for_query(writer_, transaction_man_.get_transaction_status()));
+                send_packet(build_ready_for_query(writer_, ready_status()));
                 break;
             }
             case message_type::frontend::FLUSH:
@@ -470,17 +470,32 @@ namespace frontend::postgres {
             return;
         }
 
-        // An error inside an explicit transaction block fails the block: every
-        // ReadyForQuery reports 'E' until ROLLBACK or COMMIT ends it. Outside a
-        // block there is nothing to fail and the status stays 'I'.
-        transaction_man_.mark_failed();
+        // An error inside an explicit transaction block fails the block, as in
+        // PostgreSQL: every ReadyForQuery reports 'E' until ROLLBACK or COMMIT
+        // ends it, and the engine refuses the block's statements. A statement's
+        // own failure has failed it already (the session reported it to the
+        // engine); one the frontend found itself — a malformed message, a value
+        // it cannot bind, a statement it stopped waiting for — is reported to
+        // the session here. Not awaited: it is queued behind whatever the
+        // session runs and ahead of the client's next statement, and until an
+        // answer shows it applied ReadyForQuery reports 'E' (failure_pending_).
+        // Outside a block there is nothing to fail and the status stays 'I'.
+        if (session_ != nullptr && !failure_pending_ &&
+            session_->transaction_state() == otterstax::session::transaction_state_t::in_block) {
+            [[maybe_unused]] auto [needs_sched, fut] =
+                actor_zeta::send(session_->address(),
+                                 &otterstax::session::query_session_t::fail_transaction,
+                                 core::error_code_t::other_error,
+                                 std::string{message});
+            failure_pending_ = true;
+        }
         if (ready_for_query_at_sync) {
             // Inside an extended-query pipeline the ErrorResponse goes alone:
             // the Sync that ends the pipeline answers the ReadyForQuery.
             send_packet(build_error_response(writer_, sqlstate, std::move(message), severity));
         } else {
             send_packet_merged({build_error_response(writer_, sqlstate, std::move(message), severity),
-                                build_ready_for_query(writer_, transaction_man_.get_transaction_status())});
+                                build_ready_for_query(writer_, ready_status())});
         }
     }
 } // namespace frontend::postgres

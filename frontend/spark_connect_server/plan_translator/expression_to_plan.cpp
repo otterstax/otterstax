@@ -487,8 +487,9 @@ namespace frontend::spark {
                             return child;
                         }
                         // Spark's Average casts its input to DOUBLE (DECIMAL aside) and answers
-                        // DOUBLE. The engine's avg answers its input's type and divides in it,
-                        // so over an integer column it would drop the fraction.
+                        // DOUBLE. The engine's avg answers DOUBLE for an integer argument, but
+                        // FLOAT for a FLOAT and DECIMAL for a DECIMAL; the cast answers DOUBLE
+                        // for every one of them.
                         if (function == "avg") {
                             agg->append_param(as_double(child.value(), resource));
                             continue;

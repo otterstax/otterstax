@@ -22,7 +22,7 @@
 
 #include "frontend/mysql_server/mysql_server.hpp"
 #include "raw_wire_client.hpp"
-#include "scheduler_stack.hpp"
+#include "session_stack.hpp"
 
 #include <catch2/catch_all.hpp>
 
@@ -82,14 +82,14 @@ namespace {
         throwing_connection(std::pmr::memory_resource* resource,
                             boost::asio::ip::tcp::socket&& socket,
                             uint32_t connection_id,
-                            actor_zeta::address_t scheduler,
+                            otterstax::session::session_factory_t& sessions,
                             frontend::connection_close_sink& close_sink,
                             size_t slot,
                             std::chrono::milliseconds read_timeout)
             : mysql_connection(count_construction(resource),
                                std::move(socket),
                                connection_id,
-                               scheduler,
+                               sessions,
                                close_sink,
                                slot,
                                read_timeout) {}
@@ -97,12 +97,12 @@ namespace {
 
     using retry_server = frontend::frontend_server<throwing_connection>;
 
-    frontend::frontend_server_config make_config(const otterstax::test::scheduler_stack& stack,
+    frontend::frontend_server_config make_config(const otterstax::test::session_stack& stack,
                                                  std::chrono::milliseconds retry_delay) {
         return frontend::frontend_server_config{
             .resource = stack.resource,
             .port = 0,
-            .scheduler = stack.scheduler,
+            .sessions = stack.sessions,
             .read_timeout = std::chrono::seconds(frontend::CONNECTION_TIMEOUT_SEC),
             .accept_retry_delay = retry_delay,
             .pool_size = 4,
@@ -150,7 +150,7 @@ namespace {
     // Attempts [first_failing, first_failing + failures) throw; every client is
     // still accepted and served the handshake, the one the failing
     // constructions were for only after `failures` retry pauses.
-    void accept_resumes_after_failures(const otterstax::test::scheduler_stack& stack,
+    void accept_resumes_after_failures(const otterstax::test::session_stack& stack,
                                        int first_failing,
                                        int failures,
                                        int clients_count) {
@@ -190,7 +190,7 @@ namespace {
     // keeps throwing, so the retry that holds its socket is pending (or its
     // completion is admitting it again) whenever stop() comes. stop() must
     // return and close every client, the one never served included.
-    void stop_with_retry_pending(const otterstax::test::scheduler_stack& stack, int cycles, int served) {
+    void stop_with_retry_pending(const otterstax::test::session_stack& stack, int cycles, int served) {
         for (int i = 0; i < cycles; ++i) {
             arm_failures(served + 1, ALWAYS);
             std::vector<std::unique_ptr<raw_client>> clients;
@@ -222,7 +222,7 @@ namespace {
     // it is admitted by the first construction that succeeds and gets the MySQL
     // handshake, not the too-many-connections refusal (an ERR packet) of a pool
     // whose slots all stayed taken by connections that were never built.
-    void client_served_after_more_failures_than_slots(const otterstax::test::scheduler_stack& stack, int failures) {
+    void client_served_after_more_failures_than_slots(const otterstax::test::session_stack& stack, int failures) {
         arm_failures(1, failures);
         retry_server server(make_config(stack, SHORT_RETRY_PAUSE));
         const auto started = std::chrono::steady_clock::now();
@@ -254,31 +254,31 @@ namespace {
 } // namespace
 
 TEST_CASE("frontend_server: accept resumes after the retry pause when the construction for the first client throws") {
-    otterstax::test::scheduler_stack_owner owner("/tmp/otterstax_frontend_accept_retry_start", &make_parser);
+    otterstax::test::session_stack_owner owner("/tmp/otterstax_frontend_accept_retry_start");
     accept_resumes_after_failures(owner.stack(), 1, 1, 3);
 }
 
 TEST_CASE("frontend_server: accept resumes after the retry pause when the construction for a later client throws") {
-    otterstax::test::scheduler_stack_owner owner("/tmp/otterstax_frontend_accept_retry_pool", &make_parser);
+    otterstax::test::session_stack_owner owner("/tmp/otterstax_frontend_accept_retry_pool");
     accept_resumes_after_failures(owner.stack(), 2, 1, 3);
 }
 
 TEST_CASE("frontend_server: accept resumes after three consecutive construction failures") {
-    otterstax::test::scheduler_stack_owner owner("/tmp/otterstax_frontend_accept_retry_three", &make_parser);
+    otterstax::test::session_stack_owner owner("/tmp/otterstax_frontend_accept_retry_three");
     accept_resumes_after_failures(owner.stack(), 2, 3, 3);
 }
 
 TEST_CASE("frontend_server: stop() with the retry pending for a client never served twenty times over") {
-    otterstax::test::scheduler_stack_owner owner("/tmp/otterstax_frontend_accept_retry_stop_start", &make_parser);
+    otterstax::test::session_stack_owner owner("/tmp/otterstax_frontend_accept_retry_stop_start");
     stop_with_retry_pending(owner.stack(), 20, 0);
 }
 
 TEST_CASE("frontend_server: stop() with the retry pending and a client attached twenty times over") {
-    otterstax::test::scheduler_stack_owner owner("/tmp/otterstax_frontend_accept_retry_stop_pool", &make_parser);
+    otterstax::test::session_stack_owner owner("/tmp/otterstax_frontend_accept_retry_stop_pool");
     stop_with_retry_pending(owner.stack(), 20, 1);
 }
 
 TEST_CASE("frontend_server: a client is served after more construction failures than the pool has slots") {
-    otterstax::test::scheduler_stack_owner owner("/tmp/otterstax_frontend_accept_retry_slots", &make_parser);
+    otterstax::test::session_stack_owner owner("/tmp/otterstax_frontend_accept_retry_slots");
     client_served_after_more_failures_than_slots(owner.stack(), POOL_SLOTS + 5);
 }

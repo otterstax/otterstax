@@ -39,11 +39,9 @@ namespace otterstax::kafka {
 
     // Carrier logical_plan node for one parsed kafka DDL statement
     //
-    // It is tagged components::logical_plan::node_type::unused — mirroring
-    // schema_utils::schema_node_t — and is NEVER handed to the otterbrix engine
-    // The Worker recognises it on the plan root (before the schema/execute path
-    // that assumes an `unused` node is a schema_node_t) and routes it to the
-    // kafka runtime
+    // It is tagged components::logical_plan::node_type::unused and is NEVER
+    // handed to the otterbrix engine. The query session recognises it on the plan
+    // root (ParsedQueryData::extension_kind) and routes it to the kafka runtime
     class kafka_node_t final : public components::logical_plan::node_t {
     public:
         kafka_node_t(std::pmr::memory_resource* resource, kafka_op op, std::string name);

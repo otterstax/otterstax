@@ -16,6 +16,7 @@
 #include <arrow/io/interfaces.h>
 
 #include <actor-zeta.hpp>
+#include <components/session/session.hpp>
 #include <core/result_wrapper.hpp>
 
 #include <catch2/catch_all.hpp>
@@ -58,8 +59,8 @@ namespace {
 
 TEST_CASE("s3 connector: add_credentials rejects an empty alias or empty keys as invalid_parameter") {
     auto* resource = std::pmr::new_delete_resource();
-    auto s3 = actor_zeta::spawn<conn::s3::ConnectorManager>(resource);
-    const auto id = session_id().hash();
+    auto s3 = actor_zeta::spawn<conn::s3::ConnectorManager>(resource, dir.path);
+    const auto id = components::session::session_id_t().hash();
 
     SECTION("empty alias") {
         auto params = valid_params(resource, "");
@@ -141,8 +142,8 @@ TEST_CASE("s3 connector: add_credentials rejects an empty alias or empty keys as
 
 TEST_CASE("s3 connector: list / open_input / open_output on an unknown alias fail with do_not_exists") {
     auto* resource = std::pmr::new_delete_resource();
-    auto s3 = actor_zeta::spawn<conn::s3::ConnectorManager>(resource);
-    const auto id = session_id().hash();
+    auto s3 = actor_zeta::spawn<conn::s3::ConnectorManager>(resource, dir.path);
+    const auto id = components::session::session_id_t().hash();
 
     auto listed = settled(actor_zeta::send(s3->address(),
                                            &conn::s3::ConnectorManager::list,
@@ -175,8 +176,8 @@ TEST_CASE("s3 connector: list / open_input / open_output on an unknown alias fai
 
 TEST_CASE("s3 connector: a path Arrow refuses is io_error before any request") {
     auto* resource = std::pmr::new_delete_resource();
-    auto s3 = actor_zeta::spawn<conn::s3::ConnectorManager>(resource);
-    const auto id = session_id().hash();
+    auto s3 = actor_zeta::spawn<conn::s3::ConnectorManager>(resource, dir.path);
+    const auto id = components::session::session_id_t().hash();
 
     auto stored = settled(actor_zeta::send(s3->address(),
                                            &conn::s3::ConnectorManager::add_credentials,
@@ -238,8 +239,11 @@ TEST_CASE("S3Manager: forwards the connector's error code instead of flattening 
     auto s3 = actor_zeta::spawn<conn::s3::ConnectorManager>(resource);
     // No file manager is reachable: every case below fails before the
     // integration actor would forward to it.
-    auto mgr = actor_zeta::spawn<db::S3Manager>(resource, s3->address(), actor_zeta::address_t::empty_address());
-    const auto id = session_id().hash();
+    auto mgr = actor_zeta::spawn<db::S3Manager>(resource,
+                                                s3->address(),
+                                                actor_zeta::address_t::empty_address(),
+                                                dir.path);
+    const auto id = components::session::session_id_t().hash();
 
     SECTION("download on an unknown alias is do_not_exists and names the alias") {
         auto r = settled(actor_zeta::send(mgr->address(),

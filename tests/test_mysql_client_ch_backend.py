@@ -22,6 +22,9 @@ class client:
             'port': config.MYSQL_PORT,
             'user': 'testuser',
             'password': 'testpass',
+            # Each DML is meant to commit on its own (SET autocommit is answered
+            # without effect today; session/CLAUDE.md).
+            'autocommit': True,
         }
         print(f"Connecting to host: {host}")
 

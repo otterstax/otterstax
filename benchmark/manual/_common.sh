@@ -131,4 +131,6 @@ ALL_TESTS=("${DEFAULT_TESTS[@]}"
            external_join_cross external_join_all
            kafka_ingest kafka_produce kafka_stream)
 ALL_FRONTENDS=(mysql postgres arrow)
-DEFAULT_FRONTENDS=(mysql postgres)
+# arrow has the five cross-backend tests only; run_bench.sh skips a test without
+# a benchmarks/<frontend>/<test>.py.
+DEFAULT_FRONTENDS=(mysql postgres arrow)

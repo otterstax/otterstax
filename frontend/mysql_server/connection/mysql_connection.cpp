@@ -5,13 +5,12 @@
 #include "utility/logger.hpp"
 
 using namespace components;
-using namespace components::sql;
 
 namespace frontend::mysql {
     mysql_connection::mysql_connection(std::pmr::memory_resource* resource,
                                        boost::asio::ip::tcp::socket&& socket,
                                        uint32_t connection_id,
-                                       actor_zeta::address_t scheduler,
+                                       otterstax::session::session_factory_t& sessions,
                                        connection_close_sink& close_sink,
                                        size_t slot,
                                        std::chrono::milliseconds read_timeout)
@@ -21,16 +20,16 @@ namespace frontend::mysql {
         , sequence_id_(0)
         , next_statement_id_(0)
         , client_max_packet_size_(DEFAULT_MAX_PACKET_SIZE)
-        , scheduler_(scheduler)
+        , session_(sessions.open())
         , state_(connection_state::HANDSHAKE)
         , log_(get_logger(logger_tag::MYSQL_CONNECTION)) {
         assert(log_.is_valid());
         assert(resource_ != nullptr && "memory resource must not be null");
-        assert(static_cast<bool>(scheduler_) && "scheduler address must not be null");
+        assert(session_ != nullptr && "every connection has a query session");
     }
 
     mysql_connection::prepared_stmt_meta::prepared_stmt_meta(std::pmr::memory_resource* resource,
-                                                             session_hash_t stmt_session,
+                                                             otterstax::session::statement_id_t stmt_session,
                                                              std::string sql,
                                                              uint32_t parameter_count)
         : stmt_session(stmt_session)
@@ -65,8 +64,20 @@ namespace frontend::mysql {
     }
 
     void mysql_connection::send_handshake() {
+        auto scramble = mysql_scramble();
+        if (!scramble) {
+            // An ERR packet in place of the handshake is how the server refuses a client.
+            log_->error("[Connection {}] HANDSHAKE: no secure random bytes for the scramble", connection_id_);
+            send_packet(build_error(writer_,
+                                    sequence_id_++,
+                                    mysql_error::ER_HANDSHAKE_ERROR,
+                                    "the server could not generate the authentication scramble"),
+                        false);
+            finish();
+            return;
+        }
         // The packet is written from send_buffer_, which outlives the write.
-        send_buffer_ = build_handshake_10(writer_, connection_id_, generate_backend_key(AUTH_DATA_FULL_LENGTH));
+        send_buffer_ = build_handshake_10(writer_, connection_id_, std::move(*scramble), status_flags());
         sequence_id_++;
 
         // todo: count rounds & break if too many

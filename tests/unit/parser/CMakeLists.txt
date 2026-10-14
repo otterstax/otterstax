@@ -4,9 +4,7 @@ project(test_parser)
 
 set(${PROJECT_NAME}_SOURCES
     main.cpp
-    test_subquery_extractor.cpp
     test_parser_integration.cpp
-    test_replace_qualifiers.cpp
     test_query_gen.cpp
     test_parser_extras.cpp
     test_s3_extension.cpp

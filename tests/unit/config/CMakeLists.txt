@@ -3,6 +3,7 @@ project(test_unit_config)
 set(${PROJECT_NAME}_SOURCES
     main.cpp
     test_connection_config.cpp
+    test_engine_config.cpp
 )
 
 add_executable(${PROJECT_NAME} ${${PROJECT_NAME}_SOURCES})

@@ -9,7 +9,16 @@
 #include <actor-zeta.hpp>
 #include <core/result_wrapper.hpp>
 #include <components/log/log.hpp>
+
+// Clash between otterbrix parser macros and Arrow headers
+#undef DAY
+#undef SECOND
+
+#include <arrow/filesystem/type_fwd.h>
+#include <arrow/io/type_fwd.h>
+
 #include <functional>
+#include <memory>
 #include <memory_resource>
 #include <mutex>
 #include <string>
@@ -25,14 +34,15 @@ public:
     template<typename T>
     using unique_future = actor_zeta::unique_future<T>;
 
-    // s3_download_path is the staging directory for downloaded objects; it must
-    // not be empty — there is no runtime fallback.
-    explicit ConnectorManager(std::pmr::memory_resource* res,
-                              std::string_view s3_download_path = "/tmp/otterstax_s3_cache/");
+    // Arrow's S3 buffers (ranged reads, multipart parts) are allocated on `res`
+    // through tsl::arrow_pool, so it must be thread-safe: Arrow uploads parts from
+    // its own IO threads.
+    explicit ConnectorManager(std::pmr::memory_resource* res);
 
     std::pmr::memory_resource* resource() const noexcept { return resource_; }
 
-    /// Store credentials under params.alias; overwrites if alias already exists.
+    /// Store credentials under params.alias; overwrites if alias already exists
+    /// (and drops the alias's cached filesystem, so the next call uses the new set).
     /// Errors: invalid_parameter (empty alias / access_key / secret_key).
     actor_zeta::unique_future<core::result_wrapper_t<bool>>
     add_credentials(session_hash_t id, connect_params params);
@@ -42,23 +52,24 @@ public:
     actor_zeta::unique_future<core::result_wrapper_t<std::pmr::vector<std::pmr::string>>>
     list(session_hash_t id, std::string alias, std::string s3_path);
 
-    /// Download one S3 object (s3_path is "bucket/key") into s3_download_path_
-    /// under a timestamped filename; returns the resulting local file path. A
-    /// failed transfer leaves no file behind.
-    /// Errors: do_not_exists (unknown alias), io_error (S3 or local failure).
-    actor_zeta::unique_future<core::result_wrapper_t<std::pmr::string>>
-    download(session_hash_t id, std::string alias, std::string s3_path);
+    /// Open one object ("bucket/key") for reading. RandomAccessFile is-an
+    /// InputStream, so the one handler serves parquet (ranged reads) and csv /
+    /// ndjson (sequential). Nothing is staged on local disk.
+    /// Errors: do_not_exists (unknown alias), io_error (S3 failure, no such object).
+    actor_zeta::unique_future<core::result_wrapper_t<std::shared_ptr<arrow::io::RandomAccessFile>>>
+    open_input(session_hash_t id, std::string alias, std::string s3_path);
 
-    /// Upload local_path to s3_path ("bucket/key").
-    /// Errors: do_not_exists (unknown alias), io_error (S3 or local failure).
-    actor_zeta::unique_future<core::result_wrapper_t<bool>>
-    upload(session_hash_t id, std::string alias, std::string s3_path, std::string local_path);
+    /// Open one object ("bucket/key") for writing. Only the caller's Close() publishes it;
+    /// every other path must Abort() — Arrow's S3 stream completes the upload from its
+    /// destructor. Errors: do_not_exists (unknown alias), io_error (S3 failure).
+    actor_zeta::unique_future<core::result_wrapper_t<std::shared_ptr<arrow::io::OutputStream>>>
+    open_output(session_hash_t id, std::string alias, std::string s3_path);
 
     using dispatch_traits = actor_zeta::dispatch_traits<
         &ConnectorManager::add_credentials,
         &ConnectorManager::list,
-        &ConnectorManager::download,
-        &ConnectorManager::upload>;
+        &ConnectorManager::open_input,
+        &ConnectorManager::open_output>;
 
     actor_zeta::behavior_t behavior(actor_zeta::mailbox::message* msg);
     std::pair<bool, actor_zeta::detail::enqueue_result>
@@ -73,13 +84,25 @@ private:
     };
     using credentials_store_t =
         std::pmr::unordered_map<std::pmr::string, connect_params, alias_hash, std::equal_to<>>;
+    // One S3FileSystem (one AWS client, one connection pool) per alias, built on
+    // first use instead of per call.
+    using filesystem_cache_t =
+        std::pmr::unordered_map<std::pmr::string, std::shared_ptr<arrow::fs::S3FileSystem>, alias_hash, std::equal_to<>>;
+
+    // The alias's filesystem, built and cached on first use.
+    // Errors: do_not_exists (unknown alias, message prefixed by `op`), io_error.
+    core::result_wrapper_t<std::shared_ptr<arrow::fs::S3FileSystem>> filesystem_for(std::string_view op,
+                                                                                    std::string_view alias);
 
     std::pmr::memory_resource*                      resource_;
     log_t                                           log_;
     std::mutex                                      mutex_;
     actor_zeta::behavior_t                          current_behavior_;
     credentials_store_t                             credentials_store_;
-    std::pmr::string                                s3_download_path_;
+    // Handlers run one at a time under mutex_ (enqueue_impl), so the cache needs
+    // no lock of its own. Its filesystems die with the actor, before main()'s
+    // subsystem_finalizer_t runs FinalizeS3.
+    filesystem_cache_t                              filesystems_;
 };
 
 } // namespace conn::s3

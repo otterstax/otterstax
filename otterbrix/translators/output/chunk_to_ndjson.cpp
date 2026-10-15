@@ -3,6 +3,7 @@
 
 #include "chunk_to_ndjson.hpp"
 #include "chunk_to_arrow.hpp"
+#include "file_sink.hpp"
 #include "writable_columns.hpp"
 #include "otterbrix/translators/error.hpp"
 
@@ -10,13 +11,17 @@
 
 #include <components/types/logical_value.hpp>
 #include <components/types/types.hpp>
+#include <core/date/date_to_string.hpp>
+
+#include <arrow/io/interfaces.h>
 
 #include <charconv>
 #include <cmath>
-#include <fstream>
 #include <memory_resource>
+#include <sstream>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace tsl {
 
@@ -85,6 +90,37 @@ core::result_wrapper_t<bool> write_value(std::pmr::memory_resource* res,
         out << '"' << carried.value().ToString(static_cast<int32_t>(scale)) << '"';
         return true;
     }
+    // A temporal value is written as otterbrix's own text for it (core::date::to_string: the
+    // PostgreSQL forms, a TIMESTAMP_TZ in UTC with its "+00"), as a JSON string. Its physical
+    // type is a bare count from the engine's 2000-01-01 epoch, which the switch below would
+    // write as a number no reader could take for a date.
+    {
+        namespace cd = core::date;
+        using components::types::logical_type;
+        std::string text;
+        switch (val.type().type()) {
+            case logical_type::DATE:
+                text = cd::to_string(val.value<cd::date_t>());
+                break;
+            case logical_type::TIME:
+                text = cd::to_string(val.value<cd::time_t>());
+                break;
+            case logical_type::TIMESTAMP:
+                text = cd::to_string(val.value<cd::timestamp_t>());
+                break;
+            case logical_type::TIMESTAMP_TZ:
+                text = cd::to_string(val.value<cd::timestamptz_t>());
+                break;
+            default:
+                break;
+        }
+        if (!text.empty()) {
+            out << '"';
+            write_escaped(out, text);
+            out << '"';
+            return true;
+        }
+    }
     // Every case here is admitted by is_writable_scalar; NA is covered by is_null().
     // INT128 reaches here only as HUGEINT (the gate admits no other logical type at that
     // width) and is written through the stream operator: std::to_chars has no 128-bit
@@ -123,8 +159,11 @@ core::result_wrapper_t<bool> write_value(std::pmr::memory_resource* res,
 
 core::result_wrapper_t<bool> chunk_to_ndjson(std::pmr::memory_resource* res,
                                              const std::pmr::vector<components::vector::data_chunk_t>& chunks,
-                                             const std::string& path) {
-    OTX_ZONE_N("tsl::chunk_to_ndjson");
+                                             const std::shared_ptr<arrow::io::OutputStream>& sink) {
+    OTX_ZONE_N("tsl::chunk_to_ndjson(stream)");
+    if (!sink) {
+        return make_error(res, core::error_code_t::invalid_parameter, "chunk_to_ndjson: null sink");
+    }
     for (const auto& chunk : chunks) {
         auto writable = validate_writable_columns(res, chunk, "chunk_to_ndjson");
         if (writable.has_error()) {
@@ -132,24 +171,41 @@ core::result_wrapper_t<bool> chunk_to_ndjson(std::pmr::memory_resource* res,
         }
     }
 
-    std::ofstream out(path);
-    if (!out) {
-        std::pmr::string message{"chunk_to_ndjson: cannot open output: ", res};
-        message.append(path.c_str());
-        return core::error_t(core::error_code_t::io_error, std::move(message));
-    }
+    // Rows are serialised into a line buffer and handed to the sink in pieces of about
+    // flush_bytes, so a long result never sits in memory whole and an S3 sink receives
+    // part-sized writes.
+    constexpr std::streamoff flush_bytes = 1 << 20;
+    std::ostringstream out;
+    const auto flush = [&]() -> core::result_wrapper_t<bool> {
+        const auto pending = out.view();
+        if (pending.empty()) {
+            return true;
+        }
+        if (auto status = sink->Write(pending.data(), static_cast<int64_t>(pending.size())); !status.ok()) {
+            return arrow_error(res, core::error_code_t::io_error, "chunk_to_ndjson: write failed", status);
+        }
+        out.str(std::string{});
+        return true;
+    };
 
     for (const auto& chunk : chunks) {
         const auto types = chunk.types();
         const size_t ncols = static_cast<size_t>(chunk.column_count());
         const size_t nrows = static_cast<size_t>(chunk.size());
+        // Each column's `"name":` escaped once, not once per row.
+        std::vector<std::string> keys;
+        keys.reserve(ncols);
+        for (size_t c = 0; c < ncols; c++) {
+            std::ostringstream key;
+            key << (c > 0 ? ",\"" : "\"");
+            write_escaped(key, types[c].alias());
+            key << "\":";
+            keys.push_back(std::move(key).str());
+        }
         for (size_t r = 0; r < nrows; r++) {
             out << '{';
             for (size_t c = 0; c < ncols; c++) {
-                if (c > 0) out << ',';
-                out << '"';
-                write_escaped(out, types[c].alias());
-                out << "\":";
+                out << keys[c];
                 auto written = write_value(res,
                                            out,
                                            chunk.value(static_cast<uint64_t>(c), static_cast<uint64_t>(r)),
@@ -159,16 +215,23 @@ core::result_wrapper_t<bool> chunk_to_ndjson(std::pmr::memory_resource* res,
                 }
             }
             out << "}\n";
+            if (out.tellp() >= flush_bytes) {
+                if (auto flushed = flush(); flushed.has_error()) {
+                    return flushed;
+                }
+            }
         }
     }
+    return flush();
+}
 
-    out.flush();
-    if (!out.good()) {
-        std::pmr::string message{"chunk_to_ndjson: write error for: ", res};
-        message.append(path.c_str());
-        return core::error_t(core::error_code_t::io_error, std::move(message));
-    }
-    return true;
+core::result_wrapper_t<bool> chunk_to_ndjson(std::pmr::memory_resource* res,
+                                             const std::pmr::vector<components::vector::data_chunk_t>& chunks,
+                                             const std::string& path) {
+    OTX_ZONE_N("tsl::chunk_to_ndjson(file)");
+    return write_local_file(res, "chunk_to_ndjson", path, [&](const std::shared_ptr<arrow::io::OutputStream>& sink) {
+        return chunk_to_ndjson(res, chunks, sink);
+    });
 }
 
 } // namespace tsl

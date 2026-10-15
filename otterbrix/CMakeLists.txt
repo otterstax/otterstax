@@ -12,11 +12,13 @@ set(OTTERBRIX_HEADERS
     translators/input/affected_rows_carrier.hpp
     translators/input/chunk_windows.hpp
     translators/error.hpp
+    translators/arrow_memory_pool.hpp
     translators/output/chunk_to_arrow.hpp
     translators/output/chunk_to_parquet.hpp
     translators/output/chunk_to_csv.hpp
     translators/output/chunk_to_ndjson.hpp
     translators/output/writable_columns.hpp
+    translators/output/file_sink.hpp
     operators/execute_plan.hpp
     operators/schema_probe.hpp
     parser/alias_registry.hpp

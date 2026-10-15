@@ -27,6 +27,9 @@ add_library(integration
 target_link_libraries(integration PUBLIC
     Boost::boost
     otterbrix::otterbrix
+    # s3/s3_manager.cpp drives the s3 connector's Arrow object streams
+    # (Close / Abort an upload) and carries them in FileAddParams / FileMetadata.
+    arrow::arrow
     actor-zeta::actor-zeta
     PostgreSQL::PostgreSQL
     clickhouse-cpp-lib::clickhouse-cpp-lib

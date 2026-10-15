@@ -415,13 +415,25 @@ Frontend
   → Worker::handle_external_statement
        → CREATE EXTERNAL TABLE:
            local path  → conn::file::FileManager::add_file → OtterbrixManager engine load
-           s3:// URI   → db::S3Manager::download → FileManager::add_file
+           s3:// URI   → db::S3Manager::download: s3 ConnectorManager::open_input
+                         → FileManager::add_file reads the object stream (no local copy)
        → COPY (<inner>) TO ...:
            inner SQL re-parsed; result chunk runs through chunk_to_<fmt>;
-           local path  → FileManager::dump_file
-           s3:// URI   → S3Manager::upload (uses FileManager::dump_file under the hood)
+           local path  → FileManager::dump_file (file committed only on success)
+           s3:// URI   → S3Manager::upload: ConnectorManager::open_output
+                         → FileManager::dump_file writes into the stream → Close
+                         (any failure Aborts it: no partial object is published)
   → returns empty session_payload via future; DDL/COPY return no rows
 ```
+
+No byte of an S3 object is staged on local disk in either direction, and
+`WITH (format = ...)` names the format for s3 locations too (the object key's
+extension is the fallback). Every Arrow buffer on these paths — readers,
+builders, writers, S3 read and part buffers — is allocated on the caller's
+`std::pmr::memory_resource` through `tsl::arrow_pool`
+(`otterbrix/translators/arrow_memory_pool.hpp`), not Arrow's default pool.
+Exported parquet is snappy-compressed in row groups of up to
+`tsl::parquet_row_group_rows` (128 Ki) rows.
 
 Implementation entry points:
 
@@ -430,11 +442,13 @@ Implementation entry points:
   registered with the parser registry at `otterbrix/parser/parser.cpp`. The
   `cmake/otterbrix_parser_extension.cmake` helper macro builds them.
 - **Connectors** — `connectors/s3/` (Arrow's `arrow::fs::S3FileSystem`,
-  initialised via `arrow::fs::EnsureS3Initialized`) and `connectors/file/`
-  (filesystem ingestion).
-- **Integration actors** — `integration/s3/s3_manager.{hpp,cpp}` orchestrates
-  download/upload by composing the raw s3 connector with `FileManager` (so
-  COPY ... TO 's3://...' is a single round-trip).
+  initialised via `arrow::fs::EnsureS3Initialized`, one cached per alias;
+  `open_input` / `open_output` hand out object streams) and `connectors/file/`
+  (filesystem ingestion; `FileAddParams::input` / `FileMetadata::output` carry
+  a stream instead of a path).
+- **Integration actors** — `integration/s3/s3_manager.{hpp,cpp}` streams
+  objects between the s3 connector and `FileManager` (so COPY ... TO
+  's3://...' is a single pass with no staging file).
 - **Connection config** — s3 aliases are declared in the `connections.s3:`
   section of `config.yaml` (`alias`, `access_key`, `secret_key`, `region`,
   `endpoint`) and registered at startup. The alias is then used by the

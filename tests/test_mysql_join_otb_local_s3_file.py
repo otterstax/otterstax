@@ -46,7 +46,7 @@ def _scalar(cur, sql):
 
 
 def run(local=False):
-    # Use the s3 tester to register MinIO credentials; we'll borrow the same
+    # Use the s3 tester to register RustFS credentials; we'll borrow the same
     # connection to also create a `file`-source external table by hand.
     s3_tester = ExternalTableTester("s3", local=local)
     s3_tester.ensure_credentials()

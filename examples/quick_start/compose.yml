@@ -2,7 +2,7 @@
 #
 #     cd examples/quick_start && docker compose up -d
 #
-# Two independent PostgreSQL backends + one MariaDB + one ClickHouse + MinIO
+# Two independent PostgreSQL backends + one MariaDB + one ClickHouse + RustFS
 # (S3) + Kafka + OtterStax. Everything is seeded from the committed files under
 # init/ (databases from init/<engine>/init.sql, s3 objects from init/s3/*, kafka
 # events from init/kafka/orders.ndjson). Named volumes keep the DB/s3 data across
@@ -13,7 +13,7 @@
 # Only the PostgreSQL wire (8817) is published — the demo is driven entirely
 # with psql. See README.md.
 #
-# Host ports: 3310-3317 (backends + MinIO), 19094 (Kafka, optional), 8817
+# Host ports: 3310-3317 (backends + RustFS), 19094 (Kafka, optional), 8817
 # (OtterStax PG wire). Chosen to not collide with examples/demo/ (3201-3207,
 # 19093) — but the 8817 wire port is shared, so do not run this and the demo at
 # the same time.
@@ -103,20 +103,19 @@ services:
       start_period: 30s
     networks: [quickstart_net]
 
-  qs-minio:
-    image: minio/minio:latest
-    container_name: qs-minio
-    command: server /data --console-address ":9001"
+  qs-rustfs:
+    image: rustfs/rustfs:latest
+    container_name: qs-rustfs
     environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
+      RUSTFS_ACCESS_KEY: rustfsadmin
+      RUSTFS_SECRET_KEY: rustfsadmin
     ports:
       - "3316:9000"   # S3 API
       - "3317:9001"   # console
     volumes:
-      - qs_minio_data:/data
+      - qs_rustfs_data:/data
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:9000/minio/health/live"]
+      test: ["CMD", "curl", "-sf", "http://localhost:9000/health"]
       interval: 5s
       timeout: 5s
       retries: 30
@@ -125,12 +124,16 @@ services:
 
   # One-shot: create the bucket and (re)upload the committed s3 fixtures, then
   # exit. Idempotent — runs on every `up`, re-seeds anything a wiped volume lost.
-  qs-minio-init:
-    image: minio/mc:latest
-    container_name: qs-minio-init
+  qs-rustfs-init:
+    image: amazon/aws-cli:latest
+    container_name: qs-rustfs-init
     depends_on:
-      qs-minio:
+      qs-rustfs:
         condition: service_healthy
+    environment:
+      AWS_ACCESS_KEY_ID: rustfsadmin
+      AWS_SECRET_ACCESS_KEY: rustfsadmin
+      AWS_DEFAULT_REGION: us-east-1
     volumes:
       - ./init/s3:/fixtures:ro
     # Seed the three source objects on every `up`. Also clear any `exports/`
@@ -138,10 +141,10 @@ services:
     # output (written by example 7's COPY), so a fresh start must not show it.
     entrypoint: >
       sh -c "
-        mc alias set m http://qs-minio:9000 minioadmin minioadmin;
-        mc mb --ignore-existing m/quickstart-bucket;
-        mc rm --recursive --force m/quickstart-bucket/exports/ 2>/dev/null;
-        mc cp --recursive /fixtures/ m/quickstart-bucket/;
+        E=http://qs-rustfs:9000;
+        aws --endpoint-url $$E s3api head-bucket --bucket quickstart-bucket 2>/dev/null || aws --endpoint-url $$E s3 mb s3://quickstart-bucket;
+        aws --endpoint-url $$E s3 rm --recursive --quiet s3://quickstart-bucket/exports/ 2>/dev/null;
+        aws --endpoint-url $$E s3 cp --recursive --quiet /fixtures/ s3://quickstart-bucket/;
         echo 'quickstart-bucket seeded (exports cleared).';
       "
     networks: [quickstart_net]
@@ -207,7 +210,7 @@ services:
         condition: service_healthy
       qs-clickhouse:
         condition: service_healthy
-      qs-minio:
+      qs-rustfs:
         condition: service_healthy
       qs-kafka:
         condition: service_healthy
@@ -232,4 +235,4 @@ volumes:
   qs_pg_catalog_data:
   qs_mariadb_data:
   qs_ch_data:
-  qs_minio_data:
+  qs_rustfs_data:

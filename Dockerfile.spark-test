@@ -19,6 +19,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 ARG SPARK_CLIENT_VERSIONS="3.5.0 3.5.1 3.5.2 3.5.3 3.5.4 3.5.5 3.5.6 3.5.7 3.5.8 3.5.9 4.0.0 4.0.1 4.0.2 4.0.3 4.0.4 4.1.0 4.1.1 4.1.2 4.1.3 4.2.0"
 
+# Tolerate slow PyPI downloads: pip's defaults (15 s read timeout, 5 retries)
+# fail the build on a stalled transfer.
+ENV PIP_DEFAULT_TIMEOUT=120 PIP_RETRIES=10
+
 COPY tests/scripts/install_spark_clients.sh /tmp/install_spark_clients.sh
 RUN bash /tmp/install_spark_clients.sh ${SPARK_CLIENT_VERSIONS} \
     && rm /tmp/install_spark_clients.sh

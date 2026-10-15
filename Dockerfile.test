@@ -171,7 +171,7 @@ RUN if [ "${WITH_TRACY}" != "true" ]; then \
 # runners where the docker daemon cannot see the host workspace (DinD / sibling
 # containers). Kept after the build so editing fixtures does not invalidate the
 # expensive build layers.
-COPY ./tests/minio/fixtures /fixtures
+COPY ./tests/s3/fixtures /fixtures
 
 # Single config file (server settings + connections) baked into the image at the
 # server's default config path (config.yaml, relative to WORKDIR

@@ -70,8 +70,8 @@ connections:
   # Used only by the external_* (s3) benchmarks; harmless when they are not run
   # (add_credentials just stores the alias — it does not open a connection).
   s3:
-    - alias: bench_minio
-      access_key: minioadmin
-      secret_key: minioadmin
+    - alias: bench_rustfs
+      access_key: rustfsadmin
+      secret_key: rustfsadmin
       region: us-east-1
-      endpoint: bench_minio:9000
+      endpoint: bench_rustfs:9000

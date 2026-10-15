@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Simple upload/download/list helper for the local MinIO test stack.
+# Simple upload/download/list helper for the local RustFS test stack.
 #
-# Uses the minio/mc client inside a throwaway container, so nothing needs to be
-# installed on the host beyond Docker. The MinIO stack must already be running:
+# Uses the aws-cli client inside a throwaway container, so nothing needs to be
+# installed on the host beyond Docker. The RustFS stack must already be running:
 #
-#   docker compose -f tests/minio/docker-compose.yml up -d
+#   docker compose -f tests/s3/docker-compose.yml up -d
 #
 # Usage:
 #   ./s3cmd.sh ls   [prefix]                 # list objects (default: whole bucket)
@@ -20,41 +20,42 @@
 set -euo pipefail
 
 # ── config (override via env) ────────────────────────────────────────────────
-ENDPOINT="${MINIO_ENDPOINT:-http://minio1:9000}"
-ACCESS_KEY="${MINIO_ACCESS_KEY:-minioadmin}"
-SECRET_KEY="${MINIO_SECRET_KEY:-minioadmin}"
-BUCKET="${MINIO_BUCKET:-test-bucket-1}"
-NETWORK="${MINIO_NETWORK:-minio_minio_network}"   # <compose-dir>_<network>
+ENDPOINT="${S3_ENDPOINT:-http://rustfs1:9000}"
+ACCESS_KEY="${S3_ACCESS_KEY:-rustfsadmin}"
+SECRET_KEY="${S3_SECRET_KEY:-rustfsadmin}"
+BUCKET="${S3_BUCKET:-test-bucket-1}"
+NETWORK="${S3_NETWORK:-s3_rustfs_network}"   # <compose-dir>_<network>
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Run mc in a container attached to the MinIO network, with $HERE mounted at /work.
-mc() {
+# Run aws-cli in a container attached to the RustFS network, with $HERE mounted at /work.
+s3() {
   docker run --rm --network "$NETWORK" -v "$HERE:/work" -w /work \
-    --entrypoint /bin/sh quay.io/minio/mc:latest -c \
-    "mc alias set local $ENDPOINT $ACCESS_KEY $SECRET_KEY >/dev/null && mc $*"
+    -e AWS_ACCESS_KEY_ID="$ACCESS_KEY" -e AWS_SECRET_ACCESS_KEY="$SECRET_KEY" \
+    -e AWS_DEFAULT_REGION=us-east-1 \
+    amazon/aws-cli:latest --endpoint-url "$ENDPOINT" s3 "$@"
 }
 
 cmd="${1:-}"; shift || true
 case "$cmd" in
   ls)
-    mc "ls --recursive local/$BUCKET/${1:-}"
+    s3 ls --recursive "s3://$BUCKET/${1:-}"
     ;;
   up)
     [ $# -ge 1 ] || { echo "usage: $0 up <local-file> [key]" >&2; exit 1; }
     local_file="$1"; key="${2:-$(basename "$1")}"
-    mc "cp /work/$local_file local/$BUCKET/$key"
+    s3 cp "/work/$local_file" "s3://$BUCKET/$key"
     echo "uploaded $local_file -> $BUCKET/$key"
     ;;
   down)
     [ $# -ge 1 ] || { echo "usage: $0 down <key> [local-file]" >&2; exit 1; }
     key="$1"; out="${2:-$(basename "$1")}"
-    mc "cp local/$BUCKET/$key /work/$out"
+    s3 cp "s3://$BUCKET/$key" "/work/$out"
     echo "downloaded $BUCKET/$key -> $out"
     ;;
   rm)
     [ $# -ge 1 ] || { echo "usage: $0 rm <key>" >&2; exit 1; }
-    mc "rm local/$BUCKET/$1"
+    s3 rm "s3://$BUCKET/$1"
     echo "removed $BUCKET/$1"
     ;;
   *)

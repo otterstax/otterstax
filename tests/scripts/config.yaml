@@ -55,8 +55,8 @@ connections:
       table: orders
 
   s3:
-    - alias: miniotest
-      access_key: minioadmin
-      secret_key: minioadmin
+    - alias: rustfstest
+      access_key: rustfsadmin
+      secret_key: rustfsadmin
       region: us-east-1
       endpoint: rustfs:9000

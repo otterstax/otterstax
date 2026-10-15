@@ -4,7 +4,7 @@
 """Runner for the s3/file external-table benchmarks.
 
 Three workloads, each measured per ``source`` (local ``file`` mount + ``s3``
-MinIO bucket) so file vs s3 are directly comparable:
+RustFS bucket) so file vs s3 are directly comparable:
 
   external_load   CREATE EXTERNAL TABLE — load a fixture into otterbrix-internal
                   storage.  One sub-test per (source × format).  The table is
@@ -47,9 +47,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from common import BenchmarkResult, RunResult, write_txt_result
 
-# In-container view of the seeded MinIO bucket and the /fixtures mount.
-# Mirrors run_benchmark.sh (_register_s3_credentials) + compose_minio.yml.
-S3_ALIAS = "bench_minio"
+# In-container view of the seeded RustFS bucket and the /fixtures mount.
+# Mirrors run_benchmark.sh (_register_s3_credentials) + compose_rustfs.yml.
+S3_ALIAS = "bench_rustfs"
 S3_BUCKET = "bench-bucket"
 FILE_FIXTURE_DIR = "/fixtures"
 

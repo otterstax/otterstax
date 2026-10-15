@@ -2,8 +2,8 @@
 # Copyright 2025-2026  OtterStax
 #
 # MySQL-wire end-to-end test of s3 external tables (CREATE EXTERNAL TABLE /
-# COPY ... TO) for all formats (parquet, csv, ndjson), against a seeded MinIO.
-# Registers MinIO credentials through the HTTP API before running.
+# COPY ... TO) for all formats (parquet, csv, ndjson), against a seeded RustFS.
+# Registers RustFS credentials through the HTTP API before running.
 
 import sys
 

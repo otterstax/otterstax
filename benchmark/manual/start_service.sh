@@ -15,10 +15,10 @@
 #   ./benchmark/manual/start_service.sh [--no-init] [--rebuild] [--perf] [--perf-alloc] [--tracy] [-j N] [--image-tag TAG]
 #
 # Options:
-#   --external   Also start a seeded MinIO and generate s3/file fixtures so the
+#   --external   Also start a seeded RustFS and generate s3/file fixtures so the
 #                external_load / external_join / external_dump / external_join_cross /
-#                external_join_all benchmarks can run (registers the bench_minio
-#                s3 alias). Adds compose_minio.yml.
+#                external_join_all benchmarks can run (registers the bench_rustfs
+#                s3 alias). Adds compose_rustfs.yml.
 #   --kafka      Also start a redpanda broker, generate the JSON dataset and seed
 #                it into the topic so the kafka_ingest / kafka_produce / kafka_stream
 #                benchmarks can run. Adds compose_kafka.yml. No REST registration
@@ -120,7 +120,7 @@ if $ENABLE_PERF; then
             -f "$BENCH_DIR/compose_manual.yml"
             -f "$BENCH_DIR/compose_benchmark_perf.yml"
         )
-        [ "$EXTERNAL_ENABLED" = "true" ] && _files+=(-f "$BENCH_DIR/compose_minio.yml")
+        [ "$EXTERNAL_ENABLED" = "true" ] && _files+=(-f "$BENCH_DIR/compose_rustfs.yml")
         [ "$KAFKA_ENABLED" = "true" ] && _files+=(-f "$BENCH_DIR/compose_kafka.yml")
         docker compose "${_files[@]}" -p bench "$@"
     }
@@ -174,7 +174,7 @@ _start_perf() {
     fi
 }
 
-# Generate s3/file fixtures before `up` so MinIO can seed the bucket and
+# Generate s3/file fixtures before `up` so RustFS can seed the bucket and
 # bench-otterstax can mount /fixtures.
 if $EXTERNAL_ENABLED; then
     echo ""
@@ -200,7 +200,7 @@ _wait_db_healthy bench_postgres1
 _wait_db_healthy bench_postgres2
 _wait_db_healthy bench_clickhouse1
 _wait_db_healthy bench_clickhouse2
-$EXTERNAL_ENABLED && _wait_db_healthy bench_minio
+$EXTERNAL_ENABLED && _wait_db_healthy bench_rustfs
 $KAFKA_ENABLED && _wait_db_healthy bench_kafka
 echo "Giving databases extra time to stabilise..."
 sleep 5
@@ -270,7 +270,7 @@ echo "   ${PERF_OUT_DIR}/benchmark.perf  (drag into speedscope.app)"
 echo ""
 fi
 if $EXTERNAL_ENABLED; then
-echo " s3/file ready   → MinIO seeded (alias bench_minio, bucket bench-bucket)"
+echo " s3/file ready   → RustFS seeded (alias bench_rustfs, bucket bench-bucket)"
 echo "   external bench: ./benchmark/manual/run_bench.sh \\"
 echo "                    --bench external_load external_join external_dump external_join_cross external_join_all"
 fi

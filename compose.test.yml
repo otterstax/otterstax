@@ -157,14 +157,13 @@ services:
         aliases:
           - test-otterstax
 
-  # RustFS (S3-compatible) backend for the s3 external-table tests. The MinIO
-  # images are no longer pullable without authorization.
+  # RustFS (S3-compatible) backend for the s3 external-table tests.
   rustfs:
     image: rustfs/rustfs:latest
     container_name: test-rustfs
     environment:
-      RUSTFS_ACCESS_KEY: minioadmin
-      RUSTFS_SECRET_KEY: minioadmin
+      RUSTFS_ACCESS_KEY: rustfsadmin
+      RUSTFS_SECRET_KEY: rustfsadmin
     expose:
       - "9000"
       - "9001"
@@ -179,19 +178,19 @@ services:
     restart: unless-stopped
 
   # One-shot job: create + seed test-bucket from the shared fixtures, then exit.
-  # Fixtures are baked into the image (see tests/minio/Dockerfile.fixtures) so
+  # Fixtures are baked into the image (see tests/s3/Dockerfile.fixtures) so
   # the seeding works in DinD CI runners that cannot bind-mount the workspace.
   rustfs-init:
     build:
       context: .
-      dockerfile: tests/minio/Dockerfile.fixtures
+      dockerfile: tests/s3/Dockerfile.fixtures
     container_name: test-rustfs-init
     depends_on:
       rustfs:
         condition: service_healthy
     environment:
-      AWS_ACCESS_KEY_ID: minioadmin
-      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_ACCESS_KEY_ID: rustfsadmin
+      AWS_SECRET_ACCESS_KEY: rustfsadmin
       AWS_DEFAULT_REGION: us-east-1
     entrypoint:
       - /bin/sh

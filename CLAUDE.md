@@ -47,7 +47,7 @@ connections:
   clickhouse:
     - { alias: ch, host: demo-clickhouse, port: "9000", username: demo, password: demo, database: ev, table: "" }
   s3:
-    - { alias: demo_s3, access_key: minioadmin, secret_key: minioadmin, region: us-east-1, endpoint: demo-minio:9000 }
+    - { alias: demo_s3, access_key: rustfsadmin, secret_key: rustfsadmin, region: us-east-1, endpoint: demo-rustfs:9000 }
 ```
 
 Wire-server settings live under the top-level `service:` node so
@@ -379,7 +379,7 @@ CREATE EXTERNAL TABLE <db>.<table>
 
 -- Load an S3 object (after registering credentials via REST — see below)
 CREATE EXTERNAL TABLE <db>.<table>
-    WITH (s3_alias = 'minio1',
+    WITH (s3_alias = 'rustfs1',
           location = 's3://bucket/path/file.csv',
           format   = 'csv');
 
@@ -388,7 +388,7 @@ COPY (SELECT col_a, col_b FROM <db>.<table>) TO '/tmp/out.ndjson'
     WITH (format = 'ndjson');
 
 COPY (SELECT * FROM <db>.<table>) TO 's3://bucket/exported/out.csv'
-    WITH (s3_alias = 'minio1', format = 'csv');
+    WITH (s3_alias = 'rustfs1', format = 'csv');
 ```
 
 Supported formats (both `CREATE EXTERNAL TABLE` and `COPY ... TO`):
@@ -481,7 +481,7 @@ error, just an empty result. The two width footguns to watch for:
 ```sql
 -- Bring two datasets in
 CREATE EXTERNAL TABLE eg.regions
-    WITH (s3_alias='minio1', location='s3://test-bucket/regions.parquet', format='parquet');
+    WITH (s3_alias='rustfs1', location='s3://test-bucket/regions.parquet', format='parquet');
 CREATE EXTERNAL TABLE eg.weights
     WITH (location='/fixtures/weights.csv', format='csv');
 
@@ -493,7 +493,7 @@ INSERT INTO eg.weighted_regions (region_id, region_name, weight)
 
 -- Export to s3
 COPY (SELECT * FROM eg.weighted_regions) TO 's3://test-bucket/out/weighted.csv'
-    WITH (s3_alias='minio1', format='csv');
+    WITH (s3_alias='rustfs1', format='csv');
 ```
 
 End-to-end coverage lives in `tests/test_{schema_}mysql_{file,s3}.py`,

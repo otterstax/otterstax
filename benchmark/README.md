@@ -203,7 +203,7 @@ elapsed_ms : 45.2
 
 Five opt-in workloads that exercise the `CREATE EXTERNAL TABLE` / `COPY ... TO`
 grammar extensions. Each runs both a local-file (`/fixtures` mount) and an s3
-(seeded MinIO) source, so file vs s3 are directly comparable in the sub-test
+(seeded RustFS) source, so file vs s3 are directly comparable in the sub-test
 breakdown. `mysql` and `postgres` frontends only — `arrow` is excluded by the
 same JOIN serialisation bug as the default test set.
 
@@ -224,9 +224,9 @@ shape the python tests use.
 Selecting any `external_*` test automatically:
 
 1. Generates fixtures into `benchmark/data/fixtures/` via `data/generate_external_fixtures.py`.
-2. Adds `compose_minio.yml` to the stack (MinIO + a one-shot that seeds `bench-bucket`).
+2. Adds `compose_rustfs.yml` to the stack (RustFS + a one-shot that seeds `bench-bucket`).
 
-The `bench_minio` s3 alias is declared in `benchmark/config.yaml` and
+The `bench_rustfs` s3 alias is declared in `benchmark/config.yaml` and
 registered at server startup (no runtime registration step).
 
 ```bash
@@ -240,7 +240,7 @@ registered at server startup (no runtime registration step).
   --bench external_join_cross external_join_all
 ```
 
-Manual flow: start with `--external` so MinIO + fixtures + s3 alias are ready
+Manual flow: start with `--external` so RustFS + fixtures + s3 alias are ready
 before `run_bench.sh` selects the tests:
 
 ```bash

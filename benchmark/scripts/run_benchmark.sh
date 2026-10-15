@@ -27,10 +27,10 @@ BUILD_JOBS=0
 IMAGE_TAG="${IMAGE_TAG:-bench}"
 FORCE_REBUILD=false   # set by --rebuild or --clear; bypasses image-existence check
 CLEAR=false           # set by --clear; removes images and volumes before building
-EXTERNAL_ENABLED=false  # set when any external_* test is selected (adds MinIO + fixtures)
+EXTERNAL_ENABLED=false  # set when any external_* test is selected (adds RustFS + fixtures)
 KAFKA_ENABLED=false     # set when any kafka_* test is selected (adds redpanda + seeds a topic)
 
-# external_* are opt-in via --bench: they need generated fixtures + MinIO, which
+# external_* are opt-in via --bench: they need generated fixtures + RustFS, which
 # only spin up when selected.  They cover s3/file loading, internal joins and
 # dumps — no cross-backend / JOIN ALL workloads.
 DEFAULT_TESTS=(simple_select complex_select join_same_instance join_cross_engine join_all)
@@ -74,7 +74,7 @@ Options:
                       kafka_ingest | kafka_produce | kafka_stream
                       May be repeated. Default: the five cross-backend tests.
                       external_* (s3/file: load, internal joins, dump) are opt-in
-                      and auto-start MinIO + generate fixtures. mysql/postgres only.
+                      and auto-start RustFS + generate fixtures. mysql/postgres only.
                       kafka_* are opt-in and auto-start redpanda + seed a JSON
                       topic: kafka_ingest (SOURCE ingest, at-least-once + EOS),
                       kafka_produce (INSERT VALUES write path), kafka_stream
@@ -207,7 +207,7 @@ if [ ${#BENCH_FILTER[@]} -gt 0 ]; then
     TESTS=("${_filtered[@]}")
 fi
 
-# External tests pull in MinIO + generated fixtures; kafka tests pull in redpanda
+# External tests pull in RustFS + generated fixtures; kafka tests pull in redpanda
 # + a seeded topic.  Detect once up front.
 for _t in "${TESTS[@]}"; do
     case "$_t" in
@@ -258,15 +258,15 @@ fi
 
 _compose_backends() {
     local _files=(-f "$BENCH_DIR/compose_backends.yml")
-    # External tests need a seeded MinIO alongside the DB backends.
-    $EXTERNAL_ENABLED && _files+=(-f "$BENCH_DIR/compose_minio.yml")
+    # External tests need a seeded RustFS alongside the DB backends.
+    $EXTERNAL_ENABLED && _files+=(-f "$BENCH_DIR/compose_rustfs.yml")
     # Kafka tests need a redpanda broker alongside the DB backends.
     $KAFKA_ENABLED && _files+=(-f "$BENCH_DIR/compose_kafka.yml")
     $COMPOSE_CMD "${_files[@]}" "$@"
 }
 _compose_otterstax() {
     local _files=(-f "$BENCH_DIR/compose_backends.yml" -f "$BENCH_DIR/compose_benchmark.yml")
-    $EXTERNAL_ENABLED && _files+=(-f "$BENCH_DIR/compose_minio.yml")
+    $EXTERNAL_ENABLED && _files+=(-f "$BENCH_DIR/compose_rustfs.yml")
     $KAFKA_ENABLED && _files+=(-f "$BENCH_DIR/compose_kafka.yml")
     # When --perf is active, include the perf overlay to add SYS_ADMIN/PERFMON
     # capabilities and disable seccomp on bench-otterstax so perf_event_open works.
@@ -373,10 +373,10 @@ _register_connections() {
     $EXTERNAL_ENABLED && _register_s3_credentials
 }
 
-# The bench MinIO s3 alias ('bench_minio') is likewise declared in
+# The bench RustFS s3 alias ('bench_rustfs') is likewise declared in
 # benchmark/config.yaml and registered at startup. No-op here.
 _register_s3_credentials() {
-    echo "s3 alias 'bench_minio' read from benchmark/config.yaml at startup."
+    echo "s3 alias 'bench_rustfs' read from benchmark/config.yaml at startup."
 }
 
 # ---------------------------------------------------------------------------
@@ -571,7 +571,7 @@ fi
 
 # ---------------------------------------------------------------------------
 # Step 1b: Generate s3/file external-table fixtures (only when needed)
-# Must happen before `up` so MinIO seeds the bucket and bench-otterstax mounts
+# Must happen before `up` so RustFS seeds the bucket and bench-otterstax mounts
 # the fixtures.  Written to benchmark/data/fixtures on the host (bind-mounted).
 # ---------------------------------------------------------------------------
 if $EXTERNAL_ENABLED; then
@@ -623,7 +623,7 @@ _wait_db_healthy bench_postgres1
 _wait_db_healthy bench_postgres2
 _wait_db_healthy bench_clickhouse1
 _wait_db_healthy bench_clickhouse2
-$EXTERNAL_ENABLED && _wait_db_healthy bench_minio
+$EXTERNAL_ENABLED && _wait_db_healthy bench_rustfs
 $KAFKA_ENABLED && _wait_db_healthy bench_kafka
 
 echo "Giving databases extra time to stabilise..."

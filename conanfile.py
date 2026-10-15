@@ -36,8 +36,10 @@ class OtterStax(ConanFile):
     def requirements(self):
         if self.options.with_tracy:
             self.requires("tracy/0.13.1")
-        self.requires("arrow/24.0.0")
+        # Export cmake/conan-recipes/arrow before installing dependencies.
+        self.requires("arrow/24.0.0#7590860044e65a24a100d2eaae75ee6d")
         self.requires("openssl/3.0.13")
+        self.requires("libcurl/8.22.0")
         self.requires("boost/1.88.0", override=True)
         self.requires("fmt/11.1.3")
         self.requires("spdlog/1.15.1")
@@ -54,7 +56,8 @@ class OtterStax(ConanFile):
         self.requires("benchmark/1.6.1")
         self.requires("zlib/1.3.1")
         self.requires("bzip2/1.0.8")
-        self.requires("otterbrix/1.0.0b2-rc-3#87ab253cd44870f2caf7c739e3e85ae6")
+        # Export cmake/conan-recipes/otterbrix before installing dependencies.
+        self.requires("otterbrix/1.0.0b2-rc-3#aab9f66f38b21dea259c8089339848b2")
         self.requires("magic_enum/0.8.1")
         self.requires("actor-zeta/1.2.0@")
         self.requires("libpq/15.4")

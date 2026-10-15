@@ -273,8 +273,9 @@ def first(messages, kind):
 
 
 class PgExtendedProtocolTest:
-    def __init__(self, local=False):
+    def __init__(self, local=False, port=PG_PORT):
         self.host = get_host(local)
+        self.port = port
         self.wire = None
         self.database_created = False
         self.table_created = False
@@ -293,7 +294,7 @@ class PgExtendedProtocolTest:
                 raise AssertionError(f"{what}: {error_fields(payload)}")
 
     def connect(self):
-        wire = PgWire(self.host, PG_PORT)
+        wire = PgWire(self.host, self.port)
         wire.startup("testuser", DB)
         return wire
 
@@ -566,6 +567,7 @@ class PgExtendedProtocolTest:
         """Describe('P') of an INSERT answers NoData and writes nothing; its Execute writes exactly once."""
         w = self.wire
         before = self.row_count()
+        self.assert_no_error(w.query("BEGIN"), "retain the DML portal across Sync")
 
         w.parse("dml_desc", f"INSERT INTO {DB}.{TABLE} (id, name) VALUES ($1, $2)", [OID_INT8, OID_TEXT])
         w.bind("dp", "dml_desc", ["77", "row_77"])
@@ -583,6 +585,7 @@ class PgExtendedProtocolTest:
         self.assert_no_error(messages, "Execute of the described INSERT portal")
         self.assert_equal(command_tag(first(messages, COMMAND_COMPLETE)), "INSERT 0 1", "the INSERT ran")
         self.assert_equal(self.row_count(), before + 1, "exactly one row was written, by the Execute alone")
+        self.assert_no_error(w.query("COMMIT"), "commit the described DML portal")
 
         self.assert_no_error(self.wire.query(f"DELETE FROM {DB}.{TABLE} WHERE id = 77"), "cleanup of the written row")
         print("  Describe(portal) of a DML: NoData, nothing written, Execute writes once ✓")

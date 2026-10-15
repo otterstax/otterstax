@@ -2,9 +2,11 @@
 // Copyright 2025-2026  OtterStax
 
 #include "manager.hpp"
+#include "security/file_access.hpp"
 #include "otterbrix/translators/error.hpp"
 #include "utility/logger.hpp"
 #include "utility/tracy_profiler.hpp"
+#include "utility/s3_transport.hpp"
 
 // Clash between otterbrix parser macros and Arrow headers
 #undef DAY
@@ -17,7 +19,6 @@
 #include <arrow/result.h>
 #include <arrow/status.h>
 
-#include <ctime>
 #include <filesystem>
 #include <thread>
 
@@ -39,9 +40,13 @@ make_s3fs(const connect_params& creds) {
 
     if (!creds.endpoint.empty()) {
         opts.endpoint_override = std::string_view{creds.endpoint};
-        // Disable virtual addressing for custom endpoints (e.g. LocalStack)
-        opts.scheme = "http";
     }
+    opts.scheme = std::string_view{creds.scheme};
+    opts.tls_ca_file_path = std::string_view{creds.ca_file};
+    opts.tls_verify_certificates = true;
+    // A SQL bucket must stay in the request path, never become a hostname or
+    // an access-point ARN that overrides the administrator's endpoint.
+    opts.force_virtual_addressing = false;
 
     return arrow::fs::S3FileSystem::Make(opts);
 }
@@ -69,18 +74,6 @@ arrow::Status cp_impl(arrow::fs::FileSystem& src_fs,
     return arrow::Status::OK();
 }
 
-// Build a unique local filename for a downloaded object by prefixing the
-// object's basename with a timestamp, e.g.
-//   "bucket/data/costs.parquet" → "2026-05-23_10-34-35_costs.parquet"
-std::string timestamped_filename(const std::string& s3_path) {
-    std::time_t now = std::time(nullptr);
-    std::tm     tm{};
-    localtime_r(&now, &tm);
-    char ts[20];
-    std::strftime(ts, sizeof(ts), "%Y-%m-%d_%H-%M-%S", &tm);
-    return std::string{ts} + "_" + std::filesystem::path(s3_path).filename().string();
-}
-
 core::error_t unknown_alias(std::pmr::memory_resource* res, std::string_view op, const std::string& alias) {
     return tsl::make_error(res, core::error_code_t::do_not_exists,
                            std::string{op} + ": unknown alias '" + alias + "'");
@@ -97,6 +90,8 @@ connect_params stored_on(std::pmr::memory_resource* res, const connect_params& p
         .session_token = std::pmr::string{std::string_view{params.session_token}, res},
         .endpoint = std::pmr::string{std::string_view{params.endpoint}, res},
         .alias = std::pmr::string{std::string_view{params.alias}, res},
+        .scheme = std::pmr::string{std::string_view{params.scheme}, res},
+        .ca_file = std::pmr::string{std::string_view{params.ca_file}, res},
     };
 }
 
@@ -104,11 +99,13 @@ connect_params stored_on(std::pmr::memory_resource* res, const connect_params& p
 
 // ── ConnectorManager ────────────────────────────────────────────────────────────────
 
-ConnectorManager::ConnectorManager(std::pmr::memory_resource* res, std::string_view s3_download_path)
+ConnectorManager::ConnectorManager(std::pmr::memory_resource* res, std::string_view s3_download_path,
+                                   std::shared_ptr<const otterstax::security::file_access> files)
     : resource_(res)
     , log_(get_logger(logger_tag::S3_MANAGER))
     , credentials_store_(res)
-    , s3_download_path_(s3_download_path, res) {
+    , s3_download_path_(s3_download_path, res)
+    , files_(files ? std::move(files) : std::make_shared<otterstax::security::file_access>(otterstax::security::file_access_config{}, true)) {
     assert(log_.is_valid());
     assert(res != nullptr);
     assert(!s3_download_path_.empty() && "s3 download path must not be empty");
@@ -172,6 +169,10 @@ ConnectorManager::add_credentials(session_hash_t /*id*/, connect_params params) 
                                       std::string{std::string_view{params.alias}} + "'");
     }
 
+    if (auto invalid = otterstax::validate_s3_transport(params.scheme, params.endpoint, params.ca_file)) {
+        co_return tsl::make_error(resource(), core::error_code_t::invalid_parameter, *invalid);
+    }
+
     auto it = credentials_store_.find(std::string_view{params.alias});
     const bool updated = it != credentials_store_.end();
     if (updated) {
@@ -192,6 +193,11 @@ ConnectorManager::list(session_hash_t id, std::string alias, std::string s3_path
     if (it == credentials_store_.end()) {
         log_->error("list: unknown alias '{}'", alias);
         co_return unknown_alias(resource(), "list", alias);
+    }
+
+    if (!otterstax::valid_s3_bucket_path(s3_path)) {
+        co_return tsl::make_error(resource(), core::error_code_t::invalid_parameter,
+                                  "S3 path must use a bucket name, not a URL, authority or access-point ARN");
     }
 
     auto fs_result = make_s3fs(it->second);
@@ -230,26 +236,36 @@ ConnectorManager::download(session_hash_t id, std::string alias, std::string s3_
         co_return unknown_alias(resource(), "download", alias);
     }
 
+    if (!otterstax::valid_s3_bucket_path(s3_path)) {
+        co_return tsl::make_error(resource(), core::error_code_t::invalid_parameter,
+                                  "S3 path must use a bucket name, not a URL, authority or access-point ARN");
+    }
+
     auto fs_result = make_s3fs(it->second);
     if (!fs_result.ok()) {
         co_return tsl::arrow_error(resource(), core::error_code_t::io_error, "download", fs_result.status());
     }
 
-    arrow::fs::LocalFileSystem local_fs;
-    const std::string local_path =
-        (std::filesystem::path(std::string_view{s3_download_path_}) / timestamped_filename(s3_path)).string();
-
-    auto status = cp_impl(**fs_result, s3_path, local_fs, local_path);
-    if (!status.ok()) {
-        // A transfer that failed mid-way has already created the destination;
-        // a truncated object must never be handed to the loader.
-        std::error_code ec;
-        std::filesystem::remove(local_path, ec);
-        co_return tsl::arrow_error(resource(), core::error_code_t::io_error, "download", status);
+    const auto basename = std::filesystem::path(s3_path).filename();
+    if (basename.empty() || basename == "." || basename == "..") {
+        co_return tsl::make_error(resource(), core::error_code_t::invalid_parameter, "download: object name is empty");
     }
-
-    log_->debug("download: s3://{} → {}", s3_path, local_path);
-    co_return std::pmr::string{std::string_view{local_path}, resource()};
+    auto input = (*fs_result)->OpenInputStream(s3_path);
+    if (!input.ok()) co_return tsl::arrow_error(resource(), core::error_code_t::io_error, "download", input.status());
+    const auto destination = (std::filesystem::path(std::string_view{s3_download_path_}) / basename).string();
+    auto output = files_->output(destination, true);
+    if (!output.ok()) co_return tsl::arrow_error(resource(), core::error_code_t::io_error, "download", output.status());
+    for (;;) {
+        auto buffer = (*input)->Read(1 << 20);
+        if (!buffer.ok()) co_return tsl::arrow_error(resource(), core::error_code_t::io_error, "download", buffer.status());
+        if ((*buffer)->size() == 0) break;
+        auto status = (*output)->Write((*buffer)->data(), (*buffer)->size());
+        if (!status.ok()) co_return tsl::arrow_error(resource(), core::error_code_t::io_error, "download", status);
+    }
+    auto committed = (*output)->commit();
+    if (!committed.ok()) co_return tsl::arrow_error(resource(), core::error_code_t::io_error, "download", committed);
+    log_->debug("download: s3://{} → {}", s3_path, (*output)->path());
+    co_return std::pmr::string{(*output)->path(), resource()};
 }
 
 actor_zeta::unique_future<core::result_wrapper_t<bool>>
@@ -260,6 +276,11 @@ ConnectorManager::upload(session_hash_t id, std::string alias, std::string s3_pa
     if (it == credentials_store_.end()) {
         log_->error("upload: unknown alias '{}'", alias);
         co_return unknown_alias(resource(), "upload", alias);
+    }
+
+    if (!otterstax::valid_s3_bucket_path(s3_path)) {
+        co_return tsl::make_error(resource(), core::error_code_t::invalid_parameter,
+                                  "S3 path must use a bucket name, not a URL, authority or access-point ARN");
     }
 
     auto fs_result = make_s3fs(it->second);

@@ -46,7 +46,7 @@ namespace frontend::postgres {
         , statement_name_map_(resource_)
         , portals_(resource_)
         , scheduler_(scheduler)
-        , transaction_man_()
+        , sql_session_(resource, scheduler, false)
         , pipeline_()
         , use_protocol_3_2_(false)
         , log_(get_logger(logger_tag::POSTGRES_CONNECTION)) {
@@ -69,14 +69,13 @@ namespace frontend::postgres {
         , schema(std::move(schema))
         , tag(tag)
         , specified_types(std::move(specified_types))
-        , portal_names(resource)
         , described(false) {}
 
     postgres_connection::portal_meta::portal_meta(portal_t params,
-                                                  prepared_stmt_meta& statement,
+                                                  std::shared_ptr<prepared_stmt_meta> statement,
                                                   std::vector<result_encoding> format)
         : params(std::move(params))
-        , statement(statement)
+        , statement(std::move(statement))
         , format(std::move(format))
         , described(false)
         , result()
@@ -101,7 +100,8 @@ namespace frontend::postgres {
         // As in PostgreSQL, a type byte the protocol does not define means the
         // message boundaries are lost: FATAL and close, without waiting for
         // the body the length announces.
-        if (!is_frontend_message_type(static_cast<char>(header[0]))) {
+        if ((state_ == connection_state::AUTH && header[0] != 'p') ||
+            (state_ != connection_state::AUTH && !is_frontend_message_type(static_cast<char>(header[0])))) {
             send_error_response(sql_state::PROTOCOL_VIOLATION,
                                 "invalid frontend message type " + std::to_string(header[0]),
                                 error_severity::fatal());
@@ -113,6 +113,11 @@ namespace frontend::postgres {
             return false;
         }
         size -= 4;
+        if (state_ == connection_state::AUTH && size > access_->max_token_bytes + 1) {
+            send_error_response(sql_state::INVALID_AUTHORIZATION, "Access token exceeds the configured limit",
+                                error_severity::fatal());
+            return false;
+        }
 
         return true;
     }
@@ -130,9 +135,7 @@ namespace frontend::postgres {
         arm_read_timeout("initial message");
 
         // size is 4, without char noting message type
-        boost::asio::async_read(
-            socket_,
-            boost::asio::buffer(read_buffer_.data(), 4),
+        read_transport(boost::asio::buffer(read_buffer_.data(), 4),
             safe_callback([this](boost::system::error_code ec, std::size_t length) {
                 cancel_read_timeout();
                 if (closed()) {
@@ -144,11 +147,11 @@ namespace frontend::postgres {
                 }
 
                 auto msg_length = merge_data_bytes<uint32_t, endian::BIG>(read_buffer_, 0);
-                std::cout << "Initial message length: " + std::to_string(msg_length) << std::endl;
+                log_->trace("[Connection {}] initial message length: {}", connection_id_, msg_length);
 
                 if (msg_length < 4 || msg_length > MAX_PACKET_SIZE) {
                     send_error_response(sql_state::PROTOCOL_VIOLATION,
-                                        "Invalid message length: " + std::to_string(length),
+                                        "Invalid message length: " + std::to_string(msg_length),
                                         error_severity::fatal());
                     return;
                 }
@@ -161,9 +164,7 @@ namespace frontend::postgres {
                 }
 
                 arm_read_timeout("initial message body");
-                boost::asio::async_read(
-                    socket_,
-                    boost::asio::buffer(read_buffer_.data(), msg_length),
+                read_transport(boost::asio::buffer(read_buffer_.data(), msg_length),
                     safe_callback([this, msg_length](boost::system::error_code ec, std::size_t length) {
                         cancel_read_timeout();
                         if (closed()) {
@@ -186,7 +187,7 @@ namespace frontend::postgres {
                                                 "Truncated startup message: no protocol version",
                                                 error_severity::fatal());
                         } else if (code == message_code::SSL_REQUEST_CODE) {
-                            handle_ssl_decline(reader);
+                            handle_ssl_request(reader);
                         } else if (code == message_code::PROTOCOL_VERSION_3_0) {
                             handle_startup_message(code, reader);
                         } else {
@@ -202,6 +203,25 @@ namespace frontend::postgres {
         OTX_ZONE_N("pg::handle_packet");
         assert(header.size() == 5);
         auto message_type = static_cast<char>(header[0]);
+        if (state_ == connection_state::AUTH) {
+            packet_reader reader(std::move(payload));
+            auto token = reader.read_string_null();
+            if (message_type != 'p' || !reader.ok() || reader.remaining() != 0 ||
+                verify_token(token).status != otterstax::security::token_status::accepted) {
+                send_error_response(sql_state::INVALID_AUTHORIZATION, "Access token is invalid or unavailable",
+                                    error_severity::fatal());
+                return;
+            }
+            access_token_ = std::move(token);
+            finish_authentication();
+            return;
+        }
+        if (authentication_required() && message_type != message_type::frontend::TERMINATE &&
+            verify_token(access_token_).status != otterstax::security::token_status::accepted) {
+            send_error_response(sql_state::INVALID_AUTHORIZATION, "Access token is invalid or unavailable",
+                                error_severity::fatal());
+            return;
+        }
         // A failed pipeline discards every message up to its Sync, which sends
         // the single ReadyForQuery; Terminate still ends the connection.
         if (pipeline_.has_error() && message_type != message_type::frontend::SYNC &&
@@ -223,6 +243,17 @@ namespace frontend::postgres {
         // message format", checked before the message is acted on. Only a
         // malformed StartupMessage (no session yet) and a message type the
         // protocol does not define (validate_payload_size) are FATAL.
+        // Parse/Bind/Describe can consult storage before Execute. They belong
+        // to the same implicit transaction, including errors in their payloads.
+        if (message_type == message_type::frontend::PARSE || message_type == message_type::frontend::BIND ||
+            message_type == message_type::frontend::EXECUTE || message_type == message_type::frontend::DESCRIBE) {
+            pipeline_.begin_pipeline();
+            auto started = sql_session_.begin_implicit();
+            if (started.has_error()) {
+                send_query_error(started.error());
+                return;
+            }
+        }
         switch (message_type) {
             case message_type::frontend::QUERY: {
                 // The simple protocol answers ReadyForQuery itself, after the
@@ -244,7 +275,7 @@ namespace frontend::postgres {
 
                 if (query.empty()) {
                     send_packet_merged({build_empty_query_response(writer_),
-                                        build_ready_for_query(writer_, transaction_man_.get_transaction_status())});
+                                        build_ready_for_query(writer_, wire_transaction_status())});
                     break;
                 }
 
@@ -426,7 +457,8 @@ namespace frontend::postgres {
                     send_error_response(sql_state::PROTOCOL_VIOLATION, INVALID_MESSAGE_FORMAT);
                     return;
                 }
-                send_packet(build_ready_for_query(writer_, transaction_man_.get_transaction_status()));
+                if (!finish_implicit_transaction()) return;
+                send_packet(build_ready_for_query(writer_, wire_transaction_status()));
                 break;
             }
             case message_type::frontend::FLUSH:
@@ -460,27 +492,37 @@ namespace frontend::postgres {
 
     void postgres_connection::send_error_response(const char* sqlstate, std::string message, error_severity severity) {
         log_->warn("[Connection {}] ERROR: sqlstate={} msg='{}'", connection_id_, sqlstate, message);
+        if (sql_session_.broken()) severity = error_severity::fatal();
         const bool ready_for_query_at_sync = pipeline_.set_error();
         if (severity.tag == error_severity::fatal().tag) {
             // FATAL closes the connection: a broken startup, a message type the
             // protocol does not define, a transport error, exhausted resources —
             // never a malformed message of a known type after startup.
-            send_packet(build_error_response(writer_, sqlstate, std::move(message), severity), false);
-            finish();
+            send_then(build_error_response(writer_, sqlstate, std::move(message), severity), [this] { finish(); });
             return;
         }
 
         // An error inside an explicit transaction block fails the block: every
         // ReadyForQuery reports 'E' until ROLLBACK or COMMIT ends it. Outside a
         // block there is nothing to fail and the status stays 'I'.
-        transaction_man_.mark_failed();
+        sql_session_.mark_failed();
+        if (!ready_for_query_at_sync) {
+            auto ended = sql_session_.finish_implicit();
+            if (ended.has_error()) severity = error_severity::fatal();
+            if (sql_session_.status() == frontend::sql_session::state::idle) portals_.clear();
+        }
+        if (sql_session_.broken() || severity.tag == error_severity::fatal().tag) {
+            send_then(build_error_response(writer_, sqlstate, std::move(message), error_severity::fatal()),
+                      [this] { finish(); });
+            return;
+        }
         if (ready_for_query_at_sync) {
             // Inside an extended-query pipeline the ErrorResponse goes alone:
             // the Sync that ends the pipeline answers the ReadyForQuery.
             send_packet(build_error_response(writer_, sqlstate, std::move(message), severity));
         } else {
             send_packet_merged({build_error_response(writer_, sqlstate, std::move(message), severity),
-                                build_ready_for_query(writer_, transaction_man_.get_transaction_status())});
+                                build_ready_for_query(writer_, wire_transaction_status())});
         }
     }
 } // namespace frontend::postgres

@@ -1,5 +1,35 @@
 # CLAUDE.md
 
+Native transaction semantics and current protocol limits are documented in
+[docs/transactions.md](docs/transactions.md). Keep engine execution context
+separate from process-unique request/prepared-statement IDs.
+PostgreSQL bound portals retain their statement metadata independently of the
+statement name. Spark runtime configuration exposes fixed values; mutations
+return an unsupported-operation error, or per-key warnings for an explicit
+best-effort SET. See `frontend/CLAUDE.md`.
+Client security is configured by `service.security`. Keycloak mode requires TLS
+and verifies bearer access tokens on every gRPC call and native command. An
+accepted identity has full access to its tenant instance. See [deployment](docs/deployment.md)
+and [security internals](security/CLAUDE.md) for the current authorization boundaries.
+
+Keycloak SQL file access requires configured import/export roots. File operations
+use directory descriptors and atomic exports; S3 staging is private to each tenant's
+data directory. S3 endpoints default to verified HTTPS and support environment
+credential references. Deployment details live in `docs/deployment.md`.
+
+Outbound Kafka destinations require `service.security.kafka_brokers`, including
+advertised brokers. S3 aliases require explicit endpoints and use path-style
+bucket addressing. Both deployment modes apply these restrictions.
+
+
+Engine storage and application logs use `--data-dir`, then `OTTERSTAX_DATA_DIR`,
+then `./data`. Docker images set `OTTERSTAX_DATA_DIR=/app/data`. Tenant instances
+must use separate storage and connector configuration. `--help` prints to stdout
+and exits before creating storage or starting loggers.
+The server exclusively locks its data directory before starting loggers or the
+engine. A second server using that directory fails startup. Native listeners
+accept `service.mysql.host` and `service.postgres.host` as IP addresses.
+
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## What This Project Is
@@ -27,12 +57,14 @@ The path comes from the `--config PATH` flag (default `config.yaml`), resolved
 - **bind-mounting** a stack-specific `config.yaml` onto that path (compose files)
   — a mount overrides anything baked in.
 
-A missing file → the server starts with default ports and no connections.
+A missing file loads default ports and no connections, but executable startup requires
+`service.security.mode` to explicitly select `trusted_private` or `keycloak`.
 
 ### File format
 
 ```yaml
 service:
+  security: { mode: trusted_private }
   flight_sql: { host: "0.0.0.0", port: 8815 }
   mysql:      { port: 8816 }      # wire-server port (NOT a backend)
   postgres:   { port: 8817 }      # wire-server port (NOT a backend)
@@ -55,7 +87,7 @@ Wire-server settings live under the top-level `service:` node so
 backends under `connections:` (`connections.mysql`/`connections.postgresql`) —
 different nesting. All `connections:` sections are optional (missing → empty).
 `port` is an **optional string** (empty → driver default). `schema` defaults to
-`public`. s3 `region`/`session_token`/`endpoint` are optional; malformed YAML
+`public`. s3 `endpoint` is required; `region` and `session_token` are optional; malformed YAML
 aborts startup. `service.connection_retry` (optional; default `max_attempts: 1`,
 `delay_ms: 1000` = one-shot) sets how many times startup retries opening a slow
 backend. The `alias` is the outermost qualifier in federated SQL
@@ -91,7 +123,7 @@ main.cpp
   for the first incomplete entry, malformed port or non-scalar field**; a file
   that is not YAML is a `conversion_failure`. Nothing in `config/` throws: the
   yaml-cpp calls are the only throwing sites and each is converted where it is
-  made (`config/yaml_scalar.hpp`, `YAML::LoadFile` in `ConfigReader::load`).
+  made (`config/yaml_scalar.hpp`, `YAML::Load` in `ConfigReader::load`).
   `main.cpp` logs the error and returns 1, so an invalid connection aborts
   startup rather than coming up half-configured.
 - Registration lives in `ComponentManager::register_connections` (it owns the
@@ -132,6 +164,10 @@ the VM's RAM is far smaller than the host's.
   - `./docker-run-tests.sh -j <JOBS>`
   - `./benchmark/scripts/run_benchmark.sh` / `run_stress_benchmarks.sh` already
     **auto-cap** to this formula when `-j` is omitted (see `run_benchmark.sh`).
+- Docker builds resolve `BUILD_JOBS=0` from container CPU and memory limits via
+  `cmake/build_jobs.py`, using `BUILD_MEMORY_PER_JOB_MIB` (default 1536). The same
+  cap applies to Conan dependencies, Tracy and the application build. An explicit
+  positive `BUILD_JOBS` overrides automatic sizing.
 - If a build still gets `Killed`/`ResourceExhausted`, halve `JOBS` or raise the
   Docker Desktop memory limit (Settings → Resources).
 
@@ -139,7 +175,8 @@ the VM's RAM is far smaller than the host's.
 
 ```bash
 # Install Conan deps
-# IMPORTANT: if conanfile.py changed, remove ./build first before re-running
+conan export cmake/conan-recipes/otterbrix
+conan export cmake/conan-recipes/arrow --version=24.0.0
 conan install conanfile.py --build missing -s build_type=Release
 
 # Configure
@@ -218,8 +255,8 @@ docker compose up
 
 ## Architecture Overview
 
-All components are actor-zeta actors (`actor_mixin` for the Scheduler,
-`basic_actor` for Workers and the integration managers) communicating through
+All components are actor-zeta actors (`actor_mixin` for the Scheduler and Workers,
+`basic_actor` for the integration managers) communicating through
 typed coroutine futures. The flow for every query:
 
 ```text
@@ -248,11 +285,10 @@ logical plan inside the frontend (`frontend/spark_connect_server/plan_translator
 where parsing ends (`scheduler/CLAUDE.md`).
 
 The Scheduler is a session-affinity router over a pool of `Worker` actors
-(spawned on an `actor_zeta::scheduler::sharing_scheduler`); every session
-keyed by `session_hash_t` always lands on `workers_[id % N]`. The Scheduler's
-own thread runs an otterbrix-style event loop: `enqueue_impl` (any sender
-thread) only pushes into a lock-free inbox and signals a CV; all coroutine
-work happens on the loop thread. Frontends never block on shared state — they
+(each with an interleaved actor mailbox); every request or prepared statement
+keyed by `session_hash_t` lands on `workers_[id % N]`. Scheduler queues requests
+for the same ID in order. Scheduler and Workers each own their handler and
+continuation execution on one thread. `enqueue_impl` only delivers messages. Frontends never block on shared state — they
 hold the future returned by `Scheduler::execute` and poll it from the
 per-connection asio executor through `frontend/common/asio_future_bridge.hpp`
 (the Spark Connect handlers, which run on an `agrpc::GrpcExecutor`, through its
@@ -339,8 +375,7 @@ Rules:
   `"sql_gen::generate_query"`, `"parser::prepare_sql"`).
 - **Exception — coroutine handlers that can resume on another thread.** When a handler's
   coroutine can suspend at a `co_await` and resume on another thread, or interleave with
-  other coroutines on one thread (`Worker` on the `sharing_scheduler`, the `Scheduler`
-  event loop), open the zone as the first statement of a nested block
+  other coroutines on one thread (the Worker and Scheduler mailboxes), open the zone as the first statement of a nested block
   `{ OTX_ZONE_N("Scope::function"); ... }` that closes before the first `co_await`.
   Tracy requires a zone to end on the thread that began it, in LIFO order; a zone spanning
   a suspension point breaks both and corrupts the capture. Only `assert`s, objects that
@@ -523,8 +558,8 @@ otterbrix-internal — shadow of `external_join_all` benchmark), all driven by
 ## Known Constraints
 
 - `ConnectorManager::addConnection` is the only write to a connector registry and runs on the startup thread before any query reaches the integration actor that drives the manager (`connectors/mysql/manager.hpp`); there is no remove path
-- One query per connection at a time: each alias owns a single `boost::mysql::any_connection` and nothing serializes overlapping statements on it (`Connector::runQuery_` in `connectors/mysql/connector.hpp`; the pg/ch connectors are shaped the same way)
-- A subquery inside an expression is dropped: the engine transformer lowers `WHERE x IN (SELECT …)` (and likely `EXISTS` / a scalar subquery) into a plan of its own in `execution_plan_t::sub_queries`, while `GreenplumParser::parse` keeps only the main plan (`binder.node_ptr()`) and `OtterbrixDataManager::execute_plan` runs that alone — the statement answers without the subquery's rows and without an error, even over local tables
+- One query per connection at a time: each alias owns a single connection. The MySQL, PostgreSQL and ClickHouse integration managers wait for the preceding fragment on that alias before dispatching another; fragments on different aliases can overlap. Connector registries are accessed through their owning integration actor.
+- Local expression subqueries retain the transformer's ordered plans and result mappings through parsing, parameter binding and execution. The pinned engine recipe supplies BOOLEAN placeholders when planning `EXISTS`. Federated name resolution and backend routing inside expression subqueries remain incomplete.
 - Array types support only single dimension (see the `TODO: multiple dimentions array` in `write_column_def`, `otterbrix/query_generation/sql_query_generator.cpp`)
 - Docker MariaDB volumes lag on cold start — `docker-run-tests.sh` has a 120 s wait
 - Engine (rc-3): an aggregate whose arguments are all constants is wrong over a **local** engine table — `SELECT count(1)` / `sum(1)` over a 3-row table answers 1, and 1 per group, and `count(1)` over no rows crashes the process — because `execution_dag_t::run` evaluates an all-constant node over one row per chunk (engine `components/execution_dag/execution_dag.cpp:972-995`). `OtterbrixDataManager::execute_plan` (`otterbrix/operators/execute_plan.cpp`) guards every plan the engine runs, SQL and Spark alike: `count(<non-NULL literal>)` becomes `COUNT(*)`, any other aggregate over constants is refused as `unimplemented_yet` (`sum() over a constant argument is not supported`). Backend mirrors are unaffected (`COUNT(1)` is pushed to the backend). The request to the engine is `docs/otterbrix_request_constant_aggregates.md`

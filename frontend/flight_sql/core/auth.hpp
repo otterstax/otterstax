@@ -13,19 +13,25 @@
 #include <grpcpp/server_context.h>
 
 #include <cstdint>
+#include <chrono>
+#include <memory>
 #include <optional>
 #include <string>
-#include <unordered_set>
 
 namespace flight::core {
 
 class AuthService {
   public:
+    struct token_policy_t {
+        std::chrono::milliseconds lifetime{std::chrono::hours{1}};
+        std::size_t capacity{4096};
+    };
     // Anonymous server: Handshake always succeeds, authorize is always true.
     static AuthService anonymous() { return AuthService{}; }
 
     // Basic auth: a single login/password pair. Without it — anonymous.
     static AuthService basic(std::string user, std::string password);
+    static AuthService basic(std::string user, std::string password, token_policy_t policy);
 
     // Handle a Handshake: verify Basic (header or payload), issue a token to
     // be placed into the response's initial metadata. Errors come back as a
@@ -38,10 +44,12 @@ class AuthService {
 
 
   private:
+    struct token_store_t;
     std::optional<std::pair<std::string, std::string>> credentials_;
-    std::unordered_set<std::string> tokens_;
+    std::shared_ptr<token_store_t> tokens_;
 
-    std::string issue_token();
+    grpc::Status issue_token(std::string& token);
+    bool valid_token(std::string_view token) const;
 };
 
 namespace detail {

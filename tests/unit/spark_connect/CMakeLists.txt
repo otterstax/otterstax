@@ -11,6 +11,7 @@ set(${PROJECT_NAME}_SOURCES
     test_result_encoder.cpp
     test_catalog_relations.cpp
     test_show_string.cpp
+    test_runtime_config.cpp
 )
 
 add_executable(${PROJECT_NAME} ${${PROJECT_NAME}_SOURCES})

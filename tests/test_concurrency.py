@@ -19,10 +19,11 @@
 # been replaced by truly async equivalents.
 #
 # Set OTTERSTAX_RUN_DISRUPTION=1 to run the backend-disconnect recovery test;
-# it pauses/unpauses backend containers via docker compose and is therefore
-# only meaningful when run outside the test container itself.
+# it pauses/unpauses the backend selected by OTTERSTAX_TEST_COMPOSE_PROJECT and
+# OTTERSTAX_TEST_BACKEND_SERVICE. The runner needs Docker CLI/daemon access.
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -61,6 +62,8 @@ RUN_DISRUPTION = os.environ.get('OTTERSTAX_RUN_DISRUPTION') == '1'
 
 def _mysql_select_one(cfg):
     conn = mysql.connector.connect(
+        autocommit=True,
+        connection_timeout=10, read_timeout=120, write_timeout=120,
         host=cfg['host'], port=cfg['mysql_port'],
         user=cfg['user'], password=cfg['password'],
     )
@@ -158,6 +161,7 @@ def test_slow_query_does_not_block_others(cfg):
     def run(sql, label):
         t0 = time.monotonic()
         conn = mysql.connector.connect(
+            autocommit=True,
             host=cfg['host'], port=cfg['mysql_port'],
             user=cfg['user'], password=cfg['password'],
         )
@@ -209,6 +213,7 @@ def test_isolation_across_backends(cfg):
 
     def heavy():
         conn = mysql.connector.connect(
+            autocommit=True,
             host=cfg['host'], port=cfg['mysql_port'],
             user=cfg['user'], password=cfg['password'],
         )
@@ -283,7 +288,7 @@ def test_backend_disconnect_recovery(cfg):
     DEFAULT_TIMEOUT) and recovers afterwards.
 
     This test only runs when OTTERSTAX_RUN_DISRUPTION=1 because it shells out
-    to `docker compose` and requires access to the host docker socket.
+    to Docker and requires access to the test daemon.
     """
     if not RUN_DISRUPTION:
         print("\n[backend_disconnect_recovery] SKIPPED (set OTTERSTAX_RUN_DISRUPTION=1)")
@@ -292,33 +297,42 @@ def test_backend_disconnect_recovery(cfg):
     import subprocess
     print("\n[backend_disconnect_recovery]")
 
-    def pause(svc):
-        subprocess.run(['docker', 'compose', 'pause', svc], check=True)
-
-    def unpause(svc):
-        subprocess.run(['docker', 'compose', 'unpause', svc], check=True)
+    project = os.environ['OTTERSTAX_TEST_COMPOSE_PROJECT']
+    service = os.environ['OTTERSTAX_TEST_BACKEND_SERVICE']
+    assert project and service, "The test backend project and service must be explicit"
+    targets = subprocess.check_output([
+        'docker', 'ps', '-q', '--filter', f'label=com.docker.compose.project={project}',
+        '--filter', f'label=com.docker.compose.service={service}',
+    ], text=True, timeout=15).split()
+    assert len(targets) == 1, f"Expected one running backend for {project}/{service}, found {len(targets)}"
+    target = targets[0]
+    state = json.loads(subprocess.check_output(
+        ['docker', 'inspect', '--format', '{{json .State}}', target], text=True, timeout=15))
+    assert state['Running'] and not state['Paused'], "Test backend must start running and unpaused"
+    assert _mysql_select_one(cfg) == 1, "Baseline query did not return its fixture row"
 
     # Trigger a query while pausing the MySQL backend.
-    pause('test-mariadb-1')
     try:
+        subprocess.run(['docker', 'pause', target], check=True, timeout=15)
         t0 = time.monotonic()
         err = None
         try:
             _mysql_select_one(cfg)
-        except Exception as e:
+        except mysql.connector.Error as e:
             err = e
         elapsed = time.monotonic() - t0
         print(f"  query with paused backend: elapsed={elapsed:.1f}s err={err}")
         # The 90s server-side default timeout must surface as an error rather
         # than an indefinite hang.
-        if elapsed > 120:
-            raise AssertionError(f"Server hung instead of timing out ({elapsed:.1f}s)")
+        assert err is not None, "Query succeeded while its backend was paused"
+        assert err.errno == 3024, f"Expected the server query timeout, received {err}"
+        assert elapsed < 120, f"Server hung instead of timing out ({elapsed:.1f}s)"
     finally:
-        unpause('test-mariadb-1')
+        subprocess.run(['docker', 'unpause', target], check=True, timeout=15)
 
     # After unpause, the next query must succeed.
     time.sleep(2)
-    _mysql_select_one(cfg)
+    assert _mysql_select_one(cfg) == 1, "Recovery query did not return its fixture row"
     print("  post-recovery query OK")
 
 

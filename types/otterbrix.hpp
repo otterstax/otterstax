@@ -4,10 +4,12 @@
 #pragma once
 
 #include "otterbrix/parser/name_resolution.hpp"
+#include "utility/execution_context.hpp"
 
 #include <otterbrix/otterbrix.hpp>
 
 #include <components/logical_plan/node_catalog_resolve.hpp>
+#include <components/logical_plan/execution_plan.hpp>
 #include <components/logical_plan/node_data.hpp>
 #include <components/logical_plan/node_delete.hpp>
 #include <components/logical_plan/node_insert.hpp>
@@ -16,6 +18,7 @@
 
 #include <algorithm>
 #include <memory_resource>
+#include <optional>
 #include <vector>
 
 // One external slot: pointer to the plan-node reference the backend manager
@@ -78,6 +81,30 @@ struct OtterbrixStatement {
     // erases it on execute, so no second run ever sees slots another run stamped.
     // A multi-use prepared entry would have to clone these per execution.
     components::logical_plan::catalog_resolves_t catalog_resolves;
+
+    // The transformer's complete plan includes ordered expression subqueries
+    // and the mappings that bind their results into the main query. Keep it
+    // after finalize(), including for prepared statements. The current main
+    // root still lives in `node`, where backend managers can replace it.
+    std::optional<components::logical_plan::execution_plan_t> transformed_plan;
+
+    execution_context context;
+
+    components::logical_plan::execution_plan_t execution_plan() const {
+        components::logical_plan::execution_plan_t plan(node->resource(), node, params_node);
+        if (transformed_plan) {
+            const auto& queries = transformed_plan->sub_queries;
+            plan.sub_queries.assign(queries.begin(), queries.empty() ? queries.end() : queries.end() - 1);
+            plan.sub_queries.push_back(node);
+            plan.sub_query_results.assign(transformed_plan->sub_query_results.begin(),
+                                           transformed_plan->sub_query_results.end());
+            plan.explain = transformed_plan->explain;
+            plan.explain_capture_ir = transformed_plan->explain_capture_ir;
+            plan.explain_render_id = transformed_plan->explain_render_id;
+        }
+        plan.catalog_resolves = catalog_resolves;
+        return plan;
+    }
 };
 
 // Record the affected-row count of a fully-remote DML at the one moment it is

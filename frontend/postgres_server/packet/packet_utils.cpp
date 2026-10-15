@@ -93,6 +93,8 @@ namespace frontend::postgres {
                 return delete_rows(rows);
             case T_DropStmt:
                 return {"DROP"};
+            case T_DeallocateStmt:
+                return {"DEALLOCATE"};
             default:
                 return {"COMMAND"};
         }

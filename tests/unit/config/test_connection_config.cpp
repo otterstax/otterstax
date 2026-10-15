@@ -2,7 +2,9 @@
 // Copyright 2025-2026  OtterStax
 
 #include "config/config.hpp"
+#include "tests/temporary_directory.hpp"
 #include "config/connections/connection_config_reader.hpp"
+#include "utility/s3_transport.hpp"
 
 #include <catch2/catch_all.hpp>
 #include <yaml-cpp/yaml.h>
@@ -58,8 +60,9 @@ namespace {
     // Write `content` to a unique temp file and return its path (used for the
     // whole-file ConfigReader tests).
     std::string write_temp(const std::string& content) {
+        static otterstax::test::temporary_directory directory{"otterstax-config"};
         static std::atomic<int> counter{0};
-        auto path = std::filesystem::temp_directory_path() / ("otterstax_cfg_" + std::to_string(counter++) + ".yaml");
+        auto path = directory.path / (std::to_string(counter++) + ".yaml");
         std::ofstream out(path);
         out << content;
         out.close();
@@ -213,7 +216,7 @@ connections:
     CHECK(cfg.postgresql[0].schema == "public");
 }
 
-TEST_CASE("parse_connections: optional s3 fields default to empty") {
+TEST_CASE("parse_connections: S3 requires an explicit endpoint") {
     const std::string yaml = R"(
 connections:
   s3:
@@ -221,15 +224,19 @@ connections:
       access_key: ak
       secret_key: sk
 )";
-    auto cfg = parse_ok(connections_node(yaml));
+    auto result = config::parse_connections(connections_node(yaml), std::pmr::new_delete_resource());
+    REQUIRE(result.has_error());
+    CHECK(std::string(result.error().what).find("endpoint") != std::string::npos);
+    auto explicit_node = connections_node(yaml);
+    explicit_node["s3"][0]["endpoint"] = "s3.us-east-1.amazonaws.com";
+    auto cfg = parse_ok(explicit_node);
     REQUIRE(cfg.s3.size() == 1);
-    const auto& s3 = cfg.s3[0];
-    CHECK(s3.alias == "aws");
-    CHECK(s3.access_key == "ak");
-    CHECK(s3.secret_key == "sk");
-    CHECK(s3.region.empty());
-    CHECK(s3.session_token.empty());
-    CHECK(s3.endpoint.empty());
+    CHECK(cfg.s3[0].alias == "aws");
+    CHECK(cfg.s3[0].access_key == "ak");
+    CHECK(cfg.s3[0].secret_key == "sk");
+    CHECK(cfg.s3[0].region.empty());
+    CHECK(cfg.s3[0].session_token.empty());
+    CHECK(cfg.s3[0].endpoint == "s3.us-east-1.amazonaws.com");
 }
 
 TEST_CASE("parse_connections: multiple entries per section preserve order") {
@@ -355,7 +362,7 @@ TEST_CASE("validation_error: complete descriptors pass") {
     config::ChConnectionDesc ch{.alias = "a", .host = "h", .port = "1", .username = "u", .database = "d"};
     CHECK_FALSE(config::validation_error(ch).has_value());
 
-    config::S3CredentialDesc s3{.alias = "a", .access_key = "k", .secret_key = "s"};
+    config::S3CredentialDesc s3{.alias = "a", .access_key = "k", .secret_key = "s", .endpoint = "storage.example"};
     CHECK_FALSE(config::validation_error(s3).has_value());
 }
 
@@ -560,6 +567,78 @@ TEST_CASE("ConfigReader: malformed YAML is an error") {
     auto err = load_error(write_temp(yaml));
     CHECK(err.type == core::error_code_t::conversion_failure);
     CHECK(mentions(err, "configuration file"));
+}
+
+TEST_CASE("ConfigReader: service ports reject overflow, negative values and zero") {
+    const auto section = GENERATE("flight_sql", "mysql", "postgres", "spark_connect");
+    const auto port = GENERATE("-1", "0", "65536", "2147483648", "999999999999999999999999");
+    const std::string field = std::string{"service."} + section + ".port";
+    auto err = load_error(write_temp(std::string{"service:\n  "} + section + ":\n    port: " + port));
+    CHECK(err.type == core::error_code_t::invalid_parameter);
+    CHECK(mentions(err, field));
+}
+
+TEST_CASE("ConfigReader: service ports accept both bounds") {
+    const auto port = GENERATE(1, 65535);
+    auto cfg = load_ok(write_temp("service:\n  flight_sql: {port: " + std::to_string(port) +
+                                  "}\n  mysql: {port: " + std::to_string(port) +
+                                  "}\n  postgres: {port: " + std::to_string(port) +
+                                  "}\n  spark_connect: {port: " + std::to_string(port) + "}\n"));
+    CHECK(cfg.flight_sql.port == port);
+    CHECK(cfg.mysql.port == port);
+    CHECK(cfg.postgres.port == port);
+    CHECK(cfg.spark_connect.port == port);
+}
+
+TEST_CASE("ConfigReader: malformed service structure is an error rather than an exception") {
+    const auto value = GENERATE("text", "[]", "[1, 2]");
+    SECTION("root") {
+        auto err = load_error(write_temp(value));
+        CHECK(err.type == core::error_code_t::invalid_parameter);
+        CHECK(mentions(err, "configuration"));
+    }
+    SECTION("service") {
+        auto err = load_error(write_temp(std::string{"service: "} + value));
+        CHECK(err.type == core::error_code_t::invalid_parameter);
+        CHECK(mentions(err, "service"));
+    }
+    SECTION("subsection") {
+        const auto section = GENERATE("flight_sql", "mysql", "postgres", "spark_connect", "connection_retry");
+        auto err = load_error(write_temp(std::string{"service:\n  "} + section + ": " + value));
+        CHECK(err.type == core::error_code_t::invalid_parameter);
+        CHECK(mentions(err, std::string{"service."} + section));
+    }
+}
+
+TEST_CASE("ConfigReader: invalid retry limits fail at startup") {
+    const auto entry = GENERATE("max_attempts: 0", "max_attempts: -1", "delay_ms: -1");
+    auto err = load_error(write_temp(std::string{"service:\n  connection_retry:\n    "} + entry));
+    CHECK(err.type == core::error_code_t::invalid_parameter);
+    CHECK(mentions(err, "service.connection_retry"));
+}
+
+TEST_CASE("ConfigReader: unreadable paths do not fall back to default service settings") {
+    SECTION("directory instead of a file") {
+        CHECK(load_error(std::filesystem::temp_directory_path().string()).type == core::error_code_t::io_error);
+    }
+    SECTION("a parent component is a file") {
+        const auto parent = write_temp("service: {}\n");
+        CHECK(load_error(parent + "/config.yaml").type == core::error_code_t::io_error);
+    }
+}
+
+TEST_CASE("ConfigReader: native protocol listener addresses are configurable") {
+    auto cfg = load_ok(write_temp("service:\n  mysql: {host: '127.0.0.2'}\n  postgres: {host: '::1'}\n"));
+    CHECK(cfg.mysql.host == "127.0.0.2");
+    CHECK(cfg.postgres.host == "::1");
+}
+
+TEST_CASE("ConfigReader: native protocol listener addresses reject invalid input") {
+    const auto protocol = GENERATE("mysql", "postgres");
+    const auto invalid = GENERATE("''", "[127.0.0.1]", "'127.0.0.999'", "'127.0.0.1:8816'");
+    auto error = load_error(write_temp(std::string{"service:\n  "} + protocol + ": {host: " + invalid + "}\n"));
+    CHECK(error.type == core::error_code_t::invalid_parameter);
+    CHECK(mentions(error, std::string{"service."} + protocol + ".host"));
 }
 
 TEST_CASE("ConfigReader: a service port that is not an integer is an error naming the field") {

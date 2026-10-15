@@ -16,7 +16,7 @@ TRACY_SEP=false
 TRACY_OUTPUT_DIR=""
 TRACY_FILE=""
 TRACY_CAPTURE_CONTAINER=""
-BUILD_JOBS=0  # 0 means use nproc inside the container
+BUILD_JOBS=0  # 0 means derive the cap from container CPU and memory limits
 
 _usage() {
     cat <<'EOF'
@@ -621,50 +621,36 @@ else
     TEST_RC=1
 fi
 
-#TODO: temporary disabled
-#if ! $ENABLE_TRACY && [ "${ENABLE_ASAN:-OFF}" != "ON" ] && [ "${ENABLE_TSAN:-OFF}" != "ON" ]; then
-#    echo ""
-#    echo "=== Step 8c: Kafka crash-recovery (exactly-once through kill -9) ==="
-#    echo ""
-#
-#    echo "♻️  Recreating test-otterstax for a clean data dir..."
-#    compose rm -sf test-otterstax >/dev/null 2>&1 || true
-#    compose up -d test-otterstax
-#
-#    echo "🕒 Waiting for otterstax to be healthy..."
-#    _crash_ready=false
-#    for ((i=1;i<=WAIT_RETRIES;i++)); do
-#        if compose_exec test-otterstax bash -c 'exec 3<>/dev/tcp/localhost/8815' >/dev/null 2>&1; then
-#            echo "✅ Otterstax is healthy"
-#            _crash_ready=true
-#            break
-#        fi
-#        sleep ${WAIT_SLEEP}
-#    done
-#
-#    if ! $_crash_ready; then
-#        echo "❌ otterstax not healthy before crash test"
-#        compose logs test-otterstax | tail -30
-#        TEST_RC=1
-#    else
-        # `set -e` is active: a non-zero exit here would abort the script before
-        # the log dump + Step 9 cleanup below (leaving containers running). Capture
-        # the rc via `|| _crash_rc=$?` so failure is handled, not fatal.
-#        _crash_rc=0
-#        compose run --rm --use-aliases \
-#            -v /var/run/docker.sock:/var/run/docker.sock \
-#            test-client python test_kafka_crash_recovery.py --docker-container test_otterstax_app \
-#            || _crash_rc=$?
-#        if [ $_crash_rc -eq 0 ]; then
-#            echo "✅ PASSED: Kafka crash-recovery"
-#        else
-#            echo "❌ FAILED: Kafka crash-recovery (exit code $_crash_rc)"
-#            echo "--- otterstax logs (last 40 lines) ---"
-#            compose logs test-otterstax 2>/dev/null | tail -40
-#            TEST_RC=1
-#        fi
-#    fi
-#fi
+if ! $ENABLE_TRACY && [ "${ENABLE_ASAN:-OFF}" != "ON" ] && [ "${ENABLE_TSAN:-OFF}" != "ON" ]; then
+    echo ""
+    echo "=== Step 8c: Kafka crash-recovery (exactly-once through kill -9) ==="
+    # This test owns the server lifecycle and requires clean, private storage.
+    compose rm -sf test-otterstax
+    compose up -d test-otterstax
+    _crash_server=$(compose ps -q test-otterstax)
+    _crash_broker=$(compose ps -q kafka)
+    _crash_rc=0
+    if [[ -z "$_crash_server" || "$_crash_server" == *$'\n'* ||
+          -z "$_crash_broker" || "$_crash_broker" == *$'\n'* ]]; then
+        echo "❌ Crash test requires exactly one server and broker in the test project"
+        _crash_rc=1
+    else
+        # Capture failure so logs and the stack cleanup still run. The test waits
+        # for PostgreSQL readiness and restores its temporary broker quota.
+        compose run --rm --use-aliases \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            test-client python test_kafka_crash_recovery.py \
+                --docker-container "$_crash_server" --docker-broker-container "$_crash_broker" \
+            || _crash_rc=$?
+    fi
+    if [ $_crash_rc -eq 0 ]; then
+        echo "✅ PASSED: Kafka crash-recovery"
+    else
+        echo "❌ FAILED: Kafka crash-recovery (exit code $_crash_rc)"
+        compose logs test-otterstax 2>/dev/null | tail -40
+        TEST_RC=1
+    fi
+fi
 
 echo ""
 echo "=== Step 8d: Spark Connect client matrix ==="

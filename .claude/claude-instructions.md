@@ -21,7 +21,7 @@ The system uses `ComponentManager` (`component_manager/`) as the central orchest
 ## Key Architectural Patterns
 
 ### Session-Based Query Execution Flow
-1. Frontend receives query → generates unique `session_hash_t`
+1. Frontend receives query → allocates a process-unique request ID with `next_request_id()`
 2. Frontend calls `Scheduler::execute` (and friends), which returns
    `actor_zeta::unique_future<core::result_wrapper_t<session_payload>>`
 3. Scheduler routes by session hash → a `Worker` parses SQL and determines if the
@@ -32,7 +32,7 @@ The system uses `ComponentManager` (`component_manager/`) as the central orchest
    `frontend/common/asio_future_bridge.hpp` — polled on the per-connection asio
    executor, no blocking get and no condition variable
 
-**Session Management**: the payload type is `session_payload` in
+**Session Management**: native connections retain a separate value-type `execution_context` for engine transactions; request IDs own prepared plans and must not be engine-session hashes. See `docs/transactions.md` for the supported boundary. The payload type is `session_payload` in
 `scheduler/session_data.hpp`, carried by value through the typed future.
 
 ### Federated Query Pattern (Critical!)
@@ -84,8 +84,7 @@ and `./docker-run-tests.sh -j 4` (unit: 194 pass, integration: 27 pass at -j 4).
 # Build with Conan dependencies (see conanfile.py for otterbrix/arrow versions)
 docker compose up           # Runs app + 3 MariaDB instances
 # OR local build:
-# IMPORTANT: if conanfile.py changed, remove the existing build dir first:
-#   rm -rf ./build
+conan export cmake/conan-recipes/otterbrix
 conan install conanfile.py --build missing -s build_type=Release
 cmake -S . -B build/Release \
   -DCMAKE_TOOLCHAIN_FILE=build/Release/generators/conan_toolchain.cmake

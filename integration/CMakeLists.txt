@@ -5,6 +5,7 @@ set(DB_INTEGRATION_HEADERS
     otterbrix/otterbrix_engine.hpp
     otterbrix/otterbrix_manager.hpp
     sql/connection_manager.hpp
+    sql/transaction_policy.hpp
     postgresql/connection_manager.hpp
     clickhouse/connection_manager.hpp
     s3/s3_manager.hpp
@@ -25,6 +26,7 @@ add_library(integration
 )
 
 target_link_libraries(integration PUBLIC
+    Threads::Threads
     Boost::boost
     otterbrix::otterbrix
     actor-zeta::actor-zeta

@@ -12,19 +12,18 @@ is the only actor that frontends talk to directly.
 
 `Scheduler` is a thin session-affinity router. It owns:
 
-- A pool of N `Worker` actors spawned on an `actor_zeta::scheduler::sharing_scheduler`.
-  Every session keyed by `session_hash_t` always routes to `workers_[id % N]`
+- A pool of N `Worker` actors, each owning an interleaved mailbox thread.
+  Every request/prepared statement keyed by `session_hash_t` always routes to `workers_[id % N]`
   (sticky), so prepared-statement state never crosses workers.
-- An event-loop thread (`loop_thread_` + lock-free `inbox_` + `pump_cv_`)
-  modelled on otterbrix's `services::dispatcher::manager_dispatcher_t`.
-  `enqueue_impl` (called from any sender thread) only pushes into the inbox and
-  signals the CV; *all* coroutine creation, suspension, and resumption happens
-  on `loop_thread_`. This decouples asio frontend threads from query work and
-  eliminates the inline-pump yield-spin we used before.
+- An interleaved `actor_mailbox` that owns its thread. `enqueue_impl` only
+  delivers messages; all handler creation and continuation execution happens
+  on that thread. Pending handlers can service independent requests.
+- Per-request queues that preserve prepared-statement ordering across awaits.
+  Only one operation per persistent connection may execute at a time; separate
+  connections can progress on the same Worker.
 
-Every handler is a coroutine that forwards to the routed `Worker` and
-co_returns the worker's result. This is a future-of-future passthrough — no
-state is mutated in `Scheduler` between the send and the await.
+Query handlers route to a `Worker` and return its result. Scheduler also owns
+persistent connection lifetimes and their transaction participants.
 
 ## Scheduler entry points
 
@@ -32,10 +31,10 @@ All return `unique_future<core::result_wrapper_t<session_payload>>`:
 
 | Handler | Caller | Purpose |
 |---------|--------|---------|
-| `execute(id, sql)` | FlightSQL/MySQL/PG/Spark frontend | Full query: parse → schema → dispatch → translate |
-| `execute_statement(id)` | Frontend (prepared stmt execute) | Execute a previously prepared statement |
-| `execute_prepared_statement(id, params)` | Frontend | Bind parameters then execute |
-| `prepare_schema(id, sql)` | Frontend (prepare phase) | Parse + schema-only, no execution |
+| `execute(id, sql, context)` | FlightSQL/MySQL/PG/Spark frontend | Full query: parse → schema → dispatch → translate |
+| `execute_statement(id, context)` | Frontend (prepared stmt execute) | Execute a previously prepared statement |
+| `execute_prepared_statement(id, params, context)` | Frontend | Bind parameters then execute |
+| `prepare_schema(id, sql, context)` | Frontend (prepare phase) | Parse + schema-only, no execution |
 | `close_statement(id)` | Frontend (statement close / refused prepare / Spark describe) | Drop a prepared statement that will not be executed; idempotent |
 | `execute_plan(id, data)` | Spark frontend (DataFrame) | `execute` of a pre-built plan (`ParsedQueryDataPtr`): no parse |
 | `prepare_plan(id, data)` | Spark frontend (`df.schema`) | `prepare_schema` of a pre-built plan: schema only, no execution |
@@ -43,12 +42,31 @@ All return `unique_future<core::result_wrapper_t<session_payload>>`:
 Frontends await the returned future via `frontend/common/asio_future_bridge.hpp`
 (`async_await_future` polls `take_ready()`; the Spark Connect frontend uses its
 gRPC form, `frontend/spark_connect_server/await_future.hpp`); no result is ever
-pushed to a frontend through a condvar. The Scheduler's own `pump_cv_` is
-infrastructure: it only wakes `loop_thread_` when the inbox is non-empty.
+pushed to a frontend through a condvar. Mailbox condition variables wake only
+the actor thread; future readiness is polled there.
+
+## Connection execution context
+
+A request ID comes from `next_request_id()` and owns a prepared plan. It is not
+an engine session hash. `execution_context` is a value copied through actor
+messages; a native connection retains its engine session while Flight/Spark
+one-shot requests create independent contexts. Prepared execution supplies the
+current context, rather than reusing the transaction state from prepare time.
+
+Scheduler owns the count of outstanding requests per full persistent session
+identity. `close_session(context)` refuses new work for that closing session,
+waits for outstanding work, rolls back storage and removes the entry.
+A frontend timing out and abandoning its future does not cancel that cleanup.
+Workers enlist one local engine or remote alias before execution and schema
+probes. Scheduler owns each remote transaction's dedicated integration actor;
+the context carries only its address by value. `finish_transaction` ends the
+engine's planning session, completes remote commit/rollback and destroys that
+actor after its work drains. Cross-participant and unsupported side effects
+are refused before dispatch. See `docs/transactions.md` for the storage contract.
 
 ## Worker pipeline
 
-Each `Worker` (`worker.{hpp,cpp}`) is a `basic_actor` that owns its own parser
+Each `Worker` (`worker.{hpp,cpp}`) owns an interleaved mailbox and its own parser
 instance (no shared parser between actors — codex rule 10) and a per-worker
 `metadata_map_` (`session_hash → metadata_t`). The map is unguarded because the
 sticky routing guarantees a single Worker handles all messages for a session.
@@ -132,12 +150,10 @@ A `DROP DATABASE` root that names no database is refused the same way.
 ### Tracy zones in coroutines
 
 Tracy zones are per-thread and strictly nested. A Worker coroutine resumes
-after `co_await` on whichever `sharing_scheduler` thread picks the actor up, and
-the Scheduler's loop thread interleaves its coroutines, so a zone that spans a
-suspension point ends on the wrong thread or out of order and corrupts the
+on its own thread after `co_await`. Scheduler and Worker both interleave
+handlers, so a zone spanning suspension can end out of order and corrupt the
 trace. Every handler therefore opens `OTX_ZONE_N` in a block that closes before
-its first `co_await` (the Scheduler handlers zone their synchronous `route()`
-call); synchronous helpers — `parse_sql`, `finish_schema_value`,
+its first `co_await` (the Scheduler handlers zone message routing setup); synchronous helpers — `parse_sql`, `finish_schema_value`,
 `take_payload`, `handle_external_statement` — carry their own zones as the
 first statement, and so does `Worker::close_statement`, which never suspends.
 The awaited actors measure their own work. This is the coroutine exception to

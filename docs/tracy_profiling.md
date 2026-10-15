@@ -28,6 +28,8 @@ All instrumentation uses the `OTX_` wrappers defined in `utility/tracy_profiler.
 ### devcontainer / local build
 
 ```bash
+conan export cmake/conan-recipes/otterbrix
+conan export cmake/conan-recipes/arrow --version=24.0.0
 conan install . --build=missing -s build_type=Release -o "&:with_tracy=True"
 cmake --preset conan-release
 cmake --build build/Release --target server -j$(nproc)

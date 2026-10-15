@@ -47,7 +47,6 @@ using otterstax::test::close_scheduler_statement;
 using otterstax::test::engine_row_count;
 using otterstax::test::execute_scheduler_statement;
 using otterstax::test::init_fresh_test_otterbrix;
-using otterstax::test::make_az_scheduler;
 using otterstax::test::prepare_scheduler_sql;
 using otterstax::test::run_scheduler_sql;
 using otterstax::test::run_scheduler_sql_payload;
@@ -227,7 +226,6 @@ namespace {
             : data_dir_(data_dir)
             , otterbrix_(init_fresh_test_otterbrix(data_dir_))
             , resource_(otterbrix_->dispatcher()->resource())
-            , az_scheduler_(make_az_scheduler())
             , otb_mgr_(actor_zeta::spawn<db::OtterbrixManager>(resource_, make_otterbrix_manager(otterbrix_)))
             , catalog_(actor_zeta::spawn<mysql::CatalogManager>(resource_, otb_mgr_->address(), planpg_aliases()))
             , pg_conn_(std::make_unique<pg::ConnectorManager>(resource_,
@@ -246,7 +244,6 @@ namespace {
             pg_conn_.reset();
             catalog_.reset();
             otb_mgr_.reset();
-            az_scheduler_->stop();
             otterbrix_.reset();
             std::filesystem::remove_all(data_dir_);
         }
@@ -273,7 +270,6 @@ namespace {
             REQUIRE_FALSE(added.has_error());
 
             return actor_zeta::spawn<Scheduler>(resource_,
-                                                az_scheduler_.get(),
                                                 worker_pool_size(),
                                                 &make_parser,
                                                 planpg_aliases(),
@@ -289,7 +285,6 @@ namespace {
         std::string data_dir_;
         db::otterbrix_engine_ptr otterbrix_;
         std::pmr::memory_resource* resource_{nullptr};
-        std::unique_ptr<actor_zeta::scheduler::sharing_scheduler> az_scheduler_;
         std::unique_ptr<db::OtterbrixManager, actor_zeta::pmr::deleter_t> otb_mgr_;
         std::unique_ptr<mysql::CatalogManager, actor_zeta::pmr::deleter_t> catalog_;
         std::unique_ptr<pg::ConnectorManager> pg_conn_;

@@ -99,7 +99,7 @@ target_include_directories(flight_sql_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/../..)
 # table_info's headers (qualified_name_t) come with the engine package
 target_link_libraries(flight_sql_core
-    PRIVATE otterbrix::otterbrix
+    PRIVATE otterbrix::otterbrix OpenSSL::Crypto
     PUBLIC flight_sql_proto arrow::arrow)
 
 # ---------------------------------------------------------------------------

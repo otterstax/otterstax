@@ -11,6 +11,7 @@
 #include "frontend/mysql_server/mysql_server.hpp"
 #include "frontend/postgres_server/postgres_server.hpp"
 #include "scheduler_stack.hpp"
+#include "tests/temporary_directory.hpp"
 
 #include <catch2/catch_all.hpp>
 
@@ -46,4 +47,29 @@ TEST_CASE("frontend_server: mysql start then stop with no client twenty times ov
 TEST_CASE("frontend_server: postgres start then stop with no client twenty times over") {
     otterstax::test::scheduler_stack_owner owner("/tmp/otterstax_frontend_shutdown_pg", &make_parser);
     start_stop_cycles<frontend::postgres::postgres_server>(owner.stack(), 20);
+}
+
+TEMPLATE_TEST_CASE("frontend_server binds only its configured loopback address", "[frontend-bind]",
+                   frontend::mysql::mysql_server, frontend::postgres::postgres_server) {
+    otterstax::test::temporary_directory directory("otterstax-listener");
+    otterstax::test::scheduler_stack_owner owner(directory.path.string(), &make_parser);
+    const auto stack = owner.stack();
+    const auto host = GENERATE("127.0.0.1", "::1");
+    TestType server(frontend::frontend_server_config{
+        .resource = stack.resource,
+        .port = 0,
+        .scheduler = stack.scheduler,
+        .read_timeout = std::chrono::seconds(frontend::CONNECTION_TIMEOUT_SEC),
+        .accept_retry_delay = std::chrono::milliseconds(frontend::ACCEPT_RETRY_DELAY_MS),
+        .pool_size = 2,
+        .host = host,
+    });
+    server.start();
+    REQUIRE(server.local_address() == boost::asio::ip::make_address(host));
+    boost::asio::io_context io;
+    boost::asio::ip::tcp::socket client(io);
+    boost::system::error_code error;
+    client.connect({server.local_address(), server.local_port()}, error);
+    REQUIRE_FALSE(error);
+    server.stop();
 }

@@ -24,7 +24,6 @@ Run:
 """
 
 import argparse
-import shutil
 import sys
 from pathlib import Path
 
@@ -222,9 +221,6 @@ def main_test():
         except Exception as e:
             print(f"   (cleanup skip: {e})")
         conn.close()
-        # Wipe on-disk state — otterbrix WAL recovery currently asserts on
-        # composite types from the previous run.
-        shutil.rmtree("/tmp/test_collection_sql", ignore_errors=True)
 
 
 if __name__ == "__main__":

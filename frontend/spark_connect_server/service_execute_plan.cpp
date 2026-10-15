@@ -146,8 +146,8 @@ namespace frontend::spark {
         const auto& plan = request.plan();
 
         // OtterStax session id — its hash keys Scheduler worker routing.
-        session_id id;
-        const session_hash_t hash = id.hash();
+        const auto id = next_request_id();
+        const session_hash_t hash = id;
 
         // The synchronous part of the dispatch — the pre-flight check, the choice of
         // answer, the translation of a DataFrame plan and the first request to the
@@ -182,7 +182,7 @@ namespace frontend::spark {
                 } else {
                     answer = answer_t::sql_command;
                     fut = std::move(
-                        actor_zeta::send(scheduler_address_, &Scheduler::execute, hash, sql_command_text(sql_command))
+                        actor_zeta::send(scheduler_address_, &Scheduler::execute, hash, sql_command_text(sql_command), execution_context{})
                             .second);
                 }
             } else if (plan.has_command()) {
@@ -200,7 +200,7 @@ namespace frontend::spark {
                 // SQL text, the way the wire frontends run it.
                 answer = answer_t::result;
                 fut = std::move(
-                    actor_zeta::send(scheduler_address_, &Scheduler::execute, hash, plan.root().sql().query()).second);
+                    actor_zeta::send(scheduler_address_, &Scheduler::execute, hash, plan.root().sql().query(), execution_context{}).second);
             } else if (plan.root().has_show_string()) {
                 // df.show(): the rows of the input, rendered below. A SQL input runs as
                 // SQL text, an empty LocalRelation has no rows to fetch, and any other
@@ -209,7 +209,7 @@ namespace frontend::spark {
                 answer = answer_t::show_string;
                 if (is_bare_sql(show.input())) {
                     fut = std::move(
-                        actor_zeta::send(scheduler_address_, &Scheduler::execute, hash, show.input().sql().query())
+                        actor_zeta::send(scheduler_address_, &Scheduler::execute, hash, show.input().sql().query(), execution_context{})
                             .second);
                 } else if (!is_empty_local_relation(show.input())) {
                     show_input = show_string_input_plan(show);

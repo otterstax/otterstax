@@ -2,6 +2,7 @@
 // Copyright 2025-2026  OtterStax
 
 #include "worker.hpp"
+#include "scheduler.hpp"
 
 #include "catalog/catalog_manager.hpp"
 #include "connectors/file/manager.hpp"
@@ -346,9 +347,9 @@ Worker::Worker(std::pmr::memory_resource* res,
                actor_zeta::address_t catalog_manager,
                actor_zeta::address_t s3_manager,
                actor_zeta::address_t file_manager,
-               actor_zeta::address_t kafka_manager)
-    : actor_zeta::basic_actor<Worker>(res)
-    , resource_(res)
+               actor_zeta::address_t kafka_manager,
+               actor_zeta::address_t transaction_coordinator)
+    : resource_(res)
     , self_index_(self_index)
     , worker_count_(worker_count)
     , log_(get_logger(logger_tag::SCHEDULER))
@@ -361,6 +362,7 @@ Worker::Worker(std::pmr::memory_resource* res,
     , s3_manager_(s3_manager)
     , file_manager_(file_manager)
     , kafka_manager_(kafka_manager)
+    , transaction_coordinator_(transaction_coordinator)
     , metadata_map_(res) {
     assert(log_.is_valid());
     assert(res != nullptr);
@@ -393,13 +395,12 @@ actor_zeta::behavior_t Worker::behavior(actor_zeta::mailbox::message* msg) {
 // the only call that may throw (IParser::parse) is fenced inside parse_sql.
 //
 // Tracy zones are per-thread and strictly nested, and a Worker coroutine resumes
-// after co_await on whichever sharing_scheduler thread picks the actor up. A
-// zone spanning a suspension point would therefore end on another thread (or
-// out of order) and corrupt the trace, so each handler opens its zone in a block
+// after co_await on its own thread, interleaved with other handlers. A
+// zone spanning a suspension point would therefore end out of order and corrupt the trace, so each handler opens its zone in a block
 // that closes before the first co_await: the zone measures the handler's own
 // synchronous work, the awaited actors measure theirs.
 
-actor_zeta::unique_future<Worker::session_result> Worker::execute(session_hash_t id, std::string sql) {
+actor_zeta::unique_future<Worker::session_result> Worker::execute(session_hash_t id, std::string sql, execution_context context) {
     assert(id % worker_count_ == self_index_);
     Timer timer("Worker::execute", log_);
     erase_on_exit_t erase_entry{metadata_map_, id};
@@ -415,6 +416,19 @@ actor_zeta::unique_future<Worker::session_result> Worker::execute(session_hash_t
             co_return forward_error(resource(), parsed.error(), "");
         }
         data = std::move(parsed.value());
+        data->otterbrix_params->context = context;
+    }
+
+    if (data->tag == T_TransactionStmt && !context.persistent) {
+        co_return make_error(resource(), error_code_t::unimplemented_yet,
+                             "Transaction commands require a persistent connection session");
+    }
+
+    if (context.in_transaction &&
+        (data->extension_kind != extension_kind_t::none ||
+         otterstax::kafka::kafka_write_target(data->otterbrix_params->node))) {
+        co_return make_error(resource(), error_code_t::unimplemented_yet,
+                             "File, S3 and Kafka operations cannot participate in a local transaction");
     }
 
     // CREATE EXTERNAL TABLE / COPY ... TO and Kafka DDL land on extension root
@@ -523,7 +537,7 @@ actor_zeta::unique_future<Worker::session_result> Worker::classify_and_run(sessi
     co_return co_await run_pipeline(id, std::move(it->second.query_data_ptr), backend);
 }
 
-actor_zeta::unique_future<Worker::session_result> Worker::execute_statement(session_hash_t id) {
+actor_zeta::unique_future<Worker::session_result> Worker::execute_statement(session_hash_t id, execution_context context) {
     assert(id % worker_count_ == self_index_);
     Timer timer("Worker::execute_statement", log_);
     erase_on_exit_t erase_entry{metadata_map_, id};
@@ -538,6 +552,7 @@ actor_zeta::unique_future<Worker::session_result> Worker::execute_statement(sess
         }
         backend = it->second.backend_type;
         data_ptr = std::move(it->second.query_data_ptr);
+        data_ptr->otterbrix_params->context = context;
         // A statement with placeholders runs only after execute_prepared_statement
         // has bound every one of them; executed without that Bind, the plan would
         // reach the engine carrying unbound parameters.
@@ -547,6 +562,13 @@ actor_zeta::unique_future<Worker::session_result> Worker::execute_statement(sess
                                  "prepared statement executed without binding its " +
                                      std::to_string(binder.parameter_count()) + " parameter(s)");
         }
+    }
+
+    if (context.in_transaction &&
+        (data_ptr->extension_kind != extension_kind_t::none ||
+         otterstax::kafka::kafka_write_target(data_ptr->otterbrix_params->node))) {
+        co_return make_error(resource(), error_code_t::unimplemented_yet,
+                             "File, S3 and Kafka operations cannot participate in a local transaction");
     }
 
     // External-table statements (prepared via prepare_schema) carry an
@@ -570,7 +592,7 @@ actor_zeta::unique_future<Worker::session_result> Worker::execute_statement(sess
 }
 
 actor_zeta::unique_future<Worker::session_result>
-Worker::execute_prepared_statement(session_hash_t id, std::pmr::vector<types::logical_value_t> parameters) {
+Worker::execute_prepared_statement(session_hash_t id, std::pmr::vector<types::logical_value_t> parameters, execution_context context) {
     assert(id % worker_count_ == self_index_);
     Timer timer("Worker::execute_prepared_statement", log_);
     // A failed bind consumes the entry as well: the binder has been partially
@@ -592,24 +614,21 @@ Worker::execute_prepared_statement(session_hash_t id, std::pmr::vector<types::lo
         // parameterized statement passes through it HERE rather than at parse
         // time: the parser leaves it unfinalized while any `$n` is unbound (an
         // early finalize records the failure and breaks every later bind). The
-        // plan it answers is dropped — every execution site builds its own from
-        // (node, params), because a backend manager may have replaced the root —
-        // but the lookups are a sibling of that root and travel no other way, so
-        // they are taken over onto the statement (OtterbrixStatement::catalog_resolves).
-        // Without them the engine runs this statement with no CHECK, PK or FK to
-        // enforce. Taken once per prepare: the entry is single-use, so nothing
-        // re-reads or re-appends them.
+        // complete plan is retained on the statement. execution_plan() combines
+        // its ordered subqueries and catalog lookups with the current main root,
+        // which backend managers may replace. Prepared entries are single-use.
         auto bind_res = binder.finalize();
         if (bind_res.has_error()) {
             co_return forward_error(resource(), bind_res.error(), "Argument binding failed: ");
         }
         data.otterbrix_params->catalog_resolves = bind_res.value().catalog_resolves;
+        data.otterbrix_params->transformed_plan.emplace(std::move(bind_res.value()));
     }
 
-    co_return co_await execute_statement(id);
+    co_return co_await execute_statement(id, context);
 }
 
-actor_zeta::unique_future<Worker::session_result> Worker::prepare_schema(session_hash_t id, std::string sql) {
+actor_zeta::unique_future<Worker::session_result> Worker::prepare_schema(session_hash_t id, std::string sql, execution_context context) {
     assert(id % worker_count_ == self_index_);
     Timer timer("Worker::prepare_schema", log_);
 
@@ -623,6 +642,7 @@ actor_zeta::unique_future<Worker::session_result> Worker::prepare_schema(session
             co_return forward_error(resource(), parsed.error(), "");
         }
         parsed_data = std::move(parsed.value());
+        parsed_data->otterbrix_params->context = context;
 
         // Extension roots are `unused`-tagged and must not reach the
         // schema_node_t path below. CREATE EXTERNAL TABLE / COPY ... TO has no
@@ -655,6 +675,9 @@ actor_zeta::unique_future<Worker::session_result> Worker::describe_parsed(sessio
     // before the entry exists.
     if (parsed_data->otterbrix_params->external_nodes_count == 0) {
         parsed_data->backend_type = backend_type_t::Otterbrix;
+        if (auto guard = co_await enlist_transaction(*parsed_data, backend_type_t::Otterbrix); guard.contains_error()) {
+            co_return guard;
+        }
         // Only a row-producing statement has a result schema. A DML answers an
         // affected count, which has none — unless it carries RETURNING, which
         // makes it answer ROWS, and those rows must be described: the clients
@@ -693,6 +716,7 @@ actor_zeta::unique_future<Worker::session_result> Worker::describe_parsed(sessio
                                                      0),
                 sql::transform::transform_result{resource(), core::error_t::no_error()},
                 T_SelectStmt);
+            probe_data->otterbrix_params->context = parsed_data->otterbrix_params->context;
             std::pmr::map<qualified_name_t, size_t> no_dependencies(resource());
             auto [ns_probe, probe_future] = actor_zeta::send(otterbrix_manager_,
                                                              &db::OtterbrixManager::get_schema,
@@ -774,6 +798,9 @@ actor_zeta::unique_future<Worker::session_result> Worker::describe_parsed(sessio
         co_return forward_error(resource(), catalog_result.error(), "");
     }
     auto data = std::move(catalog_result.value());
+    if (auto guard = co_await enlist_transaction(*data, data->backend_type); guard.contains_error()) {
+        co_return guard;
+    }
 
     // The prepared schema of a statement's remote slots is the backend's, not
     // the plan's. Each backend owns the result type of every expression it
@@ -795,10 +822,8 @@ actor_zeta::unique_future<Worker::session_result> Worker::describe_parsed(sessio
     // fills the stubs its node_backend_types entry names and leaves every other
     // slot alone, which is what lets each participant of a Mixed statement
     // describe its own share; a statement whose slots carry no stub (a DML, a
-    // JOIN root over plain tables) comes back with nothing probed. The sends
-    // cost no thread hop — these managers run a handler to completion on the
-    // sender's thread — so a described statement pays one backend round-trip per
-    // stub.
+    // JOIN root over plain tables) comes back with nothing probed. Each manager owns its driver thread and processes one backend round-trip
+    // per stub.
     //
     // A parameterized statement is out of the described scope for now — this is
     // a narrower scope, not a fallback: the binder holds every parameter, the
@@ -819,8 +844,10 @@ actor_zeta::unique_future<Worker::session_result> Worker::describe_parsed(sessio
             return false;
         };
         if (owns_a_slot(backend_type_t::MySQL)) {
+            const auto target = data->otterbrix_params->context.in_transaction
+                ? data->otterbrix_params->context.transaction_backend : sql_connection_manager_;
             auto [ns_my, my_future] =
-                actor_zeta::send(sql_connection_manager_, &db::MySQLManager::describe, id, std::move(data));
+                actor_zeta::send(target, &db::MySQLManager::describe, id, std::move(data));
             auto described = co_await std::move(my_future);
             if (described.has_error()) {
                 co_return forward_error(resource(), described.error(), "");
@@ -828,8 +855,10 @@ actor_zeta::unique_future<Worker::session_result> Worker::describe_parsed(sessio
             data = std::move(described.value());
         }
         if (owns_a_slot(backend_type_t::PostgreSQL)) {
+            const auto target = data->otterbrix_params->context.in_transaction
+                ? data->otterbrix_params->context.transaction_backend : pg_connection_manager_;
             auto [ns_pg, pg_future] =
-                actor_zeta::send(pg_connection_manager_, &db::PostgressManager::describe, id, std::move(data));
+                actor_zeta::send(target, &db::PostgressManager::describe, id, std::move(data));
             auto described = co_await std::move(pg_future);
             if (described.has_error()) {
                 co_return forward_error(resource(), described.error(), "");
@@ -937,9 +966,18 @@ actor_zeta::unique_future<Worker::session_result> Worker::prepare_plan(session_h
 
 actor_zeta::unique_future<Worker::session_result>
 Worker::run_pipeline(session_hash_t id, ParsedQueryDataPtr data_ptr, backend_type_t backend) {
+    if (data_ptr->tag == T_TransactionStmt && !data_ptr->otterbrix_params->context.persistent) {
+        co_return make_error(resource(), error_code_t::unimplemented_yet,
+                             "Transaction commands require a persistent connection session");
+    }
+    if (auto guard = co_await enlist_transaction(*data_ptr, backend); guard.contains_error()) {
+        co_return guard;
+    }
     if (backend == backend_type_t::MySQL || backend == backend_type_t::Mixed) {
+        const auto target = data_ptr->otterbrix_params->context.in_transaction
+                ? data_ptr->otterbrix_params->context.transaction_backend : sql_connection_manager_;
         auto [ns_sql, sql_future] =
-            actor_zeta::send(sql_connection_manager_, &db::MySQLManager::execute, id, std::move(data_ptr));
+                actor_zeta::send(target, &db::MySQLManager::execute, id, std::move(data_ptr));
         auto sql_result = co_await std::move(sql_future);
         if (sql_result.has_error()) {
             co_return forward_error(resource(), sql_result.error(), "");
@@ -947,8 +985,10 @@ Worker::run_pipeline(session_hash_t id, ParsedQueryDataPtr data_ptr, backend_typ
         data_ptr = std::move(sql_result.value());
 
         if (backend == backend_type_t::Mixed) {
+            const auto target = data_ptr->otterbrix_params->context.in_transaction
+                ? data_ptr->otterbrix_params->context.transaction_backend : pg_connection_manager_;
             auto [ns_pg, pg_future] =
-                actor_zeta::send(pg_connection_manager_, &db::PostgressManager::execute, id, std::move(data_ptr));
+                actor_zeta::send(target, &db::PostgressManager::execute, id, std::move(data_ptr));
             auto pg_result = co_await std::move(pg_future);
             if (pg_result.has_error()) {
                 co_return forward_error(resource(), pg_result.error(), "");
@@ -964,8 +1004,10 @@ Worker::run_pipeline(session_hash_t id, ParsedQueryDataPtr data_ptr, backend_typ
             data_ptr = std::move(ch_result.value());
         }
     } else if (backend == backend_type_t::PostgreSQL) {
+        const auto target = data_ptr->otterbrix_params->context.in_transaction
+                ? data_ptr->otterbrix_params->context.transaction_backend : pg_connection_manager_;
         auto [ns_pg, pg_future] =
-            actor_zeta::send(pg_connection_manager_, &db::PostgressManager::execute, id, std::move(data_ptr));
+                actor_zeta::send(target, &db::PostgressManager::execute, id, std::move(data_ptr));
         auto pg_result = co_await std::move(pg_future);
         if (pg_result.has_error()) {
             co_return forward_error(resource(), pg_result.error(), "");
@@ -1192,4 +1234,59 @@ void Worker::update_metadata(session_hash_t id,
     NodeTag tag = metadata->tag;
     backend_type_t backend_type = metadata->backend_type;
     metadata_map_[id] = metadata_t{std::move(schema), std::move(metadata), tag, backend_type};
+}
+
+actor_zeta::unique_future<core::error_t>
+Worker::enlist_transaction(ParsedQueryData& data, backend_type_t backend) {
+    auto& statement = *data.otterbrix_params;
+    if (!statement.context.in_transaction || data.tag == T_TransactionStmt) co_return core::error_t::no_error();
+    if (backend == backend_type_t::Otterbrix && data.tag == T_SelectStmt &&
+        statement.external_nodes_count == 0 &&
+        (!statement.transformed_plan || statement.transformed_plan->sub_queries.size() <= 1) &&
+        plan_dependencies(resource(), statement.node).empty()) {
+        // A constant expression has no storage participant.
+        co_return core::error_t::no_error();
+    }
+    std::string alias;
+    if (backend != backend_type_t::Otterbrix) {
+        if (backend != backend_type_t::MySQL && backend != backend_type_t::PostgreSQL) {
+            co_return make_error(resource(), error_code_t::unimplemented_yet,
+                                 "Transactions require one local engine or one PostgreSQL/MySQL connection alias");
+        }
+        if (data.tag != T_SelectStmt && data.tag != T_InsertStmt && data.tag != T_UpdateStmt && data.tag != T_DeleteStmt) {
+            co_return make_error(resource(), error_code_t::unimplemented_yet,
+                                 "Remote transactions support SELECT, INSERT, UPDATE and DELETE");
+        }
+        if (statement.transformed_plan && statement.transformed_plan->sub_queries.size() > 1) {
+            co_return make_error(resource(), error_code_t::unimplemented_yet,
+                                 "Remote expression subqueries are not supported in transactions");
+        }
+        bool remote_dml = data.tag == T_SelectStmt;
+        for (const auto& batch : statement.external_nodes) {
+            for (const auto& entry : batch) {
+                const auto& uid = entry.target.name.unique_identifier;
+                if (uid.empty() || (!alias.empty() && alias != uid)) {
+                    co_return make_error(resource(), error_code_t::unimplemented_yet,
+                                         "A transaction cannot span different storage participants");
+                }
+                alias = uid;
+                const auto& source = entry.target.from_name;
+                if (!source.collection.empty() && source.unique_identifier != alias) {
+                    co_return make_error(resource(), error_code_t::unimplemented_yet,
+                                         "A transaction cannot span different storage participants");
+                }
+                if (entry.node->get() == plan_statement_node(statement.node.get())) remote_dml = true;
+            }
+        }
+        if (alias.empty() || !remote_dml) {
+            co_return make_error(resource(), error_code_t::unimplemented_yet,
+                                 "A remote transaction cannot write local storage");
+        }
+    }
+    auto [scheduled, future] = actor_zeta::send(transaction_coordinator_, &Scheduler::enlist_transaction,
+                                               statement.context, backend, std::move(alias));
+    auto outcome = co_await std::move(future);
+    if (outcome.has_error()) co_return forward_error(resource(), outcome.error(), "");
+    statement.context.transaction_backend = outcome.value();
+    co_return core::error_t::no_error();
 }

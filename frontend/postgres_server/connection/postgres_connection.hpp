@@ -4,6 +4,7 @@
 #pragma once
 
 #include "../../common/frontend_connection.hpp"
+#include "frontend/common/sql_session.hpp"
 #include "../packet/packet_reader.hpp"
 #include "../packet/packet_utils.hpp"
 #include "../packet/packet_writer.hpp"
@@ -25,6 +26,7 @@
 #include <components/sql/transformer/utils.hpp>
 #include <components/types/types.hpp>
 #include <iostream>
+#include <memory>
 #include <optional>
 #include <random>
 #include <regex>
@@ -67,7 +69,6 @@ namespace frontend::postgres {
             // client that describes a portal and then binds it again.
             NodeTag tag;
             std::pmr::vector<field_type> specified_types;
-            std::pmr::vector<std::string> portal_names;
             // Describe(statement) already gave the client a RowDescription.
             bool described;
         };
@@ -77,10 +78,11 @@ namespace frontend::postgres {
         // limit (PortalSuspended) and the next Execute on the same portal
         // continues from `emitted` without running the statement again.
         struct portal_meta {
-            portal_meta(portal_t params, prepared_stmt_meta& statement, std::vector<result_encoding> format);
+            portal_meta(portal_t params, std::shared_ptr<prepared_stmt_meta> statement, std::vector<result_encoding> format);
 
             portal_t params;
-            std::reference_wrapper<prepared_stmt_meta> statement;
+            // A bound portal outlives Close(statement) and unnamed Parse.
+            std::shared_ptr<prepared_stmt_meta> statement;
             std::vector<result_encoding> format;
             // Describe(portal) already gave the client a RowDescription.
             bool described;
@@ -118,14 +120,10 @@ namespace frontend::postgres {
         void read_initial_message();
         // `reader` stands after the protocol version the caller dispatched on.
         void handle_startup_message(int32_t protocol_version, packet_reader& reader);
-        void handle_ssl_decline(packet_reader& reader);
+        void handle_ssl_request(packet_reader& reader);
+        void finish_authentication();
         void handle_query(std::string query);
-        // Answers a transaction statement of a simple Query from
-        // transaction_manager: one the engine ran (`error` empty: BEGIN,
-        // COMMIT, ROLLBACK) or one it refused as "Unsupported node type"
-        // (SAVEPOINT, ROLLBACK TO, RELEASE). Any other refusal goes out as the
-        // engine's error.
-        void try_handle_transaction(std::string query, std::string error);
+        bool finish_implicit_transaction();
 
         void handle_parse(std::string stmt, std::string query, int16_t num_params, packet_reader&& reader);
         void handle_bind(std::string stmt,
@@ -137,7 +135,10 @@ namespace frontend::postgres {
         void handle_close(describe_close_arg type, std::string name);
         void handle_describe(describe_close_arg type, std::string name);
 
-        void do_close(describe_close_arg type, std::string name);
+        bool do_close(describe_close_arg type, std::string name);
+        bool release_statement(session_hash_t id);
+        bool try_deallocate(const std::string& query);
+        void send_query_error(const core::error_t& error);
         // Appends a RowDescription (with the given result format codes) for a
         // resolved schema, NoData otherwise; `described` is set to whether a
         // RowDescription went out — only then does the client know the row
@@ -160,14 +161,17 @@ namespace frontend::postgres {
                                  error_severity severity = error_severity::error());
 
         std::pmr::memory_resource* resource_;
-        std::pmr::unordered_map<std::string, prepared_stmt_meta> statement_name_map_;
+        std::pmr::unordered_map<std::string, std::shared_ptr<prepared_stmt_meta>> statement_name_map_;
         std::pmr::unordered_map<std::string, portal_meta> portals_;
         packet_writer writer_;
         actor_zeta::address_t scheduler_;
+        frontend::sql_session sql_session_;
         std::vector<uint8_t> backend_secret_key_;
-        transaction_manager transaction_man_;
+        transaction_status wire_transaction_status() const;
+        command_complete_tag result_tag(const session_payload& payload, int64_t rows) const;
         pipeline_state pipeline_;
         bool use_protocol_3_2_;
+        connection_state state_{connection_state::HANDSHAKE};
         log_t log_;
     };
 } // namespace frontend::postgres

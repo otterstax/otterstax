@@ -83,7 +83,7 @@ class ExternalTableTester:
 
     # ── connection ───────────────────────────────────────────────────────────
     def connect(self):
-        return mysql.connector.connect(**self.conn_cfg)
+        return mysql.connector.connect(autocommit=True, **self.conn_cfg)
 
     # ── s3 credential registration ───────────────────────────────────────────
     def ensure_credentials(self):

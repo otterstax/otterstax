@@ -10,7 +10,7 @@ namespace frontend::spark {
 
     spark_connect_server::~spark_connect_server() { stop(); }
 
-    void spark_connect_server::start() { impl_.start(); }
+    bool spark_connect_server::start() { return impl_.start(); }
 
     void spark_connect_server::stop() { impl_.stop(); }
 

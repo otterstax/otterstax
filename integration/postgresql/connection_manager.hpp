@@ -12,12 +12,12 @@
 #include "otterbrix/schema/schema_utils.hpp"
 #include "otterbrix/translators/input/pg_to_chunk.hpp"
 #include "utility/session.hpp"
+#include "utility/actor_mailbox.hpp"
 #include "utility/tracy_profiler.hpp"
 
 #include <core/result_wrapper.hpp>
 
 #include <memory_resource>
-#include <mutex>
 #include <string>
 #include <unordered_map>
 
@@ -30,6 +30,8 @@ namespace db {
         using unique_future = actor_zeta::unique_future<T>;
 
         PostgressManager(std::pmr::memory_resource* res, pg::ConnectorManager* connector_manager);
+        PostgressManager(std::pmr::memory_resource* res, std::unique_ptr<pg::ConnectorManager> connector_manager);
+        using transaction_actor = std::unique_ptr<PostgressManager, actor_zeta::pmr::deleter_t>;
 
         std::pmr::memory_resource* resource() const noexcept { return resource_; }
 
@@ -74,7 +76,10 @@ namespace db {
         actor_zeta::unique_future<core::result_wrapper_t<ParsedQueryDataPtr>> describe(session_hash_t id,
                                                                                        ParsedQueryDataPtr data);
 
-        using dispatch_traits = actor_zeta::dispatch_traits<&PostgressManager::execute,
+        unique_future<core::result_wrapper_t<transaction_actor>> begin_transaction(session_id session, std::string alias);
+        unique_future<core::error_t> finish_transaction(session_id session, bool commit);
+
+        using dispatch_traits = actor_zeta::dispatch_traits<&PostgressManager::begin_transaction, &PostgressManager::finish_transaction, &PostgressManager::execute,
                                                             &PostgressManager::discover,
                                                             &PostgressManager::describe>;
 
@@ -86,15 +91,15 @@ namespace db {
         std::pmr::memory_resource* resource_;
         // Non-owning: ComponentManager owns it and outlives this actor. This
         // actor is its only driver after startup (execute and discover both run
-        // here, serialised by mutex_).
+        // here, serialised on the actor's thread).
+        std::unique_ptr<pg::ConnectorManager> owned_connector_manager_;
         pg::ConnectorManager* connector_manager_;
         log_t log_;
-        OTX_LOCKABLE_N(std::mutex, mutex_, "PostgressManager::mutex");
-        actor_zeta::behavior_t current_behavior_;
+
         // ENUM type oid → labels per connection uid, the metadata pg_to_chunk
         // needs to decode enum columns. Actor-confined: assigned by discover
         // from the value the io-thread query handed back, read by execute —
-        // both under mutex_. Every uid that went through discovery has an
+        // both on the actor's thread. Every uid that went through discovery has an
         // entry (possibly empty); execute treats a missing one as an error.
         std::pmr::unordered_map<std::pmr::string, tsl::pg_enum_oid_map> enums_;
 
@@ -109,5 +114,7 @@ namespace db {
                                 const otterstax::names::resolved_target_t& target,
                                 const std::pmr::vector<external_entry_t>& batch,
                                 const components::logical_plan::storage_parameters* parameters);
+        // Last member: stop/drain the mailbox before destroying actor state.
+        otterstax::actor_mailbox<PostgressManager, otterstax::actor_execution::serial> mailbox_{*this};
     };
 } // namespace db

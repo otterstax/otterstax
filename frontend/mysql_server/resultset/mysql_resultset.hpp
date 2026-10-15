@@ -31,7 +31,8 @@ namespace frontend::mysql {
         void add_row(const components::vector::data_chunk_t& chunk, size_t row_index);
 
         [[nodiscard]] static std::vector<std::vector<uint8_t>> build_packets(mysql_resultset&& resultset,
-                                                                             uint8_t& sequence_id);
+                                                                             uint8_t& sequence_id,
+                       server_status_flags_t flags = static_cast<uint16_t>(server_status::SERVER_STATUS_AUTOCOMMIT));
 
     private:
         size_t compute_text_row_size(const components::vector::data_chunk_t& chunk, size_t row_index) const;

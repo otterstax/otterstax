@@ -396,6 +396,49 @@ namespace otterstax::kafka::detail {
         return kafka_insert_session(dispatcher_address, resource, session, database, offsets_relname, std::move(chunk));
     }
 
+    actor_zeta::unique_future<cursor::cursor_t_ptr>
+    erase_offsets_session(actor_zeta::address_t dispatcher_address,
+                          std::pmr::memory_resource* resource,
+                          session::session_id_t session,
+                          const std::string& database,
+                          const std::string& offsets_relname,
+                          const std::map<int32_t, int64_t>& offsets) {
+        OTX_ZONE_N("kafka::erase_offsets_session");
+        auto params = logical_plan::make_parameter_node(resource);
+        auto predicate = expressions::make_compare_union_expression(resource, expressions::compare_type::union_or);
+        for (const auto& [partition, offset] : offsets) {
+            const auto param = params->add_parameter(types::logical_value_t(resource, partition));
+            predicate->append_child(expressions::make_compare_expression(
+                resource,
+                expressions::compare_type::eq,
+                expressions::key_t(resource, "partition_id", expressions::side_t::left),
+                param));
+        }
+        auto match = logical_plan::make_node_match(resource,
+                                                   core::dbname_t{database},
+                                                   core::relname_t{offsets_relname},
+                                                   predicate);
+        auto del = logical_plan::make_node_delete(resource,
+                                                  match,
+                                                  logical_plan::make_node_limit(resource,
+                                                                                core::dbname_t{database},
+                                                                                core::relname_t{offsets_relname},
+                                                                                logical_plan::limit_t::unlimit()));
+        logical_plan::execution_plan_t plan{resource,
+                                            sql::transform::name_catalog_target(database, offsets_relname, del),
+                                            std::move(params)};
+        sql::transform::register_catalog_resolve_table(resource,
+                                                       &plan.catalog_resolves,
+                                                       database,
+                                                       offsets_relname,
+                                                       sql::transform::constraint_resolve_kind::referencing);
+        return actor_zeta::otterbrix::send(dispatcher_address,
+                                           &services::dispatcher::manager_dispatcher_t::execute_plan,
+                                           session,
+                                           std::move(plan))
+            .second;
+    }
+
     actor_zeta::unique_future<cursor::cursor_t_ptr> write_offsets(actor_zeta::address_t dispatcher_address,
                                                                   std::pmr::memory_resource* resource,
                                                                   const std::string& database,
@@ -457,18 +500,36 @@ namespace otterstax::kafka::detail {
             .second;
     }
 
-    std::map<int32_t, int64_t> parse_offsets(const cursor::cursor_t_ptr& cursor) {
+    core::result_wrapper_t<std::map<int32_t, int64_t>> parse_offsets(const cursor::cursor_t_ptr& cursor) {
         OTX_ZONE_N("kafka::parse_offsets");
         std::map<int32_t, int64_t> result;
-        if (!cursor || cursor->is_error()) {
-            return result;
+        if (!cursor) {
+            return core::error_t(core::error_code_t::other_error,
+                                 std::pmr::string{"kafka offsets: no reply from the engine"});
+        }
+        if (cursor->is_error()) {
+            return cursor->get_error();
         }
         // The result is a batch of <=1024-row chunks; walk each chunk's own row
         // space (a global-row lookup through the cursor is a chunk scan per cell)
         for (const auto& chunk : cursor->chunks()) {
+            const auto column_types = chunk.types();
+            if (column_types.size() != 2 || column_types[0].type() != types::logical_type::INTEGER ||
+                column_types[1].type() != types::logical_type::BIGINT) {
+                return core::error_t(core::error_code_t::invalid_parameter,
+                                     std::pmr::string{"kafka offsets: expected (INTEGER, BIGINT) columns"});
+            }
             for (std::uint64_t row = 0; row < chunk.size(); ++row) {
+                if (chunk.data[0].is_null(row) || chunk.data[1].is_null(row)) {
+                    return core::error_t(core::error_code_t::invalid_parameter,
+                                         std::pmr::string{"kafka offsets: NULL partition or offset"});
+                }
                 const int32_t partition = chunk.value(0, row).value<int32_t>();
                 const int64_t offset = chunk.value(1, row).value<int64_t>();
+                if (partition < 0 || offset < 0) {
+                    return core::error_t(core::error_code_t::invalid_parameter,
+                                         std::pmr::string{"kafka offsets: negative partition or offset"});
+                }
                 auto it = result.find(partition);
                 if (it == result.end() || offset > it->second) {
                     result[partition] = offset;

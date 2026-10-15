@@ -4,10 +4,13 @@
 #include "connection_config_reader.hpp"
 
 #include "utility/parse_port.hpp"
+#include "utility/s3_transport.hpp"
 #include "yaml_scalar.hpp"
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdlib>
+#include <cctype>
 #include <map>
 #include <memory_resource>
 #include <string>
@@ -59,6 +62,22 @@ namespace config {
             }
 
             core::error_t take_error() { return std::move(error_); }
+
+            std::string credential(const char* key) {
+                const auto env_key = std::string{key} + "_env";
+                if (!node_[env_key]) return str(key);
+                const auto name = str(env_key.c_str());
+                if (error_.contains_error()) return "";
+                const bool valid_name = !name.empty() && (std::isalpha(static_cast<unsigned char>(name[0])) || name[0] == '_') &&
+                    std::all_of(name.begin(), name.end(), [](unsigned char c) { return std::isalnum(c) || c == '_'; });
+                const char* value = valid_name ? std::getenv(name.c_str()) : nullptr;
+                if (node_[key] || !value || !*value) {
+                    error_ = invalid_connection(kind_, "entry #" + std::to_string(index_ + 1),
+                        env_key + ": requires a populated environment variable and no inline credential", resource_);
+                    return "";
+                }
+                return value;
+            }
 
         private:
             const YAML::Node& node_;
@@ -241,11 +260,13 @@ namespace config {
                 entry_reader_t entry{node, "s3", index++, resource};
                 S3CredentialDesc desc{
                     .alias = entry.str("alias"),
-                    .access_key = entry.str("access_key"),
-                    .secret_key = entry.str("secret_key"),
+                    .access_key = entry.credential("access_key"),
+                    .secret_key = entry.credential("secret_key"),
                     .region = entry.str("region"),
-                    .session_token = entry.str("session_token"),
+                    .session_token = entry.credential("session_token"),
                     .endpoint = entry.str("endpoint"),
+                    .scheme = entry.str("scheme", "https"),
+                    .ca_file = entry.str("ca_file"),
                 };
                 if (auto err = entry.take_error(); err.contains_error()) {
                     return err;
@@ -298,6 +319,7 @@ namespace config {
     }
 
     std::optional<std::string> validation_error(const S3CredentialDesc& c) {
-        return first_missing({{"alias", &c.alias}, {"access_key", &c.access_key}, {"secret_key", &c.secret_key}});
+        if (auto missing = first_missing({{"alias", &c.alias}, {"access_key", &c.access_key}, {"secret_key", &c.secret_key}})) return missing;
+        return otterstax::validate_s3_transport(c.scheme, c.endpoint, c.ca_file);
     }
 } // namespace config

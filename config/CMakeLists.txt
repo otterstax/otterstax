@@ -27,6 +27,7 @@ target_link_libraries(config
     yaml-cpp::yaml-cpp
     PRIVATE
     spdlog::spdlog
+    Boost::boost
 )
 
 # Ensure otterbrix logging headers (components/log) are available to config

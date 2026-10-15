@@ -8,6 +8,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Connections are registered once at startup from the connection config file (see the top-level `CLAUDE.md` "Connection Config"): `ComponentManager::register_connections` calls each manager's `addConnection` / the s3 actor's `add_credentials`. There is no runtime add/remove API.
 
+MySQL and PostgreSQL connector managers also own dedicated transaction connections keyed by the full engine session ID. `begin_transaction` connects a fresh socket using the registered alias settings; it does not register another catalog entry. `executeQuery` with a transaction ID requires that session and alias to match and skips health probes and reconnect. The owning integration actor must drain its query futures before `finish_transaction` closes and removes the socket. Failed or uncertain completion is returned as an error and is never retried. The shared alias connection remains available for autocommit requests.
+
+`fork_transaction` copies connection settings into a separate manager with its
+own transaction socket and IO pool. The dedicated integration actor owns that
+manager. It has no shared autocommit connector or catalog registration.
+
 ## Structure
 
 ```
@@ -35,12 +41,23 @@ Unlike the SQL backends, these are `actor_zeta::actor_mixin` actors whose handle
   takes a **pre-parsed `OtterbrixStatementPtr`** (not a database/table), runs it through
   `db::OtterbrixManager::execute`, and writes the result chunk out in the requested format. Format
   translators live in `otterbrix/translators/{input,output}`.
+  Production SQL passes an explicit `security::file_access` policy. Imports read
+  through that policy's open descriptors; exports use its Arrow stream and publish
+  only after conversion succeeds. The path-taking translator APIs are for direct
+  library callers; the SQL file actor must never use them. S3 has a separate file
+  actor restricted to private tenant staging, so local SQL permissions do not
+  need to expose the staging directory. Temporary files use random names and an
+  exclusive create, with bounded writes and cleanup on failure.
+  S3 transport preserves HTTPS for custom endpoints, applies an optional CA bundle,
+  and always verifies certificates. Only an explicit `scheme: http` selects
+  plaintext. Connector credential registration validates transport settings as
+  well as required keys; it must not silently override the configured scheme.
 - **`conn::s3::ConnectorManager`** — credential store + S3 object I/O (`list`/`download`/`upload`) backed by
   Arrow's `S3FileSystem`. Credentials are registered per alias at startup from the `s3:` section of the
   connection config file (via `add_credentials`); there is no remove path. Every handler reports a typed
   `core::error_t`: `invalid_parameter` (empty alias / keys), `do_not_exists` (unknown alias), `io_error`
   (any Arrow S3 or local-file failure). A `download` that fails mid-transfer removes the partial local
-  file. Nothing here throws — Arrow reports through `Status`/`Result`. `db::S3Manager` (in
+  file. Arrow/file I/O reports through `Status`/`Result`. `db::S3Manager` (in
   `integration/s3`) bridges these two with the engine. Error paths: `tests/system/test_s3_errors.cpp`.
   The constructor calls `arrow::fs::EnsureS3Initialized()`; Arrow requires one matching `FinalizeS3()`
   before the process exits (otherwise it warns and may segfault during static teardown), and

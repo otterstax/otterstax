@@ -13,6 +13,7 @@ add_library(file
 )
 
 target_link_libraries(file PUBLIC
+    client_security
     Threads::Threads
     OpenSSL::Crypto
     OpenSSL::SSL

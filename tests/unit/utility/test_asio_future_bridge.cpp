@@ -182,3 +182,19 @@ TEST_CASE("asio_future_bridge: timeout and infra failure are distinct codes") {
     STATIC_REQUIRE(otterstax::AWAIT_TIMEOUT_CODE != core::error_code_t::other_error);
     STATIC_REQUIRE(otterstax::AWAIT_TIMEOUT_CODE != core::error_code_t::none);
 }
+
+TEST_CASE("asio_future_bridge: reported IO and transaction failures are not transport failures") {
+    std::pmr::synchronized_pool_resource resource;
+    for (const auto code : {core::error_code_t::io_error, core::error_code_t::transaction_inactive}) {
+        actor_zeta::promise<result_t> producer{&resource};
+        auto future = producer.get_future();
+        producer.set_value(result_t{core::error_t{code, std::pmr::string{"query failed", &resource}}});
+        auto result = await_on_io(std::move(future), 50ms, &resource);
+        REQUIRE(result.has_error());
+        CHECK(result.error().type == code);
+        CHECK(result.error().type != otterstax::AWAIT_TIMEOUT_CODE);
+        CHECK(result.error().type != otterstax::AWAIT_FAILED_CODE);
+        CHECK(result.error().what == "query failed");
+        CHECK(result.error().what.get_allocator().resource() == &resource);
+    }
+}

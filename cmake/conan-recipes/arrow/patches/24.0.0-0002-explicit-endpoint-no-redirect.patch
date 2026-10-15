@@ -1,0 +1,15 @@
+--- a/cpp/src/arrow/filesystem/s3fs.cc
++++ b/cpp/src/arrow/filesystem/s3fs.cc
+@@ -1102,6 +1102,12 @@
+     }
+ 
+     client_config_.endpointOverride = ToAwsString(options_.endpoint_override);
++    if (!options_.endpoint_override.empty()) {
++      // An explicit endpoint is an administrator-selected destination. A
++      // response must not redirect requests (including signed requests) to a
++      // different host, port, or scheme.
++      client_config_.followRedirects = Aws::Client::FollowRedirectsPolicy::NEVER;
++    }
+     if (options_.scheme == "http") {
+       client_config_.scheme = Aws::Http::Scheme::HTTP;
+     } else if (options_.scheme == "https") {

@@ -289,7 +289,14 @@ namespace otterstax::kafka {
 
         // Launch the continuous worker (no-op unless start_pollers_) and remember it
         // under its target stream for DROP-time cleanup
-        launch_stream(query_name);
+        if (auto started = launch_stream(query_name); started.contains_error()) {
+            registry_.erase(query_name);
+            if (auto removed = co_await delete_source_meta(query_name); !removed || removed->is_error()) {
+                log_->error("kafka: metadata cleanup after insert-query '{}' failed to start: {}",
+                            query_name, removed ? removed->get_error().what.c_str() : "no reply");
+            }
+            co_return cursor::make_cursor(resource_, std::move(started));
+        }
         stream_insert_queries_[stream].push_back(query_name);
         log_->info("kafka: added INSERT INTO query '{}' into stream '{}' (source '{}', transactional={})",
                    query_name,
@@ -309,7 +316,7 @@ namespace otterstax::kafka {
             // Kafka transaction (a crash before commit aborts it — a read-committed
             // consumer never sees a partial INSERT). Stable txn id per object for
             // producer fencing. init_transactions() needs a reachable broker
-            auto created = kafka_producer_t::create({bootstrap_servers, topic, "otterstax_insert_" + name});
+            auto created = kafka_producer_t::create({bootstrap_servers, topic, "otterstax_insert_" + name, destinations_});
             if (created.has_error()) {
                 return created.error();
             }

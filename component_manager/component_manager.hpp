@@ -29,12 +29,18 @@
 
 class ComponentManager {
 public:
-    ComponentManager(const configuration::config& config, const config::ConnectionsConfig& connections);
+    ComponentManager(const configuration::config& config, const config::ConnectionsConfig& connections,
+                     std::shared_ptr<const otterstax::security::file_access> files = {},
+                     std::vector<std::string> kafka_brokers = {});
     ~ComponentManager();
     std::pmr::memory_resource* getResource();
     actor_zeta::address_t scheduler_address() const;
     actor_zeta::address_t catalog_address() const;
     const otterstax::names::alias_registry_t& aliases() const noexcept { return aliases_; }
+
+    // Called after construction and before opening listeners. A failed recovery
+    // keeps startup from advertising a server with missing ingestion workers.
+    [[nodiscard]] core::error_t recover();
 
     // Register every remote backend and s3 alias described by the connection
     // config (parsed from the config file at startup) with the corresponding
@@ -78,17 +84,15 @@ private:
     std::unique_ptr<db::ClickhouseManager, actor_zeta::pmr::deleter_t> ch_connection_manager_actor_{
         nullptr,
         actor_zeta::pmr::deleter_t{getResource()}};
-    // The work-sharing thread pool that drives the Worker actors. Declared before
-    // scheduler_ so it outlives it: scheduler_ (workers + event loop) is destroyed
-    // first, the (already-stopped) pool after. Stopped in ~ComponentManager before
-    // any actor is destroyed.
-    std::unique_ptr<actor_zeta::scheduler::sharing_scheduler> az_scheduler_{nullptr};
     std::unique_ptr<Scheduler, actor_zeta::pmr::deleter_t> scheduler_{nullptr,
                                                                       actor_zeta::pmr::deleter_t{getResource()}};
     std::unique_ptr<conn::file::FileManager, actor_zeta::pmr::deleter_t> file_manager_{
         nullptr,
         actor_zeta::pmr::deleter_t{getResource()}};
     std::unique_ptr<conn::s3::ConnectorManager, actor_zeta::pmr::deleter_t> s3_manager_{
+        nullptr,
+        actor_zeta::pmr::deleter_t{getResource()}};
+    std::unique_ptr<conn::file::FileManager, actor_zeta::pmr::deleter_t> staging_file_manager_{
         nullptr,
         actor_zeta::pmr::deleter_t{getResource()}};
     // Integration-layer S3 orchestrator (download→add_file / dump_file→upload),

@@ -22,6 +22,7 @@ namespace frontend::mysql {
         , next_statement_id_(0)
         , client_max_packet_size_(DEFAULT_MAX_PACKET_SIZE)
         , scheduler_(scheduler)
+        , sql_session_(resource, scheduler, true)
         , state_(connection_state::HANDSHAKE)
         , log_(get_logger(logger_tag::MYSQL_CONNECTION)) {
         assert(log_.is_valid());
@@ -54,7 +55,14 @@ namespace frontend::mysql {
         return merge_n_bytes<uint32_t, 3, endian::LITTLE>(header, 0);
     }
 
-    bool mysql_connection::validate_payload_size(const std::vector<uint8_t>& header, uint32_t& size) { return true; }
+    bool mysql_connection::validate_payload_size(const std::vector<uint8_t>&, uint32_t& size) {
+        if (authentication_required() && state_ != connection_state::COMMAND &&
+            size > access_->max_token_bytes + 4096) {
+            reject_authentication();
+            return false;
+        }
+        return true;
+    }
 
     void mysql_connection::handle_network_read_error(std::string description) {
         send_error(mysql_error::ER_NET_READ_ERROR, std::move(description));
@@ -66,13 +74,12 @@ namespace frontend::mysql {
 
     void mysql_connection::send_handshake() {
         // The packet is written from send_buffer_, which outlives the write.
-        send_buffer_ = build_handshake_10(writer_, connection_id_, generate_backend_key(AUTH_DATA_FULL_LENGTH));
+        send_buffer_ = build_handshake_10(writer_, connection_id_, generate_backend_key(AUTH_DATA_FULL_LENGTH),
+                                          static_cast<uint16_t>(server_status::SERVER_STATUS_AUTOCOMMIT), tls_available());
         sequence_id_++;
 
         // todo: count rounds & break if too many
-        boost::asio::async_write(
-            socket_,
-            boost::asio::buffer(send_buffer_),
+        write_transport(boost::asio::buffer(send_buffer_),
             safe_callback([this](boost::system::error_code ec, std::size_t bytes_sent) {
                 if (ec) {
                     if (!closed()) {
@@ -96,8 +103,9 @@ namespace frontend::mysql {
         bool sequence_valid = false;
         switch (state_) {
             case connection_state::AUTH:
-                sequence_valid = (seq_id == 1); // server sent auth packet
-                sequence_id_ = 2;
+            case connection_state::AUTH_TOKEN:
+                sequence_valid = (seq_id == sequence_id_);
+                sequence_id_ = seq_id + 1;
                 break;
             case connection_state::COMMAND:
                 sequence_valid = (seq_id == 0); // start with 0
@@ -126,6 +134,9 @@ namespace frontend::mysql {
             case connection_state::AUTH:
                 handle_auth(std::move(payload));
                 break;
+            case connection_state::AUTH_TOKEN:
+                handle_auth_token(std::move(payload));
+                break;
             case connection_state::COMMAND:
                 handle_command(std::move(payload));
                 break;
@@ -138,7 +149,12 @@ namespace frontend::mysql {
                    static_cast<uint16_t>(error_code),
                    message,
                    static_cast<int>(sequence_id_));
-        send_packet(build_error(writer_, sequence_id_++, error_code, std::move(message)));
+        sql_session_.mark_failed();
+        if (sql_session_.broken()) {
+            send_then(build_error(writer_, sequence_id_++, error_code, std::move(message)), [this] { finish(); });
+        } else {
+            send_packet(build_error(writer_, sequence_id_++, error_code, std::move(message)));
+        }
     }
 
     void mysql_connection::send_malformed_packet_error(std::string message) {
@@ -149,8 +165,7 @@ namespace frontend::mysql {
         // The write is initiated before the close is posted, so the ERR packet
         // reaches the client ahead of the FIN (the same order the PG frontend
         // relies on for a FATAL ErrorResponse).
-        send_packet(build_error(writer_, sequence_id_++, mysql_error::ER_MALFORMED_PACKET, std::move(message)),
-                    false);
-        finish();
+        send_then(build_error(writer_, sequence_id_++, mysql_error::ER_MALFORMED_PACKET, std::move(message)),
+                  [this] { finish(); });
     }
 } // namespace frontend::mysql

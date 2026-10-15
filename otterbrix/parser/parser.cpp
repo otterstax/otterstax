@@ -584,6 +584,7 @@ core::result_wrapper_t<ParsedQueryDataPtr> GreenplumParser::parse(const std::str
             return finalized.convert_error<ParsedQueryDataPtr>();
         }
         result->otterbrix_params->catalog_resolves = finalized.value().catalog_resolves;
+        result->otterbrix_params->transformed_plan.emplace(std::move(finalized.value()));
     }
 
     auto external_count = get_external_nodes(resource_,

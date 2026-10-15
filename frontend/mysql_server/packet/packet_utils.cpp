@@ -100,7 +100,8 @@ namespace frontend::mysql {
     std::vector<uint8_t> build_handshake_10(packet_writer& writer,
                                             uint32_t connection_id,
                                             std::vector<uint8_t> auth_data,
-                                            server_status_flags_t flags) {
+                                            server_status_flags_t flags,
+                                            bool tls_available) {
         writer.reserve_payload(HANDSHAKE_PAYLOAD_SIZE);
         writer.write_uint8(PROTOCOL_VERSION);
         writer.write_string_null(SERVER_VERSION.data());
@@ -115,6 +116,7 @@ namespace frontend::mysql {
         // CLIENT_CONNECT_WITH_DB for HandshakeResponse41
         uint32_t capabilities =
             CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION | CLIENT_PLUGIN_AUTH | CLIENT_CONNECT_WITH_DB;
+        if (tls_available) capabilities |= CLIENT_SSL;
         writer.write_uint16(capabilities & 0xFFFF);                               // lower 2 bytes
         writer.write_uint8(static_cast<uint8_t>(character_set::UTF8_GENERAL_CI)); // character set
         writer.write_uint16(flags);

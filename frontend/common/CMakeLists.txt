@@ -9,6 +9,7 @@ set(COMMON_SERVER_HEADERS
 )
 
 set(COMMON_SERVER_SOURCES
+     sql_session.cpp
      frontend_connection.cpp
      packet_reader_base.cpp
      packet_writer_base.cpp
@@ -23,6 +24,7 @@ add_library(common_server
 )
 
 target_link_libraries(common_server PUBLIC
+    client_security
     Boost::boost
     otterbrix::otterbrix
     actor-zeta::actor-zeta

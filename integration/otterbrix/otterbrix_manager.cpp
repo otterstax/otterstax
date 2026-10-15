@@ -626,7 +626,7 @@ OtterbrixManager::get_schema(session_hash_t id,
 
     auto cursor_data = cursor::make_cursor(resource());
     if (params.size()) {
-        cursor_data = at_engine_boundary(resource(), [&] { return data_manager_->get_schema(params); });
+        cursor_data = at_engine_boundary(resource(), [&] { return data_manager_->get_schema(params, data->otterbrix_params->context.engine_session); });
         log_->trace("get_schema: get_schema done");
         if (failed(cursor_data)) {
             co_return engine_failure(resource(), cursor_data, "get_schema");

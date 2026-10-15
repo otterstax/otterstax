@@ -15,6 +15,7 @@
 
 #include <optional>
 #include <thread>
+#include <unordered_map>
 
 using namespace db;
 
@@ -317,6 +318,7 @@ ClickhouseManager::execute(session_hash_t id, ParsedQueryDataPtr data) {
         conversion_errors.reserve(batch_nodes.size());
         // unique_ptr because data_chunk_t has no default constructor.
         otterstax::QueryHandleWaiter<std::unique_ptr<components::vector::data_chunk_t>> wait_guard{resource()};
+        std::pmr::unordered_map<std::string, size_t> pending_connections(resource());
         // Order inside a batch does not matter. For a mixed backend, nodes that
         // belong to another backend are skipped, so the slots this manager filled
         // are tracked by index.
@@ -405,6 +407,11 @@ ClickhouseManager::execute(session_hash_t id, ParsedQueryDataPtr data) {
                 }
             };
 
+            // One native protocol client per alias, with one operation at a time.
+            if (auto previous = pending_connections.find(uid); previous != pending_connections.end()) {
+                wait_guard.futures[previous->second].wait();
+            }
+            pending_connections[uid] = wait_guard.futures.size();
             wait_guard.futures.push_back(
                 connector_manager_->executeQuery(uid, generated_queries.back(), data_converter));
         }

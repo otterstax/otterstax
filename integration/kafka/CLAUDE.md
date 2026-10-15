@@ -4,6 +4,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Role
 
+`KafkaManager` receives an immutable administrator destination policy. Empty
+policy denies all destinations, including in dry mode. CREATE validates every
+bootstrap entry before changing engine tables or persisted metadata; recovery
+and producer/consumer construction validate again. Both clients install the same
+resolver guard for advertised brokers. `kafka_destination_guard` owns callback
+context until the client and its internal threads have stopped; preserve that
+lifetime during moves and teardown. Test fixtures explicitly list their broker
+addresses. See `tests/system/test_kafka_destinations.cpp`.
+
 `integration/kafka/` is the Kafka **runtime**: the `KafkaManager` actor plus its
 implementation. It owns the live Kafka objects (SOURCE / STREAM), their backing
 Otterbrix tables, and the librdkafka consumer/producer threads. The Kafka DDL
@@ -49,14 +58,15 @@ Library: `kafka_runtime` (links `kafka_grammar` + `otterbrix_local`).
   `pollers_` / `producers_` / `streams_` maps, and `stream_insert_queries_`
   (stream → its INSERT-query names, for DROP-time cleanup). `start_pollers_` ctor
   flag is FALSE by default so broker-free unit tests stay thread-free;
-  component_manager passes TRUE. `recover()` (called by component_manager after
-  init) replays `kafka.__sources` in three passes — sources, streams, then INSERT
+  component_manager passes TRUE. `recover()` (called by main through the component
+  manager after construction, before listeners) replays `kafka.__sources` in three passes — sources, streams, then INSERT
   INTO queries (`kind='insert'`, sink + source re-derived from the persisted SQL).
   A source's columns are not persisted: they are re-read from its backing table
   through the shared engine-side schema probe (`otterbrix/operators/schema_probe.hpp`,
   the same helper behind `OtterbrixDataManager::get_schema`), so an empty table
   recovers with the same schema as a populated one; a missing backing table is
-  skipped, a VIEW under the source's name is refused.
+  skipped, a VIEW under the source's name is refused. Recovery returns engine,
+  metadata and worker-start errors to main, which exits without opening listeners.
 
 ## detail/ (the implementation)
 
@@ -64,7 +74,7 @@ Library: `kafka_runtime` (links `kafka_grammar` + `otterbrix_local`).
 |------|--------------|
 | `kafka_consumer.{hpp,cpp}` | RAII over `RdKafka::KafkaConsumer`. `poll_batch`, `commit` (broker-group resume), and the exactly-once helpers `send_offsets_to_transaction(producer&, batch, …)` + `seek_to_batch_start` (rewind on abort). All RdKafka pointer ownership is confined here. |
 | `kafka_producer.{hpp,cpp}` | RAII over `RdKafka::Producer` (`acks=all` + `enable.idempotence`). Optional `transactional_id` ⇒ exactly-once (`init_transactions` + `begin/send_offsets_to_transaction/commit/abort`). Used by INSERT→topic and STREAM output. |
-| `kafka_poller.{hpp,cpp}` | Per-SOURCE `std::thread`: poll → `json_to_chunk` → `ingest_at_least_once` / `ingest_transactional` (free functions returning the engine's `core::error_t`, testable broker-free) → commit only on success. A failed batch is logged with its code, the consumer is rewound to the batch start and the batch is retried after a capped exponential pause (`batch_retry_backoff`). |
+| `kafka_poller.{hpp,cpp}` | Per-SOURCE `std::thread`: poll → `json_to_chunk` → `ingest_at_least_once` / `ingest_transactional` (free functions returning the engine's `core::error_t`, testable broker-free) → commit only on success. A failed batch is logged with its code; its original records are retained and retried after a capped exponential pause (`batch_retry_backoff`) before polling later records. |
 | `kafka_stream.{hpp,cpp}` | Per-STREAM continuous-query `std::thread`: poll → node-swap transform (`aggregate(empty)+[raw_data, <operators>]`) → `chunk_matches_columns` against the stream's declared output columns → produce. `TRANSACTIONAL=true` ⇒ the producer runs each batch in a transaction (exactly-once). A batch failing at any step (transform error, schema mismatch, produce) is never committed: rewind + capped backoff, like the poller. |
 | `kafka_reader.{hpp,cpp}` | Pure/broker-free conversions + engine helpers: `json_to_chunk` / `chunk_to_json`, `chunk_matches_columns` (write-path schema guard — round-trips the rows through the declared columns), `kafka_insert`, `kafka_query` / `kafka_query_session` (parse SQL + send to the dispatcher; the session variant shares ONE engine transaction across calls — used by exactly-once), `kafka_parse_plan` / `kafka_execute`, `write_offsets` / `parse_offsets`, `stream_output_schema` (computes a STREAM's projected schema via `schema_utils::aggregate_filter_schema`, since the engine drops the schema of a projection over an empty result). |
 
@@ -79,6 +89,26 @@ a `kafka_node_t` plan root → `KafkaManager::execute`; else `kafka_write_target
 
 ## Constraints / conventions
 
+- Producer delivery reports determine whether queued messages reached the broker.
+  `flush()` reports rejected deliveries even when librdkafka's queue is empty;
+  a timed-out flush retains pending delivery errors. The callback has a stable
+  address across producer moves and outlives producer teardown. A successful
+  transaction abort drains and clears that transaction's delivery failures.
+  `tests/system/test_kafka_delivery.cpp` injects broker errors through librdkafka's
+  mock cluster and checks subsequent batches, moves and abort recovery.
+- A transactional SOURCE replaces the checkpoint rows of each touched partition
+  in the same engine transaction as its data insert. Untouched partitions retain
+  their rows. A failed replacement rolls back both the deletion and the data.
+- Checkpoint reads preserve engine errors and reject NULL, negative, or mistyped
+  positions. A transactional poller cannot start from an unreadable checkpoint.
+- A failed consumer/producer start makes CREATE fail. Its newly registered object
+  and persisted metadata are removed, along with a SOURCE's new backing tables;
+  cleanup failures are logged. A missing `kafka.__sources` is a normal first start;
+  other registry read errors, malformed rows and duplicate objects fail recovery.
+- Consumers use `read_committed` isolation. The SOURCE refreshes the positions
+  used for reassignments after each successful engine commit; a rebalance during
+  polling discards the incomplete batch from the old assignment.
+
 - The grammar reserves `partition` → the offsets column is `partition_id`.
 - `INSERT INTO kafka.<obj>` produces to the object's topic (SOURCE and STREAM
   alike); the produced rows are validated against the object's schema first.
@@ -90,28 +120,7 @@ a `kafka_node_t` plan root → `KafkaManager::execute`; else `kafka_write_target
   (and rolls its tables back) when the `kafka.__sources` metadata row cannot be
   written; DROP SOURCE drops `<name>__offsets` too and forgets the object only
   after a successful drop (`IF EXISTS` forgives only a missing table).
-- **Actor-isolation exception: `recover()` reads the probe's plan after the engine
-  replied.** For each SOURCE, `recover()` sends `probe.execution_plan(resource_)` to
-  the engine's dispatcher actor and waits for the reply future (`drive`). Then
-  `schema_probe::read_columns` reads `probe.aggregate->output_types()`, falling back
-  to the resolve nodes' catalog metadata; `read_table_oid` reads the same metadata.
-  Those nodes belong to the Kafka actor, but the engine wrote them.
-  - **Why it is safe.** The engine stamps the types during validation
-    (`validate_schema`), before it builds the physical plan and before it replies.
-    `manager_dispatcher_t::execute_plan` takes the plan by value and answers with the
-    cursor only, so after the reply the nodes belong to the caller alone. The engine
-    may still release its node references on its own thread: the
-    `intrusive_ref_counter` count is atomic, and `output_types_` is allocated on the
-    caller's resource.
-  - **What it rests on.** The guarantee depends on that ordering inside the engine; a
-    continuation that writes to the plan after the reply, or a plan cache, would break
-    it silently. `OtterbrixDataManager::get_schema` and `describe_collection` rely on
-    the same protocol.
-  - **Otterbrix rc-3.** The resolve metadata moves off the resolve nodes into
-    `execution_plan_t::catalog_resolves`, and view expansion moves to
-    `components::planner::expand_view_body`. `otterbrix/operators/schema_probe.hpp`
-    (`read_columns`, `read_table_oid`, `make_view_probe`) is rewritten for that
-    migration anyway, and that rewrite is where the column types should come from the
-    engine's reply instead of being read back off the plan.
+- Recovery reads schema and relation identity from engine reply cursors through
+  `schema_probe.hpp`. It does not read mutable plan-node metadata across actors.
 - Integration tests are Python `--local` scripts in `tests/` (`test_kafka_*.py`);
   the broker is the `kafka` service in `compose.test.yml` (`127.0.0.1:19092`).

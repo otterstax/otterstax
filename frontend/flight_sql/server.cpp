@@ -21,6 +21,7 @@ namespace flight::server {
         : log_(get_logger(logger_tag::FLIGHTSQL_SERVER))
         , address_(config.host + ":" + std::to_string(config.port))
         , threads_(std::max<std::size_t>(1, config.threads))
+        , access_(config.access)
         , core_(core::AuthService::anonymous(),
                 std::make_unique<engine::SchedulerEngine>(config.scheduler_address,
                                                           config.catalog_address,
@@ -43,7 +44,7 @@ namespace flight::server {
         // every thread: built without it, the other threads stayed blocked in the completion
         // queue and run() never returned on SIGTERM.
         grpc_context_ = std::make_unique<agrpc::GrpcContext>(builder.AddCompletionQueue(), threads_);
-        builder.AddListeningPort(address_, grpc::InsecureServerCredentials());
+        builder.AddListeningPort(address_, access_ ? access_->grpc_credentials : grpc::InsecureServerCredentials());
         builder.RegisterService(&flight_server_.service());
         server_ = builder.BuildAndStart();
         if (!server_) {

@@ -4,10 +4,12 @@
 #pragma once
 
 #include "protocol_config.hpp"
+#include "security/transport.hpp"
 
 #include <actor-zeta.hpp>
 #include <atomic>
 #include <boost/asio.hpp>
+#include <boost/asio/ssl.hpp>
 #include <chrono>
 #include <components/log/log.hpp>
 #include <cstddef>
@@ -61,8 +63,31 @@ namespace frontend {
         // Requests the close; callable from any thread, idempotent. The
         // connection stays alive until its last pending operation completes.
         void finish();
+        // Assigned by the owner before start(), then immutable.
+        void set_access(std::shared_ptr<const otterstax::security::server_access> access) {
+            access_ = std::move(access);
+        }
 
     protected:
+        template<typename Buffers, typename Handler>
+        void read_transport(const Buffers& buffers, Handler&& handler) {
+            if (tls_) boost::asio::async_read(*tls_, buffers, std::forward<Handler>(handler));
+            else boost::asio::async_read(socket_, buffers, std::forward<Handler>(handler));
+        }
+
+        template<typename Buffers, typename Handler>
+        void write_transport(const Buffers& buffers, Handler&& handler) {
+            if (tls_) boost::asio::async_write(*tls_, buffers, std::forward<Handler>(handler));
+            else boost::asio::async_write(socket_, buffers, std::forward<Handler>(handler));
+        }
+
+        bool tls_available() const { return access_ && access_->tls; }
+        bool encrypted() const { return static_cast<bool>(tls_); }
+        bool authentication_required() const { return access_ && access_->requires_authentication(); }
+        otterstax::security::token_result verify_token(std::string_view token) const;
+        void start_tls(std::function<void()> ready);
+        void send_then(std::vector<uint8_t> packet, std::function<void()> ready);
+        std::string access_token_;
         // Wraps a completion handler: the operation is counted as pending from
         // here until the wrapper has run the handler, and the wrapper is what
         // releases the connection when it was the last one. An exception out
@@ -127,6 +152,8 @@ namespace frontend {
         bool closed() const { return closed_; }
 
         boost::asio::ip::tcp::socket socket_;
+        std::shared_ptr<const otterstax::security::server_access> access_;
+        std::unique_ptr<boost::asio::ssl::stream<boost::asio::ip::tcp::socket&>> tls_;
         uint32_t connection_id_;
         // Cleared on the first close so the slot is released exactly once.
         connection_close_sink* close_sink_;

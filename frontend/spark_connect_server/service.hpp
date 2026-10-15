@@ -12,6 +12,7 @@
 #pragma once
 
 #include "otterbrix/parser/alias_registry.hpp"
+#include "security/transport.hpp"
 
 #include <actor-zeta.hpp>
 #include <agrpc/grpc_context.hpp>
@@ -49,6 +50,7 @@ namespace frontend::spark {
         std::pmr::memory_resource* resource{nullptr};
         actor_zeta::address_t scheduler_address;
         const otterstax::names::alias_registry_t* aliases{nullptr};
+        std::shared_ptr<const otterstax::security::server_access> access;
     };
 
     // ---------------------------------------------------------------------------
@@ -104,7 +106,7 @@ namespace frontend::spark {
         SparkConnectServiceImpl(SparkConnectServiceImpl&&) = delete;
         SparkConnectServiceImpl& operator=(SparkConnectServiceImpl&&) = delete;
 
-        void start();
+        [[nodiscard]] bool start();
         void stop();
 
     private:
@@ -123,6 +125,7 @@ namespace frontend::spark {
         std::pmr::vector<std::jthread> threads_;
         std::string host_;
         uint16_t port_;
+        std::shared_ptr<const otterstax::security::server_access> access_;
         bool stopped_{false};
 
         // -----------------------------------------------------------------------

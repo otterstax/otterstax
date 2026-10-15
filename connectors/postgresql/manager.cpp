@@ -117,7 +117,99 @@ namespace pg {
         return addConnection(params, connection_param.alias);
     }
 
+
+    core::error_t ConnectorManager::control(IConnector& connector, const char* command) {
+        if (thread_pool_manager_.status() != thread_pool_status::RUNNING) {
+            return core::error_t{core::error_code_t::io_error,
+                std::pmr::string{"Connector thread pool is not running", resource_}};
+        }
+        try {
+            return otterstax::spawn_marshaled<otterstax::asio_error_t>(
+                thread_pool_manager_.ctx(),
+                otterstax::run_with_owned_handler<otterstax::asio_error_t, PGresult*>(
+                    connector, command, [this, command](PGresult* result) -> otterstax::asio_error_t {
+                    // PostgreSQL acknowledges COMMIT in an aborted transaction
+                    // with the command tag ROLLBACK. That is not a commit.
+                    if (!result || std::string_view{PQcmdStatus(result)} != command) {
+                        return core::error_t{core::error_code_t::transaction_finalized,
+                            std::pmr::string{"Backend did not complete the requested transaction command", resource_}};
+                    }
+                    return {};
+                }), resource_).get();
+        } catch (const std::exception& e) {
+            return core::error_t{core::error_code_t::io_error, std::pmr::string{e.what(), resource_}};
+        }
+    }
+
+    core::error_t ConnectorManager::begin_transaction(session_id session, const std::string& alias) {
+        if (thread_pool_manager_.status() != thread_pool_status::RUNNING) {
+            return core::error_t{core::error_code_t::io_error,
+                std::pmr::string{"Connector thread pool is not running", resource_}};
+        }
+        if (transactions_.contains(session)) {
+            return core::error_t{core::error_code_t::invalid_parameter,
+                std::pmr::string{"Transaction connection already exists", resource_}};
+        }
+        auto base = connections_.find(alias);
+        if (base == connections_.end()) {
+            return core::error_t{core::error_code_t::do_not_exists,
+                std::pmr::string{"Unknown transaction connection alias", resource_}};
+        }
+        return open_transaction(session, alias, base->second->params());
+    }
+
+    core::result_wrapper_t<std::unique_ptr<ConnectorManager>>
+    ConnectorManager::fork_transaction(session_id session, const std::string& alias) {
+        auto base = connections_.find(alias);
+        if (base == connections_.end()) {
+            return core::error_t{core::error_code_t::do_not_exists,
+                std::pmr::string{"Unknown transaction connection alias", resource_}};
+        }
+        auto child = std::make_unique<ConnectorManager>(resource_, actor_zeta::address_t::empty_address(), make_connector_, 1);
+        child->start();
+        if (auto error = child->open_transaction(session, alias, base->second->params()); error.contains_error()) {
+            return error;
+        }
+        return child;
+    }
+
+    core::error_t ConnectorManager::open_transaction(session_id session, const std::string& alias, connect_params params) {
+        try {
+            auto connector = make_connector_(resource_, std::move(params), alias);
+            if (auto err = connector->connect(); err.contains_error()) return err;
+            if (auto err = control(*connector, "BEGIN"); err.contains_error()) {
+                connector->close();
+                return err;
+            }
+            transactions_.emplace(session, transaction_connection{alias, std::move(connector)});
+            return core::error_t::no_error();
+        } catch (const std::exception& e) {
+            return core::error_t{core::error_code_t::io_error, std::pmr::string{e.what(), resource_}};
+        }
+    }
+
+    core::error_t ConnectorManager::finish_transaction(session_id session, bool commit) {
+        auto active = transactions_.extract(session);
+        if (active.empty()) {
+            // Rollback also cleans up a failed begin or an already aborted block.
+            if (!commit) return core::error_t::no_error();
+            return core::error_t{core::error_code_t::invalid_parameter,
+                std::pmr::string{"Transaction connection does not exist", resource_}};
+        }
+        auto outcome = control(*active.mapped().connector, commit ? "COMMIT" : "ROLLBACK");
+        // A transport failure during COMMIT has an unknown outcome. Never retry
+        // it, reconnect, or return this socket to the autocommit connection.
+        active.mapped().connector->close();
+        return outcome;
+    }
+
     size_t ConnectorManager::totalConnections() const noexcept { return connections_.size(); }
 
-    bool ConnectorManager::hasConnection(const std::string& uuid) const noexcept { return connections_.contains(uuid); }
+    bool ConnectorManager::hasConnection(const std::string& uuid) const noexcept {
+        if (connections_.contains(uuid)) return true;
+        for (const auto& [session, transaction] : transactions_) {
+            if (transaction.alias == uuid) return true;
+        }
+        return false;
+    }
 } // namespace pg

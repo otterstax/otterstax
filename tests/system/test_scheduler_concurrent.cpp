@@ -24,7 +24,6 @@
 #include "utility/logger.hpp"
 
 #include <actor-zeta.hpp>
-#include <actor-zeta/scheduler/sharing_scheduler.hpp>
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/detached.hpp>
 #include <boost/asio/io_context.hpp>
@@ -44,11 +43,10 @@
 
 namespace {
     // Worker pool, session-future bridge and pool sizing are the ones every
-    // system test shares (scheduler_stack.hpp); the default-config engine, the
+    // system test shares (scheduler_stack.hpp); the isolated engine fixture, the
     // mock MySQL connect params and the future polling come from test_helpers.hpp.
     using otterstax::test::await_session;
-    using otterstax::test::init_default_test_otterbrix;
-    using otterstax::test::make_az_scheduler;
+    using otterstax::test::isolated_test_engine;
     using otterstax::test::mock_connect_params;
     using otterstax::test::poll_until_ready;
     using otterstax::test::worker_pool_size;
@@ -167,11 +165,11 @@ TEST_CASE("scheduler handles N parallel sessions without hanging") {
     constexpr size_t N = 32;
     constexpr auto WAIT_TIMEOUT = 60000ms;
 
-    db::otterbrix_engine_ptr otterbrix = init_default_test_otterbrix();
+    isolated_test_engine engine_fixture;
+    auto otterbrix = engine_fixture.engine();
     auto resource = otterbrix->dispatcher()->resource();
     REQUIRE(resource != nullptr);
 
-    auto az_scheduler = make_az_scheduler();
 
     // OtterbrixManager must exist before the CatalogManager: the current
     // CatalogManager ctor takes the OtterbrixManager address (OID-centric
@@ -200,14 +198,13 @@ TEST_CASE("scheduler handles N parallel sessions without hanging") {
     REQUIRE_FALSE(mysql_conn_manager->addConnection(mock_connect_params(), "1").has_error());
     REQUIRE_FALSE(mysql_conn_manager->addConnection(mock_connect_params(), "2").has_error());
 
-    // The current Scheduler ctor takes (resource, az_scheduler, worker_count,
+    // The current Scheduler ctor takes (resource, worker_count,
     // parser_factory, 5 actor addresses + s3 + file); each Worker builds its
     // own parser from the injected factory — tests pass &make_mock_parser. The
     // s3/file managers are empty here because the mock pipeline does not exercise
     // CREATE EXTERNAL TABLE / COPY ... TO statements.
     auto scheduler = actor_zeta::spawn<Scheduler>(
         resource,
-        az_scheduler.get(),
         worker_pool_size(),
         &make_mock_parser,
         no_aliases(),
@@ -230,7 +227,7 @@ TEST_CASE("scheduler handles N parallel sessions without hanging") {
         futs.push_back(actor_zeta::send(scheduler->address(),
                                         &Scheduler::execute,
                                         static_cast<session_hash_t>(i + 1),
-                                        sql)
+                                        sql, execution_context{})
                            .second);
     }
 
@@ -251,7 +248,6 @@ TEST_CASE("scheduler handles N parallel sessions without hanging") {
     WARN("Scheduler N=" << N << " parallel sessions completed in " << duration_ms << " ms");
     REQUIRE(duration_ms < WAIT_TIMEOUT.count());
 
-    az_scheduler->stop();
 }
 
 // Measures wall-clock cost of multiple parallel sessions against a deliberately
@@ -265,11 +261,11 @@ TEST_CASE("slow MySQL connector does not starve other sessions") {
     constexpr size_t SESSIONS = 4;
     constexpr auto WAIT_TIMEOUT = 30000ms;
 
-    db::otterbrix_engine_ptr otterbrix = init_default_test_otterbrix();
+    isolated_test_engine engine_fixture;
+    auto otterbrix = engine_fixture.engine();
     auto resource = otterbrix->dispatcher()->resource();
     REQUIRE(resource != nullptr);
 
-    auto az_scheduler = make_az_scheduler();
 
     auto otterbrix_manager =
         actor_zeta::spawn<db::OtterbrixManager>(resource,
@@ -296,7 +292,6 @@ TEST_CASE("slow MySQL connector does not starve other sessions") {
 
     auto scheduler = actor_zeta::spawn<Scheduler>(
         resource,
-        az_scheduler.get(),
         worker_pool_size(),
         &make_mock_parser,
         no_aliases(),
@@ -315,7 +310,7 @@ TEST_CASE("slow MySQL connector does not starve other sessions") {
         auto fut = actor_zeta::send(scheduler->address(),
                                     &Scheduler::execute,
                                     static_cast<session_hash_t>(1000),
-                                    std::string("SELECT 1"))
+                                    std::string("SELECT 1"), execution_context{})
                        .second;
         auto r = await_session(std::move(fut), WAIT_TIMEOUT, resource);
         REQUIRE_FALSE(r.has_error());
@@ -332,7 +327,7 @@ TEST_CASE("slow MySQL connector does not starve other sessions") {
         futs.push_back(actor_zeta::send(scheduler->address(),
                                         &Scheduler::execute,
                                         static_cast<session_hash_t>(i + 1),
-                                        std::string("SELECT 1"))
+                                        std::string("SELECT 1"), execution_context{})
                            .second);
     }
     std::vector<core::result_wrapper_t<session_payload>> results;
@@ -354,7 +349,6 @@ TEST_CASE("slow MySQL connector does not starve other sessions") {
 
     REQUIRE(parallel_ms < WAIT_TIMEOUT.count());
 
-    az_scheduler->stop();
 }
 
 // The PostgreSQL actor's ENUM cache is written by discovery (the catalog's

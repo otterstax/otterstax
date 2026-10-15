@@ -1,10 +1,23 @@
 # CLAUDE.md
 
+Backend execution serializes fragments sharing a connection alias within each
+batch. Different aliases can execute concurrently. `test_backend_managers.cpp`
+includes a connector that rejects overlapping operations on one connection.
+
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Role
 
-`integration/` contains the actor-based bridge between the `Scheduler`'s `Worker` pool and the raw `ConnectorManager` / Otterbrix engine. Each manager is an `actor_mixin<T>` that translates actor messages into async calls on the underlying connection pool or Otterbrix instance. In the Scheduler→Worker pool architecture, every call into these managers is sent from a `Worker` (the `Scheduler` itself is just a thin router; see `scheduler/CLAUDE.md`).
+`integration/` bridges the `Scheduler`'s Worker pool and the raw connectors or
+Otterbrix engine. Workers send query and schema requests; Scheduler sends
+transaction lifecycle requests.
+
+MySQL and PostgreSQL managers own serial mailbox threads. Blocking driver calls
+run there, without occupying the Scheduler's Worker threads. Each remote
+transaction gets its own manager actor and connector ownership; Scheduler
+retains it until completion. Connection settings and PostgreSQL ENUM metadata
+are copied from the startup manager. Mutable connector state is never shared
+between actors. ClickHouse retains its inline serialized execution model.
 
 ## Managers
 
@@ -46,7 +59,7 @@ Each remote manager is the **sole driver** of its `ConnectorManager`: besides `e
 `discover(qualified_name_t scope)`, the catalog's discovery request (`catalog/discovery.hpp` for the
 reply type and the shared query builders). Empty `scope.collection` → every base table of the
 database/schema (list query, then one probe per table); non-empty → that single table. The connector
-futures are consumed on the actor (`.get()` under its mutex), so nothing outside it touches the
+futures are consumed on the owning actor, so nothing outside it touches the
 connector manager after startup.
 
 The metadata a query later needs is discovered here and kept as actor-confined state, assigned from

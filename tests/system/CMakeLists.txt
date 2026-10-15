@@ -9,7 +9,13 @@ set(${PROJECT_NAME}_SOURCES
     test_engine_join_behavior.cpp
     test_mixed_plan_engine.cpp
     test_file_ingestion.cpp
+    test_file_authorization.cpp
     test_kafka_runtime.cpp
+    test_kafka_offsets.cpp
+    test_kafka_recovery_errors.cpp
+    test_kafka_batch_loop.cpp
+    test_kafka_delivery.cpp
+    test_kafka_destinations.cpp
     test_dml_result_shape.cpp
     test_row_producing_result_shape.cpp
     test_prepared_reexecute.cpp
@@ -31,11 +37,17 @@ set(${PROJECT_NAME}_SOURCES
     test_component_manager_lifecycle.cpp
     test_frontend_shutdown.cpp
     test_frontend_connection_lifetime.cpp
+    test_pg_prepared_lifecycle.cpp
     test_frontend_malformed_packet.cpp
     test_frontend_accept_retry.cpp
     test_spark_plan_execution.cpp
     test_prepare_plan.cpp
     test_constant_aggregates.cpp
+    test_expression_subqueries.cpp
+    test_engine_transactions.cpp
+    test_engine_rollback_checkpoint.cpp
+    test_engine_abort_versions.cpp
+    test_native_sql_session.cpp
 )
 
 add_executable(${PROJECT_NAME} ${${PROJECT_NAME}_SOURCES})
@@ -59,6 +71,7 @@ target_link_libraries(
     actor-zeta::actor-zeta
     otterbrix::otterbrix
     Catch2::Catch2
+    Boost::filesystem
     otterbrix_log
 )
 

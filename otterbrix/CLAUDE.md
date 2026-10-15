@@ -1,5 +1,16 @@
 # CLAUDE.md
 
+`OtterbrixStatement::context` carries the execution session independently of the
+request ID. Execution, plan-only schema validation and relation schema probes
+must use that session; creating a fresh session inside the adapter breaks native
+transaction isolation and rollback.
+
+The engine dependency uses the local recipe in `cmake/conan-recipes/otterbrix`,
+exported before `conan install`. Its pinned revision includes positional INSERT,
+EXISTS schema planning, failed-transaction undo and initial table-checkpoint
+corrections. Keep source patches in that recipe; never modify an installed
+package under its upstream revision.
+
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Role
@@ -32,10 +43,13 @@ name by `(db, rel)` for the write and DDL targets whose plan nodes carry no uid
 (`collect_qualified_names` → `name_registry_t`), and after the transformer names
 each external node: a read leaf by `federated_name(uid, db, rel)`, a write or DDL
 target through the registry. The Spark translator calls the same
-`canonical_table_name`. Only the main plan of the transformer is kept
-(`binder.node_ptr()`): a subquery the transformer lowers into
-`execution_plan_t::sub_queries` never reaches the engine (root `CLAUDE.md`, Known
-Constraints).
+`canonical_table_name`. Finalization retains the transformer's ordered
+expression subqueries and their result-parameter mappings on `OtterbrixStatement`.
+Its `execution_plan()` combines that metadata with the current main root for
+execution and schema planning. Prepared statements retain it after parameter
+binding. Name canonicalization and backend routing inside expression subqueries
+still need implementation; these paths require separate coverage from local
+engine subqueries.
 
 `parser/grammar_extention/` — pluggable parser extensions registered with the
 core parser registry. Two ship by default: `s3/` and `file/`, both adding the

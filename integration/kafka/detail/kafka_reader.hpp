@@ -99,8 +99,19 @@ namespace otterstax::kafka::detail {
                           const std::string& offsets_relname,
                           const std::map<int32_t, int64_t>& offsets);
 
+    // Remove all stored rows for the partitions being replaced. The caller must
+    // insert their new offsets on the same open transaction before committing.
+    actor_zeta::unique_future<components::cursor::cursor_t_ptr>
+    erase_offsets_session(actor_zeta::address_t dispatcher_address,
+                          std::pmr::memory_resource* resource,
+                          components::session::session_id_t session,
+                          const std::string& database,
+                          const std::string& offsets_relname,
+                          const std::map<int32_t, int64_t>& offsets);
+
     // Highest offset per partition from a (partition_id, committed_offset) result
-    std::map<int32_t, int64_t> parse_offsets(const components::cursor::cursor_t_ptr& cursor);
+    core::result_wrapper_t<std::map<int32_t, int64_t>>
+    parse_offsets(const components::cursor::cursor_t_ptr& cursor);
 
     // Parse + run a read-only SQL query (the caller holds only the dispatcher, no parser)
     actor_zeta::unique_future<components::cursor::cursor_t_ptr>

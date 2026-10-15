@@ -48,7 +48,7 @@ class client:
         """Context manager for mysql-connector-python"""
         conn = None
         try:
-            conn = mysql.connector.connect(**self.proxy_config)
+            conn = mysql.connector.connect(autocommit=True, **self.proxy_config)
             yield conn
         finally:
             if conn:
@@ -59,7 +59,7 @@ class client:
         """Context manager for PyMySQL"""
         conn = None
         try:
-            conn = pymysql.connect(**self.proxy_config)
+            conn = pymysql.connect(autocommit=True, **self.proxy_config)
             yield conn
         finally:
             if conn:

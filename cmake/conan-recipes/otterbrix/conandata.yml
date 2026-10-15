@@ -1,0 +1,18 @@
+sources:
+  "1.0.0b2-rc-3":
+    url: "https://github.com/otterbrix/otterbrix/archive/refs/tags/1.0.0b2-rc-3.tar.gz"
+    sha256: "9b50d7bb95d7e8f94ee2cb71d2aa01e76b0bfd0f6e3817eaa168763e874e9844"
+patches:
+  "1.0.0b2-rc-3":
+    - patch_file: "patches/fix-flex-bison-output-dir.patch"
+      patch_description: "Create output directory for flex/bison generated files"
+      patch_type: "bugfix"
+    - patch_file: "patches/production-correctness.patch"
+      patch_description: "Preserve transaction undo, type EXISTS placeholders, bind positional INSERT and initialize durable table roots"
+      patch_type: "bugfix"
+    - patch_file: "patches/checkpoint-abort.patch"
+      patch_description: "Retire aborted non-tail appends without pinning checkpoints or deleting concurrent rows"
+      patch_type: "bugfix"
+    - patch_file: "patches/actor-wait-errors.patch"
+      patch_description: "Keep actor deadline and channel failures distinct from completed engine and storage errors"
+      patch_type: "bugfix"

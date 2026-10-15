@@ -6,7 +6,9 @@
 #include <components/vector/data_chunk.hpp>
 #include <core/result_wrapper.hpp>
 
+#include <memory>
 #include <memory_resource>
+namespace arrow::io { class OutputStream; }
 #include <string>
 
 namespace tsl {
@@ -19,5 +21,12 @@ namespace tsl {
 chunk_to_parquet(std::pmr::memory_resource* res,
                  const std::pmr::vector<components::vector::data_chunk_t>& chunks,
                  const std::string& path);
+
+
+// Writes to an already authorized stream, without reopening a path.
+[[nodiscard]] core::result_wrapper_t<bool>
+chunk_to_parquet(std::pmr::memory_resource* res,
+    const std::pmr::vector<components::vector::data_chunk_t>& chunks,
+    const std::shared_ptr<arrow::io::OutputStream>& output);
 
 } // namespace tsl

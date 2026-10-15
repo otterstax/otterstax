@@ -69,6 +69,7 @@ class MultiChunkFrontendTest:
         # No `database=`: every reference below is fully qualified, and the
         # external-table tests connect the same way (external_helpers.conn_cfg).
         self.mysql_conn = mysql.connector.connect(
+            autocommit=True,
             host=self.host, port=config.MYSQL_PORT,
             user="testuser", password="testpass")
         cur = self.mysql_conn.cursor()

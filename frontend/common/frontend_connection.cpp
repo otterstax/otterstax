@@ -114,9 +114,7 @@ namespace frontend {
         arm_read_timeout("header");
 
         uint32_t header_length = get_header_size();
-        boost::asio::async_read(
-            socket_,
-            boost::asio::buffer(read_buffer_.data(), header_length),
+        read_transport(boost::asio::buffer(read_buffer_.data(), header_length),
             safe_callback([this, header_length](boost::system::error_code ec, std::size_t length) {
                 cancel_read_timeout();
                 if (closed_) {
@@ -150,9 +148,7 @@ namespace frontend {
 
         arm_read_timeout("payload");
 
-        boost::asio::async_read(
-            socket_,
-            boost::asio::buffer(read_buffer_.data(), payload_length),
+        read_transport(boost::asio::buffer(read_buffer_.data(), payload_length),
             safe_callback([this, head = std::move(header), payload_length](boost::system::error_code ec,
                                                                            std::size_t length) {
                 cancel_read_timeout();
@@ -176,11 +172,38 @@ namespace frontend {
             }));
     }
 
+    otterstax::security::token_result frontend_connection::verify_token(std::string_view token) const {
+        if (!authentication_required()) return {otterstax::security::token_status::accepted, {}, {}};
+        if (!encrypted()) return {};
+        return access_->verifier->verify(token);
+    }
+
+    void frontend_connection::start_tls(std::function<void()> ready) {
+        if (!tls_available() || encrypted()) { finish(); return; }
+        tls_ = std::make_unique<boost::asio::ssl::stream<boost::asio::ip::tcp::socket&>>(socket_, *access_->tls);
+        arm_read_timeout("TLS handshake");
+        tls_->async_handshake(boost::asio::ssl::stream_base::server,
+            safe_callback([this, ready = std::move(ready)](boost::system::error_code ec) {
+                cancel_read_timeout();
+                if (closed()) return;
+                if (ec) { finish(); return; }
+                ready();
+            }));
+    }
+
+    void frontend_connection::send_then(std::vector<uint8_t> packet, std::function<void()> ready) {
+        send_buffer_ = std::move(packet);
+        write_transport(boost::asio::buffer(send_buffer_),
+            safe_callback([this, ready = std::move(ready)](boost::system::error_code ec, std::size_t) {
+                if (closed()) return;
+                if (ec) { finish(); return; }
+                ready();
+            }));
+    }
+
     void frontend_connection::send_packet(std::vector<uint8_t> packet, bool continue_reading) {
         send_buffer_ = std::move(packet);
-        boost::asio::async_write(
-            socket_,
-            boost::asio::buffer(send_buffer_),
+        write_transport(boost::asio::buffer(send_buffer_),
             safe_callback([this, continue_reading](boost::system::error_code ec, std::size_t bytes_sent) {
                 if (ec) {
                     if (!closed_) {
@@ -209,8 +232,7 @@ namespace frontend {
                                 std::make_move_iterator(msg.end()));
         }
 
-        boost::asio::async_write(socket_,
-                                 boost::asio::buffer(send_buffer_),
+        write_transport(boost::asio::buffer(send_buffer_),
                                  safe_callback([this](boost::system::error_code ec, std::size_t bytes) {
                                      if (ec) {
                                          if (!closed_) {
@@ -235,8 +257,7 @@ namespace frontend {
         // The packet being written lives in send_buffer_ until the completion
         // runs; `packets` travels inside the handler for the next round.
         send_buffer_ = packets[index];
-        boost::asio::async_write(socket_,
-                                 boost::asio::buffer(send_buffer_),
+        write_transport(boost::asio::buffer(send_buffer_),
                                  safe_callback([this, packets = std::move(packets), index, attempt](
                                                    boost::system::error_code ec,
                                                    std::size_t) mutable {

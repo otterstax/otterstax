@@ -30,7 +30,6 @@
 #include "utility/session.hpp"
 
 #include <actor-zeta.hpp>
-#include <actor-zeta/scheduler/sharing_scheduler.hpp>
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/detached.hpp>
 #include <boost/asio/io_context.hpp>
@@ -60,15 +59,6 @@ namespace otterstax::test {
     // statements to land on the SAME Worker (and therefore the same parser
     // instance) picks `id` and `id + worker_pool_size()`.
     inline std::size_t worker_pool_size() { return std::max<std::size_t>(2, std::thread::hardware_concurrency()); }
-
-    // The worker pool runs on an actor-zeta sharing_scheduler; mirrors the helper
-    // used by test_scheduler.cpp / test_scheduler_concurrent.cpp.
-    inline std::unique_ptr<actor_zeta::scheduler::sharing_scheduler> make_az_scheduler() {
-        auto sched = std::make_unique<actor_zeta::scheduler::sharing_scheduler>(worker_pool_size(),
-                                                                               /*max_throughput*/ 1000);
-        sched->start();
-        return sched;
-    }
 
     inline db::otterbrix_engine_ptr init_test_otterbrix(const std::string& data_dir) {
         auto config = configuration::config::create_config(data_dir);
@@ -105,14 +95,12 @@ namespace otterstax::test {
             : data_dir_(data_dir)
             , otterbrix_(init_fresh_test_otterbrix(data_dir_))
             , resource_(otterbrix_->dispatcher()->resource())
-            , az_scheduler_(make_az_scheduler())
             , otb_mgr_(actor_zeta::spawn<db::OtterbrixManager>(resource_, make_otterbrix_manager(otterbrix_)))
             , catalog_(actor_zeta::spawn<mysql::CatalogManager>(resource_, otb_mgr_->address(), no_aliases()))
             , file_mgr_(actor_zeta::spawn<conn::file::FileManager>(resource_, otb_mgr_->address()))
             , s3_conn_(actor_zeta::spawn<conn::s3::ConnectorManager>(resource_))
             , s3_mgr_(actor_zeta::spawn<db::S3Manager>(resource_, s3_conn_->address(), file_mgr_->address()))
             , scheduler_(actor_zeta::spawn<Scheduler>(resource_,
-                                                      az_scheduler_.get(),
                                                       worker_pool_size(),
                                                       parser_factory,
                                                       no_aliases(),
@@ -134,7 +122,6 @@ namespace otterstax::test {
             file_mgr_.reset();
             catalog_.reset();
             otb_mgr_.reset();
-            az_scheduler_->stop();
             otterbrix_.reset();
             std::filesystem::remove_all(data_dir_);
         }
@@ -145,7 +132,6 @@ namespace otterstax::test {
         std::string data_dir_;
         db::otterbrix_engine_ptr otterbrix_;
         std::pmr::memory_resource* resource_{nullptr};
-        std::unique_ptr<actor_zeta::scheduler::sharing_scheduler> az_scheduler_;
         std::unique_ptr<db::OtterbrixManager, actor_zeta::pmr::deleter_t> otb_mgr_;
         std::unique_ptr<mysql::CatalogManager, actor_zeta::pmr::deleter_t> catalog_;
         std::unique_ptr<conn::file::FileManager, actor_zeta::pmr::deleter_t> file_mgr_;
@@ -175,7 +161,7 @@ namespace otterstax::test {
                               session_hash_t id,
                               const std::string& sql,
                               std::chrono::milliseconds timeout = std::chrono::milliseconds(10000)) {
-        auto [ns, fut] = actor_zeta::send(s.scheduler, &Scheduler::execute, id, sql);
+        auto [ns, fut] = actor_zeta::send(s.scheduler, &Scheduler::execute, id, sql, execution_context{});
         return await_session(std::move(fut), timeout, s.resource);
     }
 
@@ -199,7 +185,7 @@ namespace otterstax::test {
                           session_hash_t id,
                           const std::string& sql,
                           std::chrono::milliseconds timeout = std::chrono::milliseconds(10000)) {
-        auto [ns, fut] = actor_zeta::send(s.scheduler, &Scheduler::prepare_schema, id, sql);
+        auto [ns, fut] = actor_zeta::send(s.scheduler, &Scheduler::prepare_schema, id, sql, execution_context{});
         return await_session(std::move(fut), timeout, s.resource);
     }
 
@@ -207,7 +193,7 @@ namespace otterstax::test {
     execute_scheduler_statement(const scheduler_stack& s,
                                 session_hash_t id,
                                 std::chrono::milliseconds timeout = std::chrono::milliseconds(10000)) {
-        auto [ns, fut] = actor_zeta::send(s.scheduler, &Scheduler::execute_statement, id);
+        auto [ns, fut] = actor_zeta::send(s.scheduler, &Scheduler::execute_statement, id, execution_context{});
         return await_session(std::move(fut), timeout, s.resource);
     }
 
@@ -217,7 +203,7 @@ namespace otterstax::test {
                                std::pmr::vector<components::types::logical_value_t> parameters,
                                std::chrono::milliseconds timeout = std::chrono::milliseconds(10000)) {
         auto [ns, fut] =
-            actor_zeta::send(s.scheduler, &Scheduler::execute_prepared_statement, id, std::move(parameters));
+            actor_zeta::send(s.scheduler, &Scheduler::execute_prepared_statement, id, std::move(parameters), execution_context{});
         return await_session(std::move(fut), timeout, s.resource);
     }
 

@@ -1,0 +1,258 @@
+--- a/components/table/row_version_manager.hpp
++++ b/components/table/row_version_manager.hpp
+@@ -223,6 +223,7 @@
+                                  uint64_t row_group_end);
+         void commit_append(uint64_t commit_id, uint64_t row_group_start, uint64_t count);
+         void revert_append(uint64_t start_row);
++        bool abort_append(uint64_t txn_id, uint64_t start_row, uint64_t count);
+         void cleanup_append(uint64_t lowest_active_transaction, uint64_t row_group_start, uint64_t count);
+ 
+         uint64_t delete_rows(uint64_t vector_idx, uint64_t transaction_id, int64_t rows[], uint64_t count);
+--- a/components/table/row_version_manager.cpp
++++ b/components/table/row_version_manager.cpp
+@@ -539,6 +539,39 @@
+         }
+     }
+ 
++    bool row_version_manager_t::abort_append(uint64_t txn_id, uint64_t start_row, uint64_t count) {
++        if (txn_id < TRANSACTION_ID_START || count > UINT64_MAX - start_row) return false;
++        const auto end = start_row + count;
++        // Validate ownership before changing any stamp. An obsolete undo range
++        // must not erase a row committed or inserted by another transaction.
++        for (auto row = start_row; row < end; ++row) {
++            auto* info = get_chunk_info(row / vector::DEFAULT_VECTOR_CAPACITY);
++            if (!info) return false;
++            const auto inserted = info->type == chunk_info_type::CONSTANT_INFO
++                ? info->cast<chunk_constant_info>().insert_id
++                : info->cast<chunk_vector_info>().inserted[row % vector::DEFAULT_VECTOR_CAPACITY];
++            if (inserted != txn_id) return false;
++        }
++        for (auto row = start_row; row < end;) {
++            auto& info = vector_info(row / vector::DEFAULT_VECTOR_CAPACITY);
++            const auto offset = row % vector::DEFAULT_VECTOR_CAPACITY;
++            const auto length = std::min(end - row, vector::DEFAULT_VECTOR_CAPACITY - offset);
++            // Inserted and deleted at stamp zero is invisible to every snapshot,
++            // including snapshots older than the abort. Unlike a pending txn id,
++            // these tombstones do not hold back the checkpoint watermark.
++            info.same_inserted_id = false;
++            info.insert_id = NOT_DELETED_ID;
++            info.any_deleted = true;
++            for (auto i = offset; i < offset + length; ++i) {
++                info.inserted[i] = 0;
++                info.deleted[i] = 0;
++            }
++            row += length;
++        }
++        has_changes_ = true;
++        return true;
++    }
++
+     void row_version_manager_t::revert_append(uint64_t start_row) {
+         uint64_t start_vector_idx =
+             (start_row + (vector::DEFAULT_VECTOR_CAPACITY - 1)) / vector::DEFAULT_VECTOR_CAPACITY;
+@@ -558,8 +591,10 @@
+             auto new_info = std::make_unique<chunk_vector_info>(
+                 start_ + static_cast<int64_t>(vector_idx * vector::DEFAULT_VECTOR_CAPACITY));
+             new_info->insert_id = constant.insert_id;
++            new_info->any_deleted = constant.delete_id != NOT_DELETED_ID;
+             for (uint64_t i = 0; i < vector::DEFAULT_VECTOR_CAPACITY; i++) {
+                 new_info->inserted[i] = constant.insert_id;
++                new_info->deleted[i] = constant.delete_id;
+             }
+             vector_info_[vector_idx] = std::move(new_info);
+         }
+--- a/components/table/row_group.hpp
++++ b/components/table/row_group.hpp
+@@ -92,6 +92,7 @@
+         void append_version_info(transaction_data txn, uint64_t count);
+ 
+         void commit_append(uint64_t commit_id, uint64_t row_group_start, uint64_t count);
++        bool abort_append(uint64_t txn_id, uint64_t row_group_start, uint64_t count);
+         // The count shrinks even on a column refusal: an untruncated count over a truncated column would over-read.
+         [[nodiscard]] core::result_wrapper_t<bool> revert_append(uint64_t row_group_start);
+ 
+--- a/components/table/row_group.cpp
++++ b/components/table/row_group.cpp
+@@ -604,6 +604,13 @@
+         }
+     }
+ 
++    bool row_group_t::abort_append(uint64_t txn_id, uint64_t row_group_start, uint64_t count) {
++        const auto rows = this->count.load();
++        if (row_group_start > rows || count > rows - row_group_start) return false;
++        auto* vinfo = version_info();
++        return vinfo && vinfo->abort_append(txn_id, row_group_start, count);
++    }
++
+     core::result_wrapper_t<bool> row_group_t::revert_append(uint64_t row_group_start) {
+         auto vinfo = version_info();
+         if (vinfo) {
+--- a/components/table/collection.hpp
++++ b/components/table/collection.hpp
+@@ -91,6 +91,7 @@
+         [[nodiscard]] core::result_wrapper_t<bool> append(vector::data_chunk_t& chunk, table_append_state& state);
+         void finalize_append(table_append_state& state, transaction_data txn);
+         void commit_append(uint64_t commit_id, int64_t row_start, uint64_t count);
++        bool abort_append(uint64_t txn_id, int64_t row_start, uint64_t count);
+         // Best-effort: every row group gets a chance to truncate before the first refusal is reported.
+         core::result_wrapper_t<bool> revert_append(int64_t row_start, uint64_t count);
+         void commit_all_deletes(uint64_t txn_id, uint64_t commit_id);
+--- a/components/table/collection.cpp
++++ b/components/table/collection.cpp
+@@ -331,6 +331,24 @@
+         }
+     }
+ 
++    bool collection_t::abort_append(uint64_t txn_id, int64_t row_start, uint64_t count) {
++        const auto total = total_rows_.load();
++        if (row_start < row_start_ || static_cast<uint64_t>(row_start - row_start_) > total ||
++            count > total - static_cast<uint64_t>(row_start - row_start_)) return false;
++        uint64_t remaining = count;
++        for (auto& rg : row_groups_->segments()) {
++            const auto rows = rg.count.load();
++            const auto rg_end = rg.start + static_cast<int64_t>(rows);
++            if (rg_end <= row_start) continue;
++            if (!remaining) break;
++            const auto local_start = static_cast<uint64_t>(std::max(int64_t{0}, row_start - rg.start));
++            const auto length = std::min(remaining, rows - local_start);
++            if (!rg.abort_append(txn_id, local_start, length)) return false;
++            remaining -= length;
++        }
++        return remaining == 0;
++    }
++
+     void collection_t::commit_all_deletes(uint64_t txn_id, uint64_t commit_id) {
+         for (auto& rg : row_groups_->segments()) {
+             rg.commit_all_deletes(txn_id, commit_id);
+--- a/components/table/data_table.hpp
++++ b/components/table/data_table.hpp
+@@ -90,6 +90,7 @@
+         void finalize_append(table_append_state& state, transaction_data txn);
+         void commit_append(uint64_t commit_id, int64_t row_start, uint64_t count);
+         core::result_wrapper_t<bool> revert_append(int64_t row_start, uint64_t count);
++        core::error_t abort_append(uint64_t txn_id, int64_t row_start, uint64_t count);
+         void commit_all_deletes(uint64_t txn_id, uint64_t commit_id);
+         void revert_all_deletes(uint64_t txn_id);
+ 
+--- a/components/table/data_table.cpp
++++ b/components/table/data_table.cpp
+@@ -427,6 +427,16 @@
+         return reverted;
+     }
+ 
++    core::error_t data_table_t::abort_append(uint64_t txn_id, int64_t row_start, uint64_t count) {
++        const auto aborted = row_groups_->abort_append(txn_id, row_start, count);
++        mark_modified();
++        if (!aborted) {
++            return core::error_t{core::error_code_t::data_corruption,
++                std::pmr::string{"Append rollback range no longer belongs to the transaction", resource_}};
++        }
++        return core::error_t::no_error();
++    }
++
+     void data_table_t::commit_all_deletes(uint64_t txn_id, uint64_t commit_id) {
+         row_groups_->commit_all_deletes(txn_id, commit_id);
+         mark_modified();
+--- a/components/storage/storage.hpp
++++ b/components/storage/storage.hpp
+@@ -128,6 +128,10 @@
+         [[nodiscard]] virtual core::error_t revert_append(int64_t /*row_start*/, uint64_t /*count*/) {
+             return core::error_t::no_error();
+         }
++        [[nodiscard]] virtual core::error_t abort_append(uint64_t /*txn_id*/, int64_t /*row_start*/, uint64_t /*count*/) {
++            return core::error_t{core::error_code_t::unimplemented_yet,
++                std::pmr::string{"Storage does not support non-tail append rollback", resource()}};
++        }
+         virtual void commit_all_deletes(uint64_t /*txn_id*/, uint64_t /*commit_id*/) {}
+         virtual void revert_all_deletes(uint64_t /*txn_id*/) {}
+ 
+--- a/components/storage/table_storage_adapter.hpp
++++ b/components/storage/table_storage_adapter.hpp
+@@ -306,6 +306,10 @@
+             return core::error_t::no_error();
+         }
+ 
++        core::error_t abort_append(uint64_t txn_id, int64_t row_start, uint64_t count) override {
++            return table_.abort_append(txn_id, row_start, count);
++        }
++
+         void commit_all_deletes(uint64_t txn_id, uint64_t commit_id) override {
+             table_.commit_all_deletes(txn_id, commit_id);
+         }
+--- a/services/disk/agent_disk.hpp
++++ b/services/disk/agent_disk.hpp
+@@ -176,7 +176,7 @@
+                                                          std::pmr::vector<components::catalog::oid_t> tables);
+ 
+         unique_future<core::error_t>
+-        storage_revert_appends_inner(std::pmr::vector<components::pg_catalog_append_range_t> ranges, bool tail_only);
++        storage_revert_appends_inner(std::pmr::vector<components::pg_catalog_append_range_t> ranges, bool tail_only, uint64_t txn_id);
+ 
+         // (0, 0) means an EMPTY chunk, not "no storage".
+         unique_future<core::result_wrapper_t<std::pair<int64_t, uint64_t>>>
+--- a/services/disk/agent_disk.cpp
++++ b/services/disk/agent_disk.cpp
+@@ -803,7 +803,7 @@
+ 
+     agent_disk_t::unique_future<core::error_t>
+     agent_disk_t::storage_revert_appends_inner(std::pmr::vector<components::pg_catalog_append_range_t> ranges,
+-                                               bool tail_only) {
++                                               bool tail_only, uint64_t txn_id) {
+         // Reports the FIRST refusal but keeps unwinding: a range that cannot be rolled back must not
+         // strand the ranges after it.
+         auto first_error = core::error_t::no_error();
+@@ -826,16 +826,10 @@
+             if (tail_only) {
+                 const auto frontier = entry->storage->total_rows();
+                 if (it->start_row < 0 || static_cast<uint64_t>(it->start_row) + it->count != frontier) {
+-                    warn(log_,
+-                         "agent_disk[{}]::storage_revert_appends_inner oid={} range [{}, {}) is no longer the "
+-                         "table's tail (it holds {} rows) — the rows stay, and their pending stamps keep "
+-                         "deferring this table's checkpoint rounds until the process restarts; truncating here "
+-                         "would take a concurrent session's rows down with them",
+-                         pool_idx_,
+-                         static_cast<unsigned>(it->table_oid),
+-                         it->start_row,
+-                         static_cast<uint64_t>(it->start_row) + it->count,
+-                         frontier);
++                    // Preserve later rows and their physical ids. Checkpoint
++                    // compaction can reclaim only this transaction's tombstones.
++                    auto aborted = entry->storage->abort_append(txn_id, it->start_row, it->count);
++                    if (aborted.contains_error() && !first_error.contains_error()) first_error = aborted;
+                     continue;
+                 }
+             }
+--- a/services/disk/manager_disk_storage.cpp
++++ b/services/disk/manager_disk_storage.cpp
+@@ -635,7 +635,7 @@
+     }
+ 
+     manager_disk_t::unique_future<core::error_t>
+-    manager_disk_t::storage_revert_appends(execution_context_t /*ctx*/,
++    manager_disk_t::storage_revert_appends(execution_context_t ctx,
+                                            std::vector<components::pg_catalog_append_range_t> ranges,
+                                            bool tail_only) {
+         auto first_error = core::error_t::no_error();
+@@ -661,7 +661,8 @@
+                 auto [needs_sched, fut] = actor_zeta::otterbrix::send(agent->address(),
+                                                                       &agent_disk_t::storage_revert_appends_inner,
+                                                                       std::move(per_agent[i]),
+-                                                                      tail_only);
++                                                                      tail_only,
++                                                                      ctx.txn.transaction_id);
+                 if (needs_sched) {
+                     scheduler_disk_->enqueue(agent.get());
+                 }
+--- a/components/physical_plan/operators/operator_abort_transaction.cpp
++++ b/components/physical_plan/operators/operator_abort_transaction.cpp
+@@ -68,8 +68,8 @@
+         // (row_version_manager: commit_append is the only writer of inserted[]), and since those stamps
+         // live in the txn-id space they sit above any commit-id watermark forever — so
+         // has_versions_above defers this table from every later checkpoint round and the WAL floor
+-        // freezes. tail_only because the removal truncates; a range with a concurrent session's rows
+-        // behind it is left in place and reported.
++        // freezes. Tail ranges are truncated; interleaved ranges become permanently invisible
++        // tombstones, preserving concurrent rows until checkpoint compaction reclaims the gaps.
+         if (txn_data.transaction_id != 0 && !base_appends.empty() &&
+             ctx->disk_address != actor_zeta::address_t::empty_address()) {
+             components::execution_context_t base_ctx{ctx->session, txn_data, {}};

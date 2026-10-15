@@ -8,17 +8,17 @@ Like test_kafka_source_ingestion.py, but the source is declared with
 advance in ONE engine transaction (BEGIN -> insert(data) -> upsert(offsets) ->
 COMMIT), with the ``kafka.<source>__offsets`` table as the source of truth.
 
-This is the happy-path verification: it proves the live transactional loop runs
-end to end against a real broker (redpanda) + engine — the batch lands exactly
-once and the offsets table advances. True crash-recovery exactly-once (no loss /
-no dupe across a mid-batch kill) is Phase 4 and is blocked on the otterbrix
-WAL-recovery-on-restart segfault.
+This exercises several batches against a real broker and engine, checks that
+the offsets table retains one row per partition, and verifies read-committed
+isolation. Process-crash coverage is in test_kafka_crash_recovery.py.
 
 Cases:
   test_transactional_source_ingests_exactly — SELECT returns exactly N rows (no
       duplicates) and the offsets table advances to N (earliest -> next offset).
   test_invalid_transactional_rejected — CREATE SOURCE with TRANSACTIONAL='maybe'
       is rejected as a DDL error (our invalid_parameter, not a crash).
+  test_aborted_records_are_not_ingested — an aborted producer transaction is
+      invisible, while the following committed transaction is ingested.
 """
 
 import sys
@@ -35,7 +35,7 @@ from confluent_kafka.admin import AdminClient, NewTopic
 
 from config import get_host, get_kafka_broker, PG_PORT
 
-NUM_RECORDS = 5
+NUM_RECORDS = 2050
 POLL_TIMEOUT_S = 30
 POLL_INTERVAL_S = 1.0
 
@@ -91,8 +91,8 @@ class ExactlyOnceSourceTest:
 
     def setup(self):
         """Pre-create the topic and produce *before* declaring the source, so
-        OFFSET_RESET='earliest' guarantees the poller reads every record in one
-        batch."""
+        OFFSET_RESET='earliest' guarantees the poller reads every record across
+        several batches."""
         self.create_topic(self.topic)
         self.produce_records(self.topic, self.records)
         self.conn = psycopg.connect(host=self.host, port=PG_PORT, user="testuser",
@@ -157,6 +157,38 @@ class ExactlyOnceSourceTest:
             raise AssertionError(
                 f"Expected offsets table to advance partition 0 to {NUM_RECORDS}, got {offsets}")
         print(f"✅ Offsets table advanced: {offsets}")
+        with self.conn.cursor() as cur:
+            cur.execute(f"SELECT partition_id, committed_offset FROM kafka.{self.source}__offsets;")
+            stored = cur.fetchall()
+        if stored != [(0, NUM_RECORDS)]:
+            raise AssertionError(f"Expected one offset row after several batches, got {stored}")
+
+    def test_aborted_records_are_not_ingested(self):
+        producer = Producer({"bootstrap.servers": self.broker,
+                             "transactional.id": f"aborted_{uuid.uuid4().hex}"})
+        producer.init_transactions(20)
+        producer.begin_transaction()
+        producer.produce(self.topic, value=json.dumps({"id": -1, "name": "aborted"}).encode())
+        if producer.flush(15):
+            raise AssertionError("Aborted transaction's record was not delivered to the broker")
+        producer.abort_transaction(20)
+        producer.begin_transaction()
+        final = {"id": NUM_RECORDS + 1, "name": "committed"}
+        producer.produce(self.topic, value=json.dumps(final).encode())
+        producer.commit_transaction(20)
+        deadline = time.monotonic() + POLL_TIMEOUT_S
+        rows = []
+        while time.monotonic() < deadline:
+            with self.conn.cursor() as cur:
+                cur.execute(f"SELECT id, name FROM kafka.{self.source};")
+                rows = cur.fetchall()
+            if (final["id"], final["name"]) in rows:
+                break
+            time.sleep(POLL_INTERVAL_S)
+        expected = self.expected + [(final["id"], final["name"])]
+        if sorted(rows) != expected:
+            raise AssertionError(f"Committed rows differ: {len(rows)} rows; aborted record visible="
+                                 f"{any(row[0] == -1 for row in rows)}")
 
     def test_invalid_transactional_rejected(self):
         """CREATE SOURCE with a non-boolean TRANSACTIONAL is rejected as a DDL error
@@ -177,8 +209,7 @@ class ExactlyOnceSourceTest:
                 raise AssertionError(f"Rejected, but unexpected error: {e!r}")
             print(f"✅ Invalid TRANSACTIONAL rejected: {str(e).strip().splitlines()[0]}")
         finally:
-            # The reject still left the backing table + registry entry (validation
-            # is post-create — see CLEANUP.md); drop best-effort so reruns are clean.
+            # Best-effort cleanup if a regression allowed the invalid definition.
             try:
                 with self.conn.cursor() as cur:
                     cur.execute(f"DROP SOURCE {bad};")
@@ -189,6 +220,7 @@ class ExactlyOnceSourceTest:
         try:
             self.setup()
             self.test_transactional_source_ingests_exactly()
+            self.test_aborted_records_are_not_ingested()
             self.test_invalid_transactional_rejected()
         finally:
             self.cleanup()

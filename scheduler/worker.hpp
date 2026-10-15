@@ -10,6 +10,8 @@
 #include "scheduler/session_data.hpp"
 #include "otterbrix/schema/schema_utils.hpp"
 #include "utility/session.hpp"
+#include "utility/actor_mailbox.hpp"
+#include "utility/execution_context.hpp"
 
 #include <core/result_wrapper.hpp>
 
@@ -33,8 +35,8 @@ namespace otterstax::external {
     class external_node_t;
 }
 
-// One execution lane of the Scheduler worker pool. A Worker is a cooperative
-// actor driven by the actor-zeta sharing_scheduler; the Scheduler routes every
+// One execution lane of the Scheduler worker pool. Each Worker has a thread
+// that interleaves handlers while they await other actors; the Scheduler routes every
 // session (by session_hash) to a single Worker, so each Worker owns its session
 // metadata exclusively — no shared state, no locks (codex rules 10, 12). Each
 // Worker carries its own parser instance (rule 10: no shared objects between
@@ -50,8 +52,9 @@ namespace otterstax::external {
 // Connect frontend) in place of SQL text and follow execute / prepare_schema
 // from the point where parsing ends. Errors travel as core::error_t; the only try/catch sits
 // directly around IParser::parse.
-class Worker final : public actor_zeta::basic_actor<Worker> {
+class Worker final : public actor_zeta::actor::actor_mixin<Worker> {
 public:
+    using is_cooperative_actor_type = void;
     template<typename T>
     using unique_future = actor_zeta::unique_future<T>;
     using session_result = core::result_wrapper_t<session_payload>;
@@ -67,16 +70,17 @@ public:
            actor_zeta::address_t catalog_manager,
            actor_zeta::address_t s3_manager,
            actor_zeta::address_t file_manager,
-           actor_zeta::address_t kafka_manager);
+           actor_zeta::address_t kafka_manager,
+           actor_zeta::address_t transaction_coordinator);
 
     std::pmr::memory_resource* resource() const noexcept { return resource_; }
 
-    unique_future<session_result> execute(session_hash_t id, std::string sql);
-    unique_future<session_result> execute_statement(session_hash_t id);
+    unique_future<session_result> execute(session_hash_t id, std::string sql, execution_context context);
+    unique_future<session_result> execute_statement(session_hash_t id, execution_context context);
     unique_future<session_result>
     execute_prepared_statement(session_hash_t id,
-                               std::pmr::vector<components::types::logical_value_t> parameters);
-    unique_future<session_result> prepare_schema(session_hash_t id, std::string sql);
+                               std::pmr::vector<components::types::logical_value_t> parameters, execution_context context);
+    unique_future<session_result> prepare_schema(session_hash_t id, std::string sql, execution_context context);
     unique_future<session_result> close_statement(session_hash_t id);
     unique_future<session_result> execute_plan(session_hash_t id, ParsedQueryDataPtr data);
     unique_future<session_result> prepare_plan(session_hash_t id, ParsedQueryDataPtr data);
@@ -88,6 +92,10 @@ public:
                                                         &Worker::close_statement,
                                                         &Worker::execute_plan,
                                                         &Worker::prepare_plan>;
+
+    std::pair<bool, actor_zeta::detail::enqueue_result> enqueue_impl(actor_zeta::mailbox::message_ptr msg) {
+        return mailbox_.enqueue(std::move(msg));
+    }
 
     actor_zeta::behavior_t behavior(actor_zeta::mailbox::message* msg);
 
@@ -112,6 +120,7 @@ private:
     actor_zeta::address_t s3_manager_;   // db::S3Manager (s3 external tables / COPY)
     actor_zeta::address_t file_manager_; // conn::file::FileManager (local external tables / COPY)
     actor_zeta::address_t kafka_manager_;
+    actor_zeta::address_t transaction_coordinator_;
     std::pmr::unordered_map<session_hash_t, metadata_t> metadata_map_;
 
     // The parser boundary: the one place that may throw, converted to error_t
@@ -127,6 +136,8 @@ private:
     // the result schema from the plan and the backends' describe probes,
     // without executing the statement; the entry stays for execute or close.
     unique_future<session_result> describe_parsed(session_hash_t id, ParsedQueryDataPtr parsed_data);
+
+    unique_future<core::error_t> enlist_transaction(ParsedQueryData& data, backend_type_t backend);
 
     // Backend slices first (each inlines its rows as node_raw_data), then the
     // engine; the result is built from the session's stored schema/tag.
@@ -157,4 +168,6 @@ private:
                                        components::cursor::cursor_t_ptr cursor,
                                        ParsedQueryDataPtr data);
     session_result take_payload(session_hash_t id, components::cursor::cursor_t& cursor);
+
+    otterstax::actor_mailbox<Worker, otterstax::actor_execution::interleaved> mailbox_{*this};
 };

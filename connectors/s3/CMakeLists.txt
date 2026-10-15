@@ -15,6 +15,7 @@ add_library(s3
 )
 
 target_link_libraries(s3 PUBLIC
+    client_security
     Threads::Threads
     OpenSSL::Crypto
     OpenSSL::SSL

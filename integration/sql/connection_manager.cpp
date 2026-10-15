@@ -4,6 +4,7 @@
 #include "connection_manager.hpp"
 
 #include "integration/prepare_probe.hpp"
+#include "transaction_policy.hpp"
 #include "otterbrix/query_generation/sql_query_generator.hpp"
 #include "otterbrix/schema/schema_utils.hpp"
 #include "otterbrix/translators/input/chunk_windows.hpp"
@@ -14,6 +15,8 @@
 
 #include <optional>
 #include <thread>
+#include <unordered_map>
+#include <set>
 
 using namespace db;
 
@@ -41,32 +44,26 @@ MySQLManager::MySQLManager(std::pmr::memory_resource* res, mysql::ConnectorManag
     log_->info("MySQLManager initialized successfully");
     // The wrapped connector manager's io pool is started here, once: it is the
     // only place that knows the pool is about to receive queries.
-    connector_manager_->start();
+    if (connector_manager_->status() == thread_pool_status::CREATED) connector_manager_->start();
+}
+
+MySQLManager::MySQLManager(std::pmr::memory_resource* res, std::unique_ptr<mysql::ConnectorManager> connector_manager)
+    : MySQLManager(res, connector_manager.get()) {
+    owned_connector_manager_ = std::move(connector_manager);
 }
 
 std::pair<bool, actor_zeta::detail::enqueue_result> MySQLManager::enqueue_impl(actor_zeta::mailbox::message_ptr msg) {
-    OTX_ZONE_N("MySQLManager::enqueue_impl");
-    std::lock_guard guard(mutex_);
-    current_behavior_ = behavior(msg.get());
-
-    while (current_behavior_.is_busy()) {
-        if (current_behavior_.is_awaited_ready()) {
-            auto cont = current_behavior_.take_awaited_continuation();
-            if (cont) {
-                cont.resume();
-            }
-        } else {
-            std::this_thread::yield();
-        }
-    }
-
-    return {false, actor_zeta::detail::enqueue_result::success};
+    return mailbox_.enqueue(std::move(msg));
 }
 
 actor_zeta::behavior_t MySQLManager::behavior(actor_zeta::mailbox::message* msg) {
     OTX_ZONE_N("MySQLManager::behavior");
     auto cmd = msg->command();
-    if (cmd == actor_zeta::msg_id<MySQLManager, &MySQLManager::execute>) {
+    if (cmd == actor_zeta::msg_id<MySQLManager, &MySQLManager::begin_transaction>) {
+        co_await actor_zeta::dispatch(this, &MySQLManager::begin_transaction, msg);
+    } else if (cmd == actor_zeta::msg_id<MySQLManager, &MySQLManager::finish_transaction>) {
+        co_await actor_zeta::dispatch(this, &MySQLManager::finish_transaction, msg);
+    } else if (cmd == actor_zeta::msg_id<MySQLManager, &MySQLManager::execute>) {
         co_await actor_zeta::dispatch(this, &MySQLManager::execute, msg);
     } else if (cmd == actor_zeta::msg_id<MySQLManager, &MySQLManager::discover>) {
         co_await actor_zeta::dispatch(this, &MySQLManager::discover, msg);
@@ -188,6 +185,8 @@ actor_zeta::unique_future<core::result_wrapper_t<ParsedQueryDataPtr>> MySQLManag
     assert(data->otterbrix_params);
     log_->debug("execute started, id hash: {}", id);
 
+    if (auto error = validate_transaction_tables(*data); error.contains_error()) co_return error;
+
     const auto* parameters = &data->otterbrix_params->params_node->parameters();
 
     log_->debug("execute Total execute queries: {}", data->otterbrix_params->external_nodes_count);
@@ -212,6 +211,7 @@ actor_zeta::unique_future<core::result_wrapper_t<ParsedQueryDataPtr>> MySQLManag
         conversion_errors.reserve(batch_nodes.size());
         // unique_ptr because data_chunk_t has no default constructor.
         otterstax::QueryHandleWaiter<std::unique_ptr<components::vector::data_chunk_t>> wait_guard{resource()};
+        std::pmr::unordered_map<std::string, size_t> pending_connections(resource());
         // Order inside a batch does not matter. For a mixed backend, nodes that
         // belong to another backend are skipped, so the slots this manager filled
         // are tracked by index.
@@ -272,8 +272,16 @@ actor_zeta::unique_future<core::result_wrapper_t<ParsedQueryDataPtr>> MySQLManag
                 }
                 return std::make_unique<data_chunk_t>(std::move(converted.value()));
             };
+            // One driver connection per alias: finish its previous operation
+            // before checking/reusing it. Different aliases may stay in flight.
+            if (auto previous = pending_connections.find(uid); previous != pending_connections.end()) {
+                wait_guard.futures[previous->second].wait();
+            }
+            pending_connections[uid] = wait_guard.futures.size();
             wait_guard.futures.push_back(
-                connector_manager_->executeQuery(uid, generated_queries.back(), data_converter));
+                connector_manager_->executeQuery(uid, generated_queries.back(), data_converter,
+                    data->otterbrix_params->context.in_transaction
+                        ? std::optional{data->otterbrix_params->context.engine_session} : std::nullopt));
         }
 
         if (processed_indices.empty()) {
@@ -351,6 +359,7 @@ MySQLManager::describe(session_hash_t id, ParsedQueryDataPtr data) {
                              core::error_code_t::invalid_parameter,
                              "describe: an extension statement has no MySQL result schema");
     }
+    if (auto error = validate_transaction_tables(*data); error.contains_error()) co_return error;
     // The binder takes every parameter of a parameterized statement out of the
     // plan — the `$n` placeholders and the literals alike — and returns them at
     // finalize, so before Bind there is no statement to generate, hence nothing
@@ -427,7 +436,9 @@ MySQLManager::describe(session_hash_t id, ParsedQueryDataPtr data) {
                 header.emplace(components::types::complex_logical_type::create_struct("", converted.value().types()));
                 return otterstax::asio_error_t{};
             };
-            if (auto err = connector_manager_->executeQuery(uid, probe, header_handler).get(); err.contains_error()) {
+            if (auto err = connector_manager_->executeQuery(uid, probe, header_handler,
+                    data->otterbrix_params->context.in_transaction
+                        ? std::optional{data->otterbrix_params->context.engine_session} : std::nullopt).get(); err.contains_error()) {
                 log_->error("describe: probe failed for UID {}: {}", uid, err.what.c_str());
                 co_return std::move(err);
             }
@@ -446,4 +457,102 @@ MySQLManager::describe(session_hash_t id, ParsedQueryDataPtr data) {
     }
     log_->debug("describe finished");
     co_return std::move(data);
+}
+
+actor_zeta::unique_future<core::result_wrapper_t<MySQLManager::transaction_actor>>
+MySQLManager::begin_transaction(session_id session, std::string alias) {
+    auto manager = connector_manager_->fork_transaction(session, alias);
+    if (manager.has_error()) co_return manager.convert_error<transaction_actor>();
+    auto child = actor_zeta::spawn<MySQLManager>(resource(), std::move(manager.value()));
+    co_return child;
+}
+
+actor_zeta::unique_future<core::error_t> MySQLManager::finish_transaction(session_id session, bool commit) {
+    co_return connector_manager_->finish_transaction(session, commit);
+}
+
+core::error_t MySQLManager::validate_transaction_tables(const ParsedQueryData& data) {
+    const auto& statement = *data.otterbrix_params;
+    if (!statement.context.in_transaction) return core::error_t::no_error();
+    const auto session = statement.context.engine_session;
+    std::set<std::tuple<std::string, std::string, std::string>> tables;
+    for (const auto& batch : statement.external_nodes) {
+        for (const auto& entry : batch) {
+            if ((*entry.node)->type() == logical_plan::node_type::unused &&
+                static_cast<const schema_utils::schema_node_t&>(**entry.node).has_raw_sql()) {
+                return make_error(resource(), core::error_code_t::unimplemented_yet,
+                    "MySQL transaction subqueries require complete table dependency information");
+            }
+            for (const auto* name : {&entry.target.name, &entry.target.from_name}) {
+                if (name->collection.empty()) continue;
+                if (name->unique_identifier.empty() || name->database.empty()) {
+                    return make_error(resource(), core::error_code_t::unimplemented_yet,
+                        "MySQL transactions require fully resolved remote table names");
+                }
+                tables.emplace(name->unique_identifier, name->database, name->collection);
+            }
+        }
+    }
+    for (const auto& [alias, database, table] : tables) {
+        const auto scope = "TABLE_SCHEMA=" + mysql_transaction::text_literal(database) +
+                           " AND TABLE_NAME=" + mysql_transaction::text_literal(table);
+        auto engine_handler = [this](const boost::mysql::results& result) -> otterstax::asio_error_t {
+            if (result.rows().size() != 1 || result.rows()[0].size() != 2 ||
+                !result.rows()[0][0].is_string() || result.rows()[0][0].as_string() != "InnoDB" ||
+                !result.rows()[0][1].is_string() || result.rows()[0][1].as_string() != "BASE TABLE") {
+                return make_error(resource(), core::error_code_t::unimplemented_yet,
+                    "MySQL transactions require InnoDB base tables");
+            }
+            return {};
+        };
+        const auto metadata = "SELECT ENGINE,TABLE_TYPE FROM information_schema.TABLES WHERE " + scope;
+        if (auto error = connector_manager_->executeQuery(alias, metadata, engine_handler, session).get();
+            error.contains_error()) return error;
+        // Acquire a transaction-duration metadata lock without reading rows,
+        // then recheck the engine under that lock before any user DML runs.
+        const auto probe = "SELECT * FROM " + mysql_transaction::identifier(database) + "." +
+                           mysql_transaction::identifier(table) + " LIMIT 0";
+        auto ignore = [](const boost::mysql::results&) { return otterstax::asio_error_t{}; };
+        if (auto error = connector_manager_->executeQuery(alias, probe, ignore, session).get();
+            error.contains_error()) return error;
+        if (auto error = connector_manager_->executeQuery(alias, metadata, engine_handler, session).get();
+            error.contains_error()) return error;
+
+        // Without TRIGGER permission an empty information_schema result would
+        // also mean hidden triggers. Require a direct grant; roles and partial
+        // revokes whose effective scope is unproven are refused.
+        auto grants_handler = [this, &database, &table](const boost::mysql::results& result) -> otterstax::asio_error_t {
+            bool permitted = false;
+            for (const auto& row : result.rows()) {
+                if (row.size() != 1 || !row[0].is_string()) continue;
+                auto value = row[0].as_string();
+                std::string_view grant{value.data(), value.size()};
+                if (grant.starts_with("REVOKE ")) {
+                    return make_error(resource(), core::error_code_t::unimplemented_yet,
+                        "MySQL transaction trigger visibility cannot be verified with partial revokes");
+                }
+                permitted = permitted || mysql_transaction::grants_trigger(grant, database, table);
+            }
+            if (!permitted) {
+                return make_error(resource(), core::error_code_t::unimplemented_yet,
+                    "MySQL transactions require a direct TRIGGER grant to verify table dependencies");
+            }
+            return {};
+        };
+        if (auto error = connector_manager_->executeQuery(alias, "SHOW GRANTS FOR CURRENT_USER", grants_handler, session).get();
+            error.contains_error()) return error;
+        const auto triggers = "SELECT TRIGGER_NAME FROM information_schema.TRIGGERS WHERE EVENT_OBJECT_SCHEMA=" +
+            mysql_transaction::text_literal(database) + " AND EVENT_OBJECT_TABLE=" +
+            mysql_transaction::text_literal(table) + " LIMIT 1";
+        auto trigger_handler = [this](const boost::mysql::results& result) -> otterstax::asio_error_t {
+            if (!result.rows().empty()) {
+                return make_error(resource(), core::error_code_t::unimplemented_yet,
+                    "MySQL transactions cannot verify the storage dependencies of table triggers");
+            }
+            return {};
+        };
+        if (auto error = connector_manager_->executeQuery(alias, triggers, trigger_handler, session).get();
+            error.contains_error()) return error;
+    }
+    return core::error_t::no_error();
 }

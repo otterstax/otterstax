@@ -63,7 +63,7 @@ namespace otterstax::kafka {
         }
 
         // Stored per-partition offsets for table-seek resume; empty -> broker-group resume
-        std::map<int32_t, int64_t> read_committed_offsets(actor_zeta::address_t dispatcher_address,
+        core::result_wrapper_t<std::map<int32_t, int64_t>> read_committed_offsets(actor_zeta::address_t dispatcher_address,
                                                           std::pmr::memory_resource* resource,
                                                           const std::string& database,
                                                           const std::string& offsets_table) {
@@ -137,40 +137,68 @@ namespace otterstax::kafka {
                                      name);
     }
 
-    void KafkaManager::recover() {
+    core::error_t KafkaManager::recover() {
         OTX_ZONE_N("KafkaManager::recover");
         if (!start_pollers_) {
-            return; // broker-free unit tests don't run pollers, nothing to relaunch
+            return core::error_t::no_error();
         }
-        // No __sources table (first start / none created) → error cursor → nothing to do
+        auto failure = [&](core::error_code_t code, const std::string& what) {
+            return core::error_t(code, std::pmr::string{"kafka recovery: " + what, resource_});
+        };
+        // Only an absent registry is a first start. Preserve other engine errors.
         const std::string kafka_db{KAFKA_DATABASE_NAME};
         auto cursor = drive(
             kafka_query(dispatcher_address_,
                         resource_,
                         "SELECT name, kind, topic, bootstrap, group_id, offset_reset, transactional, as_select FROM " +
                             kafka_db + ".__sources;"));
-        if (!cursor || cursor->is_error()) {
-            return;
+        if (!cursor) {
+            return failure(core::error_code_t::other_error, "no reply when reading __sources");
+        }
+        if (cursor->is_error()) {
+            const auto code = cursor->get_error().type;
+            if (code == core::error_code_t::table_not_exists || code == core::error_code_t::database_not_exists) {
+                return core::error_t::no_error();
+            }
+            return failure(code, cursor->get_error().what.c_str());
         }
         sources_table_ensured_ = true;
 
-        // Snapshot every persisted object, then recover in TWO passes — sources
+        // Snapshot every persisted object, then recover in three passes — sources
         // first (a stream needs its source already in registry_ to relaunch)
         struct meta_t {
             std::string name, kind, topic, bootstrap, group_id, offset_reset, as_select;
             bool transactional;
         };
         std::vector<meta_t> metas;
+        std::unordered_map<std::string, bool> names;
         // The result is a batch of <=1024-row chunks: every chunk is read (a
         // registry past the first chunk is not lost), each through its own row
         // space rather than a per-cell chunk scan
         for (const auto& chunk : cursor->chunks()) {
+            const auto column_types = chunk.types();
+            if (column_types.size() != 8 ||
+                std::any_of(column_types.begin(), column_types.end(), [](const auto& column) {
+                    return column.type() != types::logical_type::STRING_LITERAL;
+                })) {
+                return failure(core::error_code_t::data_corruption, "__sources must contain eight text columns");
+            }
             for (std::uint64_t row = 0; row < chunk.size(); ++row) {
+                for (std::size_t col = 0; col < column_types.size(); ++col) {
+                    if (chunk.data[col].is_null(row)) {
+                        return failure(core::error_code_t::data_corruption, "NULL field in __sources");
+                    }
+                }
                 auto text = [&](std::uint64_t col) {
                     return std::string{chunk.value(col, row).value<std::string_view>()};
                 };
-                metas.push_back(
-                    meta_t{text(0), text(1), text(2), text(3), text(4), text(5), text(7), text(6) == "true"});
+                auto meta = meta_t{text(0), text(1), text(2), text(3), text(4), text(5), text(7), text(6) == "true"};
+                if (meta.name.empty() || !names.emplace(meta.name, true).second ||
+                    (meta.kind != "source" && meta.kind != "stream" && meta.kind != "insert") ||
+                    (text(6) != "true" && text(6) != "false")) {
+                    return failure(core::error_code_t::data_corruption, "invalid or duplicate object in __sources");
+                }
+                metas.push_back(std::move(meta));
             }
         }
 
@@ -187,12 +215,8 @@ namespace otterstax::kafka {
         };
 
         // Pass 1 — SOURCEs. Columns aren't persisted: re-read from the backing
-        // table through the engine-side schema probe, whose answer comes off the
-        // validated plan rather than row data, so an empty table has the same
-        // schema as a populated one. The probe nodes are read only after the
-        // engine's reply future is ready: the engine stamps them during validation
-        // and never touches them after replying, so the read is sequenced after
-        // the last write
+        // table through the engine's schema reply. An empty table has the same
+        // schema as a populated one.
         for (const auto& m : metas) {
             if (m.kind != "source") {
                 continue;
@@ -207,39 +231,32 @@ namespace otterstax::kafka {
                 if (code == core::error_code_t::table_not_exists || code == core::error_code_t::database_not_exists) {
                     log_->warn("kafka: recover source '{}': backing table is gone, skipping", m.name);
                 } else {
-                    log_->error("kafka: recover source '{}': schema probe failed (code {}): {}; skipping",
-                                m.name,
-                                static_cast<int32_t>(code),
-                                read.error().what.c_str());
+                    return failure(code, "source '" + m.name + "': " + read.error().what.c_str());
                 }
                 continue;
             }
             auto identity = probe_relation_kind(dispatcher_address_, resource_, kafka_db, m.name);
             if (identity.has_error()) {
-                log_->error("kafka: recover source '{}': pg_catalog probe failed (code {}): {}; skipping",
-                            m.name,
-                            static_cast<int32_t>(identity.error().type),
-                            identity.error().what.c_str());
-                continue;
+                return failure(identity.error().type, "source '" + m.name + "': " + identity.error().what.c_str());
             }
             if (identity.value().relkind == catalog::relkind::view ||
                 identity.value().relkind == catalog::relkind::materialized_view) {
                 // A SOURCE is backed by a base table the poller inserts into; a VIEW
                 // under its name cannot be ingested into
-                log_->error("kafka: recover source '{}': backing relation is a VIEW, not a table; skipping", m.name);
-                continue;
+                return failure(core::error_code_t::schema_error, "source '" + m.name + "' is backed by a VIEW");
             }
             std::vector<kafka_column_t> columns;
             for (const auto& col : read.value().columns) {
                 columns.push_back(kafka_column_t{col.has_alias() ? std::string{col.alias()} : std::string{}, col});
             }
             if (columns.empty()) {
-                log_->error("kafka: recover source '{}': backing table has no columns, skipping", m.name);
-                continue;
+                return failure(core::error_code_t::schema_error, "source '" + m.name + "' has no columns");
             }
             registry_[m.name] =
                 kafka_object_t{kafka_op::create_source, std::move(columns), make_options(m), std::string{}};
-            launch_source_poller(m.name, m.transactional);
+            if (auto started = launch_source_poller(m.name, m.transactional); started.contains_error()) {
+                return started;
+            }
             log_->info("kafka: recovered source '{}' (transactional={})", m.name, m.transactional);
         }
 
@@ -250,25 +267,24 @@ namespace otterstax::kafka {
             }
             auto plan = kafka_parse_plan(resource_, m.as_select);
             if (plan.has_error()) {
-                log_->warn("kafka: recover stream '{}': {}, skipping", m.name, plan.error().what.c_str());
-                continue;
+                return failure(plan.error().type, "stream '" + m.name + "': " + plan.error().what.c_str());
             }
             const auto* agg =
                 plan.value().sub_queries.empty() ? nullptr : kafka_find_aggregate(plan.value().sub_queries.back());
             if (!agg) {
-                log_->warn("kafka: recover stream '{}': SELECT has no aggregate/source, skipping", m.name);
-                continue;
+                return failure(core::error_code_t::schema_error, "stream '" + m.name + "' SELECT has no source");
             }
             const auto src_it = registry_.find(agg->relname().t);
             if (src_it == registry_.end()) {
-                log_->warn("kafka: recover stream '{}': unknown source '{}', skipping", m.name, agg->relname().t);
-                continue;
+                return failure(core::error_code_t::schema_error, "stream '" + m.name + "' has an unknown source");
             }
             auto stream_columns =
                 stream_output_schema(resource_, *agg, plan.value().parameters.get(), src_it->second.columns);
             registry_[m.name] =
                 kafka_object_t{kafka_op::create_stream, std::move(stream_columns), make_options(m), m.as_select};
-            launch_stream(m.name);
+            if (auto started = launch_stream(m.name); started.contains_error()) {
+                return started;
+            }
             log_->info("kafka: recovered stream '{}' (transactional={})", m.name, m.transactional);
         }
 
@@ -280,73 +296,77 @@ namespace otterstax::kafka {
             }
             auto plan = kafka_parse_plan(resource_, m.as_select);
             if (plan.has_error()) {
-                log_->warn("kafka: recover insert-query '{}': {}, skipping", m.name, plan.error().what.c_str());
-                continue;
+                return failure(plan.error().type, "insert-query '" + m.name + "': " + plan.error().what.c_str());
             }
             if (plan.value().sub_queries.empty()) {
-                log_->warn("kafka: recover insert-query '{}': compiled to an empty plan, skipping", m.name);
-                continue;
+                return failure(core::error_code_t::schema_error, "insert-query '" + m.name + "' has an empty plan");
             }
             auto write = kafka_write_target(plan.value().sub_queries.back());
             if (!write) {
-                log_->warn("kafka: recover insert-query '{}': no kafka target, skipping", m.name);
-                continue;
+                return failure(core::error_code_t::schema_error, "insert-query '" + m.name + "' has no Kafka target");
             }
             const std::string sink = write->relname;
             const auto* agg = kafka_find_aggregate(plan.value().sub_queries.back());
             if (!agg) {
-                log_->warn("kafka: recover insert-query '{}': no source table, skipping", m.name);
-                continue;
+                return failure(core::error_code_t::schema_error, "insert-query '" + m.name + "' has no source");
             }
             const auto src_it = registry_.find(agg->relname().t);
             if (src_it == registry_.end()) {
-                log_->warn("kafka: recover insert-query '{}': unknown source '{}', skipping", m.name, agg->relname().t);
-                continue;
+                return failure(core::error_code_t::schema_error, "insert-query '" + m.name + "' has an unknown source");
             }
             auto out_columns =
                 stream_output_schema(resource_, *agg, plan.value().parameters.get(), src_it->second.columns);
             registry_[m.name] =
                 kafka_object_t{kafka_op::create_stream, std::move(out_columns), make_options(m), m.as_select};
             stream_insert_queries_[sink].push_back(m.name);
-            launch_stream(m.name);
+            if (auto started = launch_stream(m.name); started.contains_error()) {
+                return started;
+            }
             log_->info("kafka: recovered INSERT INTO query '{}' into stream '{}' (transactional={})",
                        m.name,
                        sink,
                        m.transactional);
         }
+        return core::error_t::no_error();
     }
 
-    void KafkaManager::launch_source_poller(const std::string& name, bool transactional) {
+    core::error_t KafkaManager::launch_source_poller(const std::string& name, bool transactional) {
         OTX_ZONE_N("KafkaManager::launch_source_poller");
         if (!start_pollers_) {
-            return;
+            return core::error_t::no_error();
         }
+        auto failure = [&](core::error_code_t code, const std::string& what) {
+            return core::error_t(code, std::pmr::string{"kafka source '" + name + "': " + what, resource_});
+        };
         auto it = registry_.find(name);
         if (it == registry_.end()) {
-            return;
+            return failure(core::error_code_t::invalid_parameter, "source is not registered");
         }
         const auto& opts = it->second.options;
         const auto topic = opts.find("kafka_topic");
         const auto bootstrap = opts.find("bootstrap_servers");
         if (topic == opts.end() || bootstrap == opts.end()) {
-            log_->warn("kafka: source '{}' has no KAFKA_TOPIC/BOOTSTRAP_SERVERS — no poller", name);
-            return;
+            return failure(core::error_code_t::invalid_parameter, "missing KAFKA_TOPIC/BOOTSTRAP_SERVERS");
         }
         const auto gid = opts.find("group_id");
         const auto ores = opts.find("offset_reset");
+        std::map<int32_t, int64_t> committed_offsets;
+        if (transactional) {
+            auto stored = read_committed_offsets(dispatcher_address_, resource_,
+                                                  std::string{KAFKA_DATABASE_NAME}, name + "__offsets");
+            if (stored.has_error()) {
+                return failure(stored.error().type, "reading committed offsets failed: " + std::string{stored.error().what});
+            }
+            committed_offsets = std::move(stored.value());
+        }
         consumer_config_t cfg{bootstrap->second,
                               topic->second,
                               gid != opts.end() ? gid->second : ("otterstax_" + name),
                               ores != opts.end() ? ores->second : "earliest",
-                              transactional ? read_committed_offsets(dispatcher_address_,
-                                                                     resource_,
-                                                                     std::string{KAFKA_DATABASE_NAME},
-                                                                     name + "__offsets")
-                                            : std::map<int32_t, int64_t>{}};
+                              std::move(committed_offsets), destinations_};
         auto consumer = kafka_consumer_t::create(std::move(cfg));
         if (consumer.has_error()) {
-            log_->error("kafka: poller consumer for '{}' failed: {}", name, consumer.error().what.c_str());
-            return;
+            return failure(consumer.error().type, consumer.error().what.c_str());
         }
         pollers_[name] = std::make_unique<kafka_poller_t>(dispatcher_address_,
                                                           resource_,
@@ -356,20 +376,22 @@ namespace otterstax::kafka {
                                                           std::move(consumer.value()),
                                                           transactional);
         log_->info("kafka: started poller for source '{}' (topic '{}')", name, topic->second);
+        return core::error_t::no_error();
     }
 
-    void KafkaManager::launch_stream(const std::string& name) {
+    core::error_t KafkaManager::launch_stream(const std::string& name) {
         OTX_ZONE_N("KafkaManager::launch_stream");
         if (!start_pollers_) {
-            return;
-        }
-        auto it = registry_.find(name);
-        if (it == registry_.end()) {
-            return;
+            return core::error_t::no_error();
         }
         auto start_failed = [&](const std::string& why) {
-            log_->error("kafka: stream start failed for '{}': {}", name, why);
+            return core::error_t(core::error_code_t::io_error,
+                                 std::pmr::string{"kafka stream '" + name + "': " + why, resource_});
         };
+        auto it = registry_.find(name);
+        if (it == registry_.end()) {
+            return start_failed("stream is not registered");
+        }
         // Compile the captured SELECT once; extract the source table + operators
         auto plan = kafka_parse_plan(resource_, it->second.as_select);
         if (plan.has_error()) {
@@ -417,11 +439,11 @@ namespace otterstax::kafka {
         }
 
         auto consumer =
-            kafka_consumer_t::create({src_bootstrap->second, src_topic->second, group_id, offset_reset, {}});
+            kafka_consumer_t::create({src_bootstrap->second, src_topic->second, group_id, offset_reset, {}, destinations_});
         if (consumer.has_error()) {
             return start_failed(std::string{"consumer failed: "} + consumer.error().what.c_str());
         }
-        auto producer = kafka_producer_t::create({out_bootstrap->second, out_topic->second, transactional_id});
+        auto producer = kafka_producer_t::create({out_bootstrap->second, out_topic->second, transactional_id, destinations_});
         if (producer.has_error()) {
             return start_failed(std::string{"producer failed: "} + producer.error().what.c_str());
         }
@@ -434,5 +456,6 @@ namespace otterstax::kafka {
                                                           std::move(consumer.value()),
                                                           std::move(producer.value()));
         log_->info("kafka: started stream '{}' ({} -> {})", name, src_topic->second, out_topic->second);
+        return core::error_t::no_error();
     }
 } // namespace otterstax::kafka

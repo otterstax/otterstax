@@ -16,6 +16,7 @@
 #include <optional>
 #include <string_view>
 #include <thread>
+#include <unordered_map>
 
 using namespace db;
 
@@ -43,33 +44,26 @@ PostgressManager::PostgressManager(std::pmr::memory_resource* res, pg::Connector
     assert(connector_manager_ != nullptr);
     // The wrapped connector manager's io pool is started here, once: it is the
     // only place that knows the pool is about to receive queries.
-    connector_manager_->start();
+    if (connector_manager_->status() == thread_pool_status::CREATED) connector_manager_->start();
 }
 
-std::pair<bool, actor_zeta::detail::enqueue_result>
-PostgressManager::enqueue_impl(actor_zeta::mailbox::message_ptr msg) {
-    OTX_ZONE_N("PostgressManager::enqueue_impl");
-    std::lock_guard guard(mutex_);
-    current_behavior_ = behavior(msg.get());
+PostgressManager::PostgressManager(std::pmr::memory_resource* res, std::unique_ptr<pg::ConnectorManager> connector_manager)
+    : PostgressManager(res, connector_manager.get()) {
+    owned_connector_manager_ = std::move(connector_manager);
+}
 
-    while (current_behavior_.is_busy()) {
-        if (current_behavior_.is_awaited_ready()) {
-            auto cont = current_behavior_.take_awaited_continuation();
-            if (cont) {
-                cont.resume();
-            }
-        } else {
-            std::this_thread::yield();
-        }
-    }
-
-    return {false, actor_zeta::detail::enqueue_result::success};
+std::pair<bool, actor_zeta::detail::enqueue_result> PostgressManager::enqueue_impl(actor_zeta::mailbox::message_ptr msg) {
+    return mailbox_.enqueue(std::move(msg));
 }
 
 actor_zeta::behavior_t PostgressManager::behavior(actor_zeta::mailbox::message* msg) {
     OTX_ZONE_N("PostgressManager::behavior");
     auto cmd = msg->command();
-    if (cmd == actor_zeta::msg_id<PostgressManager, &PostgressManager::execute>) {
+    if (cmd == actor_zeta::msg_id<PostgressManager, &PostgressManager::begin_transaction>) {
+        co_await actor_zeta::dispatch(this, &PostgressManager::begin_transaction, msg);
+    } else if (cmd == actor_zeta::msg_id<PostgressManager, &PostgressManager::finish_transaction>) {
+        co_await actor_zeta::dispatch(this, &PostgressManager::finish_transaction, msg);
+    } else if (cmd == actor_zeta::msg_id<PostgressManager, &PostgressManager::execute>) {
         co_await actor_zeta::dispatch(this, &PostgressManager::execute, msg);
     } else if (cmd == actor_zeta::msg_id<PostgressManager, &PostgressManager::discover>) {
         co_await actor_zeta::dispatch(this, &PostgressManager::discover, msg);
@@ -275,6 +269,7 @@ PostgressManager::execute(session_hash_t id, ParsedQueryDataPtr data) {
         conversion_errors.reserve(batch_nodes.size());
         // unique_ptr because data_chunk_t has no default constructor.
         otterstax::QueryHandleWaiter<std::unique_ptr<components::vector::data_chunk_t>> wait_guard{resource()};
+        std::pmr::unordered_map<std::string, size_t> pending_connections(resource());
         // Order inside a batch does not matter. For a mixed backend, nodes that
         // belong to another backend are skipped, so the slots this manager filled
         // are tracked by index.
@@ -348,8 +343,15 @@ PostgressManager::execute(session_hash_t id, ParsedQueryDataPtr data) {
                 }
                 return std::make_unique<data_chunk_t>(std::move(converted.value()));
             };
+            // A libpq connection cannot execute overlapping statements.
+            if (auto previous = pending_connections.find(uid); previous != pending_connections.end()) {
+                wait_guard.futures[previous->second].wait();
+            }
+            pending_connections[uid] = wait_guard.futures.size();
             wait_guard.futures.push_back(
-                connector_manager_->executeQuery(uid, generated_queries.back(), data_converter));
+                connector_manager_->executeQuery(uid, generated_queries.back(), data_converter,
+                    data->otterbrix_params->context.in_transaction
+                        ? std::optional{data->otterbrix_params->context.engine_session} : std::nullopt));
         }
 
         if (processed_indices.empty()) {
@@ -510,7 +512,9 @@ PostgressManager::describe(session_hash_t id, ParsedQueryDataPtr data) {
                 header.emplace(tsl::pg_to_struct(this->resource(), result, enum_oids));
                 return otterstax::asio_error_t{};
             };
-            if (auto err = connector_manager_->executeQuery(uid, probe, header_handler).get(); err.contains_error()) {
+            if (auto err = connector_manager_->executeQuery(uid, probe, header_handler,
+                    data->otterbrix_params->context.in_transaction
+                        ? std::optional{data->otterbrix_params->context.engine_session} : std::nullopt).get(); err.contains_error()) {
                 log_->error("describe: probe failed for UID {}: {}", uid, err.what.c_str());
                 co_return std::move(err);
             }
@@ -529,4 +533,17 @@ PostgressManager::describe(session_hash_t id, ParsedQueryDataPtr data) {
     }
     log_->debug("describe finished");
     co_return std::move(data);
+}
+
+actor_zeta::unique_future<core::result_wrapper_t<PostgressManager::transaction_actor>>
+PostgressManager::begin_transaction(session_id session, std::string alias) {
+    auto manager = connector_manager_->fork_transaction(session, alias);
+    if (manager.has_error()) co_return manager.convert_error<transaction_actor>();
+    auto child = actor_zeta::spawn<PostgressManager>(resource(), std::move(manager.value()));
+    child->enums_ = enums_;
+    co_return child;
+}
+
+actor_zeta::unique_future<core::error_t> PostgressManager::finish_transaction(session_id session, bool commit) {
+    co_return connector_manager_->finish_transaction(session, commit);
 }

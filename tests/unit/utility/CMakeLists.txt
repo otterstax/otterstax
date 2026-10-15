@@ -2,14 +2,19 @@ project(test_utils)
 
 set(${PROJECT_NAME}_SOURCES
     main.cpp
+    test_actor_mailbox.cpp
     test_asio_future_bridge.cpp
     test_ch_connector.cpp
     test_ch_statement.cpp
     test_connector_errors.cpp
     test_connector_manager.cpp
+    test_remote_transaction_connections.cpp
+    test_mysql_transaction_policy.cpp
+    test_data_directory_lock.cpp
     test_mysql_connector.cpp
     test_parse_port.cpp
     test_session.cpp
+    test_request_identity.cpp
     test_wait_barrier.cpp
 )
 
@@ -32,6 +37,7 @@ target_link_libraries(
     # test_asio_future_bridge.cpp runs one directly, so Boost.Asio is a real
     # dependency of this binary, not just a transitive include.
     Boost::boost
+    Boost::filesystem
     Catch2::Catch2
     otterbrix_log
 )

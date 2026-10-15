@@ -14,7 +14,6 @@
 #include "utility/session.hpp"
 
 #include <actor-zeta.hpp>
-#include <actor-zeta/scheduler/sharing_scheduler.hpp>
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/detached.hpp>
 #include <boost/asio/io_context.hpp>
@@ -129,7 +128,7 @@ TEST_CASE("FileManager: parquet ingestion and SELECT") {
     params.format   = "parquet";
 
     auto res = actor_zeta::send(file_manager->address(),
-                                &conn::file::FileManager::add_file, session_id().hash(),
+                                &conn::file::FileManager::add_file, next_request_id(),
                                 std::move(params))
                    .second.take_ready();
     REQUIRE_FALSE(res.has_error());
@@ -178,7 +177,7 @@ TEST_CASE("FileManager: csv ingestion and SELECT") {
     params.format   = "csv";
 
     auto res = actor_zeta::send(file_manager->address(),
-                                &conn::file::FileManager::add_file, session_id().hash(),
+                                &conn::file::FileManager::add_file, next_request_id(),
                                 std::move(params))
                    .second.take_ready();
     REQUIRE_FALSE(res.has_error());
@@ -225,7 +224,7 @@ TEST_CASE("FileManager: ndjson ingestion and SELECT") {
     params.format   = "ndjson";
 
     auto res = actor_zeta::send(file_manager->address(),
-                                &conn::file::FileManager::add_file, session_id().hash(),
+                                &conn::file::FileManager::add_file, next_request_id(),
                                 std::move(params))
                    .second.take_ready();
     REQUIRE_FALSE(res.has_error());
@@ -279,7 +278,7 @@ TEST_CASE("FileManager: parquet dump and re-read") {
     params.format   = "parquet";
 
     auto add_res = actor_zeta::send(file_manager->address(),
-                                    &conn::file::FileManager::add_file, session_id().hash(),
+                                    &conn::file::FileManager::add_file, next_request_id(),
                                     std::move(params))
                        .second.take_ready();
     REQUIRE_FALSE(add_res.has_error());
@@ -287,7 +286,7 @@ TEST_CASE("FileManager: parquet dump and re-read") {
 
     // Non-temporary dump: written to the exact path requested.
     auto dump_res = actor_zeta::send(file_manager->address(),
-                                     &conn::file::FileManager::dump_file, session_id().hash(),
+                                     &conn::file::FileManager::dump_file, next_request_id(),
                                      conn::file::FileMetadata{select_all(resource, db, tbl), out,
                                                                   conn::file::FileFormat::Parquet,
                                                                   /*is_temporary=*/false})
@@ -310,7 +309,7 @@ TEST_CASE("FileManager: parquet dump and re-read") {
     // Temporary dump: timestamp-prefixed basename in the same directory, so it
     // never matches the requested path but keeps the original filename.
     auto tmp_res = actor_zeta::send(file_manager->address(),
-                                    &conn::file::FileManager::dump_file, session_id().hash(),
+                                    &conn::file::FileManager::dump_file, next_request_id(),
                                     conn::file::FileMetadata{select_all(resource, db, tbl), out,
                                                                  conn::file::FileFormat::Parquet,
                                                                  /*is_temporary=*/true})
@@ -361,14 +360,14 @@ TEST_CASE("FileManager: csv dump and re-read") {
     params.format   = "csv";
 
     auto add_res = actor_zeta::send(file_manager->address(),
-                                    &conn::file::FileManager::add_file, session_id().hash(),
+                                    &conn::file::FileManager::add_file, next_request_id(),
                                     std::move(params))
                        .second.take_ready();
     REQUIRE_FALSE(add_res.has_error());
     REQUIRE(add_res.value() == true);
 
     auto dump_res = actor_zeta::send(file_manager->address(),
-                                     &conn::file::FileManager::dump_file, session_id().hash(),
+                                     &conn::file::FileManager::dump_file, next_request_id(),
                                      conn::file::FileMetadata{select_all(resource, db, tbl), out,
                                                                   conn::file::FileFormat::CSV,
                                                                   /*is_temporary=*/false})
@@ -424,14 +423,14 @@ TEST_CASE("FileManager: ndjson dump and re-read") {
     params.format   = "ndjson";
 
     auto add_res = actor_zeta::send(file_manager->address(),
-                                    &conn::file::FileManager::add_file, session_id().hash(),
+                                    &conn::file::FileManager::add_file, next_request_id(),
                                     std::move(params))
                        .second.take_ready();
     REQUIRE_FALSE(add_res.has_error());
     REQUIRE(add_res.value() == true);
 
     auto dump_res = actor_zeta::send(file_manager->address(),
-                                     &conn::file::FileManager::dump_file, session_id().hash(),
+                                     &conn::file::FileManager::dump_file, next_request_id(),
                                      conn::file::FileMetadata{select_all(resource, db, tbl), out,
                                                                   conn::file::FileFormat::NDJSON,
                                                                   /*is_temporary=*/false})
@@ -558,13 +557,13 @@ TEST_CASE("Scheduler: external statement via prepare_schema + execute_statement 
             "CREATE EXTERNAL TABLE " + db + "." + tbl + " WITH (location = '" + src + "', format = 'parquet')";
 
         // GetFlightInfo phase — returns an (empty) schema and stores the metadata.
-        auto [ns1, fut1] = actor_zeta::send(s.scheduler, &Scheduler::prepare_schema, id, sql);
+        auto [ns1, fut1] = actor_zeta::send(s.scheduler, &Scheduler::prepare_schema, id, sql, execution_context{});
         auto r1 = await_session(std::move(fut1), 10000ms, s.resource);
         INFO("prepare_schema error: " << (r1.has_error() ? r1.error().what.c_str() : ""));
         REQUIRE_FALSE(r1.has_error());
 
         // DoGet phase — reuses the stored statement and performs the load.
-        auto [ns2, fut2] = actor_zeta::send(s.scheduler, &Scheduler::execute_statement, id);
+        auto [ns2, fut2] = actor_zeta::send(s.scheduler, &Scheduler::execute_statement, id, execution_context{});
         auto r2 = await_session(std::move(fut2), 10000ms, s.resource);
         INFO("execute_statement error: " << (r2.has_error() ? r2.error().what.c_str() : ""));
         REQUIRE_FALSE(r2.has_error());
@@ -635,7 +634,7 @@ void require_wide_file_ingested(conn::file::FileAddParams params, const std::str
         actor_zeta::spawn<conn::file::FileManager>(resource, otterbrix_manager->address());
 
     auto res = actor_zeta::send(file_manager->address(),
-                                &conn::file::FileManager::add_file, session_id().hash(),
+                                &conn::file::FileManager::add_file, next_request_id(),
                                 std::move(params))
                    .second.take_ready();
     INFO("add_file: " << (res.has_error() ? res.error().what.c_str() : "ok"));

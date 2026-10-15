@@ -13,7 +13,9 @@ struct connect_params {
     std::pmr::string access_key;
     std::pmr::string secret_key;
     std::pmr::string session_token; // optional — for IAM roles
-    std::pmr::string endpoint;      // optional — for LocalStack / custom S3-compatible endpoints
+    std::pmr::string endpoint;      // required — explicit administrator-controlled destination
     std::pmr::string alias;
+    std::pmr::string scheme{"https"};
+    std::pmr::string ca_file;
 };
 } // namespace conn::s3

@@ -40,7 +40,6 @@
 #include <vector>
 
 using otterstax::test::init_test_otterbrix;
-using otterstax::test::make_az_scheduler;
 using otterstax::test::run_scheduler_sql_payload;
 using otterstax::test::scheduler_stack;
 using otterstax::test::worker_pool_size;
@@ -269,7 +268,6 @@ namespace {
         explicit server_run(const std::string& data_dir)
             : otterbrix_(init_test_otterbrix(data_dir))
             , resource_(otterbrix_->dispatcher()->resource())
-            , az_scheduler_(make_az_scheduler())
             , otb_mgr_(actor_zeta::spawn<db::OtterbrixManager>(resource_, make_otterbrix_manager(otterbrix_)))
             , catalog_(actor_zeta::spawn<mysql::CatalogManager>(resource_, otb_mgr_->address(), shop_aliases()))
             , pg_conn_(std::make_unique<pg::ConnectorManager>(resource_,
@@ -288,7 +286,6 @@ namespace {
             pg_conn_.reset();
             catalog_.reset();
             otb_mgr_.reset();
-            az_scheduler_->stop();
             otterbrix_.reset();
         }
 
@@ -401,7 +398,6 @@ namespace {
                                            pg_mgr_->address(),
                                            actor_zeta::address_t::empty_address());
             return actor_zeta::spawn<Scheduler>(resource_,
-                                                az_scheduler_.get(),
                                                 worker_pool_size(),
                                                 &make_parser,
                                                 shop_aliases(),
@@ -416,7 +412,6 @@ namespace {
 
         db::otterbrix_engine_ptr otterbrix_;
         std::pmr::memory_resource* resource_{nullptr};
-        std::unique_ptr<actor_zeta::scheduler::sharing_scheduler> az_scheduler_;
         std::unique_ptr<db::OtterbrixManager, actor_zeta::pmr::deleter_t> otb_mgr_;
         std::unique_ptr<mysql::CatalogManager, actor_zeta::pmr::deleter_t> catalog_;
         std::unique_ptr<pg::ConnectorManager> pg_conn_;

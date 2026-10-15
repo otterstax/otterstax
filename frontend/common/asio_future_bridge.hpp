@@ -42,16 +42,11 @@ namespace otterstax {
     inline constexpr std::chrono::milliseconds DEFAULT_TIMEOUT{90000};
 
     // The bridge's own two failure codes. Frontends branch on them to tell "the
-    // worker did not answer in time" from "the worker answered with an error",
-    // so each must be a code that no Worker result can carry:
-    //  - AWAIT_TIMEOUT_CODE: the engine enum has no deadline code, and
-    //    `transaction_inactive` is produced neither by the engine nor by any
-    //    otterstax connector/manager, which makes it exclusive to the bridge;
-    //  - AWAIT_FAILED_CODE: the actor runtime closed the channel before a value
-    //    arrived (closed mailbox / cancelled operation) — the same shape as a
-    //    broken promise, which the connector barrier also reports as io_error.
-    inline constexpr core::error_code_t AWAIT_TIMEOUT_CODE = core::error_code_t::transaction_inactive;
-    inline constexpr core::error_code_t AWAIT_FAILED_CODE = core::error_code_t::io_error;
+    // worker did not answer in time" from "the worker answered with an error".
+    // The pinned core recipe reserves these codes for actor wait failures;
+    // completed storage IO and transaction errors retain their own codes.
+    inline constexpr core::error_code_t AWAIT_TIMEOUT_CODE = core::error_code_t::actor_wait_timeout;
+    inline constexpr core::error_code_t AWAIT_FAILED_CODE = core::error_code_t::actor_channel_closed;
 
     // Await an actor-zeta future from inside a boost::asio coroutine. Returns the
     // worker's result_wrapper_t<T> on success, or a core::error_t on timeout / infra

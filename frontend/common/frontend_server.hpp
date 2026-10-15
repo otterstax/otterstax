@@ -17,6 +17,7 @@
 #include <mutex>
 #include <optional>
 #include <queue>
+#include <string>
 #include <vector>
 
 namespace frontend {
@@ -33,6 +34,8 @@ namespace frontend {
         // configuration error (asserted).
         std::chrono::milliseconds accept_retry_delay;
         size_t pool_size = std::thread::hardware_concurrency();
+        std::string host = "0.0.0.0";
+        std::shared_ptr<const otterstax::security::server_access> access;
     };
 
     template<typename DerivedConnection>
@@ -41,13 +44,14 @@ namespace frontend {
         explicit frontend_server(const frontend_server_config& config)
             : resource_(config.resource)
             , thread_pool_manager_(config.pool_size)
-            , acceptor_(thread_pool_manager_.ctx(), {boost::asio::ip::tcp::v4(), config.port})
+            , acceptor_(thread_pool_manager_.ctx(), {boost::asio::ip::make_address(config.host), config.port})
             , reject_packet_(DerivedConnection::build_too_many_connections_error())
             , accept_retry_timer_(thread_pool_manager_.ctx())
             , next_connection_id_(1)
             , scheduler_(config.scheduler)
             , read_timeout_(config.read_timeout)
             , accept_retry_delay_(config.accept_retry_delay)
+            , access_(config.access)
             , log_(get_logger(logger_tag::FRONTEND_SERVER)) {
             assert(log_.is_valid());
             assert(resource_ != nullptr && "memory resource must not be null");
@@ -64,6 +68,7 @@ namespace frontend {
         // The port the acceptor is bound to — the actual one when the config
         // asked for port 0.
         uint16_t local_port() const { return acceptor_.local_endpoint().port(); }
+        boost::asio::ip::address local_address() const { return acceptor_.local_endpoint().address(); }
 
         void start() {
             accept_connections();
@@ -150,6 +155,7 @@ namespace frontend {
                                                                                   *slot,
                                                                                   read_timeout_);
                     log_->debug("Connection accepted (slot {})", *slot);
+                    connection_pool_[*slot]->set_access(access_);
                     connection_pool_[*slot]->start();
                 }
             } catch (const std::exception& e) {
@@ -242,6 +248,7 @@ namespace frontend {
         std::atomic<uint32_t> next_connection_id_;
         std::chrono::milliseconds read_timeout_;
         std::chrono::milliseconds accept_retry_delay_;
+        std::shared_ptr<const otterstax::security::server_access> access_;
         std::vector<std::unique_ptr<DerivedConnection>> connection_pool_;
         std::queue<size_t> available_slots_;
         log_t log_;

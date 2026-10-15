@@ -35,6 +35,7 @@ ARG BUILD_TYPE=Release
 ARG WITH_TRACY=false
 ARG WITH_PERF=false
 ARG BUILD_JOBS=0
+ARG BUILD_MEMORY_PER_JOB_MIB=1536
 # TSAN_DEPS=true rebuilds otterbrix + actor-zeta from source with
 # -fsanitize=thread (see tsan-deps.profile). Without it the prebuilt engine's
 # atomics are invisible to TSAN and the sanitizer job has no diagnostic power.
@@ -54,9 +55,16 @@ RUN if [ "$TSAN_DEPS" = "true" ]; then \
 # cmake_layout places generators + libs at build/${BUILD_TYPE}/ — matching
 # the devcontainer preset layout exactly.
 WORKDIR /app
+COPY cmake/build_jobs.py ./cmake/build_jobs.py
 COPY conanfile.py tsan-deps.profile ./
+COPY cmake/conan-recipes/otterbrix ./cmake/conan-recipes/otterbrix
+COPY cmake/conan-recipes/arrow ./cmake/conan-recipes/arrow
+RUN conan export cmake/conan-recipes/arrow --version=24.0.0
+RUN conan export cmake/conan-recipes/otterbrix
 COPY cmake/conan-hooks/hook_librdkafka_c11threads_off.py ./conan-hooks/
-RUN if [ "$TSAN_DEPS" = "true" ]; then \
+RUN _jobs=$(python3 cmake/build_jobs.py "${BUILD_JOBS}" --memory-per-job-mib "${BUILD_MEMORY_PER_JOB_MIB}") && \
+    printf '\ntools.build:jobs=%s\n' "${_jobs}" >> /root/.conan2/global.conf && \
+    if [ "$TSAN_DEPS" = "true" ]; then \
         mkdir -p /root/.conan2/extensions/hooks && \
         cp ./conan-hooks/hook_librdkafka_c11threads_off.py /root/.conan2/extensions/hooks/ && \
         conan install conanfile.py --build missing \
@@ -101,7 +109,7 @@ RUN if [ "$WITH_PERF" = "true" ]; then \
 fi
 
 # Build tracy-capture CLI when Tracy is enabled
-RUN _jobs=$([ "${BUILD_JOBS}" = "0" ] && nproc || echo "${BUILD_JOBS}") && \
+RUN _jobs=$(python3 cmake/build_jobs.py "${BUILD_JOBS}" --memory-per-job-mib "${BUILD_MEMORY_PER_JOB_MIB}") && \
     if [ "$WITH_TRACY" = "true" ]; then \
         curl -L https://github.com/wolfpld/tracy/archive/refs/tags/v0.13.1.tar.gz \
             | tar xz -C /tmp && \
@@ -118,6 +126,7 @@ COPY ./config ./config
 COPY ./connectors ./connectors
 COPY ./integration ./integration
 COPY ./frontend/ ./frontend
+COPY ./security ./security
 COPY ./otterbrix ./otterbrix
 COPY ./component_manager ./component_manager
 COPY ./scheduler ./scheduler
@@ -141,7 +150,7 @@ ARG BUILD_BENCHMARKS=OFF
 # Only takes effect in TSAN builds; plain Release / ASAN ignore it.
 ENV TSAN_OPTIONS="suppressions=/app/tsan.supp"
 
-RUN _jobs=$([ "${BUILD_JOBS}" = "0" ] && nproc || echo "${BUILD_JOBS}") && \
+RUN _jobs=$(python3 cmake/build_jobs.py "${BUILD_JOBS}" --memory-per-job-mib "${BUILD_MEMORY_PER_JOB_MIB}") && \
     _tracy=$([ "${WITH_TRACY}" = "true" ] && echo "ON" || echo "OFF") && \
     _perf=$([ "${WITH_PERF}" = "true" ] && echo "ON" || echo "OFF") && \
     _cc=$([ "${TSAN_DEPS}" = "true" ] && echo "-DCMAKE_C_COMPILER=gcc-12 -DCMAKE_CXX_COMPILER=g++-12" || echo "") && \
@@ -183,4 +192,5 @@ COPY ./tests/scripts/config.yaml ./config.yaml
 # Tracy profiler port (active only when built with --build-arg WITH_TRACY=true)
 EXPOSE 8086
 
+ENV OTTERSTAX_DATA_DIR=/app/data
 CMD [ "./server" ]

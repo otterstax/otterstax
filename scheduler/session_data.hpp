@@ -22,6 +22,7 @@ struct session_payload {
     std::pmr::vector<components::vector::data_chunk_t> chunks;
     size_t parameter_count;
     NodeTag tag;
+    std::string transaction_command;
 
     explicit session_payload(std::pmr::memory_resource* resource)
         : schema()

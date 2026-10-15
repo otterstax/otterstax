@@ -5,6 +5,7 @@
 
 #include "otterbrix/parser/grammar_extension/kafka/kafka_node.hpp"
 #include "utility/session.hpp"
+#include "security/network_destinations.hpp"
 
 #include <actor-zeta.hpp>
 #include <components/cursor/cursor.hpp>
@@ -49,7 +50,8 @@ namespace otterstax::kafka {
         // component_manager turns it on
         KafkaManager(std::pmr::memory_resource* resource,
                      actor_zeta::address_t engine_dispatcher_address,
-                     bool start_pollers = false);
+                     bool start_pollers = false,
+                     std::shared_ptr<const security::network_destinations> destinations = {});
         ~KafkaManager();
 
         std::pmr::memory_resource* resource() const noexcept { return resource_; }
@@ -82,9 +84,9 @@ namespace otterstax::kafka {
         // from the ctor (which runs mid-spawn — a poller started that early races the
         // half-initialised engine). No-op unless start_pollers_. Reads kafka.__sources,
         // re-reads each backing table's columns from the catalog, rebuilds registry_,
-        // relaunches pollers (Phase 2 table-seek then resumes from kafka.<src>__offsets)
+        // relaunches pollers using kafka.<src>__offsets. Startup must stop on errors.
         // Drives the dispatcher directly (no actor mailbox), safe to call inline
-        void recover();
+        [[nodiscard]] core::error_t recover();
 
         using dispatch_traits = actor_zeta::
             dispatch_traits<&KafkaManager::execute, &KafkaManager::produce, &KafkaManager::add_stream_insert>;
@@ -143,7 +145,7 @@ namespace otterstax::kafka {
         // to a kafka.__sources table; on startup recover() reads it back, re-reads
         // the columns from the recovered backing table through the engine-side
         // schema probe (otterbrix/operators/schema_probe.hpp — the answer comes off
-        // the validated plan, so an empty table has a schema too), rebuilds
+        // the reply cursor, so an empty table has a schema too), rebuilds
         // registry_, and relaunches the pollers (Phase 2 table-seek then resumes
         // from kafka.<src>__offsets). Columns are NOT stored — the catalog is their
         // single source of truth
@@ -169,17 +171,18 @@ namespace otterstax::kafka {
         actor_zeta::unique_future<components::cursor::cursor_t_ptr> delete_source_meta(const std::string& name);
         // Launch the ingestion poller for an already-registered source
         // (registry_[name] supplies columns + options). Shared by CREATE SOURCE and
-        // recover(). Logs and leaves the poller absent on failure
-        void launch_source_poller(const std::string& name, bool transactional);
+        // recover(). Returns a failure before a poller is installed.
+        [[nodiscard]] core::error_t launch_source_poller(const std::string& name, bool transactional);
         // Launch the continuous-query worker for an already-registered stream
         // (registry_[name].as_select + options; its source must already be in
-        // registry_). Shared by CREATE STREAM and recover(). Logs + skips on failure
-        void launch_stream(const std::string& name);
+        // registry_). Shared by CREATE STREAM and recover(). Returns startup errors.
+        [[nodiscard]] core::error_t launch_stream(const std::string& name);
 
         std::pmr::memory_resource* resource_;
         actor_zeta::address_t dispatcher_address_;
         log_t log_;
         bool start_pollers_;
+        std::shared_ptr<const security::network_destinations> destinations_;
         bool database_ensured_{false};
         bool sources_table_ensured_{false}; // kafka.__sources created this process
         std::unordered_map<std::string, kafka_object_t> registry_;

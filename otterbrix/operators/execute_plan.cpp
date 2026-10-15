@@ -48,10 +48,10 @@ namespace {
     core::result_wrapper_t<columns_t> probe_relation(otterbrix::base_otterbrix_t* engine,
                                                      std::pmr::memory_resource* resource,
                                                      const std::string& database,
-                                                     const std::string& collection) {
+                                                     const std::string& collection, session_id session = {}) {
         OTX_ZONE_N("otterbrix::probe_relation");
         auto probe = otterstax::schema_probe::make_table_probe(resource, database, collection);
-        auto cursor = engine->dispatcher()->execute_plan(otterbrix::session_id_t(), probe.execution_plan(resource));
+        auto cursor = engine->dispatcher()->execute_plan(session, probe.execution_plan(resource));
         auto read = otterstax::schema_probe::read_columns(probe, cursor, resource);
         if (read.has_error()) {
             return read.convert_error<columns_t>();
@@ -273,28 +273,21 @@ components::cursor::cursor_t_ptr OtterbrixDataManager::execute_plan(OtterbrixSta
 
     // Before the engine sees it: an aggregate over constants would be folded once per chunk.
     // A backend's slice is already data here, so what a backend runs is not touched.
-    if (otterbrix_params->node) {
-        auto* resource = otterbrix_->dispatcher()->resource();
-        if (auto refused = guard_node(*otterbrix_params->node, otterbrix_params->params_node.get(), resource);
-            refused.contains_error()) {
-            return error_cursor(resource, refused);
+    auto plan = otterbrix_params->execution_plan();
+    auto* resource = otterbrix_->dispatcher()->resource();
+    for (const auto& node : plan.sub_queries) {
+        if (node) {
+            if (auto refused = guard_node(*node, plan.parameters.get(), resource);
+                refused.contains_error()) {
+                return error_cursor(resource, refused);
+            }
         }
     }
 
-    components::logical_plan::execution_plan_t plan(otterbrix_params->node->resource(),
-                                                    otterbrix_params->node,
-                                                    otterbrix_params->params_node);
-    // The plan is built around the statement's CURRENT root — a backend manager
-    // may have replaced it with fetched data — so the catalog lookups have to be
-    // put back by hand: they are a sibling of the root, not a node under it, and
-    // a plan built from (node, params) alone carries none. Copied, not moved:
-    // the same statement is planned once for its output schema and executed
-    // once, and both plans need them.
-    plan.catalog_resolves = otterbrix_params->catalog_resolves;
-    return otterbrix_->dispatcher()->execute_plan(otterbrix::session_id_t(), std::move(plan));
+    return otterbrix_->dispatcher()->execute_plan(otterbrix_params->context.engine_session, std::move(plan));
 }
 
-components::cursor::cursor_t_ptr OtterbrixDataManager::get_schema(const OtterbrixSchemaParams& otterbrix_params) {
+components::cursor::cursor_t_ptr OtterbrixDataManager::get_schema(const OtterbrixSchemaParams& otterbrix_params, session_id session) {
     OTX_ZONE_N("otterbrix::get_schema_impl");
     // The input vector is in dependency-index order (built by OtterbrixManager),
     // so result->type_data()[i] is the STRUCT schema of dependency i — the layout
@@ -311,7 +304,7 @@ components::cursor::cursor_t_ptr OtterbrixDataManager::get_schema(const Otterbri
                                                            std::pmr::vector<types::complex_logical_type>(resource)));
             continue;
         }
-        auto columns = probe_relation(otterbrix_, resource, database, collection);
+        auto columns = probe_relation(otterbrix_, resource, database, collection, session);
         if (columns.has_error()) {
             return cursor::make_cursor(resource,
                                        core::error_t(columns.error().type,
@@ -329,13 +322,9 @@ components::cursor::cursor_t_ptr OtterbrixDataManager::plan_output_schema(Otterb
     // the physical tree but scans nothing; validation stamps output_types() on
     // the statement's consumer node. The rendered plan text the cursor carries
     // is not the answer and is dropped.
-    logical_plan::execution_plan_t plan{resource, otterbrix_params->node, otterbrix_params->params_node};
-    // The statement's catalog lookups, as in execute_plan: validation resolves
-    // the same targets the execution will, and a constraint the plan does not
-    // name is one the validator cannot see.
-    plan.catalog_resolves = otterbrix_params->catalog_resolves;
+    auto plan = otterbrix_params->execution_plan();
     plan.explain = logical_plan::explain_type::plan;
-    auto cursor = otterbrix_->dispatcher()->execute_plan(otterbrix::session_id_t(), std::move(plan));
+    auto cursor = otterbrix_->dispatcher()->execute_plan(otterbrix_params->context.engine_session, std::move(plan));
     if (!cursor) {
         return error_cursor(
             resource,

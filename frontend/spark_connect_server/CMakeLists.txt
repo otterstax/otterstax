@@ -12,6 +12,7 @@ set(SPARK_CONNECT_HEADERS
     catalog_relations.hpp
     catalog_rows.hpp
     show_string.hpp
+    runtime_config.hpp
     plan_translator/relation_to_plan.hpp
     plan_translator/expression_to_plan.hpp
     plan_translator/type_converter.hpp
@@ -26,6 +27,7 @@ set(SPARK_CONNECT_SOURCES
     result_encoder.cpp
     catalog_relations.cpp
     show_string.cpp
+    runtime_config.cpp
     plan_translator/relation_to_plan.cpp
     plan_translator/expression_to_plan.cpp
     plan_translator/type_converter.cpp

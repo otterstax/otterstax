@@ -50,7 +50,9 @@ struct S3CredentialDesc {
     std::string secret_key;
     std::string region;         // optional
     std::string session_token;  // optional — for IAM roles
-    std::string endpoint;       // optional — for MinIO / custom S3-compatible endpoints
+    std::string endpoint;       // required — explicit S3 hostname/port, including AWS
+    std::string scheme{"https"};
+    std::string ca_file;        // optional PEM trust bundle; otherwise system trust
 };
 
 // Aggregate parsed from the connection config file: the single source of truth

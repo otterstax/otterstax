@@ -33,11 +33,13 @@ namespace otterstax::kafka {
 
     KafkaManager::KafkaManager(std::pmr::memory_resource* resource,
                                actor_zeta::address_t engine_dispatcher_address,
-                               bool start_pollers)
+                               bool start_pollers,
+                               std::shared_ptr<const security::network_destinations> destinations)
         : resource_(resource)
         , dispatcher_address_(std::move(engine_dispatcher_address))
         , log_(get_logger(logger_tag::KAFKA_MANAGER))
-        , start_pollers_(start_pollers) {
+        , start_pollers_(start_pollers)
+        , destinations_(destinations ? std::move(destinations) : std::make_shared<const security::network_destinations>()) {
         assert(resource_ != nullptr);
         assert(log_.is_valid());
         log_->info("KafkaManager initialized (pollers {})", start_pollers_ ? "on" : "off");

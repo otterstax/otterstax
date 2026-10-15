@@ -22,7 +22,7 @@ public:
     virtual ~IDataManager() = default;
 
     virtual components::cursor::cursor_t_ptr execute_plan(OtterbrixStatementPtr& otterbrix_params) = 0;
-    virtual components::cursor::cursor_t_ptr get_schema(const OtterbrixSchemaParams& otterbrix_params) = 0;
+    virtual components::cursor::cursor_t_ptr get_schema(const OtterbrixSchemaParams& otterbrix_params, session_id session = {}) = 0;
     // Output columns of a row-producing statement as the engine's plan
     // validation stamps them (plan-only EXPLAIN: resolve + validate, no scan).
     // The cursor carries one STRUCT in type_data() — the statement's columns,
@@ -69,7 +69,7 @@ public:
     explicit OtterbrixDataManager(otterbrix::base_otterbrix_t* engine);
 
     components::cursor::cursor_t_ptr execute_plan(OtterbrixStatementPtr& otterbrix_params) override;
-    components::cursor::cursor_t_ptr get_schema(const OtterbrixSchemaParams& otterbrix_params) override;
+    components::cursor::cursor_t_ptr get_schema(const OtterbrixSchemaParams& otterbrix_params, session_id session = {}) override;
     components::cursor::cursor_t_ptr plan_output_schema(OtterbrixStatementPtr& otterbrix_params) override;
     components::cursor::cursor_t_ptr execute_sql(const std::string& query) override;
     components::cursor::cursor_t_ptr create_collection(const std::string& database,

@@ -95,7 +95,7 @@ public:
 
     // Positional schema contract: type_data()[i] is the STRUCT schema of
     // dependency i (see OtterbrixManager::get_schema).
-    components::cursor::cursor_t_ptr get_schema(const OtterbrixSchemaParams& otterbrix_params) override {
+    components::cursor::cursor_t_ptr get_schema(const OtterbrixSchemaParams& otterbrix_params, session_id session = {}) override {
         std::pmr::vector<components::types::complex_logical_type> schemas(config_.resource);
         schemas.reserve(otterbrix_params.size());
         for (size_t i = 0; i < otterbrix_params.size(); ++i) {

@@ -29,7 +29,7 @@ def make_config(local=False):
 
 
 def run_query(cfg, query):
-    conn = mysql.connector.connect(**cfg)
+    conn = mysql.connector.connect(autocommit=True, **cfg)
     try:
         cur = conn.cursor(buffered=True)
         cur.execute(query)

@@ -12,6 +12,9 @@
 #include "utility/logger.hpp"
 
 #include <boost/mysql/connect_params.hpp>
+#include <boost/filesystem/operations.hpp>
+#include <filesystem>
+#include <system_error>
 #include <otterbrix/otterbrix.hpp>
 
 #include <catch2/catch_all.hpp>
@@ -41,13 +44,37 @@ namespace otterstax::test {
         REQUIRE(poll_until_ready(future, 10s));
     }
 
-    // A default-config engine (no data directory), for tests that never persist
-    // anything — unlike scheduler_stack.hpp's init_test_otterbrix.
-    inline db::otterbrix_engine_ptr init_default_test_otterbrix() {
-        auto config = configuration::config::default_config();
-        initialize_all_loggers(config.log.path.string());
-        return db::make_otterbrix_engine(std::move(config));
-    }
+    // Even an otherwise empty engine persists its system catalog. Own one
+    // unique directory per instance so parallel tests cannot share that catalog.
+    class isolated_test_engine {
+    public:
+        isolated_test_engine() {
+            do {
+                directory_ = std::filesystem::temp_directory_path() /
+                    boost::filesystem::unique_path("otterstax-engine-%%%%-%%%%-%%%%-%%%%").string();
+            } while (!std::filesystem::create_directory(directory_));
+            try {
+                auto config = configuration::config::create_config(directory_);
+                initialize_all_loggers(config.log.path.string());
+                engine_ = db::make_otterbrix_engine(config);
+            } catch (...) {
+                std::error_code ignored;
+                std::filesystem::remove_all(directory_, ignored);
+                throw;
+            }
+        }
+        isolated_test_engine(const isolated_test_engine&) = delete;
+        isolated_test_engine& operator=(const isolated_test_engine&) = delete;
+        ~isolated_test_engine() {
+            engine_.reset();
+            std::error_code ignored;
+            std::filesystem::remove_all(directory_, ignored);
+        }
+        const db::otterbrix_engine_ptr& engine() const { return engine_; }
+    private:
+        std::filesystem::path directory_;
+        db::otterbrix_engine_ptr engine_;
+    };
 
     // addConnection keeps a MySQL connection only if the catalog could register
     // its schema, and whole-database discovery needs a database name — so the

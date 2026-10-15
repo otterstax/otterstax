@@ -790,7 +790,7 @@ namespace frontend::spark {
                 session_hash_t session,
                 std::string_view sql,
                 std::pmr::memory_resource* resource) {
-            auto future = actor_zeta::send(scheduler, &Scheduler::execute, session, std::string{sql}).second;
+            auto future = actor_zeta::send(scheduler, &Scheduler::execute, session, std::string{sql}, execution_context{}).second;
             co_return co_await await_future<session_payload>(std::move(future), resource);
         }
 
@@ -881,7 +881,7 @@ namespace frontend::spark {
             co_return table.convert_error<session_payload>();
         }
         auto prepare_future =
-            actor_zeta::send(scheduler, &Scheduler::prepare_schema, session, rows::select_all_query(*table.value()))
+            actor_zeta::send(scheduler, &Scheduler::prepare_schema, session, rows::select_all_query(*table.value()), execution_context{})
                 .second;
         auto prepared = co_await await_future<session_payload>(std::move(prepare_future), resource);
         auto close_future = actor_zeta::send(scheduler, &Scheduler::close_statement, session).second;

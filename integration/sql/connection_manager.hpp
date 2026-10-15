@@ -11,12 +11,12 @@
 #include "otterbrix/parser/parser.hpp"
 #include "otterbrix/schema/schema_utils.hpp"
 #include "utility/session.hpp"
+#include "utility/actor_mailbox.hpp"
 #include "utility/tracy_profiler.hpp"
 
 #include <core/result_wrapper.hpp>
 
 #include <memory_resource>
-#include <mutex>
 #include <string>
 
 namespace db {
@@ -27,6 +27,8 @@ namespace db {
         using unique_future = actor_zeta::unique_future<T>;
 
         MySQLManager(std::pmr::memory_resource* res, mysql::ConnectorManager* connector_manager);
+        MySQLManager(std::pmr::memory_resource* res, std::unique_ptr<mysql::ConnectorManager> connector_manager);
+        using transaction_actor = std::unique_ptr<MySQLManager, actor_zeta::pmr::deleter_t>;
 
         std::pmr::memory_resource* resource() const noexcept { return resource_; }
 
@@ -68,22 +70,26 @@ namespace db {
         actor_zeta::unique_future<core::result_wrapper_t<ParsedQueryDataPtr>> describe(session_hash_t id,
                                                                                        ParsedQueryDataPtr data);
 
+        unique_future<core::result_wrapper_t<transaction_actor>> begin_transaction(session_id session, std::string alias);
+        unique_future<core::error_t> finish_transaction(session_id session, bool commit);
+
         using dispatch_traits =
-            actor_zeta::dispatch_traits<&MySQLManager::execute, &MySQLManager::discover, &MySQLManager::describe>;
+            actor_zeta::dispatch_traits<&MySQLManager::begin_transaction, &MySQLManager::finish_transaction, &MySQLManager::execute, &MySQLManager::discover, &MySQLManager::describe>;
 
         actor_zeta::behavior_t behavior(actor_zeta::mailbox::message* msg);
 
         std::pair<bool, actor_zeta::detail::enqueue_result> enqueue_impl(actor_zeta::mailbox::message_ptr msg);
 
     private:
+        core::error_t validate_transaction_tables(const ParsedQueryData& data);
         std::pmr::memory_resource* resource_;
         // Non-owning: ComponentManager owns it and outlives this actor. This
         // actor is its only driver after startup (execute and discover both run
-        // here, serialised by mutex_).
+        // here, serialised on the actor's thread).
+        std::unique_ptr<mysql::ConnectorManager> owned_connector_manager_;
         mysql::ConnectorManager* connector_manager_;
         log_t log_;
-        OTX_LOCKABLE_N(std::mutex, mutex_, "MySQLManager::mutex");
-        actor_zeta::behavior_t current_behavior_;
+
 
         // The statement one slot sends to MySQL — shared by execute (which runs
         // it) and describe (which probes its header), so both see one text.
@@ -92,5 +98,7 @@ namespace db {
                                 const otterstax::names::resolved_target_t& target,
                                 const std::pmr::vector<external_entry_t>& batch,
                                 const components::logical_plan::storage_parameters* parameters);
+        // Last member: stop/drain the mailbox before destroying actor state.
+        otterstax::actor_mailbox<MySQLManager, otterstax::actor_execution::serial> mailbox_{*this};
     };
 } // namespace db

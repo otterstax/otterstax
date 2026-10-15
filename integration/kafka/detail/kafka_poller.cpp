@@ -2,6 +2,7 @@
 // Copyright 2025-2026  OtterStax
 
 #include "kafka_poller.hpp"
+#include "kafka_batch_loop.hpp"
 #include "kafka_const.hpp"
 #include "kafka_reader.hpp"
 #include "utility/logger.hpp"
@@ -79,7 +80,17 @@ namespace otterstax::kafka::detail {
                 drive(kafka_insert_session(dispatcher_address, resource, session, database, table, std::move(chunk))),
                 "insert");
         }
-        if (!error.contains_error()) {
+        if (!error.contains_error() && !next_offsets.empty()) {
+            error = step_error(resource,
+                               drive(erase_offsets_session(dispatcher_address,
+                                                           resource,
+                                                           session,
+                                                           database,
+                                                           offsets_table,
+                                                           next_offsets)),
+                               "offsets delete");
+        }
+        if (!error.contains_error() && !next_offsets.empty()) {
             error = step_error(resource,
                                drive(write_offsets_session(dispatcher_address,
                                                            resource,
@@ -137,19 +148,13 @@ namespace otterstax::kafka::detail {
     }
 
     void kafka_poller_t::run() {
-        while (!stop_.load(std::memory_order_relaxed)) {
-            auto records = consumer_.poll_batch(MAX_BATCH, POLL_TIMEOUT);
-            if (records.empty()) {
-                continue; // timeout / caught up — re-check stop_ and poll again
-            }
-
+        auto apply = [&](const std::vector<kafka_record_t>& records) {
             OTX_ZONE_N("kafka::poller::batch"); // one zone per processed batch (run() is an endless poll loop)
             std::vector<std::string> payloads;
             payloads.reserve(records.size());
-            for (auto& record : records) {
-                // Move just the payload: records keep partition/offset, needed for
-                // the offsets upsert and for the rewind on failure
-                payloads.push_back(std::move(record.payload));
+            for (const auto& record : records) {
+                // Keep the original payload for an engine retry of this batch.
+                payloads.push_back(record.payload);
             }
 
             auto chunk = json_to_chunk(resource_, columns_, payloads);
@@ -169,37 +174,25 @@ namespace otterstax::kafka::detail {
                 error = ingest_at_least_once(dispatcher_address_, resource_, database_, table_, std::move(chunk));
             }
 
-            if (error.contains_error()) {
-                // The batch is not lost: no consumer commit, rewind to its start so
-                // the next poll re-delivers it, and back off before retrying
-                ++consecutive_failures_;
-                get_logger(logger_tag::KAFKA_MANAGER)
-                    ->error("kafka poller: batch of {} record(s) for '{}.{}' failed (code {}): {}; rewinding, "
-                            "retry #{} in {} ms",
-                            records.size(),
-                            database_,
-                            table_,
-                            static_cast<int32_t>(error.type),
-                            error.what.c_str(),
-                            consecutive_failures_,
-                            batch_retry_backoff(consecutive_failures_).count());
-                // A failed seek is non-fatal — restart's table-seek still resumes
-                if (auto seek = consumer_.seek_to_batch_start(records); seek.contains_error()) {
-                    get_logger(logger_tag::KAFKA_MANAGER)
-                        ->error("kafka poller: rewind for '{}.{}' failed: {}", database_, table_, seek.what.c_str());
-                }
-                pause_after_failure();
-                continue;
-            }
-            consecutive_failures_ = 0;
-            if (!transactional_) {
-                // Broker-group resume: commit the consumed positions (also for an
-                // all-invalid batch, so the poller advances past unparseable messages).
-                // The exactly-once path deliberately never commits — the offsets
-                // table is the truth
+            return error;
+        };
+        auto acknowledge = [&](const std::vector<kafka_record_t>& records) {
+            if (transactional_) {
+                consumer_.remember_committed(records);
+            } else {
                 consumer_.commit();
             }
-        }
+            consecutive_failures_ = 0;
+        };
+        auto failure = [&](const char* step, const core::error_t& error) {
+            ++consecutive_failures_;
+            get_logger(logger_tag::KAFKA_MANAGER)
+                ->error("kafka poller: {} for '{}.{}' failed (code {}): {}; retry #{} in {} ms",
+                        step, database_, table_, static_cast<int32_t>(error.type), error.what.c_str(),
+                        consecutive_failures_, batch_retry_backoff(consecutive_failures_).count());
+            pause_after_failure();
+        };
+        consume_batches(consumer_, stop_, apply, acknowledge, failure);
     }
 
     void kafka_poller_t::pause_after_failure() {

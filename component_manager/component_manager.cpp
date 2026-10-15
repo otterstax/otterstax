@@ -2,6 +2,7 @@
 // Copyright 2025-2026  OtterStax
 
 #include "component_manager.hpp"
+#include "security/file_access.hpp"
 #include "connection_retry.hpp"
 #include "utility/logger.hpp"
 #include "utility/tracy_profiler.hpp"
@@ -16,8 +17,6 @@
 #include <chrono>
 #include <thread>
 
-constexpr size_t MAX_THROUGHPUT =
-    1000; // MAX_THROUGHPUT is the maximum number of messages an actor will process before yielding to the scheduler. Setting it to a high value (or to std::numeric_limits<size_t>::max()) means actors will yield only when they have no more messages to process, which can improve performance for actors that process many messages in bursts but can lead to starvation of other actors if one actor receives a continuous stream of messages.
 
 namespace {
     otterstax::names::alias_registry_t make_alias_registry(const config::ConnectionsConfig& connections) {
@@ -35,7 +34,9 @@ namespace {
     }
 } // namespace
 
-ComponentManager::ComponentManager(const configuration::config& config, const config::ConnectionsConfig& connections)
+ComponentManager::ComponentManager(const configuration::config& config, const config::ConnectionsConfig& connections,
+                                   std::shared_ptr<const otterstax::security::file_access> files,
+                                   std::vector<std::string> kafka_brokers)
     : engine_(new db::otterbrix_engine_t(config))
     , resource_(engine_->dispatcher()->resource())
     , aliases_(make_alias_registry(connections)) {
@@ -54,7 +55,8 @@ ComponentManager::ComponentManager(const configuration::config& config, const co
 
         kafka_manager_ = actor_zeta::spawn<otterstax::kafka::KafkaManager>(resource_,
                                                                            engine_->engine_dispatcher_address(),
-                                                                           /*start_pollers=*/true);
+                                                                           /*start_pollers=*/true,
+                                                                           std::make_shared<const otterstax::security::network_destinations>(kafka_brokers));
         assert(kafka_manager_ != nullptr && "kafka manager must not be null");
 
         catalog_manager_ = actor_zeta::spawn<mysql::CatalogManager>(resource_, otterbrix_manager_->address(), aliases_);
@@ -97,29 +99,34 @@ ComponentManager::ComponentManager(const configuration::config& config, const co
 
     {
         OTX_ZONE_N("ComponentManager::spawn_s3");
-        s3_manager_ = actor_zeta::spawn<conn::s3::ConnectorManager>(resource_);
+        const auto staging = std::filesystem::path(config.disk.path) / "s3-staging";
+        std::filesystem::create_directories(staging);
+        if (std::filesystem::is_symlink(staging)) throw std::runtime_error("S3 staging directory must not be a symbolic link");
+        std::filesystem::permissions(staging, std::filesystem::perms::owner_all);
+        otterstax::security::file_access_config staging_config;
+        if (files) staging_config.max_file_bytes = files->max_file_bytes();
+        staging_config.read_roots = {std::filesystem::absolute(staging).string()};
+        staging_config.write_roots = staging_config.read_roots;
+        auto staging_files = std::make_shared<otterstax::security::file_access>(staging_config);
+        s3_manager_ = actor_zeta::spawn<conn::s3::ConnectorManager>(resource_, staging_config.read_roots.front(), staging_files);
         assert(s3_manager_ != nullptr && "s3 manager must not be null");
 
-        file_manager_ = actor_zeta::spawn<conn::file::FileManager>(resource_, otterbrix_manager_->address());
+        file_manager_ = actor_zeta::spawn<conn::file::FileManager>(resource_, otterbrix_manager_->address(), std::move(files));
         assert(file_manager_ != nullptr && "file manager must not be null");
 
         // Integration S3 manager orchestrates the raw s3 + file connectors; the
         // Scheduler routes s3 CREATE EXTERNAL TABLE / COPY statements to it.
+        staging_file_manager_ = actor_zeta::spawn<conn::file::FileManager>(resource_, otterbrix_manager_->address(), staging_files);
         s3_integration_manager_ =
-            actor_zeta::spawn<db::S3Manager>(resource_, s3_manager_->address(), file_manager_->address());
+            actor_zeta::spawn<db::S3Manager>(resource_, s3_manager_->address(), staging_file_manager_->address(), staging_config.write_roots.front());
         assert(s3_integration_manager_ != nullptr && "s3 integration manager must not be null");
     }
 
     {
         OTX_ZONE_N("ComponentManager::spawn_scheduler");
-        // Work-sharing thread pool for the Worker actors: one Worker per pool
-        // thread; queries shard onto workers by session hash (id % worker_count).
+        // Each Worker owns an event loop; queries shard by request ID.
         const std::size_t worker_count = std::max<std::size_t>(2, std::thread::hardware_concurrency());
-        az_scheduler_ = std::make_unique<actor_zeta::scheduler::sharing_scheduler>(worker_count, MAX_THROUGHPUT);
-        az_scheduler_->start();
-
         scheduler_ = actor_zeta::spawn<Scheduler>(resource_,
-                                                  az_scheduler_.get(),
                                                   worker_count,
                                                   &make_parser,
                                                   aliases_,
@@ -134,20 +141,13 @@ ComponentManager::ComponentManager(const configuration::config& config, const co
         assert(scheduler_ != nullptr && "scheduler must not be null");
     }
 
-    // relaunch persisted Kafka when the full actor graph and worker pool are up
-    // doing this in the KafkaManager ctor races the half-initialised engine
-    // (the poller starts before the scheduler/executor pool)
-    kafka_manager_->recover();
 }
 
-ComponentManager::~ComponentManager() {
-    // Stop the worker pool BEFORE any actor is destroyed: once stop() returns no
-    // pool thread will resume a Worker, so the Scheduler (event loop + workers) can
-    // be torn down safely during member destruction (supervisor lifecycle rule).
-    if (az_scheduler_) {
-        az_scheduler_->stop();
-    }
+core::error_t ComponentManager::recover() {
+    return kafka_manager_->recover();
 }
+
+ComponentManager::~ComponentManager() = default;
 
 std::pmr::memory_resource* ComponentManager::getResource() {
     assert(resource_);
@@ -259,10 +259,12 @@ core::error_t ComponentManager::register_connections(const config::ConnectionsCo
             .session_token = std::pmr::string{std::string_view{c.session_token}, resource_},
             .endpoint = std::pmr::string{std::string_view{c.endpoint}, resource_},
             .alias = std::pmr::string{std::string_view{c.alias}, resource_},
+            .scheme = std::pmr::string{std::string_view{c.scheme}, resource_},
+            .ca_file = std::pmr::string{std::string_view{c.ca_file}, resource_},
         };
         auto [needs_sched, stored] = actor_zeta::send(s3_manager_->address(),
                                                       &conn::s3::ConnectorManager::add_credentials,
-                                                      session_id().hash(),
+                                                      next_request_id(),
                                                       std::move(params));
         // The s3 actor runs its handler to completion on the sending thread, so
         // the future is settled once send() returns; anything else means the

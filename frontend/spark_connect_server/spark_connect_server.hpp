@@ -12,7 +12,7 @@ namespace frontend::spark {
         explicit spark_connect_server(const SparkConnectServerConfig& config);
         ~spark_connect_server();
 
-        void start();
+        [[nodiscard]] bool start();
         void stop();
 
     private:

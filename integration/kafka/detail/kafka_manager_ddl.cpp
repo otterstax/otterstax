@@ -124,6 +124,9 @@ namespace otterstax::kafka {
     actor_zeta::unique_future<cursor::cursor_t_ptr> KafkaManager::drop_source_tables(const std::string& name) {
         OTX_ZONE_N("KafkaManager::drop_source_tables");
         auto main = co_await drop_table(name);
+        if (!main || (main->is_error() && !is_not_found(main))) {
+            co_return main ? main : error_cursor(resource_, core::error_code_t::other_error, "kafka: drop: null cursor");
+        }
         auto offsets = co_await drop_table(name + "__offsets");
         auto null_reply = [&](const char* step) {
             return error_cursor(resource_,
@@ -142,6 +145,28 @@ namespace otterstax::kafka {
     actor_zeta::unique_future<cursor::cursor_t_ptr> KafkaManager::execute(session_hash_t id, kafka_node_ptr node) {
         OTX_ZONE_N("KafkaManager::execute");
         log_->debug("execute id {}: kafka op {} name {}", id, static_cast<int32_t>(node->op()), node->name());
+        const auto existing = registry_.find(node->name());
+        const bool creating = node->op() == kafka_op::create_source || node->op() == kafka_op::create_stream;
+        if (creating && !destinations_->allows_list(node->option("BOOTSTRAP_SERVERS").value_or(""))) {
+            co_return error_cursor(resource_, core::error_code_t::invalid_parameter,
+                                   "kafka: bootstrap destinations are not allowed by service.security.kafka_brokers");
+        }
+        if (creating && existing != registry_.end()) {
+            co_return error_cursor(resource_, core::error_code_t::already_exists,
+                                   "kafka: object '" + node->name() + "' already exists");
+        }
+        if (!creating && existing == registry_.end()) {
+            if (node->if_exists()) co_return cursor::make_cursor(resource_);
+            co_return error_cursor(resource_, core::error_code_t::do_not_exists,
+                                   "kafka: object '" + node->name() + "' does not exist");
+        }
+        if (!creating && existing != registry_.end()) {
+            const auto expected = node->op() == kafka_op::drop_source ? kafka_op::create_source : kafka_op::create_stream;
+            if (existing->second.op != expected) {
+                co_return error_cursor(resource_, core::error_code_t::invalid_parameter,
+                                       "kafka: DROP object kind does not match '" + node->name() + "'");
+            }
+        }
         switch (node->op()) {
             case kafka_op::create_source:
                 co_return co_await handle_create_source(std::move(node));
@@ -194,7 +219,9 @@ namespace otterstax::kafka {
         if (auto c = co_await create_table(node->name() + "__offsets", offsets_columns(), /*if_not_exists*/ false);
             !c || c->is_error()) {
             const std::string why = "kafka: create offsets for '" + node->name() + "' failed: " + cursor_error(c);
-            if (auto d = co_await rollback(); !d || d->is_error()) {
+            // The offsets relation may belong to another object. This CREATE
+            // only owns the new source table when offsets creation failed.
+            if (auto d = co_await drop_table(node->name()); !d || d->is_error()) {
                 log_->error("kafka: rollback of '{}' after a failed create: {}", node->name(), cursor_error(d));
             }
             co_return error_cursor(resource_, core::error_code_t::schema_error, why);
@@ -219,7 +246,18 @@ namespace otterstax::kafka {
 
         registry_[node->name()] = kafka_object_t{node->op(), node->columns(), node->options(), std::string{}};
         log_->info("kafka: registered source '{}'", node->name());
-        launch_source_poller(node->name(), transactional);
+        if (auto started = launch_source_poller(node->name(), transactional); started.contains_error()) {
+            registry_.erase(node->name());
+            if (auto removed = co_await delete_source_meta(node->name()); !removed || removed->is_error()) {
+                log_->error("kafka: metadata cleanup after source '{}' failed to start: {}",
+                            node->name(), cursor_error(removed));
+            }
+            if (auto dropped = co_await rollback(); !dropped || dropped->is_error()) {
+                log_->error("kafka: table cleanup after source '{}' failed to start: {}",
+                            node->name(), cursor_error(dropped));
+            }
+            co_return cursor::make_cursor(resource_, std::move(started));
+        }
         co_return cursor::make_cursor(resource_);
     }
 
@@ -282,7 +320,14 @@ namespace otterstax::kafka {
 
         registry_[node->name()] = kafka_object_t{node->op(), stream_columns, node->options(), node->as_select()};
         log_->info("kafka: registered stream '{}' ({} output columns)", node->name(), stream_columns.size());
-        launch_stream(node->name());
+        if (auto started = launch_stream(node->name()); started.contains_error()) {
+            registry_.erase(node->name());
+            if (auto removed = co_await delete_source_meta(node->name()); !removed || removed->is_error()) {
+                log_->error("kafka: metadata cleanup after stream '{}' failed to start: {}",
+                            node->name(), cursor_error(removed));
+            }
+            co_return cursor::make_cursor(resource_, std::move(started));
+        }
         co_return cursor::make_cursor(resource_);
     }
 
@@ -298,7 +343,12 @@ namespace otterstax::kafka {
             // and ingesting; IF EXISTS only forgives a missing table, never a failure
             if (had_poller) {
                 if (const auto it = registry_.find(node->name()); it != registry_.end()) {
-                    launch_source_poller(node->name(), option_is_true(it->second.options, "transactional"));
+                    if (auto restarted = launch_source_poller(node->name(), option_is_true(it->second.options, "transactional"));
+                        restarted.contains_error()) {
+                        log_->error("kafka: could not restart source '{}' after DROP failed: {}",
+                                    node->name(), restarted.what.c_str());
+                        co_return cursor::make_cursor(resource_, std::move(restarted));
+                    }
                 }
             }
             co_return dropped ? dropped

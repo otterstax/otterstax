@@ -2,6 +2,7 @@
 // Copyright 2025-2026  OtterStax
 
 #include "manager.hpp"
+#include "security/file_access.hpp"
 #include "utility/logger.hpp"
 #include "utility/tracy_profiler.hpp"
 #include "utility/session.hpp"
@@ -14,7 +15,6 @@
 #include "otterbrix/translators/output/chunk_to_ndjson.hpp"
 #include "otterbrix/translators/error.hpp"
 
-#include <ctime>
 #include <filesystem>
 #include <thread>
 
@@ -22,34 +22,22 @@ namespace conn::file {
 
 namespace {
 
-// Build a temporary output path for a dumped table by prefixing the original
-// file's basename with a timestamp, keeping it in the same directory, e.g.
-//   "/dir/people.parquet" → "/dir/2026-06-14_10-34-35_people.parquet"
-std::string temporary_path(const std::string& path) {
-    std::time_t now = std::time(nullptr);
-    std::tm     tm{};
-    localtime_r(&now, &tm);
-    char ts[20];
-    std::strftime(ts, sizeof(ts), "%Y-%m-%d_%H-%M-%S", &tm);
-
-    const std::filesystem::path src{path};
-    return (src.parent_path() /
-            (std::string{ts} + "_" + src.filename().string())).string();
-}
-
 // Translate the file at params.path into a chunk in the format resolved from
 // params.format or, failing that, the path's extension.
 core::result_wrapper_t<components::vector::data_chunk_t> load_chunk(std::pmr::memory_resource* res,
-                                                                    const FileAddParams& params) {
+                                                                    const FileAddParams& params,
+                                                                    const otterstax::security::file_access& files) {
+    auto bytes = files.read(params.path);
+    if (!bytes.ok()) return tsl::arrow_error(res, core::error_code_t::io_error, "FileManager::add_file", bytes.status());
     switch (resolve_format(params.format, params.path)) {
         case FileFormat::Parquet:
-            return tsl::parquet_to_chunk(res, params.path);
+            return tsl::parquet_to_chunk(res, bytes->data(), bytes->size());
         case FileFormat::CSV: {
             const char delim = params.csv_delimiter.empty() ? ',' : params.csv_delimiter[0];
-            return tsl::csv_to_chunk(res, params.path, delim, params.csv_header);
+            return tsl::csv_to_chunk(res, bytes->data(), bytes->size(), delim, params.csv_header);
         }
         case FileFormat::NDJSON:
-            return tsl::ndjson_to_chunk(res, params.path);
+            return tsl::ndjson_to_chunk(res, bytes->data(), bytes->size());
         case FileFormat::Unknown:
             break;
     }
@@ -61,14 +49,14 @@ core::result_wrapper_t<components::vector::data_chunk_t> load_chunk(std::pmr::me
 core::result_wrapper_t<bool> write_chunks(std::pmr::memory_resource* res,
                                           FileFormat format,
                                           const std::pmr::vector<components::vector::data_chunk_t>& chunks,
-                                          const std::string& path) {
+                                          const std::shared_ptr<arrow::io::OutputStream>& output) {
     switch (format) {
         case FileFormat::Parquet:
-            return tsl::chunk_to_parquet(res, chunks, path);
+            return tsl::chunk_to_parquet(res, chunks, output);
         case FileFormat::CSV:
-            return tsl::chunk_to_csv(res, chunks, path);
+            return tsl::chunk_to_csv(res, chunks, output);
         case FileFormat::NDJSON:
-            return tsl::chunk_to_ndjson(res, chunks, path);
+            return tsl::chunk_to_ndjson(res, chunks, output);
         case FileFormat::Unknown:
             break;
     }
@@ -77,9 +65,11 @@ core::result_wrapper_t<bool> write_chunks(std::pmr::memory_resource* res,
 
 } // namespace
 
-FileManager::FileManager(std::pmr::memory_resource* res, actor_zeta::address_t otterbrix_manager)
+FileManager::FileManager(std::pmr::memory_resource* res, actor_zeta::address_t otterbrix_manager,
+                         std::shared_ptr<const otterstax::security::file_access> files)
     : resource_(res)
     , otterbrix_manager_(std::move(otterbrix_manager))
+    , files_(files ? std::move(files) : std::make_shared<otterstax::security::file_access>(otterstax::security::file_access_config{}, true))
     , log_(get_logger(logger_tag::FILE_MANAGER)) {
     assert(log_.is_valid());
     assert(res != nullptr);
@@ -114,11 +104,10 @@ actor_zeta::behavior_t FileManager::behavior(actor_zeta::mailbox::message* msg) 
 }
 
 actor_zeta::unique_future<core::result_wrapper_t<bool>> FileManager::add_file(session_hash_t id, FileAddParams params) {
-    OTX_ZONE_N("file::add_file");
     log_->trace("FileManager::add_file with params:\n Database: {}\n Table: {}\n Path: {}\n Format: {}",
                 params.database, params.table, params.path, params.format);
 
-    auto loaded = load_chunk(resource_, params);
+    auto loaded = load_chunk(resource_, params, *files_);
     if (loaded.has_error()) {
         log_->error("add_file: {}", loaded.error().what);
         co_return loaded.convert_error<bool>();
@@ -141,7 +130,6 @@ actor_zeta::unique_future<core::result_wrapper_t<bool>> FileManager::add_file(se
 }
 
 actor_zeta::unique_future<core::result_wrapper_t<std::string>> FileManager::dump_file(session_hash_t id, FileMetadata file_metadata) {
-    OTX_ZONE_N("file::dump_file");
     log_->trace("FileManager::dump_file with params:\n Path: {}", file_metadata.path);
     if (file_metadata.path.empty() || !file_metadata.statement) {
         log_->error("dump_file: input arguments are invalid: Path: '{}', statement: {}",
@@ -154,6 +142,9 @@ actor_zeta::unique_future<core::result_wrapper_t<std::string>> FileManager::dump
                                  .c_str(),
                              resource()});
     }
+
+    auto output = files_->output(file_metadata.path, file_metadata.is_temporary);
+    if (!output.ok()) co_return tsl::arrow_error(resource_, core::error_code_t::io_error, "FileManager::dump_file", output.status());
 
     // Execute the pre-parsed statement; its result chunk is what we dump.
     auto fut = actor_zeta::send(otterbrix_manager_,
@@ -174,23 +165,18 @@ actor_zeta::unique_future<core::result_wrapper_t<std::string>> FileManager::dump
                                                  resource()});
     }
 
-    // Temporary dumps (e.g. S3 upload staging) get a timestamp-prefixed
-    // basename in the same directory so they never clobber an existing file;
-    // otherwise the table is written to the exact path requested.
-    const auto out_path = file_metadata.is_temporary
-                              ? temporary_path(file_metadata.path)
-                              : file_metadata.path;
-
     // Engine cursors return the result as a vector of <=1024-row chunks (never
     // combined into one); the writers take the whole run.
-    auto written = write_chunks(resource_, file_metadata.format, cursor->chunks(), out_path);
+    auto written = write_chunks(resource_, file_metadata.format, cursor->chunks(), *output);
     if (written.has_error()) {
         log_->error("dump_file: {}", written.error().what);
         co_return written.convert_error<std::string>();
     }
 
-    log_->debug("dump_file: wrote {}", out_path);
-    co_return out_path;
+    auto committed = (*output)->commit();
+    if (!committed.ok()) co_return tsl::arrow_error(resource_, core::error_code_t::io_error, "FileManager::dump_file", committed);
+    log_->debug("dump_file: wrote {}", (*output)->path());
+    co_return (*output)->path();
 }
 
 } // namespace conn::file

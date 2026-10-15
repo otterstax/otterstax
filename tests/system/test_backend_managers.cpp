@@ -303,6 +303,63 @@ TEST_CASE("MySQLManager::execute: a fetched slot becomes raw data in place") {
     REQUIRE(data->otterbrix_params->remote_affected_rows == OtterbrixStatement::no_remote_dml);
 }
 
+namespace {
+    class exclusive_query_connector final : public mysql::MockConnector {
+    public:
+        exclusive_query_connector(mock_config config, std::string alias)
+            : mysql::MockConnector(config, std::move(alias)), resource_(config.resource) {}
+
+        boost::asio::awaitable<core::result_wrapper_t<std::unique_ptr<data_chunk_t>>>
+        runQuery(std::string_view,
+                 otterstax::function_ref_t<std::unique_ptr<data_chunk_t>(const boost::mysql::results&)>) override {
+            if (busy_.exchange(true)) {
+                co_return core::error_t(core::error_code_t::io_error,
+                                        std::pmr::string{"overlapping operations on one connection", resource_});
+            }
+            struct release {
+                std::atomic<bool>& busy;
+                ~release() { busy.store(false); }
+            } guard{busy_};
+            // Suspend while the connection is in use. The pool can run the next
+            // operation even with one worker, exposing overlap across co_await.
+            boost::asio::steady_timer timer(co_await boost::asio::this_coro::executor);
+            timer.expires_after(std::chrono::milliseconds(100));
+            co_await timer.async_wait(boost::asio::use_awaitable);
+            co_return std::make_unique<data_chunk_t>(get_chunk());
+        }
+    private:
+        std::pmr::memory_resource* resource_;
+        std::atomic<bool> busy_{false};
+    };
+
+    std::unique_ptr<mysql::IConnector> exclusive_query_connector_factory(std::pmr::memory_resource* resource,
+                                                                         boost::asio::io_context&,
+                                                                         boost::mysql::connect_params,
+                                                                         std::string alias) {
+        return std::make_unique<exclusive_query_connector>(mock_config{.resource = resource}, std::move(alias));
+    }
+}
+
+TEST_CASE("MySQLManager::execute: multiple fragments on one alias never overlap") {
+    std::pmr::synchronized_pool_resource arena(std::pmr::new_delete_resource());
+    mysql_stack stack(&arena, &exclusive_query_connector_factory);
+    stack.register_connection_one();
+    auto data = stack.statement();
+    auto& batch = data->otterbrix_params->external_nodes.front();
+    const auto target = batch.front().target;
+    components::logical_plan::node_ptr second = schema_utils::make_node_schema_raw(&arena, target.name, "SELECT 2", {});
+    components::logical_plan::node_ptr third = schema_utils::make_node_schema_raw(&arena, target.name, "SELECT 3", {});
+    batch.push_back(external_entry_t{&second, target});
+    batch.push_back(external_entry_t{&third, target});
+    auto result = stack.execute(std::move(data));
+    INFO((result.has_error() ? result.error().what.c_str() : "ok"));
+    REQUIRE_FALSE(result.has_error());
+    for (const auto& slot : result.value()->otterbrix_params->external_nodes.front()) {
+        REQUIRE((*slot.node)->type() == components::logical_plan::node_type::data_t);
+        CHECK(static_cast<const components::logical_plan::node_data_t&>(**slot.node).size() == 2);
+    }
+}
+
 TEST_CASE("MySQLManager::execute: a slice wider than one engine chunk is substituted as a run of chunks within the bound") {
     std::pmr::synchronized_pool_resource arena(std::pmr::new_delete_resource());
     mysql_stack stack(&arena, &wide_slice_connector_factory);
@@ -684,7 +741,6 @@ namespace {
             : data_dir_(data_dir)
             , otterbrix_(otterstax::test::init_fresh_test_otterbrix(data_dir_))
             , resource_(otterbrix_->dispatcher()->resource())
-            , az_scheduler_(otterstax::test::make_az_scheduler())
             , otb_mgr_(actor_zeta::spawn<db::OtterbrixManager>(resource_, make_otterbrix_manager(otterbrix_)))
             , catalog_(actor_zeta::spawn<mysql::CatalogManager>(resource_, otb_mgr_->address(), nulls_aliases()))
             , pg_conn_(std::make_unique<pg::ConnectorManager>(resource_, catalog_->address(), factory, 1))
@@ -700,7 +756,6 @@ namespace {
             pg_conn_.reset();
             catalog_.reset();
             otb_mgr_.reset();
-            az_scheduler_->stop();
             otterbrix_.reset();
             std::filesystem::remove_all(data_dir_);
         }
@@ -729,7 +784,6 @@ namespace {
             REQUIRE_FALSE(added.has_error());
 
             return actor_zeta::spawn<Scheduler>(resource_,
-                                                az_scheduler_.get(),
                                                 otterstax::test::worker_pool_size(),
                                                 &make_parser,
                                                 nulls_aliases(),
@@ -745,7 +799,6 @@ namespace {
         std::string data_dir_;
         db::otterbrix_engine_ptr otterbrix_;
         std::pmr::memory_resource* resource_{nullptr};
-        std::unique_ptr<actor_zeta::scheduler::sharing_scheduler> az_scheduler_;
         std::unique_ptr<db::OtterbrixManager, actor_zeta::pmr::deleter_t> otb_mgr_;
         std::unique_ptr<mysql::CatalogManager, actor_zeta::pmr::deleter_t> catalog_;
         std::unique_ptr<pg::ConnectorManager> pg_conn_;
@@ -1114,7 +1167,6 @@ namespace {
             : data_dir_(data_dir)
             , otterbrix_(otterstax::test::init_fresh_test_otterbrix(data_dir_))
             , resource_(otterbrix_->dispatcher()->resource())
-            , az_scheduler_(otterstax::test::make_az_scheduler())
             , otb_mgr_(actor_zeta::spawn<db::OtterbrixManager>(resource_, make_otterbrix_manager(otterbrix_)))
             , catalog_(actor_zeta::spawn<mysql::CatalogManager>(resource_, otb_mgr_->address(), chx_aliases()))
             , ch_conn_(std::make_unique<ch::ConnectorManager>(resource_, catalog_->address(), &events_ch_factory, 1))
@@ -1130,7 +1182,6 @@ namespace {
             ch_conn_.reset();
             catalog_.reset();
             otb_mgr_.reset();
-            az_scheduler_->stop();
             otterbrix_.reset();
             std::filesystem::remove_all(data_dir_);
         }
@@ -1154,7 +1205,6 @@ namespace {
             REQUIRE_FALSE(added.has_error());
 
             return actor_zeta::spawn<Scheduler>(resource_,
-                                                az_scheduler_.get(),
                                                 otterstax::test::worker_pool_size(),
                                                 &make_parser,
                                                 chx_aliases(),
@@ -1170,7 +1220,6 @@ namespace {
         std::string data_dir_;
         db::otterbrix_engine_ptr otterbrix_;
         std::pmr::memory_resource* resource_{nullptr};
-        std::unique_ptr<actor_zeta::scheduler::sharing_scheduler> az_scheduler_;
         std::unique_ptr<db::OtterbrixManager, actor_zeta::pmr::deleter_t> otb_mgr_;
         std::unique_ptr<mysql::CatalogManager, actor_zeta::pmr::deleter_t> catalog_;
         std::unique_ptr<ch::ConnectorManager> ch_conn_;

@@ -7,6 +7,7 @@
 #include <yaml-cpp/yaml.h>
 #include "utility/logger.hpp"
 #include "connections/connection_config.hpp"
+#include "security/access.hpp"
 
 #include <core/result_wrapper.hpp>
 
@@ -23,10 +24,12 @@ struct FlightSqlConfig {
 
 struct MysqlConfig {
     uint16_t port = 8816;
+    std::string host = "0.0.0.0";
 };
 
 struct PostgresConfig {
     uint16_t port = 8817;
+    std::string host = "0.0.0.0";
 };
 
 struct SparkConnectConfig {
@@ -35,6 +38,7 @@ struct SparkConnectConfig {
 };
 
 struct ServiceConfig {
+    otterstax::security::access_config security;
     FlightSqlConfig flight_sql;
     MysqlConfig mysql;
     PostgresConfig postgres;

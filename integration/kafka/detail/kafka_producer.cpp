@@ -3,11 +3,13 @@
 
 #include "kafka_producer.hpp"
 #include "kafka_const.hpp"
+#include "kafka_destination_guard.hpp"
 #include "utility/tracy_profiler.hpp"
 
 #include <librdkafka/rdkafkacpp.h>
 
 #include <thread>
+#include <utility>
 
 namespace otterstax::kafka::detail {
     namespace {
@@ -31,7 +33,21 @@ namespace otterstax::kafka::detail {
         }
     } // namespace
 
+    struct kafka_producer_t::delivery_report_t final : RdKafka::DeliveryReportCb {
+        RdKafka::ErrorCode failure{RdKafka::ERR_NO_ERROR};
+
+        void dr_cb(RdKafka::Message& message) override {
+            if (failure == RdKafka::ERR_NO_ERROR && message.err() != RdKafka::ERR_NO_ERROR) {
+                failure = message.err();
+            }
+        }
+    };
+
     core::result_wrapper_t<kafka_producer_t> kafka_producer_t::create(producer_config_t config) {
+        if (!config.destinations || !config.destinations->allows_list(config.bootstrap_servers)) {
+            return producer_error("bootstrap destinations are not allowed by service.security.kafka_brokers");
+        }
+        auto destinations = std::make_unique<kafka_destination_guard>(std::move(config.destinations));
         const bool transactional = !config.transactional_id.empty();
         std::unique_ptr<RdKafka::Conf> conf(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
         if (!conf) {
@@ -48,10 +64,16 @@ namespace otterstax::kafka::detail {
             return producer_error("config: " + errstr);
         }
 
+        auto delivery_report = std::make_unique<delivery_report_t>();
+        if (!destinations->install(conf->c_ptr_global())) return producer_error("cannot install destination policy");
+        if (conf->set("dr_cb", delivery_report.get(), errstr) != RdKafka::Conf::CONF_OK) {
+            return producer_error("delivery callback: " + errstr);
+        }
         std::unique_ptr<RdKafka::Producer> producer(RdKafka::Producer::create(conf.get(), errstr));
         if (!producer) {
             return producer_error("create failed: " + errstr);
         }
+        if (!destinations->attached()) return producer_error("cannot bind destination policy");
         if (transactional) {
             // A retriable init_transactions failure means the operation is still
             // running broker-side ("retry call to resume") — a single shot that loses
@@ -70,18 +92,34 @@ namespace otterstax::kafka::detail {
                 return init.error;
             }
         }
-        return kafka_producer_t(std::move(producer), std::move(config.topic), transactional);
+        return kafka_producer_t(std::move(destinations), std::move(delivery_report), std::move(producer), std::move(config.topic), transactional);
     }
 
-    kafka_producer_t::kafka_producer_t(std::unique_ptr<RdKafka::Producer> producer,
+    kafka_producer_t::kafka_producer_t(std::unique_ptr<kafka_destination_guard> destinations,
+                                       std::unique_ptr<delivery_report_t> delivery_report,
+                                       std::unique_ptr<RdKafka::Producer> producer,
                                        std::string topic,
                                        bool transactional) noexcept
-        : producer_(std::move(producer))
+        : destinations_(std::move(destinations))
+        , delivery_report_(std::move(delivery_report))
+        , producer_(std::move(producer))
         , topic_(std::move(topic))
         , transactional_(transactional) {}
 
     kafka_producer_t::kafka_producer_t(kafka_producer_t&&) noexcept = default;
-    kafka_producer_t& kafka_producer_t::operator=(kafka_producer_t&&) noexcept = default;
+    kafka_producer_t& kafka_producer_t::operator=(kafka_producer_t&& other) noexcept {
+        if (this != &other) {
+            if (producer_) producer_->flush(to_ms(PRODUCER_DRAIN_TIMEOUT));
+            // flush/destruction may invoke the old callback.
+            producer_.reset();
+            destinations_ = std::move(other.destinations_);
+            delivery_report_ = std::move(other.delivery_report_);
+            producer_ = std::move(other.producer_);
+            topic_ = std::move(other.topic_);
+            transactional_ = other.transactional_;
+        }
+        return *this;
+    }
 
     kafka_producer_t::~kafka_producer_t() {
         if (producer_) {
@@ -112,6 +150,13 @@ namespace otterstax::kafka::detail {
         if (err != RdKafka::ERR_NO_ERROR) {
             return producer_error("flush '" + topic_ + "' failed: " + RdKafka::err2str(err));
         }
+        // flush succeeds when the queue drains, including messages rejected by
+        // the broker. Preserve delivery failures across poll() and timed-out
+        // flushes, then report them before the caller can commit input offsets.
+        const auto failure = std::exchange(delivery_report_->failure, RdKafka::ERR_NO_ERROR);
+        if (failure != RdKafka::ERR_NO_ERROR) {
+            return producer_error("delivery to '" + topic_ + "' failed: " + RdKafka::err2str(failure));
+        }
         return core::error_t::no_error();
     }
 
@@ -130,11 +175,17 @@ namespace otterstax::kafka::detail {
 
     kafka_txn_result kafka_producer_t::commit_transaction(std::chrono::milliseconds timeout) {
         OTX_ZONE_N("kafka::producer::commit_transaction");
-        return to_txn_result(producer_->commit_transaction(to_ms(timeout)), "commit_transaction");
+        auto result = to_txn_result(producer_->commit_transaction(to_ms(timeout)), "commit_transaction");
+        if (result.ok()) delivery_report_->failure = RdKafka::ERR_NO_ERROR;
+        return result;
     }
 
     kafka_txn_result kafka_producer_t::abort_transaction(std::chrono::milliseconds timeout) {
         OTX_ZONE_N("kafka::producer::abort_transaction");
-        return to_txn_result(producer_->abort_transaction(to_ms(timeout)), "abort_transaction");
+        auto result = to_txn_result(producer_->abort_transaction(to_ms(timeout)), "abort_transaction");
+        // A completed abort has drained the purged messages and their delivery
+        // reports. Those failures belong to the aborted transaction only.
+        if (result.ok()) delivery_report_->failure = RdKafka::ERR_NO_ERROR;
+        return result;
     }
 } // namespace otterstax::kafka::detail

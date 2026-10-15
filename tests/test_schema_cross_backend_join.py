@@ -43,7 +43,7 @@ def test_cross_backend_join_schema(host='0.0.0.0', mysql_port=8816):
     print(f"MySQL client config: {config}")
 
     try:
-        conn = mysql.connector.connect(**config)
+        conn = mysql.connector.connect(autocommit=True, **config)
         cursor = conn.cursor()
         print("✓ Connected to FlightSQL server via MySQL protocol\n")
     except Exception as e:
@@ -139,7 +139,7 @@ def test_cross_backend_join_schema(host='0.0.0.0', mysql_port=8816):
     print(f"{'-'*70}")
     
     try:
-        conn = mysql.connector.connect(**config)
+        conn = mysql.connector.connect(autocommit=True, **config)
         cursor = conn.cursor()
         
         cursor.execute(query)
@@ -185,7 +185,7 @@ def test_cross_backend_join_schema(host='0.0.0.0', mysql_port=8816):
     print(f"{'-'*70}")
     
     try:
-        conn = mysql.connector.connect(**config)
+        conn = mysql.connector.connect(autocommit=True, **config)
         cursor = conn.cursor()
         
         cursor.execute(query)
@@ -218,7 +218,7 @@ def test_cross_backend_join_schema(host='0.0.0.0', mysql_port=8816):
     print(f"{'='*70}")
     
     try:
-        conn = mysql.connector.connect(**config)
+        conn = mysql.connector.connect(autocommit=True, **config)
         cursor = conn.cursor()
         
         # Check PostgreSQL table

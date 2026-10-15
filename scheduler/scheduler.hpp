@@ -4,32 +4,31 @@
 #pragma once
 
 #include <actor-zeta.hpp>
-#include <actor-zeta/scheduler/sharing_scheduler.hpp>
 #include <components/log/log.hpp>
 
 #include "scheduler/session_data.hpp"
 #include "scheduler/worker.hpp"
 #include "utility/session.hpp"
+#include "utility/execution_context.hpp"
 
-#include <atomic>
-#include <boost/lockfree/queue.hpp>
-#include <condition_variable>
 #include <memory>
 #include <memory_resource>
-#include <mutex>
-#include <thread>
+
+namespace db {
+    class MySQLManager;
+    class PostgressManager;
+}
 
 // Scheduler — a thin session-affinity router over a pool of Worker actors,
 // modelled on otterbrix's services::dispatcher::manager_dispatcher_t.
 //
 // Two structural pieces:
-//   * the worker pool: N Worker actors spawned on the actor-zeta sharing_scheduler;
-//     a query keyed by session_hash always routes to workers_[id % N] (sticky), so
+//   * the worker pool: N Worker actors, each with an interleaved actor mailbox;
+//     a query keyed by request ID always routes to workers_[id % N] (sticky), so
 //     prepared-statement state stays on one Worker and no state is shared (rules 10, 12).
 //   * the event loop: enqueue_impl (any sender thread) only delivers into the
-//     lock-free inbox_ and wakes loop_thread_; ALL behaviour processing — coroutine
-//     creation, continuation resume — happens on loop_thread_. This decouples the
-//     asio frontend threads from the work and removes the inline-pump yield-spin.
+//     mailbox; all coroutine creation and resumption happens on the actor's
+//     own thread. Pending handlers can advance independent requests.
 //
 // Each handler is a coroutine that forwards to a Worker and co_returns the Worker's
 // result (future-of-future passthrough); the frontend awaits the resulting future
@@ -53,7 +52,6 @@ public:
     // otterstax::external::external_node_t) can be routed to db::S3Manager or
     // conn::file::FileManager from inside the Worker pipeline.
     Scheduler(std::pmr::memory_resource* res,
-              actor_zeta::scheduler_raw scheduler,
               std::size_t worker_count,
               parser_factory_fn parser_factory,
               const otterstax::names::alias_registry_t& aliases,
@@ -72,13 +70,19 @@ public:
 
     std::pmr::memory_resource* resource() const noexcept { return resource_; }
 
-    unique_future<session_result> execute(session_hash_t id, std::string sql);
-    unique_future<session_result> execute_statement(session_hash_t id);
+    unique_future<session_result> execute(session_hash_t id, std::string sql, execution_context context);
+    unique_future<session_result> execute_statement(session_hash_t id, execution_context context);
     unique_future<session_result>
     execute_prepared_statement(session_hash_t id,
-                               std::pmr::vector<components::types::logical_value_t> parameters);
-    unique_future<session_result> prepare_schema(session_hash_t id, std::string sql);
+                               std::pmr::vector<components::types::logical_value_t> parameters, execution_context context);
+    unique_future<session_result> prepare_schema(session_hash_t id, std::string sql, execution_context context);
     unique_future<session_result> close_statement(session_hash_t id);
+    // Wait for this connection's outstanding work, then roll back and release
+    // its engine session. A timed-out caller may drop its future; cleanup still
+    // runs on the Scheduler after the request actually finishes.
+    unique_future<session_result> close_session(execution_context context);
+    unique_future<core::result_wrapper_t<actor_zeta::address_t>> enlist_transaction(execution_context context, backend_type_t backend, std::string alias);
+    unique_future<session_result> finish_transaction(execution_context context, bool commit);
     // Pre-built plans (the Spark Connect frontend translates a DataFrame
     // relation straight into a logical plan): execute runs it like a parsed
     // statement, prepare describes its result schema without running it.
@@ -90,42 +94,47 @@ public:
                                                         &Scheduler::execute_prepared_statement,
                                                         &Scheduler::prepare_schema,
                                                         &Scheduler::close_statement,
+                                                        &Scheduler::close_session,
+                                                        &Scheduler::enlist_transaction,
+                                                        &Scheduler::finish_transaction,
                                                         &Scheduler::execute_plan,
                                                         &Scheduler::prepare_plan>;
 
     actor_zeta::behavior_t behavior(actor_zeta::mailbox::message* msg);
 
-    // Delivery-only: push into the lock-free inbox and wake loop_thread_. All
-    // processing happens on loop_thread_ (otterbrix dispatcher event-loop model).
+    // Delivery only; the mailbox owns handler and continuation execution.
     std::pair<bool, actor_zeta::detail::enqueue_result> enqueue_impl(actor_zeta::mailbox::message_ptr msg);
 
 private:
-    // Hands one message to the session's Worker (`workers_[id % N]`) and returns
-    // the Worker's future for the handler to await. Synchronous on purpose: the
-    // handler's Tracy zone lives here, on one thread, closed before the await.
-    template<typename Method, typename... Args>
-    unique_future<session_result> route(Method method, session_hash_t id, Args&&... args);
-
-    // One in-flight message in the event loop. The behavior coroutine holds a raw
-    // pointer into pending_msg across suspension, so pending_msg must outlive it.
-    struct in_flight_entry_t {
-        actor_zeta::mailbox::message_ptr pending_msg{};
-        actor_zeta::behavior_t behavior{};
+    struct connection_work {
+        size_t pending{0};
+        bool closing{false};
+        backend_type_t participant{backend_type_t::Unknown};
+        std::string alias;
+        std::unique_ptr<db::MySQLManager, actor_zeta::pmr::deleter_t> mysql{nullptr, actor_zeta::pmr::deleter_t{std::pmr::new_delete_resource()}};
+        std::unique_ptr<db::PostgressManager, actor_zeta::pmr::deleter_t> postgres{nullptr, actor_zeta::pmr::deleter_t{std::pmr::new_delete_resource()}};
+        actor_zeta::address_t backend_address() const;
+        std::optional<actor_zeta::promise<bool>> drained;
     };
+    std::unordered_map<session_id, connection_work> connections_;
+    // Requests using the same prepared ID must stay ordered even while a
+    // Worker services other IDs during an asynchronous backend operation.
+    std::unordered_map<session_hash_t, std::deque<actor_zeta::promise<bool>>> request_lanes_;
+    bool start_request(const execution_context& context);
+    void finish_request(const execution_context& context);
+    unique_future<session_result> finish_transaction_impl(execution_context context, bool commit);
+    // Keep messages for one prepared ID ordered, forward to its Worker, and
+    // release the next message only after the current result is complete.
+    template<typename Method, typename... Args>
+    unique_future<session_result> route(Method method, session_hash_t id, Args... args);
 
     std::pmr::memory_resource* resource_;
-    actor_zeta::scheduler_raw scheduler_;
     log_t log_;
+    actor_zeta::address_t sql_connection_manager_;
+    actor_zeta::address_t pg_connection_manager_;
 
     std::pmr::vector<std::unique_ptr<Worker, actor_zeta::pmr::deleter_t>> workers_;
     std::pmr::vector<actor_zeta::address_t> worker_addresses_;
 
-    // Event-loop machinery: enqueue_impl delivers into inbox_ + notifies pump_cv_;
-    // loop_thread_ owns all processing. mutex_/pump_cv_ guard only the loop's idle
-    // sleep (infra synchronisation, not a data lock — codex rule 12).
-    std::thread loop_thread_;
-    std::atomic<bool> loop_running_{true};
-    boost::lockfree::queue<actor_zeta::mailbox::message*> inbox_{128};
-    std::mutex mutex_;
-    std::condition_variable pump_cv_;
+    otterstax::actor_mailbox<Scheduler, otterstax::actor_execution::interleaved> mailbox_{*this};
 };

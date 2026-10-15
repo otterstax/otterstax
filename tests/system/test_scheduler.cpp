@@ -22,7 +22,6 @@
 #include "utility/logger.hpp"
 
 #include <actor-zeta.hpp>
-#include <actor-zeta/scheduler/sharing_scheduler.hpp>
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/detached.hpp>
 #include <boost/asio/io_context.hpp>
@@ -39,8 +38,7 @@ namespace {
     // the mock MySQL connect params come from test_helpers.hpp. The table the
     // mock parser references ("1") is registered lazily on the first query.
     using otterstax::test::await_session;
-    using otterstax::test::init_default_test_otterbrix;
-    using otterstax::test::make_az_scheduler;
+    using otterstax::test::isolated_test_engine;
     using otterstax::test::mock_connect_params;
     using otterstax::test::worker_pool_size;
 } // namespace
@@ -48,13 +46,13 @@ namespace {
 TEST_CASE("base test case") {
     using namespace std::chrono_literals;
 
-    db::otterbrix_engine_ptr otterbrix = init_default_test_otterbrix();
+    isolated_test_engine engine_fixture;
+    auto otterbrix = engine_fixture.engine();
     // Objects built here escape into the actor graph and are freed on other
     // threads: name the global allocator rather than arena-scoping it.
     auto resource = std::pmr::new_delete_resource(); // no otterbrix processing, plain malloc/free for the mock
     assert(resource);
 
-    auto az_scheduler = make_az_scheduler();
 
     auto otterbrix_manager = actor_zeta::spawn<db::OtterbrixManager>(
         resource,
@@ -84,7 +82,6 @@ TEST_CASE("base test case") {
     REQUIRE_FALSE(mysql_conn_manager->addConnection(mock_connect_params(), "2").has_error());
 
     auto scheduler = actor_zeta::spawn<Scheduler>(resource,
-                                                  az_scheduler.get(),
                                                   worker_pool_size(),
                                                   &make_mock_parser,
                                                   no_aliases(),
@@ -97,26 +94,25 @@ TEST_CASE("base test case") {
                                                   actor_zeta::address_t::empty_address());
     assert(scheduler);
     std::string sql = "SELECT 1 AS test";
-    session_id id; // Use session_id type for consistency
+    const auto id = next_request_id(); // Use session_id type for consistency
     std::cout << "[Main thread] " << std::this_thread::get_id() << std::endl;
-    auto [ns, fut] = actor_zeta::send(scheduler->address(), &Scheduler::execute, id.hash(), sql);
+    auto [ns, fut] = actor_zeta::send(scheduler->address(), &Scheduler::execute, id, sql, execution_context{});
     auto r = await_session(std::move(fut), 5000ms, resource);
     std::cout << "[Main thread] " << std::this_thread::get_id() << " check data" << std::endl;
     REQUIRE(!r.has_error());
     auto sp = std::move(r.value());
     REQUIRE(sp.size() == 2);
 
-    az_scheduler->stop();
 }
 
 TEST_CASE("Error in connector test case") {
     using namespace std::chrono_literals;
 
-    db::otterbrix_engine_ptr otterbrix = init_default_test_otterbrix();
+    isolated_test_engine engine_fixture;
+    auto otterbrix = engine_fixture.engine();
     auto resource = otterbrix->dispatcher()->resource();
     assert(resource);
 
-    auto az_scheduler = make_az_scheduler();
 
     auto otterbrix_manager = actor_zeta::spawn<db::OtterbrixManager>(
         resource,
@@ -143,7 +139,6 @@ TEST_CASE("Error in connector test case") {
     REQUIRE_FALSE(mysql_conn_manager->addConnection(mock_connect_params(), "2").has_error());
 
     auto scheduler = actor_zeta::spawn<Scheduler>(resource,
-                                                  az_scheduler.get(),
                                                   worker_pool_size(),
                                                   &make_mock_parser,
                                                   no_aliases(),
@@ -158,23 +153,22 @@ TEST_CASE("Error in connector test case") {
     std::string sql = "SELECT 1 AS test";
     session_hash_t id = 1;
     std::cout << "[Main thread] " << std::this_thread::get_id() << std::endl;
-    auto [ns, fut] = actor_zeta::send(scheduler->address(), &Scheduler::execute, id, sql);
+    auto [ns, fut] = actor_zeta::send(scheduler->address(), &Scheduler::execute, id, sql, execution_context{});
     auto r = await_session(std::move(fut), 5000ms, resource);
     std::cout << "[Main thread] " << std::this_thread::get_id() << "check data" << std::endl;
     REQUIRE(r.has_error());
     REQUIRE(r.error().what == "MockConnector: exception in runQuery");
 
-    az_scheduler->stop();
 }
 
 TEST_CASE("Error in otterbrix test case") {
     using namespace std::chrono_literals;
 
-    db::otterbrix_engine_ptr otterbrix = init_default_test_otterbrix();
+    isolated_test_engine engine_fixture;
+    auto otterbrix = engine_fixture.engine();
     auto resource = otterbrix->dispatcher()->resource();
     assert(resource);
 
-    auto az_scheduler = make_az_scheduler();
 
     auto otterbrix_manager = actor_zeta::spawn<db::OtterbrixManager>(
         resource,
@@ -201,7 +195,6 @@ TEST_CASE("Error in otterbrix test case") {
     REQUIRE_FALSE(mysql_conn_manager->addConnection(mock_connect_params(), "2").has_error());
 
     auto scheduler = actor_zeta::spawn<Scheduler>(resource,
-                                                  az_scheduler.get(),
                                                   worker_pool_size(),
                                                   &make_mock_parser,
                                                   no_aliases(),
@@ -216,23 +209,22 @@ TEST_CASE("Error in otterbrix test case") {
     std::string sql = "SELECT 1 AS test";
     session_hash_t id = 1;
     std::cout << "[Main thread] " << std::this_thread::get_id() << std::endl;
-    auto [ns, fut] = actor_zeta::send(scheduler->address(), &Scheduler::execute, id, sql);
+    auto [ns, fut] = actor_zeta::send(scheduler->address(), &Scheduler::execute, id, sql, execution_context{});
     auto r = await_session(std::move(fut), 5000ms, resource);
     std::cout << "[Main thread] " << std::this_thread::get_id() << "check data" << std::endl;
     REQUIRE(r.has_error());
     REQUIRE(r.error().what == "Otterbrix execution failed: SimpleMockOtterbrixManager: exception in execute_plan");
 
-    az_scheduler->stop();
 }
 
 TEST_CASE("Error in scheduler test case") {
     using namespace std::chrono_literals;
 
-    db::otterbrix_engine_ptr otterbrix = init_default_test_otterbrix();
+    isolated_test_engine engine_fixture;
+    auto otterbrix = engine_fixture.engine();
     auto resource = otterbrix->dispatcher()->resource();
     assert(resource);
 
-    auto az_scheduler = make_az_scheduler();
 
     auto otterbrix_manager = actor_zeta::spawn<db::OtterbrixManager>(
         resource,
@@ -260,7 +252,6 @@ TEST_CASE("Error in scheduler test case") {
     auto ch_connection_manager = actor_zeta::spawn<db::ClickhouseManager>(resource, ch_conn_manager.get());
 
     auto scheduler = actor_zeta::spawn<Scheduler>(resource,
-                                                  az_scheduler.get(),
                                                   worker_pool_size(),
                                                   &make_throwing_mock_parser,
                                                   no_aliases(),
@@ -275,23 +266,22 @@ TEST_CASE("Error in scheduler test case") {
     std::string sql = "SELECT 1 AS test";
     session_hash_t id = 1;
     std::cout << "[Main thread] " << std::this_thread::get_id() << std::endl;
-    auto [ns, fut] = actor_zeta::send(scheduler->address(), &Scheduler::execute, id, sql);
+    auto [ns, fut] = actor_zeta::send(scheduler->address(), &Scheduler::execute, id, sql, execution_context{});
     auto r = await_session(std::move(fut), 5000ms, resource);
     std::cout << "[Main thread] " << std::this_thread::get_id() << "check data" << std::endl;
     REQUIRE(r.has_error());
     REQUIRE(r.error().what == "SimpleMockParser: exception in parse");
 
-    az_scheduler->stop();
 }
 
 TEST_CASE("Error in otterbrix + sql connector test case") {
     using namespace std::chrono_literals;
 
-    db::otterbrix_engine_ptr otterbrix = init_default_test_otterbrix();
+    isolated_test_engine engine_fixture;
+    auto otterbrix = engine_fixture.engine();
     auto resource = otterbrix->dispatcher()->resource();
     assert(resource);
 
-    auto az_scheduler = make_az_scheduler();
 
     auto otterbrix_manager = actor_zeta::spawn<db::OtterbrixManager>(
         resource,
@@ -318,7 +308,6 @@ TEST_CASE("Error in otterbrix + sql connector test case") {
     REQUIRE_FALSE(mysql_conn_manager->addConnection(mock_connect_params(), "2").has_error());
 
     auto scheduler = actor_zeta::spawn<Scheduler>(resource,
-                                                  az_scheduler.get(),
                                                   worker_pool_size(),
                                                   &make_mock_parser,
                                                   no_aliases(),
@@ -333,13 +322,12 @@ TEST_CASE("Error in otterbrix + sql connector test case") {
     std::string sql = "SELECT 1 AS test";
     session_hash_t id = 1;
     std::cout << "[Main thread] " << std::this_thread::get_id() << std::endl;
-    auto [ns, fut] = actor_zeta::send(scheduler->address(), &Scheduler::execute, id, sql);
+    auto [ns, fut] = actor_zeta::send(scheduler->address(), &Scheduler::execute, id, sql, execution_context{});
     auto r = await_session(std::move(fut), 5000ms, resource);
     std::cout << "[Main thread] " << std::this_thread::get_id() << "check data" << std::endl;
     REQUIRE(r.has_error());
     REQUIRE(r.error().what == "MockConnector: exception in runQuery");
 
-    az_scheduler->stop();
 }
 
 // Mock parser that creates cross-backend query (MySQL + PostgreSQL)
@@ -423,11 +411,11 @@ public:
 TEST_CASE("Cross-backend JOIN detection test case") {
     using namespace std::chrono_literals;
 
-    db::otterbrix_engine_ptr otterbrix = init_default_test_otterbrix();
+    isolated_test_engine engine_fixture;
+    auto otterbrix = engine_fixture.engine();
     auto resource = std::pmr::new_delete_resource(); // plain malloc/free for the mock
     assert(resource);
 
-    auto az_scheduler = make_az_scheduler();
 
     // Use mock Otterbrix manager that doesn't require real execution
     auto otterbrix_manager = actor_zeta::spawn<db::OtterbrixManager>(
@@ -471,7 +459,6 @@ TEST_CASE("Cross-backend JOIN detection test case") {
     // The Scheduler builds its parser from the injected factory (&make_mock_parser);
     // each Worker gets its own instance, so the mock plan drives backend detection.
     auto scheduler = actor_zeta::spawn<Scheduler>(resource,
-                                                  az_scheduler.get(),
                                                   worker_pool_size(),
                                                   &make_cross_backend_mock_parser,
                                                   no_aliases(),
@@ -489,7 +476,7 @@ TEST_CASE("Cross-backend JOIN detection test case") {
     session_hash_t id = 1;
 
     std::cout << "[Main thread] " << std::this_thread::get_id() << " sending cross-backend query" << std::endl;
-    auto [ns, fut] = actor_zeta::send(scheduler->address(), &Scheduler::execute, id, sql);
+    auto [ns, fut] = actor_zeta::send(scheduler->address(), &Scheduler::execute, id, sql, execution_context{});
 
     // Wait for completion
     auto r = await_session(std::move(fut), 10000ms, resource);
@@ -511,17 +498,16 @@ TEST_CASE("Cross-backend JOIN detection test case") {
     // error, is acceptable).
     REQUIRE_FALSE((r.has_error() && r.error().what.starts_with("backend_unknown")));
 
-    az_scheduler->stop();
 }
 
 TEST_CASE("return empty test case") {
     using namespace std::chrono_literals;
 
-    db::otterbrix_engine_ptr otterbrix = init_default_test_otterbrix();
+    isolated_test_engine engine_fixture;
+    auto otterbrix = engine_fixture.engine();
     auto resource = otterbrix->dispatcher()->resource();
     assert(resource);
 
-    auto az_scheduler = make_az_scheduler();
 
     auto otterbrix_manager = actor_zeta::spawn<db::OtterbrixManager>(
         resource,
@@ -549,7 +535,6 @@ TEST_CASE("return empty test case") {
     REQUIRE_FALSE(mysql_conn_manager->addConnection(mock_connect_params(), "2").has_error());
 
     auto scheduler = actor_zeta::spawn<Scheduler>(resource,
-                                                  az_scheduler.get(),
                                                   worker_pool_size(),
                                                   &make_mock_parser,
                                                   no_aliases(),
@@ -564,14 +549,13 @@ TEST_CASE("return empty test case") {
     std::string sql = "SELECT 1 AS test";
     session_hash_t id = 1;
     std::cout << "[Main thread] " << std::this_thread::get_id() << std::endl;
-    auto [ns, fut] = actor_zeta::send(scheduler->address(), &Scheduler::execute, id, sql);
+    auto [ns, fut] = actor_zeta::send(scheduler->address(), &Scheduler::execute, id, sql, execution_context{});
     auto r = await_session(std::move(fut), 5000ms, resource);
     std::cout << "[Main thread] " << std::this_thread::get_id() << " check data" << std::endl;
     REQUIRE(!r.has_error());
     auto sp = std::move(r.value());
     REQUIRE(sp.empty() == true);
 
-    az_scheduler->stop();
 }
 
 // Regression for the latent >1024-row truncation: the engine's cursor delivers a
@@ -583,11 +567,11 @@ TEST_CASE("multi-chunk result carries all rows through the scheduler") {
 
     constexpr size_t N = 2500;
 
-    db::otterbrix_engine_ptr otterbrix = init_default_test_otterbrix();
+    isolated_test_engine engine_fixture;
+    auto otterbrix = engine_fixture.engine();
     auto resource = otterbrix->dispatcher()->resource();
     assert(resource);
 
-    auto az_scheduler = make_az_scheduler();
 
     auto otterbrix_manager = actor_zeta::spawn<db::OtterbrixManager>(
         resource,
@@ -614,7 +598,6 @@ TEST_CASE("multi-chunk result carries all rows through the scheduler") {
     REQUIRE_FALSE(mysql_conn_manager->addConnection(mock_connect_params(), "2").has_error());
 
     auto scheduler = actor_zeta::spawn<Scheduler>(resource,
-                                                  az_scheduler.get(),
                                                   worker_pool_size(),
                                                   &make_mock_parser,
                                                   no_aliases(),
@@ -629,7 +612,7 @@ TEST_CASE("multi-chunk result carries all rows through the scheduler") {
     std::string sql = "SELECT 1 AS test";
     session_hash_t id = 1;
     std::cout << "[Main thread] " << std::this_thread::get_id() << std::endl;
-    auto [ns, fut] = actor_zeta::send(scheduler->address(), &Scheduler::execute, id, sql);
+    auto [ns, fut] = actor_zeta::send(scheduler->address(), &Scheduler::execute, id, sql, execution_context{});
     auto r = await_session(std::move(fut), 5000ms, resource);
     std::cout << "[Main thread] " << std::this_thread::get_id() << " check data" << std::endl;
     REQUIRE(!r.has_error());
@@ -651,7 +634,6 @@ TEST_CASE("multi-chunk result carries all rows through the scheduler") {
     }
     REQUIRE(row == N);
 
-    az_scheduler->stop();
 }
 // ---------------------------------------------------------------------------
 // Sequence-root unwrap during schema resolution.
@@ -846,7 +828,8 @@ TEST_CASE("otterbrix get_schema: sequence-rooted SELECT resolves columns") {
 }
 
 TEST_CASE("otterbrix get_schema: non-aggregate plans keep the empty-schema contract") {
-    db::otterbrix_engine_ptr otterbrix = init_default_test_otterbrix();
+    isolated_test_engine engine_fixture;
+    auto otterbrix = engine_fixture.engine();
     auto resource = otterbrix->dispatcher()->resource();
     auto otterbrix_manager = actor_zeta::spawn<db::OtterbrixManager>(
         resource,
@@ -918,7 +901,8 @@ TEST_CASE("otterbrix get_schema: non-aggregate plans keep the empty-schema contr
 }
 
 TEST_CASE("catalog get_catalog_schema: sequence-rooted SELECT rewrites the external node") {
-    db::otterbrix_engine_ptr otterbrix = init_default_test_otterbrix();
+    isolated_test_engine engine_fixture;
+    auto otterbrix = engine_fixture.engine();
     auto resource = otterbrix->dispatcher()->resource();
     catalog_schema_fixture fx(resource);
 
@@ -958,7 +942,8 @@ TEST_CASE("catalog get_catalog_schema: sequence-rooted SELECT rewrites the exter
 }
 
 TEST_CASE("catalog get_catalog_schema: non-aggregate plans keep the empty-schema contract") {
-    db::otterbrix_engine_ptr otterbrix = init_default_test_otterbrix();
+    isolated_test_engine engine_fixture;
+    auto otterbrix = engine_fixture.engine();
     auto resource = otterbrix->dispatcher()->resource();
     catalog_schema_fixture fx(resource);
     GreenplumParser parser(resource, products_aliases());

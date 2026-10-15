@@ -19,6 +19,10 @@ namespace frontend::postgres {
 
     void postgres_connection::handle_startup_message(int32_t protocol_version, packet_reader& reader) {
         OTX_ZONE_N("pg::handle_startup_message");
+        if (authentication_required() && !encrypted()) {
+            send_error_response(sql_state::INVALID_AUTHORIZATION, "TLS is required", error_severity::fatal());
+            return;
+        }
         log_->info("[Connection {}]: Client protocol version: {}", connection_id_, protocol_version);
         while (reader.remaining()) {
             std::string key = reader.read_string_null();
@@ -58,6 +62,18 @@ namespace frontend::postgres {
             return;
         }
 
+        if (authentication_required()) {
+            state_ = connection_state::AUTH;
+            writer_.reserve_payload(4);
+            writer_.write_int32(3); // AuthenticationCleartextPassword, inside TLS only.
+            send_packet(writer_.build_from_payload(message_type::backend::AUTHENTICATION));
+            return;
+        }
+        finish_authentication();
+    }
+
+    void postgres_connection::finish_authentication() {
+        state_ = connection_state::COMMAND;
         std::vector<std::vector<uint8_t>> msg;
         msg.reserve(INITIAL_MESSAGES_COUNT);
         msg.emplace_back(build_auth_ok(writer_));
@@ -79,42 +95,39 @@ namespace frontend::postgres {
         send_packet_merged(std::move(msg)); // send packet & begin message-handling loop
     }
 
-    void postgres_connection::handle_ssl_decline(frontend::postgres::packet_reader& reader) {
-        OTX_ZONE_N("pg::handle_ssl_decline");
-        std::vector<uint8_t> negative(1);
-        negative[0] = 'N';
-
-        log_->info("[Connection {}] Sent SSL decline ('N'), waiting for StartupMessage", connection_id_);
-        send_packet(std::move(negative), false);
-        read_initial_message();
+    void postgres_connection::handle_ssl_request(frontend::postgres::packet_reader& reader) {
+        if (reader.remaining() != 0 || encrypted()) {
+            send_error_response(sql_state::PROTOCOL_VIOLATION, "Invalid SSLRequest", error_severity::fatal());
+            return;
+        }
+        if (tls_available()) {
+            send_then({'S'}, [this] { start_tls([this] { read_initial_message(); }); });
+        } else {
+            send_then({'N'}, [this] { read_initial_message(); });
+        }
     }
 
     void postgres_connection::handle_query(std::string query) {
         OTX_ZONE_N("pg::handle_query");
-        session_id id;
-        // sending to the Scheduler event-loop always returns needs_sched=false
-        [[maybe_unused]] auto [needs_sched, fut] = actor_zeta::send(scheduler_, &Scheduler::execute, id.hash(), query);
-        auto r = otterstax::await_future_blocking<session_payload>(std::move(fut), resource_);
+        // A simple Query replaces the unnamed statement and portal.
+        if (!do_close(describe_close_arg::STATEMENT, "")) {
+            send_error_response(sql_state::INTERNAL_ERROR, "Unable to release unnamed statement", error_severity::fatal());
+            return;
+        }
+        do_close(describe_close_arg::PORTAL, "");
+        if (try_deallocate(query)) return;
+        const auto id = next_request_id();
+        auto r = sql_session_.execute(id, query);
 
         if (r.has_error()) {
-            if (r.error().type == otterstax::AWAIT_TIMEOUT_CODE) {
-                send_error_response(sql_state::QUERY_CANCELED, "Query exceeded execution limit");
-            } else {
-                // may be a transaction block, handle them separately
-                // todo: psycopg2's PREPARE & EXECUTE
-                try_handle_transaction(std::move(query), std::string{r.error().what.c_str()});
-            }
+            send_query_error(r.error());
             return;
         }
 
         // handle Ok
         session_payload sdata_result = std::move(r.value());
-        if (sdata_result.tag == T_TransactionStmt) {
-            // The engine runs BEGIN / COMMIT / ROLLBACK itself and answers
-            // without a result; the transaction block ReadyForQuery reports is
-            // kept here.
-            try_handle_transaction(std::move(query), std::string{});
-            return;
+        if (sdata_result.transaction_command == "COMMIT" || sdata_result.transaction_command == "ROLLBACK") {
+            portals_.clear();
         }
         int64_t rows_cnt = sdata_result.size();
         std::vector<std::vector<uint8_t>> response;
@@ -137,74 +150,44 @@ namespace frontend::postgres {
             }
             response = postgres_resultset::build_packets(std::move(result));
         }
+        if (!finish_implicit_transaction()) return;
         response.emplace_back(
-            build_command_complete(writer_, command_complete_tag::simple_command(sdata_result.tag, rows_cnt)));
-        response.emplace_back(build_ready_for_query(writer_, transaction_man_.get_transaction_status()));
+            build_command_complete(writer_, result_tag(sdata_result, rows_cnt)));
+        response.emplace_back(build_ready_for_query(writer_, wire_transaction_status()));
         send_packet_merged(std::move(response));
     }
 
-    void postgres_connection::try_handle_transaction(std::string query, std::string error) {
-        OTX_ZONE_N("pg::try_handle_transaction");
-        // `error` is empty for a transaction statement the engine ran (BEGIN,
-        // COMMIT, ROLLBACK); the savepoint statements reach here as the
-        // engine's "Unsupported node type".
-        if (error.empty() || error.find("Unsupported node type") != std::string::npos) {
-            try {
-                tracy_memory_resource arena_mr(resource_, "pg::parse_arena");
-                std::pmr::monotonic_buffer_resource arena_resource(&arena_mr);
-                auto res = linitial(raw_parser(&arena_resource, query.c_str()));
-                if (nodeTag(res) == T_TransactionStmt) { // handle transactions
-                    auto tr = transform::pg_ptr_cast<TransactionStmt>(res);
-                    switch (tr->kind) {
-                        case TRANS_STMT_START:
-                        case TRANS_STMT_BEGIN:
-                            send_packet_merged(transaction_man_.handle_begin(writer_));
-                            return;
-                        case TRANS_STMT_COMMIT:
-                            portals_.clear(); // portals are released at transaction's end
-                            send_packet_merged(transaction_man_.handle_commit(writer_));
-                            return;
-                        case TRANS_STMT_ROLLBACK:
-                            portals_.clear();
-                            send_packet_merged(transaction_man_.handle_rollback(writer_));
-                            return;
-                        case TRANS_STMT_SAVEPOINT: {
-                            auto def = transform::pg_ptr_cast<DefElem>(linitial(tr->options));
-                            send_packet_merged(
-                                transaction_man_.handle_savepoint(writer_,
-                                                                  strVal(transform::pg_ptr_cast<Value>(def->arg))));
-                            return;
-                        }
-                        case TRANS_STMT_ROLLBACK_TO: {
-                            auto def = transform::pg_ptr_cast<DefElem>(linitial(tr->options));
-                            send_packet_merged(transaction_man_.handle_rollback_to_savepoint(
-                                writer_,
-                                strVal(transform::pg_ptr_cast<Value>(def->arg))));
-                            return;
-                        }
-                        case TRANS_STMT_RELEASE: {
-                            auto def = transform::pg_ptr_cast<DefElem>(linitial(tr->options));
-                            send_packet_merged(transaction_man_.handle_release_savepoint(
-                                writer_,
-                                strVal(transform::pg_ptr_cast<Value>(def->arg))));
-                            return;
-                        }
-                        case TRANS_STMT_PREPARE:
-                        case TRANS_STMT_COMMIT_PREPARED:
-                        case TRANS_STMT_ROLLBACK_PREPARED:
-                            send_error_response(sql_state::PROTOCOL_VIOLATION, "Unable to prepare transaction");
-                            return;
-                    }
-                }
-            } catch (const std::exception& e) {
-                // do nothing, first error message will be sent
-            }
+    bool postgres_connection::finish_implicit_transaction() {
+        auto result = sql_session_.finish_implicit();
+        if (result.has_error()) {
+            send_query_error(result.error());
+            return false;
         }
+        if (sql_session_.status() == frontend::sql_session::state::idle) portals_.clear();
+        return true;
+    }
 
-        // The engine's own refusal; a statement the engine ran that the parse
-        // above does not recognize as a transaction statement is named instead.
-        send_error_response(sql_state::SYNTAX_ERROR,
-                            error.empty() ? "Unrecognized transaction statement: " + query : std::move(error));
+    void postgres_connection::send_query_error(const core::error_t& error) {
+        const auto code = error.type == otterstax::AWAIT_TIMEOUT_CODE ? sql_state::QUERY_CANCELED
+                         : error.type == core::error_code_t::transaction_finalized ? sql_state::IN_FAILED_SQL_TRANSACTION
+                         : error.type == core::error_code_t::unimplemented_yet ? sql_state::FEATURE_NOT_SUPPORTED
+                         : sql_state::SYNTAX_ERROR;
+        send_error_response(code, std::string{error.what.c_str()});
+    }
+
+    transaction_status postgres_connection::wire_transaction_status() const {
+        switch (sql_session_.status()) {
+            case frontend::sql_session::state::active: return transaction_status::IN_TRANSACTION;
+            case frontend::sql_session::state::failed: return transaction_status::TRANSACTION_ERROR;
+            default: return transaction_status::IDLE;
+        }
+    }
+
+    command_complete_tag postgres_connection::result_tag(const session_payload& payload, int64_t rows) const {
+        if (payload.transaction_command == "BEGIN") return command_complete_tag::begin();
+        if (payload.transaction_command == "COMMIT") return command_complete_tag::commit();
+        if (payload.transaction_command == "ROLLBACK") return command_complete_tag::rollback();
+        return command_complete_tag::simple_command(payload.tag, rows);
     }
 
     void
@@ -231,18 +214,23 @@ namespace frontend::postgres {
             return;
         }
 
-        session_id id;
-        // sending to the Scheduler event-loop always returns needs_sched=false
-        [[maybe_unused]] auto [needs_sched, fut] =
-            actor_zeta::send(scheduler_, &Scheduler::prepare_schema, id.hash(), query);
-        auto r = otterstax::await_future_blocking<session_payload>(std::move(fut), resource_);
+        if (!stmt.empty() && statement_name_map_.contains(stmt)) {
+            send_error_response(sql_state::DUPLICATE_PREPARED_STATEMENT,
+                                "Prepared statement already exists: " + stmt);
+            return;
+        }
+        // Even a failed unnamed Parse replaces the preceding unnamed statement.
+        // Bound portals retain their own ownership of its metadata.
+        if (stmt.empty() && !do_close(describe_close_arg::STATEMENT, stmt)) {
+            send_error_response(sql_state::INTERNAL_ERROR, "Unable to release prepared statement", error_severity::fatal());
+            return;
+        }
+
+        const auto id = next_request_id();
+        auto r = sql_session_.prepare(id, query);
 
         if (r.has_error()) {
-            if (r.error().type == otterstax::AWAIT_TIMEOUT_CODE) {
-                send_error_response(sql_state::QUERY_CANCELED, "Query exceeded execution limit");
-            } else {
-                send_error_response(sql_state::SYNTAX_ERROR, "Syntax error: " + std::string{r.error().what.c_str()});
-            }
+            send_query_error(r.error());
             return;
         }
 
@@ -253,17 +241,21 @@ namespace frontend::postgres {
                     result.parameter_count);
 
         if (result.parameter_count != specified_types.size()) {
+            if (!release_statement(id)) {
+                send_error_response(sql_state::INTERNAL_ERROR, "Unable to release prepared statement", error_severity::fatal());
+                return;
+            }
             send_error_response(sql_state::UNDEFINED_PARAMETER,
                                 "Parameter type left unspecified: specified " + std::to_string(specified_types.size()) +
                                     " out of " + std::to_string(result.parameter_count));
             return;
         }
 
-        // statements with identical name replace each other, together with their portals
-        do_close(describe_close_arg::STATEMENT, stmt);
         statement_name_map_.emplace(std::move(stmt),
-                                    prepared_stmt_meta(resource_,
-                                                       id.hash(),
+                                    std::allocate_shared<prepared_stmt_meta>(
+                                                       std::pmr::polymorphic_allocator<prepared_stmt_meta>{resource_},
+                                                       resource_,
+                                                       id,
                                                        std::move(query),
                                                        result.parameter_count,
                                                        std::move(result.schema),
@@ -285,11 +277,16 @@ namespace frontend::postgres {
             return;
         }
 
-        if (num_params != it->second.parameter_count) {
+        if (num_params != it->second->parameter_count) {
             send_error_response(sql_state::UNDEFINED_PARAMETER,
                                 "Missing parameters in BIND to statement " + stmt + ": received " +
                                     std::to_string(num_params) + " out of required " +
-                                    std::to_string(it->second.parameter_count));
+                                    std::to_string(it->second->parameter_count));
+            return;
+        }
+
+        if (!portal_name.empty() && portals_.contains(portal_name)) {
+            send_error_response(sql_state::DUPLICATE_CURSOR, "Portal already exists: " + portal_name);
             return;
         }
 
@@ -301,7 +298,7 @@ namespace frontend::postgres {
                 send_error_response(sql_state::UNDEFINED_PARAMETER,
                                     "Missing parameters format codes in BIND to statement " + stmt + ": received " +
                                         std::to_string(format.size()) + " out of required " +
-                                        std::to_string(it->second.parameter_count));
+                                        std::to_string(it->second->parameter_count));
                 return;
             } else {
                 encoding = *encoding_opt;
@@ -323,7 +320,7 @@ namespace frontend::postgres {
                 return;
             }
 
-            const field_type type = it->second.specified_types[i];
+            const field_type type = it->second->specified_types[i];
             if (encoding == result_encoding::TEXT) {
                 std::string str(len, '\0');
                 for (int j = 0; j < len; str[j++] = static_cast<char>(reader.read_uint8()))
@@ -433,8 +430,7 @@ namespace frontend::postgres {
         }
 
         // add & create portal
-        it->second.portal_names.emplace_back(portal_name);
-        portals_.erase(portal_name); // portals with identical name replace each other
+        portals_.erase(portal_name); // only the unnamed portal can already exist
         portals_.emplace(std::move(portal_name), portal_meta(std::move(params), it->second, std::move(out_format)));
 
         send_packet(build_bind_complete(writer_));
@@ -442,22 +438,19 @@ namespace frontend::postgres {
 
     bool postgres_connection::reprepare_stmt(prepared_stmt_meta& stmt) {
         OTX_ZONE_N("pg::reprepare_stmt");
-        session_id id;
-        // sending to the Scheduler event-loop always returns needs_sched=false
-        [[maybe_unused]] auto [needs_sched, fut] =
-            actor_zeta::send(scheduler_, &Scheduler::prepare_schema, id.hash(), std::string{stmt.sql.c_str()});
-        auto r = otterstax::await_future_blocking<session_payload>(std::move(fut), resource_);
+        const auto id = next_request_id();
+        auto r = sql_session_.prepare(id, std::string{stmt.sql.c_str()});
 
         if (r.has_error()) {
-            if (r.error().type == otterstax::AWAIT_TIMEOUT_CODE) {
-                send_error_response(sql_state::QUERY_CANCELED, "Query exceeded execution limit");
-            } else {
-                send_error_response(sql_state::SYNTAX_ERROR, "Syntax error: " + std::string{r.error().what.c_str()});
-            }
+            send_query_error(r.error());
             return false;
         }
 
         if (r.value().parameter_count != stmt.parameter_count) {
+            if (!release_statement(id)) {
+                send_error_response(sql_state::INTERNAL_ERROR, "Unable to release prepared statement", error_severity::fatal());
+                return false;
+            }
             send_error_response(sql_state::UNDEFINED_PARAMETER,
                                 "Prepared statement changed its parameter count on re-prepare: " +
                                     std::to_string(r.value().parameter_count) + " out of " +
@@ -465,33 +458,25 @@ namespace frontend::postgres {
             return false;
         }
 
-        stmt.stmt_session = id.hash();
+        stmt.stmt_session = id;
         stmt.consumed = false;
         return true;
     }
 
     bool postgres_connection::run_portal(portal_meta& portal) {
         OTX_ZONE_N("pg::run_portal");
-        auto& stmt = portal.statement.get();
+        auto& stmt = *portal.statement;
         if (stmt.consumed && !reprepare_stmt(stmt)) {
             return false;
         }
         // The worker drops the statement on every exit path of the execution.
         stmt.consumed = true;
 
-        // sending to the Scheduler event-loop always returns needs_sched=false
-        [[maybe_unused]] auto [needs_sched, fut] = actor_zeta::send(scheduler_,
-                                                                    &Scheduler::execute_prepared_statement,
-                                                                    stmt.stmt_session,
-                                                                    std::move(portal.params));
-        auto r = otterstax::await_future_blocking<session_payload>(std::move(fut), resource_);
+        auto r = sql_session_.execute_prepared(stmt.stmt_session, std::string{stmt.sql.c_str()},
+                                                   std::move(portal.params));
 
         if (r.has_error()) {
-            if (r.error().type == otterstax::AWAIT_TIMEOUT_CODE) {
-                send_error_response(sql_state::QUERY_CANCELED, "Query exceeded execution limit");
-            } else {
-                send_error_response(sql_state::SYNTAX_ERROR, "Syntax error: " + std::string{r.error().what.c_str()});
-            }
+            send_query_error(r.error());
             return false;
         }
 
@@ -511,7 +496,11 @@ namespace frontend::postgres {
         }
 
         auto& portal = it->second;
-        auto& stmt = portal.statement.get();
+        auto& stmt = *portal.statement;
+        if (portal.result && sql_session_.status() == frontend::sql_session::state::failed) {
+            send_error_response(sql_state::IN_FAILED_SQL_TRANSACTION, "Transaction is aborted");
+            return;
+        }
         if (!portal.result && !run_portal(portal)) {
             return;
         }
@@ -595,42 +584,88 @@ namespace frontend::postgres {
         }
 
         response.emplace_back(
-            build_command_complete(writer_, command_complete_tag::simple_command(payload.tag, rows_cnt)));
+            build_command_complete(writer_, result_tag(payload, rows_cnt)));
+        if (payload.transaction_command == "COMMIT" || payload.transaction_command == "ROLLBACK") {
+            portals_.clear();
+        }
         send_packet_merged(std::move(response));
     }
 
     void postgres_connection::handle_close(describe_close_arg type, std::string name) {
         OTX_ZONE_N("pg::handle_close");
         log_->info("[Connection {}] CLOSE name: \"{}\" type:\"{}\"", connection_id_, name, static_cast<char>(type));
-        do_close(type, std::move(name));
+        if (!do_close(type, std::move(name))) {
+            send_error_response(sql_state::INTERNAL_ERROR, "Unable to release prepared statement", error_severity::fatal());
+            return;
+        }
         send_packet(build_close_complete(writer_));
     }
 
-    void postgres_connection::do_close(frontend::postgres::describe_close_arg type, std::string name) {
+    bool postgres_connection::do_close(frontend::postgres::describe_close_arg type, std::string name) {
         if (type == describe_close_arg::STATEMENT) {
             if (auto it = statement_name_map_.find(name); it != statement_name_map_.end()) {
-                for (auto&& p : it->second.portal_names) {
-                    do_close(describe_close_arg::PORTAL, std::move(p));
-                }
                 // The worker keeps an unexecuted statement until it is closed;
                 // an executed one it has already dropped (consumed).
-                if (!it->second.consumed) {
-                    // sending to the Scheduler event-loop always returns needs_sched=false
-                    [[maybe_unused]] auto [needs_sched, fut] =
-                        actor_zeta::send(scheduler_, &Scheduler::close_statement, it->second.stmt_session);
-                    auto r = otterstax::await_future_blocking<session_payload>(std::move(fut), resource_);
-                    if (r.has_error()) {
-                        log_->warn("[Connection {}] CLOSE stmt: \"{}\": close_statement failed: {}",
-                                   connection_id_,
-                                   name,
-                                   r.error().what);
-                    }
+                if (!it->second->consumed) {
+                    if (!release_statement(it->second->stmt_session)) return false;
+                    // A bound portal can still execute this text. It must
+                    // obtain a fresh Worker entry, just as after an Execute.
+                    it->second->consumed = true;
                 }
                 statement_name_map_.erase(it);
             }
         } else {
             portals_.erase(std::move(name));
         }
+        return true;
+    }
+
+    bool postgres_connection::release_statement(session_hash_t id) {
+        OTX_ZONE_N("pg::release_statement");
+        auto [needs_sched, future] = actor_zeta::send(scheduler_, &Scheduler::close_statement, id);
+        auto result = otterstax::await_future_blocking<session_payload>(std::move(future), resource_);
+        if (result.has_error()) {
+            log_->warn("[Connection {}] close_statement {} failed: {}", connection_id_, id, result.error().what);
+            return false;
+        }
+        return true;
+    }
+
+    bool postgres_connection::try_deallocate(const std::string& query) {
+        std::optional<std::string> name;
+        try {
+            std::pmr::monotonic_buffer_resource arena(resource_);
+            auto statements = raw_parser(&arena, query.c_str());
+            if (list_length(statements) != 1 || nodeTag(linitial(statements)) != T_DeallocateStmt) return false;
+            auto statement = transform::pg_ptr_cast<DeallocateStmt>(linitial(statements));
+            if (statement->name) name.emplace(statement->name);
+        } catch (const std::exception&) {
+            return false;
+        }
+        if (sql_session_.status() == frontend::sql_session::state::failed) {
+            send_error_response(sql_state::IN_FAILED_SQL_TRANSACTION, "Transaction is aborted");
+            return true;
+        }
+        if (name && statement_name_map_.find(*name) == statement_name_map_.end()) {
+            send_error_response(sql_state::INVALID_SQL_STATAMENT_NAME, "Prepared statement does not exist: " + *name);
+            return true;
+        }
+        bool closed = true;
+        if (name) {
+            closed = do_close(describe_close_arg::STATEMENT, *name);
+        } else {
+            while (closed && !statement_name_map_.empty()) {
+                closed = do_close(describe_close_arg::STATEMENT, statement_name_map_.begin()->first);
+            }
+        }
+        if (!closed) {
+            send_error_response(sql_state::INTERNAL_ERROR, "Unable to release prepared statement", error_severity::fatal());
+            return true;
+        }
+        if (!finish_implicit_transaction()) return true;
+        send_packet_merged({build_command_complete(writer_, command_complete_tag::simple_command(T_DeallocateStmt)),
+                            build_ready_for_query(writer_, wire_transaction_status())});
+        return true;
     }
 
     void postgres_connection::handle_describe(describe_close_arg type, std::string name) {
@@ -646,8 +681,8 @@ namespace frontend::postgres {
             }
             // A statement has no result formats yet (they come with Bind), so its
             // RowDescription is text; ParameterDescription always precedes it.
-            packets.emplace_back(build_parameter_description(writer_, it->second.specified_types));
-            if (!do_describe(it->second.schema, {result_encoding::TEXT}, packets, it->second.described)) {
+            packets.emplace_back(build_parameter_description(writer_, it->second->specified_types));
+            if (!do_describe(it->second->schema, {result_encoding::TEXT}, packets, it->second->described)) {
                 return;
             }
         } else {
@@ -674,7 +709,12 @@ namespace frontend::postgres {
             // than by executing anything; for one without it there are no
             // result columns and the answer is NoData.
             auto& portal = it->second;
-            if (portal.statement.get().tag == T_SelectStmt) {
+            if (portal.statement->tag != T_TransactionStmt &&
+                sql_session_.status() == frontend::sql_session::state::failed) {
+                send_error_response(sql_state::IN_FAILED_SQL_TRANSACTION, "Transaction is aborted");
+                return;
+            }
+            if (portal.statement->tag == T_SelectStmt) {
                 if (!portal.result && !run_portal(portal)) {
                     return;
                 }
@@ -687,7 +727,7 @@ namespace frontend::postgres {
                                  portal.described)) {
                     return;
                 }
-            } else if (!do_describe(portal.statement.get().schema, portal.format, packets, portal.described)) {
+            } else if (!do_describe(portal.statement->schema, portal.format, packets, portal.described)) {
                 return;
             }
         }
@@ -731,11 +771,19 @@ namespace frontend::postgres {
     }
 
     void postgres_connection::finish_impl() {
+        auto rollback = sql_session_.close();
+        if (rollback.has_error()) {
+            log_->error("[Connection {}] Transaction cleanup failed: {}", connection_id_, rollback.error().what);
+        }
         OTX_ZONE_N("pg::finish_impl");
-        // do_close releases an unexecuted statement on the Worker and forgets
-        // the statement with its portals; the loop drains the map through it.
+        // do_close releases unexecuted Worker entries. Portals hold only
+        // metadata or completed results after their statement is closed.
         while (!statement_name_map_.empty()) {
-            do_close(describe_close_arg::STATEMENT, statement_name_map_.begin()->first);
+            if (!do_close(describe_close_arg::STATEMENT, statement_name_map_.begin()->first)) {
+                // The failed close was logged; avoid retrying indefinitely
+                // while the connection is being destroyed.
+                statement_name_map_.erase(statement_name_map_.begin());
+            }
         }
         portals_.clear();
     }

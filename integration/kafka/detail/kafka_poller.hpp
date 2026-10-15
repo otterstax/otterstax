@@ -22,7 +22,7 @@ namespace otterstax::kafka::detail {
     // One at-least-once batch: INSERT `chunk` into database.table on a fresh
     // (autocommit) engine session, driven to completion on the calling thread.
     // Returns the engine's error so the caller can withhold the consumer commit
-    // and rewind; an empty chunk (all messages rejected) is a success so the
+    // and retry; an empty chunk (all messages rejected) is a success so the
     // caller still advances past unparseable messages
     core::error_t ingest_at_least_once(actor_zeta::address_t dispatcher_address,
                                        std::pmr::memory_resource* resource,
@@ -31,10 +31,10 @@ namespace otterstax::kafka::detail {
                                        components::vector::data_chunk_t chunk);
 
     // One exactly-once batch on a single engine session: BEGIN -> INSERT `chunk`
-    // -> INSERT `next_offsets` into <table>__offsets -> COMMIT, so the rows and
+    // -> replace touched partitions in <table>__offsets -> COMMIT, so the rows and
     // the consumed positions land atomically (an empty chunk still advances the
     // offsets). On any failure the transaction is rolled back and the failing
-    // step's error is returned; the caller rewinds the consumer to the batch start
+    // step's error is returned; the caller retains the batch for retry
     core::error_t ingest_transactional(actor_zeta::address_t dispatcher_address,
                                        std::pmr::memory_resource* resource,
                                        const std::string& database,
@@ -44,8 +44,8 @@ namespace otterstax::kafka::detail {
 
     // Per-SOURCE ingestion worker: owns a thread that polls the topic, converts
     // each batch to a chunk and inserts it. Not an actor. A failed batch is never
-    // committed: the consumer is rewound to the batch start and the batch retried
-    // after a capped exponential pause
+    // committed: its original records are retained and retried after a capped
+    // exponential pause before polling any later records
     class kafka_poller_t {
     public:
         kafka_poller_t(actor_zeta::address_t dispatcher_address,

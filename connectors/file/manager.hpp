@@ -15,6 +15,8 @@
 #include <string>
 #include <unordered_map>
 
+namespace otterstax::security { class file_access; }
+
 namespace conn::file {
 
 class FileManager final : public actor_zeta::actor::actor_mixin<FileManager> {
@@ -23,15 +25,16 @@ class FileManager final : public actor_zeta::actor::actor_mixin<FileManager> {
         template<typename T>
         using unique_future = actor_zeta::unique_future<T>;
 
-        FileManager(std::pmr::memory_resource* res, actor_zeta::address_t otterbrix_manager);
+        FileManager(std::pmr::memory_resource* res, actor_zeta::address_t otterbrix_manager,
+                    std::shared_ptr<const otterstax::security::file_access> files = {});
 
         std::pmr::memory_resource* resource() const noexcept { return resource_; }
 
         /// handler coroutines
         actor_zeta::unique_future<core::result_wrapper_t<bool>> add_file(session_hash_t id, FileAddParams params);
         // Dumps the table to file_metadata.path. When file_metadata.is_temporary
-        // is set, the basename is prefixed by a timestamp (kept in the same
-        // directory) so existing files are never clobbered. Returns the path
+        // is set, the basename gets a random prefix (in the same directory)
+        // and is published without replacing an existing file. Returns the path
         // actually written on success.
         actor_zeta::unique_future<core::result_wrapper_t<std::string>> dump_file(session_hash_t id, FileMetadata file_metadata);
 
@@ -44,6 +47,7 @@ class FileManager final : public actor_zeta::actor::actor_mixin<FileManager> {
     private:
         std::pmr::memory_resource* resource_;
         actor_zeta::address_t otterbrix_manager_;
+        std::shared_ptr<const otterstax::security::file_access> files_;
         log_t log_;
         OTX_LOCKABLE_N(std::mutex, mutex_, "FileManager::mutex");
         actor_zeta::behavior_t current_behavior_;

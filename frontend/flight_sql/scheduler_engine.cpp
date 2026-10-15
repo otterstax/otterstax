@@ -98,10 +98,10 @@ namespace flight::engine {
 
     session_payload SchedulerEngine::run_query(const std::string& sql) {
         OTX_ZONE_N("flight::SchedulerEngine::run_query");
-        session_id id;
+        const auto id = next_request_id();
         // sending to the Scheduler event-loop always returns needs_sched=false
         [[maybe_unused]] auto [needs_sched, fut] =
-            actor_zeta::send(scheduler_, &Scheduler::execute, id.hash(), sql);
+            actor_zeta::send(scheduler_, &Scheduler::execute, id, sql, execution_context{});
         auto r = otterstax::await_future_blocking<session_payload>(std::move(fut), resource_);
         if (r.has_error()) {
             engine_error(r.error(), "executing the statement");
@@ -111,15 +111,15 @@ namespace flight::engine {
 
     std::pair<session_hash_t, session_payload> SchedulerEngine::prepare_fresh(const std::string& sql) {
         OTX_ZONE_N("flight::SchedulerEngine::prepare_fresh");
-        session_id id;
+        const auto id = next_request_id();
         // sending to the Scheduler event-loop always returns needs_sched=false
         [[maybe_unused]] auto [needs_sched, fut] =
-            actor_zeta::send(scheduler_, &Scheduler::prepare_schema, id.hash(), sql);
+            actor_zeta::send(scheduler_, &Scheduler::prepare_schema, id, sql, execution_context{});
         auto r = otterstax::await_future_blocking<session_payload>(std::move(fut), resource_);
         if (r.has_error()) {
             engine_error(r.error(), "preparing the statement");
         }
-        return {id.hash(), std::move(r.value())};
+        return {id, std::move(r.value())};
     }
 
     std::pmr::vector<std::pmr::vector<components::types::logical_value_t>>
@@ -172,7 +172,7 @@ namespace flight::engine {
                          : std::move(parameters.front());
         // sending to the Scheduler event-loop always returns needs_sched=false
         [[maybe_unused]] auto [needs_sched, fut] =
-            actor_zeta::send(scheduler_, &Scheduler::execute_prepared_statement, id, std::move(bound));
+            actor_zeta::send(scheduler_, &Scheduler::execute_prepared_statement, id, std::move(bound), execution_context{});
         auto r = otterstax::await_future_blocking<session_payload>(std::move(fut), resource_);
         if (r.has_error()) {
             engine_error(r.error(), "executing the prepared statement");
@@ -222,7 +222,7 @@ namespace flight::engine {
 
         // sending to the Scheduler event-loop always returns needs_sched=false
         [[maybe_unused]] auto [needs_sched, fut] =
-            actor_zeta::send(scheduler_, &Scheduler::execute_statement, id);
+            actor_zeta::send(scheduler_, &Scheduler::execute_statement, id, execution_context{});
         auto r = otterstax::await_future_blocking<session_payload>(std::move(fut), resource_);
         if (r.has_error()) {
             engine_error(r.error(), "executing the statement");

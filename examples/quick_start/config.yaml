@@ -5,6 +5,7 @@
 # compose.yml. Edit this file and restart to change connections.
 
 service:
+  security: { mode: trusted_private, kafka_brokers: ["qs-kafka:9092"] }
   flight_sql:
     host: "0.0.0.0"
     port: 8815
@@ -59,3 +60,4 @@ connections:
       secret_key: minioadmin
       region: us-east-1
       endpoint: qs-minio:9000
+      scheme: http

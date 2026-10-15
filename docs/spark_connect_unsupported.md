@@ -286,24 +286,27 @@ Rows reach PySpark as Arrow batches.
 
 ## Other RPCs and protocol features
 
-- **Config** — `spark.conf.set()` / `unset()` are accepted and ignored.
+- **Config** — `spark.conf.set()` / `unset()` return `UNIMPLEMENTED`.
+  A best-effort SET (`silent=true`, used by session builders) returns a warning
+  for every unapplied key. `isModifiable()` is false for all keys.
   `spark.conf.get()` answers `spark.sql.session.timeZone` (`UTC`),
   `spark.sql.execution.pyspark.binaryAsBytes` (`true`),
   `spark.sql.execution.pandas.structHandlingMode` (`LEGACY`) and
-  `spark.sql.execution.arrow.pyspark.selfDestruct.enabled` (`false`), and an
-  empty value for any other key.
+  `spark.sql.execution.arrow.pyspark.selfDestruct.enabled` (`false`). Unknown
+  keys return `NOT_FOUND`; an optional lookup returns no value, and a lookup
+  with a default uses that default only when the key has no effective value.
 - **AnalyzePlan** — besides the schema and `spark.version`: `df.explain()`
   prints `EXPLAIN not supported`, `isLocal()` and `isStreaming` are false,
   `inputFiles()` is empty. The other analyses — `printSchema()`'s tree string,
   `sameSemantics()`, `semanticHash()`, `cache()` / `persist()` / `unpersist()`,
   `storageLevel`, DDL parsing — get a placeholder answer, not a result; use
   `df.schema` in place of `printSchema()`.
-- **Interrupt** — accepted and ignored: a query runs to completion.
+- **Interrupt** — returns `UNIMPLEMENTED`; the server cannot interrupt a running query.
 - **ReattachExecute** — results are not buffered, so a result stream that broke
   cannot be resumed (`NOT_FOUND`, `INVALID_HANDLE.OPERATION_NOT_FOUND`).
   ReleaseExecute and ReleaseSession are acknowledged.
-- **Artifacts** — `AddArtifacts` / `ArtifactStatus` are acknowledged and nothing
-  is stored.
+- **Artifacts** — `AddArtifacts` / `ArtifactStatus` return `UNIMPLEMENTED`.
+  Uploads are refused immediately, without waiting for the client stream to end.
 - **FetchErrorDetails** — answers no details: an error carries its message only.
 - **Not implemented from 4.1 / 4.2** — the `CloneSession` and `GetStatus` RPCs
   (clients call them only through their explicit API); compressed plans

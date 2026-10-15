@@ -14,15 +14,16 @@
 #include <arrow/table.h>
 #include <parquet/arrow/writer.h>
 
+#include <functional>
 #include <memory>
 #include <memory_resource>
 #include <vector>
 
 namespace tsl {
 
-core::result_wrapper_t<bool> chunk_to_parquet(std::pmr::memory_resource* res,
+static core::result_wrapper_t<bool> write_parquet(std::pmr::memory_resource* res,
                                               const std::pmr::vector<components::vector::data_chunk_t>& chunks,
-                                              const std::string& path) {
+                                              const std::function<arrow::Result<std::shared_ptr<arrow::io::OutputStream>>()>& open_sink) {
     OTX_ZONE_N("tsl::chunk_to_parquet");
     // Arrow's table API takes a std::vector of batches.
     std::vector<std::shared_ptr<arrow::RecordBatch>> batches;
@@ -41,7 +42,7 @@ core::result_wrapper_t<bool> chunk_to_parquet(std::pmr::memory_resource* res,
                            "chunk_to_parquet: FromRecordBatches failed", table_result.status());
     }
 
-    auto sink_result = arrow::io::FileOutputStream::Open(path);
+    auto sink_result = open_sink();
     if (!sink_result.ok()) {
         return arrow_error(res, core::error_code_t::io_error,
                            "chunk_to_parquet: cannot open output", sink_result.status());
@@ -57,6 +58,21 @@ core::result_wrapper_t<bool> chunk_to_parquet(std::pmr::memory_resource* res,
         return arrow_error(res, core::error_code_t::io_error, "chunk_to_parquet: Close failed", closed);
     }
     return true;
+}
+
+
+core::result_wrapper_t<bool> chunk_to_parquet(std::pmr::memory_resource* res,
+    const std::pmr::vector<components::vector::data_chunk_t>& chunks, const std::string& path) {
+    return write_parquet(res, chunks, [&]() -> arrow::Result<std::shared_ptr<arrow::io::OutputStream>> {
+        ARROW_ASSIGN_OR_RAISE(auto stream, arrow::io::FileOutputStream::Open(path));
+        return stream;
+    });
+}
+
+core::result_wrapper_t<bool> chunk_to_parquet(std::pmr::memory_resource* res,
+    const std::pmr::vector<components::vector::data_chunk_t>& chunks,
+    const std::shared_ptr<arrow::io::OutputStream>& output) {
+    return write_parquet(res, chunks, [&]() -> arrow::Result<std::shared_ptr<arrow::io::OutputStream>> { return output; });
 }
 
 } // namespace tsl

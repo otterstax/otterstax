@@ -136,8 +136,8 @@ run_test "Kafka INSERT-Produce (PostgreSQL wire)" "test_kafka_insert_produce.py"
 run_test "Kafka Continuous STREAM (PostgreSQL wire)" "test_kafka_stream.py"
 run_test "Kafka STREAM Exactly-Once (PostgreSQL wire)" "test_kafka_exactly_once.py"
 run_test "Kafka STREAM Write / INSERT VALUES (PostgreSQL wire)" "test_kafka_stream_write.py"
-# NB: test_kafka_crash_recovery.py is deliberately NOT here — it is native-only
-# (owns the server via Popen kill/restart). Its docker/CI variant is a separate task.
+# test_kafka_crash_recovery.py owns the server lifecycle and runs separately
+# in docker-run-tests.sh after this suite, against a fresh server container.
 
 echo ""
 echo "========================================="

@@ -17,6 +17,8 @@
 #include <unordered_map>
 #include <vector>
 
+namespace otterstax::security { class file_access; }
+
 namespace conn::s3 {
 
 class ConnectorManager final : public actor_zeta::actor::actor_mixin<ConnectorManager> {
@@ -28,7 +30,8 @@ public:
     // s3_download_path is the staging directory for downloaded objects; it must
     // not be empty — there is no runtime fallback.
     explicit ConnectorManager(std::pmr::memory_resource* res,
-                              std::string_view s3_download_path = "/tmp/otterstax_s3_cache/");
+                              std::string_view s3_download_path = "/tmp/otterstax_s3_cache/",
+                              std::shared_ptr<const otterstax::security::file_access> files = {});
 
     std::pmr::memory_resource* resource() const noexcept { return resource_; }
 
@@ -43,7 +46,7 @@ public:
     list(session_hash_t id, std::string alias, std::string s3_path);
 
     /// Download one S3 object (s3_path is "bucket/key") into s3_download_path_
-    /// under a timestamped filename; returns the resulting local file path. A
+    /// under a random filename; returns the resulting local file path. A
     /// failed transfer leaves no file behind.
     /// Errors: do_not_exists (unknown alias), io_error (S3 or local failure).
     actor_zeta::unique_future<core::result_wrapper_t<std::pmr::string>>
@@ -80,6 +83,7 @@ private:
     actor_zeta::behavior_t                          current_behavior_;
     credentials_store_t                             credentials_store_;
     std::pmr::string                                s3_download_path_;
+    std::shared_ptr<const otterstax::security::file_access> files_;
 };
 
 } // namespace conn::s3

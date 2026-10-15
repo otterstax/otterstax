@@ -97,6 +97,7 @@ find_package(PostgreSQL REQUIRED)
 find_package(yaml-cpp REQUIRED)
 find_package(clickhouse-cpp REQUIRED)
 find_package(RdKafka REQUIRED)
+find_package(CURL REQUIRED)
 if(ENABLE_TRACY)
     find_package(Tracy REQUIRED)
     add_compile_definitions(TRACY_ENABLE)
@@ -120,6 +121,7 @@ endif()
 
 ###########################################
 
+add_subdirectory(security)
 add_subdirectory(frontend)
 add_subdirectory(catalog)
 add_subdirectory(connectors)

@@ -4,6 +4,7 @@
 #pragma once
 
 #include <core/result_wrapper.hpp>
+#include "security/network_destinations.hpp"
 
 #include <chrono>
 #include <memory>
@@ -17,11 +18,13 @@ namespace RdKafka {
 } // namespace RdKafka
 
 namespace otterstax::kafka::detail {
+    class kafka_destination_guard;
 
     struct producer_config_t {
         std::string bootstrap_servers;
         std::string topic;
         std::string transactional_id; // non-empty -> exactly-once (transactional producer)
+        std::shared_ptr<const security::network_destinations> destinations;
     };
 
     // Outcome of one transaction-lifecycle call. Carries librdkafka's classification
@@ -70,8 +73,15 @@ namespace otterstax::kafka::detail {
         [[nodiscard]] kafka_txn_result abort_transaction(std::chrono::milliseconds timeout);
 
     private:
-        kafka_producer_t(std::unique_ptr<RdKafka::Producer> producer, std::string topic, bool transactional) noexcept;
+        struct delivery_report_t;
+        kafka_producer_t(std::unique_ptr<kafka_destination_guard> destinations,
+                         std::unique_ptr<delivery_report_t> delivery_report,
+                         std::unique_ptr<RdKafka::Producer> producer, std::string topic, bool transactional) noexcept;
 
+        // librdkafka keeps a borrowed pointer to this callback. Its address is
+        // stable across moves, and it outlives the producer during teardown.
+        std::unique_ptr<kafka_destination_guard> destinations_;
+        std::unique_ptr<delivery_report_t> delivery_report_;
         std::unique_ptr<RdKafka::Producer> producer_;
         std::string topic_;
         bool transactional_;

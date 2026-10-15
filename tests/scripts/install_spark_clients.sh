@@ -39,9 +39,10 @@ create_venv() {
     local name=$1 python
     local -a deps
     case "$name" in
-        3.5)     # pyspark 3.5 supports Python 3.8-3.11 and numpy<2 only
+        3.5)     # PyArrow 26 requires NumPy 2; Spark 3.5 requires NumPy 1.
+                 # 25.0.1 is the last Arrow patch release supporting NumPy 1.
                  python=python3.11
-                 deps=(py4j==0.10.9.7 "numpy>=1.15,<2" "pandas>=1.0.5,<3" "pyarrow>=4.0.0"
+                 deps=(py4j==0.10.9.7 "numpy==1.26.4" "pandas>=1.0.5,<3" "pyarrow==25.0.1"
                        "grpcio>=1.56.0" "grpcio-status>=1.56.0"
                        "googleapis-common-protos>=1.56.4" "protobuf<5") ;;
         4.0)     python=python3.12
@@ -57,6 +58,7 @@ create_venv() {
     echo "=== venv-$name ($python): ${deps[*]}"
     "$python" -m venv "$ROOT/venv-$name"
     "$ROOT/venv-$name/bin/pip" install "${deps[@]}"
+    "$ROOT/venv-$name/bin/pip" check
 }
 
 mkdir -p "$ROOT"

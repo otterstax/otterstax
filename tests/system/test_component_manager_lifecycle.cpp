@@ -28,6 +28,7 @@ TEST_CASE("ComponentManager: constructed and destroyed unstarted on a fresh data
             REQUIRE(cmanager.getResource() != nullptr);
             REQUIRE(cmanager.scheduler_address());
             REQUIRE(cmanager.catalog_address());
+            REQUIRE_FALSE(cmanager.recover().contains_error());
             // The s3 connector actor initialises Arrow's S3 subsystem while it is
             // being spawned. Arrow requires the process to FinalizeS3 before
             // exit or it may segfault during static teardown; the server does

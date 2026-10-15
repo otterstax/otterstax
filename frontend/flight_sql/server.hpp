@@ -16,6 +16,7 @@
 #include "rpc/flight_server.hpp"
 
 #include "utility/logger.hpp"
+#include "security/transport.hpp"
 
 #include <agrpc/grpc_context.hpp>
 
@@ -46,6 +47,7 @@ namespace flight::server {
         // thread (see scheduler_engine.hpp), so this is the server's
         // concurrency for in-flight queries.
         std::size_t threads = 1;
+        std::shared_ptr<const otterstax::security::server_access> access;
     };
 
     class flight_sql_server final {
@@ -72,6 +74,7 @@ namespace flight::server {
         log_t log_;
         std::string address_;
         std::size_t threads_ = 1;
+        std::shared_ptr<const otterstax::security::server_access> access_;
 
         core::FlightSqlCore core_;
         rpc::FlightServer flight_server_;

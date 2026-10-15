@@ -1,5 +1,30 @@
 # CLAUDE.md
 
+`service.security.files` contains absolute `read_roots` / `write_roots` sequences
+and a positive `max_file_bytes` (default 64 MiB). Keycloak mode defaults to denying
+SQL file access. Startup opens and validates roots against protected server paths;
+the YAML parser validates shape and scalar values. Trusted-private mode allows all
+directories but retains the encoded file-size bound. See `docs/deployment.md`.
+
+S3 entries default to `scheme: https`; `ca_file` optionally supplies a PEM trust
+bundle. `endpoint` is required and contains a hostname/IP with optional port,
+including for AWS. Local HTTP fixtures opt in explicitly.
+`access_key_env`, `secret_key_env` and `session_token_env` resolve populated
+environment variables at startup and cannot coexist with their inline fields.
+
+`service.security.kafka_brokers` is an exact host/port allowlist for both deployment
+modes. Empty or absent means no Kafka destination is permitted. Config parsing
+rejects malformed entries; producers and consumers enforce the policy for both
+bootstrap and advertised brokers. See `docs/deployment.md` for address syntax.
+
+`service.security` carries the explicit `trusted_private` or `keycloak` mode,
+TLS file references and Keycloak introspection limits. Parsing retains an
+unspecified mode when configuration omits it; executable startup rejects that
+mode before creating the engine or listeners. Keycloak mode requires issuer,
+client ID, secret environment-variable name and both TLS files. TLS credential
+loading and HTTPS client initialization belong to `security/`, not this parser.
+See `docs/deployment.md` for the full format and authorization boundaries.
+
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Role
@@ -7,8 +32,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 `config/` is the configuration layer. There is **one config file** (`config.yaml`)
 that carries both the wire-server settings **and**, under a `connections:` key,
 every remote backend and s3 alias. It is parsed by `ConfigReader` (built into the
-`config` target, `config::config`), which depends only on `yaml-cpp` (plus
-`spdlog`/otterbrix logging) — **no connector dependencies**.
+`config` target, `config::config`), which uses `yaml-cpp`, Boost address parsing,
+and `spdlog`/otterbrix logging. It has no connector dependencies.
 
 The `connections:` section is the **single source of truth for connections**;
 there is no runtime add/remove API. To change connections, edit `config.yaml` and
@@ -37,19 +62,25 @@ Nothing in `config/` throws. Every entry point returns a
 
 | Failure | Code | Message names |
 |---------|------|---------------|
-| file is not YAML (`YAML::LoadFile` refuses it) | `conversion_failure` | the path + yaml-cpp's own message |
+| an existing path that is not a readable regular file, including a broken symlink | `io_error` | the path |
+| file is not YAML (`YAML::Load` refuses it) | `conversion_failure` | the path + yaml-cpp's own message |
 | a `service.*` value that cannot be read as its type (`port: abc`) | `invalid_parameter` | the field (`service.mysql.port`) |
 | a connection field that is not a scalar (`host: [a, b]`) | `invalid_parameter` | the section + entry position + field |
 | an incomplete connection entry, or a malformed backend port | `invalid_parameter` | the section + `alias='…'` + the missing field / bad port |
 | a backend alias that is not an unquoted SQL identifier (`[a-z_][a-z0-9_]*`), or one another backend entry already uses | `invalid_parameter` | the section + `alias='…'` + the rule, or the section that already uses it |
 
-The yaml-cpp calls (`YAML::LoadFile`, `Node::as<T>()`) are the only throwing
+The yaml-cpp calls (`YAML::Load`, `Node::as<T>()`) are the only throwing
 sites; each is wrapped in a try/catch exactly where it is made and converted to
 the value above (`yaml_scalar.hpp` for `as<T>()`, `ConfigReader::load` for
-`LoadFile`). Error messages live on the `std::pmr::memory_resource*` passed to
+`YAML::Load` of the opened stream). A missing path selects defaults; access and
+read failures do not. Error messages live on the `std::pmr::memory_resource*` passed to
 `ConfigReader` / `parse_connections` — there is no default resource.
 
 ## Types
+
+MySQL and PostgreSQL listeners accept `service.mysql.host` and
+`service.postgres.host` as IPv4 or IPv6 addresses (default `0.0.0.0`). Invalid
+addresses fail configuration loading. Ports use the existing `port` fields.
 
 - `config::ServiceConfig` — `{ FlightSqlConfig flight_sql; MysqlConfig mysql;
   PostgresConfig postgres; SparkConnectConfig spark_connect;
@@ -141,12 +172,14 @@ from `WORKDIR /app/build/Release` with no `--config`, so it reads
   (`examples/demo/compose.yml`, `compose.yml`, `benchmark/compose_benchmark.yml`).
   A mount overrides anything baked in.
 
-A missing file → the server starts with default ports and no connections.
+A missing file loads default ports and no connections, but executable startup
+requires `service.security.mode` before the engine or listeners start.
 
 ## config.yaml format
 
 ```yaml
 service:
+  security: { mode: trusted_private }
   flight_sql: { host: "0.0.0.0", port: 8815 }
   mysql:      { port: 8816 }        # wire-server port
   postgres:   { port: 8817 }        # wire-server port
@@ -166,11 +199,14 @@ connections:
 
 `port` is an **optional string** (empty → driver default; otherwise a decimal
 integer in 1..65535, anything else aborts startup). `schema` defaults to
-`public`. s3 `region`/`session_token`/`endpoint` are optional. `connection_retry`
+`public`. s3 `endpoint` is required; `region` and `session_token` are optional. `connection_retry`
 is optional (defaults to `max_attempts: 1`, `delay_ms: 1000` = one-shot), and so
 is `spark_connect` (defaults to `0.0.0.0:15002`, either key alone overriding its
 own default).
 Malformed YAML → the server aborts startup (`conversion_failure` from `load`).
+The root, `service`, and each configured service section must be mappings.
+Service ports are integers in 1..65535; retry attempts must be positive and
+retry delay nonnegative. These checks run before values reach the listeners.
 
 Wire-server settings live under the top-level `service:` node so they never
 collide with the backends under `connections:` — `service.mysql`/`service.postgres`

@@ -11,6 +11,10 @@
 #include <components/types/logical_value.hpp>
 #include <components/types/types.hpp>
 
+#undef DAY
+#undef SECOND
+#include <arrow/io/interfaces.h>
+#include <array>
 #include <charconv>
 #include <cmath>
 #include <fstream>
@@ -121,22 +125,15 @@ core::result_wrapper_t<bool> write_value(std::pmr::memory_resource* res,
 
 } // namespace
 
-core::result_wrapper_t<bool> chunk_to_ndjson(std::pmr::memory_resource* res,
+core::result_wrapper_t<bool> write_ndjson(std::pmr::memory_resource* res,
                                              const std::pmr::vector<components::vector::data_chunk_t>& chunks,
-                                             const std::string& path) {
+                                             std::ostream& out) {
     OTX_ZONE_N("tsl::chunk_to_ndjson");
     for (const auto& chunk : chunks) {
         auto writable = validate_writable_columns(res, chunk, "chunk_to_ndjson");
         if (writable.has_error()) {
             return writable;
         }
-    }
-
-    std::ofstream out(path);
-    if (!out) {
-        std::pmr::string message{"chunk_to_ndjson: cannot open output: ", res};
-        message.append(path.c_str());
-        return core::error_t(core::error_code_t::io_error, std::move(message));
     }
 
     for (const auto& chunk : chunks) {
@@ -165,10 +162,60 @@ core::result_wrapper_t<bool> chunk_to_ndjson(std::pmr::memory_resource* res,
     out.flush();
     if (!out.good()) {
         std::pmr::string message{"chunk_to_ndjson: write error for: ", res};
-        message.append(path.c_str());
         return core::error_t(core::error_code_t::io_error, std::move(message));
     }
     return true;
 }
 
+
+
+namespace {
+class output_streambuf final : public std::streambuf {
+public:
+    explicit output_streambuf(arrow::io::OutputStream& output) : output_(output) {
+        setp(buffer_.data(), buffer_.data() + buffer_.size());
+    }
+protected:
+    int sync() override {
+        if (!output_.Write(pbase(), pptr() - pbase()).ok()) return -1;
+        setp(buffer_.data(), buffer_.data() + buffer_.size());
+        return 0;
+    }
+    int_type overflow(int_type ch) override {
+        if (sync() != 0) return traits_type::eof();
+        if (!traits_type::eq_int_type(ch, traits_type::eof())) {
+            *pptr() = traits_type::to_char_type(ch);
+            pbump(1);
+        }
+        return traits_type::not_eof(ch);
+    }
+private:
+    arrow::io::OutputStream& output_;
+    std::array<char, 8192> buffer_;
+};
+}
+
+core::result_wrapper_t<bool> chunk_to_ndjson(std::pmr::memory_resource* res,
+    const std::pmr::vector<components::vector::data_chunk_t>& chunks, const std::string& path) {
+    // Validate before opening a pathname: unsupported schemas must not truncate it.
+    for (const auto& chunk : chunks) {
+        auto writable = validate_writable_columns(res, chunk, "chunk_to_ndjson");
+        if (writable.has_error()) return writable;
+    }
+    std::ofstream output(path);
+    if (!output) return make_error(res, core::error_code_t::io_error, "chunk_to_ndjson: cannot open output");
+    return write_ndjson(res, chunks, output);
+}
+
+core::result_wrapper_t<bool> chunk_to_ndjson(std::pmr::memory_resource* res,
+    const std::pmr::vector<components::vector::data_chunk_t>& chunks,
+    const std::shared_ptr<arrow::io::OutputStream>& output) {
+    output_streambuf buffer{*output};
+    std::ostream stream{&buffer};
+    auto written = write_ndjson(res, chunks, stream);
+    if (written.has_error()) return written;
+    auto closed = output->Close();
+    if (!closed.ok()) return arrow_error(res, core::error_code_t::io_error, "chunk_to_ndjson: close output", closed);
+    return true;
+}
 } // namespace tsl

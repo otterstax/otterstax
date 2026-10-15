@@ -34,6 +34,9 @@ Server settings and all remote backends / S3 aliases live in a **single
 `config.yaml`** and are read once at server startup (see
 [Connection configuration](#connection-configuration)).
 
+See [deployment boundaries](docs/deployment.md) for tenant storage, listener
+configuration and the current client authentication limits.
+
 ## Connection configuration
 
 There is a **single config file, `config.yaml`**. It holds the wire-server
@@ -49,19 +52,20 @@ The path is passed with `--config PATH` and defaults to `config.yaml`, resolved
 **relative to the server's working directory**:
 
 ```bash
-./build/server --config path/to/config.yaml
+./build/Release/server --config path/to/config.yaml
 ```
 
 In the provided Docker images the server runs from `/app/build/Release` with no
 `--config`, so it reads `/app/build/Release/config.yaml` — the compose files
 bind-mount a stack-specific `config.yaml` onto that path (and `Dockerfile.test`
-bakes one in for the integration tests). A missing file means the server starts
-with default ports and no connections.
+bakes one in for the integration tests). Startup requires an explicit
+`service.security.mode`; a missing file does not enable anonymous network access.
 
 ### File format
 
 ```yaml
 service:
+  security: { mode: trusted_private }
   flight_sql:
     host: "0.0.0.0"
     port: 8815
@@ -115,8 +119,7 @@ Wire-server settings live under the top-level `service:` node so
 backends under `connections:`. All `connections:` sections are optional; each
 backend requires `alias`/`host`/`username`/`database` (`port`/`table` optional).
 An entry missing a required field **aborts startup** (fail-fast — the config must
-be fixed), as does malformed YAML. A missing file means the server starts with no
-registered connections. A *valid* connection whose backend is unreachable is
+be fixed), as does malformed YAML. A *valid* connection whose backend is unreachable is
 retried per `service.connection_retry` and, if still down, logged without
 aborting startup (the other backends and local engine stay usable).
 
@@ -253,24 +256,28 @@ conan profile detect --force
 # conan remote add otterbrix https://conan.otterbrix.com
 ```
 
-2. Create build directory and install dependencies:
+2. Export the engine recipe and install dependencies from the repository root:
 
 ```bash
-mkdir -p build && cd build
-conan install ../conanfile.py --build missing -s build_type=Release
+conan export cmake/conan-recipes/otterbrix
+conan export cmake/conan-recipes/arrow --version=24.0.0
+conan install . --build=missing -s build_type=Release \
+  -c tools.build:jobs="${BUILD_JOBS:?Set BUILD_JOBS to fit available RAM and CPUs}"
 ```
 
-3. Configure and build with CMake:
+3. Configure and build with CMake. Set `BUILD_JOBS` to fit available CPUs and RAM
+(allow at least 1.5 GiB per compiler job):
 
 ```bash
-cmake -S .. -B . -DCMAKE_BUILD_TYPE=Release
-cmake --build . -- -j$(nproc)
+cmake -S . -B build/Release -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_TOOLCHAIN_FILE=build/Release/generators/conan_toolchain.cmake
+cmake --build build/Release --parallel "${BUILD_JOBS:?Set BUILD_JOBS to fit available RAM and CPUs}"
 ```
 
 4. Run the server (from the build directory or repo root if configured):
 
 ```bash
-./build/server
+./build/Release/server
 ```
 
 ## Command-line Options
@@ -278,7 +285,11 @@ cmake --build . -- -j$(nproc)
 ```
 --help, -h        Show help message
 --config <path>   Path to configuration file (default: config.yaml)
+--data-dir <path> Engine and logs (default: OTTERSTAX_DATA_DIR or ./data)
 ```
+
+Docker images use `/app/data`; mount persistent storage there. Each tenant
+instance needs its own storage and connector configuration.
 
 ## Testing
 

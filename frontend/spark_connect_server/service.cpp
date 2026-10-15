@@ -61,17 +61,18 @@ namespace frontend::spark {
         , grpc_contexts_(config.resource)
         , threads_(config.resource)
         , host_(config.host)
-        , port_(config.port) {
+        , port_(config.port)
+        , access_(config.access) {
         assert(resource_ != nullptr && "memory resource must not be null");
         assert(log_.is_valid());
     }
 
     SparkConnectServiceImpl::~SparkConnectServiceImpl() { stop(); }
 
-    void SparkConnectServiceImpl::start() {
+    bool SparkConnectServiceImpl::start() {
         OTX_ZONE_N("SparkConnectServiceImpl::start");
         if (server_) {
-            return; // already started
+            return true; // already started
         }
 
         grpc::ServerBuilder builder;
@@ -85,7 +86,7 @@ namespace frontend::spark {
         }
 
         const std::string address = host_ + ":" + std::to_string(port_);
-        builder.AddListeningPort(address, grpc::InsecureServerCredentials());
+        builder.AddListeningPort(address, access_ ? access_->grpc_credentials : grpc::InsecureServerCredentials());
         builder.RegisterService(this); // SparkConnectServiceImpl IS-A AsyncService
 
         server_ = builder.BuildAndStart();
@@ -94,7 +95,7 @@ namespace frontend::spark {
                 error(log_, "spark-connect: failed to start server on {}", address);
             }
             grpc_contexts_.clear();
-            return;
+            return false;
         }
         if (log_.is_valid()) {
             info(log_, "spark-connect: listening on {} ({} IO threads)", address, io_threads);
@@ -189,6 +190,7 @@ namespace frontend::spark {
             agrpc::GrpcContext* raw = ctx.get();
             threads_.emplace_back([raw] { raw->run(); });
         }
+        return true;
     }
 
     void SparkConnectServiceImpl::stop() {

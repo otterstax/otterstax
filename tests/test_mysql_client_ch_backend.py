@@ -37,7 +37,7 @@ class client:
     def mysql_connection(self):
         conn = None
         try:
-            conn = mysql.connector.connect(**self.proxy_config)
+            conn = mysql.connector.connect(autocommit=True, **self.proxy_config)
             yield conn
         finally:
             if conn:

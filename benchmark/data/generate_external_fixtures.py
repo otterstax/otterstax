@@ -5,7 +5,7 @@
 (external_load / external_join / external_dump).
 
 This is the benchmark-scale sibling of
-tests/minio/fixtures/generate_external_fixtures.py.  It writes the same three
+tests/s3/fixtures/generate_external_fixtures.py.  It writes the same three
 files but sized from bench.yaml so the fixtures share the campaign_id space with
 the benchmark backend data (Group A campaigns 1..num_campaigns):
 

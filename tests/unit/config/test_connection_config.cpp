@@ -105,12 +105,12 @@ connections:
       database: chdb
       table: orders
   s3:
-    - alias: minio1
+    - alias: rustfs1
       access_key: ak
       secret_key: sk
       region: us-east-1
       session_token: tok
-      endpoint: minio:9000
+      endpoint: rustfs:9000
 )";
 
     auto cfg = parse_ok(connections_node(yaml));
@@ -155,12 +155,12 @@ connections:
 
     SECTION("s3 fields") {
         const auto& s3 = cfg.s3[0];
-        CHECK(s3.alias == "minio1");
+        CHECK(s3.alias == "rustfs1");
         CHECK(s3.access_key == "ak");
         CHECK(s3.secret_key == "sk");
         CHECK(s3.region == "us-east-1");
         CHECK(s3.session_token == "tok");
-        CHECK(s3.endpoint == "minio:9000");
+        CHECK(s3.endpoint == "rustfs:9000");
     }
 }
 
@@ -496,7 +496,7 @@ connections:
     - alias: s3a
       access_key: k
       secret_key: s
-      endpoint: minio:9000
+      endpoint: rustfs:9000
 )";
     auto cfg = load_ok(write_temp(yaml));
 
@@ -512,7 +512,7 @@ connections:
     CHECK(cfg.connections.mysql[0].alias == "m1");
     REQUIRE(cfg.connections.s3.size() == 1);
     CHECK(cfg.connections.s3[0].alias == "s3a");
-    CHECK(cfg.connections.s3[0].endpoint == "minio:9000");
+    CHECK(cfg.connections.s3[0].endpoint == "rustfs:9000");
     CHECK(cfg.connections.postgresql.empty());
     CHECK(cfg.connections.clickhouse.empty());
 }

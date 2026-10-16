@@ -4,7 +4,7 @@
 // Verifies the s3/file grammar extensions are registered in GreenplumParser and
 // that CREATE EXTERNAL TABLE / COPY (...) TO lower into an external_node_t
 // carrying the fields the Scheduler routes on. (The end-to-end routing through
-// the file/s3 managers is exercised by the system / minio tests.)
+// the file/s3 managers is exercised by the system / s3 tests.)
 
 #include <catch2/catch_all.hpp>
 
@@ -51,14 +51,14 @@ TEST_CASE("external: CREATE EXTERNAL TABLE on an s3 URI lowers to external_node_
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     GreenplumParser parser(&arena, test_aliases());
     auto r = parser.parse("CREATE EXTERNAL TABLE s3.trades WITH ("
-                          "  s3_alias = 'minio1', location = 's3://bucket/trades.parquet', format = 'parquet')");
+                          "  s3_alias = 'rustfs1', location = 's3://bucket/trades.parquet', format = 'parquet')");
     REQUIRE_FALSE(r.has_error());
 
     auto* node = as_external(r.value()->otterbrix_params->node);
     REQUIRE(node != nullptr);
     CHECK(node->op() == external_op_t::create_external_table);
     CHECK(node->is_s3());
-    CHECK(node->s3_alias() == "minio1");
+    CHECK(node->s3_alias() == "rustfs1");
     CHECK(node->location() == "s3://bucket/trades.parquet");
     CHECK(node->object_path() == "bucket/trades.parquet"); // scheme stripped for the s3 manager
 }
@@ -81,14 +81,14 @@ TEST_CASE("external: COPY (...) TO an s3 URI captures the inner query and alias"
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     GreenplumParser parser(&arena, test_aliases());
     auto r = parser.parse(
-        "COPY (SELECT 1) TO 's3://bucket/out.parquet' WITH (s3_alias = 'minio1', format = 'parquet')");
+        "COPY (SELECT 1) TO 's3://bucket/out.parquet' WITH (s3_alias = 'rustfs1', format = 'parquet')");
     REQUIRE_FALSE(r.has_error());
 
     auto* node = as_external(r.value()->otterbrix_params->node);
     REQUIRE(node != nullptr);
     CHECK(node->op() == external_op_t::copy_to);
     CHECK(node->is_s3());
-    CHECK(node->s3_alias() == "minio1");
+    CHECK(node->s3_alias() == "rustfs1");
     CHECK(node->object_path() == "bucket/out.parquet");
     CHECK(node->inner_sql() == "SELECT 1");
 }

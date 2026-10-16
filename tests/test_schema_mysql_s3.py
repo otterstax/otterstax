@@ -3,7 +3,7 @@
 #
 # MySQL-wire schema test for s3 external tables: verifies the column schema
 # (id, name) is exposed correctly for all formats (parquet, csv, ndjson),
-# against a seeded MinIO.
+# against a seeded RustFS.
 
 import sys
 

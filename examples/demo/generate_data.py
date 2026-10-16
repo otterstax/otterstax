@@ -21,7 +21,7 @@ INIT_DIR = SCRIPT_DIR / "init"
 (INIT_DIR / "mariadb").mkdir(parents=True, exist_ok=True)
 (INIT_DIR / "postgres").mkdir(parents=True, exist_ok=True)
 (INIT_DIR / "clickhouse").mkdir(parents=True, exist_ok=True)
-# S3 fixtures — seeded into MinIO by the `demo-minio-init` compose service for
+# S3 fixtures — seeded into RustFS by the `demo-rustfs-init` compose service for
 # steps 7-9. Living under `init/` keeps them covered by the existing .gitignore
 # rule and means `up.sh` blows them away alongside the other backend init data.
 S3_DIR = INIT_DIR / "s3"
@@ -451,7 +451,7 @@ print(f"""
 
 
 # ── S3 fixtures for steps 7-9 ────────────────────────────────────────────────
-# Two tiny tables seeded into MinIO at `s3://demo-bucket/`:
+# Two tiny tables seeded into RustFS at `s3://demo-bucket/`:
 #   regions.csv   — 6-row dimension (region_id, country, region_name)
 #   promos.parquet — 12-row fact     (region_id, promo_code, discount_pct)
 # step_7 / step_8 load them as engine-internal tables; step_9 JOINs them and

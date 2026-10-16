@@ -7,7 +7,7 @@ BENCH_DIR="$(cd "$MANUAL_DIR/.." && pwd)"
 REPO_ROOT="$(cd "$BENCH_DIR/.." && pwd)"
 
 IMAGE_TAG="${IMAGE_TAG:-bench}"
-# Set to true (via start_service.sh --external) to add a seeded MinIO so the
+# Set to true (via start_service.sh --external) to add a seeded RustFS so the
 # s3/file external_* benchmarks can run in the manual flow.
 EXTERNAL_ENABLED="${EXTERNAL_ENABLED:-false}"
 # Set to true (via start_service.sh --kafka) to add a redpanda broker + a seeded
@@ -16,7 +16,7 @@ KAFKA_ENABLED="${KAFKA_ENABLED:-false}"
 
 _compose_backends() {
     local _files=(-f "$BENCH_DIR/compose_backends.yml")
-    [ "$EXTERNAL_ENABLED" = "true" ] && _files+=(-f "$BENCH_DIR/compose_minio.yml")
+    [ "$EXTERNAL_ENABLED" = "true" ] && _files+=(-f "$BENCH_DIR/compose_rustfs.yml")
     [ "$KAFKA_ENABLED" = "true" ] && _files+=(-f "$BENCH_DIR/compose_kafka.yml")
     docker compose "${_files[@]}" -p bench "$@"
 }
@@ -27,7 +27,7 @@ _compose_otterstax() {
         -f "$BENCH_DIR/compose_benchmark.yml"
         -f "$BENCH_DIR/compose_manual.yml"
     )
-    [ "$EXTERNAL_ENABLED" = "true" ] && _files+=(-f "$BENCH_DIR/compose_minio.yml")
+    [ "$EXTERNAL_ENABLED" = "true" ] && _files+=(-f "$BENCH_DIR/compose_rustfs.yml")
     [ "$KAFKA_ENABLED" = "true" ] && _files+=(-f "$BENCH_DIR/compose_kafka.yml")
     docker compose "${_files[@]}" -p bench "$@"
 }
@@ -71,10 +71,10 @@ _register_connections() {
     echo "Connections read from benchmark/config.yaml at startup (no runtime registration)."
 }
 
-# The bench MinIO s3 alias ('bench_minio') is likewise declared in
+# The bench RustFS s3 alias ('bench_rustfs') is likewise declared in
 # benchmark/config.yaml and registered at startup. No-op here.
 _register_s3_credentials() {
-    echo "s3 alias 'bench_minio' read from benchmark/config.yaml at startup."
+    echo "s3 alias 'bench_rustfs' read from benchmark/config.yaml at startup."
 }
 
 # Generate the s3/file external-table fixtures into benchmark/data/fixtures.
@@ -123,7 +123,7 @@ _frontend_port() {
     esac
 }
 
-# DEFAULT_TESTS run by default; external_* are opt-in (need MinIO via --external)
+# DEFAULT_TESTS run by default; external_* are opt-in (need RustFS via --external)
 # but remain valid --bench values.
 DEFAULT_TESTS=(simple_select complex_select join_same_instance join_cross_engine join_all)
 ALL_TESTS=("${DEFAULT_TESTS[@]}"

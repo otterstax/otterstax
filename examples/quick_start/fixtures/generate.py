@@ -21,7 +21,8 @@
 #   s3/promotions.ndjson        promotions  (60 x 3)    ndjson
 #
 # Every cross-backend JOIN key is a STRING (customer_id/product_id/order_id) to
-# sidestep the int32/int64 silent zero-row JOIN trap (see repo FIX_JOIN.md).
+# sidestep the int32/int64 silent zero-row JOIN trap (root CLAUDE.md,
+# "JOIN-key type widths must agree").
 
 import csv
 import json

@@ -116,8 +116,8 @@ Results land in `benchmark_results/<YYYYMMDD_HHMMSS>/`.
                             external_load external_join external_dump
                             kafka_ingest
                     external_* (s3/file) are opt-in: selecting any of them
-                    auto-starts MinIO, generates fixtures, registers the
-                    bench_minio s3 alias. mysql/postgres frontends only.
+                    auto-starts RustFS, generates fixtures, registers the
+                    bench_rustfs s3 alias. mysql/postgres frontends only.
                     kafka_ingest is opt-in too: it auto-starts a redpanda broker,
                     generates a JSON dataset, and seeds it into a topic. No REST
                     registration (the broker is named in CREATE SOURCE directly).
@@ -241,7 +241,7 @@ benchmark/
 ├── compose_backends.yml         # 6 DB containers (bench_net)
 ├── compose_benchmark.yml        # OtterStax container; publishes :8086 to host
 ├── compose_manual.yml           # Overlay: also publishes 8815/8816/8817 to host
-├── compose_minio.yml            # Overlay: MinIO + seed job for external_* tests
+├── compose_rustfs.yml           # Overlay: RustFS + seed job for external_* tests
 ├── compose_kafka.yml            # Overlay: redpanda broker for kafka_ingest (seed is a run_benchmark.sh step, not a service)
 ├── Dockerfile.benchmark         # Python image: data init + benchmark scripts (+ confluent-kafka)
 ├── data/
@@ -318,7 +318,7 @@ re-running an `external_*` benchmark, which regenerates them.)
 Three opt-in workloads that exercise the `CREATE EXTERNAL TABLE` / `COPY ... TO`
 grammar extensions — **loading, internal joins and dumps only; no cross-backend
 or JOIN ALL shapes.** Each runs both a local-file (`/fixtures` mount) and an s3
-(seeded MinIO) source, so file vs s3 are directly comparable in the sub-test
+(seeded RustFS) source, so file vs s3 are directly comparable in the sub-test
 breakdown.
 
 | Test            | Workload                                                        | Sub-tests |
@@ -341,15 +341,15 @@ Selecting any `external_*` test makes `run_benchmark.sh`:
 
 1. Generate fixtures into `benchmark/data/fixtures/` via `data/generate_external_fixtures.py`
    (a container run of `benchmark-client`, before the stack comes up).
-2. Add `compose_minio.yml` to the backend + otterstax compose sets (MinIO +
+2. Add `compose_rustfs.yml` to the backend + otterstax compose sets (RustFS +
    a one-shot that seeds `bench-bucket` from the same fixtures).
 
-The `bench_minio` s3 alias itself is declared in `benchmark/config.yaml`
+The `bench_rustfs` s3 alias itself is declared in `benchmark/config.yaml`
 (the `s3:` section) and registered at server startup like the six DB backends —
 no runtime registration step.
 
 The `file` and `s3` sources read the **identical** fixtures: bench-otterstax
-mounts `data/fixtures` at `/fixtures`, and MinIO is seeded from the same dir.
+mounts `data/fixtures` at `/fixtures`, and RustFS is seeded from the same dir.
 
 ```bash
 # All five external tests, both frontends
@@ -361,7 +361,7 @@ mounts `data/fixtures` at `/fixtures`, and MinIO is seeded from the same dir.
 ./benchmark/scripts/run_benchmark.sh --frontend mysql --bench external_join_cross external_join_all
 ```
 
-Manual flow: start with `--external` so MinIO + fixtures + s3 alias are ready,
+Manual flow: start with `--external` so RustFS + fixtures + s3 alias are ready,
 then select the tests:
 
 ```bash
@@ -372,7 +372,7 @@ then select the tests:
 
 ### External fixtures (`data/generate_external_fixtures.py`)
 
-Benchmark-scale sibling of `tests/minio/fixtures/generate_external_fixtures.py`,
+Benchmark-scale sibling of `tests/s3/fixtures/generate_external_fixtures.py`,
 sized from the `external:` block in `bench.yaml`. `num_campaigns` defaults to
 `group_a`, so the fixtures share the backend `campaign_id` space (they could
 JOIN the backends, but the benchmarks deliberately keep joins internal).
@@ -396,7 +396,7 @@ Three opt-in tests exercising the Kafka **runtime** (`integration/kafka/` — th
 `KafkaManager` actor + librdkafka consumer/poller/producer). Split by feature the
 way `external_load`/`external_join`/`external_dump` are (one test = one feature =
 one result file). All share the redpanda broker + the pre-seeded topic, brought
-up by the `external_*` opt-in pattern (redpanda is the analogue of MinIO; the
+up by the `external_*` opt-in pattern (redpanda is the analogue of RustFS; the
 topic is seeded at bring-up the way the s3 bucket is).
 
 | Test / sub-test | Workload |
@@ -427,7 +427,7 @@ Selecting any `kafka_*` test makes `run_benchmark.sh`:
 3. Seed the topic **once** with `data/seed_kafka.py` (Step 3b, an explicit
    `docker run` — NOT a compose one-shot, so `_ensure_otterstax`'s backend `up -d`
    on a mid-run restart can't re-produce and double the topic; Kafka produce is
-   not idempotent, unlike MinIO's `mc cp`).
+   not idempotent, unlike the RustFS seed's `aws s3 cp`).
 
 The runner (`benchmarks/kafka_common.py`, driven by the thin
 `benchmarks/{mysql,postgres}/kafka_{ingest,produce,stream}.py`) issues SQL to

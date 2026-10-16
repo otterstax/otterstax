@@ -99,7 +99,7 @@ def run(local=False):
         f"  SELECT w.campaign_id, w.label, w.weight, r.region_id, r.region_name, r.country "
         f"  FROM {INTERNAL_DB}.weights w "
         f"  JOIN {INTERNAL_DB}.regions r ON w.campaign_id = r.campaign_id"
-        f") TO '{out_csv}' WITH (s3_alias = 'miniotest', format = 'csv')"
+        f") TO '{out_csv}' WITH (s3_alias = 'rustfstest', format = 'csv')"
     )
     tester.create_external_from(cur, "jotb_local_s3_rt", "joined_csv", out_csv, "csv")
     rt_count = int(_scalar(cur, "select count(*) from jotb_local_s3_rt.joined_csv"))

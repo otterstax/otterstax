@@ -20,7 +20,7 @@ Per-campaign counts are fixed so the tests can assert exact join cardinalities.
 All integer columns are int64 in both files so the parquet/csv tables join
 without type coercion. Seeded → reproducible; re-run after changing the shape:
 
-    python tests/minio/fixtures/generate_external_fixtures.py
+    python tests/s3/fixtures/generate_external_fixtures.py
 """
 
 import csv

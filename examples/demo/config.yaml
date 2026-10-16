@@ -45,7 +45,7 @@ connections:
 
   s3:
     - alias: demo_s3
-      access_key: minioadmin
-      secret_key: minioadmin
+      access_key: rustfsadmin
+      secret_key: rustfsadmin
       region: us-east-1
-      endpoint: demo-minio:9000
+      endpoint: demo-rustfs:9000

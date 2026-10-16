@@ -120,8 +120,8 @@ detects it via `dynamic_cast` in `execute` / `execute_statement` / `prepare_sche
 s3 vs local is decided by `external_node_t::is_s3()` (the location scheme). Tests:
 `tests/unit/parser/test_external_routing.cpp` (parse → node) and the
 `Scheduler: CREATE EXTERNAL TABLE + COPY ... TO` case in `tests/system/test_file_ingestion.cpp` (full
-local-file routing through the Worker pool); the s3 path is exercised by the hidden `tests/minio`
-integration tests.
+local-file routing through the Worker pool); the s3 path is exercised by the python
+integration tests (`tests/test_{schema_,}mysql_s3.py` and friends, against the RustFS in `compose.test.yml`).
 
 ## Known limitation
 

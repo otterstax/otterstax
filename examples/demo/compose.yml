@@ -87,18 +87,17 @@ services:
 
   # S3-compatible object store used by steps 7-9. Single bucket seeded with
   # the fixtures `examples/demo/generate_data.py` writes into `init/s3/`.
-  demo-minio:
-    image: quay.io/minio/minio:latest
-    container_name: demo-minio
-    command: server /data --console-address ":9001"
+  demo-rustfs:
+    image: rustfs/rustfs:latest
+    container_name: demo-rustfs
     environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
+      RUSTFS_ACCESS_KEY: rustfsadmin
+      RUSTFS_SECRET_KEY: rustfsadmin
     ports:
       - "3206:9000"   # S3 API
       - "3207:9001"   # console
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:9000/minio/health/live"]
+      test: ["CMD", "curl", "-sf", "http://localhost:9000/health"]
       interval: 5s
       timeout: 5s
       retries: 30
@@ -134,19 +133,23 @@ services:
       - demo_net
 
   # One-shot init: create the bucket and upload the demo fixtures, then exit.
-  demo-minio-init:
-    image: quay.io/minio/mc:latest
-    container_name: demo-minio-init
+  demo-rustfs-init:
+    image: amazon/aws-cli:latest
+    container_name: demo-rustfs-init
     depends_on:
-      demo-minio:
+      demo-rustfs:
         condition: service_healthy
+    environment:
+      AWS_ACCESS_KEY_ID: rustfsadmin
+      AWS_SECRET_ACCESS_KEY: rustfsadmin
+      AWS_DEFAULT_REGION: us-east-1
     volumes:
       - ./init/s3:/fixtures:ro
     entrypoint: >
       sh -c "
-        mc alias set m http://demo-minio:9000 minioadmin minioadmin &&
-        mc mb --ignore-existing m/demo-bucket &&
-        if [ -d /fixtures ]; then mc cp --recursive /fixtures/ m/demo-bucket/; fi &&
+        E=http://demo-rustfs:9000;
+        (aws --endpoint-url $$E s3api head-bucket --bucket demo-bucket 2>/dev/null || aws --endpoint-url $$E s3 mb s3://demo-bucket) &&
+        if [ -d /fixtures ]; then aws --endpoint-url $$E s3 cp --recursive /fixtures/ s3://demo-bucket/; fi &&
         echo 'demo-bucket seeded.';
       "
     networks:
@@ -167,7 +170,7 @@ services:
         condition: service_healthy
       demo-clickhouse:
         condition: service_healthy
-      demo-minio:
+      demo-rustfs:
         condition: service_healthy
       demo-kafka:
         condition: service_healthy

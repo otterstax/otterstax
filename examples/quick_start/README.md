@@ -1,7 +1,7 @@
 # OtterStax Quick Start
 
 A one-command federated-SQL demo. `docker compose up` brings up **2 PostgreSQL + 1
-MariaDB + 1 ClickHouse + MinIO (S3) + Kafka** behind a single OtterStax server; you run
+MariaDB + 1 ClickHouse + RustFS (S3) + Kafka** behind a single OtterStax server; you run
 SQL that joins across all of them with `psql`. All data is pre-seeded from committed
 files — no scripts.
 
@@ -27,7 +27,7 @@ NAME                  STATUS
 qs-clickhouse         Up (healthy)
 qs-kafka              Up (healthy)
 qs-mariadb            Up (healthy)
-qs-minio              Up (healthy)
+qs-rustfs             Up (healthy)
 qs-otterstax          Up (healthy)
 qs-postgres-catalog   Up (healthy)
 qs-postgres-shop      Up (healthy)
@@ -78,7 +78,7 @@ Then work through the examples below:
         ┌──────────────┬───────────────┬──────┴───────┬───────────────┐
    alias pgshop   alias pgcat     alias sales     alias web       alias qs_s3
    ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐   ┌──────────────┐
-   │PostgreSQL│   │PostgreSQL│   │ MariaDB  │   │ClickHouse│   │    MinIO     │
+   │PostgreSQL│   │PostgreSQL│   │ MariaDB  │   │ClickHouse│   │    RustFS    │
    │ db=shop  │   │db=catalog│   │ db=ops   │   │db=       │   │quickstart-   │
    │customers │   │ products │   │ orders   │   │analytics │   │bucket        │
    │  (800)   │   │  (500)   │   │ (1000)   │   │pageviews │   │ regions.csv  │
@@ -100,7 +100,7 @@ the connection name; OtterStax routes the query to the right engine.
 | `pgcat` | PostgreSQL #2 | `catalog` | `products` (500 × 4) | `pgcat.catalog.products` |
 | `sales` | MariaDB | `ops` | `orders` (1000 × 5) | `sales.ops.orders` |
 | `web` | ClickHouse | `analytics` | `pageviews` (1000 × 4) | `web.analytics.pageviews` |
-| `qs_s3` | MinIO (S3) | bucket `quickstart-bucket` | `regions.csv`, `product_costs.parquet`, `promotions.ndjson` | loaded into `qs.*` (example 6) |
+| `qs_s3` | RustFS (S3) | bucket `quickstart-bucket` | `regions.csv`, `product_costs.parquet`, `promotions.ndjson` | loaded into `qs.*` (example 6) |
 
 ### Data dictionary
 
@@ -150,7 +150,7 @@ the connection name; OtterStax routes the query to the right engine.
 
 - **Docker** (Desktop or Engine) running.
 - **`psql`** on your host (the PostgreSQL client) — that's the only client you need.
-- Free host ports: **8817** (OtterStax) and **3310–3317** (backends + MinIO). Port
+- Free host ports: **8817** (OtterStax) and **3310–3317** (backends + RustFS). Port
   **19094** (Kafka) is published too but only needed for optional host-side `rpk`.
 - `mysql` / `clickhouse-client` are **optional** — this guide uses `docker exec` for those.
 
@@ -188,9 +188,9 @@ docker exec qs-clickhouse clickhouse-client -u demo --password demo \
 (The two `psql` calls will prompt for a password — it's `demo`. Or prefix with
 `PGPASSWORD=demo`.)
 
-### Verify the S3 files (MinIO console)
+### Verify the S3 files (RustFS console)
 
-Open **http://localhost:3317** and log in with **`minioadmin` / `minioadmin`**.
+Open **http://localhost:3317/rustfs/console/** and log in with **`rustfsadmin` / `rustfsadmin`**.
 Browse the `quickstart-bucket` — at a fresh start it holds exactly the three source
 objects `regions.csv`, `product_costs.parquet` and `promotions.ndjson`.
 [Example 7](#example-7--export-a-join-back-to-s3-copy--to) writes an
@@ -411,11 +411,11 @@ Output is just the command tag:
 COMMAND
 ```
 
-Verify it landed — in the MinIO console (http://localhost:3317) browse
+Verify it landed — in the RustFS console (http://localhost:3317/rustfs/console/) browse
 `quickstart-bucket/exports/promo_costs.csv`, or:
 
 ```bash
-docker exec qs-minio ls /data/quickstart-bucket/exports/
+docker exec qs-rustfs ls /data/quickstart-bucket/exports/
 ```
 
 ---
@@ -462,8 +462,7 @@ psql -h localhost -p 8817 -U demo demo \
 
 ### Example 9 — Mutations: INSERT / UPDATE / DROP
 
-A full lifecycle on a small engine table. `UPDATE` echoes the changed rows with their
-new values, so you can see exactly what it did (requires example 6 for the `qs` database):
+A full lifecycle on a small engine table (requires example 6 for the `qs` database):
 
 ```bash
 psql -h localhost -p 8817 -U demo demo <<'SQL'
@@ -478,12 +477,6 @@ SQL
 ```text
 CREATE TABLE
 INSERT 0 3
- id | label | qty
-----+-------+-----
-  1 | alpha |  10
-  2 | beta  |  20
-(2 rows)
-
 UPDATE 2
  id | label | qty
 ----+-------+-----
@@ -495,15 +488,14 @@ UPDATE 2
 DROP
 ```
 
-> The two-row block after `INSERT 0 3` is the `UPDATE` echoing the rows it changed;
-> the three-row block is the final `SELECT`. `DELETE` works the same way and reports
-> `DELETE N`. These run on **engine tables** (`qs.*`, incl. the S3-loaded ones), which
+> `UPDATE 2` is the number of rows the `UPDATE` changed; the table is the final
+> `SELECT`. `DELETE` works the same way and reports `DELETE N`. These run on **engine tables** (`qs.*`, incl. the S3-loaded ones), which
 > are the reliably writable target — mutations directly against the pre-seeded backend
 > tables (`customers`, `orders`, …) are not supported over this path.
 >
-> Engine tables live in the running server, so they **do not survive an OtterStax
-> restart** — just re-run example 6 to recreate them. Backend data and S3 files always
-> persist (see [Persistence](#persistence--what-survives-a-restart)).
+> Engine tables live inside the OtterStax container: they survive `docker compose restart`
+> but not `docker compose down` — after a `down`/`up` just re-run example 6. Backend data
+> and S3 files always persist (see [Persistence](#persistence--what-survives-a-restart)).
 
 ---
 
@@ -658,8 +650,9 @@ DROP SOURCE IF EXISTS qs_orders;
 SQL
 ```
 
-Like the engine tables, a source/stream lives in the running server and doesn't survive an
-OtterStax restart — re-run K1 (and K4). The `qs_orders` topic itself is re-seeded to the
+Like the engine tables, a source/stream lives inside the OtterStax container: it survives
+`docker compose restart` (and resumes) but not `docker compose down` — after a `down`/`up`
+re-run K1 (and K4). The `qs_orders` topic itself is re-seeded to the
 committed 40 events on every `docker compose up`.
 
 ---
@@ -668,8 +661,8 @@ committed 40 events on every `docker compose up`.
 
 Examples 1–5 are read-only and always re-runnable. Examples 6–9 create the `qs.*`
 engine tables. **Run example 6 once** — re-running `CREATE EXTERNAL TABLE` on a table
-that already exists *appends* the file again (duplicate rows). Before replaying examples
-6–9, drop the engine state:
+that already exists fails with `… qs.regions already exists` and leaves the table as it
+was. Before replaying examples 6–9, drop the engine state:
 
 ```bash
 psql -h localhost -p 8817 -U demo demo <<'SQL'
@@ -688,22 +681,23 @@ example 7 lives in S3 and is simply overwritten on the next run.)
 
 ## Persistence — what survives a restart
 
-Backend data lives in named Docker volumes and the S3 objects live in MinIO's volume,
+Backend data lives in named Docker volumes and the S3 objects live in RustFS's volume,
 so **your data is intact across restarts**. Verified behavior:
 
 | Action | Backends (customers/products/orders/pageviews) | S3 source files | Engine tables (`qs.*`) |
 |--------|-----------------------------------------------|-----------------|------------------------|
-| `docker compose restart` / `stop`+`start` | **kept** (volumes) | **kept** | lost (in-memory; re-run ex. 6) |
-| `docker compose down` then `up` (no `-v`) | **kept** (volumes) | **kept** (minio-init re-runs, idempotent) | lost — re-run ex. 6 |
+| `docker compose restart` / `stop`+`start` | **kept** (volumes) | **kept** | **kept** (the container's storage survives) |
+| `docker compose down` then `up` (no `-v`) | **kept** (volumes) | **kept** (rustfs-init re-runs, idempotent) | lost (container recreated) — re-run ex. 6 |
 | `docker compose down -v` then `up` | **rebuilt from `init/**`** (identical data) | **re-seeded from `init/s3/**`** | absent until ex. 6 |
 
 So: source data (all four backends + the three S3 **source** files) is preserved on a warm
 restart and faithfully **reconstructed from the committed init files** on a cold `down -v`.
-The only thing you re-run after an OtterStax restart is `CREATE EXTERNAL TABLE` (example 6),
-because engine-loaded tables live in the server process, not on a backend.
+The only thing you re-run after a `down`/`up` is `CREATE EXTERNAL TABLE` (example 6) — and
+K1/K4 for Kafka — because engine tables, sources and streams live inside the OtterStax
+container, not on a backend or a volume.
 
 The `exports/` prefix (example 7's `COPY` output) is **not** persisted seed data — the
-seed job clears it on every `up`, so a fresh start never shows a stale export. The Kafka
+seed job clears it on every `up` (and `restart`), so a fresh start never shows a stale export. The Kafka
 broker is ephemeral: `qs-kafka-init` re-seeds `qs_orders` to the committed 40 events on
 every `up`.
 
@@ -725,12 +719,12 @@ docker compose down -v    # stop and WIPE volumes (next `up` rebuilds from init/
 | `up` fails: *port is already allocated* (8817) | The `examples/demo/` stack (or another) holds 8817 | Stop it first: `docker stop demo-otterstax` (or `docker compose -f examples/demo/compose.yml down`). |
 | `psql: connection refused` on 8817 | OtterStax still starting | Wait for `docker compose ps` to show `qs-otterstax` healthy (it waits for all backends first). |
 | `External table is not registered: shop.customers` | Wrong qualifier — a PostgreSQL table needs `alias.db.table` where the tables live in a schema named like the db | Use the forms in [Backends & federation names](#backends--federation-names): `pgshop.shop.customers`, `pgcat.catalog.products`. |
-| My `qs.*` tables vanished after a restart | Engine tables are in-memory | Re-run `sql/06_external_create.sql`. Backend + S3 data is still there (see [Persistence](#persistence--what-survives-a-restart)). |
+| My `qs.*` tables vanished after `down`/`up` | Engine tables live in the OtterStax container, which `down` removes | Re-run `sql/06_external_create.sql`. Backend + S3 data is still there (see [Persistence](#persistence--what-survives-a-restart)). |
 | `ROUND(x, 2)` errors / returns wrong output | 2-arg `ROUND` isn't pushed to backends | Use plain `SUM()` / `AVG()` (as the examples do). |
 | ClickHouse/MariaDB "client not found" on host | You don't have those CLIs | Use the `docker exec` forms in [Directly against each backend](#directly-against-each-backend-optional-sanity-check). |
 | `kafka.qs_orders` shows 0 rows | The poller is still ingesting (async) | Wait a few seconds and re-run the `SELECT` (K1). |
 | K2 join errors `path: 'name' was not found` | `name` exists in both `customers` and `products` — the mixed join can't resolve it | Project other columns (`country`/`tier`/`category`), as K2 does. |
-| `qs_orders_paid` empty after `CREATE STREAM` | The stream worker needs a moment | Wait a few seconds; check `docker logs qs-otterstax`. Sources/streams don't survive an OtterStax restart — re-run K1/K4. |
+| `qs_orders_paid` empty after `CREATE STREAM` | The stream worker needs a moment | Wait a few seconds; check `docker logs qs-otterstax`. After a `down`/`up` the source and stream are gone — re-run K1/K4. |
 
 ---
 
@@ -738,11 +732,11 @@ docker compose down -v    # stop and WIPE volumes (next `up` rebuilds from init/
 
 | Path | What |
 |------|------|
-| `compose.yml` | the whole stack (backends + MinIO + Kafka + seed jobs + OtterStax) with named volumes |
+| `compose.yml` | the whole stack (backends + RustFS + Kafka + seed jobs + OtterStax) with named volumes |
 | `config.yaml` | OtterStax connection config (2×PG, MariaDB, ClickHouse, S3) — read at startup |
 | `sql/01…09_*.sql` | the nine core examples; `sql/cleanup.sql` drops engine state |
 | `sql/kafka_0{1..4}_*.sql` | the four Kafka examples; `sql/kafka_cleanup.sql` drops the source/stream |
 | `init/postgres_shop/`, `init/postgres_catalog/`, `init/mariadb/`, `init/clickhouse/` | committed DB seed SQL (auto-run on first container init) |
-| `init/s3/` | committed S3 fixtures (`regions.csv`, `product_costs.parquet`, `promotions.ndjson`) uploaded by `qs-minio-init` |
+| `init/s3/` | committed S3 fixtures (`regions.csv`, `product_costs.parquet`, `promotions.ndjson`) uploaded by `qs-rustfs-init` |
 | `init/kafka/orders.ndjson` | committed Kafka fixture (40 events) produced to `qs_orders` by `qs-kafka-init` |
 | `fixtures/generate.py` | **maintainer-only** regenerator for everything under `init/`. Not needed to run the demo (needs `faker` + `pyarrow`). |

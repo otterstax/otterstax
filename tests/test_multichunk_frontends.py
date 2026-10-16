@@ -39,7 +39,7 @@ DB = "multichunk_db"
 TABLE = "web_events"
 FIXTURE = next(ds for ds in DATASETS if ds["name"] == TABLE)
 COLUMNS = FIXTURE["columns"]         # event_id, campaign_id, product_id, event_type, session_seconds, value
-EXPECTED_ROWS = FIXTURE["rows"]      # 5000, tests/minio/fixtures/generate_external_fixtures.py
+EXPECTED_ROWS = FIXTURE["rows"]      # 5000, tests/s3/fixtures/generate_external_fixtures.py
 CHUNK_CAPACITY = 1024                # engine's per-chunk cap — the number to beat
 
 # Guard on the fixture definition, not on runtime state: if the fixture ever

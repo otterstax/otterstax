@@ -1,5 +1,5 @@
 -- Step 7: Load a CSV from S3 into the otterbrix engine.
---   Source: s3://demo-bucket/regions.csv (seeded into MinIO by `up.sh`).
+--   Source: s3://demo-bucket/regions.csv (seeded into RustFS by `up.sh`).
 --   The s3_alias 'demo_s3' is registered at server startup from the `s3:` section
 --   of the config file (config.yaml in docker mode / config_local.yaml with
 --   --local, where the endpoint points at host:3206).

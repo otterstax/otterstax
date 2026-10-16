@@ -1,0 +1,97 @@
+# Two standalone RustFS (S3-compatible) services for testing the conn::s3
+# connector against more than one endpoint / alias at once.
+#
+#   docker compose -f tests/s3/docker-compose.yml up -d
+#
+# ┌─────────┬──────────────────────┬──────────────┬───────────────┐
+# │ service │ S3 API (host)        │ console      │ bucket        │
+# ├─────────┼──────────────────────┼──────────────┼───────────────┤
+# │ rustfs1 │ http://localhost:9000│ :9001        │ test-bucket-1 │
+# │ rustfs2 │ http://localhost:9010│ :9011        │ test-bucket-2 │
+# └─────────┴──────────────────────┴──────────────┴───────────────┘
+#
+# In-network the endpoints are rustfs1:9000 and rustfs2:9000.
+# Both use the same credentials: rustfsadmin / rustfsadmin (region us-east-1).
+# Each bucket is pre-seeded from ./fixtures by its `*-init` container.
+
+x-rustfs: &rustfs-base
+  image: rustfs/rustfs:latest
+  environment:
+    RUSTFS_ACCESS_KEY: rustfsadmin
+    RUSTFS_SECRET_KEY: rustfsadmin
+  healthcheck:
+    test: ["CMD", "curl", "-sf", "http://localhost:9000/health"]
+    interval: 5s
+    timeout: 5s
+    retries: 20
+    start_period: 5s
+  networks:
+    - rustfs_network
+
+x-init: &init-base
+  image: amazon/aws-cli:latest
+  environment:
+    AWS_ACCESS_KEY_ID: rustfsadmin
+    AWS_SECRET_ACCESS_KEY: rustfsadmin
+    AWS_DEFAULT_REGION: us-east-1
+  volumes:
+    - ./fixtures:/fixtures:ro
+  networks:
+    - rustfs_network
+
+services:
+  rustfs1:
+    <<: *rustfs-base
+    container_name: test-rustfs1
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - rustfs1_data:/data
+
+  rustfs2:
+    <<: *rustfs-base
+    container_name: test-rustfs2
+    ports:
+      - "9010:9000"
+      - "9011:9001"
+    volumes:
+      - rustfs2_data:/data
+
+  rustfs1-init:
+    <<: *init-base
+    container_name: test-rustfs1-init
+    depends_on:
+      rustfs1:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      E=http://rustfs1:9000;
+      aws --endpoint-url $$E s3api head-bucket --bucket test-bucket-1 2>/dev/null || aws --endpoint-url $$E s3 mb s3://test-bucket-1;
+      aws --endpoint-url $$E s3api put-bucket-policy --bucket test-bucket-1 --policy '{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":[\"*\"]},\"Action\":[\"s3:GetObject\"],\"Resource\":[\"arn:aws:s3:::test-bucket-1/*\"]}]}';
+      aws --endpoint-url $$E s3 cp --recursive /fixtures/ s3://test-bucket-1/;
+      echo 'rustfs1 ready: test-bucket-1 seeded';
+      "
+
+  rustfs2-init:
+    <<: *init-base
+    container_name: test-rustfs2-init
+    depends_on:
+      rustfs2:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      E=http://rustfs2:9000;
+      aws --endpoint-url $$E s3api head-bucket --bucket test-bucket-2 2>/dev/null || aws --endpoint-url $$E s3 mb s3://test-bucket-2;
+      aws --endpoint-url $$E s3api put-bucket-policy --bucket test-bucket-2 --policy '{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":[\"*\"]},\"Action\":[\"s3:GetObject\"],\"Resource\":[\"arn:aws:s3:::test-bucket-2/*\"]}]}';
+      aws --endpoint-url $$E s3 cp --recursive /fixtures/ s3://test-bucket-2/;
+      echo 'rustfs2 ready: test-bucket-2 seeded';
+      "
+
+networks:
+  rustfs_network:
+    driver: bridge
+
+volumes:
+  rustfs1_data:
+  rustfs2_data:

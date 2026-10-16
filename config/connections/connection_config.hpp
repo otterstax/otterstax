@@ -50,7 +50,7 @@ struct S3CredentialDesc {
     std::string secret_key;
     std::string region;         // optional
     std::string session_token;  // optional — for IAM roles
-    std::string endpoint;       // optional — for MinIO / custom S3-compatible endpoints
+    std::string endpoint;       // optional — for RustFS / custom S3-compatible endpoints
 };
 
 // Aggregate parsed from the connection config file: the single source of truth

@@ -53,8 +53,8 @@ python ./generate_data.py
 # --- 2. Bring up containers ---
 echo ""
 if $LOCAL; then
-    echo "=== 2. Starting demo backends + MinIO + Kafka only (bench/local mode) ==="
-    $COMPOSE_CMD -f compose.yml up -d demo-mariadb demo-postgres demo-clickhouse demo-minio demo-minio-init demo-kafka
+    echo "=== 2. Starting demo backends + RustFS + Kafka only (bench/local mode) ==="
+    $COMPOSE_CMD -f compose.yml up -d demo-mariadb demo-postgres demo-clickhouse demo-rustfs demo-rustfs-init demo-kafka
 else
     echo "=== 2. Starting full demo stack (compose.yml --profile full) ==="
     $COMPOSE_CMD --profile full -f compose.yml up -d --build
@@ -64,9 +64,9 @@ fi
 echo ""
 echo "=== 3. Waiting for healthy containers ==="
 if $LOCAL; then
-    WAIT_SVCS="demo-mariadb demo-postgres demo-clickhouse demo-minio demo-kafka"
+    WAIT_SVCS="demo-mariadb demo-postgres demo-clickhouse demo-rustfs demo-kafka"
 else
-    WAIT_SVCS="demo-mariadb demo-postgres demo-clickhouse demo-minio demo-kafka demo-otterstax"
+    WAIT_SVCS="demo-mariadb demo-postgres demo-clickhouse demo-rustfs demo-kafka demo-otterstax"
 fi
 for svc in $WAIT_SVCS; do
     echo -n "   $svc"
@@ -96,13 +96,13 @@ if $LOCAL; then
 cat <<'EOF'
 
 ================================================================================
-✅  Demo backends + MinIO are up:
+✅  Demo backends + RustFS are up:
 
   MariaDB:    localhost:3201   user=demo pass=demo db=bill
   Postgres:   localhost:3202   user=demo pass=demo db=shop
   ClickHouse: localhost:3204   user=demo pass=demo db=ev
-  MinIO:      localhost:3206   user=minioadmin pass=minioadmin bucket=demo-bucket
-              (console: http://localhost:3207)
+  RustFS:     localhost:3206   user=rustfsadmin pass=rustfsadmin bucket=demo-bucket
+              (console: http://localhost:3207/rustfs/console/)
   Kafka:      localhost:19093  (redpanda; streaming demo broker)
 
   Now start your local otterstax server (single config file with the
@@ -135,7 +135,7 @@ cat <<'EOF'
 
   Other wires:
     mysql -h localhost -P 8816 -u demo -pdemo
-    MinIO console: http://localhost:3207  (user=minioadmin pass=minioadmin)
+    RustFS console: http://localhost:3207/rustfs/console/  (user=rustfsadmin pass=rustfsadmin)
 
   Run demo SQL files step-by-step (paths relative to repo root):
 
@@ -166,7 +166,7 @@ cat <<'EOF'
     psql -h localhost -p 8817 -U demo demo -f examples/demo/sql/cleanup.sql
 
   Tear everything down (releases volumes — clickhouse re-init needs this,
-  and the MinIO bucket is recreated on next `up`):
+  and the RustFS bucket is recreated on next `up`):
 
     examples/demo/down.sh
 

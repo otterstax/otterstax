@@ -4,4 +4,4 @@
 # DinD / sibling-container CI runners like Gitea act_runner).
 FROM amazon/aws-cli:latest
 
-COPY tests/minio/fixtures /fixtures
+COPY tests/s3/fixtures /fixtures

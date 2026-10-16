@@ -55,7 +55,7 @@ connections:
 
   s3:
     - alias: qs_s3
-      access_key: minioadmin
-      secret_key: minioadmin
+      access_key: rustfsadmin
+      secret_key: rustfsadmin
       region: us-east-1
-      endpoint: qs-minio:9000
+      endpoint: qs-rustfs:9000

@@ -8,7 +8,7 @@
 # Only the broker lives here.  The topic is seeded by an explicit `docker run` of
 # data/seed_kafka.py in run_benchmark.sh, NOT a compose one-shot: a seed service
 # would be re-run by _ensure_otterstax's backend `up -d` on a mid-run restart and
-# double the topic (Kafka produce is not idempotent, unlike MinIO's `mc cp`).
+# double the topic (Kafka produce is not idempotent, unlike the RustFS seed's `aws s3 cp`).
 # bench-otterstax reaches the broker at bench_kafka:9092; 19092 is only for
 # host-run (--local) debugging.
 

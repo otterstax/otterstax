@@ -35,6 +35,10 @@ RUN install -m 0755 -d /etc/apt/keyrings \
     && apt-get install -y docker-ce-cli \
     && rm -rf /var/lib/apt/lists/*
 
+# Tolerate slow PyPI downloads: pip's defaults (15 s read timeout, 5 retries)
+# fail the build on a stalled transfer.
+ENV PIP_DEFAULT_TIMEOUT=120 PIP_RETRIES=10
+
 # Install Python dependencies including Faker
 RUN pip install --no-cache-dir \
     pyarrow \
@@ -69,7 +73,7 @@ COPY --from=goharness /out/flightsql_go /usr/local/bin/flightsql_go
 # Copy application files. All top-level tests/*.py (helpers + test_*.py) are
 # pulled in via a single wildcard so a newly-added test doesn't need a matching
 # COPY line — startup.sh remains the source of truth for which tests actually
-# run. Subdirectories (scripts/, system/, unit/, minio/, mock/, mysql-front/)
+# run. Subdirectories (scripts/, system/, unit/, s3/, mock/, mysql-front/)
 # are intentionally excluded by the *.py glob — except the FlightSQL e2e suite
 # and its Go harness, which docker-run-tests.sh runs via pytest / the binary.
 COPY ./tests/scripts .

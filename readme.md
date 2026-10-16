@@ -104,10 +104,10 @@ connections:
 
   s3:
     - alias: demo_s3    # referenced by CREATE EXTERNAL TABLE / COPY ... TO via s3_alias=
-      access_key: minioadmin
-      secret_key: minioadmin
+      access_key: rustfsadmin
+      secret_key: rustfsadmin
       region: us-east-1         # optional
-      endpoint: demo-minio:9000 # optional; switches to http + path-style (MinIO)
+      endpoint: demo-rustfs:9000 # optional; switches to http + path-style (RustFS)
 ```
 
 Wire-server settings live under the top-level `service:` node so
@@ -143,7 +143,7 @@ Ready-made `config.yaml` files ship with each runnable stack: `examples/demo/`,
 ## S3 / file external tables
 
 OtterStax can pull data into the engine from a local file or an S3-compatible
-object store (AWS S3, MinIO, …) and dump query results back out, all over the
+object store (AWS S3, RustFS, …) and dump query results back out, all over the
 standard wire protocols. The surface SQL is two grammar extensions:
 
 ```sql
@@ -152,7 +152,7 @@ CREATE EXTERNAL TABLE db.t
     WITH (location = '/path/to/data.parquet', format = 'parquet');
 
 CREATE EXTERNAL TABLE db.t
-    WITH (s3_alias = 'minio1',
+    WITH (s3_alias = 'rustfs1',
           location = 's3://bucket/data.csv',
           format   = 'csv');
 
@@ -161,7 +161,7 @@ COPY (SELECT * FROM db.t WHERE …) TO '/tmp/out.ndjson'
     WITH (format = 'ndjson');
 
 COPY (SELECT * FROM db.t) TO 's3://bucket/exported/out.csv'
-    WITH (s3_alias = 'minio1', format = 'csv');
+    WITH (s3_alias = 'rustfs1', format = 'csv');
 ```
 
 - **Supported formats**: `parquet`, `csv`, `ndjson` (read and write).
@@ -183,15 +183,15 @@ COPY (SELECT * FROM db.t) TO 's3://bucket/exported/out.csv'
 
   ```yaml
   s3:
-    - alias: minio1
+    - alias: rustfs1
       access_key: "…"
       secret_key: "…"
       region: us-east-1
-      endpoint: minio:9000
+      endpoint: rustfs:9000
   ```
 
   The `endpoint` field switches the underlying Arrow S3 client to http +
-  path-style addressing (needed for MinIO); omit it to target real AWS.
+  path-style addressing (needed for RustFS and other S3-compatible stores); omit it to target real AWS.
 
 Implementation lives under `connectors/{s3,file}/` (raw I/O),
 `integration/s3/` (the `S3Manager` orchestrator), and
@@ -313,7 +313,7 @@ and writes results to `benchmark_results/<timestamp>/`.
 | ------ | ----------- |
 | `--repetitions N` | Repetitions per sub-test (default: 10) |
 | `--frontend F` | `mysql` \| `postgres` \| `arrow`; may be repeated; default: `mysql postgres` |
-| `--bench T [T …]` | Tests to run: `simple_select` `complex_select` `join_same_instance` `join_cross_engine` `join_all` `external_load` `external_join` `external_dump` `external_join_cross` `external_join_all`. Selecting any `external_*` test auto-starts MinIO, generates s3/file fixtures, and registers the `bench_minio` s3 alias (mysql/postgres frontends only). |
+| `--bench T [T …]` | Tests to run: `simple_select` `complex_select` `join_same_instance` `join_cross_engine` `join_all` `external_load` `external_join` `external_dump` `external_join_cross` `external_join_all`. Selecting any `external_*` test auto-starts RustFS, generates s3/file fixtures, and registers the `bench_rustfs` s3 alias (mysql/postgres frontends only). |
 | `--rebuild` | Force image rebuild even if images already exist |
 | `--clear` | Remove images + DB volumes, rebuild from scratch |
 | `-j N` | Parallel cmake build jobs (auto-capped by available RAM) |

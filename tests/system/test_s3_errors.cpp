@@ -89,17 +89,17 @@ TEST_CASE("s3 connector: add_credentials rejects an empty alias or empty keys as
     }
 
     SECTION("empty access_key") {
-        auto params = valid_params(resource, "minio");
+        auto params = valid_params(resource, "rustfs");
         params.access_key.clear();
         auto r = settled(
             actor_zeta::send(s3->address(), &conn::s3::ConnectorManager::add_credentials, id, std::move(params)));
         REQUIRE(r.has_error());
         CHECK(r.error().type == core::error_code_t::invalid_parameter);
-        CHECK_THAT(std::string{r.error().what.c_str()}, ContainsSubstring("minio"));
+        CHECK_THAT(std::string{r.error().what.c_str()}, ContainsSubstring("rustfs"));
     }
 
     SECTION("empty secret_key") {
-        auto params = valid_params(resource, "minio");
+        auto params = valid_params(resource, "rustfs");
         params.secret_key.clear();
         auto r = settled(
             actor_zeta::send(s3->address(), &conn::s3::ConnectorManager::add_credentials, id, std::move(params)));
@@ -108,7 +108,7 @@ TEST_CASE("s3 connector: add_credentials rejects an empty alias or empty keys as
     }
 
     SECTION("a rejected alias is not stored") {
-        auto params = valid_params(resource, "minio");
+        auto params = valid_params(resource, "rustfs");
         params.secret_key.clear();
         auto rejected = settled(
             actor_zeta::send(s3->address(), &conn::s3::ConnectorManager::add_credentials, id, std::move(params)));
@@ -117,7 +117,7 @@ TEST_CASE("s3 connector: add_credentials rejects an empty alias or empty keys as
         auto r = settled(actor_zeta::send(s3->address(),
                                           &conn::s3::ConnectorManager::upload,
                                           id,
-                                          std::string{"minio"},
+                                          std::string{"rustfs"},
                                           std::string{"bucket/key.csv"},
                                           std::string{"/nonexistent/file.csv"}));
         REQUIRE(r.has_error());
@@ -128,13 +128,13 @@ TEST_CASE("s3 connector: add_credentials rejects an empty alias or empty keys as
         auto first = settled(actor_zeta::send(s3->address(),
                                               &conn::s3::ConnectorManager::add_credentials,
                                               id,
-                                              valid_params(resource, "minio")));
+                                              valid_params(resource, "rustfs")));
         REQUIRE_FALSE(first.has_error());
         CHECK(first.value());
         auto again = settled(actor_zeta::send(s3->address(),
                                               &conn::s3::ConnectorManager::add_credentials,
                                               id,
-                                              valid_params(resource, "minio")));
+                                              valid_params(resource, "rustfs")));
         REQUIRE_FALSE(again.has_error());
         CHECK(again.value());
     }
@@ -185,14 +185,14 @@ TEST_CASE("s3 connector: a transfer Arrow refuses is io_error and leaves no file
     auto stored = settled(actor_zeta::send(s3->address(),
                                            &conn::s3::ConnectorManager::add_credentials,
                                            id,
-                                           valid_params(resource, "minio")));
+                                           valid_params(resource, "rustfs")));
     REQUIRE_FALSE(stored.has_error());
 
     SECTION("download of a bucket-only path (not an object) is rejected before any request") {
         auto r = settled(actor_zeta::send(s3->address(),
                                           &conn::s3::ConnectorManager::download,
                                           id,
-                                          std::string{"minio"},
+                                          std::string{"rustfs"},
                                           std::string{"bucket-without-key"}));
         REQUIRE(r.has_error());
         CHECK(r.error().type == core::error_code_t::io_error);
@@ -205,7 +205,7 @@ TEST_CASE("s3 connector: a transfer Arrow refuses is io_error and leaves no file
         auto r = settled(actor_zeta::send(s3->address(),
                                           &conn::s3::ConnectorManager::upload,
                                           id,
-                                          std::string{"minio"},
+                                          std::string{"rustfs"},
                                           std::string{"bucket/key.csv"},
                                           missing));
         REQUIRE(r.has_error());

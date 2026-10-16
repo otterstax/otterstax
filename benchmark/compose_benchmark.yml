@@ -34,9 +34,9 @@ services:
       # s3/file external-table fixtures (regions.parquet / web_events.csv /
       # campaigns.ndjson), generated into data/fixtures by run_benchmark.sh.
       # The `file` source reads these directly; the `s3` source reads the same
-      # files seeded into MinIO (compose_minio.yml).  Empty for non-external runs.
+      # files seeded into RustFS (compose_rustfs.yml).  Empty for non-external runs.
       - ./data/fixtures:/fixtures:ro
-      # Single config file (server settings + 6 backends + bench_minio s3 alias).
+      # Single config file (server settings + 6 backends + bench_rustfs s3 alias).
       # Read once at startup — overrides the config.yaml baked into the image.
       # Mounted onto the server's default config path (WORKDIR /app/build/Release).
       - ./config.yaml:/app/build/Release/config.yaml:ro

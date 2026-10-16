@@ -432,6 +432,7 @@ conaninfo.txt
 wal/
 log/
 *.txt.user
+.local_data/
 
 # AI
 .qwen/

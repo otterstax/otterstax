@@ -3,6 +3,7 @@
 
 #include "ndjson_to_chunk.hpp"
 #include "arrow_to_chunk.hpp"
+#include "otterbrix/translators/arrow_memory_pool.hpp"
 #include "otterbrix/translators/error.hpp"
 
 #include "utility/tracy_profiler.hpp"
@@ -61,7 +62,7 @@ namespace {
         parse_opts.newlines_in_values = false;
 
         auto reader_result = arrow::json::TableReader::Make(
-            arrow::default_memory_pool(), input, read_opts, parse_opts);
+            arrow_pool(res), input, read_opts, parse_opts);
         if (!reader_result.ok()) {
             return arrow_error(res, core::error_code_t::conversion_failure,
                                "ndjson_to_chunk: reader creation failed", reader_result.status());
@@ -73,7 +74,7 @@ namespace {
                                "ndjson_to_chunk: read failed", table_result.status());
         }
 
-        auto batch = (*table_result)->CombineChunksToBatch();
+        auto batch = (*table_result)->CombineChunksToBatch(arrow_pool(res));
         if (!batch.ok()) {
             return arrow_error(res, core::error_code_t::conversion_failure,
                                "ndjson_to_chunk: combine batches failed", batch.status());
@@ -85,7 +86,7 @@ namespace {
 
 core::result_wrapper_t<data_chunk_t> ndjson_to_chunk(std::pmr::memory_resource* res, const std::string& file_path) {
     OTX_ZONE_N("tsl::ndjson_to_chunk(file)");
-    auto file_result = arrow::io::ReadableFile::Open(file_path);
+    auto file_result = arrow::io::ReadableFile::Open(file_path, arrow_pool(res));
     if (!file_result.ok()) {
         return arrow_error(res, core::error_code_t::io_error,
                            "ndjson_to_chunk: cannot open file", file_result.status());
@@ -99,6 +100,15 @@ core::result_wrapper_t<data_chunk_t> ndjson_to_chunk(std::pmr::memory_resource* 
     auto buffer = std::make_shared<arrow::Buffer>(unwrapped.data(),
                                                   static_cast<int64_t>(unwrapped.size()));
     auto input = std::make_shared<arrow::io::BufferReader>(buffer);
+    return read_json(res, input);
+}
+
+core::result_wrapper_t<data_chunk_t> ndjson_to_chunk(std::pmr::memory_resource* res,
+                                                     std::shared_ptr<arrow::io::InputStream> input) {
+    OTX_ZONE_N("tsl::ndjson_to_chunk(stream)");
+    if (!input) {
+        return make_error(res, core::error_code_t::invalid_parameter, "ndjson_to_chunk: null input");
+    }
     return read_json(res, input);
 }
 

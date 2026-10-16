@@ -108,7 +108,7 @@ Converts raw backend results or file bytes into Otterbrix `data_chunk_t`:
 | `parquet_to_chunk` / `parquet_to_struct` | parquet file or buffer | `result_wrapper_t<data_chunk_t>` / `result_wrapper_t<complex_logical_type>` (via Arrow + snappy/brotli/zlib/lz4/zstd) |
 | `csv_to_chunk` | csv file or buffer | `result_wrapper_t<data_chunk_t>` |
 | `ndjson_to_chunk` | ndjson file or buffer | `result_wrapper_t<data_chunk_t>` (TableReader; LSan note: Arrow's `BackgroundGenerator` worker thread races during teardown — suppressed in `tsan.supp`) |
-| `arrow_to_chunk` | `arrow::RecordBatch` | `result_wrapper_t<data_chunk_t>` (shared shim used by parquet/csv/ndjson). Two explicit switches — the column type and the value reading — the second keyed on the array's own `type_id()`, so a type the reader has no case for is `conversion_failure` naming the column, never another array's layout read through a wrong cast. `decimal128(p, 0)` is HUGEINT (the carrier our own `COPY ... TO` writes for it), `decimal128(p, s > 0)` a DECIMAL(p, s) holding the same unscaled integer; a scale outside `0 <= s <= p`, a precision past 38, a payload that does not fit its declared precision, and a non-finite decimal payload are refused rather than read as another number |
+| `arrow_to_chunk` | `arrow::RecordBatch` | `result_wrapper_t<data_chunk_t>` (shared shim used by parquet/csv/ndjson, and FlightSQL's DoPut bind). Every Arrow type otterbrix's importer reads is read by it, through the Arrow C data interface (`ExportRecordBatch` → `schema_from_arrow` → `data_chunk_from_arrow`): the integers, floats, bool, utf8 / large_utf8 / string_view, binary (BLOB), date32/64, time, timestamp (any unit, ± tz), duration / interval, dictionary- and run-end-encoded columns, list, struct, map. The chunk aliases the batch's buffers (strings as string_views) and every column holds a second, zero-copy export of the batch as its owner (`hold_batch_in_every_column`): the importer leaves its own owner with column 0 only, and a dictionary column loses even that when it is re-sliced. Temporal values are moved from Arrow's 1970 epoch to the engine's 2000-01-01 by the importer. Two types keep this file's per-cell reader: **decimal128** (the importer narrows a value to its storage width with an unchecked cast, and reads `decimal128(p, 0)` as DECIMAL where this shim reads the HUGEINT our writers carry under it — `decimal128(p, s > 0)` is DECIMAL(p, s), a scale outside `0 <= s <= p`, a precision past 38 or a payload past its declared precision is refused) and **null** (the importer swaps an NA column's buffer and with it the owner). A type neither reads is `conversion_failure` naming the column. `arrow_schema_to_struct` / `parquet_to_struct` (discovery) ask the same importer, so a discovered type is the loaded one. otterbrix refuses a dictionary-encoded column that holds nulls |
 | `affected_rows_carrier.hpp` | affected-row count | column-less DML carrier chunks (`make_affected_rows_carrier`) |
 | `chunk_windows` | one translated `data_chunk_t` | `split_to_capacity(resource, chunk)` → `std::pmr::vector<data_chunk_t>` of chunks within `DEFAULT_VECTOR_CAPACITY` (the chunk contract below) |
 
@@ -133,7 +133,27 @@ bad argument is `invalid_parameter`. `translators/error.hpp` holds the
 the caller's resource.
 
 The file-format loaders all take a `std::pmr::memory_resource*` and route every
-allocation through it. **Lifetime trap:** the returned `data_chunk_t` keeps that
+allocation through it — Arrow's own buffers included: every reader, builder,
+writer and `CombineChunksToBatch` call allocates from `tsl::arrow_pool(res)`
+(`translators/arrow_memory_pool.hpp`), an `arrow::MemoryPool` over the
+resource, interned per resource address for the life of the process (an Arrow
+buffer frees through the raw pool pointer it was made with, possibly after the
+call returned). Arrow allocates from its helper threads too (even the serial
+CSV/JSON readers read ahead on a background thread); the pool enters the
+resource one call at a time, but code that also uses the resource directly
+while such a thread runs (S3 background part uploads) needs a thread-safe one —
+the engine's `synchronized_pool_resource` is. Each loader and writer has a
+stream overload (`std::shared_ptr<arrow::io::RandomAccessFile>` /
+`InputStream` in, `OutputStream` out) beside the path / buffer forms; the S3
+path uses those. A writer's stream form leaves the stream open (the caller
+commits or aborts); its path form writes through `write_local_file`
+(`output/file_sink.hpp`) into a temporary sibling (`temporary_path`: same
+directory, hidden, timestamp + sequence number) that is renamed over the target
+only when the write succeeded — a failed COPY never truncates or removes a file
+already at the path, and readers see the old file or the whole new one. `chunk_to_parquet` writes
+snappy-compressed row groups of up to `parquet_row_group_rows` (128 Ki) rows.
+
+**Lifetime trap:** the returned `data_chunk_t` keeps that
 resource alive — if you borrow `otterbrix->dispatcher()->resource()`, the chunk
 must die *before* the engine does, otherwise `synchronized_pool_resource`
 deallocate sees freed memory (caught by TSan in
@@ -145,10 +165,10 @@ deallocate sees freed memory (caught by TSan in
 
 | File | Output |
 |------|--------|
-| `chunk_to_arrow` | `to_arrow_schema(res, types)` / `to_arrow_schema(res, struct_t)` → `result_wrapper_t<shared_ptr<arrow::Schema>>` (`conversion_failure` on a physical type without an Arrow mapping); `chunk_to_record_batch(res, chunk)` → `result_wrapper_t<shared_ptr<arrow::RecordBatch>>` for frontends |
+| `chunk_to_arrow` | `to_arrow_schema(res, types)` / `to_arrow_schema(res, struct_t)` → `result_wrapper_t<shared_ptr<arrow::Schema>>` (`conversion_failure` on a type without an Arrow mapping; DATE → date32, TIME → time64[us], TIMESTAMP → timestamp[us], TIMESTAMP_TZ → timestamp[us, UTC], as otterbrix's exporter writes them). `chunk_to_record_batch(res, chunk)` (frontends, FlightSQL) and `chunk_to_file_batch(res, chunk)` (the csv / parquet writers): BOOLEAN, the integers, FLOAT, DOUBLE and the temporal types are written by otterbrix's `to_arrow_array` (temporal values moved to Arrow's epoch — no builder ever writes them) and imported with `arrow::ImportRecordBatch`; `chunk_to_file_batch` writes STRING through it too, as `large_utf8`, while `chunk_to_record_batch` keeps STRING on a utf8 builder because that is what the advertised FlightSQL schema says. DECIMAL / HUGEINT (sentinel and precision refusals, `to_arrow_decimal`) and NA always stay on builders, which allocate on `arrow_pool(res)`; the exporter's buffers are otterbrix's own `malloc`'d memory, not `res` |
 | `chunk_to_parquet` | `chunk_to_parquet(res, chunks, path)` → `result_wrapper_t<bool>` (snappy/brotli/zlib/lz4/zstd via Arrow) |
 | `chunk_to_csv` | `chunk_to_csv(res, chunks, path)` → `result_wrapper_t<bool>` |
-| `chunk_to_ndjson` | `chunk_to_ndjson(res, chunks, path)` → `result_wrapper_t<bool>` |
+| `chunk_to_ndjson` | `chunk_to_ndjson(res, chunks, path)` → `result_wrapper_t<bool>`; DATE / TIME / TIMESTAMP / TIMESTAMP_TZ as otterbrix's own text (`core::date::to_string`, a JSON string) |
 | `writable_columns.hpp` | the column validation shared by the writers: only named, flat scalar columns (plus NA) can be written |
 
 The three file-format writers are the `COPY (...) TO 'path'` companion to the

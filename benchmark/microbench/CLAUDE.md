@@ -111,6 +111,29 @@ Input benchmarks use the **buffer** overloads so only the parse + `data_chunk_t`
 
 ---
 
+### `bench_arrow_integration.cpp`
+
+The otterbrix Arrow integration of the file / S3 path, each benchmark next to the per-cell
+code it replaced — run over the same data in the same binary, so the speed-up is measured.
+Data: `id` int64, `score` double, `flag` bool, `name` utf8 (`name_<i>`, every 10th NULL); the
+output benchmarks use engine-shaped 1024-row chunks filled through `set_value`, on a
+`synchronized_pool_resource` (the engine's resource kind). All report `items_per_second`
+(rows/s) except the pool pair.
+
+| Benchmark | Path |
+|-----------|------|
+| `BM_arrow_to_chunk_native/{1k,10k,100k}` | `tsl::arrow_to_chunk` — otterbrix's C data interface importer, the chunk aliases the batch's buffers |
+| `BM_arrow_to_chunk_percell/{1k,10k,100k}` | baseline: the old shim's loop, a `logical_value_t` per cell (three allocations per string) |
+| `BM_chunk_to_record_batch` | `tsl::chunk_to_record_batch` (FlightSQL): numerics through otterbrix's `to_arrow_array`, strings on the utf8 builder |
+| `BM_chunk_to_file_batch` | `tsl::chunk_to_file_batch` (file writers): strings through the exporter too, as `large_utf8` |
+| `BM_chunk_to_batch_percell` | baseline: `chunk.value()` per cell into Arrow builders |
+| `BM_arrow_pool_on_resource/{4KiB,1MiB}` | `tsl::arrow_pool` allocate + free on the resource (mutex + pmr) |
+| `BM_arrow_default_pool/{4KiB,1MiB}` | baseline: Arrow's default pool |
+| `BM_chunk_to_parquet_stream/{1,10}` | `chunk_to_parquet` of 1 / 10 chunks into a `BufferOutputStream` (no filesystem) |
+| `BM_chunk_to_csv_stream/{1,10}` | same for `chunk_to_csv` |
+
+---
+
 ### `bench_parser.cpp`
 
 SQL parsing and subquery extraction.

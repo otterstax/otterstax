@@ -317,3 +317,51 @@ TEST_CASE("chunk_to_ndjson: an output path that cannot be opened is io_error") {
     REQUIRE(written.has_error());
     REQUIRE(written.error().type == core::error_code_t::io_error);
 }
+
+TEST_CASE("chunk_to_ndjson: DATE TIME and TIMESTAMP are written as otterbrix's text for them") {
+    // The engine counts dates from 2000-01-01; written as the bare count they would be numbers
+    // no reader takes for a date. 8043 engine days is 2022-01-08.
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
+    auto* res = &arena;
+    const std::string path = "/tmp/otterstax_test_chunk_to_ndjson_temporal.ndjson";
+    std::filesystem::remove(path);
+
+    constexpr int64_t engine_days = 19000 - 10957;
+    constexpr int64_t half_past_ten = 37'800'000'000LL;
+    std::pmr::vector<complex_logical_type> types{res};
+    types.emplace_back(logical_type::DATE, "day");
+    types.emplace_back(logical_type::TIME, "clock");
+    types.emplace_back(logical_type::TIMESTAMP, "at");
+    types.emplace_back(logical_type::TIMESTAMP_TZ, "at_utc");
+    data_chunk_t chunk(res, types, 2);
+    chunk.set_cardinality(2);
+    chunk.set_value(0, 0, logical_value_t{res, core::date::date_t{core::date::days{engine_days}}});
+    chunk.set_value(1, 0, logical_value_t{res, core::date::time_t{core::date::microseconds{half_past_ten + 250'000}}});
+    chunk.set_value(2,
+                    0,
+                    logical_value_t{res,
+                                    core::date::timestamp_t{
+                                        core::date::microseconds{engine_days * 86'400'000'000LL + half_past_ten}}});
+    chunk.set_value(3,
+                    0,
+                    logical_value_t{res,
+                                    core::date::timestamptz_t{
+                                        core::date::microseconds{engine_days * 86'400'000'000LL + half_past_ten}}});
+    for (uint64_t c = 0; c < 4; ++c) {
+        chunk.set_value(c, 1, logical_value_t{res, nullptr});
+    }
+    std::pmr::vector<data_chunk_t> chunks(res);
+    chunks.push_back(std::move(chunk));
+
+    auto written = tsl::chunk_to_ndjson(res, chunks, path);
+    INFO("write error: " << (written.has_error() ? written.error().what.c_str() : ""));
+    REQUIRE_FALSE(written.has_error());
+
+    const auto lines = read_lines(path);
+    REQUIRE(lines.size() == 2);
+    CHECK(lines[0] ==
+          "{\"day\":\"2022-01-08\",\"clock\":\"10:30:00.25\",\"at\":\"2022-01-08 10:30:00\",\"at_utc\":\"2022-01-08 "
+          "10:30:00+00\"}");
+    CHECK(lines[1] == "{\"day\":null,\"clock\":null,\"at\":null,\"at_utc\":null}");
+    std::filesystem::remove(path);
+}

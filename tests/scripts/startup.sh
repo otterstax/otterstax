@@ -125,6 +125,7 @@ run_test "Schema MySQL Client (s3 external, all formats)" "test_schema_mysql_s3.
 run_test "MySQL Client (file external, all formats)" "test_mysql_file.py"
 run_test "MySQL Client (file external, ndjson)" "test_mysql_file_ndjson.py"
 run_test "MySQL Client (s3 external, all formats)" "test_mysql_s3.py"
+run_test "MySQL Client (s3 streaming, format option + aborted upload)" "test_mysql_s3_stream.py"
 run_test "MySQL Client (JOIN sql-backend ⋈ s3 parquet → s3 csv)" "test_mysql_join_sql_s3_to_s3.py"
 run_test "MySQL Client (JOIN otterbrix-local ⋈ s3 parquet)" "test_mysql_join_otb_local_s3.py"
 run_test "MySQL Client (JOIN sql backend ⋈ otterbrix-local, string key)" "test_mysql_join_otb_local_backend.py"

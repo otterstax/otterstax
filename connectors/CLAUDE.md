@@ -16,7 +16,7 @@ connectors/
 ├── postgresql/    — libpq connector + ConnectorManager
 ├── clickhouse/    — clickhouse-cpp connector + ConnectorManager
 ├── file/          — actor conn::file::FileManager: add_file (file → table) / dump_file (query result → file)
-├── s3/            — actor conn::s3::ConnectorManager: S3 object I/O via Arrow S3FileSystem (list/download/upload/credentials)
+├── s3/            — actor conn::s3::ConnectorManager: S3 object streams via Arrow S3FileSystem (list/open_input/open_output/credentials)
 └── api_connections/
     └── {connection,pg_connection,ch_connection}_config.hpp  — `conn::api_server::*Params` structs
         consumed by the managers' `addConnection` overloads (populated by
@@ -31,17 +31,26 @@ Unlike the SQL backends, these are `actor_zeta::actor_mixin` actors whose handle
   `data_chunk_t` and creates `database.table` via `db::OtterbrixManager::create_table`. The chunk holds
   the whole file and travels as one; `OtterbrixDataManager::insert_rows` hands its rows to the engine as
   chunks of at most `DEFAULT_VECTOR_CAPACITY` rows (`tsl::split_to_capacity`, see `otterbrix/CLAUDE.md`),
-  and `db::S3Manager::download` loads through the same `add_file`. `dump_file(FileMetadata)`
+  and `db::S3Manager::download` loads through the same `add_file`, with `FileAddParams::input` set to
+  the object's stream (then `path` only names the source). `dump_file(FileMetadata)`
   takes a **pre-parsed `OtterbrixStatementPtr`** (not a database/table), runs it through
-  `db::OtterbrixManager::execute`, and writes the result chunk out in the requested format. Format
-  translators live in `otterbrix/translators/{input,output}`.
-- **`conn::s3::ConnectorManager`** — credential store + S3 object I/O (`list`/`download`/`upload`) backed by
-  Arrow's `S3FileSystem`. Credentials are registered per alias at startup from the `s3:` section of the
-  connection config file (via `add_credentials`); there is no remove path. Every handler reports a typed
-  `core::error_t`: `invalid_parameter` (empty alias / keys), `do_not_exists` (unknown alias), `io_error`
-  (any Arrow S3 or local-file failure). A `download` that fails mid-transfer removes the partial local
-  file. Nothing here throws — Arrow reports through `Status`/`Result`. `db::S3Manager` (in
-  `integration/s3`) bridges these two with the engine. Error paths: `tests/system/test_s3_errors.cpp`.
+  `db::OtterbrixManager::execute`, and writes the result chunk out in the requested format — into
+  `FileMetadata::output` when it is set (left open: the sender commits or aborts it), otherwise to a
+  file at `path` that is removed again if the write fails. Format translators live in
+  `otterbrix/translators/{input,output}`.
+- **`conn::s3::ConnectorManager`** — credential store + S3 object streams (`list` / `open_input` /
+  `open_output`) backed by Arrow's `S3FileSystem`, one built per alias on first use and cached (an
+  `add_credentials` update drops it). Nothing is staged on local disk. `open_output` streams are opened
+  with `allow_delayed_open`, so nothing reaches the bucket before the first write; Arrow's S3 stream
+  completes the upload from its destructor, so a caller must `Close()` to commit and `Abort()` on every
+  other path (`db::S3Manager::upload` does, through an RAII guard). The filesystem's buffers come from
+  the manager's resource through `tsl::arrow_pool`, which must therefore be thread-safe (Arrow uploads
+  parts from its IO threads). Credentials are registered per alias at startup from the `s3:` section of
+  the connection config file (via `add_credentials`); there is no remove path. Every handler reports a
+  typed `core::error_t`: `invalid_parameter` (empty alias / keys), `do_not_exists` (unknown alias),
+  `io_error` (any Arrow S3 failure). Nothing here throws — Arrow reports through `Status`/`Result`.
+  `db::S3Manager` (in `integration/s3`) bridges these two with the engine. Error paths:
+  `tests/system/test_s3_errors.cpp`.
   The constructor calls `arrow::fs::EnsureS3Initialized()`; Arrow requires one matching `FinalizeS3()`
   before the process exits (otherwise it warns and may segfault during static teardown), and
   finalization is terminal — every S3 call fails afterwards — so it is not the manager's to do.

@@ -29,6 +29,7 @@
 
 #include <arrow/api.h>
 #include <arrow/io/file.h>
+#include <arrow/io/memory.h>
 #include <parquet/arrow/writer.h>
 
 #include <catch2/catch_all.hpp>
@@ -285,16 +286,15 @@ TEST_CASE("FileManager: parquet dump and re-read") {
     REQUIRE_FALSE(add_res.has_error());
     REQUIRE(add_res.value() == true);
 
-    // Non-temporary dump: written to the exact path requested.
+    // File dump: written to the exact path requested.
     auto dump_res = actor_zeta::send(file_manager->address(),
                                      &conn::file::FileManager::dump_file, session_id().hash(),
                                      conn::file::FileMetadata{select_all(resource, db, tbl), out,
-                                                                  conn::file::FileFormat::Parquet,
-                                                                  /*is_temporary=*/false})
+                                                                  conn::file::FileFormat::Parquet})
                         .second.take_ready();
     REQUIRE_FALSE(dump_res.has_error());
-    const std::string dumped = dump_res.value();
-    REQUIRE(dumped == out);
+    REQUIRE(dump_res.value());
+    const std::string& dumped = out;
     REQUIRE(std::filesystem::exists(dumped));
 
     // Verify dumped file content via the input translator.
@@ -307,22 +307,28 @@ TEST_CASE("FileManager: parquet dump and re-read") {
         REQUIRE(loaded.value().column_count() == 2);
     }
 
-    // Temporary dump: timestamp-prefixed basename in the same directory, so it
-    // never matches the requested path but keeps the original filename.
-    auto tmp_res = actor_zeta::send(file_manager->address(),
-                                    &conn::file::FileManager::dump_file, session_id().hash(),
-                                    conn::file::FileMetadata{select_all(resource, db, tbl), out,
-                                                                 conn::file::FileFormat::Parquet,
-                                                                 /*is_temporary=*/true})
-                       .second.take_ready();
-    REQUIRE_FALSE(tmp_res.has_error());
-    const std::string tmp_dumped = tmp_res.value();
-    REQUIRE(tmp_dumped != out);
-    REQUIRE(std::filesystem::path(tmp_dumped).parent_path() ==
-            std::filesystem::path(out).parent_path());
-    REQUIRE(std::filesystem::path(tmp_dumped).filename().string().find(
-                std::filesystem::path(out).filename().string()) != std::string::npos);
-    REQUIRE(std::filesystem::exists(tmp_dumped));
+    // Stream dump (the S3 upload path): the rows go to the given stream, nothing is
+    // written at `path`, and the stream is left open for the sender to commit.
+    {
+        auto sink = arrow::io::BufferOutputStream::Create().ValueOrDie();
+        const std::string label = "/tmp/test_dump_stream_label.parquet";
+        std::filesystem::remove(label);
+        auto stream_res = actor_zeta::send(file_manager->address(),
+                                           &conn::file::FileManager::dump_file, session_id().hash(),
+                                           conn::file::FileMetadata{select_all(resource, db, tbl), label,
+                                                                    conn::file::FileFormat::Parquet, sink})
+                              .second.take_ready();
+        REQUIRE_FALSE(stream_res.has_error());
+        REQUIRE(stream_res.value());
+        REQUIRE_FALSE(std::filesystem::exists(label));
+        REQUIRE_FALSE(sink->closed());
+
+        auto bytes = sink->Finish().ValueOrDie();
+        auto loaded = tsl::parquet_to_chunk(resource, bytes->data(), static_cast<size_t>(bytes->size()));
+        REQUIRE_FALSE(loaded.has_error());
+        REQUIRE(loaded.value().size() == 5);
+        REQUIRE(loaded.value().column_count() == 2);
+    }
 
     file_manager.reset();
     otterbrix_manager.reset();
@@ -330,7 +336,6 @@ TEST_CASE("FileManager: parquet dump and re-read") {
 
     std::filesystem::remove(parquet);
     std::filesystem::remove(dumped);
-    std::filesystem::remove(tmp_dumped);
     std::filesystem::remove_all(data_dir);
 }
 
@@ -370,12 +375,11 @@ TEST_CASE("FileManager: csv dump and re-read") {
     auto dump_res = actor_zeta::send(file_manager->address(),
                                      &conn::file::FileManager::dump_file, session_id().hash(),
                                      conn::file::FileMetadata{select_all(resource, db, tbl), out,
-                                                                  conn::file::FileFormat::CSV,
-                                                                  /*is_temporary=*/false})
+                                                                  conn::file::FileFormat::CSV})
                         .second.take_ready();
     REQUIRE_FALSE(dump_res.has_error());
-    const std::string dumped = dump_res.value();
-    REQUIRE(dumped == out);
+    REQUIRE(dump_res.value());
+    const std::string& dumped = out;
     REQUIRE(std::filesystem::exists(dumped));
 
     // Verify dumped file content via the input translator.
@@ -433,12 +437,11 @@ TEST_CASE("FileManager: ndjson dump and re-read") {
     auto dump_res = actor_zeta::send(file_manager->address(),
                                      &conn::file::FileManager::dump_file, session_id().hash(),
                                      conn::file::FileMetadata{select_all(resource, db, tbl), out,
-                                                                  conn::file::FileFormat::NDJSON,
-                                                                  /*is_temporary=*/false})
+                                                                  conn::file::FileFormat::NDJSON})
                         .second.take_ready();
     REQUIRE_FALSE(dump_res.has_error());
-    const std::string dumped = dump_res.value();
-    REQUIRE(dumped == out);
+    REQUIRE(dump_res.value());
+    const std::string& dumped = out;
     REQUIRE(std::filesystem::exists(dumped));
 
     // Verify dumped file content via the input translator.

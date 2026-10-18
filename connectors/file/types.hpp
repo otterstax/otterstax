@@ -5,8 +5,15 @@
 
 #include "types/otterbrix.hpp"
 
+// Clash between otterbrix parser macros and Arrow headers
+#undef DAY
+#undef SECOND
+
+#include <arrow/io/type_fwd.h>
+
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <string>
 
 namespace conn::file {
@@ -35,7 +42,11 @@ struct FileMetadata {
     OtterbrixStatementPtr statement;
     std::string path;
     FileFormat  format{FileFormat::Unknown};
-    bool is_temporary{false};
+    // When set, the result is written here instead of to a file at `path` (which
+    // then only names the target in messages), and the stream is left open:
+    // committing or aborting it is the sender's call — an S3 upload must never
+    // publish a partial object.
+    std::shared_ptr<arrow::io::OutputStream> output;
 };
 
 struct FileAddParams {
@@ -45,6 +56,10 @@ struct FileAddParams {
     std::string format;        // "parquet" | "csv" | "ndjson" | "auto"
     std::string csv_delimiter; // single char, default ","
     bool        csv_header{true};
+    // When set, the rows are read from here instead of from a file at `path`,
+    // which then only names the source (format resolution, messages) — an S3
+    // object streamed without a local copy.
+    std::shared_ptr<arrow::io::RandomAccessFile> input;
 };
 
 } // namespace conn::file

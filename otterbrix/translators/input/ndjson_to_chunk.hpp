@@ -4,13 +4,22 @@
 #pragma once
 #include <otterbrix/otterbrix.hpp>
 #include <core/result_wrapper.hpp>
+
+// Clash between otterbrix parser and arrow
+#undef DAY
+#undef SECOND
+
+#include <arrow/io/type_fwd.h>
+
+#include <memory>
 #include <memory_resource>
 #include <string>
 
 namespace tsl {
 
 // Error messages are owned by `res`; a file that cannot be opened is io_error, a
-// body Arrow cannot parse is conversion_failure.
+// body Arrow cannot parse is conversion_failure. Arrow's own buffers are allocated
+// on `res` too (arrow_memory_pool.hpp), so it must be thread-safe.
 core::result_wrapper_t<components::vector::data_chunk_t>
 ndjson_to_chunk(std::pmr::memory_resource* res, const std::string& file_path);
 
@@ -18,5 +27,11 @@ ndjson_to_chunk(std::pmr::memory_resource* res, const std::string& file_path);
 // into one object per line before parsing.
 core::result_wrapper_t<components::vector::data_chunk_t>
 ndjson_to_chunk(std::pmr::memory_resource* res, const uint8_t* data, size_t size);
+
+// Any sequential source — a local file, an S3 object. NDJSON lines only, like the
+// file overload: unwrapping a JSON array needs the whole body (buffer overload).
+// A null input is invalid_parameter.
+core::result_wrapper_t<components::vector::data_chunk_t>
+ndjson_to_chunk(std::pmr::memory_resource* res, std::shared_ptr<arrow::io::InputStream> input);
 
 } // namespace tsl

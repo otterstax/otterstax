@@ -28,12 +28,13 @@ class FileManager final : public actor_zeta::actor::actor_mixin<FileManager> {
         std::pmr::memory_resource* resource() const noexcept { return resource_; }
 
         /// handler coroutines
+        // Loads params.input when it is set (an S3 object), otherwise the file at
+        // params.path, into a new database.table.
         actor_zeta::unique_future<core::result_wrapper_t<bool>> add_file(session_hash_t id, FileAddParams params);
-        // Dumps the table to file_metadata.path. When file_metadata.is_temporary
-        // is set, the basename is prefixed by a timestamp (kept in the same
-        // directory) so existing files are never clobbered. Returns the path
-        // actually written on success.
-        actor_zeta::unique_future<core::result_wrapper_t<std::string>> dump_file(session_hash_t id, FileMetadata file_metadata);
+        // Dumps the statement's result to file_metadata.output when it is set (left
+        // open for the sender to commit or abort), otherwise to a file at
+        // file_metadata.path, committed only on success.
+        actor_zeta::unique_future<core::result_wrapper_t<bool>> dump_file(session_hash_t id, FileMetadata file_metadata);
 
         using dispatch_traits = actor_zeta::dispatch_traits<&FileManager::add_file, &FileManager::dump_file>;
 

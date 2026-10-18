@@ -2,7 +2,8 @@
 // Copyright 2025-2026  OtterStax
 
 #include "chunk_to_csv.hpp"
-#include "chunk_to_arrow.hpp"
+#include "file_sink.hpp"
+#include "otterbrix/translators/arrow_memory_pool.hpp"
 #include "otterbrix/translators/error.hpp"
 
 #include "utility/tracy_profiler.hpp"
@@ -11,52 +12,36 @@
 #undef SECOND
 
 #include <arrow/csv/writer.h>
-#include <arrow/io/file.h>
-#include <arrow/table.h>
+#include <arrow/io/interfaces.h>
+// csv/writer.h only forward-declares the RecordBatchWriter it returns.
+#include <arrow/ipc/writer.h>
 
 #include <memory>
 #include <memory_resource>
-#include <vector>
 
 namespace tsl {
 
 core::result_wrapper_t<bool> chunk_to_csv(std::pmr::memory_resource* res,
                                           const std::pmr::vector<components::vector::data_chunk_t>& chunks,
+                                          const std::shared_ptr<arrow::io::OutputStream>& sink) {
+    OTX_ZONE_N("tsl::chunk_to_csv(stream)");
+    if (!sink) {
+        return make_error(res, core::error_code_t::invalid_parameter, "chunk_to_csv: null sink");
+    }
+    auto options = arrow::csv::WriteOptions::Defaults();
+    options.io_context = arrow::io::IOContext(arrow_pool(res));
+    return write_batches(res, "chunk_to_csv", chunks, [&](const std::shared_ptr<arrow::Schema>& schema) {
+        return arrow::csv::MakeCSVWriter(sink, schema, options);
+    });
+}
+
+core::result_wrapper_t<bool> chunk_to_csv(std::pmr::memory_resource* res,
+                                          const std::pmr::vector<components::vector::data_chunk_t>& chunks,
                                           const std::string& path) {
-    OTX_ZONE_N("tsl::chunk_to_csv");
-    // Arrow's table API takes a std::vector of batches.
-    std::vector<std::shared_ptr<arrow::RecordBatch>> batches;
-    batches.reserve(chunks.size());
-    for (const auto& chunk : chunks) {
-        auto batch = chunk_to_record_batch(res, chunk);
-        if (batch.has_error()) {
-            return batch.convert_error<bool>();
-        }
-        batches.push_back(std::move(batch.value()));
-    }
-
-    auto table_result = arrow::Table::FromRecordBatches(batches);
-    if (!table_result.ok()) {
-        return arrow_error(res, core::error_code_t::conversion_failure,
-                           "chunk_to_csv: FromRecordBatches failed", table_result.status());
-    }
-
-    auto sink_result = arrow::io::FileOutputStream::Open(path);
-    if (!sink_result.ok()) {
-        return arrow_error(res, core::error_code_t::io_error,
-                           "chunk_to_csv: cannot open output", sink_result.status());
-    }
-
-    auto write_opts = arrow::csv::WriteOptions::Defaults();
-    auto status = arrow::csv::WriteCSV(**table_result, write_opts, sink_result->get());
-    if (!status.ok()) {
-        return arrow_error(res, core::error_code_t::io_error, "chunk_to_csv: WriteCSV failed", status);
-    }
-
-    if (auto closed = (*sink_result)->Close(); !closed.ok()) {
-        return arrow_error(res, core::error_code_t::io_error, "chunk_to_csv: Close failed", closed);
-    }
-    return true;
+    OTX_ZONE_N("tsl::chunk_to_csv(file)");
+    return write_local_file(res, "chunk_to_csv", path, [&](const std::shared_ptr<arrow::io::OutputStream>& sink) {
+        return chunk_to_csv(res, chunks, sink);
+    });
 }
 
 } // namespace tsl

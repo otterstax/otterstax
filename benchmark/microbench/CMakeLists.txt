@@ -5,6 +5,7 @@ find_package(benchmark REQUIRED)
 add_executable(otterstax_bench
     bench_translators.cpp
     bench_file_translators.cpp
+    bench_arrow_integration.cpp
     bench_parser.cpp
     bench_query_gen.cpp
     bench_grammar_extension.cpp

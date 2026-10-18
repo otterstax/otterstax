@@ -26,6 +26,7 @@ RustFS credentials through the HTTP API.
 
 import argparse
 import sys
+import time
 
 import mysql.connector
 
@@ -229,14 +230,68 @@ def run_schema_test(source, local=False):
         tester.cleanup()
 
 
+def _expect_error(cur, sql, needle, label):
+    """Run `sql`, require it to fail, and require `needle` in the error text."""
+    try:
+        cur.execute(sql)
+        cur.fetchall()
+    except mysql.connector.Error as exc:
+        if needle not in str(exc):
+            raise AssertionError(f"[{label}] expected an error mentioning '{needle}', got: {exc}") from exc
+        return str(exc)
+    raise AssertionError(f"[{label}] expected an error, the statement succeeded: {sql}")
+
+
+def run_stream_test(source, local=False):
+    """The s3 streaming contracts: an object key without an extension works when
+    WITH (format = ...) names the format, in both directions; and a COPY whose query
+    fails publishes no object — the upload is aborted, so loading that key afterwards
+    fails at opening the object, not at reading an empty or truncated one."""
+    assert source == "s3", "the streaming contracts are s3-only"
+    tester = ExternalTableTester(source, local=local)
+    tester.ensure_credentials()
+    conn = tester.connect()
+    db = "extstream_s3"
+    run_tag = str(int(time.time() * 1000))
+    alias = f"s3_alias = '{S3_ALIAS}'"
+    try:
+        cur = conn.cursor()
+        tester.create_external(cur, db, "regions", "regions.parquet", "parquet")
+
+        # Format from WITH, not from the key: COPY to an extension-less key, load it back.
+        noext = f"s3://{S3_BUCKET}/exported/regions_noext_{run_tag}"
+        cur.execute(f"COPY (SELECT * FROM {db}.regions) TO '{noext}' WITH ({alias}, format = 'csv')")
+        tester.create_external_from(cur, db, "regions_noext", noext, "csv")
+        count = int(_scalar(cur, f"select count(*) from {db}.regions_noext"))
+        if count != DATASETS[0]["rows"]:
+            raise AssertionError(f"[s3/noext] round-trip count {count} != {DATASETS[0]['rows']}")
+        print(f"  ✓ s3: extension-less key with WITH (format = 'csv') round-trips {count} rows")
+
+        # A COPY whose inner query fails after the upload was opened publishes nothing.
+        failed = f"s3://{S3_BUCKET}/exported/failed_copy_{run_tag}.csv"
+        _expect_error(cur,
+                      f"COPY (SELECT * FROM {db}.no_such_table) TO '{failed}' WITH ({alias}, format = 'csv')",
+                      "COPY",
+                      "s3/failed-copy")
+        message = _expect_error(cur,
+                                f"CREATE EXTERNAL TABLE {db}.failed_copy WITH ({alias}, location = '{failed}', "
+                                f"format = 'csv')",
+                                "open_input",
+                                "s3/failed-copy-absent")
+        print(f"  ✓ s3: a failed COPY left no object behind ({message.splitlines()[0][:120]})")
+    finally:
+        conn.close()
+        tester.cleanup()
+
+
 def main(kind, source):
-    """CLI entry point shared by the four thin test files."""
+    """CLI entry point shared by the thin test files."""
     parser = argparse.ArgumentParser(description=f"External-table {kind} test ({source}) over the MySQL wire")
     parser.add_argument("--local", action="store_true", help="Use 0.0.0.0 instead of test-otterstax")
     args = parser.parse_args()
 
     label = f"{kind.upper()} — MySQL wire / {source} external tables"
-    runner = run_schema_test if kind == "schema" else run_data_test
+    runner = {"schema": run_schema_test, "stream": run_stream_test}.get(kind, run_data_test)
     try:
         runner(source, local=args.local)
         print("\n" + "=" * 70)

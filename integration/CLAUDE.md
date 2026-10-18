@@ -214,18 +214,25 @@ verdicts over the mock.
 orchestrates object I/O by bridging the raw S3 connector (`conn::s3::ConnectorManager`) and the
 file-mapping connector (`conn::file::FileManager`):
 
-- `download` — pulls an S3 object, then `FileManager::add_file` ingests it into a `database.table`.
-- `upload` — runs a **pre-parsed `OtterbrixStatementPtr`** and writes its result to S3. It hands the
-  statement to `FileManager::dump_file`, which executes it via `db::OtterbrixManager::execute` and dumps the
-  resulting chunk. This replaced the old whole-table `OtterbrixManager::read_table` handler (removed, along
-  with `IDataManager::read_table`), so `COPY (<select>) TO 's3://…'` can export an arbitrary query — not
-  just a table.
+- `download` — opens the object (`ConnectorManager::open_input`) and hands the stream to
+  `FileManager::add_file`, which ingests it into a `database.table`; nothing is staged on local disk.
+- `upload` — runs a **pre-parsed `OtterbrixStatementPtr`** and writes its result to S3: it opens the
+  object (`open_output`) and hands statement and stream to `FileManager::dump_file`, which executes it via
+  `db::OtterbrixManager::execute` and writes the resulting chunks into the stream. Only then is the stream
+  `Close()`d, which completes the upload; every other exit `Abort()`s it (`upload_guard_t`), so a COPY that
+  fails — the query, a value the writer refuses, the transfer — publishes no object. This replaced the old
+  whole-table `OtterbrixManager::read_table` handler (removed, along with `IDataManager::read_table`), so
+  `COPY (<select>) TO 's3://…'` can export an arbitrary query — not just a table.
 - `ls` — lists objects for an alias.
+
+Both take the statement's `WITH (format = ...)` (empty → the object key's extension decides), so an
+object key without an extension can be loaded and written.
 
 Every handler forwards the callee's `core::error_t` code unchanged (`do_not_exists` for an unknown alias,
 `invalid_parameter`, `io_error`, an engine code from `dump_file`) and only prefixes the message, so the
-Worker reports the real cause. Its own checks (null statement, unrecognised object-key extension) are
-`invalid_parameter`. Covered by `tests/system/test_s3_errors.cpp`.
+Worker reports the real cause. Its own checks (null statement, no format option and an unrecognised
+object-key extension) are `invalid_parameter`; a failed `Close()` is `io_error`. Covered by
+`tests/system/test_s3_errors.cpp` and, against RustFS, `tests/test_mysql_s3_stream.py`.
 
 Its handlers (and `FileManager`'s) `co_await` the cross-actor sends rather than `.take_ready()`, so they
 stay correct if those callees ever move off the synchronous busy-wait path. End-to-end coverage lives in

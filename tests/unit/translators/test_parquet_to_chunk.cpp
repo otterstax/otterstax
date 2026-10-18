@@ -250,12 +250,15 @@ TEST_CASE("arrow_schema_to_struct: a decimal whose scale the engine cannot const
     REQUIRE(std::string_view{mapped.error().what.c_str()}.find("wide") != std::string_view::npos);
 }
 
-TEST_CASE("parquet_to_chunk: a date column is conversion_failure, not a string column read off a date array") {
+TEST_CASE("parquet_to_chunk: a date column is read by otterbrix's importer as the engine's DATE") {
+    // 19000 days after 1970-01-01 is 2022-01-08; the engine counts from 2000-01-01, so the
+    // importer moves the value by the 10957 days between the epochs.
     const std::string path = "/tmp/otterstax_test_parquet_date.parquet";
     std::filesystem::remove(path);
 
     arrow::Date32Builder b;
     REQUIRE(b.Append(19000).ok());
+    REQUIRE(b.AppendNull().ok());
     std::shared_ptr<arrow::Array> arr;
     REQUIRE(b.Finish(&arr).ok());
     auto schema = arrow::schema({arrow::field("day", arrow::date32())});
@@ -265,10 +268,43 @@ TEST_CASE("parquet_to_chunk: a date column is conversion_failure, not a string c
     REQUIRE(sink->Close().ok());
 
     auto loaded = tsl::parquet_to_chunk(std::pmr::new_delete_resource(), path);
+    INFO("error: " << (loaded.has_error() ? loaded.error().what.c_str() : ""));
+    REQUIRE_FALSE(loaded.has_error());
+    REQUIRE(loaded.value().size() == 2);
+    const auto types = loaded.value().types();
+    REQUIRE(types[0].type() == components::types::logical_type::DATE);
+    REQUIRE(types[0].alias() == "day");
+    REQUIRE(loaded.value().value(0, 0).value<core::date::date_t>().value.count() == 19000 - 10957);
+    REQUIRE(loaded.value().value(0, 1).is_null());
+
+    std::filesystem::remove(path);
+}
+
+namespace {
+    // A column neither otterbrix's importer nor the shim has a reading for: half-precision float.
+    void write_half_float_parquet(const std::string& path) {
+        arrow::HalfFloatBuilder b;
+        REQUIRE(b.Append(static_cast<uint16_t>(0x3c00)).ok()); // 1.0
+        std::shared_ptr<arrow::Array> arr;
+        REQUIRE(b.Finish(&arr).ok());
+        auto schema = arrow::schema({arrow::field("half", arrow::float16())});
+        auto table = arrow::Table::Make(schema, {arr});
+        auto sink = arrow::io::FileOutputStream::Open(path).ValueOrDie();
+        REQUIRE(parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), sink, 1024).ok());
+        REQUIRE(sink->Close().ok());
+    }
+} // namespace
+
+TEST_CASE("parquet_to_chunk: a column with no reading is conversion_failure naming the column") {
+    const std::string path = "/tmp/otterstax_test_parquet_half.parquet";
+    std::filesystem::remove(path);
+    write_half_float_parquet(path);
+
+    auto loaded = tsl::parquet_to_chunk(std::pmr::new_delete_resource(), path);
 
     REQUIRE(loaded.has_error());
     REQUIRE(loaded.error().type == core::error_code_t::conversion_failure);
-    REQUIRE(std::string_view{loaded.error().what.c_str()}.find("day") != std::string_view::npos);
+    REQUIRE(std::string_view{loaded.error().what.c_str()}.find("half") != std::string_view::npos);
 
     std::filesystem::remove(path);
 }
@@ -310,8 +346,21 @@ TEST_CASE("parquet_to_struct: a decimal with a scale is discovered as the engine
 }
 
 TEST_CASE("parquet_to_struct: a column with no reading is refused at discovery") {
-    // A date column, which the loader refuses (the case below): discovery must refuse it too,
-    // rather than create a table whose load then fails on the first row.
+    // The column the loader refuses (the case above): discovery must refuse it too, rather than
+    // create a table whose load then fails on the first row.
+    const std::string path = "/tmp/otterstax_test_parquet_struct_half.parquet";
+    std::filesystem::remove(path);
+    write_half_float_parquet(path);
+
+    auto type = tsl::parquet_to_struct(std::pmr::new_delete_resource(), path);
+
+    REQUIRE(type.has_error());
+    REQUIRE(type.error().type == core::error_code_t::conversion_failure);
+
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("parquet_to_struct: a date column is discovered as the DATE the load produces") {
     const std::string path = "/tmp/otterstax_test_parquet_struct_date.parquet";
     std::filesystem::remove(path);
 
@@ -326,9 +375,11 @@ TEST_CASE("parquet_to_struct: a column with no reading is refused at discovery")
     REQUIRE(sink->Close().ok());
 
     auto type = tsl::parquet_to_struct(std::pmr::new_delete_resource(), path);
-
-    REQUIRE(type.has_error());
-    REQUIRE(type.error().type == core::error_code_t::conversion_failure);
+    INFO("error: " << (type.has_error() ? type.error().what.c_str() : ""));
+    REQUIRE_FALSE(type.has_error());
+    REQUIRE(type.value().child_types().size() == 1);
+    REQUIRE(type.value().child_types()[0].type() == components::types::logical_type::DATE);
+    REQUIRE(type.value().child_types()[0].alias() == "day");
 
     std::filesystem::remove(path);
 }

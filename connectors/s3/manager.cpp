@@ -2,6 +2,7 @@
 // Copyright 2025-2026  OtterStax
 
 #include "manager.hpp"
+#include "otterbrix/translators/arrow_memory_pool.hpp"
 #include "otterbrix/translators/error.hpp"
 #include "utility/logger.hpp"
 #include "utility/tracy_profiler.hpp"
@@ -10,15 +11,11 @@
 #undef DAY
 #undef SECOND
 
-#include <arrow/buffer.h>
-#include <arrow/filesystem/localfs.h>
 #include <arrow/filesystem/s3fs.h>
 #include <arrow/io/interfaces.h>
 #include <arrow/result.h>
 #include <arrow/status.h>
 
-#include <ctime>
-#include <filesystem>
 #include <thread>
 
 namespace conn::s3 {
@@ -27,8 +24,10 @@ namespace {
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
+// Every buffer the filesystem's streams allocate (ranged-read buffers, multipart
+// parts) comes from `res`, through the same pool the translators use.
 arrow::Result<std::shared_ptr<arrow::fs::S3FileSystem>>
-make_s3fs(const connect_params& creds) {
+make_s3fs(std::pmr::memory_resource* res, const connect_params& creds) {
     OTX_ZONE_N("s3::make_s3fs");
     auto opts = arrow::fs::S3Options::FromAccessKey(std::string{std::string_view{creds.access_key}},
                                                     std::string{std::string_view{creds.secret_key}},
@@ -42,48 +41,16 @@ make_s3fs(const connect_params& creds) {
         // Disable virtual addressing for custom endpoints (e.g. LocalStack)
         opts.scheme = "http";
     }
+    // An output stream creates its multipart upload on the first write, so one
+    // aborted before any data reaches the bucket costs no request.
+    opts.allow_delayed_open = true;
 
-    return arrow::fs::S3FileSystem::Make(opts);
+    return arrow::fs::S3FileSystem::Make(opts, arrow::io::IOContext(tsl::arrow_pool(res)));
 }
 
-// Stream all bytes from src_fs:src_path → dst_fs:dst_path.
-// Used by both download (S3→local) and upload (local→S3). The source is opened
-// first, so a missing source never creates an empty destination.
-arrow::Status cp_impl(arrow::fs::FileSystem& src_fs,
-                      const std::string&     src_path,
-                      arrow::fs::FileSystem& dst_fs,
-                      const std::string&     dst_path) {
-    OTX_ZONE_N("s3::cp_impl");
-    constexpr int64_t kChunk = 1 << 20; // 1 MiB
-
-    ARROW_ASSIGN_OR_RAISE(auto input, src_fs.OpenInputStream(src_path));
-    ARROW_ASSIGN_OR_RAISE(auto output, dst_fs.OpenOutputStream(dst_path));
-
-    while (true) {
-        ARROW_ASSIGN_OR_RAISE(auto buf, input->Read(kChunk));
-        if (buf->size() == 0) break;
-        ARROW_RETURN_NOT_OK(output->Write(buf->data(), buf->size()));
-    }
-
-    ARROW_RETURN_NOT_OK(output->Close());
-    return arrow::Status::OK();
-}
-
-// Build a unique local filename for a downloaded object by prefixing the
-// object's basename with a timestamp, e.g.
-//   "bucket/data/costs.parquet" → "2026-05-23_10-34-35_costs.parquet"
-std::string timestamped_filename(const std::string& s3_path) {
-    std::time_t now = std::time(nullptr);
-    std::tm     tm{};
-    localtime_r(&now, &tm);
-    char ts[20];
-    std::strftime(ts, sizeof(ts), "%Y-%m-%d_%H-%M-%S", &tm);
-    return std::string{ts} + "_" + std::filesystem::path(s3_path).filename().string();
-}
-
-core::error_t unknown_alias(std::pmr::memory_resource* res, std::string_view op, const std::string& alias) {
+core::error_t unknown_alias(std::pmr::memory_resource* res, std::string_view op, std::string_view alias) {
     return tsl::make_error(res, core::error_code_t::do_not_exists,
-                           std::string{op} + ": unknown alias '" + alias + "'");
+                           std::string{op} + ": unknown alias '" + std::string{alias} + "'");
 }
 
 // The credential store outlives the message that delivered a credential set,
@@ -104,23 +71,35 @@ connect_params stored_on(std::pmr::memory_resource* res, const connect_params& p
 
 // ── ConnectorManager ────────────────────────────────────────────────────────────────
 
-ConnectorManager::ConnectorManager(std::pmr::memory_resource* res, std::string_view s3_download_path)
+ConnectorManager::ConnectorManager(std::pmr::memory_resource* res)
     : resource_(res)
     , log_(get_logger(logger_tag::S3_MANAGER))
     , credentials_store_(res)
-    , s3_download_path_(s3_download_path, res) {
+    , filesystems_(res) {
     assert(log_.is_valid());
     assert(res != nullptr);
-    assert(!s3_download_path_.empty() && "s3 download path must not be empty");
     auto status = arrow::fs::EnsureS3Initialized();
     if (!status.ok())
         log_->warn("EnsureS3Initialized: {}", status.ToString());
-    // A directory that cannot be created is reported by the first download,
-    // whose OpenOutputStream fails with the real cause.
-    std::error_code ec;
-    std::filesystem::create_directories(std::string_view{s3_download_path_}, ec);
-    if (ec)
-        log_->error("cannot create s3 download directory '{}': {}", s3_download_path_, ec.message());
+}
+
+core::result_wrapper_t<std::shared_ptr<arrow::fs::S3FileSystem>>
+ConnectorManager::filesystem_for(std::string_view op, std::string_view alias) {
+    OTX_ZONE_N("s3::ConnectorManager::filesystem_for");
+    auto creds = credentials_store_.find(alias);
+    if (creds == credentials_store_.end()) {
+        log_->error("{}: unknown alias '{}'", op, alias);
+        return unknown_alias(resource(), op, alias);
+    }
+    if (auto cached = filesystems_.find(alias); cached != filesystems_.end()) {
+        return cached->second;
+    }
+    auto made = make_s3fs(resource(), creds->second);
+    if (!made.ok()) {
+        return tsl::arrow_error(resource(), core::error_code_t::io_error, op, made.status());
+    }
+    std::pmr::string key{alias, resource()};
+    return filesystems_.emplace(std::move(key), std::move(*made)).first->second;
 }
 
 std::pair<bool, actor_zeta::detail::enqueue_result>
@@ -146,10 +125,10 @@ actor_zeta::behavior_t ConnectorManager::behavior(actor_zeta::mailbox::message* 
         co_await actor_zeta::dispatch(this, &ConnectorManager::add_credentials, msg);
     else if (cmd == actor_zeta::msg_id<ConnectorManager, &ConnectorManager::list>)
         co_await actor_zeta::dispatch(this, &ConnectorManager::list, msg);
-    else if (cmd == actor_zeta::msg_id<ConnectorManager, &ConnectorManager::download>)
-        co_await actor_zeta::dispatch(this, &ConnectorManager::download, msg);
-    else if (cmd == actor_zeta::msg_id<ConnectorManager, &ConnectorManager::upload>)
-        co_await actor_zeta::dispatch(this, &ConnectorManager::upload, msg);
+    else if (cmd == actor_zeta::msg_id<ConnectorManager, &ConnectorManager::open_input>)
+        co_await actor_zeta::dispatch(this, &ConnectorManager::open_input, msg);
+    else if (cmd == actor_zeta::msg_id<ConnectorManager, &ConnectorManager::open_output>)
+        co_await actor_zeta::dispatch(this, &ConnectorManager::open_output, msg);
 }
 
 // ── handlers ─────────────────────────────────────────────────────────────────
@@ -176,6 +155,10 @@ ConnectorManager::add_credentials(session_hash_t /*id*/, connect_params params) 
     const bool updated = it != credentials_store_.end();
     if (updated) {
         it->second = stored_on(resource(), params);
+        // The cached client was built from the old set.
+        if (auto cached = filesystems_.find(std::string_view{params.alias}); cached != filesystems_.end()) {
+            filesystems_.erase(cached);
+        }
     } else {
         std::pmr::string key{std::string_view{params.alias}, resource()};
         it = credentials_store_.emplace(std::move(key), stored_on(resource(), params)).first;
@@ -188,17 +171,11 @@ actor_zeta::unique_future<core::result_wrapper_t<std::pmr::vector<std::pmr::stri
 ConnectorManager::list(session_hash_t id, std::string alias, std::string s3_path) {
     OTX_ZONE_N("s3::ConnectorManager::list");
     log_->trace("ConnectorManager::list with params:\n Session ID: {}\n Alias: {}\n S3 Path: {}", id, alias, s3_path);
-    auto it = credentials_store_.find(std::string_view{alias});
-    if (it == credentials_store_.end()) {
-        log_->error("list: unknown alias '{}'", alias);
-        co_return unknown_alias(resource(), "list", alias);
+    auto fs_result = filesystem_for("list", alias);
+    if (fs_result.has_error()) {
+        co_return fs_result.convert_error<std::pmr::vector<std::pmr::string>>();
     }
-
-    auto fs_result = make_s3fs(it->second);
-    if (!fs_result.ok()) {
-        co_return tsl::arrow_error(resource(), core::error_code_t::io_error, "list", fs_result.status());
-    }
-    auto& fs = *fs_result;
+    const auto& fs = fs_result.value();
 
     arrow::fs::FileSelector sel;
     sel.base_dir       = s3_path;
@@ -220,62 +197,36 @@ ConnectorManager::list(session_hash_t id, std::string alias, std::string s3_path
     co_return std::move(paths);
 }
 
-actor_zeta::unique_future<core::result_wrapper_t<std::pmr::string>>
-ConnectorManager::download(session_hash_t id, std::string alias, std::string s3_path) {
-    OTX_ZONE_N("s3::ConnectorManager::download");
-    log_->trace("ConnectorManager::download with params:\n Session ID: {}\n Alias: {}\n S3 Path: {}", id, alias, s3_path);
-    auto it = credentials_store_.find(std::string_view{alias});
-    if (it == credentials_store_.end()) {
-        log_->error("download: unknown alias '{}'", alias);
-        co_return unknown_alias(resource(), "download", alias);
+actor_zeta::unique_future<core::result_wrapper_t<std::shared_ptr<arrow::io::RandomAccessFile>>>
+ConnectorManager::open_input(session_hash_t id, std::string alias, std::string s3_path) {
+    OTX_ZONE_N("s3::ConnectorManager::open_input");
+    log_->trace("ConnectorManager::open_input with params:\n Session ID: {}\n Alias: {}\n S3 Path: {}", id, alias, s3_path);
+    auto fs = filesystem_for("open_input", alias);
+    if (fs.has_error()) {
+        co_return fs.convert_error<std::shared_ptr<arrow::io::RandomAccessFile>>();
     }
-
-    auto fs_result = make_s3fs(it->second);
-    if (!fs_result.ok()) {
-        co_return tsl::arrow_error(resource(), core::error_code_t::io_error, "download", fs_result.status());
+    auto opened = fs.value()->OpenInputFile(s3_path);
+    if (!opened.ok()) {
+        co_return tsl::arrow_error(resource(), core::error_code_t::io_error, "open_input", opened.status());
     }
-
-    arrow::fs::LocalFileSystem local_fs;
-    const std::string local_path =
-        (std::filesystem::path(std::string_view{s3_download_path_}) / timestamped_filename(s3_path)).string();
-
-    auto status = cp_impl(**fs_result, s3_path, local_fs, local_path);
-    if (!status.ok()) {
-        // A transfer that failed mid-way has already created the destination;
-        // a truncated object must never be handed to the loader.
-        std::error_code ec;
-        std::filesystem::remove(local_path, ec);
-        co_return tsl::arrow_error(resource(), core::error_code_t::io_error, "download", status);
-    }
-
-    log_->debug("download: s3://{} → {}", s3_path, local_path);
-    co_return std::pmr::string{std::string_view{local_path}, resource()};
+    log_->debug("open_input: s3://{}", s3_path);
+    co_return std::move(*opened);
 }
 
-actor_zeta::unique_future<core::result_wrapper_t<bool>>
-ConnectorManager::upload(session_hash_t id, std::string alias, std::string s3_path, std::string local_path) {
-    OTX_ZONE_N("s3::ConnectorManager::upload");
-    log_->trace("ConnectorManager::upload with params:\n Session ID: {}\n Alias: {}\n S3 Path: {}\n Local Path: {}", id, alias, s3_path, local_path);
-    auto it = credentials_store_.find(std::string_view{alias});
-    if (it == credentials_store_.end()) {
-        log_->error("upload: unknown alias '{}'", alias);
-        co_return unknown_alias(resource(), "upload", alias);
+actor_zeta::unique_future<core::result_wrapper_t<std::shared_ptr<arrow::io::OutputStream>>>
+ConnectorManager::open_output(session_hash_t id, std::string alias, std::string s3_path) {
+    OTX_ZONE_N("s3::ConnectorManager::open_output");
+    log_->trace("ConnectorManager::open_output with params:\n Session ID: {}\n Alias: {}\n S3 Path: {}", id, alias, s3_path);
+    auto fs = filesystem_for("open_output", alias);
+    if (fs.has_error()) {
+        co_return fs.convert_error<std::shared_ptr<arrow::io::OutputStream>>();
     }
-
-    auto fs_result = make_s3fs(it->second);
-    if (!fs_result.ok()) {
-        co_return tsl::arrow_error(resource(), core::error_code_t::io_error, "upload", fs_result.status());
+    auto opened = fs.value()->OpenOutputStream(s3_path);
+    if (!opened.ok()) {
+        co_return tsl::arrow_error(resource(), core::error_code_t::io_error, "open_output", opened.status());
     }
-
-    arrow::fs::LocalFileSystem local_fs;
-
-    auto status = cp_impl(local_fs, local_path, **fs_result, s3_path);
-    if (!status.ok()) {
-        co_return tsl::arrow_error(resource(), core::error_code_t::io_error, "upload", status);
-    }
-
-    log_->debug("upload: {} → s3://{}", local_path, s3_path);
-    co_return true;
+    log_->debug("open_output: s3://{}", s3_path);
+    co_return std::move(*opened);
 }
 
 } // namespace conn::s3

@@ -1043,7 +1043,8 @@ Worker::load_external_table(session_hash_t id, const otterstax::external::extern
                                              ext.s3_alias(),
                                              ext.object_path(),
                                              ext.database(),
-                                             ext.table());
+                                             ext.table(),
+                                             ext.format());
         auto r = co_await std::move(fut);
         if (r.has_error()) {
             co_return forward_error(resource(), r.error(), "CREATE EXTERNAL TABLE failed: ");
@@ -1105,7 +1106,8 @@ Worker::copy_to(session_hash_t id, const otterstax::external::external_node_t& e
                                              id,
                                              ext.s3_alias(),
                                              ext.object_path(),
-                                             std::move(statement));
+                                             std::move(statement),
+                                             ext.format());
         auto r = co_await std::move(fut);
         if (r.has_error()) {
             co_return forward_error(resource(), r.error(), "COPY ... TO failed: ");

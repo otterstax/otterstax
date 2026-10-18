@@ -6,29 +6,41 @@
 #include "connectors/file/manager.hpp"
 #include "connectors/file/types.hpp"
 #include "connectors/s3/manager.hpp"
+#include "otterbrix/translators/error.hpp"
 #include "utility/logger.hpp"
 #include "utility/tracy_profiler.hpp"
 
-#include <filesystem>
+// Clash between otterbrix parser macros and Arrow headers
+#undef DAY
+#undef SECOND
+
+#include <arrow/io/interfaces.h>
+
+#include <memory>
 #include <thread>
 
 namespace db {
 
 namespace {
 
-namespace fs = std::filesystem;
+// Aborts an upload on every exit that did not Close() it: Arrow's S3 stream completes the
+// upload from its destructor, so a failed COPY would publish a truncated object. Arrow marks
+// the stream closed on every Close() outcome; only a successful one completes the upload.
+struct upload_guard_t {
+    std::shared_ptr<arrow::io::OutputStream> stream;
 
-void remove_quietly(const std::string& path) {
-    std::error_code ec;
-    fs::remove(path, ec);
-}
-
-// This actor's own verdicts; the message is owned by the actor's resource.
-core::error_t make_error(std::pmr::memory_resource* res, core::error_code_t code, std::string_view what) {
-    std::pmr::string message{res};
-    message.append(what.data(), what.size());
-    return core::error_t(code, std::move(message));
-}
+    explicit upload_guard_t(std::shared_ptr<arrow::io::OutputStream> opened)
+        : stream(std::move(opened)) {}
+    upload_guard_t(const upload_guard_t&) = delete;
+    upload_guard_t& operator=(const upload_guard_t&) = delete;
+    ~upload_guard_t() {
+        if (stream && !stream->closed()) {
+            // Nobody is left to report a failed abort to; the object is not
+            // published either way.
+            (void)stream->Abort();
+        }
+    }
+};
 
 // Re-homes a callee's verdict onto this actor's resource, keeping its code and
 // prefixing the message with the failing step.
@@ -44,22 +56,13 @@ core::error_t forward_error(std::pmr::memory_resource* res, std::string_view pre
 
 S3Manager::S3Manager(std::pmr::memory_resource* res,
                      actor_zeta::address_t s3_connector,
-                     actor_zeta::address_t file_manager,
-                     std::string_view s3_upload_path)
+                     actor_zeta::address_t file_manager)
     : resource_(res)
     , s3_connector_(std::move(s3_connector))
     , file_manager_(std::move(file_manager))
-    , s3_upload_path_(s3_upload_path, res)
     , log_(get_logger(logger_tag::S3_CONNECTION_MANAGER)) {
     assert(log_.is_valid());
     assert(res != nullptr);
-    assert(!s3_upload_path_.empty() && "s3 upload path must not be empty");
-    // A directory that cannot be created is reported by the first upload,
-    // whose dump fails with the real cause.
-    std::error_code ec;
-    fs::create_directories(std::string_view{s3_upload_path_}, ec);
-    if (ec)
-        log_->error("cannot create s3 upload directory '{}': {}", s3_upload_path_, ec.message());
 }
 
 std::pair<bool, actor_zeta::detail::enqueue_result>
@@ -91,37 +94,38 @@ actor_zeta::behavior_t S3Manager::behavior(actor_zeta::mailbox::message* msg) {
 
 actor_zeta::unique_future<core::result_wrapper_t<std::pair<bool, std::pmr::string>>>
 S3Manager::download(session_hash_t id, std::string alias, std::string s3_path,
-                    std::string database, std::string table) {
+                    std::string database, std::string table, std::string format) {
     OTX_ZONE_N("S3Manager::download");
-    log_->trace("S3Manager::download with params:\n Session ID: {}\n Alias: {}\n S3 Path: {}\n Database: {}\n Table: {}", id, alias, s3_path, database, table);
-    auto dl = co_await actor_zeta::send(s3_connector_,
-                                        &conn::s3::ConnectorManager::download,
-                                        id, alias, s3_path)
-                  .second;
-    if (dl.has_error()) {
-        log_->error("download: s3 download failed: {}", dl.error().what);
-        co_return forward_error(resource(), "S3Manager::download: ", dl.error());
+    log_->trace("S3Manager::download with params:\n Session ID: {}\n Alias: {}\n S3 Path: {}\n Database: {}\n Table: {}\n Format: {}", id, alias, s3_path, database, table, format);
+    auto opened = co_await actor_zeta::send(s3_connector_,
+                                            &conn::s3::ConnectorManager::open_input,
+                                            id, alias, s3_path)
+                      .second;
+    if (opened.has_error()) {
+        log_->error("download: opening s3://{} failed: {}", s3_path, opened.error().what);
+        co_return forward_error(resource(), "S3Manager::download: ", opened.error());
     }
-    const std::string local_path{dl.value().data(), dl.value().size()};
 
+    // The object streams straight into the loader; the key names it for format
+    // resolution and messages.
     conn::file::FileAddParams params;
     params.database = database;
     params.table    = table;
-    params.path     = local_path;
-    params.format   = "auto";
+    params.path     = s3_path;
+    params.format   = format; // empty: the key's extension decides
+    params.input    = std::move(opened.value());
 
     auto add = co_await actor_zeta::send(file_manager_,
                                          &conn::file::FileManager::add_file,
                                          id, std::move(params))
                    .second;
-    remove_quietly(local_path);
     if (add.has_error()) {
         log_->error("download: mapping into otterbrix failed: {}", add.error().what);
         co_return forward_error(resource(), "S3Manager::download: ", add.error());
     }
     if (!add.value()) {
         log_->error("download: mapping into otterbrix failed: add_file returned false");
-        co_return make_error(resource(), core::error_code_t::io_error,
+        co_return tsl::make_error(resource(), core::error_code_t::io_error,
                                   "S3Manager::download: add_file returned false");
     }
 
@@ -131,28 +135,37 @@ S3Manager::download(session_hash_t id, std::string alias, std::string s3_path,
 
 actor_zeta::unique_future<core::result_wrapper_t<std::pair<bool, std::pmr::string>>>
 S3Manager::upload(session_hash_t id, std::string alias, std::string s3_path,
-                  OtterbrixStatementPtr statement) {
+                  OtterbrixStatementPtr statement, std::string format) {
     OTX_ZONE_N("S3Manager::upload");
-    log_->trace("S3Manager::upload with params:\n Session ID: {}\n Alias: {}\n S3 Path: {}\n Statement: {}", id, alias, s3_path, statement ? "set" : "null");
+    log_->trace("S3Manager::upload with params:\n Session ID: {}\n Alias: {}\n S3 Path: {}\n Statement: {}\n Format: {}", id, alias, s3_path, statement ? "set" : "null", format);
     if (!statement) {
         log_->error("upload: statement is null");
-        co_return make_error(resource(), core::error_code_t::invalid_parameter,
+        co_return tsl::make_error(resource(), core::error_code_t::invalid_parameter,
                                   "S3Manager::upload: statement must not be null");
     }
-    // The object key alone names the format: COPY ... TO 's3://...' carries no
-    // local path to fall back on.
-    const conn::file::FileFormat fmt = conn::file::resolve_format(std::string{}, s3_path);
+    // WITH (format = ...) wins; otherwise the object key's extension names it.
+    const conn::file::FileFormat fmt = conn::file::resolve_format(format, s3_path);
     if (fmt == conn::file::FileFormat::Unknown) {
         log_->error("upload: cannot determine format from '{}'", s3_path);
-        co_return make_error(resource(), core::error_code_t::invalid_parameter,
+        co_return tsl::make_error(resource(), core::error_code_t::invalid_parameter,
                                   "S3Manager::upload: cannot determine format from '" + s3_path + "'");
     }
 
+    auto opened = co_await actor_zeta::send(s3_connector_,
+                                            &conn::s3::ConnectorManager::open_output,
+                                            id, alias, s3_path)
+                      .second;
+    if (opened.has_error()) {
+        log_->error("upload: opening s3://{} failed: {}", s3_path, opened.error().what);
+        co_return forward_error(resource(), "S3Manager::upload: ", opened.error());
+    }
+    upload_guard_t guard{std::move(opened.value())};
+
     conn::file::FileMetadata meta;
-    meta.statement    = std::move(statement);
-    meta.path         = (fs::path(std::string_view{s3_upload_path_}) / fs::path(s3_path).filename()).string();
-    meta.format       = fmt;
-    meta.is_temporary = true; // staging file in the upload dir; timestamp-prefix it
+    meta.statement = std::move(statement);
+    meta.path      = s3_path;
+    meta.format    = fmt;
+    meta.output    = guard.stream;
 
     auto dump = co_await actor_zeta::send(file_manager_,
                                           &conn::file::FileManager::dump_file,
@@ -163,21 +176,11 @@ S3Manager::upload(session_hash_t id, std::string alias, std::string s3_path,
         co_return forward_error(resource(), "S3Manager::upload: ", dump.error());
     }
 
-    const std::string dumped = dump.value();
-    log_->trace("S3Manager::upload with params:\n Session ID: {}\n Alias: {}\n S3 Path: {}\n Dumped Path: {}", id, alias, s3_path, dumped);
-    auto up = co_await actor_zeta::send(s3_connector_,
-                                        &conn::s3::ConnectorManager::upload,
-                                        id, alias, s3_path, dumped)
-                  .second;
-    remove_quietly(dumped);
-    if (up.has_error()) {
-        log_->error("upload: s3 upload failed: {}", up.error().what);
-        co_return forward_error(resource(), "S3Manager::upload: ", up.error());
-    }
-    if (!up.value()) {
-        log_->error("upload: s3 upload failed: s3 upload returned false");
-        co_return make_error(resource(), core::error_code_t::io_error,
-                                  "S3Manager::upload: s3 upload returned false");
+    // Close completes the multipart upload: only now does the object appear.
+    if (auto closed = guard.stream->Close(); !closed.ok()) {
+        log_->error("upload: completing s3://{} failed: {}", s3_path, closed.ToString());
+        co_return tsl::arrow_error(resource(), core::error_code_t::io_error,
+                                   "S3Manager::upload: completing the upload failed", closed);
     }
 
     log_->debug("upload: query result -> s3://{}", s3_path);

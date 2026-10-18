@@ -3,6 +3,7 @@
 
 #include "parquet_to_chunk.hpp"
 #include "arrow_to_chunk.hpp"
+#include "otterbrix/translators/arrow_memory_pool.hpp"
 #include "otterbrix/translators/error.hpp"
 
 #include "utility/tracy_profiler.hpp"
@@ -25,7 +26,7 @@ namespace {
 
     core::result_wrapper_t<file_reader_ptr> open_parquet(std::pmr::memory_resource* res,
                                                          const std::shared_ptr<arrow::io::RandomAccessFile>& input) {
-        auto reader_result = parquet::arrow::OpenFile(input, arrow::default_memory_pool());
+        auto reader_result = parquet::arrow::OpenFile(input, arrow_pool(res));
         if (!reader_result.ok()) {
             return arrow_error(res, core::error_code_t::conversion_failure,
                                "parquet reader: cannot open parquet reader", reader_result.status());
@@ -35,7 +36,7 @@ namespace {
 
     core::result_wrapper_t<file_reader_ptr> open_parquet_file(std::pmr::memory_resource* res,
                                                               const std::string& file_path) {
-        auto file_result = arrow::io::ReadableFile::Open(file_path);
+        auto file_result = arrow::io::ReadableFile::Open(file_path, arrow_pool(res));
         if (!file_result.ok()) {
             return arrow_error(res, core::error_code_t::io_error,
                                "parquet reader: cannot open file", file_result.status());
@@ -51,7 +52,7 @@ namespace {
             return arrow_error(res, core::error_code_t::conversion_failure,
                                "parquet_to_chunk: cannot read parquet table", status);
         }
-        auto batch = table->CombineChunksToBatch();
+        auto batch = table->CombineChunksToBatch(arrow_pool(res));
         if (!batch.ok()) {
             return arrow_error(res, core::error_code_t::conversion_failure,
                                "parquet_to_chunk: table to batch failed", batch.status());
@@ -80,6 +81,19 @@ parquet_to_chunk(std::pmr::memory_resource* res, const uint8_t* data, size_t siz
     auto reader_io = std::make_shared<arrow::io::BufferReader>(buffer);
 
     auto reader = open_parquet(res, reader_io);
+    if (reader.has_error()) {
+        return reader.convert_error<data_chunk_t>();
+    }
+    return read_table(res, *reader.value());
+}
+
+core::result_wrapper_t<data_chunk_t> parquet_to_chunk(std::pmr::memory_resource* res,
+                                                      std::shared_ptr<arrow::io::RandomAccessFile> input) {
+    OTX_ZONE_N("tsl::parquet_to_chunk(stream)");
+    if (!input) {
+        return make_error(res, core::error_code_t::invalid_parameter, "parquet_to_chunk: null input");
+    }
+    auto reader = open_parquet(res, input);
     if (reader.has_error()) {
         return reader.convert_error<data_chunk_t>();
     }

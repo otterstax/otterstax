@@ -35,10 +35,17 @@ to_arrow_schema(std::pmr::memory_resource* res, const std::pmr::vector<component
 core::result_wrapper_t<std::shared_ptr<arrow::Schema>>
 to_arrow_schema(std::pmr::memory_resource* res, const components::types::complex_logical_type& struct_t);
 
-// Flat scalar columns only (see writable_columns.hpp); every column must be named.
-// Error messages are owned by `res`; the shared_ptr in the result is Arrow's contract.
+// Flat named scalar columns only (writable_columns.hpp); the schema is to_arrow_schema's.
+// Numerics and temporal types go through otterbrix's exporter (its malloc'd buffers, not `res`);
+// STRING (utf8, as frontends advertise), DECIMAL, HUGEINT and NA are built here on `res`.
 core::result_wrapper_t<std::shared_ptr<arrow::RecordBatch>>
 chunk_to_record_batch(std::pmr::memory_resource* res, const components::vector::data_chunk_t& chunk);
+
+// The file writers' batch (COPY ... TO csv / parquet): chunk_to_record_batch with STRING
+// written by otterbrix's exporter too, as large_utf8 — no schema is advertised ahead of a
+// file, and both formats store a string the same way under either layout.
+core::result_wrapper_t<std::shared_ptr<arrow::RecordBatch>>
+chunk_to_file_batch(std::pmr::memory_resource* res, const components::vector::data_chunk_t& chunk);
 
 // The Decimal128 one DECIMAL or HUGEINT cell travels as: the unscaled integer the engine
 // stored, read at the width that column keeps it in and widened to the 128 bits Arrow's only

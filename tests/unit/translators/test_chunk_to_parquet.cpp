@@ -19,6 +19,8 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <memory_resource>
 #include <string>
 #include <string_view>
@@ -365,4 +367,90 @@ TEST_CASE("chunk_to_parquet: an output path that cannot be opened is io_error") 
     auto written = tsl::chunk_to_parquet(res, chunks, "/nonexistent_dir_otterstax/out.parquet");
     REQUIRE(written.has_error());
     REQUIRE(written.error().type == core::error_code_t::io_error);
+}
+
+TEST_CASE("chunk_to_parquet: DATE and TIMESTAMP are written as Arrow's temporal types and read back unchanged") {
+    // otterbrix's exporter writes them, moving the engine's 2000-01-01 epoch to Arrow's 1970 one;
+    // otterbrix's importer moves them back. 2022-01-08 is 19000 days after 1970-01-01.
+    using components::types::complex_logical_type;
+    using components::types::logical_type;
+    using components::types::logical_value_t;
+    constexpr int64_t unix_days = 19000;
+    constexpr int64_t engine_days = unix_days - 10957;
+    constexpr int64_t half_past_ten = 37'800'000'000LL; // 10:30:00 in microseconds
+    constexpr int64_t engine_micros = engine_days * 86'400'000'000LL + half_past_ten;
+
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
+    auto* res = &arena;
+    const std::string path = "/tmp/otterstax_test_chunk_to_parquet_temporal.parquet";
+    std::filesystem::remove(path);
+
+    std::pmr::vector<complex_logical_type> types{res};
+    types.emplace_back(logical_type::DATE, "day");
+    types.emplace_back(logical_type::TIMESTAMP, "at");
+    data_chunk_t chunk(res, types, 2);
+    chunk.set_cardinality(2);
+    chunk.set_value(0, 0, logical_value_t{res, core::date::date_t{core::date::days{engine_days}}});
+    chunk.set_value(1, 0, logical_value_t{res, core::date::timestamp_t{core::date::microseconds{engine_micros}}});
+    chunk.set_value(0, 1, logical_value_t{res, nullptr});
+    chunk.set_value(1, 1, logical_value_t{res, nullptr});
+    std::pmr::vector<data_chunk_t> chunks(res);
+    chunks.push_back(std::move(chunk));
+
+    auto written = tsl::chunk_to_parquet(res, chunks, path);
+    INFO("write error: " << (written.has_error() ? written.error().what.c_str() : ""));
+    REQUIRE_FALSE(written.has_error());
+
+    auto table = read_parquet_table(path);
+    REQUIRE(table->schema()->field(0)->type()->Equals(*arrow::date32()));
+    REQUIRE(table->schema()->field(1)->type()->id() == arrow::Type::TIMESTAMP);
+    const auto& days = static_cast<const arrow::Date32Array&>(*table->column(0)->chunk(0));
+    CHECK(days.Value(0) == unix_days);
+    CHECK(days.IsNull(1));
+    const auto& at = static_cast<const arrow::TimestampArray&>(*table->column(1)->chunk(0));
+    CHECK(at.Value(0) == unix_days * 86'400'000'000LL + half_past_ten);
+    CHECK(at.IsNull(1));
+
+    auto reloaded = tsl::parquet_to_chunk(res, path);
+    INFO("read error: " << (reloaded.has_error() ? reloaded.error().what.c_str() : ""));
+    REQUIRE_FALSE(reloaded.has_error());
+    const auto reloaded_types = reloaded.value().types();
+    CHECK(reloaded_types[0].type() == logical_type::DATE);
+    CHECK(reloaded_types[1].type() == logical_type::TIMESTAMP);
+    CHECK(reloaded.value().value(0, 0).value<core::date::date_t>().value.count() == engine_days);
+    CHECK(reloaded.value().value(1, 0).value<core::date::timestamp_t>().value.count() == engine_micros);
+    CHECK(reloaded.value().value(0, 1).is_null());
+
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("chunk_to_parquet: a failed write leaves an existing file at the path untouched") {
+    // The write goes to a temporary sibling and replaces the path only when it succeeded.
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
+    auto* res = &arena;
+    const std::string path = "/tmp/otterstax_test_chunk_to_parquet_keep.parquet";
+    {
+        std::ofstream existing(path, std::ios::trunc);
+        existing << "previous export";
+    }
+
+    components::types::int128_t past_precision = 1;
+    for (int i = 0; i < 38; ++i) {
+        past_precision *= 10; // 10^38: decimal128(38, 0) cannot declare it
+    }
+    std::pmr::vector<components::types::complex_logical_type> types{res};
+    types.emplace_back(components::types::logical_type::HUGEINT, "wide");
+    data_chunk_t chunk(res, types, 1);
+    chunk.set_cardinality(1);
+    chunk.set_value(0, 0, components::types::logical_value_t{res, past_precision});
+    std::pmr::vector<data_chunk_t> chunks(res);
+    chunks.push_back(std::move(chunk));
+
+    auto written = tsl::chunk_to_parquet(res, chunks, path);
+    REQUIRE(written.has_error());
+
+    std::ifstream kept(path);
+    const std::string content{std::istreambuf_iterator<char>(kept), std::istreambuf_iterator<char>()};
+    CHECK(content == "previous export");
+    std::filesystem::remove(path);
 }

@@ -550,3 +550,173 @@ TEST_CASE("chunk_to_record_batch: the error message lives on the caller's resour
     REQUIRE(batch.has_error());
     REQUIRE(batch.error().what.get_allocator().resource() == &arena);
 }
+
+// The numeric and bool columns go through otterbrix's exporter in one pass and are merged back
+// between the columns this file builds itself; every value, every NULL and the column order
+// must come out as the builders would have written them.
+TEST_CASE("chunk_to_record_batch: natively exported columns keep their values NULLs and order") {
+    auto* res = std::pmr::new_delete_resource();
+    auto types = named_types(res,
+                             {{"flag", logical_type::BOOLEAN},
+                              {"i8", logical_type::TINYINT},
+                              {"label", logical_type::STRING_LITERAL},
+                              {"i16", logical_type::SMALLINT},
+                              {"i32", logical_type::INTEGER},
+                              {"i64", logical_type::BIGINT},
+                              {"u8", logical_type::UTINYINT},
+                              {"u16", logical_type::USMALLINT},
+                              {"u32", logical_type::UINTEGER},
+                              {"u64", logical_type::UBIGINT},
+                              {"f32", logical_type::FLOAT},
+                              {"f64", logical_type::DOUBLE}});
+    constexpr uint64_t rows = 1024;
+    data_chunk_t chunk(res, types, rows);
+    chunk.set_cardinality(rows);
+    for (uint64_t r = 0; r < rows; ++r) {
+        if (r % 5 == 0) {
+            for (uint64_t c = 0; c < types.size(); ++c) {
+                chunk.set_value(c, r, logical_value_t{res, nullptr});
+            }
+            continue;
+        }
+        chunk.set_value(0, r, logical_value_t{res, r % 2 == 0});
+        chunk.set_value(1, r, logical_value_t{res, static_cast<int8_t>(r % 100)});
+        chunk.set_value(2, r, logical_value_t{res, std::string{"l"} + std::to_string(r)});
+        chunk.set_value(3, r, logical_value_t{res, static_cast<int16_t>(r)});
+        chunk.set_value(4, r, logical_value_t{res, static_cast<int32_t>(r) * -3});
+        chunk.set_value(5, r, logical_value_t{res, static_cast<int64_t>(r) << 33});
+        chunk.set_value(6, r, logical_value_t{res, static_cast<uint8_t>(r % 200)});
+        chunk.set_value(7, r, logical_value_t{res, static_cast<uint16_t>(r * 7)});
+        chunk.set_value(8, r, logical_value_t{res, static_cast<uint32_t>(r) * 100000u});
+        chunk.set_value(9, r, logical_value_t{res, static_cast<uint64_t>(r) << 40});
+        chunk.set_value(10, r, logical_value_t{res, static_cast<float>(r) / 4.0f});
+        chunk.set_value(11, r, logical_value_t{res, static_cast<double>(r) / 8.0});
+    }
+
+    auto batch = chunk_to_record_batch(res, chunk);
+    REQUIRE_FALSE(batch.has_error());
+    const auto& rb = *batch.value();
+    REQUIRE(rb.num_rows() == static_cast<int64_t>(rows));
+    REQUIRE(rb.num_columns() == static_cast<int>(types.size()));
+    REQUIRE(rb.ValidateFull().ok());
+
+    const std::vector<std::shared_ptr<arrow::DataType>> expected{arrow::boolean(), arrow::int8(),   arrow::utf8(),
+                                                                 arrow::int16(),   arrow::int32(),  arrow::int64(),
+                                                                 arrow::uint8(),   arrow::uint16(), arrow::uint32(),
+                                                                 arrow::uint64(),  arrow::float32(), arrow::float64()};
+    for (int c = 0; c < rb.num_columns(); ++c) {
+        INFO("column " << c);
+        CHECK(rb.column(c)->type()->Equals(*expected[static_cast<size_t>(c)]));
+        CHECK(rb.schema()->field(c)->type()->Equals(*expected[static_cast<size_t>(c)]));
+        CHECK(rb.column(c)->null_count() == static_cast<int64_t>((rows + 4) / 5));
+    }
+
+    for (int64_t r = 0; r < static_cast<int64_t>(rows); ++r) {
+        INFO("row " << r);
+        if (r % 5 == 0) {
+            for (int c = 0; c < rb.num_columns(); ++c) {
+                CHECK(rb.column(c)->IsNull(r));
+            }
+            continue;
+        }
+        const auto u = static_cast<uint64_t>(r);
+        CHECK(static_cast<const arrow::BooleanArray&>(*rb.column(0)).Value(r) == (r % 2 == 0));
+        CHECK(static_cast<const arrow::Int8Array&>(*rb.column(1)).Value(r) == static_cast<int8_t>(r % 100));
+        CHECK(static_cast<const arrow::StringArray&>(*rb.column(2)).GetString(r) == "l" + std::to_string(r));
+        CHECK(static_cast<const arrow::Int16Array&>(*rb.column(3)).Value(r) == static_cast<int16_t>(r));
+        CHECK(static_cast<const arrow::Int32Array&>(*rb.column(4)).Value(r) == static_cast<int32_t>(r) * -3);
+        CHECK(static_cast<const arrow::Int64Array&>(*rb.column(5)).Value(r) == static_cast<int64_t>(r) << 33);
+        CHECK(static_cast<const arrow::UInt8Array&>(*rb.column(6)).Value(r) == static_cast<uint8_t>(r % 200));
+        CHECK(static_cast<const arrow::UInt16Array&>(*rb.column(7)).Value(r) == static_cast<uint16_t>(u * 7));
+        CHECK(static_cast<const arrow::UInt32Array&>(*rb.column(8)).Value(r) == static_cast<uint32_t>(u) * 100000u);
+        CHECK(static_cast<const arrow::UInt64Array&>(*rb.column(9)).Value(r) == u << 40);
+        CHECK(static_cast<const arrow::FloatArray&>(*rb.column(10)).Value(r) == static_cast<float>(r) / 4.0f);
+        CHECK(static_cast<const arrow::DoubleArray&>(*rb.column(11)).Value(r) == static_cast<double>(r) / 8.0);
+    }
+}
+
+TEST_CASE("chunk_to_record_batch: an empty chunk of natively exported columns is an empty batch") {
+    auto* res = std::pmr::new_delete_resource();
+    auto types = named_types(res, {{"id", logical_type::BIGINT}, {"flag", logical_type::BOOLEAN}});
+    data_chunk_t chunk(res, types, 0);
+
+    auto batch = chunk_to_record_batch(res, chunk);
+    REQUIRE_FALSE(batch.has_error());
+    REQUIRE(batch.value()->num_rows() == 0);
+    REQUIRE(batch.value()->num_columns() == 2);
+    REQUIRE(batch.value()->column(0)->type()->Equals(*arrow::int64()));
+}
+
+TEST_CASE("to_arrow_schema(vec): temporal columns map to the Arrow types otterbrix's exporter writes") {
+    auto* res = std::pmr::new_delete_resource();
+    auto types = named_types(res,
+                             {{"day", logical_type::DATE},
+                              {"clock", logical_type::TIME},
+                              {"at", logical_type::TIMESTAMP},
+                              {"at_utc", logical_type::TIMESTAMP_TZ}});
+    auto schema = to_arrow_schema(res, types);
+    REQUIRE_FALSE(schema.has_error());
+    CHECK(schema.value()->field(0)->type()->Equals(*arrow::date32()));
+    CHECK(schema.value()->field(1)->type()->Equals(*arrow::time64(arrow::TimeUnit::MICRO)));
+    CHECK(schema.value()->field(2)->type()->Equals(*arrow::timestamp(arrow::TimeUnit::MICRO)));
+    CHECK(schema.value()->field(3)->type()->Equals(*arrow::timestamp(arrow::TimeUnit::MICRO, "UTC")));
+}
+
+TEST_CASE("chunk_to_record_batch: a DATE is written on Arrow's epoch and a STRING stays utf8") {
+    // The engine counts days from 2000-01-01, Arrow's date32 from 1970-01-01: otterbrix's
+    // exporter moves the value. 2022-01-08 is 8043 engine days and 19000 Arrow days.
+    auto* res = std::pmr::new_delete_resource();
+    auto types = named_types(res, {{"day", logical_type::DATE}, {"name", logical_type::STRING_LITERAL}});
+    data_chunk_t chunk(res, types, 2);
+    chunk.set_cardinality(2);
+    chunk.set_value(0, 0, logical_value_t{res, core::date::date_t{core::date::days{19000 - 10957}}});
+    chunk.set_value(1, 0, logical_value_t{res, std::string{"first"}});
+    chunk.set_value(0, 1, logical_value_t{res, nullptr});
+    chunk.set_value(1, 1, logical_value_t{res, nullptr});
+
+    auto batch = chunk_to_record_batch(res, chunk);
+    INFO("error: " << (batch.has_error() ? batch.error().what.c_str() : ""));
+    REQUIRE_FALSE(batch.has_error());
+    const auto& rb = *batch.value();
+    REQUIRE(rb.ValidateFull().ok());
+    REQUIRE(rb.column(0)->type()->Equals(*arrow::date32()));
+    CHECK(static_cast<const arrow::Date32Array&>(*rb.column(0)).Value(0) == 19000);
+    CHECK(rb.column(0)->IsNull(1));
+    REQUIRE(rb.column(1)->type()->Equals(*arrow::utf8()));
+    CHECK(static_cast<const arrow::StringArray&>(*rb.column(1)).GetString(0) == "first");
+    CHECK(rb.column(1)->IsNull(1));
+}
+
+TEST_CASE("chunk_to_file_batch: strings are written by otterbrix's exporter as large_utf8") {
+    auto* res = std::pmr::new_delete_resource();
+    auto types = named_types(res, {{"id", logical_type::BIGINT}, {"name", logical_type::STRING_LITERAL}});
+    constexpr uint64_t rows = 1500;
+    data_chunk_t chunk(res, types, rows);
+    chunk.set_cardinality(rows);
+    for (uint64_t r = 0; r < rows; ++r) {
+        chunk.set_value(0, r, logical_value_t{res, static_cast<int64_t>(r)});
+        if (r % 3 == 0) {
+            chunk.set_value(1, r, logical_value_t{res, nullptr});
+        } else {
+            chunk.set_value(1, r, logical_value_t{res, std::string{"name_"} + std::to_string(r)});
+        }
+    }
+
+    auto batch = chunk_to_file_batch(res, chunk);
+    INFO("error: " << (batch.has_error() ? batch.error().what.c_str() : ""));
+    REQUIRE_FALSE(batch.has_error());
+    const auto& rb = *batch.value();
+    REQUIRE(rb.ValidateFull().ok());
+    REQUIRE(rb.schema()->field(1)->type()->Equals(*arrow::large_utf8()));
+    REQUIRE(rb.column(1)->type()->Equals(*arrow::large_utf8()));
+    const auto& names = static_cast<const arrow::LargeStringArray&>(*rb.column(1));
+    for (uint64_t r = 0; r < rows; r += 7) {
+        const auto i = static_cast<int64_t>(r);
+        CHECK(static_cast<const arrow::Int64Array&>(*rb.column(0)).Value(i) == i);
+        if (r % 3 == 0) {
+            CHECK(names.IsNull(i));
+        } else {
+            CHECK(names.GetString(i) == "name_" + std::to_string(r));
+        }
+    }
+}

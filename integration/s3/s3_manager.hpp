@@ -18,33 +18,38 @@
 #include <utility>
 
 namespace db {
+    // Streams objects between S3 and the engine, nothing staged on local disk: a load feeds
+    // the connector's input stream to FileManager::add_file, an export has FileManager::dump_file
+    // write into the connector's output stream, committed only once the whole result is written.
     class S3Manager final : public actor_zeta::actor::actor_mixin<S3Manager> {
     public:
         using is_cooperative_actor_type = void;
         template<typename T>
         using unique_future = actor_zeta::unique_future<T>;
 
-        // s3_upload_path is the staging directory for dumped query results; it
-        // must not be empty — there is no runtime fallback.
         S3Manager(std::pmr::memory_resource* res,
                   actor_zeta::address_t s3_connector,
-                  actor_zeta::address_t file_manager,
-                  std::string_view s3_upload_path = "/tmp/otterstax_s3_upload/");
+                  actor_zeta::address_t file_manager);
 
         std::pmr::memory_resource* resource() const noexcept { return resource_; }
 
         // Every handler keeps the callee's error code (s3 connector / file
         // manager) and only prefixes the message, so the Worker can report the
         // real cause (do_not_exists, invalid_parameter, io_error, ...).
+
+        // Loads s3_path ("bucket/key") into a new database.table. `format` is the
+        // statement's WITH (format = ...) — empty picks it from the key's extension.
         actor_zeta::unique_future<core::result_wrapper_t<std::pair<bool, std::pmr::string>>>
         download(session_hash_t id, std::string alias, std::string s3_path,
-                 std::string database, std::string table);
+                 std::string database, std::string table, std::string format);
 
         // Executes `statement` and uploads its result to s3_path. The query is
         // parsed upstream (e.g. the inner SELECT of COPY (...) TO 's3://...').
+        // `format` as for download. The object appears only when the whole result
+        // was written; any failure aborts the upload.
         actor_zeta::unique_future<core::result_wrapper_t<std::pair<bool, std::pmr::string>>>
         upload(session_hash_t id, std::string alias, std::string s3_path,
-               OtterbrixStatementPtr statement);
+               OtterbrixStatementPtr statement, std::string format);
 
         actor_zeta::unique_future<core::result_wrapper_t<std::pair<bool, std::pmr::string>>>
         ls(session_hash_t id, std::string alias, std::string s3_path);
@@ -61,7 +66,6 @@ namespace db {
         std::pmr::memory_resource* resource_;
         actor_zeta::address_t      s3_connector_;
         actor_zeta::address_t      file_manager_;
-        std::pmr::string           s3_upload_path_;
         log_t                      log_;
         OTX_LOCKABLE_N(std::mutex, mutex_, "S3Manager::mutex");
         actor_zeta::behavior_t     current_behavior_;

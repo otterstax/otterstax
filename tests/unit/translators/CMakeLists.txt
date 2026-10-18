@@ -15,6 +15,9 @@ set(${PROJECT_NAME}_SOURCES
     test_chunk_to_ndjson.cpp
     test_chunk_to_parquet.cpp
     test_chunk_windows.cpp
+    test_arrow_memory_pool.cpp
+    test_arrow_to_chunk.cpp
+    test_file_sink.cpp
 )
 
 add_executable(${PROJECT_NAME} ${${PROJECT_NAME}_SOURCES})

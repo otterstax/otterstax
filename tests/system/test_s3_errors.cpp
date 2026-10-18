@@ -1,23 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2025-2026  OtterStax
-//
-// Error paths of the two S3 actors that need no object store: a rejected
-// credential set, an alias nobody registered, an object path Arrow refuses
-// before any request goes out, and a local file that is not there. Every
-// verdict must come back as a typed core::error_t — the connector names the
-// cause (invalid_parameter / do_not_exists / io_error) and db::S3Manager
-// forwards that code unchanged rather than flattening it to other_error.
+
+// Error paths of the S3 actors that need no object store, each a typed core::error_t that
+// S3Manager forwards unchanged; and the abort contract: opening an output stream sends nothing,
+// so an upload aborted before any data costs no request and publishes nothing.
 
 #include "connectors/s3/manager.hpp"
 #include "integration/s3/s3_manager.hpp"
 #include "utility/session.hpp"
+
+// Clash between otterbrix parser macros and Arrow headers
+#undef DAY
+#undef SECOND
+
+#include <arrow/io/interfaces.h>
 
 #include <actor-zeta.hpp>
 #include <core/result_wrapper.hpp>
 
 #include <catch2/catch_all.hpp>
 
-#include <filesystem>
 #include <memory_resource>
 #include <string>
 #include <utility>
@@ -52,31 +54,11 @@ namespace {
         return params;
     }
 
-    std::size_t entries_in(const std::string& dir) {
-        std::size_t count = 0;
-        std::error_code ec;
-        for (auto it = std::filesystem::directory_iterator(dir, ec); !ec && it != std::filesystem::directory_iterator();
-             it.increment(ec)) {
-            ++count;
-        }
-        return count;
-    }
-
-    struct download_dir {
-        std::string path;
-        explicit download_dir(const char* name)
-            : path((std::filesystem::temp_directory_path() / name).string()) {
-            std::filesystem::remove_all(path);
-        }
-        ~download_dir() { std::filesystem::remove_all(path); }
-    };
-
 } // namespace
 
 TEST_CASE("s3 connector: add_credentials rejects an empty alias or empty keys as invalid_parameter") {
-    download_dir dir{"otterstax_s3_errors_add"};
     auto* resource = std::pmr::new_delete_resource();
-    auto s3 = actor_zeta::spawn<conn::s3::ConnectorManager>(resource, dir.path);
+    auto s3 = actor_zeta::spawn<conn::s3::ConnectorManager>(resource);
     const auto id = session_id().hash();
 
     SECTION("empty alias") {
@@ -115,11 +97,10 @@ TEST_CASE("s3 connector: add_credentials rejects an empty alias or empty keys as
         REQUIRE(rejected.has_error());
 
         auto r = settled(actor_zeta::send(s3->address(),
-                                          &conn::s3::ConnectorManager::upload,
+                                          &conn::s3::ConnectorManager::open_output,
                                           id,
                                           std::string{"rustfs"},
-                                          std::string{"bucket/key.csv"},
-                                          std::string{"/nonexistent/file.csv"}));
+                                          std::string{"bucket/key.csv"}));
         REQUIRE(r.has_error());
         CHECK(r.error().type == core::error_code_t::do_not_exists);
     }
@@ -131,19 +112,36 @@ TEST_CASE("s3 connector: add_credentials rejects an empty alias or empty keys as
                                               valid_params(resource, "rustfs")));
         REQUIRE_FALSE(first.has_error());
         CHECK(first.value());
+        // Builds and caches the alias's filesystem.
+        auto before = settled(actor_zeta::send(s3->address(),
+                                               &conn::s3::ConnectorManager::open_input,
+                                               id,
+                                               std::string{"rustfs"},
+                                               std::string{"bucket-without-key"}));
+        REQUIRE(before.has_error());
+        CHECK(before.error().type == core::error_code_t::io_error);
+
         auto again = settled(actor_zeta::send(s3->address(),
                                               &conn::s3::ConnectorManager::add_credentials,
                                               id,
                                               valid_params(resource, "rustfs")));
         REQUIRE_FALSE(again.has_error());
         CHECK(again.value());
+        // The re-registration dropped the cached filesystem; the next call builds a
+        // fresh one from the new set and answers the same verdict.
+        auto after = settled(actor_zeta::send(s3->address(),
+                                              &conn::s3::ConnectorManager::open_input,
+                                              id,
+                                              std::string{"rustfs"},
+                                              std::string{"bucket-without-key"}));
+        REQUIRE(after.has_error());
+        CHECK(after.error().type == core::error_code_t::io_error);
     }
 }
 
-TEST_CASE("s3 connector: list / download / upload on an unknown alias fail with do_not_exists and touch nothing") {
-    download_dir dir{"otterstax_s3_errors_unknown"};
+TEST_CASE("s3 connector: list / open_input / open_output on an unknown alias fail with do_not_exists") {
     auto* resource = std::pmr::new_delete_resource();
-    auto s3 = actor_zeta::spawn<conn::s3::ConnectorManager>(resource, dir.path);
+    auto s3 = actor_zeta::spawn<conn::s3::ConnectorManager>(resource);
     const auto id = session_id().hash();
 
     auto listed = settled(actor_zeta::send(s3->address(),
@@ -155,31 +153,29 @@ TEST_CASE("s3 connector: list / download / upload on an unknown alias fail with 
     CHECK(listed.error().type == core::error_code_t::do_not_exists);
     CHECK_THAT(std::string{listed.error().what.c_str()}, ContainsSubstring("nobody"));
 
-    auto downloaded = settled(actor_zeta::send(s3->address(),
-                                               &conn::s3::ConnectorManager::download,
-                                               id,
-                                               std::string{"nobody"},
-                                               std::string{"bucket/key.parquet"}));
-    REQUIRE(downloaded.has_error());
-    CHECK(downloaded.error().type == core::error_code_t::do_not_exists);
-    CHECK_THAT(std::string{downloaded.error().what.c_str()}, ContainsSubstring("nobody"));
+    auto input = settled(actor_zeta::send(s3->address(),
+                                          &conn::s3::ConnectorManager::open_input,
+                                          id,
+                                          std::string{"nobody"},
+                                          std::string{"bucket/key.parquet"}));
+    REQUIRE(input.has_error());
+    CHECK(input.error().type == core::error_code_t::do_not_exists);
+    CHECK_THAT(std::string{input.error().what.c_str()}, ContainsSubstring("nobody"));
+    CHECK_THAT(std::string{input.error().what.c_str()}, ContainsSubstring("open_input"));
 
-    auto uploaded = settled(actor_zeta::send(s3->address(),
-                                             &conn::s3::ConnectorManager::upload,
-                                             id,
-                                             std::string{"nobody"},
-                                             std::string{"bucket/key.csv"},
-                                             std::string{"/nonexistent/file.csv"}));
-    REQUIRE(uploaded.has_error());
-    CHECK(uploaded.error().type == core::error_code_t::do_not_exists);
-
-    CHECK(entries_in(dir.path) == 0);
+    auto output = settled(actor_zeta::send(s3->address(),
+                                           &conn::s3::ConnectorManager::open_output,
+                                           id,
+                                           std::string{"nobody"},
+                                           std::string{"bucket/key.csv"}));
+    REQUIRE(output.has_error());
+    CHECK(output.error().type == core::error_code_t::do_not_exists);
+    CHECK_THAT(std::string{output.error().what.c_str()}, ContainsSubstring("open_output"));
 }
 
-TEST_CASE("s3 connector: a transfer Arrow refuses is io_error and leaves no file in the download directory") {
-    download_dir dir{"otterstax_s3_errors_io"};
+TEST_CASE("s3 connector: a path Arrow refuses is io_error before any request") {
     auto* resource = std::pmr::new_delete_resource();
-    auto s3 = actor_zeta::spawn<conn::s3::ConnectorManager>(resource, dir.path);
+    auto s3 = actor_zeta::spawn<conn::s3::ConnectorManager>(resource);
     const auto id = session_id().hash();
 
     auto stored = settled(actor_zeta::send(s3->address(),
@@ -188,42 +184,61 @@ TEST_CASE("s3 connector: a transfer Arrow refuses is io_error and leaves no file
                                            valid_params(resource, "rustfs")));
     REQUIRE_FALSE(stored.has_error());
 
-    SECTION("download of a bucket-only path (not an object) is rejected before any request") {
+    SECTION("open_input of a bucket-only path (not an object)") {
         auto r = settled(actor_zeta::send(s3->address(),
-                                          &conn::s3::ConnectorManager::download,
+                                          &conn::s3::ConnectorManager::open_input,
                                           id,
                                           std::string{"rustfs"},
                                           std::string{"bucket-without-key"}));
         REQUIRE(r.has_error());
         CHECK(r.error().type == core::error_code_t::io_error);
-        CHECK_THAT(std::string{r.error().what.c_str()}, ContainsSubstring("download"));
-        CHECK(entries_in(dir.path) == 0);
+        CHECK_THAT(std::string{r.error().what.c_str()}, ContainsSubstring("open_input"));
     }
 
-    SECTION("upload of a missing local file is rejected before any request") {
-        const std::string missing = (std::filesystem::path(dir.path) / "does_not_exist.csv").string();
+    SECTION("open_output of a bucket-only path (not an object)") {
         auto r = settled(actor_zeta::send(s3->address(),
-                                          &conn::s3::ConnectorManager::upload,
+                                          &conn::s3::ConnectorManager::open_output,
                                           id,
                                           std::string{"rustfs"},
-                                          std::string{"bucket/key.csv"},
-                                          missing));
+                                          std::string{"bucket-without-key"}));
         REQUIRE(r.has_error());
         CHECK(r.error().type == core::error_code_t::io_error);
-        CHECK_THAT(std::string{r.error().what.c_str()}, ContainsSubstring("upload"));
+        CHECK_THAT(std::string{r.error().what.c_str()}, ContainsSubstring("open_output"));
     }
 }
 
-TEST_CASE("S3Manager: forwards the connector's error code instead of flattening it to other_error") {
-    download_dir dir{"otterstax_s3_errors_mgr"};
+TEST_CASE("s3 connector: an output stream aborted before any write sends nothing") {
+    // The endpoint refuses every connection, so open + abort both succeeding proves neither went
+    // to the network: the multipart upload is created on the first write only.
     auto* resource = std::pmr::new_delete_resource();
-    auto s3 = actor_zeta::spawn<conn::s3::ConnectorManager>(resource, dir.path);
+    auto s3 = actor_zeta::spawn<conn::s3::ConnectorManager>(resource);
+    const auto id = session_id().hash();
+
+    auto stored = settled(actor_zeta::send(s3->address(),
+                                           &conn::s3::ConnectorManager::add_credentials,
+                                           id,
+                                           valid_params(resource, "minio")));
+    REQUIRE_FALSE(stored.has_error());
+
+    auto opened = settled(actor_zeta::send(s3->address(),
+                                           &conn::s3::ConnectorManager::open_output,
+                                           id,
+                                           std::string{"minio"},
+                                           std::string{"bucket/out.csv"}));
+    REQUIRE_FALSE(opened.has_error());
+    REQUIRE(opened.value() != nullptr);
+    auto aborted = opened.value()->Abort();
+    INFO("Abort: " << aborted.ToString());
+    CHECK(aborted.ok());
+    CHECK(opened.value()->closed());
+}
+
+TEST_CASE("S3Manager: forwards the connector's error code instead of flattening it to other_error") {
+    auto* resource = std::pmr::new_delete_resource();
+    auto s3 = actor_zeta::spawn<conn::s3::ConnectorManager>(resource);
     // No file manager is reachable: every case below fails before the
     // integration actor would forward to it.
-    auto mgr = actor_zeta::spawn<db::S3Manager>(resource,
-                                                s3->address(),
-                                                actor_zeta::address_t::empty_address(),
-                                                dir.path);
+    auto mgr = actor_zeta::spawn<db::S3Manager>(resource, s3->address(), actor_zeta::address_t::empty_address());
     const auto id = session_id().hash();
 
     SECTION("download on an unknown alias is do_not_exists and names the alias") {
@@ -233,12 +248,12 @@ TEST_CASE("S3Manager: forwards the connector's error code instead of flattening 
                                           std::string{"nobody"},
                                           std::string{"bucket/key.parquet"},
                                           std::string{"db"},
-                                          std::string{"tbl"}));
+                                          std::string{"tbl"},
+                                          std::string{}));
         REQUIRE(r.has_error());
         CHECK(r.error().type == core::error_code_t::do_not_exists);
         CHECK_THAT(std::string{r.error().what.c_str()}, ContainsSubstring("nobody"));
         CHECK_THAT(std::string{r.error().what.c_str()}, ContainsSubstring("S3Manager::download"));
-        CHECK(entries_in(dir.path) == 0);
     }
 
     SECTION("ls on an unknown alias is do_not_exists") {
@@ -257,7 +272,8 @@ TEST_CASE("S3Manager: forwards the connector's error code instead of flattening 
                                           id,
                                           std::string{"nobody"},
                                           std::string{"bucket/out.csv"},
-                                          OtterbrixStatementPtr{}));
+                                          OtterbrixStatementPtr{},
+                                          std::string{}));
         REQUIRE(r.has_error());
         CHECK(r.error().type == core::error_code_t::invalid_parameter);
     }

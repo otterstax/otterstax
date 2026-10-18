@@ -3,15 +3,31 @@
 
 #include "chunk_to_arrow.hpp"
 #include "decimal_carrier.hpp"
+#include "otterbrix/translators/arrow_memory_pool.hpp"
 #include "otterbrix/translators/error.hpp"
 #include "writable_columns.hpp"
 
 #include "utility/tracy_profiler.hpp"
+
+// Clash between otterbrix parser macros and Arrow headers
+#undef DAY
+#undef SECOND
+
+// otterbrix's Arrow C data interface exporter. Its C structs and Arrow's own
+// (arrow/c/abi.h, through bridge.h) share the ARROW_C_DATA_INTERFACE guard and
+// layout, so whichever header comes first defines them for both.
+#include <components/vector/arrow/arrow_converter.hpp>
+
 #include <arrow/builder.h>
+#include <arrow/c/bridge.h>
 
+#include <exception>
 #include <string>
+#include <vector>
 
-using namespace components::vector;
+// Not `using namespace components::vector`: it holds a namespace `arrow` (the
+// exporter's), which would make every `arrow::` below ambiguous.
+using components::vector::data_chunk_t;
 using namespace components::types;
 using namespace components;
 
@@ -40,6 +56,21 @@ namespace {
         if (t.type() == types::logical_type::DECIMAL) {
             const auto spec = spec_of(t);
             return std::shared_ptr<arrow::DataType>{arrow::decimal128(spec.precision, spec.scale)};
+        }
+        // Temporal types by logical type too, as otterbrix's exporter writes them (tdD / ttu /
+        // tsu: / tsu:UTC). Their physical INT32 / INT64 count from the engine's 2000-01-01 epoch, so
+        // only the exporter writes their values (exported_natively), moving them to Arrow's 1970.
+        switch (t.type()) {
+            case types::logical_type::DATE:
+                return std::shared_ptr<arrow::DataType>{arrow::date32()};
+            case types::logical_type::TIME:
+                return std::shared_ptr<arrow::DataType>{arrow::time64(arrow::TimeUnit::MICRO)};
+            case types::logical_type::TIMESTAMP:
+                return std::shared_ptr<arrow::DataType>{arrow::timestamp(arrow::TimeUnit::MICRO)};
+            case types::logical_type::TIMESTAMP_TZ:
+                return std::shared_ptr<arrow::DataType>{arrow::timestamp(arrow::TimeUnit::MICRO, "UTC")};
+            default:
+                break;
         }
         switch (t.to_physical_type()) {
             case types::physical_type::BOOL:
@@ -109,11 +140,90 @@ namespace {
                                    "), which has no Arrow mapping");
     }
 
+    // Columns otterbrix's exporter writes (one typed pass, its own malloc'd buffers): BOOLEAN, the
+    // integers, FLOAT, DOUBLE, temporal types, and STRING as large_utf8 when `large_strings`.
+    // The builders keep utf8 STRING (FlightSQL advertises utf8), DECIMAL (sentinel / precision
+    // refusals), HUGEINT and UUID (the exporter throws on them) and NA (no appender).
+    bool exported_natively(const types::complex_logical_type& t, bool large_strings) {
+        switch (t.type()) {
+            case types::logical_type::BOOLEAN:
+            case types::logical_type::TINYINT:
+            case types::logical_type::SMALLINT:
+            case types::logical_type::INTEGER:
+            case types::logical_type::BIGINT:
+            case types::logical_type::UTINYINT:
+            case types::logical_type::USMALLINT:
+            case types::logical_type::UINTEGER:
+            case types::logical_type::UBIGINT:
+            case types::logical_type::FLOAT:
+            case types::logical_type::DOUBLE:
+            case types::logical_type::DATE:
+            case types::logical_type::TIME:
+            case types::logical_type::TIMESTAMP:
+            case types::logical_type::TIMESTAMP_TZ:
+                return true;
+            case types::logical_type::STRING_LITERAL:
+                return large_strings;
+            default:
+                return false;
+        }
+    }
+
+    // The `columns` of `chunk` (all exported_natively) as Arrow arrays, in that order, through
+    // otterbrix's exporter: to_arrow_array appends each column in one typed pass (constant and
+    // dictionary vectors included, through their unified format), and Arrow imports the result
+    // without copying it.
+    core::result_wrapper_t<arrow::ArrayVector> export_natively(std::pmr::memory_resource* res,
+                                                               const data_chunk_t& chunk,
+                                                               const std::vector<uint64_t>& columns) {
+        namespace ca = components::vector::arrow;
+        std::pmr::vector<types::complex_logical_type> view_types(res);
+        view_types.reserve(columns.size());
+        for (const auto c : columns) {
+            view_types.push_back(chunk.data[c].type());
+        }
+        // A chunk of just these columns, sharing their buffers.
+        data_chunk_t view(res, view_types, 0);
+        for (size_t i = 0; i < columns.size(); ++i) {
+            view.data[i].reference(chunk.data[columns[i]]);
+        }
+        view.set_capacity(chunk.size());
+        view.set_cardinality(chunk.size());
+
+        ca::arrow_schema_wrapper_t schema;
+        ca::arrow_array_wrapper_t array;
+        // The exporter reports a type it has no mapping for by throwing. exported_natively admits
+        // none such, so a throw here is a broken invariant (or an allocation failure) — reported
+        // as a value at this boundary, never let out of the translator.
+        try {
+            ca::to_arrow_schema(&schema.arrow_schema, view_types);
+            ca::to_arrow_array(view, &array.arrow_array);
+        } catch (const std::exception& e) {
+            return tsl::make_error(res,
+                                   core::error_code_t::conversion_failure,
+                                   std::string{"chunk_to_record_batch: native export failed: "} + e.what());
+        }
+        // Takes both structs over (the wrappers release whatever an import leaves behind).
+        auto batch = arrow::ImportRecordBatch(&array.arrow_array, &schema.arrow_schema);
+        if (!batch.ok()) {
+            return tsl::arrow_error(res, core::error_code_t::conversion_failure,
+                                    "chunk_to_record_batch: import batch", batch.status());
+        }
+        return (*batch)->columns();
+    }
+
+    // `large_strings`: a STRING field is large_utf8, the layout otterbrix's exporter writes
+    // (chunk_to_file_batch); otherwise utf8.
     arrow_schema_result fields_to_schema(std::pmr::memory_resource* res,
-                                         const std::pmr::vector<components::types::complex_logical_type>& types) {
+                                         const std::pmr::vector<components::types::complex_logical_type>& types,
+                                         bool large_strings = false) {
         arrow::FieldVector field_vector;
         field_vector.reserve(types.size());
         for (const auto& type : types) {
+            if (large_strings && type.type() == logical_type::STRING_LITERAL) {
+                field_vector.push_back(arrow::field(field_name(type), arrow::large_utf8()));
+                continue;
+            }
             auto arrow_type = arrow_type_from_logical(res, type);
             if (arrow_type.has_error()) {
                 return arrow_type.convert_error<std::shared_ptr<arrow::Schema>>();
@@ -140,31 +250,80 @@ to_arrow_schema(std::pmr::memory_resource* res, const components::types::complex
     return fields_to_schema(res, struct_t.child_types());
 }
 
-// Arrow's builders report failure through a returned Status; every one is checked so
-// a failed Append never drops a row and a failed Finish never hands a null array to
-// RecordBatch::Make.
+namespace {
+
+// Both batch builders: every exported_natively column through otterbrix's exporter, the rest
+// through Arrow's builders on the caller's resource. Arrow's builders report failure through a
+// returned Status; every one is checked so a failed Append never drops a row and a failed Finish
+// never hands a null array to RecordBatch::Make.
 core::result_wrapper_t<std::shared_ptr<arrow::RecordBatch>>
-chunk_to_record_batch(std::pmr::memory_resource* res, const data_chunk_t& chunk) {
-    OTX_ZONE_N("tsl::chunk_to_record_batch");
+make_batch(std::pmr::memory_resource* res, const data_chunk_t& chunk, bool large_strings) {
     auto writable = tsl::validate_writable_columns(res, chunk, "chunk_to_record_batch");
     if (writable.has_error()) {
         return writable.convert_error<std::shared_ptr<arrow::RecordBatch>>();
     }
 
     const auto types = chunk.types();
-    auto schema = to_arrow_schema(res, types);
-    if (schema.has_error()) {
-        return schema.convert_error<std::shared_ptr<arrow::RecordBatch>>();
+    auto built = fields_to_schema(res, types, large_strings);
+    if (built.has_error()) {
+        return built.convert_error<std::shared_ptr<arrow::RecordBatch>>();
     }
+    const std::shared_ptr<arrow::Schema> schema = std::move(built.value());
     const auto nrows  = static_cast<int64_t>(chunk.size());
     const size_t ncols = static_cast<size_t>(chunk.column_count());
+
+    // Nothing to export: every column empty, under its type.
+    if (nrows == 0) {
+        auto empty = arrow::RecordBatch::MakeEmpty(schema, tsl::arrow_pool(res));
+        if (!empty.ok()) {
+            return tsl::arrow_error(res, core::error_code_t::conversion_failure, "chunk_to_record_batch: empty batch",
+                                    empty.status());
+        }
+        return std::move(*empty);
+    }
 
     arrow::ArrayVector arrays;
     arrays.reserve(ncols);
 
+    // The natively exported columns in one pass; the loop below takes them in column order.
+    std::vector<uint64_t> native;
+    for (size_t c = 0; c < ncols; c++) {
+        if (exported_natively(types[c], large_strings)) {
+            native.push_back(c);
+        }
+    }
+    arrow::ArrayVector native_arrays;
+    if (!native.empty()) {
+        auto exported = export_natively(res, chunk, native);
+        if (exported.has_error()) {
+            return exported.convert_error<std::shared_ptr<arrow::RecordBatch>>();
+        }
+        native_arrays = std::move(exported.value());
+        // The exporter's Arrow types are the schema's by construction; a mismatch (an otterbrix
+        // whose mapping moved) is refused rather than streamed under the wrong field type.
+        for (size_t i = 0; i < native.size(); ++i) {
+            const auto& expected = schema->field(static_cast<int>(native[i]))->type();
+            if (!native_arrays[i]->type()->Equals(*expected)) {
+                return tsl::make_error(res,
+                                       core::error_code_t::conversion_failure,
+                                       "chunk_to_record_batch: column '" + field_name(types[native[i]]) +
+                                           "' was exported as " + native_arrays[i]->type()->ToString() + ", not " +
+                                           expected->ToString());
+            }
+        }
+    }
+    size_t next_native = 0;
+
+    // Every builder allocates on the caller's resource (arrow_memory_pool.hpp).
+    arrow::MemoryPool* pool = tsl::arrow_pool(res);
+
 #define BUILD_COL(Builder, cpp_type)                                                                     \
     {                                                                                                     \
-        arrow::Builder b;                                                                                 \
+        arrow::Builder b{pool};                                                                           \
+        if (auto st = b.Reserve(nrows); !st.ok()) {                                                       \
+            return tsl::arrow_error(res, core::error_code_t::conversion_failure,                         \
+                                    "chunk_to_record_batch: reserve", st);                               \
+        }                                                                                                 \
         for (int64_t r = 0; r < nrows; r++) {                                                            \
             auto v = chunk.value(static_cast<uint64_t>(c), static_cast<uint64_t>(r));                    \
             auto st = v.is_null() ? b.AppendNull() : b.Append(v.value<cpp_type>());                       \
@@ -183,6 +342,10 @@ chunk_to_record_batch(std::pmr::memory_resource* res, const data_chunk_t& chunk)
     }
 
     for (size_t c = 0; c < ncols; c++) {
+        if (next_native < native.size() && native[next_native] == c) {
+            arrays.push_back(native_arrays[next_native++]);
+            continue;
+        }
         if (travels_as_decimal(types[c])) {
             // The schema field for this column is decimal128(precision, scale) and a builder
             // carries its own type, so both must name it. What is appended is the stored
@@ -190,7 +353,11 @@ chunk_to_record_batch(std::pmr::memory_resource* res, const data_chunk_t& chunk)
             // which is exactly what keeps the pair exact in both directions.
             const auto spec = spec_of(types[c]);
             const std::string name = field_name(types[c]);
-            arrow::Decimal128Builder b{arrow::decimal128(spec.precision, spec.scale)};
+            arrow::Decimal128Builder b{arrow::decimal128(spec.precision, spec.scale), pool};
+            if (auto st = b.Reserve(nrows); !st.ok()) {
+                return tsl::arrow_error(res, core::error_code_t::conversion_failure,
+                                        "chunk_to_record_batch: reserve", st);
+            }
             for (int64_t r = 0; r < nrows; r++) {
                 auto v = chunk.value(static_cast<uint64_t>(c), static_cast<uint64_t>(r));
                 arrow::Status st;
@@ -229,7 +396,11 @@ chunk_to_record_batch(std::pmr::memory_resource* res, const data_chunk_t& chunk)
             case physical_type::FLOAT:  BUILD_COL(FloatBuilder,   float)
             case physical_type::DOUBLE: BUILD_COL(DoubleBuilder,  double)
             case physical_type::STRING: {
-                arrow::StringBuilder b;
+                arrow::StringBuilder b{pool};
+                if (auto st = b.Reserve(nrows); !st.ok()) {
+                    return tsl::arrow_error(res, core::error_code_t::conversion_failure,
+                                            "chunk_to_record_batch: reserve", st);
+                }
                 for (int64_t r = 0; r < nrows; r++) {
                     auto v = chunk.value(static_cast<uint64_t>(c),
                                         static_cast<uint64_t>(r));
@@ -250,7 +421,7 @@ chunk_to_record_batch(std::pmr::memory_resource* res, const data_chunk_t& chunk)
             case physical_type::NA: {
                 // The column's type IS null (schema field arrow::null()), so a NullArray is
                 // the faithful representation, not a stand-in.
-                arrow::NullBuilder b;
+                arrow::NullBuilder b{pool};
                 if (auto st = b.AppendNulls(nrows); !st.ok()) {
                     return tsl::arrow_error(res, core::error_code_t::conversion_failure,
                                             "chunk_to_record_batch: append nulls", st);
@@ -273,7 +444,21 @@ chunk_to_record_batch(std::pmr::memory_resource* res, const data_chunk_t& chunk)
 
 #undef BUILD_COL
 
-    return arrow::RecordBatch::Make(std::move(schema.value()), nrows, std::move(arrays));
+    return arrow::RecordBatch::Make(std::move(schema), nrows, std::move(arrays));
+}
+
+} // namespace
+
+core::result_wrapper_t<std::shared_ptr<arrow::RecordBatch>>
+chunk_to_record_batch(std::pmr::memory_resource* res, const data_chunk_t& chunk) {
+    OTX_ZONE_N("tsl::chunk_to_record_batch");
+    return make_batch(res, chunk, /*large_strings=*/false);
+}
+
+core::result_wrapper_t<std::shared_ptr<arrow::RecordBatch>>
+chunk_to_file_batch(std::pmr::memory_resource* res, const data_chunk_t& chunk) {
+    OTX_ZONE_N("tsl::chunk_to_file_batch");
+    return make_batch(res, chunk, /*large_strings=*/true);
 }
 
 core::result_wrapper_t<arrow::Decimal128> to_arrow_decimal(std::pmr::memory_resource* res,

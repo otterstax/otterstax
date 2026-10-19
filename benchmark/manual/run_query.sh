@@ -3,10 +3,10 @@
 # Start the service first with: ./benchmark/manual/start_service.sh
 #
 # Usage:
-#   ./benchmark/manual/run_query.sh --frontend mysql|postgres|arrow <query.sql>
+#   ./benchmark/manual/run_query.sh --frontend mysql|postgres <query.sql>
 #
 # Options:
-#   --frontend F    mysql | postgres | arrow (required)
+#   --frontend F    mysql | postgres (required)
 #   --name N        Label for result files (default: basename of query file)
 #   --out-dir DIR   Output directory (default: benchmark_manual/<YYYYMMDD_HHMMSS>)
 #   <query.sql>     Path to a file containing the SQL to execute
@@ -44,7 +44,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [ -z "$FRONTEND" ]; then
-    echo "ERROR: --frontend is required (mysql | postgres | arrow)" >&2
+    echo "ERROR: --frontend is required (mysql | postgres)" >&2
     exit 1
 fi
 if [ -z "$QUERY_FILE" ]; then

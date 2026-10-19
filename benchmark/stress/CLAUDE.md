@@ -118,15 +118,13 @@ pool independently so concurrent workers hit different queries.
 
 | Key | Description | Typical latency |
 | --- | ----------- | --------------- |
-| `simple_select` | `LIMIT 100` point reads across all 6 backends | 2–50 ms |
-| `complex_select` | `GROUP BY + HAVING + ORDER BY LIMIT 1000` | 5–55 ms |
-| `join_same_b` | Same-instance join, Group B only (~5 k rows) | 1–3 s |
-| `join_same_instance` | Same-instance join, both groups (up to 60 k rows) | 3–9 s |
-| `join_cross_engine` | Cross-engine join, Group B tables | 3–5 s |
+| `simple_select` | `LIMIT 100` point reads across all 6 backends | 28–51 ms |
+| `complex_select` | `GROUP BY + HAVING + ORDER BY LIMIT 1000` | 33–63 ms |
+| `join_same_b` | Same-instance join, Group B only (~5 k rows) | 36–55 ms |
+| `join_same_instance` | Same-instance join, both groups (up to 60 k rows) | 36–74 ms |
+| `join_cross_engine` | Cross-engine join, Group B tables | 36 ms–1 s |
 
-> **`join_all` is not available as a pool key.** A single `join_all` query takes 47–90 s
-> (full-table scan, no predicate pushdown) and would make per-stage statistics
-> uninterpretable.
+> **`join_all` is not available as a pool key.**
 
 ---
 

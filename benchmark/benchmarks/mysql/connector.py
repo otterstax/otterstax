@@ -26,3 +26,14 @@ def connect(host, port):
     (external_load / external_join / external_dump run one statement per call)."""
     return _mysql.connect(host=host, port=port, user="testuser",
                           password="testpass", autocommit=True)
+
+
+# ── the prepare test (benchmarks/backends/suite.py, <backend>_prepare) ────────
+def prepare_connect(host, port):
+    return connect(host, port)
+
+
+def statement_cursor(conn, prepared):
+    """A cursor that runs one statement plain (COM_QUERY) or prepared
+    (COM_STMT_PREPARE + COM_STMT_EXECUTE)."""
+    return conn.cursor(prepared=True) if prepared else conn.cursor()

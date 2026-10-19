@@ -30,25 +30,47 @@ CLEAR=false           # set by --clear; removes images and volumes before buildi
 EXTERNAL_ENABLED=false  # set when any external_* test is selected (adds RustFS + fixtures)
 KAFKA_ENABLED=false     # set when any kafka_* test is selected (adds redpanda + seeds a topic)
 
-# external_* are opt-in via --bench: they need generated fixtures + RustFS, which
-# only spin up when selected.  They cover s3/file loading, internal joins and
-# dumps — no cross-backend / JOIN ALL workloads.
-DEFAULT_TESTS=(simple_select complex_select join_same_instance join_cross_engine join_all)
-ALL_TESTS=("${DEFAULT_TESTS[@]}"
-           external_load external_join external_dump
-           external_join_cross external_join_all
-           kafka_ingest kafka_produce kafka_stream)
+# Default run: the cross-backend tests, the per-backend suite (the same four tests
+# for ClickHouse, MySQL and PostgreSQL: <backend>_select_wide / _insert / _prepare /
+# _concurrent) and the s3/file suite (external_*).  Selecting any external_* test
+# starts RustFS and generates the fixtures.  kafka_* are opt-in via --bench: they
+# start redpanda.  --suite concurrent|single keeps the *_concurrent tests or the
+# others (full: both).
+CROSS_BACKEND_TESTS=(simple_select complex_select join_same_instance join_cross_engine join_all
+                     join_concurrent join_wide join_wide_concurrent)
+BACKEND_TESTS=()
+for _b in ch mysql pg; do
+    BACKEND_TESTS+=("${_b}_select_wide" "${_b}_insert" "${_b}_prepare" "${_b}_concurrent")
+done
+S3_TESTS=(external_load external_join external_dump
+          external_join_cross external_join_all external_load_concurrent)
+KAFKA_TESTS=(kafka_ingest kafka_produce kafka_stream)
+DEFAULT_TESTS=("${CROSS_BACKEND_TESTS[@]}" "${BACKEND_TESTS[@]}" "${S3_TESTS[@]}")
+ALL_TESTS=("${DEFAULT_TESTS[@]}" "${KAFKA_TESTS[@]}")
 TESTS=("${DEFAULT_TESTS[@]}")
 BENCH_FILTER=()   # populated by --bench; empty = run default tests
-# arrow is excluded by default: OtterStax FlightSQL serializer crashes on JOIN
-# result sets > ~1000 rows.  Re-add with --frontend arrow once the bug is fixed.
-ALL_FRONTENDS=(mysql postgres arrow)
-DEFAULT_FRONTENDS=(mysql postgres)
+SUITE=full        # --suite full | concurrent | single
+ALL_FRONTENDS=(mysql postgres spark)
+DEFAULT_FRONTENDS=(mysql postgres spark)
 _frontend_port() {
     case "$1" in
-        mysql)   echo 8816 ;;
+        mysql)    echo 8816 ;;
         postgres) echo 8817 ;;
-        arrow)   echo 8815 ;;
+        spark)    echo 15002 ;;
+    esac
+}
+# The script (and its arguments) that runs one test through one frontend.  The
+# cross-backend and kafka tests live per frontend (benchmarks/<frontend>/<test>.py);
+# the per-backend suite and join_concurrent are benchmarks/backends/suite.py, the
+# s3/file suite one script per test (benchmarks/s3/); both pick the client frontend
+# with --frontend.
+_test_script() {
+    local frontend=$1 test=$2
+    case "$test" in
+        ch_* | mysql_* | pg_* | join_concurrent | join_wide | join_wide_concurrent)
+                    echo "/app/benchmarks/backends/suite.py $test --frontend $frontend" ;;
+        external_*) echo "/app/benchmarks/s3/$test.py --frontend $frontend" ;;
+        *)          echo "/app/benchmarks/$frontend/$test.py" ;;
     esac
 }
 
@@ -64,17 +86,24 @@ Both Docker images are reused automatically when they already exist.
 
 Options:
   --repetitions N     Repetitions per sub-test query (default: 10)
-  --frontend F        Frontend to run: mysql | postgres | arrow
-                      May be repeated. Default: mysql postgres.
-                      arrow is excluded by default (FlightSQL JOIN bug — see CLAUDE.md).
-  --bench T           Test(s) to run: simple_select | complex_select |
-                      join_same_instance | join_cross_engine | join_all |
-                      external_load | external_join | external_dump |
-                      external_join_cross | external_join_all |
-                      kafka_ingest | kafka_produce | kafka_stream
-                      May be repeated. Default: the five cross-backend tests.
-                      external_* (s3/file: load, internal joins, dump) are opt-in
-                      and auto-start RustFS + generate fixtures. mysql/postgres only.
+  --frontend F        Client frontend to run through: mysql | postgres | spark
+                      May be repeated. Default: mysql postgres spark.
+  --suite S           full (default) | concurrent | single: every selected test,
+                      only the *_concurrent ones, or every other one.
+  --full | --concurrent | --single
+                      Shorthands for --suite full / concurrent / single.
+  --bench T           Test(s) to run:
+                        cross-backend: simple_select | complex_select |
+                          join_same_instance | join_cross_engine | join_all |
+                          join_concurrent | join_wide | join_wide_concurrent
+                        per backend (benchmarks/backends/suite.py), <b> = ch | mysql | pg:
+                          <b>_select_wide | <b>_insert | <b>_prepare | <b>_concurrent
+                        s3/file (benchmarks/s3/): external_load | external_join |
+                          external_dump | external_join_cross | external_join_all |
+                          external_load_concurrent
+                        kafka: kafka_ingest | kafka_produce | kafka_stream
+                      May be repeated. Default: every test except kafka_*.
+                      external_* auto-start RustFS + generate fixtures.
                       kafka_* are opt-in and auto-start redpanda + seed a JSON
                       topic: kafka_ingest (SOURCE ingest, at-least-once + EOS),
                       kafka_produce (INSERT VALUES write path), kafka_stream
@@ -166,6 +195,12 @@ while [[ $# -gt 0 ]]; do
             ENABLE_PERF=true
             ENABLE_PERF_ALLOC=true
             shift ;;
+        --suite)
+            SUITE="$2"; shift 2 ;;
+        --suite=*)
+            SUITE="${1#*=}"; shift ;;
+        --full | --concurrent | --single)
+            SUITE="${1#--}"; shift ;;
         --bench)
             shift
             while [[ $# -gt 0 && ! "$1" =~ ^- ]]; do
@@ -206,6 +241,22 @@ if [ ${#BENCH_FILTER[@]} -gt 0 ]; then
     done
     TESTS=("${_filtered[@]}")
 fi
+
+case "$SUITE" in
+    full) ;;
+    concurrent | single)
+        _kept=()
+        for _t in "${TESTS[@]}"; do
+            case "$_t" in
+                *_concurrent) [ "$SUITE" = concurrent ] && _kept+=("$_t") ;;
+                *)            [ "$SUITE" = single ] && _kept+=("$_t") ;;
+            esac
+        done
+        TESTS=("${_kept[@]}") ;;
+    *)
+        echo "ERROR: --suite must be full, concurrent or single (got '$SUITE')" >&2
+        exit 1 ;;
+esac
 
 # External tests pull in RustFS + generated fixtures; kafka tests pull in redpanda
 # + a seeded topic.  Detect once up front.
@@ -370,7 +421,7 @@ _wait_otterstax() {
 # ---------------------------------------------------------------------------
 _register_connections() {
     echo "Connections read from benchmark/config.yaml at startup (no runtime registration)."
-    $EXTERNAL_ENABLED && _register_s3_credentials
+    if $EXTERNAL_ENABLED; then _register_s3_credentials; fi
 }
 
 # The bench RustFS s3 alias ('bench_rustfs') is likewise declared in
@@ -685,6 +736,7 @@ fi
 echo ""
 echo "=== Step 5: Running benchmarks ==="
 echo "    Frontends      : ${FRONTENDS[*]}"
+echo "    Suite          : $SUITE"
 echo "    Tests          : ${TESTS[*]}"
 echo "    Reps           : $REPETITIONS"
 echo "    Out dir        : $OUT_DIR"
@@ -699,6 +751,12 @@ for frontend in "${FRONTENDS[@]}"; do
 
         echo ""
         echo "--- $frontend / $test (port $port) ---"
+
+        # The kafka tests are per frontend and have no Spark Connect variant.
+        if [ "$frontend" = spark ] && [[ "$test" == kafka_* ]]; then
+            echo "  SKIP: $frontend/$test (no Spark Connect variant)"
+            continue
+        fi
 
         if $TRACY_SEP; then
             tracy_out="${frontend}_${test}.tracy"
@@ -730,7 +788,7 @@ for frontend in "${FRONTENDS[@]}"; do
             -e GIT_COMMIT="$GIT_COMMIT" \
             -e PYTHONUNBUFFERED=1 \
             benchmark-client:latest \
-            python "/app/benchmarks/$frontend/$test.py" \
+            python $(_test_script "$frontend" "$test") \
             --host bench_otterstax \
             --port "$port" \
             --repetitions "$REPETITIONS" \

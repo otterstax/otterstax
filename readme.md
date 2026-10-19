@@ -306,14 +306,22 @@ tears everything down.
 ```
 
 Runs the full benchmark harness: builds images, starts backend DBs (MariaDB, PostgreSQL,
-ClickHouse), initialises data, runs latency tests across MySQL and PostgreSQL wire frontends,
-and writes results to `benchmark_results/<timestamp>/`.
+ClickHouse) and RustFS, initialises data, runs latency tests through the MySQL wire,
+PostgreSQL wire and Spark Connect frontends (each runs the same tests), and writes
+results to `benchmark_results/<timestamp>/`.
+
+A default run covers three groups of tests:
+- the cross-backend tests, `join_concurrent` included;
+- the per-backend suite — the same four tests for ClickHouse, MySQL and PostgreSQL
+  (`benchmark/benchmarks/backends/suite.py`);
+- the S3/file suite (`benchmark/benchmarks/s3/`).
 
 | Option | Description |
 | ------ | ----------- |
 | `--repetitions N` | Repetitions per sub-test (default: 10) |
-| `--frontend F` | `mysql` \| `postgres` \| `arrow`; may be repeated; default: `mysql postgres` |
-| `--bench T [T …]` | Tests to run: `simple_select` `complex_select` `join_same_instance` `join_cross_engine` `join_all` `external_load` `external_join` `external_dump` `external_join_cross` `external_join_all`. Selecting any `external_*` test auto-starts RustFS, generates s3/file fixtures, and registers the `bench_rustfs` s3 alias (mysql/postgres frontends only). |
+| `--frontend F` | `mysql` \| `postgres` \| `spark`; may be repeated; default: all three |
+| `--suite S` | `full` (default) \| `concurrent` \| `single`: every selected test, only the `*_concurrent` ones, or every other one; `--full` / `--concurrent` / `--single` are shorthands |
+| `--bench T [T …]` | Tests to run (default: every test except `kafka_*`). Cross-backend: `simple_select` `complex_select` `join_same_instance` `join_cross_engine` `join_all` `join_concurrent`. Per backend (`<b>` = `ch` \| `mysql` \| `pg`): `<b>_select_wide` `<b>_insert` `<b>_prepare` `<b>_concurrent`. S3/file: `external_load` `external_join` `external_dump` `external_join_cross` `external_join_all` `external_load_concurrent`. Kafka (opt-in): `kafka_ingest` `kafka_produce` `kafka_stream`. Selecting any `external_*` test auto-starts RustFS and generates the s3/file fixtures. |
 | `--rebuild` | Force image rebuild even if images already exist |
 | `--clear` | Remove images + DB volumes, rebuild from scratch |
 | `-j N` | Parallel cmake build jobs (auto-capped by available RAM) |

@@ -59,7 +59,8 @@ Results land in `benchmark_results/microbench/<YYYYMMDD_HHMMSS>/`:
 
 End-to-end query latency benchmark for the OtterStax federated SQL server.
 Tests run against six real database containers (2× MariaDB, 2× PostgreSQL, 2× ClickHouse)
-via the MySQL wire, PostgreSQL wire, and Arrow/FlightSQL frontends.
+and a RustFS bucket, via the MySQL wire, PostgreSQL wire and Spark Connect frontends —
+every frontend runs the same tests.
 
 ## Prerequisites
 
@@ -80,9 +81,12 @@ Run everything end-to-end — builds images if needed, starts databases, initial
 data, runs all benchmarks, and writes results.
 
 ```bash
-# Default: mysql + postgres frontends, the 5 cross-backend tests, 10 reps each
-# (external_* s3/file tests are opt-in — see "External-table tests" below)
+# Default: mysql + postgres + spark frontends, every test except kafka_*, 10 reps each
 ./benchmark/scripts/run_benchmark.sh
+
+# Only the concurrent tests / only the single-session ones (default: --full, both)
+./benchmark/scripts/run_benchmark.sh --concurrent --repetitions 5
+./benchmark/scripts/run_benchmark.sh --single --repetitions 5
 
 # Quick smoke test
 ./benchmark/scripts/run_benchmark.sh --repetitions 1 --bench simple_select
@@ -188,32 +192,53 @@ elapsed_ms : 45.2
 
 | Test                 | What it measures                              | Typical latency |
 |----------------------|-----------------------------------------------|-----------------|
-| `simple_select`      | `LIMIT 100` point-read per table              | 2–50 ms         |
-| `complex_select`     | `GROUP BY` + `HAVING` + `ORDER BY LIMIT 1000` | 5–55 ms         |
-| `join_same_instance` | JOIN within the same engine instance          | 3–9 s           |
-| `join_cross_engine`  | JOIN across two different engine instances    | 3–5 s           |
-| `join_all`           | 3-way JOIN: MySQL + PostgreSQL + ClickHouse   | 47–90 s         |
+| `simple_select`      | `LIMIT 100` point-read per table              | 28–51 ms        |
+| `complex_select`     | `GROUP BY` + `HAVING` + `ORDER BY LIMIT 1000` | 33–63 ms        |
+| `join_same_instance` | JOIN within the same engine instance          | 36–74 ms        |
+| `join_cross_engine`  | JOIN across two different engine instances    | 36 ms–1 s       |
+| `join_all`           | 3-way JOIN: MySQL + PostgreSQL + ClickHouse   | 0.18–0.48 s     |
 
-> **Note:** `join_all` is slow because OtterStax fetches entire tables and filters
-> in-process — there is no predicate pushdown to backends.
+> **Note:** a cross-backend JOIN such as `join_all` reads each side's table whole and
+> filters in-process — its `WHERE` is not pushed down to the backends (a statement over
+> one backend runs whole on it, `WHERE` included).
 
 ---
 
-## External-table tests (s3/file)
+## Per-backend suite (`benchmarks/backends/suite.py`)
 
-Five opt-in workloads that exercise the `CREATE EXTERNAL TABLE` / `COPY ... TO`
-grammar extensions. Each runs both a local-file (`/fixtures` mount) and an s3
-(seeded RustFS) source, so file vs s3 are directly comparable in the sub-test
-breakdown. `mysql` and `postgres` frontends only — `arrow` is excluded by the
-same JOIN serialisation bug as the default test set.
+The same four tests for each backend — ClickHouse (`ch_`), MySQL (`mysql_`),
+PostgreSQL (`pg_`) — in the shapes the cross-backend tests leave out, plus
+`join_concurrent`. Part of the default run; `suite.py <test> --frontend F`.
 
-| Test                  | Workload                                                                                | Sub-tests |
-|-----------------------|-----------------------------------------------------------------------------------------|-----------|
-| `external_load`       | `CREATE EXTERNAL TABLE` — table dropped between reps to time a cold load                | `{file,s3}_{parquet,csv,ndjson}` |
-| `external_join`       | `regions`(parquet) ⋈ `web_events`(csv) on `campaign_id` — internal otterbrix-on-otterbrix join | `{file,s3}_join` |
-| `external_dump`       | `COPY (SELECT * FROM <loaded>) TO <target>` — writer + upload                           | `{file,s3}_{parquet,csv,ndjson}` |
-| `external_join_cross` | external `regions` ⋈ otterbrix-internal `weights` (`CREATE TABLE` + `INSERT`)           | `{file,s3}_cross` |
-| `external_join_all`   | s3 parquet `regions` ⋈ file csv `web_events` ⋈ internal `weights`, all on `campaign_id` | `s3parquet_filecsv_internal` |
+| Test | What it measures | Sub-tests | Typical latency |
+|------|------------------|-----------|-----------------|
+| `<b>_select_wide` | ~60 k-row results (decoding + row streaming) | `impressions_<alias>_all`, `daily_stats_<alias>_all` | 78–161 ms |
+| `<b>_insert` | `INSERT … VALUES` into the backend's `bench_inserts`; row count = the affected rows the frontend reports | `insert_{100,1000}_rows` | 3–9 ms |
+| `<b>_prepare` | the same statement plain vs prepared (the prepare sends the backend a describe probe) | `{agg,select}_<alias>_{plain,prepared}` | 23–119 ms |
+| `<b>_concurrent` | N sessions at once (N = 1, 4, 8): wall time of the batch and per-session latency | `{agg,select}_<alias>_x{1,4,8}`, `…_x{4,8}_each` | 23–198 ms |
+| `join_concurrent` | N sessions running the same cross-backend JOIN at once | `{mysql2_x_pg2,ch2_x_mysql2,pg1_ch1_mysql2}_x{1,4,8}`, `…_x{4,8}_each` | 32 ms–8.1 s |
+| `join_wide` | cross-backend JOINs whose cost is fetching each side (a whole 60 k-row table from MySQL and from PostgreSQL, one-row aggregate) | `count_mysql1_imp_x_pg1_stats`, `sum_mysql1_imp_x_pg1_imp` | TBD |
+| `join_wide_concurrent` | the same from N sessions at once (N = 1, 4, 8) | `…_x{1,4,8}`, `…_x{4,8}_each` | TBD |
+
+---
+
+## External-table tests (s3/file, `benchmarks/s3/`)
+
+Six workloads that exercise the `CREATE EXTERNAL TABLE` / `COPY ... TO` grammar
+extensions; they are part of the default run.
+- Each runs both a local-file source (the `/fixtures` mount) and an s3 source
+  (seeded RustFS), so file vs s3 are directly comparable in the sub-test
+  breakdown.
+- Each script takes `--frontend mysql|postgres|spark`.
+
+| Test                  | Workload                                                                                | Sub-tests | Typical latency |
+|-----------------------|-----------------------------------------------------------------------------------------|-----------|-----------------|
+| `external_load`       | `CREATE EXTERNAL TABLE` — table dropped between reps to time a cold load                | `{file,s3}_{parquet,csv,ndjson}` | 103–148 ms |
+| `external_join`       | `regions`(parquet) ⋈ `web_events`(csv) on `campaign_id` — internal otterbrix-on-otterbrix join | `{file,s3}_join` | 108–131 ms |
+| `external_dump`       | `COPY (SELECT * FROM <loaded>) TO <target>` — writer + upload                           | `{file,s3}_{parquet,csv,ndjson}` | 50–77 ms |
+| `external_join_cross` | external `regions` ⋈ otterbrix-internal `weights` (`CREATE TABLE` + `INSERT`)           | `{file,s3}_cross` | 37–38 ms |
+| `external_join_all`   | s3 parquet `regions` ⋈ file csv `web_events` ⋈ internal `weights`, all on `campaign_id` | `s3parquet_filecsv_internal` | 76–81 ms |
+| `external_load_concurrent` | N sessions run `CREATE EXTERNAL TABLE` at once (N = 1, 4, 8) from `web_events.csv`: wall time of the batch and per-session latency | `{file,s3}_csv_x{1,4,8}`, `…_x{4,8}_each` | 0.15–1.17 s |
 
 `external_join_cross` / `external_join_all` deliberately load every side into
 otterbrix-internal storage (external load + a hand-built `bigint` engine table).
@@ -230,9 +255,10 @@ The `bench_rustfs` s3 alias is declared in `benchmark/config.yaml` and
 registered at server startup (no runtime registration step).
 
 ```bash
-# All five external tests, both frontends
+# All six external tests, both frontends
 ./benchmark/scripts/run_benchmark.sh \
   --bench external_load external_join external_dump external_join_cross external_join_all \
+          external_load_concurrent \
   --repetitions 5
 
 # Just the s3-join shapes, mysql wire

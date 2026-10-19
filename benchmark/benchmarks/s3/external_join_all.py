@@ -5,8 +5,9 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+from common import frontend_from_argv
 from external_common import external_main
-from connector import FRONTEND, DEFAULT_PORT, connect
 
 if __name__ == "__main__":
-    external_main("external_join_cross", FRONTEND, DEFAULT_PORT, connect)
+    fe = frontend_from_argv()
+    external_main("external_join_all", fe.FRONTEND, fe.DEFAULT_PORT, fe.connect)

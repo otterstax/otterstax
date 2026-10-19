@@ -12,7 +12,7 @@ import time
 from datetime import datetime, timezone
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--frontend", required=True, choices=["mysql", "postgres", "arrow"])
+parser.add_argument("--frontend", required=True, choices=["mysql", "postgres"])
 parser.add_argument("--host", default="bench_otterstax")
 parser.add_argument("--port", type=int, default=0)
 parser.add_argument("--out-dir", default="/results")
@@ -21,7 +21,7 @@ parser.add_argument("sql")
 args = parser.parse_args()
 
 if args.port == 0:
-    args.port = {"mysql": 8816, "postgres": 8817, "arrow": 8815}[args.frontend]
+    args.port = {"mysql": 8816, "postgres": 8817}[args.frontend]
 
 git_commit = os.environ.get("GIT_COMMIT", "unknown")
 generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -56,14 +56,6 @@ try:
         col_names = [d[0] for d in (cur.description or [])]
         cur.close()
         conn.close()
-
-    elif args.frontend == "arrow":
-        from flightsql import FlightSQLClient
-        client = FlightSQLClient(host=args.host, port=args.port, insecure=True)
-        info = client.execute(args.sql)
-        table = client.do_get(info.endpoints[0].ticket).read_all()
-        rows = table.to_pylist()
-        col_names = table.schema.names
 
 except Exception as exc:
     error = str(exc)

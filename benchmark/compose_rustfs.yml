@@ -29,7 +29,12 @@ services:
       retries: 20
       start_period: 5s
     networks:
-      - bench_net
+      bench_net:
+        # The S3 endpoint OtterStax uses (benchmark/config.yaml). The AWS SDK
+        # rejects a host with an underscore ("Invalid DNS Label found in URI
+        # host"), so the container name bench_rustfs cannot be the endpoint.
+        aliases:
+          - bench-rustfs
     restart: unless-stopped
 
   # One-shot: create + seed bench-bucket from the generated fixtures, then exit.
@@ -47,7 +52,7 @@ services:
       - ./data/fixtures:/fixtures:ro
     entrypoint: >
       /bin/sh -c "
-      E=http://bench_rustfs:9000;
+      E=http://bench-rustfs:9000;
       aws --endpoint-url $$E s3api head-bucket --bucket bench-bucket 2>/dev/null || aws --endpoint-url $$E s3 mb s3://bench-bucket;
       aws --endpoint-url $$E s3api put-bucket-policy --bucket bench-bucket --policy '{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":[\"*\"]},\"Action\":[\"s3:GetObject\"],\"Resource\":[\"arn:aws:s3:::bench-bucket/*\"]}]}';
       aws --endpoint-url $$E s3 cp --recursive /fixtures/ s3://bench-bucket/;

@@ -4,16 +4,30 @@ WORKDIR /app
 
 RUN apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*
 
+# mysql-connector-python is pinned to the version the integration tests use
+# (Dockerfile.integration-test). Unpinned, pip picked 26.7.0, which has no C
+# extension here: its pure-Python connect sends `SET @@session.autocommit = ...`,
+# which OtterStax's MySQL frontend rejects (it accepts `SET AUTOCOMMIT=...`), so
+# every mysql-frontend benchmark failed before its first query.
 RUN pip install --no-cache-dir --timeout 120 --retries 5 \
-    mysql-connector-python \
+    mysql-connector-python==9.7.0 \
     psycopg2-binary \
-    flightsql-dbapi \
+    "psycopg[binary]" \
     pyarrow \
     pymysql \
     clickhouse-driver \
     confluent-kafka \
     faker \
     pyyaml
+
+# The Spark Connect frontend's client: pyspark-client 4.2.0 (pure Python, no JVM)
+# with the dependency set the PySpark E2E matrix pins for 4.1/4.2
+# (tests/scripts/install_spark_clients.sh).
+RUN pip install --no-cache-dir --timeout 120 --retries 5 \
+    pyspark-client==4.2.0 \
+    "numpy>=1.21" "pandas>=2.2.0,<3" "pyarrow>=18.0.0" \
+    "grpcio>=1.76.0" "grpcio-status>=1.76.0" "googleapis-common-protos>=1.71.0" \
+    "zstandard>=0.25.0" "protobuf>=6.33.5,<7"
 
 COPY benchmark/bench.yaml   /app/bench.yaml
 COPY benchmark/data/       /app/data/

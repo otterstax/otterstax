@@ -252,7 +252,18 @@ def init_mariadb_group_b(host, user, password, db, seed):
     cur.execute("DROP TABLE IF EXISTS orders")
     cur.execute("DROP TABLE IF EXISTS events")
     cur.execute("DROP TABLE IF EXISTS products")
+    cur.execute("DROP TABLE IF EXISTS bench_inserts")
 
+    # Target of mysql_insert, empty here so startup discovery registers it. No key:
+    # the benchmark reuses ids across insert sizes and frontends.
+    cur.execute("""
+        CREATE TABLE bench_inserts (
+            id          BIGINT,
+            campaign_id INT,
+            note        VARCHAR(64),
+            amount      DOUBLE
+        )
+    """)
     cur.execute("""
         CREATE TABLE products (
             product_id   INT PRIMARY KEY AUTO_INCREMENT,
@@ -417,8 +428,19 @@ def init_postgres_group_b(host, user, password, db, seed):
     cur.execute("DROP TABLE IF EXISTS orders")
     cur.execute("DROP TABLE IF EXISTS events")
     cur.execute("DROP TABLE IF EXISTS products")
+    cur.execute("DROP TABLE IF EXISTS bench_inserts")
     conn.commit()
 
+    # Target of pg_insert, empty here so startup discovery registers it. No key:
+    # the benchmark reuses ids across insert sizes and frontends.
+    cur.execute("""
+        CREATE TABLE bench_inserts (
+            id          BIGINT,
+            campaign_id INT,
+            note        VARCHAR(64),
+            amount      DOUBLE PRECISION
+        )
+    """)
     cur.execute("""
         CREATE TABLE products (
             product_id   SERIAL PRIMARY KEY,
@@ -553,6 +575,7 @@ def init_clickhouse_group_b(host, user, password, db, seed):
     client.execute("DROP TABLE IF EXISTS orders")
     client.execute("DROP TABLE IF EXISTS events")
     client.execute("DROP TABLE IF EXISTS products")
+    client.execute("DROP TABLE IF EXISTS bench_inserts")
 
     client.execute("""
         CREATE TABLE products (
@@ -584,6 +607,17 @@ def init_clickhouse_group_b(host, user, password, db, seed):
             user_id     UInt64,
             device      LowCardinality(String)
         ) ENGINE = MergeTree() ORDER BY campaign_id
+    """)
+    # Target of the ch_insert benchmark (benchmarks/clickhouse/ch_insert.py). Created
+    # empty here, before OtterStax starts, so startup discovery registers it.
+    # Signed columns: the benchmark's INSERT literals are plain integers.
+    client.execute("""
+        CREATE TABLE bench_inserts (
+            id          Int64,
+            campaign_id Int32,
+            note        String,
+            amount      Float64
+        ) ENGINE = MergeTree() ORDER BY id
     """)
 
     prods = gen_products(fake, seed)

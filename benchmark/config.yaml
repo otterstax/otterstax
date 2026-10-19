@@ -69,9 +69,11 @@ connections:
 
   # Used only by the external_* (s3) benchmarks; harmless when they are not run
   # (add_credentials just stores the alias — it does not open a connection).
+  # The endpoint is RustFS's network alias bench-rustfs (compose_rustfs.yml): the
+  # AWS SDK rejects the container name bench_rustfs as a host (underscore).
   s3:
     - alias: bench_rustfs
       access_key: rustfsadmin
       secret_key: rustfsadmin
       region: us-east-1
-      endpoint: bench_rustfs:9000
+      endpoint: bench-rustfs:9000

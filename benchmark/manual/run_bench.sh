@@ -6,11 +6,15 @@
 #   ./benchmark/manual/run_bench.sh [--frontend F]... [--bench T]... [--repetitions N] [--out-dir DIR]
 #
 # Options:
-#   --frontend F    mysql | postgres | arrow  (repeatable; default: mysql postgres)
-#   --bench T [T..] Test name(s) to run, space-separated (default: cross-backend tests).
+#   --frontend F    mysql | postgres | spark  (repeatable; default: all three)
+#   --bench T [T..] Test name(s) to run, space-separated
+#                   (default: cross-backend tests + the per-backend suite).
 #                   Values: simple_select complex_select join_same_instance
 #                           join_cross_engine join_all
+#                           ch_select_wide ch_insert ch_prepare ch_concurrent
 #                           external_load external_join external_dump
+#                           external_join_cross external_join_all
+#                           external_load_concurrent
 #                           kafka_ingest kafka_produce kafka_stream
 #                   (external_* require ./start_service.sh --external;
 #                    kafka_* require ./start_service.sh --kafka)
@@ -98,7 +102,7 @@ for frontend in "${FRONTENDS[@]}"; do
             -e GIT_COMMIT="$GIT_COMMIT" \
             -e PYTHONUNBUFFERED=1 \
             benchmark-client:latest \
-            python "/app/benchmarks/$frontend/$test.py" \
+            python $(_test_script "$frontend" "$test") \
             --host bench_otterstax \
             --port "$port" \
             --repetitions "$REPETITIONS" \

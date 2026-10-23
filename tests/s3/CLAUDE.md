@@ -14,8 +14,9 @@ exists for two reasons:
    into the docker integration test stack (the single-RustFS service defined in
    the top-level `compose.test.yml`) and read by `tests/test_*_mysql_{file,s3}.py`.
 
-The old C++ semi-integration target (`test_s3_manager`) was removed — `conn::s3::ConnectorManager` and `db::S3Manager`
-are now exercised end-to-end through the python integration tests
+The old C++ semi-integration target (`test_s3_manager`) was removed. The s3 transfer
+driver (`conn::s3::driver_t`) and its pools are covered by `tests/system/test_s3_errors.cpp`
+(error paths, no object store) and end-to-end through the python integration tests
 (`test_{schema_}mysql_s3.py`, `test_mysql_join_sql_s3_to_s3.py`,
 `test_mysql_join_otb_local_s3.py`, `test_mysql_join_otb_local_s3_file.py`).
 

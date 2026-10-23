@@ -3,10 +3,10 @@
 
 #include "catalog_manager.hpp"
 
-#include "integration/clickhouse/connection_manager.hpp"
+#include "integration/clickhouse/clickhouse_backend.hpp"
 #include "integration/otterbrix/otterbrix_manager.hpp"
-#include "integration/postgresql/connection_manager.hpp"
-#include "integration/sql/connection_manager.hpp"
+#include "integration/postgresql/postgres_backend.hpp"
+#include "integration/sql/mysql_backend.hpp"
 #include "otterbrix/parser/grammar_extension/kafka/kafka_node.hpp"
 #include "utility/tracy_profiler.hpp"
 
@@ -36,7 +36,7 @@ namespace {
     // True when the external entry's node needs no registered schema: CREATE
     // targets a table that does not exist yet, DROP removes one, and a subquery
     // stub (schema_node_t, node_type::unused) names no relation to register —
-    // its schema is the backend's, which ClickhouseManager::describe writes
+    // its schema is the backend's, which db::backend_t::describe writes
     // into the stub at prepare. Of the drop kinds only DROP TABLE and
     // DROP INDEX carry an alias-qualified name (the parser's
     // carries_table_reference); any other kind inside external_nodes is a
@@ -114,9 +114,6 @@ namespace mysql {
         , log_(get_logger(logger_tag::CATALOG_MANAGER))
         , store_(res)
         , otterbrix_manager_(std::move(otterbrix_manager))
-        , mysql_manager_(actor_zeta::address_t::empty_address())
-        , pg_manager_(actor_zeta::address_t::empty_address())
-        , ch_manager_(actor_zeta::address_t::empty_address())
         , aliases_(aliases)
         , connection_registry_(res) {
         assert(log_.is_valid());
@@ -124,13 +121,7 @@ namespace mysql {
         log_->info("CatalogManager initialized successfully");
     }
 
-    void CatalogManager::set_backend_managers(actor_zeta::address_t mysql_manager,
-                                              actor_zeta::address_t pg_manager,
-                                              actor_zeta::address_t ch_manager) {
-        mysql_manager_ = std::move(mysql_manager);
-        pg_manager_ = std::move(pg_manager);
-        ch_manager_ = std::move(ch_manager);
-    }
+    void CatalogManager::set_backends(backends_t backends) { backends_ = backends; }
 
     void CatalogManager::registerConnection(const std::string& uuid, catalog_ext::ConnectionType type) {
         connection_registry_.insert_or_assign(std::pmr::string{uuid.c_str(), resource()}, type);
@@ -592,49 +583,33 @@ namespace mysql {
         co_return core::error_t(core::error_code_t::invalid_parameter, std::move(what));
     }
 
-    // Discovery is a message to the backend actor that owns the connector
-    // manager; the catalog awaits its reply and never touches a connector
-    // itself. The reply is settled by the time send() returns (the backend
-    // actors run their handlers to completion on the sending thread), so the
-    // co_await below never suspends across another catalog message.
+    // Discovery runs on the backend's connection pool. The answer is settled on
+    // a pool thread; until then this handler is suspended inside enqueue_impl's
+    // loop on the sender's thread, still holding the catalog's mutex, so no
+    // other catalog message interleaves with it.
     actor_zeta::unique_future<core::result_wrapper_t<catalog_ext::discovered_tables_t>>
     CatalogManager::discover_connection_schemas(const qualified_name_t& name, catalog_ext::ConnectionType conn_type) {
         OTX_ZONE_N("catalog::discover_connection_schemas");
-        const actor_zeta::address_t* backend = nullptr;
-        switch (conn_type) {
-            case catalog_ext::ConnectionType::MySQL:
-                backend = &mysql_manager_;
-                break;
-            case catalog_ext::ConnectionType::PostgreSQL:
-                backend = &pg_manager_;
-                break;
-            case catalog_ext::ConnectionType::ClickHouse:
-                backend = &ch_manager_;
-                break;
-        }
-        if (backend == nullptr || !*backend) {
-            log_->error("discover_connection_schemas: no {} backend manager registered (uid {})",
+        const bool registered = (conn_type == catalog_ext::ConnectionType::MySQL && backends_.mysql != nullptr) ||
+                                (conn_type == catalog_ext::ConnectionType::PostgreSQL && backends_.postgresql != nullptr) ||
+                                (conn_type == catalog_ext::ConnectionType::ClickHouse && backends_.clickhouse != nullptr);
+        if (!registered) {
+            log_->error("discover_connection_schemas: no {} backend registered (uid {})",
                         backend_name(conn_type),
                         name.unique_identifier);
             co_return make_error(resource(),
                                  core::error_code_t::do_not_exists,
                                  std::string{"No "} + backend_name(conn_type) +
-                                     " backend manager is registered for uid: " + name.unique_identifier);
+                                     " backend is registered for uid: " + name.unique_identifier);
         }
 
         switch (conn_type) {
-            case catalog_ext::ConnectionType::MySQL: {
-                auto [needs_sched, future] = actor_zeta::send(*backend, &db::MySQLManager::discover, name);
-                co_return co_await std::move(future);
-            }
-            case catalog_ext::ConnectionType::PostgreSQL: {
-                auto [needs_sched, future] = actor_zeta::send(*backend, &db::PostgressManager::discover, name);
-                co_return co_await std::move(future);
-            }
-            case catalog_ext::ConnectionType::ClickHouse: {
-                auto [needs_sched, future] = actor_zeta::send(*backend, &db::ClickhouseManager::discover, name);
-                co_return co_await std::move(future);
-            }
+            case catalog_ext::ConnectionType::MySQL:
+                co_return co_await backends_.mysql->discover(name);
+            case catalog_ext::ConnectionType::PostgreSQL:
+                co_return co_await backends_.postgresql->discover(name);
+            case catalog_ext::ConnectionType::ClickHouse:
+                co_return co_await backends_.clickhouse->discover(name);
         }
         co_return make_error(resource(),
                              core::error_code_t::invalid_parameter,

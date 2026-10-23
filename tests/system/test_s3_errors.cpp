@@ -1,25 +1,25 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2025-2026  OtterStax
 
-// Error paths of the S3 actors that need no object store, each a typed core::error_t that
-// S3Manager forwards unchanged; and the abort contract: opening an output stream sends nothing,
-// so an upload aborted before any data costs no request and publishes nothing.
+// Error paths of the S3 transfers that need no object store, each a typed core::error_t the
+// Worker forwards unchanged; and the abort contract: opening an output stream sends nothing,
+// so an export that fails before any data costs no request and publishes nothing.
 
-#include "connectors/s3/manager.hpp"
-#include "integration/s3/s3_manager.hpp"
+#include "connectors/common/transfer.hpp"
+#include "connectors/s3/driver.hpp"
+#include "scheduler_stack.hpp"
 #include "utility/session.hpp"
 
-// Clash between otterbrix parser macros and Arrow headers
-#undef DAY
-#undef SECOND
-
-#include <arrow/io/interfaces.h>
+#include "../mock/drive.hpp"
 
 #include <actor-zeta.hpp>
+#include <components/cursor/cursor.hpp>
 #include <core/result_wrapper.hpp>
 
 #include <catch2/catch_all.hpp>
 
+#include <chrono>
+#include <memory>
 #include <memory_resource>
 #include <string>
 #include <utility>
@@ -27,14 +27,9 @@
 namespace {
 
     using Catch::Matchers::ContainsSubstring;
+    using otterstax::test::drive;
 
-    // Both S3 actors run their handlers to completion inside enqueue_impl, so a
-    // future returned by send() is settled by the time send() returns.
-    template<typename Sent>
-    auto settled(Sent&& sent) {
-        REQUIRE(sent.second.is_ready());
-        return std::move(sent.second).take_ready();
-    }
+    constexpr std::chrono::milliseconds kConnectTimeout{1000};
 
     conn::s3::connect_params valid_params(std::pmr::memory_resource* resource, const std::string& alias) {
         conn::s3::connect_params params{
@@ -49,22 +44,36 @@ namespace {
         params.access_key = "ak";
         params.secret_key = "sk";
         params.region = "us-east-1";
-        // A custom endpoint keeps the client from resolving a real AWS host.
+        // A custom endpoint that refuses every connection keeps the client from
+        // resolving a real AWS host, and makes any request that does go out fail.
         params.endpoint = "127.0.0.1:1";
         return params;
     }
 
+    // The alias's transfer pool over a driver for valid_params.
+    std::unique_ptr<conn::transfer_pools_t> pools_with(std::pmr::memory_resource* resource, const std::string& alias) {
+        auto driver = conn::s3::driver_t::make(resource, valid_params(resource, alias), kConnectTimeout);
+        INFO("make: " << (driver.has_error() ? driver.error().what.c_str() : "ok"));
+        REQUIRE_FALSE(driver.has_error());
+        auto pools = std::make_unique<conn::transfer_pools_t>(resource);
+        REQUIRE_FALSE(pools->add_s3(alias, std::move(driver.value()), {}).contains_error());
+        return pools;
+    }
+
+    // A result with one typed column and no rows: what an export writes.
+    components::cursor::cursor_t_ptr empty_result(std::pmr::memory_resource* resource) {
+        std::pmr::vector<components::types::complex_logical_type> types(resource);
+        types.emplace_back(components::types::logical_type::INTEGER, "id");
+        return components::cursor::make_cursor(resource, std::move(types));
+    }
+
 } // namespace
 
-TEST_CASE("s3 connector: add_credentials rejects an empty alias or empty keys as invalid_parameter") {
+TEST_CASE("s3 driver: make rejects an empty alias or empty keys as invalid_parameter") {
     auto* resource = std::pmr::new_delete_resource();
-    auto s3 = actor_zeta::spawn<conn::s3::ConnectorManager>(resource);
-    const auto id = session_id().hash();
 
     SECTION("empty alias") {
-        auto params = valid_params(resource, "");
-        auto r = settled(
-            actor_zeta::send(s3->address(), &conn::s3::ConnectorManager::add_credentials, id, std::move(params)));
+        auto r = conn::s3::driver_t::make(resource, valid_params(resource, ""), kConnectTimeout);
         REQUIRE(r.has_error());
         CHECK(r.error().type == core::error_code_t::invalid_parameter);
         CHECK_THAT(std::string{r.error().what.c_str()}, ContainsSubstring("alias"));
@@ -73,8 +82,7 @@ TEST_CASE("s3 connector: add_credentials rejects an empty alias or empty keys as
     SECTION("empty access_key") {
         auto params = valid_params(resource, "rustfs");
         params.access_key.clear();
-        auto r = settled(
-            actor_zeta::send(s3->address(), &conn::s3::ConnectorManager::add_credentials, id, std::move(params)));
+        auto r = conn::s3::driver_t::make(resource, params, kConnectTimeout);
         REQUIRE(r.has_error());
         CHECK(r.error().type == core::error_code_t::invalid_parameter);
         CHECK_THAT(std::string{r.error().what.c_str()}, ContainsSubstring("rustfs"));
@@ -83,198 +91,111 @@ TEST_CASE("s3 connector: add_credentials rejects an empty alias or empty keys as
     SECTION("empty secret_key") {
         auto params = valid_params(resource, "rustfs");
         params.secret_key.clear();
-        auto r = settled(
-            actor_zeta::send(s3->address(), &conn::s3::ConnectorManager::add_credentials, id, std::move(params)));
+        auto r = conn::s3::driver_t::make(resource, params, kConnectTimeout);
         REQUIRE(r.has_error());
         CHECK(r.error().type == core::error_code_t::invalid_parameter);
     }
 
-    SECTION("a rejected alias is not stored") {
-        auto params = valid_params(resource, "rustfs");
-        params.secret_key.clear();
-        auto rejected = settled(
-            actor_zeta::send(s3->address(), &conn::s3::ConnectorManager::add_credentials, id, std::move(params)));
-        REQUIRE(rejected.has_error());
-
-        auto r = settled(actor_zeta::send(s3->address(),
-                                          &conn::s3::ConnectorManager::open_output,
-                                          id,
-                                          std::string{"rustfs"},
-                                          std::string{"bucket/key.csv"}));
-        REQUIRE(r.has_error());
-        CHECK(r.error().type == core::error_code_t::do_not_exists);
-    }
-
-    SECTION("a complete credential set is stored and can be re-registered") {
-        auto first = settled(actor_zeta::send(s3->address(),
-                                              &conn::s3::ConnectorManager::add_credentials,
-                                              id,
-                                              valid_params(resource, "rustfs")));
-        REQUIRE_FALSE(first.has_error());
-        CHECK(first.value());
-        // Builds and caches the alias's filesystem.
-        auto before = settled(actor_zeta::send(s3->address(),
-                                               &conn::s3::ConnectorManager::open_input,
-                                               id,
-                                               std::string{"rustfs"},
-                                               std::string{"bucket-without-key"}));
-        REQUIRE(before.has_error());
-        CHECK(before.error().type == core::error_code_t::io_error);
-
-        auto again = settled(actor_zeta::send(s3->address(),
-                                              &conn::s3::ConnectorManager::add_credentials,
-                                              id,
-                                              valid_params(resource, "rustfs")));
+    SECTION("a second registration of an alias is invalid_parameter") {
+        auto pools = pools_with(resource, "rustfs");
+        auto again = conn::s3::driver_t::make(resource, valid_params(resource, "rustfs"), kConnectTimeout);
         REQUIRE_FALSE(again.has_error());
-        CHECK(again.value());
-        // The re-registration dropped the cached filesystem; the next call builds a
-        // fresh one from the new set and answers the same verdict.
-        auto after = settled(actor_zeta::send(s3->address(),
-                                              &conn::s3::ConnectorManager::open_input,
-                                              id,
-                                              std::string{"rustfs"},
-                                              std::string{"bucket-without-key"}));
-        REQUIRE(after.has_error());
-        CHECK(after.error().type == core::error_code_t::io_error);
+        auto added = pools->add_s3("rustfs", std::move(again.value()), {});
+        REQUIRE(added.contains_error());
+        CHECK(added.type == core::error_code_t::invalid_parameter);
     }
 }
 
-TEST_CASE("s3 connector: list / open_input / open_output on an unknown alias fail with do_not_exists") {
+TEST_CASE("s3 transfers: load / export on an unknown alias fail with do_not_exists") {
     auto* resource = std::pmr::new_delete_resource();
-    auto s3 = actor_zeta::spawn<conn::s3::ConnectorManager>(resource);
-    const auto id = session_id().hash();
+    conn::transfer_pools_t pools(resource);
 
-    auto listed = settled(actor_zeta::send(s3->address(),
-                                           &conn::s3::ConnectorManager::list,
-                                           id,
-                                           std::string{"nobody"},
-                                           std::string{"bucket/prefix"}));
-    REQUIRE(listed.has_error());
-    CHECK(listed.error().type == core::error_code_t::do_not_exists);
-    CHECK_THAT(std::string{listed.error().what.c_str()}, ContainsSubstring("nobody"));
-
-    auto input = settled(actor_zeta::send(s3->address(),
-                                          &conn::s3::ConnectorManager::open_input,
-                                          id,
-                                          std::string{"nobody"},
-                                          std::string{"bucket/key.parquet"}));
+    auto input = drive(resource, pools.s3("open_input", "nobody", conn::load_t{"bucket/key.parquet", ""}));
     REQUIRE(input.has_error());
     CHECK(input.error().type == core::error_code_t::do_not_exists);
     CHECK_THAT(std::string{input.error().what.c_str()}, ContainsSubstring("nobody"));
     CHECK_THAT(std::string{input.error().what.c_str()}, ContainsSubstring("open_input"));
 
-    auto output = settled(actor_zeta::send(s3->address(),
-                                           &conn::s3::ConnectorManager::open_output,
-                                           id,
-                                           std::string{"nobody"},
-                                           std::string{"bucket/key.csv"}));
+    auto output = drive(resource,
+                        pools.s3("open_output",
+                                 "nobody",
+                                 conn::export_t{"bucket/key.csv", conn::file::FileFormat::CSV, empty_result(resource)}));
     REQUIRE(output.has_error());
     CHECK(output.error().type == core::error_code_t::do_not_exists);
     CHECK_THAT(std::string{output.error().what.c_str()}, ContainsSubstring("open_output"));
 }
 
-TEST_CASE("s3 connector: a path Arrow refuses is io_error before any request") {
+TEST_CASE("s3 driver: a path Arrow refuses is io_error before any request") {
     auto* resource = std::pmr::new_delete_resource();
-    auto s3 = actor_zeta::spawn<conn::s3::ConnectorManager>(resource);
-    const auto id = session_id().hash();
+    auto pools = pools_with(resource, "rustfs");
 
-    auto stored = settled(actor_zeta::send(s3->address(),
-                                           &conn::s3::ConnectorManager::add_credentials,
-                                           id,
-                                           valid_params(resource, "rustfs")));
-    REQUIRE_FALSE(stored.has_error());
-
-    SECTION("open_input of a bucket-only path (not an object)") {
-        auto r = settled(actor_zeta::send(s3->address(),
-                                          &conn::s3::ConnectorManager::open_input,
-                                          id,
-                                          std::string{"rustfs"},
-                                          std::string{"bucket-without-key"}));
+    SECTION("load of a bucket-only path (not an object)") {
+        auto r = drive(resource, pools->s3("open_input", "rustfs", conn::load_t{"bucket-without-key", "csv"}));
         REQUIRE(r.has_error());
         CHECK(r.error().type == core::error_code_t::io_error);
         CHECK_THAT(std::string{r.error().what.c_str()}, ContainsSubstring("open_input"));
     }
 
-    SECTION("open_output of a bucket-only path (not an object)") {
-        auto r = settled(actor_zeta::send(s3->address(),
-                                          &conn::s3::ConnectorManager::open_output,
-                                          id,
-                                          std::string{"rustfs"},
-                                          std::string{"bucket-without-key"}));
+    SECTION("export to a bucket-only path (not an object)") {
+        auto r = drive(
+            resource,
+            pools->s3("open_output",
+                      "rustfs",
+                      conn::export_t{"bucket-without-key", conn::file::FileFormat::CSV, empty_result(resource)}));
         REQUIRE(r.has_error());
         CHECK(r.error().type == core::error_code_t::io_error);
         CHECK_THAT(std::string{r.error().what.c_str()}, ContainsSubstring("open_output"));
     }
 }
 
-TEST_CASE("s3 connector: an output stream aborted before any write sends nothing") {
-    // The endpoint refuses every connection, so open + abort both succeeding proves neither went
-    // to the network: the multipart upload is created on the first write only.
+TEST_CASE("s3 driver: an export that fails before any write sends nothing") {
+    // The endpoint refuses every connection. The export opens its stream, the write refuses the
+    // format and the stream is aborted: had the open or the abort gone to the network, the answer
+    // would be the endpoint's io_error. The multipart upload is created on the first write only.
     auto* resource = std::pmr::new_delete_resource();
-    auto s3 = actor_zeta::spawn<conn::s3::ConnectorManager>(resource);
-    const auto id = session_id().hash();
+    auto pools = pools_with(resource, "minio");
 
-    auto stored = settled(actor_zeta::send(s3->address(),
-                                           &conn::s3::ConnectorManager::add_credentials,
-                                           id,
-                                           valid_params(resource, "minio")));
-    REQUIRE_FALSE(stored.has_error());
-
-    auto opened = settled(actor_zeta::send(s3->address(),
-                                           &conn::s3::ConnectorManager::open_output,
-                                           id,
-                                           std::string{"minio"},
-                                           std::string{"bucket/out.csv"}));
-    REQUIRE_FALSE(opened.has_error());
-    REQUIRE(opened.value() != nullptr);
-    auto aborted = opened.value()->Abort();
-    INFO("Abort: " << aborted.ToString());
-    CHECK(aborted.ok());
-    CHECK(opened.value()->closed());
+    auto r = drive(resource,
+                   pools->s3("open_output",
+                             "minio",
+                             conn::export_t{"bucket/out.csv", conn::file::FileFormat::Unknown, empty_result(resource)}));
+    REQUIRE(r.has_error());
+    CHECK(r.error().type == core::error_code_t::invalid_parameter);
 }
 
-TEST_CASE("S3Manager: forwards the connector's error code instead of flattening it to other_error") {
-    auto* resource = std::pmr::new_delete_resource();
-    auto s3 = actor_zeta::spawn<conn::s3::ConnectorManager>(resource);
-    // No file manager is reachable: every case below fails before the
-    // integration actor would forward to it.
-    auto mgr = actor_zeta::spawn<db::S3Manager>(resource, s3->address(), actor_zeta::address_t::empty_address());
-    const auto id = session_id().hash();
+TEST_CASE("s3 statements: the Worker forwards the transfer's error code instead of flattening it") {
+    otterstax::test::with_scheduler_stack("/tmp/test_s3_errors_worker_otb", [](const otterstax::test::scheduler_stack& s) {
+        session_hash_t id = 9800;
 
-    SECTION("download on an unknown alias is do_not_exists and names the alias") {
-        auto r = settled(actor_zeta::send(mgr->address(),
-                                          &db::S3Manager::download,
-                                          id,
-                                          std::string{"nobody"},
-                                          std::string{"bucket/key.parquet"},
-                                          std::string{"db"},
-                                          std::string{"tbl"},
-                                          std::string{}));
-        REQUIRE(r.has_error());
-        CHECK(r.error().type == core::error_code_t::do_not_exists);
-        CHECK_THAT(std::string{r.error().what.c_str()}, ContainsSubstring("nobody"));
-        CHECK_THAT(std::string{r.error().what.c_str()}, ContainsSubstring("S3Manager::download"));
-    }
+        SECTION("CREATE EXTERNAL TABLE on an unknown alias is do_not_exists and names the alias") {
+            auto r = otterstax::test::run_scheduler_sql_payload(
+                s,
+                id++,
+                "CREATE EXTERNAL TABLE db.tbl WITH (s3_alias = 'nobody', location = 's3://bucket/key.parquet', "
+                "format = 'parquet');");
+            REQUIRE(r.has_error());
+            CHECK(r.error().type == core::error_code_t::do_not_exists);
+            CHECK_THAT(std::string{r.error().what.c_str()}, ContainsSubstring("nobody"));
+            CHECK_THAT(std::string{r.error().what.c_str()}, ContainsSubstring("CREATE EXTERNAL TABLE"));
+        }
 
-    SECTION("ls on an unknown alias is do_not_exists") {
-        auto r = settled(actor_zeta::send(mgr->address(),
-                                          &db::S3Manager::ls,
-                                          id,
-                                          std::string{"nobody"},
-                                          std::string{"bucket/prefix"}));
-        REQUIRE(r.has_error());
-        CHECK(r.error().type == core::error_code_t::do_not_exists);
-    }
+        SECTION("COPY ... TO an unknown alias is do_not_exists before the query runs") {
+            auto r = otterstax::test::run_scheduler_sql_payload(
+                s,
+                id++,
+                "COPY (SELECT * FROM nodb.notable) TO 's3://bucket/out.csv' WITH (s3_alias = 'nobody', format = 'csv');");
+            REQUIRE(r.has_error());
+            CHECK(r.error().type == core::error_code_t::do_not_exists);
+            CHECK_THAT(std::string{r.error().what.c_str()}, ContainsSubstring("open_output"));
+        }
 
-    SECTION("upload with a null statement is invalid_parameter") {
-        auto r = settled(actor_zeta::send(mgr->address(),
-                                          &db::S3Manager::upload,
-                                          id,
-                                          std::string{"nobody"},
-                                          std::string{"bucket/out.csv"},
-                                          OtterbrixStatementPtr{},
-                                          std::string{}));
-        REQUIRE(r.has_error());
-        CHECK(r.error().type == core::error_code_t::invalid_parameter);
-    }
+        SECTION("COPY ... TO an extension-less key without a format is invalid_parameter") {
+            auto r = otterstax::test::run_scheduler_sql_payload(
+                s,
+                id++,
+                "COPY (SELECT 1) TO 's3://bucket/out' WITH (s3_alias = 'nobody');");
+            REQUIRE(r.has_error());
+            CHECK(r.error().type == core::error_code_t::invalid_parameter);
+        }
+    });
 }

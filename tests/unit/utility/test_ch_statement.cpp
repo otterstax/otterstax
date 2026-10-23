@@ -6,7 +6,7 @@
 // through the QueryEvents base, the only seam the driver offers without a
 // server.
 
-#include "connectors/clickhouse/connector.hpp"
+#include "connectors/clickhouse/driver.hpp"
 
 #include <catch2/catch_all.hpp>
 

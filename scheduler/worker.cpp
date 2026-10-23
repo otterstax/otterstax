@@ -4,13 +4,10 @@
 #include "worker.hpp"
 
 #include "catalog/catalog_manager.hpp"
-#include "connectors/file/manager.hpp"
-#include "integration/clickhouse/connection_manager.hpp"
+#include "connectors/common/transfer.hpp"
+#include "integration/backends.hpp"
 #include "integration/kafka/kafka_manager.hpp"
 #include "integration/otterbrix/otterbrix_manager.hpp"
-#include "integration/postgresql/connection_manager.hpp"
-#include "integration/s3/s3_manager.hpp"
-#include "integration/sql/connection_manager.hpp"
 #include "otterbrix/operators/schema_probe.hpp"
 #include "otterbrix/parser/grammar_extention/external_node.hpp"
 #include "otterbrix/parser/grammar_extension/kafka/kafka_node.hpp"
@@ -21,11 +18,15 @@
 #include <components/expressions/scalar_expression.hpp>
 #include <components/logical_plan/node_aggregate.hpp>
 #include <components/logical_plan/node_create_database.hpp>
+#include <components/logical_plan/node_data.hpp>
 #include <components/logical_plan/node_drop.hpp>
 
 #include <cassert>
 #include <deque>
 #include <exception>
+#include <memory>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -336,30 +337,25 @@ namespace {
 } // namespace
 
 Worker::Worker(std::pmr::memory_resource* res,
+               actor_zeta::scheduler_raw scheduler,
                std::size_t self_index,
                std::size_t worker_count,
                std::unique_ptr<IParser> parser,
-               actor_zeta::address_t sql_connection_manager,
-               actor_zeta::address_t pg_connection_manager,
-               actor_zeta::address_t ch_connection_manager,
+               db::backend_registry_t& backends,
                actor_zeta::address_t otterbrix_manager,
                actor_zeta::address_t catalog_manager,
-               actor_zeta::address_t s3_manager,
-               actor_zeta::address_t file_manager,
                actor_zeta::address_t kafka_manager)
     : actor_zeta::basic_actor<Worker>(res)
     , resource_(res)
+    , parking_(this, scheduler)
     , self_index_(self_index)
     , worker_count_(worker_count)
     , log_(get_logger(logger_tag::SCHEDULER))
     , parser_(std::move(parser))
-    , sql_connection_manager_(sql_connection_manager)
-    , pg_connection_manager_(pg_connection_manager)
-    , ch_connection_manager_(ch_connection_manager)
+    , backends_(std::make_unique<db::backend_set_t>(res, backends, &parking_))
     , otterbrix_manager_(otterbrix_manager)
     , catalog_manager_(catalog_manager)
-    , s3_manager_(s3_manager)
-    , file_manager_(file_manager)
+    , transfers_(&backends.transfers)
     , kafka_manager_(kafka_manager)
     , metadata_map_(res) {
     assert(log_.is_valid());
@@ -367,6 +363,30 @@ Worker::Worker(std::pmr::memory_resource* res,
     assert(parser_ != nullptr);
     assert(worker_count_ > 0);
     assert(self_index_ < worker_count_);
+}
+
+Worker::~Worker() = default;
+
+actor_zeta::scheduler::resume_info Worker::resume(std::size_t max_throughput) noexcept {
+    if (parking_.park()) {
+        return actor_zeta::scheduler::resume_info(actor_zeta::scheduler::resume_result::awaiting, 0);
+    }
+    return actor_zeta::basic_actor<Worker>::resume(max_throughput);
+}
+
+template<typename Submit>
+actor_zeta::unique_future<conn::transfer_outcome_t> Worker::run_transfer(Submit submit) {
+    auto watched = conn::watch(&parking_);
+    auto transfer = submit(std::move(watched.waker));
+    conn::suspended_on_t suspended(&parking_, watched.ticket, transfer.is_ready());
+    auto outcome = co_await std::move(transfer);
+    co_return outcome;
+}
+
+actor_zeta::unique_future<void> Worker::wake() {
+    OTX_ZONE_N("Worker::wake"); // no co_await: the zone ends on the thread that began it
+    parking_.woken();           // the next waker that finds the Worker not parked sends another
+    co_return;
 }
 
 actor_zeta::behavior_t Worker::behavior(actor_zeta::mailbox::message* msg) {
@@ -385,6 +405,8 @@ actor_zeta::behavior_t Worker::behavior(actor_zeta::mailbox::message* msg) {
         co_await actor_zeta::dispatch(this, &Worker::execute_plan, msg);
     } else if (cmd == actor_zeta::msg_id<Worker, &Worker::prepare_plan>) {
         co_await actor_zeta::dispatch(this, &Worker::prepare_plan, msg);
+    } else if (cmd == actor_zeta::msg_id<Worker, &Worker::wake>) {
+        co_await actor_zeta::dispatch(this, &Worker::wake, msg);
     }
 }
 
@@ -789,16 +811,15 @@ actor_zeta::unique_future<Worker::session_result> Worker::describe_parsed(sessio
     // collection is missing in catalog" and the prepare fails outright.
     //
     // So every backend that owns a slot of this statement describes its own, in
-    // the order run_pipeline executes them: each manager probes the slot with
+    // the order run_pipeline executes them: each backend probes the slot with
     // the statement execute would run and fills that stub's schema with what the
-    // backend answers, decoded exactly as execute decodes its rows. A manager
+    // backend answers, decoded exactly as execute decodes its rows. A backend
     // fills the stubs its node_backend_types entry names and leaves every other
     // slot alone, which is what lets each participant of a Mixed statement
     // describe its own share; a statement whose slots carry no stub (a DML, a
-    // JOIN root over plain tables) comes back with nothing probed. The sends
-    // cost no thread hop — these managers run a handler to completion on the
-    // sender's thread — so a described statement pays one backend round-trip per
-    // stub.
+    // JOIN root over plain tables) comes back with nothing probed. The probes run
+    // on the backend's connection pool while this Worker is suspended, so a
+    // described statement pays one backend round-trip per stub.
     //
     // A parameterized statement is out of the described scope for now — this is
     // a narrower scope, not a fallback: the binder holds every parameter, the
@@ -807,44 +828,11 @@ actor_zeta::unique_future<Worker::session_result> Worker::describe_parsed(sessio
     // separately. Until that policy lands such a statement keeps the schema the
     // catalog put on the stub, exactly as it did before this routing.
     if (data->otterbrix_params->parameters_count == 0) {
-        const auto owns_a_slot = [&data](backend_type_t backend) {
-            if (data->backend_type != backend_type_t::Mixed) {
-                return data->backend_type == backend;
-            }
-            for (const auto& node_backend : data->node_backend_types) {
-                if (node_backend.second == backend) {
-                    return true;
-                }
-            }
-            return false;
-        };
-        if (owns_a_slot(backend_type_t::MySQL)) {
-            auto [ns_my, my_future] =
-                actor_zeta::send(sql_connection_manager_, &db::MySQLManager::describe, id, std::move(data));
-            auto described = co_await std::move(my_future);
-            if (described.has_error()) {
-                co_return forward_error(resource(), described.error(), "");
-            }
-            data = std::move(described.value());
+        auto described = co_await backends_->describe(id, std::move(data));
+        if (described.has_error()) {
+            co_return forward_error(resource(), described.error(), "");
         }
-        if (owns_a_slot(backend_type_t::PostgreSQL)) {
-            auto [ns_pg, pg_future] =
-                actor_zeta::send(pg_connection_manager_, &db::PostgressManager::describe, id, std::move(data));
-            auto described = co_await std::move(pg_future);
-            if (described.has_error()) {
-                co_return forward_error(resource(), described.error(), "");
-            }
-            data = std::move(described.value());
-        }
-        if (owns_a_slot(backend_type_t::ClickHouse)) {
-            auto [ns_ch, ch_future] =
-                actor_zeta::send(ch_connection_manager_, &db::ClickhouseManager::describe, id, std::move(data));
-            auto described = co_await std::move(ch_future);
-            if (described.has_error()) {
-                co_return forward_error(resource(), described.error(), "");
-            }
-            data = std::move(described.value());
-        }
+        data = std::move(described.value());
     }
 
     // Extension roots were filtered above, so an `unused` schema root here is
@@ -937,48 +925,20 @@ actor_zeta::unique_future<Worker::session_result> Worker::prepare_plan(session_h
 
 actor_zeta::unique_future<Worker::session_result>
 Worker::run_pipeline(session_hash_t id, ParsedQueryDataPtr data_ptr, backend_type_t backend) {
-    if (backend == backend_type_t::MySQL || backend == backend_type_t::Mixed) {
-        auto [ns_sql, sql_future] =
-            actor_zeta::send(sql_connection_manager_, &db::MySQLManager::execute, id, std::move(data_ptr));
-        auto sql_result = co_await std::move(sql_future);
-        if (sql_result.has_error()) {
-            co_return forward_error(resource(), sql_result.error(), "");
+    // The remote slots first: one backend's, or for a Mixed statement every backend's side
+    // by side, batch by batch, each running only the slots node_backend_types gives it.
+    if (backend != backend_type_t::Otterbrix) {
+        auto remote = co_await backends_->execute(id, std::move(data_ptr), backend);
+        if (remote.has_error()) {
+            co_return forward_error(resource(), remote.error(), "");
         }
-        data_ptr = std::move(sql_result.value());
+        data_ptr = std::move(remote.value());
+    }
 
-        if (backend == backend_type_t::Mixed) {
-            auto [ns_pg, pg_future] =
-                actor_zeta::send(pg_connection_manager_, &db::PostgressManager::execute, id, std::move(data_ptr));
-            auto pg_result = co_await std::move(pg_future);
-            if (pg_result.has_error()) {
-                co_return forward_error(resource(), pg_result.error(), "");
-            }
-            data_ptr = std::move(pg_result.value());
-
-            auto [ns_ch, ch_future] =
-                actor_zeta::send(ch_connection_manager_, &db::ClickhouseManager::execute, id, std::move(data_ptr));
-            auto ch_result = co_await std::move(ch_future);
-            if (ch_result.has_error()) {
-                co_return forward_error(resource(), ch_result.error(), "");
-            }
-            data_ptr = std::move(ch_result.value());
-        }
-    } else if (backend == backend_type_t::PostgreSQL) {
-        auto [ns_pg, pg_future] =
-            actor_zeta::send(pg_connection_manager_, &db::PostgressManager::execute, id, std::move(data_ptr));
-        auto pg_result = co_await std::move(pg_future);
-        if (pg_result.has_error()) {
-            co_return forward_error(resource(), pg_result.error(), "");
-        }
-        data_ptr = std::move(pg_result.value());
-    } else if (backend == backend_type_t::ClickHouse) {
-        auto [ns_ch, ch_future] =
-            actor_zeta::send(ch_connection_manager_, &db::ClickhouseManager::execute, id, std::move(data_ptr));
-        auto ch_result = co_await std::move(ch_future);
-        if (ch_result.has_error()) {
-            co_return forward_error(resource(), ch_result.error(), "");
-        }
-        data_ptr = std::move(ch_result.value());
+    // A statement one backend answered whole skips the engine: a run of its plan would
+    // only hand the same chunks back, after a dispatcher round trip.
+    if (auto answered = take_backend_result(id, *data_ptr)) {
+        co_return std::move(*answered);
     }
 
     auto [ns_ot, ot_future] = actor_zeta::send(otterbrix_manager_,
@@ -1020,10 +980,11 @@ actor_zeta::unique_future<core::error_t> Worker::guard_database_ddl(const Parsed
 }
 
 // ─── External-table dispatch (CREATE EXTERNAL TABLE / COPY ... TO) ──────────
-// Both forms parse into an otterstax::external::external_node_t. The s3 / file
-// managers do the actual ingestion or export — neither lands on the regular
-// backend / otterbrix execute path. DDL and COPY produce no rows, so success
-// returns an empty session_payload.
+// Both forms parse into an otterstax::external::external_node_t. A transfer pool
+// moves the bytes — the S3 alias's, or the local-file one — on its own threads
+// while this Worker is suspended; the engine calls stay here. Neither lands on
+// the regular backend path. DDL and COPY produce no rows, so success returns an
+// empty session_payload.
 
 actor_zeta::unique_future<Worker::session_result>
 Worker::handle_external_statement(session_hash_t id, const otterstax::external::external_node_t& ext) {
@@ -1036,40 +997,37 @@ Worker::handle_external_statement(session_hash_t id, const otterstax::external::
 
 actor_zeta::unique_future<Worker::session_result>
 Worker::load_external_table(session_hash_t id, const otterstax::external::external_node_t& ext) {
-    if (ext.is_s3()) {
-        auto [ns_s3, fut] = actor_zeta::send(s3_manager_,
-                                             &db::S3Manager::download,
-                                             id,
-                                             ext.s3_alias(),
-                                             ext.object_path(),
-                                             ext.database(),
-                                             ext.table(),
-                                             ext.format());
-        auto r = co_await std::move(fut);
-        if (r.has_error()) {
-            co_return forward_error(resource(), r.error(), "CREATE EXTERNAL TABLE failed: ");
-        }
-        co_return session_payload{resource()};
+    std::string database = ext.database();
+    std::string table = ext.table();
+    auto transfer = run_transfer([&](conn::waker_t waker) {
+        OTX_ZONE_N("Worker::load_external_table");
+        // An empty format lets the location's extension decide.
+        conn::load_t job{ext.object_path(), ext.format()};
+        return ext.is_s3() ? transfers_->s3("open_input", ext.s3_alias(), std::move(job), std::move(waker))
+                           : transfers_->files("load", std::move(job), std::move(waker));
+    });
+    auto loaded = co_await std::move(transfer);
+    if (loaded.has_error()) {
+        co_return forward_error(resource(), loaded.error(), "CREATE EXTERNAL TABLE failed: ");
+    }
+    if (!loaded.value().loaded) {
+        co_return make_error(resource(), error_code_t::other_error, "CREATE EXTERNAL TABLE failed: the load answered no rows");
     }
 
-    conn::file::FileAddParams params;
-    {
-        OTX_ZONE_N("Worker::load_external_table");
-        params.database = ext.database();
-        params.table = ext.table();
-        params.path = ext.location();
-        params.format = ext.format().empty() ? std::string{"auto"} : ext.format();
+    auto [ns_ot, created_future] = actor_zeta::send(otterbrix_manager_,
+                                                    &db::OtterbrixManager::create_table,
+                                                    id,
+                                                    std::move(database),
+                                                    std::move(table),
+                                                    std::move(*loaded.value().loaded));
+    auto created = co_await std::move(created_future);
+    if (created.has_error()) {
+        co_return forward_error(resource(), created.error(), "CREATE EXTERNAL TABLE failed: ");
     }
-    auto [ns_file, fut] =
-        actor_zeta::send(file_manager_, &conn::file::FileManager::add_file, id, std::move(params));
-    auto r = co_await std::move(fut);
-    if (r.has_error()) {
-        co_return forward_error(resource(), r.error(), "CREATE EXTERNAL TABLE failed: ");
-    }
-    if (!r.value()) {
+    if (!created.value()) {
         co_return make_error(resource(),
                              error_code_t::io_error,
-                             "CREATE EXTERNAL TABLE failed: add_file returned false");
+                             "CREATE EXTERNAL TABLE failed: create_table returned false");
     }
     co_return session_payload{resource()};
 }
@@ -1078,7 +1036,9 @@ actor_zeta::unique_future<Worker::session_result>
 Worker::copy_to(session_hash_t id, const otterstax::external::external_node_t& ext) {
     // The inner query is re-parsed here; its result is what gets exported.
     OtterbrixStatementPtr statement;
-    conn::file::FileFormat fmt = conn::file::FileFormat::Unknown;
+    conn::export_t job;
+    const bool to_s3 = ext.is_s3();
+    std::string alias = ext.s3_alias();
     {
         OTX_ZONE_N("Worker::copy_to");
         if (ext.inner_sql().empty()) {
@@ -1090,39 +1050,40 @@ Worker::copy_to(session_hash_t id, const otterstax::external::external_node_t& e
         }
         statement = std::move(inner.value()->otterbrix_params);
 
-        if (!ext.is_s3()) {
-            fmt = conn::file::resolve_format(ext.format(), ext.location());
-            if (fmt == conn::file::FileFormat::Unknown) {
-                co_return make_error(resource(),
-                                     error_code_t::invalid_parameter,
-                                     "COPY ... TO: cannot determine file format for '" + ext.location() + "'");
-            }
+        // WITH (format = ...) wins; otherwise the location's extension names it.
+        job.location = ext.object_path();
+        job.format = conn::file::resolve_format(ext.format(), ext.location());
+        if (job.format == conn::file::FileFormat::Unknown) {
+            co_return make_error(resource(),
+                                 error_code_t::invalid_parameter,
+                                 "COPY ... TO: cannot determine file format for '" + ext.location() + "'");
+        }
+        // Refused before the query runs: there is nowhere to write its result.
+        if (to_s3 && !transfers_->has_s3(alias)) {
+            co_return make_error(resource(),
+                                 error_code_t::do_not_exists,
+                                 "COPY ... TO failed: open_output: unknown alias '" + alias + "'");
         }
     }
 
-    if (ext.is_s3()) {
-        auto [ns_s3, fut] = actor_zeta::send(s3_manager_,
-                                             &db::S3Manager::upload,
-                                             id,
-                                             ext.s3_alias(),
-                                             ext.object_path(),
-                                             std::move(statement),
-                                             ext.format());
-        auto r = co_await std::move(fut);
-        if (r.has_error()) {
-            co_return forward_error(resource(), r.error(), "COPY ... TO failed: ");
+    auto [ns_ot, ot_future] = actor_zeta::send(otterbrix_manager_, &db::OtterbrixManager::execute, id, std::move(statement));
+    auto cursor = co_await std::move(ot_future);
+    if (!cursor || !cursor->is_success()) {
+        // The engine's verdict is kept: its code and message. A cursor with no
+        // error at all is an engine contract violation, reported as other_error.
+        if (cursor && cursor->is_error()) {
+            co_return forward_error(resource(), cursor->get_error(), "COPY ... TO failed: execute failed: ");
         }
-        co_return session_payload{resource()};
+        co_return make_error(resource(), error_code_t::other_error, "COPY ... TO failed: execute failed: cursor error");
     }
 
-    conn::file::FileMetadata meta;
-    meta.statement = std::move(statement);
-    meta.path = ext.location();
-    meta.format = fmt;
-    auto [ns_file, fut] = actor_zeta::send(file_manager_, &conn::file::FileManager::dump_file, id, std::move(meta));
-    auto r = co_await std::move(fut);
-    if (r.has_error()) {
-        co_return forward_error(resource(), r.error(), "COPY ... TO failed: ");
+    job.result = std::move(cursor);
+    auto written = co_await run_transfer([&](conn::waker_t waker) {
+        return to_s3 ? transfers_->s3("open_output", alias, std::move(job), std::move(waker))
+                     : transfers_->files("export", std::move(job), std::move(waker));
+    });
+    if (written.has_error()) {
+        co_return forward_error(resource(), written.error(), "COPY ... TO failed: ");
     }
     co_return session_payload{resource()};
 }
@@ -1186,6 +1147,28 @@ Worker::session_result Worker::take_payload(session_hash_t id, cursor::cursor_t&
         std::exchange(cursor.chunks(), std::pmr::vector<components::vector::data_chunk_t>{resource()}),
         0,
         meta.tag};
+}
+
+std::optional<Worker::session_result> Worker::take_backend_result(session_hash_t id, ParsedQueryData& data) {
+    OTX_ZONE_N("Worker::take_backend_result");
+    auto& statement = *data.otterbrix_params;
+    // A fully-remote DML answers from the count captured at substitution time, in the
+    // carrier shape OtterbrixManager::execute builds for it.
+    if (statement.remote_affected_rows != OtterbrixStatement::no_remote_dml) {
+        return std::nullopt;
+    }
+    auto* node = plan_statement_node(statement.node.get());
+    if (node == nullptr || node->type() != logical_plan::node_type::data_t) {
+        return std::nullopt;
+    }
+    // Already in engine-sized chunks (tsl::split_to_capacity). A column-less result keeps
+    // the engine path: every frontend reads no columns as an affected count.
+    auto& chunks = static_cast<logical_plan::node_data_t&>(*node).chunks();
+    if (chunks.empty() || chunks.front().column_count() == 0) {
+        return std::nullopt;
+    }
+    auto cursor = cursor::make_cursor(resource(), std::move(chunks));
+    return take_payload(id, *cursor);
 }
 
 void Worker::update_metadata(session_hash_t id,

@@ -2,7 +2,7 @@
 // Copyright 2025-2026  OtterStax
 //
 // otterstax::parse_port — the port field of a connection descriptor is a string
-// in config.yaml; the three ConnectorManagers turn it into a uint16_t. A malformed
+// in config.yaml; the config layer and register_connections turn it into a uint16_t. A malformed
 // value must come back as invalid_parameter, never as a truncated number and
 // never as an exception that would abort startup.
 

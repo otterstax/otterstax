@@ -6,21 +6,17 @@
 // backend classification of DDL targets, and the discovery error paths that
 // must not register a half-known table.
 #include "catalog/catalog_manager.hpp"
-#include "integration/clickhouse/connection_manager.hpp"
+#include "connectors/clickhouse/driver.hpp"
+#include "integration/backends.hpp"
 #include "integration/otterbrix/otterbrix_manager.hpp"
-#include "integration/postgresql/connection_manager.hpp"
-#include "integration/sql/connection_manager.hpp"
 #include "test_helpers.hpp"
 
 #include "../mock/aliases.hpp"
-#include "../mock/ch_db_connector.hpp"
 #include "../mock/mock_config.hpp"
+#include "../mock/mock_driver.hpp"
 #include "../mock/otterbrix.hpp"
-#include "../mock/pg_db_connector.hpp"
-#include "../mock/sql_db_connector.hpp"
 
 #include <actor-zeta.hpp>
-#include <boost/asio.hpp>
 #include <clickhouse/columns/numeric.h>
 #include <components/logical_plan/node_drop.hpp>
 #include <core/result_wrapper.hpp>
@@ -49,179 +45,102 @@ namespace {
         return aliases;
     }
 
-    // ClickHouse connector whose schema-discovery overload replays a fixed set of
-    // blocks — an empty vector reproduces a probe that produced no header block.
-    class ch_replay_connector final : public ch::IConnector {
-    public:
-        ch_replay_connector(ch::connect_params params, std::string alias, std::vector<clickhouse::Block> blocks)
-            : params_(std::move(params))
-            , alias_(std::move(alias))
-            , blocks_(std::move(blocks)) {}
+    using otterstax::test::mock_backends;
+    using otterstax::test::scripted_driver_t;
 
-        ch::Status status() const noexcept override { return ch::Status::Connected; }
-        ch::connect_params params() const noexcept override { return params_; }
-        void close() override {}
-        core::error_t connect() override { return core::error_t::no_error(); }
-        bool isConnected() override { return true; }
-        core::error_t tryReconnect() override { return core::error_t::no_error(); }
-        bool isClosed() const noexcept override { return false; }
-        std::string alias() const noexcept override { return alias_; }
+    using ch_driver_factory = std::unique_ptr<conn::IDriver> (*)(std::pmr::memory_resource*);
 
-        boost::asio::awaitable<core::result_wrapper_t<std::unique_ptr<components::vector::data_chunk_t>>> runQuery(
-            std::string_view,
-            otterstax::function_ref_t<std::unique_ptr<components::vector::data_chunk_t>(const ch::select_result_t&)>)
-            override {
-            co_return std::unique_ptr<components::vector::data_chunk_t>{};
-        }
-
-        boost::asio::awaitable<core::result_wrapper_t<int64_t>>
-        runQuery(std::string_view, otterstax::function_ref_t<int64_t(const ch::select_result_t&)>) override {
-            co_return int64_t{0};
-        }
-
-        // Answers every metadata query (named types and the schema probe)
-        // with the same replayed blocks.
-        boost::asio::awaitable<core::error_t>
-        runQuery(std::string_view,
-                 otterstax::function_ref_t<otterstax::asio_error_t(const ch::select_result_t&)> handler) override {
-            ch::select_result_t replayed;
-            replayed.blocks = blocks_;
-            co_return otterstax::as_query_result<otterstax::asio_error_t>(handler(replayed));
-        }
-
-    private:
-        ch::connect_params params_;
-        std::string alias_;
-        std::vector<clickhouse::Block> blocks_;
-    };
-
-    std::unique_ptr<ch::IConnector>
-    ch_empty_probe_factory(std::pmr::memory_resource*, ch::connect_params params, std::string alias) {
-        return std::make_unique<ch_replay_connector>(std::move(params),
-                                                     std::move(alias),
-                                                     std::vector<clickhouse::Block>{});
+    // A ClickHouse driver whose discovery statements (named types and the schema
+    // probe) are all answered with the same blocks — an empty vector reproduces a
+    // probe that produced no header block — decoded by the driver's own decode.
+    std::unique_ptr<conn::IDriver> ch_replay_driver(std::pmr::memory_resource* resource,
+                                                    std::vector<clickhouse::Block> blocks) {
+        return std::make_unique<scripted_driver_t>(
+            [](const conn::statement_t&) -> conn::statement_outcome_t { return conn::statement_result_t{}; },
+            [resource, blocks = std::move(blocks)](const conn::statement_t& statement) {
+                ch::select_result_t replayed;
+                replayed.blocks = blocks;
+                return ch::decode(resource, replayed, statement);
+            });
     }
 
-    std::unique_ptr<ch::IConnector>
-    ch_columnless_block_factory(std::pmr::memory_resource*, ch::connect_params params, std::string alias) {
+    std::unique_ptr<conn::IDriver> ch_empty_probe_driver(std::pmr::memory_resource* resource) {
+        return ch_replay_driver(resource, {});
+    }
+
+    std::unique_ptr<conn::IDriver> ch_columnless_block_driver(std::pmr::memory_resource* resource) {
         std::vector<clickhouse::Block> blocks;
         blocks.emplace_back();
-        return std::make_unique<ch_replay_connector>(std::move(params), std::move(alias), std::move(blocks));
+        return ch_replay_driver(resource, std::move(blocks));
     }
 
-    // ClickHouse connector whose schema probe answers a header block with a
-    // named column followed by a column without a name; the named-types query
+    // A ClickHouse driver whose schema probe answers a header block with a named
+    // column followed by a column without a name; the named-types query
     // (system.columns) answers no rows, as for a table without overrides.
-    class ch_unnamed_column_connector final : public ch::IConnector {
-    public:
-        ch_unnamed_column_connector(ch::connect_params params, std::string alias)
-            : params_(std::move(params))
-            , alias_(std::move(alias)) {}
-
-        ch::Status status() const noexcept override { return ch::Status::Connected; }
-        ch::connect_params params() const noexcept override { return params_; }
-        void close() override {}
-        core::error_t connect() override { return core::error_t::no_error(); }
-        bool isConnected() override { return true; }
-        core::error_t tryReconnect() override { return core::error_t::no_error(); }
-        bool isClosed() const noexcept override { return false; }
-        std::string alias() const noexcept override { return alias_; }
-
-        boost::asio::awaitable<core::result_wrapper_t<std::unique_ptr<components::vector::data_chunk_t>>> runQuery(
-            std::string_view,
-            otterstax::function_ref_t<std::unique_ptr<components::vector::data_chunk_t>(const ch::select_result_t&)>)
-            override {
-            co_return std::unique_ptr<components::vector::data_chunk_t>{};
-        }
-
-        boost::asio::awaitable<core::result_wrapper_t<int64_t>>
-        runQuery(std::string_view, otterstax::function_ref_t<int64_t(const ch::select_result_t&)>) override {
-            co_return int64_t{0};
-        }
-
-        boost::asio::awaitable<core::error_t>
-        runQuery(std::string_view query,
-                 otterstax::function_ref_t<otterstax::asio_error_t(const ch::select_result_t&)> handler) override {
-            ch::select_result_t answer;
-            if (query.find("system.columns") == std::string_view::npos) {
-                clickhouse::Block header;
-                header.AppendColumn("id", std::make_shared<clickhouse::ColumnUInt32>());
-                header.AppendColumn("", std::make_shared<clickhouse::ColumnUInt32>());
-                answer.blocks.push_back(std::move(header));
-            }
-            co_return otterstax::as_query_result<otterstax::asio_error_t>(handler(answer));
-        }
-
-    private:
-        ch::connect_params params_;
-        std::string alias_;
-    };
-
-    std::unique_ptr<ch::IConnector>
-    ch_unnamed_column_factory(std::pmr::memory_resource*, ch::connect_params params, std::string alias) {
-        return std::make_unique<ch_unnamed_column_connector>(std::move(params), std::move(alias));
+    std::unique_ptr<conn::IDriver> ch_unnamed_column_driver(std::pmr::memory_resource* resource) {
+        return std::make_unique<scripted_driver_t>(
+            [](const conn::statement_t&) -> conn::statement_outcome_t { return conn::statement_result_t{}; },
+            [resource](const conn::statement_t& statement) {
+                ch::select_result_t answer;
+                if (statement.sql.find("system.columns") == std::string::npos) {
+                    clickhouse::Block header;
+                    header.AppendColumn("id", std::make_shared<clickhouse::ColumnUInt32>());
+                    header.AppendColumn("", std::make_shared<clickhouse::ColumnUInt32>());
+                    answer.blocks.push_back(std::move(header));
+                }
+                return ch::decode(resource, answer, statement);
+            });
     }
 
-    // Catalog actor plus the three connector managers over mocked connectors
-    // and the three backend actors that drive them (the catalog runs every
-    // discovery through those actors, and their constructors start the
-    // connector pools). Members are declared so that the actors are destroyed
-    // before the managers and the managers before the catalog.
+    std::unique_ptr<conn::IDriver> ch_mock_driver(std::pmr::memory_resource* resource) {
+        return std::make_unique<otterstax::test::mock_driver_t>(mock_config{.resource = resource}, "ch");
+    }
+
+    // Catalog actor plus the connection pools of the three backend types over
+    // mock drivers, the catalog's own backends wired in (it runs every discovery
+    // through them). The pools are declared after the catalog, so they are
+    // destroyed first.
     struct catalog_fixture {
         std::pmr::memory_resource* resource;
         std::unique_ptr<db::OtterbrixManager, actor_zeta::pmr::deleter_t> otterbrix_manager;
         std::unique_ptr<mysql::CatalogManager, actor_zeta::pmr::deleter_t> catalog;
-        std::unique_ptr<mysql::ConnectorManager> mysql_conn;
-        std::unique_ptr<pg::ConnectorManager> pg_conn;
-        std::unique_ptr<ch::ConnectorManager> ch_conn;
-        std::unique_ptr<db::MySQLManager, actor_zeta::pmr::deleter_t> mysql_manager;
-        std::unique_ptr<db::PostgressManager, actor_zeta::pmr::deleter_t> pg_manager;
-        std::unique_ptr<db::ClickhouseManager, actor_zeta::pmr::deleter_t> ch_manager;
+        std::unique_ptr<mock_backends> backends;
+        ch_driver_factory ch_factory;
 
-        explicit catalog_fixture(std::pmr::memory_resource* res,
-                                 ch::connector_factory ch_factory = &ch_mock_connector_factory)
-            : catalog_fixture(res,
-                              std::make_unique<SimpleMockOtterbrixManager>(mock_config{.resource = res}),
-                              ch_factory) {}
+        explicit catalog_fixture(std::pmr::memory_resource* res, ch_driver_factory ch = &ch_mock_driver)
+            : catalog_fixture(res, std::make_unique<SimpleMockOtterbrixManager>(mock_config{.resource = res}), ch) {}
 
         // `engine` is the data manager behind the OtterbrixManager the catalog
         // registers into, for tests that need a particular engine verdict.
-        catalog_fixture(std::pmr::memory_resource* res,
-                        std::unique_ptr<IDataManager> engine,
-                        ch::connector_factory ch_factory)
+        catalog_fixture(std::pmr::memory_resource* res, std::unique_ptr<IDataManager> engine, ch_driver_factory ch)
             : resource(res)
             , otterbrix_manager(actor_zeta::spawn<db::OtterbrixManager>(res, std::move(engine)))
             , catalog(actor_zeta::spawn<mysql::CatalogManager>(res, otterbrix_manager->address(), catalog_aliases()))
-            , mysql_conn(std::make_unique<mysql::ConnectorManager>(res,
-                                                                   catalog->address(),
-                                                                   &mysql_mock_connector_factory,
-                                                                   /*pool_size*/ 1))
-            , pg_conn(std::make_unique<pg::ConnectorManager>(res, catalog->address(), &pg_mock_connector_factory, 1))
-            , ch_conn(std::make_unique<ch::ConnectorManager>(res, catalog->address(), ch_factory, 1))
-            , mysql_manager(actor_zeta::spawn<db::MySQLManager>(res, mysql_conn.get()))
-            , pg_manager(actor_zeta::spawn<db::PostgressManager>(res, pg_conn.get()))
-            , ch_manager(actor_zeta::spawn<db::ClickhouseManager>(res, ch_conn.get())) {
-            catalog->set_backend_managers(mysql_manager->address(), pg_manager->address(), ch_manager->address());
-        }
+            , backends(std::make_unique<mock_backends>(res, *catalog))
+            , ch_factory(ch) {}
 
-        // Registers a PostgreSQL alias whose single table is discovered eagerly by
-        // addConnection (through the catalog actor).
+        // Registers a PostgreSQL alias whose single table is discovered eagerly
+        // (through the catalog actor).
         void add_pg(const std::string& alias,
                     const std::string& database,
                     const std::string& schema,
                     const std::string& table) {
-            conn::api_server::PgConnectionParams params;
-            params.alias = alias;
-            params.host = "localhost";
-            params.port = "5432";
-            params.username = "user";
-            params.password = "pass";
-            params.database = database;
-            params.schema = schema;
-            params.table = table;
-            auto added = pg_conn->addConnection(params);
-            REQUIRE_FALSE(added.has_error());
+            auto added = backends->add_postgresql(alias, database, schema, table);
+            INFO("register " << alias << ": " << (added.contains_error() ? added.what.c_str() : "ok"));
+            REQUIRE_FALSE(added.contains_error());
         }
+
+        // Registers a ClickHouse alias over the fixture's ClickHouse driver; answers
+        // the registration's verdict.
+        core::error_t add_ch(const std::string& alias, const std::string& database, const std::string& table) {
+            return backends->add(backend_type_t::ClickHouse,
+                                 alias,
+                                 ch_factory(resource),
+                                 qualified_name_t(alias, database, "", table));
+        }
+
+        bool has_ch(const std::string& alias) const { return backends->registry().clickhouse.contains(alias); }
+        bool has_pg(const std::string& alias) const { return backends->registry().postgresql.contains(alias); }
 
         core::error_t add_connection_schema(qualified_name_t name, catalog_ext::ConnectionType type) {
             auto [needs_sched, future] = actor_zeta::send(catalog->address(),
@@ -506,37 +425,29 @@ TEST_CASE("catalog update_backend_type: only collection/index drop kinds may car
 
 // ── discovery error paths ────────────────────────────────────────────────────
 
-// addConnection registers eagerly through the catalog and keeps the
-// connection only when that succeeded, so a discovery failure surfaces as the
-// addConnection verdict, with the catalog's error code, and nothing is listed.
+// A connection is registered eagerly through the catalog and kept only when
+// that succeeded, so a discovery failure surfaces as the registration's
+// verdict, with the catalog's error code, and nothing is listed.
 
 TEST_CASE("catalog add_connection_schema: a ClickHouse probe without a header block registers nothing") {
     auto* resource = std::pmr::new_delete_resource();
-    catalog_fixture fx(resource, &ch_empty_probe_factory);
+    catalog_fixture fx(resource, &ch_empty_probe_driver);
 
-    ch::connect_params params;
-    params.host = "localhost";
-    params.database = "ev";
-    params.table = "events";
-    auto added = fx.ch_conn->addConnection(params, "ev_alias");
-    REQUIRE(added.has_error());
-    REQUIRE(added.error().type == core::error_code_t::schema_error);
-    REQUIRE_FALSE(fx.ch_conn->hasConnection("ev_alias"));
+    auto added = fx.add_ch("ev_alias", "ev", "events");
+    REQUIRE(added.contains_error());
+    REQUIRE(added.type == core::error_code_t::schema_error);
+    REQUIRE_FALSE(fx.has_ch("ev_alias"));
     REQUIRE(fx.list_tables(get_tables_command()).empty());
 }
 
 TEST_CASE("catalog add_connection_schema: a column-less ClickHouse header block registers nothing") {
     auto* resource = std::pmr::new_delete_resource();
-    catalog_fixture fx(resource, &ch_columnless_block_factory);
+    catalog_fixture fx(resource, &ch_columnless_block_driver);
 
-    ch::connect_params params;
-    params.host = "localhost";
-    params.database = "ev";
-    params.table = "events";
-    auto added = fx.ch_conn->addConnection(params, "ev_alias");
-    REQUIRE(added.has_error());
-    REQUIRE(added.error().type == core::error_code_t::schema_error);
-    REQUIRE_FALSE(fx.ch_conn->hasConnection("ev_alias"));
+    auto added = fx.add_ch("ev_alias", "ev", "events");
+    REQUIRE(added.contains_error());
+    REQUIRE(added.type == core::error_code_t::schema_error);
+    REQUIRE_FALSE(fx.has_ch("ev_alias"));
     REQUIRE(fx.list_tables(get_tables_command()).empty());
 }
 
@@ -545,33 +456,25 @@ TEST_CASE("catalog add_connection_schema: a column-less ClickHouse header block 
 // carries no alias, and the engine's alias() has no null guard for such a type.
 TEST_CASE("catalog add_connection_schema: a discovered column without a name registers nothing") {
     auto* resource = std::pmr::new_delete_resource();
-    catalog_fixture fx(resource, &ch_unnamed_column_factory);
+    catalog_fixture fx(resource, &ch_unnamed_column_driver);
 
-    ch::connect_params params;
-    params.host = "localhost";
-    params.database = "ev";
-    params.table = "events";
-    auto added = fx.ch_conn->addConnection(params, "ev_alias");
-    REQUIRE(added.has_error());
-    REQUIRE(added.error().type == core::error_code_t::schema_error);
-    REQUIRE_FALSE(fx.ch_conn->hasConnection("ev_alias"));
+    auto added = fx.add_ch("ev_alias", "ev", "events");
+    REQUIRE(added.contains_error());
+    REQUIRE(added.type == core::error_code_t::schema_error);
+    REQUIRE_FALSE(fx.has_ch("ev_alias"));
     REQUIRE(fx.list_tables(get_tables_command()).empty());
 }
 
 TEST_CASE("catalog add_connection_schema: ClickHouse connection without a database is rejected before probing") {
     auto* resource = std::pmr::new_delete_resource();
-    // The replay connector would answer a probe with no header block; a
+    // The replay driver would answer a probe with no header block; a
     // schema_error verdict would therefore mean the probe ran.
-    catalog_fixture fx(resource, &ch_empty_probe_factory);
+    catalog_fixture fx(resource, &ch_empty_probe_driver);
 
-    ch::connect_params params;
-    params.host = "localhost";
-    params.database = "";
-    params.table = "events";
-    auto added = fx.ch_conn->addConnection(params, "nodb");
-    REQUIRE(added.has_error());
-    REQUIRE(added.error().type == core::error_code_t::missing_field);
-    REQUIRE_FALSE(fx.ch_conn->hasConnection("nodb"));
+    auto added = fx.add_ch("nodb", "", "events");
+    REQUIRE(added.contains_error());
+    REQUIRE(added.type == core::error_code_t::missing_field);
+    REQUIRE_FALSE(fx.has_ch("nodb"));
     REQUIRE(fx.list_tables(get_tables_command()).empty());
 }
 
@@ -579,16 +482,10 @@ TEST_CASE("catalog add_connection_schema: PostgreSQL connection without a schema
     auto* resource = std::pmr::new_delete_resource();
     catalog_fixture fx(resource);
 
-    // addConnection substitutes the driver default for an empty schema, so
-    // the registration succeeds under "public"; the catalog message is the
-    // path on which an empty schema can reach the discovery.
-    pg::connect_params params;
-    params.host = "localhost";
-    params.database = "pgdb";
-    params.schema = "";
-    params.table = "orders";
-    auto added = fx.pg_conn->addConnection(params, "noschema");
-    REQUIRE_FALSE(added.has_error());
+    // register_connections substitutes "public" for an empty schema, so the
+    // registration succeeds under it; the catalog message is the path on which
+    // an empty schema can reach the discovery.
+    fx.add_pg("noschema", "pgdb", "public", "orders");
 
     auto err = fx.add_connection_schema(qualified_name_t("noschema", "pgdb", "", "orders"),
                                         catalog_ext::ConnectionType::PostgreSQL);
@@ -624,21 +521,15 @@ TEST_CASE("catalog add_connection_schema: a uid keeps the backend it was registe
     REQUIRE(fx.list_tables(get_tables_command()) == std::vector<std::string>{"pgdb.public.orders"});
 }
 
-TEST_CASE("catalog add_connection_schema: no backend actor for the type is an error, not a hang") {
+TEST_CASE("catalog add_connection_schema: no backend for the type is an error, not a hang") {
     auto* resource = std::pmr::new_delete_resource();
     catalog_fixture fx(resource);
-    fx.catalog->set_backend_managers(actor_zeta::address_t::empty_address(),
-                                     actor_zeta::address_t::empty_address(),
-                                     actor_zeta::address_t::empty_address());
+    fx.catalog->set_backends({});
 
-    ch::connect_params params;
-    params.host = "localhost";
-    params.database = "ev";
-    params.table = "events";
-    auto added = fx.ch_conn->addConnection(params, "ev_alias");
-    REQUIRE(added.has_error());
-    REQUIRE(added.error().type == core::error_code_t::do_not_exists);
-    REQUIRE_FALSE(fx.ch_conn->hasConnection("ev_alias"));
+    auto added = fx.add_ch("ev_alias", "ev", "events");
+    REQUIRE(added.contains_error());
+    REQUIRE(added.type == core::error_code_t::do_not_exists);
+    REQUIRE_FALSE(fx.has_ch("ev_alias"));
     REQUIRE(fx.list_tables(get_tables_command()).empty());
 }
 
@@ -649,29 +540,20 @@ TEST_CASE("catalog add_connection_schema: a table the store cannot mirror is dro
     auto* resource = std::pmr::new_delete_resource();
     auto engine = std::make_unique<constant_oid_data_manager>(mock_config{.resource = resource});
     auto* recorder = engine.get();
-    catalog_fixture fx(resource, std::move(engine), &ch_mock_connector_factory);
+    catalog_fixture fx(resource, std::move(engine), &ch_mock_driver);
 
     fx.add_pg("shop", "pgdb", "public", "orders");
     REQUIRE(fx.list_tables(get_tables_command()) == std::vector<std::string>{"pgdb.public.orders"});
     REQUIRE(recorder->statements == std::vector<std::string>{"CREATE DATABASE \"shop\""});
 
-    conn::api_server::PgConnectionParams params;
-    params.alias = "crm";
-    params.host = "localhost";
-    params.port = "5432";
-    params.username = "user";
-    params.password = "pass";
-    params.database = "crmdb";
-    params.schema = "sales";
-    params.table = "customers";
-    auto added = fx.pg_conn->addConnection(params);
+    auto added = fx.backends->add_postgresql("crm", "crmdb", "sales", "customers");
 
-    REQUIRE(added.has_error());
-    REQUIRE(added.error().type == core::error_code_t::already_exists);
+    REQUIRE(added.contains_error());
+    REQUIRE(added.type == core::error_code_t::already_exists);
     REQUIRE(recorder->statements == std::vector<std::string>{"CREATE DATABASE \"shop\"",
                                                              "CREATE DATABASE \"crm\"",
                                                              "DROP TABLE \"crm\".\"crmdb:sales:customers\""});
-    REQUIRE_FALSE(fx.pg_conn->hasConnection("crm"));
+    REQUIRE_FALSE(fx.has_pg("crm"));
     REQUIRE(fx.list_tables(get_tables_command()) == std::vector<std::string>{"pgdb.public.orders"});
 }
 

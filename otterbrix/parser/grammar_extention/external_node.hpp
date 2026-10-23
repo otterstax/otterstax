@@ -11,8 +11,8 @@
 // Logical-plan carrier for a parsed external-table statement (CREATE EXTERNAL
 // TABLE / COPY ... TO). Both the `s3` and `file` grammar-extension transforms
 // lower their AST into this single node type; the Scheduler classifies it
-// (s3 vs local by location scheme, create vs copy by `op`) and routes to the
-// S3 / file managers.
+// (s3 vs local by location scheme, create vs copy by `op`) and runs it on the
+// S3 alias's or the local-file transfer pool.
 //
 // Tagged node_type::unused — like schema_utils::schema_node_t — so the engine
 // never tries to execute it. Header-only (all virtuals inline) so both the
@@ -56,7 +56,7 @@ namespace otterstax::external {
         const std::string& inner_sql() const noexcept { return inner_sql_; }
 
         // "s3://bucket/key" -> "bucket/key" (the path form Arrow's S3FileSystem
-        // and conn::s3::ConnectorManager expect); local paths pass through.
+        // and conn::s3::driver_t expect); local paths pass through.
         std::string object_path() const { return is_s3() ? location_.substr(5) : location_; }
 
     private:

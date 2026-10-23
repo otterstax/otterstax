@@ -1,12 +1,12 @@
 set(S3_HEADERS
     s3_connect_params.hpp
     s3_subsystem.hpp
-    manager.hpp
+    driver.hpp
 )
 
 set(S3_SOURCES
     s3_subsystem.cpp
-    manager.cpp
+    driver.cpp
 )
 
 add_library(s3

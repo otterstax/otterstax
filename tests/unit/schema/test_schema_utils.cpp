@@ -245,7 +245,7 @@ TEST_CASE("aggregate: grouping-key markers and hidden HAVING outputs are not col
 
 // A federated sub-query the SQL generator cannot write is lifted out of the
 // statement as raw text, and the backend describes its result columns onto that
-// stub (ClickhouseManager::describe). The stub IS the input relation of the
+// stub (db::backend_t::describe). The stub IS the input relation of the
 // aggregate above it — the transformer's derived-table wrapper, which names no
 // table — so the projection is resolved against the described columns. While the
 // stub is undescribed there is nothing to resolve against, and the schema stays

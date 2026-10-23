@@ -689,3 +689,157 @@ service:
     CHECK(err.type == core::error_code_t::invalid_parameter);
     CHECK(mentions(err, "service.spark_connect.port"));
 }
+
+// ── the pool: block, statement and connect timeouts, service.file_transfers ──
+
+TEST_CASE("parse_connections: an entry without a pool block gets the default pool and timeouts") {
+    const std::string yaml = R"(
+connections:
+  mysql:
+    - { alias: my, host: h, username: u, database: d }
+  postgresql:
+    - { alias: pg, host: h, username: u, database: d }
+  clickhouse:
+    - { alias: ch, host: h, username: u, database: d }
+  s3:
+    - { alias: lake, access_key: ak, secret_key: sk }
+)";
+    auto cfg = parse_ok(connections_node(yaml));
+    const config::PoolDesc defaults;
+    for (const auto* pool : {&cfg.mysql.front().pool,
+                             &cfg.postgresql.front().pool,
+                             &cfg.clickhouse.front().pool,
+                             &cfg.s3.front().pool}) {
+        CHECK(pool->min_size == defaults.min_size);
+        CHECK(pool->max_size == defaults.max_size);
+        CHECK(pool->idle_timeout_ms == defaults.idle_timeout_ms);
+        CHECK(pool->check_after_idle_ms == defaults.check_after_idle_ms);
+        CHECK(pool->queue_timeout_ms == defaults.queue_timeout_ms);
+        CHECK(pool->connect_backoff_ms == defaults.connect_backoff_ms);
+    }
+    CHECK(defaults.min_size == 1);
+    CHECK(defaults.max_size == 4);
+    CHECK(cfg.mysql.front().statement_timeout_ms == 90000);
+    CHECK(cfg.postgresql.front().statement_timeout_ms == 90000);
+    CHECK(cfg.s3.front().connect_timeout_ms == 1000);
+}
+
+TEST_CASE("parse_connections: the pool block and the timeouts are read per entry") {
+    const std::string yaml = R"(
+connections:
+  mysql:
+    - alias: my
+      host: h
+      username: u
+      database: d
+      statement_timeout_ms: 5000
+      pool: { min_size: 2, max_size: 8, idle_timeout_ms: 1000, check_after_idle_ms: 0,
+              queue_timeout_ms: 2000, connect_backoff_ms: 0 }
+  postgresql:
+    - { alias: pg, host: h, username: u, database: d, statement_timeout_ms: 7000, pool: { max_size: 2 } }
+  clickhouse:
+    - { alias: ch, host: h, username: u, database: d, pool: { min_size: 3, max_size: 3 } }
+  s3:
+    - { alias: lake, access_key: ak, secret_key: sk, connect_timeout_ms: 250, pool: { max_size: 6 } }
+)";
+    auto cfg = parse_ok(connections_node(yaml));
+    const auto& my = cfg.mysql.front();
+    CHECK(my.statement_timeout_ms == 5000);
+    CHECK(my.pool.min_size == 2);
+    CHECK(my.pool.max_size == 8);
+    CHECK(my.pool.idle_timeout_ms == 1000);
+    CHECK(my.pool.check_after_idle_ms == 0);
+    CHECK(my.pool.queue_timeout_ms == 2000);
+    CHECK(my.pool.connect_backoff_ms == 0);
+
+    CHECK(cfg.postgresql.front().statement_timeout_ms == 7000);
+    CHECK(cfg.postgresql.front().pool.min_size == 1);
+    CHECK(cfg.postgresql.front().pool.max_size == 2);
+    CHECK(cfg.clickhouse.front().pool.min_size == 3);
+    CHECK(cfg.clickhouse.front().pool.max_size == 3);
+    CHECK(cfg.s3.front().connect_timeout_ms == 250);
+    CHECK(cfg.s3.front().pool.max_size == 6);
+}
+
+TEST_CASE("parse_connections: an invalid pool block aborts parsing naming the setting") {
+    struct case_t {
+        const char* pool;
+        const char* names;
+    };
+    const case_t cases[] = {
+        {"{ min_size: 0 }", "min_size"},
+        {"{ min_size: 5, max_size: 4 }", "max_size"},
+        {"{ max_size: 0 }", "max_size"},
+        {"{ idle_timeout_ms: 0 }", "idle_timeout_ms"},
+        {"{ queue_timeout_ms: -1 }", "queue_timeout_ms"},
+        {"{ check_after_idle_ms: -1 }", "check_after_idle_ms"},
+        {"{ connect_backoff_ms: -5 }", "connect_backoff_ms"},
+        {"{ max_szie: 8 }", "max_szie"},
+        {"{ min_size: lots }", "min_size"},
+        {"[1, 2]", "pool"},
+    };
+    for (const auto& c : cases) {
+        INFO("pool: " << c.pool);
+        const std::string yaml =
+            std::string("connections:\n  clickhouse:\n    - { alias: ch, host: h, username: u, database: d, pool: ") +
+            c.pool + " }\n";
+        auto err = parse_error(connections_node(yaml));
+        CHECK(err.type == core::error_code_t::invalid_parameter);
+        CHECK(mentions(err, c.names));
+        CHECK(mentions(err, "clickhouse"));
+    }
+}
+
+TEST_CASE("parse_connections: a non-positive statement or connect timeout aborts parsing") {
+    SECTION("mysql statement_timeout_ms") {
+        auto err = parse_error(connections_node(R"(
+connections:
+  mysql:
+    - { alias: my, host: h, username: u, database: d, statement_timeout_ms: 0 }
+)"));
+        CHECK(err.type == core::error_code_t::invalid_parameter);
+        CHECK(mentions(err, "statement_timeout_ms"));
+    }
+    SECTION("postgresql statement_timeout_ms") {
+        auto err = parse_error(connections_node(R"(
+connections:
+  postgresql:
+    - { alias: pg, host: h, username: u, database: d, statement_timeout_ms: -1 }
+)"));
+        CHECK(err.type == core::error_code_t::invalid_parameter);
+        CHECK(mentions(err, "statement_timeout_ms"));
+    }
+    SECTION("s3 connect_timeout_ms") {
+        auto err = parse_error(connections_node(R"(
+connections:
+  s3:
+    - { alias: lake, access_key: ak, secret_key: sk, connect_timeout_ms: 0 }
+)"));
+        CHECK(err.type == core::error_code_t::invalid_parameter);
+        CHECK(mentions(err, "connect_timeout_ms"));
+    }
+}
+
+TEST_CASE("ConfigReader: service.file_transfers sizes the local-file transfer pool") {
+    SECTION("read when present") {
+        auto cfg = load_ok(write_temp(R"(
+service:
+  file_transfers: { min_size: 2, max_size: 6 }
+)"));
+        CHECK(cfg.file_transfers.min_size == 2);
+        CHECK(cfg.file_transfers.max_size == 6);
+    }
+    SECTION("the default pool when absent") {
+        auto cfg = load_ok("/nonexistent/config.yaml");
+        CHECK(cfg.file_transfers.min_size == 1);
+        CHECK(cfg.file_transfers.max_size == 4);
+    }
+    SECTION("an invalid block is an error naming the field") {
+        auto err = load_error(write_temp(R"(
+service:
+  file_transfers: { min_size: 3, max_size: 1 }
+)"));
+        CHECK(err.type == core::error_code_t::invalid_parameter);
+        CHECK(mentions(err, "service.file_transfers"));
+    }
+}

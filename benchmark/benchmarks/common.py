@@ -207,6 +207,116 @@ def benchmark_main(test_name, frontend, default_port, queries, make_fetch_factor
         sys.exit(1)
 
 
+# ── frontends and concurrency, shared by the connector suites ─────────────────
+# The connector suites (benchmarks/backends/suite.py, benchmarks/s3/) run
+# through the client frontend named by --frontend: they load that
+# frontend's connector.py, the module the per-frontend tests import directly.
+FRONTENDS = ("mysql", "postgres", "spark")
+
+
+def load_frontend(name):
+    """The connector module of a client frontend: FRONTEND, DEFAULT_PORT,
+    make_fetch_factory and connect."""
+    import importlib.util
+
+    if name not in FRONTENDS:
+        raise SystemExit(f"unknown frontend {name!r}; expected one of {FRONTENDS}")
+    path = Path(__file__).parent / name / "connector.py"
+    spec = importlib.util.spec_from_file_location(f"{name}_connector", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def frontend_from_argv(argv=None):
+    """Takes `--frontend <name>` out of argv (default: mysql) and loads that
+    frontend's connector, so the suite's own argument parser never sees it."""
+    import sys
+
+    argv = sys.argv if argv is None else argv
+    name = "mysql"
+    for i, arg in enumerate(argv):
+        if arg == "--frontend" and i + 1 < len(argv):
+            name = argv[i + 1]
+            del argv[i:i + 2]
+            break
+        if arg.startswith("--frontend="):
+            name = arg.split("=", 1)[1]
+            del argv[i]
+            break
+    return load_frontend(name)
+
+
+def concurrent_batch(connect, host, port, statements, fetch=True):
+    """Runs every statement at once, one session each, and times the batch.
+
+    The sessions connect first (untimed) and start together at a barrier, so
+    `wall_ms` covers the statements only. Returns (wall_ms, per_session), where
+    per_session[i] is (elapsed_ms, rows, error) for statements[i]; rows is 0
+    when fetch is False (DDL)."""
+    import threading
+
+    n = len(statements)
+    conns = [connect(host, port) for _ in range(n)]
+    start = threading.Barrier(n + 1)
+    per_session = [(0.0, 0, "did not run")] * n
+
+    def session(i):
+        cur = conns[i].cursor()
+        start.wait()
+        t0 = time.perf_counter()
+        try:
+            cur.execute(statements[i])
+            rows = len(cur.fetchall()) if fetch else 0
+            per_session[i] = ((time.perf_counter() - t0) * 1000, rows, None)
+        except Exception as exc:  # noqa: BLE001
+            per_session[i] = ((time.perf_counter() - t0) * 1000, 0, str(exc))
+        finally:
+            try:
+                cur.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    threads = [threading.Thread(target=session, args=(i,)) for i in range(n)]
+    for t in threads:
+        t.start()
+    start.wait()
+    t0 = time.perf_counter()
+    for t in threads:
+        t.join()
+    wall_ms = (time.perf_counter() - t0) * 1000
+    for c in conns:
+        try:
+            c.close()
+        except Exception:  # noqa: BLE001
+            pass
+    return wall_ms, per_session
+
+
+def suite_main(test_name, run, frontends=FRONTENDS):
+    """CLI entry point of a connector-suite script: benchmark_main's arguments
+    plus --frontend. `run(fe, host, port, repetitions, out_dir)` returns the
+    BenchmarkResult; a frontend outside `frontends` skips the test."""
+    import argparse
+    import sys
+
+    fe = frontend_from_argv()
+    p = argparse.ArgumentParser()
+    p.add_argument("--host", default="bench_otterstax")
+    p.add_argument("--port", type=int, default=fe.DEFAULT_PORT)
+    p.add_argument("--repetitions", type=int, default=10)
+    p.add_argument("--out-dir", type=Path, default=Path(f"benchmark_results/{fe.FRONTEND}"))
+    args = p.parse_args()
+
+    if fe.FRONTEND not in frontends:
+        print(f"=== {test_name} ({fe.FRONTEND}) skipped: runs through {', '.join(frontends)} only ===")
+        return
+    print(f"=== {test_name} ({fe.FRONTEND}) reps={args.repetitions} ===")
+    result = run(fe, args.host, args.port, args.repetitions, Path(args.out_dir))
+    if any(r.error for r in result.runs):
+        sys.exit(1)
+
+
 def write_db_info(out_root: Path) -> None:
     import os
     import yaml as _yaml

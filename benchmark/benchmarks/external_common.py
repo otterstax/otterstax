@@ -25,6 +25,13 @@ RustFS bucket) so file vs s3 are directly comparable:
   external_join_all   three origins at once: s3 parquet `regions` ⋈ file csv
                   `web_events` ⋈ otterbrix-internal `weights`, all on
                   campaign_id.  Models the "everything joined together" shape.
+  external_load_concurrent   N sessions run CREATE EXTERNAL TABLE at once
+                  (N = 1, 4, 8), each into its own table, from the largest
+                  fixture (web_events.csv).  Times the batch (wall) and each
+                  session (<sub>_each).  Each load reads and parses on the
+                  alias's (or the local-file) transfer pool, then creates its
+                  table through the engine, so the wall time shows how far
+                  loads run side by side.
 
 The join keys are int64 on every side (parquet/csv loaders emit int64; the
 engine table declares `campaign_id bigint`) — a direct backend.campaign_id
@@ -45,7 +52,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from common import BenchmarkResult, RunResult, write_txt_result
+from common import BenchmarkResult, RunResult, concurrent_batch, write_txt_result
 
 # In-container view of the seeded RustFS bucket and the /fixtures mount.
 # Mirrors run_benchmark.sh (_register_s3_credentials) + compose_rustfs.yml.
@@ -355,17 +362,64 @@ def run_external_join_all(frontend, connect, host, port, sources, reps, out_dir)
     return result
 
 
+LOAD_CONCURRENCY = (1, 4, 8)
+
+
+def run_external_load_concurrent(frontend, connect, host, port, sources, reps, out_dir):
+    db = f"bench_ext_conc_{frontend}"
+    fmt = "csv"  # web_events.csv, the largest fixture (~20k rows)
+    filename, name = FORMATS[fmt]
+    result = BenchmarkResult("external_load_concurrent", frontend, reps)
+    admin = connect(host, port)
+    try:
+        for source in sources:
+            location = _location(source, filename)
+            # N = 1 runs first, so the database exists before sessions load into it at once.
+            for n in LOAD_CONCURRENCY:
+                tables = [f"{name}_{source}_{i}" for i in range(n)]
+                statements = [f"CREATE EXTERNAL TABLE {db}.{t} {_create_with(source, location, fmt)}"
+                              for t in tables]
+                sub = f"{source}_{fmt}_x{n}"
+                result.queries[sub] = (f"{statements[0]}   -- {n} session(s) at once, one table each;"
+                                       " elapsed = wall time of the batch")
+                for rep in range(1, reps + 1):
+                    for t in tables:
+                        _drop(admin, db, t)  # untimed — every load is cold
+                    wall, sessions = concurrent_batch(connect, host, port, statements, fetch=False)
+                    failed = next((err for _, _, err in sessions if err), None)
+                    if failed:
+                        result.runs.append(RunResult(sub, rep, 0, 0, failed))
+                        print(f"  [{sub}] rep {rep}/{reps}: ERROR {failed}")
+                        continue
+                    rows = int(_exec(admin, f"SELECT count(*) FROM {db}.{tables[0]}", fetch=True)[0][0])
+                    result.runs.append(RunResult(sub, rep, wall, rows))
+                    if n > 1:
+                        for ms, _, _ in sessions:
+                            result.runs.append(RunResult(f"{sub}_each", rep, ms, rows))
+                    slowest = max(ms for ms, _, _ in sessions)
+                    print(f"  [{sub}] rep {rep}/{reps}: wall {wall:.1f} ms,"
+                          f" slowest session {slowest:.1f} ms ({rows} rows per table)")
+                for t in tables:
+                    _drop(admin, db, t)
+    finally:
+        admin.close()
+    write_txt_result(result, out_dir)
+    return result
+
+
 _RUNNERS = {
     "external_load": run_external_load,
     "external_join": run_external_join,
     "external_dump": run_external_dump,
     "external_join_cross": run_external_join_cross,
     "external_join_all": run_external_join_all,
+    "external_load_concurrent": run_external_load_concurrent,
 }
 
 
 def external_main(test_name, frontend, default_port, connect):
-    """CLI entry point shared by the per-frontend external_*.py scripts.
+    """CLI entry point of the benchmarks/s3/ scripts, which pick the client
+    frontend with --frontend (common.frontend_from_argv) before calling it.
     Mirrors common.benchmark_main so run_benchmark.sh drives it identically."""
     import argparse
 

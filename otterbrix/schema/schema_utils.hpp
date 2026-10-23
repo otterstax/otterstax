@@ -47,7 +47,7 @@ namespace schema_utils {
                       const std::pmr::vector<otterstax::parser::qualifier_rewrite_t>& qualifiers);
 
         const components::types::complex_logical_type& schema() const;
-        // The schema a backend answered for this stub (ClickhouseManager::describe).
+        // The schema a backend answered for this stub (db::backend_t::describe).
         // Filled in place: a raw-SQL stub must keep the text and qualifiers the
         // execute path still generates its statement from, so the node is never
         // rebuilt to carry a schema.

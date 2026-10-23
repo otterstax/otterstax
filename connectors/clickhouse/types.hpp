@@ -3,19 +3,10 @@
 
 #pragma once
 
-#include <string>
 #include <cstdint>
+#include <string>
 
 namespace ch {
-
-    enum class Status
-    {
-        Created,
-        Connected,
-        Disconnected,
-        Working,
-        Closed
-    };
 
     struct connect_params {
         std::string host;
@@ -24,9 +15,6 @@ namespace ch {
         std::string password;
         std::string database{"default"};
         std::string table;
-
-        uint32_t reconnect_delay_ms{200};
-        uint32_t max_reconnect_attempts{3};
     };
 
 } // namespace ch

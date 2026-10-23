@@ -48,7 +48,7 @@ namespace {
                                            const std::pmr::map<qualified_name_t, size_t>& dependencies) {
         // A stub child IS this aggregate's input relation: the statement's FROM
         // is a federated sub-query, whose columns the backend described onto the
-        // stub (ClickhouseManager::describe). The aggregate itself names no table
+        // stub (db::backend_t::describe). The aggregate itself names no table
         // then — it is the transformer's unnamed derived-table wrapper — so the
         // catalog lookup below has nothing to answer with and the projection is
         // resolved against the described columns instead. A stub no backend
@@ -230,7 +230,7 @@ namespace schema_utils {
             // int8 arrives differs in width AND kind, where COUNT above differs only in
             // signedness over the same 64-bit non-negative value. Until the type comes from
             // whoever executes the statement — a prepare-time probe like
-            // ClickhouseManager::describe, or the backend threaded in here — these two stay
+            // db::backend_t::describe, or the backend threaded in here — these two stay
             // the answer the remote paths were built on.
             if (fn == "sum") {
                 return types::logical_type::BIGINT;

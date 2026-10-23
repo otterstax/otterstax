@@ -11,9 +11,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Despite the `mysql::` namespace the class handles all three backend types.
 
-The catalog reaches a backend only through its integration actor: schema discovery is a `discover` message to `db::MySQLManager` / `db::PostgressManager` / `db::ClickhouseManager` (addresses set once through `CatalogManager::set_backend_managers`, which `ComponentManager` calls), and the catalog `co_await`s the reply — it never holds a connector manager and never blocks on a connector future.
+The catalog reaches a backend through its own backend set (`db::MySQLBackend` / `db::PostgresBackend` / `db::ClickhouseBackend`, `integration/backends.hpp`; pointers set once through `CatalogManager::set_backends`, which `ComponentManager` calls): schema discovery is `co_await backend->discover(scope)`, whose statements run on the backend's connection pool. The catalog never holds a connection.
 
-`catalog/discovery.hpp` holds what the catalog and those actors share: `catalog_ext::ConnectionType`, `discovered_table_t` / `discovered_tables_t` (the reply of `discover`), and the handwritten query builders. `otterstax::catalog::escape_sql_literal(resource, value, backend)` quotes the values embedded in the discovery list queries (`information_schema.tables` / `system.tables`) and in the ClickHouse named-types query (`make_named_types_query`, `system.columns`). It is dialect-aware: the apostrophe is doubled everywhere, and the backslash is doubled for MySQL and ClickHouse, where it is an escape character inside a literal. Every per-table probe goes through `sql_gen::generate_query` instead (`make_schema_probe_query`).
+`catalog/discovery.hpp` holds what the catalog and the backends share: `catalog_ext::ConnectionType`, `discovered_table_t` / `discovered_tables_t` (the reply of `discover`), and the handwritten query builders. `otterstax::catalog::escape_sql_literal(resource, value, backend)` quotes the values embedded in the discovery list queries (`information_schema.tables` / `system.tables`) and in the ClickHouse named-types query (`make_named_types_query`, `system.columns`). It is dialect-aware: the apostrophe is doubled everywhere, and the backslash is doubled for MySQL and ClickHouse, where it is an escape character inside a literal. Every per-table probe goes through `sql_gen::generate_query` instead (`make_schema_probe_query`).
 
 ## Actor Handlers (`dispatch_traits`)
 
@@ -21,7 +21,7 @@ The catalog reaches a backend only through its integration actor: schema discove
 |--------|-----------|---------|
 | `update_backend_type` | `Worker::execute` (statements with external nodes) | Lazily registers unknown external tables, stamps OIDs, sets `backend_type`; classifying a statement that already carries a backend type is an `invalid_parameter` error |
 | `get_catalog_schema` | `Worker::prepare_schema` (extended-protocol prepare) | Same pre-pass as `update_backend_type`, then rewrites each external aggregate into a `schema_node_t` carrying the projected output schema |
-| `add_connection_schema(name, type)` | The three `ConnectorManager::addConnection` (eager, at startup; the message names the backend type, which the manager knows) and the catalog itself (lazily, from the pre-pass above, with the type from `connection_registry_` — a uid the registry does not know is `do_not_exists`) | Send `discover(name)` to the backend actor of `type`, register the discovered table(s) in the engine, mirror them in `store_`. A uid already registered under another type is `invalid_parameter`; a type whose backend actor address is empty is `do_not_exists`. See "Registration on a persisted data dir" below |
+| `add_connection_schema(name, type)` | `ComponentManager::register_connections` (eager, at startup, once the alias's pool is open; the message names the backend type) and the catalog itself (lazily, from the pre-pass above, with the type from `connection_registry_` — a uid the registry does not know is `do_not_exists`) | Run `discover(name)` on the backend of `type`, register the discovered table(s) in the engine, mirror them in `store_`. A uid already registered under another type is `invalid_parameter`; a type without a backend (`set_backends` left it null) is `do_not_exists`. See "Registration on a persisted data dir" below |
 | `get_tables` | FlightSQL frontend (`DoGetTables`) | List mirrored tables for the `GetTables` RPC. `catalog` is an exact match on the database part; `db_schema_filter_pattern` / `table_name_filter_pattern` are SQL LIKE patterns (`%`, `_`); a non-empty `table_types` lists anything only if it names `catalog_ext::table_type_name` (`"TABLE"`) |
 | `check_database_ownership` | `Worker::guard_database_ddl` (every `CREATE DATABASE` / `DROP DATABASE`, on all three Worker entry points) | Answers `invalid_parameter` (`database '<name>' is owned by connection '<uid>'`) when the name, lower-cased, is a configured alias — the `alias_registry_t` the catalog is constructed with (the one `ComponentManager` builds from the config), whether the alias has registered yet or not — or `KAFKA_DATABASE_NAME`. The engine database mirroring a connection must not be created or dropped by user DDL, and a database made while the alias's backend is down would block its mirror later. Any other name passes with `no_error`. The check stays a message to the catalog: it is the one place a DDL on a database name is decided |
 
@@ -31,8 +31,8 @@ There is no removal handler: connections are read once from `config.yaml` at sta
 
 - `otterstax::catalog::schema_store_t store_` — actor-confined mirror of external table schemas (qualified name + STRUCT, keyed by engine pg_class oid); the tables themselves are registered in the engine pg_catalog via `OtterbrixManager`, one engine database per connection uid
 - `connection_registry_` (`pmr::unordered_map<uid, ConnectionType>`) — private to the actor; a uid is entered only after `add_connection_schema` mirrored its tables, so a registry miss is what makes a registration the uid's first in this process (the one that runs `register_external_database` and the stale-mirror drop; a failed attempt repeats it). It drives the catalog-internal decision that needs a backend type before the store is consulted: `backend_type` classification. Names arrive canonical (`otterstax::names::canonical_table_name` in the parser and the Spark translator), so the catalog no longer rewrites the schema of a non-PostgreSQL target. Nothing outside the catalog reads it — the Worker routes on the `backend_type` / `node_backend_types` the catalog writes onto `ParsedQueryData`
-- Three backend actor addresses (`set_backend_managers`, called by `ComponentManager` once the integration actors exist — the connector managers were built with the catalog's address first, hence the setter). The catalog holds no connector manager: the per-connection metadata a query needs (PostgreSQL ENUM oids, ClickHouse named types) is state of the actor that discovered it
-- No locking besides `mutex_` in `enqueue_impl`: every handler body runs to completion on the sender's thread under that mutex, so the registry and the store never see concurrent access. The `discover` reply is settled by the time `send` returns (the backend actors run their handlers to completion the same way), so the `co_await` on it never suspends across another catalog message
+- `backends_t backends_` — the catalog's own backends (`set_backends`, called by `ComponentManager` once the registry exists). Discovery writes the per-connection decode metadata a query needs (PostgreSQL ENUM oids, ClickHouse named types) into the shared `pg_metadata_t` / `ch_metadata_t` the Workers' backends read
+- No locking besides `mutex_` in `enqueue_impl`: every handler body runs to completion on the sender's thread under that mutex, so the registry and the store never see concurrent access. A discovery statement is answered on a pool thread; until then the handler is suspended inside `enqueue_impl`'s loop on the sender's thread, still holding `mutex_`, so no other catalog message interleaves with it (and the catalog's backends need no waker: the loop polls)
 
 ## Backend-type classification (`update_backend_type_impl`)
 
@@ -93,13 +93,13 @@ The manifest, the engine-side probe and the encoding live in
 `tests/system/test_restart_reconciliation.cpp` drives all three outcomes over
 a real engine restarted on the same data dir.
 
-## Discovery contract (`discover` on the backend actors)
+## Discovery contract (`discover` on the backends)
 
-`discover_connection_schemas` picks the backend actor by `ConnectionType` and
-sends it `discover(name)`. Empty `name.collection` → every base table of the
+`discover_connection_schemas` picks the backend by `ConnectionType` and awaits
+its `discover(name)`. Empty `name.collection` → every base table of the
 database/schema the name carries (list query, then one probe per table);
 non-empty → that single table. The name is the only input: the eager path
-builds it from the connect params in `addConnection`, the lazy path takes it
+builds it from the config entry in `register_connections`, the lazy path takes it
 from the statement. PostgreSQL needs a non-empty schema, MySQL and ClickHouse
 a non-empty database (`missing_field`) — there is no default. The metadata
 queries (PostgreSQL `pg_enum`, ClickHouse `system.columns`) are part of the

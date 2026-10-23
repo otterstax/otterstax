@@ -5,18 +5,10 @@
 
 #include "catalog/catalog_manager.hpp"
 #include "config/connections/connection_config.hpp"
-#include "connectors/clickhouse/manager.hpp"
-#include "connectors/file/manager.hpp"
-#include "connectors/mysql/manager.hpp"
-#include "connectors/postgresql/manager.hpp"
-#include "connectors/s3/manager.hpp"
-#include "integration/clickhouse/connection_manager.hpp"
+#include "integration/backends.hpp"
 #include "integration/kafka/kafka_manager.hpp"
 #include "integration/otterbrix/otterbrix_engine.hpp"
 #include "integration/otterbrix/otterbrix_manager.hpp"
-#include "integration/postgresql/connection_manager.hpp"
-#include "integration/s3/s3_manager.hpp"
-#include "integration/sql/connection_manager.hpp"
 #include "scheduler/scheduler.hpp"
 
 #include <actor-zeta.hpp>
@@ -37,29 +29,36 @@ public:
     const otterstax::names::alias_registry_t& aliases() const noexcept { return aliases_; }
 
     // Register every remote backend and s3 alias described by the connection
-    // config (parsed from the config file at startup) with the corresponding
-    // connector managers. This is the sole entry point for registering
-    // connections — there is no runtime add/remove API. Every descriptor was
-    // validated for completeness by parse_connections before it reaches this
-    // point. Opening a backend is best-effort: it is retried per `retry`
-    // (mysql/pg/ch connect eagerly and may need to wait on a slow DB) and a
-    // backend that stays unreachable is logged and skipped. A descriptor the
-    // backend rejects outright (invalid_parameter) or an s3 alias that cannot be
-    // stored is a configuration error, returned so startup aborts.
+    // config (parsed from the config file at startup). This is the sole entry
+    // point for registering connections — there is no runtime add/remove API.
+    // Every descriptor was validated for completeness by parse_connections
+    // before it reaches this point. A mysql/pg/ch connection becomes a pool in
+    // backends_ (its min_size connections opened here), then the catalog
+    // discovers its tables; a connection whose discovery fails is dropped again.
+    // Opening a backend is best-effort: it is retried per `retry` (a slow DB may
+    // need a moment) and a backend that stays unreachable is logged and skipped.
+    // Each s3 alias gets its S3FileSystem and a transfer pool; `file_transfers`
+    // sizes the local-file transfer pool. A descriptor the backend rejects
+    // outright (invalid_parameter) or an s3 alias whose filesystem cannot be
+    // built is a configuration error, returned so startup aborts.
     [[nodiscard]] core::error_t register_connections(const config::ConnectionsConfig& connections,
-                                                     const config::ConnectionRetryConfig& retry);
+                                                     const config::ConnectionRetryConfig& retry,
+                                                     const config::PoolDesc& file_transfers = {});
 
 private:
     db::otterbrix_engine_ptr engine_{nullptr};
     std::pmr::memory_resource* resource_{nullptr};
     // Read by every Worker's parser; declared before scheduler_ so it outlives it.
     otterstax::names::alias_registry_t aliases_;
-    // Sole owner of the three connector managers. Everyone else — the catalog
-    // actor and the three integration actors — holds a non-owning pointer, and
-    // is declared BELOW so it is destroyed first.
-    std::unique_ptr<mysql::ConnectorManager> db_connector_manager_{nullptr};
-    std::unique_ptr<pg::ConnectorManager> pg_connector_manager_{nullptr};
-    std::unique_ptr<ch::ConnectorManager> ch_connector_manager_{nullptr};
+    // Sole owner of the connection pools and decode metadata of the three
+    // database backend types, and of the S3 / local-file transfer pools.
+    // Everything that builds on them — the catalog's backends below and every
+    // Worker — is declared BELOW, so it is destroyed first; the pools then
+    // answer what is still queued and join their threads. The S3 filesystems
+    // die with them, before main()'s subsystem_finalizer_t runs FinalizeS3.
+    std::unique_ptr<db::backend_registry_t> backends_;
+    // The catalog's own backends: schema discovery runs through them.
+    std::unique_ptr<db::backend_set_t> catalog_backends_;
     std::unique_ptr<mysql::CatalogManager, actor_zeta::pmr::deleter_t> catalog_manager_{
         nullptr,
         actor_zeta::pmr::deleter_t{getResource()}};
@@ -69,15 +68,6 @@ private:
     std::unique_ptr<otterstax::kafka::KafkaManager, actor_zeta::pmr::deleter_t> kafka_manager_{
         nullptr,
         actor_zeta::pmr::deleter_t{getResource()}};
-    std::unique_ptr<db::MySQLManager, actor_zeta::pmr::deleter_t> sql_connection_manager_{
-        nullptr,
-        actor_zeta::pmr::deleter_t{getResource()}};
-    std::unique_ptr<db::PostgressManager, actor_zeta::pmr::deleter_t> pg_connection_manager_{
-        nullptr,
-        actor_zeta::pmr::deleter_t{getResource()}};
-    std::unique_ptr<db::ClickhouseManager, actor_zeta::pmr::deleter_t> ch_connection_manager_actor_{
-        nullptr,
-        actor_zeta::pmr::deleter_t{getResource()}};
     // The work-sharing thread pool that drives the Worker actors. Declared before
     // scheduler_ so it outlives it: scheduler_ (workers + event loop) is destroyed
     // first, the (already-stopped) pool after. Stopped in ~ComponentManager before
@@ -85,15 +75,4 @@ private:
     std::unique_ptr<actor_zeta::scheduler::sharing_scheduler> az_scheduler_{nullptr};
     std::unique_ptr<Scheduler, actor_zeta::pmr::deleter_t> scheduler_{nullptr,
                                                                       actor_zeta::pmr::deleter_t{getResource()}};
-    std::unique_ptr<conn::file::FileManager, actor_zeta::pmr::deleter_t> file_manager_{
-        nullptr,
-        actor_zeta::pmr::deleter_t{getResource()}};
-    std::unique_ptr<conn::s3::ConnectorManager, actor_zeta::pmr::deleter_t> s3_manager_{
-        nullptr,
-        actor_zeta::pmr::deleter_t{getResource()}};
-    // Integration-layer S3 orchestrator (download→add_file / dump_file→upload),
-    // wrapping the raw conn::s3 + conn::file managers. Routed to by the Scheduler.
-    std::unique_ptr<db::S3Manager, actor_zeta::pmr::deleter_t> s3_integration_manager_{
-        nullptr,
-        actor_zeta::pmr::deleter_t{getResource()}};
 };

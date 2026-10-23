@@ -48,22 +48,16 @@ public:
     // no parser object is shared between actors (rule 10).
     using parser_factory_fn = parser_ptr (*)(std::pmr::memory_resource*, const otterstax::names::alias_registry_t&);
 
-    // s3_manager / file_manager addresses are forwarded as-is to every Worker so
-    // CREATE EXTERNAL TABLE and COPY ... TO statements (parsed as
-    // otterstax::external::external_node_t) can be routed to db::S3Manager or
-    // conn::file::FileManager from inside the Worker pipeline.
     Scheduler(std::pmr::memory_resource* res,
               actor_zeta::scheduler_raw scheduler,
               std::size_t worker_count,
               parser_factory_fn parser_factory,
               const otterstax::names::alias_registry_t& aliases,
-              actor_zeta::address_t sql_connection_manager,
-              actor_zeta::address_t pg_connection_manager,
-              actor_zeta::address_t ch_connection_manager,
+              // The shared connection pools, decode metadata and transfer pools
+              // every Worker builds its backends over; outlives the Scheduler.
+              db::backend_registry_t& backends,
               actor_zeta::address_t otterbrix_manager,
               actor_zeta::address_t catalog_manager,
-              actor_zeta::address_t s3_manager,
-              actor_zeta::address_t file_manager,
               // Optional: production (component_manager) passes the KafkaManager;
               // tests that don't exercise Kafka omit it (Workers never send to an
               // empty address unless a kafka_node_t is parsed).

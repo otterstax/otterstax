@@ -28,6 +28,7 @@ services:
       - "8815"
       - "8816"
       - "8817"
+      - "15002"   # Spark Connect
     ports:
       - "8086:8086"
     volumes:

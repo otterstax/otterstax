@@ -29,7 +29,7 @@ namespace tsl {
                                                         const boost::mysql::results& result);
 
     // The schema of that chunk, taken off the result's column definitions: the
-    // STRUCT MySQLManager::discover mirrors into the catalog. It is the same one
+    // STRUCT the MySQL backend's discover mirrors into the catalog. It is the same one
     // table mysql_to_chunk types its rows with, so a discovered column's type is
     // the executed column's type by construction. A column type the table has no
     // arm for is the same conversion_failure, naming the column; a result without

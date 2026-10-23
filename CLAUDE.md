@@ -38,10 +38,13 @@ service:
   postgres:   { port: 8817 }      # wire-server port (NOT a backend)
   spark_connect: { host: "0.0.0.0", port: 15002 }   # Spark Connect gRPC server
   connection_retry: { max_attempts: 10, delay_ms: 2000 }
+  file_transfers: { min_size: 1, max_size: 4 }       # local CREATE EXTERNAL TABLE / COPY … TO at once
 
 connections:
   mysql:
-    - { alias: mysql, host: demo-mariadb, port: "3306", username: demo, password: demo, database: bill, table: "" }
+    - { alias: mysql, host: demo-mariadb, port: "3306", username: demo, password: demo, database: bill, table: "",
+        statement_timeout_ms: 90000,                   # optional; total time one statement may take
+        pool: { min_size: 1, max_size: 4 } }           # optional; see below
   postgresql:
     - { alias: pg, host: demo-postgres, port: "5432", username: demo, password: demo, database: shop, schema: shop, table: "" }
   clickhouse:
@@ -65,6 +68,20 @@ backend. The `alias` is the outermost qualifier in federated SQL
 (`[a-z_][a-z0-9_]*`) and name one connection across the three sections —
 anything else aborts startup.
 
+Every connection takes an optional `pool:` block — how many connections (for s3,
+concurrent transfers) the alias may hold and when they open, close and give up:
+`min_size` (1; opened at startup, never closed), `max_size` (4; the cap),
+`idle_timeout_ms` (60000; a connection above `min_size` idle this long closes),
+`check_after_idle_ms` (30000; a connection idle this long is pinged before use),
+`queue_timeout_ms` (30000; a statement waiting longer is refused with `io_error` when its time is up),
+`connect_backoff_ms` (1000; the wait after a failed connect). `1 <= min_size <=
+max_size`, an unknown setting or a bad value aborts startup. `max_size` × the number
+of OtterStax instances must fit the backend's own connection limit (PostgreSQL's
+default `max_connections` is 100, MySQL's 151). MySQL and PostgreSQL also take
+`statement_timeout_ms` (90000), s3 `connect_timeout_ms` (1000); ClickHouse keeps a
+fixed 10 s socket bound. `service.file_transfers` is the `pool:` block of the
+local-file transfers. See `connectors/CLAUDE.md` for what the pools do.
+
 ### Flow through the code
 
 ```text
@@ -74,14 +91,17 @@ main.cpp
         (parse_connections validates every entry → the first incomplete one is returned as
          core::error_t{invalid_parameter} → main logs it and returns 1 before the engine, any actor
          or connector exists — ComponentManager is constructed only after the config is accepted)
-  → conn::s3::subsystem_finalizer_t            — declared before ComponentManager: the s3 actor it spawns
-                                                 initialises Arrow S3, and the process must FinalizeS3
-                                                 after the actor graph is gone on every exit path
-  → ComponentManager(make_create_config(...))   → engine + actor graph + worker pool
-  → ComponentManager::register_connections(server_config.connections, server_config.connection_retry)
-       mysql/pg/ch: ConnectorManager::addConnection(conn::api_server::*Params)   — opens the connector,
-                    retried up to connection_retry.max_attempts (delay_ms between tries)
-       s3         : actor send &conn::s3::ConnectorManager::add_credentials      — stores the alias (no retry)
+  → conn::s3::subsystem_finalizer_t            — declared before ComponentManager: the s3 drivers it builds
+                                                 initialise Arrow S3, and the process must FinalizeS3
+                                                 after they are gone on every exit path
+  → ComponentManager(make_create_config(...))   → engine + actor graph + worker pool + empty connection pools
+  → ComponentManager::register_connections(connections, connection_retry, file_transfers)
+       mysql/pg/ch: <type>::make_driver(params) → registry.<type>.add(alias, driver, pool) — opens min_size
+                    connections — then the catalog discovers the alias's tables (add_connection_schema);
+                    a failed discovery drops the pool again. Retried up to connection_retry.max_attempts
+                    (delay_ms between tries)
+       local files: registry.transfers.set_files(file::driver_t, file_transfers)
+       s3         : s3::driver_t::make(params) → registry.transfers.add_s3(alias, driver, pool)   (no retry)
 ```
 
 - Parsing + validation live in the `config` target (`config/`), which has **no
@@ -95,8 +115,8 @@ main.cpp
   `main.cpp` logs the error and returns 1, so an invalid connection aborts
   startup rather than coming up half-configured.
 - Registration lives in `ComponentManager::register_connections` (it owns the
-  connector managers), converting the pre-validated descriptors → connector param
-  structs. Opening a backend is best-effort: it is retried up to
+  connection pools, `db::backend_registry_t`), converting the pre-validated
+  descriptors → driver params. Opening a backend is best-effort: it is retried up to
   `connection_retry.max_attempts`, and a backend that is still unreachable logs an
   error but does not abort startup (the other backends and local engine stay up).
 
@@ -109,7 +129,7 @@ main.cpp
 | integration tests | `tests/scripts/config.yaml` | baked by `Dockerfile.test` |
 | root manual stack | `scripts/database/config.yaml` | mounted by `compose.yml` |
 | benchmarks | `benchmark/config.yaml` | mounted by `benchmark/compose_benchmark.yml` |
-| examples/simple | `examples/simple/example_connetion/config{,_local}.yaml` | pass `--config <file>` |
+| quick start (`examples/quick_start/`) | `config.yaml` | mounted by `examples/quick_start/compose.yml` |
 
 Unit tests: `tests/unit/config/` (`test_unit_config`).
 
@@ -218,18 +238,24 @@ docker compose up
 
 ## Architecture Overview
 
-All components are actor-zeta actors (`actor_mixin` for the Scheduler,
-`basic_actor` for Workers and the integration managers) communicating through
-typed coroutine futures. The flow for every query:
+The query pipeline runs on actor-zeta actors (`actor_mixin` for the Scheduler, the
+catalog and the engine manager, `basic_actor` for Workers) communicating through
+typed coroutine futures; remote databases, S3 and local files are reached through
+plain objects over per-alias connection pools whose threads answer through
+`actor_zeta::promise` (`connectors/CLAUDE.md`). The flow for every query:
 
 ```text
 Frontend (MySQL/PG/FlightSQL/Spark Connect)
   → Scheduler::execute()          — thin router, hashes session_hash → Worker
   → Worker::execute()             — owns the parser, runs the full pipeline
   → CatalogManager                — resolve schemas, set backend type on ParsedQueryData
-  → [if remote] integration/{sql,postgresql,clickhouse}::ConnectionManager
-       → connectors/{mysql,postgresql,clickhouse}::ConnectorManager::executeQuery()
-       → otterbrix/translators/input/  — convert raw results to data_chunk_t
+  → [if remote] the Worker's own db::{MySQL,Postgres,Clickhouse}Backend (integration/backend.hpp)
+       → conn::connection_pool_t::execute()  — the alias's pool runs the statement on a free
+                                               connection thread; the Worker co_awaits the answer
+       → driver decode → otterbrix/translators/input/  — raw results to data_chunk_t
+       → a statement the backend answered whole: its chunks are the result (no engine call,
+         Worker::take_backend_result); anything left above the slice — a Mixed JOIN, a
+         backend ⋈ local table — and a remote DML's count continue to OtterbrixManager
   → [if local] integration/otterbrix::OtterbrixManager
        → otterbrix/operators/execute_plan — delegate to Otterbrix engine
   → otterbrix/translators/output/chunk_to_arrow — convert to Arrow RecordBatch
@@ -348,7 +374,7 @@ Rules:
   block fills (the `unique_future`, the parsed query data) may precede that block; the
   awaited actor instruments its own work. A handler of an actor whose `enqueue_impl`
   drives the coroutine to completion on the sender's thread (e.g. `CatalogManager`,
-  `S3Manager`, `FileManager`) keeps the zone as its first statement even across
+  `OtterbrixManager`) keeps the zone as its first statement even across
   `co_await`: the awaited call runs nested on the same thread. If such an actor moves off
   that synchronous path, its handlers fall under this exception. See
   `scheduler/CLAUDE.md`, "Tracy zones in coroutines".
@@ -414,15 +440,14 @@ Frontend
   → [parser extension claims the statement → otterstax::external::external_node_t]
   → Worker::handle_external_statement
        → CREATE EXTERNAL TABLE:
-           local path  → conn::file::FileManager::add_file → OtterbrixManager engine load
-           s3:// URI   → db::S3Manager::download: s3 ConnectorManager::open_input
-                         → FileManager::add_file reads the object stream (no local copy)
+           load_t on the transfer pool (local path: the file pool; s3:// URI: the alias's pool,
+             OpenInputFile streamed into the loader, no local copy) → <fmt>_to_chunk
+           → OtterbrixManager::create_table with that chunk (on the Worker)
        → COPY (<inner>) TO ...:
-           inner SQL re-parsed; result chunk runs through chunk_to_<fmt>;
-           local path  → FileManager::dump_file (file committed only on success)
-           s3:// URI   → S3Manager::upload: ConnectorManager::open_output
-                         → FileManager::dump_file writes into the stream → Close
-                         (any failure Aborts it: no partial object is published)
+           inner SQL re-parsed and run through OtterbrixManager::execute (on the Worker)
+           → export_t on the transfer pool: chunk_to_<fmt> into the file (committed only on
+             success) or into OpenOutputStream → Close (any failure Aborts it: no partial
+             object is published)
   → returns empty session_payload via future; DDL/COPY return no rows
 ```
 
@@ -441,17 +466,17 @@ Implementation entry points:
   `.../file/`. Each ships a `*_gram.y` + `*_scan.l` + `*_extension.cpp` and is
   registered with the parser registry at `otterbrix/parser/parser.cpp`. The
   `cmake/otterbrix_parser_extension.cmake` helper macro builds them.
-- **Connectors** — `connectors/s3/` (Arrow's `arrow::fs::S3FileSystem`,
-  initialised via `arrow::fs::EnsureS3Initialized`, one cached per alias;
-  `open_input` / `open_output` hand out object streams) and `connectors/file/`
-  (filesystem ingestion; `FileAddParams::input` / `FileMetadata::output` carry
-  a stream instead of a path).
-- **Integration actors** — `integration/s3/s3_manager.{hpp,cpp}` streams
-  objects between the s3 connector and `FileManager` (so COPY ... TO
-  's3://...' is a single pass with no staging file).
+- **Transfer drivers and pools** — `connectors/s3/driver.*` (one Arrow
+  `arrow::fs::S3FileSystem` per alias, built at startup; `EnsureS3Initialized`
+  is called there) and `connectors/file/driver.*` (`file::load_chunk` /
+  `file::write_chunks`, the format dispatch both share), run on
+  `conn::transfer_pools_t` (`connectors/common/transfer.hpp`): one pool per s3
+  alias, one for local files, so transfers run side by side instead of one at a
+  time. The Worker (`load_external_table` / `copy_to`) awaits the transfer and
+  calls the engine itself.
 - **Connection config** — s3 aliases are declared in the `connections.s3:`
   section of `config.yaml` (`alias`, `access_key`, `secret_key`, `region`,
-  `endpoint`) and registered at startup. The alias is then used by the
+  `endpoint`, `connect_timeout_ms`, `pool:`) and registered at startup. The alias is then used by the
   `s3_alias` option on `CREATE EXTERNAL TABLE` / `COPY ... TO`.
 
 ### Working JOIN shapes
@@ -464,10 +489,9 @@ All combinations below are joinable in a single SQL statement:
   ndjson).
 - Two registered backends (cross-backend, classified as `Mixed`).
 - **Registered backend ⋈ otterbrix-internal table** in a single statement. The
-  backend manager fetches its slice through the existing single-backend
-  dispatch and inlines it as `node_raw_data`
-  (`integration/sql/connection_manager.cpp:162-164` for MySQL; PG/CH have the
-  equivalent). The engine then resolves the symbolic local side by its
+  backend fetches its slice through the existing single-backend dispatch and
+  inlines it as `node_raw_data` (`db::backend_t::execute`,
+  `integration/backend.hpp`, one template for MySQL, PG and CH). The engine then resolves the symbolic local side by its
   stamped `table_oid` (`catalog/catalog_manager.cpp:240-242`) and JOINs raw
   data against engine-resident rows. The live demo's
   `examples/demo/sql/step_4.sql` exercises exactly this shape every run.
@@ -521,23 +545,24 @@ otterbrix-internal — shadow of `external_join_all` benchmark), all driven by
 
 | Directory | CMake target | Role |
 | --------- | ------------ | ---- |
-| `connectors/` | `connectors`, `s3`, `file` | Raw DB connections (Boost.MySQL, libpq, clickhouse-cpp), S3 (Arrow `S3FileSystem`), local-file ingestion. `api_connections/` holds the `conn::api_server::*Params` structs consumed by `addConnection` |
+| `connectors/` | `connectors`, `s3`, `file` | Drivers — one connection each, sync, bounded, never throwing (Boost.MySQL, libpq, clickhouse-cpp), S3 (Arrow `S3FileSystem`) and local files — and the per-alias pools that run them (`common/`: `work_pool_t`, `connection_pool_t`, `transfer_pools_t`). See `connectors/CLAUDE.md` |
 | `config/` | `config` | Single `config.yaml` reader — wire-server settings + `connections:` section (single source of truth for backend/s3 connections). See `config/CLAUDE.md` |
 | `catalog/` | `catalog` | Schema discovery + connection type registry (`CatalogManager`) |
-| `integration/` | `integration` | Actor wrappers bridging Worker ↔ ConnectorManagers (incl. `db::S3Manager`); each backend actor is the sole driver of its ConnectorManager and answers the catalog's `discover` |
+| `integration/` | `integration` | `db::backend_t<Traits>` (MySQL / PostgreSQL / ClickHouse backends: execute, describe, discover over the pools; every Worker and the catalog own a set), `db::backend_registry_t` (pools + decode metadata + transfer pools, owned by ComponentManager), and `db::OtterbrixManager` |
 | `integration/kafka/` | `kafka_runtime` | `KafkaManager` actor + `detail/` impl (consumer/producer/poller/stream/reader); Kafka SOURCE/STREAM objects, librdkafka |
 | `otterbrix/` | `otterbrix_local` (+ `otterbrix_s3_extension`, `otterbrix_file_extension`) | Parser, SQL generator, translators, plan execution, grammar extensions for `CREATE EXTERNAL TABLE` / `COPY ... TO` |
 | `otterbrix/parser/grammar_extension/kafka/` | `kafka_grammar` | Kafka DDL parser extension (flex+bison): `kafka_node_t`, `kafka_write_target` |
 | `scheduler/` | `scheduler` | `Scheduler` router + `Worker` pool (full parse→catalog→backend→otterbrix pipeline, including external-statement dispatch) + schema computation utilities |
 | `frontend/` | `flight_sql`, `mysql_server`, `postgres_server`, `spark_connect_server` | Wire-protocol frontends (await `Scheduler` futures via `asio_future_bridge.hpp`). `flight_sql/` is the in-house Flight SQL server: asio-grpc handlers over gRPC, the data plane on the project's arrow core (`arrow::ipc` + `tsl::*` translators) — no Arrow Flight dependency. The Spark Connect gRPC server (asio-grpc; `spark.sql()` through `Scheduler::execute`, DataFrame plans through `Scheduler::execute_plan`, awaited via `await_future.hpp`). See `frontend/CLAUDE.md` |
-| `utility/` | (header-only) | `session`, `wait_barrier` (connector error marshalling), `asio_error`, `table_info`, logger, profiler |
+| `utility/` | (header-only) | `session`, `settled_future`, `parse_port`, `thread_pool_manager` (frontends), `table_info`, logger, profiler |
 | `cmake/` | (helper macros) | `otterbrix_parser_extension.cmake` — builds the s3/file flex+bison grammar extensions |
 | `tests/` | `test_system`, `test_parser`, `test_schema`, `test_utils`, `test_unit_translators`, `test_unit_config`, `test_unit_spark_connect`, `test_kafka_grammar`, `test_mysql_front` | Catch2 tests + python integration suite under `tests/test_*.py` (the `test_spark_client_*.py` files run in the PySpark client matrix, `Dockerfile.spark-test`; binary names are the `project()` names in `tests/*/CMakeLists.txt`; see `tests/CLAUDE.md`) |
 
 ## Known Constraints
 
-- `ConnectorManager::addConnection` is the only write to a connector registry and runs on the startup thread before any query reaches the integration actor that drives the manager (`connectors/mysql/manager.hpp`); there is no remove path
-- One query per connection at a time: each alias owns a single `boost::mysql::any_connection` and nothing serializes overlapping statements on it (`Connector::runQuery_` in `connectors/mysql/connector.hpp`; the pg/ch connectors are shaped the same way)
+- `connection_pool_t::add` / `transfer_pools_t::add_s3` / `set_files` are the only writes to the pool registries and run on the startup thread (`ComponentManager::register_connections`) before any query; there is no remove path
+- A Worker parks while it awaits a pool answer (`scheduler/parking.hpp`): actor-zeta 1.2.0 (and 2.0.0, by design) keeps a cooperative actor whose behavior awaits an unsettled future scheduled and re-runs it until the future settles — a core per waiting actor. `Worker::resume` hides the base one and answers `awaiting` while the Worker's coroutine is suspended on a watched pool request; the request's waker enqueues it again. Only pool requests are watched: anything else a Worker awaits that settles asynchronously is polled (spins) unless it carries `actor_parking_t::watch`'s waker and reports `suspending_on` / `resumed` around its `co_await`, as `db::backend_t::answer` and `Worker::run_transfer` do
+- A waker that finds the Worker not parked sends it `Worker::wake`, a no-op message (at most one queued at a time): actor-zeta 1.2.0 leaves a cooperative actor blocked on its mailbox when, after resuming one awaited answer, its handler suspends on a second one (`cooperative_actor::resume_impl` re-checks `is_busy()` only inside its message loop)
 - A subquery inside an expression is dropped: the engine transformer lowers `WHERE x IN (SELECT …)` (and likely `EXISTS` / a scalar subquery) into a plan of its own in `execution_plan_t::sub_queries`, while `GreenplumParser::parse` keeps only the main plan (`binder.node_ptr()`) and `OtterbrixDataManager::execute_plan` runs that alone — the statement answers without the subquery's rows and without an error, even over local tables
 - Array types support only single dimension (see the `TODO: multiple dimentions array` in `write_column_def`, `otterbrix/query_generation/sql_query_generator.cpp`)
 - Docker MariaDB volumes lag on cold start — `docker-run-tests.sh` has a 120 s wait

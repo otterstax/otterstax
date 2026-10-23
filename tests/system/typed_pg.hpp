@@ -3,7 +3,8 @@
 
 #pragma once
 
-#include "integration/postgresql/connection_manager.hpp"
+#include "connectors/postgresql/driver.hpp"
+#include "integration/backends.hpp"
 #include "typed_backend.hpp"
 
 #include "../mock/aliases.hpp"
@@ -29,13 +30,7 @@ namespace otterstax::test {
     struct pg_backend {
         using wire = pg_wire;
         using column = wire_column<pg_wire>;
-        using status = pg::Status;
-        using connect_params = pg::connect_params;
-        using connector_iface = pg::IConnector;
-        using connector_manager = pg::ConnectorManager;
-        using manager = db::PostgressManager;
-        using api_params = conn::api_server::PgConnectionParams;
-        using handler_arg = PGresult*;
+        using backend = db::PostgresBackend;
 
         struct clear_result {
             void operator()(PGresult* result) const { PQclear(result); }
@@ -59,7 +54,15 @@ namespace otterstax::test {
                     {"price", pg_wire::float8}};
         }
 
-        static PGresult* view(const answer& result) { return result.get(); }
+        static backend& backend_of(db::backend_set_t& set) { return set.postgresql; }
+        static qualified_name_t scope(const test_connection_t& c) {
+            return qualified_name_t(c.alias, c.database, c.schema, c.table);
+        }
+
+        static conn::statement_outcome_t
+        decode(std::pmr::memory_resource* resource, const answer& result, const conn::statement_t& statement) {
+            return pg::decode(resource, result.get(), statement);
+        }
 
         static answer rows(const std::vector<column>& columns, std::size_t count) {
             answer result(PQmakeEmptyPGresult(nullptr, PGRES_TUPLES_OK));
@@ -105,11 +108,6 @@ namespace otterstax::test {
                     break;
             }
             return probe_refusal(resource);
-        }
-
-        static std::unique_ptr<connector_iface>
-        factory(std::pmr::memory_resource* resource, connect_params params, std::string alias) {
-            return std::make_unique<typed_connector<pg_backend>>(resource, std::move(params), std::move(alias));
         }
 
     private:

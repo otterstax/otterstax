@@ -54,6 +54,14 @@ namespace catalog_ext {
 
 } // namespace catalog_ext
 
+namespace db {
+    template<typename Traits>
+    class backend_t;
+    struct mysql_traits;
+    struct postgres_traits;
+    struct clickhouse_traits;
+} // namespace db
+
 namespace mysql {
     class CatalogManager final : public actor_zeta::actor::actor_mixin<CatalogManager> {
     public:
@@ -70,14 +78,17 @@ namespace mysql {
                        actor_zeta::address_t otterbrix_manager,
                        const otterstax::names::alias_registry_t& aliases);
 
-        // The three backend integration actors (db::MySQLManager,
-        // db::PostgressManager, db::ClickhouseManager). Each one is the sole
-        // driver of its connector manager, so schema discovery is a message to
-        // it (`discover`), never a call into the connector manager from here.
-        // A backend that is not part of the deployment keeps an empty address.
-        void set_backend_managers(actor_zeta::address_t mysql_manager,
-                                  actor_zeta::address_t pg_manager,
-                                  actor_zeta::address_t ch_manager);
+        // The catalog's own instances of the three backends (db::MySQLBackend,
+        // db::PostgresBackend, db::ClickhouseBackend), owned by whoever owns the
+        // catalog and set once before the first message. Schema discovery is
+        // `backend->discover(scope)`, run on the backend's connection pool. A
+        // backend that is not part of the deployment stays null.
+        struct backends_t {
+            db::backend_t<db::mysql_traits>* mysql = nullptr;
+            db::backend_t<db::postgres_traits>* postgresql = nullptr;
+            db::backend_t<db::clickhouse_traits>* clickhouse = nullptr;
+        };
+        void set_backends(backends_t backends);
 
         std::pmr::memory_resource* resource() const noexcept { return resource_; }
 
@@ -91,7 +102,8 @@ namespace mysql {
         // Discovers the table(s) `name` designates on the backend of `type`
         // (empty collection → every table of the database/schema), registers
         // them in the engine and mirrors them in the store. Sent by
-        // ConnectorManager::addConnection, which knows its backend; a uid that
+        // ComponentManager::register_connections once the alias's pool is open,
+        // with the alias's backend type; a uid that
         // is already registered under another type is an invalid_parameter
         // error. Lazily re-run from the pre-pass with the registered type.
         actor_zeta::unique_future<core::error_t> add_connection_schema(qualified_name_t name,
@@ -138,9 +150,7 @@ namespace mysql {
         // engine pg_class OID.
         otterstax::catalog::schema_store_t store_;
         actor_zeta::address_t otterbrix_manager_;
-        actor_zeta::address_t mysql_manager_;
-        actor_zeta::address_t pg_manager_;
-        actor_zeta::address_t ch_manager_;
+        backends_t backends_;
         const otterstax::names::alias_registry_t& aliases_;
         OTX_LOCKABLE_N(std::mutex, mutex_, "CatalogManager::mutex");
         actor_zeta::behavior_t current_behavior_;
@@ -163,12 +173,11 @@ namespace mysql {
         // the pass MUTATES the parsed data (name normalization, store fills).
         actor_zeta::unique_future<core::error_t> ensure_external_targets_registered(ParsedQueryData& data);
         // Body of add_connection_schema once the backend type is settled:
-        // discovery through the backend actor, engine registration, store
+        // discovery through the backend, engine registration, store
         // mirror, registry entry.
         actor_zeta::unique_future<core::error_t> register_tables(const qualified_name_t& name,
                                                                  catalog_ext::ConnectionType type);
-        // Asks the backend actor of `conn_type` for the table(s) `name`
-        // designates. Unified contract for all three backends: empty
+        // Asks the backend of `conn_type` for the table(s) `name` designates. Unified contract for all three backends: empty
         // `name.collection` → discover every table of the configured
         // database/schema; non-empty → discover that single table. Does NOT
         // touch the engine catalog, the local store or the connection

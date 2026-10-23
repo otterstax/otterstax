@@ -2,6 +2,7 @@ set(SCHEDULER_HEADERS
     scheduler.hpp
     session_data.hpp
     worker.hpp
+    parking.hpp
 )
 
 set(SCHEDULER_SOURCES

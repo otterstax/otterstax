@@ -2,29 +2,29 @@ add_subdirectory(s3)
 add_subdirectory(file)
 
 set(CONNECTORS_HEADERS
-    mysql/connector.hpp
+    common/statement.hpp
+    common/driver.hpp
+    common/pool_config.hpp
+    common/work_pool.hpp
+    common/connection_pool.hpp
+    common/transfer.hpp
+    common/wait.hpp
+    mysql/driver.hpp
     mysql/errors.hpp
-    mysql/manager.hpp
     postgresql/types.hpp
-    postgresql/connector.hpp
+    postgresql/driver.hpp
     postgresql/errors.hpp
-    postgresql/manager.hpp
     clickhouse/types.hpp
-    clickhouse/connector.hpp
+    clickhouse/driver.hpp
     clickhouse/errors.hpp
-    clickhouse/manager.hpp
-    api_connections/connection_config.hpp
-    api_connections/pg_connection_config.hpp
-    api_connections/ch_connection_config.hpp
 )
 
 set(CONNECTORS_SOURCES
-    mysql/connector.cpp
-    mysql/manager.cpp
-    postgresql/connector.cpp
-    postgresql/manager.cpp
-    clickhouse/connector.cpp
-    clickhouse/manager.cpp
+    common/connection_pool.cpp
+    common/transfer.cpp
+    mysql/driver.cpp
+    postgresql/driver.cpp
+    clickhouse/driver.cpp
 )
 
 add_library(connectors

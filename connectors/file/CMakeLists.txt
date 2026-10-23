@@ -1,10 +1,10 @@
 set(FILE_HEADERS
     types.hpp
-    manager.hpp
+    driver.hpp
 )
 
 set(FILE_SOURCES
-    manager.cpp
+    driver.cpp
 )
 
 add_library(file

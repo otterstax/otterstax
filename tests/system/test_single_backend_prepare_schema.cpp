@@ -598,7 +598,7 @@ TEMPLATE_TEST_CASE("backend prepare_schema: a probe the backend refuses fails th
     REQUIRE(std::string{prepared.error().what.c_str()}.find("simulated probe refusal") != std::string::npos);
 }
 
-TEST_CASE("ClickhouseManager::describe: COUNT(*) is prepared as the UInt64 ClickHouse answers and not BIGINT") {
+TEST_CASE("ClickHouse backend describe: COUNT(*) is prepared as the UInt64 ClickHouse answers and not BIGINT") {
     std::pmr::synchronized_pool_resource arena(std::pmr::new_delete_resource());
     actor_stack stack(&arena, {ch_backend::connection});
     mock<ch_backend>::reset({{"n", ch_wire::UInt64}});
@@ -612,7 +612,7 @@ TEST_CASE("ClickhouseManager::describe: COUNT(*) is prepared as the UInt64 Click
     REQUIRE(root_raw(*data).data_chunk().value(0, 0).value<uint64_t>() == cell::uint64(0));
 }
 
-TEST_CASE("ClickhouseManager::describe: score + 1 AS score is prepared as the Int64 ClickHouse widens to") {
+TEST_CASE("ClickHouse backend describe: score + 1 AS score is prepared as the Int64 ClickHouse widens to") {
     std::pmr::synchronized_pool_resource arena(std::pmr::new_delete_resource());
     actor_stack stack(&arena, {ch_backend::connection});
     mock<ch_backend>::reset({{"score", ch_wire::Int64}});
@@ -626,7 +626,7 @@ TEST_CASE("ClickhouseManager::describe: score + 1 AS score is prepared as the In
     REQUIRE(root_raw(*data).data_chunk().value(0, 0).value<int64_t>() == cell::int64(0));
 }
 
-TEST_CASE("ClickhouseManager::describe: the probe's header is read under the discovered named types") {
+TEST_CASE("ClickHouse backend describe: the probe's header is read under the discovered named types") {
     std::pmr::synchronized_pool_resource arena(std::pmr::new_delete_resource());
     actor_stack stack(&arena, {ch_backend::connection});
     mock<ch_backend>::reset({{"rec", ch_wire::NamedTuple}});
@@ -645,7 +645,7 @@ TEST_CASE("ClickhouseManager::describe: the probe's header is read under the dis
     REQUIRE(root_raw(*data).data_chunk().value(0, 1).children()[1].is_null());
 }
 
-TEST_CASE("ClickhouseManager::describe: a probe answered without any block is schema_error") {
+TEST_CASE("ClickHouse backend describe: a probe answered without any block is schema_error") {
     std::pmr::synchronized_pool_resource arena(std::pmr::new_delete_resource());
     actor_stack stack(&arena, {ch_backend::connection});
     mock<ch_backend>::reset({{"n", ch_wire::UInt64}}, ch_backend::probe_mode::no_blocks);
@@ -685,7 +685,7 @@ TEST_CASE("ClickHouse prepare_schema: score + 1 AS score is prepared and streame
                                   arrow::Type::INT64);
 }
 
-TEST_CASE("MySQLManager::describe: score + 1 AS score is prepared as the BIGINT MySQL widens to") {
+TEST_CASE("MySQL backend describe: score + 1 AS score is prepared as the BIGINT MySQL widens to") {
     std::pmr::synchronized_pool_resource arena(std::pmr::new_delete_resource());
     actor_stack stack(&arena, {my_backend::connection});
     mock<my_backend>::reset({{"score", my_wire::bigint}});

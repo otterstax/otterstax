@@ -6,11 +6,14 @@
 #include "utility/logger.hpp"
 #include "utility/tracy_profiler.hpp"
 
-#include "connectors/api_connections/ch_connection_config.hpp"
-#include "connectors/api_connections/connection_config.hpp"
-#include "connectors/api_connections/pg_connection_config.hpp"
-#include "connectors/s3/s3_connect_params.hpp"
+#include "connectors/clickhouse/driver.hpp"
+#include "connectors/file/driver.hpp"
+#include "connectors/mysql/driver.hpp"
+#include "connectors/postgresql/driver.hpp"
+#include "connectors/s3/driver.hpp"
+#include "utility/parse_port.hpp"
 #include "utility/session.hpp"
+#include "utility/settled_future.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -32,6 +35,52 @@ namespace {
             aliases.add(connection.alias, {backend_type_t::ClickHouse, connection.database, {}});
         }
         return aliases;
+    }
+
+    conn::pool_config_t to_pool_config(const config::PoolDesc& pool) {
+        return conn::pool_config_t{
+            .min_size = pool.min_size,
+            .max_size = pool.max_size,
+            .idle_timeout = std::chrono::milliseconds(pool.idle_timeout_ms),
+            .check_after_idle = std::chrono::milliseconds(pool.check_after_idle_ms),
+            .queue_timeout = std::chrono::milliseconds(pool.queue_timeout_ms),
+            .connect_backoff = std::chrono::milliseconds(pool.connect_backoff_ms),
+        };
+    }
+
+    // Opens the alias's pool, then has the catalog discover its tables (`scope`). A
+    // connection whose schema could not be registered is unusable for federated SQL, so its
+    // pool is dropped again. The catalog answers synchronously: its handler runs to
+    // completion on this thread, awaiting the discovery statements the pool runs.
+    core::result_wrapper_t<std::string> open_backend(std::pmr::memory_resource* resource,
+                                                     log_t& log,
+                                                     conn::connection_pool_t& pool,
+                                                     actor_zeta::address_t catalog,
+                                                     const std::string& alias,
+                                                     std::unique_ptr<conn::IDriver> prototype,
+                                                     const config::PoolDesc& pool_desc,
+                                                     qualified_name_t scope,
+                                                     catalog_ext::ConnectionType type) {
+        if (auto err = pool.add(alias, std::move(prototype), to_pool_config(pool_desc)); err.contains_error()) {
+            return std::move(err);
+        }
+        auto [needs_sched, registered] =
+            actor_zeta::send(catalog, &mysql::CatalogManager::add_connection_schema, std::move(scope), type);
+        if (auto err = otterstax::take_settled_error(std::move(registered), resource); err.contains_error()) {
+            log->error("Add connection {} failed: schema registration: {}", alias, err.what.c_str());
+            pool.drop(alias);
+            return std::move(err);
+        }
+        return alias;
+    }
+
+    // An empty port is the backend's default; the config layer already refused a malformed one.
+    core::result_wrapper_t<uint16_t>
+    port_or(const std::string& port, uint16_t fallback, std::pmr::memory_resource* resource) {
+        if (port.empty()) {
+            return fallback;
+        }
+        return otterstax::parse_port(port, resource);
     }
 } // namespace
 
@@ -60,54 +109,13 @@ ComponentManager::ComponentManager(const configuration::config& config, const co
         catalog_manager_ = actor_zeta::spawn<mysql::CatalogManager>(resource_, otterbrix_manager_->address(), aliases_);
         assert(catalog_manager_ != nullptr && "catalog manager must not be null");
 
-        db_connector_manager_ = std::make_unique<mysql::ConnectorManager>(resource_,
-                                                                          catalog_manager_->address(),
-                                                                          &mysql::make_mysql_connector);
-
-        pg_connector_manager_ =
-            std::make_unique<pg::ConnectorManager>(resource_, catalog_manager_->address(), &pg::make_pg_connector);
-
-        ch_connector_manager_ =
-            std::make_unique<ch::ConnectorManager>(resource_, catalog_manager_->address(), &ch::make_ch_connector);
-    }
-
-    {
-        OTX_ZONE_N("ComponentManager::spawn_managers");
-        // Each integration actor starts the io pool of the connector manager it
-        // wraps, so the pools are running before register_connections opens the
-        // first backend. Nothing else starts them.
-        sql_connection_manager_ = actor_zeta::spawn<db::MySQLManager>(resource_, db_connector_manager_.get());
-        assert(sql_connection_manager_ != nullptr && "sql connection manager must not be null");
-
-        pg_connection_manager_ = actor_zeta::spawn<db::PostgressManager>(resource_, pg_connector_manager_.get());
-        assert(pg_connection_manager_ != nullptr && "pg connection manager must not be null");
-
-        ch_connection_manager_actor_ = actor_zeta::spawn<db::ClickhouseManager>(resource_, ch_connector_manager_.get());
-        assert(ch_connection_manager_actor_ != nullptr && "ch connection manager must not be null");
-
-        // The integration actors are the sole drivers of their connector
-        // managers; the catalog reaches a backend only through them (schema
-        // discovery is a message), which is why it learns their addresses
-        // rather than the managers themselves. cyclic dependency: the managers
-        // were built with the catalog's address above.
-        catalog_manager_->set_backend_managers(sql_connection_manager_->address(),
-                                               pg_connection_manager_->address(),
-                                               ch_connection_manager_actor_->address());
-    }
-
-    {
-        OTX_ZONE_N("ComponentManager::spawn_s3");
-        s3_manager_ = actor_zeta::spawn<conn::s3::ConnectorManager>(resource_);
-        assert(s3_manager_ != nullptr && "s3 manager must not be null");
-
-        file_manager_ = actor_zeta::spawn<conn::file::FileManager>(resource_, otterbrix_manager_->address());
-        assert(file_manager_ != nullptr && "file manager must not be null");
-
-        // Integration S3 manager orchestrates the raw s3 + file connectors; the
-        // Scheduler routes s3 CREATE EXTERNAL TABLE / COPY statements to it.
-        s3_integration_manager_ =
-            actor_zeta::spawn<db::S3Manager>(resource_, s3_manager_->address(), file_manager_->address());
-        assert(s3_integration_manager_ != nullptr && "s3 integration manager must not be null");
+        // The pools stay empty until register_connections; the catalog discovers
+        // through its own backends over them.
+        backends_ = std::make_unique<db::backend_registry_t>(resource_);
+        catalog_backends_ = std::make_unique<db::backend_set_t>(resource_, *backends_);
+        catalog_manager_->set_backends({&catalog_backends_->mysql,
+                                        &catalog_backends_->postgresql,
+                                        &catalog_backends_->clickhouse});
     }
 
     {
@@ -123,13 +131,9 @@ ComponentManager::ComponentManager(const configuration::config& config, const co
                                                   worker_count,
                                                   &make_parser,
                                                   aliases_,
-                                                  sql_connection_manager_->address(),
-                                                  pg_connection_manager_->address(),
-                                                  ch_connection_manager_actor_->address(),
+                                                  *backends_,
                                                   otterbrix_manager_->address(),
                                                   catalog_manager_->address(),
-                                                  s3_integration_manager_->address(),
-                                                  file_manager_->address(),
                                                   kafka_manager_->address());
         assert(scheduler_ != nullptr && "scheduler must not be null");
     }
@@ -159,7 +163,8 @@ actor_zeta::address_t ComponentManager::scheduler_address() const { return sched
 actor_zeta::address_t ComponentManager::catalog_address() const { return catalog_manager_->address(); }
 
 core::error_t ComponentManager::register_connections(const config::ConnectionsConfig& connections,
-                                                     const config::ConnectionRetryConfig& retry) {
+                                                     const config::ConnectionRetryConfig& retry,
+                                                     const config::PoolDesc& file_transfers) {
     OTX_ZONE_N("ComponentManager::register_connections");
     auto log = get_logger(logger_tag::Main);
 
@@ -183,16 +188,29 @@ core::error_t ComponentManager::register_connections(const config::ConnectionsCo
             c.alias,
             max_attempts,
             retry_delay,
-            [&] {
-                return db_connector_manager_->addConnection(conn::api_server::ConnectionParams{
-                    .alias = c.alias,
-                    .host = c.host,
-                    .port = c.port,
-                    .username = c.username,
-                    .password = c.password,
-                    .database = c.database,
-                    .table = c.table,
-                });
+            [&]() -> core::result_wrapper_t<std::string> {
+                auto port = port_or(c.port, 3306, resource_);
+                if (port.has_error()) {
+                    return port.convert_error<std::string>();
+                }
+                mysql::connect_params params{
+                    .statement_timeout = std::chrono::milliseconds(c.statement_timeout_ms),
+                };
+                params.server.server_address.emplace_host_and_port(c.host, port.value());
+                params.server.username = c.username;
+                params.server.password = c.password;
+                params.server.database = c.database;
+                // Empty collection → the catalog discovers every table of the
+                // configured database (the configured table is not a filter here).
+                return open_backend(resource_,
+                                    log,
+                                    backends_->mysql,
+                                    catalog_manager_->address(),
+                                    c.alias,
+                                    mysql::make_driver(resource_, std::move(params), c.alias),
+                                    c.pool,
+                                    qualified_name_t(c.alias, c.database, "", ""),
+                                    catalog_ext::ConnectionType::MySQL);
             },
             sleep_for);
         if (opened.has_error()) {
@@ -207,17 +225,28 @@ core::error_t ComponentManager::register_connections(const config::ConnectionsCo
             c.alias,
             max_attempts,
             retry_delay,
-            [&] {
-                return pg_connector_manager_->addConnection(conn::api_server::PgConnectionParams{
-                    .alias = c.alias,
+            [&]() -> core::result_wrapper_t<std::string> {
+                auto port = port_or(c.port, 5432, resource_);
+                if (port.has_error()) {
+                    return port.convert_error<std::string>();
+                }
+                pg::connect_params params{
                     .host = c.host,
-                    .port = c.port,
+                    .port = port.value(),
                     .username = c.username,
                     .password = c.password,
                     .database = c.database,
-                    .schema = c.schema,
-                    .table = c.table,
-                });
+                    .statement_timeout = std::chrono::milliseconds(c.statement_timeout_ms),
+                };
+                return open_backend(resource_,
+                                    log,
+                                    backends_->postgresql,
+                                    catalog_manager_->address(),
+                                    c.alias,
+                                    pg::make_driver(resource_, std::move(params), c.alias),
+                                    c.pool,
+                                    qualified_name_t(c.alias, c.database, c.schema.empty() ? "public" : c.schema, c.table),
+                                    catalog_ext::ConnectionType::PostgreSQL);
             },
             sleep_for);
         if (opened.has_error()) {
@@ -232,16 +261,29 @@ core::error_t ComponentManager::register_connections(const config::ConnectionsCo
             c.alias,
             max_attempts,
             retry_delay,
-            [&] {
-                return ch_connector_manager_->addConnection(conn::api_server::ChConnectionParams{
-                    .alias = c.alias,
+            [&]() -> core::result_wrapper_t<std::string> {
+                auto port = port_or(c.port, 9000, resource_);
+                if (port.has_error()) {
+                    return port.convert_error<std::string>();
+                }
+                ch::connect_params params{
                     .host = c.host,
-                    .port = c.port,
+                    .port = port.value(),
                     .username = c.username,
                     .password = c.password,
                     .database = c.database,
                     .table = c.table,
-                });
+                };
+                // ClickHouse has no schema level: database.table.
+                return open_backend(resource_,
+                                    log,
+                                    backends_->clickhouse,
+                                    catalog_manager_->address(),
+                                    c.alias,
+                                    ch::make_driver(resource_, std::move(params), c.alias),
+                                    c.pool,
+                                    qualified_name_t(c.alias, c.database, "", c.table),
+                                    catalog_ext::ConnectionType::ClickHouse);
             },
             sleep_for);
         if (opened.has_error()) {
@@ -249,9 +291,17 @@ core::error_t ComponentManager::register_connections(const config::ConnectionsCo
         }
     }
 
+    // Local files need no connection: the pool only bounds how many transfers run at once.
+    if (auto err = backends_->transfers.set_files(std::make_shared<conn::file::driver_t>(resource_),
+                                                  to_pool_config(file_transfers));
+        err.contains_error()) {
+        log->error("Failed to open the local-file transfer pool: {}", err.what.c_str());
+        return err;
+    }
+
     for (const auto& c : connections.s3) {
-        // An s3 alias is only stored — no network is touched — so the only way
-        // storing it can fail is the descriptor itself, which no retry fixes.
+        // Building an alias's filesystem touches no network, so the only way it can
+        // fail is the descriptor itself, which no retry fixes.
         conn::s3::connect_params params{
             .region = std::pmr::string{std::string_view{c.region}, resource_},
             .access_key = std::pmr::string{std::string_view{c.access_key}, resource_},
@@ -260,29 +310,15 @@ core::error_t ComponentManager::register_connections(const config::ConnectionsCo
             .endpoint = std::pmr::string{std::string_view{c.endpoint}, resource_},
             .alias = std::pmr::string{std::string_view{c.alias}, resource_},
         };
-        auto [needs_sched, stored] = actor_zeta::send(s3_manager_->address(),
-                                                      &conn::s3::ConnectorManager::add_credentials,
-                                                      session_id().hash(),
-                                                      std::move(params));
-        // The s3 actor runs its handler to completion on the sending thread, so
-        // the future is settled once send() returns; anything else means the
-        // alias was not stored.
-        if (stored.failed()) {
-            log->error("Failed to register s3 alias '{}': actor rejected the request", c.alias);
-            return core::error_t(
-                core::error_code_t::io_error,
-                std::pmr::string{("s3 alias '" + c.alias + "': actor rejected the request").c_str(), resource_});
+        auto driver = conn::s3::driver_t::make(resource_, params, std::chrono::milliseconds(c.connect_timeout_ms));
+        if (driver.has_error()) {
+            log->error("Failed to register s3 alias '{}': {}", c.alias, driver.error().what.c_str());
+            return driver.error();
         }
-        if (!stored.is_ready()) {
-            log->error("Failed to register s3 alias '{}': actor did not settle the request", c.alias);
-            return core::error_t(
-                core::error_code_t::io_error,
-                std::pmr::string{("s3 alias '" + c.alias + "': actor did not settle the request").c_str(), resource_});
-        }
-        auto result = std::move(stored).take_ready();
-        if (result.has_error()) {
-            log->error("Failed to register s3 alias '{}': {}", c.alias, result.error().what.c_str());
-            return rejected(result);
+        if (auto err = backends_->transfers.add_s3(c.alias, std::move(driver.value()), to_pool_config(c.pool));
+            err.contains_error()) {
+            log->error("Failed to register s3 alias '{}': {}", c.alias, err.what.c_str());
+            return err;
         }
         log->info("Registered s3 alias '{}' (endpoint='{}')", c.alias, c.endpoint);
     }

@@ -28,6 +28,15 @@ namespace config {
 core::result_wrapper_t<ConnectionsConfig> parse_connections(const YAML::Node& connections_node,
                                                             std::pmr::memory_resource* resource);
 
+// Parses a `pool:` block; `field` names it in messages ("pool" inside a
+// connection entry, "service.file_transfers"). A missing node yields the
+// defaults. A setting that is not an integer, an unknown setting, min_size < 1,
+// max_size < min_size, a non-positive idle_timeout_ms / queue_timeout_ms or a
+// negative check_after_idle_ms / connect_backoff_ms is an invalid_parameter.
+core::result_wrapper_t<PoolDesc> parse_pool(const YAML::Node& node,
+                                            const std::string& field,
+                                            std::pmr::memory_resource* resource);
+
 // Per-descriptor validation. Returns a human-readable message naming the first
 // missing required field or the malformed port, or std::nullopt if the entry is
 // complete enough to register. Parsing itself is lenient (missing keys become
@@ -37,7 +46,8 @@ core::result_wrapper_t<ConnectionsConfig> parse_connections(const YAML::Node& co
 //   postgresql       : alias, host, username, database (port/schema default)
 //   s3               : alias, access_key, secret_key
 // A non-empty backend port must be a decimal integer in 1..65535 — the same
-// rule the connectors apply when opening the backend.
+// rule the drivers apply when opening the backend. statement_timeout_ms
+// (mysql/postgresql) and connect_timeout_ms (s3) must be positive.
 std::optional<std::string> validation_error(const MysqlConnectionDesc& c);
 std::optional<std::string> validation_error(const PgConnectionDesc& c);
 std::optional<std::string> validation_error(const ChConnectionDesc& c);

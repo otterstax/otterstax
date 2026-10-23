@@ -198,8 +198,9 @@ elapsed_ms : 45.2
 | `join_cross_engine`  | JOIN across two different engine instances    | 36 ms–1 s       |
 | `join_all`           | 3-way JOIN: MySQL + PostgreSQL + ClickHouse   | 0.18–0.48 s     |
 
-> **Note:** `join_all` reads entire tables and filters in-process — there is no
-> predicate pushdown to backends.
+> **Note:** a cross-backend JOIN such as `join_all` reads each side's table whole and
+> filters in-process — its `WHERE` is not pushed down to the backends (a statement over
+> one backend runs whole on it, `WHERE` included).
 
 ---
 
@@ -211,11 +212,13 @@ PostgreSQL (`pg_`) — in the shapes the cross-backend tests leave out, plus
 
 | Test | What it measures | Sub-tests | Typical latency |
 |------|------------------|-----------|-----------------|
-| `<b>_select_wide` | ~60 k-row results (decoding + row streaming) | `impressions_<alias>_all`, `daily_stats_<alias>_all` | 78–161 ms |
-| `<b>_insert` | `INSERT … VALUES` into the backend's `bench_inserts`; row count = the affected rows the frontend reports | `insert_{100,1000}_rows` | 3–9 ms |
-| `<b>_prepare` | the same statement plain vs prepared (the prepare sends the backend a describe probe) | `{agg,select}_<alias>_{plain,prepared}` | 23–119 ms |
-| `<b>_concurrent` | N sessions at once (N = 1, 4, 8): wall time of the batch and per-session latency | `{agg,select}_<alias>_x{1,4,8}`, `…_x{4,8}_each` | 23–198 ms |
-| `join_concurrent` | N sessions running the same cross-backend JOIN at once | `{mysql2_x_pg2,ch2_x_mysql2,pg1_ch1_mysql2}_x{1,4,8}`, `…_x{4,8}_each` | 32 ms–8.1 s |
+| `<b>_select_wide` | ~60 k-row results (decoding + row streaming) | `impressions_<alias>_all`, `daily_stats_<alias>_all` | 77–163 ms |
+| `<b>_insert` | `INSERT … VALUES` into the backend's `bench_inserts`; row count = the affected rows the frontend reports | `insert_{100,1000}_rows` | 2–8 ms |
+| `<b>_prepare` | the same statement plain vs prepared (the prepare sends the backend a describe probe) | `{agg,select}_<alias>_{plain,prepared}` | 23–118 ms |
+| `<b>_concurrent` | N sessions at once (N = 1, 4, 8): wall time of the batch and per-session latency | `{agg,select}_<alias>_x{1,4,8}`, `…_x{4,8}_each` | 21–78 ms |
+| `join_concurrent` | N sessions running the same cross-backend JOIN at once | `{mysql2_x_pg2,ch2_x_mysql2,pg1_ch1_mysql2}_x{1,4,8}`, `…_x{4,8}_each` | 30 ms–3.5 s |
+| `join_wide` | cross-backend JOINs whose cost is fetching each side (a whole 60 k-row table from MySQL and from PostgreSQL, one-row aggregate) | `count_mysql1_imp_x_pg1_stats`, `sum_mysql1_imp_x_pg1_imp` | TBD |
+| `join_wide_concurrent` | the same from N sessions at once (N = 1, 4, 8) | `…_x{1,4,8}`, `…_x{4,8}_each` | TBD |
 
 ---
 
@@ -235,7 +238,7 @@ extensions; they are part of the default run.
 | `external_dump`       | `COPY (SELECT * FROM <loaded>) TO <target>` — writer + upload                           | `{file,s3}_{parquet,csv,ndjson}` | 50–77 ms |
 | `external_join_cross` | external `regions` ⋈ otterbrix-internal `weights` (`CREATE TABLE` + `INSERT`)           | `{file,s3}_cross` | 37–38 ms |
 | `external_join_all`   | s3 parquet `regions` ⋈ file csv `web_events` ⋈ internal `weights`, all on `campaign_id` | `s3parquet_filecsv_internal` | 76–81 ms |
-| `external_load_concurrent` | N sessions run `CREATE EXTERNAL TABLE` at once (N = 1, 4, 8) from `web_events.csv`: wall time of the batch and per-session latency | `{file,s3}_csv_x{1,4,8}`, `…_x{4,8}_each` | 0.15–1.17 s |
+| `external_load_concurrent` | N sessions run `CREATE EXTERNAL TABLE` at once (N = 1, 4, 8) from `web_events.csv`: wall time of the batch and per-session latency | `{file,s3}_csv_x{1,4,8}`, `…_x{4,8}_each` | 0.15–0.39 s |
 
 `external_join_cross` / `external_join_all` deliberately load every side into
 otterbrix-internal storage (external load + a hand-built `bigint` engine table).

@@ -6,26 +6,26 @@
 // directly; the pool, bridge and sizing helpers are shared by every system
 // test that spawns a Scheduler.
 //
-// sql/pg/ch addresses are left empty on purpose. A statement with no external
-// nodes is classified Otterbrix by the Worker itself and never sends to a
-// backend manager, and the external-table path is intercepted before any
-// backend routing — so nothing here reaches an empty address. The catalog is
+// The backend registry has no connection on purpose. A statement with no
+// external nodes is classified Otterbrix by the Worker itself and never reaches
+// a backend, and the external-table path is intercepted before any backend
+// routing; it runs on the registry's local-file transfer pool. The catalog is
 // real (with no connections registered): every CREATE DATABASE / DROP
 // DATABASE asks it whether the name belongs to a connection.
 
 #pragma once
 
 #include "catalog/catalog_manager.hpp"
-#include "connectors/file/manager.hpp"
-#include "connectors/s3/manager.hpp"
+#include "connectors/file/driver.hpp"
 #include "frontend/common/asio_future_bridge.hpp"
+#include "integration/backends.hpp"
 #include "integration/otterbrix/otterbrix_manager.hpp"
-#include "integration/s3/s3_manager.hpp"
 #include "otterbrix/operators/execute_plan.hpp"
 #include "../mock/aliases.hpp"
 #include "otterbrix/parser/parser.hpp"
 #include "scheduler/scheduler.hpp"
 #include "scheduler/session_data.hpp"
+#include "test_helpers.hpp"
 #include "utility/logger.hpp"
 #include "utility/session.hpp"
 
@@ -42,6 +42,7 @@
 #include <algorithm>
 #include <chrono>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <memory_resource>
 #include <string>
@@ -92,7 +93,17 @@ namespace otterstax::test {
         return otterstax::await_future_blocking<session_payload>(std::move(fut), resource, timeout);
     }
 
-    // Owns otterbrix + file/s3 managers + a Scheduler over `parser_factory`.
+    // A registry without connections whose local-file transfer pool is open, as
+    // register_connections leaves it for a config without connections.
+    inline std::unique_ptr<db::backend_registry_t> make_registry(std::pmr::memory_resource* resource) {
+        auto registry = std::make_unique<db::backend_registry_t>(resource);
+        auto opened = registry->transfers.set_files(std::make_shared<conn::file::driver_t>(resource), {});
+        REQUIRE_FALSE(opened.contains_error());
+        return registry;
+    }
+
+    // Owns otterbrix + the backend registry (no connections, a local-file transfer
+    // pool) + a Scheduler over `parser_factory`.
     // Teardown runs in the destructor in dependency order (actors before
     // otterbrix, whose dtor checkpoints to data_dir), so it happens whether the
     // test body returns or a failed REQUIRE unwinds through it.
@@ -108,30 +119,22 @@ namespace otterstax::test {
             , az_scheduler_(make_az_scheduler())
             , otb_mgr_(actor_zeta::spawn<db::OtterbrixManager>(resource_, make_otterbrix_manager(otterbrix_)))
             , catalog_(actor_zeta::spawn<mysql::CatalogManager>(resource_, otb_mgr_->address(), no_aliases()))
-            , file_mgr_(actor_zeta::spawn<conn::file::FileManager>(resource_, otb_mgr_->address()))
-            , s3_conn_(actor_zeta::spawn<conn::s3::ConnectorManager>(resource_))
-            , s3_mgr_(actor_zeta::spawn<db::S3Manager>(resource_, s3_conn_->address(), file_mgr_->address()))
+            , backends_(make_registry(resource_))
             , scheduler_(actor_zeta::spawn<Scheduler>(resource_,
                                                       az_scheduler_.get(),
                                                       worker_pool_size(),
                                                       parser_factory,
                                                       no_aliases(),
-                                                      actor_zeta::address_t::empty_address(), // sql
-                                                      actor_zeta::address_t::empty_address(), // pg
-                                                      actor_zeta::address_t::empty_address(), // ch
+                                                      *backends_,
                                                       otb_mgr_->address(),
-                                                      catalog_->address(),
-                                                      s3_mgr_->address(),
-                                                      file_mgr_->address())) {}
+                                                      catalog_->address())) {}
 
         scheduler_stack_owner(const scheduler_stack_owner&) = delete;
         scheduler_stack_owner& operator=(const scheduler_stack_owner&) = delete;
 
         ~scheduler_stack_owner() {
             scheduler_.reset();
-            s3_mgr_.reset();
-            s3_conn_.reset();
-            file_mgr_.reset();
+            backends_.reset();
             catalog_.reset();
             otb_mgr_.reset();
             az_scheduler_->stop();
@@ -148,9 +151,66 @@ namespace otterstax::test {
         std::unique_ptr<actor_zeta::scheduler::sharing_scheduler> az_scheduler_;
         std::unique_ptr<db::OtterbrixManager, actor_zeta::pmr::deleter_t> otb_mgr_;
         std::unique_ptr<mysql::CatalogManager, actor_zeta::pmr::deleter_t> catalog_;
-        std::unique_ptr<conn::file::FileManager, actor_zeta::pmr::deleter_t> file_mgr_;
-        std::unique_ptr<conn::s3::ConnectorManager, actor_zeta::pmr::deleter_t> s3_conn_;
-        std::unique_ptr<db::S3Manager, actor_zeta::pmr::deleter_t> s3_mgr_;
+        std::unique_ptr<db::backend_registry_t> backends_;
+        std::unique_ptr<Scheduler, actor_zeta::pmr::deleter_t> scheduler_;
+    };
+
+    // A full Scheduler stack over a real engine, a real catalog and the real
+    // parser, whose connections are drivers a test registers through `add`
+    // (mock_backends::add / add_mysql / ...) before the Scheduler exists — the
+    // order register_connections keeps. `aliases` must outlive the owner.
+    class backend_stack_owner {
+    public:
+        using add_fn = std::function<void(mock_backends&, std::pmr::memory_resource*)>;
+
+        backend_stack_owner(const std::string& data_dir, const otterstax::names::alias_registry_t& aliases, add_fn add)
+            : data_dir_(data_dir)
+            , otterbrix_(init_fresh_test_otterbrix(data_dir_))
+            , resource_(otterbrix_->dispatcher()->resource())
+            , az_scheduler_(make_az_scheduler())
+            , otb_mgr_(actor_zeta::spawn<db::OtterbrixManager>(resource_, make_otterbrix_manager(otterbrix_)))
+            , catalog_(actor_zeta::spawn<mysql::CatalogManager>(resource_, otb_mgr_->address(), aliases))
+            , backends_(std::make_unique<mock_backends>(resource_, *catalog_))
+            , scheduler_(spawn_scheduler(aliases, add)) {}
+
+        backend_stack_owner(const backend_stack_owner&) = delete;
+        backend_stack_owner& operator=(const backend_stack_owner&) = delete;
+
+        ~backend_stack_owner() {
+            scheduler_.reset();
+            backends_.reset();
+            catalog_.reset();
+            otb_mgr_.reset();
+            az_scheduler_->stop();
+            otterbrix_.reset();
+            std::filesystem::remove_all(data_dir_);
+        }
+
+        scheduler_stack stack() const { return scheduler_stack{scheduler_->address(), otterbrix_, resource_}; }
+        mock_backends& backends() const { return *backends_; }
+        actor_zeta::address_t catalog() const { return catalog_->address(); }
+
+    private:
+        std::unique_ptr<Scheduler, actor_zeta::pmr::deleter_t>
+        spawn_scheduler(const otterstax::names::alias_registry_t& aliases, const add_fn& add) {
+            add(*backends_, resource_);
+            return actor_zeta::spawn<Scheduler>(resource_,
+                                                az_scheduler_.get(),
+                                                worker_pool_size(),
+                                                &make_parser,
+                                                aliases,
+                                                backends_->registry(),
+                                                otb_mgr_->address(),
+                                                catalog_->address());
+        }
+
+        std::string data_dir_;
+        db::otterbrix_engine_ptr otterbrix_;
+        std::pmr::memory_resource* resource_{nullptr};
+        std::unique_ptr<actor_zeta::scheduler::sharing_scheduler> az_scheduler_;
+        std::unique_ptr<db::OtterbrixManager, actor_zeta::pmr::deleter_t> otb_mgr_;
+        std::unique_ptr<mysql::CatalogManager, actor_zeta::pmr::deleter_t> catalog_;
+        std::unique_ptr<mock_backends> backends_;
         std::unique_ptr<Scheduler, actor_zeta::pmr::deleter_t> scheduler_;
     };
 

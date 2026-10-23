@@ -360,7 +360,7 @@ TEST_CASE("pure engine: group by string key over node_data", "[engine-group-by-s
 }
 
 // Engine defect D1: a backend slice (node_raw_data, exactly what a
-// ConnectorManager substitutes) JOINed against a LOCAL table on a struct-field
+// backend substitutes) JOINed against a LOCAL table on a struct-field
 // key, with a WHERE predicate on the local side that leaves no rows, hands
 // operator_join_t::build_layout_ zero build chunks and it dereferences null.
 // Without the predicate an empty table scans as one empty chunk; with a plain

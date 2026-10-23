@@ -11,6 +11,7 @@
 #include "typed_pg.hpp"
 
 #include "../mock/aliases.hpp"
+#include "../mock/drive.hpp"
 #include "../mock/mock_config.hpp"
 #include "../mock/otterbrix.hpp"
 
@@ -26,91 +27,60 @@
 #include <utility>
 
 namespace otterstax::test {
-    template<class B>
-    class backend_slot {
-    public:
-        explicit backend_slot(std::pmr::memory_resource* resource)
-            : resource_(resource)
-            , manager_(nullptr, actor_zeta::pmr::deleter_t(resource)) {}
-
-        void open(actor_zeta::address_t catalog) {
-            if (connectors_) {
-                return;
-            }
-            connectors_ =
-                std::make_unique<typename B::connector_manager>(resource_, std::move(catalog), &B::factory, 1);
-            manager_ = actor_zeta::spawn<typename B::manager>(resource_, connectors_.get());
-        }
-
-        void add(const test_connection_t& connection) {
-            typename B::api_params params;
-            params.alias = connection.alias;
-            params.host = "localhost";
-            params.database = connection.database;
-            params.table = connection.table;
-            if constexpr (requires(typename B::api_params p) { p.schema; }) {
-                params.schema = connection.schema;
-            }
-            auto added = connectors_->addConnection(std::move(params));
-            INFO("addConnection " << connection.alias << ": "
-                                  << (added.has_error() ? added.error().what.c_str() : "ok"));
-            REQUIRE_FALSE(added.has_error());
-        }
-
-        actor_zeta::address_t address() const {
-            return manager_ ? manager_->address() : actor_zeta::address_t::empty_address();
-        }
-
-    private:
-        std::pmr::memory_resource* resource_;
-        std::unique_ptr<typename B::connector_manager> connectors_;
-        std::unique_ptr<typename B::manager, actor_zeta::pmr::deleter_t> manager_;
-    };
-
+    // The connections of a stack, each over the typed driver of its backend, registered the
+    // way register_connections registers them: pool, then the catalog's discovery.
     class typed_backends {
     public:
         typed_backends(std::pmr::memory_resource* resource,
                        mysql::CatalogManager& catalog,
                        std::initializer_list<test_connection_t> connections)
-            : slots_(backend_slot<my_backend>(resource),
-                     backend_slot<pg_backend>(resource),
-                     backend_slot<ch_backend>(resource)) {
+            : resource_(resource)
+            , backends_(resource, catalog) {
             for (const auto& connection : connections) {
-                visit(connection.backend, [&](auto& slot) { slot.open(catalog.address()); });
-            }
-            catalog.set_backend_managers(address<my_backend>(), address<pg_backend>(), address<ch_backend>());
-            for (const auto& connection : connections) {
-                visit(connection.backend, [&](auto& slot) { slot.add(connection); });
+                switch (connection.backend) {
+                    case backend_type_t::MySQL:
+                        add<my_backend>(connection);
+                        break;
+                    case backend_type_t::PostgreSQL:
+                        add<pg_backend>(connection);
+                        break;
+                    case backend_type_t::ClickHouse:
+                        add<ch_backend>(connection);
+                        break;
+                    default:
+                        FAIL("a typed stack connects MySQL, PostgreSQL and ClickHouse only");
+                }
             }
         }
 
+        // The catalog's backend of type B; a test drives its coroutines directly.
         template<class B>
-        actor_zeta::address_t address() const {
-            return std::get<backend_slot<B>>(slots_).address();
+        typename B::backend& backend() {
+            return B::backend_of(backends_.backends());
         }
+
+        db::backend_registry_t& registry() noexcept { return backends_.registry(); }
 
     private:
-        template<class F>
-        void visit(backend_type_t backend, F&& f) {
-            switch (backend) {
-                case backend_type_t::MySQL:
-                    return f(std::get<backend_slot<my_backend>>(slots_));
-                case backend_type_t::PostgreSQL:
-                    return f(std::get<backend_slot<pg_backend>>(slots_));
-                case backend_type_t::ClickHouse:
-                    return f(std::get<backend_slot<ch_backend>>(slots_));
-                default:
-                    FAIL("a typed stack connects MySQL, PostgreSQL and ClickHouse only");
-            }
+        template<class B>
+        void add(const test_connection_t& connection) {
+            auto added = backends_.add(connection.backend,
+                                       connection.alias,
+                                       std::make_unique<typed_driver<B>>(resource_, connection.alias),
+                                       B::scope(connection));
+            INFO("register " << connection.alias << ": " << (added.contains_error() ? added.what.c_str() : "ok"));
+            REQUIRE_FALSE(added.contains_error());
         }
 
-        std::tuple<backend_slot<my_backend>, backend_slot<pg_backend>, backend_slot<ch_backend>> slots_;
+        std::pmr::memory_resource* resource_;
+        mock_backends backends_;
     };
 
     class actor_stack {
     public:
         actor_stack(std::pmr::memory_resource* resource, std::initializer_list<test_connection_t> connections)
-            : aliases_(make_aliases(connections))
+            : resource_(resource)
+            , aliases_(make_aliases(connections))
             , otterbrix_manager_(actor_zeta::spawn<db::OtterbrixManager>(
                   resource,
                   std::make_unique<SimpleMockOtterbrixManager>(mock_config{.resource = resource})))
@@ -135,12 +105,12 @@ namespace otterstax::test {
 
         template<class B>
         core::result_wrapper_t<ParsedQueryDataPtr> describe(session_hash_t id, ParsedQueryDataPtr data) {
-            return settle(actor_zeta::send(backends_.address<B>(), &B::manager::describe, id, std::move(data)));
+            return drive(resource_, backends_.backend<B>().describe(id, std::move(data)));
         }
 
         template<class B>
         core::result_wrapper_t<ParsedQueryDataPtr> execute(session_hash_t id, ParsedQueryDataPtr data) {
-            return settle(actor_zeta::send(backends_.address<B>(), &B::manager::execute, id, std::move(data)));
+            return drive(resource_, backends_.backend<B>().execute(id, std::move(data)));
         }
 
     private:
@@ -151,6 +121,7 @@ namespace otterstax::test {
             return std::move(future).take_ready();
         }
 
+        std::pmr::memory_resource* resource_;
         otterstax::names::alias_registry_t aliases_;
         std::unique_ptr<db::OtterbrixManager, actor_zeta::pmr::deleter_t> otterbrix_manager_;
         std::unique_ptr<mysql::CatalogManager, actor_zeta::pmr::deleter_t> catalog_;
@@ -174,13 +145,9 @@ namespace otterstax::test {
                                                       worker_pool_size(),
                                                       &make_parser,
                                                       aliases_,
-                                                      backends_->address<my_backend>(),
-                                                      backends_->address<pg_backend>(),
-                                                      backends_->address<ch_backend>(),
+                                                      backends_->registry(),
                                                       otb_mgr_->address(),
-                                                      catalog_->address(),
-                                                      actor_zeta::address_t::empty_address(),
-                                                      actor_zeta::address_t::empty_address())) {}
+                                                      catalog_->address())) {}
 
         stack_owner(const stack_owner&) = delete;
         stack_owner& operator=(const stack_owner&) = delete;

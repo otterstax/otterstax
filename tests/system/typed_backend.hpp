@@ -3,13 +3,11 @@
 
 #pragma once
 
+#include "../mock/mock_driver.hpp"
+#include "connectors/common/driver.hpp"
 #include "plan_stubs.hpp"
 #include "sent_queries.hpp"
-#include "utility/asio_error.hpp"
-#include "utility/function_ref.hpp"
-#include "utility/wait_barrier.hpp"
 
-#include <boost/asio/awaitable.hpp>
 #include <components/vector/data_chunk.hpp>
 #include <core/result_wrapper.hpp>
 
@@ -106,57 +104,49 @@ namespace otterstax::test {
         static inline state_t state_;
     };
 
+    // A connection of backend B answering from mock<B>: a describe probe (kProbePrefix)
+    // with the case's columns in the case's probe mode, the catalog's discovery with B's
+    // own discovery answer, a slot statement with kDataRows rows of the case's columns. Every
+    // answer is put on B's wire and read back by B's own decode — the function the real
+    // driver decodes with — so the chunks and schemas are what a real backend's would be.
+    // Slot statements are recorded per alias (sent_queries.hpp); an affected_rows statement
+    // answers a count of 0.
     template<class B>
-    class typed_connector final : public B::connector_iface {
-        using chunk_ptr = std::unique_ptr<components::vector::data_chunk_t>;
-
+    class typed_driver final : public conn::IDriver {
     public:
-        typed_connector(std::pmr::memory_resource* resource, typename B::connect_params params, std::string alias)
+        typed_driver(std::pmr::memory_resource* resource, std::string alias)
             : resource_(resource)
-            , params_(std::move(params))
             , alias_(std::move(alias)) {}
 
-        typename B::status status() const noexcept override { return B::status::Connected; }
-        typename B::connect_params params() const noexcept override { return params_; }
-        void close() override {}
         core::error_t connect() override { return core::error_t::no_error(); }
-        bool isConnected() override { return true; }
-        core::error_t tryReconnect() override { return core::error_t::no_error(); }
-        bool isClosed() const noexcept override { return false; }
-        std::string alias() const noexcept override { return alias_; }
-
-        boost::asio::awaitable<core::result_wrapper_t<chunk_ptr>>
-        runQuery(std::string_view query,
-                 otterstax::function_ref_t<chunk_ptr(typename B::handler_arg)> handler) override {
-            auto rows = B::rows(mock<B>::data(query), kDataRows);
-            record_sent(alias_, query);
-            co_return otterstax::as_query_result<chunk_ptr>(handler(B::view(rows)));
+        core::error_t ping() override { return core::error_t::no_error(); }
+        void close() noexcept override {}
+        std::unique_ptr<conn::IDriver> clone_disconnected() const override {
+            return std::make_unique<typed_driver>(resource_, alias_);
         }
 
-        boost::asio::awaitable<core::result_wrapper_t<int64_t>>
-        runQuery(std::string_view query, otterstax::function_ref_t<int64_t(typename B::handler_arg)>) override {
-            record_sent(alias_, query);
-            co_return int64_t{0};
-        }
-
-        boost::asio::awaitable<core::error_t>
-        runQuery(std::string_view query,
-                 otterstax::function_ref_t<otterstax::asio_error_t(typename B::handler_arg)> handler) override {
-            if (!query.starts_with(kProbePrefix)) {
-                auto discovered = B::discovery(query);
-                co_return otterstax::as_query_result<otterstax::asio_error_t>(handler(B::view(discovered)));
+        conn::statement_outcome_t execute(const conn::statement_t& statement) override {
+            const std::string_view query = statement.sql;
+            if (query.starts_with(kProbePrefix)) {
+                auto probe = mock<B>::probe(query);
+                auto described = B::describe(probe.columns, probe.mode, resource_);
+                if (described.has_error()) {
+                    return described.error();
+                }
+                return B::decode(resource_, described.value(), statement);
             }
-            auto probe = mock<B>::probe(query);
-            auto described = B::describe(probe.columns, probe.mode, resource_);
-            if (described.has_error()) {
-                co_return described.error();
+            if (is_discovery(statement)) {
+                return B::decode(resource_, B::discovery(query), statement);
             }
-            co_return otterstax::as_query_result<otterstax::asio_error_t>(handler(B::view(described.value())));
+            record_sent(alias_, query, statement.repeatable);
+            if (statement.kind == conn::result_kind::affected_rows) {
+                return conn::statement_result_t{};
+            }
+            return B::decode(resource_, B::rows(mock<B>::data(query), kDataRows), statement);
         }
 
     private:
         std::pmr::memory_resource* resource_;
-        typename B::connect_params params_;
         std::string alias_;
     };
 } // namespace otterstax::test

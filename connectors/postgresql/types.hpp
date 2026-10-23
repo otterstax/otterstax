@@ -3,19 +3,12 @@
 
 #pragma once
 
-#include <string>
+#include <chrono>
 #include <cstdint>
+#include <string>
+#include <string_view>
 
 namespace pg {
-
-    enum class Status
-    {
-        Created,
-        Connected,
-        Disconnected,
-        Working,
-        Closed
-    };
 
     struct connect_params {
         std::string host;
@@ -23,24 +16,33 @@ namespace pg {
         std::string username;
         std::string password;
         std::string database;
-        std::string schema{"public"};  // PostgreSQL schema, defaults to "public"
-        std::string table;             // Table name for this connection
+        // Bounds the connect (libpq's connect_timeout, whole seconds).
+        std::chrono::seconds connect_timeout{10};
+        // Client-side deadline per statement: blocking PQexec has none, so the driver waits
+        // for the answer with poll() against it (driver_t::send).
+        std::chrono::milliseconds statement_timeout{90'000};
 
-        // Reconnect settings
-        uint32_t reconnect_delay_ms{200};
-        uint32_t max_reconnect_attempts{3};
-
-        // Per-attempt connect deadline (seconds); without it PQconnectdb can
-        // block the calling (HTTP API) thread until the OS TCP timeout.
-        uint32_t connect_timeout_s{10};
-
+        // libpq's conninfo string. Every value is single-quoted with ' and \ escaped, so a
+        // password with a space or a quote survives. Besides connect_timeout it sets the
+        // transport bounds libpq offers: keepalives notice a peer that vanished while we wait
+        // for an answer, and tcp_user_timeout (Linux) bounds data the peer never
+        // acknowledges.
         std::string connection_string() const {
-            return "host=" + host +
-                   " port=" + std::to_string(port) +
-                   " dbname=" + database +
-                   " user=" + username +
-                   " password=" + password +
-                   " connect_timeout=" + std::to_string(connect_timeout_s);
+            const auto quoted = [](std::string_view value) {
+                std::string out = "'";
+                for (char c : value) {
+                    if (c == '\'' || c == '\\') {
+                        out += '\\';
+                    }
+                    out += c;
+                }
+                return out + "'";
+            };
+            return "host=" + quoted(host) + " port=" + std::to_string(port) + " dbname=" + quoted(database) +
+                   " user=" + quoted(username) + " password=" + quoted(password) +
+                   " connect_timeout=" + std::to_string(connect_timeout.count()) +
+                   " keepalives=1 keepalives_idle=30 keepalives_interval=10 keepalives_count=3" +
+                   " tcp_user_timeout=30000";
         }
     };
 

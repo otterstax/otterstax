@@ -150,17 +150,56 @@ After `CatalogManager::get_catalog_schema` sets `backend_type` on
 `ParsedQueryData`:
 
 - `Otterbrix` → `OtterbrixManager::execute`
-- `MySQL` → `MySQLManager::execute`
-- `PostgreSQL` → `PostgressManager::execute`
-- `ClickHouse` → `ClickHouseManager::execute`
-- `Mixed` → MySQL → PostgreSQL → ClickHouse → Otterbrix in sequence, each
-  inlining its slice as `node_raw_data`
+- anything else → the Worker's `backends_->execute(id, data, backend)`
+  (`integration/backends.hpp`), which picks the backend:
+  - `MySQL` → `mysql.execute`
+  - `PostgreSQL` → `postgresql.execute`
+  - `ClickHouse` → `clickhouse.execute`
+  - `Mixed` → `execute_mixed`: batch by batch, innermost first, every
+    backend's slots of the batch are sent before the first answer is awaited, so
+    MySQL, PostgreSQL and ClickHouse run side by side and a batch costs the slowest
+    backend, not the sum; each slice is inlined as `node_raw_data`, then the engine
+    runs what is above them (the JOIN)
+
+`prepare_schema` / `prepare_plan` likewise hand a statement with remote slots to
+`backends_->describe`, which asks every backend owning a slot, in that order.
+
+After the backends, `run_pipeline` sends the plan to `OtterbrixManager::execute`
+unless a backend answered the statement whole: when the plan's statement node is the
+slice itself (`plan_statement_node` is a `data_t`), with columns, and the statement is
+no remote DML, `take_backend_result` moves its chunks — already engine-sized
+(`tsl::split_to_capacity`) — straight into the payload. An engine run would only hand
+the same chunks back after a dispatcher round trip. A remote DML keeps the engine
+path for its affected-row count, a column-less slice for the result-shape rules, and a
+plan with anything above the slice (a Mixed JOIN, a backend ⋈ local table) for the
+work the engine still has to do.
+
+Every Worker owns its backends (`db::backend_set_t`, `integration/backends.hpp`)
+over the shared connection pools; a statement is sent to the alias's pool and the
+Worker suspends until a pool thread answers. The Worker is built with its
+sharing_scheduler and owns an `actor_parking_t<Worker>` (`scheduler/parking.hpp`),
+the `conn::wait_owner_t` its backends and transfers report to. actor-zeta 1.2.0
+keeps a cooperative actor whose behavior awaits an unsettled future scheduled and
+re-runs it until the future settles — a busy loop through the scheduler's queue, a
+core per waiting Worker. `Worker::resume` hides the base one (the scheduler calls it
+statically typed): while the behavior is suspended on an unsettled pool request
+(`db::backend_t::answer`, `Worker::run_transfer`) it answers `awaiting` without
+entering the base, the Worker stays marked scheduled (a message sent meanwhile does
+not enqueue it twice), and the request's waker enqueues it again. A waker that finds
+the Worker not parked sends it `Worker::wake` (a no-op message, at most one queued at
+a time: `actor_parking_t::woken`) instead: actor-zeta 1.2.0 leaves a cooperative actor
+blocked on its mailbox when, after resuming one
+awaited answer, its handler suspends on another one — a JOIN's second slot, a Mixed
+statement's second backend, a describe of two stubs. `~actor_parking_t` detaches
+the wakers still in flight, so an answer that arrives during shutdown wakes nobody.
+`test_scheduler_concurrent.cpp` pins the parking by process CPU, and
+`benchmark/microbench/bench_connection_pool.cpp` measures it against the spin.
 
 A query that mixes **one registered backend with one or more
 otterbrix-internal tables** is classified as that **single backend**, not
 Mixed — the parser strips local tables from `external_nodes`
 (`otterbrix/parser/parser.cpp:212`), so the catalog only sees the backend.
-The backend manager fetches its slice, inlines it as `node_raw_data`, and
+The backend fetches its slice, inlines it as `node_raw_data`, and
 hands the mutated plan to `OtterbrixManager`; the engine resolves the
 remaining symbolic local-table nodes via their stamped `table_oid` and runs
 the JOIN in-process. `examples/demo/sql/step_4.sql` exercises this every
@@ -182,12 +221,16 @@ cannot execute this node and would otherwise mis-`static_cast` an `unused` root
 to a `schema_node_t`; `execute_plan` / `prepare_plan` refuse such a root
 instead):
 
-- create → `db::S3Manager::download` (s3://) or `conn::file::FileManager::add_file` (local) — loads into `db.table`
-- copy → parse `inner_sql`, then `db::S3Manager::upload` / `conn::file::FileManager::dump_file`
+- create → `load_t` on the S3 alias's or the local-file transfer pool
+  (`registry.transfers`), then `OtterbrixManager::create_table` with the chunk —
+  loads into `db.table`
+- copy → parse `inner_sql`, run it through `OtterbrixManager::execute`, then
+  `export_t` on the transfer pool writes the result (an unknown s3 alias is refused
+  before the query runs)
 
-The `s3_manager` (`db::S3Manager`) and `file_manager` (`conn::file::FileManager`)
-addresses are passed through the `Scheduler` constructor and forwarded to every
-`Worker` at spawn time. Successful DDL/COPY returns an empty `session_payload`
+The transfer pools are part of the backend registry the `Scheduler` constructor
+takes and every `Worker` gets at spawn time (`connectors/CLAUDE.md`, "S3 and local
+files"). Successful DDL/COPY returns an empty `session_payload`
 through the future; `prepare_schema` returns an empty schema and the work runs
 in `execute`/`execute_statement` (DoGet).
 
@@ -237,8 +280,8 @@ too (`42P01`).
 
 **A remote statement's prepared schema comes from the backend.**
 Right after `CatalogManager::get_catalog_schema`, and before the stub is read,
-`prepare_schema` sends a statement classified `ClickHouse` to
-`ClickhouseManager::describe`, which probes each ClickHouse slot with
+`prepare_schema` hands a statement classified `ClickHouse` to the Worker's
+`backends_->clickhouse.describe`, which probes each ClickHouse slot with
 `SELECT * FROM (<the statement execute would run>) LIMIT 0` and writes the STRUCT
 of the header block the backend answers into the stub, decoded the way `execute`
 decodes its data blocks. It fills the schema field in place rather than rebuilding

@@ -1,32 +1,34 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2025-2026  OtterStax
 //
-// The three backend managers share one execute() shape; MySQLManager stands in
-// for all of them here. What is pinned: the error a query gets when it names a
-// backend nobody registered, a connector that resolves without a result chunk,
-// and a connector failure keeping its own code instead of being flattened. And the
-// engine's chunk bound: a backend slice wider than DEFAULT_VECTOR_CAPACITY rows is
-// substituted as a run of chunks within it (and reaches the engine's cursor that
-// way), while the column-less DML count carrier is substituted whole. And the lifetime
-// of what a converter writes: a converter still running on the io thread when
-// execute() answers an earlier slot's failure writes into slots that are still alive.
+// The three backends share one execute() (db::backend_t); the MySQL backend stands in for all
+// of them here. What is pinned: the error a query gets when it names a backend nobody
+// registered, a driver that answers without a result chunk, and a driver failure keeping its
+// own code instead of being flattened. And the engine's chunk bound: a backend slice wider than
+// DEFAULT_VECTOR_CAPACITY rows is substituted as a run of chunks within it (and reaches the
+// engine's cursor that way), while the column-less DML count carrier is substituted whole. And
+// the lifetime of what a statement still running writes: a statement a pool thread is still
+// decoding when execute() answers an earlier slot's failure writes only into memory that is
+// still alive.
 
 #include "catalog/catalog_manager.hpp"
-#include "otterbrix/translators/output/chunk_to_arrow.hpp"
-#include "integration/clickhouse/connection_manager.hpp"
+#include "connectors/clickhouse/driver.hpp"
+#include "connectors/mysql/driver.hpp"
+#include "connectors/postgresql/driver.hpp"
+#include "integration/backends.hpp"
 #include "integration/otterbrix/otterbrix_manager.hpp"
-#include "integration/postgresql/connection_manager.hpp"
-#include "integration/sql/connection_manager.hpp"
 #include "otterbrix/schema/schema_utils.hpp"
 #include "otterbrix/translators/input/affected_rows_carrier.hpp"
 #include "otterbrix/translators/input/mysql_to_chunk.hpp"
+#include "otterbrix/translators/output/chunk_to_arrow.hpp"
 #include "scheduler_stack.hpp"
 #include "test_helpers.hpp"
 
+#include "../mock/drive.hpp"
 #include "../mock/mock_config.hpp"
+#include "../mock/mock_driver.hpp"
 #include "../mock/otterbrix.hpp"
 #include "../mock/parser.hpp"
-#include "../mock/sql_db_connector.hpp"
 
 #include <actor-zeta.hpp>
 #include <catch2/catch_all.hpp>
@@ -64,24 +66,24 @@
 
 namespace {
 
-    // A connector that answers a data query with no chunk at all.
-    class chunkless_connector final : public mysql::MockConnector {
-    public:
-        chunkless_connector(mock_config config, std::string alias)
-            : mysql::MockConnector(std::move(config), std::move(alias)) {}
+    using otterstax::test::drive;
+    using otterstax::test::mock_backends;
+    using otterstax::test::mock_driver_t;
+    using otterstax::test::scripted_driver_t;
 
-        boost::asio::awaitable<core::result_wrapper_t<std::unique_ptr<data_chunk_t>>>
-        runQuery(std::string_view,
-                 otterstax::function_ref_t<std::unique_ptr<data_chunk_t>(const boost::mysql::results&)>) override {
-            co_return std::unique_ptr<data_chunk_t>{};
-        }
-    };
+    // A driver that answers a slot statement with no chunk at all.
+    std::unique_ptr<conn::IDriver> chunkless_driver(std::pmr::memory_resource*) {
+        return std::make_unique<scripted_driver_t>([](const conn::statement_t&) -> conn::statement_outcome_t {
+            return conn::statement_result_t{};
+        });
+    }
 
-    std::unique_ptr<mysql::IConnector> chunkless_connector_factory(std::pmr::memory_resource* resource,
-                                                                   boost::asio::io_context&,
-                                                                   boost::mysql::connect_params,
-                                                                   std::string alias) {
-        return std::make_unique<chunkless_connector>(mock_config{.resource = resource}, std::move(alias));
+    std::unique_ptr<conn::IDriver> mock_driver(std::pmr::memory_resource* resource) {
+        return std::make_unique<mock_driver_t>(mock_config{.resource = resource}, "1");
+    }
+
+    std::unique_ptr<conn::IDriver> failing_driver(std::pmr::memory_resource* resource) {
+        return std::make_unique<mock_driver_t>(mock_config{.resource = resource, .can_throw = true}, "1");
     }
 
     // More rows than one engine chunk holds (DEFAULT_VECTOR_CAPACITY = 1024).
@@ -107,53 +109,23 @@ namespace {
         return chunk;
     }
 
-    // A connector whose data query answers a result set wider than one engine chunk.
-    class wide_slice_connector final : public mysql::MockConnector {
-    public:
-        wide_slice_connector(mock_config config, std::string alias)
-            : mysql::MockConnector(config, std::move(alias))
-            , resource_(config.resource) {}
-
-        boost::asio::awaitable<core::result_wrapper_t<std::unique_ptr<data_chunk_t>>>
-        runQuery(std::string_view,
-                 otterstax::function_ref_t<std::unique_ptr<data_chunk_t>(const boost::mysql::results&)>) override {
-            co_return std::make_unique<data_chunk_t>(make_wide_slice(resource_));
-        }
-
-    private:
-        std::pmr::memory_resource* resource_;
-    };
-
-    std::unique_ptr<mysql::IConnector> wide_slice_connector_factory(std::pmr::memory_resource* resource,
-                                                                    boost::asio::io_context&,
-                                                                    boost::mysql::connect_params,
-                                                                    std::string alias) {
-        return std::make_unique<wide_slice_connector>(mock_config{.resource = resource}, std::move(alias));
+    // A driver whose slot statement answers a result set wider than one engine chunk.
+    std::unique_ptr<conn::IDriver> wide_slice_driver(std::pmr::memory_resource* resource) {
+        return std::make_unique<scripted_driver_t>([resource](const conn::statement_t&) -> conn::statement_outcome_t {
+            conn::statement_result_t out;
+            out.rows.emplace(make_wide_slice(resource));
+            return out;
+        });
     }
 
-    // A connector whose data query answers a DML count over more rows than one engine chunk holds:
-    // the column-less carrier the translators build from an OK packet / command tag.
-    class wide_carrier_connector final : public mysql::MockConnector {
-    public:
-        wide_carrier_connector(mock_config config, std::string alias)
-            : mysql::MockConnector(config, std::move(alias))
-            , resource_(config.resource) {}
-
-        boost::asio::awaitable<core::result_wrapper_t<std::unique_ptr<data_chunk_t>>>
-        runQuery(std::string_view,
-                 otterstax::function_ref_t<std::unique_ptr<data_chunk_t>(const boost::mysql::results&)>) override {
-            co_return std::make_unique<data_chunk_t>(tsl::make_affected_rows_carrier(resource_, wide_slice_rows));
-        }
-
-    private:
-        std::pmr::memory_resource* resource_;
-    };
-
-    std::unique_ptr<mysql::IConnector> wide_carrier_connector_factory(std::pmr::memory_resource* resource,
-                                                                      boost::asio::io_context&,
-                                                                      boost::mysql::connect_params,
-                                                                      std::string alias) {
-        return std::make_unique<wide_carrier_connector>(mock_config{.resource = resource}, std::move(alias));
+    // A driver whose slot statement answers a DML count over more rows than one engine chunk
+    // holds: the column-less carrier the translators build from an OK packet / command tag.
+    std::unique_ptr<conn::IDriver> wide_carrier_driver(std::pmr::memory_resource* resource) {
+        return std::make_unique<scripted_driver_t>([resource](const conn::statement_t&) -> conn::statement_outcome_t {
+            conn::statement_result_t out;
+            out.rows.emplace(tsl::make_affected_rows_carrier(resource, wide_slice_rows));
+            return out;
+        });
     }
 
     // The chunk of a run holding its global row `row`, and the row's index inside that chunk.
@@ -191,38 +163,31 @@ namespace {
         }
     }
 
-    using otterstax::test::wait_until_ready;
+    using driver_factory = std::unique_ptr<conn::IDriver> (*)(std::pmr::memory_resource*);
 
-    // Catalog + connector manager over `factory` + the MySQL integration actor.
-    // Connection "1" matches the uid SimpleMockParser stamps on its external node.
+    // Catalog + the backends over a mock engine; connection "1" (the uid SimpleMockParser
+    // stamps on its external node) over the driver `factory` makes, once registered.
     struct mysql_stack {
         std::pmr::memory_resource* resource;
         std::unique_ptr<db::OtterbrixManager, actor_zeta::pmr::deleter_t> otterbrix_manager;
         std::unique_ptr<mysql::CatalogManager, actor_zeta::pmr::deleter_t> catalog_manager;
-        std::unique_ptr<mysql::ConnectorManager> connector_manager;
-        std::unique_ptr<db::MySQLManager, actor_zeta::pmr::deleter_t> manager;
+        std::unique_ptr<mock_backends> backends;
+        driver_factory factory;
 
-        mysql_stack(std::pmr::memory_resource* res, mysql::connector_factory factory)
+        mysql_stack(std::pmr::memory_resource* res, driver_factory make)
             : resource(res)
             , otterbrix_manager(actor_zeta::spawn<db::OtterbrixManager>(
                   res,
                   std::make_unique<SimpleMockOtterbrixManager>(mock_config{.resource = res})))
             , catalog_manager(actor_zeta::spawn<mysql::CatalogManager>(res, otterbrix_manager->address(), no_aliases()))
-            , connector_manager(
-                  std::make_unique<mysql::ConnectorManager>(res, catalog_manager->address(), factory, 2))
-            , manager(actor_zeta::spawn<db::MySQLManager>(res, connector_manager.get())) {
-            catalog_manager->set_backend_managers(manager->address(),
-                                                  actor_zeta::address_t::empty_address(),
-                                                  actor_zeta::address_t::empty_address());
-        }
+            , backends(std::make_unique<mock_backends>(res, *catalog_manager))
+            , factory(make) {}
 
         void register_connection_one() {
             // MySQL discovery refuses a connection that names no database.
-            boost::mysql::connect_params params;
-            params.database = "db";
-            auto added = connector_manager->addConnection(std::move(params), "1");
-            INFO("addConnection: " << (added.has_error() ? added.error().what.c_str() : "ok"));
-            REQUIRE_FALSE(added.has_error());
+            auto added = backends->add(backend_type_t::MySQL, "1", factory(resource), qualified_name_t("1", "db", "", ""));
+            INFO("register: " << (added.contains_error() ? added.what.c_str() : "ok"));
+            REQUIRE_FALSE(added.contains_error());
         }
 
         ParsedQueryDataPtr statement() {
@@ -239,18 +204,15 @@ namespace {
         }
 
         core::result_wrapper_t<ParsedQueryDataPtr> execute(ParsedQueryDataPtr data) {
-            auto [needs_sched, future] =
-                actor_zeta::send(manager->address(), &db::MySQLManager::execute, session_hash_t{1}, std::move(data));
-            wait_until_ready(future);
-            return std::move(future).take_ready();
+            return drive(resource, backends->backends().mysql.execute(session_hash_t{1}, std::move(data)));
         }
     };
 
 } // namespace
 
-TEST_CASE("MySQLManager::execute: a node whose backend was never registered is do_not_exists") {
+TEST_CASE("MySQL backend execute: a node whose backend was never registered is do_not_exists") {
     std::pmr::synchronized_pool_resource arena(std::pmr::new_delete_resource());
-    mysql_stack stack(&arena, &mysql_mock_connector_factory);
+    mysql_stack stack(&arena, &mock_driver);
 
     auto result = stack.execute(stack.statement());
 
@@ -259,9 +221,9 @@ TEST_CASE("MySQLManager::execute: a node whose backend was never registered is d
     REQUIRE(std::string{result.error().what.c_str()}.find("'1'") != std::string::npos);
 }
 
-TEST_CASE("MySQLManager::execute: a connector that resolves without a chunk is an error, not a dereference") {
+TEST_CASE("MySQL backend execute: a driver that answers without a chunk is an error, not a dereference") {
     std::pmr::synchronized_pool_resource arena(std::pmr::new_delete_resource());
-    mysql_stack stack(&arena, &chunkless_connector_factory);
+    mysql_stack stack(&arena, &chunkless_driver);
     stack.register_connection_one();
 
     auto result = stack.execute(stack.statement());
@@ -270,24 +232,23 @@ TEST_CASE("MySQLManager::execute: a connector that resolves without a chunk is a
     REQUIRE(std::string{result.error().what.c_str()}.find("returned no result chunk") != std::string::npos);
 }
 
-TEST_CASE("MySQLManager::execute: a connector failure keeps its own error code") {
+TEST_CASE("MySQL backend execute: a driver failure keeps its own error code") {
     std::pmr::synchronized_pool_resource arena(std::pmr::new_delete_resource());
-    mysql_stack stack(&arena, &mysql_mock_connector_factory_throw);
+    mysql_stack stack(&arena, &failing_driver);
     stack.register_connection_one();
 
     auto result = stack.execute(stack.statement());
 
     REQUIRE(result.has_error());
-    // The throw on the io thread is marshalled as io_error by the connector
-    // layer; the manager hands that code through untouched.
+    // The driver answers its failure as io_error; the backend hands that code
+    // through untouched.
     REQUIRE(result.error().type == core::error_code_t::io_error);
-    REQUIRE(std::string{result.error().what.c_str()}.find("MockConnector: exception in runQuery") !=
-            std::string::npos);
+    REQUIRE(std::string{result.error().what.c_str()}.find("mock driver: statement failed") != std::string::npos);
 }
 
-TEST_CASE("MySQLManager::execute: a fetched slot becomes raw data in place") {
+TEST_CASE("MySQL backend execute: a fetched slot becomes raw data in place") {
     std::pmr::synchronized_pool_resource arena(std::pmr::new_delete_resource());
-    mysql_stack stack(&arena, &mysql_mock_connector_factory);
+    mysql_stack stack(&arena, &mock_driver);
     stack.register_connection_one();
 
     auto result = stack.execute(stack.statement());
@@ -297,15 +258,15 @@ TEST_CASE("MySQLManager::execute: a fetched slot becomes raw data in place") {
     auto& data = result.value();
     const auto& slot = data->otterbrix_params->external_nodes.front().front();
     REQUIRE((*slot.node)->type() == components::logical_plan::node_type::data_t);
-    // The mock connector answers two rows of (id, name); a SELECT slot is data,
+    // The mock driver answers two rows of (id, name); a SELECT slot is data,
     // so no remote DML count is recorded.
     REQUIRE(static_cast<const components::logical_plan::node_data_t&>(**slot.node).data_chunk().size() == 2);
     REQUIRE(data->otterbrix_params->remote_affected_rows == OtterbrixStatement::no_remote_dml);
 }
 
-TEST_CASE("MySQLManager::execute: a slice wider than one engine chunk is substituted as a run of chunks within the bound") {
+TEST_CASE("MySQL backend execute: a slice wider than one engine chunk is substituted as a run of chunks within the bound") {
     std::pmr::synchronized_pool_resource arena(std::pmr::new_delete_resource());
-    mysql_stack stack(&arena, &wide_slice_connector_factory);
+    mysql_stack stack(&arena, &wide_slice_driver);
     stack.register_connection_one();
 
     auto result = stack.execute(stack.statement());
@@ -322,9 +283,9 @@ TEST_CASE("MySQLManager::execute: a slice wider than one engine chunk is substit
     REQUIRE(data->otterbrix_params->remote_affected_rows == OtterbrixStatement::no_remote_dml);
 }
 
-TEST_CASE("MySQLManager::execute: a DML count carrier over more than 1024 rows is substituted whole") {
+TEST_CASE("MySQL backend execute: a DML count carrier over more than 1024 rows is substituted whole") {
     std::pmr::synchronized_pool_resource arena(std::pmr::new_delete_resource());
-    mysql_stack stack(&arena, &wide_carrier_connector_factory);
+    mysql_stack stack(&arena, &wide_carrier_driver);
     stack.register_connection_one();
 
     auto result = stack.execute(stack.statement());
@@ -341,12 +302,12 @@ TEST_CASE("MySQLManager::execute: a DML count carrier over more than 1024 rows i
     REQUIRE(raw.data_chunk().size() == wide_slice_rows);
 }
 
-TEST_CASE("MySQLManager::execute: a substituted wide slice reaches the engine cursor as chunks within the bound") {
+TEST_CASE("MySQL backend execute: a substituted wide slice reaches the engine cursor as chunks within the bound") {
     // Declared first: the substituted chunks, and the engine's copies of them, live on it.
     std::pmr::synchronized_pool_resource arena(std::pmr::new_delete_resource());
     const std::string data_dir = "/tmp/test_backend_managers_wide_slice_otb";
     {
-        mysql_stack stack(&arena, &wide_slice_connector_factory);
+        mysql_stack stack(&arena, &wide_slice_driver);
         stack.register_connection_one();
         auto result = stack.execute(stack.statement());
         INFO("execute: " << (result.has_error() ? result.error().what.c_str() : "ok"));
@@ -367,11 +328,11 @@ TEST_CASE("MySQLManager::execute: a substituted wide slice reaches the engine cu
 }
 
 // ── A converter still running when execute() answers an earlier failure ──────
-// execute() spawns one query per slot of a batch and answers the first failed
-// future; QueryHandleWaiter's destructor then drains the queries still in flight.
-// A converter that cannot convert its result records why in its conversion_errors
-// slot, from the io thread — so those slots must outlive the drain. Destroyed before
-// it, a converter that is still running writes into freed memory.
+// execute() sends every slot of a batch to the alias's pool and answers the first
+// failed answer, dropping the futures of the slots still in flight. A pool thread
+// still decoding one of them — its converter refusing the result — then settles a
+// promise nobody awaits: the answer must land in the promise's own state, which
+// the pool keeps alive, never in memory the backend already freed.
 
 namespace {
 
@@ -408,37 +369,19 @@ namespace {
     }
 
     // Answers kFailFastSql at once with a backend error, and kSlowUnsupportedSql
-    // kSlowAnswerDelay later by running the manager's converter over
-    // unsupported_column_results().
-    class late_unsupported_connector final : public mysql::MockConnector {
-    public:
-        late_unsupported_connector(mock_config config, std::string alias)
-            : mysql::MockConnector(config, std::move(alias))
-            , resource_(config.resource) {}
-
-        boost::asio::awaitable<core::result_wrapper_t<std::unique_ptr<data_chunk_t>>>
-        runQuery(std::string_view query,
-                 otterstax::function_ref_t<std::unique_ptr<data_chunk_t>(const boost::mysql::results&)> handler)
-            override {
-            if (query.find("fail_fast") != std::string_view::npos) {
-                co_return core::error_t(core::error_code_t::io_error,
-                                        std::pmr::string{"simulated backend failure", resource_});
+    // kSlowAnswerDelay later by decoding unsupported_column_results() — the MySQL
+    // driver's own decode, which refuses it.
+    std::unique_ptr<conn::IDriver> late_unsupported_driver(std::pmr::memory_resource* resource) {
+        return std::make_unique<scripted_driver_t>([resource](const conn::statement_t& statement) -> conn::statement_outcome_t {
+            if (statement.sql.find("fail_fast") != std::string::npos) {
+                return core::error_t(core::error_code_t::io_error,
+                                     std::pmr::string{"simulated backend failure", resource});
             }
             std::this_thread::sleep_for(kSlowAnswerDelay);
-            auto chunk = handler(unsupported_column_results());
+            auto decoded = mysql::decode(resource, unsupported_column_results(), statement);
             ++g_late_conversions;
-            co_return std::move(chunk);
-        }
-
-    private:
-        std::pmr::memory_resource* resource_;
-    };
-
-    std::unique_ptr<mysql::IConnector> late_unsupported_connector_factory(std::pmr::memory_resource* resource,
-                                                                          boost::asio::io_context&,
-                                                                          boost::mysql::connect_params,
-                                                                          std::string alias) {
-        return std::make_unique<late_unsupported_connector>(mock_config{.resource = resource}, std::move(alias));
+            return decoded;
+        });
     }
 
     // Zeroes every block handed back to it and keeps the block until the resource
@@ -496,12 +439,12 @@ namespace {
 
 } // namespace
 
-TEST_CASE("MySQLManager::execute: a converter still running when an earlier slot failed writes into live slots") {
+TEST_CASE("MySQL backend execute: a statement still decoding when an earlier slot failed writes into live memory") {
     g_late_conversions = 0;
     // Declared first: every block the stack frees stays quarantined until the end.
     quarantine_resource arena(std::pmr::new_delete_resource());
     {
-        mysql_stack stack(&arena, &late_unsupported_connector_factory);
+        mysql_stack stack(&arena, &late_unsupported_driver);
         stack.register_connection_one();
         {
             auto converted = tsl::mysql_to_chunk(&arena, unsupported_column_results());
@@ -510,7 +453,7 @@ TEST_CASE("MySQLManager::execute: a converter still running when an earlier slot
         }
 
         // Two slots in one batch on connection "1": the first fails at once, the
-        // second is converted kSlowAnswerDelay later.
+        // second is decoded kSlowAnswerDelay later.
         auto data = stack.statement();
         auto& batch = data->otterbrix_params->external_nodes.front();
         const auto target = batch.front().target;
@@ -535,7 +478,7 @@ TEST_CASE("MySQLManager::execute: a converter still running when an earlier slot
 
 // ── NOT NULL over a backend slice wider than one engine chunk ─────────────────
 // INSERT INTO <local table with a NOT NULL column> SELECT ... FROM <backend>: the
-// backend manager substitutes the SELECT slot with the fetched rows as raw data
+// backend substitutes the SELECT slot with the fetched rows as raw data
 // under the engine's insert, cut into chunks of at most DEFAULT_VECTOR_CAPACITY
 // rows. A NULL in the NOT NULL column must refuse the statement and leave the
 // table empty wherever the NULL row falls.
@@ -551,10 +494,9 @@ TEST_CASE("MySQLManager::execute: a converter still running when an earlier slot
 // refuses its own literal INSERT, which the rc-2 transformer cuts into chunks of
 // DEFAULT_VECTOR_CAPACITY rows (the engine-alone cases).
 //
-// Driven through the real Scheduler→Worker→catalog stack over a typed PostgreSQL
-// mock connector (its discovery answers the table's columns — MySQL discovery
-// needs boost.mysql metadata no test can manufacture; the substitution is the
-// same in all three managers).
+// Driven through the real Scheduler→Worker→catalog stack over a PostgreSQL mock
+// driver (its discovery answers the table's columns; the substitution is the same
+// in all three backends).
 
 namespace {
 
@@ -576,26 +518,29 @@ namespace {
     // The backend table nulls.pgdb.public.src (id INT4 = row, label TEXT =
     // "label_<row>"), whose label is NULL on row NullRow alone.
     template<size_t NullRow>
-    class null_label_pg_connector final : public pg::IConnector {
+    class null_label_pg_driver final : public conn::IDriver {
     public:
-        null_label_pg_connector(std::pmr::memory_resource* resource, pg::connect_params params, std::string alias)
-            : resource_(resource)
-            , params_(std::move(params))
-            , alias_(std::move(alias)) {}
+        explicit null_label_pg_driver(std::pmr::memory_resource* resource)
+            : resource_(resource) {}
 
-        pg::Status status() const noexcept override { return pg::Status::Connected; }
-        pg::connect_params params() const noexcept override { return params_; }
-        void close() override {}
         core::error_t connect() override { return core::error_t::no_error(); }
-        bool isConnected() override { return true; }
-        core::error_t tryReconnect() override { return core::error_t::no_error(); }
-        bool isClosed() const noexcept override { return false; }
-        std::string alias() const noexcept override { return alias_; }
+        core::error_t ping() override { return core::error_t::no_error(); }
+        void close() noexcept override {}
+        std::unique_ptr<conn::IDriver> clone_disconnected() const override {
+            return std::make_unique<null_label_pg_driver>(resource_);
+        }
 
-        // The data query: every row in ONE chunk — the shape pg_to_chunk gives a
+        conn::statement_outcome_t execute(const conn::statement_t& statement) override {
+            if (otterstax::test::is_discovery(statement)) {
+                return discovery(statement);
+            }
+            return conn::statement_result_t{.rows = rows(statement.sql)};
+        }
+
+    private:
+        // The slot statement: every row in ONE chunk — the shape pg_to_chunk gives a
         // result set — with the columns in the generated statement's order.
-        boost::asio::awaitable<core::result_wrapper_t<std::unique_ptr<data_chunk_t>>>
-        runQuery(std::string_view query, otterstax::function_ref_t<std::unique_ptr<data_chunk_t>(PGresult*)>) override {
+        data_chunk_t rows(std::string_view query) const {
             const auto select = query.find("SELECT ");
             const auto from = query.find(" FROM ");
             std::string_view list = query;
@@ -617,31 +562,24 @@ namespace {
                 fields.emplace_back(types::logical_type::INTEGER, "id");
                 fields.emplace_back(types::logical_type::STRING_LITERAL, "label");
             }
-            auto chunk = std::make_unique<data_chunk_t>(resource_, fields, not_null_rows);
+            data_chunk_t chunk(resource_, fields, not_null_rows);
             for (size_t row = 0; row < not_null_rows; ++row) {
-                chunk->set_value(id_col, row, types::logical_value_t(resource_, static_cast<int32_t>(row)));
-                chunk->set_value(label_col,
-                                 row,
-                                 row == NullRow ? types::logical_value_t(resource_, nullptr)
-                                                : types::logical_value_t(resource_, not_null_label(row)));
+                chunk.set_value(id_col, row, types::logical_value_t(resource_, static_cast<int32_t>(row)));
+                chunk.set_value(label_col,
+                                row,
+                                row == NullRow ? types::logical_value_t(resource_, nullptr)
+                                               : types::logical_value_t(resource_, not_null_label(row)));
             }
-            chunk->set_cardinality(not_null_rows);
-            co_return std::move(chunk);
+            chunk.set_cardinality(not_null_rows);
+            return chunk;
         }
 
-        boost::asio::awaitable<core::result_wrapper_t<int64_t>>
-        runQuery(std::string_view, otterstax::function_ref_t<int64_t(PGresult*)>) override {
-            co_return int64_t{0};
-        }
-
-        // Discovery: the pg_enum query lists no enums, the probe answers the
-        // table's attributes.
-        boost::asio::awaitable<core::error_t>
-        runQuery(std::string_view query,
-                 otterstax::function_ref_t<otterstax::asio_error_t(PGresult*)> handler) override {
+        // Discovery: the pg_enum query lists no enums, the probe answers the table's
+        // attributes — decoded by the PostgreSQL driver's own decode.
+        conn::statement_outcome_t discovery(const conn::statement_t& statement) const {
             std::unique_ptr<PGresult, decltype(&PQclear)> result(PQmakeEmptyPGresult(nullptr, PGRES_TUPLES_OK),
                                                                  &PQclear);
-            if (query.find("pg_enum") == std::string_view::npos) {
+            if (statement.sql.find("pg_enum") == std::string::npos) {
                 std::vector<PGresAttDesc> attrs(2);
                 attrs[0].name = const_cast<char*>("id");
                 attrs[0].typid = kNotNullInt4Oid;
@@ -656,102 +594,23 @@ namespace {
                 }
                 PQsetResultAttrs(result.get(), static_cast<int>(attrs.size()), attrs.data());
             }
-            co_return otterstax::as_query_result<otterstax::asio_error_t>(handler(result.get()));
+            return pg::decode(resource_, result.get(), statement);
         }
 
-    private:
         std::pmr::memory_resource* resource_;
-        pg::connect_params params_;
-        std::string alias_;
     };
-
-    template<size_t NullRow>
-    std::unique_ptr<pg::IConnector>
-    null_label_pg_factory(std::pmr::memory_resource* resource, pg::connect_params params, std::string alias) {
-        return std::make_unique<null_label_pg_connector<NullRow>>(resource, std::move(params), std::move(alias));
-    }
-
-    using pg_factory_fn =
-        std::unique_ptr<pg::IConnector> (*)(std::pmr::memory_resource*, pg::connect_params, std::string);
 
     // Real engine, real parser, real catalog; the PostgreSQL connection is the
-    // mock above, registered under kNotNullUid with its table discovered eagerly.
-    class pg_backend_stack_owner {
-    public:
-        // Member order is construction order: every actor is spawned after the
-        // ones whose addresses it takes.
-        pg_backend_stack_owner(const std::string& data_dir, pg_factory_fn factory)
-            : data_dir_(data_dir)
-            , otterbrix_(otterstax::test::init_fresh_test_otterbrix(data_dir_))
-            , resource_(otterbrix_->dispatcher()->resource())
-            , az_scheduler_(otterstax::test::make_az_scheduler())
-            , otb_mgr_(actor_zeta::spawn<db::OtterbrixManager>(resource_, make_otterbrix_manager(otterbrix_)))
-            , catalog_(actor_zeta::spawn<mysql::CatalogManager>(resource_, otb_mgr_->address(), nulls_aliases()))
-            , pg_conn_(std::make_unique<pg::ConnectorManager>(resource_, catalog_->address(), factory, 1))
-            , pg_mgr_(actor_zeta::spawn<db::PostgressManager>(resource_, pg_conn_.get()))
-            , scheduler_(spawn_scheduler()) {}
-
-        pg_backend_stack_owner(const pg_backend_stack_owner&) = delete;
-        pg_backend_stack_owner& operator=(const pg_backend_stack_owner&) = delete;
-
-        ~pg_backend_stack_owner() {
-            scheduler_.reset();
-            pg_mgr_.reset();
-            pg_conn_.reset();
-            catalog_.reset();
-            otb_mgr_.reset();
-            az_scheduler_->stop();
-            otterbrix_.reset();
-            std::filesystem::remove_all(data_dir_);
-        }
-
-        otterstax::test::scheduler_stack stack() const {
-            return otterstax::test::scheduler_stack{scheduler_->address(), otterbrix_, resource_};
-        }
-
-    private:
-        std::unique_ptr<Scheduler, actor_zeta::pmr::deleter_t> spawn_scheduler() {
-            catalog_->set_backend_managers(actor_zeta::address_t::empty_address(),
-                                           pg_mgr_->address(),
-                                           actor_zeta::address_t::empty_address());
-
-            conn::api_server::PgConnectionParams params;
-            params.alias = kNotNullUid;
-            params.host = "localhost";
-            params.port = "5432";
-            params.username = "user";
-            params.password = "pass";
-            params.database = "pgdb";
-            params.schema = "public";
-            params.table = "src";
-            auto added = pg_conn_->addConnection(params);
-            INFO("addConnection: " << (added.has_error() ? added.error().what.c_str() : "ok"));
-            REQUIRE_FALSE(added.has_error());
-
-            return actor_zeta::spawn<Scheduler>(resource_,
-                                                az_scheduler_.get(),
-                                                otterstax::test::worker_pool_size(),
-                                                &make_parser,
-                                                nulls_aliases(),
-                                                actor_zeta::address_t::empty_address(), // sql
-                                                pg_mgr_->address(),
-                                                actor_zeta::address_t::empty_address(), // ch
-                                                otb_mgr_->address(),
-                                                catalog_->address(),
-                                                actor_zeta::address_t::empty_address(), // s3
-                                                actor_zeta::address_t::empty_address()); // file
-        }
-
-        std::string data_dir_;
-        db::otterbrix_engine_ptr otterbrix_;
-        std::pmr::memory_resource* resource_{nullptr};
-        std::unique_ptr<actor_zeta::scheduler::sharing_scheduler> az_scheduler_;
-        std::unique_ptr<db::OtterbrixManager, actor_zeta::pmr::deleter_t> otb_mgr_;
-        std::unique_ptr<mysql::CatalogManager, actor_zeta::pmr::deleter_t> catalog_;
-        std::unique_ptr<pg::ConnectorManager> pg_conn_;
-        std::unique_ptr<db::PostgressManager, actor_zeta::pmr::deleter_t> pg_mgr_;
-        std::unique_ptr<Scheduler, actor_zeta::pmr::deleter_t> scheduler_;
-    };
+    // driver above, registered under kNotNullUid with its table discovered eagerly.
+    template<size_t NullRow>
+    void add_null_label_connection(mock_backends& backends, std::pmr::memory_resource* resource) {
+        auto added = backends.add(backend_type_t::PostgreSQL,
+                                  kNotNullUid,
+                                  std::make_unique<null_label_pg_driver<NullRow>>(resource),
+                                  qualified_name_t(kNotNullUid, "pgdb", "public", "src"));
+        INFO("register: " << (added.contains_error() ? added.what.c_str() : "ok"));
+        REQUIRE_FALSE(added.contains_error());
+    }
 
     constexpr const char* kNotNullTable = "CREATE TABLE nndb.target (id int, label string NOT NULL);";
 
@@ -765,7 +624,7 @@ namespace {
     // INSERT INTO nndb.target SELECT ... FROM the backend table whose label is NULL on row NullRow.
     template<size_t NullRow>
     not_null_insert_outcome_t backend_insert_select_with_null(const std::string& data_dir) {
-        pg_backend_stack_owner owner(data_dir, &null_label_pg_factory<NullRow>);
+        otterstax::test::backend_stack_owner owner(data_dir, nulls_aliases(), &add_null_label_connection<NullRow>);
         auto s = owner.stack();
         session_hash_t id = 9900;
         std::string err;
@@ -861,12 +720,12 @@ TEST_CASE("engine alone: a literal INSERT with a NULL past the first chunk of a 
 }
 
 // ── ClickHouse: nested columns past one engine chunk; a result column named like a base column ──────
-// Real engine, real parser, real catalog over a ClickHouse mock connection whose discovery answers
+// Real engine, real parser, real catalog over a ClickHouse mock driver whose discovery answers
 // chdb.events (id Int32, score Int32, nums Array(Nullable(Int32)), tags Array(Nullable(String)),
 // rec Tuple(a Int32, b Nullable(String))) — the system.columns types and the header block of the
 // `WHERE 1 = 0` probe — and whose data query answers ClickHouse blocks for the generated statement's
-// SELECT list. The blocks go through the ClickhouseManager's own converter: ch_to_chunk under the
-// discovered named types, then split_to_capacity, then the engine.
+// SELECT list. The blocks go through the ClickHouse driver's own decode: ch_to_chunk under the
+// discovered named types; then the backend's split_to_capacity, then the engine.
 
 namespace {
 
@@ -1007,34 +866,38 @@ namespace {
         return columns;
     }
 
-    class events_ch_connector final : public ch::IConnector {
+    // The slot statement: AVG(score) AS score is ClickHouse's Float64 avg under the Int32 column's
+    // name; any other statement is the rows of the columns it selects, in two blocks. Discovery
+    // (system.columns answers the named types, the table probe the header block of every column)
+    // and the describe probe of a prepare, told apart by the wrap describe puts around the
+    // statement — the discovery probe is a `WHERE 1 = 0` over the table and has no `(` after FROM.
+    // The describe probe answers the header of the columns its inner statement projects, rowless,
+    // so a prepare reads the columns the slot statement of that same statement answers: AVG(score)
+    // is the Float64 the slot statement sends under the Int32 column's name. Every answer is
+    // decoded by the ClickHouse driver's own decode, under the named types the statement carries.
+    class events_ch_driver final : public conn::IDriver {
     public:
-        events_ch_connector(ch::connect_params params, std::string alias)
-            : params_(std::move(params))
-            , alias_(std::move(alias)) {}
+        explicit events_ch_driver(std::pmr::memory_resource* resource)
+            : resource_(resource) {}
 
-        ch::Status status() const noexcept override { return ch::Status::Connected; }
-        ch::connect_params params() const noexcept override { return params_; }
-        void close() override {}
         core::error_t connect() override { return core::error_t::no_error(); }
-        bool isConnected() override { return true; }
-        core::error_t tryReconnect() override { return core::error_t::no_error(); }
-        bool isClosed() const noexcept override { return false; }
-        std::string alias() const noexcept override { return alias_; }
+        core::error_t ping() override { return core::error_t::no_error(); }
+        void close() noexcept override {}
+        std::unique_ptr<conn::IDriver> clone_disconnected() const override {
+            return std::make_unique<events_ch_driver>(resource_);
+        }
 
-        // The data query: AVG(score) AS score is ClickHouse's Float64 avg under the Int32 column's name;
-        // any other statement is the rows of the columns it selects, in two blocks.
-        boost::asio::awaitable<core::result_wrapper_t<std::unique_ptr<data_chunk_t>>>
-        runQuery(std::string_view query,
-                 otterstax::function_ref_t<std::unique_ptr<data_chunk_t>(const ch::select_result_t&)> handler)
-            override {
-            ch::select_result_t outcome;
-            if (query.find("AVG(") != std::string_view::npos) {
+        conn::statement_outcome_t execute(const conn::statement_t& statement) override {
+            const std::string_view query = statement.sql;
+            ch::select_result_t answer;
+            if (otterstax::test::is_discovery(statement)) {
+                answer.blocks.push_back(discovery_block(query));
+            } else if (query.find("AVG(") != std::string_view::npos) {
                 auto averages = std::make_shared<clickhouse::ColumnFloat64>();
                 averages->Append(ch_average_score);
                 clickhouse::Block block;
                 block.AppendColumn("score", averages);
-                outcome.blocks.push_back(std::move(block));
+                answer.blocks.push_back(std::move(block));
             } else {
                 const auto columns = ch_projected_columns(query);
                 const std::pair<size_t, size_t> ranges[] = {{0, ch_first_block_rows},
@@ -1044,26 +907,14 @@ namespace {
                     for (const auto name : columns) {
                         block.AppendColumn(std::string{name}, ch_event_column(name, first, last));
                     }
-                    outcome.blocks.push_back(std::move(block));
+                    answer.blocks.push_back(std::move(block));
                 }
             }
-            co_return handler(outcome);
+            return ch::decode(resource_, answer, statement);
         }
 
-        boost::asio::awaitable<core::result_wrapper_t<int64_t>>
-        runQuery(std::string_view, otterstax::function_ref_t<int64_t(const ch::select_result_t&)>) override {
-            co_return int64_t{0};
-        }
-
-        // Discovery (system.columns answers the named types, the table probe the header block of every
-        // column) and the describe probe of a prepare, told apart by the wrap describe puts around the
-        // statement — the discovery probe is a `WHERE 1 = 0` over the table and has no `(` after FROM.
-        // The describe probe answers the header of the columns its inner statement projects, rowless,
-        // so a prepare reads the columns the data query of that same statement answers: AVG(score) is
-        // the Float64 the data query sends under the Int32 column's name.
-        boost::asio::awaitable<core::error_t>
-        runQuery(std::string_view query,
-                 otterstax::function_ref_t<otterstax::asio_error_t(const ch::select_result_t&)> handler) override {
+    private:
+        static clickhouse::Block discovery_block(std::string_view query) {
             constexpr std::string_view describe_probe_prefix = "SELECT * FROM (";
             clickhouse::Block block;
             if (query.find("system.columns") != std::string_view::npos) {
@@ -1089,93 +940,27 @@ namespace {
                     block.AppendColumn(column.name, ch_event_column(column.name, 0, 0));
                 }
             }
-            ch::select_result_t answer;
-            answer.blocks.push_back(std::move(block));
-            co_return otterstax::as_query_result<otterstax::asio_error_t>(handler(answer));
+            return block;
         }
 
-    private:
-        ch::connect_params params_;
-        std::string alias_;
+        std::pmr::memory_resource* resource_;
     };
 
-    std::unique_ptr<ch::IConnector>
-    events_ch_factory(std::pmr::memory_resource*, ch::connect_params params, std::string alias) {
-        return std::make_unique<events_ch_connector>(std::move(params), std::move(alias));
+    // Real engine, real parser, real catalog; the ClickHouse connection is the driver above,
+    // registered under kChUid with chdb.events discovered eagerly.
+    void add_events_connection(mock_backends& backends, std::pmr::memory_resource* resource) {
+        auto added = backends.add(backend_type_t::ClickHouse,
+                                  kChUid,
+                                  std::make_unique<events_ch_driver>(resource),
+                                  qualified_name_t(kChUid, "chdb", "", "events"));
+        INFO("register: " << (added.contains_error() ? added.what.c_str() : "ok"));
+        REQUIRE_FALSE(added.contains_error());
     }
 
-    // Real engine, real parser, real catalog; the ClickHouse connection is the mock above, registered
-    // under kChUid with chdb.events discovered eagerly.
-    class ch_backend_stack_owner {
+    class ch_backend_stack_owner : public otterstax::test::backend_stack_owner {
     public:
-        // Member order is construction order: every actor is spawned after the ones whose addresses it
-        // takes.
         explicit ch_backend_stack_owner(const std::string& data_dir)
-            : data_dir_(data_dir)
-            , otterbrix_(otterstax::test::init_fresh_test_otterbrix(data_dir_))
-            , resource_(otterbrix_->dispatcher()->resource())
-            , az_scheduler_(otterstax::test::make_az_scheduler())
-            , otb_mgr_(actor_zeta::spawn<db::OtterbrixManager>(resource_, make_otterbrix_manager(otterbrix_)))
-            , catalog_(actor_zeta::spawn<mysql::CatalogManager>(resource_, otb_mgr_->address(), chx_aliases()))
-            , ch_conn_(std::make_unique<ch::ConnectorManager>(resource_, catalog_->address(), &events_ch_factory, 1))
-            , ch_mgr_(actor_zeta::spawn<db::ClickhouseManager>(resource_, ch_conn_.get()))
-            , scheduler_(spawn_scheduler()) {}
-
-        ch_backend_stack_owner(const ch_backend_stack_owner&) = delete;
-        ch_backend_stack_owner& operator=(const ch_backend_stack_owner&) = delete;
-
-        ~ch_backend_stack_owner() {
-            scheduler_.reset();
-            ch_mgr_.reset();
-            ch_conn_.reset();
-            catalog_.reset();
-            otb_mgr_.reset();
-            az_scheduler_->stop();
-            otterbrix_.reset();
-            std::filesystem::remove_all(data_dir_);
-        }
-
-        otterstax::test::scheduler_stack stack() const {
-            return otterstax::test::scheduler_stack{scheduler_->address(), otterbrix_, resource_};
-        }
-
-    private:
-        std::unique_ptr<Scheduler, actor_zeta::pmr::deleter_t> spawn_scheduler() {
-            catalog_->set_backend_managers(actor_zeta::address_t::empty_address(),
-                                           actor_zeta::address_t::empty_address(),
-                                           ch_mgr_->address());
-
-            ch::connect_params params;
-            params.host = "localhost";
-            params.database = "chdb";
-            params.table = "events";
-            auto added = ch_conn_->addConnection(std::move(params), kChUid);
-            INFO("addConnection: " << (added.has_error() ? added.error().what.c_str() : "ok"));
-            REQUIRE_FALSE(added.has_error());
-
-            return actor_zeta::spawn<Scheduler>(resource_,
-                                                az_scheduler_.get(),
-                                                otterstax::test::worker_pool_size(),
-                                                &make_parser,
-                                                chx_aliases(),
-                                                actor_zeta::address_t::empty_address(), // sql
-                                                actor_zeta::address_t::empty_address(), // pg
-                                                ch_mgr_->address(),
-                                                otb_mgr_->address(),
-                                                catalog_->address(),
-                                                actor_zeta::address_t::empty_address(), // s3
-                                                actor_zeta::address_t::empty_address()); // file
-        }
-
-        std::string data_dir_;
-        db::otterbrix_engine_ptr otterbrix_;
-        std::pmr::memory_resource* resource_{nullptr};
-        std::unique_ptr<actor_zeta::scheduler::sharing_scheduler> az_scheduler_;
-        std::unique_ptr<db::OtterbrixManager, actor_zeta::pmr::deleter_t> otb_mgr_;
-        std::unique_ptr<mysql::CatalogManager, actor_zeta::pmr::deleter_t> catalog_;
-        std::unique_ptr<ch::ConnectorManager> ch_conn_;
-        std::unique_ptr<db::ClickhouseManager, actor_zeta::pmr::deleter_t> ch_mgr_;
-        std::unique_ptr<Scheduler, actor_zeta::pmr::deleter_t> scheduler_;
+            : backend_stack_owner(data_dir, chx_aliases(), &add_events_connection) {}
     };
 
     // Row `row` of chdb.events, read at row `at` of `chunk`, whose columns are (id, nums, tags, rec).
@@ -1228,7 +1013,7 @@ namespace {
 
 } // namespace
 
-TEST_CASE("ClickhouseManager slice: 2500 rows with LIST and STRUCT columns reach the engine cursor intact") {
+TEST_CASE("ClickHouse backend slice: 2500 rows with LIST and STRUCT columns reach the engine cursor intact") {
     ch_backend_stack_owner owner("/tmp/test_backend_managers_ch_nested_otb");
     auto s = owner.stack();
 
@@ -1255,7 +1040,7 @@ TEST_CASE("ClickhouseManager slice: 2500 rows with LIST and STRUCT columns reach
     }
 }
 
-TEST_CASE("ClickhouseManager slice: an engine JOIN on the scalar id keeps the LIST and STRUCT values of its rows") {
+TEST_CASE("ClickHouse backend slice: an engine JOIN on the scalar id keeps the LIST and STRUCT values of its rows") {
     ch_backend_stack_owner owner("/tmp/test_backend_managers_ch_join_otb");
     auto s = owner.stack();
     session_hash_t id = 9960;

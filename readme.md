@@ -137,7 +137,7 @@ CREATE EXTERNAL TABLE otter.regions
 ```
 
 Ready-made `config.yaml` files ship with each runnable stack: `examples/demo/`,
-`examples/simple/example_connetion/`, `tests/scripts/`, `scripts/database/`, and
+`examples/quick_start/`, `tests/scripts/`, `scripts/database/`, and
 `benchmark/` (plus a template at the repo root).
 
 ## S3 / file external tables
@@ -193,11 +193,12 @@ COPY (SELECT * FROM db.t) TO 's3://bucket/exported/out.csv'
   The `endpoint` field switches the underlying Arrow S3 client to http +
   path-style addressing (needed for RustFS and other S3-compatible stores); omit it to target real AWS.
 
-Implementation lives under `connectors/{s3,file}/` (raw I/O),
-`integration/s3/` (the `S3Manager` orchestrator), and
+Implementation lives under `connectors/{s3,file}/` (the transfer drivers),
+`connectors/common/transfer.*` (the per-alias transfer pools), `scheduler/worker.cpp`
+(`load_external_table` / `copy_to`), and
 `otterbrix/parser/grammar_extention/{s3,file}/` (the parser extensions). The
 top-level [`CLAUDE.md`](CLAUDE.md#external-tables--file--s3) has the full
-end-to-end actor flow.
+end-to-end flow.
 
 ## Requirements
 
@@ -236,13 +237,19 @@ docker compose up
    section to point at your backends and s3 aliases, then restart the server —
    connections are read only at startup (there is no runtime registration step).
 
-4. Run example queries using the Python client:
+4. Run an example federated query over the PostgreSQL wire (any client works; the
+   wire ignores credentials):
 
 ```bash
-python examples/simple/flight_sql_example.py examples/simple/example_1.txt
+psql -h localhost -p 8817 -U otterstax -c "SELECT * FROM campaigns.db1.campaigns c
+  JOIN impressions.db2.impressions i ON c.campaign_id = i.campaign_id
+  WHERE c.campaign_length > 30 ORDER BY i.clicks DESC;"
 ```
 
-3. (Optional) Add example database connections used by clients:
+### Building locally
+
+Size the build to your RAM first: each compile job needs ~1.5 GB, so use
+`JOBS = min(nCPU, floor(RAM_MB / 1536))`.
 
 1. Install and configure Conan (example using a recommended version):
 
@@ -263,14 +270,14 @@ conan install ../conanfile.py --build missing -s build_type=Release
 3. Configure and build with CMake:
 
 ```bash
-cmake -S .. -B . -DCMAKE_BUILD_TYPE=Release
-cmake --build . -- -j$(nproc)
+cmake -S .. -B . -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=generators/conan_toolchain.cmake
+cmake --build . --parallel <JOBS>
 ```
 
-4. Run the server (from the build directory or repo root if configured):
+4. Run the server (`--config` defaults to `config.yaml` in the working directory):
 
 ```bash
-./build/server
+./server --config ../config.yaml
 ```
 
 ## Command-line Options
@@ -285,7 +292,7 @@ cmake --build . -- -j$(nproc)
 ### Run integration tests (Docker-based)
 
 ```bash
-./build/server
+./docker-run-tests.sh -j <JOBS>
 ```
 
 The script brings up MariaDB/PostgreSQL/ClickHouse containers, loads test data,
@@ -297,7 +304,29 @@ tears everything down.
 | `-h`, `--help` | Print usage and exit |
 | `--tracy` | Collect a single Tracy profile for the entire run → `tracy_profiles/<timestamp>/otterstax.tracy` |
 | `--tracy-sep` | Collect one Tracy profile **per test** → `tracy_profiles/<timestamp>/<test_name>.tracy`. Otterstax is restarted between tests so each file is cleanly finalised. |
-| `-j N` | Parallel jobs for the Docker image build (default: all cores inside the container) |
+| `-j N` | Parallel jobs for the Docker image build (default: all cores inside the container — cap it to Docker's RAM, ~1.5 GB per job) |
+
+#### Examples
+
+```bash
+# Plain run
+./docker-run-tests.sh
+
+# Fast build using 4 cores
+./docker-run-tests.sh -j4
+
+# Collect a single Tracy profile for the whole suite
+./docker-run-tests.sh --tracy
+
+# Collect a separate Tracy file for every individual test
+./docker-run-tests.sh --tracy-sep
+
+# Tracy-sep with a faster build
+./docker-run-tests.sh --tracy-sep -j8
+```
+
+Tracy output is written to `tracy_profiles/` in the repository root and is
+never deleted automatically; each run creates a new timestamped sub-directory.
 
 ### Benchmark suite
 
@@ -338,47 +367,30 @@ A default run covers three groups of tests:
 ./benchmark/scripts/run_benchmark.sh --frontend postgres --bench simple_select complex_select --perf-alloc
 ```
 
-#### Examples
-
-```bash
-# Plain run
-./docker-run-tests.sh
-
-# Fast build using 4 cores
-./docker-run-tests.sh -j4
-
-# Collect a single Tracy profile for the whole suite
-./docker-run-tests.sh --tracy
-
-# Collect a separate Tracy file for every individual test
-./docker-run-tests.sh --tracy-sep
-
-# Tracy-sep with a faster build
-./docker-run-tests.sh --tracy-sep -j8
-```
-
-Tracy output is written to `tracy_profiles/` in the repository root and is
-never deleted automatically; each run creates a new timestamped sub-directory.
-
 ### Unit tests (containerized)
 
-## Testing
+Building the test image compiles every Catch2 suite and runs them with `ctest`; a
+failing test fails the build:
 
-### Run integration tests (Docker-based)
+```bash
+docker build -f Dockerfile.test --build-arg BUILD_JOBS=<JOBS> -t otterstax-test .
+```
+
+## Project structure
 
 ```
 otterstax/
-├── frontend/           # Protocol servers (FlightSQL, MySQL, PostgreSQL)
+├── frontend/           # Protocol servers (Flight SQL, MySQL, PostgreSQL, Spark Connect)
 ├── catalog/            # Metadata catalog + connection type registry
-├── connectors/         # MySQL / PG / ClickHouse / S3 / file connectors
+├── connectors/         # MySQL / PG / ClickHouse / S3 / file drivers + per-alias pools
 ├── component_manager/  # Component lifecycle management
 ├── config/             # Configuration loading and runtime settings
-├── integration/        # Actor wrappers bridging Scheduler ↔ connectors (incl. S3Manager)
+├── integration/        # Backends over the pools (execute/describe/discover) + engine manager
 ├── otterbrix/          # Otterbrix engine integration + s3/file grammar extensions
-├── scheduler/          # Query routing actor
+├── scheduler/          # Scheduler router + Worker pool (the query pipeline)
 ├── cmake/              # Build helpers (parser-extension macro)
 ├── tests/              # Catch2 C++ tests + python integration suite
-├── examples/           # Demo stack (examples/demo/) + simple client examples (examples/simple/)
+├── examples/           # Demo stack (examples/demo/) + quick start (examples/quick_start/)
 └── fixtures/           # Test data generation
 ```
 

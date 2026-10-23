@@ -8,8 +8,8 @@
 
 #include <filesystem>
 
-// FileManager/S3Manager construction (reachable via the Scheduler stack) calls
-// arrow::fs::EnsureS3Initialized() transitively. Arrow requires a matching
+// Building an s3 driver (conn::s3::driver_t::make, reachable through the
+// ComponentManager and the s3 tests) calls arrow::fs::EnsureS3Initialized(). Arrow requires a matching
 // FinalizeS3() before exit or it warns and may segfault during static teardown;
 // the same guard the server's main.cpp holds does it once the run is over.
 struct S3Finalizer : Catch::EventListenerBase {

@@ -28,9 +28,10 @@ RustFS bucket) so file vs s3 are directly comparable:
   external_load_concurrent   N sessions run CREATE EXTERNAL TABLE at once
                   (N = 1, 4, 8), each into its own table, from the largest
                   fixture (web_events.csv).  Times the batch (wall) and each
-                  session (<sub>_each).  Every s3 and file load goes through
-                  the S3Manager / FileManager actors under their mutexes, so
-                  the wall time shows whether loads run side by side.
+                  session (<sub>_each).  Each load reads and parses on the
+                  alias's (or the local-file) transfer pool, then creates its
+                  table through the engine, so the wall time shows how far
+                  loads run side by side.
 
 The join keys are int64 on every side (parquet/csv loaders emit int64; the
 engine table declares `campaign_id bigint`) — a direct backend.campaign_id

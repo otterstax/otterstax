@@ -15,7 +15,7 @@ there is no runtime add/remove API. To change connections, edit `config.yaml` an
 restart the server.
 
 Actual registration of connections lives one layer up in
-`ComponentManager::register_connections` (it needs the connector managers), which
+`ComponentManager::register_connections` (it owns the connection pools), which
 keeps `config/` free of connector/actor dependencies.
 
 ## Structure
@@ -41,6 +41,8 @@ Nothing in `config/` throws. Every entry point returns a
 | a `service.*` value that cannot be read as its type (`port: abc`) | `invalid_parameter` | the field (`service.mysql.port`) |
 | a connection field that is not a scalar (`host: [a, b]`) | `invalid_parameter` | the section + entry position + field |
 | an incomplete connection entry, or a malformed backend port | `invalid_parameter` | the section + `alias='…'` + the missing field / bad port |
+| a `pool:` block that is not a map, an unknown or non-integer setting, `min_size < 1`, `max_size < min_size`, a non-positive `idle_timeout_ms` / `queue_timeout_ms`, a negative `check_after_idle_ms` / `connect_backoff_ms` | `invalid_parameter` | the section + entry position + `field 'pool…'` (`service.file_transfers` for the service block) |
+| a non-positive `statement_timeout_ms` (mysql/postgresql) or `connect_timeout_ms` (s3) | `invalid_parameter` | the section + `alias='…'` + the field |
 | a backend alias that is not an unquoted SQL identifier (`[a-z_][a-z0-9_]*`), or one another backend entry already uses | `invalid_parameter` | the section + `alias='…'` + the rule, or the section that already uses it |
 
 The yaml-cpp calls (`YAML::LoadFile`, `Node::as<T>()`) are the only throwing
@@ -53,10 +55,16 @@ the value above (`yaml_scalar.hpp` for `as<T>()`, `ConfigReader::load` for
 
 - `config::ServiceConfig` — `{ FlightSqlConfig flight_sql; MysqlConfig mysql;
   PostgresConfig postgres; SparkConnectConfig spark_connect;
-  ConnectionRetryConfig connection_retry; ConnectionsConfig connections; }`. The
-  `flight_sql`/`mysql`/`postgres`/`spark_connect`/`connection_retry` fields come
-  from the top-level `service:` node; `connections` from the `connections:` node
-  of the same file.
+  ConnectionRetryConfig connection_retry; PoolDesc file_transfers;
+  ConnectionsConfig connections; }`. The
+  `flight_sql`/`mysql`/`postgres`/`spark_connect`/`connection_retry`/`file_transfers`
+  fields come from the top-level `service:` node; `connections` from the
+  `connections:` node of the same file.
+- `config::PoolDesc` — `{ min_size = 1; max_size = 4; idle_timeout_ms = 60000;
+  check_after_idle_ms = 30000; queue_timeout_ms = 30000; connect_backoff_ms = 1000; }`:
+  the optional `pool:` block of every connection and `service.file_transfers`, parsed
+  by `parse_pool(node, field, resource)`; `ComponentManager` turns it into a
+  `conn::pool_config_t` (`connectors/CLAUDE.md`, "Pools").
 - `config::SparkConnectConfig` — `{ std::string host = "0.0.0.0";
   uint16_t port = 15002; }`: the listen address `main.cpp` hands to the Spark
   Connect gRPC server (`frontend::spark::SparkConnectServerConfig`).
@@ -66,8 +74,10 @@ the value above (`yaml_scalar.hpp` for `as<T>()`, `ConfigReader::load` for
 - `config::ConnectionsConfig` — `{ vector<MysqlConnectionDesc> mysql;
   vector<PgConnectionDesc> postgresql; vector<ChConnectionDesc> clickhouse;
   vector<S3CredentialDesc> s3; }`. The descriptor structs are plain data
-  (`alias/host/port/username/password/database[/schema]/table` for backends;
-  `alias/access_key/secret_key/region/session_token/endpoint` for s3).
+  (`alias/host/port/username/password/database[/schema]/table` and a `pool` for
+  backends, plus `statement_timeout_ms` = 90000 for mysql/postgresql;
+  `alias/access_key/secret_key/region/session_token/endpoint`,
+  `connect_timeout_ms` = 1000 and a `pool` for s3).
 
 ## Parsing split
 
@@ -112,11 +122,13 @@ main.cpp
         parse_connections validates every entry → the first incomplete one is an invalid_parameter;
         ConfigReader::load logs it and returns it → main logs it and returns 1 (server never starts:
         the reader runs on its own pmr resource before ComponentManager — engine, actors, pools — exists)
-  → ComponentManager::register_connections(server_config.connections, server_config.connection_retry)
+  → ComponentManager::register_connections(connections, connection_retry, file_transfers)
         (descriptors are already validated) — opens each backend:
-        mysql/pg/ch: ConnectorManager::addConnection(conn::api_server::*Params)   — retried up to
+        mysql/pg/ch: a driver → its type's connection pool (min_size connections), then the
+                     catalog discovers the alias's tables — retried up to
                      connection_retry.max_attempts (delay_ms between tries)
-        s3         : actor send &conn::s3::ConnectorManager::add_credentials      — stores the alias (no retry)
+        local files: the local-file transfer pool (file_transfers)
+        s3         : the alias's S3FileSystem → its transfer pool (no retry)
 ```
 
 Two failure modes, deliberately different:
@@ -152,10 +164,14 @@ service:
   postgres:   { port: 8817 }        # wire-server port
   spark_connect: { host: "0.0.0.0", port: 15002 }   # Spark Connect gRPC server
   connection_retry: { max_attempts: 10, delay_ms: 2000 }
+  file_transfers: { min_size: 1, max_size: 4 }      # optional; local-file transfers at once
 
 connections:
   mysql:
-    - { alias: <a>, host: <h>, port: "<p>", username: <u>, password: <pw>, database: <db>, table: "" }
+    - { alias: <a>, host: <h>, port: "<p>", username: <u>, password: <pw>, database: <db>, table: "",
+        statement_timeout_ms: 90000,                 # optional (mysql/postgresql)
+        pool: { min_size: 1, max_size: 4, idle_timeout_ms: 60000, check_after_idle_ms: 30000,
+                queue_timeout_ms: 30000, connect_backoff_ms: 1000 } }   # optional, every section
   postgresql:
     - { alias: <a>, host: <h>, port: "<p>", username: <u>, password: <pw>, database: <db>, schema: <s>, table: "" }
   clickhouse:
@@ -166,7 +182,9 @@ connections:
 
 `port` is an **optional string** (empty → driver default; otherwise a decimal
 integer in 1..65535, anything else aborts startup). `schema` defaults to
-`public`. s3 `region`/`session_token`/`endpoint` are optional. `connection_retry`
+`public`. s3 `region`/`session_token`/`endpoint`/`connect_timeout_ms` are optional.
+Every entry's `pool:` block is optional (the defaults above), and so is
+`service.file_transfers`. `connection_retry`
 is optional (defaults to `max_attempts: 1`, `delay_ms: 1000` = one-shot), and so
 is `spark_connect` (defaults to `0.0.0.0:15002`, either key alone overriding its
 own default).
@@ -192,11 +210,11 @@ rules).
    pass (`connections/connection_config_reader.cpp`).
 3. Add a `validation_error(const <Desc>&)` overload for its required fields
    (`connections/connection_config_reader.{hpp,cpp}`).
-4. Register it in `ComponentManager::register_connections` (descriptors are
-   already validated at parse time — just convert the descriptor → the
-   connector's param struct and call `addConnection` inside the retry helper).
-5. Add a corresponding `*_connection_config.hpp` param struct under
-   `connectors/api_connections/` if the manager needs one.
+4. Read its `pool:` block through `entry_reader_t::pool()`.
+5. Register it in `ComponentManager::register_connections` (descriptors are
+   already validated at parse time — just convert the descriptor → the driver's
+   params, add the driver to its pool and have the catalog discover it, inside
+   the retry helper).
 6. Extend the unit tests in `tests/unit/config/test_connection_config.cpp`.
 
 ## Tests
@@ -208,7 +226,9 @@ malformed port or a non-scalar field**, empty `table`/omitted `port` allowed, th
 `[names]` table of backend aliases: duplicates within and across sections, an
 upper-case letter, a dot, a dash, a leading digit),
 `validation_error` (required-field checks, optional port, port range/format, s3
-keys), and `ConfigReader` (whole `config.yaml`: `service.*` ports +
+keys), the `pool:` block (defaults, every setting read, each invalid setting
+refused naming it, a non-positive statement/connect timeout refused), and
+`ConfigReader` (`service.file_transfers` read, defaulted and refused) (whole `config.yaml`: `service.*` ports +
 `connection_retry` + embedded connections, defaults when file missing, retry
 defaults, the `spark_connect` host/port and their `0.0.0.0:15002` default when
 the node is absent, no-`connections:` section, **malformed YAML →

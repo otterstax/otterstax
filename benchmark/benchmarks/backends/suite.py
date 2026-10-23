@@ -21,14 +21,17 @@
                          <name>_x<N> is the wall time of the batch, <name>_x<N>_each each
                          session's own latency;
 
-and join_concurrent, the same N-session shape over cross-backend JOINs."""
+and join_concurrent, the same N-session shape over cross-backend JOINs; join_wide (one
+session) and join_wide_concurrent (N = 1, 4, 8) over JOINs whose cost is fetching each
+side — a whole 60k-row table from MySQL and from PostgreSQL — where running the backends
+side by side should show."""
 import sys
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from common import BenchmarkResult, RunResult, concurrent_batch, run_benchmark, suite_main, write_txt_result
-from queries import BACKEND_SUITES, JOIN_CONCURRENT
+from queries import BACKEND_SUITES, JOIN_CONCURRENT, JOIN_WIDE
 
 CONCURRENCY = (1, 4, 8)
 INSERT_SIZES = (100, 1000)
@@ -136,7 +139,7 @@ SHAPES = {
 def tests():
     """Every test this script runs."""
     names = [f"{backend}_{shape}" for backend in BACKEND_SUITES for shape in SHAPES]
-    return names + ["join_concurrent"]
+    return names + ["join_concurrent", "join_wide", "join_wide_concurrent"]
 
 
 def main():
@@ -145,6 +148,13 @@ def main():
     test = sys.argv.pop(1)
     if test == "join_concurrent":
         suite_main(test, lambda fe, *args: run_concurrent(test, JOIN_CONCURRENT, fe, *args))
+        return
+    if test == "join_wide":
+        suite_main(test, lambda fe, host, port, reps, out_dir: run_benchmark(
+            test, fe.FRONTEND, JOIN_WIDE, fe.make_fetch_factory(host, port), reps, out_dir))
+        return
+    if test == "join_wide_concurrent":
+        suite_main(test, lambda fe, *args: run_concurrent(test, JOIN_WIDE, fe, *args))
         return
     backend, shape = test.split("_", 1)
     suite_main(test, lambda fe, *args: SHAPES[shape](test, BACKEND_SUITES[backend], fe, *args))

@@ -128,7 +128,7 @@ _frontend_port() {
 _test_script() {
     local frontend=$1 test=$2
     case "$test" in
-        ch_* | mysql_* | pg_* | join_concurrent)
+        ch_* | mysql_* | pg_* | join_concurrent | join_wide | join_wide_concurrent)
                     echo "/app/benchmarks/backends/suite.py $test --frontend $frontend" ;;
         external_*) echo "/app/benchmarks/s3/$test.py --frontend $frontend" ;;
         *)          echo "/app/benchmarks/$frontend/$test.py" ;;
@@ -140,7 +140,7 @@ _test_script() {
 # external_* (need RustFS: ./start_service.sh --external) and kafka_* (need
 # redpanda: --kafka) are opt-in but remain valid --bench values.
 DEFAULT_TESTS=(simple_select complex_select join_same_instance join_cross_engine join_all
-               join_concurrent)
+               join_concurrent join_wide join_wide_concurrent)
 for _b in ch mysql pg; do
     DEFAULT_TESTS+=("${_b}_select_wide" "${_b}_insert" "${_b}_prepare" "${_b}_concurrent")
 done

@@ -4,7 +4,7 @@
 
 Three independent benchmark systems:
 
-- **`microbench/`** — Google Benchmark C++ microbenchmarks for translation, parsing, and schema hot paths. No Docker required; runs locally against the build tree.
+- **`microbench/`** — Google Benchmark C++ microbenchmarks for translation, parsing, and schema hot paths, and for the connector pools, actor parking and engine concurrency. No Docker required; runs locally against the build tree.
 - **`scripts/run_benchmark.sh` + `benchmarks/`** — End-to-end query latency harness. Measures query latency through the MySQL wire, PostgreSQL wire and Spark Connect frontends: cross-backend queries, the per-backend suite (`benchmarks/backends/suite.py`) and S3/file external tables (`benchmarks/s3/`).
 - **`stress/run_stress_benchmarks.sh` + `stress/`** — Concurrent load stress test. Runs many parallel connections across three escalating stages and produces a degradation report (throughput, latency percentiles, error rate).
 
@@ -350,15 +350,17 @@ through every frontend. It is part of the default run.
 
 | Test | Workload | Sub-tests | Typical latency |
 |------|----------|-----------|-----------------|
-| `<b>_select_wide` | ~60 k-row results from the backend's group-A `impressions` / `daily_stats` (decoding + row streaming dominate) | `impressions_<alias>_all`, `daily_stats_<alias>_all` | 78–161 ms |
-| `<b>_insert` | `INSERT … VALUES` into the backend's group-B `bench_inserts`; the run's row count is the affected-row count the frontend reports (Spark Connect reports none: -1) | `insert_{100,1000}_rows` | 3–9 ms |
-| `<b>_prepare` | the same statement plain and prepared, a fresh connection per rep (untimed); the difference is the prepare path (the describe probe OtterStax sends the backend). Prepared is `COM_STMT_PREPARE` (mysql), a named Parse through psycopg 3 (postgres — psycopg2 has no protocol-level prepare), `df.schema` before the collect (spark, AnalyzePlan) | `{agg,select}_<alias>_{plain,prepared}` | 23–119 ms |
-| `<b>_concurrent` | N sessions send the same statement at once (N = 1, 4, 8) | `{agg,select}_<alias>_x{1,4,8}` (wall time of the batch), `…_x{4,8}_each` (per-session latency) | 23–198 ms |
-| `join_concurrent` | N sessions run the same cross-backend JOIN at once: MySQL × PG, ClickHouse × MySQL, PG × ClickHouse × MySQL | `{mysql2_x_pg2,ch2_x_mysql2,pg1_ch1_mysql2}_x{1,4,8}`, `…_x{4,8}_each` | 32 ms–8.1 s |
+| `<b>_select_wide` | ~60 k-row results from the backend's group-A `impressions` / `daily_stats` (decoding + row streaming dominate) | `impressions_<alias>_all`, `daily_stats_<alias>_all` | 77–163 ms |
+| `<b>_insert` | `INSERT … VALUES` into the backend's group-B `bench_inserts`; the run's row count is the affected-row count the frontend reports (Spark Connect reports none: -1) | `insert_{100,1000}_rows` | 2–8 ms |
+| `<b>_prepare` | the same statement plain and prepared, a fresh connection per rep (untimed); the difference is the prepare path (the describe probe OtterStax sends the backend). Prepared is `COM_STMT_PREPARE` (mysql), a named Parse through psycopg 3 (postgres — psycopg2 has no protocol-level prepare), `df.schema` before the collect (spark, AnalyzePlan) | `{agg,select}_<alias>_{plain,prepared}` | 23–118 ms |
+| `<b>_concurrent` | N sessions send the same statement at once (N = 1, 4, 8) | `{agg,select}_<alias>_x{1,4,8}` (wall time of the batch), `…_x{4,8}_each` (per-session latency) | 21–78 ms |
+| `join_concurrent` | N sessions run the same cross-backend JOIN at once: MySQL × PG, ClickHouse × MySQL, PG × ClickHouse × MySQL | `{mysql2_x_pg2,ch2_x_mysql2,pg1_ch1_mysql2}_x{1,4,8}`, `…_x{4,8}_each` | 30 ms–3.5 s |
+| `join_wide` | cross-backend JOINs whose cost is fetching each side: a whole 60 k-row table from MySQL (`mysql1` impressions) and from PostgreSQL (`pg1` daily_stats / impressions), BIGINT keys on both sides, an aggregate answering one row — so the fetches, not the engine JOIN or the client transfer, are the time. Running the two backends side by side shows here | `count_mysql1_imp_x_pg1_stats`, `sum_mysql1_imp_x_pg1_imp` | TBD |
+| `join_wide_concurrent` | `join_wide`'s statements from N sessions at once (N = 1, 4, 8) | `{count_mysql1_imp_x_pg1_stats,sum_mysql1_imp_x_pg1_imp}_x{1,4,8}`, `…_x{4,8}_each` | TBD |
 
 - **Where the SQL lives:** `queries.py` — `BACKEND_SUITES` (per backend: the wide
   selects, the INSERT target, an aggregate over ~60 k rows and a 100-row select)
-  and `JOIN_CONCURRENT`. The ClickHouse sub-test names are the ones `ch_*` always
+  and `JOIN_CONCURRENT` / `JOIN_WIDE`. The ClickHouse sub-test names are the ones `ch_*` always
   had, so older runs compare directly.
 - **The `bench_inserts` tables** (`ch2.benchch2`, `mysql2.benchdb2`,
   `pg2.benchpg2.public`) are created empty by `data/init_data.py` before OtterStax
@@ -368,8 +370,10 @@ through every frontend. It is part of the default run.
   `connector.py` (`common.suite_main`); `run_benchmark.sh` passes both per
   frontend (`_test_script`). A connector provides `connect`,
   `make_fetch_factory` and, for `_prepare`, `prepare_connect` / `statement_cursor`.
-- **Why concurrency matters:** a `_concurrent` test's wall time shows how far
-  sessions run side by side.
+- **Why concurrency matters:** each session's statement runs on a connection of
+  the alias's pool (`max_size` at once), and every session's result then goes
+  through the engine, which takes concurrent statements. A `_concurrent` test's
+  wall time shows how far sessions run side by side.
 
 ## External-table tests (s3/file, `benchmarks/s3/`)
 
@@ -390,7 +394,7 @@ extensions and are part of the default run.
 | `external_dump` | `COPY (SELECT * FROM <loaded>) TO <target>` — writer + upload (source loaded once, untimed) | `{file,s3}_{parquet,csv,ndjson}` | 50–77 ms |
 | `external_join_cross` | external `regions` (s3/file) ⋈ otterbrix-internal `weights` (`CREATE TABLE`+`INSERT`) — the supported s3-join shape from `tests/test_mysql_join_otb_local_s3.py` | `{file,s3}_cross` | 37–38 ms |
 | `external_join_all` | s3 parquet `regions` ⋈ file csv `web_events` ⋈ internal `weights`, all on `campaign_id` — three origins joined at once | `s3parquet_filecsv_internal` | 76–81 ms |
-| `external_load_concurrent` | N sessions run `CREATE EXTERNAL TABLE` at once (N = 1, 4, 8), each into its own table, from `web_events.csv` (the largest fixture). Every s3/file load goes through the `S3Manager` / `FileManager` actors under their mutexes, so the wall time shows whether loads run side by side | `{file,s3}_csv_x{1,4,8}` (wall time of the batch), `…_x{4,8}_each` (per-session latency) | 0.15–1.17 s |
+| `external_load_concurrent` | N sessions run `CREATE EXTERNAL TABLE` at once (N = 1, 4, 8), each into its own table, from `web_events.csv` (the largest fixture). Each load reads and parses on the alias's (or the local-file) transfer pool (`max_size` at once), then creates its table through the engine, so the wall time shows how far loads run side by side | `{file,s3}_csv_x{1,4,8}` (wall time of the batch), `…_x{4,8}_each` (per-session latency) | 0.15–0.39 s |
 
 `external_join_cross` / `external_join_all` deliberately load every side into
 otterbrix-internal storage first (external load + a hand-built `bigint` engine
@@ -571,11 +575,12 @@ Each test gets its own `.tracy` file. `tracy-capture` runs inside the
 3. Run a query or benchmark — zones appear live in the Tracy UI
 4. `./benchmark/manual/stop_service.sh` when done
 
-**Why `ZoneScopedN` is absent from `mysql::Connector::runQuery_`:**
-The MySQL connector uses `co_await` (Boost.Asio) which can resume on a different
-io_context thread. Tracy zones opened before the suspension would close on the wrong
-thread, causing "Zone is ended twice". The outer `mysql::ConnectorManager::executeQuery`
-zone (single-threaded, non-coroutine) provides equivalent coverage.
+**Why the MySQL driver's coroutines carry no zone:** `mysql::driver_t` runs
+Boost.MySQL's async operations as Asio coroutines on its private io_context. A zone
+opened before a suspension point would end after it, out of LIFO order with the
+zones the io_context runs meanwhile ("Zone is ended twice"). The driver's sync entry
+points (`connect`, `execute`) carry the zones instead; they run on one pool thread
+from start to end.
 
 ## Result files
 
@@ -624,12 +629,13 @@ table's field names") — on the spark frontend `join_same_instance`,
 prepared statement over such a JOIN fails the same way (client error 2057);
 single-table statements are unaffected.
 
-### No predicate pushdown
+### No predicate pushdown into a cross-backend JOIN
 
-OtterStax fetches entire tables from each backend and filters in-process (OtterBrix).
-`WHERE` clauses in SQL **do not** reduce rows fetched from backends. So `join_all`
-reads all ~60 k Group A rows even with `WHERE campaign_id <= 50 LIMIT 500`, and its
-cost grows with table size, not with the result.
+A statement over one backend runs whole on it, `WHERE` included. A JOIN across backends
+fetches each side's table whole and filters in-process (OtterBrix): its `WHERE` does
+**not** reduce the rows fetched. So `join_all` reads all ~60 k Group A rows even with
+`WHERE campaign_id <= 50 LIMIT 500`, and its cost grows with table size, not with the
+result — which is also what makes `join_wide` a test of the fetches.
 
 ### Connection aliases required
 

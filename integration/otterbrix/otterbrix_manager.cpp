@@ -108,12 +108,22 @@ OtterbrixManager::OtterbrixManager(std::pmr::memory_resource* res, std::unique_p
 std::pair<bool, actor_zeta::detail::enqueue_result>
 OtterbrixManager::enqueue_impl(actor_zeta::mailbox::message_ptr msg) {
     OTX_ZONE_N("OtterbrixManager::enqueue_impl");
-    std::lock_guard guard(mutex_);
-    current_behavior_ = behavior(msg.get());
+    const auto cmd = msg->command();
+    const bool registration = cmd == actor_zeta::msg_id<OtterbrixManager, &OtterbrixManager::register_external_database> ||
+                              cmd == actor_zeta::msg_id<OtterbrixManager, &OtterbrixManager::register_external_table> ||
+                              cmd == actor_zeta::msg_id<OtterbrixManager, &OtterbrixManager::drop_external_table> ||
+                              cmd == actor_zeta::msg_id<OtterbrixManager, &OtterbrixManager::drop_stale_external_tables>;
+    std::unique_lock guard(registration_mutex_, std::defer_lock);
+    if (registration) {
+        guard.lock();
+    }
 
-    while (current_behavior_.is_busy()) {
-        if (current_behavior_.is_awaited_ready()) {
-            auto cont = current_behavior_.take_awaited_continuation();
+    // Each call drives its own behavior on its own thread, so statements from
+    // different Workers are in the engine at once.
+    auto current = behavior(msg.get());
+    while (current.is_busy()) {
+        if (current.is_awaited_ready()) {
+            auto cont = current.take_awaited_continuation();
             if (cont) {
                 cont.resume();
             }

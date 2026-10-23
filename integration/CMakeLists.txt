@@ -4,19 +4,19 @@ set(DB_INTEGRATION_HEADERS
     prepare_probe.hpp
     otterbrix/otterbrix_engine.hpp
     otterbrix/otterbrix_manager.hpp
-    sql/connection_manager.hpp
-    postgresql/connection_manager.hpp
-    clickhouse/connection_manager.hpp
-    s3/s3_manager.hpp
+    backend.hpp
+    backends.hpp
+    sql/mysql_backend.hpp
+    postgresql/postgres_backend.hpp
+    clickhouse/clickhouse_backend.hpp
 )
 
 set(DB_INTEGRATION_SOURCES
     otterbrix/otterbrix_engine.cpp
     otterbrix/otterbrix_manager.cpp
-    sql/connection_manager.cpp
-    postgresql/connection_manager.cpp
-    clickhouse/connection_manager.cpp
-    s3/s3_manager.cpp
+    sql/mysql_backend.cpp
+    postgresql/postgres_backend.cpp
+    clickhouse/clickhouse_backend.cpp
 )
 
 add_library(integration
@@ -27,8 +27,6 @@ add_library(integration
 target_link_libraries(integration PUBLIC
     Boost::boost
     otterbrix::otterbrix
-    # s3/s3_manager.cpp drives the s3 connector's Arrow object streams
-    # (Close / Abort an upload) and carries them in FileAddParams / FileMetadata.
     arrow::arrow
     actor-zeta::actor-zeta
     PostgreSQL::PostgreSQL

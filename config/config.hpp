@@ -41,6 +41,9 @@ struct ServiceConfig {
     SparkConnectConfig spark_connect;
     // Startup retry policy for opening backend connections (from `service.connection_retry`).
     ConnectionRetryConfig connection_retry;
+    // Concurrent local-file transfers (CREATE EXTERNAL TABLE / COPY ... TO a path), from
+    // `service.file_transfers`; check_after_idle_ms does not apply (no connection to check).
+    PoolDesc file_transfers;
     // Remote backends + s3 aliases parsed from the `connections:` section of the
     // same config file. Single source of truth for connections — registered once
     // at startup by ComponentManager::register_connections.

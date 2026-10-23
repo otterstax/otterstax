@@ -37,7 +37,7 @@ KAFKA_ENABLED=false     # set when any kafka_* test is selected (adds redpanda +
 # start redpanda.  --suite concurrent|single keeps the *_concurrent tests or the
 # others (full: both).
 CROSS_BACKEND_TESTS=(simple_select complex_select join_same_instance join_cross_engine join_all
-                     join_concurrent)
+                     join_concurrent join_wide join_wide_concurrent)
 BACKEND_TESTS=()
 for _b in ch mysql pg; do
     BACKEND_TESTS+=("${_b}_select_wide" "${_b}_insert" "${_b}_prepare" "${_b}_concurrent")
@@ -67,7 +67,7 @@ _frontend_port() {
 _test_script() {
     local frontend=$1 test=$2
     case "$test" in
-        ch_* | mysql_* | pg_* | join_concurrent)
+        ch_* | mysql_* | pg_* | join_concurrent | join_wide | join_wide_concurrent)
                     echo "/app/benchmarks/backends/suite.py $test --frontend $frontend" ;;
         external_*) echo "/app/benchmarks/s3/$test.py --frontend $frontend" ;;
         *)          echo "/app/benchmarks/$frontend/$test.py" ;;
@@ -95,7 +95,7 @@ Options:
   --bench T           Test(s) to run:
                         cross-backend: simple_select | complex_select |
                           join_same_instance | join_cross_engine | join_all |
-                          join_concurrent
+                          join_concurrent | join_wide | join_wide_concurrent
                         per backend (benchmarks/backends/suite.py), <b> = ch | mysql | pg:
                           <b>_select_wide | <b>_insert | <b>_prepare | <b>_concurrent
                         s3/file (benchmarks/s3/): external_load | external_join |
@@ -421,7 +421,7 @@ _wait_otterstax() {
 # ---------------------------------------------------------------------------
 _register_connections() {
     echo "Connections read from benchmark/config.yaml at startup (no runtime registration)."
-    $EXTERNAL_ENABLED && _register_s3_credentials
+    if $EXTERNAL_ENABLED; then _register_s3_credentials; fi
 }
 
 # The bench RustFS s3 alias ('bench_rustfs') is likewise declared in

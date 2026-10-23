@@ -12,14 +12,15 @@ namespace otterstax::test {
     struct sent_query_t {
         std::string alias;
         std::string query;
+        bool repeatable{true}; // conn::statement_t::repeatable as the driver received it
     };
 
     inline std::mutex g_sent_mutex;
     inline std::vector<sent_query_t> g_sent;
 
-    inline void record_sent(std::string_view alias, std::string_view query) {
+    inline void record_sent(std::string_view alias, std::string_view query, bool repeatable = true) {
         std::lock_guard guard(g_sent_mutex);
-        g_sent.push_back({std::string{alias}, std::string{query}});
+        g_sent.push_back({std::string{alias}, std::string{query}, repeatable});
     }
 
     inline void forget_sent() {

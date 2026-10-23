@@ -3,12 +3,12 @@
 
 #pragma once
 
-#include "integration/sql/connection_manager.hpp"
+#include "connectors/mysql/driver.hpp"
+#include "integration/backends.hpp"
 #include "typed_backend.hpp"
 
 #include "../mock/aliases.hpp"
 
-#include <boost/asio/io_context.hpp>
 #include <boost/core/span.hpp>
 #include <boost/mysql/column_type.hpp>
 #include <boost/mysql/detail/access.hpp>
@@ -42,14 +42,8 @@ namespace otterstax::test {
     struct my_backend {
         using wire = my_wire;
         using column = wire_column<my_wire>;
-        using status = mysql::Status;
-        using connect_params = boost::mysql::connect_params;
-        using connector_iface = mysql::IConnector;
-        using connector_manager = mysql::ConnectorManager;
-        using manager = db::MySQLManager;
-        using api_params = conn::api_server::ConnectionParams;
-        using handler_arg = const boost::mysql::results&;
         using answer = boost::mysql::results;
+        using backend = db::MySQLBackend;
 
         enum class probe_mode
         {
@@ -65,7 +59,16 @@ namespace otterstax::test {
             return {{"id", my_wire::int_}, {"score", my_wire::int_}, {"name", my_wire::varchar}};
         }
 
-        static const answer& view(const answer& results) { return results; }
+        static backend& backend_of(db::backend_set_t& set) { return set.mysql; }
+        // The whole database is discovered, as register_connections does for MySQL.
+        static qualified_name_t scope(const test_connection_t& c) {
+            return qualified_name_t(c.alias, c.database, "", "");
+        }
+
+        static conn::statement_outcome_t
+        decode(std::pmr::memory_resource* resource, const answer& result, const conn::statement_t& statement) {
+            return mysql::decode(resource, result, statement);
+        }
 
         static answer rows(const std::vector<column>& columns, std::size_t count) {
             if (columns.empty()) {
@@ -117,13 +120,6 @@ namespace otterstax::test {
                     break;
             }
             return probe_refusal(resource);
-        }
-
-        static std::unique_ptr<connector_iface> factory(std::pmr::memory_resource* resource,
-                                                        boost::asio::io_context&,
-                                                        connect_params params,
-                                                        std::string alias) {
-            return std::make_unique<typed_connector<my_backend>>(resource, std::move(params), std::move(alias));
         }
 
     private:

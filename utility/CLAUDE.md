@@ -26,56 +26,21 @@ included by nothing and listed in no CMakeLists — two structs of the same name
 in the global namespace, i.e. an ODR trap waiting for the first TU to include
 both. It has been deleted; `scheduler/session_data.hpp` is the only definition.
 
-### `wait_barrier.hpp`
+### `wait_barrier.hpp`, `function_ref.hpp`, `asio_error.hpp` — deleted
 
-`otterstax::query_result_t` / `as_query_result` / `spawn_marshaled` /
-`make_failed_future` / `QueryHandleWaiter` — the single point where a connector
-result crosses the io_context worker → consumer thread boundary. A live
-exception must never cross it (boost.asio's `use_future` destroys the captured
-`exception_ptr` on the io thread, racing the consumer's `get()`; TSAN race under
-boost 1.88), so failures are marshalled as **values**: `core::error_t` for
-error-only (`asio_error_t`) handlers, `core::result_wrapper_t<R>` for handlers
-that return data. The connector's `runQuery` already resolves to that outcome
-type; `spawn_marshaled` forwards it through a `std::promise` held by
-`detail::outcome_promise_t`, a by-value coroutine parameter whose destructor
-settles the promise with `io_error` if the frame is destroyed before the body
-ran (io_context torn down or never run) — so `future.get()` never throws
-`broken_promise`. The try/catch around the `co_await` in
-`detail::marshal_outcome` is the driver boundary: an exception raised on the io
-thread becomes an `io_error` value there. `spawn_marshaled`'s first argument
-is whatever `co_spawn` takes — an execution context or an executor: the three
-`ConnectorManager::executeQuery` pass the pool's `io_context`, the MySQL
-connector's `connectWithTimeout` passes its connection's strand executor so the
-coroutine, and every completion handler the awaited `async_connect` derives
-from it (the `cancel_after` deadline timer's included), runs serialized on that
-strand rather than on any pool thread. `run_with_owned_handler<R, Arg>(connector,
-query, handler)` is the awaitable the three `executeQuery` spawn: the handler is a
-by-value coroutine parameter, and the connector's virtual `runQuery` is called from
-that frame, on the io thread, with a `function_ref_t` to the copy — so the handler
-object lives exactly as long as the query, and a caller may pass a temporary or a
-loop-local lambda. `QueryHandleWaiter` takes the
-`memory_resource` its pmr `futures`/`results` live on; `wait()` is
-`[[nodiscard]]`: it returns the first failure instead of throwing, and its
-callers index `results` positionally. Its destructor drains unconsumed futures
-(asio futures do not block on destruction, unlike `std::async`).
-
-### `function_ref.hpp`
-
-`otterstax::function_ref_t<R(Args...)>` — a non-owning, non-allocating reference to a
-callable: its address plus a trampoline typed on the callable. It is how a handler
-crosses a virtual boundary — `IConnector::runQuery` in the mysql / pg / ch connectors —
-without `std::function`, which owns a heap copy and is excluded by the code rules. The
-reference does not keep the callable alive: the callable must outlive every call made
-through it. It binds only a named, non-const object, so a temporary does not compile.
-Production binds it in one place, `run_with_owned_handler` (above), to the handler copy
-in that coroutine's frame.
+They marshalled connector results off a Boost.Asio io_context
+(`spawn_marshaled`, `QueryHandleWaiter`, `run_with_owned_handler`) and carried
+handlers across the old `IConnector::runQuery` virtual boundary. The connectors
+are now synchronous drivers run on pool threads that answer through an
+`actor_zeta::promise` (`connectors/CLAUDE.md`), so nothing crosses an io_context
+any more.
 
 ### `parse_port.hpp`
 
 `otterstax::parse_port(text, resource)` — the config `port` string →
 `core::result_wrapper_t<uint16_t>`; digits only, 1..65535, otherwise
-`invalid_parameter`. Used by the three `ConnectorManager::addConnection`
-overloads.
+`invalid_parameter`. Used by the config layer to refuse a bad port at parse time
+and by `ComponentManager::register_connections` to read it.
 
 ### `settled_future.hpp`
 
@@ -83,8 +48,8 @@ overloads.
 up the outcome of an actor whose `enqueue_impl` runs the handler to completion on
 the sending thread (`CatalogManager`, `OtterbrixManager`): the future is settled
 when `actor_zeta::send` returns, so a non-settled future is reported as
-`io_error` rather than waited on. Used by `addConnection` to observe
-`add_connection_schema`.
+`io_error` rather than waited on. Used by `ComponentManager::register_connections`
+(and the test fixture `register_backend`) to observe `add_connection_schema`.
 
 ### `cv_wrapper.hpp` — deleted
 
@@ -104,7 +69,7 @@ supported way to hand shared mutable state to an actor — return a value.
 
 ### `thread_pool_manager.hpp`
 
-`thread_pool_manager` — wraps a `boost::asio::io_context` + `std::vector<std::thread>`. Used by each `ConnectorManager` to host async DB operations.
+`thread_pool_manager` — wraps a `boost::asio::io_context` + `std::vector<std::thread>`. Used by the wire-protocol frontends (`frontend/common/frontend_server.hpp`).
 
 ### `logger.hpp`
 

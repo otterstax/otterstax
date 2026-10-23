@@ -268,3 +268,17 @@ JOIN_CONCURRENT = [
     ("ch2_x_mysql2", dict(JOIN_CROSS_ENGINE)["prod_ch2_x_ord_mysql2"]),
     ("pg1_ch1_mysql2", dict(JOIN_ALL)["variant2_pg_ch_mysql"]),
 ]
+
+# join_wide / join_wide_concurrent: cross-backend JOINs whose fetch is the cost. Each side
+# reads a whole 60k-row group-A table (no filter to push down), the keys are BIGINT on both
+# sides (a mismatched key width sends the engine down a far slower JOIN path), and an
+# aggregate keeps the answer to one row, so neither the engine JOIN nor the client transfer
+# hides the two fetches.
+JOIN_WIDE = [
+    ("count_mysql1_imp_x_pg1_stats",
+     "SELECT count(*) FROM mysql1.benchdb1.impressions i"
+     " JOIN pg1.benchpg1.public.daily_stats d ON i.impression_id = d.stat_id"),
+    ("sum_mysql1_imp_x_pg1_imp",
+     "SELECT sum(i.clicks), sum(p.views) FROM mysql1.benchdb1.impressions i"
+     " JOIN pg1.benchpg1.public.impressions p ON i.impression_id = p.impression_id"),
+]

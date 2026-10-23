@@ -5,8 +5,8 @@ and as the source of the joinable fixtures the python integration suite loads
 into its own (single-bucket) RustFS via `compose.test.yml`.
 
 > The previous C++ semi-integration target (`test_s3_manager`) has been
-> removed. `conn::s3::ConnectorManager` and `db::S3Manager` are exercised
-> end-to-end by the python integration suite — `tests/test_{schema_}mysql_s3.py`,
+> removed. The s3 transfer driver (`conn::s3::driver_t`) and its pools are
+> covered by `tests/system/test_s3_errors.cpp` and end-to-end by the python integration suite — `tests/test_{schema_}mysql_s3.py`,
 > `tests/test_mysql_join_sql_s3_to_s3.py`, `tests/test_mysql_join_otb_local_s3.py`,
 > `tests/test_mysql_join_otb_local_s3_file.py` (3-origin: s3 ⋈ file ⋈
 > otterbrix-internal) — driven by `docker-run-tests.sh`. Run those to validate the

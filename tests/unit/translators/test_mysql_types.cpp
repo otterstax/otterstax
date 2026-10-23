@@ -27,7 +27,7 @@ using namespace components::types;
 // and the reader that writes its values, so the schema a discovery registers
 // and the types the executed chunk carries are the same answer by construction.
 // mysql_to_struct is that answer taken off a result set's column definitions —
-// what MySQLManager::discover mirrors into the catalog — and mysql_to_chunk the
+// what the MySQL backend's discover mirrors into the catalog — and mysql_to_chunk the
 // chunk built under it.
 //
 // These cases pin the table per column type AND the agreement between the two

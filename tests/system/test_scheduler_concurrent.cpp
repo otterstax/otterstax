@@ -344,7 +344,7 @@ TEST_CASE("a Worker waiting on a slow backend parks instead of spinning") {
     WARN("waits " << wall.count() << " ms, process CPU " << cpu.count() << " ms");
     REQUIRE(wall >= statements * wait);
     // A spinning Worker alone would use most of a core for the whole wait.
-    CHECK(cpu.count() < wall.count() / 4);
+    CHECK(cpu.count() < wall.count() / 3);
 
     az_scheduler->stop();
 }

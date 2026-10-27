@@ -1,0 +1,4 @@
+# The saved benchmark dataset: generated once by init_data.py, then loaded by every
+# run (see dataset_stamp.py). Machine-local; do not commit it.
+*
+!.gitignore

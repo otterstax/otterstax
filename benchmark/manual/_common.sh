@@ -77,7 +77,8 @@ _register_s3_credentials() {
     echo "s3 alias 'bench_rustfs' read from benchmark/config.yaml at startup."
 }
 
-# Generate the s3/file external-table fixtures into benchmark/data/fixtures.
+# Generate the s3/file external-table fixtures into benchmark/data/fixtures
+# (reused while current; REGEN_ARG=--regenerate forces it).
 _generate_external_fixtures() {
     echo "Generating external-table fixtures..."
     mkdir -p "$BENCH_DIR/data/fixtures"
@@ -86,7 +87,7 @@ _generate_external_fixtures() {
         -v "$BENCH_DIR/bench.yaml:/app/bench.yaml:ro" \
         -e PYTHONUNBUFFERED=1 \
         benchmark-client:latest \
-        python /app/data/generate_external_fixtures.py --out /app/data/fixtures
+        python /app/data/generate_external_fixtures.py --out /app/data/fixtures ${REGEN_ARG:-}
 }
 
 # Generate the kafka JSON dataset into benchmark/data/fixtures.
@@ -100,7 +101,7 @@ _generate_kafka_fixtures() {
         -v "$BENCH_DIR/data/fixtures:/app/data/fixtures" \
         -e PYTHONUNBUFFERED=1 \
         benchmark-client:latest \
-        python /app/data/generate_kafka_fixtures.py --out /app/data/fixtures
+        python /app/data/generate_kafka_fixtures.py --out /app/data/fixtures ${REGEN_ARG:-}
 }
 
 # Seed the kafka topic from the generated dataset (once, after the broker is up).

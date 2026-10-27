@@ -22,6 +22,7 @@ DURATION_SMALL=60
 DURATION_MEDIUM=60
 DURATION_HEAVY=90
 SKIP_INIT=false
+REGEN_ARG=""
 ENABLE_TRACY=false
 TRACY_FILE=""
 TRACY_CAPTURE_CONTAINER=""
@@ -64,6 +65,7 @@ Output:
 Build control:
   --rebuild            Rebuild both Docker images even if they already exist.
   --no-init            Skip benchmark data initialisation (reuse existing DB volumes).
+  --regen-data         Generate the saved benchmark data (benchmark/data/dataset) again.
   --clear              Full reset: remove images + DB volumes, then rebuild from scratch.
   -j N                 Parallel cmake jobs for the otterstax_app build (default: auto).
 
@@ -136,6 +138,8 @@ while [[ $# -gt 0 ]]; do
             OUT_DIR="${1#*=}"; shift ;;
         --no-init)
             SKIP_INIT=true; shift ;;
+        --regen-data)
+            REGEN_ARG="--regenerate"; shift ;;
         --tracy)
             ENABLE_TRACY=true; shift ;;
         --perf)
@@ -467,10 +471,12 @@ echo ""
 if $SKIP_INIT; then
     echo "  --no-init: skipping data initialisation"
 else
+    mkdir -p "$BENCH_DIR/data/dataset"
     docker run --rm --network=bench_net \
+        -v "$BENCH_DIR/data/dataset:/app/data/dataset" \
         -e PYTHONUNBUFFERED=1 \
         benchmark-client:latest \
-        python /app/data/init_data.py
+        python /app/data/init_data.py $REGEN_ARG
 fi
 
 # ---------------------------------------------------------------------------

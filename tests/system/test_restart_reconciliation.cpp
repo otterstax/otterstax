@@ -8,12 +8,13 @@
 // is reused, a table whose columns still match keeps its engine OID, a table
 // whose backend schema changed is recreated, a table the backend no longer
 // has is dropped. Every run below is a fresh engine over the SAME data dir,
-// the way a server restart is, over a PostgreSQL mock connector whose table
+// the way a server restart is, over a PostgreSQL mock driver whose table
 // catalog the test switches between runs.
 
 #include "catalog/catalog_manager.hpp"
+#include "connectors/postgresql/driver.hpp"
+#include "integration/backends.hpp"
 #include "integration/otterbrix/otterbrix_manager.hpp"
-#include "integration/postgresql/connection_manager.hpp"
 #include "otterbrix/operators/execute_plan.hpp"
 #include "otterbrix/parser/parser.hpp"
 #include "otterbrix/query_generation/sql_query_generator.hpp"
@@ -81,9 +82,8 @@ namespace {
         return {std::move(name), kFloat8Oid, components::types::logical_type::DOUBLE};
     }
 
-    // connector_factory is a plain function pointer, so the backend's table
-    // catalog the connector answers from is shared through this; the test
-    // switches it between runs, while no stack is alive.
+    // The backend's table catalog the driver answers from is shared through
+    // this; the test switches it between runs, while no stack is alive.
     std::mutex g_tables_mutex;
     std::vector<backend_table> g_tables;
 
@@ -165,77 +165,65 @@ namespace {
 
     constexpr std::size_t kBackendRows = 2;
 
-    class catalog_pg_connector final : public pg::IConnector {
+    // Answers from the current table catalog: discovery (no enums, the table listing, attributes for
+    // a probe) via the PostgreSQL driver's decode, and slot statements with kBackendRows rows.
+    class catalog_pg_driver final : public conn::IDriver {
     public:
-        catalog_pg_connector(std::pmr::memory_resource* resource, pg::connect_params params, std::string alias)
-            : resource_(resource)
-            , params_(std::move(params))
-            , alias_(std::move(alias)) {}
+        explicit catalog_pg_driver(std::pmr::memory_resource* resource)
+            : resource_(resource) {}
 
-        pg::Status status() const noexcept override { return pg::Status::Connected; }
-        pg::connect_params params() const noexcept override { return params_; }
-        void close() override {}
         core::error_t connect() override { return core::error_t::no_error(); }
-        bool isConnected() override { return true; }
-        core::error_t tryReconnect() override { return core::error_t::no_error(); }
-        bool isClosed() const noexcept override { return false; }
-        std::string alias() const noexcept override { return alias_; }
+        core::error_t ping() override { return core::error_t::no_error(); }
+        void close() noexcept override {}
+        std::unique_ptr<conn::IDriver> clone_disconnected() const override {
+            return std::make_unique<catalog_pg_driver>(resource_);
+        }
 
-        // Data path: kBackendRows rows of every column of the referenced table
-        // (the tests only SELECT *).
-        boost::asio::awaitable<core::result_wrapper_t<std::unique_ptr<data_chunk_t>>>
-        runQuery(std::string_view query, otterstax::function_ref_t<std::unique_ptr<data_chunk_t>(PGresult*)>) override {
-            using components::types::complex_logical_type;
-            using components::types::logical_value_t;
+        conn::statement_outcome_t execute(const conn::statement_t& statement) override {
+            const std::string_view query = statement.sql;
             const auto tables = backend_tables();
+            if (!otterstax::test::is_discovery(statement)) {
+                return rows(tables, query);
+            }
+            if (query.find("pg_enum") != std::string_view::npos) {
+                auto result = empty_tuples();
+                return pg::decode(resource_, result.get(), statement);
+            }
+            if (query.find("information_schema.tables") != std::string_view::npos) {
+                auto result = listing_result(tables);
+                return pg::decode(resource_, result.get(), statement);
+            }
             const auto* table = referenced_table(tables, query);
             if (table == nullptr) {
-                co_return core::error_t(core::error_code_t::table_not_exists,
-                                        std::pmr::string{"mock backend: unknown table in query", resource_});
+                return core::error_t(core::error_code_t::table_not_exists,
+                                     std::pmr::string{"mock backend: probe of an unknown table", resource_});
+            }
+            auto result = probe_result(*table);
+            return pg::decode(resource_, result.get(), statement);
+        }
+
+    private:
+        conn::statement_outcome_t rows(const std::vector<backend_table>& tables, std::string_view query) const {
+            using components::types::complex_logical_type;
+            const auto* table = referenced_table(tables, query);
+            if (table == nullptr) {
+                return core::error_t(core::error_code_t::table_not_exists,
+                                     std::pmr::string{"mock backend: unknown table in query", resource_});
             }
             std::pmr::vector<complex_logical_type> fields(resource_);
             for (const auto& column : table->columns) {
                 fields.emplace_back(column.type, column.name);
             }
-            auto chunk = std::make_unique<data_chunk_t>(resource_, fields, kBackendRows);
+            data_chunk_t chunk(resource_, fields, kBackendRows);
             for (std::size_t c = 0; c < table->columns.size(); ++c) {
                 for (std::size_t row = 0; row < kBackendRows; ++row) {
-                    chunk->set_value(c, row, cell(table->columns[c].type, row));
+                    chunk.set_value(c, row, cell(table->columns[c].type, row));
                 }
             }
-            chunk->set_cardinality(kBackendRows);
-            co_return std::move(chunk);
+            chunk.set_cardinality(kBackendRows);
+            return conn::statement_result_t{.rows = std::move(chunk)};
         }
 
-        boost::asio::awaitable<core::result_wrapper_t<int64_t>>
-        runQuery(std::string_view, otterstax::function_ref_t<int64_t(PGresult*)>) override {
-            co_return int64_t{0};
-        }
-
-        // Discovery: no enums, the current table listing, the referenced table's
-        // attributes for a probe.
-        boost::asio::awaitable<core::error_t>
-        runQuery(std::string_view query,
-                 otterstax::function_ref_t<otterstax::asio_error_t(PGresult*)> handler) override {
-            if (query.find("pg_enum") != std::string_view::npos) {
-                auto result = empty_tuples();
-                co_return otterstax::as_query_result<otterstax::asio_error_t>(handler(result.get()));
-            }
-            const auto tables = backend_tables();
-            if (query.find("information_schema.tables") != std::string_view::npos) {
-                auto result = listing_result(tables);
-                co_return otterstax::as_query_result<otterstax::asio_error_t>(handler(result.get()));
-            }
-            const auto* table = referenced_table(tables, query);
-            if (table == nullptr) {
-                co_return core::error_t(core::error_code_t::table_not_exists,
-                                        std::pmr::string{"mock backend: probe of an unknown table", resource_});
-            }
-            auto result = probe_result(*table);
-            co_return otterstax::as_query_result<otterstax::asio_error_t>(handler(result.get()));
-        }
-
-    private:
         components::types::logical_value_t cell(components::types::logical_type type, std::size_t row) const {
             using components::types::logical_value_t;
             switch (type) {
@@ -249,21 +237,12 @@ namespace {
         }
 
         std::pmr::memory_resource* resource_;
-        pg::connect_params params_;
-        std::string alias_;
     };
-
-    std::unique_ptr<pg::IConnector>
-    catalog_pg_factory(std::pmr::memory_resource* resource, pg::connect_params params, std::string alias) {
-        return std::make_unique<catalog_pg_connector>(resource, std::move(params), std::move(alias));
-    }
 
     using otterstax::test::wait_until_ready;
 
-    // One server run: a real engine over `data_dir` — which is NOT cleared, a
-    // restart sees what the previous run persisted — real parser and catalog,
-    // the PostgreSQL connection over the mock connector. Destroying the run
-    // checkpoints the engine, as a server shutdown does.
+    // One server run: a real engine over `data_dir` (not cleared, so a restart sees the previous
+    // run's data), real parser and catalog, and the PostgreSQL mock driver. Destroying it checkpoints.
     class server_run {
     public:
         explicit server_run(const std::string& data_dir)
@@ -272,20 +251,22 @@ namespace {
             , az_scheduler_(make_az_scheduler())
             , otb_mgr_(actor_zeta::spawn<db::OtterbrixManager>(resource_, make_otterbrix_manager(otterbrix_)))
             , catalog_(actor_zeta::spawn<mysql::CatalogManager>(resource_, otb_mgr_->address(), shop_aliases()))
-            , pg_conn_(std::make_unique<pg::ConnectorManager>(resource_,
-                                                              catalog_->address(),
-                                                              &catalog_pg_factory,
-                                                              /*pool_size*/ 1))
-            , pg_mgr_(actor_zeta::spawn<db::PostgressManager>(resource_, pg_conn_.get()))
-            , scheduler_(spawn_scheduler()) {}
+            , backends_(std::make_unique<otterstax::test::mock_backends>(resource_, *catalog_))
+            , scheduler_(actor_zeta::spawn<Scheduler>(resource_,
+                                                      az_scheduler_.get(),
+                                                      worker_pool_size(),
+                                                      &make_parser,
+                                                      shop_aliases(),
+                                                      backends_->registry(),
+                                                      otb_mgr_->address(),
+                                                      catalog_->address())) {}
 
         server_run(const server_run&) = delete;
         server_run& operator=(const server_run&) = delete;
 
         ~server_run() {
             scheduler_.reset();
-            pg_mgr_.reset();
-            pg_conn_.reset();
+            backends_.reset();
             catalog_.reset();
             otb_mgr_.reset();
             az_scheduler_->stop();
@@ -294,17 +275,11 @@ namespace {
 
         // Registers the connection the way startup does: whole-schema discovery
         // over the mock's current table catalog.
-        core::result_wrapper_t<std::string> register_connection() {
-            conn::api_server::PgConnectionParams params;
-            params.alias = kUid;
-            params.host = "localhost";
-            params.port = "5432";
-            params.username = "user";
-            params.password = "pass";
-            params.database = "pgdb";
-            params.schema = kSchema;
-            params.table = "";
-            return pg_conn_->addConnection(params);
+        core::error_t register_connection() {
+            return backends_->add(backend_type_t::PostgreSQL,
+                                  kUid,
+                                  std::make_unique<catalog_pg_driver>(resource_),
+                                  qualified_name_t(kUid, "pgdb", kSchema, ""));
         }
 
         scheduler_stack stack() const { return scheduler_stack{scheduler_->address(), otterbrix_, resource_}; }
@@ -396,31 +371,12 @@ namespace {
         }
 
     private:
-        std::unique_ptr<Scheduler, actor_zeta::pmr::deleter_t> spawn_scheduler() {
-            catalog_->set_backend_managers(actor_zeta::address_t::empty_address(),
-                                           pg_mgr_->address(),
-                                           actor_zeta::address_t::empty_address());
-            return actor_zeta::spawn<Scheduler>(resource_,
-                                                az_scheduler_.get(),
-                                                worker_pool_size(),
-                                                &make_parser,
-                                                shop_aliases(),
-                                                actor_zeta::address_t::empty_address(), // sql
-                                                pg_mgr_->address(),
-                                                actor_zeta::address_t::empty_address(), // ch
-                                                otb_mgr_->address(),
-                                                catalog_->address(),
-                                                actor_zeta::address_t::empty_address(), // s3
-                                                actor_zeta::address_t::empty_address()); // file
-        }
-
         db::otterbrix_engine_ptr otterbrix_;
         std::pmr::memory_resource* resource_{nullptr};
         std::unique_ptr<actor_zeta::scheduler::sharing_scheduler> az_scheduler_;
         std::unique_ptr<db::OtterbrixManager, actor_zeta::pmr::deleter_t> otb_mgr_;
         std::unique_ptr<mysql::CatalogManager, actor_zeta::pmr::deleter_t> catalog_;
-        std::unique_ptr<pg::ConnectorManager> pg_conn_;
-        std::unique_ptr<db::PostgressManager, actor_zeta::pmr::deleter_t> pg_mgr_;
+        std::unique_ptr<otterstax::test::mock_backends> backends_;
         std::unique_ptr<Scheduler, actor_zeta::pmr::deleter_t> scheduler_;
     };
 
@@ -441,9 +397,9 @@ namespace {
                 backend_table{"customers", {int4("id"), varchar("email")}}};
     }
 
-    void require_registered(const core::result_wrapper_t<std::string>& added) {
-        INFO("addConnection: " << (added.has_error() ? added.error().what.c_str() : "ok"));
-        REQUIRE_FALSE(added.has_error());
+    void require_registered(const core::error_t& added) {
+        INFO("register: " << (added.contains_error() ? added.what.c_str() : "ok"));
+        REQUIRE_FALSE(added.contains_error());
     }
 
     // SELECT * over the external table through the Scheduler: the mock's rows

@@ -37,6 +37,9 @@ namespace db {
     inline constexpr const char* external_manifest_collection = "__otterstax_tables";
     inline constexpr const char* external_manifest_column = "collection";
 
+    // The engine's actor. Every handler runs to completion on the sender's thread (enqueue_impl drives
+    // its behavior). Statements (execute, get_schema, create_table) run concurrently, each on a fresh
+    // session; the multi-step mirror-registration handlers are serialized under registration_mutex_.
     class OtterbrixManager final : public actor_zeta::actor::actor_mixin<OtterbrixManager> {
     public:
         using is_cooperative_actor_type = void; // Required by actor_zeta::send() concept
@@ -113,8 +116,9 @@ namespace db {
         std::pmr::memory_resource* resource_;
         std::unique_ptr<IDataManager> data_manager_;
         log_t log_;
-        OTX_LOCKABLE_N(std::mutex, mutex_, "OtterbrixManager::mutex");
-        actor_zeta::behavior_t current_behavior_;
+        // Held by register_external_database / register_external_table /
+        // drop_external_table / drop_stale_external_tables, never by a statement.
+        OTX_LOCKABLE_N(std::mutex, registration_mutex_, "OtterbrixManager::registration_mutex");
 
         // Whether `db_name` holds the manifest, which only a mirror does.
         core::result_wrapper_t<bool> has_manifest(const std::string& db_name);

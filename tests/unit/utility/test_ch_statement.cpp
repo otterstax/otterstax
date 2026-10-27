@@ -6,7 +6,7 @@
 // through the QueryEvents base, the only seam the driver offers without a
 // server.
 
-#include "connectors/clickhouse/connector.hpp"
+#include "connectors/clickhouse/driver.hpp"
 
 #include <catch2/catch_all.hpp>
 
@@ -33,7 +33,7 @@ namespace {
 } // namespace
 
 TEST_CASE("ch::make_statement: keeps the query text and starts from zero written rows") {
-    ch::select_result_t out;
+    ch::select_result_t out(std::pmr::new_delete_resource());
     auto statement = ch::make_statement("INSERT INTO t VALUES (1)", out);
 
     REQUIRE(statement.GetText() == "INSERT INTO t VALUES (1)");
@@ -42,7 +42,7 @@ TEST_CASE("ch::make_statement: keeps the query text and starts from zero written
 }
 
 TEST_CASE("ch::make_statement: written rows are the sum of every Progress packet") {
-    ch::select_result_t out;
+    ch::select_result_t out(std::pmr::new_delete_resource());
     auto statement = ch::make_statement("INSERT INTO t VALUES (1), (2), (3)", out);
     clickhouse::QueryEvents& events = statement;
 
@@ -57,7 +57,7 @@ TEST_CASE("ch::make_statement: written rows are the sum of every Progress packet
 }
 
 TEST_CASE("ch::make_statement: every data block is collected in order, header block included") {
-    ch::select_result_t out;
+    ch::select_result_t out(std::pmr::new_delete_resource());
     auto statement = ch::make_statement("SELECT id FROM t", out);
     clickhouse::QueryEvents& events = statement;
 

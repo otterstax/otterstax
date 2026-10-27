@@ -1,12 +1,37 @@
 # Microbenchmark Coverage Guide
 
-Google Benchmark suite for the hot paths in OtterStax's translation, parsing, and query-generation layers.
+Google Benchmark suite for the hot paths in OtterStax's translation, parsing, and query-generation layers, and for the connector pools, the actors awaiting them and the engine stage.
 Binary: `build/Release/benchmark/microbench/otterstax_bench`
 Run script: `benchmark/microbench/run-bench.sh` (handles LD_LIBRARY_PATH and JSON repair).
 
 ---
 
 ## Source files and what they cover
+
+### `bench_allocations.cpp`
+
+Heap allocations as well as time: the binary's global `operator new` counts per thread, and
+every benchmark here reports `allocs/op`, `bytes/op` and, where the operation has rows or cells,
+`allocs/item`. Every resource is `new_delete_resource`, so each allocation is a counted
+`operator new` (a pool resource would hide them behind its reuse). The counter covers the whole
+binary, so the other files' benchmarks pay one thread-local add per allocation.
+
+| Benchmark | What it measures |
+|-----------|------------------|
+| `BM_real_ch_to_chunk_text_columns` | `tsl::ch_to_chunk` of DateTime64(6), Decimal(38, 10), UInt128, UUID and String columns, 1024 rows (every cell read as text) |
+| `BM_real_pg_to_chunk_text_columns` | `tsl::pg_to_chunk` of a manufactured 1024-row text result: three varchar columns, an int4, a float8 |
+| `BM_real_encode_to_text` | `frontend::encode_to_text` over every cell of a 1024-row INTEGER / BIGINT / DOUBLE / STRING / DECIMAL chunk |
+| `BM_real_mysql_resultset_text` / `BM_real_postgres_resultset_text` | a whole text resultset of that chunk: every row framed, `build_packets` |
+| `BM_real_chunk_to_ndjson` | `tsl::chunk_to_ndjson` of that chunk into a sink that keeps nothing |
+| `BM_real_generate_query` | `sql_gen::generate_query` of one parsed remote slot (WHERE / ORDER BY / LIMIT) |
+| `BM_old_*` / `BM_new_*` | a replaced pattern next to its replacement, in one run: error-message building, a registry lookup by uid, a value's text handed to the engine, a statement's scratch containers, JSON escaping, the SQL stream, the wait ticket (also from 8 threads on a shared `synchronized_pool_resource`) |
+
+The `BM_real_*` benchmarks compile against the code before the allocation work as well
+(`OTX_BENCH_NEW` — the presence of `utility/stack_arena.hpp` — picks the call shape where a
+signature changed), so one source compares two builds: build `otterstax_bench` from a worktree of
+the older commit with the same `bench_allocations.cpp` and `CMakeLists.txt`, and run both
+binaries with `--benchmark_filter=BM_real_`. The `BM_old_*` / `BM_new_*` pairs exist only in the
+newer tree.
 
 ### `bench_translators.cpp`
 
@@ -277,6 +302,66 @@ Both report `items_per_second` (rows/s). `data_chunk_t` is move-only, so
 `BM_chunk_to_json` builds the chunk once outside the loop (`chunk_to_json` takes it
 by const ref). Links `kafka_runtime` (a separate `target_link_libraries` call in
 `CMakeLists.txt`, which also brings `kafka_grammar` for `kafka_column_t`).
+
+---
+
+### `bench_connection_pool.cpp`
+
+The connector pools (`connectors/common/`), the actors that await them, and the engine
+stage they hand results to. The pool benchmarks run an in-file `sleep_driver_t` (an
+`IDriver` that answers an empty result after a fixed wait) on alias `bench`, every
+session opened up front. All of them use real time (`UseRealTime`): the caller sleeps
+or blocks while the work runs on other threads.
+
+#### Pool round trip — one no-op statement through `connection_pool_t::execute`
+
+| Benchmark | How the caller picks up the answer |
+|-----------|-------------------------------------|
+| `BM_pool_round_trip_poll` | polls the future, yielding — as `drive()` and `CatalogManager::enqueue_impl` do |
+| `BM_pool_round_trip_waker` | sleeps on a semaphore the request's `waker_t` releases — as a parked actor waits |
+
+The difference between the two is the cost of a thread wake-up on the host.
+
+#### Pool fan-out — `BM_pool_parallel/{1,4,8,16}`
+
+N statements of 5 ms each on a four-connection pool, all submitted at once, then
+awaited. Whichever session is free takes the next statement, so the batch's wall
+time follows ceil(N/4) statement times. Reports `statements_per_s`.
+
+#### An actor awaiting pool answers — `BM_actor_await_{spin,park}`
+
+`pool_awaiter_t`, a `basic_actor` shaped like a Worker awaiting a backend: its
+handler submits a statement with `actor_parking_t::watch`'s waker and reports the
+ticket around its `co_await`. `_park` hides `resume` with `actor_parking_t::park()`
+exactly as `Worker::resume` does; `_spin` keeps the base `resume`, so actor-zeta
+re-runs the actor until the answer is there (the Worker before parking). The actors
+run on a four-thread `sharing_scheduler`.
+
+| Arg | Meaning |
+|-----|---------|
+| `wait_ms` | the statement's time: 0 (the hop alone), 2, 20 |
+| `actors` | actors awaiting at once, each on a connection of its own: 1 or 4 |
+
+Counters, over the whole process (`getrusage`, every scheduler, pool and benchmark
+thread): `cpu_ms_per_await` — CPU per answered statement; `cpu_cores` — CPU time over
+wall time, i.e. how many cores the waits keep busy. Compare `_spin` against `_park` at
+the same args: the wall time should match, and the CPU is what parking saves.
+
+#### Engine statements from several threads — `BM_engine_select_1_{concurrent,serialized}`
+
+`OtterbrixManager::execute` of `SELECT 1` on a real engine, from 1, 4 and 8 threads;
+each thread parses with its own `GreenplumParser` (a Worker owns one) and the
+manager's handler runs on the sending thread. `_serialized` holds one global mutex
+around every send — the lock `OtterbrixManager` used to hold around each statement —
+so the two variants show what running statements concurrently buys. Reports
+`statements_per_s` (summed over the threads). With threads the `Time` column is wall
+time per statement across all threads, i.e. the inverse of the throughput.
+
+The engine and its manager are built once per process on first use
+(`engine_fixture()`, data dir `/tmp/otterstax_bench_engine`, wiped first), after
+`bench_parser.cpp`'s static `LoggerInit` has registered the loggers. Its
+`initialize_all_loggers` must not run again: `spdlog::register_logger` throws on a
+duplicate name.
 
 ## What is NOT benchmarkable at this level
 

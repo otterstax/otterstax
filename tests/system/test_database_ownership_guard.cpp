@@ -10,13 +10,12 @@
 // engine database and the registration untouched.
 
 #include "catalog/catalog_manager.hpp"
-#include "integration/sql/connection_manager.hpp"
+#include "integration/backends.hpp"
 #include "otterbrix/parser/grammar_extension/kafka/kafka_node.hpp"
 #include "scheduler_stack.hpp"
 #include "test_helpers.hpp"
 
 #include "../mock/mock_config.hpp"
-#include "../mock/sql_db_connector.hpp"
 
 #include <catch2/catch_all.hpp>
 
@@ -62,48 +61,22 @@ namespace {
 
     using otterstax::test::wait_until_ready;
 
-    // Real engine, real parser, real catalog; the MySQL connection is a mock
-    // connector registered under kUid. The stack is the production shape minus
-    // pg/ch/s3/file/kafka, which this DDL never reaches.
-    class guarded_stack_owner {
+    // Real engine, parser and catalog; the MySQL connection is a mock driver registered under kUid
+    // before any Worker exists. Discovery lists no tables, so registration creates the engine database
+    // and enters the uid in the catalog. Production shape minus pg/ch/s3/file/kafka, which this DDL skips.
+    class guarded_stack_owner : public otterstax::test::backend_stack_owner {
     public:
-        // Member order is construction order: every actor is spawned after the
-        // ones whose addresses it takes, and the pmr deleters carry the engine's
-        // resource, so the members are initialised here rather than assigned.
         explicit guarded_stack_owner(const std::string& data_dir)
-            : data_dir_(data_dir)
-            , otterbrix_(init_fresh_test_otterbrix(data_dir_))
-            , resource_(otterbrix_->dispatcher()->resource())
-            , az_scheduler_(make_az_scheduler())
-            , otb_mgr_(actor_zeta::spawn<db::OtterbrixManager>(resource_, make_otterbrix_manager(otterbrix_)))
-            , catalog_(actor_zeta::spawn<mysql::CatalogManager>(resource_, otb_mgr_->address(), shop_aliases()))
-            , mysql_conn_(std::make_unique<mysql::ConnectorManager>(resource_,
-                                                                    catalog_->address(),
-                                                                    &mysql_mock_connector_factory,
-                                                                    /*pool_size*/ 1))
-            , mysql_mgr_(actor_zeta::spawn<db::MySQLManager>(resource_, mysql_conn_.get()))
-            , scheduler_(spawn_guarded_scheduler()) {}
-
-        guarded_stack_owner(const guarded_stack_owner&) = delete;
-        guarded_stack_owner& operator=(const guarded_stack_owner&) = delete;
-
-        ~guarded_stack_owner() {
-            scheduler_.reset();
-            mysql_mgr_.reset();
-            mysql_conn_.reset();
-            catalog_.reset();
-            otb_mgr_.reset();
-            az_scheduler_->stop();
-            otterbrix_.reset();
-            std::filesystem::remove_all(data_dir_);
-        }
-
-        scheduler_stack stack() const { return scheduler_stack{scheduler_->address(), otterbrix_, resource_}; }
+            : backend_stack_owner(data_dir, shop_aliases(), [](otterstax::test::mock_backends& backends, auto*) {
+                REQUIRE_FALSE(backends.add_mysql(kUid).contains_error());
+            }) {}
 
         // The catalog's own verdict on a name, bypassing the Worker.
         core::error_t catalog_verdict(const std::string& dbname) {
             auto [needs_sched, future] =
-                actor_zeta::send(catalog_->address(), &mysql::CatalogManager::check_database_ownership, dbname);
+                actor_zeta::send(catalog(),
+                                 &mysql::CatalogManager::check_database_ownership,
+                                 std::pmr::string(dbname, std::pmr::new_delete_resource()));
             wait_until_ready(future);
             return std::move(future).take_ready();
         }
@@ -112,50 +85,12 @@ namespace {
         // intact mirror answers database_already_exists.
         core::error_code_t engine_create_uid_database() {
             session_id sid;
-            auto cur = otterbrix_->dispatcher()->execute_sql(sid, std::string{"CREATE DATABASE \""} + kUid + "\";");
+            auto cur =
+                stack().otterbrix->dispatcher()->execute_sql(sid, std::string{"CREATE DATABASE \""} + kUid + "\";");
             REQUIRE(cur);
             REQUIRE(cur->is_error());
             return cur->get_error().type;
         }
-
-    private:
-        // The uid is registered before any Worker exists. Whole-database
-        // discovery over the mock lists no tables, so the registration creates
-        // the engine database for the uid and enters the uid in the catalog's
-        // connection registry.
-        std::unique_ptr<Scheduler, actor_zeta::pmr::deleter_t> spawn_guarded_scheduler() {
-            catalog_->set_backend_managers(mysql_mgr_->address(),
-                                           actor_zeta::address_t::empty_address(),
-                                           actor_zeta::address_t::empty_address());
-
-            boost::mysql::connect_params params;
-            params.database = "db";
-            auto added = mysql_conn_->addConnection(params, kUid);
-            REQUIRE_FALSE(added.has_error());
-
-            return actor_zeta::spawn<Scheduler>(resource_,
-                                                az_scheduler_.get(),
-                                                worker_pool_size(),
-                                                &make_parser,
-                                                shop_aliases(),
-                                                mysql_mgr_->address(),
-                                                actor_zeta::address_t::empty_address(), // pg
-                                                actor_zeta::address_t::empty_address(), // ch
-                                                otb_mgr_->address(),
-                                                catalog_->address(),
-                                                actor_zeta::address_t::empty_address(), // s3
-                                                actor_zeta::address_t::empty_address()); // file
-        }
-
-        std::string data_dir_;
-        db::otterbrix_engine_ptr otterbrix_;
-        std::pmr::memory_resource* resource_{nullptr};
-        std::unique_ptr<actor_zeta::scheduler::sharing_scheduler> az_scheduler_;
-        std::unique_ptr<db::OtterbrixManager, actor_zeta::pmr::deleter_t> otb_mgr_;
-        std::unique_ptr<mysql::CatalogManager, actor_zeta::pmr::deleter_t> catalog_;
-        std::unique_ptr<mysql::ConnectorManager> mysql_conn_;
-        std::unique_ptr<db::MySQLManager, actor_zeta::pmr::deleter_t> mysql_mgr_;
-        std::unique_ptr<Scheduler, actor_zeta::pmr::deleter_t> scheduler_;
     };
 
     void require_owned_by(const core::result_wrapper_t<session_payload>& r,
@@ -286,20 +221,13 @@ TEST_CASE("database ownership: a user database of the alias name is not adopted 
         auto* resource = engine->dispatcher()->resource();
         auto otb_mgr = actor_zeta::spawn<db::OtterbrixManager>(resource, make_otterbrix_manager(engine));
         auto catalog = actor_zeta::spawn<mysql::CatalogManager>(resource, otb_mgr->address(), legacy_aliases());
-        auto conn =
-            std::make_unique<mysql::ConnectorManager>(resource, catalog->address(), &mysql_mock_connector_factory, 1);
-        auto mgr = actor_zeta::spawn<db::MySQLManager>(resource, conn.get());
-        catalog->set_backend_managers(mgr->address(),
-                                      actor_zeta::address_t::empty_address(),
-                                      actor_zeta::address_t::empty_address());
+        otterstax::test::mock_backends backends(resource, *catalog);
 
-        boost::mysql::connect_params params;
-        params.database = "db";
-        auto added = conn->addConnection(params, "legacy");
+        auto added = backends.add_mysql("legacy");
 
         CHECK(run(engine, "SELECT id FROM legacy.t;")->size() == 1);
-        REQUIRE(added.has_error());
-        CHECK(added.error().type == core::error_code_t::database_already_exists);
+        REQUIRE(added.contains_error());
+        CHECK(added.type == core::error_code_t::database_already_exists);
     }
     std::filesystem::remove_all(data_dir);
 }

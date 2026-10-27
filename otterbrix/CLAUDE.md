@@ -116,8 +116,8 @@ Converts raw backend results or file bytes into Otterbrix `data_chunk_t`:
 `data_chunk_t`; a wider result is a run of such chunks sharing one column shape, and that
 is also what the cursor hands the frontends. Every translator above builds its whole input —
 a backend result set, a file — as ONE chunk, so it is cut into that run where it enters the
-engine, by `tsl::split_to_capacity`: at the three backend managers' `node_raw_data`
-substitution (`integration/{sql,postgresql,clickhouse}/connection_manager.cpp`) and in
+engine, by `tsl::split_to_capacity`: at the backends' `node_raw_data`
+substitution (`db::backend_t::execute`, `integration/backend.hpp`) and in
 `OtterbrixDataManager::insert_rows` (the file / s3 load path). A chunk within the bound is
 moved in unchanged. A column-less chunk is never cut, whatever its cardinality: it is the
 DML count carrier, which `capture_remote_dml_count` reads whole, and a zero-column window
@@ -172,8 +172,8 @@ deallocate sees freed memory (caught by TSan in
 | `writable_columns.hpp` | the column validation shared by the writers: only named, flat scalar columns (plus NA) can be written |
 
 The three file-format writers are the `COPY (...) TO 'path'` companion to the
-input loaders. `db::S3Manager::upload` and `conn::file::FileManager::dump_file`
-pick the writer by `FileFormat` enum (auto-detected from the location's
+input loaders. `conn::file::write_chunks` (`connectors/file/driver.cpp`, used by the
+local-file and the s3 transfer drivers) picks the writer by `FileFormat` enum (auto-detected from the location's
 extension when `format=` is omitted).
 
 ### `operators/`
@@ -196,4 +196,4 @@ Re-exports the Otterbrix configuration type used when initialising the engine in
    anonymous namespace: the translators reuse those names inside `tsl`, and with external linkage the linker keeps
    one definition for all of them, so one translator's objects get destroyed with another translator's layout
 3. Register in `otterbrix/CMakeLists.txt` under both `OTTERBRIX_HEADERS` and `OTTERBRIX_SOURCES`
-4. Use the new translator in the relevant `integration/<backend>/connection_manager.cpp`
+4. Use the new translator in the relevant driver's `decode` (`connectors/<backend>/driver.cpp`)

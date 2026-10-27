@@ -12,7 +12,6 @@
 #include <spdlog/spdlog.h>
 
 #include "component_manager/component_manager.hpp"
-#include "connectors/mysql/connector.hpp"
 #include "connectors/s3/s3_subsystem.hpp"
 #include "frontend/flight_sql/server.hpp"
 #include "frontend/mysql_server/mysql_server.hpp"
@@ -83,22 +82,20 @@ int main(int argc, char* argv[]) {
     }
     config::ServiceConfig server_config = std::move(loaded.value());
 
-    // ComponentManager spawns the s3 connector actor, which initialises Arrow's
-    // S3 subsystem; the process owes Arrow a FinalizeS3 before exit on every
-    // path below, including the aborted-startup returns. Declared before the
-    // manager so it finalizes after the whole actor graph is gone.
+    // ComponentManager's s3 aliases initialise Arrow's S3, so the process must FinalizeS3 on every exit
+    // path. Declared before the manager so it finalizes after the whole actor graph is gone.
     conn::s3::subsystem_finalizer_t finalize_s3(get_logger(logger_tag::S3_MANAGER));
 
     // Create component manager
     OTX_MESSAGE_L("startup: creating component manager");
     ComponentManager cmanager(make_create_config(DATA_DIR), server_config.connections);
 
-    // Register the connections read from the config file with the connector
-    // managers (opens the backend connections / stores the s3 aliases). A
-    // backend that is down is skipped with a logged error; a descriptor the
-    // backend cannot accept is a configuration error and the server does not
-    // start with it.
-    if (auto registered = cmanager.register_connections(server_config.connections, server_config.connection_retry);
+    // Register the configured connections: open each backend's pool and discover its tables, build each
+    // s3 filesystem and the transfer pools. A backend that is down is logged and skipped; a descriptor
+    // a backend cannot accept is a configuration error and the server does not start.
+    if (auto registered = cmanager.register_connections(server_config.connections,
+                                                        server_config.connection_retry,
+                                                        server_config.file_transfers);
         registered.contains_error()) {
         log->error("Invalid connection configuration: {}", registered.what.c_str());
         return 1;

@@ -6,8 +6,8 @@
 namespace conn::s3 {
 
 
-// Kept by ConnectorManager for the life of the process, so every field lives on
-// a memory_resource: the manager re-homes a registered set onto its own.
+// What conn::s3::driver_t::make builds an alias's S3FileSystem from; every field
+// lives on the registering resource.
 struct connect_params {
     std::pmr::string region;
     std::pmr::string access_key;

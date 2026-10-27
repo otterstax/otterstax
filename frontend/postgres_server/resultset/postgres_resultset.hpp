@@ -9,6 +9,7 @@
 #include "field_description.hpp"
 
 #include <iostream>
+#include <memory_resource>
 #include <optional>
 #include <string>
 
@@ -35,13 +36,22 @@ namespace frontend::postgres {
 
         void add_row(const components::vector::data_chunk_t& chunk, size_t row_index);
 
-        [[nodiscard]] static std::vector<std::vector<uint8_t>> build_packets(postgres_resultset&& resultset);
+        // The RowDescription (unless datarow_only) and every DataRow, back to back in wire
+        // order: what one write sends, with whatever the caller appends behind it.
+        [[nodiscard]] static std::vector<uint8_t> build_packets(postgres_resultset&& resultset);
 
     private:
         std::vector<result_encoding> format_;
         std::vector<field_description> field_desc_;
-        std::vector<std::vector<uint8_t>> encoded_rows_;
+        // The RowDescription (written in front of the first row, once the formats are set) and
+        // every DataRow, framed back to back: one buffer for the whole resultset.
+        std::vector<uint8_t> packets_;
+        bool head_written_ = false;
+        void write_head();
         std::reference_wrapper<packet_writer> writer_;
         bool datarow_only_;
+        // encode_to_text's buffer, reused for every cell. On the default resource until the
+        // frontends take one.
+        std::pmr::string text_scratch_{std::pmr::get_default_resource()};
     };
 } // namespace frontend::postgres

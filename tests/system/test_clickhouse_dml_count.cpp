@@ -2,21 +2,24 @@
 // Copyright 2025-2026  OtterStax
 //
 // The ClickHouse native protocol never puts an affected-row count into a block:
-// the only signal is Progress.written_rows, which the connector sums and hands
-// to the manager beside the blocks. What is pinned here is how the manager
-// turns that number into the engine's count carrier — INSERT reports it,
+// the only signal is Progress.written_rows, which the driver sums and decodes
+// into the statement's affected-row count. What is pinned here is how the
+// backend turns that number into the engine's count carrier — INSERT reports it,
 // a lightweight DELETE (a mutation) reports 0 whatever the server wrote, and a
 // SELECT slot is data, never a count.
 
 #include "catalog/catalog_manager.hpp"
-#include "integration/clickhouse/connection_manager.hpp"
+#include "connectors/clickhouse/driver.hpp"
+#include "integration/backends.hpp"
 #include "integration/otterbrix/otterbrix_manager.hpp"
 #include "otterbrix/schema/schema_utils.hpp"
 #include "test_helpers.hpp"
 #include "types/otterbrix.hpp"
 
 #include "../mock/aliases.hpp"
+#include "../mock/drive.hpp"
 #include "../mock/mock_config.hpp"
+#include "../mock/mock_driver.hpp"
 #include "../mock/otterbrix.hpp"
 #include "../mock/parser.hpp"
 
@@ -55,90 +58,48 @@ namespace {
         return block;
     }
 
-    // Answers the catalog's discovery with the header block and every data
-    // query with no blocks at all plus `written_rows` of progress — the exact
-    // shape a DML statement produces on the wire.
-    class counting_connector final : public ch::IConnector {
-    public:
-        counting_connector(ch::connect_params params, std::string alias, uint64_t written_rows)
-            : params_(std::move(params))
-            , alias_(std::move(alias))
-            , written_rows_(written_rows) {}
-
-        ch::Status status() const noexcept override { return ch::Status::Connected; }
-        ch::connect_params params() const noexcept override { return params_; }
-        void close() override {}
-        core::error_t connect() override { return core::error_t::no_error(); }
-        bool isConnected() override { return true; }
-        core::error_t tryReconnect() override { return core::error_t::no_error(); }
-        bool isClosed() const noexcept override { return false; }
-        std::string alias() const noexcept override { return alias_; }
-
-        boost::asio::awaitable<core::result_wrapper_t<std::unique_ptr<data_chunk_t>>>
-        runQuery(std::string_view,
-                 otterstax::function_ref_t<std::unique_ptr<data_chunk_t>(const ch::select_result_t&)> handler)
-            override {
-            ch::select_result_t outcome;
-            outcome.written_rows = written_rows_;
-            co_return handler(outcome);
-        }
-
-        boost::asio::awaitable<core::result_wrapper_t<int64_t>>
-        runQuery(std::string_view, otterstax::function_ref_t<int64_t(const ch::select_result_t&)>) override {
-            co_return int64_t{0};
-        }
-
-        boost::asio::awaitable<core::error_t>
-        runQuery(std::string_view,
-                 otterstax::function_ref_t<otterstax::asio_error_t(const ch::select_result_t&)> handler) override {
-            ch::select_result_t probe;
-            probe.blocks.push_back(header_block());
-            co_return otterstax::as_query_result<otterstax::asio_error_t>(handler(probe));
-        }
-
-    private:
-        ch::connect_params params_;
-        std::string alias_;
-        uint64_t written_rows_;
-    };
-
-    template<uint64_t WrittenRows>
-    std::unique_ptr<ch::IConnector>
-    counting_factory(std::pmr::memory_resource*, ch::connect_params params, std::string alias) {
-        return std::make_unique<counting_connector>(std::move(params), std::move(alias), WrittenRows);
+    // Answers discovery with the header block and every slot statement with no blocks plus `written_rows`
+    // of progress, the wire shape of a DML, decoded by the ClickHouse driver's own decode.
+    std::unique_ptr<conn::IDriver> counting_driver(std::pmr::memory_resource* resource, uint64_t written_rows) {
+        return std::make_unique<otterstax::test::scripted_driver_t>(
+            [resource, written_rows](const conn::statement_t& statement) {
+                ch::select_result_t outcome(std::pmr::new_delete_resource());
+                outcome.written_rows = written_rows;
+                return ch::decode(resource, outcome, statement);
+            },
+            [resource](const conn::statement_t& statement) {
+                ch::select_result_t probe(std::pmr::new_delete_resource());
+                probe.blocks.push_back(header_block());
+                return ch::decode(resource, probe, statement);
+            });
     }
 
-    using otterstax::test::wait_until_ready;
-
-    // Catalog + connector manager over `factory` + the ClickHouse integration
-    // actor. Connection "1" matches the uid SimpleMockParser stamps on its
-    // external node.
+    // Catalog + the connection pools; connection "1" — the uid SimpleMockParser
+    // stamps on its external node — over a counting driver reporting
+    // `written_rows`.
     struct ch_stack {
         std::pmr::memory_resource* resource;
         std::unique_ptr<db::OtterbrixManager, actor_zeta::pmr::deleter_t> otterbrix_manager;
         std::unique_ptr<mysql::CatalogManager, actor_zeta::pmr::deleter_t> catalog_manager;
-        std::unique_ptr<ch::ConnectorManager> connector_manager;
-        std::unique_ptr<db::ClickhouseManager, actor_zeta::pmr::deleter_t> manager;
+        std::unique_ptr<otterstax::test::mock_backends> backends;
+        uint64_t written_rows;
 
-        ch_stack(std::pmr::memory_resource* res, ch::connector_factory factory)
+        ch_stack(std::pmr::memory_resource* res, uint64_t written)
             : resource(res)
             , otterbrix_manager(actor_zeta::spawn<db::OtterbrixManager>(
                   res,
                   std::make_unique<SimpleMockOtterbrixManager>(mock_config{.resource = res})))
             , catalog_manager(actor_zeta::spawn<mysql::CatalogManager>(res, otterbrix_manager->address(), no_aliases()))
-            , connector_manager(std::make_unique<ch::ConnectorManager>(res, catalog_manager->address(), factory, 2))
-            , manager(actor_zeta::spawn<db::ClickhouseManager>(res, connector_manager.get())) {
-            catalog_manager->set_backend_managers(actor_zeta::address_t::empty_address(),
-                                                  actor_zeta::address_t::empty_address(),
-                                                  manager->address());
-        }
+            , backends(std::make_unique<otterstax::test::mock_backends>(res, *catalog_manager))
+            , written_rows(written) {}
 
         void register_connection_one() {
-            ch::connect_params params;
-            params.table = "orders";
-            auto added = connector_manager->addConnection(std::move(params), "1");
-            INFO("addConnection: " << (added.has_error() ? added.error().what.c_str() : "ok"));
-            REQUIRE_FALSE(added.has_error());
+            auto added = backends->add(backend_type_t::ClickHouse,
+                                       "1",
+                                       counting_driver(resource, written_rows),
+                                       qualified_name_t("1", "default", "", "orders"));
+            INFO("register: " << (added.contains_error() ? added.what.c_str() : "ok"));
+            REQUIRE_FALSE(added.contains_error());
         }
 
         ParsedQueryDataPtr statement() {
@@ -189,12 +150,8 @@ namespace {
         }
 
         core::result_wrapper_t<ParsedQueryDataPtr> execute(ParsedQueryDataPtr data) {
-            auto [needs_sched, future] = actor_zeta::send(manager->address(),
-                                                          &db::ClickhouseManager::execute,
-                                                          session_hash_t{1},
-                                                          std::move(data));
-            wait_until_ready(future);
-            return std::move(future).take_ready();
+            return otterstax::test::drive(resource,
+                                          backends->backends().clickhouse.execute(session_hash_t{1}, std::move(data)));
         }
     };
 
@@ -206,9 +163,9 @@ namespace {
 
 } // namespace
 
-TEST_CASE("ClickhouseManager::execute: a remote INSERT reports the server's written rows as its affected count") {
+TEST_CASE("ClickHouse backend execute: a remote INSERT reports the server's written rows as its affected count") {
     std::pmr::synchronized_pool_resource arena(std::pmr::new_delete_resource());
-    ch_stack stack(&arena, &counting_factory<3>);
+    ch_stack stack(&arena, 3);
     stack.register_connection_one();
 
     auto result = stack.execute(stack.insert_statement());
@@ -221,10 +178,10 @@ TEST_CASE("ClickhouseManager::execute: a remote INSERT reports the server's writ
     REQUIRE(result.value()->otterbrix_params->remote_affected_rows == 3);
 }
 
-TEST_CASE("ClickhouseManager::execute: an INSERT writing more than one vector window keeps the whole count") {
+TEST_CASE("ClickHouse backend execute: an INSERT writing more than one vector window keeps the whole count") {
     std::pmr::synchronized_pool_resource arena(std::pmr::new_delete_resource());
     constexpr uint64_t written = DEFAULT_VECTOR_CAPACITY * 2 + 452;
-    ch_stack stack(&arena, &counting_factory<written>);
+    ch_stack stack(&arena, written);
     stack.register_connection_one();
 
     auto result = stack.execute(stack.insert_statement());
@@ -237,11 +194,11 @@ TEST_CASE("ClickhouseManager::execute: an INSERT writing more than one vector wi
     REQUIRE(result.value()->otterbrix_params->remote_affected_rows == written);
 }
 
-TEST_CASE("ClickhouseManager::execute: a lightweight DELETE reports 0 rows even when the server writes progress") {
+TEST_CASE("ClickHouse backend execute: a lightweight DELETE reports 0 rows even when the server writes progress") {
     std::pmr::synchronized_pool_resource arena(std::pmr::new_delete_resource());
     // A mutation rewrites whole parts: whatever written_rows the server ever
     // attributes to it is a part size, not the number of matched rows.
-    ch_stack stack(&arena, &counting_factory<5>);
+    ch_stack stack(&arena, 5);
     stack.register_connection_one();
 
     auto result = stack.execute(stack.delete_statement());
@@ -254,9 +211,9 @@ TEST_CASE("ClickhouseManager::execute: a lightweight DELETE reports 0 rows even 
     REQUIRE(result.value()->otterbrix_params->remote_affected_rows == 0);
 }
 
-TEST_CASE("ClickhouseManager::execute: a SELECT slot is data — written rows never become an affected count") {
+TEST_CASE("ClickHouse backend execute: a SELECT slot is data — written rows never become an affected count") {
     std::pmr::synchronized_pool_resource arena(std::pmr::new_delete_resource());
-    ch_stack stack(&arena, &counting_factory<3>);
+    ch_stack stack(&arena, 3);
     stack.register_connection_one();
 
     auto result = stack.execute(stack.select_statement());

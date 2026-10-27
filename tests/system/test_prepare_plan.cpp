@@ -8,8 +8,8 @@
 // execute_plan. prepare_plan must DESCRIBE the plan and never run it — a schema
 // request that executed its statement would read the backend's rows on every
 // df.schema. Driven through the real Scheduler→Worker→catalog stack over a
-// typed PostgreSQL mock connector that records its describe probes apart from
-// its data queries; the plan is built by the real GreenplumParser, the parse
+// PostgreSQL mock driver that records its describe probes apart from its data
+// queries; the plan is built by the real GreenplumParser, the parse
 // the Worker applies to SQL text.
 //
 // spark.sql() is told apart the same way — without running anything: the
@@ -21,7 +21,8 @@
 
 #include "catalog/catalog_manager.hpp"
 #include "frontend/spark_connect_server/service.hpp"
-#include "integration/postgresql/connection_manager.hpp"
+#include "connectors/postgresql/driver.hpp"
+#include "integration/backends.hpp"
 #include "otterbrix/parser/parser.hpp"
 #include "scheduler_stack.hpp"
 
@@ -97,9 +98,8 @@ namespace {
     // (db::make_prepare_probe).
     constexpr std::string_view kProbePrefix = "SELECT * FROM (";
 
-    // Shared with the connector through file-scope state (connector_factory is
-    // a plain function pointer); every access is ordered by the future the
-    // io-thread query settles.
+    // Shared with the driver through file-scope state; every access is ordered
+    // by the future the pool thread settles.
     std::mutex g_mutex;
     std::vector<std::string> g_probe_queries;
     std::vector<std::string> g_data_queries;
@@ -138,28 +138,42 @@ namespace {
         return result;
     }
 
-    // Answers discovery and the describe probe with the table's columns and the
-    // data query with kRows, recording the probes and the data queries apart.
-    class recording_pg_connector final : public pg::IConnector {
+    // Answers discovery and the describe probe with the table's columns and the slot statement with
+    // kRows, recording probes and slot statements apart. Discovery and the describe probe are told
+    // apart by the wrap describe puts around the statement.
+    class recording_pg_driver final : public conn::IDriver {
     public:
-        recording_pg_connector(std::pmr::memory_resource* resource, pg::connect_params params, std::string alias)
-            : resource_(resource)
-            , params_(std::move(params))
-            , alias_(std::move(alias)) {}
+        explicit recording_pg_driver(std::pmr::memory_resource* resource)
+            : resource_(resource) {}
 
-        pg::Status status() const noexcept override { return pg::Status::Connected; }
-        pg::connect_params params() const noexcept override { return params_; }
-        void close() override {}
         core::error_t connect() override { return core::error_t::no_error(); }
-        bool isConnected() override { return true; }
-        core::error_t tryReconnect() override { return core::error_t::no_error(); }
-        bool isClosed() const noexcept override { return false; }
-        std::string alias() const noexcept override { return alias_; }
+        core::error_t ping() override { return core::error_t::no_error(); }
+        void close() noexcept override {}
+        std::unique_ptr<conn::IDriver> clone_disconnected() const override {
+            return std::make_unique<recording_pg_driver>(resource_);
+        }
 
-        // The data path: the statement a remote SELECT executes.
-        boost::asio::awaitable<core::result_wrapper_t<std::unique_ptr<components::vector::data_chunk_t>>>
-        runQuery(std::string_view query,
-                 otterstax::function_ref_t<std::unique_ptr<components::vector::data_chunk_t>(PGresult*)>) override {
+        conn::statement_outcome_t execute(const conn::statement_t& statement) override {
+            const std::string_view query = statement.sql;
+            if (!otterstax::test::is_discovery(statement)) {
+                return conn::statement_result_t{.rows = rows(query)};
+            }
+            if (query.find("pg_enum") != std::string_view::npos) {
+                std::unique_ptr<PGresult, decltype(&PQclear)> empty(PQmakeEmptyPGresult(nullptr, PGRES_TUPLES_OK),
+                                                                    &PQclear);
+                return pg::decode(resource_, empty.get(), statement);
+            }
+            if (query.substr(0, kProbePrefix.size()) == kProbePrefix) {
+                std::lock_guard guard(g_mutex);
+                g_probe_queries.emplace_back(query);
+            }
+            auto header = make_header();
+            return pg::decode(resource_, header.get(), statement);
+        }
+
+    private:
+        // The slot statement a remote SELECT executes.
+        components::vector::data_chunk_t rows(std::string_view query) const {
             using components::types::complex_logical_type;
             using components::types::logical_value_t;
             {
@@ -170,131 +184,35 @@ namespace {
             for (const auto& column : kColumns) {
                 fields.emplace_back(column.type, column.name);
             }
-            auto chunk = std::make_unique<components::vector::data_chunk_t>(resource_, fields, kRows.size());
+            components::vector::data_chunk_t chunk(resource_, fields, kRows.size());
             for (std::size_t row = 0; row < kRows.size(); ++row) {
-                chunk->set_value(0, row, logical_value_t(resource_, kRows[row].id));
-                chunk->set_value(1, row, logical_value_t(resource_, std::string_view{kRows[row].name}));
-                chunk->set_value(2, row, logical_value_t(resource_, kRows[row].price));
+                chunk.set_value(0, row, logical_value_t(resource_, kRows[row].id));
+                chunk.set_value(1, row, logical_value_t(resource_, std::string_view{kRows[row].name}));
+                chunk.set_value(2, row, logical_value_t(resource_, kRows[row].price));
             }
-            chunk->set_cardinality(kRows.size());
-            co_return std::move(chunk);
+            chunk.set_cardinality(kRows.size());
+            return chunk;
         }
 
-        boost::asio::awaitable<core::result_wrapper_t<int64_t>>
-        runQuery(std::string_view, otterstax::function_ref_t<int64_t(PGresult*)>) override {
-            co_return int64_t{0};
-        }
-
-        // Discovery (the pg_enum query lists no enums, the table's schema probe
-        // answers its columns) and the describe probe, told apart by the wrap
-        // describe puts around the statement.
-        boost::asio::awaitable<core::error_t>
-        runQuery(std::string_view query,
-                 otterstax::function_ref_t<otterstax::asio_error_t(PGresult*)> handler) override {
-            if (query.find("pg_enum") != std::string_view::npos) {
-                std::unique_ptr<PGresult, decltype(&PQclear)> empty(PQmakeEmptyPGresult(nullptr, PGRES_TUPLES_OK),
-                                                                    &PQclear);
-                co_return otterstax::as_query_result<otterstax::asio_error_t>(handler(empty.get()));
-            }
-            if (query.substr(0, kProbePrefix.size()) == kProbePrefix) {
-                std::lock_guard guard(g_mutex);
-                g_probe_queries.emplace_back(query);
-            }
-            auto header = make_header();
-            co_return otterstax::as_query_result<otterstax::asio_error_t>(handler(header.get()));
-        }
-
-    private:
         std::pmr::memory_resource* resource_;
-        pg::connect_params params_;
-        std::string alias_;
     };
 
-    std::unique_ptr<pg::IConnector>
-    recording_pg_factory(std::pmr::memory_resource* resource, pg::connect_params params, std::string alias) {
-        return std::make_unique<recording_pg_connector>(resource, std::move(params), std::move(alias));
-    }
-
     // Real engine, real parser, real catalog; the PostgreSQL connection is the
-    // recording mock registered under kUid with its single table discovered
+    // recording driver registered under kUid with its single table discovered
     // eagerly.
-    class plan_stack_owner {
+    class plan_stack_owner : public otterstax::test::backend_stack_owner {
     public:
-        // Member order is construction order: every actor is spawned after the
-        // ones whose addresses it takes, and the pmr deleters carry the engine's
-        // resource, so the members are initialised here rather than assigned.
         explicit plan_stack_owner(const std::string& data_dir)
-            : data_dir_(data_dir)
-            , otterbrix_(init_fresh_test_otterbrix(data_dir_))
-            , resource_(otterbrix_->dispatcher()->resource())
-            , az_scheduler_(make_az_scheduler())
-            , otb_mgr_(actor_zeta::spawn<db::OtterbrixManager>(resource_, make_otterbrix_manager(otterbrix_)))
-            , catalog_(actor_zeta::spawn<mysql::CatalogManager>(resource_, otb_mgr_->address(), planpg_aliases()))
-            , pg_conn_(std::make_unique<pg::ConnectorManager>(resource_,
-                                                              catalog_->address(),
-                                                              &recording_pg_factory,
-                                                              /*pool_size*/ 1))
-            , pg_mgr_(actor_zeta::spawn<db::PostgressManager>(resource_, pg_conn_.get()))
-            , scheduler_(spawn_scheduler()) {}
-
-        plan_stack_owner(const plan_stack_owner&) = delete;
-        plan_stack_owner& operator=(const plan_stack_owner&) = delete;
-
-        ~plan_stack_owner() {
-            scheduler_.reset();
-            pg_mgr_.reset();
-            pg_conn_.reset();
-            catalog_.reset();
-            otb_mgr_.reset();
-            az_scheduler_->stop();
-            otterbrix_.reset();
-            std::filesystem::remove_all(data_dir_);
-        }
-
-        scheduler_stack stack() const { return scheduler_stack{scheduler_->address(), otterbrix_, resource_}; }
-
-    private:
-        std::unique_ptr<Scheduler, actor_zeta::pmr::deleter_t> spawn_scheduler() {
-            catalog_->set_backend_managers(actor_zeta::address_t::empty_address(),
-                                           pg_mgr_->address(),
-                                           actor_zeta::address_t::empty_address());
-
-            conn::api_server::PgConnectionParams params;
-            params.alias = kUid;
-            params.host = "localhost";
-            params.port = "5432";
-            params.username = "user";
-            params.password = "pass";
-            params.database = "pgdb";
-            params.schema = "public";
-            params.table = "items";
-            auto added = pg_conn_->addConnection(params);
-            INFO("addConnection: " << (added.has_error() ? added.error().what.c_str() : "ok"));
-            REQUIRE_FALSE(added.has_error());
-
-            return actor_zeta::spawn<Scheduler>(resource_,
-                                                az_scheduler_.get(),
-                                                worker_pool_size(),
-                                                &make_parser,
-                                                planpg_aliases(),
-                                                actor_zeta::address_t::empty_address(), // sql
-                                                pg_mgr_->address(),
-                                                actor_zeta::address_t::empty_address(), // ch
-                                                otb_mgr_->address(),
-                                                catalog_->address(),
-                                                actor_zeta::address_t::empty_address(),  // s3
-                                                actor_zeta::address_t::empty_address()); // file
-        }
-
-        std::string data_dir_;
-        db::otterbrix_engine_ptr otterbrix_;
-        std::pmr::memory_resource* resource_{nullptr};
-        std::unique_ptr<actor_zeta::scheduler::sharing_scheduler> az_scheduler_;
-        std::unique_ptr<db::OtterbrixManager, actor_zeta::pmr::deleter_t> otb_mgr_;
-        std::unique_ptr<mysql::CatalogManager, actor_zeta::pmr::deleter_t> catalog_;
-        std::unique_ptr<pg::ConnectorManager> pg_conn_;
-        std::unique_ptr<db::PostgressManager, actor_zeta::pmr::deleter_t> pg_mgr_;
-        std::unique_ptr<Scheduler, actor_zeta::pmr::deleter_t> scheduler_;
+            : backend_stack_owner(data_dir,
+                                  planpg_aliases(),
+                                  [](otterstax::test::mock_backends& backends, std::pmr::memory_resource* resource) {
+                                      auto added = backends.add(backend_type_t::PostgreSQL,
+                                                                kUid,
+                                                                std::make_unique<recording_pg_driver>(resource),
+                                                                qualified_name_t(kUid, "pgdb", "public", "items"));
+                                      INFO("register: " << (added.contains_error() ? added.what.c_str() : "ok"));
+                                      REQUIRE_FALSE(added.contains_error());
+                                  }) {}
     };
 
     // The plan a pre-built-plan frontend hands the Scheduler, parsed the way

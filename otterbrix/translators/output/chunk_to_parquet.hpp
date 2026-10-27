@@ -16,6 +16,7 @@
 #include <memory>
 #include <memory_resource>
 #include <string>
+#include <string_view>
 
 namespace tsl {
 
@@ -30,7 +31,7 @@ inline constexpr int64_t parquet_row_group_rows = 128 * 1024;
 [[nodiscard]] core::result_wrapper_t<bool>
 chunk_to_parquet(std::pmr::memory_resource* res,
                  const std::pmr::vector<components::vector::data_chunk_t>& chunks,
-                 const std::string& path);
+                 std::string_view path);
 
 // The same rows written to `sink`, which stays open: committing it (Close) or
 // discarding it (Abort — an S3 upload must never publish a partial object) is the

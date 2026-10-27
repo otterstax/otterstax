@@ -3,7 +3,8 @@
 
 #pragma once
 
-#include "integration/clickhouse/connection_manager.hpp"
+#include "connectors/clickhouse/driver.hpp"
+#include "integration/backends.hpp"
 #include "typed_backend.hpp"
 
 #include "../mock/aliases.hpp"
@@ -36,14 +37,8 @@ namespace otterstax::test {
     struct ch_backend {
         using wire = ch_wire;
         using column = wire_column<ch_wire>;
-        using status = ch::Status;
-        using connect_params = ch::connect_params;
-        using connector_iface = ch::IConnector;
-        using connector_manager = ch::ConnectorManager;
-        using manager = db::ClickhouseManager;
-        using api_params = conn::api_server::ChConnectionParams;
-        using handler_arg = const ch::select_result_t&;
         using answer = ch::select_result_t;
+        using backend = db::ClickhouseBackend;
 
         enum class probe_mode
         {
@@ -56,19 +51,28 @@ namespace otterstax::test {
         static constexpr test_connection_t connection{"chx", backend_type_t::ClickHouse, "chdb", "", "events"};
         static constexpr std::string_view events = "chx.chdb.events";
 
-        static const answer& view(const answer& result) { return result; }
+        static backend& backend_of(db::backend_set_t& set) { return set.clickhouse; }
+        // ClickHouse has no schema level: the configured table is discovered, in its database.
+        static qualified_name_t scope(const test_connection_t& c) {
+            return qualified_name_t(c.alias, c.database, "", c.table);
+        }
+
+        static conn::statement_outcome_t
+        decode(std::pmr::memory_resource* resource, const answer& result, const conn::statement_t& statement) {
+            return ch::decode(resource, result, statement);
+        }
 
         static answer rows(const std::vector<column>& columns, std::size_t count) {
             constexpr std::size_t first_block_rows = 2;
             const auto split = std::min(count, first_block_rows);
-            answer result;
+            answer result(std::pmr::new_delete_resource());
             result.blocks.push_back(block(columns, 0, split));
             result.blocks.push_back(block(columns, split, count));
             return result;
         }
 
         static answer discovery(std::string_view query) {
-            answer result;
+            answer result(std::pmr::new_delete_resource());
             if (query.find("system.columns") != std::string_view::npos) {
                 result.blocks.push_back(named_types());
             } else {
@@ -79,7 +83,7 @@ namespace otterstax::test {
 
         static core::result_wrapper_t<answer>
         describe(const std::vector<column>& columns, probe_mode mode, std::pmr::memory_resource* resource) {
-            answer result;
+            answer result(std::pmr::new_delete_resource());
             switch (mode) {
                 case probe_mode::header:
                     result.blocks.push_back(block(columns, 0, 0));
@@ -94,11 +98,6 @@ namespace otterstax::test {
                     break;
             }
             return probe_refusal(resource);
-        }
-
-        static std::unique_ptr<connector_iface>
-        factory(std::pmr::memory_resource* resource, connect_params params, std::string alias) {
-            return std::make_unique<typed_connector<ch_backend>>(resource, std::move(params), std::move(alias));
         }
 
     private:

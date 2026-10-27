@@ -12,6 +12,8 @@
 
 #include <libpq-fe.h>
 
+#include "pg_enum_types.hpp"
+
 #include <exception>
 #include <iostream>
 #include <optional>
@@ -23,13 +25,6 @@ using namespace components::vector;
 using namespace components;
 
 namespace tsl {
-
-    // populated by fetch_enum_types at connection-add
-    struct pg_enum_descriptor {
-        std::string typname;
-        std::vector<std::string> values;
-    };
-    using pg_enum_oid_map = std::unordered_map<unsigned int, pg_enum_descriptor>;
 
     // A result with columns becomes a chunk of its tuples; a column-less result
     // (DML) becomes the column-less affected-row carrier (affected_rows_carrier.hpp)

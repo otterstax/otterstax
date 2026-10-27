@@ -3,6 +3,8 @@
 
 #include "packet_writer.hpp"
 
+#include <algorithm>
+
 namespace frontend::mysql {
     void packet_writer::reserve_payload(size_t length) {
         packet_writer_base::reserve_payload(length, PACKET_HEADER_SIZE);
@@ -37,9 +39,9 @@ namespace frontend::mysql {
         }
     }
 
-    void packet_writer::write_length_encoded_string(std::string str) {
+    void packet_writer::write_length_encoded_string(std::string_view str) {
         write_length_encoded_integer(str.size());
-        write_string_fixed(std::move(str));
+        write_string_fixed(str);
     }
 
     void packet_writer::write_null() {
@@ -59,5 +61,42 @@ namespace frontend::mysql {
         payload_[3] = sequence_id;
 
         return extract_payload();
+    }
+
+    namespace {
+        // The largest payload one packet carries; a longer one continues in the next packet.
+        constexpr size_t max_packet_payload = 0xFFFFFF;
+    } // namespace
+
+    void packet_writer::append_frame(std::vector<uint8_t>& out) {
+        const size_t body_start = is_reserved_ ? PACKET_HEADER_SIZE : 0;
+        const uint8_t* body = payload_.data() + body_start;
+        size_t remaining = payload_.size() - body_start;
+        size_t fragment = 0;
+        do {
+            fragment = std::min(remaining, max_packet_payload);
+            const uint32_t length = static_cast<uint32_t>(fragment);
+            const uint8_t header[PACKET_HEADER_SIZE] = {extract_nth_byte_le<0>(length),
+                                                         extract_nth_byte_le<1>(length),
+                                                         extract_nth_byte_le<2>(length),
+                                                         0};
+            out.insert(out.end(), header, header + PACKET_HEADER_SIZE);
+            out.insert(out.end(), body, body + fragment);
+            body += fragment;
+            remaining -= fragment;
+        } while (fragment == max_packet_payload);
+        payload_.clear();
+        is_reserved_ = false;
+    }
+
+    void assign_sequence_ids(std::span<uint8_t> frames, uint8_t& sequence_id) {
+        size_t position = 0;
+        while (position + PACKET_HEADER_SIZE <= frames.size()) {
+            const size_t length = static_cast<size_t>(frames[position]) |
+                                  (static_cast<size_t>(frames[position + 1]) << 8) |
+                                  (static_cast<size_t>(frames[position + 2]) << 16);
+            frames[position + 3] = sequence_id++;
+            position += PACKET_HEADER_SIZE + length;
+        }
     }
 } // namespace frontend::mysql

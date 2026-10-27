@@ -25,9 +25,12 @@
 #include <components/vector/data_chunk.hpp>
 #include <core/result_wrapper.hpp>
 
+#include <atomic>
+#include <chrono>
 #include <memory>
 #include <memory_resource>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -566,4 +569,113 @@ TEST_CASE("OtterbrixManager::drop_external_table: the engine's verdict is return
     REQUIRE(dropped.has_error());
     REQUIRE(dropped.error().type == core::error_code_t::table_not_exists);
     REQUIRE(std::string{dropped.error().what.c_str()}.find("pgdb.orders") != std::string::npos);
+}
+
+namespace {
+
+    // Counts how many calls are inside the engine at once: statements through
+    // execute_plan, registrations through execute_sql (CREATE DATABASE). Every call
+    // takes `hold`, so overlapping callers overlap here.
+    class overlap_data_manager final : public SimpleMockOtterbrixManager {
+    public:
+        overlap_data_manager(mock_config config, std::chrono::milliseconds hold)
+            : SimpleMockOtterbrixManager(config)
+            , hold_(hold) {}
+
+        components::cursor::cursor_t_ptr execute_plan(OtterbrixStatementPtr& params) override {
+            enter(statements_in_flight, max_statements);
+            auto cursor = SimpleMockOtterbrixManager::execute_plan(params);
+            --statements_in_flight;
+            return cursor;
+        }
+
+        components::cursor::cursor_t_ptr execute_sql(const std::string& query) override {
+            enter(registrations_in_flight, max_registrations);
+            std::this_thread::sleep_for(hold_);
+            --registrations_in_flight;
+            return SimpleMockOtterbrixManager::execute_sql(query);
+        }
+
+        std::atomic<int> statements_in_flight{0};
+        std::atomic<int> max_statements{0};
+        std::atomic<int> registrations_in_flight{0};
+        std::atomic<int> max_registrations{0};
+
+    private:
+        static void enter(std::atomic<int>& in_flight, std::atomic<int>& max) {
+            const int now = ++in_flight;
+            int seen = max;
+            while (now > seen && !max.compare_exchange_weak(seen, now)) {
+            }
+        }
+
+        std::chrono::milliseconds hold_;
+    };
+
+} // namespace
+
+TEST_CASE("OtterbrixManager: statements from different senders are in the engine at once") {
+    std::pmr::synchronized_pool_resource arena(std::pmr::new_delete_resource());
+    constexpr auto hold = std::chrono::milliseconds(300);
+    constexpr int senders = 4;
+    auto data_manager =
+        std::make_unique<overlap_data_manager>(mock_config{.resource = &arena, .wait_time = hold}, hold);
+    auto* observed = data_manager.get();
+    auto manager = actor_zeta::spawn<db::OtterbrixManager>(&arena, std::move(data_manager));
+
+    std::vector<components::cursor::cursor_t_ptr> cursors(senders);
+    const auto started = std::chrono::steady_clock::now();
+    {
+        std::vector<std::thread> threads;
+        for (int i = 0; i < senders; ++i) {
+            // No Catch2 assertion off the test thread: the handler runs to completion
+            // inside send(), so the future is settled when send returns.
+            threads.emplace_back([&, i] {
+                auto [needs_sched, future] =
+                    actor_zeta::send(manager->address(),
+                                     &db::OtterbrixManager::execute,
+                                     session_hash_t{static_cast<session_hash_t>(i + 1)},
+                                     statement_with_remote_count(&arena, OtterbrixStatement::no_remote_dml));
+                if (future.is_ready()) {
+                    cursors[i] = std::move(future).take_ready();
+                }
+            });
+        }
+        for (auto& thread : threads) {
+            thread.join();
+        }
+    }
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+
+    for (const auto& cursor : cursors) {
+        REQUIRE(cursor);
+        REQUIRE_FALSE(cursor->is_error());
+    }
+    CHECK(observed->max_statements.load() == senders);
+    // One after another they would take senders × hold.
+    CHECK(elapsed < 2 * hold);
+}
+
+TEST_CASE("OtterbrixManager: mirror registrations never overlap") {
+    std::pmr::synchronized_pool_resource arena(std::pmr::new_delete_resource());
+    auto data_manager =
+        std::make_unique<overlap_data_manager>(mock_config{.resource = &arena}, std::chrono::milliseconds(50));
+    auto* observed = data_manager.get();
+    auto manager = actor_zeta::spawn<db::OtterbrixManager>(&arena, std::move(data_manager));
+
+    {
+        std::vector<std::thread> threads;
+        for (int i = 0; i < 4; ++i) {
+            threads.emplace_back([&, i] {
+                auto [needs_sched, future] = actor_zeta::send(manager->address(),
+                                                              &db::OtterbrixManager::register_external_database,
+                                                              "uid" + std::to_string(i));
+                (void) future;
+            });
+        }
+        for (auto& thread : threads) {
+            thread.join();
+        }
+    }
+    CHECK(observed->max_registrations.load() == 1);
 }

@@ -648,6 +648,7 @@ namespace frontend::mysql {
     }
 
     void mysql_connection::send_resultset(mysql_resultset&& result) {
-        send_packet_merged(mysql_resultset::build_packets(std::move(result), sequence_id_));
+        // One buffer, moved into the send buffer: no per-packet copy.
+        send_packet(mysql_resultset::build_packets(std::move(result), sequence_id_));
     }
 } // namespace frontend::mysql

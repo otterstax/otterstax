@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2025-2026  OtterStax
 //
-// The real ch::Connector against a fake ClickHouse server that speaks just
+// The real ch::driver_t against a fake ClickHouse server that speaks just
 // enough of the native TCP protocol — ClientHello/ServerHello, the addendum
 // string that follows the hello, Ping/Pong — on 127.0.0.1:0, on its own
 // thread. No frontend, no Docker.
@@ -12,31 +12,29 @@
 // SO_RCVTIMEO / SO_SNDTIMEO at 0 unless the ClientOptions set them, and every
 // read on the wire is a plain blocking recv(): the ServerHello the Client
 // constructor waits for in Handshake(), and the Pong that Ping() waits for.
-// On the connector that is connect() (constructor + Ping) and isConnected()
-// (Ping). At server start connect() runs on the startup thread inside
-// ComponentManager::register_connections, so a silent ClickHouse kept the
-// wire-protocol ports from ever coming up.
+// On the driver that is connect() (constructor + Ping) and ping(). At server
+// start connect() runs on the startup thread inside
+// ComponentManager::register_connections (the pool's min_size connections),
+// so a silent ClickHouse kept the wire-protocol ports from ever coming up.
 //
 // Also pinned: a query must not enter the driver's RetryGuard. With
 // ping_before_query set, Client::Execute pings first and on a socket failure
 // sleeps retry_timeout, reconnects and pings again, leaving that loop only
 // when the ping succeeds or the reconnect fails on exactly its send_retries-th
 // turn — a backend that completes every handshake but never answers a Ping
-// keeps it reconnecting for good, on the connector pool's io thread. The
-// manager already pings (isConnected) in front of every query, so the
-// connector opens the driver without ping_before_query and a query against
-// such a backend is one bounded recv on the query itself.
+// keeps it reconnecting for good, on a pool thread. Liveness is the pool's
+// business (it pings a connection that sat idle past check_after_idle), so the
+// driver opens the client without ping_before_query and a query against such
+// a backend is one bounded recv on the query itself — a timeout, which the
+// driver does not repeat.
 //
-// A connector that hangs cannot be failed by Catch2 — nothing returns to it —
+// A driver that hangs cannot be failed by Catch2 — nothing returns to it —
 // so each blocking call runs under a deadline (run_or_die / die_hung).
 //
 // Catch2 assertions are not thread-safe: the server thread only counts what it
 // saw (atomics) and the test thread asserts.
 
-#include "connectors/clickhouse/connector.hpp"
-#include "connectors/clickhouse/manager.hpp"
-#include "utility/thread_pool_manager.hpp"
-#include "utility/wait_barrier.hpp"
+#include "connectors/clickhouse/driver.hpp"
 
 #include <catch2/catch_all.hpp>
 
@@ -341,34 +339,18 @@ namespace {
         params.username = std::string(USER);
         params.password = "";
         params.database = "default";
-        // The connector's own reconnect ladder is not what is under test: one
-        // attempt and no delay, so a case's wall time is the driver's timeouts
-        // alone (tryReconnect is a do-while, so 1 is its minimum).
-        params.reconnect_delay_ms = 0;
-        params.max_reconnect_attempts = 1;
         return params;
     }
 
-    // How long a blocking connector call may take before the case is declared
-    // hung. The fixed connector bounds every socket read and write at 10 s and
-    // makes one driver attempt per connect call, so connect() against a silent
-    // server is the attempt in connect() plus the one in tryReconnect() — about
-    // 20 s — and isConnected() is one Ping, about 10 s. Three times the larger
-    // one, so a loaded CI host does not fail the fixed code.
+    // How long a blocking driver call may take before the case is declared hung. The driver bounds
+    // socket I/O at 10 s, so connect() and ping() against a mute server take about 10 s; six times
+    // that keeps a loaded CI host from failing correct code.
     constexpr auto PATIENCE = 60s;
 
-    // The verdict on a call that missed PATIENCE.
-    //
-    // The pre-fix connector blocks in the driver's recv() with no socket
-    // timeout (or spins in its RetryGuard): that thread can never be joined or
-    // interrupted, Catch2 has no way to fail a test that never returns, and
-    // destroying a joinable std::thread — or stopping a pool whose thread is
-    // stuck — is std::terminate / a hang, with no assertion message. So the
-    // miss is reported through FAIL_CHECK — the console reporter prints a
-    // failed assertion as it happens — the streams are flushed, and the process
-    // leaves with std::_Exit(1): ctest sees the non-zero exit, the failure line
-    // is already on the console, and the stuck thread dies with the process
-    // instead of aborting it.
+    // Verdict on a call that missed PATIENCE. An unbounded driver blocks in recv() or spins in its
+    // RetryGuard: the thread cannot be joined, Catch2 cannot fail a test that never returns, and
+    // destroying it is std::terminate or a hang. So report via FAIL_CHECK, flush the streams and
+    // leave with std::_Exit(1) so ctest sees the failure.
     [[noreturn]] void die_hung(std::string_view what) {
         FAIL_CHECK(what << " did not return within " << PATIENCE.count() << " s: the driver never gave up");
         std::cout.flush();
@@ -396,118 +378,91 @@ namespace {
 
 } // namespace
 
-TEST_CASE("ch Connector: connects to the fake server and pings it") {
+TEST_CASE("ch driver: connects to the fake server and pings it") {
     fake_clickhouse_server server{fake_clickhouse_server::behaviour::handshake, std::string(USER)};
     auto* resource = std::pmr::new_delete_resource();
 
-    auto connector = ch::make_ch_connector(resource, params_for(server.port()), "smoke");
-    auto err = connector->connect(); // handshake + the Ping connect() sends itself
+    ch::driver_t driver{resource, params_for(server.port()), "smoke"};
+    auto err = driver.connect(); // handshake + the Ping connect() sends itself
     REQUIRE_FALSE(err.contains_error());
-    REQUIRE(connector->status() == ch::Status::Connected);
-    REQUIRE(connector->isConnected()); // a second Ping round trip
+    REQUIRE_FALSE(driver.ping().contains_error()); // a second Ping round trip
     REQUIRE(server.connections() == 1);
     REQUIRE(server.hellos() == 1);
     REQUIRE(server.malformed_hellos() == 0);
     REQUIRE(server.unexpected_users() == 0);
     REQUIRE(server.pongs() == 2);
 
-    connector->close();
-    REQUIRE(connector->isClosed());
-    REQUIRE(connector->status() == ch::Status::Closed);
+    driver.close();
+    REQUIRE(driver.ping().contains_error()); // closed: nothing to ping
     REQUIRE(server.unexpected_packets() == 0);
 }
 
-TEST_CASE("ch Connector: connect() to a server that accepts and never answers fails with io_error in bounded time") {
+TEST_CASE("ch driver: connect() to a server that accepts and never answers fails with io_error in bounded time") {
     fake_clickhouse_server server{fake_clickhouse_server::behaviour::silent, std::string(USER)};
     auto* resource = std::pmr::new_delete_resource();
 
-    auto connector = ch::make_ch_connector(resource, params_for(server.port()), "silent");
+    ch::driver_t driver{resource, params_for(server.port()), "silent"};
     core::error_t err = core::error_t::no_error();
     const auto started = std::chrono::steady_clock::now();
-    run_or_die("connect() against a silent server", [&] { err = connector->connect(); });
+    run_or_die("connect() against a silent server", [&] { err = driver.connect(); });
     const auto elapsed = std::chrono::steady_clock::now() - started;
 
     INFO("connect() took " << std::chrono::duration_cast<std::chrono::seconds>(elapsed).count() << " s: " << err.what);
     REQUIRE(err.contains_error());
     REQUIRE(err.type == core::error_code_t::io_error);
-    REQUIRE(connector->status() == ch::Status::Disconnected);
-    REQUIRE_FALSE(connector->isConnected());
-    // One driver attempt per connect call — the connector's own ladder owns
-    // the retries: the attempt in connect() and the single one tryReconnect()
-    // was allowed here.
-    REQUIRE(server.connections() == 2);
+    // One client attempt per connect call: retrying is the pool's business
+    // (connect_backoff), not a ladder inside the driver.
+    REQUIRE(server.connections() == 1);
     REQUIRE(server.hellos() == 0);
 }
 
-TEST_CASE("ch Connector: isConnected() when the server completed the handshake and then went silent is false in bounded time") {
+TEST_CASE("ch driver: ping() when the server completed the handshake and then went silent is io_error in bounded time") {
     // One Pong: the Ping connect() sends itself is answered, every later one is
     // read and left hanging.
     fake_clickhouse_server server{fake_clickhouse_server::behaviour::handshake, std::string(USER), 1};
     auto* resource = std::pmr::new_delete_resource();
 
-    auto connector = ch::make_ch_connector(resource, params_for(server.port()), "mute");
-    auto err = connector->connect();
-    REQUIRE_FALSE(err.contains_error());
-    REQUIRE(connector->status() == ch::Status::Connected);
+    ch::driver_t driver{resource, params_for(server.port()), "mute"};
+    REQUIRE_FALSE(driver.connect().contains_error());
     REQUIRE(server.pongs() == 1);
 
-    bool alive = true;
+    core::error_t err = core::error_t::no_error();
     const auto started = std::chrono::steady_clock::now();
-    run_or_die("isConnected() against a server that stopped answering", [&] { alive = connector->isConnected(); });
+    run_or_die("ping() against a server that stopped answering", [&] { err = driver.ping(); });
     const auto elapsed = std::chrono::steady_clock::now() - started;
 
-    INFO("isConnected() took " << std::chrono::duration_cast<std::chrono::seconds>(elapsed).count() << " s");
-    REQUIRE_FALSE(alive);
-    REQUIRE(connector->status() == ch::Status::Disconnected);
+    INFO("ping() took " << std::chrono::duration_cast<std::chrono::seconds>(elapsed).count() << " s");
+    REQUIRE(err.contains_error());
+    REQUIRE(err.type == core::error_code_t::io_error);
     REQUIRE(server.wait_until([&server] { return server.swallowed_pings() == 1; }));
     REQUIRE(server.pongs() == 1);
     REQUIRE(server.connections() == 1);
     REQUIRE(server.unexpected_packets() == 0);
 }
 
-TEST_CASE("ch Connector: a query against a server that completes every handshake but never answers a ping fails with io_error in bounded time") {
-    // Two Pongs — the Ping connect() sends and the isConnected() the manager
-    // runs in front of every query — then nothing is ever answered again, on
-    // this connection or on any the driver opens afterwards.
-    fake_clickhouse_server server{fake_clickhouse_server::behaviour::handshake, std::string(USER), 2};
-    thread_pool_manager pool{2};
-    pool.start();
+TEST_CASE("ch driver: a query against a server that completes every handshake but never answers fails with io_error in bounded time") {
+    // One Pong — the Ping connect() sends — then nothing is ever answered
+    // again, on this connection or on any the client opens afterwards.
+    fake_clickhouse_server server{fake_clickhouse_server::behaviour::handshake, std::string(USER), 1};
     auto* resource = std::pmr::new_delete_resource();
 
-    auto connector = ch::make_ch_connector(resource, params_for(server.port()), "unanswered");
-    REQUIRE_FALSE(connector->connect().contains_error());
+    ch::driver_t driver{resource, params_for(server.port()), "unanswered"};
+    REQUIRE_FALSE(driver.connect().contains_error());
+    REQUIRE(server.pongs() == 1);
 
-    // ch::ConnectorManager::executeQuery minus the registry lookup: the
-    // liveness check on the calling thread, then the query marshaled off the
-    // pool's io_context and its outcome taken with get().
-    REQUIRE(connector->isConnected());
-    REQUIRE(server.pongs() == 2);
-    // runQuery holds only a reference to its handler: named, and declared before
-    // the future, it outlives every call the io thread makes through it.
-    auto one = [](const ch::select_result_t&) -> int64_t { return 1; };
+    conn::statement_outcome_t outcome{conn::statement_result_t{}};
     const auto started = std::chrono::steady_clock::now();
-    auto pending = otterstax::spawn_marshaled<int64_t>(
-        pool.ctx(),
-        connector->runQuery("SELECT 1", otterstax::function_ref_t<int64_t(const ch::select_result_t&)>{one}),
-        resource);
-    if (pending.wait_for(PATIENCE) != std::future_status::ready) {
-        // On the unfixed connector the pool thread is inside the driver's
-        // RetryGuard: Ping (recv timeout), sleep, reconnect (handshake
-        // answered), Ping ... — the server's connection count keeps growing.
-        INFO("connections opened by the driver so far: " << server.connections());
-        die_hung("a query against a server that stopped answering pings");
-    }
-    const auto outcome = pending.get();
+    run_or_die("a query against a server that stopped answering",
+               [&] { outcome = driver.execute(conn::statement_t::rows("SELECT 1")); });
     const auto elapsed = std::chrono::steady_clock::now() - started;
 
     INFO("the query took " << std::chrono::duration_cast<std::chrono::seconds>(elapsed).count() << " s");
     REQUIRE(outcome.has_error());
     REQUIRE(outcome.error().type == core::error_code_t::io_error);
-    // The query itself was sent and left unanswered — no driver-level Ping in
-    // front of it, and no reconnect behind it.
+    // The query itself was sent and left unanswered — no client-level Ping in
+    // front of it, and, a timeout not being repeatable, no reconnect behind it.
     REQUIRE(server.wait_until([&server] { return server.swallowed_queries() == 1; }));
     REQUIRE(server.swallowed_pings() == 0);
     REQUIRE(server.connections() == 1);
     REQUIRE(server.unexpected_packets() == 0);
-    pool.stop();
 }

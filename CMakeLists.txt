@@ -131,6 +131,9 @@ add_subdirectory(scheduler)
 
 set(${PROJECT_NAME}_HEADERS
 
+        utility/string_hash.hpp
+        utility/pmr_text.hpp
+        utility/stack_arena.hpp
         utility/timer.hpp
         utility/tsan_helper.hpp
         utility/tracy_profiler.hpp
@@ -155,8 +158,8 @@ add_library(lib_${PROJECT_NAME} INTERFACE
 # These internal static libs cross-reference each other (e.g. scheduler uses
 # integration handlers while integration/otterbrix_local use scheduler's
 # schema_utils), so a single left-to-right link pass can miss objects only
-# one of them pulls (e.g. integration/s3/s3_manager.o, referenced solely by
-# the Scheduler). RESCAN groups them (--start-group/--end-group) so the
+# one of them pulls (e.g. the s3 transfer driver, referenced solely by
+# ComponentManager). RESCAN groups them (--start-group/--end-group) so the
 # linker re-pulls until the cycle is fully resolved. Apple's ld64 rejects
 # LINK_GROUP:RESCAN for CXX and does not need it — it re-searches archives
 # until no new symbols resolve.
@@ -188,7 +191,8 @@ target_link_libraries(
 )
 
 if(ENABLE_TRACY)
-    target_link_libraries(lib_${PROJECT_NAME} PUBLIC Tracy::TracyClient)
+    # lib_otterstax is an INTERFACE library (the link group above): INTERFACE, not PUBLIC.
+    target_link_libraries(lib_${PROJECT_NAME} INTERFACE Tracy::TracyClient)
 endif()
 
 

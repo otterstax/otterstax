@@ -7,13 +7,10 @@
 
 namespace conn::s3 {
 
-// Process-wide shutdown of Arrow's S3 subsystem. ConnectorManager's constructor
-// initialises it (arrow::fs::EnsureS3Initialized); Arrow requires a matching
-// FinalizeS3 before the process exits or it may segfault during static
-// teardown. Finalization is terminal — every S3 call fails afterwards — so it
-// belongs to the process, not to any one manager: declare one of these before
-// the object graph that spawns the s3 actor, and it finalizes after that graph
-// is gone on every exit path, including an aborted startup.
+// Process-wide shutdown of Arrow's S3 subsystem, which driver_t::make initialises. Arrow needs a
+// FinalizeS3 before exit or it may segfault in static teardown, and finalization is terminal. So it
+// belongs to the process: declare one before the graph owning the s3 drivers, and it finalizes after
+// that graph is gone on every exit path.
 class subsystem_finalizer_t final {
 public:
     explicit subsystem_finalizer_t(log_t log);

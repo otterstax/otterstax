@@ -433,7 +433,7 @@ TEST_CASE("split_to_capacity: 2500 PostgreSQL tuples become 1024 + 1024 + 452 ro
 TEST_CASE("split_to_capacity: 2500 rows over two ClickHouse blocks become 1024 + 1024 + 452 rows with every boundary row intact") {
     std::pmr::unsynchronized_pool_resource arena{std::pmr::new_delete_resource()};
     // The block boundary (1500) falls inside a window, not on one.
-    const std::vector<clickhouse::Block> blocks{make_ch_block(0, 1500), make_ch_block(1500, wide_rows - 1500)};
+    const std::pmr::vector<clickhouse::Block> blocks{make_ch_block(0, 1500), make_ch_block(1500, wide_rows - 1500)};
     auto converted = tsl::ch_to_chunk(&arena, blocks);
     REQUIRE_FALSE(converted.has_error());
     REQUIRE(converted.value().size() == wide_rows);
@@ -457,11 +457,11 @@ TEST_CASE("split_to_capacity: 2500 rows over two ClickHouse blocks become 1024 +
 // way the engine's raw-data operator adopts it.
 TEST_CASE("split_to_capacity: 2500 ClickHouse rows with LIST and STRUCT columns keep every row's elements and fields") {
     std::pmr::unsynchronized_pool_resource arena{std::pmr::new_delete_resource()};
-    const std::unordered_map<std::string, std::string> overrides{{"nums", "Array(Nullable(Int32))"},
+    const tsl::named_type_map_t overrides{{"nums", "Array(Nullable(Int32))"},
                                                                  {"tags", "Array(Nullable(String))"},
                                                                  {"rec", "Tuple(a Int32, b Nullable(String))"}};
     // The block boundary (1500) falls inside a window, not on one.
-    const std::vector<clickhouse::Block> blocks{make_ch_nested_block(0, 1500),
+    const std::pmr::vector<clickhouse::Block> blocks{make_ch_nested_block(0, 1500),
                                                 make_ch_nested_block(1500, wide_rows - 1500)};
     auto converted = tsl::ch_to_chunk(&arena, blocks, overrides);
     INFO((converted.has_error() ? converted.error().what.c_str() : "converted"));

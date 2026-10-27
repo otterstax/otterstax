@@ -359,16 +359,10 @@ TEST_CASE("pure engine: group by string key over node_data", "[engine-group-by-s
     REQUIRE(cursor);
 }
 
-// Engine defect D1: a backend slice (node_raw_data, exactly what a
-// ConnectorManager substitutes) JOINed against a LOCAL table on a struct-field
-// key, with a WHERE predicate on the local side that leaves no rows, hands
-// operator_join_t::build_layout_ zero build chunks and it dereferences null.
-// Without the predicate an empty table scans as one empty chunk; with a plain
-// column as the key the same predicate is survived. Pure engine — no live
-// backend. The demo's step_4 is this shape.
-//
-// Four separate TEST_CASEs, not SECTIONs: a SIGSEGV aborts the process, and
-// each variant must be attributable on its own.
+// Engine defect D1: a backend slice (node_raw_data) JOINed to a LOCAL table on a struct-field key,
+// with a WHERE on the local side that leaves no rows, gives operator_join_t::build_layout_ zero build
+// chunks and it dereferences null. Pure engine; the demo's step_4 has this shape.
+// Four TEST_CASEs, not SECTIONs: a SIGSEGV aborts the process, so each variant must stand alone.
 #include <filesystem>
 
 namespace {

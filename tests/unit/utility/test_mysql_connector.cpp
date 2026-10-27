@@ -1,32 +1,27 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2025-2026  OtterStax
 //
-// The real mysql::Connector over the pool the ConnectorManager gives it — a
-// boost::asio::io_context run by N threads — against a fake MySQL server that
-// speaks just enough of the wire for boost.mysql's handshake, COM_PING and
-// COM_QUIT. No frontend, no Docker: the fake listens on 127.0.0.1:0 on its own
-// thread.
+// The real mysql::driver_t against a fake MySQL server that speaks just enough
+// of the wire for boost.mysql's handshake, COM_PING and COM_QUIT. No frontend,
+// no Docker: the fake listens on 127.0.0.1:0 on its own thread.
 //
 // What is pinned:
-//   - connect() completes with a value, every time. Before the strand fix the
-//     connect ran asio::cancel_after(use_future) on the multi-threaded
-//     io_context, whose timed_cancel_op lets the timer's cancellation handler
-//     (thread B) run between `timer_.cancel()` and `release()` of the
-//     completing operation (thread A); B's complete() then takes the ref_count
-//     2->1 without invoking, A's release() takes it 1->0 and DESTROYS the
-//     use_future handler without invoking it — broken promise, future.get()
-//     throws, and on the startup thread that is std::terminate. The window
-//     exists on every connect that finishes before the deadline, so a loop of
-//     connects on the unfixed code hits it within seconds.
+//   - connect() completes with a value, every time, and so does a connect to a
+//     server that accepts and never greets: every operation runs under
+//     asio::cancel_after on the driver's private single-thread io_context, so
+//     its deadline bounds it and no second thread can race the timer's
+//     cancellation handler against the completing operation (the
+//     timed_cancel_op race the old connector's strand guarded against).
 //   - close() on a connection the server already dropped must not throw: it
 //     writes COM_QUIT to a reset socket, and the destructor calls close().
+//   - A stale connection repeats a read once and never a statement marked once().
+//   - A statement past its deadline is killed on the server: KILL QUERY naming the
+//     session's CONNECTION_ID(), over a connection of its own.
 //
 // Catch2 assertions are not thread-safe: the server thread only counts what it
 // saw (atomics) and the test thread asserts.
 
-#include "connectors/mysql/connector.hpp"
-#include "connectors/mysql/manager.hpp"
-#include "utility/thread_pool_manager.hpp"
+#include "connectors/mysql/driver.hpp"
 
 #include <catch2/catch_all.hpp>
 
@@ -72,7 +67,11 @@ namespace {
                                              CLIENT_CONNECT_WITH_DB;
     constexpr uint16_t SERVER_STATUS_AUTOCOMMIT = 2;
     constexpr uint8_t COM_QUIT = 0x01;
+    constexpr uint8_t COM_QUERY = 0x03;
     constexpr uint8_t COM_PING = 0x0e;
+    constexpr uint8_t COM_STMT_PREPARE = 0x16;
+    constexpr std::string_view CONNECTION_ID_QUERY = "SELECT CONNECTION_ID()";
+    constexpr std::string_view KILL_QUERY = "KILL QUERY ";
     // HandshakeResponse41 fixed head: flags(4) max_packet(4) collation(1) filler(23).
     constexpr size_t LOGIN_HEAD_SIZE = 32;
     constexpr std::string_view SERVER_VERSION = "8.0.36-otterstax-fake";
@@ -145,6 +144,43 @@ namespace {
         return out;
     }
 
+    void put_lenenc_string(std::vector<uint8_t>& out, std::string_view text) {
+        out.push_back(static_cast<uint8_t>(text.size())); // every string here is shorter than 251
+        out.insert(out.end(), text.begin(), text.end());
+    }
+
+    // The text resultset of SELECT CONNECTION_ID(), CLIENT_DEPRECATE_EOF framing: column
+    // count, one Protocol::ColumnDefinition41 (BIGINT UNSIGNED NOT NULL), the row, then an
+    // OK packet with the 0xFE header in place of the EOF.
+    std::vector<std::vector<uint8_t>> connection_id_resultset(uint32_t connection_id) {
+        std::vector<uint8_t> column;
+        put_lenenc_string(column, "def");
+        put_lenenc_string(column, ""); // schema
+        put_lenenc_string(column, ""); // table
+        put_lenenc_string(column, ""); // org_table
+        put_lenenc_string(column, CONNECTION_ID_QUERY.substr(7));
+        put_lenenc_string(column, ""); // org_name
+        column.push_back(0x0c);        // length of the fixed fields
+        put_u16(column, 63);           // binary
+        put_u32(column, 21);           // column length
+        column.push_back(0x08);        // MYSQL_TYPE_LONGLONG
+        put_u16(column, 0x0021);       // NOT_NULL | UNSIGNED
+        column.push_back(0);           // decimals
+        put_u16(column, 0);            // filler
+
+        std::vector<uint8_t> row;
+        put_lenenc_string(row, std::to_string(connection_id));
+
+        std::vector<uint8_t> end{0xFE, 0x00, 0x00};
+        put_u16(end, SERVER_STATUS_AUTOCOMMIT);
+        put_u16(end, 0);
+        return {std::vector<uint8_t>{0x01}, column, row, end};
+    }
+
+    std::string_view command_text(const std::vector<uint8_t>& command) {
+        return {reinterpret_cast<const char*>(command.data()) + 1, command.size() - 1};
+    }
+
     // The NUL-terminated user name that follows the fixed head of HandshakeResponse41.
     std::string login_user(const std::vector<uint8_t>& login) {
         auto begin = login.begin() + LOGIN_HEAD_SIZE;
@@ -156,10 +192,13 @@ namespace {
 
     class fake_mysql_server {
     public:
+        // Every mode answers the driver's SELECT CONNECTION_ID() with the session's
+        // connection id.
         enum class after_ok
         {
-            serve_commands, // answer COM_PING, close on COM_QUIT / EOF
-            reset_socket    // drop the client (RST) shortly after the OK, before any command
+            serve_commands,  // answer COM_PING and KILL QUERY, close on COM_QUIT / EOF
+            reset_socket,    // drop the client (RST) shortly after, before any other command
+            stall_statements // as serve_commands, but never answer COM_STMT_PREPARE
         };
 
         explicit fake_mysql_server(after_ok mode, std::string expected_user)
@@ -191,8 +230,15 @@ namespace {
         size_t unexpected_users() const noexcept { return unexpected_users_.load(); }
         // Sockets dropped with RST (after_ok::reset_socket).
         size_t resets() const noexcept { return resets_.load(); }
-        // Commands other than COM_PING / COM_QUIT.
+        // Commands other than the ones the mode answers.
         size_t unexpected_commands() const noexcept { return unexpected_commands_.load(); }
+        // Sessions that read their id through SELECT CONNECTION_ID().
+        size_t id_queries() const noexcept { return id_queries_.load(); }
+        // Statements left unanswered (after_ok::stall_statements).
+        size_t stalled() const noexcept { return stalled_.load(); }
+        // The session id the last KILL QUERY named, 0 for none yet; sessions are numbered
+        // from 1 in accept order.
+        uint32_t killed() const noexcept { return killed_.load(); }
 
         // True once `predicate` holds, false at the deadline.
         template<typename Predicate>
@@ -240,6 +286,24 @@ namespace {
             co_await asio::async_write(socket, asio::buffer(bytes), asio::redirect_error(asio::use_awaitable, ec));
         }
 
+        static bool is_id_query(const std::vector<uint8_t>& command) {
+            return !command.empty() && command[0] == COM_QUERY && command_text(command) == CONNECTION_ID_QUERY;
+        }
+
+        // The driver's SELECT CONNECTION_ID(), sent once per connect (a KILL's side
+        // connection sends none).
+        asio::awaitable<void>
+        answer_id_query(tcp::socket& socket, uint8_t seq, uint32_t connection_id, boost::system::error_code& ec) {
+            uint8_t reply = static_cast<uint8_t>(seq + 1);
+            for (const auto& packet : connection_id_resultset(connection_id)) {
+                co_await write_frame(socket, reply++, packet, ec);
+                if (ec) {
+                    co_return;
+                }
+            }
+            ++id_queries_;
+        }
+
         asio::awaitable<void> serve(tcp::socket socket, uint32_t connection_id) {
             boost::system::error_code ec;
             // Every close of a session socket is abortive (RST). The connector is
@@ -274,6 +338,17 @@ namespace {
             }
 
             if (mode_ == after_ok::reset_socket) {
+                // The driver reads its session id right after the handshake; answer it so
+                // connect() succeeds.
+                const auto id_query = co_await read_frame(socket, seq, ec);
+                if (ec || !is_id_query(id_query)) {
+                    ++unexpected_commands_;
+                    co_return;
+                }
+                co_await answer_id_query(socket, seq, connection_id, ec);
+                if (ec) {
+                    co_return;
+                }
                 // Let the client consume its OK first, so connect() succeeds and
                 // the drop (the RST of the linger-0 close) is observed by the
                 // NEXT thing the connector does.
@@ -289,7 +364,20 @@ namespace {
                 if (ec || command.empty() || command[0] == COM_QUIT) {
                     break;
                 }
-                if (command[0] != COM_PING) {
+                if (is_id_query(command)) {
+                    co_await answer_id_query(socket, seq, connection_id, ec);
+                    if (ec) {
+                        break;
+                    }
+                    continue;
+                }
+                if (command[0] == COM_STMT_PREPARE && mode_ == after_ok::stall_statements) {
+                    ++stalled_;
+                    continue; // never answered: the driver's deadline has to fire
+                }
+                if (command[0] == COM_QUERY && command_text(command).starts_with(KILL_QUERY)) {
+                    killed_ = static_cast<uint32_t>(std::stoul(std::string{command_text(command).substr(KILL_QUERY.size())}));
+                } else if (command[0] != COM_PING) {
                     ++unexpected_commands_;
                     break;
                 }
@@ -311,6 +399,9 @@ namespace {
         std::atomic<size_t> unexpected_users_{0};
         std::atomic<size_t> resets_{0};
         std::atomic<size_t> unexpected_commands_{0};
+        std::atomic<size_t> id_queries_{0};
+        std::atomic<size_t> stalled_{0};
+        std::atomic<uint32_t> killed_{0};
         std::jthread thread_;
     };
 
@@ -318,118 +409,162 @@ namespace {
 
     constexpr std::string_view USER = "stress";
 
-    boost::mysql::connect_params params_for(uint16_t port) {
-        boost::mysql::connect_params params;
-        params.server_address.emplace_host_and_port("127.0.0.1", port);
-        params.username = std::string(USER);
-        params.password = ""; // mysql_native_password with a blank password: empty auth blob
-        params.database = "db";
+    mysql::connect_params params_for(uint16_t port) {
+        mysql::connect_params params;
+        params.server.server_address.emplace_host_and_port("127.0.0.1", port);
+        params.server.username = std::string(USER);
+        params.server.password = ""; // mysql_native_password with a blank password: empty auth blob
+        params.server.database = "db";
         return params;
     }
 
-    // The ConnectorManager's pool: hardware_concurrency() threads on one
-    // io_context, never fewer than eight so the race has threads to run on.
-    size_t pool_threads() { return std::max<size_t>(8, std::thread::hardware_concurrency()); }
-
-    // Enough connects to hit the timed_cancel_op window on the unfixed code
-    // (observed at iterations 83..2913 over six runs on an 18-core macOS host,
-    // ~0.2 ms per connect), few enough to keep the fixed test at a few seconds.
-    constexpr int STRESS_ITERATIONS = 10000;
+    // Enough connects that a value-less completion would show; each is ~0.2 ms.
+    constexpr int STRESS_ITERATIONS = 2000;
 
 } // namespace
 
-TEST_CASE("mysql Connector: connects to the fake server and pings it") {
+TEST_CASE("mysql driver: connects to the fake server and pings it") {
     fake_mysql_server server{fake_mysql_server::after_ok::serve_commands, std::string(USER)};
-    thread_pool_manager pool{pool_threads()};
-    pool.start();
     auto* resource = std::pmr::new_delete_resource();
 
-    auto connector = mysql::make_mysql_connector(resource, pool.ctx(), params_for(server.port()), "smoke");
-    auto err = connector->connect();
+    mysql::driver_t driver{resource, params_for(server.port()), "smoke"};
+    auto err = driver.connect();
     REQUIRE_FALSE(err.contains_error());
-    REQUIRE(connector->status() == mysql::Status::Connected);
-    REQUIRE(connector->isConnected()); // COM_PING round trip
+    REQUIRE_FALSE(driver.ping().contains_error()); // COM_PING round trip
     REQUIRE(server.sessions() == 1);
+    REQUIRE(server.id_queries() == 1);
     REQUIRE(server.malformed_logins() == 0);
     REQUIRE(server.unexpected_users() == 0);
 
-    connector->close();
-    REQUIRE(connector->isClosed());
-    REQUIRE(connector->status() == mysql::Status::Closed);
+    driver.close();
+    REQUIRE(driver.ping().contains_error()); // closed: nothing to ping
     REQUIRE(server.unexpected_commands() == 0);
-    pool.stop();
 }
 
-TEST_CASE("mysql Connector: connect and close in a loop over a multi-threaded io_context always yields a value") {
+TEST_CASE("mysql driver: connect and close in a loop always yields a value") {
     fake_mysql_server server{fake_mysql_server::after_ok::serve_commands, std::string(USER)};
-    thread_pool_manager pool{pool_threads()};
-    pool.start();
     auto* resource = std::pmr::new_delete_resource();
     const auto params = params_for(server.port());
 
-    // One connector per iteration, as addConnection does: a fresh
+    // One driver per iteration, as the pool does for a new connection: a fresh
     // any_connection, one connect, one close, then the destructor.
     for (int i = 0; i < STRESS_ITERATIONS; ++i) {
         INFO("iteration " << i);
-        auto connector = mysql::make_mysql_connector(resource, pool.ctx(), params, "stress");
+        mysql::driver_t driver{resource, params, "stress"};
         core::error_t err = core::error_t::no_error();
-        // On the unfixed code the broken promise surfaces here as a
-        // std::future_error out of connect(), which no caller catches.
-        REQUIRE_NOTHROW(err = connector->connect());
+        REQUIRE_NOTHROW(err = driver.connect());
         REQUIRE_FALSE(err.contains_error());
-        REQUIRE(connector->status() == mysql::Status::Connected);
-        REQUIRE_NOTHROW(connector->close());
-        REQUIRE(connector->isClosed());
+        REQUIRE_NOTHROW(driver.close());
     }
 
     REQUIRE(server.sessions() == static_cast<size_t>(STRESS_ITERATIONS));
     REQUIRE(server.malformed_logins() == 0);
     REQUIRE(server.unexpected_users() == 0);
     REQUIRE(server.unexpected_commands() == 0);
-    pool.stop();
 }
 
-TEST_CASE("mysql Connector: close() after the server dropped the connection does not throw") {
-    fake_mysql_server server{fake_mysql_server::after_ok::reset_socket, std::string(USER)};
-    thread_pool_manager pool{pool_threads()};
-    pool.start();
+TEST_CASE("mysql driver: connect() to a server that accepts and never greets fails with io_error at its deadline") {
+    // Listening, never accepting: the kernel completes the TCP handshake from
+    // the backlog and nothing ever sends the server greeting.
+    asio::io_context ctx;
+    tcp::acceptor silent{ctx, tcp::endpoint{asio::ip::make_address("127.0.0.1"), 0}};
     auto* resource = std::pmr::new_delete_resource();
 
-    auto connector = mysql::make_mysql_connector(resource, pool.ctx(), params_for(server.port()), "dropped");
-    auto err = connector->connect();
+    auto params = params_for(silent.local_endpoint().port());
+    params.connect_timeout = 300ms;
+    mysql::driver_t driver{resource, params, "silent"};
+
+    const auto started = std::chrono::steady_clock::now();
+    auto err = driver.connect();
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+
+    INFO("connect() took " << std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count() << " ms: "
+                           << err.what.c_str());
+    REQUIRE(err.contains_error());
+    REQUIRE(err.type == core::error_code_t::io_error);
+    REQUIRE(elapsed < 5s);
+}
+
+TEST_CASE("mysql driver: close() after the server dropped the connection does not throw") {
+    fake_mysql_server server{fake_mysql_server::after_ok::reset_socket, std::string(USER)};
+    auto* resource = std::pmr::new_delete_resource();
+
+    mysql::driver_t driver{resource, params_for(server.port()), "dropped"};
+    auto err = driver.connect();
     REQUIRE_FALSE(err.contains_error());
-    REQUIRE(connector->status() == mysql::Status::Connected);
 
     // The server resets the socket right after the OK; wait for it, plus a
     // moment for the RST to land on the client socket.
     REQUIRE(server.wait_until([&server] { return server.resets() == 1; }));
     std::this_thread::sleep_for(100ms);
 
-    // Status is still Connected — nothing has touched the socket since the
-    // handshake — so close() really writes COM_QUIT to the reset socket.
-    REQUIRE(connector->status() == mysql::Status::Connected);
-    REQUIRE_NOTHROW(connector->close());
-    REQUIRE(connector->isClosed());
-    REQUIRE(connector->status() == mysql::Status::Closed);
-    pool.stop();
+    // Nothing has touched the socket since the handshake, so close() really
+    // writes COM_QUIT to the reset socket.
+    REQUIRE_NOTHROW(driver.close());
 }
 
-TEST_CASE("mysql Connector: destroying a connector whose server went away does not terminate") {
+TEST_CASE("mysql driver: destroying a driver whose server went away does not terminate") {
     fake_mysql_server server{fake_mysql_server::after_ok::reset_socket, std::string(USER)};
-    thread_pool_manager pool{pool_threads()};
-    pool.start();
     auto* resource = std::pmr::new_delete_resource();
 
     {
-        auto connector = mysql::make_mysql_connector(resource, pool.ctx(), params_for(server.port()), "dropped");
-        auto err = connector->connect();
+        mysql::driver_t driver{resource, params_for(server.port()), "dropped"};
+        auto err = driver.connect();
         REQUIRE_FALSE(err.contains_error());
         REQUIRE(server.wait_until([&server] { return server.resets() == 1; }));
         std::this_thread::sleep_for(100ms);
-        REQUIRE(connector->status() == mysql::Status::Connected);
-        // ~Connector() is noexcept and calls close(): a throwing close here is
-        // std::terminate, which is why this case is separate from the one above.
+        // ~driver_t() calls close(): a throwing close here is std::terminate,
+        // which is why this case is separate from the one above.
     }
+}
 
-    pool.stop();
+// A stale socket (the server dropped an idle connection) is noticed by the statement itself. The driver
+// reconnects and repeats a read once, never a statement marked once() (a DML or DDL). The fake server
+// drops every session after its OK, so the repeat fails too; what is pinned is whether it reconnected.
+TEST_CASE("mysql driver: a stale connection repeats a read once and never a statement marked once") {
+    auto* resource = std::pmr::new_delete_resource();
+    const auto stale_execute = [resource](conn::statement_t statement) {
+        fake_mysql_server server{fake_mysql_server::after_ok::reset_socket, std::string(USER)};
+        mysql::driver_t driver{resource, params_for(server.port()), "stale"};
+        REQUIRE_FALSE(driver.connect().contains_error());
+        REQUIRE(server.wait_until([&server] { return server.resets() == 1; }));
+        std::this_thread::sleep_for(100ms); // the RST lands on the client socket
+
+        auto outcome = driver.execute(statement);
+        CHECK(outcome.has_error());
+        // A repeat's session is counted before its OK is written, so it is there by now.
+        return server.sessions();
+    };
+
+    SECTION("a read reconnects and is sent again") {
+        CHECK(stale_execute(conn::statement_t::rows("SELECT 1")) == 2);
+    }
+    SECTION("a statement marked once is not repeated") {
+        CHECK(stale_execute(conn::statement_t::rows("INSERT INTO t VALUES (1)").once()) == 1);
+    }
+}
+
+// A statement the server never answers fails at its deadline, and the driver kills it on the
+// server: closing the socket alone would leave it running there. The KILL names the id the
+// session read at connect and goes over a second connection.
+TEST_CASE("mysql driver: a statement past its deadline is killed on the server") {
+    fake_mysql_server server{fake_mysql_server::after_ok::stall_statements, std::string(USER)};
+    auto* resource = std::pmr::new_delete_resource();
+
+    auto params = params_for(server.port());
+    params.statement_timeout = 300ms;
+    mysql::driver_t driver{resource, params, "stalled"};
+    REQUIRE_FALSE(driver.connect().contains_error());
+
+    const auto started = std::chrono::steady_clock::now();
+    auto outcome = driver.execute(conn::statement_t::rows("SELECT 1"));
+    const auto elapsed = std::chrono::steady_clock::now() - started;
+
+    REQUIRE(outcome.has_error());
+    CHECK(outcome.error().type == core::error_code_t::io_error);
+    CHECK(elapsed < 5s);
+    CHECK(server.stalled() == 1);
+    CHECK(server.sessions() == 2);  // the statement's session and the KILL's
+    CHECK(server.killed() == 1);    // the first session's CONNECTION_ID()
+    CHECK(server.unexpected_commands() == 0);
 }

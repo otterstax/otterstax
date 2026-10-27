@@ -89,6 +89,13 @@ core::result_wrapper_t<ServiceConfig> ConfigReader::load(const std::string& conf
             }
             server_config.connection_retry = retry.value();
         }
+        if (service["file_transfers"]) {
+            auto transfers = parse_pool(service["file_transfers"], "service.file_transfers", resource_);
+            if (transfers.has_error()) {
+                return failed(transfers.error());
+            }
+            server_config.file_transfers = transfers.value();
+        }
     }
 
     // Connections live in the same file under the `connections:` key — the single
@@ -109,6 +116,9 @@ core::result_wrapper_t<ServiceConfig> ConfigReader::load(const std::string& conf
     log_->debug("Connection retry: {} attempt(s), {} ms delay",
                 server_config.connection_retry.max_attempts,
                 server_config.connection_retry.delay_ms);
+    log_->debug("File transfers: {}..{}",
+                server_config.file_transfers.min_size,
+                server_config.file_transfers.max_size);
     log_->debug("Connections: {} mysql, {} postgresql, {} clickhouse, {} s3",
                 server_config.connections.mysql.size(),
                 server_config.connections.postgresql.size(),

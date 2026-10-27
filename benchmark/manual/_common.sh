@@ -77,7 +77,8 @@ _register_s3_credentials() {
     echo "s3 alias 'bench_rustfs' read from benchmark/config.yaml at startup."
 }
 
-# Generate the s3/file external-table fixtures into benchmark/data/fixtures.
+# Generate the s3/file external-table fixtures into benchmark/data/fixtures
+# (reused while current; REGEN_ARG=--regenerate forces it).
 _generate_external_fixtures() {
     echo "Generating external-table fixtures..."
     mkdir -p "$BENCH_DIR/data/fixtures"
@@ -86,7 +87,7 @@ _generate_external_fixtures() {
         -v "$BENCH_DIR/bench.yaml:/app/bench.yaml:ro" \
         -e PYTHONUNBUFFERED=1 \
         benchmark-client:latest \
-        python /app/data/generate_external_fixtures.py --out /app/data/fixtures
+        python /app/data/generate_external_fixtures.py --out /app/data/fixtures ${REGEN_ARG:-}
 }
 
 # Generate the kafka JSON dataset into benchmark/data/fixtures.
@@ -100,7 +101,7 @@ _generate_kafka_fixtures() {
         -v "$BENCH_DIR/data/fixtures:/app/data/fixtures" \
         -e PYTHONUNBUFFERED=1 \
         benchmark-client:latest \
-        python /app/data/generate_kafka_fixtures.py --out /app/data/fixtures
+        python /app/data/generate_kafka_fixtures.py --out /app/data/fixtures ${REGEN_ARG:-}
 }
 
 # Seed the kafka topic from the generated dataset (once, after the broker is up).
@@ -118,17 +119,35 @@ _frontend_port() {
     case "$1" in
         mysql)    echo 8816 ;;
         postgres) echo 8817 ;;
-        arrow)    echo 8815 ;;
+        spark) echo 15002 ;;
         *) echo "Unknown frontend: $1" >&2; return 1 ;;
     esac
 }
 
-# DEFAULT_TESTS run by default; external_* are opt-in (need RustFS via --external)
-# but remain valid --bench values.
-DEFAULT_TESTS=(simple_select complex_select join_same_instance join_cross_engine join_all)
+# The script (and its arguments) that runs one test through one frontend; the
+# same mapping as run_benchmark.sh's _test_script.
+_test_script() {
+    local frontend=$1 test=$2
+    case "$test" in
+        ch_* | mysql_* | pg_* | join_concurrent | join_wide | join_wide_concurrent)
+                    echo "/app/benchmarks/backends/suite.py $test --frontend $frontend" ;;
+        external_*) echo "/app/benchmarks/s3/$test.py --frontend $frontend" ;;
+        *)          echo "/app/benchmarks/$frontend/$test.py" ;;
+    esac
+}
+
+# DEFAULT_TESTS run by default: the cross-backend tests and the per-backend suite
+# (<backend>_select_wide / _insert / _prepare / _concurrent for ch, mysql, pg).
+# external_* (need RustFS: ./start_service.sh --external) and kafka_* (need
+# redpanda: --kafka) are opt-in but remain valid --bench values.
+DEFAULT_TESTS=(simple_select complex_select join_same_instance join_cross_engine join_all
+               join_concurrent join_wide join_wide_concurrent)
+for _b in ch mysql pg; do
+    DEFAULT_TESTS+=("${_b}_select_wide" "${_b}_insert" "${_b}_prepare" "${_b}_concurrent")
+done
 ALL_TESTS=("${DEFAULT_TESTS[@]}"
            external_load external_join external_dump
-           external_join_cross external_join_all
+           external_join_cross external_join_all external_load_concurrent
            kafka_ingest kafka_produce kafka_stream)
-ALL_FRONTENDS=(mysql postgres arrow)
-DEFAULT_FRONTENDS=(mysql postgres)
+ALL_FRONTENDS=(mysql postgres spark)
+DEFAULT_FRONTENDS=(mysql postgres spark)

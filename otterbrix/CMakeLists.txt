@@ -4,7 +4,9 @@ set(OTTERBRIX_HEADERS
     config.hpp
     translators/input/mysql_to_chunk.hpp
     translators/input/pg_to_chunk.hpp
+    translators/input/pg_enum_types.hpp
     translators/input/ch_to_chunk.hpp
+    translators/input/named_types.hpp
     translators/input/arrow_to_chunk.hpp
     translators/input/parquet_to_chunk.hpp
     translators/input/csv_to_chunk.hpp

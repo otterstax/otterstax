@@ -111,11 +111,11 @@ gracefully, so the registry-aware `raw_parser` does the real parse.
 detects it via `dynamic_cast` in `execute` / `execute_statement` / `prepare_schema` and routes through
 `Worker::handle_external_statement`:
 
-- **CREATE EXTERNAL TABLE** loads the file/object into the engine table — `db::S3Manager::download`
-  (s3://) or `conn::file::FileManager::add_file` (local path).
-- **`COPY (<select>) TO`** parses `inner_sql` and exports the result — `db::S3Manager::upload` or
-  `conn::file::FileManager::dump_file` (both take the pre-parsed `OtterbrixStatementPtr`, run via
-  `db::OtterbrixManager::execute`).
+- **CREATE EXTERNAL TABLE** loads the file/object on the S3 alias's (s3://) or the local-file
+  (local path) transfer pool, then creates the engine table from the chunk
+  (`Worker::load_external_table`).
+- **`COPY (<select>) TO`** parses `inner_sql`, runs it via `db::OtterbrixManager::execute` and
+  exports the result on the transfer pool (`Worker::copy_to`).
 
 s3 vs local is decided by `external_node_t::is_s3()` (the location scheme). Tests:
 `tests/unit/parser/test_external_routing.cpp` (parse → node) and the

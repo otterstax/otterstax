@@ -2,7 +2,7 @@
 # Copyright 2025-2026  OtterStax
 """
 Shared SQL definitions for all benchmark tests.
-All three frontends (mysql, postgres, arrow) use the same SQL strings.
+Both frontends (mysql, postgres) use the same SQL strings.
 Only the connector library and port change per frontend.
 
 Data layout (controlled by bench.yaml):
@@ -173,6 +173,49 @@ JOIN_CROSS_ENGINE = [
      " FROM ch2.benchch2.products p"
      " JOIN pg2.benchpg2.public.orders o"
      " ON p.product_id = o.product_id"),
+    # The engine hashes a JOIN only when ON is one equality of two keys of one type
+    # (docs/otterbrix_request_joins.md); every other JOIN is a nested loop. These pairs
+    # answer the same rows on both plans. The same row filter in ON (nested loop) and
+    # in WHERE (pushed below the JOIN, hash join):
+    ("prod_mysql2_x_ord_pg2_on_filter",
+     "SELECT p.product_id, p.product_name, p.category,"
+     " o.quantity, o.total_price"
+     " FROM mysql2.benchdb2.products p"
+     " JOIN pg2.benchpg2.public.orders o"
+     " ON p.product_id = o.product_id AND o.quantity > 10"),
+    ("prod_mysql2_x_ord_pg2_where_filter",
+     "SELECT p.product_id, p.product_name, p.category,"
+     " o.quantity, o.total_price"
+     " FROM mysql2.benchdb2.products p"
+     " JOIN pg2.benchpg2.public.orders o"
+     " ON p.product_id = o.product_id"
+     " WHERE o.quantity > 10"),
+    # The same rows as prod_mysql2_x_ord_pg2 with only the key type changed in ON: a BIGINT key
+    # against INT is cast to a common type (nested loop), and so is a cast on both sides.
+    ("prod_mysql2_x_ord_pg2_key_bigint_x_int",
+     "SELECT p.product_id, p.product_name, p.category,"
+     " o.quantity, o.total_price"
+     " FROM mysql2.benchdb2.products p"
+     " JOIN pg2.benchpg2.public.orders o"
+     " ON CAST(p.product_id AS BIGINT) = o.product_id"),
+    ("prod_mysql2_x_ord_pg2_key_bigint_x_bigint",
+     "SELECT p.product_id, p.product_name, p.category,"
+     " o.quantity, o.total_price"
+     " FROM mysql2.benchdb2.products p"
+     " JOIN pg2.benchpg2.public.orders o"
+     " ON CAST(p.product_id AS BIGINT) = CAST(o.product_id AS BIGINT)"),
+    # campaign_id: UInt32 on both ClickHouse instances (hash join), INT x UInt32 from
+    # MySQL (cast keys, nested loop).
+    ("camp_ch1_x_ord_ch2",
+     "SELECT c.campaign_id, c.campaign_name, o.order_id, o.total_price"
+     " FROM ch1.benchch1.campaigns c"
+     " JOIN ch2.benchch2.orders o"
+     " ON c.campaign_id = o.campaign_id"),
+    ("camp_mysql1_x_ord_ch2",
+     "SELECT c.campaign_id, c.campaign_name, o.order_id, o.total_price"
+     " FROM mysql1.benchdb1.campaigns c"
+     " JOIN ch2.benchch2.orders o"
+     " ON c.campaign_id = o.campaign_id"),
 ]
 
 # ── JOIN_ALL ───────────────────────────────────────────────────────────────────
@@ -200,4 +243,85 @@ JOIN_ALL = [
      "   ON c.campaign_id = e.campaign_id AND e.event_type = 'purchase'"
      " WHERE c.campaign_id <= 50 AND c.status = 'active'"
      " LIMIT 500"),
+]
+
+# ── Per-backend suite (benchmarks/backends/suite.py) ──────────────────────────
+# The same four tests for every backend: <backend>_select_wide, _insert, _prepare,
+# _concurrent. Each backend's entry names the same shapes on its own tables.
+#   wide:       ~60k-row results (Group A: 1000 campaigns × 60) — decoding and the
+#               frontend's row streaming dominate, not the backend;
+#   insert:     the INSERT target, created empty by data/init_data.py before
+#               OtterStax starts, so startup discovery registers it;
+#   statements: a backend-heavy statement (GROUP BY over ~60k rows) and a light
+#               one (100 rows), so _prepare and _concurrent separate backend time
+#               from OtterStax's own.
+def _wide(table_prefix):
+    return [
+        ("impressions_{}_all",
+         "SELECT impression_id, campaign_id, views, clicks, cost"
+         f" FROM {table_prefix}.impressions"),
+        ("daily_stats_{}_all",
+         "SELECT stat_id, campaign_id, total_spend, total_revenue,"
+         " conversion_count, ctr, roas"
+         f" FROM {table_prefix}.daily_stats"),
+    ]
+
+
+BACKEND_SUITES = {
+    "ch": {
+        "alias": "ch1",
+        "wide": _wide("ch1.benchch1"),
+        "insert": "ch2.benchch2.bench_inserts",
+        "statements": [
+            ("agg_ch1", dict(COMPLEX_SELECT)["impressions_ch1"]),
+            ("select_ch2", dict(SIMPLE_SELECT)["group_b_ch2"]),
+        ],
+    },
+    "mysql": {
+        "alias": "mysql1",
+        "wide": _wide("mysql1.benchdb1"),
+        "insert": "mysql2.benchdb2.bench_inserts",
+        "statements": [
+            ("agg_mysql1", dict(COMPLEX_SELECT)["impressions_mysql1"]),
+            ("select_mysql2", dict(SIMPLE_SELECT)["group_b_mysql2"]),
+        ],
+    },
+    "pg": {
+        "alias": "pg1",
+        "wide": _wide("pg1.benchpg1.public"),
+        "insert": "pg2.benchpg2.public.bench_inserts",
+        "statements": [
+            ("agg_pg1", dict(COMPLEX_SELECT)["impressions_pg1"]),
+            ("select_pg2", dict(SIMPLE_SELECT)["group_b_pg2"]),
+        ],
+    },
+}
+for _suite in BACKEND_SUITES.values():
+    _suite["wide"] = [(name.format(_suite["alias"]), sql) for name, sql in _suite["wide"]]
+
+# Kept for the names the ClickHouse suite has always had.
+CH_WIDE_SELECT = BACKEND_SUITES["ch"]["wide"]
+CH_INSERT_TABLE = BACKEND_SUITES["ch"]["insert"]
+CH_STATEMENTS = BACKEND_SUITES["ch"]["statements"]
+
+# join_concurrent: cross-backend JOINs from N sessions at once — a light two-engine
+# join, a ClickHouse one, and a three-engine join.
+JOIN_CONCURRENT = [
+    ("mysql2_x_pg2", dict(JOIN_CROSS_ENGINE)["prod_mysql2_x_ord_pg2"]),
+    ("ch2_x_mysql2", dict(JOIN_CROSS_ENGINE)["prod_ch2_x_ord_mysql2"]),
+    ("pg1_ch1_mysql2", dict(JOIN_ALL)["variant2_pg_ch_mysql"]),
+]
+
+# join_wide / join_wide_concurrent: cross-backend JOINs whose fetch is the cost. Each side
+# reads a whole 60k-row group-A table (no filter to push down), the keys are BIGINT on both
+# sides (a mismatched key width sends the engine down a far slower JOIN path), and an
+# aggregate keeps the answer to one row, so neither the engine JOIN nor the client transfer
+# hides the two fetches.
+JOIN_WIDE = [
+    ("count_mysql1_imp_x_pg1_stats",
+     "SELECT count(*) FROM mysql1.benchdb1.impressions i"
+     " JOIN pg1.benchpg1.public.daily_stats d ON i.impression_id = d.stat_id"),
+    ("sum_mysql1_imp_x_pg1_imp",
+     "SELECT sum(i.clicks), sum(p.views) FROM mysql1.benchdb1.impressions i"
+     " JOIN pg1.benchpg1.public.impressions p ON i.impression_id = p.impression_id"),
 ]

@@ -20,13 +20,9 @@ Scheduler::Scheduler(std::pmr::memory_resource* res,
                      std::size_t worker_count,
                      parser_factory_fn parser_factory,
                      const otterstax::names::alias_registry_t& aliases,
-                     actor_zeta::address_t sql_connection_manager,
-                     actor_zeta::address_t pg_connection_manager,
-                     actor_zeta::address_t ch_connection_manager,
+                     db::backend_registry_t& backends,
                      actor_zeta::address_t otterbrix_manager,
                      actor_zeta::address_t catalog_manager,
-                     actor_zeta::address_t s3_manager,
-                     actor_zeta::address_t file_manager,
                      actor_zeta::address_t kafka_manager)
     : resource_(res)
     , scheduler_(scheduler)
@@ -39,26 +35,20 @@ Scheduler::Scheduler(std::pmr::memory_resource* res,
     assert(worker_count > 0);
     assert(parser_factory != nullptr);
 
-    // Each Worker owns its own parser instance — no shared objects between actors
-    // (codex rule 10). The factory is a plain function pointer (rule 14: no
-    // std::function); the built parser is moved into the Worker. s3/file manager
-    // addresses are forwarded so each Worker can dispatch external-table
-    // statements (CREATE EXTERNAL TABLE / COPY ... TO) without touching shared
-    // state.
+    // Each Worker owns its parser (built by a plain function pointer) and its backends over the shared
+    // connection pools, and runs external-table statements through the shared transfer pools. Actors
+    // share no objects.
     workers_.reserve(worker_count);
     worker_addresses_.reserve(worker_count);
     for (std::size_t i = 0; i < worker_count; ++i) {
         auto worker = actor_zeta::spawn<Worker>(res,
+                                                scheduler_,
                                                 i,
                                                 worker_count,
                                                 parser_factory(res, aliases),
-                                                sql_connection_manager,
-                                                pg_connection_manager,
-                                                ch_connection_manager,
+                                                backends,
                                                 otterbrix_manager,
                                                 catalog_manager,
-                                                s3_manager,
-                                                file_manager,
                                                 kafka_manager);
         worker_addresses_.push_back(worker->address());
         workers_.push_back(std::move(worker));

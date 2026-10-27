@@ -12,7 +12,7 @@
 # is no HTTP management port).
 #
 # Usage:
-#   ./benchmark/manual/start_service.sh [--no-init] [--rebuild] [--perf] [--perf-alloc] [--tracy] [-j N] [--image-tag TAG]
+#   ./benchmark/manual/start_service.sh [--no-init] [--regen-data] [--rebuild] [--perf] [--perf-alloc] [--tracy] [-j N] [--image-tag TAG]
 #
 # Options:
 #   --external   Also start a seeded RustFS and generate s3/file fixtures so the
@@ -24,6 +24,7 @@
 #                benchmarks can run. Adds compose_kafka.yml. No REST registration
 #                (the broker is named in CREATE SOURCE directly).
 #   --no-init    Skip benchmark data initialisation (reuse existing data).
+#   --regen-data Generate the saved benchmark data (data/dataset, fixtures) again.
 #   --rebuild    Force rebuild of both Docker images (otterstax_app + benchmark-client)
 #                even if they already exist. Use after C++ source changes.
 #   --perf       CPU call-graph profiling (perf, 99 Hz, dwarf unwind).
@@ -47,6 +48,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/_common.sh"
 
 SKIP_INIT=false
+REGEN_ARG=""
 ENABLE_TRACY=false
 ENABLE_PERF=false
 ENABLE_PERF_ALLOC=false
@@ -58,6 +60,7 @@ while [[ $# -gt 0 ]]; do
         --external)     EXTERNAL_ENABLED=true; shift ;;
         --kafka)        KAFKA_ENABLED=true; shift ;;
         --no-init)      SKIP_INIT=true; shift ;;
+        --regen-data)   REGEN_ARG="--regenerate"; shift ;;
         --rebuild)      FORCE_REBUILD=true; shift ;;
         --perf)         ENABLE_PERF=true; shift ;;
         --perf-alloc)   ENABLE_PERF=true; ENABLE_PERF_ALLOC=true; shift ;;
@@ -67,7 +70,7 @@ while [[ $# -gt 0 ]]; do
         -j)             BUILD_JOBS="$2"; shift 2 ;;
         -j*)            BUILD_JOBS="${1#-j}"; shift ;;
         -h|--help)
-            sed -n '2,32p' "$0" | grep '^#' | sed 's/^# \?//'
+            sed -n '2,33p' "$0" | grep '^#' | sed 's/^# \?//'
             exit 0 ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
@@ -216,12 +219,14 @@ fi
 if ! $SKIP_INIT; then
     echo ""
     echo "=== Initialising benchmark data ==="
+    mkdir -p "$BENCH_DIR/data/dataset"
     docker run --rm \
         --network=bench_net \
         -v "$BENCH_DIR/bench.yaml:/app/bench.yaml:ro" \
+        -v "$BENCH_DIR/data/dataset:/app/data/dataset" \
         -e PYTHONUNBUFFERED=1 \
         benchmark-client:latest \
-        python /app/data/init_data.py
+        python /app/data/init_data.py $REGEN_ARG
 fi
 
 echo ""

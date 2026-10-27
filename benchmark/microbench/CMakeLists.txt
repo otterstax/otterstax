@@ -10,6 +10,9 @@ add_executable(otterstax_bench
     bench_query_gen.cpp
     bench_grammar_extension.cpp
     bench_kafka_translators.cpp
+    bench_connection_pool.cpp
+    bench_allocations.cpp
+    bench_engine_join.cpp
 )
 
 target_include_directories(otterstax_bench PRIVATE ${CMAKE_SOURCE_DIR})

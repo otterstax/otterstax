@@ -401,10 +401,12 @@ make_batch(std::pmr::memory_resource* res, const data_chunk_t& chunk, bool large
                     return tsl::arrow_error(res, core::error_code_t::conversion_failure,
                                             "chunk_to_record_batch: reserve", st);
                 }
+                // Read off the vector: no value object, no string copy per cell.
+                const auto& column = chunk.data[c];
                 for (int64_t r = 0; r < nrows; r++) {
-                    auto v = chunk.value(static_cast<uint64_t>(c),
-                                        static_cast<uint64_t>(r));
-                    auto st = v.is_null() ? b.AppendNull() : b.Append(v.value<const std::string&>());
+                    const auto row = static_cast<uint64_t>(r);
+                    auto st = column.is_null(row) ? b.AppendNull()
+                                                  : b.Append(column.get_value<std::string_view>(row));
                     if (!st.ok()) {
                         return tsl::arrow_error(res, core::error_code_t::conversion_failure,
                                                 "chunk_to_record_batch: append string", st);

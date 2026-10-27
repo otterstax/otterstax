@@ -41,7 +41,7 @@ core::result_wrapper_t<bool> chunk_to_parquet(std::pmr::memory_resource* res,
 
 core::result_wrapper_t<bool> chunk_to_parquet(std::pmr::memory_resource* res,
                                               const std::pmr::vector<components::vector::data_chunk_t>& chunks,
-                                              const std::string& path) {
+                                              std::string_view path) {
     OTX_ZONE_N("tsl::chunk_to_parquet(file)");
     return write_local_file(res, "chunk_to_parquet", path, [&](const std::shared_ptr<arrow::io::OutputStream>& sink) {
         return chunk_to_parquet(res, chunks, sink);

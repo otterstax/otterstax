@@ -3,10 +3,10 @@
 
 #include "catalog_manager.hpp"
 
-#include "integration/clickhouse/connection_manager.hpp"
+#include "integration/clickhouse/clickhouse_backend.hpp"
 #include "integration/otterbrix/otterbrix_manager.hpp"
-#include "integration/postgresql/connection_manager.hpp"
-#include "integration/sql/connection_manager.hpp"
+#include "integration/postgresql/postgres_backend.hpp"
+#include "integration/sql/mysql_backend.hpp"
 #include "otterbrix/parser/grammar_extension/kafka/kafka_node.hpp"
 #include "utility/tracy_profiler.hpp"
 
@@ -15,8 +15,8 @@
 #include <components/table/column_definition.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <string_view>
-#include <thread>
 
 using namespace components;
 
@@ -26,21 +26,35 @@ namespace {
     // error_t copy re-allocates the message on the default resource. Rebuild
     // the error on the actor's own resource instead.
     core::error_t copy_error(std::pmr::memory_resource* resource, const core::error_t& err) {
-        return core::error_t(err.type, std::pmr::string{err.what.c_str(), resource});
+        return core::error_t(err.type, std::pmr::string{err.what, resource});
     }
 
-    core::error_t make_error(std::pmr::memory_resource* resource, core::error_code_t code, const std::string& what) {
-        return core::error_t(code, std::pmr::string{what.c_str(), resource});
+    core::error_t make_error(std::pmr::memory_resource* resource, core::error_code_t code, std::string_view what) {
+        return core::error_t(code, std::pmr::string{what, resource});
     }
 
-    // True when the external entry's node needs no registered schema: CREATE
-    // targets a table that does not exist yet, DROP removes one, and a subquery
-    // stub (schema_node_t, node_type::unused) names no relation to register —
-    // its schema is the backend's, which ClickhouseManager::describe writes
-    // into the stub at prepare. Of the drop kinds only DROP TABLE and
-    // DROP INDEX carry an alias-qualified name (the parser's
-    // carries_table_reference); any other kind inside external_nodes is a
-    // contract violation, not a target to skip.
+    // The message joined from `parts`, built once on `resource`.
+    core::error_t make_error(std::pmr::memory_resource* resource,
+                             core::error_code_t code,
+                             std::initializer_list<std::string_view> parts) {
+        return core::error_t(code, otterstax::concat(resource, parts));
+    }
+
+    // "<before><number><after>" on `resource`.
+    core::error_t make_error(std::pmr::memory_resource* resource,
+                             core::error_code_t code,
+                             std::string_view before,
+                             int64_t number,
+                             std::string_view after) {
+        auto what = otterstax::concat(resource, {before});
+        otterstax::append_number(what, number);
+        what += after;
+        return core::error_t(code, std::move(what));
+    }
+
+    // True when the node needs no registered schema: CREATE targets a table that does not exist yet,
+    // DROP removes one, and a subquery stub (schema_node_t, unused) is described by the backend at
+    // prepare. Only DROP TABLE / DROP INDEX carry a name here; any other drop kind is a contract violation.
     core::result_wrapper_t<bool> is_schema_exempt(std::pmr::memory_resource* resource,
                                                   const logical_plan::node_t& node) {
         switch (node.type()) {
@@ -56,8 +70,9 @@ namespace {
                 }
                 return make_error(resource,
                                   core::error_code_t::invalid_parameter,
-                                  "External DROP target of kind " + std::to_string(static_cast<int>(kind)) +
-                                      " carries no alias-qualified table name");
+                                  "External DROP target of kind ",
+                                  static_cast<int>(kind),
+                                  " carries no alias-qualified table name");
             }
             default:
                 return false;
@@ -114,9 +129,6 @@ namespace mysql {
         , log_(get_logger(logger_tag::CATALOG_MANAGER))
         , store_(res)
         , otterbrix_manager_(std::move(otterbrix_manager))
-        , mysql_manager_(actor_zeta::address_t::empty_address())
-        , pg_manager_(actor_zeta::address_t::empty_address())
-        , ch_manager_(actor_zeta::address_t::empty_address())
         , aliases_(aliases)
         , connection_registry_(res) {
         assert(log_.is_valid());
@@ -124,21 +136,19 @@ namespace mysql {
         log_->info("CatalogManager initialized successfully");
     }
 
-    void CatalogManager::set_backend_managers(actor_zeta::address_t mysql_manager,
-                                              actor_zeta::address_t pg_manager,
-                                              actor_zeta::address_t ch_manager) {
-        mysql_manager_ = std::move(mysql_manager);
-        pg_manager_ = std::move(pg_manager);
-        ch_manager_ = std::move(ch_manager);
-    }
+    void CatalogManager::set_backends(backends_t backends) { backends_ = backends; }
 
-    void CatalogManager::registerConnection(const std::string& uuid, catalog_ext::ConnectionType type) {
-        connection_registry_.insert_or_assign(std::pmr::string{uuid.c_str(), resource()}, type);
+    void CatalogManager::registerConnection(std::string_view uuid, catalog_ext::ConnectionType type) {
+        if (auto it = connection_registry_.find(uuid); it != connection_registry_.end()) {
+            it->second = type;
+        } else {
+            connection_registry_.emplace(uuid, type); // the key on the registry's resource
+        }
         log_->debug("Registered connection: {} with type: {}", uuid, static_cast<int>(type));
     }
 
-    std::optional<catalog_ext::ConnectionType> CatalogManager::getConnectionType(const std::string& uuid) const {
-        auto it = connection_registry_.find(std::pmr::string{uuid.c_str(), resource()});
+    std::optional<catalog_ext::ConnectionType> CatalogManager::getConnectionType(std::string_view uuid) const {
+        auto it = connection_registry_.find(uuid); // transparent: no key is built
         if (it != connection_registry_.end()) {
             return it->second;
         }
@@ -152,13 +162,15 @@ namespace mysql {
         current_behavior_ = behavior(msg.get());
 
         while (current_behavior_.is_busy()) {
+            const auto seen = waits_.answers();
             if (current_behavior_.is_awaited_ready()) {
                 auto cont = current_behavior_.take_awaited_continuation();
                 if (cont) {
                     cont.resume();
                 }
             } else {
-                std::this_thread::yield();
+                idle_waits_.fetch_add(1, std::memory_order_relaxed);
+                waits_.wait_after(seen, std::chrono::milliseconds(1)); // woken by the pool answer
             }
         }
 
@@ -195,8 +207,9 @@ namespace mysql {
                         static_cast<int>(data->backend_type));
             return make_error(resource(),
                               core::error_code_t::invalid_parameter,
-                              "Backend type is already classified as " +
-                                  std::to_string(static_cast<int>(data->backend_type)));
+                              "Backend type is already classified as ",
+                              static_cast<int>(data->backend_type),
+                              "");
         }
 
         bool has_mysql = false;
@@ -212,15 +225,24 @@ namespace mysql {
                 auto conn_type_opt = getConnectionType(name.unique_identifier);
                 if (conn_type_opt.has_value()) {
                     auto conn_type = conn_type_opt.value();
+                    // The key on the plan's resource; one uid names one backend.
+                    const auto record = [&](backend_type_t backend) {
+                        if (auto it = data->node_backend_types.find(name.unique_identifier);
+                            it != data->node_backend_types.end()) {
+                            it->second = backend;
+                        } else {
+                            data->node_backend_types.emplace(name.unique_identifier, backend);
+                        }
+                    };
                     if (conn_type == catalog_ext::ConnectionType::MySQL) {
                         has_mysql = true;
-                        data->node_backend_types[name.unique_identifier] = backend_type_t::MySQL;
+                        record(backend_type_t::MySQL);
                     } else if (conn_type == catalog_ext::ConnectionType::PostgreSQL) {
                         has_pg = true;
-                        data->node_backend_types[name.unique_identifier] = backend_type_t::PostgreSQL;
+                        record(backend_type_t::PostgreSQL);
                     } else if (conn_type == catalog_ext::ConnectionType::ClickHouse) {
                         has_ch = true;
-                        data->node_backend_types[name.unique_identifier] = backend_type_t::ClickHouse;
+                        record(backend_type_t::ClickHouse);
                     }
                 }
 
@@ -241,7 +263,7 @@ namespace mysql {
                                     name.to_string());
                         return make_error(resource(),
                                           core::error_code_t::table_not_exists,
-                                          "External table is not registered: " + name.to_string());
+                                          {"External table is not registered: ", name.to_string()});
                     }
                     // No connection uid — local Otterbrix table, resolved by the engine itself.
                 } else {
@@ -432,8 +454,12 @@ namespace mysql {
                         backend_name(type));
             co_return make_error(resource(),
                                  core::error_code_t::invalid_parameter,
-                                 "Connection '" + name.unique_identifier + "' is registered as " +
-                                     backend_name(registered.value()) + ", not " + backend_name(type));
+                                 {"Connection '",
+                                  name.unique_identifier,
+                                  "' is registered as ",
+                                  backend_name(registered.value()),
+                                  ", not ",
+                                  backend_name(type)});
         }
         co_return co_await register_tables(name, type);
     }
@@ -441,7 +467,9 @@ namespace mysql {
     actor_zeta::unique_future<core::error_t> CatalogManager::register_tables(const qualified_name_t& name,
                                                                              catalog_ext::ConnectionType type) {
         OTX_ZONE_N("catalog::register_tables");
-        const std::string uuid = name.unique_identifier;
+        // The engine's database name (std::string, what OtterbrixManager takes); the caller's
+        // name outlives this call.
+        const std::string& uuid = name.unique_identifier;
 
         // Step 1: probe the remote backend and collect per-table STRUCT schemas.
         auto discovered = co_await discover_connection_schemas(name, type);
@@ -457,10 +485,12 @@ namespace mysql {
             const auto& fields = table.schema.child_types();
             for (size_t i = 0; i < fields.size(); ++i) {
                 if (!fields[i].has_alias()) {
-                    const std::string what = "Discovered table '" + table.name.to_string() +
-                                             "' has a column without a name at position " + std::to_string(i);
+                    auto what = otterstax::concat(
+                        resource(),
+                        {"Discovered table '", table.name.to_string(), "' has a column without a name at position "});
+                    otterstax::append_number(what, i);
                     log_->error("add_connection_schema: {}", what);
-                    co_return make_error(resource(), core::error_code_t::schema_error, what);
+                    co_return core::error_t(core::error_code_t::schema_error, std::move(what));
                 }
             }
         }
@@ -482,8 +512,7 @@ namespace mysql {
                             db_result.error().what.c_str());
                 co_return make_error(resource(),
                                      db_result.error().type,
-                                     "Failed to create engine database for uid '" + uuid +
-                                         "': " + db_result.error().what.c_str());
+                                     {"Failed to create engine database for uid '", uuid, "': ", db_result.error().what});
             }
             const bool created = db_result.value();
             if (!created) {
@@ -503,8 +532,7 @@ namespace mysql {
                                 stale_result.error().what.c_str());
                     co_return make_error(resource(),
                                          core::error_code_t::schema_error,
-                                         "Failed to drop the stale mirrors of uid '" + uuid +
-                                             "': " + stale_result.error().what.c_str());
+                                         {"Failed to drop the stale mirrors of uid '", uuid, "': ", stale_result.error().what});
                 }
                 log_->info("add_connection_schema: uid {} reuses its engine database; {} stale mirror(s) dropped",
                            uuid,
@@ -542,8 +570,10 @@ namespace mysql {
                             tbl_result.error().what.c_str());
                 co_return make_error(resource(),
                                      core::error_code_t::schema_error,
-                                     "Failed to register external table '" + table.name.to_string() +
-                                         "': " + tbl_result.error().what.c_str());
+                                     {"Failed to register external table '",
+                                      table.name.to_string(),
+                                      "': ",
+                                      tbl_result.error().what});
             }
 
             auto oid = tbl_result.value();
@@ -577,7 +607,7 @@ namespace mysql {
         co_return core::error_t::no_error();
     }
 
-    actor_zeta::unique_future<core::error_t> CatalogManager::check_database_ownership(std::string dbname) {
+    actor_zeta::unique_future<core::error_t> CatalogManager::check_database_ownership(std::pmr::string dbname) {
         OTX_ZONE_N("catalog::check_database_ownership");
         if (dbname != otterstax::kafka::KAFKA_DATABASE_NAME && aliases_.find(dbname) == nullptr) {
             co_return core::error_t::no_error();
@@ -592,53 +622,35 @@ namespace mysql {
         co_return core::error_t(core::error_code_t::invalid_parameter, std::move(what));
     }
 
-    // Discovery is a message to the backend actor that owns the connector
-    // manager; the catalog awaits its reply and never touches a connector
-    // itself. The reply is settled by the time send() returns (the backend
-    // actors run their handlers to completion on the sending thread), so the
-    // co_await below never suspends across another catalog message.
+    // Discovery runs on the backend's connection pool. Until it answers, this handler is suspended in
+    // enqueue_impl's loop on the sender's thread, still holding the catalog's mutex, so no other
+    // catalog message interleaves with it.
     actor_zeta::unique_future<core::result_wrapper_t<catalog_ext::discovered_tables_t>>
     CatalogManager::discover_connection_schemas(const qualified_name_t& name, catalog_ext::ConnectionType conn_type) {
         OTX_ZONE_N("catalog::discover_connection_schemas");
-        const actor_zeta::address_t* backend = nullptr;
-        switch (conn_type) {
-            case catalog_ext::ConnectionType::MySQL:
-                backend = &mysql_manager_;
-                break;
-            case catalog_ext::ConnectionType::PostgreSQL:
-                backend = &pg_manager_;
-                break;
-            case catalog_ext::ConnectionType::ClickHouse:
-                backend = &ch_manager_;
-                break;
-        }
-        if (backend == nullptr || !*backend) {
-            log_->error("discover_connection_schemas: no {} backend manager registered (uid {})",
+        const bool registered = (conn_type == catalog_ext::ConnectionType::MySQL && backends_.mysql != nullptr) ||
+                                (conn_type == catalog_ext::ConnectionType::PostgreSQL && backends_.postgresql != nullptr) ||
+                                (conn_type == catalog_ext::ConnectionType::ClickHouse && backends_.clickhouse != nullptr);
+        if (!registered) {
+            log_->error("discover_connection_schemas: no {} backend registered (uid {})",
                         backend_name(conn_type),
                         name.unique_identifier);
             co_return make_error(resource(),
                                  core::error_code_t::do_not_exists,
-                                 std::string{"No "} + backend_name(conn_type) +
-                                     " backend manager is registered for uid: " + name.unique_identifier);
+                                 {"No ", backend_name(conn_type), " backend is registered for uid: ", name.unique_identifier});
         }
 
         switch (conn_type) {
-            case catalog_ext::ConnectionType::MySQL: {
-                auto [needs_sched, future] = actor_zeta::send(*backend, &db::MySQLManager::discover, name);
-                co_return co_await std::move(future);
-            }
-            case catalog_ext::ConnectionType::PostgreSQL: {
-                auto [needs_sched, future] = actor_zeta::send(*backend, &db::PostgressManager::discover, name);
-                co_return co_await std::move(future);
-            }
-            case catalog_ext::ConnectionType::ClickHouse: {
-                auto [needs_sched, future] = actor_zeta::send(*backend, &db::ClickhouseManager::discover, name);
-                co_return co_await std::move(future);
-            }
+            case catalog_ext::ConnectionType::MySQL:
+                co_return co_await backends_.mysql->discover(name);
+            case catalog_ext::ConnectionType::PostgreSQL:
+                co_return co_await backends_.postgresql->discover(name);
+            case catalog_ext::ConnectionType::ClickHouse:
+                co_return co_await backends_.clickhouse->discover(name);
         }
         co_return make_error(resource(),
                              core::error_code_t::invalid_parameter,
-                             "Unknown backend type for uid: " + name.unique_identifier);
+                             {"Unknown backend type for uid: ", name.unique_identifier});
     }
 
     actor_zeta::unique_future<core::result_wrapper_t<std::pmr::vector<table_info>>>

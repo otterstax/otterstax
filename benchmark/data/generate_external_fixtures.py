@@ -36,7 +36,12 @@ import pyarrow.parquet as pq
 from faker import Faker
 import yaml
 
+import dataset_stamp
+
 SEED = 20260626
+# Bump when the generator changes, so saved files are generated again (dataset_stamp.py).
+VERSION = 1
+FILES = ["regions.parquet", "web_events.csv", "campaigns.ndjson"]
 COUNTRIES = ["US", "UK", "DE", "FR", "JP", "BR", "IN", "CA"]
 EVENT_TYPES = ["view", "click", "purchase"]
 STATUSES = ["active", "paused", "completed"]
@@ -64,14 +69,19 @@ def _load_config():
     }
 
 
-def generate(out_dir: Path):
+def generate(out_dir: Path, regenerate: bool = False):
     cfg = _load_config()
+    settings = {"version": VERSION, "seed": SEED, **cfg}
+    if not regenerate and dataset_stamp.is_current(out_dir, "external", settings, FILES):
+        print(f"reusing the saved external fixtures in {out_dir}")
+        return
+    out_dir.mkdir(parents=True, exist_ok=True)
+    dataset_stamp.invalidate(out_dir, "external")
     num_campaigns = cfg["num_campaigns"]
     regions_per = cfg["regions_per_campaign"]
     events_per = cfg["events_per_campaign"]
     max_product = cfg["max_product_id"]
 
-    out_dir.mkdir(parents=True, exist_ok=True)
     fake = Faker("en_US")
     Faker.seed(SEED)
     random.seed(SEED)
@@ -136,10 +146,14 @@ def generate(out_dir: Path):
     print(f"wrote {campaigns_path}: {num_campaigns} rows, columns "
           "[campaign_id, campaign_name, budget, status]")
 
+    dataset_stamp.mark_current(out_dir, "external", settings)
+
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description="Generate s3/file external-table benchmark fixtures")
     p.add_argument("--out", type=Path, default=Path(__file__).parent / "fixtures",
                    help="Output directory (default: benchmark/data/fixtures)")
+    p.add_argument("--regenerate", action="store_true",
+                   help="Generate the files again even when the saved ones are current")
     args = p.parse_args()
-    generate(args.out)
+    generate(args.out, args.regenerate)

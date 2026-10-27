@@ -24,7 +24,12 @@ from pathlib import Path
 
 import yaml
 
+import dataset_stamp
+
 SEED = 20260703
+# Bump when the generator changes, so saved files are generated again (dataset_stamp.py).
+VERSION = 1
+FILES = ["kafka_events.ndjson"]
 EVENT_TYPES = ["view", "click", "purchase"]
 
 
@@ -42,12 +47,17 @@ def _load_config():
     }
 
 
-def generate(out_dir: Path):
+def generate(out_dir: Path, regenerate: bool = False):
     cfg = _load_config()
+    settings = {"version": VERSION, "seed": SEED, **cfg}
+    if not regenerate and dataset_stamp.is_current(out_dir, "kafka", settings, FILES):
+        print(f"reusing the saved kafka dataset in {out_dir}")
+        return
+    out_dir.mkdir(parents=True, exist_ok=True)
+    dataset_stamp.invalidate(out_dir, "kafka")
     num_records = cfg["num_records"]
     num_campaigns = cfg["num_campaigns"]
 
-    out_dir.mkdir(parents=True, exist_ok=True)
     random.seed(SEED)
 
     path = out_dir / "kafka_events.ndjson"
@@ -65,10 +75,14 @@ def generate(out_dir: Path):
     print(f"wrote {path}: {num_records} rows, columns "
           "[id, campaign_id, event_type, amount, ts]")
 
+    dataset_stamp.mark_current(out_dir, "kafka", settings)
+
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser(description="Generate the kafka_ingest benchmark JSON dataset")
     p.add_argument("--out", type=Path, default=Path(__file__).parent / "fixtures",
                    help="Output directory (default: benchmark/data/fixtures)")
+    p.add_argument("--regenerate", action="store_true",
+                   help="Generate the files again even when the saved ones are current")
     args = p.parse_args()
-    generate(args.out)
+    generate(args.out, args.regenerate)

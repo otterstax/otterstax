@@ -20,6 +20,7 @@
 // range included. `uhugeint` is mapped by neither and stands here for the
 // refusal path every unmapped type takes.
 
+#include "packet_split.hpp"
 #include "frontend/common/resultset_utils.hpp"
 #include "frontend/common/utils.hpp"
 #include "frontend/mysql_server/packet/packet_reader.hpp"
@@ -97,7 +98,8 @@ namespace {
                              types::int128_t unscaled) {
         auto type = decimal_type(resource, width, scale);
         auto chunk = decimal_chunk(resource, type, {unscaled});
-        return encode_to_text(chunk, 0, 0);
+        std::pmr::string scratch(resource);
+        return std::string(encode_to_text(chunk, 0, 0, scratch));
     }
 
     // One HUGEINT column holding the given integers, one per row. No extension
@@ -117,7 +119,8 @@ namespace {
     // The text a HUGEINT cell goes out as, on either wire.
     std::string hugeint_text(std::pmr::memory_resource* resource, types::int128_t value) {
         auto chunk = hugeint_chunk(resource, {value});
-        return encode_to_text(chunk, 0, 0);
+        std::pmr::string scratch(resource);
+        return std::string(encode_to_text(chunk, 0, 0, scratch));
     }
 } // namespace
 
@@ -441,7 +444,7 @@ TEST_CASE("mysql resultset: a DECIMAL column goes out as NEWDECIMAL with its sca
     result.add_row(chunk, 1);
 
     uint8_t sequence = 0;
-    auto packets = mysql::mysql_resultset::build_packets(std::move(result), sequence);
+    auto packets = otterstax::test::split_mysql_packets(mysql::mysql_resultset::build_packets(std::move(result), sequence));
     REQUIRE(packets.size() == 6); // column count + column def + eof + 2 rows + eof
 
     {
@@ -489,7 +492,7 @@ TEST_CASE("mysql resultset: a binary DECIMAL row carries the same digits as a le
     result.add_row(chunk, 0);
 
     uint8_t sequence = 0;
-    auto packets = mysql::mysql_resultset::build_packets(std::move(result), sequence);
+    auto packets = otterstax::test::split_mysql_packets(mysql::mysql_resultset::build_packets(std::move(result), sequence));
     REQUIRE(packets.size() == 5);
 
     mysql::packet_reader r(packets[3]);
@@ -510,7 +513,7 @@ TEST_CASE("pg resultset: a DECIMAL column is a NUMERIC field whose text keeps th
     postgres::postgres_resultset result(writer);
     result.add_chunk_columns(chunk);
     result.add_row(chunk, 0);
-    auto packets = postgres::postgres_resultset::build_packets(std::move(result));
+    auto packets = otterstax::test::split_pg_messages(postgres::postgres_resultset::build_packets(std::move(result)));
     REQUIRE(packets.size() == 2);
 
     {
@@ -570,7 +573,7 @@ TEST_CASE("mysql resultset: a HUGEINT column goes out as NEWDECIMAL with no deci
     result.add_row(chunk, 1);
 
     uint8_t sequence = 0;
-    auto packets = mysql::mysql_resultset::build_packets(std::move(result), sequence);
+    auto packets = otterstax::test::split_mysql_packets(mysql::mysql_resultset::build_packets(std::move(result), sequence));
     REQUIRE(packets.size() == 6); // column count + column def + eof + 2 rows + eof
 
     {
@@ -617,7 +620,7 @@ TEST_CASE("mysql resultset: a binary HUGEINT row carries the digits as a length-
     result.add_row(chunk, 0);
 
     uint8_t sequence = 0;
-    auto packets = mysql::mysql_resultset::build_packets(std::move(result), sequence);
+    auto packets = otterstax::test::split_mysql_packets(mysql::mysql_resultset::build_packets(std::move(result), sequence));
     REQUIRE(packets.size() == 5);
 
     mysql::packet_reader r(packets[3]);
@@ -638,7 +641,7 @@ TEST_CASE("pg resultset: a HUGEINT column is a NUMERIC field whose text keeps ev
     postgres::postgres_resultset result(writer);
     result.add_chunk_columns(chunk);
     result.add_row(chunk, 0);
-    auto packets = postgres::postgres_resultset::build_packets(std::move(result));
+    auto packets = otterstax::test::split_pg_messages(postgres::postgres_resultset::build_packets(std::move(result)));
     REQUIRE(packets.size() == 2);
 
     {

@@ -21,26 +21,21 @@
 
 class ComponentManager {
 public:
-    ComponentManager(const configuration::config& config, const config::ConnectionsConfig& connections);
+    // `data_resource`: memory for backend rows — decoded on pool threads, freed on Worker and
+    // engine threads, so it must be thread-safe. Not the engine's locked shared resource; see
+    // docs/otterbrix_request_scalable_memory_resource.md.
+    ComponentManager(const configuration::config& config,
+                     const config::ConnectionsConfig& connections,
+                     std::pmr::memory_resource* data_resource = std::pmr::new_delete_resource());
     ~ComponentManager();
     std::pmr::memory_resource* getResource();
     actor_zeta::address_t scheduler_address() const;
     actor_zeta::address_t catalog_address() const;
     const otterstax::names::alias_registry_t& aliases() const noexcept { return aliases_; }
 
-    // Register every remote backend and s3 alias described by the connection
-    // config (parsed from the config file at startup). This is the sole entry
-    // point for registering connections — there is no runtime add/remove API.
-    // Every descriptor was validated for completeness by parse_connections
-    // before it reaches this point. A mysql/pg/ch connection becomes a pool in
-    // backends_ (its min_size connections opened here), then the catalog
-    // discovers its tables; a connection whose discovery fails is dropped again.
-    // Opening a backend is best-effort: it is retried per `retry` (a slow DB may
-    // need a moment) and a backend that stays unreachable is logged and skipped.
-    // Each s3 alias gets its S3FileSystem and a transfer pool; `file_transfers`
-    // sizes the local-file transfer pool. A descriptor the backend rejects
-    // outright (invalid_parameter) or an s3 alias whose filesystem cannot be
-    // built is a configuration error, returned so startup aborts.
+    // Register backends and s3 aliases from the startup config; the sole entry point, no runtime
+    // add/remove. Opens each pool (min_size) and discovers its tables; unreachable backends are
+    // retried then skipped (a failed discovery drops its pool); bad config aborts startup.
     [[nodiscard]] core::error_t register_connections(const config::ConnectionsConfig& connections,
                                                      const config::ConnectionRetryConfig& retry,
                                                      const config::PoolDesc& file_transfers = {});
@@ -48,14 +43,13 @@ public:
 private:
     db::otterbrix_engine_ptr engine_{nullptr};
     std::pmr::memory_resource* resource_{nullptr};
+    // Backend rows (see the constructor).
+    std::pmr::memory_resource* data_resource_{nullptr};
     // Read by every Worker's parser; declared before scheduler_ so it outlives it.
     otterstax::names::alias_registry_t aliases_;
-    // Sole owner of the connection pools and decode metadata of the three
-    // database backend types, and of the S3 / local-file transfer pools.
-    // Everything that builds on them — the catalog's backends below and every
-    // Worker — is declared BELOW, so it is destroyed first; the pools then
-    // answer what is still queued and join their threads. The S3 filesystems
-    // die with them, before main()'s subsystem_finalizer_t runs FinalizeS3.
+    // Sole owner of the connection pools and decode metadata for the three backend types, and of
+    // the S3 / local-file transfer pools. Everything using them is declared below, so it dies
+    // first; the pools then drain and join, and their S3 filesystems die before FinalizeS3.
     std::unique_ptr<db::backend_registry_t> backends_;
     // The catalog's own backends: schema discovery runs through them.
     std::unique_ptr<db::backend_set_t> catalog_backends_;

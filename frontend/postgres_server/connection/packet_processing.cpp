@@ -117,7 +117,7 @@ namespace frontend::postgres {
             return;
         }
         int64_t rows_cnt = sdata_result.size();
-        std::vector<std::vector<uint8_t>> response;
+        std::vector<uint8_t> response; // every message back to back: one buffer, one write
         if (sdata_result.column_count() > 0) {
             // A column the text encoder cannot carry is an ErrorResponse, not a
             // dropped connection.
@@ -137,10 +137,10 @@ namespace frontend::postgres {
             }
             response = postgres_resultset::build_packets(std::move(result));
         }
-        response.emplace_back(
-            build_command_complete(writer_, command_complete_tag::simple_command(sdata_result.tag, rows_cnt)));
-        response.emplace_back(build_ready_for_query(writer_, transaction_man_.get_transaction_status()));
-        send_packet_merged(std::move(response));
+        append_packet(response,
+                      build_command_complete(writer_, command_complete_tag::simple_command(sdata_result.tag, rows_cnt)));
+        append_packet(response, build_ready_for_query(writer_, transaction_man_.get_transaction_status()));
+        send_packet(std::move(response));
     }
 
     void postgres_connection::try_handle_transaction(std::string query, std::string error) {
@@ -542,7 +542,7 @@ namespace frontend::postgres {
             }
         }
 
-        std::vector<std::vector<uint8_t>> response;
+        std::vector<uint8_t> response; // every message back to back: one buffer, one write
         // CommandComplete reports the rows of THIS Execute: the rows sent for a
         // query, the affected count for a DML statement (which has no result
         // columns, so the count comes from the payload and is reported once).
@@ -585,8 +585,8 @@ namespace frontend::postgres {
             response = postgres_resultset::build_packets(std::move(result));
 
             if (portal.emitted < total) {
-                response.emplace_back(build_portal_suspended(writer_));
-                send_packet_merged(std::move(response));
+                append_packet(response, build_portal_suspended(writer_));
+                send_packet(std::move(response));
                 return;
             }
         } else {
@@ -594,9 +594,9 @@ namespace frontend::postgres {
             portal.emitted = payload.size();
         }
 
-        response.emplace_back(
-            build_command_complete(writer_, command_complete_tag::simple_command(payload.tag, rows_cnt)));
-        send_packet_merged(std::move(response));
+        append_packet(response,
+                      build_command_complete(writer_, command_complete_tag::simple_command(payload.tag, rows_cnt)));
+        send_packet(std::move(response));
     }
 
     void postgres_connection::handle_close(describe_close_arg type, std::string name) {

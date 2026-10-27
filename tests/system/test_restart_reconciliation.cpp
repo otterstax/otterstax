@@ -165,10 +165,8 @@ namespace {
 
     constexpr std::size_t kBackendRows = 2;
 
-    // Answers from the current table catalog: discovery — no enums, the table
-    // listing, the referenced table's attributes for a probe — decoded by the
-    // PostgreSQL driver's own decode, and a slot statement with kBackendRows
-    // rows of every column of the referenced table (the tests only SELECT *).
+    // Answers from the current table catalog: discovery (no enums, the table listing, attributes for
+    // a probe) via the PostgreSQL driver's decode, and slot statements with kBackendRows rows.
     class catalog_pg_driver final : public conn::IDriver {
     public:
         explicit catalog_pg_driver(std::pmr::memory_resource* resource)
@@ -243,10 +241,8 @@ namespace {
 
     using otterstax::test::wait_until_ready;
 
-    // One server run: a real engine over `data_dir` — which is NOT cleared, a
-    // restart sees what the previous run persisted — real parser and catalog,
-    // the PostgreSQL connection over the mock driver. Destroying the run
-    // checkpoints the engine, as a server shutdown does.
+    // One server run: a real engine over `data_dir` (not cleared, so a restart sees the previous
+    // run's data), real parser and catalog, and the PostgreSQL mock driver. Destroying it checkpoints.
     class server_run {
     public:
         explicit server_run(const std::string& data_dir)

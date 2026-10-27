@@ -22,19 +22,9 @@
 using boost::mysql::column_type;
 using namespace components::types;
 
-// The MySQL column-type mapping has ONE table (to_local_translator in
-// mysql_to_chunk.cpp): each arm names both the engine type a column is read as
-// and the reader that writes its values, so the schema a discovery registers
-// and the types the executed chunk carries are the same answer by construction.
-// mysql_to_struct is that answer taken off a result set's column definitions —
-// what the MySQL backend's discover mirrors into the catalog — and mysql_to_chunk the
-// chunk built under it.
-//
-// These cases pin the table per column type AND the agreement between the two
-// paths over every type MySQL can report, which is what a second, drifting copy
-// of the map broke: the copy had no BIGINT / date / datetime / json arm, so a
-// real BIGINT column mirrored into the catalog with no type at all (NA) while
-// its rows arrived as BIGINT.
+// The MySQL column-type mapping has one table (to_local_translator in mysql_to_chunk.cpp), so the
+// schema discovery registers (mysql_to_struct) and the executed chunk (mysql_to_chunk) agree.
+// These cases pin it per type and pin the agreement, which a drifting second copy of the map broke.
 
 namespace {
 

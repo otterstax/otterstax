@@ -95,7 +95,7 @@ bool is_raw_sql_stub(const components::logical_plan::node_ptr& n) {
 }
 
 // generate_query for the external slot of `parsed` registered under `uid`.
-core::result_wrapper_t<std::string> generate_for(const ParsedQueryDataPtr& parsed,
+core::result_wrapper_t<std::pmr::string> generate_for(const ParsedQueryDataPtr& parsed,
                                                  const std::string& uid,
                                                  backend_type_t backend,
                                                  std::pmr::memory_resource* resource) {
@@ -115,7 +115,7 @@ std::string sql_for(GreenplumParser& parser,
     auto gen = generate_for(parsed, "mysql", backend, resource);
     INFO("error: " << std::string_view{gen.error().what});
     REQUIRE_FALSE(gen.has_error());
-    return gen.value();
+    return std::string(gen.value());
 }
 
 // Parse + generate for the `mysql` slot; the generator must refuse.
@@ -149,7 +149,7 @@ node_aggregate_ptr orders_select(std::pmr::memory_resource* resource) {
     return make_node_aggregate(resource, core::dbname_t{"bill"}, core::relname_t{"orders"});
 }
 
-core::result_wrapper_t<std::string>
+core::result_wrapper_t<std::pmr::string>
 generate_manual(const node_ptr& node,
                 const parameter_node_t& params,
                 backend_type_t backend,
@@ -1786,7 +1786,7 @@ TEST_CASE("generate_query: stringstream overload produces the same output") {
     // The string overload appends the statement terminator; the stream
     // overload emits the bare statement so callers can keep composing.
     REQUIRE_FALSE(sql_str.has_error());
-    REQUIRE(sql_str.value() == ss.str() + ";");
+    REQUIRE(std::string_view(sql_str.value()) == ss.str() + ";");
 }
 
 // ── replace_qualifiers edge cases not covered in test_replace_qualifiers.cpp ──
@@ -1808,7 +1808,7 @@ TEST_CASE("replace_qualifiers: 3-part qualifier treated as db.schema.collection 
     auto rendered =
         sql_gen::replace_qualifiers(r.stubs[0].raw_sql, r.stubs[0].qualifiers, backend_type_t::MySQL, &arena);
     REQUIRE_FALSE(rendered.has_error());
-    const std::string& out = rendered.value();
+    const std::string_view out = rendered.value();
     // After rewrite the 3-part name becomes quoted db.collection for MySQL
     REQUIRE(out.find("FROM `bill`.`orders`") != std::string::npos);
     REQUIRE(out.find("mysql.bill.orders") == std::string::npos);
@@ -1830,7 +1830,7 @@ TEST_CASE("replace_qualifiers: multiple qualifiers in one stub") {
     auto rendered =
         sql_gen::replace_qualifiers(r.stubs[0].raw_sql, r.stubs[0].qualifiers, backend_type_t::MySQL, &arena);
     REQUIRE_FALSE(rendered.has_error());
-    const std::string& out = rendered.value();
+    const std::string_view out = rendered.value();
     // Both 4-part names rewritten
     REQUIRE(out.find("`db`.`t1`") != std::string::npos);
     REQUIRE(out.find("`db`.`t2`") != std::string::npos);
@@ -1886,11 +1886,11 @@ outcome_t parse_refuses(core::error_code_t code, std::string what) {
     return outcome_t{stage_t::parse_refused, code, std::move(what)};
 }
 
-outcome_t outcome_of_generation(const core::result_wrapper_t<std::string>& gen) {
+outcome_t outcome_of_generation(const core::result_wrapper_t<std::pmr::string>& gen) {
     if (gen.has_error()) {
         return generate_refuses(gen.error().type, std::string{gen.error().what.c_str()});
     }
-    return sql_is(gen.value());
+    return sql_is(std::string(gen.value()));
 }
 
 // generate_query for the `mysql` slot of an already parsed statement.

@@ -35,12 +35,9 @@ Scheduler::Scheduler(std::pmr::memory_resource* res,
     assert(worker_count > 0);
     assert(parser_factory != nullptr);
 
-    // Each Worker owns its own parser instance — no shared objects between actors
-    // (codex rule 10). The factory is a plain function pointer (rule 14: no
-    // std::function); the built parser is moved into the Worker. Each Worker
-    // builds its own backends over the shared connection pools and runs
-    // external-table statements (CREATE EXTERNAL TABLE / COPY ... TO) through
-    // the shared transfer pools.
+    // Each Worker owns its parser (built by a plain function pointer) and its backends over the shared
+    // connection pools, and runs external-table statements through the shared transfer pools. Actors
+    // share no objects.
     workers_.reserve(worker_count);
     worker_addresses_.reserve(worker_count);
     for (std::size_t i = 0; i < worker_count; ++i) {

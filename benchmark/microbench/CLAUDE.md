@@ -8,6 +8,31 @@ Run script: `benchmark/microbench/run-bench.sh` (handles LD_LIBRARY_PATH and JSO
 
 ## Source files and what they cover
 
+### `bench_allocations.cpp`
+
+Heap allocations as well as time: the binary's global `operator new` counts per thread, and
+every benchmark here reports `allocs/op`, `bytes/op` and, where the operation has rows or cells,
+`allocs/item`. Every resource is `new_delete_resource`, so each allocation is a counted
+`operator new` (a pool resource would hide them behind its reuse). The counter covers the whole
+binary, so the other files' benchmarks pay one thread-local add per allocation.
+
+| Benchmark | What it measures |
+|-----------|------------------|
+| `BM_real_ch_to_chunk_text_columns` | `tsl::ch_to_chunk` of DateTime64(6), Decimal(38, 10), UInt128, UUID and String columns, 1024 rows (every cell read as text) |
+| `BM_real_pg_to_chunk_text_columns` | `tsl::pg_to_chunk` of a manufactured 1024-row text result: three varchar columns, an int4, a float8 |
+| `BM_real_encode_to_text` | `frontend::encode_to_text` over every cell of a 1024-row INTEGER / BIGINT / DOUBLE / STRING / DECIMAL chunk |
+| `BM_real_mysql_resultset_text` / `BM_real_postgres_resultset_text` | a whole text resultset of that chunk: every row framed, `build_packets` |
+| `BM_real_chunk_to_ndjson` | `tsl::chunk_to_ndjson` of that chunk into a sink that keeps nothing |
+| `BM_real_generate_query` | `sql_gen::generate_query` of one parsed remote slot (WHERE / ORDER BY / LIMIT) |
+| `BM_old_*` / `BM_new_*` | a replaced pattern next to its replacement, in one run: error-message building, a registry lookup by uid, a value's text handed to the engine, a statement's scratch containers, JSON escaping, the SQL stream, the wait ticket (also from 8 threads on a shared `synchronized_pool_resource`) |
+
+The `BM_real_*` benchmarks compile against the code before the allocation work as well
+(`OTX_BENCH_NEW` — the presence of `utility/stack_arena.hpp` — picks the call shape where a
+signature changed), so one source compares two builds: build `otterstax_bench` from a worktree of
+the older commit with the same `bench_allocations.cpp` and `CMakeLists.txt`, and run both
+binaries with `--benchmark_filter=BM_real_`. The `BM_old_*` / `BM_new_*` pairs exist only in the
+newer tree.
+
 ### `bench_translators.cpp`
 
 Data conversion paths between backend wire formats, `data_chunk_t`, and Arrow.

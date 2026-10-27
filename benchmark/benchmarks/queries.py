@@ -173,6 +173,49 @@ JOIN_CROSS_ENGINE = [
      " FROM ch2.benchch2.products p"
      " JOIN pg2.benchpg2.public.orders o"
      " ON p.product_id = o.product_id"),
+    # The engine hashes a JOIN only when ON is one equality of two keys of one type
+    # (docs/otterbrix_request_joins.md); every other JOIN is a nested loop. These pairs
+    # answer the same rows on both plans. The same row filter in ON (nested loop) and
+    # in WHERE (pushed below the JOIN, hash join):
+    ("prod_mysql2_x_ord_pg2_on_filter",
+     "SELECT p.product_id, p.product_name, p.category,"
+     " o.quantity, o.total_price"
+     " FROM mysql2.benchdb2.products p"
+     " JOIN pg2.benchpg2.public.orders o"
+     " ON p.product_id = o.product_id AND o.quantity > 10"),
+    ("prod_mysql2_x_ord_pg2_where_filter",
+     "SELECT p.product_id, p.product_name, p.category,"
+     " o.quantity, o.total_price"
+     " FROM mysql2.benchdb2.products p"
+     " JOIN pg2.benchpg2.public.orders o"
+     " ON p.product_id = o.product_id"
+     " WHERE o.quantity > 10"),
+    # The same rows as prod_mysql2_x_ord_pg2 with only the key type changed in ON: a BIGINT key
+    # against INT is cast to a common type (nested loop), and so is a cast on both sides.
+    ("prod_mysql2_x_ord_pg2_key_bigint_x_int",
+     "SELECT p.product_id, p.product_name, p.category,"
+     " o.quantity, o.total_price"
+     " FROM mysql2.benchdb2.products p"
+     " JOIN pg2.benchpg2.public.orders o"
+     " ON CAST(p.product_id AS BIGINT) = o.product_id"),
+    ("prod_mysql2_x_ord_pg2_key_bigint_x_bigint",
+     "SELECT p.product_id, p.product_name, p.category,"
+     " o.quantity, o.total_price"
+     " FROM mysql2.benchdb2.products p"
+     " JOIN pg2.benchpg2.public.orders o"
+     " ON CAST(p.product_id AS BIGINT) = CAST(o.product_id AS BIGINT)"),
+    # campaign_id: UInt32 on both ClickHouse instances (hash join), INT x UInt32 from
+    # MySQL (cast keys, nested loop).
+    ("camp_ch1_x_ord_ch2",
+     "SELECT c.campaign_id, c.campaign_name, o.order_id, o.total_price"
+     " FROM ch1.benchch1.campaigns c"
+     " JOIN ch2.benchch2.orders o"
+     " ON c.campaign_id = o.campaign_id"),
+    ("camp_mysql1_x_ord_ch2",
+     "SELECT c.campaign_id, c.campaign_name, o.order_id, o.total_price"
+     " FROM mysql1.benchdb1.campaigns c"
+     " JOIN ch2.benchch2.orders o"
+     " ON c.campaign_id = o.campaign_id"),
 ]
 
 # ── JOIN_ALL ───────────────────────────────────────────────────────────────────

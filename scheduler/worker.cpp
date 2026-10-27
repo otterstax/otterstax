@@ -12,6 +12,8 @@
 #include "otterbrix/parser/grammar_extention/external_node.hpp"
 #include "otterbrix/parser/grammar_extension/kafka/kafka_node.hpp"
 #include "utility/logger.hpp"
+#include "utility/pmr_text.hpp"
+#include "utility/stack_arena.hpp"
 #include "utility/timer.hpp"
 #include "utility/tracy_profiler.hpp"
 
@@ -22,7 +24,6 @@
 #include <components/logical_plan/node_drop.hpp>
 
 #include <cassert>
-#include <deque>
 #include <exception>
 #include <memory>
 #include <mutex>
@@ -134,19 +135,21 @@ namespace {
     std::pmr::map<qualified_name_t, size_t> plan_dependencies(std::pmr::memory_resource* resource,
                                                               const logical_plan::node_ptr& root) {
         std::pmr::map<qualified_name_t, size_t> dependencies(resource);
-        std::deque<logical_plan::node_ptr> nodes_traverse;
-        nodes_traverse.emplace_back(root);
-        while (!nodes_traverse.empty()) {
-            auto& n = nodes_traverse.front();
+        // Breadth first, the numbering's order. The plan owns its nodes for the whole walk, so
+        // the queue holds plain pointers (no refcount traffic) in a stack arena.
+        otterstax::stack_arena_t<512> scratch(resource);
+        std::pmr::vector<const logical_plan::node_t*> nodes_traverse(scratch.resource());
+        nodes_traverse.push_back(root.get());
+        for (std::size_t next = 0; next < nodes_traverse.size(); ++next) {
+            const auto* n = nodes_traverse[next];
             if (n->type() == logical_plan::node_type::aggregate_t) {
                 const size_t index = dependencies.size();
                 dependencies.emplace(schema_utils::agg_key(static_cast<const logical_plan::node_aggregate_t&>(*n)),
                                      index);
             }
-            for (auto& child : n->children()) {
-                nodes_traverse.emplace_back(child);
+            for (const auto& child : n->children()) {
+                nodes_traverse.push_back(child.get());
             }
-            nodes_traverse.pop_front();
         }
         return dependencies;
     }
@@ -368,6 +371,7 @@ Worker::Worker(std::pmr::memory_resource* res,
 Worker::~Worker() = default;
 
 actor_zeta::scheduler::resume_info Worker::resume(std::size_t max_throughput) noexcept {
+    runs_.fetch_add(1, std::memory_order_relaxed);
     if (parking_.park()) {
         return actor_zeta::scheduler::resume_info(actor_zeta::scheduler::resume_result::awaiting, 0);
     }
@@ -376,7 +380,9 @@ actor_zeta::scheduler::resume_info Worker::resume(std::size_t max_throughput) no
 
 template<typename Submit>
 actor_zeta::unique_future<conn::transfer_outcome_t> Worker::run_transfer(Submit submit) {
-    auto watched = conn::watch(&parking_);
+    // The ticket on the transfer pools' resource, not the Worker's (the engine's
+    // synchronized pool in production): see db::backend_t::statement_resource.
+    auto watched = conn::watch(&parking_, transfers_->resource());
     auto transfer = submit(std::move(watched.waker));
     conn::suspended_on_t suspended(&parking_, watched.ticket, transfer.is_ready());
     auto outcome = co_await std::move(transfer);
@@ -797,36 +803,11 @@ actor_zeta::unique_future<Worker::session_result> Worker::describe_parsed(sessio
     }
     auto data = std::move(catalog_result.value());
 
-    // The prepared schema of a statement's remote slots is the backend's, not
-    // the plan's. Each backend owns the result type of every expression it
-    // evaluates — ClickHouse's count() is UInt64 where the plan reads BIGINT and
-    // `x + 1` over an Int32 column is Int64, MySQL widens `x + 1` over an INT
-    // column to BIGINT, and a non-aggregate function aliased as a base column
-    // (`length(name) AS name`) has no type on the plan at all — so a
-    // plan-derived type names something the executed chunk does not carry, and
-    // the stream then disagrees with the schema it was announced under. A
-    // raw-SQL sub-query stub is worse off still: it carries the user's text,
-    // which nothing on the plan describes, so its schema stays NA, and a JOIN
-    // with it does not merely degrade — the schema merge answers "OtterBrix
-    // collection is missing in catalog" and the prepare fails outright.
-    //
-    // So every backend that owns a slot of this statement describes its own, in
-    // the order run_pipeline executes them: each backend probes the slot with
-    // the statement execute would run and fills that stub's schema with what the
-    // backend answers, decoded exactly as execute decodes its rows. A backend
-    // fills the stubs its node_backend_types entry names and leaves every other
-    // slot alone, which is what lets each participant of a Mixed statement
-    // describe its own share; a statement whose slots carry no stub (a DML, a
-    // JOIN root over plain tables) comes back with nothing probed. The probes run
-    // on the backend's connection pool while this Worker is suspended, so a
-    // described statement pays one backend round-trip per stub.
-    //
-    // A parameterized statement is out of the described scope for now — this is
-    // a narrower scope, not a fallback: the binder holds every parameter, the
-    // literals included, until finalize, so before Bind there is no SQL to
-    // probe with, and what a prepare should answer for `$n` is being decided
-    // separately. Until that policy lands such a statement keeps the schema the
-    // catalog put on the stub, exactly as it did before this routing.
+    // The prepared schema of a remote slot is the backend's, not the plan's: backends type expressions
+    // their own way (count() is UInt64, `x + 1` widens) and a raw-SQL sub-query stub has no plan type.
+    // So each backend probes its slots with the statement execute would run and fills the stub schema,
+    // decoded as execute decodes rows. A backend touches only the stubs its node_backend_types names.
+    // A parameterized statement is skipped (no SQL to probe before Bind) and keeps the catalog schema.
     if (data->otterbrix_params->parameters_count == 0) {
         auto described = co_await backends_->describe(id, std::move(data));
         if (described.has_error()) {
@@ -971,7 +952,7 @@ actor_zeta::unique_future<core::error_t> Worker::guard_database_ddl(const Parsed
 
     auto [ns_own, owner_future] = actor_zeta::send(catalog_manager_,
                                                    &mysql::CatalogManager::check_database_ownership,
-                                                   std::string{dbname.c_str(), dbname.size()});
+                                                   std::move(dbname));
     auto owned = co_await std::move(owner_future);
     if (owned.contains_error()) {
         co_return forward_error(resource(), owned, "");
@@ -979,12 +960,8 @@ actor_zeta::unique_future<core::error_t> Worker::guard_database_ddl(const Parsed
     co_return core::error_t::no_error();
 }
 
-// ─── External-table dispatch (CREATE EXTERNAL TABLE / COPY ... TO) ──────────
-// Both forms parse into an otterstax::external::external_node_t. A transfer pool
-// moves the bytes — the S3 alias's, or the local-file one — on its own threads
-// while this Worker is suspended; the engine calls stay here. Neither lands on
-// the regular backend path. DDL and COPY produce no rows, so success returns an
-// empty session_payload.
+// External-table dispatch (CREATE EXTERNAL TABLE / COPY ... TO). A transfer pool moves the bytes
+// on its own threads while this Worker is suspended; the engine calls stay here. No rows come back.
 
 actor_zeta::unique_future<Worker::session_result>
 Worker::handle_external_statement(session_hash_t id, const otterstax::external::external_node_t& ext) {
@@ -997,12 +974,14 @@ Worker::handle_external_statement(session_hash_t id, const otterstax::external::
 
 actor_zeta::unique_future<Worker::session_result>
 Worker::load_external_table(session_hash_t id, const otterstax::external::external_node_t& ext) {
-    std::string database = ext.database();
-    std::string table = ext.table();
+    // std::string: the engine's catalog names (OtterbrixManager::create_table).
+    std::string database(ext.database());
+    std::string table(ext.table());
     auto transfer = run_transfer([&](conn::waker_t waker) {
         OTX_ZONE_N("Worker::load_external_table");
         // An empty format lets the location's extension decide.
-        conn::load_t job{ext.object_path(), ext.format()};
+        auto* text = transfers_->resource(); // what the transfer thread reads and frees
+        conn::load_t job{std::pmr::string(ext.object_path(), text), std::pmr::string(ext.format(), text)};
         return ext.is_s3() ? transfers_->s3("open_input", ext.s3_alias(), std::move(job), std::move(waker))
                            : transfers_->files("load", std::move(job), std::move(waker));
     });
@@ -1036,15 +1015,15 @@ actor_zeta::unique_future<Worker::session_result>
 Worker::copy_to(session_hash_t id, const otterstax::external::external_node_t& ext) {
     // The inner query is re-parsed here; its result is what gets exported.
     OtterbrixStatementPtr statement;
-    conn::export_t job;
+    conn::export_t job{std::pmr::string(transfers_->resource()), conn::file::FileFormat::Unknown, nullptr};
     const bool to_s3 = ext.is_s3();
-    std::string alias = ext.s3_alias();
+    const std::string_view alias = ext.s3_alias(); // the plan's node outlives this coroutine
     {
         OTX_ZONE_N("Worker::copy_to");
         if (ext.inner_sql().empty()) {
             co_return make_error(resource(), error_code_t::sql_parse_error, "COPY ... TO: missing inner query");
         }
-        auto inner = parse_sql(ext.inner_sql());
+        auto inner = parse_sql(std::string(ext.inner_sql())); // the parser takes a std::string
         if (inner.has_error()) {
             co_return forward_error(resource(), inner.error(), "COPY ... TO: ");
         }
@@ -1054,15 +1033,15 @@ Worker::copy_to(session_hash_t id, const otterstax::external::external_node_t& e
         job.location = ext.object_path();
         job.format = conn::file::resolve_format(ext.format(), ext.location());
         if (job.format == conn::file::FileFormat::Unknown) {
-            co_return make_error(resource(),
-                                 error_code_t::invalid_parameter,
-                                 "COPY ... TO: cannot determine file format for '" + ext.location() + "'");
+            co_return core::error_t(
+                error_code_t::invalid_parameter,
+                otterstax::concat(resource(), {"COPY ... TO: cannot determine file format for '", ext.location(), "'"}));
         }
         // Refused before the query runs: there is nowhere to write its result.
         if (to_s3 && !transfers_->has_s3(alias)) {
-            co_return make_error(resource(),
-                                 error_code_t::do_not_exists,
-                                 "COPY ... TO failed: open_output: unknown alias '" + alias + "'");
+            co_return core::error_t(
+                error_code_t::do_not_exists,
+                otterstax::concat(resource(), {"COPY ... TO failed: open_output: unknown alias '", alias, "'"}));
         }
     }
 

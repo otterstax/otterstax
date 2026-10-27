@@ -518,11 +518,9 @@ TEST_CASE("mysql driver: destroying a driver whose server went away does not ter
     }
 }
 
-// A stale socket — the server dropped the connection while it sat idle — is noticed by the
-// statement itself. The driver reconnects and repeats a read once; a statement marked
-// once() (a DML or DDL, whose lost answer may hide an applied change) is never repeated, so
-// the server sees no second session. The fake server drops every session right after its OK,
-// so the repeat fails as well; what is pinned is whether the driver reconnected at all.
+// A stale socket (the server dropped an idle connection) is noticed by the statement itself. The driver
+// reconnects and repeats a read once, never a statement marked once() (a DML or DDL). The fake server
+// drops every session after its OK, so the repeat fails too; what is pinned is whether it reconnected.
 TEST_CASE("mysql driver: a stale connection repeats a read once and never a statement marked once") {
     auto* resource = std::pmr::new_delete_resource();
     const auto stale_execute = [resource](conn::statement_t statement) {

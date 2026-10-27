@@ -64,7 +64,7 @@ namespace otterstax::catalog {
     // through the regular plan-driven generator — the single quoting point.
     // The always-false predicate is two bound parameters, so no fake column
     // identifier appears in the generated SQL.
-    core::result_wrapper_t<std::string>
+    core::result_wrapper_t<std::pmr::string>
     make_schema_probe_query(std::pmr::memory_resource* resource, const qualified_name_t& name, backend_type_t backend);
 
     // Per-table discovery failures are collected and folded into one hard

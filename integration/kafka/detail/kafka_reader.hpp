@@ -16,14 +16,18 @@
 #include <cstdint>
 #include <map>
 #include <memory_resource>
+#include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace otterstax::kafka::detail {
-    // JSON message values -> data_chunk_t with `columns`. A payload that isn't a JSON
-    // object, misses a column, or has a value that does not fit the column (wrong
-    // JSON kind, integer outside the column's range) is dropped with a logged
-    // error; a JSON null is a SQL NULL. Never throws. Pure apart from the log
+    // Converts JSON message values to a data_chunk_t with `columns`. A payload that is not an object,
+    // misses a column or has a value that does not fit is dropped with a logged error; JSON null is
+    // SQL NULL. Never throws. The payloads are views of the consumed record: nothing is copied.
+    components::vector::data_chunk_t json_to_chunk(std::pmr::memory_resource* resource,
+                                                   const std::vector<kafka_column_t>& columns,
+                                                   std::span<const std::string_view> payloads);
     components::vector::data_chunk_t json_to_chunk(std::pmr::memory_resource* resource,
                                                    const std::vector<kafka_column_t>& columns,
                                                    const std::vector<std::string>& payloads);

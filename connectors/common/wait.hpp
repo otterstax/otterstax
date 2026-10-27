@@ -6,7 +6,12 @@
 #include "pool_config.hpp"
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdint>
 #include <memory>
+#include <mutex>
+#include <memory_resource>
 
 namespace conn {
 
@@ -17,16 +22,9 @@ namespace conn {
     };
     using wait_ticket_ptr = std::shared_ptr<wait_ticket_t>;
 
-    // An owner that parks while it is suspended on a pool answer instead of being polled: a
-    // Worker. actor-zeta 1.2.0 keeps an actor whose behavior awaits an unsettled future
-    // scheduled and re-runs it until the future settles — a busy loop through the
-    // scheduler's queue. An owner told which request it is suspended on can leave the
-    // scheduler instead, and the request's waker brings it back.
-    //
-    // The protocol, per request: `watch(ticket)` makes the waker the request is submitted
-    // with; right before the owner's coroutine suspends on the answer it calls
-    // `suspending_on(ticket)`, right after it resumed `resumed()`. An owner that polls on its
-    // own (CatalogManager's enqueue_impl, otterstax::test::drive) needs none of this.
+    // Lets a Worker park on a pool answer instead of being polled: actor-zeta 1.2.0 re-runs an
+    // actor awaiting an unsettled future, so a ticket lets it leave and its waker brings it back.
+    // Per request: watch(ticket) builds the waker, suspending_on(ticket) before the suspend, resumed() after.
     class wait_owner_t {
     public:
         virtual ~wait_owner_t() = default;
@@ -37,33 +35,74 @@ namespace conn {
         virtual void resumed() noexcept = 0;
     };
 
-    // The protocol above, for every awaiter of a pool request (db::backend_t, the Worker's
-    // transfers):
-    //
-    //     auto watched = conn::watch(owner);
-    //     auto answer = pool.submit(request, std::move(watched.waker));
-    //     conn::suspended_on_t suspended(owner, watched.ticket, answer.is_ready());
-    //     auto outcome = co_await std::move(answer);
-    //
-    // Without an owner (null) the waker is empty and nothing is reported.
+    // Used by every awaiter of a pool request: watch, submit with the waker, suspended_on_t, co_await.
+    // A null owner gives an empty waker. The ticket lives on `resource`, which must be thread-safe:
+    // the pool thread may release it last.
     struct watched_t {
         waker_t waker;          // the request is submitted with it
         wait_ticket_ptr ticket; // what the owner suspends on
     };
 
-    inline watched_t watch(wait_owner_t* owner) {
+    inline watched_t watch(wait_owner_t* owner, std::pmr::memory_resource* resource) {
         if (owner == nullptr) {
             return {};
         }
-        auto ticket = std::make_shared<wait_ticket_t>();
+        auto ticket = std::allocate_shared<wait_ticket_t>(std::pmr::polymorphic_allocator<wait_ticket_t>(resource));
         auto waker = owner->watch(ticket);
         return {std::move(waker), std::move(ticket)};
     }
 
-    // Reports the owner suspended on `ticket` while it lives, when the answer is not there
-    // yet: constructed right before the co_await, destroyed right after it resumes — or with
-    // the coroutine frame, so an owner whose coroutine is destroyed mid-wait is not left
-    // waiting on a ticket.
+    // The owner of a thread that drives its own coroutine to completion (CatalogManager::enqueue_impl):
+    // instead of spinning while a pool answer is outstanding, it sleeps until the answer's waker counts it.
+    // Read answers() before checking readiness, then wait_after() it, so an answer in between is not missed.
+    class blocking_owner_t final : public wait_owner_t {
+    public:
+        waker_t watch(wait_ticket_ptr ticket) override {
+            return [state = state_, ticket = std::move(ticket)] {
+                ticket->settled.store(true);
+                {
+                    std::lock_guard guard(state->mutex);
+                    ++state->answers;
+                }
+                state->answered.notify_all();
+            };
+        }
+        void suspending_on(wait_ticket_ptr ticket) override {
+            std::lock_guard guard(state_->mutex);
+            state_->waiting_on = std::move(ticket);
+        }
+        void resumed() noexcept override {
+            std::lock_guard guard(state_->mutex);
+            state_->waiting_on.reset();
+        }
+
+        std::uint64_t answers() const {
+            std::lock_guard guard(state_->mutex);
+            return state_->answers;
+        }
+
+        // Until an answer arrives after `seen`. Suspended on a watched pool answer, its waker ends the
+        // wait (1 s is only a safety net); a wait on anything else is polled every `poll`.
+        void wait_after(std::uint64_t seen, std::chrono::microseconds poll) const {
+            std::unique_lock lock(state_->mutex);
+            const std::chrono::microseconds limit = state_->waiting_on ? std::chrono::seconds(1) : poll;
+            state_->answered.wait_for(lock, limit, [&] { return state_->answers != seen; });
+        }
+
+    private:
+        // Shared with the wakers, so one that outlives the owner stays valid.
+        struct state_t {
+            std::mutex mutex;
+            std::condition_variable answered;
+            std::uint64_t answers{0};
+            wait_ticket_ptr waiting_on; // the watched answer the coroutine is suspended on, if any
+        };
+        std::shared_ptr<state_t> state_ = std::make_shared<state_t>();
+    };
+
+    // Reports the owner suspended on `ticket` while it lives, when the answer is not ready:
+    // constructed before the co_await, destroyed after it resumes or with the coroutine frame,
+    // so an owner whose coroutine is destroyed mid-wait is not left waiting on a ticket.
     class suspended_on_t {
     public:
         suspended_on_t(wait_owner_t* owner, const wait_ticket_ptr& ticket, bool ready)

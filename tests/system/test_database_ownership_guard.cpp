@@ -61,12 +61,9 @@ namespace {
 
     using otterstax::test::wait_until_ready;
 
-    // Real engine, real parser, real catalog; the MySQL connection is a mock
-    // driver registered under kUid before any Worker exists. Whole-database
-    // discovery over the mock lists no tables, so the registration creates the
-    // engine database for the uid and enters the uid in the catalog's connection
-    // registry. The stack is the production shape minus pg/ch/s3/file/kafka,
-    // which this DDL never reaches.
+    // Real engine, parser and catalog; the MySQL connection is a mock driver registered under kUid
+    // before any Worker exists. Discovery lists no tables, so registration creates the engine database
+    // and enters the uid in the catalog. Production shape minus pg/ch/s3/file/kafka, which this DDL skips.
     class guarded_stack_owner : public otterstax::test::backend_stack_owner {
     public:
         explicit guarded_stack_owner(const std::string& data_dir)
@@ -77,7 +74,9 @@ namespace {
         // The catalog's own verdict on a name, bypassing the Worker.
         core::error_t catalog_verdict(const std::string& dbname) {
             auto [needs_sched, future] =
-                actor_zeta::send(catalog(), &mysql::CatalogManager::check_database_ownership, dbname);
+                actor_zeta::send(catalog(),
+                                 &mysql::CatalogManager::check_database_ownership,
+                                 std::pmr::string(dbname, std::pmr::new_delete_resource()));
             wait_until_ready(future);
             return std::move(future).take_ready();
         }

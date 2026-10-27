@@ -52,10 +52,9 @@ namespace conn::s3 {
             return arrow::fs::S3FileSystem::Make(opts, arrow::io::IOContext(tsl::arrow_pool(res)));
         }
 
-        // Aborts an upload on every exit that did not Close() it: Arrow's S3 stream completes
-        // the upload from its destructor, so a failed COPY would publish a truncated object.
-        // Arrow marks the stream closed on every Close() outcome; only a successful one
-        // completes the upload.
+        // Aborts an upload that was not Close()d: Arrow's S3 stream completes the upload from its
+        // destructor, so a failed COPY would publish a truncated object. Only a successful Close()
+        // completes it.
         struct upload_guard_t {
             std::shared_ptr<arrow::io::OutputStream> stream;
 
@@ -85,8 +84,7 @@ namespace conn::s3 {
         if (params.access_key.empty() || params.secret_key.empty()) {
             return tsl::make_error(resource,
                                    core::error_code_t::invalid_parameter,
-                                   "s3: access_key and secret_key are required for alias '" +
-                                       std::string{std::string_view{params.alias}} + "'");
+                                   {"s3: access_key and secret_key are required for alias '", params.alias, "'"});
         }
         if (auto status = arrow::fs::EnsureS3Initialized(); !status.ok() && log.is_valid()) {
             log->warn("EnsureS3Initialized: {}", status.ToString());
@@ -95,14 +93,14 @@ namespace conn::s3 {
         if (!made.ok()) {
             return tsl::arrow_error(resource, core::error_code_t::io_error, "s3: building the filesystem", made.status());
         }
-        return std::make_shared<driver_t>(resource, std::string{std::string_view{params.alias}}, std::move(*made));
+        return std::make_shared<driver_t>(resource, params.alias, std::move(*made));
     }
 
     driver_t::driver_t(std::pmr::memory_resource* resource,
-                       std::string alias,
+                       std::string_view alias,
                        std::shared_ptr<arrow::fs::S3FileSystem> fs)
         : resource_(resource)
-        , alias_(std::move(alias))
+        , alias_(alias, resource)
         , fs_(std::move(fs)) {
         assert(resource_ != nullptr);
         assert(fs_ != nullptr);
@@ -124,7 +122,7 @@ namespace conn::s3 {
 
     transfer_outcome_t driver_t::load(const load_t& job) {
         OTX_ZONE_N("s3::driver::load");
-        auto opened = fs_->OpenInputFile(job.location);
+        auto opened = fs_->OpenInputFile(std::string(job.location)); // Arrow takes a std::string
         if (!opened.ok()) {
             return tsl::arrow_error(resource_, core::error_code_t::io_error, "open_input", opened.status());
         }
@@ -144,9 +142,9 @@ namespace conn::s3 {
         if (!job.result) {
             return tsl::make_error(resource_,
                                    core::error_code_t::invalid_parameter,
-                                   "export: no result to write to s3://" + job.location);
+                                   {"export: no result to write to s3://", job.location});
         }
-        auto opened = fs_->OpenOutputStream(job.location);
+        auto opened = fs_->OpenOutputStream(std::string(job.location)); // Arrow takes a std::string
         if (!opened.ok()) {
             return tsl::arrow_error(resource_, core::error_code_t::io_error, "open_output", opened.status());
         }

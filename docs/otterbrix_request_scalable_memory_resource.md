@@ -145,11 +145,39 @@ Any of these would remove the cap; they are listed from least to most work.
 
 ## What OtterStax does in the meantime
 
-OtterStax is moving its own work off the shared pool:
-- decoding backend rows and building its chunks on a resource of its own instead of
-  `dispatcher()->resource()`, which takes its traffic off the engine's lock;
-- with mimalloc as the process `malloc`, whose cheap cross-thread frees suit chunks that are
-  built on one thread and freed on another.
+OtterStax has moved its own work off the shared pool:
+- backend rows are decoded and their chunks built on a resource of its own (the "data
+  resource", `ComponentManager`'s customization point, `new_delete_resource()` by default)
+  instead of `dispatcher()->resource()`, which takes that traffic off the engine's lock;
+- the connection pools — their request state, the per-request wait ticket, the generated SQL
+  text and the transfer requests — live on the same data resource, not on the engine's pool,
+  since many Workers' statements allocate there at once;
+- the decoders write a STRING cell straight into the vector (`vector_t::set_value(row,
+  std::string_view)`), which bypasses `logical_value_t` and its heap string (below).
 
 The engine's own allocations stay on the shared pool, so concurrent JOINs inside the engine
 still contend with each other. That part needs one of the changes above.
+
+## Related: allocations a string value makes, and an allocator a type keeps
+
+Two further engine behaviours bear on where memory comes from; neither needs the pool change,
+both would ideally be covered by the same "the embedder's resource is used" rule.
+
+- **A string `logical_value_t` allocates on the global heap, whatever resource it is given.**
+  Its constructors from `std::string`, `std::pmr::string` and `std::string_view`
+  (`components/types/logical_value.hpp`) store the text as `heap_new<std::string>(...)`: one
+  heap block for the `std::string` object and one for its buffer once the text is past the
+  short-string size. The `resource` argument is kept but not used for the text. Every string a
+  translator or a plan parameter builds through a value object therefore costs two global
+  allocations before the vector copies the text into its own string buffer. OtterStax writes its
+  decoded STRING cells through the typed `vector_t::set_value(row, std::string_view)` instead,
+  which copies once into the vector's buffer on the chunk's resource; nested values (a STRUCT
+  field, a LIST element) still have to go through a value object. Asked: build the text on the
+  value's `resource` (a `std::pmr::string`), or let `set_value` of a nested value take views.
+- **A STRUCT type keeps the allocator of the field vector it was built from.**
+  `struct_logical_type_extension` copies `fields` with `fields.get_allocator()`
+  (`components/types/types.cpp`, `fields_(fields, fields.get_allocator())`), so the type points
+  into whatever resource the caller used — a scratch arena the caller releases leaves the type
+  dangling. OtterStax keeps every vector it hands `create_struct` on a long-lived resource for
+  that reason (`utility/stack_arena.hpp` documents it). Asked: copy with the type's own
+  resource, or document that the fields' resource must outlive the type.

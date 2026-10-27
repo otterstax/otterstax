@@ -5,6 +5,7 @@
 
 #include "otterbrix/parser/parser.hpp"
 
+#include <memory_resource>
 #include <string>
 #include <string_view>
 
@@ -40,12 +41,13 @@ namespace db {
     // refuses it (ER_DUP_FIELDNAME). A slot statement is one table's projection
     // or a sub-query the user already wrote as a derived table, so neither
     // carries duplicates.
-    inline std::string make_prepare_probe(std::string_view statement, backend_type_t backend) {
+    inline std::pmr::string
+    make_prepare_probe(std::pmr::memory_resource* resource, std::string_view statement, backend_type_t backend) {
         while (!statement.empty() &&
                (statement.back() == ';' || statement.back() == ' ' || statement.back() == '\n')) {
             statement.remove_suffix(1);
         }
-        std::string probe;
+        std::pmr::string probe(resource);
         probe.reserve(statement.size() + kPrepareProbeAlias.size() + 32);
         probe.append("SELECT * FROM (");
         probe.append(statement);

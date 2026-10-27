@@ -39,27 +39,21 @@ namespace pg {
     };
     using PGConnPtr = std::unique_ptr<PGconn, PGConnDeleter>;
 
-    // A statement's raw answer decoded as the statement asks, under the connection's ENUM
-    // map: rows through tsl::pg_to_chunk (a DML's command tag becomes the affected-row
-    // carrier there), the schema through tsl::pg_to_struct — none for a result without
-    // columns — and the count from the command tag. A free function so a test driver
-    // answering canned PGresults decodes them exactly as the driver does.
+    // A statement's raw answer decoded as the statement asks, under the connection's ENUM map: rows
+    // (pg_to_chunk), schema (pg_to_struct) and the count from the command tag. A free function so a
+    // test driver decodes canned PGresults exactly as the driver does.
     conn::statement_outcome_t
     decode(std::pmr::memory_resource* resource, PGresult* result, const conn::statement_t& statement);
 
-    // One PostgreSQL connection over libpq (15), sync from the outside.
-    //
-    // Blocking PQexec has no deadline: a backend that stops answering mid-statement held
-    // the thread for good. The driver runs the same exchange through libpq's asynchronous
-    // API on a non-blocking connection — PQsendQuery, PQflush, PQconsumeInput / PQisBusy,
-    // PQgetResult — and waits on the socket with poll() against one deadline per statement.
-    // On expiry the connection is closed (PQfinish), the statement is not repeated, and the
-    // server is told to cancel it (PQcancel, the protocol's CancelRequest): closing
-    // the socket alone leaves the statement running — a DML that may still commit, and a
-    // server connection outside the pool's max_size — until the server next writes to it.
+    // One PostgreSQL connection over libpq (15), sync from the outside. It runs the statement through
+    // libpq's asynchronous API and poll() against one deadline, since blocking PQexec has none. On expiry
+    // it closes the connection (PQfinish), does not repeat the statement and sends PQcancel: closing the
+    // socket alone would leave the statement running outside the pool's max_size.
     class driver_t final : public conn::IDriver {
     public:
-        driver_t(std::pmr::memory_resource* resource, connect_params params, std::string alias);
+        // `params` is the startup config descriptor (std::string); the alias is copied onto
+        // `resource`.
+        driver_t(std::pmr::memory_resource* resource, connect_params params, std::string_view alias);
         ~driver_t() override;
 
         core::error_t connect() override;
@@ -70,7 +64,7 @@ namespace pg {
         std::unique_ptr<conn::IDriver> clone_disconnected() const override;
 
         const connect_params& params() const noexcept { return params_; }
-        const std::string& alias() const noexcept { return alias_; }
+        std::string_view alias() const noexcept { return alias_; }
 
     private:
         using clock = std::chrono::steady_clock;
@@ -95,21 +89,22 @@ namespace pg {
         // the statement on the server.
         void drop_connection(failure_kind kind);
         void cancel_on_server();
+        // `sql` is NUL-terminated (a std::pmr::string or a literal): libpq takes a C string.
         sent_t send(std::string_view sql, std::chrono::milliseconds limit);
         failure_t transport_failure(std::string_view sql) const;
         failure_t timeout_failure(std::string_view sql) const;
         core::error_t query_error(const PGresult* result, std::string_view sql) const;
-        core::error_t connection_error(std::string_view what) const;
+        core::error_t connection_error(std::pmr::string what) const;
 
         log_t log_;
         std::pmr::memory_resource* resource_;
         connect_params params_;
-        std::string alias_;
+        std::pmr::string alias_;
         PGConnPtr conn_; // null: not connected
     };
 
     // A disconnected driver: the prototype connection_pool_t::add clones every connection from.
     std::unique_ptr<conn::IDriver>
-    make_driver(std::pmr::memory_resource* resource, connect_params params, std::string alias);
+    make_driver(std::pmr::memory_resource* resource, connect_params params, std::string_view alias);
 
 } // namespace pg

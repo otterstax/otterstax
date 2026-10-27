@@ -31,6 +31,7 @@ namespace {
         std::atomic<int> max_in_flight{0};
         std::atomic<bool> fail_connect{false};
         std::chrono::milliseconds delay{0};
+        std::atomic<int> connect_delay_ms{0}; // how long connect() takes
     };
 
     class mock_driver_t final : public conn::IDriver {
@@ -41,6 +42,9 @@ namespace {
 
         core::error_t connect() override {
             ++script_->connects;
+            if (const int ms = script_->connect_delay_ms; ms > 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+            }
             if (script_->fail_connect) {
                 return core::error_t(core::error_code_t::io_error, std::pmr::string{"refused", resource_});
             }
@@ -96,7 +100,7 @@ namespace {
         }
 
         conn::statement_outcome_t run(const std::string& alias, std::string sql) {
-            return drive(&resource, pool.execute(alias, conn::statement_t::rows(std::move(sql))));
+            return drive(&resource, pool.execute(alias, conn::statement_t::rows(std::pmr::string(sql, &resource))));
         }
     };
 
@@ -195,6 +199,30 @@ TEST_CASE("connection_pool: connections above min_size close after idle_timeout"
     CHECK(f.pool.find("a")->open_sessions() == 1);
     CHECK(f.script->closes >= 1);
     // The floor keeps serving.
+    CHECK_FALSE(f.run("a", "SELECT 1").has_error());
+}
+
+// The last open session must not close for idleness while a second one is still connecting:
+// if that connect then fails, the pool would have no session and nothing to grow it again.
+TEST_CASE("connection_pool: a connect in flight does not count toward min_size") {
+    fixture_t f;
+    f.script->delay = 50ms;
+    auto cfg = config(1, 2);
+    cfg.idle_timeout = 100ms;
+    cfg.connect_backoff = 10s;
+    cfg.queue_timeout = 2s;
+    f.add("a", cfg);
+    f.script->connect_delay_ms = 600; // the grown session connects for longer than the idle timeout
+    f.script->fail_connect = true;
+    std::vector<conn::statement_future_t> futures;
+    for (int i = 0; i < 2; ++i) {
+        futures.push_back(f.pool.execute("a", conn::statement_t::rows("SELECT 1")));
+    }
+    for (auto& future : futures) {
+        REQUIRE_FALSE(drive(&f.resource, std::move(future)).has_error());
+    }
+    std::this_thread::sleep_for(900ms); // the open session idles past its timeout, the connect fails
+    CHECK(f.pool.find("a")->open_sessions() == 1);
     CHECK_FALSE(f.run("a", "SELECT 1").has_error());
 }
 

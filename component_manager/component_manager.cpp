@@ -48,10 +48,9 @@ namespace {
         };
     }
 
-    // Opens the alias's pool, then has the catalog discover its tables (`scope`). A
-    // connection whose schema could not be registered is unusable for federated SQL, so its
-    // pool is dropped again. The catalog answers synchronously: its handler runs to
-    // completion on this thread, awaiting the discovery statements the pool runs.
+    // Opens the alias's pool, then has the catalog discover its tables (`scope`); a connection
+    // whose schema could not be registered is unusable, so its pool is dropped again. The catalog
+    // answers on this thread: its handler runs to completion, awaiting the pool's discovery statements.
     core::result_wrapper_t<std::string> open_backend(std::pmr::memory_resource* resource,
                                                      log_t& log,
                                                      conn::connection_pool_t& pool,
@@ -84,9 +83,12 @@ namespace {
     }
 } // namespace
 
-ComponentManager::ComponentManager(const configuration::config& config, const config::ConnectionsConfig& connections)
+ComponentManager::ComponentManager(const configuration::config& config,
+                                   const config::ConnectionsConfig& connections,
+                                   std::pmr::memory_resource* data_resource)
     : engine_(new db::otterbrix_engine_t(config))
     , resource_(engine_->dispatcher()->resource())
+    , data_resource_(data_resource)
     , aliases_(make_alias_registry(connections)) {
     OTX_ZONE_N("ComponentManager::init");
 
@@ -109,10 +111,12 @@ ComponentManager::ComponentManager(const configuration::config& config, const co
         catalog_manager_ = actor_zeta::spawn<mysql::CatalogManager>(resource_, otterbrix_manager_->address(), aliases_);
         assert(catalog_manager_ != nullptr && "catalog manager must not be null");
 
-        // The pools stay empty until register_connections; the catalog discovers
-        // through its own backends over them.
-        backends_ = std::make_unique<db::backend_registry_t>(resource_);
-        catalog_backends_ = std::make_unique<db::backend_set_t>(resource_, *backends_);
+        // The pools stay empty until register_connections; the catalog discovers through its own
+        // backends over them. Allocated on the data resource, not the engine's synchronized pool:
+        // every statement allocates its request state, ticket and SQL there from many threads.
+        backends_ = std::make_unique<db::backend_registry_t>(data_resource_);
+        catalog_backends_ =
+            std::make_unique<db::backend_set_t>(resource_, *backends_, catalog_manager_->wait_owner());
         catalog_manager_->set_backends({&catalog_backends_->mysql,
                                         &catalog_backends_->postgresql,
                                         &catalog_backends_->clickhouse});
@@ -207,7 +211,7 @@ core::error_t ComponentManager::register_connections(const config::ConnectionsCo
                                     backends_->mysql,
                                     catalog_manager_->address(),
                                     c.alias,
-                                    mysql::make_driver(resource_, std::move(params), c.alias),
+                                    mysql::make_driver(data_resource_, std::move(params), c.alias),
                                     c.pool,
                                     qualified_name_t(c.alias, c.database, "", ""),
                                     catalog_ext::ConnectionType::MySQL);
@@ -243,7 +247,7 @@ core::error_t ComponentManager::register_connections(const config::ConnectionsCo
                                     backends_->postgresql,
                                     catalog_manager_->address(),
                                     c.alias,
-                                    pg::make_driver(resource_, std::move(params), c.alias),
+                                    pg::make_driver(data_resource_, std::move(params), c.alias),
                                     c.pool,
                                     qualified_name_t(c.alias, c.database, c.schema.empty() ? "public" : c.schema, c.table),
                                     catalog_ext::ConnectionType::PostgreSQL);
@@ -280,7 +284,7 @@ core::error_t ComponentManager::register_connections(const config::ConnectionsCo
                                     backends_->clickhouse,
                                     catalog_manager_->address(),
                                     c.alias,
-                                    ch::make_driver(resource_, std::move(params), c.alias),
+                                    ch::make_driver(data_resource_, std::move(params), c.alias),
                                     c.pool,
                                     qualified_name_t(c.alias, c.database, "", c.table),
                                     catalog_ext::ConnectionType::ClickHouse);
@@ -292,7 +296,7 @@ core::error_t ComponentManager::register_connections(const config::ConnectionsCo
     }
 
     // Local files need no connection: the pool only bounds how many transfers run at once.
-    if (auto err = backends_->transfers.set_files(std::make_shared<conn::file::driver_t>(resource_),
+    if (auto err = backends_->transfers.set_files(std::make_shared<conn::file::driver_t>(data_resource_),
                                                   to_pool_config(file_transfers));
         err.contains_error()) {
         log->error("Failed to open the local-file transfer pool: {}", err.what.c_str());
@@ -310,7 +314,7 @@ core::error_t ComponentManager::register_connections(const config::ConnectionsCo
             .endpoint = std::pmr::string{std::string_view{c.endpoint}, resource_},
             .alias = std::pmr::string{std::string_view{c.alias}, resource_},
         };
-        auto driver = conn::s3::driver_t::make(resource_, params, std::chrono::milliseconds(c.connect_timeout_ms));
+        auto driver = conn::s3::driver_t::make(data_resource_, params, std::chrono::milliseconds(c.connect_timeout_ms));
         if (driver.has_error()) {
             log->error("Failed to register s3 alias '{}': {}", c.alias, driver.error().what.c_str());
             return driver.error();

@@ -11,6 +11,7 @@
 
 #include <components/types/logical_value.hpp>
 #include <components/types/types.hpp>
+#include <components/vector/vector.hpp>
 #include <core/date/date_to_string.hpp>
 
 #include <arrow/io/interfaces.h>
@@ -29,23 +30,30 @@ namespace {
 
 void write_escaped(std::ostream& out, std::string_view s) {
     static constexpr char hex[] = "0123456789abcdef";
-    for (unsigned char c : s) {
+    // Runs that need no escape go out in one write each, not a character at a time.
+    std::size_t run = 0;
+    for (std::size_t i = 0; i < s.size(); ++i) {
+        const auto c = static_cast<unsigned char>(s[i]);
+        if (c >= 0x20 && c != '"' && c != '\\') {
+            continue;
+        }
+        out.write(s.data() + run, static_cast<std::streamsize>(i - run));
+        run = i + 1;
         switch (c) {
             case '"':  out << "\\\""; break;
             case '\\': out << "\\\\"; break;
             case '\n': out << "\\n";  break;
             case '\r': out << "\\r";  break;
             case '\t': out << "\\t";  break;
-            default:
-                if (c < 0x20) {
-                    // JSON forbids raw control characters inside strings.
-                    out << "\\u00" << hex[c >> 4] << hex[c & 0x0f];
-                } else {
-                    out << static_cast<char>(c);
-                }
+            default: {
+                // JSON forbids raw control characters inside strings.
+                const char escape[] = {'\\', 'u', '0', '0', hex[c >> 4], hex[c & 0x0f]};
+                out.write(escape, sizeof(escape));
                 break;
+            }
         }
     }
+    out.write(s.data() + run, static_cast<std::streamsize>(s.size() - run));
 }
 
 template<typename T>
@@ -155,6 +163,62 @@ core::result_wrapper_t<bool> write_value(std::pmr::memory_resource* res,
     return true;
 }
 
+// One cell of `column`, read straight off the vector: no value object per cell, and a STRING is
+// the vector's own bytes. A DECIMAL and the temporal types take write_value, the value object
+// their renderers read.
+core::result_wrapper_t<bool> write_cell(std::pmr::memory_resource* res,
+                                        std::ostream& out,
+                                        const components::vector::vector_t& column,
+                                        uint64_t row,
+                                        const components::types::complex_logical_type& type) {
+    using components::types::logical_type;
+    using components::types::physical_type;
+    if (column.is_null(row)) {
+        out << "null";
+        return true;
+    }
+    switch (type.type()) {
+        case logical_type::DECIMAL:
+        case logical_type::DATE:
+        case logical_type::TIME:
+        case logical_type::TIMESTAMP:
+        case logical_type::TIMESTAMP_TZ:
+            return write_value(res, out, column.value(row), type.alias());
+        default:
+            break;
+    }
+    // The same cases, in the same spelling, as write_value's switch.
+    switch (type.to_physical_type()) {
+        case physical_type::BOOL:   out << (column.get_value<bool>(row) ? "true" : "false"); break;
+        case physical_type::INT8:   write_number(out, static_cast<int>(column.get_value<int8_t>(row))); break;
+        case physical_type::INT16:  write_number(out, column.get_value<int16_t>(row)); break;
+        case physical_type::INT32:  write_number(out, column.get_value<int32_t>(row)); break;
+        case physical_type::INT64:  write_number(out, column.get_value<int64_t>(row)); break;
+        case physical_type::UINT8:  write_number(out, static_cast<unsigned>(column.get_value<uint8_t>(row))); break;
+        case physical_type::UINT16: write_number(out, column.get_value<uint16_t>(row)); break;
+        case physical_type::UINT32: write_number(out, column.get_value<uint32_t>(row)); break;
+        case physical_type::UINT64: write_number(out, column.get_value<uint64_t>(row)); break;
+        case physical_type::INT128:
+            out << '"' << column.get_value<components::types::int128_t>(row) << '"';
+            break;
+        case physical_type::FLOAT:  write_floating(out, column.get_value<float>(row)); break;
+        case physical_type::DOUBLE: write_floating(out, column.get_value<double>(row)); break;
+        case physical_type::STRING:
+            out << '"';
+            write_escaped(out, column.get_value<std::string_view>(row));
+            out << '"';
+            break;
+        default:
+            out << "null";
+            break;
+    }
+    return true;
+}
+
+// A string stream whose buffer lives on a memory_resource.
+using pmr_ostringstream_t =
+    std::basic_ostringstream<char, std::char_traits<char>, std::pmr::polymorphic_allocator<char>>;
+
 } // namespace
 
 core::result_wrapper_t<bool> chunk_to_ndjson(std::pmr::memory_resource* res,
@@ -171,11 +235,11 @@ core::result_wrapper_t<bool> chunk_to_ndjson(std::pmr::memory_resource* res,
         }
     }
 
-    // Rows are serialised into a line buffer and handed to the sink in pieces of about
-    // flush_bytes, so a long result never sits in memory whole and an S3 sink receives
-    // part-sized writes.
+    // Rows are serialised into a line buffer handed to the sink in pieces of about flush_bytes, so a long
+    // result never sits in memory whole. One buffer on `res` serves the export: a flush takes it out of
+    // the stream, empties it and puts it back, keeping its capacity.
     constexpr std::streamoff flush_bytes = 1 << 20;
-    std::ostringstream out;
+    pmr_ostringstream_t out(std::ios_base::out, res);
     const auto flush = [&]() -> core::result_wrapper_t<bool> {
         const auto pending = out.view();
         if (pending.empty()) {
@@ -184,7 +248,9 @@ core::result_wrapper_t<bool> chunk_to_ndjson(std::pmr::memory_resource* res,
         if (auto status = sink->Write(pending.data(), static_cast<int64_t>(pending.size())); !status.ok()) {
             return arrow_error(res, core::error_code_t::io_error, "chunk_to_ndjson: write failed", status);
         }
-        out.str(std::string{});
+        auto buffer = std::move(out).str();
+        buffer.clear();
+        out.str(std::move(buffer));
         return true;
     };
 
@@ -193,10 +259,10 @@ core::result_wrapper_t<bool> chunk_to_ndjson(std::pmr::memory_resource* res,
         const size_t ncols = static_cast<size_t>(chunk.column_count());
         const size_t nrows = static_cast<size_t>(chunk.size());
         // Each column's `"name":` escaped once, not once per row.
-        std::vector<std::string> keys;
+        std::pmr::vector<std::pmr::string> keys(res);
         keys.reserve(ncols);
         for (size_t c = 0; c < ncols; c++) {
-            std::ostringstream key;
+            pmr_ostringstream_t key(std::ios_base::out, res);
             key << (c > 0 ? ",\"" : "\"");
             write_escaped(key, types[c].alias());
             key << "\":";
@@ -206,10 +272,7 @@ core::result_wrapper_t<bool> chunk_to_ndjson(std::pmr::memory_resource* res,
             out << '{';
             for (size_t c = 0; c < ncols; c++) {
                 out << keys[c];
-                auto written = write_value(res,
-                                           out,
-                                           chunk.value(static_cast<uint64_t>(c), static_cast<uint64_t>(r)),
-                                           types[c].alias());
+                auto written = write_cell(res, out, chunk.data[c], static_cast<uint64_t>(r), types[c]);
                 if (written.has_error()) {
                     return written;
                 }
@@ -227,7 +290,7 @@ core::result_wrapper_t<bool> chunk_to_ndjson(std::pmr::memory_resource* res,
 
 core::result_wrapper_t<bool> chunk_to_ndjson(std::pmr::memory_resource* res,
                                              const std::pmr::vector<components::vector::data_chunk_t>& chunks,
-                                             const std::string& path) {
+                                             std::string_view path) {
     OTX_ZONE_N("tsl::chunk_to_ndjson(file)");
     return write_local_file(res, "chunk_to_ndjson", path, [&](const std::shared_ptr<arrow::io::OutputStream>& sink) {
         return chunk_to_ndjson(res, chunks, sink);

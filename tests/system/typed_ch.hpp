@@ -65,14 +65,14 @@ namespace otterstax::test {
         static answer rows(const std::vector<column>& columns, std::size_t count) {
             constexpr std::size_t first_block_rows = 2;
             const auto split = std::min(count, first_block_rows);
-            answer result;
+            answer result(std::pmr::new_delete_resource());
             result.blocks.push_back(block(columns, 0, split));
             result.blocks.push_back(block(columns, split, count));
             return result;
         }
 
         static answer discovery(std::string_view query) {
-            answer result;
+            answer result(std::pmr::new_delete_resource());
             if (query.find("system.columns") != std::string_view::npos) {
                 result.blocks.push_back(named_types());
             } else {
@@ -83,7 +83,7 @@ namespace otterstax::test {
 
         static core::result_wrapper_t<answer>
         describe(const std::vector<column>& columns, probe_mode mode, std::pmr::memory_resource* resource) {
-            answer result;
+            answer result(std::pmr::new_delete_resource());
             switch (mode) {
                 case probe_mode::header:
                     result.blocks.push_back(block(columns, 0, 0));

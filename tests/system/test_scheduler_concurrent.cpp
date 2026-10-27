@@ -111,7 +111,7 @@ namespace {
         }
 
         conn::statement_outcome_t execute(const conn::statement_t& statement) override {
-            ch::select_result_t answer;
+            ch::select_result_t answer(std::pmr::new_delete_resource());
             if (otterstax::test::is_discovery(statement)) {
                 answer.blocks.push_back(ch_header_block());
             }
@@ -196,11 +196,8 @@ TEST_CASE("scheduler handles N parallel sessions without hanging") {
     az_scheduler->stop();
 }
 
-// Parallel sessions against a deliberately slow MySQL mock driver. Each Worker
-// owns its backend and only awaits the statement it sent to the alias's pool,
-// which runs up to max_size (4 by default) statements side by side on as many
-// connections — so SESSIONS slow statements overlap instead of queueing behind
-// one another.
+// Parallel sessions against a slow MySQL mock driver. Each Worker awaits only its own statement,
+// and the alias's pool runs up to max_size statements at once, so slow statements overlap.
 TEST_CASE("slow MySQL connector does not starve other sessions") {
     using namespace std::chrono_literals;
 
@@ -295,12 +292,9 @@ namespace {
     }
 } // namespace
 
-// A Worker whose statement waits on a slow backend leaves the scheduler (Worker::resume parks
-// it, the answer's waker enqueues it again) instead of being re-run until the answer arrives
-// — the busy loop actor-zeta gives an awaiting actor, a core per waiting session. The process's
-// CPU time over the waits is what tells them apart: polled, one scheduler thread spins through
-// every wait; parked, the process is close to idle (the engine's and the Scheduler loop's
-// own 100 µs pumps aside).
+// A Worker waiting on a slow backend should park (leave the scheduler until the answer's
+// waker enqueues it) rather than be re-run in a busy loop. Counting how often the scheduler
+// runs a Worker tells the two apart; process CPU time is printed only, it is load-sensitive.
 TEST_CASE("a Worker waiting on a slow backend parks instead of spinning") {
     using namespace std::chrono_literals;
     constexpr auto wait = 400ms;
@@ -334,26 +328,60 @@ TEST_CASE("a Worker waiting on a slow backend parks instead of spinning") {
     run(1); // registration of the table, first connections
 
     const auto cpu_before = process_cpu_time();
+    const auto runs_before = Worker::runs();
     const auto started = std::chrono::steady_clock::now();
     for (int i = 0; i < statements; ++i) {
         run(static_cast<session_hash_t>(100 + i));
     }
     const auto wall = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started);
     const auto cpu = process_cpu_time() - cpu_before;
+    const auto runs = Worker::runs() - runs_before;
 
-    WARN("waits " << wall.count() << " ms, process CPU " << cpu.count() << " ms");
+    WARN("waits " << wall.count() << " ms, process CPU " << cpu.count() << " ms, Worker runs " << runs);
     REQUIRE(wall >= statements * wait);
-    // A spinning Worker alone would use most of a core for the whole wait.
-    CHECK(cpu.count() < wall.count() / 3);
+    // A handful of runs per statement when parked; a spinning Worker runs thousands of times
+    // in each 400 ms wait.
+    CHECK(runs < statements * 50);
 
     az_scheduler->stop();
 }
 
-// The PostgreSQL ENUM metadata is written by discovery (the catalog's
-// add_connection_schema, re-run here for an already registered table) and read
-// by every backend's execute — one backend per thread, as every Worker owns its
-// own over the shared pools and metadata. pg_metadata_t orders the two with a
-// shared_mutex; ThreadSanitizer checks the invariant while they interleave.
+// Discovery awaits pool answers on the sender's thread (CatalogManager::enqueue_impl). It should
+// sleep until the answer's waker wakes it, not spin on yield() for the whole round trip.
+TEST_CASE("the catalog sleeps while discovery waits on a slow backend") {
+    using namespace std::chrono_literals;
+    constexpr auto wait = 400ms;
+
+    db::otterbrix_engine_ptr otterbrix = init_default_test_otterbrix();
+    auto resource = otterbrix->dispatcher()->resource();
+    auto otterbrix_manager =
+        actor_zeta::spawn<db::OtterbrixManager>(resource,
+                                                std::make_unique<SimpleMockOtterbrixManager>(
+                                                    mock_config{.resource = resource}));
+    auto catalog_manager = actor_zeta::spawn<mysql::CatalogManager>(resource, otterbrix_manager->address(), no_aliases());
+    mock_backends backends(resource, *catalog_manager);
+
+    const auto waits_before = mysql::CatalogManager::idle_waits();
+    const auto started = std::chrono::steady_clock::now();
+    // A backend whose discovery query takes `wait`; registration runs discovery through the catalog.
+    auto driver = std::make_unique<otterstax::test::scripted_driver_t>(
+        [](const conn::statement_t&) -> conn::statement_outcome_t { return conn::statement_result_t{}; },
+        [wait](const conn::statement_t&) -> conn::statement_outcome_t {
+            std::this_thread::sleep_for(wait);
+            return conn::statement_result_t{};
+        });
+    REQUIRE_FALSE(
+        backends.add(backend_type_t::MySQL, "1", std::move(driver), qualified_name_t("1", "db", "", "")).contains_error());
+    const auto wall = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started);
+    const auto waits = mysql::CatalogManager::idle_waits() - waits_before;
+
+    WARN("discovery took " << wall.count() << " ms, catalog idle waits " << waits);
+    REQUIRE(wall >= wait);
+    CHECK(waits < 10); // about one per round trip
+}
+
+// PostgreSQL ENUM metadata is written by discovery and read by every backend's execute, one backend
+// per thread. pg_metadata_t orders the two with a shared_mutex; ThreadSanitizer checks it.
 TEST_CASE("PostgreSQL backends: parallel execute and re-discovery share no unsynchronised state") {
     constexpr size_t THREADS = 8;
     constexpr size_t ROUNDS = 6;

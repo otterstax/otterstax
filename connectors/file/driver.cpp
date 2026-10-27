@@ -30,9 +30,9 @@ namespace conn::file {
 
     core::result_wrapper_t<components::vector::data_chunk_t>
     load_chunk(std::pmr::memory_resource* resource,
-               const std::string& path,
+               std::string_view path,
                const std::shared_ptr<arrow::io::RandomAccessFile>& input,
-               const std::string& format) {
+               std::string_view format) {
         OTX_ZONE_N("file::load_chunk");
         switch (resolve_format(format, path)) {
             case FileFormat::Parquet:
@@ -44,15 +44,13 @@ namespace conn::file {
             case FileFormat::Unknown:
                 break;
         }
-        return tsl::make_error(resource,
-                               core::error_code_t::invalid_parameter,
-                               "load: cannot determine format for: " + path);
+        return tsl::make_error(resource, core::error_code_t::invalid_parameter, {"load: cannot determine format for: ", path});
     }
 
     core::result_wrapper_t<bool> write_chunks(std::pmr::memory_resource* resource,
                                               FileFormat format,
                                               const std::pmr::vector<components::vector::data_chunk_t>& chunks,
-                                              const std::string& path,
+                                              std::string_view path,
                                               const std::shared_ptr<arrow::io::OutputStream>& sink) {
         OTX_ZONE_N("file::write_chunks");
         switch (format) {
@@ -65,7 +63,7 @@ namespace conn::file {
             case FileFormat::Unknown:
                 break;
         }
-        return tsl::make_error(resource, core::error_code_t::invalid_parameter, "export: unknown format for: " + path);
+        return tsl::make_error(resource, core::error_code_t::invalid_parameter, {"export: unknown format for: ", path});
     }
 
     driver_t::driver_t(std::pmr::memory_resource* resource)
@@ -91,7 +89,7 @@ namespace conn::file {
                     if (!job.result) {
                         return tsl::make_error(resource_,
                                                core::error_code_t::invalid_parameter,
-                                               "export: no result to write to " + job.location);
+                                               {"export: no result to write to ", job.location});
                     }
                     auto written = write_chunks(resource_, job.format, job.result->chunks(), job.location, nullptr);
                     if (written.has_error()) {

@@ -7,6 +7,7 @@
 
 #include "otterbrix/translators/input/pg_to_chunk.hpp"
 #include "utility/logger.hpp"
+#include "utility/pmr_text.hpp"
 #include "utility/tracy_profiler.hpp"
 
 #include <poll.h>
@@ -86,67 +87,76 @@ namespace pg {
         return std::move(out);
     }
 
-    driver_t::driver_t(std::pmr::memory_resource* resource, connect_params params, std::string alias)
+    driver_t::driver_t(std::pmr::memory_resource* resource, connect_params params, std::string_view alias)
         : log_(get_logger(logger_tag::CONNECTOR))
         , resource_(resource)
         , params_(std::move(params))
-        , alias_(std::move(alias)) {
+        , alias_(alias, resource) {
         assert(log_.is_valid());
         assert(resource_ != nullptr);
     }
 
     driver_t::~driver_t() { close(); }
 
-    core::error_t driver_t::connection_error(std::string_view what) const {
-        return core::error_t(core::error_code_t::io_error, std::pmr::string{what.data(), what.size(), resource_});
+    core::error_t driver_t::connection_error(std::pmr::string what) const {
+        return core::error_t(core::error_code_t::io_error, std::move(what));
     }
 
     core::error_t driver_t::query_error(const PGresult* result, std::string_view sql) const {
         const char* sqlstate = PQresultErrorField(result, PG_DIAG_SQLSTATE);
         const char* message = PQresultErrorMessage(result);
         const std::string_view state = sqlstate ? sqlstate : "";
-        std::string what = "[Run query] Alias: " + alias_ + " query [" + std::string(sql) + "] failed";
+        auto what = otterstax::concat(resource_, {"[Run query] Alias: ", alias_, " query [", sql, "] failed"});
         if (!state.empty()) {
-            what += " (SQLSTATE " + std::string(state) + ")";
+            what += " (SQLSTATE ";
+            what += state;
+            what += ")";
         }
         what += ": ";
         what += message ? message : "no server message";
-        log_->error(what);
-        return core::error_t(classify_sqlstate(state), std::pmr::string{what.c_str(), resource_});
+        log_->error(std::string_view(what));
+        return core::error_t(classify_sqlstate(state), std::move(what));
     }
 
     driver_t::failure_t driver_t::transport_failure(std::string_view sql) const {
-        std::string what = "[Run query] Alias: " + alias_ + " query [" + std::string(sql) + "] failed: ";
-        what += conn_ ? PQerrorMessage(conn_.get()) : "not connected";
-        log_->error(what);
-        return {connection_error(what), failure_kind::stale};
+        auto what = otterstax::concat(resource_,
+                                      {"[Run query] Alias: ",
+                                       alias_,
+                                       " query [",
+                                       sql,
+                                       "] failed: ",
+                                       conn_ ? PQerrorMessage(conn_.get()) : "not connected"});
+        log_->error(std::string_view(what));
+        return {connection_error(std::move(what)), failure_kind::stale};
     }
 
     driver_t::failure_t driver_t::timeout_failure(std::string_view sql) const {
-        const std::string what = "[Run query] Alias: " + alias_ + " query [" + std::string(sql) +
-                                 "] failed: the statement did not finish within its deadline";
-        log_->error(what);
-        return {connection_error(what), failure_kind::broken};
+        auto what = otterstax::concat(
+            resource_,
+            {"[Run query] Alias: ", alias_, " query [", sql, "] failed: the statement did not finish within its deadline"});
+        log_->error(std::string_view(what));
+        return {connection_error(std::move(what)), failure_kind::broken};
     }
 
     core::error_t driver_t::connect() {
         OTX_ZONE_N("pg::driver::connect");
         log_->debug("Alias: {} connecting to {}:{} dbname={}", alias_, params_.host, params_.port, params_.database);
-        conn_.reset(PQconnectdb(params_.connection_string().c_str()));
+        conn_.reset(PQconnectdb(params_.connection_string(resource_).c_str()));
         if (PQstatus(conn_.get()) != CONNECTION_OK) {
-            const std::string what =
-                "[Connector] Alias: " + alias_ + " connect failed " + std::string(PQerrorMessage(conn_.get()));
-            log_->warn(what);
+            auto what =
+                otterstax::concat(resource_, {"[Connector] Alias: ", alias_, " connect failed ", PQerrorMessage(conn_.get())});
+            log_->warn(std::string_view(what));
             conn_.reset();
-            return connection_error(what);
+            return connection_error(std::move(what));
         }
         // Non-blocking, so a send cannot block either: send() flushes against the deadline.
         if (PQsetnonblocking(conn_.get(), 1) != 0) {
-            const std::string what = "[Connector] Alias: " + alias_ + " cannot switch to non-blocking mode: " +
-                                     std::string(PQerrorMessage(conn_.get()));
-            log_->warn(what);
+            auto what = otterstax::concat(
+                resource_,
+                {"[Connector] Alias: ", alias_, " cannot switch to non-blocking mode: ", PQerrorMessage(conn_.get())});
+            log_->warn(std::string_view(what));
             conn_.reset();
-            return connection_error(what);
+            return connection_error(std::move(what));
         }
         return core::error_t::no_error();
     }
@@ -158,14 +168,10 @@ namespace pg {
         conn_.reset();
     }
 
-    // A statement past its deadline keeps running on the server after the socket closes —
-    // until the server next writes to it — so it is cancelled first. PQcancel sends the
-    // protocol's CancelRequest with this connection's cancel key on a socket of its own (what
-    // psql's ^C does); a pooler such as PgBouncer routes it to the right server connection,
-    // where a pg_cancel_backend(PQbackendPID()) over another connection would name the
-    // pooler's made-up pid. libpq 15 connects that socket without a timeout; the server
-    // answered this connection moments ago. Best-effort: a failure is logged and the
-    // statement's own deadline error stands.
+    // A statement past its deadline keeps running on the server after the socket closes, so it is
+    // cancelled first. PQcancel sends a CancelRequest on a socket of its own, which a pooler such as
+    // PgBouncer routes correctly (pg_cancel_backend would name the pooler's fake pid). libpq 15 connects
+    // it without a timeout; acceptable, as the server just answered. Best-effort: a failure is logged.
     void driver_t::cancel_on_server() {
         OTX_ZONE_N("pg::driver::cancel_on_server");
         PGcancel* cancel = PQgetCancel(conn_.get());
@@ -190,8 +196,8 @@ namespace pg {
         const auto deadline = clock::now() + limit;
         PGconn* conn = conn_.get();
         sent_t sent;
-        const std::string text{sql}; // libpq wants a NUL-terminated string
-        if (PQsendQuery(conn, text.c_str()) == 0) {
+        assert(sql.data()[sql.size()] == '\0');
+        if (PQsendQuery(conn, sql.data()) == 0) {
             sent.failure = transport_failure(sql);
             return sent;
         }
@@ -305,8 +311,8 @@ namespace pg {
     }
 
     std::unique_ptr<conn::IDriver>
-    make_driver(std::pmr::memory_resource* resource, connect_params params, std::string alias) {
-        return std::make_unique<driver_t>(resource, std::move(params), std::move(alias));
+    make_driver(std::pmr::memory_resource* resource, connect_params params, std::string_view alias) {
+        return std::make_unique<driver_t>(resource, std::move(params), alias);
     }
 
 } // namespace pg

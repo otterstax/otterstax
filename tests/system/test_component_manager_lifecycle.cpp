@@ -40,11 +40,8 @@ TEST_CASE("ComponentManager: constructed and destroyed with no database connecti
             auto registered = cmanager.register_connections(connections, config::ConnectionRetryConfig{});
             INFO("register_connections: " << registered.what.c_str());
             REQUIRE_FALSE(registered.contains_error());
-            // Building the alias's s3 driver initialises Arrow's S3 subsystem.
-            // Arrow requires the process to FinalizeS3 before exit or it may
-            // segfault during static teardown; the server does that through
-            // conn::s3::subsystem_finalizer_t in main.cpp, this binary through
-            // the listener in tests/system/main.cpp.
+            // Building the s3 driver initialises Arrow's S3 subsystem, which must be finalized before
+            // exit: the server does it in main.cpp, this binary in the listener in tests/system/main.cpp.
             REQUIRE(arrow::fs::IsS3Initialized());
         }
         REQUIRE(std::filesystem::exists(dir));

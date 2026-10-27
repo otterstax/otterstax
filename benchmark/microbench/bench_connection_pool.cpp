@@ -166,10 +166,9 @@ BENCHMARK(BM_pool_parallel)->Arg(1)->Arg(4)->Arg(8)->Arg(16)->UseRealTime()->Uni
 
 namespace {
 
-    // A cooperative actor whose one handler awaits a pool statement, shaped like a Worker
-    // awaiting a backend: the request carries actor_parking_t's waker and the coroutine
-    // reports the ticket it suspends on. With `parks` false its resume() is the base one, so
-    // actor-zeta keeps re-running it until the answer is there — the Worker before parking.
+    // A cooperative actor whose handler awaits a pool statement, shaped like a Worker awaiting
+    // a backend: the request carries actor_parking_t's waker and the coroutine reports its ticket.
+    // With `parks` false resume() stays the base one, so actor-zeta re-runs it until the answer is in.
     class pool_awaiter_t final : public actor_zeta::basic_actor<pool_awaiter_t> {
     public:
         template<typename T>
@@ -299,10 +298,9 @@ BENCHMARK(BM_actor_await_park)->OTX_ACTOR_AWAIT_ARGS;
 
 namespace {
 
-    // One engine and its OtterbrixManager for the whole run, built on first use (the loggers
-    // are registered by bench_parser.cpp's static initializer by then). A function-local
-    // static is destroyed before spdlog::shutdown, which bench_parser.cpp registered earlier
-    // with atexit; members go in reverse order, the manager before the engine.
+    // One engine and its OtterbrixManager for the whole run, built on first use after
+    // bench_parser.cpp's static initializer registers the loggers. The function-local static dies
+    // before spdlog::shutdown (registered earlier with atexit): members die in reverse, manager, then engine.
     struct engine_fixture_t {
         static constexpr const char* data_dir = "/tmp/otterstax_bench_engine";
 

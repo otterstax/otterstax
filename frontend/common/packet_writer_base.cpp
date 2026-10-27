@@ -13,13 +13,13 @@ namespace frontend {
 
     void packet_writer_base::write_uint8(uint8_t value) { payload_.push_back(value); }
 
-    void packet_writer_base::write_string_null(std::string str) {
-        payload_.insert(payload_.end(), std::make_move_iterator(str.begin()), std::make_move_iterator(str.end()));
+    void packet_writer_base::write_string_null(std::string_view str) {
+        payload_.insert(payload_.end(), str.begin(), str.end());
         payload_.push_back(0);
     }
 
-    void packet_writer_base::write_string_fixed(std::string str) {
-        payload_.insert(payload_.end(), std::make_move_iterator(str.begin()), std::make_move_iterator(str.end()));
+    void packet_writer_base::write_string_fixed(std::string_view str) {
+        payload_.insert(payload_.end(), str.begin(), str.end());
     }
 
     std::vector<uint8_t> packet_writer_base::extract_payload() {

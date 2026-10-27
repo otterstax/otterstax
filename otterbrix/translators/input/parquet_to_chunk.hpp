@@ -14,6 +14,7 @@
 #include <memory>
 #include <memory_resource>
 #include <string>
+#include <string_view>
 
 namespace tsl {
 
@@ -22,7 +23,7 @@ namespace tsl {
 // invalid_parameter. Arrow's own buffers are allocated on `res` too
 // (arrow_memory_pool.hpp), so it must be thread-safe.
 core::result_wrapper_t<components::vector::data_chunk_t>
-parquet_to_chunk(std::pmr::memory_resource* res, const std::string& file_path);
+parquet_to_chunk(std::pmr::memory_resource* res, std::string_view file_path);
 
 core::result_wrapper_t<components::vector::data_chunk_t>
 parquet_to_chunk(std::pmr::memory_resource* res, const uint8_t* data, size_t size);
@@ -34,6 +35,6 @@ parquet_to_chunk(std::pmr::memory_resource* res, std::shared_ptr<arrow::io::Rand
 
 // Schema only, without reading the row groups.
 core::result_wrapper_t<components::types::complex_logical_type>
-parquet_to_struct(std::pmr::memory_resource* res, const std::string& file_path);
+parquet_to_struct(std::pmr::memory_resource* res, std::string_view file_path);
 
 } // namespace tsl

@@ -21,16 +21,14 @@
 
 namespace conn::file {
 
-    // Translates `input` — or, when it is null, the file at `path` — into one chunk, in the
-    // format `format` names or, when it names none ("", "auto"), the path's extension: what
-    // CREATE EXTERNAL TABLE loads, from a local file or an S3 object stream. `path` names the
-    // source in messages either way. An unknown format is invalid_parameter; the translators
-    // report conversion_failure / io_error.
+    // Translates `input`, or the file at `path` when it is null, into one chunk in the format `format`
+    // names (empty or "auto": the path's extension). `path` names the source in messages. An unknown
+    // format is invalid_parameter; translators report conversion_failure / io_error.
     core::result_wrapper_t<components::vector::data_chunk_t>
     load_chunk(std::pmr::memory_resource* resource,
-               const std::string& path,
+               std::string_view path,
                const std::shared_ptr<arrow::io::RandomAccessFile>& input,
-               const std::string& format);
+               std::string_view format);
 
     // Writes the engine's result chunks in `format` into `sink` — left open, committing or
     // aborting it is the caller's call — or, when it is null, to a file at `path` that is
@@ -38,7 +36,7 @@ namespace conn::file {
     core::result_wrapper_t<bool> write_chunks(std::pmr::memory_resource* resource,
                                               FileFormat format,
                                               const std::pmr::vector<components::vector::data_chunk_t>& chunks,
-                                              const std::string& path,
+                                              std::string_view path,
                                               const std::shared_ptr<arrow::io::OutputStream>& sink);
 
     // Local files: load_t reads a path, export_t writes one. Stateless, so one instance

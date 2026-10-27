@@ -55,10 +55,9 @@ namespace otterstax::test {
         return db::make_otterbrix_engine(std::move(config));
     }
 
-    // What ComponentManager::register_connections does for one connection: the
-    // alias's pool opens, then the catalog discovers its tables (`scope`), and a
-    // connection whose discovery fails is dropped again. Answers the first
-    // failure.
+    // What ComponentManager::register_connections does for one connection: the pool opens, the catalog
+    // discovers its tables (`scope`), and a connection whose discovery fails is dropped. Returns the
+    // first failure.
     inline core::error_t register_backend(std::pmr::memory_resource* resource,
                                           conn::connection_pool_t& pool,
                                           actor_zeta::address_t catalog,
@@ -79,19 +78,16 @@ namespace otterstax::test {
         return err;
     }
 
-    // The connection pools and decode metadata of the three backend types — what
-    // the catalog and every Worker build their backends over — with the catalog's
-    // own backends wired in (unless `wire_catalog` is false: a catalog without
-    // backends refuses every registration). Declare it after the catalog and
-    // before the Scheduler: it outlives the Workers and is gone before the
-    // catalog.
+    // The pools and decode metadata of the three backend types, with the catalog's backends wired in
+    // (unless `wire_catalog` is false: a catalog without backends refuses every registration).
+    // Declare it after the catalog and before the Scheduler: it outlives the Workers, not the catalog.
     class mock_backends {
     public:
         mock_backends(std::pmr::memory_resource* resource, mysql::CatalogManager& catalog, bool wire_catalog = true)
             : resource_(resource)
             , catalog_(catalog.address())
             , registry_(resource)
-            , catalog_backends_(resource, registry_) {
+            , catalog_backends_(resource, registry_, catalog.wait_owner()) {
             if (wire_catalog) {
                 catalog.set_backends(
                     {&catalog_backends_.mysql, &catalog_backends_.postgresql, &catalog_backends_.clickhouse});

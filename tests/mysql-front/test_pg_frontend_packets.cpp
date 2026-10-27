@@ -7,6 +7,7 @@
 // error state that decides when ReadyForQuery follows an ErrorResponse, and the
 // transaction block status ReadyForQuery carries.
 
+#include "packet_split.hpp"
 #include "frontend/postgres_server/connection/pipeline_state.hpp"
 #include "frontend/postgres_server/connection/transaction_manager.hpp"
 #include "frontend/postgres_server/packet/packet_reader.hpp"
@@ -155,7 +156,7 @@ TEST_CASE("pg RowDescription: format codes follow the Bind result formats") {
         result.add_chunk_columns(row);
         result.add_encoding({result_encoding::BINARY});
         result.add_row(row, 0);
-        auto packets = postgres_resultset::build_packets(std::move(result));
+        auto packets = otterstax::test::split_pg_messages(postgres_resultset::build_packets(std::move(result)));
         REQUIRE(packets.size() == 2);
 
         packet_reader r(packets[0]);
@@ -172,7 +173,7 @@ TEST_CASE("pg RowDescription: format codes follow the Bind result formats") {
         result.add_chunk_columns(row);
         result.add_encoding({result_encoding::BINARY, result_encoding::TEXT});
         result.add_row(row, 0);
-        auto packets = postgres_resultset::build_packets(std::move(result));
+        auto packets = otterstax::test::split_pg_messages(postgres_resultset::build_packets(std::move(result)));
         REQUIRE(packets.size() == 2);
 
         packet_reader r(packets[0]);
@@ -189,7 +190,7 @@ TEST_CASE("pg RowDescription: format codes follow the Bind result formats") {
         result.add_chunk_columns(row);
         result.add_encoding({});
         result.add_row(row, 0);
-        auto packets = postgres_resultset::build_packets(std::move(result));
+        auto packets = otterstax::test::split_pg_messages(postgres_resultset::build_packets(std::move(result)));
 
         packet_reader r(packets[0]);
         REQUIRE(static_cast<char>(r.read_uint8()) == message_type::backend::ROW_DESCRIPTION);

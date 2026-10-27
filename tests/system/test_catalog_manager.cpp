@@ -58,8 +58,8 @@ namespace {
         return std::make_unique<scripted_driver_t>(
             [](const conn::statement_t&) -> conn::statement_outcome_t { return conn::statement_result_t{}; },
             [resource, blocks = std::move(blocks)](const conn::statement_t& statement) {
-                ch::select_result_t replayed;
-                replayed.blocks = blocks;
+                ch::select_result_t replayed(std::pmr::new_delete_resource());
+                replayed.blocks.assign(blocks.begin(), blocks.end());
                 return ch::decode(resource, replayed, statement);
             });
     }
@@ -81,7 +81,7 @@ namespace {
         return std::make_unique<scripted_driver_t>(
             [](const conn::statement_t&) -> conn::statement_outcome_t { return conn::statement_result_t{}; },
             [resource](const conn::statement_t& statement) {
-                ch::select_result_t answer;
+                ch::select_result_t answer(std::pmr::new_delete_resource());
                 if (statement.sql.find("system.columns") == std::string::npos) {
                     clickhouse::Block header;
                     header.AppendColumn("id", std::make_shared<clickhouse::ColumnUInt32>());
@@ -96,10 +96,9 @@ namespace {
         return std::make_unique<otterstax::test::mock_driver_t>(mock_config{.resource = resource}, "ch");
     }
 
-    // Catalog actor plus the connection pools of the three backend types over
-    // mock drivers, the catalog's own backends wired in (it runs every discovery
-    // through them). The pools are declared after the catalog, so they are
-    // destroyed first.
+    // Catalog actor plus the pools of the three backend types over mock drivers, with the catalog's
+    // backends wired in (it runs discovery through them). Pools are declared after the catalog, so
+    // they are destroyed first.
     struct catalog_fixture {
         std::pmr::memory_resource* resource;
         std::unique_ptr<db::OtterbrixManager, actor_zeta::pmr::deleter_t> otterbrix_manager;
@@ -154,7 +153,7 @@ namespace {
         core::error_t check_database_ownership(std::string dbname) {
             auto [needs_sched, future] = actor_zeta::send(catalog->address(),
                                                           &mysql::CatalogManager::check_database_ownership,
-                                                          std::move(dbname));
+                                                          std::pmr::string(dbname, std::pmr::new_delete_resource()));
             wait_until_ready(future);
             return std::move(future).take_ready();
         }

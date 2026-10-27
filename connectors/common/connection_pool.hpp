@@ -22,11 +22,9 @@
 
 namespace conn {
 
-    // What one pool thread owns: one backend connection. Before running a statement on a
-    // connection that sat idle longer than check_after_idle it pings it (PgBouncer's
-    // server_check_delay): the server or a balancer may have dropped it meanwhile, and a
-    // DML sent on a dead socket cannot be repeated (IDriver). A connection in steady use is
-    // never pinged.
+    // What one pool thread owns: one backend connection. It is pinged before use if it sat
+    // idle longer than check_after_idle (PgBouncer's server_check_delay): the server or a
+    // balancer may have dropped it, and a DML on a dead socket cannot be repeated (IDriver).
     class driver_session_t {
     public:
         using request_t = statement_t;
@@ -62,9 +60,9 @@ namespace conn {
         // Startup thread only. `prototype` is a disconnected driver for the alias; every
         // connection the pool opens is prototype->clone_disconnected(). Opens min_size
         // connections; on failure the alias is not registered.
-        [[nodiscard]] core::error_t add(const std::string& alias, std::unique_ptr<IDriver> prototype, pool_config_t config);
+        [[nodiscard]] core::error_t add(std::string_view alias, std::unique_ptr<IDriver> prototype, pool_config_t config);
         // Startup thread only: a connection whose schema registration failed is not kept.
-        void drop(const std::string& alias);
+        void drop(std::string_view alias);
         bool contains(std::string_view alias) const noexcept;
 
         // Any thread; never blocks. An unknown alias gets an already-settled do_not_exists.

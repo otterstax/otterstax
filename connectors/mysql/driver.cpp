@@ -7,6 +7,7 @@
 
 #include "otterbrix/translators/input/mysql_to_chunk.hpp"
 #include "utility/logger.hpp"
+#include "utility/pmr_text.hpp"
 #include "utility/tracy_profiler.hpp"
 
 #include <boost/asio/cancel_after.hpp>
@@ -26,11 +27,17 @@ namespace mysql {
 
     namespace {
 
-        std::string to_std_string(bm::string_view text) { return std::string{text.data(), text.size()}; }
+        // `out` += ": <the server's message>", when the server sent one.
+        void append_server_message(std::pmr::string& out, const bm::diagnostics& diag) {
+            const auto message = diag.server_message();
+            if (!message.empty()) {
+                out += ": ";
+                out.append(message.data(), message.size());
+            }
+        }
 
-        // Runs `body` to completion on `io`, which nothing else runs: every handler of the
-        // operations it awaits, cancel_after's deadline timers included, runs on this thread,
-        // one after the other. Returns what the body let escape — nothing should, every
+        // Runs `body` to completion on `io`, which nothing else runs, so every handler (deadline timers
+        // included) runs on this thread in turn. Returns what escaped the body; nothing should, as every
         // operation uses redirect_error.
         std::exception_ptr run_on(asio::io_context& io, asio::awaitable<void> body) {
             std::exception_ptr escaped;
@@ -81,11 +88,11 @@ namespace mysql {
         return std::move(result);
     }
 
-    driver_t::driver_t(std::pmr::memory_resource* resource, connect_params params, std::string alias)
+    driver_t::driver_t(std::pmr::memory_resource* resource, connect_params params, std::string_view alias)
         : log_(get_logger(logger_tag::CONNECTOR))
         , resource_(resource)
         , params_(std::move(params))
-        , alias_(std::move(alias))
+        , alias_(alias, resource)
         , conn_(io_.get_executor()) {
         assert(log_.is_valid());
         assert(resource_ != nullptr);
@@ -94,30 +101,31 @@ namespace mysql {
 
     driver_t::~driver_t() { close(); }
 
-    core::error_t driver_t::connection_error(std::string_view what) const {
-        return core::error_t(core::error_code_t::io_error, std::pmr::string{what.data(), what.size(), resource_});
+    core::error_t driver_t::connection_error(std::pmr::string what) const {
+        return core::error_t(core::error_code_t::io_error, std::move(what));
     }
 
     core::error_t driver_t::query_error(const boost::system::error_code& ec,
                                         const bm::diagnostics& diag,
                                         std::string_view sql) const {
-        std::string what = "[Run query] Alias: " + alias_ + " query [" + std::string(sql) + "] failed: (" +
-                           std::to_string(ec.value()) + ") " + ec.message();
-        if (!diag.server_message().empty()) {
-            what += ": " + to_std_string(diag.server_message());
-        }
-        log_->error(what);
-        return core::error_t(classify_error(ec), std::pmr::string{what.c_str(), resource_});
+        auto what = otterstax::concat(resource_, {"[Run query] Alias: ", alias_, " query [", sql, "] failed: ("});
+        otterstax::append_number(what, ec.value());
+        what += ") ";
+        what += ec.message();
+        append_server_message(what, diag);
+        log_->error(std::string_view(what));
+        return core::error_t(classify_error(ec), std::move(what));
     }
 
     driver_t::failure_t
     driver_t::classify(const boost::system::error_code& ec, const bm::diagnostics& diag, std::string_view sql) const {
         if (ec == asio::error::operation_aborted) {
             // Only our deadline cancels an operation here.
-            const std::string what = "[Run query] Alias: " + alias_ + " query [" + std::string(sql) +
-                                     "] failed: the statement did not finish within its deadline";
-            log_->error(what);
-            return {connection_error(what), failure_kind::broken};
+            auto what = otterstax::concat(
+                resource_,
+                {"[Run query] Alias: ", alias_, " query [", sql, "] failed: the statement did not finish within its deadline"});
+            log_->error(std::string_view(what));
+            return {connection_error(std::move(what)), failure_kind::broken};
         }
         // classify_error (errors.hpp) answers io_error exactly for a client or transport
         // error, and the engine's code for everything the server raised.
@@ -140,17 +148,14 @@ namespace mysql {
             diag,
             asio::cancel_after(params_.connect_timeout, asio::redirect_error(asio::use_awaitable, ec)));
         if (ec) {
-            std::string what = "[Connector] Alias: " + alias_ + " connect failed: " + ec.message();
-            if (!diag.server_message().empty()) {
-                what += ": " + to_std_string(diag.server_message());
-            }
-            out.emplace(connection_error(what));
+            auto what = otterstax::concat(resource_, {"[Connector] Alias: ", alias_, " connect failed: ", ec.message()});
+            append_server_message(what, diag);
+            out.emplace(connection_error(std::move(what)));
             co_return;
         }
-        // The session's id, which KILL QUERY names when a statement passes its deadline
-        // (cancel_on_server). Boost.MySQL reads it from the server greeting but does not
-        // expose it. A server refusing the query leaves the connection usable, only without
-        // the cancel; a transport failure fails the connect.
+        // The session id, which KILL QUERY names when a statement passes its deadline (cancel_on_server).
+        // Boost.MySQL reads it from the greeting but does not expose it. If the server refuses the query
+        // the connection stays usable without the cancel; a transport failure fails the connect.
         bm::results id;
         co_await conn_.async_execute(
             "SELECT CONNECTION_ID()",
@@ -158,12 +163,13 @@ namespace mysql {
             diag,
             asio::cancel_after(params_.connect_timeout, asio::redirect_error(asio::use_awaitable, ec)));
         if (ec) {
-            const std::string what = "[Connector] Alias: " + alias_ + " cannot read the session id: " + ec.message();
+            auto what =
+                otterstax::concat(resource_, {"[Connector] Alias: ", alias_, " cannot read the session id: ", ec.message()});
             if (ec == asio::error::operation_aborted || classify_error(ec) == core::error_code_t::io_error) {
-                out.emplace(connection_error(what));
+                out.emplace(connection_error(std::move(what)));
                 co_return;
             }
-            log_->warn(what);
+            log_->warn(std::string_view(what));
         } else if (!id.rows().empty() && id.rows().at(0).size() == 1) {
             const auto field = id.rows().at(0).at(0);
             if (field.is_uint64()) {
@@ -184,10 +190,11 @@ namespace mysql {
         if (ec) {
             co_return;
         }
-        const std::string kill = "KILL QUERY " + std::to_string(session_id);
+        auto kill = otterstax::concat(resource_, {"KILL QUERY "});
+        otterstax::append_number(kill, session_id);
         bm::results ignored;
         co_await side.async_execute(
-            kill,
+            std::string_view(kill),
             ignored,
             diag,
             asio::cancel_after(params_.connect_timeout, asio::redirect_error(asio::use_awaitable, ec)));
@@ -198,21 +205,18 @@ namespace mysql {
             asio::cancel_after(params_.connect_timeout, asio::redirect_error(asio::use_awaitable, closed)));
     }
 
-    // A statement past its deadline keeps running on the server after the socket closes —
-    // until the server next writes to it — so the driver kills it over a connection of its
-    // own: the alias's parameters, connect_timeout for the connect and for the KILL.
-    // Best-effort: a failure (1094, the statement finished meanwhile, included) is logged and
-    // the statement's own deadline error stands.
+    // A statement past its deadline keeps running on the server after the socket closes, so it is killed
+    // over a connection of its own (same parameters; connect_timeout for connect and KILL). Best-effort:
+    // a failure is logged and the statement's own deadline error stands.
     void driver_t::cancel_on_server(uint64_t session_id) {
         OTX_ZONE_N("mysql::driver::cancel_on_server");
         boost::system::error_code ec;
         bm::diagnostics diag;
         const bool escaped = static_cast<bool>(run_on(io_, kill_(session_id, ec, diag)));
         if (escaped || ec) {
-            std::string what = escaped ? std::string{"unexpected exception"} : ec.message();
-            if (!diag.server_message().empty()) {
-                what += ": " + to_std_string(diag.server_message());
-            }
+            std::pmr::string what(escaped ? std::string_view{"unexpected exception"} : std::string_view{ec.message()},
+                                  resource_);
+            append_server_message(what, diag);
             log_->warn("Alias: {} cannot kill the statement of session {}: {}", alias_, session_id, what);
             return;
         }
@@ -226,7 +230,8 @@ namespace mysql {
         std::optional<core::error_t> out;
         if (auto escaped = run_on(io_, connect_(diag, out)); escaped || !out) {
             reset_connection();
-            return connection_error("[Connector] Alias: " + alias_ + " connect failed: unexpected exception");
+            return connection_error(
+                otterstax::concat(resource_, {"[Connector] Alias: ", alias_, " connect failed: unexpected exception"}));
         }
         if (out->contains_error()) {
             log_->warn("{}", out->what.c_str());
@@ -246,7 +251,7 @@ namespace mysql {
     core::error_t driver_t::ping() {
         OTX_ZONE_N("mysql::driver::ping");
         if (!connected_) {
-            return connection_error("[Connector] Alias: " + alias_ + " is not connected");
+            return connection_error(otterstax::concat(resource_, {"[Connector] Alias: ", alias_, " is not connected"}));
         }
         boost::system::error_code ec;
         bm::diagnostics diag;
@@ -254,7 +259,8 @@ namespace mysql {
         if (escaped || ec) {
             reset_connection(); // the next execute() reconnects first
             log_->debug("Alias: {} ping failed: {}", alias_, ec.message());
-            return connection_error("[Connector] Alias: " + alias_ + " ping failed: " + ec.message());
+            return connection_error(
+                otterstax::concat(resource_, {"[Connector] Alias: ", alias_, " ping failed: ", ec.message()}));
         }
         return core::error_t::no_error();
     }
@@ -303,7 +309,7 @@ namespace mysql {
         }
         bm::pipeline_request pipeline;
         pipeline.add_execute(prepared).add_close_statement(prepared);
-        std::vector<bm::stage_response> stages;
+        std::vector<bm::stage_response> stages; // the type async_run_pipeline fills
         co_await conn_.async_run_pipeline(
             pipeline,
             stages,
@@ -322,8 +328,9 @@ namespace mysql {
         sent_t sent;
         const auto limit = statement.timeout.count() > 0 ? statement.timeout : params_.statement_timeout;
         if (auto escaped = run_on(io_, send_(statement.sql, clock::now() + limit, sent)); escaped) {
-            sent.failure = failure_t{connection_error("[Run query] Alias: " + alias_ + " query [" + statement.sql +
-                                                      "] failed: unexpected exception"),
+            sent.failure = failure_t{connection_error(otterstax::concat(
+                                         resource_,
+                                         {"[Run query] Alias: ", alias_, " query [", statement.sql, "] failed: unexpected exception"})),
                                      failure_kind::broken};
         }
         if (sent.failure && sent.failure->kind != failure_kind::server) {
@@ -360,8 +367,8 @@ namespace mysql {
     }
 
     std::unique_ptr<conn::IDriver>
-    make_driver(std::pmr::memory_resource* resource, connect_params params, std::string alias) {
-        return std::make_unique<driver_t>(resource, std::move(params), std::move(alias));
+    make_driver(std::pmr::memory_resource* resource, connect_params params, std::string_view alias) {
+        return std::make_unique<driver_t>(resource, std::move(params), alias);
     }
 
 } // namespace mysql

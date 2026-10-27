@@ -131,6 +131,9 @@ add_subdirectory(scheduler)
 
 set(${PROJECT_NAME}_HEADERS
 
+        utility/string_hash.hpp
+        utility/pmr_text.hpp
+        utility/stack_arena.hpp
         utility/timer.hpp
         utility/tsan_helper.hpp
         utility/tracy_profiler.hpp
@@ -188,7 +191,8 @@ target_link_libraries(
 )
 
 if(ENABLE_TRACY)
-    target_link_libraries(lib_${PROJECT_NAME} PUBLIC Tracy::TracyClient)
+    # lib_otterstax is an INTERFACE library (the link group above): INTERFACE, not PUBLIC.
+    target_link_libraries(lib_${PROJECT_NAME} INTERFACE Tracy::TracyClient)
 endif()
 
 

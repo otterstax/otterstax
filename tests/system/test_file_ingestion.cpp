@@ -91,10 +91,9 @@ void write_test_ndjson(const std::string& path) {
       << "{\"id\":5,\"name\":\"Eve\"}\n";
 }
 
-// What the Worker does for a local-file CREATE EXTERNAL TABLE and COPY ... TO,
-// minus the pool: the file driver loads / writes, the engine creates the table /
-// runs the statement. The engine actor runs a handler to completion on the
-// sender's thread, so its future is settled when send() returns.
+// What the Worker does for a local-file CREATE EXTERNAL TABLE and COPY ... TO, minus the pool: the
+// file driver loads or writes, the engine creates the table or runs the statement. The engine runs a
+// handler on the sender's thread, so its future is settled when send() returns.
 struct file_stack_t {
     std::pmr::memory_resource* resource;
     actor_zeta::address_t otterbrix_manager;
@@ -102,7 +101,7 @@ struct file_stack_t {
 
     core::result_wrapper_t<bool>
     add_file(const std::string& db, const std::string& tbl, const std::string& path, const std::string& format) {
-        auto loaded = driver.run(conn::load_t{path, format});
+        auto loaded = driver.run(conn::load_t{std::pmr::string(path, resource), std::pmr::string(format, resource)});
         if (loaded.has_error()) {
             return loaded.convert_error<bool>();
         }
@@ -134,7 +133,7 @@ struct file_stack_t {
         if (sink) {
             return conn::file::write_chunks(resource, format, cursor->chunks(), path, sink);
         }
-        auto written = driver.run(conn::export_t{path, format, cursor});
+        auto written = driver.run(conn::export_t{std::pmr::string(path, resource), format, cursor});
         if (written.has_error()) {
             return written.convert_error<bool>();
         }

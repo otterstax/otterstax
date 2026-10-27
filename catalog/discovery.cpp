@@ -4,6 +4,7 @@
 #include "discovery.hpp"
 
 #include "otterbrix/query_generation/sql_query_generator.hpp"
+#include "utility/pmr_text.hpp"
 #include "utility/tracy_profiler.hpp"
 
 #include <components/expressions/compare_expression.hpp>
@@ -60,7 +61,7 @@ namespace otterstax::catalog {
         return query;
     }
 
-    core::result_wrapper_t<std::string>
+    core::result_wrapper_t<std::pmr::string>
     make_schema_probe_query(std::pmr::memory_resource* resource, const qualified_name_t& name, backend_type_t backend) {
         OTX_ZONE_N("catalog::make_schema_probe_query");
         logical_plan::parameter_node_t param(resource);
@@ -88,7 +89,7 @@ namespace otterstax::catalog {
         constexpr size_t max_named = 3;
         std::pmr::string msg{resource};
         msg.append("Schema discovery failed for ");
-        msg.append(std::to_string(failed_tables.size()).c_str());
+        otterstax::append_number(msg, failed_tables.size());
         msg.append(" table(s): ");
         for (size_t i = 0; i < failed_tables.size() && i < max_named; ++i) {
             if (i != 0) {

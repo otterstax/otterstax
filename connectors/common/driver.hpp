@@ -11,22 +11,12 @@
 
 namespace conn {
 
-    // One backend connection. Not thread-safe: the pool thread that owns it makes every
-    // call, one at a time. A call may block, but never past the driver's own timeouts, and
-    // never throws: a driver exception is caught and classified inside (errors.hpp).
-    //
-    // Reconnecting belongs to the driver, because only the driver can tell a stale socket
-    // (server restarted, idle connection closed by the server or a balancer) from a stalled
-    // backend: the engine's error_code_t has no timeout value, so both arrive as io_error
-    // and the pool could not tell them apart. execute() therefore
-    //   - reconnects first when an earlier failure dropped the connection — this replaces
-    //     the liveness check the old connector managers ran in front of every query;
-    //   - on a stale connection reconnects and repeats the statement once, but only when
-    //     statement.repeatable (a read);
-    //   - never repeats after its deadline expired (the backend is stalled, and a repeat
-    //     doubles the wait) and never repeats a statement that is not repeatable — a DML or
-    //     DDL whose answer was lost may already have been applied. The result kind does not
-    //     decide it: MySQL and PostgreSQL send a DML as a `rows` statement.
+    // One backend connection. Not thread-safe: the pool thread that owns it makes each call, one
+    // at a time; calls may block within the driver's timeouts and never throw (errors.hpp).
+    // Only the driver can tell a stale socket from a stalled backend: error_code_t has no timeout,
+    // so both are io_error. execute() reconnects after a drop and repeats a stale statement once,
+    // but only a statement.repeatable read before its deadline; a DML/DDL may already be applied.
+    // The result kind cannot tell (MySQL/PostgreSQL send a DML as a `rows` statement).
     class IDriver {
     public:
         virtual ~IDriver() = default;

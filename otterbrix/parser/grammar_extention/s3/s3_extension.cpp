@@ -181,7 +181,7 @@ namespace s3_ext {
         // Lower the parsed statement into an external_node_t the Scheduler routes
         // to the S3 manager. nullptr option fields collapse to empty strings.
         const auto* stmt = static_cast<const s3_stmt*>(node->data);
-        const auto str = [](const char* s) { return s ? std::string{s} : std::string{}; };
+        const auto str = [](const char* s) { return s ? std::string_view{s} : std::string_view{}; };
         const auto op = stmt->kind == s3_stmt_kind::create_external_table
                             ? otterstax::external::external_op_t::create_external_table
                             : otterstax::external::external_op_t::copy_to;

@@ -14,6 +14,7 @@
 #include <memory>
 #include <memory_resource>
 #include <string>
+#include <string_view>
 
 namespace tsl {
 
@@ -21,7 +22,7 @@ namespace tsl {
 // body Arrow cannot parse is conversion_failure. Arrow's own buffers are allocated
 // on `res` too (arrow_memory_pool.hpp), so it must be thread-safe.
 core::result_wrapper_t<components::vector::data_chunk_t>
-ndjson_to_chunk(std::pmr::memory_resource* res, const std::string& file_path);
+ndjson_to_chunk(std::pmr::memory_resource* res, std::string_view file_path);
 
 // A buffer holding a JSON array of objects is accepted as well and unwrapped
 // into one object per line before parsing.

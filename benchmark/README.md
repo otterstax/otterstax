@@ -95,9 +95,16 @@ data, runs all benchmarks, and writes results.
 ./benchmark/scripts/run_benchmark.sh \
   --frontend mysql --bench join_all join_cross_engine --repetitions 3
 
-# Full clean slate (wipes DB volumes)
+# Full clean slate (wipes DB volumes; the saved benchmark data is kept)
 ./benchmark/scripts/run_benchmark.sh --clear
+
+# Generate the saved benchmark data again
+./benchmark/scripts/run_benchmark.sh --regen-data
 ```
+
+The backend rows are generated once into `benchmark/data/dataset/` and every
+run loads that same data, so results from different runs and different images
+compare over identical tables. See "Saved benchmark data" in `benchmark/CLAUDE.md`.
 
 Results land in `benchmark_results/<YYYYMMDD_HHMMSS>/`.
 
@@ -248,7 +255,8 @@ shape the python tests use.
 
 Selecting any `external_*` test automatically:
 
-1. Generates fixtures into `benchmark/data/fixtures/` via `data/generate_external_fixtures.py`.
+1. Generates fixtures into `benchmark/data/fixtures/` via `data/generate_external_fixtures.py`
+   (once: later runs reuse them while `bench.yaml` is unchanged).
 2. Adds `compose_rustfs.yml` to the stack (RustFS + a one-shot that seeds `bench-bucket`).
 
 The `bench_rustfs` s3 alias is declared in `benchmark/config.yaml` and

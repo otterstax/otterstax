@@ -10,12 +10,24 @@ Group B (mariadb2 / postgres2 / clickhouse2): products, orders, events
 campaign_id 1-1000 is shared across all 6 DBs so cross-group JOINs always match.
 Date/timestamp columns are intentionally omitted until OtterStax supports the
 date type translator across all frontends.
+
+The rows are generated once into a saved dataset (``--dataset``, default
+``data/dataset/``: ``<db>/<table>.json.gz``) and every run loads that same data,
+so runs on different days and different images query identical tables.  The
+dataset is generated again only when it is missing, when the bench.yaml sizes or
+DATASET_VERSION changed, or with ``--regenerate`` (see dataset_stamp.py).
 """
 
+import argparse
+import gzip
+import json
 import random
+import shutil
 from pathlib import Path
 from faker import Faker
 import yaml
+
+import dataset_stamp
 
 # ---------------------------------------------------------------------------
 # Load configuration
@@ -61,6 +73,7 @@ def batched(lst, n):
 # ---------------------------------------------------------------------------
 
 def gen_campaigns(fake, seed):
+    random.seed(seed)
     fake.seed_instance(seed)
     rows = []
     for cid in range(1, NUM_CAMPAIGNS + 1):
@@ -115,6 +128,7 @@ def gen_daily_stats(seed):
 # ---------------------------------------------------------------------------
 
 def gen_products(fake, seed):
+    random.seed(seed + 2000)
     fake.seed_instance(seed + 2000)
     rows = []
     pid = 1
@@ -178,9 +192,8 @@ def mysql_conn(host, user, password, database):
                            autocommit=False)
 
 
-def init_mariadb_group_a(host, user, password, db, seed):
+def init_mariadb_group_a(host, user, password, db, tables):
     print(f"  MariaDB group-A  host={host} db={db}")
-    fake = Faker("en_US")
     conn = mysql_conn(host, user, password, db)
     cur  = conn.cursor()
 
@@ -217,13 +230,13 @@ def init_mariadb_group_a(host, user, password, db, seed):
         )
     """)
 
-    camps = gen_campaigns(fake, seed)
+    camps = tables["campaigns"]
     for chunk in batched(camps, BATCH):
         cur.executemany(
             "INSERT INTO campaigns VALUES (%s,%s,%s,%s)", chunk)
     conn.commit()
 
-    imps = gen_impressions(seed)
+    imps = tables["impressions"]
     for chunk in batched(imps, BATCH):
         cur.executemany(
             "INSERT INTO impressions (campaign_id,views,clicks,cost) "
@@ -231,7 +244,7 @@ def init_mariadb_group_a(host, user, password, db, seed):
             [(r[1], r[2], r[3], r[4]) for r in chunk])
     conn.commit()
 
-    stats = gen_daily_stats(seed)
+    stats = tables["daily_stats"]
     for chunk in batched(stats, BATCH):
         cur.executemany(
             "INSERT INTO daily_stats "
@@ -243,9 +256,8 @@ def init_mariadb_group_a(host, user, password, db, seed):
     print(f"    campaigns={NUM_CAMPAIGNS} impressions={len(imps)} daily_stats={len(stats)}")
 
 
-def init_mariadb_group_b(host, user, password, db, seed):
+def init_mariadb_group_b(host, user, password, db, tables):
     print(f"  MariaDB group-B  host={host} db={db}")
-    fake = Faker("en_US")
     conn = mysql_conn(host, user, password, db)
     cur  = conn.cursor()
 
@@ -296,18 +308,15 @@ def init_mariadb_group_b(host, user, password, db, seed):
         )
     """)
 
-    prods = gen_products(fake, seed)
+    prods = tables["products"]
     for chunk in batched(prods, BATCH_B):
         cur.executemany(
-            "INSERT INTO products (campaign_id,product_name,category,price,stock_qty) "
-            "VALUES (%s,%s,%s,%s,%s)",
-            [(r[1], r[2], r[3], r[4], r[5]) for r in chunk])
+            "INSERT INTO products (product_id,campaign_id,product_name,category,price,stock_qty) "
+            "VALUES (%s,%s,%s,%s,%s,%s)",
+            chunk)
     conn.commit()
 
-    cur.execute("SELECT product_id, campaign_id, product_name, category, price, stock_qty FROM products")
-    db_prods = cur.fetchall()
-
-    ords = gen_orders(db_prods, seed)
+    ords = tables["orders"]
     for chunk in batched(ords, BATCH_B):
         cur.executemany(
             "INSERT INTO orders "
@@ -316,7 +325,7 @@ def init_mariadb_group_b(host, user, password, db, seed):
             [(r[1], r[2], r[3], r[4], r[5], r[6]) for r in chunk])
     conn.commit()
 
-    evts = gen_events(db_prods, seed)
+    evts = tables["events"]
     for chunk in batched(evts, BATCH_B):
         cur.executemany(
             "INSERT INTO events (campaign_id,product_id,event_type,user_id,device) "
@@ -348,9 +357,8 @@ def _pg_terminate_other_connections(conn):
     conn.commit()
 
 
-def init_postgres_group_a(host, user, password, db, seed):
+def init_postgres_group_a(host, user, password, db, tables):
     print(f"  PostgreSQL group-A  host={host} db={db}")
-    fake = Faker("en_US")
     conn = pg_conn(host, user, password, db)
     conn.autocommit = False
     _pg_terminate_other_connections(conn)
@@ -391,13 +399,13 @@ def init_postgres_group_a(host, user, password, db, seed):
     """)
     conn.commit()
 
-    camps = gen_campaigns(fake, seed)
+    camps = tables["campaigns"]
     for chunk in batched(camps, BATCH):
         cur.executemany(
             "INSERT INTO campaigns VALUES (%s,%s,%s,%s)", chunk)
     conn.commit()
 
-    imps = gen_impressions(seed)
+    imps = tables["impressions"]
     for chunk in batched(imps, BATCH):
         cur.executemany(
             "INSERT INTO impressions (campaign_id,views,clicks,cost) "
@@ -405,7 +413,7 @@ def init_postgres_group_a(host, user, password, db, seed):
             [(r[1], r[2], r[3], r[4]) for r in chunk])
     conn.commit()
 
-    stats = gen_daily_stats(seed)
+    stats = tables["daily_stats"]
     for chunk in batched(stats, BATCH):
         cur.executemany(
             "INSERT INTO daily_stats "
@@ -417,9 +425,8 @@ def init_postgres_group_a(host, user, password, db, seed):
     print(f"    campaigns={NUM_CAMPAIGNS} impressions={len(imps)} daily_stats={len(stats)}")
 
 
-def init_postgres_group_b(host, user, password, db, seed):
+def init_postgres_group_b(host, user, password, db, tables):
     print(f"  PostgreSQL group-B  host={host} db={db}")
-    fake = Faker("en_US")
     conn = pg_conn(host, user, password, db)
     conn.autocommit = False
     _pg_terminate_other_connections(conn)
@@ -474,18 +481,15 @@ def init_postgres_group_b(host, user, password, db, seed):
     """)
     conn.commit()
 
-    prods = gen_products(fake, seed)
+    prods = tables["products"]
     for chunk in batched(prods, BATCH_B):
         cur.executemany(
-            "INSERT INTO products (campaign_id,product_name,category,price,stock_qty) "
-            "VALUES (%s,%s,%s,%s,%s)",
-            [(r[1], r[2], r[3], r[4], r[5]) for r in chunk])
+            "INSERT INTO products (product_id,campaign_id,product_name,category,price,stock_qty) "
+            "VALUES (%s,%s,%s,%s,%s,%s)",
+            chunk)
     conn.commit()
 
-    cur.execute("SELECT product_id, campaign_id, product_name, category, price, stock_qty FROM products")
-    db_prods = cur.fetchall()
-
-    ords = gen_orders(db_prods, seed)
+    ords = tables["orders"]
     for chunk in batched(ords, BATCH_B):
         cur.executemany(
             "INSERT INTO orders "
@@ -494,7 +498,7 @@ def init_postgres_group_b(host, user, password, db, seed):
             [(r[1], r[2], r[3], r[4], r[5], r[6]) for r in chunk])
     conn.commit()
 
-    evts = gen_events(db_prods, seed)
+    evts = tables["events"]
     for chunk in batched(evts, BATCH_B):
         cur.executemany(
             "INSERT INTO events (campaign_id,product_id,event_type,user_id,device) "
@@ -514,9 +518,8 @@ def ch_conn(host, user, password, database):
                   password=password, database=database)
 
 
-def init_clickhouse_group_a(host, user, password, db, seed):
+def init_clickhouse_group_a(host, user, password, db, tables):
     print(f"  ClickHouse group-A  host={host} db={db}")
-    fake   = Faker("en_US")
     client = ch_conn(host, user, password, db)
 
     client.execute("DROP TABLE IF EXISTS impressions")
@@ -552,24 +555,23 @@ def init_clickhouse_group_a(host, user, password, db, seed):
         ) ENGINE = MergeTree() ORDER BY campaign_id
     """)
 
-    camps = gen_campaigns(fake, seed)
+    camps = tables["campaigns"]
     for chunk in batched(camps, BATCH):
         client.execute("INSERT INTO campaigns VALUES", chunk)
 
-    imps = gen_impressions(seed)
+    imps = tables["impressions"]
     for chunk in batched(imps, BATCH):
         client.execute("INSERT INTO impressions VALUES", chunk)
 
-    stats = gen_daily_stats(seed)
+    stats = tables["daily_stats"]
     for chunk in batched(stats, BATCH):
         client.execute("INSERT INTO daily_stats VALUES", chunk)
 
     print(f"    campaigns={NUM_CAMPAIGNS} impressions={len(imps)} daily_stats={len(stats)}")
 
 
-def init_clickhouse_group_b(host, user, password, db, seed):
+def init_clickhouse_group_b(host, user, password, db, tables):
     print(f"  ClickHouse group-B  host={host} db={db}")
-    fake   = Faker("en_US")
     client = ch_conn(host, user, password, db)
 
     client.execute("DROP TABLE IF EXISTS orders")
@@ -620,15 +622,15 @@ def init_clickhouse_group_b(host, user, password, db, seed):
         ) ENGINE = MergeTree() ORDER BY id
     """)
 
-    prods = gen_products(fake, seed)
+    prods = tables["products"]
     for chunk in batched(prods, BATCH_B):
         client.execute("INSERT INTO products VALUES", chunk)
 
-    ords = gen_orders(prods, seed)
+    ords = tables["orders"]
     for chunk in batched(ords, BATCH_B):
         client.execute("INSERT INTO orders VALUES", chunk)
 
-    evts = gen_events(prods, seed)
+    evts = tables["events"]
     for chunk in batched(evts, BATCH_B):
         client.execute("INSERT INTO events VALUES", chunk)
 
@@ -638,18 +640,96 @@ def init_clickhouse_group_b(host, user, password, db, seed):
 # Entry point
 # ---------------------------------------------------------------------------
 
+# The six databases: name -> (host, user, password, group, seed, loader).
+DATABASES = {
+    "benchdb1": ("bench_mariadb1",    "user1",  "password1",  "a", 1, init_mariadb_group_a),
+    "benchpg1": ("bench_postgres1",   "pguser", "pgpassword", "a", 2, init_postgres_group_a),
+    "benchch1": ("bench_clickhouse1", "chuser", "chpassword", "a", 3, init_clickhouse_group_a),
+    "benchdb2": ("bench_mariadb2",    "user2",  "password2",  "b", 4, init_mariadb_group_b),
+    "benchpg2": ("bench_postgres2",   "pguser", "pgpassword", "b", 5, init_postgres_group_b),
+    "benchch2": ("bench_clickhouse2", "chuser", "chpassword", "b", 6, init_clickhouse_group_b),
+}
+GROUP_TABLES = {
+    "a": ("campaigns", "impressions", "daily_stats"),
+    "b": ("products", "orders", "events"),
+}
+
+# Bump when a generator changes, so saved datasets are generated again.
+DATASET_VERSION = 1
+STAMP = "dataset"
+
+
+def dataset_settings():
+    return {
+        "version": DATASET_VERSION,
+        "seeds": {name: db[4] for name, db in DATABASES.items()},
+        "num_campaigns": NUM_CAMPAIGNS,
+        "impressions_per_campaign": IMPRESSIONS_PER_CAM,
+        "stats_per_campaign": STATS_PER_CAM,
+        "products_per_campaign": PRODUCTS_PER_CAM,
+        "orders_per_product": ORDERS_PER_PRODUCT,
+        "events_per_campaign": EVENTS_PER_CAM,
+    }
+
+
+def dataset_files():
+    return [f"{name}/{table}.json.gz"
+            for name, db in DATABASES.items() for table in GROUP_TABLES[db[3]]]
+
+
+def generate_tables(group, seed):
+    fake = Faker("en_US")
+    if group == "a":
+        return {"campaigns": gen_campaigns(fake, seed),
+                "impressions": gen_impressions(seed),
+                "daily_stats": gen_daily_stats(seed)}
+    products = gen_products(fake, seed)
+    return {"products": products,
+            "orders": gen_orders(products, seed),
+            "events": gen_events(products, seed)}
+
+
+def generate_dataset(root):
+    dataset_stamp.invalidate(root, STAMP)
+    for name, db in DATABASES.items():
+        shutil.rmtree(root / name, ignore_errors=True)
+        (root / name).mkdir(parents=True)
+        for table, rows in generate_tables(db[3], db[4]).items():
+            with gzip.open(root / name / f"{table}.json.gz", "wt") as f:
+                json.dump(rows, f)
+    dataset_stamp.mark_current(root, STAMP, dataset_settings())
+
+
+def load_tables(root, name):
+    tables = {}
+    for table in GROUP_TABLES[DATABASES[name][3]]:
+        with gzip.open(root / name / f"{table}.json.gz", "rt") as f:
+            tables[table] = [tuple(row) for row in json.load(f)]
+    return tables
+
+
 def main():
+    p = argparse.ArgumentParser(description="Load the benchmark data into the six backend databases")
+    p.add_argument("--dataset", type=Path, default=Path(__file__).parent / "dataset",
+                   help="Saved dataset directory (default: data/dataset)")
+    p.add_argument("--regenerate", action="store_true",
+                   help="Generate the dataset again even when the saved one is current")
+    args = p.parse_args()
+
     print("=== OtterStax Benchmark Data Initialisation ===\n")
+    args.dataset.mkdir(parents=True, exist_ok=True)
+    if not args.regenerate and dataset_stamp.is_current(args.dataset, STAMP, dataset_settings(), dataset_files()):
+        print(f"Reusing the saved dataset in {args.dataset}")
+    else:
+        print(f"Generating the dataset into {args.dataset}")
+        generate_dataset(args.dataset)
 
-    print("Group A — campaigns / impressions / daily_stats")
-    init_mariadb_group_a("bench_mariadb1", "user1",   "password1", "benchdb1", seed=1)
-    init_postgres_group_a("bench_postgres1", "pguser", "pgpassword", "benchpg1", seed=2)
-    init_clickhouse_group_a("bench_clickhouse1", "chuser", "chpassword", "benchch1", seed=3)
-
-    print("\nGroup B — products / orders / events")
-    init_mariadb_group_b("bench_mariadb2", "user2",   "password2", "benchdb2", seed=4)
-    init_postgres_group_b("bench_postgres2", "pguser", "pgpassword", "benchpg2", seed=5)
-    init_clickhouse_group_b("bench_clickhouse2", "chuser", "chpassword", "benchch2", seed=6)
+    for name, (host, user, password, group, _, init) in DATABASES.items():
+        if name == "benchdb2":
+            print("\nGroup B — products / orders / events")
+        elif name == "benchdb1":
+            print("\nGroup A — campaigns / impressions / daily_stats")
+        init(host, user, password, name, load_tables(args.dataset, name))
 
     print("\n=== Initialisation complete ===")
 

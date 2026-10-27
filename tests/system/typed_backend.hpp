@@ -104,13 +104,10 @@ namespace otterstax::test {
         static inline state_t state_;
     };
 
-    // A connection of backend B answering from mock<B>: a describe probe (kProbePrefix)
-    // with the case's columns in the case's probe mode, the catalog's discovery with B's
-    // own discovery answer, a slot statement with kDataRows rows of the case's columns. Every
-    // answer is put on B's wire and read back by B's own decode — the function the real
-    // driver decodes with — so the chunks and schemas are what a real backend's would be.
-    // Slot statements are recorded per alias (sent_queries.hpp); an affected_rows statement
-    // answers a count of 0.
+    // A connection of backend B answering from mock<B>: a describe probe (kProbePrefix) with the case's
+    // columns, B's own discovery answer, and kDataRows rows for a slot statement. Answers go through B's
+    // wire format and its real decode. Slot statements are recorded per alias (sent_queries.hpp); an
+    // affected_rows statement answers a count of 0.
     template<class B>
     class typed_driver final : public conn::IDriver {
     public:

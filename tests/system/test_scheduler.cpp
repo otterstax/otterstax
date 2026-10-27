@@ -30,10 +30,9 @@
 #include <thread>
 
 namespace {
-    // Worker pool, session-future bridge and pool sizing are the ones every
-    // system test shares (scheduler_stack.hpp); the default-config engine and
-    // the backends over mock drivers come from test_helpers.hpp. The table the
-    // mock parser references ("1") is registered lazily on the first query.
+    // The worker pool, future bridge and pool sizing are shared by all system tests (scheduler_stack.hpp);
+    // the engine and mock backends come from test_helpers.hpp. The mock parser's table "1" is registered
+    // on the first query.
     using otterstax::test::await_session;
     using otterstax::test::init_default_test_otterbrix;
     using otterstax::test::make_az_scheduler;
@@ -175,10 +174,8 @@ TEST_CASE("Error in scheduler test case") {
         resource,
         std::make_unique<SimpleMockOtterbrixManager>(mock_config{.resource = resource}));
     auto catalog_manager = actor_zeta::spawn<mysql::CatalogManager>(resource, otterbrix_manager->address(), no_aliases());
-    // The catalog is not given its backends on purpose: it has nothing to run
-    // the discovery through, so schema registration is rejected and the
-    // connection is dropped. The statement never needs it — the parser throws
-    // first.
+    // The catalog gets no backends on purpose: it cannot run discovery, so schema registration is
+    // rejected and the connection dropped. The statement never needs it, as the parser throws first.
     mock_backends backends(resource, *catalog_manager, /*wire_catalog=*/false);
     REQUIRE(backends.add_mysql("1").contains_error());
     REQUIRE(backends.add_mysql("2").contains_error());
@@ -381,10 +378,9 @@ TEST_CASE("Cross-backend JOIN detection test case") {
     az_scheduler->stop();
 }
 
-// The shape a JOIN of two backend tables parses into: a local root over two slots in ONE
-// batch — "campaigns" (MySQL) and "products" (PostgreSQL) — the way siblings of a JOIN
-// share a batch. (CrossBackendMockParser puts one node in two batches, so its second slot
-// is already data when its turn comes.)
+// A JOIN of two backend tables as the parser shapes it: a local root over two slots in ONE batch,
+// "campaigns" (MySQL) and "products" (PostgreSQL). CrossBackendMockParser instead puts one node in two
+// batches, so its second slot is already data when its turn comes.
 class TwoSlotJoinMockParser : public IParser {
 public:
     core::result_wrapper_t<ParsedQueryDataPtr> parse(const std::string&) override {
@@ -433,10 +429,8 @@ inline parser_ptr make_two_slot_join_mock_parser(std::pmr::memory_resource*, con
     return std::make_unique<TwoSlotJoinMockParser>();
 }
 
-// A Mixed statement's backends run side by side (backend_set_t::execute_mixed): each
-// backend's slots are sent before any answer is awaited, so a MySQL ⋈ PostgreSQL JOIN
-// whose two slices take 400 ms each costs about 400 ms, not the 800 ms of one backend
-// after the other.
+// A Mixed statement's backends run side by side (backend_set_t::execute_mixed): all slots are sent
+// before any answer is awaited, so two 400 ms slices cost about 400 ms, not 800 ms.
 TEST_CASE("Cross-backend JOIN runs its backends side by side") {
     using namespace std::chrono_literals;
     constexpr auto slice_time = 400ms;
@@ -543,12 +537,9 @@ TEST_CASE("return empty test case") {
     az_scheduler->stop();
 }
 
-// Regression for the latent >1024-row truncation: a result reaches the client as a
-// batch of <=1024-row chunks (never one oversized chunk). The backend answers N=2500
-// rows in one chunk; db::backend_t splits it into ceil(2500/1024)=3 chunks, and since
-// the backend answered the statement whole, the Worker hands them to the payload
-// without the engine (Worker::take_backend_result). The whole vector must ride
-// through the scheduler into the session_payload without losing rows.
+// A result reaches the client as chunks of at most 1024 rows, never one oversized chunk. The backend
+// answers 2500 rows in one chunk, db::backend_t splits it into 3, and the Worker passes them to the
+// payload without the engine (Worker::take_backend_result). No row may be lost on the way.
 TEST_CASE("multi-chunk result carries all rows through the scheduler") {
     using namespace std::chrono_literals;
 

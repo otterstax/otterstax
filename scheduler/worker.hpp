@@ -15,17 +15,16 @@
 
 #include <core/result_wrapper.hpp>
 
+#include <atomic>
+#include <cstdint>
 #include <memory>
 #include <memory_resource>
 #include <optional>
 #include <string>
 #include <unordered_map>
 
-// Forward declarations for the external-table (CREATE EXTERNAL TABLE / COPY ... TO)
-// dispatch path. The full types live in connectors/common/transfer.hpp and
-// otterbrix/parser/grammar_extention; pulling them in here would force every
-// translation unit that includes scheduler/worker.hpp to drag in Arrow's S3
-// filesystem and the parser AST, which is wasteful (rules 10 / 14).
+// Forward declarations for the external-table dispatch path; the full types would pull Arrow's S3
+// filesystem and the parser AST into every includer of this header.
 namespace db {
     struct backend_registry_t;
     struct backend_set_t;
@@ -85,19 +84,19 @@ public:
     unique_future<session_result> close_statement(session_hash_t id);
     unique_future<session_result> execute_plan(session_hash_t id, ParsedQueryDataPtr data);
     unique_future<session_result> prepare_plan(session_hash_t id, ParsedQueryDataPtr data);
-    // Does nothing. A pool answer's waker sends it when the Worker is not parked, since the
-    // Worker may then be asleep on its mailbox:
-    // actor-zeta 1.2.0 leaves a cooperative actor blocked there when, after resuming one
-    // awaited answer, its handler suspends on the next one and no message is queued
-    // (cooperative_actor::resume_impl re-checks is_busy only inside its message loop). Taken
-    // from the mailbox once the handler in progress has finished. At most one is queued at a
-    // time (actor_parking_t::woken).
+    // Does nothing. A pool answer's waker sends it when the Worker is not parked: actor-zeta 1.2.0
+    // leaves a cooperative actor blocked on its mailbox if, after resuming one awaited answer, its handler
+    // suspends on the next with no message queued. At most one is queued (actor_parking_t::woken).
     unique_future<void> wake();
 
     // Hides cooperative_actor::resume (the scheduler calls it statically typed): a Worker
     // whose behavior is suspended on an unsettled backend or transfer answer parks instead
     // of being re-run until the answer arrives (scheduler/parking.hpp).
     actor_zeta::scheduler::resume_info resume(std::size_t max_throughput) noexcept;
+
+    // How many times the scheduler has run any Worker, for tests. A parked Worker runs a few
+    // times per statement; a spinning one thousands of times per wait.
+    static std::uint64_t runs() noexcept { return runs_.load(std::memory_order_relaxed); }
 
     using dispatch_traits = actor_zeta::dispatch_traits<&Worker::execute,
                                                         &Worker::execute_statement,
@@ -117,6 +116,8 @@ private:
         NodeTag tag;
         backend_type_t backend_type{backend_type_t::Unknown};
     };
+
+    static inline std::atomic<std::uint64_t> runs_{0};
 
     std::pmr::memory_resource* resource_;
     // The conn::wait_owner_t of this Worker's backends and transfers; declared before them.
@@ -163,10 +164,8 @@ private:
     // engine; any other statement passes with no_error.
     unique_future<core::error_t> guard_database_ddl(const ParsedQueryData& data);
 
-    // Runs a parsed external-table statement (CREATE EXTERNAL TABLE / COPY ... TO):
-    // the S3 alias's or the local-file transfer pool moves the bytes, the engine
-    // calls (create_table, execute) stay on this Worker. The DDL/COPY itself
-    // produces no rows, so both return an empty session_payload on success.
+    // Runs a parsed external-table statement (CREATE EXTERNAL TABLE / COPY ... TO): a transfer pool
+    // moves the bytes, the engine calls stay on this Worker. Returns an empty session_payload on success.
     unique_future<session_result>
     handle_external_statement(session_hash_t id, const otterstax::external::external_node_t& ext);
     unique_future<session_result>
@@ -185,9 +184,8 @@ private:
                                        components::cursor::cursor_t_ptr cursor,
                                        ParsedQueryDataPtr data);
     session_result take_payload(session_hash_t id, components::cursor::cursor_t& cursor);
-    // The rows of a statement a backend answered whole — its statement node is the
-    // backend's data, so nothing is left for the engine to run — taken straight into the
-    // payload. Empty when the engine still has work: anything else in the plan, a remote
-    // DML (its count is answered by OtterbrixManager::execute), a column-less result.
+    // Takes the rows of a statement a backend answered whole straight into the payload. Empty when the
+    // engine still has work: other plan nodes, a remote DML (counted by OtterbrixManager::execute),
+    // or a column-less result.
     std::optional<session_result> take_backend_result(session_hash_t id, ParsedQueryData& data);
 };

@@ -34,40 +34,30 @@ namespace mysql {
         std::chrono::milliseconds statement_timeout{90'000};  // total time one statement may take
     };
 
-    // A statement's raw answer decoded as the statement asks: rows through
-    // tsl::mysql_to_chunk (a DML's OK packet becomes the affected-row carrier there), the
-    // schema through tsl::mysql_to_struct of the column definitions — none for a bare OK
-    // packet — and the count from affected_rows(). A free function so a test driver
-    // answering canned results decodes them exactly as the driver does.
+    // Decodes a statement's raw answer: rows via tsl::mysql_to_chunk, the schema via mysql_to_struct
+    // (none for a bare OK packet), the count from affected_rows(). A free function so a test driver
+    // with canned results decodes exactly as the driver does.
     conn::statement_outcome_t
     decode(std::pmr::memory_resource* resource, const bm::results& rows, const conn::statement_t& statement);
 
     // One MySQL / MariaDB connection over Boost.MySQL, sync from the outside.
-    //
-    // Boost.MySQL's own sync functions take no deadline, and Asio's blocking reads ignore a
-    // socket timeout: on EAGAIN sync_recv1 polls again without a limit. So a backend that
-    // stops answering would hold the connection's thread for good. The driver therefore runs
-    // Boost.MySQL's async operations, each under asio::cancel_after with the time left of
-    // the call's one deadline, inside a coroutine on a private io_context that only the
-    // calling (pool) thread runs. With one thread, the deadline timer's handler and the
-    // operation's run one after the other, so the timed_cancel_op race the old connector's
-    // strand guarded against (two pool threads) cannot happen.
-    //
-    // Every statement goes over the binary protocol, never COM_QUERY: the text protocol
-    // renders a FLOAT column with FLT_DIG (six) significant digits, so rows read over it are
-    // not the values the backend holds. The statement is prepared, then executed and closed
-    // in one pipeline round trip; the close stage runs even when execute fails, so no
-    // server-side handle outlives the statement.
-    //
-    // A statement past its deadline is killed on the server (KILL QUERY over a connection of
-    // its own, cancel_on_server): closing the socket alone leaves it running — a DML that may
-    // still commit, and a server connection outside the pool's max_size. The session id it
-    // names is read once per connect (SELECT CONNECTION_ID()). Behind a proxy that
-    // multiplexes client sessions onto backend connections and forwards both statements
-    // as-is, that id is a backend connection's, not this session's.
+    // 
+    // Boost.MySQL's sync calls take no deadline and Asio's blocking reads ignore socket timeouts, so a
+    // silent backend would hold the thread forever. The driver runs the async operations under
+    // asio::cancel_after with the call's remaining deadline, in a coroutine on a private io_context
+    // that only the calling pool thread runs, so the timer and the operation never race.
+    // 
+    // Statements use the binary protocol, never COM_QUERY: the text protocol rounds FLOAT to six digits.
+    // Prepare, execute and close go in one pipeline; close runs even if execute fails.
+    // 
+    // A statement past its deadline is killed with KILL QUERY on its own connection (cancel_on_server),
+    // since closing the socket leaves it running. The session id is read once per connect. Behind a
+    // proxy that multiplexes sessions, that id is a backend connection's, not this session's.
     class driver_t final : public conn::IDriver {
     public:
-        driver_t(std::pmr::memory_resource* resource, connect_params params, std::string alias);
+        // `params` is the startup config descriptor (std::string: what bm::connect_params
+        // takes); the alias is copied onto `resource`.
+        driver_t(std::pmr::memory_resource* resource, connect_params params, std::string_view alias);
         ~driver_t() override;
 
         core::error_t connect() override;
@@ -77,7 +67,7 @@ namespace mysql {
         std::unique_ptr<conn::IDriver> clone_disconnected() const override;
 
         const connect_params& params() const noexcept { return params_; }
-        const std::string& alias() const noexcept { return alias_; }
+        std::string_view alias() const noexcept { return alias_; }
 
     private:
         using clock = std::chrono::steady_clock;
@@ -114,7 +104,7 @@ namespace mysql {
         core::error_t query_error(const boost::system::error_code& ec,
                                   const bm::diagnostics& diag,
                                   std::string_view sql) const;
-        core::error_t connection_error(std::string_view what) const;
+        core::error_t connection_error(std::pmr::string what) const;
         // A fresh any_connection on io_: one whose operation was cancelled is unusable, and
         // the old socket closes without COM_QUIT. Safe only while nothing is pending on io_,
         // which holds between calls.
@@ -123,7 +113,7 @@ namespace mysql {
         log_t log_;
         std::pmr::memory_resource* resource_;
         connect_params params_;
-        std::string alias_;
+        std::pmr::string alias_;
         asio::io_context io_;     // private; run only by the thread that calls this driver
         bm::any_connection conn_; // on io_
         bool connected_{false};
@@ -132,6 +122,6 @@ namespace mysql {
 
     // A disconnected driver: the prototype connection_pool_t::add clones every connection from.
     std::unique_ptr<conn::IDriver>
-    make_driver(std::pmr::memory_resource* resource, connect_params params, std::string alias);
+    make_driver(std::pmr::memory_resource* resource, connect_params params, std::string_view alias);
 
 } // namespace mysql

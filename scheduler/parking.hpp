@@ -11,47 +11,32 @@
 #include <memory>
 #include <mutex>
 
-// Parks a cooperative actor (actor_zeta::basic_actor) while its behavior is suspended on a
-// pool answer, instead of letting actor-zeta re-run it until the answer arrives.
-//
-// actor-zeta (1.2.0, and 2.0.0 by design) keeps an actor whose behavior awaits an unsettled
-// future scheduled: cooperative_actor::resume_impl answers `resume` with keep_scheduled, and
-// the scheduler puts the job straight back on its queue — a busy loop through the queue's
-// mutex, a core per waiting actor. Readiness is a flag on the future; settling a promise
-// touches neither the mailbox nor the scheduler, so nothing else could wake a parked actor.
+// Parks a cooperative actor while its behavior is suspended on a pool answer. Without it actor-zeta
+// (1.2.0, and 2.0.0 by design) re-runs the actor in a busy loop, a core per waiting actor, because
+// settling a promise touches neither the mailbox nor the scheduler.
 //
 // This is the conn::wait_owner_t of an actor whose requests go to a work_pool_t:
 //   - every request is submitted with watch(ticket)'s waker;
-//   - the actor's coroutine calls suspending_on(ticket) right before it suspends on the
-//     answer and resumed() right after (db::backend_t::answer);
-//   - the actor hides cooperative_actor::resume with one that asks park() first — the
-//     scheduler calls it as scheduler::detail::resume_impl<Actor>, statically typed:
+//   - the coroutine calls suspending_on(ticket) just before it suspends on the answer and resumed()
+//     just after (db::backend_t::answer);
+//   - the actor hides cooperative_actor::resume with a version that asks park() first:
 //
 //         resume_info resume(size_t n) noexcept {
 //             if (parking_.park()) return resume_info(resume_result::awaiting, 0);
 //             return actor_zeta::basic_actor<Actor>::resume(n);
 //         }
 //
-// park() is true when the behavior is suspended on a ticket not yet settled. The actor then
-// answers `awaiting` without entering the base: the job is dropped, the actor stays marked
-// scheduled — so a message sent meanwhile does not enqueue it a second time — and the
-// ticket's waker enqueues it again. A spurious run (another request's waker) parks again. A
-// wait on anything that is not a watched pool answer runs the base, polled as before.
+// park() is true when the behavior waits on an unsettled ticket. The job is dropped but the actor
+// stays marked scheduled, so no message enqueues it twice, and the ticket's waker enqueues it again.
+// Waits on anything but a watched pool answer run the base and are polled.
 //
-// The waker of a request that finds the actor NOT parked sends it the no-op `wake` message
-// instead: the actor may be asleep on its mailbox (actor-zeta 1.2.0 blocks it when, after
-// resuming one awaited answer, its handler suspends on another and no message is queued).
-// At most one wake is in the mailbox at a time: while one is queued the mailbox is not empty,
-// so resume_impl never blocks the actor on it (try_block is reached only on an empty
-// mailbox), and a second wake would only be one more dispatch of nothing. A queued wake is
-// taken only when no handler is suspended, so a waker that skips its send meanwhile has no
-// handler waiting on its answer. The actor's wake() calls woken() first, and the next waker
+// A waker that finds the actor not parked sends it the no-op `wake` message, since actor-zeta 1.2.0
+// may have blocked the actor on its mailbox. At most one wake is queued: a queued wake keeps the
+// mailbox non-empty, so the actor is never blocked on it. wake() calls woken() first; the next waker
 // sends again.
 //
-// Actor needs `actor_zeta::unique_future<void> wake()` in its dispatch_traits, calling
-// woken() before anything else. The scheduler
-// must be stopped before the actor is destroyed (as for any actor); the destructor detaches
-// the wakers of requests still in flight.
+// Actor needs `unique_future<void> wake()` in its dispatch_traits, calling woken() first. Stop the
+// scheduler before destroying the actor; the destructor detaches the wakers of requests in flight.
 template<class Actor>
 class actor_parking_t final : public conn::wait_owner_t {
 public:
@@ -105,10 +90,8 @@ public:
         waiting_on_.reset();
     }
 
-    // The flags pair like Dekker's: park() stores `parked` then loads `settled`, the waker
-    // stores `settled` then exchanges `parked` (all sequentially consistent), so either
-    // park() sees the answer or the waker sees the park — a parked actor is never left
-    // without its enqueue.
+    // The flags pair like Dekker's, all seq_cst: park() stores `parked` then loads `settled`, the waker
+    // stores `settled` then exchanges `parked`. Either park() sees the answer or the waker sees the park.
     bool park() noexcept {
         conn::wait_ticket_ptr ticket;
         {

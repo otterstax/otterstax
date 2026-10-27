@@ -4,29 +4,30 @@
 #pragma once
 
 #include "integration/backend.hpp"
+#include "utility/string_hash.hpp"
 
 #include <memory_resource>
 #include <shared_mutex>
 #include <string>
 #include <string_view>
-#include <unordered_map>
 
 namespace db {
 
-    // Named-type overrides of every discovered ClickHouse table: uid → table → the column
-    // types system.columns answered (a named Tuple's field names, which the native protocol's
-    // block headers do not carry). Discovery writes it — at startup, through the catalog's
-    // backend — and every Worker's backend reads it for each statement. A table without an
-    // entry (a DDL target, never probed) has no overrides. The lock only orders a
-    // re-discovery a test may run against those reads.
+    // Named-type overrides of discovered ClickHouse tables: uid -> table -> the column types
+    // system.columns answered (the native protocol's headers lack named Tuple field names). Discovery
+    // writes it, every Worker's backend reads it. The lock only orders a test's re-discovery.
     class ch_metadata_t {
     public:
-        void set(const std::string& uid, const std::string& table, conn::named_types_ptr types);
-        conn::named_types_ptr find(const std::string& uid, const std::string& table) const;
+        explicit ch_metadata_t(std::pmr::memory_resource* resource)
+            : tables_(resource) {}
+
+        void set(std::string_view uid, std::string_view table, conn::named_types_ptr types);
+        conn::named_types_ptr find(std::string_view uid, std::string_view table) const;
 
     private:
         mutable std::shared_mutex mutex_;
-        std::unordered_map<std::string, std::unordered_map<std::string, conn::named_types_ptr>> tables_;
+        // Both levels on the registry's resource: an inner map takes it from the outer one.
+        otterstax::pmr_string_map_t<otterstax::pmr_string_map_t<conn::named_types_ptr>> tables_;
     };
 
     struct clickhouse_traits;
@@ -38,7 +39,7 @@ namespace db {
         static constexpr std::string_view log_tag = logger_tag::CH_CONNECTION_MANAGER;
         using metadata_t = ch_metadata_t;
 
-        static core::error_t check(const metadata_t&, const std::string&, std::pmr::memory_resource*) {
+        static core::error_t check(const metadata_t&, std::string_view, std::pmr::memory_resource*) {
             return core::error_t::no_error();
         }
 
@@ -46,31 +47,27 @@ namespace db {
         // (materialized views add theirs; async_insert reports none). A lightweight DELETE and
         // ALTER ... UPDATE are mutations outside the statement's pipeline: they report 0.
         static conn::statement_t slot_statement(components::logical_plan::node_type slot,
-                                                std::string sql,
+                                                std::pmr::string sql,
                                                 const metadata_t& metadata,
-                                                const std::string& uid,
-                                                const std::string& table);
+                                                std::string_view uid,
+                                                std::string_view table);
         static core::result_wrapper_t<components::vector::data_chunk_t>
         slot_chunk(std::pmr::memory_resource* resource,
                    components::logical_plan::node_type slot,
                    conn::statement_result_t answer,
-                   const std::string& uid);
+                   std::string_view uid);
         // The prepare probe's header goes through ch_to_struct under the slot's table's named
         // types, as execute's blocks go through ch_to_chunk, so the prepared column types are
         // the executed chunk's by construction.
-        static conn::statement_t probe_statement(std::string probe,
+        static conn::statement_t probe_statement(std::pmr::string probe,
                                                  const metadata_t& metadata,
-                                                 const std::string& uid,
-                                                 const std::string& table);
-        static std::string no_header(const std::string& probe) {
-            return "ClickHouse answered the prepare probe without a header block: " + probe;
-        }
+                                                 std::string_view uid,
+                                                 std::string_view table);
+        static constexpr std::string_view no_header = "ClickHouse answered the prepare probe without a header block: ";
 
-        // `scope.database` is the ClickHouse database the probes run against (empty is
-        // missing_field); empty `scope.collection` → every table of it (system.tables, then one
-        // probe per table), otherwise that table. Each table's named types (system.columns)
-        // are fetched first — a failed metadata query fails the table, so it is never
-        // registered with degraded column types — and the probe's STRUCT is built with them.
+        // `scope.database` is the database to probe (empty is missing_field); empty `scope.collection`
+        // means every table, otherwise that one. Named types (system.columns) are fetched first and a
+        // failure fails the table, so no table is registered with degraded column types.
         static actor_zeta::unique_future<core::result_wrapper_t<catalog_ext::discovered_tables_t>>
         discover(ClickhouseBackend& backend, qualified_name_t scope);
     };

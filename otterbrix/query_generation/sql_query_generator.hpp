@@ -14,14 +14,20 @@
 #include "otterbrix/parser/subquery_extractor.hpp"
 
 #include <memory_resource>
+#include <ostream>
 #include <sstream>
+#include <string>
 #include <vector>
 
 namespace sql_gen {
 
+    // The stream a backend statement is generated into: its buffer on the caller's resource,
+    // and std::move(stream).str() hands that buffer over as the statement's std::pmr::string.
+    using sql_stream_t = std::basic_stringstream<char, std::char_traits<char>, std::pmr::polymorphic_allocator<char>>;
+
     // VALUES (...), (...) for every row of `chunk`, literals in the dialect of
     // `backend`. `resource` owns the returned error's message.
-    core::error_t generate_values(std::stringstream& stream,
+    core::error_t generate_values(std::ostream& stream,
                                   const components::vector::data_chunk_t& chunk,
                                   backend_type_t backend,
                                   std::pmr::memory_resource* resource);
@@ -31,7 +37,7 @@ namespace sql_gen {
     //   PostgreSQL: schema.collection (e.g., public.products; an empty schema is public)
     // Only those three backends have a dialect: any other backend value, and an
     // empty name, is invalid_parameter. `resource` owns the error's message.
-    core::result_wrapper_t<std::string>
+    core::result_wrapper_t<std::pmr::string>
     table_reference(const qualified_name_t& name, backend_type_t backend, std::pmr::memory_resource* resource);
 
     // Rewrites every 4-part qualifier slot of a raw subquery into the backend's
@@ -41,7 +47,7 @@ namespace sql_gen {
     // an unknown name. A slot table_reference refuses (a backend without a
     // dialect, an empty name) fails the rewrite with that error. Error messages
     // are owned by `resource`.
-    core::result_wrapper_t<std::string>
+    core::result_wrapper_t<std::pmr::string>
     replace_qualifiers(std::string_view raw_sql,
                        const std::pmr::vector<otterstax::parser::qualifier_rewrite_t>& quals,
                        backend_type_t backend,
@@ -66,25 +72,23 @@ namespace sql_gen {
     // coroutine can co_return the error directly instead of catching and
     // re-wrapping. Only MySQL, PostgreSQL and ClickHouse are dialects the
     // generator emits; any other backend value is invalid_parameter.
-    core::error_t generate_query(std::stringstream& stream,
+    core::error_t generate_query(std::ostream& stream,
                                  const components::logical_plan::node_ptr& node,
                                  const components::logical_plan::storage_parameters* parameters,
                                  backend_type_t backend,
                                  const otterstax::names::resolved_target_t& target,
                                  const std::pmr::vector<external_entry_t>& batch,
                                  std::pmr::memory_resource* resource);
-    core::result_wrapper_t<std::string> generate_query(const components::logical_plan::node_ptr& node,
+    core::result_wrapper_t<std::pmr::string> generate_query(const components::logical_plan::node_ptr& node,
                                                        const components::logical_plan::storage_parameters* parameters,
                                                        backend_type_t backend,
                                                        const otterstax::names::resolved_target_t& target,
                                                        const std::pmr::vector<external_entry_t>& batch,
                                                        std::pmr::memory_resource* resource);
 
-    // Engine-dialect (Otterbrix, double-quoted identifiers) statements used by
-    // OtterbrixManager when mirroring external connections into the engine
-    // catalog: the per-uid database, the drop of one mirrored collection
-    // (`collection` is the already-encoded engine-side name), and the read of
-    // one column of a collection (the per-uid manifest of mirrored tables).
+    // Engine-dialect (double-quoted) statements OtterbrixManager uses to mirror external connections:
+    // the per-uid database, the drop of one mirrored collection (`collection` is the encoded engine-side
+    // name) and the read of one column of the per-uid manifest. std::string: execute_sql takes one.
     std::string create_database_statement(const std::string& db);
     std::string drop_table_statement(const std::string& db, const std::string& collection);
     std::string

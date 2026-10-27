@@ -153,16 +153,16 @@ namespace tsl {
                             types::logical_value_t{chunk.resource(), rows.at(row_index).at(column_index).as_uint64()});
         }
 
+        void set_text(data_chunk_t& chunk, size_t row_index, size_t column_index, std::string_view text);
+
         void
         set_string(data_chunk_t& chunk, const boost::mysql::rows_view& rows, size_t row_index, size_t column_index) {
             if (rows.at(row_index).at(column_index).kind() == boost::mysql::field_kind::null) {
                 chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), nullptr});
                 return;
             }
-            chunk.set_value(
-                column_index,
-                row_index,
-                types::logical_value_t{chunk.resource(), std::string(rows.at(row_index).at(column_index).as_string())});
+            const auto text = rows.at(row_index).at(column_index).as_string();
+            set_text(chunk, row_index, column_index, std::string_view(text.data(), text.size()));
         }
 
         void set_blob(data_chunk_t& chunk, const boost::mysql::rows_view& rows, size_t row_index, size_t column_index) {
@@ -177,7 +177,28 @@ namespace tsl {
         }
 
         // `value` in at least `width` digits, zero-padded, as MySQL prints it.
-        void append_padded(std::string& out, uint64_t value, size_t width) {
+        // The text of one date / time cell, on the stack: the longest is a TIME of 24 characters
+        // ('-', ten hour digits, ":mm:ss.ffffff"). The engine copies it into the chunk.
+        struct cell_text_t {
+            char data[40];
+            std::size_t size = 0;
+            void push_back(char c) { data[size++] = c; }
+            void reserve(std::size_t) {}
+            std::string_view view() const { return {data, size}; }
+        };
+
+        // A text cell: into the vector's string buffer when the column is a STRING (no value
+        // object, no heap string), through a value object otherwise.
+        void set_text(data_chunk_t& chunk, size_t row_index, size_t column_index, std::string_view text) {
+            if (chunk.data[column_index].type().type() == types::logical_type::STRING_LITERAL) {
+                chunk.set_value(column_index, row_index, text);
+                return;
+            }
+            chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), text});
+        }
+
+        template<typename Out>
+        void append_padded(Out& out, uint64_t value, size_t width) {
             char digits[20];
             size_t count = 0;
             do {
@@ -202,8 +223,8 @@ namespace tsl {
         // MySQL's zero date ('0000-00-00', which boost reports as an invalid
         // date) renders as itself instead of being a conversion the value has
         // none of.
-        std::string date_text(const boost::mysql::date& value) {
-            std::string out;
+        cell_text_t date_text(const boost::mysql::date& value) {
+            cell_text_t out;
             out.reserve(10);
             append_padded(out, value.year(), 4);
             out.push_back('-');
@@ -213,8 +234,8 @@ namespace tsl {
             return out;
         }
 
-        std::string datetime_text(const boost::mysql::datetime& value) {
-            std::string out;
+        cell_text_t datetime_text(const boost::mysql::datetime& value) {
+            cell_text_t out;
             out.reserve(26);
             append_padded(out, value.year(), 4);
             out.push_back('-');
@@ -239,8 +260,8 @@ namespace tsl {
         // sign belongs to the whole value. The magnitude is taken in unsigned
         // arithmetic, so the most negative count — which has no positive
         // counterpart — renders exactly instead of overflowing.
-        std::string time_text(boost::mysql::time value) {
-            std::string out;
+        cell_text_t time_text(boost::mysql::time value) {
+            cell_text_t out;
             out.reserve(17);
             const auto micros = value.count();
             uint64_t magnitude = 0;
@@ -269,10 +290,7 @@ namespace tsl {
                 chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), nullptr});
                 return;
             }
-            chunk.set_value(
-                column_index,
-                row_index,
-                types::logical_value_t{chunk.resource(), date_text(rows.at(row_index).at(column_index).as_date())});
+            set_text(chunk, row_index, column_index, date_text(rows.at(row_index).at(column_index).as_date()).view());
         }
 
         void
@@ -281,11 +299,7 @@ namespace tsl {
                 chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), nullptr});
                 return;
             }
-            chunk.set_value(
-                column_index,
-                row_index,
-                types::logical_value_t{chunk.resource(),
-                                       datetime_text(rows.at(row_index).at(column_index).as_datetime())});
+            set_text(chunk, row_index, column_index, datetime_text(rows.at(row_index).at(column_index).as_datetime()).view());
         }
 
         void set_time(data_chunk_t& chunk, const boost::mysql::rows_view& rows, size_t row_index, size_t column_index) {
@@ -293,10 +307,7 @@ namespace tsl {
                 chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), nullptr});
                 return;
             }
-            chunk.set_value(
-                column_index,
-                row_index,
-                types::logical_value_t{chunk.resource(), time_text(rows.at(row_index).at(column_index).as_time())});
+            set_text(chunk, row_index, column_index, time_text(rows.at(row_index).at(column_index).as_time()).view());
         }
 
         struct value_translator_t {

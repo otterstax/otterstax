@@ -3,13 +3,12 @@
 
 #pragma once
 
+#include "utility/string_hash.hpp"
+
 #include <chrono>
 #include <cstddef>
 #include <functional>
 #include <memory>
-#include <string>
-#include <string_view>
-#include <unordered_map>
 
 namespace conn {
 
@@ -24,20 +23,14 @@ namespace conn {
         std::chrono::milliseconds connect_backoff{1'000};   // wait after a failed connect before the next one
     };
 
-    // Called on the pool thread once a request's answer is settled and its promise released,
-    // for an awaiter that does not poll on its own: settling a promise schedules nobody. A
-    // Worker parks while it awaits and its waker enqueues it again, or sends it a message when
-    // it is not parked (wait.hpp, scheduler/parking.hpp). Empty for an awaiter that polls
-    // until the answer is there (CatalogManager's enqueue_impl, otterstax::test::drive).
+    // Runs on the pool thread once a request's answer settles and its promise is released, for an awaiter
+    // that does not poll: settling schedules nobody, so a Worker's waker re-enqueues it or sends Worker::wake
+    // if not parked (wait.hpp, scheduler/parking.hpp); empty for a poller (CatalogManager, test::drive).
     using waker_t = std::function<void()>;
 
-    // Alias → its pool (connection_pool_t, transfer_pools_t). The hash is transparent, so a
-    // lookup by string_view builds no string.
-    struct alias_hash {
-        using is_transparent = void;
-        std::size_t operator()(std::string_view alias) const noexcept { return std::hash<std::string_view>{}(alias); }
-    };
+    // Alias → its pool (connection_pool_t, transfer_pools_t), on the registry's resource. The
+    // hash is transparent, so a lookup by string_view builds no string.
     template<class Pool>
-    using alias_map_t = std::unordered_map<std::string, std::unique_ptr<Pool>, alias_hash, std::equal_to<>>;
+    using alias_map_t = otterstax::pmr_string_map_t<std::unique_ptr<Pool>>;
 
 } // namespace conn

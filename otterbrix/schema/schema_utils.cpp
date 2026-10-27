@@ -46,13 +46,9 @@ namespace {
                                            logical_plan::parameter_node_t* params,
                                            cursor::cursor_t_ptr catalog,
                                            const std::pmr::map<qualified_name_t, size_t>& dependencies) {
-        // A stub child IS this aggregate's input relation: the statement's FROM
-        // is a federated sub-query, whose columns the backend described onto the
-        // stub (db::backend_t::describe). The aggregate itself names no table
-        // then — it is the transformer's unnamed derived-table wrapper — so the
-        // catalog lookup below has nothing to answer with and the projection is
-        // resolved against the described columns instead. A stub no backend
-        // described carries no STRUCT and is left to that lookup, unchanged.
+        // A stub child is this aggregate's input: a federated sub-query whose columns the backend
+        // described (db::backend_t::describe). The aggregate names no table, so the projection is
+        // resolved against those columns. A stub with no STRUCT goes to the catalog lookup below.
         for (const auto& child : node.children()) {
             if (child->type() != logical_plan::node_type::unused) {
                 continue;
@@ -218,20 +214,10 @@ namespace schema_utils {
                 // width, so no wire is told a type that cannot hold what arrives.
                 return types::logical_type::UBIGINT;
             }
-            // SUM and AVG are deliberately NOT the engine's answer. Both kernels are
-            // output_type::computed(same_type_resolver(0)) as well (aggregate.cpp:443,
-            // :527): the engine sums and averages IN the argument's own type, so SUM over
-            // an INTEGER column is INTEGER and AVG over one is integer division. No backend
-            // agrees — MySQL's AVG is DOUBLE and its SUM of an integer column DECIMAL,
-            // PostgreSQL's sum(int4) is int8 and avg(int4) numeric — and this one
-            // computation has no way to tell which executor it is typing for. Narrowing
-            // them to the kernel rule would trade today's mismatch on the local engine for
-            // a worse one on every remote path: an INTEGER announced where a DOUBLE or an
-            // int8 arrives differs in width AND kind, where COUNT above differs only in
-            // signedness over the same 64-bit non-negative value. Until the type comes from
-            // whoever executes the statement — a prepare-time probe like
-            // db::backend_t::describe, or the backend threaded in here — these two stay
-            // the answer the remote paths were built on.
+            // SUM and AVG deliberately do not take the engine's answer, the argument's own type (AVG of
+            // an INTEGER is integer division). No backend agrees (MySQL AVG is DOUBLE, PostgreSQL
+            // sum(int4) is int8) and this code cannot tell which executor it types for, so they keep the
+            // types the remote paths were built on until the executing side supplies the type.
             if (fn == "sum") {
                 return types::logical_type::BIGINT;
             }

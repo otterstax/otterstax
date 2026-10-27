@@ -328,11 +328,8 @@ TEST_CASE("MySQL backend execute: a substituted wide slice reaches the engine cu
 }
 
 // ── A converter still running when execute() answers an earlier failure ──────
-// execute() sends every slot of a batch to the alias's pool and answers the first
-// failed answer, dropping the futures of the slots still in flight. A pool thread
-// still decoding one of them — its converter refusing the result — then settles a
-// promise nobody awaits: the answer must land in the promise's own state, which
-// the pool keeps alive, never in memory the backend already freed.
+// execute() answers the first failed slot and drops the futures of slots still in flight. A pool thread
+// that then settles one must write into the promise's own state (kept alive by the pool), not freed memory.
 
 namespace {
 
@@ -477,26 +474,10 @@ TEST_CASE("MySQL backend execute: a statement still decoding when an earlier slo
 }
 
 // ── NOT NULL over a backend slice wider than one engine chunk ─────────────────
-// INSERT INTO <local table with a NOT NULL column> SELECT ... FROM <backend>: the
-// backend substitutes the SELECT slot with the fetched rows as raw data
-// under the engine's insert, cut into chunks of at most DEFAULT_VECTOR_CAPACITY
-// rows. A NULL in the NOT NULL column must refuse the statement and leave the
-// table empty wherever the NULL row falls.
-//
-// rc-2 checks NOT NULL twice. Plan validation (validate_static_nulls in
-// services/dispatcher/validate_logical_plan.cpp) reads only the FIRST raw chunk
-// under the insert and answers "insert_node: NULL value for NOT NULL column".
-// The check-constraint operator the planner stacks on every insert into a table
-// with NOT NULL columns (components/planner/planner.cpp rewrite_insert →
-// operator_check_constraint_t::validate_) reads every chunk of the written rows
-// and answers "NOT NULL constraint violated for column". So a NULL past the first
-// chunk is refused by the operator, and no row is left behind — the way the engine
-// refuses its own literal INSERT, which the rc-2 transformer cuts into chunks of
-// DEFAULT_VECTOR_CAPACITY rows (the engine-alone cases).
-//
-// Driven through the real Scheduler→Worker→catalog stack over a PostgreSQL mock
-// driver (its discovery answers the table's columns; the substitution is the same
-// in all three backends).
+// INSERT INTO <local table with NOT NULL column> SELECT ... FROM <backend> must refuse the statement and
+// leave the table empty wherever the NULL row falls, even past the first DEFAULT_VECTOR_CAPACITY chunk.
+// Plan validation reads only the first raw chunk; the check-constraint operator reads every chunk, so it
+// catches a later NULL. Runs through the real Scheduler, Worker and catalog over a PostgreSQL mock driver.
 
 namespace {
 
@@ -720,12 +701,9 @@ TEST_CASE("engine alone: a literal INSERT with a NULL past the first chunk of a 
 }
 
 // ── ClickHouse: nested columns past one engine chunk; a result column named like a base column ──────
-// Real engine, real parser, real catalog over a ClickHouse mock driver whose discovery answers
-// chdb.events (id Int32, score Int32, nums Array(Nullable(Int32)), tags Array(Nullable(String)),
-// rec Tuple(a Int32, b Nullable(String))) — the system.columns types and the header block of the
-// `WHERE 1 = 0` probe — and whose data query answers ClickHouse blocks for the generated statement's
-// SELECT list. The blocks go through the ClickHouse driver's own decode: ch_to_chunk under the
-// discovered named types; then the backend's split_to_capacity, then the engine.
+// Real engine, parser and catalog over a ClickHouse mock driver that answers discovery for chdb.events
+// and ClickHouse blocks for the slot statement. Blocks go through ch_to_chunk, split_to_capacity, then
+// the engine.
 
 namespace {
 
@@ -866,15 +844,10 @@ namespace {
         return columns;
     }
 
-    // The slot statement: AVG(score) AS score is ClickHouse's Float64 avg under the Int32 column's
-    // name; any other statement is the rows of the columns it selects, in two blocks. Discovery
-    // (system.columns answers the named types, the table probe the header block of every column)
-    // and the describe probe of a prepare, told apart by the wrap describe puts around the
-    // statement — the discovery probe is a `WHERE 1 = 0` over the table and has no `(` after FROM.
-    // The describe probe answers the header of the columns its inner statement projects, rowless,
-    // so a prepare reads the columns the slot statement of that same statement answers: AVG(score)
-    // is the Float64 the slot statement sends under the Int32 column's name. Every answer is
-    // decoded by the ClickHouse driver's own decode, under the named types the statement carries.
+    // Slot statement: AVG(score) AS score is a Float64 under the Int32 column's name; any other statement
+    // returns its columns' rows in two blocks. Discovery (a `WHERE 1 = 0` probe with no `(` after FROM)
+    // and the describe probe (wrapped in a subquery, answered rowless) are told apart by that wrap.
+    // Every answer goes through the ClickHouse driver's own decode.
     class events_ch_driver final : public conn::IDriver {
     public:
         explicit events_ch_driver(std::pmr::memory_resource* resource)
@@ -889,7 +862,7 @@ namespace {
 
         conn::statement_outcome_t execute(const conn::statement_t& statement) override {
             const std::string_view query = statement.sql;
-            ch::select_result_t answer;
+            ch::select_result_t answer(std::pmr::new_delete_resource());
             if (otterstax::test::is_discovery(statement)) {
                 answer.blocks.push_back(discovery_block(query));
             } else if (query.find("AVG(") != std::string_view::npos) {

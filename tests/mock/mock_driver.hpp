@@ -34,16 +34,10 @@ namespace otterstax::test {
                sql.find("pg_enum") != std::string_view::npos;
     }
 
-    // A connection that is always up, of any backend type. Discovery succeeds with nothing
-    // to report — no tables listed, no ENUMs, a column-less schema — so a connection
-    // registers whatever its data path is configured to do, as a backend that came up
-    // healthy and only fails later at query time. A slot statement answers, after
-    // config.wait_time:
-    //   - the canned chunk (id INTEGER, name STRING, two rows);
-    //   - a chunk without columns (config.return_empty);
-    //   - the configured failure as io_error (config.can_throw: a driver never throws, so
-    //     the failure is the value a real driver hands back);
-    //   - an affected-row count of 42 for an affected_rows statement.
+    // A connection of any backend type that is always up. Discovery succeeds and reports nothing, so a
+    // backend registers and fails only at query time. A slot statement answers after config.wait_time:
+    // the canned chunk (id INTEGER, name STRING, two rows); an empty chunk (return_empty); io_error
+    // (can_throw, as a real driver returns failures); or a count of 42 for an affected_rows statement.
     class mock_driver_t final : public conn::IDriver {
     public:
         mock_driver_t(mock_config config, std::string alias)

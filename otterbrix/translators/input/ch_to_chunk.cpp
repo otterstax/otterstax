@@ -2,18 +2,21 @@
 
 #include "otterbrix/translators/error.hpp"
 
+#include "utility/stack_arena.hpp"
+#include "utility/pmr_text.hpp"
 #include "utility/tracy_profiler.hpp"
 
+#include <algorithm>
 #include <arpa/inet.h>
 #include <charconv>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <iomanip>
 #include <netinet/in.h>
 #include <optional>
-#include <sstream>
+#include <string>
+#include <string_view>
 #include <utility>
 
 #include <clickhouse/columns/column.h>
@@ -45,10 +48,12 @@ namespace tsl {
 
         types::logical_type ch_code_to_logical(clickhouse::Type::Code code);
         types::complex_logical_type
-        ast_to_complex_type(std::pmr::memory_resource* resource, const clickhouse::TypeAst& ast, const std::string& alias);
+        ast_to_complex_type(std::pmr::memory_resource* resource, const clickhouse::TypeAst& ast, std::string_view alias);
         types::complex_logical_type build_from_named_string(std::pmr::memory_resource* resource,
-                                                            const std::string& type_str,
-                                                            const std::string& alias);
+                                                            std::string_view type_str,
+                                                            std::string_view alias);
+
+        using otterstax::append_number;
         // The value one wire cell holds, read as `target_type`; nullopt when the wire value has no
         // reading as that type.
         std::optional<types::logical_value_t> read_value(std::pmr::memory_resource* res,
@@ -56,15 +61,22 @@ namespace tsl {
                                                          size_t row,
                                                          const types::complex_logical_type& target_type);
         bool has_type(const types::logical_value_t& value, const types::complex_logical_type& type);
+        // Cell `row` of a top-level STRING column written straight into the chunk's vector;
+        // false when the wire value has no text.
+        bool write_text_cell(data_chunk_t& chunk,
+                             size_t chunk_col,
+                             size_t chunk_row,
+                             const clickhouse::ColumnRef& col,
+                             size_t row);
 
         // The column's type as the wire describes it.
         types::complex_logical_type
         wire_type(std::pmr::memory_resource* resource, const clickhouse::Block& block, size_t col) {
-            std::string col_name = block.GetColumnName(col);
+            const auto& col_name = block.GetColumnName(col); // clickhouse-cpp owns it
             auto type_ref = block[col]->Type();
             const clickhouse::TypeAst* ast = clickhouse::ParseTypeName(type_ref->GetName());
             if (ast == nullptr) {
-                return {ch_code_to_logical(get_base_type_code(type_ref)), col_name.c_str()};
+                return {ch_code_to_logical(get_base_type_code(type_ref)), std::string(col_name)}; // the engine takes a std::string
             }
             return ast_to_complex_type(resource, *ast, col_name);
         }
@@ -110,7 +122,7 @@ namespace tsl {
                       const clickhouse::Block& block,
                       size_t col,
                       const types::complex_logical_type& wire,
-                      const std::unordered_map<std::string, std::string>& named_type_overrides) {
+                      const named_type_map_t& named_type_overrides) {
             const auto override_it = named_type_overrides.find(block.GetColumnName(col));
             if (override_it == named_type_overrides.end()) {
                 return std::nullopt;
@@ -129,7 +141,7 @@ namespace tsl {
         column_type(std::pmr::memory_resource* resource,
                     const clickhouse::Block& block,
                     size_t col,
-                    const std::unordered_map<std::string, std::string>& named_type_overrides) {
+                    const named_type_map_t& named_type_overrides) {
             auto wire = wire_type(resource, block, col);
             auto declared = declared_type(resource, block, col, wire, named_type_overrides);
             if (declared.has_value()) {
@@ -142,13 +154,16 @@ namespace tsl {
                                        const clickhouse::Block& block,
                                        size_t col,
                                        size_t result_row,
-                                       const std::unordered_map<std::string, std::string>& named_type_overrides) {
-            const std::string col_name = block.GetColumnName(col);
-            std::string what = "ClickHouse column '" + col_name + "' of wire type " + block[col]->Type()->GetName();
+                                       const named_type_map_t& named_type_overrides) {
+            const auto& col_name = block.GetColumnName(col);
+            std::pmr::string what(resource);
+            what.append("ClickHouse column '").append(col_name).append("' of wire type ").append(block[col]->Type()->GetName());
             if (declared_type(resource, block, col, wire_type(resource, block, col), named_type_overrides).has_value()) {
-                what += " declared " + named_type_overrides.find(col_name)->second;
+                what.append(" declared ").append(named_type_overrides.find(col_name)->second);
             }
-            what += ": the value in row " + std::to_string(result_row) + " cannot be converted to the column's type";
+            what.append(": the value in row ");
+            append_number(what, result_row);
+            what.append(" cannot be converted to the column's type");
             return make_error(resource, core::error_code_t::conversion_failure, what);
         }
 
@@ -159,18 +174,30 @@ namespace tsl {
                                    const types::complex_logical_type& type,
                                    const clickhouse::Block& block,
                                    size_t first_row,
-                                   const std::unordered_map<std::string, std::string>& named_type_overrides) {
+                                   const named_type_map_t& named_type_overrides) {
             const size_t nrows = block.GetRowCount();
             if (nrows == 0) {
                 return core::error_t::no_error();
             }
             if (col >= block.GetColumnCount()) {
-                return make_error(resource,
-                                  core::error_code_t::conversion_failure,
-                                  "ClickHouse block of " + std::to_string(nrows) + " row(s) has no column " +
-                                      std::to_string(col));
+                std::pmr::string what(resource);
+                what.append("ClickHouse block of ");
+                append_number(what, nrows);
+                what.append(" row(s) has no column ");
+                append_number(what, col);
+                return make_error(resource, core::error_code_t::conversion_failure, what);
             }
             const auto& column = block[col];
+            // A STRING cell goes into the vector's string buffer as it is read: no value object,
+            // no heap string per cell (the decode's most common cell).
+            if (type.type() == types::logical_type::STRING_LITERAL) {
+                for (size_t row = 0; row < nrows; ++row) {
+                    if (!write_text_cell(chunk, col, first_row + row, column, row)) {
+                        return unreadable_value(resource, block, col, first_row + row, named_type_overrides);
+                    }
+                }
+                return core::error_t::no_error();
+            }
             for (size_t row = 0; row < nrows; ++row) {
                 auto value = read_value(resource, column, row, type);
                 // The engine refuses a value whose type is not its vector's (and a child vector a
@@ -193,7 +220,7 @@ namespace tsl {
     core::result_wrapper_t<data_chunk_t>
     ch_to_chunk(std::pmr::memory_resource* resource,
                 const clickhouse::Block& block,
-                const std::unordered_map<std::string, std::string>& named_type_overrides) {
+                const named_type_map_t& named_type_overrides) {
         OTX_ZONE_N("tsl::ch_to_chunk(block)");
         // No affected-row counterpart to mysql_to_chunk / pg_to_chunk here: no
         // ClickHouse block ever carries a count. An INSERT's written rows arrive
@@ -224,14 +251,14 @@ namespace tsl {
 
     // Multi-block version: allocates one chunk for all rows, fills in-place with no intermediate allocations.
     core::result_wrapper_t<data_chunk_t> ch_to_chunk(std::pmr::memory_resource* resource,
-                                                     const std::vector<clickhouse::Block>& blocks) {
+                                                     const std::pmr::vector<clickhouse::Block>& blocks) {
         return ch_to_chunk(resource, blocks, {});
     }
 
     core::result_wrapper_t<data_chunk_t>
     ch_to_chunk(std::pmr::memory_resource* resource,
-                const std::vector<clickhouse::Block>& blocks,
-                const std::unordered_map<std::string, std::string>& named_type_overrides) {
+                const std::pmr::vector<clickhouse::Block>& blocks,
+                const named_type_map_t& named_type_overrides) {
         OTX_ZONE_N("tsl::ch_to_chunk(blocks)");
         // Find schema block (first with column metadata) and count total rows
         const clickhouse::Block* schema_block = nullptr;
@@ -307,7 +334,7 @@ namespace tsl {
             }
         }
 
-        types::logical_type primitive_name_to_logical(const std::string& name) {
+        types::logical_type primitive_name_to_logical(std::string_view name) {
             if (name == "Int8")
                 return types::logical_type::TINYINT;
             if (name == "Int16")
@@ -334,25 +361,24 @@ namespace tsl {
             return types::logical_type::STRING_LITERAL;
         }
 
-        types::complex_logical_type build_from_named_string(std::pmr::memory_resource* resource,
-                                                            const std::string& type_str,
-                                                            const std::string& alias);
-
-        std::vector<std::pair<std::string, std::string>> split_named_tuple_fields(const std::string& inner) {
-            std::vector<std::pair<std::string, std::string>> out;
+        // The top-level fields of a Tuple's (or a function's) argument list, each a name and a type
+        // — views into `inner`, which must outlive them; a field without a name has an empty one.
+        std::pmr::vector<std::pair<std::string_view, std::string_view>>
+        split_named_tuple_fields(std::pmr::memory_resource* resource, std::string_view inner) {
+            std::pmr::vector<std::pair<std::string_view, std::string_view>> out(resource);
             int depth = 0;
             size_t start = 0;
             auto emit = [&](size_t end) {
-                std::string field = inner.substr(start, end - start);
+                std::string_view field = inner.substr(start, end - start);
                 // trim
                 size_t a = field.find_first_not_of(" \t");
                 size_t b = field.find_last_not_of(" \t");
-                if (a == std::string::npos)
+                if (a == std::string_view::npos)
                     return;
                 field = field.substr(a, b - a + 1);
                 // split on first top-level space
                 int d = 0;
-                size_t sp = std::string::npos;
+                size_t sp = std::string_view::npos;
                 for (size_t i = 0; i < field.size(); ++i) {
                     if (field[i] == '(')
                         d++;
@@ -363,15 +389,15 @@ namespace tsl {
                         break;
                     }
                 }
-                if (sp == std::string::npos) {
-                    out.emplace_back("", field);
+                if (sp == std::string_view::npos) {
+                    out.emplace_back(std::string_view{}, field);
                 } else {
-                    std::string name = field.substr(0, sp);
-                    std::string type = field.substr(sp + 1);
+                    std::string_view name = field.substr(0, sp);
+                    std::string_view type = field.substr(sp + 1);
                     size_t ta = type.find_first_not_of(" \t");
-                    if (ta != std::string::npos)
+                    if (ta != std::string_view::npos)
                         type = type.substr(ta);
-                    out.emplace_back(std::move(name), std::move(type));
+                    out.emplace_back(name, type);
                 }
             };
             for (size_t i = 0; i < inner.size(); ++i) {
@@ -389,7 +415,8 @@ namespace tsl {
             return out;
         }
 
-        std::string strip_wrapper(const std::string& s, const std::string& wrapper) {
+        // The argument list of `wrapper(...)` — a view into `s` — or empty when `s` is not one.
+        std::string_view strip_wrapper(std::string_view s, std::string_view wrapper) {
             if (s.size() < wrapper.size() + 2)
                 return {};
             if (s.compare(0, wrapper.size(), wrapper) != 0)
@@ -400,14 +427,15 @@ namespace tsl {
         }
 
         types::complex_logical_type build_from_named_string(std::pmr::memory_resource* resource,
-                                                            const std::string& type_str,
-                                                            const std::string& alias) {
+                                                            std::string_view type_str,
+                                                            std::string_view alias) {
+            // The engine's type constructors take their alias and name as std::string.
             size_t a = type_str.find_first_not_of(" \t");
             size_t b = type_str.find_last_not_of(" \t");
-            if (a == std::string::npos) {
-                return {types::logical_type::STRING_LITERAL, alias};
+            if (a == std::string_view::npos) {
+                return {types::logical_type::STRING_LITERAL, std::string(alias)};
             }
-            std::string s = type_str.substr(a, b - a + 1);
+            std::string_view s = type_str.substr(a, b - a + 1);
 
             if (auto inner = strip_wrapper(s, "Nullable"); !inner.empty()) {
                 return build_from_named_string(resource, inner, alias);
@@ -417,51 +445,72 @@ namespace tsl {
             }
             // SimpleAggregateFunction(f, T) stores and sends plain values of T, its last argument.
             if (auto inner = strip_wrapper(s, "SimpleAggregateFunction"); !inner.empty()) {
-                auto arguments = split_named_tuple_fields(inner);
+                otterstax::stack_arena_t<256> scratch(resource); // the views die here
+                auto arguments = split_named_tuple_fields(scratch.resource(), inner);
                 if (arguments.size() < 2) {
-                    return {types::logical_type::STRING_LITERAL, alias};
+                    return {types::logical_type::STRING_LITERAL, std::string(alias)};
                 }
                 return build_from_named_string(resource, arguments.back().second, alias);
             }
             // A ClickHouse Array has no fixed length: every row carries its own element count.
             if (auto inner = strip_wrapper(s, "Array"); !inner.empty()) {
                 auto child = build_from_named_string(resource, inner, "");
-                return types::complex_logical_type::create_list(child, alias);
+                return types::complex_logical_type::create_list(child, std::string(alias));
             }
             if (auto inner = strip_wrapper(s, "Tuple"); !inner.empty()) {
-                auto fields = split_named_tuple_fields(inner);
+                // Scratch: the field views and the name buffer (each name is copied into its type).
+                // Not the fields: the engine's STRUCT keeps the vector's allocator
+                // (struct_logical_type_extension copies it with fields.get_allocator()).
+                otterstax::stack_arena_t<512> scratch(resource);
+                auto fields = split_named_tuple_fields(scratch.resource(), inner);
                 std::pmr::vector<types::complex_logical_type> out_fields(resource);
                 out_fields.reserve(fields.size());
                 size_t pos_idx = 0;
+                std::pmr::string field_name(scratch.resource());
                 for (auto& [name, sub_type] : fields) {
-                    std::string field_name = name.empty() ? ("_" + std::to_string(++pos_idx)) : name;
+                    field_name.clear();
+                    if (name.empty()) {
+                        field_name.push_back('_');
+                        append_number(field_name, ++pos_idx);
+                    } else {
+                        field_name.assign(name);
+                    }
                     out_fields.emplace_back(build_from_named_string(resource, sub_type, field_name));
                 }
-                return types::complex_logical_type::create_struct(alias.empty() ? "tuple_t" : (alias + "_t"),
-                                                                  out_fields,
-                                                                  alias);
+                return types::complex_logical_type::create_struct(
+                    alias.empty() ? std::string("tuple_t") : std::string(alias) + "_t",
+                    out_fields,
+                    std::string(alias));
             }
             auto paren = s.find('(');
-            std::string base = (paren == std::string::npos) ? s : s.substr(0, paren);
-            return {primitive_name_to_logical(base), alias};
+            std::string_view base = (paren == std::string_view::npos) ? s : s.substr(0, paren);
+            return {primitive_name_to_logical(base), std::string(alias)};
         }
 
+        // Value texts are built in a stack buffer and passed to the engine as a string_view, since
+        // logical_value_t copies its text anyway and a heap string would be a second allocation per value.
+        // 48 bytes hold the longest: a UInt128 / Decimal128 (39 digits, sign, point) or a DateTime64(9).
+        using value_text_t = char[48];
+
         // A Date / Date32 body is the day number since the Unix epoch; the driver's At() answers
-        // it multiplied into seconds, so the readers take RawAt().
-        std::string format_epoch_day(int32_t day_number) {
+        // it multiplied into seconds, so the readers take RawAt(). YYYY-MM-DD into `out`; its length.
+        std::size_t write_epoch_day(char* out, std::size_t size, int32_t day_number) {
             const std::chrono::year_month_day ymd{std::chrono::sys_days{std::chrono::days{day_number}}};
-            char buf[32];
-            std::snprintf(buf,
-                          sizeof(buf),
-                          "%04d-%02u-%02u",
-                          static_cast<int>(ymd.year()),
-                          static_cast<unsigned>(ymd.month()),
-                          static_cast<unsigned>(ymd.day()));
-            return buf;
+            const int written = std::snprintf(out,
+                                              size,
+                                              "%04d-%02u-%02u",
+                                              static_cast<int>(ymd.year()),
+                                              static_cast<unsigned>(ymd.month()),
+                                              static_cast<unsigned>(ymd.day()));
+            return written > 0 ? std::min(static_cast<std::size_t>(written), size - 1) : 0;
+        }
+
+        std::string_view epoch_day_text(value_text_t& text, int32_t day_number) {
+            return {text, write_epoch_day(text, sizeof(text), day_number)};
         }
 
         constexpr int64_t seconds_per_day = 86400;
-        // The days format_epoch_day prints as YYYY-MM-DD: the four-digit years 0000 to 9999.
+        // The days write_epoch_day prints as YYYY-MM-DD: the four-digit years 0000 to 9999.
         constexpr int64_t first_four_digit_year_day =
             std::chrono::sys_days{std::chrono::year{0} / std::chrono::January / 1}.time_since_epoch().count();
         constexpr int64_t last_four_digit_year_day =
@@ -479,23 +528,22 @@ namespace tsl {
             return scale;
         }
 
-        void append_fraction(std::string& text, int64_t fraction, size_t precision) {
-            if (precision == 0) {
-                return;
+        // ".<precision digits>" at out[length]; the new length. Nothing for precision 0.
+        std::size_t append_fraction(char* out, std::size_t size, std::size_t length, int64_t fraction, size_t precision) {
+            if (precision == 0 || length >= size) {
+                return length;
             }
-            char digits[16];
-            std::snprintf(digits,
-                          sizeof(digits),
-                          ".%0*lld",
-                          static_cast<int>(precision),
-                          static_cast<long long>(fraction));
-            text += digits;
+            const int written = std::snprintf(out + length,
+                                              size - length,
+                                              ".%0*lld",
+                                              static_cast<int>(precision),
+                                              static_cast<long long>(fraction));
+            return written > 0 ? std::min(length + static_cast<std::size_t>(written), size - 1) : length;
         }
 
         // `ticks` counts 10^-precision seconds from the Unix epoch: YYYY-MM-DD hh:mm:ss with
         // `precision` fraction digits, the wall clock in UTC (a column's timezone is not applied).
-        std::optional<types::logical_value_t>
-        epoch_text(std::pmr::memory_resource* res, int64_t ticks, size_t precision) {
+        std::optional<std::string_view> epoch_text(value_text_t& text, int64_t ticks, size_t precision) {
             const auto scale = ticks_per_second(precision);
             if (!scale.has_value()) {
                 return std::nullopt;
@@ -516,23 +564,21 @@ namespace tsl {
             if (days < first_four_digit_year_day || days > last_four_digit_year_day) {
                 return std::nullopt;
             }
-            std::string text = format_epoch_day(static_cast<int32_t>(days));
-            char clock[16];
-            std::snprintf(clock,
-                          sizeof(clock),
-                          " %02d:%02d:%02d",
-                          static_cast<int>(second_of_day / 3600),
-                          static_cast<int>(second_of_day / 60 % 60),
-                          static_cast<int>(second_of_day % 60));
-            text += clock;
-            append_fraction(text, fraction, precision);
-            return types::logical_value_t{res, std::move(text)};
+            std::size_t length = write_epoch_day(text, sizeof(text), static_cast<int32_t>(days));
+            const int clock = std::snprintf(text + length,
+                                            sizeof(text) - length,
+                                            " %02d:%02d:%02d",
+                                            static_cast<int>(second_of_day / 3600),
+                                            static_cast<int>(second_of_day / 60 % 60),
+                                            static_cast<int>(second_of_day % 60));
+            length = std::min(length + static_cast<std::size_t>(std::max(clock, 0)), sizeof(text) - 1);
+            length = append_fraction(text, sizeof(text), length, fraction, precision);
+            return std::string_view(text, length);
         }
 
         // A Time / Time64 value counts 10^-precision seconds and may be negative or past a day:
         // [-]hh:mm:ss with `precision` fraction digits, the hours at least two digits.
-        std::optional<types::logical_value_t>
-        time_text(std::pmr::memory_resource* res, int64_t ticks, size_t precision) {
+        std::optional<std::string_view> time_text(value_text_t& text, int64_t ticks, size_t precision) {
             const auto scale = ticks_per_second(precision);
             if (!scale.has_value()) {
                 return std::nullopt;
@@ -540,159 +586,162 @@ namespace tsl {
             const bool negative = ticks < 0;
             const uint64_t magnitude = negative ? 0 - static_cast<uint64_t>(ticks) : static_cast<uint64_t>(ticks);
             const uint64_t seconds = magnitude / static_cast<uint64_t>(*scale);
-            char clock[40];
-            std::snprintf(clock,
-                          sizeof(clock),
-                          "%s%02llu:%02llu:%02llu",
-                          negative ? "-" : "",
-                          static_cast<unsigned long long>(seconds / 3600),
-                          static_cast<unsigned long long>(seconds / 60 % 60),
-                          static_cast<unsigned long long>(seconds % 60));
-            std::string text = clock;
-            append_fraction(text, static_cast<int64_t>(magnitude % static_cast<uint64_t>(*scale)), precision);
-            return types::logical_value_t{res, std::move(text)};
+            const int clock = std::snprintf(text,
+                                            sizeof(text),
+                                            "%s%02llu:%02llu:%02llu",
+                                            negative ? "-" : "",
+                                            static_cast<unsigned long long>(seconds / 3600),
+                                            static_cast<unsigned long long>(seconds / 60 % 60),
+                                            static_cast<unsigned long long>(seconds % 60));
+            std::size_t length = std::min(static_cast<std::size_t>(std::max(clock, 0)), sizeof(text) - 1);
+            length = append_fraction(text,
+                                     sizeof(text),
+                                     length,
+                                     static_cast<int64_t>(magnitude % static_cast<uint64_t>(*scale)),
+                                     precision);
+            return std::string_view(text, length);
         }
 
-        // The decimal digits of `magnitude`, a decimal point before the last `scale` of them; exact
-        // for every width, Decimal128 and UInt128 included.
-        std::string unscaled_text(bool negative, absl::uint128 magnitude, size_t scale) {
-            std::string digits; // least significant first
+        // The decimal digits of `magnitude`, a decimal point before the last `scale` of them, as a
+        // view into `text`; exact for every width, Decimal128 and UInt128 included (scale <= 38).
+        std::string_view unscaled_text(value_text_t& text, bool negative, absl::uint128 magnitude, size_t scale) {
+            constexpr std::size_t max_digits = 39; // 2^128 - 1
+            scale = std::min(scale, max_digits - 1);
+            char digits[max_digits]; // least significant first
+            std::size_t count = 0;
             do {
-                digits.push_back(static_cast<char>('0' + absl::Uint128Low64(magnitude % 10)));
+                digits[count++] = static_cast<char>('0' + absl::Uint128Low64(magnitude % 10));
                 magnitude /= 10;
             } while (magnitude != 0);
-            if (digits.size() <= scale) {
-                digits.append(scale + 1 - digits.size(), '0');
+            while (count <= scale) {
+                digits[count++] = '0';
             }
-            std::string text;
-            text.reserve(digits.size() + 2);
+            std::size_t length = 0;
             if (negative) {
-                text.push_back('-');
+                text[length++] = '-';
             }
-            for (size_t i = digits.size(); i-- > 0;) {
-                text.push_back(digits[i]);
+            for (size_t i = count; i-- > 0;) {
+                text[length++] = digits[i];
                 if (i == scale && scale > 0) {
-                    text.push_back('.');
+                    text[length++] = '.';
                 }
             }
-            return text;
+            return {text, length};
         }
 
-        types::logical_value_t decimal_text(std::pmr::memory_resource* res, clickhouse::Int128 unscaled, size_t scale) {
+        std::string_view decimal_text(value_text_t& text, clickhouse::Int128 unscaled, size_t scale) {
             const bool negative = unscaled < 0;
             // Negated as unsigned, so the most negative value keeps its magnitude.
             const absl::uint128 magnitude =
                 negative ? -static_cast<absl::uint128>(unscaled) : static_cast<absl::uint128>(unscaled);
-            return {res, unscaled_text(negative, magnitude, scale)};
+            return unscaled_text(text, negative, magnitude, scale);
         }
 
+        // A view into the column type's own item names.
         template<typename EnumColumn>
-        std::optional<types::logical_value_t>
-        enum_text(std::pmr::memory_resource* res, const EnumColumn& enum_col, size_t row) {
+        std::optional<std::string_view> enum_text(const EnumColumn& enum_col, size_t row) {
             // NameAt looks the value up without checking it is one of the type's items.
             if (!enum_col.Type()->template As<clickhouse::EnumType>()->HasEnumValue(enum_col.At(row))) {
                 return std::nullopt;
             }
-            return types::logical_value_t{res, std::string(enum_col.NameAt(row))};
+            return enum_col.NameAt(row);
         }
 
         template<typename Number>
-        types::logical_value_t number_text(std::pmr::memory_resource* res, Number value) {
-            char buf[32];
-            const auto written = std::to_chars(buf, buf + sizeof(buf), value);
-            return {res, std::string(buf, written.ptr)};
+        std::string_view number_text(value_text_t& text, Number value) {
+            const auto written = std::to_chars(text, text + sizeof(text), value);
+            return {text, static_cast<size_t>(written.ptr - text)};
         }
 
         // A wire value as the column's text; nullopt for a wire type without one (Map, the geo
         // types, Nothing, an Array or a Tuple).
-        std::optional<types::logical_value_t> read_text(std::pmr::memory_resource* res,
-                                                        const clickhouse::ColumnRef& col,
-                                                        clickhouse::Type::Code code,
-                                                        size_t row) {
+        // Into `text`, or a view of the column's own bytes; valid while both live.
+        std::optional<std::string_view>
+        read_text(value_text_t& text, const clickhouse::ColumnRef& col, clickhouse::Type::Code code, size_t row) {
             using c = clickhouse::Type;
             switch (code) {
                 case c::Int8:
-                    return number_text(res, col->As<clickhouse::ColumnInt8>()->At(row));
+                    return number_text(text, col->As<clickhouse::ColumnInt8>()->At(row));
                 case c::Int16:
-                    return number_text(res, col->As<clickhouse::ColumnInt16>()->At(row));
+                    return number_text(text, col->As<clickhouse::ColumnInt16>()->At(row));
                 case c::Int32:
-                    return number_text(res, col->As<clickhouse::ColumnInt32>()->At(row));
+                    return number_text(text, col->As<clickhouse::ColumnInt32>()->At(row));
                 case c::Int64:
-                    return number_text(res, col->As<clickhouse::ColumnInt64>()->At(row));
+                    return number_text(text, col->As<clickhouse::ColumnInt64>()->At(row));
                 case c::UInt8:
-                    return number_text(res, col->As<clickhouse::ColumnUInt8>()->At(row));
+                    return number_text(text, col->As<clickhouse::ColumnUInt8>()->At(row));
                 case c::UInt16:
-                    return number_text(res, col->As<clickhouse::ColumnUInt16>()->At(row));
+                    return number_text(text, col->As<clickhouse::ColumnUInt16>()->At(row));
                 case c::UInt32:
-                    return number_text(res, col->As<clickhouse::ColumnUInt32>()->At(row));
+                    return number_text(text, col->As<clickhouse::ColumnUInt32>()->At(row));
                 case c::UInt64:
-                    return number_text(res, col->As<clickhouse::ColumnUInt64>()->At(row));
+                    return number_text(text, col->As<clickhouse::ColumnUInt64>()->At(row));
                 case c::Float32:
-                    return number_text(res, col->As<clickhouse::ColumnFloat32>()->At(row));
+                    return number_text(text, col->As<clickhouse::ColumnFloat32>()->At(row));
                 case c::Float64:
-                    return number_text(res, col->As<clickhouse::ColumnFloat64>()->At(row));
+                    return number_text(text, col->As<clickhouse::ColumnFloat64>()->At(row));
                 case c::String:
-                    return types::logical_value_t{res, std::string(col->As<clickhouse::ColumnString>()->At(row))};
+                    return col->As<clickhouse::ColumnString>()->At(row);
                 case c::FixedString:
-                    return types::logical_value_t{res, std::string(col->As<clickhouse::ColumnFixedString>()->At(row))};
+                    return col->As<clickhouse::ColumnFixedString>()->At(row);
                 case c::DateTime:
-                    return epoch_text(res, col->As<clickhouse::ColumnDateTime>()->RawAt(row), 0);
+                    return epoch_text(text, col->As<clickhouse::ColumnDateTime>()->RawAt(row), 0);
                 case c::DateTime64: {
                     const auto datetime64_col = col->As<clickhouse::ColumnDateTime64>();
-                    return epoch_text(res, datetime64_col->At(row), datetime64_col->GetPrecision());
+                    return epoch_text(text, datetime64_col->At(row), datetime64_col->GetPrecision());
                 }
                 case c::Time:
-                    return time_text(res, col->As<clickhouse::ColumnTime>()->At(row), 0);
+                    return time_text(text, col->As<clickhouse::ColumnTime>()->At(row), 0);
                 case c::Time64: {
                     const auto time64_col = col->As<clickhouse::ColumnTime64>();
-                    return time_text(res, time64_col->At(row), time64_col->GetPrecision());
+                    return time_text(text, time64_col->At(row), time64_col->GetPrecision());
                 }
                 case c::Decimal:
                 case c::Decimal32:
                 case c::Decimal64:
                 case c::Decimal128: {
                     const auto decimal_col = col->As<clickhouse::ColumnDecimal>();
-                    return decimal_text(res, decimal_col->At(row), decimal_col->GetScale());
+                    return decimal_text(text, decimal_col->At(row), decimal_col->GetScale());
                 }
                 case c::Int128:
-                    return decimal_text(res, col->As<clickhouse::ColumnInt128>()->At(row), 0);
+                    return decimal_text(text, col->As<clickhouse::ColumnInt128>()->At(row), 0);
                 case c::UInt128:
-                    return types::logical_value_t{
-                        res,
-                        unscaled_text(false, col->As<clickhouse::ColumnUInt128>()->At(row), 0)};
+                    return unscaled_text(text, false, col->As<clickhouse::ColumnUInt128>()->At(row), 0);
                 case c::Enum8:
-                    return enum_text(res, *col->As<clickhouse::ColumnEnum8>(), row);
+                    return enum_text(*col->As<clickhouse::ColumnEnum8>(), row);
                 case c::Enum16:
-                    return enum_text(res, *col->As<clickhouse::ColumnEnum16>(), row);
+                    return enum_text(*col->As<clickhouse::ColumnEnum16>(), row);
                 case c::IPv4: {
                     const in_addr address = col->As<clickhouse::ColumnIPv4>()->At(row);
-                    char buf[INET_ADDRSTRLEN];
-                    if (inet_ntop(AF_INET, &address, buf, sizeof(buf)) == nullptr) {
+                    if (inet_ntop(AF_INET, &address, text, sizeof(text)) == nullptr) {
                         return std::nullopt;
                     }
-                    return types::logical_value_t{res, std::string(buf)};
+                    return std::string_view(text);
                 }
                 case c::IPv6: {
                     const in6_addr address = col->As<clickhouse::ColumnIPv6>()->At(row);
-                    char buf[INET6_ADDRSTRLEN];
-                    if (inet_ntop(AF_INET6, &address, buf, sizeof(buf)) == nullptr) {
+                    static_assert(sizeof(value_text_t) >= INET6_ADDRSTRLEN);
+                    if (inet_ntop(AF_INET6, &address, text, sizeof(text)) == nullptr) {
                         return std::nullopt;
                     }
-                    return types::logical_value_t{res, std::string(buf)};
+                    return std::string_view(text);
                 }
                 case c::Date:
-                    return types::logical_value_t{res, format_epoch_day(col->As<clickhouse::ColumnDate>()->RawAt(row))};
+                    return epoch_day_text(text, col->As<clickhouse::ColumnDate>()->RawAt(row));
                 case c::Date32:
-                    return types::logical_value_t{res,
-                                                  format_epoch_day(col->As<clickhouse::ColumnDate32>()->RawAt(row))};
+                    return epoch_day_text(text, col->As<clickhouse::ColumnDate32>()->RawAt(row));
                 case c::UUID: {
+                    // 8-4-4-4-12 hex digits: the high 64 bits, then the low 64.
                     auto u = col->As<clickhouse::ColumnUUID>()->At(row);
-                    std::ostringstream oss;
-                    oss << std::hex << std::setfill('0') << std::setw(16) << u.first << std::setw(16) << u.second;
-                    std::string hex = oss.str();
-                    return types::logical_value_t{res,
-                                                  hex.substr(0, 8) + "-" + hex.substr(8, 4) + "-" + hex.substr(12, 4) +
-                                                      "-" + hex.substr(16, 4) + "-" + hex.substr(20, 12)};
+                    const int written = std::snprintf(text,
+                                                      sizeof(text),
+                                                      "%08llx-%04llx-%04llx-%04llx-%012llx",
+                                                      static_cast<unsigned long long>(u.first >> 32),
+                                                      static_cast<unsigned long long>((u.first >> 16) & 0xffffULL),
+                                                      static_cast<unsigned long long>(u.first & 0xffffULL),
+                                                      static_cast<unsigned long long>(u.second >> 48),
+                                                      static_cast<unsigned long long>(u.second & 0xffffffffffffULL));
+                    return std::string_view(text, static_cast<size_t>(written));
                 }
                 default:
                     return std::nullopt;
@@ -749,7 +798,7 @@ namespace tsl {
             if (!tuple_col || tuple_col->TupleSize() != field_types.size()) {
                 return std::nullopt;
             }
-            std::vector<types::logical_value_t> fields;
+            std::vector<types::logical_value_t> fields; // the engine's create_struct takes a std::vector
             fields.reserve(field_types.size());
             for (size_t i = 0; i < field_types.size(); ++i) {
                 auto field = read_value(res, (*tuple_col)[i], row, field_types[i]);
@@ -777,7 +826,7 @@ namespace tsl {
             // The element type is the extension's, read through child_type(); child_types() is
             // a STRUCT's field list and reads past the end of an ARRAY / LIST extension.
             const auto& item_type = target_type.child_type();
-            std::vector<types::logical_value_t> values;
+            std::vector<types::logical_value_t> values; // the engine's create_list takes a std::vector
             values.reserve(items->Size());
             for (size_t i = 0; i < items->Size(); ++i) {
                 auto item = read_value(res, items, i, item_type);
@@ -817,7 +866,7 @@ namespace tsl {
                     (item.type != c::String && item.type != c::FixedString)) {
                     return std::nullopt;
                 }
-                return types::logical_value_t{res, std::string(item.data)};
+                return types::logical_value_t{res, std::string_view(item.data)};
             }
             switch (target_type.type()) {
                 case lt::BOOLEAN:
@@ -857,8 +906,14 @@ namespace tsl {
                         return std::nullopt;
                     }
                     return types::logical_value_t{res, col->As<clickhouse::ColumnFloat64>()->At(row)};
-                case lt::STRING_LITERAL:
-                    return read_text(res, col, code, row);
+                case lt::STRING_LITERAL: {
+                    value_text_t text;
+                    const auto view = read_text(text, col, code, row);
+                    if (!view.has_value()) {
+                        return std::nullopt;
+                    }
+                    return types::logical_value_t{res, *view};
+                }
                 case lt::STRUCT:
                     return read_struct(res, col, code, row, target_type);
                 case lt::LIST:
@@ -866,6 +921,46 @@ namespace tsl {
                 default:
                     return std::nullopt;
             }
+        }
+
+        bool write_text_cell(data_chunk_t& chunk,
+                             size_t chunk_col,
+                             size_t chunk_row,
+                             const clickhouse::ColumnRef& col,
+                             size_t row) {
+            using c = clickhouse::Type;
+            const auto code = col->Type()->GetCode();
+            // The same unwrapping as read_value, whose STRING reading this is.
+            if (code == c::Nullable) {
+                const auto nullable_col = col->As<clickhouse::ColumnNullable>();
+                if (!nullable_col) {
+                    return false;
+                }
+                if (nullable_col->IsNull(row)) {
+                    chunk.set_value(chunk_col, chunk_row, types::logical_value_t{chunk.resource(), nullptr});
+                    return true;
+                }
+                return write_text_cell(chunk, chunk_col, chunk_row, nullable_col->Nested(), row);
+            }
+            if (code == c::LowCardinality) {
+                const auto item = col->GetItem(row);
+                if (item.type == c::Void) {
+                    chunk.set_value(chunk_col, chunk_row, types::logical_value_t{chunk.resource(), nullptr});
+                    return true;
+                }
+                if (item.type != c::String && item.type != c::FixedString) {
+                    return false;
+                }
+                chunk.set_value(chunk_col, chunk_row, std::string_view(item.data));
+                return true;
+            }
+            value_text_t text;
+            const auto view = read_text(text, col, code, row);
+            if (!view.has_value()) {
+                return false;
+            }
+            chunk.set_value(chunk_col, chunk_row, *view); // copied into the vector's string buffer
+            return true;
         }
 
         bool has_type(const types::logical_value_t& value, const types::complex_logical_type& type) {
@@ -897,44 +992,52 @@ namespace tsl {
         }
 
         types::complex_logical_type
-        ast_to_complex_type(std::pmr::memory_resource* resource, const clickhouse::TypeAst& ast, const std::string& alias) {
+        ast_to_complex_type(std::pmr::memory_resource* resource, const clickhouse::TypeAst& ast, std::string_view alias) {
             using meta = clickhouse::TypeAst::Meta;
             switch (ast.meta) {
                 case meta::Array: {
                     if (ast.elements.empty()) {
-                        return {types::logical_type::STRING_LITERAL, alias};
+                        return {types::logical_type::STRING_LITERAL, std::string(alias)};
                     }
                     auto inner = ast_to_complex_type(resource, ast.elements[0], "");
-                    return types::complex_logical_type::create_list(inner, alias);
+                    return types::complex_logical_type::create_list(inner, std::string(alias));
                 }
                 case meta::Tuple: {
                     std::pmr::vector<types::complex_logical_type> fields(resource);
                     fields.reserve(ast.elements.size());
                     size_t idx = 0;
+                    std::pmr::string field_name(resource);
                     for (const auto& elem : ast.elements) {
-                        std::string field_name = elem.name.empty() ? ("_" + std::to_string(++idx)) : elem.name;
+                        field_name.clear();
+                        if (elem.name.empty()) {
+                            field_name.push_back('_');
+                            append_number(field_name, ++idx);
+                        } else {
+                            field_name.assign(elem.name);
+                        }
                         fields.emplace_back(ast_to_complex_type(resource, elem, field_name));
                     }
-                    return types::complex_logical_type::create_struct(alias.empty() ? "tuple_t" : (alias + "_t"),
-                                                                      fields,
-                                                                      alias);
+                    return types::complex_logical_type::create_struct(
+                        alias.empty() ? std::string("tuple_t") : std::string(alias) + "_t",
+                        fields,
+                        std::string(alias));
                 }
                 case meta::Nullable: {
                     if (ast.elements.empty()) {
-                        return {types::logical_type::STRING_LITERAL, alias};
+                        return {types::logical_type::STRING_LITERAL, std::string(alias)};
                     }
                     return ast_to_complex_type(resource, ast.elements[0], alias);
                 }
                 case meta::LowCardinality: {
                     if (ast.elements.empty()) {
-                        return {types::logical_type::STRING_LITERAL, alias};
+                        return {types::logical_type::STRING_LITERAL, std::string(alias)};
                     }
                     return ast_to_complex_type(resource, ast.elements[0], alias);
                 }
                 case meta::Enum:
-                    return {types::logical_type::STRING_LITERAL, alias};
+                    return {types::logical_type::STRING_LITERAL, std::string(alias)};
                 default:
-                    return {ch_code_to_logical(ast.code), alias};
+                    return {ch_code_to_logical(ast.code), std::string(alias)};
             }
         }
     } // namespace
@@ -945,7 +1048,7 @@ namespace tsl {
 
     types::complex_logical_type ch_to_struct(std::pmr::memory_resource* resource,
                                              const clickhouse::Block& block,
-                                             const std::unordered_map<std::string, std::string>& named_type_overrides) {
+                                             const named_type_map_t& named_type_overrides) {
         OTX_ZONE_N("tsl::ch_to_struct");
         const size_t ncols = block.GetColumnCount();
 

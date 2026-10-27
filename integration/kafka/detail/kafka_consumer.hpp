@@ -12,17 +12,27 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace RdKafka {
     class KafkaConsumer;
+    class Message;
 } // namespace RdKafka
 
 namespace otterstax::kafka::detail {
     struct offset_rebalance_cb;
 
+    // Frees a librdkafka message (defined where RdKafka::Message is complete).
+    struct kafka_message_deleter_t {
+        void operator()(RdKafka::Message* message) const noexcept;
+    };
+
+    // One consumed message. It owns librdkafka's message, and `payload` is a view of the
+    // message value (JSON for now) inside it: no copy per message. Valid while the record lives.
     struct kafka_record_t {
-        std::string payload; // message value (JSON for now)
+        std::unique_ptr<RdKafka::Message, kafka_message_deleter_t> message;
+        std::string_view payload;
         int32_t partition;
         int64_t offset;
     };

@@ -3,6 +3,7 @@
 
 #include "sql_query_generator.hpp"
 
+#include "utility/pmr_text.hpp"
 #include "utility/tracy_profiler.hpp"
 
 #include <components/expressions/aggregate_expression.hpp>
@@ -33,6 +34,8 @@
 #include <cmath>
 #include <cstdio>
 #include <limits>
+#include <concepts>
+#include <iterator>
 #include <regex>
 #include <string_view>
 #include <unordered_map>
@@ -88,10 +91,16 @@ namespace {
                 error = core::error_t(code, std::pmr::string{msg.data(), msg.size(), resource});
             }
         }
-        void fail(core::error_code_t code, std::string_view msg, const std::string& detail) {
+        void fail(core::error_code_t code, std::string_view msg, std::string_view detail) {
             if (!failed()) {
-                std::pmr::string what{msg.data(), msg.size(), resource};
-                what.append(detail.data(), detail.size());
+                error = core::error_t(code, otterstax::concat(resource, {msg, detail}));
+            }
+        }
+        template<std::integral Number>
+        void fail(core::error_code_t code, std::string_view msg, Number detail) {
+            if (!failed()) {
+                auto what = otterstax::concat(resource, {msg});
+                otterstax::append_number(what, detail);
                 error = core::error_t(code, std::move(what));
             }
         }
@@ -147,7 +156,7 @@ namespace {
         }
     }
 
-    void quote_ident(std::stringstream& stream, std::string_view ident, backend_type_t backend) {
+    void quote_ident(std::ostream& stream, std::string_view ident, backend_type_t backend) {
         const char q = ident_quote_char(backend);
         stream << q;
         for (char c : ident) {
@@ -165,7 +174,7 @@ namespace {
     // `public`. A backend without a dialect, or a name with no part set, has no
     // reference to write: the statement fails rather than guessing a spelling
     // or naming a placeholder table the backend does not have.
-    void write_table_reference(std::stringstream& stream, const qualified_name_t& name, gen_ctx_t& ctx) {
+    void write_table_reference(std::ostream& stream, const qualified_name_t& name, gen_ctx_t& ctx) {
         if (ctx.failed()) {
             return;
         }
@@ -190,7 +199,7 @@ namespace {
     // parts separately in storage() (table/column or struct-member paths);
     // each part is quoted on its own — a dotted string is never quoted as one
     // identifier. A '*' part is the star token, not an identifier.
-    void write_key(std::stringstream& stream, const components::expressions::key_t& key, backend_type_t backend) {
+    void write_key(std::ostream& stream, const components::expressions::key_t& key, backend_type_t backend) {
         bool dot = false;
         for (const auto& part : key.storage()) {
             if (dot) {
@@ -302,7 +311,7 @@ namespace {
     }
 
     // Type keyword for a column definition, in the dialect of ctx.backend.
-    void write_logical_type(std::stringstream& stream, logical_type type, gen_ctx_t& ctx) {
+    void write_logical_type(std::ostream& stream, logical_type type, gen_ctx_t& ctx) {
         if (ctx.failed()) {
             return;
         }
@@ -328,7 +337,7 @@ namespace {
 
     // Column definition inside CREATE TABLE: quoted column name + type keyword
     // (type names are SQL keywords and stay unquoted).
-    void write_column_def(std::stringstream& stream, const complex_logical_type& type, gen_ctx_t& ctx) {
+    void write_column_def(std::ostream& stream, const complex_logical_type& type, gen_ctx_t& ctx) {
         if (ctx.failed()) {
             return;
         }
@@ -373,7 +382,7 @@ namespace {
     // Single-quoted literal: the embedded quote doubled on every backend (the
     // only form MySQL also honours under NO_BACKSLASH_ESCAPES), the backslash
     // doubled where the dialect treats it as an escape.
-    void write_string_literal(std::stringstream& stream, std::string_view str, backend_type_t backend) {
+    void write_string_literal(std::ostream& stream, std::string_view str, backend_type_t backend) {
         const bool escape_backslash = backslash_escapes(backend);
         stream << '\'';
         for (char c : str) {
@@ -392,7 +401,7 @@ namespace {
     // literal carries max_digits10 significant digits: every finite value parses
     // back to the identical float/double on the backend.
     template<class Float>
-    void write_float_literal(std::stringstream& stream, Float value, gen_ctx_t& ctx) {
+    void write_float_literal(std::ostream& stream, Float value, gen_ctx_t& ctx) {
         if (!std::isfinite(value)) {
             ctx.fail(core::error_code_t::invalid_parameter, "non-finite floating-point value has no SQL literal");
             return;
@@ -406,9 +415,9 @@ namespace {
         stream.write(buf, written);
     }
 
-    void write_logical_value(std::stringstream& stream, const logical_value_t& value, gen_ctx_t& ctx);
+    void write_logical_value(std::ostream& stream, const logical_value_t& value, gen_ctx_t& ctx);
 
-    void write_value_list(std::stringstream& stream,
+    void write_value_list(std::ostream& stream,
                           const std::vector<logical_value_t>& values,
                           std::string_view open,
                           std::string_view close,
@@ -426,7 +435,7 @@ namespace {
     }
 
     // Write a logical value as a literal in the dialect of ctx.backend.
-    void write_logical_value(std::stringstream& stream, const logical_value_t& value, gen_ctx_t& ctx) {
+    void write_logical_value(std::ostream& stream, const logical_value_t& value, gen_ctx_t& ctx) {
         if (ctx.failed()) {
             return;
         }
@@ -521,7 +530,7 @@ namespace {
 
     // A bound parameter is the only way a literal reaches the generator; a miss
     // means the plan references a value nobody bound — never a NULL.
-    void write_parameter(std::stringstream& stream, core::parameter_id_t id, gen_ctx_t& ctx) {
+    void write_parameter(std::ostream& stream, core::parameter_id_t id, gen_ctx_t& ctx) {
         if (ctx.failed()) {
             return;
         }
@@ -533,7 +542,7 @@ namespace {
         if (it == ctx.parameters->parameters.end()) {
             ctx.fail(core::error_code_t::invalid_parameter,
                      "plan references an unbound parameter #",
-                     std::to_string(static_cast<uint16_t>(id)));
+                     static_cast<uint16_t>(id));
             return;
         }
         write_logical_value(stream, it->second, ctx);
@@ -541,9 +550,9 @@ namespace {
 
     // ── expressions ───────────────────────────────────────────────────────────
 
-    void write_expr(std::stringstream& stream, const expression_i& expr, gen_ctx_t& ctx);
-    void write_predicate(std::stringstream& stream, const expression_i& expr, gen_ctx_t& ctx);
-    void write_operand(std::stringstream& stream, const param_storage& param, gen_ctx_t& ctx);
+    void write_expr(std::ostream& stream, const expression_i& expr, gen_ctx_t& ctx);
+    void write_predicate(std::ostream& stream, const expression_i& expr, gen_ctx_t& ctx);
+    void write_operand(std::ostream& stream, const param_storage& param, gen_ctx_t& ctx);
 
     // A grouping-key marker names the key, not an output column. The transformer
     // appends a copy of a computed key next to its marker, and it is that copy —
@@ -598,7 +607,7 @@ namespace {
     // table and the bare name is unambiguous. A key carrying a cast type is the
     // engine's typed field selection: dropping the type would change the value
     // and no backend spells it.
-    void write_column(std::stringstream& stream, const components::expressions::key_t& key, gen_ctx_t& ctx) {
+    void write_column(std::ostream& stream, const components::expressions::key_t& key, gen_ctx_t& ctx) {
         if (ctx.failed()) {
             return;
         }
@@ -629,7 +638,7 @@ namespace {
     // cannot see output aliases (PostgreSQL does not resolve them in HAVING) and
     // wherever the alias exists only inside the engine (a hidden __group_key_* /
     // __having_*); otherwise it is a column of the table.
-    void write_key_operand(std::stringstream& stream, const components::expressions::key_t& key, gen_ctx_t& ctx) {
+    void write_key_operand(std::ostream& stream, const components::expressions::key_t& key, gen_ctx_t& ctx) {
         if (ctx.failed()) {
             return;
         }
@@ -670,7 +679,7 @@ namespace {
         return true;
     }
 
-    void write_operand(std::stringstream& stream, const param_storage& param, gen_ctx_t& ctx) {
+    void write_operand(std::ostream& stream, const param_storage& param, gen_ctx_t& ctx) {
         if (ctx.failed()) {
             return;
         }
@@ -698,7 +707,7 @@ namespace {
     // write_whitelisted_call below is what resolves a plan's function name into
     // that spelling. A call with no argument is the parameterless COUNT(*): the
     // star is the argument the backend needs.
-    void write_call(std::stringstream& stream,
+    void write_call(std::ostream& stream,
                     std::string_view function,
                     const std::pmr::vector<param_storage>& args,
                     bool distinct,
@@ -784,7 +793,7 @@ namespace {
     // A call of a function the whitelist names, written in the dialect's own
     // spelling. Both refusals are unimplemented_yet: the statement is expressible,
     // just not as SQL this backend would run the same way.
-    void write_whitelisted_call(std::stringstream& stream,
+    void write_whitelisted_call(std::ostream& stream,
                                 std::string_view function,
                                 const std::pmr::vector<param_storage>& args,
                                 bool distinct,
@@ -803,14 +812,14 @@ namespace {
         if (entry == nullptr) {
             ctx.fail(core::error_code_t::unimplemented_yet,
                      "function is not pushed down to the backend: ",
-                     std::string{function});
+                     function);
             return;
         }
         const std::string_view spelling = dialect_spelling(*entry, ctx.backend);
         if (spelling.empty()) {
             ctx.fail(core::error_code_t::unimplemented_yet,
                      "function is not supported by this backend: ",
-                     std::string{function});
+                     function);
             return;
         }
         write_call(stream, spelling, args, distinct, star, ctx);
@@ -818,7 +827,7 @@ namespace {
 
     // fn(args) with the name spelled exactly as given: a ClickHouse function
     // name is case-sensitive, so the dialect's own spelling is passed in.
-    void write_named_call(std::stringstream& stream,
+    void write_named_call(std::ostream& stream,
                           std::string_view function,
                           const std::pmr::vector<param_storage>& args,
                           size_t arity,
@@ -838,7 +847,7 @@ namespace {
         stream << ")";
     }
 
-    void write_infix(std::stringstream& stream,
+    void write_infix(std::ostream& stream,
                      const std::pmr::vector<param_storage>& args,
                      std::string_view op,
                      gen_ctx_t& ctx) {
@@ -852,7 +861,7 @@ namespace {
         stream << ")";
     }
 
-    void write_prefix(std::stringstream& stream,
+    void write_prefix(std::ostream& stream,
                       const std::pmr::vector<param_storage>& args,
                       std::string_view open,
                       std::string_view close,
@@ -871,7 +880,7 @@ namespace {
     // only spelling that keeps its meaning — a regex operator would read `%` and
     // `_` literally and match nothing. Any other regexp_like shape is a real
     // regular expression, which no single spelling covers on all three dialects.
-    void write_like(std::stringstream& stream, const function_expression_t& call, gen_ctx_t& ctx) {
+    void write_like(std::ostream& stream, const function_expression_t& call, gen_ctx_t& ctx) {
         static constexpr std::string_view no_regex = "a regular-expression match is not generated for this backend";
         const auto& args = call.args();
         if (args.size() != 3 || !is_parameter(args[2])) {
@@ -930,7 +939,7 @@ namespace {
     // operators `^` (power), `|/` (square root), `||/` (cube root), `!` / `!!`
     // (factorial) and `@` (absolute value): each dialect spells them
     // differently, and MySQL / ClickHouse have no equivalent for some.
-    void write_function(std::stringstream& stream, const function_expression_t& call, gen_ctx_t& ctx) {
+    void write_function(std::ostream& stream, const function_expression_t& call, gen_ctx_t& ctx) {
         const bool pg = ctx.backend == backend_type_t::PostgreSQL;
         const bool ch = ctx.backend == backend_type_t::ClickHouse;
         const std::string& name = call.name();
@@ -974,7 +983,7 @@ namespace {
         write_whitelisted_call(stream, name, args, call.is_distinct(), call.has_star_argument(), ctx);
     }
 
-    void write_aggregate(std::stringstream& stream, const aggregate_expression_t& expr, gen_ctx_t& ctx) {
+    void write_aggregate(std::ostream& stream, const aggregate_expression_t& expr, gen_ctx_t& ctx) {
         write_whitelisted_call(stream, expr.function_name(), expr.params(), expr.is_distinct(), true, ctx);
     }
 
@@ -1004,7 +1013,7 @@ namespace {
         }
     }
 
-    void write_cast(std::stringstream& stream, const cast_expression_t& expr, gen_ctx_t& ctx) {
+    void write_cast(std::ostream& stream, const cast_expression_t& expr, gen_ctx_t& ctx) {
         if (expr.kind() == components::casts::cast_kind::try_cast) {
             // TRY_CAST yields NULL instead of failing; PostgreSQL and MySQL have
             // no such form, so the whole statement cannot be expressed.
@@ -1036,7 +1045,7 @@ namespace {
     // Operators that are PostgreSQL spellings (`#` xor, `~` not, `&`, `|`, the
     // shifts) are mapped per dialect: MySQL reads `^` as XOR, ClickHouse has no
     // bitwise operators at all — only functions.
-    void write_scalar(std::stringstream& stream, const scalar_expression_t& expr, gen_ctx_t& ctx) {
+    void write_scalar(std::ostream& stream, const scalar_expression_t& expr, gen_ctx_t& ctx) {
         const bool pg = ctx.backend == backend_type_t::PostgreSQL;
         const bool ch = ctx.backend == backend_type_t::ClickHouse;
         const auto& params = expr.params();
@@ -1132,7 +1141,7 @@ namespace {
         }
     }
 
-    void write_expr(std::stringstream& stream, const expression_i& expr, gen_ctx_t& ctx) {
+    void write_expr(std::ostream& stream, const expression_i& expr, gen_ctx_t& ctx) {
         if (ctx.failed()) {
             return;
         }
@@ -1164,9 +1173,9 @@ namespace {
         }
     }
 
-    void write_compare(std::stringstream& stream, const compare_expression_t& expr, gen_ctx_t& ctx);
+    void write_compare(std::ostream& stream, const compare_expression_t& expr, gen_ctx_t& ctx);
 
-    void write_junction(std::stringstream& stream,
+    void write_junction(std::ostream& stream,
                         const compare_expression_t& expr,
                         std::string_view separator,
                         gen_ctx_t& ctx) {
@@ -1192,7 +1201,7 @@ namespace {
         stream << ")";
     }
 
-    void write_compare(std::stringstream& stream, const compare_expression_t& expr, gen_ctx_t& ctx) {
+    void write_compare(std::ostream& stream, const compare_expression_t& expr, gen_ctx_t& ctx) {
         if (ctx.failed()) {
             return;
         }
@@ -1264,7 +1273,7 @@ namespace {
         write_operand(stream, expr.right(), ctx);
     }
 
-    void write_predicate(std::stringstream& stream, const expression_i& expr, gen_ctx_t& ctx) {
+    void write_predicate(std::ostream& stream, const expression_i& expr, gen_ctx_t& ctx) {
         if (ctx.failed()) {
             return;
         }
@@ -1280,7 +1289,7 @@ namespace {
     // One output column of a pushed-down SELECT, with its alias. A bare column
     // reference already IS its own output name, and a star is neither named nor
     // aliasable.
-    void write_projection(std::stringstream& stream, const expression_i& expr, gen_ctx_t& ctx) {
+    void write_projection(std::ostream& stream, const expression_i& expr, gen_ctx_t& ctx) {
         if (ctx.failed()) {
             return;
         }
@@ -1324,7 +1333,7 @@ namespace {
         return predicate;
     }
 
-    void write_where(std::stringstream& stream, const node_match_t* match, gen_ctx_t& ctx) {
+    void write_where(std::ostream& stream, const node_match_t* match, gen_ctx_t& ctx) {
         if (const auto* predicate = match_predicate(match, ctx)) {
             stream << " WHERE ";
             write_predicate(stream, *predicate, ctx);
@@ -1335,7 +1344,7 @@ namespace {
     // alias of a grouping key hoisted into ORDER BY, which is written as the
     // expression itself. Anything else has no name on the backend, and sorting by
     // the wrong column reorders the rows the manager hands back as the answer.
-    void write_sort_expr(std::stringstream& stream, const sort_expression_t* sort, gen_ctx_t& ctx) {
+    void write_sort_expr(std::ostream& stream, const sort_expression_t* sort, gen_ctx_t& ctx) {
         if (ctx.failed()) {
             return;
         }
@@ -1366,7 +1375,7 @@ namespace {
     // unlimit) and offset_ (0 = none) independently, and the transformer builds
     // the node when either is present — a bare OFFSET and LIMIT ALL OFFSET n both
     // arrive as (-1, n).
-    void write_limit(std::stringstream& stream, const node_limit_t* limit, gen_ctx_t& ctx) {
+    void write_limit(std::ostream& stream, const node_limit_t* limit, gen_ctx_t& ctx) {
         if (limit == nullptr || ctx.failed()) {
             return;
         }
@@ -1375,13 +1384,13 @@ namespace {
         if (limit_count < -1) {
             ctx.fail(core::error_code_t::invalid_parameter,
                      "negative LIMIT in query generation: ",
-                     std::to_string(limit_count));
+                     limit_count);
             return;
         }
         if (offset_count < 0) {
             ctx.fail(core::error_code_t::invalid_parameter,
                      "negative OFFSET in query generation: ",
-                     std::to_string(offset_count));
+                     offset_count);
             return;
         }
         if (limit_count >= 0) {
@@ -1409,7 +1418,7 @@ namespace {
         }
     }
 
-    void generate_select(std::stringstream& stream,
+    void generate_select(std::ostream& stream,
                          const node_aggregate_t* node,
                          gen_ctx_t& ctx,
                          const qualified_name_t& table_name) {
@@ -1586,7 +1595,7 @@ namespace {
 
     // ── DDL ───────────────────────────────────────────────────────────────────
 
-    void generate_create_collection(std::stringstream& stream,
+    void generate_create_collection(std::ostream& stream,
                                     const node_create_collection_t* node,
                                     const qualified_name_t& name,
                                     gen_ctx_t& ctx) {
@@ -1613,12 +1622,12 @@ namespace {
     }
 
     // this wight cause problems with connections
-    void generate_create_database(std::stringstream& stream, const qualified_name_t& name, backend_type_t backend) {
+    void generate_create_database(std::ostream& stream, const qualified_name_t& name, backend_type_t backend) {
         stream << "CREATE DATABASE ";
         quote_ident(stream, name.database, backend);
     }
 
-    void generate_create_index(std::stringstream& stream,
+    void generate_create_index(std::ostream& stream,
                                const node_create_index_t* node,
                                const qualified_name_t& name,
                                gen_ctx_t& ctx) {
@@ -1648,19 +1657,19 @@ namespace {
         stream << ")";
     }
 
-    void generate_drop_collection(std::stringstream& stream, const qualified_name_t& name, gen_ctx_t& ctx) {
+    void generate_drop_collection(std::ostream& stream, const qualified_name_t& name, gen_ctx_t& ctx) {
         stream << "DROP TABLE ";
         write_table_reference(stream, name, ctx);
     }
 
     // this wight cause problems with connections
-    void generate_drop_database(std::stringstream& stream, const qualified_name_t& name, backend_type_t backend) {
+    void generate_drop_database(std::ostream& stream, const qualified_name_t& name, backend_type_t backend) {
         stream << "DROP DATABASE ";
         quote_ident(stream, name.database, backend);
     }
 
     // target.name is the indexed table; target.from_name carries the index.
-    void generate_drop_index(std::stringstream& stream,
+    void generate_drop_index(std::ostream& stream,
                              const otterstax::names::resolved_target_t& target,
                              gen_ctx_t& ctx) {
         if (target.from_name.collection.empty()) {
@@ -1744,7 +1753,7 @@ namespace {
         if (parts.source_count > 1) {
             ctx.fail(core::error_code_t::invalid_parameter,
                      "more than one source sub-plan on one statement: ",
-                     std::string{statement});
+                     statement);
             return false;
         }
         if (parts.source != nullptr && !with_source) {
@@ -1752,19 +1761,19 @@ namespace {
             // table: a single-table statement here would touch every matching row.
             ctx.fail(core::error_code_t::unimplemented_yet,
                      "a source sub-plan is not pushed down to the backend for ",
-                     std::string{statement});
+                     statement);
             return false;
         }
         if (parts.source == nullptr && with_source) {
             ctx.fail(core::error_code_t::invalid_parameter,
                      "a second table is resolved but the plan carries no source sub-plan for ",
-                     std::string{statement});
+                     statement);
             return false;
         }
         if (has_dml_limit(parts) && ctx.backend != backend_type_t::MySQL) {
             ctx.fail(core::error_code_t::unimplemented_yet,
                      "LIMIT is not supported for this backend on ",
-                     std::string{statement});
+                     statement);
             return false;
         }
         if (with_source && ctx.backend == backend_type_t::ClickHouse) {
@@ -1774,13 +1783,13 @@ namespace {
             // the join key and assigns none, so there is no general equivalent.
             ctx.fail(core::error_code_t::unimplemented_yet,
                      "a second table is not supported for ClickHouse on ",
-                     std::string{statement});
+                     statement);
             return false;
         }
         if (with_source && has_dml_limit(parts)) {
             ctx.fail(core::error_code_t::unimplemented_yet,
                      "LIMIT together with a second table is not supported on ",
-                     std::string{statement});
+                     statement);
             return false;
         }
         if (!with_source) {
@@ -1793,14 +1802,14 @@ namespace {
             // backend does not have.
             ctx.fail(core::error_code_t::unimplemented_yet,
                      "the FROM / USING source is not on the same backend as the target of ",
-                     std::string{statement});
+                     statement);
             return false;
         }
         if (target.from_name.database == target.name.database && target.from_name.schema == target.name.schema &&
             target.from_name.collection == target.name.collection) {
             ctx.fail(core::error_code_t::unimplemented_yet,
                      "a FROM / USING source that is the target table itself needs table aliases on ",
-                     std::string{statement});
+                     statement);
             return false;
         }
         // The resolved name must be the table the plan actually reads: a plain
@@ -1808,7 +1817,7 @@ namespace {
         if (parts.source->type() != node_type::aggregate_t || !parts.source->children().empty()) {
             ctx.fail(core::error_code_t::unimplemented_yet,
                      "only a plain table is pushed down as the FROM / USING source of ",
-                     std::string{statement});
+                     statement);
             return false;
         }
         const auto& source = static_cast<const node_aggregate_t&>(*parts.source);
@@ -1817,7 +1826,7 @@ namespace {
         if (source.relname().t != target.from_name.collection || source.dbname().t != source_db) {
             ctx.fail(core::error_code_t::invalid_parameter,
                      "the resolved FROM / USING table is not the table the plan reads on ",
-                     std::string{statement});
+                     statement);
             return false;
         }
         return true;
@@ -1827,7 +1836,7 @@ namespace {
     // ALTER ... UPDATE are a syntax error without one, so a statement with no
     // predicate — every row — gets the constant-true filter spelled out there;
     // the other dialects take the bare statement.
-    void write_dml_where(std::stringstream& stream, const node_match_t* match, gen_ctx_t& ctx) {
+    void write_dml_where(std::ostream& stream, const node_match_t* match, gen_ctx_t& ctx) {
         if (const auto* predicate = match_predicate(match, ctx)) {
             stream << " WHERE ";
             write_predicate(stream, *predicate, ctx);
@@ -1839,7 +1848,7 @@ namespace {
     // The value of one SET assignment. The assignment IS the value expression,
     // named by its key, so a bare key with nothing under it assigns nothing: the
     // transformer never builds one, and a plan carrying it is malformed.
-    void write_set_value(std::stringstream& stream, const expression_i& value, gen_ctx_t& ctx) {
+    void write_set_value(std::ostream& stream, const expression_i& value, gen_ctx_t& ctx) {
         if (value.group() == expression_group::scalar) {
             const auto& scalar = static_cast<const scalar_expression_t&>(value);
             const bool names_itself = scalar.type() == scalar_type::get_field ||
@@ -1853,7 +1862,7 @@ namespace {
         write_expr(stream, value, ctx);
     }
 
-    void generate_delete(std::stringstream& stream,
+    void generate_delete(std::ostream& stream,
                          const node_delete_t* node,
                          const otterstax::names::resolved_target_t& target,
                          gen_ctx_t& ctx) {
@@ -1900,7 +1909,7 @@ namespace {
         }
     }
 
-    void generate_update(std::stringstream& stream,
+    void generate_update(std::ostream& stream,
                          const node_update_t* node,
                          const otterstax::names::resolved_target_t& target,
                          gen_ctx_t& ctx) {
@@ -1982,7 +1991,7 @@ namespace {
     }
 
     // VALUES (...), (...) for every row of the chunk.
-    void generate_values(std::stringstream& stream, const components::vector::data_chunk_t& chunk, gen_ctx_t& ctx) {
+    void generate_values(std::ostream& stream, const components::vector::data_chunk_t& chunk, gen_ctx_t& ctx) {
         if (ctx.failed()) {
             return;
         }
@@ -2008,7 +2017,7 @@ namespace {
         }
     }
 
-    void generate_insert(std::stringstream& stream,
+    void generate_insert(std::ostream& stream,
                          const node_insert_t* node,
                          const otterstax::names::resolved_target_t& target,
                          const std::pmr::vector<external_entry_t>& batch,
@@ -2079,10 +2088,11 @@ namespace sql_gen {
     namespace {
         // ClickHouse-only dialect fixup: postgres-style `(expr).field` tuple
         // member access doesn't parse in CH, which expects plain `expr.field`.
-        std::string ch_unwrap_paren_field_access(std::string sql) {
+        std::pmr::string ch_unwrap_paren_field_access(std::pmr::string sql) {
             static const std::regex paren_field(R"(\(([a-zA-Z_][\w.]*)\)\.([a-zA-Z_]\w*))");
             for (int i = 0; i < 8; ++i) {
-                std::string out = std::regex_replace(sql, paren_field, "$1.$2");
+                std::pmr::string out(sql.get_allocator());
+                std::regex_replace(std::back_inserter(out), sql.begin(), sql.end(), paren_field, "$1.$2");
                 if (out == sql)
                     break;
                 sql = std::move(out);
@@ -2091,15 +2101,15 @@ namespace sql_gen {
         }
     } // namespace
 
-    core::result_wrapper_t<std::string>
+    core::result_wrapper_t<std::pmr::string>
     replace_qualifiers(std::string_view raw_sql,
                        const std::pmr::vector<otterstax::parser::qualifier_rewrite_t>& quals,
                        backend_type_t backend,
                        std::pmr::memory_resource* resource) {
         OTX_ZONE_N("sql_gen::replace_qualifiers");
         // The rendered statement leaves the parser layer as the backend SQL
-        // text the connection managers collect, hence a plain std::string.
-        std::string sql{raw_sql};
+        // text the connection pools run, on the caller's (thread-safe) resource.
+        std::pmr::string sql{raw_sql, resource};
         // Substitute in descending offset order so an earlier replacement never
         // shifts a later slot. Two slots cannot share a start offset, so the
         // next slot is always the largest start strictly below the previous one.
@@ -2117,11 +2127,16 @@ namespace sql_gen {
             bound = next->start;
             if (next->start < 0 || next->length <= 0 ||
                 static_cast<size_t>(next->start) + static_cast<size_t>(next->length) > sql.size()) {
-                const std::string what = "replace_qualifiers: qualifier slot [" + std::to_string(next->start) +
-                                         ", +" + std::to_string(next->length) + ") of '" + next->name.to_string() +
-                                         "' lies outside the SQL text of " + std::to_string(sql.size()) +
-                                         " bytes";
-                return core::error_t{core::error_code_t::invalid_parameter, std::pmr::string{what.c_str(), resource}};
+                auto what = otterstax::concat(resource, {"replace_qualifiers: qualifier slot ["});
+                otterstax::append_number(what, next->start);
+                what += ", +";
+                otterstax::append_number(what, next->length);
+                what += ") of '";
+                what += next->name.to_string();
+                what += "' lies outside the SQL text of ";
+                otterstax::append_number(what, sql.size());
+                what += " bytes";
+                return core::error_t{core::error_code_t::invalid_parameter, std::move(what)};
             }
             auto reference = table_reference(next->name, backend, resource);
             if (reference.has_error()) {
@@ -2135,19 +2150,19 @@ namespace sql_gen {
         return sql;
     }
 
-    core::result_wrapper_t<std::string>
+    core::result_wrapper_t<std::pmr::string>
     table_reference(const qualified_name_t& name, backend_type_t backend, std::pmr::memory_resource* resource) {
         OTX_ZONE_N("sql_gen::table_reference");
         gen_ctx_t ctx{backend, nullptr, resource};
-        std::stringstream stream;
+        sql_stream_t stream(std::ios_base::out, resource);
         write_table_reference(stream, name, ctx);
         if (ctx.failed()) {
-            return core::result_wrapper_t<std::string>{std::move(ctx.error)};
+            return core::result_wrapper_t<std::pmr::string>{std::move(ctx.error)};
         }
-        return stream.str();
+        return std::move(stream).str();
     }
 
-    core::error_t generate_values(std::stringstream& stream,
+    core::error_t generate_values(std::ostream& stream,
                                   const components::vector::data_chunk_t& chunk,
                                   backend_type_t backend,
                                   std::pmr::memory_resource* resource) {
@@ -2161,7 +2176,7 @@ namespace sql_gen {
         return std::move(ctx.error);
     }
 
-    core::error_t generate_query(std::stringstream& stream,
+    core::error_t generate_query(std::ostream& stream,
                                  const node_ptr& node,
                                  const storage_parameters* parameters,
                                  backend_type_t backend,
@@ -2232,31 +2247,31 @@ namespace sql_gen {
         return std::move(ctx.error);
     }
 
-    core::result_wrapper_t<std::string> generate_query(const node_ptr& node,
+    core::result_wrapper_t<std::pmr::string> generate_query(const node_ptr& node,
                                                        const storage_parameters* parameters,
                                                        backend_type_t backend,
                                                        const otterstax::names::resolved_target_t& target,
                                                        const std::pmr::vector<external_entry_t>& batch,
                                                        std::pmr::memory_resource* resource) {
         OTX_ZONE_N("sql_gen::generate_query");
-        std::stringstream stream;
+        sql_stream_t stream(std::ios_base::out, resource);
         auto err = generate_query(stream, node, parameters, backend, target, batch, resource);
         if (err.contains_error()) {
-            return core::result_wrapper_t<std::string>{std::move(err)};
+            return core::result_wrapper_t<std::pmr::string>{std::move(err)};
         }
         stream << ";";
-        return stream.str();
+        return std::move(stream).str();
     }
 
     std::string create_database_statement(const std::string& db) {
-        std::stringstream s;
+        std::ostringstream s;
         s << "CREATE DATABASE ";
         quote_ident(s, db, backend_type_t::Otterbrix);
         return s.str();
     }
 
     std::string drop_table_statement(const std::string& db, const std::string& collection) {
-        std::stringstream s;
+        std::ostringstream s;
         s << "DROP TABLE ";
         quote_ident(s, db, backend_type_t::Otterbrix);
         s << '.';
@@ -2266,7 +2281,7 @@ namespace sql_gen {
 
     std::string
     select_column_statement(const std::string& db, const std::string& collection, const std::string& column) {
-        std::stringstream s;
+        std::ostringstream s;
         s << "SELECT ";
         quote_ident(s, column, backend_type_t::Otterbrix);
         s << " FROM ";

@@ -25,7 +25,7 @@ namespace {
         auto rendered =
             sql_gen::replace_qualifiers(stub.raw_sql, stub.qualifiers, backend, std::pmr::new_delete_resource());
         REQUIRE_FALSE(rendered.has_error());
-        return std::move(rendered.value());
+        return std::string(rendered.value());
     }
 } // namespace
 

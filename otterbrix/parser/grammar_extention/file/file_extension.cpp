@@ -167,7 +167,7 @@ namespace file_ext {
         // Lower the parsed statement into an external_node_t the Scheduler routes
         // to the file manager. The file extension carries no s3_alias.
         const auto* stmt = static_cast<const file_stmt*>(node->data);
-        const auto str = [](const char* s) { return s ? std::string{s} : std::string{}; };
+        const auto str = [](const char* s) { return s ? std::string_view{s} : std::string_view{}; };
         const auto op = stmt->kind == file_stmt_kind::create_external_table
                             ? otterstax::external::external_op_t::create_external_table
                             : otterstax::external::external_op_t::copy_to;
@@ -176,7 +176,7 @@ namespace file_ext {
                                                        str(stmt->db),
                                                        str(stmt->table),
                                                        str(stmt->location),
-                                                       /*s3_alias=*/std::string{},
+                                                       /*s3_alias=*/std::string_view{},
                                                        str(stmt->format),
                                                        str(stmt->inner_sql));
     }

@@ -7,6 +7,10 @@
 
 #include <catch2/catch_all.hpp>
 
+#include <cstddef>
+#include <cstdint>
+#include <vector>
+
 using namespace frontend::mysql;
 
 TEST_CASE("packet_writer: basic operations") {
@@ -159,6 +163,80 @@ TEST_CASE("packet_writer: length encoded integers") {
         REQUIRE(packet[10] == 0x56); // byte 5
         REQUIRE(packet[11] == 0x34); // byte 6
         REQUIRE(packet[12] == 0x12); // byte 7
+    }
+}
+
+// append_frame frames each packet into one buffer of packets; a payload of 0xFFFFFF bytes or more
+// continues in further packets, as the protocol requires, and assign_sequence_ids numbers them all.
+TEST_CASE("packet_writer: append_frame frames packets back to back and splits past 16 MiB") {
+    constexpr std::size_t max_payload = 0xFFFFFF;
+    packet_writer writer;
+    std::vector<uint8_t> frames;
+
+    // The length and sequence id of the packet at `position`, and the position after it.
+    struct header_t {
+        std::size_t length;
+        uint8_t sequence_id;
+        std::size_t next;
+    };
+    const auto header_at = [&frames](std::size_t position) {
+        const std::size_t length = static_cast<std::size_t>(frames[position]) |
+                                   (static_cast<std::size_t>(frames[position + 1]) << 8) |
+                                   (static_cast<std::size_t>(frames[position + 2]) << 16);
+        return header_t{length, frames[position + 3], position + 4 + length};
+    };
+    const auto frame_payload = [&](std::size_t bytes) {
+        writer.reserve_payload(bytes);
+        writer.write_zeros(bytes);
+        writer.append_frame(frames);
+    };
+
+    SECTION("small packets go back to back and are numbered in order") {
+        writer.reserve_payload(2);
+        writer.write_uint8(7);
+        writer.write_uint8(8);
+        writer.append_frame(frames);
+        frame_payload(0);
+        uint8_t seq = 5;
+        assign_sequence_ids(frames, seq);
+        REQUIRE(seq == 7);
+        REQUIRE(frames.size() == 4 + 2 + 4);
+        const auto first = header_at(0);
+        REQUIRE(first.length == 2);
+        REQUIRE(first.sequence_id == 5);
+        REQUIRE(frames[4] == 7);
+        REQUIRE(frames[5] == 8);
+        const auto second = header_at(first.next);
+        REQUIRE(second.length == 0);
+        REQUIRE(second.sequence_id == 6);
+        REQUIRE(second.next == frames.size());
+    }
+
+    SECTION("a payload past 0xFFFFFF continues in the next packet") {
+        frame_payload(max_payload + 10);
+        uint8_t seq = 1;
+        assign_sequence_ids(frames, seq);
+        REQUIRE(seq == 3);
+        const auto first = header_at(0);
+        REQUIRE(first.length == max_payload);
+        REQUIRE(first.sequence_id == 1);
+        const auto second = header_at(first.next);
+        REQUIRE(second.length == 10);
+        REQUIRE(second.sequence_id == 2);
+        REQUIRE(second.next == frames.size());
+    }
+
+    SECTION("a payload of exactly 0xFFFFFF bytes ends with an empty packet") {
+        frame_payload(max_payload);
+        uint8_t seq = 1;
+        assign_sequence_ids(frames, seq);
+        REQUIRE(seq == 3);
+        const auto first = header_at(0);
+        REQUIRE(first.length == max_payload);
+        const auto second = header_at(first.next);
+        REQUIRE(second.length == 0);
+        REQUIRE(second.sequence_id == 2);
+        REQUIRE(second.next == frames.size());
     }
 }
 

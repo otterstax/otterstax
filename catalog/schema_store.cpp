@@ -3,6 +3,8 @@
 
 #include "schema_store.hpp"
 
+#include "utility/pmr_text.hpp"
+
 #include <cassert>
 
 namespace otterstax::catalog {
@@ -22,14 +24,13 @@ namespace otterstax::catalog {
                                  std::pmr::string{"schema_store: cannot register INVALID_OID", resource_});
         }
         if (by_oid_.contains(oid)) {
-            return core::error_t(
-                core::error_code_t::already_exists,
-                std::pmr::string{("schema_store: oid already registered: " + std::to_string(oid)).c_str(), resource_});
+            auto what = otterstax::concat(resource_, {"schema_store: oid already registered: "});
+            otterstax::append_number(what, oid);
+            return core::error_t(core::error_code_t::already_exists, std::move(what));
         }
         if (by_name_.contains(name)) {
-            return core::error_t(
-                core::error_code_t::already_exists,
-                std::pmr::string{("schema_store: name already registered: " + name.to_string()).c_str(), resource_});
+            return core::error_t(core::error_code_t::already_exists,
+                                 otterstax::concat(resource_, {"schema_store: name already registered: ", name.to_string()}));
         }
         by_name_.emplace(name, oid);
         by_oid_.emplace(oid, entry_t{std::move(name), std::move(struct_schema)});

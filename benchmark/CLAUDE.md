@@ -95,6 +95,9 @@ The Kafka tests are opt-in (MySQL and PostgreSQL frontends only). `--suite`
 # Rebuild images only (keeps existing DB volumes / data)
 ./benchmark/scripts/run_benchmark.sh --rebuild
 
+# Generate the saved benchmark data again (see "Saved benchmark data")
+./benchmark/scripts/run_benchmark.sh --regen-data
+
 # Single frontend
 ./benchmark/scripts/run_benchmark.sh --frontend postgres --repetitions 3
 
@@ -145,6 +148,8 @@ Results land in `benchmark_results/<YYYYMMDD_HHMMSS>/`.
 --out-dir DIR       Result root (default: benchmark_results/<timestamp>)
 --rebuild           Force image rebuild even if images exist
 --clear             Remove images + DB volumes, then rebuild from scratch
+                    (the saved data/dataset and fixtures are kept)
+--regen-data        Generate the saved benchmark data and fixtures again
 -j N                Parallel build jobs for otterstax_app
 --tracy             Continuous Tracy capture → <out-dir>/benchmark.tracy
 --tracy-sep         Per-test Tracy capture → <out-dir>/<frontend>_<test>.tracy
@@ -266,7 +271,10 @@ benchmark/
 ├── compose_kafka.yml            # Overlay: redpanda broker for kafka_ingest (seed is a run_benchmark.sh step, not a service)
 ├── Dockerfile.benchmark         # Python image: data init + benchmark scripts (+ confluent-kafka)
 ├── data/
-│   ├── init_data.py             # Creates tables and inserts Faker data in all 6 DBs
+│   ├── init_data.py             # Creates the tables in all 6 DBs and loads the saved dataset
+│   │                            #   (generating it once, from seeded Faker data)
+│   ├── dataset_stamp.py         # Generate-once stamps for the dataset and the fixtures
+│   ├── dataset/                 # Saved dataset: <db>/<table>.json.gz + .dataset.stamp.json (not committed)
 │   ├── generate_external_fixtures.py  # Writes s3/file fixtures from bench.yaml `external:`
 │   ├── generate_kafka_fixtures.py     # Writes kafka_events.ndjson from bench.yaml `kafka:`
 │   ├── seed_kafka.py            # Creates the topic + produces the ndjson (run once at bring-up)
@@ -323,9 +331,32 @@ below); it shares the same `campaign_id` space as Group A but its data lives in
 generated files, not the DB backends.
 
 Changing `bench.yaml` requires rebuilding the client image (`--rebuild` or `--clear`)
-because `bench.yaml` is baked into the image at build time. (External fixtures
-are the exception — they are bind-mounted, so editing `external:` only requires
-re-running an `external_*` benchmark, which regenerates them.)
+because `bench.yaml` is baked into the image at build time. The saved dataset and
+the fixtures are generated again by themselves once the sizes they were made with
+change (see "Saved benchmark data").
+
+### Saved benchmark data
+
+The data is generated **once** and every later run loads the same rows, so two
+runs — on different days, or of two images in an A/B — query identical tables.
+A run used to generate the rows afresh, and the MySQL group-A `campaigns.status`
+came from an unseeded `random`, so the set of `'active'` campaigns that drives
+`join_all` changed from run to run, and its time with it.
+
+- `data/init_data.py` writes the rows of all six databases into
+  `benchmark/data/dataset/<db>/<table>.json.gz` (about 6.5 MB, bind-mounted at
+  `/app/data/dataset`, not committed) and loads them into the backends on every run.
+  The DB volumes are still filled each run; only the generation is skipped.
+- `data/generate_external_fixtures.py` and `data/generate_kafka_fixtures.py` keep
+  their files in `data/fixtures/` the same way.
+- Each set carries a stamp (`.<name>.stamp.json`, `data/dataset_stamp.py`): the
+  generator's `VERSION` / `DATASET_VERSION`, its seed and the `bench.yaml` sizes. A
+  run reuses the files while the stamp matches, and generates them again when the
+  files are missing or the stamp differs. `--regen-data` (`run_benchmark.sh`,
+  `manual/start_service.sh`, `stress/run_stress_benchmarks.sh`) forces it.
+- Every generator is seeded, so a regenerated set is the same data as long as the
+  Faker / Python versions in the client image are.
+- Bump the generator's version constant when you change what it generates.
 
 ## Test categories
 
@@ -334,8 +365,19 @@ re-running an `external_*` benchmark, which regenerates them.)
 | simple_select       | LIMIT 100 point-read per table                        | 28–51 ms        |
 | complex_select      | GROUP BY + HAVING + ORDER BY LIMIT 1000               | 33–63 ms        |
 | join_same_instance  | JOIN two tables in the same engine instance           | 36–74 ms        |
-| join_cross_engine   | JOIN Group B tables across different engine instances | 36 ms–1 s       |
+| join_cross_engine   | JOIN tables across different engine instances; pairs of the same JOIN planned as a hash join and as a nested loop (see below) | 36 ms–1 s       |
 | join_all            | 3-engine JOIN (mysql1 × pg1/ch1 × ch2/mysql2)         | 0.18–0.48 s     |
+
+`join_cross_engine` shows what the engine's JOIN plan costs. The engine hashes a
+JOIN only when its ON clause is one equality of two keys of the same type; every
+other JOIN is a nested loop (`docs/otterbrix_request_joins.md`). MySQL × PostgreSQL
+(`INT` × `INT`) and ClickHouse × ClickHouse (`UInt32` × `UInt32`) are hashed; a
+ClickHouse key against a MySQL / PostgreSQL one (`UInt32` × `INT`) is cast and runs
+as a nested loop. `prod_mysql2_x_ord_pg2_on_filter` / `_where_filter` put the same
+row filter in ON (nested loop) and in WHERE (pushed below the JOIN, hash join).
+`prod_mysql2_x_ord_pg2_key_bigint_x_int` / `_key_bigint_x_bigint` answer the same rows as
+`prod_mysql2_x_ord_pg2` with only the key type changed in ON (`CAST(... AS BIGINT)`): any cast
+key is a nested loop.
 
 `join_all` reads all ~60 k Group A rows regardless of the
 `WHERE campaign_id <= 50` filter, because there is no predicate pushdown to
@@ -407,7 +449,8 @@ scale.
 Selecting any `external_*` test makes `run_benchmark.sh`:
 
 1. Generate fixtures into `benchmark/data/fixtures/` via `data/generate_external_fixtures.py`
-   (a container run of `benchmark-client`, before the stack comes up).
+   (a container run of `benchmark-client`, before the stack comes up; reused once
+   generated).
 2. Add `compose_rustfs.yml` to the backend + otterstax compose sets (RustFS +
    a one-shot that seeds `bench-bucket` from the same fixtures).
 
@@ -454,9 +497,9 @@ JOIN the backends, but the benchmarks deliberately keep joins internal).
 `regions ⋈ web_events` keys on int64 `campaign_id` on both sides — no width
 mismatch (the silent zero-row JOIN trap when int32 meets int64). Defaults:
 `regions_per_campaign=4`, `events_per_campaign=20` → ~4 k / ~20 k rows and an
-~80 k-row internal join. Editing `bench.yaml` requires regenerating fixtures
-(automatic on the next external run; the `benchmark-client` image is unaffected
-because fixtures are bind-mounted, not baked in).
+~80 k-row internal join. The fixtures are generated once and reused; editing the
+`bench.yaml` sizes regenerates them on the next external run (their stamp no
+longer matches, see "Saved benchmark data").
 
 ## Kafka benchmarks (`kafka_ingest` / `kafka_produce` / `kafka_stream`)
 

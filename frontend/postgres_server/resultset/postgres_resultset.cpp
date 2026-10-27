@@ -3,6 +3,8 @@
 
 #include "postgres_resultset.hpp"
 
+#include "utility/tracy_profiler.hpp"
+
 namespace frontend::postgres {
     inline constexpr int32_t POSTGRES_NULL = -1;
 
@@ -26,7 +28,6 @@ namespace frontend::postgres {
     postgres_resultset::postgres_resultset(packet_writer& writer, bool datarow_only)
         : format_()
         , field_desc_()
-        , encoded_rows_()
         , writer_(writer)
         , datarow_only_(datarow_only) {}
 
@@ -51,6 +52,9 @@ namespace frontend::postgres {
     }
 
     void postgres_resultset::add_row(const components::vector::data_chunk_t& chunk, size_t row_index) {
+        if (!head_written_) {
+            write_head(); // the formats are final by the first row
+        }
         size_t len = datarow_only_ ? chunk.data.size() : std::min(chunk.data.size(), field_desc_.size());
 
         // Only the reserve is computed here. The length a binary field states in
@@ -86,29 +90,32 @@ namespace frontend::postgres {
                 writer.write_int32(estimate_binary_field_size<frontend_type::POSTGRES>(chunk, i, row_index));
                 encode_to_binary<frontend_type::POSTGRES>(writer, chunk, i, row_index);
             } else {
-                auto str = encode_to_text(chunk, i, row_index);
-                writer.write_int32(str.size());
-                writer.write_string_fixed(std::move(str));
+                const auto str = encode_to_text(chunk, i, row_index, text_scratch_);
+                writer.write_int32(static_cast<int32_t>(str.size()));
+                writer.write_string_fixed(str);
             }
         }
 
-        encoded_rows_.emplace_back(writer.build_from_payload(message_type::backend::DATA_ROW));
+        // Framed in place behind the messages before it.
+        writer.append_frame(packets_, message_type::backend::DATA_ROW);
     }
 
-    std::vector<std::vector<uint8_t>> postgres_resultset::build_packets(postgres_resultset&& resultset) {
-        std::vector<std::vector<uint8_t>> packets;
-        packets.reserve(!resultset.datarow_only_ + resultset.encoded_rows_.size() +
-                        2 /*reserve for complete + ready msg*/);
-
-        auto& writer = resultset.writer_.get();
-        if (!resultset.datarow_only_) {
-            packets.emplace_back(
-                build_row_description(writer, std::move(resultset.field_desc_), std::move(resultset.format_)));
+    void postgres_resultset::write_head() {
+        if (!datarow_only_) {
+            // Copies: add_row still reads the fields' count and the formats.
+            append_packet(packets_,
+                          build_row_description(writer_.get(),
+                                                std::vector<field_description>(field_desc_),
+                                                std::vector<result_encoding>(format_)));
         }
+        head_written_ = true;
+    }
 
-        for (auto&& row : resultset.encoded_rows_) {
-            packets.emplace_back(std::move(row));
+    std::vector<uint8_t> postgres_resultset::build_packets(postgres_resultset&& resultset) {
+        OTX_ZONE_N("postgres_resultset::build_packets");
+        if (!resultset.head_written_) {
+            resultset.write_head(); // a resultset without rows
         }
-        return packets;
+        return std::move(resultset.packets_);
     }
 } // namespace frontend::postgres

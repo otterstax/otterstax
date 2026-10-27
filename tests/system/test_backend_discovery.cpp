@@ -125,14 +125,14 @@ namespace {
     std::unique_ptr<conn::IDriver> ch_recording_driver(std::pmr::memory_resource* resource) {
         return std::make_unique<scripted_driver_t>(
             [resource](const conn::statement_t& statement) {
-                return ch::decode(resource, ch::select_result_t{}, statement);
+                return ch::decode(resource, ch::select_result_t(std::pmr::new_delete_resource()), statement);
             },
             [resource](const conn::statement_t& statement) {
                 {
                     std::lock_guard guard(g_ch_queries_mutex);
                     g_ch_queries.emplace_back(statement.sql);
                 }
-                ch::select_result_t answer;
+                ch::select_result_t answer(std::pmr::new_delete_resource());
                 if (statement.sql.find("system.columns") != std::string::npos) {
                     answer.blocks.push_back(g_ch_named_types_malformed.load() ? ch_malformed_named_types_block()
                                                                               : ch_named_types_block());

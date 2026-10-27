@@ -13,7 +13,9 @@
 #include "otterbrix/translators/input/chunk_windows.hpp"
 #include "types/otterbrix.hpp"
 #include "utility/logger.hpp"
+#include "utility/pmr_text.hpp"
 #include "utility/session.hpp"
+#include "utility/stack_arena.hpp"
 #include "utility/tracy_profiler.hpp"
 
 #include <actor-zeta.hpp>
@@ -21,69 +23,56 @@
 #include <core/result_wrapper.hpp>
 
 #include <cassert>
+#include <initializer_list>
 #include <memory_resource>
 #include <string>
+#include <string_view>
 #include <utility>
 
 namespace db {
 
-    // The text of column `col` of every row of `chunk` — how discovery reads the catalog
-    // listings (table names, system.columns) out of a decoded answer. A chunk without that
-    // column, a column that is not text, or a NULL is `code`, naming `what`.
-    inline core::result_wrapper_t<std::vector<std::string>> read_text_column(std::pmr::memory_resource* resource,
-                                                                             const components::vector::data_chunk_t& chunk,
-                                                                             std::size_t col,
-                                                                             core::error_code_t code,
-                                                                             const std::string& what) {
-        const auto refuse = [&](const std::string& why) {
-            return core::error_t(code, std::pmr::string{(what + ": " + why).c_str(), resource});
+    // Reads text column `col` of every row of `chunk` (how discovery reads catalog listings).
+    // A missing column, a non-text column or a NULL gives `code`, naming `what`. Results live on `resource`.
+    inline core::result_wrapper_t<std::pmr::vector<std::pmr::string>>
+    read_text_column(std::pmr::memory_resource* resource,
+                     const components::vector::data_chunk_t& chunk,
+                     std::size_t col,
+                     core::error_code_t code,
+                     std::string_view what) {
+        // "<what>: <before><number><after>"
+        const auto refuse = [&](std::string_view before, uint64_t number, std::string_view after) {
+            auto message = otterstax::concat(resource, {what, ": ", before});
+            otterstax::append_number(message, number);
+            message += after;
+            return core::error_t(code, std::move(message));
         };
-        std::vector<std::string> out;
+        std::pmr::vector<std::pmr::string> out(resource);
         if (chunk.size() == 0) {
             return out;
         }
         if (chunk.column_count() <= col) {
-            return refuse("the answer has " + std::to_string(chunk.column_count()) + " column(s)");
+            return refuse("the answer has ", chunk.column_count(), " column(s)");
         }
         if (chunk.types()[col].type() != components::types::logical_type::STRING_LITERAL) {
-            return refuse("column " + std::to_string(col) + " is not text");
+            return refuse("column ", col, " is not text");
         }
         out.reserve(chunk.size());
         for (uint64_t row = 0; row < chunk.size(); ++row) {
             auto value = chunk.value(col, row);
             if (value.is_null()) {
-                return refuse("row " + std::to_string(row) + " is NULL");
+                return refuse("row ", row, " is NULL");
             }
-            out.emplace_back(value.value<std::string_view>());
+            out.emplace_back(value.value<std::string_view>()); // on `resource` (uses-allocator)
         }
         return out;
     }
 
-    // The part of the query pipeline that reaches one remote database: generate each plan
-    // slot's statement, run it on the connection pool, splice the answers into the plan.
-    // One template for MySQL, PostgreSQL and ClickHouse; Traits holds what differs.
-    //
-    // Not an actor. Every Worker owns one of each, the catalog owns one of each for
-    // discovery, and their coroutines run inside the owner's behavior on the owner's thread,
-    // so awaiting a statement suspends the owner instead of blocking a thread, and two
-    // Workers' statements run on two pool connections at once. actor-zeta allocates every
-    // coroutine frame of this object on resource().
-    //
-    // Traits provides
-    //   static constexpr backend_type_t type;
-    //   static constexpr const char* name;          // in messages: "MySQL", "PostgreSQL", "ClickHouse"
-    //   static constexpr std::string_view log_tag;
-    //   using metadata_t;                            // decode metadata discovery fills
-    //   static core::error_t check(const metadata_t&, const std::string& uid, std::pmr::memory_resource*);
-    //   static conn::statement_t slot_statement(node_type slot, std::string sql, const metadata_t&,
-    //                                           const std::string& uid, const std::string& table);
-    //   static core::result_wrapper_t<data_chunk_t> slot_chunk(std::pmr::memory_resource*, node_type slot,
-    //                                                          conn::statement_result_t answer,
-    //                                                          const std::string& uid);
-    //   static conn::statement_t probe_statement(std::string probe, const metadata_t&,
-    //                                            const std::string& uid, const std::string& table);
-    //   static std::string no_header(const std::string& probe); // describe's schema_error text
-    //   static unique_future<result_wrapper_t<discovered_tables_t>> discover(backend_t&, qualified_name_t);
+    // Reaches one remote database: generates each plan slot's statement, runs it on the connection
+    // pool and splices the answers into the plan. One template for MySQL, PostgreSQL and ClickHouse.
+    // Not an actor: each Worker and the catalog own one, and its coroutines run on the owner's thread,
+    // so awaiting suspends the owner. Coroutine frames are allocated on resource().
+    // Traits supplies: type, name, log_tag, metadata_t, check, slot_statement, slot_chunk,
+    // probe_statement, no_header and discover (see the existing Traits structs).
     template<typename Traits>
     class backend_t {
     public:
@@ -93,10 +82,10 @@ namespace db {
 
         // The statement one slot sends and the base table it reads, whose named types shape
         // its result columns (ClickHouse) — shared by execute (which runs it) and describe
-        // (which probes its header), so both see one text.
+        // (which probes its header), so both see one text. On the backend's resource.
         struct slot_statement_t {
-            std::string sql;
-            std::string table;
+            std::pmr::string sql;
+            std::pmr::string table;
         };
 
         // A statement sent to the pool, with the ticket its owner waits on (null without an
@@ -106,10 +95,9 @@ namespace db {
             conn::wait_ticket_ptr ticket;
         };
 
-        // `pool` and `metadata` are owned by ComponentManager (or a test fixture) and
-        // outlive every backend built on them. `owner` parks while a statement of this
-        // backend is in flight and is woken by its answer — a Worker; an owner that polls
-        // (the catalog) passes none (conn::wait_owner_t).
+        // `pool` and `metadata` are owned by ComponentManager (or a test fixture) and outlive the backend.
+        // `owner` is woken by each answer: a Worker parks while a statement is in flight, the catalog sleeps
+        // (conn::blocking_owner_t). Without one (tests driving a backend by hand) the awaiter polls.
         backend_t(std::pmr::memory_resource* resource,
                   conn::connection_pool_t* pool,
                   metadata_t* metadata,
@@ -125,13 +113,17 @@ namespace db {
         }
 
         std::pmr::memory_resource* resource() const noexcept { return resource_; }
+        // Resource for what is sent to the pool (SQL text, wait ticket): the pool's, not the owner's,
+        // because the owner's synchronized engine pool would be contended by many Workers.
+        // Coroutine frames stay on resource().
+        std::pmr::memory_resource* statement_resource() const noexcept { return pool_->resource(); }
         conn::connection_pool_t& pool() const noexcept { return *pool_; }
         metadata_t& metadata() const noexcept { return *metadata_; }
         const log_t& log() const noexcept { return log_; }
 
         // Sends one statement to the alias's pool; the owner is woken when it is answered.
         sent_t send(std::string_view uid, conn::statement_t statement) const {
-            auto watched = conn::watch(owner_);
+            auto watched = conn::watch(owner_, statement_resource());
             return sent_t{pool_->execute(uid, std::move(statement), std::move(watched.waker)),
                           std::move(watched.ticket)};
         }
@@ -149,8 +141,12 @@ namespace db {
             return answer(send(uid, std::move(statement)));
         }
 
-        core::error_t make_error(core::error_code_t code, const std::string& what) const {
-            return core::error_t(code, std::pmr::string{what.c_str(), resource_});
+        core::error_t make_error(core::error_code_t code, std::string_view what) const {
+            return core::error_t(code, std::pmr::string{what, resource_});
+        }
+        // The message joined from `parts`, built once on the backend's resource.
+        core::error_t make_error(core::error_code_t code, std::initializer_list<std::string_view> parts) const {
+            return core::error_t(code, otterstax::concat(resource_, parts));
         }
 
         // A statement sent for one slot of a batch, waiting for its answer.
@@ -161,12 +157,9 @@ namespace db {
         };
         using in_flight_list_t = std::pmr::vector<in_flight_t>;
 
-        // Runs every slot of the statement this backend owns and replaces it with the rows
-        // it answered (node_raw_data, cut to the engine's chunk bound). Batches run back to
-        // front, innermost dependencies first; a batch's statements are all sent before the
-        // first answer is awaited, so they run side by side on the alias's pool. For a Mixed
-        // statement the slots of the other backends are left alone (node_backend_types);
-        // backend_set_t::execute_mixed runs all three backends batch by batch instead.
+        // Runs every slot this backend owns and replaces it with the rows it answered (node_raw_data).
+        // Batches run back to front; a batch's statements are all sent before the first answer is awaited.
+        // Slots of other backends in a Mixed statement are left alone (see backend_set_t::execute_mixed).
         actor_zeta::unique_future<core::result_wrapper_t<ParsedQueryDataPtr>> execute(session_hash_t id,
                                                                                       ParsedQueryDataPtr data) {
             assert(data);
@@ -185,10 +178,8 @@ namespace db {
         }
 
         // Sends the statement of every slot of `batch` this backend owns; answers nothing yet.
-        // A slot already holding rows (data_t) was answered by another backend. Refuses the
-        // whole batch — before anything is sent — when a slot's connection or metadata is
-        // missing or its SQL cannot be generated; a slot left symbolic would die later in
-        // the engine with a misleading "database does not exist".
+        // Refuses the whole batch before sending if a connection, metadata or SQL is missing, since a
+        // slot left symbolic would fail later in the engine with a misleading "database does not exist".
         core::result_wrapper_t<in_flight_list_t> send_batch(session_hash_t id, ParsedQueryData& data, std::size_t batch) {
             OTX_ZONE_N("db::backend::dispatch");
             const auto* parameters = &data.otterbrix_params->params_node->parameters();
@@ -199,10 +190,13 @@ namespace db {
             struct ready_t {
                 std::size_t index;
                 node_type slot;
-                std::string uid;
+                std::string_view uid; // the slot target's own uid, alive for the whole call
                 conn::statement_t statement;
             };
-            std::pmr::vector<ready_t> ready(resource_);
+            // Scratch, dead once everything is sent: its statements move into the pool's queue.
+            otterstax::stack_arena_t<1024> scratch(resource_);
+            std::pmr::vector<ready_t> ready(scratch.resource());
+            ready.reserve(nodes.size());
             for (std::size_t i = 0; i < nodes.size(); ++i) {
                 auto& node = *nodes[i].node;
                 const auto& target = nodes[i].target;
@@ -213,7 +207,7 @@ namespace db {
                 if (!pool_->contains(uid)) {
                     log_->error("execute: no {} connection registered for UID: {}", Traits::name, uid);
                     return make_error(core::error_code_t::do_not_exists,
-                                      std::string{"no "} + Traits::name + " connection registered for '" + uid + "'");
+                                      {"no ", Traits::name, " connection registered for '", uid, "'"});
                 }
                 if (auto refused = Traits::check(*metadata_, uid, resource_); refused.contains_error()) {
                     return refused;
@@ -241,9 +235,8 @@ namespace db {
         }
 
         // Awaits the answers send_batch sent, in slot order, and splices each into its slot.
-        // The first failed answer is the result; the statements still running are dropped —
-        // the pool finishes them and their answers are discarded. Nothing they touch lives
-        // in this frame.
+        // The first failure is the result; statements still running are dropped and the pool discards
+        // their answers. Nothing they touch lives in this frame.
         actor_zeta::unique_future<core::error_t>
         answer_batch(ParsedQueryData& data, std::size_t batch, in_flight_list_t in_flight) {
             auto& nodes = data.otterbrix_params->external_nodes[batch];
@@ -266,27 +259,24 @@ namespace db {
                     log_->error("execute: {}", chunk.error().what.c_str());
                     co_return std::move(chunk.error());
                 }
-                // The slot being replaced is still typed: if it IS the statement's own
-                // DML node, the whole statement ran on the backend and the chunk's
-                // cardinality is its affected-row count. Record it before the slot
-                // becomes a data_t.
+                // The slot is still typed here: if it is the statement's own DML node, the whole statement ran
+                // on the backend and the chunk's cardinality is the affected-row count. Record it before the
+                // slot becomes a data_t.
                 capture_remote_dml_count(*data.otterbrix_params, slot, chunk.value());
                 // The engine takes at most DEFAULT_VECTOR_CAPACITY rows per chunk: a wider
                 // result goes in as a run of such chunks (a count carrier stays whole).
                 slot = components::logical_plan::make_node_raw_data(
                     resource_,
-                    tsl::split_to_capacity(resource_, std::move(chunk.value())));
+                    // On the resource the driver decoded the slice into (the backends' data
+                    // resource, ComponentManager): the engine copies the windows through it too.
+                    tsl::split_to_capacity(chunk.value().resource(), std::move(chunk.value())));
             }
             co_return core::error_t::no_error();
         }
 
-        // The prepared schema of the statement's slots this backend owns, answered by the
-        // backend: for every schema_node_t stub the statement execute would run for it is
-        // wrapped as a LIMIT 0 probe (prepare_probe.hpp) and run, and the stub takes the
-        // STRUCT of the answer's columns — decoded by the translator execute reads rows
-        // with, so the prepared types are the executed chunk's by construction. A raw-SQL
-        // stub is filled in place, so its text and qualifiers survive for execute. Nothing
-        // is cached: every prepare asks the backend.
+        // Prepared schema of this backend's slots: each schema_node_t stub is wrapped as a LIMIT 0 probe
+        // (prepare_probe.hpp), run, and takes the STRUCT of the answer, decoded as execute decodes rows.
+        // A raw-SQL stub is filled in place so its text survives. Nothing is cached.
         actor_zeta::unique_future<core::result_wrapper_t<ParsedQueryDataPtr>> describe(session_hash_t id,
                                                                                        ParsedQueryDataPtr data) {
             assert(data);
@@ -299,17 +289,16 @@ namespace db {
                 // An extension root is `unused` like a stub; the Worker keeps it away from here.
                 if (data->extension_kind != extension_kind_t::none) {
                     co_return make_error(core::error_code_t::invalid_parameter,
-                                         std::string{"describe: an extension statement has no "} + Traits::name +
-                                             " result schema");
+                                         {"describe: an extension statement has no ", Traits::name, " result schema"});
                 }
                 // The binder holds every parameter of a parameterized statement, literals
                 // included, until finalize: before Bind there is no SQL to probe with, and a
                 // type read off the plan instead would be the guess this exists to replace.
                 if (const std::size_t unbound = data->otterbrix_params->parameters_count; unbound > 0) {
-                    co_return make_error(core::error_code_t::unimplemented_yet,
-                                         std::string{"the result schema of a "} + Traits::name + " statement with " +
-                                             std::to_string(unbound) +
-                                             " unbound parameter(s) is known only once they are bound");
+                    auto what = otterstax::concat(resource_, {"the result schema of a ", Traits::name, " statement with "});
+                    otterstax::append_number(what, unbound);
+                    what += " unbound parameter(s) is known only once they are bound";
+                    co_return core::error_t(core::error_code_t::unimplemented_yet, std::move(what));
                 }
             }
 
@@ -326,15 +315,14 @@ namespace db {
                         continue;
                     }
                     auto& stub = static_cast<schema_utils::schema_node_t&>(*node);
-                    std::string probe;
-                    std::string table;
+                    std::pmr::string probe(statement_resource());
+                    std::pmr::string table(statement_resource());
                     {
                         OTX_ZONE_N("db::backend::describe_slot"); // ends before the probe is awaited
                         if (!pool_->contains(uid)) {
                             log_->error("describe: no {} connection registered for UID: {}", Traits::name, uid);
                             co_return make_error(core::error_code_t::do_not_exists,
-                                                 std::string{"no "} + Traits::name + " connection registered for '" +
-                                                     uid + "'");
+                                                 {"no ", Traits::name, " connection registered for '", uid, "'"});
                         }
                         if (auto refused = Traits::check(*metadata_, uid, resource_); refused.contains_error()) {
                             co_return std::move(refused);
@@ -345,18 +333,21 @@ namespace db {
                             co_return generated.template convert_error<ParsedQueryDataPtr>();
                         }
                         // The wrap, its cost and what it cannot carry: prepare_probe.hpp.
-                        probe = make_prepare_probe(generated.value().sql, Traits::type);
+                        probe = make_prepare_probe(statement_resource(), generated.value().sql, Traits::type);
                         table = std::move(generated.value().table);
                         log_->debug("describe: probing \"{}\"", probe);
                     }
-                    auto answer = co_await run(uid, Traits::probe_statement(probe, *metadata_, uid, table));
+                    // A copy: the probe text is logged and quoted in the errors below.
+                    auto answer = co_await run(
+                        uid,
+                        Traits::probe_statement(std::pmr::string(probe, statement_resource()), *metadata_, uid, table));
                     if (answer.has_error()) {
                         log_->error("describe: probe failed for UID {}: {}", uid, answer.error().what.c_str());
                         co_return answer.template convert_error<ParsedQueryDataPtr>();
                     }
                     if (!answer.value().schema) {
                         log_->error("describe: probe answered without columns: \"{}\"", probe);
-                        co_return make_error(core::error_code_t::schema_error, Traits::no_header(probe));
+                        co_return make_error(core::error_code_t::schema_error, {Traits::no_header, probe});
                     }
                     // Filled in place rather than rebuilt: a raw-SQL stub keeps the text and
                     // qualifiers execute generates its statement from.
@@ -373,11 +364,9 @@ namespace db {
             return Traits::discover(*this, std::move(scope));
         }
 
-        // Whether a slot of this type only reads, so the driver may repeat its statement after
-        // a stale connection lost the answer. Everything else — INSERT/UPDATE/DELETE, every
-        // CREATE/DROP, a bare function call — may already have been applied when the answer
-        // was lost, and is sent once. A stub (unused) is a raw SELECT subquery or the
-        // catalog's aggregate.
+        // True if the slot only reads, so the driver may repeat it after a stale connection lost the
+        // answer. Anything else may already have been applied and is sent once. A stub (unused) is a
+        // raw SELECT subquery or the catalog's aggregate.
         static constexpr bool is_read(node_type slot) noexcept {
             switch (slot) {
                 case node_type::aggregate_t:
@@ -415,12 +404,12 @@ namespace db {
                                 const std::pmr::vector<external_entry_t>& batch,
                                 const components::logical_plan::storage_parameters* parameters) const {
             OTX_ZONE_N("db::backend::generate_slot_statement");
-            slot_statement_t statement;
-            statement.table = target.name.collection;
+            auto* text = statement_resource();
+            slot_statement_t statement{std::pmr::string(text), std::pmr::string(target.name.collection, text)};
             if (node->type() == node_type::unused) {
                 auto& stub = static_cast<schema_utils::schema_node_t&>(*node);
                 if (stub.has_raw_sql()) {
-                    auto rendered = sql_gen::replace_qualifiers(stub.raw_sql(), stub.qualifiers(), Traits::type, resource_);
+                    auto rendered = sql_gen::replace_qualifiers(stub.raw_sql(), stub.qualifiers(), Traits::type, text);
                     if (rendered.has_error()) {
                         return rendered.template convert_error<slot_statement_t>();
                     }
@@ -431,14 +420,14 @@ namespace db {
                     return std::move(statement);
                 }
                 auto generated =
-                    sql_gen::generate_query(stub.agg_node(), parameters, Traits::type, target, batch, resource_);
+                    sql_gen::generate_query(stub.agg_node(), parameters, Traits::type, target, batch, text);
                 if (generated.has_error()) {
                     return generated.template convert_error<slot_statement_t>();
                 }
                 statement.sql = std::move(generated.value());
                 return std::move(statement);
             }
-            auto generated = sql_gen::generate_query(node, parameters, Traits::type, target, batch, resource_);
+            auto generated = sql_gen::generate_query(node, parameters, Traits::type, target, batch, text);
             if (generated.has_error()) {
                 return generated.template convert_error<slot_statement_t>();
             }

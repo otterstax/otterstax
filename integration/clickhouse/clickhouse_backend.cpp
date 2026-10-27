@@ -14,12 +14,20 @@ namespace db {
 
     template class backend_t<clickhouse_traits>;
 
-    void ch_metadata_t::set(const std::string& uid, const std::string& table, conn::named_types_ptr types) {
+    void ch_metadata_t::set(std::string_view uid, std::string_view table, conn::named_types_ptr types) {
         std::unique_lock guard(mutex_);
-        tables_[uid].insert_or_assign(table, std::move(types));
+        auto u = tables_.find(uid);
+        if (u == tables_.end()) {
+            u = tables_.emplace(std::piecewise_construct, std::forward_as_tuple(uid), std::forward_as_tuple()).first;
+        }
+        if (auto t = u->second.find(table); t != u->second.end()) {
+            t->second = std::move(types);
+            return;
+        }
+        u->second.emplace(table, std::move(types));
     }
 
-    conn::named_types_ptr ch_metadata_t::find(const std::string& uid, const std::string& table) const {
+    conn::named_types_ptr ch_metadata_t::find(std::string_view uid, std::string_view table) const {
         std::shared_lock guard(mutex_);
         auto u = tables_.find(uid);
         if (u == tables_.end()) {
@@ -30,10 +38,10 @@ namespace db {
     }
 
     conn::statement_t clickhouse_traits::slot_statement(components::logical_plan::node_type slot,
-                                                        std::string sql,
+                                                        std::pmr::string sql,
                                                         const metadata_t& metadata,
-                                                        const std::string& uid,
-                                                        const std::string& table) {
+                                                        std::string_view uid,
+                                                        std::string_view table) {
         using components::logical_plan::node_type;
         switch (slot) {
             case node_type::insert_t:
@@ -49,7 +57,7 @@ namespace db {
     clickhouse_traits::slot_chunk(std::pmr::memory_resource* resource,
                                   components::logical_plan::node_type slot,
                                   conn::statement_result_t answer,
-                                  const std::string& uid) {
+                                  std::string_view uid) {
         using components::logical_plan::node_type;
         switch (slot) {
             case node_type::insert_t:
@@ -61,34 +69,38 @@ namespace db {
                 if (!answer.rows) {
                     return core::error_t(
                         core::error_code_t::other_error,
-                        std::pmr::string{("ClickHouse backend '" + uid + "' returned no result chunk").c_str(), resource});
+                        otterstax::concat(resource, {"ClickHouse backend '", uid, "' returned no result chunk"}));
                 }
                 return std::move(*answer.rows);
         }
     }
 
-    conn::statement_t clickhouse_traits::probe_statement(std::string probe,
+    conn::statement_t clickhouse_traits::probe_statement(std::pmr::string probe,
                                                          const metadata_t& metadata,
-                                                         const std::string& uid,
-                                                         const std::string& table) {
+                                                         std::string_view uid,
+                                                         std::string_view table) {
         return conn::statement_t::schema(std::move(probe), metadata.find(uid, table));
     }
 
     namespace {
 
-        // The system.columns answer for one table, decoded: column → type string.
+        // The system.columns answer for one table, decoded: column → type string. The names
+        // are the caller's, which awaits this at once.
         actor_zeta::unique_future<core::result_wrapper_t<conn::named_types_ptr>>
-        fetch_named_types(ClickhouseBackend& backend, std::string uid, std::string database, std::string table) {
+        fetch_named_types(ClickhouseBackend& backend, std::string_view uid, std::string_view database, std::string_view table) {
             auto query = otterstax::catalog::make_named_types_query(backend.resource(), database, table);
-            auto answer = co_await backend.run(uid, conn::statement_t::rows(std::string(std::string_view(query))));
+            auto answer = co_await backend.run(uid, conn::statement_t::rows(std::move(query)));
             if (answer.has_error()) {
                 backend.log()->error("fetch_named_types failed for {}.{}: {}", database, table, answer.error().what.c_str());
                 co_return answer.convert_error<conn::named_types_ptr>();
             }
-            auto fresh = std::make_shared<conn::named_types_t>();
+            // The map and its nodes on the registry's resource, where it lives (uses-allocator
+            // construction).
+            auto fresh = std::allocate_shared<conn::named_types_t>(
+                std::pmr::polymorphic_allocator<conn::named_types_t>(backend.statement_resource()));
             if (answer.value().rows) {
                 const auto& columns = *answer.value().rows;
-                const std::string what = "system.columns of " + database + "." + table;
+                const auto what = otterstax::concat(backend.resource(), {"system.columns of ", database, ".", table});
                 auto names = read_text_column(backend.resource(), columns, 0, core::error_code_t::schema_error, what);
                 if (names.has_error()) {
                     co_return names.convert_error<conn::named_types_ptr>();
@@ -109,14 +121,14 @@ namespace db {
         // rows); an answer without a block that has columns did not describe the table, and
         // registering a column-less table would hide that until the first query against it.
         actor_zeta::unique_future<core::result_wrapper_t<catalog_ext::discovered_table_t>>
-        probe_table(ClickhouseBackend& backend, std::string uid, std::string database, std::string table) {
+        probe_table(ClickhouseBackend& backend, std::string_view uid, std::string_view database, std::string_view table) {
             auto named = co_await fetch_named_types(backend, uid, database, table);
             if (named.has_error()) {
                 co_return named.convert_error<catalog_ext::discovered_table_t>();
             }
             backend.metadata().set(uid, table, named.value());
 
-            qualified_name_t name(uid, database, "", table);
+            qualified_name_t name(std::string(uid), std::string(database), "", std::string(table)); // the engine's name type
             auto probe = otterstax::catalog::make_schema_probe_query(backend.resource(), name, backend_type_t::ClickHouse);
             if (probe.has_error()) {
                 co_return probe.convert_error<catalog_ext::discovered_table_t>();
@@ -127,7 +139,7 @@ namespace db {
             }
             if (!answer.value().schema) {
                 co_return backend.make_error(core::error_code_t::schema_error,
-                                             "ClickHouse schema probe returned no columns for " + database + "." + table);
+                                             {"ClickHouse schema probe returned no columns for ", database, ".", table});
             }
             backend.log()->info("discover: schema discovered for: {}.{}", database, table);
             co_return catalog_ext::discovered_table_t{std::move(name), std::move(*answer.value().schema)};
@@ -140,12 +152,12 @@ namespace db {
         // Run by the catalog only, whose enqueue_impl drives it to completion on the sender's
         // thread, so the zone may span its co_awaits (CLAUDE.md, "Tracy zones in coroutines").
         OTX_ZONE_N("ch::discover");
-        const std::string uid = scope.unique_identifier;
-        const std::string database = scope.database;
+        const std::string_view uid = scope.unique_identifier; // scope lives in this frame
+        const std::string_view database = scope.database;
         if (database.empty()) {
             backend.log()->error("discover: no ClickHouse database configured for uuid {}", uid);
             co_return backend.make_error(core::error_code_t::missing_field,
-                                         "Cannot discover ClickHouse schema: no database configured for uuid: " + uid);
+                                         {"Cannot discover ClickHouse schema: no database configured for uuid: ", uid});
         }
 
         catalog_ext::discovered_tables_t out(backend.resource());
@@ -160,11 +172,11 @@ namespace db {
 
         // Whole-database discovery via system.tables.
         auto list = otterstax::catalog::make_list_tables_query(backend.resource(), backend_type_t::ClickHouse, database);
-        auto listed = co_await backend.run(uid, conn::statement_t::rows(std::string(std::string_view(list))));
+        auto listed = co_await backend.run(uid, conn::statement_t::rows(std::move(list)));
         if (listed.has_error()) {
             co_return listed.convert_error<catalog_ext::discovered_tables_t>();
         }
-        std::vector<std::string> names;
+        std::pmr::vector<std::pmr::string> names(backend.resource());
         if (listed.value().rows) {
             auto read = read_text_column(backend.resource(),
                                          *listed.value().rows,
@@ -187,7 +199,7 @@ namespace db {
                                      database,
                                      table,
                                      probed.error().what.c_str());
-                failed.emplace_back((database + "." + table).c_str());
+                failed.push_back(otterstax::concat(backend.resource(), {database, ".", table}));
                 continue;
             }
             out.push_back(std::move(probed.value()));

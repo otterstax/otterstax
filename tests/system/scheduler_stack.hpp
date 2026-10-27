@@ -102,11 +102,9 @@ namespace otterstax::test {
         return registry;
     }
 
-    // Owns otterbrix + the backend registry (no connections, a local-file transfer
-    // pool) + a Scheduler over `parser_factory`.
-    // Teardown runs in the destructor in dependency order (actors before
-    // otterbrix, whose dtor checkpoints to data_dir), so it happens whether the
-    // test body returns or a failed REQUIRE unwinds through it.
+    // Owns otterbrix, the backend registry (no connections, a local-file transfer pool) and a Scheduler
+    // over `parser_factory`. The destructor tears down actors before otterbrix (whose dtor checkpoints
+    // to data_dir), also when a failed REQUIRE unwinds through it.
     class scheduler_stack_owner {
     public:
         // Member order is construction order: every actor is spawned after the
@@ -155,10 +153,9 @@ namespace otterstax::test {
         std::unique_ptr<Scheduler, actor_zeta::pmr::deleter_t> scheduler_;
     };
 
-    // A full Scheduler stack over a real engine, a real catalog and the real
-    // parser, whose connections are drivers a test registers through `add`
-    // (mock_backends::add / add_mysql / ...) before the Scheduler exists — the
-    // order register_connections keeps. `aliases` must outlive the owner.
+    // A full Scheduler stack over a real engine, catalog and parser. Its connections are drivers a test
+    // registers through `add` before the Scheduler exists, as register_connections does. `aliases` must
+    // outlive the owner.
     class backend_stack_owner {
     public:
         using add_fn = std::function<void(mock_backends&, std::pmr::memory_resource*)>;

@@ -12,8 +12,10 @@
 #include <components/vector/data_chunk.hpp>
 
 #include <cassert>
+#include <memory_resource>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace frontend {
@@ -62,20 +64,25 @@ namespace frontend {
     constexpr size_t
     estimate_text_field_size(const components::vector::data_chunk_t& chunk, size_t column_index, size_t row_index);
 
-    // The digits of a DECIMAL cell: the stored unscaled integer with the point
-    // put back where the scale of the type says it belongs — DECIMAL(18, 4)
-    // holding 12345 is "1.2345", never "12345". Both wires spell a fixed-point
-    // number this way, so the text and the MySQL binary row share this one
-    // rendering. The engine's non-finite sentinels come out as PostgreSQL
-    // spells them for NUMERIC ("NaN", "Infinity", "-Infinity") rather than as
-    // the extreme integer that carries them. A HUGEINT cell is rendered here
-    // too: it goes out under the same wire type (NEWDECIMAL / NUMERIC) and is
-    // the same rendering at scale 0 — every digit of the 128-bit integer and
-    // nothing after the point, with no sentinel among its values.
-    std::string
-    decimal_to_text(const components::vector::data_chunk_t& chunk, size_t column_index, size_t row_index);
+    // The digits of a DECIMAL cell: the unscaled integer with the point at the type's scale, so
+    // DECIMAL(18, 4) holding 12345 is "1.2345". Text and MySQL binary rows share it. Non-finite
+    // sentinels print as PostgreSQL NUMERIC does; HUGEINT is rendered here too, at scale 0.
+    //
+    // Rendered into `text`, the caller's stack buffer, and answered as a view into it: the longest
+    // rendering is 43 characters (39 digits, a sign, "0.").
+    using decimal_text_t = char[48];
+    std::string_view decimal_to_text(const components::vector::data_chunk_t& chunk,
+                                     size_t column_index,
+                                     size_t row_index,
+                                     decimal_text_t& text);
 
-    std::string encode_to_text(const components::vector::data_chunk_t& chunk, size_t column_index, size_t row_index);
+    // The text-protocol rendering of one cell, as a view: into the chunk for a STRING, into `scratch`
+    // otherwise. Valid until the next call with the same scratch or the chunk's end. One scratch serves
+    // a whole resultset, so no string is allocated per cell.
+    std::string_view encode_to_text(const components::vector::data_chunk_t& chunk,
+                                    size_t column_index,
+                                    size_t row_index,
+                                    std::pmr::string& scratch);
 
     template<frontend_type front_type>
     constexpr size_t
@@ -136,11 +143,11 @@ namespace frontend {
                 break;
             }
             case components::types::logical_type::STRING_LITERAL: {
+                // The chunk's own bytes, no copy.
                 if constexpr (front_type == frontend_type::MYSQL) {
-                    writer.write_length_encoded_string(
-                        std::string(chunk.data[column_index].data<std::string_view>()[row_index]));
+                    writer.write_length_encoded_string(chunk.data[column_index].data<std::string_view>()[row_index]);
                 } else {
-                    writer.write_string_null(std::string(chunk.data[column_index].data<std::string_view>()[row_index]));
+                    writer.write_string_null(chunk.data[column_index].data<std::string_view>()[row_index]);
                 }
                 break;
             }
@@ -152,7 +159,10 @@ namespace frontend {
                     // how boost.mysql — the client this server answers — reads
                     // it back: deserialize_binary_field_string). A HUGEINT goes
                     // out under that type too, so it takes the same rendering.
-                    writer.write_length_encoded_string(decimal_to_text(chunk, column_index, row_index));
+                {
+                    decimal_text_t text;
+                    writer.write_length_encoded_string(decimal_to_text(chunk, column_index, row_index, text));
+                }
                 } else {
                     // Unreachable: PostgreSQL's binary NUMERIC is a different
                     // encoding, which this frontend does not write, so

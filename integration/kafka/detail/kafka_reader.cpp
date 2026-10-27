@@ -4,6 +4,7 @@
 #include "kafka_reader.hpp"
 #include "otterbrix/schema/schema_utils.hpp"
 #include "utility/logger.hpp"
+#include "utility/pmr_text.hpp"
 #include "utility/tracy_profiler.hpp"
 
 #include <boost/json.hpp>
@@ -116,7 +117,7 @@ namespace otterstax::kafka::detail {
                     if (!jv.is_string()) {
                         return {std::nullopt, "not a string"};
                     }
-                    return {types::logical_value_t(resource, std::string(jv.as_string().c_str())), ""};
+                    return {types::logical_value_t(resource, std::string_view(jv.as_string())), ""};
                 case types::logical_type::BOOLEAN:
                     if (!jv.is_bool()) {
                         return {std::nullopt, "not a boolean"};
@@ -144,46 +145,65 @@ namespace otterstax::kafka::detail {
             OTX_ZONE_N("kafka::chunk_to_json");
             std::vector<std::string> out;
             out.reserve(chunk.size());
+            // Each column's key once per chunk, not once per cell.
+            std::pmr::vector<std::pmr::string> keys(resource);
+            keys.reserve(chunk.column_count());
+            for (std::uint64_t col = 0; col < chunk.column_count(); ++col) {
+                const auto& col_type = chunk.data[col].type();
+                if (col_type.has_alias()) {
+                    keys.emplace_back(col_type.alias());
+                } else {
+                    keys.emplace_back("col");
+                    otterstax::append_number(keys.back(), col);
+                }
+            }
+            // A row's object on a stack buffer, released after it is serialised.
+            unsigned char object_buffer[4096];
+            boost::json::monotonic_resource object_resource(object_buffer, sizeof(object_buffer));
             for (std::uint64_t row = 0; row < chunk.size(); ++row) {
-                boost::json::object obj;
+                {
+                boost::json::object obj(&object_resource);
+                obj.reserve(chunk.column_count());
                 for (std::uint64_t col = 0; col < chunk.column_count(); ++col) {
-                    const auto& col_type = chunk.data[col].type();
-                    const std::string key =
-                        col_type.has_alias() ? std::string{col_type.alias()} : "col" + std::to_string(col);
-                    if (chunk.data[col].is_null(row)) {
+                    const auto& column = chunk.data[col];
+                    const auto& col_type = column.type();
+                    const std::string_view key = keys[col];
+                    if (column.is_null(row)) {
                         obj[key] = nullptr;
                         continue;
                     }
-                    const auto value = chunk.value(col, row);
+                    // Read off the vector: no value object, and a STRING is the vector's bytes.
                     switch (col_type.type()) {
                         case types::logical_type::INTEGER:
-                            obj[key] = value.value<int32_t>();
+                            obj[key] = column.get_value<int32_t>(row);
                             break;
                         case types::logical_type::BIGINT:
-                            obj[key] = value.value<int64_t>();
+                            obj[key] = column.get_value<int64_t>(row);
                             break;
                         case types::logical_type::UBIGINT:
-                            obj[key] = value.value<std::uint64_t>();
+                            obj[key] = column.get_value<std::uint64_t>(row);
                             break;
                         case types::logical_type::DOUBLE:
-                            obj[key] = value.value<double>();
+                            obj[key] = column.get_value<double>(row);
                             break;
                         case types::logical_type::BOOLEAN:
-                            obj[key] = value.value<bool>();
+                            obj[key] = column.get_value<bool>(row);
                             break;
                         case types::logical_type::STRING_LITERAL:
-                            obj[key] = std::string(value.value<std::string_view>());
+                            obj[key] = column.get_value<std::string_view>(row);
                             break;
                         default:
-                            return core::error_t(
-                                core::error_code_t::conversion_failure,
-                                std::pmr::string{"kafka: column '" + key + "' (logical type " +
-                                                     std::to_string(static_cast<int>(col_type.type())) +
-                                                     ") has no JSON encoding",
-                                                 resource});
+                        {
+                            auto what = otterstax::concat(resource, {"kafka: column '", key, "' (logical type "});
+                            otterstax::append_number(what, static_cast<int>(col_type.type()));
+                            what += ") has no JSON encoding";
+                            return core::error_t(core::error_code_t::conversion_failure, std::move(what));
+                        }
                     }
                 }
                 out.push_back(boost::json::serialize(obj));
+                }
+                object_resource.release();
             }
             return out;
         }
@@ -212,6 +232,17 @@ namespace otterstax::kafka::detail {
     vector::data_chunk_t json_to_chunk(std::pmr::memory_resource* resource,
                                        const std::vector<kafka_column_t>& columns,
                                        const std::vector<std::string>& payloads) {
+        std::pmr::vector<std::string_view> views(resource);
+        views.reserve(payloads.size());
+        for (const auto& payload : payloads) {
+            views.emplace_back(payload);
+        }
+        return json_to_chunk(resource, columns, views);
+    }
+
+    vector::data_chunk_t json_to_chunk(std::pmr::memory_resource* resource,
+                                       const std::vector<kafka_column_t>& columns,
+                                       std::span<const std::string_view> payloads) {
         OTX_ZONE_N("kafka::json_to_chunk");
         std::pmr::vector<types::complex_logical_type> types(resource);
         types.reserve(columns.size());
@@ -236,9 +267,17 @@ namespace otterstax::kafka::detail {
         // by the next good row or excluded by the final set_cardinality
         vector::data_chunk_t chunk(resource, types, std::max<std::size_t>(payloads.size(), 1));
         std::uint64_t row = 0;
+        // Each message's DOM on a stack buffer (a bigger one spills to the heap), released
+        // after the row: a typical payload parses without a heap allocation.
+        unsigned char dom_buffer[4096];
+        boost::json::monotonic_resource dom_resource(dom_buffer, sizeof(dom_buffer));
         for (std::size_t index = 0; index < payloads.size(); ++index) {
+            struct release_t {
+                boost::json::monotonic_resource& resource;
+                ~release_t() { resource.release(); }
+            } release_dom{dom_resource}; // declared before the DOM: released after it is gone
             boost::system::error_code ec;
-            const boost::json::value jv = boost::json::parse(payloads[index], ec);
+            const boost::json::value jv = boost::json::parse(payloads[index], ec, &dom_resource);
             if (ec) {
                 reject(index, "malformed JSON: " + ec.message());
                 continue;
@@ -256,6 +295,11 @@ namespace otterstax::kafka::detail {
                     reject(index, "missing column '" + columns[c].name + "'");
                     row_ok = false;
                     break;
+                }
+                if (columns[c].type.type() == types::logical_type::STRING_LITERAL && field->is_string()) {
+                    // Straight into the vector's string buffer: no value object, no heap string.
+                    chunk.set_value(c, row, std::string_view(field->as_string()));
+                    continue;
                 }
                 auto converted = json_field_to_value(resource, columns[c].type.type(), *field);
                 if (!converted.value) {

@@ -51,10 +51,10 @@ namespace otterstax::kafka::detail {
 
             OTX_ZONE_N("kafka::stream_batch"); // one zone per processed batch (run() is an endless poll loop)
             auto log = get_logger(logger_tag::KAFKA_MANAGER);
-            std::vector<std::string> payloads;
+            std::pmr::vector<std::string_view> payloads(resource_); // views into the records, alive for the batch
             payloads.reserve(records.size());
             for (auto& record : records) {
-                payloads.push_back(std::move(record.payload)); // partition/offset retained for the offset commit
+                payloads.push_back(record.payload); // partition/offset retained for the offset commit
             }
 
             // A batch that fails before its offsets are committed is reprocessed:

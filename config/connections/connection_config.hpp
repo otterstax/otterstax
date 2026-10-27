@@ -14,12 +14,9 @@ namespace config {
 // connector-specific parameter structs when it registers connections at
 // startup.
 
-// The optional `pool:` block of a connection (and `service.file_transfers`):
-// how many connections — or, for s3 and local files, concurrent transfers — one
-// alias may hold, and when they open, close and give up. Converted into
-// conn::pool_config_t at registration. Validated at parse time:
-// 1 <= min_size <= max_size, every duration positive except check_after_idle_ms
-// and connect_backoff_ms, which may be 0.
+// The optional `pool:` block (also `service.file_transfers`): how many connections or s3/file transfers
+// an alias may hold, and when they open, close and give up. Converted to conn::pool_config_t at registration;
+// parse: 1 <= min_size <= max_size, and only check_after_idle_ms and connect_backoff_ms may be 0.
 struct PoolDesc {
     std::size_t min_size = 1;        // opened at startup, never closed
     std::size_t max_size = 4;        // hard cap on connections to this backend
@@ -85,11 +82,9 @@ struct ConnectionsConfig {
     std::vector<S3CredentialDesc> s3;
 };
 
-// Startup retry policy for opening remote backend connections. A slow backend
-// (e.g. a DB still booting) fails the pool's first min_size connects; the
-// registrar retries up to max_attempts, sleeping delay_ms between tries.
-// max_attempts <= 1 means a single attempt (no retry). Applies to
-// mysql/postgresql/clickhouse — s3 aliases are only stored, not opened.
+// Startup retry policy for opening remote backend connections: a slow backend that fails the pool's
+// first min_size connects is retried up to max_attempts, sleeping delay_ms between tries.
+// max_attempts <= 1 means one attempt. Applies to mysql/postgresql/clickhouse; s3 aliases are not opened.
 struct ConnectionRetryConfig {
     int max_attempts = 1;
     int delay_ms = 1000;

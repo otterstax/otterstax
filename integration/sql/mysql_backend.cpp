@@ -15,11 +15,10 @@ namespace db {
     mysql_traits::slot_chunk(std::pmr::memory_resource* resource,
                              components::logical_plan::node_type,
                              conn::statement_result_t answer,
-                             const std::string& uid) {
+                             std::string_view uid) {
         if (!answer.rows) {
-            return core::error_t(
-                core::error_code_t::other_error,
-                std::pmr::string{("MySQL backend '" + uid + "' returned no result chunk").c_str(), resource});
+            return core::error_t(core::error_code_t::other_error,
+                                 otterstax::concat(resource, {"MySQL backend '", uid, "' returned no result chunk"}));
         }
         return std::move(*answer.rows);
     }
@@ -54,7 +53,7 @@ namespace db {
         // Run by the catalog only, whose enqueue_impl drives it to completion on the sender's
         // thread, so the zone may span its co_awaits (CLAUDE.md, "Tracy zones in coroutines").
         OTX_ZONE_N("mysql::discover");
-        const std::string uid = scope.unique_identifier;
+        const std::string_view uid = scope.unique_identifier; // scope lives in this frame
         catalog_ext::discovered_tables_t out(backend.resource());
 
         if (!scope.collection.empty()) {
@@ -70,14 +69,14 @@ namespace db {
         if (scope.database.empty()) {
             backend.log()->error("discover: no MySQL database configured for uuid {}", uid);
             co_return backend.make_error(core::error_code_t::missing_field,
-                                         "Cannot discover MySQL schema: no database configured for uuid: " + uid);
+                                         {"Cannot discover MySQL schema: no database configured for uuid: ", uid});
         }
         auto list = otterstax::catalog::make_list_tables_query(backend.resource(), backend_type_t::MySQL, scope.database);
-        auto listed = co_await backend.run(uid, conn::statement_t::rows(std::string(std::string_view(list))));
+        auto listed = co_await backend.run(uid, conn::statement_t::rows(std::move(list)));
         if (listed.has_error()) {
             co_return listed.convert_error<catalog_ext::discovered_tables_t>();
         }
-        std::vector<std::string> names;
+        std::pmr::vector<std::pmr::string> names(backend.resource());
         if (listed.value().rows) {
             auto read = read_text_column(backend.resource(),
                                          *listed.value().rows,
@@ -93,13 +92,13 @@ namespace db {
 
         std::pmr::vector<std::pmr::string> failed(backend.resource());
         for (const auto& name : names) {
-            auto probed = co_await probe_table(backend, qualified_name_t(uid, scope.database, "", name));
+            auto probed = co_await probe_table(backend, qualified_name_t(std::string(uid), scope.database, "", std::string(name)));
             if (probed.has_error()) {
                 backend.log()->error("discover: failed to fetch schema for {}.{}: {}",
                                      scope.database,
                                      name,
                                      probed.error().what.c_str());
-                failed.emplace_back((scope.database + "." + name).c_str());
+                failed.push_back(otterstax::concat(backend.resource(), {scope.database, ".", name}));
                 continue;
             }
             out.push_back(std::move(probed.value()));

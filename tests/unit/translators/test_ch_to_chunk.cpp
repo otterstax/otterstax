@@ -156,7 +156,7 @@ TEST_CASE("ch_to_chunk: multi-block vector merges row counts") {
 
     auto b1 = make_block_3col(3);
     auto b2 = make_block_3col(4);
-    auto converted = tsl::ch_to_chunk(res, std::vector<clickhouse::Block>{b1, b2});
+    auto converted = tsl::ch_to_chunk(res, std::pmr::vector<clickhouse::Block>{b1, b2});
     REQUIRE_FALSE(converted.has_error());
     const auto& chunk = converted.value();
 
@@ -170,7 +170,7 @@ TEST_CASE("ch_to_chunk: multi-block with empty blocks ignored") {
     auto b1 = make_block_3col(2);
     clickhouse::Block empty{};
     auto b2 = make_block_3col(3);
-    auto converted = tsl::ch_to_chunk(res, std::vector<clickhouse::Block>{b1, empty, b2});
+    auto converted = tsl::ch_to_chunk(res, std::pmr::vector<clickhouse::Block>{b1, empty, b2});
     REQUIRE_FALSE(converted.has_error());
     const auto& chunk = converted.value();
 
@@ -187,7 +187,7 @@ TEST_CASE("ch_to_chunk: a String override over an Int32 wire column keeps the co
     clickhouse::Block block;
     block.AppendColumn("payload", col);
 
-    std::unordered_map<std::string, std::string> overrides;
+    tsl::named_type_map_t overrides;
     overrides["payload"] = "String";
 
     auto converted = tsl::ch_to_chunk(res, block, overrides);
@@ -371,7 +371,7 @@ TEST_CASE("ch_to_chunk characterization: column type and value per wire type cod
         require_scalar_values(chunk, 0);
     }
     SECTION("multi block") {
-        auto converted = tsl::ch_to_chunk(res, std::vector<clickhouse::Block>{block, clickhouse::Block{}, block});
+        auto converted = tsl::ch_to_chunk(res, std::pmr::vector<clickhouse::Block>{block, clickhouse::Block{}, block});
         REQUIRE_FALSE(converted.has_error());
         const auto& chunk = converted.value();
         REQUIRE(chunk.size() == 2);
@@ -404,7 +404,7 @@ TEST_CASE("ch_to_chunk characterization: Nullable columns keep the nested type a
         REQUIRE(chunk.value(1, 1).value<std::string_view>() == "x");
     }
     SECTION("multi block") {
-        auto converted = tsl::ch_to_chunk(res, std::vector<clickhouse::Block>{b1, b2});
+        auto converted = tsl::ch_to_chunk(res, std::pmr::vector<clickhouse::Block>{b1, b2});
         REQUIRE_FALSE(converted.has_error());
         const auto& chunk = converted.value();
         REQUIRE(chunk.size() == 4);
@@ -430,7 +430,7 @@ TEST_CASE("ch_to_chunk characterization: scalar named-type override keeps the pr
     clickhouse::Block block;
     block.AppendColumn("v", make_nullable<clickhouse::ColumnInt64, int64_t>({42, std::nullopt}));
     block.AppendColumn("w", words);
-    const std::unordered_map<std::string, std::string> overrides{{"v", "Nullable(Int64)"},
+    const tsl::named_type_map_t overrides{{"v", "Nullable(Int64)"},
                                                                  {"w", "LowCardinality(String)"}};
 
     auto converted = tsl::ch_to_chunk(res, block, overrides);
@@ -450,7 +450,7 @@ TEST_CASE("ch_to_chunk characterization: scalar named-type override keeps the pr
 
 TEST_CASE("ch_to_chunk characterization: Tuple override reads a STRUCT column") {
     auto* res = std::pmr::new_delete_resource();
-    const std::unordered_map<std::string, std::string> overrides{{"rec", "Tuple(id Int32, name Nullable(String))"}};
+    const tsl::named_type_map_t overrides{{"rec", "Tuple(id Int32, name Nullable(String))"}};
 
     auto require_struct_type = [](const complex_logical_type& type) {
         REQUIRE(type.type() == logical_type::STRUCT);
@@ -480,7 +480,7 @@ TEST_CASE("ch_to_chunk characterization: Tuple override reads a STRUCT column") 
     SECTION("multi block") {
         auto converted = tsl::ch_to_chunk(
             res,
-            std::vector<clickhouse::Block>{make_tuple_block(1, {"a"}), make_tuple_block(10, {std::nullopt, "c"})},
+            std::pmr::vector<clickhouse::Block>{make_tuple_block(1, {"a"}), make_tuple_block(10, {std::nullopt, "c"})},
             overrides);
         REQUIRE_FALSE(converted.has_error());
         const auto& chunk = converted.value();
@@ -547,7 +547,7 @@ clickhouse::Block make_array_block(const std::vector<std::vector<int32_t>>& nums
 
 TEST_CASE("ch_to_chunk: Array override reads every row's elements across block boundaries") {
     auto* res = std::pmr::new_delete_resource();
-    const std::unordered_map<std::string, std::string> overrides{{"nums", "Array(Int32)"},
+    const tsl::named_type_map_t overrides{{"nums", "Array(Int32)"},
                                                                  {"tags", "Array(Nullable(String))"}};
     const std::vector<std::vector<int32_t>> nums{{1, 2}, {-3, 40000}, {7, 0}};
     const std::vector<std::vector<std::optional<std::string>>> tags{
@@ -589,7 +589,7 @@ TEST_CASE("ch_to_chunk: Array override reads every row's elements across block b
     }
     SECTION("multi block") {
         // Row 0 in the first block, rows 1 and 2 in the last, an empty block between them.
-        const std::vector<clickhouse::Block> blocks{make_array_block({nums[0]}, {tags[0]}),
+        const std::pmr::vector<clickhouse::Block> blocks{make_array_block({nums[0]}, {tags[0]}),
                                                     clickhouse::Block{},
                                                     make_array_block({nums[1], nums[2]}, {tags[1], tags[2]})};
         auto converted = tsl::ch_to_chunk(res, blocks, overrides);
@@ -648,7 +648,7 @@ TEST_CASE("ch_to_chunk: Date and Date32 columns read the calendar day the wire c
     SECTION("multi block") {
         auto converted = tsl::ch_to_chunk(
             res,
-            std::vector<clickhouse::Block>{make_date_block(0, 1), clickhouse::Block{}, make_date_block(1, 3)});
+            std::pmr::vector<clickhouse::Block>{make_date_block(0, 1), clickhouse::Block{}, make_date_block(1, 3)});
         REQUIRE_FALSE(converted.has_error());
         require_rows(converted.value());
     }
@@ -660,7 +660,7 @@ TEST_CASE("ch_to_chunk: Date and Date32 columns read the calendar day the wire c
 // would not hold, and checks that the value read back has the column vector's type.
 namespace {
 
-    using overrides_t = std::unordered_map<std::string, std::string>;
+    using overrides_t = tsl::named_type_map_t;
 
     clickhouse::Block one_column_block(const char* name, clickhouse::ColumnRef column) {
         clickhouse::Block block;
@@ -705,7 +705,7 @@ namespace {
             require_rows(converted.value());
         }
         SECTION("split blocks") {
-            const std::vector<clickhouse::Block> blocks{make_block(0, 1), clickhouse::Block{}, make_block(1, rows)};
+            const std::pmr::vector<clickhouse::Block> blocks{make_block(0, 1), clickhouse::Block{}, make_block(1, rows)};
             auto converted = tsl::ch_to_chunk(res, blocks, overrides);
             INFO((converted.has_error() ? converted.error().what.c_str() : "converted"));
             REQUIRE_FALSE(converted.has_error());
@@ -728,7 +728,7 @@ namespace {
         };
         SECTION("single block") { require_failure(tsl::ch_to_chunk(res, make_block(0, rows), overrides)); }
         SECTION("split blocks") {
-            const std::vector<clickhouse::Block> blocks{make_block(0, 1), clickhouse::Block{}, make_block(1, rows)};
+            const std::pmr::vector<clickhouse::Block> blocks{make_block(0, 1), clickhouse::Block{}, make_block(1, rows)};
             require_failure(tsl::ch_to_chunk(res, blocks, overrides));
         }
     }
@@ -1437,7 +1437,7 @@ TEST_CASE("ch_to_chunk: an Array(Tuple) override the wire column represents name
 // base column the overrides shape both the same way.
 TEST_CASE("ch_to_struct of a statement's header block is the chunk types of its data blocks") {
     auto* res = std::pmr::new_delete_resource();
-    const std::unordered_map<std::string, std::string> overrides{
+    const tsl::named_type_map_t overrides{
         {"id", "Int32"},
         {"score", "Int32"},
         {"name", "String"},
@@ -1479,7 +1479,7 @@ TEST_CASE("ch_to_struct of a statement's header block is the chunk types of its 
     REQUIRE(header.child_types()[3].child_types()[0].alias() == "a");
     REQUIRE(header.child_types()[3].child_types()[1].alias() == "b");
 
-    auto converted = tsl::ch_to_chunk(res, std::vector<clickhouse::Block>{make_block(3), make_block(2)}, overrides);
+    auto converted = tsl::ch_to_chunk(res, std::pmr::vector<clickhouse::Block>{make_block(3), make_block(2)}, overrides);
     INFO(converted.error().what.c_str());
     REQUIRE_FALSE(converted.has_error());
     const auto& chunk = converted.value();

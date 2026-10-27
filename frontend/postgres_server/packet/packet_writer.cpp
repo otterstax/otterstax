@@ -34,4 +34,19 @@ namespace frontend::postgres {
 
         return extract_payload();
     }
+
+    void packet_writer::append_frame(std::vector<uint8_t>& out, char message_type) {
+        if (!is_reserved_) {
+            payload_.insert(payload_.begin(), PACKET_HEADER_SIZE, 0);
+        }
+        const int32_t length = static_cast<int32_t>(payload_.size() - 1); // the type byte is not counted
+        payload_[0] = static_cast<uint8_t>(message_type);
+        payload_[1] = extract_nth_byte_be<0, 4>(length);
+        payload_[2] = extract_nth_byte_be<1, 4>(length);
+        payload_[3] = extract_nth_byte_be<2, 4>(length);
+        payload_[4] = extract_nth_byte_be<3, 4>(length);
+        out.insert(out.end(), payload_.begin(), payload_.end());
+        payload_.clear();
+        is_reserved_ = false;
+    }
 } // namespace frontend::postgres

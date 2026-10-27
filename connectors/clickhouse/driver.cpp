@@ -7,6 +7,7 @@
 
 #include "otterbrix/translators/input/ch_to_chunk.hpp"
 #include "utility/logger.hpp"
+#include "utility/pmr_text.hpp"
 #include "utility/tracy_profiler.hpp"
 
 #include <clickhouse/exceptions.h>
@@ -22,15 +23,9 @@ namespace ch {
 
     namespace {
 
-        // The driver bounds only the TCP connect on its own (5 s); every read and write on
-        // the socket is a plain blocking recv()/send() with SO_RCVTIMEO / SO_SNDTIMEO left at
-        // 0 unless the options set them — the ServerHello the Client constructor waits for in
-        // its handshake, the Pong Ping() waits for, every packet of a query. A backend that
-        // accepted the connection and never answered therefore froze the calling thread for
-        // good. One bound for connect, recv and send: 10 s. A running query does not idle that
-        // long — the server sends a Progress packet every interactive_delay (100 ms by
-        // default) while it works — so the recv bound is on a stalled backend, not on a slow
-        // query. The driver reports the expiry as std::system_error (EAGAIN out of recv).
+        // One 10 s deadline for connect, recv and send: clickhouse-cpp bounds only the TCP
+        // connect, and every other socket read/write blocks forever on a silent backend.
+        // A running query sends Progress every interactive_delay, so 10 s means a stall.
         constexpr std::chrono::seconds io_timeout{10};
 
         // send_retries is the number of back-to-back connect attempts the Client constructor
@@ -38,13 +33,9 @@ namespace ch {
         // connect() call; the startup retry ladder (service.connection_retry) is the caller's.
         constexpr unsigned int driver_connect_attempts{1};
 
-        // No ping_before_query: with it, Execute pings first and on a socket failure enters
-        // the driver's RetryGuard — sleep retry_timeout, reconnect, ping again — which it
-        // leaves only when the ping succeeds or the reconnect fails on exactly its
-        // send_retries-th turn, so a backend that completed every handshake but never
-        // answered a Ping kept the thread reconnecting for good. Liveness is the pool's
-        // (a ping after an idle period, conn::driver_session_t) and execute()'s (reconnect
-        // after a failure); a query is SendQuery plus reads, each bounded.
+        // No ping_before_query: Execute would ping first and on a socket failure enter the
+        // driver's RetryGuard (sleep, reconnect, ping), which loops forever against a backend
+        // that handshakes but never answers. Liveness is the pool's idle ping and execute()'s reconnect.
         clickhouse::ClientOptions client_options(const connect_params& params) {
             clickhouse::ClientOptions opts;
             opts.SetHost(params.host)
@@ -69,7 +60,7 @@ namespace ch {
 
     clickhouse::Query make_statement(std::string_view sql, select_result_t& out) {
         OTX_ZONE_N("ch::make_statement");
-        clickhouse::Query statement{std::string(sql)};
+        clickhouse::Query statement{std::string(sql)}; // clickhouse-cpp owns the text as a std::string
         statement.OnData([&out](const clickhouse::Block& block) { out.blocks.push_back(block); })
             .OnProgress([&out](const clickhouse::Progress& progress) { out.written_rows += progress.written_rows; });
         return statement;
@@ -78,7 +69,8 @@ namespace ch {
     conn::statement_outcome_t
     decode(std::pmr::memory_resource* resource, const select_result_t& raw, const conn::statement_t& statement) {
         OTX_ZONE_N("ch::decode");
-        static const conn::named_types_t no_overrides;
+        // No allocation: an empty map holds no node and no bucket array.
+        static const conn::named_types_t no_overrides{std::pmr::null_memory_resource()};
         const auto* hint = std::get_if<conn::named_types_ptr>(&statement.hints);
         const conn::named_types_t& overrides = (hint != nullptr && *hint) ? **hint : no_overrides;
 
@@ -111,20 +103,16 @@ namespace ch {
         return std::move(result);
     }
 
-    driver_t::driver_t(std::pmr::memory_resource* resource, connect_params params, std::string alias)
+    driver_t::driver_t(std::pmr::memory_resource* resource, connect_params params, std::string_view alias)
         : log_(get_logger(logger_tag::CONNECTOR))
         , resource_(resource)
         , params_(std::move(params))
-        , alias_(std::move(alias)) {
+        , alias_(alias, resource) {
         assert(log_.is_valid());
         assert(resource_ != nullptr);
     }
 
     driver_t::~driver_t() { close(); }
-
-    core::error_t driver_t::transport_error(std::string_view what) const {
-        return core::error_t(core::error_code_t::io_error, std::pmr::string{what.data(), what.size(), resource_});
-    }
 
     core::error_t driver_t::connect() {
         OTX_ZONE_N("ch::driver::connect");
@@ -137,16 +125,17 @@ namespace ch {
             return core::error_t::no_error();
         } catch (const std::exception& e) {
             client_.reset();
-            const std::string what = "[Connector] Alias: " + alias_ + " connect failed: " + e.what();
-            log_->warn(what);
-            return transport_error(what);
+            auto what = otterstax::concat(resource_, {"[Connector] Alias: ", alias_, " connect failed: ", e.what()});
+            log_->warn(std::string_view(what));
+            return core::error_t(core::error_code_t::io_error, std::move(what));
         }
     }
 
     core::error_t driver_t::ping() {
         OTX_ZONE_N("ch::driver::ping");
         if (!client_) {
-            return transport_error("[Connector] Alias: " + alias_ + " is not connected");
+            return core::error_t(core::error_code_t::io_error,
+                                 otterstax::concat(resource_, {"[Connector] Alias: ", alias_, " is not connected"}));
         }
         try {
             client_->Ping();
@@ -154,7 +143,8 @@ namespace ch {
         } catch (const std::exception& e) {
             client_.reset(); // the next execute() reconnects first
             log_->debug("Alias: {} ping failed: {}", alias_, e.what());
-            return transport_error("[Connector] Alias: " + alias_ + " ping failed: " + e.what());
+            return core::error_t(core::error_code_t::io_error,
+                                 otterstax::concat(resource_, {"[Connector] Alias: ", alias_, " ping failed: ", e.what()}));
         }
     }
 
@@ -166,42 +156,39 @@ namespace ch {
 
     std::optional<driver_t::send_failure_t> driver_t::send(std::string_view sql, select_result_t& out) {
         OTX_ZONE_N("ch::driver::send");
-        const auto failed = [&](const std::string& reason) {
-            return "[Run query] Alias: " + alias_ + " query [" + std::string(sql) + "] failed: " + reason;
+        // The message, logged, then moved into the error.
+        const auto failed = [&](std::string_view reason, std::string_view code = {}) {
+            auto what =
+                otterstax::concat(resource_, {"[Run query] Alias: ", alias_, " query [", sql, "] failed: ", code, reason});
+            log_->error(std::string_view(what));
+            return what;
         };
         try {
             client_->Execute(make_statement(sql, out));
             return std::nullopt;
         } catch (const clickhouse::ServerException& e) {
             // The server's verdict: the connection is fine and keeps serving.
-            const std::string what = failed("(" + std::to_string(e.GetCode()) + ") " + e.what());
-            log_->error(what);
-            return send_failure_t{core::error_t(classify_server_code(e.GetCode()), std::pmr::string{what.c_str(), resource_}),
-                                  false};
+            std::pmr::string code(resource_);
+            code += '(';
+            otterstax::append_number(code, e.GetCode());
+            code += ") ";
+            return send_failure_t{core::error_t(classify_server_code(e.GetCode()), failed(e.what(), code)), false};
         } catch (const clickhouse::ValidationError& e) {
             // A stream the client could not read: not a dead socket, but the connection is out
             // of step with the server, so it is dropped and nothing is repeated.
             client_.reset();
-            const std::string what = failed(e.what());
-            log_->error(what);
-            return send_failure_t{transport_error(what), false};
+            return send_failure_t{core::error_t(core::error_code_t::io_error, failed(e.what())), false};
         } catch (const clickhouse::UnimplementedError& e) {
             client_.reset();
-            const std::string what = failed(e.what());
-            log_->error(what);
-            return send_failure_t{transport_error(what), false};
+            return send_failure_t{core::error_t(core::error_code_t::io_error, failed(e.what())), false};
         } catch (const std::system_error& e) {
             // EAGAIN out of recv() is io_timeout expiring on a stalled backend: no repeat.
             // Anything else at the socket level is a dead connection: a read may be repeated.
             client_.reset();
-            const std::string what = failed(e.what());
-            log_->error(what);
-            return send_failure_t{transport_error(what), !is_timeout(e)};
+            return send_failure_t{core::error_t(core::error_code_t::io_error, failed(e.what())), !is_timeout(e)};
         } catch (const std::exception& e) {
             client_.reset();
-            const std::string what = failed(e.what());
-            log_->error(what);
-            return send_failure_t{transport_error(what), true};
+            return send_failure_t{core::error_t(core::error_code_t::io_error, failed(e.what())), true};
         }
     }
 
@@ -215,13 +202,13 @@ namespace ch {
             }
         }
         log_->debug("Alias: {} query: {}", alias_, statement.sql);
-        select_result_t raw;
+        select_result_t raw(resource_);
         auto failure = send(statement.sql, raw);
         // A stale socket (server restarted, idle connection closed by the server or a
         // balancer): reconnect and repeat a read once. Not after a timeout, and never a DML or
         // DDL (statement.repeatable).
         if (failure && failure->repeatable && statement.repeatable && !connect().contains_error()) {
-            raw = select_result_t{};
+            raw = select_result_t(resource_);
             failure = send(statement.sql, raw);
         }
         if (failure) {
@@ -231,8 +218,8 @@ namespace ch {
     }
 
     std::unique_ptr<conn::IDriver>
-    make_driver(std::pmr::memory_resource* resource, connect_params params, std::string alias) {
-        return std::make_unique<driver_t>(resource, std::move(params), std::move(alias));
+    make_driver(std::pmr::memory_resource* resource, connect_params params, std::string_view alias) {
+        return std::make_unique<driver_t>(resource, std::move(params), alias);
     }
 
 } // namespace ch

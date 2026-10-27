@@ -4,28 +4,29 @@
 #pragma once
 
 #include "integration/backend.hpp"
+#include "utility/string_hash.hpp"
 
 #include <memory_resource>
 #include <shared_mutex>
 #include <string>
 #include <string_view>
-#include <unordered_map>
 
 namespace db {
 
-    // The ENUM types of every discovered PostgreSQL connection, by uid: what pg_to_chunk and
-    // pg_to_struct decode an enum column with. Refreshed by every discovery of the uid — a
-    // failed pg_enum query fails the discovery — and read by every Worker's backend for each
-    // statement. A uid without an entry never went through discovery and is do_not_exists.
-    // The lock only orders a re-discovery a test may run against those reads.
+    // The ENUM types of every discovered PostgreSQL connection, by uid, for pg_to_chunk and pg_to_struct.
+    // Every discovery of the uid refreshes it (a failed pg_enum query fails the discovery) and every
+    // Worker's backend reads it. A uid without an entry never went through discovery: do_not_exists.
     class pg_metadata_t {
     public:
-        void set(const std::string& uid, conn::pg_enums_ptr enums);
-        conn::pg_enums_ptr find(const std::string& uid) const;
+        explicit pg_metadata_t(std::pmr::memory_resource* resource)
+            : enums_(resource) {}
+
+        void set(std::string_view uid, conn::pg_enums_ptr enums);
+        conn::pg_enums_ptr find(std::string_view uid) const;
 
     private:
         mutable std::shared_mutex mutex_;
-        std::unordered_map<std::string, conn::pg_enums_ptr> enums_;
+        otterstax::pmr_string_map_t<conn::pg_enums_ptr> enums_;
     };
 
     struct postgres_traits;
@@ -37,31 +38,29 @@ namespace db {
         static constexpr std::string_view log_tag = logger_tag::PG_CONNECTION_MANAGER;
         using metadata_t = pg_metadata_t;
 
-        static core::error_t check(const metadata_t& metadata, const std::string& uid, std::pmr::memory_resource* resource);
+        static core::error_t check(const metadata_t& metadata, std::string_view uid, std::pmr::memory_resource* resource);
 
         // Every slot is a rows statement: pg_to_chunk turns a DML's command tag into the
         // affected-row carrier itself.
         static conn::statement_t slot_statement(components::logical_plan::node_type,
-                                                std::string sql,
+                                                std::pmr::string sql,
                                                 const metadata_t& metadata,
-                                                const std::string& uid,
-                                                const std::string&) {
+                                                std::string_view uid,
+                                                std::string_view) {
             return conn::statement_t::rows(std::move(sql), metadata.find(uid));
         }
         static core::result_wrapper_t<components::vector::data_chunk_t>
         slot_chunk(std::pmr::memory_resource* resource,
                    components::logical_plan::node_type slot,
                    conn::statement_result_t answer,
-                   const std::string& uid);
+                   std::string_view uid);
         // The probe's answer goes through pg_to_struct under the connection's ENUM map — the
         // translator pg_to_chunk types tuples with.
         static conn::statement_t
-        probe_statement(std::string probe, const metadata_t& metadata, const std::string& uid, const std::string&) {
+        probe_statement(std::pmr::string probe, const metadata_t& metadata, std::string_view uid, std::string_view) {
             return conn::statement_t::schema(std::move(probe), metadata.find(uid));
         }
-        static std::string no_header(const std::string& probe) {
-            return "PostgreSQL answered the prepare probe without columns: " + probe;
-        }
+        static constexpr std::string_view no_header = "PostgreSQL answered the prepare probe without columns: ";
 
         // `scope.schema` is required (missing_field otherwise). The ENUM map is fetched first,
         // then empty `scope.collection` → every base table of the schema (information_schema

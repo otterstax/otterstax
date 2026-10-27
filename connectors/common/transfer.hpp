@@ -22,18 +22,18 @@
 
 namespace conn {
 
-    // Loads one object or file into a chunk (CREATE EXTERNAL TABLE). `location` is
-    // "bucket/key" for S3 and a path for a local file; an empty `format` lets the
-    // location's extension decide.
+    // Loads one object or file into a chunk (CREATE EXTERNAL TABLE). `location` is "bucket/key" for S3
+    // or a path; an empty `format` is taken from the extension. The strings live on the builder's
+    // resource, which must be thread-safe: the transfer thread reads and may destroy them.
     struct load_t {
-        std::string location;
-        std::string format;
+        std::pmr::string location;
+        std::pmr::string format;
     };
     // Writes the engine's result to one object or file (COPY ... TO). The cursor is moved in
     // and read only by the transfer thread. An S3 object appears only once the whole result
     // was written; a local file is removed when the write fails.
     struct export_t {
-        std::string location;
+        std::pmr::string location;
         file::FileFormat format{file::FileFormat::Unknown};
         components::cursor::cursor_t_ptr result;
     };
@@ -44,10 +44,9 @@ namespace conn {
     };
     using transfer_outcome_t = core::result_wrapper_t<transfer_result_t>;
 
-    // Moves bytes and translates formats; never touches the engine. Synchronous, bounded by
-    // its transport's timeouts, never throws. One driver serves every thread of its pool, so
-    // it holds no per-transfer state: an S3 alias's driver shares one S3FileSystem (one AWS
-    // client with its own HTTP connection pool), the local-file driver shares nothing.
+    // Moves bytes and translates formats; never touches the engine. Synchronous, bounded by its
+    // transport's timeouts, never throws. One driver serves every thread of its pool, so it keeps no
+    // per-transfer state.
     class ITransferDriver {
     public:
         virtual ~ITransferDriver() = default;
@@ -75,10 +74,9 @@ namespace conn {
     using transfer_pool_t = work_pool_t<transfer_session_t>;
     using transfer_future_t = transfer_pool_t::future_t;
 
-    // Every transfer pool: one per S3 alias and one for local files. Filled on the startup
-    // thread before the first statement (ComponentManager::register_connections) and
-    // read-only afterwards, so submitting takes no lock but the pool's own; transfers of
-    // different aliases, and of one alias up to its max_size, run side by side.
+    // Every transfer pool: one per S3 alias and one for local files. Filled on the startup thread
+    // before the first statement and read-only afterwards, so submitting takes no lock but the pool's
+    // own. Transfers of different aliases, and of one alias up to max_size, run side by side.
     class transfer_pools_t {
     public:
         explicit transfer_pools_t(std::pmr::memory_resource* resource);
@@ -89,7 +87,7 @@ namespace conn {
 
         // Startup thread only. A second registration of an alias is invalid_parameter.
         [[nodiscard]] core::error_t
-        add_s3(const std::string& alias, std::shared_ptr<ITransferDriver> driver, pool_config_t config);
+        add_s3(std::string_view alias, std::shared_ptr<ITransferDriver> driver, pool_config_t config);
         // Startup thread only; replaces nothing once set (invalid_parameter).
         [[nodiscard]] core::error_t set_files(std::shared_ptr<ITransferDriver> driver, pool_config_t config);
 
@@ -104,7 +102,7 @@ namespace conn {
         std::pmr::memory_resource* resource() const noexcept { return resource_; }
 
     private:
-        transfer_future_t refuse(core::error_code_t code, const std::string& what) const;
+        transfer_future_t refuse(core::error_code_t code, std::pmr::string what) const;
 
         std::pmr::memory_resource* resource_;
         alias_map_t<transfer_pool_t> s3_;

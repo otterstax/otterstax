@@ -342,25 +342,15 @@ namespace {
         return params;
     }
 
-    // How long a blocking driver call may take before the case is declared
-    // hung. The driver bounds every socket read and write at 10 s and makes one
-    // client attempt per connect call, so connect() against a silent server and
-    // ping() against a mute one are about 10 s each. Six times that, so a
-    // loaded CI host does not fail the fixed code.
+    // How long a blocking driver call may take before the case is declared hung. The driver bounds
+    // socket I/O at 10 s, so connect() and ping() against a mute server take about 10 s; six times
+    // that keeps a loaded CI host from failing correct code.
     constexpr auto PATIENCE = 60s;
 
-    // The verdict on a call that missed PATIENCE.
-    //
-    // An unbounded driver blocks in the client's recv() with no socket
-    // timeout (or spins in its RetryGuard): that thread can never be joined or
-    // interrupted, Catch2 has no way to fail a test that never returns, and
-    // destroying a joinable std::thread — or stopping a pool whose thread is
-    // stuck — is std::terminate / a hang, with no assertion message. So the
-    // miss is reported through FAIL_CHECK — the console reporter prints a
-    // failed assertion as it happens — the streams are flushed, and the process
-    // leaves with std::_Exit(1): ctest sees the non-zero exit, the failure line
-    // is already on the console, and the stuck thread dies with the process
-    // instead of aborting it.
+    // Verdict on a call that missed PATIENCE. An unbounded driver blocks in recv() or spins in its
+    // RetryGuard: the thread cannot be joined, Catch2 cannot fail a test that never returns, and
+    // destroying it is std::terminate or a hang. So report via FAIL_CHECK, flush the streams and
+    // leave with std::_Exit(1) so ctest sees the failure.
     [[noreturn]] void die_hung(std::string_view what) {
         FAIL_CHECK(what << " did not return within " << PATIENCE.count() << " s: the driver never gave up");
         std::cout.flush();

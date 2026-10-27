@@ -47,10 +47,8 @@ namespace schema_utils {
                       const std::pmr::vector<otterstax::parser::qualifier_rewrite_t>& qualifiers);
 
         const components::types::complex_logical_type& schema() const;
-        // The schema a backend answered for this stub (db::backend_t::describe).
-        // Filled in place: a raw-SQL stub must keep the text and qualifiers the
-        // execute path still generates its statement from, so the node is never
-        // rebuilt to carry a schema.
+        // The schema a backend answered for this stub (db::backend_t::describe). Set in place: a raw-SQL
+        // stub must keep the text and qualifiers execute generates its statement from.
         void set_schema(components::types::complex_logical_type&& schema);
         const components::logical_plan::node_aggregate_ptr agg_node();
 

@@ -28,12 +28,9 @@ namespace tsl {
     core::result_wrapper_t<data_chunk_t> mysql_to_chunk(std::pmr::memory_resource* res,
                                                         const boost::mysql::results& result);
 
-    // The schema of that chunk, taken off the result's column definitions: the
-    // STRUCT the MySQL backend's discover mirrors into the catalog. It is the same one
-    // table mysql_to_chunk types its rows with, so a discovered column's type is
-    // the executed column's type by construction. A column type the table has no
-    // arm for is the same conversion_failure, naming the column; a result without
-    // columns (a DML's bare OK packet) is the empty STRUCT.
+    // The STRUCT of that chunk from the result's column definitions, as the MySQL backend's discover
+    // mirrors it into the catalog. It uses the same type table as mysql_to_chunk. An unmapped column type
+    // is a conversion_failure naming the column; a result without columns (a DML's OK) is the empty STRUCT.
     core::result_wrapper_t<types::complex_logical_type> mysql_to_struct(std::pmr::memory_resource* res,
                                                                        const boost::mysql::results& result);
 

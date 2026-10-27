@@ -5,6 +5,7 @@
 
 #include "types/otterbrix.hpp"
 #include "utility/logger.hpp"
+#include "utility/string_hash.hpp"
 
 #include "otterbrix/parser/alias_registry.hpp"
 #include "otterbrix/parser/grammar_extension/kafka/kafka_extension.hpp"
@@ -57,8 +58,9 @@ struct ParsedQueryData {
 
     backend_type_t backend_type{backend_type_t::Unknown}; // Set by CatalogManager during get_catalog_schema
 
-    // For mixed backend: maps connection UID to its backend type
-    std::unordered_map<std::string, backend_type_t> node_backend_types;
+    // For mixed backend: maps connection UID to its backend type. On the plan's resource (the
+    // one otterbrix_params->external_nodes is built on).
+    otterstax::pmr_string_map_t<backend_type_t> node_backend_types;
 
 private:
     components::sql::transform::transform_result binder_;

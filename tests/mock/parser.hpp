@@ -16,11 +16,9 @@
 
 class SimpleMockParser : public IParser {
 public:
-    // `slot_below_root`: the backend slot is the child of a local aggregate instead of the
-    // plan root, so once the backend has answered there is still a plan for the engine to
-    // run (as for a JOIN above a backend slice) and the Worker does not hand the slice
-    // straight to the payload. What a test of the engine stage — its failure, its result —
-    // needs.
+    // `slot_below_root`: the backend slot is the child of a local aggregate, not the plan root, so after
+    // the backend answers there is still a plan for the engine and the Worker does not hand the slice
+    // straight to the payload. For tests of the engine stage.
     SimpleMockParser(mock_config config, bool slot_below_root = false)
         : config_(std::move(config))
         , slot_below_root_(slot_below_root) {

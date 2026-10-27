@@ -164,8 +164,14 @@ namespace tsl {
                 chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), nullptr});
                 return;
             }
-            const char* val = PQgetvalue(result, row_index, column_index);
-            chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), std::string(val)});
+            const std::string_view val(PQgetvalue(result, row_index, column_index),
+                                       static_cast<std::size_t>(PQgetlength(result, row_index, column_index)));
+            if (chunk.data[column_index].type().type() == types::logical_type::STRING_LITERAL) {
+                // Straight into the vector's string buffer: no value object, no heap string.
+                chunk.set_value(column_index, row_index, val);
+                return;
+            }
+            chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), val});
         }
 
         void set_bytea(data_chunk_t& chunk,

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2025-2026  OtterStax
 
+#include "packet_split.hpp"
 #include "frontend/mysql_server/packet/packet_reader.hpp"
 #include "frontend/mysql_server/resultset/mysql_resultset.hpp"
 
@@ -54,7 +55,7 @@ TEST_CASE("text_resultset: single row") {
     result.add_row(row, 0);
 
     uint8_t seq = 0;
-    auto packets = mysql_resultset::build_packets(std::move(result), seq);
+    auto packets = otterstax::test::split_mysql_packets(mysql_resultset::build_packets(std::move(result), seq));
 
     REQUIRE(packets.size() == 8); // column count + 4 column def + eof + 1 row + eof
     REQUIRE(packets.size() == seq);
@@ -138,7 +139,7 @@ TEST_CASE("text_resultset: multi row") {
     }
 
     uint8_t seq = 0;
-    auto packets = mysql_resultset::build_packets(std::move(result), seq);
+    auto packets = otterstax::test::split_mysql_packets(mysql_resultset::build_packets(std::move(result), seq));
 
     REQUIRE(packets.size() == 104); // column count + column def + eof + 100 row + eof
     REQUIRE(packets.size() == seq);
@@ -181,7 +182,7 @@ TEST_CASE("binary_resultset: a NULL bigint cell is the bitmap bit alone and neve
     result.add_row(chunk, 1);
 
     uint8_t seq = 0;
-    auto packets = mysql_resultset::build_packets(std::move(result), seq);
+    auto packets = otterstax::test::split_mysql_packets(mysql_resultset::build_packets(std::move(result), seq));
     REQUIRE(packets.size() == 6); // column count + column def + eof + 2 rows + eof
 
     {
@@ -232,7 +233,7 @@ TEST_CASE("binary_resultset: the NULL bit of column i sits at i + 2 across the b
     result.add_row(chunk, 0);
 
     uint8_t seq = 0;
-    auto packets = mysql_resultset::build_packets(std::move(result), seq);
+    auto packets = otterstax::test::split_mysql_packets(mysql_resultset::build_packets(std::move(result), seq));
     REQUIRE(packets.size() == 12); // column count + 8 column defs + eof + 1 row + eof
 
     packet_reader r(packets[10]);
@@ -268,7 +269,7 @@ TEST_CASE("binary_resultset: a row whose every cell is NULL writes the bitmap an
     result.add_row(chunk, 0);
 
     uint8_t seq = 0;
-    auto packets = mysql_resultset::build_packets(std::move(result), seq);
+    auto packets = otterstax::test::split_mysql_packets(mysql_resultset::build_packets(std::move(result), seq));
     REQUIRE(packets.size() == 7); // column count + 3 column defs + eof + 1 row + eof
 
     packet_reader r(packets[5]);
@@ -316,7 +317,7 @@ TEST_CASE("binary_resultset: a NULL in the first and in the last column keeps th
     }
 
     uint8_t seq = 0;
-    auto packets = mysql_resultset::build_packets(std::move(result), seq);
+    auto packets = otterstax::test::split_mysql_packets(mysql_resultset::build_packets(std::move(result), seq));
     REQUIRE(packets.size() == 9); // column count + 3 column defs + eof + 3 rows + eof
 
     {
@@ -372,7 +373,7 @@ TEST_CASE("text_resultset: a NULL cell of a typed column is the 0xFB marker") {
     result.add_row(chunk, 0);
 
     uint8_t seq = 0;
-    auto packets = mysql_resultset::build_packets(std::move(result), seq);
+    auto packets = otterstax::test::split_mysql_packets(mysql_resultset::build_packets(std::move(result), seq));
     REQUIRE(packets.size() == 6);
 
     packet_reader r(packets[4]);
@@ -403,7 +404,7 @@ TEST_CASE("text_resultset: null (data_chunk)") {
     result.add_row(chunk, 1);
 
     uint8_t seq = 0;
-    auto packets = mysql_resultset::build_packets(std::move(result), seq);
+    auto packets = otterstax::test::split_mysql_packets(mysql_resultset::build_packets(std::move(result), seq));
 
     REQUIRE(packets.size() == 6); // column count + column def + eof + 2 rows + eof
     REQUIRE(packets.size() == seq);

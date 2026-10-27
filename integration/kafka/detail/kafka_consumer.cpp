@@ -90,6 +90,8 @@ namespace otterstax::kafka::detail {
         }
     }
 
+    void kafka_message_deleter_t::operator()(RdKafka::Message* message) const noexcept { delete message; }
+
     std::vector<kafka_record_t> kafka_consumer_t::poll_batch(std::size_t max_records,
                                                              std::chrono::milliseconds timeout) {
         OTX_ZONE_N("kafka::consumer::poll_batch");
@@ -98,13 +100,16 @@ namespace otterstax::kafka::detail {
         const auto timeout_ms = to_ms(timeout);
 
         while (batch.size() < max_records) {
-            std::unique_ptr<RdKafka::Message> msg(consumer_->consume(timeout_ms));
+            std::unique_ptr<RdKafka::Message, kafka_message_deleter_t> msg(consumer_->consume(timeout_ms));
             switch (msg->err()) {
-                case RdKafka::ERR_NO_ERROR:
-                    batch.push_back(kafka_record_t{std::string(static_cast<const char*>(msg->payload()), msg->len()),
-                                                   msg->partition(),
-                                                   msg->offset()});
+                case RdKafka::ERR_NO_ERROR: {
+                    // The record keeps the message; its payload is read in place.
+                    const std::string_view payload(static_cast<const char*>(msg->payload()), msg->len());
+                    const auto partition = msg->partition();
+                    const auto offset = msg->offset();
+                    batch.push_back(kafka_record_t{std::move(msg), payload, partition, offset});
                     break;
+                }
                 case RdKafka::ERR__PARTITION_EOF: // caught up on this partition
                 case RdKafka::ERR__TIMED_OUT:     // nothing available this tick
                 default:                          // transient/other: end the batch, retry next tick

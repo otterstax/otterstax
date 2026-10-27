@@ -37,13 +37,9 @@ namespace db {
     inline constexpr const char* external_manifest_collection = "__otterstax_tables";
     inline constexpr const char* external_manifest_column = "collection";
 
-    // The engine's actor. Every handler runs to completion on the sender's thread
-    // (enqueue_impl drives its own behavior until it is done). Statements —
-    // execute, get_schema, create_table — run CONCURRENTLY: each Worker's call
-    // drives its own behavior, and the engine takes concurrent plans, each on a
-    // fresh session (statement-level autocommit; the Kafka runtime sends plans to
-    // it the same way). The mirror-registration handlers, multi-step manifest
-    // operations the catalog sends, are serialized under registration_mutex_.
+    // The engine's actor. Every handler runs to completion on the sender's thread (enqueue_impl drives
+    // its behavior). Statements (execute, get_schema, create_table) run concurrently, each on a fresh
+    // session; the multi-step mirror-registration handlers are serialized under registration_mutex_.
     class OtterbrixManager final : public actor_zeta::actor::actor_mixin<OtterbrixManager> {
     public:
         using is_cooperative_actor_type = void; // Required by actor_zeta::send() concept

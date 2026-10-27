@@ -381,8 +381,10 @@ ParsedQueryData::ParsedQueryData(OtterbrixStatementPtr otterbrix_params,
                                  components::sql::transform::transform_result&& binder,
                                  NodeTag tag)
     : otterbrix_params(std::move(otterbrix_params))
-    , binder_(std::move(binder))
-    , tag(tag) {}
+    , tag(tag)
+    , node_backend_types(this->otterbrix_params ? this->otterbrix_params->external_nodes.get_allocator().resource()
+                                                : std::pmr::get_default_resource())
+    , binder_(std::move(binder)) {}
 
 components::sql::transform::transform_result& ParsedQueryData::binder() { return binder_; }
 

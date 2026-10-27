@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "otterbrix/translators/input/named_types.hpp"
 #include "otterbrix/translators/input/pg_enum_types.hpp"
 
 #include <components/types/types.hpp>
@@ -12,9 +13,9 @@
 #include <chrono>
 #include <cstdint>
 #include <memory>
+#include <memory_resource>
 #include <optional>
 #include <string>
-#include <unordered_map>
 #include <utility>
 #include <variant>
 
@@ -22,7 +23,7 @@ namespace conn {
 
     // Column name → ClickHouse type string (system.columns): the overrides
     // tsl::ch_to_chunk / ch_to_struct take for a table's named Tuple columns.
-    using named_types_t = std::unordered_map<std::string, std::string>;
+    using named_types_t = tsl::named_type_map_t;
     using named_types_ptr = std::shared_ptr<const named_types_t>;
 
     // The ENUM types of one PostgreSQL connection (tsl::pg_to_chunk / pg_to_struct).
@@ -41,28 +42,24 @@ namespace conn {
         affected_rows, // a DML: the count only
     };
 
-    // One statement for one backend connection. Every field is owned: the statement
-    // crosses from the actor that builds it to the pool thread that runs it, and
-    // nothing in it refers back to the caller.
-    //
-    // `repeatable` is separate from `kind`: kind says how the answer is decoded, repeatable
-    // whether the driver may send the statement a second time after a stale connection lost
-    // its answer. MySQL and PostgreSQL decode a DML as `rows` (their translators build the
-    // count carrier), so the kind alone cannot tell a read from a write.
+    // One statement for one backend connection. Every field is owned: it crosses from the building actor
+    // to the pool thread, so `sql` lives on a thread-safe resource the pool thread may destroy.
+    // `repeatable` says whether the driver may resend it after a stale connection lost its answer; `kind`
+    // cannot, since MySQL and PostgreSQL decode a DML as `rows`.
     struct statement_t {
-        std::string sql;
+        std::pmr::string sql;
         result_kind kind{result_kind::rows};
         decode_hints_t hints{};
         std::chrono::milliseconds timeout{0}; // 0: the driver's own statement deadline
         bool repeatable{true};                // false: a DML or DDL, whose lost answer may hide an applied change
 
-        static statement_t rows(std::string sql, decode_hints_t hints = {}) {
+        static statement_t rows(std::pmr::string sql, decode_hints_t hints = {}) {
             return {std::move(sql), result_kind::rows, std::move(hints), {}, true};
         }
-        static statement_t schema(std::string sql, decode_hints_t hints = {}) {
+        static statement_t schema(std::pmr::string sql, decode_hints_t hints = {}) {
             return {std::move(sql), result_kind::schema, std::move(hints), {}, true};
         }
-        static statement_t affected_rows(std::string sql) {
+        static statement_t affected_rows(std::pmr::string sql) {
             return {std::move(sql), result_kind::affected_rows, {}, {}, false};
         }
 

@@ -9,10 +9,9 @@
 
 namespace tsl {
 
-    // The ENUM types of one PostgreSQL connection, by type oid: what pg_to_chunk and
-    // pg_to_struct decode an enum column with. Filled by discovery (the pg_enum query),
-    // read-only afterwards. Kept apart from pg_to_chunk.hpp so code that only carries
-    // the map (conn::statement_t's decode hints) does not pull in libpq-fe.h.
+    // The ENUM types of one PostgreSQL connection, by type oid, used to decode enum columns.
+    // Filled by discovery, read-only afterwards. Kept apart from pg_to_chunk.hpp so carrying the map
+    // does not pull in libpq-fe.h. Uses std::string, not pmr, since the engine's create_enum takes it.
     struct pg_enum_descriptor {
         std::string typname;
         std::vector<std::string> values;

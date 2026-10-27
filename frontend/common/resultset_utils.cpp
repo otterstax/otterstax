@@ -4,11 +4,15 @@
 #include "resultset_utils.hpp"
 
 #include "utils.hpp"
+#include "utility/pmr_text.hpp"
 #include "utility/tracy_profiler.hpp"
 
 #include <components/types/logical_value.hpp>
 
 #include <algorithm>
+#include <charconv>
+#include <cstring>
+#include <type_traits>
 
 namespace frontend {
     namespace {
@@ -190,68 +194,93 @@ namespace frontend {
             return value < 0 ? ~static_cast<uint128_t>(value) + 1 : static_cast<uint128_t>(value);
         }
 
-        // The decimal digits of a 128-bit magnitude, most significant first.
-        std::string digits_of(components::types::uint128_t magnitude) {
-            std::string digits;
-            if (magnitude == 0) {
-                digits.push_back('0');
-            }
-            while (magnitude > 0) {
-                digits.push_back(static_cast<char>('0' + absl::Uint128Low64(magnitude % 10)));
+        // The decimal digits of a 128-bit magnitude, most significant first, into `out` (at least
+        // 39 bytes: 2^128 - 1 has 39 digits); their count.
+        std::size_t write_digits(char* out, components::types::uint128_t magnitude) {
+            char reversed[40];
+            std::size_t count = 0;
+            do {
+                reversed[count++] = static_cast<char>('0' + absl::Uint128Low64(magnitude % 10));
                 magnitude /= 10;
+            } while (magnitude > 0);
+            for (std::size_t i = 0; i < count; ++i) {
+                out[i] = reversed[count - 1 - i];
             }
-            std::reverse(digits.begin(), digits.end());
-            return digits;
+            return count;
         }
 
         // A whole 128-bit integer as text: its digits behind its sign.
-        std::string int128_to_text(components::types::int128_t value) {
-            std::string text;
+        void append_int128(std::pmr::string& out, components::types::int128_t value) {
+            char text[41];
+            std::size_t length = 0;
             if (value < 0) {
-                text.push_back('-');
+                text[length++] = '-';
             }
-            text += digits_of(magnitude_of(value));
-            return text;
+            length += write_digits(text + length, magnitude_of(value));
+            out.append(text, length);
         }
 
-        std::string element_to_text(const components::types::logical_value_t& v) {
+        using otterstax::append_number;
+
+        // What std::to_string writes for a float or a double ("%f": six fraction digits, no
+        // exponent), without its std::string. The widest double, 1.8e308, is 316 characters.
+        void append_floating(std::pmr::string& out, double value) {
+            char text[400];
+            const auto written = std::to_chars(text, text + sizeof(text), value, std::chars_format::fixed, 6);
+            out.append(text, static_cast<std::size_t>(written.ptr - text));
+        }
+
+        // One element of an array or composite literal, appended to `out`.
+        void append_element_text(std::pmr::string& out, const components::types::logical_value_t& v) {
             using LT = components::types::logical_type;
             switch (v.type().type()) {
                 case LT::NA:
-                    return "NULL";
+                    out += "NULL";
+                    return;
                 case LT::BOOLEAN:
-                    return v.value<bool>() ? "t" : "f";
+                    out += v.value<bool>() ? 't' : 'f';
+                    return;
                 case LT::TINYINT:
-                    return std::to_string(v.value<int8_t>());
+                    append_number(out, static_cast<int>(v.value<int8_t>()));
+                    return;
                 case LT::UTINYINT:
-                    return std::to_string(v.value<uint8_t>());
+                    append_number(out, static_cast<unsigned>(v.value<uint8_t>()));
+                    return;
                 case LT::SMALLINT:
-                    return std::to_string(v.value<int16_t>());
+                    append_number(out, v.value<int16_t>());
+                    return;
                 case LT::USMALLINT:
-                    return std::to_string(v.value<uint16_t>());
+                    append_number(out, v.value<uint16_t>());
+                    return;
                 case LT::INTEGER:
                 case LT::ENUM: // ENUM stores its ordinal as INT32
-                    return std::to_string(v.value<int32_t>());
+                    append_number(out, v.value<int32_t>());
+                    return;
                 case LT::UINTEGER:
-                    return std::to_string(v.value<uint32_t>());
+                    append_number(out, v.value<uint32_t>());
+                    return;
                 case LT::BIGINT:
-                    return std::to_string(v.value<int64_t>());
+                    append_number(out, v.value<int64_t>());
+                    return;
                 case LT::UBIGINT:
-                    return std::to_string(v.value<uint64_t>());
+                    append_number(out, v.value<uint64_t>());
+                    return;
                 case LT::HUGEINT:
-                    // No std::to_string for a 128-bit integer; without this the
-                    // element would go out as the empty string below.
-                    return int128_to_text(v.value<components::types::int128_t>());
+                    // No std::to_chars for a 128-bit integer; without this the element would go
+                    // out as the empty string below.
+                    append_int128(out, v.value<components::types::int128_t>());
+                    return;
                 case LT::FLOAT:
-                    return std::to_string(v.value<float>());
+                    append_floating(out, v.value<float>());
+                    return;
                 case LT::DOUBLE:
-                    return std::to_string(v.value<double>());
+                    append_floating(out, v.value<double>());
+                    return;
                 case LT::STRING_LITERAL: {
                     // postgres array string element: wrap in double-quotes,
                     // escape backslash and quote inside.
                     auto sv = v.value<std::string_view>();
-                    std::string out;
-                    out.reserve(sv.size() + 2);
+                    out.reserve(out.size() + sv.size() + 2);
                     out.push_back('"');
                     for (char c : sv) {
                         if (c == '\\' || c == '"') {
@@ -260,11 +289,10 @@ namespace frontend {
                         out.push_back(c);
                     }
                     out.push_back('"');
-                    return out;
+                    return;
                 }
                 case LT::STRUCT: {
                     // postgres composite literal: (f1,f2,f3)
-                    std::string out;
                     out.push_back('(');
                     bool first = true;
                     for (const auto& child : v.children()) {
@@ -272,13 +300,13 @@ namespace frontend {
                             out.push_back(',');
                         }
                         first = false;
-                        out += element_to_text(child);
+                        append_element_text(out, child);
                     }
                     out.push_back(')');
-                    return out;
+                    return;
                 }
                 default:
-                    return "";
+                    return;
             }
         }
     } // namespace
@@ -342,7 +370,10 @@ namespace frontend {
             }
             case components::types::logical_type::DECIMAL:
             case components::types::logical_type::HUGEINT:
-                row_sz = decimal_to_text(chunk, column_index, row_index).size();
+            {
+                decimal_text_t text; // the length only: rendered on the stack
+                row_sz = decimal_to_text(chunk, column_index, row_index, text).size();
+            }
                 break;
             default:
                 // fallback
@@ -400,8 +431,9 @@ namespace frontend {
             case components::types::logical_type::DECIMAL:
             case components::types::logical_type::HUGEINT: {
                 if constexpr (type == frontend_type::MYSQL) {
+                    decimal_text_t text; // the length only: rendered on the stack
                     return mysql::get_length_encoded_string_size(
-                        decimal_to_text(chunk, column_index, row_index).size());
+                        decimal_to_text(chunk, column_index, row_index, text).size());
                 } else {
                     // Unreachable: is_encodable<POSTGRES> is false for both of
                     // these in BINARY, so the column is refused before a binary
@@ -420,8 +452,10 @@ namespace frontend {
         }
     }
 
-    std::string
-    decimal_to_text(const components::vector::data_chunk_t& chunk, size_t column_index, size_t row_index) {
+    std::string_view decimal_to_text(const components::vector::data_chunk_t& chunk,
+                                     size_t column_index,
+                                     size_t row_index,
+                                     decimal_text_t& text) {
         OTX_ZONE_N("frontend::decimal_to_text");
         using namespace components::types;
 
@@ -490,61 +524,81 @@ namespace frontend {
         }
 
         const bool negative = raw < 0;
-        std::string digits = digits_of(magnitude_of(raw));
-        std::string text;
-        text.reserve(digits.size() + scale + 3);
+        char digits[40];
+        const std::size_t count = write_digits(digits, magnitude_of(raw));
+        std::size_t length = 0;
         if (negative) {
-            text.push_back('-');
+            text[length++] = '-';
         }
+        const auto put = [&](const char* from, std::size_t n) {
+            std::memcpy(text + length, from, n);
+            length += n;
+        };
         if (scale == 0) {
-            text += digits;
-            return text;
-        }
-        if (digits.size() <= scale) {
+            put(digits, count);
+        } else if (count <= scale) {
             // The number is all fraction: 1 at scale 4 is 0.0001, and the zeros
             // between the point and the digits are part of the value.
-            text += "0.";
-            text.append(scale - digits.size(), '0');
-            text += digits;
-            return text;
+            put("0.", 2);
+            std::memset(text + length, '0', scale - count);
+            length += scale - count;
+            put(digits, count);
+        } else {
+            put(digits, count - scale);
+            text[length++] = '.';
+            put(digits + count - scale, scale);
         }
-        text.append(digits, 0, digits.size() - scale);
-        text.push_back('.');
-        text.append(digits, digits.size() - scale, scale);
-        return text;
+        return {text, length};
     }
 
-    std::string encode_to_text(const components::vector::data_chunk_t& chunk, size_t column_index, size_t row_index) {
+    std::string_view encode_to_text(const components::vector::data_chunk_t& chunk,
+                                    size_t column_index,
+                                    size_t row_index,
+                                    std::pmr::string& scratch) {
         OTX_ZONE_N("frontend::encode_to_text");
+        scratch.clear(); // its capacity stays: one buffer serves every cell of a resultset
+        const auto number = [&](auto value) -> std::string_view {
+            if constexpr (std::is_floating_point_v<decltype(value)>) {
+                append_floating(scratch, value);
+            } else {
+                append_number(scratch, value);
+            }
+            return scratch;
+        };
         const auto type = chunk.data[column_index].type().type();
         switch (type) {
             case components::types::logical_type::BOOLEAN:
                 return chunk.data[column_index].data<bool>()[row_index] ? "TRUE" : "FALSE";
             case components::types::logical_type::TINYINT:
-                return std::to_string(chunk.data[column_index].data<int8_t>()[row_index]);
+                return number(static_cast<int>(chunk.data[column_index].data<int8_t>()[row_index]));
             case components::types::logical_type::UTINYINT:
-                return std::to_string(chunk.data[column_index].data<uint8_t>()[row_index]);
+                return number(static_cast<unsigned>(chunk.data[column_index].data<uint8_t>()[row_index]));
             case components::types::logical_type::SMALLINT:
-                return std::to_string(chunk.data[column_index].data<int16_t>()[row_index]);
+                return number(chunk.data[column_index].data<int16_t>()[row_index]);
             case components::types::logical_type::USMALLINT:
-                return std::to_string(chunk.data[column_index].data<uint16_t>()[row_index]);
+                return number(chunk.data[column_index].data<uint16_t>()[row_index]);
             case components::types::logical_type::INTEGER:
-                return std::to_string(chunk.data[column_index].data<int32_t>()[row_index]);
+                return number(chunk.data[column_index].data<int32_t>()[row_index]);
             case components::types::logical_type::UINTEGER:
-                return std::to_string(chunk.data[column_index].data<uint32_t>()[row_index]);
+                return number(chunk.data[column_index].data<uint32_t>()[row_index]);
             case components::types::logical_type::BIGINT:
-                return std::to_string(chunk.data[column_index].data<int64_t>()[row_index]);
+                return number(chunk.data[column_index].data<int64_t>()[row_index]);
             case components::types::logical_type::UBIGINT:
-                return std::to_string(chunk.data[column_index].data<uint64_t>()[row_index]);
+                return number(chunk.data[column_index].data<uint64_t>()[row_index]);
             case components::types::logical_type::FLOAT:
-                return std::to_string(chunk.data[column_index].data<float>()[row_index]);
+                return number(chunk.data[column_index].data<float>()[row_index]);
             case components::types::logical_type::DOUBLE:
-                return std::to_string(chunk.data[column_index].data<double>()[row_index]);
+                return number(chunk.data[column_index].data<double>()[row_index]);
             case components::types::logical_type::STRING_LITERAL:
-                return std::string(chunk.data[column_index].data<std::string_view>()[row_index]);
+                // The chunk's own text: no copy.
+                return chunk.data[column_index].data<std::string_view>()[row_index];
             case components::types::logical_type::DECIMAL:
             case components::types::logical_type::HUGEINT:
-                return decimal_to_text(chunk, column_index, row_index);
+            {
+                decimal_text_t text;
+                scratch.assign(decimal_to_text(chunk, column_index, row_index, text));
+                return scratch;
+            }
             case components::types::logical_type::NA:
                 return {};
             case components::types::logical_type::ENUM: {
@@ -555,43 +609,41 @@ namespace frontend {
                 if (ext) {
                     const auto& entries = ext->entries();
                     if (ordinal >= 0 && static_cast<size_t>(ordinal) < entries.size()) {
-                        return entries[ordinal].type().alias();
+                        return entries[ordinal].type().alias(); // the type's own name outlives the call
                     }
                 }
-                return std::to_string(ordinal);
+                return number(ordinal);
             }
             case components::types::logical_type::ARRAY:
             case components::types::logical_type::LIST: {
                 // postgres-style array literal {e1,e2,e3}
                 auto val = chunk.data[column_index].value(row_index);
-                std::string out;
-                out.push_back('{');
+                scratch.push_back('{');
                 bool first = true;
                 for (const auto& child : val.children()) {
                     if (!first) {
-                        out.push_back(',');
+                        scratch.push_back(',');
                     }
                     first = false;
-                    out += element_to_text(child);
+                    append_element_text(scratch, child);
                 }
-                out.push_back('}');
-                return out;
+                scratch.push_back('}');
+                return scratch;
             }
             case components::types::logical_type::STRUCT: {
                 // postgres composite literal (f1,f2,f3)
                 auto val = chunk.data[column_index].value(row_index);
-                std::string out;
-                out.push_back('(');
+                scratch.push_back('(');
                 bool first = true;
                 for (const auto& child : val.children()) {
                     if (!first) {
-                        out.push_back(',');
+                        scratch.push_back(',');
                     }
                     first = false;
-                    out += element_to_text(child);
+                    append_element_text(scratch, child);
                 }
-                out.push_back(')');
-                return out;
+                scratch.push_back(')');
+                return scratch;
             }
             default:
                 // Unreachable: is_encodable<type>(.., TEXT) is checked for every

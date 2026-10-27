@@ -144,7 +144,7 @@ BENCHMARK(BM_ch_to_chunk_100k);
 // Multi-block: two blocks of 5 000 rows each = 10 000 total.
 static void BM_ch_to_chunk_multiblock_10k(benchmark::State& state) {
     auto* res = std::pmr::new_delete_resource();
-    std::vector<clickhouse::Block> blocks{make_ch_block(5000), make_ch_block(5000)};
+    std::pmr::vector<clickhouse::Block> blocks{make_ch_block(5000), make_ch_block(5000)};
     for (auto _ : state) {
         auto chunk = tsl::ch_to_chunk(res, blocks);
         if (chunk.has_error()) {

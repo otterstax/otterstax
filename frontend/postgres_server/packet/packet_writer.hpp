@@ -22,6 +22,11 @@ namespace frontend::postgres {
 
         std::vector<uint8_t> build_from_payload(char message_type);
 
+        // Frames the payload written since reserve_payload as a `message_type` message and
+        // appends it to `out`. The payload buffer is cleared, not moved out, so the next message
+        // reuses its capacity: no allocation per message.
+        void append_frame(std::vector<uint8_t>& out, char message_type);
+
     private:
         using packet_writer_base::reserve_payload;
     };

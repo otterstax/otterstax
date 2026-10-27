@@ -3,6 +3,7 @@
 
 #include "connection_pool.hpp"
 
+#include "utility/pmr_text.hpp"
 #include "utility/tracy_profiler.hpp"
 
 #include <cassert>
@@ -38,7 +39,8 @@ namespace conn {
     void driver_session_t::close() noexcept { driver_->close(); }
 
     connection_pool_t::connection_pool_t(std::pmr::memory_resource* resource)
-        : resource_(resource) {
+        : resource_(resource)
+        , aliases_(resource) {
         assert(resource_ != nullptr);
     }
 
@@ -46,13 +48,12 @@ namespace conn {
     connection_pool_t::~connection_pool_t() = default;
 
     core::error_t
-    connection_pool_t::add(const std::string& alias, std::unique_ptr<IDriver> prototype, pool_config_t config) {
+    connection_pool_t::add(std::string_view alias, std::unique_ptr<IDriver> prototype, pool_config_t config) {
         OTX_ZONE_N("conn::connection_pool::add");
         assert(prototype != nullptr);
         if (aliases_.contains(alias)) {
-            return core::error_t(
-                core::error_code_t::invalid_parameter,
-                std::pmr::string{("connection '" + alias + "' is already registered").c_str(), resource_});
+            return core::error_t(core::error_code_t::invalid_parameter,
+                                 otterstax::concat(resource_, {"connection '", alias, "' is already registered"}));
         }
         std::shared_ptr<const IDriver> shared_prototype{std::move(prototype)};
         auto factory = [shared_prototype, check = config.check_after_idle] {
@@ -66,7 +67,11 @@ namespace conn {
         return core::error_t::no_error();
     }
 
-    void connection_pool_t::drop(const std::string& alias) { aliases_.erase(alias); }
+    void connection_pool_t::drop(std::string_view alias) {
+        if (auto it = aliases_.find(alias); it != aliases_.end()) {
+            aliases_.erase(it);
+        }
+    }
 
     bool connection_pool_t::contains(std::string_view alias) const noexcept { return aliases_.contains(alias); }
 
@@ -78,8 +83,7 @@ namespace conn {
                 resource_,
                 statement_outcome_t{
                     core::error_t(core::error_code_t::do_not_exists,
-                                  std::pmr::string{("no connection registered for '" + std::string(alias) + "'").c_str(),
-                                                   resource_})});
+                                  otterstax::concat(resource_, {"no connection registered for '", alias, "'"}))});
         }
         return it->second->submit(std::move(statement), std::move(waker));
     }

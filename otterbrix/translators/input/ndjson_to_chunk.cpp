@@ -84,9 +84,9 @@ namespace {
     }
 } // namespace
 
-core::result_wrapper_t<data_chunk_t> ndjson_to_chunk(std::pmr::memory_resource* res, const std::string& file_path) {
+core::result_wrapper_t<data_chunk_t> ndjson_to_chunk(std::pmr::memory_resource* res, std::string_view file_path) {
     OTX_ZONE_N("tsl::ndjson_to_chunk(file)");
-    auto file_result = arrow::io::ReadableFile::Open(file_path, arrow_pool(res));
+    auto file_result = arrow::io::ReadableFile::Open(std::string(file_path), arrow_pool(res)); // Arrow takes a std::string
     if (!file_result.ok()) {
         return arrow_error(res, core::error_code_t::io_error,
                            "ndjson_to_chunk: cannot open file", file_result.status());

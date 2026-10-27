@@ -6,6 +6,7 @@
 #include "pool_config.hpp"
 
 #include "utility/logger.hpp"
+#include "utility/pmr_text.hpp"
 #include "utility/tracy_profiler.hpp"
 
 #include <actor-zeta.hpp>
@@ -22,43 +23,31 @@
 #include <memory_resource>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
 
 namespace conn {
 
-    // A queue of requests served by between min_size and max_size threads, each owning one
-    // Session. Whichever thread is free takes the next request, so a request never waits
-    // behind a slow one while another session sits idle. Every request is answered through
-    // an actor_zeta::promise: the awaiting actor resumes on its own scheduler thread and
-    // never blocks one.
+    // A queue of requests served by min_size..max_size threads, each owning one Session. Any free thread
+    // takes the next request. Every request is answered through an actor_zeta::promise, so the awaiting
+    // actor resumes on its own scheduler thread and never blocks.
     //
-    // Session is what one thread owns: a backend connection (driver_session_t) or a handle
-    // on a shared client (transfer sessions). It provides
-    //   using request_t, outcome_t;          // outcome_t is constructible from core::error_t
-    //   core::error_t open();                // connect; called on the session's own thread,
-    //                                        // except the min_size opened by open()
-    //   outcome_t run(const request_t&);     // may block, must not throw
-    //   void close() noexcept;
+    // Session provides: using request_t, outcome_t (constructible from core::error_t);
+    // core::error_t open() (connect, on the session's own thread except the min_size from open());
+    // outcome_t run(const request_t&) (may block, must not throw); void close() noexcept.
     //
-    // Sizing (pool_config_t):
-    //   - min_size sessions are opened on the caller's thread by open(); any failure → no pool.
-    //   - The pool grows when more requests are queued than sessions are idle, below
-    //     max_size, one connect at a time, and not within connect_backoff of a failed one —
-    //     a backend that is down does not get a connect storm. A new session connects on its
-    //     own thread, never on the submitter's (an actor's).
-    //   - A session idle for idle_timeout closes while more than min_size are open.
-    //   - A request that waited longer than queue_timeout is answered with io_error instead
-    //     of being run: its client has very likely given up. An expiry thread per pool
-    //     answers it when its time is up, while every session is still busy; the check a
-    //     session makes when it takes the request is the backstop for the race between the
-    //     two.
-    //   - On destruction every queued request is answered with io_error, then every session
-    //     thread is stopped and joined; a request already running finishes first.
+    // Sizing (pool_config_t): open() opens min_size sessions on the caller's thread; a failure means no pool.
+    // The pool grows by one connect at a time, on the new session's thread, when requests queue past the
+    // idle sessions, and not within connect_backoff of a failed connect. Sessions above min_size close
+    // after idle_timeout. A request queued past queue_timeout is answered io_error: an expiry thread does
+    // it while all sessions are busy, and the check at take-time covers the race between the two.
+    // Destruction answers queued requests io_error, then stops and joins every session thread; a running
+    // request finishes first.
     //
-    // `resource` must be thread-safe: promise states and error messages are allocated on
-    // the session threads and released on the awaiting actor's.
+    // `resource` must be thread-safe: promise states and errors are allocated on session threads and
+    // released on the awaiting actor's.
     template<typename Session>
     class work_pool_t {
     public:
@@ -69,15 +58,15 @@ namespace conn {
         using clock = std::chrono::steady_clock;
 
         static core::result_wrapper_t<std::unique_ptr<work_pool_t>> open(std::pmr::memory_resource* resource,
-                                                                          std::string name,
+                                                                          std::string_view name,
                                                                           session_factory_t factory,
                                                                           pool_config_t config) {
             OTX_ZONE_N("conn::work_pool::open");
-            std::unique_ptr<work_pool_t> pool{new work_pool_t(resource, std::move(name), std::move(factory), config)};
+            std::unique_ptr<work_pool_t> pool{new work_pool_t(resource, name, std::move(factory), config)};
             try {
                 pool->expirer_ = std::thread([raw = pool.get()] { raw->expire(); });
             } catch (const std::exception& e) {
-                return pool->error(core::error_code_t::io_error, std::string{"cannot start its expiry thread: "} + e.what());
+                return pool->error(core::error_code_t::io_error, "cannot start its expiry thread: ", e.what());
             }
             for (std::size_t i = 0; i < pool->config_.min_size; ++i) {
                 auto session = pool->factory_();
@@ -92,7 +81,7 @@ namespace conn {
         }
 
         ~work_pool_t() {
-            std::deque<job_t> left;
+            std::pmr::deque<job_t> left(resource_); // the same resource as queue_: swap needs it
             {
                 std::lock_guard guard(mutex_);
                 stopping_ = true;
@@ -117,10 +106,9 @@ namespace conn {
         work_pool_t(const work_pool_t&) = delete;
         work_pool_t& operator=(const work_pool_t&) = delete;
 
-        // Any thread; never blocks. `waker` (may be empty) is called on the session thread
-        // once the answer is settled. A request refused because the pool is stopping is
-        // settled before submit returns, and the shutdown answers queued requests without
-        // waking anyone: their awaiters are gone by then.
+        // Any thread; never blocks. `waker` (may be empty) is called on the session thread once the
+        // answer is settled. A request refused because the pool is stopping is settled before submit
+        // returns; shutdown answers queued requests without waking anyone, as their awaiters are gone.
         future_t submit(request_t request, waker_t waker = {}) {
             actor_zeta::promise<outcome_t> promise{resource_};
             auto future = promise.get_future();
@@ -141,7 +129,7 @@ namespace conn {
             return future;
         }
 
-        const std::string& name() const noexcept { return name_; }
+        std::string_view name() const noexcept { return name_; }
         std::pmr::memory_resource* resource() const noexcept { return resource_; }
 
         // Sessions open or connecting, and requests waiting; for tests and plots.
@@ -187,14 +175,16 @@ namespace conn {
         };
 
         work_pool_t(std::pmr::memory_resource* resource,
-                    std::string name,
+                    std::string_view name,
                     session_factory_t factory,
                     pool_config_t config)
             : resource_(resource)
-            , name_(std::move(name))
+            , name_(name, resource)
             , factory_(std::move(factory))
             , config_(config)
-            , log_(get_logger(logger_tag::CONNECTOR_MANAGER)) {
+            , log_(get_logger(logger_tag::CONNECTOR_MANAGER))
+            , queue_(resource)
+            , slots_(resource) {
             assert(resource_ != nullptr);
             assert(factory_);
             config_.max_size = std::max<std::size_t>(config_.max_size, 1);
@@ -202,8 +192,9 @@ namespace conn {
             slots_.resize(config_.max_size); // never reallocated: threads hold slot references
         }
 
-        core::error_t error(core::error_code_t code, const std::string& what) const {
-            return core::error_t(code, std::pmr::string{("pool '" + name_ + "' " + what).c_str(), resource_});
+        // "pool '<name>' <what><detail>"
+        core::error_t error(core::error_code_t code, std::string_view what, std::string_view detail = {}) const {
+            return core::error_t(code, otterstax::concat(resource_, {"pool '", name_, "' ", what, detail}));
         }
 
         // Under mutex_. A finished slot's thread no longer touches the pool, so it joins at once.
@@ -275,7 +266,7 @@ namespace conn {
                     expiry_.wait_until(lock, due);
                     continue;
                 }
-                std::vector<job_t> expired;
+                std::pmr::vector<job_t> expired(resource_);
                 const auto now = clock::now();
                 while (!queue_.empty() && now - queue_.front().queued_at > config_.queue_timeout) {
                     expired.push_back(std::move(queue_.front()));
@@ -296,7 +287,7 @@ namespace conn {
             try {
                 return session.run(job.request);
             } catch (const std::exception& e) {
-                return outcome_t{error(core::error_code_t::io_error, std::string{"session failed: "} + e.what())};
+                return outcome_t{error(core::error_code_t::io_error, "session failed: ", e.what())};
             } catch (...) {
                 return outcome_t{error(core::error_code_t::io_error, "session failed")};
             }
@@ -304,15 +295,19 @@ namespace conn {
 
         void serve(slot_t& slot) {
             // A grown session connects here, on its own thread: a connect can take seconds.
+            const bool grown = !slot.session;
             std::unique_ptr<Session> fresh;
             core::error_t opened = core::error_t::no_error();
-            if (!slot.session) {
+            if (grown) {
                 fresh = factory_();
                 opened = fresh->open();
+                if (opened.contains_error()) {
+                    fresh.reset(); // torn down before the slot reads as finished: free_slot joins it under mutex_
+                }
             }
 
             std::unique_lock lock(mutex_);
-            if (fresh) {
+            if (grown) {
                 connecting_ = false;
                 if (opened.contains_error()) {
                     if (log_.is_valid()) {
@@ -336,7 +331,8 @@ namespace conn {
                     break;
                 }
                 if (!has_work) {
-                    if (open_ > config_.min_size) {
+                    // A session still connecting may yet fail, so it does not count toward the floor.
+                    if (open_ - (connecting_ ? 1 : 0) > config_.min_size) {
                         break; // idle too long, above the floor
                     }
                     continue;
@@ -358,21 +354,21 @@ namespace conn {
         }
 
         std::pmr::memory_resource* resource_;
-        std::string name_;
-        session_factory_t factory_;
+        std::pmr::string name_;
+        session_factory_t factory_; // called at open() and when the pool grows, never per request
         pool_config_t config_;
         log_t log_;
 
         mutable std::mutex mutex_;
         std::condition_variable ready_;
         std::condition_variable expiry_; // the expiry thread: a request queued into an empty queue, or stop
-        std::deque<job_t> queue_;
+        std::pmr::deque<job_t> queue_;
         std::size_t open_{0};     // sessions open or connecting
         std::size_t idle_{0};     // sessions waiting for a request
         bool connecting_{false};  // at most one connect in flight
         clock::time_point next_connect_attempt_{};
         bool stopping_{false};
-        std::vector<slot_t> slots_;
+        std::pmr::vector<slot_t> slots_;
         std::thread expirer_; // runs expire(); joined by the destructor
     };
 

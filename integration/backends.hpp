@@ -13,17 +13,16 @@
 
 namespace db {
 
-    // What every backend is built on: one connection pool per backend type, the decode
-    // metadata discovery fills, and the transfer pools of S3 aliases and local files.
-    // Owned by ComponentManager (or a test fixture) and outliving every backend_set_t built
-    // over it. Its pools are filled on the startup thread (register_connections) before the
-    // first statement and only read afterwards. A type the deployment has no connection of
-    // keeps an empty pool, whose statements answer do_not_exists.
+    // A pool per backend type, decode metadata, and the S3/local-file transfer pools. Owned by
+    // ComponentManager (or a test fixture) and outliving every backend_set_t. Filled at startup
+    // before any query, read-only after; an unconfigured type has an empty pool (do_not_exists).
     struct backend_registry_t {
         explicit backend_registry_t(std::pmr::memory_resource* resource)
             : mysql(resource)
             , postgresql(resource)
             , clickhouse(resource)
+            , pg_metadata(resource)
+            , ch_metadata(resource)
             , transfers(resource) {}
 
         backend_registry_t(const backend_registry_t&) = delete;
@@ -73,10 +72,9 @@ namespace db {
             }
         }
 
-        // Every backend that owns a slot of the statement describes its own stubs
-        // (backend_t::describe), in the order execute runs them: MySQL, PostgreSQL,
-        // ClickHouse. Each fills only the stubs node_backend_types gives it, so the
-        // participants of a Mixed statement describe their shares in turn.
+        // Each backend that owns a slot describes its own stubs (backend_t::describe), in
+        // execute's order: MySQL, PostgreSQL, ClickHouse. It fills only the stubs
+        // node_backend_types gives it, so a Mixed statement's participants describe in turn.
         actor_zeta::unique_future<core::result_wrapper_t<ParsedQueryDataPtr>> describe(session_hash_t id,
                                                                                        ParsedQueryDataPtr data) {
             assert(data);
@@ -104,12 +102,9 @@ namespace db {
             co_return std::move(data);
         }
 
-        // A Mixed statement: every backend runs the slots node_backend_types gives it. Batch
-        // by batch, innermost first — an outer slot may read an inner one's rows (an INSERT
-        // whose SELECT ran on another backend becomes INSERT ... VALUES) — and within a
-        // batch every backend's statements are sent before the first answer is awaited, so
-        // MySQL, PostgreSQL and ClickHouse run side by side: the batch costs the slowest
-        // backend's time, not the sum. Slots of one batch never read each other.
+        // Innermost batch first: an outer slot may read an inner one's rows (an INSERT whose
+        // SELECT ran elsewhere becomes INSERT ... VALUES); same-batch slots never read each
+        // other. All backends are sent before any answer is awaited, so they run side by side.
         actor_zeta::unique_future<core::result_wrapper_t<ParsedQueryDataPtr>> execute_mixed(session_hash_t id,
                                                                                             ParsedQueryDataPtr data) {
             assert(data);

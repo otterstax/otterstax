@@ -58,19 +58,17 @@ namespace {
         return block;
     }
 
-    // Answers the catalog's discovery with the header block and every slot
-    // statement with no blocks at all plus `written_rows` of progress — the exact
-    // shape a DML statement produces on the wire — decoded by the ClickHouse
-    // driver's own decode.
+    // Answers discovery with the header block and every slot statement with no blocks plus `written_rows`
+    // of progress, the wire shape of a DML, decoded by the ClickHouse driver's own decode.
     std::unique_ptr<conn::IDriver> counting_driver(std::pmr::memory_resource* resource, uint64_t written_rows) {
         return std::make_unique<otterstax::test::scripted_driver_t>(
             [resource, written_rows](const conn::statement_t& statement) {
-                ch::select_result_t outcome;
+                ch::select_result_t outcome(std::pmr::new_delete_resource());
                 outcome.written_rows = written_rows;
                 return ch::decode(resource, outcome, statement);
             },
             [resource](const conn::statement_t& statement) {
-                ch::select_result_t probe;
+                ch::select_result_t probe(std::pmr::new_delete_resource());
                 probe.blocks.push_back(header_block());
                 return ch::decode(resource, probe, statement);
             });

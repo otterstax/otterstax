@@ -138,11 +138,9 @@ namespace {
         return result;
     }
 
-    // Answers discovery and the describe probe with the table's columns and the
-    // slot statement with kRows, recording the probes and the slot statements
-    // apart. Discovery (the pg_enum query lists no enums, the table's schema
-    // probe answers its columns) and the describe probe are told apart by the
-    // wrap describe puts around the statement.
+    // Answers discovery and the describe probe with the table's columns and the slot statement with
+    // kRows, recording probes and slot statements apart. Discovery and the describe probe are told
+    // apart by the wrap describe puts around the statement.
     class recording_pg_driver final : public conn::IDriver {
     public:
         explicit recording_pg_driver(std::pmr::memory_resource* resource)

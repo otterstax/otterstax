@@ -1,5 +1,7 @@
 #pragma once
 
+#include "named_types.hpp"
+
 #include <core/result_wrapper.hpp>
 #include <otterbrix/otterbrix.hpp>
 
@@ -11,9 +13,9 @@
 
 #include <exception>
 #include <iostream>
+#include <memory_resource>
 #include <optional>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 using namespace components::vector;
@@ -31,16 +33,16 @@ namespace tsl {
     // — is conversion_failure; the message is owned by `res`.
     core::result_wrapper_t<data_chunk_t> ch_to_chunk(std::pmr::memory_resource* res, const clickhouse::Block& block);
     core::result_wrapper_t<data_chunk_t> ch_to_chunk(std::pmr::memory_resource* res,
-                                                     const std::vector<clickhouse::Block>& blocks);
+                                                     const std::pmr::vector<clickhouse::Block>& blocks);
 
     core::result_wrapper_t<data_chunk_t>
     ch_to_chunk(std::pmr::memory_resource* res,
                 const clickhouse::Block& block,
-                const std::unordered_map<std::string, std::string>& named_type_overrides);
+                const named_type_map_t& named_type_overrides);
     core::result_wrapper_t<data_chunk_t>
     ch_to_chunk(std::pmr::memory_resource* res,
-                const std::vector<clickhouse::Block>& blocks,
-                const std::unordered_map<std::string, std::string>& named_type_overrides);
+                const std::pmr::vector<clickhouse::Block>& blocks,
+                const named_type_map_t& named_type_overrides);
 
     components::types::complex_logical_type ch_to_struct(std::pmr::memory_resource* res,
                                                          const clickhouse::Block& block);
@@ -48,6 +50,6 @@ namespace tsl {
     components::types::complex_logical_type
     ch_to_struct(std::pmr::memory_resource* res,
                  const clickhouse::Block& block,
-                 const std::unordered_map<std::string, std::string>& named_type_overrides);
+                 const named_type_map_t& named_type_overrides);
 
 } // namespace tsl

@@ -144,12 +144,12 @@ namespace otterstax::kafka::detail {
             }
 
             OTX_ZONE_N("kafka::poller::batch"); // one zone per processed batch (run() is an endless poll loop)
-            std::vector<std::string> payloads;
+            std::pmr::vector<std::string_view> payloads(resource_); // views into the records, alive for the batch
             payloads.reserve(records.size());
             for (auto& record : records) {
-                // Move just the payload: records keep partition/offset, needed for
-                // the offsets upsert and for the rewind on failure
-                payloads.push_back(std::move(record.payload));
+                // A view of the payload: the records keep their messages, and their
+                // partition/offset for the offsets upsert and the rewind on failure
+                payloads.push_back(record.payload);
             }
 
             auto chunk = json_to_chunk(resource_, columns_, payloads);

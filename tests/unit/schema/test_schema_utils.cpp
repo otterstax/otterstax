@@ -243,13 +243,9 @@ TEST_CASE("aggregate: grouping-key markers and hidden HAVING outputs are not col
     REQUIRE(filtered.child_types()[1].type() == logical_type::UBIGINT);
 }
 
-// A federated sub-query the SQL generator cannot write is lifted out of the
-// statement as raw text, and the backend describes its result columns onto that
-// stub (db::backend_t::describe). The stub IS the input relation of the
-// aggregate above it — the transformer's derived-table wrapper, which names no
-// table — so the projection is resolved against the described columns. While the
-// stub is undescribed there is nothing to resolve against, and the schema stays
-// unanswered rather than being invented.
+// A federated sub-query the SQL generator cannot write becomes a raw-text stub, and the backend
+// describes its columns onto it (db::backend_t::describe). The aggregate's projection resolves
+// against those columns; while the stub is undescribed the schema stays unanswered.
 TEST_CASE("aggregate: a described sub-query stub types the projection above it") {
     auto* resource = std::pmr::new_delete_resource();
     auto [node, params] = parse("SELECT id FROM test;");

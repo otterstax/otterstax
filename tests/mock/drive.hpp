@@ -30,12 +30,9 @@ namespace otterstax::test {
         }
     } // namespace detail
 
-    // Runs `future` to completion on the calling thread, the way an actor_mixin's
-    // enqueue_impl does (CatalogManager): a behavior awaits it, and while the deepest
-    // awaited future is not ready the thread yields; once it is, its continuation is
-    // resumed, which unwinds the coroutine chain. This is how a test calls a backend's
-    // coroutines (db::backend_t::execute / describe / discover) synchronously, with the
-    // statements answered by pool threads. Throws std::runtime_error after `timeout`.
+    // Runs `future` to completion on the calling thread, as CatalogManager's enqueue_impl does:
+    // yields while the deepest awaited future is not ready, then resumes the coroutine chain. Lets a
+    // test call backend coroutines synchronously. Throws std::runtime_error after `timeout`.
     template<typename T>
     T drive(std::pmr::memory_resource* resource,
             actor_zeta::unique_future<T> future,

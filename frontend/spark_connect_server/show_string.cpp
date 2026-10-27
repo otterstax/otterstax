@@ -5,6 +5,7 @@
 
 #include "frontend/common/resultset_utils.hpp"
 #include "utility/tracy_profiler.hpp"
+#include "utility/pmr_text.hpp"
 
 #include <core/date/date_to_string.hpp>
 
@@ -31,12 +32,7 @@ namespace frontend::spark {
 
         int32_t shown_rows(int32_t requested) { return std::clamp(requested, int32_t{0}, max_shown_rows); }
 
-        template<typename Integer>
-        void append_integer(std::pmr::string& out, Integer value) {
-            char buffer[24];
-            const auto written = std::to_chars(buffer, buffer + sizeof(buffer), value);
-            out.append(buffer, written.ptr);
-        }
+        using otterstax::append_number;
 
         // One character of UTF-8 text: its code point and its length in bytes. A
         // byte that does not start a well-formed sequence is a character of its own.
@@ -236,7 +232,7 @@ namespace frontend::spark {
                 out.push_back('0');
             }
             out.push_back('E');
-            append_integer(out, exponent);
+            append_number(out, exponent);
         }
 
         // Spark's ToPrettyString of the cell at `row` of column `column`: NULL for a
@@ -259,33 +255,36 @@ namespace frontend::spark {
                     out.append(vector.get_value<bool>(row) ? "true" : "false");
                     break;
                 case ct::logical_type::TINYINT:
-                    append_integer(out, vector.get_value<int8_t>(row));
+                    append_number(out, vector.get_value<int8_t>(row));
                     break;
                 case ct::logical_type::UTINYINT:
-                    append_integer(out, vector.get_value<uint8_t>(row));
+                    append_number(out, vector.get_value<uint8_t>(row));
                     break;
                 case ct::logical_type::SMALLINT:
-                    append_integer(out, vector.get_value<int16_t>(row));
+                    append_number(out, vector.get_value<int16_t>(row));
                     break;
                 case ct::logical_type::USMALLINT:
-                    append_integer(out, vector.get_value<uint16_t>(row));
+                    append_number(out, vector.get_value<uint16_t>(row));
                     break;
                 case ct::logical_type::INTEGER:
-                    append_integer(out, vector.get_value<int32_t>(row));
+                    append_number(out, vector.get_value<int32_t>(row));
                     break;
                 case ct::logical_type::UINTEGER:
-                    append_integer(out, vector.get_value<uint32_t>(row));
+                    append_number(out, vector.get_value<uint32_t>(row));
                     break;
                 case ct::logical_type::BIGINT:
-                    append_integer(out, vector.get_value<int64_t>(row));
+                    append_number(out, vector.get_value<int64_t>(row));
                     break;
                 case ct::logical_type::UBIGINT:
-                    append_integer(out, vector.get_value<uint64_t>(row));
+                    append_number(out, vector.get_value<uint64_t>(row));
                     break;
                 case ct::logical_type::HUGEINT:
                 case ct::logical_type::DECIMAL:
                     // Decimal.toPlainString: the digits with the point where the scale puts it.
-                    out.append(decimal_to_text(chunk, column, row));
+                {
+                    decimal_text_t text;
+                    out.append(decimal_to_text(chunk, column, row, text));
+                }
                     break;
                 case ct::logical_type::FLOAT:
                     append_java_floating(out, vector.get_value<float>(row));
@@ -313,7 +312,7 @@ namespace frontend::spark {
                     std::pmr::string message{"df.show(): column '", resource};
                     message.append(name);
                     message.append("' has a type show() cannot render (logical type ");
-                    append_integer(message, static_cast<unsigned>(vector.type().type()));
+                    append_number(message, static_cast<unsigned>(vector.type().type()));
                     message.push_back(')');
                     return core::error_t{core::error_code_t::conversion_failure, std::move(message)};
                 }
@@ -353,6 +352,11 @@ namespace frontend::spark {
         // the shown ones — that row only tells whether more exist. A result without
         // columns has no rows: its chunks carry an affected count, not rows.
         std::pmr::vector<std::pmr::string> cells(resource);
+        size_t available = 0; // reserve by the rows there are, not the count the client asked for
+        for (const auto& chunk : chunks) {
+            available += chunk.size();
+        }
+        cells.reserve(column_count * (std::min(rows_shown + 1, available) + 1)); // header, rows, one past
         for (size_t c = 0; c < column_count; ++c) {
             std::pmr::string header{resource};
             if (named_schema && schema.child_types()[c].has_alias()) {
@@ -361,7 +365,7 @@ namespace frontend::spark {
                 append_escaped(header, chunks.front().data[c].type().alias());
             } else {
                 header.append("col");
-                append_integer(header, c);
+                append_number(header, c);
             }
             cells.push_back(std::move(header));
         }
@@ -379,14 +383,17 @@ namespace frontend::spark {
                         core::error_code_t::conversion_failure,
                         std::pmr::string{"df.show(): the chunks of the result do not hold the same columns", resource}};
                 }
+                // One scratch for every cell's raw text; only the escaped cell is kept.
+                std::pmr::string value{resource};
                 for (uint64_t row = 0; row < chunk.size() && data_rows <= rows_shown; ++row, ++data_rows) {
                     for (size_t c = 0; c < column_count; ++c) {
-                        std::pmr::string value{resource};
+                        value.clear();
                         if (auto error = append_cell(value, chunk, c, row, cells[c], resource);
                             error.contains_error()) {
                             return error;
                         }
                         std::pmr::string cell{resource};
+                        cell.reserve(value.size());
                         append_escaped(cell, value);
                         truncate_cell(cell, truncate);
                         cells.push_back(std::move(cell));
@@ -456,7 +463,7 @@ namespace frontend::spark {
             const size_t record_width = name_width + data_width + 5;
             for (size_t r = 1; r <= shown; ++r) {
                 std::pmr::string record{"-RECORD ", resource};
-                append_integer(record, r - 1);
+                append_number(record, r - 1);
                 out.append(record);
                 if (record.size() < record_width) {
                     out.append(record_width - record.size(), '-');
@@ -484,7 +491,7 @@ namespace frontend::spark {
             out.append("(0 rows)");
         } else if (has_more_data) {
             out.append("only showing top ");
-            append_integer(out, rows_shown);
+            append_number(out, rows_shown);
             out.append(rows_shown == 1 ? " row" : " rows");
         }
         return out;

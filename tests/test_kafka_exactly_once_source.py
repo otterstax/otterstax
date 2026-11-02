@@ -6,7 +6,7 @@
 Like test_kafka_source_ingestion.py, but the source is declared with
 ``TRANSACTIONAL=true``: the poller commits each batch's rows AND its offset
 advance in ONE engine transaction (BEGIN -> insert(data) -> upsert(offsets) ->
-COMMIT), with the ``kafka.<source>__offsets`` table as the source of truth.
+COMMIT), with the ``federation.kafka.<source>__offsets`` table as the source of truth.
 
 This is the happy-path verification: it proves the live transactional loop runs
 end to end against a real broker (redpanda) + engine — the batch lands exactly
@@ -96,7 +96,7 @@ class ExactlyOnceSourceTest:
         self.create_topic(self.topic)
         self.produce_records(self.topic, self.records)
         self.conn = psycopg.connect(host=self.host, port=PG_PORT, user="testuser",
-                                    password="testpass", dbname="kafka", autocommit=True)
+                                    password="testpass", dbname="main", autocommit=True)
         # Don't let psycopg server-prepare the poll query: while the table is still
         # empty the engine returns a schemaless result (Describe -> NoData), and a
         # prepared statement would cache that and never see the rows once they land.
@@ -150,7 +150,7 @@ class ExactlyOnceSourceTest:
         with self.conn.cursor() as cur:
             cur.execute(
                 f"SELECT partition_id, MAX(committed_offset) "
-                f"FROM kafka.{self.source}__offsets GROUP BY partition_id;")
+                f"FROM federation.kafka.{self.source}__offsets GROUP BY partition_id;")
             offset_rows = cur.fetchall() if cur.description is not None else []
         offsets = {p: o for p, o in offset_rows}
         if offsets.get(0) != NUM_RECORDS:

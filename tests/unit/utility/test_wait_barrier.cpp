@@ -73,11 +73,11 @@ TEST_CASE("make_failed_future: reports the error without touching an io_context"
     // failed reconnect): a ready future carrying the error, so the function has one
     // single way to report a failure instead of a throw plus a value.
     auto fut = otterstax::make_failed_future<std::unique_ptr<std::string>>(
-        core::error_t(core::error_code_t::do_not_exists, std::pmr::string{"no such connection", resource}));
+        core::error_t(core::error_code_t::undefined_object, std::pmr::string{"no such connection", resource}));
 
     auto outcome = fut.get();
     REQUIRE(outcome.has_error());
-    REQUIRE(outcome.error().type == core::error_code_t::do_not_exists);
+    REQUIRE(outcome.error().type == core::error_code_t::undefined_object);
 }
 
 TEST_CASE("make_failed_future: error-only handlers collapse to a bare core::error_t") {
@@ -107,9 +107,9 @@ TEST_CASE("as_query_result: shapes a handler's return into the marshaled outcome
     REQUIRE_FALSE(clean.contains_error());
 
     auto failed = otterstax::as_query_result<otterstax::asio_error_t>(
-        otterstax::asio_error_t{core::error_t(core::error_code_t::schema_error, std::pmr::string{"bad", resource})});
+        otterstax::asio_error_t{core::error_t(core::error_code_t::protocol_violation, std::pmr::string{"bad", resource})});
     REQUIRE(failed.contains_error());
-    REQUIRE(failed.type == core::error_code_t::schema_error);
+    REQUIRE(failed.type == core::error_code_t::protocol_violation);
 }
 
 TEST_CASE("spawn_marshaled: a value produced on the io thread arrives through the future") {
@@ -127,7 +127,7 @@ TEST_CASE("spawn_marshaled: a value produced on the io thread arrives through th
 
 TEST_CASE("spawn_marshaled: accepts an executor and runs the awaitable on it") {
     // The first argument is an executor or an execution context, whatever
-    // co_spawn takes: the ConnectorManagers pass their io_context, the MySQL
+    // co_spawn takes: a backend agent passes its io_context, the MySQL
     // connector passes its connection's strand so every completion of the
     // connect — the operation's and its deadline timer's — is serialized.
     auto* resource = std::pmr::new_delete_resource();

@@ -8,7 +8,6 @@
 #include <actor-zeta.hpp>
 #include <components/cursor/cursor.hpp>
 #include <components/logical_plan/execution_plan.hpp>
-#include <components/logical_plan/node_aggregate.hpp>
 #include <components/logical_plan/param_storage.hpp>
 #include <components/session/session.hpp>
 #include <components/vector/data_chunk.hpp>
@@ -48,18 +47,36 @@ namespace otterstax::kafka::detail {
                                const std::pmr::vector<components::vector::data_chunk_t>& chunks,
                                const std::vector<kafka_column_t>& declared);
 
-    // A STREAM's output schema = its SELECT's projection applied to `source_columns`
-    // (no data — the engine drops the schema of a projection over an empty result)
-    std::vector<kafka_column_t> stream_output_schema(std::pmr::memory_resource* resource,
-                                                     const components::logical_plan::node_aggregate_t& agg,
-                                                     components::logical_plan::parameter_node_t* params,
-                                                     const std::vector<kafka_column_t>& source_columns);
+    // The plan a STREAM runs over one batch: `rows` under an empty-named
+    // aggregate, then the SELECT's operators re-homed onto them
+    // (kafka_stream_source) — aggregate(empty) + [raw_data(rows), <operators>]
+    components::logical_plan::execution_plan_t
+    stream_batch_plan(std::pmr::memory_resource* resource,
+                      components::vector::data_chunk_t rows,
+                      const std::vector<components::logical_plan::node_ptr>& operators,
+                      const components::logical_plan::parameter_node_ptr& params);
 
-    // INSERT `chunk` into kafka.<relname> (node_insert + catalog_resolve_table wrap)
+    // The engine's describe (explain_type::describe: analyzed, nothing run) of the
+    // batch plan over no rows of `source_columns`: its reply names the columns the
+    // STREAM produces, typed as the engine types them
+    actor_zeta::unique_future<components::cursor::cursor_t_ptr>
+    describe_stream(actor_zeta::address_t dispatcher_address,
+                    std::pmr::memory_resource* resource,
+                    const std::vector<kafka_column_t>& source_columns,
+                    const std::vector<components::logical_plan::node_ptr>& operators,
+                    const components::logical_plan::parameter_node_ptr& params);
+
+    // The result columns of a described statement (describe_stream, a describe of
+    // a SELECT): name = the column's alias, empty for an unnamed one; the engine's
+    // error when it refused the statement
+    core::result_wrapper_t<std::vector<kafka_column_t>>
+    described_columns(std::pmr::memory_resource* resource, const components::cursor::cursor_t_ptr& described);
+
+    // INSERT `chunk` into `target` (node_insert named on its target + the write
+    // target's table resolve) on a fresh (autocommit) session
     actor_zeta::unique_future<components::cursor::cursor_t_ptr> kafka_insert(actor_zeta::address_t dispatcher_address,
                                                                              std::pmr::memory_resource* resource,
-                                                                             const std::string& database,
-                                                                             const std::string& relname,
+                                                                             const qualified_name_t& target,
                                                                              components::vector::data_chunk_t chunk);
 
     // kafka_insert on an explicit session (joins the caller's open transaction)
@@ -67,27 +84,24 @@ namespace otterstax::kafka::detail {
     kafka_insert_session(actor_zeta::address_t dispatcher_address,
                          std::pmr::memory_resource* resource,
                          components::session::session_id_t session,
-                         const std::string& database,
-                         const std::string& relname,
+                         const qualified_name_t& target,
                          components::vector::data_chunk_t chunk);
 
-    // DELETE rows of db.<relname> where STRING `column` == `value`, as the plan
+    // DELETE rows of `target` where STRING `column` == `value`, as the plan
     // shape the SQL transformer emits for a DELETE (node_delete over node_match,
     // resolve-wrapped); `value` is bound as a parameter, never spliced into SQL
     actor_zeta::unique_future<components::cursor::cursor_t_ptr>
     kafka_delete_where_eq(actor_zeta::address_t dispatcher_address,
                           std::pmr::memory_resource* resource,
-                          const std::string& database,
-                          const std::string& relname,
+                          const qualified_name_t& target,
                           const std::string& column,
                           const std::string& value);
 
-    // Append one row per (partition, offset) to the offsets table
+    // Append one row per (partition, offset) to the offsets table `offsets_table`
     actor_zeta::unique_future<components::cursor::cursor_t_ptr>
     write_offsets(actor_zeta::address_t dispatcher_address,
                   std::pmr::memory_resource* resource,
-                  const std::string& database,
-                  const std::string& offsets_relname,
+                  const qualified_name_t& offsets_table,
                   const std::map<int32_t, int64_t>& offsets);
 
     // write_offsets on an explicit session (atomic with the data insert)
@@ -95,8 +109,7 @@ namespace otterstax::kafka::detail {
     write_offsets_session(actor_zeta::address_t dispatcher_address,
                           std::pmr::memory_resource* resource,
                           components::session::session_id_t session,
-                          const std::string& database,
-                          const std::string& offsets_relname,
+                          const qualified_name_t& offsets_table,
                           const std::map<int32_t, int64_t>& offsets);
 
     // Highest offset per partition from a (partition_id, committed_offset) result

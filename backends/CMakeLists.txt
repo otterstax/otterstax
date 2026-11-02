@@ -1,9 +1,9 @@
 # The backend module of the process (runtime_t -> remote_backends_t ->
-# engine_t, every module owned by main.cpp): remote_backends_t (connector
-# managers, the MySQL / PostgreSQL / ClickHouse backends, the startup discovery
-# and the federation registry, before the engine opens) and two startup steps
-# after it opens (backends.hpp): the s3 aliases stored in the s3 connector and
-# the federation metadata written into the engine.
+# engine_t, every module owned by main.cpp): remote_backends_t (a backend actor
+# per MySQL / PostgreSQL / ClickHouse connection over its agents, the startup
+# discovery, before the engine opens) and two startup steps after it
+# opens (backends.hpp): the s3 aliases stored in the s3 connector and the
+# discovered tables registered in the engine's catalog.
 set(BACKENDS_HEADERS
     backends.hpp
     connection_retry.hpp

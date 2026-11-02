@@ -10,6 +10,7 @@
 // packets of the text resultset.
 
 #include "frontend/mysql_server/packet/packet_reader.hpp"
+#include "frontend/mysql_server/packet/packet_utils.hpp"
 #include "frontend/mysql_server/protocol/lexer.hpp"
 #include "frontend/mysql_server/protocol/protocol_statement.hpp"
 #include "frontend/mysql_server/protocol_const.hpp"
@@ -232,8 +233,11 @@ TEST_CASE("mysql protocol: a ? makes a protocol statement only in a prepared tex
     CHECK_FALSE(classify_protocol_statement("SET @@session.autocommit = ?").has_value());
     auto prepared = classify_protocol_statement("SET @@session.autocommit = ?", true);
     REQUIRE(prepared.has_value());
-    CHECK(std::holds_alternative<set_variables_t>(*prepared));
-    // SET NAMES ... COLLATE is the frontend's, whatever the collation.
+    REQUIRE(std::holds_alternative<set_variables_t>(*prepared));
+    // The engine's SET takes a string constant: a parameter is refused.
+    REQUIRE(std::get<set_variables_t>(*prepared).refusal.has_value());
+    CHECK(std::get<set_variables_t>(*prepared).refusal->code == mysql_error::ER_NOT_SUPPORTED_YET);
+    // SET NAMES ... COLLATE is the frontend's to translate, whatever the collation.
     CHECK(classify_protocol_statement("SET NAMES 'utf8mb4' COLLATE 'utf8mb4_0900_ai_ci'").has_value());
 }
 
@@ -432,37 +436,157 @@ TEST_CASE("mysql protocol: anything but variables and aliases goes to the sessio
 }
 
 TEST_CASE("mysql protocol: SET NAMES SET CHARACTER SET and the MySQL SET forms") {
-    auto names = [](const char* sql) {
+    // Every assignment as the engine's own statement, in order.
+    auto engine = [](const char* sql) {
         auto statement = classify_protocol_statement(sql);
         INFO(sql);
         REQUIRE(statement.has_value());
-        REQUIRE(std::holds_alternative<set_names_t>(*statement));
-        return std::get<set_names_t>(*statement).charset;
+        REQUIRE(std::holds_alternative<set_variables_t>(*statement));
+        const auto& set = std::get<set_variables_t>(*statement);
+        REQUIRE_FALSE(set.refusal.has_value());
+        std::vector<std::string> statements;
+        for (const auto& setting : set.settings) {
+            statements.push_back(engine_setting_statement(setting));
+        }
+        return statements;
     };
-    CHECK(names("SET NAMES utf8mb4") == "utf8mb4");
-    CHECK(names("SET NAMES 'utf8mb4' COLLATE 'utf8mb4_0900_ai_ci'") == "utf8mb4");
-    CHECK(names("set names UTF8 ;") == "utf8");
-    CHECK(names("SET NAMES latin1") == "latin1");
-    CHECK(names("SET NAMES DEFAULT") == "utf8mb4");
-    CHECK(names("SET CHARACTER SET utf8mb4") == "utf8mb4");
-    CHECK(names("SET CHARSET 'utf8'") == "utf8");
-
-    for (const char* sql : {"SET @@session.autocommit = OFF",
-                            "SET autocommit=0",
-                            "SET AUTOCOMMIT = 0",
-                            "SET SESSION time_zone='+00:00'",
-                            "SET @@session.sql_mode = 'ANSI_QUOTES'",
-                            "SET GLOBAL x = 1, SESSION y = concat(@@sql_mode, ',STRICT_TRANS_TABLES')",
+    using statements_t = std::vector<std::string>;
+    // The protocol's character sets are the frontend's: a utf-8 one is
+    // accepted with nothing for the engine.
+    for (const char* sql : {"SET NAMES utf8mb4",
+                            "SET NAMES utf8mb4 COLLATE utf8mb4_general_ci",
+                            "SET NAMES 'utf8mb4' COLLATE 'utf8mb4_0900_ai_ci'",
+                            "set names UTF8 ;",
+                            "SET NAMES utf8mb3 COLLATE utf8_general_ci",
+                            "SET NAMES DEFAULT",
+                            "SET CHARACTER SET utf8mb4",
+                            "SET CHARSET 'utf8'",
                             "SET character_set_results = NULL",
-                            "SET sql_select_limit=DEFAULT",
-                            "SET x := 5",
-                            "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED",
-                            "SET TRANSACTION READ ONLY"}) {
+                            "SET character_set_client = utf8mb4, character_set_connection = 'utf8mb4'",
+                            "SET @@session.character_set_results = DEFAULT"}) {
+        CHECK(engine(sql).empty());
+    }
+    CHECK(engine("SET character_set_results = NULL, autocommit = 0") == statements_t{"SET autocommit = 'off'"});
+
+    for (const char* sql : {"SET @@session.autocommit = OFF", "SET autocommit=0", "SET AUTOCOMMIT = 0", "set autocommit = false"}) {
+        CHECK(engine(sql) == statements_t{"SET autocommit = 'off'"});
+    }
+    CHECK(engine("SET autocommit = 1") == statements_t{"SET autocommit = 'on'"});
+    CHECK(engine("SET SESSION time_zone='+00:00'") == statements_t{"SET timezone = '+00:00'"});
+    CHECK(engine("SET time_zone = 'SYSTEM'") == statements_t{"RESET timezone"});
+    CHECK(engine("SET @@session.sql_mode = 'ANSI_QUOTES'") == statements_t{"SET sql_mode = 'ANSI_QUOTES'"});
+    CHECK(engine("SET sql_select_limit=DEFAULT") == statements_t{"RESET sql_select_limit"});
+    CHECK(engine("SET x := 5") == statements_t{"SET x = '5'"});
+    CHECK(engine("SET x = -5") == statements_t{"SET x = '-5'"});
+    CHECK(engine("SET x = 'it''s'") == statements_t{"SET x = 'it''s'"});
+    CHECK(engine("SET SESSION time_zone = 'UTC', @@local.x = DEFAULT, autocommit = ON") ==
+          statements_t{"SET timezone = 'UTC'", "RESET x", "SET autocommit = 'on'"});
+
+    // A setting of the whole server is refused whole: no assignment of the
+    // statement is sent, a session part beside it included.
+    for (const char* sql : {"SET GLOBAL time_zone = 'UTC'",
+                            "set global autocommit = 0",
+                            "SET @@global.sql_mode = 'ANSI_QUOTES'",
+                            "SET @@GLOBAL.max_connections = 10",
+                            "SET PERSIST time_zone = 'UTC'",
+                            "SET PERSIST_ONLY x = 1",
+                            "SET @@persist.x = DEFAULT",
+                            "SET @@persist_only.x = 1",
+                            "SET autocommit = 1, GLOBAL time_zone = 'UTC'",
+                            "SET time_zone = 'UTC', @@global.x = concat('a', 'b')",
+                            "SET GLOBAL TRANSACTION ISOLATION LEVEL READ COMMITTED",
+                            "RESET PERSIST",
+                            "RESET PERSIST x",
+                            "reset persist if exists x;"}) {
         INFO(sql);
         auto statement = classify_protocol_statement(sql);
         REQUIRE(statement.has_value());
-        CHECK(std::holds_alternative<set_variables_t>(*statement));
+        REQUIRE(std::holds_alternative<set_variables_t>(*statement));
+        const auto& set = std::get<set_variables_t>(*statement);
+        CHECK(set.settings.empty());
+        REQUIRE(set.refusal.has_value());
+        CHECK(set.refusal->code == mysql_error::ER_NOT_SUPPORTED_YET);
+        CHECK(set.refusal->message == "server-wide settings are not changed by a client");
     }
+
+    // A value the engine's SET cannot take is the frontend's refusal.
+    auto expression = classify_protocol_statement("SET x = 1, SESSION y = concat(@@sql_mode, ',STRICT_TRANS_TABLES')");
+    REQUIRE(expression.has_value());
+    REQUIRE(std::holds_alternative<set_variables_t>(*expression));
+    REQUIRE(std::get<set_variables_t>(*expression).refusal.has_value());
+    CHECK(std::get<set_variables_t>(*expression).refusal->code == mysql_error::ER_NOT_SUPPORTED_YET);
+
+    // SET TRANSACTION and a user variable are no setting: the engine reads them.
+    for (const char* sql : {"SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED", "SET TRANSACTION READ ONLY", "SET @x = 1"}) {
+        INFO(sql);
+        CHECK_FALSE(classify_protocol_statement(sql).has_value());
+    }
+}
+
+
+// A character set the wire does not carry refuses the whole statement before
+// anything of it runs; so does a collation of another character set and, in
+// the HandshakeResponse, a collation id of another character set.
+TEST_CASE("mysql protocol: a character set other than utf-8 is refused") {
+    struct refusal_case_t {
+        const char* sql;
+        mysql_error code;
+        const char* message;
+    };
+    for (const auto& [sql, code, message] : {
+             refusal_case_t{"SET NAMES latin1",
+                            mysql_error::ER_NOT_SUPPORTED_YET,
+                            "character set 'latin1' is not supported: OtterStax reads and sends utf8mb4 only"},
+             refusal_case_t{"SET CHARACTER SET latin1",
+                            mysql_error::ER_NOT_SUPPORTED_YET,
+                            "character set 'latin1' is not supported: OtterStax reads and sends utf8mb4 only"},
+             refusal_case_t{"SET NAMES utf8mb4 COLLATE latin1_swedish_ci",
+                            mysql_error::ER_COLLATION_CHARSET_MISMATCH,
+                            "COLLATION 'latin1_swedish_ci' is not valid for CHARACTER SET 'utf8mb4'"},
+             refusal_case_t{"SET NAMES utf8 COLLATE utf8mb4_bin",
+                            mysql_error::ER_COLLATION_CHARSET_MISMATCH,
+                            "COLLATION 'utf8mb4_bin' is not valid for CHARACTER SET 'utf8'"},
+             refusal_case_t{"SET autocommit = 0, character_set_client = latin1",
+                            mysql_error::ER_NOT_SUPPORTED_YET,
+                            "character set 'latin1' is not supported: OtterStax reads and sends utf8mb4 only"},
+             refusal_case_t{"SET character_set_connection = NULL",
+                            mysql_error::ER_NOT_SUPPORTED_YET,
+                            "character set 'null' is not supported: OtterStax reads and sends utf8mb4 only"},
+         }) {
+        INFO(sql);
+        auto statement = classify_protocol_statement(sql);
+        REQUIRE(statement.has_value());
+        REQUIRE(std::holds_alternative<set_variables_t>(*statement));
+        const auto& set = std::get<set_variables_t>(*statement);
+        REQUIRE(set.refusal.has_value());
+        CHECK(set.refusal->code == code);
+        CHECK(set.refusal->message == message);
+    }
+
+    for (uint8_t id : {uint8_t{33}, uint8_t{45}, uint8_t{46}, uint8_t{83}, uint8_t{192}, uint8_t{224}, uint8_t{255}}) {
+        INFO(int{id});
+        CHECK_FALSE(handshake_charset_refusal(id).has_value());
+    }
+    for (uint8_t id : {uint8_t{0}, uint8_t{8}, uint8_t{63}, uint8_t{248}}) {
+        INFO(int{id});
+        auto refusal = handshake_charset_refusal(id);
+        REQUIRE(refusal.has_value());
+        CHECK(refusal->code == mysql_error::ER_NOT_SUPPORTED_YET);
+    }
+}
+TEST_CASE("mysql protocol: USE is the session's place") {
+    auto use = [](const char* sql) {
+        auto statement = classify_protocol_statement(sql);
+        INFO(sql);
+        REQUIRE(statement.has_value());
+        REQUIRE(std::holds_alternative<use_database_t>(*statement));
+        return engine_search_path_statement(std::get<use_database_t>(*statement).database);
+    };
+    CHECK(use("USE shop") == "SET search_path = 'shop.public'");
+    CHECK(use("use `Shop`;") == "SET search_path = 'Shop.public'");
+    CHECK(use("USE pg.shop") == "SET search_path = 'pg.shop.public'");
+    CHECK_FALSE(classify_protocol_statement("USE a.b.c").has_value());
+    CHECK_FALSE(classify_protocol_statement("USE").has_value());
 }
 
 TEST_CASE("mysql protocol: SHOW VARIABLES and SHOW WARNINGS are recognised") {
@@ -530,7 +654,7 @@ TEST_CASE("mysql protocol: the session functions and LIMIT 0") {
     auto* resource = std::pmr::new_delete_resource();
     auto functions = over_the_wire(answer_rows(resource, "SELECT DATABASE(), USER(), CURRENT_USER, CONNECTION_ID()"));
     REQUIRE(functions.rows.size() == 1);
-    CHECK_FALSE(functions.rows[0][0].has_value()); // no default database is in effect
+    CHECK_FALSE(functions.rows[0][0].has_value()); // no USE yet
     CHECK(functions.rows[0][1] == "alice@10.0.0.5");
     CHECK(functions.rows[0][2] == "alice@%");
     CHECK(functions.rows[0][3] == "7");
@@ -585,17 +709,73 @@ TEST_CASE("mysql protocol: SHOW WARNINGS is the empty list") {
     CHECK(warnings.rows.empty());
 }
 
-TEST_CASE("mysql protocol: SET NAMES takes utf-8 only") {
+TEST_CASE("mysql protocol: @@autocommit, @@time_zone and DATABASE() answer what the engine accepted") {
     auto* resource = std::pmr::new_delete_resource();
-    for (const char* sql : {"SET NAMES utf8mb4", "SET NAMES utf8mb3", "SET NAMES utf8", "SET CHARACTER SET utf8mb4"}) {
-        INFO(sql);
-        auto statement = classify_protocol_statement(sql);
-        REQUIRE(statement.has_value());
-        CHECK(std::holds_alternative<std::monostate>(answer_protocol_statement(resource, *statement, context())));
+    auto set = context();
+    set.autocommit = false;
+    set.time_zone = "+03:00";
+    set.database = "shop";
+    auto statement = classify_protocol_statement("SELECT @@autocommit, @@session.time_zone, DATABASE()");
+    REQUIRE(statement.has_value());
+    auto answer = answer_protocol_statement(resource, *statement, set);
+    REQUIRE(std::holds_alternative<components::vector::data_chunk_t>(answer));
+    auto wire = over_the_wire(std::get<components::vector::data_chunk_t>(answer));
+    REQUIRE(wire.rows.size() == 1);
+    CHECK(wire.rows[0][0] == "0");
+    CHECK(wire.rows[0][1] == "+03:00");
+    CHECK(wire.rows[0][2] == "shop");
+}
+
+// The SQLSTATE of every errno the frontend sends is MySQL 8.4's own
+// (share/messages_to_clients.txt; an errno without one is HY000): a client
+// that classifies by SQLSTATE (JDBC's SQLSyntaxErrorException for 42000,
+// SQLNonTransientConnectionException for 08S01) reads what MySQL would make it.
+TEST_CASE("mysql protocol: an ERR packet carries MySQL's SQLSTATE of its errno") {
+    struct state_case_t {
+        mysql_error code;
+        const char* state;
+    };
+    for (const auto& [code, state] : {state_case_t{mysql_error::ER_CON_COUNT_ERROR, "08004"},
+                                      state_case_t{mysql_error::ER_OUT_OF_RESOURCES, "HY000"},
+                                      state_case_t{mysql_error::ER_HANDSHAKE_ERROR, "08S01"},
+                                      state_case_t{mysql_error::ER_DBACCESS_DENIED_ERROR, "42000"},
+                                      state_case_t{mysql_error::ER_ACCESS_DENIED_ERROR, "28000"},
+                                      state_case_t{mysql_error::ER_UNKNOWN_COM_ERROR, "08S01"},
+                                      state_case_t{mysql_error::ER_BAD_DB_ERROR, "42000"},
+                                      state_case_t{mysql_error::ER_DB_CREATE_EXISTS, "HY000"},
+                                      state_case_t{mysql_error::ER_DB_DROP_EXISTS, "HY000"},
+                                      state_case_t{mysql_error::ER_TABLE_EXISTS_ERROR, "42S01"},
+                                      state_case_t{mysql_error::ER_PARSE_ERROR, "42000"},
+                                      state_case_t{mysql_error::ER_EMPTY_QUERY, "42000"},
+                                      state_case_t{mysql_error::ER_UNKNOWN_ERROR, "HY000"},
+                                      state_case_t{mysql_error::ER_UNKNOWN_TABLE, "42S02"},
+                                      state_case_t{mysql_error::ER_WRONG_VALUE_COUNT_ON_ROW, "21S01"},
+                                      state_case_t{mysql_error::ER_TABLEACCESS_DENIED_ERROR, "42000"},
+                                      state_case_t{mysql_error::ER_NO_SUCH_TABLE, "42S02"},
+                                      state_case_t{mysql_error::ER_SYNTAX_ERROR, "42000"},
+                                      state_case_t{mysql_error::ER_PACKET_TOO_LARGE, "08S01"},
+                                      state_case_t{mysql_error::ER_NET_READ_ERROR, "08S01"},
+                                      state_case_t{mysql_error::ER_UNKNOWN_SYSTEM_VARIABLE, "HY000"},
+                                      state_case_t{mysql_error::ER_NOT_SUPPORTED_YET, "42000"},
+                                      state_case_t{mysql_error::ER_UNKNOWN_STMT_HANDLER, "HY000"},
+                                      state_case_t{mysql_error::ER_NOT_SUPPORTED_AUTH_MODE, "08004"},
+                                      state_case_t{mysql_error::ER_COLLATION_CHARSET_MISMATCH, "42000"},
+                                      state_case_t{mysql_error::ER_MALFORMED_PACKET, "HY000"},
+                                      state_case_t{mysql_error::ER_SEQUENCE_ERROR, "HY000"},
+                                      state_case_t{mysql_error::ER_QUERY_TIMEOUT, "HY000"},
+                                      state_case_t{mysql_error::ER_PROTOCOL_ERROR, "HY000"}}) {
+        INFO(static_cast<int>(code));
+        packet_writer w;
+        const auto packet = build_error(w, 1, code, "m");
+        packet_reader r(packet);
+        r.skip_bytes(4);
+        REQUIRE(r.read_uint8() == 0xFF);
+        CHECK(r.read_uint16() == static_cast<uint16_t>(code));
+        REQUIRE(r.read_uint8() == '#');
+        std::string sqlstate;
+        for (int i = 0; i < 5; ++i) {
+            sqlstate.push_back(static_cast<char>(r.read_uint8()));
+        }
+        CHECK(sqlstate == state);
     }
-    auto latin = classify_protocol_statement("SET NAMES latin1");
-    REQUIRE(latin.has_value());
-    auto refused = answer_protocol_statement(resource, *latin, context());
-    REQUIRE(std::holds_alternative<protocol_refusal_t>(refused));
-    CHECK(std::get<protocol_refusal_t>(refused).code == mysql_error::ER_HANDSHAKE_ERROR);
 }

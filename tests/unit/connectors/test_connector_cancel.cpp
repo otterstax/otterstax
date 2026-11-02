@@ -13,6 +13,7 @@
 // asserts.
 
 #include "connectors/clickhouse/connector.hpp"
+#include "connectors/mysql/connector.hpp"
 #include "connectors/postgresql/connector.hpp"
 #include "utility/thread_pool_manager.hpp"
 #include "utility/wait_barrier.hpp"
@@ -350,4 +351,37 @@ TEST_CASE("ch Connector: cancel() aborts a statement the server never answers") 
 
     connector.reset();
     pool.stop();
+}
+
+// A MySQL server that accepts the TCP connection (the kernel's backlog: nobody accepts it) and never
+// sends its greeting: each connect attempt waits for its 10 s deadline, a reconnect makes three. The
+// backend agent's cancel() at shutdown must end the (re)connect at once, as it ends a statement.
+TEST_CASE("mysql Connector: cancel() ends a connect the server never answers, and its retries") {
+    asio::io_context listener_io;
+    tcp::acceptor silent(listener_io, tcp::endpoint(asio::ip::make_address("127.0.0.1"), 0));
+    silent.listen();
+    const auto port = silent.local_endpoint().port();
+
+    asio::io_context io;
+    boost::mysql::connect_params params;
+    params.server_address.emplace_host_and_port("127.0.0.1", port);
+    params.username = "user";
+    params.password = "pass";
+    params.ssl = boost::mysql::ssl_mode::disable;
+    auto connector = mysql::make_mysql_connector(std::pmr::new_delete_resource(), io, params, "silent");
+
+    auto connected = std::async(std::launch::async, [&connector] { return connector->connect(); });
+    REQUIRE(connected.wait_for(300ms) == std::future_status::timeout);
+    const auto started = std::chrono::steady_clock::now();
+    connector->cancel();
+    REQUIRE(connected.wait_for(8s) == std::future_status::ready);
+    CHECK(std::chrono::steady_clock::now() - started < 5s);
+    const auto outcome = connected.get();
+    REQUIRE(outcome.contains_error());
+    CHECK(outcome.type == core::error_code_t::io_error);
+    // Cancelled for good: a reconnect does not try again.
+    const auto again = std::chrono::steady_clock::now();
+    CHECK(connector->tryReconnect().contains_error());
+    CHECK(std::chrono::steady_clock::now() - again < 1s);
+    connector.reset();
 }

@@ -35,6 +35,8 @@ from flightsql import FlightSQLClient
 import config
 from external_helpers import DATASETS, FILE_FIXTURE_DIR, S3_ALIAS, S3_BUCKET
 
+# A schema of the database `main` (every session's place): `DB.TABLE` names
+# the table on every wire.
 DB = "multichunk_db"
 TABLE = "web_events"
 FIXTURE = next(ds for ds in DATASETS if ds["name"] == TABLE)
@@ -72,6 +74,9 @@ class MultiChunkFrontendTest:
             host=self.host, port=config.MYSQL_PORT,
             user="testuser", password="testpass", autocommit=True)
         cur = self.mysql_conn.cursor()
+        # CREATE EXTERNAL TABLE names its table as CREATE TABLE does: the
+        # schema must exist.
+        cur.execute(f"CREATE SCHEMA IF NOT EXISTS {DB}")
         cur.execute(
             f"CREATE EXTERNAL TABLE {DB}.{TABLE} "
             f"WITH (location = '{FILE_FIXTURE_DIR}/{TABLE}.csv', format = 'csv')")
@@ -93,6 +98,10 @@ class MultiChunkFrontendTest:
                     cur.execute(f"DROP TABLE {db}.{table}")
                 except Exception as e:
                     print(f"cleanup: DROP {db}.{table} failed: {e}")
+            try:
+                cur.execute(f"DROP SCHEMA IF EXISTS {DB}")
+            except Exception as e:
+                print(f"cleanup: DROP SCHEMA {DB} failed: {e}")
             cur.close()
         finally:
             self.mysql_conn.close()
@@ -136,7 +145,7 @@ class MultiChunkFrontendTest:
     def test_pg_simple_protocol_spans_chunks(self):
         """PG simple query: all 5000 rows, not the first chunk."""
         with psycopg.connect(host=self.host, port=config.PG_PORT, user="testuser",
-                             password="testpass", dbname=DB, autocommit=True) as conn:
+                             password="testpass", dbname="main", autocommit=True) as conn:
             conn.prepare_threshold = None
             with conn.cursor() as cur:
                 cur.execute(f"SELECT event_id, campaign_id, value FROM {DB}.{TABLE}")
@@ -149,7 +158,7 @@ class MultiChunkFrontendTest:
     def test_pg_extended_protocol_spans_chunks(self):
         """PG Bind/Execute: same, through the row-limit-aware path."""
         with psycopg.connect(host=self.host, port=config.PG_PORT, user="testuser",
-                             password="testpass", dbname=DB, autocommit=True) as conn:
+                             password="testpass", dbname="main", autocommit=True) as conn:
             conn.prepare_threshold = None
             with conn.cursor() as cur:
                 # A parameter switches psycopg3 to the extended protocol, which

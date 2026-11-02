@@ -16,10 +16,13 @@ PostgreSQL (session/CLAUDE.md, "The engine session and transactions"):
     Parse/Bind/Execute leaves the connection INTRANS, and a driver that runs
     with autocommit off (psycopg opens the block itself) commits and rolls back
     for real;
-  * SAVEPOINT / RELEASE / ROLLBACK TO are refused with 0A000 (otterbrix has no
-    savepoints); inside a block the refusal fails it, outside it fails nothing;
-  * a SET is answered "SET" without effect: inside a block it keeps the block
-    open, and `SET autocommit TO off` changes no connection, its own included.
+  * SAVEPOINT / RELEASE / ROLLBACK TO run in the engine: ROLLBACK TO takes a
+    failed block back to INTRANS and undoes what followed the savepoint;
+    outside a block SAVEPOINT is 25P01, as in PostgreSQL;
+  * a SET runs in the engine and is the connection's own: inside a block it
+    keeps the block open, `SET autocommit TO off` makes that connection's next
+    statement open a block (no other connection is affected), and a parameter
+    the engine does not have is an error.
 
 The C++ counterparts are tests/system/test_frontend_transactions.cpp and
 tests/session/test_session_lifetime.cpp; this file pins the same rules through
@@ -34,19 +37,19 @@ from psycopg import pq
 
 from config import get_host, PG_PORT
 
-DB = "txn_pg_wire"
+SCHEMA = "txn_pg_wire"                 # a schema of the session's database, main
 TABLE = "items"
-QUALIFIED = f"{DB}.{TABLE}"
+QUALIFIED = f"{SCHEMA}.{TABLE}"
 
 SQLSTATE_IN_FAILED_SQL_TRANSACTION = "25P02"
-SQLSTATE_FEATURE_NOT_SUPPORTED = "0A000"
+SQLSTATE_NO_ACTIVE_SQL_TRANSACTION = "25P01"
 
 
 class PgWireTransactionTest:
     def __init__(self, local=False):
         self.host = get_host(local)
         self.admin = None
-        self.database_created = False
+        self.schema_created = False
         self.table_created = False
 
     # ── helpers ─────────────────────────────────────────────────────────────
@@ -56,7 +59,7 @@ class PgWireTransactionTest:
 
     def connect(self, autocommit=True):
         return psycopg.connect(host=self.host, port=PG_PORT, user="testuser",
-                               password="testpass", dbname=DB, autocommit=autocommit)
+                               password="testpass", dbname="main", autocommit=autocommit)
 
     def ids(self, conn, low, high):
         """The ids in [low, high] the connection sees, sorted."""
@@ -81,8 +84,9 @@ class PgWireTransactionTest:
     def setup(self):
         self.admin = self.connect()
         with self.admin.cursor() as cur:
-            cur.execute(f"CREATE DATABASE {DB}")
-            self.database_created = True
+            cur.execute(f"DROP SCHEMA IF EXISTS {SCHEMA} CASCADE")
+            cur.execute(f"CREATE SCHEMA {SCHEMA}")
+            self.schema_created = True
             cur.execute(f"CREATE TABLE {QUALIFIED} (id bigint, name string)")
             self.table_created = True
 
@@ -93,8 +97,8 @@ class PgWireTransactionTest:
             with self.admin.cursor() as cur:
                 if self.table_created:
                     cur.execute(f"DROP TABLE {QUALIFIED}")
-                if self.database_created:
-                    cur.execute(f"DROP DATABASE {DB}")
+                if self.schema_created:
+                    cur.execute(f"DROP SCHEMA {SCHEMA} CASCADE")
         finally:
             self.admin.close()
 
@@ -149,7 +153,7 @@ class PgWireTransactionTest:
             with a.cursor() as cur:
                 cur.execute("BEGIN")
                 cur.execute(f"INSERT INTO {QUALIFIED} (id, name) VALUES (130, 'lost')")
-                self.expect_error(cur, f"SELECT * FROM {DB}.no_such_table", what="a missing table")
+                self.expect_error(cur, f"SELECT * FROM {SCHEMA}.no_such_table", what="a missing table")
                 self.assert_equal(self.status(a), pq.TransactionStatus.INERROR, "the error failed the block")
                 for sql in (f"SELECT count(*) FROM {QUALIFIED}",
                             f"INSERT INTO {QUALIFIED} (id, name) VALUES (131, 'refused')"):
@@ -204,28 +208,31 @@ class PgWireTransactionTest:
             self.assert_equal(self.ids(b, 160, 169), [160], "rollback() discards the second row")
         print("  psycopg autocommit=False: commit() / rollback() are real ✓")
 
-    def test_savepoint_is_refused_with_0a000(self):
-        """SAVEPOINT / RELEASE / ROLLBACK TO: 0A000; inside a block the refusal fails it, outside it fails nothing."""
-        with self.connect() as a:
+    def test_savepoint_rolls_back_to_its_point(self):
+        """SAVEPOINT / ROLLBACK TO / RELEASE: a failed block is taken back to the savepoint; outside a block 25P01."""
+        with self.connect() as a, self.connect() as b:
             with a.cursor() as cur:
-                for sql in ("SAVEPOINT s1", "RELEASE SAVEPOINT s1", "ROLLBACK TO SAVEPOINT s1"):
-                    self.expect_error(cur, sql, SQLSTATE_FEATURE_NOT_SUPPORTED, "outside a block")
-                    self.assert_equal(self.status(a), pq.TransactionStatus.IDLE, f"{sql} outside a block fails nothing")
-                cur.execute(f"SELECT count(*) FROM {QUALIFIED}")
-                cur.fetchall()
+                self.expect_error(cur, "SAVEPOINT s1", SQLSTATE_NO_ACTIVE_SQL_TRANSACTION, "outside a block")
+                self.assert_equal(self.status(a), pq.TransactionStatus.IDLE, "SAVEPOINT outside a block fails nothing")
 
                 cur.execute("BEGIN")
                 cur.execute(f"INSERT INTO {QUALIFIED} (id, name) VALUES (170, 'before savepoint')")
-                self.expect_error(cur, "SAVEPOINT s1", SQLSTATE_FEATURE_NOT_SUPPORTED, "inside a block")
-                self.assert_equal(self.status(a), pq.TransactionStatus.INERROR, "the refusal fails the block")
-                self.expect_error(cur, f"SELECT count(*) FROM {QUALIFIED}", SQLSTATE_IN_FAILED_SQL_TRANSACTION,
-                                  "after the refused SAVEPOINT")
-                cur.execute("ROLLBACK")
-            self.assert_equal(self.ids(a, 170, 179), [], "the block was rolled back")
-        print("  SAVEPOINT / RELEASE / ROLLBACK TO -> 0A000 ✓")
+                cur.execute("SAVEPOINT s1")
+                self.assert_equal(cur.statusmessage, "SAVEPOINT", "SAVEPOINT tag")
+                cur.execute(f"INSERT INTO {QUALIFIED} (id, name) VALUES (171, 'after savepoint')")
+                self.expect_error(cur, f"SELECT id FROM {SCHEMA}.nowhere", None, "a failing statement")
+                self.assert_equal(self.status(a), pq.TransactionStatus.INERROR, "the error fails the block")
+                cur.execute("ROLLBACK TO SAVEPOINT s1")
+                self.assert_equal(self.status(a), pq.TransactionStatus.INTRANS, "ROLLBACK TO revives the block")
+                self.assert_equal(self.ids(a, 170, 179), [170], "the row after the savepoint is gone")
+                cur.execute("RELEASE SAVEPOINT s1")
+                self.assert_equal(cur.statusmessage, "RELEASE", "RELEASE tag")
+                cur.execute("COMMIT")
+            self.assert_equal(self.ids(b, 170, 179), [170], "COMMIT kept what preceded the savepoint")
+        print("  SAVEPOINT / ROLLBACK TO / RELEASE ✓")
 
     def test_set_inside_a_block_keeps_it_open(self):
-        """A SET inside a block is answered "SET" without effect and the block commits after it."""
+        """A SET inside a block is answered "SET" and the block commits after it."""
         with self.connect() as a, self.connect() as b:
             with a.cursor() as cur:
                 cur.execute("BEGIN")
@@ -238,21 +245,33 @@ class PgWireTransactionTest:
             self.assert_equal(self.ids(b, 180, 189), [180, 181], "both rows committed")
         print("  SET inside a block: block kept ✓")
 
-    def test_set_autocommit_off_changes_no_connection(self):
-        """SET autocommit TO off is answered without effect: this and every other connection stay in autocommit."""
+    def test_set_autocommit_off_is_the_connections_own(self):
+        """SET autocommit TO off: that connection's INSERT opens a block; another connection stays in autocommit."""
         with self.connect() as a, self.connect() as b, self.connect() as c:
             with a.cursor() as cur:
                 cur.execute("SET autocommit TO off")
                 self.assert_equal(cur.statusmessage, "SET", "SET tag")
-                self.assert_equal(self.status(a), pq.TransactionStatus.IDLE, "no block was opened")
+                self.assert_equal(self.status(a), pq.TransactionStatus.IDLE, "the SET itself opens no block")
                 cur.execute(f"INSERT INTO {QUALIFIED} (id, name) VALUES (190, 'a after set')")
+                self.assert_equal(self.status(a), pq.TransactionStatus.INTRANS, "the INSERT opened a block")
             with b.cursor() as cur:
                 cur.execute(f"INSERT INTO {QUALIFIED} (id, name) VALUES (191, 'b')")
-            self.assert_equal(self.ids(c, 190, 199), [190, 191],
-                              "both INSERTs committed on their own, the SET connection's included")
+            self.assert_equal(self.ids(c, 190, 199), [191], "b committed on its own, a did not yet")
             with a.cursor() as cur:
+                cur.execute("COMMIT")
                 cur.execute("SET autocommit TO on")
-        print("  SET autocommit TO off: no effect on any connection ✓")
+            self.assert_equal(self.ids(c, 190, 199), [190, 191], "a's row after its COMMIT")
+        print("  SET autocommit TO off: the connection's own ✓")
+
+    def test_set_of_an_unknown_parameter_is_an_error(self):
+        """A SET of a parameter the engine does not have is refused; outside a block it fails nothing."""
+        with self.connect() as a:
+            with a.cursor() as cur:
+                self.expect_error(cur, "SET no_such_parameter TO 'x'", None, "unknown parameter")
+                self.assert_equal(self.status(a), pq.TransactionStatus.IDLE, "nothing failed outside a block")
+                cur.execute(f"SELECT count(*) FROM {QUALIFIED}")
+                cur.fetchall()
+        print("  SET of an unknown parameter: error ✓")
 
     def run_all_tests(self):
         try:
@@ -264,9 +283,10 @@ class PgWireTransactionTest:
             self.test_commit_of_a_failed_block_is_a_rollback()
             self.test_extended_protocol_begin_leaves_the_connection_intrans()
             self.test_driver_managed_transaction_commits_and_rolls_back()
-            self.test_savepoint_is_refused_with_0a000()
+            self.test_savepoint_rolls_back_to_its_point()
             self.test_set_inside_a_block_keeps_it_open()
-            self.test_set_autocommit_off_changes_no_connection()
+            self.test_set_autocommit_off_is_the_connections_own()
+            self.test_set_of_an_unknown_parameter_is_an_error()
         finally:
             self.cleanup()
 

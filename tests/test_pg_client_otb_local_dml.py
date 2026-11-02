@@ -21,9 +21,7 @@ Three wire shapes are covered:
   * unnamed statement       — parameters, `prepare_threshold = None`
   * named statement         — `execute(..., prepare=True)`: Parse once under a
                               server-side name, then Bind/Execute it again and
-                              again. The session drops a statement after it ran,
-                              so the second Execute goes through re-prepare and
-                              must still report its own count.
+                              again; every Execute must report its own count.
 
 The last case pushes a DML over the engine's 1024-row chunk cap: the affected
 count travels in a payload whose size IS the count, so a 2000-row UPDATE/DELETE
@@ -41,7 +39,7 @@ import psycopg
 
 from config import get_host, PG_PORT
 
-INTERNAL_DB = "otb_local_dml"
+INTERNAL_DB = "otb_local_dml"        # a schema of the session's database, main
 TABLE = "counters"
 
 # Rows for the >1024 case; ids start high so they never collide with the
@@ -65,7 +63,7 @@ class LocalDmlRowCountTest:
 
     def _connect(self):
         return psycopg.connect(host=self.host, port=PG_PORT, user="testuser",
-                               password="testpass", dbname=INTERNAL_DB, autocommit=True)
+                               password="testpass", dbname="main", autocommit=True)
 
     def setup(self):
         self.conn = self._connect()
@@ -73,9 +71,9 @@ class LocalDmlRowCountTest:
         # statement case opens its own connection with server-side prepare on.
         self.conn.prepare_threshold = None
         with self.conn.cursor() as cur:
-            # The database is dropped on cleanup, so a failure here is a real
+            # The schema is dropped on cleanup, so a failure here is a real
             # leak from an earlier run and must surface, not be skipped.
-            cur.execute(f"CREATE DATABASE {INTERNAL_DB}")
+            cur.execute(f"CREATE SCHEMA {INTERNAL_DB}")
             self.database_created = True
             cur.execute(f"CREATE TABLE {INTERNAL_DB}.{TABLE} (id bigint, name string)")
             self.table_created = True
@@ -88,7 +86,7 @@ class LocalDmlRowCountTest:
                 if self.table_created:
                     cur.execute(f"DROP TABLE {INTERNAL_DB}.{TABLE}")
                 if self.database_created:
-                    cur.execute(f"DROP DATABASE {INTERNAL_DB}")
+                    cur.execute(f"DROP SCHEMA {INTERNAL_DB} CASCADE")
         finally:
             self.conn.close()
 
@@ -168,8 +166,7 @@ class LocalDmlRowCountTest:
                 cur.execute(insert, (20, "twenty"), prepare=True)
                 self.assert_equal(cur.rowcount, 1, "named-statement INSERT row count (first Execute)")
                 self.assert_equal(cur.statusmessage, "INSERT 0 1", "named-statement INSERT tag")
-                # Second Execute of the SAME statement name: the session dropped
-                # it after the first run, so this goes through re-prepare.
+                # Second Execute of the SAME statement name.
                 cur.execute(insert, (21, "twenty-one"), prepare=True)
                 self.assert_equal(cur.rowcount, 1, "named-statement INSERT row count (re-executed)")
                 self.assert_equal(cur.statusmessage, "INSERT 0 1", "named-statement INSERT tag (re-executed)")

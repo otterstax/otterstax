@@ -27,9 +27,11 @@ class client:
             'port': 8817,
             'user': 'testuser',
             'password': 'testpass',
-            'dbname': 'campaigns',
+            # The engine database the session is placed in (main.public); an
+            # unknown one is FATAL 3D000. The remote tables are named in full.
+            'dbname': 'main',
         }
-        self.test_database = 'campaigns.db1'
+        self.test_database = 'campaigns.db1.public'
         self.test_table = 'postgresql_test_table'
         self.test_encoding_table = 'postgresql_test_encoding'
 
@@ -178,7 +180,9 @@ class client:
         the stored one while SUM() over the same column is exact — the
         inconsistency test_crud_queries trips over. The connector must read
         the rows over the binary protocol, where the float travels as its four
-        bytes.
+        bytes. The PG wire then writes the float4 as float4out does, the
+        shortest text that reads back as the same float32 ("64647.54"), so the
+        client's double is checked as a float32, not against 64647.5390625.
         """
         table = f"{self.test_database}.{self.test_table}"
         stored = struct.unpack('f', struct.pack('f', 64647.54))[0]
@@ -188,7 +192,11 @@ class client:
             cursor.execute(f"INSERT INTO {table} (_id, campaign_name, campaign_length, budget) VALUES (%s, %s, %s, %s)",
                            (gen_id(100), 'Campaign Float Exact', 1, 64647.54))
             cursor.execute(f"SELECT budget FROM {table} WHERE _id = %s", (gen_id(100),))
-            self.assert_floating_equal(cursor.fetchall()[0][0], stored, msg="FLOAT column read back rounded")
+            got = cursor.fetchall()[0][0]
+            self.assert_equal(struct.unpack('f', struct.pack('f', got))[0], stored,
+                              msg=f"FLOAT column read back as {got!r}, not the stored float32")
+            if abs(got - 64647.5) < 0.01:
+                raise AssertionError(f"FLOAT column read back rounded to six digits: {got!r}")
             cursor.execute(f"DELETE FROM {table} WHERE _id = %s", (gen_id(100),))
 
     def test_remote_dml_row_counts(self):
@@ -199,7 +207,7 @@ class client:
         and the PG frontend must forward it unchanged. Asserted on three wire
         shapes: psycopg2 (simple query), psycopg3 with parameters (unnamed
         statement, Bind/Execute) and `prepare=True` (named statement, Parsed
-        once and Executed repeatedly through re-prepare).
+        once and Executed repeatedly).
         """
         table = f"{self.test_database}.{self.test_table}"
 
@@ -364,13 +372,13 @@ class client:
         except Exception as e:
             raise ValueError(f"Cleanup error {e}")
 
-    def test_backend_error_carries_server_message(self):
-        """A statement MariaDB refuses surfaces MariaDB's verdict on the PG wire too.
+    def test_missing_remote_table_is_an_error_not_a_transport_failure(self):
+        """A DROP TABLE of a remote table neither the catalog nor MariaDB has fails on the PG wire too.
 
-        Same shape as the MySQL-wire case: DROP TABLE of a table the backend
-        does not have is routed to the backend without a registered schema,
-        MariaDB answers 1051 "Unknown table", and that text — not a transport
-        failure — is what the ErrorResponse carries.
+        Same shape as the MySQL-wire case: the engine's catalog misses the
+        four-part name, the discovery on MariaDB finds no table, and the
+        ErrorResponse carries the catalog's "does not exist" verdict — not a
+        transport failure; the connection keeps serving.
         """
         missing = f"{self.test_database}.no_such_table_{gen_id(404)}"
         with self.psycopg2_connection() as conn:
@@ -381,11 +389,11 @@ class client:
                 message = str(e)
             else:
                 raise AssertionError("DROP TABLE of a table the backend does not have must fail")
-            assert "Unknown table" in message, f"MariaDB's verdict is missing from: {message}"
-            assert "no_such_table" in message, f"the refused table is not named in: {message}"
+            assert "no_such_table" in message or "does not exist" in message, \
+                f"the refusal names neither the table nor its absence: {message}"
             assert "connect failed" not in message, f"a transport error was reported instead: {message}"
 
-            # The connection is still usable after the backend refused a statement.
+            # The connection is still usable after the refusal.
             cursor.execute(f"select count(_id) as cnt from {self.test_database}.{self.test_table}")
             cursor.fetchall()
 
@@ -398,7 +406,7 @@ class client:
             self.test_character_encoding()
             self.test_protocol_capability_flags()
             self.test_prepared_queries_psycopg3()
-            self.test_backend_error_carries_server_message()
+            self.test_missing_remote_table_is_an_error_not_a_transport_failure()
             print("\033[92mTest success.\033[0m")
         except Exception as e:
             print(f"\033[91mAn error occurred: {e}\033[0m")

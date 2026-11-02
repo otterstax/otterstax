@@ -2,11 +2,11 @@ project(test_federation)
 
 set(${PROJECT_NAME}_SOURCES
     main.cpp
+    test_federation_registration.cpp
+    test_federation_scans.cpp
+    test_federation_offer.cpp
+    test_federation_transactions.cpp
     test_federation_units.cpp
-    test_federation_engine.cpp
-    test_federation_rediscovery.cpp
-    test_federation_pushdown.cpp
-    test_federation_joins.cpp
 )
 
 add_executable(${PROJECT_NAME} ${${PROJECT_NAME}_SOURCES})
@@ -17,12 +17,10 @@ target_include_directories(${PROJECT_NAME} PRIVATE
 
 target_link_libraries(${PROJECT_NAME} PRIVATE
     catalog
-    runtime
     otterstax_federation
     otterbrix_local
     otterbrix::otterbrix
     actor-zeta::actor-zeta
-    PostgreSQL::PostgreSQL
     Catch2::Catch2
 )
 

@@ -14,6 +14,10 @@ namespace config {
 // connector-specific parameter structs when they register connections at
 // startup.
 
+// The connections kept open to a backend whose entry names no `pool_size`: a transaction block holds
+// one of them from its first statement to its end, so four blocks of one connection run at once.
+inline constexpr int default_pool_size = 4;
+
 struct MysqlConnectionDesc {
     std::string alias;
     std::string host;
@@ -22,7 +26,7 @@ struct MysqlConnectionDesc {
     std::string password;
     std::string database;
     std::string table;
-    int pool_size = 1;  // optional; connections kept open to the backend, >= 1
+    int pool_size = default_pool_size;  // optional; connections kept open to the backend, >= 1
 };
 
 struct PgConnectionDesc {
@@ -32,9 +36,9 @@ struct PgConnectionDesc {
     std::string username;
     std::string password;
     std::string database;
-    std::string schema{"public"};  // PostgreSQL schema, defaults to "public"
+    std::string schema;  // PostgreSQL schema; empty: every user schema of the database
     std::string table;
-    int pool_size = 1;  // optional; connections kept open to the backend, >= 1
+    int pool_size = default_pool_size;  // optional; connections kept open to the backend, >= 1
 };
 
 struct ChConnectionDesc {
@@ -45,7 +49,7 @@ struct ChConnectionDesc {
     std::string password;
     std::string database;
     std::string table;
-    int pool_size = 1;  // optional; connections kept open to the backend, >= 1
+    int pool_size = default_pool_size;  // optional; connections kept open to the backend, >= 1
 };
 
 struct S3CredentialDesc {

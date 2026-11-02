@@ -89,9 +89,7 @@ namespace frontend::spark {
     // a SELECT of the core grammar is a query; anything else (DDL, DML, CREATE
     // EXTERNAL TABLE / COPY, Kafka DDL) is a command. A statement that does not
     // parse is the parser's error, its message on `resource`.
-    core::result_wrapper_t<sql_statement_t> classify_sql(const std::string& sql,
-                                                         std::pmr::memory_resource* resource,
-                                                         const otterstax::names::alias_registry_t& aliases);
+    core::result_wrapper_t<sql_statement_t> classify_sql(const std::string& sql, std::pmr::memory_resource* resource);
 
     // What a SqlCommand whose statement is a query answers with (Spark's
     // SqlCommandResult for a statement that is not a command): the command's input
@@ -105,6 +103,17 @@ namespace frontend::spark {
     // A LocalRelation with neither data nor a schema: what a SQL command that is
     // not a query answers with. It stands for an empty result without columns.
     bool is_empty_local_relation(const sc::Relation& relation);
+
+    // A DataFrame plan as the query session takes it: relation_to_plan's
+    // translation, and how the session builds it again for its one more run
+    // after registering a table the plan missed (the same Plan, copied into the
+    // rebuild, translated again on the session's thread).
+    struct session_plan_t {
+        ParsedQueryDataPtr data;
+        otterstax::session::query_session_t::rebuild_fn rebuild;
+    };
+    core::result_wrapper_t<session_plan_t> translate_for_session(const sc::Plan& plan,
+                                                                 std::pmr::memory_resource* resource);
 
     // "Spark command <name> is not supported", <name> being the JSON name of the
     // Command field that is set (writeOperation, createDataframeView, ...).

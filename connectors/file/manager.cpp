@@ -5,7 +5,6 @@
 #include "utility/logger.hpp"
 #include "utility/tracy_profiler.hpp"
 #include "utility/session.hpp"
-#include "otterbrix/operators/engine_requests.hpp"
 #include "otterbrix/translators/input/parquet_to_chunk.hpp"
 #include "otterbrix/translators/input/csv_to_chunk.hpp"
 #include "otterbrix/translators/input/ndjson_to_chunk.hpp"
@@ -28,43 +27,46 @@ namespace conn::file {
 
 namespace {
 
-// Translate params.input (or, when unset, the file at params.path) into a chunk
-// in the format resolved from params.format or, failing that, the path's
+using chunk_run_t = std::pmr::vector<components::vector::data_chunk_t>;
+
+// Translate params.input (or, when unset, the file at params.path) into a run of
+// chunks in the format resolved from params.format or, failing that, the path's
 // extension.
-core::result_wrapper_t<components::vector::data_chunk_t> load_chunk(std::pmr::memory_resource* res,
-                                                                    const FileAddParams& params) {
+core::result_wrapper_t<chunk_run_t> load_chunks(std::pmr::memory_resource* res, const FileLoadParams& params) {
     switch (resolve_format(params.format, params.path)) {
         case FileFormat::Parquet:
-            return params.input ? tsl::parquet_to_chunk(res, params.input) : tsl::parquet_to_chunk(res, params.path);
+            return params.input ? tsl::parquet_to_chunk(res, params.input.arrow())
+                                : tsl::parquet_to_chunk(res, params.path);
         case FileFormat::CSV: {
             const char delim = params.csv_delimiter.empty() ? ',' : params.csv_delimiter[0];
-            return params.input ? tsl::csv_to_chunk(res, params.input, delim, params.csv_header)
+            return params.input ? tsl::csv_to_chunk(res, params.input.arrow(), delim, params.csv_header)
                                 : tsl::csv_to_chunk(res, params.path, delim, params.csv_header);
         }
         case FileFormat::NDJSON:
-            return params.input ? tsl::ndjson_to_chunk(res, params.input) : tsl::ndjson_to_chunk(res, params.path);
+            return params.input ? tsl::ndjson_to_chunk(res, params.input.arrow())
+                                : tsl::ndjson_to_chunk(res, params.path);
         case FileFormat::Unknown:
             break;
     }
     return tsl::make_error(res,
                            core::error_code_t::invalid_parameter,
-                           "FileManager::add_file: cannot determine format for: " + params.path);
+                           "FileManager::load_file: cannot determine format for: " + params.path);
 }
 
-// Writes to `sink` when one is given (left open for the sender to commit or
-// abort), otherwise to a file at `path`.
+// Writes to `sink` when one is given (published by the caller), otherwise to a
+// file at `path`, committed only on success (tsl::write_local_file).
 core::result_wrapper_t<bool> write_chunks(std::pmr::memory_resource* res,
                                           FileFormat format,
-                                          const std::pmr::vector<components::vector::data_chunk_t>& chunks,
+                                          const chunk_run_t& chunks,
                                           const std::string& path,
-                                          const std::shared_ptr<arrow::io::OutputStream>& sink) {
+                                          const tsl::output_stream_t& sink) {
     switch (format) {
         case FileFormat::Parquet:
-            return sink ? tsl::chunk_to_parquet(res, chunks, sink) : tsl::chunk_to_parquet(res, chunks, path);
+            return sink ? tsl::chunk_to_parquet(res, chunks, sink.arrow()) : tsl::chunk_to_parquet(res, chunks, path);
         case FileFormat::CSV:
-            return sink ? tsl::chunk_to_csv(res, chunks, sink) : tsl::chunk_to_csv(res, chunks, path);
+            return sink ? tsl::chunk_to_csv(res, chunks, sink.arrow()) : tsl::chunk_to_csv(res, chunks, path);
         case FileFormat::NDJSON:
-            return sink ? tsl::chunk_to_ndjson(res, chunks, sink) : tsl::chunk_to_ndjson(res, chunks, path);
+            return sink ? tsl::chunk_to_ndjson(res, chunks, sink.arrow()) : tsl::chunk_to_ndjson(res, chunks, path);
         case FileFormat::Unknown:
             break;
     }
@@ -73,14 +75,11 @@ core::result_wrapper_t<bool> write_chunks(std::pmr::memory_resource* res,
 
 } // namespace
 
-FileManager::FileManager(std::pmr::memory_resource* res, actor_zeta::address_t engine_dispatcher)
+FileManager::FileManager(std::pmr::memory_resource* res)
     : resource_(res)
-    , engine_dispatcher_(std::move(engine_dispatcher))
-    , engine_session_(components::session::session_id_t::generate_uid())
     , log_(get_logger(logger_tag::FILE_MANAGER)) {
     assert(log_.is_valid());
     assert(res != nullptr);
-    assert(static_cast<bool>(engine_dispatcher_) && "the file manager needs the engine dispatcher");
 }
 
 std::pair<bool, actor_zeta::detail::enqueue_result>
@@ -104,83 +103,55 @@ FileManager::enqueue_impl(actor_zeta::mailbox::message_ptr msg) {
 
 actor_zeta::behavior_t FileManager::behavior(actor_zeta::mailbox::message* msg) {
     auto cmd = msg->command();
-    if (cmd == actor_zeta::msg_id<FileManager, &FileManager::add_file>) {
-        co_await actor_zeta::dispatch(this, &FileManager::add_file, msg);
+    if (cmd == actor_zeta::msg_id<FileManager, &FileManager::load_file>) {
+        co_await actor_zeta::dispatch(this, &FileManager::load_file, msg);
     } else if (cmd == actor_zeta::msg_id<FileManager, &FileManager::dump_file>) {
         co_await actor_zeta::dispatch(this, &FileManager::dump_file, msg);
     }
 }
 
-actor_zeta::unique_future<core::result_wrapper_t<bool>> FileManager::add_file(session_hash_t id, FileAddParams params) {
-    OTX_ZONE_N("file::add_file");
-    log_->trace("FileManager::add_file with params:\n Database: {}\n Table: {}\n Path: {}\n Format: {}",
-                params.database, params.table, params.path, params.format);
-
-    auto loaded = load_chunk(resource_, params);
+actor_zeta::unique_future<core::result_wrapper_t<std::pmr::vector<components::vector::data_chunk_t>>>
+FileManager::load_file(session_hash_t id, FileLoadParams params) {
+    OTX_ZONE_N("file::load_file");
+    log_->trace("FileManager::load_file id {}:\n Path: {}\n Format: {}\n Stream: {}",
+                id, params.path, params.format, params.input ? "set" : "none");
+    auto loaded = load_chunks(resource_, params);
     if (loaded.has_error()) {
-        log_->error("add_file: {}", loaded.error().what);
-        co_return loaded.convert_error<bool>();
+        log_->error("load_file: {}", loaded.error().what);
     }
-
-    // The load runs on the file manager's own engine session, outside any
-    // client transaction (writes to files and S3 are not transactional yet).
-    auto fut = otterstax::engine::create_table(resource_,
-                                               engine_dispatcher_,
-                                               engine_session_,
-                                               params.database,
-                                               params.table,
-                                               std::move(loaded.value()));
-    auto result = co_await std::move(fut);
-    if (result.has_error()) {
-        log_->error("add_file: create_table failed: {}", result.error().what);
-        co_return std::move(result);
-    }
-
-    log_->debug("add_file: loaded {} into {}.{}", params.path, params.database, params.table);
-    co_return true;
+    co_return std::move(loaded);
 }
 
 actor_zeta::unique_future<core::result_wrapper_t<bool>> FileManager::dump_file(session_hash_t id, FileMetadata file_metadata) {
     OTX_ZONE_N("file::dump_file");
-    log_->trace("FileManager::dump_file with params:\n Path: {}", file_metadata.path);
-    if (file_metadata.path.empty() || !file_metadata.statement) {
-        log_->error("dump_file: input arguments are invalid: Path: '{}', statement: {}",
-                    file_metadata.path, file_metadata.statement ? "set" : "null");
+    log_->trace("FileManager::dump_file id {}:\n Path: {}\n Stream: {}", id, file_metadata.path,
+                file_metadata.output ? "set" : "none");
+    if (file_metadata.path.empty() || !file_metadata.rows) {
+        log_->error("dump_file: input arguments are invalid: Path: '{}', rows: {}",
+                    file_metadata.path, file_metadata.rows ? "set" : "null");
         co_return core::error_t(
             core::error_code_t::invalid_parameter,
             std::pmr::string{("FileManager::dump_file: input arguments are invalid: Path: '" +
-                              std::string{file_metadata.path} + "', statement: " +
-                              (file_metadata.statement ? "set" : "null"))
+                              std::string{file_metadata.path} + "', rows: " +
+                              (file_metadata.rows ? "set" : "null"))
                                  .c_str(),
                              resource()});
     }
 
-    // Execute the pre-parsed statement; its result chunk is what we dump.
-    auto fut = otterstax::engine::execute_statement(resource_,
-                                                    engine_dispatcher_,
-                                                    engine_session_,
-                                                    std::move(file_metadata.statement));
-    auto cursor = co_await std::move(fut);
-    if (!cursor || !cursor->is_success()) {
-        // The engine's verdict is kept: its code and message, re-homed on this
-        // actor's resource. A cursor with no error at all is an engine contract
-        // violation and can only be reported as other_error.
-        const bool engine_error = cursor && cursor->is_error();
-        const std::string why = engine_error ? std::string{cursor->get_error().what.c_str()}
-                                             : std::string{"cursor error"};
-        log_->error("dump_file: execute failed: {}", why);
-        co_return core::error_t(engine_error ? cursor->get_error().type : core::error_code_t::other_error,
-                                std::pmr::string{("FileManager::dump_file: execute failed: " + why).c_str(),
-                                                 resource()});
-    }
-
     // Engine cursors return the result as a vector of <=1024-row chunks (never
     // combined into one); the writers take the whole run.
-    auto written =
-        write_chunks(resource_, file_metadata.format, cursor->chunks(), file_metadata.path, file_metadata.output);
+    auto written = write_chunks(resource_, file_metadata.format, file_metadata.rows->chunks(), file_metadata.path,
+                                file_metadata.output);
     if (written.has_error()) {
+        // The stream (if any) is let go unclosed with file_metadata: aborted.
         log_->error("dump_file: {}", written.error().what);
         co_return std::move(written);
+    }
+    if (file_metadata.output) {
+        if (auto closed = file_metadata.output.close(); !closed.ok()) {
+            log_->error("dump_file: publishing {} failed: {}", file_metadata.path, closed.ToString());
+            co_return tsl::arrow_error(resource_, core::error_code_t::io_error, "FileManager::dump_file: close", closed);
+        }
     }
 
     log_->debug("dump_file: wrote {}", file_metadata.path);

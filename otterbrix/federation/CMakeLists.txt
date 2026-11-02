@@ -1,20 +1,20 @@
-# The federation provider: the name resolution primitives (need / decide), the pushdown rule, the
-# storage of a remote table and its operators, and the process-wide registry of servers they read.
-# See CLAUDE.md in this directory.
+# The federation core: the backend actor of each connection of config.yaml (otterbrix's storage
+# contract), its agents (one physical connection each, on the runtime's backends pool), and the host
+# table of the backends' spelling. See CLAUDE.md in this directory.
 set(OTTERSTAX_FEDERATION_HEADERS
+    backend_actor.hpp
+    backend_agent.hpp
+    reachability.hpp
+    conform.hpp
     metadata.hpp
-    provider.hpp
-    remote_storage.hpp
-    name_resolution.hpp
-    rules/pushdown.hpp
 )
 
 set(OTTERSTAX_FEDERATION_SOURCES
+    backend_actor.cpp
+    backend_actor_offer.cpp
+    backend_agent.cpp
+    conform.cpp
     metadata.cpp
-    provider.cpp
-    remote_storage.cpp
-    name_resolution.cpp
-    rules/pushdown.cpp
 )
 
 add_library(otterstax_federation
@@ -23,10 +23,14 @@ add_library(otterstax_federation
 )
 
 target_link_libraries(otterstax_federation PUBLIC
+    catalog_discovery
+    connectors
     otterbrix_local
     otterbrix::otterbrix
     actor-zeta::actor-zeta
     Boost::boost
+    PostgreSQL::PostgreSQL
+    clickhouse-cpp-lib::clickhouse-cpp-lib
 )
 
 if(ENABLE_TRACY)

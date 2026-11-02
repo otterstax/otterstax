@@ -375,16 +375,31 @@ parse into an `otterstax::external::external_node_t`; `extension_root()` reads
 `ParsedQueryData::extension_kind` and the node's op routes it — to
 `load_external_table` or `copy_to` — before the backend / schema logic:
 
-- create → `db::S3Manager::download` (s3://) or `conn::file::FileManager::add_file` (local);
-- copy → the inner SQL re-parsed on the session's own parser and handed to
-  `db::S3Manager::upload` / `conn::file::FileManager::dump_file`, which execute
-  it on the file manager's OWN engine session (so outside the connection's
-  transaction, as the load of `CREATE EXTERNAL TABLE` is).
+Both run on the connection's engine session — its place (`search_path`), its
+snapshot and its transaction:
+
+- create → the file read into one chunk by `db::S3Manager::download` (s3://) or
+  `conn::file::FileManager::load_file` (local), then `engine::create_table_plan`
+  of the target as written (1–4 parts, completed by the place as any CREATE TABLE:
+  the database is not created, a missing schema is the engine's refusal, an
+  existing table `table_already_exists`) and `engine::load_table`: outside a block
+  BEGIN / CREATE / INSERT / COMMIT (ROLLBACK on a failure — the table with its
+  rows or nothing), inside a block two more statements of it; a connection's
+  table (four parts) is created and filled in autocommit, inside a block as the
+  backend's rules for a remote write in a block decide;
+- copy → the inner SQL parsed on the session's own parser and run on the
+  connection's engine session (`engine::execute_statement`); its cursor is handed
+  to `db::S3Manager::upload` / `conn::file::FileManager::dump_file`, which write
+  it. A write that fails after the query ran is reported to the engine as a
+  failed statement (`settle`), so it fails an open block.
 
 Success is an empty payload under the statement's tag (`command_payload`, as
 every statement that answers no rows: remote DDL, Kafka); `prepare_schema`
-answers an empty schema and the work runs at execute. Kafka DDL (`kafka_node_t`) and `INSERT INTO kafka.<obj>`
-go to `KafkaManager`; Kafka DDL cannot be prepared.
+answers an empty schema and the work runs at execute. Kafka DDL (`kafka_node_t`) goes to
+`KafkaManager`; Kafka DDL cannot be prepared. An INSERT is a Kafka write when its target's last part is
+a registered object (`KafkaManager::has_object`) and the target, completed with the session's place
+(`SELECT current_database(), current_schema()`, asked only then), is `main.kafka.<obj>`
+(`names_kafka_object`, `integration/kafka/CLAUDE.md`, "Routing").
 
 ### Describe (prepare)
 

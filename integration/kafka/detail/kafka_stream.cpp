@@ -8,8 +8,6 @@
 #include "utility/tracy_profiler.hpp"
 
 #include <components/logical_plan/execution_plan.hpp>
-#include <components/logical_plan/node_aggregate.hpp>
-#include <components/logical_plan/node_data.hpp>
 
 #include <chrono>
 #include <string>
@@ -81,14 +79,9 @@ namespace otterstax::kafka::detail {
             std::vector<std::string> out_payloads;
             auto chunk = json_to_chunk(resource_, source_columns_, payloads);
             if (chunk.size() > 0) {
-                auto agg = logical_plan::make_node_aggregate(resource_, qualified_name_t{});
-                agg->append_child(logical_plan::make_node_raw_data(resource_, std::move(chunk)));
-                for (const auto& op : operators_) {
-                    agg->append_child(logical_plan::node_ptr(op)); // copy: keep operators_ intact
-                }
                 auto future = kafka_execute(dispatcher_address_,
                                             resource_,
-                                            logical_plan::execution_plan_t{resource_, agg, params_});
+                                            stream_batch_plan(resource_, std::move(chunk), operators_, params_));
                 while (!future.is_ready()) {
                     std::this_thread::sleep_for(ENGINE_POLL_STEP); // dedicated thread: park, don't burn a core
                 }

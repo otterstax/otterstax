@@ -89,12 +89,11 @@ namespace otterstax::runtime::test {
                 core::error_t(core::error_code_t::sql_parse_error, std::pmr::string{what, engine.resource()}));
         };
         std::pmr::monotonic_buffer_resource arena(engine.resource());
-        List* tree = nullptr;
-        try {
-            tree = raw_parser(&arena, sql.c_str());
-        } catch (const std::exception& error) {
-            return refused(error.what());
+        auto parsed = raw_parser(&arena, sql.c_str());
+        if (parsed.has_error()) {
+            return refused(std::string_view{parsed.error().what});
         }
+        List* tree = parsed.value();
         if (tree == nullptr || list_length(tree) != 1) {
             return refused("one statement expected");
         }

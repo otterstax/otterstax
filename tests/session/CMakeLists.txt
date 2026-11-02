@@ -6,8 +6,11 @@ set(${PROJECT_NAME}_SOURCES
     test_session_prepared.cpp
     test_session_subquery.cpp
     test_session_external.cpp
+    test_session_kafka.cpp
     test_session_plans.cpp
     test_session_lifetime.cpp
+    test_session_registration.cpp
+    test_session_settings.cpp
 )
 
 add_executable(${PROJECT_NAME} ${${PROJECT_NAME}_SOURCES})

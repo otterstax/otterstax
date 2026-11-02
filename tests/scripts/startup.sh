@@ -119,10 +119,10 @@ run_test "Transactions (MySQL wire)" "test_transactions_mysql_wire.py"
 run_test "MySQL driver housekeeping" "test_mysql_client_housekeeping.py"
 # Flight SQL: GetTables lists local and remote tables; BEGIN by text refused.
 run_test "FlightSQL Client (GetTables, BEGIN refused)" "test_flightsql_client_tables_and_transactions.py"
-# Remote DML through the engine: row by row by primary key (MariaDB, PG),
-# refused without a usable key and on ClickHouse; four-part targets; a
-# remote write inside BEGIN survives ROLLBACK.
-run_test "Remote DML (row by row by primary key, four-part targets)" "test_remote_row_dml.py"
+# Remote DML through the engine: pushed whole (MariaDB, PG, ClickHouse) or
+# refused (unimplemented_yet); RETURNING on PG only; a remote write inside
+# BEGIN is undone by ROLLBACK on the backend, a ClickHouse one refused.
+run_test "Remote DML (pushed whole or refused, backend transactions)" "test_remote_row_dml.py"
 # JOINs of one server pushed as one statement: a ClickHouse JOIN reading the
 # second table's Bool (INNER and LEFT), ORDER BY a name both tables have +
 # LIMIT (ClickHouse, MariaDB), PostgreSQL DISTINCT ON over a JOIN.

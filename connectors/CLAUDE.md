@@ -15,8 +15,8 @@ connectors/
 ├── mysql/         — Boost.MySQL async connector + ConnectorManager
 ├── postgresql/    — libpq connector + ConnectorManager
 ├── clickhouse/    — clickhouse-cpp connector + ConnectorManager
-├── file/          — actor conn::file::FileManager: add_file (file → table) / dump_file (query result → file)
-├── s3/            — actor conn::s3::ConnectorManager: S3 object I/O via Arrow S3FileSystem (list/download/upload/credentials)
+├── file/          — actor conn::file::FileManager: load_file (file / stream → chunks) / dump_file (result → file / stream)
+├── s3/            — actor conn::s3::ConnectorManager: S3 object streams via Arrow S3FileSystem (list/open_input/open_output/credentials)
 ├── common/        — connection_pool.hpp (per-uid pool), pooled_query.hpp (run_on_checked_out: the
 │                    statement coroutine that returns its connection when it ends)
 └── api_connections/
@@ -29,23 +29,32 @@ connectors/
 
 Unlike the SQL backends, these are `actor_zeta::actor_mixin` actors whose handlers run synchronously:
 
-- **`conn::file::FileManager`** — `add_file(FileAddParams)` translates a CSV/NDJSON/Parquet file into a
-  `data_chunk_t` and creates `database.table` via `otterstax::engine::create_table` (sent straight to the engine dispatcher
-  on the file manager's own engine session; `FileManager(resource, engine_dispatcher)`). The chunk holds
-  the whole file and travels as one; `otterstax::engine::create_table` hands its rows to the engine as
-  chunks of at most `DEFAULT_VECTOR_CAPACITY` rows (`tsl::split_to_capacity`, see `otterbrix/CLAUDE.md`),
-  and `db::S3Manager::download` loads through the same `add_file`, with `FileAddParams::input` set to
-  the object's stream (then `path` only names the source). `dump_file(FileMetadata)`
-  takes a **pre-parsed `OtterbrixStatementPtr`** (not a database/table), runs it through
-  `otterstax::engine::execute_statement` on that same engine session, and writes the result chunk out in the requested format. Format
-  translators live in `otterbrix/translators/{input,output}`.
-- **`conn::s3::ConnectorManager`** — credential store + S3 object I/O (`list`/`download`/`upload`) backed by
-  Arrow's `S3FileSystem`. Credentials are registered per alias at startup from the `s3:` section of the
-  connection config file (via `add_credentials`); there is no remove path. Every handler reports a typed
-  `core::error_t`: `invalid_parameter` (empty alias / keys), `do_not_exists` (unknown alias), `io_error`
-  (any Arrow S3 or local-file failure). A `download` that fails mid-transfer removes the partial local
-  file. Nothing here throws — Arrow reports through `Status`/`Result`. `db::S3Manager` (in
-  `integration/s3`) bridges these two with the engine. Error paths: `tests/system/test_s3_errors.cpp`.
+- **`conn::file::FileManager`** — moves bytes only, no engine work (`FileManager(resource)`):
+  `load_file(FileLoadParams)` translates a CSV/NDJSON/Parquet file — or `FileLoadParams::input`, the
+  stream of an S3 object (then `path` only names the source) — into a run of chunks of at most
+  `DEFAULT_VECTOR_CAPACITY` rows with named columns (the format from `format` or the path's
+  extension; an empty file is one chunk of its columns and no row), which the query session loads
+  on the connection's engine session (`otterstax::engine::load_table`, see `otterbrix/CLAUDE.md`);
+  `db::S3Manager::download` reads through the same `load_file`. `dump_file(FileMetadata)` writes
+  `rows` — the cursor of a COPY's inner query, which the query session ran on the connection's
+  engine session — in the requested format: into `FileMetadata::output` when it is set (the stream's
+  last holder: it publishes it, `close()`, only when the whole result was written, and a stream it
+  lets go unclosed is aborted), otherwise to a file at `path`, committed only on success
+  (`tsl::write_local_file`). Format translators live in `otterbrix/translators/{input,output}`.
+- **`conn::s3::ConnectorManager`** — credential store + S3 object streams (`list` / `open_input` /
+  `open_output`) backed by Arrow's `S3FileSystem`, one built per alias on first use and cached (an
+  `add_credentials` update drops it). Nothing is staged on local disk. The streams travel as their one
+  owner, `tsl::input_stream_t` / `tsl::output_stream_t` (`otterbrix/translators/arrow_stream.hpp`:
+  move-only, Arrow's `std::shared_ptr` handle only for the Arrow calls). `open_output` streams are
+  opened with `allow_delayed_open`, so nothing reaches the bucket before the first write; Arrow's S3
+  stream completes the upload from its destructor, so `output_stream_t` aborts a stream its last holder
+  lets go without `close()`. The filesystem's buffers come from the manager's resource through
+  `tsl::arrow_pool`, which must therefore be thread-safe (Arrow uploads parts from its IO threads).
+  Credentials are registered per alias at startup from the `s3:` section of the connection config file
+  (via `add_credentials`); there is no remove path. Every handler reports a typed `core::error_t`:
+  `invalid_parameter` (empty alias / keys), `undefined_object` (unknown alias), `io_error` (any Arrow S3
+  failure). Nothing here throws — Arrow reports through `Status`/`Result`. `db::S3Manager` (in
+  `integration/s3`) bridges these two for the query session. Error paths: `tests/system/test_s3_errors.cpp`.
   The constructor calls `arrow::fs::EnsureS3Initialized()`; Arrow requires one matching `FinalizeS3()`
   before the process exits (otherwise it warns and may segfault during static teardown), and
   finalization is terminal — every S3 call fails afterwards — so it is not the manager's to do.
@@ -85,7 +94,7 @@ Each backend has a `ConnectorManager` with identical shape:
   query hands back.
 - `executeQuery(uuid, query, handler)` — returns `otterstax::query_future_t<R>` (`utility/wait_barrier.hpp`);
   never throws. Refuses before spawning with a ready future when the pool is not `RUNNING` (`io_error`),
-  the uuid is unknown (`do_not_exists`), no connection of the uid frees up within the checkout timeout
+  the uuid is unknown (`undefined_object`), no connection of the uid frees up within the checkout timeout
   (`io_error`), the connector is `Closed` or its reconnect fails (`io_error`) —
   a failed reconnect fails that query only and leaves the connection registered. Otherwise the query is
   `spawn_marshaled` on the io_context and its outcome, including any exception thrown by the driver or
@@ -107,7 +116,9 @@ the returned awaitable, which `run_with_owned_handler` guarantees for `executeQu
 backend rejects keeps the backend's verdict — `mysql/errors.hpp` (boost.mysql `error_code` +
 `diagnostics::server_message`), `postgresql/errors.hpp` (SQLSTATE), `clickhouse/errors.hpp`
 (`ServerException::GetCode`) map syntax, missing table/column/database, duplicates, ambiguity and
-constraint failures onto the engine's `error_code_t`; transport failures are `io_error`.
+constraint failures onto the engine's `error_code_t` — the PostgreSQL code of the same verdict
+(`undefined_column`, `ambiguous_column`, `unique_violation`, …; a server code without one is
+`internal_error`); transport failures are `io_error`.
 
 The MySQL connector runs every statement over the **binary protocol** — `async_prepare_statement`, then
 an `execute` + `close_statement` pipeline — never `COM_QUERY`: the text protocol renders a FLOAT column
@@ -248,14 +259,30 @@ connection: with every connection busy the next one waits. Discovery, remote DDL
 pool's `scan` / `write` jobs all take this path. The checkout blocks the caller (as `.get()` on the
 result does); never call `executeQuery` from a connector io thread.
 
-**No transaction affinity.** Every remote statement — inside an explicit `BEGIN` block or not — checks a
-connection out for that one statement and runs in the backend's autocommit. A `BEGIN` over remote tables
-covers the engine tables only (root `CLAUDE.md`, Known Constraints): a remote write inside the block is
-committed by the backend at once and a ROLLBACK does not undo it, and remote reads inside a block are not
-one snapshot of the backend. Pinning a connection to a session's transaction needs storage transaction
-callbacks otterbrix does not offer yet (the engine telling the federation's remote storage that a
-transaction began, commits or rolls back); it will be built on them. Tests: `tests/unit/connectors/`
-(`test_unit_connectors`: the pool, the pooled MySQL / PostgreSQL / ClickHouse managers).
+**Transaction affinity (pinned connections).** A statement of an engine transaction
+(`executeQuery(uuid, transaction, query, handler)` with a transaction id, MySQL / PostgreSQL) runs on
+the connection pinned to that transaction on that uid: the transaction's first statement checks one
+out (the same checkout and health check as above, the same 60 s timeout) and
+`conn::pinned_connections_t` (`common/pinned_connections.hpp`, generic like the pool) keeps it until
+`endTransaction(uuid, transaction, final_statement)` runs COMMIT / ROLLBACK on it and returns it to the
+pool. A transaction step (BEGIN, SAVEPOINT, …) runs through `transactionStep`, which marks the pin as
+holding an open backend transaction. A connection never goes back in an unknown transaction state:
+when COMMIT / ROLLBACK fails, its session is replaced first (`close()` — the backend rolls back — then
+`tryReconnect()`, skipped while shutting down); an unpin (empty `final_statement`) of a pin a step ran
+on is the caller's mistake — ROLLBACK runs (the session replaced if it fails) and the answer is
+`invalid_parameter` —, while an unpin of a pin that only read runs nothing. A transaction that pinned
+nothing ends at once with no statement. Both block the caller (a backends pool thread). One statement at a time per pin: a second statement of the
+same transaction waits (blocking the caller, a thread of the backends pool) until the first one has
+completed on the io thread (`conn::run_on_pinned`, `common/pooled_query.hpp`, gives the lease back
+when its frame ends). A pinned connection is not health-checked again (a reconnect would lose the
+transaction): a broken one fails the transaction's statements. `shutdown()` first returns every pin no
+statement is using to its pool, which it then closes (closing the connection: the backend rolls back
+what it left), cancels the pinned ones running a statement like any other, and refuses a statement
+waiting for its pin (`io_error`). The statements of each step (BEGIN, SAVEPOINT, …) are the
+integration backend's (`integration/transaction_statement.hpp`); ClickHouse has no transactions and
+pins nothing. A statement without a transaction checks a connection out for itself as before, so with
+every connection of a uid pinned it waits up to the checkout timeout. Tests:
+`tests/unit/connectors/test_pinned_connections.cpp`.
 
 ## Connection Params (`api_connections/`)
 

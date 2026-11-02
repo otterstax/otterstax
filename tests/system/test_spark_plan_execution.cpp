@@ -13,8 +13,7 @@
 // database.
 
 #include "session_stack.hpp"
-
-#include "../mock/aliases.hpp"
+#include "../mock/cell.hpp"
 
 #include "frontend/spark_connect_server/plan_translator/relation_to_plan.hpp"
 
@@ -57,7 +56,7 @@ namespace {
     // integers (north 10 + 30 + 50, south 20 + 60, east 40), then `extra_rows`.
     void
     seed_sales(const session_stack& s, session_hash_t& id, const std::string& db, const std::string& extra_rows) {
-        run_or_fail(s, id++, "CREATE DATABASE " + db + ";");
+        run_or_fail(s, id++, "CREATE SCHEMA " + db + ";");
         run_or_fail(s, id++, "CREATE TABLE " + db + ".sales (id bigint, region string, amount bigint);");
         run_or_fail(s,
                     id++,
@@ -194,14 +193,15 @@ namespace {
     run_plan(const session_stack& s, session_hash_t id, const sc::Relation& root) {
         sc::Plan plan;
         *plan.mutable_root() = root;
-        auto translated = frontend::spark::relation_to_plan(plan, s.resource, no_aliases());
+        auto translated = frontend::spark::relation_to_plan(plan, s.resource);
         if (translated.has_error()) {
             return translated.convert_error<session_payload>();
         }
         auto [needs_sched, future] = actor_zeta::send(s.session,
                                                       &otterstax::session::query_session_t::execute_plan,
                                                       otterstax::test::stmt(id),
-                                                      std::move(translated.value().parsed_data));
+                                                      std::move(translated.value().parsed_data),
+                                                      otterstax::session::query_session_t::rebuild_fn{});
         return await_session(std::move(future), std::chrono::milliseconds(10000), s.resource);
     }
 
@@ -227,7 +227,7 @@ namespace {
 
     // An integral cell as int64: count answers UBIGINT, sum and max keep their
     // argument's BIGINT, avg answers DOUBLE (every seeded mean is exact).
-    int64_t as_int64(const ct::logical_value_t& value) {
+    int64_t as_int64(const otterstax::test::cell_t& value) {
         REQUIRE_FALSE(value.is_null());
         switch (value.type().type()) {
             case ct::logical_type::BIGINT:
@@ -254,7 +254,7 @@ namespace {
             }
             const auto index = column_of(chunk, name);
             for (uint64_t row = 0; row < chunk.size(); ++row) {
-                values.push_back(as_int64(chunk.value(index, row)));
+                values.push_back(as_int64(otterstax::test::cell(chunk, index, row)));
             }
         }
         return values;
@@ -384,13 +384,13 @@ TEST_CASE("Spark plan: groupBy agg answers one row per group with count sum and 
             // An aggregate without an alias is named by its function.
             const auto max = column_of(chunk, "max");
             for (uint64_t row = 0; row < chunk.size(); ++row) {
-                const auto region_value = chunk.value(region, row);
+                const auto region_value = otterstax::test::cell(chunk, region, row);
                 const std::string name{region_value.value<std::string_view>()};
                 INFO("region " << name);
-                const int64_t got[] = {as_int64(chunk.value(n, row)),
-                                       as_int64(chunk.value(total, row)),
-                                       as_int64(chunk.value(mean, row)),
-                                       as_int64(chunk.value(max, row))};
+                const int64_t got[] = {as_int64(otterstax::test::cell(chunk, n, row)),
+                                       as_int64(otterstax::test::cell(chunk, total, row)),
+                                       as_int64(otterstax::test::cell(chunk, mean, row)),
+                                       as_int64(otterstax::test::cell(chunk, max, row))};
                 if (name == "north") {
                     CHECK(got[0] == 3);
                     CHECK(got[1] == 90);
@@ -429,11 +429,11 @@ TEST_CASE("Spark plan: avg of an integer column answers DOUBLE and keeps the fra
             for (const auto& chunk : payload.chunks) {
                 const auto mean = column_of(chunk, "mean");
                 for (uint64_t row = 0; row < chunk.size(); ++row) {
-                    if (!region.empty() && chunk.value(column_of(chunk, "region"), row).value<std::string_view>() !=
+                    if (!region.empty() && otterstax::test::cell(chunk, column_of(chunk, "region"), row).value<std::string_view>() !=
                                                region) {
                         continue;
                     }
-                    const auto value = chunk.value(mean, row);
+                    const auto value = otterstax::test::cell(chunk, mean, row);
                     REQUIRE(value.type().type() == ct::logical_type::DOUBLE);
                     return value.value<double>();
                 }
@@ -538,7 +538,7 @@ TEST_CASE("Spark plan: filter after orderBy and select after limit keep the sort
 TEST_CASE("Spark plan: crossJoin of two small tables answers every pair", "[spark-plan]") {
     with_session_stack("/tmp/test_spark_plan_cross_join", [](session_stack s) {
         session_hash_t id = 12500;
-        run_or_fail(s, id++, "CREATE DATABASE spark_cross;");
+        run_or_fail(s, id++, "CREATE SCHEMA spark_cross;");
         run_or_fail(s, id++, "CREATE TABLE spark_cross.colors (color string);");
         run_or_fail(s, id++, "CREATE TABLE spark_cross.sizes (size_id bigint);");
         run_or_fail(s, id++, "INSERT INTO spark_cross.colors (color) VALUES ('red'), ('blue');");
@@ -562,10 +562,10 @@ TEST_CASE("Spark plan: crossJoin of two small tables answers every pair", "[spar
             const auto color = column_of(chunk, "color");
             const auto size = column_of(chunk, "size_id");
             for (uint64_t row = 0; row < chunk.size(); ++row) {
-                const auto color_value = chunk.value(color, row);
+                const auto color_value = otterstax::test::cell(chunk, color, row);
                 std::pmr::string pair{color_value.value<std::string_view>(), s.resource};
                 pair += ':';
-                pair += std::to_string(as_int64(chunk.value(size, row)));
+                pair += std::to_string(as_int64(otterstax::test::cell(chunk, size, row)));
                 pairs.push_back(std::move(pair));
             }
         }
@@ -581,7 +581,7 @@ TEST_CASE("Spark plan: crossJoin of two small tables answers every pair", "[spar
 TEST_CASE("Spark plan: df.count() and groupBy().agg(count(lit(1))) count every row", "[spark-plan]") {
     with_session_stack("/tmp/test_spark_plan_count_literal", [](session_stack s) {
         session_hash_t id = 12700;
-        run_or_fail(s, id++, "CREATE DATABASE spark_count;");
+        run_or_fail(s, id++, "CREATE SCHEMA spark_count;");
         run_or_fail(s, id++, "CREATE TABLE spark_count.items (id bigint, grp string);");
         run_or_fail(s, id++, "INSERT INTO spark_count.items (id, grp) VALUES (1, 'a'), (2, 'a'), (3, 'b');");
         const auto items = read_table("spark_count.items");

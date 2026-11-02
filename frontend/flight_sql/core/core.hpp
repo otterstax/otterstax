@@ -40,6 +40,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <vector>
 
@@ -62,6 +63,17 @@ struct QueryResult {
     std::vector<std::shared_ptr<arrow::RecordBatch>> batches;
 };
 
+// The catalog of a schema or a table: its database as SQL writes it — `d` for
+// a local database, `c.d` for the database d of the connection c.
+inline std::string catalog_of(std::string_view connection, std::string_view database) {
+    std::string catalog;
+    if (!connection.empty()) {
+        catalog.append(connection).push_back('.');
+    }
+    catalog.append(database);
+    return catalog;
+}
+
 // One GetDbSchemas row: a schema under the catalog (database) that holds it.
 struct DbSchema {
     std::string catalog;
@@ -69,18 +81,6 @@ struct DbSchema {
 
     friend bool operator==(const DbSchema&, const DbSchema&) = default;
     friend auto operator<=>(const DbSchema&, const DbSchema&) = default;
-};
-
-// The tables the metadata commands answer with: the PROJECT's table_info
-// (qualified name + engine schema); the arrow schema of a table is built
-// where the metadata batches are assembled (commands.cpp). The catalogs and
-// the schemas are derived from the tables: each once, in the order the
-// Flight SQL spec asks for (catalog_name, then db_schema_name).
-struct EngineMetadata {
-    std::vector<std::string> catalogs;  // distinct, sorted
-    std::vector<DbSchema> db_schemas;   // distinct (catalog, schema), sorted
-    std::pmr::vector<table_info> tables;
-    std::vector<std::string> table_types;
 };
 
 // A prepared query: text + the result and parameter schemas.
@@ -94,9 +94,6 @@ struct Prepared {
 // adapter reads rows out of them through the project's tsl::arrow_to_chunk).
 using BoundParams = std::vector<std::shared_ptr<arrow::RecordBatch>>;
 
-// SQL-LIKE matcher (% — any sequence, _ — one character).
-// No escaping; a ""/NULL pattern does not filter.
-[[nodiscard]] bool like_match(std::string_view text, std::string_view pattern);
 
 // One DoGet-ready batch message: the bare flatbuffer header (data_header) and
 // the aligned body buffers (data_body), as arrow::ipc produced them.

@@ -6,8 +6,8 @@
 Unlike a SOURCE (which has a backing table), a STREAM is a continuous query with
 no column list. `INSERT INTO kafka.<stream> VALUES(...)` still produces the rows
 to the stream's output topic (ksqlDB VALUES semantics), validated against the
-stream's OUTPUT schema — the projected columns of its SELECT, computed without
-data via schema_utils::aggregate_filter_schema.
+stream's OUTPUT schema — the projected columns of its SELECT, as the engine's
+describe of the stream's batch plan types them (no data).
 
 To isolate the write from the stream's continuous transform we never produce to
 the source topic, so the worker emits nothing and the output topic contains only
@@ -99,7 +99,7 @@ class StreamWriteTest:
         self.create_topic(self.src_topic)
         self.create_topic(self.out_topic)
         self.conn = psycopg.connect(host=self.host, port=PG_PORT, user="testuser",
-                                    password="testpass", dbname="kafka", autocommit=True)
+                                    password="testpass", dbname="main", autocommit=True)
         self.conn.prepare_threshold = None
         with self.conn.cursor() as cur:
             cur.execute(

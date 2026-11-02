@@ -66,8 +66,9 @@ TEST_CASE("s3: CREATE EXTERNAL TABLE is parsed into the AST") {
                                 "  location = 's3://bucket/data.parquet',"
                                 "  format   = 'parquet' );");
     CHECK(s->kind == s3_ext::s3_stmt_kind::create_external_table);
-    CHECK(ceq(s->db, "s3"));
-    CHECK(ceq(s->table, "trades"));
+    REQUIRE(s->name_parts == 2);
+    CHECK(ceq(s->name[0], "s3"));
+    CHECK(ceq(s->name[1], "trades"));
     CHECK(ceq(s->location, "s3://bucket/data.parquet"));
     CHECK(ceq(s->s3_alias, "my_s3_alias"));
     CHECK(ceq(s->format, "parquet"));
@@ -151,7 +152,9 @@ TEST_CASE("s3: core SQL and local-path statements are not claimed") {
 TEST_CASE("s3 registry: an s3 statement is routed to the s3 extension") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto registry = make_registry();
-    auto* tree = raw_parser(&arena, "CREATE EXTERNAL TABLE s3.trades WITH (location='s3://b/d.parquet');", registry);
+    auto parsed = raw_parser(&arena, "CREATE EXTERNAL TABLE s3.trades WITH (location='s3://b/d.parquet');", registry);
+    REQUIRE_FALSE(parsed.has_error());
+    auto* tree = parsed.value();
     REQUIRE(tree != NIL);
     auto* node = reinterpret_cast<Node*>(linitial(tree));
     REQUIRE(nodeTag(node) == T_ExtensionNode);
@@ -162,7 +165,9 @@ TEST_CASE("s3 registry: an s3 statement is routed to the s3 extension") {
 TEST_CASE("s3 registry: core SQL is claimed by neither extension") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto registry = make_registry();
-    auto* tree = raw_parser(&arena, "SELECT 1", registry);
+    auto parsed = raw_parser(&arena, "SELECT 1", registry);
+    REQUIRE_FALSE(parsed.has_error());
+    auto* tree = parsed.value();
     REQUIRE(tree != NIL);
     CHECK(nodeTag(reinterpret_cast<Node*>(linitial(tree))) == T_SelectStmt);
 }
@@ -170,7 +175,7 @@ TEST_CASE("s3 registry: core SQL is claimed by neither extension") {
 TEST_CASE("s3 registry: a malformed external statement surfaces a parser error") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto registry = make_registry();
-    CHECK_THROWS_AS(raw_parser(&arena, "CREATE EXTERNAL TABLE s3.t WITH (location=);", registry), parser_exception_t);
+    CHECK(raw_parser(&arena, "CREATE EXTERNAL TABLE s3.t WITH (location=);", registry).has_error());
 }
 
 // ── transform stage (lowers to an external_node_t the query session routes) ──────
@@ -179,7 +184,8 @@ TEST_CASE("s3 transform: ExtensionNode lowers to an external_node_t") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto registry = make_registry();
     auto* node = reinterpret_cast<Node*>(linitial(
-        raw_parser(&arena, "CREATE EXTERNAL TABLE s3.t WITH (s3_alias='a', location='s3://b/d.parquet');", registry)));
+        raw_parser(&arena, "CREATE EXTERNAL TABLE s3.t WITH (s3_alias='a', location='s3://b/d.parquet');", registry)
+            .value()));
     REQUIRE(nodeTag(node) == T_ExtensionNode);
 
     components::sql::transform::transformer tr(&arena, nullptr, &registry);

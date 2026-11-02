@@ -40,16 +40,11 @@ namespace frontend::mysql {
         struct prepared_stmt_meta {
             prepared_stmt_meta(std::pmr::memory_resource* resource,
                                otterstax::session::statement_id_t stmt_session,
-                               std::string sql,
                                uint32_t parameter_count);
 
-            // The statement's id in the connection's query session.
+            // The statement's id in the connection's query session, which keeps
+            // it for every COM_STMT_EXECUTE until COM_STMT_CLOSE.
             otterstax::session::statement_id_t stmt_session;
-            // The session keeps a prepared statement for exactly one execution,
-            // successful or not; every later COM_STMT_EXECUTE prepares this text
-            // again under a fresh statement id before executing.
-            std::pmr::string sql;
-            bool consumed;
             uint32_t parameter_count;
             std::pmr::vector<uint16_t> param_types;
             // A protocol statement (SELECT @@x, SET @@x = ?, SHOW VARIABLES, ...)
@@ -95,41 +90,56 @@ namespace frontend::mysql {
         // A text to_engine_text refused: the ERR packet, with an open block
         // failed behind it as an engine parse error fails it.
         void refuse_text(text_refusal_t refusal);
-        // The MySQL protocol statements (protocol/protocol_statement.hpp), which
-        // never reach the engine: its grammar has no `@@variable`, no SHOW
-        // VARIABLES / WARNINGS, no MySQL SET forms. SET NAMES, a SELECT of
-        // system variables, SHOW VARIABLES and SHOW WARNINGS are answered here,
-        // whatever the session's block (a refusal of driver housekeeping would
-        // fail an open block behind an answer the client never asked to fail);
-        // a SET of system variables goes to the session's execute_setting,
-        // which answers it as it answers every SET. True when the answer went
-        // out.
+        // The MySQL protocol statements (protocol/protocol_statement.hpp), whose
+        // forms the engine's grammar cannot read: no `@@variable`, no SHOW
+        // VARIABLES / WARNINGS, no MySQL SET forms, no USE. A SELECT of system
+        // variables, SHOW VARIABLES and SHOW WARNINGS are answered here, whatever
+        // the session's block (a refusal of driver housekeeping would fail an
+        // open block behind an answer the client never asked to fail); a SET and
+        // a USE go to the engine as its SET and the engine answers them
+        // (answer_setting, answer_use). True when the answer went out.
         bool serve_protocol_statement(std::string_view query);
-        // A SET of system variables in MySQL's forms: the session's answer.
-        void answer_setting();
+        // Every assignment of `set` in ONE engine statement
+        // (engine_setting_plan), as MySQL applies a SET: all or none. A
+        // refusal — the frontend's, the engine's parser's or the engine's — is
+        // the ERR packet with nothing applied, else an OK packet; only then is
+        // what the engine accepted remembered (autocommit_, time_zone_).
+        void answer_setting(const set_variables_t& set);
+        // SET search_path = '<database>.public' on the engine: an OK packet and
+        // database_ remembered, or the ERR packet — ER_BAD_DB_ERROR for a
+        // database or schema that does not exist, any other refusal as
+        // send_statement_error answers a statement. False when the engine
+        // refused (the ERR packet went out).
+        bool answer_use(const std::string& database, bool answer_ok);
+        // Awaits a statement of the frontend's own (a SET, a USE) on the
+        // session; false after the ERR packet went out: the bridge's own
+        // failures (answer_await_failure), ER_BAD_DB_ERROR for a missing
+        // database / schema when `names_database`, else send_statement_error.
+        bool await_own_statement(
+            actor_zeta::unique_future<otterstax::session::query_session_t::session_result> future,
+            bool names_database);
         // What the protocol statements' answers are derived from.
         protocol_context_t protocol_context() const;
-        // A session error as an ERR packet (COM_QUERY, COM_STMT_PREPARE): `code`
+        // A session error as an ERR packet (COM_QUERY, COM_STMT_PREPARE,
+        // COM_STMT_EXECUTE, a SET, a USE that names an existing place): `code`
         // a statement the engine does not support is ER_NOT_SUPPORTED_YET,
         // anything else ER_SYNTAX_ERROR.
         void send_statement_error(core::error_code_t code, std::string error);
-        // The status flags of an OK / EOF packet: autocommit, and
-        // SERVER_STATUS_IN_TRANS while the session is inside a transaction block
-        // (open or failed: the block holds until ROLLBACK / COMMIT ends it).
+        // The status flags of an OK / EOF packet: SERVER_STATUS_AUTOCOMMIT
+        // while the last SET autocommit the engine accepted left it on, and
+        // SERVER_STATUS_IN_TRANS while the engine stamps the session inside a
+        // transaction (open or failed: the block holds until ROLLBACK / COMMIT
+        // ends it; with autocommit off, after any statement).
         server_status_flags_t status_flags() const;
-        // COMMIT of a transaction the engine already failed and rolled back:
-        // ended as that rollback, as PostgreSQL does — an OK packet, nothing was
-        // committed. Told by query_session_t::ended_failed_block; true when the
-        // answer went out.
-        bool answer_failed_commit(const core::error_t& error);
         // The bridge's own failures (asio_future_bridge.hpp, by status, never by
         // code): ER_QUERY_TIMEOUT for a statement it stopped waiting for,
         // ER_UNKNOWN_ERROR with the bridge's message for one that got no
         // answer; an open block is failed behind either. True when the answer
         // went out (the session answered nothing).
         bool answer_await_failure(const otterstax::awaited_t<session_payload>& r);
-        // Inside an open block, fails it behind the statement in flight
-        // (query_session_t::fail_transaction, not awaited).
+        // Inside an open block (the engine's status in_transaction), fails it
+        // behind the statement in flight (query_session_t::fail_transaction, not
+        // awaited).
         void fail_open_block(std::string reason);
 
         // COM_STMT_PREPARE: the text is written in the engine's form, its `?`
@@ -140,24 +150,25 @@ namespace frontend::mysql {
         void handle_prepared_stmt(std::string_view query);
         // COM_STMT_PREPARE of a protocol statement: STMT_PREPARE_OK with its
         // columns (computed now, as MySQL resolves a system variable at prepare:
-        // an unknown one is refused here) and `parameter_count` parameters.
+        // an unknown one is refused here, failing no block) and
+        // `parameter_count` parameters. A SET the frontend refuses is refused
+        // here, an open block failed behind it, as COM_QUERY refuses it.
         void prepare_protocol_statement(protocol_statement_t statement, uint32_t parameter_count);
         // COM_STMT_EXECUTE of a prepared protocol statement: its answer as a
-        // binary resultset or an OK / ERR packet; the parameters are not read.
+        // binary resultset or an OK / ERR packet (a SET / USE: the engine's); the
+        // parameters are not read.
         void execute_protocol_statement(const protocol_statement_t& statement);
 
-        std::pmr::vector<components::types::logical_value_t>
+        // The COM_STMT_EXECUTE values, `$<i+1>` at i, each a one-row vector.
+        std::pmr::vector<components::vector::vector_t>
         handle_execute_params(uint32_t stmt_id,
                               size_t num_params,
                               std::pmr::vector<uint16_t>& param_types,
                               packet_reader&& reader);
-        // Prepares the statement text again once the session has consumed it.
-        // Returns false after sending the error to the client.
-        bool reprepare_stmt(prepared_stmt_meta& stmt);
         // Drops an unexecuted statement in the session; a failure is logged only.
         void close_stmt_in_session(otterstax::session::statement_id_t stmt_session, const char* reason);
         void handle_execute_stmt(prepared_stmt_meta& stmt,
-                                 std::pmr::vector<components::types::logical_value_t> param_values);
+                                 std::pmr::vector<components::vector::vector_t> param_values);
 
         void send_resultset(mysql_resultset&& result);
         void send_error(mysql_error error_code, std::string message);
@@ -177,6 +188,13 @@ namespace frontend::mysql {
         otterstax::session::session_ptr session_;
         // The user named in the HandshakeResponse (USER(), CURRENT_USER()).
         std::string user_;
+        // What the last SET / USE the engine accepted set, as @@autocommit,
+        // @@time_zone and DATABASE() answer it (the engine has no SHOW,
+        // OTB-show); a refused SET changes none of them. A SET a ROLLBACK
+        // later undoes is not followed here.
+        bool autocommit_{true};
+        std::string time_zone_{"SYSTEM"};
+        std::optional<std::string> database_;
         connection_state state_;
         log_t log_;
     };

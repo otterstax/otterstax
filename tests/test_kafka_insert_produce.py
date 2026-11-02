@@ -84,7 +84,7 @@ class InsertProduceTest:
         """Topic + CREATE SOURCE, then INSERT the records (produced to the topic)."""
         self.create_topic(self.topic)
         self.conn = psycopg.connect(host=self.host, port=PG_PORT, user="testuser",
-                                    password="testpass", dbname="kafka", autocommit=True)
+                                    password="testpass", dbname="main", autocommit=True)
         self.conn.prepare_threshold = None
         with self.conn.cursor() as cur:
             cur.execute(

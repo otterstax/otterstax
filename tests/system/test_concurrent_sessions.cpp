@@ -3,10 +3,6 @@
 
 #include "backends/remote_backends.hpp"
 #include "frontend/common/asio_future_bridge.hpp"
-#include "integration/clickhouse/connection_manager.hpp"
-#include "integration/postgresql/connection_manager.hpp"
-#include "integration/sql/connection_manager.hpp"
-#include "otterbrix/federation/provider.hpp"
 #include "session/session_payload.hpp"
 #include "session_stack.hpp"
 #include "test_helpers.hpp"
@@ -115,7 +111,9 @@ namespace {
         runQuery(std::string_view,
                  otterstax::function_ref_t<std::unique_ptr<data_chunk_t>(const ch::select_result_t&)> handler)
             override {
+            // The table's columns, no row.
             ch::select_result_t outcome;
+            outcome.blocks.push_back(ch_header_block());
             co_return handler(outcome);
         }
 
@@ -258,17 +256,15 @@ namespace {
     namespace fed = otterstax::federation;
 
     // The remote backends alone over `connectors`, the connections of
-    // `connections` opened.
-    // `runtime` lends its backends pool and must outlive the module.
+    // `connections` opened (no engine). `runtime` lends its backends pool and
+    // must outlive the module.
     std::unique_ptr<otterstax::backends::remote_backends_t> open_remote(std::pmr::memory_resource* resource,
                                                                         otterstax::runtime::runtime_t& runtime,
                                                                         otterstax::backends::connector_factories_t connectors,
                                                                         const config::ConnectionsConfig& connections) {
         auto remote = std::make_unique<otterstax::backends::remote_backends_t>(
             resource,
-            otterstax::backends::remote_backends_options_t{.connectors = connectors,
-                                                           .connector_threads = {2, 2, 2},
-                                                           .statements = runtime.backends_scheduler()});
+            otterstax::backends::remote_backends_options_t{.connectors = connectors, .runtime = &runtime});
         auto opened = remote->open(connections, config::ConnectionRetryConfig{});
         INFO(opened.what.c_str());
         REQUIRE_FALSE(opened.contains_error());
@@ -276,32 +272,78 @@ namespace {
         return remote;
     }
 
-    // One federation read through `backend`, polled from the calling thread:
-    // the rows it answered, or the error text.
-    thread_verdict scan_once(fed::backend_t& backend, std::pmr::memory_resource* resource, fed::scan_request_t request) {
+    constexpr fed::oid_t table_oid = 100;
+
+    // The startup discovery's table (id, name) handed to the connection's actor, as the
+    // registration does once the engine is open (oid `table_oid`).
+    fed::backend_actor_t& actor_with_table(otterstax::backends::remote_backends_t& remote,
+                                          const std::string& alias,
+                                          const std::string& container) {
+        auto* actor = remote.actor(alias);
+        REQUIRE(actor != nullptr);
+        const auto& discovered = remote.discovered().front();
+        REQUIRE(discovered.discovered);
+        REQUIRE(discovered.tables.size() == 1);
+        const auto& table = discovered.tables.front();
+        fed::registered_table_t registered{table_oid,
+                                           qualified_name_t{core::connection_name_t{alias},
+                                                            core::dbname_t{"d"},
+                                                            core::schema_t{"public"},
+                                                            core::relname_t{table.name.collection.t}},
+                                           container,
+                                           table.name.collection.t,
+                                           {}};
+        fed::oid_t attoid = 1;
+        for (const auto& column : table.schema.child_types()) {
+            const auto type = table.remote_types.find(column.alias());
+            registered.columns.push_back(fed::registered_column_t{attoid++,
+                                                                  column.alias(),
+                                                                  column,
+                                                                  column.alias(),
+                                                                  type == table.remote_types.end() ? std::string{}
+                                                                                                   : type->second});
+        }
+        actor->load_tables({std::move(registered)});
+        return *actor;
+    }
+
+    // One read of the table through the connection's actor (otterbrix's storage_fetch_next_batch,
+    // an autocommit statement), polled from the calling thread: the rows it answered, or the error.
+    thread_verdict scan_once(fed::backend_actor_t& actor) {
         thread_verdict verdict;
-        auto rows = std::make_shared<fed::scan_rows_t>();
-        auto future = backend.scan(resource, std::move(request), rows);
+        auto [needs_sched, future] = actor_zeta::send(&actor,
+                                                      &fed::backend_actor_t::storage_fetch_next_batch,
+                                                      components::session::session_id_t{},
+                                                      table_oid,
+                                                      std::uint64_t{0},
+                                                      std::int64_t{-1},
+                                                      std::vector<size_t>{},
+                                                      components::table::transaction_data{1, 0});
+        static_cast<void>(needs_sched);
         if (!poll_until_ready(future, THREAD_POLL_TIMEOUT)) {
-            verdict.what = "scan did not settle";
+            verdict.what = "read did not settle";
             return verdict;
         }
-        auto err = std::move(future).take_ready();
-        if (err.contains_error()) {
-            verdict.what = std::string{err.what.c_str()};
+        auto page = std::move(future).take_ready();
+        if (page.has_error()) {
+            verdict.what = std::string{page.error().what.c_str()};
             return verdict;
         }
-        for (const auto& chunk : rows->chunks) {
-            verdict.rows += chunk.size();
-        }
+        verdict.rows = page.value().batch ? page.value().batch->size() : 0;
         verdict.ok = true;
         return verdict;
     }
 
-    // One rediscovery through the backend's `discover`.
-    thread_verdict discover_once(fed::backend_t& backend, const qualified_name_t& scope) {
+    // One rediscovery through the connection's actor (its discover message).
+    thread_verdict discover_once(fed::backend_actor_t& actor, const qualified_name_t& scope) {
         thread_verdict verdict;
-        auto reply = backend.discover(scope);
+        auto [needs_sched, future] = actor_zeta::send(&actor, &fed::backend_actor_t::discover, scope);
+        static_cast<void>(needs_sched);
+        if (!poll_until_ready(future, THREAD_POLL_TIMEOUT)) {
+            verdict.what = "discovery did not settle";
+            return verdict;
+        }
+        auto reply = std::move(future).take_ready();
         if (reply.has_error()) {
             verdict.what = std::string{reply.error().what.c_str()};
             return verdict;
@@ -312,11 +354,10 @@ namespace {
 
 } // namespace
 
-// The PostgreSQL backend's ENUM cache is written by discovery (re-run here for an
-// already discovered table) and read by every federation read, which runs on
-// the backends pool's threads. Senders on different threads interleave the
-// two — the invariant ThreadSanitizer checks.
-TEST_CASE("PostgressManager: parallel reads and re-discovery share no unsynchronised state") {
+// A PostgreSQL connection's actor: reads and re-discoveries sent from many threads at once run on
+// its agents (an agent's ENUM labels read again after a discovery) — the invariant ThreadSanitizer
+// checks.
+TEST_CASE("PostgreSQL actor: parallel reads and re-discovery share no unsynchronised state") {
     constexpr size_t THREADS = 8;
     constexpr size_t ROUNDS = 6;
 
@@ -332,6 +373,7 @@ TEST_CASE("PostgressManager: parallel reads and re-discovery share no unsynchron
                                                               .table = "t"});
     otterstax::runtime::runtime_t runtime(otterstax::test::test_runtime_config());
     auto remote = open_remote(&resource, runtime, otterstax::test::mock_connectors(), connections);
+    auto& actor = actor_with_table(*remote, "1", "public");
 
     std::vector<thread_verdict> verdicts(THREADS * ROUNDS);
     {
@@ -341,12 +383,10 @@ TEST_CASE("PostgressManager: parallel reads and re-discovery share no unsynchron
             threads.emplace_back([&, t] {
                 for (size_t r = 0; r < ROUNDS; ++r) {
                     verdicts[t * ROUNDS + r] =
-                        t % 2 == 0 ? scan_once(remote->postgres(),
-                                               &resource,
-                                               fed::scan_request_t{"1", R"(SELECT "id", "name" FROM "public"."t")", {}})
+                        t % 2 == 0 ? scan_once(actor)
                                    : discover_once(
-                                         remote->postgres(),
-                                         qualified_name_t{core::uid_t{"1"},
+                                         actor,
+                                         qualified_name_t{core::connection_name_t{"1"},
                                                           core::dbname_t{"pgdb"},
                                                           core::schema_t{"public"},
                                                           core::relname_t{"t"}});
@@ -367,9 +407,8 @@ TEST_CASE("PostgressManager: parallel reads and re-discovery share no unsynchron
     }
 }
 
-// Same shape for the ClickHouse backend: discovery rewrites the per-table
-// named-type overrides every read copies into its converter.
-TEST_CASE("ClickhouseManager: parallel reads and re-discovery share no unsynchronised state") {
+// Same shape for a ClickHouse connection: a read holds its columns to their system.columns types.
+TEST_CASE("ClickHouse actor: parallel reads and re-discovery share no unsynchronised state") {
     constexpr size_t THREADS = 8;
     constexpr size_t ROUNDS = 6;
 
@@ -381,6 +420,7 @@ TEST_CASE("ClickhouseManager: parallel reads and re-discovery share no unsynchro
     connectors.clickhouse = &ch_header_connector_factory;
     otterstax::runtime::runtime_t runtime(otterstax::test::test_runtime_config());
     auto remote = open_remote(&resource, runtime, connectors, connections);
+    auto& actor = actor_with_table(*remote, "1", "ev");
 
     std::vector<thread_verdict> verdicts(THREADS * ROUNDS);
     {
@@ -391,15 +431,10 @@ TEST_CASE("ClickhouseManager: parallel reads and re-discovery share no unsynchro
                 for (size_t r = 0; r < ROUNDS; ++r) {
                     verdicts[t * ROUNDS + r] =
                         t % 2 == 0
-                            ? scan_once(remote->clickhouse(),
-                                        &resource,
-                                        fed::scan_request_t{"1",
-                                                            "SELECT `id`, `name` FROM `ev`.`t`",
-                                                            {fed::column_origin_t{{"ev", "", "t"}, "id"},
-                                                             fed::column_origin_t{{"ev", "", "t"}, "name"}}})
+                            ? scan_once(actor)
                             : discover_once(
-                                  remote->clickhouse(),
-                                  qualified_name_t{core::uid_t{"1"}, core::dbname_t{"ev"}, core::schema_t{}, core::relname_t{"t"}});
+                                  actor,
+                                  qualified_name_t{core::connection_name_t{"1"}, core::dbname_t{"ev"}, core::schema_t{}, core::relname_t{"t"}});
                 }
             });
         }

@@ -52,6 +52,7 @@ namespace frontend::spark {
         // or the plan a DataFrame translates to.
         std::optional<std::string> statement;
         ParsedQueryDataPtr statement_plan;
+        query_session_t::rebuild_fn rebuild;
         {
             OTX_ZONE_N("SparkConnectServiceImpl::handle_analyze_plan");
             response.set_session_id(spark_session_id);
@@ -81,14 +82,15 @@ namespace frontend::spark {
                         // SQL text, the way ExecutePlan runs it.
                         statement = plan.root().sql().query();
                     } else if (plan.has_root()) {
-                        auto plan_result = relation_to_plan(plan, resource_, aliases_);
+                        auto plan_result = translate_for_session(plan, resource_);
                         if (plan_result.has_error()) {
                             refusal =
                                 grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, plan_result.error().what.c_str());
                         } else {
                             // Described, never executed: prepare_plan resolves the plan's
                             // result schema the way prepare_schema does for SQL text.
-                            statement_plan = std::move(plan_result.value().parsed_data);
+                            statement_plan = std::move(plan_result.value().data);
+                            rebuild = std::move(plan_result.value().rebuild);
                         }
                     } else {
                         refusal = grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
@@ -126,7 +128,8 @@ namespace frontend::spark {
                     prepare_fut = statement_plan ? std::move(actor_zeta::send(session.address(),
                                                                               &query_session_t::prepare_plan,
                                                                               hash,
-                                                                              std::move(statement_plan))
+                                                                              std::move(statement_plan),
+                                                                              std::move(rebuild))
                                                                  .second)
                                                  : std::move(actor_zeta::send(session.address(),
                                                                               &query_session_t::prepare_schema,

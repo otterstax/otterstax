@@ -17,21 +17,23 @@
 
 namespace tsl {
 
+// Each answers the file as a run of chunks of at most DEFAULT_VECTOR_CAPACITY rows
+// (arrow_to_chunk.hpp; an empty file is one chunk of its columns and no row).
 // Error messages are owned by `res`; a file that cannot be opened is io_error, a
-// body Arrow cannot parse is conversion_failure. Arrow's own buffers are allocated
+// body Arrow cannot parse is invalid_text_representation. Arrow's own buffers are allocated
 // on `res` too (arrow_memory_pool.hpp), so it must be thread-safe.
-core::result_wrapper_t<components::vector::data_chunk_t>
+core::result_wrapper_t<std::pmr::vector<components::vector::data_chunk_t>>
 ndjson_to_chunk(std::pmr::memory_resource* res, const std::string& file_path);
 
 // A buffer holding a JSON array of objects is accepted as well and unwrapped
 // into one object per line before parsing.
-core::result_wrapper_t<components::vector::data_chunk_t>
+core::result_wrapper_t<std::pmr::vector<components::vector::data_chunk_t>>
 ndjson_to_chunk(std::pmr::memory_resource* res, const uint8_t* data, size_t size);
 
 // Any sequential source — a local file, an S3 object. NDJSON lines only, like the
 // file overload: unwrapping a JSON array needs the whole body (buffer overload).
 // A null input is invalid_parameter.
-core::result_wrapper_t<components::vector::data_chunk_t>
+core::result_wrapper_t<std::pmr::vector<components::vector::data_chunk_t>>
 ndjson_to_chunk(std::pmr::memory_resource* res, std::shared_ptr<arrow::io::InputStream> input);
 
 } // namespace tsl

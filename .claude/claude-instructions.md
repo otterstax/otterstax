@@ -49,8 +49,8 @@ sessions and stops their pool) → the four servers (each stops in its destructo
 ### Federated Query Pattern (Critical!)
 Queries use **connection aliases** as database names:
 ```sql
-SELECT * FROM campaigns.db1.campaigns
-JOIN impressions.db2.impressions ON campaigns.id = impressions.id
+SELECT * FROM campaigns.db1.schema.campaigns
+JOIN impressions.db2.schema.impressions ON campaigns.id = impressions.id
 ```
 - `campaigns` and `impressions` are **connection aliases** (not databases!)
 - Each alias maps to a connection declared in the `connections:` section of the
@@ -178,7 +178,7 @@ auto result = co_await std::move(future);
 ## Dependencies & Constraints
 
 ### Critical External Dependencies
-- **Otterbrix 1.0.0b2-embedding.46fba865**: a local Conan package pinned by recipe revision in `conanfile.py` (see the root `CLAUDE.md`, Critical Dependency Versions)
+- **Otterbrix 1.0.0b2-embedding.61aa43d6**: a local Conan package pinned by recipe revision in `conanfile.py` (see the root `CLAUDE.md`, Critical Dependency Versions)
 - **Arrow 24.0.0** (S3, parquet, csv, json; Flight SQL is served in-house, no Arrow Flight dependency)
 - **Boost 1.88.0**: Required for C++20 coroutines in MySQL connector
 - **actor-zeta 2.0.0**: Custom actor framework with C++20 coroutines (not Akka/CAF)

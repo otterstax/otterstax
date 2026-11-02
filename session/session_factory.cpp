@@ -91,7 +91,7 @@ namespace otterstax::session {
         std::lock_guard lock(mutex_);
         std::size_t count = 0;
         for (const auto* session : sessions_) {
-            if (session->transaction_state() != transaction_state_t::idle) {
+            if (session->transaction_status() != query_session_t::transaction_status_t::idle) {
                 ++count;
             }
         }

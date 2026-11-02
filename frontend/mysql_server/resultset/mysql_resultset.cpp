@@ -33,12 +33,11 @@ namespace frontend::mysql {
             // can carry a type with no alias, and alias() has no null guard for
             // such a type; it goes out with the empty name.
             column_definition_41 col(column.type().has_alias() ? column.type().alias() : std::string{}, *wire_type);
-            // A DECIMAL column announces its own scale and display length.
-            apply_decimal_metadata(col, column.type());
+            // The flags of its type; a DECIMAL column its own scale and display length.
+            apply_type_metadata(col, column.type());
             col.schema = database_;
             col.table = table_;
             col.org_table = table_;
-            col.column_flags = 0;
             column_defs_.push_back(col);
         }
     }
@@ -110,7 +109,7 @@ namespace frontend::mysql {
                 writer.write_null();
                 continue;
             }
-            writer.write_length_encoded_string(encode_to_text(chunk, i, row_index));
+            writer.write_length_encoded_string(encode_to_text(chunk, i, row_index, {frontend_type::MYSQL}));
         }
     }
 

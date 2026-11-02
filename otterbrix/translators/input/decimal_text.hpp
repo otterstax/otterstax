@@ -4,6 +4,7 @@
 #pragma once
 
 #include <components/types/types.hpp>
+#include <components/vector/vector.hpp>
 
 #include <cstdint>
 #include <memory_resource>
@@ -38,6 +39,26 @@ namespace tsl {
             return std::nullopt;
         }
         return std::move(type.value());
+    }
+
+    // Stores the unscaled integer `raw` of a DECIMAL value in row `row` of the DECIMAL `column`, in the
+    // integer width the column's type is stored as (INT16 / INT32 / INT64 / INT128).
+    inline void set_decimal_raw(components::vector::vector_t& column, uint64_t row, components::types::int128_t raw) {
+        using components::types::physical_type;
+        switch (column.type().to_physical_type()) {
+            case physical_type::INT16:
+                column.set_value(row, static_cast<int16_t>(raw));
+                break;
+            case physical_type::INT32:
+                column.set_value(row, static_cast<int32_t>(raw));
+                break;
+            case physical_type::INT64:
+                column.set_value(row, static_cast<int64_t>(raw));
+                break;
+            default:
+                column.set_value(row, raw);
+                break;
+        }
     }
 
 } // namespace tsl

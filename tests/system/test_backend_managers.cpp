@@ -1,26 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2025-2026  OtterStax
 //
-// The three backend managers are the federation's backends (federation::backend_t):
-// a read is the statement run as a job on the backends pool, its rows translated by the
-// backend's input translator; MySQLManager stands in for all of them in the
-// first cases. What is pinned: the error a read gets when it names a connection
-// nobody opened, a connector that resolves without a result chunk, and a
-// connector failure keeping its own code instead of being flattened; the
+// A backend agent runs a remote statement (otterbrix/federation/backend_agent.hpp): a read is
+// the statement run on the agent's connector, its rows translated by the backend's input
+// translator; a MySQL agent stands in for all of them in the first cases. What is pinned: a
+// connector that resolves without a result chunk, and a connector failure keeping its own code
+// instead of being flattened; the
 // engine's chunk bound, a read wider than DEFAULT_VECTOR_CAPACITY rows reaching
 // the cursor as a run of chunks within it; the count a write reports. Then
 // INSERT ... SELECT from a backend into a local NOT NULL column, and ClickHouse
 // nested columns through the session stack.
 
+#include "agent_driver.hpp"
 #include "backends/remote_backends.hpp"
-#include "otterbrix/federation/provider.hpp"
 #include "otterbrix/translators/output/chunk_to_arrow.hpp"
-#include "integration/clickhouse/connection_manager.hpp"
-#include "integration/postgresql/connection_manager.hpp"
-#include "integration/sql/connection_manager.hpp"
 #include "session_stack.hpp"
 #include "test_helpers.hpp"
 
+#include "../mock/cell.hpp"
 #include "../mock/mock_config.hpp"
 #include "../mock/parser.hpp"
 #include "../mock/sql_db_connector.hpp"
@@ -90,8 +87,9 @@ namespace {
         fields.emplace_back(types::logical_type::STRING_LITERAL, "name");
         data_chunk_t chunk(resource, fields, wide_slice_rows);
         for (size_t row = 0; row < wide_slice_rows; ++row) {
-            chunk.set_value(0, row, types::logical_value_t(resource, static_cast<int32_t>(row)));
-            chunk.set_value(1, row, types::logical_value_t(resource, wide_slice_name(row)));
+            chunk.set_value(0, row, static_cast<int32_t>(row));
+            const std::string name = wide_slice_name(row);
+            chunk.set_value(1, row, std::string_view{name});
         }
         chunk.set_cardinality(wide_slice_rows);
         return chunk;
@@ -153,85 +151,51 @@ namespace {
             INFO("row " << row);
             const run_cell_t cell = locate(run, row);
             REQUIRE(cell.chunk != nullptr);
-            REQUIRE(cell.chunk->value(0, cell.row).value<int32_t>() == static_cast<int32_t>(row));
-            REQUIRE(cell.chunk->value(1, cell.row).value<std::string_view>() == wide_slice_name(row));
+            REQUIRE(otterstax::test::cell(*cell.chunk, 0, cell.row).value<int32_t>() == static_cast<int32_t>(row));
+            REQUIRE(otterstax::test::cell(*cell.chunk, 1, cell.row).value<std::string_view>() == wide_slice_name(row));
         }
     }
 
-    // The remote backends alone over the MySQL connector `factory`; connection
-    // "1" opened when `open_one` (database "db", the mock's discovery).
-    struct mysql_backend {
-        std::pmr::synchronized_pool_resource arena{std::pmr::new_delete_resource()};
-        // The backends pool the statements run on; outlives the backends.
-        otterstax::runtime::runtime_t runtime{otterstax::test::test_runtime_config()};
-        otterstax::backends::remote_backends_t remote;
+} // namespace
 
-        mysql_backend(mysql::connector_factory factory, bool open_one)
-            : remote(&arena,
-                     otterstax::backends::remote_backends_options_t{
-                         .connectors = otterstax::backends::connector_factories_t{.mysql = factory},
-                         .connector_threads = {2, 2, 2},
-                         .statements = runtime.backends_scheduler()}) {
-            config::ConnectionsConfig connections;
-            if (open_one) {
-                connections.mysql = otterstax::test::mock_mysql({"1"});
-            }
-            auto opened = remote.open(connections, config::ConnectionRetryConfig{});
-            INFO(opened.what.c_str());
-            REQUIRE_FALSE(opened.contains_error());
-        }
+namespace {
 
-        // One read of `1`.db.table, the rows it answered or its error.
-        core::error_t scan(std::shared_ptr<fed::scan_rows_t> rows) {
-            return drive_until_ready(remote.mysql().scan(
-                &arena,
-                fed::scan_request_t{"1", "SELECT `id`, `name` FROM `db`.`table`", {}},
-                std::move(rows)));
-        }
-    };
+    // One read of db.table on a MySQL agent over the connector `factory`.
+    otterstax::federation::backend_agent_t::rows_t scan(otterstax::test::agent_driver_t& agent) {
+        return agent.read("SELECT `id`, `name` FROM `db`.`table`");
+    }
 
 } // namespace
 
-TEST_CASE("MySQLManager::scan: a read of a connection nobody opened is do_not_exists") {
-    mysql_backend backend(&mysql_mock_connector_factory, false);
-    auto read = backend.scan(std::make_shared<fed::scan_rows_t>());
-    REQUIRE(read.contains_error());
-    REQUIRE(read.type == core::error_code_t::do_not_exists);
-    REQUIRE(std::string{read.what.c_str()}.find("1") != std::string::npos);
+TEST_CASE("mysql agent read: a connector that resolves without a chunk is an error, not a dereference") {
+    otterstax::test::agent_driver_t agent(&chunkless_connector_factory);
+    auto read = scan(agent);
+    REQUIRE(read.has_error());
+    REQUIRE(std::string{read.error().what.c_str()}.find("returned no result chunk") != std::string::npos);
 }
 
-TEST_CASE("MySQLManager::scan: a connector that resolves without a chunk is an error, not a dereference") {
-    mysql_backend backend(&chunkless_connector_factory, true);
-    auto read = backend.scan(std::make_shared<fed::scan_rows_t>());
-    REQUIRE(read.contains_error());
-    REQUIRE(std::string{read.what.c_str()}.find("returned no result chunk") != std::string::npos);
-}
-
-TEST_CASE("MySQLManager::scan: a connector failure keeps its own error code") {
-    mysql_backend backend(&mysql_mock_connector_factory_throw, true);
-    auto read = backend.scan(std::make_shared<fed::scan_rows_t>());
-    REQUIRE(read.contains_error());
+TEST_CASE("mysql agent read: a connector failure keeps its own error code") {
+    otterstax::test::agent_driver_t agent(&mysql_mock_connector_factory_throw);
+    auto read = scan(agent);
+    REQUIRE(read.has_error());
     // The throw on the io thread is marshalled as io_error by the connector
-    // layer; the manager hands that code through untouched.
-    REQUIRE(read.type == core::error_code_t::io_error);
-    REQUIRE(std::string{read.what.c_str()}.find("MockConnector: exception in runQuery") != std::string::npos);
+    // layer; the agent hands that code through untouched.
+    REQUIRE(read.error().type == core::error_code_t::io_error);
+    REQUIRE(std::string{read.error().what.c_str()}.find("MockConnector: exception in runQuery") != std::string::npos);
 }
 
-TEST_CASE("MySQLManager::scan: the rows a read answered are handed over whole") {
-    mysql_backend backend(&mysql_mock_connector_factory, true);
-    auto rows = std::make_shared<fed::scan_rows_t>();
-    auto read = backend.scan(rows);
-    INFO(read.what.c_str());
-    REQUIRE_FALSE(read.contains_error());
-    REQUIRE(rows->chunks.size() == 1);
-    REQUIRE(rows->chunks.front().size() == 2);
+TEST_CASE("mysql agent read: the rows a read answered are handed over whole") {
+    otterstax::test::agent_driver_t agent(&mysql_mock_connector_factory);
+    auto read = scan(agent);
+    INFO((read.has_error() ? read.error().what.c_str() : "ok"));
+    REQUIRE_FALSE(read.has_error());
+    REQUIRE(read.value().size() == 1);
+    REQUIRE(read.value().front().size() == 2);
 }
 
-TEST_CASE("MySQLManager::write: the count the backend reports is the write's") {
-    mysql_backend backend(&mysql_mock_connector_factory, true);
-    auto written = drive_until_ready(backend.remote.mysql().write(
-        &backend.arena,
-        fed::write_request_t{"1", "DELETE FROM `db`.`table`;", fed::write_kind_t::delete_}));
+TEST_CASE("mysql agent write: the count the backend reports is the write's") {
+    otterstax::test::agent_driver_t agent(&mysql_mock_connector_factory);
+    auto written = agent.write("DELETE FROM `db`.`table`;", otterstax::federation::write_kind_t::delete_);
     INFO((written.has_error() ? written.error().what.c_str() : "ok"));
     REQUIRE_FALSE(written.has_error());
     // The mock connector answers every write with 42 affected rows.
@@ -254,49 +218,47 @@ TEST_CASE("federation read: a result wider than one engine chunk reaches the cur
     require_wide_slice_run(selected.value().chunks);
 }
 
+// A DML whose target is a connection's table (c.d.s.t) runs on the engine: the engine offers the
+// statement to the table's storage, the backend actor, which runs it on the backend; the count is
+// the backend's (the mock answers every write with 42). Simple and prepared with a bound value.
 TEST_CASE("federation write: a remote DML answers the backend's count through the session") {
     otterstax::test::stack_options_t options;
     options.connections.mysql = otterstax::test::mock_mysql({"orders"});
     otterstax::test::session_stack_owner owner(otterstax::test::unique_test_dir("test_backend_managers_dml"), options);
-    auto deleted = otterstax::test::run_session_sql_payload(owner.stack(), 1, "DELETE FROM orders.db.\"table\" WHERE id = 1;");
+    auto updated = otterstax::test::run_session_sql_payload(owner.stack(),
+                                                            1,
+                                                            "UPDATE orders.db.public.\"table\" SET name = 'x' WHERE id = 1;");
+    INFO((updated.has_error() ? updated.error().what.c_str() : "ok"));
+    REQUIRE_FALSE(updated.has_error());
+    REQUIRE(updated.value().column_count() == 0);
+    REQUIRE(updated.value().reported_rows() == 42);
+
+    auto deleted =
+        otterstax::test::run_session_sql_payload(owner.stack(), 2, "DELETE FROM orders.db.public.\"table\" WHERE id = 1;");
     INFO((deleted.has_error() ? deleted.error().what.c_str() : "ok"));
     REQUIRE_FALSE(deleted.has_error());
     REQUIRE(deleted.value().column_count() == 0);
     REQUIRE(deleted.value().reported_rows() == 42);
 
+    // An INSERT reaches the backend as a write of the rows the engine appended: the count is the
+    // backend's as well.
     auto inserted = otterstax::test::run_session_sql_payload(owner.stack(),
-                                                             2,
-                                                             "INSERT INTO orders.db.\"table\" (id, name) VALUES (9, 'z');");
+                                                             4,
+                                                             "INSERT INTO orders.db.public.\"table\" (id, name) VALUES (9, 'z');");
     INFO((inserted.has_error() ? inserted.error().what.c_str() : "ok"));
     REQUIRE_FALSE(inserted.has_error());
+    REQUIRE(inserted.value().column_count() == 0);
     REQUIRE(inserted.value().reported_rows() == 42);
 
-    // A four-part DML target: the engine's transformer keeps no uid slot on a
-    // DML target (waits for otterbrix), so the session runs the statement on the
-    // backend directly, generated from the parsed plan; its count the backend's.
-    auto four = otterstax::test::run_session_sql_payload(owner.stack(),
-                                                         3,
-                                                         "UPDATE orders.db.public.\"table\" SET name = 'x' WHERE id = 1;");
-    INFO((four.has_error() ? four.error().what.c_str() : "ok"));
-    REQUIRE_FALSE(four.has_error());
-    REQUIRE(four.value().column_count() == 0);
-    REQUIRE(four.value().reported_rows() == 42);
-    auto four_insert = otterstax::test::run_session_sql_payload(
-        owner.stack(),
-        4,
-        "INSERT INTO orders.db.public.\"table\" (id, name) VALUES (10, 'y');");
-    INFO((four_insert.has_error() ? four_insert.error().what.c_str() : "ok"));
-    REQUIRE_FALSE(four_insert.has_error());
-    REQUIRE(four_insert.value().reported_rows() == 42);
     // ... prepared and executed with a bound value as well.
     auto prepared = otterstax::test::prepare_session_sql(owner.stack(),
-                                                         5,
+                                                         3,
                                                          "DELETE FROM orders.db.public.\"table\" WHERE id = $1;");
     INFO((prepared.has_error() ? prepared.error().what.c_str() : "ok"));
     REQUIRE_FALSE(prepared.has_error());
-    std::pmr::vector<components::types::logical_value_t> values(owner.engine().resource());
-    values.emplace_back(owner.engine().resource(), std::int64_t{1});
-    auto executed = otterstax::test::execute_session_prepared(owner.stack(), 5, std::move(values));
+    std::pmr::vector<components::vector::vector_t> values(owner.engine().resource());
+    values.push_back(components::vector::make_scalar(owner.engine().resource(), std::int32_t{1}));
+    auto executed = otterstax::test::execute_session_prepared(owner.stack(), 3, std::move(values));
     INFO((executed.has_error() ? executed.error().what.c_str() : "ok"));
     REQUIRE_FALSE(executed.has_error());
     REQUIRE(executed.value().reported_rows() == 42);
@@ -325,10 +287,6 @@ TEST_CASE("federation write: a remote DML answers the backend's count through th
 namespace {
 
     constexpr const char* kNotNullUid = "nulls";
-    const otterstax::names::alias_registry_t& nulls_aliases() {
-        static const auto aliases = make_aliases({{kNotNullUid, backend_type_t::PostgreSQL, "pgdb", "public"}});
-        return aliases;
-    }
     constexpr size_t not_null_rows = 2000;
     constexpr Oid kNotNullInt4Oid = 23;
     constexpr Oid kNotNullTextOid = 25;
@@ -385,11 +343,13 @@ namespace {
             }
             auto chunk = std::make_unique<data_chunk_t>(resource_, fields, not_null_rows);
             for (size_t row = 0; row < not_null_rows; ++row) {
-                chunk->set_value(id_col, row, types::logical_value_t(resource_, static_cast<int32_t>(row)));
-                chunk->set_value(label_col,
-                                 row,
-                                 row == NullRow ? types::logical_value_t(resource_, nullptr)
-                                                : types::logical_value_t(resource_, not_null_label(row)));
+                chunk->set_value(id_col, row, static_cast<int32_t>(row));
+                if (row == NullRow) {
+                    chunk->data[label_col].set_null(row, true);
+                } else {
+                    const std::string label = not_null_label(row);
+                    chunk->set_value(label_col, row, std::string_view{label});
+                }
             }
             chunk->set_cardinality(not_null_rows);
             co_return std::move(chunk);
@@ -471,6 +431,7 @@ namespace {
     };
 
     constexpr const char* kNotNullTable = "CREATE TABLE nndb.target (id int, label string NOT NULL);";
+    constexpr const char* kNotNullSchema = "CREATE SCHEMA nndb;";
 
     // What a statement answered, and how many rows nndb.target holds afterwards.
     struct not_null_insert_outcome_t {
@@ -486,8 +447,8 @@ namespace {
         auto s = owner.stack();
         session_hash_t id = 9900;
         std::string err;
-        const bool created_db = otterstax::test::run_session_sql(s, id++, "CREATE DATABASE nndb;", err);
-        INFO("CREATE DATABASE: " << err);
+        const bool created_db = otterstax::test::run_session_sql(s, id++, kNotNullSchema, err);
+        INFO("CREATE SCHEMA: " << err);
         REQUIRE(created_db);
         const bool created_tbl = otterstax::test::run_session_sql(s, id++, kNotNullTable, err);
         INFO("CREATE TABLE: " << err);
@@ -509,7 +470,7 @@ namespace {
         auto engine = std::make_unique<otterstax::test::test_engine_t>(data_dir);
         not_null_insert_outcome_t outcome{false, {}, 0};
         {
-            auto created_db = engine->sql("CREATE DATABASE nndb;");
+            auto created_db = engine->sql(kNotNullSchema);
             REQUIRE(created_db);
             REQUIRE_FALSE(created_db->is_error());
             auto created_tbl = engine->sql(kNotNullTable);
@@ -586,11 +547,7 @@ TEST_CASE("engine alone: a literal INSERT with a NULL past the first chunk of a 
 namespace {
 
     constexpr const char* kChUid = "chx";
-    constexpr const char* kChEvents = "chx.chdb.events";
-    const otterstax::names::alias_registry_t& chx_aliases() {
-        static const auto aliases = make_aliases({{kChUid, backend_type_t::ClickHouse, "chdb"}});
-        return aliases;
-    }
+    constexpr const char* kChEvents = "chx.chdb.public.events";
     constexpr size_t ch_event_rows = 2500;
     // The rows of the first data block; the second holds the rest, so the block boundary falls inside
     // an engine chunk.
@@ -832,39 +789,39 @@ namespace {
     // Row `row` of chdb.events, read at row `at` of `chunk`, whose columns are (id, nums, tags, rec).
     void require_ch_event_row(const data_chunk_t& chunk, uint64_t at, size_t row) {
         INFO("row " << row);
-        REQUIRE(chunk.value(0, at).value<int32_t>() == static_cast<int32_t>(row));
+        REQUIRE(otterstax::test::cell(chunk, 0, at).value<int32_t>() == static_cast<int32_t>(row));
 
-        const auto nums = chunk.value(1, at);
+        const auto nums = otterstax::test::cell(chunk, 1, at);
         const auto expected_nums = ch_nums_of(row);
-        REQUIRE(nums.children().size() == expected_nums.size());
+        REQUIRE(nums.child_count() == expected_nums.size());
         for (size_t i = 0; i < expected_nums.size(); ++i) {
             INFO("nums[" << i << "]");
             if (expected_nums[i]) {
-                REQUIRE(nums.children()[i].value<int32_t>() == *expected_nums[i]);
+                REQUIRE(nums.child(i).value<int32_t>() == *expected_nums[i]);
             } else {
-                REQUIRE(nums.children()[i].is_null());
+                REQUIRE(nums.child(i).is_null());
             }
         }
 
-        const auto tags = chunk.value(2, at);
+        const auto tags = otterstax::test::cell(chunk, 2, at);
         const auto expected_tags = ch_tags_of(row);
-        REQUIRE(tags.children().size() == expected_tags.size());
+        REQUIRE(tags.child_count() == expected_tags.size());
         for (size_t i = 0; i < expected_tags.size(); ++i) {
             INFO("tags[" << i << "]");
             if (expected_tags[i]) {
-                REQUIRE(tags.children()[i].value<std::string_view>() == *expected_tags[i]);
+                REQUIRE(tags.child(i).value<std::string_view>() == *expected_tags[i]);
             } else {
-                REQUIRE(tags.children()[i].is_null());
+                REQUIRE(tags.child(i).is_null());
             }
         }
 
-        const auto rec = chunk.value(3, at);
-        REQUIRE(rec.children().size() == 2);
-        REQUIRE(rec.children()[0].value<int32_t>() == static_cast<int32_t>(row));
+        const auto rec = otterstax::test::cell(chunk, 3, at);
+        REQUIRE(rec.child_count() == 2);
+        REQUIRE(rec.child(0).value<int32_t>() == static_cast<int32_t>(row));
         if (const auto b = ch_rec_b_of(row)) {
-            REQUIRE(rec.children()[1].value<std::string_view>() == *b);
+            REQUIRE(rec.child(1).value<std::string_view>() == *b);
         } else {
-            REQUIRE(rec.children()[1].is_null());
+            REQUIRE(rec.child(1).is_null());
         }
     }
 
@@ -911,8 +868,8 @@ TEST_CASE("ClickhouseManager slice: an engine JOIN on the scalar id keeps the LI
     auto s = owner.stack();
     session_hash_t id = 9960;
     std::string err;
-    const bool created_db = otterstax::test::run_session_sql(s, id++, "CREATE DATABASE lk;", err);
-    INFO("CREATE DATABASE: " << err);
+    const bool created_db = otterstax::test::run_session_sql(s, id++, "CREATE SCHEMA lk;", err);
+    INFO("CREATE SCHEMA: " << err);
     REQUIRE(created_db);
     const bool created_tbl = otterstax::test::run_session_sql(s, id++, "CREATE TABLE lk.keys (id int);", err);
     INFO("CREATE TABLE: " << err);
@@ -940,7 +897,7 @@ TEST_CASE("ClickhouseManager slice: an engine JOIN on the scalar id keeps the LI
         }
         REQUIRE(chunk.column_count() == 4);
         for (uint64_t at = 0; at < chunk.size(); ++at) {
-            const auto row = chunk.value(0, at).value<int32_t>();
+            const auto row = otterstax::test::cell(chunk, 0, at).value<int32_t>();
             ids.push_back(row);
             require_ch_event_row(chunk, at, static_cast<size_t>(row));
         }
@@ -975,7 +932,7 @@ TEST_CASE("ClickHouse prepare_schema: AVG(score) AS score is prepared and stream
     REQUIRE(column_types.size() == 1);
     REQUIRE(column_types[0].type() == types::logical_type::DOUBLE);
     REQUIRE(column_types[0].type() == schema.child_types()[0].type());
-    REQUIRE(executed.value().chunks.front().value(0, 0).value<double>() == ch_average_score);
+    REQUIRE(otterstax::test::cell(executed.value().chunks.front(), 0, 0).value<double>() == ch_average_score);
 
     auto flight_schema = to_arrow_schema(s.resource, schema);
     INFO("arrow schema: " << (flight_schema.has_error() ? flight_schema.error().what.c_str() : "ok"));

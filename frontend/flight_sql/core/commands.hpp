@@ -9,11 +9,9 @@
 #include <core/core.hpp>
 
 #include <memory>
-
-namespace arrow::flight::protocol::sql {
-    class CommandGetDbSchemas;
-    class CommandGetTables;
-}
+#include <memory_resource>
+#include <string>
+#include <vector>
 
 namespace flight::core {
 
@@ -27,19 +25,13 @@ grpc::Status execute_descriptor(FlightSqlCore& core, engine::SessionEngine& engi
                                 const arrow::flight::protocol::FlightDescriptor& descriptor,
                                 const std::string& client, CachedResultPtr* result_out);
 
-// The GetCatalogs / GetDbSchemas / GetTables answers over one metadata
-// listing: every catalog once, every (catalog, schema) pair once under its
-// own catalog, every table under its catalog and schema, in the listing's
-// order (catalog_name, then db_schema_name, then table_name). GetDbSchemas and
-// GetTables keep the rows of `catalog` (exact match) when the command carries
-// it, and those whose schema matches db_schema_filter_pattern (LIKE); GetTables
-// also filters on table_name_filter_pattern (LIKE) and table_types. Throw
-// EngineError.
-std::shared_ptr<arrow::RecordBatch> catalogs_batch(const EngineMetadata& md);
-std::shared_ptr<arrow::RecordBatch> db_schemas_batch(const arrow::flight::protocol::sql::CommandGetDbSchemas& cmd,
-                                                     const EngineMetadata& md);
-std::shared_ptr<arrow::RecordBatch> tables_batch(const arrow::flight::protocol::sql::CommandGetTables& cmd,
-                                                 const EngineMetadata& md);
+// The GetCatalogs / GetDbSchemas / GetTables answers over what
+// engine::SessionEngine listed (filtered and sorted there): one row per
+// catalog, per (catalog, schema), per table — its arrow schema serialized when
+// `include_schema`, NULL otherwise. Throw EngineError.
+std::shared_ptr<arrow::RecordBatch> catalogs_batch(const std::vector<std::string>& catalogs);
+std::shared_ptr<arrow::RecordBatch> db_schemas_batch(const std::vector<DbSchema>& schemas);
+std::shared_ptr<arrow::RecordBatch> tables_batch(const std::pmr::vector<table_info>& tables, bool include_schema);
 
 // Parse the DoPut command (the Any from the first FlightData).
 enum class DoPutKind { Update, PreparedUpdate, PreparedBind };

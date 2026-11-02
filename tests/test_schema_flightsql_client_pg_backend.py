@@ -8,12 +8,13 @@ from flightsql import FlightSQLClient
 import pyarrow as pa
 import pyarrow.ipc as ipc
 
-# GetTables lists the engine's own tables beside the remote ones
-# (catalog/introspection.cpp), each local one under its database with an empty
-# schema. Only the backend's databases are validated here, so a local table of
-# the same name — or one whose column Arrow cannot carry, whose table_schema is
-# NULL — never stands in for a backend table.
-BACKEND_CATALOGS = {'pgdb'}
+# GetTables lists the engine's catalog, local and remote tables alike
+# (frontend/flight_sql/session_engine.cpp, SessionEngine::tables): a catalog is
+# a database as SQL writes it — `d` for a local one, `c.d` for the database d of
+# the connection c (tests/scripts/config.yaml). Only the backend's catalogs are
+# validated here, so a local table of the same name — or one whose column Arrow
+# cannot carry, whose table_schema is NULL — never stands in for a backend table.
+BACKEND_CATALOGS = {'products.pgdb'}
 
 def validate_table_schemas(client, expected_schemas):
     """Validate table schemas using get_tables method"""

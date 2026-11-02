@@ -43,7 +43,7 @@ import sys
 
 from config import get_host, MYSQL_PORT
 
-DB = "mysql_wire_proto"
+DB = "mysql_wire_proto"          # a schema of the session's database, main
 PLAIN = "plain"
 WIDE = "wide"
 UWIDE = "uwide"
@@ -236,7 +236,7 @@ class MysqlWireProtocolTest:
 
     def setup(self):
         self.wire = self.connect()
-        self.run_ok(self.wire, f"CREATE DATABASE {DB}")
+        self.run_ok(self.wire, f"CREATE SCHEMA {DB}")
         self.database_created = True
         self.run_ok(self.wire, f"CREATE TABLE {DB}.{PLAIN} (id bigint, name string)")
         self.created_tables.append(PLAIN)
@@ -257,7 +257,7 @@ class MysqlWireProtocolTest:
             for table in self.created_tables:
                 self.wire.query(f"DROP TABLE {DB}.{table}")
             if self.database_created:
-                self.wire.query(f"DROP DATABASE {DB}")
+                self.wire.query(f"DROP SCHEMA {DB} CASCADE")
         finally:
             self.wire.quit()
             self.wire.close()

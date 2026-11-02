@@ -53,13 +53,16 @@ namespace otterstax::runtime {
         // that created no Main (a test) gets one created under that directory.
         //
         // A refused start — a log that cannot be made (make_engine_log's
-        // error), a held `.lock` (already_exists), an unreadable WAL (io_error),
-        // a bad config.execution (invalid_parameter), the runtime's engine pools
-        // already used (invalid_parameter) — is the error; its message lives on
+        // error), a held `.lock` (lock_file_exists), an unreadable WAL
+        // (io_error), a bad config.execution (invalid_parameter), the runtime's
+        // engine pools already used (invalid_parameter), an exception out of
+        // open_engine (internal_error) — is the error; its message lives on
         // new_delete_resource, so it outlives the runtime. A refusal once the
         // pools were lent spends them: the next engine needs a new runtime_t.
-        // `primitives` are the host's optimizer rules and name resolution
-        // need/decide; empty is otterbrix's "resolve nothing".
+        // `primitives` maps every host connection to its backend actor
+        // (remote_backends_t::primitives(); read once, during the call); empty
+        // is an engine with no connection, where a statement reaching a
+        // connection's database is refused. The actors must outlive the engine.
         [[nodiscard]] static core::result_wrapper_t<engine_ptr> open(runtime_t& runtime,
                                                                       const config::EngineConfig& engine,
                                                                       components::planner::primitives_t primitives = {});

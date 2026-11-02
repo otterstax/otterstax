@@ -3,8 +3,8 @@
 
 #include "session_engine.hpp"
 
-#include "catalog/introspection.hpp"
 #include "frontend/common/asio_future_bridge.hpp"
+#include "otterbrix/federation/metadata.hpp"
 #include "otterbrix/translators/input/arrow_to_chunk.hpp"
 #include "otterbrix/translators/output/chunk_to_arrow.hpp"
 #include "otterbrix/translators/output/writable_columns.hpp"
@@ -13,7 +13,10 @@
 #include "utility/tracy_profiler.hpp"
 
 #include <algorithm>
+#include <optional>
 #include <string>
+#include <string_view>
+#include <tuple>
 #include <vector>
 
 using namespace components::types;
@@ -70,6 +73,68 @@ namespace flight::engine {
             return result;
         }
 
+        // A SQL string literal / quoted identifier of `text`: an embedded quote doubled.
+        std::string enquote(std::string_view text, char quote) {
+            std::string out(1, quote);
+            for (const char c : text) {
+                if (c == quote) {
+                    out.push_back(quote);
+                }
+                out.push_back(c);
+            }
+            out.push_back(quote);
+            return out;
+        }
+        std::string literal(std::string_view text) { return enquote(text, '\''); }
+
+        // The schemas a client may list (n), with their database (d): every
+        // one but the system schemas and the database `federation` OtterStax
+        // keeps its own tables in.
+        std::string listed_schemas_where() {
+            return " WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') AND NOT (d.datconnection = '' AND "
+                   "d.datname = " +
+                   literal(otterstax::federation::metadata_database) + ")";
+        }
+        constexpr std::string_view schemas_from =
+            " FROM pg_catalog.pg_namespace n JOIN pg_catalog.pg_database d ON n.nspdatabase = d.oid";
+
+        // The database `catalog` names, as catalog_of writes it: `d` local,
+        // `c.d` of the connection c (an alias has no dot, the first one splits).
+        std::string catalog_filter(const std::optional<std::string>& catalog) {
+            if (!catalog) {
+                return {};
+            }
+            std::string filter = " AND ((d.datconnection = '' AND d.datname = " + literal(*catalog) + ")";
+            if (const auto dot = catalog->find('.'); dot != std::string::npos) {
+                filter += " OR (d.datconnection = " + literal(catalog->substr(0, dot)) +
+                          " AND d.datname = " + literal(catalog->substr(dot + 1)) + ")";
+            }
+            return filter + ")";
+        }
+
+        std::string like_filter(std::string_view column, const std::string& pattern) {
+            return pattern.empty() ? std::string{} : " AND " + std::string{column} + " LIKE " + literal(pattern);
+        }
+
+        // Every row of `payload` as its text cells (the listing selects text
+        // columns only; a NULL is empty).
+        std::vector<std::vector<std::string>> text_rows(const session_payload& payload) {
+            std::vector<std::vector<std::string>> rows;
+            for (const auto& chunk : payload.chunks) {
+                for (std::uint64_t row = 0; row < chunk.size(); ++row) {
+                    auto& cells = rows.emplace_back();
+                    for (const auto& column : chunk.data) {
+                        if (column.is_null(row) || column.type().type() != logical_type::STRING_LITERAL) {
+                            cells.emplace_back();
+                        } else {
+                            cells.emplace_back(column.get_value<std::string_view>(row));
+                        }
+                    }
+                }
+            }
+            return rows;
+        }
+
     } // namespace
 
     SessionEngine::SessionEngine(otterstax::session::session_factory_t& sessions, std::pmr::memory_resource* resource)
@@ -119,30 +184,23 @@ namespace flight::engine {
         return {id, std::move(payload)};
     }
 
-    std::pmr::vector<std::pmr::vector<components::types::logical_value_t>>
-    SessionEngine::to_param_rows(const core::BoundParams& params) {
-        std::pmr::vector<std::pmr::vector<components::types::logical_value_t>> rows(resource_);
+    std::pmr::vector<components::vector::data_chunk_t> SessionEngine::to_param_chunks(const core::BoundParams& params) {
+        std::pmr::vector<components::vector::data_chunk_t> chunks(resource_);
         for (const auto& batch : params) {
             if (!batch || batch->num_rows() == 0) {
                 continue;
             }
-            // The project's own reader: an arrow batch -> engine chunk; each
-            // chunk cell IS a logical_value_t, which is what the binder takes.
+            // The project's own reader: an arrow batch -> engine chunk, whose
+            // rows are what the binder takes.
             auto converted = tsl::arrow_to_chunk(resource_, batch);
             if (converted.has_error()) {
                 throw core::EngineError(converted.error().what.c_str());
             }
-            const auto& chunk = converted.value();
-            for (std::size_t r = 0; r < chunk.size(); ++r) {
-                std::pmr::vector<components::types::logical_value_t> row(resource_);
-                row.reserve(chunk.column_count());
-                for (std::size_t c = 0; c < chunk.column_count(); ++c) {
-                    row.push_back(chunk.value(c, r));
-                }
-                rows.push_back(std::move(row));
+            for (auto& chunk : converted.value()) {
+                chunks.push_back(std::move(chunk));
             }
         }
-        return rows;
+        return chunks;
     }
 
     template<typename Session>
@@ -150,29 +208,36 @@ namespace flight::engine {
     SessionEngine::run_prepared(const Session& session, const std::string& sql, const core::BoundParams& params) {
         OTX_ZONE_N("flight::SessionEngine::run_prepared");
         auto [id, prepared_payload] = prepare_fresh(session, sql);
-        auto parameters = to_param_rows(params);
-        if (prepared_payload.parameter_count > 0 && parameters.size() != 1 && !parameters.empty()) {
+        auto parameters = to_param_chunks(params);
+        std::size_t rows = 0;
+        for (const auto& chunk : parameters) {
+            rows += chunk.size();
+        }
+        if (prepared_payload.parameter_count > 0 && rows != 1 && rows != 0) {
             // executemany goes row-by-row upstream; a single run takes one row
             close_quietly(session, id);
             throw core::EngineError("prepared statement takes one parameter row per execution, got " +
-                                    std::to_string(parameters.size()));
+                                    std::to_string(rows));
         }
-        if (prepared_payload.parameter_count > 0 &&
-            (parameters.empty() || parameters.front().size() != prepared_payload.parameter_count)) {
+        const std::size_t columns = parameters.empty() ? 0 : parameters.front().column_count();
+        if (prepared_payload.parameter_count > 0 && (rows == 0 || columns != prepared_payload.parameter_count)) {
             close_quietly(session, id);
             throw core::EngineError("prepared statement takes " + std::to_string(prepared_payload.parameter_count) +
-                                    " parameter(s), got " +
-                                    std::to_string(parameters.empty() ? 0 : parameters.front().size()));
+                                    " parameter(s), got " + std::to_string(rows == 0 ? 0 : columns));
         }
-        auto bound = parameters.empty() ? std::pmr::vector<components::types::logical_value_t>{resource_}
-                                        : std::move(parameters.front());
+        auto bound = parameters.empty()
+                         ? components::vector::data_chunk_t(resource_,
+                                                            std::pmr::vector<components::types::complex_logical_type>{resource_},
+                                                            1)
+                         : std::move(parameters.front());
         return call(
             session,
             [&, id = id](query_session_t& target) {
                 return actor_zeta::send(target.address(),
                                         &query_session_t::execute_prepared_statement,
                                         id,
-                                        std::move(bound))
+                                        std::move(bound),
+                                        uint64_t{0})
                     .second;
             },
             "executing the prepared statement");
@@ -180,11 +245,11 @@ namespace flight::engine {
 
     template<typename Session>
     void SessionEngine::refuse_open_transaction(const Session& session) {
-        auto state = otterstax::session::transaction_state_t::idle;
-        if (!session([&](query_session_t& target) { state = target.transaction_state(); })) {
+        auto status = query_session_t::transaction_status_t::idle;
+        if (!session([&](query_session_t& target) { status = target.transaction_status(); })) {
             throw core::EngineError("the prepared statement was closed");
         }
-        if (state == otterstax::session::transaction_state_t::idle) {
+        if (status == query_session_t::transaction_status_t::idle) {
             return;
         }
         // No Flight SQL scope outlives what it runs: a statement by text closes
@@ -352,55 +417,98 @@ namespace flight::engine {
         return affected;
     }
 
-    core::EngineMetadata SessionEngine::metadata() {
-        OTX_ZONE_N("flight::SessionEngine::metadata");
-        core::EngineMetadata metadata;
-
-        // One listing pass — the engine's own tables and the federation's remote
-        // ones — on a session of its own; every metadata command (Catalogs /
-        // DbSchemas / Tables / TableTypes) reads this answer.
+    std::vector<std::string> SessionEngine::catalogs() {
+        OTX_ZONE_N("flight::SessionEngine::catalogs");
         auto scope = sessions_.open();
         auto session = [&scope](auto&& use) {
             use(*scope);
             return true;
         };
-        auto classes = run_query(session, std::string{otterstax::catalog::classes_sql});
-        auto namespaces = run_query(session, std::string{otterstax::catalog::namespaces_sql});
-        auto attributes = run_query(session, std::string{otterstax::catalog::attributes_sql});
-        auto remote_tables = run_query(session, std::string{otterstax::catalog::remote_tables_sql});
-        auto remote_columns = run_query(session, std::string{otterstax::catalog::remote_columns_sql});
-        otterstax::catalog::get_tables_command_t command;
-        command.include_schema = true;
-        auto listed = otterstax::catalog::list_tables(resource_,
-                                                      command,
-                                                      namespaces.chunks,
-                                                      classes.chunks,
-                                                      &attributes.chunks,
-                                                      remote_tables.chunks,
-                                                      &remote_columns.chunks);
-        if (listed.has_error()) {
-            throw core::EngineError(std::string{"Error while reading table metadata: "} + listed.error().what.c_str());
+        // Every database of a listed schema (a local database has at least
+        // public; a connection's, the schemas registered of it).
+        auto listed = run_query(session,
+                                "SELECT DISTINCT d.datconnection, d.datname" + std::string{schemas_from} +
+                                    listed_schemas_where() + ";");
+        std::vector<std::string> out;
+        for (const auto& row : text_rows(listed)) {
+            out.push_back(core::catalog_of(row.at(0), row.at(1)));
         }
+        std::sort(out.begin(), out.end());
+        return out;
+    }
 
-        // The tables ride as the project's own table_info (qualified name +
-        // engine schema); the arrow schema of a table is built where the
-        // metadata batches are assembled (commands.cpp).
-        // GetCatalogs / GetDbSchemas answer each catalog and each (catalog,
-        // schema) pair once, ordered as the spec asks: catalog_name, then
-        // db_schema_name. A schema keeps the catalog that holds it.
-        for (const auto& table : listed.value()) {
-            metadata.catalogs.emplace_back(table.name.database.t.c_str());
-            metadata.db_schemas.push_back(core::DbSchema{table.name.database.t.c_str(), table.name.schema.t.c_str()});
-            metadata.tables.emplace_back(table);
+    std::vector<core::DbSchema> SessionEngine::db_schemas(const std::optional<std::string>& catalog,
+                                                          const std::string& schema_pattern) {
+        OTX_ZONE_N("flight::SessionEngine::db_schemas");
+        auto scope = sessions_.open();
+        auto session = [&scope](auto&& use) {
+            use(*scope);
+            return true;
+        };
+        auto listed = run_query(session,
+                                "SELECT d.datconnection, d.datname, n.nspname" + std::string{schemas_from} +
+                                    listed_schemas_where() + catalog_filter(catalog) +
+                                    like_filter("n.nspname", schema_pattern) + ";");
+        std::vector<core::DbSchema> out;
+        for (const auto& row : text_rows(listed)) {
+            out.push_back(core::DbSchema{core::catalog_of(row.at(0), row.at(1)), row.at(2)});
         }
-        std::sort(metadata.catalogs.begin(), metadata.catalogs.end());
-        metadata.catalogs.erase(std::unique(metadata.catalogs.begin(), metadata.catalogs.end()),
-                                metadata.catalogs.end());
-        std::sort(metadata.db_schemas.begin(), metadata.db_schemas.end());
-        metadata.db_schemas.erase(std::unique(metadata.db_schemas.begin(), metadata.db_schemas.end()),
-                                  metadata.db_schemas.end());
-        metadata.table_types.emplace_back(otterstax::catalog::table_type_name);
-        return metadata;
+        std::sort(out.begin(), out.end());
+        return out;
+    }
+
+    std::pmr::vector<table_info> SessionEngine::tables(const std::optional<std::string>& catalog,
+                                                       const std::string& schema_pattern,
+                                                       const std::string& table_pattern,
+                                                       bool include_schema) {
+        OTX_ZONE_N("flight::SessionEngine::tables");
+        auto scope = sessions_.open();
+        auto session = [&scope](auto&& use) {
+            use(*scope);
+            return true;
+        };
+        // Tables and views (r / g / v / m); no index, sequence or type.
+        auto listed = run_query(session,
+                                "SELECT d.datconnection, d.datname, n.nspname, c.relname FROM pg_catalog.pg_class c "
+                                "JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid JOIN pg_catalog.pg_database "
+                                "d ON n.nspdatabase = d.oid" +
+                                    listed_schemas_where() + " AND c.relkind IN ('r', 'g', 'v', 'm')" +
+                                    catalog_filter(catalog) + like_filter("n.nspname", schema_pattern) +
+                                    like_filter("c.relname", table_pattern) + ";");
+        std::pmr::vector<table_info> out(resource_);
+        for (auto& row : text_rows(listed)) {
+            out.push_back(table_info{qualified_name_t{::core::connection_name_t{row.at(0)},
+                                                      ::core::dbname_t{row.at(1)},
+                                                      ::core::schema_t{row.at(2)},
+                                                      ::core::relname_t{row.at(3)}},
+                                     {}});
+        }
+        std::sort(out.begin(), out.end(), [](const table_info& a, const table_info& b) {
+            return std::tuple{core::catalog_of(a.name.connection.t, a.name.database.t), a.name.schema.t, a.name.collection.t} <
+                   std::tuple{core::catalog_of(b.name.connection.t, b.name.database.t), b.name.schema.t, b.name.collection.t};
+        });
+        if (!include_schema) {
+            return out;
+        }
+        // The columns: the engine's describe of each table's `SELECT *` (no
+        // backend is asked). A table dropped since the listing keeps no schema.
+        for (auto& table : out) {
+            std::string sql = "SELECT * FROM ";
+            for (const auto* part : {&table.name.connection.t, &table.name.database.t, &table.name.schema.t}) {
+                if (!part->empty()) {
+                    sql += enquote(*part, '"') + ".";
+                }
+            }
+            sql += enquote(table.name.collection.t, '"') + ";";
+            try {
+                auto [id, described] = prepare_fresh(session, sql);
+                close_quietly(session, id);
+                table.schema = std::move(described.schema);
+            } catch (const core::EngineError& e) {
+                get_logger(logger_tag::FLIGHTSQL_SERVER)->warn("GetTables: describing {} failed: {}", sql, e.what());
+            }
+        }
+        return out;
     }
 
     std::string SessionEngine::dialect_name() const {

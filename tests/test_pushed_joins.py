@@ -6,8 +6,8 @@
 Over the PostgreSQL wire (port 8817), against tables this file makes on the
 backends directly (clickhouse_driver to clickhouse1, psycopg2 to postgres1,
 pymysql to mariadb1, as create_test_data.py does), so it runs only inside the
-test network; the server discovers each table on first use (one rediscovery
-retry).
+test network; the server registers each table the first time a statement
+names it.
 
   * ClickHouse: an INNER and a LEFT JOIN whose second table has a Bool column
     (system.columns says Bool, the wire says UInt8): the JOIN's result columns
@@ -36,12 +36,12 @@ CLICKHOUSE = dict(host=config.CH_DOCKER_HOST, port=config.CH_PORT, user="chuser"
 POSTGRES = dict(host="postgres1", port=5432, user="pguser", password="pgpassword", dbname="pgdb")
 MARIADB = dict(host="mariadb1", port=3306, user="user1", password="password1", database="db1")
 
-CH_PRODUCTS = f"{config.CH_ALIAS}.{config.CH_DATABASE}.schema.pj_products"
-CH_FLAGS = f"{config.CH_ALIAS}.{config.CH_DATABASE}.schema.pj_flags"
+CH_PRODUCTS = f"{config.CH_ALIAS}.{config.CH_DATABASE}.public.pj_products"
+CH_FLAGS = f"{config.CH_ALIAS}.{config.CH_DATABASE}.public.pj_flags"
 PG_CUSTOMERS = "products.pgdb.public.pj_customers"
 PG_ORDERS = "products.pgdb.public.pj_orders"
-MY_PRODUCTS = "campaigns.db1.schema.pj_products"
-MY_FLAGS = "campaigns.db1.schema.pj_flags"
+MY_PRODUCTS = "campaigns.db1.public.pj_products"
+MY_FLAGS = "campaigns.db1.public.pj_flags"
 
 # products: 1 apple, 2 pear, 3 plum (no flags row). The flags' own `name` sorts the other way round
 # from the products' (apple's flag is z-one, pear's a-two): sorting by the wrong table's `name`
@@ -105,10 +105,10 @@ class PushedJoinsTest:
                             [(pid, name) for pid, name, _ in FLAGS])
 
         self.pg = psycopg2.connect(host=self.host, port=config.PG_PORT, user="testuser", password="testpass",
-                                   dbname=config.CH_ALIAS)
+                                   dbname="main")  # the engine database the session is placed in
         self.pg.autocommit = True
         # The tables were made on the backends after the server started: the first statement naming
-        # each one rediscovers it.
+        # each one registers it.
         for table in (CH_PRODUCTS, CH_FLAGS, PG_CUSTOMERS, PG_ORDERS, MY_PRODUCTS, MY_FLAGS):
             self.rows(f"SELECT count(*) FROM {table}")
 

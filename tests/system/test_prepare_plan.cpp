@@ -22,7 +22,7 @@
 // LocalRelation, the name of an unsupported command) are pinned last.
 
 #include "frontend/spark_connect_server/service.hpp"
-#include "integration/postgresql/connection_manager.hpp"
+#include "../mock/cell.hpp"
 #include "otterbrix/parser/parser.hpp"
 #include "session_stack.hpp"
 
@@ -53,11 +53,8 @@ using otterstax::test::run_session_sql_payload;
 using otterstax::test::session_stack;
 
 namespace {
+
     constexpr const char* kUid = "planpg";
-    const otterstax::names::alias_registry_t& planpg_aliases() {
-        static const auto aliases = make_aliases({{kUid, backend_type_t::PostgreSQL, "pgdb", "public"}});
-        return aliases;
-    }
     // Every column of the one remote table, in backend order: the projection
     // the mock answers the describe probe and the data query with.
     constexpr std::string_view kSql = "SELECT id, name, price FROM planpg.pgdb.public.items;";
@@ -159,7 +156,6 @@ namespace {
         runQuery(std::string_view query,
                  otterstax::function_ref_t<std::unique_ptr<components::vector::data_chunk_t>(PGresult*)>) override {
             using components::types::complex_logical_type;
-            using components::types::logical_value_t;
             {
                 std::lock_guard guard(g_mutex);
                 g_data_queries.emplace_back(query);
@@ -170,9 +166,9 @@ namespace {
             }
             auto chunk = std::make_unique<components::vector::data_chunk_t>(resource_, fields, kRows.size());
             for (std::size_t row = 0; row < kRows.size(); ++row) {
-                chunk->set_value(0, row, logical_value_t(resource_, kRows[row].id));
-                chunk->set_value(1, row, logical_value_t(resource_, std::string_view{kRows[row].name}));
-                chunk->set_value(2, row, logical_value_t(resource_, kRows[row].price));
+                chunk->set_value(0, row, kRows[row].id);
+                chunk->set_value(1, row, std::string_view{kRows[row].name});
+                chunk->set_value(2, row, kRows[row].price);
             }
             chunk->set_cardinality(kRows.size());
             co_return std::move(chunk);
@@ -257,7 +253,8 @@ namespace {
         auto [ns, fut] = actor_zeta::send(s.session,
                                           &otterstax::session::query_session_t::prepare_plan,
                                           otterstax::test::stmt(id),
-                                          std::move(plan));
+                                          std::move(plan),
+                                          otterstax::session::query_session_t::rebuild_fn{});
         return await_session(std::move(fut), std::chrono::milliseconds(10000), s.resource);
     }
 
@@ -266,7 +263,8 @@ namespace {
         auto [ns, fut] = actor_zeta::send(s.session,
                                           &otterstax::session::query_session_t::execute_plan,
                                           otterstax::test::stmt(id),
-                                          std::move(plan));
+                                          std::move(plan),
+                                          otterstax::session::query_session_t::rebuild_fn{});
         return await_session(std::move(fut), std::chrono::milliseconds(10000), s.resource);
     }
 
@@ -289,9 +287,9 @@ namespace {
         std::vector<item_row> rows;
         for (const auto& chunk : payload.chunks) {
             for (std::size_t row = 0; row < chunk.size(); ++row) {
-                rows.push_back(item_row{chunk.value(0, row).value<int32_t>(),
-                                        std::string{chunk.value(1, row).value<std::string_view>()},
-                                        chunk.value(2, row).value<double>()});
+                rows.push_back(item_row{otterstax::test::cell(chunk, 0, row).value<int32_t>(),
+                                        std::string{otterstax::test::cell(chunk, 1, row).value<std::string_view>()},
+                                        otterstax::test::cell(chunk, 2, row).value<double>()});
             }
         }
         std::sort(rows.begin(), rows.end(), [](const item_row& a, const item_row& b) { return a.id < b.id; });
@@ -324,6 +322,7 @@ namespace {
     }
 
 #pragma GCC diagnostic pop
+
 } // namespace
 
 TEST_CASE("prepare_plan: a parsed remote SELECT is described and never executed") {
@@ -340,7 +339,7 @@ TEST_CASE("prepare_plan: a parsed remote SELECT is described and never executed"
     REQUIRE_FALSE(close_session_statement(s, by_sql).has_error());
 
     reset_queries();
-    GreenplumParser parser(s.resource, planpg_aliases());
+    GreenplumParser parser(s.resource);
     const session_hash_t by_plan = 9901;
     auto prepared = prepare_plan_on(s, by_plan, parse_plan(parser, kSql));
     INFO("prepare_plan: " << (prepared.has_error() ? prepared.error().what.c_str() : "ok"));
@@ -393,7 +392,7 @@ TEST_CASE("spark.sql classification: the parse tells a query from a command and 
     session_hash_t id = 9940;
     std::string err;
     for (const char* setup :
-         {"CREATE DATABASE plandb;", "CREATE TABLE plandb.t (id bigint);", "INSERT INTO plandb.t (id) VALUES (1);"}) {
+         {"CREATE SCHEMA plandb;", "CREATE TABLE plandb.t (id bigint);", "INSERT INTO plandb.t (id) VALUES (1);"}) {
         const bool ran = run_session_sql(s, id++, setup, err);
         INFO(setup << ": " << err);
         REQUIRE(ran);
@@ -402,7 +401,7 @@ TEST_CASE("spark.sql classification: the parse tells a query from a command and 
     // A SELECT over the remote table is a query, and classifying it asked the
     // backend nothing: no data query, not even a describe probe.
     reset_queries();
-    auto query = frontend::spark::classify_sql(std::string{kSql}, s.resource, planpg_aliases());
+    auto query = frontend::spark::classify_sql(std::string{kSql}, s.resource);
     INFO("classify_sql(query): " << (query.has_error() ? query.error().what.c_str() : "ok"));
     REQUIRE_FALSE(query.has_error());
     CHECK(query.value() == frontend::spark::sql_statement_t::query);
@@ -412,7 +411,7 @@ TEST_CASE("spark.sql classification: the parse tells a query from a command and 
     // An INSERT is a command, and classifying it writes nothing: the row is
     // written by the one execute ExecutePlan sends for it.
     const std::string insert = "INSERT INTO plandb.t (id) VALUES (2);";
-    auto command = frontend::spark::classify_sql(insert, s.resource, planpg_aliases());
+    auto command = frontend::spark::classify_sql(insert, s.resource);
     INFO("classify_sql(insert): " << (command.has_error() ? command.error().what.c_str() : "ok"));
     REQUIRE_FALSE(command.has_error());
     CHECK(command.value() == frontend::spark::sql_statement_t::command);
@@ -511,7 +510,7 @@ TEST_CASE("spark plan shapes: classify_sql calls only a SELECT of the core gramm
     using frontend::spark::sql_statement_t;
     std::pmr::synchronized_pool_resource pool;
     const auto kind_of = [&pool](const std::string& sql) {
-        auto kind = frontend::spark::classify_sql(sql, &pool, planpg_aliases());
+        auto kind = frontend::spark::classify_sql(sql, &pool);
         INFO(sql << ": " << (kind.has_error() ? kind.error().what.c_str() : "ok"));
         REQUIRE_FALSE(kind.has_error());
         return kind.value();
@@ -532,10 +531,10 @@ TEST_CASE("spark plan shapes: classify_sql calls only a SELECT of the core gramm
                   "VALUE_FORMAT='JSON', BOOTSTRAP_SERVERS='localhost:9092')") == sql_statement_t::command);
 
     // A statement the parser refuses is its error, message included.
-    auto broken = frontend::spark::classify_sql("SELEC 1", &pool, planpg_aliases());
+    auto broken = frontend::spark::classify_sql("SELEC 1", &pool);
     REQUIRE(broken.has_error());
     CHECK_FALSE(std::string_view{broken.error().what.c_str()}.empty());
-    auto explain = frontend::spark::classify_sql("EXPLAIN SELECT 1", &pool, planpg_aliases());
+    auto explain = frontend::spark::classify_sql("EXPLAIN SELECT 1", &pool);
     REQUIRE(explain.has_error());
     CHECK(std::string_view{explain.error().what.c_str()}.find("EXPLAIN") != std::string_view::npos);
 }

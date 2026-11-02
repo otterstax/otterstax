@@ -189,7 +189,7 @@ Results land in `benchmark_manual/<YYYYMMDD_HHMMSS>/`.
 ### Run a custom query
 
 ```bash
-echo "SELECT * FROM mysql1.benchdb1.campaigns LIMIT 10" > /tmp/my.sql
+echo "SELECT * FROM mysql1.benchdb1.public.campaigns LIMIT 10" > /tmp/my.sql
 ./benchmark/manual/run_query.sh --frontend mysql /tmp/my.sql
 ```
 
@@ -320,7 +320,7 @@ side (see "What the pushdown sends" below). The ClickHouse pairs of
 `join_cross_engine` take about a second because their key types differ
 (ClickHouse `UInt32` against `INT`): the engine has no hash join over keys cast
 to a common type and runs them nested-loop, 5 000 × 5 000 rows
-(OTB-hash-join-cast, `docs/proposals/scheduler-to-otterbrix-migration.md` §9).
+(OTB-hash-join-cast, `docs/proposals/otterbrix-embedding.md`).
 
 ## External-table tests (s3/file)
 
@@ -337,6 +337,12 @@ breakdown.
 | `external_dump` | `COPY (SELECT * FROM <loaded>) TO <target>` — writer + upload (source loaded once, untimed) | `{file,s3}_{parquet,csv,ndjson}` |
 | `external_join_cross` | external `regions` (s3/file) ⋈ otterbrix-internal `weights` (`CREATE TABLE`+`INSERT`) — the supported s3-join shape from `tests/test_mysql_join_otb_local_s3.py` | `{file,s3}_cross` |
 | `external_join_all` | s3 parquet `regions` ⋈ file csv `web_events` ⋈ internal `weights`, all on `campaign_id` — three origins joined at once | `s3parquet_filecsv_internal` |
+
+Every workload names its tables `bench_ext_<workload>_<frontend>.<table>`: a
+two-part name, the schema of the session's database (`main`), which the runner
+creates first (`CREATE SCHEMA IF NOT EXISTS`, `_ensure_schema` in
+`benchmarks/external_common.py`) — CREATE TABLE / CREATE EXTERNAL TABLE never
+create a schema or a database.
 
 `external_join_cross` / `external_join_all` deliberately load every side into
 otterbrix-internal storage first (external load + a hand-built `bigint` engine

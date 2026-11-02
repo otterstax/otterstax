@@ -50,7 +50,7 @@ namespace {
 
     // hdb.huge (id INT, big hugeint), empty; hdb.plain (id bigint, name string), one row.
     void seed(const session_stack& s, session_hash_t& id) {
-        run_or_fail(s, id++, "CREATE DATABASE hdb;");
+        run_or_fail(s, id++, "CREATE SCHEMA hdb;");
         run_or_fail(s, id++, "CREATE TABLE hdb.huge (id INT, big hugeint);");
         run_or_fail(s, id++, "CREATE TABLE hdb.plain (id bigint, name string);");
         run_or_fail(s, id++, "INSERT INTO hdb.plain (id, name) VALUES (1, 'one');");
@@ -111,7 +111,7 @@ TEST_CASE("a uhugeint column is refused by the export path, naming the column", 
     // signed, so the writers refuse it rather than emitting a wrong value.
     with_session_stack("/tmp/test_row_shape_select_uhugeint", [](session_stack s) {
         session_hash_t id = 9850;
-        run_or_fail(s, id++, "CREATE DATABASE udb;");
+        run_or_fail(s, id++, "CREATE SCHEMA udb;");
         run_or_fail(s, id++, "CREATE TABLE udb.uhuge (id INT, big uhugeint);");
 
         auto selected = run_session_sql_payload(s, id++, "SELECT big FROM udb.uhuge;");

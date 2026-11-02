@@ -8,6 +8,15 @@
 #include <algorithm>
 
 namespace frontend::mysql {
+    char to_lower(char c) { return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c; }
+
+    std::string to_lower(std::string text) {
+        for (auto& c : text) {
+            c = to_lower(c);
+        }
+        return text;
+    }
+
     namespace {
         enum class span_kind : uint8_t
         {
@@ -38,8 +47,6 @@ namespace frontend::mysql {
         }
 
         bool is_ident_char(char c) { return is_ident_start(c) || is_digit(c) || c == '$'; }
-
-        char to_lower(char c) { return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c; }
 
         // MySQL's spans, one at a time. An executable comment that runs opens a
         // region whose content is code until its */; the scanner remembers it.
@@ -306,12 +313,6 @@ namespace frontend::mysql {
                 scanner = ahead;
             }
             return false;
-        }
-
-        std::string lowered(std::string_view text) {
-            std::string out(text);
-            std::transform(out.begin(), out.end(), out.begin(), to_lower);
-            return out;
         }
 
         // The name run (identifier characters) starting at `i`.
@@ -647,7 +648,7 @@ namespace frontend::mysql {
                     if (content.find('\0') != std::string::npos) {
                         return nul_character();
                     }
-                    std::transform(content.begin(), content.end(), content.begin(), to_lower);
+                    content = to_lower(std::move(content));
                     append_quoted(text, content, '"');
                     continue;
                 }
@@ -673,7 +674,7 @@ namespace frontend::mysql {
             }
             if (token_start && is_ident_start(c)) {
                 const std::size_t end = name_end(sql, i);
-                const auto word = lowered(sql.substr(i, end - i));
+                const auto word = to_lower(std::string{sql.substr(i, end - i)});
                 auto after = scanner;
                 advance_to(after, end);
                 // N'..': a string in the national character set, utf-8 here.
@@ -736,14 +737,14 @@ namespace frontend::mysql {
                         if (first == '`' || first == '"' || first == '\'') {
                             const auto span_c = ahead.next();
                             if (span_c.terminated) {
-                                name = lowered(first == '\'' || first == '"'
-                                                   ? string_content(sql.substr(name_begin, span_c.end - name_begin))
-                                                   : identifier_content(
-                                                         sql.substr(name_begin, span_c.end - name_begin)));
+                                name = to_lower(first == '\'' || first == '"'
+                                                    ? string_content(sql.substr(name_begin, span_c.end - name_begin))
+                                                    : identifier_content(
+                                                          sql.substr(name_begin, span_c.end - name_begin)));
                             }
                         } else if (is_ident_start(first) || is_digit(first)) {
                             const std::size_t name_stop = name_end(sql, name_begin);
-                            name = lowered(sql.substr(name_begin, name_stop - name_begin));
+                            name = to_lower(std::string{sql.substr(name_begin, name_stop - name_begin)});
                             advance_to(ahead, name_stop);
                         }
                         if (name) {

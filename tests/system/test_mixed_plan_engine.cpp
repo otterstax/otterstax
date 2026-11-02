@@ -49,10 +49,11 @@ TEST_CASE("pure engine: group by string key over node_data", "[engine-group-by-s
     // The raw AST lives in an arena, exactly like GreenplumParser does in
     // production — raw_parser allocations are never freed individually.
     std::pmr::monotonic_buffer_resource arena(resource);
-    auto* raw = raw_parser(&arena, sql);
-    REQUIRE(raw != nullptr);
-    auto* res = reinterpret_cast<::Node*>(linitial(raw));
-    components::sql::transform::transformer transformer(resource);
+    auto raw = raw_parser(&arena, sql);
+    REQUIRE_FALSE(raw.has_error());
+    REQUIRE(raw.value() != nullptr);
+    auto* res = reinterpret_cast<::Node*>(linitial(raw.value()));
+    components::sql::transform::transformer transformer(resource, sql);
     auto binder = transformer.transform(components::sql::transform::pg_cell_to_node_cast(res));
     REQUIRE_FALSE(binder.has_error());
     auto finalized = binder.finalize();
@@ -72,18 +73,13 @@ TEST_CASE("pure engine: group by string key over node_data", "[engine-group-by-s
             for (size_t r = 0; r < 2; ++r) {
                 switch (cols[c].type()) {
                     case components::types::logical_type::INTEGER:
-                        chunk.set_value(c,
-                                        r,
-                                        components::types::logical_value_t(resource, static_cast<int32_t>(r + 1)));
+                        chunk.set_value(c, r, static_cast<int32_t>(r + 1));
                         break;
                     case components::types::logical_type::DOUBLE:
-                        chunk.set_value(c, r, components::types::logical_value_t(resource, 100.5 * (r + 1)));
+                        chunk.set_value(c, r, 100.5 * (r + 1));
                         break;
                     default:
-                        chunk.set_value(
-                            c,
-                            r,
-                            components::types::logical_value_t(resource, std::string("n_") + std::to_string(r)));
+                        chunk.set_value(c, r, std::string_view{std::string("n_") + std::to_string(r)});
                         break;
                 }
             }

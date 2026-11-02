@@ -96,7 +96,7 @@ class StreamTest:
         self.create_topic(self.src_topic)
         self.create_topic(self.out_topic)
         self.conn = psycopg.connect(host=self.host, port=PG_PORT, user="testuser",
-                                    password="testpass", dbname="kafka", autocommit=True)
+                                    password="testpass", dbname="main", autocommit=True)
         self.conn.prepare_threshold = None
         with self.conn.cursor() as cur:
             cur.execute(

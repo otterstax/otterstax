@@ -1,17 +1,10 @@
 add_subdirectory(kafka)
 
 set(DB_INTEGRATION_HEADERS
-    sql/connection_manager.hpp
-    postgresql/connection_manager.hpp
-    clickhouse/connection_manager.hpp
     s3/s3_manager.hpp
-    statement_executor.hpp
 )
 
 set(DB_INTEGRATION_SOURCES
-    sql/connection_manager.cpp
-    postgresql/connection_manager.cpp
-    clickhouse/connection_manager.cpp
     s3/s3_manager.cpp
 )
 
@@ -27,8 +20,8 @@ target_link_libraries(integration PUBLIC
     connectors
     Boost::boost
     otterbrix::otterbrix
-    # s3/s3_manager.cpp drives the s3 connector's Arrow object streams
-    # (Close / Abort an upload) and carries them in FileAddParams / FileMetadata.
+    # s3/s3_manager.cpp carries the s3 connector's Arrow object streams
+    # (tsl::input_stream_t / output_stream_t) in FileLoadParams / FileMetadata.
     arrow::arrow
     actor-zeta::actor-zeta
     PostgreSQL::PostgreSQL

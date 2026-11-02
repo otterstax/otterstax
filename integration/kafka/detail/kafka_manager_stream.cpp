@@ -57,7 +57,7 @@ namespace otterstax::kafka {
             if (it == registry_.end()) {
                 co_return cursor::make_cursor(
                     resource_,
-                    core::error_t(core::error_code_t::do_not_exists,
+                    core::error_t(core::error_code_t::undefined_object,
                                   std::pmr::string{"kafka: INSERT into unknown object '" + relname + "'", resource_}));
             }
             const auto& options = it->second.options;
@@ -85,7 +85,7 @@ namespace otterstax::kafka {
             log_->error("kafka: produce source eval for '{}' failed: {}", relname, what);
             co_return cursor::make_cursor(
                 resource_,
-                core::error_t(cursor ? cursor->get_error().type : core::error_code_t::other_error,
+                core::error_t(cursor ? cursor->get_error().type : core::error_code_t::internal_error,
                               std::pmr::string{"kafka: produce source eval failed: " + what, resource_}));
         }
 
@@ -98,7 +98,7 @@ namespace otterstax::kafka {
         if (!chunk_matches_columns(resource_, chunks, columns)) {
             co_return cursor::make_cursor(
                 resource_,
-                core::error_t(core::error_code_t::schema_error,
+                core::error_t(core::error_code_t::datatype_mismatch,
                               std::pmr::string{"kafka: INSERT into '" + relname +
                                                    "' does not match its declared schema (column or type "
                                                    "mismatch); nothing produced",
@@ -171,6 +171,14 @@ namespace otterstax::kafka {
         bool transactional = false;
         std::string query_name;
         std::string group_id;
+        std::vector<kafka_column_t> sink_columns;
+        std::optional<actor_zeta::unique_future<cursor::cursor_t_ptr>> described;
+        auto invalid = [this](const std::string& why) {
+            return cursor::make_cursor(
+                resource_,
+                core::error_t(core::error_code_t::invalid_parameter,
+                              std::pmr::string{"kafka: INSERT INTO ... SELECT invalid: " + why, resource_}));
+        };
         {
             // The loop interleaves its coroutines on one thread: the zone closes
             // before the first co_await (root CLAUDE.md, Tracy).
@@ -183,7 +191,7 @@ namespace otterstax::kafka {
             if (sink_it == registry_.end()) {
                 co_return cursor::make_cursor(
                     resource_,
-                    core::error_t(core::error_code_t::do_not_exists,
+                    core::error_t(core::error_code_t::undefined_object,
                                   std::pmr::string{"kafka: INSERT INTO unknown object '" + stream + "'", resource_}));
             }
             if (sink_it->second.op != kafka_op::create_stream) {
@@ -206,49 +214,6 @@ namespace otterstax::kafka {
             }
             out_topic = topic_it->second;
             out_bootstrap = bootstrap_it->second;
-
-            // Compile the INSERT once: find the SELECT's source (a known kafka object)
-            // and compute the output schema for the union guard
-            auto invalid = [&](const std::string& why) {
-                return cursor::make_cursor(
-                    resource_,
-                    core::error_t(core::error_code_t::invalid_parameter,
-                                  std::pmr::string{"kafka: INSERT INTO ... SELECT invalid: " + why, resource_}));
-            };
-            auto plan = kafka_parse_plan(resource_, insert_sql);
-            if (plan.has_error()) {
-                co_return invalid(plan.error().what.c_str());
-            }
-            const auto* agg =
-                plan.value().sub_queries.empty() ? nullptr : kafka_find_aggregate(plan.value().sub_queries.back());
-            if (!agg) {
-                co_return invalid("SELECT has no source table");
-            }
-            source_relname = agg->target().collection.t;
-            const auto src_it = registry_.find(source_relname);
-            if (src_it == registry_.end()) {
-                co_return invalid("unknown source '" + source_relname + "'");
-            }
-            out_columns =
-                stream_output_schema(resource_, *agg, plan.value().parameters.get(), src_it->second.columns);
-            for (std::size_t i = 0; i < out_columns.size(); ++i) {
-                if (out_columns[i].name.empty()) {
-                    co_return invalid("output column " + std::to_string(i + 1) +
-                                      " has no name; alias it so the produced JSON can be keyed");
-                }
-            }
-
-            // Union guard: the query's output must be positionally type-compatible with
-            // the stream's schema, or the shared output topic gets incompatible records
-            if (!columns_type_compatible(out_columns, sink_it->second.columns)) {
-                co_return cursor::make_cursor(
-                    resource_,
-                    core::error_t(core::error_code_t::invalid_parameter,
-                                  std::pmr::string{"kafka: INSERT INTO '" + stream +
-                                                       "' SELECT output does not match the stream's schema",
-                                                   resource_}));
-            }
-
             // Exactly-once is inherited from the target stream's TRANSACTIONAL option
             if (const auto t = sink_opts.find("transactional"); t != sink_opts.end()) {
                 std::string value = t->second;
@@ -258,6 +223,56 @@ namespace otterstax::kafka {
                 transactional = (value == "true");
             }
 
+            // Compile the INSERT once: find the SELECT's source (a known kafka object)
+            // and describe the output the union guard compares
+            auto plan = kafka_parse_plan(resource_, insert_sql);
+            if (plan.has_error()) {
+                co_return invalid(plan.error().what.c_str());
+            }
+            auto stream_src = plan.value().sub_queries.empty()
+                                  ? std::nullopt
+                                  : kafka_stream_source(resource_, plan.value().sub_queries.back());
+            if (!stream_src) {
+                co_return invalid("SELECT has no source table");
+            }
+            source_relname = stream_src->source_relname;
+            const auto src_it = registry_.find(source_relname);
+            if (src_it == registry_.end()) {
+                co_return invalid("unknown source '" + source_relname + "'");
+            }
+            sink_columns = sink_it->second.columns;
+            described.emplace(describe_stream(dispatcher_address_,
+                                              resource_,
+                                              src_it->second.columns,
+                                              stream_src->operators,
+                                              plan.value().parameters));
+        }
+        {
+            auto columns = described_columns(resource_, co_await std::move(*described));
+            if (columns.has_error()) {
+                co_return invalid(columns.error().what.c_str());
+            }
+            out_columns = std::move(columns.value());
+        }
+        {
+            OTX_ZONE_N("KafkaManager::add_stream_insert::register");
+            for (std::size_t i = 0; i < out_columns.size(); ++i) {
+                if (out_columns[i].name.empty()) {
+                    co_return invalid("output column " + std::to_string(i + 1) +
+                                      " has no name; alias it so the produced JSON can be keyed");
+                }
+            }
+
+            // Union guard: the query's output must be positionally type-compatible with
+            // the stream's schema, or the shared output topic gets incompatible records
+            if (!columns_type_compatible(out_columns, sink_columns)) {
+                co_return cursor::make_cursor(
+                    resource_,
+                    core::error_t(core::error_code_t::invalid_parameter,
+                                  std::pmr::string{"kafka: INSERT INTO '" + stream +
+                                                       "' SELECT output does not match the stream's schema",
+                                                   resource_}));
+            }
             // An anonymous persistent query gets a unique internal name (own
             // registry_/streams_/__sources entry, consumer group + producer txn id)
             // The do-while skips any name a recovered query already holds
@@ -271,10 +286,10 @@ namespace otterstax::kafka {
         // the stream's OUT side; as_select carries the whole INSERT — the target
         // stream and the SELECT source are re-derived from it on recover()). A query
         // that cannot be persisted is not registered
-        if (auto s = co_await ensure_sources_table_once(); !s || s->is_error()) {
+        if (auto s = co_await ensure_storage(); !s || s->is_error()) {
             co_return s ? s
                         : cursor::make_cursor(resource_,
-                                              core::error_t(core::error_code_t::other_error,
+                                              core::error_t(core::error_code_t::internal_error,
                                                             std::pmr::string{"kafka: null cursor", resource_}));
         }
         if (auto persisted = co_await persist_source_meta(query_name,
@@ -290,7 +305,7 @@ namespace otterstax::kafka {
                 persisted ? std::string{persisted->get_error().what.c_str()} : std::string{"null cursor"};
             co_return cursor::make_cursor(
                 resource_,
-                core::error_t(persisted ? persisted->get_error().type : core::error_code_t::other_error,
+                core::error_t(persisted ? persisted->get_error().type : core::error_code_t::internal_error,
                               std::pmr::string{"kafka: persist metadata for insert-query '" + query_name +
                                                    "' failed: " + what,
                                                resource_}));
@@ -311,7 +326,7 @@ namespace otterstax::kafka {
         }
         obj.as_select = insert_sql;
         obj.source = source_relname;
-        registry_[query_name] = std::move(obj);
+        register_object(query_name, std::move(obj));
 
         // Launch the continuous worker (no-op unless start_pollers_) and remember it
         // under its target stream for DROP-time cleanup

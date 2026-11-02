@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2025-2026  OtterStax
 
+#include "otterbrix/translators/input/decimal_text.hpp"
 #include "otterbrix/translators/output/chunk_to_arrow.hpp"
 
 #include <catch2/catch_all.hpp>
@@ -240,7 +241,7 @@ TEST_CASE("to_arrow_schema(vec): a HUGEINT column maps to decimal128(38, 0)") {
     REQUIRE(decimal.scale() == 0);
 }
 
-TEST_CASE("to_arrow_schema(vec): a UHUGEINT column is conversion_failure naming the column") {
+TEST_CASE("to_arrow_schema(vec): a UHUGEINT column is unimplemented_yet naming the column") {
     // decimal128 is signed, so it cannot carry the upper half of a 128-bit
     // unsigned range; UINT128 keeps its refusal where HUGEINT gained a mapping.
     std::pmr::vector<complex_logical_type> types{std::pmr::new_delete_resource()};
@@ -250,7 +251,7 @@ TEST_CASE("to_arrow_schema(vec): a UHUGEINT column is conversion_failure naming 
     auto schema = to_arrow_schema(std::pmr::new_delete_resource(), types);
 
     REQUIRE(schema.has_error());
-    REQUIRE(schema.error().type == core::error_code_t::conversion_failure);
+    REQUIRE(schema.error().type == core::error_code_t::unimplemented_yet);
     REQUIRE(std::string_view{schema.error().what.c_str()}.find("wide") != std::string_view::npos);
 }
 
@@ -302,7 +303,7 @@ TEST_CASE("to_arrow_schema(struct): an unmappable LIST element propagates the er
     auto schema = to_arrow_schema(std::pmr::new_delete_resource(), struct_t);
 
     REQUIRE(schema.has_error());
-    REQUIRE(schema.error().type == core::error_code_t::conversion_failure);
+    REQUIRE(schema.error().type == core::error_code_t::unimplemented_yet);
 }
 
 TEST_CASE("to_arrow_schema(vec): the error message lives on the caller's resource") {
@@ -319,7 +320,6 @@ TEST_CASE("to_arrow_schema(vec): the error message lives on the caller's resourc
 // ── chunk_to_record_batch ─────────────────────────────────────────────────────
 
 using components::vector::data_chunk_t;
-using components::types::logical_value_t;
 
 namespace {
 
@@ -343,9 +343,9 @@ TEST_CASE("chunk_to_record_batch: a HUGEINT column carries values no 64-bit colu
     data_chunk_t chunk(res, types, 3);
     chunk.set_cardinality(3);
     const auto positive = absl::MakeInt128(1, 0);  // 2^64, past the int64 range
-    chunk.set_value(0, 0, logical_value_t{res, positive});
-    chunk.set_value(0, 1, logical_value_t{res, -positive});
-    chunk.set_value(0, 2, logical_value_t{res, nullptr});
+    chunk.set_value(0, 0, positive);
+    chunk.set_value(0, 1, -positive);
+    chunk.data[0].set_null(2, true);
 
     auto batch = chunk_to_record_batch(res, chunk);
     INFO("error: " << batch.error().what.c_str());
@@ -373,8 +373,8 @@ TEST_CASE("chunk_to_record_batch: a hugeint decimal128 can declare is appended a
         max_declarable *= 10;
     }
     max_declarable -= 1; // 10^38 - 1, the largest decimal128(38, 0) may declare
-    chunk.set_value(0, 0, logical_value_t{res, max_declarable});
-    chunk.set_value(0, 1, logical_value_t{res, -max_declarable});
+    chunk.set_value(0, 0, max_declarable);
+    chunk.set_value(0, 1, -max_declarable);
 
     auto batch = chunk_to_record_batch(res, chunk);
     INFO("error: " << batch.error().what.c_str());
@@ -400,12 +400,12 @@ TEST_CASE("chunk_to_record_batch: a hugeint past 10^38 is refused, naming the co
     for (int i = 0; i < 38; ++i) {
         tail *= 10; // exactly 10^38
     }
-    chunk.set_value(0, 0, logical_value_t{res, tail});
+    chunk.set_value(0, 0, tail);
 
     auto batch = chunk_to_record_batch(res, chunk);
 
     REQUIRE(batch.has_error());
-    REQUIRE(batch.error().type == core::error_code_t::conversion_failure);
+    REQUIRE(batch.error().type == core::error_code_t::numeric_value_out_of_range);
     REQUIRE(std::string_view{batch.error().what.c_str()}.find("wide") != std::string_view::npos);
     REQUIRE(std::string_view{batch.error().what.c_str()}.find("100000000000000000000000000000000000000") !=
             std::string_view::npos);
@@ -424,9 +424,9 @@ TEST_CASE("chunk_to_record_batch: a DECIMAL keeps its scale so the value is the 
 
     data_chunk_t chunk(res, types, 3);
     chunk.set_cardinality(3);
-    chunk.set_value(0, 0, logical_value_t::create_decimal(res, types[0], int64_t{12345}));   // 1.2345
-    chunk.set_value(0, 1, logical_value_t::create_decimal(res, types[0], int64_t{-12345}));  // -1.2345
-    chunk.set_value(0, 2, logical_value_t{res, nullptr});
+    tsl::set_decimal_raw(chunk.data[0], 0, int64_t{12345});   // 1.2345
+    tsl::set_decimal_raw(chunk.data[0], 1, int64_t{-12345});  // -1.2345
+    chunk.data[0].set_null(2, true);
 
     auto batch = chunk_to_record_batch(res, chunk);
     INFO("error: " << batch.error().what.c_str());
@@ -451,7 +451,7 @@ TEST_CASE("chunk_to_record_batch: a UHUGEINT column is refused before any array 
     auto batch = chunk_to_record_batch(res, chunk);
 
     REQUIRE(batch.has_error());
-    REQUIRE(batch.error().type == core::error_code_t::conversion_failure);
+    REQUIRE(batch.error().type == core::error_code_t::unimplemented_yet);
     REQUIRE(std::string_view{batch.error().what.c_str()}.find("wide") != std::string_view::npos);
 }
 
@@ -461,10 +461,10 @@ TEST_CASE("chunk_to_record_batch: flat named scalar columns become a RecordBatch
     data_chunk_t chunk(res, types, 3);
     chunk.set_cardinality(3);
     for (int64_t r = 0; r < 3; ++r) {
-        chunk.set_value(0, static_cast<uint64_t>(r), logical_value_t{res, r});
-        chunk.set_value(1, static_cast<uint64_t>(r), logical_value_t{res, std::string{"row_"} + std::to_string(r)});
+        chunk.set_value(0, static_cast<uint64_t>(r), r);
+        chunk.set_value(1, static_cast<uint64_t>(r), std::string_view{std::string{"row_"} + std::to_string(r)});
     }
-    chunk.set_value(1, 2, logical_value_t{res, nullptr});
+    chunk.data[1].set_null(2, true);
 
     auto batch = chunk_to_record_batch(res, chunk);
     REQUIRE_FALSE(batch.has_error());
@@ -499,7 +499,7 @@ TEST_CASE("chunk_to_record_batch: a LIST column is an error, not a NullArray") {
 
     auto batch = chunk_to_record_batch(res, chunk);
     REQUIRE(batch.has_error());
-    REQUIRE(batch.error().type == core::error_code_t::conversion_failure);
+    REQUIRE(batch.error().type == core::error_code_t::unimplemented_yet);
     REQUIRE(std::string_view{batch.error().what.c_str()}.find("items") != std::string_view::npos);
 }
 
@@ -513,7 +513,7 @@ TEST_CASE("chunk_to_record_batch: a STRUCT column is an error, not a NullArray")
 
     auto batch = chunk_to_record_batch(res, chunk);
     REQUIRE(batch.has_error());
-    REQUIRE(batch.error().type == core::error_code_t::conversion_failure);
+    REQUIRE(batch.error().type == core::error_code_t::unimplemented_yet);
 }
 
 TEST_CASE("chunk_to_record_batch: an ARRAY column is an error, not a NullArray") {
@@ -524,20 +524,20 @@ TEST_CASE("chunk_to_record_batch: an ARRAY column is an error, not a NullArray")
 
     auto batch = chunk_to_record_batch(res, chunk);
     REQUIRE(batch.has_error());
-    REQUIRE(batch.error().type == core::error_code_t::conversion_failure);
+    REQUIRE(batch.error().type == core::error_code_t::unimplemented_yet);
 }
 
-TEST_CASE("chunk_to_record_batch: a column without a name is schema_error") {
+TEST_CASE("chunk_to_record_batch: a column without a name is undefined_column") {
     auto* res = std::pmr::new_delete_resource();
     std::pmr::vector<complex_logical_type> types{res};
     types.emplace_back(logical_type::INTEGER);
     data_chunk_t chunk(res, types, 1);
     chunk.set_cardinality(1);
-    chunk.set_value(0, 0, logical_value_t{res, int32_t{1}});
+    chunk.set_value(0, 0, int32_t{1});
 
     auto batch = chunk_to_record_batch(res, chunk);
     REQUIRE(batch.has_error());
-    REQUIRE(batch.error().type == core::error_code_t::schema_error);
+    REQUIRE(batch.error().type == core::error_code_t::undefined_column);
 }
 
 TEST_CASE("chunk_to_record_batch: the error message lives on the caller's resource") {
@@ -575,22 +575,22 @@ TEST_CASE("chunk_to_record_batch: natively exported columns keep their values NU
     for (uint64_t r = 0; r < rows; ++r) {
         if (r % 5 == 0) {
             for (uint64_t c = 0; c < types.size(); ++c) {
-                chunk.set_value(c, r, logical_value_t{res, nullptr});
+                chunk.data[c].set_null(r, true);
             }
             continue;
         }
-        chunk.set_value(0, r, logical_value_t{res, r % 2 == 0});
-        chunk.set_value(1, r, logical_value_t{res, static_cast<int8_t>(r % 100)});
-        chunk.set_value(2, r, logical_value_t{res, std::string{"l"} + std::to_string(r)});
-        chunk.set_value(3, r, logical_value_t{res, static_cast<int16_t>(r)});
-        chunk.set_value(4, r, logical_value_t{res, static_cast<int32_t>(r) * -3});
-        chunk.set_value(5, r, logical_value_t{res, static_cast<int64_t>(r) << 33});
-        chunk.set_value(6, r, logical_value_t{res, static_cast<uint8_t>(r % 200)});
-        chunk.set_value(7, r, logical_value_t{res, static_cast<uint16_t>(r * 7)});
-        chunk.set_value(8, r, logical_value_t{res, static_cast<uint32_t>(r) * 100000u});
-        chunk.set_value(9, r, logical_value_t{res, static_cast<uint64_t>(r) << 40});
-        chunk.set_value(10, r, logical_value_t{res, static_cast<float>(r) / 4.0f});
-        chunk.set_value(11, r, logical_value_t{res, static_cast<double>(r) / 8.0});
+        chunk.set_value(0, r, r % 2 == 0);
+        chunk.set_value(1, r, static_cast<int8_t>(r % 100));
+        chunk.set_value(2, r, std::string_view{std::string{"l"} + std::to_string(r)});
+        chunk.set_value(3, r, static_cast<int16_t>(r));
+        chunk.set_value(4, r, static_cast<int32_t>(r) * -3);
+        chunk.set_value(5, r, static_cast<int64_t>(r) << 33);
+        chunk.set_value(6, r, static_cast<uint8_t>(r % 200));
+        chunk.set_value(7, r, static_cast<uint16_t>(r * 7));
+        chunk.set_value(8, r, static_cast<uint32_t>(r) * 100000u);
+        chunk.set_value(9, r, static_cast<uint64_t>(r) << 40);
+        chunk.set_value(10, r, static_cast<float>(r) / 4.0f);
+        chunk.set_value(11, r, static_cast<double>(r) / 8.0);
     }
 
     auto batch = chunk_to_record_batch(res, chunk);
@@ -669,10 +669,10 @@ TEST_CASE("chunk_to_record_batch: a DATE is written on Arrow's epoch and a STRIN
     auto types = named_types(res, {{"day", logical_type::DATE}, {"name", logical_type::STRING_LITERAL}});
     data_chunk_t chunk(res, types, 2);
     chunk.set_cardinality(2);
-    chunk.set_value(0, 0, logical_value_t{res, core::date::date_t{core::date::days{19000 - 10957}}});
-    chunk.set_value(1, 0, logical_value_t{res, std::string{"first"}});
-    chunk.set_value(0, 1, logical_value_t{res, nullptr});
-    chunk.set_value(1, 1, logical_value_t{res, nullptr});
+    chunk.set_value(0, 0, core::date::date_t{core::date::days{19000 - 10957}});
+    chunk.set_value(1, 0, std::string_view{std::string{"first"}});
+    chunk.data[0].set_null(1, true);
+    chunk.data[1].set_null(1, true);
 
     auto batch = chunk_to_record_batch(res, chunk);
     INFO("error: " << (batch.has_error() ? batch.error().what.c_str() : ""));
@@ -694,11 +694,11 @@ TEST_CASE("chunk_to_file_batch: strings are written by otterbrix's exporter as l
     data_chunk_t chunk(res, types, rows);
     chunk.set_cardinality(rows);
     for (uint64_t r = 0; r < rows; ++r) {
-        chunk.set_value(0, r, logical_value_t{res, static_cast<int64_t>(r)});
+        chunk.set_value(0, r, static_cast<int64_t>(r));
         if (r % 3 == 0) {
-            chunk.set_value(1, r, logical_value_t{res, nullptr});
+            chunk.data[1].set_null(r, true);
         } else {
-            chunk.set_value(1, r, logical_value_t{res, std::string{"name_"} + std::to_string(r)});
+            chunk.set_value(1, r, std::string_view{std::string{"name_"} + std::to_string(r)});
         }
     }
 

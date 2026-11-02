@@ -13,7 +13,6 @@
 #include "../mock/parser.hpp"
 #include "../mock/sql_db_connector.hpp"
 #include "../system/test_helpers.hpp"
-#include "session/statement_kind.hpp"
 
 #include <catch2/catch_all.hpp>
 
@@ -96,7 +95,7 @@ TEST_CASE("session: an engine failure keeps the engine's code under the executio
         REQUIRE(r.has_error());
         INFO(r.error().what.c_str());
         REQUIRE(std::string{r.error().what.c_str()}.rfind("Otterbrix execution failed: ", 0) == 0);
-        REQUIRE(r.error().type != core::error_code_t::kernel_error);
+        REQUIRE(r.error().type != core::error_code_t::internal_error);
     });
 }
 
@@ -160,7 +159,7 @@ TEST_CASE("session: statements sent back-to-back complete in order") {
     auto send = [&](const std::string& sql) {
         futures.push_back(actor_zeta::send(s.session, &query_session_t::execute, stmt(id++), sql).second);
     };
-    send("CREATE DATABASE orderdb;");
+    send("CREATE SCHEMA orderdb;");
     send("CREATE TABLE orderdb.t (id bigint);");
     for (size_t i = 0; i < K; ++i) {
         send("INSERT INTO orderdb.t (id) VALUES (" + std::to_string(i) + ");");
@@ -188,7 +187,7 @@ TEST_CASE("session: parallel connections over the real engine keep their own ord
 
     session_stack_owner owner("/tmp/test_session_parallel");
     const auto first = owner.stack();
-    run_session_or_fail(first, 1, "CREATE DATABASE pardb;");
+    run_session_or_fail(first, 1, "CREATE SCHEMA pardb;");
 
     std::vector<session_stack> connections;
     for (size_t c = 0; c < M; ++c) {
@@ -307,50 +306,10 @@ TEST_CASE("session: a non-std exception at the parser boundary becomes a parse e
 
 TEST_CASE("session: a database a connection owns is refused before the engine") {
     with_session_stack_parser("/tmp/test_session_ddl_guard", &make_parser, [](session_stack s) {
-        // The kafka object database belongs to the KafkaManager.
-        auto r = run_session_sql_payload(s, 8400, "CREATE DATABASE kafka;");
+        // OtterStax's service database (remote names, Kafka's bookkeeping).
+        auto r = run_session_sql_payload(s, 8400, "CREATE DATABASE federation;");
         REQUIRE(r.has_error());
         REQUIRE(r.error().type == core::error_code_t::invalid_parameter);
         run_session_or_fail(s, 8401, "CREATE DATABASE free_name;");
     });
-}
-
-// The statements told by their raw parse tree (session/statement_kind.hpp) are
-// told past blanks, `;` and comments, without regard to case; a text whose first
-// keyword cannot begin one is answered without a parse, and a text that is more
-// than one statement is none.
-TEST_CASE("statement kind: SET RESET and DEALLOCATE by the first keyword and the raw tree") {
-    auto* resource = std::pmr::new_delete_resource();
-    using otterstax::session::deallocate_statement;
-    using otterstax::session::is_setting_statement;
-
-    CHECK(is_setting_statement(resource, "SET timezone TO 'UTC'"));
-    CHECK(is_setting_statement(resource, "  /* a /* nested */ comment */ -- line\n set autocommit = 0"));
-    CHECK(is_setting_statement(resource, ";Reset ALL"));
-    CHECK(is_setting_statement(resource, "SET SESSION search_path TO DEFAULT;"));
-    CHECK_FALSE(is_setting_statement(resource, "SELECT 1"));
-    CHECK_FALSE(is_setting_statement(resource, "settings"));
-    CHECK_FALSE(is_setting_statement(resource, "SET x = 1; SELECT 1"));
-    CHECK_FALSE(is_setting_statement(resource, "/* unterminated SET x = 1"));
-    CHECK_FALSE(is_setting_statement(resource, "DEALLOCATE ALL"));
-
-    auto named = deallocate_statement(resource, "/**/ deallocate PREPARE s1");
-    REQUIRE(named.has_value());
-    CHECK(named->name == std::optional<std::string>{"s1"});
-    auto all = deallocate_statement(resource, "DEALLOCATE ALL;");
-    REQUIRE(all.has_value());
-    CHECK_FALSE(all->name.has_value());
-    CHECK_FALSE(deallocate_statement(resource, "SELECT 1").has_value());
-    CHECK_FALSE(deallocate_statement(resource, "SET x = 1").has_value());
-    CHECK_FALSE(deallocate_statement(resource, "DEALLOCATE s1; DEALLOCATE s2").has_value());
-
-    using otterstax::session::is_transaction_exit_statement;
-    for (const char* sql : {"COMMIT", "end", "ROLLBACK", " /* c */ abort;", "ROLLBACK TO SAVEPOINT sp"}) {
-        INFO(sql);
-        CHECK(is_transaction_exit_statement(resource, sql));
-    }
-    for (const char* sql : {"BEGIN", "SAVEPOINT sp", "SELECT 1", "COMMIT; SELECT 1", "endless"}) {
-        INFO(sql);
-        CHECK_FALSE(is_transaction_exit_statement(resource, sql));
-    }
 }

@@ -6,11 +6,11 @@
 # INSERT VALUES. This is the shape `examples/demo/sql/step_4.sql` proves
 # works end-to-end:
 #
-#   FROM <backend>.<…> c JOIN <local_db>.<table> w ON <string-key>
+#   FROM <alias>.<db>.public.<t> c JOIN <local_schema>.<table> w ON <string-key>
 #
-# Mechanism: the engine resolves the local table from its own catalog and the
-# backend table through the federation (otterbrix/federation: the uid-qualified
-# name answered from federation.remote_columns), reads the backend table through
+# Mechanism: the engine resolves both tables from its own catalog — the local
+# one in main, the backend one as a table of the connection's database (its
+# four-part name, otterbrix/federation/CLAUDE.md), reads the backend table through
 # its storage's scan (the JOIN is not pushed down: one side is local) and JOINs
 # the two in-process.
 #
@@ -30,7 +30,7 @@ from external_helpers import ExternalTableTester
 
 LABEL = "DATA — MySQL wire / JOIN sql backend ⋈ otterbrix-local (string key)"
 
-SQL_BACKEND_TABLE = "campaigns.db1.campaigns"
+SQL_BACKEND_TABLE = "campaigns.db1.public.campaigns"
 INTERNAL_DB = "jotb_local_backend"
 LOCAL_TABLE = "campaign_tags"
 # Pick the first `SAMPLE_SIZE` backend campaigns deterministically via a
@@ -72,17 +72,9 @@ def run(local=False):
         f"expected {SAMPLE_SIZE} backend rows, got {len(sample)}"
     sample_names = {row[1] for row in sample}
 
-    # ── 2. Materialize the local engine database. Plain CREATE TABLE in an
-    #       unknown database errors out; CREATE EXTERNAL TABLE auto-creates the
-    #       db as a side effect, so we use a throwaway external table as the
-    #       bootstrap and immediately drop it. The drop only removes the
-    #       table — the engine database stays so the CREATE TABLE below can
-    #       reuse it.
-    cur.execute(
-        f"CREATE EXTERNAL TABLE {INTERNAL_DB}._bootstrap "
-        f"WITH (location = '/fixtures/people.csv', format = 'csv');"
-    )
-    cur.execute(f"drop table {INTERNAL_DB}._bootstrap")
+    # ── 2. The local schema (a schema of the session's database, main):
+    #       a two-part CREATE TABLE needs it to exist.
+    tester.ensure_schema(cur, INTERNAL_DB)
 
     # ── 3. CREATE TABLE + INSERT VALUES into otterbrix-internal storage.
     #       Both JOIN-key columns are strings, mirroring step_4's

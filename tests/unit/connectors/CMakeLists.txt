@@ -2,10 +2,8 @@ project(test_unit_connectors)
 
 set(${PROJECT_NAME}_SOURCES
     main.cpp
-    test_connection_pool.cpp
+    test_backend_agent.cpp
     test_connector_cancel.cpp
-    test_pooled_managers.cpp
-    test_pooled_clickhouse.cpp
 )
 
 add_executable(${PROJECT_NAME} ${${PROJECT_NAME}_SOURCES})
@@ -17,11 +15,9 @@ target_include_directories(
 
 target_link_libraries(
     ${PROJECT_NAME} PRIVATE
-    # test_pooled_managers.cpp / test_pooled_clickhouse.cpp drive the real
-    # mysql / pg / clickhouse ConnectorManagers (with stub connectors) through
-    # their integration backends, so the binary
-    # links the internal libraries the way test_utils does.
-    lib_otterstax
+    # test_backend_agent.cpp drives the backend agents and actors
+    # (otterstax_federation) over fake connectors.
+    otterstax_federation
     actor-zeta::actor-zeta
     otterbrix::otterbrix
     Boost::boost

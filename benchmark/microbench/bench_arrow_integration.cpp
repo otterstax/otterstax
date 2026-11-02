@@ -29,7 +29,6 @@
 
 using components::types::complex_logical_type;
 using components::types::logical_type;
-using components::types::logical_value_t;
 using components::vector::data_chunk_t;
 
 namespace {
@@ -79,13 +78,15 @@ namespace {
         chunk.set_cardinality(rows);
         for (uint64_t r = 0; r < rows; ++r) {
             const auto i = first + static_cast<int64_t>(r);
-            chunk.set_value(0, r, logical_value_t{res, i});
-            chunk.set_value(1, r, logical_value_t{res, static_cast<double>(i) * 0.5});
-            chunk.set_value(2, r, logical_value_t{res, i % 2 == 0});
-            chunk.set_value(3,
-                            r,
-                            i % 10 == 0 ? logical_value_t{res, nullptr}
-                                        : logical_value_t{res, std::string{"name_"} + std::to_string(i)});
+            chunk.set_value(0, r, i);
+            chunk.set_value(1, r, static_cast<double>(i) * 0.5);
+            chunk.set_value(2, r, i % 2 == 0);
+            if (i % 10 == 0) {
+                chunk.data[3].set_null(r, true);
+            } else {
+                const std::string name = "name_" + std::to_string(i);
+                chunk.set_value(3, r, std::string_view{name});
+            }
         }
         return chunk;
     }
@@ -100,8 +101,8 @@ namespace {
 
     // ── the per-cell baselines: what the shims did before the otterbrix integration ──────────
 
-    // The old arrow_to_chunk: a logical_value_t per cell (for a string: GetString's copy, the
-    // value's heap copy, then the vector's string heap).
+    // The old arrow_to_chunk: one set_value per cell (for a string: a copy into the vector's
+    // string heap), into one chunk of every row.
     data_chunk_t arrow_to_chunk_percell(std::pmr::memory_resource* res, const arrow::RecordBatch& batch) {
         const auto rows = static_cast<uint64_t>(batch.num_rows());
         data_chunk_t chunk(res, chunk_types(res), rows);
@@ -111,25 +112,26 @@ namespace {
         const auto& flag = static_cast<const arrow::BooleanArray&>(*batch.column(2));
         const auto& name = static_cast<const arrow::StringArray&>(*batch.column(3));
         for (uint64_t r = 0; r < rows; ++r) {
-            chunk.set_value(0, r, logical_value_t{res, id.Value(static_cast<int64_t>(r))});
+            chunk.set_value(0, r, id.Value(static_cast<int64_t>(r)));
         }
         for (uint64_t r = 0; r < rows; ++r) {
-            chunk.set_value(1, r, logical_value_t{res, score.Value(static_cast<int64_t>(r))});
+            chunk.set_value(1, r, score.Value(static_cast<int64_t>(r)));
         }
         for (uint64_t r = 0; r < rows; ++r) {
-            chunk.set_value(2, r, logical_value_t{res, static_cast<bool>(flag.Value(static_cast<int64_t>(r)))});
+            chunk.set_value(2, r, static_cast<bool>(flag.Value(static_cast<int64_t>(r))));
         }
         for (uint64_t r = 0; r < rows; ++r) {
             const auto i = static_cast<int64_t>(r);
-            chunk.set_value(3,
-                            r,
-                            name.IsNull(i) ? logical_value_t{res, nullptr}
-                                           : logical_value_t{res, std::string(name.GetString(i))});
+            if (name.IsNull(i)) {
+                chunk.data[3].set_null(r, true);
+            } else {
+                chunk.set_value(3, r, name.GetView(i));
+            }
         }
         return chunk;
     }
 
-    // The old chunk_to_record_batch: chunk.value() per cell into an Arrow builder.
+    // The old chunk_to_record_batch: one read per cell into an Arrow builder.
     std::shared_ptr<arrow::RecordBatch> chunk_to_batch_percell(const data_chunk_t& chunk) {
         const auto rows = static_cast<int64_t>(chunk.size());
         arrow::Int64Builder id;
@@ -138,14 +140,14 @@ namespace {
         arrow::StringBuilder name;
         for (int64_t r = 0; r < rows; ++r) {
             const auto u = static_cast<uint64_t>(r);
-            auto v0 = chunk.value(0, u);
-            (void) (v0.is_null() ? id.AppendNull() : id.Append(v0.value<int64_t>()));
-            auto v1 = chunk.value(1, u);
-            (void) (v1.is_null() ? score.AppendNull() : score.Append(v1.value<double>()));
-            auto v2 = chunk.value(2, u);
-            (void) (v2.is_null() ? flag.AppendNull() : flag.Append(v2.value<bool>()));
-            auto v3 = chunk.value(3, u);
-            (void) (v3.is_null() ? name.AppendNull() : name.Append(v3.value<const std::string&>()));
+            const auto& c0 = chunk.data[0];
+            (void) (c0.is_null(u) ? id.AppendNull() : id.Append(c0.get_value<int64_t>(u)));
+            const auto& c1 = chunk.data[1];
+            (void) (c1.is_null(u) ? score.AppendNull() : score.Append(c1.get_value<double>(u)));
+            const auto& c2 = chunk.data[2];
+            (void) (c2.is_null(u) ? flag.AppendNull() : flag.Append(c2.get_value<bool>(u)));
+            const auto& c3 = chunk.data[3];
+            (void) (c3.is_null(u) ? name.AppendNull() : name.Append(c3.get_value<std::string_view>(u)));
         }
         std::shared_ptr<arrow::Array> a0, a1, a2, a3;
         (void) id.Finish(&a0);

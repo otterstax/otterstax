@@ -22,16 +22,6 @@
 #include <string>
 
 namespace {
-    const otterstax::names::alias_registry_t& bench_aliases() {
-        static const auto aliases = [] {
-            otterstax::names::alias_registry_t registry;
-            registry.add("mysql", {backend_type_t::MySQL, "bill", ""});
-            registry.add("pg", {backend_type_t::PostgreSQL, "shop", "shop"});
-            registry.add("ch", {backend_type_t::ClickHouse, "ev", ""});
-            return registry;
-        }();
-        return aliases;
-    }
 
     // The first aggregate under (or at) `node` that reads a table of the connection `uid`.
     components::logical_plan::node_ptr block_of(const components::logical_plan::node_ptr& node, const std::string& uid) {
@@ -39,7 +29,7 @@ namespace {
             return nullptr;
         }
         if (node->type() == components::logical_plan::node_type::aggregate_t &&
-            node->target().unique_identifier.t == uid) {
+            node->target().connection.t == uid) {
             return node;
         }
         for (const auto& child : node->children()) {
@@ -59,7 +49,7 @@ namespace {
         auto parsed = parser.parse(sql);
         assert(!parsed.has_error());
         block_t block{std::move(parsed.value()), nullptr};
-        block.node = block_of(block.parsed->otterbrix_params->node, uid);
+        block.node = block_of(plan_root(*block.parsed->plan), uid);
         assert(block.node);
         return block;
     }
@@ -68,7 +58,7 @@ namespace {
         std::pmr::unsynchronized_pool_resource pool;
         GreenplumParser parser(&pool);
         auto block = parse_block(parser, sql, uid);
-        const auto& params = block.parsed->otterbrix_params->params_node->parameters();
+        const auto& params = block.parsed->plan->parameters->parameters();
         const sql_gen::statement_target_t target{block.node->target()};
         for (auto _ : state) {
             auto out = sql_gen::generate_query(block.node, &params, backend, target, std::pmr::new_delete_resource());
@@ -76,11 +66,11 @@ namespace {
         }
     }
 
-    const char* kMysqlFilter = "SELECT id, name, status FROM mysql.bill.schema.orders WHERE status = 'active' "
+    const char* kMysqlFilter = "SELECT id, name, status FROM mysql.bill.public.orders WHERE status = 'active' "
                                "ORDER BY id LIMIT 100";
     const char* kPgAggregate = "SELECT category, count(*) AS n, sum(price) AS total FROM pg.shop.shop.products "
                                "WHERE price > 10 GROUP BY category HAVING count(*) > 1";
-    const char* kChFilter = "SELECT session_id, ts FROM ch.ev.schema.sessions WHERE country = 'DE' AND ts > 100";
+    const char* kChFilter = "SELECT session_id, ts FROM ch.ev.public.sessions WHERE country = 'DE' AND ts > 100";
 
 } // namespace
 

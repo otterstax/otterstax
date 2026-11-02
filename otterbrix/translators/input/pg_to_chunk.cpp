@@ -46,150 +46,152 @@ namespace tsl {
     // set_string, to_local_translator, ...); with external linkage the linker keeps one
     // definition of each for every translator, whatever its layout.
     namespace {
+        using components::casts::kernels::detail::parse_outcome;
+
         // The column's own type travels with every call so an ENUM cell can be built
         // without a per-column closure.
-        // False: the value has no reading as its column's type.
-        using rows_to_otterbrix = bool (*)(data_chunk_t&, PGresult*, int, int, const types::complex_logical_type&);
+        // Not parsed: the value has no reading as its column's type (malformed) or is past its range.
+        using rows_to_otterbrix = parse_outcome (*)(data_chunk_t&, PGresult*, int, int, const types::complex_logical_type&);
 
-        bool set_bool(data_chunk_t& chunk,
+        parse_outcome set_bool(data_chunk_t& chunk,
                       PGresult* result,
                       int row_index,
                       int column_index,
                       const types::complex_logical_type&) {
             if (PQgetisnull(result, row_index, column_index)) {
-                chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), nullptr});
-                return true;
+                chunk.data[column_index].set_null(row_index, true);
+                return parse_outcome::parsed;
             }
             const char* val = PQgetvalue(result, row_index, column_index);
             bool bval = (val[0] == 't' || val[0] == 'T' || val[0] == '1');
-            chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), bval});
-            return true;
+            chunk.set_value(column_index, row_index, bval);
+            return parse_outcome::parsed;
         }
 
-        bool set_int16(data_chunk_t& chunk,
+        parse_outcome set_int16(data_chunk_t& chunk,
                        PGresult* result,
                        int row_index,
                        int column_index,
                        const types::complex_logical_type&) {
             if (PQgetisnull(result, row_index, column_index)) {
-                chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), nullptr});
-                return true;
+                chunk.data[column_index].set_null(row_index, true);
+                return parse_outcome::parsed;
             }
             const char* val = PQgetvalue(result, row_index, column_index);
             int16_t value = 0;
             auto [ptr, ec] = std::from_chars(val, val + std::strlen(val), value);
             if (ec != std::errc{}) {
-                chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), nullptr});
-                return true;
+                chunk.data[column_index].set_null(row_index, true);
+                return parse_outcome::parsed;
             }
-            chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), value});
-            return true;
+            chunk.set_value(column_index, row_index, value);
+            return parse_outcome::parsed;
         }
 
-        bool set_int32(data_chunk_t& chunk,
+        parse_outcome set_int32(data_chunk_t& chunk,
                        PGresult* result,
                        int row_index,
                        int column_index,
                        const types::complex_logical_type&) {
             if (PQgetisnull(result, row_index, column_index)) {
-                chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), nullptr});
-                return true;
+                chunk.data[column_index].set_null(row_index, true);
+                return parse_outcome::parsed;
             }
             const char* val = PQgetvalue(result, row_index, column_index);
             int32_t value = 0;
             auto [ptr, ec] = std::from_chars(val, val + std::strlen(val), value);
             if (ec != std::errc{}) {
-                chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), nullptr});
-                return true;
+                chunk.data[column_index].set_null(row_index, true);
+                return parse_outcome::parsed;
             }
-            chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), value});
-            return true;
+            chunk.set_value(column_index, row_index, value);
+            return parse_outcome::parsed;
         }
 
-        bool set_int64(data_chunk_t& chunk,
+        parse_outcome set_int64(data_chunk_t& chunk,
                        PGresult* result,
                        int row_index,
                        int column_index,
                        const types::complex_logical_type&) {
             if (PQgetisnull(result, row_index, column_index)) {
-                chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), nullptr});
-                return true;
+                chunk.data[column_index].set_null(row_index, true);
+                return parse_outcome::parsed;
             }
             const char* val = PQgetvalue(result, row_index, column_index);
             int64_t value = 0;
             auto [ptr, ec] = std::from_chars(val, val + std::strlen(val), value);
             if (ec != std::errc{}) {
-                chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), nullptr});
-                return true;
+                chunk.data[column_index].set_null(row_index, true);
+                return parse_outcome::parsed;
             }
-            chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), value});
-            return true;
+            chunk.set_value(column_index, row_index, value);
+            return parse_outcome::parsed;
         }
 
-        bool set_float(data_chunk_t& chunk,
+        parse_outcome set_float(data_chunk_t& chunk,
                        PGresult* result,
                        int row_index,
                        int column_index,
                        const types::complex_logical_type&) {
             if (PQgetisnull(result, row_index, column_index)) {
-                chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), nullptr});
-                return true;
+                chunk.data[column_index].set_null(row_index, true);
+                return parse_outcome::parsed;
             }
             const char* val = PQgetvalue(result, row_index, column_index);
             char* end = nullptr;
             float value = std::strtof(val, &end);
             if (end == val) {
                 // Conversion failed
-                chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), nullptr});
-                return true;
+                chunk.data[column_index].set_null(row_index, true);
+                return parse_outcome::parsed;
             }
-            chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), value});
-            return true;
+            chunk.set_value(column_index, row_index, value);
+            return parse_outcome::parsed;
         }
 
-        bool set_double(data_chunk_t& chunk,
+        parse_outcome set_double(data_chunk_t& chunk,
                         PGresult* result,
                         int row_index,
                         int column_index,
                         const types::complex_logical_type&) {
             if (PQgetisnull(result, row_index, column_index)) {
-                chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), nullptr});
-                return true;
+                chunk.data[column_index].set_null(row_index, true);
+                return parse_outcome::parsed;
             }
             const char* val = PQgetvalue(result, row_index, column_index);
             char* end = nullptr;
             double value = std::strtod(val, &end);
             if (end == val) {
                 // Conversion failed
-                chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), nullptr});
-                return true;
+                chunk.data[column_index].set_null(row_index, true);
+                return parse_outcome::parsed;
             }
-            chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), value});
-            return true;
+            chunk.set_value(column_index, row_index, value);
+            return parse_outcome::parsed;
         }
 
-        bool set_string(data_chunk_t& chunk,
+        parse_outcome set_string(data_chunk_t& chunk,
                         PGresult* result,
                         int row_index,
                         int column_index,
                         const types::complex_logical_type&) {
             if (PQgetisnull(result, row_index, column_index)) {
-                chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), nullptr});
-                return true;
+                chunk.data[column_index].set_null(row_index, true);
+                return parse_outcome::parsed;
             }
             const char* val = PQgetvalue(result, row_index, column_index);
-            chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), std::string(val)});
-            return true;
+            chunk.set_value(column_index, row_index, std::string_view{val});
+            return parse_outcome::parsed;
         }
 
-        bool set_bytea(data_chunk_t& chunk,
+        parse_outcome set_bytea(data_chunk_t& chunk,
                        PGresult* result,
                        int row_index,
                        int column_index,
                        const types::complex_logical_type&) {
             if (PQgetisnull(result, row_index, column_index)) {
-                chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), nullptr});
-                return true;
+                chunk.data[column_index].set_null(row_index, true);
+                return parse_outcome::parsed;
             }
             size_t len = 0;
             unsigned char* unescaped =
@@ -198,76 +200,74 @@ namespace tsl {
             if (unescaped) {
                 std::string blob(reinterpret_cast<char*>(unescaped), len);
                 PQfreemem(unescaped);
-                chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), std::move(blob)});
+                chunk.set_value(column_index, row_index, std::string_view{blob});
             } else {
-                chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), nullptr});
+                chunk.data[column_index].set_null(row_index, true);
             }
-            return true;
+            return parse_outcome::parsed;
         }
 
         // A NUMERIC(p, s) value: the text PostgreSQL prints for it (exactly s fraction digits) read as
         // the unscaled integer of the column's DECIMAL, every digit kept. A constrained NUMERIC takes
         // NaN (never an infinity), which is the engine's DECIMAL NaN.
-        bool set_decimal(data_chunk_t& chunk,
+        parse_outcome set_decimal(data_chunk_t& chunk,
                          PGresult* result,
                          int row_index,
                          int column_index,
                          const types::complex_logical_type& type) {
             if (PQgetisnull(result, row_index, column_index)) {
-                chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), nullptr});
-                return true;
+                chunk.data[column_index].set_null(row_index, true);
+                return parse_outcome::parsed;
             }
             const std::string_view text{PQgetvalue(result, row_index, column_index)};
             const auto* spec = type.extension_as<types::decimal_logical_type_extension>();
             if (text == "NaN") {
-                chunk.set_value(
-                    column_index,
-                    row_index,
-                    types::logical_value_t::create_decimal(chunk.resource(),
-                                                           type,
-                                                           types::decimal_special::not_a_number(spec->stored_as())));
-                return true;
+                set_decimal_raw(chunk.data[column_index],
+                                row_index,
+                                types::decimal_special::not_a_number(spec->stored_as()));
+                return parse_outcome::parsed;
             }
             types::int128_t unscaled = 0;
-            if (!components::casts::kernels::detail::parse_decimal(text, spec->width(), spec->scale(), &unscaled)) {
-                return false;
+            if (const auto outcome = components::casts::kernels::detail::parse_decimal(text,
+                                                                                       spec->width(),
+                                                                                       spec->scale(),
+                                                                                       &unscaled);
+                outcome != parse_outcome::parsed) {
+                return outcome;
             }
-            chunk.set_value(column_index,
-                            row_index,
-                            types::logical_value_t::create_decimal(chunk.resource(), type, unscaled));
-            return true;
+            set_decimal_raw(chunk.data[column_index], row_index, unscaled);
+            return parse_outcome::parsed;
         }
 
-        // The enum value whose entry is named `key`, or NA for a key the type
-        // does not list — what the engine's create_enum(key) answered before it
-        // was dropped (the entries carry the ordinal and the name as alias).
-        types::logical_value_t
-        enum_value_of(std::pmr::memory_resource* resource, const types::complex_logical_type& type, std::string_view key) {
+        // The ordinal of the enum entry named `key`, or nullopt for a key the type does not list.
+        std::optional<int32_t> enum_ordinal_of(const types::complex_logical_type& type, std::string_view key) {
             const auto* extension = static_cast<const types::enum_logical_type_extension*>(type.extension());
             const auto& entries = extension->entries();
-            auto it = std::find_if(entries.begin(), entries.end(), [key](const types::logical_value_t& entry) {
-                return entry.type().alias() == key;
+            auto it = std::find_if(entries.begin(), entries.end(), [key](const types::enum_entry_t& entry) {
+                return entry.label == key;
             });
             if (it == entries.end()) {
-                return types::logical_value_t{resource, types::complex_logical_type{types::logical_type::NA}};
+                return std::nullopt;
             }
-            return types::logical_value_t::create_enum(resource, type, it->value<int32_t>());
+            return it->value;
         }
 
-        bool set_enum(data_chunk_t& chunk,
+        parse_outcome set_enum(data_chunk_t& chunk,
                       PGresult* result,
                       int row_index,
                       int column_index,
                       const types::complex_logical_type& type) {
             if (PQgetisnull(result, row_index, column_index)) {
-                chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), nullptr});
-                return true;
+                chunk.data[column_index].set_null(row_index, true);
+                return parse_outcome::parsed;
             }
             const char* val = PQgetvalue(result, row_index, column_index);
-            chunk.set_value(column_index,
-                            row_index,
-                            enum_value_of(chunk.resource(), type, std::string_view(val)));
-            return true;
+            if (const auto ordinal = enum_ordinal_of(type, std::string_view(val))) {
+                chunk.set_value(column_index, row_index, *ordinal);
+            } else {
+                chunk.data[column_index].set_null(row_index, true);
+            }
+            return parse_outcome::parsed;
         }
 
         struct value_translator_t {
@@ -360,7 +360,7 @@ namespace tsl {
     }
 
     namespace {
-        std::optional<types::complex_logical_type> try_make_enum_type(std::pmr::memory_resource* res,
+        std::optional<types::complex_logical_type> try_make_enum_type(std::pmr::memory_resource*,
                                                                       Oid pg_type,
                                                                       const char* column_name,
                                                                       const pg_enum_oid_map& enum_oids) {
@@ -369,13 +369,11 @@ namespace tsl {
                 return std::nullopt;
             }
             const auto& desc = it->second;
-            std::vector<types::logical_value_t> entries;
+            std::vector<types::enum_entry_t> entries;
             entries.reserve(desc.values.size());
             int32_t counter = 0;
             for (const auto& v : desc.values) {
-                types::logical_value_t entry{res, counter++};
-                entry.set_alias(v);
-                entries.emplace_back(std::move(entry));
+                entries.push_back(types::enum_entry_t{std::string{v}, counter++});
             }
             return types::complex_logical_type::create_enum(desc.typname, std::move(entries), column_name);
         }
@@ -410,15 +408,21 @@ namespace tsl {
         for (size_t i = 0; i < nrows; i++) {
             for (int j = 0; j < ncolumns; j++) {
                 const auto& translator = translators.at(static_cast<size_t>(j));
-                if (!translator.conversion_func(chunk, result, static_cast<int>(i), j, translator.type)) {
+                if (const auto outcome =
+                        translator.conversion_func(chunk, result, static_cast<int>(i), j, translator.type);
+                    outcome != parse_outcome::parsed) {
                     std::pmr::string what{"pg_to_chunk: the value '", resource};
                     what.append(PQgetvalue(result, static_cast<int>(i), j));
                     what.append("' in row ");
                     what.append(std::to_string(i));
                     what.append(" of column '");
                     what.append(PQfname(result, j));
-                    what.append("' has no reading as the column's type");
-                    return core::error_t(core::error_code_t::conversion_failure, std::move(what));
+                    what.append(outcome == parse_outcome::out_of_range ? "' is out of the column's range"
+                                                                       : "' has no reading as the column's type");
+                    return core::error_t(outcome == parse_outcome::out_of_range
+                                             ? core::error_code_t::numeric_value_out_of_range
+                                             : core::error_code_t::invalid_text_representation,
+                                         std::move(what));
                 }
             }
         }

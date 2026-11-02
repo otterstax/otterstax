@@ -218,13 +218,12 @@ namespace {
             PoolConfig* target;
             bool allow_auto;
         };
-        const std::array<pool_entry_t, 10> pools{{
+        const std::array<pool_entry_t, 9> pools{{
             {"general", &runtime.general, false},
             {"exec", &runtime.exec, false},
             {"disk", &runtime.disk, false},
             {"sessions", &runtime.sessions, true},
             {"backends", &runtime.backends, true},
-            {"connector_io", &runtime.connector_io, true},
             {"mysql_io", &runtime.mysql_io, true},
             {"postgres_io", &runtime.postgres_io, true},
             {"flight_sql_io", &runtime.flight_sql_io, true},
@@ -262,7 +261,7 @@ core::result_wrapper_t<ServiceConfig> load_config(std::pmr::memory_resource* res
     try {
         config = YAML::LoadFile(config_path);
     } catch (const YAML::Exception& e) {
-        return core::error_t(core::error_code_t::conversion_failure,
+        return core::error_t(core::error_code_t::invalid_text_representation,
                              std::pmr::string{("malformed configuration file '" + config_path + "': " + e.what()).c_str(),
                                               resource});
     }

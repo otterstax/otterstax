@@ -3,10 +3,10 @@
 
 #pragma once
 
-#include "otterbrix/federation/provider.hpp"
-#include "otterbrix/parser/parser.hpp"
+#include "otterbrix/backend_type.hpp"
 #include "utility/table_info.hpp"
 
+#include <components/base/collection_full_name.hpp>
 #include <components/types/types.hpp>
 #include <core/result_wrapper.hpp>
 
@@ -16,11 +16,10 @@
 #include <string_view>
 #include <vector>
 
-// Query builders of schema discovery, shared by the three backend
-// integration classes (which own the connector managers and run the discovery
-// queries) and the writers of the federation metadata (remote_metadata.hpp),
-// which turn a discovery reply into rows of federation.remote_tables /
-// remote_columns.
+// Query builders of schema discovery, used by the backend agents
+// (otterbrix/federation/backend_agent.hpp), which run the discovery queries.
+// What a discovery finds is registered in otterbrix's catalog by
+// catalog/registration.hpp.
 namespace otterstax::catalog {
 
     // Single-quoted SQL string literal for the handwritten discovery queries
@@ -34,18 +33,12 @@ namespace otterstax::catalog {
     // Whole-database table listing per dialect — the only handwritten queries
     // besides the named-types one; every per-table probe goes through
     // sql_gen::generate_query. `scope` is the MySQL database, the PostgreSQL
-    // schema or the ClickHouse database respectively.
+    // schema or the ClickHouse database respectively. MySQL / ClickHouse answer
+    // one column (the table); PostgreSQL two (table_schema, table_name), and an
+    // empty `scope` lists every user schema (not pg_catalog, information_schema,
+    // pg_toast*, pg_temp*).
     std::pmr::string
     make_list_tables_query(std::pmr::memory_resource* resource, backend_type_t backend, std::string_view scope);
-
-    // The primary key columns of the PostgreSQL tables of `schema` (of the one
-    // table `table` when it is not empty): rows of (relname, attname), in key
-    // order per table (pg_index.indisprimary; a partitioned table's key is its
-    // parent's). MySQL needs no query — the schema probe's column definitions
-    // carry PRI_KEY_FLAG — and a ClickHouse table has no key that names a row.
-    std::pmr::string make_primary_keys_query(std::pmr::memory_resource* resource,
-                                             std::string_view schema,
-                                             std::string_view table);
 
     // ClickHouse column type strings of one table (system.columns), the source
     // of the named-type overrides (Tuple(...) with field names) that the
@@ -61,7 +54,8 @@ namespace otterstax::catalog {
     make_schema_probe_query(std::pmr::memory_resource* resource, const qualified_name_t& name, backend_type_t backend);
 
     // Per-table discovery failures are collected and folded into one hard
-    // error naming the failure count and the first few tables.
+    // error naming the failure count and the first few tables
+    // (undefined_object).
     core::error_t make_discovery_error(std::pmr::memory_resource* resource,
                                        const std::pmr::vector<std::pmr::string>& failed_tables);
 

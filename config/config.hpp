@@ -62,8 +62,8 @@ inline const std::string& log_directory(const EngineConfig& engine) {
     return engine.log_dir.empty() ? engine.data_dir : engine.log_dir;
 }
 
-// One thread pool: an actor-zeta pool of runtime_t, the io pool of the
-// connector managers or of a frontend server. What 0 (auto) means is the
+// One thread pool: an actor-zeta pool of runtime_t or the io pool of a
+// frontend server. What 0 (auto) means is the
 // field's own (RuntimeConfig).
 struct PoolConfig {
     std::size_t threads = 0;
@@ -72,31 +72,21 @@ struct PoolConfig {
 // `service.runtime`: every thread pool of the server, so config.yaml sizes all
 // of them. general / exec / disk are the engine's (otterbrix base_spaces sized
 // them 3 threads); sessions hosts one query session actor per client
-// connection (0 = auto, max(2, hardware threads)); backends runs the backends'
-// statements — these five are actor-zeta pools otterstax::runtime::runtime_t
+// connection (0 = auto, max(2, hardware threads)); backends runs the remote
+// connections' agents — these five are actor-zeta pools otterstax::runtime::runtime_t
 // owns. The rest are plain thread pools their owners build from these sizes.
 struct RuntimeConfig {
     PoolConfig general{3};
     PoolConfig exec{3};
     PoolConfig disk{3};
     PoolConfig sessions{0};
-    // A statement holds a backends thread for the whole remote call (the
-    // connection checkout and the wait for the backend's answer), so with fewer
+    // A statement holds a backends thread for the whole remote call (an agent
+    // runs it there, backend_agent.hpp), so with fewer
     // threads than connections the surplus connections idle and one slow alias
     // can take every thread. 0 (auto) is therefore max(2, hardware threads) and
     // at least the sum of pool_size of every remote connection; an explicit
     // value is taken as is (main logs a warning when it is below that sum).
     PoolConfig backends{0};
-    // The asio io pool of each remote connector manager (MySQL / PostgreSQL /
-    // ClickHouse): the threads its connections' statements run on. A statement
-    // holds one of them while it runs — libpq and clickhouse-cpp block it for
-    // the whole statement, Boost.MySQL completes its async operations on it —
-    // and a connection runs one statement at a time, so a manager can never keep
-    // more io threads busy than it has connections. 0 = auto: each manager gets
-    // as many threads as config.yaml opens connections to its backend kind (the
-    // sum of their pool_size), at least 1 (otterstax::backends::connector_io_threads).
-    // N = N threads for each of the three managers.
-    PoolConfig connector_io{};
     // The frontend servers' threads; 0 = auto, max(2, hardware threads)
     // (otterstax::runtime::resolve_threads), for each.
     //  - mysql_io / postgres_io: the asio pool of the wire server. A connection
@@ -132,7 +122,7 @@ struct ServiceConfig {
 };
 
 // Reads the whole config.yaml. A missing file is the default ServiceConfig; a
-// file that is not YAML is a conversion_failure; a value that cannot be read
+// file that is not YAML is an invalid_text_representation; a value that cannot be read
 // as its type (a port outside 1..65535 included) or a connection entry that is
 // incomplete is an invalid_parameter naming the field or the entry. No
 // exception leaves it: the yaml-cpp calls are the only throwing sites and each

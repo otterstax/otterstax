@@ -41,12 +41,18 @@ namespace frontend::mysql {
         void init_type(field_type type);
     };
 
-    // Fills in what a NEWDECIMAL column definition says about itself: `decimals`
-    // is the scale of the column (the field's documented meaning — the number of
-    // decimals, as 0x1F is used for float and double above), and the length is
-    // the digits plus room for the sign and the point. Both are fixed-size
-    // fields, so this never changes the packet size. Called for every column: a
-    // type that is not a DECIMAL is left exactly as init_type set it.
-    void apply_decimal_metadata(column_definition_41& column, const components::types::complex_logical_type& type);
+    // Fills in what a column definition says about its engine type beyond
+    // init_type. The flags MySQL derives from the type: BINARY_FLAG for a
+    // column of the binary charset (numbers, dates, DECIMAL), UNSIGNED_FLAG for
+    // UTINYINT / USMALLINT / UINTEGER / UBIGINT, ENUM_FLAG for an ENUM; never
+    // NOT_NULL_FLAG (nothing says a result column has no NULL). A NEWDECIMAL:
+    // `decimals` is the scale of the column (the field's documented meaning —
+    // the number of decimals, as 0x1F is used for float and double above), and
+    // the length is the digits plus room for the sign and the point. A BOOLEAN
+    // (MYSQL_TYPE_TINY): the length 1 of TINYINT(1). All are fixed-size fields,
+    // so this never changes the packet size. Called for every column of a
+    // resultset and of a COM_STMT_PREPARE schema; a column's other fields are
+    // left exactly as init_type set them.
+    void apply_type_metadata(column_definition_41& column, const components::types::complex_logical_type& type);
 
 } // namespace frontend::mysql

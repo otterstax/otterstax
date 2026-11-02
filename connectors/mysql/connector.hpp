@@ -64,7 +64,7 @@ namespace mysql {
     // connect()/tryReconnect() return it, and each runQuery overload resolves to
     // the marshaled outcome of its handler (see otterstax::query_result_t).
     // runQuery takes the handler as a non-owning otterstax::function_ref_t: the
-    // callable must outlive the returned awaitable. ConnectorManager::executeQuery
+    // callable must outlive the returned awaitable. The backend agent (backend_agent.hpp)
     // binds the copy otterstax::run_with_owned_handler keeps in its frame.
     class IConnector {
     public:
@@ -77,9 +77,10 @@ namespace mysql {
         virtual core::error_t tryReconnect() = 0;
         virtual bool isClosed() const noexcept = 0;
         virtual std::string alias() const noexcept = 0;
-        // Aborts the statement this connector runs, from any thread (the connector manager's
-        // shutdown): the running operation is cancelled on the connection's strand and completes with
-        // io_error, and the connector refuses every later statement — a cancelled Boost.MySQL
+        // Aborts the statement this connector runs, from any thread (the backend agent's cancel at
+        // shutdown): the running operation — a statement, or the connect of a (re)connect, whose
+        // attempts stop too — is cancelled on the connection's strand and completes with io_error, and
+        // the connector refuses every later statement and connect — a cancelled Boost.MySQL
         // connection is unusable. Never blocks. The default does nothing: a connector that cannot
         // abort (a test stub) lets its statement finish.
         virtual void cancel() noexcept {}
@@ -268,6 +269,9 @@ namespace mysql {
 
     private:
         std::pmr::memory_resource* resource_;
+        // The connection's strand, kept apart from conn_: cancel() posts to it from another thread,
+        // while a (re)connect on the agent's thread replaces the stream conn_.get_executor() reads.
+        asio::strand<asio::io_context::executor_type> strand_;
         bm::any_connection conn_;
         std::shared_ptr<cancel_state_t> cancel_{std::make_shared<cancel_state_t>()};
         bm::connect_params params_;
@@ -284,5 +288,9 @@ namespace mysql {
                                                               asio::io_context&,
                                                               bm::connect_params,
                                                               std::string);
+
+    // The real connector, as production builds it (remote_backends_t's default factory).
+    std::unique_ptr<IConnector>
+    make_mysql_connector(std::pmr::memory_resource* resource, asio::io_context& io_ctx, bm::connect_params params, std::string alias);
 
 } // namespace mysql

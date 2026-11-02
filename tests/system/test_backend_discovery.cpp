@@ -1,24 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2025-2026  OtterStax
 //
-// Schema discovery runs on the backend that owns the connector manager
-// (remote_backends_t::open at startup, the session's rediscovery later). What
+// Schema discovery runs on a backend agent of the connection
+// (remote_backends_t::open at startup, the connection's actor — its discover
+// message — for the session's registration of a table a statement missed). What
 // is pinned here: the metadata queries that enrich a table's schema —
 // PostgreSQL ENUM labels, ClickHouse named types — are part of the discovery,
 // so their failure leaves the connection out instead of degrading it silently;
 // the ClickHouse named-types query quotes the names it embeds; and a
 // rediscovered table carries the backend's current types, not the ones seen
-// first, which is what the next read converts with.
+// first, which is what a read of it converts with.
 
+#include "agent_driver.hpp"
 #include "backends/remote_backends.hpp"
-#include "integration/clickhouse/connection_manager.hpp"
-#include "integration/postgresql/connection_manager.hpp"
-#include "integration/sql/connection_manager.hpp"
-#include "otterbrix/federation/provider.hpp"
 #include "session_stack.hpp"
 #include "test_helpers.hpp"
 
-#include "../mock/aliases.hpp"
 #include "../mock/mock_config.hpp"
 #include "../mock/pg_db_connector.hpp"
 
@@ -216,8 +213,7 @@ namespace {
             , remote(res,
                      otterstax::backends::remote_backends_options_t{
                          .connectors = otterstax::backends::connector_factories_t{.clickhouse = &ch_recording_factory},
-                         .connector_threads = {2, 2, 2},
-                         .statements = runtime.backends_scheduler()}) {
+                         .runtime = &runtime}) {
             g_ch_type_variant.store(0);
             g_ch_named_types_malformed.store(false);
             take_recorded_queries();
@@ -230,8 +226,14 @@ namespace {
             return remote.open(connections, config::ConnectionRetryConfig{});
         }
 
+        // A discovery through the connection's actor (its discover message).
         core::result_wrapper_t<otterstax::federation::discovered_tables_t> discover(const qualified_name_t& scope) {
-            return remote.clickhouse().discover(scope);
+            auto* actor = remote.actor(scope.connection.t);
+            REQUIRE(actor != nullptr);
+            auto [needs_sched, future] = actor_zeta::send(actor, &otterstax::federation::backend_actor_t::discover, scope);
+            static_cast<void>(needs_sched);
+            REQUIRE(otterstax::test::poll_until_ready(future, std::chrono::seconds(30)));
+            return std::move(future).take_ready();
         }
     };
 
@@ -246,74 +248,65 @@ namespace {
 
 } // namespace
 
-TEST_CASE("PostgressManager::discover: a failed ENUM query leaves the connection out") {
+TEST_CASE("PostgreSQL discovery: a failed ENUM query leaves the connection undiscovered") {
     std::pmr::synchronized_pool_resource arena(std::pmr::new_delete_resource());
     otterstax::runtime::runtime_t runtime(otterstax::test::test_runtime_config());
     otterstax::backends::remote_backends_t remote(
         &arena,
         otterstax::backends::remote_backends_options_t{
             .connectors = otterstax::backends::connector_factories_t{.postgres = &pg_enum_failing_factory},
-            .connector_threads = {2, 2, 2},
-            .statements = runtime.backends_scheduler()});
+            .runtime = &runtime});
     config::ConnectionsConfig connections;
     connections.postgresql.push_back(config::PgConnectionDesc{.alias = "shop",
                                                               .host = "localhost",
                                                               .database = "pgdb",
                                                               .schema = "public",
                                                               .table = "orders"});
-    // Startup goes on without the connection (the failure is logged); nothing
-    // of it is recorded.
+    // Startup goes on without the connection's tables (the failure is logged);
+    // nothing of it is recorded.
     auto opened = remote.open(connections, config::ConnectionRetryConfig{});
     INFO(opened.what.c_str());
     REQUIRE_FALSE(opened.contains_error());
-    REQUIRE_FALSE(remote.postgres_connectors().hasConnection("shop"));
-    REQUIRE(remote.discovered().empty());
+    REQUIRE(std::none_of(remote.discovered().begin(), remote.discovered().end(), [](const auto& d) { return d.discovered; }));
 
     // The discovery itself answers the pg_enum failure, code and text: asked of
-    // the same connection opened again by hand (open() removed it).
-    auto added = remote.postgres_connectors().addConnection(conn::api_server::PgConnectionParams{.alias = "shop",
-                                                                                                 .host = "localhost",
-                                                                                                 .database = "pgdb",
-                                                                                                 .schema = "public",
-                                                                                                 .table = "orders"});
-    INFO((added.has_error() ? added.error().what.c_str() : "ok"));
-    REQUIRE_FALSE(added.has_error());
-    auto reply = remote.postgres().discover(qualified_name_t{core::uid_t{"shop"},
-                                                             core::dbname_t{"pgdb"},
-                                                             core::schema_t{"public"},
-                                                             core::relname_t{"orders"}});
+    // an agent over the same connector.
+    otterstax::test::agent_driver_t agent(&pg_enum_failing_factory, "shop");
+    auto reply = agent.discover(qualified_name_t{core::connection_name_t{"shop"},
+                                                 core::dbname_t{"pgdb"},
+                                                 core::schema_t{"public"},
+                                                 core::relname_t{"orders"}});
     REQUIRE(reply.has_error());
     INFO(reply.error().what.c_str());
     CHECK(reply.error().type == core::error_code_t::io_error);
     CHECK(std::string{reply.error().what.c_str()}.find("simulated pg_enum failure") != std::string::npos);
 }
 
-TEST_CASE("ClickhouseManager::discover: the named-types query quotes the database and table") {
+TEST_CASE("ClickHouse discovery: the named-types query quotes the database and table") {
     std::pmr::synchronized_pool_resource arena(std::pmr::new_delete_resource());
     ch_stack stack(&arena);
 
     auto opened = stack.open("ev_alias", "d\\b", "ev'il");
     INFO(opened.what.c_str());
     REQUIRE_FALSE(opened.contains_error());
-    REQUIRE(stack.remote.clickhouse_connectors().hasConnection("ev_alias"));
+    REQUIRE(stack.remote.discovered().front().discovered);
 
     const auto queries = take_recorded_queries();
     const std::string expected = "SELECT name, type FROM system.columns WHERE database = 'd\\\\b' AND table = 'ev''il'";
     REQUIRE(std::find(queries.begin(), queries.end(), expected) != queries.end());
 }
 
-TEST_CASE("ClickhouseManager::discover: a malformed system.columns answer leaves the connection out") {
+TEST_CASE("ClickHouse discovery: a malformed system.columns answer leaves the connection undiscovered") {
     std::pmr::synchronized_pool_resource arena(std::pmr::new_delete_resource());
     ch_stack stack(&arena);
     g_ch_named_types_malformed.store(true);
 
     auto opened = stack.open("ev_alias", "ev", "events");
     REQUIRE_FALSE(opened.contains_error());
-    REQUIRE_FALSE(stack.remote.clickhouse_connectors().hasConnection("ev_alias"));
-    REQUIRE(stack.remote.discovered().empty());
+    REQUIRE(std::none_of(stack.remote.discovered().begin(), stack.remote.discovered().end(), [](const auto& d) { return d.discovered; }));
 }
 
-TEST_CASE("ClickhouseManager::discover: a rediscovered table carries the backend's current named types") {
+TEST_CASE("ClickHouse discovery: a rediscovered table carries the backend's current named types") {
     std::pmr::synchronized_pool_resource arena(std::pmr::new_delete_resource());
     ch_stack stack(&arena);
 
@@ -326,22 +319,18 @@ TEST_CASE("ClickhouseManager::discover: a rediscovered table carries the backend
     // The backend now reports a named tuple for the same column: the override
     // must shape the discovered schema, and the entry seen first must not win.
     g_ch_type_variant.store(1);
-    auto second = stack.discover(qualified_name_t{core::uid_t{"1"}, core::dbname_t{"ev"}, core::schema_t{}, core::relname_t{"events"}});
+    auto second = stack.discover(qualified_name_t{core::connection_name_t{"1"}, core::dbname_t{"ev"}, core::schema_t{}, core::relname_t{"events"}});
     REQUIRE_FALSE(second.has_error());
     REQUIRE(column_t_type(second.value()) == components::types::logical_type::STRUCT);
 
-    // The refreshed overrides are what a read converts with; the connector
-    // answers a data query with no blocks.
-    auto rows = std::make_shared<otterstax::federation::scan_rows_t>();
-    auto read = drive_until_ready(stack.remote.clickhouse().scan(
-        &arena,
-        otterstax::federation::scan_request_t{
-            "1",
-            "SELECT `t` FROM `ev`.`events`",
-            {otterstax::federation::column_origin_t{otterstax::federation::remote_table_name_t{"ev", "", "events"}, "t"}}},
-        rows));
-    INFO(read.what.c_str());
-    REQUIRE_FALSE(read.contains_error());
+    // The refreshed type is what the table's reads hold the column to (the registered column's
+    // remote type); the connector answers a data query with no blocks.
+    const auto& types = second.value().front().remote_types;
+    REQUIRE(types.contains("t"));
+    otterstax::test::agent_driver_t agent(&ch_recording_factory);
+    auto read = agent.read("SELECT `t` FROM `ev`.`events`", {types.at("t")});
+    INFO((read.has_error() ? read.error().what.c_str() : "ok"));
+    REQUIRE_FALSE(read.has_error());
 }
 
 // ── ClickHouse: one table name in two databases of one connection ──────────
@@ -413,45 +402,24 @@ namespace {
 
 } // namespace
 
-TEST_CASE("ClickhouseManager::scan: a table name in two databases of one connection keeps each database's named types") {
-    std::pmr::synchronized_pool_resource arena(std::pmr::new_delete_resource());
-    otterstax::runtime::runtime_t runtime(otterstax::test::test_runtime_config());
-    otterstax::backends::remote_backends_t remote(
-        &arena,
-        otterstax::backends::remote_backends_options_t{
-            .connectors = otterstax::backends::connector_factories_t{.clickhouse = &ch_two_databases_factory},
-            .connector_threads = {2, 2, 2},
-            .statements = runtime.backends_scheduler()});
-    config::ConnectionsConfig connections;
-    connections.clickhouse.push_back(
-        config::ChConnectionDesc{.alias = "ch", .host = "localhost", .database = "db1", .table = "events"});
-    auto opened = remote.open(connections, config::ConnectionRetryConfig{});
-    INFO(opened.what.c_str());
-    REQUIRE_FALSE(opened.contains_error());
-    REQUIRE(remote.discovered().size() == 1);
-
-    // The same table name in another database of the connection (a rediscovery): its named
-    // types must not replace db1's.
-    auto second = remote.clickhouse().discover(
-        qualified_name_t{core::uid_t{"ch"}, core::dbname_t{"db2"}, core::schema_t{}, core::relname_t{"events"}});
-    INFO((second.has_error() ? second.error().what.c_str() : "ok"));
-    REQUIRE_FALSE(second.has_error());
-
+TEST_CASE("ClickHouse discovery: a table name in two databases of one connection keeps each database's named types") {
+    // Each database's table is discovered with its own system.columns types, and a read of it is
+    // held to them (the registered columns of each table carry their own).
+    otterstax::test::agent_driver_t agent(&ch_two_databases_factory, "ch");
     auto flag_type = [&](const std::string& database) {
-        auto rows = std::make_shared<otterstax::federation::scan_rows_t>();
-        auto read = drive_until_ready(remote.clickhouse().scan(
-            &arena,
-            otterstax::federation::scan_request_t{
-                "ch",
-                "SELECT `flag` FROM `" + database + "`.`events`",
-                {otterstax::federation::column_origin_t{
-                    otterstax::federation::remote_table_name_t{database, "", "events"}, "flag"}}},
-            rows));
-        INFO(read.what.c_str());
-        REQUIRE_FALSE(read.contains_error());
-        REQUIRE(rows->chunks.size() == 1);
-        REQUIRE(rows->chunks.front().column_count() == 1);
-        return rows->chunks.front().types()[0].type();
+        auto reply = agent.discover(
+            qualified_name_t{core::connection_name_t{"ch"}, core::dbname_t{database}, core::schema_t{}, core::relname_t{"events"}});
+        INFO((reply.has_error() ? reply.error().what.c_str() : "ok"));
+        REQUIRE_FALSE(reply.has_error());
+        REQUIRE(reply.value().size() == 1);
+        const auto& types = reply.value().front().remote_types;
+        REQUIRE(types.contains("flag"));
+        auto read = agent.read("SELECT `flag` FROM `" + database + "`.`events`", {types.at("flag")});
+        INFO((read.has_error() ? read.error().what.c_str() : "ok"));
+        REQUIRE_FALSE(read.has_error());
+        REQUIRE(read.value().size() == 1);
+        REQUIRE(read.value().front().column_count() == 1);
+        return read.value().front().types()[0].type();
     };
     CHECK(flag_type("db1") == components::types::logical_type::BOOLEAN);
     CHECK(flag_type("db2") == components::types::logical_type::UTINYINT);
@@ -459,15 +427,14 @@ TEST_CASE("ClickhouseManager::scan: a table name in two databases of one connect
 
 // ── MySQL: a configured table scopes the startup discovery, as for PG / CH ──
 
-TEST_CASE("MySQLManager::discover: a configured table is the only table the startup discovery records") {
+TEST_CASE("MySQL discovery: a configured table is the only table the startup discovery records") {
     std::pmr::synchronized_pool_resource arena(std::pmr::new_delete_resource());
     otterstax::runtime::runtime_t runtime(otterstax::test::test_runtime_config());
     otterstax::backends::remote_backends_t remote(
         &arena,
         otterstax::backends::remote_backends_options_t{
             .connectors = otterstax::backends::connector_factories_t{.mysql = &mysql_mock_connector_factory},
-            .connector_threads = {2, 2, 2},
-            .statements = runtime.backends_scheduler()});
+            .runtime = &runtime});
 
     // The mock lists one table, `table`, for a whole-database discovery and
     // answers the probe of any table: a scoped discovery records the configured
@@ -483,203 +450,18 @@ TEST_CASE("MySQLManager::discover: a configured table is the only table the star
     REQUIRE(remote.discovered().size() == 2);
 
     const auto& scoped = remote.discovered()[0];
-    CHECK(scoped.scope.unique_identifier.t == "scoped");
-    CHECK(scoped.scope.collection.t == "orders");
+    CHECK(scoped.connection.name == "scoped");
     REQUIRE(scoped.tables.size() == 1);
-    CHECK(scoped.tables.front().name.unique_identifier.t == "scoped");
+    CHECK(scoped.tables.front().name.connection.t == "scoped");
     CHECK(scoped.tables.front().name.database.t == "db");
     CHECK(scoped.tables.front().name.collection.t == "orders");
 
     const auto& whole = remote.discovered()[1];
-    CHECK(whole.scope.collection.t.empty());
+    CHECK(whole.connection.name == "whole");
     REQUIRE(whole.tables.size() == 1);
     CHECK(whole.tables.front().name.collection.t == "table");
 }
 
-// ── MySQL: the primary key off the probe's PRI_KEY_FLAG, a binary key dropped ──
-
-namespace {
-
-    // The writes the keyed MySQL backend received, in order.
-    std::mutex g_mysql_writes_mutex;
-    std::vector<std::string> g_mysql_writes;
-
-    std::vector<std::string> take_mysql_writes() {
-        std::lock_guard guard(g_mysql_writes_mutex);
-        return std::exchange(g_mysql_writes, {});
-    }
-
-    // The OK packet of an UPDATE that matched one row, its info in a language other than English:
-    // the matched rows are read by the message's numbers, whatever lc_messages says.
-    boost::mysql::results update_ok_results() {
-        boost::mysql::results result;
-        auto& impl = boost::mysql::detail::access::get_impl(result);
-        impl.reset(boost::mysql::detail::resultset_encoding::text, boost::mysql::metadata_mode::minimal);
-        boost::mysql::diagnostics diag;
-        [[maybe_unused]] auto ec = impl.on_head_ok_packet(
-            boost::mysql::detail::ok_view{0, 0, 0, 0, "Datensätze gefunden: 1  Geändert: 0  Warnungen: 0"},
-            diag);
-        REQUIRE_FALSE(ec);
-        return result;
-    }
-
-    // Database `db` with three tables: `orders` (id INT, name VARCHAR; PRIMARY KEY (id)), `blobs`
-    // (k VARBINARY, v INT; PRIMARY KEY (k)) and `wide` (k DECIMAL without a precision the engine can
-    // declare — read as its text —, v INT; PRIMARY KEY (k)). The data path answers two rows of the
-    // table a statement names; a write is recorded and answers an UPDATE's OK packet.
-    class keyed_mysql_connector final : public mysql::IConnector {
-    public:
-        keyed_mysql_connector(std::pmr::memory_resource* resource, std::string alias)
-            : resource_(resource)
-            , alias_(std::move(alias)) {}
-
-        mysql::Status status() const noexcept override { return mysql::Status::Connected; }
-        boost::mysql::connect_params params() const noexcept override { return {}; }
-        void close() override {}
-        core::error_t connect() override { return core::error_t::no_error(); }
-        bool isConnected() override { return true; }
-        core::error_t tryReconnect() override { return core::error_t::no_error(); }
-        bool isClosed() const noexcept override { return false; }
-        std::string alias() const noexcept override { return alias_; }
-
-        boost::asio::awaitable<core::result_wrapper_t<std::unique_ptr<data_chunk_t>>>
-        runQuery(std::string_view query,
-                 otterstax::function_ref_t<std::unique_ptr<data_chunk_t>(const boost::mysql::results&)>) override {
-            using components::types::logical_type;
-            using components::types::logical_value_t;
-            const bool blobs = query.find("`blobs`") != std::string_view::npos;
-            std::pmr::vector<components::types::complex_logical_type> fields(resource_);
-            fields.emplace_back(blobs ? logical_type::STRING_LITERAL : logical_type::INTEGER, blobs ? "k" : "id");
-            fields.emplace_back(blobs ? logical_type::INTEGER : logical_type::STRING_LITERAL, blobs ? "v" : "name");
-            auto chunk = std::make_unique<data_chunk_t>(resource_, fields, 2);
-            for (std::uint64_t row = 0; row < 2; ++row) {
-                const auto number = logical_value_t(resource_, static_cast<int32_t>(row + 1));
-                const auto text = logical_value_t(resource_, std::string{row == 0 ? "a" : "b"});
-                chunk->set_value(0, row, blobs ? text : number);
-                chunk->set_value(1, row, blobs ? number : text);
-            }
-            chunk->set_cardinality(2);
-            co_return std::move(chunk);
-        }
-
-        boost::asio::awaitable<core::result_wrapper_t<int64_t>>
-        runQuery(std::string_view query, otterstax::function_ref_t<int64_t(const boost::mysql::results&)> handler) override {
-            {
-                std::lock_guard guard(g_mysql_writes_mutex);
-                g_mysql_writes.emplace_back(query);
-            }
-            const auto ok = update_ok_results();
-            co_return handler(ok);
-        }
-
-        boost::asio::awaitable<core::error_t>
-        runQuery(std::string_view query,
-                 otterstax::function_ref_t<otterstax::asio_error_t(const boost::mysql::results&)> handler) override {
-            using boost::mysql::column_type;
-            if (query.find("sql_mode") != std::string_view::npos) {
-                const auto mode = mysql::mock_results({{"@@SESSION.sql_mode", column_type::varchar}},
-                                                      {{std::string{"STRICT_TRANS_TABLES"}}});
-                co_return otterstax::as_query_result<otterstax::asio_error_t>(handler(mode));
-            }
-            if (query.find("information_schema") != std::string_view::npos) {
-                const auto listing = mysql::mock_results(
-                    {{"TABLE_NAME", column_type::varchar}},
-                    {{std::string{"orders"}}, {std::string{"blobs"}}, {std::string{"wide"}}});
-                co_return otterstax::as_query_result<otterstax::asio_error_t>(handler(listing));
-            }
-            if (query.find("`orders`") != std::string_view::npos) {
-                const auto probe = mysql::mock_results(
-                    {{.name = "id", .type = column_type::int_, .primary_key = true}, {"name", column_type::varchar}});
-                co_return otterstax::as_query_result<otterstax::asio_error_t>(handler(probe));
-            }
-            if (query.find("`blobs`") != std::string_view::npos) {
-                const auto probe = mysql::mock_results(
-                    {{.name = "k", .type = column_type::varbinary, .primary_key = true}, {"v", column_type::int_}});
-                co_return otterstax::as_query_result<otterstax::asio_error_t>(handler(probe));
-            }
-            if (query.find("`wide`") != std::string_view::npos) {
-                const auto probe = mysql::mock_results(
-                    {{.name = "k", .type = column_type::decimal, .primary_key = true}, {"v", column_type::int_}});
-                co_return otterstax::as_query_result<otterstax::asio_error_t>(handler(probe));
-            }
-            co_return otterstax::as_query_result<otterstax::asio_error_t>(handler(mysql::mock_ok_results()));
-        }
-
-    private:
-        std::pmr::memory_resource* resource_;
-        std::string alias_;
-    };
-
-    std::unique_ptr<mysql::IConnector> keyed_mysql_factory(std::pmr::memory_resource* resource,
-                                                           boost::asio::io_context&,
-                                                           boost::mysql::connect_params,
-                                                           std::string alias) {
-        return std::make_unique<keyed_mysql_connector>(resource, std::move(alias));
-    }
-
-} // namespace
-
-TEST_CASE("MySQLManager::discover: the PRI_KEY_FLAG key is recorded and names the row a change writes") {
-    otterstax::test::stack_options_t options;
-    options.connectors.mysql = &keyed_mysql_factory;
-    options.connections.mysql.push_back(
-        config::MysqlConnectionDesc{.alias = "keyed", .host = "localhost", .database = "db", .table = ""});
-    otterstax::test::session_stack_owner owner("/tmp/otterstax_backend_discovery_mysql_key", options);
-    take_mysql_writes();
-
-    // The discovery's reply: the key off the probe's column flags; a key over a VARBINARY column
-    // names no row the federation can write back, so `blobs` has none; nor does a key over a DECIMAL
-    // the engine holds as its text (MySQL would compare `k = '…'` as DOUBLE), so `wide` has none.
-    const auto& discovered = owner.remote().discovered();
-    REQUIRE(discovered.size() == 1);
-    for (const auto& table : discovered.front().tables) {
-        CAPTURE(table.name.collection.t);
-        CHECK(table.primary_key ==
-              (table.name.collection.t == "orders" ? std::vector<std::string>{"id"} : std::vector<std::string>{}));
-    }
-
-    auto keys = owner.engine().sql("SELECT table_name, column_name, key_position FROM federation.remote_columns "
-                                   "ORDER BY table_name, ordinal;");
-    REQUIRE(keys);
-    INFO((keys->is_error() ? keys->get_error().what.c_str() : "ok"));
-    REQUIRE_FALSE(keys->is_error());
-    std::vector<std::tuple<std::string, std::string, std::int64_t>> recorded;
-    for (const auto& chunk : keys->chunks()) {
-        for (std::uint64_t row = 0; row < chunk.size(); ++row) {
-            recorded.emplace_back(chunk.value(0, row).value<std::string_view>(),
-                                  chunk.value(1, row).value<std::string_view>(),
-                                  chunk.value(2, row).value<std::int64_t>());
-        }
-    }
-    CHECK(recorded == std::vector<std::tuple<std::string, std::string, std::int64_t>>{{"blobs", "k", 0},
-                                                                                      {"blobs", "v", 0},
-                                                                                      {"orders", "id", 1},
-                                                                                      {"orders", "name", 0},
-                                                                                      {"wide", "k", 0},
-                                                                                      {"wide", "v", 0}});
-
-    REQUIRE_FALSE(owner.engine().sql("CREATE DATABASE loc;")->is_error());
-    REQUIRE_FALSE(owner.engine().sql("CREATE TABLE loc.ids (id INT);")->is_error());
-    REQUIRE_FALSE(owner.engine().sql("INSERT INTO loc.ids (id) VALUES (2);")->is_error());
-    // A row the engine picks is changed by its key; the count is the rows the backend matched,
-    // read off its (here German) OK packet info.
-    auto updated = owner.engine().sql("UPDATE keyed.db.orders SET name = 'z' WHERE id IN (SELECT id FROM loc.ids);");
-    REQUIRE(updated);
-    INFO((updated->is_error() ? updated->get_error().what.c_str() : "ok"));
-    REQUIRE_FALSE(updated->is_error());
-    CHECK(updated->affected_rows() == 1);
-    CHECK(take_mysql_writes() == std::vector<std::string>{"UPDATE `db`.`orders` SET `name` = 'z' WHERE `id` = 2"});
-
-    for (const char* table : {"blobs", "wide"}) {
-        CAPTURE(table);
-        auto refused = owner.engine().sql(std::string{"UPDATE keyed.db."} + table +
-                                          " SET v = 0 WHERE v IN (SELECT id FROM loc.ids);");
-        REQUIRE(refused);
-        REQUIRE(refused->is_error());
-        CHECK(std::string{refused->get_error().what.c_str()}.find("has no primary key") != std::string::npos);
-        CHECK(take_mysql_writes().empty());
-    }
-}
 
 // ── MySQL: a server under NO_BACKSLASH_ESCAPES is refused at startup ──
 
@@ -720,7 +502,7 @@ namespace {
 
 } // namespace
 
-TEST_CASE("MySQLManager::discover: a server under NO_BACKSLASH_ESCAPES is left out and the others serve") {
+TEST_CASE("MySQL discovery: a server under NO_BACKSLASH_ESCAPES is left out and the others serve") {
     otterstax::test::stack_options_t options;
     options.connectors.mysql = &sql_mode_mysql_factory;
     options.connections.mysql.push_back(
@@ -731,13 +513,13 @@ TEST_CASE("MySQLManager::discover: a server under NO_BACKSLASH_ESCAPES is left o
 
     // Startup goes on without the refused connection; nothing of it is recorded.
     auto& remote = owner.remote();
-    CHECK(remote.mysql_connectors().hasConnection("plain"));
-    CHECK_FALSE(remote.mysql_connectors().hasConnection("nbe"));
-    REQUIRE(remote.discovered().size() == 1);
-    CHECK(remote.discovered().front().scope.unique_identifier.t == "plain");
+    REQUIRE(remote.discovered().size() == 2);
+    CHECK(remote.discovered().front().connection.name == "plain");
+    CHECK(remote.discovered().front().discovered);
+    CHECK_FALSE(remote.discovered().back().discovered);
 
     // The other connection serves its table; the refused one is unknown.
-    auto served = owner.engine().sql("SELECT id, name FROM plain.db.orders;");
+    auto served = owner.engine().sql("SELECT id, name FROM plain.db.public.orders;");
     REQUIRE(served);
     INFO((served->is_error() ? served->get_error().what.c_str() : "ok"));
     REQUIRE_FALSE(served->is_error());
@@ -746,18 +528,15 @@ TEST_CASE("MySQLManager::discover: a server under NO_BACKSLASH_ESCAPES is left o
         rows += chunk.size();
     }
     CHECK(rows == 2);
-    auto refused = owner.engine().sql("SELECT id, name FROM nbe.db.orders;");
+    auto refused = owner.engine().sql("SELECT id, name FROM nbe.db.public.orders;");
     REQUIRE(refused);
     CHECK(refused->is_error());
 
-    // The discovery itself answers the refusal, code and text: asked of the
-    // same connection opened again by hand (open() removed it).
-    auto added = remote.mysql_connectors().addConnection(conn::api_server::ConnectionParams{
-        .alias = "nbe", .host = "localhost", .database = "db", .table = "orders"});
-    INFO((added.has_error() ? added.error().what.c_str() : "ok"));
-    REQUIRE_FALSE(added.has_error());
-    auto reply = remote.mysql().discover(
-        qualified_name_t{core::uid_t{"nbe"}, core::dbname_t{"db"}, core::schema_t{""}, core::relname_t{"orders"}});
+    // The discovery itself answers the refusal, code and text: asked of an
+    // agent over the same connector.
+    otterstax::test::agent_driver_t agent(&sql_mode_mysql_factory, "nbe");
+    auto reply = agent.discover(
+        qualified_name_t{core::connection_name_t{"nbe"}, core::dbname_t{"db"}, core::schema_t{""}, core::relname_t{"orders"}});
     REQUIRE(reply.has_error());
     INFO(reply.error().what.c_str());
     CHECK(reply.error().type == core::error_code_t::unimplemented_yet);

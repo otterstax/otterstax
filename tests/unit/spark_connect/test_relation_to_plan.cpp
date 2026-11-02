@@ -2,7 +2,6 @@
 // Copyright 2025-2026  OtterStax
 
 #include "frontend/spark_connect_server/plan_translator/relation_to_plan.hpp"
-#include "../../mock/aliases.hpp"
 
 #include <spark/connect/expressions.pb.h>
 #include <spark/connect/relations.pb.h>
@@ -17,11 +16,10 @@
 #include <components/logical_plan/node_data.hpp>
 #include <components/logical_plan/node_limit.hpp>
 #include <components/logical_plan/node_sort.hpp>
-#include <components/types/logical_value.hpp>
 #include <core/result_wrapper.hpp>
 
 #include "otterbrix/parser/parser.hpp" // ParsedQueryData
-#include "types/otterbrix.hpp"         // OtterbrixStatement
+#include "types/otterbrix.hpp"         // plan_root
 
 #include <catch2/catch_all.hpp>
 
@@ -32,15 +30,6 @@
 #include <string_view>
 
 namespace {
-
-    // The connections the tests' table identifiers name, as config.yaml would declare them.
-    const otterstax::names::alias_registry_t& spark_aliases() {
-        static const auto aliases = make_aliases({
-            {"alias1", backend_type_t::PostgreSQL, "db1", "sch1"},
-            {"a", backend_type_t::PostgreSQL, "db1", "sch1"},
-        });
-        return aliases;
-    }
 
     namespace sc = ::spark::connect;
     namespace cl = components::logical_plan;
@@ -194,7 +183,7 @@ namespace {
     // `root`, copied off the resource it was built on.
     std::string refusal_of(const sc::Relation& root) {
         std::pmr::synchronized_pool_resource pool;
-        auto result = frontend::spark::relation_to_plan(make_plan(root), &pool, spark_aliases());
+        auto result = frontend::spark::relation_to_plan(make_plan(root), &pool);
         REQUIRE(result.has_error());
         CHECK(result.error().type == core::error_code_t::unimplemented_yet);
         return std::string(result.error().what.begin(), result.error().what.end());
@@ -264,7 +253,7 @@ namespace {
                               int64_t value) {
         return ce::is_key(cmp.left()) && ce::as_key(cmp.left()).storage().size() == 1 &&
                std::string_view{ce::as_key(cmp.left()).storage()[0]} == column && ce::is_parameter(cmp.right()) &&
-               params->parameter(ce::as_parameter(cmp.right())).value<int64_t>() == value;
+               params->parameter(ce::as_parameter(cmp.right())).get_value<int64_t>(0) == value;
     }
 
     // The first aggregate under (or at) `node` that names a remote table: its
@@ -273,7 +262,7 @@ namespace {
         if (!node) {
             return nullptr;
         }
-        if (node->type() == cl::node_type::aggregate_t && !node->target().unique_identifier.t.empty()) {
+        if (node->type() == cl::node_type::aggregate_t && !node->target().connection.t.empty()) {
             return node.get();
         }
         for (const auto& child : node->children()) {
@@ -294,18 +283,18 @@ TEST_CASE("relation_to_plan: Read.NamedTable federated alias.db.schema.table") {
 
     auto plan = make_read_plan("alias1.db1.sch1.table1");
 
-    auto result = frontend::spark::relation_to_plan(plan, resource, spark_aliases());
+    auto result = frontend::spark::relation_to_plan(plan, resource);
     REQUIRE_FALSE(result.has_error());
 
     auto& parsed = result.value().parsed_data;
     REQUIRE(parsed != nullptr);
-    REQUIRE(parsed->otterbrix_params->node != nullptr);
-    CHECK(parsed->otterbrix_params->node->type() == cl::node_type::aggregate_t);
+    REQUIRE(plan_root(*parsed->plan) != nullptr);
+    CHECK(plan_root(*parsed->plan)->type() == cl::node_type::aggregate_t);
 
     // The name rides whole on the read: the federation resolves it by its uid,
     // a PostgreSQL table by the schema the identifier named.
-    const auto& target = parsed->otterbrix_params->node->target();
-    CHECK(target.unique_identifier.t == "alias1");
+    const auto& target = plan_root(*parsed->plan)->target();
+    CHECK(target.connection.t == "alias1");
     CHECK(target.database.t == "db1");
     CHECK(target.collection.t == "table1");
     CHECK(target.schema.t == "sch1");
@@ -322,27 +311,33 @@ TEST_CASE("relation_to_plan: Read.NamedTable reads one to four name parts as the
         const char* schema;
         const char* table;
     };
-    // One part is a table and two a local db.table; three are read as the
-    // engine reads them, database.schema.table — the federation takes the
-    // database slot of uid.db.table for the uid; four are alias.db.schema.table.
+    // One part is a table, two schema.table, three database.schema.table (a
+    // local database), four connection.database.schema.table.
     const expected_name cases[] = {
         {"t1", "", "", "", "t1"},
-        {"db1.t1", "", "db1", "", "t1"},
+        {"db1.t1", "", "", "db1", "t1"},
         {"alias1.db1.t1", "", "alias1", "db1", "t1"},
         {"alias1.db1.sch1.t1", "alias1", "db1", "sch1", "t1"},
     };
     for (const auto& expected : cases) {
         INFO("identifier " << expected.identifier);
-        auto result = frontend::spark::relation_to_plan(make_read_plan(expected.identifier), resource, spark_aliases());
+        auto result = frontend::spark::relation_to_plan(make_read_plan(expected.identifier), resource);
         REQUIRE_FALSE(result.has_error());
-        const auto& statement = *result.value().parsed_data->otterbrix_params;
-        REQUIRE(statement.node->type() == cl::node_type::aggregate_t);
-        const auto& agg = static_cast<const cl::node_aggregate_t&>(*statement.node);
-        CHECK(agg.target().unique_identifier.t == expected.uid);
+        const auto& statement = *result.value().parsed_data->plan;
+        REQUIRE(plan_root(statement)->type() == cl::node_type::aggregate_t);
+        const auto& agg = static_cast<const cl::node_aggregate_t&>(*plan_root(statement));
+        CHECK(agg.target().connection.t == expected.uid);
         CHECK(agg.target().database.t == expected.database);
         CHECK(agg.target().schema.t == expected.schema);
         CHECK(agg.target().collection.t == expected.table);
     }
+}
+
+TEST_CASE("relation_to_plan: Read.NamedTable of five name parts is refused, never cut down") {
+    std::pmr::synchronized_pool_resource pool;
+    auto result = frontend::spark::relation_to_plan(make_read_plan("a.b.c.d.e"), &pool);
+    REQUIRE(result.has_error());
+    CHECK(result.error().type == core::error_code_t::sql_parse_error);
 }
 
 TEST_CASE("relation_to_plan: Read.NamedTable of a local db.table carries no uid") {
@@ -351,14 +346,14 @@ TEST_CASE("relation_to_plan: Read.NamedTable of a local db.table carries no uid"
 
     auto plan = make_read_plan("db1.table1");
 
-    auto result = frontend::spark::relation_to_plan(plan, resource, spark_aliases());
+    auto result = frontend::spark::relation_to_plan(plan, resource);
     REQUIRE_FALSE(result.has_error());
 
     auto& parsed = result.value().parsed_data;
     REQUIRE(parsed != nullptr);
-    CHECK(parsed->otterbrix_params->node->type() == cl::node_type::aggregate_t);
-    CHECK(parsed->otterbrix_params->node->target().unique_identifier.t.empty());
-    CHECK(remote_read(parsed->otterbrix_params->node) == nullptr);
+    CHECK(plan_root(*parsed->plan)->type() == cl::node_type::aggregate_t);
+    CHECK(plan_root(*parsed->plan)->target().connection.t.empty());
+    CHECK(remote_read(plan_root(*parsed->plan)) == nullptr);
 }
 
 // ── Filter ────────────────────────────────────────────────────────────────────
@@ -376,14 +371,14 @@ TEST_CASE("relation_to_plan: Filter with condition") {
     *fn->add_arguments() = make_attribute("id");
     fn->add_arguments()->mutable_literal()->set_integer(1);
 
-    auto result = frontend::spark::relation_to_plan(plan, resource, spark_aliases());
+    auto result = frontend::spark::relation_to_plan(plan, resource);
     REQUIRE_FALSE(result.has_error());
 
     auto& parsed = result.value().parsed_data;
     REQUIRE(parsed != nullptr);
-    REQUIRE(parsed->otterbrix_params->node != nullptr);
+    REQUIRE(plan_root(*parsed->plan) != nullptr);
 
-    const auto& children = parsed->otterbrix_params->node->children();
+    const auto& children = plan_root(*parsed->plan)->children();
     REQUIRE(children.size() == 1);
     CHECK(children[0]->type() == cl::node_type::match_t);
     CHECK(children[0]->expressions().size() == 1);
@@ -400,14 +395,14 @@ TEST_CASE("relation_to_plan: Filter with ExpressionString predicate (raw SQL)") 
     // sends it (Expression.ExpressionString), not a structured expression tree.
     filter->mutable_condition()->mutable_expression_string()->set_expression("budget > 0");
 
-    auto result = frontend::spark::relation_to_plan(plan, resource, spark_aliases());
+    auto result = frontend::spark::relation_to_plan(plan, resource);
     REQUIRE_FALSE(result.has_error());
 
     auto& parsed = result.value().parsed_data;
     REQUIRE(parsed != nullptr);
-    REQUIRE(parsed->otterbrix_params->node != nullptr);
+    REQUIRE(plan_root(*parsed->plan) != nullptr);
 
-    const auto& children = parsed->otterbrix_params->node->children();
+    const auto& children = plan_root(*parsed->plan)->children();
     REQUIRE(children.size() == 1);
     REQUIRE(children[0]->type() == cl::node_type::match_t);
     REQUIRE(children[0]->expressions().size() == 1);
@@ -425,9 +420,9 @@ TEST_CASE("relation_to_plan: Filter with ExpressionString predicate (raw SQL)") 
 
     // The constant 0 was materialised into the SHARED parameter node (single
     // id-space), so remote SQL generation / local execution can resolve it.
-    const auto& pmap = parsed->otterbrix_params->params_node->parameters().parameters;
+    const auto& pmap = parsed->plan->parameters->parameters();
     REQUIRE(pmap.size() == 1);
-    CHECK(pmap.begin()->second.value<int64_t>() == 0);
+    CHECK(pmap.at(core::parameter_id_t{0}).get_value<int64_t>(0) == 0);
 }
 
 TEST_CASE("relation_to_plan: SQL relation binds its constants into the shared params") {
@@ -440,16 +435,16 @@ TEST_CASE("relation_to_plan: SQL relation binds its constants into the shared pa
     // execution fails with "value getter: parameter not bound".
     plan.mutable_root()->mutable_sql()->set_query("SELECT * FROM t WHERE x > 100");
 
-    auto result = frontend::spark::relation_to_plan(plan, resource, spark_aliases());
+    auto result = frontend::spark::relation_to_plan(plan, resource);
     REQUIRE_FALSE(result.has_error());
 
     auto& parsed = result.value().parsed_data;
     REQUIRE(parsed != nullptr);
-    REQUIRE(parsed->otterbrix_params->params_node != nullptr);
+    REQUIRE(parsed->plan->parameters != nullptr);
 
-    const auto& pmap = parsed->otterbrix_params->params_node->parameters().parameters;
+    const auto& pmap = parsed->plan->parameters->parameters();
     REQUIRE(pmap.size() == 1);
-    CHECK(pmap.begin()->second.value<int64_t>() == 100);
+    CHECK(pmap.at(core::parameter_id_t{0}).get_value<int64_t>(0) == 100);
 }
 
 TEST_CASE("relation_to_plan: SQL relation keeps the schema of an external table it names") {
@@ -463,16 +458,15 @@ TEST_CASE("relation_to_plan: SQL relation keeps the schema of an external table 
     filtered.mutable_filter()->mutable_condition()->mutable_expression_string()->set_expression("price > 100");
     auto plan = make_plan(make_project(filtered, {make_attribute("name"), make_attribute("price")}));
 
-    static const auto aliases = make_aliases({{"a", backend_type_t::PostgreSQL, "pgdb", "public"}});
-    auto result = frontend::spark::relation_to_plan(plan, resource, aliases);
+    auto result = frontend::spark::relation_to_plan(plan, resource);
     REQUIRE_FALSE(result.has_error());
-    const auto& statement = *result.value().parsed_data->otterbrix_params;
+    const auto& statement = *result.value().parsed_data->plan;
 
     // The leaf's read keeps every slot of the name it was written with.
-    const auto* read = remote_read(statement.node);
+    const auto* read = remote_read(plan_root(statement));
     REQUIRE(read != nullptr);
     const auto& name = read->target();
-    CHECK(name.unique_identifier.t == "a");
+    CHECK(name.connection.t == "a");
     CHECK(name.database.t == "pgdb");
     CHECK(name.schema.t == "public");
     CHECK(name.collection.t == "t");
@@ -491,12 +485,12 @@ TEST_CASE("relation_to_plan: Join using_columns builds an equi-compare in key fo
     join->set_join_type(sc::Join::JOIN_TYPE_INNER);
     join->add_using_columns("campaign_id");
 
-    auto result = frontend::spark::relation_to_plan(plan, resource, spark_aliases());
+    auto result = frontend::spark::relation_to_plan(plan, resource);
     REQUIRE_FALSE(result.has_error());
 
     auto& parsed = result.value().parsed_data;
     REQUIRE(parsed != nullptr);
-    const auto& children = parsed->otterbrix_params->node->children();
+    const auto& children = plan_root(*parsed->plan)->children();
     REQUIRE(children.size() == 1);
     REQUIRE(children[0]->type() == cl::node_type::join_t);
     REQUIRE(children[0]->expressions().size() == 1);
@@ -529,9 +523,9 @@ TEST_CASE("relation_to_plan: crossJoin carries a match-everything condition") {
         *join->mutable_right() = make_read_relation("db1.b");
         join->set_join_type(type);
 
-        auto result = frontend::spark::relation_to_plan(plan, resource, spark_aliases());
+        auto result = frontend::spark::relation_to_plan(plan, resource);
         REQUIRE_FALSE(result.has_error());
-        const auto& children = result.value().parsed_data->otterbrix_params->node->children();
+        const auto& children = plan_root(*result.value().parsed_data->plan)->children();
         REQUIRE(children.size() == 1);
         REQUIRE(children[0]->type() == cl::node_type::join_t);
         REQUIRE(children[0]->expressions().size() == 1);
@@ -568,9 +562,9 @@ TEST_CASE("relation_to_plan: Sort maps Spark null placement explicitly") {
         order->set_null_ordering(key.nulls);
     }
 
-    auto result = frontend::spark::relation_to_plan(plan, resource, spark_aliases());
+    auto result = frontend::spark::relation_to_plan(plan, resource);
     REQUIRE_FALSE(result.has_error());
-    const auto& children = result.value().parsed_data->otterbrix_params->node->children();
+    const auto& children = plan_root(*result.value().parsed_data->plan)->children();
     REQUIRE(children.size() == 1);
     REQUIRE(children[0]->type() == cl::node_type::sort_t);
     const auto& exprs = children[0]->expressions();
@@ -635,12 +629,12 @@ TEST_CASE("relation_to_plan: Range materialises a single column named id") {
     range->set_end(10);
     range->set_step(1);
 
-    auto result = frontend::spark::relation_to_plan(plan, resource, spark_aliases());
+    auto result = frontend::spark::relation_to_plan(plan, resource);
     REQUIRE_FALSE(result.has_error());
 
     auto& parsed = result.value().parsed_data;
     REQUIRE(parsed != nullptr);
-    const auto& children = parsed->otterbrix_params->node->children();
+    const auto& children = plan_root(*parsed->plan)->children();
     REQUIRE(children.size() == 1);
     REQUIRE(children[0]->type() == cl::node_type::data_t);
 
@@ -666,16 +660,16 @@ TEST_CASE("relation_to_plan: Project with expressions") {
     *project->add_expressions() = make_attribute("a");
     *project->add_expressions() = make_attribute("b");
 
-    auto result = frontend::spark::relation_to_plan(plan, resource, spark_aliases());
+    auto result = frontend::spark::relation_to_plan(plan, resource);
     REQUIRE_FALSE(result.has_error());
 
     auto& parsed = result.value().parsed_data;
     REQUIRE(parsed != nullptr);
-    REQUIRE(parsed->otterbrix_params->node != nullptr);
+    REQUIRE(plan_root(*parsed->plan) != nullptr);
 
     // The transformer's shape: the output list on a group, beside an empty
     // select (the validator dissolves a group without keys or aggregates).
-    const auto& children = parsed->otterbrix_params->node->children();
+    const auto& children = plan_root(*parsed->plan)->children();
     REQUIRE(children.size() == 2);
     CHECK(children[0]->type() == cl::node_type::group_t);
     REQUIRE(children[0]->expressions().size() == 2);
@@ -690,9 +684,9 @@ TEST_CASE("relation_to_plan: Project names an aliased column by its key") {
     auto plan = make_plan(
         make_project(make_read_relation("db1.t1"), {make_alias(make_attribute("a"), "x"), make_attribute("b")}));
 
-    auto result = frontend::spark::relation_to_plan(plan, resource, spark_aliases());
+    auto result = frontend::spark::relation_to_plan(plan, resource);
     REQUIRE_FALSE(result.has_error());
-    const auto& children = result.value().parsed_data->otterbrix_params->node->children();
+    const auto& children = plan_root(*result.value().parsed_data->plan)->children();
     REQUIRE(children.size() == 2);
     REQUIRE(children[0]->type() == cl::node_type::group_t);
     const auto& outputs = children[0]->expressions();
@@ -719,9 +713,9 @@ TEST_CASE("relation_to_plan: Project of a lone star adds no clause") {
 
     auto plan = make_plan(make_project(make_read_relation("db1.t1"), {make_star()}));
 
-    auto result = frontend::spark::relation_to_plan(plan, resource, spark_aliases());
+    auto result = frontend::spark::relation_to_plan(plan, resource);
     REQUIRE_FALSE(result.has_error());
-    CHECK(result.value().parsed_data->otterbrix_params->node->children().empty());
+    CHECK(plan_root(*result.value().parsed_data->plan)->children().empty());
 }
 
 // ── Aggregate ─────────────────────────────────────────────────────────────────
@@ -738,11 +732,11 @@ TEST_CASE("relation_to_plan: groupBy agg builds the group shape with named outpu
     *agg->add_aggregate_expressions() = make_alias(make_call("sum", {make_attribute("amount")}), "total");
     *agg->add_aggregate_expressions() = make_call("count", {make_star()});
 
-    auto result = frontend::spark::relation_to_plan(make_plan(rel), resource, spark_aliases());
+    auto result = frontend::spark::relation_to_plan(make_plan(rel), resource);
     REQUIRE_FALSE(result.has_error());
 
     // rc-3 keeps the whole SELECT list in the group; the select beside it is empty.
-    const auto& children = result.value().parsed_data->otterbrix_params->node->children();
+    const auto& children = plan_root(*result.value().parsed_data->plan)->children();
     REQUIRE(children.size() == 2);
     REQUIRE(children[0]->type() == cl::node_type::group_t);
     CHECK(children[1]->type() == cl::node_type::select_t);
@@ -788,9 +782,9 @@ TEST_CASE("relation_to_plan: groupBy on a computed key marks it the way the tran
     *rel.mutable_aggregate()->mutable_grouping_expressions(0) =
         make_alias(make_call("%", {make_attribute("amount"), make_long(2)}), "parity");
 
-    auto result = frontend::spark::relation_to_plan(make_plan(rel), resource, spark_aliases());
+    auto result = frontend::spark::relation_to_plan(make_plan(rel), resource);
     REQUIRE_FALSE(result.has_error());
-    const auto& children = result.value().parsed_data->otterbrix_params->node->children();
+    const auto& children = plan_root(*result.value().parsed_data->plan)->children();
     REQUIRE(children.size() == 2);
     REQUIRE(children[0]->type() == cl::node_type::group_t);
     const auto& exprs = children[0]->expressions();
@@ -822,20 +816,20 @@ TEST_CASE("relation_to_plan: consecutive filters are ANDed into one match") {
     auto inner = make_filter(make_read_relation("db1.t1"), make_call(">", {make_attribute("a"), make_long(1)}));
     auto plan = make_plan(make_filter(inner, make_call("<", {make_attribute("b"), make_long(2)})));
 
-    auto result = frontend::spark::relation_to_plan(plan, resource, spark_aliases());
+    auto result = frontend::spark::relation_to_plan(plan, resource);
     REQUIRE_FALSE(result.has_error());
-    const auto& statement = *result.value().parsed_data->otterbrix_params;
+    const auto& statement = *result.value().parsed_data->plan;
 
     // One match — the engine keeps only the last one — holding both predicates.
-    const auto* both = match_predicate(statement.node);
+    const auto* both = match_predicate(plan_root(statement));
     CHECK(both->type() == ce::compare_type::union_and);
     REQUIRE(both->children().size() == 2);
     const auto* first = static_cast<const ce::compare_expression_t*>(both->children()[0].get());
     const auto* second = static_cast<const ce::compare_expression_t*>(both->children()[1].get());
     CHECK(first->type() == ce::compare_type::gt);
-    CHECK(compares_column_with(*first, "a", statement.params_node, 1));
+    CHECK(compares_column_with(*first, "a", statement.parameters, 1));
     CHECK(second->type() == ce::compare_type::lt);
-    CHECK(compares_column_with(*second, "b", statement.params_node, 2));
+    CHECK(compares_column_with(*second, "b", statement.parameters, 2));
 }
 
 TEST_CASE("relation_to_plan: an operation the clause order cannot stack reads a derived table") {
@@ -883,17 +877,17 @@ TEST_CASE("relation_to_plan: an operation the clause order cannot stack reads a 
     };
     for (const auto& derived : cases) {
         INFO("chain " << derived.chain);
-        auto result = frontend::spark::relation_to_plan(make_plan(derived.relation), resource, spark_aliases());
+        auto result = frontend::spark::relation_to_plan(make_plan(derived.relation), resource);
         REQUIRE_FALSE(result.has_error());
-        const auto& root = result.value().parsed_data->otterbrix_params->node;
+        const auto& root = plan_root(*result.value().parsed_data->plan);
         CHECK(child_kinds(root) == derived.outer);
         CHECK(child_kinds(derived_inner(root)) == derived.inner);
     }
 
     // distinct() after limit(): the distinct rows of the window.
-    auto distinct = frontend::spark::relation_to_plan(make_plan(make_distinct(make_limit(read, 5))), resource, spark_aliases());
+    auto distinct = frontend::spark::relation_to_plan(make_plan(make_distinct(make_limit(read, 5))), resource);
     REQUIRE_FALSE(distinct.has_error());
-    const auto& root = distinct.value().parsed_data->otterbrix_params->node;
+    const auto& root = plan_root(*distinct.value().parsed_data->plan);
     CHECK(child_kinds(root) == "aggregate");
     CHECK(static_cast<const cl::node_aggregate_t&>(*root).is_distinct());
     const auto& inner = derived_inner(root);
@@ -909,7 +903,7 @@ TEST_CASE("relation_to_plan: a limit or an offset on a limit merges into one win
     struct window_case {
         const char* chain;
         sc::Relation relation;
-        int64_t limit;
+        int64_t limit; // -1: no count (LIMIT ALL)
         int64_t offset;
     };
     // Two windows in a row are one: rows [o1 + o2, o1 + min(l1 - o2, l2)).
@@ -923,23 +917,23 @@ TEST_CASE("relation_to_plan: a limit or an offset on a limit merges into one win
     };
     for (const auto& window : cases) {
         INFO("chain " << window.chain);
-        auto result = frontend::spark::relation_to_plan(make_plan(window.relation), resource, spark_aliases());
+        auto result = frontend::spark::relation_to_plan(make_plan(window.relation), resource);
         REQUIRE_FALSE(result.has_error());
-        const auto& root = result.value().parsed_data->otterbrix_params->node;
+        const auto& root = plan_root(*result.value().parsed_data->plan);
         REQUIRE(child_kinds(root) == "limit");
         const auto& merged = static_cast<const cl::node_limit_t&>(*root->children().front()).limit();
-        CHECK(merged.limit() == window.limit);
+        CHECK((merged.has_count() ? merged.count() : -1) == window.limit);
         CHECK(merged.offset() == window.offset);
     }
 
     // A spark.sql() leaf's own LIMIT merges the same way.
     sc::Relation sql;
     sql.mutable_sql()->set_query("SELECT * FROM t LIMIT 5");
-    auto leaf = frontend::spark::relation_to_plan(make_plan(make_limit(sql, 3)), resource, spark_aliases());
+    auto leaf = frontend::spark::relation_to_plan(make_plan(make_limit(sql, 3)), resource);
     REQUIRE_FALSE(leaf.has_error());
-    const auto& root = leaf.value().parsed_data->otterbrix_params->node;
+    const auto& root = plan_root(*leaf.value().parsed_data->plan);
     REQUIRE(child_kinds(root) == "limit");
-    CHECK(static_cast<const cl::node_limit_t&>(*root->children().front()).limit().limit() == 3);
+    CHECK(static_cast<const cl::node_limit_t&>(*root->children().front()).limit().count() == 3);
 }
 
 TEST_CASE("relation_to_plan: reading a derived table through a renamed column is unimplemented_yet") {
@@ -959,7 +953,7 @@ TEST_CASE("relation_to_plan: reading a derived table through a renamed column is
     // An operation that reads no column by name still works: count() and
     // distinct() read a derived table of it, limit() stacks on it.
     for (const auto& reading_nothing : {make_count(renamed), make_distinct(renamed), make_limit(renamed, 3)}) {
-        CHECK_FALSE(frontend::spark::relation_to_plan(make_plan(reading_nothing), resource, spark_aliases()).has_error());
+        CHECK_FALSE(frontend::spark::relation_to_plan(make_plan(reading_nothing), resource).has_error());
     }
 }
 
@@ -972,18 +966,18 @@ TEST_CASE("relation_to_plan: a remote read under a derived table keeps its windo
     const auto gt_one = make_call(">", {make_attribute("a"), make_long(1)});
     auto result = frontend::spark::relation_to_plan(
         make_plan(make_filter(make_limit(make_read_relation("a.db1.sch1.t1"), 5), gt_one)),
-        resource,        spark_aliases());
+        resource);
     REQUIRE_FALSE(result.has_error());
-    const auto& statement = *result.value().parsed_data->otterbrix_params;
-    CHECK(child_kinds(statement.node) == "aggregate,match");
-    CHECK(static_cast<const cl::node_aggregate_t&>(*statement.node).target().unique_identifier.t.empty());
-    const auto& inner = derived_inner(statement.node);
+    const auto& statement = *result.value().parsed_data->plan;
+    CHECK(child_kinds(plan_root(statement)) == "aggregate,match");
+    CHECK(static_cast<const cl::node_aggregate_t&>(*plan_root(statement)).target().connection.t.empty());
+    const auto& inner = derived_inner(plan_root(statement));
     CHECK(child_kinds(inner) == "limit");
 
     // The inner block — the read and its window — is what the pushdown rule
     // sends to the backend as one statement.
-    CHECK(remote_read(statement.node) == inner.get());
-    CHECK(inner->target().unique_identifier.t == "a");
+    CHECK(remote_read(plan_root(statement)) == inner.get());
+    CHECK(inner->target().connection.t == "a");
     CHECK(inner->target().schema.t == "sch1");
 }
 
@@ -1009,15 +1003,15 @@ TEST_CASE("relation_to_plan: filter and orderBy may follow a select of plain col
 
     const auto projected = make_project(make_read_relation("db1.t1"), {make_attribute("a"), make_attribute("b")});
     const auto a_gt_one = make_call(">", {make_attribute("a"), make_long(1)});
-    auto filtered = frontend::spark::relation_to_plan(make_plan(make_filter(projected, a_gt_one)), resource, spark_aliases());
+    auto filtered = frontend::spark::relation_to_plan(make_plan(make_filter(projected, a_gt_one)), resource);
     REQUIRE_FALSE(filtered.has_error());
-    const auto& children = filtered.value().parsed_data->otterbrix_params->node->children();
+    const auto& children = plan_root(*filtered.value().parsed_data->plan)->children();
     REQUIRE(children.size() == 3);
     CHECK(children[0]->type() == cl::node_type::group_t);
     CHECK(children[1]->type() == cl::node_type::select_t);
     CHECK(children[2]->type() == cl::node_type::match_t);
 
-    auto sorted = frontend::spark::relation_to_plan(make_plan(make_sort(projected, "a")), resource, spark_aliases());
+    auto sorted = frontend::spark::relation_to_plan(make_plan(make_sort(projected, "a")), resource);
     CHECK_FALSE(sorted.has_error());
 
     // Below a computed or renamed column the filter would test another value:
@@ -1026,9 +1020,9 @@ TEST_CASE("relation_to_plan: filter and orderBy may follow a select of plain col
     const auto x_gt_one = make_call(">", {make_attribute("x"), make_long(1)});
     const auto computed = make_project(make_read_relation("db1.t1"),
                                        {make_alias(make_call("+", {make_attribute("a"), make_long(1)}), "x")});
-    auto derived = frontend::spark::relation_to_plan(make_plan(make_filter(computed, x_gt_one)), resource, spark_aliases());
+    auto derived = frontend::spark::relation_to_plan(make_plan(make_filter(computed, x_gt_one)), resource);
     REQUIRE_FALSE(derived.has_error());
-    CHECK(child_kinds(derived.value().parsed_data->otterbrix_params->node) == "aggregate,match");
+    CHECK(child_kinds(plan_root(*derived.value().parsed_data->plan)) == "aggregate,match");
     const auto renamed = make_project(make_read_relation("db1.t1"), {make_alias(make_attribute("a"), "x")});
     CHECK(refusal_of(make_filter(renamed, x_gt_one))
               .find("filter() reads the result of a select() that renames a column") != std::string::npos);
@@ -1043,9 +1037,9 @@ TEST_CASE("relation_to_plan: filter after orderBy runs below the sort") {
     const auto a_gt_one = make_call(">", {make_attribute("a"), make_long(1)});
     auto result = frontend::spark::relation_to_plan(
         make_plan(make_filter(make_sort(make_read_relation("db1.t1"), "a"), a_gt_one)),
-        resource,        spark_aliases());
+        resource);
     REQUIRE_FALSE(result.has_error());
-    const auto& children = result.value().parsed_data->otterbrix_params->node->children();
+    const auto& children = plan_root(*result.value().parsed_data->plan)->children();
     REQUIRE(children.size() == 2);
     CHECK(children[0]->type() == cl::node_type::sort_t);
     CHECK(children[1]->type() == cl::node_type::match_t);
@@ -1061,9 +1055,9 @@ TEST_CASE("relation_to_plan: a row-wise select after orderBy and limit keeps the
     const auto top = make_limit(make_sort(make_read_relation("db1.t1"), "a"), 3);
     auto result = frontend::spark::relation_to_plan(
         make_plan(make_project(top, {make_attribute("a"), make_alias(make_attribute("b"), "y")})),
-        resource,        spark_aliases());
+        resource);
     REQUIRE_FALSE(result.has_error());
-    const auto& children = result.value().parsed_data->otterbrix_params->node->children();
+    const auto& children = plan_root(*result.value().parsed_data->plan)->children();
     REQUIRE(children.size() == 4);
     CHECK(children[0]->type() == cl::node_type::sort_t);
     CHECK(children[1]->type() == cl::node_type::limit_t);
@@ -1081,18 +1075,18 @@ TEST_CASE("relation_to_plan: structured filter compares a column key with a boun
     auto plan =
         make_plan(make_filter(make_read_relation("db1.t1"), make_call(">", {make_attribute("id"), make_long(5)})));
 
-    auto result = frontend::spark::relation_to_plan(plan, resource, spark_aliases());
+    auto result = frontend::spark::relation_to_plan(plan, resource);
     REQUIRE_FALSE(result.has_error());
-    const auto& statement = *result.value().parsed_data->otterbrix_params;
+    const auto& statement = *result.value().parsed_data->plan;
 
     // The transformer's form compare(key_t, parameter_id_t), with the literal
     // bound in the plan's one parameter node.
-    const auto* cmp = match_predicate(statement.node);
+    const auto* cmp = match_predicate(plan_root(statement));
     CHECK(cmp->type() == ce::compare_type::gt);
-    CHECK(compares_column_with(*cmp, "id", statement.params_node, 5));
+    CHECK(compares_column_with(*cmp, "id", statement.parameters, 5));
 
     // Every literal is bound: no `$n` is left for the describe path to refuse.
-    CHECK(statement.parameters_count == 0);
+    CHECK(result.value().parsed_data->binder().parameter_count() == 0);
 }
 
 TEST_CASE("relation_to_plan: filter with the literal first is mirrored to lead with the column") {
@@ -1102,31 +1096,31 @@ TEST_CASE("relation_to_plan: filter with the literal first is mirrored to lead w
     // lit(5) < id  is  id > 5
     auto lt = frontend::spark::relation_to_plan(
         make_plan(make_filter(make_read_relation("db1.t1"), make_call("<", {make_long(5), make_attribute("id")}))),
-        resource,        spark_aliases());
+        resource);
     REQUIRE_FALSE(lt.has_error());
-    const auto& lt_statement = *lt.value().parsed_data->otterbrix_params;
-    const auto* gt = match_predicate(lt_statement.node);
+    const auto& lt_statement = *lt.value().parsed_data->plan;
+    const auto* gt = match_predicate(plan_root(lt_statement));
     CHECK(gt->type() == ce::compare_type::gt);
-    CHECK(compares_column_with(*gt, "id", lt_statement.params_node, 5));
+    CHECK(compares_column_with(*gt, "id", lt_statement.parameters, 5));
 
     // lit(5) >= id  is  id <= 5; equality keeps its operator
     auto gte = frontend::spark::relation_to_plan(
         make_plan(make_filter(make_read_relation("db1.t1"), make_call(">=", {make_long(5), make_attribute("id")}))),
-        resource,        spark_aliases());
+        resource);
     REQUIRE_FALSE(gte.has_error());
-    const auto& gte_statement = *gte.value().parsed_data->otterbrix_params;
-    const auto* lte = match_predicate(gte_statement.node);
+    const auto& gte_statement = *gte.value().parsed_data->plan;
+    const auto* lte = match_predicate(plan_root(gte_statement));
     CHECK(lte->type() == ce::compare_type::lte);
-    CHECK(compares_column_with(*lte, "id", gte_statement.params_node, 5));
+    CHECK(compares_column_with(*lte, "id", gte_statement.parameters, 5));
 
     auto eq = frontend::spark::relation_to_plan(
         make_plan(make_filter(make_read_relation("db1.t1"), make_call("==", {make_long(7), make_attribute("id")}))),
-        resource,        spark_aliases());
+        resource);
     REQUIRE_FALSE(eq.has_error());
-    const auto& eq_statement = *eq.value().parsed_data->otterbrix_params;
-    const auto* same = match_predicate(eq_statement.node);
+    const auto& eq_statement = *eq.value().parsed_data->plan;
+    const auto* same = match_predicate(plan_root(eq_statement));
     CHECK(same->type() == ce::compare_type::eq);
-    CHECK(compares_column_with(*same, "id", eq_statement.params_node, 7));
+    CHECK(compares_column_with(*same, "id", eq_statement.parameters, 7));
 }
 
 TEST_CASE("relation_to_plan: isin filter is an OR of equalities on the column") {
@@ -1136,10 +1130,10 @@ TEST_CASE("relation_to_plan: isin filter is an OR of equalities on the column") 
     const auto isin = make_call("in", {make_attribute("region"), make_string("north"), make_string("east")});
     auto plan = make_plan(make_filter(make_read_relation("db1.t1"), isin));
 
-    auto result = frontend::spark::relation_to_plan(plan, resource, spark_aliases());
+    auto result = frontend::spark::relation_to_plan(plan, resource);
     REQUIRE_FALSE(result.has_error());
-    const auto& statement = *result.value().parsed_data->otterbrix_params;
-    const auto* any = match_predicate(statement.node);
+    const auto& statement = *result.value().parsed_data->plan;
+    const auto* any = match_predicate(plan_root(statement));
     CHECK(any->type() == ce::compare_type::union_or);
     REQUIRE(any->children().size() == 2);
     const char* expected[] = {"north", "east"};
@@ -1149,7 +1143,7 @@ TEST_CASE("relation_to_plan: isin filter is an OR of equalities on the column") 
         REQUIRE(ce::is_key(eq->left()));
         CHECK(ce::as_key(eq->left()).as_string() == "region");
         REQUIRE(ce::is_parameter(eq->right()));
-        CHECK(statement.params_node->parameter(ce::as_parameter(eq->right())).value<std::string_view>() == expected[i]);
+        CHECK(statement.parameters->parameter(ce::as_parameter(eq->right())).get_value<std::string_view>(0) == expected[i]);
     }
 }
 
@@ -1160,18 +1154,18 @@ TEST_CASE("relation_to_plan: between filter is an AND of the two bounds") {
     auto plan = make_plan(make_filter(make_read_relation("db1.t1"),
                                       make_call("between", {make_attribute("amount"), make_long(10), make_long(20)})));
 
-    auto result = frontend::spark::relation_to_plan(plan, resource, spark_aliases());
+    auto result = frontend::spark::relation_to_plan(plan, resource);
     REQUIRE_FALSE(result.has_error());
-    const auto& statement = *result.value().parsed_data->otterbrix_params;
-    const auto* all = match_predicate(statement.node);
+    const auto& statement = *result.value().parsed_data->plan;
+    const auto* all = match_predicate(plan_root(statement));
     CHECK(all->type() == ce::compare_type::union_and);
     REQUIRE(all->children().size() == 2);
     const auto* lower = static_cast<const ce::compare_expression_t*>(all->children()[0].get());
     const auto* upper = static_cast<const ce::compare_expression_t*>(all->children()[1].get());
     CHECK(lower->type() == ce::compare_type::gte);
-    CHECK(compares_column_with(*lower, "amount", statement.params_node, 10));
+    CHECK(compares_column_with(*lower, "amount", statement.parameters, 10));
     CHECK(upper->type() == ce::compare_type::lte);
-    CHECK(compares_column_with(*upper, "amount", statement.params_node, 20));
+    CHECK(compares_column_with(*upper, "amount", statement.parameters, 20));
 }
 
 TEST_CASE("relation_to_plan: filter condition that is not a predicate is refused") {
@@ -1192,18 +1186,18 @@ TEST_CASE("relation_to_plan: Limit") {
     *limit->mutable_input() = make_read_relation("db1.t1");
     limit->set_limit(5);
 
-    auto result = frontend::spark::relation_to_plan(plan, resource, spark_aliases());
+    auto result = frontend::spark::relation_to_plan(plan, resource);
     REQUIRE_FALSE(result.has_error());
 
     auto& parsed = result.value().parsed_data;
     REQUIRE(parsed != nullptr);
-    REQUIRE(parsed->otterbrix_params->node != nullptr);
+    REQUIRE(plan_root(*parsed->plan) != nullptr);
 
-    const auto& children = parsed->otterbrix_params->node->children();
+    const auto& children = plan_root(*parsed->plan)->children();
     REQUIRE(children.size() == 1);
     REQUIRE(children[0]->type() == cl::node_type::limit_t);
     const auto* limit_node = static_cast<const cl::node_limit_t*>(children[0].get());
-    CHECK(limit_node->limit().limit() == 5);
+    CHECK(limit_node->limit().count() == 5);
 }
 
 // ── contains_window ───────────────────────────────────────────────────────────

@@ -116,7 +116,7 @@ add_library(flight_sql
     session_engine.cpp)
 target_include_directories(flight_sql PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
-    # repo root, for session/catalog/utility headers the adapter includes
+    # repo root, for the session/utility headers the adapter includes
     ${CMAKE_CURRENT_SOURCE_DIR}/../..)
 target_link_libraries(flight_sql
     PUBLIC
@@ -127,5 +127,4 @@ target_link_libraries(flight_sql
         gRPC::grpc++
         protobuf::libprotobuf
     PRIVATE
-        session
-        catalog)
+        session)

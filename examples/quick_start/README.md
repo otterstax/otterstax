@@ -33,10 +33,11 @@ qs-postgres-catalog   Up (healthy)
 qs-postgres-shop      Up (healthy)
 ```
 
-Connect to OtterStax (no password):
+Connect to OtterStax (no password; the database is the engine's `main` — a database the
+engine does not have is refused with `FATAL 3D000`):
 
 ```bash
-psql -h localhost -p 8817 -U demo demo
+psql -h localhost -p 8817 -U demo main
 ```
 
 > Uses the PostgreSQL wire on port **8817** — the same port as `examples/demo/`, so don't
@@ -46,11 +47,11 @@ psql -h localhost -p 8817 -U demo demo
 
 ```bash
 # federation across MariaDB + both PostgreSQL backends
-psql -h localhost -p 8817 -U demo demo \
+psql -h localhost -p 8817 -U demo main \
   -c "SELECT p.category, c.country, SUM(o.amount) AS revenue
-      FROM sales.ops.orders o
-      JOIN pgshop.shop.customers c  ON c.customer_id = o.customer_id
-      JOIN pgcat.catalog.products p ON p.product_id  = o.product_id
+      FROM sales.ops.public.orders o
+      JOIN pgshop.shop.shop.customers c  ON c.customer_id = o.customer_id
+      JOIN pgcat.catalog.catalog.products p ON p.product_id  = o.product_id
       WHERE o.status IN ('paid','shipped')
       GROUP BY p.category, c.country ORDER BY revenue DESC LIMIT 5;"
 ```
@@ -91,20 +92,25 @@ Then work through the examples below:
 
 ### Backends & federation names
 
-You reference a table in federated SQL as **`alias.database.table`**. The alias is
-the connection name; OtterStax routes the query to the right engine.
+You reference a backend table in federated SQL in four parts,
+**`alias.database.schema.table`**. The alias is the connection name; OtterStax
+routes the query to the right engine. A MariaDB / ClickHouse connection has the
+one schema `public`; a PostgreSQL connection the schema its `schema:` in
+`config.yaml` names (`shop` / `catalog` here). Three parts always name a local
+engine table (`database.schema.table`), so `pgshop.shop.customers` is not the
+backend table.
 
 | Alias | Engine | Database | Table (rows × cols) | Reference in SQL |
 |-------|--------|----------|---------------------|------------------|
-| `pgshop` | PostgreSQL #1 | `shop` | `customers` (800 × 4) | `pgshop.shop.customers` |
-| `pgcat` | PostgreSQL #2 | `catalog` | `products` (500 × 4) | `pgcat.catalog.products` |
-| `sales` | MariaDB | `ops` | `orders` (1000 × 5) | `sales.ops.orders` |
-| `web` | ClickHouse | `analytics` | `pageviews` (1000 × 4) | `web.analytics.pageviews` |
-| `qs_s3` | RustFS (S3) | bucket `quickstart-bucket` | `regions.csv`, `product_costs.parquet`, `promotions.ndjson` | loaded into `qs.*` (example 6) |
+| `pgshop` | PostgreSQL #1 | `shop` | `customers` (800 × 4) | `pgshop.shop.shop.customers` |
+| `pgcat` | PostgreSQL #2 | `catalog` | `products` (500 × 4) | `pgcat.catalog.catalog.products` |
+| `sales` | MariaDB | `ops` | `orders` (1000 × 5) | `sales.ops.public.orders` |
+| `web` | ClickHouse | `analytics` | `pageviews` (1000 × 4) | `web.analytics.public.pageviews` |
+| `qs_s3` | RustFS (S3) | bucket `quickstart-bucket` | `regions.csv`, `product_costs.parquet`, `promotions.ndjson` | loaded into `qs.*` — the schema `qs` of the local database `main` (example 6) |
 
 ### Data dictionary
 
-**`pgshop.shop.customers`** — who buys
+**`pgshop.shop.shop.customers`** — who buys
 | column | type | notes |
 |--------|------|-------|
 | `customer_id` | text (PK) | `C0001`…`C0800` |
@@ -112,7 +118,7 @@ the connection name; OtterStax routes the query to the right engine.
 | `country` | char(2) | one of 12 ISO codes |
 | `tier` | text | `bronze` / `silver` / `gold` |
 
-**`pgcat.catalog.products`** — what's for sale
+**`pgcat.catalog.catalog.products`** — what's for sale
 | column | type | notes |
 |--------|------|-------|
 | `product_id` | text (PK) | `P0001`…`P0500` |
@@ -120,7 +126,7 @@ the connection name; OtterStax routes the query to the right engine.
 | `category` | text | 8 categories |
 | `price` | double | 9.99–499.99 |
 
-**`sales.ops.orders`** — transactions
+**`sales.ops.public.orders`** — transactions
 | column | type | notes |
 |--------|------|-------|
 | `order_id` | varchar(8) (PK) | `O00001`…`O01000` |
@@ -129,7 +135,7 @@ the connection name; OtterStax routes the query to the right engine.
 | `amount` | double | 50–500 |
 | `status` | varchar(16) | paid / shipped / pending / refunded |
 
-**`web.analytics.pageviews`** — clickstream (OLAP)
+**`web.analytics.public.pageviews`** — clickstream (OLAP)
 | column | type | notes |
 |--------|------|-------|
 | `customer_id` | String | → customers |
@@ -163,10 +169,10 @@ the connection name; OtterStax routes the query to the right engine.
 A count against each backend, all through the one OtterStax connection on 8817:
 
 ```bash
-psql -h localhost -p 8817 -U demo demo -c "SELECT count(*) FROM pgshop.shop.customers;"    # 800
-psql -h localhost -p 8817 -U demo demo -c "SELECT count(*) FROM pgcat.catalog.products;"    # 500
-psql -h localhost -p 8817 -U demo demo -c "SELECT count(*) FROM sales.ops.orders;"          # 1000
-psql -h localhost -p 8817 -U demo demo -c "SELECT count(*) FROM web.analytics.pageviews;"   # 1000
+psql -h localhost -p 8817 -U demo main -c "SELECT count(*) FROM pgshop.shop.shop.customers;"    # 800
+psql -h localhost -p 8817 -U demo main -c "SELECT count(*) FROM pgcat.catalog.catalog.products;"    # 500
+psql -h localhost -p 8817 -U demo main -c "SELECT count(*) FROM sales.ops.public.orders;"          # 1000
+psql -h localhost -p 8817 -U demo main -c "SELECT count(*) FROM web.analytics.public.pageviews;"   # 1000
 ```
 
 ### Directly against each backend (optional sanity check)
@@ -214,9 +220,9 @@ Run them from the repo root (or any directory — the commands are self-containe
 Premium products priced over 485, excluding the Clothing category (`>` and `<>`):
 
 ```bash
-psql -h localhost -p 8817 -U demo demo \
+psql -h localhost -p 8817 -U demo main \
   -c "SELECT product_id, name, category, price
-      FROM pgcat.catalog.products
+      FROM pgcat.catalog.catalog.products
       WHERE price > 485 AND category <> 'Clothing'
       ORDER BY price DESC;"
 ```
@@ -241,9 +247,9 @@ psql -h localhost -p 8817 -U demo demo \
 ### Example 2 — Aggregate (1 backend: MariaDB)
 
 ```bash
-psql -h localhost -p 8817 -U demo demo \
+psql -h localhost -p 8817 -U demo main \
   -c "SELECT status, COUNT(*) AS n, SUM(amount) AS total
-      FROM sales.ops.orders
+      FROM sales.ops.public.orders
       GROUP BY status
       ORDER BY total DESC;"
 ```
@@ -265,10 +271,10 @@ psql -h localhost -p 8817 -U demo demo \
 Top-spending customers on paid orders — `orders` (MariaDB) joined to `customers` (PG #1).
 
 ```bash
-psql -h localhost -p 8817 -U demo demo \
+psql -h localhost -p 8817 -U demo main \
   -c "SELECT c.name, c.country, COUNT(*) AS orders_cnt, SUM(o.amount) AS spend
-      FROM sales.ops.orders o
-      JOIN pgshop.shop.customers c ON c.customer_id = o.customer_id
+      FROM sales.ops.public.orders o
+      JOIN pgshop.shop.shop.customers c ON c.customer_id = o.customer_id
       WHERE o.status = 'paid'
       GROUP BY c.name, c.country
       ORDER BY spend DESC
@@ -294,11 +300,11 @@ Revenue by product category and customer country — exercises **both independen
 PostgreSQL backends** in one statement (`customers` from PG #1, `products` from PG #2).
 
 ```bash
-psql -h localhost -p 8817 -U demo demo \
+psql -h localhost -p 8817 -U demo main \
   -c "SELECT p.category, c.country, SUM(o.amount) AS revenue
-      FROM sales.ops.orders o
-      JOIN pgshop.shop.customers c  ON c.customer_id = o.customer_id
-      JOIN pgcat.catalog.products p ON p.product_id  = o.product_id
+      FROM sales.ops.public.orders o
+      JOIN pgshop.shop.shop.customers c  ON c.customer_id = o.customer_id
+      JOIN pgcat.catalog.catalog.products p ON p.product_id  = o.product_id
       WHERE o.status IN ('paid','shipped')
       GROUP BY p.category, c.country
       ORDER BY revenue DESC
@@ -325,15 +331,15 @@ on **both** `customer_id` and `product_id`, then to `customers` (PG #1) and `pro
 (PG #2); aggregated by channel and category.
 
 ```bash
-psql -h localhost -p 8817 -U demo demo \
+psql -h localhost -p 8817 -U demo main \
   -c "SELECT v.channel, p.category,
              COUNT(DISTINCT o.order_id) AS orders_cnt,
              SUM(o.amount) AS revenue
-      FROM web.analytics.pageviews v
-      JOIN sales.ops.orders o   ON o.customer_id = v.customer_id
+      FROM web.analytics.public.pageviews v
+      JOIN sales.ops.public.orders o   ON o.customer_id = v.customer_id
                                AND o.product_id  = v.product_id
-      JOIN pgshop.shop.customers c  ON c.customer_id = o.customer_id
-      JOIN pgcat.catalog.products p ON p.product_id  = o.product_id
+      JOIN pgshop.shop.shop.customers c  ON c.customer_id = o.customer_id
+      JOIN pgcat.catalog.catalog.products p ON p.product_id  = o.product_id
       WHERE o.status = 'paid'
       GROUP BY v.channel, p.category
       ORDER BY revenue DESC
@@ -356,18 +362,20 @@ psql -h localhost -p 8817 -U demo demo \
 ### Example 6 — Load 3 S3 files into the engine (csv + parquet + ndjson)
 
 Loads three S3 objects — one of each format — into OtterStax-internal tables, then joins
-one of them (`qs.regions`) to a live backend (`customers`). The `qs` database is
-**auto-created** by the first `CREATE EXTERNAL TABLE`, and the **format is auto-detected**
-from each file's extension (no `format` option needed):
+one of them (`qs.regions`) to a live backend (`customers`). The tables go into the
+schema `qs` of the session's database `main` (`qs.regions` is `main.qs.regions`);
+`CREATE EXTERNAL TABLE` never creates a schema, so the example creates it first. The
+**format is auto-detected** from each file's extension (no `format` option needed):
 
 ```bash
-psql -h localhost -p 8817 -U demo demo <<'SQL'
+psql -h localhost -p 8817 -U demo main <<'SQL'
+CREATE SCHEMA IF NOT EXISTS qs;
 CREATE EXTERNAL TABLE qs.regions       WITH (s3_alias = 'qs_s3', location = 's3://quickstart-bucket/regions.csv');
 CREATE EXTERNAL TABLE qs.product_costs WITH (s3_alias = 'qs_s3', location = 's3://quickstart-bucket/product_costs.parquet');
 CREATE EXTERNAL TABLE qs.promotions    WITH (s3_alias = 'qs_s3', location = 's3://quickstart-bucket/promotions.ndjson');
 
 SELECT r.region_name, COUNT(*) AS customers
-FROM   pgshop.shop.customers c
+FROM   pgshop.shop.shop.customers c
 JOIN   qs.regions r ON r.country = c.country
 GROUP BY r.region_name
 ORDER BY customers DESC;
@@ -395,7 +403,7 @@ COMMAND
 Joins the two S3-sourced engine tables and writes the result as CSV to S3:
 
 ```bash
-psql -h localhost -p 8817 -U demo demo \
+psql -h localhost -p 8817 -U demo main \
   -c "COPY (
         SELECT pc.product_id, pc.unit_cost, pr.promo_code, pr.discount_pct
         FROM   qs.product_costs pc
@@ -426,15 +434,15 @@ The headline: **all four live backends and an S3-loaded engine table** in one
 statement. Gross margin (`revenue − unit_cost`) per country, category and channel.
 
 ```bash
-psql -h localhost -p 8817 -U demo demo \
+psql -h localhost -p 8817 -U demo main \
   -c "SELECT c.country, p.category, v.channel,
              COUNT(DISTINCT o.order_id)     AS orders_cnt,
              SUM(o.amount)                  AS revenue,
              SUM(o.amount - pcst.unit_cost) AS gross_margin
-      FROM sales.ops.orders o
-      JOIN pgshop.shop.customers  c    ON c.customer_id   = o.customer_id
-      JOIN pgcat.catalog.products p    ON p.product_id    = o.product_id
-      JOIN web.analytics.pageviews v   ON v.customer_id   = o.customer_id
+      FROM sales.ops.public.orders o
+      JOIN pgshop.shop.shop.customers  c    ON c.customer_id   = o.customer_id
+      JOIN pgcat.catalog.catalog.products p    ON p.product_id    = o.product_id
+      JOIN web.analytics.public.pageviews v   ON v.customer_id   = o.customer_id
                                       AND v.product_id    = o.product_id
       JOIN qs.product_costs       pcst ON pcst.product_id = o.product_id
       WHERE o.status = 'paid'
@@ -462,10 +470,10 @@ psql -h localhost -p 8817 -U demo demo \
 
 ### Example 9 — Mutations: INSERT / UPDATE / DROP
 
-A full lifecycle on a small engine table (requires example 6 for the `qs` database):
+A full lifecycle on a small engine table (requires example 6 for the `qs` schema):
 
 ```bash
-psql -h localhost -p 8817 -U demo demo <<'SQL'
+psql -h localhost -p 8817 -U demo main <<'SQL'
 CREATE TABLE qs.scratch (id bigint, label string, qty bigint);
 INSERT INTO qs.scratch (id, label, qty) VALUES (1,'alpha',1), (2,'beta',2), (3,'gamma',3);
 UPDATE qs.scratch SET qty = qty * 10 WHERE id <= 2;
@@ -514,7 +522,7 @@ the same `psql` connection. `TRANSACTIONAL=true` makes ingest/produce **exactly-
 Declare the source (broker is the in-network `qs-kafka:9092`):
 
 ```bash
-psql -h localhost -p 8817 -U demo demo <<'SQL'
+psql -h localhost -p 8817 -U demo main <<'SQL'
 DROP SOURCE IF EXISTS qs_orders CASCADE;
 CREATE SOURCE qs_orders (
     event_id VARCHAR, customer_id VARCHAR, product_id VARCHAR,
@@ -530,9 +538,9 @@ SQL
 Then **wait ~5 s** and query it like any table:
 
 ```bash
-psql -h localhost -p 8817 -U demo demo \
+psql -h localhost -p 8817 -U demo main \
   -c "SELECT count(*) AS events FROM kafka.qs_orders;"
-psql -h localhost -p 8817 -U demo demo \
+psql -h localhost -p 8817 -U demo main \
   -c "SELECT status, count(*) AS n, SUM(amount) AS total
       FROM kafka.qs_orders GROUP BY status ORDER BY n DESC;"
 ```
@@ -555,11 +563,11 @@ psql -h localhost -p 8817 -U demo demo \
 Each live order joined to its customer (PG #1: country, tier) and product (PG #2: category):
 
 ```bash
-psql -h localhost -p 8817 -U demo demo \
+psql -h localhost -p 8817 -U demo main \
   -c "SELECT o.event_id, c.country, c.tier, p.category, o.amount
       FROM kafka.qs_orders o
-      JOIN pgshop.shop.customers  c ON c.customer_id = o.customer_id
-      JOIN pgcat.catalog.products p ON p.product_id  = o.product_id
+      JOIN pgshop.shop.shop.customers  c ON c.customer_id = o.customer_id
+      JOIN pgcat.catalog.catalog.products p ON p.product_id  = o.product_id
       WHERE o.status = 'paid'
       ORDER BY o.amount DESC
       LIMIT 10;"
@@ -584,7 +592,7 @@ psql -h localhost -p 8817 -U demo demo \
 `INSERT INTO` a kafka object writes to the topic; the poller ingests it straight back:
 
 ```bash
-psql -h localhost -p 8817 -U demo demo \
+psql -h localhost -p 8817 -U demo main \
   -c "INSERT INTO kafka.qs_orders (event_id, customer_id, product_id, amount, status, channel)
       VALUES ('E9001','C0001','P0001',199.99,'paid','api'),
              ('E9002','C0002','P0002', 49.50,'pending','api');"
@@ -593,7 +601,7 @@ psql -h localhost -p 8817 -U demo demo \
 Then **wait a moment** and see the produced rows come back through the topic:
 
 ```bash
-psql -h localhost -p 8817 -U demo demo \
+psql -h localhost -p 8817 -U demo main \
   -c "SELECT event_id, customer_id, amount, status, channel
       FROM kafka.qs_orders WHERE channel = 'api' ORDER BY event_id;"
 ```
@@ -611,7 +619,7 @@ Spawn a persistent worker that filters `qs_orders` to paid rows and produces the
 `qs_orders_paid` topic, forever:
 
 ```bash
-psql -h localhost -p 8817 -U demo demo <<'SQL'
+psql -h localhost -p 8817 -U demo main <<'SQL'
 DROP STREAM IF EXISTS qs_orders_paid;
 CREATE STREAM qs_orders_paid
     WITH (KAFKA_TOPIC       = 'qs_orders_paid',
@@ -644,7 +652,7 @@ docker exec qs-kafka rpk topic consume qs_orders_paid -o :end -f '%v\n'
 `DROP` the stream + source before replaying K1–K4:
 
 ```bash
-psql -h localhost -p 8817 -U demo demo <<'SQL'
+psql -h localhost -p 8817 -U demo main <<'SQL'
 DROP STREAM IF EXISTS qs_orders_paid;
 DROP SOURCE IF EXISTS qs_orders;
 SQL
@@ -665,15 +673,15 @@ that already exists fails with `… qs.regions already exists` and leaves the ta
 was. Before replaying examples 6–9, drop the engine state:
 
 ```bash
-psql -h localhost -p 8817 -U demo demo <<'SQL'
+psql -h localhost -p 8817 -U demo main <<'SQL'
 DROP TABLE IF EXISTS qs.regions;
 DROP TABLE IF EXISTS qs.product_costs;
 DROP TABLE IF EXISTS qs.promotions;
-DROP DATABASE IF EXISTS qs;
+DROP SCHEMA IF EXISTS qs CASCADE;
 SQL
 ```
 
-This drops `qs.regions`, `qs.product_costs`, `qs.promotions` and the `qs` database.
+This drops `qs.regions`, `qs.product_costs`, `qs.promotions` and the `qs` schema.
 Backend data and S3 files are untouched. (The `exports/promo_costs.csv` object from
 example 7 lives in S3 and is simply overwritten on the next run.)
 
@@ -718,7 +726,7 @@ docker compose down -v    # stop and WIPE volumes (next `up` rebuilds from init/
 |---------|-------|-----|
 | `up` fails: *port is already allocated* (8817) | The `examples/demo/` stack (or another) holds 8817 | Stop it first: `docker stop demo-otterstax` (or `docker compose -f examples/demo/compose.yml down`). |
 | `psql: connection refused` on 8817 | OtterStax still starting | Wait for `docker compose ps` to show `qs-otterstax` healthy (it waits for all backends first). |
-| `External table is not registered: shop.customers` | Wrong qualifier — a PostgreSQL table needs `alias.db.table` where the tables live in a schema named like the db | Use the forms in [Backends & federation names](#backends--federation-names): `pgshop.shop.customers`, `pgcat.catalog.products`. |
+| `pgshop.shop.customers` (or another 3-part name of a backend table) does not exist | Three parts name a local engine table; a backend table takes four, `alias.database.schema.table` | Use the forms in [Backends & federation names](#backends--federation-names): `pgshop.shop.shop.customers`, `pgcat.catalog.catalog.products`. |
 | My `qs.*` tables vanished after `down`/`up` | Engine tables live in the OtterStax container, which `down` removes | Re-run `sql/06_external_create.sql`. Backend + S3 data is still there (see [Persistence](#persistence--what-survives-a-restart)). |
 | `ROUND(x, 2)` errors / returns wrong output | 2-arg `ROUND` isn't pushed to backends | Use plain `SUM()` / `AVG()` (as the examples do). |
 | ClickHouse/MariaDB "client not found" on host | You don't have those CLIs | Use the `docker exec` forms in [Directly against each backend](#directly-against-each-backend-optional-sanity-check). |

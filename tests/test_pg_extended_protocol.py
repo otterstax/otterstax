@@ -29,10 +29,8 @@ the exact message sequence the server answers with:
     another shape (a different column count, or a column under another type
     oid): ErrorResponse 0A000 "cached plan must not change result type", as
     PostgreSQL answers, and not one row under the shape the client holds.
-  * A named statement executed twice, and again after a failed execution: the
-    query session keeps a prepared statement for one execution only, so the frontend
-    prepares it again under the hood; a second Execute must never surface the
-    session's "must be re-prepared" verdict.
+  * A named statement executed twice, and again after a failed execution: every
+    Execute runs it again and a failed one fails the same way the second time.
   * An error inside an extended-query pipeline (Parse, Bind, Describe,
     Execute): ErrorResponse alone, the rest of the pipeline is discarded, and
     the Sync answers the one ReadyForQuery — never two. A failed simple Query
@@ -89,7 +87,7 @@ import sys
 
 from config import get_host, PG_PORT
 
-DB = "pg_ext_proto"
+DB = "pg_ext_proto"     # a schema of the session's database, main
 TABLE = "rows"
 ROWS = 5
 
@@ -294,12 +292,15 @@ class PgExtendedProtocolTest:
 
     def connect(self):
         wire = PgWire(self.host, PG_PORT)
-        wire.startup("testuser", DB)
+        # The StartupMessage names an engine database (an unknown one is FATAL
+        # 3D000): the session is placed in main.public.
+        wire.startup("testuser", "main")
         return wire
 
     def setup(self):
         self.wire = self.connect()
-        self.assert_no_error(self.wire.query(f"CREATE DATABASE {DB}"), "CREATE DATABASE")
+        self.wire.query(f"DROP SCHEMA IF EXISTS {DB} CASCADE")
+        self.assert_no_error(self.wire.query(f"CREATE SCHEMA {DB}"), "CREATE SCHEMA")
         self.database_created = True
         self.assert_no_error(self.wire.query(f"CREATE TABLE {DB}.{TABLE} (id bigint, name string)"), "CREATE TABLE")
         self.table_created = True
@@ -339,7 +340,7 @@ class PgExtendedProtocolTest:
             for table in self.join_tables_created:
                 self.wire.query(f"DROP TABLE {DB}.{table}")
             if self.database_created:
-                self.wire.query(f"DROP DATABASE {DB}")
+                self.wire.query(f"DROP SCHEMA {DB} CASCADE")
         finally:
             self.wire.close()
 
@@ -657,8 +658,7 @@ class PgExtendedProtocolTest:
         # bigint column is refused when the INSERT runs ("insert_node: can not
         # convert data column[0] type to table type"), not at Parse, whose
         # prepare of a DML statement does not touch the engine. The failure must
-        # be the engine's verdict both times, never the session's re-prepare
-        # demand.
+        # be the engine's verdict both times.
         w.parse("failing", f"INSERT INTO {DB}.{TABLE} (id, name) VALUES ('not a number', 'row_x')")
         w.sync()
         self.assert_no_error(w.read_until_ready(), "Parse of an INSERT with a literal the column cannot hold")
@@ -673,7 +673,7 @@ class PgExtendedProtocolTest:
             assert COMMAND_COMPLETE not in kinds(messages), f"attempt {attempt}: nothing completes after the error"
         self.assert_equal([data_row_texts(p)[0] for k, p in self.wire.query(f"SELECT count(*) FROM {DB}.{TABLE}")
                            if k == DATA_ROW], [str(ROWS)], "the failed INSERTs wrote nothing")
-        print("  named statement: two Executes, then two failing ones, no re-prepare leak ✓")
+        print("  named statement: two Executes, then two failing ones, the same verdict ✓")
 
     def test_bind_rejects_a_literal_the_type_cannot_hold(self):
         """Bind '12abc' for an int8: ErrorResponse 22P02 and no BindComplete."""

@@ -2,7 +2,9 @@
 // Copyright 2025-2026  OtterStax
 
 #include "otterbrix/translators/input/arrow_to_chunk.hpp"
+#include "single_chunk.hpp"
 #include "otterbrix/translators/input/parquet_to_chunk.hpp"
+#include "../../mock/cell.hpp"
 
 // otterbrix's parser headers (pulled in above) #define DAY / SECOND, which clash
 // with Arrow's TimeUnit/DateUnit enum values.
@@ -61,15 +63,15 @@ TEST_CASE("parquet_to_chunk: file overload parses columns, rows and values") {
 
     auto loaded = tsl::parquet_to_chunk(std::pmr::new_delete_resource(), path);
     REQUIRE_FALSE(loaded.has_error());
-    const auto& chunk = loaded.value();
+    const auto& chunk = otterstax::test::single(loaded.value());
 
     REQUIRE(chunk.column_count() == 2);
     REQUIRE(chunk.size() == 5);
     // int32 id column round-trips as INTEGER.
-    REQUIRE(chunk.value(0, 0).value<int32_t>() == 1);
-    REQUIRE(chunk.value(0, 4).value<int32_t>() == 5);
-    REQUIRE(chunk.value(1, 0).value<std::string_view>() == "Alice");
-    REQUIRE(chunk.value(1, 4).value<std::string_view>() == "Eve");
+    REQUIRE(otterstax::test::cell(chunk, 0, 0).value<int32_t>() == 1);
+    REQUIRE(otterstax::test::cell(chunk, 0, 4).value<int32_t>() == 5);
+    REQUIRE(otterstax::test::cell(chunk, 1, 0).value<std::string_view>() == "Alice");
+    REQUIRE(otterstax::test::cell(chunk, 1, 4).value<std::string_view>() == "Eve");
 
     std::filesystem::remove(path);
 }
@@ -83,12 +85,12 @@ TEST_CASE("parquet_to_chunk: buffer overload matches file overload") {
                                         reinterpret_cast<const uint8_t*>(bytes.data()),
                                         bytes.size());
     REQUIRE_FALSE(loaded.has_error());
-    const auto& chunk = loaded.value();
+    const auto& chunk = otterstax::test::single(loaded.value());
 
     REQUIRE(chunk.column_count() == 2);
     REQUIRE(chunk.size() == 5);
-    REQUIRE(chunk.value(0, 2).value<int32_t>() == 3);
-    REQUIRE(chunk.value(1, 2).value<std::string_view>() == "Charlie");
+    REQUIRE(otterstax::test::cell(chunk, 0, 2).value<int32_t>() == 3);
+    REQUIRE(otterstax::test::cell(chunk, 1, 2).value<std::string_view>() == "Charlie");
 
     std::filesystem::remove(path);
 }
@@ -177,14 +179,14 @@ TEST_CASE("parquet_to_chunk: a decimal128(38, 0) column is read back as HUGEINT 
     auto loaded = tsl::parquet_to_chunk(std::pmr::new_delete_resource(), path);
     INFO("error: " << loaded.error().what.c_str());
     REQUIRE_FALSE(loaded.has_error());
-    const auto& chunk = loaded.value();
+    const auto& chunk = otterstax::test::single(loaded.value());
 
     REQUIRE(chunk.column_count() == 1);
     REQUIRE(chunk.size() == 3);
     REQUIRE(chunk.types()[0].type() == components::types::logical_type::HUGEINT);
-    REQUIRE(chunk.value(0, 0).value<components::types::int128_t>() == big);
-    REQUIRE(chunk.value(0, 1).value<components::types::int128_t>() == -big);
-    REQUIRE(chunk.value(0, 2).is_null());
+    REQUIRE(otterstax::test::cell(chunk, 0, 0).value<components::types::int128_t>() == big);
+    REQUIRE(otterstax::test::cell(chunk, 0, 1).value<components::types::int128_t>() == -big);
+    REQUIRE(otterstax::test::cell(chunk, 0, 2).is_null());
 
     std::filesystem::remove(path);
 }
@@ -202,8 +204,8 @@ TEST_CASE("parquet_to_chunk: a decimal128(38, 0) value past its own precision st
     auto loaded = tsl::parquet_to_chunk(std::pmr::new_delete_resource(), path);
     INFO("error: " << loaded.error().what.c_str());
     REQUIRE_FALSE(loaded.has_error());
-    REQUIRE(loaded.value().types()[0].type() == components::types::logical_type::HUGEINT);
-    REQUIRE(loaded.value().value(0, 0).value<components::types::int128_t>() == tail);
+    REQUIRE(otterstax::test::single(loaded.value()).types()[0].type() == components::types::logical_type::HUGEINT);
+    REQUIRE(otterstax::test::cell(otterstax::test::single(loaded.value()), 0, 0).value<components::types::int128_t>() == tail);
 
     std::filesystem::remove(path);
 }
@@ -222,7 +224,7 @@ TEST_CASE("parquet_to_chunk: a decimal with a scale reads back as the engine's o
     INFO("error: " << loaded.error().what.c_str());
     REQUIRE_FALSE(loaded.has_error());
     // types() answers a vector by value, so it is kept alive for the checks below.
-    const auto loaded_types = loaded.value().types();
+    const auto loaded_types = otterstax::test::single(loaded.value()).types();
     const auto& type = loaded_types[0];
     REQUIRE(type.type() == components::types::logical_type::DECIMAL);
     const auto* spec = type.extension_as<components::types::decimal_logical_type_extension>();
@@ -230,7 +232,7 @@ TEST_CASE("parquet_to_chunk: a decimal with a scale reads back as the engine's o
     REQUIRE(spec->scale() == 2);
     // Precision 10 is stored as an int64 payload, and the payload is the unscaled integer.
     REQUIRE(type.to_physical_type() == components::types::physical_type::INT64);
-    REQUIRE(loaded.value().value(0, 0).value<int64_t>() == 123);
+    REQUIRE(otterstax::test::cell(otterstax::test::single(loaded.value()), 0, 0).value<int64_t>() == 123);
 
     std::filesystem::remove(path);
 }
@@ -246,7 +248,7 @@ TEST_CASE("arrow_schema_to_struct: a decimal whose scale the engine cannot const
     auto mapped = tsl::arrow_schema_to_struct(std::pmr::new_delete_resource(), schema);
 
     REQUIRE(mapped.has_error());
-    REQUIRE(mapped.error().type == core::error_code_t::conversion_failure);
+    REQUIRE(mapped.error().type == core::error_code_t::unimplemented_yet);
     REQUIRE(std::string_view{mapped.error().what.c_str()}.find("wide") != std::string_view::npos);
 }
 
@@ -270,12 +272,12 @@ TEST_CASE("parquet_to_chunk: a date column is read by otterbrix's importer as th
     auto loaded = tsl::parquet_to_chunk(std::pmr::new_delete_resource(), path);
     INFO("error: " << (loaded.has_error() ? loaded.error().what.c_str() : ""));
     REQUIRE_FALSE(loaded.has_error());
-    REQUIRE(loaded.value().size() == 2);
-    const auto types = loaded.value().types();
+    REQUIRE(otterstax::test::single(loaded.value()).size() == 2);
+    const auto types = otterstax::test::single(loaded.value()).types();
     REQUIRE(types[0].type() == components::types::logical_type::DATE);
     REQUIRE(types[0].alias() == "day");
-    REQUIRE(loaded.value().value(0, 0).value<core::date::date_t>().value.count() == 19000 - 10957);
-    REQUIRE(loaded.value().value(0, 1).is_null());
+    REQUIRE(otterstax::test::cell(otterstax::test::single(loaded.value()), 0, 0).value<core::date::date_t>().value.count() == 19000 - 10957);
+    REQUIRE(otterstax::test::cell(otterstax::test::single(loaded.value()), 0, 1).is_null());
 
     std::filesystem::remove(path);
 }
@@ -295,7 +297,7 @@ namespace {
     }
 } // namespace
 
-TEST_CASE("parquet_to_chunk: a column with no reading is conversion_failure naming the column") {
+TEST_CASE("parquet_to_chunk: a column with no reading is unimplemented_yet naming the column") {
     const std::string path = "/tmp/otterstax_test_parquet_half.parquet";
     std::filesystem::remove(path);
     write_half_float_parquet(path);
@@ -303,7 +305,7 @@ TEST_CASE("parquet_to_chunk: a column with no reading is conversion_failure nami
     auto loaded = tsl::parquet_to_chunk(std::pmr::new_delete_resource(), path);
 
     REQUIRE(loaded.has_error());
-    REQUIRE(loaded.error().type == core::error_code_t::conversion_failure);
+    REQUIRE(loaded.error().type == core::error_code_t::unimplemented_yet);
     REQUIRE(std::string_view{loaded.error().what.c_str()}.find("half") != std::string_view::npos);
 
     std::filesystem::remove(path);
@@ -355,7 +357,7 @@ TEST_CASE("parquet_to_struct: a column with no reading is refused at discovery")
     auto type = tsl::parquet_to_struct(std::pmr::new_delete_resource(), path);
 
     REQUIRE(type.has_error());
-    REQUIRE(type.error().type == core::error_code_t::conversion_failure);
+    REQUIRE(type.error().type == core::error_code_t::unimplemented_yet);
 
     std::filesystem::remove(path);
 }
@@ -384,12 +386,12 @@ TEST_CASE("parquet_to_struct: a date column is discovered as the DATE the load p
     std::filesystem::remove(path);
 }
 
-TEST_CASE("parquet_to_chunk: a buffer that is not parquet is conversion_failure") {
+TEST_CASE("parquet_to_chunk: a buffer that is not parquet is invalid_text_representation") {
     const std::string bytes = "id,name\n1,Alice\n";
     auto loaded = tsl::parquet_to_chunk(std::pmr::new_delete_resource(),
                                         reinterpret_cast<const uint8_t*>(bytes.data()),
                                         bytes.size());
 
     REQUIRE(loaded.has_error());
-    REQUIRE(loaded.error().type == core::error_code_t::conversion_failure);
+    REQUIRE(loaded.error().type == core::error_code_t::invalid_text_representation);
 }

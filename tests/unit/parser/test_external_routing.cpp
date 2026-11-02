@@ -4,15 +4,15 @@
 // Verifies the s3/file grammar extensions are registered in GreenplumParser and
 // that CREATE EXTERNAL TABLE / COPY (...) TO lower into an external_node_t
 // carrying the fields the query session routes on. (The end-to-end routing through
-// the file/s3 managers is exercised by the system / minio tests.)
+// the file/s3 managers is exercised by the system / s3 tests.)
 
 #include <catch2/catch_all.hpp>
 
 #include "otterbrix/parser/grammar_extention/external_node.hpp"
-#include "test_aliases.hpp"
 #include "otterbrix/parser/parser.hpp"
 
 #include <memory_resource>
+#include <string>
 
 using otterstax::external::external_node_t;
 using otterstax::external::external_op_t;
@@ -31,30 +31,57 @@ namespace {
 
 TEST_CASE("external: CREATE EXTERNAL TABLE on a local path lowers to external_node_t") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
-    GreenplumParser parser(&arena, test_aliases());
+    GreenplumParser parser(&arena);
     auto r = parser.parse(
         "CREATE EXTERNAL TABLE file.people WITH (location = '/tmp/people.parquet', format = 'parquet')");
     REQUIRE_FALSE(r.has_error());
 
-    auto* node = as_external(r.value()->otterbrix_params->node);
+    auto* node = as_external(plan_root(*r.value()->plan));
     REQUIRE(node != nullptr);
     CHECK(node->op() == external_op_t::create_external_table);
     CHECK_FALSE(node->is_s3());
-    CHECK(node->database() == "file");
-    CHECK(node->table() == "people");
+    // Two parts are schema.table, the database the session's place.
+    CHECK(node->target() == qualified_name_t{core::schema_t{"file"}, core::relname_t{"people"}});
     CHECK(node->location() == "/tmp/people.parquet");
     CHECK(node->object_path() == "/tmp/people.parquet");
     CHECK(node->inner_sql().empty());
 }
 
+// The loaded table is named as otterbrix names any table: one to four parts,
+// unquoted identifiers folded to lower case; a fifth part is refused.
+TEST_CASE("external: CREATE EXTERNAL TABLE names its table in one to four parts") {
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
+    GreenplumParser parser(&arena);
+    auto target_of = [&](const std::string& name) {
+        auto r = parser.parse("CREATE EXTERNAL TABLE " + name + " WITH (location = '/tmp/p.csv')");
+        REQUIRE_FALSE(r.has_error());
+        auto* node = as_external(plan_root(*r.value()->plan));
+        REQUIRE(node != nullptr);
+        return node->target();
+    };
+    CHECK(target_of("People") == qualified_name_t{core::relname_t{"people"}});
+    CHECK(target_of("Db.Sch.People") ==
+          qualified_name_t{core::dbname_t{"db"}, core::schema_t{"sch"}, core::relname_t{"people"}});
+    CHECK(target_of("pg.shop.public.orders") == qualified_name_t{core::connection_name_t{"pg"},
+                                                                 core::dbname_t{"shop"},
+                                                                 core::schema_t{"public"},
+                                                                 core::relname_t{"orders"}});
+
+    auto five = parser.parse("CREATE EXTERNAL TABLE a.b.c.d.e WITH (location = '/tmp/p.csv')");
+    REQUIRE(five.has_error());
+    CHECK(five.error().type == core::error_code_t::sql_parse_error);
+    CHECK(std::string{five.error().what.c_str()} ==
+          "CREATE EXTERNAL TABLE: the table name has 5 parts; write it as [connection.][database.][schema.]name");
+}
+
 TEST_CASE("external: CREATE EXTERNAL TABLE on an s3 URI lowers to external_node_t") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
-    GreenplumParser parser(&arena, test_aliases());
+    GreenplumParser parser(&arena);
     auto r = parser.parse("CREATE EXTERNAL TABLE s3.trades WITH ("
                           "  s3_alias = 'rustfs1', location = 's3://bucket/trades.parquet', format = 'parquet')");
     REQUIRE_FALSE(r.has_error());
 
-    auto* node = as_external(r.value()->otterbrix_params->node);
+    auto* node = as_external(plan_root(*r.value()->plan));
     REQUIRE(node != nullptr);
     CHECK(node->op() == external_op_t::create_external_table);
     CHECK(node->is_s3());
@@ -65,11 +92,11 @@ TEST_CASE("external: CREATE EXTERNAL TABLE on an s3 URI lowers to external_node_
 
 TEST_CASE("external: COPY (...) TO a local path captures the inner query") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
-    GreenplumParser parser(&arena, test_aliases());
+    GreenplumParser parser(&arena);
     auto r = parser.parse("COPY (SELECT * FROM file.people) TO '/tmp/out.csv' WITH (format = 'csv')");
     REQUIRE_FALSE(r.has_error());
 
-    auto* node = as_external(r.value()->otterbrix_params->node);
+    auto* node = as_external(plan_root(*r.value()->plan));
     REQUIRE(node != nullptr);
     CHECK(node->op() == external_op_t::copy_to);
     CHECK_FALSE(node->is_s3());
@@ -79,12 +106,12 @@ TEST_CASE("external: COPY (...) TO a local path captures the inner query") {
 
 TEST_CASE("external: COPY (...) TO an s3 URI captures the inner query and alias") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
-    GreenplumParser parser(&arena, test_aliases());
+    GreenplumParser parser(&arena);
     auto r = parser.parse(
         "COPY (SELECT 1) TO 's3://bucket/out.parquet' WITH (s3_alias = 'rustfs1', format = 'parquet')");
     REQUIRE_FALSE(r.has_error());
 
-    auto* node = as_external(r.value()->otterbrix_params->node);
+    auto* node = as_external(plan_root(*r.value()->plan));
     REQUIRE(node != nullptr);
     CHECK(node->op() == external_op_t::copy_to);
     CHECK(node->is_s3());
@@ -95,10 +122,10 @@ TEST_CASE("external: COPY (...) TO an s3 URI captures the inner query and alias"
 
 TEST_CASE("external: a plain SELECT is not claimed by the extensions") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
-    GreenplumParser parser(&arena, test_aliases());
+    GreenplumParser parser(&arena);
     auto r = parser.parse("SELECT 1 AS x");
     REQUIRE_FALSE(r.has_error());
-    CHECK(as_external(r.value()->otterbrix_params->node) == nullptr);
+    CHECK(as_external(plan_root(*r.value()->plan)) == nullptr);
     CHECK(r.value()->extension_kind == extension_kind_t::none);
 }
 
@@ -106,7 +133,7 @@ TEST_CASE("external: a plain SELECT is not claimed by the extensions") {
 // which extension claimed the statement; the query session routes on that record.
 TEST_CASE("external: the claiming extension is recorded on ParsedQueryData") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
-    GreenplumParser parser(&arena, test_aliases());
+    GreenplumParser parser(&arena);
 
     SECTION("file extension") {
         auto r = parser.parse("CREATE EXTERNAL TABLE file.t WITH (location = '/tmp/a.parquet')");
@@ -124,8 +151,8 @@ TEST_CASE("external: the claiming extension is recorded on ParsedQueryData") {
                               "WITH (KAFKA_TOPIC='orders_topic', value_format='JSON')");
         REQUIRE_FALSE(r.has_error());
         CHECK(r.value()->extension_kind == extension_kind_t::kafka);
-        REQUIRE(r.value()->otterbrix_params->node != nullptr);
-        CHECK(r.value()->otterbrix_params->node->type() == components::logical_plan::node_type::unused);
+        REQUIRE(plan_root(*r.value()->plan) != nullptr);
+        CHECK(plan_root(*r.value()->plan)->type() == components::logical_plan::node_type::unused);
     }
     SECTION("an engine statement") {
         auto r = parser.parse("CREATE DATABASE plain_db");
@@ -136,11 +163,11 @@ TEST_CASE("external: the claiming extension is recorded on ParsedQueryData") {
 
 TEST_CASE("external: the format option is optional (auto-detected downstream)") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
-    GreenplumParser parser(&arena, test_aliases());
+    GreenplumParser parser(&arena);
     auto r = parser.parse("CREATE EXTERNAL TABLE file.t WITH (location = '/tmp/a.parquet')");
     REQUIRE_FALSE(r.has_error());
 
-    auto* node = as_external(r.value()->otterbrix_params->node);
+    auto* node = as_external(plan_root(*r.value()->plan));
     REQUIRE(node != nullptr);
     CHECK(node->op() == external_op_t::create_external_table);
     CHECK(node->format().empty());
@@ -149,7 +176,7 @@ TEST_CASE("external: the format option is optional (auto-detected downstream)") 
 
 TEST_CASE("external: a malformed external statement surfaces a parse error (no crash)") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
-    GreenplumParser parser(&arena, test_aliases());
+    GreenplumParser parser(&arena);
     // Claimed by the s3 extension (CREATE EXTERNAL TABLE + WITH) but the option
     // value is missing — the extension grammar rejects it; GreenplumParser must
     // turn the thrown parser_exception_t into a clean error result.

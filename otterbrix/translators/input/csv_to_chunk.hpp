@@ -17,20 +17,22 @@
 
 namespace tsl {
 
+// Each answers the file as a run of chunks of at most DEFAULT_VECTOR_CAPACITY rows
+// (arrow_to_chunk.hpp; an empty file is one chunk of its columns and no row).
 // Error messages are owned by `res`; a file that cannot be opened is io_error, a
-// body Arrow cannot parse is conversion_failure. Arrow's own buffers are allocated
+// body Arrow cannot parse is invalid_text_representation. Arrow's own buffers are allocated
 // on `res` too (arrow_memory_pool.hpp), so it must be thread-safe.
-core::result_wrapper_t<components::vector::data_chunk_t>
+core::result_wrapper_t<std::pmr::vector<components::vector::data_chunk_t>>
 csv_to_chunk(std::pmr::memory_resource* res, const std::string& file_path,
              char delimiter = ',', bool has_header = true);
 
-core::result_wrapper_t<components::vector::data_chunk_t>
+core::result_wrapper_t<std::pmr::vector<components::vector::data_chunk_t>>
 csv_to_chunk(std::pmr::memory_resource* res, const uint8_t* data, size_t size,
              char delimiter = ',', bool has_header = true);
 
 // Any sequential source — a local file, an S3 object, a buffer. A null input is
 // invalid_parameter.
-core::result_wrapper_t<components::vector::data_chunk_t>
+core::result_wrapper_t<std::pmr::vector<components::vector::data_chunk_t>>
 csv_to_chunk(std::pmr::memory_resource* res, std::shared_ptr<arrow::io::InputStream> input,
              char delimiter = ',', bool has_header = true);
 

@@ -1,17 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2025-2026  OtterStax
 //
-// The engine takes at most DEFAULT_VECTOR_CAPACITY (1024) rows per data_chunk_t, while every input
-// translator builds a whole result — a backend result set, a file — as ONE chunk.
-// tsl::split_to_capacity cuts it into the run of <=1024-row chunks the engine is handed by
-// otterstax::engine::insert_rows (the file / s3 load).
+// The engine takes at most DEFAULT_VECTOR_CAPACITY (1024) rows per data_chunk_t. A file loader
+// (csv / ndjson / parquet / an arrow batch) answers its input as a run of such chunks, the run
+// otterstax::engine::load_table inserts; a backend translator answers ONE chunk, which the
+// federation's backend actor hands the engine page by page (backend_actor_t::next_page: a
+// data_chunk_t::partial_copy window of at most 1024 rows, as `windows_of` below cuts it).
 //
 // Every row-producing source here yields 2500 rows, so the run is 1024 + 1024 + 452. The rows on
-// both sides of both window boundaries keep their values and their NULLs: a window that restarted
-// at its source's first row would repeat rows 0.., one that lost the offset of a validity mask
-// would move a NULL. The DML affected-row carrier is column-less and is handed on whole.
-
-#include "otterbrix/translators/input/chunk_windows.hpp"
+// both sides of both boundaries keep their values and their NULLs: a piece that restarted at its
+// source's first row would repeat rows 0.., one that lost the offset of a validity mask would move
+// a NULL.
 
 #include "otterbrix/translators/input/arrow_to_chunk.hpp"
 #include "otterbrix/translators/input/ch_to_chunk.hpp"
@@ -22,6 +21,7 @@
 
 #include "pg_result_fixture.hpp"
 #include "rows_chunk.hpp"
+#include "../../mock/cell.hpp"
 
 // otterbrix's parser headers (pulled in above) #define DAY / SECOND, which clash
 // with Arrow's TimeUnit/DateUnit enum values.
@@ -40,6 +40,7 @@
 
 #include <catch2/catch_all.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <memory_resource>
 #include <optional>
@@ -51,6 +52,7 @@
 using components::vector::data_chunk_t;
 using components::vector::DEFAULT_VECTOR_CAPACITY;
 using otterstax::test::make_rows_chunk;
+using otterstax::test::make_rows_run;
 using otterstax::test::make_tuples_result;
 using otterstax::test::pg_result_guard;
 
@@ -84,6 +86,22 @@ namespace {
             row -= chunk.size();
         }
         return {nullptr, 0};
+    }
+
+    // A backend translator's one chunk as the pages the federation's backend actor hands the engine
+    // (backend_actor_t::next_page): partial_copy windows of at most DEFAULT_VECTOR_CAPACITY rows; a
+    // chunk within the bound is one page.
+    std::pmr::vector<data_chunk_t> windows_of(std::pmr::memory_resource* res, const data_chunk_t& chunk) {
+        std::pmr::vector<data_chunk_t> pages(res);
+        const uint64_t rows = chunk.size();
+        if (rows == 0) {
+            pages.emplace_back(chunk.partial_copy(res, 0, 0));
+            return pages;
+        }
+        for (uint64_t offset = 0; offset < rows; offset += DEFAULT_VECTOR_CAPACITY) {
+            pages.emplace_back(chunk.partial_copy(res, offset, std::min<uint64_t>(DEFAULT_VECTOR_CAPACITY, rows - offset)));
+        }
+        return pages;
     }
 
     // Every chunk within the engine's bound — its capacity too, the bound set_cardinality checks —
@@ -139,13 +157,13 @@ namespace {
             INFO("row " << row);
             const auto cell = locate(run, row);
             REQUIRE(cell.chunk != nullptr);
-            REQUIRE(cell.chunk->value(0, cell.row).value<int32_t>() == static_cast<int32_t>(row));
+            REQUIRE(otterstax::test::cell((*cell.chunk), 0, cell.row).value<int32_t>() == static_cast<int32_t>(row));
             if (null_row(row)) {
-                REQUIRE(cell.chunk->value(1, cell.row).is_null());
+                REQUIRE(otterstax::test::cell((*cell.chunk), 1, cell.row).is_null());
             } else {
-                REQUIRE(cell.chunk->value(1, cell.row).value<std::string_view>() == name_of(row));
+                REQUIRE(otterstax::test::cell((*cell.chunk), 1, cell.row).value<std::string_view>() == name_of(row));
             }
-            REQUIRE(cell.chunk->value(2, cell.row).value<double>() == static_cast<double>(row) * 0.5);
+            REQUIRE(otterstax::test::cell((*cell.chunk), 2, cell.row).value<double>() == static_cast<double>(row) * 0.5);
         }
     }
 
@@ -242,39 +260,39 @@ namespace {
     // Global row `row` of make_ch_nested_block's rows, read at row `at` of `chunk`.
     void require_nested_row(const data_chunk_t& chunk, uint64_t at, size_t row) {
         INFO("row " << row);
-        REQUIRE(chunk.value(0, at).value<int32_t>() == static_cast<int32_t>(row));
+        REQUIRE(otterstax::test::cell(chunk, 0, at).value<int32_t>() == static_cast<int32_t>(row));
 
-        const auto nums = chunk.value(1, at);
+        const auto nums = otterstax::test::cell(chunk, 1, at);
         const auto expected_nums = nums_of(row);
-        REQUIRE(nums.children().size() == expected_nums.size());
+        REQUIRE(nums.child_count() == expected_nums.size());
         for (size_t i = 0; i < expected_nums.size(); ++i) {
             INFO("nums[" << i << "]");
             if (expected_nums[i]) {
-                REQUIRE(nums.children()[i].value<int32_t>() == *expected_nums[i]);
+                REQUIRE(nums.child(i).value<int32_t>() == *expected_nums[i]);
             } else {
-                REQUIRE(nums.children()[i].is_null());
+                REQUIRE(nums.child(i).is_null());
             }
         }
 
-        const auto tags = chunk.value(2, at);
+        const auto tags = otterstax::test::cell(chunk, 2, at);
         const auto expected_tags = tags_of(row);
-        REQUIRE(tags.children().size() == expected_tags.size());
+        REQUIRE(tags.child_count() == expected_tags.size());
         for (size_t i = 0; i < expected_tags.size(); ++i) {
             INFO("tags[" << i << "]");
             if (expected_tags[i]) {
-                REQUIRE(tags.children()[i].value<std::string_view>() == *expected_tags[i]);
+                REQUIRE(tags.child(i).value<std::string_view>() == *expected_tags[i]);
             } else {
-                REQUIRE(tags.children()[i].is_null());
+                REQUIRE(tags.child(i).is_null());
             }
         }
 
-        const auto rec = chunk.value(3, at);
-        REQUIRE(rec.children().size() == 2);
-        REQUIRE(rec.children()[0].value<int32_t>() == static_cast<int32_t>(row));
+        const auto rec = otterstax::test::cell(chunk, 3, at);
+        REQUIRE(rec.child_count() == 2);
+        REQUIRE(rec.child(0).value<int32_t>() == static_cast<int32_t>(row));
         if (const auto b = rec_b_of(row)) {
-            REQUIRE(rec.children()[1].value<std::string_view>() == *b);
+            REQUIRE(rec.child(1).value<std::string_view>() == *b);
         } else {
-            REQUIRE(rec.children()[1].is_null());
+            REQUIRE(rec.child(1).is_null());
         }
     }
 
@@ -282,7 +300,7 @@ namespace {
 
 // ── row-producing sources ─────────────────────────────────────────────────────
 
-TEST_CASE("split_to_capacity: a 2500-row csv becomes 1024 + 1024 + 452 rows with every boundary row intact") {
+TEST_CASE("csv_to_chunk: a 2500-row csv becomes 1024 + 1024 + 452 rows with every boundary row intact") {
     std::pmr::unsynchronized_pool_resource arena{std::pmr::new_delete_resource()};
     std::string csv = "id,name,qty\n";
     for (size_t row = 0; row < wide_rows; ++row) {
@@ -290,26 +308,24 @@ TEST_CASE("split_to_capacity: a 2500-row csv becomes 1024 + 1024 + 452 rows with
     }
     auto loaded = tsl::csv_to_chunk(&arena, reinterpret_cast<const uint8_t*>(csv.data()), csv.size());
     REQUIRE_FALSE(loaded.has_error());
-    REQUIRE(loaded.value().size() == wide_rows);
-
-    auto run = tsl::split_to_capacity(&arena, std::move(loaded.value()));
+    const auto& run = loaded.value();
 
     require_run_shape(run, wide_rows, 3);
     for (const size_t row : probe_rows) {
         INFO("row " << row);
         const auto cell = locate(run, row);
         REQUIRE(cell.chunk != nullptr);
-        REQUIRE(cell.chunk->value(0, cell.row).value<int64_t>() == static_cast<int64_t>(row));
-        REQUIRE(cell.chunk->value(1, cell.row).value<std::string_view>() == name_of(row));
+        REQUIRE(otterstax::test::cell((*cell.chunk), 0, cell.row).value<int64_t>() == static_cast<int64_t>(row));
+        REQUIRE(otterstax::test::cell((*cell.chunk), 1, cell.row).value<std::string_view>() == name_of(row));
         if (null_row(row)) {
-            REQUIRE(cell.chunk->value(2, cell.row).is_null());
+            REQUIRE(otterstax::test::cell((*cell.chunk), 2, cell.row).is_null());
         } else {
-            REQUIRE(cell.chunk->value(2, cell.row).value<int64_t>() == static_cast<int64_t>(row * 2));
+            REQUIRE(otterstax::test::cell((*cell.chunk), 2, cell.row).value<int64_t>() == static_cast<int64_t>(row * 2));
         }
     }
 }
 
-TEST_CASE("split_to_capacity: a 2500-row ndjson becomes 1024 + 1024 + 452 rows with every boundary row intact") {
+TEST_CASE("ndjson_to_chunk: a 2500-row ndjson becomes 1024 + 1024 + 452 rows with every boundary row intact") {
     std::pmr::unsynchronized_pool_resource arena{std::pmr::new_delete_resource()};
     std::string json;
     for (size_t row = 0; row < wide_rows; ++row) {
@@ -318,26 +334,24 @@ TEST_CASE("split_to_capacity: a 2500-row ndjson becomes 1024 + 1024 + 452 rows w
     }
     auto loaded = tsl::ndjson_to_chunk(&arena, reinterpret_cast<const uint8_t*>(json.data()), json.size());
     REQUIRE_FALSE(loaded.has_error());
-    REQUIRE(loaded.value().size() == wide_rows);
-
-    auto run = tsl::split_to_capacity(&arena, std::move(loaded.value()));
+    const auto& run = loaded.value();
 
     require_run_shape(run, wide_rows, 3);
     for (const size_t row : probe_rows) {
         INFO("row " << row);
         const auto cell = locate(run, row);
         REQUIRE(cell.chunk != nullptr);
-        REQUIRE(cell.chunk->value(0, cell.row).value<int64_t>() == static_cast<int64_t>(row));
-        REQUIRE(cell.chunk->value(1, cell.row).value<std::string_view>() == name_of(row));
+        REQUIRE(otterstax::test::cell((*cell.chunk), 0, cell.row).value<int64_t>() == static_cast<int64_t>(row));
+        REQUIRE(otterstax::test::cell((*cell.chunk), 1, cell.row).value<std::string_view>() == name_of(row));
         if (null_row(row)) {
-            REQUIRE(cell.chunk->value(2, cell.row).is_null());
+            REQUIRE(otterstax::test::cell((*cell.chunk), 2, cell.row).is_null());
         } else {
-            REQUIRE(cell.chunk->value(2, cell.row).value<int64_t>() == static_cast<int64_t>(row * 2));
+            REQUIRE(otterstax::test::cell((*cell.chunk), 2, cell.row).value<int64_t>() == static_cast<int64_t>(row * 2));
         }
     }
 }
 
-TEST_CASE("split_to_capacity: a 2500-row parquet becomes 1024 + 1024 + 452 rows with every boundary row intact") {
+TEST_CASE("parquet_to_chunk: a 2500-row parquet becomes 1024 + 1024 + 452 rows with every boundary row intact") {
     std::pmr::unsynchronized_pool_resource arena{std::pmr::new_delete_resource()};
     auto table_result = arrow::Table::FromRecordBatches({make_wide_batch()});
     REQUIRE(table_result.ok());
@@ -348,28 +362,23 @@ TEST_CASE("split_to_capacity: a 2500-row parquet becomes 1024 + 1024 + 452 rows 
 
     auto loaded = tsl::parquet_to_chunk(&arena, buffer->data(), static_cast<size_t>(buffer->size()));
     REQUIRE_FALSE(loaded.has_error());
-    REQUIRE(loaded.value().size() == wide_rows);
-
-    auto run = tsl::split_to_capacity(&arena, std::move(loaded.value()));
+    const auto& run = loaded.value();
 
     require_run_shape(run, wide_rows, 3);
     require_wide_batch_rows(run);
 }
 
-TEST_CASE("split_to_capacity: a 2500-row arrow batch becomes 1024 + 1024 + 452 rows with every boundary row intact") {
+TEST_CASE("arrow_to_chunk: a 2500-row arrow batch becomes 1024 + 1024 + 452 rows with every boundary row intact") {
     std::pmr::unsynchronized_pool_resource arena{std::pmr::new_delete_resource()};
     auto loaded = tsl::arrow_to_chunk(&arena, make_wide_batch());
     REQUIRE_FALSE(loaded.has_error());
-    auto chunk = std::move(loaded.value());
-    REQUIRE(chunk.size() == wide_rows);
-
-    auto run = tsl::split_to_capacity(&arena, std::move(chunk));
+    const auto& run = loaded.value();
 
     require_run_shape(run, wide_rows, 3);
     require_wide_batch_rows(run);
 }
 
-TEST_CASE("split_to_capacity: 2500 PostgreSQL tuples become 1024 + 1024 + 452 rows with every boundary row intact") {
+TEST_CASE("backend pages: 2500 PostgreSQL tuples become 1024 + 1024 + 452 rows with every boundary row intact") {
     std::pmr::unsynchronized_pool_resource arena{std::pmr::new_delete_resource()};
     std::vector<std::string> ids;
     std::vector<std::string> labels;
@@ -391,23 +400,23 @@ TEST_CASE("split_to_capacity: 2500 PostgreSQL tuples become 1024 + 1024 + 452 ro
     REQUIRE_FALSE(converted.has_error());
     REQUIRE(converted.value().size() == wide_rows);
 
-    auto run = tsl::split_to_capacity(&arena, std::move(converted.value()));
+    auto run = windows_of(&arena, converted.value());
 
     require_run_shape(run, wide_rows, 2);
     for (const size_t row : probe_rows) {
         INFO("row " << row);
         const auto cell = locate(run, row);
         REQUIRE(cell.chunk != nullptr);
-        REQUIRE(cell.chunk->value(0, cell.row).value<int32_t>() == static_cast<int32_t>(row));
+        REQUIRE(otterstax::test::cell((*cell.chunk), 0, cell.row).value<int32_t>() == static_cast<int32_t>(row));
         if (null_row(row)) {
-            REQUIRE(cell.chunk->value(1, cell.row).is_null());
+            REQUIRE(otterstax::test::cell((*cell.chunk), 1, cell.row).is_null());
         } else {
-            REQUIRE(cell.chunk->value(1, cell.row).value<std::string_view>() == name_of(row));
+            REQUIRE(otterstax::test::cell((*cell.chunk), 1, cell.row).value<std::string_view>() == name_of(row));
         }
     }
 }
 
-TEST_CASE("split_to_capacity: 2500 rows over two ClickHouse blocks become 1024 + 1024 + 452 rows with every boundary row intact") {
+TEST_CASE("backend pages: 2500 rows over two ClickHouse blocks become 1024 + 1024 + 452 rows with every boundary row intact") {
     std::pmr::unsynchronized_pool_resource arena{std::pmr::new_delete_resource()};
     // The block boundary (1500) falls inside a window, not on one.
     const std::vector<clickhouse::Block> blocks{make_ch_block(0, 1500), make_ch_block(1500, wide_rows - 1500)};
@@ -415,16 +424,16 @@ TEST_CASE("split_to_capacity: 2500 rows over two ClickHouse blocks become 1024 +
     REQUIRE_FALSE(converted.has_error());
     REQUIRE(converted.value().size() == wide_rows);
 
-    auto run = tsl::split_to_capacity(&arena, std::move(converted.value()));
+    auto run = windows_of(&arena, converted.value());
 
     require_run_shape(run, wide_rows, 3);
     for (const size_t row : probe_rows) {
         INFO("row " << row);
         const auto cell = locate(run, row);
         REQUIRE(cell.chunk != nullptr);
-        REQUIRE(cell.chunk->value(0, cell.row).value<int32_t>() == static_cast<int32_t>(row));
-        REQUIRE(cell.chunk->value(1, cell.row).value<double>() == static_cast<double>(row) * 1.5);
-        REQUIRE(cell.chunk->value(2, cell.row).value<std::string_view>() == name_of(row));
+        REQUIRE(otterstax::test::cell((*cell.chunk), 0, cell.row).value<int32_t>() == static_cast<int32_t>(row));
+        REQUIRE(otterstax::test::cell((*cell.chunk), 1, cell.row).value<double>() == static_cast<double>(row) * 1.5);
+        REQUIRE(otterstax::test::cell((*cell.chunk), 2, cell.row).value<std::string_view>() == name_of(row));
     }
 }
 
@@ -432,7 +441,7 @@ TEST_CASE("split_to_capacity: 2500 rows over two ClickHouse blocks become 1024 +
 // slices each field: every row of every window keeps its own elements — an empty list, NULL elements,
 // a NULL field — on both sides of each boundary and at the end, also once each window is copied the
 // way the engine's raw-data operator adopts it.
-TEST_CASE("split_to_capacity: 2500 ClickHouse rows with LIST and STRUCT columns keep every row's elements and fields") {
+TEST_CASE("backend pages: 2500 ClickHouse rows with LIST and STRUCT columns keep every row's elements and fields") {
     std::pmr::unsynchronized_pool_resource arena{std::pmr::new_delete_resource()};
     // The system.columns types of (id, nums, tags, rec), by result position.
     const std::vector<std::optional<std::string>> declared{std::nullopt,
@@ -451,7 +460,7 @@ TEST_CASE("split_to_capacity: 2500 ClickHouse rows with LIST and STRUCT columns 
     REQUIRE(types[2].type() == components::types::logical_type::LIST);
     REQUIRE(types[3].type() == components::types::logical_type::STRUCT);
 
-    auto run = tsl::split_to_capacity(&arena, std::move(converted.value()));
+    auto run = windows_of(&arena, converted.value());
 
     require_run_shape(run, wide_rows, 4);
     SECTION("the windows") {
@@ -476,24 +485,24 @@ TEST_CASE("split_to_capacity: 2500 ClickHouse rows with LIST and STRUCT columns 
     }
 }
 
-TEST_CASE("split_to_capacity: one row past the bound is a second window of one row") {
+TEST_CASE("csv_to_chunk: one row past the bound is a second chunk of one row") {
     std::pmr::unsynchronized_pool_resource arena{std::pmr::new_delete_resource()};
 
-    auto run = tsl::split_to_capacity(&arena, make_rows_chunk(&arena, 0, DEFAULT_VECTOR_CAPACITY + 1));
+    auto run = make_rows_run(&arena, 0, DEFAULT_VECTOR_CAPACITY + 1);
 
     REQUIRE(run.size() == 2);
     REQUIRE(run[0].size() == DEFAULT_VECTOR_CAPACITY);
     REQUIRE(run[1].size() == 1);
-    REQUIRE(run[0].value(0, DEFAULT_VECTOR_CAPACITY - 1).value<int64_t>() ==
+    REQUIRE(otterstax::test::cell(run[0], 0, DEFAULT_VECTOR_CAPACITY - 1).value<int64_t>() ==
             static_cast<int64_t>(DEFAULT_VECTOR_CAPACITY - 1));
-    REQUIRE(run[1].value(0, 0).value<int64_t>() == static_cast<int64_t>(DEFAULT_VECTOR_CAPACITY));
-    REQUIRE(run[1].value(1, 0).value<std::string_view>() == name_of(DEFAULT_VECTOR_CAPACITY));
+    REQUIRE(otterstax::test::cell(run[1], 0, 0).value<int64_t>() == static_cast<int64_t>(DEFAULT_VECTOR_CAPACITY));
+    REQUIRE(otterstax::test::cell(run[1], 1, 0).value<std::string_view>() == name_of(DEFAULT_VECTOR_CAPACITY));
 }
 
-TEST_CASE("split_to_capacity: the run and its windows live on the caller's resource") {
+TEST_CASE("csv_to_chunk: the run and its chunks live on the caller's resource") {
     std::pmr::unsynchronized_pool_resource arena{std::pmr::new_delete_resource()};
 
-    auto run = tsl::split_to_capacity(&arena, make_rows_chunk(&arena, 0, wide_rows));
+    auto run = make_rows_run(&arena, 0, wide_rows);
 
     REQUIRE(run.get_allocator().resource() == &arena);
     for (const auto& chunk : run) {
@@ -501,23 +510,27 @@ TEST_CASE("split_to_capacity: the run and its windows live on the caller's resou
     }
 }
 
-// ── shapes that are handed on as they are ────────────────────────────────────
+// ── shapes within the bound ──────────────────────────────────────────────────
 
-TEST_CASE("split_to_capacity: a chunk within the bound is handed on as it is") {
+TEST_CASE("chunks within the bound: one chunk, a result without rows keeping its columns") {
     std::pmr::unsynchronized_pool_resource arena{std::pmr::new_delete_resource()};
 
-    SECTION("exactly DEFAULT_VECTOR_CAPACITY rows") {
-        auto chunk = make_rows_chunk(&arena, 0, DEFAULT_VECTOR_CAPACITY);
-        const auto* id_buffer = chunk.data[0].data();
-
-        auto run = tsl::split_to_capacity(&arena, std::move(chunk));
+    SECTION("a file of exactly DEFAULT_VECTOR_CAPACITY rows is one chunk") {
+        auto run = make_rows_run(&arena, 0, DEFAULT_VECTOR_CAPACITY);
 
         REQUIRE(run.size() == 1);
         REQUIRE(run.front().size() == DEFAULT_VECTOR_CAPACITY);
-        // Moved, neither copied nor sliced: the very same column buffer.
-        REQUIRE(run.front().data[0].data() == id_buffer);
     }
-    SECTION("a result without rows keeps its columns") {
+    SECTION("a file without rows is one chunk of its columns") {
+        const std::string csv = "id,name\n";
+        auto loaded = tsl::csv_to_chunk(&arena, reinterpret_cast<const uint8_t*>(csv.data()), csv.size());
+        REQUIRE_FALSE(loaded.has_error());
+
+        REQUIRE(loaded.value().size() == 1);
+        REQUIRE(loaded.value().front().column_count() == 2);
+        REQUIRE(loaded.value().front().size() == 0);
+    }
+    SECTION("a backend result without rows keeps its columns") {
         // A schema'd zero-row chunk is real pipeline input (a scalar aggregate over it answers
         // COUNT = 0); only a zero-COLUMN chunk is the drain sentinel.
         pg_result_guard g(make_tuples_result({{"id", INT4OID}, {"label", TEXTOID}}, {}));
@@ -525,7 +538,7 @@ TEST_CASE("split_to_capacity: a chunk within the bound is handed on as it is") {
         auto converted = tsl::pg_to_chunk(&arena, g.get(), no_enums);
         REQUIRE_FALSE(converted.has_error());
 
-        auto run = tsl::split_to_capacity(&arena, std::move(converted.value()));
+        auto run = windows_of(&arena, converted.value());
 
         REQUIRE(run.size() == 1);
         REQUIRE(run.front().column_count() == 2);

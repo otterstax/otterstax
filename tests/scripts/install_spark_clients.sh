@@ -29,15 +29,14 @@ venv_of() {
     esac
 }
 
-# Each set is the line's declared Connect requirements, plus caps:
+# Each set is the line's declared Connect requirements, plus three caps:
 #  - pandas<3: every line caps it in its own dev/requirements.txt;
 #  - pyarrow<26 for 3.5: pyarrow 26 needs numpy>=2 at import but does not declare
 #    it, so pip pairs it with 3.5's numpy<2 and the client fails to import;
 #  - protobuf on the major the line's *_pb2.py was generated for (3.5: protoc
 #    21.7 = python 4.21, 4.0: 5.28, 4.1/4.2: 6.33), the only pairing protobuf's
 #    cross-version guarantee covers and what the 4.x CI pins; unpinned, pip
-#    picks 7.x for every line;
-#  - 3.5 only: pyarrow<26 — 26.0 requires numpy 2, and 3.5 runs on numpy<2.
+#    picks 7.x for every line.
 create_venv() {
     local name=$1 python
     local -a deps

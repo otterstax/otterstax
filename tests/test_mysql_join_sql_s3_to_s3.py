@@ -49,17 +49,18 @@ LABEL = "DATA — MySQL wire / JOIN sql-backend ⋈ s3 parquet, persist, dump to
 JOIN_CAMPAIGN_IDS = (1, 2, 3)
 EXPECTED_JOIN_ROWS = len(JOIN_CAMPAIGN_IDS) * 4
 
-# Source: campaigns lives in MariaDB1 (alias 'campaigns', db 'db1', schema 'schema').
-SQL_BACKEND_TABLE = "campaigns.db1.campaigns"
+# Source: campaigns lives in MariaDB1 (alias 'campaigns', db 'db1'; a MySQL
+# connection's one schema is 'public').
+SQL_BACKEND_TABLE = "campaigns.db1.public.campaigns"
 
-# Otterbrix-internal database. Used for BOTH the parquet-loaded regions and the
-# persisted JOIN result — CREATE EXTERNAL TABLE auto-creates the database, then
-# plain CREATE TABLE can reuse it. The name must not collide with any registered
-# backend alias (campaigns/products/orders) or other external test db.
+# Otterbrix-internal schema of the session's database (main). Used for BOTH the
+# parquet-loaded regions and the persisted JOIN result — the tester creates the
+# schema before its first CREATE EXTERNAL TABLE, then plain CREATE TABLE reuses
+# it. The name must not collide with another external test's schema.
 INTERNAL_DB = "joinflow_otb"
 
 # Round-trip verification reads the dumped csv back from s3 as a fresh external
-# table; this database is auto-created by that CREATE EXTERNAL TABLE call.
+# table; the tester creates this schema before that CREATE EXTERNAL TABLE call.
 VERIFY_DB = "joinverify_s3"
 
 

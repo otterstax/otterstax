@@ -45,8 +45,9 @@ Nothing in `config/` throws. Every entry point returns a
 | a connection entry that is a scalar (`mysql: [name]`) | `invalid_parameter` | the section + entry position + "expected a mapping of keys" |
 | a connection field that is not a scalar (`host: [a, b]`) | `invalid_parameter` | the section + entry position + field |
 | an incomplete connection entry, or a malformed backend port | `invalid_parameter` | the section + `alias='…'` + the missing field / bad port |
-| a connection whose alias is `federation` or `kafka` in any case, in any section | `invalid_parameter` | the section + `alias='…'` + "reserved" + what the name is |
-| a backend alias (mysql / postgresql / clickhouse) equal to another one under the federation's case folding, or an s3 alias equal to another s3 alias | `invalid_parameter` | the section + `alias='…'` + "already taken by" the other entry |
+| a connection whose alias is `federation` or `main` in any case, in any section | `invalid_parameter` | the section + `alias='…'` + "reserved" + what the name is |
+| a backend alias (mysql / postgresql / clickhouse) that is not an unquoted SQL identifier (`[a-z_][a-z0-9_]*`) | `invalid_parameter` | the section + `alias='…'` + the rule ("unquoted") |
+| a backend alias (mysql / postgresql / clickhouse) equal to another one, or an s3 alias equal to another s3 alias | `invalid_parameter` | the section + `alias='…'` + "already taken by" the other entry |
 | a `pool_size` below 1, or one that is not an integer | `invalid_parameter` | the section + `alias='…'` (or entry position) + `pool_size` |
 | a `service.spark_connect.session_timeout_s` that is not an integer in [0, one year] | `invalid_parameter` | the field |
 
@@ -176,19 +177,21 @@ before its first key. Error messages live on the `std::pmr::memory_resource*` pa
   `connection_config_reader.hpp`): `federation` (`reserved_connection_alias`,
   defined as the federation's `metadata_database` — a header-only constant), the
   engine database holding the remote-table metadata (`federation.remote_tables` /
-  `remote_columns`, `otterbrix/federation/metadata.hpp`), and
-  `kafka` (`reserved_kafka_alias`), the engine database of the Kafka objects
-  (`otterstax::kafka::KAFKA_DATABASE_NAME`, which `config` cannot include — a
-  `static_assert` in `backends/backends.cpp` pins the two spellings together). An
-  alias is the first qualifier of a federated name, so a connection under either
-  would shadow that database. `pool_size` is checked last (every backend section). `parse_connections` turns a non-empty
+  `remote_columns`, `otterbrix/federation/metadata.hpp`), and `main`, the engine's
+  default local database. An
+  alias is the first qualifier of a federated name, so a connection under it
+  would shadow that database. Then a backend alias (mysql / postgresql /
+  clickhouse) must be an **unquoted SQL identifier**, `[a-z_][a-z0-9_]*`: it is
+  the first segment of a federated table name, written unquoted in SQL, so it
+  must be what the lexer folds an unquoted identifier to — an upper-case letter,
+  a dot, a dash or a leading digit would be unreachable. s3 aliases are a string
+  literal (`s3_alias = '…'`) and take any spelling. `kafka` is an ordinary alias: the Kafka objects are
+  the schema `main.kafka`, never the uid slot of a four-part name. `pool_size` is checked last (every backend section). `parse_connections` turns a non-empty
   result into its `invalid_parameter`.
 - After every entry passed, `parse_connections` checks the **aliases**: the
   mysql / postgresql / clickhouse aliases share one namespace — an alias is the
-  connection uid every federated name starts with and the federation resolves it
-  case-insensitively (`federation::fold_identifier`, ASCII lower case; spelled
-  again in the reader because `config` links nothing of the federation) — so two
-  entries equal under that folding, in one section or two, are refused: one
+  connection uid every federated name starts with — so two equal entries, in one
+  section or two, are refused: one
   backend would be unreachable and its tables recorded under the other's uid.
   s3 aliases are another namespace (the `s3_alias` option of CREATE EXTERNAL
   TABLE / COPY ... TO, looked up exactly by `conn::s3::ConnectorManager`, where a
@@ -288,9 +291,8 @@ connections:
     - { alias: <a>, access_key: <k>, secret_key: <s>, region: <r>, endpoint: <e> }
 ```
 
-`alias` must not be `federation` or `kafka` (any case) in any section: the names
-are reserved for the engine databases of the remote-table metadata and of the
-Kafka objects, and such an entry aborts
+`alias` must not be `federation` (any case) in any section: the name
+is reserved for the engine database of the remote-table metadata, and such an entry aborts
 startup, and so does an alias another backend entry already takes (any case, any
 backend section) or another s3 entry already takes. `port` is an **optional string** (empty → driver default; otherwise a decimal
 integer in 1..65535, anything else aborts startup). mysql / postgresql entries take
@@ -334,11 +336,13 @@ rules).
 `tests/unit/config/` (`test_unit_config`) covers `parse_connections` (field
 parsing, null/missing node, missing sections, pg `schema` default, optional s3
 fields, order preservation, **`invalid_parameter` on an incomplete entry, a
-malformed port, a non-scalar field, a bad `pool_size`, or the reserved alias
-`federation` or `kafka` in any case and any section** (an alias merely containing
-the word is accepted), **a backend alias taken twice across sections in any case, two equal
+malformed port, a non-scalar field, a bad `pool_size`, or the reserved aliases
+`federation` / `main` in any case and any section** (an alias merely containing
+the word is accepted; `kafka` is accepted), **a backend alias taken twice across sections, two equal
 s3 aliases** (an s3 alias equal to a backend alias, or differing in case, is
-accepted), empty `table`/omitted `port` allowed),
+accepted), the `[names]` table of backend aliases (duplicates within and across
+sections, an upper-case letter, a dot, a dash, a leading digit), empty
+`table`/omitted `port` allowed),
 `validation_error` (required-field checks, optional port, port range/format, s3
 keys, the reserved alias reported after the missing fields and before the port), and `load_config` (whole `config.yaml`: `service.*` ports +
 `connection_retry` + embedded connections, a connection under the reserved alias

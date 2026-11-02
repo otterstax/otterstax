@@ -19,11 +19,12 @@ import pyarrow as pa
 import pyarrow.ipc as ipc
 
 # GetTables lists the engine's own tables beside the remote ones
-# (catalog/introspection.cpp), each local one under its database with an empty
-# schema. Only the backend's databases are validated here, so a local table of
-# the same name — or one whose column Arrow cannot carry, whose table_schema is
-# NULL — never stands in for a backend table.
-BACKEND_CATALOGS = {'db1', 'db2', 'pgdb'}
+# (frontend/flight_sql/session_engine.cpp): a local table under its database
+# (`main`), a remote one under `<alias>.<database>` with its schema. Only the
+# backends' catalogs are validated here, so a local table of the same name — or
+# one whose column Arrow cannot carry, whose table_schema is NULL — never
+# stands in for a backend table.
+BACKEND_CATALOGS = {'campaigns.db1', 'impressions.db2', 'products.pgdb'}
 
 
 def validate_table_schemas(client, expected_schemas, test_name):

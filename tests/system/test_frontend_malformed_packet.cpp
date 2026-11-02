@@ -757,7 +757,7 @@ TEST_CASE("malformed packet: postgres well-formed messages of every type are rea
     raw_client client(server.local_port());
     pg_startup(client);
 
-    for (const char* sql : {"CREATE DATABASE wfdb",
+    for (const char* sql : {"CREATE SCHEMA wfdb",
                             "CREATE TABLE wfdb.people (id bigint, name string)",
                             "INSERT INTO wfdb.people (id, name) VALUES (1, 'one')"}) {
         client.write(pg_frame('Q', cstr(sql)));
@@ -1017,8 +1017,8 @@ TEST_CASE("malformed packet: postgres RowDescription of an executed column witho
         // The engine binds a view at creation and refuses an output column without a name
         // ("view column 1 has no name; name it with AS"), so no such view can exist; the
         // refusal comes back as an ordinary ErrorResponse and the connection keeps serving.
-        client.write(pg_frame('Q', cstr("CREATE DATABASE unnamed_db;")));
-        pg_require_no_error(pg_read_until_ready(client), "CREATE DATABASE unnamed_db;");
+        client.write(pg_frame('Q', cstr("CREATE SCHEMA unnamed_db;")));
+        pg_require_no_error(pg_read_until_ready(client), "CREATE SCHEMA unnamed_db;");
         client.write(pg_frame('Q', cstr("CREATE VIEW unnamed_db.v AS SELECT 1;")));
         const auto messages = pg_read_until_ready(client);
         const auto kinds = pg_message_kinds(messages);

@@ -99,14 +99,14 @@ configuration::config make_engine_configuration(const config::EngineConfig&);
   It validates `config.execution`, takes `<main_path>/.lock`, replays the WAL,
   bootstraps the catalog and starts the three pools. A refusal is returned as the error,
   with its message re-homed onto `new_delete_resource`:
-  - a held lock → `already_exists`, "another engine already owns …";
+  - a held lock → `lock_file_exists`, "another engine already owns …";
   - an unreadable WAL → `io_error`;
   - the runtime's engine pools already lent or spent → `invalid_parameter`;
   - no log directory (`make_engine_log`) → `invalid_parameter`, a log file that
     cannot be created → `io_error`; the pools are not lent. `make_engine_log`
     answers a valid log or the error: the engine would dereference an invalid one;
   - an exception thrown by any step under `open_engine` (the directory lock, the
-    WAL read, allocation, the log) → `other_error` "engine startup REFUSED,
+    WAL read, allocation, the log) → `internal_error` "engine startup REFUSED,
     open_engine threw: …". It is caught in `engine_t::open`, so the pools are
     spent unstarted (`lent → spent`) like for any refusal — an exception
     escaping would leave them lent and `~runtime_t` would abort.
@@ -116,12 +116,19 @@ configuration::config make_engine_configuration(const config::EngineConfig&);
   dispatcher's `begin_shutdown` runs first, then the final CHECKPOINT (a failure is
   logged, the next start replays the journal), the manager loops stop, and general /
   exec / disk stop. The runtime then marks its engine pools spent.
-- **`primitives`** are the host's optimizer rules and name-resolution `need`/`decide`.
-  `open_engine` reads them once, and every executor copies them. Empty means otterbrix's
-  defaults: `no_name_reads` / `no_storages`, no rules. The server opens the engine with
-  the federation's (`otterstax::federation::make_primitives()`: `need`/`decide` and the
-  pushdown rule), after `remote_backends_t::open` installed the registry the hooks read;
-  the test stacks and `tests/federation/` open it the same way.
+- **`primitives`** are the host's backend map (`components/planner/host_hooks.hpp`):
+  `backend_address_t{connection, address, max_rows_per_write}` for every configured
+  connection, all on the one backend actor (`federation::backend_actor_t`). `open_engine`
+  reads it once and every executor copies it, so the array need not outlive the call,
+  but the actor must outlive the engine. Empty is an engine with no connection (a
+  statement reaching a connection's database is refused, the engine runs on). The
+  server opens the engine with `remote_backends_t::primitives()` after
+  `remote_backends_t::open` spawned the actor — over every configured connection,
+  reachable or not; the test stacks open it the same way. otterbrix takes no host
+  optimizer rule and no name-resolution hook any more.
+- **Pools**: `open_engine` refuses a null pool, a pool with no worker, and two roles on
+  one pool (`refuse_host_arguments`); `runtime_t` lends three distinct pools (general /
+  exec / disk), apart from the sessions and backends pools.
 - **`make_engine_configuration`**: `main_path` (the locked directory), the WAL and
   the tables are `data_dir`; the log is `config::log_directory` (`log_dir`, else
   `data_dir`). This is the single-directory layout the server always used, with one
@@ -159,18 +166,21 @@ command line, config::load_config → ServiceConfig{ engine, runtime, … }   (f
 initialize_all_loggers(config::log_directory(server_config.engine))   — log_dir, else data_dir
 runtime_t runtime(server_config.runtime, backends.threads resolved by backends::backends_threads)
 remote_backends_t(runtime.resource(), {.statements = runtime.backends_scheduler()}).open(connections, retry)
-                                     → connections discovered, registry installed
-auto engine = engine_t::open(runtime, server_config.engine, federation::make_primitives())   → error: log, return 1
+                                     → connections discovered, the backend actor spawned over every one
+                                       (an unreachable one included); an error → log, return 1
+auto engine = engine_t::open(runtime, server_config.engine, remote->primitives())   → error: log, return 1
 s3 connector, FileManager, S3Manager, KafkaManager spawned (main's locals, after the engine)
-backends::register_s3_aliases, backends::publish_federation_metadata, kafka->recover()
-session_factory_t(runtime, &make_parser, make_session_services(…))   → query sessions on runtime.sessions_scheduler()
+backends::register_s3_aliases, backends::register_remote_tables (the discovery into the
+engine's catalog, no SQL to a backend; an error → return 1), kafka->recover()
+session_factory_t(runtime, &make_parser, make_session_services(…, remote->connections(), remote->actor()))
+                                     → query sessions on runtime.sessions_scheduler()
 the four servers over the factory; start, flight->run()
 ── shutdown (the reverse of the declarations) ──
 servers destroyed (each stops in its destructor; their sessions closed)
 ~session_factory_t: sessions drain (30 s) → runtime.stop_sessions() → reap
 Kafka, S3, file, s3 connector destroyed (Kafka first)
 engine destroyed (final CHECKPOINT, engine pools stopped)
-remote backends destroyed (registry reset, the backends' statement jobs on the backends pool drained, connector managers)
+remote backends destroyed (the backend actor's loop first, then the backends' statement jobs on the backends pool drained, connector managers)
 runtime destroyed (backends pool stopped, memory)
 ```
 

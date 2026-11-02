@@ -11,7 +11,7 @@ from contextlib import contextmanager
 
 import config
 
-_ORDERS = f"{config.CH_ALIAS}.{config.CH_DATABASE}.orders"
+_ORDERS = f"{config.CH_ALIAS}.{config.CH_DATABASE}.public.orders"
 
 
 class client:
@@ -22,7 +22,7 @@ class client:
             'port': config.PG_PORT,
             'user': 'testuser',
             'password': 'testpass',
-            'dbname': config.CH_ALIAS,
+            'dbname': 'main',  # the engine database the session is placed in
         }
         print(f"Connecting to host: {host}")
 

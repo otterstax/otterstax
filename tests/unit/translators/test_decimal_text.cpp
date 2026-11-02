@@ -20,7 +20,8 @@ namespace {
 
     std::optional<int128_t> parse(std::string_view text, std::uint8_t scale, std::uint8_t width = 38) {
         int128_t out = 0;
-        if (!components::casts::kernels::detail::parse_decimal(text, width, scale, &out)) {
+        if (components::casts::kernels::detail::parse_decimal(text, width, scale, &out) !=
+            components::casts::kernels::detail::parse_outcome::parsed) {
             return std::nullopt;
         }
         return out;

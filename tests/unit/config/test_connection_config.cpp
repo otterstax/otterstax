@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2025-2026  OtterStax
 
-#include "config/config.hpp"
 #include "config/connections/connection_config_reader.hpp"
+#include "config/config.hpp"
 
 #include <catch2/catch_all.hpp>
 #include <yaml-cpp/yaml.h>
@@ -14,19 +14,32 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 namespace {
-    std::pmr::memory_resource* resource() { return std::pmr::new_delete_resource(); }
 
-    // Parse a YAML string and return its top-level `connections` node.
-    YAML::Node connections_node(const std::string& yaml) { return YAML::Load(yaml)["connections"]; }
+std::pmr::memory_resource* resource() {
+    return std::pmr::new_delete_resource();
+}
 
-    // parse_connections on a node that must be accepted; the descriptors it produced.
-    config::ConnectionsConfig parse_ok(const YAML::Node& node) {
-        auto parsed = config::parse_connections(node, resource());
-        REQUIRE_FALSE(parsed.has_error());
-        return std::move(parsed.value());
-    }
+// Parse a YAML string and return its top-level `connections` node.
+YAML::Node connections_node(const std::string& yaml) {
+    return YAML::Load(yaml)["connections"];
+}
+
+// parse_connections on a node that must be accepted; the descriptors it produced.
+config::ConnectionsConfig parse_ok(const YAML::Node& node) {
+    auto parsed = config::parse_connections(node, resource());
+    REQUIRE_FALSE(parsed.has_error());
+    return std::move(parsed.value());
+}
+
+// parse_connections on a node that must be rejected; the error it produced.
+core::error_t parse_error(const YAML::Node& node) {
+    auto parsed = config::parse_connections(node, resource());
+    REQUIRE(parsed.has_error());
+    return parsed.error();
+}
 
 // load_config on a file that must be accepted; the whole ServiceConfig.
 config::ServiceConfig load_ok(const std::string& path) {
@@ -42,13 +55,9 @@ core::error_t load_error(const std::string& path) {
     return loaded.error();
 }
 
-    // ConfigReader::load on a file that must be rejected; the error it produced.
-    core::error_t load_error(const std::string& path) {
-        config::ConfigReader reader{resource()};
-        auto loaded = reader.load(path);
-        REQUIRE(loaded.has_error());
-        return loaded.error();
-    }
+bool mentions(const core::error_t& error, std::string_view text) {
+    return std::string_view{error.what.data(), error.what.size()}.find(text) != std::string_view::npos;
+}
 
 // Write `content` to a unique temp file and return its path (used for the
 // whole-file load_config tests).
@@ -62,17 +71,7 @@ std::string write_temp(const std::string& content) {
     return path.string();
 }
 
-    // Write `content` to a unique temp file and return its path (used for the
-    // whole-file ConfigReader tests).
-    std::string write_temp(const std::string& content) {
-        static std::atomic<int> counter{0};
-        auto path = std::filesystem::temp_directory_path() / ("otterstax_cfg_" + std::to_string(counter++) + ".yaml");
-        std::ofstream out(path);
-        out << content;
-        out.close();
-        return path.string();
-    }
-} // namespace
+}  // namespace
 
 // ── parse_connections (the `connections:` subtree) ───────────────────────────
 
@@ -172,7 +171,7 @@ connections:
 }
 
 TEST_CASE("parse_connections: null/missing node yields an empty config") {
-    YAML::Node absent; // null node
+    YAML::Node absent;  // null node
     auto cfg = parse_ok(absent);
     CHECK(cfg.mysql.empty());
     CHECK(cfg.postgresql.empty());
@@ -203,7 +202,7 @@ connections:
     CHECK(cfg.s3.empty());
 }
 
-TEST_CASE("parse_connections: postgresql schema defaults to 'public' when omitted") {
+TEST_CASE("parse_connections: postgresql schema is empty when omitted (every user schema)") {
     const std::string yaml = R"(
 connections:
   postgresql:
@@ -217,7 +216,7 @@ connections:
 )";
     auto cfg = parse_ok(connections_node(yaml));
     REQUIRE(cfg.postgresql.size() == 1);
-    CHECK(cfg.postgresql[0].schema == "public");
+    CHECK(cfg.postgresql[0].schema.empty());
 }
 
 TEST_CASE("parse_connections: optional s3 fields default to empty") {
@@ -252,48 +251,6 @@ connections:
     CHECK(cfg.mysql[0].alias == "a");
     CHECK(cfg.mysql[1].alias == "b");
     CHECK(cfg.mysql[2].alias == "c");
-}
-
-TEST_CASE("parse_connections: a backend alias is reachable from SQL and names one connection", "[names]") {
-    struct row_t {
-        const char* name;
-        std::string entries;
-        bool accepted;
-    };
-    const std::string my = R"({ host: h, port: "3306", username: u, password: p, database: d, table: "" })";
-    const auto entry = [](const char* alias, const std::string& fields) {
-        return "    - { alias: " + std::string{alias} + ", " + fields.substr(2);
-    };
-    const std::string pg = R"({ host: h, port: "5432", username: u, password: p, database: d, schema: s, table: "" })";
-    const std::string ch = R"({ host: h, port: "9000", username: u, password: p, database: d, table: "" })";
-    const std::vector<row_t> rows{
-        {"distinct lower-case aliases across sections",
-         "  mysql:\n" + entry("shop", my) + "\n  postgresql:\n" + entry("pg_2", pg) + "\n  clickhouse:\n" +
-             entry("ch", ch) + "\n",
-         true},
-        {"same alias in two sections",
-         "  mysql:\n" + entry("shop", my) + "\n  postgresql:\n" + entry("shop", pg) + "\n",
-         false},
-        {"same alias twice in one section", "  clickhouse:\n" + entry("ch", ch) + "\n" + entry("ch", ch) + "\n", false},
-        {"alias with an upper-case letter", "  postgresql:\n" + entry("Shop", pg) + "\n", false},
-        {"alias with a dot", "  postgresql:\n" + entry("pg.main", pg) + "\n", false},
-        {"alias with a dash", "  mysql:\n" + entry("my-shop", my) + "\n", false},
-        {"alias starting with a digit", "  clickhouse:\n" + entry("1ch", ch) + "\n", false},
-        {"alias starting with an underscore", "  mysql:\n" + entry("_shop2", my) + "\n", true},
-    };
-    for (const auto& row : rows) {
-        DYNAMIC_SECTION(row.name) {
-            const std::string yaml = "connections:\n" + row.entries;
-            INFO(yaml);
-            auto parsed = config::parse_connections(connections_node(yaml), resource());
-            if (row.accepted) {
-                REQUIRE_FALSE(parsed.has_error());
-            } else {
-                REQUIRE(parsed.has_error());
-                CHECK(parsed.error().type == core::error_code_t::invalid_parameter);
-            }
-        }
-    }
 }
 
 TEST_CASE("parse_connections: an incomplete connection aborts parsing (fail-fast)") {
@@ -477,19 +434,24 @@ TEST_CASE("validation_error: s3 requires access_key and secret_key") {
 
 // ── pool_size (mysql / postgresql) ───────────────────────────────────────────
 
-TEST_CASE("parse_connections: pool_size defaults to 1 when omitted") {
+TEST_CASE("parse_connections: pool_size defaults to 4 when omitted") {
     const std::string yaml = R"(
 connections:
   mysql:
     - { alias: m, host: h, username: u, database: d }
   postgresql:
     - { alias: p, host: h, username: u, database: d }
+  clickhouse:
+    - { alias: c, host: h, username: u, database: d }
 )";
     auto cfg = parse_ok(connections_node(yaml));
     REQUIRE(cfg.mysql.size() == 1);
     REQUIRE(cfg.postgresql.size() == 1);
-    CHECK(cfg.mysql[0].pool_size == 1);
-    CHECK(cfg.postgresql[0].pool_size == 1);
+    REQUIRE(cfg.clickhouse.size() == 1);
+    CHECK(config::default_pool_size == 4);
+    CHECK(cfg.mysql[0].pool_size == 4);
+    CHECK(cfg.postgresql[0].pool_size == 4);
+    CHECK(cfg.clickhouse[0].pool_size == 4);
 }
 
 TEST_CASE("parse_connections: pool_size is read for mysql and postgresql entries") {
@@ -571,7 +533,7 @@ connections:
     REQUIRE(cfg.connections.mysql.size() == 1);
     REQUIRE(cfg.connections.postgresql.size() == 1);
     CHECK(cfg.connections.mysql[0].pool_size == 3);
-    CHECK(cfg.connections.postgresql[0].pool_size == 1);
+    CHECK(cfg.connections.postgresql[0].pool_size == config::default_pool_size);
     std::filesystem::remove(path);
 }
 
@@ -596,12 +558,12 @@ TEST_CASE("parse_connections: the alias federation is refused in every section a
     }
 }
 
-// `kafka` is the engine database of the Kafka objects: a connection under it
-// would capture kafka.<object>.
-TEST_CASE("parse_connections: the alias kafka is refused in every section and any case") {
+// `main` is the engine's default local database (every session's place is main.public): a
+// connection under it would make main.public.t and main.db.public.t two different things.
+TEST_CASE("parse_connections: the alias main is refused in every section and any case") {
     const std::string backend_fields = ", host: h, username: u, database: d }\n";
     const std::string s3_fields = ", access_key: k, secret_key: s }\n";
-    for (const char* alias : {"kafka", "Kafka", "KAFKA"}) {
+    for (const char* alias : {"main", "Main", "MAIN"}) {
         INFO("alias " << alias);
         for (const char* section : {"mysql", "postgresql", "clickhouse", "s3"}) {
             INFO("section " << section);
@@ -612,18 +574,44 @@ TEST_CASE("parse_connections: the alias kafka is refused in every section and an
             CHECK(err.type == core::error_code_t::invalid_parameter);
             CHECK(mentions(err, std::string("alias='") + alias + "'"));
             CHECK(mentions(err, "reserved"));
-            CHECK(mentions(err, "Kafka"));
+            CHECK(mentions(err, "default local database"));
         }
     }
-    // A name that only contains it is a name of its own.
-    auto cfg = parse_ok(connections_node("connections:\n  mysql:\n    - { alias: kafka2, host: h, username: u, database: d }\n"));
-    REQUIRE(cfg.mysql.size() == 1);
-    CHECK(cfg.mysql[0].alias == "kafka2");
+    config::PgConnectionDesc pg{.alias = "Main", .host = "h", .username = "u", .database = "d"};
+    CHECK(config::validation_error(pg).has_value());
+}
 
-    config::PgConnectionDesc pg{.alias = "Kafka", .host = "h", .username = "u", .database = "d"};
-    auto err = config::validation_error(pg);
-    REQUIRE(err.has_value());
-    CHECK(err->find("reserved") != std::string::npos);
+// `kafka` is a connection alias like any other: the Kafka objects are the schema
+// main.kafka (two or three parts), and a connection's name is the uid slot of a
+// four-part name, so the two never meet.
+TEST_CASE("parse_connections: the alias kafka is an ordinary alias in every section") {
+    const std::string backend_fields = ", host: h, username: u, database: d }\n";
+    const std::string s3_fields = ", access_key: k, secret_key: s }\n";
+    for (const char* alias : {"kafka", "Kafka", "KAFKA"}) {
+        INFO("alias " << alias);
+        for (const char* section : {"mysql", "postgresql", "clickhouse", "s3"}) {
+            INFO("section " << section);
+            const bool s3 = std::string_view{section} == "s3";
+            const std::string fields = s3 ? s3_fields : backend_fields;
+            const std::string yaml =
+                std::string("connections:\n  ") + section + ":\n    - { alias: " + alias + fields;
+            if (!s3 && std::string_view{alias} != "kafka") {
+                // A backend alias is an unquoted identifier: an upper-case letter is refused
+                // as such, not as a reserved name.
+                auto err = parse_error(connections_node(yaml));
+                CHECK(mentions(err, "unquoted"));
+                CHECK_FALSE(mentions(err, "reserved"));
+                continue;
+            }
+            auto cfg = parse_ok(connections_node(yaml));
+            const std::size_t entries =
+                cfg.mysql.size() + cfg.postgresql.size() + cfg.clickhouse.size() + cfg.s3.size();
+            CHECK(entries == 1);
+        }
+    }
+
+    config::PgConnectionDesc pg{.alias = "kafka", .host = "h", .username = "u", .database = "d"};
+    CHECK_FALSE(config::validation_error(pg).has_value());
 }
 
 TEST_CASE("parse_connections: the reserved alias is refused after valid entries before it") {
@@ -792,7 +780,7 @@ service:
 TEST_CASE("load_config: malformed YAML is an error") {
     const std::string yaml = "service: [ {port: }";  // unbalanced flow mapping
     auto err = load_error(write_temp(yaml));
-    CHECK(err.type == core::error_code_t::conversion_failure);
+    CHECK(err.type == core::error_code_t::invalid_text_representation);
     CHECK(mentions(err, "configuration file"));
 }
 
@@ -977,12 +965,12 @@ service:
 
 // ── aliases: one connection per name ──────────────────────────────────────────
 
-// A backend alias is the connection uid a federated name starts with, and the
-// federation resolves it case-insensitively: a second backend under the same
-// alias (in any section, in any case) would leave one of the two unreachable
-// and record its tables under the other's uid. The uid keeps the backend it was
-// registered with because a config that would rebind it never loads.
-TEST_CASE("parse_connections: a backend alias taken twice is refused across sections and case") {
+// A backend alias is the connection uid a federated name starts with: a second
+// backend under the same alias (in any section) would leave one of the two
+// unreachable and record its tables under the other's uid. The uid keeps the
+// backend it was registered with because a config that would rebind it never
+// loads.
+TEST_CASE("parse_connections: a backend alias taken twice is refused across sections") {
     struct case_t {
         const char* first_section;
         const char* first_alias;
@@ -991,8 +979,8 @@ TEST_CASE("parse_connections: a backend alias taken twice is refused across sect
     };
     for (const auto& c : {case_t{"mysql", "shop", "mysql", "shop"},
                           case_t{"mysql", "shop", "postgresql", "shop"},
-                          case_t{"postgresql", "Shop", "clickhouse", "SHOP"},
-                          case_t{"mysql", "shop", "clickhouse", "sHoP"}}) {
+                          case_t{"postgresql", "shop", "clickhouse", "shop"},
+                          case_t{"clickhouse", "shop_2", "clickhouse", "shop_2"}}) {
         INFO(c.first_section << " " << c.first_alias << " / " << c.second_section << " " << c.second_alias);
         const std::string entry = ", host: h, username: u, database: d }\n";
         std::string yaml = "connections:\n";
@@ -1008,6 +996,49 @@ TEST_CASE("parse_connections: a backend alias taken twice is refused across sect
         CHECK(mentions(err, std::string("alias='") + c.second_alias + "'"));
         CHECK(mentions(err, "already taken"));
         CHECK(mentions(err, std::string(c.first_section) + " alias='" + c.first_alias + "'"));
+    }
+}
+
+// The alias is the first part of every federated name, written unquoted in SQL: a
+// backend alias is an unquoted identifier ([a-z_][a-z0-9_]*) and names one connection.
+TEST_CASE("parse_connections: a backend alias is reachable from SQL and names one connection", "[names]") {
+    struct row_t {
+        const char* name;
+        std::string entries;
+        bool accepted;
+    };
+    const std::string my = R"({ host: h, port: "3306", username: u, password: p, database: d, table: "" })";
+    const auto entry = [](const char* alias, const std::string& fields) {
+        return "    - { alias: " + std::string{alias} + ", " + fields.substr(2);
+    };
+    const std::string pg = R"({ host: h, port: "5432", username: u, password: p, database: d, schema: s, table: "" })";
+    const std::string ch = R"({ host: h, port: "9000", username: u, password: p, database: d, table: "" })";
+    const std::vector<row_t> rows{
+        {"distinct lower-case aliases across sections",
+         "  mysql:\n" + entry("shop", my) + "\n  postgresql:\n" + entry("pg_2", pg) + "\n  clickhouse:\n" +
+             entry("ch", ch) + "\n",
+         true},
+        {"same alias in two sections", "  mysql:\n" + entry("shop", my) + "\n  postgresql:\n" + entry("shop", pg) + "\n",
+         false},
+        {"same alias twice in one section", "  clickhouse:\n" + entry("ch", ch) + "\n" + entry("ch", ch) + "\n", false},
+        {"alias with an upper-case letter", "  postgresql:\n" + entry("Shop", pg) + "\n", false},
+        {"alias with a dot", "  postgresql:\n" + entry("pg.main", pg) + "\n", false},
+        {"alias with a dash", "  mysql:\n" + entry("my-shop", my) + "\n", false},
+        {"alias starting with a digit", "  clickhouse:\n" + entry("1ch", ch) + "\n", false},
+        {"alias starting with an underscore", "  mysql:\n" + entry("_shop2", my) + "\n", true},
+    };
+    for (const auto& row : rows) {
+        DYNAMIC_SECTION(row.name) {
+            const std::string yaml = "connections:\n" + row.entries;
+            INFO(yaml);
+            auto parsed = config::parse_connections(connections_node(yaml), resource());
+            if (row.accepted) {
+                REQUIRE_FALSE(parsed.has_error());
+            } else {
+                REQUIRE(parsed.has_error());
+                CHECK(parsed.error().type == core::error_code_t::invalid_parameter);
+            }
+        }
     }
 }
 
@@ -1054,11 +1085,12 @@ connections:
   mysql:
     - { alias: shop, host: h, port: "3306", username: u, password: p, database: d, table: "" }
   postgresql:
-    - { alias: SHOP, host: h, port: "5432", username: u, password: p, database: d, table: "" }
+    - { alias: shop, host: h, port: "5432", username: u, password: p, database: d, table: "" }
 )");
     auto err = load_error(path);
     CHECK(err.type == core::error_code_t::invalid_parameter);
-    CHECK(mentions(err, "alias='SHOP'"));
+    CHECK(mentions(err, "postgresql"));
+    CHECK(mentions(err, "alias='shop'"));
     CHECK(mentions(err, "already taken"));
     std::filesystem::remove(path);
 }

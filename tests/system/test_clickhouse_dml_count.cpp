@@ -3,16 +3,15 @@
 //
 // The ClickHouse native protocol never puts an affected-row count into a block:
 // the only signal is Progress.written_rows, which the connector sums and hands
-// to the manager beside the blocks. What is pinned here is how the manager,
-// as the federation's backend (federation::backend_t::write / scan), turns that
+// to the agent beside the blocks. What is pinned here is how a ClickHouse
+// backend agent (federation::backend_agent_t::write / read) turns that
 // number into the statement's count — an INSERT reports it, a mutation
 // (ALTER TABLE ... UPDATE, a lightweight DELETE) reports 0 whatever the server
 // wrote, and a read is data, never a count — and the same through a session:
 // INSERT / DELETE on a remote ClickHouse table answer those counts.
 
+#include "agent_driver.hpp"
 #include "backends/remote_backends.hpp"
-#include "integration/clickhouse/connection_manager.hpp"
-#include "otterbrix/federation/provider.hpp"
 #include "session_stack.hpp"
 
 #include <actor-zeta.hpp>
@@ -134,35 +133,21 @@ namespace {
         return connections;
     }
 
-    // The remote backends alone (no engine), the ClickHouse connection open
-    // over `factory`.
+    // A ClickHouse agent over `factory`, alone (no engine, no actor).
     struct ch_backends {
-        std::pmr::synchronized_pool_resource arena{std::pmr::new_delete_resource()};
-        // The backends pool the statements run on; outlives the backends.
-        otterstax::runtime::runtime_t runtime{otterstax::test::test_runtime_config()};
-        otterstax::backends::remote_backends_t remote;
+        otterstax::test::agent_driver_t agent;
 
         explicit ch_backends(ch::connector_factory factory)
-            : remote(&arena,
-                     otterstax::backends::remote_backends_options_t{
-                         .connectors = otterstax::backends::connector_factories_t{.clickhouse = factory},
-                         .connector_threads = {2, 2, 2},
-                         .statements = runtime.backends_scheduler()}) {
-            auto opened = remote.open(ch_connection(), config::ConnectionRetryConfig{});
-            INFO(opened.what.c_str());
-            REQUIRE_FALSE(opened.contains_error());
-        }
+            : agent(factory, kUid) {}
 
-        fed::write_result_t write(fed::write_kind_t kind, std::string sql) {
-            return drive_until_ready(remote.clickhouse().write(&arena, fed::write_request_t{kKindUid, std::move(sql), kind}));
+        core::result_wrapper_t<std::uint64_t> write(fed::write_kind_t kind, std::string sql) {
+            return agent.write(std::move(sql), kind);
         }
-
-        static constexpr const char* kKindUid = kUid;
     };
 
 } // namespace
 
-TEST_CASE("ClickhouseManager::write: an INSERT reports the server's written rows as its affected count") {
+TEST_CASE("ClickHouse agent write: an INSERT reports the server's written rows as its affected count") {
     ch_backends backends(&counting_factory<3>);
     auto written = backends.write(fed::write_kind_t::insert, "INSERT INTO `ev`.`orders` (`id`) VALUES (1);");
     INFO((written.has_error() ? written.error().what.c_str() : "ok"));
@@ -170,7 +155,7 @@ TEST_CASE("ClickhouseManager::write: an INSERT reports the server's written rows
     REQUIRE(written.value() == 3);
 }
 
-TEST_CASE("ClickhouseManager::write: an INSERT writing more than one vector window keeps the whole count") {
+TEST_CASE("ClickHouse agent write: an INSERT writing more than one vector window keeps the whole count") {
     constexpr uint64_t rows = DEFAULT_VECTOR_CAPACITY * 2 + 452;
     ch_backends backends(&counting_factory<rows>);
     auto written = backends.write(fed::write_kind_t::insert, "INSERT INTO `ev`.`orders` (`id`) VALUES (1);");
@@ -178,7 +163,7 @@ TEST_CASE("ClickhouseManager::write: an INSERT writing more than one vector wind
     REQUIRE(written.value() == rows);
 }
 
-TEST_CASE("ClickhouseManager::write: a mutation reports 0 rows even when the server writes progress") {
+TEST_CASE("ClickHouse agent write: a mutation reports 0 rows even when the server writes progress") {
     // A mutation rewrites whole parts: whatever written_rows the server ever
     // attributes to it is a part size, not the number of matched rows.
     ch_backends backends(&counting_factory<5>);
@@ -190,18 +175,14 @@ TEST_CASE("ClickhouseManager::write: a mutation reports 0 rows even when the ser
     REQUIRE(updated.value() == 0);
 }
 
-TEST_CASE("ClickhouseManager::scan: a read is data — written rows never become rows") {
+TEST_CASE("ClickHouse agent read: a read is data — written rows never become rows") {
     ch_backends backends(&counting_factory<3>);
-    auto rows = std::make_shared<fed::scan_rows_t>();
-    auto scanned = drive_until_ready(backends.remote.clickhouse().scan(
-        &backends.arena,
-        fed::scan_request_t{kUid, "SELECT `id`, `name` FROM `ev`.`orders`", {}},
-        rows));
-    INFO(scanned.what.c_str());
-    REQUIRE_FALSE(scanned.contains_error());
+    auto scanned = backends.agent.read("SELECT `id`, `name` FROM `ev`.`orders`");
+    INFO((scanned.has_error() ? scanned.error().what.c_str() : "ok"));
+    REQUIRE_FALSE(scanned.has_error());
     // No blocks came back: an empty result set, not three rows.
     std::uint64_t total = 0;
-    for (const auto& chunk : rows->chunks) {
+    for (const auto& chunk : scanned.value()) {
         total += chunk.size();
     }
     REQUIRE(total == 0);
@@ -219,14 +200,14 @@ TEST_CASE("ClickHouse DML through a session: INSERT answers written_rows and DEL
     const auto s = owner.stack();
 
     auto inserted = otterstax::test::run_session_sql_payload(
-        s, 1, std::string{"INSERT INTO "} + kUid + ".ev.orders (id, name) VALUES (1, 'a'), (2, 'b');");
+        s, 1, std::string{"INSERT INTO "} + kUid + ".ev.public.orders (id, name) VALUES (1, 'a'), (2, 'b');");
     INFO((inserted.has_error() ? inserted.error().what.c_str() : "ok"));
     REQUIRE_FALSE(inserted.has_error());
     REQUIRE(inserted.value().column_count() == 0);
     REQUIRE(inserted.value().reported_rows() == 4);
 
     auto deleted =
-        otterstax::test::run_session_sql_payload(s, 2, std::string{"DELETE FROM "} + kUid + ".ev.orders WHERE id = 1;");
+        otterstax::test::run_session_sql_payload(s, 2, std::string{"DELETE FROM "} + kUid + ".ev.public.orders WHERE id = 1;");
     INFO((deleted.has_error() ? deleted.error().what.c_str() : "ok"));
     REQUIRE_FALSE(deleted.has_error());
     REQUIRE(deleted.value().reported_rows() == 0);

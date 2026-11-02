@@ -158,7 +158,7 @@ files as the automated run, plus a `summary.md`.
 ### 4. Run a custom query
 
 ```bash
-echo "SELECT * FROM mysql1.benchdb1.campaigns LIMIT 10" > /tmp/q.sql
+echo "SELECT * FROM mysql1.benchdb1.public.campaigns LIMIT 10" > /tmp/q.sql
 ./benchmark/manual/run_query.sh --frontend mysql /tmp/q.sql
 ```
 
@@ -203,7 +203,7 @@ elapsed_ms : 45.2
 
 Five opt-in workloads that exercise the `CREATE EXTERNAL TABLE` / `COPY ... TO`
 grammar extensions. Each runs both a local-file (`/fixtures` mount) and an s3
-(seeded MinIO) source, so file vs s3 are directly comparable in the sub-test
+(seeded RustFS) source, so file vs s3 are directly comparable in the sub-test
 breakdown. `mysql` and `postgres` frontends only — there is no arrow script for
 them (the Flight SQL DDL path is not covered), so `run_benchmark.sh` skips arrow.
 
@@ -257,12 +257,14 @@ Fixture sizes come from the `external:` block in `bench.yaml` (defaults:
 
 ## Connection aliases
 
-All SQL must qualify table names with the registered alias:
+A remote table is named in four parts, `alias.database.schema.table` (lower case).
+MySQL / ClickHouse have the one schema `public`; a PostgreSQL connection's schema is the
+`schema` of its `config.yaml` entry (`public` here). Three parts always name a local table.
 
 ```sql
-SELECT * FROM mysql1.benchdb1.campaigns LIMIT 5;
+SELECT * FROM mysql1.benchdb1.public.campaigns LIMIT 5;
 SELECT * FROM pg1.benchpg1.public.impressions LIMIT 5;
-SELECT * FROM ch1.benchch1.daily_stats LIMIT 5;
+SELECT * FROM ch1.benchch1.public.daily_stats LIMIT 5;
 ```
 
 | Alias  | Engine     | Database  | Group | Size        |

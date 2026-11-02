@@ -1,17 +1,25 @@
+# The discovery queries the backend agents run (otterstax_federation links it); the registration
+# of what they found builds on the federation.
+add_library(catalog_discovery discovery.hpp discovery.cpp)
+
+target_link_libraries(catalog_discovery PUBLIC
+    otterbrix_local
+    otterbrix::otterbrix
+    Boost::boost
+)
+
+target_include_directories(catalog_discovery PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+)
+
 set(CATALOG_HEADERS
-    discovery.hpp
-    introspection.hpp
     ownership.hpp
-    remote_metadata.hpp
-    remote_rediscovery.hpp
+    registration.hpp
 )
 
 set(CATALOG_SOURCES
-    discovery.cpp
-    introspection.cpp
     ownership.cpp
-    remote_metadata.cpp
-    remote_rediscovery.cpp
+    registration.cpp
 )
 
 add_library(catalog
@@ -20,6 +28,7 @@ add_library(catalog
 )
 
 target_link_libraries(catalog PUBLIC
+    catalog_discovery
     otterstax_federation
     otterbrix_local
     Boost::boost

@@ -11,6 +11,7 @@
 // answers on the simple route and on prepare + execute.
 
 #include "session_stack.hpp"
+#include "../mock/cell.hpp"
 
 #include <catch2/catch_all.hpp>
 
@@ -39,7 +40,7 @@ namespace {
 
     // constagg.items: three rows over two groups; constagg.empty: no rows.
     void seed(const session_stack& s, session_hash_t& id) {
-        run_or_fail(s, id++, "CREATE DATABASE constagg;");
+        run_or_fail(s, id++, "CREATE SCHEMA constagg;");
         run_or_fail(s, id++, "CREATE TABLE constagg.items (id bigint, grp string);");
         run_or_fail(s, id++, "INSERT INTO constagg.items (id, grp) VALUES (1, 'a'), (2, 'a'), (3, 'b');");
         run_or_fail(s, id++, "CREATE TABLE constagg.empty (id bigint);");
@@ -47,7 +48,7 @@ namespace {
 
     // A count or a sum as int64: count answers UBIGINT, sum keeps the column's BIGINT,
     // and a count plus a literal is widened to HUGEINT.
-    int64_t as_int64(const ct::logical_value_t& value) {
+    int64_t as_int64(const otterstax::test::cell_t& value) {
         REQUIRE_FALSE(value.is_null());
         switch (value.type().type()) {
             case ct::logical_type::UBIGINT:
@@ -67,7 +68,7 @@ namespace {
         std::vector<int64_t> values;
         for (const auto& chunk : payload.chunks) {
             for (uint64_t row = 0; row < chunk.size(); ++row) {
-                values.push_back(as_int64(chunk.value(column, row)));
+                values.push_back(as_int64(otterstax::test::cell(chunk, column, row)));
             }
         }
         return values;
@@ -82,18 +83,18 @@ namespace {
 
     using counts_t = std::vector<int64_t>;
 
-    ct::logical_value_t first_value(const session_payload& payload) {
+    otterstax::test::cell_t first_value(const session_payload& payload) {
         for (const auto& chunk : payload.chunks) {
             if (chunk.size() != 0) {
-                return chunk.value(0, 0);
+                return otterstax::test::cell(chunk, 0, 0);
             }
         }
         REQUIRE_FALSE(payload.chunks.empty());
         FAIL("no row");
-        return payload.chunks.front().value(0, 0);
+        return otterstax::test::cell(payload.chunks.front(), 0, 0);
     }
 
-    double as_double(const ct::logical_value_t& value) {
+    double as_double(const otterstax::test::cell_t& value) {
         if (value.is_null()) {
             return -1;
         }
@@ -138,7 +139,7 @@ TEST_CASE("constant aggregates: count of a literal counts every row", "[constant
         REQUIRE(having.value().size() == 1);
         for (const auto& chunk : having.value().chunks) {
             if (chunk.size() != 0) {
-                CHECK(chunk.value(0, 0).value<std::string_view>() == "a");
+                CHECK(otterstax::test::cell(chunk, 0, 0).value<std::string_view>() == "a");
             }
         }
     });

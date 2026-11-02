@@ -29,7 +29,8 @@ namespace mysql {
         // two completion handlers of the deadline-bounded connect (see
         // connectWithTimeout), and a statement runs on it too (runQuery_), so
         // cancel() can emit its signal there.
-        , conn_(asio::make_strand(io_ctx))
+        , strand_(asio::make_strand(io_ctx))
+        , conn_(strand_)
         , params_{std::move(params)}
         , status_{Status::Created}
         , alias_{std::move(alias)} {
@@ -73,7 +74,7 @@ namespace mysql {
             // The signal belongs to the strand: the emission is posted there, after the store above,
             // so a statement either sees `requested` before its next operation or is in one whose
             // slot the emission reaches.
-            asio::post(conn_.get_executor(),
+            asio::post(strand_,
                        [state = cancel_] { state->signal.emit(asio::cancellation_type::terminal); });
         } catch (...) {
             // Posting allocates; without the emission the statement still stops at its next check.
@@ -83,10 +84,21 @@ namespace mysql {
     asio::awaitable<core::error_t> Connector::asyncConnect_(bm::diagnostics& diag) {
         constexpr std::chrono::seconds connect_timeout{10};
         boost::system::error_code ec;
+        if (cancel_->requested.load(std::memory_order_acquire)) {
+            co_return cancelled_error();
+        }
+        // The deadline, and cancel() too: the connect binds the cancel signal's slot like a
+        // statement (cancel_after forwards the slot of the handler it wraps), so a reconnect of a
+        // server that never answers ends at the shutdown, not at its deadline.
         co_await conn_.async_connect(
             params_,
             diag,
-            asio::cancel_after(connect_timeout, asio::redirect_error(asio::use_awaitable, ec)));
+            asio::cancel_after(connect_timeout,
+                               asio::bind_cancellation_slot(cancel_->signal.slot(),
+                                                            asio::redirect_error(asio::use_awaitable, ec))));
+        if (cancel_->requested.load(std::memory_order_acquire)) {
+            co_return cancelled_error();
+        }
         if (ec) {
             co_return connection_error(ec.message());
         }
@@ -95,8 +107,21 @@ namespace mysql {
 
     core::error_t Connector::connectWithTimeout(bm::diagnostics& diag) {
         OTX_ZONE_N("mysql::Connector::connectWithTimeout");
-        return otterstax::spawn_marshaled<otterstax::asio_error_t>(conn_.get_executor(), asyncConnect_(diag), resource_)
-            .get();
+        auto outcome =
+            otterstax::spawn_marshaled<otterstax::asio_error_t>(conn_.get_executor(), asyncConnect_(diag), resource_);
+        // The calling thread runs the connection's io_context until the connect completed: the
+        // backend agent that owns the connector (and its io_context) runs it on its own thread for
+        // every statement, and nobody else does. An io_context other threads run as well (a test's
+        // pool) is driven by them too; run_one_for only bounds this thread's wait for its next handler.
+        // The constructor built conn_ over a strand of an io_context.
+        auto& io = static_cast<asio::io_context&>(asio::query(conn_.get_executor(), asio::execution::context));
+        while (outcome.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+            if (io.stopped()) {
+                io.restart();
+            }
+            io.run_one_for(std::chrono::milliseconds(10));
+        }
+        return outcome.get();
     }
 
     core::error_t Connector::query_error(const boost::system::error_code& ec,
@@ -154,6 +179,9 @@ namespace mysql {
         std::string last_failure;
         boost::mysql::diagnostics diag;
         do {
+            if (cancel_->requested.load(std::memory_order_acquire)) {
+                return cancelled_error();
+            }
             log_->debug("Alias: {} Attempt: {}", alias_, attempts);
             core::error_t err = connectWithTimeout(diag);
             if (!err.contains_error()) {
@@ -168,6 +196,9 @@ namespace mysql {
                         last_failure,
                         diag.server_message());
             ++attempts;
+            if (cancel_->requested.load(std::memory_order_acquire)) {
+                return cancelled_error();
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
         } while (attempts < 3);
         std::string error = "[Connector] Alias: " + alias_ + " connect failed: " + last_failure;
@@ -180,4 +211,8 @@ namespace mysql {
 
     bool Connector::isClosed() const noexcept { return status_ == Status::Closed; }
     std::string Connector::alias() const noexcept { return alias_; }
+    std::unique_ptr<IConnector>
+    make_mysql_connector(std::pmr::memory_resource* resource, asio::io_context& io_ctx, bm::connect_params params, std::string alias) {
+        return std::make_unique<Connector>(resource, io_ctx, std::move(params), std::move(alias));
+    }
 } // namespace mysql

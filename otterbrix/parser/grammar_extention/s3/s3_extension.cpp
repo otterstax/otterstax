@@ -19,7 +19,6 @@
 #include <components/sql/parser/flex_scanner_guard.hpp>
 #include <components/sql/parser/nodes/parsenodes.h>
 #include <components/sql/parser/pg_std_list.h>
-#include <components/types/logical_value.hpp>
 
 namespace {
     // s3's scanner: the shared macro binds the s3yy entry points into the RAII guard type
@@ -163,6 +162,14 @@ namespace s3_ext {
         if (!is_s3_uri(stmt->location)) {
             return NIL;
         }
+        if (stmt->kind == s3_stmt_kind::create_external_table &&
+            stmt->name_parts > otterstax::external::max_name_parts) {
+            // otterbrix's own refusal of a longer name (qualified_name_of)
+            std::pmr::string what{"CREATE EXTERNAL TABLE: the table name has ", resource};
+            what += std::to_string(stmt->name_parts);
+            what += " parts; write it as [connection.][database.][schema.]name";
+            return core::error_t(core::error_code_t::sql_parse_error, std::move(what));
+        }
 
         if (stmt->kind == s3_stmt_kind::copy_to && !inner_sql.empty()) {
             stmt->inner_sql = arena_strdup(resource, inner_sql.c_str(), inner_sql.size());
@@ -187,8 +194,10 @@ namespace s3_ext {
                             : otterstax::external::external_op_t::copy_to;
         return otterstax::external::make_external_node(resource,
                                                        op,
-                                                       str(stmt->db),
-                                                       str(stmt->table),
+                                                       stmt->kind == s3_stmt_kind::create_external_table
+                                                           ? otterstax::external::external_target(stmt->name,
+                                                                                                  stmt->name_parts)
+                                                           : qualified_name_t{},
                                                        str(stmt->location),
                                                        str(stmt->s3_alias),
                                                        str(stmt->format),

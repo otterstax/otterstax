@@ -21,18 +21,20 @@ Use the bundled wrapper for every interaction:
 echo "SELECT 1" | .claude/skills/otterstax-sql/psql.sh    # SQL from stdin
 ```
 
-It calls the host `psql` against the OtterStax PG wire. **The wire ignores
-authentication** — any user/db/password is accepted (it's a federation router,
-not a real PG server), so the defaults below work out of the box against a local
-engine. Override `HOST`/`PORT` only to reach a remote one:
+It calls the host `psql` against the OtterStax PG wire. **The wire does not
+authenticate** — any user/password is accepted. **The database is honoured**: it
+places the session (`search_path = <db>.public`), and a database the engine does
+not have is refused at connect (`FATAL 3D000 database "<db>" does not exist`, hint
+`The default database is "main".`). The defaults below work out of the box against
+a local engine. Override `HOST`/`PORT` only to reach a remote one:
 
 | Var | Default | Notes |
 |---|---|---|
 | `OTTERSTAX_HOST` | `localhost` | |
 | `OTTERSTAX_PORT` | `8817` | |
-| `OTTERSTAX_USER` | `otterstax` | ignored by the wire |
-| `OTTERSTAX_DB` | `otterstax` | ignored by the wire |
-| `OTTERSTAX_PASSWORD` | *(empty)* | ignored by the wire |
+| `OTTERSTAX_USER` | `otterstax` | not checked by the wire |
+| `OTTERSTAX_DB` | `main` | must be a database of the engine (`main` is its default) |
+| `OTTERSTAX_PASSWORD` | *(empty)* | not checked by the wire |
 
 `psql` must be on PATH. On macOS: `brew install libpq` then add
 `/opt/homebrew/opt/libpq/bin` to PATH.
@@ -46,14 +48,18 @@ recovery hint on that exit code.
 A connection alias is the outermost qualifier. Backends are declared under
 `connections:` in the server's `config.yaml` and registered once at startup —
 there is no runtime add/remove API; to change them, edit the file and restart the
-server. Reference their tables as:
+server. Reference their tables in **four parts**:
 
 ```sql
-SELECT * FROM <alias>.<db>.<tbl> JOIN <alias2>.<db>.<tbl2> ON ...
+SELECT * FROM <alias>.<db>.<schema>.<tbl> JOIN <alias2>.<db>.<schema>.<tbl2> ON ...
 ```
 
-A query to an alias the config does not declare fails with
-`No registered connection for uuid: <alias>`.
+`<db>` is the connection's configured `database` (lower case). `<schema>` is
+`public` for a MySQL / ClickHouse connection; for a PostgreSQL connection it is the
+configured `schema:` (or, with none configured, any user schema of the database).
+Example: `mysql.bill.public.orders`, `pg.shop.shop.customers` (config `schema: shop`),
+`ch.ev.public.sessions`. A name whose first part is no configured alias is the
+engine's `... does not exist`.
 
 ## SQL support matrix
 
@@ -69,18 +75,17 @@ otterbrix engine. Some features only survive the engine path.
 
 ### Table identifiers
 
-| Form | Pattern |
+| Form | Means |
 |---|---|
-| 3-part | `<alias>.<db>.<tbl>` |
-| 4-part | `<alias>.<db>.<schema>.<tbl>` — PostgreSQL only, the schema must be the connection's |
+| 4 parts `<alias>.<db>.<schema>.<tbl>` | a remote table of the connection `<alias>` |
+| 3 parts `<db>.<schema>.<tbl>` | a **local** engine table — never a remote one |
+| 2 parts `<schema>.<tbl>` | a local table in the session's database (`main` by default) |
+| 1 part `<tbl>` | a local table found by `search_path` (`main.public` by default) |
 
-`<alias>` = a connection declared under `connections:` in `config.yaml`. The
-parser reads 3-part as federated only when the first part is a configured alias
-(PostgreSQL takes the schema from the connection; MySQL/ClickHouse have none, so a
-4-part name on them is refused), rewrites it to the 4-part shape, then emits
-backend-native qualifiers (`db.tbl` for MySQL/CH, `schema.tbl` for PG). A 3-part
-name without an alias is a local `db.schema.tbl` and refused — local tables have no
-schema. `<alias>.<tbl>` is refused too.
+`<alias>` = a connection declared under `connections:` in `config.yaml` (`main`
+and `federation` are reserved and cannot be aliases). The old 3-part remote form
+`<alias>.<db>.<tbl>` no longer reaches a backend. A table created on the backend
+while the server runs is discovered on the first statement that names it.
 
 ### SELECT / read
 
@@ -125,12 +130,14 @@ schema. `<alias>.<tbl>` is refused too.
 
 | Feature | Syntax | Status |
 |---|---|---|
-| Create database | `CREATE DATABASE <db>` | ✅ |
+| Create database (local) | `CREATE DATABASE <db>` (with its `public` schema; a connection alias, `federation` refused) | ✅ |
+| Create schema (local) | `CREATE SCHEMA [IF NOT EXISTS] <s>` — in the session's database; needed before `CREATE TABLE <s>.<tbl>` / `CREATE EXTERNAL TABLE <s>.<tbl>` | ✅ |
 | Create ENUM type | `CREATE TYPE <name> AS ENUM(...)` | ✅ |
 | Create composite/STRUCT type | `CREATE TYPE <name> AS (<field> <type>, ...)` | ✅ |
 | Create table (scalar + custom types) | `CREATE TABLE <tbl> (<col> <type>, ...)` | ✅ |
+| Create / drop a remote table | `CREATE TABLE <alias>.<db>.<schema>.<tbl> (...)` / `DROP TABLE ...` — runs on the backend | ✅ |
 | Create index | `CREATE INDEX <ix> ON <tbl> (<col>)` | ✅ |
-| Drop index / table / database | `DROP INDEX|TABLE|DATABASE ...` | ✅ |
+| Drop index / table / schema / database | `DROP INDEX|TABLE|SCHEMA|DATABASE ...` | ✅ |
 
 ### DML
 
@@ -141,13 +148,26 @@ schema. `<alias>.<tbl>` is refused too.
 | Insert from select | `INSERT INTO <tbl> (<col>) SELECT ...` | ✅ |
 | Update with expression | `UPDATE <tbl> SET <col> = <expr> WHERE <pred>` | ✅ |
 | Delete | `DELETE FROM <tbl> WHERE <pred>` | ✅ |
+| Update / delete a **remote** table | must run on the backend as **one** statement (a plain `WHERE`, or `FROM` / `USING` a table of the same connection); otherwise — a local or another server's source, a value the dialect cannot write — refused `unimplemented_yet` (`UPDATE of "<t>" cannot run as one statement of connection "<alias>": ...`): there is no row-by-row write | ⚠️ |
+| `RETURNING` on a remote write | PostgreSQL only | ⚠️ |
+
+### Transactions and settings
+
+| Feature | Syntax | Status |
+|---|---|---|
+| Blocks over local tables | `BEGIN` / `COMMIT` / `ROLLBACK` | ✅ |
+| Blocks over PostgreSQL / MySQL backends | the block is one backend transaction; `ROLLBACK` undoes the backend writes too | ✅ |
+| Savepoints | `SAVEPOINT <s>` / `RELEASE SAVEPOINT <s>` / `ROLLBACK TO SAVEPOINT <s>` (inside a block; outside one `25P01`) | ✅ |
+| ClickHouse write inside a block | an INSERT / UPDATE / DELETE of a ClickHouse table between `BEGIN` and `COMMIT` | ❌ refused `unimplemented_yet` (ClickHouse has no transactions; autocommit writes work) |
+| Settings | `SET` / `RESET` of `timezone`, `autocommit`, `search_path` — per session, applied by the engine | ✅ |
+| Any other `SET` | `SET <other> = ...` | ❌ refused `SET <name> is not supported` (inside a block this fails the block) |
 
 ### Rules for generating valid OtterStax SQL
 
 Apply these to turn a `⚠️`/`❌` into a `✅`:
 
-1. **Qualify every table** as `<alias>.<db>.<tbl>` (or 4-part). Bare names don't
-   resolve to a backend.
+1. **Qualify every remote table in four parts**, `<alias>.<db>.<schema>.<tbl>`
+   (`public` for MySQL / ClickHouse). Three parts and fewer are local names.
 2. **Date/time columns come back as text — or not at all.** A backend's
    `date`/`timestamp`/`datetime` column is carried as the text the backend prints:
    compare it with a string literal (`<ts_col> >= '<date>'`, pushed down) and parse
@@ -155,13 +175,11 @@ Apply these to turn a `⚠️`/`❌` into a `✅`:
    PostgreSQL wire type: the statement is refused with
    `column '<col>' has type TIMESTAMP (19), which the PostgreSQL wire cannot encode in text format`
    (the connection stays usable) — leave such a column out of the result set.
-3. **Route engine-only features through the engine.** `CASE`-in-aggregate and
-   struct/composite field access need the otterbrix plan. If the query touches only
-   one remote backend and the pushdown refuses it
-   (`function is not pushed down to the backend: <name>`,
-   `unsupported SELECT list expression`,
-   `a struct-member reference is not generated for a two-table statement`), add a
-   join to a second source or a local table so the engine plans it.
+3. **Reads fall back to the engine by themselves.** A query block over one
+   backend is pushed down whole where the backend's dialect can say it; what it
+   cannot say (`CASE`-in-aggregate, struct field access, a function with no
+   dialect spelling) is run by the engine over a scan of the table — no rewrite
+   needed. Writes do not fall back (DML rows above).
 4. **Prefer `WHERE`-side struct access on remote columns**; for projecting remote
    struct fields, mirror a known-good shape rather than improvising.
 5. **Avoid `CAST` on pushed-down scans** (results can be garbled); project the raw
@@ -203,7 +221,10 @@ shape on a small `LIMIT`/`WHERE` slice before running it broadly.
 |---|---|---|
 | `psql: command not found` | client not installed | `brew install libpq`; add its `bin` to PATH |
 | port 8817 `Connection refused` | no OtterStax server on that host/port | start the server or set `OTTERSTAX_HOST`/`OTTERSTAX_PORT` |
-| `No registered connection for uuid: <alias>` | alias not declared in the server's config | add it under `connections:` in `config.yaml` and restart the server |
+| `FATAL 3D000 database "<db>" does not exist` at connect | the client named a database the engine does not have | connect to `main` (`OTTERSTAX_DB=main`, the default) or a database you created |
+| `... does not exist` for `<alias>.<db>.<tbl>` | three parts name a local table | write the remote table in four parts, `<alias>.<db>.<schema>.<tbl>` |
+| `... does not exist` for a four-part name | alias not declared in the server's config, or a wrong `<db>` / `<schema>` | add the alias under `connections:` in `config.yaml` and restart the server; check the configured `database` / `schema` |
+| `UPDATE of "<t>" cannot run as one statement of connection "<alias>"` | a remote write the backend cannot run whole | rewrite it as one backend statement (no local / other-server source) |
+| `SET <name> is not supported` | the engine has only `timezone`, `autocommit`, `search_path` | drop the `SET` |
 | `column '<col>' has type TIMESTAMP (19), which the PostgreSQL wire cannot encode in text format` | local engine date/time column in the result set | apply Rule 2 |
-| `function is not pushed down to the backend: <name>` / `unsupported SELECT list expression` / `a struct-member reference is not generated for a two-table statement` | construct the single-backend pushdown cannot write as backend SQL | apply Rule 3 (route through the engine) |
 | `server closed the connection unexpectedly` / `psql exit 2` | engine crashed mid-query (SIGSEGV) | see **Engine crashes** — recreate fresh (not plain restart); connections come back from `config.yaml` |

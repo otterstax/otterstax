@@ -6,6 +6,7 @@ set(COMMON_SERVER_HEADERS
     packet_writer_base.hpp
     utils.hpp
     resultset_utils.hpp
+    float_text.hpp
 )
 
 set(COMMON_SERVER_SOURCES
@@ -15,6 +16,7 @@ set(COMMON_SERVER_SOURCES
      frontend_connection.cpp
      utils.cpp
      resultset_utils.cpp
+     float_text.cpp
 )
 
 add_library(common_server

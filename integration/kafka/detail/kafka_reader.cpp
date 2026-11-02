@@ -2,7 +2,6 @@
 // Copyright 2025-2026  OtterStax
 
 #include "kafka_reader.hpp"
-#include "otterbrix/schema/schema_utils.hpp"
 #include "utility/logger.hpp"
 #include "utility/tracy_profiler.hpp"
 
@@ -11,6 +10,7 @@
 #include <components/expressions/key.hpp>
 #include <components/logical_plan/execution_plan.hpp>
 #include <components/logical_plan/node_aggregate.hpp>
+#include <components/logical_plan/node_data.hpp>
 #include <components/logical_plan/node_delete.hpp>
 #include <components/logical_plan/node_insert.hpp>
 #include <components/logical_plan/node_limit.hpp>
@@ -21,7 +21,7 @@
 #include <components/sql/transformer/transform_result.hpp>
 #include <components/sql/transformer/transformer.hpp>
 #include <components/sql/transformer/utils.hpp>
-#include <components/types/logical_value.hpp>
+#include <components/vector/vector_builders.hpp>
 #include <components/types/types.hpp>
 #include <services/dispatcher/dispatcher.hpp>
 
@@ -51,39 +51,39 @@ namespace otterstax::kafka::detail {
             return std::nullopt;
         }
 
-        // One JSON field -> logical_value_t of the column's logical_type, or nullopt
-        // with the reason when the value cannot be stored (the caller drops the
-        // row). A JSON null is a SQL NULL for every type. Non-throwing: every
-        // boost::json accessor is called only after its kind check
-        struct field_value_t {
-            std::optional<types::logical_value_t> value;
-            const char* reject{""};
-        };
-
-        field_value_t json_field_to_value(std::pmr::memory_resource* resource,
-                                          types::logical_type type,
-                                          const boost::json::value& jv) {
+        // One JSON field stored into row `row` of `column` as the column's
+        // logical_type; the reason when the value cannot be stored (the caller
+        // drops the row), nullptr once stored. A JSON null is a SQL NULL for every
+        // type. Non-throwing: every boost::json accessor is called only after its
+        // kind check
+        const char* store_json_field(vector::vector_t& column,
+                                     std::uint64_t row,
+                                     types::logical_type type,
+                                     const boost::json::value& jv) {
             if (jv.is_null()) {
-                return {types::logical_value_t(resource, nullptr), ""};
+                column.set_null(row, true);
+                return nullptr;
             }
             switch (type) {
                 case types::logical_type::INTEGER:
                 case types::logical_type::BIGINT: {
                     if (!jv.is_int64() && !jv.is_uint64()) {
-                        return {std::nullopt, "not an integer"};
+                        return "not an integer";
                     }
                     const auto integral = json_integral(jv);
                     if (!integral) {
-                        return {std::nullopt, "integer out of BIGINT range"};
+                        return "integer out of BIGINT range";
                     }
                     if (type == types::logical_type::BIGINT) {
-                        return {types::logical_value_t(resource, *integral), ""};
+                        column.set_value(row, std::int64_t{*integral});
+                        return nullptr;
                     }
                     if (*integral < std::numeric_limits<std::int32_t>::min() ||
                         *integral > std::numeric_limits<std::int32_t>::max()) {
-                        return {std::nullopt, "integer out of INTEGER range"};
+                        return "integer out of INTEGER range";
                     }
-                    return {types::logical_value_t(resource, static_cast<std::int32_t>(*integral)), ""};
+                    column.set_value(row, static_cast<std::int32_t>(*integral));
+                    return nullptr;
                 }
                 case types::logical_type::UBIGINT: {
                     // The unsigned counterpart of the case above. A stream projecting a
@@ -92,38 +92,42 @@ namespace otterstax::kafka::detail {
                     // back into one. A negative number has no reading as UBIGINT and is
                     // rejected, never wrapped around
                     if (!jv.is_int64() && !jv.is_uint64()) {
-                        return {std::nullopt, "not an integer"};
+                        return "not an integer";
                     }
                     if (jv.is_int64() && jv.get_int64() < 0) {
-                        return {std::nullopt, "negative integer out of UBIGINT range"};
+                        return "negative integer out of UBIGINT range";
                     }
                     const std::uint64_t unsigned_value =
                         jv.is_uint64() ? jv.get_uint64() : static_cast<std::uint64_t>(jv.get_int64());
-                    return {types::logical_value_t(resource, unsigned_value), ""};
+                    column.set_value(row, std::uint64_t{unsigned_value});
+                    return nullptr;
                 }
                 case types::logical_type::DOUBLE: {
                     if (!jv.is_number()) {
-                        return {std::nullopt, "not a number"};
+                        return "not a number";
                     }
                     boost::system::error_code ec;
                     const double d = jv.to_number<double>(ec);
                     if (ec) {
-                        return {std::nullopt, "number not representable as DOUBLE"};
+                        return "number not representable as DOUBLE";
                     }
-                    return {types::logical_value_t(resource, d), ""};
+                    column.set_value(row, double{d});
+                    return nullptr;
                 }
                 case types::logical_type::STRING_LITERAL:
                     if (!jv.is_string()) {
-                        return {std::nullopt, "not a string"};
+                        return "not a string";
                     }
-                    return {types::logical_value_t(resource, std::string(jv.as_string().c_str())), ""};
+                    column.set_value(row, std::string_view{jv.as_string().c_str()});
+                    return nullptr;
                 case types::logical_type::BOOLEAN:
                     if (!jv.is_bool()) {
-                        return {std::nullopt, "not a boolean"};
+                        return "not a boolean";
                     }
-                    return {types::logical_value_t(resource, jv.as_bool()), ""};
+                    column.set_value(row, bool{jv.as_bool()});
+                    return nullptr;
                 default:
-                    return {std::nullopt, "column type has no JSON mapping"};
+                    return "column type has no JSON mapping";
             }
         }
 
@@ -132,7 +136,7 @@ namespace otterstax::kafka::detail {
         // such a batch fails the chunk_matches_columns round-trip instead of
         // dereferencing a null alias extension here.
         //
-        // A column whose type this writer has no encoding for is a conversion_failure
+        // A column whose type this writer has no encoding for is unimplemented_yet
         // naming it, never a JSON null in its place: the reader below ingests a null
         // back as a SQL NULL, so a record written that way round-trips, passes the
         // write-path guard, and reaches every consumer of the topic with the value
@@ -154,29 +158,29 @@ namespace otterstax::kafka::detail {
                         obj[key] = nullptr;
                         continue;
                     }
-                    const auto value = chunk.value(col, row);
+                    const auto& value = chunk.data[col];
                     switch (col_type.type()) {
                         case types::logical_type::INTEGER:
-                            obj[key] = value.value<int32_t>();
+                            obj[key] = value.get_value<int32_t>(row);
                             break;
                         case types::logical_type::BIGINT:
-                            obj[key] = value.value<int64_t>();
+                            obj[key] = value.get_value<int64_t>(row);
                             break;
                         case types::logical_type::UBIGINT:
-                            obj[key] = value.value<std::uint64_t>();
+                            obj[key] = value.get_value<std::uint64_t>(row);
                             break;
                         case types::logical_type::DOUBLE:
-                            obj[key] = value.value<double>();
+                            obj[key] = value.get_value<double>(row);
                             break;
                         case types::logical_type::BOOLEAN:
-                            obj[key] = value.value<bool>();
+                            obj[key] = value.get_value<bool>(row);
                             break;
                         case types::logical_type::STRING_LITERAL:
-                            obj[key] = std::string(value.value<std::string_view>());
+                            obj[key] = std::string(value.get_value<std::string_view>(row));
                             break;
                         default:
                             return core::error_t(
-                                core::error_code_t::conversion_failure,
+                                core::error_code_t::unimplemented_yet,
                                 std::pmr::string{"kafka: column '" + key + "' (logical type " +
                                                      std::to_string(static_cast<int>(col_type.type())) +
                                                      ") has no JSON encoding",
@@ -257,13 +261,11 @@ namespace otterstax::kafka::detail {
                     row_ok = false;
                     break;
                 }
-                auto converted = json_field_to_value(resource, columns[c].type.type(), *field);
-                if (!converted.value) {
-                    reject(index, "column '" + columns[c].name + "': " + converted.reject);
+                if (const char* refused = store_json_field(chunk.data[c], row, columns[c].type.type(), *field)) {
+                    reject(index, "column '" + columns[c].name + "': " + refused);
                     row_ok = false;
                     break;
                 }
-                chunk.set_value(c, row, *converted.value);
             }
             if (row_ok) {
                 ++row;
@@ -300,30 +302,46 @@ namespace otterstax::kafka::detail {
         return true;
     }
 
-    std::vector<kafka_column_t> stream_output_schema(std::pmr::memory_resource* resource,
-                                                     const logical_plan::node_aggregate_t& agg,
-                                                     logical_plan::parameter_node_t* params,
-                                                     const std::vector<kafka_column_t>& source_columns) {
-        OTX_ZONE_N("kafka::stream_output_schema");
-        // Input schema = the source's columns, alias = column name (the form the
-        // schema computation matches projected columns against)
-        std::pmr::vector<types::complex_logical_type> schema_types(resource);
-        schema_types.reserve(source_columns.size());
-        for (const auto& col : source_columns) {
-            types::complex_logical_type t = col.type;
-            t.set_alias(col.name);
-            schema_types.push_back(std::move(t));
+    logical_plan::execution_plan_t stream_batch_plan(std::pmr::memory_resource* resource,
+                                                     vector::data_chunk_t rows,
+                                                     const std::vector<logical_plan::node_ptr>& operators,
+                                                     const logical_plan::parameter_node_ptr& params) {
+        OTX_ZONE_N("kafka::stream_batch_plan");
+        auto agg = logical_plan::make_node_aggregate(resource, qualified_name_t{});
+        agg->append_child(logical_plan::make_node_raw_data(resource, std::move(rows)));
+        for (const auto& op : operators) {
+            agg->append_child(logical_plan::node_ptr(op)); // copy: the caller keeps its operators
         }
-        // Apply the SELECT's projection/rename to the source schema (no data) —
-        // returns a STRUCT whose fields are the output columns (alias = name)
-        const types::complex_logical_type out = schema_utils::aggregate_filter_schema(agg, params, schema_types);
+        return logical_plan::execution_plan_t{resource, agg, params};
+    }
+
+    actor_zeta::unique_future<cursor::cursor_t_ptr>
+    describe_stream(actor_zeta::address_t dispatcher_address,
+                    std::pmr::memory_resource* resource,
+                    const std::vector<kafka_column_t>& source_columns,
+                    const std::vector<logical_plan::node_ptr>& operators,
+                    const logical_plan::parameter_node_ptr& params) {
+        OTX_ZONE_N("kafka::describe_stream");
+        auto plan = stream_batch_plan(resource, json_to_chunk(resource, source_columns, {}), operators, params);
+        plan.explain = logical_plan::explain_type::describe;
+        return kafka_execute(dispatcher_address, resource, std::move(plan));
+    }
+
+    core::result_wrapper_t<std::vector<kafka_column_t>>
+    described_columns(std::pmr::memory_resource* resource, const cursor::cursor_t_ptr& described) {
+        OTX_ZONE_N("kafka::described_columns");
+        if (!described) {
+            return core::error_t(core::error_code_t::internal_error,
+                                 std::pmr::string{"kafka: the engine answered no cursor", resource});
+        }
+        if (described->is_error()) {
+            return core::error_t(described->get_error().type,
+                                 std::pmr::string{described->get_error().what.c_str(), resource});
+        }
         std::vector<kafka_column_t> columns;
-        if (out.type() != types::logical_type::STRUCT) {
-            return columns;
-        }
-        for (const auto& field : out.child_types()) {
-            // Guard alias() — an alias-less field would null-deref (schema_utils note)
-            columns.push_back(kafka_column_t{field.has_alias() ? std::string{field.alias()} : std::string{}, field});
+        columns.reserve(described->type_data().size());
+        for (const auto& type : described->type_data()) {
+            columns.push_back(kafka_column_t{type.has_alias() ? std::string{type.alias()} : std::string{}, type});
         }
         return columns;
     }
@@ -331,8 +349,7 @@ namespace otterstax::kafka::detail {
     actor_zeta::unique_future<cursor::cursor_t_ptr> kafka_insert_session(actor_zeta::address_t dispatcher_address,
                                                                          std::pmr::memory_resource* resource,
                                                                          session::session_id_t session,
-                                                                         const std::string& database,
-                                                                         const std::string& relname,
+                                                                         const qualified_name_t& target,
                                                                          vector::data_chunk_t chunk) {
         OTX_ZONE_N("kafka::kafka_insert_session");
         // No explicit column list → full-row insert in chunk order (the chunk holds
@@ -341,16 +358,9 @@ namespace otterstax::kafka::detail {
         // with the outgoing FK gather). Sent on the caller's `session` so it can
         // share a transaction
         auto insert = logical_plan::make_node_insert(resource, std::move(chunk));
-        logical_plan::execution_plan_t plan{resource,
-                                            sql::transform::name_catalog_target(core::dbname_t{database},
-                                                                                core::relname_t{relname},
-                                                                                insert),
-                                            logical_plan::make_parameter_node(resource)};
-        sql::transform::register_catalog_resolve_table(resource,
-                                                       &plan.catalog_resolves,
-                                                       database,
-                                                       relname,
-                                                       sql::transform::constraint_resolve_kind::outgoing);
+        insert->set_target(target);
+        logical_plan::execution_plan_t plan{resource, insert, logical_plan::make_parameter_node(resource)};
+        sql::transform::register_catalog_resolve_table(resource, &plan.catalog_resolves, target);
         return actor_zeta::otterbrix::send(dispatcher_address,
                                            &services::dispatcher::manager_dispatcher_t::execute_plan,
                                            session,
@@ -360,23 +370,16 @@ namespace otterstax::kafka::detail {
 
     actor_zeta::unique_future<cursor::cursor_t_ptr> kafka_insert(actor_zeta::address_t dispatcher_address,
                                                                  std::pmr::memory_resource* resource,
-                                                                 const std::string& database,
-                                                                 const std::string& relname,
+                                                                 const qualified_name_t& target,
                                                                  vector::data_chunk_t chunk) {
         // Fresh session -> statement-level autocommit (the at-least-once poller path)
-        return kafka_insert_session(dispatcher_address,
-                                    resource,
-                                    session::session_id_t(),
-                                    database,
-                                    relname,
-                                    std::move(chunk));
+        return kafka_insert_session(dispatcher_address, resource, session::session_id_t(), target, std::move(chunk));
     }
 
     actor_zeta::unique_future<cursor::cursor_t_ptr> write_offsets_session(actor_zeta::address_t dispatcher_address,
                                                                           std::pmr::memory_resource* resource,
                                                                           session::session_id_t session,
-                                                                          const std::string& database,
-                                                                          const std::string& offsets_relname,
+                                                                          const qualified_name_t& offsets_table,
                                                                           const std::map<int32_t, int64_t>& offsets) {
         OTX_ZONE_N("kafka::write_offsets_session");
         std::pmr::vector<types::complex_logical_type> types(resource);
@@ -390,42 +393,36 @@ namespace otterstax::kafka::detail {
         vector::data_chunk_t chunk(resource, types, std::max<std::size_t>(offsets.size(), 1));
         std::uint64_t row = 0;
         for (const auto& [partition, offset] : offsets) {
-            chunk.set_value(0, row, types::logical_value_t(resource, partition));
-            chunk.set_value(1, row, types::logical_value_t(resource, offset));
+            chunk.set_value(0, row, std::int32_t{partition});
+            chunk.set_value(1, row, std::int64_t{offset});
             ++row;
         }
         chunk.set_cardinality(row);
-        return kafka_insert_session(dispatcher_address, resource, session, database, offsets_relname, std::move(chunk));
+        return kafka_insert_session(dispatcher_address, resource, session, offsets_table, std::move(chunk));
     }
 
     actor_zeta::unique_future<cursor::cursor_t_ptr> write_offsets(actor_zeta::address_t dispatcher_address,
                                                                   std::pmr::memory_resource* resource,
-                                                                  const std::string& database,
-                                                                  const std::string& offsets_relname,
+                                                                  const qualified_name_t& offsets_table,
                                                                   const std::map<int32_t, int64_t>& offsets) {
         // Fresh session -> statement-level autocommit
-        return write_offsets_session(dispatcher_address,
-                                     resource,
-                                     session::session_id_t(),
-                                     database,
-                                     offsets_relname,
-                                     offsets);
+        return write_offsets_session(dispatcher_address, resource, session::session_id_t(), offsets_table, offsets);
     }
 
     actor_zeta::unique_future<cursor::cursor_t_ptr> kafka_delete_where_eq(actor_zeta::address_t dispatcher_address,
                                                                           std::pmr::memory_resource* resource,
-                                                                          const std::string& database,
-                                                                          const std::string& relname,
+                                                                          const qualified_name_t& target,
                                                                           const std::string& column,
                                                                           const std::string& value) {
         OTX_ZONE_N("kafka::kafka_delete_where_eq");
-        // `DELETE FROM database.relname WHERE column = value` as the plan shape
+        // `DELETE FROM target WHERE column = value` as the plan shape
         // transform_delete emits for a live DELETE: node_delete over node_match(eq
         // predicate), naming its target table (a node_delete without the name has
         // no resolved target). The value is bound as a parameter, never spliced
         // into SQL text
         auto params = logical_plan::make_parameter_node(resource);
-        const auto value_param = params->add_parameter(types::logical_value_t(resource, value));
+        const auto value_param =
+            params->add_parameter(vector::make_scalar(resource, std::string_view{value}), vector::parameter_kind::literal);
         // side_t::left: the predicate column belongs to the (single) target table
         // transform_delete reaches this via key.deduce_side(names); a hand-built key
         // defaults to side_t::undefined, which leaves the column unresolved and the
@@ -433,22 +430,15 @@ namespace otterstax::kafka::detail {
         expressions::key_t column_key(resource, column, expressions::side_t::left);
         auto predicate =
             expressions::make_compare_expression(resource, expressions::compare_type::eq, column_key, value_param);
-        const qualified_name_t target{core::dbname_t{database}, core::relname_t{relname}};
         auto match = logical_plan::make_node_match(resource, target, predicate);
-        // unlimit() keeps the delete-all-matching semantics
+        // all() keeps the delete-all-matching semantics
         auto del = logical_plan::make_node_delete(resource,
                                                   match,
-                                                  logical_plan::make_node_limit(resource, logical_plan::limit_t::unlimit()));
-        logical_plan::execution_plan_t plan{resource,
-                                            sql::transform::name_catalog_target(target.database, target.collection, del),
-                                            std::move(params)};
-        // constraint_resolve_kind::referencing mirrors transform_delete (FK cascade to
-        // children); __sources has no FKs, so the gather finds nothing here
-        sql::transform::register_catalog_resolve_table(resource,
-                                                       &plan.catalog_resolves,
-                                                       database,
-                                                       relname,
-                                                       sql::transform::constraint_resolve_kind::referencing);
+                                                  logical_plan::make_node_limit(resource, logical_plan::limit_t::all()));
+        del->set_target(target);
+        logical_plan::execution_plan_t plan{resource, del, std::move(params)};
+        // The target's lookup, as transform_delete registers a write target
+        sql::transform::register_catalog_resolve_table(resource, &plan.catalog_resolves, target);
         return actor_zeta::otterbrix::send(dispatcher_address,
                                            &services::dispatcher::manager_dispatcher_t::execute_plan,
                                            session::session_id_t(),
@@ -466,8 +456,8 @@ namespace otterstax::kafka::detail {
         // space (a global-row lookup through the cursor is a chunk scan per cell)
         for (const auto& chunk : cursor->chunks()) {
             for (std::uint64_t row = 0; row < chunk.size(); ++row) {
-                const int32_t partition = chunk.value(0, row).value<int32_t>();
-                const int64_t offset = chunk.value(1, row).value<int64_t>();
+                const int32_t partition = chunk.get_value<int32_t>(0, row);
+                const int64_t offset = chunk.get_value<int64_t>(1, row);
                 auto it = result.find(partition);
                 if (it == result.end() || offset > it->second) {
                     result[partition] = offset;
@@ -495,16 +485,12 @@ namespace otterstax::kafka::detail {
         using namespace components::sql::transform;
         components::sql::parser::parser_extension_registry_t registry;
         std::pmr::monotonic_buffer_resource arena(resource);
-        void* parse_result;
-        try {
-            parse_result = linitial(raw_parser(&arena, sql.c_str(), registry));
-        } catch (const std::exception& exception) {
-            return actor_zeta::make_ready_future<cursor::cursor_t_ptr>(
-                resource,
-                cursor::make_cursor(
-                    resource,
-                    core::error_t(core::error_code_t::sql_parse_error, std::pmr::string{exception.what(), resource})));
+        auto parsed = raw_parser(&arena, sql.c_str(), registry);
+        if (parsed.has_error()) {
+            return actor_zeta::make_ready_future<cursor::cursor_t_ptr>(resource,
+                                                                       cursor::make_cursor(resource, parsed.error()));
         }
+        void* parse_result = list_length(parsed.value()) == 0 ? nullptr : linitial(parsed.value());
         if (!parse_result) {
             return actor_zeta::make_ready_future<cursor::cursor_t_ptr>(
                 resource,
@@ -531,12 +517,11 @@ namespace otterstax::kafka::detail {
         using namespace components::sql::transform;
         components::sql::parser::parser_extension_registry_t registry;
         std::pmr::monotonic_buffer_resource arena(resource);
-        void* parse_result = nullptr;
-        try {
-            parse_result = linitial(raw_parser(&arena, sql.c_str(), registry));
-        } catch (const std::exception& exception) {
-            return core::error_t(core::error_code_t::sql_parse_error, std::pmr::string{exception.what(), resource});
+        auto parsed = raw_parser(&arena, sql.c_str(), registry);
+        if (parsed.has_error()) {
+            return parsed.error();
         }
+        void* parse_result = list_length(parsed.value()) == 0 ? nullptr : linitial(parsed.value());
         if (!parse_result) {
             return core::error_t(core::error_code_t::sql_parse_error,
                                  std::pmr::string{"kafka: parser returned null", resource});

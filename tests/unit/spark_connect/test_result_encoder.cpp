@@ -3,7 +3,6 @@
 
 #include "frontend/spark_connect_server/result_encoder.hpp"
 
-#include <components/types/logical_value.hpp>
 #include <components/types/types.hpp>
 #include <components/vector/data_chunk.hpp>
 
@@ -80,9 +79,9 @@ TEST_CASE("result_encoder: simple chunk encodes row count correctly") {
     types.push_back(ct::complex_logical_type{ct::logical_type::INTEGER});
     cv::data_chunk_t chunk(resource, types);
 
-    chunk.set_value(0, 0, ct::logical_value_t{resource, int32_t{10}});
-    chunk.set_value(0, 1, ct::logical_value_t{resource, int32_t{20}});
-    chunk.set_value(0, 2, ct::logical_value_t{resource, int32_t{30}});
+    chunk.set_value(0, 0, int32_t{10});
+    chunk.set_value(0, 1, int32_t{20});
+    chunk.set_value(0, 2, int32_t{30});
     chunk.set_cardinality(3);
 
     ct::complex_logical_type schema{ct::logical_type::NA};
@@ -109,7 +108,7 @@ TEST_CASE("result_encoder: unsigned integer columns are re-tagged as signed for 
     count_col.set_alias("product_count");
     types.push_back(count_col);
     cv::data_chunk_t chunk(resource, types);
-    chunk.set_value(0, 0, ct::logical_value_t{resource, static_cast<uint64_t>(42)});
+    chunk.set_value(0, 0, static_cast<uint64_t>(42));
     chunk.set_cardinality(1);
 
     ct::complex_logical_type schema{ct::logical_type::NA};
@@ -135,7 +134,7 @@ TEST_CASE("result_encoder: unsigned integer columns are re-tagged as signed for 
     CHECK(col_arr->Value(0) == 42);
 }
 
-TEST_CASE("result_encoder: a column type the Arrow batch cannot carry is a conversion_failure") {
+TEST_CASE("result_encoder: a column type the Arrow batch cannot carry is unimplemented_yet") {
     std::pmr::synchronized_pool_resource pool;
     auto* resource = &pool;
 
@@ -152,5 +151,5 @@ TEST_CASE("result_encoder: a column type the Arrow batch cannot carry is a conve
 
     auto result = frontend::spark::encode_arrow_batch(schema, chunk, 0, resource);
     REQUIRE(result.has_error());
-    CHECK(result.error().type == core::error_code_t::conversion_failure);
+    CHECK(result.error().type == core::error_code_t::unimplemented_yet);
 }

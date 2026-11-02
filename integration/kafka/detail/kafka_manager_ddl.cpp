@@ -108,7 +108,7 @@ namespace otterstax::kafka {
         // and reports the first such dependent only. Answers N, or nullopt when the
         // error is not that refusal
         std::optional<std::string> restrict_blocking_oid(const cursor::cursor_t_ptr& c) {
-            if (!c || !c->is_error() || c->get_error().type != core::error_code_t::other_error) {
+            if (!c || !c->is_error() || c->get_error().type != core::error_code_t::dependent_objects_still_exist) {
                 return std::nullopt;
             }
             const std::string what{c->get_error().what.c_str()};
@@ -188,22 +188,26 @@ namespace otterstax::kafka {
         }
     } // namespace
 
-    actor_zeta::unique_future<cursor::cursor_t_ptr> KafkaManager::ensure_sources_table_once() {
+    actor_zeta::unique_future<cursor::cursor_t_ptr> KafkaManager::ensure_storage() {
+        std::vector<logical_plan::execution_plan_t> plans;
         {
             // The loop interleaves its coroutines on one thread: the zone closes
             // before the first co_await (root CLAUDE.md, Tracy).
-            OTX_ZONE_N("KafkaManager::ensure_sources_table_once");
-            if (sources_table_ensured_) {
+            OTX_ZONE_N("KafkaManager::ensure_storage");
+            if (storage_ensured_) {
                 co_return cursor::make_cursor(resource_);
             }
+            plans = storage_plans();
         }
-        auto c = co_await ensure_sources_table(); // IF NOT EXISTS: a restart finds it already there
-        if (!c || c->is_error()) {
-            co_return error_cursor(resource_,
-                                   c ? c->get_error().type : core::error_code_t::other_error,
-                                   "kafka: ensure kafka.__sources failed: " + cursor_error(c));
+        for (auto& plan : plans) {
+            auto c = co_await send_plan(std::move(plan)); // IF NOT EXISTS: a restart finds them there
+            if (!c || c->is_error()) {
+                co_return error_cursor(resource_,
+                                       c ? c->get_error().type : core::error_code_t::internal_error,
+                                       "kafka: ensure federation.kafka.__sources failed: " + cursor_error(c));
+            }
         }
-        sources_table_ensured_ = true;
+        storage_ensured_ = true;
         co_return cursor::make_cursor(resource_);
     }
 
@@ -217,9 +221,9 @@ namespace otterstax::kafka {
                         name,
                         behavior == catalog::drop_behavior_t::cascade_ ? "CASCADE" : "RESTRICT");
         }
-        auto main = co_await drop_table(name, behavior);
+        auto main = co_await drop_table(kafka_table_name(name), behavior);
         if (!main) {
-            co_return error_cursor(resource_, core::error_code_t::other_error, "kafka: drop: null cursor");
+            co_return error_cursor(resource_, core::error_code_t::internal_error, "kafka: drop: null cursor");
         }
         if (main->is_error() && !is_not_found(main)) {
             // Refused (RESTRICT under a dependent) or failed: the source stands, so
@@ -229,11 +233,11 @@ namespace otterstax::kafka {
         // __offsets is internal and nothing user-visible should read it; CASCADE so
         // that a VIEW someone put over it anyway cannot strand a source whose
         // backing table is already gone
-        auto offsets = co_await drop_table(name + "__offsets", catalog::drop_behavior_t::cascade_);
+        auto offsets = co_await drop_table(kafka_offsets_table_name(name), catalog::drop_behavior_t::cascade_);
         if (!offsets || (offsets->is_error() && !is_not_found(offsets))) {
             // The source is gone either way; a leftover offsets table is removed by
             // a later DROP SOURCE IF EXISTS of the name (or fails its next CREATE)
-            log_->error("kafka: drop of kafka.{}__offsets failed: {}", name, cursor_error(offsets));
+            log_->error("kafka: drop of {} failed: {}", kafka_offsets_table_name(name).to_string(), cursor_error(offsets));
         }
         co_return main;
     }
@@ -299,7 +303,7 @@ namespace otterstax::kafka {
             OTX_ZONE_N("KafkaManager::forget_stream_objects");
             for (const auto& object : names) {
                 streams_.erase(object); // stop + join the continuous-query worker
-                registry_.erase(object);
+                forget_object(object);
                 producers_.erase(object);
                 // As a sink: its INSERT INTO queries are in `names` too (cascade_closure)
                 stream_insert_queries_.erase(object);
@@ -349,10 +353,15 @@ namespace otterstax::kafka {
         if (relname_col.has_error() || namespace_col.has_error() || kind_col.has_error()) {
             co_return fallback();
         }
-        const std::string relname{relation->value(relname_col.value(), 0).value<std::string_view>()};
-        // Copied out at once: value() answers a temporary the view would outlive
-        const std::string kind{relation->value(kind_col.value(), 0).value<std::string_view>()};
-        const auto namespace_oid = relation->value(namespace_col.value(), 0).value<std::uint32_t>();
+        const auto relname_cell = relation->get<std::string_view>(relname_col.value(), 0);
+        const auto kind_cell = relation->get<std::string_view>(kind_col.value(), 0);
+        const auto namespace_cell = relation->get<std::uint32_t>(namespace_col.value(), 0);
+        if (relname_cell.has_error() || kind_cell.has_error() || namespace_cell.has_error()) {
+            co_return fallback();
+        }
+        const std::string relname{relname_cell.value()};
+        const std::string kind{kind_cell.value()};
+        const auto namespace_oid = namespace_cell.value();
         auto nsp = co_await kafka_query(dispatcher_address_,
                                         resource_,
                                         "SELECT nspname FROM pg_catalog.pg_namespace WHERE oid = " +
@@ -360,7 +369,9 @@ namespace otterstax::kafka {
         std::string qualified = relname;
         if (nsp && !nsp->is_error() && nsp->size() > 0) {
             if (const auto nspname_col = nsp->column_index("nspname"); !nspname_col.has_error()) {
-                qualified = std::string{nsp->value(nspname_col.value(), 0).value<std::string_view>()} + "." + relname;
+                if (const auto nspname = nsp->get<std::string_view>(nspname_col.value(), 0); !nspname.has_error()) {
+                    qualified = std::string{nspname.value()} + "." + relname;
+                }
             }
         }
         co_return error_cursor(resource_,
@@ -409,35 +420,29 @@ namespace otterstax::kafka {
 
         // A SOURCE is a user-visible materialized table: the poller ingests its topic
         // into it, and INSERT produces to the topic
-        if (!database_ensured_) {
-            if (auto db = co_await ensure_database(); !db || db->is_error()) {
-                co_return error_cursor(resource_,
-                                       core::error_code_t::schema_error,
-                                       "kafka: ensure database failed: " + cursor_error(db));
-            }
-            database_ensured_ = true;
+        // The schemas and the metadata table come first: a source that cannot be
+        // persisted would silently vanish on restart, so it is not created at all
+        if (auto s = co_await ensure_storage(); !s || s->is_error()) {
+            co_return s ? s : error_cursor(resource_, core::error_code_t::internal_error, "kafka: null cursor");
         }
-        // The metadata table comes first: a source that cannot be persisted would
-        // silently vanish on restart, so it is not created at all
-        if (auto s = co_await ensure_sources_table_once(); !s || s->is_error()) {
-            co_return s ? s : error_cursor(resource_, core::error_code_t::other_error, "kafka: null cursor");
-        }
-        if (auto c = co_await create_table(node->name(), declared_columns(node), /*if_not_exists*/ false);
+        if (auto c = co_await create_table(kafka_table_name(node->name()), declared_columns(node), /*if_not_exists*/ false);
             !c || c->is_error()) {
             co_return error_cursor(resource_,
-                                   core::error_code_t::schema_error,
+                                   c ? c->get_error().type : core::error_code_t::internal_error,
                                    "kafka: create '" + node->name() + "' failed: " + cursor_error(c));
         }
         // A SOURCE consumes -> persist per-partition offsets. From here on a failure
         // rolls the created tables back so nothing half-created survives
         auto rollback = [&] { return drop_source_tables(node->name(), catalog::drop_behavior_t::cascade_); };
-        if (auto c = co_await create_table(node->name() + "__offsets", offsets_columns(), /*if_not_exists*/ false);
+        if (auto c =
+                co_await create_table(kafka_offsets_table_name(node->name()), offsets_columns(), /*if_not_exists*/ false);
             !c || c->is_error()) {
+            const auto code = c ? c->get_error().type : core::error_code_t::internal_error;
             const std::string why = "kafka: create offsets for '" + node->name() + "' failed: " + cursor_error(c);
             if (auto d = co_await rollback(); !d || d->is_error()) {
                 log_->error("kafka: rollback of '{}' after a failed create: {}", node->name(), cursor_error(d));
             }
-            co_return error_cursor(resource_, core::error_code_t::schema_error, why);
+            co_return error_cursor(resource_, code, why);
         }
         // Persist options so a restart relaunches the poller (columns re-read from the
         // catalog, not stored)
@@ -454,11 +459,11 @@ namespace otterstax::kafka {
             if (auto d = co_await rollback(); !d || d->is_error()) {
                 log_->error("kafka: rollback of '{}' after a failed persist: {}", node->name(), cursor_error(d));
             }
-            co_return error_cursor(resource_, p ? p->get_error().type : core::error_code_t::other_error, why);
+            co_return error_cursor(resource_, p ? p->get_error().type : core::error_code_t::internal_error, why);
         }
 
-        registry_[node->name()] =
-            kafka_object_t{node->op(), node->columns(), node->options(), std::string{}, std::string{}};
+        register_object(node->name(),
+                        kafka_object_t{node->op(), node->columns(), node->options(), std::string{}, std::string{}});
         log_->info("kafka: registered source '{}'", node->name());
         launch_source_poller(node->name(), transactional);
         co_return cursor::make_cursor(resource_);
@@ -470,6 +475,10 @@ namespace otterstax::kafka {
         bool transactional = false;
         std::string source;
         std::vector<kafka_column_t> stream_columns;
+        std::optional<actor_zeta::unique_future<cursor::cursor_t_ptr>> described;
+        auto invalid = [this](const std::string& why) {
+            return error_cursor(resource_, core::error_code_t::invalid_parameter, "kafka: stream SELECT invalid: " + why);
+        };
         {
             // The loop interleaves its coroutines on one thread: the zone closes
             // before the first co_await (root CLAUDE.md, Tracy).
@@ -483,29 +492,36 @@ namespace otterstax::kafka {
             }
             transactional = txn.value();
 
-            // STREAM is a continuous query (no user table); its schema is the SELECT's
-            // output columns. Any parse/schema failure becomes a DDL error
-            auto invalid = [&](const std::string& why) {
-                return error_cursor(resource_,
-                                    core::error_code_t::invalid_parameter,
-                                    "kafka: stream SELECT invalid: " + why);
-            };
+            // STREAM is a continuous query (no user table); its schema is the
+            // engine's describe of the SELECT the worker runs over each batch. Any
+            // parse/schema failure becomes a DDL error
             auto plan = kafka_parse_plan(resource_, node->as_select());
             if (plan.has_error()) {
                 co_return invalid(plan.error().what.c_str());
             }
-            const auto* agg =
-                plan.value().sub_queries.empty() ? nullptr : kafka_find_aggregate(plan.value().sub_queries.back());
-            if (!agg) {
+            auto stream_src = plan.value().sub_queries.empty()
+                                  ? std::nullopt
+                                  : kafka_stream_source(resource_, plan.value().sub_queries.back());
+            if (!stream_src) {
                 co_return invalid("SELECT has no aggregate/source table");
             }
-            source = agg->target().collection.t;
+            source = stream_src->source_relname;
             const auto src_it = registry_.find(source);
             if (src_it == registry_.end()) {
                 co_return invalid("unknown source '" + source + "'");
             }
-            stream_columns =
-                stream_output_schema(resource_, *agg, plan.value().parameters.get(), src_it->second.columns);
+            described.emplace(describe_stream(dispatcher_address_,
+                                              resource_,
+                                              src_it->second.columns,
+                                              stream_src->operators,
+                                              plan.value().parameters));
+        }
+        {
+            auto columns = described_columns(resource_, co_await std::move(*described));
+            if (columns.has_error()) {
+                co_return invalid(columns.error().what.c_str());
+            }
+            stream_columns = std::move(columns.value());
             if (const auto unnamed = unnamed_column(stream_columns)) {
                 co_return invalid("output column " + std::to_string(*unnamed + 1) +
                                   " has no name; alias it so the produced JSON can be keyed");
@@ -514,8 +530,8 @@ namespace otterstax::kafka {
 
         // Persist so a restart relaunches it (source re-derived from as_select); a
         // stream that cannot be persisted is not created
-        if (auto s = co_await ensure_sources_table_once(); !s || s->is_error()) {
-            co_return s ? s : error_cursor(resource_, core::error_code_t::other_error, "kafka: null cursor");
+        if (auto s = co_await ensure_storage(); !s || s->is_error()) {
+            co_return s ? s : error_cursor(resource_, core::error_code_t::internal_error, "kafka: null cursor");
         }
         if (auto p = co_await persist_source_meta(node->name(),
                                                   "stream",
@@ -527,13 +543,13 @@ namespace otterstax::kafka {
                                                   node->as_select());
             !p || p->is_error()) {
             co_return error_cursor(resource_,
-                                   p ? p->get_error().type : core::error_code_t::other_error,
+                                   p ? p->get_error().type : core::error_code_t::internal_error,
                                    "kafka: persist metadata for stream '" + node->name() +
                                        "' failed: " + cursor_error(p));
         }
 
-        registry_[node->name()] =
-            kafka_object_t{node->op(), stream_columns, node->options(), node->as_select(), source};
+        register_object(node->name(),
+                        kafka_object_t{node->op(), stream_columns, node->options(), node->as_select(), source});
         log_->info("kafka: registered stream '{}' ({} output columns)", node->name(), stream_columns.size());
         launch_stream(node->name());
         co_return cursor::make_cursor(resource_);
@@ -558,7 +574,7 @@ namespace otterstax::kafka {
             if (!cascade) {
                 if (const auto readers = blocking_readers(name); !readers.empty()) {
                     co_return error_cursor(resource_,
-                                           core::error_code_t::other_error,
+                                           core::error_code_t::dependent_objects_still_exist,
                                            "kafka: cannot drop source '" + name + "': " + describe_readers(readers) +
                                                "; use DROP SOURCE " + name + " CASCADE");
                 }
@@ -601,7 +617,7 @@ namespace otterstax::kafka {
         if (auto readers = cascade_closure(name); !readers.empty()) {
             co_await forget_stream_objects(std::move(readers));
         }
-        registry_.erase(name);
+        forget_object(name);
         producers_.erase(name);
         // A concurrent DROP of the same source that was refused may have
         // relaunched the poller while this one awaited the engine
@@ -627,7 +643,7 @@ namespace otterstax::kafka {
                     co_return cursor::make_cursor(resource_);
                 }
                 co_return error_cursor(resource_,
-                                       core::error_code_t::do_not_exists,
+                                       core::error_code_t::undefined_object,
                                        "kafka: stream '" + name + "' does not exist");
             }
             if (it->second.op != kafka_op::create_stream) {
@@ -641,7 +657,7 @@ namespace otterstax::kafka {
             if (!node->cascade()) {
                 if (const auto readers = blocking_readers(name); !readers.empty()) {
                     co_return error_cursor(resource_,
-                                           core::error_code_t::other_error,
+                                           core::error_code_t::dependent_objects_still_exist,
                                            "kafka: cannot drop stream '" + name + "': " + describe_readers(readers) +
                                                "; use DROP STREAM " + name + " CASCADE");
                 }

@@ -8,6 +8,8 @@
 #include "utility/tracy_memory_resource.hpp"
 #include "utility/tracy_profiler.hpp"
 
+#include <components/vector/vector_builders.hpp>
+
 using namespace components;
 
 namespace {
@@ -74,7 +76,6 @@ namespace frontend::mysql {
 
         std::string requested_database;
         if ((client_flags & CLIENT_CONNECT_WITH_DB) && reader.remaining() > 0) {
-            // todo: support
             requested_database = reader.read_string_null();
             log_->info("[Connection {}] AUTH: database='{}'", connection_id_, requested_database);
         }
@@ -90,11 +91,24 @@ namespace frontend::mysql {
             send_malformed_packet_error("Malformed HandshakeResponse packet");
             return;
         }
+        // The client's character set is the protocol's: one the wire does not
+        // carry refuses the login, as SET NAMES refuses it.
+        if (auto refusal = handshake_charset_refusal(charset)) {
+            send_error(refusal->code, std::move(refusal->message));
+            finish();
+            return;
+        }
 
         // skip auth
         state_ = connection_state::COMMAND;
         log_->info("[Connection {}] AUTH: Success -> COMMAND state", connection_id_);
-        send_packet(build_ok(writer_, sequence_id_, 0, status_flags()));
+        // The database the client connects to is the session's place; one the
+        // engine refuses ends the connection, as MySQL refuses the login.
+        if (!requested_database.empty() && !answer_use(requested_database, true)) {
+            finish();
+        } else if (requested_database.empty()) {
+            send_packet(build_ok(writer_, sequence_id_, 0, status_flags()));
+        }
     }
 
     void mysql_connection::handle_command(std::vector<uint8_t> payload) {
@@ -116,7 +130,6 @@ namespace frontend::mysql {
                 break;
             }
             case COM_INIT_DB: {
-                // todo: support
                 if (payload.size() < 2) {
                     send_error(mysql_error::ER_MALFORMED_PACKET, "Malformed COM_INIT_DB packet");
                     break;
@@ -124,8 +137,8 @@ namespace frontend::mysql {
 
                 std::string db_name(std::make_move_iterator(payload.begin() + 1),
                                     std::make_move_iterator(payload.end()));
-                log_->info("[Connection {}] COM_INIT_DB: '{}'", connection_id_, std::move(db_name));
-                send_packet(build_ok(writer_, sequence_id_, 0, status_flags()));
+                log_->info("[Connection {}] COM_INIT_DB: '{}'", connection_id_, db_name);
+                [[maybe_unused]] const bool used = answer_use(db_name, true);
                 break;
             }
             case COM_STMT_PREPARE: // fall-through
@@ -174,7 +187,7 @@ namespace frontend::mysql {
                            num_params);
 
                 if (num_params == 0) {
-                    handle_execute_stmt(it_stmt->second, std::pmr::vector<types::logical_value_t>{resource_});
+                    handle_execute_stmt(it_stmt->second, std::pmr::vector<components::vector::vector_t>{resource_});
                     break;
                 }
 
@@ -196,9 +209,8 @@ namespace frontend::mysql {
                     break;
                 }
                 if (auto it = statement_id_map_.find(stmt_id); it != statement_id_map_.end()) {
-                    // The session keeps an unexecuted statement until it is
-                    // closed; an executed one it has already dropped (consumed).
-                    if (!it->second.consumed && !it->second.protocol) {
+                    // The session keeps the statement until it is closed.
+                    if (!it->second.protocol) {
                         close_stmt_in_session(it->second.stmt_session, "COM_STMT_CLOSE");
                     }
                     statement_id_map_.erase(it);
@@ -220,9 +232,12 @@ namespace frontend::mysql {
         // Never SERVER_STATUS_NO_BACKSLASH_ESCAPES: drivers then escape a string
         // value with a backslash, which is what the frontend reads
         // (protocol/lexer.hpp), as @@sql_mode says.
-        auto flags = static_cast<server_status_flags_t>(server_status::SERVER_STATUS_AUTOCOMMIT);
+        server_status_flags_t flags = 0;
+        if (autocommit_) {
+            flags |= static_cast<server_status_flags_t>(server_status::SERVER_STATUS_AUTOCOMMIT);
+        }
         if (session_ != nullptr &&
-            session_->transaction_state() != otterstax::session::transaction_state_t::idle) {
+            session_->transaction_status() != otterstax::session::query_session_t::transaction_status_t::idle) {
             flags |= static_cast<server_status_flags_t>(server_status::SERVER_STATUS_IN_TRANS);
         }
         return flags;
@@ -234,48 +249,123 @@ namespace frontend::mysql {
         if (!statement) {
             return false;
         }
-        if (std::holds_alternative<set_variables_t>(*statement)) {
-            answer_setting();
+        if (const auto* set = std::get_if<set_variables_t>(&*statement)) {
+            answer_setting(*set);
+            return true;
+        }
+        if (const auto* use = std::get_if<use_database_t>(&*statement)) {
+            [[maybe_unused]] const bool used = answer_use(use->database, true);
             return true;
         }
         auto answer = answer_protocol_statement(resource_, *statement, protocol_context());
         if (auto* refusal = std::get_if<protocol_refusal_t>(&answer)) {
             send_error(refusal->code, std::move(refusal->message));
-        } else if (auto* rows = std::get_if<vector::data_chunk_t>(&answer)) {
+        } else {
+            auto& rows = std::get<vector::data_chunk_t>(answer);
             mysql_resultset result(writer_, result_encoding::TEXT);
-            result.add_chunk_columns(*rows);
-            for (size_t i = 0; i < rows->size(); ++i) {
-                result.add_row(*rows, i);
+            result.add_chunk_columns(rows);
+            for (size_t i = 0; i < rows.size(); ++i) {
+                result.add_row(rows, i);
             }
             send_resultset(std::move(result));
+        }
+        return true;
+    }
+
+    bool mysql_connection::await_own_statement(
+        actor_zeta::unique_future<otterstax::session::query_session_t::session_result> future,
+        bool names_database) {
+        OTX_ZONE_N("mysql::await_own_statement");
+        auto r = otterstax::await_future_blocking<session_payload>(std::move(future), resource_);
+        if (!r.has_error()) {
+            return true;
+        }
+        if (answer_await_failure(r)) {
+            return false;
+        }
+        const auto code = r.error().type;
+        // A place that does not exist is MySQL's ER_BAD_DB_ERROR; any other
+        // refusal (a failed block, a malformed place) is the statement's.
+        if (names_database &&
+            (code == core::error_code_t::database_not_exists || code == core::error_code_t::schema_not_exists)) {
+            send_error(mysql_error::ER_BAD_DB_ERROR, std::string{r.error().what.c_str()});
         } else {
+            send_statement_error(code, std::string{r.error().what.c_str()});
+        }
+        return false;
+    }
+
+    void mysql_connection::answer_setting(const set_variables_t& set) {
+        OTX_ZONE_N("mysql::answer_setting");
+        // A value the engine's SET cannot take is refused before any
+        // assignment runs; like an engine refusal it fails an open block.
+        if (set.refusal) {
+            fail_open_block(set.refusal->message);
+            send_error(set.refusal->code, set.refusal->message);
+            return;
+        }
+        if (!set.settings.empty()) {
+            // MySQL applies a SET whole or not at all: every assignment goes to
+            // the engine in one statement.
+            auto plan = engine_setting_plan(resource_, set.settings);
+            if (plan.has_error()) {
+                // The engine's parser refused an assignment, nothing was
+                // sent: refused as the session refuses a text that does not
+                // parse, an open block failed behind it.
+                std::string message{plan.error().what.c_str()};
+                fail_open_block(message);
+                send_statement_error(plan.error().type, std::move(message));
+                return;
+            }
+            // a query session schedules itself: needs_sched is always false
+            [[maybe_unused]] auto [needs_sched, fut] =
+                actor_zeta::send(session_->address(),
+                                 &otterstax::session::query_session_t::execute_plan,
+                                 session_->next_statement(),
+                                 std::move(plan.value()),
+                                 otterstax::session::query_session_t::rebuild_fn{});
+            if (!await_own_statement(std::move(fut), false)) {
+                return;
+            }
+            // Every assignment was applied: what the engine now holds.
+            for (const auto& setting : set.settings) {
+                if (setting.name == "autocommit") {
+                    autocommit_ = !setting.value || *setting.value != "off";
+                } else if (setting.name == "timezone") {
+                    time_zone_ = setting.value.value_or("SYSTEM");
+                }
+            }
+        }
+        send_packet(build_ok(writer_, sequence_id_, 0, status_flags()));
+    }
+
+    bool mysql_connection::answer_use(const std::string& database, bool answer_ok) {
+        OTX_ZONE_N("mysql::answer_use");
+        // a query session schedules itself: needs_sched is always false
+        [[maybe_unused]] auto [needs_sched, fut] = actor_zeta::send(session_->address(),
+                                                                    &otterstax::session::query_session_t::execute,
+                                                                    session_->next_statement(),
+                                                                    engine_search_path_statement(database));
+        if (!await_own_statement(std::move(fut), true)) {
+            return false;
+        }
+        database_ = database;
+        if (answer_ok) {
             send_packet(build_ok(writer_, sequence_id_, 0, status_flags()));
         }
         return true;
     }
 
-    void mysql_connection::answer_setting() {
-        OTX_ZONE_N("mysql::answer_setting");
-        // a query session schedules itself: needs_sched is always false
-        [[maybe_unused]] auto [needs_sched, fut] =
-            actor_zeta::send(session_->address(), &otterstax::session::query_session_t::execute_setting);
-        auto r = otterstax::await_future_blocking<session_payload>(std::move(fut), resource_);
-        if (r.has_error()) {
-            if (!answer_await_failure(r)) {
-                send_statement_error(r.error().type, std::string{r.error().what.c_str()});
-            }
-            return;
-        }
-        send_packet(build_ok(writer_, sequence_id_, 0, status_flags()));
-    }
-
     protocol_context_t mysql_connection::protocol_context() const {
         boost::system::error_code ec;
         const auto peer = socket_.remote_endpoint(ec);
-        return protocol_context_t{std::chrono::duration_cast<std::chrono::seconds>(read_timeout_),
-                                  connection_id_,
-                                  user_,
-                                  ec ? std::string{"localhost"} : peer.address().to_string()};
+        return protocol_context_t{.wait_timeout = std::chrono::duration_cast<std::chrono::seconds>(read_timeout_),
+                                  .connection_id = connection_id_,
+                                  .user = user_,
+                                  .host = ec ? std::string{"localhost"} : peer.address().to_string(),
+                                  .autocommit = autocommit_,
+                                  .time_zone = time_zone_,
+                                  .database = database_};
     }
 
     void mysql_connection::refuse_text(text_refusal_t refusal) {
@@ -287,10 +377,10 @@ namespace frontend::mysql {
 
     void mysql_connection::handle_query(std::string query) {
         OTX_ZONE_N("mysql::handle_query");
-        // Protocol statements first: they never reach the engine, so their text
-        // is never written in its form (SET NAMES utf8mb4 COLLATE
-        // utf8mb4_0900_ai_ci is answered, where a COLLATE the engine cannot
-        // keep is refused in a statement it runs).
+        // Protocol statements first: their text is never written in the
+        // engine's form (a SET / USE reaches the engine as its own SET, so SET
+        // NAMES utf8mb4 COLLATE utf8mb4_0900_ai_ci is never refused for its
+        // collation, which the engine's SET does not carry).
         if (serve_protocol_statement(query)) {
             return;
         }
@@ -314,7 +404,7 @@ namespace frontend::mysql {
         auto r = otterstax::await_future_blocking<session_payload>(std::move(fut), resource_);
 
         if (r.has_error()) {
-            if (!answer_await_failure(r) && !answer_failed_commit(r.error())) {
+            if (!answer_await_failure(r)) {
                 send_statement_error(r.error().type, std::string{r.error().what.c_str()});
             }
             return;
@@ -347,14 +437,6 @@ namespace frontend::mysql {
         send_resultset(std::move(result));
     }
 
-    bool mysql_connection::answer_failed_commit(const core::error_t& error) {
-        if (!session_->ended_failed_block(error)) {
-            return false;
-        }
-        send_packet(build_ok(writer_, sequence_id_, 0, status_flags()));
-        return true;
-    }
-
     bool mysql_connection::answer_await_failure(const otterstax::awaited_t<session_payload>& r) {
         switch (r.status()) {
             case otterstax::await_status_t::answered:
@@ -381,19 +463,20 @@ namespace frontend::mysql {
     void mysql_connection::fail_open_block(std::string reason) {
         // The failure is queued after the statement and ahead of the client's
         // next one (not awaited — it runs once the statement ended).
-        if (session_->transaction_state() == otterstax::session::transaction_state_t::in_block) {
+        if (session_->transaction_status() ==
+            otterstax::session::query_session_t::transaction_status_t::in_transaction) {
             [[maybe_unused]] auto [needs_sched, fut] =
                 actor_zeta::send(session_->address(),
                                  &otterstax::session::query_session_t::fail_transaction,
-                                 core::error_code_t::other_error,
+                                 core::error_code_t::protocol_violation,
                                  std::move(reason));
         }
     }
 
     void mysql_connection::send_statement_error(core::error_code_t code, std::string error) {
-        // A statement the engine does not support (SAVEPOINT / RELEASE /
-        // ROLLBACK TO among them: it has no savepoints) is ER_NOT_SUPPORTED_YET,
-        // by COM_QUERY and COM_STMT_PREPARE alike.
+        // A statement the engine does not support is ER_NOT_SUPPORTED_YET, by
+        // COM_QUERY and COM_STMT_PREPARE alike; every other code is
+        // ER_SYNTAX_ERROR until the engine maps its codes (OTB-sqlstate).
         send_error(code == core::error_code_t::unimplemented_yet ? mysql_error::ER_NOT_SUPPORTED_YET
                                                                  : mysql_error::ER_SYNTAX_ERROR,
                    std::move(error));
@@ -443,12 +526,15 @@ namespace frontend::mysql {
 
         // The client binds one value per `?` it wrote; the engine must take
         // exactly as many, or the values would land on other parameters.
+        // A prepare the frontend refuses fails an open block, as the engine's
+        // own refusal of a prepare does (and as COM_QUERY's refusals do).
         if (result.parameter_count != rewritten.placeholders) {
             close_stmt_in_session(id, "COM_STMT_PREPARE refused");
-            send_error(mysql_error::ER_NOT_SUPPORTED_YET,
-                       "the statement has " + std::to_string(rewritten.placeholders) +
-                           " '?' placeholder(s), and the engine takes " + std::to_string(result.parameter_count) +
-                           " parameter(s)");
+            std::string message = "the statement has " + std::to_string(rewritten.placeholders) +
+                                  " '?' placeholder(s), and the engine takes " +
+                                  std::to_string(result.parameter_count) + " parameter(s)";
+            fail_open_block(message);
+            send_error(mysql_error::ER_NOT_SUPPORTED_YET, std::move(message));
             return;
         }
 
@@ -461,8 +547,9 @@ namespace frontend::mysql {
             if (auto bad = find_unsupported_column<frontend_type::MYSQL>(result.schema.child_types(),
                                                                         {result_encoding::BINARY})) {
                 close_stmt_in_session(id, "COM_STMT_PREPARE refused");
-                send_error(mysql_error::ER_NOT_SUPPORTED_YET,
-                           unsupported_column_message<frontend_type::MYSQL>(*bad));
+                auto message = unsupported_column_message<frontend_type::MYSQL>(*bad);
+                fail_open_block(message);
+                send_error(mysql_error::ER_NOT_SUPPORTED_YET, std::move(message));
                 return;
             }
         }
@@ -475,10 +562,9 @@ namespace frontend::mysql {
                    result.parameter_count);
         packets.push_back(
             build_stmt_prepare_ok(writer_, sequence_id_++, next_statement_id_, column_cnt, result.parameter_count));
-        // The text the session accepted (`?` already written as `$n`) is the
-        // text a re-prepare uses.
-        statement_id_map_.emplace(next_statement_id_++,
-                                  prepared_stmt_meta(resource_, id, std::move(rewritten.sql), result.parameter_count));
+        // The session keeps the statement (`?` already written as `$n`) for
+        // every COM_STMT_EXECUTE until COM_STMT_CLOSE.
+        statement_id_map_.emplace(next_statement_id_++, prepared_stmt_meta(resource_, id, result.parameter_count));
 
         // params
         if (result.parameter_count) {
@@ -498,8 +584,9 @@ namespace frontend::mysql {
                 // schema, and alias() has no null guard for such a type; it goes
                 // out with the empty name an executed result gives it.
                 column_definition_41 col(column.has_alias() ? column.alias() : std::string{}, *wire_type);
-                // A DECIMAL column announces its own scale and display length.
-                apply_decimal_metadata(col, column);
+                // The flags of its type; a DECIMAL column its own scale and
+                // display length.
+                apply_type_metadata(col, column);
                 packets.push_back(column_definition_41::write_packet(std::move(col), writer_, sequence_id_++));
             }
             packets.push_back(build_eof(writer_, sequence_id_++, 0, status_flags()));
@@ -510,9 +597,18 @@ namespace frontend::mysql {
 
     void mysql_connection::prepare_protocol_statement(protocol_statement_t statement, uint32_t parameter_count) {
         OTX_ZONE_N("mysql::prepare_protocol_statement");
-        // The columns the execution will answer; a SET answers an OK packet.
+        // The columns the execution will answer; a SET / USE answers an OK
+        // packet, and a SET whose value the engine cannot take is refused now.
         std::pmr::vector<types::complex_logical_type> columns(resource_);
-        if (!std::holds_alternative<set_variables_t>(statement)) {
+        // A SET refused now is refused as COM_QUERY refuses it (answer_setting):
+        // a statement refused, an open block failed behind it — as the prepare
+        // of any other statement the frontend refuses fails it.
+        if (const auto* set = std::get_if<set_variables_t>(&statement); set != nullptr && set->refusal) {
+            fail_open_block(set->refusal->message);
+            send_error(set->refusal->code, set->refusal->message);
+            return;
+        }
+        if (!std::holds_alternative<set_variables_t>(statement) && !std::holds_alternative<use_database_t>(statement)) {
             auto answer = answer_protocol_statement(resource_, statement, protocol_context());
             if (auto* refusal = std::get_if<protocol_refusal_t>(&answer)) {
                 // Driver housekeeping never fails a block (serve_protocol_statement).
@@ -529,9 +625,8 @@ namespace frontend::mysql {
         packets.reserve(4 + column_cnt + parameter_count);
         packets.push_back(
             build_stmt_prepare_ok(writer_, sequence_id_++, next_statement_id_, column_cnt, parameter_count));
-        prepared_stmt_meta meta(resource_, session_->next_statement(), std::string{}, parameter_count);
-        meta.consumed = true; // nothing in the session to close or execute
-        meta.protocol = std::move(statement);
+        prepared_stmt_meta meta(resource_, session_->next_statement(), parameter_count);
+        meta.protocol = std::move(statement); // nothing in the session to close or execute
         statement_id_map_.emplace(next_statement_id_++, std::move(meta));
 
         if (parameter_count) {
@@ -546,6 +641,8 @@ namespace frontend::mysql {
                 auto wire_type = get_field_type(column.type());
                 assert(wire_type.has_value() && "a protocol answer is BIGINT and text columns only");
                 column_definition_41 col(column.has_alias() ? column.alias() : std::string{}, *wire_type);
+                // The flags of its type, as the executed resultset announces them.
+                apply_type_metadata(col, column);
                 packets.push_back(column_definition_41::write_packet(std::move(col), writer_, sequence_id_++));
             }
             packets.push_back(build_eof(writer_, sequence_id_++, 0, status_flags()));
@@ -555,26 +652,29 @@ namespace frontend::mysql {
 
     void mysql_connection::execute_protocol_statement(const protocol_statement_t& statement) {
         OTX_ZONE_N("mysql::execute_protocol_statement");
-        if (std::holds_alternative<set_variables_t>(statement)) {
-            answer_setting();
+        if (const auto* set = std::get_if<set_variables_t>(&statement)) {
+            answer_setting(*set);
+            return;
+        }
+        if (const auto* use = std::get_if<use_database_t>(&statement)) {
+            [[maybe_unused]] const bool used = answer_use(use->database, true);
             return;
         }
         auto answer = answer_protocol_statement(resource_, statement, protocol_context());
         if (auto* refusal = std::get_if<protocol_refusal_t>(&answer)) {
             send_error(refusal->code, std::move(refusal->message));
-        } else if (auto* rows = std::get_if<vector::data_chunk_t>(&answer)) {
+        } else {
+            auto& rows = std::get<vector::data_chunk_t>(answer);
             mysql_resultset result(writer_, result_encoding::BINARY);
-            result.add_chunk_columns(*rows);
-            for (size_t i = 0; i < rows->size(); ++i) {
-                result.add_row(*rows, i);
+            result.add_chunk_columns(rows);
+            for (size_t i = 0; i < rows.size(); ++i) {
+                result.add_row(rows, i);
             }
             send_resultset(std::move(result));
-        } else {
-            send_packet(build_ok(writer_, sequence_id_, 0, status_flags()));
         }
     }
 
-    std::pmr::vector<components::types::logical_value_t>
+    std::pmr::vector<components::vector::vector_t>
     mysql_connection::handle_execute_params(uint32_t stmt_id,
                                             size_t num_params,
                                             std::pmr::vector<uint16_t>& param_types,
@@ -613,11 +713,12 @@ namespace frontend::mysql {
         }
 
         // values are always sent if num_params > 0, regardless of new_params_bound_flag
-        std::pmr::vector<types::logical_value_t> param_values(resource_);
+        std::pmr::vector<components::vector::vector_t> param_values(resource_);
         for (size_t i = 0; i < num_params; ++i) {
             bool is_null = (null_bitmap[i / 8] >> (i % 8)) & 1;
             if (is_null) {
-                param_values.emplace_back(resource_, nullptr);
+                param_values.push_back(components::vector::make_null(
+                    resource_, components::types::complex_logical_type{components::types::logical_type::NA}));
                 continue;
             }
 
@@ -628,54 +729,54 @@ namespace frontend::mysql {
                 case field_type::MYSQL_TYPE_TINY: {
                     auto val = reader.read_uint8();
                     if (is_unsigned) {
-                        param_values.emplace_back(resource_, val);
+                        param_values.push_back(components::vector::make_scalar(resource_, val));
                     } else {
-                        param_values.emplace_back(resource_, static_cast<int8_t>(val));
+                        param_values.push_back(components::vector::make_scalar(resource_, static_cast<int8_t>(val)));
                     }
                     break;
                 }
                 case field_type::MYSQL_TYPE_SHORT: {
                     auto val = reader.read_uint16();
                     if (is_unsigned) {
-                        param_values.emplace_back(resource_, val);
+                        param_values.push_back(components::vector::make_scalar(resource_, val));
                     } else {
-                        param_values.emplace_back(resource_, static_cast<int16_t>(val));
+                        param_values.push_back(components::vector::make_scalar(resource_, static_cast<int16_t>(val)));
                     }
                     break;
                 }
                 case field_type::MYSQL_TYPE_LONG: {
                     auto val = reader.read_uint32();
                     if (is_unsigned) {
-                        param_values.emplace_back(resource_, val);
+                        param_values.push_back(components::vector::make_scalar(resource_, val));
                     } else {
-                        param_values.emplace_back(resource_, static_cast<int32_t>(val));
+                        param_values.push_back(components::vector::make_scalar(resource_, static_cast<int32_t>(val)));
                     }
                     break;
                 }
                 case field_type::MYSQL_TYPE_LONGLONG: {
                     auto val = reader.read_uint64();
                     if (is_unsigned) {
-                        param_values.emplace_back(resource_, val);
+                        param_values.push_back(components::vector::make_scalar(resource_, val));
                     } else {
-                        param_values.emplace_back(resource_, static_cast<int64_t>(val));
+                        param_values.push_back(components::vector::make_scalar(resource_, static_cast<int64_t>(val)));
                     }
                     break;
                 }
                 case field_type::MYSQL_TYPE_FLOAT: {
                     auto f = std::bit_cast<float>(reader.read_uint32());
-                    param_values.emplace_back(resource_, f);
+                    param_values.push_back(components::vector::make_scalar(resource_, f));
                     break;
                 }
                 case field_type::MYSQL_TYPE_DOUBLE: {
                     auto d = std::bit_cast<double>(reader.read_uint64());
-                    param_values.emplace_back(resource_, d);
+                    param_values.push_back(components::vector::make_scalar(resource_, d));
                     break;
                 }
                 case field_type::MYSQL_TYPE_VAR_STRING:
                 case field_type::MYSQL_TYPE_STRING:
                 case field_type::MYSQL_TYPE_BLOB: {
                     std::string s = reader.read_length_encoded_string();
-                    param_values.emplace_back(resource_, std::move(s));
+                    param_values.push_back(components::vector::make_scalar(resource_, std::string_view{s}));
                     break;
                 }
                 default:
@@ -690,37 +791,6 @@ namespace frontend::mysql {
         }
 
         return param_values;
-    }
-
-    bool mysql_connection::reprepare_stmt(prepared_stmt_meta& stmt) {
-        OTX_ZONE_N("mysql::reprepare_stmt");
-        const auto id = session_->next_statement();
-        // a query session schedules itself: needs_sched is always false
-        [[maybe_unused]] auto [needs_sched, fut] = actor_zeta::send(session_->address(),
-                                                                    &otterstax::session::query_session_t::prepare_schema,
-                                                                    id,
-                                                                    std::string{stmt.sql.c_str()});
-        auto r = otterstax::await_future_blocking<session_payload>(std::move(fut), resource_);
-
-        if (r.has_error()) {
-            // Refused as the COM_STMT_PREPARE of the same text would be.
-            if (!answer_await_failure(r)) {
-                send_statement_error(r.error().type, std::string{r.error().what.c_str()});
-            }
-            return false;
-        }
-
-        if (r.value().parameter_count != stmt.parameter_count) {
-            send_error(mysql_error::ER_UNKNOWN_STMT_HANDLER,
-                       "Prepared statement changed its parameter count on re-prepare: " +
-                           std::to_string(r.value().parameter_count) + " out of " +
-                           std::to_string(stmt.parameter_count));
-            return false;
-        }
-
-        stmt.stmt_session = id;
-        stmt.consumed = false;
-        return true;
     }
 
     void mysql_connection::close_stmt_in_session(otterstax::session::statement_id_t stmt_session, const char* reason) {
@@ -744,28 +814,23 @@ namespace frontend::mysql {
     }
 
     void mysql_connection::handle_execute_stmt(prepared_stmt_meta& stmt,
-                                               std::pmr::vector<types::logical_value_t> param_values) {
+                                               std::pmr::vector<components::vector::vector_t> param_values) {
         OTX_ZONE_N("mysql::handle_execute_stmt");
         if (stmt.protocol) {
             execute_protocol_statement(*stmt.protocol);
             return;
         }
-        if (stmt.consumed && !reprepare_stmt(stmt)) {
-            return;
-        }
-        // The session drops the statement on every exit path of the execution.
-        stmt.consumed = true;
-
         // a query session schedules itself: needs_sched is always false
         [[maybe_unused]] auto [needs_sched, fut] =
             actor_zeta::send(session_->address(),
                              &otterstax::session::query_session_t::execute_prepared_statement,
                              stmt.stmt_session,
-                             std::move(param_values));
+                             otterstax::session::parameter_row(resource_, std::move(param_values)),
+                             uint64_t{0});
         auto r = otterstax::await_future_blocking<session_payload>(std::move(fut), resource_);
 
         if (r.has_error()) {
-            if (!answer_await_failure(r) && !answer_failed_commit(r.error())) {
+            if (!answer_await_failure(r)) {
                 send_statement_error(r.error().type, std::string{r.error().what.c_str()});
             }
             return;

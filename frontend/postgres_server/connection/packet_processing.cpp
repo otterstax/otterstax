@@ -6,20 +6,62 @@
 #include "utility/tracy_memory_resource.hpp"
 #include "utility/tracy_profiler.hpp"
 
+#include <components/catalog/settings.hpp>
+#include <components/logical_plan/node_cursor.hpp>
+#include <components/vector/vector_builders.hpp>
+
 #include <algorithm>
+#include <array>
 #include <bit>
 
 using namespace components;
 using namespace components::sql;
 
 namespace frontend::postgres {
-    constexpr size_t INITIAL_MESSAGES_COUNT = 1 + 6 + 1 + 1; // auth_ok + 6 param + backend_key + ready_for_query
     constexpr size_t SECRET_KEY_3_2_SIZE = 32;
     constexpr size_t SECRET_KEY_SIZE = 4;
+
+    namespace {
+        // An engine SET of `name` to `value`: the name a quoted identifier, the
+        // value a standard string literal (the engine takes a SET value as a
+        // string constant only).
+        std::string engine_set_statement(std::string_view name, std::string_view value) {
+            std::string sql = "SET \"";
+            for (char c : name) {
+                sql += c;
+                if (c == '"') {
+                    sql += '"';
+                }
+            }
+            sql += "\" = '";
+            for (char c : value) {
+                sql += c;
+                if (c == '\'') {
+                    sql += '\'';
+                }
+            }
+            sql += '\'';
+            return sql;
+        }
+
+        // The engine setting a pg_settings row is of (its `name` column is the
+        // setting's catalog name), nullptr for any other row.
+        const components::catalog::setting_def_t* setting_of_row(std::string_view name) {
+            for (const auto& setting : components::catalog::all_settings()) {
+                if (setting.catalog_name == name) {
+                    return &setting;
+                }
+            }
+            return nullptr;
+        }
+    } // namespace
 
     void postgres_connection::handle_startup_message(int32_t protocol_version, packet_reader& reader) {
         OTX_ZONE_N("pg::handle_startup_message");
         log_->info("[Connection {}]: Client protocol version: {}", connection_id_, protocol_version);
+        std::optional<std::string> database;
+        std::vector<std::pair<std::string, std::string>> options;
+        std::vector<std::pair<std::string, std::string>> parameters;
         while (reader.remaining()) {
             std::string key = reader.read_string_null();
 
@@ -47,6 +89,22 @@ namespace frontend::postgres {
                     use_protocol_3_2_ = true;
                     log_->info("[Connection {}]: Postgres client supports Protocol 3.2+", connection_id_);
                 }
+            } else if (key.starts_with("_pq_.") || key == "user") {
+                // A protocol extension; the user: no authentication.
+            } else if (key == "database") {
+                database = std::move(value);
+            } else if (key == "options") {
+                auto switches = startup_options(value);
+                if (auto* refusal = std::get_if<std::string>(&switches)) {
+                    send_error_response(sql_state::SYNTAX_ERROR, std::move(*refusal), error_severity::fatal());
+                    return;
+                }
+                auto& settings = std::get<0>(switches);
+                options.insert(options.end(),
+                               std::make_move_iterator(settings.begin()),
+                               std::make_move_iterator(settings.end()));
+            } else {
+                parameters.emplace_back(std::move(key), std::move(value));
             }
         }
 
@@ -58,16 +116,47 @@ namespace frontend::postgres {
             return;
         }
 
-        std::vector<std::vector<uint8_t>> msg;
-        msg.reserve(INITIAL_MESSAGES_COUNT);
-        msg.emplace_back(build_auth_ok(writer_));
+        // PostgreSQL applies the `options` switches first, the parameters after.
+        options.insert(options.end(),
+                       std::make_move_iterator(parameters.begin()),
+                       std::make_move_iterator(parameters.end()));
+        // The defaults first: a RESET of a reported engine setting goes back to
+        // them, not to the startup's value (the startup's SET is an ordinary
+        // SET in the engine).
+        read_default_settings();
+        if (!apply_startup_settings(database, options)) {
+            return;
+        }
 
-        msg.emplace_back(build_parameter_status(writer_, "server_version", "16.0 (Mock)"));
+        std::vector<std::vector<uint8_t>> msg;
+        msg.emplace_back(build_auth_ok(writer_));
+        // The client's encoding, then the protocol's parameters: what OtterStax
+        // does, fixed.
+        reported_.client_encoding = client_encoding_.current();
+        msg.emplace_back(build_parameter_status(writer_, "client_encoding", reported_.client_encoding));
+        for (const auto& parameter : protocol_parameters()) {
+            msg.emplace_back(build_parameter_status(writer_, std::string{parameter.name}, std::string{parameter.value}));
+        }
+        // Read-only facts of the server: the PostgreSQL version it speaks, the
+        // encoding the engine stores text in, the timestamps' microsecond
+        // integers (core/date/date_types.hpp).
+        msg.emplace_back(build_parameter_status(writer_, "server_version", "18.0"));
         msg.emplace_back(build_parameter_status(writer_, "server_encoding", "UTF8"));
-        msg.emplace_back(build_parameter_status(writer_, "client_encoding", "UTF8"));
-        msg.emplace_back(build_parameter_status(writer_, "DateStyle", "ISO, MDY"));
-        msg.emplace_back(build_parameter_status(writer_, "TimeZone", "UTC"));
         msg.emplace_back(build_parameter_status(writer_, "integer_datetimes", "on"));
+        // The engine session's, as the engine has them.
+        reported_.timezone = timezone_.current();
+        reported_.search_path = search_path_.current();
+        msg.emplace_back(build_parameter_status(writer_, "TimeZone", reported_.timezone));
+        msg.emplace_back(build_parameter_status(writer_, "search_path", reported_.search_path));
+        // The client's own, reported empty when it named none (PostgreSQL's
+        // default).
+        log_->info("[Connection {}] application_name: \"{}\", client_encoding: {}, extra_float_digits: {}",
+                   connection_id_,
+                   application_name_.session,
+                   client_encoding_.session,
+                   extra_float_digits_.session);
+        reported_.application_name = application_name_.current();
+        msg.emplace_back(build_parameter_status(writer_, "application_name", reported_.application_name));
 
         auto secret_key = secure_random_bytes(use_protocol_3_2_ ? SECRET_KEY_3_2_SIZE : SECRET_KEY_SIZE);
         if (!secret_key) {
@@ -86,6 +175,155 @@ namespace frontend::postgres {
         send_packet_merged(std::move(msg)); // send packet & begin message-handling loop
     }
 
+    bool postgres_connection::apply_startup_settings(const std::optional<std::string>& database,
+                                                     const std::vector<std::pair<std::string, std::string>>& settings) {
+        OTX_ZONE_N("pg::apply_startup_settings");
+        // The protocol's first: nothing reaches the engine unless all are true.
+        // A client parameter is the client's: the last one given is kept, and
+        // RESET goes back to it.
+        for (const auto& [name, value] : settings) {
+            if (const auto client = find_client_parameter(name)) {
+                switch (*client) {
+                    case client_parameter_t::application_name:
+                        application_name_.reset = clean_application_name(value);
+                        application_name_.session = application_name_.reset;
+                        continue;
+                    case client_parameter_t::client_encoding: {
+                        auto encoding = client_encoding_value(value);
+                        if (!encoding) {
+                            send_error_response(sql_state::INVALID_PARAMETER_VALUE,
+                                                client_encoding_refusal(value),
+                                                error_severity::fatal());
+                            return false;
+                        }
+                        client_encoding_.reset = std::move(*encoding);
+                        client_encoding_.session = client_encoding_.reset;
+                        continue;
+                    }
+                    case client_parameter_t::extra_float_digits: {
+                        auto digits = parse_extra_float_digits(value);
+                        if (auto* refusal = std::get_if<std::string>(&digits)) {
+                            send_error_response(sql_state::INVALID_PARAMETER_VALUE,
+                                                std::move(*refusal),
+                                                error_severity::fatal());
+                            return false;
+                        }
+                        extra_float_digits_.reset = std::get<int>(digits);
+                        extra_float_digits_.session = extra_float_digits_.reset;
+                        continue;
+                    }
+                }
+            } else if (const auto* parameter = find_protocol_parameter(name)) {
+                if (auto refusal = check_protocol_parameter(*parameter, value)) {
+                    send_error_response(sql_state::INVALID_PARAMETER_VALUE,
+                                        std::move(*refusal),
+                                        error_severity::fatal());
+                    return false;
+                }
+            }
+        }
+        // Each SET the engine applied is followed by await_session.
+        const auto run = [&](std::string sql) {
+            [[maybe_unused]] auto [needs_sched, fut] = actor_zeta::send(session_->address(),
+                                                                        &otterstax::session::query_session_t::execute,
+                                                                        session_->next_statement(),
+                                                                        std::move(sql));
+            return await_session(std::move(fut));
+        };
+        if (database && !database->empty()) {
+            auto r = run(engine_set_statement("search_path", *database + ".public"));
+            if (r.has_error()) {
+                const auto code = r.error().type;
+                if (!r.timed_out() && code == core::error_code_t::database_not_exists) {
+                    // The database a client that names none is placed in
+                    // (otterbrix's built-in search_path, main.public).
+                    send_error_response(sql_state::INVALID_CATALOG_NAME,
+                                        "database \"" + *database + "\" does not exist",
+                                        error_severity::fatal(),
+                                        "The default database is \"main\".");
+                } else if (!r.timed_out() && code == core::error_code_t::schema_not_exists) {
+                    // The database is there, its public schema (the place a
+                    // StartupMessage's database names) is not. PostgreSQL never
+                    // refuses a connection for a search_path schema, but the
+                    // engine cannot place a session in one that does not exist:
+                    // the refusal names the schema, never "the database does not
+                    // exist" for a database that does.
+                    send_error_response(sql_state::INVALID_SCHEMA_NAME,
+                                        "schema \"" + *database + ".public\" does not exist",
+                                        error_severity::fatal());
+                } else {
+                    send_session_error(r, "", error_severity::fatal());
+                }
+                return false;
+            }
+        }
+        for (const auto& [name, value] : settings) {
+            if (find_protocol_parameter(name) != nullptr || find_client_parameter(name)) {
+                continue;
+            }
+            auto r = run(engine_set_statement(name, value));
+            if (r.has_error()) {
+                send_session_error(r, "", error_severity::fatal());
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void postgres_connection::read_default_settings() {
+        OTX_ZONE_N("pg::read_default_settings");
+        // A fresh session's value is the default every session shares: the
+        // built-in one with the stored rows of pg_settings over it, the last
+        // row of a setting winning (the table is append-only; the engine reads
+        // the last one at its start), each through the engine's set_setting.
+        components::catalog::session_catalog_t defaults;
+        [[maybe_unused]] auto [needs_sched, fut] =
+            actor_zeta::send(session_->address(),
+                             &otterstax::session::query_session_t::execute,
+                             session_->next_statement(),
+                             std::string{"SELECT name, setting FROM pg_catalog.pg_settings"});
+        auto r = await_session(std::move(fut));
+        if (r.has_error()) {
+            log_->warn("[Connection {}] pg_settings could not be read: {}", connection_id_, r.error().what.c_str());
+        } else {
+            for (const auto& chunk : r.value().chunks) {
+                // Two text columns, or the rows are not what this reads.
+                if (chunk.column_count() < 2 ||
+                    chunk.data[0].type().type() != types::logical_type::STRING_LITERAL ||
+                    chunk.data[1].type().type() != types::logical_type::STRING_LITERAL) {
+                    log_->warn("[Connection {}] pg_settings answered columns other than (name, setting): ignored",
+                               connection_id_);
+                    continue;
+                }
+                for (uint64_t row = 0; row < chunk.size(); ++row) {
+                    if (chunk.data[0].is_null(row) || chunk.data[1].is_null(row)) {
+                        continue;
+                    }
+                    const auto* setting = setting_of_row(chunk.data[0].data<std::string_view>()[row]);
+                    if (setting == nullptr) {
+                        continue;
+                    }
+                    const auto value = chunk.data[1].data<std::string_view>()[row];
+                    if (auto refused = components::catalog::set_setting(defaults, setting->id, value, resource_);
+                        refused.contains_error()) {
+                        log_->warn("[Connection {}] pg_settings {} = '{}' refused: {}",
+                                   connection_id_,
+                                   setting->sql_name,
+                                   value,
+                                   refused.what.c_str());
+                    }
+                }
+            }
+        }
+        const auto value_of = [&](components::catalog::setting_id id) {
+            return std::string{components::catalog::current_setting_value(defaults, id, resource_)};
+        };
+        timezone_.reset = value_of(components::catalog::setting_id::timezone);
+        timezone_.session = timezone_.reset;
+        search_path_.reset = value_of(components::catalog::setting_id::search_path);
+        search_path_.session = search_path_.reset;
+    }
+
     void postgres_connection::handle_ssl_decline(frontend::postgres::packet_reader& reader) {
         OTX_ZONE_N("pg::handle_ssl_decline");
         std::vector<uint8_t> negative(1);
@@ -97,19 +335,30 @@ namespace frontend::postgres {
     }
 
     namespace {
-        // The CommandComplete tag of a statement's answer: an executed BEGIN /
-        // COMMIT / ROLLBACK by the transaction statement the session says it
-        // was, every other statement by its kind.
-        command_complete_tag tag_of(const session_payload& payload, int64_t rows) {
+        // The CommandComplete tag of a statement's answer (`sql` its text): an
+        // executed transaction statement by what the session says it was (a
+        // COMMIT that ended a failed block is ROLLBACK), every other statement
+        // by its kind.
+        command_complete_tag tag_of(const session_payload& payload, int64_t rows, std::string_view sql) {
             switch (payload.transaction) {
                 case otterstax::session::transaction_command_t::begin:
                     return command_complete_tag::begin();
                 case otterstax::session::transaction_command_t::commit:
                     return command_complete_tag::commit();
                 case otterstax::session::transaction_command_t::rollback:
+                case otterstax::session::transaction_command_t::rollback_to:
                     return command_complete_tag::rollback();
+                case otterstax::session::transaction_command_t::savepoint:
+                    return command_complete_tag::savepoint();
+                case otterstax::session::transaction_command_t::release:
+                    return command_complete_tag::release();
                 case otterstax::session::transaction_command_t::none:
                     break;
+            }
+            // RESET and RESET ALL are tagged RESET (utility.c), SET ... TO
+            // DEFAULT SET: one VariableSetStmt, told by its first keyword.
+            if (payload.tag == T_VariableSetStmt && keyword_is(first_keyword(sql), "reset")) {
+                return command_complete_tag::reset();
             }
             return command_complete_tag::simple_command(payload.tag, rows);
         }
@@ -117,6 +366,35 @@ namespace frontend::postgres {
         bool ends_block(const session_payload& payload) {
             return payload.transaction == otterstax::session::transaction_command_t::commit ||
                    payload.transaction == otterstax::session::transaction_command_t::rollback;
+        }
+
+        // The SQLSTATE of an engine code, where the tests read one; the full
+        // table is otterbrix's to give (OTB-sqlstate). nullptr: none.
+        const char* sqlstate_of(core::error_code_t code) {
+            switch (code) {
+                case core::error_code_t::transaction_finalized:
+                    return sql_state::IN_FAILED_SQL_TRANSACTION;
+                case core::error_code_t::unimplemented_yet:
+                    return sql_state::FEATURE_NOT_SUPPORTED;
+                case core::error_code_t::undefined_prepared_statement:
+                    return sql_state::INVALID_SQL_STATAMENT_NAME;
+                case core::error_code_t::no_active_sql_transaction:
+                    return sql_state::NO_ACTIVE_SQL_TRANSACTION;
+                default:
+                    return nullptr;
+            }
+        }
+
+        // The Bind values copied: Describe(portal) binds them into a describe
+        // and leaves the portal its own for the Execute.
+        components::vector::data_chunk_t copy_row(std::pmr::memory_resource* resource,
+                                                  const postgres_connection::portal_t& params) {
+            std::pmr::vector<components::vector::vector_t> values(resource);
+            values.reserve(params.size());
+            for (const auto& value : params) {
+                values.push_back(components::vector::make_constant_copy(resource, value, 0));
+            }
+            return otterstax::session::parameter_row(resource, std::move(values));
         }
     } // namespace
 
@@ -129,50 +407,242 @@ namespace frontend::postgres {
         if (!r.timed_out()) {
             failure_pending_ = false;
         }
+        follow_parameters(r);
         return r;
     }
 
-    session_payload postgres_connection::rollback_payload() const {
-        session_payload payload(resource_);
-        payload.tag = T_TransactionStmt;
-        payload.transaction = otterstax::session::transaction_command_t::rollback;
-        return payload;
+    void postgres_connection::follow_parameters(const otterstax::awaited_t<session_payload>& answer) {
+        OTX_ZONE_N("pg::follow_parameters");
+        if (session_ == nullptr || answer.timed_out()) {
+            return; // nothing the statement did is known yet
+        }
+        const bool inside_block =
+            session_->transaction_status() != components::session::transaction_status_t::idle;
+        if (!answer.has_error()) {
+            const auto& payload = answer.value();
+            for (const auto& change : payload.setting_changes) {
+                client_setting_t<std::string>* followed = nullptr;
+                switch (change.id) {
+                    case components::catalog::setting_id::timezone:
+                        followed = &timezone_;
+                        break;
+                    case components::catalog::setting_id::search_path:
+                        followed = &search_path_;
+                        break;
+                    case components::catalog::setting_id::autocommit:
+                        break; // not reported
+                }
+                if (followed != nullptr) {
+                    followed->set(change.value ? *change.value : followed->reset, change.local, inside_block);
+                }
+            }
+            if (payload.savepoint) {
+                const auto each = [&](auto&& apply) {
+                    apply(application_name_);
+                    apply(client_encoding_);
+                    apply(extra_float_digits_);
+                    apply(timezone_);
+                    apply(search_path_);
+                };
+                switch (payload.transaction) {
+                    case otterstax::session::transaction_command_t::savepoint:
+                        each([&](auto& setting) { setting.savepoint(*payload.savepoint); });
+                        break;
+                    case otterstax::session::transaction_command_t::release:
+                        each([&](auto& setting) { setting.release(*payload.savepoint); });
+                        break;
+                    case otterstax::session::transaction_command_t::rollback_to:
+                        each([&](auto& setting) { setting.rollback_to(*payload.savepoint); });
+                        break;
+                    default:
+                        break;
+                }
+            }
+        }
+        // The block ended with this statement (or none is open): kept by a
+        // COMMIT (not a COMMIT of a failed block, answered as a rollback),
+        // dropped otherwise; a SET LOCAL ends either way.
+        if (!inside_block) {
+            const bool committed =
+                !answer.has_error() && answer.value().transaction == otterstax::session::transaction_command_t::commit;
+            application_name_.end_block(committed);
+            client_encoding_.end_block(committed);
+            extra_float_digits_.end_block(committed);
+            timezone_.end_block(committed);
+            search_path_.end_block(committed);
+        }
+    }
+
+    void postgres_connection::reset_client_parameters() {
+        OTX_ZONE_N("pg::reset_client_parameters");
+        const bool inside_block =
+            session_->transaction_status() != components::session::transaction_status_t::idle;
+        application_name_.set(application_name_.reset, false, inside_block);
+        client_encoding_.set(client_encoding_.reset, false, inside_block);
+        extra_float_digits_.set(extra_float_digits_.reset, false, inside_block);
+    }
+
+    command_complete_tag postgres_connection::setting_tag(const protocol_setting_t& setting) const {
+        return setting.reset ? command_complete_tag::reset()
+                             : command_complete_tag::simple_command(T_VariableSetStmt, 0);
+    }
+
+    void postgres_connection::append_ready_for_query(std::vector<std::vector<uint8_t>>& response) {
+        const auto report = [&](const char* name, const std::string& current, std::string& reported) {
+            if (current == reported) {
+                return;
+            }
+            reported = current;
+            response.emplace_back(build_parameter_status(writer_, name, reported));
+        };
+        report("application_name", application_name_.current(), reported_.application_name);
+        report("client_encoding", client_encoding_.current(), reported_.client_encoding);
+        report("TimeZone", timezone_.current(), reported_.timezone);
+        report("search_path", search_path_.current(), reported_.search_path);
+        response.emplace_back(build_ready_for_query(writer_, ready_status()));
     }
 
     void postgres_connection::send_session_error(const otterstax::awaited_t<session_payload>& answer,
-                                                 std::string_view prefix) {
+                                                 std::string_view prefix,
+                                                 error_severity severity) {
         const auto& error = answer.error();
         if (answer.timed_out()) {
             // The statement goes on running; send_error_response fails an open
             // block behind it, so a COMMIT cannot publish what the client was told
             // is cancelled.
-            send_error_response(sql_state::QUERY_CANCELED, "Query exceeded execution limit");
-        } else if (error.type == core::error_code_t::transaction_finalized) {
-            send_error_response(sql_state::IN_FAILED_SQL_TRANSACTION, std::string{error.what.c_str()});
-        } else if (error.type == core::error_code_t::unimplemented_yet) {
-            // SAVEPOINT / RELEASE / ROLLBACK TO among them: the engine has no
-            // savepoints, and like every error inside a block the refusal fails it.
-            send_error_response(sql_state::FEATURE_NOT_SUPPORTED, std::string{error.what.c_str()});
+            send_error_response(sql_state::QUERY_CANCELED, "Query exceeded execution limit", severity);
+        } else if (const char* state = sqlstate_of(error.type)) {
+            send_error_response(state, std::string{error.what.c_str()}, severity);
         } else {
-            send_error_response(sql_state::SYNTAX_ERROR, std::string{prefix} + error.what.c_str());
+            send_error_response(sql_state::SYNTAX_ERROR, std::string{prefix} + error.what.c_str(), severity);
         }
     }
 
+    bool postgres_connection::run_protocol_setting(const protocol_setting_t& setting) {
+        OTX_ZONE_N("pg::run_protocol_setting");
+        // As the engine refuses every statement of a failed block.
+        if (block_aborted()) {
+            refuse_in_aborted_block();
+            return false;
+        }
+        // flatten_set_variable_args: a parameter that is no list takes one value.
+        if (setting.several_values && (setting.parameter == nullptr || !setting.parameter->list_input)) {
+            send_error_response(sql_state::INVALID_PARAMETER_VALUE, "SET " + setting.name + " takes only one argument");
+            return false;
+        }
+        if (setting.client) {
+            return set_client_parameter(setting);
+        }
+        if (setting.value) {
+            if (auto refusal = check_protocol_parameter(*setting.parameter, *setting.value)) {
+                // Inside a block the error fails it (send_error_response).
+                send_error_response(sql_state::INVALID_PARAMETER_VALUE, std::move(*refusal));
+                return false;
+            }
+        }
+        // The value is what OtterStax gives already: nothing changes, so no
+        // ParameterStatus follows (PostgreSQL reports a changed value only).
+        return true;
+    }
+
+    bool postgres_connection::set_client_parameter(const protocol_setting_t& setting) {
+        OTX_ZONE_N("pg::set_client_parameter");
+        // A failed block was refused before: the session is idle or in an open
+        // block.
+        const bool inside_block =
+            session_->transaction_status() != components::session::transaction_status_t::idle;
+        switch (*setting.client) {
+            case client_parameter_t::application_name: {
+                auto& name = application_name_;
+                std::string value = setting.value    ? clean_application_name(*setting.value)
+                                    : setting.current ? name.current()
+                                                      : name.reset;
+                name.set(std::move(value), setting.local, inside_block);
+                return true;
+            }
+            case client_parameter_t::client_encoding: {
+                auto& encoding = client_encoding_;
+                std::string value = setting.current ? encoding.current() : encoding.reset;
+                if (setting.value) {
+                    auto kept = client_encoding_value(*setting.value);
+                    if (!kept) {
+                        // Inside a block the error fails it (send_error_response).
+                        send_error_response(sql_state::INVALID_PARAMETER_VALUE,
+                                            client_encoding_refusal(*setting.value));
+                        return false;
+                    }
+                    value = std::move(*kept);
+                }
+                encoding.set(std::move(value), setting.local, inside_block);
+                return true;
+            }
+            case client_parameter_t::extra_float_digits: {
+                auto& digits = extra_float_digits_;
+                int value = setting.current ? digits.current() : digits.reset;
+                if (setting.value) {
+                    auto parsed = parse_extra_float_digits(*setting.value);
+                    if (auto* refusal = std::get_if<std::string>(&parsed)) {
+                        // Inside a block the error fails it (send_error_response).
+                        send_error_response(sql_state::INVALID_PARAMETER_VALUE, std::move(*refusal));
+                        return false;
+                    }
+                    value = std::get<int>(parsed);
+                }
+                digits.set(value, setting.local, inside_block);
+                return true;
+            }
+        }
+        return true;
+    }
+
+    std::vector<std::vector<uint8_t>> postgres_connection::answer_show(client_parameter_t parameter,
+                                                                       const std::vector<result_encoding>& format,
+                                                                       bool row_shape_known) {
+        OTX_ZONE_N("pg::answer_show");
+        std::pmr::vector<types::complex_logical_type> columns(resource_);
+        columns.emplace_back(types::logical_type::STRING_LITERAL, std::string{client_parameter_name(parameter)});
+        components::vector::data_chunk_t chunk(resource_, columns);
+        std::string value;
+        switch (parameter) {
+            case client_parameter_t::application_name:
+                value = application_name_.current();
+                break;
+            case client_parameter_t::client_encoding:
+                value = client_encoding_.current();
+                break;
+            case client_parameter_t::extra_float_digits:
+                value = std::to_string(extra_float_digits_.current());
+                break;
+        }
+        chunk.set_value(0, 0, std::string_view{value});
+        chunk.set_cardinality(1);
+        postgres_resultset result(writer_, extra_float_digits_t{extra_float_digits_.current()}, row_shape_known);
+        if (!row_shape_known) {
+            result.add_chunk_columns(chunk);
+        }
+        result.add_encoding(format);
+        result.add_row(chunk, 0);
+        auto response = postgres_resultset::build_packets(std::move(result));
+        response.emplace_back(
+            build_command_complete(writer_, command_complete_tag::simple_command(T_VariableShowStmt, 1)));
+        return response;
+    }
+
     transaction_status postgres_connection::ready_status() const {
-        switch (session_->transaction_state()) {
-            case otterstax::session::transaction_state_t::idle:
+        switch (session_->transaction_status()) {
+            case components::session::transaction_status_t::idle:
                 return transaction_status::IDLE;
-            case otterstax::session::transaction_state_t::in_block:
+            case components::session::transaction_status_t::in_transaction:
                 // A failure the session has been told of and not run yet.
                 return failure_pending_ ? transaction_status::TRANSACTION_ERROR : transaction_status::IN_TRANSACTION;
-            case otterstax::session::transaction_state_t::failed:
+            case components::session::transaction_status_t::failed:
                 return transaction_status::TRANSACTION_ERROR;
         }
         return transaction_status::IDLE;
     }
 
     bool postgres_connection::block_aborted() const {
-        return session_->transaction_state() == otterstax::session::transaction_state_t::failed || failure_pending_;
+        return session_->transaction_status() == components::session::transaction_status_t::failed || failure_pending_;
     }
 
     void postgres_connection::refuse_in_aborted_block() {
@@ -180,14 +650,32 @@ namespace frontend::postgres {
                             "current transaction is aborted, commands ignored until end of transaction block");
     }
 
-    bool postgres_connection::run_deallocate(const otterstax::session::deallocate_statement_t& statement) {
+    bool postgres_connection::run_deallocate(const deallocate_statement_t& statement, const std::string& sql) {
         OTX_ZONE_N("pg::run_deallocate");
-        if (block_aborted()) {
-            refuse_in_aborted_block();
+        const bool own = statement.name.has_value() && !statement.name->empty() &&
+                         statement_name_map_.find(*statement.name) != statement_name_map_.end();
+        if (own) {
+            if (block_aborted()) {
+                refuse_in_aborted_block();
+                return false;
+            }
+            drop_statement(*statement.name);
+            return true;
+        }
+        // The engine's store (SQL PREPARE): its answer, 26000 for a name it
+        // does not have either, 25P02 in a failed block.
+        [[maybe_unused]] auto [needs_sched, fut] = actor_zeta::send(session_->address(),
+                                                                    &otterstax::session::query_session_t::execute,
+                                                                    session_->next_statement(),
+                                                                    sql);
+        auto r = await_session(std::move(fut));
+        if (r.has_error()) {
+            send_session_error(r, "");
             return false;
         }
         if (!statement.name.has_value()) {
-            // The named statements; the unnamed one is the protocol's, not DEALLOCATE's.
+            // DEALLOCATE ALL: the named statements of the map too; the unnamed
+            // one is the protocol's, not DEALLOCATE's.
             std::vector<std::string> names;
             names.reserve(statement_name_map_.size());
             for (const auto& entry : statement_name_map_) {
@@ -198,33 +686,64 @@ namespace frontend::postgres {
             for (const auto& name : names) {
                 drop_statement(name);
             }
-            return true;
         }
-        if (statement.name->empty() || statement_name_map_.find(*statement.name) == statement_name_map_.end()) {
-            send_error_response(sql_state::INVALID_SQL_STATAMENT_NAME,
-                                "prepared statement \"" + *statement.name + "\" does not exist");
-            return false;
-        }
-        drop_statement(*statement.name);
         return true;
     }
 
-    void postgres_connection::handle_deallocate(otterstax::session::deallocate_statement_t statement) {
+    void postgres_connection::handle_deallocate(const deallocate_statement_t& statement, const std::string& sql) {
         OTX_ZONE_N("pg::handle_deallocate");
-        if (!run_deallocate(statement)) {
+        if (!run_deallocate(statement, sql)) {
             return;
         }
         std::vector<std::vector<uint8_t>> response;
         response.emplace_back(
             build_command_complete(writer_, command_complete_tag::deallocate(!statement.name.has_value())));
-        response.emplace_back(build_ready_for_query(writer_, ready_status()));
+        append_ready_for_query(response);
         send_packet_merged(std::move(response));
     }
 
     void postgres_connection::handle_query(std::string query) {
         OTX_ZONE_N("pg::handle_query");
-        if (auto deallocate = otterstax::session::deallocate_statement(resource_, query)) {
-            handle_deallocate(std::move(*deallocate));
+        if (auto deallocate = deallocate_statement(resource_, query)) {
+            handle_deallocate(*deallocate, query);
+            return;
+        }
+        // RESET ALL resets the engine's settings (the session runs it) and the
+        // client parameters behind its success; DISCARD ALL too, which
+        // PostgreSQL runs only outside a block (PreventInTransactionBlock).
+        bool resets_client_parameters = false;
+        if (auto setting = protocol_setting_statement(resource_, query)) {
+            if (setting->all) {
+                resets_client_parameters = true;
+            } else {
+                if (run_protocol_setting(*setting)) {
+                    std::vector<std::vector<uint8_t>> response;
+                    response.emplace_back(build_command_complete(writer_, setting_tag(*setting)));
+                    append_ready_for_query(response);
+                    send_packet_merged(std::move(response));
+                }
+                return;
+            }
+        } else if (discard_all_statement(resource_, query)) {
+            if (block_aborted()) {
+                refuse_in_aborted_block();
+                return;
+            }
+            if (session_->transaction_status() != components::session::transaction_status_t::idle) {
+                send_error_response(sql_state::ACTIVE_SQL_TRANSACTION,
+                                    "DISCARD ALL cannot run inside a transaction block");
+                return;
+            }
+            resets_client_parameters = true;
+        } else if (const auto shown = show_client_parameter(resource_, query)) {
+            // As the engine refuses every statement of a failed block.
+            if (block_aborted()) {
+                refuse_in_aborted_block();
+                return;
+            }
+            auto response = answer_show(*shown, {result_encoding::TEXT}, false);
+            append_ready_for_query(response);
+            send_packet_merged(std::move(response));
             return;
         }
         // a query session schedules itself: needs_sched is always false
@@ -233,21 +752,17 @@ namespace frontend::postgres {
                                                                     session_->next_statement(),
                                                                     query);
         auto r = await_session(std::move(fut));
-
-        session_payload sdata_result(resource_);
-        if (!r.has_error()) {
-            sdata_result = std::move(r.value());
-        } else if (session_->ended_failed_block(r.error())) {
-            // COMMIT of a failed block: CommandComplete ROLLBACK and status I,
-            // as PostgreSQL answers it.
-            sdata_result = rollback_payload();
-        } else {
+        if (r.has_error()) {
             send_session_error(r, "");
             return;
         }
+        session_payload sdata_result = std::move(r.value());
+        if (resets_client_parameters) {
+            reset_client_parameters();
+        }
 
         if (ends_block(sdata_result)) {
-            portals_.clear(); // portals are released at the transaction's end
+            release_portals(false); // portals are released at the transaction's end
         }
         int64_t rows_cnt = static_cast<int64_t>(sdata_result.reported_rows());
         std::vector<std::vector<uint8_t>> response;
@@ -261,7 +776,7 @@ namespace frontend::postgres {
                 return;
             }
 
-            postgres_resultset result(writer_);
+            postgres_resultset result(writer_, extra_float_digits_t{extra_float_digits_.current()});
             result.add_chunk_columns(sdata_result.chunks.front()); // default text encoding
             for (auto& ch : sdata_result.chunks) {
                 for (size_t i = 0; i < ch.size(); ++i) {
@@ -270,8 +785,10 @@ namespace frontend::postgres {
             }
             response = postgres_resultset::build_packets(std::move(result));
         }
-        response.emplace_back(build_command_complete(writer_, tag_of(sdata_result, rows_cnt)));
-        response.emplace_back(build_ready_for_query(writer_, ready_status()));
+        response.emplace_back(build_command_complete(writer_, tag_of(sdata_result, rows_cnt, query)));
+        // A reported parameter the statement changed (a SET, the end of the
+        // block a SET was in), as PostgreSQL sends it before the ReadyForQuery.
+        append_ready_for_query(response);
         send_packet_merged(std::move(response));
     }
 
@@ -279,13 +796,17 @@ namespace frontend::postgres {
     postgres_connection::handle_parse(std::string stmt, std::string query, int16_t num_params, packet_reader&& reader) {
         OTX_ZONE_N("pg::handle_parse");
         log_->info("[Connection {}] PARSE stmt: \"{}\", query: \"{}\"", connection_id_, stmt, query);
-        std::pmr::vector<field_type> specified_types(resource_);
+        // oid 0 (or one the frontend has no type for) leaves the type to the
+        // engine's describe.
+        std::pmr::vector<int32_t> oids(resource_);
+        std::pmr::vector<std::optional<field_type>> declared(resource_);
         for (int i = 0; i < num_params; ++i) {
             auto oid = reader.read_int32();
+            oids.push_back(oid);
             if (get_field_type(oid) == field_type::NA) {
-                specified_types.emplace_back(field_type::TEXT);
+                declared.emplace_back(std::nullopt);
             } else {
-                specified_types.emplace_back(static_cast<field_type>(oid));
+                declared.emplace_back(static_cast<field_type>(oid));
             }
         }
 
@@ -299,41 +820,64 @@ namespace frontend::postgres {
             return;
         }
 
-        // PostgreSQL refuses a Parse in an aborted block before it parses the
-        // statement for anything (exec_parse_message), unless the statement ends
-        // the block or the text is empty.
-        const bool transaction_exit = otterstax::session::is_transaction_exit_statement(resource_, query);
-        if (block_aborted() && !transaction_exit && query.find_first_not_of(" \t\r\n\f\v;") != std::string::npos) {
-            refuse_in_aborted_block();
-            return;
-        }
-
         const auto id = session_->next_statement();
-        // DEALLOCATE is the frontend's (session/statement_kind.hpp): kept here
-        // and run at Execute, never prepared by the session.
-        if (auto deallocate = otterstax::session::deallocate_statement(resource_, query)) {
-            if (!specified_types.empty()) {
-                send_error_response(sql_state::UNDEFINED_PARAMETER,
-                                    "Parameter type left unspecified: specified " +
-                                        std::to_string(specified_types.size()) + " out of 0");
+        // A statement the frontend keeps (DEALLOCATE, a protocol SET, SHOW of a
+        // client parameter): run at Execute, never prepared by the session. It
+        // uses no parameter, and PostgreSQL takes a Parse that declares types
+        // for parameters the statement does not use: they are its parameters
+        // (described, bound) all the same — but an undeclared one (oid 0) has
+        // no type to be described by (42P18).
+        const auto keep = [&](statement_run_t run) {
+            if (block_aborted()) {
+                refuse_in_aborted_block();
                 return;
             }
+            std::pmr::vector<field_type> types(resource_);
+            for (std::size_t i = 0; i < oids.size(); ++i) {
+                if (oids[i] == 0) {
+                    send_error_response(sql_state::INDETERMINATE_DATATYPE,
+                                        "could not determine data type of parameter $" + std::to_string(i + 1));
+                    return;
+                }
+                types.push_back(static_cast<field_type>(oids[i]));
+            }
             do_close(describe_close_arg::STATEMENT, stmt);
-            auto meta = std::allocate_shared<prepared_stmt_meta>(std::pmr::polymorphic_allocator<prepared_stmt_meta>(resource_),
-                                                                 resource_,
-                                                                 id,
-                                                                 std::move(query),
-                                                                 0,
-                                                                 types::complex_logical_type{},
-                                                                 std::move(specified_types),
-                                                                 T_DeallocateStmt);
-            meta->consumed = true; // nothing in the session to close or execute
-            meta->transaction_exit = false;
-            meta->deallocate = std::move(*deallocate);
-            statement_name_map_.emplace(std::move(stmt), std::move(meta));
+            const auto count = static_cast<uint32_t>(types.size());
+            statement_name_map_.emplace(std::move(stmt), prepared_stmt_meta(std::move(run), count, std::move(types)));
             send_packet(build_parse_complete(writer_));
+        };
+        if (auto deallocate = deallocate_statement(resource_, query)) {
+            statement_run_t run(resource_, id, query, types::complex_logical_type{}, T_DeallocateStmt);
+            run.deallocate = std::move(*deallocate);
+            keep(std::move(run));
             return;
         }
+        // So is a SET of a protocol parameter: checked at Execute, as
+        // PostgreSQL applies a SET when it runs. RESET ALL is the engine's,
+        // the client parameters reset behind it.
+        auto setting = protocol_setting_statement(resource_, query);
+        if (setting && !setting->all) {
+            statement_run_t run(resource_, id, query, types::complex_logical_type{}, T_VariableSetStmt);
+            run.protocol_setting = std::move(*setting);
+            keep(std::move(run));
+            return;
+        }
+        // And SHOW of a client parameter: answered at Execute, described by
+        // its one text column.
+        if (const auto shown = show_client_parameter(resource_, query)) {
+            std::pmr::vector<types::complex_logical_type> columns(resource_);
+            columns.emplace_back(types::logical_type::STRING_LITERAL, std::string{client_parameter_name(*shown)});
+            statement_run_t run(resource_,
+                                id,
+                                query,
+                                types::complex_logical_type::create_struct("", columns),
+                                T_VariableShowStmt);
+            run.show = *shown;
+            keep(std::move(run));
+            return;
+        }
+        // The engine describes the statement (a failed block refuses it, but
+        // a COMMIT / ROLLBACK / ROLLBACK TO, with 25P02, as PostgreSQL's Parse).
         // a query session schedules itself: needs_sched is always false
         [[maybe_unused]] auto [needs_sched, fut] = actor_zeta::send(session_->address(),
                                                                     &otterstax::session::query_session_t::prepare_schema,
@@ -352,24 +896,36 @@ namespace frontend::postgres {
                     query,
                     result.parameter_count);
 
-        if (result.parameter_count != specified_types.size()) {
+        if (declared.size() > result.parameter_count) {
+            close_session_statement(id);
             send_error_response(sql_state::UNDEFINED_PARAMETER,
-                                "Parameter type left unspecified: specified " + std::to_string(specified_types.size()) +
-                                    " out of " + std::to_string(result.parameter_count));
+                                "Parameter types specified for " + std::to_string(declared.size()) +
+                                    " parameter(s), the statement has " + std::to_string(result.parameter_count));
             return;
+        }
+        // The client's type, else the engine's, else text.
+        std::pmr::vector<field_type> parameter_types(resource_);
+        parameter_types.reserve(result.parameter_count);
+        for (size_t i = 0; i < result.parameter_count; ++i) {
+            if (i < declared.size() && declared[i]) {
+                parameter_types.push_back(*declared[i]);
+                continue;
+            }
+            std::optional<field_type> engine;
+            if (i < result.parameter_types.size()) {
+                engine = get_field_type(result.parameter_types[i].type());
+            }
+            parameter_types.push_back(engine.value_or(field_type::TEXT));
         }
 
         // statements with identical name replace each other, together with their portals
         do_close(describe_close_arg::STATEMENT, stmt);
-        auto meta = std::allocate_shared<prepared_stmt_meta>(std::pmr::polymorphic_allocator<prepared_stmt_meta>(resource_),
-                                                             resource_,
-                                                             id,
-                                                             std::move(query),
-                                                             result.parameter_count,
-                                                             std::move(result.schema),
-                                                             std::move(specified_types),
-                                                             result.tag);
-        meta->transaction_exit = transaction_exit;
+        statement_run_t run(resource_, id, query, std::move(result.schema), result.tag);
+        run.resets_client_parameters = setting.has_value(); // RESET ALL
+        prepared_stmt_meta meta(std::move(run), result.parameter_count, std::move(parameter_types));
+        meta.transaction_exit = result.transaction == otterstax::session::transaction_command_t::commit ||
+                                result.transaction == otterstax::session::transaction_command_t::rollback ||
+                                result.transaction == otterstax::session::transaction_command_t::rollback_to;
         statement_name_map_.emplace(std::move(stmt), std::move(meta));
         send_packet(build_parse_complete(writer_));
     }
@@ -387,7 +943,7 @@ namespace frontend::postgres {
             return;
         }
 
-        auto& statement = *it->second;
+        auto& statement = it->second;
         // As PostgreSQL's exec_bind_message: in an aborted block only a
         // transaction exit without parameters is bound.
         if (block_aborted() && (!statement.transaction_exit || num_params != 0)) {
@@ -423,7 +979,8 @@ namespace frontend::postgres {
 
             int32_t len = reader.read_int32();
             if (len == -1) {
-                params.emplace_back(resource_, nullptr);
+                params.push_back(components::vector::make_null(
+                    resource_, components::types::complex_logical_type{components::types::logical_type::NA}));
                 continue;
             }
 
@@ -458,28 +1015,28 @@ namespace frontend::postgres {
                         send_error_response(sql_state::PROTOCOL_VIOLATION, "Invalid BOOL binary length");
                         return;
                     }
-                    params.emplace_back(resource_, reader.read_uint8() != 0);
+                    params.push_back(components::vector::make_scalar(resource_, reader.read_uint8() != 0));
                     break;
                 case field_type::INT2:
                     if (len != 2) {
                         send_error_response(sql_state::PROTOCOL_VIOLATION, "Invalid INT2 binary length");
                         return;
                     }
-                    params.emplace_back(resource_, reader.read_int16());
+                    params.push_back(components::vector::make_scalar(resource_, reader.read_int16()));
                     break;
                 case field_type::INT4:
                     if (len != 4) {
                         send_error_response(sql_state::PROTOCOL_VIOLATION, "Invalid INT4 binary length");
                         return;
                     }
-                    params.emplace_back(resource_, reader.read_int32());
+                    params.push_back(components::vector::make_scalar(resource_, reader.read_int32()));
                     break;
                 case field_type::INT8:
                     if (len != 8) {
                         send_error_response(sql_state::PROTOCOL_VIOLATION, "Invalid INT8 binary length");
                         return;
                     }
-                    params.emplace_back(resource_, reader.read_int64());
+                    params.push_back(components::vector::make_scalar(resource_, reader.read_int64()));
                     break;
                 case field_type::FLOAT4: {
                     if (len != 4) {
@@ -487,7 +1044,7 @@ namespace frontend::postgres {
                         return;
                     }
                     uint32_t raw = reader.read_uint32();
-                    params.emplace_back(resource_, std::bit_cast<float>(raw));
+                    params.push_back(components::vector::make_scalar(resource_, std::bit_cast<float>(raw)));
                     break;
                 }
                 case field_type::FLOAT8: {
@@ -496,14 +1053,14 @@ namespace frontend::postgres {
                         return;
                     }
                     uint64_t raw = reader.read_uint64();
-                    params.emplace_back(resource_, std::bit_cast<double>(raw));
+                    params.push_back(components::vector::make_scalar(resource_, std::bit_cast<double>(raw)));
                     break;
                 }
                 case field_type::TEXT: {
                     std::string str(len, '\0');
                     for (int j = 0; j < len; str[j++] = static_cast<char>(reader.read_uint8()))
                         ;
-                    params.emplace_back(resource_, std::move(str));
+                    params.push_back(components::vector::make_scalar(resource_, std::string_view{str}));
                     break;
                 }
                 default:
@@ -541,74 +1098,85 @@ namespace frontend::postgres {
             return;
         }
 
-        // add & create portal
-        statement.portal_names.emplace_back(portal_name);
-        portals_.erase(portal_name); // portals with identical name replace each other
-        portals_.emplace(std::move(portal_name), portal_meta(std::move(params), it->second, std::move(out_format)));
+        // add & create portal; portals with identical name replace each other
+        if (auto replaced = portals_.find(portal_name); replaced != portals_.end()) {
+            release_portal(replaced, true);
+        }
+        portals_.emplace(std::move(portal_name),
+                         portal_meta(std::move(params),
+                                     it->first,
+                                     statement_run_t(statement.run, resource_),
+                                     statement.described,
+                                     std::move(out_format)));
 
         send_packet(build_bind_complete(writer_));
     }
 
-    bool postgres_connection::reprepare_stmt(prepared_stmt_meta& stmt) {
-        OTX_ZONE_N("pg::reprepare_stmt");
-        const auto id = session_->next_statement();
+    void postgres_connection::close_window(portal_meta& portal) {
+        OTX_ZONE_N("pg::close_window");
+        if (portal.window == 0 || session_ == nullptr) {
+            return;
+        }
+        [[maybe_unused]] auto [needs_sched, fut] =
+            actor_zeta::send(session_->address(), &otterstax::session::query_session_t::close_window, portal.window);
+        auto r = await_session(std::move(fut));
+        if (r.has_error()) {
+            log_->warn("[Connection {}] the window of a portal could not be closed: {}", connection_id_, r.error().what);
+        }
+        portal.window = 0;
+        portal.done = true;
+    }
+
+    postgres_connection::portal_iterator postgres_connection::release_portal(portal_iterator it, bool close_windows) {
+        OTX_ZONE_N("pg::release_portal");
+        if (close_windows) {
+            close_window(it->second);
+        }
+        return portals_.erase(it);
+    }
+
+    void postgres_connection::release_portals(bool close_windows) {
+        for (auto it = portals_.begin(); it != portals_.end();) {
+            it = release_portal(it, close_windows);
+        }
+    }
+
+    void postgres_connection::close_session_statement(otterstax::session::statement_id_t stmt_session) {
+        if (session_ == nullptr) {
+            return;
+        }
         // a query session schedules itself: needs_sched is always false
+        [[maybe_unused]] auto [needs_sched, fut] = actor_zeta::send(session_->address(),
+                                                                    &otterstax::session::query_session_t::close_statement,
+                                                                    stmt_session);
+        auto r = await_session(std::move(fut));
+        if (r.has_error()) {
+            log_->warn("[Connection {}] close_statement failed: {}", connection_id_, r.error().what);
+        }
+    }
+
+    std::optional<otterstax::session::statement_id_t> postgres_connection::portal_entry(const portal_meta& portal,
+                                                                                        bool& temporary) {
+        OTX_ZONE_N("pg::portal_entry");
+        temporary = false;
+        if (auto it = statement_name_map_.find(portal.statement_name);
+            it != statement_name_map_.end() && it->second.run.stmt_session == portal.run.stmt_session) {
+            return portal.run.stmt_session;
+        }
+        // The statement was DEALLOCATEd since the Bind: the portal prepares its
+        // text again, as PostgreSQL's portal keeps its plan.
+        const auto id = session_->next_statement();
         [[maybe_unused]] auto [needs_sched, fut] = actor_zeta::send(session_->address(),
                                                                     &otterstax::session::query_session_t::prepare_schema,
                                                                     id,
-                                                                    std::string{stmt.sql.c_str()});
+                                                                    std::string{portal.run.sql});
         auto r = await_session(std::move(fut));
-
         if (r.has_error()) {
             send_session_error(r, "Syntax error: ");
-            return false;
+            return std::nullopt;
         }
-
-        if (r.value().parameter_count != stmt.parameter_count) {
-            send_error_response(sql_state::UNDEFINED_PARAMETER,
-                                "Prepared statement changed its parameter count on re-prepare: " +
-                                    std::to_string(r.value().parameter_count) + " out of " +
-                                    std::to_string(stmt.parameter_count));
-            return false;
-        }
-
-        stmt.stmt_session = id;
-        stmt.consumed = false;
-        return true;
-    }
-
-    bool postgres_connection::run_portal(portal_meta& portal) {
-        OTX_ZONE_N("pg::run_portal");
-        auto& stmt = *portal.statement;
-        if (stmt.consumed && !reprepare_stmt(stmt)) {
-            return false;
-        }
-        // The session drops the statement on every exit path of the execution.
-        stmt.consumed = true;
-
-        // a query session schedules itself: needs_sched is always false
-        [[maybe_unused]] auto [needs_sched, fut] =
-            actor_zeta::send(session_->address(),
-                             &otterstax::session::query_session_t::execute_prepared_statement,
-                             stmt.stmt_session,
-                             std::move(portal.params));
-        auto r = await_session(std::move(fut));
-
-        if (r.has_error()) {
-            if (!session_->ended_failed_block(r.error())) {
-                send_session_error(r, "Syntax error: ");
-                return false;
-            }
-            // COMMIT of a failed block: CommandComplete ROLLBACK, as PostgreSQL
-            // answers it; the Sync then reports the block ended.
-            portal.result.emplace(rollback_payload());
-            portal.emitted = 0;
-            return true;
-        }
-
-        portal.result.emplace(std::move(r.value()));
-        portal.emitted = 0;
-        return true;
+        temporary = true;
+        return id;
     }
 
     void postgres_connection::handle_execute(std::string portal_name, int32_t limit) {
@@ -622,41 +1190,123 @@ namespace frontend::postgres {
         }
 
         auto& portal = it->second;
-        // The portal holds its statement: a DEALLOCATE ALL run below drops the
-        // statement from the map, never from under this Execute.
-        const statement_ptr statement = portal.statement;
-        auto& stmt = *statement;
-        if (stmt.deallocate) {
-            if (run_deallocate(*stmt.deallocate)) {
-                send_packet(build_command_complete(writer_,
-                                                   command_complete_tag::deallocate(!stmt.deallocate->name.has_value())));
+        const auto& run = portal.run;
+        if (portal.done && (run.deallocate || run.protocol_setting)) {
+            // PortalRun: a portal of a utility statement (PORTAL_MULTI_QUERY)
+            // that ran is done, and MarkPortalActive refuses to run it again.
+            send_error_response(sql_state::OBJECT_NOT_IN_PREREQUISITE_STATE,
+                                "portal \"" + portal_name + "\" cannot be run");
+            return;
+        }
+        if (run.deallocate) {
+            // run_deallocate may drop statements, never the portal this runs.
+            const auto statement = *run.deallocate;
+            const std::string sql{run.sql};
+            portal.done = true;
+            if (run_deallocate(statement, sql)) {
+                send_packet(build_command_complete(writer_, command_complete_tag::deallocate(!statement.name.has_value())));
             }
             return;
         }
-        if (!portal.result && !run_portal(portal)) {
+        if (run.protocol_setting) {
+            portal.done = true;
+            if (run_protocol_setting(*run.protocol_setting)) {
+                send_packet(build_command_complete(writer_, setting_tag(*run.protocol_setting)));
+            }
             return;
         }
-        session_payload& payload = *portal.result;
+        if (portal.done) {
+            // A portal that ran to its end answers no more rows.
+            send_packet(build_command_complete(writer_, command_complete_tag::simple_command(run.tag, 0)));
+            return;
+        }
+        if (run.show) {
+            // PostgreSQL's exec_execute_message: a failed block runs nothing but
+            // a transaction exit.
+            if (block_aborted()) {
+                refuse_in_aborted_block();
+                return;
+            }
+            const bool row_shape_known = portal.statement_described || portal.described;
+            portal.described = true;
+            portal.done = true;
+            send_packet_merged(answer_show(*run.show, portal.format, row_shape_known));
+            return;
+        }
+
+        // A row limit runs the statement under an engine window; the next
+        // Execute fetches on from it.
+        const uint64_t count = limit > 0 ? static_cast<uint64_t>(limit) : components::logical_plan::fetch_all;
+        // The session entry this Execute prepared for itself (its statement was
+        // DEALLOCATEd since the Bind), closed once it ran.
+        std::optional<otterstax::session::statement_id_t> temporary_entry;
+        actor_zeta::unique_future<otterstax::session::query_session_t::session_result> fut;
+        if (portal.window != 0) {
+            fut = actor_zeta::send(session_->address(),
+                                   &otterstax::session::query_session_t::fetch_window,
+                                   portal.window,
+                                   count)
+                      .second;
+        } else {
+            bool temporary = false;
+            const auto entry = portal_entry(portal, temporary);
+            if (!entry) {
+                release_portal(it, false);
+                return;
+            }
+            if (temporary) {
+                temporary_entry = entry;
+            }
+            if (limit > 0) {
+                fut = actor_zeta::send(session_->address(),
+                                       &otterstax::session::query_session_t::execute_window,
+                                       *entry,
+                                       otterstax::session::parameter_row(resource_, std::move(portal.params)),
+                                       uint64_t{0},
+                                       count)
+                          .second;
+            } else {
+                fut = actor_zeta::send(session_->address(),
+                                       &otterstax::session::query_session_t::execute_prepared_statement,
+                                       *entry,
+                                       otterstax::session::parameter_row(resource_, std::move(portal.params)),
+                                       uint64_t{0})
+                          .second;
+            }
+        }
+        auto r = await_session(std::move(fut));
+        if (temporary_entry) {
+            close_session_statement(*temporary_entry);
+        }
+        if (r.has_error()) {
+            // A failed Execute ends the portal: a fetch that fails ends the
+            // window (the engine's rule), and the values were handed to the run
+            // — an Execute again finds no portal rather than running the
+            // statement once more without them.
+            portal.window = 0;
+            release_portal(it, false);
+            send_session_error(r, "Syntax error: ");
+            return;
+        }
+        session_payload& payload = r.value();
+        // A fetch answers rows of the statement: CommandComplete names it.
+        payload.tag = run.tag;
+        portal.window = payload.has_more ? payload.portal : 0;
+        portal.done = !payload.has_more;
 
         // PostgreSQL's guarantee: the row shape a client was handed before Bind
-        // is the shape the rows arrive in. A statement described then was
-        // described from what a prepare could know — a parameterized
-        // statement's projection carries no types at all — so the executed
-        // result may not be that shape, and a client that decodes by the
-        // description it holds would read one type's bytes as another's.
-        // PostgreSQL answers that divergence with 0A000 "cached plan must not
-        // change result type" instead of streaming rows of another shape
-        // (plancache.c, RevalidateCachedQuery), and so does this. A portal the
-        // client described itself was described from this very result and is
-        // not held against the statement's older answer.
-        if (stmt.described && !portal.described) {
-            assert(stmt.schema.type() == types::logical_type::STRUCT &&
+        // is the shape the rows arrive in; a divergence is 0A000 "cached plan
+        // must not change result type" (plancache.c, RevalidateCachedQuery). A
+        // portal the client described itself is not held against the
+        // statement's older answer.
+        if (portal.statement_described && !portal.described && payload.column_count() > 0) {
+            assert(run.schema.type() == types::logical_type::STRUCT &&
                    "a described statement was described from a STRUCT schema");
-            if (!same_wire_shape(stmt.schema.child_types(), payload.chunks.front())) {
+            if (!same_wire_shape(run.schema.child_types(), payload.chunks.front())) {
                 log_->warn("[Connection {}] EXECUTE portal \"{}\": described {} column(s), executed {}",
                            connection_id_,
                            portal_name,
-                           stmt.schema.child_types().size(),
+                           run.schema.child_types().size(),
                            payload.column_count());
                 send_error_response(sql_state::FEATURE_NOT_SUPPORTED, "cached plan must not change result type");
                 return;
@@ -665,9 +1315,8 @@ namespace frontend::postgres {
 
         std::vector<std::vector<uint8_t>> response;
         // CommandComplete reports the rows of THIS Execute: the rows sent for a
-        // query, the affected count for a DML statement (which has no result
-        // columns, so the count comes from the payload and is reported once).
-        int64_t rows_cnt = 0;
+        // query, the affected count for a DML statement.
+        int64_t rows_cnt = static_cast<int64_t>(payload.reported_rows());
         if (payload.column_count() > 0) {
             // The result formats are the portal's; the executed columns may
             // differ from the described schema, so every Execute checks them.
@@ -677,49 +1326,38 @@ namespace frontend::postgres {
                                     unsupported_column_message<frontend_type::POSTGRES>(*bad));
                 return;
             }
-
-            const size_t total = payload.size();
-            const size_t stop = limit > 0 ? std::min(total, portal.emitted + static_cast<size_t>(limit)) : total;
-
             // Execute itself never carries the row shape; a client that skipped
             // Describe gets it once, in front of the first rows of the portal.
-            const bool row_shape_known = stmt.described || portal.described || portal.emitted > 0;
-            postgres_resultset result(writer_, row_shape_known);
+            const bool row_shape_known = portal.statement_described || portal.described;
+            postgres_resultset result(writer_, extra_float_digits_t{extra_float_digits_.current()}, row_shape_known);
             if (!row_shape_known) {
                 result.add_chunk_columns(payload.chunks.front());
+                portal.described = true;
             }
             result.add_encoding(portal.format);
-
-            size_t row = 0;
             for (auto& ch : payload.chunks) {
-                for (size_t i = 0; i < ch.size() && row < stop; ++i, ++row) {
-                    if (row >= portal.emitted) {
-                        result.add_row(ch, i);
-                    }
-                }
-                if (row >= stop) {
-                    break;
+                for (size_t i = 0; i < ch.size(); ++i) {
+                    result.add_row(ch, i);
                 }
             }
-            rows_cnt = static_cast<int64_t>(stop - portal.emitted);
-            portal.emitted = stop;
             response = postgres_resultset::build_packets(std::move(result));
-
-            if (portal.emitted < total) {
+            if (payload.has_more) {
                 response.emplace_back(build_portal_suspended(writer_));
                 send_packet_merged(std::move(response));
                 return;
             }
-        } else {
-            rows_cnt = portal.emitted == 0 ? static_cast<int64_t>(payload.affected_rows) : 0;
-            portal.emitted = payload.size();
         }
 
-        response.emplace_back(build_command_complete(writer_, tag_of(payload, rows_cnt)));
+        response.emplace_back(build_command_complete(writer_, tag_of(payload, rows_cnt, run.sql)));
+        // RESET ALL: the client parameters too. What changed is reported in
+        // front of the Sync's ReadyForQuery, as PostgreSQL reports it.
+        if (run.resets_client_parameters) {
+            reset_client_parameters();
+        }
         const bool block_ended = ends_block(payload);
         send_packet_merged(std::move(response));
         if (block_ended) {
-            portals_.clear(); // portals are released at the transaction's end
+            release_portals(false); // portals are released at the transaction's end
         }
     }
 
@@ -733,17 +1371,19 @@ namespace frontend::postgres {
     void postgres_connection::do_close(frontend::postgres::describe_close_arg type, std::string name) {
         if (type == describe_close_arg::STATEMENT) {
             if (auto it = statement_name_map_.find(name); it != statement_name_map_.end()) {
-                // Closing a statement closes the portals bound from it (protocol).
-                for (auto&& p : it->second->portal_names) {
-                    if (auto portal = portals_.find(p);
-                        portal != portals_.end() && portal->second.statement == it->second) {
-                        portals_.erase(portal);
-                    }
+                // Closing a statement closes the portals bound from it
+                // (protocol): those of its name and its session entry — a
+                // portal of an earlier statement of the name stays.
+                const auto entry = it->second.run.stmt_session;
+                for (auto portal = portals_.begin(); portal != portals_.end();) {
+                    portal = portal->second.statement_name == name && portal->second.run.stmt_session == entry
+                                 ? release_portal(portal, true)
+                                 : std::next(portal);
                 }
                 drop_statement(name);
             }
-        } else {
-            portals_.erase(std::move(name));
+        } else if (auto portal = portals_.find(name); portal != portals_.end()) {
+            release_portal(portal, true);
         }
     }
 
@@ -752,25 +1392,12 @@ namespace frontend::postgres {
         if (it == statement_name_map_.end()) {
             return;
         }
-        auto& stmt = *it->second;
-        // The session keeps an unexecuted statement until it is closed; an
-        // executed one it has already dropped (consumed).
-        if (!stmt.consumed && session_ != nullptr) {
-            // a query session schedules itself: needs_sched is always false
-            [[maybe_unused]] auto [needs_sched, fut] = actor_zeta::send(session_->address(),
-                                                                        &otterstax::session::query_session_t::close_statement,
-                                                                        stmt.stmt_session);
-            auto r = await_session(std::move(fut));
-            if (r.has_error()) {
-                log_->warn("[Connection {}] CLOSE stmt: \"{}\": close_statement failed: {}",
-                           connection_id_,
-                           name,
-                           r.error().what);
-            }
+        // The session keeps the statement until it is closed. A portal still
+        // bound from it (DEALLOCATE leaves them) prepares its text again at its
+        // Execute (portal_entry).
+        if (!it->second.run.frontend_only()) {
+            close_session_statement(it->second.run.stmt_session);
         }
-        // A portal still bound from it (DEALLOCATE leaves them) prepares the
-        // text again at its Execute.
-        stmt.consumed = true;
         statement_name_map_.erase(it);
     }
 
@@ -787,10 +1414,17 @@ namespace frontend::postgres {
             }
             // A statement has no result formats yet (they come with Bind), so its
             // RowDescription is text; ParameterDescription always precedes it.
-            auto& statement = *it->second;
+            auto& statement = it->second;
             packets.emplace_back(build_parameter_description(writer_, statement.specified_types));
-            if (!do_describe(statement.schema, {result_encoding::TEXT}, packets, statement.described)) {
+            if (!do_describe(statement.run.schema, {result_encoding::TEXT}, packets, statement.described)) {
                 return;
+            }
+            // A portal already bound from it (Parse, Bind, Describe(statement),
+            // Execute): the client has the row shape now too.
+            for (auto& [portal_name, portal] : portals_) {
+                if (portal.statement_name == name && portal.run.stmt_session == statement.run.stmt_session) {
+                    portal.statement_described = statement.described;
+                }
             }
         } else {
             auto it = portals_.find(name);
@@ -798,39 +1432,38 @@ namespace frontend::postgres {
                 send_error_response(sql_state::INVALID_NAME, "Portal " + name + " does not exist");
                 return;
             }
-            // A portal is a BOUND statement: every parameter has a value, so a
-            // statement that answers rows can be described by the result it
-            // actually answers — exactly, and at no extra cost, since the
-            // portal keeps that result and its Execute streams it rather than
-            // running the statement again. This is the only description that is
-            // right for a parameterized statement: what a prepare could say
-            // before Bind is the plan's projection, which carries no types.
-            //
-            // Only a row-producing statement is run here, and the statement
-            // KIND decides it — not the columns of a result nobody has yet. An
-            // INSERT / UPDATE / DELETE described this way would write, and
-            // write a second time for a client that binds the portal again, so
-            // a DML is described from the prepared schema and nothing runs. For
-            // a DML with RETURNING that schema names the RETURNING columns,
-            // resolved from the plan at prepare (query_session_t::prepare_schema) rather
-            // than by executing anything; for one without it there are no
-            // result columns and the answer is NoData.
+            // A portal is a BOUND statement: the engine describes it with the
+            // Bind's values in it (a `$n` takes its value's type), and runs
+            // nothing — a DML described this way writes nothing.
             auto& portal = it->second;
-            if (portal.statement->tag == T_SelectStmt) {
-                if (!portal.result && !run_portal(portal)) {
+            if (portal.run.frontend_only()) {
+                // A SHOW's one column, NoData for the others.
+                if (!do_describe(portal.run.schema, portal.format, packets, portal.described)) {
                     return;
                 }
-                // types() answers a copy; the STRUCT is what do_describe reads
-                // its columns from, exactly as for a prepared schema.
-                const auto executed = portal.result->chunks.front().types();
-                if (!do_describe(types::complex_logical_type::create_struct("", executed),
-                                 portal.format,
-                                 packets,
-                                 portal.described)) {
+            } else {
+                bool temporary = false;
+                const auto entry = portal_entry(portal, temporary);
+                if (!entry) {
                     return;
                 }
-            } else if (!do_describe(portal.statement->schema, portal.format, packets, portal.described)) {
-                return;
+                [[maybe_unused]] auto [needs_sched, fut] =
+                    actor_zeta::send(session_->address(),
+                                     &otterstax::session::query_session_t::describe_bound,
+                                     *entry,
+                                     copy_row(resource_, portal.params),
+                                     uint64_t{0});
+                auto r = await_session(std::move(fut));
+                if (temporary) {
+                    close_session_statement(*entry);
+                }
+                if (r.has_error()) {
+                    send_session_error(r, "");
+                    return;
+                }
+                if (!do_describe(r.value().schema, portal.format, packets, portal.described)) {
+                    return;
+                }
             }
         }
         send_packet_merged(std::move(packets));

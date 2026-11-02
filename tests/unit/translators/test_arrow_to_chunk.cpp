@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2025-2026  OtterStax
 
-// tsl::arrow_to_chunk through otterbrix's importer: types, names and values survive, and the
-// aliased Arrow buffers stay alive as long as ANY column does (not just column 0).
+// tsl::arrow_to_chunk through otterbrix's importer: a run of chunks within the engine's bound,
+// types, names and values survive, and the aliased Arrow buffers stay alive as long as ANY
+// column of any chunk does (not just column 0).
 
 #include "otterbrix/translators/arrow_memory_pool.hpp"
 #include "otterbrix/translators/input/arrow_to_chunk.hpp"
+#include "../../mock/cell.hpp"
 
 #include <catch2/catch_all.hpp>
 
@@ -22,6 +24,8 @@
 using components::types::complex_logical_type;
 using components::types::logical_type;
 using components::vector::data_chunk_t;
+using components::vector::DEFAULT_VECTOR_CAPACITY;
+using otterstax::test::cell;
 
 namespace {
 
@@ -78,9 +82,15 @@ namespace {
             {amount_arr, id_arr, name_arr, flag_arr});
     }
 
-    void check_name(const data_chunk_t& chunk, uint64_t col) {
-        for (int i = 0; i < rows; i += 499) {
-            const auto v = chunk.value(col, static_cast<uint64_t>(i));
+    // The name column `col` of `chunk`, whose row 0 is row `first_row` of the batch: every 499th
+    // batch row it holds.
+    void check_name(const data_chunk_t& chunk, uint64_t col, uint64_t first_row = 0) {
+        for (uint64_t r = 0; r < chunk.size(); ++r) {
+            const auto i = first_row + r;
+            if (i % 499 != 0) {
+                continue;
+            }
+            const auto v = cell(chunk, col, r);
             if (i % 7 == 0) {
                 CHECK(v.is_null());
             } else {
@@ -88,6 +98,18 @@ namespace {
                 CHECK(std::string{v.value<std::string_view>()} == "name_" + std::to_string(i));
             }
         }
+    }
+
+    // The batch's row `row` of a run: the chunk holding it and its row there.
+    std::pair<const data_chunk_t*, uint64_t> locate(const std::pmr::vector<data_chunk_t>& run, uint64_t row) {
+        for (const auto& chunk : run) {
+            if (row < chunk.size()) {
+                return {&chunk, row};
+            }
+            row -= chunk.size();
+        }
+        FAIL("row past the run");
+        return {nullptr, 0};
     }
 
     // A chunk holding only `col` of `source`, sharing its buffers the way a window or a
@@ -109,11 +131,18 @@ TEST_CASE("arrow_to_chunk: natively read columns keep their types names and valu
     auto batch = make_batch(tsl::arrow_pool(&ledger), /*with_decimal=*/true);
     auto loaded = tsl::arrow_to_chunk(&ledger, batch);
     REQUIRE_FALSE(loaded.has_error());
-    const auto& chunk = loaded.value();
-    REQUIRE(chunk.size() == rows);
-    REQUIRE(chunk.column_count() == 4);
+    const auto& run = loaded.value();
+    // 3000 rows: 1024 + 1024 + 952, one column shape.
+    REQUIRE(run.size() == 3);
+    uint64_t total = 0;
+    for (const auto& chunk : run) {
+        REQUIRE(chunk.size() <= DEFAULT_VECTOR_CAPACITY);
+        REQUIRE(chunk.column_count() == 4);
+        total += chunk.size();
+    }
+    CHECK(total == static_cast<uint64_t>(rows));
 
-    const auto types = chunk.types();
+    const auto types = run.front().types();
     CHECK(types[0].type() == logical_type::DECIMAL);
     CHECK(types[0].alias() == "amount");
     CHECK(types[1].type() == logical_type::BIGINT);
@@ -124,10 +153,15 @@ TEST_CASE("arrow_to_chunk: natively read columns keep their types names and valu
     CHECK(types[3].alias() == "flag");
 
     for (int i = 0; i < rows; i += 499) {
-        CHECK(chunk.value(1, static_cast<uint64_t>(i)).value<int64_t>() == i);
-        CHECK(chunk.value(3, static_cast<uint64_t>(i)).value<bool>() == (i % 2 == 0));
+        const auto [chunk, r] = locate(run, static_cast<uint64_t>(i));
+        CHECK(cell(*chunk, 1, r).value<int64_t>() == i);
+        CHECK(cell(*chunk, 3, r).value<bool>() == (i % 2 == 0));
     }
-    check_name(chunk, 2);
+    uint64_t first_row = 0;
+    for (const auto& chunk : run) {
+        check_name(chunk, 2, first_row);
+        first_row += chunk.size();
+    }
 }
 
 TEST_CASE("arrow_to_chunk: the Arrow buffers outlive column 0 while a later column holds them") {
@@ -135,7 +169,7 @@ TEST_CASE("arrow_to_chunk: the Arrow buffers outlive column 0 while a later colu
     arrow::MemoryPool* pool = tsl::arrow_pool(&ledger);
     const int64_t arrow_before = pool->bytes_allocated();
 
-    // Every column native: the imported chunk itself is the answer.
+    // Every column native: the imported chunks themselves are the answer.
     SECTION("all columns read natively") {
         std::optional<data_chunk_t> kept;
         int64_t aliased = 0;
@@ -146,10 +180,11 @@ TEST_CASE("arrow_to_chunk: the Arrow buffers outlive column 0 while a later colu
             batch.reset(); // the chunk is now the only holder of the Arrow buffers
             aliased = pool->bytes_allocated() - arrow_before;
             REQUIRE(aliased > 0); // the values were not copied out: the chunk aliases them
-            kept.emplace(keep_only(&ledger, loaded.value(), 1)); // name, not column 0
-        } // every other column, column 0 included, is gone
+            // name of the last chunk, not column 0, not the first chunk
+            kept.emplace(keep_only(&ledger, loaded.value().back(), 1));
+        } // every other column of every chunk, column 0 included, is gone
         CHECK(pool->bytes_allocated() - arrow_before == aliased);
-        check_name(*kept, 0);
+        check_name(*kept, 0, 2 * DEFAULT_VECTOR_CAPACITY);
     }
 
     // A decimal column takes the own reader: the native columns are imported apart, and
@@ -164,10 +199,11 @@ TEST_CASE("arrow_to_chunk: the Arrow buffers outlive column 0 while a later colu
             batch.reset();
             aliased = pool->bytes_allocated() - arrow_before;
             REQUIRE(aliased > 0);
-            kept.emplace(keep_only(&ledger, loaded.value(), 2)); // name; id is the imported column 0
+            // name of the last chunk; id is the imported column 0
+            kept.emplace(keep_only(&ledger, loaded.value().back(), 2));
         }
         CHECK(pool->bytes_allocated() - arrow_before == aliased);
-        check_name(*kept, 0);
+        check_name(*kept, 0, 2 * DEFAULT_VECTOR_CAPACITY);
     }
 
     // With the last column gone, so are the Arrow buffers.
@@ -201,7 +237,8 @@ TEST_CASE("arrow_to_chunk: dates timestamps and dictionary strings are read by o
     auto loaded = tsl::arrow_to_chunk(&ledger, batch);
     INFO("error: " << (loaded.has_error() ? loaded.error().what.c_str() : ""));
     REQUIRE_FALSE(loaded.has_error());
-    const auto& chunk = loaded.value();
+    REQUIRE(loaded.value().size() == 1);
+    const auto& chunk = loaded.value().front();
     const auto types = chunk.types();
     CHECK(types[0].type() == logical_type::DATE);
     CHECK(types[0].alias() == "day");
@@ -212,10 +249,10 @@ TEST_CASE("arrow_to_chunk: dates timestamps and dictionary strings are read by o
     constexpr int64_t engine_days = 19000 - 10957;
     for (int i = 0; i < 4; ++i) {
         const auto r = static_cast<uint64_t>(i);
-        CHECK(chunk.value(0, r).value<core::date::date_t>().value.count() == engine_days + i);
-        CHECK(chunk.value(1, r).value<core::date::timestamp_t>().value.count() ==
+        CHECK(cell(chunk, 0, r).value<core::date::date_t>().value.count() == engine_days + i);
+        CHECK(cell(chunk, 1, r).value<core::date::timestamp_t>().value.count() ==
               (engine_days * 86'400'000'000LL + 37'800'000'000LL) + i * 1000LL);
-        CHECK(std::string{chunk.value(2, r).value<std::string_view>()} == (i % 2 == 0 ? "even" : "odd"));
+        CHECK(std::string{cell(chunk, 2, r).value<std::string_view>()} == (i % 2 == 0 ? "even" : "odd"));
     }
 }
 
@@ -234,4 +271,20 @@ TEST_CASE("arrow_schema_to_struct: answers the types arrow_to_chunk loads") {
     CHECK(fields[2].type() == logical_type::DATE);
     CHECK(fields[3].type() == logical_type::LIST);
     CHECK(fields[3].alias() == "tags");
+}
+
+TEST_CASE("arrow_to_chunk: a batch without rows is one chunk of its columns and no row") {
+    auto schema = arrow::schema({arrow::field("id", arrow::int64()), arrow::field("amount", arrow::decimal128(12, 2))});
+    auto batch = arrow::RecordBatch::MakeEmpty(schema).ValueOrDie();
+    auto loaded = tsl::arrow_to_chunk(std::pmr::new_delete_resource(), batch);
+    INFO("error: " << (loaded.has_error() ? loaded.error().what.c_str() : ""));
+    REQUIRE_FALSE(loaded.has_error());
+    REQUIRE(loaded.value().size() == 1);
+    const auto& chunk = loaded.value().front();
+    CHECK(chunk.size() == 0);
+    REQUIRE(chunk.column_count() == 2);
+    CHECK(chunk.data[0].type().type() == logical_type::BIGINT);
+    CHECK(chunk.data[0].type().alias() == "id");
+    CHECK(chunk.data[1].type().type() == logical_type::DECIMAL);
+    CHECK(chunk.data[1].type().alias() == "amount");
 }

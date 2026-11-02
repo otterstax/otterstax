@@ -20,25 +20,6 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `parse_fragment(sql, shared_params)` parses a single SELECT into the caller's parameter node (the Spark translator's SQL leaves). `backend_type_t` (`otterbrix/backend_type.hpp`, included by `parser.hpp` and `federation/metadata.hpp`; `{MySQL, PostgreSQL, ClickHouse}`) is the dialect the generator writes and the only enumeration of a backend's kind (the federation, the catalog and the backends module use it too). `qualified_name.hpp` restores the ordering of `qualified_name_t` (the dependency maps).
 
-`GreenplumParser(resource, aliases)` reads every table name against the configured
-connections — `otterstax::names::alias_registry_t` (`parser/alias_registry.hpp`),
-held by reference; there is no constructor without one. The rule lives in one
-function, `canonical_table_name`: three segments `a.b.c` are federated only behind
-a registered alias (schema = the connection's for PostgreSQL, none for MySQL /
-ClickHouse), a local reference names no schema, a slot the connection pins must
-match — refused otherwise. `parse()` runs it as a pass over the raw tree before the
-engine transformer (`canonicalize_names`, `parser/subquery_extractor.cpp`: every
-`RangeVar` of FROM, JOIN, derived tables, DML targets and sources, CREATE TABLE /
-INDEX — not a CTE body, not a subquery inside an expression), records every full
-name by `(db, rel)` for the write and DDL targets whose plan nodes carry no uid
-(`collect_qualified_names` → `name_registry_t`), and after the transformer names
-each external node: a read leaf by `federated_name(uid, db, rel)`, a write or DDL
-target through the registry. The Spark translator calls the same
-`canonical_table_name`. Only the main plan of the transformer is kept
-(`binder.node_ptr()`): a subquery the transformer lowers into
-`execution_plan_t::sub_queries` never reaches the engine (root `CLAUDE.md`, Known
-Constraints).
-
 `parser/grammar_extention/` — pluggable parser extensions registered with the
 core parser registry. Two ship by default: `s3/` and `file/`, both adding the
 `CREATE EXTERNAL TABLE` and `COPY (...) TO ...` syntax. Each extension is a flex
@@ -54,9 +35,10 @@ The Kafka DDL grammar extension (library `kafka_grammar`): a self-contained
 flex+bison pair (`kafka_yy` prefix, isolated from the core parser) producing a
 `kafka_node_t` for `CREATE/DROP SOURCE/STREAM` (DROP takes `[IF EXISTS] <name>
 [CASCADE | RESTRICT]`, RESTRICT by default — `kafka_node_t::cascade()`), registered into `GreenplumParser`
-via `make_kafka_extension()`. Also defines `kafka_write_target` (detects
-`INSERT INTO kafka.<obj>`) and `kafka_stream_source` / `kafka_find_aggregate`
-(stream plan helpers). Namespace `otterstax::kafka`. The Kafka **runtime** that
+via `make_kafka_extension()`. Also defines the Kafka names (`kafka_table_name`: `main.kafka.<obj>`;
+`kafka_service_table_name` / `kafka_offsets_table_name`: `federation.kafka.*`), `kafka_write_target`
+(an INSERT whose written target can name `main.kafka.<obj>`) with `kafka_target_named` (the target
+completed by the session's place), and `kafka_stream_source` / `kafka_find_aggregate` (stream plan helpers). Namespace `otterstax::kafka`. The Kafka **runtime** that
 consumes these nodes lives in `integration/kafka/` — see its CLAUDE.md.
 
 ### `query_generation/`
@@ -146,36 +128,62 @@ Converts raw backend results or file bytes into Otterbrix `data_chunk_t`:
 | `pg_to_chunk` | `PGresult*` of a SELECT (a DML's count is the backend's write, never read through here) | `result_wrapper_t<data_chunk_t>` (`conversion_failure` on a value with no reading as its column's type). NUMERIC(p, s) of at most 38 digits (its typmod, `PQfmod`) is the engine's DECIMAL(p, s), NaN its DECIMAL NaN; every other NUMERIC — wider, a scale outside 0..p (PostgreSQL 15), and the unconstrained NUMERIC, whose values each keep their own scale and up to 131072 digits (also what PostgreSQL answers for SUM(bigint) / AVG) — is its exact text: no DECIMAL(38, s) holds it without rounding or overflowing, and DOUBLE would round past 15 digits |
 | `decimal_text.hpp` | — | `decimal_type(p, s, alias)` (inline: the engine's DECIMAL(p, s) when it can declare one: 1 ≤ p ≤ 38, 0 ≤ s ≤ p), shared by the three translators. A backend's decimal text is read with the engine's own parse, `components::casts::kernels::detail::parse_decimal(text, p, s, &out)` (`<components/casts/kernels/string_cast.hpp>`: the unscaled integer at scale s, a longer fraction rounded half away from zero, a value past p digits refused), in `mysql_to_chunk`, `pg_to_chunk` and the federation's `conform_to_result` |
 | `ch_to_chunk` | ClickHouse blocks of a SELECT + the declared types (`system.columns` type strings) by result position: the type of the table column each result column reads as it is (`ClickhouseManager::declared_types_for` over `federation::scan_request_t::columns`: a pushed statement's columns come from several tables under names of the statement's own) | `result_wrapper_t<data_chunk_t>`. A column's type is its override's (`Nullable(T)`, `LowCardinality(T)`, `SimpleAggregateFunction(f, T)` → `T`; `Bool` → BOOLEAN; `Array(T)` → a LIST of `T` whose rows keep their own length; `Tuple` → STRUCT; Decimal(P, S) / Decimal32 / 64 / 128 of at most 38 digits → DECIMAL(P, S) holding the wire's unscaled integer, a result column of another width under a Decimal column's name keeping the wire's; DateTime64, Enum, IPv4/6, Int128/UInt128, Time, Map, … → STRING) when the wire column is a representation of it — the same type up to Nullable / LowCardinality / SimpleAggregateFunction, Tuple field names and `Bool` over the wire's UInt8 — and the wire type's otherwise: a result column that only reads like a table column (`AVG(x) AS x` is Float64, `toString(id) AS id` String, `count() AS x` UInt64, `x + 1 AS x` Int64) is not that column. `ch_to_struct(res, block, named_type_overrides)` gives discovery the same answer for its probe (the table's columns under their own names, the overrides keyed by name). Every value is read as that type, never handed to the engine under another (rc-3's `set_value` aborts on one): `Bool` from the wire's UInt8, and under STRING the text of any wire scalar that has one — Date / Date32 `YYYY-MM-DD` (from the day number, `RawAt`), DateTime / DateTime64(p) `YYYY-MM-DD hh:mm:ss` with p fraction digits in UTC (the column's timezone is not applied), Time / Time64 `[-]hh:mm:ss[.f]`, Int128 / UInt128 decimal, Enum the item's name, IPv4 / IPv6 via `inet_ntop`, UUID, numbers. A value with no reading as its column's type — Map, the geo types, Nothing, an Enum value outside its items, a DateTime64 outside the years 0000–9999 — is `conversion_failure` naming the column, not a placeholder; a NULL is NULL whatever its wire type |
-| `parquet_to_chunk` / `parquet_to_struct` | parquet file or buffer | `result_wrapper_t<data_chunk_t>` / `result_wrapper_t<complex_logical_type>` (via Arrow + snappy/brotli/zlib/lz4/zstd) |
-| `csv_to_chunk` | csv file or buffer | `result_wrapper_t<data_chunk_t>` |
-| `ndjson_to_chunk` | ndjson file or buffer | `result_wrapper_t<data_chunk_t>` (TableReader; LSan note: Arrow's `BackgroundGenerator` worker thread races during teardown — suppressed in `tsan.supp`) |
-| `arrow_to_chunk` | `arrow::RecordBatch` | `result_wrapper_t<data_chunk_t>` (shared shim used by parquet/csv/ndjson). Two explicit switches — the column type and the value reading — the second keyed on the array's own `type_id()`, so a type the reader has no case for is `conversion_failure` naming the column, never another array's layout read through a wrong cast. `decimal128(p, 0)` is HUGEINT (the carrier our own `COPY ... TO` writes for it), `decimal128(p, s > 0)` a DECIMAL(p, s) holding the same unscaled integer; a scale outside `0 <= s <= p`, a precision past 38, a payload that does not fit its declared precision, and a non-finite decimal payload are refused rather than read as another number |
-| `chunk_windows` | one translated `data_chunk_t` | `split_to_capacity(resource, chunk)` → `std::pmr::vector<data_chunk_t>` of chunks within `DEFAULT_VECTOR_CAPACITY` (the chunk contract below) |
+| `parquet_to_chunk` / `parquet_to_struct` | parquet file, buffer or stream | `result_wrapper_t<std::pmr::vector<data_chunk_t>>` (a run, as `arrow_to_chunk` cuts it) / `result_wrapper_t<complex_logical_type>` (via Arrow + snappy/brotli/zlib/lz4/zstd) |
+| `csv_to_chunk` | csv file, buffer or stream | `result_wrapper_t<std::pmr::vector<data_chunk_t>>` (a run) |
+| `ndjson_to_chunk` | ndjson file, buffer or stream | `result_wrapper_t<std::pmr::vector<data_chunk_t>>` (a run; TableReader; LSan note: Arrow's `BackgroundGenerator` worker thread races during teardown — suppressed in `tsan.supp`) |
+| `arrow_to_chunk` | `arrow::RecordBatch` | `result_wrapper_t<std::pmr::vector<data_chunk_t>>`: the batch as a run of chunks of at most `DEFAULT_VECTOR_CAPACITY` rows sharing one column shape (shared step of parquet/csv/ndjson, and FlightSQL's DoPut bind); a batch without rows is ONE chunk of its columns and no row, so the schema survives an empty file. Every Arrow type otterbrix's importer reads is read by it, through the Arrow C data interface (`ExportRecordBatch` → `schema_from_arrow` → `data_chunks_from_arrow`, which answers the pieces itself): the integers, floats, bool, utf8 / large_utf8 / string_view, binary (BLOB), date32/64, time, timestamp (any unit, ± tz), duration / interval, dictionary- and run-end-encoded columns, list, struct, map. The pieces alias the batch's buffers — strings as string_views into them (a fixed-size binary is copied) — and every column of every piece also holds a second, zero-copy export of the batch as its owner (`hold_batch_in_every_column`). Temporal values are moved from Arrow's 1970 epoch to the engine's 2000-01-01 by the importer. Two types keep this file's per-cell reader, filled into the rows of each piece: **decimal128** (the importer narrows a value to its storage width with an unchecked cast, and reads `decimal128(p, 0)` as DECIMAL where this shim reads the HUGEINT our writers carry under it — `decimal128(p, s > 0)` is DECIMAL(p, s), a scale outside `0 <= s <= p` or a precision past 38 `unimplemented_yet`, a payload past its declared precision `numeric_value_out_of_range`) and **null**. A type neither reads is the importer's refusal (`unimplemented_yet`) naming the column. `arrow_schema_to_struct` / `parquet_to_struct` (discovery) ask the same importer, so a discovered type is the loaded one. otterbrix refuses a dictionary-encoded column that holds nulls |
 
 **Chunk contract.** The engine takes at most `DEFAULT_VECTOR_CAPACITY` (1024) rows per
 `data_chunk_t`; a wider result is a run of such chunks sharing one column shape, and that
-is also what the cursor hands the frontends. Every translator above builds its whole input —
-a backend result set, a file — as ONE chunk. A remote table's rows are handed to the engine in
-windows of at most that many rows by the federation's operators (`federation/remote_storage.hpp`,
-`rules/pushdown.hpp`); a file / s3 load is cut into that run by `tsl::split_to_capacity` in
-`otterstax::engine::create_table`. A chunk within the bound is moved in unchanged. A column-less
-chunk is never cut, whatever its cardinality: a zero-column window would be the engine pipeline's
-drain sentinel. The translators of a backend answer read only a SELECT (a scan); a remote write's
-count is the backend's `write` (`federation/CLAUDE.md`). The windows are
-`data_chunk_t::partial_copy` slices of the source's reference-counted buffers, so no row is copied.
-`tests/unit/translators/test_chunk_windows.cpp` pins `split_to_capacity` per source (2500 rows),
-`tests/system/test_backend_managers.cpp` and `tests/federation/` the federation's windows through a
-real engine's cursor.
+is also what the cursor hands the frontends. A file loader (`arrow_to_chunk` and the
+parquet / csv / ndjson loaders over it) answers that run itself — otterbrix's importer
+cuts the pieces — and `otterstax::engine::load_table` inserts it as it is; an empty file is
+one chunk of its columns and no row (`create_table_plan` names the table's columns from the
+run's first chunk). A backend translator builds its whole answer as ONE chunk, which the
+federation's backend actor hands the engine page by page (`backend_actor_t::next_page`:
+`data_chunk_t::partial_copy` windows of at most 1024 rows, slices of the source's
+reference-counted buffers, so no row is copied). A column-less chunk is never cut: a
+zero-column window would be the engine pipeline's drain sentinel. The translators of a
+backend answer read only a SELECT (a scan); a remote write's count is the backend's `write`
+(`federation/CLAUDE.md`). `tests/unit/translators/test_chunk_windows.cpp` pins the loaders'
+runs and the backend pages per source (2500 rows), `tests/system/test_backend_managers.cpp`
+and `tests/federation/` the federation's pages through a real engine's cursor.
 
 Nothing in `translators/` throws: a file that cannot be opened is `io_error`, a
-body Arrow cannot parse or a value without a mapping is `conversion_failure`, a
-bad argument is `invalid_parameter`. `translators/error.hpp` holds the
+body Arrow cannot parse `invalid_text_representation`, a type without a reading
+`unimplemented_yet`, a value past its type `numeric_value_out_of_range`, a
+broken Arrow step `internal_error`, a bad argument `invalid_parameter`. `translators/error.hpp` holds the
 `make_error` / `arrow_error` helpers that build those `core::error_t` values on
 the caller's resource (`tsl::make_error` is also the one the federation, the
 catalog's metadata plans and the engine requests build their errors with).
 
 The file-format loaders all take a `std::pmr::memory_resource*` and route every
-allocation through it. **Lifetime trap:** the returned `data_chunk_t` keeps that
+allocation through it — Arrow's own buffers included: every reader, builder,
+writer and `CombineChunksToBatch` call allocates from `tsl::arrow_pool(res)`
+(`translators/arrow_memory_pool.hpp`), an `arrow::MemoryPool` over the
+resource, interned per resource address for the life of the process (an Arrow
+buffer frees through the raw pool pointer it was made with, possibly after the
+call returned). Arrow allocates from its helper threads too (even the serial
+CSV/JSON readers read ahead on a background thread); the pool enters the
+resource one call at a time, but code that also uses the resource directly
+while such a thread runs (S3 background part uploads) needs a thread-safe one —
+the engine's `synchronized_pool_resource` is. Each loader and writer has a
+stream overload (`std::shared_ptr<arrow::io::RandomAccessFile>` /
+`InputStream` in, `OutputStream` out — Arrow's own handles, for the Arrow
+calls) beside the path / buffer forms; the S3 path uses those. Between actors a
+stream travels only in its one owner, `tsl::input_stream_t` / `output_stream_t`
+(`translators/arrow_stream.hpp`: move-only; `arrow()` is the handle for an
+Arrow call; an output stream let go unclosed is aborted, so only `close()`
+publishes it). A writer's stream form leaves the stream open (its holder
+publishes or aborts it: `FileManager::dump_file` closes it once the whole
+result is written); its path form writes through `write_local_file`
+(`output/file_sink.hpp`) into a temporary sibling (`temporary_path`: same
+directory, hidden, timestamp + sequence number) that is renamed over the target
+only when the write succeeded — a failed COPY never truncates or removes a file
+already at the path, and readers see the old file or the whole new one. `chunk_to_parquet` writes
+snappy-compressed row groups of up to `parquet_row_group_rows` (128 Ki) rows.
+
+**Lifetime trap:** the returned chunks keep that
 resource alive — if you borrow the engine's resource (`engine_t::resource()`), the chunk
 must die *before* the engine does, otherwise `synchronized_pool_resource`
 deallocate sees freed memory (caught by TSan in
@@ -200,17 +208,16 @@ extension when `format=` is omitted).
 
 ### `operators/`
 
-`engine_requests.{hpp,cpp}` (namespace `otterstax::engine`) — every request otterstax makes to the embedded engine, as free functions sent straight to the engine dispatcher (`runtime::engine_t::dispatcher_address()`, `services::dispatcher::manager_dispatcher_t`); there is no engine actor of otterstax's own. Each names the engine SESSION it runs on (a query session passes its connection's; the catalog and the file manager their own) and the coroutines take the memory resource first and must be awaited from an actor coroutine (or a test's drive loop). Nothing throws; an engine refusal is an error cursor or an error value with the engine's own code.
+`engine_requests.{hpp,cpp}` (namespace `otterstax::engine`) — every request otterstax makes to the embedded engine, as free functions sent straight to the engine dispatcher (`runtime::engine_t::dispatcher_address()`, `services::dispatcher::manager_dispatcher_t`); there is no engine actor of otterstax's own. Each names the engine SESSION it runs on (a query session passes its connection's; the catalog its own) and the coroutines take the memory resource first and must be awaited from an actor coroutine (or a test's drive loop). Nothing throws; an engine refusal is an error cursor or an error value with the engine's own code.
 
 - `sql_plan` — one bookkeeping SQL statement through the engine's own parser and transformer.
 - `send_plan` — one plan on a session. (A statement that failed before the engine is reported by the query session itself, `manager_dispatcher_t::refuse_statement`, so it fails an open transaction.)
 - `execute_statement` — runs a parsed statement and holds the answer to the shape its root owes: a DML without RETURNING answers its count through `cursor->affected_rows()` (a write to a remote table too: the backend's count when the pushdown rule made it one remote statement, otherwise the rows the engine handed the storage's sink — for an UPDATE / DELETE equal to the sum the backend reported, each row statement having to change exactly one row; `federation/CLAUDE.md`), a row-producing statement without columns is `schema_error`.
 - `describe` — the result schema without execution: the engine's plan-only EXPLAIN when every parameter is bound and the statement is not a set operation (a remote table's columns come from `federation.remote_columns`; no backend is asked), else the federated computation over one probe per relation the root reads — a `LIMIT 0` read (`schema_probe.hpp`) for a local one, `probe_declared_columns` (a plan-only EXPLAIN of a read of the full name) for a remote one, positional. The engine always answers a cursor (asserted).
-- `delete_rows_plan` (the one builder of a `DELETE … WHERE c1 = v1 AND …` plan: node_delete over node_match named on the node, the referencing constraints looked up, every value bound as a parameter — the caller sends it, e.g. inside the startup's metadata transaction), and `create_table` — the file / s3 load: makes the database exist, refuses a relation already under the name as `table_already_exists` (the engine accepts a create over an existing table and the insert would append), creates the table from the chunk's columns (a create node named on its target) and inserts (node_insert named on the node, constraints looked up; rows cut to the chunk contract). The statement plan, the relation probe, the create and the insert are internal to `engine_requests.cpp`.
+- `create_table_plan` / `load_table` — the load behind CREATE EXTERNAL TABLE, on the session it is given (the query session passes its connection's): CREATE TABLE of the target as written (1–4 parts, its empty slots the session's place; the database is not created, a missing schema and an existing relation are the engine's refusals — `table_already_exists`), a column without a name `invalid_parameter`; then the insert of the loader's run (node_insert named on the node, the write target looked up, each chunk within the chunk contract); `own_block` wraps both in BEGIN / COMMIT, ROLLBACK on a failure, the answer carrying the status the session is left in.
 
-The engine evaluates aggregates over constants correctly, so no plan rewrite or guard stands in front of it (`tests/system/test_constant_aggregates.cpp` pins the engine's answers). `tests/system/test_engine_requests.cpp` and `tests/unit/schema/test_schema_probe.cpp` cover these over a real engine.
+The engine evaluates aggregates over constants correctly, so no plan rewrite or guard stands in front of it (`tests/system/test_constant_aggregates.cpp` pins the engine's answers). `tests/system/test_engine_requests.cpp` and `tests/system/test_external_registration.cpp` cover these over a real engine.
 
-`schema_probe.hpp` — the probe protocol shared by `describe` / `create_table` and `KafkaManager::recover()`. Every answer comes out of the engine's REPLY, never off the plan the probe sent: a plan travels into the dispatcher by value and the engine keeps writing to its nodes while it runs. Three questions, one plan each: `make_table_probe` → `read_columns` (the column types, from the cursor of a `LIMIT 0` read — the same answer for an empty relation and a full one, and a VIEW comes back expanded because the engine splices the body into the probe's own aggregate); `make_namespace_probe` → `read_namespace_oid` and `make_relation_probe` → `read_relation` (pg_class oid + relkind, which is what tells a base relation from a VIEW). The pg_catalog lookups bind their literal as a plan parameter, so no name is ever spelled into SQL text.
 
 ## Adding a New Backend Translator
 

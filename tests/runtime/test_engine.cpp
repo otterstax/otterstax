@@ -14,9 +14,9 @@ TEST_CASE("engine: rows written before a shutdown are read after a reopen on the
         runtime_t runtime(small_runtime());
         auto engine = open_ok(runtime, dir.path());
         REQUIRE(execute_sql(*engine, session, "CREATE DATABASE rt;")->is_success());
-        REQUIRE(execute_sql(*engine, session, "CREATE TABLE rt.items (id BIGINT, name STRING);")->is_success());
+        REQUIRE(execute_sql(*engine, session, "CREATE TABLE rt.public.items (id BIGINT, name STRING);")->is_success());
         auto inserted =
-            execute_sql(*engine, session, "INSERT INTO rt.items (id, name) VALUES (1, 'one'), (2, 'two'), (3, 'three');");
+            execute_sql(*engine, session, "INSERT INTO rt.public.items (id, name) VALUES (1, 'one'), (2, 'two'), (3, 'three');");
         REQUIRE(inserted->is_success());
         CHECK(inserted->affected_rows() == 3);
         // The shutdown checkpoint folds the journal into the table files.
@@ -26,16 +26,16 @@ TEST_CASE("engine: rows written before a shutdown are read after a reopen on the
 
     runtime_t runtime(small_runtime());
     auto engine = open_ok(runtime, dir.path());
-    auto rows = execute_sql(*engine, session, "SELECT id, name FROM rt.items ORDER BY id;");
+    auto rows = execute_sql(*engine, session, "SELECT id, name FROM rt.public.items ORDER BY id;");
     REQUIRE(rows->is_success());
     REQUIRE(rows->size() == 3);
-    CHECK(rows->value(0, 0).value<int64_t>() == 1);
-    CHECK(rows->value(0, 2).value<int64_t>() == 3);
-    CHECK(std::string{rows->value(1, 1).value<std::string_view>()} == "two");
+    CHECK(rows->get<int64_t>(0, 0).value() == 1);
+    CHECK(rows->get<int64_t>(0, 2).value() == 3);
+    CHECK(std::string{rows->get<std::string_view>(1, 1).value()} == "two");
 
     // The reopened engine keeps writing.
-    REQUIRE(execute_sql(*engine, session, "INSERT INTO rt.items (id, name) VALUES (4, 'four');")->is_success());
-    auto count = execute_sql(*engine, session, "SELECT id FROM rt.items;");
+    REQUIRE(execute_sql(*engine, session, "INSERT INTO rt.public.items (id, name) VALUES (4, 'four');")->is_success());
+    auto count = execute_sql(*engine, session, "SELECT id FROM rt.public.items;");
     REQUIRE(count->is_success());
     CHECK(count->size() == 4);
 }
@@ -48,7 +48,7 @@ TEST_CASE("engine: a second engine on a directory another engine owns is refused
     runtime_t second_runtime(small_runtime());
     auto second = engine_t::open(second_runtime, engine_config(dir.path()));
     REQUIRE(second.has_error());
-    CHECK(second.error().type == core::error_code_t::already_exists);
+    CHECK(second.error().type == core::error_code_t::lock_file_exists);
     CHECK(mentions(second.error(), "another engine already owns"));
     // The pools were lent to the refused open: the next engine needs a new runtime.
     temp_dir_t free_dir("locked_other");

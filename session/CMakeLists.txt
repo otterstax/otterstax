@@ -4,15 +4,12 @@ set(SESSION_HEADERS
     session_factory.hpp
     session_ids.hpp
     session_payload.hpp
-    statement_kind.hpp
-    transaction_state.hpp
 )
 
 set(SESSION_SOURCES
     plan_inspection.cpp
     query_session.cpp
     session_factory.cpp
-    statement_kind.cpp
 )
 
 add_library(session
@@ -22,10 +19,9 @@ add_library(session
 
 # The session sends to the engine dispatcher (otterbrix_local's
 # engine_requests), the s3 manager, the file connector and the KafkaManager,
-# calls the remote backends the federation registry holds (remote DDL,
-# rediscovery), reads plans through otterbrix_local
-# (parser, schema_utils, schema_probe) and the federation registry and metadata
-# through catalog / otterstax_federation. The session factory stops the
+# registers a missed table of a connection through catalog (registration,
+# ownership) and the backend actor of otterstax_federation, and reads plans
+# through otterbrix_local (parser). The session factory stops the
 # runtime's sessions pool in its shutdown (runtime_t::stop_sessions).
 target_link_libraries(session PUBLIC
     Boost::boost

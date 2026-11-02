@@ -52,7 +52,7 @@ namespace ch {
         // ping succeeds or the reconnect fails on exactly its send_retries-th
         // turn, so a backend that completed every handshake but never answered
         // a Ping kept the io thread reconnecting for good. The liveness check
-        // is the manager's: ConnectorManager::executeQuery runs isConnected()
+        // is the backend agent's: it runs isConnected()
         // (one direct Ping, bounded by io_timeout) and tryReconnect() in front
         // of every query, so the driver's own ping was a second copy of it.
         // Without it RetryGuard — the only user of retry_timeout, which is
@@ -274,4 +274,7 @@ namespace ch {
     bool Connector::isClosed() const noexcept { return status_ == Status::Closed; }
     std::string Connector::alias() const noexcept { return alias_; }
 
+    std::unique_ptr<IConnector> make_ch_connector(std::pmr::memory_resource* resource, connect_params params, std::string alias) {
+        return std::make_unique<Connector>(resource, std::move(params), std::move(alias));
+    }
 } // namespace ch

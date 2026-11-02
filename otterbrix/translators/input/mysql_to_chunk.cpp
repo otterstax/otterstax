@@ -18,205 +18,198 @@ namespace tsl {
     // set_string, to_local_translator, ...); with external linkage the linker keeps one
     // definition of each for every translator, whatever its layout.
     namespace {
-        // False: the value has no reading as its column's type (the chunk is not filled).
-        using rows_to_otterbrix = bool (*)(data_chunk_t&, const boost::mysql::rows_view&, size_t, size_t);
+        using components::casts::kernels::detail::parse_outcome;
 
-        bool set_int8(data_chunk_t& chunk, const boost::mysql::rows_view& rows, size_t row_index, size_t column_index) {
+        // Not parsed: the value has no reading as its column's type (malformed) or is past its range.
+        using rows_to_otterbrix = parse_outcome (*)(data_chunk_t&, const boost::mysql::rows_view&, size_t, size_t);
+
+        parse_outcome set_int8(data_chunk_t& chunk, const boost::mysql::rows_view& rows, size_t row_index, size_t column_index) {
             if (rows.at(row_index).at(column_index).kind() == boost::mysql::field_kind::null) {
-                chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), nullptr});
-                return true;
+                chunk.data[column_index].set_null(row_index, true);
+                return parse_outcome::parsed;
             }
             chunk.set_value(
                 column_index,
                 row_index,
-                types::logical_value_t{chunk.resource(),
-                                       static_cast<int8_t>(rows.at(row_index).at(column_index).as_int64())});
-            return true;
+                static_cast<int8_t>(rows.at(row_index).at(column_index).as_int64()));
+            return parse_outcome::parsed;
         }
 
-        bool
+        parse_outcome
         set_int16(data_chunk_t& chunk, const boost::mysql::rows_view& rows, size_t row_index, size_t column_index) {
             if (rows.at(row_index).at(column_index).kind() == boost::mysql::field_kind::null) {
-                chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), nullptr});
-                return true;
+                chunk.data[column_index].set_null(row_index, true);
+                return parse_outcome::parsed;
             }
             chunk.set_value(
                 column_index,
                 row_index,
-                types::logical_value_t{chunk.resource(),
-                                       static_cast<int16_t>(rows.at(row_index).at(column_index).as_int64())});
-            return true;
+                static_cast<int16_t>(rows.at(row_index).at(column_index).as_int64()));
+            return parse_outcome::parsed;
         }
 
-        bool
+        parse_outcome
         set_int32(data_chunk_t& chunk, const boost::mysql::rows_view& rows, size_t row_index, size_t column_index) {
             if (rows.at(row_index).at(column_index).kind() == boost::mysql::field_kind::null) {
-                chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), nullptr});
-                return true;
+                chunk.data[column_index].set_null(row_index, true);
+                return parse_outcome::parsed;
             }
             chunk.set_value(
                 column_index,
                 row_index,
-                types::logical_value_t{chunk.resource(),
-                                       static_cast<int32_t>(rows.at(row_index).at(column_index).as_int64())});
-            return true;
+                static_cast<int32_t>(rows.at(row_index).at(column_index).as_int64()));
+            return parse_outcome::parsed;
         }
 
-        bool
+        parse_outcome
         set_int64(data_chunk_t& chunk, const boost::mysql::rows_view& rows, size_t row_index, size_t column_index) {
             if (rows.at(row_index).at(column_index).kind() == boost::mysql::field_kind::null) {
-                chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), nullptr});
-                return true;
+                chunk.data[column_index].set_null(row_index, true);
+                return parse_outcome::parsed;
             }
             chunk.set_value(
                 column_index,
                 row_index,
-                types::logical_value_t{chunk.resource(),
-                                       static_cast<int64_t>(rows.at(row_index).at(column_index).as_int64())});
-            return true;
+                static_cast<int64_t>(rows.at(row_index).at(column_index).as_int64()));
+            return parse_outcome::parsed;
         }
 
-        bool
+        parse_outcome
         set_uint8(data_chunk_t& chunk, const boost::mysql::rows_view& rows, size_t row_index, size_t column_index) {
             if (rows.at(row_index).at(column_index).kind() == boost::mysql::field_kind::null) {
-                chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), nullptr});
-                return true;
+                chunk.data[column_index].set_null(row_index, true);
+                return parse_outcome::parsed;
             }
             chunk.set_value(
                 column_index,
                 row_index,
-                types::logical_value_t{chunk.resource(),
-                                       static_cast<uint8_t>(rows.at(row_index).at(column_index).as_uint64())});
-            return true;
+                static_cast<uint8_t>(rows.at(row_index).at(column_index).as_uint64()));
+            return parse_outcome::parsed;
         }
 
-        bool
+        parse_outcome
         set_uint16(data_chunk_t& chunk, const boost::mysql::rows_view& rows, size_t row_index, size_t column_index) {
             if (rows.at(row_index).at(column_index).kind() == boost::mysql::field_kind::null) {
-                chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), nullptr});
-                return true;
+                chunk.data[column_index].set_null(row_index, true);
+                return parse_outcome::parsed;
             }
             chunk.set_value(
                 column_index,
                 row_index,
-                types::logical_value_t{chunk.resource(),
-                                       static_cast<uint16_t>(rows.at(row_index).at(column_index).as_uint64())});
-            return true;
+                static_cast<uint16_t>(rows.at(row_index).at(column_index).as_uint64()));
+            return parse_outcome::parsed;
         }
 
-        bool
+        parse_outcome
         set_uint32(data_chunk_t& chunk, const boost::mysql::rows_view& rows, size_t row_index, size_t column_index) {
             if (rows.at(row_index).at(column_index).kind() == boost::mysql::field_kind::null) {
-                chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), nullptr});
-                return true;
+                chunk.data[column_index].set_null(row_index, true);
+                return parse_outcome::parsed;
             }
             chunk.set_value(
                 column_index,
                 row_index,
-                types::logical_value_t{chunk.resource(),
-                                       static_cast<uint32_t>(rows.at(row_index).at(column_index).as_uint64())});
-            return true;
+                static_cast<uint32_t>(rows.at(row_index).at(column_index).as_uint64()));
+            return parse_outcome::parsed;
         }
 
-        bool
+        parse_outcome
         set_uint64(data_chunk_t& chunk, const boost::mysql::rows_view& rows, size_t row_index, size_t column_index) {
             if (rows.at(row_index).at(column_index).kind() == boost::mysql::field_kind::null) {
-                chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), nullptr});
-                return true;
+                chunk.data[column_index].set_null(row_index, true);
+                return parse_outcome::parsed;
             }
             chunk.set_value(
                 column_index,
                 row_index,
-                types::logical_value_t{chunk.resource(),
-                                       static_cast<uint64_t>(rows.at(row_index).at(column_index).as_uint64())});
-            return true;
+                static_cast<uint64_t>(rows.at(row_index).at(column_index).as_uint64()));
+            return parse_outcome::parsed;
         }
 
-        bool
+        parse_outcome
         set_float(data_chunk_t& chunk, const boost::mysql::rows_view& rows, size_t row_index, size_t column_index) {
             if (rows.at(row_index).at(column_index).kind() == boost::mysql::field_kind::null) {
-                chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), nullptr});
-                return true;
+                chunk.data[column_index].set_null(row_index, true);
+                return parse_outcome::parsed;
             }
             chunk.set_value(column_index,
                             row_index,
-                            types::logical_value_t{chunk.resource(), rows.at(row_index).at(column_index).as_float()});
-            return true;
+                            rows.at(row_index).at(column_index).as_float());
+            return parse_outcome::parsed;
         }
 
-        bool
+        parse_outcome
         set_double(data_chunk_t& chunk, const boost::mysql::rows_view& rows, size_t row_index, size_t column_index) {
             if (rows.at(row_index).at(column_index).kind() == boost::mysql::field_kind::null) {
-                chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), nullptr});
-                return true;
+                chunk.data[column_index].set_null(row_index, true);
+                return parse_outcome::parsed;
             }
             chunk.set_value(column_index,
                             row_index,
-                            types::logical_value_t{chunk.resource(), rows.at(row_index).at(column_index).as_double()});
-            return true;
+                            rows.at(row_index).at(column_index).as_double());
+            return parse_outcome::parsed;
         }
 
-        bool set_bit(data_chunk_t& chunk, const boost::mysql::rows_view& rows, size_t row_index, size_t column_index) {
+        parse_outcome set_bit(data_chunk_t& chunk, const boost::mysql::rows_view& rows, size_t row_index, size_t column_index) {
             if (rows.at(row_index).at(column_index).kind() == boost::mysql::field_kind::null) {
-                chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), nullptr});
-                return true;
+                chunk.data[column_index].set_null(row_index, true);
+                return parse_outcome::parsed;
             }
             chunk.set_value(column_index,
                             row_index,
-                            types::logical_value_t{chunk.resource(), rows.at(row_index).at(column_index).as_uint64()});
-            return true;
+                            rows.at(row_index).at(column_index).as_uint64());
+            return parse_outcome::parsed;
         }
 
-        bool
+        parse_outcome
         set_string(data_chunk_t& chunk, const boost::mysql::rows_view& rows, size_t row_index, size_t column_index) {
             if (rows.at(row_index).at(column_index).kind() == boost::mysql::field_kind::null) {
-                chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), nullptr});
-                return true;
+                chunk.data[column_index].set_null(row_index, true);
+                return parse_outcome::parsed;
             }
             chunk.set_value(
                 column_index,
                 row_index,
-                types::logical_value_t{chunk.resource(), std::string(rows.at(row_index).at(column_index).as_string())});
-            return true;
+                std::string_view{rows.at(row_index).at(column_index).as_string()});
+            return parse_outcome::parsed;
         }
 
         // A DECIMAL(p, s) value arrives as the text MySQL prints for it (exactly s fraction digits),
         // read as the unscaled integer of the column's DECIMAL: every digit kept.
-        bool
+        parse_outcome
         set_decimal(data_chunk_t& chunk, const boost::mysql::rows_view& rows, size_t row_index, size_t column_index) {
             const auto field = rows.at(row_index).at(column_index);
             if (field.kind() == boost::mysql::field_kind::null) {
-                chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), nullptr});
-                return true;
+                chunk.data[column_index].set_null(row_index, true);
+                return parse_outcome::parsed;
             }
             if (field.kind() != boost::mysql::field_kind::string) {
-                return false;
+                return parse_outcome::malformed;
             }
             const auto& type = chunk.data[column_index].type();
             const auto* spec = type.extension_as<types::decimal_logical_type_extension>();
             types::int128_t unscaled = 0;
-            if (!components::casts::kernels::detail::parse_decimal(field.as_string(),
-                                                                   spec->width(),
-                                                                   spec->scale(),
-                                                                   &unscaled)) {
-                return false;
+            if (const auto outcome = components::casts::kernels::detail::parse_decimal(field.as_string(),
+                                                                                       spec->width(),
+                                                                                       spec->scale(),
+                                                                                       &unscaled);
+                outcome != parse_outcome::parsed) {
+                return outcome;
             }
-            chunk.set_value(column_index,
-                            row_index,
-                            types::logical_value_t::create_decimal(chunk.resource(), type, unscaled));
-            return true;
+            set_decimal_raw(chunk.data[column_index], row_index, unscaled);
+            return parse_outcome::parsed;
         }
 
-        bool set_blob(data_chunk_t& chunk, const boost::mysql::rows_view& rows, size_t row_index, size_t column_index) {
+        parse_outcome set_blob(data_chunk_t& chunk, const boost::mysql::rows_view& rows, size_t row_index, size_t column_index) {
             if (rows.at(row_index).at(column_index).kind() == boost::mysql::field_kind::null) {
-                chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), nullptr});
-                return true;
+                chunk.data[column_index].set_null(row_index, true);
+                return parse_outcome::parsed;
             }
             auto blob = rows.at(row_index).at(column_index).as_blob();
             chunk.set_value(column_index,
                             row_index,
-                            types::logical_value_t{chunk.resource(), std::string(blob.begin(), blob.end())});
-            return true;
+                            std::string_view{reinterpret_cast<const char*>(blob.data()), blob.size()});
+            return parse_outcome::parsed;
         }
 
         // `value` in at least `width` digits, zero-padded, as MySQL prints it.
@@ -307,42 +300,41 @@ namespace tsl {
             return out;
         }
 
-        bool set_date(data_chunk_t& chunk, const boost::mysql::rows_view& rows, size_t row_index, size_t column_index) {
+        parse_outcome set_date(data_chunk_t& chunk, const boost::mysql::rows_view& rows, size_t row_index, size_t column_index) {
             if (rows.at(row_index).at(column_index).kind() == boost::mysql::field_kind::null) {
-                chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), nullptr});
-                return true;
+                chunk.data[column_index].set_null(row_index, true);
+                return parse_outcome::parsed;
             }
             chunk.set_value(
                 column_index,
                 row_index,
-                types::logical_value_t{chunk.resource(), date_text(rows.at(row_index).at(column_index).as_date())});
-            return true;
+                std::string_view{date_text(rows.at(row_index).at(column_index).as_date())});
+            return parse_outcome::parsed;
         }
 
-        bool
+        parse_outcome
         set_datetime(data_chunk_t& chunk, const boost::mysql::rows_view& rows, size_t row_index, size_t column_index) {
             if (rows.at(row_index).at(column_index).kind() == boost::mysql::field_kind::null) {
-                chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), nullptr});
-                return true;
+                chunk.data[column_index].set_null(row_index, true);
+                return parse_outcome::parsed;
             }
             chunk.set_value(
                 column_index,
                 row_index,
-                types::logical_value_t{chunk.resource(),
-                                       datetime_text(rows.at(row_index).at(column_index).as_datetime())});
-            return true;
+                std::string_view{datetime_text(rows.at(row_index).at(column_index).as_datetime())});
+            return parse_outcome::parsed;
         }
 
-        bool set_time(data_chunk_t& chunk, const boost::mysql::rows_view& rows, size_t row_index, size_t column_index) {
+        parse_outcome set_time(data_chunk_t& chunk, const boost::mysql::rows_view& rows, size_t row_index, size_t column_index) {
             if (rows.at(row_index).at(column_index).kind() == boost::mysql::field_kind::null) {
-                chunk.set_value(column_index, row_index, types::logical_value_t{chunk.resource(), nullptr});
-                return true;
+                chunk.data[column_index].set_null(row_index, true);
+                return parse_outcome::parsed;
             }
             chunk.set_value(
                 column_index,
                 row_index,
-                types::logical_value_t{chunk.resource(), time_text(rows.at(row_index).at(column_index).as_time())});
-            return true;
+                std::string_view{time_text(rows.at(row_index).at(column_index).as_time())});
+            return parse_outcome::parsed;
         }
 
         struct value_translator_t {
@@ -503,7 +495,7 @@ namespace tsl {
                 std::ostringstream what;
                 what << "mysql_to_chunk: unsupported column type " << column.type() << " for column '"
                      << column.column_name() << "'";
-                return make_error(resource, core::error_code_t::conversion_failure, what.str());
+                return make_error(resource, core::error_code_t::unimplemented_yet, what.str());
             }
             translators.emplace_back(std::move(*translator));
             types.emplace_back(translators.back().type);
@@ -514,11 +506,17 @@ namespace tsl {
 
         for (size_t i = 0; i < nrows; i++) {
             for (size_t j = 0; j < ncolumns; j++) {
-                if (!translators.at(j).conversion_func(chunk, result.rows(), i, j)) {
+                if (const auto outcome = translators.at(j).conversion_func(chunk, result.rows(), i, j);
+                    outcome != parse_outcome::parsed) {
                     std::ostringstream what;
                     what << "mysql_to_chunk: the value in row " << i << " of column '" << metadata[j].column_name()
-                         << "' has no reading as the column's type";
-                    return make_error(resource, core::error_code_t::conversion_failure, what.str());
+                         << (outcome == parse_outcome::out_of_range ? "' is out of the column's range"
+                                                                    : "' has no reading as the column's type");
+                    return make_error(resource,
+                                      outcome == parse_outcome::out_of_range
+                                          ? core::error_code_t::numeric_value_out_of_range
+                                          : core::error_code_t::invalid_text_representation,
+                                      what.str());
                 }
             }
         }

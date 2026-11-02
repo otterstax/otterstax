@@ -54,33 +54,44 @@ namespace frontend::postgres {
         assert(session_ != nullptr && "every connection has a query session");
     }
 
-    postgres_connection::prepared_stmt_meta::prepared_stmt_meta(std::pmr::memory_resource* resource,
-                                                                otterstax::session::statement_id_t stmt_session,
-                                                                std::string sql,
-                                                                uint32_t parameter_count,
-                                                                components::types::complex_logical_type schema,
-                                                                std::pmr::vector<field_type> specified_types,
-                                                                NodeTag tag)
+    postgres_connection::statement_run_t::statement_run_t(std::pmr::memory_resource* resource,
+                                                          otterstax::session::statement_id_t stmt_session,
+                                                          std::string_view sql,
+                                                          components::types::complex_logical_type schema,
+                                                          NodeTag tag)
         : stmt_session(stmt_session)
-        , sql(sql.c_str(), sql.size(), resource)
-        , consumed(false)
-        , parameter_count(parameter_count)
+        , sql(sql, resource)
         , schema(std::move(schema))
-        , tag(tag)
-        , specified_types(std::move(specified_types))
-        , portal_names(resource)
-        , described(false)
-        , deallocate() {}
+        , tag(tag) {}
+
+    postgres_connection::statement_run_t::statement_run_t(const statement_run_t& other,
+                                                          std::pmr::memory_resource* resource)
+        : stmt_session(other.stmt_session)
+        , sql(other.sql, resource)
+        , schema(other.schema)
+        , tag(other.tag)
+        , deallocate(other.deallocate)
+        , protocol_setting(other.protocol_setting)
+        , show(other.show)
+        , resets_client_parameters(other.resets_client_parameters) {}
+
+    postgres_connection::prepared_stmt_meta::prepared_stmt_meta(statement_run_t run,
+                                                                uint32_t parameter_count,
+                                                                std::pmr::vector<field_type> specified_types)
+        : run(std::move(run))
+        , parameter_count(parameter_count)
+        , specified_types(std::move(specified_types)) {}
 
     postgres_connection::portal_meta::portal_meta(portal_t params,
-                                                  statement_ptr statement,
+                                                  std::string statement_name,
+                                                  statement_run_t run,
+                                                  bool statement_described,
                                                   std::vector<result_encoding> format)
         : params(std::move(params))
-        , statement(std::move(statement))
-        , format(std::move(format))
-        , described(false)
-        , result()
-        , emitted(0) {}
+        , statement_name(std::move(statement_name))
+        , run(std::move(run))
+        , statement_described(statement_described)
+        , format(std::move(format)) {}
 
     std::vector<uint8_t> postgres_connection::build_too_many_connections_error() {
         packet_writer writer;
@@ -243,8 +254,10 @@ namespace frontend::postgres {
                 }
 
                 if (query.empty()) {
-                    send_packet_merged({build_empty_query_response(writer_),
-                                        build_ready_for_query(writer_, ready_status())});
+                    std::vector<std::vector<uint8_t>> response;
+                    response.emplace_back(build_empty_query_response(writer_));
+                    append_ready_for_query(response);
+                    send_packet_merged(std::move(response));
                     break;
                 }
 
@@ -426,7 +439,16 @@ namespace frontend::postgres {
                     send_error_response(sql_state::PROTOCOL_VIOLATION, INVALID_MESSAGE_FORMAT);
                     return;
                 }
-                send_packet(build_ready_for_query(writer_, ready_status()));
+                // Outside a block the Sync ends the implicit transaction, and
+                // with it every portal (PostgreSQL drops them at the
+                // transaction's end): a window one of them left open is closed
+                // (it holds the statement's snapshot until it ends).
+                if (session_->transaction_status() == components::session::transaction_status_t::idle) {
+                    release_portals(true);
+                }
+                std::vector<std::vector<uint8_t>> response;
+                append_ready_for_query(response);
+                send_packet_merged(std::move(response));
                 break;
             }
             case message_type::frontend::FLUSH:
@@ -458,14 +480,17 @@ namespace frontend::postgres {
         }
     }
 
-    void postgres_connection::send_error_response(const char* sqlstate, std::string message, error_severity severity) {
+    void postgres_connection::send_error_response(const char* sqlstate,
+                                                  std::string message,
+                                                  error_severity severity,
+                                                  std::string hint) {
         log_->warn("[Connection {}] ERROR: sqlstate={} msg='{}'", connection_id_, sqlstate, message);
         const bool ready_for_query_at_sync = pipeline_.set_error();
         if (severity.tag == error_severity::fatal().tag) {
             // FATAL closes the connection: a broken startup, a message type the
             // protocol does not define, a transport error, exhausted resources —
             // never a malformed message of a known type after startup.
-            send_packet(build_error_response(writer_, sqlstate, std::move(message), severity), false);
+            send_packet(build_error_response(writer_, sqlstate, std::move(message), severity, std::move(hint)), false);
             finish();
             return;
         }
@@ -481,21 +506,23 @@ namespace frontend::postgres {
         // answer shows it applied ReadyForQuery reports 'E' (failure_pending_).
         // Outside a block there is nothing to fail and the status stays 'I'.
         if (session_ != nullptr && !failure_pending_ &&
-            session_->transaction_state() == otterstax::session::transaction_state_t::in_block) {
+            session_->transaction_status() == components::session::transaction_status_t::in_transaction) {
             [[maybe_unused]] auto [needs_sched, fut] =
                 actor_zeta::send(session_->address(),
                                  &otterstax::session::query_session_t::fail_transaction,
-                                 core::error_code_t::other_error,
+                                 core::error_code_t::protocol_violation,
                                  std::string{message});
             failure_pending_ = true;
         }
         if (ready_for_query_at_sync) {
             // Inside an extended-query pipeline the ErrorResponse goes alone:
             // the Sync that ends the pipeline answers the ReadyForQuery.
-            send_packet(build_error_response(writer_, sqlstate, std::move(message), severity));
+            send_packet(build_error_response(writer_, sqlstate, std::move(message), severity, std::move(hint)));
         } else {
-            send_packet_merged({build_error_response(writer_, sqlstate, std::move(message), severity),
-                                build_ready_for_query(writer_, ready_status())});
+            std::vector<std::vector<uint8_t>> response;
+            response.emplace_back(build_error_response(writer_, sqlstate, std::move(message), severity, std::move(hint)));
+            append_ready_for_query(response);
+            send_packet_merged(std::move(response));
         }
     }
 } // namespace frontend::postgres

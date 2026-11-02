@@ -153,7 +153,12 @@ namespace otterstax::kafka {
         for (const auto& child : root->children()) {
             inspect(child.get());
         }
-        if (!insert || insert->target().database.t != KAFKA_DATABASE_NAME) {
+        if (!insert) {
+            return std::nullopt;
+        }
+        const auto& target = insert->target();
+        if (!target.connection.t.empty() || (!target.database.t.empty() && target.database.t != KAFKA_DATABASE_NAME) ||
+            (!target.schema.t.empty() && target.schema.t != KAFKA_SCHEMA_NAME)) {
             return std::nullopt;
         }
         if (insert->children().empty()) {
@@ -164,7 +169,16 @@ namespace otterstax::kafka {
         // the latter a continuous INSERT INTO query — the caller routes on this
         auto source = insert->children().front();
         const bool source_is_select = source->type() != logical_plan::node_type::data_t;
-        return kafka_write_t{insert->target().collection.t, std::move(source), source_is_select};
+        return kafka_write_t{target, std::move(source), source_is_select};
+    }
+
+    bool kafka_target_named(const qualified_name_t& written, std::string_view database, std::string_view schema) {
+        // The completion otterbrix applies to a name the place fills in
+        // (components::catalog::complete_name): a written database brings its
+        // schema slot with it, an empty schema is the place's.
+        const std::string_view db = written.database.t.empty() ? database : std::string_view{written.database.t};
+        const std::string_view sch = written.schema.t.empty() ? schema : std::string_view{written.schema.t};
+        return written.connection.t.empty() && db == KAFKA_DATABASE_NAME && sch == KAFKA_SCHEMA_NAME;
     }
 
     namespace {

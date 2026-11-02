@@ -155,4 +155,7 @@ namespace pg {
     bool Connector::isClosed() const noexcept { return status_ == Status::Closed; }
     std::string Connector::alias() const noexcept { return alias_; }
 
+    std::unique_ptr<IConnector> make_pg_connector(std::pmr::memory_resource* resource, connect_params params, std::string alias) {
+        return std::make_unique<Connector>(resource, std::move(params), std::move(alias));
+    }
 } // namespace pg

@@ -2,6 +2,7 @@
 // Copyright 2025-2026  OtterStax
 
 #include "otterbrix/translators/input/mysql_to_chunk.hpp"
+#include "../../mock/cell.hpp"
 
 #include <catch2/catch_all.hpp>
 
@@ -141,8 +142,8 @@ TEST_CASE("mysql discovery types every column exactly as the data path types it"
             // the same code: never a column registered without a type.
             REQUIRE(chunk.has_error() == schema.has_error());
             if (chunk.has_error()) {
-                REQUIRE(chunk.error().type == core::error_code_t::conversion_failure);
-                REQUIRE(schema.error().type == core::error_code_t::conversion_failure);
+                REQUIRE(chunk.error().type == core::error_code_t::unimplemented_yet);
+                REQUIRE(schema.error().type == core::error_code_t::unimplemented_yet);
                 continue;
             }
 
@@ -254,12 +255,12 @@ TEST_CASE("mysql types: an unknown column type is refused by both paths") {
 
     auto chunk = tsl::mysql_to_chunk(resource, result);
     REQUIRE(chunk.has_error());
-    REQUIRE(chunk.error().type == core::error_code_t::conversion_failure);
+    REQUIRE(chunk.error().type == core::error_code_t::unimplemented_yet);
     REQUIRE(std::string{chunk.error().what.c_str()}.find("mystery") != std::string::npos);
 
     auto schema = tsl::mysql_to_struct(resource, result);
     REQUIRE(schema.has_error());
-    REQUIRE(schema.error().type == core::error_code_t::conversion_failure);
+    REQUIRE(schema.error().type == core::error_code_t::unimplemented_yet);
     REQUIRE(std::string{schema.error().what.c_str()}.find("mystery") != std::string::npos);
 }
 
@@ -278,7 +279,7 @@ TEST_CASE("mysql types: a result set without columns has an empty schema") {
 
 namespace {
 
-    components::types::int128_t unscaled_of(const logical_value_t& value) {
+    components::types::int128_t unscaled_of(const otterstax::test::cell_t& value) {
         switch (value.type().to_physical_type()) {
             case physical_type::INT16:
                 return value.value<int16_t>();
@@ -321,18 +322,18 @@ TEST_CASE("mysql types: DECIMAL of at most 38 digits is the engine's DECIMAL of 
         REQUIRE(schema.value().child_types()[col] == types[col]);
     }
     const auto& rows = chunk.value();
-    REQUIRE(unscaled_of(rows.value(0, 0)) == 1234567812);
-    REQUIRE(unscaled_of(rows.value(0, 1)) == -50);
-    REQUIRE(unscaled_of(rows.value(1, 0)) == -42);
-    REQUIRE(rows.value(1, 1).is_null());
+    REQUIRE(unscaled_of(otterstax::test::cell(rows, 0, 0)) == 1234567812);
+    REQUIRE(unscaled_of(otterstax::test::cell(rows, 0, 1)) == -50);
+    REQUIRE(unscaled_of(otterstax::test::cell(rows, 1, 0)) == -42);
+    REQUIRE(otterstax::test::cell(rows, 1, 1).is_null());
     components::types::int128_t wide = 0;
     for (char digit : std::string_view{"12345678901234567890123456780123456789"}) {
         wide = wide * 10 + (digit - '0');
     }
-    REQUIRE(unscaled_of(rows.value(2, 0)) == wide);
-    REQUIRE(unscaled_of(rows.value(2, 1)) == -1);
-    REQUIRE(unscaled_of(rows.value(3, 0)) == 5);
-    REQUIRE(unscaled_of(rows.value(3, 1)) == 9999999999);
+    REQUIRE(unscaled_of(otterstax::test::cell(rows, 2, 0)) == wide);
+    REQUIRE(unscaled_of(otterstax::test::cell(rows, 2, 1)) == -1);
+    REQUIRE(unscaled_of(otterstax::test::cell(rows, 3, 0)) == 5);
+    REQUIRE(unscaled_of(otterstax::test::cell(rows, 3, 1)) == 9999999999);
 }
 
 // A DECIMAL wider than 38 digits (MySQL takes 65: DECIMAL(65, 30), and what it answers for SUM over
@@ -344,16 +345,16 @@ TEST_CASE("mysql types: a DECIMAL wider than 38 digits is carried as its exact t
     auto chunk = tsl::mysql_to_chunk(resource, result);
     REQUIRE_FALSE(chunk.has_error());
     REQUIRE(chunk.value().types().front().type() == logical_type::STRING_LITERAL);
-    REQUIRE(chunk.value().value(0, 0).value<std::string_view>() == sixty_five);
+    REQUIRE(otterstax::test::cell(chunk.value(), 0, 0).value<std::string_view>() == sixty_five);
     REQUIRE(discovered_type(column_type::decimal, false) == logical_type::STRING_LITERAL); // no precision reported
 }
 
-// A DECIMAL text the declared precision cannot hold is a conversion_failure naming the column.
-TEST_CASE("mysql types: a DECIMAL value past its declared precision is conversion_failure") {
+// A DECIMAL text the declared precision cannot hold is a numeric_value_out_of_range naming the column.
+TEST_CASE("mysql types: a DECIMAL value past its declared precision is numeric_value_out_of_range") {
     auto* resource = std::pmr::new_delete_resource();
     auto result = make_results({{"price", column_type::decimal, false, 6, 2}}, {{std::string{"1234.56"}}});
     auto chunk = tsl::mysql_to_chunk(resource, result);
     REQUIRE(chunk.has_error());
-    REQUIRE(chunk.error().type == core::error_code_t::conversion_failure);
+    REQUIRE(chunk.error().type == core::error_code_t::numeric_value_out_of_range);
     REQUIRE(std::string{chunk.error().what.c_str()}.find("price") != std::string::npos);
 }

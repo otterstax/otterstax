@@ -2,6 +2,7 @@
 // Copyright 2025-2026  OtterStax
 
 #include "otterbrix/translators/input/ch_to_chunk.hpp"
+#include "../../mock/cell.hpp"
 
 #include <catch2/catch_all.hpp>
 
@@ -115,9 +116,9 @@ TEST_CASE("ch_to_chunk: Int32 column values round-trip") {
     const auto& chunk = converted.value();
 
     REQUIRE(chunk.size() == 3);
-    REQUIRE(chunk.value(0, 0).value<int32_t>() == 10);
-    REQUIRE(chunk.value(0, 1).value<int32_t>() == 20);
-    REQUIRE(chunk.value(0, 2).value<int32_t>() == 30);
+    REQUIRE(otterstax::test::cell(chunk, 0, 0).value<int32_t>() == 10);
+    REQUIRE(otterstax::test::cell(chunk, 0, 1).value<int32_t>() == 20);
+    REQUIRE(otterstax::test::cell(chunk, 0, 2).value<int32_t>() == 30);
 }
 
 TEST_CASE("ch_to_chunk: Float64 column values round-trip") {
@@ -134,8 +135,8 @@ TEST_CASE("ch_to_chunk: Float64 column values round-trip") {
     const auto& chunk = converted.value();
 
     REQUIRE(chunk.size() == 2);
-    REQUIRE(chunk.value(0, 0).value<double>() == Catch::Approx(1.5));
-    REQUIRE(chunk.value(0, 1).value<double>() == Catch::Approx(2.5));
+    REQUIRE(otterstax::test::cell(chunk, 0, 0).value<double>() == Catch::Approx(1.5));
+    REQUIRE(otterstax::test::cell(chunk, 0, 1).value<double>() == Catch::Approx(2.5));
 }
 
 TEST_CASE("ch_to_chunk: String column values round-trip") {
@@ -152,8 +153,8 @@ TEST_CASE("ch_to_chunk: String column values round-trip") {
     const auto& chunk = converted.value();
 
     REQUIRE(chunk.size() == 2);
-    REQUIRE(chunk.value(0, 0).value<std::string_view>() == "hello");
-    REQUIRE(chunk.value(0, 1).value<std::string_view>() == "world");
+    REQUIRE(otterstax::test::cell(chunk, 0, 0).value<std::string_view>() == "hello");
+    REQUIRE(otterstax::test::cell(chunk, 0, 1).value<std::string_view>() == "world");
 }
 
 TEST_CASE("ch_to_chunk: empty block produces empty chunk") {
@@ -210,7 +211,7 @@ TEST_CASE("ch_to_chunk: a String override over an Int32 wire column keeps the co
 
     REQUIRE(chunk.size() == 1);
     REQUIRE(chunk.types()[0].type() == logical_type::INTEGER);
-    REQUIRE(chunk.value(0, 0).value<int32_t>() == 42);
+    REQUIRE(otterstax::test::cell(chunk, 0, 0).value<int32_t>() == 42);
 }
 
 TEST_CASE("ch_to_struct: Int64 and UInt32 columns") {
@@ -334,28 +335,28 @@ void require_scalar_types(const data_chunk_t& chunk) {
 }
 
 void require_scalar_values(const data_chunk_t& chunk, uint64_t row) {
-    REQUIRE(chunk.value(0, row).value<int8_t>() == -5);
-    REQUIRE(chunk.value(1, row).value<int16_t>() == -300);
-    REQUIRE(chunk.value(2, row).value<int32_t>() == -70000);
-    REQUIRE(chunk.value(3, row).value<int64_t>() == -(int64_t{1} << 40));
-    REQUIRE(chunk.value(4, row).value<uint8_t>() == 200);
-    REQUIRE(chunk.value(5, row).value<uint16_t>() == 60000);
-    REQUIRE(chunk.value(6, row).value<uint32_t>() == 4000000000U);
-    REQUIRE(chunk.value(7, row).value<uint64_t>() == (uint64_t{1} << 63));
-    REQUIRE(chunk.value(8, row).value<float>() == 1.25F);
-    REQUIRE(chunk.value(9, row).value<double>() == -2.5);
-    REQUIRE(chunk.value(10, row).value<std::string_view>() == "text");
-    REQUIRE(chunk.value(11, row).value<std::string_view>() == "abcd");
-    REQUIRE(chunk.value(12, row).value<std::string_view>() == "1970-01-01");
-    REQUIRE(chunk.value(13, row).value<std::string_view>() == "2024-01-02 03:04:05");
+    REQUIRE(otterstax::test::cell(chunk, 0, row).value<int8_t>() == -5);
+    REQUIRE(otterstax::test::cell(chunk, 1, row).value<int16_t>() == -300);
+    REQUIRE(otterstax::test::cell(chunk, 2, row).value<int32_t>() == -70000);
+    REQUIRE(otterstax::test::cell(chunk, 3, row).value<int64_t>() == -(int64_t{1} << 40));
+    REQUIRE(otterstax::test::cell(chunk, 4, row).value<uint8_t>() == 200);
+    REQUIRE(otterstax::test::cell(chunk, 5, row).value<uint16_t>() == 60000);
+    REQUIRE(otterstax::test::cell(chunk, 6, row).value<uint32_t>() == 4000000000U);
+    REQUIRE(otterstax::test::cell(chunk, 7, row).value<uint64_t>() == (uint64_t{1} << 63));
+    REQUIRE(otterstax::test::cell(chunk, 8, row).value<float>() == 1.25F);
+    REQUIRE(otterstax::test::cell(chunk, 9, row).value<double>() == -2.5);
+    REQUIRE(otterstax::test::cell(chunk, 10, row).value<std::string_view>() == "text");
+    REQUIRE(otterstax::test::cell(chunk, 11, row).value<std::string_view>() == "abcd");
+    REQUIRE(otterstax::test::cell(chunk, 12, row).value<std::string_view>() == "1970-01-01");
+    REQUIRE(otterstax::test::cell(chunk, 13, row).value<std::string_view>() == "2024-01-02 03:04:05");
     // Without an override DateTime64 is its text with the column's precision, and an Array is
     // a LIST of its elements.
-    REQUIRE(chunk.value(14, row).value<std::string_view>() == "2024-01-02 03:04:05.123");
-    REQUIRE(chunk.value(15, row).value<std::string_view>() == "01234567-89ab-cdef-fedc-ba9876543210");
-    REQUIRE(chunk.value(16, row).value<int32_t>() == 5);
-    REQUIRE(chunk.value(17, row).children().size() == 2);
-    REQUIRE(chunk.value(17, row).children()[0].value<int32_t>() == 1);
-    REQUIRE(chunk.value(17, row).children()[1].value<int32_t>() == 2);
+    REQUIRE(otterstax::test::cell(chunk, 14, row).value<std::string_view>() == "2024-01-02 03:04:05.123");
+    REQUIRE(otterstax::test::cell(chunk, 15, row).value<std::string_view>() == "01234567-89ab-cdef-fedc-ba9876543210");
+    REQUIRE(otterstax::test::cell(chunk, 16, row).value<int32_t>() == 5);
+    REQUIRE(otterstax::test::cell(chunk, 17, row).child_count() == 2);
+    REQUIRE(otterstax::test::cell(chunk, 17, row).child(0).value<int32_t>() == 1);
+    REQUIRE(otterstax::test::cell(chunk, 17, row).child(1).value<int32_t>() == 2);
 }
 
 clickhouse::Block make_tuple_block(int32_t first_id, const std::vector<std::optional<std::string>>& names) {
@@ -412,10 +413,10 @@ TEST_CASE("ch_to_chunk characterization: Nullable columns keep the nested type a
         REQUIRE(chunk.size() == 2);
         REQUIRE(chunk.types()[0].type() == logical_type::INTEGER);
         REQUIRE(chunk.types()[1].type() == logical_type::STRING_LITERAL);
-        REQUIRE(chunk.value(0, 0).value<int32_t>() == 5);
-        REQUIRE(chunk.value(0, 1).is_null());
-        REQUIRE(chunk.value(1, 0).is_null());
-        REQUIRE(chunk.value(1, 1).value<std::string_view>() == "x");
+        REQUIRE(otterstax::test::cell(chunk, 0, 0).value<int32_t>() == 5);
+        REQUIRE(otterstax::test::cell(chunk, 0, 1).is_null());
+        REQUIRE(otterstax::test::cell(chunk, 1, 0).is_null());
+        REQUIRE(otterstax::test::cell(chunk, 1, 1).value<std::string_view>() == "x");
     }
     SECTION("multi block") {
         auto converted = tsl::ch_to_chunk(res, std::vector<clickhouse::Block>{b1, b2}, {});
@@ -424,14 +425,14 @@ TEST_CASE("ch_to_chunk characterization: Nullable columns keep the nested type a
         REQUIRE(chunk.size() == 4);
         REQUIRE(chunk.types()[0].type() == logical_type::INTEGER);
         REQUIRE(chunk.types()[1].type() == logical_type::STRING_LITERAL);
-        REQUIRE(chunk.value(0, 0).value<int32_t>() == 5);
-        REQUIRE(chunk.value(0, 1).is_null());
-        REQUIRE(chunk.value(0, 2).is_null());
-        REQUIRE(chunk.value(0, 3).value<int32_t>() == 7);
-        REQUIRE(chunk.value(1, 0).is_null());
-        REQUIRE(chunk.value(1, 1).value<std::string_view>() == "x");
-        REQUIRE(chunk.value(1, 2).value<std::string_view>() == "y");
-        REQUIRE(chunk.value(1, 3).is_null());
+        REQUIRE(otterstax::test::cell(chunk, 0, 0).value<int32_t>() == 5);
+        REQUIRE(otterstax::test::cell(chunk, 0, 1).is_null());
+        REQUIRE(otterstax::test::cell(chunk, 0, 2).is_null());
+        REQUIRE(otterstax::test::cell(chunk, 0, 3).value<int32_t>() == 7);
+        REQUIRE(otterstax::test::cell(chunk, 1, 0).is_null());
+        REQUIRE(otterstax::test::cell(chunk, 1, 1).value<std::string_view>() == "x");
+        REQUIRE(otterstax::test::cell(chunk, 1, 2).value<std::string_view>() == "y");
+        REQUIRE(otterstax::test::cell(chunk, 1, 3).is_null());
     }
 }
 
@@ -456,10 +457,10 @@ TEST_CASE("ch_to_chunk characterization: scalar named-type override keeps the pr
     REQUIRE(chunk.types()[0].alias() == "v");
     REQUIRE(chunk.types()[1].type() == logical_type::STRING_LITERAL);
     REQUIRE(chunk.types()[1].alias() == "w");
-    REQUIRE(chunk.value(0, 0).value<int64_t>() == 42);
-    REQUIRE(chunk.value(0, 1).is_null());
-    REQUIRE(chunk.value(1, 0).value<std::string_view>() == "p");
-    REQUIRE(chunk.value(1, 1).value<std::string_view>() == "q");
+    REQUIRE(otterstax::test::cell(chunk, 0, 0).value<int64_t>() == 42);
+    REQUIRE(otterstax::test::cell(chunk, 0, 1).is_null());
+    REQUIRE(otterstax::test::cell(chunk, 1, 0).value<std::string_view>() == "p");
+    REQUIRE(otterstax::test::cell(chunk, 1, 1).value<std::string_view>() == "q");
 }
 
 TEST_CASE("ch_to_chunk characterization: Tuple override reads a STRUCT column") {
@@ -483,14 +484,14 @@ TEST_CASE("ch_to_chunk characterization: Tuple override reads a STRUCT column") 
         const auto& chunk = converted.value();
         REQUIRE(chunk.size() == 2);
         require_struct_type(chunk.types()[0]);
-        auto row0 = chunk.value(0, 0);
-        REQUIRE(row0.children().size() == 2);
-        REQUIRE(row0.children()[0].value<int32_t>() == 1);
-        REQUIRE(row0.children()[1].value<std::string_view>() == "a");
-        auto row1 = chunk.value(0, 1);
-        REQUIRE(row1.children().size() == 2);
-        REQUIRE(row1.children()[0].value<int32_t>() == 2);
-        REQUIRE(row1.children()[1].is_null());
+        auto row0 = otterstax::test::cell(chunk, 0, 0);
+        REQUIRE(row0.child_count() == 2);
+        REQUIRE(row0.child(0).value<int32_t>() == 1);
+        REQUIRE(row0.child(1).value<std::string_view>() == "a");
+        auto row1 = otterstax::test::cell(chunk, 0, 1);
+        REQUIRE(row1.child_count() == 2);
+        REQUIRE(row1.child(0).value<int32_t>() == 2);
+        REQUIRE(row1.child(1).is_null());
     }
     SECTION("multi block") {
         const std::vector<clickhouse::Block> blocks{make_tuple_block(1, {"a"}),
@@ -500,12 +501,12 @@ TEST_CASE("ch_to_chunk characterization: Tuple override reads a STRUCT column") 
         const auto& chunk = converted.value();
         REQUIRE(chunk.size() == 3);
         require_struct_type(chunk.types()[0]);
-        REQUIRE(chunk.value(0, 0).children()[0].value<int32_t>() == 1);
-        REQUIRE(chunk.value(0, 0).children()[1].value<std::string_view>() == "a");
-        REQUIRE(chunk.value(0, 1).children()[0].value<int32_t>() == 10);
-        REQUIRE(chunk.value(0, 1).children()[1].is_null());
-        REQUIRE(chunk.value(0, 2).children()[0].value<int32_t>() == 11);
-        REQUIRE(chunk.value(0, 2).children()[1].value<std::string_view>() == "c");
+        REQUIRE(otterstax::test::cell(chunk, 0, 0).child(0).value<int32_t>() == 1);
+        REQUIRE(otterstax::test::cell(chunk, 0, 0).child(1).value<std::string_view>() == "a");
+        REQUIRE(otterstax::test::cell(chunk, 0, 1).child(0).value<int32_t>() == 10);
+        REQUIRE(otterstax::test::cell(chunk, 0, 1).child(1).is_null());
+        REQUIRE(otterstax::test::cell(chunk, 0, 2).child(0).value<int32_t>() == 11);
+        REQUIRE(otterstax::test::cell(chunk, 0, 2).child(1).value<std::string_view>() == "c");
     }
     SECTION("unnamed tuple fields are numbered") {
         auto s = tsl::ch_to_struct(res, make_tuple_block(1, {"a"}), {{"rec", "Tuple(Int32, String)"}});
@@ -577,20 +578,20 @@ TEST_CASE("ch_to_chunk: Array override reads every row's elements across block b
         REQUIRE(chunk.types()[1].child_type().type() == logical_type::STRING_LITERAL);
         for (size_t row = 0; row < nums.size(); ++row) {
             CAPTURE(row);
-            const auto num_value = chunk.value(0, row);
-            REQUIRE(num_value.children().size() == nums[row].size());
+            const auto num_value = otterstax::test::cell(chunk, 0, row);
+            REQUIRE(num_value.child_count() == nums[row].size());
             for (size_t i = 0; i < nums[row].size(); ++i) {
                 CAPTURE(i);
-                REQUIRE(num_value.children()[i].value<int32_t>() == nums[row][i]);
+                REQUIRE(num_value.child(i).value<int32_t>() == nums[row][i]);
             }
-            const auto tag_value = chunk.value(1, row);
-            REQUIRE(tag_value.children().size() == tags[row].size());
+            const auto tag_value = otterstax::test::cell(chunk, 1, row);
+            REQUIRE(tag_value.child_count() == tags[row].size());
             for (size_t i = 0; i < tags[row].size(); ++i) {
                 CAPTURE(i);
                 if (tags[row][i]) {
-                    REQUIRE(tag_value.children()[i].value<std::string_view>() == *tags[row][i]);
+                    REQUIRE(tag_value.child(i).value<std::string_view>() == *tags[row][i]);
                 } else {
-                    REQUIRE(tag_value.children()[i].is_null());
+                    REQUIRE(tag_value.child(i).is_null());
                 }
             }
         }
@@ -644,15 +645,15 @@ TEST_CASE("ch_to_chunk: Date and Date32 columns read the calendar day the wire c
         REQUIRE(chunk.types()[0].type() == logical_type::STRING_LITERAL);
         REQUIRE(chunk.types()[1].type() == logical_type::STRING_LITERAL);
         REQUIRE(chunk.types()[2].type() == logical_type::STRING_LITERAL);
-        REQUIRE(chunk.value(0, 0).value<std::string_view>() == "2024-01-15");
-        REQUIRE(chunk.value(0, 1).value<std::string_view>() == "1970-01-01");
-        REQUIRE(chunk.value(0, 2).value<std::string_view>() == "2149-06-06");
-        REQUIRE(chunk.value(1, 0).value<std::string_view>() == "1969-12-31");
-        REQUIRE(chunk.value(1, 1).value<std::string_view>() == "1900-01-01");
-        REQUIRE(chunk.value(1, 2).value<std::string_view>() == "2299-12-31");
-        REQUIRE(chunk.value(2, 0).value<std::string_view>() == "2024-01-15");
-        REQUIRE(chunk.value(2, 1).is_null());
-        REQUIRE(chunk.value(2, 2).value<std::string_view>() == "1970-01-01");
+        REQUIRE(otterstax::test::cell(chunk, 0, 0).value<std::string_view>() == "2024-01-15");
+        REQUIRE(otterstax::test::cell(chunk, 0, 1).value<std::string_view>() == "1970-01-01");
+        REQUIRE(otterstax::test::cell(chunk, 0, 2).value<std::string_view>() == "2149-06-06");
+        REQUIRE(otterstax::test::cell(chunk, 1, 0).value<std::string_view>() == "1969-12-31");
+        REQUIRE(otterstax::test::cell(chunk, 1, 1).value<std::string_view>() == "1900-01-01");
+        REQUIRE(otterstax::test::cell(chunk, 1, 2).value<std::string_view>() == "2299-12-31");
+        REQUIRE(otterstax::test::cell(chunk, 2, 0).value<std::string_view>() == "2024-01-15");
+        REQUIRE(otterstax::test::cell(chunk, 2, 1).is_null());
+        REQUIRE(otterstax::test::cell(chunk, 2, 2).value<std::string_view>() == "1970-01-01");
     };
 
     SECTION("single block") {
@@ -702,7 +703,7 @@ namespace {
     // The cell is not NULL and carries the type of the vector it was written to.
     void require_written(const data_chunk_t& chunk, size_t col, size_t row) {
         CAPTURE(col, row);
-        const auto value = chunk.value(col, row);
+        const auto value = otterstax::test::cell(chunk, col, row);
         REQUIRE_FALSE(value.is_null());
         REQUIRE(value.type() == chunk.data[col].type());
     }
@@ -730,9 +731,9 @@ namespace {
         }
     }
 
-    // The same two shapes, each answered with conversion_failure naming the column.
+    // The same two shapes, each answered with datatype_mismatch naming the column.
     template<typename MakeBlock>
-    void require_conversion_failure(const MakeBlock& make_block,
+    void require_datatype_mismatch(const MakeBlock& make_block,
                                     size_t rows,
                                     const overrides_t& overrides,
                                     std::string_view column) {
@@ -740,7 +741,7 @@ namespace {
         auto require_failure = [column](const core::result_wrapper_t<data_chunk_t>& converted) {
             REQUIRE(converted.has_error());
             INFO(converted.error().what.c_str());
-            REQUIRE(converted.error().type == core::error_code_t::conversion_failure);
+            REQUIRE(converted.error().type == core::error_code_t::datatype_mismatch);
             REQUIRE(std::string_view{converted.error().what}.find(column) != std::string_view::npos);
         };
         SECTION("single block") {
@@ -780,7 +781,7 @@ namespace {
             REQUIRE(chunk.types()[0].type() == type);
             for (size_t row = 0; row < rows; ++row) {
                 CAPTURE(row);
-                const auto value = chunk.value(0, row);
+                const auto value = otterstax::test::cell(chunk, 0, row);
                 REQUIRE((value.is_null() || value.type() == chunk.data[0].type()));
                 require_row(value, row);
             }
@@ -801,7 +802,7 @@ TEST_CASE("ch_to_chunk: a named-type override reads each wire value as the colum
             REQUIRE(chunk.types()[0].type() == logical_type::BOOLEAN);
             for (size_t row = 0; row < flags.size(); ++row) {
                 require_written(chunk, 0, row);
-                REQUIRE(chunk.value(0, row).value<bool>() == (flags[row] != 0));
+                REQUIRE(otterstax::test::cell(chunk, 0, row).value<bool>() == (flags[row] != 0));
             }
         });
     }
@@ -817,10 +818,10 @@ TEST_CASE("ch_to_chunk: a named-type override reads each wire value as the colum
                                  [&](const data_chunk_t& chunk) {
                                      REQUIRE(chunk.types()[0].type() == logical_type::BOOLEAN);
                                      require_written(chunk, 0, 0);
-                                     REQUIRE(chunk.value(0, 0).value<bool>());
-                                     REQUIRE(chunk.value(0, 1).is_null());
+                                     REQUIRE(otterstax::test::cell(chunk, 0, 0).value<bool>());
+                                     REQUIRE(otterstax::test::cell(chunk, 0, 1).is_null());
                                      require_written(chunk, 0, 2);
-                                     REQUIRE(chunk.value(0, 2).value<bool>());
+                                     REQUIRE(otterstax::test::cell(chunk, 0, 2).value<bool>());
                                  });
     }
     SECTION("LowCardinality(String) is String") {
@@ -837,7 +838,7 @@ TEST_CASE("ch_to_chunk: a named-type override reads each wire value as the colum
                                      REQUIRE(chunk.types()[0].type() == logical_type::STRING_LITERAL);
                                      for (size_t row = 0; row < words.size(); ++row) {
                                          require_written(chunk, 0, row);
-                                         REQUIRE(chunk.value(0, row).value<std::string_view>() == words[row]);
+                                         REQUIRE(otterstax::test::cell(chunk, 0, row).value<std::string_view>() == words[row]);
                                      }
                                  });
     }
@@ -855,10 +856,10 @@ TEST_CASE("ch_to_chunk: a named-type override reads each wire value as the colum
                                  [&](const data_chunk_t& chunk) {
                                      REQUIRE(chunk.types()[0].type() == logical_type::STRING_LITERAL);
                                      require_written(chunk, 0, 0);
-                                     REQUIRE(chunk.value(0, 0).value<std::string_view>() == "z");
-                                     REQUIRE(chunk.value(0, 1).is_null());
+                                     REQUIRE(otterstax::test::cell(chunk, 0, 0).value<std::string_view>() == "z");
+                                     REQUIRE(otterstax::test::cell(chunk, 0, 1).is_null());
                                      require_written(chunk, 0, 2);
-                                     REQUIRE(chunk.value(0, 2).value<std::string_view>() == "zz");
+                                     REQUIRE(otterstax::test::cell(chunk, 0, 2).value<std::string_view>() == "zz");
                                  });
     }
     SECTION("SimpleAggregateFunction(f, T) is T") {
@@ -877,13 +878,13 @@ TEST_CASE("ch_to_chunk: a named-type override reads each wire value as the colum
             REQUIRE(chunk.types()[1].type() == logical_type::INTEGER);
             for (size_t row = 0; row < totals.size(); ++row) {
                 require_written(chunk, 0, row);
-                REQUIRE(chunk.value(0, row).value<uint64_t>() == totals[row]);
+                REQUIRE(otterstax::test::cell(chunk, 0, row).value<uint64_t>() == totals[row]);
             }
             require_written(chunk, 1, 0);
-            REQUIRE(chunk.value(1, 0).value<int32_t>() == -3);
-            REQUIRE(chunk.value(1, 1).is_null());
+            REQUIRE(otterstax::test::cell(chunk, 1, 0).value<int32_t>() == -3);
+            REQUIRE(otterstax::test::cell(chunk, 1, 1).is_null());
             require_written(chunk, 1, 2);
-            REQUIRE(chunk.value(1, 2).value<int32_t>() == 11);
+            REQUIRE(otterstax::test::cell(chunk, 1, 2).value<int32_t>() == 11);
         });
     }
     SECTION("a Tuple field declared Bool reads the UInt8 the wire carries") {
@@ -907,11 +908,11 @@ TEST_CASE("ch_to_chunk: a named-type override reads each wire value as the colum
                                      REQUIRE(type.child_types()[1].type() == logical_type::BOOLEAN);
                                      for (size_t row = 0; row < ids.size(); ++row) {
                                          require_written(chunk, 0, row);
-                                         const auto value = chunk.value(0, row);
-                                         REQUIRE(value.children().size() == 2);
-                                         REQUIRE(value.children()[0].value<int32_t>() == ids[row]);
-                                         REQUIRE(value.children()[1].type() == type.child_types()[1]);
-                                         REQUIRE(value.children()[1].value<bool>() == (oks[row] != 0));
+                                         const auto value = otterstax::test::cell(chunk, 0, row);
+                                         REQUIRE(value.child_count() == 2);
+                                         REQUIRE(value.child(0).value<int32_t>() == ids[row]);
+                                         REQUIRE(value.child(1).type() == type.child_types()[1]);
+                                         REQUIRE(value.child(1).value<bool>() == (oks[row] != 0));
                                      }
                                  });
     }
@@ -921,7 +922,7 @@ TEST_CASE("ch_to_chunk: a named-type override reads each wire value as the colum
 // can carry a base column's name without being that column: `AVG(x) AS x`, `toString(id) AS id`,
 // `count() AS x`, `x + 1 AS x`. An override names the column's type only when the wire column is a
 // representation of it; any other column is the wire's type holding the wire's values, as without an
-// override — neither converted to the override's type nor a conversion_failure — and discovery
+// override — neither converted to the override's type nor a datatype_mismatch — and discovery
 // registers that same type.
 TEST_CASE("ch_to_chunk: a wire column that does not represent its override's type is the wire's type") {
     SECTION("AVG(x) AS x: a Float64 under an Int32 column's name is DOUBLE") {
@@ -933,7 +934,7 @@ TEST_CASE("ch_to_chunk: a wire column that does not represent its override's typ
                             averages.size(),
                             {{"x", "Int32"}},
                             logical_type::DOUBLE,
-                            [&](const logical_value_t& value, size_t row) {
+                            [&](const otterstax::test::cell_t& value, size_t row) {
                                 REQUIRE(value.value<double>() == averages[row]);
                             });
     }
@@ -947,7 +948,7 @@ TEST_CASE("ch_to_chunk: a wire column that does not represent its override's typ
                             averages.size(),
                             {{"x", "Nullable(Int32)"}},
                             logical_type::DOUBLE,
-                            [&](const logical_value_t& value, size_t row) {
+                            [&](const otterstax::test::cell_t& value, size_t row) {
                                 if (averages[row]) {
                                     REQUIRE(value.value<double>() == *averages[row]);
                                 } else {
@@ -964,7 +965,7 @@ TEST_CASE("ch_to_chunk: a wire column that does not represent its override's typ
                             texts.size(),
                             {{"id", "Int32"}},
                             logical_type::STRING_LITERAL,
-                            [&](const logical_value_t& value, size_t row) {
+                            [&](const otterstax::test::cell_t& value, size_t row) {
                                 REQUIRE(value.value<std::string_view>() == texts[row]);
                             });
     }
@@ -977,7 +978,7 @@ TEST_CASE("ch_to_chunk: a wire column that does not represent its override's typ
                             counts.size(),
                             {{"x", "Int32"}},
                             logical_type::UBIGINT,
-                            [&](const logical_value_t& value, size_t row) {
+                            [&](const otterstax::test::cell_t& value, size_t row) {
                                 REQUIRE(value.value<uint64_t>() == counts[row]);
                             });
     }
@@ -991,7 +992,7 @@ TEST_CASE("ch_to_chunk: a wire column that does not represent its override's typ
                             sums.size(),
                             {{"qty", "Int32"}},
                             logical_type::BIGINT,
-                            [&](const logical_value_t& value, size_t row) {
+                            [&](const otterstax::test::cell_t& value, size_t row) {
                                 REQUIRE(value.value<int64_t>() == sums[row]);
                             });
     }
@@ -1004,7 +1005,7 @@ TEST_CASE("ch_to_chunk: a wire column that does not represent its override's typ
                             values.size(),
                             {{"n", "UInt32"}},
                             logical_type::INTEGER,
-                            [&](const logical_value_t& value, size_t row) {
+                            [&](const otterstax::test::cell_t& value, size_t row) {
                                 REQUIRE(value.value<int32_t>() == values[row]);
                             });
     }
@@ -1017,7 +1018,7 @@ TEST_CASE("ch_to_chunk: a wire column that does not represent its override's typ
                             values.size(),
                             {{"n", "Int64"}},
                             logical_type::DOUBLE,
-                            [&](const logical_value_t& value, size_t row) {
+                            [&](const otterstax::test::cell_t& value, size_t row) {
                                 REQUIRE(value.value<double>() == values[row]);
                             });
     }
@@ -1030,7 +1031,7 @@ TEST_CASE("ch_to_chunk: a wire column that does not represent its override's typ
                             values.size(),
                             {{"f", "Float32"}},
                             logical_type::DOUBLE,
-                            [&](const logical_value_t& value, size_t row) {
+                            [&](const otterstax::test::cell_t& value, size_t row) {
                                 REQUIRE(value.value<double>() == values[row]);
                             });
     }
@@ -1043,7 +1044,7 @@ TEST_CASE("ch_to_chunk: a wire column that does not represent its override's typ
                             ratios.size(),
                             {{"ratio", "Float64"}},
                             logical_type::FLOAT,
-                            [&](const logical_value_t& value, size_t row) {
+                            [&](const otterstax::test::cell_t& value, size_t row) {
                                 REQUIRE(value.value<float>() == ratios[row]);
                             });
     }
@@ -1062,9 +1063,9 @@ TEST_CASE("ch_to_chunk: a wire column that does not represent its override's typ
             REQUIRE(chunk.types()[1].type() == logical_type::DOUBLE);
             for (size_t row = 0; row < codes.size(); ++row) {
                 require_written(chunk, 0, row);
-                REQUIRE(chunk.value(0, row).value<int32_t>() == codes[row]);
+                REQUIRE(otterstax::test::cell(chunk, 0, row).value<int32_t>() == codes[row]);
                 require_written(chunk, 1, row);
-                REQUIRE(chunk.value(1, row).value<double>() == ratios[row]);
+                REQUIRE(otterstax::test::cell(chunk, 1, row).value<double>() == ratios[row]);
             }
             require_struct_is_chunk_types(make_block(0, codes.size()), overrides, chunk);
         });
@@ -1078,7 +1079,7 @@ TEST_CASE("ch_to_chunk: a wire column that does not represent its override's typ
                             values.size(),
                             {{"flag", "Bool"}},
                             logical_type::USMALLINT,
-                            [&](const logical_value_t& value, size_t row) {
+                            [&](const otterstax::test::cell_t& value, size_t row) {
                                 REQUIRE(value.value<uint16_t>() == values[row]);
                             });
     }
@@ -1091,7 +1092,7 @@ TEST_CASE("ch_to_chunk: a wire column that does not represent its override's typ
                             values.size(),
                             {{"rec", "Tuple(a Int32)"}},
                             logical_type::INTEGER,
-                            [&](const logical_value_t& value, size_t row) {
+                            [&](const otterstax::test::cell_t& value, size_t row) {
                                 REQUIRE(value.value<int32_t>() == values[row]);
                             });
     }
@@ -1106,11 +1107,11 @@ TEST_CASE("ch_to_chunk: a wire column that does not represent its override's typ
                             ids.size(),
                             {{"rec", "Tuple(id Int32, name String)"}},
                             logical_type::STRUCT,
-                            [&](const logical_value_t& value, size_t row) {
+                            [&](const otterstax::test::cell_t& value, size_t row) {
                                 REQUIRE(value.type().child_types().size() == 1);
                                 REQUIRE(value.type().child_types()[0].type() == logical_type::INTEGER);
-                                REQUIRE(value.children().size() == 1);
-                                REQUIRE(value.children()[0].value<int32_t>() == ids[row]);
+                                REQUIRE(value.child_count() == 1);
+                                REQUIRE(value.child(0).value<int32_t>() == ids[row]);
                             });
     }
     SECTION("tuple(name, id) AS rec: a Tuple of other field types under a named Tuple is the wire's STRUCT") {
@@ -1126,14 +1127,14 @@ TEST_CASE("ch_to_chunk: a wire column that does not represent its override's typ
                             ids.size(),
                             {{"rec", "Tuple(id Int32, name String)"}},
                             logical_type::STRUCT,
-                            [&](const logical_value_t& value, size_t row) {
+                            [&](const otterstax::test::cell_t& value, size_t row) {
                                 const auto& fields = value.type().child_types();
                                 REQUIRE(fields.size() == 2);
                                 REQUIRE(fields[0].type() == logical_type::STRING_LITERAL);
                                 REQUIRE(fields[0].alias() != "id");
                                 REQUIRE(fields[1].type() == logical_type::INTEGER);
-                                REQUIRE(value.children()[0].value<std::string_view>() == names[row]);
-                                REQUIRE(value.children()[1].value<int32_t>() == ids[row]);
+                                REQUIRE(value.child(0).value<std::string_view>() == names[row]);
+                                REQUIRE(value.child(1).value<int32_t>() == ids[row]);
                             });
     }
 }
@@ -1178,31 +1179,31 @@ TEST_CASE("ch_to_chunk: Array override is a LIST of each row's own length") {
         }
         for (size_t row = 0; row < nums.size(); ++row) {
             CAPTURE(row);
-            const auto num_value = chunk.value(0, row);
+            const auto num_value = otterstax::test::cell(chunk, 0, row);
             REQUIRE(num_value.type() == chunk.data[0].type());
-            REQUIRE(num_value.children().size() == nums[row].size());
+            REQUIRE(num_value.child_count() == nums[row].size());
             for (size_t i = 0; i < nums[row].size(); ++i) {
                 CAPTURE(i);
-                REQUIRE(num_value.children()[i].value<int32_t>() == nums[row][i]);
+                REQUIRE(num_value.child(i).value<int32_t>() == nums[row][i]);
             }
-            const auto tag_value = chunk.value(1, row);
+            const auto tag_value = otterstax::test::cell(chunk, 1, row);
             REQUIRE(tag_value.type() == chunk.data[1].type());
-            REQUIRE(tag_value.children().size() == tags[row].size());
+            REQUIRE(tag_value.child_count() == tags[row].size());
             for (size_t i = 0; i < tags[row].size(); ++i) {
                 CAPTURE(i);
                 if (tags[row][i]) {
-                    REQUIRE(tag_value.children()[i].value<std::string_view>() == *tags[row][i]);
+                    REQUIRE(tag_value.child(i).value<std::string_view>() == *tags[row][i]);
                 } else {
-                    REQUIRE(tag_value.children()[i].is_null());
+                    REQUIRE(tag_value.child(i).is_null());
                 }
             }
-            const auto flag_value = chunk.value(2, row);
+            const auto flag_value = otterstax::test::cell(chunk, 2, row);
             REQUIRE(flag_value.type() == chunk.data[2].type());
-            REQUIRE(flag_value.children().size() == flags[row].size());
+            REQUIRE(flag_value.child_count() == flags[row].size());
             for (size_t i = 0; i < flags[row].size(); ++i) {
                 CAPTURE(i);
-                REQUIRE(flag_value.children()[i].type() == types[2].child_type());
-                REQUIRE(flag_value.children()[i].value<bool>() == (flags[row][i] != 0));
+                REQUIRE(flag_value.child(i).type() == types[2].child_type());
+                REQUIRE(flag_value.child(i).value<bool>() == (flags[row][i] != 0));
             }
         }
     };
@@ -1294,7 +1295,7 @@ TEST_CASE("ch_to_chunk: wire types without a numeric mapping are read as their t
             REQUIRE(types[col].type() == logical_type::STRING_LITERAL);
             for (size_t row = 0; row < 2; ++row) {
                 require_written(chunk, col, row);
-                REQUIRE(chunk.value(col, row).value<std::string_view>() == expected[col].texts[row]);
+                REQUIRE(otterstax::test::cell(chunk, col, row).value<std::string_view>() == expected[col].texts[row]);
             }
         }
     };
@@ -1372,7 +1373,7 @@ TEST_CASE("ch_to_chunk: a Decimal of at most 38 digits is the engine's DECIMAL o
             REQUIRE(spec->scale() == expected[col].scale);
             for (size_t row = 0; row < 2; ++row) {
                 require_written(chunk, col, row);
-                const auto value = chunk.value(col, row);
+                const auto value = otterstax::test::cell(chunk, col, row);
                 const components::types::int128_t unscaled =
                     spec->stored_as() == physical_type::INT32   ? components::types::int128_t{value.value<int32_t>()}
                     : spec->stored_as() == physical_type::INT64 ? components::types::int128_t{value.value<int64_t>()}
@@ -1418,7 +1419,7 @@ TEST_CASE("ch_to_chunk: a Decimal of at most 38 digits is the engine's DECIMAL o
 
 // A wire type with no reading as the column's type fails the conversion instead of writing a
 // placeholder; discovery still registers the column (as STRING), so the failure is the query's.
-TEST_CASE("ch_to_chunk: a wire type without a reading is conversion_failure") {
+TEST_CASE("ch_to_chunk: a wire type without a reading is datatype_mismatch") {
     SECTION("Map") {
         auto make_block = [](size_t first, size_t last) {
             auto entries = std::make_shared<clickhouse::ColumnArray>(std::make_shared<clickhouse::ColumnTuple>(
@@ -1434,9 +1435,9 @@ TEST_CASE("ch_to_chunk: a wire type without a reading is conversion_failure") {
             }
             return one_column_block("attrs", std::make_shared<clickhouse::ColumnMap>(entries));
         };
-        SECTION("without an override") { require_conversion_failure(make_block, 2, {}, "attrs"); }
+        SECTION("without an override") { require_datatype_mismatch(make_block, 2, {}, "attrs"); }
         SECTION("under its system.columns type") {
-            require_conversion_failure(make_block, 2, {{"attrs", "Map(String, UInt64)"}}, "attrs");
+            require_datatype_mismatch(make_block, 2, {{"attrs", "Map(String, UInt64)"}}, "attrs");
         }
         SECTION("discovery registers it as STRING") {
             const auto schema = tsl::ch_to_struct(std::pmr::new_delete_resource(),
@@ -1450,7 +1451,7 @@ TEST_CASE("ch_to_chunk: a wire type without a reading is conversion_failure") {
         auto make_block = [](size_t first, size_t last) {
             return one_column_block("nothing", std::make_shared<clickhouse::ColumnNothing>(last - first));
         };
-        require_conversion_failure(make_block, 2, {}, "nothing");
+        require_datatype_mismatch(make_block, 2, {}, "nothing");
     }
 }
 
@@ -1469,8 +1470,8 @@ TEST_CASE("ch_to_chunk: a Nullable(Nothing) column is its NULL rows") {
     convert_single_and_split(make_block, 2, {}, [](const data_chunk_t& chunk) {
         REQUIRE(chunk.size() == 2);
         REQUIRE(chunk.types()[0].type() == logical_type::STRING_LITERAL);
-        REQUIRE(chunk.value(0, 0).is_null());
-        REQUIRE(chunk.value(0, 1).is_null());
+        REQUIRE(otterstax::test::cell(chunk, 0, 0).is_null());
+        REQUIRE(otterstax::test::cell(chunk, 0, 1).is_null());
     });
 }
 
@@ -1504,12 +1505,12 @@ TEST_CASE("ch_to_chunk: an Array(Tuple) override the wire column represents name
         REQUIRE(item.child_types()[1].type() == logical_type::BOOLEAN);
         for (size_t row = 0; row < ids.size(); ++row) {
             CAPTURE(row);
-            const auto value = chunk.value(0, row);
-            REQUIRE(value.children().size() == ids[row].size());
+            const auto value = otterstax::test::cell(chunk, 0, row);
+            REQUIRE(value.child_count() == ids[row].size());
             for (size_t i = 0; i < ids[row].size(); ++i) {
                 CAPTURE(i);
-                REQUIRE(value.children()[i].children()[0].value<int32_t>() == ids[row][i]);
-                REQUIRE(value.children()[i].children()[1].value<bool>() == (oks[row][i] != 0));
+                REQUIRE(value.child(i).child(0).value<int32_t>() == ids[row][i]);
+                REQUIRE(value.child(i).child(1).value<bool>() == (oks[row][i] != 0));
             }
         }
         require_struct_is_chunk_types(make_block(0, ids.size()), overrides, chunk);
@@ -1579,10 +1580,10 @@ TEST_CASE("ch_to_struct of a statement's header block is the chunk types of its 
         CAPTURE(col);
         REQUIRE(chunk_types[col] == header.child_types()[col]);
     }
-    REQUIRE(chunk.value(0, 4).value<uint64_t>() == 8);
-    REQUIRE(chunk.value(1, 0).value<int64_t>() == 3000000000LL);
-    REQUIRE(chunk.value(2, 2).value<uint64_t>() == 4);
-    REQUIRE(chunk.value(3, 1).children()[1].is_null());
+    REQUIRE(otterstax::test::cell(chunk, 0, 4).value<uint64_t>() == 8);
+    REQUIRE(otterstax::test::cell(chunk, 1, 0).value<int64_t>() == 3000000000LL);
+    REQUIRE(otterstax::test::cell(chunk, 2, 2).value<uint64_t>() == 4);
+    REQUIRE(otterstax::test::cell(chunk, 3, 1).child(1).is_null());
 }
 
 // The declared types by result position (a pushed-down statement, whose columns come from several
@@ -1620,13 +1621,13 @@ TEST_CASE("ch_to_chunk: declared types by position apply to the column at that p
     const auto& chunk = converted.value();
     REQUIRE(chunk.size() == 2);
     CHECK(chunk.types()[0].type() == logical_type::BOOLEAN);
-    CHECK(chunk.value(0, 0).value<bool>());
-    CHECK_FALSE(chunk.value(0, 1).value<bool>());
+    CHECK(otterstax::test::cell(chunk, 0, 0).value<bool>());
+    CHECK_FALSE(otterstax::test::cell(chunk, 0, 1).value<bool>());
     REQUIRE(chunk.types()[1].type() == logical_type::STRUCT);
     REQUIRE(chunk.types()[1].child_types().size() == 2);
     CHECK(chunk.types()[1].child_types()[0].alias() == "id");
     CHECK(chunk.types()[1].child_types()[1].alias() == "label");
-    CHECK(chunk.value(1, 1).children()[1].value<std::string_view>() == "b");
+    CHECK(otterstax::test::cell(chunk, 1, 1).child(1).value<std::string_view>() == "b");
     CHECK(chunk.types()[2].type() == logical_type::UTINYINT);
     CHECK(chunk.types()[3].type() == logical_type::UTINYINT);
 

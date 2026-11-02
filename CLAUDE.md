@@ -92,12 +92,14 @@ referenced by `CREATE EXTERNAL TABLE` / `COPY ... TO`.
 
 Refused at load (startup aborts, the reason on stderr): a section that is not a
 mapping (`service: {mysql: 8816}`, a scalar connection entry), an incomplete entry, a
-malformed port or `pool_size`, the reserved aliases `federation` and `kafka` (any
-case, any section — the engine databases of the remote-table metadata and of the
-Kafka objects), and a **duplicate
-alias**: the mysql / postgresql / clickhouse aliases are ONE namespace compared
-case-insensitively (an alias is the uid every federated name starts with, and
-the federation folds it to lower case), so `Sales` under mysql and `sales` under
+malformed port or `pool_size`, the reserved aliases `federation` and `main` (any
+case, any section — the engine database of the remote-table metadata and the
+engine's default local database; `kafka` is an ordinary alias, the Kafka objects
+being the schema `main.kafka`), a backend alias (mysql / postgresql / clickhouse)
+that is not an unquoted SQL identifier (`[a-z_][a-z0-9_]*`: the first part of a
+federated name, written unquoted), and a **duplicate alias**: the mysql /
+postgresql / clickhouse aliases are ONE namespace (an alias is the uid every
+federated name starts with), so `sales` under mysql and `sales` under
 clickhouse collide; s3 aliases are a namespace of their own (two equal s3
 aliases are refused, an s3 alias equal to a backend alias is fine). A MySQL
 connection whose server runs with `sql_mode` `NO_BACKSLASH_ESCAPES` is refused
@@ -360,7 +362,7 @@ docker compose up
 
 ### TEMPORARY: local otterbrix recipe in Docker builds (until OTB-tag)
 
-`conanfile.py` pins `otterbrix/1.0.0b2-embedding.46fba865#66a161bad0259c1280d2a132e32e8bb3`.
+`conanfile.py` pins `otterbrix/1.0.0b2-embedding.61aa43d6#fb35b92b1f62ef17085b21a267334967`.
 It is not on a conan remote, it exists only in the developer's local Conan cache
 (see **Critical Dependency Versions**). Docker images therefore get it from an
 archive in the build context. `actor-zeta/2.0.0` (pinned as
@@ -555,42 +557,13 @@ Every handler is listed in the actor's `dispatch_traits` alias and the `behavior
 
 ### Federated Query Syntax
 
-A table behind a configured connection is named after its alias (see
-**Connection Config** above):
+Connection aliases act as the outermost database name qualifier:
 
 ```sql
-SELECT * FROM my.bill.orders o JOIN pg.shop.customers c ON ...   -- alias.db.table
-SELECT * FROM pg.shop.public.customers                            -- alias.db.schema.table
+SELECT * FROM alias1.db.schema.table JOIN alias2.db.schema.table2 ON ...
 ```
 
-One function reads every table reference — `otterstax::names::canonical_table_name`
-(`otterbrix/parser/alias_registry.hpp`), used by the SQL parser and the Spark
-translator alike, for SELECT, JOIN, derived tables and every DML/DDL target and
-source. The parser rewrites each federated name to the canonical four segments
-`alias.db.schema.table` before the engine transformer sees it:
-
-- **Three segments `a.b.c`** are federated only when `a` is a configured alias;
-  otherwise they are a local `db.schema.table`, and a local table has no schema
-  (`invalid_parameter`, write `db.table`). One or two segments are always local;
-  `alias.table` is refused (`invalid_parameter`).
-- **PostgreSQL** pins the database and the schema to the connection (`database`,
-  `schema` in the config): another database is `invalid_parameter`, another
-  schema `unimplemented_yet` (one schema per alias — configure a second alias for
-  another schema).
-- **MySQL / ClickHouse** have no schema level: the database is free and goes into
-  the backend SQL, a schema segment is `invalid_parameter` (write `alias.db.table`).
-- **Columns** may be qualified by the table, `db.table`, the FROM alias, or the
-  five-segment `alias.db.schema.table.col`; `alias.db.table.col` names no FROM
-  element (`table_not_exists`).
-- **Errors** name the table canonically (`pg.shop.public.orders`), not as written.
-- **Not reached** by the rewrite: a CTE body and a subquery inside an expression
-  (WHERE, SELECT list, HAVING) — a federated name there is read as a local one.
-- An alias and a local engine database share one namespace (the alias's mirror
-  is an engine database of that name): `CREATE/DROP DATABASE <alias>` is refused,
-  and an alias does not register over an existing local database.
-
-The rows `tests/system/test_name_canonicalization.cpp` (`[names]`) pin each rule
-by what reaches the backend.
+`alias1`/`alias2` are the aliases registered in the connection config file (see **Connection Config** above).
 
 ## Profiling Instrumentation (Tracy) — MANDATORY
 
@@ -645,21 +618,21 @@ through grammar extensions registered on the parser side.
 ### Surface SQL
 
 ```sql
--- Load a local file into otterbrix-internal storage
-CREATE EXTERNAL TABLE <db>.<table>
+-- Load a local file into a table (named as any table: t, s.t, d.s.t, c.d.s.t)
+CREATE EXTERNAL TABLE <schema>.<table>
     WITH (location = '/path/to/file.parquet', format = 'parquet');
 
 -- Load an S3 object (the s3_alias is a connections.s3 entry of config.yaml — see below)
-CREATE EXTERNAL TABLE <db>.<table>
+CREATE EXTERNAL TABLE <schema>.<table>
     WITH (s3_alias = 'rustfs1',
           location = 's3://bucket/path/file.csv',
           format   = 'csv');
 
 -- Export an arbitrary SELECT (inner query is re-parsed and executed by the engine)
-COPY (SELECT col_a, col_b FROM <db>.<table>) TO '/tmp/out.ndjson'
+COPY (SELECT col_a, col_b FROM <schema>.<table>) TO '/tmp/out.ndjson'
     WITH (format = 'ndjson');
 
-COPY (SELECT * FROM <db>.<table>) TO 's3://bucket/exported/out.csv'
+COPY (SELECT * FROM <schema>.<table>) TO 's3://bucket/exported/out.csv'
     WITH (s3_alias = 'rustfs1', format = 'csv');
 ```
 
@@ -674,8 +647,12 @@ Supported formats (both `CREATE EXTERNAL TABLE` and `COPY ... TO`):
 `format` is optional in both statements — if omitted, it is auto-detected from
 the location's file extension. Once loaded, the table is a normal
 otterbrix-internal table; the parquet→engine schema/column types survive into
-the engine catalog (int64, double, utf8 strings, etc.). The database segment
-(`<db>` above) is auto-created by `CREATE EXTERNAL TABLE` if it doesn't exist.
+the engine catalog (int64, double, utf8 strings, etc.). The table is named as
+`CREATE TABLE` names one — completed by the session's place, the database never
+created, a missing schema refused. Both statements run on the connection's
+engine session (its place, snapshot and transaction): a load outside a block is
+one transaction of its own, inside a block part of it; a four-part target (a
+connection's table) is created and filled in autocommit.
 
 ### How it flows through the actor graph
 
@@ -685,14 +662,16 @@ Frontend
   → [parser extension claims the statement → otterstax::external::external_node_t]
   → query_session_t::load_external_table / copy_to (by the node's op)
        → CREATE EXTERNAL TABLE:
-           local path  → conn::file::FileManager::add_file → engine::create_table (its own engine session)
-           s3:// URI   → db::S3Manager::download → FileManager::add_file
+           local path  → conn::file::FileManager::load_file (file → a run of chunks)
+           s3:// URI   → db::S3Manager::download: s3 ConnectorManager::open_input
+                         → FileManager::load_file reads the object stream (no local copy)
+           then engine::create_table_plan + engine::load_table on the connection's engine session
        → COPY (<inner>) TO ...:
-           inner SQL re-parsed; result chunk runs through chunk_to_<fmt>;
+           inner SQL parsed and run on the connection's engine session; its cursor through chunk_to_<fmt>;
            local path  → FileManager::dump_file (file committed only on success)
            s3:// URI   → S3Manager::upload: ConnectorManager::open_output
-                         → FileManager::dump_file writes into the stream → Close
-                         (any failure Aborts it: no partial object is published)
+                         → FileManager::dump_file writes into the stream, then closes (publishes) it
+                         (any failure aborts it: no partial object is published)
   → returns empty session_payload via future; DDL/COPY return no rows
 ```
 
@@ -714,8 +693,8 @@ Implementation entry points:
 - **Connectors** — `connectors/s3/` (Arrow's `arrow::fs::S3FileSystem`,
   initialised via `arrow::fs::EnsureS3Initialized`, one cached per alias;
   `open_input` / `open_output` hand out object streams) and `connectors/file/`
-  (filesystem ingestion; `FileAddParams::input` / `FileMetadata::output` carry
-  a stream instead of a path).
+  (filesystem ingestion; `FileLoadParams::input` / `FileMetadata::output` carry
+  a stream — `tsl::input_stream_t` / `output_stream_t`, its one owner — instead of a path).
 - **Integration actors** — `integration/s3/s3_manager.{hpp,cpp}` streams
   objects between the s3 connector and `FileManager` (so COPY ... TO
   's3://...' is a single pass with no staging file).
@@ -833,7 +812,7 @@ otterbrix-internal — shadow of `external_join_all` benchmark), all driven by
 - Flight SQL keeps no transaction across RPCs: a statement that leaves its session inside a block (`BEGIN`, by text or prepared) is rolled back and refused ("a transaction cannot be opened over Flight SQL")
 - A statement a frontend stopped waiting for (the await bridge's 90 s, `asio_future_bridge.hpp`) runs to its end in the session; inside a block the frontend fails the block behind it (MySQL answers `ER_QUERY_TIMEOUT`)
 - A Spark session that sent no RPC for `service.spark_connect.session_timeout_s` (default 3600) is closed with its query session (an open block rolled back); a later RPC with its id is refused `FAILED_PRECONDITION` `[INVALID_HANDLE.SESSION_CLOSED]`
-- `COPY ... TO` and the `CREATE EXTERNAL TABLE` load run on the file manager's own engine session, outside the connection's transaction
+- `COPY ... TO` and the `CREATE EXTERNAL TABLE` load run on the connection's engine session, in its transaction; the file or s3 object itself is not transactional (a COPY rolled back leaves its file written)
 - Waits for otterbrix — remote DDL: DDL never reaches the engine's host hooks, so `CREATE TABLE` / `DROP TABLE` / `CREATE INDEX` / `DROP INDEX` on a remote table is generated in the backend's dialect and run by the session directly through the backend the registry holds for the uid (`run_remote_ddl` → `backend_t::execute_ddl`); the federation metadata follows (the created table rediscovered, the dropped one's rows removed). Kafka DDL and the S3 / file statements keep their own routes
 - Waits for otterbrix — four-part DML targets: the engine's transformer keeps database, schema and table on an INSERT / UPDATE / DELETE target and no uid (`set_target`, external targets), so the engine cannot resolve `UPDATE uid.db.schema.t` through the federation. The session generates that form in the backend's dialect from the parsed plan and runs it on the backend directly (`run_remote_dml`, the parser's written `dml_target`), its count the backend's; a source on another server or a local one is refused by the generator, and so is a `RETURNING` list (`unimplemented_yet`, at execute and at prepare). The three-part form (`uid.db.t` for MySQL / ClickHouse, `uid.schema.t` for PostgreSQL — the engine reads three parts as database.schema.table and the federation takes the database slot for the uid) runs on the engine through the federation and takes any source (`INSERT ... SELECT` from a local table included). SELECT keeps every slot
 - Waits for otterbrix — a prepared statement is described by the engine's plan-only EXPLAIN (no execution, no backend round-trip: the declared columns come from `federation.remote_columns`); a statement with unbound parameters or a set operation is described by the federated computation (`otterbrix/schema/schema_utils.hpp`) over a plan-only probe of each relation
@@ -841,7 +820,7 @@ otterbrix-internal — shadow of `external_join_all` benchmark), all driven by
 
 ## Critical Dependency Versions
 
-- Otterbrix `1.0.0b2-embedding.46fba865` — a **local** Conan package built from otterbrix branch `feat/otterstax-embedding` (`conan create . --version 1.0.0b2-embedding.46fba865 -pr:h profiles/release -pr:b default -o "otterbrix/*:shared=True"`), pinned by recipe revision in `conanfile.py`; it replaces the `1.0.0b2-rc-3` remote package until otterbrix cuts a release tag from that branch (see `docs/proposals/otterbrix-embedding.md`, OTB-tag). Docker images cannot fetch it from the remote yet, so they build it from source out of the recipe archive written by `scripts/conan/export_local_packages.sh`. See **Docker Workflows**, "TEMPORARY: local otterbrix recipe". The package ships a single `libotterbrix.so`; the per-component libs such as `libotterbrix_log.so` are gone, and so is their `tsan.supp` entry
+- Otterbrix `1.0.0b2-embedding.61aa43d6` — a **local** Conan package built from otterbrix branch `feat/otterstax-requests` (PR #850) (`conan create . --version 1.0.0b2-embedding.61aa43d6 -pr:h profiles/release -pr:b default -o "otterbrix/*:shared=True"`), pinned by recipe revision in `conanfile.py`; it replaces the `1.0.0b2-rc-3` remote package until otterbrix cuts a release tag from that branch (see `docs/proposals/otterbrix-embedding.md`, OTB-tag). Docker images cannot fetch it from the remote yet, so they build it from source out of the recipe archive written by `scripts/conan/export_local_packages.sh`. See **Docker Workflows**, "TEMPORARY: local otterbrix recipe". The package ships a single `libotterbrix.so`; the per-component libs such as `libotterbrix_log.so` are gone, and so is their `tsan.supp` entry
 - Arrow 24.0.0 (with `with_s3=True`, `with_parquet=True`, `with_csv=True`, `with_json=True`, plus snappy/brotli/zlib/lz4/zstd compression codecs)
 - Boost 1.88.0
 - actor-zeta 2.0.0 (required by the otterbrix package), pinned as `actor-zeta/2.0.0#887bc992cac0ead59e5bdf5c90c844f4` in `conanfile.py` and taken from the `conan.otterbrix.com` remote like any other dependency: the remote has a Linux x86_64 gcc 13 binary, other configurations build from the recipe via `--build missing`. API constraints: no blocking `unique_future::get()/wait()`, no `co_await` on a future outside an actor coroutine. What OtterStax asks of actor-zeta (a waker on `unique_future`, parking an awaiting actor, destroying an actor on a live pool, restartable pools, the exception of a failed future): `docs/proposals/actor-zeta.md`

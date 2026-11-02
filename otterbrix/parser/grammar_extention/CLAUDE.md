@@ -19,7 +19,7 @@ Two extensions live here:
 Both recognise:
 
 ```sql
-CREATE EXTERNAL TABLE <db>.<table> WITH ( s3_alias = '…', location = '…', format = '…' );
+CREATE EXTERNAL TABLE [[[connection.]database.]schema.]table WITH ( s3_alias = '…', location = '…', format = '…' );
 COPY (<select>) TO '<location>' WITH ( s3_alias = '…', format = '…' );
 ```
 
@@ -106,21 +106,23 @@ gracefully, so the registry-aware `raw_parser` does the real parse.
 
 `transform()` lowers each statement into an `otterstax::external::external_node_t` (defined header-only in
 `grammar_extention/external_node.hpp`, tagged `node_type::unused` like `schema_node_t`) carrying
-`op` (create/copy), database, table, location, s3_alias, format, inner_sql. The connection's query session
+`op` (create/copy), the target (`external_target`: one to four parts as written, unquoted identifiers
+folded to lower case, placed as otterbrix places them — `t`, `s.t`, `d.s.t`, `c.d.s.t`; a fifth part is
+refused at parse with otterbrix's wording), location, s3_alias, format, inner_sql. The connection's query session
 (`session/query_session.cpp`) detects it through `ParsedQueryData::extension_kind` in `execute` /
 `execute_statement` / `prepare_schema` and routes by the node's op to `query_session_t::load_external_table` / `copy_to`:
 
-- **CREATE EXTERNAL TABLE** loads the file/object into the engine table — `db::S3Manager::download`
-  (s3://) or `conn::file::FileManager::add_file` (local path).
-- **`COPY (<select>) TO`** parses `inner_sql` and exports the result — `db::S3Manager::upload` or
-  `conn::file::FileManager::dump_file` (both take the pre-parsed `OtterbrixStatementPtr`, run via
-  `otterstax::engine::execute_statement` on the file manager's own engine session).
+- **CREATE EXTERNAL TABLE** reads the file/object into a chunk — `db::S3Manager::download` (s3://) or
+  `conn::file::FileManager::load_file` (local path) — and loads it on the connection's engine session
+  (`otterstax::engine::create_table_plan` + `load_table`).
+- **`COPY (<select>) TO`** parses `inner_sql`, runs it on the connection's engine session and hands the
+  cursor to `db::S3Manager::upload` or `conn::file::FileManager::dump_file`, which write it.
 
 s3 vs local is decided by `external_node_t::is_s3()` (the location scheme). Tests:
 `tests/unit/parser/test_external_routing.cpp` (parse → node) and the
 `session: CREATE EXTERNAL TABLE + COPY ... TO` cases in `tests/system/test_file_ingestion.cpp` (full
-local-file routing through a query session); the s3 path is exercised by the hidden `tests/minio`
-integration tests.
+local-file routing through a query session); the s3 path is exercised by the python
+integration tests (`tests/test_{schema_,}mysql_s3.py` and friends, against the RustFS in `compose.test.yml`).
 
 ## Known limitation
 

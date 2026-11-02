@@ -20,6 +20,7 @@
 namespace tsl {
 
 using components::vector::data_chunk_t;
+using chunk_run_t = std::pmr::vector<data_chunk_t>;
 
 namespace {
     using file_reader_ptr = std::unique_ptr<parquet::arrow::FileReader>;
@@ -28,7 +29,7 @@ namespace {
                                                          const std::shared_ptr<arrow::io::RandomAccessFile>& input) {
         auto reader_result = parquet::arrow::OpenFile(input, arrow_pool(res));
         if (!reader_result.ok()) {
-            return arrow_error(res, core::error_code_t::conversion_failure,
+            return arrow_error(res, core::error_code_t::invalid_text_representation,
                                "parquet reader: cannot open parquet reader", reader_result.status());
         }
         return std::move(*reader_result);
@@ -44,33 +45,32 @@ namespace {
         return open_parquet(res, *file_result);
     }
 
-    core::result_wrapper_t<data_chunk_t> read_table(std::pmr::memory_resource* res,
+    core::result_wrapper_t<chunk_run_t> read_table(std::pmr::memory_resource* res,
                                                     parquet::arrow::FileReader& reader) {
-        std::shared_ptr<arrow::Table> table;
-        auto status = reader.ReadTable(&table);
-        if (!status.ok()) {
-            return arrow_error(res, core::error_code_t::conversion_failure,
-                               "parquet_to_chunk: cannot read parquet table", status);
+        auto table = reader.ReadTable();
+        if (!table.ok()) {
+            return arrow_error(res, core::error_code_t::invalid_text_representation,
+                               "parquet_to_chunk: cannot read parquet table", table.status());
         }
-        auto batch = table->CombineChunksToBatch(arrow_pool(res));
+        auto batch = (*table)->CombineChunksToBatch(arrow_pool(res));
         if (!batch.ok()) {
-            return arrow_error(res, core::error_code_t::conversion_failure,
+            return arrow_error(res, core::error_code_t::internal_error,
                                "parquet_to_chunk: table to batch failed", batch.status());
         }
         return arrow_to_chunk(res, *batch);
     }
 } // namespace
 
-core::result_wrapper_t<data_chunk_t> parquet_to_chunk(std::pmr::memory_resource* res, const std::string& file_path) {
+core::result_wrapper_t<chunk_run_t> parquet_to_chunk(std::pmr::memory_resource* res, const std::string& file_path) {
     OTX_ZONE_N("tsl::parquet_to_chunk(file)");
     auto reader = open_parquet_file(res, file_path);
     if (reader.has_error()) {
-        return reader.convert_error<data_chunk_t>();
+        return reader.convert_error<chunk_run_t>();
     }
     return read_table(res, *reader.value());
 }
 
-core::result_wrapper_t<data_chunk_t>
+core::result_wrapper_t<chunk_run_t>
 parquet_to_chunk(std::pmr::memory_resource* res, const uint8_t* data, size_t size) {
     OTX_ZONE_N("tsl::parquet_to_chunk(buffer)");
     if (!data || size == 0) {
@@ -82,12 +82,12 @@ parquet_to_chunk(std::pmr::memory_resource* res, const uint8_t* data, size_t siz
 
     auto reader = open_parquet(res, reader_io);
     if (reader.has_error()) {
-        return reader.convert_error<data_chunk_t>();
+        return reader.convert_error<chunk_run_t>();
     }
     return read_table(res, *reader.value());
 }
 
-core::result_wrapper_t<data_chunk_t> parquet_to_chunk(std::pmr::memory_resource* res,
+core::result_wrapper_t<chunk_run_t> parquet_to_chunk(std::pmr::memory_resource* res,
                                                       std::shared_ptr<arrow::io::RandomAccessFile> input) {
     OTX_ZONE_N("tsl::parquet_to_chunk(stream)");
     if (!input) {
@@ -95,7 +95,7 @@ core::result_wrapper_t<data_chunk_t> parquet_to_chunk(std::pmr::memory_resource*
     }
     auto reader = open_parquet(res, input);
     if (reader.has_error()) {
-        return reader.convert_error<data_chunk_t>();
+        return reader.convert_error<chunk_run_t>();
     }
     return read_table(res, *reader.value());
 }
@@ -111,7 +111,7 @@ core::result_wrapper_t<components::types::complex_logical_type> parquet_to_struc
     std::shared_ptr<arrow::Schema> schema;
     auto status = reader.value()->GetSchema(&schema);
     if (!status.ok()) {
-        return arrow_error(res, core::error_code_t::conversion_failure,
+        return arrow_error(res, core::error_code_t::invalid_text_representation,
                            "parquet_to_struct: cannot read parquet schema", status);
     }
 

@@ -6,7 +6,7 @@
 //
 //   runtime_t → remote_backends_t (opened: connections of the test's
 //   `connections:`, discovered) → engine_t (a real engine in a temp dir, opened
-//   with the federation's primitives) → the s3 connector, file manager, S3
+//   with the backend actor's address) → the s3 connector, file manager, S3
 //   orchestrator and Kafka manager (s3 aliases registered, federation metadata
 //   published) → a session_factory_t on the runtime's sessions pool → query
 //   sessions
@@ -29,7 +29,6 @@
 #include "connectors/s3/manager.hpp"
 #include "integration/kafka/kafka_manager.hpp"
 #include "integration/s3/s3_manager.hpp"
-#include "otterbrix/federation/name_resolution.hpp"
 #include "frontend/common/asio_future_bridge.hpp"
 #include "otterbrix/operators/engine_requests.hpp"
 #include "otterbrix/parser/parser.hpp"
@@ -50,6 +49,7 @@
 #include <actor-zeta.hpp>
 #include <components/cursor/cursor.hpp>
 #include <components/session/session.hpp>
+#include <components/vector/vector_builders.hpp>
 #include <core/result_wrapper.hpp>
 
 #include <catch2/catch_all.hpp>
@@ -118,21 +118,16 @@ namespace otterstax::test {
     }
 
     // A runtime, the remote backends and the engine on it, over `data_dir`, in
-    // the server's order (the federation registry is installed before the
-    // engine opens with the federation's primitives). `fresh` wipes the
+    // the server's order (the backend actor is spawned before the engine opens
+    // with its address for every connection, remote_backends_t::primitives()). `fresh` wipes the
     // directory first and removes it once the engine is gone (its final
     // CHECKPOINT writes there); a restart test opens a second one over the same
     // directory after destroying the first, with `fresh` off.
-    // What the engine is opened with: the federation's primitives, or a test's
-    // own (the federation's plus a rule of its own).
-    using engine_primitives_fn = components::planner::primitives_t (*)();
-
     class test_engine_t {
     public:
         explicit test_engine_t(std::string data_dir,
                                bool fresh = true,
-                               remote_setup_t remote = {},
-                               engine_primitives_fn primitives = &federation::make_primitives)
+                               remote_setup_t remote = {})
             : data_dir_(std::move(data_dir))
             , session_(components::session::session_id_t::generate_uid())
             , remove_on_exit_(fresh) {
@@ -145,15 +140,14 @@ namespace otterstax::test {
             remote_ = std::make_unique<backends::remote_backends_t>(runtime_->resource(),
                                                                     backends::remote_backends_options_t{
                                                                         .connectors = remote.connectors,
-                                                                        .connector_threads = {2, 2, 2},
-                                                                        .statements = runtime_->backends_scheduler(),
+                                                                        .runtime = runtime_.get(),
                                                                     });
             if (auto err = remote_->open(remote.connections, remote.retry); err.contains_error()) {
                 FAIL("test remote backends refused to open: " << err.what.c_str());
             }
             config::EngineConfig engine_config;
             engine_config.data_dir = data_dir_;
-            auto opened = runtime::engine_t::open(*runtime_, engine_config, primitives());
+            auto opened = runtime::engine_t::open(*runtime_, engine_config, remote_->primitives());
             if (opened.has_error()) {
                 FAIL("test engine refused to open on " << data_dir_ << ": " << opened.error().what.c_str());
             }
@@ -165,7 +159,7 @@ namespace otterstax::test {
 
         ~test_engine_t() {
             // The server's order: the engine (its final CHECKPOINT), the remote
-            // backends (registry reset first), the runtime.
+            // backends (the backend actor first), the runtime.
             engine_.reset();
             remote_.reset();
             runtime_.reset();
@@ -240,7 +234,6 @@ namespace otterstax::test {
         config::ConnectionsConfig connections{};
         config::ConnectionRetryConfig retry{};
         bool kafka_pollers = false;
-        engine_primitives_fn engine_primitives = &federation::make_primitives;
         // Wipe the data dir before and after.
         bool fresh = true;
     };
@@ -259,10 +252,9 @@ namespace otterstax::test {
             , engine_(std::make_unique<test_engine_t>(
                   data_dir,
                   options.fresh,
-                  remote_setup_t{.connectors = options.connectors, .connections = options.connections, .retry = options.retry},
-                  options.engine_primitives))
+                  remote_setup_t{.connectors = options.connectors, .connections = options.connections, .retry = options.retry}))
             , s3_connector_(actor_zeta::spawn<conn::s3::ConnectorManager>(engine_->resource()))
-            , file_(actor_zeta::spawn<conn::file::FileManager>(engine_->resource(), engine_->dispatcher()))
+            , file_(actor_zeta::spawn<conn::file::FileManager>(engine_->resource()))
             , s3_(actor_zeta::spawn<db::S3Manager>(engine_->resource(), s3_connector_->address(), file_->address()))
             , kafka_(actor_zeta::spawn<otterstax::kafka::KafkaManager>(engine_->resource(),
                                                                        engine_->dispatcher(),
@@ -271,15 +263,17 @@ namespace otterstax::test {
                 err.contains_error()) {
                 FAIL("s3 aliases refused: " << err.what.c_str());
             }
-            if (auto err = backends::publish_federation_metadata(engine_->resource(), engine_->engine(), engine_->remote());
+            if (auto err = backends::register_remote_tables(engine_->resource(), engine_->engine(), engine_->remote());
                 err.contains_error()) {
-                FAIL("federation metadata refused: " << err.what.c_str());
+                FAIL("remote tables refused: " << err.what.c_str());
             }
             auto services = otterstax::session::make_session_services(engine_->resource(),
                                                                       engine_->dispatcher(),
                                                                       s3_->address(),
                                                                       file_->address(),
-                                                                      kafka_->address());
+                                                                      kafka_->address(),
+                                                                      kafka_->object_names(),
+                                                                      engine_->remote().connections());
             REQUIRE_FALSE(services.has_error());
             sessions_ = std::make_unique<otterstax::session::session_factory_t>(engine_->runtime(),
                                                                                 options.parser_factory,
@@ -326,6 +320,7 @@ namespace otterstax::test {
         actor_zeta::address_t s3_address() const { return s3_->address(); }
         actor_zeta::address_t file_address() const { return file_->address(); }
         actor_zeta::address_t kafka_address() const { return kafka_->address(); }
+        const otterstax::kafka::kafka_object_names_t& kafka_objects() const { return kafka_->object_names(); }
         backends::remote_backends_t& remote() { return engine_->remote(); }
         otterstax::session::session_factory_t& sessions() { return *sessions_; }
 
@@ -409,12 +404,13 @@ namespace otterstax::test {
     inline core::result_wrapper_t<session_payload>
     execute_session_prepared(const session_stack& s,
                              session_hash_t id,
-                             std::pmr::vector<components::types::logical_value_t> parameters,
+                             std::pmr::vector<components::vector::vector_t> parameters,
                              std::chrono::milliseconds timeout = std::chrono::milliseconds(10000)) {
         auto [ns, fut] = actor_zeta::send(s.session,
                                           &otterstax::session::query_session_t::execute_prepared_statement,
                                           stmt(id),
-                                          std::move(parameters));
+                                          otterstax::session::parameter_row(s.resource, std::move(parameters)),
+                                          uint64_t{0});
         return await_session(std::move(fut), timeout, s.resource);
     }
 
@@ -430,9 +426,13 @@ namespace otterstax::test {
     execute_session_plan(const session_stack& s,
                          session_hash_t id,
                          ParsedQueryDataPtr plan,
-                         std::chrono::milliseconds timeout = std::chrono::milliseconds(10000)) {
-        auto [ns, fut] =
-            actor_zeta::send(s.session, &otterstax::session::query_session_t::execute_plan, stmt(id), std::move(plan));
+                         std::chrono::milliseconds timeout = std::chrono::milliseconds(10000),
+                         otterstax::session::query_session_t::rebuild_fn rebuild = {}) {
+        auto [ns, fut] = actor_zeta::send(s.session,
+                                          &otterstax::session::query_session_t::execute_plan,
+                                          stmt(id),
+                                          std::move(plan),
+                                          std::move(rebuild));
         return await_session(std::move(fut), timeout, s.resource);
     }
 
@@ -440,9 +440,13 @@ namespace otterstax::test {
     prepare_session_plan(const session_stack& s,
                          session_hash_t id,
                          ParsedQueryDataPtr plan,
-                         std::chrono::milliseconds timeout = std::chrono::milliseconds(10000)) {
-        auto [ns, fut] =
-            actor_zeta::send(s.session, &otterstax::session::query_session_t::prepare_plan, stmt(id), std::move(plan));
+                         std::chrono::milliseconds timeout = std::chrono::milliseconds(10000),
+                         otterstax::session::query_session_t::rebuild_fn rebuild = {}) {
+        auto [ns, fut] = actor_zeta::send(s.session,
+                                          &otterstax::session::query_session_t::prepare_plan,
+                                          stmt(id),
+                                          std::move(plan),
+                                          std::move(rebuild));
         return await_session(std::move(fut), timeout, s.resource);
     }
 
@@ -488,7 +492,7 @@ namespace otterstax::test {
     // Fresh dmldb.people (id bigint, name string) with `rows` rows, inserted in
     // multi-row VALUES batches so a table larger than one chunk is cheap to seed.
     inline void seed_people_bulk(const session_stack& s, session_hash_t& id, size_t rows) {
-        run_session_or_fail(s, id++, "CREATE DATABASE dmldb;");
+        run_session_or_fail(s, id++, "CREATE SCHEMA dmldb;");
         run_session_or_fail(s, id++, "CREATE TABLE dmldb.people (id bigint, name string);");
         constexpr size_t batch = 500;
         for (size_t first = 0; first < rows; first += batch) {

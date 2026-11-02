@@ -344,12 +344,12 @@ TEST_CASE("show_string: cells are spelled as Spark prints them") {
           one_cell_table("-0.50"));
 }
 
-TEST_CASE("show_string: a cell of a type show cannot render is a conversion_failure") {
+TEST_CASE("show_string: a cell of a type show cannot render is unimplemented_yet") {
     std::pmr::synchronized_pool_resource pool;
     auto chunks = one_cell(ct::complex_logical_type{ct::logical_type::UUID}, ct::int128_t{7}, &pool);
     auto rendered = frontend::spark::format_show_string(no_schema, chunks, 20, 20, false, &pool);
     REQUIRE(rendered.has_error());
-    CHECK(rendered.error().type == core::error_code_t::conversion_failure);
+    CHECK(rendered.error().type == core::error_code_t::unimplemented_yet);
     CHECK(std::string_view{rendered.error().what.c_str()}.find("'c'") != std::string_view::npos);
 }
 

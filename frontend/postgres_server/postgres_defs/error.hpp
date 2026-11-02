@@ -20,6 +20,7 @@ namespace frontend::postgres::sql_state {
     inline constexpr const char* STRING_DATA_RIGHT_TRUNCATION = "22001";
     inline constexpr const char* NUMERIC_VALUE_OUT_OF_RANGE = "22003";
     inline constexpr const char* DIVISION_BY_ZERO = "22012";
+    inline constexpr const char* INVALID_PARAMETER_VALUE = "22023";
     inline constexpr const char* INVALID_TEXT_REPRESENTATION = "22P02";
     inline constexpr const char* INVALID_DATETIME_FORMAT = "22007";
     inline constexpr const char* DATETIME_FIELD_OVERFLOW = "22008";
@@ -42,6 +43,9 @@ namespace frontend::postgres::sql_state {
     inline constexpr const char* INVALID_AUTHORIZATION_SPECIFICATION = "28000";
     inline constexpr const char* INVALID_PASSWORD = "28P01";
 
+    inline constexpr const char* INVALID_CATALOG_NAME = "3D000";
+    inline constexpr const char* INVALID_SCHEMA_NAME = "3F000";
+
     inline constexpr const char* INVALID_SAVEPOINT_SPECIFICATION = "3B001";
 
     inline constexpr const char* SYNTAX_ERROR_OR_ACCESS_RULE_VIOLATION = "42000";
@@ -52,6 +56,7 @@ namespace frontend::postgres::sql_state {
     inline constexpr const char* UNDEFINED_COLUMN = "42703";
     inline constexpr const char* UNDEFINED_TABLE = "42P01";
     inline constexpr const char* UNDEFINED_PARAMETER = "42P02";
+    inline constexpr const char* INDETERMINATE_DATATYPE = "42P18";
     inline constexpr const char* DUPLICATE_TABLE = "42P07";
     inline constexpr const char* DUPLICATE_COLUMN = "42701";
     inline constexpr const char* AMBIGUOUS_COLUMN = "42702";
@@ -59,6 +64,8 @@ namespace frontend::postgres::sql_state {
     inline constexpr const char* DATATYPE_MISMATCH = "42804";
     inline constexpr const char* WRONG_OBJECT_TYPE = "42809";
     inline constexpr const char* INVALID_FOREIGN_KEY = "42830";
+
+    inline constexpr const char* OBJECT_NOT_IN_PREREQUISITE_STATE = "55000";
 
     inline constexpr const char* INSUFFICIENT_RESOURCES = "53000";
     inline constexpr const char* DISK_FULL = "53100";

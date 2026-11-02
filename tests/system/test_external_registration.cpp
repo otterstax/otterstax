@@ -2,16 +2,15 @@
 // Copyright 2025-2026  OtterStax
 
 // External-table registration against the real engine, through the engine
-// requests (otterbrix/operators/engine_requests): the file / s3 load
-// (engine::create_table) and the relation probe of its result.
+// requests (otterbrix/operators/engine_requests): the load behind CREATE
+// EXTERNAL TABLE (engine::create_table_plan + engine::load_table) on a session.
 #include "otterbrix/operators/engine_requests.hpp"
-#include "otterbrix/operators/schema_probe.hpp"
+#include "../mock/cell.hpp"
 #include "session_stack.hpp"
 
 #include <catch2/catch_all.hpp>
 
 #include <components/types/types.hpp>
-#include <components/types/logical_value.hpp>
 #include <components/vector/data_chunk.hpp>
 
 #include <cstdint>
@@ -22,7 +21,6 @@
 
 using components::types::complex_logical_type;
 using components::types::logical_type;
-using components::types::logical_value_t;
 using otterstax::test::test_engine_t;
 namespace engine_requests = otterstax::engine;
 
@@ -39,8 +37,8 @@ namespace {
         components::vector::data_chunk_t chunk{resource, types, rows};
         for (std::size_t i = 0; i < rows; ++i) {
             const std::int64_t row_id = first_id + static_cast<std::int64_t>(i);
-            chunk.set_value(0, i, logical_value_t(resource, row_id));
-            chunk.set_value(1, i, logical_value_t(resource, "name_" + std::to_string(row_id)));
+            chunk.set_value(0, i, row_id);
+            chunk.set_value(1, i, std::string_view{"name_" + std::to_string(row_id)});
         }
         chunk.set_cardinality(rows);
         return chunk;
@@ -52,103 +50,81 @@ namespace {
         REQUIRE_FALSE(cursor->is_error());
     }
 
-    void require_error(const components::cursor::cursor_t_ptr& cursor,
-                       core::error_code_t code,
-                       const std::string& what) {
-        REQUIRE(cursor);
-        REQUIRE(cursor->is_error());
-        REQUIRE(cursor->get_error().type == code);
-        REQUIRE(std::string{cursor->get_error().what.c_str()} == what);
-    }
-
     template<typename T>
     void require_ok(const core::result_wrapper_t<T>& result) {
         INFO("error: " << (result.has_error() ? result.error().what.c_str() : ""));
         REQUIRE_FALSE(result.has_error());
     }
 
-    // The file / s3 load: database made to exist, the table created from the
-    // chunk's columns, the rows inserted.
-    core::result_wrapper_t<bool> load(test_engine_t& engine,
-                                      const std::string& database,
-                                      const std::string& table,
-                                      components::vector::data_chunk_t rows) {
-        return engine.drive(engine_requests::create_table(engine.resource(),
-                                                          engine.dispatcher(),
-                                                          engine.session(),
-                                                          database,
-                                                          table,
-                                                          std::move(rows)));
+    // The load on the test's engine session: CREATE TABLE `target` from the
+    // chunk's columns, then the rows (a run of one chunk, as a loader answers a
+    // small file); `own_block` as the query session passes it.
+    components::cursor::cursor_t_ptr load(test_engine_t& engine,
+                                          const qualified_name_t& target,
+                                          components::vector::data_chunk_t chunk,
+                                          bool own_block = true) {
+        std::pmr::vector<components::vector::data_chunk_t> rows(engine.resource());
+        rows.push_back(std::move(chunk));
+        auto create = engine_requests::create_table_plan(engine.resource(), target, rows);
+        REQUIRE_FALSE(create.has_error());
+        return engine.drive(engine_requests::load_table(engine.resource(),
+                                                        engine.dispatcher(),
+                                                        engine.session(),
+                                                        std::move(create.value()),
+                                                        target,
+                                                        std::move(rows),
+                                                        own_block));
     }
 
-    // The relation probe of engine::describe: a LIMIT 0 read of database.collection.
-    core::result_wrapper_t<engine_requests::columns_t>
-    probe(test_engine_t& engine, const std::string& database, const std::string& collection) {
-        auto* resource = engine.resource();
-        auto probe = otterstax::schema_probe::make_table_probe(resource, database, collection);
-        auto cursor =
-            engine.drive(engine_requests::send_plan(engine.dispatcher(), engine.session(), probe.execution_plan(resource)));
-        auto read = otterstax::schema_probe::read_columns(probe, cursor, resource);
-        if (read.has_error()) {
-            return read.convert_error<engine_requests::columns_t>();
-        }
-        return std::move(read.value().columns);
+    qualified_name_t local(const char* database, const char* table) {
+        return qualified_name_t{core::dbname_t{database}, core::schema_t{"public"}, core::relname_t{table}};
     }
 
     // (id, name) of every row of an (id, name) result, in result order.
     std::vector<std::pair<std::int64_t, std::string>> id_name_pairs(const components::cursor::cursor_t_ptr& cursor) {
         std::vector<std::pair<std::int64_t, std::string>> rows;
         for (std::uint64_t row = 0; row < cursor->size(); ++row) {
-            rows.emplace_back(cursor->value(0, row).value<std::int64_t>(),
-                              std::string{cursor->value(1, row).value<std::string_view>()});
+            rows.emplace_back(cursor->get<std::int64_t>(0, row).value(),
+                              std::string{cursor->get<std::string_view>(1, row).value()});
         }
         return rows;
     }
 
-    void require_id_name_struct(const complex_logical_type& schema) {
-        REQUIRE(schema.type() == logical_type::STRUCT);
-        REQUIRE(schema.child_types().size() == 2);
-        REQUIRE(schema.child_types()[0].alias() == "id");
-        REQUIRE(schema.child_types()[0].type() == logical_type::BIGINT);
-        REQUIRE(schema.child_types()[1].alias() == "name");
-        REQUIRE(schema.child_types()[1].type() == logical_type::STRING_LITERAL);
-    }
-
 } // namespace
 
-// The load (engine::create_table, behind CREATE EXTERNAL TABLE) makes the
-// database exist, creates database.collection and inserts the rows: they land
-// in the named database and nowhere else, and a table that already exists is
-// refused rather than appended to.
+// The load (behind CREATE EXTERNAL TABLE) creates the table as CREATE TABLE
+// names it and inserts the rows: they land in the named database and nowhere
+// else, a database that does not exist is not created, and a table that already
+// exists is refused rather than appended to.
 TEST_CASE("external registration: a load fills a table in its own database only") {
     test_engine_t engine("/tmp/otterstax_test_insert_data");
     engine.remove_on_exit();
     auto* resource = engine.resource();
 
     require_ok(engine.sql("CREATE DATABASE mixdb;"));
-    require_ok(load(engine, "mixdb", "t", id_name_rows(resource, 1, 3)));
+    require_ok(load(engine, local("mixdb", "t"), id_name_rows(resource, 1, 3)));
 
-    // A database that does not exist yet is created by the load.
-    require_ok(load(engine, "newdb", "t", id_name_rows(resource, 50, 1)));
-    auto created = engine.sql("SELECT id, name FROM newdb.t;");
-    require_ok(created);
-    REQUIRE(id_name_pairs(created) == std::vector<std::pair<std::int64_t, std::string>>{{50, "name_50"}});
+    // A database that does not exist is the engine's refusal; nothing is made.
+    auto missing = load(engine, local("newdb", "t"), id_name_rows(resource, 50, 1));
+    REQUIRE(missing->is_error());
+    CHECK(missing->transaction_status() == components::session::transaction_status_t::idle);
+    CHECK(engine.sql("SELECT id, name FROM newdb.public.t;")->is_error());
 
-    // The same collection name in another database is a separate table.
-    require_ok(load(engine, "otherdb", "t", id_name_rows(resource, 100, 1)));
+    // The same table name in another database is a separate table.
+    require_ok(engine.sql("CREATE DATABASE otherdb;"));
+    require_ok(load(engine, local("otherdb", "t"), id_name_rows(resource, 100, 1)));
 
     // A second load of an existing table is refused, and the table keeps only
     // the rows of the first load.
-    auto again = load(engine, "mixdb", "t", id_name_rows(resource, 200, 2));
-    REQUIRE(again.has_error());
-    REQUIRE(again.error().type == core::error_code_t::table_already_exists);
-    REQUIRE(std::string{again.error().what.c_str()}.find("mixdb.t already exists") != std::string::npos);
+    auto again = load(engine, local("mixdb", "t"), id_name_rows(resource, 200, 2));
+    REQUIRE(again->is_error());
+    REQUIRE(again->get_error().type == core::error_code_t::table_already_exists);
 
-    auto mixed = engine.sql("SELECT id, name FROM mixdb.t ORDER BY id;");
+    auto mixed = engine.sql("SELECT id, name FROM mixdb.public.t ORDER BY id;");
     require_ok(mixed);
     REQUIRE(id_name_pairs(mixed) ==
             std::vector<std::pair<std::int64_t, std::string>>{{1, "name_1"}, {2, "name_2"}, {3, "name_3"}});
-    auto others = engine.sql("SELECT id, name FROM otherdb.t ORDER BY id;");
+    auto others = engine.sql("SELECT id, name FROM otherdb.public.t ORDER BY id;");
     require_ok(others);
     REQUIRE(id_name_pairs(others) == std::vector<std::pair<std::int64_t, std::string>>{{100, "name_100"}});
 }
@@ -161,41 +137,61 @@ TEST_CASE("external registration: a load fills a dropped table again") {
     engine.remove_on_exit();
     auto* resource = engine.resource();
 
-    require_ok(load(engine, "mixdb", "t", id_name_rows(resource, 1, 3)));
-    require_ok(engine.sql("DROP TABLE mixdb.t;"));
-    require_ok(load(engine, "mixdb", "t", id_name_rows(resource, 200, 2)));
+    const qualified_name_t t{core::relname_t{"t"}};
+    require_ok(load(engine, t, id_name_rows(resource, 1, 3)));
+    require_ok(engine.sql("DROP TABLE t;"));
+    require_ok(load(engine, t, id_name_rows(resource, 200, 2)));
 
-    auto rows = engine.sql("SELECT id, name FROM mixdb.t ORDER BY id;");
+    auto rows = engine.sql("SELECT id, name FROM t ORDER BY id;");
     require_ok(rows);
     REQUIRE(id_name_pairs(rows) ==
             std::vector<std::pair<std::int64_t, std::string>>{{200, "name_200"}, {201, "name_201"}});
 }
 
-// The relation probe reads the columns off the engine's reply to a LIMIT 0
-// read, never off row data: an empty and a populated table of one shape answer
-// the same STRUCT.
-TEST_CASE("external registration: the probe of an empty and a populated table") {
-    test_engine_t engine("/tmp/otterstax_test_get_schema");
+// A load of its own block leaves the session outside one; a load inside the
+// session's block (own_block false) is part of it: ROLLBACK takes the table
+// and its rows back.
+TEST_CASE("external registration: a load inside the session's block is rolled back with it") {
+    test_engine_t engine("/tmp/otterstax_test_insert_data_block");
     engine.remove_on_exit();
     auto* resource = engine.resource();
+    using components::session::transaction_status_t;
 
-    require_ok(engine.sql("CREATE DATABASE mixdb;"));
-    require_ok(engine.sql("CREATE TABLE mixdb.empty_t (id BIGINT, name STRING);"));
-    require_ok(load(engine, "mixdb", "full_t", id_name_rows(resource, 1, 3)));
+    auto own = load(engine, qualified_name_t{core::relname_t{"own"}}, id_name_rows(resource, 1, 2));
+    require_ok(own);
+    CHECK(own->transaction_status() == transaction_status_t::idle);
 
-    for (const char* table : {"empty_t", "full_t"}) {
-        auto columns = probe(engine, "mixdb", table);
-        require_ok(columns);
-        require_id_name_struct(complex_logical_type::create_struct("", columns.value()));
-    }
+    require_ok(engine.sql("BEGIN;"));
+    auto inside = load(engine, qualified_name_t{core::relname_t{"inside"}}, id_name_rows(resource, 1, 2), false);
+    require_ok(inside);
+    CHECK(inside->transaction_status() == transaction_status_t::in_transaction);
+    auto seen = engine.sql("SELECT id, name FROM inside ORDER BY id;");
+    require_ok(seen);
+    CHECK(seen->size() == 2);
+    require_ok(engine.sql("ROLLBACK;"));
+    CHECK(engine.sql("SELECT id, name FROM inside;")->is_error());
+    CHECK(engine.sql("SELECT id, name FROM own;")->size() == 2);
+}
 
-    auto missing_table = probe(engine, "mixdb", "nope");
-    REQUIRE(missing_table.has_error());
-    REQUIRE(missing_table.error().type == core::error_code_t::table_not_exists);
-    REQUIRE(std::string{missing_table.error().what.c_str()} == "collection does not exist: mixdb.nope");
+// A column without a name cannot define a table: refused before the engine.
+TEST_CASE("external registration: a nameless column cannot define a table") {
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
+    std::pmr::vector<complex_logical_type> types(&arena);
+    types.emplace_back(logical_type::BIGINT);
+    std::pmr::vector<components::vector::data_chunk_t> rows(&arena);
+    rows.emplace_back(&arena, types, 1);
+    auto plan = engine_requests::create_table_plan(&arena, qualified_name_t{core::relname_t{"t"}}, rows);
+    REQUIRE(plan.has_error());
+    CHECK(plan.error().type == core::error_code_t::invalid_parameter);
+    CHECK(std::string{plan.error().what.c_str()} == "CREATE TABLE t: column 0 has no name");
+}
 
-    auto missing_database = probe(engine, "nodb", "t");
-    REQUIRE(missing_database.has_error());
-    REQUIRE(missing_database.error().type == core::error_code_t::database_not_exists);
-    REQUIRE(std::string{missing_database.error().what.c_str()} == "database does not exist: nodb");
+// An empty run names no column: refused before the engine.
+TEST_CASE("external registration: an empty run cannot define a table") {
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
+    std::pmr::vector<components::vector::data_chunk_t> rows(&arena);
+    auto plan = engine_requests::create_table_plan(&arena, qualified_name_t{core::relname_t{"t"}}, rows);
+    REQUIRE(plan.has_error());
+    CHECK(plan.error().type == core::error_code_t::invalid_parameter);
+    CHECK(std::string{plan.error().what.c_str()} == "CREATE TABLE t: the input has no columns");
 }

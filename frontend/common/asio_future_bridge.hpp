@@ -101,7 +101,7 @@ namespace otterstax {
     // The bridge's own failures, the message on `resource`.
     template<typename T>
     awaited_t<T> await_timed_out(std::pmr::memory_resource* resource) {
-        return awaited_t<T>{core::error_t{core::error_code_t::other_error,
+        return awaited_t<T>{core::error_t{core::error_code_t::io_error,
                                           std::pmr::string{"await deadline reached", resource}},
                             await_status_t::timed_out};
     }
@@ -116,7 +116,7 @@ namespace otterstax {
             ec == std::errc::interrupted
                 ? std::string{"the statement failed without an answer: an exception escaped the actor running it"}
                 : "the statement failed without an answer: " + ec.message();
-        return awaited_t<T>{core::error_t{core::error_code_t::other_error, std::pmr::string{why.c_str(), resource}},
+        return awaited_t<T>{core::error_t{core::error_code_t::internal_error, std::pmr::string{why.c_str(), resource}},
                             await_status_t::broken};
     }
 

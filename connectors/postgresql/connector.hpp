@@ -59,7 +59,7 @@ namespace pg {
     // connect()/tryReconnect() return it, and each runQuery overload resolves to
     // the marshaled outcome of its handler (see otterstax::query_result_t).
     // runQuery takes the handler as a non-owning otterstax::function_ref_t: the
-    // callable must outlive the returned awaitable. ConnectorManager::executeQuery
+    // callable must outlive the returned awaitable. The backend agent (backend_agent.hpp)
     // binds the copy otterstax::run_with_owned_handler keeps in its frame.
     class IConnector {
     public:
@@ -72,7 +72,7 @@ namespace pg {
         virtual core::error_t tryReconnect() = 0;
         virtual bool isClosed() const noexcept = 0;
         virtual std::string alias() const noexcept = 0;
-        // Aborts the statement this connector runs, from any thread (the connector manager's
+        // Aborts the statement this connector runs, from any thread (the backend agent's cancel at
         // shutdown): the connection's socket is shut down, so the blocking PQexec returns its
         // "server closed the connection" error at once whatever state the server is in, and the
         // connector refuses every later statement. Never blocks. The server notices the closed
@@ -191,5 +191,8 @@ namespace pg {
     // function. The leading memory_resource owns every core::error_t message the
     // connector produces on the io thread.
     using connector_factory = std::unique_ptr<IConnector> (*)(std::pmr::memory_resource*, connect_params, std::string);
+
+    // The real connector, as production builds it (remote_backends_t's default factory).
+    std::unique_ptr<IConnector> make_pg_connector(std::pmr::memory_resource* resource, connect_params params, std::string alias);
 
 } // namespace pg

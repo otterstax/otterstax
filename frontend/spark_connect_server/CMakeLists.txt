@@ -132,7 +132,6 @@ target_link_libraries(spark_connect_server PUBLIC
     protobuf::protobuf
     otterbrix::otterbrix
     actor-zeta::actor-zeta
-    catalog
     session
 )
 

@@ -11,12 +11,13 @@
 #include "../postgres_defs/field_type.hpp"
 #include "../postgres_defs/message_type.hpp"
 #include "../resultset/postgres_resultset.hpp"
+#include "deallocate_statement.hpp"
 #include "pipeline_state.hpp"
+#include "protocol_parameters.hpp"
 
 #include "frontend/common/asio_future_bridge.hpp"
 #include "session/session_factory.hpp"
 #include "session/session_payload.hpp"
-#include "session/statement_kind.hpp"
 #include "utility/session.hpp"
 
 #include <actor-zeta.hpp>
@@ -25,15 +26,13 @@
 #include <components/sql/transformer/utils.hpp>
 #include <components/types/types.hpp>
 #include <iostream>
-#include <memory>
 #include <optional>
-#include <random>
-#include <regex>
 
 namespace frontend::postgres {
     class postgres_connection : public frontend_connection {
     public:
-        using portal_t = std::pmr::vector<components::types::logical_value_t>;
+        // The Bind values, `$<i+1>` at i, each a one-row vector.
+        using portal_t = std::pmr::vector<components::vector::vector_t>;
 
         postgres_connection(std::pmr::memory_resource* resource,
                             boost::asio::ip::tcp::socket&& socket,
@@ -43,61 +42,95 @@ namespace frontend::postgres {
                             size_t slot,
                             std::chrono::milliseconds read_timeout);
 
-        struct prepared_stmt_meta {
-            prepared_stmt_meta(std::pmr::memory_resource* resource,
-                               otterstax::session::statement_id_t stmt_session,
-                               std::string sql,
-                               uint32_t parameter_count,
-                               components::types::complex_logical_type schema,
-                               std::pmr::vector<field_type> specified_types,
-                               NodeTag tag);
+        // What a statement runs: the part of it a portal bound from it keeps
+        // (a copy, taken at Bind), so a portal outlives the statement's
+        // DEALLOCATE (PostgreSQL's DEALLOCATE touches no portal).
+        struct statement_run_t {
+            statement_run_t(std::pmr::memory_resource* resource,
+                            otterstax::session::statement_id_t stmt_session,
+                            std::string_view sql,
+                            components::types::complex_logical_type schema,
+                            NodeTag tag);
+            // A copy whose text lives on `resource`.
+            statement_run_t(const statement_run_t& other, std::pmr::memory_resource* resource);
 
-            // The statement's id in the connection's query session.
+            // The statement's id in the connection's query session, which keeps
+            // it (its text, its described schema) for every execution until the
+            // statement is closed.
             otterstax::session::statement_id_t stmt_session;
-            // The session keeps a prepared statement for exactly one execution,
-            // successful or not; every later Execute prepares this text again
-            // under a fresh statement id before executing.
+            // Prepared again under a fresh id by a portal whose statement is
+            // gone (portal_entry).
             std::pmr::string sql;
-            bool consumed;
-            uint32_t parameter_count;
             components::types::complex_logical_type schema;
-            // The kind of statement the prepare answered for. Describe(portal)
-            // decides by it whether the portal may be RUN to be described:
-            // running a statement that answers rows costs the execution the
-            // Execute would do anyway (the portal keeps the result), while
-            // running an INSERT / UPDATE / DELETE would write — twice, for a
-            // client that describes a portal and then binds it again.
             NodeTag tag;
-            std::pmr::vector<field_type> specified_types;
-            std::pmr::vector<std::string> portal_names;
-            // Describe(statement) already gave the client a RowDescription.
-            bool described;
             // A DEALLOCATE prepared through Parse (psycopg's pipeline sends
             // DEALLOCATE ALL so): the frontend runs it at Execute, the session
             // never holds it (`stmt_session` names nothing there).
-            std::optional<otterstax::session::deallocate_statement_t> deallocate;
-            // COMMIT / ROLLBACK (session::is_transaction_exit_statement): the only
-            // statement a Bind takes in an aborted block, as in PostgreSQL.
-            bool transaction_exit = false;
+            std::optional<deallocate_statement_t> deallocate;
+            // A SET of a protocol parameter prepared through Parse: the frontend
+            // checks it at Execute, the session never holds it either.
+            std::optional<protocol_setting_t> protocol_setting;
+            // SHOW of a client parameter prepared through Parse: the frontend
+            // answers it at Execute (`schema` is its one text column).
+            std::optional<client_parameter_t> show;
+            // RESET ALL / DISCARD ALL: the engine runs it, the frontend resets
+            // the client parameters behind its success.
+            bool resets_client_parameters{false};
+            // DEALLOCATE, a protocol SET or a SHOW of a client parameter: kept
+            // by the frontend alone.
+            bool frontend_only() const noexcept {
+                return deallocate.has_value() || protocol_setting.has_value() || show.has_value();
+            }
         };
-        // Shared with the portals bound from it: DEALLOCATE drops the statement
-        // and leaves its portals open, as PostgreSQL does.
-        using statement_ptr = std::shared_ptr<prepared_stmt_meta>;
 
-        // Result format codes belong to the Bind that created the portal, and so
-        // does the executed result: an Execute with a row limit stops at the
-        // limit (PortalSuspended) and the next Execute on the same portal
-        // continues from `emitted` without running the statement again.
+        struct prepared_stmt_meta {
+            prepared_stmt_meta(statement_run_t run,
+                               uint32_t parameter_count,
+                               std::pmr::vector<field_type> specified_types);
+
+            statement_run_t run;
+            uint32_t parameter_count;
+            // The type each `$n` is bound by: the client's (Parse), else the
+            // engine's (the describe's parameter types), else text.
+            std::pmr::vector<field_type> specified_types;
+            // Describe(statement) already gave the client a RowDescription.
+            bool described{false};
+            // COMMIT / ROLLBACK / ROLLBACK TO (the describe's transaction
+            // statement): the only statement a Bind takes in an aborted block,
+            // as in PostgreSQL's exec_bind_message.
+            bool transaction_exit{false};
+        };
+
+        // Result format codes belong to the Bind that created the portal. An
+        // Execute with a row limit runs the statement under an engine window
+        // (query_session_t::execute_window): `window` names it while more rows
+        // may follow (PortalSuspended), and the next Execute on the portal
+        // fetches on from it; a portal closed, replaced or left at an
+        // autocommit Sync closes its window.
         struct portal_meta {
-            portal_meta(portal_t params, statement_ptr statement, std::vector<result_encoding> format);
+            portal_meta(portal_t params,
+                        std::string statement_name,
+                        statement_run_t run,
+                        bool statement_described,
+                        std::vector<result_encoding> format);
 
             portal_t params;
-            statement_ptr statement;
+            // The statement it was bound from, by name (Close(statement) and a
+            // replacing Parse close the portals of the statement still of that
+            // name and entry); its run, as Bind found it.
+            std::string statement_name;
+            statement_run_t run;
+            // The statement gave the client a RowDescription before Bind: the
+            // shape an Execute is held to (same_wire_shape).
+            bool statement_described;
             std::vector<result_encoding> format;
-            // Describe(portal) already gave the client a RowDescription.
-            bool described;
-            std::optional<session_payload> result;
-            size_t emitted;
+            // Describe(portal) already gave the client a RowDescription, or an
+            // Execute sent one in front of the first rows.
+            bool described{false};
+            uint64_t window{0};
+            // Ran to its end: a later Execute answers no rows (a statement the
+            // frontend keeps: 55000, its portal cannot run again).
+            bool done{false};
         };
 
         static std::vector<uint8_t> build_too_many_connections_error();
@@ -129,18 +162,76 @@ namespace frontend::postgres {
 
         void read_initial_message();
         // `reader` stands after the protocol version the caller dispatched on.
+        // Every parameter is either the protocol's (protocol_parameters.hpp:
+        // checked against what OtterStax does, any other value FATAL 22023;
+        // a client parameter kept as the client gives it — application_name
+        // cleaned, extra_float_digits checked, FATAL 22023) or a
+        // setting of the engine session: `database` is SET search_path =
+        // '<database>.public' (a database the engine does not have: FATAL
+        // 3D000), the `options` switches (-c name=value, --name=value) and every
+        // other parameter SET in the engine, in that order (PostgreSQL's), a
+        // refusal FATAL with the engine's text. `user` names nobody to
+        // authenticate; `_pq_.*` are protocol extensions.
         void handle_startup_message(int32_t protocol_version, packet_reader& reader);
+        // The startup's engine settings in order; false after the FATAL error.
+        // Each one the engine applied is followed (follow_parameters).
+        [[nodiscard]] bool apply_startup_settings(const std::optional<std::string>& database,
+                                                  const std::vector<std::pair<std::string, std::string>>& settings);
+        // The reported engine settings as a fresh session has them, the
+        // default every session shares: the engine's built-in values with the
+        // stored pg_catalog.pg_settings rows over them (the last row of a
+        // setting, as the engine reads it at its start), each through the
+        // engine's own set_setting. ALTER SYSTEM never reaches the engine
+        // (the parser refuses it), so they stay what the engine started with;
+        // still they are read per connection: the frontend has no per-server
+        // slot (frontend_server constructs the connections) and the read is
+        // one catalog scan on the connection's own engine session.
+        void read_default_settings();
+        // A SET of a protocol parameter (Query, or an Execute of one Parse
+        // kept): a failed block refuses it (25P02), a value OtterStax does not
+        // give is 22023, a SET of a client parameter changes the connection's
+        // (set_client_parameter); nothing reaches the engine. False after the
+        // error.
+        [[nodiscard]] bool run_protocol_setting(const protocol_setting_t& setting);
+        // A SET / RESET of a client parameter as PostgreSQL's GUC applies it
+        // (client_setting_t): a value extra_float_digits does not take is 22023
+        // (inside a block it fails it). False after the error.
+        [[nodiscard]] bool set_client_parameter(const protocol_setting_t& setting);
+        // ReadyForQuery with the block's status, behind a ParameterStatus for
+        // every reported parameter (application_name, client_encoding,
+        // TimeZone, search_path) whose value is not the one last reported —
+        // PostgreSQL's ReportChangedGUCOptions, which runs in front of every
+        // ReadyForQuery: a SET, a RESET, the end of a block (a ROLLBACK takes a
+        // value back), a ROLLBACK TO, inside a block too. extra_float_digits is
+        // not reported (no GUC_REPORT).
+        void append_ready_for_query(std::vector<std::vector<uint8_t>>& response);
+        // What an answered statement did to the parameters the frontend
+        // follows: the engine settings it assigned (session_payload::
+        // setting_changes), a savepoint it set, released or rolled back to, the
+        // end of the block (COMMIT keeps, anything else drops). Every awaited
+        // answer goes through here (await_session).
+        void follow_parameters(const otterstax::awaited_t<session_payload>& answer);
+        // RESET ALL: every client parameter back to its StartupMessage value,
+        // as a SET (inside a block until it ends).
+        void reset_client_parameters();
+        // CommandComplete of a SET of the frontend's: RESET for RESET (utility.c).
+        command_complete_tag setting_tag(const protocol_setting_t& setting) const;
+        // The answer of SHOW <client parameter>: a RowDescription unless
+        // `row_shape_known`, one DataRow in `format`, CommandComplete SHOW.
+        std::vector<std::vector<uint8_t>>
+        answer_show(client_parameter_t parameter, const std::vector<result_encoding>& format, bool row_shape_known);
         void handle_ssl_decline(packet_reader& reader);
         void handle_query(std::string query);
         // DEALLOCATE [PREPARE] <name> | ALL on the simple-query route: run_deallocate,
         // then CommandComplete DEALLOCATE / DEALLOCATE ALL and ReadyForQuery.
-        void handle_deallocate(otterstax::session::deallocate_statement_t statement);
-        // Drops the named statement, or every named one, as PostgreSQL's
-        // DEALLOCATE does: the session entry is released, the portals bound
-        // from it stay open. An unknown name is 26000 and a failed block refuses
-        // it with 25P02, as PostgreSQL does. Returns false after sending the
-        // ErrorResponse.
-        bool run_deallocate(const otterstax::session::deallocate_statement_t& statement);
+        void handle_deallocate(const deallocate_statement_t& statement, const std::string& sql);
+        // A name of the connection's statement map (Parse) is dropped there, as
+        // PostgreSQL's DEALLOCATE does — the session entry released, the portals
+        // bound from it left open; a failed block refuses it with 25P02. Any
+        // other name is the engine's (SQL PREPARE): `sql` runs on the session,
+        // the engine's answer; DEALLOCATE ALL drops the map's and runs on the
+        // engine. Returns false after sending the ErrorResponse.
+        bool run_deallocate(const deallocate_statement_t& statement, const std::string& sql);
 
         // Every session call is awaited here: the bridge, plus the end of a
         // pending failure once an answer shows the session ran it.
@@ -150,24 +241,21 @@ namespace frontend::postgres {
         // not yet seen applied.
         bool block_aborted() const;
         // 25P02 for what an aborted block refuses before it reaches the session
-        // (PostgreSQL's exec_parse_message / exec_bind_message): every statement
-        // but a transaction exit.
+        // (PostgreSQL's exec_bind_message: a Bind of anything but a transaction
+        // exit; a Parse of a DEALLOCATE, which the frontend keeps).
         void refuse_in_aborted_block();
-        // The ReadyForQuery status: the session's transaction block ('I' / 'T' /
-        // 'E'), 'E' too while a failure sent to it is pending. One source for
-        // the simple and the extended route alike.
+        // The ReadyForQuery status: where the engine stamped the session after
+        // its last statement ('I' / 'T' / 'E', query_session_t::transaction_status),
+        // 'E' too while a failure sent to it is pending. One source for the
+        // simple and the extended route alike.
         transaction_status ready_status() const;
-        // The answer a COMMIT of a failed block is given
-        // (query_session_t::ended_failed_block): the engine rolled the block
-        // back and it has ended, so no rows and the ROLLBACK tag, as PostgreSQL
-        // answers it.
-        session_payload rollback_payload() const;
         // A session failure as an ErrorResponse: the bridge's timeout (told by
-        // the await's status, never by a code) 57014,
-        // a statement refused in a failed block 25P02, one the engine does not
-        // support (SAVEPOINT among them) 0A000, any other `prefix` + the text as
-        // 42601.
-        void send_session_error(const otterstax::awaited_t<session_payload>& answer, std::string_view prefix);
+        // the await's status, never by a code) 57014, else the SQLSTATE of the
+        // engine's code (sqlstate_of; 42601 with `prefix` for a code without
+        // one).
+        void send_session_error(const otterstax::awaited_t<session_payload>& answer,
+                                std::string_view prefix,
+                                error_severity severity = error_severity::error());
 
         void handle_parse(std::string stmt, std::string query, int16_t num_params, packet_reader&& reader);
         void handle_bind(std::string stmt,
@@ -183,8 +271,14 @@ namespace frontend::postgres {
         // or the portal.
         void do_close(describe_close_arg type, std::string name);
         // Forgets the named statement and releases its session entry; its
-        // portals are left alone (they hold the statement).
+        // portals are left alone (each keeps its statement's run, and prepares
+        // the text again at its Execute: portal_entry).
         void drop_statement(const std::string& name);
+        // The session entry a portal runs: its statement's while that statement
+        // is still the one of its name, else its text prepared again under a
+        // fresh id (`temporary`: closed by the caller after the run, through
+        // close_session_statement). std::nullopt after the ErrorResponse.
+        std::optional<otterstax::session::statement_id_t> portal_entry(const portal_meta& portal, bool& temporary);
         // Appends a RowDescription (with the given result format codes) for a
         // resolved schema, NoData otherwise; `described` is set to whether a
         // RowDescription went out — only then does the client know the row
@@ -194,20 +288,30 @@ namespace frontend::postgres {
                                        const std::vector<result_encoding>& format,
                                        std::vector<std::vector<uint8_t>>& packets,
                                        bool& described);
-        // Prepares the statement text again once the session has consumed it.
-        // Returns false after sending the error to the client.
-        bool reprepare_stmt(prepared_stmt_meta& stmt);
-        // Runs the portal's statement and stores the result in the portal.
-        // Returns false after sending the error to the client.
-        bool run_portal(portal_meta& portal);
+        // Closes the portal's engine window, if one is open (Close, a replacing
+        // Bind, an autocommit Sync); a failure is logged only.
+        void close_window(portal_meta& portal);
+        using portal_iterator = std::pmr::unordered_map<std::string, portal_meta>::iterator;
+        // Ends a portal: its window closed when `close_windows` (a window the
+        // transaction's end ended is not), the portal forgotten. Answers the
+        // next portal.
+        portal_iterator release_portal(portal_iterator it, bool close_windows);
+        // Every portal, as release_portal ends one: at the transaction's end.
+        void release_portals(bool close_windows);
+        // close_statement of the session's entry; a failure is logged only.
+        void close_session_statement(otterstax::session::statement_id_t stmt_session);
         // PostgreSQL's text for a message with bytes after its last field.
         static constexpr const char* INVALID_MESSAGE_FORMAT = "invalid message format";
+        // `hint`: the ErrorResponse's H field, empty for none.
         void send_error_response(const char* sqlstate,
                                  std::string message,
-                                 error_severity severity = error_severity::error());
+                                 error_severity severity = error_severity::error(),
+                                 std::string hint = {});
 
         std::pmr::memory_resource* resource_;
-        std::pmr::unordered_map<std::string, statement_ptr> statement_name_map_;
+        // The one owner of every prepared statement (a portal keeps a copy of
+        // its run, never the statement).
+        std::pmr::unordered_map<std::string, prepared_stmt_meta> statement_name_map_;
         std::pmr::unordered_map<std::string, portal_meta> portals_;
         packet_writer writer_;
         // The connection's query session: one engine session, its transaction
@@ -217,6 +321,28 @@ namespace frontend::postgres {
         // A failure reported to the session (fail_transaction) and not yet seen
         // applied: an open block is reported failed meanwhile.
         bool failure_pending_{false};
+        // The client parameters as PostgreSQL's GUC keeps them
+        // (protocol_parameters.hpp): the frontend's, never the engine's. A block
+        // their SET was made in ends in follow_parameters.
+        client_setting_t<std::string> application_name_{};
+        // PostgreSQL's value when the client names none: the database's
+        // encoding.
+        client_setting_t<std::string> client_encoding_{"UTF8", "UTF8"};
+        // How this connection's float cells are written as text.
+        client_setting_t<int> extra_float_digits_{default_extra_float_digits, default_extra_float_digits};
+        // The engine settings PostgreSQL reports, followed as the engine keeps
+        // them (follow_parameters): `reset` the engine's default
+        // (read_default_settings), the startup's SET its session value.
+        client_setting_t<std::string> timezone_{};
+        client_setting_t<std::string> search_path_{};
+        // The value of the last ParameterStatus of each reported parameter.
+        struct reported_t {
+            std::string application_name;
+            std::string client_encoding;
+            std::string timezone;
+            std::string search_path;
+        };
+        reported_t reported_{};
         pipeline_state pipeline_;
         bool use_protocol_3_2_;
         log_t log_;

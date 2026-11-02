@@ -35,49 +35,53 @@ namespace frontend::mysql {
 
     std::vector<uint8_t>
     build_error(packet_writer& writer, uint8_t sequence_id, mysql_error error_code, std::string message) {
-        const char* sql_state; // 5 chars
-
+        // MySQL 8.4's SQLSTATE of the errno (error.hpp, sql_state).
+        const char* sql_state = sql_state::GENERAL_ERROR; // 5 chars
         switch (error_code) {
             case mysql_error::ER_ACCESS_DENIED_ERROR:
-            case mysql_error::ER_DBACCESS_DENIED_ERROR:
-            case mysql_error::ER_TABLEACCESS_DENIED_ERROR:
                 sql_state = sql_state::ACCESS_DENIED;
-                break;
-            case mysql_error::ER_PACKET_TOO_LARGE:
-            case mysql_error::ER_MALFORMED_PACKET:
-            case mysql_error::ER_SEQUENCE_ERROR:
-            case mysql_error::ER_UNKNOWN_ERROR:
-                sql_state = sql_state::PACKET_ERROR;
-                break;
-            case mysql_error::ER_OUT_OF_RESOURCES:
-                sql_state = sql_state::RESOURCE_ERROR;
-                break;
-            case mysql_error::ER_UNKNOWN_COM_ERROR:
-            case mysql_error::ER_PARSE_ERROR:
-            case mysql_error::ER_SYNTAX_ERROR:
-            case mysql_error::ER_WRONG_VALUE_COUNT_ON_ROW:
-            case mysql_error::ER_EMPTY_QUERY:
-                sql_state = sql_state::COMMAND_ERROR;
-                break;
-            case mysql_error::ER_NET_READ_ERROR:
-                sql_state = sql_state::CONNECTION_ERROR;
-                break;
-            case mysql_error::ER_BAD_DB_ERROR:
-            case mysql_error::ER_NO_SUCH_TABLE:
-            case mysql_error::ER_UNKNOWN_TABLE:
-            case mysql_error::ER_DB_CREATE_EXISTS:
-            case mysql_error::ER_DB_DROP_EXISTS:
-            case mysql_error::ER_TABLE_EXISTS_ERROR:
-            case mysql_error::ER_UNKNOWN_STMT_HANDLER:
-            case mysql_error::ER_NOT_SUPPORTED_YET:
-                sql_state = sql_state::COMMAND_ERROR;
                 break;
             case mysql_error::ER_CON_COUNT_ERROR:
             case mysql_error::ER_NOT_SUPPORTED_AUTH_MODE:
-                sql_state = sql_state::NOT_SUPPORTED_AUTH_ERROR;
+                sql_state = sql_state::CONNECTION_REJECTED;
                 break;
-            default:
-                sql_state = sql_state::PROTOCOL_ERROR;
+            case mysql_error::ER_HANDSHAKE_ERROR:
+            case mysql_error::ER_UNKNOWN_COM_ERROR:
+            case mysql_error::ER_PACKET_TOO_LARGE:
+            case mysql_error::ER_NET_READ_ERROR:
+                sql_state = sql_state::COMMUNICATION_LINK_FAILURE;
+                break;
+            case mysql_error::ER_DBACCESS_DENIED_ERROR:
+            case mysql_error::ER_TABLEACCESS_DENIED_ERROR:
+            case mysql_error::ER_BAD_DB_ERROR:
+            case mysql_error::ER_PARSE_ERROR:
+            case mysql_error::ER_EMPTY_QUERY:
+            case mysql_error::ER_SYNTAX_ERROR:
+            case mysql_error::ER_NOT_SUPPORTED_YET:
+            case mysql_error::ER_COLLATION_CHARSET_MISMATCH:
+                sql_state = sql_state::SYNTAX_ERROR_OR_ACCESS_RULE;
+                break;
+            case mysql_error::ER_TABLE_EXISTS_ERROR:
+                sql_state = sql_state::TABLE_EXISTS;
+                break;
+            case mysql_error::ER_NO_SUCH_TABLE:
+            case mysql_error::ER_UNKNOWN_TABLE:
+                sql_state = sql_state::TABLE_NOT_FOUND;
+                break;
+            case mysql_error::ER_WRONG_VALUE_COUNT_ON_ROW:
+                sql_state = sql_state::VALUE_COUNT_MISMATCH;
+                break;
+            case mysql_error::ER_OUT_OF_RESOURCES:
+            case mysql_error::ER_DB_CREATE_EXISTS:
+            case mysql_error::ER_DB_DROP_EXISTS:
+            case mysql_error::ER_UNKNOWN_ERROR:
+            case mysql_error::ER_UNKNOWN_SYSTEM_VARIABLE:
+            case mysql_error::ER_UNKNOWN_STMT_HANDLER:
+            case mysql_error::ER_MALFORMED_PACKET:
+            case mysql_error::ER_SEQUENCE_ERROR:
+            case mysql_error::ER_QUERY_TIMEOUT:
+            case mysql_error::ER_PROTOCOL_ERROR:
+                sql_state = sql_state::GENERAL_ERROR;
                 break;
         }
 

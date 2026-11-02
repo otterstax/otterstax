@@ -1,16 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2025-2026  OtterStax
 //
-// Sub-queries over local tables through query_session_t (the scenarios of
-// test_subquery_plan.cpp), and the describe of a parameterized statement whose
-// SELECT list holds a scalar sub-query: the statement's dependency map and the
-// federated schema computation walk the statement's root only, so that column
-// is described as the engine's describe answers it (the column reads a
-// parameter the sub-query's result is bound into when it runs).
+// Sub-queries over local tables through query_session_t, and the engine's
+// describe of statements that carry them: a relation only a sub-query reads is
+// analyzed with the statement, and a scalar sub-query's column is typed.
 
 #include "../system/session_stack.hpp"
-
-#include "session/plan_inspection.hpp"
+#include "../mock/cell.hpp"
 
 #include <catch2/catch_all.hpp>
 
@@ -35,7 +31,7 @@ namespace {
 
     // sq.t: ids 1..4; sq.u: ids 2 and 3.
     void seed(const session_stack& s, session_hash_t& id) {
-        run_session_or_fail(s, id++, "CREATE DATABASE sq;");
+        run_session_or_fail(s, id++, "CREATE SCHEMA sq;");
         run_session_or_fail(s, id++, "CREATE TABLE sq.t (id bigint, name string);");
         run_session_or_fail(s, id++, "CREATE TABLE sq.u (id bigint);");
         run_session_or_fail(s, id++, "INSERT INTO sq.t (id, name) VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd');");
@@ -46,7 +42,7 @@ namespace {
         ids_t ids;
         for (const auto& chunk : chunks) {
             for (uint64_t row = 0; row < chunk.size(); ++row) {
-                ids.push_back(chunk.value(0, row).value<int64_t>());
+                ids.push_back(otterstax::test::cell(chunk, 0, row).value<int64_t>());
             }
         }
         return ids;
@@ -117,8 +113,8 @@ TEST_CASE("session sub-query: prepared statements carry their sub-queries", "[su
                                           "ORDER BY id;");
         INFO((parsed.has_error() ? parsed.error().what.c_str() : ""));
         REQUIRE_FALSE(parsed.has_error());
-        std::pmr::vector<ct::logical_value_t> params(s.resource);
-        params.emplace_back(s.resource, int64_t{2});
+        std::pmr::vector<components::vector::vector_t> params(s.resource);
+        params.push_back(components::vector::make_scalar(s.resource, int64_t{2}));
         auto executed = execute_session_prepared(s, bound_id, std::move(params));
         INFO((executed.has_error() ? executed.error().what.c_str() : ""));
         REQUIRE_FALSE(executed.has_error());
@@ -137,35 +133,10 @@ TEST_CASE("session sub-query: DML with an IN sub-query touches the selected rows
     });
 }
 
-// The describe of a statement probes the relations its ROOT reads; a relation
-// only a sub-query reads is not among them.
-TEST_CASE("session sub-query: the describe reads the statement's root only", "[subquery]") {
-    with_session_stack("/tmp/test_session_subquery_deps", [](session_stack s) {
-        GreenplumParser parser(s.resource);
-        auto parsed = parser.parse("SELECT id, (SELECT max(id) FROM sq.u) AS top FROM sq.t WHERE id = $1;");
-        INFO((parsed.has_error() ? parsed.error().what.c_str() : ""));
-        REQUIRE_FALSE(parsed.has_error());
-        const auto& statement = *parsed.value()->otterbrix_params;
-        REQUIRE_FALSE(statement.sub_queries.empty());
-
-        const auto reads = [](const otterstax::session::plan::dependencies_t& dependencies, const char* collection) {
-            bool found = false;
-            for (const auto& [name, index] : dependencies) {
-                REQUIRE(index < dependencies.size());
-                found = found || (name.database.t == "sq" && name.collection.t == collection);
-            }
-            return found;
-        };
-
-        const auto root_only = otterstax::session::plan::plan_dependencies(s.resource, statement);
-        CHECK(reads(root_only, "t"));
-        CHECK_FALSE(reads(root_only, "u"));
-    });
-}
-
-// A relation only a sub-query reads, missing from the engine, does not fail
-// the prepare of the statement: the root's relations describe it.
-TEST_CASE("session sub-query: a sub-query relation the engine lacks does not fail the prepare", "[subquery]") {
+// The engine analyzes a prepare as a run analyzes it, sub-queries included: a
+// relation only a sub-query reads, missing from the engine, fails the prepare
+// as PostgreSQL's Parse fails it.
+TEST_CASE("session sub-query: a sub-query relation the engine lacks fails the prepare", "[subquery]") {
     with_session_stack("/tmp/test_session_subquery_missing", [](session_stack s) {
         session_hash_t id = 14350;
         seed(s, id);
@@ -173,21 +144,15 @@ TEST_CASE("session sub-query: a sub-query relation the engine lacks does not fai
             s,
             id++,
             "SELECT id FROM sq.t WHERE id = $1 AND id IN (SELECT id FROM sq.not_there);");
-        INFO((prepared.has_error() ? prepared.error().what.c_str() : ""));
-        REQUIRE_FALSE(prepared.has_error());
-        REQUIRE(prepared.value().parameter_count == 1);
-        const auto& schema = prepared.value().schema;
-        REQUIRE(schema.type() == ct::logical_type::STRUCT);
-        REQUIRE(field_named(schema, "id") != nullptr);
+        REQUIRE(prepared.has_error());
+        CHECK(prepared.error().type == core::error_code_t::table_not_exists);
     });
 }
 
-// The column of a scalar sub-query reads the parameter its result is bound
-// into when it runs, so the describe over the statement's root answers it NA;
-// the engine types it once it describes a statement with $n
-// (docs/proposals/otterbrix-embedding.md, OTB-scalar-subquery-type). The
-// statement still runs and answers the sub-query's value.
-TEST_CASE("session sub-query: a scalar sub-query column of a parameterized statement is described NA", "[subquery]") {
+// The engine's describe analyzes a scalar sub-query as a run does and types
+// its column (a NULL of the column's type); the statement runs and answers the
+// sub-query's value.
+TEST_CASE("session sub-query: a scalar sub-query column of a parameterized statement is typed", "[subquery]") {
     with_session_stack("/tmp/test_session_subquery_describe", [](session_stack s) {
         session_hash_t id = 14400;
         seed(s, id);
@@ -203,20 +168,20 @@ TEST_CASE("session sub-query: a scalar sub-query column of a parameterized state
         REQUIRE(schema.type() == ct::logical_type::STRUCT);
         const auto* top = field_named(schema, "top");
         REQUIRE(top != nullptr);
-        CHECK(top->type() == ct::logical_type::NA);
+        CHECK(top->type() == ct::logical_type::BIGINT);
         const auto* plain = field_named(schema, "id");
         REQUIRE(plain != nullptr);
         CHECK(plain->type() == ct::logical_type::BIGINT);
 
-        std::pmr::vector<ct::logical_value_t> params(s.resource);
-        params.emplace_back(s.resource, int64_t{2});
+        std::pmr::vector<components::vector::vector_t> params(s.resource);
+        params.push_back(components::vector::make_scalar(s.resource, int64_t{2}));
         auto executed = execute_session_prepared(s, stmt, std::move(params));
         INFO((executed.has_error() ? executed.error().what.c_str() : ""));
         REQUIRE_FALSE(executed.has_error());
         REQUIRE(executed.value().size() == 1);
         const auto& chunk = executed.value().chunks.front();
         REQUIRE(chunk.column_count() == 2);
-        CHECK(chunk.value(0, 0).value<int64_t>() == 2);
-        CHECK(chunk.value(1, 0).value<int64_t>() == 3);
+        CHECK(otterstax::test::cell(chunk, 0, 0).value<int64_t>() == 2);
+        CHECK(otterstax::test::cell(chunk, 1, 0).value<int64_t>() == 3);
     });
 }

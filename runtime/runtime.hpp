@@ -37,21 +37,16 @@ namespace otterstax::runtime {
     //    engine_t::open, spent once that engine is destroyed or its open was
     //    refused. A second engine needs a second runtime_t.
     //  - sessions — one query session actor per client connection.
-    //  - backends — the federation's statements of the three backends
-    //    (remote_backends_t: the connection checkout and the wait for a
-    //    backend's answer, off the engine's executors; integration/
-    //    statement_executor.hpp). Their discover / execute_ddl run on the
-    //    calling thread, and the connectors do their I/O on the
-    //    asio io pools their connector managers own (sized by
-    //    service.runtime.connector_io; not a runtime_t pool). A statement
-    //    holds one of its threads for the whole remote call, so the server
-    //    sizes it against the remote connections before it builds the runtime
+    //  - backends — the agents of the remote connections (remote_backends_t:
+    //    one agent per physical connection, federation/backend_agent.hpp), each
+    //    statement on one of its threads for the whole remote call, the
+    //    connector's io_context run there; the server sizes it against the
+    //    remote connections before it builds the runtime
     //    (backends::backends_threads); a 0 that reaches here is resolve_threads.
     //    Both started here, at construction; sessions is stopped by
-    //    stop_sessions or the destructor, backends by the destructor only,
-    //    sessions first. The server stops sessions before its sessions are
-    //    freed and backends only after the backends are gone (~runtime_t): they
-    //    wait for the jobs they posted, which a stopped scheduler would drop.
+    //    stop_sessions or the destructor, backends by stop_backends (the remote
+    //    backends' destructor, once its agents were cancelled: they are
+    //    destroyed after the pool stopped) or the destructor, sessions first.
     //
     // Not thread-safe: built, lent and stopped by the thread that assembles the
     // process (main, a test).
@@ -62,7 +57,7 @@ namespace otterstax::runtime {
         runtime_t& operator=(const runtime_t&) = delete;
         runtime_t(runtime_t&&) = delete;
         runtime_t& operator=(runtime_t&&) = delete;
-        // Stops the sessions pool, then the backends pool; an engine still
+        // Stops the sessions pool, then the backends pool (each once); an engine still
         // running on the engine pools here is a programming error and aborts
         // (its threads would outlive their pools).
         ~runtime_t();
@@ -78,6 +73,10 @@ namespace otterstax::runtime {
         // sessions are destroyed: once it returns, no pool thread resumes one
         // of them (~session_factory_t calls it in its shutdown).
         void stop_sessions() noexcept;
+        // Joins the backends pool's threads; idempotent (a second stop of an
+        // actor-zeta pool waits forever). ~remote_backends_t calls it before it
+        // destroys the agents: once it returns, no job of theirs runs or waits.
+        void stop_backends() noexcept;
 
     private:
         friend class engine_t;
@@ -108,6 +107,7 @@ namespace otterstax::runtime {
         std::unique_ptr<pool_t> sessions_;
         std::unique_ptr<pool_t> backends_;
         bool sessions_running_{false};
+        bool backends_running_{false};
         engine_pools_state_t engine_pools_state_{engine_pools_state_t::fresh};
     };
 

@@ -3,8 +3,9 @@
 //
 // The MySQL frontend over a raw socket: what MySQL clients and drivers send on
 // their own — the system-variable selects of the mysql CLI and Connector/J,
-// SHOW VARIABLES / SHOW WARNINGS, the MySQL SET forms — is answered without
-// the engine, whose grammar reads none of it; the text is read by MySQL's
+// SHOW VARIABLES / SHOW WARNINGS — is answered without the engine, whose
+// grammar reads none of it; the MySQL SET forms and USE reach the engine as its
+// own SET (search_path for a USE), and the engine answers; the text is read by MySQL's
 // default lexical rules (backslash escapes, "..." strings, `#` comments) and
 // reaches the session in the engine's form, which the handshake, the status
 // flags and @@sql_mode agree with; a `?` in a COM_QUERY text is a syntax error,
@@ -15,11 +16,14 @@
 
 #include "frontend/mysql_server/mysql_defs/error.hpp"
 #include "frontend/mysql_server/mysql_server.hpp"
+#include "frontend/mysql_server/protocol/protocol_statement.hpp"
 #include "frontend/mysql_server/protocol_const.hpp"
 #include "raw_wire_client.hpp"
 #include "session_stack.hpp"
 
 #include <catch2/catch_all.hpp>
+
+#include <components/logical_plan/node_set_setting.hpp>
 
 #include <cstdint>
 #include <optional>
@@ -38,6 +42,8 @@ namespace {
     constexpr uint8_t ERR_HEADER = 0xFF;
     constexpr uint8_t EOF_HEADER = 0xFE;
     constexpr uint16_t SERVER_STATUS_IN_TRANS = 0x0001;
+    constexpr uint16_t SERVER_STATUS_AUTOCOMMIT = 0x0002;
+    constexpr uint8_t COM_INIT_DB = 0x02;
     constexpr uint16_t SERVER_STATUS_NO_BACKSLASH_ESCAPES = 0x0200;
     constexpr uint8_t MYSQL_TYPE_LONGLONG = 0x08;
 
@@ -256,7 +262,7 @@ namespace {
             , server(make_config(owner.stack()))
             , client((server.start(), server.local_port())) {
             mysql_handshake(client);
-            query_ok(client, "CREATE DATABASE wp");
+            query_ok(client, "CREATE SCHEMA wp"); // `wp.t` is schema.table
             query_ok(client, "CREATE TABLE wp.t (id bigint, name string)");
             query_ok(client, "INSERT INTO wp.t (id, name) VALUES (1, 'a'), (2, '?'), (3, 'c')");
         }
@@ -322,30 +328,231 @@ TEST_CASE("mysql protocol over the wire: an unknown variable SHOW VARIABLES and 
     CHECK(count.rows[0][0] == "3");
 }
 
-TEST_CASE("mysql protocol over the wire: the MySQL SET forms are answered as every SET is") {
+TEST_CASE("mysql protocol over the wire: the MySQL SET forms reach the engine as its SET") {
     fixture f("otterstax_mysql_protocol_set");
-    CHECK((query_ok(f.client, "SET @@session.autocommit = OFF") & SERVER_STATUS_NO_BACKSLASH_ESCAPES) == 0);
-    query_ok(f.client, "SET GLOBAL x = 1, SESSION sql_mode = concat(@@sql_mode, ',STRICT_ALL_TABLES')");
-    query_ok(f.client, "SET character_set_results = NULL");
+    CHECK((query_rows(f.client, "SELECT 1").status & SERVER_STATUS_AUTOCOMMIT) != 0);
+    // autocommit off: the engine opens a transaction with the next statement.
+    const auto off = query_ok(f.client, "SET @@session.autocommit = OFF");
+    CHECK((off & SERVER_STATUS_AUTOCOMMIT) == 0);
+    CHECK((off & SERVER_STATUS_NO_BACKSLASH_ESCAPES) == 0);
+    CHECK(query_rows(f.client, "SELECT @@autocommit").rows[0][0] == "0");
+    CHECK((query_ok(f.client, "INSERT INTO wp.t (id, name) VALUES (4, 'd')") & SERVER_STATUS_IN_TRANS) != 0);
+    raw_client other(f.server.local_port());
+    mysql_handshake(other);
+    CHECK(query_rows(other, "SELECT count(*) FROM wp.t").rows[0][0] == "3");
+    CHECK((query_ok(f.client, "COMMIT") & SERVER_STATUS_IN_TRANS) == 0);
+    CHECK(query_rows(other, "SELECT count(*) FROM wp.t").rows[0][0] == "4");
+    // The SET itself is a statement while autocommit is off: the engine opens a
+    // transaction for it, which stays until COMMIT (MySQL's SET autocommit = 1
+    // would commit it).
+    const auto on = query_ok(f.client, "SET AUTOCOMMIT = 1");
+    CHECK((on & SERVER_STATUS_AUTOCOMMIT) != 0);
+    CHECK((on & SERVER_STATUS_IN_TRANS) != 0);
+    CHECK((query_ok(f.client, "COMMIT") & SERVER_STATUS_IN_TRANS) == 0);
+    CHECK(query_rows(f.client, "SELECT @@session.autocommit").rows[0][0] == "1");
+    CHECK((query_ok(f.client, "INSERT INTO wp.t (id, name) VALUES (5, 'e')") & SERVER_STATUS_IN_TRANS) == 0);
+    CHECK(query_rows(other, "SELECT count(*) FROM wp.t").rows[0][0] == "5");
+    // The other connection's autocommit is its own.
+    CHECK((query_rows(other, "SELECT 1").status & SERVER_STATUS_AUTOCOMMIT) != 0);
 
-    // Without effect: still autocommit, a second connection sees the row at once.
-    query_ok(f.client, "INSERT INTO wp.t (id, name) VALUES (4, 'd')");
+    // time_zone is the engine's timezone, SYSTEM its default.
+    CHECK(query_rows(f.client, "SELECT @@time_zone").rows[0][0] == "SYSTEM");
+    query_ok(f.client, "SET time_zone = 'UTC'");
+    CHECK(query_rows(f.client, "SELECT @@session.time_zone").rows[0][0] == "UTC");
+    query_ok(f.client, "SET time_zone = 'SYSTEM'");
+    CHECK(query_rows(f.client, "SELECT @@time_zone").rows[0][0] == "SYSTEM");
+
+    // The protocol's character sets are the frontend's: a utf-8 one is OK and
+    // reaches no engine, another one refused. A parameter the engine does not
+    // have is the engine's refusal; a value its SET cannot take (an
+    // expression) the frontend's.
+    query_ok(f.client, "SET character_set_results = NULL");
+    query_ok(f.client, "SET NAMES utf8mb4");
+    query_ok(f.client, "SET NAMES utf8mb4 COLLATE utf8mb4_general_ci");
+    CHECK(err_code(query(f.client, "SET NAMES latin1")) ==
+          static_cast<uint16_t>(frontend::mysql::mysql_error::ER_NOT_SUPPORTED_YET));
+    CHECK(query(f.client, "SET sql_mode = 'ANSI'")[0] == ERR_HEADER);
+    CHECK(err_code(query(f.client, "SET SESSION sql_mode = concat(@@sql_mode, ',STRICT_ALL_TABLES')")) ==
+          static_cast<uint16_t>(frontend::mysql::mysql_error::ER_NOT_SUPPORTED_YET));
+
+    // Inside a block a SET the engine accepts keeps it open; a refused one
+    // fails it, as every refusal does, and driver housekeeping (a variable
+    // select) is still answered.
+    CHECK((query_ok(f.client, "BEGIN") & SERVER_STATUS_IN_TRANS) != 0);
+    CHECK((query_ok(f.client, "SET @@session.autocommit = 1") & SERVER_STATUS_IN_TRANS) != 0);
+    CHECK((query_rows(f.client, "SELECT @@session.transaction_read_only").status & SERVER_STATUS_IN_TRANS) != 0);
+    CHECK((query_ok(f.client, "SET NAMES utf8mb4") & SERVER_STATUS_IN_TRANS) != 0);
+    CHECK(query(f.client, "SET sql_mode = 'ANSI'")[0] == ERR_HEADER);
+    CHECK(query(f.client, "INSERT INTO wp.t (id, name) VALUES (6, 'f')")[0] == ERR_HEADER);
+    CHECK((query_rows(f.client, "SELECT @@autocommit").status & SERVER_STATUS_IN_TRANS) != 0);
+    CHECK((query_ok(f.client, "ROLLBACK") & SERVER_STATUS_IN_TRANS) == 0);
+    CHECK(query_rows(f.client, "SELECT count(*) FROM wp.t").rows[0][0] == "5");
+}
+
+// A SET of system variables runs as ONE engine statement whatever the
+// number of assignments (engine_setting_plan): the engine's own parser reads
+// each of them — a parameter it does not have, a value it does not take as a
+// constant is its refusal, nothing applied — and one set_setting node carries
+// them all, so the engine applies all of them or none.
+TEST_CASE("mysql protocol: a SET of several variables is one engine statement") {
+    auto* resource = std::pmr::new_delete_resource();
+    auto settings_of = [](const char* sql) {
+        auto statement = frontend::mysql::classify_protocol_statement(sql);
+        REQUIRE(statement.has_value());
+        REQUIRE(std::holds_alternative<frontend::mysql::set_variables_t>(*statement));
+        return std::get<frontend::mysql::set_variables_t>(*statement).settings;
+    };
+
+    auto plan = frontend::mysql::engine_setting_plan(resource, settings_of("SET autocommit = 0, time_zone = 'UTC', time_zone = SYSTEM"));
+    REQUIRE_FALSE(plan.has_error());
+    REQUIRE(plan.value()->plan);
+    REQUIRE(plan.value()->plan->sub_queries.size() == 1);
+    const auto& root = plan_root(*plan.value()->plan);
+    REQUIRE(root->type() == components::logical_plan::node_type::set_setting_t);
+    const auto& set = static_cast<const components::logical_plan::node_set_setting_t&>(*root);
+    CHECK(set.scope() == components::catalog::setting_scope_t::session);
+    REQUIRE(set.assignments().size() == 3);
+    CHECK(set.assignments()[0].id == components::catalog::setting_id::autocommit);
+    CHECK(set.assignments()[0].value == "off");
+    CHECK(set.assignments()[1].id == components::catalog::setting_id::timezone);
+    CHECK(set.assignments()[1].value == "UTC");
+    CHECK(set.assignments()[2].is_default);
+    // A plan the frontend built has no text to parse again.
+    CHECK(plan.value()->sql.empty());
+
+    // A variable the engine does not have refuses the statement whole.
+    auto unknown = frontend::mysql::engine_setting_plan(resource, settings_of("SET autocommit = 0, sql_mode = 'ANSI'"));
+    REQUIRE(unknown.has_error());
+    CHECK(unknown.error().type == core::error_code_t::sql_parse_error);
+    CHECK(std::string{unknown.error().what.c_str()} == "SET sql_mode is not supported");
+}
+
+// MySQL applies a SET of several variables whole or not at all: one refused
+// assignment leaves every variable of the statement as it was, on the engine
+// and in what the frontend answers (@@autocommit, @@time_zone, the status
+// flags).
+TEST_CASE("mysql protocol over the wire: a SET of several variables is applied whole or not at all") {
+    fixture f("otterstax_mysql_protocol_set_atomic");
+    const auto refused_with = [&](const std::string& sql) {
+        INFO(sql);
+        const auto answer = query(f.client, sql);
+        INFO(err_text(answer));
+        REQUIRE(answer[0] == ERR_HEADER);
+        return err_code(answer);
+    };
+
+    // A variable the engine does not have, behind ones it has.
+    CHECK(refused_with("SET autocommit = 0, time_zone = 'UTC', sql_mode = 'ANSI'") ==
+          static_cast<uint16_t>(frontend::mysql::mysql_error::ER_SYNTAX_ERROR));
+    // A value the engine refuses when the statement runs, behind one it takes.
+    CHECK(refused_with("SET time_zone = 'UTC', autocommit = 'maybe'") ==
+          static_cast<uint16_t>(frontend::mysql::mysql_error::ER_SYNTAX_ERROR));
+    CHECK(refused_with("SET autocommit = 0, time_zone = 'Nowhere/City'") ==
+          static_cast<uint16_t>(frontend::mysql::mysql_error::ER_SYNTAX_ERROR));
+
+    // Nothing of them was applied: the frontend's answers ...
+    const auto vars = query_rows(f.client, "SELECT @@autocommit, @@time_zone");
+    CHECK(vars.rows[0][0] == "1");
+    CHECK(vars.rows[0][1] == "SYSTEM");
+    CHECK((vars.status & SERVER_STATUS_AUTOCOMMIT) != 0);
+    // ... and the engine: autocommit still on, an INSERT commits on its own.
+    CHECK((query_ok(f.client, "INSERT INTO wp.t (id, name) VALUES (4, 'd')") & SERVER_STATUS_IN_TRANS) == 0);
     raw_client other(f.server.local_port());
     mysql_handshake(other);
     CHECK(query_rows(other, "SELECT count(*) FROM wp.t").rows[0][0] == "4");
 
-    // Inside a block the block stays open, and protocol queries keep it too.
-    CHECK((query_ok(f.client, "BEGIN") & SERVER_STATUS_IN_TRANS) != 0);
-    CHECK((query_ok(f.client, "SET @@session.autocommit = 0") & SERVER_STATUS_IN_TRANS) != 0);
-    CHECK((query_rows(f.client, "SELECT @@session.transaction_read_only").status & SERVER_STATUS_IN_TRANS) != 0);
-    // A failed block refuses the SET as it refuses every statement but ROLLBACK;
-    // driver housekeeping (a variable select) is still answered.
-    const auto failed = query(f.client, "SELECT * FROM wp.no_such_table");
-    REQUIRE(failed[0] == ERR_HEADER);
-    CHECK(query(f.client, "SET @@session.autocommit = 1")[0] == ERR_HEADER);
-    CHECK(query_rows(f.client, "SELECT @@autocommit").rows[0][0] == "1");
-    CHECK((query_ok(f.client, "ROLLBACK") & SERVER_STATUS_IN_TRANS) == 0);
-    query_ok(f.client, "SET @@session.autocommit = 1");
+    // Every assignment the engine takes is applied by the one statement.
+    const auto both = query_ok(f.client, "SET autocommit = 0, time_zone = 'UTC'");
+    CHECK((both & SERVER_STATUS_AUTOCOMMIT) == 0);
+    const auto applied = query_rows(f.client, "SELECT @@autocommit, @@time_zone");
+    CHECK(applied.rows[0][0] == "0");
+    CHECK(applied.rows[0][1] == "UTC");
+    CHECK((query_ok(f.client, "INSERT INTO wp.t (id, name) VALUES (5, 'e')") & SERVER_STATUS_IN_TRANS) != 0);
+    query_ok(f.client, "ROLLBACK");
+    // The last assignment of a variable wins, as in MySQL.
+    CHECK((query_ok(f.client, "SET autocommit = 0, autocommit = 1") & SERVER_STATUS_AUTOCOMMIT) != 0);
+    // The SET ran with autocommit off: the transaction the engine opened for
+    // it stays until COMMIT (the MySQL SET forms test, above).
+    query_ok(f.client, "COMMIT");
+    CHECK((query_ok(f.client, "INSERT INTO wp.t (id, name) VALUES (6, 'f')") & SERVER_STATUS_IN_TRANS) == 0);
+    CHECK(query_rows(other, "SELECT count(*) FROM wp.t").rows[0][0] == "5");
+}
+
+TEST_CASE("mysql protocol over the wire: USE, COM_INIT_DB and the handshake's database are the session's place") {
+    fixture f("otterstax_mysql_protocol_use");
+    query_ok(f.client, "CREATE DATABASE shop");
+    CHECK_FALSE(query_rows(f.client, "SELECT DATABASE()").rows[0][0].has_value());
+    query_ok(f.client, "USE shop");
+    CHECK(query_rows(f.client, "SELECT DATABASE()").rows[0][0] == "shop");
+    // A bare name is the place's: shop.public.
+    query_ok(f.client, "CREATE TABLE u (id bigint)");
+    query_ok(f.client, "INSERT INTO u (id) VALUES (7)");
+    CHECK(query_rows(f.client, "SELECT id FROM shop.public.u").rows[0][0] == "7");
+    // A database the engine does not have is ER_BAD_DB_ERROR; the place stays.
+    CHECK(err_code(query(f.client, "USE nosuch")) == static_cast<uint16_t>(frontend::mysql::mysql_error::ER_BAD_DB_ERROR));
+    CHECK(query_rows(f.client, "SELECT DATABASE()").rows[0][0] == "shop");
+
+    // COM_INIT_DB is the same statement.
+    f.client.write(mysql_command(COM_INIT_DB, "main"));
+    REQUIRE(mysql_read_packet(f.client)[0] == OK_HEADER);
+    CHECK(query_rows(f.client, "SELECT DATABASE()").rows[0][0] == "main");
+    CHECK(query_rows(f.client, "SELECT count(*) FROM wp.t").rows[0][0] == "3");
+    f.client.write(mysql_command(COM_INIT_DB, "nosuch"));
+    CHECK(err_code(mysql_read_packet(f.client)) == static_cast<uint16_t>(frontend::mysql::mysql_error::ER_BAD_DB_ERROR));
+
+    // The HandshakeResponse's database: the connection starts there, or is refused.
+    const auto connect_to = [&](const std::string& database) {
+        raw_client client(f.server.local_port());
+        mysql_read_handshake(client);
+        auto resp = mysql_handshake_response_head();
+        const uint32_t flags = frontend::mysql::CLIENT_PROTOCOL_41 | frontend::mysql::CLIENT_SECURE_CONNECTION |
+                               frontend::mysql::CLIENT_CONNECT_WITH_DB;
+        for (int i = 0; i < 4; ++i) {
+            resp[i] = static_cast<uint8_t>((flags >> (8 * i)) & 0xFF);
+        }
+        resp.insert(resp.end(), {'t', 'e', 's', 't', 0, 0});
+        resp.insert(resp.end(), database.begin(), database.end());
+        resp.push_back(0);
+        client.write(mysql_frame(1, resp));
+        auto answer = mysql_read_packet(client);
+        std::optional<std::string> current;
+        if (!answer.empty() && answer[0] == OK_HEADER) {
+            current = query_rows(client, "SELECT DATABASE()").rows[0][0];
+        } else {
+            CHECK(err_code(answer) == static_cast<uint16_t>(frontend::mysql::mysql_error::ER_BAD_DB_ERROR));
+        }
+        return current;
+    };
+    CHECK(connect_to("shop") == std::optional<std::string>{"shop"});
+    CHECK_FALSE(connect_to("nosuch").has_value());
+}
+
+// ER_BAD_DB_ERROR answers a database (or schema) that does not exist, nothing
+// else: a USE the engine refuses for another reason — inside a failed block,
+// a place with too many parts — is answered as every other statement the
+// session refuses (send_statement_error), on USE and on COM_INIT_DB.
+TEST_CASE("mysql protocol over the wire: only a missing database is ER_BAD_DB_ERROR") {
+    fixture f("otterstax_mysql_protocol_use_errno");
+    query_ok(f.client, "CREATE DATABASE shop");
+    const auto syntax_error = static_cast<uint16_t>(frontend::mysql::mysql_error::ER_SYNTAX_ERROR);
+
+    // [[connection.]database.]schema: a place of four parts is no place.
+    const auto malformed = query(f.client, "USE `a.b.c`");
+    INFO(err_text(malformed));
+    CHECK(err_code(malformed) == syntax_error);
+
+    query_ok(f.client, "BEGIN");
+    CHECK(query(f.client, "SELECT id FROM wp.nowhere")[0] == ERR_HEADER);
+    const auto in_failed = query(f.client, "USE shop");
+    INFO(err_text(in_failed));
+    CHECK(err_code(in_failed) == syntax_error);
+    f.client.write(mysql_command(COM_INIT_DB, "shop"));
+    CHECK(err_code(mysql_read_packet(f.client)) == syntax_error);
+    query_ok(f.client, "ROLLBACK");
+
+    // Outside the block the same database is used.
+    query_ok(f.client, "USE shop");
+    CHECK(query_rows(f.client, "SELECT DATABASE()").rows[0][0] == "shop");
 }
 
 TEST_CASE("mysql protocol over the wire: a prepared ? reaches the session as $n") {
@@ -355,7 +562,7 @@ TEST_CASE("mysql protocol over the wire: a prepared ? reaches the session as $n"
         const auto stmt = prepare_ok(f.client, "SELECT ? + 1 FROM wp.t WHERE id = 1");
         CHECK(stmt.parameters == 1);
         CHECK(read_bigint_rows(f.client, execute(f.client, stmt, {41})) == std::vector<int64_t>{42});
-        // A second execution re-prepares the rewritten text.
+        // The session keeps the statement: a second execution runs it again.
         CHECK(read_bigint_rows(f.client, execute(f.client, stmt, {9})) == std::vector<int64_t>{10});
     }
 
@@ -376,33 +583,9 @@ TEST_CASE("mysql protocol over the wire: a prepared ? reaches the session as $n"
     CHECK(query_rows(f.client, "SELECT count(*) FROM wp.t").rows[0][0] == "3");
 }
 
-// The engine cannot run a bare parameter as a result column: `SELECT $1 FROM t`
-// is prepared, and its execution throws std::bad_variant_access inside the
-// engine's executor (validate_schema_impl), which reaches the session's future
-// as a broken promise (actor-zeta's errc::interrupted, "Interrupted system
-// call"). The client gets ERR 1105 saying the statement got no answer — not the
-// errno text under a syntax-error code — and the connection keeps serving.
-TEST_CASE("mysql protocol over the wire: a prepared SELECT ? FROM t is an error not a dropped connection") {
-    fixture f("otterstax_mysql_protocol_bare_param");
-    const auto stmt = prepare_ok(f.client, "SELECT ? FROM wp.t");
-    CHECK(stmt.parameters == 1);
-    const auto executed = execute(f.client, stmt, {5});
-    INFO(err_text(executed));
-    if (executed[0] == ERR_HEADER) {
-        CHECK(err_code(executed) == static_cast<uint16_t>(frontend::mysql::mysql_error::ER_UNKNOWN_ERROR));
-        CHECK(err_text(executed).find("without an answer") != std::string::npos);
-    } else {
-        // The engine answering the column (once otterbrix types it) is right too.
-        CHECK(read_bigint_rows(f.client, executed) == std::vector<int64_t>{5, 5, 5});
-    }
-    CHECK(query_rows(f.client, "SELECT count(*) FROM wp.t").rows[0][0] == "3");
-}
-
-// Hidden — open in otterbrix (OTB-select-param, docs/proposals/otterbrix-embedding.md
-// 4.20; tests/CLAUDE.md, "Engine-defect tags"). The right answer: the bound value once
-// per row. Take the dot off once the engine types a select-list parameter.
-TEST_CASE("mysql protocol over the wire: a prepared SELECT ? FROM t answers the bound value per row",
-          "[.engine-defect-select-param]") {
+// The engine types a select-list parameter by its bound value: the value once
+// per row (it used to throw inside the engine's executor, OTB-select-param).
+TEST_CASE("mysql protocol over the wire: a prepared SELECT ? FROM t answers the bound value per row") {
     fixture f("otterstax_mysql_protocol_bare_param_value");
     const auto stmt = prepare_ok(f.client, "SELECT ? FROM wp.t");
     CHECK(stmt.parameters == 1);
@@ -410,6 +593,7 @@ TEST_CASE("mysql protocol over the wire: a prepared SELECT ? FROM t answers the 
     INFO(err_text(executed));
     REQUIRE(executed[0] != ERR_HEADER);
     CHECK(read_bigint_rows(f.client, executed) == std::vector<int64_t>{5, 5, 5});
+    CHECK(query_rows(f.client, "SELECT count(*) FROM wp.t").rows[0][0] == "3");
 }
 
 TEST_CASE("mysql protocol over the wire: a prepare that does not parse fails an open block") {
@@ -443,17 +627,17 @@ TEST_CASE("mysql protocol over the wire: a refused statement's errno on COM_STMT
     };
     CHECK(refused_with("SELECT id FROM wp.nowhere WHERE id = ?") ==
           static_cast<uint16_t>(frontend::mysql::mysql_error::ER_SYNTAX_ERROR));
-    CHECK(refused_with("SAVEPOINT sp") == static_cast<uint16_t>(frontend::mysql::mysql_error::ER_NOT_SUPPORTED_YET));
+    CHECK(refused_with("CREATE SOURCE s (name VARCHAR(255)) WITH (KAFKA_TOPIC='t')") ==
+          static_cast<uint16_t>(frontend::mysql::mysql_error::ER_NOT_SUPPORTED_YET));
     CHECK(refused_with("SELEKT id FROM wp.t") == static_cast<uint16_t>(frontend::mysql::mysql_error::ER_SYNTAX_ERROR));
 
     // The execution refused: the table went between the prepare and the
-    // execute. The first execution runs the statement the prepare stored; the
-    // second prepares the text again first, and that re-prepare refuses it —
-    // under the same mapping (it used to be ER_UNKNOWN_ERROR).
+    // execute. Every execution parses the stored text again, and each is
+    // refused under the same mapping.
     query_ok(f.client, "CREATE TABLE wp.gone (id bigint)");
     const auto stmt = prepare_ok(f.client, "SELECT id FROM wp.gone WHERE id = ?");
     query_ok(f.client, "DROP TABLE wp.gone");
-    for (const char* route : {"the prepared statement", "its re-prepare"}) {
+    for (const char* route : {"the first execution", "the second"}) {
         INFO(route);
         const auto executed = execute(f.client, stmt, {1});
         INFO(err_text(executed));
@@ -489,7 +673,7 @@ TEST_CASE("mysql protocol over the wire: the collation is utf8mb4_bin in the han
     {
         raw_client client(server.local_port());
         mysql_handshake(client);
-        query_ok(client, "CREATE DATABASE coll");
+        query_ok(client, "CREATE SCHEMA coll");
         query_ok(client, "CREATE TABLE coll.t (id bigint, name string)");
         query_ok(client, "INSERT INTO coll.t (id, name) VALUES (1, 'a'), (2, 'A')");
         // Compared byte by byte: 'a' is not 'A'.
@@ -539,7 +723,8 @@ TEST_CASE("mysql protocol over the wire: introducers and binary literals") {
           static_cast<uint16_t>(frontend::mysql::mysql_error::ER_NOT_SUPPORTED_YET));
     CHECK(err_code(query(f.client, "SELECT id FROM wp.t WHERE name = 'a' COLLATE utf8mb4_general_ci")) ==
           static_cast<uint16_t>(frontend::mysql::mysql_error::ER_NOT_SUPPORTED_YET));
-    // SET NAMES ... COLLATE is the frontend's, whatever the collation.
+    // SET NAMES ... COLLATE is the frontend's: a collation of utf8mb4 is
+    // accepted (the comparison stays the engine's byte one, utf8mb4_bin).
     query_ok(f.client, "SET NAMES 'utf8mb4' COLLATE 'utf8mb4_0900_ai_ci'");
     CHECK(query_rows(f.client, "SELECT count(*) FROM wp.t").rows[0][0] == "8");
 }
@@ -605,10 +790,10 @@ TEST_CASE("mysql protocol over the wire: protocol statements through COM_STMT_PR
     const auto rows = read_bigint_rows(f.client, execute(f.client, variable, {}));
     CHECK(rows == std::vector<int64_t>{frontend::mysql::MAX_ALLOWED_PACKET});
 
-    const auto setting = prepare_ok(f.client, "SET @@session.autocommit = ?");
+    const auto setting = prepare_ok(f.client, "SET @@session.autocommit = 1");
     CHECK(setting.columns == 0);
-    CHECK(setting.parameters == 1);
-    CHECK((ok_status(execute(f.client, setting, {1})) & SERVER_STATUS_IN_TRANS) != 0);
+    CHECK(setting.parameters == 0);
+    CHECK((ok_status(execute(f.client, setting, {})) & SERVER_STATUS_IN_TRANS) != 0);
 
     // A variable the server does not have is refused at prepare, as MySQL does.
     auto unknown = prepare(f.client, "SELECT @@query_cache_size");
@@ -619,4 +804,128 @@ TEST_CASE("mysql protocol over the wire: protocol statements through COM_STMT_PR
     // None of it failed the block: the INSERT commits.
     query_ok(f.client, "COMMIT");
     CHECK(query_rows(f.client, "SELECT count(*) FROM wp.t").rows[0][0] == "4");
+}
+
+// A SET the frontend refuses (a character set the wire does not carry, a
+// value the engine's SET cannot take) is a statement refused, by COM_QUERY and
+// by COM_STMT_PREPARE alike: inside a block it fails the block, as the engine's
+// refusal of a SET does and as every other refusal of the frontend does (a
+// text it cannot write for the engine, a prepare it refuses) — only the
+// answers to driver housekeeping (SELECT @@x, SHOW) never fail one.
+TEST_CASE("mysql protocol over the wire: a refused SET fails an open block on COM_QUERY and COM_STMT_PREPARE") {
+    fixture f("otterstax_mysql_protocol_refused_set_block");
+    struct route_t {
+        const char* name;
+        bool prepared;
+        const char* sql;
+        frontend::mysql::mysql_error code;
+    };
+    for (const auto& route : {route_t{"COM_QUERY", false, "SET NAMES latin1", frontend::mysql::mysql_error::ER_NOT_SUPPORTED_YET},
+                              route_t{"COM_STMT_PREPARE", true, "SET NAMES latin1", frontend::mysql::mysql_error::ER_NOT_SUPPORTED_YET},
+                              // The engine's SET takes a string constant: a parameter is refused at prepare.
+                              route_t{"COM_STMT_PREPARE", true, "SET @@session.autocommit = ?", frontend::mysql::mysql_error::ER_NOT_SUPPORTED_YET},
+                              route_t{"COM_STMT_PREPARE",
+                                      true,
+                                      "SET NAMES utf8mb4 COLLATE latin1_swedish_ci",
+                                      frontend::mysql::mysql_error::ER_COLLATION_CHARSET_MISMATCH}}) {
+        INFO(route.name << ": " << route.sql);
+        query_ok(f.client, "BEGIN");
+        query_ok(f.client, "INSERT INTO wp.t (id, name) VALUES (4, 'd')");
+        std::vector<uint8_t> refused;
+        if (route.prepared) {
+            auto answer = prepare(f.client, route.sql);
+            REQUIRE(std::holds_alternative<std::vector<uint8_t>>(answer));
+            refused = std::get<std::vector<uint8_t>>(answer);
+        } else {
+            refused = query(f.client, route.sql);
+        }
+        CHECK(err_code(refused) == static_cast<uint16_t>(route.code));
+        // The block is failed: the next statement is refused until ROLLBACK.
+        CHECK(query(f.client, "INSERT INTO wp.t (id, name) VALUES (5, 'e')")[0] == ERR_HEADER);
+        query_ok(f.client, "ROLLBACK");
+        CHECK(query_rows(f.client, "SELECT count(*) FROM wp.t").rows[0][0] == "3");
+    }
+}
+
+namespace {
+    // HandshakeResponse41 naming `collation` as the client's character set; the
+    // server's answer (OK, or the ERR that refuses the login).
+    std::vector<uint8_t> handshake_with(raw_client& client, uint8_t collation) {
+        mysql_read_handshake(client);
+        auto resp = mysql_handshake_response_head(collation);
+        const std::string user = "test";
+        resp.insert(resp.end(), user.begin(), user.end());
+        resp.push_back(0);
+        resp.push_back(0); // auth length
+        client.write(mysql_frame(1, resp));
+        return mysql_read_packet(client);
+    }
+} // namespace
+
+// The HandshakeResponse's character set is the protocol's, checked as SET NAMES
+// is: a utf-8 collation logs in, another one is refused and the connection
+// closed.
+TEST_CASE("mysql protocol over the wire: the handshake's character set is utf-8 or refused") {
+    fixture f("otterstax_mysql_protocol_handshake_charset");
+    for (uint8_t collation : {uint8_t{45}, uint8_t{255}, uint8_t{46}}) {
+        INFO(int{collation});
+        raw_client client(f.server.local_port());
+        CHECK(ok_status(handshake_with(client, collation)) != 0);
+    }
+    raw_client latin1(f.server.local_port());
+    const auto refused = handshake_with(latin1, 8); // latin1_swedish_ci
+    CHECK(err_code(refused) == static_cast<uint16_t>(frontend::mysql::mysql_error::ER_NOT_SUPPORTED_YET));
+    CHECK(err_text(refused).find("utf8mb4 only") != std::string::npos);
+    CHECK(latin1.wait_for_close());
+}
+
+// What PyMySQL sends when it connects (charset utf8mb4, autocommit off by
+// default): the HandshakeResponse with utf8mb4_general_ci, SET NAMES utf8mb4
+// [COLLATE ...], SET AUTOCOMMIT = 0 — then the first query of the program runs
+// in a block of its own.
+TEST_CASE("mysql protocol over the wire: PyMySQL's connect sequence reaches the first query") {
+    fixture f("otterstax_mysql_protocol_pymysql_connect");
+    raw_client client(f.server.local_port());
+    REQUIRE((ok_status(handshake_with(client, 45)) & SERVER_STATUS_AUTOCOMMIT) != 0);
+    query_ok(client, "SET NAMES utf8mb4");
+    query_ok(client, "SET NAMES utf8mb4 COLLATE utf8mb4_general_ci");
+    CHECK((query_ok(client, "SET AUTOCOMMIT = 0") & SERVER_STATUS_AUTOCOMMIT) == 0);
+    const auto rows = query_rows(client, "SELECT count(*) FROM wp.t");
+    CHECK(rows.rows[0][0] == "3");
+    CHECK((rows.status & SERVER_STATUS_IN_TRANS) != 0);
+    CHECK((query_ok(client, "COMMIT") & SERVER_STATUS_IN_TRANS) == 0);
+}
+
+// A DOUBLE / FLOAT cell of a text resultset is what MySQL 8.4 writes
+// (my_gcvt): the shortest exact digits, a FLOAT at most six of them, fixed
+// down to a decimal point position of -13 and up to 15, else 1e20 / 1e-16.
+TEST_CASE("mysql protocol over the wire: a DOUBLE cell is MySQL's shortest text") {
+    fixture f("otterstax_mysql_protocol_double_text");
+    query_ok(f.client, "CREATE TABLE wp.fl (id bigint, d double, f float4)");
+    query_ok(f.client,
+             "INSERT INTO wp.fl (id, d, f) VALUES (1, 0.30000000000000004, 3.14159265), (2, 0.000000001, 0.1), "
+             "(3, 1e300, 16777216), (4, 1e-16, 1e20), (5, 123456789.123, -1.5)");
+    auto rows = query_rows(f.client, "SELECT d, f FROM wp.fl ORDER BY id");
+    REQUIRE(rows.rows.size() == 5);
+    const std::vector<std::pair<std::string, std::string>> expected{{"0.30000000000000004", "3.14159"},
+                                                                    {"0.000000001", "0.1"},
+                                                                    {"1e300", "16777200"},
+                                                                    {"1e-16", "1e20"},
+                                                                    {"123456789.123", "-1.5"}};
+    for (size_t i = 0; i < expected.size(); ++i) {
+        INFO("row " << i);
+        CHECK(rows.rows[i][0] == expected[i].first);
+        CHECK(rows.rows[i][1] == expected[i].second);
+    }
+}
+
+// A BOOLEAN is MySQL's TINYINT(1): 1 or 0 in a text row.
+TEST_CASE("mysql protocol over the wire: a BOOLEAN cell is 1 or 0") {
+    fixture f("otterstax_mysql_protocol_boolean");
+    query_ok(f.client, "CREATE TABLE wp.flags (id bigint, ok bool)");
+    query_ok(f.client, "INSERT INTO wp.flags (id, ok) VALUES (1, true), (2, false)");
+    auto rows = query_rows(f.client, "SELECT ok FROM wp.flags ORDER BY id");
+    REQUIRE(rows.rows.size() == 2);
+    CHECK(rows.rows[0][0] == "1");
+    CHECK(rows.rows[1][0] == "0");
 }

@@ -34,7 +34,7 @@
 // saw (atomics) and the test thread asserts.
 
 #include "connectors/clickhouse/connector.hpp"
-#include "connectors/clickhouse/manager.hpp"
+#include "connectors/clickhouse/connector.hpp"
 #include "utility/thread_pool_manager.hpp"
 #include "utility/wait_barrier.hpp"
 
@@ -477,9 +477,8 @@ TEST_CASE("ch Connector: a query against a server that completes every handshake
     auto connector = ch::make_ch_connector(resource, params_for(server.port()), "unanswered");
     REQUIRE_FALSE(connector->connect().contains_error());
 
-    // ch::ConnectorManager::executeQuery minus the registry lookup: the
-    // liveness check on the calling thread, then the query marshaled off the
-    // pool's io_context and its outcome taken with get().
+    // What a backend agent does: the liveness check on the calling thread,
+    // then the query marshaled off an io_context and its outcome taken with get().
     REQUIRE(connector->isConnected());
     REQUIRE(server.pongs() == 2);
     // runQuery holds only a reference to its handler: named, and declared before

@@ -122,11 +122,11 @@ output benchmarks use engine-shaped 1024-row chunks filled through `set_value`, 
 
 | Benchmark | Path |
 |-----------|------|
-| `BM_arrow_to_chunk_native/{1k,10k,100k}` | `tsl::arrow_to_chunk` — otterbrix's C data interface importer, the chunk aliases the batch's buffers |
-| `BM_arrow_to_chunk_percell/{1k,10k,100k}` | baseline: the old shim's loop, a `logical_value_t` per cell (three allocations per string) |
+| `BM_arrow_to_chunk_native/{1k,10k,100k}` | `tsl::arrow_to_chunk` — otterbrix's C data interface importer, a run of ≤ 1024-row chunks aliasing the batch's buffers |
+| `BM_arrow_to_chunk_percell/{1k,10k,100k}` | baseline: the old shim's loop, one `set_value` per cell into one chunk (a string copied into the vector's heap) |
 | `BM_chunk_to_record_batch` | `tsl::chunk_to_record_batch` (FlightSQL): numerics through otterbrix's `to_arrow_array`, strings on the utf8 builder |
 | `BM_chunk_to_file_batch` | `tsl::chunk_to_file_batch` (file writers): strings through the exporter too, as `large_utf8` |
-| `BM_chunk_to_batch_percell` | baseline: `chunk.value()` per cell into Arrow builders |
+| `BM_chunk_to_batch_percell` | baseline: one `get_value` per cell into Arrow builders |
 | `BM_arrow_pool_on_resource/{4KiB,1MiB}` | `tsl::arrow_pool` allocate + free on the resource (mutex + pmr) |
 | `BM_arrow_default_pool/{4KiB,1MiB}` | baseline: Arrow's default pool |
 | `BM_chunk_to_parquet_stream/{1,10}` | `chunk_to_parquet` of 1 / 10 chunks into a `BufferOutputStream` (no filesystem) |

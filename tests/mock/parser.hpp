@@ -14,6 +14,9 @@
 #include <thread>
 #include <utility>
 
+// The mock spells the engine's namespaces as the translators' headers make them visible.
+using namespace components;
+
 class SimpleMockParser : public IParser {
 public:
     SimpleMockParser(mock_config config)
@@ -39,7 +42,7 @@ public:
         // discovers, read whole (the storage's scan; no clause to push down).
         auto node = logical_plan::make_node_aggregate(
             config_.resource,
-            qualified_name_t{core::uid_t{"1"}, core::dbname_t{"db"}, core::schema_t{}, core::relname_t{"table"}});
+            qualified_name_t{core::connection_name_t{"1"}, core::dbname_t{"db"}, core::schema_t{}, core::relname_t{"table"}});
         auto params = logical_plan::make_parameter_node(config_.resource);
         auto binder = sql::transform::transform_result(
             config_.resource,
@@ -48,7 +51,7 @@ public:
             sql::transform::transform_result::insert_map_t{config_.resource},
             sql::transform::transform_result::insert_rows_t(config_.resource));
         auto parsed = std::make_unique<ParsedQueryData>(
-            std::make_unique<OtterbrixStatement>(std::move(params), std::move(node), 1),
+            std::make_unique<logical_plan::execution_plan_t>(config_.resource, std::move(node), std::move(params)),
             std::move(binder),
             NodeTag::T_SelectStmt);
         parsed->sql = sql;
@@ -59,13 +62,12 @@ private:
     mock_config config_;
 };
 
-inline parser_ptr make_mock_parser(std::pmr::memory_resource* resource, const otterstax::names::alias_registry_t&) {
+inline parser_ptr make_mock_parser(std::pmr::memory_resource* resource) {
     return std::make_unique<SimpleMockParser>(mock_config({.resource = resource}));
 }
 
 // Stateless factory variant for the "parser throws" path: each session gets a
 // SimpleMockParser whose parse() throws "SimpleMockParser: exception in parse".
-inline parser_ptr make_throwing_mock_parser(std::pmr::memory_resource* resource,
-                                            const otterstax::names::alias_registry_t&) {
+inline parser_ptr make_throwing_mock_parser(std::pmr::memory_resource* resource) {
     return std::make_unique<SimpleMockParser>(mock_config({.resource = resource, .can_throw = true}));
 }

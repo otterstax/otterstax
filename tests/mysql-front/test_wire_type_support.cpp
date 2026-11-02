@@ -26,6 +26,7 @@
 #include "frontend/mysql_server/resultset/mysql_resultset.hpp"
 #include "frontend/postgres_server/packet/packet_reader.hpp"
 #include "frontend/postgres_server/resultset/postgres_resultset.hpp"
+#include "otterbrix/translators/input/decimal_text.hpp"
 
 #include <catch2/catch_all.hpp>
 
@@ -84,7 +85,7 @@ namespace {
         columns.push_back(type);
         vector::data_chunk_t chunk(resource, columns, unscaled.size());
         for (size_t row = 0; row < unscaled.size(); ++row) {
-            chunk.set_value(0, row, types::logical_value_t::create_decimal(resource, type, unscaled[row]));
+            tsl::set_decimal_raw(chunk.data[0], row, unscaled[row]);
         }
         chunk.set_cardinality(unscaled.size());
         return chunk;
@@ -97,7 +98,7 @@ namespace {
                              types::int128_t unscaled) {
         auto type = decimal_type(resource, width, scale);
         auto chunk = decimal_chunk(resource, type, {unscaled});
-        return encode_to_text(chunk, 0, 0);
+        return encode_to_text(chunk, 0, 0, {frontend_type::POSTGRES, 1});
     }
 
     // One HUGEINT column holding the given integers, one per row. No extension
@@ -108,7 +109,7 @@ namespace {
         columns.emplace_back(LT::HUGEINT, "big");
         vector::data_chunk_t chunk(resource, columns, values.size());
         for (size_t row = 0; row < values.size(); ++row) {
-            chunk.set_value(0, row, types::logical_value_t{resource, values[row]});
+            chunk.set_value(0, row, types::int128_t{values[row]});
         }
         chunk.set_cardinality(values.size());
         return chunk;
@@ -117,7 +118,7 @@ namespace {
     // The text a HUGEINT cell goes out as, on either wire.
     std::string hugeint_text(std::pmr::memory_resource* resource, types::int128_t value) {
         auto chunk = hugeint_chunk(resource, {value});
-        return encode_to_text(chunk, 0, 0);
+        return encode_to_text(chunk, 0, 0, {frontend_type::POSTGRES, 1});
     }
 } // namespace
 
@@ -507,7 +508,7 @@ TEST_CASE("pg resultset: a DECIMAL column is a NUMERIC field whose text keeps th
     auto chunk = decimal_chunk(&arena, type, {types::int128_t{-5}});
 
     postgres::packet_writer writer;
-    postgres::postgres_resultset result(writer);
+    postgres::postgres_resultset result(writer, postgres::extra_float_digits_t{1});
     result.add_chunk_columns(chunk);
     result.add_row(chunk, 0);
     auto packets = postgres::postgres_resultset::build_packets(std::move(result));
@@ -635,7 +636,7 @@ TEST_CASE("pg resultset: a HUGEINT column is a NUMERIC field whose text keeps ev
     const std::string digits = "170141183460469231731687303715884105727";
 
     postgres::packet_writer writer;
-    postgres::postgres_resultset result(writer);
+    postgres::postgres_resultset result(writer, postgres::extra_float_digits_t{1});
     result.add_chunk_columns(chunk);
     result.add_row(chunk, 0);
     auto packets = postgres::postgres_resultset::build_packets(std::move(result));

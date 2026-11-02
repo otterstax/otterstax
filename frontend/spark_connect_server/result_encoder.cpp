@@ -53,9 +53,10 @@ namespace frontend::spark {
             return encode_result{core::error_t{code, std::pmr::string{what.data(), what.size(), resource}}};
         }
 
-        // An Arrow failure while building the stream: the encoder's conversion_failure.
+        // An Arrow failure while building the stream of a column the encoder
+        // checked: internal_error.
         encode_result arrow_error(const arrow::Status& status, std::pmr::memory_resource* resource) {
-            return make_error(core::error_code_t::conversion_failure, status.ToString(), resource);
+            return make_error(core::error_code_t::internal_error, status.ToString(), resource);
         }
 
         // Whether the otterbrix C ABI converters carry a column of this type. Both throw
@@ -161,7 +162,7 @@ namespace frontend::spark {
             // A column the converters below cannot carry is refused here, before
             // either of them could throw on it.
             if (!arrow_encodable(field_types[i])) {
-                return make_error(core::error_code_t::conversion_failure,
+                return make_error(core::error_code_t::unimplemented_yet,
                                   "column '" + name + "' has a type the Spark Arrow batch cannot carry (logical type " +
                                       std::to_string(static_cast<unsigned>(field_types[i].type())) + ")",
                                   resource);
@@ -180,8 +181,13 @@ namespace frontend::spark {
         // non-const reference even though it only reads from the chunk (it
         // forwards into non-const vector_t accessors); casting away const here
         // is therefore safe.
-        ca::to_arrow_schema(&schema_guard.value, field_types);
-        ca::to_arrow_array(const_cast<cv::data_chunk_t&>(chunk), &array_guard.value);
+        if (auto exported = ca::to_arrow_schema(resource, &schema_guard.value, field_types); exported.contains_error()) {
+            return encode_result{core::error_on(resource, exported)};
+        }
+        if (auto exported = ca::to_arrow_array(const_cast<cv::data_chunk_t&>(chunk), &array_guard.value);
+            exported.contains_error()) {
+            return encode_result{core::error_on(resource, exported)};
+        }
 
         // ImportSchema / ImportRecordBatch consume their C structs on success
         // (the guards become no-ops); on failure they leave them for the guards.

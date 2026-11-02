@@ -7,7 +7,6 @@
 #include "types/otterbrix.hpp"
 #include "utility/logger.hpp"
 
-#include "otterbrix/parser/alias_registry.hpp"
 #include "otterbrix/parser/grammar_extension/kafka/kafka_extension.hpp"
 
 #include <integration/cpp/otterbrix.hpp>
@@ -35,39 +34,35 @@ enum class extension_kind_t : uint8_t {
 };
 
 struct ParsedQueryData {
-    explicit ParsedQueryData(OtterbrixStatementPtr otterbrix_params,
+    explicit ParsedQueryData(ExecutionPlanPtr plan,
                              components::sql::transform::transform_result&& binder,
                              NodeTag tag);
 
+    // The statement's transform: it binds the client's values into the
+    // statement and finalizes it (query_session_t::parse_bound). Finalized
+    // already for a statement without `$n`; parameter_count() stays readable.
     components::sql::transform::transform_result& binder();
+    const components::sql::transform::transform_result& binder() const;
 
-    OtterbrixStatementPtr otterbrix_params;
+    // The statement as the engine runs it. For a statement still awaiting its
+    // Bind, the plan of the describe finalize (finalize_for_describe: every `$n`
+    // unbound), replaced by the binder's finalized plan once bound.
+    ExecutionPlanPtr plan;
 
     NodeTag tag;
 
     extension_kind_t extension_kind{extension_kind_t::none};
 
     // The SQL text the statement was parsed from (GreenplumParser::parse); empty
-    // for a plan a frontend built itself. The query session parses it again to
-    // run the statement a second time (a plan is single-use).
+    // for a plan a frontend built itself. The query session keeps it for a
+    // prepared statement and parses it again for every execution and for the
+    // registration retry (a plan is single-use).
     std::string sql;
 
-    // A table-level DDL statement's target (CREATE TABLE, CREATE INDEX, DROP
-    // TABLE, the indexed table of DROP INDEX) as written, every slot — the plan
-    // node keeps only database and table; empty otherwise and for a plan a
-    // frontend built itself.
-    qualified_name_t ddl_target;
-
-    // An INSERT / UPDATE / DELETE target written with a uid slot
-    // (uid.db.schema.table), every slot; empty otherwise. The engine's
-    // transformer keeps no uid on a DML target, so the query session runs such a
-    // statement on its backend directly (query_session_t::run_remote_dml).
-    qualified_name_t dml_target;
-
-    // True while the statement's `$n` hold the placeholders the parser bound to
-    // reach its plan (GreenplumParser::parse): the binder reads as fully bound,
-    // but no client value has been bound yet. Cleared by the query session once
-    // execute_prepared_statement has bound and finalized the real values.
+    // True while the statement's `$n` are unbound (GreenplumParser::parse): the
+    // binder is not finalized yet and `plan` is the describe plan. Cleared by
+    // the query session once execute_prepared_statement has bound and finalized
+    // the client's values.
     bool awaiting_bind{false};
 
 private:
@@ -103,7 +98,6 @@ public:
 
 private:
     std::pmr::memory_resource* resource_;
-    const otterstax::names::alias_registry_t& aliases_;
     log_t log_;
     // One shared registry for all DDL parser extensions: s3/file (CREATE EXTERNAL
     // TABLE / COPY ... TO → external_node_t) and kafka (CREATE/DROP SOURCE/STREAM
@@ -117,6 +111,6 @@ private:
 
 using parser_ptr = std::unique_ptr<IParser>;
 
-inline parser_ptr make_parser(std::pmr::memory_resource* resource, const otterstax::names::alias_registry_t& aliases) {
-    return std::make_unique<GreenplumParser>(resource, aliases);
+inline parser_ptr make_parser(std::pmr::memory_resource* resource) {
+    return std::make_unique<GreenplumParser>(resource);
 }

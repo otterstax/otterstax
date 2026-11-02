@@ -31,16 +31,15 @@
 #include "session/session_payload.hpp"
 
 #include <actor-zeta.hpp>
+#include <components/vector/data_chunk.hpp>
 
 #include <cstddef>
 #include <cstdint>
 #include <memory_resource>
+#include <optional>
 #include <string>
 #include <utility>
-
-namespace components::types {
-    class logical_value_t;
-}
+#include <vector>
 
 namespace flight::engine {
 
@@ -70,11 +69,23 @@ namespace flight::engine {
                                              const core::Prepared& prepared,
                                              const core::BoundParams& params);
 
-        // Metadata (Catalogs / DbSchemas / Tables / TableTypes): the engine's own
-        // tables (pg_catalog) and the remote tables the federation knows
-        // (federation.remote_tables), read through a query session of its own
-        // and listed by catalog::list_tables.
-        core::EngineMetadata metadata();
+        // Metadata (GetCatalogs / GetDbSchemas / GetTables), read from the
+        // engine's catalog (pg_catalog.pg_database / pg_namespace / pg_class)
+        // through a query session of its own; no backend is asked. A catalog
+        // is a database as SQL writes it: `d` for a local one, `c.d` for the
+        // database d of the connection c; a schema is a schema of it. Hidden:
+        // pg_catalog, information_schema and the database `federation`. The
+        // filters run in the engine: `catalog` (when given) is an exact match,
+        // the patterns are LIKE patterns (empty: no filter). Sorted by
+        // catalog, schema, table; a table's columns (include_schema) are the
+        // engine's describe of `SELECT * FROM` it. Throw core::EngineError.
+        std::vector<std::string> catalogs();
+        std::vector<core::DbSchema> db_schemas(const std::optional<std::string>& catalog,
+                                               const std::string& schema_pattern);
+        std::pmr::vector<table_info> tables(const std::optional<std::string>& catalog,
+                                            const std::string& schema_pattern,
+                                            const std::string& table_pattern,
+                                            bool include_schema);
 
         std::string dialect_name() const;
 
@@ -102,9 +113,9 @@ namespace flight::engine {
         // Re-prepare + execute_prepared_statement with one parameter row.
         template<typename Session>
         session_payload run_prepared(const Session& session, const std::string& sql, const core::BoundParams& params);
-        // The DoPut batches -> engine parameter rows (tsl::arrow_to_chunk).
-        std::pmr::vector<std::pmr::vector<components::types::logical_value_t>>
-        to_param_rows(const core::BoundParams& params);
+        // The DoPut batches -> engine chunks (tsl::arrow_to_chunk), one per
+        // non-empty batch: column i is `$<i+1>`, one row is one parameter set.
+        std::pmr::vector<components::vector::data_chunk_t> to_param_chunks(const core::BoundParams& params);
         // A statement that left the session inside an explicit transaction
         // (BEGIN): rolled back and refused (throws). No Flight SQL scope
         // outlives what it runs, so the client could never end it.

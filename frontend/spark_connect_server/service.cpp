@@ -49,11 +49,6 @@ namespace frontend::spark {
         using FetchErrorDetailsRPC = agrpc::ServerRPC<&SCS::AsyncService::RequestFetchErrorDetails>;
         using AddArtifactsRPC = agrpc::ServerRPC<&SCS::AsyncService::RequestAddArtifacts>;
 
-        const otterstax::names::alias_registry_t& required_aliases(const SparkConnectServerConfig& config) {
-            assert(config.aliases != nullptr && "the connection aliases must be given");
-            return *config.aliases;
-        }
-
     } // namespace
 
     SparkConnectServiceImpl::SparkConnectServiceImpl(const SparkConnectServerConfig& config)
@@ -95,12 +90,12 @@ namespace frontend::spark {
         }
         // A Spark session closed meanwhile has no block left to fail.
         spark_sessions_.use(id, std::chrono::steady_clock::now(), [&](query_session_t& session) {
-            if (session.transaction_state() != otterstax::session::transaction_state_t::in_block) {
+            if (session.transaction_status() != query_session_t::transaction_status_t::in_transaction) {
                 return;
             }
             [[maybe_unused]] auto [needs_sched, fut] = actor_zeta::send(session.address(),
                                                                         &query_session_t::fail_transaction,
-                                                                        core::error_code_t::other_error,
+                                                                        core::error_code_t::protocol_violation,
                                                                         std::move(*reason));
         });
     }

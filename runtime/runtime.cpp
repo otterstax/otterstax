@@ -38,6 +38,7 @@ namespace otterstax::runtime {
         // Backends first: the sessions an accepted connection spawns talk to
         // them, never the other way round. Stopped in the reverse order.
         backends_->start();
+        backends_running_ = true;
         sessions_->start();
         sessions_running_ = true;
     }
@@ -45,8 +46,7 @@ namespace otterstax::runtime {
     runtime_t::~runtime_t() {
         OTX_ZONE_N("runtime::~runtime_t");
         stop_sessions();
-        // Started in the constructor, stopped once, here.
-        backends_->stop();
+        stop_backends();
         if (engine_pools_state_ == engine_pools_state_t::lent) {
             // The engine's threads would outlive the pools they run on.
             std::fputs("otterstax::runtime::runtime_t destroyed while an engine_t still runs on its engine pools: "
@@ -64,6 +64,14 @@ namespace otterstax::runtime {
         if (sessions_running_) {
             sessions_->stop();
             sessions_running_ = false;
+        }
+    }
+
+    void runtime_t::stop_backends() noexcept {
+        OTX_ZONE_N("runtime::stop_backends");
+        if (backends_running_) {
+            backends_->stop();
+            backends_running_ = false;
         }
     }
 

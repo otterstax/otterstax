@@ -81,7 +81,7 @@ TEST_CASE("flight session scope: a statement by text runs on a session closed wh
     auto core = make_core(owner);
     auto& engine = core.engine();
 
-    CHECK(engine.execute_update("CREATE DATABASE fs") == 0);
+    CHECK(engine.execute_update("CREATE SCHEMA fs") == 0);
     CHECK(engine.execute_update("CREATE TABLE fs.t (id bigint)") == 0);
     CHECK(engine.execute_update("INSERT INTO fs.t (id) VALUES (1), (2), (3)") == 3);
     CHECK(rows_of(engine.execute("SELECT id FROM fs.t")) == 3);
@@ -94,7 +94,7 @@ TEST_CASE("flight session scope: a prepared statement keeps one session until it
     const size_t baseline = sessions.live_sessions();
     auto core = make_core(owner);
     auto& engine = core.engine();
-    REQUIRE(engine.execute_update("CREATE DATABASE fp") == 0);
+    REQUIRE(engine.execute_update("CREATE SCHEMA fp") == 0);
     REQUIRE(engine.execute_update("CREATE TABLE fp.t (id bigint)") == 0);
     REQUIRE(engine.execute_update("INSERT INTO fp.t (id) VALUES (1), (2)") == 2);
     REQUIRE(wait_for_live(sessions, baseline));
@@ -133,7 +133,7 @@ TEST_CASE("flight session scope: a close racing executions of the statement") {
     auto& sessions = owner.sessions();
     const size_t baseline = sessions.live_sessions();
     auto core = make_core(owner);
-    REQUIRE(core.engine().execute_update("CREATE DATABASE fr") == 0);
+    REQUIRE(core.engine().execute_update("CREATE SCHEMA fr") == 0);
     REQUIRE(core.engine().execute_update("CREATE TABLE fr.t (id bigint)") == 0);
     REQUIRE(core.engine().execute_update("INSERT INTO fr.t (id) VALUES (1), (2), (3)") == 3);
     REQUIRE(wait_for_live(sessions, baseline));
@@ -181,7 +181,7 @@ TEST_CASE("flight session scope: BEGIN is refused and leaves no transaction open
     const size_t baseline = sessions.live_sessions();
     auto core = make_core(owner);
     auto& engine = core.engine();
-    REQUIRE(engine.execute_update("CREATE DATABASE fb") == 0);
+    REQUIRE(engine.execute_update("CREATE SCHEMA fb") == 0);
     REQUIRE(engine.execute_update("CREATE TABLE fb.t (id bigint)") == 0);
 
     auto refused = [](auto&& call) {

@@ -12,7 +12,6 @@ set(${PROJECT_NAME}_SOURCES
     test_kafka_runtime.cpp
     test_dml_result_shape.cpp
     test_row_producing_result_shape.cpp
-    test_prepared_reexecute.cpp
     test_clickhouse_dml_count.cpp
     test_composite_insert.cpp
     test_default_insert.cpp
@@ -28,7 +27,6 @@ set(${PROJECT_NAME}_SOURCES
     test_flightsql_metadata.cpp
     test_flightsql_tickets.cpp
     test_flightsql_auth.cpp
-    test_single_backend_prepare_schema.cpp
     test_engine_requests.cpp
     test_s3_errors.cpp
     test_process_assembly.cpp
@@ -36,13 +34,14 @@ set(${PROJECT_NAME}_SOURCES
     test_frontend_connection_lifetime.cpp
     test_frontend_malformed_packet.cpp
     test_frontend_transactions.cpp
+    test_frontend_registration.cpp
     test_frontend_mysql_protocol.cpp
     test_frontend_accept_retry.cpp
     test_spark_plan_execution.cpp
     test_spark_transactions.cpp
     test_prepare_plan.cpp
     test_constant_aggregates.cpp
-    test_subquery_plan.cpp
+    test_federated_queries.cpp
 )
 
 add_executable(${PROJECT_NAME} ${${PROJECT_NAME}_SOURCES})

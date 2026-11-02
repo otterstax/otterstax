@@ -1,0 +1,97 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2025-2026  OtterStax
+
+#pragma once
+
+#include "otterbrix/backend_type.hpp"
+#include "otterbrix/federation/backend_actor.hpp"
+
+#include <components/base/collection_full_name.hpp>
+#include <components/cursor/cursor.hpp>
+#include <components/logical_plan/execution_plan.hpp>
+#include <components/session/session.hpp>
+#include <core/result_wrapper.hpp>
+
+#include <functional>
+#include <memory_resource>
+#include <optional>
+#include <span>
+#include <string>
+#include <vector>
+
+// The registration of the connections' tables in otterbrix's catalog. A connection's table is
+// ordinary catalog rows of a database of the connection (pg_database.datconnection):
+//
+//   c.d          CREATE DATABASE, a plan naming the connection (SQL has no spelling for it)
+//   c.d.s        CREATE SCHEMA — MySQL / ClickHouse: `public`; PostgreSQL: config.yaml's `schema`,
+//                or every user schema of the database when it names none
+//   c.d.s.t      CREATE TABLE with the discovered columns
+//
+// every name in lower case (the backend's spelling goes to the backend actor, staged before the
+// CREATE, and from its DDL reply into federation.public.remote_names). Every statement runs on the
+// actor's registration session, so no SQL reaches a backend: the table is there already.
+namespace otterstax::catalog {
+
+    // A connection of config.yaml as the registration sees it.
+    struct configured_connection_t {
+        std::string name; // config.yaml's spelling
+        backend_type_t kind{backend_type_t::PostgreSQL};
+        std::string database; // config.yaml's `database:`, as spelled
+        std::string schema;   // PostgreSQL's `schema:`; empty: every user schema
+        // The connection's backend actor: its registration staging, its discovery (discover).
+        federation::backend_actor_t* actor{nullptr};
+    };
+
+    // What the startup discovery of one connection found; `discovered` false: the backend did not
+    // answer (unreachable), and its catalog rows are kept as they are.
+    struct connection_discovery_t {
+        configured_connection_t connection;
+        bool discovered{false};
+        federation::discovered_tables_t tables;
+    };
+
+    // How the startup runs its statements, blocking the calling thread: a SQL text (otterbrix's own
+    // parser) or a plan, on a session. main: runtime::engine_t::execute_plan_blocking (with
+    // engine::sql_plan for the text); a test: its wrapper_dispatcher_t.
+    struct engine_calls_t {
+        std::function<components::cursor::cursor_t_ptr(const components::session::session_id_t&, const std::string&)>
+            sql;
+        std::function<components::cursor::cursor_t_ptr(const components::session::session_id_t&,
+                                                        components::logical_plan::execution_plan_t)>
+            plan;
+    };
+
+    // The startup step, once the engine opened and before any client: the host table
+    // federation.public.remote_names (created when missing; its oid handed to every connection's
+    // actor), the catalog's tables of every connection handed to its actor with their spelling
+    // (load_tables), then each connection that answered brought in line with its discovery — a
+    // table that is new registered, one the backend no longer has dropped, a column added / dropped
+    // (a changed type: dropped and added), all on `session` (the actors' registration session), so
+    // the backends get no SQL. A connection the catalog has and config.yaml no longer names keeps its
+    // databases (a warning in the BACKENDS log). An engine refusal is the error (startup aborts).
+    [[nodiscard]] core::error_t register_connections(std::pmr::memory_resource* resource,
+                                                     const engine_calls_t& engine,
+                                                     const components::session::session_id_t& session,
+                                                     std::span<const connection_discovery_t> connections);
+
+    // The scope to discover when a statement of a client missed a remote table: `error` is
+    // table_not_exists, schema_not_exists or database_not_exists and `written` — the name as the
+    // statement wrote it — has four parts, the first a connection of `connections`. The scope is
+    // (connection as configured, its database as configured, the written schema — PostgreSQL's —,
+    // the written table). nullopt otherwise. A table written in another case than the backend
+    // spells it is found only when the written name is the backend's.
+    [[nodiscard]] std::optional<std::pair<configured_connection_t, qualified_name_t>>
+    registration_target(const core::error_t& error,
+                        const qualified_name_t& written,
+                        std::span<const configured_connection_t> connections);
+
+    // The plans that register `tables` (what `connection`'s discovery answered), to run in order on
+    // the actor's registration_session(): CREATE DATABASE / SCHEMA / TABLE IF NOT EXISTS of each,
+    // every table's spelling staged in `connection.actor`. A table whose columns fold to one name is
+    // left out.
+    [[nodiscard]] std::vector<components::logical_plan::execution_plan_t>
+    registration_plans(std::pmr::memory_resource* resource,
+                       const configured_connection_t& connection,
+                       const federation::discovered_tables_t& tables);
+
+} // namespace otterstax::catalog

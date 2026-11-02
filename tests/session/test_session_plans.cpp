@@ -10,9 +10,9 @@
 // PostgreSQL mock connector), and the refusals both share.
 
 #include "../system/session_stack.hpp"
+#include "../mock/cell.hpp"
 
 #include "frontend/spark_connect_server/plan_translator/relation_to_plan.hpp"
-#include "integration/postgresql/connection_manager.hpp"
 
 #include <spark/connect/base.pb.h>
 #include <spark/connect/expressions.pb.h>
@@ -53,7 +53,7 @@ namespace {
     // ─── Spark DataFrame plans over the real engine ──────────────────────────
 
     void seed_sales(const session_stack& s, session_hash_t& id, const std::string& db) {
-        run_session_or_fail(s, id++, "CREATE DATABASE " + db + ";");
+        run_session_or_fail(s, id++, "CREATE SCHEMA " + db + ";");
         run_session_or_fail(s, id++, "CREATE TABLE " + db + ".sales (id bigint, region string, amount bigint);");
         run_session_or_fail(s,
                             id++,
@@ -156,19 +156,19 @@ namespace {
         return 0;
     }
 
-    int64_t as_int64(const ct::logical_value_t& value) {
-        REQUIRE_FALSE(value.is_null());
-        switch (value.type().type()) {
+    int64_t as_int64(const components::vector::vector_t& column, uint64_t row) {
+        REQUIRE_FALSE(column.is_null(row));
+        switch (column.type().type()) {
             case ct::logical_type::BIGINT:
-                return value.value<int64_t>();
+                return column.get_value<int64_t>(row);
             case ct::logical_type::UBIGINT:
-                return static_cast<int64_t>(value.value<uint64_t>());
+                return static_cast<int64_t>(column.get_value<uint64_t>(row));
             case ct::logical_type::INTEGER:
-                return value.value<int32_t>();
+                return column.get_value<int32_t>(row);
             case ct::logical_type::DOUBLE:
-                return static_cast<int64_t>(value.value<double>());
+                return static_cast<int64_t>(column.get_value<double>(row));
             default:
-                FAIL("unexpected result type " << static_cast<int>(value.type().type()));
+                FAIL("unexpected result type " << static_cast<int>(column.type().type()));
                 return 0;
         }
     }
@@ -181,7 +181,7 @@ namespace {
             }
             const auto index = column_of(chunk, name);
             for (uint64_t row = 0; row < chunk.size(); ++row) {
-                values.push_back(as_int64(chunk.value(index, row)));
+                values.push_back(as_int64(chunk.data[index], row));
             }
         }
         std::sort(values.begin(), values.end());
@@ -226,7 +226,7 @@ TEST_CASE("session plan: groupBy agg and df.count answer per group and overall",
 
         auto counted = run_plan_or_fail(s, id++, aggregate(sales, {}, {call("count", {long_literal(1)})}));
         REQUIRE(counted.size() == 1);
-        CHECK(as_int64(counted.chunks.front().value(0, 0)) == 6);
+        CHECK(as_int64(counted.chunks.front().data[0], 0) == 6);
     });
 }
 
@@ -349,9 +349,9 @@ namespace {
             }
             auto chunk = std::make_unique<components::vector::data_chunk_t>(resource_, fields, kRows.size());
             for (std::size_t row = 0; row < kRows.size(); ++row) {
-                chunk->set_value(0, row, ct::logical_value_t(resource_, kRows[row].id));
-                chunk->set_value(1, row, ct::logical_value_t(resource_, std::string_view{kRows[row].name}));
-                chunk->set_value(2, row, ct::logical_value_t(resource_, kRows[row].price));
+                chunk->set_value(0, row, kRows[row].id);
+                chunk->set_value(1, row, std::string_view{kRows[row].name});
+                chunk->set_value(2, row, kRows[row].price);
             }
             chunk->set_cardinality(kRows.size());
             co_return std::move(chunk);
@@ -442,9 +442,9 @@ namespace {
         std::vector<item_row> rows;
         for (const auto& chunk : payload.chunks) {
             for (std::size_t row = 0; row < chunk.size(); ++row) {
-                rows.push_back(item_row{chunk.value(0, row).value<int32_t>(),
-                                        std::string{chunk.value(1, row).value<std::string_view>()},
-                                        chunk.value(2, row).value<double>()});
+                rows.push_back(item_row{otterstax::test::cell(chunk, 0, row).value<int32_t>(),
+                                        std::string{otterstax::test::cell(chunk, 1, row).value<std::string_view>()},
+                                        otterstax::test::cell(chunk, 2, row).value<double>()});
             }
         }
         std::sort(rows.begin(), rows.end(), [](const item_row& a, const item_row& b) { return a.id < b.id; });
@@ -475,7 +475,7 @@ TEST_CASE("session prepare_plan: a parsed remote SELECT is described and never e
     require_item_schema(prepared.value().schema);
     REQUIRE(prepared.value().empty());
     REQUIRE(data_count() == 0);
-    // Described from federation.remote_columns: the backend is not asked.
+    // Described from the catalog rows of the connection's table: the backend is not asked.
     REQUIRE(probe_count() == 0);
 
     REQUIRE_FALSE(close_session_statement(s, by_plan).has_error());
@@ -506,9 +506,9 @@ TEST_CASE("session execute_plan: a parsed remote SELECT returns the rows execute
 }
 
 // A DataFrame over a remote table: the Spark translator names the table as the
-// SQL path does (four parts keep the alias slot), and the engine resolves it
-// through the federation — a bare read through the storage's scan, a filtered
-// projection as one pushed-down statement — for execute_plan and prepare_plan.
+// SQL path does (four parts name a connection's table, three a local one), and
+// the engine reads it through the connection's backend, for execute_plan and
+// prepare_plan.
 TEST_CASE("session execute_plan: a DataFrame over a remote table reads it through the federation") {
     plan_stack_owner owner("/tmp/test_session_plan_remote_dataframe");
     auto s = owner.stack();
@@ -519,11 +519,9 @@ TEST_CASE("session execute_plan: a DataFrame over a remote table reads it throug
     const std::vector<item_row> expected(kRows.begin(), kRows.end());
     REQUIRE(rows_of(all.value()) == expected);
 
-    // Three parts read as database.schema.table: the alias in the database slot.
+    // Three parts are always a local database's (d.s.t): no connection's.
     auto three = execute_session_plan(s, 9941, translate(s, read_table(std::string{kUid} + ".public.items")));
-    INFO("three-part read: " << (three.has_error() ? three.error().what.c_str() : "ok"));
-    REQUIRE_FALSE(three.has_error());
-    REQUIRE(rows_of(three.value()) == expected);
+    CHECK(three.has_error());
 
     // df.schema of the same read: described, never executed.
     reset_queries();

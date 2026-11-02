@@ -4,18 +4,17 @@
 #pragma once
 
 #include "otterbrix/parser/parser.hpp"
-#include "session/transaction_state.hpp"
+#include "session/session_payload.hpp"
 #include "types/otterbrix.hpp"
 
 #include <components/base/collection_full_name.hpp>
 
-#include <components/expressions/expression.hpp>
-#include <components/types/types.hpp>
 #include <core/result_wrapper.hpp>
 
-#include <map>
 #include <memory_resource>
+#include <optional>
 #include <string>
+#include <vector>
 
 namespace otterstax::external {
     class external_node_t;
@@ -40,8 +39,8 @@ namespace otterstax::session::plan {
 
     extension_root_t extension_root(const ParsedQueryData& data);
 
-    // The transaction statement (BEGIN / COMMIT / ROLLBACK) the plan root is;
-    // `none` for every other statement.
+    // The transaction statement (BEGIN / COMMIT / ROLLBACK / SAVEPOINT /
+    // RELEASE / ROLLBACK TO) the plan root is; `none` for every other statement.
     transaction_command_t transaction_command(const ParsedQueryData& data);
 
     // The database a CREATE DATABASE / DROP DATABASE statement names; empty
@@ -50,69 +49,39 @@ namespace otterstax::session::plan {
     core::result_wrapper_t<std::pmr::string> database_ddl_target(std::pmr::memory_resource* resource,
                                                                  const ParsedQueryData& data);
 
-    using dependencies_t = std::pmr::map<qualified_name_t, size_t>;
+    // The relation or schema a DDL or DML statement changes, as written (every
+    // slot as the statement spells it): the target of an INSERT / UPDATE /
+    // DELETE, a CREATE / ALTER / DROP of a relation, an index, a view, a
+    // sequence, a type, a schema. nullopt for every other statement (a query, a
+    // transaction or setting statement, CREATE / DROP DATABASE — those are
+    // database_ddl_target's). `drops_schema`: a DROP SCHEMA.
+    struct write_target_t {
+        qualified_name_t name;
+        bool drops_schema{false};
+    };
+    std::optional<write_target_t> write_target(const ParsedQueryData& data);
+
+    // What a SET / RESET / RESET ALL of the session or SET LOCAL assigns, as
+    // the engine applies it (session_payload::setting_changes): each value
+    // canonicalised as the engine does, nullopt for the default. Empty for
+    // ALTER SYSTEM (refused before the engine) and every other statement.
+    std::vector<session_payload::setting_change_t> setting_changes(std::pmr::memory_resource* resource,
+                                                                   const ParsedQueryData& data);
+    // The savepoint a SAVEPOINT / RELEASE / ROLLBACK TO names; nullopt for
+    // every other statement.
+    std::optional<std::string> savepoint_name(const ParsedQueryData& data);
+
+    // Whether the statement is a query — a SELECT, VALUES or a set operation
+    // (the plan's statement node an aggregate, a VALUES list's data, a union or
+    // an intersect), not an
+    // EXPLAIN: what COPY (<query>) TO exports.
+    bool is_query(const ParsedQueryData& data);
 
     // Every table name the statement writes — its root and its sub-queries,
-    // in plan order, each once, every slot as written (a remote table keeps its
-    // uid and schema): what a rediscovery looks among for a remote table.
+    // in plan order, each once, every slot as written (a table of a connection
+    // keeps its connection): what the registration of a missed table looks
+    // among (catalog::registration_target).
     std::pmr::vector<qualified_name_t> statement_names(std::pmr::memory_resource* resource,
-                                                       const OtterbrixStatement& statement);
-
-    // A table-level DDL statement — CREATE TABLE, CREATE INDEX, DROP TABLE,
-    // DROP INDEX — and the name it targets as written (ParsedQueryData::ddl_target,
-    // every slot, when the parser kept it; the node's target otherwise); empty
-    // `node` for every other statement (CREATE / DROP DATABASE are
-    // database_ddl_target's).
-    struct table_ddl_t {
-        const components::logical_plan::node_t* node{nullptr};
-        qualified_name_t target;
-        // DROP INDEX: the index; empty otherwise.
-        std::string index;
-        // CREATE TABLE / DROP TABLE change which tables exist; an index
-        // statement does not.
-        enum class kind_t
-        {
-            create_table,
-            drop_table,
-            index,
-        } kind{kind_t::index};
-    };
-    table_ddl_t table_ddl(const ParsedQueryData& data);
-
-    // The relations a statement reads, as the dependency map the federated
-    // schema computation resolves its aggregates against: one entry per
-    // DISTINCT aggregate key, numbered in insertion order, because the engine
-    // answers a vector of that many probes and compute_otterbrix_schema indexes
-    // into it by these numbers. Two aggregates over one relation share a key
-    // and so share a slot — the number is the map's own size, never a node
-    // counter, which for a self-join would run past the vector the map sizes.
-    //
-    // The statement's ROOT only: the describe of a statement probes the
-    // relations its result is computed from. Its sub-queries are siblings of the
-    // root, and a relation only a sub-query reads costs a probe the statement's
-    // own columns do not need — and a probe that fails would fail the prepare.
-    dependencies_t plan_dependencies(std::pmr::memory_resource* resource, const OtterbrixStatement& statement);
-
-    // The RETURNING list of a DML statement and the relation whose columns
-    // resolve it, or an empty answer for every other statement (and for an
-    // UPDATE ... FROM / DELETE ... USING, whose RETURNING may name the source).
-    struct returning_clause_t {
-        const std::pmr::vector<components::expressions::expression_ptr>* list{nullptr};
-        // The target relation as the statement wrote it (every slot: a remote
-        // target keeps its uid and schema).
-        const qualified_name_t* target{nullptr};
-        // Whether the statement carries a RETURNING list at all (an UPDATE ...
-        // FROM / DELETE ... USING included, which has no `list` here).
-        bool present{false};
-    };
-
-    returning_clause_t dml_returning(const components::logical_plan::node_ptr& root);
-
-    // The columns a RETURNING list projects, typed from the columns the target
-    // relation's probe answered; NA for a list that projects no column.
-    components::types::complex_logical_type
-    returning_schema(std::pmr::memory_resource* resource,
-                     const std::pmr::vector<components::expressions::expression_ptr>& returning,
-                     const std::pmr::vector<components::types::complex_logical_type>& columns);
+                                                       const components::logical_plan::execution_plan_t& statement);
 
 } // namespace otterstax::session::plan

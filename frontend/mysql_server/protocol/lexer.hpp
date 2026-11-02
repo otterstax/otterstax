@@ -54,6 +54,12 @@ namespace frontend::mysql {
     // throws.
     [[nodiscard]] std::optional<std::vector<token_t>> tokenize(std::string_view sql);
 
+    // The one lower case of the MySQL frontend: ASCII letters folded, every
+    // other byte (UTF-8 included) kept — how the lexer folds a word and the
+    // protocol statements a name, a charset or a value they compare.
+    [[nodiscard]] char to_lower(char c);
+    [[nodiscard]] std::string to_lower(std::string text);
+
     // Which command carries the text: a `?` placeholder exists only in a
     // COM_STMT_PREPARE text, and MySQL answers one in a COM_QUERY text with a
     // syntax error.

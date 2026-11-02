@@ -7,6 +7,7 @@ set(${PROJECT_NAME}_SOURCES
     test_wire_type_support.cpp
     test_protocol_statement.cpp
     test_secure_random.cpp
+    test_float_text.cpp
     # wire-level tests of the other two frontends: they need no running server
     test_pg_frontend_packets.cpp
 )

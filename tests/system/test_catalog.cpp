@@ -3,14 +3,12 @@
 
 // The catalog building blocks over the federation, no query session needed
 // except where a statement is the subject: literal escaping for the handwritten
-// discovery queries; the Flight SQL GetTables listing (catalog::list_tables over
-// the engine's pg_catalog and federation.remote_tables) and its filters; the
-// startup discovery error paths, which must not record a half-known table; the
-// database names user DDL must leave alone; and a remote DROP TABLE, which runs
-// on its backend and takes the table out of the federation metadata.
+// discovery queries; the startup discovery error paths, which must not register
+// a half-known table; the database names user DDL must leave alone; and a
+// remote DROP TABLE, which runs on its backend and takes the table out of the
+// catalog.
 
 #include "catalog/discovery.hpp"
-#include "catalog/introspection.hpp"
 #include "catalog/ownership.hpp"
 #include "session_stack.hpp"
 
@@ -141,46 +139,25 @@ namespace {
             return options;
         }
 
-        cat::rows_t read(std::string_view sql) {
-            auto cursor = owner.engine().sql(std::string{sql});
+        // Sorted "<connection>.<database>.<schema>.<table>" of every table the
+        // catalog keeps of a connection's database.
+        std::vector<std::string> names() {
+            auto cursor = owner.engine().sql(
+                "SELECT d.datconnection, d.datname, n.nspname, c.relname FROM pg_catalog.pg_database d JOIN "
+                "pg_catalog.pg_namespace n ON n.nspdatabase = d.oid JOIN pg_catalog.pg_class c ON c.relnamespace = "
+                "n.oid WHERE d.datconnection <> '' AND c.relkind = 'r';");
             REQUIRE(cursor);
-            INFO(sql << ": " << (cursor->is_error() ? cursor->get_error().what.c_str() : "ok"));
+            INFO((cursor->is_error() ? cursor->get_error().what.c_str() : "ok"));
             REQUIRE_FALSE(cursor->is_error());
-            cat::rows_t rows{owner.engine().resource()};
-            for (const auto& chunk : cursor->chunks()) {
-                rows.push_back(chunk.partial_copy(owner.engine().resource(), 0, chunk.size()));
-            }
-            return rows;
-        }
-
-        // Every table GetTables lists for `command`, as the frontend computes it.
-        std::pmr::vector<table_info> tables(const cat::get_tables_command_t& command) {
-            auto namespaces = read(cat::namespaces_sql);
-            auto classes = read(cat::classes_sql);
-            auto remote_tables = read(cat::remote_tables_sql);
-            cat::rows_t attributes{owner.engine().resource()};
-            cat::rows_t remote_columns{owner.engine().resource()};
-            if (command.include_schema) {
-                attributes = read(cat::attributes_sql);
-                remote_columns = read(cat::remote_columns_sql);
-            }
-            auto listed = cat::list_tables(owner.engine().resource(),
-                                           command,
-                                           namespaces,
-                                           classes,
-                                           command.include_schema ? &attributes : nullptr,
-                                           remote_tables,
-                                           command.include_schema ? &remote_columns : nullptr);
-            INFO((listed.has_error() ? listed.error().what.c_str() : "ok"));
-            REQUIRE_FALSE(listed.has_error());
-            return std::move(listed.value());
-        }
-
-        // Sorted "<catalog>.<schema>.<table>" of every listed table.
-        std::vector<std::string> names(const cat::get_tables_command_t& command) {
             std::vector<std::string> out;
-            for (const auto& table : tables(command)) {
-                out.push_back(table.name.database.t + "." + table.name.schema.t + "." + table.name.collection.t);
+            for (const auto& chunk : cursor->chunks()) {
+                for (std::uint64_t row = 0; row < chunk.size(); ++row) {
+                    std::string name;
+                    for (std::uint64_t column = 0; column < 4; ++column) {
+                        name += (column ? "." : "") + std::string{chunk.data[column].get_value<std::string_view>(row)};
+                    }
+                    out.push_back(std::move(name));
+                }
             }
             std::sort(out.begin(), out.end());
             return out;
@@ -231,40 +208,6 @@ TEST_CASE("escape_sql_literal: apostrophes are doubled on every backend") {
     }
 }
 
-// ── GetTables ────────────────────────────────────────────────────────────────
-// A remote table is listed as the backend spells it, a local one under its
-// database with an empty schema; the federation metadata tables are hidden. The
-// GetTables filters are the Flight SQL frontend's, applied over the listing
-// (tests/system/test_flightsql_metadata.cpp).
-
-TEST_CASE("catalog GetTables: local tables are listed beside the remote ones") {
-    catalog_stack fx("test_catalog_get_tables_local", two_pg());
-    REQUIRE_FALSE(fx.owner.engine().sql("CREATE DATABASE loc;")->is_error());
-    REQUIRE_FALSE(fx.owner.engine().sql("CREATE TABLE loc.items (id bigint, label string);")->is_error());
-
-    cat::get_tables_command_t command;
-    REQUIRE(fx.names(command) ==
-            std::vector<std::string>{"crmdb.sales.customers", "loc..items", "pgdb.public.orders"});
-}
-
-TEST_CASE("catalog GetTables: include_schema attaches the discovered columns") {
-    config::ConnectionsConfig connections;
-    connections.postgresql.push_back(pg_connection("shop", "pgdb", "public", "orders"));
-    catalog_stack fx("test_catalog_include_schema", connections);
-
-    cat::get_tables_command_t command;
-    command.include_schema = true;
-    auto listed = fx.tables(command);
-    REQUIRE(listed.size() == 1);
-    const auto& schema = listed.front().schema;
-    REQUIRE(schema.type() == components::types::logical_type::STRUCT);
-    REQUIRE(schema.child_types().size() == 2);
-    CHECK(schema.child_types()[0].alias() == "id");
-    CHECK(schema.child_types()[0].type() == components::types::logical_type::INTEGER);
-    CHECK(schema.child_types()[1].alias() == "name");
-    CHECK(schema.child_types()[1].type() == components::types::logical_type::STRING_LITERAL);
-}
-
 // ── startup discovery error paths ────────────────────────────────────────────
 // A connection whose discovery fails is not kept (the connector manager drops
 // it) and records nothing; the server still starts.
@@ -272,9 +215,11 @@ TEST_CASE("catalog GetTables: include_schema attaches the discovered columns") {
 namespace {
 
     void require_left_out(catalog_stack& fx, const std::string& alias) {
-        REQUIRE_FALSE(fx.owner.remote().clickhouse_connectors().hasConnection(alias));
-        REQUIRE(fx.owner.remote().discovered().empty());
-        REQUIRE(fx.names(cat::get_tables_command_t{}).empty());
+        REQUIRE(fx.owner.remote().actor(alias) != nullptr);
+        for (const auto& discovery : fx.owner.remote().discovered()) {
+            REQUIRE_FALSE(discovery.discovered);
+        }
+        REQUIRE(fx.names().empty());
     }
 
 } // namespace
@@ -293,13 +238,16 @@ TEST_CASE("catalog discovery: a column-less ClickHouse header block records noth
     require_left_out(fx, "ev_alias");
 }
 
-// A recorded column is defined by its name: a column the backend answers
-// without one fails the connection's discovery.
+// A registered column is defined by its name: a table whose discovery answers
+// a column without one is left out of the catalog. The discovery itself
+// answered, so the connection stays open (its other tables would register).
 TEST_CASE("catalog discovery: a discovered column without a name records nothing") {
     config::ConnectionsConfig connections;
     connections.clickhouse.push_back(ch_events("ev_alias", "ev"));
     catalog_stack fx("test_catalog_ch_unnamed", connections, &ch_unnamed_column_factory);
-    require_left_out(fx, "ev_alias");
+    REQUIRE(fx.owner.remote().discovered().size() == 1);
+    REQUIRE(fx.owner.remote().discovered().front().discovered);
+    REQUIRE(fx.names().empty());
 }
 
 TEST_CASE("catalog discovery: a ClickHouse connection without a database is refused before probing") {
@@ -311,60 +259,74 @@ TEST_CASE("catalog discovery: a ClickHouse connection without a database is refu
     require_left_out(fx, "nodb");
 }
 
-TEST_CASE("catalog discovery: a PostgreSQL connection without a schema is discovered under public") {
+// No `schema:` is every user schema of the database. The mock's
+// information_schema listing answers one table, `public`.`table`, so the
+// connection names no table (every table of every user schema).
+TEST_CASE("catalog discovery: a PostgreSQL connection without a schema registers every user schema") {
     config::ConnectionsConfig connections;
-    connections.postgresql.push_back(pg_connection("noschema", "pgdb", "", "orders"));
+    connections.postgresql.push_back(pg_connection("noschema", "pgdb", "", ""));
     catalog_stack fx("test_catalog_pg_noschema", connections);
-    REQUIRE(fx.names(cat::get_tables_command_t{}) == std::vector<std::string>{"pgdb.public.orders"});
-    auto read = otterstax::test::run_session_sql_payload(fx.owner.stack(), 1, "SELECT * FROM noschema.pgdb.public.orders;");
+    REQUIRE(fx.names() == std::vector<std::string>{"noschema.pgdb.public.table"});
+    auto read =
+        otterstax::test::run_session_sql_payload(fx.owner.stack(), 1, "SELECT * FROM noschema.pgdb.public.\"table\";");
     INFO((read.has_error() ? read.error().what.c_str() : "ok"));
     REQUIRE_FALSE(read.has_error());
     REQUIRE(read.value().size() == 2);
 }
 
 // ── owned database names ─────────────────────────────────────────────────────
-// A connection uid (an engine database of that name would capture the
-// connection's remote names), the kafka object database and the federation
-// metadata database. Unquoted identifiers reach the engine lower-cased, so the
-// match ignores case.
+// A connection of config.yaml (a local database of that name would read like
+// the connection) and OtterStax's own database. Unquoted identifiers reach the engine lower-cased, so the
+// match ignores case. `kafka` is not owned: the Kafka objects are the schema main.kafka.
 
-TEST_CASE("catalog check_database_ownership: connection uids, kafka and federation are owned names") {
+TEST_CASE("catalog check_database_ownership: connection uids and federation are owned names") {
     config::ConnectionsConfig connections;
     connections.postgresql.push_back(pg_connection("PgAlias", "pgdb", "public", "orders"));
     catalog_stack fx("test_catalog_ownership", connections);
     auto* resource = fx.owner.engine().resource();
+    const auto aliases = fx.owner.remote().aliases();
 
-    for (const char* owned : {"PgAlias", "pgalias", "PGALIAS", "kafka", "KAFKA", "federation", "Federation"}) {
+    for (const char* owned : {"PgAlias", "pgalias", "PGALIAS", "federation", "Federation"}) {
         INFO("database name = " << owned);
-        auto verdict = cat::check_database_ownership(resource, owned);
+        auto verdict = cat::check_database_ownership(resource, owned, aliases);
         REQUIRE(verdict.contains_error());
         REQUIRE(verdict.type == core::error_code_t::invalid_parameter);
     }
     // The owner is named in the configured spelling.
-    CHECK(std::string{cat::check_database_ownership(resource, "pgalias").what.c_str()} ==
+    CHECK(std::string{cat::check_database_ownership(resource, "pgalias", aliases).what.c_str()} ==
           "database 'pgalias' is owned by connection 'PgAlias'");
 
-    REQUIRE_FALSE(cat::check_database_ownership(resource, "orders").contains_error());
-    REQUIRE_FALSE(cat::check_database_ownership(resource, "pgdb").contains_error());
+    REQUIRE_FALSE(cat::check_database_ownership(resource, "orders", aliases).contains_error());
+    REQUIRE_FALSE(cat::check_database_ownership(resource, "pgdb", aliases).contains_error());
+    REQUIRE_FALSE(cat::check_database_ownership(resource, "kafka", aliases).contains_error());
 }
 
 // ── remote DDL ───────────────────────────────────────────────────────────────
-// DDL never reaches the engine's host hooks, so a DDL statement naming a remote
-// table runs on its backend directly (the generated statement) and the
-// federation metadata follows: a dropped table's rows go.
+// A DROP TABLE of a connection's table is otterbrix's DDL plan: the backend
+// actor runs the backend's DROP at the COMMIT, the catalog's rows go with it.
 
-TEST_CASE("catalog remote DDL: DROP TABLE runs on the backend and takes the table out of the metadata") {
+TEST_CASE("catalog remote DDL: DROP TABLE runs on the backend and takes the table out of the catalog") {
     catalog_stack fx("test_catalog_remote_drop", two_pg());
     const auto s = fx.owner.stack();
+    REQUIRE(fx.names() == std::vector<std::string>{"crm.crmdb.sales.customers", "shop.pgdb.public.orders"});
 
     auto dropped = otterstax::test::run_session_sql_payload(s, 1, "DROP TABLE shop.pgdb.public.orders;");
     INFO((dropped.has_error() ? dropped.error().what.c_str() : "ok"));
     REQUIRE_FALSE(dropped.has_error());
-    REQUIRE(fx.names(cat::get_tables_command_t{}) == std::vector<std::string>{"crmdb.sales.customers"});
+    REQUIRE(fx.names() == std::vector<std::string>{"crm.crmdb.sales.customers"});
 
-    // A table the metadata never held: the statement still goes to the backend.
+    // A table the catalog never registered is a miss: the session discovers
+    // it on its connection (the mock backend answers every table it is asked
+    // about), registers it and runs the DROP once more — the backend drops it
+    // and the catalog keeps nothing of it.
     auto unknown = otterstax::test::run_session_sql_payload(s, 2, "DROP TABLE crm.crmdb.sales.never_discovered;");
     INFO((unknown.has_error() ? unknown.error().what.c_str() : "ok"));
     REQUIRE_FALSE(unknown.has_error());
-    REQUIRE(fx.names(cat::get_tables_command_t{}) == std::vector<std::string>{"crmdb.sales.customers"});
+    REQUIRE(fx.names() == std::vector<std::string>{"crm.crmdb.sales.customers"});
+
+    // A four-part name whose first part is no connection of config.yaml is
+    // not discovered: otterbrix's "does not exist".
+    auto foreign = otterstax::test::run_session_sql_payload(s, 3, "DROP TABLE nowhere.crmdb.sales.customers;");
+    REQUIRE(foreign.has_error());
+    REQUIRE(fx.names() == std::vector<std::string>{"crm.crmdb.sales.customers"});
 }

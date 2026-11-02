@@ -6,12 +6,9 @@
 // tables discovered at startup into the federation metadata), and a real engine
 // that reads the remote tables through the federation — each failure site's
 // error text, an empty and a multi-chunk result, a JOIN over two servers — plus
-// the sequence-root unwrap of the engine describe.
+// the engine's describe of a prepare.
 
-#include "integration/clickhouse/connection_manager.hpp"
-#include "integration/postgresql/connection_manager.hpp"
-#include "integration/sql/connection_manager.hpp"
-#include "otterbrix/operators/engine_requests.hpp"
+#include "../mock/cell.hpp"
 #include "session/session_payload.hpp"
 
 #include "../mock/ch_db_connector.hpp"
@@ -70,8 +67,8 @@ TEST_CASE("pipeline: a remote SELECT runs through the MySQL backend and the engi
     // The backend's rows, read by the remote table's scan, are what the engine answers.
     const auto& chunk = sp.chunks.front();
     REQUIRE(chunk.column_count() == 2);
-    REQUIRE(chunk.value(0, 0).value<int32_t>() == 1);
-    REQUIRE(chunk.value(1, 1).value<std::string_view>() == "name_1");
+    REQUIRE(otterstax::test::cell(chunk, 0, 0).value<int32_t>() == 1);
+    REQUIRE(otterstax::test::cell(chunk, 1, 1).value<std::string_view>() == "name_1");
 }
 
 TEST_CASE("pipeline: a connector failure keeps the connector's message") {
@@ -118,7 +115,7 @@ TEST_CASE("pipeline: a JOIN over two servers reads each through the federation a
     // Each mock discovered its table `table` (id, name) and answers rows
     // (1, name_0), (2, name_1).
     auto r = execute(owner.stack(),
-                     "SELECT c.id, p.name FROM campaigns.db.\"table\" c JOIN products.pgdb.public.\"table\" p "
+                     "SELECT c.id, p.name FROM campaigns.db.public.\"table\" c JOIN products.pgdb.public.\"table\" p "
                      "ON c.id = p.id;");
     INFO((r.has_error() ? r.error().what.c_str() : ""));
     REQUIRE_FALSE(r.has_error());
@@ -158,101 +155,57 @@ TEST_CASE("pipeline: a multi-chunk result carries all rows through the session")
     for (const auto& chunk : sp.chunks) {
         REQUIRE(chunk.column_count() == 2);
         for (size_t r_idx = 0; r_idx < chunk.size(); ++r_idx, ++row) {
-            REQUIRE(chunk.value(0, r_idx).value<int64_t>() == static_cast<int64_t>(row + 1));
-            REQUIRE(chunk.value(1, r_idx).value<std::string_view>() == "name_" + std::to_string(row));
+            REQUIRE(otterstax::test::cell(chunk, 0, r_idx).value<int64_t>() == static_cast<int64_t>(row + 1));
+            REQUIRE(otterstax::test::cell(chunk, 1, r_idx).value<std::string_view>() == "name_" + std::to_string(row));
         }
     }
     REQUIRE(row == N);
 }
 
 // ---------------------------------------------------------------------------
-// The engine describe (otterstax::engine::describe) of a parsed statement: the
-// parser hands over the bare consumer, and an aggregate root answers its
-// columns while any other root answers no schema.
+// The describe of a prepare (query_session_t::prepare_schema): the engine's
+// own (explain_type::describe) — the result columns named and typed as a run
+// answers them, the type of every `$n`, none for a statement without rows, a
+// table of a connection typed from its catalog rows without a backend round
+// trip.
 // ---------------------------------------------------------------------------
 
-namespace {
+TEST_CASE("describe: a SELECT is described by the engine, its parameters typed") {
+    session_stack_owner owner(otterstax::test::unique_test_dir("/tmp/otterstax_describe_local"));
+    const auto s = owner.stack();
+    std::string err;
+    REQUIRE(otterstax::test::run_session_sql(s, 1, "CREATE DATABASE db1;", err));
+    REQUIRE(otterstax::test::run_session_sql(s,
+                                             2,
+                                             "CREATE TABLE db1.public.campaigns (campaign_id BIGINT, campaign_name "
+                                             "STRING, budget DOUBLE);",
+                                             err));
 
-    otterstax::engine::describe_answer_t describe(otterstax::test::test_engine_t& engine,
-                                                  std::pmr::map<qualified_name_t, size_t> dependencies,
-                                                  ParsedQueryDataPtr data) {
-        return engine.drive(otterstax::engine::describe(engine.resource(),
-                                                        engine.dispatcher(),
-                                                        engine.session(),
-                                                        std::move(dependencies),
-                                                        std::move(data)));
-    }
-
-} // namespace
-
-TEST_CASE("engine describe: a SELECT resolves columns") {
-    otterstax::test::test_engine_t engine("/tmp/otterstax_seq_get_schema");
-    engine.remove_on_exit();
-    auto* resource = engine.resource();
-
-    {
-        // Local engine table the describe's dependency probe resolves against.
-        auto db_cursor = engine.sql("CREATE DATABASE db1;");
-        REQUIRE(db_cursor);
-        REQUIRE_FALSE(db_cursor->is_error());
-        auto create_cursor = engine.sql("CREATE TABLE db1.campaigns (campaign_id INT, campaign_name STRING, budget DOUBLE);");
-        REQUIRE(create_cursor);
-        REQUIRE_FALSE(create_cursor->is_error());
-    }
-
-    GreenplumParser parser(resource);
-    auto parsed = parser.parse("SELECT campaign_name, budget FROM db1.campaigns;");
-    REQUIRE_FALSE(parsed.has_error());
-    auto data = std::move(parsed.value());
-
-    // The parser hands over the bare consumer.
-    const auto& root = data->otterbrix_params->node;
-    REQUIRE(root->type() == logical_plan::node_type::aggregate_t);
-
-    std::pmr::map<qualified_name_t, size_t> dependencies(resource);
-    dependencies.emplace(root->target(), 0);
-
-    auto result = describe(engine, std::move(dependencies), std::move(data));
-    INFO((result.has_error() ? result.error().what.c_str() : ""));
-    REQUIRE_FALSE(result.has_error());
-    auto [cursor, returned] = std::move(result.value());
-    REQUIRE(cursor);
-    REQUIRE_FALSE(cursor->is_error());
-    // Exactly one schema, for the aggregate root.
-    REQUIRE(cursor->size() == 1);
-    const auto& schema = cursor->type_data()[0];
+    auto described = prepare_session_sql(s, 3, "SELECT campaign_name, budget FROM db1.public.campaigns WHERE campaign_id = $1;");
+    INFO((described.has_error() ? described.error().what.c_str() : ""));
+    REQUIRE_FALSE(described.has_error());
+    const auto& schema = described.value().schema;
     REQUIRE(schema.type() == types::logical_type::STRUCT);
-    // The schema lists the SELECT-list columns by name, in statement order.
     REQUIRE(schema.child_types().size() == 2);
-    REQUIRE(schema.child_types()[0].alias() == "campaign_name");
-    REQUIRE(schema.child_types()[1].alias() == "budget");
-    // The probe resolves the column types, not only their names.
-    REQUIRE(schema.child_types()[0].type() == types::logical_type::STRING_LITERAL);
-    REQUIRE(schema.child_types()[1].type() == types::logical_type::DOUBLE);
+    CHECK(schema.child_types()[0].alias() == "campaign_name");
+    CHECK(schema.child_types()[0].type() == types::logical_type::STRING_LITERAL);
+    CHECK(schema.child_types()[1].alias() == "budget");
+    CHECK(schema.child_types()[1].type() == types::logical_type::DOUBLE);
+    REQUIRE(described.value().parameter_count == 1);
+    REQUIRE(described.value().parameter_types.size() == 1);
+    CHECK(described.value().parameter_types[0].type() == types::logical_type::BIGINT);
 }
 
-TEST_CASE("engine describe: non-aggregate plans keep the empty-schema contract") {
-    otterstax::test::test_engine_t engine("/tmp/otterstax_seq_get_schema_empty");
-    engine.remove_on_exit();
-    auto* resource = engine.resource();
-    GreenplumParser parser(resource);
-
-    SECTION("non-aggregate root -> empty schema, no error") {
-        auto parsed = parser.parse("CREATE DATABASE describe_only;");
-        REQUIRE_FALSE(parsed.has_error());
-        auto data = std::move(parsed.value());
-        REQUIRE(data->otterbrix_params->node->type() != logical_plan::node_type::aggregate_t);
-
-        auto result = describe(engine, std::pmr::map<qualified_name_t, size_t>(resource), std::move(data));
-        REQUIRE_FALSE(result.has_error());
-        auto [cursor, returned] = std::move(result.value());
-        REQUIRE(cursor);
-        REQUIRE_FALSE(cursor->is_error());
-        REQUIRE(cursor->size() == 0);
-    }
+TEST_CASE("describe: a statement without rows has no schema") {
+    session_stack_owner owner(otterstax::test::unique_test_dir("/tmp/otterstax_describe_empty"));
+    const auto s = owner.stack();
+    auto described = prepare_session_sql(s, 1, "CREATE DATABASE describe_only;");
+    REQUIRE_FALSE(described.has_error());
+    CHECK(described.value().schema.type() != types::logical_type::STRUCT);
+    CHECK(described.value().parameter_types.empty());
 }
 
-TEST_CASE("engine describe: a remote SELECT resolves the declared columns") {
+TEST_CASE("describe: a SELECT of a connection's table is typed from its catalog rows") {
     stack_options_t options;
     options.connections.postgresql.push_back(config::PgConnectionDesc{.alias = "products",
                                                                       .host = "localhost",
@@ -261,30 +214,17 @@ TEST_CASE("engine describe: a remote SELECT resolves the declared columns") {
                                                                       .password = "pass",
                                                                       .database = "pgdb",
                                                                       .schema = "public"});
-    session_stack_owner owner("/tmp/test_describe_seq_remote", options);
-    auto& engine = owner.engine();
-    auto* resource = engine.resource();
+    session_stack_owner owner(otterstax::test::unique_test_dir("/tmp/test_describe_seq_remote"), options);
+    const auto s = owner.stack();
 
-    GreenplumParser parser(resource);
-    auto parsed = parser.parse("SELECT id, name FROM products.pgdb.public.\"table\";");
-    REQUIRE_FALSE(parsed.has_error());
-    auto data = std::move(parsed.value());
-    REQUIRE(data->otterbrix_params->node->type() == logical_plan::node_type::aggregate_t);
-
-    std::pmr::map<qualified_name_t, size_t> dependencies(resource);
-    dependencies.emplace(data->otterbrix_params->node->target(), 0);
-    auto result = describe(engine, std::move(dependencies), std::move(data));
-    INFO((result.has_error() ? result.error().what.c_str() : ""));
-    REQUIRE_FALSE(result.has_error());
-    auto [cursor, returned] = std::move(result.value());
-    REQUIRE(cursor);
-    REQUIRE_FALSE(cursor->is_error());
-    REQUIRE(cursor->size() == 1);
-    const auto& schema = cursor->type_data()[0];
+    auto described = prepare_session_sql(s, 1, "SELECT id, name FROM products.pgdb.public.\"table\";");
+    INFO((described.has_error() ? described.error().what.c_str() : ""));
+    REQUIRE_FALSE(described.has_error());
+    const auto& schema = described.value().schema;
     REQUIRE(schema.type() == types::logical_type::STRUCT);
     REQUIRE(schema.child_types().size() == 2);
-    REQUIRE(schema.child_types()[0].alias() == "id");
-    REQUIRE(schema.child_types()[0].type() == types::logical_type::INTEGER);
-    REQUIRE(schema.child_types()[1].alias() == "name");
-    REQUIRE(schema.child_types()[1].type() == types::logical_type::STRING_LITERAL);
+    CHECK(schema.child_types()[0].alias() == "id");
+    CHECK(schema.child_types()[0].type() == types::logical_type::INTEGER);
+    CHECK(schema.child_types()[1].alias() == "name");
+    CHECK(schema.child_types()[1].type() == types::logical_type::STRING_LITERAL);
 }

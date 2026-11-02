@@ -206,7 +206,7 @@ TEST_CASE("flight tickets: another client's ticket is not found and stays for it
 TEST_CASE("flight prepared handles: random unique handles that only their creator can use") {
     otterstax::test::session_stack_owner owner(otterstax::test::unique_test_dir("otterstax_flight_handles"));
     auto engine = std::make_unique<flight::engine::SessionEngine>(owner.sessions(), owner.engine().resource());
-    REQUIRE(engine->execute_update("CREATE DATABASE fh") == 0);
+    REQUIRE(engine->execute_update("CREATE SCHEMA fh") == 0);
     REQUIRE(engine->execute_update("CREATE TABLE fh.t (id bigint)") == 0);
     FlightSqlCore core(flight::core::AuthService::anonymous(), std::move(engine));
 

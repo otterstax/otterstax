@@ -30,11 +30,8 @@ namespace frontend::mysql {
 
     mysql_connection::prepared_stmt_meta::prepared_stmt_meta(std::pmr::memory_resource* resource,
                                                              otterstax::session::statement_id_t stmt_session,
-                                                             std::string sql,
                                                              uint32_t parameter_count)
         : stmt_session(stmt_session)
-        , sql(sql.c_str(), sql.size(), resource)
-        , consumed(false)
         , parameter_count(parameter_count)
         , param_types(resource) {}
 
@@ -140,6 +137,8 @@ namespace frontend::mysql {
             case connection_state::COMMAND:
                 handle_command(std::move(payload));
                 break;
+            case connection_state::HANDSHAKE:
+                break; // refused by the first switch above
         }
     }
 

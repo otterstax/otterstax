@@ -11,6 +11,7 @@
 // the width its precision needs.
 
 #include <components/types/types.hpp>
+#include <components/vector/vector.hpp>
 
 #include <cstdint>
 #include <optional>
@@ -60,24 +61,24 @@ namespace tsl {
         return t.type() == logical_type::DECIMAL || t.type() == logical_type::HUGEINT;
     }
 
-    // The unscaled integer a decimal128 slot carries: the engine keeps a
-    // DECIMAL's unscaled integer at the width its precision needs, so it is
-    // read back at that same width and sign-extended; a HUGEINT is already
-    // 128 bits wide. A storage width no carrier reads answers nullopt — the
-    // caller reports it in its own error shape.
-    inline std::optional<components::types::int128_t>
-    read_unscaled_decimal(const components::types::complex_logical_type& type,
-                          const components::types::logical_value_t& value) {
+    // The unscaled integer a decimal128 slot carries: row `row` of `column`
+    // (not NULL). The engine keeps a DECIMAL's unscaled integer at the width
+    // its precision needs, so it is read back at that same width and
+    // sign-extended; a HUGEINT is already 128 bits wide. A storage width no
+    // carrier reads answers nullopt — the caller reports it in its own error
+    // shape.
+    inline std::optional<components::types::int128_t> read_unscaled_decimal(const components::vector::vector_t& column,
+                                                                             std::uint64_t row) {
         using namespace components::types;
-        switch (type.to_physical_type()) {
+        switch (column.type().to_physical_type()) {
             case physical_type::INT16:
-                return static_cast<int128_t>(value.value<std::int16_t>());
+                return static_cast<int128_t>(column.get_value<std::int16_t>(row));
             case physical_type::INT32:
-                return static_cast<int128_t>(value.value<std::int32_t>());
+                return static_cast<int128_t>(column.get_value<std::int32_t>(row));
             case physical_type::INT64:
-                return static_cast<int128_t>(value.value<std::int64_t>());
+                return static_cast<int128_t>(column.get_value<std::int64_t>(row));
             case physical_type::INT128:
-                return value.value<int128_t>();
+                return column.get_value<int128_t>(row);
             default:
                 return std::nullopt;
         }

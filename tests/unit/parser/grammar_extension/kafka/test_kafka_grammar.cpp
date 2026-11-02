@@ -35,8 +35,24 @@ namespace {
         return registry;
     }
 
+    // The statement's tree; a refused statement fails the test.
+    List* parsed(core::result_wrapper_t<List*> tree) {
+        REQUIRE_FALSE(tree.has_error());
+        return tree.value();
+    }
+
+    List* parsed_raw(std::pmr::memory_resource* resource,
+                     const char* sql,
+                     const parser_extension_registry_t& registry) {
+        return parsed(raw_parser(resource, sql, registry));
+    }
+
     const kafka_grammar::kafka_stmt* kafka_stmt(List* tree) {
         return extension_payload<kafka_grammar::kafka_stmt>(tree, "kafka");
+    }
+
+    const kafka_grammar::kafka_stmt* kafka_stmt(core::result_wrapper_t<List*> tree) {
+        return kafka_stmt(parsed(std::move(tree)));
     }
 
     std::vector<const kafka_grammar::column_def*> columns(const kafka_grammar::kafka_stmt* stmt) {
@@ -224,12 +240,12 @@ TEST_CASE("kafka grammar: a DROP with a bad drop behaviour is refused") {
     auto registry = kafka_registry();
     std::pmr::monotonic_buffer_resource arena(std::pmr::new_delete_resource());
 
-    CHECK_THROWS_AS(raw_parser(&arena, "DROP SOURCE orders CASCADES", registry), parser_exception_t);
-    CHECK_THROWS_AS(raw_parser(&arena, "DROP SOURCE orders CASCADE RESTRICT", registry), parser_exception_t);
-    CHECK_THROWS_AS(raw_parser(&arena, "DROP SOURCE orders RESTRICT CASCADE", registry), parser_exception_t);
-    CHECK_THROWS_AS(raw_parser(&arena, "DROP STREAM orders CASCADE CASCADE", registry), parser_exception_t);
-    CHECK_THROWS_AS(raw_parser(&arena, "DROP STREAM orders FORCE", registry), parser_exception_t);
-    CHECK_THROWS_AS(raw_parser(&arena, "DROP STREAM CASCADE IF EXISTS orders", registry), parser_exception_t);
+    CHECK(raw_parser(&arena, "DROP SOURCE orders CASCADES", registry).has_error());
+    CHECK(raw_parser(&arena, "DROP SOURCE orders CASCADE RESTRICT", registry).has_error());
+    CHECK(raw_parser(&arena, "DROP SOURCE orders RESTRICT CASCADE", registry).has_error());
+    CHECK(raw_parser(&arena, "DROP STREAM orders CASCADE CASCADE", registry).has_error());
+    CHECK(raw_parser(&arena, "DROP STREAM orders FORCE", registry).has_error());
+    CHECK(raw_parser(&arena, "DROP STREAM CASCADE IF EXISTS orders", registry).has_error());
 }
 
 TEST_CASE("kafka grammar: keywords are case-insensitive") {
@@ -248,13 +264,13 @@ TEST_CASE("kafka grammar: non-kafka SQL is not claimed") {
     std::pmr::monotonic_buffer_resource arena(std::pmr::new_delete_resource());
 
     SECTION("plain SELECT stays core") {
-        auto* tree = raw_parser(&arena, "SELECT * FROM t;", registry);
+        auto* tree = parsed(raw_parser(&arena, "SELECT * FROM t;", registry));
         CHECK(nodeTag(linitial(tree)) == T_SelectStmt);
         CHECK(kafka_stmt(tree) == nullptr);
     }
 
     SECTION("CREATE TABLE stays core (no collision with our grammar)") {
-        auto* tree = raw_parser(&arena, "CREATE TABLE t (a INT)", registry);
+        auto* tree = parsed(raw_parser(&arena, "CREATE TABLE t (a INT)", registry));
         CHECK(kafka_stmt(tree) == nullptr);
     }
 }
@@ -263,12 +279,11 @@ TEST_CASE("kafka grammar: malformed kafka statements raise a parse error") {
     auto registry = kafka_registry();
     std::pmr::monotonic_buffer_resource arena(std::pmr::new_delete_resource());
 
-    CHECK_THROWS_AS(raw_parser(&arena, "CREATE SOURCE orders", registry), parser_exception_t);
-    CHECK_THROWS_AS(raw_parser(&arena, "CREATE STREAM s", registry), parser_exception_t);
-    CHECK_THROWS_AS(raw_parser(&arena, "CREATE SOURCE s (a INT)", registry), parser_exception_t); // no WITH
+    CHECK(raw_parser(&arena, "CREATE SOURCE orders", registry).has_error());
+    CHECK(raw_parser(&arena, "CREATE STREAM s", registry).has_error());
+    CHECK(raw_parser(&arena, "CREATE SOURCE s (a INT)", registry).has_error()); // no WITH
     // unknown column type rejected by the semantic guard in kafka_ext::parse
-    CHECK_THROWS_AS(raw_parser(&arena, "CREATE SOURCE s (a FOOBAR) WITH (KAFKA_TOPIC='t')", registry),
-                    parser_exception_t);
+    CHECK(raw_parser(&arena, "CREATE SOURCE s (a FOOBAR) WITH (KAFKA_TOPIC='t')", registry).has_error());
 }
 
 TEST_CASE("kafka grammar: only JSON-ingestible column types are accepted") {
@@ -297,19 +312,16 @@ TEST_CASE("kafka grammar: only JSON-ingestible column types are accepted") {
     CHECK_FALSE(map_column_type("uuid").has_value());
     CHECK_FALSE(map_column_type("timestamp").has_value());
 
-    CHECK_THROWS_AS(raw_parser(&arena, "CREATE SOURCE s (a SMALLINT) WITH (KAFKA_TOPIC='t')", registry),
-                    parser_exception_t);
-    CHECK_THROWS_AS(raw_parser(&arena, "CREATE SOURCE s (a FLOAT) WITH (KAFKA_TOPIC='t')", registry),
-                    parser_exception_t);
-    CHECK_THROWS_AS(raw_parser(&arena, "CREATE SOURCE s (a UUID) WITH (KAFKA_TOPIC='t')", registry),
-                    parser_exception_t);
+    CHECK(raw_parser(&arena, "CREATE SOURCE s (a SMALLINT) WITH (KAFKA_TOPIC='t')", registry).has_error());
+    CHECK(raw_parser(&arena, "CREATE SOURCE s (a FLOAT) WITH (KAFKA_TOPIC='t')", registry).has_error());
+    CHECK(raw_parser(&arena, "CREATE SOURCE s (a UUID) WITH (KAFKA_TOPIC='t')", registry).has_error());
 }
 
 TEST_CASE("kafka grammar: transform lowers to a kafka_node_t") {
     auto registry = kafka_registry();
     std::pmr::monotonic_buffer_resource arena(std::pmr::new_delete_resource());
 
-    auto* node = reinterpret_cast<Node*>(linitial(raw_parser(&arena,
+    auto* node = reinterpret_cast<Node*>(linitial(parsed_raw(&arena,
                                                              "CREATE SOURCE orders (id BIGINT, note VARCHAR) "
                                                              "WITH (KAFKA_TOPIC='orders_topic', value_format='JSON')",
                                                              registry)));
@@ -350,7 +362,7 @@ TEST_CASE("kafka grammar: transform folds identifiers, preserves topic case") {
     std::pmr::monotonic_buffer_resource arena(std::pmr::new_delete_resource());
 
     auto* node = reinterpret_cast<Node*>(linitial(
-        raw_parser(&arena, "CREATE SOURCE OrDeRs (Id BIGINT, Amount DOUBLE) WITH (Kafka_Topic='MyTopic')", registry)));
+        parsed_raw(&arena, "CREATE SOURCE OrDeRs (Id BIGINT, Amount DOUBLE) WITH (Kafka_Topic='MyTopic')", registry)));
     REQUIRE(nodeTag(node) == T_ExtensionNode);
 
     components::sql::transform::transformer tr(&arena, nullptr, &registry);
@@ -378,7 +390,7 @@ TEST_CASE("kafka grammar: transform of a DROP node") {
     auto registry = kafka_registry();
     std::pmr::monotonic_buffer_resource arena(std::pmr::new_delete_resource());
 
-    auto* node = reinterpret_cast<Node*>(linitial(raw_parser(&arena, "DROP STREAM IF EXISTS s", registry)));
+    auto* node = reinterpret_cast<Node*>(linitial(parsed_raw(&arena, "DROP STREAM IF EXISTS s", registry)));
     REQUIRE(nodeTag(node) == T_ExtensionNode);
 
     components::sql::transform::transformer tr(&arena, nullptr, &registry);
@@ -407,7 +419,7 @@ TEST_CASE("kafka grammar: transform of a DROP ... CASCADE node") {
           std::tuple{"DROP SOURCE s RESTRICT", otterstax::kafka::kafka_op::drop_source, false},
           std::tuple{"DROP STREAM IF EXISTS s CASCADE", otterstax::kafka::kafka_op::drop_stream, true}}) {
         INFO(sql);
-        auto* node = reinterpret_cast<Node*>(linitial(raw_parser(&arena, sql, registry)));
+        auto* node = reinterpret_cast<Node*>(linitial(parsed_raw(&arena, sql, registry)));
         REQUIRE(nodeTag(node) == T_ExtensionNode);
         components::sql::transform::transformer tr(&arena, nullptr, &registry);
         auto result = tr.transform(*node);

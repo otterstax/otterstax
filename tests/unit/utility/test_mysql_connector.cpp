@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2025-2026  OtterStax
 //
-// The real mysql::Connector over the pool the ConnectorManager gives it — a
-// boost::asio::io_context run by N threads — against a fake MySQL server that
+// The real mysql::Connector over a boost::asio::io_context run by N threads
+// (the backend agent runs its own on one thread; a multi-threaded one is the
+// harder case for the deadline's handlers) — against a fake MySQL server that
 // speaks just enough of the wire for boost.mysql's handshake, COM_PING and
 // COM_QUIT. No frontend, no Docker: the fake listens on 127.0.0.1:0 on its own
 // thread.
@@ -25,7 +26,7 @@
 // saw (atomics) and the test thread asserts.
 
 #include "connectors/mysql/connector.hpp"
-#include "connectors/mysql/manager.hpp"
+#include "connectors/mysql/connector.hpp"
 #include "utility/thread_pool_manager.hpp"
 
 #include <catch2/catch_all.hpp>
@@ -335,8 +336,8 @@ namespace {
         return params;
     }
 
-    // The ConnectorManager's pool: hardware_concurrency() threads on one
-    // io_context, never fewer than eight so the race has threads to run on.
+    // hardware_concurrency() threads on one io_context, never fewer than eight
+    // so the race has threads to run on.
     size_t pool_threads() { return std::max<size_t>(8, std::thread::hardware_concurrency()); }
 
     // Enough connects to hit the timed_cancel_op window on the unfixed code
@@ -451,7 +452,7 @@ TEST_CASE("mysql Connector: cancel() aborts a statement the server never answers
     auto connector = mysql::make_mysql_connector(resource, pool.ctx(), params_for(server.port()), "hung");
     REQUIRE_FALSE(connector->connect().contains_error());
 
-    // The statement as ConnectorManager::executeQuery spawns it: its ping is read and never
+    // The statement as a backend agent spawns it: its ping is read and never
     // answered, so the statement waits for good.
     auto handler = [](const boost::mysql::results&) -> otterstax::asio_error_t { return otterstax::asio_error_t{}; };
     auto running = otterstax::spawn_marshaled<otterstax::asio_error_t>(

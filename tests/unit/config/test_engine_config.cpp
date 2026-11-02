@@ -74,7 +74,6 @@ namespace {
         CHECK(runtime.disk.threads == 3);
         CHECK(runtime.sessions.threads == 0);
         CHECK(runtime.backends.threads == 0);
-        CHECK(runtime.connector_io.threads == 0);
         for (const auto* pool : {&runtime.mysql_io, &runtime.postgres_io, &runtime.flight_sql_io, &runtime.spark_connect_io}) {
             CHECK(pool->threads == 0);
         }
@@ -174,24 +173,7 @@ service:
     CHECK(runtime.disk.threads == 1);
     CHECK(runtime.sessions.threads == 16);
     CHECK(runtime.backends.threads == 0);
-    CHECK(runtime.connector_io.threads == 0);
     check_default_engine(loaded.engine);
-}
-
-TEST_CASE("service.runtime: the connector io pools are read") {
-    auto loaded = load_ok(R"(
-service:
-  runtime:
-    connector_io: { threads: 6 }
-)");
-    CHECK(loaded.runtime.connector_io.threads == 6);
-    // The actor-zeta pools keep their defaults.
-    CHECK(loaded.runtime.backends.threads == 0);
-    CHECK(loaded.runtime.general.threads == 3);
-
-    // 0 is auto, as for sessions / backends.
-    auto automatic = load_ok("service:\n  runtime:\n    connector_io: { threads: 0 }\n");
-    CHECK(automatic.runtime.connector_io.threads == 0);
 }
 
 // Every pool of the server comes from config.yaml, the frontends' too.
@@ -209,7 +191,6 @@ service:
     CHECK(loaded.runtime.flight_sql_io.threads == 7);
     CHECK(loaded.runtime.spark_connect_io.threads == 1);
     // The others keep their defaults.
-    CHECK(loaded.runtime.connector_io.threads == 0);
     CHECK(loaded.runtime.sessions.threads == 0);
 
     // One alone overrides only its own; 0 is auto.
@@ -231,10 +212,6 @@ TEST_CASE("service.runtime: invalid pool sizes are invalid_parameter naming the 
         {"service:\n  runtime:\n    sessions: { threads: lots }\n", "service.runtime.sessions.threads"},
         {"service:\n  runtime:\n    sessions: 4\n", "service.runtime.sessions"},
         {"service:\n  runtime: [1, 2]\n", "service.runtime"},
-        {"service:\n  runtime:\n    connector_io: { threads: -1 }\n", "service.runtime.connector_io.threads"},
-        {"service:\n  runtime:\n    connector_io: { threads: 5000 }\n", "service.runtime.connector_io.threads"},
-        {"service:\n  runtime:\n    connector_io: { threads: many }\n", "service.runtime.connector_io.threads"},
-        {"service:\n  runtime:\n    connector_io: 4\n", "service.runtime.connector_io"},
         {"service:\n  runtime:\n    mysql_io: { threads: -1 }\n", "service.runtime.mysql_io.threads"},
         {"service:\n  runtime:\n    postgres_io: { threads: 5000 }\n", "service.runtime.postgres_io.threads"},
         {"service:\n  runtime:\n    flight_sql_io: { threads: some }\n", "service.runtime.flight_sql_io.threads"},

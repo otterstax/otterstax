@@ -6,115 +6,55 @@
 #include "otterbrix/backend_type.hpp"
 
 #include <components/base/collection_full_name.hpp>
+#include <components/types/types.hpp>
 
 #include <array>
 #include <cstddef>
-#include <optional>
+#include <memory_resource>
 #include <string>
 #include <string_view>
+#include <unordered_map>
+#include <vector>
 
-// The layout of the host metadata OtterStax keeps in ordinary engine tables: the remote tables
-// discovered on the servers of config.yaml and their columns. The name resolution hook reads
-// federation.remote_columns (need / decide); catalog/remote_metadata.hpp builds the plans that write
-// both (startup: backends::publish_federation_metadata; a rediscovery: the query session). Both
-// sides take every name and column position from here.
+// What OtterStax keeps of a remote table beside otterbrix's catalog. otterbrix keeps the table itself
+// (pg_database.datconnection, pg_namespace, pg_class, pg_attribute: every name in lower case); the
+// host keeps the backend's own spelling of it in an ordinary table of its own, keyed by otterbrix's
+// oids, which the backend actor answers as host rows of every DDL step (backend_actor.hpp).
 namespace otterstax::federation {
 
-    // The spelling stored in the `backend` columns: "mysql", "postgresql", "clickhouse".
-    std::string_view backend_kind_name(backend_type_t kind) noexcept;
-    std::optional<backend_type_t> parse_backend_kind(std::string_view name) noexcept;
-
+    // The local database of OtterStax's own tables (the Kafka objects' tables live there too).
     inline constexpr std::string_view metadata_database = "federation";
-    inline constexpr std::string_view remote_tables_table = "remote_tables";
-    inline constexpr std::string_view remote_columns_table = "remote_columns";
+    inline constexpr std::string_view metadata_schema = "public";
 
-    // federation.remote_tables: one row per discovered table. The key columns (uid .. table_name) are
-    // the engine-facing name (table_key_t); remote_* keep the backend's own spelling.
-    struct remote_tables_layout {
+    // federation.public.remote_names: the backend's spelling of every remote table and column.
+    //  - a table:  (table_oid, 0, the table's name, the database (MySQL / ClickHouse) or schema
+    //    (PostgreSQL) the table is in on the backend, NULL);
+    //  - a column: (table_oid, attoid, the column's name, NULL, the backend's own type where the
+    //    dialect reads by it — ClickHouse's system.columns type — else NULL).
+    inline constexpr std::string_view remote_names_table = "remote_names";
+
+    struct remote_names_layout {
         enum column : std::size_t
         {
-            uid,
-            database_name,
-            schema_name,
-            table_name,
-            remote_database,
-            remote_schema,
-            remote_table,
-            backend,
+            table_oid,
+            attoid,
+            remote_name,
+            remote_container,
+            remote_type,
             count
         };
-        static constexpr std::array<std::string_view, count> names{"uid",
-                                                                   "database_name",
-                                                                   "schema_name",
-                                                                   "table_name",
-                                                                   "remote_database",
-                                                                   "remote_schema",
-                                                                   "remote_table",
-                                                                   "backend"};
+        static constexpr std::array<std::string_view, count> names{"table_oid",
+                                                                   "attoid",
+                                                                   "remote_name",
+                                                                   "remote_container",
+                                                                   "remote_type"};
     };
 
-    // federation.remote_columns: one row per column of a discovered table. column_name is what the
-    // engine binds (lower case, as an unquoted reference is folded); remote_column is the backend's
-    // spelling, column_type the engine type (otterbrix's type spec), ordinal its 1-based position,
-    // key_position its 1-based position in the table's primary key (0: not a key column; the
-    // storage changes a row the engine picked by these columns). The table's remote spelling is
-    // repeated on every row, so ONE read of this table is everything decide needs to build a
-    // storage (need issues one read per unresolved name).
-    struct remote_columns_layout {
-        enum column : std::size_t
-        {
-            uid,
-            database_name,
-            schema_name,
-            table_name,
-            column_name,
-            remote_column,
-            column_type,
-            ordinal,
-            backend,
-            remote_database,
-            remote_schema,
-            remote_table,
-            key_position,
-            count
-        };
-        static constexpr std::array<std::string_view, count> names{"uid",
-                                                                   "database_name",
-                                                                   "schema_name",
-                                                                   "table_name",
-                                                                   "column_name",
-                                                                   "remote_column",
-                                                                   "column_type",
-                                                                   "ordinal",
-                                                                   "backend",
-                                                                   "remote_database",
-                                                                   "remote_schema",
-                                                                   "remote_table",
-                                                                   "key_position"};
-    };
-
-    // ASCII lower case: the engine folds an unquoted identifier so, and the metadata keys are stored so.
+    // ASCII lower case: otterbrix folds an unquoted identifier so, and every name OtterStax registers
+    // in its catalog is written so.
     std::string fold_identifier(std::string_view name);
 
-    // The engine-facing key of a remote table, lower case. A MySQL or ClickHouse table is named by
-    // its database (the schema slot stays empty); a PostgreSQL table by its schema (the database
-    // slot stays empty: a connection reaches one database, so the slot cannot select another).
-    struct table_key_t {
-        std::string uid;
-        std::string database;
-        std::string schema;
-        std::string table;
-
-        bool operator==(const table_key_t&) const = default;
-    };
-
-    table_key_t make_table_key(backend_type_t kind,
-                               std::string_view uid,
-                               std::string_view database,
-                               std::string_view schema,
-                               std::string_view table);
-
-    // The backend's own spelling of a table, as discovery answered it.
+    // The backend's own spelling of a table.
     struct remote_table_name_t {
         std::string database;
         std::string schema;
@@ -124,5 +64,18 @@ namespace otterstax::federation {
     // A remote table's backend spelling as the generator names a table: database.table for MySQL
     // and ClickHouse, schema.table for PostgreSQL (its connection is bound to one database).
     qualified_name_t generator_name(backend_type_t kind, const remote_table_name_t& table);
+
+    // One table a discovery found on a backend: its full name in the backend's spelling
+    // (connection, database, schema — PostgreSQL's; empty for MySQL / ClickHouse — and table), the
+    // STRUCT of its column types as the input translators produce them (each field named in the
+    // backend's spelling) and, for ClickHouse, the system.columns type of each column by that name:
+    // what a read of the column is held to (ch_to_chunk's declared types).
+    struct discovered_table_t {
+        qualified_name_t name;
+        components::types::complex_logical_type schema;
+        std::unordered_map<std::string, std::string> remote_types{};
+    };
+
+    using discovered_tables_t = std::pmr::vector<discovered_table_t>;
 
 } // namespace otterstax::federation

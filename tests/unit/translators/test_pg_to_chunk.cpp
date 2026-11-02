@@ -8,6 +8,7 @@
 
 #include "otterbrix/translators/input/pg_to_chunk.hpp"
 #include "pg_result_fixture.hpp"
+#include "../../mock/cell.hpp"
 
 #include <catch2/catch_all.hpp>
 
@@ -115,15 +116,15 @@ TEST_CASE("pg_to_chunk: tuples are converted by column type, NULL cells stay NUL
         const auto& chunk = converted.value();
         REQUIRE(chunk.column_count() == 3);
         REQUIRE(chunk.size() == 3);
-        REQUIRE(chunk.value(0, 0).template value<int32_t>() == 1);
-        REQUIRE(chunk.value(1, 0).template value<int64_t>() == 10000000000LL);
-        REQUIRE(chunk.value(2, 0).template value<std::string_view>() == "one");
-        REQUIRE(chunk.value(0, 1).template value<int32_t>() == 2);
-        REQUIRE(chunk.value(1, 1).is_null());
-        REQUIRE(chunk.value(2, 1).template value<std::string_view>() == "two");
-        REQUIRE(chunk.value(0, 2).is_null());
-        REQUIRE(chunk.value(1, 2).template value<int64_t>() == 3);
-        REQUIRE(chunk.value(2, 2).is_null());
+        REQUIRE(otterstax::test::cell(chunk, 0, 0).template value<int32_t>() == 1);
+        REQUIRE(otterstax::test::cell(chunk, 1, 0).template value<int64_t>() == 10000000000LL);
+        REQUIRE(otterstax::test::cell(chunk, 2, 0).template value<std::string_view>() == "one");
+        REQUIRE(otterstax::test::cell(chunk, 0, 1).template value<int32_t>() == 2);
+        REQUIRE(otterstax::test::cell(chunk, 1, 1).is_null());
+        REQUIRE(otterstax::test::cell(chunk, 2, 1).template value<std::string_view>() == "two");
+        REQUIRE(otterstax::test::cell(chunk, 0, 2).is_null());
+        REQUIRE(otterstax::test::cell(chunk, 1, 2).template value<int64_t>() == 3);
+        REQUIRE(otterstax::test::cell(chunk, 2, 2).is_null());
     });
 }
 
@@ -136,7 +137,7 @@ namespace {
     // NUMERIC(p, s)'s type modifier, as PostgreSQL sends it in the row description.
     constexpr int numeric_typmod(int precision, int scale) { return ((precision << 16) | (scale & 0x7ff)) + 4; }
 
-    components::types::int128_t unscaled_of(const logical_value_t& value) {
+    components::types::int128_t unscaled_of(const otterstax::test::cell_t& value) {
         switch (value.type().to_physical_type()) {
             case physical_type::INT16:
                 return value.value<int16_t>();
@@ -176,19 +177,19 @@ TEST_CASE("pg_to_chunk: NUMERIC of at most 38 digits is the engine's DECIMAL of 
             REQUIRE(spec->scale() == specs[col].second);
             REQUIRE(schema.child_types()[col] == types[col]);
         }
-        REQUIRE(unscaled_of(chunk.value(0, 0)) == 123450);
-        REQUIRE(unscaled_of(chunk.value(0, 1)) == -5);
+        REQUIRE(unscaled_of(otterstax::test::cell(chunk, 0, 0)) == 123450);
+        REQUIRE(unscaled_of(otterstax::test::cell(chunk, 0, 1)) == -5);
         const auto* price = types[0].extension_as<decimal_logical_type_extension>();
-        REQUIRE(unscaled_of(chunk.value(0, 2)) == decimal_special::not_a_number(price->stored_as()));
+        REQUIRE(unscaled_of(otterstax::test::cell(chunk, 0, 2)) == decimal_special::not_a_number(price->stored_as()));
         components::types::int128_t wide = 0;
         for (char digit : std::string_view{"12345678901234567890123456780123456789"}) {
             wide = wide * 10 + (digit - '0');
         }
-        REQUIRE(unscaled_of(chunk.value(1, 0)) == wide);
-        REQUIRE(unscaled_of(chunk.value(1, 1)) == -1);
-        REQUIRE(chunk.value(1, 2).is_null());
-        REQUIRE(unscaled_of(chunk.value(2, 0)) == -42);
-        REQUIRE(unscaled_of(chunk.value(2, 2)) == 99999);
+        REQUIRE(unscaled_of(otterstax::test::cell(chunk, 1, 0)) == wide);
+        REQUIRE(unscaled_of(otterstax::test::cell(chunk, 1, 1)) == -1);
+        REQUIRE(otterstax::test::cell(chunk, 1, 2).is_null());
+        REQUIRE(unscaled_of(otterstax::test::cell(chunk, 2, 0)) == -42);
+        REQUIRE(unscaled_of(otterstax::test::cell(chunk, 2, 2)) == 99999);
     });
 }
 
@@ -211,20 +212,20 @@ TEST_CASE("pg_to_chunk: a NUMERIC wider than the engine's DECIMAL is carried as 
             REQUIRE(chunk.types()[col].type() == logical_type::STRING_LITERAL);
             REQUIRE(schema.child_types()[col].type() == logical_type::STRING_LITERAL);
         }
-        REQUIRE(chunk.value(0, 0).value<std::string_view>() == "0.333333333333333333333333");
-        REQUIRE(chunk.value(1, 0).value<std::string_view>() == "123456789012345678901234567890123456789012345678.90");
-        REQUIRE(chunk.value(2, 1).value<std::string_view>() == "-100");
+        REQUIRE(otterstax::test::cell(chunk, 0, 0).value<std::string_view>() == "0.333333333333333333333333");
+        REQUIRE(otterstax::test::cell(chunk, 1, 0).value<std::string_view>() == "123456789012345678901234567890123456789012345678.90");
+        REQUIRE(otterstax::test::cell(chunk, 2, 1).value<std::string_view>() == "-100");
     });
 }
 
 // A NUMERIC(p, s) value the declared DECIMAL cannot hold (a server that broke its own typmod) is a
-// conversion_failure naming the column, never a value cut down to fit.
-TEST_CASE("pg_to_chunk: a NUMERIC value past its declared precision is conversion_failure") {
+// numeric_value_out_of_range naming the column, never a value cut down to fit.
+TEST_CASE("pg_to_chunk: a NUMERIC value past its declared precision is numeric_value_out_of_range") {
     auto* res = std::pmr::new_delete_resource();
     pg_result_guard g(make_tuples_result({{"price", NUMERICOID, numeric_typmod(4, 2)}}, {{"123.45"}}));
     for_both_overloads(res, g.get(), [&](core::result_wrapper_t<components::vector::data_chunk_t>& converted) {
         REQUIRE(converted.has_error());
-        REQUIRE(converted.error().type == core::error_code_t::conversion_failure);
+        REQUIRE(converted.error().type == core::error_code_t::numeric_value_out_of_range);
         REQUIRE(std::string{converted.error().what.c_str()}.find("price") != std::string::npos);
     });
 }

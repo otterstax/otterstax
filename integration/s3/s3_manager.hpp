@@ -3,9 +3,10 @@
 
 #pragma once
 
+#include <components/cursor/cursor.hpp>
 #include <components/log/log.hpp>
+#include <components/vector/data_chunk.hpp>
 
-#include "types/otterbrix.hpp"
 #include "utility/session.hpp"
 #include "utility/tracy_profiler.hpp"
 #include <actor-zeta.hpp>
@@ -18,9 +19,11 @@
 #include <utility>
 
 namespace db {
-    // Streams objects between S3 and the engine, nothing staged on local disk: a load feeds
-    // the connector's input stream to FileManager::add_file, an export has FileManager::dump_file
-    // write into the connector's output stream, committed only once the whole result is written.
+    // Streams objects between S3 and the query session, nothing staged on local disk: a load
+    // feeds the connector's input stream to FileManager::load_file, an export has
+    // FileManager::dump_file write into the connector's output stream, published only once
+    // the whole result is written. No engine work: the session loads the rows and runs
+    // COPY's query on its own engine session.
     class S3Manager final : public actor_zeta::actor::actor_mixin<S3Manager> {
     public:
         using is_cooperative_actor_type = void;
@@ -35,21 +38,22 @@ namespace db {
 
         // Every handler keeps the callee's error code (s3 connector / file
         // manager) and only prefixes the message, so the query session can report the
-        // real cause (do_not_exists, invalid_parameter, io_error, ...).
+        // real cause (the connector's, invalid_parameter, io_error, ...).
 
-        // Loads s3_path ("bucket/key") into a new database.table. `format` is the
-        // statement's WITH (format = ...) — empty picks it from the key's extension.
-        actor_zeta::unique_future<core::result_wrapper_t<std::pair<bool, std::pmr::string>>>
-        download(session_hash_t id, std::string alias, std::string s3_path,
-                 std::string database, std::string table, std::string format);
+        // The object at s3_path ("bucket/key") as a run of chunks of at most
+        // DEFAULT_VECTOR_CAPACITY rows, its columns named, streamed into the file
+        // manager's loader (no local copy). `format` is the statement's
+        // WITH (format = ...) — empty picks it from the key's extension. The query
+        // session loads it.
+        actor_zeta::unique_future<core::result_wrapper_t<std::pmr::vector<components::vector::data_chunk_t>>>
+        download(session_hash_t id, std::string alias, std::string s3_path, std::string format);
 
-        // Executes `statement` and uploads its result to s3_path. The query is
-        // parsed upstream (e.g. the inner SELECT of COPY (...) TO 's3://...').
-        // `format` as for download. The object appears only when the whole result
-        // was written; any failure aborts the upload.
+        // Uploads `rows` (the result of COPY's inner query, which the query session
+        // ran) to s3_path, `format` as for download. The object appears only when the
+        // whole result was written; any failure aborts the upload.
         actor_zeta::unique_future<core::result_wrapper_t<std::pair<bool, std::pmr::string>>>
         upload(session_hash_t id, std::string alias, std::string s3_path,
-               OtterbrixStatementPtr statement, std::string format);
+               components::cursor::cursor_t_ptr rows, std::string format);
 
         actor_zeta::unique_future<core::result_wrapper_t<std::pair<bool, std::pmr::string>>>
         ls(session_hash_t id, std::string alias, std::string s3_path);

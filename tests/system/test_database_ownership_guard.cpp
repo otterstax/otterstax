@@ -1,16 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2025-2026  OtterStax
 //
-// Database-level DDL on a name OtterStax owns: a connection uid of the
-// federation registry (an engine database of that name would capture the
-// connection's remote names before the federation is asked), the kafka object
-// database and the federation metadata database (DROP DATABASE is CASCADE). The
+// Database-level DDL on a name OtterStax owns: a connection of config.yaml (a
+// local database of that name would read like the connection) and OtterStax's
+// own database `federation` (DROP DATABASE is CASCADE; it holds Kafka's
+// bookkeeping too — the Kafka objects are the schema main.kafka). The
 // session checks the name (catalog::check_database_ownership) before the
 // statement reaches the engine, on every entry point a frontend uses, and the
 // refusal leaves the engine and the connection's remote tables untouched.
 
 #include "catalog/ownership.hpp"
-#include "otterbrix/parser/grammar_extension/kafka/kafka_node.hpp"
+#include "../mock/cell.hpp"
 #include "session_stack.hpp"
 #include "test_helpers.hpp"
 
@@ -40,7 +40,7 @@ namespace {
     // unquoted `DROP DATABASE shopdb` reaches the session lower-cased. Only a
     // case-insensitive match protects both forms.
     constexpr const char* kUid = "ShopDb";
-    constexpr const char* kReprepare = "prepared statement must be re-prepared";
+    constexpr const char* kNoEntry = "prepared statement does not exist";
 
     // Real engine, real parser; the MySQL connection is a mock connector
     // configured under kUid, its one table `table` discovered at startup.
@@ -53,26 +53,28 @@ namespace {
 
         // The ownership verdict on a name, bypassing the session.
         core::error_t verdict(const std::string& dbname) {
-            return otterstax::catalog::check_database_ownership(owner_.engine().resource(), dbname);
+            return otterstax::catalog::check_database_ownership(owner_.engine().resource(),
+                                                                dbname,
+                                                                owner_.engine().remote().aliases());
         }
 
-        // The refused statement created no engine database under the uid, and
+        // The refused statement created no local database under the connection's name, and
         // the connection's remote table still answers.
         void require_untouched() {
-            auto databases = owner_.engine().sql("SELECT nspname FROM pg_catalog.pg_namespace;");
+            auto databases = owner_.engine().sql("SELECT datname FROM pg_catalog.pg_database WHERE datconnection = '';");
             REQUIRE(databases);
             INFO((databases->is_error() ? databases->get_error().what.c_str() : ""));
             REQUIRE_FALSE(databases->is_error());
             for (const auto& chunk : databases->chunks()) {
                 for (std::uint64_t row = 0; row < chunk.size(); ++row) {
-                    std::string name{chunk.value(0, row).value<std::string_view>()};
+                    std::string name{otterstax::test::cell(chunk, 0, row).value<std::string_view>()};
                     for (auto& c : name) {
                         c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
                     }
                     CHECK(name != "shopdb");
                 }
             }
-            auto remote = run_session_sql_payload(owner_.stack(), 9999, "SELECT * FROM shopdb.db.\"table\";");
+            auto remote = run_session_sql_payload(owner_.stack(), 9999, "SELECT * FROM shopdb.db.public.\"table\";");
             INFO((remote.has_error() ? remote.error().what.c_str() : ""));
             REQUIRE_FALSE(remote.has_error());
             CHECK(remote.value().size() == 2);
@@ -95,11 +97,6 @@ namespace {
         REQUIRE(r.error().type == core::error_code_t::invalid_parameter);
         REQUIRE(std::string{r.error().what.c_str()} ==
                 "database '" + dbname + "' is owned by connection '" + owner + "'");
-    }
-
-    void require_ok(const core::result_wrapper_t<session_payload>& r) {
-        INFO(r.error().what.c_str());
-        REQUIRE_FALSE(r.has_error());
     }
 
 } // namespace
@@ -143,21 +140,10 @@ TEST_CASE("database ownership: the federation metadata database is refused") {
     require_owned_by(run_session_sql_payload(s, id++, "DROP DATABASE federation;"), "federation", "federation");
     require_owned_by(run_session_sql_payload(s, id++, "CREATE DATABASE \"Federation\";"), "Federation", "federation");
     // The metadata is intact: the connection's table is still listed.
-    auto listed = run_session_sql_payload(s, id++, "SELECT table_name FROM federation.remote_tables;");
+    auto listed = run_session_sql_payload(s, id++, "SELECT remote_name FROM federation.public.remote_names WHERE attoid = 0;");
     INFO((listed.has_error() ? listed.error().what.c_str() : ""));
     REQUIRE_FALSE(listed.has_error());
     CHECK(listed.value().size() == 1);
-}
-
-TEST_CASE("database ownership: the kafka object database is refused") {
-    guarded_stack_owner owner("/tmp/test_db_owner_kafka");
-    auto s = owner.stack();
-    session_hash_t id = 9440;
-    const std::string kafka{otterstax::kafka::KAFKA_DATABASE_NAME};
-
-    require_owned_by(run_session_sql_payload(s, id++, "DROP DATABASE " + kafka + ";"), kafka, kafka);
-    require_owned_by(run_session_sql_payload(s, id++, "CREATE DATABASE " + kafka + ";"), kafka, kafka);
-    require_owned_by(run_session_sql_payload(s, id++, "DROP DATABASE \"KAFKA\";"), "KAFKA", kafka);
 }
 
 TEST_CASE("database ownership: the prepared path is guarded at prepare time") {
@@ -171,7 +157,7 @@ TEST_CASE("database ownership: the prepared path is guarded at prepare time") {
     auto executed = execute_session_statement(s, stmt);
     REQUIRE(executed.has_error());
     REQUIRE(executed.error().type == core::error_code_t::invalid_parameter);
-    REQUIRE(std::string{executed.error().what.c_str()} == kReprepare);
+    REQUIRE(std::string{executed.error().what.c_str()} == kNoEntry);
 
     owner.require_untouched();
 }
@@ -201,4 +187,42 @@ TEST_CASE("database ownership: a user database passes the guard on both paths") 
     REQUIRE_FALSE(owner.verdict("userdb").contains_error());
     REQUIRE(owner.verdict("shopdb").contains_error());
     REQUIRE(owner.verdict("SHOPDB").contains_error());
+}
+
+// Inside the databases: a relation of `federation` written (DDL or DML) and
+// the schema of the Kafka objects dropped are refused before the engine, on
+// the direct and the prepared path and for CREATE EXTERNAL TABLE; reading
+// `federation` and writing a user schema named like Kafka's elsewhere pass.
+TEST_CASE("database ownership: federation relations and the schema main.kafka are refused") {
+    guarded_stack_owner owner("/tmp/test_ownership_write_guard");
+    auto s = owner.stack();
+    session_hash_t id = 9700;
+    for (const std::string sql : {"DELETE FROM federation.public.remote_names;",
+                                  "INSERT INTO federation.public.remote_names SELECT * FROM federation.public.remote_names;",
+                                  "DROP TABLE federation.public.remote_names;",
+                                  "CREATE TABLE federation.public.mine (id bigint);",
+                                  "DROP SCHEMA kafka CASCADE;",
+                                  "CREATE EXTERNAL TABLE federation.public.loaded WITH (location = '/nowhere.csv', format = 'csv')"}) {
+        INFO(sql);
+        auto direct = run_session_sql_payload(s, id++, sql);
+        REQUIRE(direct.has_error());
+        CHECK(direct.error().type == core::error_code_t::invalid_parameter);
+        CHECK(std::string{direct.error().what.c_str()}.find("is owned by OtterStax") != std::string::npos);
+    }
+    auto prepared = prepare_session_sql(s, id++, "DELETE FROM federation.public.remote_names;");
+    REQUIRE(prepared.has_error());
+    CHECK(prepared.error().type == core::error_code_t::invalid_parameter);
+
+    // DROP SCHEMA names a schema of the place: from federation, its kafka schema.
+    REQUIRE_FALSE(run_session_sql_payload(s, id++, "SET search_path = 'federation.public';").has_error());
+    REQUIRE(run_session_sql_payload(s, id++, "DROP SCHEMA kafka CASCADE;").has_error());
+    REQUIRE_FALSE(run_session_sql_payload(s, id++, "SET search_path = 'main.public';").has_error());
+
+    REQUIRE_FALSE(run_session_sql_payload(s, id++, "SELECT * FROM federation.public.remote_names;").has_error());
+    REQUIRE_FALSE(run_session_sql_payload(s, id++, "CREATE DATABASE other;").has_error());
+    REQUIRE_FALSE(run_session_sql_payload(s, id++, "SET search_path = 'other.public';").has_error());
+    REQUIRE_FALSE(run_session_sql_payload(s, id++, "CREATE SCHEMA kafka;").has_error());
+    auto dropped = run_session_sql_payload(s, id++, "DROP SCHEMA kafka;");
+    INFO((dropped.has_error() ? dropped.error().what.c_str() : "ok"));
+    REQUIRE_FALSE(dropped.has_error());
 }

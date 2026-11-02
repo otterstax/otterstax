@@ -26,6 +26,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -52,9 +53,6 @@ namespace mysql {
         std::string name;
         boost::mysql::column_type type;
         bool is_unsigned = false;
-        // PRI_KEY_FLAG: the column is part of the table's primary key, as the
-        // server marks it in a probe's column definitions.
-        bool primary_key = false;
     };
 
     using mock_row_t = std::vector<std::optional<std::string>>;
@@ -74,9 +72,8 @@ namespace mysql {
             boost::mysql::detail::coldef_view coldef{};
             coldef.name = column.name;
             coldef.type = column.type;
-            coldef.flags = static_cast<std::uint16_t>(
-                (column.is_unsigned ? boost::mysql::detail::column_flags::unsigned_ : 0) |
-                (column.primary_key ? boost::mysql::detail::column_flags::pri_key : 0));
+            coldef.flags =
+                static_cast<std::uint16_t>(column.is_unsigned ? boost::mysql::detail::column_flags::unsigned_ : 0);
             boost::mysql::diagnostics diag;
             [[maybe_unused]] auto meta_ec = impl.on_meta(coldef, diag);
             assert(!meta_ec && "mock result set: on_meta must not fail");
@@ -160,28 +157,36 @@ namespace mysql {
 
         std::string alias() const noexcept override { return alias_; }
 
-        data_chunk_t get_chunk() {
+        data_chunk_t get_chunk(std::string_view query = {}) {
+            // The columns the SELECT list names, in its order (mock_projection).
+            const auto projection = mock_projection(query, '`');
             std::pmr::vector<types::complex_logical_type> fields(config_.resource);
-            fields.reserve(2);
-            fields.emplace_back(types::logical_type::INTEGER, "id");
-            fields.emplace_back(types::logical_type::STRING_LITERAL, "name");
+            for (auto c : projection) {
+                if (c == 0) {
+                    fields.emplace_back(types::logical_type::INTEGER, "id");
+                } else {
+                    fields.emplace_back(types::logical_type::STRING_LITERAL, "name");
+                }
+            }
             if (config_.return_empty) {
                 // The table's columns, no row: what an empty table answers.
-                std::cout << "MockConnector returning empty result." << std::endl;
                 data_chunk_t chunk(config_.resource, fields, 1);
                 chunk.set_cardinality(0);
                 return chunk;
             }
-
             data_chunk_t result(config_.resource, fields, 2);
             result.set_cardinality(2);
             // Defined values: the slice reaches a real engine, which copies and
             // reads every cell.
             for (uint64_t row = 0; row < 2; ++row) {
-                result.set_value(0, row, types::logical_value_t(config_.resource, static_cast<int32_t>(row + 1)));
-                result.set_value(1,
-                                 row,
-                                 types::logical_value_t(config_.resource, std::string{"name_" + std::to_string(row)}));
+                for (std::size_t at = 0; at < projection.size(); ++at) {
+                    if (projection[at] == 0) {
+                        result.set_value(at, row, static_cast<int32_t>(row + 1));
+                    } else {
+                        const std::string name = "name_" + std::to_string(row);
+                        result.set_value(at, row, std::string_view{name});
+                    }
+                }
             }
             return result;
         }
@@ -203,7 +208,7 @@ namespace mysql {
             }
 
             std::this_thread::sleep_for(std::chrono::milliseconds(config_.wait_time)); // Simulate some processing delay
-            co_return std::make_unique<data_chunk_t>(get_chunk());
+            co_return std::make_unique<data_chunk_t>(get_chunk(query));
         }
 
         asio::awaitable<core::result_wrapper_t<int64_t>>

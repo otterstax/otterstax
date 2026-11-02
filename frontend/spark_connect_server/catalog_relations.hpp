@@ -8,12 +8,12 @@
 //
 // Spark's Catalog API (spark.catalog.listDatabases(), listTables(),
 // tableExists(), ...) arrives as `Relation.catalog`. Unlike regular relations
-// it builds no logical plan of its own: the databases and tables are read from
-// the engine's pg_catalog.pg_namespace / pg_catalog.pg_class and the remote
-// tables from federation.remote_tables, with SQL through the Spark session's
-// query session, and a table's columns come from preparing
-// `SELECT * FROM <table>` (then closing that statement). Both local tables and
-// the remote tables the federation knows are listed. The rows are laid out
+// it builds no logical plan of its own: the databases (schemas) and tables are
+// read from the engine's pg_catalog.pg_database / pg_namespace / pg_class —
+// local ones and those of the connections alike, no backend asked — and the
+// current database from current_database() / current_schema(), with SQL
+// through the Spark session's query session; a table's columns come from
+// preparing `SELECT * FROM <table>` (then closing that statement). The rows are laid out
 // exactly as PySpark 3.5–4.2 reads them — by position — so a list answer is a
 // session_payload with one row per entry; an existence check is a single
 // boolean, currentCatalog/currentDatabase a single string. What Spark sees of

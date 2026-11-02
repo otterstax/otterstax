@@ -14,6 +14,7 @@
 
 #include "session_stack.hpp"
 
+#include "otterbrix/translators/input/decimal_text.hpp"
 #include "otterbrix/translators/output/chunk_to_arrow.hpp"
 
 #include <catch2/catch_all.hpp>
@@ -44,7 +45,7 @@ namespace {
     // Two INT tables sharing the key name, so a `SELECT *` JOIN result carries
     // `id` twice.
     void seed_join_tables(const session_stack& s, session_hash_t& id) {
-        run_or_fail(s, id++, "CREATE DATABASE fdb;");
+        run_or_fail(s, id++, "CREATE SCHEMA fdb;");
         run_or_fail(s, id++, "CREATE TABLE fdb.a (id INT, x INT);");
         run_or_fail(s, id++, "CREATE TABLE fdb.b (id INT, y INT);");
         run_or_fail(s, id++, "INSERT INTO fdb.a (id, x) VALUES (1, 10), (2, 20);");
@@ -160,7 +161,7 @@ TEST_CASE("FlightSQL contract: a local JOIN streams both key columns under the p
 TEST_CASE("FlightSQL contract: a column without an Arrow mapping is refused where the schema is produced") {
     with_session_stack("/tmp/test_flightsql_contract_unmappable", [](session_stack s) {
         session_hash_t id = 9600;
-        run_or_fail(s, id++, "CREATE DATABASE fdb;");
+        run_or_fail(s, id++, "CREATE SCHEMA fdb;");
 
         SECTION("a UHUGEINT column names the column in the error") {
             run_or_fail(s, id++, "CREATE TABLE fdb.uhuge (id INT, big uhugeint);");
@@ -209,7 +210,7 @@ TEST_CASE("FlightSQL contract: a column without an Arrow mapping is refused wher
 TEST_CASE("FlightSQL contract: a HUGEINT column is carried, not refused") {
     with_session_stack("/tmp/test_flightsql_contract_hugeint", [](session_stack s) {
         session_hash_t id = 9650;
-        run_or_fail(s, id++, "CREATE DATABASE hdb;");
+        run_or_fail(s, id++, "CREATE SCHEMA hdb;");
         run_or_fail(s, id++, "CREATE TABLE hdb.huge (id INT, big hugeint);");
 
         const session_hash_t stmt = id++;
@@ -249,7 +250,7 @@ TEST_CASE("FlightSQL contract: a HUGEINT column is carried, not refused") {
 TEST_CASE("FlightSQL contract: a DECIMAL column is carried with its scale") {
     with_session_stack("/tmp/test_flightsql_contract_decimal", [](session_stack s) {
         session_hash_t id = 9660;
-        run_or_fail(s, id++, "CREATE DATABASE ddb;");
+        run_or_fail(s, id++, "CREATE SCHEMA ddb;");
         run_or_fail(s, id++, "CREATE TABLE ddb.money (id INT, amount decimal(38, 10));");
 
         const session_hash_t stmt = id++;
@@ -299,9 +300,9 @@ TEST_CASE("FlightSQL contract: the DoGet stream carries a DECIMAL value with its
 
     components::vector::data_chunk_t chunk(res, types, 3);
     chunk.set_cardinality(3);
-    chunk.set_value(0, 0, components::types::logical_value_t::create_decimal(res, types[0], int64_t{12345}));
-    chunk.set_value(0, 1, components::types::logical_value_t::create_decimal(res, types[0], int64_t{-12345}));
-    chunk.set_value(0, 2, components::types::logical_value_t{res, nullptr});
+    tsl::set_decimal_raw(chunk.data[0], 0, int64_t{12345});
+    tsl::set_decimal_raw(chunk.data[0], 1, int64_t{-12345});
+    chunk.data[0].set_null(2, true);
 
     auto flight_schema = to_arrow_schema(
         res,
@@ -324,7 +325,7 @@ TEST_CASE("FlightSQL contract: the DoGet stream carries a DECIMAL value with its
 TEST_CASE("FlightSQL contract: a parameterized SELECT is prepared from the engine's own columns") {
     with_session_stack("/tmp/test_flightsql_contract_params", [](session_stack s) {
         session_hash_t id = 9700;
-        run_or_fail(s, id++, "CREATE DATABASE fdb;");
+        run_or_fail(s, id++, "CREATE SCHEMA fdb;");
         run_or_fail(s, id++, "CREATE TABLE fdb.a (id INT, x INT);");
 
         // The engine validates a plan only with every parameter bound — its

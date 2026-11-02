@@ -40,13 +40,22 @@ using otterstax::kafka::kafka_op;
 using otterstax::kafka::KafkaManager;
 
 namespace {
+    // Cell (col, row) of a result, every chunk of it counted; a cell that cannot be
+    // read as T fails the test
+    template<typename T>
+    T cell(const components::cursor::cursor_t_ptr& cursor, std::uint64_t col, std::uint64_t row) {
+        auto value = cursor->get<T>(col, row);
+        REQUIRE_FALSE(value.has_error());
+        return value.value();
+    }
+
     kafka_node_ptr parse_kafka(GreenplumParser& parser, const std::string& sql) {
         auto parsed = parser.parse(sql);
         REQUIRE_FALSE(parsed.has_error());
         auto data = std::move(parsed.value());
         // Every statement handed here is kafka DDL: the parser extension lowers it
         // to a kafka_node_t, the only node_type::unused root the parser produces
-        auto& root = data->otterbrix_params->node;
+        const auto& root = plan_root(*data->plan);
         if (!root || root->type() != components::logical_plan::node_type::unused) {
             return kafka_node_ptr{};
         }
@@ -88,18 +97,18 @@ TEST_CASE("kafka dry: CREATE/DROP SOURCE materialises tables, STREAM does not") 
             actor_zeta::send(kafka_mgr->address(), &KafkaManager::execute, session_hash_t{1}, std::move(node));
         return drive_until_ready(std::move(fut));
     };
-    // True iff kafka.__sources currently holds a row for `name` (the persisted
+    // True iff federation.kafka.__sources currently holds a row for `name` (the persisted
     // registry each CREATE writes and each DROP must remove)
     auto sources_has = [&](const std::string& name) {
         auto cursor = drive_until_ready(otterstax::kafka::detail::kafka_query(engine->dispatcher(),
                                                                               resource,
-                                                                              "SELECT name FROM kafka.__sources;"));
+                                                                              "SELECT name FROM federation.kafka.__sources;"));
         if (!cursor || cursor->is_error()) {
             return false;
         }
-        // cursor->value() spans the <=1024-row chunks of the result
+        // cursor->get() spans the <=1024-row chunks of the result
         for (std::uint64_t row = 0; row < cursor->size(); ++row) {
-            if (std::string{cursor->value(0, row).value<std::string_view>()} == name) {
+            if (std::string{cell<std::string_view>(cursor, 0, row)} == name) {
                 return true;
             }
         }
@@ -128,7 +137,7 @@ TEST_CASE("kafka dry: CREATE/DROP SOURCE materialises tables, STREAM does not") 
     }
     {
         // a SOURCE also gets a per-partition offsets table
-        auto offsets = probe("kafka.s__offsets");
+        auto offsets = probe("federation.kafka.s__offsets");
         REQUIRE(offsets);
         REQUIRE_FALSE(offsets->is_error());
         REQUIRE(offsets->type_data().size() == 2); // (partition, committed_offset)
@@ -149,7 +158,7 @@ TEST_CASE("kafka dry: CREATE/DROP SOURCE materialises tables, STREAM does not") 
     }
     REQUIRE(probe("kafka.st")->is_error()); // a stream creates no table
 
-    // Both objects persisted a kafka.__sources row (source + stream)
+    // Both objects persisted a federation.kafka.__sources row (source + stream)
     REQUIRE(sources_has("s"));
     REQUIRE(sources_has("st"));
 
@@ -212,17 +221,17 @@ TEST_CASE("kafka insert-query: INSERT INTO stream SELECT registers + persists, D
                                          std::string{sql});
         return drive_until_ready(std::move(fut));
     };
-    // Count kafka.__sources rows of a given kind (source / stream / insert)
+    // Count federation.kafka.__sources rows of a given kind (source / stream / insert)
     auto kind_count = [&](const std::string& kind) {
         auto cursor =
             drive_until_ready(otterstax::kafka::detail::kafka_query(engine->dispatcher(),
                                                                     resource,
-                                                                    "SELECT name, kind FROM kafka.__sources;"));
+                                                                    "SELECT name, kind FROM federation.kafka.__sources;"));
         int n = 0;
         if (cursor && !cursor->is_error()) {
-            // cursor->value() spans the <=1024-row chunks of the result
+            // cursor->get() spans the <=1024-row chunks of the result
             for (std::uint64_t row = 0; row < cursor->size(); ++row) {
-                if (std::string{cursor->value(1, row).value<std::string_view>()} == kind) {
+                if (std::string{cell<std::string_view>(cursor, 1, row)} == kind) {
                     ++n;
                 }
             }
@@ -318,8 +327,7 @@ TEST_CASE("kafka ingest: a json batch is inserted into the source table") {
     {
         auto cursor = drive_until_ready(otterstax::kafka::detail::kafka_insert(engine->dispatcher(),
                                                                                resource,
-                                                                               "kafka",
-                                                                               "s",
+                                                                               otterstax::kafka::kafka_table_name("s"),
                                                                                std::move(chunk)));
         REQUIRE(cursor);
         REQUIRE_FALSE(cursor->is_error());
@@ -358,12 +366,12 @@ TEST_CASE("kafka offsets: write_offsets / parse_offsets roundtrip with max-per-p
         return otterstax::kafka::detail::parse_offsets(drive_until_ready(
             otterstax::kafka::detail::kafka_query(addr,
                                                   resource,
-                                                  "SELECT partition_id, committed_offset FROM kafka.s__offsets;")));
+                                                  "SELECT partition_id, committed_offset FROM federation.kafka.s__offsets;")));
     };
 
     {
         auto cur = drive_until_ready(
-            otterstax::kafka::detail::write_offsets(addr, resource, "kafka", "s__offsets", {{0, 100}, {1, 250}}));
+            otterstax::kafka::detail::write_offsets(addr, resource, otterstax::kafka::kafka_offsets_table_name("s"), {{0, 100}, {1, 250}}));
         REQUIRE(cur);
         REQUIRE_FALSE(cur->is_error());
     }
@@ -377,7 +385,7 @@ TEST_CASE("kafka offsets: write_offsets / parse_offsets roundtrip with max-per-p
     // Appending a higher offset for partition 0 wins; partition 1 unchanged
     {
         auto cur = drive_until_ready(
-            otterstax::kafka::detail::write_offsets(addr, resource, "kafka", "s__offsets", {{0, 180}}));
+            otterstax::kafka::detail::write_offsets(addr, resource, otterstax::kafka::kafka_offsets_table_name("s"), {{0, 180}}));
         REQUIRE(cur);
         REQUIRE_FALSE(cur->is_error());
     }
@@ -393,7 +401,7 @@ TEST_CASE("kafka poller: CREATE SOURCE starts a poller, DROP/teardown join clean
     auto engine = std::make_unique<otterstax::test::test_engine_t>("/tmp/otterstax_kafka_poller");
     auto* resource = engine->resource();
 
-    GreenplumParser parser(resource, no_aliases());
+    GreenplumParser parser(resource);
     auto kafka_mgr =
         actor_zeta::spawn<KafkaManager>(resource, engine->dispatcher(), /*start_pollers=*/true);
 
@@ -606,7 +614,7 @@ TEST_CASE("kafka stream node-swap: the ORDER BY / LIMIT / HAVING tail is re-home
         services::catalog_resolve::register_plan_targets(resource, agg.get(), &resolves);
         if (resolves.tables) {
             for (const auto& entry : resolves.tables->entries()) {
-                out.resolved_tables.push_back(entry.dbname + "." + entry.relname);
+                out.resolved_tables.push_back(entry.database + "." + entry.relname);
             }
         }
 
@@ -680,7 +688,7 @@ TEST_CASE("kafka txn: BEGIN/INSERT/INSERT/COMMIT on one session is atomic; ROLLB
     GreenplumParser parser(resource);
     auto kafka_mgr = actor_zeta::spawn<KafkaManager>(resource, engine->dispatcher());
 
-    // CREATE SOURCE s -> kafka.s (id, name) + kafka.s__offsets (partition_id, committed_offset)
+    // CREATE SOURCE s -> kafka.s (id, name) + federation.kafka.s__offsets (partition_id, committed_offset)
     {
         auto src = parse_kafka(parser,
                                "CREATE SOURCE s (id INT, name VARCHAR) "
@@ -714,19 +722,19 @@ TEST_CASE("kafka txn: BEGIN/INSERT/INSERT/COMMIT on one session is atomic; ROLLB
         auto txn = ses::session_id_t::generate_uid();
         REQUIRE_FALSE(on_session(txn, "BEGIN;")->is_error());
         REQUIRE_FALSE(on_session(txn, "INSERT INTO kafka.s (id, name) VALUES (1, 'a');")->is_error());
-        REQUIRE_FALSE(on_session(txn, "INSERT INTO kafka.s__offsets (partition_id, committed_offset) VALUES (0, 100);")
+        REQUIRE_FALSE(on_session(txn, "INSERT INTO federation.kafka.s__offsets (partition_id, committed_offset) VALUES (0, 100);")
                           ->is_error());
 
         // Mid-txn: a fresh session must NOT see the uncommitted rows — proves the
         // session txn genuinely spans the calls (not per-statement autocommit)
         CHECK(count("kafka.s") == 0);
-        CHECK(count("kafka.s__offsets") == 0);
+        CHECK(count("federation.kafka.s__offsets") == 0);
 
         REQUIRE_FALSE(on_session(txn, "COMMIT;")->is_error());
 
         // After COMMIT both inserts are visible — committed atomically
         CHECK(count("kafka.s") == 1);
-        CHECK(count("kafka.s__offsets") == 1);
+        CHECK(count("federation.kafka.s__offsets") == 1);
     }
 
     // ROLLBACK: an aborted batch leaves the tables unchanged
@@ -746,7 +754,7 @@ TEST_CASE("kafka eos: node-based insert+offsets on one session are atomic; ROLLB
     auto* resource = engine->resource();
     auto addr = engine->dispatcher();
 
-    GreenplumParser parser(resource, no_aliases());
+    GreenplumParser parser(resource);
     auto kafka_mgr = actor_zeta::spawn<KafkaManager>(resource, addr);
 
     auto src = parse_kafka(parser,
@@ -783,21 +791,21 @@ TEST_CASE("kafka eos: node-based insert+offsets on one session are atomic; ROLLB
 
         auto chunk = kd::json_to_chunk(resource, columns, {R"({"id": 1, "name": "a"})", R"({"id": 2, "name": "b"})"});
         REQUIRE(chunk.size() == 2);
-        REQUIRE_FALSE(drive_until_ready(kd::kafka_insert_session(addr, resource, txn, "kafka", "s", std::move(chunk)))
+        REQUIRE_FALSE(drive_until_ready(kd::kafka_insert_session(addr, resource, txn, otterstax::kafka::kafka_table_name("s"), std::move(chunk)))
                           ->is_error());
         REQUIRE_FALSE(drive_until_ready(
-                          kd::write_offsets_session(addr, resource, txn, "kafka", "s__offsets", {{0, 100}, {1, 250}}))
+                          kd::write_offsets_session(addr, resource, txn, otterstax::kafka::kafka_offsets_table_name("s"), {{0, 100}, {1, 250}}))
                           ->is_error());
 
         // Mid-txn: a fresh session must NOT see the uncommitted rows — proves the
         // node-based helpers genuinely run inside the session txn.
         CHECK(count("kafka.s") == 0);
-        CHECK(count("kafka.s__offsets") == 0);
+        CHECK(count("federation.kafka.s__offsets") == 0);
 
         REQUIRE_FALSE(on_session(txn, "COMMIT;")->is_error());
 
         CHECK(count("kafka.s") == 2);
-        CHECK(count("kafka.s__offsets") == 2); // one row per partition
+        CHECK(count("federation.kafka.s__offsets") == 2); // one row per partition
     }
 
     // ROLLBACK: an aborted batch leaves both tables unchanged
@@ -807,16 +815,16 @@ TEST_CASE("kafka eos: node-based insert+offsets on one session are atomic; ROLLB
 
         auto chunk = kd::json_to_chunk(resource, columns, {R"({"id": 3, "name": "c"})"});
         REQUIRE(chunk.size() == 1);
-        REQUIRE_FALSE(drive_until_ready(kd::kafka_insert_session(addr, resource, txn, "kafka", "s", std::move(chunk)))
+        REQUIRE_FALSE(drive_until_ready(kd::kafka_insert_session(addr, resource, txn, otterstax::kafka::kafka_table_name("s"), std::move(chunk)))
                           ->is_error());
         REQUIRE_FALSE(
-            drive_until_ready(kd::write_offsets_session(addr, resource, txn, "kafka", "s__offsets", {{0, 300}}))
+            drive_until_ready(kd::write_offsets_session(addr, resource, txn, otterstax::kafka::kafka_offsets_table_name("s"), {{0, 300}}))
                 ->is_error());
 
         REQUIRE_FALSE(on_session(txn, "ROLLBACK;")->is_error());
 
         CHECK(count("kafka.s") == 2);          // still the two committed rows
-        CHECK(count("kafka.s__offsets") == 2); // offsets unchanged
+        CHECK(count("federation.kafka.s__offsets") == 2); // offsets unchanged
     }
 }
 
@@ -949,9 +957,9 @@ TEST_CASE("kafka stream write: SELECT output schema is derived; INSERT routes to
                     "CREATE STREAM st WITH (KAFKA_TOPIC='ot', VALUE_FORMAT='JSON', "
                     "BOOTSTRAP_SERVERS='localhost:9092') AS SELECT id, name FROM kafka.s;"));
 
-    // (a) Output-schema computation: apply the SELECT's projection to the source's
-    // declared schema, no data (schema_utils::aggregate_filter_schema via
-    // stream_output_schema). Covers projection, single-column, and SELECT *
+    // (a) Output-schema computation: the engine's describe of the batch plan the
+    // stream runs (stream_batch_plan) over no rows of the source's declared
+    // columns (describe_stream). Covers projection, single-column, and SELECT *
     {
         const std::vector<otterstax::kafka::kafka_column_t> source_cols{
             {"id", ty::complex_logical_type(ty::logical_type::INTEGER)},
@@ -960,12 +968,18 @@ TEST_CASE("kafka stream write: SELECT output schema is derived; INSERT routes to
             auto plan = otterstax::kafka::detail::kafka_parse_plan(resource, sql);
             REQUIRE_FALSE(plan.has_error());
             REQUIRE_FALSE(plan.value().sub_queries.empty());
-            const auto* agg = otterstax::kafka::kafka_find_aggregate(plan.value().sub_queries.back());
-            REQUIRE(agg != nullptr);
-            return otterstax::kafka::detail::stream_output_schema(resource,
-                                                                  *agg,
-                                                                  plan.value().parameters.get(),
-                                                                  source_cols);
+            auto stream_src = otterstax::kafka::kafka_stream_source(resource, plan.value().sub_queries.back());
+            REQUIRE(stream_src);
+            auto described = otterstax::kafka::detail::described_columns(
+                resource,
+                drive_until_ready(otterstax::kafka::detail::describe_stream(engine->dispatcher(),
+                                                                            resource,
+                                                                            source_cols,
+                                                                            stream_src->operators,
+                                                                            plan.value().parameters)));
+            INFO("describe: " << (described.has_error() ? described.error().what.c_str() : "ok"));
+            REQUIRE_FALSE(described.has_error());
+            return described.value();
         };
 
         auto proj = schema_of("SELECT id, name FROM kafka.s WHERE id > 2;");
@@ -984,9 +998,32 @@ TEST_CASE("kafka stream write: SELECT output schema is derived; INSERT routes to
     {
         auto parsed = parser.parse("INSERT INTO kafka.st (id, name) VALUES (1, 'a');");
         REQUIRE_FALSE(parsed.has_error());
-        auto write = otterstax::kafka::kafka_write_target(parsed.value()->otterbrix_params->node);
+        auto write = otterstax::kafka::kafka_write_target(plan_root(*parsed.value()->plan));
         REQUIRE(write.has_value());
-        CHECK(write->relname == "st");
+        CHECK(write->relname() == "st");
+        // kafka.st from the default place main.public is main.kafka.st; from
+        // another place it is that place's database
+        CHECK(otterstax::kafka::kafka_target_named(write->target, "main", "public"));
+        CHECK_FALSE(otterstax::kafka::kafka_target_named(write->target, "shop", "public"));
+    }
+    // (c) A name written so that it cannot be main.kafka.<x> is no Kafka write;
+    // the others are once the place completes them
+    {
+        auto target_of = [&](const std::string& sql) {
+            auto parsed = parser.parse(sql);
+            REQUIRE_FALSE(parsed.has_error());
+            return otterstax::kafka::kafka_write_target(plan_root(*parsed.value()->plan));
+        };
+        CHECK_FALSE(target_of("INSERT INTO public.st (id, name) VALUES (1, 'a');"));
+        CHECK_FALSE(target_of("INSERT INTO shop.kafka.st (id, name) VALUES (1, 'a');"));
+        CHECK_FALSE(target_of("INSERT INTO c.main.kafka.st (id, name) VALUES (1, 'a');"));
+        auto full = target_of("INSERT INTO main.kafka.st (id, name) VALUES (1, 'a');");
+        REQUIRE(full);
+        CHECK(otterstax::kafka::kafka_target_named(full->target, {}, {}));
+        auto bare = target_of("INSERT INTO st (id, name) VALUES (1, 'a');");
+        REQUIRE(bare);
+        CHECK(otterstax::kafka::kafka_target_named(bare->target, "main", "kafka"));
+        CHECK_FALSE(otterstax::kafka::kafka_target_named(bare->target, "main", "public"));
     }
 }
 
@@ -1008,7 +1045,7 @@ TEST_CASE("kafka stream: a COUNT column is declared and produced as the type the
     auto* resource = engine->resource();
     auto addr = engine->dispatcher();
 
-    GreenplumParser parser(resource, no_aliases());
+    GreenplumParser parser(resource);
     auto kafka_mgr = actor_zeta::spawn<KafkaManager>(resource, addr);
     {
         auto src = parse_kafka(
@@ -1028,31 +1065,33 @@ TEST_CASE("kafka stream: a COUNT column is declared and produced as the type the
     auto plan = kd::kafka_parse_plan(resource, "SELECT name, COUNT(*) AS cnt FROM kafka.s GROUP BY name;");
     REQUIRE_FALSE(plan.has_error());
     REQUIRE_FALSE(plan.value().sub_queries.empty());
-    const auto* agg = otterstax::kafka::kafka_find_aggregate(plan.value().sub_queries.back());
-    REQUIRE(agg != nullptr);
+    auto stream_src = otterstax::kafka::kafka_stream_source(resource, plan.value().sub_queries.back());
+    REQUIRE(stream_src);
 
-    // What CREATE STREAM registers the stream's output columns as
-    const auto declared = kd::stream_output_schema(resource, *agg, plan.value().parameters.get(), source_cols);
+    // What CREATE STREAM registers the stream's output columns as: the engine's
+    // describe of the batch plan
+    auto described = kd::described_columns(
+        resource,
+        drive_until_ready(
+            kd::describe_stream(addr, resource, source_cols, stream_src->operators, plan.value().parameters)));
+    REQUIRE_FALSE(described.has_error());
+    const auto declared = described.value();
     REQUIRE(declared.size() == 2);
     REQUIRE(declared[0].name == "name");
     REQUIRE(declared[1].name == "cnt");
 
-    // What the engine puts in the chunk, over the very node-swap the stream worker
-    // runs per batch: aggregate(empty) + [raw_data(batch), <re-homed operators>]
-    auto stream_src = otterstax::kafka::kafka_stream_source(resource, plan.value().sub_queries.back());
-    REQUIRE(stream_src);
-    auto swapped = lp::make_node_aggregate(resource, qualified_name_t{});
-    swapped->append_child(lp::make_node_raw_data(
+    // What the engine puts in the chunk, over the very batch plan the stream
+    // worker runs: aggregate(empty) + [raw_data(batch), <re-homed operators>]
+    auto cursor = drive_until_ready(kd::kafka_execute(
+        addr,
         resource,
-        kd::json_to_chunk(
+        kd::stream_batch_plan(
             resource,
-            source_cols,
-            {R"({"id":1,"name":"a"})", R"({"id":2,"name":"a"})", R"({"id":3,"name":"b"})"})));
-    for (const auto& op : stream_src->operators) {
-        swapped->append_child(lp::node_ptr(op));
-    }
-    auto cursor = drive_until_ready(
-        kd::kafka_execute(addr, resource, lp::execution_plan_t{resource, swapped, plan.value().parameters}));
+            kd::json_to_chunk(resource,
+                              source_cols,
+                              {R"({"id":1,"name":"a"})", R"({"id":2,"name":"a"})", R"({"id":3,"name":"b"})"}),
+            stream_src->operators,
+            plan.value().parameters)));
     REQUIRE(cursor);
     INFO("transform: " << (cursor->is_error() ? cursor->get_error().what.c_str() : "ok"));
     REQUIRE_FALSE(cursor->is_error());
@@ -1108,12 +1147,12 @@ TEST_CASE("kafka json: out-of-range numbers are rejected without throwing, JSON 
 
     REQUIRE(chunk.column_count() == 3);
     REQUIRE(chunk.size() == 3);
-    CHECK(chunk.value(1, 0).value<int64_t>() == std::numeric_limits<int64_t>::max());
-    CHECK(chunk.value(0, 1).value<int32_t>() == std::numeric_limits<int32_t>::min());
-    CHECK(chunk.value(1, 1).value<int64_t>() == std::numeric_limits<int64_t>::min());
+    CHECK(chunk.get_value<int64_t>(1, 0) == std::numeric_limits<int64_t>::max());
+    CHECK(chunk.get_value<int32_t>(0, 1) == std::numeric_limits<int32_t>::min());
+    CHECK(chunk.get_value<int64_t>(1, 1) == std::numeric_limits<int64_t>::min());
     CHECK(chunk.is_null(0, 2));
     CHECK_FALSE(chunk.is_null(1, 2));
-    CHECK(chunk.value(1, 2).value<int64_t>() == 5);
+    CHECK(chunk.get_value<int64_t>(1, 2) == 5);
     CHECK(chunk.is_null(2, 2));
 }
 
@@ -1145,8 +1184,8 @@ TEST_CASE("kafka schema guard: an alias-less chunk and a mismatching second chun
         types.emplace_back(logical_type::INTEGER);
         types.emplace_back(logical_type::STRING_LITERAL);
         components::vector::data_chunk_t bare(resource, types, 1);
-        bare.set_value(0, 0, components::types::logical_value_t(resource, int32_t{1}));
-        bare.set_value(1, 0, components::types::logical_value_t(resource, std::string{"a"}));
+        bare.set_value(0, 0, int32_t{1});
+        bare.set_value(1, 0, std::string_view{"a"});
         bare.set_cardinality(1);
         std::pmr::vector<components::vector::data_chunk_t> chunks(resource);
         chunks.push_back(std::move(bare));
@@ -1187,7 +1226,7 @@ TEST_CASE("kafka offsets: parse_offsets spans a result of more than 1024 rows") 
     auto* resource = engine->resource();
     auto addr = engine->dispatcher();
 
-    GreenplumParser parser(resource, no_aliases());
+    GreenplumParser parser(resource);
     auto kafka_mgr = actor_zeta::spawn<KafkaManager>(resource, addr);
     {
         auto src = parse_kafka(parser,
@@ -1207,7 +1246,7 @@ TEST_CASE("kafka offsets: parse_offsets spans a result of more than 1024 rows") 
         for (int32_t p = first_partition; p < first_partition + count; ++p) {
             offsets[p] = offset;
         }
-        auto cur = drive_until_ready(kd::write_offsets(addr, resource, "kafka", "s__offsets", offsets));
+        auto cur = drive_until_ready(kd::write_offsets(addr, resource, otterstax::kafka::kafka_offsets_table_name("s"), offsets));
         REQUIRE(cur);
         REQUIRE_FALSE(cur->is_error());
     };
@@ -1218,7 +1257,7 @@ TEST_CASE("kafka offsets: parse_offsets spans a result of more than 1024 rows") 
     write(0, 600, 30);
 
     auto rows = drive_until_ready(
-        kd::kafka_query(addr, resource, "SELECT partition_id, committed_offset FROM kafka.s__offsets;"));
+        kd::kafka_query(addr, resource, "SELECT partition_id, committed_offset FROM federation.kafka.s__offsets;"));
     REQUIRE(rows);
     REQUIRE_FALSE(rows->is_error());
     REQUIRE(rows->size() == 1800);
@@ -1238,7 +1277,7 @@ TEST_CASE("kafka create: an invalid TRANSACTIONAL option is rejected before any 
     auto* resource = engine->resource();
     auto addr = engine->dispatcher();
 
-    GreenplumParser parser(resource, no_aliases());
+    GreenplumParser parser(resource);
     auto kafka_mgr = actor_zeta::spawn<KafkaManager>(resource, addr);
 
     auto run_kafka = [&](kafka_node_ptr node) {
@@ -1253,13 +1292,13 @@ TEST_CASE("kafka create: an invalid TRANSACTIONAL option is rejected before any 
     };
     auto sources_has = [&](const std::string& name) {
         auto cursor = drive_until_ready(
-            otterstax::kafka::detail::kafka_query(addr, resource, "SELECT name FROM kafka.__sources;"));
+            otterstax::kafka::detail::kafka_query(addr, resource, "SELECT name FROM federation.kafka.__sources;"));
         if (!cursor || cursor->is_error()) {
             return false;
         }
         for (const auto& chunk : cursor->chunks()) {
             for (std::uint64_t row = 0; row < chunk.size(); ++row) {
-                if (std::string{chunk.value(0, row).value<std::string_view>()} == name) {
+                if (std::string{chunk.get_value<std::string_view>(0, row)} == name) {
                     return true;
                 }
             }
@@ -1277,7 +1316,7 @@ TEST_CASE("kafka create: an invalid TRANSACTIONAL option is rejected before any 
         CHECK(cursor->get_error().type == core::error_code_t::invalid_parameter);
     }
     CHECK(probe("kafka.bad")->is_error());
-    CHECK(probe("kafka.bad__offsets")->is_error());
+    CHECK(probe("federation.kafka.bad__offsets")->is_error());
     CHECK_FALSE(sources_has("bad"));
 
     // STREAM: validated before the object is registered or persisted
@@ -1315,14 +1354,15 @@ TEST_CASE("kafka create: a failed __sources write fails CREATE SOURCE and rolls 
     auto addr = engine->dispatcher();
 
     namespace kd = otterstax::kafka::detail;
-    // A pre-existing kafka.__sources with the wrong shape: the manager's metadata
-    // insert (8 columns) cannot land in it, so persisting the source must fail
-    REQUIRE_FALSE(drive_until_ready(kd::kafka_query(addr, resource, "CREATE DATABASE kafka;"))->is_error());
-    REQUIRE_FALSE(
-        drive_until_ready(kd::kafka_query(addr, resource, "CREATE TABLE kafka.__sources (x INT);"))->is_error());
-
-    GreenplumParser parser(resource, no_aliases());
+    // A federation.kafka.__sources of the wrong shape: the manager's metadata
+    // insert (8 columns) cannot land in it, so persisting the source must fail.
+    // The startup (recover) made the schemas and the real table; it is swapped.
+    GreenplumParser parser(resource);
     auto kafka_mgr = actor_zeta::spawn<KafkaManager>(resource, addr);
+    kafka_mgr->recover();
+    REQUIRE_FALSE(drive_until_ready(kd::kafka_query(addr, resource, "DROP TABLE federation.kafka.__sources;"))->is_error());
+    REQUIRE_FALSE(
+        drive_until_ready(kd::kafka_query(addr, resource, "CREATE TABLE federation.kafka.__sources (x INT);"))->is_error());
     auto probe = [&](const std::string& qualified) {
         return drive_until_ready(kd::kafka_query(addr, resource, "SELECT * FROM " + qualified + ";"));
     };
@@ -1340,7 +1380,7 @@ TEST_CASE("kafka create: a failed __sources write fails CREATE SOURCE and rolls 
     }
     // Nothing half-created survives the failure: no backing tables, no registration
     CHECK(probe("kafka.s")->is_error());
-    CHECK(probe("kafka.s__offsets")->is_error());
+    CHECK(probe("federation.kafka.s__offsets")->is_error());
     {
         namespace lp = components::logical_plan;
         namespace ty = components::types;
@@ -1364,7 +1404,7 @@ TEST_CASE("kafka drop: DROP SOURCE removes the offsets table; a missing source e
     auto* resource = engine->resource();
     auto addr = engine->dispatcher();
 
-    GreenplumParser parser(resource, no_aliases());
+    GreenplumParser parser(resource);
     auto kafka_mgr = actor_zeta::spawn<KafkaManager>(resource, addr);
 
     auto run_kafka = [&](kafka_node_ptr node) {
@@ -1383,11 +1423,11 @@ TEST_CASE("kafka drop: DROP SOURCE removes the offsets table; a missing source e
                                         "WITH (KAFKA_TOPIC='t', BOOTSTRAP_SERVERS='localhost:9092');"))
                       ->is_error());
     REQUIRE_FALSE(probe("kafka.s")->is_error());
-    REQUIRE_FALSE(probe("kafka.s__offsets")->is_error());
+    REQUIRE_FALSE(probe("federation.kafka.s__offsets")->is_error());
 
     REQUIRE_FALSE(run_kafka(parse_kafka(parser, "DROP SOURCE s;"))->is_error());
     CHECK(probe("kafka.s")->is_error());
-    CHECK(probe("kafka.s__offsets")->is_error()); // the offsets table goes with its source
+    CHECK(probe("federation.kafka.s__offsets")->is_error()); // the offsets table goes with its source
 
     // Dropped -> unknown to the write path
     {
@@ -1427,7 +1467,7 @@ TEST_CASE("kafka poller: an at-least-once batch whose insert fails reports the e
     auto* resource = engine->resource();
     auto addr = engine->dispatcher();
 
-    GreenplumParser parser(resource, no_aliases());
+    GreenplumParser parser(resource);
     auto kafka_mgr = actor_zeta::spawn<KafkaManager>(resource, addr);
     auto src = parse_kafka(parser,
                            "CREATE SOURCE s (id INT, name VARCHAR) "
@@ -1447,15 +1487,14 @@ TEST_CASE("kafka poller: an at-least-once batch whose insert fails reports the e
     {
         auto error = kd::ingest_at_least_once(addr,
                                               resource,
-                                              "kafka",
-                                              "missing",
+                                              otterstax::kafka::kafka_table_name("missing"),
                                               kd::json_to_chunk(resource, columns, payloads));
         CHECK(error.contains_error());
     }
     // The same batch into the real table lands
     {
         auto error =
-            kd::ingest_at_least_once(addr, resource, "kafka", "s", kd::json_to_chunk(resource, columns, payloads));
+            kd::ingest_at_least_once(addr, resource, otterstax::kafka::kafka_table_name("s"), kd::json_to_chunk(resource, columns, payloads));
         CHECK_FALSE(error.contains_error());
     }
     auto rows = drive_until_ready(kd::kafka_query(addr, resource, "SELECT * FROM kafka.s;"));
@@ -1470,7 +1509,7 @@ TEST_CASE("kafka poller: a failed exactly-once batch is rolled back and the sess
     auto* resource = engine->resource();
     auto addr = engine->dispatcher();
 
-    GreenplumParser parser(resource, no_aliases());
+    GreenplumParser parser(resource);
     auto kafka_mgr = actor_zeta::spawn<KafkaManager>(resource, addr);
     auto src = parse_kafka(parser,
                            "CREATE SOURCE s (id INT, name VARCHAR) "
@@ -1501,8 +1540,7 @@ TEST_CASE("kafka poller: a failed exactly-once batch is rolled back and the sess
         auto failed = drive_until_ready(kd::kafka_insert_session(addr,
                                                                  resource,
                                                                  txn,
-                                                                 "kafka",
-                                                                 "missing",
+                                                                 otterstax::kafka::kafka_table_name("missing"),
                                                                  kd::json_to_chunk(resource, columns, payloads)));
         REQUIRE(failed);
         CHECK(failed->is_error());
@@ -1512,8 +1550,7 @@ TEST_CASE("kafka poller: a failed exactly-once batch is rolled back and the sess
         REQUIRE_FALSE(drive_until_ready(kd::kafka_insert_session(addr,
                                                                  resource,
                                                                  txn,
-                                                                 "kafka",
-                                                                 "s",
+                                                                 otterstax::kafka::kafka_table_name("s"),
                                                                  kd::json_to_chunk(resource, columns, payloads)))
                           ->is_error());
         REQUIRE_FALSE(drive_until_ready(kd::kafka_query_session(addr, resource, txn, "COMMIT;"))->is_error());
@@ -1525,24 +1562,24 @@ TEST_CASE("kafka poller: a failed exactly-once batch is rolled back and the sess
     {
         auto error = kd::ingest_transactional(addr,
                                               resource,
-                                              "kafka",
-                                              "missing",
+                                              otterstax::kafka::kafka_table_name("missing"),
+                                              otterstax::kafka::kafka_offsets_table_name("missing"),
                                               {{0, 10}},
                                               kd::json_to_chunk(resource, columns, payloads));
         CHECK(error.contains_error());
         CHECK(count("kafka.s") == 1);
-        CHECK(count("kafka.s__offsets") == 0);
+        CHECK(count("federation.kafka.s__offsets") == 0);
     }
     {
         auto error = kd::ingest_transactional(addr,
                                               resource,
-                                              "kafka",
-                                              "s",
+                                              otterstax::kafka::kafka_table_name("s"),
+                                              otterstax::kafka::kafka_offsets_table_name("s"),
                                               {{0, 10}},
                                               kd::json_to_chunk(resource, columns, payloads));
         CHECK_FALSE(error.contains_error());
         CHECK(count("kafka.s") == 2);
-        CHECK(count("kafka.s__offsets") == 1);
+        CHECK(count("federation.kafka.s__offsets") == 1);
     }
 }
 
@@ -1555,7 +1592,7 @@ TEST_CASE("kafka recover: __sources rows past the first chunk are replayed, a mi
     namespace lp = components::logical_plan;
     namespace ty = components::types;
 
-    GreenplumParser parser(resource, no_aliases());
+    GreenplumParser parser(resource);
     // The registry in this process: creates the objects and persists their rows
     auto creator = actor_zeta::spawn<KafkaManager>(resource, addr);
     auto create_source = [&](const std::string& name) {
@@ -1593,11 +1630,11 @@ TEST_CASE("kafka recover: __sources rows past the first chunk are replayed, a mi
                                            "false",
                                            ""};
             for (std::size_t col = 0; col < 8; ++col) {
-                chunk.set_value(col, row, ty::logical_value_t(resource, values[col]));
+                chunk.set_value(col, row, std::string_view{values[col]});
             }
         }
         chunk.set_cardinality(count);
-        auto cursor = drive_until_ready(kd::kafka_insert(addr, resource, "kafka", "__sources", std::move(chunk)));
+        auto cursor = drive_until_ready(kd::kafka_insert(addr, resource, otterstax::kafka::kafka_service_table_name("__sources"), std::move(chunk)));
         REQUIRE(cursor);
         REQUIRE_FALSE(cursor->is_error());
     };
@@ -1605,7 +1642,7 @@ TEST_CASE("kafka recover: __sources rows past the first chunk are replayed, a mi
     ghost_rows(515, 515);
     create_source("last");
     {
-        auto rows = drive_until_ready(kd::kafka_query(addr, resource, "SELECT name FROM kafka.__sources;"));
+        auto rows = drive_until_ready(kd::kafka_query(addr, resource, "SELECT name FROM federation.kafka.__sources;"));
         REQUIRE(rows);
         REQUIRE_FALSE(rows->is_error());
         REQUIRE(rows->size() == 1032);
@@ -1647,9 +1684,8 @@ TEST_CASE("kafka recover: a source's columns are read from the catalog, for an e
     namespace kd = otterstax::kafka::detail;
     namespace lp = components::logical_plan;
     namespace ty = components::types;
-    const std::string kafka_db{otterstax::kafka::KAFKA_DATABASE_NAME};
 
-    GreenplumParser parser(resource, no_aliases());
+    GreenplumParser parser(resource);
     auto run_kafka = [&](auto& manager, const std::string& sql) {
         auto node = parse_kafka(parser, sql);
         REQUIRE(node);
@@ -1682,13 +1718,13 @@ TEST_CASE("kafka recover: a source's columns are read from the catalog, for an e
                                         R"({"id":2,"name":"b","w":2.5})",
                                         R"({"id":3,"name":"c","w":3.5})"});
         REQUIRE(chunk.size() == 3);
-        auto cursor = drive_until_ready(kd::kafka_insert(addr, resource, kafka_db, "full_src", std::move(chunk)));
+        auto cursor = drive_until_ready(kd::kafka_insert(addr, resource, otterstax::kafka::kafka_table_name("full_src"), std::move(chunk)));
         REQUIRE(cursor);
         REQUIRE_FALSE(cursor->is_error());
     }
     auto count = [&](const std::string& relname) {
         auto cursor =
-            drive_until_ready(kd::kafka_query(addr, resource, "SELECT * FROM " + kafka_db + "." + relname + ";"));
+            drive_until_ready(kd::kafka_query(addr, resource, "SELECT * FROM kafka." + relname + ";"));
         REQUIRE(cursor);
         REQUIRE_FALSE(cursor->is_error());
         return cursor->size();
@@ -1761,15 +1797,15 @@ TEST_CASE("kafka recover: a source's columns are read from the catalog, for an e
 }
 
 namespace {
-    // The objects named in kafka.__sources, as a set
+    // The objects named in federation.kafka.__sources, as a set
     std::set<std::string> sources_rows(actor_zeta::address_t addr, std::pmr::memory_resource* resource) {
         auto cursor =
-            drive_until_ready(otterstax::kafka::detail::kafka_query(addr, resource, "SELECT name FROM kafka.__sources;"));
+            drive_until_ready(otterstax::kafka::detail::kafka_query(addr, resource, "SELECT name FROM federation.kafka.__sources;"));
         REQUIRE(cursor);
         REQUIRE_FALSE(cursor->is_error());
         std::set<std::string> names;
         for (std::uint64_t row = 0; row < cursor->size(); ++row) {
-            names.insert(std::string{cursor->value(0, row).value<std::string_view>()});
+            names.insert(std::string{cell<std::string_view>(cursor, 0, row)});
         }
         return names;
     }
@@ -1809,7 +1845,7 @@ TEST_CASE("kafka drop: DROP SOURCE with a dependent VIEW") {
     auto addr = engine->dispatcher();
     namespace kd = otterstax::kafka::detail;
 
-    GreenplumParser parser(resource, no_aliases());
+    GreenplumParser parser(resource);
     auto kafka_mgr = actor_zeta::spawn<KafkaManager>(resource, addr);
 
     auto run_kafka = [&](kafka_node_ptr node) {
@@ -1843,14 +1879,14 @@ TEST_CASE("kafka drop: DROP SOURCE with a dependent VIEW") {
     // Bare DROP and an explicit RESTRICT are refused alike, naming the view
     const std::string refusal = "kafka: cannot drop source 's': view kafka.v depends on it (and possibly other "
                                 "objects); use DROP SOURCE s CASCADE";
-    require_error(run_kafka(parse_kafka(parser, "DROP SOURCE s;")), core::error_code_t::other_error, refusal);
-    require_error(run_kafka(parse_kafka(parser, "DROP SOURCE s RESTRICT;")), core::error_code_t::other_error, refusal);
+    require_error(run_kafka(parse_kafka(parser, "DROP SOURCE s;")), core::error_code_t::dependent_objects_still_exist, refusal);
+    require_error(run_kafka(parse_kafka(parser, "DROP SOURCE s RESTRICT;")), core::error_code_t::dependent_objects_still_exist, refusal);
     // IF EXISTS forgives a missing source, never a dependent
-    require_error(run_kafka(parse_kafka(parser, "DROP SOURCE IF EXISTS s;")), core::error_code_t::other_error, refusal);
+    require_error(run_kafka(parse_kafka(parser, "DROP SOURCE IF EXISTS s;")), core::error_code_t::dependent_objects_still_exist, refusal);
 
     // Nothing was dropped or forgotten
     CHECK_FALSE(query("SELECT * FROM kafka.s;")->is_error());
-    CHECK_FALSE(query("SELECT * FROM kafka.s__offsets;")->is_error());
+    CHECK_FALSE(query("SELECT * FROM federation.kafka.s__offsets;")->is_error());
     CHECK(sources_rows(addr, resource) == std::set<std::string>{"s"});
     CHECK(produce_probe(kafka_mgr.get(), resource, "s").find("does not match its declared schema") !=
           std::string::npos);
@@ -1861,8 +1897,7 @@ TEST_CASE("kafka drop: DROP SOURCE with a dependent VIEW") {
             {"name", components::types::complex_logical_type(components::types::logical_type::STRING_LITERAL)}};
         auto error = kd::ingest_at_least_once(addr,
                                               resource,
-                                              "kafka",
-                                              "s",
+                                              otterstax::kafka::kafka_table_name("s"),
                                               kd::json_to_chunk(resource, cols, {R"({"id":1,"name":"a"})"}));
         CHECK_FALSE(error.contains_error());
         auto rows = query("SELECT * FROM kafka.v;");
@@ -1874,21 +1909,21 @@ TEST_CASE("kafka drop: DROP SOURCE with a dependent VIEW") {
     REQUIRE_FALSE(run_kafka(parse_kafka(parser, "DROP SOURCE s CASCADE;"))->is_error());
     require_error(query("SELECT * FROM kafka.s;"),
                   core::error_code_t::table_not_exists,
-                  "collection does not exist: kafka.s");
-    require_error(query("SELECT * FROM kafka.s__offsets;"),
+                  "relation \"kafka.s\" does not exist");
+    require_error(query("SELECT * FROM federation.kafka.s__offsets;"),
                   core::error_code_t::table_not_exists,
-                  "collection does not exist: kafka.s__offsets");
+                  "relation \"federation.kafka.s__offsets\" does not exist");
     CHECK(sources_rows(addr, resource).empty());
     require_error(query("SELECT * FROM kafka.v;"),
                   core::error_code_t::table_not_exists,
-                  "collection does not exist: kafka.v");
+                  "relation \"kafka.v\" does not exist");
     CHECK(produce_probe(kafka_mgr.get(), resource, "s") == "kafka: INSERT into unknown object 's'");
     CHECK_FALSE(run_kafka(parse_kafka(parser, "DROP SOURCE IF EXISTS s CASCADE;"))->is_error());
 
     REQUIRE_FALSE(run_kafka(parse_kafka(parser, create_source))->is_error());
     require_error(query("SELECT * FROM kafka.v;"),
                   core::error_code_t::table_not_exists,
-                  "collection does not exist: kafka.v");
+                  "relation \"kafka.v\" does not exist");
 }
 
 // A refused drop of the backing table must not have dropped the offsets table
@@ -1914,14 +1949,14 @@ TEST_CASE("kafka drop: a refused DROP SOURCE leaves the offsets table intact") {
     };
     auto stored_offsets = [&] {
         return kd::parse_offsets(drive_until_ready(
-            kd::kafka_query(addr, resource, "SELECT partition_id, committed_offset FROM kafka.s__offsets;")));
+            kd::kafka_query(addr, resource, "SELECT partition_id, committed_offset FROM federation.kafka.s__offsets;")));
     };
 
     REQUIRE_FALSE(run_kafka("CREATE SOURCE s (id INT, name VARCHAR) "
                             "WITH (KAFKA_TOPIC='t', BOOTSTRAP_SERVERS='localhost:9092');")
                       ->is_error());
     const std::map<int32_t, int64_t> offsets{{0, 41}, {1, 7}, {2, 1000}};
-    REQUIRE_FALSE(drive_until_ready(kd::write_offsets(addr, resource, "kafka", "s__offsets", offsets))->is_error());
+    REQUIRE_FALSE(drive_until_ready(kd::write_offsets(addr, resource, otterstax::kafka::kafka_offsets_table_name("s"), offsets))->is_error());
     REQUIRE(stored_offsets() == offsets);
     REQUIRE_FALSE(
         drive_until_ready(kd::kafka_query(addr, resource, "CREATE VIEW kafka.v AS SELECT id FROM kafka.s;"))
@@ -1929,12 +1964,12 @@ TEST_CASE("kafka drop: a refused DROP SOURCE leaves the offsets table intact") {
 
     auto refused = run_kafka("DROP SOURCE s;");
     REQUIRE(refused->is_error());
-    CHECK(refused->get_error().type == core::error_code_t::other_error);
+    CHECK(refused->get_error().type == core::error_code_t::dependent_objects_still_exist);
     CHECK(stored_offsets() == offsets);
 
     // Once the source does go, its offsets table goes with it
     REQUIRE_FALSE(run_kafka("DROP SOURCE s CASCADE;")->is_error());
-    auto gone = drive_until_ready(kd::kafka_query(addr, resource, "SELECT * FROM kafka.s__offsets;"));
+    auto gone = drive_until_ready(kd::kafka_query(addr, resource, "SELECT * FROM federation.kafka.s__offsets;"));
     REQUIRE(gone);
     CHECK(gone->is_error());
 }
@@ -2005,11 +2040,11 @@ TEST_CASE("kafka drop: DROP SOURCE and DROP STREAM with dependent streams and IN
     // RESTRICT (written or defaulted) names every reader and leaves everything up
     const std::string source_refusal = "kafka: cannot drop source 'a': insert query 'm__insert__0', stream 'st' "
                                        "depend on it; use DROP SOURCE a CASCADE";
-    require_error(run_kafka("DROP SOURCE a;"), core::error_code_t::other_error, source_refusal);
-    require_error(run_kafka("DROP SOURCE a RESTRICT;"), core::error_code_t::other_error, source_refusal);
-    require_error(run_kafka("DROP SOURCE IF EXISTS a;"), core::error_code_t::other_error, source_refusal);
+    require_error(run_kafka("DROP SOURCE a;"), core::error_code_t::dependent_objects_still_exist, source_refusal);
+    require_error(run_kafka("DROP SOURCE a RESTRICT;"), core::error_code_t::dependent_objects_still_exist, source_refusal);
+    require_error(run_kafka("DROP SOURCE IF EXISTS a;"), core::error_code_t::dependent_objects_still_exist, source_refusal);
     CHECK(table_exists("kafka.a"));
-    CHECK(table_exists("kafka.a__offsets"));
+    CHECK(table_exists("federation.kafka.a__offsets"));
     CHECK(sources_rows(addr, resource) == all);
     for (const auto& name : all) {
         CHECK(known(name));
@@ -2017,7 +2052,7 @@ TEST_CASE("kafka drop: DROP SOURCE and DROP STREAM with dependent streams and IN
 
     // A stream read by another stream is held back the same way
     require_error(run_kafka("DROP STREAM st;"),
-                  core::error_code_t::other_error,
+                  core::error_code_t::dependent_objects_still_exist,
                   "kafka: cannot drop stream 'st': stream 'st2' depends on it; use DROP STREAM st CASCADE");
     // DROP STREAM names a stream, never a source
     require_error(run_kafka("DROP STREAM b CASCADE;"),
@@ -2041,7 +2076,7 @@ TEST_CASE("kafka drop: DROP SOURCE and DROP STREAM with dependent streams and IN
     // CASCADE takes st, st2 (over st) and the INSERT INTO query; m and b stay
     REQUIRE_FALSE(run_kafka("DROP SOURCE a CASCADE;")->is_error());
     CHECK_FALSE(table_exists("kafka.a"));
-    CHECK_FALSE(table_exists("kafka.a__offsets"));
+    CHECK_FALSE(table_exists("federation.kafka.a__offsets"));
     CHECK(sources_rows(addr, resource) == std::set<std::string>{"b", "m"});
     for (const auto& name : {"a", "st", "st2", "m__insert__0"}) {
         CHECK_FALSE(known(name));
@@ -2064,7 +2099,7 @@ TEST_CASE("kafka drop: DROP SOURCE and DROP STREAM with dependent streams and IN
     REQUIRE_FALSE(run_kafka("CREATE STREAM y" + with + " AS SELECT id, val FROM kafka.x;")->is_error());
     REQUIRE_FALSE(run_insert("m", "INSERT INTO kafka.m SELECT id, val FROM kafka.b;")->is_error());
     require_error(run_kafka("DROP STREAM x RESTRICT;"),
-                  core::error_code_t::other_error,
+                  core::error_code_t::dependent_objects_still_exist,
                   "kafka: cannot drop stream 'x': stream 'y' depends on it; use DROP STREAM x CASCADE");
     REQUIRE_FALSE(run_kafka("DROP STREAM x CASCADE;")->is_error());
     CHECK_FALSE(known("x"));
@@ -2129,7 +2164,7 @@ TEST_CASE("kafka recover: dangling stream and INSERT INTO query rows are deleted
     REQUIRE_FALSE(drive_until_ready(kd::kafka_query(addr, resource, "DROP TABLE kafka.a;"))->is_error());
     for (const auto& name : {"c", "z"}) {
         REQUIRE_FALSE(
-            drive_until_ready(kd::kafka_delete_where_eq(addr, resource, "kafka", "__sources", "name", name))
+            drive_until_ready(kd::kafka_delete_where_eq(addr, resource, otterstax::kafka::kafka_service_table_name("__sources"), "name", name))
                 ->is_error());
     }
     REQUIRE(sources_rows(addr, resource) == std::set<std::string>{"a",
@@ -2203,7 +2238,7 @@ TEST_CASE("kafka drop: a refused DROP SOURCE keeps its poller") {
     {
         auto refused = run_kafka("DROP SOURCE s RESTRICT;");
         REQUIRE(refused->is_error());
-        CHECK(refused->get_error().type == core::error_code_t::other_error);
+        CHECK(refused->get_error().type == core::error_code_t::dependent_objects_still_exist);
     }
     CHECK(kafka_mgr->has_poller("s"));
 
@@ -2244,7 +2279,7 @@ TEST_CASE("kafka recover: a stream over a stream is recovered whatever the row o
     // a, st3, st2, st1 — every stream before the stream it reads
     auto rewrite_last = [&](const std::string& name, const std::string& as_select) {
         REQUIRE_FALSE(
-            drive_until_ready(kd::kafka_delete_where_eq(addr, resource, "kafka", "__sources", "name", name))
+            drive_until_ready(kd::kafka_delete_where_eq(addr, resource, otterstax::kafka::kafka_service_table_name("__sources"), "name", name))
                 ->is_error());
         std::pmr::vector<ty::complex_logical_type> col_types(resource);
         for (const char* alias :
@@ -2257,21 +2292,21 @@ TEST_CASE("kafka recover: a stream over a stream is recovered whatever the row o
         const std::string values[8] =
             {name, "stream", "t", "127.0.0.1:9092", "otterstax_stream_" + name, "earliest", "false", as_select};
         for (std::size_t col = 0; col < 8; ++col) {
-            chunk.set_value(col, 0, ty::logical_value_t(resource, values[col]));
+            chunk.set_value(col, 0, std::string_view{values[col]});
         }
         chunk.set_cardinality(1);
-        REQUIRE_FALSE(drive_until_ready(kd::kafka_insert(addr, resource, "kafka", "__sources", std::move(chunk)))
+        REQUIRE_FALSE(drive_until_ready(kd::kafka_insert(addr, resource, otterstax::kafka::kafka_service_table_name("__sources"), std::move(chunk)))
                           ->is_error());
     };
     rewrite_last("st2", "SELECT id, val FROM kafka.st1");
     rewrite_last("st1", "SELECT id, val FROM kafka.a");
     {
-        auto rows = drive_until_ready(kd::kafka_query(addr, resource, "SELECT name FROM kafka.__sources;"));
+        auto rows = drive_until_ready(kd::kafka_query(addr, resource, "SELECT name FROM federation.kafka.__sources;"));
         REQUIRE(rows);
         REQUIRE_FALSE(rows->is_error());
         std::vector<std::string> order;
         for (std::uint64_t row = 0; row < rows->size(); ++row) {
-            order.emplace_back(rows->value(0, row).value<std::string_view>());
+            order.emplace_back(cell<std::string_view>(rows, 0, row));
         }
         REQUIRE(order == std::vector<std::string>{"a", "st3", "st2", "st1"});
     }

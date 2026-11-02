@@ -11,8 +11,8 @@ forms (frontend/CLAUDE.md, "MySQL protocol statements"):
     variable selects with aliases (Connector/J), `SELECT @@session.autocommit` /
     `@@session.sql_mode` (mysql-connector-python's properties), SHOW VARIABLES
     LIKE, SHOW WARNINGS, SELECT DATABASE();
-  * `SET @@session.autocommit = OFF` (mysql-connector-python, pure mode) is
-    answered OK, without effect, as every SET is;
+  * `SET @@session.autocommit = ON` (mysql-connector-python, pure mode) is
+    written as the engine's SET and applied to the connection alone;
   * the text is read by MySQL's default lexical rules and the server says so:
     neither the status flags nor @@sql_mode carry NO_BACKSLASH_ESCAPES or
     ANSI_QUOTES, so the drivers escape with a backslash, and the frontend reads
@@ -35,9 +35,9 @@ import pymysql
 
 import config
 
-DB = "mysql_housekeeping"
+SCHEMA = "mysql_housekeeping"          # a schema of the session's database, main
 TABLE = "items"
-QUALIFIED = f"{DB}.{TABLE}"
+QUALIFIED = f"{SCHEMA}.{TABLE}"
 
 ER_UNKNOWN_SYSTEM_VARIABLE = 1193
 ER_PARSE_ERROR = 1064
@@ -53,7 +53,7 @@ class MySqlClientHousekeepingTest:
     def __init__(self, local=False):
         self.host = config.get_host(local)
         self.admin = None
-        self.database_created = False
+        self.schema_created = False
         self.table_created = False
 
     # ── helpers ─────────────────────────────────────────────────────────────
@@ -73,8 +73,9 @@ class MySqlClientHousekeepingTest:
     def setup(self):
         self.admin = self.connect()
         with self.admin.cursor() as cur:
-            cur.execute(f"CREATE DATABASE {DB}")
-            self.database_created = True
+            cur.execute(f"DROP SCHEMA IF EXISTS {SCHEMA} CASCADE")
+            cur.execute(f"CREATE SCHEMA {SCHEMA}")
+            self.schema_created = True
             cur.execute(f"CREATE TABLE {QUALIFIED} (id bigint, name string)")
             self.table_created = True
             cur.execute(f"INSERT INTO {QUALIFIED} (id, name) VALUES (1, 'a'), (2, '?'), (3, 'c')")
@@ -86,8 +87,8 @@ class MySqlClientHousekeepingTest:
             with self.admin.cursor() as cur:
                 if self.table_created:
                     cur.execute(f"DROP TABLE {QUALIFIED}")
-                if self.database_created:
-                    cur.execute(f"DROP DATABASE {DB}")
+                if self.schema_created:
+                    cur.execute(f"DROP SCHEMA {SCHEMA} CASCADE")
         finally:
             self.admin.close()
 

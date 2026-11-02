@@ -9,14 +9,15 @@ The block rules are the engine's, the same as on the PostgreSQL wire
 
   * BEGIN ... COMMIT publishes the block's rows to other connections, and a
     block the client never commits is rolled back when its connection closes;
-  * `SET autocommit = 0` is answered OK WITHOUT EFFECT (otterbrix would apply a
-    SET to every session; OTB-session-settings): a driver running with
-    autocommit off still commits every statement it sends outside an explicit
-    BEGIN, and the SET changes no other connection either;
+  * `SET autocommit = 0` runs in the engine and is the connection's own: a
+    driver running with autocommit off opens a block with its first statement
+    (SERVER_STATUS_IN_TRANS) that commit() ends, and no other connection is
+    affected;
   * an error inside a block fails it: later statements are refused and the
     COMMIT of the failed block is answered with an OK packet that commits
     nothing;
-  * SAVEPOINT is refused with ER_NOT_SUPPORTED_YET (1235);
+  * SAVEPOINT / ROLLBACK TO / RELEASE run in the engine; outside a block
+    SAVEPOINT is the engine's refusal and fails nothing;
   * SET NAMES inside a block is answered by the frontend and keeps the block;
   * every OK packet carries SERVER_STATUS_IN_TRANS while a block is open.
 
@@ -30,11 +31,9 @@ import pymysql
 
 import config
 
-DB = "txn_mysql_wire"
+SCHEMA = "txn_mysql_wire"              # a schema of the session's database, main
 TABLE = "items"
-QUALIFIED = f"{DB}.{TABLE}"
-
-ER_NOT_SUPPORTED_YET = 1235
+QUALIFIED = f"{SCHEMA}.{TABLE}"
 SERVER_STATUS_IN_TRANS = 0x0001
 
 
@@ -42,7 +41,7 @@ class MySqlWireTransactionTest:
     def __init__(self, local=False):
         self.host = config.get_host(local)
         self.admin = None
-        self.database_created = False
+        self.schema_created = False
         self.table_created = False
 
     # ── helpers ─────────────────────────────────────────────────────────────
@@ -79,8 +78,9 @@ class MySqlWireTransactionTest:
     def setup(self):
         self.admin = self.connect()
         with self.admin.cursor() as cur:
-            cur.execute(f"CREATE DATABASE {DB}")
-            self.database_created = True
+            cur.execute(f"DROP SCHEMA IF EXISTS {SCHEMA} CASCADE")
+            cur.execute(f"CREATE SCHEMA {SCHEMA}")
+            self.schema_created = True
             cur.execute(f"CREATE TABLE {QUALIFIED} (id bigint, name string)")
             self.table_created = True
 
@@ -91,8 +91,8 @@ class MySqlWireTransactionTest:
             with self.admin.cursor() as cur:
                 if self.table_created:
                     cur.execute(f"DROP TABLE {QUALIFIED}")
-                if self.database_created:
-                    cur.execute(f"DROP DATABASE {DB}")
+                if self.schema_created:
+                    cur.execute(f"DROP SCHEMA {SCHEMA} CASCADE")
         finally:
             self.admin.close()
 
@@ -133,38 +133,42 @@ class MySqlWireTransactionTest:
             b.close()
         print("  block left open at close: rolled back ✓")
 
-    def test_autocommit_off_without_begin_commits_each_statement(self):
-        """A driver with autocommit off sends SET autocommit = 0, answered without effect: its writes commit."""
+    def test_autocommit_off_opens_a_block_at_the_first_statement(self):
+        """A driver with autocommit off sends SET autocommit = 0: its first INSERT opens a block commit() ends."""
         a, b = self.connect(autocommit=False), self.connect()
         try:
             with a.cursor() as cur:
-                cur.execute(f"INSERT INTO {QUALIFIED} (id, name) VALUES (120, 'no commit')")
-            self.assert_equal(self.in_transaction(a), False, "no block was opened by the driver's SET")
-            self.assert_equal(self.ids(b, 120, 129), [120], "the statement committed on its own")
-            a.commit()  # COMMIT outside a block is accepted and ends nothing
+                cur.execute(f"INSERT INTO {QUALIFIED} (id, name) VALUES (120, 'autocommit off')")
+            self.assert_equal(self.in_transaction(a), True, "the INSERT opened a block")
+            self.assert_equal(self.ids(b, 120, 129), [], "not committed before commit()")
+            a.commit()
+            self.assert_equal(self.in_transaction(a), False, "commit() ended the block")
+            self.assert_equal(self.ids(b, 120, 129), [120], "visible after commit()")
         finally:
             a.close()
             b.close()
-        print("  autocommit=False without BEGIN: each statement commits (SET autocommit has no effect) ✓")
+        print("  autocommit=False: the first statement opens a block, commit() publishes it ✓")
 
-    def test_set_autocommit_on_one_connection_changes_no_other(self):
+    def test_set_autocommit_is_the_connections_own(self):
         """SET autocommit = 0 on one connection: another connection's INSERT is still seen at once by a third."""
         a, b, c = self.connect(), self.connect(), self.connect()
         try:
             with a.cursor() as cur:
                 cur.execute("SET autocommit = 0")
                 cur.execute(f"INSERT INTO {QUALIFIED} (id, name) VALUES (130, 'a after set')")
+            self.assert_equal(self.in_transaction(a), True, "a's INSERT opened a block")
             with b.cursor() as cur:
                 cur.execute(f"INSERT INTO {QUALIFIED} (id, name) VALUES (131, 'b')")
-            self.assert_equal(self.ids(c, 130, 139), [130, 131],
-                              "both INSERTs are committed: the SET changed neither connection")
+            self.assert_equal(self.ids(c, 130, 139), [131], "b committed on its own, a did not yet")
             with a.cursor() as cur:
+                cur.execute("COMMIT")
                 cur.execute("SET autocommit = 1")
+            self.assert_equal(self.ids(c, 130, 139), [130, 131], "a's row after its COMMIT")
         finally:
             a.close()
             b.close()
             c.close()
-        print("  SET autocommit = 0: no other connection affected ✓")
+        print("  SET autocommit = 0: the connection's own ✓")
 
     def test_error_fails_the_block_and_commit_commits_nothing(self):
         """An error inside a block refuses the next statements; COMMIT answers OK and keeps nothing."""
@@ -173,10 +177,10 @@ class MySqlWireTransactionTest:
             a.begin()
             with a.cursor() as cur:
                 cur.execute(f"INSERT INTO {QUALIFIED} (id, name) VALUES (140, 'lost')")
-                self.expect_error(cur, f"SELECT * FROM {DB}.no_such_table", what="a missing table")
+                self.expect_error(cur, f"SELECT * FROM {SCHEMA}.no_such_table", what="a missing table")
                 error = self.expect_error(cur, f"INSERT INTO {QUALIFIED} (id, name) VALUES (141, 'refused')",
                                           what="inside the failed block")
-                assert "only ROLLBACK is accepted" in str(error), f"the refusal must say why: {error}"
+                assert "only ROLLBACK" in str(error), f"the refusal must say why: {error}"
             self.assert_equal(self.in_transaction(a), True, "a failed block is still a block")
             a.commit()  # answered with an OK packet: the engine rolled the failed block back
             self.assert_equal(self.in_transaction(a), False, "the COMMIT ended the failed block")
@@ -187,27 +191,29 @@ class MySqlWireTransactionTest:
             b.close()
         print("  error in a block: refused until it ends, COMMIT keeps nothing ✓")
 
-    def test_savepoint_is_refused_with_1235(self):
-        """SAVEPOINT: ER_NOT_SUPPORTED_YET outside a block (nothing failed) and inside one (the block fails)."""
+    def test_savepoint_rolls_back_to_its_point(self):
+        """SAVEPOINT / ROLLBACK TO / RELEASE inside a block; outside one SAVEPOINT is refused and fails nothing."""
         a, b = self.connect(), self.connect()
         try:
             with a.cursor() as cur:
-                self.expect_error(cur, "SAVEPOINT s1", ER_NOT_SUPPORTED_YET, "outside a block")
+                self.expect_error(cur, "SAVEPOINT s1", what="outside a block")
                 cur.execute(f"INSERT INTO {QUALIFIED} (id, name) VALUES (150, 'outside')")
             self.assert_equal(self.ids(b, 150, 159), [150], "a refusal outside a block fails nothing")
 
             a.begin()
             with a.cursor() as cur:
-                cur.execute(f"INSERT INTO {QUALIFIED} (id, name) VALUES (151, 'inside')")
-                self.expect_error(cur, "SAVEPOINT s1", ER_NOT_SUPPORTED_YET, "inside a block")
-                self.expect_error(cur, f"INSERT INTO {QUALIFIED} (id, name) VALUES (152, 'refused')",
-                                  what="after the refused SAVEPOINT")
-            a.rollback()
-            self.assert_equal(self.ids(b, 150, 159), [150], "the failed block kept nothing")
+                cur.execute(f"INSERT INTO {QUALIFIED} (id, name) VALUES (151, 'before savepoint')")
+                cur.execute("SAVEPOINT s1")
+                cur.execute(f"INSERT INTO {QUALIFIED} (id, name) VALUES (152, 'after savepoint')")
+                cur.execute("ROLLBACK TO SAVEPOINT s1")
+                cur.execute("RELEASE SAVEPOINT s1")
+            self.assert_equal(self.in_transaction(a), True, "the block is still open")
+            a.commit()
+            self.assert_equal(self.ids(b, 150, 159), [150, 151], "ROLLBACK TO undid the row after the savepoint")
         finally:
             a.close()
             b.close()
-        print("  SAVEPOINT -> 1235 ✓")
+        print("  SAVEPOINT / ROLLBACK TO / RELEASE ✓")
 
     def test_set_names_inside_a_block_keeps_it(self):
         """SET NAMES inside a block is the frontend's OK: the block stays open and commits both rows."""
@@ -231,10 +237,10 @@ class MySqlWireTransactionTest:
             self.setup()
             self.test_begin_commit_is_visible_to_another_connection()
             self.test_block_left_open_is_rolled_back_when_the_connection_closes()
-            self.test_autocommit_off_without_begin_commits_each_statement()
-            self.test_set_autocommit_on_one_connection_changes_no_other()
+            self.test_autocommit_off_opens_a_block_at_the_first_statement()
+            self.test_set_autocommit_is_the_connections_own()
             self.test_error_fails_the_block_and_commit_commits_nothing()
-            self.test_savepoint_is_refused_with_1235()
+            self.test_savepoint_rolls_back_to_its_point()
             self.test_set_names_inside_a_block_keeps_it()
         finally:
             self.cleanup()

@@ -18,7 +18,9 @@ namespace frontend {
                 case components::types::logical_type::NA:
                     return mysql::field_type::MYSQL_TYPE_NULL;
                 case components::types::logical_type::BOOLEAN:
-                    return mysql::field_type::MYSQL_TYPE_BOOL;
+                    // MySQL's BOOLEAN is TINYINT(1) (apply_type_metadata); 244
+                    // (MYSQL_TYPE_BOOL) is the server's placeholder, never sent.
+                    return mysql::field_type::MYSQL_TYPE_TINY;
                 case components::types::logical_type::TINYINT:
                 case components::types::logical_type::UTINYINT:
                     return mysql::field_type::MYSQL_TYPE_TINY;
@@ -74,14 +76,18 @@ namespace frontend {
             switch (log_type) {
                 case components::types::logical_type::BOOLEAN:
                     return postgres::field_type::BOOL;
+                // PostgreSQL has no 1-byte and no unsigned integer: the smallest
+                // type that holds every value. UBIGINT has none (count(*) is
+                // one, and PostgreSQL's count is bigint): int8, a value past
+                // INT64_MAX not representable.
                 case components::types::logical_type::TINYINT:
                 case components::types::logical_type::UTINYINT:
                 case components::types::logical_type::SMALLINT:
+                    return postgres::field_type::INT2;
                 case components::types::logical_type::USMALLINT:
-                    return postgres::field_type::INT2; // smallest postgres int
                 case components::types::logical_type::INTEGER:
-                case components::types::logical_type::UINTEGER:
                     return postgres::field_type::INT4;
+                case components::types::logical_type::UINTEGER:
                 case components::types::logical_type::BIGINT:
                 case components::types::logical_type::UBIGINT:
                     return postgres::field_type::INT8;

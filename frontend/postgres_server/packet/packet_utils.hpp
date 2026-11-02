@@ -10,7 +10,7 @@
 #include "packet_writer.hpp"
 
 #include <components/sql/parser/nodes/nodes.h>
-#include <components/types/logical_value.hpp>
+#include <components/vector/vector.hpp>
 #include <core/result_wrapper.hpp>
 
 #include <memory_resource>
@@ -49,6 +49,8 @@ namespace frontend::postgres {
         static command_complete_tag rollback();
         static command_complete_tag savepoint();
         static command_complete_tag release();
+        // RESET [name | ALL] (utility.c: VAR_RESET, VAR_RESET_ALL).
+        static command_complete_tag reset();
         // DEALLOCATE <name> answers "DEALLOCATE", DEALLOCATE ALL "DEALLOCATE ALL".
         static command_complete_tag deallocate(bool all);
 
@@ -63,17 +65,20 @@ namespace frontend::postgres {
 
     // A text-format Bind parameter value converted to the engine value of the
     // statement's declared type. A literal the type cannot hold (garbage,
-    // trailing characters, out of range) is `conversion_failure`; a type the
-    // frontend cannot bind is `unimplemented_yet`. Nothing throws here.
-    core::result_wrapper_t<components::types::logical_value_t>
+    // trailing characters, out of range) is `invalid_text_representation`; a
+    // type the frontend cannot bind is `unimplemented_yet`. Nothing throws here.
+    // The value is a one-row vector.
+    core::result_wrapper_t<components::vector::vector_t>
     parse_text_parameter(std::pmr::memory_resource* resource, field_type type, std::string text);
 
     std::vector<uint8_t> build_auth_ok(packet_writer& writer);
 
+    // Fields S, C, M, and H (PostgreSQL's errhint) only when `hint` is given.
     std::vector<uint8_t> build_error_response(packet_writer& writer,
                                               const char* sqlstate,
                                               std::string message,
-                                              error_severity severity = error_severity::fatal());
+                                              error_severity severity = error_severity::fatal(),
+                                              std::string hint = {});
 
     std::vector<uint8_t> build_parameter_status(packet_writer& writer, std::string key, std::string value);
 

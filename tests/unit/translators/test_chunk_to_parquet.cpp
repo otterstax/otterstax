@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2025-2026  OtterStax
 
+#include "otterbrix/translators/input/decimal_text.hpp"
+#include "single_chunk.hpp"
 #include "otterbrix/translators/input/csv_to_chunk.hpp"
 #include "otterbrix/translators/input/parquet_to_chunk.hpp"
 #include "otterbrix/translators/output/chunk_to_parquet.hpp"
 #include "rows_chunk.hpp"
+#include "../../mock/cell.hpp"
 
 // otterbrix's parser headers (pulled in above) #define DAY / SECOND, which clash
 // with Arrow's TimeUnit/DateUnit enum values.
@@ -28,7 +31,6 @@
 
 using components::types::complex_logical_type;
 using components::types::logical_type;
-using components::types::logical_value_t;
 using components::vector::data_chunk_t;
 using otterstax::test::make_rows_chunk;
 
@@ -39,7 +41,7 @@ namespace {
         const std::string csv = "id,name\n1,Alice\n2,Bob\n3,Charlie\n4,Dave\n5,Eve\n";
         auto loaded = tsl::csv_to_chunk(res, reinterpret_cast<const uint8_t*>(csv.data()), csv.size());
         REQUIRE_FALSE(loaded.has_error());
-        return std::move(loaded.value());
+        return std::move(otterstax::test::single(loaded.value()));
     }
 
     // The whole file through Arrow's own reader, independent of the input translator,
@@ -49,9 +51,9 @@ namespace {
         REQUIRE(file.ok());
         auto reader = parquet::arrow::OpenFile(*file, arrow::default_memory_pool());
         REQUIRE(reader.ok());
-        std::shared_ptr<arrow::Table> table;
-        REQUIRE((*reader)->ReadTable(&table).ok());
-        return table;
+        auto table = (*reader)->ReadTable();
+        REQUIRE(table.ok());
+        return *table;
     }
 
 } // namespace
@@ -73,14 +75,14 @@ TEST_CASE("chunk_to_parquet: round-trips through parquet_to_chunk") {
 
     auto back = tsl::parquet_to_chunk(res, path);
     REQUIRE_FALSE(back.has_error());
-    const auto& chunk = back.value();
+    const auto& chunk = otterstax::test::single((back.value()));
     REQUIRE(chunk.column_count() == 2);
     REQUIRE(chunk.size() == 5);
     // The source chunk's id column is BIGINT, so it round-trips as int64.
-    REQUIRE(chunk.value(0, 0).value<int64_t>() == 1);
-    REQUIRE(chunk.value(0, 4).value<int64_t>() == 5);
-    REQUIRE(chunk.value(1, 0).value<std::string_view>() == "Alice");
-    REQUIRE(chunk.value(1, 4).value<std::string_view>() == "Eve");
+    REQUIRE(otterstax::test::cell(chunk, 0, 0).value<int64_t>() == 1);
+    REQUIRE(otterstax::test::cell(chunk, 0, 4).value<int64_t>() == 5);
+    REQUIRE(otterstax::test::cell(chunk, 1, 0).value<std::string_view>() == "Alice");
+    REQUIRE(otterstax::test::cell(chunk, 1, 4).value<std::string_view>() == "Eve");
 
     std::filesystem::remove(path);
 }
@@ -162,9 +164,9 @@ TEST_CASE("chunk_to_parquet: a hugeint column keeps its full width") {
     data_chunk_t chunk(res, types, 3);
     chunk.set_cardinality(3);
     const auto big = absl::MakeInt128(1, 0); // 2^64
-    chunk.set_value(0, 0, logical_value_t{res, big});
-    chunk.set_value(0, 1, logical_value_t{res, -big});
-    chunk.set_value(0, 2, logical_value_t{res, nullptr});
+    chunk.set_value(0, 0, big);
+    chunk.set_value(0, 1, -big);
+    chunk.data[0].set_null(2, true);
 
     std::pmr::vector<data_chunk_t> chunks(res);
     chunks.push_back(std::move(chunk));
@@ -206,11 +208,11 @@ TEST_CASE("chunk_to_parquet: a DECIMAL round-trips through parquet_to_chunk with
     types.push_back(amount.value());
     data_chunk_t chunk(res, types, 4);
     chunk.set_cardinality(4);
-    chunk.set_value(0, 0, logical_value_t::create_decimal(res, types[0], int64_t{12345}));  // 1.2345
-    chunk.set_value(0, 1, logical_value_t::create_decimal(res, types[0], int64_t{-12345})); // -1.2345
+    tsl::set_decimal_raw(chunk.data[0], 0, int64_t{12345});  // 1.2345
+    tsl::set_decimal_raw(chunk.data[0], 1, int64_t{-12345}); // -1.2345
     // The largest magnitude DECIMAL(18, 4) may declare: 10^18 - 1 unscaled.
-    chunk.set_value(0, 2, logical_value_t::create_decimal(res, types[0], int64_t{999999999999999999}));
-    chunk.set_value(0, 3, logical_value_t{res, nullptr});
+    tsl::set_decimal_raw(chunk.data[0], 2, int64_t{999999999999999999});
+    chunk.data[0].set_null(3, true);
 
     std::pmr::vector<data_chunk_t> chunks(res);
     chunks.push_back(std::move(chunk));
@@ -239,16 +241,16 @@ TEST_CASE("chunk_to_parquet: a DECIMAL round-trips through parquet_to_chunk with
     INFO("load error: " << loaded.error().what.c_str());
     REQUIRE_FALSE(loaded.has_error());
     // types() answers a vector by value, so it is kept alive for the checks below.
-    const auto loaded_types = loaded.value().types();
+    const auto loaded_types = otterstax::test::single(loaded.value()).types();
     const auto& back = loaded_types[0];
     REQUIRE(back.type() == logical_type::DECIMAL);
     const auto* spec = back.extension_as<components::types::decimal_logical_type_extension>();
     REQUIRE(spec->width() == 18);
     REQUIRE(spec->scale() == 4);
-    REQUIRE(loaded.value().value(0, 0).value<int64_t>() == 12345);
-    REQUIRE(loaded.value().value(0, 1).value<int64_t>() == -12345);
-    REQUIRE(loaded.value().value(0, 2).value<int64_t>() == 999999999999999999);
-    REQUIRE(loaded.value().value(0, 3).is_null());
+    REQUIRE(otterstax::test::cell(otterstax::test::single(loaded.value()), 0, 0).value<int64_t>() == 12345);
+    REQUIRE(otterstax::test::cell(otterstax::test::single(loaded.value()), 0, 1).value<int64_t>() == -12345);
+    REQUIRE(otterstax::test::cell(otterstax::test::single(loaded.value()), 0, 2).value<int64_t>() == 999999999999999999);
+    REQUIRE(otterstax::test::cell(otterstax::test::single(loaded.value()), 0, 3).is_null());
 
     std::filesystem::remove(path);
 }
@@ -272,10 +274,10 @@ TEST_CASE("chunk_to_parquet: a hugeint column round-trips through parquet_to_chu
         max_declarable *= 10;
     }
     max_declarable -= 1;
-    chunk.set_value(0, 0, logical_value_t{res, big});
-    chunk.set_value(0, 1, logical_value_t{res, -big});
-    chunk.set_value(0, 2, logical_value_t{res, max_declarable});
-    chunk.set_value(0, 3, logical_value_t{res, nullptr});
+    chunk.set_value(0, 0, big);
+    chunk.set_value(0, 1, -big);
+    chunk.set_value(0, 2, max_declarable);
+    chunk.data[0].set_null(3, true);
 
     std::pmr::vector<data_chunk_t> chunks(res);
     chunks.push_back(std::move(chunk));
@@ -287,15 +289,15 @@ TEST_CASE("chunk_to_parquet: a hugeint column round-trips through parquet_to_chu
     auto back = tsl::parquet_to_chunk(res, path);
     INFO("read error: " << back.error().what.c_str());
     REQUIRE_FALSE(back.has_error());
-    const auto& reloaded = back.value();
+    const auto& reloaded = otterstax::test::single((back.value()));
     REQUIRE(reloaded.column_count() == 1);
     REQUIRE(reloaded.size() == 4);
     REQUIRE(reloaded.types()[0].type() == logical_type::HUGEINT);
     REQUIRE(reloaded.types()[0].alias() == "wide");
-    REQUIRE(reloaded.value(0, 0).value<components::types::int128_t>() == big);
-    REQUIRE(reloaded.value(0, 1).value<components::types::int128_t>() == -big);
-    REQUIRE(reloaded.value(0, 2).value<components::types::int128_t>() == max_declarable);
-    REQUIRE(reloaded.value(0, 3).is_null());
+    REQUIRE(otterstax::test::cell(reloaded, 0, 0).value<components::types::int128_t>() == big);
+    REQUIRE(otterstax::test::cell(reloaded, 0, 1).value<components::types::int128_t>() == -big);
+    REQUIRE(otterstax::test::cell(reloaded, 0, 2).value<components::types::int128_t>() == max_declarable);
+    REQUIRE(otterstax::test::cell(reloaded, 0, 3).is_null());
 
     std::filesystem::remove(path);
 }
@@ -321,7 +323,7 @@ TEST_CASE("chunk_to_parquet: a hugeint past 10^38 is refused, nothing is written
     types.emplace_back(logical_type::HUGEINT, "wide");
     data_chunk_t chunk(res, types, 1);
     chunk.set_cardinality(1);
-    chunk.set_value(0, 0, logical_value_t{res, tail});
+    chunk.set_value(0, 0, tail);
 
     std::pmr::vector<data_chunk_t> chunks(res);
     chunks.push_back(std::move(chunk));
@@ -329,7 +331,7 @@ TEST_CASE("chunk_to_parquet: a hugeint past 10^38 is refused, nothing is written
     auto written = tsl::chunk_to_parquet(res, chunks, path);
 
     REQUIRE(written.has_error());
-    REQUIRE(written.error().type == core::error_code_t::conversion_failure);
+    REQUIRE(written.error().type == core::error_code_t::numeric_value_out_of_range);
     REQUIRE(std::string_view{written.error().what.c_str()}.find("wide") != std::string_view::npos);
     REQUIRE(std::string_view{written.error().what.c_str()}.find("100000000000000000000000000000000000000") !=
             std::string_view::npos);
@@ -346,14 +348,14 @@ TEST_CASE("chunk_to_parquet: a column without a name is refused, nothing is writ
     types.emplace_back(logical_type::BIGINT);
     data_chunk_t chunk(res, types, 1);
     chunk.set_cardinality(1);
-    chunk.set_value(0, 0, logical_value_t{res, int64_t{42}});
+    chunk.set_value(0, 0, int64_t{42});
 
     std::pmr::vector<data_chunk_t> chunks(res);
     chunks.push_back(std::move(chunk));
 
     auto written = tsl::chunk_to_parquet(res, chunks, path);
     REQUIRE(written.has_error());
-    REQUIRE(written.error().type == core::error_code_t::schema_error);
+    REQUIRE(written.error().type == core::error_code_t::undefined_column);
     REQUIRE_FALSE(std::filesystem::exists(path));
 }
 
@@ -374,7 +376,6 @@ TEST_CASE("chunk_to_parquet: DATE and TIMESTAMP are written as Arrow's temporal 
     // otterbrix's importer moves them back. 2022-01-08 is 19000 days after 1970-01-01.
     using components::types::complex_logical_type;
     using components::types::logical_type;
-    using components::types::logical_value_t;
     constexpr int64_t unix_days = 19000;
     constexpr int64_t engine_days = unix_days - 10957;
     constexpr int64_t half_past_ten = 37'800'000'000LL; // 10:30:00 in microseconds
@@ -390,10 +391,10 @@ TEST_CASE("chunk_to_parquet: DATE and TIMESTAMP are written as Arrow's temporal 
     types.emplace_back(logical_type::TIMESTAMP, "at");
     data_chunk_t chunk(res, types, 2);
     chunk.set_cardinality(2);
-    chunk.set_value(0, 0, logical_value_t{res, core::date::date_t{core::date::days{engine_days}}});
-    chunk.set_value(1, 0, logical_value_t{res, core::date::timestamp_t{core::date::microseconds{engine_micros}}});
-    chunk.set_value(0, 1, logical_value_t{res, nullptr});
-    chunk.set_value(1, 1, logical_value_t{res, nullptr});
+    chunk.set_value(0, 0, core::date::date_t{core::date::days{engine_days}});
+    chunk.set_value(1, 0, core::date::timestamp_t{core::date::microseconds{engine_micros}});
+    chunk.data[0].set_null(1, true);
+    chunk.data[1].set_null(1, true);
     std::pmr::vector<data_chunk_t> chunks(res);
     chunks.push_back(std::move(chunk));
 
@@ -414,12 +415,12 @@ TEST_CASE("chunk_to_parquet: DATE and TIMESTAMP are written as Arrow's temporal 
     auto reloaded = tsl::parquet_to_chunk(res, path);
     INFO("read error: " << (reloaded.has_error() ? reloaded.error().what.c_str() : ""));
     REQUIRE_FALSE(reloaded.has_error());
-    const auto reloaded_types = reloaded.value().types();
+    const auto reloaded_types = otterstax::test::single(reloaded.value()).types();
     CHECK(reloaded_types[0].type() == logical_type::DATE);
     CHECK(reloaded_types[1].type() == logical_type::TIMESTAMP);
-    CHECK(reloaded.value().value(0, 0).value<core::date::date_t>().value.count() == engine_days);
-    CHECK(reloaded.value().value(1, 0).value<core::date::timestamp_t>().value.count() == engine_micros);
-    CHECK(reloaded.value().value(0, 1).is_null());
+    CHECK(otterstax::test::cell(otterstax::test::single(reloaded.value()), 0, 0).value<core::date::date_t>().value.count() == engine_days);
+    CHECK(otterstax::test::cell(otterstax::test::single(reloaded.value()), 1, 0).value<core::date::timestamp_t>().value.count() == engine_micros);
+    CHECK(otterstax::test::cell(otterstax::test::single(reloaded.value()), 0, 1).is_null());
 
     std::filesystem::remove(path);
 }
@@ -442,7 +443,7 @@ TEST_CASE("chunk_to_parquet: a failed write leaves an existing file at the path 
     types.emplace_back(components::types::logical_type::HUGEINT, "wide");
     data_chunk_t chunk(res, types, 1);
     chunk.set_cardinality(1);
-    chunk.set_value(0, 0, components::types::logical_value_t{res, past_precision});
+    chunk.set_value(0, 0, past_precision);
     std::pmr::vector<data_chunk_t> chunks(res);
     chunks.push_back(std::move(chunk));
 

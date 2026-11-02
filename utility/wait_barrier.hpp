@@ -145,8 +145,8 @@ namespace otterstax {
     // reported, an error converted from an exception on the io thread, or
     // io_error when the io_context went away before the query ran.
     //
-    // `where` is whatever co_spawn accepts: an execution context (the
-    // ConnectorManagers pass their pool's io_context) or an executor. The MySQL
+    // `where` is whatever co_spawn accepts: an execution context (a backend
+    // agent passes its own io_context) or an executor. The MySQL
     // connector passes its connection's strand executor, so the coroutine — and
     // with it every completion handler the awaited operation derives from it,
     // asio::cancel_after's deadline timer included — runs serialized on that
@@ -165,11 +165,11 @@ namespace otterstax {
         return future;
     }
 
-    // The awaitable ConnectorManager::executeQuery spawns: the connector's
+    // The awaitable a backend agent spawns for a statement: the connector's
     // runQuery, with the handler OWNED by this coroutine's frame.
     //
     // IConnector::runQuery is virtual, so it takes its handler as a non-owning
-    // function_ref_t. executeQuery holds the handler only until it has spawned the
+    // function_ref_t. The agent holds the handler only until it has spawned the
     // query and returned; the handler is moved into this frame instead — a by-value
     // coroutine PARAMETER, like marshal_outcome's promise — and runQuery is called
     // from here, on the io thread, with a reference to that copy, which lives until
@@ -179,8 +179,8 @@ namespace otterstax {
     //
     // runQuery's own frame is created inside marshal_outcome's try, so a throw from
     // that comes back as io_error. `connector` and `query` are borrowed: the
-    // connector belongs to the manager's registry, which has no remove path, and
-    // `query` to the caller, who keeps it until the future settles.
+    // connector belongs to the agent, which waits for the future before it goes,
+    // and `query` to the caller, who keeps it until the future settles.
     template<typename R, typename Arg, typename Connector, typename Callable>
     boost::asio::awaitable<query_result_t<R>>
     run_with_owned_handler(Connector& connector, std::string_view query, Callable handler) {

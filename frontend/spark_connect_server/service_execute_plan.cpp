@@ -23,7 +23,6 @@
 #include "service.hpp"
 
 #include "await_future.hpp"
-#include "session/statement_kind.hpp"
 #include "catalog_relations.hpp"
 #include "frontend/common/utils.hpp"
 #include "otterbrix/parser/parser.hpp"
@@ -41,7 +40,6 @@
 
 #include <cstdint>
 #include <cstdio>
-#include <exception>
 #include <optional>
 #include <utility>
 
@@ -103,38 +101,38 @@ namespace frontend::spark {
 
 #pragma GCC diagnostic pop
 
-    core::result_wrapper_t<sql_statement_t> classify_sql(const std::string& sql,
-                                                         std::pmr::memory_resource* resource,
-                                                         const otterstax::names::alias_registry_t& aliases) {
+    core::result_wrapper_t<sql_statement_t> classify_sql(const std::string& sql, std::pmr::memory_resource* resource) {
         OTX_ZONE_N("spark::classify_sql");
-        // The engine's raw parser sits behind GreenplumParser::parse; as in
-        // query_session_t::parse_sql, the catch is confined to this one call and turns
-        // whatever it throws into sql_parse_error.
-        // A SET / RESET is a command the session answers without effect; the
-        // engine's transformer refuses most of its forms, so it is told by the
-        // raw statement before the parse.
-        if (otterstax::session::is_setting_statement(resource, sql)) {
-            return sql_statement_t::command;
+        GreenplumParser parser(resource);
+        auto parsed = parser.parse(sql);
+        if (parsed.has_error()) {
+            return parsed.convert_error<sql_statement_t>();
         }
-        try {
-            GreenplumParser parser(resource, aliases);
-            auto parsed = parser.parse(sql);
-            if (parsed.has_error()) {
-                return parsed.convert_error<sql_statement_t>();
-            }
-            if (!parsed.value()) {
-                return core::error_t{core::error_code_t::sql_parse_error,
-                                     std::pmr::string{"parser returned no plan", resource}};
-            }
-            const ParsedQueryData& data = *parsed.value();
-            return data.tag == T_SelectStmt && data.extension_kind == extension_kind_t::none ? sql_statement_t::query
-                                                                                             : sql_statement_t::command;
-        } catch (const std::exception& e) {
-            return core::error_t{core::error_code_t::sql_parse_error, std::pmr::string{e.what(), resource}};
-        } catch (...) {
+        if (!parsed.value()) {
             return core::error_t{core::error_code_t::sql_parse_error,
-                                 std::pmr::string{"parser threw a non-standard exception", resource}};
+                                 std::pmr::string{"parser returned no plan", resource}};
         }
+        const ParsedQueryData& data = *parsed.value();
+        return data.tag == T_SelectStmt && data.extension_kind == extension_kind_t::none ? sql_statement_t::query
+                                                                                         : sql_statement_t::command;
+    }
+
+    core::result_wrapper_t<session_plan_t> translate_for_session(const sc::Plan& plan,
+                                                                 std::pmr::memory_resource* resource) {
+        OTX_ZONE_N("spark::translate_for_session");
+        auto translated = relation_to_plan(plan, resource);
+        if (translated.has_error()) {
+            return std::move(translated.error());
+        }
+        return session_plan_t{
+            .data = std::move(translated.value().parsed_data),
+            .rebuild = [plan, resource]() -> core::result_wrapper_t<ParsedQueryDataPtr> {
+                auto again = relation_to_plan(plan, resource);
+                if (again.has_error()) {
+                    return std::move(again.error());
+                }
+                return std::move(again.value().parsed_data);
+            }};
     }
 
     bool is_empty_local_relation(const sc::Relation& relation) {
@@ -181,6 +179,7 @@ namespace frontend::spark {
         // DataFrame translates to.
         std::optional<std::string> statement;
         ParsedQueryDataPtr statement_plan;
+        query_session_t::rebuild_fn rebuild;
         {
             OTX_ZONE_N("SparkConnectServiceImpl::handle_execute_plan");
             if (!spark_sessions_.open_or_use(
@@ -203,7 +202,7 @@ namespace frontend::spark {
                 if (sql_command.has_input() && !sql_command.input().has_sql()) {
                     refusal = grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
                                            "spark.sql() over DataFrame arguments is not supported");
-                } else if (auto kind = classify_sql(sql_command_text(sql_command), resource_, aliases_); kind.has_error()) {
+                } else if (auto kind = classify_sql(sql_command_text(sql_command), resource_); kind.has_error()) {
                     refusal = grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, kind.error().what.c_str());
                 } else if (kind.value() == sql_statement_t::query) {
                     answer = answer_t::sql_query;
@@ -236,22 +235,24 @@ namespace frontend::spark {
                     statement = show.input().sql().query();
                 } else if (!is_empty_local_relation(show.input())) {
                     show_input = show_string_input_plan(show);
-                    auto plan_result = relation_to_plan(show_input, resource_, aliases_);
+                    auto plan_result = translate_for_session(show_input, resource_);
                     if (plan_result.has_error()) {
                         answer = answer_t::refused;
                         refusal = grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, plan_result.error().what.c_str());
                     } else {
-                        statement_plan = std::move(plan_result.value().parsed_data);
+                        statement_plan = std::move(plan_result.value().data);
+                        rebuild = std::move(plan_result.value().rebuild);
                     }
                 }
             } else {
                 // Path B: DataFrame -> Otterbrix logical plan.
-                auto plan_result = relation_to_plan(plan, resource_, aliases_);
+                auto plan_result = translate_for_session(plan, resource_);
                 if (plan_result.has_error()) {
                     refusal = grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, plan_result.error().what.c_str());
                 } else {
                     answer = answer_t::result;
-                    statement_plan = std::move(plan_result.value().parsed_data);
+                    statement_plan = std::move(plan_result.value().data);
+                    rebuild = std::move(plan_result.value().rebuild);
                 }
             }
             // The statement chosen above, queued on the session.
@@ -260,7 +261,8 @@ namespace frontend::spark {
                     fut = statement_plan ? std::move(actor_zeta::send(session.address(),
                                                                       &query_session_t::execute_plan,
                                                                       hash,
-                                                                      std::move(statement_plan))
+                                                                      std::move(statement_plan),
+                                                                      std::move(rebuild))
                                                          .second)
                                          : std::move(actor_zeta::send(session.address(),
                                                                       &query_session_t::execute,

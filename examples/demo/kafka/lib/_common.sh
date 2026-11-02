@@ -44,7 +44,7 @@ KAFKA_CONTAINER="${KAFKA_CONTAINER:-demo-kafka}"
 PGHOST_="${PGHOST_:-localhost}"
 PGPORT_="${PGPORT_:-8817}"
 PGUSER_="${PGUSER_:-demo}"
-PGDB_="${PGDB_:-demo}"
+PGDB_="${PGDB_:-main}"
 export PGPASSWORD="${PGPASSWORD:-demo}"
 # A host that drops the connection attempt fails after this many seconds
 # instead of hanging the step.

@@ -28,16 +28,14 @@ namespace otterstax::backends {
                                                     actor_zeta::address_t s3_connector,
                                                     const config::ConnectionsConfig& connections);
 
-    // Writes the federation metadata (federation.servers / remote_tables /
-    // remote_columns) from what `remote` discovered: bootstrap (CREATE DATABASE
-    // / TABLE IF NOT EXISTS), the rows of a connection no longer configured or
-    // written for another backend kind than the connection's removed, and the
-    // startup discovery of every connection that opened (its tables' rows
-    // replaced); a legacy mirror database of a configured uid is dropped first.
-    // Blocks the calling (assembling) thread; an engine refusal is the error and
-    // startup aborts.
-    [[nodiscard]] core::error_t publish_federation_metadata(std::pmr::memory_resource* resource,
-                                                            runtime::engine_t& engine,
-                                                            const remote_backends_t& remote);
+    // Registers what remote.open() discovered in the engine's catalog
+    // (catalog::register_connections: the host table of the backends'
+    // spelling, the catalog's tables handed to their connections' actors, every
+    // connection that answered brought in line with its discovery, no SQL to a
+    // backend), on the actors' registration session. Blocks the calling
+    // (assembling) thread; an engine refusal is the error and startup aborts.
+    [[nodiscard]] core::error_t register_remote_tables(std::pmr::memory_resource* resource,
+                                                       runtime::engine_t& engine,
+                                                       remote_backends_t& remote);
 
 } // namespace otterstax::backends

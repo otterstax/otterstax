@@ -20,6 +20,7 @@
 #include <chrono>
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace otterstax::test::wire {
@@ -138,8 +139,9 @@ namespace otterstax::test::wire {
         REQUIRE(handshake[0] == 10); // protocol version
     }
 
-    // The fixed 32-byte head of HandshakeResponse41: flags, max packet, charset, filler.
-    inline std::vector<uint8_t> mysql_handshake_response_head() {
+    // The fixed 32-byte head of HandshakeResponse41: flags, max packet, the
+    // client's collation (utf8_general_ci by default), filler.
+    inline std::vector<uint8_t> mysql_handshake_response_head(uint8_t collation = 33) {
         std::vector<uint8_t> resp;
         const uint32_t flags = frontend::mysql::CLIENT_PROTOCOL_41 | frontend::mysql::CLIENT_SECURE_CONNECTION;
         for (int i = 0; i < 4; ++i) {
@@ -149,7 +151,7 @@ namespace otterstax::test::wire {
         for (int i = 0; i < 4; ++i) {
             resp.push_back(static_cast<uint8_t>((max_packet >> (8 * i)) & 0xFF));
         }
-        resp.push_back(33); // utf8
+        resp.push_back(collation);
         resp.insert(resp.end(), 23, 0);
         return resp;
     }
@@ -215,15 +217,17 @@ namespace otterstax::test::wire {
         return {};
     }
 
-    inline void pg_startup(raw_client& client) {
+    // A StartupMessage (protocol 3.0) with `parameters` in order.
+    inline std::vector<uint8_t> pg_startup_packet(const std::vector<std::pair<std::string, std::string>>& parameters) {
         std::vector<uint8_t> body;
         const uint32_t version = static_cast<uint32_t>(frontend::postgres::message_code::PROTOCOL_VERSION_3_0);
         for (int i = 3; i >= 0; --i) {
             body.push_back(static_cast<uint8_t>((version >> (8 * i)) & 0xFF));
         }
-        for (const char* kv : {"user", "test", "database", "test"}) {
-            const std::string s = kv;
-            body.insert(body.end(), s.begin(), s.end());
+        for (const auto& [key, value] : parameters) {
+            body.insert(body.end(), key.begin(), key.end());
+            body.push_back(0);
+            body.insert(body.end(), value.begin(), value.end());
             body.push_back(0);
         }
         body.push_back(0);
@@ -234,15 +238,29 @@ namespace otterstax::test::wire {
             msg.push_back(static_cast<uint8_t>((len >> (8 * i)) & 0xFF));
         }
         msg.insert(msg.end(), body.begin(), body.end());
-        client.write(msg);
+        return msg;
+    }
 
-        // AuthenticationOk, ParameterStatus..., BackendKeyData, ReadyForQuery
+    // The answer to a StartupMessage of `parameters`: every message up to the
+    // ReadyForQuery, or up to the ErrorResponse that refuses the startup.
+    inline std::vector<pg_message>
+    pg_startup_answer(raw_client& client, const std::vector<std::pair<std::string, std::string>>& parameters) {
+        client.write(pg_startup_packet(parameters));
+        std::vector<pg_message> answer;
         for (int guard = 0; guard < 32; ++guard) {
-            if (pg_read_message(client).type == 'Z') {
-                return;
+            answer.push_back(pg_read_message(client));
+            if (answer.back().type == 'Z' || answer.back().type == 'E') {
+                return answer;
             }
         }
-        FAIL("no ReadyForQuery after StartupMessage");
+        FAIL("no ReadyForQuery or ErrorResponse after StartupMessage");
+        return answer;
+    }
+
+    // AuthenticationOk, ParameterStatus..., BackendKeyData, ReadyForQuery.
+    inline void pg_startup(raw_client& client) {
+        const auto answer = pg_startup_answer(client, {{"user", "test"}, {"database", "main"}});
+        REQUIRE(answer.back().type == 'Z');
     }
 
 } // namespace otterstax::test::wire

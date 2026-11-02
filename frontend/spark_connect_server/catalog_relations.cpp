@@ -2,10 +2,10 @@
 // Copyright 2025-2026  OtterStax
 //
 // spark.catalog from the engine's own catalog. handle_catalog_relation reads
-// pg_catalog.pg_class and pg_catalog.pg_namespace with SQL through the Spark
-// session's query session, catalog_rows turns them into what Spark sees and lays the answer
-// out the way PySpark reads it (catalog_rows.hpp), and listColumns prepares the
-// table's `SELECT *` for its columns.
+// the listed schemas, tables and the session's place with SQL through the
+// Spark session's query session, catalog_rows turns them into what Spark sees
+// and lays the answer out the way PySpark reads it (catalog_rows.hpp), and
+// listColumns prepares the table's `SELECT *` for its columns.
 
 #include "catalog_relations.hpp"
 #include "catalog_rows.hpp"
@@ -18,13 +18,12 @@
 #include <google/protobuf/descriptor.h>
 
 #include "await_future.hpp"
-#include "catalog/introspection.hpp"
 #include "otterbrix/federation/metadata.hpp"
+#include "plan_translator/relation_to_plan.hpp"
 #include "plan_translator/type_converter.hpp"
 #include "session/query_session.hpp"
 #include "utility/tracy_profiler.hpp"
 
-#include <components/catalog/catalog_oids.hpp>
 #include <components/types/types.hpp>
 #include <components/vector/data_chunk.hpp>
 #include <core/result_wrapper.hpp>
@@ -40,8 +39,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
-#include <unordered_map>
-#include <unordered_set>
+#include <tuple>
 #include <utility>
 
 namespace frontend::spark {
@@ -64,84 +62,73 @@ namespace frontend::spark {
 
         namespace {
 
-            struct class_row_t {
-                uint32_t oid;
-                std::string_view name;
-                uint32_t namespace_oid;
-                char kind;
-            };
-
-            const cv::vector_t* column_named(const cv::data_chunk_t& chunk, std::string_view name) {
-                for (const auto& column : chunk.data) {
-                    if (column.type().has_alias() && column.type().alias() == name) {
-                        return &column;
-                    }
-                }
-                return nullptr;
-            }
-
-            template<typename Integer>
-            std::optional<uint32_t> as_oid(Integer value) {
-                if (!std::in_range<uint32_t>(value)) {
-                    return std::nullopt;
-                }
-                return static_cast<uint32_t>(value);
-            }
-
-            // An OID cell of an integer column of any width and signedness;
-            // nullopt for a NULL, a value outside the OID range or another type.
-            std::optional<uint32_t> read_oid(const cv::vector_t& column, uint64_t row) {
-                if (column.is_null(row)) {
-                    return std::nullopt;
-                }
-                switch (column.type().type()) {
-                    case ct::logical_type::UTINYINT:
-                        return as_oid(column.get_value<uint8_t>(row));
-                    case ct::logical_type::USMALLINT:
-                        return as_oid(column.get_value<uint16_t>(row));
-                    case ct::logical_type::UINTEGER:
-                        return as_oid(column.get_value<uint32_t>(row));
-                    case ct::logical_type::UBIGINT:
-                        return as_oid(column.get_value<uint64_t>(row));
-                    case ct::logical_type::TINYINT:
-                        return as_oid(column.get_value<int8_t>(row));
-                    case ct::logical_type::SMALLINT:
-                        return as_oid(column.get_value<int16_t>(row));
-                    case ct::logical_type::INTEGER:
-                        return as_oid(column.get_value<int32_t>(row));
-                    case ct::logical_type::BIGINT:
-                        return as_oid(column.get_value<int64_t>(row));
-                    default:
+            // Row `row` of `chunk` as its text cells, nullopt when one is not
+            // text (a NULL included) but `nullable` (the column index allowed NULL, as empty).
+            std::optional<std::pmr::vector<std::pmr::string>>
+            text_row(const cv::data_chunk_t& chunk, uint64_t row, std::optional<size_t> nullable, std::pmr::memory_resource* resource) {
+                std::pmr::vector<std::pmr::string> cells(resource);
+                for (size_t column = 0; column < chunk.column_count(); ++column) {
+                    const auto& cell = chunk.data[column];
+                    if (cell.is_null(row) && nullable == column) {
+                        cells.emplace_back();
+                    } else if (cell.is_null(row) || cell.type().type() != ct::logical_type::STRING_LITERAL) {
                         return std::nullopt;
-                }
-            }
-
-            // A text cell; nullopt for a NULL or a column of another type.
-            std::optional<std::string_view> read_text(const cv::vector_t& column, uint64_t row) {
-                if (column.is_null(row) || column.type().type() != ct::logical_type::STRING_LITERAL) {
-                    return std::nullopt;
-                }
-                return column.get_value<std::string_view>(row);
-            }
-
-            // True when `identifier` is the table's ".".join(namespace + [name]).
-            bool identifies(const table_entry_t& table, std::string_view identifier) {
-                for (const auto& part : table.qualifier) {
-                    if (!identifier.starts_with(part) || identifier.size() == part.size() ||
-                        identifier[part.size()] != '.') {
-                        return false;
+                    } else {
+                        cells.emplace_back(cell.get_value<std::string_view>(row));
                     }
-                    identifier.remove_prefix(part.size() + 1);
                 }
-                return identifier == table.name;
+                return cells;
             }
 
-            void append_identifier(std::pmr::string& out, const table_entry_t& table) {
-                for (const auto& part : table.qualifier) {
-                    out.append(part);
-                    out.push_back('.');
+            // Every row of `payload`, `columns` text cells each.
+            core::result_wrapper_t<std::pmr::vector<std::pmr::vector<std::pmr::string>>>
+            text_rows(const session_payload& payload,
+                      size_t columns,
+                      std::string_view read,
+                      std::optional<size_t> nullable,
+                      std::pmr::memory_resource* resource) {
+                std::pmr::vector<std::pmr::vector<std::pmr::string>> rows(resource);
+                for (const auto& chunk : payload.chunks) {
+                    if (chunk.size() == 0) {
+                        continue;
+                    }
+                    for (uint64_t row = 0; row < chunk.size(); ++row) {
+                        auto cells = text_row(chunk, row, nullable, resource);
+                        if (!cells || cells->size() != columns) {
+                            return make_error(resource,
+                                              core::error_code_t::internal_error,
+                                              "spark.catalog: the ",
+                                              read,
+                                              " read answered a row that is not its text columns");
+                        }
+                        rows.push_back(std::move(*cells));
+                    }
                 }
-                out.append(table.name);
+                return rows;
+            }
+
+            // The schema of `cells` (datconnection, datname, nspname, ...) as
+            // its namespace: [d, s] or [c, d, s].
+            std::pmr::vector<std::pmr::string> namespace_of(const std::pmr::vector<std::pmr::string>& cells,
+                                                            std::pmr::memory_resource* resource) {
+                std::pmr::vector<std::pmr::string> parts(resource);
+                if (!cells[0].empty()) {
+                    parts.push_back(cells[0]);
+                }
+                parts.push_back(cells[1]);
+                parts.push_back(cells[2]);
+                return parts;
+            }
+
+            std::pmr::string joined(const std::pmr::vector<std::pmr::string>& parts, std::pmr::memory_resource* resource) {
+                std::pmr::string out(resource);
+                for (const auto& part : parts) {
+                    if (!out.empty()) {
+                        out.push_back('.');
+                    }
+                    out.append(part);
+                }
+                return out;
             }
 
             char fold_case(char c) { return c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : c; }
@@ -349,212 +336,108 @@ namespace frontend::spark {
                     resource);
             }
 
-            // The one table find_tables answers, or why there is not exactly one.
+            // The table find_table answers, or why there is none.
             core::result_wrapper_t<const table_entry_t*> resolve_table(const catalog_view_t& view,
                                                                        std::string_view table_name,
                                                                        std::optional<std::string_view> db_name,
                                                                        std::pmr::memory_resource* resource) {
-                const auto found = find_tables(view, table_name, db_name, resource);
-                if (found.size() == 1) {
-                    return found.front();
+                auto found = find_table(view, table_name, db_name, resource);
+                if (found.has_error() || found.value() != nullptr) {
+                    return found;
                 }
-                if (found.empty()) {
-                    if (!db_name) {
-                        return make_error(resource,
-                                          core::error_code_t::table_not_exists,
-                                          "spark.catalog: table or view '",
-                                          table_name,
-                                          "' does not exist");
-                    }
-                    if (!database_exists(view, *db_name)) {
-                        return make_error(resource,
-                                          core::error_code_t::database_not_exists,
-                                          "spark.catalog: database '",
-                                          *db_name,
-                                          "' does not exist");
-                    }
+                if (!db_name) {
                     return make_error(resource,
                                       core::error_code_t::table_not_exists,
                                       "spark.catalog: table or view '",
                                       table_name,
-                                      "' does not exist in database '",
+                                      "' does not exist");
+                }
+                if (!database_exists(view, *db_name)) {
+                    return make_error(resource,
+                                      core::error_code_t::database_not_exists,
+                                      "spark.catalog: database '",
                                       *db_name,
-                                      "'");
+                                      "' does not exist");
                 }
-                std::pmr::string what{"spark.catalog: '", resource};
-                what.append(table_name);
-                what.append("' names more than one table, name one of them in full:");
-                for (const auto* table : found) {
-                    what.push_back(' ');
-                    append_identifier(what, *table);
-                }
-                return core::error_t{core::error_code_t::ambiguous_name, std::move(what)};
+                return make_error(resource,
+                                  core::error_code_t::table_not_exists,
+                                  "spark.catalog: table or view '",
+                                  table_name,
+                                  "' does not exist in database '",
+                                  *db_name,
+                                  "'");
             }
 
         } // namespace
 
-        core::result_wrapper_t<catalog_view_t> read_catalog(const session_payload& namespaces,
-                                                            const session_payload& classes,
-                                                            const session_payload& remote_tables,
+        namespace {
+            // Every listed schema (n) with its database (d): all but the system
+            // schemas and the database `federation` OtterStax keeps its tables in.
+            std::string listed_where() {
+                return std::string{" WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') AND NOT "
+                                   "(d.datconnection = '' AND d.datname = '"} +
+                       std::string{otterstax::federation::metadata_database} + "')";
+            }
+        } // namespace
+
+        std::string schemas_sql() {
+            return "SELECT d.datconnection, d.datname, n.nspname FROM pg_catalog.pg_namespace n JOIN "
+                   "pg_catalog.pg_database d ON n.nspdatabase = d.oid" +
+                   listed_where() + ";";
+        }
+
+        std::string tables_sql() {
+            return "SELECT d.datconnection, d.datname, n.nspname, c.relname, c.relkind FROM pg_catalog.pg_class c "
+                   "JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid JOIN pg_catalog.pg_database d ON "
+                   "n.nspdatabase = d.oid" +
+                   listed_where() + " AND c.relkind IN ('r', 'g', 'v', 'm');";
+        }
+
+        core::result_wrapper_t<catalog_view_t> read_catalog(const session_payload& schemas,
+                                                            const session_payload& tables,
+                                                            const session_payload& place,
                                                             std::pmr::memory_resource* resource) {
             OTX_ZONE_N("spark::catalog::read_catalog");
-            using components::catalog::FIRST_USER_OID;
-            using components::catalog::INVALID_OID;
-
-            std::pmr::unordered_map<uint32_t, std::string_view> namespace_names(resource);
-            for (const auto& chunk : namespaces.chunks) {
-                if (chunk.size() == 0) {
-                    continue;
-                }
-                const auto* oid = column_named(chunk, "oid");
-                const auto* name = column_named(chunk, "nspname");
-                if (oid == nullptr || name == nullptr) {
-                    return make_error(resource,
-                                      core::error_code_t::schema_error,
-                                      "spark.catalog: pg_catalog.pg_namespace answered without its oid / nspname "
-                                      "columns");
-                }
-                for (uint64_t row = 0; row < chunk.size(); ++row) {
-                    const auto oid_value = read_oid(*oid, row);
-                    const auto name_value = read_text(*name, row);
-                    if (!oid_value || !name_value) {
-                        return make_error(resource,
-                                          core::error_code_t::schema_error,
-                                          "spark.catalog: pg_catalog.pg_namespace holds a NULL or mistyped oid / "
-                                          "nspname");
-                    }
-                    namespace_names.emplace(*oid_value, *name_value);
-                }
+            auto schema_rows = text_rows(schemas, 3, "schemas", std::nullopt, resource);
+            if (schema_rows.has_error()) {
+                return schema_rows.convert_error<catalog_view_t>();
             }
-
-            std::pmr::vector<class_row_t> class_rows(resource);
-            for (const auto& chunk : classes.chunks) {
-                if (chunk.size() == 0) {
-                    continue;
-                }
-                const auto* oid = column_named(chunk, "oid");
-                const auto* name = column_named(chunk, "relname");
-                const auto* namespace_oid = column_named(chunk, "relnamespace");
-                const auto* kind = column_named(chunk, "relkind");
-                if (oid == nullptr || name == nullptr || namespace_oid == nullptr || kind == nullptr) {
-                    return make_error(resource,
-                                      core::error_code_t::schema_error,
-                                      "spark.catalog: pg_catalog.pg_class answered without its oid / relname / "
-                                      "relnamespace / relkind columns");
-                }
-                for (uint64_t row = 0; row < chunk.size(); ++row) {
-                    const auto oid_value = read_oid(*oid, row);
-                    const auto name_value = read_text(*name, row);
-                    const auto namespace_value = read_oid(*namespace_oid, row);
-                    const auto kind_value = read_text(*kind, row);
-                    if (!oid_value || !name_value || !namespace_value || !kind_value || kind_value->size() != 1) {
-                        return make_error(resource,
-                                          core::error_code_t::schema_error,
-                                          "spark.catalog: pg_catalog.pg_class holds a NULL or mistyped oid / "
-                                          "relname / relnamespace / relkind");
-                    }
-                    class_rows.push_back(class_row_t{*oid_value, *name_value, *namespace_value, kind_value->front()});
-                }
+            auto table_rows = text_rows(tables, 5, "tables", std::nullopt, resource);
+            if (table_rows.has_error()) {
+                return table_rows.convert_error<catalog_view_t>();
+            }
+            // current_schema() is NULL when the place is gone.
+            auto place_rows = text_rows(place, 2, "place", size_t{1}, resource);
+            if (place_rows.has_error()) {
+                return place_rows.convert_error<catalog_view_t>();
+            }
+            if (place_rows.value().size() != 1) {
+                return make_error(resource, core::error_code_t::internal_error, "spark.catalog: the place read answered no row");
             }
 
             catalog_view_t view(resource);
-            view.databases.emplace_back(default_database);
-            for (const auto& [oid, name] : namespace_names) {
-                // The federation metadata database is owned elsewhere
-                // (otterbrix/federation/metadata.hpp).
-                if (oid >= FIRST_USER_OID && name != otterstax::federation::metadata_database) {
-                    view.databases.emplace_back(name);
-                }
+            for (const auto& cells : schema_rows.value()) {
+                view.databases.push_back(joined(namespace_of(cells, resource), resource));
             }
-
-            for (const auto& row : class_rows) {
-                const bool is_table = row.kind == 'r' || row.kind == 'g';
-                const bool is_view = row.kind == 'v' || row.kind == 'm';
-                // System rows, and whatever lives in a system namespace
-                // (pg_catalog, public, information_schema), are not Spark's.
-                const bool system_namespace = row.namespace_oid != INVALID_OID && row.namespace_oid < FIRST_USER_OID;
-                if (row.oid < FIRST_USER_OID || (!is_table && !is_view) || system_namespace) {
-                    continue;
-                }
+            for (const auto& cells : table_rows.value()) {
                 table_entry_t entry{std::pmr::string{resource},
-                                    std::pmr::string{row.name, resource},
-                                    std::pmr::vector<std::pmr::string>{resource},
-                                    is_view};
-                if (row.namespace_oid == INVALID_OID) {
-                    entry.database = default_database;
-                    view.tables.push_back(std::move(entry));
-                    continue;
-                }
-                const auto found = namespace_names.find(row.namespace_oid);
-                if (found == namespace_names.end()) {
-                    // pg_class is read before pg_namespace, so the namespace was
-                    // dropped between the two reads — and DROP DATABASE cascades:
-                    // the table is gone with it.
-                    continue;
-                }
-                const std::string_view database = found->second;
-                if (otterstax::catalog::is_internal_table(database, row.name)) {
-                    continue;
-                }
-                entry.database = database;
-                entry.qualifier.emplace_back(database);
+                                    cells[3],
+                                    namespace_of(cells, resource),
+                                    cells[4] == "v" || cells[4] == "m"};
+                entry.database = joined(entry.qualifier, resource);
                 view.tables.push_back(std::move(entry));
             }
-
-            // The remote tables the federation knows, listed under their connection:
-            // namespace [alias, db] for MySQL / ClickHouse, [alias, db, schema] for
-            // PostgreSQL — the name the SQL path resolves.
-            for (const auto& chunk : remote_tables.chunks) {
-                if (chunk.size() == 0) {
-                    continue;
-                }
-                const auto* uid = column_named(chunk, "uid");
-                const auto* database = column_named(chunk, "database_name");
-                const auto* schema = column_named(chunk, "schema_name");
-                const auto* table = column_named(chunk, "table_name");
-                const auto* remote_database = column_named(chunk, "remote_database");
-                if (uid == nullptr || database == nullptr || schema == nullptr || table == nullptr ||
-                    remote_database == nullptr) {
-                    return make_error(resource,
-                                      core::error_code_t::schema_error,
-                                      "spark.catalog: federation.remote_tables answered without its key columns");
-                }
-                for (uint64_t row = 0; row < chunk.size(); ++row) {
-                    const auto uid_value = read_text(*uid, row);
-                    const auto table_value = read_text(*table, row);
-                    if (!uid_value || !table_value) {
-                        return make_error(resource,
-                                          core::error_code_t::schema_error,
-                                          "spark.catalog: federation.remote_tables holds a NULL uid / table_name");
-                    }
-                    const auto database_value = read_text(*database, row).value_or(std::string_view{});
-                    const auto schema_value = read_text(*schema, row).value_or(std::string_view{});
-                    table_entry_t entry{std::pmr::string{*uid_value, resource},
-                                        std::pmr::string{*table_value, resource},
-                                        std::pmr::vector<std::pmr::string>{resource},
-                                        false};
-                    entry.qualifier.emplace_back(*uid_value);
-                    if (!schema_value.empty()) {
-                        entry.qualifier.emplace_back(read_text(*remote_database, row).value_or(std::string_view{}));
-                        entry.qualifier.emplace_back(schema_value);
-                    } else {
-                        entry.qualifier.emplace_back(database_value);
-                    }
-                    view.databases.emplace_back(*uid_value);
-                    view.tables.push_back(std::move(entry));
+            for (auto& part : place_rows.value().front()) {
+                if (!part.empty()) {
+                    view.place.push_back(std::move(part));
                 }
             }
+            view.current_database = joined(view.place, resource);
+
             std::sort(view.databases.begin(), view.databases.end());
             view.databases.erase(std::unique(view.databases.begin(), view.databases.end()), view.databases.end());
-
             std::sort(view.tables.begin(), view.tables.end(), [](const table_entry_t& lhs, const table_entry_t& rhs) {
-                if (lhs.database != rhs.database) {
-                    return lhs.database < rhs.database;
-                }
-                if (lhs.name != rhs.name) {
-                    return lhs.name < rhs.name;
-                }
-                return lhs.qualifier < rhs.qualifier;
+                return std::tie(lhs.database, lhs.name) < std::tie(rhs.database, rhs.name);
             });
             return std::move(view);
         }
@@ -583,20 +466,46 @@ namespace frontend::spark {
             return std::find(view.databases.begin(), view.databases.end(), name) != view.databases.end();
         }
 
-        std::pmr::vector<const table_entry_t*> find_tables(const catalog_view_t& view,
-                                                           std::string_view table_name,
-                                                           std::optional<std::string_view> db_name,
-                                                           std::pmr::memory_resource* resource) {
-            OTX_ZONE_N("spark::catalog::find_tables");
-            std::pmr::vector<const table_entry_t*> found(resource);
+        core::result_wrapper_t<const table_entry_t*> find_table(const catalog_view_t& view,
+                                                                std::string_view table_name,
+                                                                std::optional<std::string_view> db_name,
+                                                                std::pmr::memory_resource* resource) {
+            OTX_ZONE_N("spark::catalog::find_table");
+            std::pmr::string database(resource);
+            std::string_view name = table_name;
+            qualified_name_t parsed;
+            if (db_name) {
+                database = *db_name;
+            } else {
+                auto read = parse_table_identifier(table_name, resource);
+                if (read.has_error()) {
+                    return read.convert_error<const table_entry_t*>();
+                }
+                parsed = std::move(read.value());
+                // Completed with the place, as the engine reads a short name.
+                std::pmr::vector<std::pmr::string> qualifier(resource);
+                if (!parsed.connection.t.empty()) {
+                    qualifier.emplace_back(parsed.connection.t);
+                }
+                if (!parsed.database.t.empty()) {
+                    qualifier.emplace_back(parsed.database.t);
+                } else if (!view.place.empty()) {
+                    qualifier.push_back(view.place.front());
+                }
+                if (!parsed.schema.t.empty()) {
+                    qualifier.emplace_back(parsed.schema.t);
+                } else if (view.place.size() > 1) {
+                    qualifier.push_back(view.place[1]);
+                }
+                database = joined(qualifier, resource);
+                name = parsed.collection.t;
+            }
             for (const auto& table : view.tables) {
-                const bool named =
-                    db_name ? table.database == *db_name && table.name == table_name : identifies(table, table_name);
-                if (named) {
-                    found.push_back(&table);
+                if (table.database == database && table.name == name) {
+                    return &table;
                 }
             }
-            return found;
+            return static_cast<const table_entry_t*>(nullptr);
         }
 
         std::string select_all_query(const table_entry_t& table) {
@@ -682,7 +591,7 @@ namespace frontend::spark {
                                                             std::optional<std::string_view> pattern,
                                                             std::pmr::memory_resource* resource) {
             OTX_ZONE_N("spark::catalog::list_tables");
-            const std::string_view database = db_name.value_or(default_database);
+            const std::string_view database = db_name.value_or(std::string_view{view.current_database});
             if (!database_exists(view, database)) {
                 return make_error(resource,
                                   core::error_code_t::database_not_exists,
@@ -820,13 +729,13 @@ namespace frontend::spark {
         run_sql(idle_session_registry_t<otterstax::session::session_ptr>& sessions,
                 const std::string& id,
                 otterstax::session::statement_id_t statement,
-                std::string_view sql,
+                std::string sql,
                 std::pmr::memory_resource* resource) {
             co_return co_await run_step(
                 sessions,
                 id,
                 [&](query_session_t& target) {
-                    return actor_zeta::send(target.address(), &query_session_t::execute, statement, std::string{sql})
+                    return actor_zeta::send(target.address(), &query_session_t::execute, statement, std::move(sql))
                         .second;
                 },
                 resource);
@@ -847,10 +756,9 @@ namespace frontend::spark {
             switch (catalog.cat_type_case()) {
                 case C::kCurrentCatalog:
                     co_return rows::string_payload(rows::catalog_name, resource);
-                case C::kCurrentDatabase:
-                    co_return rows::string_payload(rows::default_database, resource);
                 case C::kListCatalogs:
                     co_return rows::list_catalogs(pattern_of(catalog.list_catalogs()), resource);
+                case C::kCurrentDatabase:
                 case C::kListDatabases:
                 case C::kGetDatabase:
                 case C::kDatabaseExists:
@@ -864,32 +772,27 @@ namespace frontend::spark {
             }
         }
 
-        // pg_class first: a namespace one of its rows names is then missing
-        // from pg_namespace only when a DROP DATABASE between the two reads
-        // took the table with it (read_catalog).
-        auto classes = co_await run_sql(sessions, session_id, statement, otterstax::catalog::classes_sql, resource);
-        if (classes.has_error()) {
-            co_return forward_error(resource, classes.error(), "spark.catalog: reading pg_catalog.pg_class failed: ");
+        auto schemas = co_await run_sql(sessions, session_id, statement, rows::schemas_sql(), resource);
+        if (schemas.has_error()) {
+            co_return forward_error(resource, schemas.error(), "spark.catalog: reading the schemas failed: ");
         }
-        auto namespaces = co_await run_sql(sessions, session_id, statement, otterstax::catalog::namespaces_sql, resource);
-        if (namespaces.has_error()) {
-            co_return forward_error(resource,
-                                    namespaces.error(),
-                                    "spark.catalog: reading pg_catalog.pg_namespace failed: ");
+        auto tables = co_await run_sql(sessions, session_id, statement, rows::tables_sql(), resource);
+        if (tables.has_error()) {
+            co_return forward_error(resource, tables.error(), "spark.catalog: reading the tables failed: ");
         }
-        auto remote_tables = co_await run_sql(sessions, session_id, statement, otterstax::catalog::remote_tables_sql, resource);
-        if (remote_tables.has_error()) {
-            co_return forward_error(resource,
-                                    remote_tables.error(),
-                                    "spark.catalog: reading federation.remote_tables failed: ");
+        auto place = co_await run_sql(sessions, session_id, statement, std::string{rows::place_sql}, resource);
+        if (place.has_error()) {
+            co_return forward_error(resource, place.error(), "spark.catalog: reading the current database failed: ");
         }
-        auto loaded = rows::read_catalog(namespaces.value(), classes.value(), remote_tables.value(), resource);
+        auto loaded = rows::read_catalog(schemas.value(), tables.value(), place.value(), resource);
         if (loaded.has_error()) {
             co_return loaded.convert_error<session_payload>();
         }
         const rows::catalog_view_t& view = loaded.value();
 
         switch (catalog.cat_type_case()) {
+            case C::kCurrentDatabase:
+                co_return rows::string_payload(view.current_database, resource);
             case C::kListDatabases:
                 co_return rows::list_databases(view, pattern_of(catalog.list_databases()), resource);
             case C::kGetDatabase:
@@ -909,8 +812,11 @@ namespace frontend::spark {
                                           resource);
             case C::kTableExists: {
                 const auto& operation = catalog.table_exists();
-                const auto found = rows::find_tables(view, operation.table_name(), db_name_of(operation), resource);
-                co_return rows::boolean_payload(!found.empty(), resource);
+                auto found = rows::find_table(view, operation.table_name(), db_name_of(operation), resource);
+                if (found.has_error()) {
+                    co_return found.convert_error<session_payload>();
+                }
+                co_return rows::boolean_payload(found.value() != nullptr, resource);
             }
             default:
                 break; // listColumns, below

@@ -27,7 +27,6 @@
 #include "frontend/spark_connect_server/spark_connect_server.hpp"
 #include "integration/kafka/kafka_manager.hpp"
 #include "integration/s3/s3_manager.hpp"
-#include "otterbrix/federation/name_resolution.hpp"
 #include "otterbrix/parser/parser.hpp"
 #include "runtime/engine.hpp"
 #include "runtime/runtime.hpp"
@@ -43,16 +42,21 @@ namespace po = boost::program_options;
 //
 //   subsystem_finalizer_t — Arrow's FinalizeS3, after everything else is gone
 //   runtime_t         — the memory resource and every thread pool (service.runtime)
-//   remote_backends_t — the MySQL / PostgreSQL / ClickHouse connections, their
-//                       backends, the startup discovery and the federation
-//                       registry, complete before the engine opens
+//   remote_backends_t — the MySQL / PostgreSQL / ClickHouse connections: a backend
+//                       actor per connection over its agents (one physical
+//                       connection each, on the runtime's backends pool), the
+//                       startup discovery, complete before the engine opens; it
+//                       outlives the engine, whose tables of a connection send to
+//                       the connection's actor
 //   engine_t          — the embedded otterbrix engine on the runtime's engine pools
-//                       (service.engine), opened with the federation's primitives;
-//                       destroying it is its final CHECKPOINT
+//                       (service.engine), opened with every connection's backend
+//                       address (remote_backends_t::primitives()); destroying it
+//                       is its final CHECKPOINT
 //   s3 connector, file manager, S3 orchestrator, Kafka manager — the actors a
 //                       query session sends to besides the engine; spawned after
 //                       the engine, so destroyed before it, Kafka (its pollers and
-//                       streams send to the engine) first
+//                       streams send to the engine) first; then the discovery
+//                       registered in the engine's catalog
 //   session_factory_t — the query sessions on the runtime's sessions pool; its
 //                       destructor drains them, stops the pool and frees what
 //                       the pool left
@@ -61,9 +65,9 @@ namespace po = boost::program_options;
 //
 // Shutdown: servers (stopped, their sessions closed) → session factory
 // (sessions drain, sessions pool stops) → Kafka, S3, file, s3 connector →
-// engine (final CHECKPOINT, engine pools stop) → remote backends (registry
-// reset, backends, connections) → runtime (the remaining pools, then the
-// memory) → FinalizeS3.
+// engine (final CHECKPOINT, engine pools stop) → remote backends (the agents'
+// statements cancelled, the backends pool stopped, then the actors and their
+// agents) → runtime (the remaining pools, then the memory) → FinalizeS3.
 int main(int argc, char* argv[]) {
     // The loggers write under service.engine.log_dir, which the config file
     // names: they are created once it is read. What goes wrong before that —
@@ -135,26 +139,24 @@ int main(int argc, char* argv[]) {
     OTX_MESSAGE_L("startup: runtime");
     otterstax::runtime::runtime_t runtime(runtime_config);
 
-    // The remote connections, opened and discovered before the engine: the
-    // engine opens with the federation's name-resolution hooks, which read the
-    // registry this module installs. A backend that is down is skipped with a
-    // logged error; a descriptor the backend cannot accept is a configuration
-    // error and the server does not start with it.
+    // The remote connections, opened and discovered before the engine, and a
+    // backend actor for each configured connection: the engine opens with its
+    // address for each of them. A backend that is down is logged and kept (its
+    // statements fail at the connection, or reach it once it is back); a
+    // descriptor the backend cannot accept, or an actor that cannot start, is
+    // an error and the server does not start.
     OTX_MESSAGE_L("startup: remote backends");
     auto remote = std::make_unique<otterstax::backends::remote_backends_t>(
         runtime.resource(),
-        otterstax::backends::remote_backends_options_t{
-            .connector_threads = otterstax::backends::connector_io_threads(server_config.runtime.connector_io.threads,
-                                                                           server_config.connections),
-            .statements = runtime.backends_scheduler()});
+        otterstax::backends::remote_backends_options_t{.runtime = &runtime});
     if (auto opened = remote->open(server_config.connections, server_config.connection_retry);
         opened.contains_error()) {
-        log->error("Invalid connection configuration: {}", opened.what.c_str());
+        log->error("Failed to open the remote connections: {}", opened.what.c_str());
         return 1;
     }
 
     OTX_MESSAGE_L("startup: engine");
-    auto opened = otterstax::runtime::engine_t::open(runtime, server_config.engine, otterstax::federation::make_primitives());
+    auto opened = otterstax::runtime::engine_t::open(runtime, server_config.engine, remote->primitives());
     if (opened.has_error()) {
         log->error("Failed to open the engine: {}", opened.error().what.c_str());
         return 1;
@@ -166,7 +168,7 @@ int main(int argc, char* argv[]) {
     // Declared after the engine, so destroyed before it; the Kafka manager,
     // declared last, first.
     auto s3_connector = actor_zeta::spawn<conn::s3::ConnectorManager>(runtime.resource());
-    auto file = actor_zeta::spawn<conn::file::FileManager>(runtime.resource(), engine->dispatcher_address());
+    auto file = actor_zeta::spawn<conn::file::FileManager>(runtime.resource());
     auto s3 = actor_zeta::spawn<db::S3Manager>(runtime.resource(), s3_connector->address(), file->address());
     // start_pollers: CREATE SOURCE launches an ingestion poller (needs a broker).
     auto kafka = actor_zeta::spawn<otterstax::kafka::KafkaManager>(runtime.resource(),
@@ -179,11 +181,11 @@ int main(int argc, char* argv[]) {
         log->error("Invalid connection configuration: {}", registered.what.c_str());
         return 1;
     }
-    // The remote tables the startup discovery found, recorded in the engine's
-    // federation metadata before any client can name one.
-    if (auto published = otterstax::backends::publish_federation_metadata(runtime.resource(), *engine, *remote);
-        published.contains_error()) {
-        log->error("Failed to record the federation metadata: {}", published.what.c_str());
+    // The remote tables the startup discovery found, registered in the
+    // engine's catalog (no SQL to a backend) before any client can name one.
+    if (auto registered = otterstax::backends::register_remote_tables(runtime.resource(), *engine, *remote);
+        registered.contains_error()) {
+        log->error("Failed to register the remote tables: {}", registered.what.c_str());
         return 1;
     }
     // The persisted Kafka objects relaunch once the engine and every backend
@@ -195,7 +197,9 @@ int main(int argc, char* argv[]) {
                                                               engine->dispatcher_address(),
                                                               s3->address(),
                                                               file->address(),
-                                                              kafka->address());
+                                                              kafka->address(),
+                                                              kafka->object_names(),
+                                                              remote->connections());
     if (services.has_error()) {
         log->error("Failed to assemble the session services: {}", services.error().what.c_str());
         return 1;

@@ -19,12 +19,13 @@
 // is what tells an engine defect from an OtterStax one.
 
 #include "session_stack.hpp"
+#include "../mock/cell.hpp"
 
 
 #include <catch2/catch_all.hpp>
 
 #include <components/cursor/cursor.hpp>
-#include <components/types/logical_value.hpp>
+
 #include <components/vector/data_chunk.hpp>
 
 #include <filesystem>
@@ -91,31 +92,31 @@ namespace {
 
     // DEFAULT literals whose type equals the declared column type.
     constexpr std::initializer_list<const char*> k_same_type_defaults = {
-        "CREATE DATABASE ddb;",
+        "CREATE SCHEMA ddb;",
         "CREATE TABLE ddb.same (id BIGINT, n BIGINT DEFAULT 7, s STRING DEFAULT 'x', d DOUBLE DEFAULT 1.5);",
         "INSERT INTO ddb.same (id) VALUES (1);",
     };
 
     // INT column, integer literal: the literal is BIGINT.
     constexpr std::initializer_list<const char*> k_int_default = {
-        "CREATE DATABASE ddb;",
+        "CREATE SCHEMA ddb;",
         "CREATE TABLE ddb.narrow (id BIGINT, n INT DEFAULT 7);",
         "INSERT INTO ddb.narrow (id) VALUES (1);",
     };
 
     // Composite column, ROW(...) literal: the members are literal-typed.
     constexpr std::initializer_list<const char*> k_row_default = {
-        "CREATE DATABASE ddb;",
+        "CREATE SCHEMA ddb;",
         "CREATE TYPE trio_t AS (a INT, b STRING, c STRING);",
         "CREATE TABLE ddb.comp (id BIGINT, v trio_t DEFAULT ROW(5, 'd', NULL));",
         "INSERT INTO ddb.comp (id) VALUES (1);",
     };
 
-    void require_trio_default(const components::types::logical_value_t& v) {
-        REQUIRE(v.children().size() == 3);
-        REQUIRE(v.children()[0].value<int32_t>() == 5);
-        REQUIRE(v.children()[1].value<std::string_view>() == "d");
-        REQUIRE(v.children()[2].is_null());
+    void require_trio_default(const otterstax::test::cell_t& v) {
+        REQUIRE(v.child_count() == 3);
+        REQUIRE(v.child(0).value<int32_t>() == 5);
+        REQUIRE(v.child(1).value<std::string_view>() == "d");
+        REQUIRE(v.child(2).is_null());
     }
 
 } // namespace
@@ -126,9 +127,9 @@ TEST_CASE("DEFAULT: engine alone stores same-typed DEFAULTs for omitted BIGINT /
     e.run_all(k_same_type_defaults);
 
     auto cursor = e.select_one("SELECT n, s, d FROM ddb.same;");
-    REQUIRE(cursor->value(0, 0).value<int64_t>() == 7);
-    REQUIRE(cursor->value(1, 0).value<std::string_view>() == "x");
-    REQUIRE(cursor->value(2, 0).value<double>() == 1.5);
+    REQUIRE(cursor->get<int64_t>(0, 0).value() == 7);
+    REQUIRE(cursor->get<std::string_view>(1, 0).value() == "x");
+    REQUIRE(cursor->get<double>(2, 0).value() == 1.5);
 }
 
 TEST_CASE("DEFAULT: the session stack stores same-typed DEFAULTs for omitted BIGINT / STRING / DOUBLE columns",
@@ -140,9 +141,9 @@ TEST_CASE("DEFAULT: the session stack stores same-typed DEFAULTs for omitted BIG
         const auto payload = select_one(s, id, "SELECT n, s, d FROM ddb.same;");
         const auto& row = payload.chunks.front();
         REQUIRE(row.column_count() == 3);
-        REQUIRE(row.value(0, 0).value<int64_t>() == 7);
-        REQUIRE(row.value(1, 0).value<std::string_view>() == "x");
-        REQUIRE(row.value(2, 0).value<double>() == 1.5);
+        REQUIRE(otterstax::test::cell(row, 0, 0).value<int64_t>() == 7);
+        REQUIRE(otterstax::test::cell(row, 1, 0).value<std::string_view>() == "x");
+        REQUIRE(otterstax::test::cell(row, 2, 0).value<double>() == 1.5);
     });
 }
 
@@ -152,7 +153,7 @@ TEST_CASE("DEFAULT: engine alone — INT DEFAULT 7 omitted from the INSERT reads
     e.run_all(k_int_default);
 
     auto cursor = e.select_one("SELECT n FROM ddb.narrow;");
-    const auto n = cursor->value(0, 0);
+    const auto n = otterstax::test::cell(*cursor, 0, 0);
     REQUIRE_FALSE(n.is_null());
     REQUIRE(n.value<int32_t>() == 7);
 }
@@ -164,7 +165,7 @@ TEST_CASE("DEFAULT: the session stack — INT DEFAULT 7 omitted from the INSERT 
         run_all(s, id, k_int_default);
 
         const auto payload = select_one(s, id, "SELECT n FROM ddb.narrow;");
-        const auto n = payload.chunks.front().value(0, 0);
+        const auto n = otterstax::test::cell(payload.chunks.front(), 0, 0);
         REQUIRE_FALSE(n.is_null());
         REQUIRE(n.value<int32_t>() == 7);
     });
@@ -176,7 +177,7 @@ TEST_CASE("DEFAULT: engine alone — a composite column with a ROW(...) DEFAULT 
     e.run_all(k_row_default);
 
     auto cursor = e.select_one("SELECT v FROM ddb.comp;");
-    require_trio_default(cursor->value(0, 0));
+    require_trio_default(otterstax::test::cell(*cursor, 0, 0));
 }
 
 TEST_CASE("DEFAULT: the session stack — a composite column with a ROW(...) DEFAULT is filled in when omitted",
@@ -186,6 +187,6 @@ TEST_CASE("DEFAULT: the session stack — a composite column with a ROW(...) DEF
         run_all(s, id, k_row_default);
 
         const auto payload = select_one(s, id, "SELECT v FROM ddb.comp;");
-        require_trio_default(payload.chunks.front().value(0, 0));
+        require_trio_default(otterstax::test::cell(payload.chunks.front(), 0, 0));
     });
 }

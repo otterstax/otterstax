@@ -183,13 +183,12 @@ TEST_CASE("asio_future_bridge: infra failure") {
 }
 
 // The engine answers with every code the bridge could pick for itself —
-// transaction_inactive among them (manager_dispatcher_t's BEGIN that reached no
-// transaction, txn_accumulate_msg) — so an engine answer carrying it must reach
+// io_error and internal_error among them — so an engine answer carrying it must reach
 // the frontend as the engine's error, never as the bridge's timeout.
 TEST_CASE("asio_future_bridge: a worker error with any code is not a timeout") {
     std::pmr::synchronized_pool_resource resource;
-    for (const auto code : {core::error_code_t::transaction_inactive,
-                            core::error_code_t::other_error,
+    for (const auto code : {core::error_code_t::no_active_sql_transaction,
+                            core::error_code_t::internal_error,
                             core::error_code_t::io_error,
                             core::error_code_t::connection_closed}) {
         actor_zeta::promise<result_t> producer{&resource};

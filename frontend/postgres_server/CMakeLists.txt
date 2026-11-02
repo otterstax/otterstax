@@ -5,8 +5,10 @@ set(POSTGRES_SERVER_HEADERS
     packet/packet_reader.hpp
     packet/packet_writer.hpp
     packet/packet_utils.hpp
+    connection/deallocate_statement.hpp
     connection/postgres_connection.hpp
     connection/pipeline_state.hpp
+    connection/protocol_parameters.hpp
     postgres_server.hpp
     resultset/field_description.hpp
     resultset/postgres_resultset.hpp
@@ -16,9 +18,11 @@ set(POSTGRES_SERVER_SOURCES
      packet/packet_reader.cpp
      packet/packet_writer.cpp
      packet/packet_utils.cpp
+     connection/deallocate_statement.cpp
      connection/packet_processing.cpp
      connection/postgres_connection.cpp
      connection/pipeline_state.cpp
+     connection/protocol_parameters.cpp
      resultset/field_description.cpp
      resultset/postgres_resultset.cpp
 )

@@ -135,7 +135,7 @@ namespace otterstax::runtime {
             thrown = "an exception of unknown type";
         }
         runtime.engine_pools_spent();
-        return core::error_t(core::error_code_t::other_error,
+        return core::error_t(core::error_code_t::internal_error,
                              std::pmr::string{("engine startup REFUSED, open_engine threw: " + thrown).c_str(),
                                               std::pmr::new_delete_resource()});
     }

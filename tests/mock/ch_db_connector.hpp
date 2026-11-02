@@ -12,6 +12,8 @@
 
 namespace ch {
 
+    namespace types = components::types;
+
     class MockConnector : public ch::IConnector {
     public:
         explicit MockConnector(mock_config config, std::string alias = "ch_mock_connector")
@@ -42,25 +44,33 @@ namespace ch {
 
         std::string alias() const noexcept override { return alias_; }
 
-        data_chunk_t get_chunk() {
-            std::pmr::vector<components::types::complex_logical_type> fields(config_.resource);
-            if (config_.return_empty) {
-                components::vector::data_chunk_t result(config_.resource, fields);
-                return result;
+        data_chunk_t get_chunk(std::string_view query = {}) {
+            // The columns the SELECT list names, in its order (mock_projection).
+            const auto projection = mock_projection(query, '`');
+            std::pmr::vector<types::complex_logical_type> fields(config_.resource);
+            for (auto c : projection) {
+                if (c == 0) {
+                    fields.emplace_back(types::logical_type::INTEGER, "id");
+                } else {
+                    fields.emplace_back(types::logical_type::STRING_LITERAL, "name");
+                }
             }
-
-            fields.reserve(2);
-            fields.emplace_back(types::logical_type::INTEGER, "id");
-            fields.emplace_back(types::logical_type::STRING_LITERAL, "name");
-            components::vector::data_chunk_t result(config_.resource, fields);
+            if (config_.return_empty) {
+                return data_chunk_t(config_.resource, std::pmr::vector<types::complex_logical_type>(config_.resource));
+            }
+            data_chunk_t result(config_.resource, fields, 2);
             result.set_cardinality(2);
             // Defined values: the slice reaches a real engine, which copies and
             // reads every cell.
             for (uint64_t row = 0; row < 2; ++row) {
-                result.set_value(0, row, types::logical_value_t(config_.resource, static_cast<int32_t>(row + 1)));
-                result.set_value(1,
-                                 row,
-                                 types::logical_value_t(config_.resource, std::string{"name_" + std::to_string(row)}));
+                for (std::size_t at = 0; at < projection.size(); ++at) {
+                    if (projection[at] == 0) {
+                        result.set_value(at, row, static_cast<int32_t>(row + 1));
+                    } else {
+                        const std::string name = "name_" + std::to_string(row);
+                        result.set_value(at, row, std::string_view{name});
+                    }
+                }
             }
             return result;
         }
@@ -80,7 +90,7 @@ namespace ch {
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(config_.wait_time));
 
-            co_return std::make_unique<data_chunk_t>(get_chunk());
+            co_return std::make_unique<data_chunk_t>(get_chunk(query));
         }
 
         asio::awaitable<core::result_wrapper_t<int64_t>>

@@ -7,10 +7,12 @@
 // queued behind it),
 // one statement at a time across real suspensions (the engine on its own pools,
 // a slow backend on the connector pool), and the connection's engine session:
-// BEGIN / COMMIT / ROLLBACK over engine tables with PostgreSQL semantics,
-// isolated per connection.
+// BEGIN / COMMIT / ROLLBACK / SAVEPOINT over engine tables with PostgreSQL
+// semantics, isolated per connection, the status the engine stamps on every
+// answer, SET in the engine, and close_session when the session closes.
 
 #include "../system/session_stack.hpp"
+#include "../mock/cell.hpp"
 
 #include "../mock/mock_config.hpp"
 #include "../mock/parser.hpp"
@@ -153,7 +155,7 @@ namespace {
         REQUIRE(r.value().size() == 1);
         for (const auto& chunk : r.value().chunks) {
             if (chunk.size() != 0) {
-                return chunk.value(0, 0).value<uint64_t>();
+                return otterstax::test::cell(chunk, 0, 0).value<uint64_t>();
             }
         }
         FAIL("no row");
@@ -188,7 +190,9 @@ TEST_CASE("session services: make_session_services sets every address") {
                                                               owner.engine().dispatcher(),
                                                               owner.s3_address(),
                                                               owner.file_address(),
-                                                              owner.kafka_address());
+                                                              owner.kafka_address(),
+                                                              owner.kafka_objects(),
+                                                              owner.remote().connections());
     REQUIRE_FALSE(services.has_error());
     CHECK(services.value().engine_dispatcher == owner.engine().dispatcher());
     CHECK(services.value().s3 == owner.s3_address());
@@ -208,12 +212,44 @@ TEST_CASE("session services: make_session_services refuses each empty address") 
                                                                   missing == 0 ? empty : owner.engine().dispatcher(),
                                                                   missing == 1 ? empty : owner.s3_address(),
                                                                   missing == 2 ? empty : owner.file_address(),
-                                                                  missing == 3 ? empty : owner.kafka_address());
+                                                                  missing == 3 ? empty : owner.kafka_address(),
+                                                                  owner.kafka_objects(),
+                                                                  owner.remote().connections());
         REQUIRE(services.has_error());
         CHECK(services.error().type == core::error_code_t::invalid_parameter);
         CHECK(std::string{services.error().what.c_str()} ==
               std::string{"session services: the "} + names[missing] + " address is empty");
     }
+}
+
+// The registration of a missed table needs the backend actor of every
+// configured connection.
+TEST_CASE("session services: connections without the backend actor are refused") {
+    stack_options_t options;
+    options.connections.mysql = otterstax::test::mock_mysql({"orders"});
+    session_stack_owner owner(otterstax::test::unique_test_dir("otterstax_session_services_actor"), options);
+    REQUIRE_FALSE(owner.remote().connections().empty());
+    auto without_actor = owner.remote().connections();
+    without_actor.front().actor = nullptr;
+    auto services = otterstax::session::make_session_services(owner.engine().resource(),
+                                                              owner.engine().dispatcher(),
+                                                              owner.s3_address(),
+                                                              owner.file_address(),
+                                                              owner.kafka_address(),
+                                                              owner.kafka_objects(),
+                                                              without_actor);
+    REQUIRE(services.has_error());
+    CHECK(services.error().type == core::error_code_t::invalid_parameter);
+    auto with_actor = otterstax::session::make_session_services(owner.engine().resource(),
+                                                                owner.engine().dispatcher(),
+                                                                owner.s3_address(),
+                                                                owner.file_address(),
+                                                                owner.kafka_address(),
+                                                                owner.kafka_objects(),
+                                                                owner.remote().connections());
+    REQUIRE_FALSE(with_actor.has_error());
+    REQUIRE(with_actor.value().aliases.size() == 1);
+    CHECK(with_actor.value().aliases.front() == "orders");
 }
 
 TEST_CASE("session close: an idle session frees itself at once") {
@@ -307,7 +343,7 @@ TEST_CASE("session wait: a statement held on its backend does not spin the pools
 TEST_CASE("session order: one statement at a time across real suspensions") {
     session_stack_owner owner(otterstax::test::unique_test_dir("otterstax_session_order_suspend"), slow_options());
     const auto s = owner.stack();
-    run_session_or_fail(s, 1, "CREATE DATABASE ord;");
+    run_session_or_fail(s, 1, "CREATE SCHEMA ord;");
     run_session_or_fail(s, 2, "CREATE TABLE ord.t (id bigint);");
 
     constexpr size_t kRounds = 12;
@@ -341,7 +377,7 @@ TEST_CASE("session order: one statement at a time across real suspensions") {
 TEST_CASE("session transaction: ROLLBACK discards and COMMIT keeps the block's writes") {
     session_stack_owner owner(otterstax::test::unique_test_dir("otterstax_session_txn"));
     const auto s = owner.stack();
-    run_session_or_fail(s, 1, "CREATE DATABASE txn;");
+    run_session_or_fail(s, 1, "CREATE SCHEMA txn;");
     run_session_or_fail(s, 2, "CREATE TABLE txn.t (id bigint);");
 
     run_session_or_fail(s, 3, "BEGIN;");
@@ -359,7 +395,7 @@ TEST_CASE("session transaction: ROLLBACK discards and COMMIT keeps the block's w
 TEST_CASE("session transaction: an error aborts the block until ROLLBACK") {
     session_stack_owner owner(otterstax::test::unique_test_dir("otterstax_session_txn_abort"));
     const auto s = owner.stack();
-    run_session_or_fail(s, 1, "CREATE DATABASE txa;");
+    run_session_or_fail(s, 1, "CREATE SCHEMA txa;");
     run_session_or_fail(s, 2, "CREATE TABLE txa.t (id bigint);");
 
     SECTION("an engine error, then ROLLBACK") {
@@ -367,7 +403,7 @@ TEST_CASE("session transaction: an error aborts the block until ROLLBACK") {
         run_session_or_fail(s, 4, "INSERT INTO txa.t (id) VALUES (1);");
         REQUIRE(run_session_sql_payload(s, 5, "SELECT * FROM txa.nowhere;").has_error());
         auto refused = run_session_sql_payload(s, 6, "SELECT count(*) FROM txa.t;");
-        require_error_containing(refused, "only ROLLBACK is accepted");
+        require_error_containing(refused, "only ROLLBACK");
         CHECK(refused.error().type == core::error_code_t::transaction_finalized);
         run_session_or_fail(s, 7, "ROLLBACK;");
         CHECK(count_rows(s, 8, "txa.t") == 0);
@@ -379,10 +415,12 @@ TEST_CASE("session transaction: an error aborts the block until ROLLBACK") {
         REQUIRE(parse.has_error());
         CHECK(parse.error().type == core::error_code_t::sql_parse_error);
         require_error_containing(run_session_sql_payload(s, 6, "INSERT INTO txa.t (id) VALUES (2);"),
-                                 "only ROLLBACK is accepted");
+                                 "only ROLLBACK");
+        // The engine answers the COMMIT of a failed block with success and
+        // rolls it back; the session tags it ROLLBACK, as PostgreSQL does.
         auto commit = run_session_sql_payload(s, 7, "COMMIT;");
-        require_error_containing(commit, "nothing was committed");
-        CHECK(commit.error().type == core::error_code_t::transaction_finalized);
+        REQUIRE_FALSE(commit.has_error());
+        CHECK(commit.value().transaction == otterstax::session::transaction_command_t::rollback);
         // The block is over: statements run again, and nothing of it was kept.
         CHECK(count_rows(s, 8, "txa.t") == 0);
     }
@@ -392,7 +430,7 @@ TEST_CASE("session transaction: two connections are isolated") {
     session_stack_owner owner(otterstax::test::unique_test_dir("otterstax_session_txn_iso"));
     const auto a = owner.stack();
     const auto b = a.on(owner.open_connection());
-    run_session_or_fail(a, 1, "CREATE DATABASE iso;");
+    run_session_or_fail(a, 1, "CREATE SCHEMA iso;");
     run_session_or_fail(a, 2, "CREATE TABLE iso.t (id bigint);");
 
     run_session_or_fail(a, 3, "BEGIN;");
@@ -425,64 +463,28 @@ TEST_CASE("session transaction: COMMIT and ROLLBACK outside a block are accepted
     run_session_or_fail(s, 2, "CREATE DATABASE txnone;");
 }
 
-// ─── The block the session follows (transaction_state) ──────────────────────
+// ─── Where the engine stamped the session (transaction_status) ──────────────
 
-using otterstax::session::next_transaction_state;
 using otterstax::session::transaction_command_t;
-using otterstax::session::transaction_state_t;
+using status_t = components::session::transaction_status_t;
 
-TEST_CASE("transaction state: the transitions mirror the engine dispatcher") {
-    using enum transaction_state_t;
-    constexpr auto none = core::error_code_t::none;
-    constexpr auto finalized = core::error_code_t::transaction_finalized;
-    constexpr auto other = core::error_code_t::table_not_exists;
-    constexpr auto io = core::error_code_t::io_error;
-    // BEGIN opens a block; a stray BEGIN inside one keeps it.
-    STATIC_REQUIRE(next_transaction_state(idle, transaction_command_t::begin, true, none) == in_block);
-    STATIC_REQUIRE(next_transaction_state(in_block, transaction_command_t::begin, true, none) == in_block);
-    // COMMIT / ROLLBACK end it, whatever it was; COMMIT of a failed block ends
-    // it as the rollback the engine answers transaction_finalized for.
-    STATIC_REQUIRE(next_transaction_state(in_block, transaction_command_t::commit, true, none) == idle);
-    STATIC_REQUIRE(next_transaction_state(failed, transaction_command_t::commit, false, finalized) == idle);
-    STATIC_REQUIRE(next_transaction_state(failed, transaction_command_t::rollback, true, none) == idle);
-    STATIC_REQUIRE(next_transaction_state(idle, transaction_command_t::commit, true, none) == idle);
-    // A COMMIT that fails on its own (the WAL marker, the index commit) has
-    // already drained the transaction in the engine: the session is idle there,
-    // so it is idle here — never failed, which would refuse the remote DDL /
-    // DML, COPY and Kafka statements and show E on the PG wire until the next
-    // statement.
-    STATIC_REQUIRE(next_transaction_state(in_block, transaction_command_t::commit, false, io) == idle);
-    STATIC_REQUIRE(next_transaction_state(in_block, transaction_command_t::commit, false, other) == idle);
-    STATIC_REQUIRE(next_transaction_state(failed, transaction_command_t::commit, false, io) == idle);
-    // An error fails an open block, and only an open one.
-    STATIC_REQUIRE(next_transaction_state(in_block, transaction_command_t::none, false, other) == failed);
-    STATIC_REQUIRE(next_transaction_state(idle, transaction_command_t::none, false, other) == idle);
-    // A refusal as transaction_finalized is a failed block, whatever was believed.
-    STATIC_REQUIRE(next_transaction_state(failed, transaction_command_t::none, false, finalized) == failed);
-    STATIC_REQUIRE(next_transaction_state(idle, transaction_command_t::none, false, finalized) == failed);
-    STATIC_REQUIRE(next_transaction_state(failed, transaction_command_t::begin, false, finalized) == failed);
-    // A statement that ran proves there is no failed block.
-    STATIC_REQUIRE(next_transaction_state(failed, transaction_command_t::none, true, none) == idle);
-    STATIC_REQUIRE(next_transaction_state(in_block, transaction_command_t::none, true, none) == in_block);
-}
-
-TEST_CASE("transaction state: the session follows BEGIN, a failure, the refusals and COMMIT") {
+TEST_CASE("transaction status: the session reads the engine's status on every answer") {
     session_stack_owner owner(otterstax::test::unique_test_dir("otterstax_session_txn_state"));
     auto session = owner.open_session();
     const auto s = owner.stack().on(session->address());
-    run_session_or_fail(s, 1, "CREATE DATABASE txs;");
+    run_session_or_fail(s, 1, "CREATE SCHEMA txs;");
     run_session_or_fail(s, 2, "CREATE TABLE txs.t (id bigint);");
-    CHECK(session->transaction_state() == transaction_state_t::idle);
+    CHECK(session->transaction_status() == status_t::idle);
 
     auto begun = run_session_sql_payload(s, 3, "BEGIN;");
     REQUIRE_FALSE(begun.has_error());
     CHECK(begun.value().transaction == transaction_command_t::begin);
-    CHECK(session->transaction_state() == transaction_state_t::in_block);
+    CHECK(session->transaction_status() == status_t::in_transaction);
 
     auto inserted = run_session_sql_payload(s, 4, "INSERT INTO txs.t (id) VALUES (1);");
     REQUIRE_FALSE(inserted.has_error());
     CHECK(inserted.value().transaction == transaction_command_t::none);
-    CHECK(session->transaction_state() == transaction_state_t::in_block);
+    CHECK(session->transaction_status() == status_t::in_transaction);
 
     SECTION("an engine error") {
         REQUIRE(run_session_sql_payload(s, 5, "SELECT * FROM txs.nowhere;").has_error());
@@ -490,84 +492,67 @@ TEST_CASE("transaction state: the session follows BEGIN, a failure, the refusals
     SECTION("a prepare the engine refuses") {
         REQUIRE(otterstax::test::prepare_session_sql(s, 5, "SELECT nowhere FROM txs.t;").has_error());
     }
+    SECTION("a prepare that does not parse") {
+        REQUIRE(otterstax::test::prepare_session_sql(s, 5, "SELEKT id FROM txs.t;").has_error());
+    }
     SECTION("a failure the frontend reports") {
         auto [ns, fut] = actor_zeta::send(s.session,
                                           &query_session_t::fail_transaction,
-                                          core::error_code_t::other_error,
+                                          core::error_code_t::protocol_violation,
                                           std::string{"the client sent a malformed message"});
         auto failed = await_session(std::move(fut), 10000ms, s.resource);
         require_error_containing(failed, "malformed message");
     }
-    CHECK(session->transaction_state() == transaction_state_t::failed);
-    require_error_containing(run_session_sql_payload(s, 6, "INSERT INTO txs.t (id) VALUES (2);"),
-                             "only ROLLBACK is accepted");
-    CHECK(session->transaction_state() == transaction_state_t::failed);
+    CHECK(session->transaction_status() == status_t::failed);
+    auto refused = run_session_sql_payload(s, 6, "INSERT INTO txs.t (id) VALUES (2);");
+    require_error_containing(refused, "only ROLLBACK");
+    CHECK(refused.error().type == core::error_code_t::transaction_finalized);
+    CHECK(session->transaction_status() == status_t::failed);
 
     auto commit = run_session_sql_payload(s, 7, "COMMIT;");
-    REQUIRE(commit.has_error());
-    CHECK(commit.error().type == core::error_code_t::transaction_finalized);
-    CHECK(session->transaction_state() == transaction_state_t::idle);
+    REQUIRE_FALSE(commit.has_error());
+    CHECK(commit.value().transaction == transaction_command_t::rollback);
+    CHECK(session->transaction_status() == status_t::idle);
     CHECK(count_rows(s, 8, "txs.t") == 0);
 
     auto rolled = run_session_sql_payload(s, 9, "ROLLBACK;");
     REQUIRE_FALSE(rolled.has_error());
     CHECK(rolled.value().transaction == transaction_command_t::rollback);
-    CHECK(session->transaction_state() == transaction_state_t::idle);
+    CHECK(session->transaction_status() == status_t::idle);
 }
 
-// A prepare whose text does not parse fails an open block, as PostgreSQL's own
-// Parse error does (the MySQL frontend writes `?` as `$n` before its first
-// prepare, so no prepare is retried under another spelling).
-TEST_CASE("transaction state: a prepare that does not parse fails an open block") {
-    session_stack_owner owner(otterstax::test::unique_test_dir("otterstax_session_txn_prepare_parse"));
-    auto session = owner.open_session();
-    const auto s = owner.stack().on(session->address());
-    run_session_or_fail(s, 1, "CREATE DATABASE txp;");
-    run_session_or_fail(s, 2, "CREATE TABLE txp.t (id bigint);");
-    run_session_or_fail(s, 3, "BEGIN;");
-    run_session_or_fail(s, 4, "INSERT INTO txp.t (id) VALUES (1);");
-    REQUIRE(otterstax::test::prepare_session_sql(s, 5, "SELEKT id FROM txp.t;").has_error());
-    CHECK(session->transaction_state() == transaction_state_t::failed);
-    auto refused = run_session_sql_payload(s, 6, "INSERT INTO txp.t (id) VALUES (2);");
-    REQUIRE(refused.has_error());
-    CHECK(refused.error().type == core::error_code_t::transaction_finalized);
-    auto committed = run_session_sql_payload(s, 7, "COMMIT;");
-    CHECK(session->transaction_state() == transaction_state_t::idle);
-    static_cast<void>(committed);
-    CHECK(count_rows(s, 8, "txp.t") == 0);
-}
-
-TEST_CASE("transaction state: SAVEPOINT is refused as not supported and fails an open block") {
+TEST_CASE("transaction status: SAVEPOINT, RELEASE and ROLLBACK TO run on the engine") {
     session_stack_owner owner(otterstax::test::unique_test_dir("otterstax_session_txn_savepoint"));
     auto session = owner.open_session();
     const auto s = owner.stack().on(session->address());
-    SECTION("outside a block nothing fails") {
-        auto refused = run_session_sql_payload(s, 1, "SAVEPOINT sp;");
-        REQUIRE(refused.has_error());
-        CHECK(refused.error().type == core::error_code_t::unimplemented_yet);
-        CHECK(session->transaction_state() == transaction_state_t::idle);
-    }
-    SECTION("inside one the block fails, as any error does") {
-        run_session_or_fail(s, 1, "BEGIN;");
-        for (const char* sql : {"SAVEPOINT sp;", "RELEASE SAVEPOINT sp;", "ROLLBACK TO SAVEPOINT sp;"}) {
-            INFO(sql);
-            auto refused = run_session_sql_payload(s, 2, sql);
-            REQUIRE(refused.has_error());
-            if (session->transaction_state() == transaction_state_t::in_block) {
-                FAIL("the block is still open after " << sql);
-            }
-            // The first refusal fails the block; the next ones are refused in it.
-            CHECK((refused.error().type == core::error_code_t::unimplemented_yet ||
-                   refused.error().type == core::error_code_t::transaction_finalized));
-        }
-        CHECK(session->transaction_state() == transaction_state_t::failed);
-        run_session_or_fail(s, 3, "ROLLBACK;");
-    }
+    const auto other = owner.stack();
+    run_session_or_fail(s, 1, "CREATE SCHEMA txsp;");
+    run_session_or_fail(s, 2, "CREATE TABLE txsp.t (id bigint);");
+
+    run_session_or_fail(s, 3, "BEGIN;");
+    run_session_or_fail(s, 4, "INSERT INTO txsp.t (id) VALUES (1);");
+    auto saved = run_session_sql_payload(s, 5, "SAVEPOINT sp;");
+    REQUIRE_FALSE(saved.has_error());
+    CHECK(saved.value().transaction == transaction_command_t::savepoint);
+    run_session_or_fail(s, 6, "INSERT INTO txsp.t (id) VALUES (2);");
+    // An error after the savepoint fails the block; ROLLBACK TO takes it back.
+    REQUIRE(run_session_sql_payload(s, 7, "SELECT * FROM txsp.nowhere;").has_error());
+    CHECK(session->transaction_status() == status_t::failed);
+    auto back = run_session_sql_payload(s, 8, "ROLLBACK TO SAVEPOINT sp;");
+    INFO((back.has_error() ? back.error().what.c_str() : "ok"));
+    REQUIRE_FALSE(back.has_error());
+    CHECK(back.value().transaction == transaction_command_t::rollback_to);
+    CHECK(session->transaction_status() == status_t::in_transaction);
+    auto released = run_session_sql_payload(s, 9, "RELEASE SAVEPOINT sp;");
+    REQUIRE_FALSE(released.has_error());
+    CHECK(released.value().transaction == transaction_command_t::release);
+    run_session_or_fail(s, 10, "COMMIT;");
+    // The row written before the savepoint is kept, the one after it is not.
+    CHECK(count_rows(other, 11, "txsp.t") == 1);
 }
 
-// A SET never reaches the engine, which would apply it to every session and
-// persist it: one session's SET autocommit / timezone, in any form, is answered
-// OK without effect, and another session stays in autocommit.
+// SET goes to the engine as written: the engine keeps it for its session
+// alone (PostgreSQL 18's rules), and refuses a parameter it does not know.
 TEST_CASE("settings: a SET of one session changes no other session") {
     session_stack_owner owner(otterstax::test::unique_test_dir("otterstax_session_set_isolated"));
     auto a = owner.open_session();
@@ -575,42 +560,37 @@ TEST_CASE("settings: a SET of one session changes no other session") {
     const auto sa = owner.stack().on(a->address());
     const auto sb = owner.stack().on(b->address());
     const auto sc = owner.stack();
-    run_session_or_fail(sa, 1, "CREATE DATABASE sets;");
+    run_session_or_fail(sa, 1, "CREATE SCHEMA sets;");
     run_session_or_fail(sa, 2, "CREATE TABLE sets.t (id bigint);");
 
-    session_hash_t id = 10;
-    for (const char* sql : {"SET autocommit TO off;",
-                            "SET autocommit = 0;",
-                            "SET SESSION autocommit = false;",
-                            "SET LOCAL autocommit TO off;",
-                            "SET timezone TO 'Asia/Tokyo';",
-                            "SET TIME ZONE 'UTC';",
-                            "SET decimal_width TO '10';",
-                            "RESET autocommit;",
-                            "RESET ALL;",
-                            "SET autocommit TO DEFAULT;",
-                            "SET no_such_parameter TO 1;"}) {
-        INFO(sql);
-        auto answered = run_session_sql_payload(sa, ++id, sql);
-        INFO((answered.has_error() ? answered.error().what.c_str() : "ok"));
-        REQUIRE_FALSE(answered.has_error());
-        CHECK(answered.value().column_count() == 0);
-        CHECK(answered.value().tag == T_VariableSetStmt);
-        CHECK(a->transaction_state() == transaction_state_t::idle);
-    }
-    // Prepared, then executed: the same.
-    REQUIRE_FALSE(otterstax::test::prepare_session_sql(sa, 40, "SET autocommit TO off;").has_error());
-    auto [ns, fut] = actor_zeta::send(sa.session, &query_session_t::execute_statement, stmt(40));
-    auto executed = await_session(std::move(fut), 10000ms, sa.resource);
-    REQUIRE_FALSE(executed.has_error());
+    auto set = run_session_sql_payload(sa, 3, "SET autocommit TO off;");
+    INFO((set.has_error() ? set.error().what.c_str() : "ok"));
+    REQUIRE_FALSE(set.has_error());
+    CHECK(set.value().column_count() == 0);
+    CHECK(set.value().tag == T_VariableSetStmt);
 
+    // a is out of autocommit: its INSERT opens a block the others do not see.
+    run_session_or_fail(sa, 4, "INSERT INTO sets.t (id) VALUES (2);");
+    CHECK(a->transaction_status() == status_t::in_transaction);
+    CHECK(count_rows(sc, 5, "sets.t") == 0);
     // b is still in autocommit: its INSERT commits on its own, seen at once.
-    run_session_or_fail(sb, 1, "INSERT INTO sets.t (id) VALUES (1);");
-    CHECK(b->transaction_state() == transaction_state_t::idle);
-    CHECK(count_rows(sc, 2, "sets.t") == 1);
-    // And a itself.
-    run_session_or_fail(sa, 50, "INSERT INTO sets.t (id) VALUES (2);");
-    CHECK(count_rows(sc, 3, "sets.t") == 2);
+    run_session_or_fail(sb, 6, "INSERT INTO sets.t (id) VALUES (1);");
+    CHECK(b->transaction_status() == status_t::idle);
+    CHECK(count_rows(sc, 7, "sets.t") == 1);
+    run_session_or_fail(sa, 8, "COMMIT;");
+    CHECK(count_rows(sc, 9, "sets.t") == 2);
+}
+
+TEST_CASE("settings: a SET of a parameter the engine does not know is the engine's error") {
+    session_stack_owner owner(otterstax::test::unique_test_dir("otterstax_session_set_unknown"));
+    const auto s = owner.stack();
+    for (const char* sql : {"SET no_such_parameter TO '1';", "SET client_encoding = 'utf8';"}) {
+        INFO(sql);
+        auto refused = run_session_sql_payload(s, 1, sql);
+        REQUIRE(refused.has_error());
+    }
+    // Prepared: the same refusal at prepare.
+    REQUIRE(otterstax::test::prepare_session_sql(s, 2, "SET no_such_parameter TO '1';").has_error());
 }
 
 TEST_CASE("settings: a SET inside a block keeps it open and is refused in a failed one") {
@@ -618,23 +598,13 @@ TEST_CASE("settings: a SET inside a block keeps it open and is refused in a fail
     auto session = owner.open_session();
     const auto s = owner.stack().on(session->address());
     const auto other = owner.stack();
-    run_session_or_fail(s, 1, "CREATE DATABASE setb;");
+    run_session_or_fail(s, 1, "CREATE SCHEMA setb;");
     run_session_or_fail(s, 2, "CREATE TABLE setb.t (id bigint);");
 
     run_session_or_fail(s, 3, "BEGIN;");
     run_session_or_fail(s, 4, "INSERT INTO setb.t (id) VALUES (1);");
-    run_session_or_fail(s, 5, "SET autocommit = 0;");
     run_session_or_fail(s, 6, "SET timezone TO 'UTC';");
-    // A SET in a frontend's own grammar (MySQL `SET @@session.autocommit = 0`)
-    // is the same answer.
-    {
-        auto [ns, fut] =
-            actor_zeta::send(session->address(), &query_session_t::execute_setting);
-        auto answered = otterstax::test::await_session(std::move(fut), std::chrono::milliseconds(10000), s.resource);
-        REQUIRE_FALSE(answered.has_error());
-        CHECK(answered.value().column_count() == 0);
-    }
-    CHECK(session->transaction_state() == transaction_state_t::in_block);
+    CHECK(session->transaction_status() == status_t::in_transaction);
     run_session_or_fail(s, 7, "COMMIT;");
     CHECK(count_rows(other, 8, "setb.t") == 1);
 
@@ -642,27 +612,21 @@ TEST_CASE("settings: a SET inside a block keeps it open and is refused in a fail
     // there, and the block stays failed.
     run_session_or_fail(s, 9, "BEGIN;");
     REQUIRE(run_session_sql_payload(s, 10, "SELECT * FROM setb.nowhere;").has_error());
-    auto refused = run_session_sql_payload(s, 11, "SET autocommit TO on;");
-    require_error_containing(refused, "only ROLLBACK is accepted");
-    {
-        auto [ns, fut] =
-            actor_zeta::send(session->address(), &query_session_t::execute_setting);
-        auto answered = otterstax::test::await_session(std::move(fut), std::chrono::milliseconds(10000), s.resource);
-        require_error_containing(answered, "only ROLLBACK is accepted");
-    }
-    CHECK(session->transaction_state() == transaction_state_t::failed);
+    auto refused = run_session_sql_payload(s, 11, "SET timezone TO 'UTC';");
+    require_error_containing(refused, "only ROLLBACK");
+    CHECK(session->transaction_status() == status_t::failed);
     run_session_or_fail(s, 12, "ROLLBACK;");
 }
 
-// otterbrix has no close-session call: a connection closed inside a block would
-// leave its transaction with the engine for good. The session rolls it back as
-// it goes.
-TEST_CASE("transaction state: a session closed inside a block rolls it back") {
+// close() ends the engine session (manager_dispatcher_t::close_session): an
+// open block rolls back and the session's own state — its SQL PREPAREs among
+// it — goes, whether the session was inside a block or not.
+TEST_CASE("transaction status: a session closed inside a block rolls it back") {
     session_stack_owner owner(otterstax::test::unique_test_dir("otterstax_session_txn_close"));
     auto& sessions = owner.sessions();
     const size_t baseline = sessions.live_sessions();
     const auto other = owner.stack();
-    run_session_or_fail(other, 1, "CREATE DATABASE txc;");
+    run_session_or_fail(other, 1, "CREATE SCHEMA txc;");
     run_session_or_fail(other, 2, "CREATE TABLE txc.t (id bigint);");
 
     auto session = owner.open_session();
@@ -670,30 +634,45 @@ TEST_CASE("transaction state: a session closed inside a block rolls it back") {
     const auto s = owner.stack().on(session->address());
     run_session_or_fail(s, 1, "BEGIN;");
     run_session_or_fail(s, 2, "INSERT INTO txc.t (id) VALUES (1), (2);");
-    REQUIRE(session->transaction_state() == transaction_state_t::in_block);
+    REQUIRE(session->transaction_status() == status_t::in_transaction);
     session.reset();
-    // The ROLLBACK is queued on the session's own pool; the session frees
-    // itself once it ran.
     REQUIRE(wait_for_live(sessions, baseline, 10000ms));
     // Not visible from another session — which MVCC would answer for a block
-    // left open too, so it proves nothing about the ROLLBACK by itself.
+    // left open too, so it proves nothing about the rollback by itself.
     CHECK(count_rows(other, 3, "txc.t") == 0);
-    // The proof: the closed connection's engine session is no longer inside
-    // the block. A COMMIT sent on it now commits nothing; had the block been
-    // left with the engine, this COMMIT would publish the two rows.
+    // The proof: the closed connection's engine session is a new, empty one.
+    // A COMMIT sent on it now commits nothing; had the block been left with
+    // the engine, this COMMIT would publish the two rows.
     auto commit = otterstax::engine::sql_plan(owner.engine().resource(), "COMMIT;");
     REQUIRE_FALSE(commit.has_error());
     auto committed = owner.engine().engine().execute_plan_blocking(engine_session, std::move(commit.value()));
     REQUIRE(committed);
     CHECK(count_rows(other, 4, "txc.t") == 0);
-    run_session_or_fail(other, 5, "INSERT INTO txc.t (id) VALUES (3);");
-    CHECK(count_rows(other, 6, "txc.t") == 1);
 }
 
-// The statements that do not run on the connection's engine session — remote
-// DDL, a four-part DML — are refused in a failed block exactly as the engine
-// refuses the rest; once the block ended they run again.
-TEST_CASE("transaction state: remote DDL and a four-part DML are refused in a failed block") {
+TEST_CASE("transaction status: an idle session closed takes its engine state with it") {
+    session_stack_owner owner(otterstax::test::unique_test_dir("otterstax_session_close_idle"));
+    auto& sessions = owner.sessions();
+    const size_t baseline = sessions.live_sessions();
+    auto session = owner.open_session();
+    const auto engine_session = session->engine_session();
+    const auto s = owner.stack().on(session->address());
+    run_session_or_fail(s, 1, "PREPARE q AS SELECT 1;");
+    run_session_or_fail(s, 2, "EXECUTE q;");
+    REQUIRE(session->transaction_status() == status_t::idle);
+    session.reset();
+    REQUIRE(wait_for_live(sessions, baseline, 10000ms));
+    // The engine dropped the session's prepared statement with the session.
+    auto execute = otterstax::engine::sql_plan(owner.engine().resource(), "EXECUTE q;");
+    REQUIRE_FALSE(execute.has_error());
+    auto executed = owner.engine().engine().execute_plan_blocking(engine_session, std::move(execute.value()));
+    REQUIRE(executed);
+    CHECK(executed->is_error());
+}
+
+// A statement over a connection's table in a failed block is refused by the
+// engine, as everything is there.
+TEST_CASE("transaction status: a statement over a connection's table is refused in a failed block") {
     stack_options_t options;
     options.connections.mysql = otterstax::test::mock_mysql({"orders"});
     session_stack_owner owner(otterstax::test::unique_test_dir("otterstax_session_txn_remote"), options);
@@ -701,45 +680,15 @@ TEST_CASE("transaction state: remote DDL and a four-part DML are refused in a fa
     const auto s = owner.stack().on(session->address());
 
     run_session_or_fail(s, 1, "BEGIN;");
-    REQUIRE(run_session_sql_payload(s, 2, "SELECT * FROM orders.db.nowhere_at_all;").has_error());
-    REQUIRE(session->transaction_state() == transaction_state_t::failed);
-
+    REQUIRE(run_session_sql_payload(s, 2, "SELECT * FROM txr_nowhere.t;").has_error());
+    REQUIRE(session->transaction_status() == status_t::failed);
     for (const char* sql : {"UPDATE orders.db.public.\"table\" SET name = 'x' WHERE id = 1;",
-                            "CREATE TABLE orders.db.created_in_failed_block (id bigint);"}) {
+                            "CREATE TABLE orders.db.public.created_in_failed_block (id bigint);"}) {
         INFO(sql);
         auto refused = run_session_sql_payload(s, 3, sql);
-        require_error_containing(refused, "only ROLLBACK is accepted");
+        require_error_containing(refused, "only ROLLBACK");
         CHECK(refused.error().type == core::error_code_t::transaction_finalized);
-        CHECK(session->transaction_state() == transaction_state_t::failed);
+        CHECK(session->transaction_status() == status_t::failed);
     }
-
     run_session_or_fail(s, 4, "ROLLBACK;");
-    auto four = run_session_sql_payload(s, 5, "UPDATE orders.db.public.\"table\" SET name = 'x' WHERE id = 1;");
-    INFO((four.has_error() ? four.error().what.c_str() : "ok"));
-    REQUIRE_FALSE(four.has_error());
-    CHECK(four.value().reported_rows() == 42);
-}
-
-// A four-part DML target runs on its backend directly, whose write answers a
-// count only: a RETURNING list is refused at execute and at prepare, never
-// answered as a bare count.
-TEST_CASE("remote DML: RETURNING on a four-part target is refused at execute and at prepare") {
-    stack_options_t options;
-    options.connections.mysql = otterstax::test::mock_mysql({"orders"});
-    session_stack_owner owner(otterstax::test::unique_test_dir("otterstax_session_remote_returning"), options);
-    const auto s = owner.stack();
-    for (const char* sql : {"UPDATE orders.db.public.\"table\" SET name = 'x' WHERE id = 1 RETURNING id;",
-                            "DELETE FROM orders.db.public.\"table\" WHERE id = 1 RETURNING id, name;",
-                            "INSERT INTO orders.db.public.\"table\" (id, name) VALUES (5, 'e') RETURNING *;"}) {
-        INFO(sql);
-        auto executed = run_session_sql_payload(s, 1, sql);
-        REQUIRE(executed.has_error());
-        CHECK(executed.error().type == core::error_code_t::unimplemented_yet);
-        require_error_containing(executed, "RETURNING is not supported");
-
-        auto prepared = otterstax::test::prepare_session_sql(s, 2, sql);
-        REQUIRE(prepared.has_error());
-        CHECK(prepared.error().type == core::error_code_t::unimplemented_yet);
-        require_error_containing(prepared, "RETURNING is not supported");
-    }
 }

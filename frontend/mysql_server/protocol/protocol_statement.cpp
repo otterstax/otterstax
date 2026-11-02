@@ -8,6 +8,8 @@
 
 #include "utility/tracy_profiler.hpp"
 
+#include <components/logical_plan/node_set_setting.hpp>
+
 #include <algorithm>
 #include <array>
 #include <cassert>
@@ -234,7 +236,84 @@ namespace frontend::mysql {
             if (c.word("default")) {
                 return std::string{SERVER_CHARSET};
             }
-            return c.name(false);
+            auto charset = c.name(false);
+            if (charset) {
+                *charset = to_lower(std::move(*charset));
+            }
+            return charset;
+        }
+
+        // The engine's spelling of a MySQL system variable and of its value.
+        setting_t engine_setting(std::string name, std::optional<std::string> value) {
+            if (name == "time_zone") {
+                name = "timezone";
+                // MySQL's SYSTEM is the server's zone: the engine's default.
+                if (value && to_lower(*value) == "system") {
+                    value.reset();
+                }
+            } else if (name == "autocommit" && value) {
+                const auto v = to_lower(*value);
+                if (v == "1" || v == "on" || v == "true") {
+                    value = "on";
+                } else if (v == "0" || v == "off" || v == "false") {
+                    value = "off";
+                }
+            }
+            return setting_t{std::move(name), std::move(value)};
+        }
+
+        // The character set of a client's statements, of the connection's
+        // literals and of the results (SET NAMES, SET CHARACTER SET,
+        // character_set_client / _connection / _results), checked here against
+        // what the wire carries — never the engine's (it has no such setting).
+        // UTF-8 both ways: a statement's text reaches the engine as sent, a
+        // result's text goes out as the engine holds it, never converted
+        // (frontend/common/resultset_utils.cpp, encode_to_text), which is
+        // what the handshake and every column definition announce
+        // (SERVER_COLLATION_ID, utf8mb4_bin). So utf8mb4 and its older names are
+        // true, and for character_set_results NULL too (MySQL's "send as
+        // stored": the bytes are sent as stored). A COLLATE names a collation
+        // of that character set; comparisons stay the engine's byte comparison
+        // whatever it names, which @@collation_connection answers (utf8mb4_bin).
+        constexpr std::array<std::string_view, 3> utf8_charsets{"utf8mb4", "utf8mb3", "utf8"};
+
+        std::optional<protocol_refusal_t> charset_refusal(std::string_view variable,
+                                                          std::string_view charset,
+                                                          const std::optional<std::string>& collation) {
+            if (variable == "character_set_results" && charset == "null") {
+                return std::nullopt;
+            }
+            if (std::find(utf8_charsets.begin(), utf8_charsets.end(), charset) == utf8_charsets.end()) {
+                return protocol_refusal_t{mysql_error::ER_NOT_SUPPORTED_YET,
+                                          "character set '" + std::string{charset} +
+                                              "' is not supported: OtterStax reads and sends utf8mb4 only"};
+            }
+            if (collation) {
+                const bool mb4 = charset == "utf8mb4";
+                const bool of_charset = mb4 ? collation->starts_with("utf8mb4_")
+                                            : collation->starts_with("utf8mb3_") || collation->starts_with("utf8_");
+                if (!of_charset) {
+                    return protocol_refusal_t{mysql_error::ER_COLLATION_CHARSET_MISMATCH,
+                                              "COLLATION '" + *collation + "' is not valid for CHARACTER SET '" +
+                                                  std::string{charset} + "'"};
+                }
+            }
+            return std::nullopt;
+        }
+
+        bool is_charset_variable(std::string_view name) {
+            return name == "character_set_client" || name == "character_set_connection" ||
+                   name == "character_set_results";
+        }
+
+        // GLOBAL / PERSIST / PERSIST_ONLY, RESET PERSIST: a setting of the whole
+        // server, which a client does not change (the engine's ALTER SYSTEM
+        // would reach every other client's sessions, across restarts). The
+        // whole statement is refused, nothing of it applied.
+        set_variables_t server_wide_refusal() {
+            return set_variables_t{{},
+                                   protocol_refusal_t{mysql_error::ER_NOT_SUPPORTED_YET,
+                                                      "server-wide settings are not changed by a client"}};
         }
 
         std::optional<protocol_statement_t> classify_set(cursor_t& c) {
@@ -244,16 +323,18 @@ namespace frontend::mysql {
                 if (!charset) {
                     return std::nullopt;
                 }
-                if (c.word("collate") && !c.name(false)) {
-                    return std::nullopt;
+                std::optional<std::string> collation;
+                if (c.word("collate")) {
+                    collation = c.name(false);
+                    if (!collation) {
+                        return std::nullopt;
+                    }
+                    *collation = to_lower(std::move(*collation));
                 }
                 if (!c.at_statement_end()) {
                     return std::nullopt;
                 }
-                std::transform(charset->begin(), charset->end(), charset->begin(), [](unsigned char ch) {
-                    return static_cast<char>(std::tolower(ch));
-                });
-                return set_names_t{std::move(*charset)};
+                return set_variables_t{{}, charset_refusal("names", *charset, collation)};
             }
             // SET CHARACTER SET <charset> / SET CHARSET <charset>
             if ((c.peek_word("character") && c.peek_word("set", 1)) ||
@@ -267,18 +348,7 @@ namespace frontend::mysql {
                 if (!charset || !c.at_statement_end()) {
                     return std::nullopt;
                 }
-                std::transform(charset->begin(), charset->end(), charset->begin(), [](unsigned char ch) {
-                    return static_cast<char>(std::tolower(ch));
-                });
-                return set_names_t{std::move(*charset)};
-            }
-            // SET [GLOBAL | SESSION] TRANSACTION <characteristics>
-            {
-                const std::size_t skip = (c.peek_word("global") || c.peek_word("session")) ? 1 : 0;
-                if (c.peek_word("transaction", skip)) {
-                    return c.peek(skip + 1) != nullptr ? std::optional<protocol_statement_t>{set_variables_t{}}
-                                                       : std::nullopt;
-                }
+                return set_variables_t{{}, charset_refusal("character set", *charset, std::nullopt)};
             }
             // The assignments.
             constexpr std::array<std::string_view, 5> scopes{"global", "session", "local", "persist", "persist_only"};
@@ -287,28 +357,41 @@ namespace frontend::mysql {
                 return t != nullptr && t->kind == token_kind::word &&
                        std::find(scopes.begin(), scopes.end(), t->value) != scopes.end();
             };
+            const auto is_global = [](std::string_view scope) {
+                return scope == "global" || scope == "persist" || scope == "persist_only";
+            };
+            set_variables_t set;
+            bool server_wide = false;
             do {
+                bool global = false;
                 if (c.take(token_kind::at_at) != nullptr) {
                     if (scope_word(0) && c.peek_punct(".", 1)) {
+                        global = is_global(c.peek()->value);
                         c.word(c.peek()->value);
                         c.punct(".");
                     }
                 } else if (scope_word(0) && c.peek(1) != nullptr && c.peek(1)->kind == token_kind::word) {
+                    global = is_global(c.peek()->value);
                     c.word(c.peek()->value);
                 }
                 const auto* name = c.take(token_kind::word);
-                // `SET PASSWORD = ...` sets an account's password, and a target
+                // `SET PASSWORD = ...` sets an account's password, `SET
+                // TRANSACTION ...` a transaction's characteristics, and a target
                 // that is no word (`@user_variable` among them) is no system
-                // variable: neither is a setting.
-                if (name == nullptr || name->value == "password") {
+                // variable: none is a setting.
+                if (name != nullptr && name->value == "transaction" && global) {
+                    return server_wide_refusal(); // SET GLOBAL TRANSACTION ...
+                }
+                if (name == nullptr || name->value == "password" || name->value == "transaction") {
                     return std::nullopt;
                 }
+                server_wide = server_wide || global;
                 if (!c.punct("=") && !c.punct(":=")) {
                     return std::nullopt;
                 }
                 // The value: anything up to the next comma outside parentheses.
                 std::size_t depth = 0;
-                std::size_t taken = 0;
+                std::vector<const token_t*> value;
                 while (const auto* t = c.peek()) {
                     if (t->kind == token_kind::punct) {
                         if (depth == 0 && (t->value == "," || t->value == ";")) {
@@ -323,17 +406,90 @@ namespace frontend::mysql {
                             --depth;
                         }
                     }
-                    c.take(t->kind);
-                    ++taken;
+                    value.push_back(c.take(t->kind));
                 }
-                if (taken == 0 || depth != 0) {
+                if (value.empty() || depth != 0) {
                     return std::nullopt;
                 }
+                // One literal, word or number (a sign before a number); the
+                // engine takes a SET value as a string constant only.
+                std::optional<std::string> literal;
+                bool is_default = false;
+                if (value.size() == 1 && value[0]->kind == token_kind::word) {
+                    is_default = value[0]->value == "default";
+                    literal = value[0]->value;
+                } else if (value.size() == 1 &&
+                           (value[0]->kind == token_kind::string || value[0]->kind == token_kind::number)) {
+                    literal = value[0]->value;
+                } else if (value.size() == 2 && value[0]->kind == token_kind::punct &&
+                           (value[0]->value == "-" || value[0]->value == "+") && value[1]->kind == token_kind::number) {
+                    literal = (value[0]->value == "-" ? "-" : "") + value[1]->value;
+                }
+                if (!literal && !set.refusal) {
+                    set.refusal = protocol_refusal_t{mysql_error::ER_NOT_SUPPORTED_YET,
+                                                     "SET " + name->value +
+                                                         ": the value must be one literal, word or number"};
+                }
+                set.settings.push_back(engine_setting(name->value, is_default ? std::nullopt : std::move(literal)));
             } while (c.punct(","));
             if (!c.at_statement_end()) {
                 return std::nullopt;
             }
-            return set_variables_t{};
+            if (server_wide) {
+                return server_wide_refusal();
+            }
+            // The protocol's character sets are checked here and never reach
+            // the engine; one that is not true refuses the whole statement.
+            for (const auto& setting : set.settings) {
+                if (!set.refusal && is_charset_variable(setting.name)) {
+                    set.refusal = charset_refusal(setting.name,
+                                                  setting.value ? to_lower(*setting.value) : std::string{SERVER_CHARSET},
+                                                  std::nullopt);
+                }
+            }
+            std::erase_if(set.settings, [](const setting_t& setting) { return is_charset_variable(setting.name); });
+            return set;
+        }
+
+        // RESET PERSIST [[IF EXISTS] name]: the persisted server settings. Any
+        // other RESET is not a protocol statement.
+        std::optional<protocol_statement_t> classify_reset(cursor_t& c) {
+            if (!c.word("persist")) {
+                return std::nullopt;
+            }
+            return server_wide_refusal();
+        }
+
+        // USE <database> | USE <connection>.<database>
+        std::optional<protocol_statement_t> classify_use(cursor_t& c) {
+            auto database = c.name(false);
+            if (!database) {
+                return std::nullopt;
+            }
+            if (c.punct(".")) {
+                auto part = c.name(false);
+                if (!part) {
+                    return std::nullopt;
+                }
+                *database += "." + *part;
+            }
+            if (!c.at_statement_end()) {
+                return std::nullopt;
+            }
+            return use_database_t{std::move(*database)};
+        }
+
+        // A string constant of the engine: quotes doubled, nothing escaped.
+        std::string engine_literal(std::string_view text) {
+            std::string out{"'"};
+            for (const char ch : text) {
+                out += ch;
+                if (ch == '\'') {
+                    out += '\'';
+                }
+            }
+            out += '\'';
+            return out;
         }
 
         std::optional<protocol_statement_t> classify_show(cursor_t& c) {
@@ -374,10 +530,9 @@ namespace frontend::mysql {
         // (@@query_cache_size, @@tx_isolation's sibling @@language, ...).
         std::optional<variable_value_t> system_variable(std::string_view name, const protocol_context_t& context) {
             const auto timeout = static_cast<int64_t>(context.wait_timeout.count());
-            // Every SET is answered without effect (session/statement_kind.hpp):
-            // a connection is always in autocommit mode, never read-only.
+            // What the connection's last SET the engine accepted set.
             if (name == "autocommit") {
-                return int64_t{1};
+                return int64_t{context.autocommit ? 1 : 0};
             }
             if (name == "auto_increment_increment" || name == "auto_increment_offset") {
                 return int64_t{1};
@@ -433,7 +588,7 @@ namespace frontend::mysql {
                 return std::string{"UTC"};
             }
             if (name == "time_zone") {
-                return std::string{"SYSTEM"};
+                return context.time_zone;
             }
             // A transaction reads the snapshot taken when it began.
             if (name == "transaction_isolation" || name == "tx_isolation") {
@@ -490,9 +645,6 @@ namespace frontend::mysql {
         // MySQL's LIKE over a variable name: `%`, `_`, a backslash escaping the
         // next character, letters compared without case.
         bool like(std::string_view text, std::string_view pattern) {
-            const auto lower = [](char ch) {
-                return (ch >= 'A' && ch <= 'Z') ? static_cast<char>(ch - 'A' + 'a') : ch;
-            };
             std::size_t t = 0;
             std::size_t p = 0;
             std::size_t star_p = std::string_view::npos;
@@ -506,7 +658,7 @@ namespace frontend::mysql {
                 if (p < pattern.size()) {
                     const bool escaped = pattern[p] == '\\' && p + 1 < pattern.size();
                     const char want = escaped ? pattern[p + 1] : pattern[p];
-                    if ((!escaped && want == '_') || lower(want) == lower(text[t])) {
+                    if ((!escaped && want == '_') || to_lower(want) == to_lower(text[t])) {
                         p += escaped ? 2 : 1;
                         ++t;
                         continue;
@@ -536,7 +688,6 @@ namespace frontend::mysql {
 
         using components::types::complex_logical_type;
         using components::types::logical_type;
-        using components::types::logical_value_t;
         using components::vector::data_chunk_t;
 
         data_chunk_t make_chunk(std::pmr::memory_resource* resource,
@@ -547,15 +698,14 @@ namespace frontend::mysql {
             return chunk;
         }
 
-        void set_cell(std::pmr::memory_resource* resource,
-                      data_chunk_t& chunk,
+        void set_cell(data_chunk_t& chunk,
                       std::size_t column,
                       std::size_t row,
                       const variable_value_t& value) {
             if (const auto* number = std::get_if<int64_t>(&value)) {
-                chunk.set_value(column, row, logical_value_t{resource, *number});
+                chunk.set_value(column, row, *number);
             } else if (const auto* text = std::get_if<std::string>(&value)) {
-                chunk.set_value(column, row, logical_value_t{resource, *text});
+                chunk.set_value(column, row, std::string_view{*text});
             } else {
                 chunk.data[column].set_null(row, true);
             }
@@ -578,12 +728,14 @@ namespace frontend::mysql {
                         values.push_back(std::move(*value));
                         break;
                     }
-                    // No default database is in effect: COM_INIT_DB and the
-                    // HandshakeResponse's database are accepted without effect,
-                    // so an unqualified name never resolves in a database the
-                    // client chose.
+                    // The database of the last USE / COM_INIT_DB / HandshakeResponse
+                    // the engine accepted, NULL before one.
                     case kind_t::database:
-                        values.emplace_back(std::monostate{});
+                        if (context.database) {
+                            values.emplace_back(*context.database);
+                        } else {
+                            values.emplace_back(std::monostate{});
+                        }
                         break;
                     case kind_t::version:
                         values.emplace_back(std::string{SERVER_VERSION});
@@ -611,7 +763,7 @@ namespace frontend::mysql {
             auto chunk = make_chunk(resource, types, select.rows);
             for (std::size_t row = 0; row < select.rows; ++row) {
                 for (std::size_t column = 0; column < values.size(); ++column) {
-                    set_cell(resource, chunk, column, row, values[column]);
+                    set_cell(chunk, column, row, values[column]);
                 }
             }
             return chunk;
@@ -632,9 +784,9 @@ namespace frontend::mysql {
             types.emplace_back(logical_type::STRING_LITERAL, "Value");
             auto chunk = make_chunk(resource, types, names.size());
             for (std::size_t row = 0; row < names.size(); ++row) {
-                chunk.set_value(0, row, logical_value_t{resource, std::string{names[row]}});
+                chunk.set_value(0, row, std::string_view{names[row]});
                 // SHOW VARIABLES spells a NULL value as the empty string.
-                chunk.set_value(1, row, logical_value_t{resource, as_text(*system_variable(names[row], context))});
+                chunk.set_value(1, row, std::string_view{as_text(*system_variable(names[row], context))});
             }
             return chunk;
         }
@@ -666,22 +818,93 @@ namespace frontend::mysql {
         if (c.word("set")) {
             return classify_set(c);
         }
+        if (c.word("reset")) {
+            return classify_reset(c);
+        }
         if (c.word("show")) {
             return classify_show(c);
         }
+        if (c.word("use")) {
+            return classify_use(c);
+        }
         return std::nullopt;
+    }
+
+    std::string engine_setting_statement(const setting_t& setting) {
+        OTX_ZONE_N("mysql_protocol::engine_setting_statement");
+        if (!setting.value) {
+            return "RESET " + setting.name;
+        }
+        return "SET " + setting.name + " = " + engine_literal(*setting.value);
+    }
+
+    core::result_wrapper_t<ParsedQueryDataPtr> engine_setting_plan(std::pmr::memory_resource* resource,
+                                                                   const std::vector<setting_t>& settings) {
+        OTX_ZONE_N("mysql_protocol::engine_setting_plan");
+        assert(!settings.empty() && "engine_setting_plan: a SET without an assignment for the engine");
+        namespace catalog = components::catalog;
+        namespace logical_plan = components::logical_plan;
+        GreenplumParser parser(resource);
+        ParsedQueryDataPtr first;
+        std::pmr::vector<catalog::setting_assignment_t> assignments(resource);
+        assignments.reserve(settings.size());
+        for (const auto& setting : settings) {
+            auto parsed = parser.parse(engine_setting_statement(setting));
+            if (parsed.has_error()) {
+                return std::move(parsed.error());
+            }
+            auto& data = parsed.value();
+            const logical_plan::node_t* root = data && data->plan ? plan_root(*data->plan).get() : nullptr;
+            if (root == nullptr || root->type() != logical_plan::node_type::set_setting_t) {
+                return core::error_t{core::error_code_t::internal_error,
+                                     std::pmr::string{"the engine read the frontend's SET as another statement",
+                                                      resource}};
+            }
+            const auto& set = static_cast<const logical_plan::node_set_setting_t&>(*root);
+            assert(set.scope() == catalog::setting_scope_t::session && "the frontend writes a session's SET only");
+            for (const auto& assignment : set.assignments()) {
+                assignments.push_back(assignment.is_default
+                                          ? catalog::setting_assignment_t::to_default(assignment.id, resource)
+                                          : catalog::setting_assignment_t{assignment.id, assignment.value, resource});
+            }
+            if (!first) {
+                first = std::move(data);
+            }
+        }
+        first->plan->sub_queries.back() =
+            logical_plan::make_node_set_setting(resource, catalog::setting_scope_t::session, std::move(assignments));
+        // Its text is one assignment of several: nothing to parse again.
+        first->sql.clear();
+        return first;
+    }
+
+    std::optional<protocol_refusal_t> handshake_charset_refusal(uint8_t collation_id) {
+        OTX_ZONE_N("mysql_protocol::handshake_charset_refusal");
+        // The collations of utf8mb3 / utf8mb4 a one-byte id can name
+        // (mysql_defs/character_set.hpp): utf8_general_ci 33, utf8mb4_general_ci
+        // 45, utf8mb4_bin 46, utf8_tolower_ci 76, utf8_bin 83, utf8_unicode_ci ..
+        // utf8_vietnamese_ci 192-215, utf8_general_mysql500_ci 223,
+        // utf8mb4_unicode_ci .. utf8mb4_vietnamese_ci 224-247, utf8mb4_0900_ai_ci 255.
+        const bool utf8 = collation_id == 33 || collation_id == 45 || collation_id == 46 || collation_id == 76 ||
+                          collation_id == 83 || (collation_id >= 192 && collation_id <= 215) ||
+                          (collation_id >= 223 && collation_id <= 247) || collation_id == 255;
+        if (utf8) {
+            return std::nullopt;
+        }
+        return protocol_refusal_t{mysql_error::ER_NOT_SUPPORTED_YET,
+                                  "the character set of collation " + std::to_string(collation_id) +
+                                      " is not supported: OtterStax reads and sends utf8mb4 only"};
+    }
+
+    std::string engine_search_path_statement(std::string_view database) {
+        OTX_ZONE_N("mysql_protocol::engine_search_path_statement");
+        return "SET search_path = " + engine_literal(std::string{database} + ".public");
     }
 
     protocol_answer_t answer_protocol_statement(std::pmr::memory_resource* resource,
                                                 const protocol_statement_t& statement,
                                                 const protocol_context_t& context) {
         OTX_ZONE_N("mysql_protocol::answer_protocol_statement");
-        if (const auto* names = std::get_if<set_names_t>(&statement)) {
-            if (names->charset == "utf8mb4" || names->charset == "utf8mb3" || names->charset == "utf8") {
-                return std::monostate{};
-            }
-            return protocol_refusal_t{mysql_error::ER_HANDSHAKE_ERROR, "Only utf-8 encodings are supported"};
-        }
         if (const auto* select = std::get_if<select_variables_t>(&statement)) {
             return answer_select(resource, *select, context);
         }
@@ -691,7 +914,7 @@ namespace frontend::mysql {
         if (std::holds_alternative<show_warnings_t>(statement)) {
             return answer_show_warnings(resource);
         }
-        assert(false && "a SET of system variables is answered by the query session");
+        assert(false && "a SET and a USE are answered by the engine");
         return protocol_refusal_t{mysql_error::ER_UNKNOWN_ERROR, "not a statement the frontend answers"};
     }
 

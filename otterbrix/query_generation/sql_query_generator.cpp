@@ -28,7 +28,10 @@
 #include <components/logical_plan/node_sort.hpp>
 #include <components/logical_plan/node_update.hpp>
 #include <components/logical_plan/param_storage.hpp>
+#include <components/compute/function.hpp>
 #include <components/types/operations_helper.hpp>
+#include <components/vector/operations/apply_quantified.hpp>
+#include <components/vector/vector.hpp>
 #include <core/date/date_to_string.hpp>
 
 #include <array>
@@ -390,6 +393,13 @@ namespace {
         quote_ident(stream, type.alias(), ctx.backend);
         stream << " ";
         if (type.type() != logical_type::ARRAY) {
+            // A ClickHouse column is NOT NULL unless declared Nullable; an engine column takes NULL.
+            if (ctx.backend == backend_type_t::ClickHouse) {
+                stream << "Nullable(";
+                write_logical_type(stream, type.type(), ctx);
+                stream << ")";
+                return;
+            }
             write_logical_type(stream, type.type(), ctx);
             return;
         }
@@ -470,31 +480,58 @@ namespace {
         stream.write(buf, written);
     }
 
-    void write_logical_value(std::stringstream& stream, const logical_value_t& value, gen_ctx_t& ctx);
+    void write_cell(std::stringstream& stream,
+                    const components::vector::vector_t& column,
+                    std::uint64_t row,
+                    gen_ctx_t& ctx);
+
+    // The storage a cell lives in, past CONSTANT / DICTIONARY: the flat vector and the row in it
+    // (vector_t::resolve_nested_element with an empty path).
+    using located_cell_t = components::vector::vector_t::nested_element_t;
+    located_cell_t locate(const components::vector::vector_t& column, std::uint64_t row) {
+        return column.resolve_nested_element(row, std::span<const size_t>{}, 0);
+    }
+
+    // The unscaled integer of a DECIMAL cell (any of its storages), widened.
+    int128_t decimal_storage(const components::vector::vector_t& leaf, std::uint64_t index) {
+        switch (leaf.type().to_physical_type()) {
+            case physical_type::INT16:
+                return leaf.get_value<std::int16_t>(index);
+            case physical_type::INT32:
+                return leaf.get_value<std::int32_t>(index);
+            case physical_type::INT64:
+                return leaf.get_value<std::int64_t>(index);
+            default:
+                return leaf.get_value<int128_t>(index);
+        }
+    }
 
     // A DECIMAL's exact text (the unscaled integer and the scale of its type):
     // PostgreSQL and MySQL read a decimal literal as an exact numeric; ClickHouse
     // reads it as Float64, so there it is the Decimal its type names. NaN and the
     // infinities have no literal on MySQL / ClickHouse and are refused everywhere.
-    void write_decimal_literal(std::stringstream& stream, const logical_value_t& value, gen_ctx_t& ctx) {
-        const auto* extension = value.type().extension_as<decimal_logical_type_extension>();
+    void write_decimal_literal(std::stringstream& stream,
+                               const components::vector::vector_t& leaf,
+                               std::uint64_t index,
+                               gen_ctx_t& ctx) {
+        const auto* extension = leaf.type().extension_as<decimal_logical_type_extension>();
         if (extension == nullptr) {
             ctx.fail(core::error_code_t::invalid_parameter, "a DECIMAL value without its width and scale");
             return;
         }
         std::string text;
-        switch (value.type().to_physical_type()) {
+        switch (leaf.type().to_physical_type()) {
             case physical_type::INT16:
-                text = decimal_to_string(value.value<int16_t>(), extension->width(), extension->scale());
+                text = decimal_to_string(leaf.get_value<int16_t>(index), extension->width(), extension->scale());
                 break;
             case physical_type::INT32:
-                text = decimal_to_string(value.value<int32_t>(), extension->width(), extension->scale());
+                text = decimal_to_string(leaf.get_value<int32_t>(index), extension->width(), extension->scale());
                 break;
             case physical_type::INT64:
-                text = decimal_to_string(value.value<int64_t>(), extension->width(), extension->scale());
+                text = decimal_to_string(leaf.get_value<int64_t>(index), extension->width(), extension->scale());
                 break;
             case physical_type::INT128:
-                text = decimal_to_string(value.value<int128_t>(), extension->width(), extension->scale());
+                text = decimal_to_string(leaf.get_value<int128_t>(index), extension->width(), extension->scale());
                 break;
             default:
                 ctx.fail(core::error_code_t::invalid_parameter, "a DECIMAL value without an integer storage");
@@ -517,11 +554,14 @@ namespace {
     // cannot type is unimplemented_yet: ClickHouse 23.8 has no TIME, and only
     // PostgreSQL has a TIMESTAMPTZ literal. A ClickHouse TIMESTAMP is read and
     // written in UTC.
-    void write_temporal_literal(std::stringstream& stream, const logical_value_t& value, gen_ctx_t& ctx) {
+    void write_temporal_literal(std::stringstream& stream,
+                                const components::vector::vector_t& leaf,
+                                std::uint64_t index,
+                                gen_ctx_t& ctx) {
         const bool ch = ctx.backend == backend_type_t::ClickHouse;
-        switch (value.type().type()) {
+        switch (leaf.type().type()) {
             case logical_type::DATE: {
-                const auto text = core::date::to_string(value.value<core::date::date_t>());
+                const auto text = core::date::to_string(leaf.get_value<core::date::date_t>(index));
                 if (ch) {
                     stream << "toDate('" << text << "')";
                 } else {
@@ -533,10 +573,10 @@ namespace {
                 if (ch) {
                     break;
                 }
-                stream << "TIME '" << core::date::to_string(value.value<core::date::time_t>()) << "'";
+                stream << "TIME '" << core::date::to_string(leaf.get_value<core::date::time_t>(index)) << "'";
                 return;
             case logical_type::TIMESTAMP: {
-                const auto text = core::date::to_string(value.value<core::date::timestamp_t>());
+                const auto text = core::date::to_string(leaf.get_value<core::date::timestamp_t>(index));
                 if (ch) {
                     // In UTC, as ch_to_chunk renders every DateTime / DateTime64 it reads: without
                     // the zone ClickHouse would parse the text in the server's time zone. A DATE
@@ -551,7 +591,8 @@ namespace {
                 if (ctx.backend != backend_type_t::PostgreSQL) {
                     break;
                 }
-                stream << "TIMESTAMPTZ '" << core::date::to_string(value.value<core::date::timestamptz_t>()) << "'";
+                stream << "TIMESTAMPTZ '" << core::date::to_string(leaf.get_value<core::date::timestamptz_t>(index))
+                       << "'";
                 return;
             default:
                 break;
@@ -559,96 +600,127 @@ namespace {
         ctx.fail(core::error_code_t::unimplemented_yet, "this date/time value has no literal in the backend's dialect");
     }
 
-    void write_value_list(std::stringstream& stream,
-                          const std::vector<logical_value_t>& values,
-                          std::string_view open,
-                          std::string_view close,
-                          gen_ctx_t& ctx) {
+    // The elements of a LIST / ARRAY cell, or the fields of a STRUCT one, as a list of literals.
+    void write_nested_list(std::stringstream& stream,
+                           const components::vector::vector_t& leaf,
+                           std::uint64_t index,
+                           std::string_view open,
+                           std::string_view close,
+                           gen_ctx_t& ctx) {
         stream << open;
         bool separator = false;
-        for (const auto& child : values) {
+        auto element = [&](const components::vector::vector_t& child, std::uint64_t child_row) {
             if (separator) {
                 stream << ", ";
             }
-            write_logical_value(stream, child, ctx);
+            write_cell(stream, child, child_row, ctx);
             separator = true;
+        };
+        switch (leaf.type().type()) {
+            case logical_type::STRUCT:
+                for (const auto& field : leaf.entries()) {
+                    element(*field, index);
+                }
+                break;
+            case logical_type::LIST: {
+                const auto entry = leaf.data<list_entry_t>()[index];
+                for (std::uint64_t i = entry.offset; i < entry.offset + entry.length; ++i) {
+                    element(leaf.entry(), i);
+                }
+                break;
+            }
+            default: {
+                const auto* array = static_cast<const array_logical_type_extension*>(leaf.type().extension());
+                const std::uint64_t stride = array->size();
+                for (std::uint64_t i = index * stride; i < (index + 1) * stride; ++i) {
+                    element(leaf.entry(), i);
+                }
+                break;
+            }
         }
         stream << close;
     }
 
-    // Write a logical value as a literal in the dialect of ctx.backend.
-    void write_logical_value(std::stringstream& stream, const logical_value_t& value, gen_ctx_t& ctx) {
+    // Write row `row` of `column` as a literal in the dialect of ctx.backend.
+    void write_cell(std::stringstream& stream,
+                    const components::vector::vector_t& column,
+                    std::uint64_t row,
+                    gen_ctx_t& ctx) {
         if (ctx.failed()) {
             return;
         }
         const backend_type_t backend = ctx.backend;
-        if (value.is_null()) {
+        if (column.type().type() == logical_type::NA) {
             stream << "NULL";
             return;
         }
-        switch (value.type().type()) {
-            case logical_type::NA:
-                stream << "NULL";
-                break;
+        const auto cell = locate(column, row);
+        if (cell.is_null) {
+            stream << "NULL";
+            return;
+        }
+        const auto& leaf = *cell.leaf;
+        const std::uint64_t index = cell.index;
+        switch (leaf.type().type()) {
             case logical_type::BOOLEAN:
-                stream << (value.value<bool>() ? "TRUE" : "FALSE");
+                stream << (leaf.get_value<bool>(index) ? "TRUE" : "FALSE");
                 break;
             // int8_t/uint8_t stream as characters; the literal needs the number.
             case logical_type::TINYINT:
-                stream << static_cast<int>(value.value<int8_t>());
+                stream << static_cast<int>(leaf.get_value<int8_t>(index));
                 break;
             case logical_type::UTINYINT:
-                stream << static_cast<int>(value.value<uint8_t>());
+                stream << static_cast<int>(leaf.get_value<uint8_t>(index));
                 break;
             case logical_type::SMALLINT:
-                stream << value.value<int16_t>();
+                stream << leaf.get_value<int16_t>(index);
                 break;
             case logical_type::INTEGER:
-                stream << value.value<int32_t>();
+                stream << leaf.get_value<int32_t>(index);
                 break;
             case logical_type::BIGINT:
-                stream << value.value<int64_t>();
+                stream << leaf.get_value<int64_t>(index);
                 break;
             case logical_type::HUGEINT:
-                stream << value.value<components::types::int128_t>();
+                stream << leaf.get_value<components::types::int128_t>(index);
                 break;
             case logical_type::FLOAT:
-                write_float_literal(stream, value.value<float>(), ctx);
+                write_float_literal(stream, leaf.get_value<float>(index), ctx);
                 break;
             case logical_type::DOUBLE:
-                write_float_literal(stream, value.value<double>(), ctx);
+                write_float_literal(stream, leaf.get_value<double>(index), ctx);
                 break;
             case logical_type::USMALLINT:
-                stream << value.value<uint16_t>();
+                stream << leaf.get_value<uint16_t>(index);
                 break;
             case logical_type::UINTEGER:
-                stream << value.value<uint32_t>();
+                stream << leaf.get_value<uint32_t>(index);
                 break;
             case logical_type::UBIGINT:
-                stream << value.value<uint64_t>();
+                stream << leaf.get_value<uint64_t>(index);
                 break;
             case logical_type::UHUGEINT:
-                stream << value.value<components::types::uint128_t>();
+                stream << leaf.get_value<components::types::uint128_t>(index);
                 break;
             case logical_type::STRING_LITERAL:
-                write_string_literal(stream, value.value<std::string_view>(), backend);
+                write_string_literal(stream, leaf.get_value<std::string_view>(index), backend);
                 break;
             case logical_type::DECIMAL:
-                write_decimal_literal(stream, value, ctx);
+                write_decimal_literal(stream, leaf, index, ctx);
                 break;
             case logical_type::DATE:
             case logical_type::TIME:
             case logical_type::TIMESTAMP:
             case logical_type::TIMESTAMP_TZ:
-                write_temporal_literal(stream, value, ctx);
+                write_temporal_literal(stream, leaf, index, ctx);
                 break;
             case logical_type::STRUCT:
                 switch (backend) {
                     case backend_type_t::PostgreSQL:
-                        write_value_list(stream, value.children(), "ROW(", ")", ctx);
+                        write_nested_list(stream, leaf, index, "ROW(", ")", ctx);
                         break;
                     case backend_type_t::ClickHouse:
-                        write_value_list(stream, value.children(), "(", ")", ctx);
+                        write_nested_list(stream, leaf, index, "(", ")", ctx);
                         break;
                     default:
                         ctx.fail(core::error_code_t::unimplemented_yet,
@@ -660,10 +732,10 @@ namespace {
             case logical_type::LIST:
                 switch (backend) {
                     case backend_type_t::PostgreSQL:
-                        write_value_list(stream, value.children(), "ARRAY[", "]", ctx);
+                        write_nested_list(stream, leaf, index, "ARRAY[", "]", ctx);
                         break;
                     case backend_type_t::ClickHouse:
-                        write_value_list(stream, value.children(), "[", "]", ctx);
+                        write_nested_list(stream, leaf, index, "[", "]", ctx);
                         break;
                     default:
                         ctx.fail(core::error_code_t::unimplemented_yet,
@@ -672,13 +744,26 @@ namespace {
                 }
                 break;
             default:
-                // UUID, INTERVAL, BLOB, MAP, ...: no literal is written for them.
-                // A statement with such a value is not sent; the federation's
-                // operators fall back to the engine's own plan over the scan.
+                // UUID, INTERVAL, BLOB, MAP, ...: no literal is written for them. A block with such
+                // a value is not taken: otterbrix runs it over the table's scan.
                 ctx.fail(core::error_code_t::unimplemented_yet,
                          "Encountered an unsupported value type during query generation");
                 break;
         }
+    }
+
+    // The value a bound parameter holds (a one-row vector), or null when it is not known: no
+    // parameters, an id that names no slot, or — in the offer's probe (placeholders) — a value
+    // written only while the statement runs (kind execution: a correlated or sub-query value). The
+    // probe reads every value it can, so its verdict on a cast is the run's: a taken block has no
+    // fallback once it runs.
+    const components::vector::vector_t* bound_value(core::parameter_id_t id, const gen_ctx_t& ctx) {
+        if (ctx.parameters == nullptr || !ctx.parameters->is_valid(id) ||
+            (ctx.options.placeholders &&
+             ctx.parameters->kind(id) == components::vector::parameter_kind::execution)) {
+            return nullptr;
+        }
+        return &ctx.parameters->at(id);
     }
 
     // A bound parameter is the only way a literal reaches the generator; a miss
@@ -695,14 +780,13 @@ namespace {
             ctx.fail(core::error_code_t::invalid_parameter, "plan references a parameter but no parameters were bound");
             return;
         }
-        auto it = ctx.parameters->parameters.find(id);
-        if (it == ctx.parameters->parameters.end()) {
+        if (!ctx.parameters->is_valid(id)) {
             ctx.fail(core::error_code_t::invalid_parameter,
                      "plan references an unbound parameter #",
-                     std::to_string(static_cast<uint16_t>(id)));
+                     std::to_string(static_cast<uint64_t>(id)));
             return;
         }
-        write_logical_value(stream, it->second, ctx);
+        write_cell(stream, ctx.parameters->at(id), 0, ctx);
     }
 
     // ── expressions ───────────────────────────────────────────────────────────
@@ -1007,7 +1091,7 @@ namespace {
 
     // pow / sqrt / cbrt / factorial / abs are spelled by write_function itself:
     // PostgreSQL writes pow as its `^` operator, and the MySQL / ClickHouse gaps
-    // name the missing operation in their own message. regexp_like is the LIKE
+    // name the missing operation in their own message. like_match is the LIKE
     // carrier and never reaches a call.
     constexpr std::array<function_spelling_t, 12> function_spellings{{
         {"count", "COUNT", "COUNT", "COUNT"},
@@ -1143,12 +1227,11 @@ namespace {
         stream << (!text.empty() && text.front() == '-' ? "(- " : "(-") << text << ")";
     }
 
-    // SQL LIKE / ILIKE, which the engine lowers to a regexp_like call of
-    // (subject, pattern, flags): 'l' marks a LIKE pattern, 'i' case-insensitive,
-    // 'n' negated. The pattern travels as the LIKE pattern itself, so LIKE is the
-    // only spelling that keeps its meaning — a regex operator would read `%` and
-    // `_` literally and match nothing. Any other regexp_like shape is a real
-    // regular expression, which no single spelling covers on all three dialects.
+    // SQL LIKE / ILIKE, which the engine lowers to a like_match call of (subject, pattern, mode):
+    // the mode is a UTINYINT bit set (vector::operations::match_flags_of) — glob (a LIKE pattern),
+    // case_insensitive, negate. The pattern travels as the LIKE pattern itself, so LIKE is the only
+    // spelling that keeps its meaning. A mode without glob is a regular expression, which no single
+    // spelling covers on all three dialects.
     void write_like(std::stringstream& stream, const function_expression_t& call, gen_ctx_t& ctx) {
         static constexpr std::string_view no_regex = "a regular-expression match is not generated for this backend";
         const auto& args = call.args();
@@ -1156,48 +1239,30 @@ namespace {
             ctx.fail(core::error_code_t::unimplemented_yet, no_regex);
             return;
         }
-        if (ctx.options.placeholders) {
-            // The flags are a parameter, unknown here: the verdict is taken for a
-            // LIKE, and a real regular expression is refused when the values are.
-            write_operand(stream, args[0], ctx);
-            stream << " LIKE ";
-            write_operand(stream, args[1], ctx);
-            return;
-        }
-        if (ctx.parameters == nullptr) {
-            ctx.fail(core::error_code_t::invalid_parameter,
-                     "plan references a parameter but no parameters were bound");
-            return;
-        }
-        auto it = ctx.parameters->parameters.find(as_parameter(args[2]));
-        if (it == ctx.parameters->parameters.end() || it->second.is_null() ||
-            !is_string(it->second.type().type())) {
-            ctx.fail(core::error_code_t::unimplemented_yet, no_regex);
-            return;
-        }
-        bool like = false;
-        bool icase = false;
-        bool negate = false;
-        for (char flag : it->second.value<std::string_view>()) {
-            if (flag == 'l') {
-                like = true;
-            } else if (flag == 'i') {
-                icase = true;
-            } else if (flag == 'n') {
-                negate = true;
-            } else {
-                ctx.fail(core::error_code_t::unimplemented_yet, no_regex);
+        // The mode is a literal the transformer wrote: it is known in the offer's probe too.
+        if (ctx.parameters == nullptr || !ctx.parameters->is_valid(as_parameter(args[2]))) {
+            if (ctx.options.placeholders) {
+                write_operand(stream, args[0], ctx);
+                stream << " LIKE ";
+                write_operand(stream, args[1], ctx);
                 return;
             }
+            ctx.fail(core::error_code_t::invalid_parameter, "plan references a parameter but no parameters were bound");
+            return;
         }
-        if (!like) {
+        const auto& mode_value = ctx.parameters->at(as_parameter(args[2]));
+        if (mode_value.is_null(0) || mode_value.type().type() != logical_type::UTINYINT) {
             ctx.fail(core::error_code_t::unimplemented_yet, no_regex);
             return;
         }
-        // MySQL has no ILIKE; LOWER() on both sides is case-insensitive whatever
-        // the column collation. A case-sensitive LIKE follows the collation there,
-        // as the REGEXP of the previous engine did.
-        const bool lower_both = icase && ctx.backend == backend_type_t::MySQL;
+        const auto flags = components::vector::operations::match_flags_of(mode_value.get_value<uint8_t>(0));
+        if (!flags.glob) {
+            ctx.fail(core::error_code_t::unimplemented_yet, no_regex);
+            return;
+        }
+        // MySQL has no ILIKE; LOWER() on both sides is case-insensitive whatever the column
+        // collation. A case-sensitive LIKE follows the collation there.
+        const bool lower_both = flags.case_insensitive && ctx.backend == backend_type_t::MySQL;
         auto write_side = [&stream, &ctx, lower_both](const param_storage& operand) {
             if (lower_both) {
                 stream << "LOWER(";
@@ -1208,7 +1273,7 @@ namespace {
             write_operand(stream, operand, ctx);
         };
         write_side(args[0]);
-        stream << (negate ? " NOT " : " ") << ((icase && !lower_both) ? "ILIKE " : "LIKE ");
+        stream << (flags.negate ? " NOT " : " ") << ((flags.case_insensitive && !lower_both) ? "ILIKE " : "LIKE ");
         write_side(args[1]);
     }
 
@@ -1221,7 +1286,7 @@ namespace {
         const bool ch = ctx.backend == backend_type_t::ClickHouse;
         const std::string& name = call.name();
         const auto& args = call.args();
-        if (name == "regexp_like") {
+        if (name == components::compute::like_match_name) {
             write_like(stream, call, ctx);
             return;
         }
@@ -1453,14 +1518,14 @@ namespace {
             return std::nullopt;
         }
         if (is_parameter(operand)) {
-            if (ctx.options.placeholders || ctx.parameters == nullptr) {
+            if (ctx.parameters == nullptr) {
                 return std::nullopt;
             }
-            auto it = ctx.parameters->parameters.find(as_parameter(operand));
-            if (it == ctx.parameters->parameters.end() || it->second.is_null()) {
+            const auto* value = bound_value(as_parameter(operand), ctx);
+            if (value == nullptr || value->is_null(0)) {
                 return std::nullopt;
             }
-            return it->second.type();
+            return value->type();
         }
         if (!is_expr(operand) || !as_expr(operand)) {
             return std::nullopt;
@@ -1569,15 +1634,17 @@ namespace {
     bool bound_integer_in_range(const param_storage& operand, const complex_logical_type& target, gen_ctx_t& ctx) {
         const logical_type to = target.type();
         const auto parameter = parameter_of(operand);
-        if (!parameter || ctx.options.placeholders || ctx.parameters == nullptr || !is_integer(to) ||
+        if (!parameter || ctx.parameters == nullptr || !is_integer(to) ||
             integral_bytes(to) > 8) {
             return false;
         }
-        auto it = ctx.parameters->parameters.find(*parameter);
-        if (it == ctx.parameters->parameters.end() || it->second.is_null()) {
+        const auto* bound = bound_value(*parameter, ctx);
+        if (bound == nullptr || bound->is_null(0)) {
             return false;
         }
-        const auto& value = it->second;
+        const auto cell = locate(*bound, 0);
+        const auto& value = *cell.leaf;
+        const std::uint64_t index = cell.index;
         const int bits = 8 * integral_bytes(to);
         switch (value.type().type()) {
             case logical_type::TINYINT:
@@ -1587,16 +1654,16 @@ namespace {
                 std::int64_t v = 0;
                 switch (value.type().type()) {
                     case logical_type::TINYINT:
-                        v = value.value<int8_t>();
+                        v = value.get_value<int8_t>(index);
                         break;
                     case logical_type::SMALLINT:
-                        v = value.value<int16_t>();
+                        v = value.get_value<int16_t>(index);
                         break;
                     case logical_type::INTEGER:
-                        v = value.value<int32_t>();
+                        v = value.get_value<int32_t>(index);
                         break;
                     default:
-                        v = value.value<int64_t>();
+                        v = value.get_value<int64_t>(index);
                         break;
                 }
                 if (is_unsigned(to)) {
@@ -1605,8 +1672,8 @@ namespace {
                 if (bits == 64) {
                     return true;
                 }
-                const std::int64_t bound = std::int64_t{1} << (bits - 1);
-                return v >= -bound && v < bound;
+                const std::int64_t bound_magnitude = std::int64_t{1} << (bits - 1);
+                return v >= -bound_magnitude && v < bound_magnitude;
             }
             case logical_type::UTINYINT:
             case logical_type::USMALLINT:
@@ -1615,16 +1682,16 @@ namespace {
                 std::uint64_t v = 0;
                 switch (value.type().type()) {
                     case logical_type::UTINYINT:
-                        v = value.value<uint8_t>();
+                        v = value.get_value<uint8_t>(index);
                         break;
                     case logical_type::USMALLINT:
-                        v = value.value<uint16_t>();
+                        v = value.get_value<uint16_t>(index);
                         break;
                     case logical_type::UINTEGER:
-                        v = value.value<uint32_t>();
+                        v = value.get_value<uint32_t>(index);
                         break;
                     default:
-                        v = value.value<uint64_t>();
+                        v = value.get_value<uint64_t>(index);
                         break;
                 }
                 const int value_bits = is_unsigned(to) ? bits : bits - 1;
@@ -1646,26 +1713,12 @@ namespace {
     // integer rescaled exactly (no fraction digit dropped that is not 0) and within the width. NaN and
     // the infinities are no such value. (otterbrix's logical_value_t::cast_as has no DECIMAL-to-DECIMAL
     // conversion to ask.)
-    bool decimal_value_fits(const logical_value_t& value, const complex_logical_type& target) {
-        const auto* from = value.type().extension_as<decimal_logical_type_extension>();
+    // `raw`: the unscaled integer at the scale of `source`.
+    bool decimal_value_fits(int128_t raw, const complex_logical_type& source, const complex_logical_type& target) {
+        const auto* from = source.extension_as<decimal_logical_type_extension>();
         const auto* to = target.extension_as<decimal_logical_type_extension>();
         if (from == nullptr || to == nullptr) {
             return false;
-        }
-        int128_t raw = 0;
-        switch (value.type().to_physical_type()) {
-            case physical_type::INT16:
-                raw = value.value<std::int16_t>();
-                break;
-            case physical_type::INT32:
-                raw = value.value<std::int32_t>();
-                break;
-            case physical_type::INT64:
-                raw = value.value<std::int64_t>();
-                break;
-            default:
-                raw = value.value<int128_t>();
-                break;
         }
         if (decimal_special::is_special(from->stored_as(), raw)) {
             return false;
@@ -1697,27 +1750,61 @@ namespace {
 
     bool bound_exact_value_preserved(const param_storage& operand, const complex_logical_type& target, gen_ctx_t& ctx) {
         const auto parameter = parameter_of(operand);
-        if (!parameter || ctx.options.placeholders || ctx.parameters == nullptr ||
+        if (!parameter || ctx.parameters == nullptr ||
             target.type() != logical_type::DECIMAL) {
             return false;
         }
-        auto it = ctx.parameters->parameters.find(*parameter);
-        if (it == ctx.parameters->parameters.end() || it->second.is_null()) {
+        const auto* bound = bound_value(*parameter, ctx);
+        if (bound == nullptr || bound->is_null(0)) {
             return false;
         }
-        const auto& value = it->second;
+        const auto cell = locate(*bound, 0);
+        const auto& value = *cell.leaf;
         if (value.type().type() == logical_type::DECIMAL) {
-            return decimal_value_fits(value, target);
+            return decimal_value_fits(decimal_storage(value, cell.index), value.type(), target);
         }
         if (!is_integer(value.type().type())) {
             return false;
         }
-        auto cast = value.cast_as(target, core::date::timezone_offset_t{});
-        if (cast.has_error()) {
+        // An integer is carried over unchanged into DECIMAL(p, s) exactly when |v| < 10^(p - s).
+        const auto* decimal = target.extension_as<decimal_logical_type_extension>();
+        if (decimal == nullptr) {
             return false;
         }
-        auto back = cast.value().cast_as(value.type(), core::date::timezone_offset_t{});
-        return !back.has_error() && back.value() == value;
+        int128_t v = 0;
+        switch (value.type().type()) {
+            case logical_type::TINYINT:
+                v = value.get_value<int8_t>(cell.index);
+                break;
+            case logical_type::SMALLINT:
+                v = value.get_value<int16_t>(cell.index);
+                break;
+            case logical_type::INTEGER:
+                v = value.get_value<int32_t>(cell.index);
+                break;
+            case logical_type::BIGINT:
+                v = value.get_value<int64_t>(cell.index);
+                break;
+            case logical_type::UTINYINT:
+                v = value.get_value<uint8_t>(cell.index);
+                break;
+            case logical_type::USMALLINT:
+                v = value.get_value<uint16_t>(cell.index);
+                break;
+            case logical_type::UINTEGER:
+                v = value.get_value<uint32_t>(cell.index);
+                break;
+            case logical_type::UBIGINT:
+                v = static_cast<int128_t>(value.get_value<uint64_t>(cell.index));
+                break;
+            default:
+                return false; // a 16-byte integer: no exact bound is checked here
+        }
+        int128_t limit = 1;
+        for (int digit = 0; digit < static_cast<int>(decimal->width()) - static_cast<int>(decimal->scale()); ++digit) {
+            limit *= 10;
+        }
+        return v < limit && v > -limit;
     }
 
     // The CAST target of a numeric cast of the validated tree, spelled so the backend's CAST does to
@@ -1874,18 +1961,6 @@ namespace {
                     kind = numeric_cast_t::lossless;
                 }
                 const auto spelling = numeric_cast_target(source, target, kind, ctx.backend);
-                if (spelling.empty() && ctx.options.placeholders && parameter_of(expr.child()) &&
-                    (!source || (is_integer(source->type()) && is_integer(target.type())) ||
-                     ((is_integer(source->type()) || source->type() == logical_type::DECIMAL) &&
-                      target.type() == logical_type::DECIMAL))) {
-                    // The pushdown rule's probe does not know the value — so neither its type, nor,
-                    // for an integer narrowed to another, whether it lies in the target's range
-                    // (bound_integer_in_range): the operator decides once it generates with the
-                    // values (an unimplemented_yet there plans the block in the engine). The probe
-                    // text is never sent.
-                    write_operand(stream, expr.child(), ctx);
-                    return;
-                }
                 if (spelling.empty()) {
                     ctx.fail(core::error_code_t::unimplemented_yet,
                              "this numeric CAST has no spelling in the backend's dialect that range-checks and "
@@ -2101,6 +2176,59 @@ namespace {
         stream << ")";
     }
 
+    // `x = ANY(<list>)` as `x IN (v1, ...)` and `x <> ALL(<list>)` as `x NOT IN (v1, ...)`, the list a
+    // parameter of a LIST / ARRAY type — a literal, a client's `$n` or the result of an uncorrelated
+    // sub-query (kind execution, known when the node runs): the same three-valued answer on every
+    // dialect. An empty list is FALSE / TRUE (`x = ANY('{}')` is false for a NULL x too), a NULL list
+    // `IN (NULL)` (NULL whatever x is). In the offer's probe (placeholders) only the parameter's type
+    // is read. Any other quantified comparison (another operator, an operand that is no parameter)
+    // is not written.
+    void write_quantified(std::stringstream& stream, const compare_expression_t& expr, gen_ctx_t& ctx) {
+        const bool in = expr.type() == compare_type::any && expr.inner_op() == compare_type::eq;
+        const bool not_in = expr.type() == compare_type::all && expr.inner_op() == compare_type::ne;
+        const bool parameter = is_parameter(expr.right()) && ctx.parameters != nullptr &&
+                               ctx.parameters->is_valid(as_parameter(expr.right()));
+        const auto list_type = parameter ? ctx.parameters->type(as_parameter(expr.right())).type() : logical_type::NA;
+        if ((!in && !not_in) || (list_type != logical_type::LIST && list_type != logical_type::ARRAY)) {
+            ctx.fail(core::error_code_t::unimplemented_yet,
+                     "unsupported quantified comparison in query generation: ",
+                     expr.to_string());
+            return;
+        }
+        if (ctx.options.placeholders) {
+            write_operand(stream, expr.left(), ctx);
+            stream << (in ? " IN (?)" : " NOT IN (?)");
+            return;
+        }
+        const auto cell = locate(ctx.parameters->at(as_parameter(expr.right())), 0);
+        if (cell.is_null) {
+            write_operand(stream, expr.left(), ctx);
+            stream << (in ? " IN (NULL)" : " NOT IN (NULL)");
+            return;
+        }
+        std::uint64_t first = 0;
+        std::uint64_t count = 0;
+        if (cell.leaf->type().type() == logical_type::LIST) {
+            const auto entry = cell.leaf->data<list_entry_t>()[cell.index];
+            first = entry.offset;
+            count = entry.length;
+        } else {
+            count = static_cast<const array_logical_type_extension*>(cell.leaf->type().extension())->size();
+            first = cell.index * count;
+        }
+        if (count == 0) {
+            stream << (in ? "FALSE" : "TRUE");
+            return;
+        }
+        write_operand(stream, expr.left(), ctx);
+        stream << (in ? " IN (" : " NOT IN (");
+        for (std::uint64_t i = 0; i < count; ++i) {
+            stream << (i == 0 ? "" : ", ");
+            write_cell(stream, cell.leaf->entry(), first + i, ctx);
+        }
+        stream << ")";
+    }
+
     void write_compare(std::stringstream& stream, const compare_expression_t& expr, gen_ctx_t& ctx) {
         if (ctx.failed()) {
             return;
@@ -2156,9 +2284,11 @@ namespace {
             case compare_type::lte:
                 op = " <= ";
                 break;
-            case compare_type::regex:
             case compare_type::any:
             case compare_type::all:
+                write_quantified(stream, expr, ctx);
+                return;
+            case compare_type::regex:
             case compare_type::invalid:
             default:
                 // A regex predicate carries an engine-side pattern dialect, and
@@ -2289,31 +2419,24 @@ namespace {
 
     // The remote statement's answer replaces the whole query block, so nothing
     // re-applies the window afterwards: what is emitted must be the exact
-    // [offset, offset+limit) window, not a read cap. limit_t stores limit_ (-1 =
-    // unlimit) and offset_ (0 = none) independently, and the transformer builds
-    // the node when either is present — a bare OFFSET and LIMIT ALL OFFSET n both
-    // arrive as (-1, n).
+    // [offset, offset+count) window, not a read cap. limit_t keeps the count
+    // (none: LIMIT ALL) and the offset (0: none) apart, as written and not
+    // validated: a negative one is otterbrix's to refuse with PostgreSQL's text,
+    // so such a window is not written (unimplemented_yet: the block stays with
+    // the engine).
     void write_limit(std::stringstream& stream, const node_limit_t* limit, gen_ctx_t& ctx) {
         if (limit == nullptr || ctx.failed()) {
             return;
         }
-        const int64_t limit_count = limit->limit().limit();
-        const int64_t offset_count = limit->limit().offset();
-        if (limit_count < -1) {
-            ctx.fail(core::error_code_t::invalid_parameter,
-                     "negative LIMIT in query generation: ",
-                     std::to_string(limit_count));
+        const auto& window = limit->limit();
+        const int64_t offset_count = window.offset();
+        if ((window.has_count() && window.count() < 0) || offset_count < 0) {
+            ctx.fail(core::error_code_t::unimplemented_yet, "a negative LIMIT / OFFSET is the engine's to refuse");
             return;
         }
-        if (offset_count < 0) {
-            ctx.fail(core::error_code_t::invalid_parameter,
-                     "negative OFFSET in query generation: ",
-                     std::to_string(offset_count));
-            return;
-        }
-        if (limit_count >= 0) {
-            // LIMIT 0 is a real window, so the boundary is >= 0, not > 0.
-            stream << " LIMIT " << limit_count;
+        if (window.has_count()) {
+            // LIMIT 0 is a real window.
+            stream << " LIMIT " << window.count();
             if (offset_count > 0) {
                 stream << " OFFSET " << offset_count;
             }
@@ -2416,6 +2539,26 @@ namespace {
                          const qualified_name_t& table_name,
                          std::span<const std::string> all_columns);
     void write_relation(std::stringstream& stream, const node_ptr& node, source_columns_t& columns, gen_ctx_t& ctx);
+
+    // The columns a block of one table outputs when it projects nothing itself: all of them, or,
+    // when otterbrix pruned the scan (projected_cols() not empty), those, in that order. Empty when a
+    // position is past the table's columns.
+    std::optional<std::vector<std::string>> read_columns(const node_aggregate_t& block,
+                                                         std::span<const std::string> all_columns) {
+        const auto& projected = block.projected_cols();
+        if (projected.empty()) {
+            return std::vector<std::string>(all_columns.begin(), all_columns.end());
+        }
+        std::vector<std::string> out;
+        out.reserve(projected.size());
+        for (const auto position : projected) {
+            if (position >= all_columns.size()) {
+                return std::nullopt;
+            }
+            out.push_back(all_columns[position]);
+        }
+        return out;
+    }
 
     // The names a derived table's outputs go by, by position: the aliases the engine gave its
     // output columns. The query around it names a column by them, so each must be there and
@@ -2740,18 +2883,20 @@ namespace {
         const auto* block = static_cast<const node_aggregate_t*>(node.get());
         const auto* relation = relation_of(node.get(), ctx);
         if (relation != nullptr && node->children().empty()) {
+            // A pruned leaf (projected_cols()) outputs only those columns, and the keys above it
+            // number them in that order.
             const auto& types = node->output_types();
-            if (types.size() != relation->all_columns.size()) {
+            const auto read = read_columns(*block, relation->all_columns);
+            if (!read || types.size() != read->size()) {
                 ctx.fail(core::error_code_t::invalid_parameter,
-                         "a table whose output columns are not its declared columns");
+                         "a table whose output columns are not the columns it reads");
                 return;
             }
             const auto alias = relation_alias('t', ctx);
             write_table_reference(stream, relation->name, ctx);
             stream << " AS " << alias;
             for (std::size_t i = 0; i < types.size(); ++i) {
-                columns.push_back(
-                    source_column_t{qualified_column(alias, relation->all_columns[i], ctx.backend), types[i]});
+                columns.push_back(source_column_t{qualified_column(alias, (*read)[i], ctx.backend), types[i]});
             }
             return;
         }
@@ -2987,7 +3132,12 @@ namespace {
                     name_field();
                 }
             } else {
-                for (const auto& column : all_columns) {
+                const auto read = read_columns(*node, all_columns);
+                if (!read) {
+                    ctx.fail(core::error_code_t::invalid_parameter, "a block reads a column past its table's columns");
+                    return;
+                }
+                for (const auto& column : *read) {
                     next_field();
                     quote_ident(stream, column, backend);
                     name_field();
@@ -3131,6 +3281,13 @@ namespace {
 
     // ── DDL ───────────────────────────────────────────────────────────────────
 
+    // ClickHouse has no default table engine: a table is a MergeTree without a sorting key.
+    void write_table_engine(std::stringstream& stream, gen_ctx_t& ctx) {
+        if (!ctx.failed() && ctx.backend == backend_type_t::ClickHouse) {
+            stream << " ENGINE = MergeTree ORDER BY tuple()";
+        }
+    }
+
     void generate_create_collection(std::stringstream& stream,
                                     const node_create_collection_t* node,
                                     const qualified_name_t& name,
@@ -3155,6 +3312,7 @@ namespace {
             comma = true;
         }
         stream << ")";
+        write_table_engine(stream, ctx);
     }
 
     // CREATE / DROP DATABASE name the database alone: which server it lands on
@@ -3267,13 +3425,9 @@ namespace {
         return parts;
     }
 
-    // The transformer ALWAYS attaches a limit child to a DML node (an unlimit
-    // one when the statement had no LIMIT), so `limit != nullptr` carries no
-    // information — limit() >= 0 is what means "the user wrote LIMIT n". That
-    // is the opposite of the SELECT path, where >= 0 is exactly the wrong test;
-    // do not "harmonise" the two. DML LIMIT never carries an OFFSET either:
-    // build_dml_limit passes a null offset, grammar-enforced.
-    bool has_dml_limit(const dml_parts_t& parts) { return parts.limit && parts.limit->limit().limit() >= 0; }
+    // A DML LIMIT n: a limit child that carries a count (LIMIT ALL / none: every matching row).
+    // DML LIMIT never carries an OFFSET (grammar-enforced).
+    bool has_dml_limit(const dml_parts_t& parts) { return parts.limit && parts.limit->limit().has_count(); }
 
     // Checks the DML shape a backend can express in one statement, and that the
     // FROM / USING source of a two-table statement is exactly the table the
@@ -3345,11 +3499,9 @@ namespace {
             // scan of a table of the same server, named here in its spelling.
             return true;
         }
-        if (target.from_name.unique_identifier != target.name.unique_identifier) {
-            // A source on another connection — or a local table, whose uid is
-            // empty — is not part of this backend's statement: its rows have to be
-            // joined by the engine, and naming it remotely would read a table the
-            // backend does not have.
+        if (target.from_name.connection != target.name.connection) {
+            // A source on another connection — or a local table — is not part of this backend's
+            // statement: its rows have to be joined by the engine.
             ctx.fail(core::error_code_t::unimplemented_yet,
                      "the FROM / USING source is not on the same backend as the target of ",
                      std::string{statement});
@@ -3405,6 +3557,39 @@ namespace {
         write_expr(stream, value, ctx);
     }
 
+    // ` RETURNING <every column of the target>` (the declared order), each qualified by the target
+    // when a second table is named: PostgreSQL only — MySQL has no RETURNING, ClickHouse's
+    // mutations answer no rows.
+    void write_returning(std::stringstream& stream,
+                         const sql_gen::statement_target_t& target,
+                         bool qualified,
+                         gen_ctx_t& ctx) {
+        if (!ctx.options.returning || ctx.failed()) {
+            return;
+        }
+        if (ctx.backend != backend_type_t::PostgreSQL) {
+            ctx.fail(core::error_code_t::unimplemented_yet, "RETURNING is not supported by this backend");
+            return;
+        }
+        if (target.all_columns.empty()) {
+            ctx.fail(core::error_code_t::invalid_parameter, "RETURNING: the table's columns are not named");
+            return;
+        }
+        stream << " RETURNING ";
+        bool comma = false;
+        for (const auto& column : target.all_columns) {
+            if (comma) {
+                stream << ", ";
+            }
+            if (qualified) {
+                write_table_reference(stream, target.name, ctx);
+                stream << '.';
+            }
+            quote_ident(stream, column, ctx.backend);
+            comma = true;
+        }
+    }
+
     void generate_delete(std::stringstream& stream,
                          const node_delete_t* node,
                          const sql_gen::statement_target_t& target,
@@ -3457,8 +3642,9 @@ namespace {
         ctx.left_columns = nullptr;
         ctx.right_columns = nullptr;
         if (has_dml_limit(parts)) {
-            stream << " LIMIT " << parts.limit->limit().limit();
+            stream << " LIMIT " << parts.limit->limit().count();
         }
+        write_returning(stream, target, with_source, ctx);
     }
 
     void generate_update(std::stringstream& stream,
@@ -3550,8 +3736,9 @@ namespace {
         ctx.left_columns = nullptr;
         ctx.right_columns = nullptr;
         if (has_dml_limit(parts)) {
-            stream << " LIMIT " << parts.limit->limit().limit();
+            stream << " LIMIT " << parts.limit->limit().count();
         }
+        write_returning(stream, target, with_source, ctx);
     }
 
     // VALUES (...), (...) for every row of the chunk.
@@ -3574,7 +3761,7 @@ namespace {
                 if (j != 0) {
                     stream << ", ";
                 }
-                write_logical_value(stream, chunk.value(j, i), ctx);
+                write_cell(stream, chunk.data[j], i, ctx);
             }
             stream << ")";
             comma = true;
@@ -3738,11 +3925,16 @@ namespace sql_gen {
                                                              std::span<const std::string> columns,
                                                              std::span<const std::size_t> column_indexes,
                                                              const components::vector::data_chunk_t& rows,
-                                                             std::pmr::memory_resource* resource) {
+                                                             std::pmr::memory_resource* resource,
+                                                             std::span<const std::string> returning_columns) {
         OTX_ZONE_N("sql_gen::generate_insert_rows");
         gen_ctx_t ctx{backend, nullptr, resource};
         if (columns.empty() || columns.size() != column_indexes.size() || rows.size() == 0) {
             ctx.fail(core::error_code_t::invalid_parameter, "INSERT: no rows or no columns to write");
+            return core::result_wrapper_t<std::string>{std::move(ctx.error)};
+        }
+        if (!returning_columns.empty() && backend != backend_type_t::PostgreSQL) {
+            ctx.fail(core::error_code_t::unimplemented_yet, "RETURNING is not supported by this backend");
             return core::result_wrapper_t<std::string>{std::move(ctx.error)};
         }
         std::stringstream stream;
@@ -3766,133 +3958,166 @@ namespace sql_gen {
                     ctx.fail(core::error_code_t::invalid_parameter, "INSERT: a column index past the row");
                     break;
                 }
-                write_logical_value(stream, rows.value(column_indexes[i], row), ctx);
+                write_cell(stream, rows.data[column_indexes[i]], row, ctx);
             }
             stream << ")";
         }
+        if (!returning_columns.empty()) {
+            stream << " RETURNING ";
+            for (std::size_t i = 0; i < returning_columns.size(); ++i) {
+                if (i != 0) {
+                    stream << ", ";
+                }
+                quote_ident(stream, returning_columns[i], backend);
+            }
+        }
         if (ctx.failed()) {
             return core::result_wrapper_t<std::string>{std::move(ctx.error)};
         }
+        stream << ";";
         return stream.str();
     }
 
-    namespace {
-
-        // `k1 = o1 AND k2 = o2 ...` over the primary key's columns of one row.
-        void write_key_match(std::stringstream& stream,
-                             std::span<const std::string> columns,
-                             std::span<const std::size_t> key,
-                             const std::vector<logical_value_t>& before,
-                             gen_ctx_t& ctx) {
-            stream << " WHERE ";
-            bool first = true;
-            for (auto position : key) {
-                if (ctx.failed()) {
-                    return;
-                }
-                stream << (first ? "" : " AND ");
-                quote_ident(stream, columns[position], ctx.backend);
-                stream << " = ";
-                write_logical_value(stream, before[position], ctx);
-                first = false;
-            }
-        }
-
-        core::error_t check_row_statement(std::span<const std::string> columns,
-                                          std::span<const std::size_t> key,
-                                          const std::vector<logical_value_t>& before,
-                                          gen_ctx_t& ctx) {
-            if (ctx.backend == backend_type_t::ClickHouse) {
-                ctx.fail(core::error_code_t::unimplemented_yet, "ClickHouse has no primary key that names one row");
-            } else if (columns.size() != before.size()) {
-                ctx.fail(core::error_code_t::invalid_parameter, "a row's values do not match the table's columns");
-            } else if (key.empty()) {
-                ctx.fail(core::error_code_t::invalid_parameter, "a row is changed by its primary key, and none is given");
-            } else {
-                for (auto position : key) {
-                    if (position >= columns.size()) {
-                        ctx.fail(core::error_code_t::invalid_parameter, "a primary key column past the row");
-                        break;
-                    }
-                    if (before[position].is_null()) {
-                        ctx.fail(core::error_code_t::invalid_parameter,
-                                 "the primary key column is NULL in the row read: ",
-                                 columns[position]);
-                        break;
-                    }
-                }
-            }
-            return std::move(ctx.error);
-        }
-
-    } // namespace
-
-    core::result_wrapper_t<std::string> generate_update_row(backend_type_t backend,
-                                                            const qualified_name_t& table,
-                                                            std::span<const std::string> columns,
-                                                            std::span<const std::size_t> key,
-                                                            const std::vector<logical_value_t>& before,
-                                                            const std::vector<logical_value_t>& after,
-                                                            std::pmr::memory_resource* resource) {
-        OTX_ZONE_N("sql_gen::generate_update_row");
-        gen_ctx_t ctx{backend, nullptr, resource};
-        if (auto err = check_row_statement(columns, key, before, ctx); err.contains_error()) {
-            return core::result_wrapper_t<std::string>{std::move(err)};
-        }
-        if (after.size() != before.size()) {
-            return core::error_t{core::error_code_t::invalid_parameter,
-                                 std::pmr::string{"an updated row has another width than the row it replaces",
-                                                  resource}};
-        }
+    core::result_wrapper_t<std::string> generate_table_read(backend_type_t backend,
+                                                            const statement_target_t& target,
+                                                            std::span<const std::size_t> columns,
+                                                            std::span<const components::expressions::expression_ptr> where,
+                                                            const storage_parameters* parameters,
+                                                            std::int64_t limit,
+                                                            std::pmr::memory_resource* resource,
+                                                            generation_options_t options) {
+        OTX_ZONE_N("sql_gen::generate_table_read");
+        gen_ctx_t ctx{backend, parameters, resource};
+        ctx.options = options;
+        ctx.columns = target.columns;
         std::stringstream stream;
-        stream << "UPDATE ";
-        write_table_reference(stream, table, ctx);
-        stream << " SET ";
-        bool changed = false;
-        for (std::size_t i = 0; i < columns.size() && !ctx.failed(); ++i) {
-            const bool same = before[i].is_null() ? after[i].is_null() : (!after[i].is_null() && before[i] == after[i]);
-            if (same) {
-                continue;
+        stream << "SELECT ";
+        if (target.all_columns.empty()) {
+            if (!columns.empty()) {
+                ctx.fail(core::error_code_t::invalid_parameter, "a table read of columns without the table's columns");
             }
-            stream << (changed ? ", " : "");
-            quote_ident(stream, columns[i], backend);
-            stream << " = ";
-            write_logical_value(stream, after[i], ctx);
-            changed = true;
+            stream << "*";
+        } else if (columns.empty()) {
+            for (std::size_t i = 0; i < target.all_columns.size(); ++i) {
+                stream << (i == 0 ? "" : ", ");
+                quote_ident(stream, target.all_columns[i], backend);
+            }
+        } else {
+            for (std::size_t i = 0; i < columns.size(); ++i) {
+                if (columns[i] >= target.all_columns.size()) {
+                    ctx.fail(core::error_code_t::invalid_parameter, "a table read of a column past the table's columns");
+                    break;
+                }
+                stream << (i == 0 ? "" : ", ");
+                quote_ident(stream, target.all_columns[columns[i]], backend);
+            }
         }
-        if (!changed) {
-            // Nothing changes, yet the row was matched: the statement still names
-            // it (and reports it, as the engine counts it), setting a key column
-            // to its own value.
-            quote_ident(stream, columns[key.front()], backend);
-            stream << " = ";
-            write_logical_value(stream, before[key.front()], ctx);
+        stream << " FROM ";
+        write_table_reference(stream, target.name, ctx);
+        ctx.clause = "WHERE";
+        bool first = true;
+        for (const auto& conjunct : where) {
+            if (!conjunct) {
+                ctx.fail(core::error_code_t::invalid_parameter, "WHERE: an empty conjunct");
+                break;
+            }
+            stream << (first ? " WHERE (" : " AND (");
+            write_predicate(stream, *conjunct, ctx);
+            stream << ")";
+            first = false;
         }
-        write_key_match(stream, columns, key, before, ctx);
+        ctx.clause = "query";
+        if (limit >= 0) {
+            stream << " LIMIT " << limit;
+        }
         if (ctx.failed()) {
             return core::result_wrapper_t<std::string>{std::move(ctx.error)};
         }
+        stream << ";";
         return stream.str();
     }
 
-    core::result_wrapper_t<std::string> generate_delete_row(backend_type_t backend,
-                                                            const qualified_name_t& table,
-                                                            std::span<const std::string> columns,
-                                                            std::span<const std::size_t> key,
-                                                            const std::vector<logical_value_t>& before,
-                                                            std::pmr::memory_resource* resource) {
-        OTX_ZONE_N("sql_gen::generate_delete_row");
+    core::result_wrapper_t<std::string> generate_create_table(backend_type_t backend,
+                                                              const qualified_name_t& table,
+                                                              std::span<const remote_column_t> columns,
+                                                              std::pmr::memory_resource* resource) {
+        OTX_ZONE_N("sql_gen::generate_create_table");
         gen_ctx_t ctx{backend, nullptr, resource};
-        if (auto err = check_row_statement(columns, key, before, ctx); err.contains_error()) {
-            return core::result_wrapper_t<std::string>{std::move(err)};
+        if (columns.empty()) {
+            ctx.fail(core::error_code_t::invalid_parameter, "CREATE TABLE without columns");
+            return core::result_wrapper_t<std::string>{std::move(ctx.error)};
         }
         std::stringstream stream;
-        stream << "DELETE FROM ";
+        stream << "CREATE TABLE ";
         write_table_reference(stream, table, ctx);
-        write_key_match(stream, columns, key, before, ctx);
+        stream << " (";
+        for (std::size_t i = 0; i < columns.size(); ++i) {
+            stream << (i == 0 ? "" : ", ");
+            auto type = columns[i].type;
+            type.set_alias(columns[i].name);
+            write_column_def(stream, type, ctx);
+        }
+        stream << ")";
+        write_table_engine(stream, ctx);
         if (ctx.failed()) {
             return core::result_wrapper_t<std::string>{std::move(ctx.error)};
         }
+        stream << ";";
+        return stream.str();
+    }
+
+    core::result_wrapper_t<std::string>
+    generate_drop_table(backend_type_t backend, const qualified_name_t& table, std::pmr::memory_resource* resource) {
+        OTX_ZONE_N("sql_gen::generate_drop_table");
+        gen_ctx_t ctx{backend, nullptr, resource};
+        std::stringstream stream;
+        generate_drop_collection(stream, table, ctx);
+        if (ctx.failed()) {
+            return core::result_wrapper_t<std::string>{std::move(ctx.error)};
+        }
+        stream << ";";
+        return stream.str();
+    }
+
+    core::result_wrapper_t<std::string> generate_add_column(backend_type_t backend,
+                                                            const qualified_name_t& table,
+                                                            const remote_column_t& column,
+                                                            std::pmr::memory_resource* resource) {
+        OTX_ZONE_N("sql_gen::generate_add_column");
+        gen_ctx_t ctx{backend, nullptr, resource};
+        std::stringstream stream;
+        stream << "ALTER TABLE ";
+        write_table_reference(stream, table, ctx);
+        stream << " ADD COLUMN ";
+        auto type = column.type;
+        type.set_alias(column.name);
+        write_column_def(stream, type, ctx);
+        if (ctx.failed()) {
+            return core::result_wrapper_t<std::string>{std::move(ctx.error)};
+        }
+        stream << ";";
+        return stream.str();
+    }
+
+    core::result_wrapper_t<std::string> generate_drop_column(backend_type_t backend,
+                                                             const qualified_name_t& table,
+                                                             std::string_view column,
+                                                             std::pmr::memory_resource* resource) {
+        OTX_ZONE_N("sql_gen::generate_drop_column");
+        gen_ctx_t ctx{backend, nullptr, resource};
+        if (column.empty()) {
+            ctx.fail(core::error_code_t::invalid_parameter, "DROP COLUMN without a column name");
+            return core::result_wrapper_t<std::string>{std::move(ctx.error)};
+        }
+        std::stringstream stream;
+        stream << "ALTER TABLE ";
+        write_table_reference(stream, table, ctx);
+        stream << " DROP COLUMN ";
+        quote_ident(stream, column, backend);
+        if (ctx.failed()) {
+            return core::result_wrapper_t<std::string>{std::move(ctx.error)};
+        }
+        stream << ";";
         return stream.str();
     }
 

@@ -14,9 +14,9 @@ The `connections:` section is the **single source of truth for connections**;
 there is no runtime add/remove API. To change connections, edit `config.yaml` and
 restart the server.
 
-Actual registration of connections lives one layer up — `remote_backends_t::open`
-(`backends/`, it owns the connector managers: the MySQL / PostgreSQL / ClickHouse
-connections, opened and discovered) and `backends::register_s3_aliases` (the s3
+Opening the connections lives one layer up — `remote_backends_t::open`
+(`backends/`: the MySQL / PostgreSQL / ClickHouse connections, their agents and
+backend actors, opened and discovered) and `backends::register_s3_aliases` (the s3
 aliases, `backends/backends.hpp`) — which keeps `config/` free of connector/actor dependencies.
 
 ## Structure
@@ -38,7 +38,7 @@ Nothing in `config/` throws. Every entry point returns a
 
 | Failure | Code | Message names |
 |---------|------|---------------|
-| file is not YAML (`YAML::LoadFile` refuses it) | `conversion_failure` | the path + yaml-cpp's own message |
+| file is not YAML (`YAML::LoadFile` refuses it) | `invalid_text_representation` | the path + yaml-cpp's own message |
 | a `service.*` value that cannot be read as its type (`port: abc`), or a service port outside 1..65535 (`port: 70000`) | `invalid_parameter` | the field (`service.mysql.port`) |
 | a `service.runtime` pool size out of range, an empty directory, or one of those sections (or a pool) that is not a mapping | `invalid_parameter` | the field (`service.engine.data_dir`, `service.runtime.general.threads`) |
 | a section that is present and not a mapping — the document itself (an empty file is the defaults), `service`, `service.flight_sql` / `mysql` / `postgres` / `spark_connect` / `connection_retry` (`service: {mysql: 8816}`) | `invalid_parameter` | the field (`service.mysql`, `(document)`) + "expected a mapping of keys" |
@@ -50,6 +50,7 @@ Nothing in `config/` throws. Every entry point returns a
 | a backend alias (mysql / postgresql / clickhouse) equal to another one, or an s3 alias equal to another s3 alias | `invalid_parameter` | the section + `alias='…'` + "already taken by" the other entry |
 | a `pool_size` below 1, or one that is not an integer | `invalid_parameter` | the section + `alias='…'` (or entry position) + `pool_size` |
 | a `service.spark_connect.session_timeout_s` that is not an integer in [0, one year] | `invalid_parameter` | the field |
+| a key the reader does not know, at any level: the document (`service`, `connections`), `service`, each `service.*` section, a `service.runtime` pool, `connections` (`mysql` / `postgresql` / `clickhouse` / `s3`), a connection entry | `invalid_parameter` | `unknown key "<key>" in <place>` — `(document)`, `service.engine`, `service.runtime.general`, `connections`, `connections.mysql[0]` (the entry's position from 0) |
 
 The yaml-cpp calls (`YAML::LoadFile`, `Node::as<T>()`) are the only throwing
 sites; each is wrapped in a try/catch exactly where it is made and converted to
@@ -60,7 +61,13 @@ no key is read off a node before it is known to be a mapping: `require_map`
 `parse_flight_sql`, `parse_spark_connect`, `parse_connection_retry`,
 `parse_engine`, `parse_runtime`, `pool_config`) and for `service` and the
 document in `load_config`; `entry_reader_t` refuses a scalar connection entry
-before its first key. Error messages live on the `std::pmr::memory_resource*` passed to
+before its first key. **No key is unknown**: every mapping the reader reads is
+checked against the keys it knows (`require_known_keys`, `yaml_scalar.hpp`) right
+after `require_map` — a connection entry before any field is read, so an entry
+with a typo is reported for the typo, not as incomplete — and a key it does not
+know is refused naming the key and its place: a typo (`pool_sise`) or a key no
+longer read (`wal_dir`, a pool's `max_throughput`) must not leave a default
+silently in force. Error messages live on the `std::pmr::memory_resource*` passed to
 `load_config` / `parse_connections` — there is no default resource.
 
 ## Types
@@ -74,7 +81,7 @@ before its first key. Error messages live on the `std::pmr::memory_resource*` pa
   `connections:` node of the same file.
 - `config::EngineConfig` (`service.engine`) — the embedded otterbrix engine:
   `data_dir` (default `DEFAULT_ENGINE_DATA_DIR` = `/tmp/test_collection_sql/base`,
-  the directory `main.cpp` hard-coded; the engine's `.lock`, WAL and tables) and
+  the engine's `.lock`, WAL and tables) and
   `log_dir` (empty → `data_dir`; `config::log_directory(engine)` answers it). `log_dir` is where
   **every** log file of the server goes: `main.cpp` reads the config first (a refused
   argument or file is written to stderr, there are no loggers yet), then
@@ -89,21 +96,21 @@ before its first key. Error messages live on the `std::pmr::memory_resource*` pa
   (`engine_t::open(runtime, server_config.engine)`, `runtime/CLAUDE.md`).
 - `config::RuntimeConfig` (`service.runtime`) — **every thread pool of the
   server**, so `config.yaml` sizes all of them; nothing is sized from the machine
-  in code except the documented auto value of a `threads: 0`. Ten `PoolConfig
+  in code except the documented auto value of a `threads: 0`. Nine `PoolConfig
   { threads; }`, `threads` in 0..4096. Five are actor-zeta pools: `general` / `exec` / `disk` (the engine's
   pools, default 3 threads, `threads >= 1`) and `sessions` / `backends` (default
   0 = auto). `otterstax::runtime::runtime_t` (`runtime/runtime.hpp`) builds its
   pools from it; `main.cpp` builds the process's `runtime_t` from it. Auto for
-  `sessions` is `max(2, hardware threads)`. **`backends`**: a statement holds a
-  backends thread for its whole remote call (the connection checkout and the wait
-  for the backend's answer), so this pool is what isolates the remote connections
-  from each other — with fewer threads than connections the surplus connections
+  `sessions` is `max(2, hardware threads)`. **`backends`** runs the connections'
+  agents (`otterbrix/federation/CLAUDE.md`): a statement holds a backends thread
+  for its whole remote call, so this pool is what isolates the remote connections
+  from each other — with fewer threads than connections the surplus agents
   idle, and one slow alias can take every thread from the others. Auto (0) is
   therefore `max(2, hardware threads)` and at least the sum of `pool_size` over
   every mysql / postgresql / clickhouse entry
   (`otterstax::backends::backends_threads`, resolved by `main.cpp` before it builds
   the runtime); an explicit value is taken as is, and below that sum
-  `backends_threads` logs a warning. The other five (default 0) are plain thread
+  `backends_threads` logs a warning. The other four (default 0) are plain thread
   pools that are not `runtime_t`'s:
   `mysql_io` / `postgres_io` (the asio pool of each wire server; a connection
   holds one of its threads while its statement runs, so the pool bounds the
@@ -111,16 +118,7 @@ before its first key. Error messages live on the `std::pmr::memory_resource*` pa
   `GrpcContext` threads; its adapter blocks the calling thread for the length of a
   query), `spark_connect_io` (one `GrpcContext` per thread; the handlers are
   coroutines) — each 0 = `max(2, hardware threads)`, resolved by
-  `otterstax::runtime::resolve_threads` where `main.cpp` builds the servers — and
-  `connector_io`, the asio io pool each of the three remote connector managers
-  owns. `main.cpp` turns it into per-manager sizes with
-  `otterstax::backends::connector_io_threads(threads, connections)`
-  (`backends/remote_backends.hpp`): `threads: N` gives each manager N; 0 (the
-  default) gives each manager one thread per connection `connections:` opens to its
-  backend kind (the sum of the entries' `pool_size`), at least one — a statement
-  holds an io thread while it runs and a connection runs one statement at a time,
-  so fewer would queue statements that already hold a connection and more could
-  never all be busy (`connectors/CLAUDE.md`, "ConnectorManager Pattern").
+  `otterstax::runtime::resolve_threads` where `main.cpp` builds the servers.
 - `config::SparkConnectConfig` — `{ std::string host = "0.0.0.0";
   uint16_t port = 15002; std::uint32_t session_timeout_s = 3600; }`: the listen
   address `main.cpp` hands to the Spark Connect gRPC server
@@ -135,12 +133,16 @@ before its first key. Error messages live on the `std::pmr::memory_resource*` pa
   vector<PgConnectionDesc> postgresql; vector<ChConnectionDesc> clickhouse;
   vector<S3CredentialDesc> s3; }`. The descriptor structs are plain data
   (`alias/host/port/username/password/database[/schema]/table` for backends,
-  plus `int pool_size = 1` on each of them;
-  `alias/access_key/secret_key/region/session_token/endpoint` for s3).
-  `pool_size` (the number of connections kept open to the backend, validated
-  `>= 1`) is copied by `remote_backends_t::open` into the
-  `conn::api_server::*Params`; the manager opens that many connections for the
-  alias (`connectors/CLAUDE.md`, "Connection pools").
+  plus `int pool_size = default_pool_size` (4) on each of them;
+  `alias/access_key/secret_key/region/session_token/endpoint` for s3). PostgreSQL
+  `schema` empty (the default) = every user schema of the database, a name = that
+  schema only; MySQL / ClickHouse have the one schema `public`.
+  `pool_size` (validated `>= 1`) is the number of agents — one physical
+  connection each — `remote_backends_t::open` builds for the connection. A
+  transaction block holds one agent from its first statement to its end, so
+  `pool_size` blocks of one connection run at once and the next one waits for a
+  free agent up to the checkout timeout (60 s, then `io_error`;
+  `otterbrix/federation/CLAUDE.md`).
 
 ## Parsing split
 
@@ -151,7 +153,7 @@ before its first key. Error messages live on the `std::pmr::memory_resource*` pa
   the `flight_sql` / `spark_connect` hosts, `connection_retry`, `engine` and
   `runtime` (each scalar through `yaml_scalar<T>`; integers range-checked,
   sections checked to be mappings before a key is read; a key the reader does
-  not know is ignored), then delegates the `connections:` node to
+  not know is refused, `unknown key "<key>" in <place>`), then delegates the `connections:` node to
   `parse_connections`. A missing file is the default `ServiceConfig` (not an
   error). Every failure is returned and nothing is logged: `main.cpp` reads the
   file before it creates the loggers (they go under `service.engine.log_dir`,
@@ -175,24 +177,23 @@ before its first key. Error messages live on the `std::pmr::memory_resource*` pa
   fields (before the port) every section refuses the **reserved aliases**,
   compared case-insensitively (`reserved_connection_aliases` in
   `connection_config_reader.hpp`): `federation` (`reserved_connection_alias`,
-  defined as the federation's `metadata_database` — a header-only constant), the
-  engine database holding the remote-table metadata (`federation.remote_tables` /
-  `remote_columns`, `otterbrix/federation/metadata.hpp`), and `main`, the engine's
-  default local database. An
-  alias is the first qualifier of a federated name, so a connection under it
-  would shadow that database. Then a backend alias (mysql / postgresql /
+  defined as the federation's `metadata_database` — a header-only constant),
+  OtterStax's own database (`federation.public.remote_names`, the backends'
+  spelling of the remote tables, `otterbrix/federation/metadata.hpp`;
+  `federation.kafka.*`, Kafka's bookkeeping — the refusal says so), and `main`, the
+  engine's default local database. An alias is the first part of a four-part
+  name, so a connection under it would shadow that database. Then a backend alias (mysql / postgresql /
   clickhouse) must be an **unquoted SQL identifier**, `[a-z_][a-z0-9_]*`: it is
   the first segment of a federated table name, written unquoted in SQL, so it
   must be what the lexer folds an unquoted identifier to — an upper-case letter,
   a dot, a dash or a leading digit would be unreachable. s3 aliases are a string
   literal (`s3_alias = '…'`) and take any spelling. `kafka` is an ordinary alias: the Kafka objects are
-  the schema `main.kafka`, never the uid slot of a four-part name. `pool_size` is checked last (every backend section). `parse_connections` turns a non-empty
+  the schema `main.kafka`, never the first part of a four-part name. `pool_size` is checked last (every backend section). `parse_connections` turns a non-empty
   result into its `invalid_parameter`.
 - After every entry passed, `parse_connections` checks the **aliases**: the
   mysql / postgresql / clickhouse aliases share one namespace — an alias is the
-  connection uid every federated name starts with — so two equal entries, in one
-  section or two, are refused: one
-  backend would be unreachable and its tables recorded under the other's uid.
+  connection every four-part name starts with — so two equal entries, in one
+  section or two, are refused: one backend would be unreachable.
   s3 aliases are another namespace (the `s3_alias` option of CREATE EXTERNAL
   TABLE / COPY ... TO, looked up exactly by `conn::s3::ConnectorManager`, where a
   second entry would silently replace the first): an s3 alias equal to a backend
@@ -205,25 +206,24 @@ main.cpp
   → command line (--config)                              — a refused argument goes to stderr
   → config::load_config(resource, config_path)          — config.yaml → result_wrapper_t<ServiceConfig> (service.* + .connections)
         parse_connections validates every entry, then the aliases → the first problem is an invalid_parameter;
-        main writes it to stderr and returns 1 (server never starts: the reader runs on its own pmr resource
-        before any module — runtime, engine, actors, pools — exists, and before any logger)
+        main writes it to stderr and returns 1 (the reader runs on its own pmr resource before any
+        module — runtime, engine, actors, pools — exists, and before any logger)
   → initialize_all_loggers(config::log_directory(server_config.engine))   — every log file under log_dir
   → backends::backends_threads(runtime.backends.threads, connections)   — the backends pool against the
                                                   connections (a warning when an explicit size is below them)
   → runtime_t(server_config.runtime with that backends size)
-  → remote_backends_t(resource, {.connector_threads = connector_io_threads(runtime.connector_io.threads, connections),
-                                  .statements = runtime.backends_scheduler()}).open(connections, connection_retry)
+  → remote_backends_t(resource, {.runtime = &runtime}).open(connections, connection_retry)
         first the descriptors the connector can never accept (a malformed port, pool_size < 1) — a
-        configuration error, checked before any connection opens, returned so main returns 1 — then each backend:
-        mysql/pg/ch: ConnectorManager::addConnection(conn::api_server::*Params, pool_size included) + discover —
-                     retried up to connection_retry.max_attempts (delay_ms between tries)
-  → engine_t::open(runtime, server_config.engine, federation::make_primitives())
+        configuration error, checked before any connection opens, returned so main returns 1 — then each
+        backend: pool_size agents, the first connected and discovering on the startup thread — retried up
+        to connection_retry.max_attempts (delay_ms between tries) — and the connection's backend actor
+  → engine_t::open(runtime, server_config.engine, remote->primitives())
   → the s3 connector / file / S3 / Kafka actors spawned (main's locals)
   → backends::register_s3_aliases(resource, s3_connector, server_config.connections)
-        s3         : actor send &conn::s3::ConnectorManager::add_credentials      — stores the alias (no retry)
-  → backends::publish_federation_metadata(resource, *engine, *remote)
-                                                — rows of every configured connection written, rows of
-                                                  a connection no longer configured removed
+        s3: actor send &conn::s3::ConnectorManager::add_credentials      — stores the alias (no retry)
+  → backends::register_remote_tables(resource, *engine, *remote)
+                                                — the discovery registered in the engine's catalog
+                                                  (catalog/CLAUDE.md), no SQL to a backend
 ```
 
 Two failure modes, deliberately different:
@@ -231,15 +231,18 @@ Two failure modes, deliberately different:
 - **Invalid config** (a required field missing, a bad port, a file that is not
   YAML) → **fail-fast**: `load` returns the error, `main` returns 1, startup
   aborts. The operator must fix the file.
-- **Backend unreachable** (valid config, DB still booting) → **best-effort**: the
-  open is retried per `connection_retry`, and if it still fails the error is logged
-  but startup continues (the other backends and the local engine stay usable).
-  A backend that answers something the federation metadata cannot record (a
-  discovered column without a name, …) is left out at once, not retried. Which of
-  the three a failure is, the step that failed says (`open_failure_kind_t`,
-  `backends/connection_retry.hpp`) — never the error's code, which may be one the
-  backend, the connector or the engine produced: an `invalid_parameter` from the
-  metadata or the engine does not abort startup.
+- **Backend unreachable** (valid config, DB still booting) → **best-effort**: a
+  failed connect of any of its agents or a failed discovery is retried per
+  `connection_retry`, and if it still fails the error is logged but startup
+  continues (the other backends and the local engine stay usable; the connection
+  keeps its actor and agents, which connect on their first statement). What a
+  failure is, the step that failed says (`backends/connection_retry.hpp`) — never
+  the error's code, which may be one the backend or the connector produced: an
+  `invalid_parameter` from a backend does not abort startup. A backend that
+  answered it cannot be written to (a MySQL session under `sql_mode`
+  `NO_BACKSLASH_ESCAPES`: the agent's check of every session it opens,
+  `backend_agent_t::session_refused()`) is **unusable**: not retried, and left
+  out — no actor, not in the engine's map, a statement naming it refused.
 
 ## Where the file lives at runtime
 
@@ -274,7 +277,6 @@ service:
     disk:     { threads: 3 }
     sessions: { threads: 0 }        # 0 = max(2, hardware threads)
     backends: { threads: 0 }        # 0 = max(2, hardware threads, sum of every connection's pool_size)
-    connector_io: { threads: 0 }    # io threads of EACH connector manager; 0 = its connections' pool_size sum (>= 1)
     mysql_io:         { threads: 0 }   # the wire servers' asio pools; 0 = max(2, hardware threads)
     postgres_io:      { threads: 0 }
     flight_sql_io:    { threads: 0 }   # Flight SQL GrpcContext threads
@@ -286,23 +288,28 @@ connections:
   postgresql:
     - { alias: <a>, host: <h>, port: "<p>", username: <u>, password: <pw>, database: <db>, schema: <s>, table: "" }
   clickhouse:
-    - { alias: <a>, host: <h>, port: "<p>", username: <u>, password: <pw>, database: <db>, table: "", pool_size: 1 }
+    - { alias: <a>, host: <h>, port: "<p>", username: <u>, password: <pw>, database: <db>, table: "", pool_size: 4 }
   s3:
     - { alias: <a>, access_key: <k>, secret_key: <s>, region: <r>, endpoint: <e> }
 ```
 
-`alias` must not be `federation` (any case) in any section: the name
-is reserved for the engine database of the remote-table metadata, and such an entry aborts
-startup, and so does an alias another backend entry already takes (any case, any
-backend section) or another s3 entry already takes. `port` is an **optional string** (empty → driver default; otherwise a decimal
-integer in 1..65535, anything else aborts startup). mysql / postgresql entries take
-an optional `pool_size` (integer `>= 1`, default 1: the connections the manager
-keeps open to that backend), clickhouse entries too. `schema` defaults to
-`public`. s3 `region`/`session_token`/`endpoint` are optional. `connection_retry`
+`alias` must not be `federation` or `main` (any case) in any section, a backend
+alias must match `[a-z_][a-z0-9_]*`, and an alias another backend entry (any
+backend section) or another s3 entry already takes aborts startup. `port` is an
+**optional string** (empty → driver default; otherwise a decimal integer in
+1..65535, anything else aborts startup). Every backend entry takes an optional
+`pool_size` (integer `>= 1`, default 4: the agents, one connection each).
+PostgreSQL `schema` empty = every user schema. `table` empty = every base table
+of the database (schema); a name = the connection is that one table: only it is
+registered (at startup and by a miss), and DDL of another table of the
+connection is refused (`catalog/CLAUDE.md`). A key the reader does not know —
+at the top level, in `service:` and each of its sections and pools, in
+`connections:` or in a connection entry — aborts startup (`unknown key "<key>" in
+<place>`). s3 `region`/`session_token`/`endpoint` are optional. `connection_retry`
 is optional (defaults to `max_attempts: 1`, `delay_ms: 1000` = one-shot), and so
 is `spark_connect` (defaults to `0.0.0.0:15002`, either key alone overriding its
 own default).
-Malformed YAML → the server aborts startup (`conversion_failure` from `load`).
+Malformed YAML → the server aborts startup (`invalid_text_representation` from `load_config`).
 
 Wire-server settings live under the top-level `service:` node so they never
 collide with the backends under `connections:` — `service.mysql`/`service.postgres`
@@ -324,18 +331,17 @@ rules).
    pass (`connections/connection_config_reader.cpp`).
 3. Add a `validation_error(const <Desc>&)` overload for its required fields
    (`connections/connection_config_reader.{hpp,cpp}`).
-4. Open it in `remote_backends_t::open` (descriptors are already validated
-   at parse time — just convert the descriptor → the connector's param struct
-   and call `addConnection` + the discovery inside the retry helper).
-5. Add a corresponding `*_connection_config.hpp` param struct under
-   `connectors/api_connections/` if the manager needs one.
-6. Extend the unit tests in `tests/unit/config/test_connection_config.cpp`.
+4. Open it in `remote_backends_t::open` (descriptors are already validated at
+   parse time: convert the descriptor into the connector's `connect_params`, build
+   its agents over the connector factory — `connectors/CLAUDE.md` — and its backend
+   actor).
+5. Extend the unit tests in `tests/unit/config/test_connection_config.cpp`.
 
 ## Tests
 
 `tests/unit/config/` (`test_unit_config`) covers `parse_connections` (field
-parsing, null/missing node, missing sections, pg `schema` default, optional s3
-fields, order preservation, **`invalid_parameter` on an incomplete entry, a
+parsing, null/missing node, missing sections, pg `schema` empty when omitted, optional s3
+fields, order preservation, the `pool_size` default 4, **`invalid_parameter` on an incomplete entry, a
 malformed port, a non-scalar field, a bad `pool_size`, or the reserved aliases
 `federation` / `main` in any case and any section** (an alias merely containing
 the word is accepted; `kafka` is accepted), **a backend alias taken twice across sections, two equal
@@ -350,7 +356,7 @@ aborting the load, defaults when file missing, retry
 defaults, the `spark_connect` host/port and their `0.0.0.0:15002` default when
 the node is absent, `session_timeout_s` (default 3600, 0 accepted, range-checked),
 a backend alias taken twice aborting the load, no-`connections:` section, **malformed YAML →
-`conversion_failure`, a non-integer service port (`service.mysql.port`,
+`invalid_text_representation`, a non-integer service port (`service.mysql.port`,
 `service.spark_connect.port`), a service port outside 1..65535 / an invalid connection or port →
 `invalid_parameter`**, every `service` section — `service` itself and the
 document included — given as a scalar or a sequence → `invalid_parameter`
@@ -359,12 +365,16 @@ section → `invalid_parameter` naming the entry). `test_engine_config.cpp` cove
 `service.runtime`: the defaults when the sections or the file are absent, every
 key read, one key overriding only its own default, the keys an older file may
 still carry (`wal_dir`, `disk_dir`, `log_level`, `executor_pool_size`,
-`dml_flush_row_threshold`, `pump`, a pool's `max_throughput`) ignored like any
+`dml_flush_row_threshold`, `pump`, a pool's `max_throughput`) refused like any
 unknown key, and `invalid_parameter` naming the field for every refused value
 (an empty or non-scalar directory, non-mapping sections, engine pools with 0 threads, out-of-range or
-textual pool sizes, a `connector_io` that is not a mapping or whose `threads` is
-negative, past 4096 or text; `connector_io.threads` read, 0 kept as auto; the
-four frontend pools read, one alone overriding only its own default, and refused
-the same way). How `connector_io_threads` sizes the managers, how
-`backends_threads` sizes the backends pool against the connections are pinned in
-`tests/system/test_process_assembly.cpp`. Nothing is asserted to throw.
+textual pool sizes; the four frontend pools read, one alone overriding only its
+own default, and refused the same way). `test_connection_config.cpp` also pins an
+unknown key at every level (`unknown key "<key>" in <place>`, an entry's typo
+reported before its missing fields), the refusal of the alias `federation`
+naming what the database holds, and that every `config*.yaml` the repository
+ships (found under `OTTERSTAX_SOURCE_DIR`, the build trees and `.git` skipped:
+the template, the demo, the quick start, the benchmarks, the integration tests,
+the manual stack) loads. How `backends_threads` sizes the backends
+pool against the connections is pinned in `tests/system/test_process_assembly.cpp`.
+Nothing is asserted to throw.

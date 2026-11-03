@@ -52,7 +52,7 @@ examples/demo/up.sh
 
 This does, in order:
 
-1. `python examples/demo/generate_data.py` — writes `examples/demo/init/{mariadb,postgres,clickhouse}/init.sql` with seeded data (correlated IDs across backends, time windows aligned to demo predicates) **and** writes `examples/demo/init/s3/{regions.csv,promos.parquet}` (6 rows + 12 rows) for steps 7-9.
+1. `python3 examples/demo/generate_data.py` — writes `examples/demo/init/{mariadb,postgres,clickhouse}/init.sql` with seeded data (correlated IDs across backends, time windows aligned to demo predicates) **and** writes `examples/demo/init/s3/{regions.csv,promos.parquet}` (6 rows + 12 rows) for steps 7-9.
 2. `docker compose -f examples/demo/compose.yml --profile full up -d --build` — starts MariaDB + PostgreSQL + ClickHouse + RustFS + the `demo-rustfs-init` one-shot (which `aws s3 mb s3://demo-bucket && aws s3 cp --recursive /fixtures/ s3://demo-bucket/`) + the `otterstax_app` container.
 3. Polls each container's healthcheck (up to 3 minutes). `demo-rustfs-init` exits cleanly once seeding finishes; it's not polled.
 4. Connections require no registration step: `examples/demo/config.yaml` (docker-DNS hostnames: `demo-mariadb`, `demo-rustfs`, …) is mounted into the `demo-otterstax` container by `compose.yml` and read once at startup — server settings, the mysql/pg/ch backends **and** the `demo_s3` alias all come from that one file.
@@ -162,7 +162,7 @@ examples/demo/down.sh
 | `FATAL 3D000 database "demo" does not exist` at connect | The client named a database the engine does not have | Connect to `main` (`psql -h localhost -p 8817 -U demo main`). |
 | `Otterbrix execution failed: database does not exist` | Query routed to local engine that doesn't know the external alias | Check the config file (`config.yaml` / `config_local.yaml`) `connections:` section has all three backends and restart the server — connections load only at startup. |
 | `External table is not registered: …` from step 7/8/9 | The `demo_s3` alias was not in the config file this server read | Add the `s3:` `demo_s3` entry under `connections:` and restart the server. |
-| Step 8 fails with `External table is not registered` and `init/s3/promos.parquet` is missing | `pyarrow` not installed when `generate_data.py` ran | `pip install pyarrow` and re-run `python examples/demo/generate_data.py`, then `docker compose -f examples/demo/compose.yml up -d demo-rustfs-init` to re-seed. |
+| Step 8 fails with `External table is not registered` and `init/s3/promos.parquet` is missing | `pyarrow` not installed when `generate_data.py` ran | `pip install pyarrow` and re-run `python3 examples/demo/generate_data.py`, then `docker compose -f examples/demo/compose.yml up -d demo-rustfs-init` to re-seed. |
 | Step 9 hangs or returns `Cannot reach rustfs:9000` from inside the server | s3 endpoint mismatch (docker vs local config) | In docker mode the alias points at `demo-rustfs:9000`; in bench mode it points at `localhost:3206`. Use the matching config file (`config.yaml` vs `config_local.yaml`) and restart the server. |
 
 ## File reference

@@ -4,21 +4,19 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Role
 
-`otterbrix/` is the glue layer between OtterStax and the external Otterbrix library: the parser, the SQL generator for remote backends, the data translators, the engine requests, and the federation provider the engine is opened with (`federation/`, see `federation/CLAUDE.md`).
+`otterbrix/` is the glue layer between OtterStax and the external Otterbrix library: the parser, the SQL generator for remote backends, the data translators, the engine requests, and the federation's backend actors the engine is opened with (`federation/`, see `federation/CLAUDE.md`).
 
 ## Subdirectories
 
 ### `parser/`
 
-`IParser` / `GreenplumParser` — thin interface over the Otterbrix SQL parser: the engine's `raw_parser` (with the s3 / file / kafka extensions registered) and transformer over the statement text as written. `parse()` returns `ParsedQueryDataPtr` which carries:
-- `otterbrix_params` (`OtterbrixStatementPtr`) — the logical plan (its root, the flattened sub-queries ahead of it, the catalog lookups the transformer registered, the shared parameter node); names ride on the plan nodes whole — a remote name keeps its uid slot, which the federation resolves by
-- `binder` (`transform_result`) — parameter bindings for prepared statements
-- `sql` — the text, which the query session parses again to run a statement a second time (a plan is single-use: a rediscovery retry, the describe of a prepared statement)
-- `ddl_target` — a table DDL statement's target as written, every slot (the transformer keeps only database and table on the DDL node); the session runs remote DDL by it
-- `dml_target` — an INSERT / UPDATE / DELETE target written with a uid slot (four parts), every slot (the transformer keeps no uid on a DML target); the session runs such a statement on its backend directly
-- `extension_kind`, `awaiting_bind`
+`IParser` / `GreenplumParser` — thin interface over the Otterbrix SQL parser: the engine's `raw_parser` (with the s3 / file / kafka extensions registered) and transformer over the statement text as written. `parse()` returns `core::result_wrapper_t<ParsedQueryDataPtr>` (a refusal is the engine's error, never an exception) which carries:
+- `plan` (`ExecutionPlanPtr`, `types/otterbrix.hpp`: the engine's `execution_plan_t` — its root `plan_root()`, the flattened sub-queries ahead of it, the catalog lookups the transformer registered, the parameter node); every name is the name the client wrote, 1–4 parts (`t`, `s.t`, `d.s.t` local, `c.d.s.t` a connection's table), resolved by the engine. For a statement still awaiting its Bind, the describe plan (`finalize_for_describe`: every `$n` unbound)
+- `binder()` (`transform_result`) — binds the client's values and finalizes the statement (`query_session_t::parse_bound`)
+- `sql` — the text, which the query session parses again to run a statement a second time (a plan is single-use: a prepared statement's executions, the registration retry)
+- `tag`, `extension_kind`, `awaiting_bind`
 
-`parse_fragment(sql, shared_params)` parses a single SELECT into the caller's parameter node (the Spark translator's SQL leaves). `backend_type_t` (`otterbrix/backend_type.hpp`, included by `parser.hpp` and `federation/metadata.hpp`; `{MySQL, PostgreSQL, ClickHouse}`) is the dialect the generator writes and the only enumeration of a backend's kind (the federation, the catalog and the backends module use it too). `qualified_name.hpp` restores the ordering of `qualified_name_t` (the dependency maps).
+`parse_fragment(sql, shared_params)` parses a single SELECT into the caller's parameter node (the Spark translator's SQL leaves). `backend_type_t` (`otterbrix/backend_type.hpp`, included by `parser.hpp` and `federation/metadata.hpp`; `{MySQL, PostgreSQL, ClickHouse}`) is the dialect the generator writes and the only enumeration of a backend's kind (the federation, the catalog and the backends module use it too).
 
 `parser/grammar_extention/` — pluggable parser extensions registered with the
 core parser registry. Two ship by default: `s3/` and `file/`, both adding the
@@ -43,7 +41,9 @@ consumes these nodes lives in `integration/kafka/` — see its CLAUDE.md.
 
 ### `query_generation/`
 
-`sql_gen::generate_query(node, params, backend, statement_target_t, resource, generation_options_t)` — walks an Otterbrix logical plan node (a query block's aggregate, a DML / DDL root) and produces a SQL string for a specific `backend_type_t`. `statement_target_t` names the table (`name`, as `federation::generator_name` spells it), the second table (`from_name`: the FROM / USING source, the INSERT ... SELECT source, the DROP INDEX index), how the engine's column names are spelled on the backend (`columns` / `from_columns`, each column with its whole engine type — a DECIMAL with its width and scale) and every column for `SELECT *` (`all_columns`); a query over a JOIN tree or a derived table (validated tree only) names its tables in `relations` instead (`relation_t`: the node that reads the table, its name, columns and declared column list). Such a query is written with every table under an alias of its own (`<table> AS tN`, a derived table `(SELECT … ) AS dN` whose outputs are named as the engine names them) and every column qualified by its relation's alias, a column found by its position (the validator numbers each column reference by the column's place in what the FROM — in an ON condition, what its side — outputs; HAVING / ORDER BY / DISTINCT ON of a query that groups or aggregates — the only one the validator leaves a group node — number the group's outputs: HAVING and DISTINCT ON are written as the output's expression, ORDER BY by the output's name, and every output of such a query over relations is named, `AS <name>` (a name two outputs share takes a `_<n>` suffix on the later one), since a bare column name is ambiguous on MySQL and the left table's column on ClickHouse), so two tables sharing a column name never mix; a JOIN node alone is the SELECT of every column it outputs. JOIN kinds: INNER / LEFT / RIGHT / CROSS on every dialect, FULL on PostgreSQL and ClickHouse; LATERAL / semi / anti, a JOIN tree on the right of a ClickHouse JOIN and a ClickHouse ON condition other than side-to-side equalities AND-ed with conditions on the side an outer join does not preserve are `unimplemented_yet`; a ClickHouse JOIN is written with its strictness (`ALL INNER JOIN`, `ALL LEFT JOIN`, …: the server's `join_default_strictness` decides otherwise), an outer one ends the statement with `SETTINGS join_use_nulls = 1`, and a statement reading an Array / Tuple / Map column of the side it pads (`source_column_t::padded_without_null`: no Nullable holds it, so it would read its default value where the engine has NULL) is `unimplemented_yet`. `generation_options_t::placeholders` writes every parameter as `?` (the pushdown rule's "can this be one statement" probe); `validated` marks the engine's validated tree (a numeric cast — the validator's and a user's are the same node — is written in the dialect's syntax where its CAST does to the value what the engine's does and refused otherwise, a lossless one that is a comparison's operand written as its operand; `*` expands to the declared columns; a two-table statement trusts the caller for its source). `generate_insert_rows` / `generate_update_row` / `generate_delete_row` are the federation sinks' statements (one VALUES list per chunk; one row named by its primary key — `WHERE k1 = v1 AND …`, no LIMIT, no row address — ClickHouse refused), `quote_identifier` the dialect's quoting (ClickHouse doubles a backslash too; its PostgreSQL form also spells the names of the engine's own bookkeeping SQL, `operators/engine_requests.cpp` and `catalog/remote_metadata.cpp`). Backend differences:
+The SQL OtterStax sends to a backend, in its dialect (`sql_query_generator.hpp`, namespace `sql_gen`). The caller is the backend actor (`federation/CLAUDE.md`): it generates from the blocks otterbrix offers it (`storage_offer`: a detached copy of a validated sub-tree whose nodes name their table by `table_oid()` — every name and column reaches the generator through `statement_target_t` / `relation_t`); the discovery probe (`catalog/discovery.hpp`) generates a SELECT from a hand-built node. Entry points: `generate_query` (below), `generate_table_read` (a scan of one table: the projected columns, the WHERE conjuncts the actor took, a LIMIT), `generate_insert_rows` (one `INSERT … VALUES` per chunk, `RETURNING` on PostgreSQL only), `generate_create_table` / `generate_drop_table` / `generate_add_column` / `generate_drop_column` (a client's DDL of a remote table; ClickHouse tables are MergeTree ordered by `tuple()`), `quote_identifier` (the dialect's quoting; ClickHouse doubles a backslash too).
+
+`sql_gen::generate_query(node, params, backend, statement_target_t, resource, generation_options_t)` — walks an Otterbrix logical plan node (a query block's aggregate, a JOIN, a DML / DDL root) and produces a SQL string for a specific `backend_type_t`. `statement_target_t` names the table (`name`, as `federation::generator_name` spells it), the second table (`from_name`: the FROM / USING source, the INSERT ... SELECT source, the DROP INDEX index), how the engine's column names are spelled on the backend (`columns` / `from_columns`, each column with its whole engine type — a DECIMAL with its width and scale) and every column for `SELECT *` (`all_columns`); a query over a JOIN tree or a derived table (validated tree only) names its tables in `relations` instead (`relation_t`: the node that reads the table, its name, columns and declared column list). Such a query is written with every table under an alias of its own (`<table> AS tN`, a derived table `(SELECT … ) AS dN` whose outputs are named as the engine names them) and every column qualified by its relation's alias, a column found by its position (the validator numbers each column reference by the column's place in what the FROM — in an ON condition, what its side — outputs; HAVING / ORDER BY / DISTINCT ON of a query that groups or aggregates — the only one the validator leaves a group node — number the group's outputs: HAVING and DISTINCT ON are written as the output's expression, ORDER BY by the output's name, and every output of such a query over relations is named, `AS <name>` (a name two outputs share takes a `_<n>` suffix on the later one), since a bare column name is ambiguous on MySQL and the left table's column on ClickHouse), so two tables sharing a column name never mix; a JOIN node alone is the SELECT of every column it outputs. JOIN kinds: INNER / LEFT / RIGHT / CROSS on every dialect, FULL on PostgreSQL and ClickHouse; LATERAL / semi / anti, a JOIN tree on the right of a ClickHouse JOIN and a ClickHouse ON condition other than side-to-side equalities AND-ed with conditions on the side an outer join does not preserve are `unimplemented_yet`; a ClickHouse JOIN is written with its strictness (`ALL INNER JOIN`, `ALL LEFT JOIN`, …: the server's `join_default_strictness` decides otherwise), an outer one ends the statement with `SETTINGS join_use_nulls = 1`, and a statement reading an Array / Tuple / Map column of the side it pads (`source_column_t::padded_without_null`: no Nullable holds it, so it would read its default value where the engine has NULL) is `unimplemented_yet`. `generation_options_t::placeholders` writes every parameter as `?` (the offer's "can this be one statement" probe; the text is never sent); `validated` (the default; only the discovery probe clears it) marks the engine's validated tree (a numeric cast — the validator's and a user's are the same node — is written in the dialect's syntax where its CAST does to the value what the engine's does and refused otherwise, a lossless one that is a comparison's operand written as its operand; `*` expands to the declared columns; a two-table statement trusts the caller for its source); `returning` appends ` RETURNING <every column>` to an UPDATE / DELETE (PostgreSQL only). Backend differences:
 - MySQL: `database.collection` table reference
 - PostgreSQL: `schema.collection` table reference
 - ClickHouse: `database.collection` with backticks, like MySQL. ClickHouse 23.8 has no `UPDATE`
@@ -65,9 +65,17 @@ count (`federation/CLAUDE.md`), and `unimplemented_yet` on ClickHouse, whose avg
 Float64), DATE / TIME / TIMESTAMP as typed literals (`DATE '…'`, ClickHouse `toDate('…')` /
 `toDateTime64('…', 6, 'UTC')` — in UTC, as `ch_to_chunk` renders every DateTime it reads, where a literal
 without a zone would be parsed in the server's time zone; no TIME on ClickHouse), TIMESTAMPTZ on PostgreSQL only, strings with the quote doubled everywhere and the
-backslash doubled on MySQL / ClickHouse (a MySQL connection under `NO_BACKSLASH_ESCAPES` is refused at
-discovery), ROW / ARRAY on PostgreSQL and ClickHouse. Anything else (INTERVAL, UUID, BLOB, …) is
-`unimplemented_yet`, which the federation's operators answer with the engine's own plan.
+backslash doubled on MySQL / ClickHouse (a MySQL session under `NO_BACKSLASH_ESCAPES` is refused when
+the agent opens it) and on PostgreSQL inside an escape string constant `E'…'` — only for a value that
+holds a backslash, the plain `'…'` otherwise —, which the server reads the same under
+`standard_conforming_strings` on and off, ROW / ARRAY on PostgreSQL and ClickHouse, an ENUM as its label
+(a string literal: against a PostgreSQL ENUM column it takes the column's type, so it compares in the
+declaration order as the engine does; a MySQL ENUM / ClickHouse Enum column is text in the catalog,
+and the label the text the engine compares). Anything else (INTERVAL, UUID, BLOB, …) is
+`unimplemented_yet`, so the backend actor does not take that block in its offer and the engine evaluates it:
+the offer's probe (`placeholders`) writes a bound value as `?` but writes it once more into nothing first,
+so it refuses exactly what the run with the value would (only a parameter of kind execution, unknown
+there, is not checked).
 
 **Expressions.** One pair of recursive writers covers every clause: `write_operand` for a
 `param_storage` operand (key / bound parameter / nested expression) and `write_expr` dispatching on
@@ -88,9 +96,12 @@ Notable dialect points:
 - `/` over the validated tree whose result type is integral is integer division as the engine computes
   it (truncation toward zero): PostgreSQL `/`, MySQL `DIV`, ClickHouse `intDiv(a, b)`; over the parser's
   tree it is written as written;
-- SQL LIKE arrives as a `regexp_like` function call carrying the LIKE pattern and its flags, so it is
-  written as `[NOT] LIKE` / `[NOT] ILIKE` (MySQL, which has no ILIKE, gets `LOWER(...) LIKE LOWER(...)`
-  for the case-insensitive form); a real regular expression is `unimplemented_yet`;
+- SQL LIKE arrives as a `like_match` call (subject, pattern, mode bits: glob, case-insensitive,
+  negate), so it is written as `[NOT] LIKE` / `[NOT] ILIKE` (MySQL, which has no ILIKE, gets
+  `LOWER(...) LIKE LOWER(...)` for the case-insensitive form); a mode without glob (a regular
+  expression) is `unimplemented_yet`;
+- `x = ANY(<list>)` / `x <> ALL(<list>)` is `x IN (…)` / `x NOT IN (…)` (an empty list FALSE / TRUE, a
+  NULL list `IN (NULL)`);
 - `CAST` takes each dialect's own target-type spelling (MySQL `SIGNED` / `UNSIGNED` / `CHAR`, not a
   column type), and `TRY_CAST` is `unimplemented_yet`. Over the validated tree a numeric CAST is never
   dropped as such (a user's `CAST(a AS DOUBLE) / CAST(b AS DOUBLE)` must not become integer division):
@@ -100,16 +111,33 @@ Notable dialect points:
   written where the dialect's CAST does the same: PostgreSQL every numeric cast (`int2` / `int4` / `int8`
   / `float4` / `float8` / `numeric(p, s)`; an unsigned, 1-byte or 16-byte target only when lossless),
   MySQL / ClickHouse only the lossless and converting ones (`SIGNED` / `UNSIGNED` / `DECIMAL(p, s)` with
-  s ≤ 30 — MySQL's limit — / `DOUBLE`, `Int64` / `Decimal(p, s)` / `Float64`, …). A narrowing cast there is `unimplemented_yet`
+  s ≤ 30 — MySQL's limit — / `DOUBLE`, `Nullable(Int64)` / `Nullable(Decimal(p, s))` / `Nullable(Float64)`, …:
+  every ClickHouse CAST target is `Nullable(T)`, since a CAST into a bare `T` refuses a NULL, Code 349, and
+  `isNull` over it folds to 0; a target is always a scalar, never an Array / Tuple / Map). A narrowing cast there is `unimplemented_yet`
   (MySQL's CAST does not narrow and rounds ties away from zero, ClickHouse's wraps and truncates), and the
-  expression stays in the engine (the rule's `placeholders` probe, which knows no parameter's type,
+  expression stays in the engine (the offer's `placeholders` probe, which knows no parameter's type,
   leaves a CAST of a parameter to the operator's generation with the values). A lossless cast that is a
   comparison's operand is written as its
   operand (`CAST(a AS BIGINT) = 5` → `a = 5`): that is the validator's cast between two widths, and
   every dialect compares them exactly;
+- an UPDATE assignment's narrowing cast (`write_assignment_cast`): otterbrix wraps a SET value not of its
+  column's type in a `cast_kind::cast` to that type (OTB-assignment-cast: unmarked, so the topmost cast
+  of a SET value to the column's own type is taken as it — a user's CAST there is the same cast for a
+  number). Where `numeric_cast_target` has no spelling, the store into the column range-checks:
+  MySQL — an integer into a narrower integer, a DOUBLE into FLOAT — gets the value uncast and
+  `statement_needs_t::strict_store` (the agent runs it only on a strict `sql_mode`, whose store refuses
+  an out-of-range value, ER 1264, and rounds a DOUBLE to the nearest FLOAT; a bound DOUBLE the engine
+  takes needs no strict mode); ClickHouse an integer `if(isNull(x), NULL, accurateCast(x, 'Nullable(T)'))`
+  (CANNOT_CONVERT_TYPE out of range; accurateCast alone also range-checks the value ClickHouse computes
+  under a NULL from the column's default 0 — `i + 3000000000` over a NULL row — so a NULL is kept NULL
+  before it, as the engine keeps it; `if` evaluates each branch only for its rows and is Nullable(T)), a
+  DOUBLE into Float32 only a
+  bound value (`CAST(v AS Float32)`; ClickHouse's conversion checks no range). A bound DOUBLE out of
+  FLOAT's range is `numeric_value_out_of_range`, a fraction into an integer stays refused;
 - unary minus over a negative literal is `(- -5)`: `--` opens a comment in every dialect;
-- `UPDATE ... FROM` / `DELETE ... USING` are pushed down when the plan's source child is a plain
-  table of the same server (the pushdown rule checks it) and `target.from_name` names it: PostgreSQL `UPDATE t SET … FROM s` /
+- `UPDATE ... FROM` / `DELETE ... USING` are generated when the plan's source child is a plain
+  table of the same server and `target.from_name` names it (the backend actor fills it from the
+  block's source): PostgreSQL `UPDATE t SET … FROM s` /
   `DELETE FROM t USING s`, MySQL the multi-table `UPDATE t, s SET t.c = …` / `DELETE t FROM t, s`
   (the plan's join condition is the WHERE, so the comma forms are the faithful ones), with every
   column qualified by the table its key's side names. A source on another backend or a local one, a
@@ -123,11 +151,11 @@ Converts raw backend results or file bytes into Otterbrix `data_chunk_t`:
 
 | File | Input type | Output |
 |------|-----------|--------|
-| `mysql_to_chunk` | `boost::mysql::results` of a SELECT (a DML's count is the backend's write) | `result_wrapper_t<data_chunk_t>` (`conversion_failure` on a MySQL column type without a mapping) |
-| `mysql_to_struct` (same file) | `boost::mysql::results` | `result_wrapper_t<complex_logical_type>` (schema only). The STRUCT of the chunk's own types, so discovery and execute answer off ONE table: each arm of `to_local_translator` names both the engine type and the reader of its values. Every MySQL column type has an arm — DECIMAL(p, s) of at most 38 digits as the engine's DECIMAL(p, s) (p from the column definition's display length less the point and the sign, s its `decimals`; the digits read off the text the wire sends, a value past the precision `conversion_failure`), a wider DECIMAL (MySQL takes 65) as its exact text, the date/time family and JSON/ENUM/SET as the text MySQL prints (no wire frontend can encode a DATE/TIMESTAMP), BINARY/VARBINARY/BLOB/GEOMETRY as their bytes, BIT as the UBIGINT the wire sends — except `column_type::unknown`, which is `conversion_failure` in both paths rather than a guess |
-| `pg_to_chunk` | `PGresult*` of a SELECT (a DML's count is the backend's write, never read through here) | `result_wrapper_t<data_chunk_t>` (`conversion_failure` on a value with no reading as its column's type). NUMERIC(p, s) of at most 38 digits (its typmod, `PQfmod`) is the engine's DECIMAL(p, s), NaN its DECIMAL NaN; every other NUMERIC — wider, a scale outside 0..p (PostgreSQL 15), and the unconstrained NUMERIC, whose values each keep their own scale and up to 131072 digits (also what PostgreSQL answers for SUM(bigint) / AVG) — is its exact text: no DECIMAL(38, s) holds it without rounding or overflowing, and DOUBLE would round past 15 digits |
+| `mysql_to_chunk` | `boost::mysql::results` of a SELECT (a DML's count is the backend's write) | `result_wrapper_t<data_chunk_t>` (`unimplemented_yet` on a MySQL column type without a mapping; a value with no reading as its column's type `invalid_text_representation`, past its range `numeric_value_out_of_range`) |
+| `mysql_to_struct` (same file) | `boost::mysql::results` | `result_wrapper_t<complex_logical_type>` (schema only). The STRUCT of the chunk's own types, so discovery and execute answer off ONE table: each arm of `to_local_translator` names both the engine type and the reader of its values. Every MySQL column type has an arm — DECIMAL(p, s) of at most 38 digits as the engine's DECIMAL(p, s) (p from the column definition's display length less the point and the sign, s its `decimals`; the digits read off the text the wire sends, a value past the precision `numeric_value_out_of_range`), a wider DECIMAL (MySQL takes 65) as its exact text, the date/time family and JSON/ENUM/SET as the text MySQL prints (no wire frontend can encode a DATE/TIMESTAMP), BINARY/VARBINARY/BLOB/GEOMETRY as their bytes, BIT as the UBIGINT the wire sends — except `column_type::unknown`, which is `unimplemented_yet` in both paths rather than a guess |
+| `pg_to_chunk` | `PGresult*` of a SELECT (a DML's count is the backend's write, never read through here) | `result_wrapper_t<data_chunk_t>` (`invalid_text_representation` on a value with no reading as its column's type, `numeric_value_out_of_range` past its range). NUMERIC(p, s) of at most 38 digits (its typmod, `PQfmod`) is the engine's DECIMAL(p, s), NaN its DECIMAL NaN; every other NUMERIC — wider, a scale outside 0..p (PostgreSQL 15), and the unconstrained NUMERIC, whose values each keep their own scale and up to 131072 digits (also what PostgreSQL answers for SUM(bigint) / AVG) — is its exact text: no DECIMAL(38, s) holds it without rounding or overflowing, and DOUBLE would round past 15 digits |
 | `decimal_text.hpp` | — | `decimal_type(p, s, alias)` (inline: the engine's DECIMAL(p, s) when it can declare one: 1 ≤ p ≤ 38, 0 ≤ s ≤ p), shared by the three translators. A backend's decimal text is read with the engine's own parse, `components::casts::kernels::detail::parse_decimal(text, p, s, &out)` (`<components/casts/kernels/string_cast.hpp>`: the unscaled integer at scale s, a longer fraction rounded half away from zero, a value past p digits refused), in `mysql_to_chunk`, `pg_to_chunk` and the federation's `conform_to_result` |
-| `ch_to_chunk` | ClickHouse blocks of a SELECT + the declared types (`system.columns` type strings) by result position: the type of the table column each result column reads as it is (`ClickhouseManager::declared_types_for` over `federation::scan_request_t::columns`: a pushed statement's columns come from several tables under names of the statement's own) | `result_wrapper_t<data_chunk_t>`. A column's type is its override's (`Nullable(T)`, `LowCardinality(T)`, `SimpleAggregateFunction(f, T)` → `T`; `Bool` → BOOLEAN; `Array(T)` → a LIST of `T` whose rows keep their own length; `Tuple` → STRUCT; Decimal(P, S) / Decimal32 / 64 / 128 of at most 38 digits → DECIMAL(P, S) holding the wire's unscaled integer, a result column of another width under a Decimal column's name keeping the wire's; DateTime64, Enum, IPv4/6, Int128/UInt128, Time, Map, … → STRING) when the wire column is a representation of it — the same type up to Nullable / LowCardinality / SimpleAggregateFunction, Tuple field names and `Bool` over the wire's UInt8 — and the wire type's otherwise: a result column that only reads like a table column (`AVG(x) AS x` is Float64, `toString(id) AS id` String, `count() AS x` UInt64, `x + 1 AS x` Int64) is not that column. `ch_to_struct(res, block, named_type_overrides)` gives discovery the same answer for its probe (the table's columns under their own names, the overrides keyed by name). Every value is read as that type, never handed to the engine under another (rc-3's `set_value` aborts on one): `Bool` from the wire's UInt8, and under STRING the text of any wire scalar that has one — Date / Date32 `YYYY-MM-DD` (from the day number, `RawAt`), DateTime / DateTime64(p) `YYYY-MM-DD hh:mm:ss` with p fraction digits in UTC (the column's timezone is not applied), Time / Time64 `[-]hh:mm:ss[.f]`, Int128 / UInt128 decimal, Enum the item's name, IPv4 / IPv6 via `inet_ntop`, UUID, numbers. A value with no reading as its column's type — Map, the geo types, Nothing, an Enum value outside its items, a DateTime64 outside the years 0000–9999 — is `conversion_failure` naming the column, not a placeholder; a NULL is NULL whatever its wire type |
+| `ch_to_chunk` | ClickHouse blocks of a SELECT + the declared types (`system.columns` type strings) by result position: the type of the table column each result column reads as it is (the agent passes the actor's `remote_type` of each column the statement reads: a pushed statement's columns come from several tables under names of the statement's own) | `result_wrapper_t<data_chunk_t>`. A column's type is its override's (`Nullable(T)`, `LowCardinality(T)`, `SimpleAggregateFunction(f, T)` → `T`; `Bool` → BOOLEAN; `Array(T)` → a LIST of `T` whose rows keep their own length; `Tuple` → STRUCT; Decimal(P, S) / Decimal32 / 64 / 128 of at most 38 digits → DECIMAL(P, S) holding the wire's unscaled integer, a result column of another width under a Decimal column's name keeping the wire's; DateTime64, Enum, IPv4/6, Int128/UInt128, Time, Map, … → STRING) when the wire column is a representation of it — the same type up to Nullable / LowCardinality / SimpleAggregateFunction, Tuple field names and `Bool` over the wire's UInt8 — and the wire type's otherwise: a result column that only reads like a table column (`AVG(x) AS x` is Float64, `toString(id) AS id` String, `count() AS x` UInt64, `x + 1 AS x` Int64) is not that column. `ch_to_struct(res, block, named_type_overrides)` gives discovery the same answer for its probe (the table's columns under their own names, the overrides keyed by name). Every value is read as that type, never handed to the engine under another (rc-3's `set_value` aborts on one): `Bool` from the wire's UInt8, and under STRING the text of any wire scalar that has one — Date / Date32 `YYYY-MM-DD` (from the day number, `RawAt`), DateTime / DateTime64(p) `YYYY-MM-DD hh:mm:ss` with p fraction digits in UTC (the column's timezone is not applied), Time / Time64 `[-]hh:mm:ss[.f]`, Int128 / UInt128 decimal, Enum the item's name, IPv4 / IPv6 via `inet_ntop`, UUID, numbers. A value with no reading as its column's type — Map, the geo types, Nothing, an Enum value outside its items, a DateTime64 outside the years 0000–9999 — is `datatype_mismatch` naming the column, not a placeholder; a NULL is NULL whatever its wire type |
 | `parquet_to_chunk` / `parquet_to_struct` | parquet file, buffer or stream | `result_wrapper_t<std::pmr::vector<data_chunk_t>>` (a run, as `arrow_to_chunk` cuts it) / `result_wrapper_t<complex_logical_type>` (via Arrow + snappy/brotli/zlib/lz4/zstd) |
 | `csv_to_chunk` | csv file, buffer or stream | `result_wrapper_t<std::pmr::vector<data_chunk_t>>` (a run) |
 | `ndjson_to_chunk` | ndjson file, buffer or stream | `result_wrapper_t<std::pmr::vector<data_chunk_t>>` (a run; TableReader; LSan note: Arrow's `BackgroundGenerator` worker thread races during teardown — suppressed in `tsan.supp`) |
@@ -144,8 +172,8 @@ federation's backend actor hands the engine page by page (`backend_actor_t::next
 `data_chunk_t::partial_copy` windows of at most 1024 rows, slices of the source's
 reference-counted buffers, so no row is copied). A column-less chunk is never cut: a
 zero-column window would be the engine pipeline's drain sentinel. The translators of a
-backend answer read only a SELECT (a scan); a remote write's count is the backend's `write`
-(`federation/CLAUDE.md`). `tests/unit/translators/test_chunk_windows.cpp` pins the loaders'
+backend answer read only a SELECT (a scan, a RETURNING); a remote write's count is the
+backend's (`federation/CLAUDE.md`). `tests/unit/translators/test_chunk_windows.cpp` pins the loaders'
 runs and the backend pages per source (2500 rows), `tests/system/test_backend_managers.cpp`
 and `tests/federation/` the federation's pages through a real engine's cursor.
 
@@ -154,8 +182,8 @@ body Arrow cannot parse `invalid_text_representation`, a type without a reading
 `unimplemented_yet`, a value past its type `numeric_value_out_of_range`, a
 broken Arrow step `internal_error`, a bad argument `invalid_parameter`. `translators/error.hpp` holds the
 `make_error` / `arrow_error` helpers that build those `core::error_t` values on
-the caller's resource (`tsl::make_error` is also the one the federation, the
-catalog's metadata plans and the engine requests build their errors with).
+the caller's resource (`tsl::make_error` is also the one the federation's agents, the
+engine requests and the s3 / file managers build their errors with).
 
 The file-format loaders all take a `std::pmr::memory_resource*` and route every
 allocation through it — Arrow's own buffers included: every reader, builder,
@@ -186,8 +214,7 @@ snappy-compressed row groups of up to `parquet_row_group_rows` (128 Ki) rows.
 **Lifetime trap:** the returned chunks keep that
 resource alive — if you borrow the engine's resource (`engine_t::resource()`), the chunk
 must die *before* the engine does, otherwise `synchronized_pool_resource`
-deallocate sees freed memory (caught by TSan in
-`tests/system/test_file_ingestion.cpp` previously).
+deallocate sees freed memory (`tests/system/test_file_ingestion.cpp`).
 
 `translators/internal/doc_to_chunk.cpp` handles conversion from Otterbrix document cursor rows.
 
@@ -195,7 +222,7 @@ deallocate sees freed memory (caught by TSan in
 
 | File | Output |
 |------|--------|
-| `chunk_to_arrow` | `to_arrow_schema(res, types)` / `to_arrow_schema(res, struct_t)` → `result_wrapper_t<shared_ptr<arrow::Schema>>` (`conversion_failure` on a type without an Arrow mapping; DATE → date32, TIME → time64[us], TIMESTAMP → timestamp[us], TIMESTAMP_TZ → timestamp[us, UTC], as otterbrix's exporter writes them). `chunk_to_record_batch(res, chunk)` (frontends, FlightSQL) and `chunk_to_file_batch(res, chunk)` (the csv / parquet writers): BOOLEAN, the integers, FLOAT, DOUBLE and the temporal types are written by otterbrix's `to_arrow_array` (temporal values moved to Arrow's epoch — no builder ever writes them) and imported with `arrow::ImportRecordBatch`; `chunk_to_file_batch` writes STRING through it too, as `large_utf8`, while `chunk_to_record_batch` keeps STRING on a utf8 builder because that is what the advertised FlightSQL schema says. DECIMAL / HUGEINT (sentinel and precision refusals, `to_arrow_decimal`) and NA always stay on builders, which allocate on `arrow_pool(res)`; the exporter's buffers are otterbrix's own `malloc`'d memory, not `res` |
+| `chunk_to_arrow` | `to_arrow_schema(res, types)` / `to_arrow_schema(res, struct_t)` → `result_wrapper_t<shared_ptr<arrow::Schema>>` (`unimplemented_yet` on a type without an Arrow mapping; DATE → date32, TIME → time64[us], TIMESTAMP → timestamp[us], TIMESTAMP_TZ → timestamp[us, UTC], as otterbrix's exporter writes them). `chunk_to_record_batch(res, chunk)` (frontends, FlightSQL) and `chunk_to_file_batch(res, chunk)` (the csv / parquet writers): BOOLEAN, the integers, FLOAT, DOUBLE and the temporal types are written by otterbrix's `to_arrow_array` (temporal values moved to Arrow's epoch — no builder ever writes them) and imported with `arrow::ImportRecordBatch`; `chunk_to_file_batch` writes STRING through it too, as `large_utf8`, while `chunk_to_record_batch` keeps STRING on a utf8 builder because that is what the advertised FlightSQL schema says. DECIMAL / HUGEINT (sentinel and precision refusals, `to_arrow_decimal`) and NA always stay on builders, which allocate on `arrow_pool(res)`; the exporter's buffers are otterbrix's own `malloc`'d memory, not `res` |
 | `chunk_to_parquet` | `chunk_to_parquet(res, chunks, path)` → `result_wrapper_t<bool>` (snappy/brotli/zlib/lz4/zstd via Arrow) |
 | `chunk_to_csv` | `chunk_to_csv(res, chunks, path)` → `result_wrapper_t<bool>` |
 | `chunk_to_ndjson` | `chunk_to_ndjson(res, chunks, path)` → `result_wrapper_t<bool>`; DATE / TIME / TIMESTAMP / TIMESTAMP_TZ as otterbrix's own text (`core::date::to_string`, a JSON string) |
@@ -212,9 +239,8 @@ extension when `format=` is omitted).
 
 - `sql_plan` — one bookkeeping SQL statement through the engine's own parser and transformer.
 - `send_plan` — one plan on a session. (A statement that failed before the engine is reported by the query session itself, `manager_dispatcher_t::refuse_statement`, so it fails an open transaction.)
-- `execute_statement` — runs a parsed statement and holds the answer to the shape its root owes: a DML without RETURNING answers its count through `cursor->affected_rows()` (a write to a remote table too: the backend's count when the pushdown rule made it one remote statement, otherwise the rows the engine handed the storage's sink — for an UPDATE / DELETE equal to the sum the backend reported, each row statement having to change exactly one row; `federation/CLAUDE.md`), a row-producing statement without columns is `schema_error`.
-- `describe` — the result schema without execution: the engine's plan-only EXPLAIN when every parameter is bound and the statement is not a set operation (a remote table's columns come from `federation.remote_columns`; no backend is asked), else the federated computation over one probe per relation the root reads — a `LIMIT 0` read (`schema_probe.hpp`) for a local one, `probe_declared_columns` (a plan-only EXPLAIN of a read of the full name) for a remote one, positional. The engine always answers a cursor (asserted).
-- `create_table_plan` / `load_table` — the load behind CREATE EXTERNAL TABLE, on the session it is given (the query session passes its connection's): CREATE TABLE of the target as written (1–4 parts, its empty slots the session's place; the database is not created, a missing schema and an existing relation are the engine's refusals — `table_already_exists`), a column without a name `invalid_parameter`; then the insert of the loader's run (node_insert named on the node, the write target looked up, each chunk within the chunk contract); `own_block` wraps both in BEGIN / COMMIT, ROLLBACK on a failure, the answer carrying the status the session is left in.
+- `execute_statement` — runs a parsed statement (`ExecutionPlanPtr`) and holds the answer to the shape its root owes: a DML without RETURNING answers its count through `cursor->affected_rows()` (a write to a remote table too: the backend's count for a statement the backend actor ran whole, otherwise the rows the engine handed the storage; `federation/CLAUDE.md`), a row-producing statement without columns is `internal_error`. Every cursor carries the engine's transaction status and window (`transaction_status()`, `portal_id()`, `has_more()`). A describe is the engine's own (`session/CLAUDE.md`).
+- `create_table_plan` / `load_table` — the load behind CREATE EXTERNAL TABLE, on the session it is given (the query session passes its connection's): CREATE TABLE of the target as written (1–4 parts, its empty slots the session's place; the database is not created, a missing schema and an existing relation are the engine's refusals — `table_already_exists`), a column without a name or an empty run `invalid_parameter`; then the insert of the loader's run (each chunk within the chunk contract); `own_block` wraps both in BEGIN / COMMIT, ROLLBACK on a failure, the answer carrying the status the session is left in.
 
 The engine evaluates aggregates over constants correctly, so no plan rewrite or guard stands in front of it (`tests/system/test_constant_aggregates.cpp` pins the engine's answers). `tests/system/test_engine_requests.cpp` and `tests/system/test_external_registration.cpp` cover these over a real engine.
 
@@ -227,4 +253,4 @@ The engine evaluates aggregates over constants correctly, so no plan rewrite or 
    anonymous namespace: the translators reuse those names inside `tsl`, and with external linkage the linker keeps
    one definition for all of them, so one translator's objects get destroyed with another translator's layout
 3. Register in `otterbrix/CMakeLists.txt` under both `OTTERBRIX_HEADERS` and `OTTERBRIX_SOURCES`
-4. Use the new translator in the relevant `integration/<backend>/connection_manager.cpp`
+4. Use the new translator in the backend agent's read (`otterbrix/federation/backend_agent.cpp`)

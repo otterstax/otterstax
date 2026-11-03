@@ -26,7 +26,8 @@ std::pmr::memory_resource* resource();                          // core::pmr::ot
 pool_t* sessions_scheduler();
 pool_t* backends_scheduler();
 void stop_sessions();                                           // idempotent; ~session_factory_t's shutdown
-// the destructor: stop_sessions, then the backends pool (stopped there, once)
+void stop_backends();                                           // idempotent; ~remote_backends_t's shutdown
+// the destructor: stop_sessions, then stop_backends (each pool stopped once)
 ```
 
 `pool_t` is `actor_zeta::scheduler::sharing_scheduler` (otterbrix's `actor_zeta::shared_work`).
@@ -35,8 +36,7 @@ void stop_sessions();                                           // idempotent; ~
   `runtime_t` builds them and never starts or stops them: `open_engine` starts them,
   and the engine's shutdown stops them. An actor-zeta pool cannot be restarted.
   `scheduler_t::start` appends a second set of workers, and `stop()` on a pool that
-  was never started indexes an empty vector (asked of actor-zeta as AZ-pool-lifecycle;
-  the engine stopping its pools at all waits for AZ-teardown, actor-zeta#187 —
+  was never started indexes an empty vector (asked of actor-zeta as AZ-pool-lifecycle,
   `docs/proposals/actor-zeta.md`). So the three pools serve **one** engine.
   `engine_t::open` lends them (`fresh → lent`) and the engine's destructor spends them
   (`lent → spent`); a refused open spends them too, unstarted (`lent → spent`). A
@@ -46,35 +46,28 @@ void stop_sessions();                                           // idempotent; ~
   flag: the lend refusal needs "ever lent" (lent or spent), the abort needs "lent and
   not spent".
 - **sessions** runs one `query_session_t` actor per client connection
-  (`session/CLAUDE.md`). **backends** runs the federation's statements of the
-  three backends (`remote_backends_options_t::statements` =
-  `backends_scheduler()`: the connection checkout and the wait for a backend's
-  answer, off the engine's executors; `integration/statement_executor.hpp`); their
-  `discover` / `execute_ddl` run on the calling thread and the
-  connectors do their I/O on the asio io pools their connector managers own — not
-  a `runtime_t` pool: `remote_backends_t` sizes them from
-  `service.runtime.connector_io` (`config/CLAUDE.md`). Both are started in the
-  constructor, backends first; `stop_sessions` (public) and the destructor (the
-  backends pool, stopped once there) join them, and the two are stopped at opposite
-  ends of the shutdown:
-  - **sessions** before its actors are freed: `~session_factory_t` stops it once
-    the closed sessions drained and before it reaps what is left (no pool thread
-    may resume a freed session);
-  - **backends** after the backends are gone: a backend's statement executor
-    waits, when destroyed, for every job it posted, and a scheduler drops queued
-    jobs at `stop()`, so the pool runs until `remote_backends_t` is destroyed —
-    after the engine — and stops in `~runtime_t`.
+  (`session/CLAUDE.md`). **backends** runs the agents of the remote connections
+  (`remote_backends_options_t::runtime`; one agent per physical connection, each
+  statement on one of its threads for the whole remote call, the connector's
+  `io_context` run there — `otterbrix/federation/CLAUDE.md`). Both are started in
+  the constructor, backends first, and stopped at opposite ends of the shutdown
+  (a second `stop()` of an actor-zeta pool waits forever, so each is stopped once):
+  - **sessions** before its actors are freed: `~session_factory_t` calls
+    `stop_sessions` once the closed sessions drained and before it reaps what is
+    left (no pool thread may resume a freed session);
+  - **backends** by `~remote_backends_t` (after the engine): it cancels every
+    agent, calls `stop_backends`, then destroys the actors and their agents — once
+    the pool stopped no agent job runs or waits.
 
   The destructor stops whatever is still running.
 - Sizes come from `service.runtime`. `threads: 0` means `max(2, hardware threads)`
   (`resolve_threads`) for sessions. For backends `main.cpp` resolves 0 before it
   builds the runtime (`backends::backends_threads`): at least that and at least
   the sum of `pool_size` over every remote connection of `connections:`. **A
-  statement holds a backends thread for its whole remote call** (the connection
-  checkout, then the wait for the backend's answer), so the pool is what isolates
-  the connections from each other: with fewer threads than connections the
-  surplus connections idle, and one slow alias whose statements hold every thread
-  stalls the others — even those with free connections. An explicit
+  statement holds a backends thread for its whole remote call**, so the pool is
+  what isolates the connections from each other: with fewer threads than agents
+  the surplus agents idle, and one slow alias whose statements hold every thread
+  stalls the others — even those with free agents. An explicit
   `backends.threads` is taken as is; below the sum of `pool_size`
   `backends_threads` logs a warning saying so (logger `BACKENDS`). The engine pools default to 3 threads; every pool takes
   1000 messages per actor before it yields its thread (`max_throughput`, a constant of
@@ -118,21 +111,19 @@ configuration::config make_engine_configuration(const config::EngineConfig&);
   exec / disk stop. The runtime then marks its engine pools spent.
 - **`primitives`** are the host's backend map (`components/planner/host_hooks.hpp`):
   `backend_address_t{connection, address, max_rows_per_write}` for every configured
-  connection, all on the one backend actor (`federation::backend_actor_t`). `open_engine`
+  connection, each on that connection's backend actor (`federation::backend_actor_t`). `open_engine`
   reads it once and every executor copies it, so the array need not outlive the call,
-  but the actor must outlive the engine. Empty is an engine with no connection (a
+  but the actors must outlive the engine. Empty is an engine with no connection (a
   statement reaching a connection's database is refused, the engine runs on). The
   server opens the engine with `remote_backends_t::primitives()` after
-  `remote_backends_t::open` spawned the actor — over every configured connection,
-  reachable or not; the test stacks open it the same way. otterbrix takes no host
-  optimizer rule and no name-resolution hook any more.
+  `remote_backends_t::open` spawned the actors — one per configured connection,
+  reachable or not; the test stacks open it the same way.
 - **Pools**: `open_engine` refuses a null pool, a pool with no worker, and two roles on
   one pool (`refuse_host_arguments`); `runtime_t` lends three distinct pools (general /
   exec / disk), apart from the sessions and backends pools.
 - **`make_engine_configuration`**: `main_path` (the locked directory), the WAL and
   the tables are `data_dir`; the log is `config::log_directory` (`log_dir`, else
-  `data_dir`). This is the single-directory layout the server always used, with one
-  fix: `main_path` is no longer the process's working directory. The log level is
+  `data_dir`), never the process's working directory. The log level is
   `SPDLOG_ACTIVE_LEVEL`, the compile-time level of otterstax's own loggers
   (`utility/logger.hpp`; default `ERROR`), not otterbrix's `trace`. Everything else —
   the execution knobs — is otterbrix's own default.
@@ -151,13 +142,10 @@ configuration::config make_engine_configuration(const config::EngineConfig&);
   engine's lines land in that file. If nobody initialized `Main` (a test), the
   function initializes it under `directory` first.
 - The logger is never registered with spdlog. Each engine owns its own logger, and
-  `spdlog::set_level` / `initialize_all_loggers` never touch it. This matches the
-  migration doc, decision 9.
+  `spdlog::set_level` / `initialize_all_loggers` never touch it.
 - Failures come back as `io_error` / `invalid_parameter` on `new_delete_resource`.
   No exception leaves it. It is local to `engine.cpp`: `engine_t::open` is its
   one caller, and the tests reach it through it.
-- Before this, the engine wrote through `make_log("otterbrix", log.path)`, which had
-  its own stdout sink and its own `otterbrix-<seconds>.txt`.
 
 ## Startup / shutdown order (`main.cpp`)
 
@@ -165,14 +153,14 @@ configuration::config make_engine_configuration(const config::EngineConfig&);
 command line, config::load_config → ServiceConfig{ engine, runtime, … }   (failures → stderr)
 initialize_all_loggers(config::log_directory(server_config.engine))   — log_dir, else data_dir
 runtime_t runtime(server_config.runtime, backends.threads resolved by backends::backends_threads)
-remote_backends_t(runtime.resource(), {.statements = runtime.backends_scheduler()}).open(connections, retry)
-                                     → connections discovered, the backend actor spawned over every one
+remote_backends_t(runtime.resource(), {.runtime = &runtime}).open(connections, retry)
+                                     → per connection: pool_size agents, the discovery, a backend actor
                                        (an unreachable one included); an error → log, return 1
 auto engine = engine_t::open(runtime, server_config.engine, remote->primitives())   → error: log, return 1
 s3 connector, FileManager, S3Manager, KafkaManager spawned (main's locals, after the engine)
 backends::register_s3_aliases, backends::register_remote_tables (the discovery into the
 engine's catalog, no SQL to a backend; an error → return 1), kafka->recover()
-session_factory_t(runtime, &make_parser, make_session_services(…, remote->connections(), remote->actor()))
+session_factory_t(runtime, &make_parser, make_session_services(…, kafka->object_names(), remote->connections()))
                                      → query sessions on runtime.sessions_scheduler()
 the four servers over the factory; start, flight->run()
 ── shutdown (the reverse of the declarations) ──
@@ -180,8 +168,8 @@ servers destroyed (each stops in its destructor; their sessions closed)
 ~session_factory_t: sessions drain (30 s) → runtime.stop_sessions() → reap
 Kafka, S3, file, s3 connector destroyed (Kafka first)
 engine destroyed (final CHECKPOINT, engine pools stopped)
-remote backends destroyed (the backend actor's loop first, then the backends' statement jobs on the backends pool drained, connector managers)
-runtime destroyed (backends pool stopped, memory)
+remote backends destroyed (agents cancelled → runtime.stop_backends() → the actors and their agents)
+runtime destroyed (memory; a pool still running stopped first)
 ```
 
 ## Tests
@@ -190,7 +178,7 @@ runtime destroyed (backends pool stopped, memory)
 
 - runtime start (`stop_sessions` idempotent, the destructor stopping the rest) with no engine, the pool sizes, the resolved auto size;
 - engine reopen on the same directory, data present;
-- a second engine on a locked directory refused as `already_exists`, not abort; the
+- a second engine on a locked directory refused as `lock_file_exists`, not abort; the
   refusal spends that runtime's pools (a second open on it refused) and the directory
   opens afterwards on a new runtime;
 - one runtime hosts one engine, then its pools are spent;
@@ -208,6 +196,6 @@ runtime destroyed (backends pool stopped, memory)
 
 ## Tracy
 
-`runtime_t` ctor/dtor, `stop_sessions`, `engine_t::open`,
+`runtime_t` ctor/dtor, `stop_sessions`, `stop_backends`, `engine_t::open`,
 `~engine_t`, `execute_plan_blocking`, `make_engine_configuration`, `make_engine_log`
 carry `OTX_ZONE_N`. None of them is a coroutine.

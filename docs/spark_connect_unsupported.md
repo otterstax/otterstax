@@ -23,7 +23,7 @@ with that message.
 | An action on the DataFrame of a `spark.sql()` query with no operation on top (`collect()`, `toPandas()`, `show()`, `df.schema`, …) | Runs (or describes) the query through the SQL path — whatever the MySQL / PostgreSQL wires accept, sub-queries and derived tables included |
 | An action on any other DataFrame (`collect()`, `toPandas()`, `count()`, `take()`, `first()`, …) | Translates the DataFrame into an engine plan and executes it |
 | `df.show()` | Renders the rows the way Spark's `showString` does — see [df.show()](#dfshow) |
-| `df.schema`, `df.columns`, `df.dtypes` | Describes the query or the plan without executing it (a backend sees at most a `LIMIT 0` probe) |
+| `df.schema`, `df.columns`, `df.dtypes` | Describes the query or the plan without executing it: the engine describes it from its catalog, no backend is asked |
 | `spark.catalog.*` | Answers from the engine's catalog — see [Catalog](#catalog) |
 
 A statement `spark.sql()` cannot parse is refused when it is called
@@ -37,17 +37,21 @@ the [chain](#chaining-operations). `spark.sql()` with `args` is not supported:
 the arguments are not bound. `spark.sql()` over DataFrame arguments is refused
 (`spark.sql() over DataFrame arguments is not supported`).
 
-Every request runs in a fresh OtterStax session: nothing is kept per Spark
-session (no temporary views, no current database, no runtime configuration).
+Every Spark session has one OtterStax session, opened by its first request and
+closed by `ReleaseSession` or after `service.spark_connect.session_timeout_s`
+without a request: its place (`SET search_path`, `main.public` at the start) and
+an open transaction last across its `spark.sql()` statements. Nothing else is
+kept per Spark session (no temporary views, no runtime configuration).
 
 ## Reading data
 
 - `spark.table(name)` / `spark.read.table(name)` — the name is read the way SQL
-  reads it: `t` (a table created without a database), `db.t` (a local table),
-  `alias.db.t` and `alias.db.schema.t` (a table of the backend registered as
-  `alias`; in the three-part form the database also stands for the schema, so
-  name a PostgreSQL table with four parts). Backticks quote a part that contains
-  a `.`.
+  reads it: `t`, `s.t` and `d.s.t` are local tables (a name with fewer parts is
+  completed by the session's place, `main.public` at the start), `alias.db.schema.t`
+  a table of the backend registered as `alias` (MySQL and ClickHouse have the one
+  schema `public`: `alias.db.public.t`). Three parts never name a backend's table.
+  More than four parts are refused (`improper qualified name (too many dotted
+  names)`). Backticks quote a part that contains a `.`.
 - `spark.range(start, end, step)` — a single `id` column of at most 1024 rows
   (`Spark Range exceeds maximum materialization size (1024 rows)`).
 - Refused: file, JDBC and other format readers (`Spark DataSource reads are not
@@ -245,22 +249,25 @@ Rows reach PySpark as Arrow batches.
 
 ## Catalog
 
-`spark.catalog` is answered from the engine's own catalog, in catalog
-`otterstax`, current database `default`.
+`spark.catalog` is answered from the engine's own catalog (`pg_database`,
+`pg_namespace`, `pg_class`; no backend is asked), in catalog `otterstax`. A Spark
+database is a schema, named as SQL names it.
 
-- **Databases** — every backend connection alias (the engine's mirror of that
-  backend), every local database (`CREATE DATABASE`), and `default`, which holds
-  the tables created without a database.
-- **Tables** — `Table.namespace` is `[alias, db]` for a MySQL or ClickHouse
-  table, `[alias, db, schema]` for a PostgreSQL one, `[db]` for a local table and
-  `[]` in `default`, so `".".join(namespace + [name])` is the name `spark.table()`
-  and SQL read. `tableType` is `MANAGED` for tables and `VIEW` for views and
-  materialized views.
+- **Databases** — `d.s` for the schema `s` of the local database `d`
+  (`main.public` among them), `alias.db.s` for a schema of the database `db` of
+  the backend registered as `alias`. The schemas `pg_catalog` and
+  `information_schema` and the database `federation` (OtterStax's own tables)
+  are hidden. The current database is the session's place
+  (`current_database()`, `current_schema()`).
+- **Tables** — `Table.namespace` is `[d, s]` for a local table and
+  `[alias, db, s]` for a backend's, so `".".join(namespace + [name])` is the name
+  `spark.table()` and SQL read. `tableType` is `MANAGED` for tables and `VIEW`
+  for views and materialized views.
 - **Supported** — `currentCatalog()`, `listCatalogs()`, `currentDatabase()`,
   `listDatabases()`, `getDatabase()`, `databaseExists()`, `listTables()`,
   `getTable()`, `tableExists()`, `listColumns()`, with Spark's name patterns
   (`*`, `|`, case-insensitive). `listTables()` and `tableExists("t")` without a
-  database use `default`; `getTable()` / `tableExists()` / `listColumns()` take
+  database use the current database; `getTable()` / `tableExists()` / `listColumns()` take
   `(name, dbName)` or the qualified name. A name that fits more than one table is
   refused (`spark.catalog: '<name>' names more than one table, name one of them
   in full: ...`).
@@ -276,13 +283,14 @@ Rows reach PySpark as Arrow batches.
 - **Limitations**
   - `nullable` is always true; `description` and `locationUri` are NULL;
     `isTemporary` is false; `tableType` is `MANAGED` for a backend table too.
-  - Kafka STREAMs are not listed, nor are tables in the `public` schema of the
-    engine.
+  - Kafka STREAMs are not listed (a stream has no table).
+  - In a place of a backend's schema the current database is named without the
+    alias: the engine's `current_database()` answers the database alone.
   - A database or schema name containing `:` is split wrongly.
   - The qualified forms cannot name a table whose parts contain `.` or
     backticks, nor take a catalog prefix (`otterstax.db.t`).
-  - The current database cannot be changed.
-  - `listColumns()` of a backend table asks the backend (a `LIMIT 0` probe).
+  - `setCurrentDatabase()` is not supported; `spark.sql("SET search_path = 'd.s'")`
+    changes the place, and with it the current database.
   - The databases and the tables are two reads, not one snapshot: a table
     dropped between them may be missing.
 

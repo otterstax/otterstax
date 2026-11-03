@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Role
 
-`utility/` is a header-only collection of shared primitives used across all layers. There are no `.cpp` files; headers are compiled directly into `lib_otterstax` via the root `CMakeLists.txt`.
+`utility/` is a header-only collection of shared primitives used across all layers. There are no `.cpp` files; each user includes what it needs (`lib_otterstax`, the root `CMakeLists.txt`'s INTERFACE target, lists a few of them).
 
 ## Key Types
 
@@ -14,9 +14,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 (`complex_logical_type`), `chunks` (`std::pmr::vector<data_chunk_t>` — the
 engine caps each chunk at 1024 rows, so a result spans multiple chunks;
 `size()`/`column_count()`/`empty()` accessors span the whole vector),
-`parameter_count`, `NodeTag`, and `affected_rows` (a DML's count, from the
-engine cursor's `affected_rows()`); `reported_rows()` is `size()` for a result
-with columns and `affected_rows` otherwise. Frontends receive it through a typed
+`parameter_count`, `tag`, `affected_rows`, the transaction command it was, a
+prepare's `parameter_types`, a window's `portal` / `has_more` and the settings it
+changed (`setting_changes`, `savepoint`); `reported_rows()` is `size()` for a
+result with columns and `affected_rows` otherwise (see `session/CLAUDE.md`). Frontends receive it through a typed
 future (`actor_zeta::unique_future<core::result_wrapper_t<session_payload>>`)
 returned by a send to their connection's `query_session_t`. The poll-side bridge
 lives at `frontend/common/asio_future_bridge.hpp`.
@@ -24,33 +25,32 @@ lives at `frontend/common/asio_future_bridge.hpp`.
 ### `wait_barrier.hpp`
 
 `otterstax::query_result_t` / `as_query_result` / `spawn_marshaled` /
-`make_failed_future` — the single point where a connector
-result crosses the io_context worker → consumer thread boundary. A live
-exception must never cross it (boost.asio's `use_future` destroys the captured
+`run_with_owned_handler` — the single point where a
+connector result crosses from the io_context to its consumer. A live exception
+must never cross it (boost.asio's `use_future` destroys the captured
 `exception_ptr` on the io thread, racing the consumer's `get()`; TSAN race under
 boost 1.88), so failures are marshalled as **values**: `core::error_t` for
-error-only (`asio_error_t`) handlers, `core::result_wrapper_t<R>` for handlers
-that return data. The connector's `runQuery` already resolves to that outcome
-type; `spawn_marshaled` forwards it through a `std::promise` held by
+error-only (`asio_error_t`, `asio_error.hpp`) handlers, `core::result_wrapper_t<R>`
+for handlers that return data. The connector's `runQuery` already resolves to that
+outcome type; `spawn_marshaled` forwards it through a `std::promise` held by
 `detail::outcome_promise_t`, a by-value coroutine parameter whose destructor
 settles the promise with `io_error` if the frame is destroyed before the body
 ran (io_context torn down or never run) — so `future.get()` never throws
 `broken_promise`. The try/catch around the `co_await` in
 `detail::marshal_outcome` is the driver boundary: an exception raised on the io
 thread becomes an `io_error` value there. `spawn_marshaled`'s first argument
-is whatever `co_spawn` takes — an execution context or an executor: the three
-`ConnectorManager::executeQuery` pass the pool's `io_context`, the MySQL
-connector's `connectWithTimeout` passes its connection's strand executor so the
-coroutine, and every completion handler the awaited `async_connect` derives
-from it (the `cancel_after` deadline timer's included), runs serialized on that
-strand rather than on any pool thread. `run_with_owned_handler<R, Arg>(connector,
-query, handler)` is the awaitable the three `executeQuery` spawn: the handler is a
-by-value coroutine parameter, and the connector's virtual `runQuery` is called from
-that frame, on the io thread, with a `function_ref_t` to the copy — so the handler
-object lives exactly as long as the query, and a caller may pass a temporary or a
-loop-local lambda. The futures `spawn_marshaled` answers do not block on
-destruction (unlike `std::async`): a caller whose handler captures its frame by
-reference waits on the future (`.get()`) before that frame ends.
+is whatever `co_spawn` takes — an execution context or an executor: the backend
+agent passes its own `io_context` (`otterbrix/federation/backend_agent.cpp`), the
+MySQL connector's `connectWithTimeout` its connection's strand executor, so the
+coroutine and every completion handler the awaited `async_connect` derives from it
+(the `cancel_after` deadline timer's included) run serialized on that strand.
+`run_with_owned_handler<R, Arg>(connector, query, handler)` is the awaitable the
+agent spawns: the handler is a by-value coroutine parameter, and the connector's
+virtual `runQuery` is called from that frame with a `function_ref_t` to the copy —
+so the handler object lives exactly as long as the query, and a caller may pass a
+temporary or a loop-local lambda. The futures `spawn_marshaled` answers do not block
+on destruction (unlike `std::async`): a caller whose handler captures its frame by
+reference waits on the future before that frame ends.
 
 ### `function_ref.hpp`
 
@@ -67,20 +67,9 @@ in that coroutine's frame.
 
 `otterstax::parse_port(text, resource)` — the config `port` string →
 `core::result_wrapper_t<uint16_t>`; digits only, 1..65535, otherwise
-`invalid_parameter`. Used by the three `ConnectorManager::addConnection`
-overloads.
-
-### `cv_wrapper.hpp` — deleted
-
-`cv_wrapper_t<T>` / `shared_data<T>` (a `shared_ptr` of mutex + condvar, handed
-to an actor through `actor_zeta::send` and blocked on for up to 90 s) are gone.
-Their last caller, the FlightSQL `GetTables` path, now takes the same route as
-every other frontend: the actor returns
-`core::result_wrapper_t<T>` through the future and the caller awaits it on its
-own asio executor via `frontend/common/asio_future_bridge.hpp`. The behaviours
-the primitive guaranteed are re-asserted against the bridge in
-`tests/unit/utility/test_asio_future_bridge.cpp`. There is no longer any
-supported way to hand shared mutable state to an actor — return a value.
+`invalid_parameter`. Used by the config reader
+(`config/connections/connection_config_reader.cpp`) and by
+`remote_backends_t::open` when it builds the connectors' params.
 
 ### `session.hpp`
 
@@ -90,7 +79,25 @@ session is `components::session::session_id_t`, included where it is used.
 
 ### `thread_pool_manager.hpp`
 
-`thread_pool_manager` — wraps a `boost::asio::io_context` + `std::vector<std::thread>`. Used by each `ConnectorManager` to host async DB operations.
+`thread_pool_manager` — a `boost::asio::io_context` + the `std::thread`s that run it, sized by its
+owner (no default). The wire-protocol frontend servers' asio pools (`frontend/common/frontend_server.hpp`,
+`service.runtime.{mysql,postgres}_io`); the connector tests run their connectors' io_context on one.
+
+### `asio_error.hpp`
+
+`otterstax::asio_error_t` — the return type of an error-only connector handler (the outcome IS the
+error, no payload); `query_result_t` keys off it to marshal a bare `core::error_t`.
+
+### `table_info.hpp`
+
+`table_info` — a table's `qualified_name_t` and its STRUCT schema (`catalog/discovery.hpp`, the Flight SQL
+core).
+
+### `tracy_memory_resource.hpp`
+
+A PMR interposer that reports every upstream slab to Tracy under a named pool (the parser's arena, the
+MySQL / PostgreSQL packet processing). It must outlive every container built over it; the name must
+be a string literal.
 
 ### `logger.hpp`
 
@@ -112,6 +119,6 @@ as its first statement — see the root `CLAUDE.md` Tracy section for the rule.
 
 `Timer` — RAII helper that logs `"<scope> took N µs"` at destruction through
 the provided `log_t`. Used by the `query_session_t` entry points
-(`execute`, `execute_statement`, `prepare_schema`) to
-get free per-query timings in DEBUG builds.
+(`execute`, `execute_prepared_statement`, `prepare_schema`, `execute_plan`,
+`prepare_plan`) to get free per-query timings in DEBUG builds.
 

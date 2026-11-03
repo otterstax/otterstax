@@ -160,8 +160,8 @@ SQL generation for the backends, exercised via `sql_gen::generate_query`.
 #### `generate_query` — one query block per dialect
 
 The query block (the aggregate that reads the remote table, with its clauses) is parsed once by
-`GreenplumParser` before the timing loop — the shape the federation's pushdown rule hands the
-generator (`otterbrix/federation/rules/pushdown.hpp`); only `generate_query` is timed.
+`GreenplumParser` before the timing loop — the shape a backend actor's offer hands the generator
+(`otterbrix/federation/backend_actor_offer.cpp`); only `generate_query` is timed.
 
 | Benchmark | Backend | Block |
 |-----------|---------|-------|
@@ -241,7 +241,7 @@ by const ref). Links `kafka_runtime` (a separate `target_link_libraries` call in
 
 ### Translator benchmark (`bench_translators.cpp`)
 
-1. Use `make_ch_block(N)` + `tsl::ch_to_chunk(res, blocks, {})` (the block in a vector, no declared types) to get a synthetic `data_chunk_t`. It answers `core::result_wrapper_t<data_chunk_t>` (`conversion_failure` for a value with no reading as its column's type): check `has_error()` and end the run with `state.SkipWithError(result.error().what.c_str())` before taking `value()`, as the `BM_ch_to_chunk_*` benchmarks do. A declared type (by result position) applies only to a wire column that represents it (see `otterbrix/CLAUDE.md`).
+1. Use `make_ch_block(N)` + `tsl::ch_to_chunk(res, blocks, {})` (the block in a vector, no declared types) to get a synthetic `data_chunk_t`. It answers `core::result_wrapper_t<data_chunk_t>` (`datatype_mismatch` for a value with no reading as its column's type): check `has_error()` and end the run with `state.SkipWithError(result.error().what.c_str())` before taking `value()`, as the `BM_ch_to_chunk_*` benchmarks do. A declared type (by result position) applies only to a wire column that represents it (see `otterbrix/CLAUDE.md`).
 2. `data_chunk_t` is **non-copyable**. If you need N iterations over the same data, either hold a `clickhouse::Block` outside the loop and call `ch_to_chunk` inside, or redesign to avoid copies.
 3. If the benchmark needs `GreenplumParser` (e.g., testing a path that touches the parser), include `utility/logger.hpp` and add a `LoggerInit` guard as in `bench_parser.cpp` — the parser requires named spdlog loggers to be registered.
 
@@ -254,12 +254,13 @@ by const ref). Links `kafka_runtime` (a separate `target_link_libraries` call in
 ### Query-generation benchmark (`bench_query_gen.cpp`)
 
 1. Add the SQL as a `const char*` fixture: one query block over ONE remote table written with its
-   alias (`alias.db.schema.table`), the shape the federation's pushdown rule hands the generator.
+   alias (`alias.db.schema.table`), the shape a backend actor's offer hands the generator.
 2. `parse_block(parser, sql, uid)` parses it once outside the timing loop and finds the aggregate
-   that reads the uid's table (`block_of`); `bench_block` times `sql_gen::generate_query` over it
+   that reads the connection's table (`block_of`); `bench_block` times `sql_gen::generate_query` over it
    with the block's own target (`statement_target_t{block.node->target()}`) and parameters.
-3. A JOIN or a statement over two servers is not one query block: the pushdown rule never sends it
-   whole, so it is not a generator benchmark.
+3. A statement over two connections is never one statement of a backend, so it is not a generator
+   benchmark; a JOIN of one connection's tables is (a relation the offer takes whole) but has no
+   benchmark yet.
 
 ---
 

@@ -315,18 +315,18 @@ re-running an `external_*` benchmark, which regenerates them.)
 (PostgreSQL frontend, 5 repetitions, medians per sub-test.) `join_same_instance`
 is one remote statement per sub-test: the JOIN of two tables of one server, its
 WHERE included, is pushed down whole. `join_cross_engine` and `join_all` JOIN
-tables of different servers, so the JOIN runs in the engine over a scan of each
-side (see "What the pushdown sends" below). The ClickHouse pairs of
-`join_cross_engine` take about a second because their key types differ
-(ClickHouse `UInt32` against `INT`): the engine has no hash join over keys cast
-to a common type and runs them nested-loop, 5 000 × 5 000 rows
-(OTB-hash-join-cast, `docs/proposals/otterbrix-embedding.md`).
+tables of different servers, so the JOIN runs in the engine over what each
+server takes of its side (see "What the pushdown sends" below). The ClickHouse pairs of
+`join_cross_engine` JOIN keys of different types (ClickHouse `UInt32` against
+`INT`), which the engine hash-joins over a common cast type (OTB-hash-join-cast,
+done in otterbrix #850); the ~1 s in the table was measured before that and wants
+a new run.
 
 ## External-table tests (s3/file)
 
-Three opt-in workloads that exercise the `CREATE EXTERNAL TABLE` / `COPY ... TO`
-grammar extensions — **loading, internal joins and dumps only; no cross-backend
-or JOIN ALL shapes.** Each runs both a local-file (`/fixtures` mount) and an s3
+Five opt-in workloads that exercise the `CREATE EXTERNAL TABLE` / `COPY ... TO`
+grammar extensions — **loading, joins of engine-internal tables and dumps only; no
+backend table takes part.** Each runs both a local-file (`/fixtures` mount) and an s3
 (seeded RustFS) source, so file vs s3 are directly comparable in the sub-test
 breakdown.
 
@@ -453,8 +453,7 @@ count rows. Every Kafka statement is built by a `sql_*` helper at the top of
 
 **First `kafka_*` run needs a client-image rebuild.** `seed_kafka.py` and the
 stream runner import `confluent-kafka`, added to `Dockerfile.benchmark`. If a
-imports `confluent-kafka`, added to `Dockerfile.benchmark`. If a
-`benchmark-client:latest` image from before this change is still cached,
+`benchmark-client:latest` image built without it is still cached,
 run once with `--rebuild` (or `--clear`) so the seed step doesn't fail with
 `ModuleNotFoundError: confluent_kafka`.
 
@@ -522,10 +521,10 @@ Each test gets its own `.tracy` file. `tracy-capture` runs inside the
 4. `./benchmark/manual/stop_service.sh` when done
 
 **Why `ZoneScopedN` is absent from `mysql::Connector::runQuery_`:**
-The MySQL connector uses `co_await` (Boost.Asio) which can resume on a different
-io_context thread. Tracy zones opened before the suspension would close on the wrong
-thread, causing "Zone is ended twice". The outer `mysql::ConnectorManager::executeQuery`
-zone (single-threaded, non-coroutine) provides equivalent coverage.
+The MySQL connector's statement is a Boost.Asio coroutine: a zone opened before a
+`co_await` could close on another thread ("Zone is ended twice"). The backend
+agent's own zones (`backend_agent::read` / `write` / `step`, non-coroutine, around
+the run of the agent's io_context) cover it.
 
 ## Result files
 
@@ -562,17 +561,15 @@ OtterStax crashes between reps.
 
 ### What the pushdown sends
 
-A subtree over the tables of ONE server that the dialect can say is sent to the
-backend as one statement (`otterbrix/federation/rules/pushdown.hpp`,
-`otterbrix/federation/CLAUDE.md`): a query block over one table (its filters,
-grouping, aggregates, order and window), and a JOIN of tables of that server with
-the block above it — every `join_same_instance` sub-test is one statement. A JOIN
-of tables of different servers (`join_cross_engine`, `join_all`) runs in the
-engine; each server's own subtree is still pushed, but there a side is a bare
-table: the rule runs at the optimizer's `after_simplify` stage, before the
-engine's own `pushdown_filter` moves the WHERE and ON conjuncts into the JOIN's
-branches, so each side is read whole through its storage's scan and those
-conditions are applied in the engine.
+otterbrix offers each connection's backend actor the blocks of a statement over
+its tables (`storage_offer`; `otterbrix/federation/CLAUDE.md`, "Offer"): a
+relation the dialect says whole — a query block over one table with its filters,
+grouping, aggregates, order and window, a JOIN of tables of that connection with
+the block above it — is taken as one statement; every `join_same_instance`
+sub-test is one. A JOIN of tables of different connections (`join_cross_engine`,
+`join_all`) runs in the engine over what each connection's actor takes of its own
+side; what it does not take is read through the table's scan and finished in the
+engine.
 
 ### Connection aliases required
 
@@ -593,15 +590,15 @@ If you need a clean build and the remote is down, wait for it to come back.
 run `--rebuild` (keeps DB volumes) or `--clear` (also wipes DB data and reinitialises).
 
 **Log appears frozen during join_all**
-It should not: a `join_all` rep takes 0.15–0.55 s (each side is a whole-table scan,
-see "What the pushdown sends"), and Python stdout is unbuffered
+It should not: a `join_all` rep takes 0.15–0.55 s (see "What the pushdown sends"),
+and Python stdout is unbuffered
 (`PYTHONUNBUFFERED=1`), so output streams in real time. A rep that runs for tens of
 seconds is a regression worth profiling (`--perf`).
 
 **"Zone is ended twice" in Tracy captures**
-This was caused by `ZoneScopedN` inside MySQL connector coroutines that cross
-io_context thread boundaries at `co_await` suspension points. Fixed by removing
-the zone from `mysql::Connector::runQuery_`. See the Tracy profiling section above.
+A zone that spans a `co_await` of a coroutine that can resume on another thread
+(the MySQL connector's statement, a query session's handler). See the Tracy
+profiling section above and the root `CLAUDE.md` Tracy rules.
 
 ---
 

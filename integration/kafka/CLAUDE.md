@@ -19,7 +19,7 @@ Library: `kafka_runtime` (links `kafka_grammar` + `otterbrix_local`).
   `kafka_find_aggregate`, `kafka_column_t`).
 - `otterstax::kafka::detail` — the implementation in `detail/` (the RAII
   consumer/producer, the poller/stream threads, and the reader helpers). The
-  manager `.cpp` does `using namespace detail;`; `kafka_manager.hpp` qualifies
+  manager sources (`detail/kafka_manager*.cpp`) do `using namespace detail;`; `kafka_manager.hpp` qualifies
   members as `detail::kafka_*_t`. External code (the query session, tests) reaches the
   helpers as `otterstax::kafka::detail::json_to_chunk` etc.
 
@@ -29,7 +29,7 @@ Library: `kafka_runtime` (links `kafka_grammar` + `otterbrix_local`).
 
 - **Names.** The Kafka objects live in the schema `kafka` of otterbrix's default
   database: `main.kafka.<name>` (`kafka_table_name`), so `kafka.<name>` from the
-  default place `main.public` names them as before. The bookkeeping lives in the
+  default place `main.public` names them. The bookkeeping lives in the
   schema `kafka` of OtterStax's service database `federation`:
   `federation.kafka.__sources` (`kafka_service_table_name`) and
   `federation.kafka.<source>__offsets` (`kafka_offsets_table_name`) — hidden from
@@ -71,7 +71,7 @@ Library: `kafka_runtime` (links `kafka_grammar` + `otterbrix_local`).
   (stream → its INSERT-query names, for DROP-time cleanup). `start_pollers_` ctor
   flag is FALSE by default so broker-free unit tests stay thread-free;
   `main.cpp` spawns it with TRUE (the tests' stack with `stack_options_t::kafka_pollers`, FALSE by default). `recover()` (called
-  by `main.cpp` once the s3 aliases are registered and the remote tables registered, before any client) makes the storage exist, then (with `start_pollers_`) replays `federation.kafka.__sources` in three passes — sources, streams, then INSERT
+  by `main.cpp` once the s3 aliases and the remote tables are registered, before any client) makes the storage exist, then (with `start_pollers_`) replays `federation.kafka.__sources` in three passes — sources, streams, then INSERT
   INTO queries (`kind='insert'`, sink + source re-derived from the persisted SQL).
   Streams are recovered in rounds until none becomes resolvable, so a stream over
   another stream comes back whatever the row order. A stream or INSERT query that
@@ -80,7 +80,7 @@ Library: `kafka_runtime` (links `kafka_grammar` + `otterbrix_local`).
   dangling stream — has its `__sources` row deleted (logged at warn) instead of
   being skipped on every restart and silently re-attached to an unrelated object
   re-created under the name. One whose source merely failed to recover (a probe
-  error, a VIEW under the name) is only skipped, as before; so is a source row
+  error, a VIEW under the name) is only skipped; so is a source row
   whose backing table is gone.
   A source's columns are not persisted: they are the engine's describe of
   `SELECT * FROM main.kafka.<src>` (typed from the catalog, so an empty table
@@ -109,7 +109,7 @@ Dependents come from two places:
 0. a name registered as a stream or INSERT INTO query → `invalid_parameter`
    `kafka: 'st' is a stream, not a source; use DROP STREAM` (with or without IF
    EXISTS — a stream has no table, so the absent-table path would forget it);
-1. any Kafka-side reader → `other_error` `kafka: cannot drop source 's': insert
+1. any Kafka-side reader → `dependent_objects_still_exist` `kafka: cannot drop source 's': insert
    query 'm__insert__0', stream 'st' depend on it; use DROP SOURCE s CASCADE`,
    before anything is stopped (`IF EXISTS` does not forgive it);
 2. the poller is stopped and `main.kafka.s` dropped RESTRICT. A refusal relaunches the
@@ -141,7 +141,7 @@ After it, the in-memory steps cannot fail; a failed `__offsets` drop or
 leftover reader row (dangling) and skips a leftover source row.
 
 `DROP STREAM x`: `undefined_object` unless `IF EXISTS`; a SOURCE name is
-`invalid_parameter`. RESTRICT refuses (`other_error`, `kafka: cannot drop stream
+`invalid_parameter`. RESTRICT refuses (`dependent_objects_still_exist`, `kafka: cannot drop stream
 'x': stream 'y' depends on it; use DROP STREAM x CASCADE`) when another stream or
 INSERT query reads FROM it (a stream's output topic can be another stream's
 source). The stream's own INSERT INTO queries (it is their sink) go with it in both
@@ -192,7 +192,7 @@ engine's. The write splits on `source_is_select` — a `VALUES` write
   engine dependents before changing anything, drops `<name>__offsets` only after
   the backing table is gone, and forgets the object only then (`IF EXISTS`
   forgives only a missing object, never a dependent) — see "DROP semantics".
-- **Known races (pre-existing, not addressed).** The manager's loop interleaves
+- **Known races.** The manager's loop interleaves
   coroutines at every `co_await`, so DDL on related objects is not serialised:
   a `CREATE STREAM` / `INSERT INTO … SELECT` over a source that a concurrent
   `DROP SOURCE … CASCADE` is dropping can register after the closure was taken and

@@ -136,6 +136,8 @@ namespace {
         // HAVING / ORDER BY of a grouped query over relations: a column key there is numbered by
         // the group's outputs, not by what the FROM outputs, so it is read by its output name.
         bool keys_name_outputs{false};
+        // An UPDATE assignment was left to MySQL's store into the column (statement_needs_t).
+        bool strict_store{false};
 
         bool failed() const noexcept { return error.contains_error(); }
         void fail(core::error_code_t code, std::string_view msg) {
@@ -423,19 +425,27 @@ namespace {
 
     // ── literal values ────────────────────────────────────────────────────────
 
-    // PostgreSQL treats a backslash literally (standard_conforming_strings);
-    // MySQL (default sql_mode) and ClickHouse read it as an escape, so there it
-    // must be doubled or the character after it is swallowed — including a
-    // closing quote.
+    // MySQL (default sql_mode) and ClickHouse read a backslash as an escape, so
+    // there it must be doubled or the character after it is swallowed —
+    // including a closing quote. PostgreSQL reads a backslash of '...' literally
+    // under standard_conforming_strings = on and as an escape under off (a role
+    // or database default reaches OtterStax's session), while an escape string
+    // constant E'...' always reads it as an escape: a PostgreSQL value holding a
+    // backslash is written E'...' with the backslash doubled, which reads the
+    // same under either setting; one without keeps the plain form, which does too.
     bool backslash_escapes(backend_type_t backend) noexcept {
         return backend != backend_type_t::PostgreSQL;
     }
 
     // Single-quoted literal: the embedded quote doubled on every backend (the
     // only form MySQL also honours under NO_BACKSLASH_ESCAPES), the backslash
-    // doubled where the dialect treats it as an escape.
+    // doubled where the dialect treats it as an escape — on PostgreSQL inside E'...'.
     void write_string_literal(std::stringstream& stream, std::string_view str, backend_type_t backend) {
-        const bool escape_backslash = backslash_escapes(backend);
+        const bool escape_backslash =
+            backslash_escapes(backend) || str.find('\\') != std::string_view::npos;
+        if (escape_backslash && backend == backend_type_t::PostgreSQL) {
+            stream << 'E';
+        }
         stream << '\'';
         for (char c : str) {
             if (c == '\'') {
@@ -705,6 +715,31 @@ namespace {
             case logical_type::STRING_LITERAL:
                 write_string_literal(stream, leaf.get_value<std::string_view>(index), backend);
                 break;
+            case logical_type::ENUM: {
+                // Its label: a PostgreSQL ENUM column takes the literal as a value of its own type (in
+                // its declaration order, the engine's); a MySQL ENUM / ClickHouse Enum column is text
+                // in the catalog, and the label the text the engine compares.
+                const auto* extension =
+                    static_cast<const components::types::enum_logical_type_extension*>(leaf.type().extension());
+                const auto value = leaf.get_value<int32_t>(index);
+                const components::types::enum_entry_t* entry = nullptr;
+                if (extension != nullptr) {
+                    for (const auto& candidate : extension->entries()) {
+                        if (candidate.value == value) {
+                            entry = &candidate;
+                            break;
+                        }
+                    }
+                }
+                if (entry == nullptr) {
+                    ctx.fail(core::error_code_t::invalid_parameter,
+                             "an ENUM value has no label: ",
+                             std::to_string(value));
+                    break;
+                }
+                write_string_literal(stream, entry->label, backend);
+                break;
+            }
             case logical_type::DECIMAL:
                 write_decimal_literal(stream, leaf, index, ctx);
                 break;
@@ -773,6 +808,16 @@ namespace {
             return;
         }
         if (ctx.options.placeholders) {
+            // The value is written only at the run, but decided on here as the run writes it: a
+            // value no literal of the dialect spells refuses the probe, so otterbrix runs the block
+            // over the table's scan instead of taking it (a taken block has no fallback).
+            if (const auto* value = bound_value(id, ctx)) {
+                std::stringstream unused;
+                write_cell(unused, *value, 0, ctx);
+                if (ctx.failed()) {
+                    return;
+                }
+            }
             stream << '?';
             return;
         }
@@ -1873,20 +1918,29 @@ namespace {
                     default:
                         return {};
                 }
-            case backend_type_t::ClickHouse:
+            case backend_type_t::ClickHouse: {
                 if (kind == numeric_cast_t::narrowing) {
                     return {};
                 }
+                std::string spelling;
                 switch (to) {
                     case logical_type::HUGEINT:
-                        return "Int128";
+                        spelling = "Int128";
+                        break;
                     case logical_type::UHUGEINT:
-                        return "UInt128";
+                        spelling = "UInt128";
+                        break;
                     case logical_type::DECIMAL:
-                        return decimal_spelling("Decimal");
+                        spelling = decimal_spelling("Decimal");
+                        break;
                     default:
-                        return std::string{clickhouse_type_keyword(to)};
+                        spelling = clickhouse_type_keyword(to);
+                        break;
                 }
+                // A CAST into a type without Nullable refuses a NULL (Code 349), and isNull over it
+                // folds to 0: the target holds a NULL as the engine's cast keeps it.
+                return spelling.empty() ? spelling : "Nullable(" + spelling + ")";
+            }
             default:
                 if (kind == numeric_cast_t::narrowing) {
                     return {};
@@ -1908,6 +1962,23 @@ namespace {
                 }
                 return std::string{mysql_cast_keyword(to)};
         }
+    }
+
+    // What a numeric CAST of the validated tree does in this statement: classify_numeric_cast, a
+    // narrowing one of a bound value it leaves unchanged taken as lossless.
+    numeric_cast_t statement_cast_kind(const cast_expression_t& expr,
+                                       const std::optional<complex_logical_type>& source,
+                                       gen_ctx_t& ctx) {
+        const auto& target = expr.result_type();
+        auto kind = classify_numeric_cast(source, target);
+        if (kind == numeric_cast_t::narrowing && source && is_integer(source->type()) &&
+            bound_integer_in_range(expr.child(), target, ctx)) {
+            kind = numeric_cast_t::lossless;
+        }
+        if (kind == numeric_cast_t::narrowing && bound_exact_value_preserved(expr.child(), target, ctx)) {
+            kind = numeric_cast_t::lossless;
+        }
+        return kind;
     }
 
     // A numeric CAST of the validated tree that changes no value.
@@ -1952,15 +2023,8 @@ namespace {
             // lossless one (write_compared_operand).
             const auto source = operand_type(expr.child(), ctx);
             if (!source || numeric_type(source->type())) {
-                auto kind = classify_numeric_cast(source, target);
-                if (kind == numeric_cast_t::narrowing && source && is_integer(source->type()) &&
-                    bound_integer_in_range(expr.child(), target, ctx)) {
-                    kind = numeric_cast_t::lossless;
-                }
-                if (kind == numeric_cast_t::narrowing && bound_exact_value_preserved(expr.child(), target, ctx)) {
-                    kind = numeric_cast_t::lossless;
-                }
-                const auto spelling = numeric_cast_target(source, target, kind, ctx.backend);
+                const auto spelling =
+                    numeric_cast_target(source, target, statement_cast_kind(expr, source, ctx), ctx.backend);
                 if (spelling.empty()) {
                     ctx.fail(core::error_code_t::unimplemented_yet,
                              "this numeric CAST has no spelling in the backend's dialect that range-checks and "
@@ -1992,6 +2056,12 @@ namespace {
         }
         stream << "CAST(";
         write_operand(stream, expr.child(), ctx);
+        // ClickHouse: a scalar target (clickhouse_type_keyword names no Array / Tuple / Map) held
+        // Nullable, so that a NULL stays NULL (numeric_cast_target).
+        if (ctx.backend == backend_type_t::ClickHouse) {
+            stream << " AS Nullable(" << keyword << "))";
+            return;
+        }
         stream << " AS " << keyword << ")";
     }
 
@@ -3540,10 +3610,131 @@ namespace {
         }
     }
 
+    // A bound DOUBLE that the engine's DOUBLE -> FLOAT cast takes (otterbrix kernels::floating_fits:
+    // a finite magnitude that rounds past FLT_MAX, 2^128 - 2^103 and above, or that is not 0 and
+    // rounds to 0, 2^-150 and below, is out of range; NaN and the infinities pass). nullopt: the
+    // operand is not a known bound DOUBLE.
+    std::optional<bool> bound_double_fits_float(const param_storage& operand, gen_ctx_t& ctx) {
+        const auto parameter = parameter_of(operand);
+        if (!parameter || ctx.parameters == nullptr) {
+            return std::nullopt;
+        }
+        const auto* bound = bound_value(*parameter, ctx);
+        if (bound == nullptr || bound->is_null(0)) {
+            return std::nullopt;
+        }
+        const auto cell = locate(*bound, 0);
+        if (cell.leaf->type().type() != logical_type::DOUBLE) {
+            return std::nullopt;
+        }
+        const double magnitude = std::fabs(cell.leaf->get_value<double>(cell.index));
+        if (!std::isfinite(magnitude)) {
+            return true;
+        }
+        return magnitude < std::ldexp(1.0, 128) - std::ldexp(1.0, 103) &&
+               (magnitude == 0.0 || magnitude > std::ldexp(1.0, -150));
+    }
+
+    // The column an UPDATE assignment names, as the target's column map has it (null: not there).
+    const sql_gen::remote_column_t* assigned_column(const components::expressions::key_t& key,
+                                                    const sql_gen::column_map_t* columns) {
+        if (columns == nullptr || key.storage().size() != 1) {
+            return nullptr;
+        }
+        const auto& part = key.storage().front();
+        const auto found = columns->find(std::string{part.data(), part.size()});
+        return found == columns->end() ? nullptr : &found->second;
+    }
+
+    // The value of an UPDATE assignment the validator cast to the type of its column (otterbrix
+    // wraps an assignment whose type is not the column's in a cast_kind::cast of the column's type —
+    // validate_logical_plan.cpp; a user's CAST to the column's type in that place is the same node,
+    // and for a number the same cast) when that cast narrows and the dialect's CAST cannot say it
+    // (numeric_cast_target): the store into the column range-checks instead.
+    //  - MySQL, an integer into a narrower integer, a DOUBLE into FLOAT: written without the CAST.
+    //    Under a strict sql_mode the store refuses a value out of the column's range (ER 1264) and
+    //    rounds a DOUBLE to the nearest FLOAT (Field_long::store, Field_float::store), as the engine;
+    //    a statement relying on it needs a strict session (statement_needs_t::strict_store). A bound
+    //    DOUBLE the engine takes needs no strict mode: nothing is out of range.
+    //  - ClickHouse, an integer into a narrower integer: accurateCast into the Nullable column type
+    //    (out of range: CANNOT_CONVERT_TYPE), which the mutation's own _CAST then stores, under
+    //    `if(isNull(v), NULL, …)`: accurateCast also checks the value computed under a NULL from the
+    //    column's default 0 (`i + 3000000000` over a NULL row), where the engine keeps NULL. A
+    //    widening cast under it (`i + 1` over an Int32 column reads CAST(i AS Nullable(Int64)) + 1)
+    //    is Nullable (numeric_cast_target): a bare one refuses every NULL row. A DOUBLE into Float32 only for a bound value the engine
+    //    takes: ClickHouse's conversion has no range check (an overflow is ±inf, an underflow 0).
+    // A bound DOUBLE out of FLOAT's range is the engine's refusal. Anything else (a fraction into an
+    // integer — MySQL rounds a DECIMAL half away from zero, the engine to even —, a DECIMAL) is left
+    // to write_cast, which refuses it. True when the value was written (or refused) here.
+    bool write_assignment_cast(std::stringstream& stream,
+                               const expression_i& value,
+                               const sql_gen::remote_column_t* column,
+                               gen_ctx_t& ctx) {
+        if (!ctx.options.validated || column == nullptr || value.group() != expression_group::cast ||
+            ctx.backend == backend_type_t::PostgreSQL) {
+            return false;
+        }
+        const auto& cast = static_cast<const cast_expression_t&>(value);
+        const auto& target = cast.result_type();
+        if (cast.kind() != components::casts::cast_kind::cast || target.type() != column->type.type() ||
+            !numeric_type(target.type())) {
+            return false;
+        }
+        const auto source = operand_type(cast.child(), ctx);
+        if (!source || !numeric_type(source->type()) ||
+            statement_cast_kind(cast, source, ctx) != numeric_cast_t::narrowing) {
+            return false;
+        }
+        const bool integers =
+            is_integer(source->type()) && is_integer(target.type()) && integral_bytes(target.type()) <= 8;
+        const bool to_float = source->type() == logical_type::DOUBLE && target.type() == logical_type::FLOAT;
+        if (!integers && !to_float) {
+            return false;
+        }
+        const auto fits = to_float ? bound_double_fits_float(cast.child(), ctx) : std::nullopt;
+        if (fits && !*fits) {
+            ctx.fail_clause(core::error_code_t::numeric_value_out_of_range, ": the value is out of the range of FLOAT");
+            return true;
+        }
+        if (ctx.backend == backend_type_t::MySQL) {
+            if (!fits) {
+                ctx.strict_store = true;
+            }
+            write_operand(stream, cast.child(), ctx);
+            return true;
+        }
+        if (integers) {
+            // A NULL row is left NULL before accurateCast sees it: accurateCast range-checks the
+            // value computed under a NULL from the column's default 0 too. ClickHouse's `if`
+            // evaluates a branch only for its rows (short_circuit_function_evaluation), and its type
+            // with a NULL branch is Nullable(T).
+            stream << "if(isNull(";
+            write_operand(stream, cast.child(), ctx);
+            stream << "), NULL, accurateCast(";
+            write_operand(stream, cast.child(), ctx);
+            stream << ", 'Nullable(" << clickhouse_type_keyword(target.type()) << ")'))";
+            return true;
+        }
+        if (!fits) {
+            ctx.fail(core::error_code_t::unimplemented_yet,
+                     "ClickHouse converts a Float64 to Float32 without a range check: a computed DOUBLE assigned "
+                     "to a FLOAT column is not written");
+            return true;
+        }
+        stream << "CAST(";
+        write_operand(stream, cast.child(), ctx);
+        stream << " AS Float32)";
+        return true;
+    }
+
     // The value of one SET assignment. The assignment IS the value expression,
     // named by its key, so a bare key with nothing under it assigns nothing: the
-    // transformer never builds one, and a plan carrying it is malformed.
-    void write_set_value(std::stringstream& stream, const expression_i& value, gen_ctx_t& ctx) {
+    // transformer never builds one, and a plan carrying it is malformed. `column`:
+    // the assigned column (null: not known).
+    void write_set_value(std::stringstream& stream,
+                         const expression_i& value,
+                         const sql_gen::remote_column_t* column,
+                         gen_ctx_t& ctx) {
         if (value.group() == expression_group::scalar) {
             const auto& scalar = static_cast<const scalar_expression_t&>(value);
             const bool names_itself = scalar.type() == scalar_type::get_field ||
@@ -3553,6 +3744,9 @@ namespace {
                 ctx.fail_clause(core::error_code_t::invalid_parameter, " expression is missing an operand");
                 return;
             }
+        }
+        if (write_assignment_cast(stream, value, column, ctx)) {
+            return;
         }
         write_expr(stream, value, ctx);
     }
@@ -3713,7 +3907,7 @@ namespace {
             }
             write_column_name(stream, set->key(), target.columns, backend);
             stream << " = ";
-            write_set_value(stream, *set, ctx);
+            write_set_value(stream, *set, assigned_column(set->key(), target.columns), ctx);
             comma = true;
         }
         if (with_source && backend == backend_type_t::PostgreSQL) {
@@ -3836,7 +4030,8 @@ namespace sql_gen {
                                                        backend_type_t backend,
                                                        const statement_target_t& target,
                                                        std::pmr::memory_resource* resource,
-                                                       generation_options_t options) {
+                                                       generation_options_t options,
+                                                       statement_needs_t* needs) {
         OTX_ZONE_N("sql_gen::generate_query");
         std::stringstream stream;
         gen_ctx_t ctx{backend, parameters, resource};
@@ -3917,6 +4112,9 @@ namespace sql_gen {
             stream << " SETTINGS join_use_nulls = 1";
         }
         stream << ";";
+        if (needs != nullptr) {
+            needs->strict_store = ctx.strict_store;
+        }
         return stream.str();
     }
 

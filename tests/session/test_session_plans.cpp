@@ -4,7 +4,7 @@
 // The pre-built-plan entry points through query_session_t: execute_plan of a
 // Spark Connect DataFrame plan over the real engine (the scenarios of
 // test_spark_plan_execution.cpp), prepare_plan of a remote SELECT described by
-// the engine from the federation metadata — no backend round-trip — and never
+// the engine from its catalog — no backend round-trip — and never
 // executed, execute_plan answering the rows execute
 // answers for the same SQL (test_prepare_plan.cpp, over the same recording
 // PostgreSQL mock connector), and the refusals both share.

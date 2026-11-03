@@ -94,6 +94,18 @@ namespace sql_gen {
         bool returning{false};
     };
 
+    // What a generated statement leaves to the session that runs it.
+    struct statement_needs_t {
+        // MySQL: an UPDATE assignment the engine narrows to its column's type (an integer into a
+        // narrower integer, a computed DOUBLE into FLOAT: otterbrix's assignment cast, range-checked)
+        // is written without that CAST — MySQL's neither narrows nor range-checks — and left to the
+        // store into the column, which range-checks (and rounds a DOUBLE to the nearest FLOAT) as the
+        // engine does only in a session whose sql_mode is strict (STRICT_TRANS_TABLES or
+        // STRICT_ALL_TABLES); elsewhere it clamps the value with a warning. Such a statement must not
+        // run in a session that is not strict.
+        bool strict_store{false};
+    };
+
     // One identifier quoted for `backend` (`...` MySQL / ClickHouse, "..." PostgreSQL; the quote
     // character doubled inside, and for ClickHouse, which reads a backslash inside a quoted
     // identifier as an escape, the backslash doubled too).
@@ -113,13 +125,14 @@ namespace sql_gen {
     // Nothing in this module throws across its API: an unsupported dialect feature comes back as
     // unimplemented_yet, a violated plan invariant (unbound parameter, malformed node) as
     // invalid_parameter. `resource` owns the returned error's message. The statement is terminated
-    // by `;`.
+    // by `;`. `needs` (optional): what the statement asks of the session that runs it.
     core::result_wrapper_t<std::string> generate_query(const components::logical_plan::node_ptr& node,
                                                        const components::logical_plan::storage_parameters* parameters,
                                                        backend_type_t backend,
                                                        const statement_target_t& target,
                                                        std::pmr::memory_resource* resource,
-                                                       generation_options_t options = {});
+                                                       generation_options_t options = {},
+                                                       statement_needs_t* needs = nullptr);
 
     // A read of one table: SELECT <columns> FROM <target.name> [WHERE w1 AND w2 ...] [LIMIT n];
     // `columns` are positions in target.all_columns (empty: every column); `where` the conjuncts of a

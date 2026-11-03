@@ -52,13 +52,15 @@ namespace flight::engine {
         std::int64_t execute_update(const std::string& query);
 
         // Prepared statements. prepare() opens the statement's session, prepares
-        // the text there and hands the session to the caller (FlightSqlCore
-        // keeps it with the handle until ClosePreparedStatement). A session's
-        // stored statement is single-use, so every execution re-prepares the
-        // text on that session — the one `statements` keeps under `handle`,
-        // reached step by step (FlightSqlCore::use_prepared) — and binds the
-        // parameters there (the pattern the MySQL and PG frontends follow). A
-        // step that finds the session closed throws core::EngineError.
+        // the text there — ONE entry of the session (core::Prepared::statement)
+        // — and hands the session to the caller (FlightSqlCore keeps it with
+        // the handle until ClosePreparedStatement, which closes the session and
+        // its entry). Every execution runs that entry on that session — the one
+        // `statements` keeps under `handle`, reached step by step
+        // (FlightSqlCore::use_prepared) — with its own parameters (the entry is
+        // reusable: query_session_t::execute_prepared_statement parses the text
+        // again and binds them; the pattern the MySQL and PG frontends follow).
+        // A step that finds the session closed throws core::EngineError.
         std::pair<core::Prepared, otterstax::session::session_ptr> prepare(const std::string& query);
         core::QueryResult execute_prepared(core::FlightSqlCore& statements,
                                            const std::string& handle,
@@ -110,9 +112,9 @@ namespace flight::engine {
         template<typename Session>
         std::pair<otterstax::session::statement_id_t, session_payload> prepare_fresh(const Session& session,
                                                                                      const std::string& sql);
-        // Re-prepare + execute_prepared_statement with one parameter row.
+        // execute_prepared_statement of the statement's entry with one parameter row.
         template<typename Session>
-        session_payload run_prepared(const Session& session, const std::string& sql, const core::BoundParams& params);
+        session_payload run_prepared(const Session& session, const core::Prepared& prepared, const core::BoundParams& params);
         // The DoPut batches -> engine chunks (tsl::arrow_to_chunk), one per
         // non-empty batch: column i is `$<i+1>`, one row is one parameter set.
         std::pmr::vector<components::vector::data_chunk_t> to_param_chunks(const core::BoundParams& params);

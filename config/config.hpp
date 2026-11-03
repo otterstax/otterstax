@@ -38,8 +38,7 @@ struct SparkConnectConfig {
     std::uint32_t session_timeout_s = 3600;
 };
 
-// The directory main.cpp hard-coded as the engine's data dir before
-// `service.engine.data_dir` existed; it stays the default.
+// The engine's data dir when `service.engine.data_dir` is not set.
 inline constexpr const char* DEFAULT_ENGINE_DATA_DIR = "/tmp/test_collection_sql/base";
 
 // `service.engine`: the embedded otterbrix engine (otterbrix

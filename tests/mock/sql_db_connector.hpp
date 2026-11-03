@@ -193,7 +193,7 @@ namespace mysql {
 
         // The data overloads throw when configured to: that models a driver or
         // translator exception raised inside the coroutine on the io thread, which
-        // executeQuery must hand back as an io_error value.
+        // the backend agent (backend_agent_t::run) must hand back as an error value.
         asio::awaitable<core::result_wrapper_t<std::unique_ptr<data_chunk_t>>>
         runQuery(std::string_view query,
                  otterstax::function_ref_t<std::unique_ptr<data_chunk_t>(const boost::mysql::results&)> handler)
@@ -225,7 +225,7 @@ namespace mysql {
             co_return 42;
         }
 
-        // Schema-discovery overload (MySQLManager::discover) and DDL. Always
+        // Schema-discovery overload (the MySQL discovery of backend_agent_t) and DDL. Always
         // succeeds — startup must open even a connector whose data path is
         // configured to throw, mirroring a connection that came up healthy and
         // only fails later at query time. The information_schema listing

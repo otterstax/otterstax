@@ -20,8 +20,8 @@ target_include_directories(
 
 target_link_libraries(
     ${PROJECT_NAME} PRIVATE
-    # connectors) and the MySQL integration backend, so the binary links the
-    # internal libraries the same way test_system does.
+    # The connectors and the wait_barrier helpers live in the internal
+    # libraries, so the binary links them the same way test_system does.
     lib_otterstax
     actor-zeta::actor-zeta
     otterbrix::otterbrix

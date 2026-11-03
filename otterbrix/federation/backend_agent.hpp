@@ -96,6 +96,14 @@ namespace otterstax::federation {
     // back: the tag "ROLLBACK", which a COMMIT of an aborted transaction answers without an error.
     bool pg_commit_rolled_back(std::string_view command_status) noexcept;
 
+    // The mutations ClickHouse names in its refusal of a synchronous mutation (ALTER TABLE ... UPDATE
+    // / DELETE under mutations_sync, a lightweight DELETE) that failed on a part:
+    // "Exception happened during execution of mutation[s] '<id>[, <id>...]' with part ..."
+    // (checkMutationStatus, ClickHouse 23.8 and later). The statement's own mutation is always among
+    // them; the others are mutations of the same table that failed with the same error, executed
+    // together with it. Empty for any other text (a statement refused before its mutation existed).
+    std::vector<std::string> ch_failed_mutations(std::string_view message);
+
     class backend_agent_t final : public actor_zeta::basic_actor<backend_agent_t> {
     public:
         template<typename T>
@@ -123,7 +131,8 @@ namespace otterstax::federation {
         void attach(std::unique_ptr<mysql::IConnector> connector);
         void attach(std::unique_ptr<pg::IConnector> connector);
         void attach(std::unique_ptr<ch::IConnector> connector);
-        // Opens the connection (the connector's connect: its deadline, its retries).
+        // Opens the connection (the connector's connect: its deadline, its retries) and checks the
+        // session it opened (check_session).
         [[nodiscard]] core::error_t connect();
         // Who the agent wakes after it answered: the backend actor's loop.
         void set_owner(void (*wake)(void*) noexcept, void* owner) noexcept;
@@ -132,6 +141,9 @@ namespace otterstax::federation {
         // The discovery of the discover message, run on the calling thread (the startup: before
         // the agent is handed to its actor).
         [[nodiscard]] core::result_wrapper_t<discovered_tables_t> discover_now(const qualified_name_t& scope);
+        // The last session the agent opened was refused by check_session: the server answered that
+        // it cannot be written to (the same answer on every attempt), not that it cannot be reached.
+        [[nodiscard]] bool session_refused() const noexcept { return session_refused_; }
 
         [[nodiscard]] backend_type_t kind() const noexcept { return kind_; }
 
@@ -148,8 +160,13 @@ namespace otterstax::federation {
         unique_future<rows_t> read(std::string sql, std::vector<std::optional<std::string>> declared, std::uint64_t metadata);
         // The rows the backend reports it wrote: MySQL's affected rows (for an UPDATE the rows it
         // matched, mysql_update_rows_matched), PostgreSQL's command tag, ClickHouse's written_rows
-        // for an INSERT and 0 for a mutation, which reports nothing.
-        unique_future<core::result_wrapper_t<std::uint64_t>> write(std::string sql, write_kind_t kind);
+        // for an INSERT and 0 for a mutation, which reports nothing. `strict_store`: the statement
+        // relies on a strict sql_mode (sql_gen::statement_needs_t) — refused (unimplemented_yet),
+        // nothing sent, on a MySQL session whose sql_mode is not. `table`: the table an UPDATE /
+        // DELETE writes, as the generator names it (ClickHouse: database.table), where a ClickHouse
+        // mutation that failed is killed (write_ch).
+        unique_future<core::result_wrapper_t<std::uint64_t>>
+        write(std::string sql, write_kind_t kind, bool strict_store, qualified_name_t table);
         // One transaction step (transaction_statement). A failed COMMIT / ROLLBACK replaces the
         // connection's session (close, reconnect: the backend rolls back what it held); an unpin
         // after a step that opened the transaction rolls it back and answers invalid_parameter;
@@ -175,9 +192,19 @@ namespace otterstax::federation {
         // fails reconnected — refused at once (io_error, "unreachable") while a failed connect of
         // the connection marks it (reachability_t).
         [[nodiscard]] core::error_t ready();
-        // The connector's tryReconnect, under the reachability mark.
+        // The connector's tryReconnect, under the reachability mark, then check_session.
         template<typename Connector>
         [[nodiscard]] core::error_t reconnect(Connector& connector);
+        // Whether the session a connect just opened can be written to, asked of every session
+        // (the server may have been replaced or reconfigured since the last one): MySQL's
+        // `SELECT @@SESSION.sql_mode` — under NO_BACKSLASH_ESCAPES the generated literals, which
+        // double a backslash, would read as other text — refused (unimplemented_yet), the session
+        // closed and session_refused_ set; a check that failed closes the session too. Either way
+        // the next statement connects and asks again (reopen_). Whether the mode is strict is kept
+        // (strict_session_).
+        // PostgreSQL needs no check (a literal holding a backslash is written E'...', which reads
+        // the same under either standard_conforming_strings); ClickHouse has no such mode.
+        [[nodiscard]] core::error_t check_session();
         // Runs the connector's statement on io_ until it completed.
         template<typename R, typename Arg, typename Connector, typename Handler>
         auto run(Connector& connector, std::string_view sql, Handler handler);
@@ -197,7 +224,13 @@ namespace otterstax::federation {
         rows_t read_ch(ch::IConnector& connector, const std::string& sql, const std::vector<std::optional<std::string>>& declared);
         core::result_wrapper_t<std::uint64_t> write_mysql(mysql::IConnector& connector, const std::string& sql, write_kind_t kind);
         core::result_wrapper_t<std::uint64_t> write_pg(pg::IConnector& connector, const std::string& sql);
-        core::result_wrapper_t<std::uint64_t> write_ch(ch::IConnector& connector, const std::string& sql, write_kind_t kind);
+        core::result_wrapper_t<std::uint64_t>
+        write_ch(ch::IConnector& connector, const std::string& sql, write_kind_t kind, const qualified_name_t& table);
+        // The answer to a ClickHouse mutation of `table` that failed with `failed`: the mutation is
+        // killed (ClickHouse would retry it forever, and every later mutation of the table would
+        // fail with its error), then `failed` answered; a KILL that failed adds its own error.
+        [[nodiscard]] core::error_t
+        kill_failed_mutation(ch::IConnector& connector, const std::string& sql, const qualified_name_t& table, core::error_t failed);
         core::result_wrapper_t<discovered_tables_t> discover_mysql(mysql::IConnector& connector, const qualified_name_t& scope);
         core::result_wrapper_t<discovered_tables_t> discover_pg(pg::IConnector& connector, const qualified_name_t& scope);
         core::result_wrapper_t<discovered_tables_t> discover_ch(ch::IConnector& connector, const qualified_name_t& scope);
@@ -214,6 +247,15 @@ namespace otterstax::federation {
         reachability_t* reachability_ = nullptr;
         // cancel() ran: no statement and no reconnect any more.
         std::atomic<bool> cancelled_{false};
+        // The last session opened did not pass check_session — refused, or the check itself
+        // failed — and was closed: the next statement connects again rather than reading the
+        // connector's closed state as final.
+        bool reopen_{false};
+        // check_session refused the last session opened: its server cannot be written to.
+        bool session_refused_{false};
+        // The MySQL session's sql_mode is strict (STRICT_TRANS_TABLES or STRICT_ALL_TABLES): a value
+        // stored into a column out of its range is refused, not clamped.
+        bool strict_session_{false};
         // A transaction step opened a backend transaction that no COMMIT / ROLLBACK ended yet.
         bool in_transaction_{false};
         // The savepoints the open transaction holds, in the order they were set.

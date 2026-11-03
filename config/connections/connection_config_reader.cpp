@@ -31,16 +31,26 @@ core::error_t invalid_connection(const char* kind, const std::string& entry, con
 // fallback; a key whose value is not a scalar is recorded as the entry's error
 // and every later read yields an empty string, so the first bad field is the
 // one reported. An entry that is a scalar is that error before any key is read
-// (yaml-cpp throws on a subscript of a scalar).
+// (yaml-cpp throws on a subscript of a scalar); a key outside `known` is that
+// error before any field is read (`unknown key "pool_sise" in connections.mysql[0]`).
 class entry_reader_t {
 public:
-    entry_reader_t(const YAML::Node& node, const char* kind, std::size_t index, std::pmr::memory_resource* resource)
+    entry_reader_t(const YAML::Node& node,
+                   const char* kind,
+                   std::size_t index,
+                   std::initializer_list<std::string_view> known,
+                   std::pmr::memory_resource* resource)
         : node_(node)
         , kind_(kind)
         , index_(index)
         , resource_(resource) {
         if (node_.IsScalar()) {
             error_ = invalid_connection(kind_, "entry #" + std::to_string(index_ + 1), "expected a mapping of keys",
+                                        resource_);
+        } else if (node_.IsMap()) {
+            error_ = require_known_keys(node_,
+                                        "connections." + std::string{kind_} + "[" + std::to_string(index_) + "]",
+                                        known,
                                         resource_);
         }
     }
@@ -83,6 +93,14 @@ private:
     core::error_t error_{core::error_t::no_error()};
 };
 
+// The keys of a connection entry, per section (ClickHouse's are MySQL's).
+const std::initializer_list<std::string_view> mysql_keys{
+    "alias", "host", "port", "username", "password", "database", "table", "pool_size"};
+const std::initializer_list<std::string_view> postgresql_keys{
+    "alias", "host", "port", "username", "password", "database", "schema", "table", "pool_size"};
+const std::initializer_list<std::string_view> s3_keys{
+    "alias", "access_key", "secret_key", "region", "session_token", "endpoint"};
+
 // Returns an error naming the first empty required field, or nullopt. `fields`
 // pairs each required field name with its value.
 std::optional<std::string> first_missing(
@@ -95,7 +113,7 @@ std::optional<std::string> first_missing(
     return std::nullopt;
 }
 
-// The folding the federation looks a uid up by (otterstax::federation::
+// The folding the federation looks a connection up by (otterstax::federation::
 // fold_identifier, otterbrix/federation/metadata.cpp: ASCII lower case): two
 // aliases equal under it name one connection. Spelled here because config links
 // nothing of the federation.
@@ -189,12 +207,12 @@ core::error_t validate_all(const std::vector<Desc>& descs, const char* kind, std
     return core::error_t::no_error();
 }
 
-// A backend alias is the connection uid every federated name starts with, so
+// A backend alias is the connection every four-part name starts with, so
 // the mysql / postgresql / clickhouse aliases share one namespace (each an
 // unquoted identifier, so lower case: the federation's folding is the identity
 // on them, and the map keys them folded all the same): a second entry
 // under an alias already taken would leave one of the two backends unreachable
-// (and its remote tables recorded under the other's uid). s3 aliases are
+// (and its remote tables registered under the other's name). s3 aliases are
 // another namespace — the `s3_alias` option of CREATE EXTERNAL TABLE / COPY ...
 // TO, looked up exactly (conn::s3::ConnectorManager), where a second entry would
 // silently replace the first.
@@ -248,11 +266,15 @@ core::result_wrapper_t<ConnectionsConfig> parse_connections(const YAML::Node& co
     if (!connections_node || !connections_node.IsMap()) {
         return result;
     }
+    if (auto unknown = require_known_keys(connections_node, "connections", {"mysql", "postgresql", "clickhouse", "s3"}, resource);
+        unknown.contains_error()) {
+        return unknown;
+    }
 
     if (connections_node["mysql"] && connections_node["mysql"].IsSequence()) {
         std::size_t index = 0;
         for (const auto& node : connections_node["mysql"]) {
-            entry_reader_t entry{node, "mysql", index++, resource};
+            entry_reader_t entry{node, "mysql", index++, mysql_keys, resource};
             MysqlConnectionDesc desc{
                 .alias = entry.str("alias"),
                 .host = entry.str("host"),
@@ -273,7 +295,7 @@ core::result_wrapper_t<ConnectionsConfig> parse_connections(const YAML::Node& co
     if (connections_node["postgresql"] && connections_node["postgresql"].IsSequence()) {
         std::size_t index = 0;
         for (const auto& node : connections_node["postgresql"]) {
-            entry_reader_t entry{node, "postgresql", index++, resource};
+            entry_reader_t entry{node, "postgresql", index++, postgresql_keys, resource};
             PgConnectionDesc desc{
                 .alias = entry.str("alias"),
                 .host = entry.str("host"),
@@ -295,7 +317,7 @@ core::result_wrapper_t<ConnectionsConfig> parse_connections(const YAML::Node& co
     if (connections_node["clickhouse"] && connections_node["clickhouse"].IsSequence()) {
         std::size_t index = 0;
         for (const auto& node : connections_node["clickhouse"]) {
-            entry_reader_t entry{node, "clickhouse", index++, resource};
+            entry_reader_t entry{node, "clickhouse", index++, mysql_keys, resource};
             ChConnectionDesc desc{
                 .alias = entry.str("alias"),
                 .host = entry.str("host"),
@@ -316,7 +338,7 @@ core::result_wrapper_t<ConnectionsConfig> parse_connections(const YAML::Node& co
     if (connections_node["s3"] && connections_node["s3"].IsSequence()) {
         std::size_t index = 0;
         for (const auto& node : connections_node["s3"]) {
-            entry_reader_t entry{node, "s3", index++, resource};
+            entry_reader_t entry{node, "s3", index++, s3_keys, resource};
             S3CredentialDesc desc{
                 .alias = entry.str("alias"),
                 .access_key = entry.str("access_key"),
@@ -355,7 +377,7 @@ core::result_wrapper_t<ConnectionsConfig> parse_connections(const YAML::Node& co
 }
 
 // port is intentionally not required: an empty port makes the connector fall
-// back to the driver's default (see the addConnection implementations). A
+// back to the driver's default (the connectors' connect_params). A
 // non-empty port must be a valid TCP port.
 std::optional<std::string> validation_error(const MysqlConnectionDesc& c) {
     if (auto err = backend_validation_error({{"alias", &c.alias},

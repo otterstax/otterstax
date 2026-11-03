@@ -112,8 +112,8 @@ TEST_CASE("open_with_retry: an invalid_parameter code does not make a failure a 
     REQUIRE(attempts.sleeps.size() == 2);
 }
 
-// An answer the federation metadata cannot record comes back the same on every
-// attempt: the backend is left out at once, startup goes on.
+// An answer the startup cannot use (open_failure_kind_t::unusable) comes back the
+// same on every attempt: the backend is left out at once, startup goes on.
 TEST_CASE("open_with_retry: an unusable answer is skipped on the first attempt and never retried") {
     std::pmr::synchronized_pool_resource arena(std::pmr::new_delete_resource());
     auto log = get_logger(logger_tag::Main);

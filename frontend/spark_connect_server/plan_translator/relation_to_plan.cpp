@@ -268,8 +268,9 @@ namespace frontend::spark {
         // the inner one's output as its input schema (validate_logical_plan.cpp, the
         // aggregate's data child) and the planner runs the inner plan as its source.
         // A remote read stays the inner aggregate: the engine resolves its name, and
-        // the federation's pushdown rule sends the inner block to the backend as one
-        // statement where it can; the outer aggregate runs in the engine.
+        // the connection's backend actor takes the inner block as one statement of
+        // the backend where its dialect says it (storage_offer); the outer aggregate
+        // runs in the engine.
         cl::node_ptr derive(cl::node_ptr node, std::pmr::memory_resource* resource) {
             auto outer = cl::make_node_aggregate(resource, qualified_name_t{});
             outer->append_child(std::move(node));

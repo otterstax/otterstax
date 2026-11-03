@@ -6,9 +6,9 @@
 //
 //   runtime_t → remote_backends_t (opened: connections of the test's
 //   `connections:`, discovered) → engine_t (a real engine in a temp dir, opened
-//   with the backend actor's address) → the s3 connector, file manager, S3
-//   orchestrator and Kafka manager (s3 aliases registered, federation metadata
-//   published) → a session_factory_t on the runtime's sessions pool → query
+//   with the backend actors' addresses) → the s3 connector, file manager, S3
+//   orchestrator and Kafka manager (s3 aliases registered, the remote tables
+//   registered) → a session_factory_t on the runtime's sessions pool → query
 //   sessions
 //
 // A "connection" is a query session; a statement is a statement_id_t on it.

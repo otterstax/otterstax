@@ -77,7 +77,7 @@ namespace ch {
 
         // The data overloads throw when configured to: that models a driver or
         // translator exception raised inside the coroutine on the io thread, which
-        // executeQuery must hand back as an io_error value.
+        // the backend agent (backend_agent_t::run) must hand back as an error value.
         asio::awaitable<core::result_wrapper_t<std::unique_ptr<data_chunk_t>>>
         runQuery(std::string_view query,
                  otterstax::function_ref_t<std::unique_ptr<data_chunk_t>(const select_result_t&)> handler) override {
@@ -104,7 +104,7 @@ namespace ch {
             co_return 42;
         }
 
-        // Metadata overload (ClickhouseManager::discover: named types and the
+        // Metadata overload (the ClickHouse discovery of backend_agent_t: named types and the
         // schema probe): a coroutine reporting the failure as a value, the same
         // channel a real connector uses.
         asio::awaitable<core::error_t>

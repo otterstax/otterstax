@@ -77,6 +77,9 @@ namespace {
         if (auto not_map = require_map(node, field, resource); not_map.contains_error()) {
             return not_map;
         }
+        if (auto unknown = require_known_keys(node, field, {"threads"}, resource); unknown.contains_error()) {
+            return unknown;
+        }
         // Far beyond any machine; refuses a typo that would spawn a million threads.
         constexpr long long max_threads = 4096;
         if (node["threads"]) {
@@ -109,10 +112,23 @@ namespace {
         return core::error_t::no_error();
     }
 
+    // A wire server's section of one key, `port` (service.mysql / service.postgres): a section that is
+    // not a mapping is read_port's to refuse.
+    core::error_t known_port_section(const YAML::Node& section, std::string_view field, std::pmr::memory_resource* resource) {
+        if (!section.IsMap()) {
+            return core::error_t::no_error();
+        }
+        return require_known_keys(section, field, {"port"}, resource);
+    }
+
     core::result_wrapper_t<FlightSqlConfig> parse_flight_sql(const YAML::Node& config,
                                                              std::pmr::memory_resource* resource) {
         if (auto not_map = require_map(config, "service.flight_sql", resource); not_map.contains_error()) {
             return not_map;
+        }
+        if (auto unknown = require_known_keys(config, "service.flight_sql", {"host", "port"}, resource);
+            unknown.contains_error()) {
+            return unknown;
         }
         FlightSqlConfig flight_config;
         if (config["host"]) {
@@ -133,6 +149,11 @@ namespace {
                                                                    std::pmr::memory_resource* resource) {
         if (auto not_map = require_map(config, "service.spark_connect", resource); not_map.contains_error()) {
             return not_map;
+        }
+        if (auto unknown =
+                require_known_keys(config, "service.spark_connect", {"host", "port", "session_timeout_s"}, resource);
+            unknown.contains_error()) {
+            return unknown;
         }
         SparkConnectConfig spark_config;
         if (config["host"]) {
@@ -166,6 +187,11 @@ namespace {
         if (auto not_map = require_map(config, "service.connection_retry", resource); not_map.contains_error()) {
             return not_map;
         }
+        if (auto unknown =
+                require_known_keys(config, "service.connection_retry", {"max_attempts", "delay_ms"}, resource);
+            unknown.contains_error()) {
+            return unknown;
+        }
         ConnectionRetryConfig retry;
         if (config["max_attempts"]) {
             auto max_attempts =
@@ -189,6 +215,10 @@ namespace {
         if (auto not_map = require_map(config, "service.engine", resource); not_map.contains_error()) {
             return not_map;
         }
+        if (auto unknown = require_known_keys(config, "service.engine", {"data_dir", "log_dir"}, resource);
+            unknown.contains_error()) {
+            return unknown;
+        }
         EngineConfig engine;
         const std::array<std::pair<const char*, std::string*>, 2> directories{{
             {"data_dir", &engine.data_dir},
@@ -209,6 +239,21 @@ namespace {
     core::result_wrapper_t<RuntimeConfig> parse_runtime(const YAML::Node& config, std::pmr::memory_resource* resource) {
         if (auto not_map = require_map(config, "service.runtime", resource); not_map.contains_error()) {
             return not_map;
+        }
+        if (auto unknown = require_known_keys(config,
+                                              "service.runtime",
+                                              {"general",
+                                               "exec",
+                                               "disk",
+                                               "sessions",
+                                               "backends",
+                                               "mysql_io",
+                                               "postgres_io",
+                                               "flight_sql_io",
+                                               "spark_connect_io"},
+                                              resource);
+            unknown.contains_error()) {
+            return unknown;
         }
         RuntimeConfig runtime;
         // The engine's pools need a thread each to run on; every other pool takes
@@ -272,6 +317,10 @@ core::result_wrapper_t<ServiceConfig> load_config(std::pmr::memory_resource* res
         if (auto not_map = require_map(config, "(document)", resource); not_map.contains_error()) {
             return not_map;
         }
+        if (auto unknown = require_known_keys(config, "(document)", {"service", "connections"}, resource);
+            unknown.contains_error()) {
+            return unknown;
+        }
     }
 
     ServiceConfig server_config;
@@ -284,6 +333,14 @@ core::result_wrapper_t<ServiceConfig> load_config(std::pmr::memory_resource* res
         if (auto not_map = require_map(service, "service", resource); not_map.contains_error()) {
             return not_map;
         }
+        if (auto unknown = require_known_keys(
+                service,
+                "service",
+                {"flight_sql", "mysql", "postgres", "spark_connect", "connection_retry", "engine", "runtime"},
+                resource);
+            unknown.contains_error()) {
+            return unknown;
+        }
         if (service["flight_sql"]) {
             auto flight_sql = parse_flight_sql(service["flight_sql"], resource);
             if (flight_sql.has_error()) {
@@ -292,12 +349,19 @@ core::result_wrapper_t<ServiceConfig> load_config(std::pmr::memory_resource* res
             server_config.flight_sql = std::move(flight_sql.value());
         }
         if (service["mysql"]) {
+            if (auto unknown = known_port_section(service["mysql"], "service.mysql", resource); unknown.contains_error()) {
+                return unknown;
+            }
             if (auto port = read_port(service["mysql"], "service.mysql", server_config.mysql.port, resource);
                 port.contains_error()) {
                 return port;
             }
         }
         if (service["postgres"]) {
+            if (auto unknown = known_port_section(service["postgres"], "service.postgres", resource);
+                unknown.contains_error()) {
+                return unknown;
+            }
             if (auto port =
                     read_port(service["postgres"], "service.postgres", server_config.postgres.port, resource);
                 port.contains_error()) {

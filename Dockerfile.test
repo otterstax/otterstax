@@ -45,6 +45,14 @@ ARG BUILD_JOBS=0
 # (google/sanitizers#1259), yielding false "double lock" reports on every
 # condition_variable::wait_for, and one process must link a single libtsan.
 ARG TSAN_DEPS=false
+# ASAN_DEPS=true rebuilds gRPC with abseil / protobuf / re2, and otterbrix
+# (whose library embeds and exports abseil + re2), from source with
+# -fsanitize=address (see asan-deps.profile; protoc / grpc_cpp_plugin come from
+# a plain build-context grpc / protobuf, as for TSAN). Their headers change
+# layouts under ASAN (gpr_mu's leak_checker, abseil's swisstable generations),
+# so an ENABLE_ASAN=ON build over the prebuilt packages hands them the wrong
+# field addresses. Pass it with ENABLE_ASAN=ON.
+ARG ASAN_DEPS=false
 
 RUN if [ "$TSAN_DEPS" = "true" ]; then \
         apt-get update && \
@@ -56,7 +64,7 @@ RUN if [ "$TSAN_DEPS" = "true" ]; then \
 # cmake_layout places generators + libs at build/${BUILD_TYPE}/ — matching
 # the devcontainer preset layout exactly.
 WORKDIR /app
-COPY conanfile.py tsan-deps.profile ./
+COPY conanfile.py tsan-deps.profile asan-deps.profile ./
 COPY cmake/conan-hooks/hook_librdkafka_c11threads_off.py ./conan-hooks/
 # TEMPORARY (OTB-tag, docs/proposals/otterbrix-embedding.md): the pinned
 # otterbrix/1.0.0b2-embedding.* exists only in the developer's local Conan
@@ -94,31 +102,21 @@ RUN _local_build=() && \
             --build="otterbrix/*" --build="actor-zeta/*" --build="librdkafka/*" \
             -pr:h ./tsan-deps.profile \
             -s build_type=${BUILD_TYPE} \
-            -s compiler.cppstd=gnu20 \
-            -s 'clickhouse-cpp/*:compiler.cppstd=17' \
-            -s 'abseil/*:compiler.cppstd=17' \
-            -s 'protobuf/*:compiler.cppstd=17' \
-            -s 're2/*:compiler.cppstd=17' \
-            -s 'grpc/*:compiler.cppstd=17'; \
+            -s compiler.cppstd=gnu20; \
+    elif [ "$ASAN_DEPS" = "true" ]; then \
+        conan install conanfile.py --build missing "${_local_build[@]}" "${_jobs_conf[@]}" \
+            -pr:h ./asan-deps.profile -pr:b default \
+            -s build_type=${BUILD_TYPE} \
+            -s compiler.cppstd=gnu20; \
     elif [ "$WITH_TRACY" = "true" ]; then \
         conan install conanfile.py --build missing "${_local_build[@]}" "${_jobs_conf[@]}" \
             -s build_type=${BUILD_TYPE} \
             -s compiler.cppstd=gnu20 \
-            -s 'clickhouse-cpp/*:compiler.cppstd=17' \
-            -s 'abseil/*:compiler.cppstd=17' \
-            -s 'protobuf/*:compiler.cppstd=17' \
-            -s 're2/*:compiler.cppstd=17' \
-            -s 'grpc/*:compiler.cppstd=17' \
             -o "&:with_tracy=True"; \
     else \
         conan install conanfile.py --build missing "${_local_build[@]}" "${_jobs_conf[@]}" \
             -s build_type=${BUILD_TYPE} \
-            -s compiler.cppstd=gnu20 \
-            -s 'clickhouse-cpp/*:compiler.cppstd=17' \
-            -s 'abseil/*:compiler.cppstd=17' \
-            -s 'protobuf/*:compiler.cppstd=17' \
-            -s 're2/*:compiler.cppstd=17' \
-            -s 'grpc/*:compiler.cppstd=17'; \
+            -s compiler.cppstd=gnu20; \
     fi
 
 # Install perf tools when WITH_PERF=true.

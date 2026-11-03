@@ -374,12 +374,23 @@ namespace otterstax::session {
         actor_zeta::unique_future<components::cursor::cursor_t_ptr>
         send_to_engine(ParsedQueryData& data, engine_call_t call, uint64_t window);
 
+        // What register_missed did: `registered` a table; `unreachable` the
+        // failure of a connection whose discovery could not reach its backend
+        // (io_error / connection_closed: the connection lost or never opened,
+        // marked unreachable, no free connection), which the client gets
+        // instead of the miss when nothing was registered.
+        struct registration_outcome_t {
+            bool registered{false};
+            std::optional<core::error_t> unreachable;
+        };
+
         // Registers the tables `error` says the statement missed among `names`
         // (its names as written): a four-part name of a connection, and `t` /
         // `s.t` completed with the session's place (place()) for every
-        // connection whose database the place's is. True when one was
-        // registered; one the backend does not have leaves the others.
-        unique_future<bool> register_missed(core::error_t error, std::pmr::vector<qualified_name_t> names);
+        // connection whose database the place's is. One the backend does not
+        // have leaves the others.
+        unique_future<registration_outcome_t> register_missed(core::error_t error,
+                                                              std::pmr::vector<qualified_name_t> names);
 
         // execute_statement / execute_prepared_statement / execute_window.
         unique_future<session_result> execute_entry(statement_id_t id, bound_values_t values, uint64_t window);

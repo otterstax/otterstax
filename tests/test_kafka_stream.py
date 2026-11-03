@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2025-2026  OtterStax
 
-"""Kafka continuous STREAM integration test (§5.2c, stateless).
+"""Kafka continuous STREAM integration test (stateless).
 
 CREATE SOURCE, then CREATE STREAM ... AS SELECT ... WHERE ... — a continuous
 worker consumes the source topic, applies the SELECT (filter + projection) to

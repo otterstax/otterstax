@@ -8,7 +8,7 @@
 // PostgreSQL ENUM labels, ClickHouse named types — are part of the discovery,
 // so their failure leaves the connection out instead of degrading it silently;
 // the ClickHouse named-types query quotes the names it embeds; and a
-// rediscovered table carries the backend's current types, not the ones seen
+// table registered again carries the backend's current types, not the ones seen
 // first, which is what a read of it converts with.
 
 #include "agent_driver.hpp"
@@ -463,7 +463,7 @@ TEST_CASE("MySQL discovery: a configured table is the only table the startup dis
 }
 
 
-// ── MySQL: a server under NO_BACKSLASH_ESCAPES is refused at startup ──
+// ── MySQL: a server under NO_BACKSLASH_ESCAPES is refused at startup (its session's check) ──
 
 namespace {
 
@@ -532,13 +532,14 @@ TEST_CASE("MySQL discovery: a server under NO_BACKSLASH_ESCAPES is left out and 
     REQUIRE(refused);
     CHECK(refused->is_error());
 
-    // The discovery itself answers the refusal, code and text: asked of an
-    // agent over the same connector.
-    otterstax::test::agent_driver_t agent(&sql_mode_mysql_factory, "nbe");
-    auto reply = agent.discover(
-        qualified_name_t{core::connection_name_t{"nbe"}, core::dbname_t{"db"}, core::schema_t{""}, core::relname_t{"orders"}});
-    REQUIRE(reply.has_error());
-    INFO(reply.error().what.c_str());
-    CHECK(reply.error().type == core::error_code_t::unimplemented_yet);
-    CHECK(std::string{reply.error().what.c_str()}.find("NO_BACKSLASH_ESCAPES") != std::string::npos);
+    // The connect itself answers the refusal, code and text: the session an
+    // agent over the same connector opens is checked before it serves.
+    std::pmr::synchronized_pool_resource resource{std::pmr::new_delete_resource()};
+    auto agent = actor_zeta::spawn<otterstax::federation::backend_agent_t>(&resource, "nbe");
+    agent->attach(sql_mode_mysql_factory(&resource, agent->io(), boost::mysql::connect_params{}, "nbe"));
+    auto refusal = agent->connect();
+    INFO(refusal.what.c_str());
+    CHECK(refusal.type == core::error_code_t::unimplemented_yet);
+    CHECK(std::string{refusal.what.c_str()}.find("NO_BACKSLASH_ESCAPES") != std::string::npos);
+    CHECK(agent->session_refused());
 }

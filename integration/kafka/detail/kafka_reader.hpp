@@ -31,7 +31,7 @@ namespace otterstax::kafka::detail {
     // of <=1024-row chunks (never combined). Serializes every chunk's rows, in
     // order, one JSON object per row keyed by column alias. Pure.
     // A column whose type has no JSON encoding — anything but the five a SOURCE can
-    // declare plus the UBIGINT a COUNT projects — is a conversion_failure naming the
+    // declare plus the UBIGINT a COUNT projects — is unimplemented_yet naming the
     // column, never a null written in its place: such a null ingests back as a SQL
     // NULL, so the loss would survive the round-trip guard below and reach the topic
     core::result_wrapper_t<std::vector<std::string>>

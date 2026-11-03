@@ -120,27 +120,27 @@ service:
     CHECK(loaded.engine.log_dir.empty());
 }
 
-// The keys an older config.yaml may still carry are not read any more: like
-// any key the reader does not know, they are ignored and the file loads.
-TEST_CASE("service.engine: keys no longer read are ignored") {
-    auto loaded = load_ok(R"(
-service:
-  engine:
-    data_dir: /srv/otterstax/data
-    wal_dir: /srv/otterstax/wal
-    disk_dir: /srv/otterstax/disk
-    log_level: warn
-    executor_pool_size: 8
-    dml_flush_row_threshold: 4096
-    pump: { in_flight_us: 20, idle_us: 5000 }
-  runtime:
-    general:  { threads: 4, max_throughput: 500 }
-    sessions: { threads: 16, max_throughput: 0 }
-)");
-    CHECK(loaded.engine.data_dir == "/srv/otterstax/data");
-    CHECK(loaded.engine.log_dir.empty());
-    CHECK(loaded.runtime.general.threads == 4);
-    CHECK(loaded.runtime.sessions.threads == 16);
+// The keys an older config.yaml may still carry are not read any more: like any key the reader
+// does not know, each is refused, naming the key and its section, so the operator removes it.
+TEST_CASE("service.engine: keys no longer read are refused") {
+    const std::pair<const char*, const char*> cases[] = {
+        {"service:\n  engine:\n    data_dir: /d\n    wal_dir: /w\n", R"(unknown key "wal_dir" in service.engine)"},
+        {"service:\n  engine:\n    disk_dir: /d\n", R"(unknown key "disk_dir" in service.engine)"},
+        {"service:\n  engine:\n    log_level: warn\n", R"(unknown key "log_level" in service.engine)"},
+        {"service:\n  engine:\n    executor_pool_size: 8\n", R"(unknown key "executor_pool_size" in service.engine)"},
+        {"service:\n  engine:\n    dml_flush_row_threshold: 4096\n",
+         R"(unknown key "dml_flush_row_threshold" in service.engine)"},
+        {"service:\n  engine:\n    pump: { in_flight_us: 20, idle_us: 5000 }\n", R"(unknown key "pump" in service.engine)"},
+        {"service:\n  runtime:\n    general: { threads: 4, max_throughput: 500 }\n",
+         R"(unknown key "max_throughput" in service.runtime.general)"},
+    };
+    for (const auto& [yaml, message] : cases) {
+        INFO(yaml);
+        auto error = load_error(yaml);
+        INFO(error.what.c_str());
+        CHECK(error.type == core::error_code_t::invalid_parameter);
+        CHECK(mentions(error, message));
+    }
 }
 
 TEST_CASE("service.engine: invalid values are invalid_parameter naming the field") {

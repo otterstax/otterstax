@@ -334,7 +334,7 @@ namespace {
         return verdict;
     }
 
-    // One rediscovery through the connection's actor (its discover message).
+    // One discovery through the connection's actor (its discover message).
     thread_verdict discover_once(fed::backend_actor_t& actor, const qualified_name_t& scope) {
         thread_verdict verdict;
         auto [needs_sched, future] = actor_zeta::send(&actor, &fed::backend_actor_t::discover, scope);

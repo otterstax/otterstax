@@ -267,3 +267,40 @@ TEST_CASE("names: a local table never answers a connection's name, nor the conne
                               "ORDER BY datconnection;");
     CHECK(rows_of(databases) == std::vector<std::string>{"bill|", "bill|sales"});
 }
+
+// A connection whose config.yaml names one `table:` is that table only: a miss of any other name of
+// it is no registration target (the statement's own error answers, no discovery is asked), the
+// configured table is one — MySQL by its database, PostgreSQL by its configured schema too.
+TEST_CASE("registration: a connection configured with one table is a target for that table alone") {
+    fed_stack_t stack({{"my", backend_type_t::MySQL, "Bill", "", 2, "Orders"},
+                       {"pg", backend_type_t::PostgreSQL, "shop", "Sales", 2, "Orders"}});
+    for (const char* table : {"Orders", "other"}) {
+        stack.backend("my").add_table({"Bill", "", table, {column("id", logical_type::BIGINT)}, {{std::int64_t{1}}}});
+        stack.backend("pg").add_table({"shop", "Sales", table, {column("id", logical_type::BIGINT)}, {{std::int64_t{2}}}});
+    }
+    stack.open();
+    // The startup discovery is scoped by the table: only it is in the catalog.
+    CHECK(rows_of(stack.ok("SELECT id FROM my.bill.public.orders;")) == std::vector<std::string>{"1"});
+    CHECK(rows_of(stack.ok("SELECT id FROM pg.shop.sales.orders;")) == std::vector<std::string>{"2"});
+    const auto connections = stack.connections();
+
+    auto missed = stack.refused("SELECT id FROM my.bill.public.other;");
+    CHECK(missed.type == core::error_code_t::table_not_exists);
+    const auto name = [](const char* connection, const char* database, const char* schema, const char* table) {
+        return qualified_name_t{core::connection_name_t{connection},
+                                core::dbname_t{database},
+                                core::schema_t{schema},
+                                core::relname_t{table}};
+    };
+    CHECK_FALSE(cat::registration_target(missed, name("my", "bill", "public", "other"), connections).has_value());
+    CHECK_FALSE(cat::registration_target(missed, name("pg", "shop", "sales", "other"), connections).has_value());
+
+    // The configured table, written in any case, is the target (a table the startup did not find).
+    auto mine = cat::registration_target(missed, name("my", "bill", "public", "orders"), connections);
+    REQUIRE(mine.has_value());
+    CHECK(mine->second.collection.t == "Orders");
+    auto pg = cat::registration_target(missed, name("pg", "shop", "sales", "orders"), connections);
+    REQUIRE(pg.has_value());
+    CHECK(pg->second.schema.t == "Sales");
+    CHECK(pg->second.collection.t == "Orders");
+}

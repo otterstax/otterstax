@@ -29,7 +29,7 @@ namespace tsl {
     // SimpleAggregateFunction, Tuple field names and Bool over UInt8); a result column that merely
     // reads like a table column (`AVG(x) AS x`) is its wire type. Every value written has its
     // column's type: a wire value that cannot be converted to it — a wire type without a reader (Map,
-    // the geo types, Nothing) — is conversion_failure; the message is owned by `res`.
+    // the geo types, Nothing) — is datatype_mismatch; the message is owned by `res`.
     core::result_wrapper_t<data_chunk_t> ch_to_chunk(std::pmr::memory_resource* res,
                                                      const std::vector<clickhouse::Block>& blocks,
                                                      const std::vector<std::optional<std::string>>& column_types);

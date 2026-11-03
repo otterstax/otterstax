@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2025-2026  OtterStax
 
-"""Kafka STREAM write integration test (§5.2 #2 — ksql-style INSERT INTO stream).
+"""Kafka STREAM write integration test (ksql-style INSERT INTO stream).
 
 Unlike a SOURCE (which has a backing table), a STREAM is a continuous query with
 no column list. `INSERT INTO kafka.<stream> VALUES(...)` still produces the rows

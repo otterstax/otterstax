@@ -303,7 +303,7 @@ TEST_CASE("mysql protocol over the wire: Connector/J's variable query is answere
     CHECK_FALSE(vars.rows[0][2].has_value());
     CHECK(vars.rows[0][3] == std::to_string(frontend::mysql::MAX_ALLOWED_PACKET));
     // MySQL's default lexical rules: backslash escapes, "..." a string.
-    CHECK(vars.rows[0][4] == "PIPES_AS_CONCAT,STRICT_TRANS_TABLES");
+    CHECK(vars.rows[0][4] == "STRICT_TRANS_TABLES");
     CHECK(vars.rows[0][6] == std::to_string(frontend::CONNECTION_TIMEOUT_SEC));
     CHECK((vars.status & SERVER_STATUS_NO_BACKSLASH_ESCAPES) == 0);
 }

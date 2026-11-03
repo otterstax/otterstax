@@ -24,7 +24,7 @@ using namespace components;
 
 namespace tsl {
 
-    // populated by fetch_enum_types at connection-add
+    // filled from pg_type / pg_enum by the PostgreSQL backend agent (backend_agent_t::fetch_enums)
     struct pg_enum_descriptor {
         std::string typname;
         std::vector<std::string> values;
@@ -33,7 +33,8 @@ namespace tsl {
 
     // A SELECT's result becomes a chunk of its tuples (a DML's count is the
     // backend's write, never read through here). A value with no reading as its
-    // column's type is conversion_failure; the message is owned by `res`.
+    // column's type is invalid_text_representation (numeric_value_out_of_range for
+    // a number past the column's range); the message is owned by `res`.
     core::result_wrapper_t<data_chunk_t> pg_to_chunk(std::pmr::memory_resource* res, PGresult* result);
     core::result_wrapper_t<data_chunk_t>
     pg_to_chunk(std::pmr::memory_resource* res, PGresult* result, const pg_enum_oid_map& enum_oids);

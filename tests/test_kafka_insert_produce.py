@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2025-2026  OtterStax
 
-"""Kafka INSERT-produce integration test (§5.2b + §5.2 #1 schema guard).
+"""Kafka INSERT-produce integration test (with the schema guard).
 
 `INSERT INTO kafka.<source> VALUES(...)` over the PostgreSQL wire publishes the
 rows to the object's topic (durability is the Kafka log, no engine staging).

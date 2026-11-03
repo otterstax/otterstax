@@ -62,6 +62,7 @@ namespace fedtest {
         std::string database;
         std::string schema; // PostgreSQL's config `schema:`
         int pool_size{2};
+        std::string table{}; // config `table:`: the one table of the connection (empty: every table)
     };
 
     // The engine and the actors over fake servers: open() is main.cpp's startup (discovery,
@@ -97,6 +98,7 @@ namespace fedtest {
                                                            specs_[i].kind,
                                                            specs_[i].database,
                                                            specs_[i].schema,
+                                                           specs_[i].table,
                                                            i < actors_.size() ? actors_[i].get() : nullptr});
             }
             return out;
@@ -112,6 +114,11 @@ namespace fedtest {
                 std::vector<fed::backend_agent_ptr> agents;
                 for (int a = 0; a < spec.pool_size; ++a) {
                     agents.push_back(fake_agent(&resource_, spec.name, spec.kind, *backends_[i], ++number));
+                    // As remote_backends_t::open: each agent connects and checks its session (a MySQL
+                    // session's sql_mode) before it serves.
+                    if (!reachable || reachable->contains(spec.name)) {
+                        REQUIRE_FALSE(agents.back()->connect().contains_error());
+                    }
                 }
                 actors_.push_back(actor_zeta::spawn<fed::backend_actor_t>(&resource_,
                                                                           fed::connection_t{spec.name, spec.kind},
@@ -130,7 +137,7 @@ namespace fedtest {
                                            .discover(qualified_name_t{core::connection_name_t{connection.name},
                                                                       core::dbname_t{connection.database},
                                                                       core::schema_t{connection.schema},
-                                                                      core::relname_t{}});
+                                                                      core::relname_t{connection.table}});
                 }
                 discoveries.push_back(std::move(discovery));
             }

@@ -138,14 +138,14 @@ namespace mysql {
         // PostgreSQL on 5432) both sides wait for the other's first packet and
         // the call blocks until the remote auth timeout closes the socket —
         // freezing the startup thread for minutes. asyncConnect_ runs the async
-        // op under asio::cancel_after on the connection's strand (the pool is
-        // started before any addConnection) and this wrapper blocks on its
-        // marshaled outcome (spawn_marshaled), so the verdict — success, the
-        // driver's error, operation_aborted on timeout, io_error if the pool
-        // went away — always arrives as a value, never as an exception.
+        // op under asio::cancel_after on the connection's strand and this
+        // wrapper runs the connection's io_context on the calling thread until
+        // its marshaled outcome (spawn_marshaled) is ready, so the verdict —
+        // success, the driver's error, operation_aborted on timeout — always
+        // arrives as a value, never as an exception.
         //
-        // The strand is load-bearing. conn_ lives on an io_context run by N
-        // pool threads, and asio::cancel_after (boost 1.88,
+        // The strand is load-bearing. conn_ lives on an io_context more than
+        // one thread may run (a test's pool), and asio::cancel_after (boost 1.88,
         // asio/detail/timed_cancel_op.hpp) completes through TWO handlers that
         // share a ref_count of 2: the operation's handle_op does
         // `timer_.cancel(); release();`, the cancelled timer's handle_timer
@@ -165,8 +165,8 @@ namespace mysql {
         // The connect itself: one async_connect under the deadline, awaited on
         // conn_'s strand. On failure the error is io_error carrying
         // ec.message(); `diag` (the caller's) carries the server message. No
-        // Tracy zone: the body runs on a pool thread while connectWithTimeout
-        // blocks on the startup thread.
+        // Tracy zone: the coroutine suspends at its co_await and resumes inside
+        // connectWithTimeout's run_one_for (or on a test's pool thread).
         asio::awaitable<core::error_t> asyncConnect_(boost::mysql::diagnostics& diag);
 
         // The backend's verdict on a statement, classified (errors.hpp) and carrying

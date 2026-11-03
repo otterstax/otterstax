@@ -54,10 +54,13 @@ namespace otterstax::session::plan {
     // DELETE, a CREATE / ALTER / DROP of a relation, an index, a view, a
     // sequence, a type, a schema. nullopt for every other statement (a query, a
     // transaction or setting statement, CREATE / DROP DATABASE — those are
-    // database_ddl_target's). `drops_schema`: a DROP SCHEMA.
+    // database_ddl_target's). `drops_schema`: a DROP SCHEMA. `table_ddl`: a
+    // CREATE / ALTER / DROP TABLE, a constraint or a CREATE INDEX — the name is
+    // the table's (catalog::check_table_scope).
     struct write_target_t {
         qualified_name_t name;
         bool drops_schema{false};
+        bool table_ddl{false};
     };
     std::optional<write_target_t> write_target(const ParsedQueryData& data);
 

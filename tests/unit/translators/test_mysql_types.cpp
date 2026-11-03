@@ -30,13 +30,13 @@ using namespace components::types;
 // and the reader that writes its values, so the schema a discovery registers
 // and the types the executed chunk carries are the same answer by construction.
 // mysql_to_struct is that answer taken off a result set's column definitions —
-// what MySQLManager::discover mirrors into the catalog — and mysql_to_chunk the
+// what the backend agent's discovery registers in the catalog — and mysql_to_chunk the
 // chunk built under it.
 //
 // These cases pin the table per column type AND the agreement between the two
 // paths over every type MySQL can report, which is what a second, drifting copy
 // of the map broke: the copy had no BIGINT / date / datetime / json arm, so a
-// real BIGINT column mirrored into the catalog with no type at all (NA) while
+// real BIGINT column registered in the catalog with no type at all (NA) while
 // its rows arrived as BIGINT.
 
 namespace {
@@ -153,7 +153,7 @@ TEST_CASE("mysql discovery types every column exactly as the data path types it"
             REQUIRE(discovered.size() == 1);
             REQUIRE(discovered.front().type() == executed.front().type());
             REQUIRE(discovered.front().alias() == executed.front().alias());
-            // No column is ever mirrored without a type.
+            // No column is ever registered without a type.
             REQUIRE(discovered.front().type() != logical_type::NA);
         }
     }

@@ -2,13 +2,13 @@
 // Copyright 2025-2026  OtterStax
 //
 // Google Benchmark targets for SQL query generation:
-//   sql_gen::generate_query() — the statement the federation's pushdown rule
-//                               sends to a backend for one query block
+//   sql_gen::generate_query() — the statement a backend actor sends to its
+//                               backend for one query block it took
 //
 // The query blocks come from GreenplumParser::parse(): the aggregate that reads
-// the remote table (its name carries the uid slot) with its clauses — what the
-// pushdown rule hands the generator. The rule generates over the engine's
-// validated tree; the parse tree here has the same shape before validation,
+// the remote table (its name carries the connection slot) with its clauses — what
+// the backend actor's offer (storage_offer) hands the generator. The actor generates
+// over the engine's validated tree; the parse tree here has the same shape before validation,
 // which is what the generator's own cost depends on. GreenplumParser needs the
 // named loggers: bench_parser.cpp registers them before main in this binary.
 

@@ -541,8 +541,8 @@ TEST_CASE("engine alone: a literal INSERT with a NULL past the first chunk of a 
 // (id Int32, score Int32, nums Array(Nullable(Int32)), tags Array(Nullable(String)),
 // rec Tuple(a Int32, b Nullable(String))) — the system.columns types and the header block of the
 // `WHERE 1 = 0` probe — and whose data query answers ClickHouse blocks for the generated statement's
-// SELECT list. The blocks go through the ClickhouseManager's own converter (ch_to_chunk under the
-// discovered named types), then the federation's operator hands them to the engine in windows.
+// SELECT list. The blocks go through the ClickHouse agent's own converter (ch_to_chunk under the
+// discovered named types), then the connection's backend actor hands them to the engine in pages.
 
 namespace {
 
@@ -570,6 +570,8 @@ namespace {
         {"nums", "Array(Nullable(Int32))"},
         {"tags", "Array(Nullable(String))"},
         {"rec", "Tuple(a Int32, b Nullable(String))"},
+        // The demo's ev.sessions.props: a named Tuple two levels deep.
+        {"props", "Tuple(channel String, geo Tuple(ip String))"},
     };
 
     // nums of row `row`: row % 4 elements row * 10 + i (every fourth row an empty list), the element
@@ -642,6 +644,16 @@ namespace {
                 column->AppendAsColumn(ch_nullable<clickhouse::ColumnString, std::string>(ch_tags_of(row)));
             }
             return column;
+        }
+        if (name == "props") {
+            auto channel = std::make_shared<clickhouse::ColumnString>();
+            auto ip = std::make_shared<clickhouse::ColumnString>();
+            for (size_t row = first; row < last; ++row) {
+                channel->Append("c" + std::to_string(row));
+                ip->Append("10.0.0." + std::to_string(row % 256));
+            }
+            auto geo = std::make_shared<clickhouse::ColumnTuple>(std::vector<clickhouse::ColumnRef>{ip});
+            return std::make_shared<clickhouse::ColumnTuple>(std::vector<clickhouse::ColumnRef>{channel, geo});
         }
         auto a = std::make_shared<clickhouse::ColumnInt32>();
         std::vector<std::optional<std::string>> b;
@@ -836,7 +848,7 @@ namespace {
 
 } // namespace
 
-TEST_CASE("ClickhouseManager slice: 2500 rows with LIST and STRUCT columns reach the engine cursor intact") {
+TEST_CASE("ClickHouse agent slice: 2500 rows with LIST and STRUCT columns reach the engine cursor intact") {
     ch_backend_stack_owner owner("/tmp/test_backend_managers_ch_nested_otb");
     auto s = owner.stack();
 
@@ -863,7 +875,7 @@ TEST_CASE("ClickhouseManager slice: 2500 rows with LIST and STRUCT columns reach
     }
 }
 
-TEST_CASE("ClickhouseManager slice: an engine JOIN on the scalar id keeps the LIST and STRUCT values of its rows") {
+TEST_CASE("ClickHouse agent slice: an engine JOIN on the scalar id keeps the LIST and STRUCT values of its rows") {
     ch_backend_stack_owner owner("/tmp/test_backend_managers_ch_join_otb");
     auto s = owner.stack();
     session_hash_t id = 9960;
@@ -970,5 +982,41 @@ TEST_CASE("ClickHouse prepare_schema: named-type columns are prepared and execut
     for (size_t col = 0; col < column_types.size(); ++col) {
         INFO("column " << col);
         REQUIRE(column_types[col] == schema.child_types()[col]);
+    }
+}
+
+// The demo's steps 3d / 5: `props Tuple(channel String, geo Tuple(ip String))` read by a statement
+// pushed whole — a SELECT block with a WHERE, a derived table — whose answer names no table column
+// for the ClickHouse reader: the wire carries no Tuple field names, so the backend actor declares the
+// column's system.columns type for an answer column that is the table's column, and the page is the
+// registered type (no STRUCT cast, which the engine has none of).
+TEST_CASE("ClickHouse agent slice: a two-level named Tuple read by a statement pushed whole keeps its fields") {
+    ch_backend_stack_owner owner("/tmp/test_backend_managers_ch_nested_tuple_otb");
+    auto s = owner.stack();
+    session_hash_t id = 9995;
+    for (const auto& sql :
+         {from_ch_events("SELECT id, props", " WHERE id >= 2490"),
+          std::string{"SELECT d.id, d.props FROM (SELECT id, props FROM "} + kChEvents + " WHERE id >= 2490) AS d;"}) {
+        INFO(sql);
+        auto selected = otterstax::test::run_session_sql_payload(s, id++, sql);
+        INFO((selected.has_error() ? selected.error().what.c_str() : "ok"));
+        REQUIRE_FALSE(selected.has_error());
+        uint64_t rows = 0;
+        for (const auto& chunk : selected.value().chunks) {
+            for (uint64_t at = 0; at < chunk.size(); ++at, ++rows) {
+                const auto row = otterstax::test::cell(chunk, 0, at).value<int32_t>();
+                const std::string channel = "c" + std::to_string(row);
+                const std::string ip = "10.0.0." + std::to_string(row % 256);
+                REQUIRE(chunk.column_count() == 2);
+                const auto props = otterstax::test::cell(chunk, 1, at);
+                REQUIRE(chunk.types()[1].child_types()[0].alias() == "channel");
+                REQUIRE(chunk.types()[1].child_types()[1].alias() == "geo");
+                REQUIRE(chunk.types()[1].child_types()[1].child_types()[0].alias() == "ip");
+                REQUIRE(props.child(0).value<std::string_view>() == channel);
+                REQUIRE(props.child(1).child(0).value<std::string_view>() == ip);
+            }
+        }
+        // The mock answers every row whatever the WHERE: the statement was pushed whole.
+        CHECK(rows == ch_event_rows);
     }
 }

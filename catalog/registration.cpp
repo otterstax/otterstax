@@ -222,6 +222,13 @@ namespace otterstax::catalog {
             if (fed::fold_identifier(connection.database) != fed::fold_identifier(written.database.t)) {
                 return std::nullopt; // a connection reaches its one database
             }
+            // A connection configured with one `table:` is that table only, in the configured
+            // spelling; any other name of it misses.
+            if (!connection.table.empty() &&
+                fed::fold_identifier(connection.table) != fed::fold_identifier(written.collection.t)) {
+                return std::nullopt;
+            }
+            const std::string& table = connection.table.empty() ? written.collection.t : connection.table;
             if (connection.kind != backend_type_t::PostgreSQL) {
                 if (fed::fold_identifier(written.schema.t) != "public") {
                     return std::nullopt;
@@ -230,7 +237,7 @@ namespace otterstax::catalog {
                                  qualified_name_t{core::connection_name_t{connection.name},
                                                   core::dbname_t{connection.database},
                                                   core::schema_t{},
-                                                  core::relname_t{written.collection.t}}};
+                                                  core::relname_t{table}}};
             }
             if (!connection.schema.empty() &&
                 fed::fold_identifier(connection.schema) != fed::fold_identifier(written.schema.t)) {
@@ -241,9 +248,33 @@ namespace otterstax::catalog {
                                               core::dbname_t{connection.database},
                                               core::schema_t{connection.schema.empty() ? written.schema.t
                                                                                        : connection.schema},
-                                              core::relname_t{written.collection.t}}};
+                                              core::relname_t{table}}};
         }
         return std::nullopt;
+    }
+
+    core::error_t check_table_scope(std::pmr::memory_resource* resource,
+                                    const qualified_name_t& written,
+                                    std::span<const configured_connection_t> connections) {
+        OTX_ZONE_N("catalog::check_table_scope");
+        if (written.connection.t.empty()) {
+            return core::error_t::no_error();
+        }
+        const auto folded = fed::fold_identifier(written.connection.t);
+        for (const auto& connection : connections) {
+            if (fed::fold_identifier(connection.name) != folded) {
+                continue;
+            }
+            if (connection.table.empty() ||
+                fed::fold_identifier(connection.table) == fed::fold_identifier(written.collection.t)) {
+                return core::error_t::no_error();
+            }
+            const std::string what = "connection \"" + connection.name + "\" is configured with table \"" +
+                                     connection.table + "\": DDL of its table \"" + written.collection.t +
+                                     "\" is refused";
+            return core::error_t(core::error_code_t::invalid_parameter, std::pmr::string{what.c_str(), resource});
+        }
+        return core::error_t::no_error();
     }
 
     core::error_t register_connections(std::pmr::memory_resource* resource,
@@ -318,7 +349,9 @@ namespace otterstax::catalog {
         for (const auto& chunk : names_oid.value()->chunks()) {
             if (chunk.size() > 0) {
                 for (const auto& discovery : connections) {
-                    discovery.connection.actor->set_names_table(static_cast<fed::oid_t>(integer_at(chunk.data[0], 0)));
+                    if (discovery.connection.actor != nullptr) { // a connection left out has none
+                        discovery.connection.actor->set_names_table(static_cast<fed::oid_t>(integer_at(chunk.data[0], 0)));
+                    }
                 }
             }
         }

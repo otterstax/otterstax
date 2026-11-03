@@ -6,7 +6,7 @@
 // and a busy one when its statement in flight has finished, refusing what was
 // queued behind it),
 // one statement at a time across real suspensions (the engine on its own pools,
-// a slow backend on the connector pool), and the connection's engine session:
+// a slow backend on the backends pool), and the connection's engine session:
 // BEGIN / COMMIT / ROLLBACK / SAVEPOINT over engine tables with PostgreSQL
 // semantics, isolated per connection, the status the engine stamps on every
 // answer, SET in the engine, and close_session when the session closes.
@@ -24,6 +24,8 @@
 
 #include <chrono>
 #include <condition_variable>
+#include <functional>
+#include <optional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -49,7 +51,7 @@ namespace {
     constexpr auto kSlowFor = std::chrono::milliseconds(800);
 
     // A remote SELECT whose backend answers after kSlowFor: the session awaits
-    // the MySQL integration backend while the mock sleeps on the connector pool.
+    // the MySQL backend actor while the mock sleeps on its agent's backends-pool thread.
     std::unique_ptr<mysql::IConnector> slow_mysql_factory(std::pmr::memory_resource* resource,
                                                           boost::asio::io_context&,
                                                           boost::mysql::connect_params,
@@ -300,14 +302,135 @@ TEST_CASE("session close: a statement in flight finishes and what was queued beh
     CHECK(probe->is_error());
 }
 
-// Hidden until OTB-notify (docs/proposals/otterbrix-embedding.md §4.13): a
+namespace {
+
+    constexpr const char* kRemoteSelect = "SELECT * FROM orders.db.public.\"table\";";
+
+    // One MySQL connection "orders" of one agent (pool_size 1): every block that reads it holds
+    // that agent until it ends.
+    stack_options_t one_agent_options() {
+        stack_options_t options;
+        options.connections.mysql = otterstax::test::mock_mysql({"orders"});
+        options.connections.mysql.front().pool_size = 1;
+        return options;
+    }
+
+    otterstax::federation::backend_actor_t& orders_actor(session_stack_owner& owner) {
+        for (const auto& connection : owner.remote().connections()) {
+            if (connection.name == "orders") {
+                REQUIRE(connection.actor != nullptr);
+                return *connection.actor;
+            }
+        }
+        FAIL("no connection orders");
+        throw;
+    }
+
+    bool wait_until(const std::function<bool()>& done, std::chrono::milliseconds timeout) {
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (!done()) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                return false;
+            }
+            std::this_thread::sleep_for(1ms);
+        }
+        return true;
+    }
+
+} // namespace
+
+// A client that closes its connection inside a block (a driver with autocommit off: its first
+// SELECT opened the block) frees the backend connection the block held at once. The engine's own
+// ROLLBACK of the closed session is a statement for one of its executors (four, each running one
+// statement at a time), and here every executor runs a statement of another block waiting for that
+// very connection: the agent comes back only because the session's close reaches the backend actor
+// itself, never behind those statements.
+TEST_CASE("session close: a closed block's backend connection serves the blocks waiting for it at once") {
+    session_stack_owner owner(otterstax::test::unique_test_dir("otterstax_session_close_pin"), one_agent_options());
+    auto& actor = orders_actor(owner);
+    actor.set_checkout_timeout(30s);
+    auto holder = owner.open_session();
+    const auto h = owner.stack().on(holder->address());
+    run_session_or_fail(h, 1, "BEGIN;");
+    run_session_or_fail(h, 2, kRemoteSelect);
+    REQUIRE(actor.pinned() == 1);
+
+    // More blocks wait for the agent than the engine has executors: their BEGINs first, then
+    // their SELECTs one after another, so the SELECTs take every executor.
+    constexpr std::size_t blocks = 6;
+    std::vector<otterstax::session::session_ptr> waiting;
+    std::vector<std::optional<future_t>> selects(blocks);
+    for (std::size_t i = 0; i < blocks; ++i) {
+        waiting.push_back(owner.open_session());
+        run_session_or_fail(owner.stack().on(waiting.back()->address()), 1, "BEGIN;");
+    }
+    for (std::size_t i = 0; i < blocks; ++i) {
+        selects[i].emplace(send_sql(waiting[i]->address(), 2, kRemoteSelect));
+    }
+    // Four of them reached the actor's queue, one per executor of the engine; the others wait for an
+    // executor.
+    REQUIRE(wait_until([&] { return actor.waiting() >= 4; }, 10000ms));
+
+    const auto started = std::chrono::steady_clock::now();
+    holder.reset();
+    // Each block gets the agent in turn, as the one before it closes.
+    std::size_t answered = 0;
+    const bool all = wait_until(
+        [&] {
+            for (std::size_t i = 0; i < blocks; ++i) {
+                if (selects[i] && selects[i]->is_ready()) {
+                    auto result = await_session(std::move(*selects[i]), 1000ms, owner.engine().resource());
+                    selects[i].reset();
+                    INFO((result.has_error() ? result.error().what.c_str() : ""));
+                    CHECK_FALSE(result.has_error());
+                    waiting[i].reset();
+                    ++answered;
+                }
+            }
+            return answered == blocks;
+        },
+        10000ms);
+    INFO("answered " << answered << " of " << blocks << " after "
+                     << std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count() << " s");
+    REQUIRE(all);
+    CHECK(wait_until([&] { return actor.pinned() == 0 && actor.waiting() == 0; }, 5000ms));
+}
+
+// A session closed while its block's first statement still waits in the queue for an agent: the
+// statement leaves the queue at once with the connection's close, and holds nothing after it.
+TEST_CASE("session close: a statement waiting for a backend connection leaves the queue with the close") {
+    session_stack_owner owner(otterstax::test::unique_test_dir("otterstax_session_close_waiter"), one_agent_options());
+    auto& actor = orders_actor(owner);
+    actor.set_checkout_timeout(30s);
+    auto holder = owner.open_session();
+    const auto h = owner.stack().on(holder->address());
+    run_session_or_fail(h, 1, "BEGIN;");
+    run_session_or_fail(h, 2, kRemoteSelect);
+    REQUIRE(actor.pinned() == 1);
+
+    auto waiter = owner.open_session();
+    run_session_or_fail(owner.stack().on(waiter->address()), 1, "BEGIN;");
+    auto select = send_sql(waiter->address(), 2, kRemoteSelect);
+    REQUIRE(wait_until([&] { return actor.waiting() == 1; }, 10000ms));
+    waiter.reset();
+    auto result = await_session(std::move(select), 5000ms, owner.engine().resource());
+    require_error_containing(result, "the connection is closed");
+    CHECK(actor.waiting() == 0);
+    // The holder still has its agent; the waiter took none.
+    CHECK(actor.pinned() == 1);
+    run_session_or_fail(h, 3, "COMMIT;");
+    CHECK(wait_until([&] { return actor.pinned() == 0; }, 5000ms));
+}
+
+// Hidden until OTB-notify (docs/proposals/otterbrix-embedding.md): a
 // statement held on its backend for a second must leave the process idle. In
 // actor-zeta 2.0.0 a cooperative actor suspended on a co_await is requeued on
 // every pass of its pool (completion is flag-only), so today both the session
 // on the sessions pool and the engine's executor on the exec pool spin: about
-// 3.4 CPU-seconds per second of waiting on an 18-core machine, against 0.03
-// with nothing in flight. Asserts the correct behaviour; take the dot off once
-// a settled future wakes the actor that awaits it.
+// 3.1 CPU-seconds per second of waiting on an 18-core machine (otterbrix
+// 61aa43d6), against 0.03 with nothing in flight. Asserts the correct
+// behaviour; take the dot off once a settled future wakes the actor that
+// awaits it.
 TEST_CASE("session wait: a statement held on its backend does not spin the pools", "[.engine-defect-otb-notify]") {
     auto options = slow_options();
     options.connectors.mysql = &gated_mysql_factory;
@@ -336,7 +459,7 @@ TEST_CASE("session wait: a statement held on its backend does not spin the pools
 }
 
 // Every statement is sent before any answer is read. The engine runs on its
-// own pools and the slow statement on the connector pool, so the session
+// own pools and the slow statement on the backends pool, so the session
 // really suspends at each of them; a statement taken off the mailbox early, or
 // a wakeup lost, shows up as a count that is not the number of INSERTs sent
 // before it, or as a future that never settles.

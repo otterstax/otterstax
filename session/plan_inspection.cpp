@@ -106,23 +106,26 @@ namespace otterstax::session::plan {
                 if (kind == logical_plan::drop_target_kind::database) {
                     return std::nullopt;
                 }
-                return write_target_t{statement->target(), kind == logical_plan::drop_target_kind::schema};
+                return write_target_t{statement->target(),
+                                      kind == logical_plan::drop_target_kind::schema,
+                                      kind == logical_plan::drop_target_kind::collection};
             }
+            case logical_plan::node_type::create_collection_t:
+            case logical_plan::node_type::create_index_t:
+            case logical_plan::node_type::alter_table_t:
+            case logical_plan::node_type::create_constraint_t:
+                return write_target_t{statement->target(), false, true};
             case logical_plan::node_type::insert_t:
             case logical_plan::node_type::insert_on_conflict_t:
             case logical_plan::node_type::update_t:
             case logical_plan::node_type::delete_t:
-            case logical_plan::node_type::create_collection_t:
             case logical_plan::node_type::create_schema_t:
-            case logical_plan::node_type::create_index_t:
             case logical_plan::node_type::create_type_t:
             case logical_plan::node_type::create_sequence_t:
             case logical_plan::node_type::create_view_t:
             case logical_plan::node_type::create_matview_t:
             case logical_plan::node_type::refresh_matview_t:
             case logical_plan::node_type::create_macro_t:
-            case logical_plan::node_type::alter_table_t:
-            case logical_plan::node_type::create_constraint_t:
                 return write_target_t{statement->target(), false};
             default:
                 return std::nullopt;

@@ -65,7 +65,8 @@ namespace otterstax::backends {
     //    the connection's tables discovered by the first of them on the calling
     //    thread, before any agent serves (retried per service.connection_retry;
     //    one that stays unreachable is logged and keeps agents that connect on
-    //    their first statement), and the connection's backend actor
+    //    their first statement; one whose server cannot be written to is left
+    //    out at once), and the connection's backend actor
     //    (federation::backend_actor_t) spawned over its agents;
     //  - after the engine opened: backends::register_remote_tables
     //    (backends.hpp) registers the discovery in the engine's catalog.
@@ -87,19 +88,25 @@ namespace otterstax::backends {
         // checked before the first connection opens, and the first bad one is
         // returned (invalid_parameter) so startup aborts; so is a loop thread
         // the OS refuses an actor. Nothing an attempt answers aborts: an
-        // unreachable backend is retried, then left undiscovered
-        // (open_failure_kind_t, connection_retry.hpp) — whatever error code it carries.
+        // unreachable backend is retried, then left undiscovered with its actor
+        // (open_failure_kind_t, connection_retry.hpp) — whatever error code it
+        // carries; a backend whose server answers it cannot be written to (a
+        // MySQL server under sql_mode NO_BACKSLASH_ESCAPES) is unusable: not
+        // retried and left out — no actor, no address in primitives(), not in
+        // connections().
         [[nodiscard]] core::error_t open(const config::ConnectionsConfig& connections,
                                          const config::ConnectionRetryConfig& retry);
 
         // What open() found: every configured connection (in config order:
         // mysql, postgresql, clickhouse) with its actor and discovery,
-        // `discovered` false for one that did not answer.
+        // `discovered` false for one that did not answer, and a null actor for
+        // one left out.
         [[nodiscard]] const std::vector<catalog::connection_discovery_t>& discovered() const noexcept {
             return discovered_;
         }
-        // Every configured connection with its actor (the session's
-        // registration of a table it missed, the database-name guard).
+        // Every configured connection that has its actor (the session's
+        // registration of a table it missed, the database-name guard); one
+        // left out is not among them.
         [[nodiscard]] std::vector<catalog::configured_connection_t> connections() const;
         [[nodiscard]] std::vector<std::string> aliases() const;
         // The backend actor of a configured connection (null for another name).

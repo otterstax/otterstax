@@ -175,8 +175,11 @@ namespace {
 
 // ── escape_sql_literal ───────────────────────────────────────────────────────
 // MySQL (default sql_mode) and ClickHouse treat a backslash as an escape
-// character inside a quoted literal; PostgreSQL (standard_conforming_strings)
-// does not. Doubling only the apostrophe leaves `\'` able to close the literal.
+// character inside a quoted literal; PostgreSQL does in '...' only under
+// standard_conforming_strings = off, and always in E'...': a PostgreSQL value
+// holding a backslash is written E'...' with it doubled, which reads the same
+// under either setting. Doubling only the apostrophe leaves `\'` able to close
+// the literal.
 
 TEST_CASE("escape_sql_literal: trailing backslash cannot swallow the closing quote") {
     std::pmr::monotonic_buffer_resource arena(std::pmr::new_delete_resource());
@@ -184,7 +187,7 @@ TEST_CASE("escape_sql_literal: trailing backslash cannot swallow the closing quo
 
     REQUIRE(cat::escape_sql_literal(resource, "a\\", backend_type_t::MySQL) == "'a\\\\'");
     REQUIRE(cat::escape_sql_literal(resource, "a\\", backend_type_t::ClickHouse) == "'a\\\\'");
-    REQUIRE(cat::escape_sql_literal(resource, "a\\", backend_type_t::PostgreSQL) == "'a\\'");
+    REQUIRE(cat::escape_sql_literal(resource, "a\\", backend_type_t::PostgreSQL) == "E'a\\\\'");
 }
 
 TEST_CASE("escape_sql_literal: backslash-quote injection stays inside the literal") {
@@ -194,7 +197,18 @@ TEST_CASE("escape_sql_literal: backslash-quote injection stays inside the litera
 
     REQUIRE(cat::escape_sql_literal(resource, payload, backend_type_t::MySQL) == "'\\\\'' OR 1=1 -- '");
     REQUIRE(cat::escape_sql_literal(resource, payload, backend_type_t::ClickHouse) == "'\\\\'' OR 1=1 -- '");
-    REQUIRE(cat::escape_sql_literal(resource, payload, backend_type_t::PostgreSQL) == "'\\'' OR 1=1 -- '");
+    REQUIRE(cat::escape_sql_literal(resource, payload, backend_type_t::PostgreSQL) == "E'\\\\'' OR 1=1 -- '");
+}
+
+// The listing of every user schema leaves out pg_toast* / pg_temp* by a LIKE whose `_` is escaped:
+// written E'pg\\_toast%', a server under standard_conforming_strings = off reads the same
+// pattern (in 'pg\_toast%' it would read `\_` as `_`, a wildcard).
+TEST_CASE("make_list_tables_query: the PostgreSQL LIKE patterns read the same under either standard_conforming_strings") {
+    std::pmr::monotonic_buffer_resource arena(std::pmr::new_delete_resource());
+    const auto query = std::string{cat::make_list_tables_query(&arena, backend_type_t::PostgreSQL, "")};
+    INFO(query);
+    CHECK(query.find("NOT LIKE E'pg\\\\_toast%'") != std::string::npos);
+    CHECK(query.find("NOT LIKE E'pg\\\\_temp%'") != std::string::npos);
 }
 
 TEST_CASE("escape_sql_literal: apostrophes are doubled on every backend") {
@@ -209,8 +223,8 @@ TEST_CASE("escape_sql_literal: apostrophes are doubled on every backend") {
 }
 
 // ── startup discovery error paths ────────────────────────────────────────────
-// A connection whose discovery fails is not kept (the connector manager drops
-// it) and records nothing; the server still starts.
+// A connection whose discovery fails keeps its actor (its statements fail at the
+// connection) and records nothing; the server still starts.
 
 namespace {
 
@@ -315,13 +329,16 @@ TEST_CASE("catalog remote DDL: DROP TABLE runs on the backend and takes the tabl
     REQUIRE_FALSE(dropped.has_error());
     REQUIRE(fx.names() == std::vector<std::string>{"crm.crmdb.sales.customers"});
 
-    // A table the catalog never registered is a miss: the session discovers
-    // it on its connection (the mock backend answers every table it is asked
-    // about), registers it and runs the DROP once more — the backend drops it
-    // and the catalog keeps nothing of it.
+    // Another table of a connection configured with one `table:` (crm is
+    // `customers` only) is no DDL target of it: the session refuses the DROP
+    // before the engine (the mock backend would answer any table it is asked
+    // about) and the catalog keeps what it had.
     auto unknown = otterstax::test::run_session_sql_payload(s, 2, "DROP TABLE crm.crmdb.sales.never_discovered;");
-    INFO((unknown.has_error() ? unknown.error().what.c_str() : "ok"));
-    REQUIRE_FALSE(unknown.has_error());
+    REQUIRE(unknown.has_error());
+    INFO(unknown.error().what.c_str());
+    CHECK(unknown.error().type == core::error_code_t::invalid_parameter);
+    CHECK(std::string{unknown.error().what.c_str()}.find("connection \"crm\" is configured with table \"customers\"") !=
+          std::string::npos);
     REQUIRE(fx.names() == std::vector<std::string>{"crm.crmdb.sales.customers"});
 
     // A four-part name whose first part is no connection of config.yaml is

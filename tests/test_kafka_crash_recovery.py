@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2025-2026  OtterStax
 
-"""Kafka exactly-once CRASH-RECOVERY test (§5.4 Phase 4 + Phase 5).
+"""Kafka exactly-once CRASH-RECOVERY test (sources and streams).
 
 The fault-injection proof that the kafka runtime survives a hard crash
 exactly-once. Unlike the other test_kafka_*.py scripts (which expect an
@@ -66,7 +66,7 @@ NUM_RECORDS = 5000
 KILL_AT = NUM_RECORDS // 3          # kill once this many rows are committed (mid-ingest)
 STREAM_CUTOFF = NUM_RECORDS // 2    # STREAM keeps rows with id < cutoff
 INSERT_ROWS = 20
-FANIN_BATCH = 1500                  # §5.3 fan-in: rows per source per batch (each source = 2 batches)
+FANIN_BATCH = 1500                  # fan-in: rows per source per batch (each source = 2 batches)
 PG_WAIT_S = 25
 DOCKER_PG_WAIT_S = 90   # docker start + WAL recover has more headroom than the native binary
 WAIT_S = 60
@@ -290,7 +290,7 @@ class KafkaCrashRecoveryTest:
         print(f"✅ STREAM survived crash exactly-once: {total} filtered rows in out topic (ids 0..{STREAM_CUTOFF-1})")
 
     def test_fanin_survives_crash(self):
-        """§5.3 fan-in: a STREAM plus an `INSERT INTO <stream> SELECT` query merge
+        """Fan-in: a STREAM plus an `INSERT INTO <stream> SELECT` query merge
         two sources into ONE output topic, exactly-once, across a kill -9.
 
             CREATE STREAM merged AS SELECT ... FROM src_a        (src_a's ids)

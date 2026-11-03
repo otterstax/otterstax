@@ -266,7 +266,7 @@ TEST_CASE("s3 connector: an output stream moved to another holder is aborted by 
     CHECK(arrow_handle->closed());
 }
 
-TEST_CASE("S3Manager: forwards the connector's error code instead of flattening it to other_error") {
+TEST_CASE("S3Manager: forwards the connector's error code unchanged") {
     auto* resource = std::pmr::new_delete_resource();
     auto s3 = actor_zeta::spawn<conn::s3::ConnectorManager>(resource);
     // No file manager is reachable: every case below fails before the

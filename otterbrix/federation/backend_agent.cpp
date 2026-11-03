@@ -116,6 +116,43 @@ namespace otterstax::federation {
 
     bool pg_commit_rolled_back(std::string_view command_status) noexcept { return command_status == "ROLLBACK"; }
 
+    std::vector<std::string> ch_failed_mutations(std::string_view message) {
+        OTX_ZONE_N("ch_failed_mutations");
+        constexpr std::string_view lead = "Exception happened during execution of mutation";
+        constexpr std::string_view tail = "' with part '";
+        std::vector<std::string> ids;
+        auto at = message.find(lead);
+        if (at == std::string_view::npos) {
+            return ids;
+        }
+        at += lead.size();
+        if (at < message.size() && message[at] == 's') {
+            ++at;
+        }
+        if (message.substr(at, 2) != " '") {
+            return ids;
+        }
+        at += 2;
+        const auto end = message.find(tail, at);
+        if (end == std::string_view::npos) {
+            return ids;
+        }
+        // The ids joined by ", " (a MergeTree's mutation_<n>.txt, a replicated table's 0000000005).
+        auto list = message.substr(at, end - at);
+        while (!list.empty()) {
+            const auto comma = list.find(", ");
+            ids.emplace_back(list.substr(0, comma));
+            if (comma == std::string_view::npos) {
+                break;
+            }
+            list.remove_prefix(comma + 2);
+        }
+        if (std::any_of(ids.begin(), ids.end(), [](const std::string& id) { return id.empty(); })) {
+            ids.clear();
+        }
+        return ids;
+    }
+
     backend_agent_t::backend_agent_t(std::pmr::memory_resource* resource, std::string connection)
         : actor_zeta::basic_actor<backend_agent_t>(resource)
         , resource_(resource)
@@ -146,7 +183,7 @@ namespace otterstax::federation {
 
     core::error_t backend_agent_t::connect() {
         OTX_ZONE_N("backend_agent::connect");
-        return std::visit(
+        auto failed = std::visit(
             [this](auto& connector) -> core::error_t {
                 if constexpr (std::is_same_v<std::decay_t<decltype(connector)>, std::monostate>) {
                     return error(core::error_code_t::internal_error, "no connector attached");
@@ -155,6 +192,10 @@ namespace otterstax::federation {
                 }
             },
             connector_);
+        if (failed.contains_error()) {
+            return failed;
+        }
+        return check_session();
     }
 
     void backend_agent_t::cancel() noexcept {
@@ -182,10 +223,10 @@ namespace otterstax::federation {
                 if constexpr (std::is_same_v<std::decay_t<decltype(connector)>, std::monostate>) {
                     return error(core::error_code_t::internal_error, "no connector attached");
                 } else {
-                    if (connector->isClosed()) {
+                    if (connector->isClosed() && !reopen_) {
                         return error(core::error_code_t::io_error, "the connection is closed");
                     }
-                    if (!connector->isConnected()) {
+                    if (reopen_ || !connector->isConnected()) {
                         return reconnect(*connector);
                     }
                     return core::error_t::no_error();
@@ -222,7 +263,7 @@ namespace otterstax::federation {
                          "connection \"" + connection_ + "\" is unreachable: " +
                              std::string{failed.what.data(), failed.what.size()});
         }
-        return failed;
+        return check_session();
     }
 
     template<typename R, typename Arg, typename Connector, typename Handler>
@@ -263,6 +304,56 @@ namespace otterstax::federation {
                 }
             },
             connector_);
+    }
+
+    core::error_t backend_agent_t::check_session() {
+        OTX_ZONE_N("backend_agent::check_session");
+        reopen_ = false;
+        session_refused_ = false;
+        auto* my = std::get_if<std::unique_ptr<mysql::IConnector>>(&connector_);
+        if (my == nullptr) {
+            return core::error_t::no_error();
+        }
+        // The generated literals double a backslash, which a session under NO_BACKSLASH_ESCAPES
+        // would read as two characters: such a session is refused rather than written to with the
+        // wrong text. The mode is the session's (the server's global sql_mode, or a role's init
+        // command), so every session is asked.
+        // Whether the mode is strict decides which UPDATE may leave its range check to the store into
+        // the column (sql_gen::statement_needs_t, write).
+        bool no_backslash_escapes = false;
+        strict_session_ = false;
+        auto mode_handler = [this,
+                             &no_backslash_escapes](const boost::mysql::results& result) -> otterstax::asio_error_t {
+            for (auto row : result.rows()) {
+                if (row.size() != 0 && row.at(0).is_string()) {
+                    const auto mode = row.at(0).as_string();
+                    no_backslash_escapes = mode.find("NO_BACKSLASH_ESCAPES") != std::string_view::npos;
+                    strict_session_ = mode.find("STRICT_TRANS_TABLES") != std::string_view::npos ||
+                                      mode.find("STRICT_ALL_TABLES") != std::string_view::npos;
+                }
+            }
+            return otterstax::asio_error_t{};
+        };
+        auto failed =
+            run<otterstax::asio_error_t, const boost::mysql::results&>(**my, "SELECT @@SESSION.sql_mode", mode_handler);
+        if (!failed.contains_error() && !no_backslash_escapes) {
+            return core::error_t::no_error();
+        }
+        // A session that is not known to be writable is not kept.
+        (*my)->close();
+        reopen_ = true;
+        if (failed.contains_error()) {
+            return error(failed.type,
+                         "the session's sql_mode could not be read: " + std::string{failed.what.data(), failed.what.size()});
+        }
+        session_refused_ = true;
+        auto refused = error(core::error_code_t::unimplemented_yet,
+                             "the server runs with sql_mode NO_BACKSLASH_ESCAPES: OtterStax escapes a backslash in "
+                             "the string literals it sends");
+        if (log_.is_valid()) {
+            log_->error("{}", refused.what.c_str());
+        }
+        return refused;
     }
 
     core::error_t backend_agent_t::commit() {
@@ -400,8 +491,8 @@ namespace otterstax::federation {
         co_return rows;
     }
 
-    backend_agent_t::unique_future<core::result_wrapper_t<std::uint64_t>> backend_agent_t::write(std::string sql,
-                                                                                                write_kind_t kind) {
+    backend_agent_t::unique_future<core::result_wrapper_t<std::uint64_t>>
+    backend_agent_t::write(std::string sql, write_kind_t kind, bool strict_store, qualified_name_t table) {
         OTX_ZONE_N("backend_agent::write");
         if (!in_transaction_) {
             if (auto refused = ready(); refused.contains_error()) {
@@ -410,6 +501,14 @@ namespace otterstax::federation {
         }
         if (broken_) {
             co_return broken_error("a write");
+        }
+        if (strict_store && kind_ == backend_type_t::MySQL && !strict_session_) {
+            // Outside a strict sql_mode MySQL clamps a value out of the column's range with a warning
+            // where the engine's assignment cast refuses it.
+            co_return error(core::error_code_t::unimplemented_yet,
+                            "the UPDATE narrows a value to its column's type, which MySQL range-checks only under a "
+                            "strict sql_mode (STRICT_TRANS_TABLES or STRICT_ALL_TABLES); the session's sql_mode is "
+                            "not strict");
         }
         if (log_.is_valid()) {
             log_->debug("{} write: \"{}\"", connection_, sql);
@@ -420,7 +519,7 @@ namespace otterstax::federation {
         } else if (auto* pg = std::get_if<std::unique_ptr<pg::IConnector>>(&connector_)) {
             written = write_pg(**pg, sql);
         } else if (auto* ch = std::get_if<std::unique_ptr<ch::IConnector>>(&connector_)) {
-            written = write_ch(**ch, sql, kind);
+            written = write_ch(**ch, sql, kind, table);
         }
         if (written.has_error()) {
             note_failure(written.error());
@@ -589,35 +688,10 @@ namespace otterstax::federation {
         return static_cast<std::uint64_t>(outcome.value());
     }
 
-    core::result_wrapper_t<discovered_tables_t> backend_agent_t::discover_mysql(mysql::IConnector& connector,
-                                                                                const qualified_name_t& scope) {
+    core::result_wrapper_t<discovered_tables_t>
+    backend_agent_t::discover_mysql(mysql::IConnector& connector, const qualified_name_t& scope) {
         discovered_tables_t out(resource_);
-        // The generated literals double a backslash, which a server under NO_BACKSLASH_ESCAPES would
-        // read as two characters: such a connection is refused rather than written to with the wrong
-        // text.
-        {
-            bool no_backslash_escapes = false;
-            auto mode_handler = [&no_backslash_escapes](const boost::mysql::results& result) -> otterstax::asio_error_t {
-                for (auto row : result.rows()) {
-                    if (row.size() != 0 && row.at(0).is_string()) {
-                        no_backslash_escapes =
-                            row.at(0).as_string().find("NO_BACKSLASH_ESCAPES") != std::string_view::npos;
-                    }
-                }
-                return otterstax::asio_error_t{};
-            };
-            if (auto failed =
-                    run<otterstax::asio_error_t, const boost::mysql::results&>(connector, "SELECT @@SESSION.sql_mode", mode_handler);
-                failed.contains_error()) {
-                return failed;
-            }
-            if (no_backslash_escapes) {
-                return error(core::error_code_t::unimplemented_yet,
-                             "the server runs with sql_mode NO_BACKSLASH_ESCAPES: OtterStax escapes a backslash in "
-                             "the string literals it sends");
-            }
-        }
-
+        // The session's sql_mode was checked when it was opened (check_session).
         auto probe = [this, &out, &connector](const qualified_name_t& table) -> core::error_t {
             auto schema_handler = [this, table, &out](const boost::mysql::results& result) -> otterstax::asio_error_t {
                 // Read by the very table a read types its rows with, so a recorded column's type is
@@ -856,8 +930,10 @@ namespace otterstax::federation {
         return rows;
     }
 
-    core::result_wrapper_t<std::uint64_t>
-    backend_agent_t::write_ch(ch::IConnector& connector, const std::string& sql, write_kind_t kind) {
+    core::result_wrapper_t<std::uint64_t> backend_agent_t::write_ch(ch::IConnector& connector,
+                                                                    const std::string& sql,
+                                                                    write_kind_t kind,
+                                                                    const qualified_name_t& table) {
         // No ClickHouse block carries an affected-row count: written_rows (the sum of the Progress
         // packets) is an INSERT's count; a lightweight DELETE / ALTER TABLE ... UPDATE is a mutation
         // that reports nothing — 0, whatever the server wrote.
@@ -867,9 +943,62 @@ namespace otterstax::federation {
         };
         auto outcome = run<int64_t, const ch::select_result_t&>(connector, sql, handler);
         if (outcome.has_error()) {
-            return core::error_on(resource_, outcome.error());
+            auto failed = core::error_on(resource_, outcome.error());
+            if (insert) {
+                return failed;
+            }
+            return kill_failed_mutation(connector, sql, table, std::move(failed));
         }
         return static_cast<std::uint64_t>(outcome.value());
+    }
+
+    core::error_t backend_agent_t::kill_failed_mutation(ch::IConnector& connector,
+                                                        const std::string& sql,
+                                                        const qualified_name_t& table,
+                                                        core::error_t failed) {
+        OTX_ZONE_N("backend_agent::kill_failed_mutation");
+        // A mutation that failed on a part stays in system.mutations (is_done = 0): ClickHouse
+        // retries it forever, and every later mutation of the table, executed together with it,
+        // fails with its error. The server's text follows the statement's in the connector's error
+        // (the statement's literals are not searched).
+        const std::string_view what{failed.what.data(), failed.what.size()};
+        const auto statement = what.find(sql);
+        const auto ids =
+            ch_failed_mutations(statement == std::string_view::npos ? what : what.substr(statement + sql.size()));
+        if (ids.empty() || table.database.t.empty() || table.collection.t.empty()) {
+            return failed;
+        }
+        const auto with = [this, &failed](const std::string& note) {
+            return core::error_t{failed.type,
+                                 std::pmr::string{(std::string{failed.what.data(), failed.what.size()} + note).c_str(),
+                                                  resource_}};
+        };
+        if (ids.size() > 1) {
+            // Which of them is this statement's ClickHouse does not say; the others are not ours.
+            std::string listed;
+            for (const auto& id : ids) {
+                listed += (listed.empty() ? "" : ", ") + id;
+            }
+            return with("; ClickHouse names the mutations " + listed + " as failed together and does not say which "
+                        "one this statement's is: none was killed (KILL MUTATION by hand)");
+        }
+        std::string kill = "KILL MUTATION WHERE database = ";
+        kill += otterstax::catalog::escape_sql_literal(resource_, table.database.t, backend_type_t::ClickHouse);
+        kill += " AND table = ";
+        kill += otterstax::catalog::escape_sql_literal(resource_, table.collection.t, backend_type_t::ClickHouse);
+        kill += " AND mutation_id = ";
+        kill += otterstax::catalog::escape_sql_literal(resource_, ids.front(), backend_type_t::ClickHouse);
+        if (log_.is_valid()) {
+            log_->warn("{}: the mutation {} of {}.{} failed, killing it: \"{}\"", connection_, ids.front(),
+                       table.database.t, table.collection.t, kill);
+        }
+        auto ok = [](const ch::select_result_t&) -> otterstax::asio_error_t { return otterstax::asio_error_t{}; };
+        if (auto refused = run<otterstax::asio_error_t, const ch::select_result_t&>(connector, kill, ok);
+            refused.contains_error()) {
+            return with("; the failed mutation " + ids.front() + " was not killed, ClickHouse retries it: " +
+                        std::string{refused.what.data(), refused.what.size()});
+        }
+        return failed;
     }
 
     core::result_wrapper_t<discovered_tables_t> backend_agent_t::discover_ch(ch::IConnector& connector,

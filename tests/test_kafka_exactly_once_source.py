@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2025-2026  OtterStax
 
-"""Kafka SOURCE exactly-once ingestion integration test (§5.4 Phase 3).
+"""Kafka SOURCE exactly-once ingestion integration test.
 
 Like test_kafka_source_ingestion.py, but the source is declared with
 ``TRANSACTIONAL=true``: the poller commits each batch's rows AND its offset

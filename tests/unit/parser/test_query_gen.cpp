@@ -28,8 +28,11 @@
 #include <cstdint>
 #include <limits>
 #include <memory_resource>
+#include <optional>
 #include <ostream>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 using namespace components::expressions;
@@ -801,10 +804,11 @@ TEST_CASE("generate_insert_rows: apostrophes are escaped on every backend") {
     }
 }
 
-// MySQL (default sql_mode; a connection under NO_BACKSLASH_ESCAPES is refused at discovery) and
+// MySQL (default sql_mode; a session under NO_BACKSLASH_ESCAPES is refused at every connect) and
 // ClickHouse read a backslash as an escape: an unescaped trailing backslash swallows the closing
-// quote, and `\'` opens the literal to injection. PostgreSQL (standard_conforming_strings) reads it
-// literally, where doubling it would change the value.
+// quote, and `\'` opens the literal to injection. PostgreSQL reads a backslash of '...' literally
+// under standard_conforming_strings = on and as an escape under off, so a value holding one is
+// written as an escape string constant, E'...', which reads the same whatever the parameter says.
 TEST_CASE("generate_insert_rows: backslash is escaped per dialect") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
@@ -816,11 +820,99 @@ TEST_CASE("generate_insert_rows: backslash is escaped per dialect") {
 
     REQUIRE(render("a\\", backend_type_t::MySQL) == "'a\\\\'");
     REQUIRE(render("a\\", backend_type_t::ClickHouse) == "'a\\\\'");
-    REQUIRE(render("a\\", backend_type_t::PostgreSQL) == "'a\\'");
+    REQUIRE(render("a\\", backend_type_t::PostgreSQL) == "E'a\\\\'");
 
     REQUIRE(render("\\' OR 1=1 -- ", backend_type_t::MySQL) == "'\\\\'' OR 1=1 -- '");
     REQUIRE(render("\\' OR 1=1 -- ", backend_type_t::ClickHouse) == "'\\\\'' OR 1=1 -- '");
-    REQUIRE(render("\\' OR 1=1 -- ", backend_type_t::PostgreSQL) == "'\\'' OR 1=1 -- '");
+    REQUIRE(render("\\' OR 1=1 -- ", backend_type_t::PostgreSQL) == "E'\\\\'' OR 1=1 -- '");
+
+    // A value without a backslash keeps the plain form on every dialect.
+    REQUIRE(render("O'Brien", backend_type_t::PostgreSQL) == "'O''Brien'");
+}
+
+namespace {
+
+    // How PostgreSQL's scanner (scan.l) reads the string constant at the start of `text`: '...' with
+    // '' one quote and — in an E'...' constant, or in any constant under
+    // standard_conforming_strings = off — a backslash escaping the character after it (\b \f \n \r
+    // \t a control character, any other character itself; the generator writes no octal, hex or
+    // unicode escape). The value and the length of the constant; nullopt when no constant closes.
+    std::optional<std::pair<std::string, std::size_t>> pg_read_string_constant(std::string_view text,
+                                                                               bool standard_conforming_strings) {
+        std::size_t at = 0;
+        bool escapes = !standard_conforming_strings;
+        if (at < text.size() && (text[at] == 'E' || text[at] == 'e')) {
+            escapes = true;
+            ++at;
+        }
+        if (at >= text.size() || text[at] != '\'') {
+            return std::nullopt;
+        }
+        ++at;
+        std::string value;
+        while (at < text.size()) {
+            const char c = text[at];
+            if (c == '\'') {
+                if (at + 1 < text.size() && text[at + 1] == '\'') {
+                    value += '\'';
+                    at += 2;
+                    continue;
+                }
+                return std::pair{value, at + 1};
+            }
+            if (c == '\\' && escapes) {
+                if (at + 1 >= text.size()) {
+                    return std::nullopt;
+                }
+                switch (text[at + 1]) {
+                    case 'b':
+                        value += '\b';
+                        break;
+                    case 'f':
+                        value += '\f';
+                        break;
+                    case 'n':
+                        value += '\n';
+                        break;
+                    case 'r':
+                        value += '\r';
+                        break;
+                    case 't':
+                        value += '\t';
+                        break;
+                    default:
+                        value += text[at + 1];
+                        break;
+                }
+                at += 2;
+                continue;
+            }
+            value += c;
+            ++at;
+        }
+        return std::nullopt;
+    }
+
+} // namespace
+
+// A PostgreSQL server reads every string literal the generator writes back as the value, whole and
+// nothing after it, under standard_conforming_strings = on and = off alike (a role or database
+// default, `ALTER DATABASE ... SET standard_conforming_strings = off`, reaches OtterStax's session).
+TEST_CASE("generate_insert_rows: a PostgreSQL string literal reads the same under either standard_conforming_strings") {
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
+    auto* resource = &arena;
+    for (const char* value : {"plain", "O'Brien", "a\\", "\\", "\\\\", "\\' OR 1=1 -- ", "x\\'' y", "a\\nb", "''", ""}) {
+        auto literal = literal_of(components::vector::make_scalar(resource, value), backend_type_t::PostgreSQL, resource);
+        REQUIRE_FALSE(literal.has_error());
+        for (bool standard_conforming_strings : {true, false}) {
+            INFO("value [" << value << "] literal [" << literal.value() << "] standard_conforming_strings "
+                           << (standard_conforming_strings ? "on" : "off"));
+            const auto read = pg_read_string_constant(literal.value(), standard_conforming_strings);
+            REQUIRE(read.has_value());
+            CHECK(read->first == value);
+            CHECK(read->second == literal.value().size());
+        }
+    }
 }
 
 TEST_CASE("generate_insert_rows: TINYINT and UTINYINT render as numbers, not characters") {
@@ -985,6 +1077,51 @@ TEST_CASE("generate_query: unsupported parameter type in WHERE fails the stateme
     auto gen = generate_manual(node, params, backend_type_t::MySQL, resource);
     REQUIRE(gen.has_error());
     REQUIRE(gen.error().type == core::error_code_t::unimplemented_yet);
+}
+
+// An ENUM value (a PostgreSQL ENUM column's, or a value cast to an engine ENUM type: the demo's
+// `c.tier = 'gold'::tier_t`) is its label as a string literal: compared with a PostgreSQL ENUM column
+// the literal takes the column's type (its order is the declaration order, as the engine's), with a
+// text column — every MySQL ENUM and ClickHouse Enum8 / Enum16 column, which OtterStax registers as
+// text — it is the text the engine compares.
+TEST_CASE("generate_query: an ENUM value is its label as a string literal in every dialect") {
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
+    auto* resource = &arena;
+    parameter_node_t params(resource);
+    const auto tier = complex_logical_type::create_enum("tier_t", {{"bronze", 0}, {"silver", 1}, {"o'gold", 2}});
+    auto id = params.add_parameter(components::vector::make_scalar(resource, tier, std::int32_t{2}), parameter_kind::literal);
+    auto node = orders_select(resource);
+    node->append_child(
+        orders_match(resource, make_compare_expression(resource, compare_type::eq, components::expressions::key_t{resource, "d"}, id)));
+    for (auto backend : {backend_type_t::MySQL, backend_type_t::PostgreSQL, backend_type_t::ClickHouse}) {
+        INFO("backend = " << static_cast<int>(backend));
+        auto gen = generate_manual(node, params, backend, resource);
+        INFO((gen.has_error() ? std::string{gen.error().what} : gen.value()));
+        REQUIRE_FALSE(gen.has_error());
+        CHECK(gen.value().find(" = 'o''gold'") != std::string::npos);
+    }
+}
+
+// The offer's probe writes a bound value as `?`, but decides on it as the run writes it: a value no
+// literal of the dialect spells refuses the block there (otterbrix then runs it over the table's
+// scan), never a take whose run fails.
+TEST_CASE("validated: the offer probe refuses a bound value the dialect has no literal for") {
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
+    auto* resource = &arena;
+    parameter_node_t params(resource);
+    auto id = params.add_parameter(components::vector::make_scalar(resource, core::date::interval_t{}), parameter_kind::literal);
+    auto node = orders_select(resource);
+    node->append_child(
+        orders_match(resource, make_compare_expression(resource, compare_type::eq, components::expressions::key_t{resource, "d"}, id)));
+    sql_gen::generation_options_t probe;
+    probe.placeholders = true;
+    for (auto backend : {backend_type_t::MySQL, backend_type_t::PostgreSQL, backend_type_t::ClickHouse}) {
+        INFO("backend = " << static_cast<int>(backend));
+        auto probed = sql_gen::generate_query(node, &params.parameters(), backend, orders_target(), resource, probe);
+        INFO((probed.has_error() ? std::string{probed.error().what} : probed.value()));
+        REQUIRE(probed.has_error());
+        CHECK(probed.error().type == core::error_code_t::unimplemented_yet);
+    }
 }
 
 TEST_CASE("generate_query: unsupported parameter type in UPDATE SET fails the statement") {
@@ -1493,7 +1630,7 @@ TEST_CASE("generate_query: DELETE ... USING with a resolved second table per dia
     GreenplumParser parser(resource);
 
     // The plan keeps the USING source as a child of the delete node; the
-    // pushdown rule hands its name over as the second table — which is what
+    // caller hands its name over as the second table — which is what
     // makes the statement one two-table DELETE on the backend.
     auto parsed =
         parse_or_die(parser, "DELETE FROM mysql.bill.schema.orders USING mysql.bill.schema.other WHERE id > 0;");
@@ -1551,7 +1688,7 @@ TEST_CASE("generate_query: UPDATE ... FROM with a resolved second table per dial
     GreenplumParser parser(resource);
 
     // The plan keeps the FROM source as a child of the update node; the
-    // pushdown rule hands its name over as the second table — which is what
+    // caller hands its name over as the second table — which is what
     // makes the statement one two-table UPDATE on the backend.
     auto parsed = parse_or_die(
         parser,
@@ -2066,7 +2203,7 @@ TEST_CASE("characterization: UPDATE SET bound parameters per dialect") {
     CHECK(bound(backend_type_t::MySQL) ==
           sql_is("UPDATE `bill`.`orders` SET `note` = 'it''s a \\\\ path', `qty` = 5 WHERE `id` = 7;"));
     CHECK(bound(backend_type_t::PostgreSQL) ==
-          sql_is("UPDATE \"schema\".\"orders\" SET \"note\" = 'it''s a \\ path', \"qty\" = 5 WHERE \"id\" = 7;"));
+          sql_is("UPDATE \"schema\".\"orders\" SET \"note\" = E'it''s a \\\\ path', \"qty\" = 5 WHERE \"id\" = 7;"));
     CHECK(bound(backend_type_t::ClickHouse) ==
           sql_is("ALTER TABLE `bill`.`orders` UPDATE `note` = 'it''s a \\\\ path', `qty` = 5 WHERE `id` = 7 SETTINGS mutations_sync = 2;"));
 
@@ -2173,7 +2310,7 @@ TEST_CASE("characterization: UPDATE SET operators and functions written as SQL p
             // The cast keeps its column operand. Each dialect spells the target
             // type its own way: MySQL CAST takes SIGNED / UNSIGNED / CHAR rather
             // than a column type name.
-            {"CAST(b AS bigint)", set_a_is("CAST(`b` AS SIGNED)", "CAST(\"b\" AS int8)", "CAST(`b` AS Int64)")},
+            {"CAST(b AS bigint)", set_a_is("CAST(`b` AS SIGNED)", "CAST(\"b\" AS int8)", "CAST(`b` AS Nullable(Int64))")},
         },
         resource);
 }
@@ -2267,7 +2404,7 @@ TEST_CASE("characterization: every UPDATE SET expression kind per dialect") {
                                           complex_logical_type{logical_type::BIGINT},
                                           components::casts::cast_t{},
                                           components::casts::cast_kind::cast),
-                     manual_set_a_is("CAST(`b` AS SIGNED)", "CAST(\"b\" AS int8)", "CAST(`b` AS Int64)")});
+                     manual_set_a_is("CAST(`b` AS SIGNED)", "CAST(\"b\" AS int8)", "CAST(`b` AS Nullable(Int64))")});
     cases.push_back({"a binary kind without its right operand",
                      unary(scalar_type::add),
                      generate_refuses_everywhere(core::error_code_t::invalid_parameter,
@@ -2618,7 +2755,7 @@ TEST_CASE("validated: a user's numeric CAST is written in each dialect and never
                         columns,
                         manual_set_a_is("(CAST(`a` AS DOUBLE) / CAST(`b` AS DOUBLE))",
                                         "(CAST(\"a\" AS float8) / CAST(\"b\" AS float8))",
-                                        "(CAST(`a` AS Float64) / CAST(`b` AS Float64))"),
+                                        "(CAST(`a` AS Nullable(Float64)) / CAST(`b` AS Nullable(Float64)))"),
                         resource);
     }
     SECTION("a widening CAST under arithmetic is written: the product is computed at the wider type") {
@@ -2631,7 +2768,7 @@ TEST_CASE("validated: a user's numeric CAST is written in each dialect and never
                         columns,
                         manual_set_a_is("(CAST(`a` AS SIGNED) * `b`)",
                                         "(CAST(\"a\" AS int8) * \"b\")",
-                                        "(CAST(`a` AS Int64) * `b`)"),
+                                        "(CAST(`a` AS Nullable(Int64)) * `b`)"),
                         resource);
     }
     SECTION("an integer into a DECIMAL that holds it is spelled with its width and scale") {
@@ -2643,7 +2780,7 @@ TEST_CASE("validated: a user's numeric CAST is written in each dialect and never
                         columns,
                         manual_set_a_is("CAST(`a` AS DECIMAL(12, 2))",
                                         "CAST(\"a\" AS numeric(12, 2))",
-                                        "CAST(`a` AS Decimal(12, 2))"),
+                                        "CAST(`a` AS Nullable(Decimal(12, 2)))"),
                         resource);
     }
     SECTION("a narrowing CAST is PostgreSQL's alone: MySQL and ClickHouse neither range-check nor round alike") {
@@ -2707,7 +2844,7 @@ TEST_CASE("validated: a comparison drops only a lossless numeric CAST") {
                         columns,
                         {sql_is("DELETE FROM `bill`.`orders` WHERE CAST(`a` AS DOUBLE) > 5;"),
                          sql_is("DELETE FROM \"schema\".\"orders\" WHERE CAST(\"a\" AS float8) > 5;"),
-                         sql_is("DELETE FROM `bill`.`orders` WHERE CAST(`a` AS Float64) > 5;")},
+                         sql_is("DELETE FROM `bill`.`orders` WHERE CAST(`a` AS Nullable(Float64)) > 5;")},
                         resource);
     }
 }
@@ -2794,7 +2931,7 @@ TEST_CASE("validated: a bound DECIMAL cast into a DECIMAL that keeps its value i
                         columns,
                         manual_set_a_is("CAST(12.300 AS DECIMAL(4, 2))",
                                         "CAST(12.300 AS numeric(4, 2))",
-                                        "CAST(toDecimal128('12.300', 3) AS Decimal(4, 2))"),
+                                        "CAST(toDecimal128('12.300', 3) AS Nullable(Decimal(4, 2)))"),
                         resource);
     }
     SECTION("12.345 into DECIMAL(4, 2)") {
@@ -2824,7 +2961,7 @@ TEST_CASE("validated: a bound DECIMAL cast into a DECIMAL that keeps its value i
                         {sql_is("UPDATE `bill`.`orders` SET `a` = CAST(99.990 AS DECIMAL(4, 2));"),
                          sql_is("UPDATE \"schema\".\"orders\" SET \"a\" = CAST(99.990 AS numeric(4, 2));"),
                          sql_is("ALTER TABLE `bill`.`orders` UPDATE `a` = CAST(toDecimal128('99.990', 3) AS "
-                                "Decimal(4, 2)) WHERE 1 SETTINGS mutations_sync = 2;")},
+                                "Nullable(Decimal(4, 2))) WHERE 1 SETTINGS mutations_sync = 2;")},
                         resource);
     }
 }
@@ -2843,7 +2980,195 @@ TEST_CASE("validated: a CAST into a DECIMAL of more than 30 fraction digits is r
                     columns,
                     {generate_refuses(core::error_code_t::unimplemented_yet, unfaithful_cast),
                      sql_is("UPDATE \"schema\".\"orders\" SET \"a\" = CAST(\"s\" AS numeric(38, 31));"),
-                     sql_is("ALTER TABLE `bill`.`orders` UPDATE `a` = CAST(`s` AS Decimal(38, 31)) WHERE 1 "
+                     sql_is("ALTER TABLE `bill`.`orders` UPDATE `a` = CAST(`s` AS Nullable(Decimal(38, 31))) WHERE 1 "
                             "SETTINGS mutations_sync = 2;")},
                     resource);
+}
+
+// otterbrix wraps an UPDATE assignment whose value is not of its column's type in a cast_kind::cast
+// to the column's type (validate_logical_plan.cpp: an assignment cast, the same node as a user's
+// CAST), and types a literal BIGINT / DOUBLE: `SET i = i + 1` over an INTEGER column reads
+// `SET i = CAST(i + 1 AS INTEGER)`, `SET f = 2.5` over a FLOAT one `SET f = CAST(2.5 AS FLOAT)`.
+// MySQL's CAST neither narrows nor range-checks and ClickHouse's wraps: there the store into the
+// column range-checks instead — MySQL's under a strict sql_mode (the statement needs one), a
+// ClickHouse accurateCast — and a DOUBLE into FLOAT is a bound value the engine takes (ClickHouse)
+// or MySQL's store, which rounds to the nearest FLOAT as the engine does.
+namespace {
+
+    // UPDATE bill.orders SET <column> = <value>.
+    node_ptr orders_update_set(std::pmr::memory_resource* resource, const char* column, const expression_ptr& value) {
+        std::pmr::vector<expression_ptr> updates{resource};
+        value->key() = components::expressions::key_t{resource, column};
+        updates.emplace_back(value);
+        return orders_update(resource, updates);
+    }
+
+    dialect_outcomes_t set_column_is(const std::string& column,
+                                     const outcome_t& mysql,
+                                     const std::string& pg,
+                                     const outcome_t& ch) {
+        return dialect_outcomes_t{mysql, sql_is("UPDATE \"schema\".\"orders\" SET \"" + column + "\" = " + pg + ";"), ch};
+    }
+
+    outcome_t mysql_set_is(const std::string& column, const std::string& value) {
+        return sql_is("UPDATE `bill`.`orders` SET `" + column + "` = " + value + ";");
+    }
+
+    outcome_t ch_set_is(const std::string& column, const std::string& value) {
+        return sql_is("ALTER TABLE `bill`.`orders` UPDATE `" + column + "` = " + value +
+                      " WHERE 1 SETTINGS mutations_sync = 2;");
+    }
+
+    // What the generation asks of the session for `node` on `backend`.
+    sql_gen::statement_needs_t needs_of(const node_ptr& node,
+                                        const parameter_node_t& params,
+                                        backend_type_t backend,
+                                        const sql_gen::column_map_t& columns,
+                                        std::pmr::memory_resource* resource) {
+        auto target = orders_target();
+        target.columns = &columns;
+        sql_gen::statement_needs_t needs;
+        needs.strict_store = true; // overwritten by every generation that succeeds
+        auto generated = sql_gen::generate_query(node, &params.parameters(), backend, target, resource, {}, &needs);
+        REQUIRE_FALSE(generated.has_error());
+        return needs;
+    }
+
+} // namespace
+
+TEST_CASE("validated: an UPDATE assignment narrowed to its column is left to the backend's range-checked store") {
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
+    auto* resource = &arena;
+    parameter_node_t params(resource);
+    const auto one = params.add_parameter(components::vector::make_scalar(resource, std::int64_t{1}), parameter_kind::literal);
+    const auto half = params.add_parameter(components::vector::make_scalar(resource, 2.5), parameter_kind::literal);
+    const auto huge = params.add_parameter(components::vector::make_scalar(resource, 1e300), parameter_kind::literal);
+    const auto tiny = params.add_parameter(components::vector::make_scalar(resource, 1e-50), parameter_kind::literal);
+    const sql_gen::column_map_t columns{{"a", {"a", logical_type::INTEGER}},
+                                        {"u", {"u", logical_type::UINTEGER}},
+                                        {"big", {"big", logical_type::BIGINT}},
+                                        {"f", {"f", logical_type::FLOAT}}};
+    const complex_logical_type bigint{logical_type::BIGINT};
+    const complex_logical_type integer{logical_type::INTEGER};
+    const complex_logical_type real{logical_type::FLOAT};
+    auto plus_one = [&](const char* column, const complex_logical_type& type) {
+        auto sum = calculate(resource, scalar_type::add, read_key(resource, column), read_parameter(resource, one));
+        sum->set_result_type(type);
+        return sum;
+    };
+
+    SECTION("SET a = a + 1 over an INTEGER column: MySQL's store, ClickHouse's accurateCast") {
+        const auto node = orders_update_set(resource, "a", cast_to(resource, param_storage{plus_one("a", bigint)}, integer));
+        check_validated(node,
+                        params,
+                        columns,
+                        set_column_is("a",
+                                      mysql_set_is("a", "(`a` + 1)"),
+                                      "CAST((\"a\" + 1) AS int4)",
+                                      ch_set_is("a", "if(isNull((`a` + 1)), NULL, accurateCast((`a` + 1), 'Nullable(Int32)'))")),
+                        resource);
+        CHECK(needs_of(node, params, backend_type_t::MySQL, columns, resource).strict_store);
+        CHECK_FALSE(needs_of(node, params, backend_type_t::PostgreSQL, columns, resource).strict_store);
+        CHECK_FALSE(needs_of(node, params, backend_type_t::ClickHouse, columns, resource).strict_store);
+    }
+    SECTION("SET a = CAST(a AS BIGINT) + 1: ClickHouse's widening CAST under accurateCast keeps a NULL row NULL") {
+        // The validator's widening of `a + 1` over an INTEGER column. A ClickHouse CAST into a bare
+        // Int64 refuses the NULL of a Nullable(Int32) row (Code 349) and the mutation never ends.
+        auto sum = calculate(resource,
+                             scalar_type::add,
+                             cast_to(resource, column_operand(resource, "a"), bigint),
+                             read_parameter(resource, one));
+        sum->set_result_type(bigint);
+        const auto node = orders_update_set(resource, "a", cast_to(resource, param_storage{sum}, integer));
+        check_validated(node,
+                        params,
+                        columns,
+                        set_column_is("a",
+                                      mysql_set_is("a", "(CAST(`a` AS SIGNED) + 1)"),
+                                      "CAST((CAST(\"a\" AS int8) + 1) AS int4)",
+                                      ch_set_is("a",
+                                                "if(isNull((CAST(`a` AS Nullable(Int64)) + 1)), NULL, "
+                                                "accurateCast((CAST(`a` AS Nullable(Int64)) + 1), 'Nullable(Int32)'))")),
+                        resource);
+    }
+    SECTION("SET u = u + 1 over an UNSIGNED column (MySQL and ClickHouse)") {
+        const auto node = orders_update_set(resource,
+                                            "u",
+                                            cast_to(resource,
+                                                    param_storage{plus_one("u", bigint)},
+                                                    complex_logical_type{logical_type::UINTEGER}));
+        check_validated(node,
+                        params,
+                        columns,
+                        // PostgreSQL has no unsigned column, and no narrowing cast into one.
+                        {mysql_set_is("u", "(`u` + 1)"),
+                         generate_refuses(core::error_code_t::unimplemented_yet, unfaithful_cast),
+                         ch_set_is("u", "if(isNull((`u` + 1)), NULL, accurateCast((`u` + 1), 'Nullable(UInt32)'))")},
+                        resource);
+    }
+    SECTION("SET f = 2.5 over a FLOAT column: a bound DOUBLE the engine takes needs no strict mode") {
+        const auto node =
+            orders_update_set(resource, "f", cast_to(resource, param_storage{read_parameter(resource, half)}, real));
+        check_validated(node,
+                        params,
+                        columns,
+                        set_column_is("f", mysql_set_is("f", "2.5"), "CAST(2.5 AS float4)", ch_set_is("f", "CAST(2.5 AS Float32)")),
+                        resource);
+        CHECK_FALSE(needs_of(node, params, backend_type_t::MySQL, columns, resource).strict_store);
+    }
+    SECTION("SET f = f + 1: MySQL's store, refused on ClickHouse, whose Float32 conversion checks no range") {
+        const auto node = orders_update_set(resource,
+                                            "f",
+                                            cast_to(resource,
+                                                    param_storage{plus_one("f", complex_logical_type{logical_type::DOUBLE})},
+                                                    real));
+        check_validated(node,
+                        params,
+                        columns,
+                        set_column_is("f",
+                                      mysql_set_is("f", "(`f` + 1)"),
+                                      "CAST((\"f\" + 1) AS float4)",
+                                      generate_refuses(core::error_code_t::unimplemented_yet,
+                                                       "ClickHouse converts a Float64 to Float32 without a range check: "
+                                                       "a computed DOUBLE assigned to a FLOAT column is not written")),
+                        resource);
+        CHECK(needs_of(node, params, backend_type_t::MySQL, columns, resource).strict_store);
+    }
+    SECTION("a bound DOUBLE out of FLOAT's range is the engine's refusal") {
+        for (auto value : {huge, tiny}) {
+            const auto node =
+                orders_update_set(resource, "f", cast_to(resource, param_storage{read_parameter(resource, value)}, real));
+            const auto refused = generate_refuses(core::error_code_t::numeric_value_out_of_range,
+                                                  "UPDATE SET: the value is out of the range of FLOAT");
+            CHECK(validated_outcome(node, params, backend_type_t::MySQL, columns, resource) == refused);
+            CHECK(validated_outcome(node, params, backend_type_t::ClickHouse, columns, resource) == refused);
+        }
+    }
+    SECTION("a fraction into an integer column stays refused: MySQL rounds a DECIMAL half away from zero") {
+        const auto node =
+            orders_update_set(resource, "a", cast_to(resource, param_storage{read_parameter(resource, half)}, integer));
+        check_validated(node,
+                        params,
+                        columns,
+                        set_column_is("a",
+                                      generate_refuses(core::error_code_t::unimplemented_yet, unfaithful_cast),
+                                      "CAST(2.5 AS int4)",
+                                      generate_refuses(core::error_code_t::unimplemented_yet, unfaithful_cast)),
+                        resource);
+    }
+    SECTION("a CAST to a type that is not the column's is no assignment cast") {
+        const auto node = orders_update_set(resource,
+                                            "a",
+                                            cast_to(resource,
+                                                    column_operand(resource, "big"),
+                                                    complex_logical_type{logical_type::SMALLINT}));
+        check_validated(node,
+                        params,
+                        columns,
+                        set_column_is("a",
+                                      generate_refuses(core::error_code_t::unimplemented_yet, unfaithful_cast),
+                                      "CAST(\"big\" AS int2)",
+                                      generate_refuses(core::error_code_t::unimplemented_yet, unfaithful_cast)),
+                        resource);
+    }
 }

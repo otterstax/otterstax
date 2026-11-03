@@ -24,9 +24,13 @@ namespace otterstax::backends {
         // The connection or the discovery failed (a container reported healthy a
         // moment before it listens, a server not ready yet): retried.
         unreachable,
-        // The backend answered, but what it answered cannot be used (a discovered
-        // column the federation metadata cannot record): the same answer comes
-        // back on every attempt, so it is not retried; the backend is left out.
+        // The backend answered, but what it answered cannot be used: the same
+        // answer comes back on every attempt, so it is not retried; the backend
+        // is left out. (remote_backends_t::open reports a session the server
+        // opened with settings it cannot be written under — MySQL's sql_mode
+        // NO_BACKSLASH_ESCAPES, backend_agent_t::session_refused() — as
+        // unusable, every other failure of its attempt, the connect and the
+        // discovery, as unreachable.)
         unusable,
     };
 

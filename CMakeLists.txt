@@ -154,7 +154,7 @@ add_library(lib_${PROJECT_NAME} INTERFACE
 # common_server (secure_random_bytes) and flight_sql uses flight_sql_core.
 set(OTTERSTAX_INTERNAL_LIBS
     flight_sql flight_sql_core common_server mysql_server postgres_server
-    spark_connect_server catalog connectors s3 file backends session runtime
+    spark_connect_server catalog catalog_discovery connectors s3 file backends session runtime
     integration otterbrix_local otterstax_federation kafka_grammar kafka_runtime)
 if(APPLE)
     set(OTTERSTAX_LINK_GROUP ${OTTERSTAX_INTERNAL_LIBS})

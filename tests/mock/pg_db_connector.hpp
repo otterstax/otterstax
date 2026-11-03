@@ -86,7 +86,7 @@ namespace pg {
 
         // The data overloads throw when configured to: that models a driver or
         // translator exception raised inside the coroutine on the io thread, which
-        // executeQuery must hand back as an io_error value.
+        // the backend agent (backend_agent_t::run) must hand back as an error value.
         asio::awaitable<core::result_wrapper_t<std::unique_ptr<data_chunk_t>>>
         runQuery(std::string_view query,
                  otterstax::function_ref_t<std::unique_ptr<data_chunk_t>(PGresult*)> handler) override {
@@ -115,7 +115,7 @@ namespace pg {
             co_return 42;
         }
 
-        // Schema-discovery overload (PostgressManager::discover: the pg_enum
+        // Schema-discovery overload (the PostgreSQL discovery of backend_agent_t: the pg_enum
         // metadata query, the table listing and the schema probes) and DDL.
         // Always succeeds so startup opens the connection regardless of the
         // data-path throw configuration: pg_enum answers no labels, the

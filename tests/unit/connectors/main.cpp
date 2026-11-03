@@ -7,7 +7,7 @@
 
 #include <filesystem>
 
-// The connector managers and the integration backends log through named spdlog
+// The connectors and the backend agents log through named spdlog
 // loggers that must exist before the first construction. Under CTest each
 // test case runs in its own process, so initialize here in main.
 int main(int argc, char* argv[]) {

@@ -42,6 +42,7 @@ set(${PROJECT_NAME}_SOURCES
     test_prepare_plan.cpp
     test_constant_aggregates.cpp
     test_federated_queries.cpp
+    test_registration_scope.cpp
 )
 
 add_executable(${PROJECT_NAME} ${${PROJECT_NAME}_SOURCES})

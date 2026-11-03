@@ -218,3 +218,43 @@ TEST_CASE("flight session scope: BEGIN is refused and leaves no transaction open
     CHECK(engine.execute_update("INSERT INTO fb.t (id) VALUES (1)") == 1);
     CHECK(rows_of(engine.execute("SELECT id FROM fb.t")) == 1);
 }
+
+// A prepared statement is ONE entry of its session, prepared at CreatePreparedStatement and run by
+// every execution: N executions add none. The entries are counted through the session's own
+// answers — every statement id it gave out executed once more: an id it keeps no entry for is
+// "prepared statement does not exist".
+TEST_CASE("flight session scope: executions of a prepared statement add no entry to its session") {
+    otterstax::test::session_stack_owner owner(otterstax::test::unique_test_dir("otterstax_flight_scope_entries"));
+    auto core = make_core(owner);
+    auto& engine = core.engine();
+    REQUIRE(engine.execute_update("CREATE SCHEMA fe") == 0);
+    REQUIRE(engine.execute_update("CREATE TABLE fe.t (id bigint)") == 0);
+    REQUIRE(engine.execute_update("INSERT INTO fe.t (id) VALUES (1), (2)") == 2);
+
+    const auto select = prepare(core, "SELECT id FROM fe.t");
+    for (int run = 0; run < 5; ++run) {
+        CHECK(rows_of_prepared(core, select) == 2);
+    }
+
+    using otterstax::session::query_session_t;
+    using otterstax::session::statement_id_t;
+    std::size_t issued = 0;
+    REQUIRE(core.use_prepared(select, [&](query_session_t& session) {
+        issued = static_cast<std::size_t>(session.next_statement());
+    }));
+    std::size_t entries = 0;
+    for (std::size_t id = 1; id < issued; ++id) {
+        query_session_t::unique_future<query_session_t::session_result> future;
+        REQUIRE(core.use_prepared(select, [&](query_session_t& session) {
+            future = actor_zeta::send(session.address(), &query_session_t::execute_statement, statement_id_t{id}).second;
+        }));
+        auto answer = otterstax::await_future_blocking<session_payload>(std::move(future), owner.engine().resource());
+        const bool unknown = answer.has_error() &&
+                             std::string{answer.error().what.c_str()}.find("does not exist") != std::string::npos;
+        if (!unknown) {
+            ++entries;
+        }
+    }
+    CHECK(entries == 1);
+    REQUIRE(core.close_prepared(select, kClient).ok());
+}

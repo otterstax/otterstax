@@ -17,10 +17,12 @@
 
 #include <atomic>
 #include <chrono>
+#include <map>
 #include <memory>
 #include <memory_resource>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace fakebackend;
@@ -225,7 +227,9 @@ TEST_CASE("agent: a read answers the rows of its statement, a write the backend'
     CHECK(rows.value().front().column_count() == 1);
     auto written = wait_ready(stack.send(&fed::backend_agent_t::write,
                                          std::string{R"(INSERT INTO "public"."t" VALUES (3, 'c'), (4, 'd'))"},
-                                         fed::write_kind_t::insert));
+                                         fed::write_kind_t::insert,
+                                         false,
+                                         qualified_name_t{}));
     REQUIRE_FALSE(written.has_error());
     CHECK(written.value() == 2);
 }
@@ -246,6 +250,43 @@ TEST_CASE("agent: a MySQL discovery reads the server's listing and probes") {
     REQUIRE(table.schema.child_types().size() == 2);
     CHECK(table.schema.child_types()[0].type() == logical_type::BIGINT);
     CHECK(table.schema.child_types()[1].alias() == "Note");
+}
+
+// An UPDATE whose narrowing assignment the generator left to MySQL's store into the column
+// (sql_gen::statement_needs_t::strict_store) runs only on a session whose sql_mode is strict:
+// elsewhere MySQL would clamp an out-of-range value where the engine refuses it.
+TEST_CASE("agent: a write relying on a strict sql_mode runs only on a strict MySQL session") {
+    const std::string update = "UPDATE `bill`.`orders` SET `a` = (`a` + 1);";
+    auto write = [](agent_stack_t& stack, const std::string& sql, bool strict_store) {
+        return wait_ready(stack.send(&fed::backend_agent_t::write,
+                                     std::string{sql},
+                                     fed::write_kind_t::update,
+                                     strict_store,
+                                     qualified_name_t{}));
+    };
+    SECTION("not strict: refused with nothing sent, a write not relying on it runs") {
+        agent_stack_t stack(backend_type_t::MySQL);
+        stack.server.set_sql_mode("NO_ENGINE_SUBSTITUTION");
+        REQUIRE_FALSE(stack.agent->connect().contains_error());
+        stack.server.clear();
+        auto refused = write(stack, update, true);
+        REQUIRE(refused.has_error());
+        CHECK(refused.error().type == core::error_code_t::unimplemented_yet);
+        CHECK(std::string{refused.error().what}.find("strict sql_mode") != std::string::npos);
+        CHECK(stack.server.log().empty());
+        CHECK_FALSE(write(stack, update, false).has_error());
+        CHECK(stack.server.log().size() == 1);
+    }
+    for (const char* mode : {"STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION", "STRICT_ALL_TABLES"}) {
+        DYNAMIC_SECTION("strict: " << mode) {
+            agent_stack_t stack(backend_type_t::MySQL);
+            stack.server.set_sql_mode(mode);
+            REQUIRE_FALSE(stack.agent->connect().contains_error());
+            stack.server.clear();
+            CHECK_FALSE(write(stack, update, true).has_error());
+            CHECK(stack.server.log() == std::vector<std::string>{"write " + update});
+        }
+    }
 }
 
 TEST_CASE("agent: cancel ends a statement the backend never answers and refuses the next one") {
@@ -318,12 +359,12 @@ namespace {
         }
 
         // A read of the table by engine transaction `txn`, inside a block or not.
-        auto read(std::uint64_t txn, bool block) {
+        auto read(std::uint64_t txn, bool block, components::session::session_id_t session = {}) {
             components::table::transaction_data data{txn, 0};
             data.command_id = block ? 1 : 0;
             auto [needs_sched, future] = actor_zeta::send(actor.get(),
                                                           &fed::backend_actor_t::storage_fetch_next_batch,
-                                                          components::session::session_id_t{},
+                                                          session,
                                                           table_oid,
                                                           std::uint64_t{0},
                                                           std::int64_t{-1},
@@ -331,6 +372,25 @@ namespace {
                                                           data);
             static_cast<void>(needs_sched);
             return std::move(future);
+        }
+        // The client's connection of `session` closed (query_session_t::close).
+        void end_session(const components::session::session_id_t& session) {
+            auto [needs_sched, future] =
+                actor_zeta::send(actor.get(), &fed::backend_actor_t::end_session, session);
+            static_cast<void>(needs_sched);
+            wait_ready(std::move(future));
+        }
+        // otterbrix's ROLLBACK of transaction `txn`.
+        void abort(std::uint64_t txn) {
+            components::execution_context_t ctx;
+            ctx.txn = components::table::transaction_data{txn, 0};
+            auto [needs_sched, future] = actor_zeta::send(actor.get(),
+                                                          &fed::backend_actor_t::abort_transaction,
+                                                          ctx,
+                                                          std::uint64_t{0},
+                                                          std::pmr::set<fed::oid_t>{&resource});
+            static_cast<void>(needs_sched);
+            CHECK_FALSE(wait_ready(std::move(future)).contains_error());
         }
         void release(std::uint64_t txn) {
             components::execution_context_t ctx;
@@ -473,6 +533,64 @@ TEST_CASE("actor: a statement waiting for its own transaction's agent waits past
     CHECK(stack.actor->pinned() == 0);
 }
 
+TEST_CASE("actor: a closed connection's block ends on its agent at once and its waiting statement leaves the queue") {
+    actor_stack_t stack(2);
+    stack.actor->set_checkout_timeout(std::chrono::seconds(30));
+    using session_id = components::session::session_id_t;
+    const session_id s1, s2, s3, s4;
+    CHECK(answered_rows(wait_ready(stack.read(1, true, s1))));
+    CHECK(answered_rows(wait_ready(stack.read(2, true, s2))));
+    REQUIRE(stack.actor->pinned() == 2);
+    // Two more blocks wait for an agent.
+    auto third = stack.read(3, true, s3);
+    auto fourth = stack.read(4, true, s4);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (stack.actor->waiting() < 2) {
+        REQUIRE(std::chrono::steady_clock::now() < deadline);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    // The first block's connection closes: its ROLLBACK runs on its agent, which serves the third.
+    stack.end_session(s1);
+    CHECK(answered_rows(wait_ready(std::move(third))));
+    // The fourth's connection closes while its first statement waits: it leaves the queue at once
+    // and never took an agent.
+    stack.end_session(s4);
+    auto refused = wait_ready(std::move(fourth));
+    REQUIRE(refused.has_error());
+    CHECK(refused.error().type == core::error_code_t::connection_closed);
+    CHECK(stack.actor->waiting() == 0);
+    // otterbrix's own ROLLBACK of the closed sessions comes later: nothing more reaches the backend.
+    stack.abort(1);
+    stack.abort(4);
+    stack.end_session(s2);
+    stack.end_session(s3);
+    CHECK(stack.actor->pinned() == 0);
+    // Every backend transaction that began ended on its own connection: no agent keeps one open.
+    std::map<int, int> open;
+    const auto log = stack.server.log();
+    const auto on = stack.server.connections();
+    int begins = 0;
+    for (std::size_t i = 0; i < log.size(); ++i) {
+        if (log[i] == "begin") {
+            ++begins;
+            ++open[on[i]];
+        } else if (log[i] == "rollback" || log[i] == "commit") {
+            --open[on[i]];
+        }
+    }
+    CHECK(begins == 3);
+    for (const auto& [connection, count] : open) {
+        INFO("connection " << connection);
+        CHECK(count == 0);
+    }
+    // A closed connection's transaction takes no agent any more, a new block takes one at once.
+    auto late = wait_ready(stack.read(2, true, s2));
+    REQUIRE(late.has_error());
+    CHECK(late.error().type == core::error_code_t::connection_closed);
+    CHECK(answered_rows(wait_ready(stack.read(5, true))));
+    CHECK(stack.actor->pinned() == 1);
+}
+
 TEST_CASE("pg_commit_rolled_back: the tag a COMMIT of an aborted transaction answers") {
     CHECK(fed::pg_commit_rolled_back("ROLLBACK"));
     CHECK_FALSE(fed::pg_commit_rolled_back("COMMIT"));
@@ -510,7 +628,8 @@ TEST_CASE("agent: a MySQL deadlock ends the transaction and its COMMIT is refuse
     agent_stack_t stack(backend_type_t::MySQL);
     stack.server.fail_statements("dead", core::error_code_t::write_conflict);
     auto write = [&](std::string sql) {
-        return wait_ready(stack.send(&fed::backend_agent_t::write, std::move(sql), fed::write_kind_t::insert));
+        return wait_ready(
+            stack.send(&fed::backend_agent_t::write, std::move(sql), fed::write_kind_t::insert, false, qualified_name_t{}));
     };
     REQUIRE_FALSE(stack.step(transaction_step_t::begin).contains_error());
     REQUIRE_FALSE(write("INSERT ok").has_error());
@@ -523,4 +642,91 @@ TEST_CASE("agent: a MySQL deadlock ends the transaction and its COMMIT is refuse
     const auto log = stack.server.log();
     CHECK(std::find(log.begin(), log.end(), "commit") == log.end());
     CHECK(std::none_of(log.begin(), log.end(), [](const auto& line) { return line.find("later") != std::string::npos; }));
+}
+
+TEST_CASE("ch_failed_mutations: the mutations ClickHouse names in a failed synchronous mutation") {
+    using ids_t = std::vector<std::string>;
+    CHECK(fed::ch_failed_mutations("Code: 341. DB::Exception: Exception happened during execution of mutation "
+                                   "'mutation_4.txt' with part 'all_1_1_0' reason: 'Code: 70. DB::Exception: Value in "
+                                   "column Int64 cannot be safely converted into type Int32'.") == ids_t{"mutation_4.txt"});
+    CHECK(fed::ch_failed_mutations("Exception happened during execution of mutations 'mutation_2.txt, mutation_3.txt' "
+                                   "with part 'all_1_1_0' reason: 'Code: 153. Division by zero'") ==
+          ids_t{"mutation_2.txt", "mutation_3.txt"});
+    CHECK(fed::ch_failed_mutations("Exception happened during execution of mutation '0000000005' with part "
+                                   "'all_0_0_0_4' reason: 'x'") == ids_t{"0000000005"});
+    // A statement refused before its mutation existed, a killed one, a text of another shape.
+    CHECK(fed::ch_failed_mutations("Code: 47. DB::Exception: Missing columns: 'nope'").empty());
+    CHECK(fed::ch_failed_mutations("Code: 341. DB::Exception: Mutation mutation_4.txt was killed").empty());
+    CHECK(fed::ch_failed_mutations("Exception happened during execution of mutation 'mutation_4.txt").empty());
+    CHECK(fed::ch_failed_mutations("Exception happened during execution of mutation '' with part 'p'").empty());
+}
+
+// A ClickHouse mutation that failed on a part (ALTER TABLE ... UPDATE under mutations_sync = 2)
+// stays in system.mutations and is retried forever, failing every later mutation of the table: the
+// agent kills exactly the mutation ClickHouse names, then answers the statement's own error.
+TEST_CASE("agent: a failed ClickHouse mutation is killed and the statement answers its own error") {
+    const std::string update =
+        "ALTER TABLE `chdb`.`pc` UPDATE `i` = accurateCast((`i` * 3000000000), 'Nullable(Int32)') WHERE 1 "
+        "SETTINGS mutations_sync = 2;";
+    const std::string reason = "Code: 341. DB::Exception: Exception happened during execution of mutation "
+                               "'mutation_4.txt' with part 'all_1_1_0' reason: 'Code: 70. DB::Exception: Value in "
+                               "column Int64 cannot be safely converted into type Int32'";
+    const std::string kill =
+        "exec KILL MUTATION WHERE database = 'chdb' AND table = 'pc' AND mutation_id = 'mutation_4.txt'";
+    const qualified_name_t table{core::dbname_t{"chdb"}, core::schema_t{}, core::relname_t{"pc"}};
+    auto write = [&table](agent_stack_t& stack, const std::string& sql, fed::write_kind_t kind) {
+        return wait_ready(stack.send(&fed::backend_agent_t::write, std::string{sql}, kind, false, table));
+    };
+    SECTION("the mutation named is killed, the answer is the mutation's error") {
+        agent_stack_t stack(backend_type_t::ClickHouse);
+        stack.server.fail_statements("ALTER TABLE", core::error_code_t::internal_error, reason);
+        auto written = write(stack, update, fed::write_kind_t::update);
+        REQUIRE(written.has_error());
+        CHECK(written.error().type == core::error_code_t::internal_error);
+        CHECK(std::string{written.error().what} == "fake backend: refused " + update + ": " + reason);
+        CHECK(stack.server.log() == std::vector<std::string>{"write " + update, kill});
+    }
+    SECTION("a lightweight DELETE that failed: the same") {
+        agent_stack_t stack(backend_type_t::ClickHouse);
+        const std::string remove = "DELETE FROM `chdb`.`pc` WHERE (intDiv(`i`, 0) = 1);";
+        stack.server.fail_statements("DELETE FROM", core::error_code_t::internal_error, reason);
+        CHECK(write(stack, remove, fed::write_kind_t::delete_).has_error());
+        CHECK(stack.server.log() == std::vector<std::string>{"write " + remove, kill});
+    }
+    SECTION("a KILL that failed: both errors in the answer") {
+        agent_stack_t stack(backend_type_t::ClickHouse);
+        stack.server.fail_statements("ALTER TABLE", core::error_code_t::internal_error, reason);
+        stack.server.fail_statements("KILL MUTATION", core::error_code_t::io_error, "connection lost");
+        auto written = write(stack, update, fed::write_kind_t::update);
+        REQUIRE(written.has_error());
+        CHECK(written.error().type == core::error_code_t::internal_error);
+        const std::string what{written.error().what};
+        CHECK(what.rfind("fake backend: refused " + update + ": " + reason, 0) == 0);
+        CHECK(what.find("the failed mutation mutation_4.txt was not killed") != std::string::npos);
+        CHECK(what.find("connection lost") != std::string::npos);
+    }
+    SECTION("several mutations named together: none is killed, the answer says so") {
+        agent_stack_t stack(backend_type_t::ClickHouse);
+        stack.server.fail_statements("ALTER TABLE",
+                                     core::error_code_t::internal_error,
+                                     "Exception happened during execution of mutations 'mutation_2.txt, "
+                                     "mutation_3.txt' with part 'all_1_1_0' reason: 'x'");
+        auto written = write(stack, update, fed::write_kind_t::update);
+        REQUIRE(written.has_error());
+        CHECK(std::string{written.error().what}.find("mutation_2.txt, mutation_3.txt as failed together") !=
+              std::string::npos);
+        CHECK(stack.server.log() == std::vector<std::string>{"write " + update});
+    }
+    SECTION("a refusal naming no mutation, the statement's own literal, an INSERT: nothing killed") {
+        agent_stack_t stack(backend_type_t::ClickHouse);
+        stack.server.fail_statements("ALTER TABLE", core::error_code_t::undefined_column, "Missing columns: 'nope'");
+        CHECK(write(stack, update, fed::write_kind_t::update).has_error());
+        const std::string literal = "ALTER TABLE `chdb`.`pc` UPDATE `s` = 'Exception happened during execution of "
+                                    "mutation ''m'' with part ''p''' WHERE 1 SETTINGS mutations_sync = 2;";
+        CHECK(write(stack, literal, fed::write_kind_t::update).has_error());
+        stack.server.fail_statements("INSERT", core::error_code_t::internal_error, reason);
+        const std::string insert = "INSERT INTO `chdb`.`pc` (`i`) VALUES (1);";
+        CHECK(write(stack, insert, fed::write_kind_t::insert).has_error());
+        CHECK(stack.server.log() == std::vector<std::string>{"write " + update, "write " + literal, "write " + insert});
+    }
 }

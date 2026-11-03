@@ -6,7 +6,7 @@
 //   - PostgreSQL: SSL / GSS encryption refused, AuthenticationOk, ReadyForQuery;
 //   - ClickHouse: ClientHello / ServerHello, the addendum, a Pong for the connect's Ping.
 // PQexec / Client::Execute block their io thread on such a server (for good, or up to the 10 s recv
-// timeout); cancel(), called from another thread as the connector manager's shutdown calls it,
+// timeout); cancel(), called from another thread as the shutdown's cancel_agents calls it,
 // must end the statement at once.
 //
 // Catch2 assertions are not thread-safe: the server thread only counts (atomics), the test thread

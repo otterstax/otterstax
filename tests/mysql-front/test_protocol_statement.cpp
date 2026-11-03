@@ -627,7 +627,8 @@ TEST_CASE("mysql protocol: variable values agree with the handshake and the serv
     CHECK(chunk.data[6].data<int64_t>()[0] == 600); // the connection's read timeout
     CHECK(chunk.data[7].is_null(0));
     CHECK(text_cell(chunk, 8) == "REPEATABLE-READ");
-    CHECK(text_cell(chunk, 9) == "PIPES_AS_CONCAT,STRICT_TRANS_TABLES");
+    // No PIPES_AS_CONCAT: the engine has no `||` for strings (OTB-concat).
+    CHECK(text_cell(chunk, 9) == "STRICT_TRANS_TABLES");
 
     auto wire = over_the_wire(chunk);
     REQUIRE(wire.names.size() == 10);

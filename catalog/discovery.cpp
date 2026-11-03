@@ -21,9 +21,16 @@ namespace otterstax::catalog {
     std::pmr::string
     escape_sql_literal(std::pmr::memory_resource* resource, std::string_view value, backend_type_t backend) {
         OTX_ZONE_N("catalog::escape_sql_literal");
-        const bool backslash_escapes = backend == backend_type_t::MySQL || backend == backend_type_t::ClickHouse;
+        // A PostgreSQL value holding a backslash is an escape string constant, E'...', which reads
+        // the backslash as an escape whatever standard_conforming_strings says (sql_gen's
+        // write_string_literal writes the same).
+        const bool backslash_escapes = backend == backend_type_t::MySQL || backend == backend_type_t::ClickHouse ||
+                                       value.find('\\') != std::string_view::npos;
         std::pmr::string out{resource};
-        out.reserve(value.size() + 2);
+        out.reserve(value.size() + 3);
+        if (backslash_escapes && backend == backend_type_t::PostgreSQL) {
+            out.push_back('E');
+        }
         out.push_back('\'');
         for (char c : value) {
             if (c == '\'') {
@@ -52,7 +59,7 @@ namespace otterstax::catalog {
                          "AND ");
             if (scope.empty()) {
                 query.append("table_schema NOT IN ('pg_catalog', 'information_schema') AND table_schema NOT LIKE "
-                             "'pg\\_toast%' AND table_schema NOT LIKE 'pg\\_temp%'");
+                             "E'pg\\\\_toast%' AND table_schema NOT LIKE E'pg\\\\_temp%'");
             } else {
                 query.append("table_schema = ");
                 query.append(escape_sql_literal(resource, scope, backend));

@@ -13,6 +13,9 @@ target_include_directories(
     ${CMAKE_SOURCE_DIR}
 )
 
+# The repository's config files (load_config: every config yaml of the repository loads).
+target_compile_definitions(${PROJECT_NAME} PRIVATE OTTERSTAX_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+
 target_link_libraries(
     ${PROJECT_NAME} PRIVATE
     config::config

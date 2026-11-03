@@ -99,7 +99,8 @@ namespace otterstax::federation {
     backend_actor_t::take_sql(const take_t& take,
                               const components::vector::storage_parameters* parameters,
                               bool placeholders,
-                              bool returning) const {
+                              bool returning,
+                              sql_gen::statement_needs_t* needs) const {
         const auto& block = *blocks_.at(take.block);
         const auto kind = connection_.kind;
         const sql_gen::generation_options_t options{.placeholders = placeholders, .validated = true, .returning = returning};
@@ -162,7 +163,7 @@ namespace otterstax::federation {
                 }
             }
             const sql_gen::statement_target_t target{*name, from, map, from_map, all, {}};
-            return sql_gen::generate_query(take.node, parameters, kind, target, resource_, options);
+            return sql_gen::generate_query(take.node, parameters, kind, target, resource_, options, needs);
         }
         if (table_block(node)) {
             auto name = spell(node.table_oid());

@@ -22,8 +22,8 @@
 // sleeps retry_timeout, reconnects and pings again, leaving that loop only
 // when the ping succeeds or the reconnect fails on exactly its send_retries-th
 // turn — a backend that completes every handshake but never answers a Ping
-// keeps it reconnecting for good, on the connector pool's io thread. The
-// manager already pings (isConnected) in front of every query, so the
+// keeps it reconnecting for good, on the thread running the statement. The
+// backend agent already pings (isConnected) in front of every query, so the
 // connector opens the driver without ping_before_query and a query against
 // such a backend is one bounded recv on the query itself.
 //
@@ -466,7 +466,7 @@ TEST_CASE("ch Connector: isConnected() when the server completed the handshake a
 }
 
 TEST_CASE("ch Connector: a query against a server that completes every handshake but never answers a ping fails with io_error in bounded time") {
-    // Two Pongs — the Ping connect() sends and the isConnected() the manager
+    // Two Pongs — the Ping connect() sends and the isConnected() the backend agent
     // runs in front of every query — then nothing is ever answered again, on
     // this connection or on any the driver opens afterwards.
     fake_clickhouse_server server{fake_clickhouse_server::behaviour::handshake, std::string(USER), 2};

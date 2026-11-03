@@ -109,13 +109,13 @@ run_test "PostgreSQL extended protocol (raw wire)" "test_pg_extended_protocol.py
 run_test "MySQL wire protocol (raw socket)" "test_mysql_wire_protocol.py"
 # Local transactions with PostgreSQL semantics on both wires: ROLLBACK /
 # COMMIT seen from a second connection, 25P02 / refusals inside a failed
-# block, the extended-protocol BEGIN, SAVEPOINT refused (0A000 / 1235), SET
-# answered without effect (SET autocommit included, on every connection).
+# block, the extended-protocol BEGIN, SAVEPOINT / ROLLBACK TO / RELEASE, SET
+# run by the engine for the connection alone (SET autocommit included).
 run_test "Transactions (PostgreSQL wire)" "test_transactions_pg_wire.py"
 run_test "Transactions (MySQL wire)" "test_transactions_mysql_wire.py"
 # What MySQL drivers send on their own: @@variable selects, SHOW VARIABLES /
-# WARNINGS, MySQL SET forms answered by the frontend; NO_BACKSLASH_ESCAPES
-# honoured by PyMySQL; a server-side prepared `?` running as `$n`.
+# WARNINGS, MySQL SET forms; values escaped with a backslash (no
+# NO_BACKSLASH_ESCAPES) read as values; a server-side prepared `?` running as `$n`.
 run_test "MySQL driver housekeeping" "test_mysql_client_housekeeping.py"
 # Flight SQL: GetTables lists local and remote tables; BEGIN by text refused.
 run_test "FlightSQL Client (GetTables, BEGIN refused)" "test_flightsql_client_tables_and_transactions.py"

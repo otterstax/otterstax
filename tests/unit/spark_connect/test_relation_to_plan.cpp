@@ -974,8 +974,8 @@ TEST_CASE("relation_to_plan: a remote read under a derived table keeps its windo
     const auto& inner = derived_inner(plan_root(statement));
     CHECK(child_kinds(inner) == "limit");
 
-    // The inner block — the read and its window — is what the pushdown rule
-    // sends to the backend as one statement.
+    // The inner block — the read and its window — is what the backend actor
+    // takes as one statement of the backend.
     CHECK(remote_read(plan_root(statement)) == inner.get());
     CHECK(inner->target().connection.t == "a");
     CHECK(inner->target().schema.t == "sch1");

@@ -63,21 +63,11 @@ RUN _local_build=() && \
         conan install conanfile.py --build missing "${_local_build[@]}" "${_jobs_conf[@]}" \
             -s build_type=Release \
             -s compiler.cppstd=20 \
-            -s 'clickhouse-cpp/*:compiler.cppstd=17' \
-            -s 'abseil/*:compiler.cppstd=17' \
-            -s 'protobuf/*:compiler.cppstd=17' \
-            -s 're2/*:compiler.cppstd=17' \
-            -s 'grpc/*:compiler.cppstd=17' \
             -o "&:with_tracy=True"; \
     else \
         conan install conanfile.py --build missing "${_local_build[@]}" "${_jobs_conf[@]}" \
             -s build_type=Release \
-            -s compiler.cppstd=20 \
-            -s 'clickhouse-cpp/*:compiler.cppstd=17' \
-            -s 'abseil/*:compiler.cppstd=17' \
-            -s 'protobuf/*:compiler.cppstd=17' \
-            -s 're2/*:compiler.cppstd=17' \
-            -s 'grpc/*:compiler.cppstd=17'; \
+            -s compiler.cppstd=20; \
     fi
 
 # Build tracy-capture CLI (headless, no GUI deps) when Tracy is enabled

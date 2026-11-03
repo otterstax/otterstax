@@ -48,7 +48,7 @@ clickhouse::Block make_block_3col(int rows) {
 
 // The system.columns types `named`, keyed by column name, by the result position of `block`'s
 // columns: what the ClickHouse backend hands ch_to_chunk for a read of a table's columns under their
-// own names (ClickhouseManager::declared_types_for).
+// own names (the `declared` types of backend_agent_t::read_ch).
 std::vector<std::optional<std::string>> by_position(const clickhouse::Block& block,
                                                      const std::unordered_map<std::string, std::string>& named) {
     std::vector<std::optional<std::string>> out(block.GetColumnCount());
@@ -517,6 +517,55 @@ TEST_CASE("ch_to_chunk characterization: Tuple override reads a STRUCT column") 
         REQUIRE(rec.child_types()[0].alias() == "_1");
         REQUIRE(rec.child_types()[1].alias() == "_2");
     }
+}
+
+// The demo's `props Tuple(channel String, geo Tuple(ip String))`: a named Tuple two levels deep is
+// registered (ch_to_struct, at discovery) and read (ch_to_chunk, every page) as one type, the
+// field names of both levels kept, so a page conforms to the declared column without a cast.
+TEST_CASE("ch_to_chunk: a named Tuple two levels deep reads as the type discovery registers") {
+    auto* res = std::pmr::new_delete_resource();
+    auto make_block = [] {
+        auto channel = std::make_shared<clickhouse::ColumnString>();
+        channel->Append("web");
+        auto ip = std::make_shared<clickhouse::ColumnString>();
+        ip->Append("10.0.0.1");
+        auto geo = std::make_shared<clickhouse::ColumnTuple>(std::vector<clickhouse::ColumnRef>{ip});
+        auto props = std::make_shared<clickhouse::ColumnTuple>(std::vector<clickhouse::ColumnRef>{channel, geo});
+        clickhouse::Block block;
+        block.AppendColumn("props", props);
+        return block;
+    };
+    const std::unordered_map<std::string, std::string> overrides{
+        {"props", "Tuple(channel String, geo Tuple(ip String))"}};
+    const auto block = make_block();
+    const auto registered = tsl::ch_to_struct(res, block, overrides);
+    REQUIRE(registered.child_types().size() == 1);
+    const auto& declared = registered.child_types()[0];
+    REQUIRE(declared.type() == logical_type::STRUCT);
+    REQUIRE(declared.child_types().size() == 2);
+    CHECK(declared.child_types()[0].alias() == "channel");
+    CHECK(declared.child_types()[1].alias() == "geo");
+    REQUIRE(declared.child_types()[1].type() == logical_type::STRUCT);
+    REQUIRE(declared.child_types()[1].child_types().size() == 1);
+    CHECK(declared.child_types()[1].child_types()[0].alias() == "ip");
+
+    // A read with the column's system.columns type declared by position is the registered type.
+    auto converted = tsl::ch_to_chunk(res, {block}, by_position(block, overrides));
+    REQUIRE_FALSE(converted.has_error());
+    const auto& chunk = converted.value();
+    CHECK(chunk.types()[0] == declared);
+    auto row = otterstax::test::cell(chunk, 0, 0);
+    REQUIRE(row.child_count() == 2);
+    CHECK(row.child(0).value<std::string_view>() == "web");
+    CHECK(row.child(1).child(0).value<std::string_view>() == "10.0.0.1");
+    // Without it the wire's type names the fields otherwise — what a read the backend actor declared
+    // nothing for would answer: no Tuple field name travels on the wire.
+    auto bare = tsl::ch_to_chunk(res, {block}, std::vector<std::optional<std::string>>(1));
+    REQUIRE_FALSE(bare.has_error());
+    const auto wire = bare.value().types()[0];
+    CHECK_FALSE(wire == declared);
+    REQUIRE(wire.child_types().size() == 2);
+    CHECK(wire.child_types()[0].alias() != "channel");
 }
 
 // Types only: the rows of an Array-overridden column are read by the cases below.

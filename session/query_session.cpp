@@ -200,6 +200,23 @@ namespace otterstax::session {
 
     void query_session_t::close() noexcept {
         OTX_ZONE_N("query_session::close");
+        // Every backend actor ends what the connection holds of it at once: its statements waiting
+        // for a backend connection leave the queue, its transaction rolls back on the agent it holds
+        // and frees it (backend_actor_t::end_session). Not left to the engine's ROLLBACK below: that
+        // is a statement for one of the engine's executors, each running one statement at a time, and
+        // all of them may be running statements of other blocks that wait for the very agent this
+        // connection's block holds. Not awaited.
+        for (const auto& connection : services_.connections) {
+            try {
+                [[maybe_unused]] auto [needs_sched, future] =
+                    actor_zeta::send(connection.actor, &federation::backend_actor_t::end_session, engine_session_);
+            } catch (const std::exception& e) {
+                log_->error("query_session: cannot end the session on connection {} ({}); its transaction there "
+                            "ends with the engine's ROLLBACK",
+                            connection.name,
+                            e.what());
+            }
+        }
         // The engine ends the session after the statements this one sent before
         // the close (manager_dispatcher_t::close_session): the statement in
         // flight runs to its end, an open block — failed or not — rolls back,
@@ -736,9 +753,12 @@ namespace otterstax::session {
         }
         if (root.external != nullptr) {
             log_->debug("query_session: external-table statement, routing to file/s3 manager");
-            co_return co_await (root.external->op() == otterstax::external::external_op_t::create_external_table
-                                    ? load_external_table(id, *root.external, data->tag)
-                                    : copy_to(id, *root.external, data->tag));
+            // Two statements, not `co_await (c ? a() : b())`: gcc 11 builds the
+            // frames of both arms of a conditional under co_await.
+            if (root.external->op() == otterstax::external::external_op_t::create_external_table) {
+                co_return co_await load_external_table(id, *root.external, data->tag);
+            }
+            co_return co_await copy_to(id, *root.external, data->tag);
         }
         // Every Kafka route answers a cursor: its error, or an empty payload.
         auto kafka_answer = [this, tag = data->tag](const cursor::cursor_t_ptr& cursor,
@@ -898,10 +918,18 @@ namespace otterstax::session {
         // in the catalog yet: registered whatever the block (the registration
         // session's own statements), and the statement run once more only
         // outside a block — inside one the failure has failed it already.
-        const bool registered = co_await register_missed(
+        auto outcome = co_await register_missed(
             core::error_t{cursor->get_error().type, std::pmr::string{cursor->get_error().what.c_str(), resource()}},
             std::move(names));
-        if (!registered || !rebuild || cursor->transaction_status() != transaction_status_t::idle) {
+        if (!outcome.registered && outcome.unreachable) {
+            // The table may well be there: what the client must know is that its connection is
+            // not, not that the name does not exist. Answered where the engine left the session.
+            OTX_ZONE_N("query_session::on_engine::unreachable");
+            auto failed = cursor::make_cursor(resource(), std::move(*outcome.unreachable));
+            failed->set_transaction_status(cursor->transaction_status());
+            co_return failed;
+        }
+        if (!outcome.registered || !rebuild || cursor->transaction_status() != transaction_status_t::idle) {
             co_return cursor;
         }
         sent.reset();
@@ -921,8 +949,8 @@ namespace otterstax::session {
         co_return again;
     }
 
-    actor_zeta::unique_future<bool> query_session_t::register_missed(core::error_t error,
-                                                                    std::pmr::vector<qualified_name_t> names) {
+    actor_zeta::unique_future<query_session_t::registration_outcome_t>
+    query_session_t::register_missed(core::error_t error, std::pmr::vector<qualified_name_t> names) {
         std::vector<std::pair<otterstax::catalog::configured_connection_t, qualified_name_t>> targets;
         std::pmr::vector<qualified_name_t> short_names(resource());
         {
@@ -930,7 +958,7 @@ namespace otterstax::session {
             if (services_.connections.empty() || (error.type != error_code_t::table_not_exists &&
                                                   error.type != error_code_t::schema_not_exists &&
                                                   error.type != error_code_t::database_not_exists)) {
-                co_return false;
+                co_return registration_outcome_t{};
             }
             for (auto& name : names) {
                 if (auto target = otterstax::catalog::registration_target(error, name, services_.connections)) {
@@ -972,13 +1000,13 @@ namespace otterstax::session {
         {
             OTX_ZONE_N("query_session::register_missed::targets");
             if (targets.empty()) {
-                co_return false;
+                co_return registration_outcome_t{};
             }
             log_->info("query_session: registering {} table(s) after: {}", targets.size(), error.what.c_str());
         }
         // Each target on its own: one a backend does not have (a completed
         // short name of another connection) leaves the others registered.
-        bool registered = false;
+        registration_outcome_t outcome;
         for (auto& [connection, scope] : targets) {
             // The connection's backend actor discovers the table on one of its agents; this
             // session's thread does not wait for the backend (the session awaits the answer).
@@ -994,6 +1022,13 @@ namespace otterstax::session {
                 OTX_ZONE_N("query_session::register_missed::plans");
                 if (reply.has_error()) {
                     log_->warn("query_session: {} cannot be discovered: {}", scope.to_string(), reply.error().what.c_str());
+                    // The connection failed, not the name: that is the client's answer. A backend
+                    // that answered (no such table, a refused probe) leaves the statement's miss.
+                    const auto code = reply.error().type;
+                    if (!outcome.unreachable &&
+                        (code == error_code_t::io_error || code == error_code_t::connection_closed)) {
+                        outcome.unreachable.emplace(code, std::pmr::string{reply.error().what.c_str(), resource()});
+                    }
                     continue;
                 }
                 plans = otterstax::catalog::registration_plans(resource(), connection, reply.value());
@@ -1026,9 +1061,9 @@ namespace otterstax::session {
                     connection.actor->unstage_table(name);
                 }
             }
-            registered = registered || recorded;
+            outcome.registered = outcome.registered || recorded;
         }
-        co_return registered;
+        co_return outcome;
     }
 
     actor_zeta::unique_future<query_session_t::session_result> query_session_t::describe(ParsedQueryDataPtr data,
@@ -1064,10 +1099,21 @@ namespace otterstax::session {
         if (!target.value().empty()) {
             return otterstax::catalog::check_database_ownership(resource(), target.value(), services_.aliases);
         }
+        auto written = plan::write_target(data);
+        if (!written) {
+            return core::error_t::no_error();
+        }
         // DROP SCHEMA names a schema of the session's place: dispatch asks the
         // place before it runs (a describe changes nothing).
-        if (auto written = plan::write_target(data); written && !written->drops_schema) {
-            return otterstax::catalog::check_write_ownership(resource(), written->name, false);
+        if (!written->drops_schema) {
+            if (auto owned = otterstax::catalog::check_write_ownership(resource(), written->name, false);
+                owned.contains_error()) {
+                return owned;
+            }
+        }
+        // A connection configured with one `table:` takes DDL of that table only.
+        if (written->table_ddl) {
+            return otterstax::catalog::check_table_scope(resource(), written->name, services_.connections);
         }
         return core::error_t::no_error();
     }
@@ -1089,6 +1135,10 @@ namespace otterstax::session {
             if (auto owned = otterstax::catalog::check_write_ownership(resource(), ext.target(), false);
                 owned.contains_error()) {
                 co_return std::move(owned);
+            }
+            if (auto scoped = otterstax::catalog::check_table_scope(resource(), ext.target(), services_.connections);
+                scoped.contains_error()) {
+                co_return std::move(scoped);
             }
             if (ext.is_s3()) {
                 read.emplace(

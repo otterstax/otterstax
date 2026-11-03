@@ -180,7 +180,8 @@ namespace otterstax::kafka {
                      bool if_not_exists);
         // DROP TABLE <name> RESTRICT | CASCADE. Non-coroutine (returns the
         // send() future); a missing table is reported by the engine as
-        // table_not_exists, a RESTRICT drop under a dependent VIEW as other_error
+        // table_not_exists, a RESTRICT drop under a dependent VIEW as
+        // dependent_objects_still_exist
         actor_zeta::unique_future<components::cursor::cursor_t_ptr>
         drop_table(const qualified_name_t& name, components::catalog::drop_behavior_t behavior);
         // Drop a SOURCE's backing table with `behavior`, then — only when that

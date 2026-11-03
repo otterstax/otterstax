@@ -216,3 +216,132 @@ TEST_CASE("offer: RETURNING is PostgreSQL's alone") {
     auto returned = stack.ok("UPDATE " + table_of(pg, "orders") + " SET note = 'z' WHERE id = 2 RETURNING id, note;");
     CHECK(rows_of(returned) == std::vector<std::string>{"2|z"});
 }
+
+// The demo's `c.tier = 'gold'::tier_t`: a PostgreSQL ENUM column (pg_enum: the engine's ENUM of the
+// same labels) compared with a value cast to the engine's ENUM type. The block is one statement, the
+// value its label as a string literal, which PostgreSQL reads as a value of the column's type; before,
+// the offer's probe took the block (the value a `?`) and its run failed "unsupported value type".
+TEST_CASE("offer: a value of an ENUM type is pushed as its label") {
+    auto owned = std::make_unique<fed_stack_t>(
+        std::vector<connection_spec_t>{{"pg", backend_type_t::PostgreSQL, "shop", "public"}});
+    auto& stack = *owned;
+    auto mood = complex_logical_type::create_enum("mood", {{"a", 0}, {"b", 1}, {"c", 2}}, "m");
+    stack.backend("pg").add_table({"shop", "public", "moods", {column("id", logical_type::BIGINT), mood}, {}});
+    stack.open();
+    stack.ok("CREATE TYPE mood AS ENUM ('a', 'b', 'c');");
+    stack.backend("pg").on_scan([](const std::string& sql, std::pmr::memory_resource* resource)
+                                    -> std::optional<components::vector::data_chunk_t> {
+        if (sql.find("WHERE") == std::string::npos) {
+            return std::nullopt;
+        }
+        return chunk_of(resource, {column("id", logical_type::BIGINT)}, {{std::int64_t{2}}});
+    });
+    auto cursor = stack.ok("SELECT id FROM pg.shop.public.moods WHERE m = 'b'::mood;");
+    CHECK(rows_of(cursor) == std::vector<std::string>{"2"});
+    const auto reads = starting_with(stack.backend("pg").log(), "scan ");
+    REQUIRE_FALSE(reads.empty());
+    INFO(reads.back());
+    CHECK(reads.back().find("\"m\" = 'b'") != std::string::npos);
+}
+
+// otterbrix casts an UPDATE assignment whose value is not of its column's type to that type (a
+// literal is BIGINT / DOUBLE): `SET i = i + 1` over an INTEGER column narrows a BIGINT. MySQL's
+// CAST neither narrows nor range-checks, so the statement leaves the range check to the store into
+// the column, which only a strict sql_mode makes an error; ClickHouse's mutation gets accurateCast.
+TEST_CASE("offer: an UPDATE narrowing its value to the column is one statement where the store range-checks it") {
+    auto owned = std::make_unique<fed_stack_t>(std::vector<connection_spec_t>{{"pg", backend_type_t::PostgreSQL, "shop", "public"},
+                                                                              {"my", backend_type_t::MySQL, "shop", ""},
+                                                                              {"lax", backend_type_t::MySQL, "shop", ""},
+                                                                              {"ch", backend_type_t::ClickHouse, "shop", ""}});
+    auto& stack = *owned;
+    for (const std::string connection : {"pg", "my", "lax", "ch"}) {
+        stack.backend(connection).add_table({"shop",
+                                             connection == "pg" ? "public" : "",
+                                             "counts",
+                                             {column("id", logical_type::BIGINT),
+                                              column("i", logical_type::INTEGER),
+                                              column("f", logical_type::FLOAT)},
+                                             {}});
+    }
+    stack.backend("my").set_sql_mode("STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION");
+    stack.backend("lax").set_sql_mode("NO_ENGINE_SUBSTITUTION");
+    stack.open();
+    auto written = [&](const std::string& connection, const std::string& set) {
+        stack.backend(connection).clear();
+        stack.ok("UPDATE " + connection + ".shop.public.counts SET " + set + " WHERE id = 1;");
+        const auto writes = starting_with(stack.backend(connection).log(), "write ");
+        REQUIRE(writes.size() == 1);
+        return writes.front();
+    };
+
+    SECTION("an integer narrowed to INTEGER") {
+        const auto pg = written("pg", "i = i + 1");
+        INFO(pg);
+        CHECK(pg.find("CAST(") != std::string::npos);
+        // The validator's widening of `i` stays; the assignment's narrowing is the store's.
+        CHECK(written("my", "i = i * 1000") ==
+              "write UPDATE `shop`.`counts` SET `i` = (CAST(`i` AS SIGNED) * 1000) WHERE `id` = 1; @txn");
+        const auto ch = written("ch", "i = i + 1");
+        INFO(ch);
+        CHECK(ch.find("accurateCast(") != std::string::npos);
+        CHECK(ch.find("'Nullable(Int32)')") != std::string::npos);
+        // The validator's widening of `i` holds a NULL row's NULL: a bare Int64 target refuses it.
+        CHECK(ch.find("CAST(`i` AS Nullable(Int64))") != std::string::npos);
+    }
+    SECTION("a DOUBLE narrowed to FLOAT") {
+        CHECK(written("my", "f = 2.5").find("`f` = 2.5 ") != std::string::npos);
+        CHECK(written("my", "f = f + 1") ==
+              "write UPDATE `shop`.`counts` SET `f` = (CAST(`f` AS DOUBLE) + CAST(1 AS DOUBLE)) WHERE `id` = 1; @txn");
+        CHECK(written("ch", "f = 2.5").find("CAST(2.5 AS Float32)") != std::string::npos);
+        stack.backend("ch").clear();
+        auto refused = stack.refused("UPDATE ch.shop.public.counts SET f = f + 1 WHERE id = 1;");
+        CHECK(refused.type == core::error_code_t::unimplemented_yet);
+        CHECK(starting_with(stack.backend("ch").log(), "write ").empty());
+    }
+    SECTION("a MySQL session without a strict sql_mode takes no narrowing assignment") {
+        stack.backend("lax").clear();
+        auto refused = stack.refused("UPDATE lax.shop.public.counts SET i = i + 1 WHERE id = 1;");
+        CHECK(refused.type == core::error_code_t::unimplemented_yet);
+        CHECK(std::string{refused.what}.find("strict sql_mode") != std::string::npos);
+        CHECK(starting_with(stack.backend("lax").log(), "write ").empty());
+        // A bound value the engine's cast takes leaves nothing to range-check.
+        CHECK(written("lax", "f = 2.5").find("`f` = 2.5 ") != std::string::npos);
+        CHECK(written("lax", "i = 7").find("`i` = ") != std::string::npos);
+    }
+    SECTION("a fraction into an integer column stays refused on MySQL and ClickHouse") {
+        for (const std::string connection : {"my", "ch"}) {
+            INFO(connection);
+            stack.backend(connection).clear();
+            CHECK(stack.refused("UPDATE " + connection + ".shop.public.counts SET i = 2.5 WHERE id = 1;").type ==
+                  core::error_code_t::unimplemented_yet);
+            CHECK(starting_with(stack.backend(connection).log(), "write ").empty());
+        }
+    }
+}
+
+// A ClickHouse mutation that failed on a part stays in system.mutations, retried forever, and every
+// later mutation of the table fails with its error: the agent kills the mutation ClickHouse names in
+// the table the statement wrote (its backend spelling), the client gets the mutation's own error, and
+// the next UPDATE of the table runs.
+TEST_CASE("offer: a ClickHouse mutation that failed is killed and the table takes the next UPDATE") {
+    auto owned = std::make_unique<fed_stack_t>(std::vector<connection_spec_t>{{"ch", backend_type_t::ClickHouse, "Shop", ""}});
+    auto& stack = *owned;
+    stack.backend("ch").add_table(
+        {"Shop", "", "Counts", {column("id", logical_type::BIGINT), column("i", logical_type::INTEGER)}, {}});
+    stack.open();
+    const std::string reason = "Code: 341. DB::Exception: Exception happened during execution of mutation "
+                               "'mutation_4.txt' with part 'all_1_1_0' reason: 'Code: 70. DB::Exception: Value in "
+                               "column Int64 cannot be safely converted into type Int32'";
+    stack.backend("ch").fail_statements("3000000000", core::error_code_t::internal_error, reason);
+    stack.backend("ch").clear();
+    auto refused = stack.refused("UPDATE ch.shop.public.counts SET i = i * 3000000000 WHERE id = 1;");
+    CHECK(refused.type == core::error_code_t::internal_error);
+    CHECK(std::string{refused.what}.find(reason) != std::string::npos);
+    const auto log = stack.backend("ch").log();
+    REQUIRE(log.size() == 2);
+    CHECK(log[0].rfind("write ALTER TABLE `Shop`.`Counts` UPDATE ", 0) == 0);
+    CHECK(log[1] == "exec KILL MUTATION WHERE database = 'Shop' AND table = 'Counts' AND mutation_id = 'mutation_4.txt'");
+    stack.backend("ch").clear();
+    stack.ok("UPDATE ch.shop.public.counts SET i = i + 1 WHERE id = 1;");
+    CHECK(starting_with(stack.backend("ch").log(), "write ALTER TABLE `Shop`.`Counts` UPDATE ").size() == 1);
+}

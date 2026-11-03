@@ -48,7 +48,7 @@ fi
 # --- 1. Generate init SQL ---
 echo "=== 1. Generating demo data ==="
 if [ -f ../../.venv/bin/activate ]; then source ../../.venv/bin/activate; fi
-python ./generate_data.py
+python3 ./generate_data.py
 
 # --- 2. Bring up containers ---
 echo ""

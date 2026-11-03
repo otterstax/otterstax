@@ -6,7 +6,6 @@
 #include <components/log/log.hpp>
 #include <components/vector/data_chunk.hpp>
 #include "utility/tracy_profiler.hpp"
-#include "utility/thread_pool_manager.hpp"
 #include "utility/session.hpp"
 #include <core/result_wrapper.hpp>
 #include "types.hpp"

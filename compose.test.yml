@@ -118,6 +118,10 @@ services:
       args:
         WITH_TRACY: ${WITH_TRACY:-false}
         BUILD_JOBS: ${BUILD_JOBS:-0}
+        # ENABLE_ASAN=ON ./docker-run-tests.sh: the ASAN image, its
+        # dependencies instrumented too (asan-deps.profile)
+        ENABLE_ASAN: ${ENABLE_ASAN:-OFF}
+        ASAN_DEPS: ${ASAN_DEPS:-false}
     container_name: test_otterstax_app
     depends_on:
       mariadb1:

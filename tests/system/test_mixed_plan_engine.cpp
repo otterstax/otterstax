@@ -1,11 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2025-2026  OtterStax
 //
-// An engine-only reproduction kept from the old mixed-plan path: a GROUP BY on a
-// table-qualified STRING key over raw data chunks. The federated shapes it was
-// found through (a cross-server JOIN with GROUP BY, a remote table JOINed with a
-// local composite table — engine defect D1) are covered over the federation in
-// tests/federation/test_federation_joins.cpp.
+// An engine-only reproduction: a GROUP BY on a table-qualified STRING key over
+// raw data chunks (found through a cross-server JOIN with GROUP BY).
 
 #include <catch2/catch_all.hpp>
 

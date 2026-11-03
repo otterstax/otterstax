@@ -2317,3 +2317,88 @@ TEST_CASE("wire startup: postgres database without its public schema") {
     CHECK(refusal.message == "schema \"bare.public\" does not exist");
     server.stop();
 }
+
+// PostgreSQL's guarantee for a described statement: the rows of an Execute come in the shape its
+// Describe gave (RowDescription), or the Execute is ErrorResponse 0A000 "cached plan must not change
+// result type" (plancache.c, RevalidateCachedQuery). Every Execute parses the statement's text
+// again, so a table the connection changed between the Describe and the Execute gives the run
+// another shape; the frontend refuses it rather than send rows the client reads under the old one.
+TEST_CASE("wire statements: postgres Execute of a described statement whose table changed shape is 0A000") {
+    otterstax::test::session_stack_owner owner(otterstax::test::unique_test_dir("otterstax_wire_pg_cached_plan"));
+    frontend::postgres::postgres_server server(make_config<frontend::postgres::postgres_server>(owner.stack()));
+    server.start();
+
+    raw_client a(server.local_port());
+    pg_startup(a);
+    pg_ok(a, "CREATE SCHEMA wcp", "CREATE SCHEMA", 'I');
+    pg_ok(a, "CREATE TABLE wcp.t (id bigint)", "CREATE TABLE", 'I');
+    pg_ok(a, "INSERT INTO wcp.t (id) VALUES (1)", "INSERT 0 1", 'I');
+
+    auto parse = [](const std::string& name, const std::string& sql) {
+        auto body = cstr(name);
+        auto text = cstr(sql);
+        body.insert(body.end(), text.begin(), text.end());
+        body.insert(body.end(), {0x00, 0x00}); // no parameter types
+        return pg_frame('P', body);
+    };
+    auto describe_statement = [](const std::string& name) {
+        std::vector<uint8_t> body{'S'};
+        auto text = cstr(name);
+        body.insert(body.end(), text.begin(), text.end());
+        return pg_frame('D', body);
+    };
+    auto bind = [](const std::string& statement) {
+        auto body = cstr("");
+        auto name = cstr(statement);
+        body.insert(body.end(), name.begin(), name.end());
+        body.insert(body.end(), {0x00, 0x00, 0x00, 0x00, 0x00, 0x00}); // no formats, no parameters, no result formats
+        return pg_frame('B', body);
+    };
+    const auto execute = pg_frame('E', {0x00, 0x00, 0x00, 0x00, 0x00}); // portal "", no row limit
+    auto send = [&a](std::initializer_list<std::vector<uint8_t>> frames) {
+        std::vector<uint8_t> bytes;
+        for (const auto& frame : frames) {
+            bytes.insert(bytes.end(), frame.begin(), frame.end());
+        }
+        a.write(bytes);
+    };
+    // The messages up to ReadyForQuery, by type; the error's SQLSTATE and text.
+    auto read_until_ready = [&a](std::string& error_code, std::string& error_text) {
+        std::string types;
+        for (int guard = 0; guard < 64; ++guard) {
+            auto m = pg_read_message(a);
+            types.push_back(m.type);
+            if (m.type == 'E') {
+                error_code = pg_error_field(m.payload, 'C');
+                error_text = pg_error_field(m.payload, 'M');
+            }
+            if (m.type == 'Z') {
+                return types;
+            }
+        }
+        FAIL("no ReadyForQuery within 64 messages");
+        return types;
+    };
+
+    std::string code;
+    std::string text;
+    send({parse("s", "SELECT * FROM wcp.t"), describe_statement("s"), pg_frame('S', {})});
+    CHECK(read_until_ready(code, text) == "1tTZ");
+    // The control: the shape it was described with.
+    send({bind("s"), execute, pg_frame('S', {})});
+    CHECK(read_until_ready(code, text) == "2DCZ");
+
+    // The table gets a second column on the same connection; the statement's text now reads two.
+    pg_ok(a, "DROP TABLE wcp.t", "DROP", 'I');
+    pg_ok(a, "CREATE TABLE wcp.t (id bigint, note string)", "CREATE TABLE", 'I');
+    pg_ok(a, "INSERT INTO wcp.t (id, note) VALUES (1, 'a')", "INSERT 0 1", 'I');
+    send({bind("s"), execute, pg_frame('S', {})});
+    const auto types = read_until_ready(code, text);
+    INFO(types << " " << text);
+    CHECK(types == "2EZ");
+    CHECK(code == frontend::postgres::sql_state::FEATURE_NOT_SUPPORTED);
+    CHECK(text == "cached plan must not change result type");
+    // The connection serves on.
+    pg_ok(a, "DROP SCHEMA wcp CASCADE", "DROP", 'I');
+    server.stop();
+}

@@ -58,8 +58,8 @@ namespace {
 } // namespace
 
 TEST_CASE("spark sessions: one session per id, opened on its first RPC") {
-    registry_t registry(60min);
     sessions_t sessions;
+    registry_t registry(60min);
     const auto now = clock::now();
     const int a = first_step(registry, sessions, "a", now);
     const int again = first_step(registry, sessions, "a", now);
@@ -76,8 +76,8 @@ TEST_CASE("spark sessions: one session per id, opened on its first RPC") {
 }
 
 TEST_CASE("spark sessions: an idle session is closed and its id refused afterwards") {
-    registry_t registry(10min);
     sessions_t sessions;
+    registry_t registry(10min);
     const auto start = clock::now();
     first_step(registry, sessions, "a", start);
     first_step(registry, sessions, "b", start);
@@ -103,8 +103,8 @@ TEST_CASE("spark sessions: an idle session is closed and its id refused afterwar
 // statement it took runs to its end; the RPC awaits its answer, not the
 // session).
 TEST_CASE("spark sessions: every step of an RPC restarts the idle clock") {
-    registry_t registry(1min);
     sessions_t sessions;
+    registry_t registry(1min);
     const auto start = clock::now();
     first_step(registry, sessions, "a", start);
     CHECK(later_step(registry, "a", start + 50s) == 1);
@@ -118,8 +118,8 @@ TEST_CASE("spark sessions: every step of an RPC restarts the idle clock") {
 // from expiring however long the wait; its finish restarts the idle clock.
 // A release closes it all the same.
 TEST_CASE("spark sessions: a session with a step in work is not closed as idle") {
-    registry_t registry(1min);
     sessions_t sessions;
+    registry_t registry(1min);
     const auto start = clock::now();
     first_step(registry, sessions, "a", start);
     int seen = 0;
@@ -147,8 +147,8 @@ TEST_CASE("spark sessions: a session with a step in work is not closed as idle")
 }
 
 TEST_CASE("spark sessions: a zero timeout keeps sessions until released") {
-    registry_t registry(0ms);
     sessions_t sessions;
+    registry_t registry(0ms);
     const auto start = clock::now();
     first_step(registry, sessions, "a", start);
     CHECK(registry.evict_idle(start + 24h) == 0);
@@ -163,8 +163,8 @@ TEST_CASE("spark sessions: a zero timeout keeps sessions until released") {
 // (INVALID_HANDLE.SESSION_CLOSED, as Spark answers it) rather than handed a
 // fresh session that knows nothing of its transaction.
 TEST_CASE("spark sessions: a released id is refused afterwards") {
-    registry_t registry(1min);
     sessions_t sessions;
+    registry_t registry(1min);
     const auto start = clock::now();
     first_step(registry, sessions, "a", start);
     CHECK(registry.release("a"));
@@ -181,8 +181,8 @@ TEST_CASE("spark sessions: a released id is refused afterwards") {
 
 // The server's stop closes every session.
 TEST_CASE("spark sessions: clear closes every session") {
-    registry_t registry(1min);
     sessions_t sessions;
+    registry_t registry(1min);
     const auto start = clock::now();
     for (const char* id : {"a", "b"}) {
         first_step(registry, sessions, id, start);
@@ -193,8 +193,8 @@ TEST_CASE("spark sessions: clear closes every session") {
 }
 
 TEST_CASE("spark sessions: the expired ids remembered are bounded") {
-    registry_t registry(1min, /*tombstones=*/2);
     sessions_t sessions;
+    registry_t registry(1min, /*tombstones=*/2);
     const auto start = clock::now();
     for (const char* id : {"a", "b", "c"}) {
         first_step(registry, sessions, id, start);

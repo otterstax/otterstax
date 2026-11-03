@@ -100,7 +100,7 @@ librdkafka/*:tools.build:exelinkflags=["-fsanitize=thread"]
 # Profile-only on purpose: in a plain build host == build, and the same
 # tool_requires in conanfile.py would build a second grpc for the build context
 # (its version ranges resolve openssl/c-ares/zlib to newer versions than the host
-# pins, and the cppstd=17 host settings do not reach the build profile).
+# pins).
 [tool_requires]
 &: protobuf/<host_version>, grpc/<host_version>
 

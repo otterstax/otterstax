@@ -25,7 +25,7 @@ namespace mysql {
                          std::string alias)
         : log_(get_logger(logger_tag::CONNECTOR))
         , resource_(resource)
-        // A strand over the pool, not the bare io_context: it serializes the
+        // A strand over the io_context, not the bare io_context: it serializes the
         // two completion handlers of the deadline-bounded connect (see
         // connectWithTimeout), and a statement runs on it too (runQuery_), so
         // cancel() can emit its signal there.

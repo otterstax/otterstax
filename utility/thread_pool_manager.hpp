@@ -17,8 +17,8 @@ enum class thread_pool_status
 };
 
 // A Boost.Asio io_context and the threads that run it. The owner sizes it
-// (config.yaml's service.runtime, through the connector managers and the
-// frontend servers); there is no default size.
+// (the frontend servers from config.yaml's service.runtime; the connector
+// tests); there is no default size.
 class thread_pool_manager {
 public:
     explicit thread_pool_manager(size_t pool_size)

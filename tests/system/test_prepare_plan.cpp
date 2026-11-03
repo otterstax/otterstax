@@ -8,11 +8,11 @@
 // execute_plan. prepare_plan must DESCRIBE the plan and never run it — a schema
 // request that executed its statement would read the backend's rows on every
 // df.schema. Driven through a real query session → engine stack over a typed
-// PostgreSQL mock connector (its table discovered at startup into the
-// federation metadata) that records any LIMIT-0 probe apart from its data
+// PostgreSQL mock connector (its table discovered at startup and registered in
+// the engine's catalog) that records any LIMIT-0 probe apart from its data
 // queries; the plan is built by the real GreenplumParser, the parse the session
 // applies to SQL text. A describe asks the backend nothing: the engine types
-// the plan from federation.remote_columns.
+// the plan from the table's columns in its catalog.
 //
 // spark.sql() is told apart the same way — without running anything: the
 // frontend parses the statement (classify_sql), hands a query back to the
@@ -348,7 +348,7 @@ TEST_CASE("prepare_plan: a parsed remote SELECT is described and never executed"
     REQUIRE(prepared.value().parameter_count == 0);
     require_item_schema(prepared.value().schema);
 
-    // Described by the engine from the federation metadata, never run: no row
+    // Described by the engine from its catalog, never run: no row
     // came back, the data path was not taken and the backend was not asked.
     REQUIRE(prepared.value().empty());
     INFO("data queries: " << data_queries().size());

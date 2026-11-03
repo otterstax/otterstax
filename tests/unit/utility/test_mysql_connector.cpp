@@ -342,8 +342,18 @@ namespace {
 
     // Enough connects to hit the timed_cancel_op window on the unfixed code
     // (observed at iterations 83..2913 over six runs on an 18-core macOS host,
-    // ~0.2 ms per connect), few enough to keep the fixed test at a few seconds.
-    constexpr int STRESS_ITERATIONS = 10000;
+    // when a connect took ~0.2 ms). A connect now takes ~13 ms of wall time
+    // here, almost all of it idle: connectWithTimeout() re-checks its future
+    // only when run_one_for(10 ms) returns, and with the pool's threads taking
+    // the handlers this thread waits out the 10 ms. 10000 connects one after
+    // another were 117-136 s, past ctest's 120 s; the same 10000 connects from
+    // STRESS_DRIVERS threads at once — each a connector of its own, as every
+    // backend agent holds one — take a few seconds (2 s here: each driver's
+    // run_one_for also runs the others' handlers), and every connect still
+    // races its cancel_after timer against its completion on the pool's
+    // threads, the property under test, now with other connects beside it.
+    constexpr int STRESS_DRIVERS = 10;
+    constexpr int STRESS_ITERATIONS = 1000; // per driver
 
 } // namespace
 
@@ -376,22 +386,42 @@ TEST_CASE("mysql Connector: connect and close in a loop over a multi-threaded io
     auto* resource = std::pmr::new_delete_resource();
     const auto params = params_for(server.port());
 
-    // One connector per iteration, as addConnection does: a fresh
-    // any_connection, one connect, one close, then the destructor.
-    for (int i = 0; i < STRESS_ITERATIONS; ++i) {
-        INFO("iteration " << i);
-        auto connector = mysql::make_mysql_connector(resource, pool.ctx(), params, "stress");
-        core::error_t err = core::error_t::no_error();
-        // On the unfixed code the broken promise surfaces here as a
-        // std::future_error out of connect(), which no caller catches.
-        REQUIRE_NOTHROW(err = connector->connect());
-        REQUIRE_FALSE(err.contains_error());
-        REQUIRE(connector->status() == mysql::Status::Connected);
-        REQUIRE_NOTHROW(connector->close());
-        REQUIRE(connector->isClosed());
+    // One connector per iteration, as a backend agent holds one: a fresh
+    // any_connection, one connect, one close, then the destructor. Catch2's
+    // assertions are not for other threads: each driver counts what failed.
+    std::atomic<int> thrown{0};
+    std::atomic<int> refused{0};
+    std::atomic<int> unclosed{0};
+    {
+        std::vector<std::jthread> drivers;
+        for (int d = 0; d < STRESS_DRIVERS; ++d) {
+            drivers.emplace_back([&] {
+                for (int i = 0; i < STRESS_ITERATIONS; ++i) {
+                    try {
+                        auto connector = mysql::make_mysql_connector(resource, pool.ctx(), params, "stress");
+                        // On the unfixed code the broken promise surfaces here as a
+                        // std::future_error out of connect(), which no caller catches.
+                        auto err = connector->connect();
+                        if (err.contains_error() || connector->status() != mysql::Status::Connected) {
+                            ++refused;
+                            continue;
+                        }
+                        connector->close();
+                        if (!connector->isClosed()) {
+                            ++unclosed;
+                        }
+                    } catch (...) {
+                        ++thrown;
+                    }
+                }
+            });
+        }
     }
+    REQUIRE(thrown.load() == 0);
+    REQUIRE(refused.load() == 0);
+    REQUIRE(unclosed.load() == 0);
 
-    REQUIRE(server.sessions() == static_cast<size_t>(STRESS_ITERATIONS));
+    REQUIRE(server.sessions() == static_cast<size_t>(STRESS_DRIVERS * STRESS_ITERATIONS));
     REQUIRE(server.malformed_logins() == 0);
     REQUIRE(server.unexpected_users() == 0);
     REQUIRE(server.unexpected_commands() == 0);
@@ -464,7 +494,7 @@ TEST_CASE("mysql Connector: cancel() aborts a statement the server never answers
     REQUIRE(server.wait_until([&server] { return server.swallowed() == 1; }));
     REQUIRE(running.wait_for(100ms) == std::future_status::timeout);
 
-    // From another thread, as the connector manager's shutdown does it.
+    // From another thread, as the shutdown's backend_actor_t::cancel_agents does it.
     const auto started = std::chrono::steady_clock::now();
     connector->cancel();
     REQUIRE(running.wait_for(5s) == std::future_status::ready);

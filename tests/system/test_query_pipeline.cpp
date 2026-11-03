@@ -2,8 +2,8 @@
 // Copyright 2025-2026  OtterStax
 //
 // The query pipeline end to end over the real modules: a query session on the
-// sessions pool, the integration backends over mock connectors (their
-// tables discovered at startup into the federation metadata), and a real engine
+// sessions pool, the backend actors and agents over mock connectors (their
+// tables discovered at startup and registered in the engine's catalog), and a real engine
 // that reads the remote tables through the federation — each failure site's
 // error text, an empty and a multi-chunk result, a JOIN over two servers — plus
 // the engine's describe of a prepare.

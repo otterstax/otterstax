@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2025-2026  OtterStax
 
-"""Kafka exactly-once STREAM integration test (§5.2d, happy-path).
+"""Kafka exactly-once STREAM integration test (happy path).
 
 The STREAM is created with TRANSACTIONAL=true, so the worker runs a transactional
 producer: each batch is begin_transaction -> produce -> send_offsets_to_-

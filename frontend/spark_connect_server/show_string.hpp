@@ -26,7 +26,7 @@
 //    whether the footer "only showing top N row(s)" follows, and a vertical
 //    rendering without rows ends "(0 rows)" — neither is followed by a newline
 //    (Spark 3.5 ended both with one).
-// A cell of any other type is a conversion_failure naming its column. Nothing
+// A cell of any other type is unimplemented_yet naming its column. Nothing
 // here throws.
 
 #include "session/session_payload.hpp"

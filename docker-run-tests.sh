@@ -260,6 +260,16 @@ if $ENABLE_TRACY; then
     export WITH_TRACY=true
 fi
 
+# ENABLE_ASAN=ON in the environment builds test-otterstax as the ASAN image:
+# compose.test.yml passes ENABLE_ASAN and ASAN_DEPS to Dockerfile.test, and an
+# ASAN build over the prebuilt gRPC / abseil / protobuf / re2 / otterbrix
+# packages is not sound (their headers change layouts under ASAN —
+# asan-deps.profile), so ASAN_DEPS=true always goes with it. The CI path
+# (IMAGE_TAG) builds its image itself with both build-args.
+if [ "${ENABLE_ASAN:-OFF}" = "ON" ]; then
+    export ENABLE_ASAN ASAN_DEPS=true
+fi
+
 # CI path: the Spark client matrix image (Dockerfile.spark-test) is pre-built
 # by the workflow and its tag passed in SPARK_CLIENT_IMAGE.
 SPARK_CLIENT_BUILD="test-spark-client"

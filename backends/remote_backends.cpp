@@ -219,6 +219,9 @@ namespace otterstax::backends {
                                          core::relname_t{c.table}};
             std::vector<federation::backend_agent_ptr> agents;
             federation::discovered_tables_t tables{resource_};
+            // The server answered that it cannot be written to (an agent's session_refused(): its
+            // session's sql_mode holds NO_BACKSLASH_ESCAPES): the same answer comes on every attempt.
+            bool unusable = false;
             // One attempt: open every connection of the pool, then discover the tables on the
             // first one, on this thread (the agents serve nobody yet).
             const bool opened = open_with_retry(
@@ -231,14 +234,16 @@ namespace otterstax::backends {
                     agents = make_agents();
                     for (auto& agent : agents) {
                         if (auto failed = agent->connect(); failed.contains_error()) {
-                            return open_failure_t{open_failure_kind_t::unreachable,
+                            unusable = agent->session_refused();
+                            return open_failure_t{unusable ? open_failure_kind_t::unusable : open_failure_kind_t::unreachable,
                                                   core::error_t(failed.type, std::pmr::string{failed.what.c_str(), resource_})};
                         }
                     }
                     auto reply = agents.front()->discover_now(scope);
                     if (reply.has_error()) {
+                        unusable = agents.front()->session_refused();
                         return open_failure_t{
-                            open_failure_kind_t::unreachable,
+                            unusable ? open_failure_kind_t::unusable : open_failure_kind_t::unreachable,
                             core::error_t(reply.error().type,
                                           std::pmr::string{("schema discovery: " + std::string{reply.error().what.c_str()}).c_str(),
                                                            resource_})};
@@ -247,6 +252,17 @@ namespace otterstax::backends {
                     return std::nullopt;
                 },
                 sleep_for);
+            if (unusable) {
+                // Left out: no actor and no address in the engine's map (a statement naming the
+                // connection is refused there, `undefined_object`), not among the sessions'
+                // connections; kept in discovered() undiscovered, so the registration keeps its
+                // catalog rows as they are.
+                discovered_.push_back(catalog::connection_discovery_t{
+                    catalog::configured_connection_t{c.alias, kind, c.database, schema_of(c), c.table, nullptr},
+                    false,
+                    federation::discovered_tables_t{resource_}});
+                return core::error_t::no_error();
+            }
             if (!opened) {
                 // Kept in the map with agents that connect on their first statement: a statement of
                 // the connection fails there while the backend stays away.
@@ -262,7 +278,7 @@ namespace otterstax::backends {
                                      std::pmr::string{actor->construction_error().what, resource_});
             }
             discovered_.push_back(catalog::connection_discovery_t{
-                catalog::configured_connection_t{c.alias, kind, c.database, schema_of(c), actor.get()},
+                catalog::configured_connection_t{c.alias, kind, c.database, schema_of(c), c.table, actor.get()},
                 opened,
                 std::move(tables)});
             actors_.push_back(std::move(actor));
@@ -295,7 +311,9 @@ namespace otterstax::backends {
         std::vector<catalog::configured_connection_t> out;
         out.reserve(discovered_.size());
         for (const auto& discovery : discovered_) {
-            out.push_back(discovery.connection);
+            if (discovery.connection.actor != nullptr) {
+                out.push_back(discovery.connection);
+            }
         }
         return out;
     }

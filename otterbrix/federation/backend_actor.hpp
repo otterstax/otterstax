@@ -41,6 +41,10 @@
 #include <string>
 #include <vector>
 
+namespace sql_gen {
+    struct statement_needs_t;
+} // namespace sql_gen
+
 // The backend actor of one connection of config.yaml: the storage of every table of the connection
 // (otterbrix's storage contract, services/disk/storage_contract.hpp; docs/embedding-host-api.md, "The
 // backend actor"). otterbrix plans every statement and reaches a remote table's rows only through
@@ -185,6 +189,8 @@ namespace otterstax::federation {
         [[nodiscard]] std::optional<registered_table_t> table(oid_t oid) const;
         // The transactions holding an agent right now.
         [[nodiscard]] std::size_t pinned() const noexcept { return pinned_.load(std::memory_order_relaxed); }
+        // The statements waiting in the queue for an agent right now.
+        [[nodiscard]] std::size_t waiting() const noexcept { return waiting_.load(std::memory_order_relaxed); }
         // How long a statement waits for a free agent (60 s by default), then io_error.
         void set_checkout_timeout(std::chrono::milliseconds timeout) noexcept {
             checkout_timeout_ms_.store(timeout.count(), std::memory_order_relaxed);
@@ -266,8 +272,20 @@ namespace otterstax::federation {
         // The tables of `scope` on the backend (backend_agent_t::discover), run by a free agent:
         // the session's registration of a table a statement missed.
         unique_future<core::result_wrapper_t<discovered_tables_t>> discover(qualified_name_t scope);
+        // The client's connection of engine session `session` is closed (query_session_t::close): its
+        // statements waiting in the queue are answered connection_closed at once, and its transaction
+        // ends on the backend here and now — ROLLBACK (or unpin) on the agent it holds, after the
+        // statement that agent runs, then the compensations — not when otterbrix's own ROLLBACK of the
+        // closed session reaches the actor. That ROLLBACK is a statement for one of otterbrix's
+        // executors, each of which runs one statement at a time, and every executor may be running a
+        // statement of another block waiting in this very queue for the agent the closed block holds.
+        // The transaction is refused every later agent (connection_closed); otterbrix's abort or
+        // release of it then only forgets it. A transaction whose COMMIT runs, or ran, is left to
+        // otterbrix's release.
+        unique_future<void> end_session(session_id_t session);
 
-        // The contract, checked; the dispatch is the contract's eighteen in its order, then discover.
+        // The contract, checked; the dispatch is the contract's eighteen in its order, then discover
+        // and end_session.
         using contract_check = actor_zeta::implements<services::disk::storage_contract,
                                                       &backend_actor_t::storage_fetch_next_batch,
                                                       &backend_actor_t::storage_close_cursor,
@@ -305,7 +323,8 @@ namespace otterstax::federation {
                                                             &backend_actor_t::storage_close_block,
                                                             &backend_actor_t::storage_release_block,
                                                             &backend_actor_t::storage_run_write,
-                                                            &backend_actor_t::discover>;
+                                                            &backend_actor_t::discover,
+                                                            &backend_actor_t::end_session>;
 
         actor_zeta::behavior_t behavior(actor_zeta::mailbox::message* msg);
 
@@ -334,7 +353,12 @@ namespace otterstax::federation {
 
         // The connection inside one otterbrix transaction.
         struct participant_t {
-            bool pinned{false}; // a request ran on the transaction's agent
+            session_id_t session; // the engine session of its requests
+            // Its client's connection closed (end_session): it ended on the backend, no agent serves it
+            // any more, and otterbrix's abort or release only forgets it.
+            bool closed{false};
+            bool preparing{false}; // storage_prepare runs its COMMIT
+            bool pinned{false};    // a request ran on the transaction's agent
             bool began{false};  // BEGIN was sent
             // The backend savepoints s<sub_id>, in the order they were set.
             std::vector<uint64_t> savepoints;
@@ -390,6 +414,8 @@ namespace otterstax::federation {
         // A statement waiting for an agent.
         struct waiter_t {
             std::optional<uint64_t> transaction;
+            session_id_t session;
+            bool ending{false}; // a step that ends its transaction: a close never takes it out
             actor_zeta::promise<core::result_wrapper_t<std::size_t>> promise;
             std::chrono::steady_clock::time_point deadline;
         };
@@ -403,22 +429,26 @@ namespace otterstax::federation {
         bool owns(const qualified_name_t& name) const;
         std::optional<registered_table_t> table_locked(oid_t oid) const;
         qualified_name_t generator_target(const registered_table_t& table) const;
-        participant_t& participant(uint64_t transaction);
+        participant_t& participant(uint64_t transaction, const session_id_t& session);
         // The steps a statement of `txn` on its transaction's agent needs before it: BEGIN (before
         // the first statement of a block, or a write), SAVEPOINT s<sub_id> before the first
         // statement of a savepoint level. None on ClickHouse.
-        std::vector<step_t> before_statement(const components::table::transaction_data& txn);
+        std::vector<step_t> before_statement(const components::table::transaction_data& txn,
+                                             const session_id_t& session);
         // The end of `transaction` for the actor's own state: the columns its ADD / DROP COLUMN
         // changed and the tables it created or dropped, kept (`committed`) or undone.
         void end_tables(uint64_t transaction, bool committed);
-        std::optional<uint64_t> pin_of(const components::table::transaction_data& txn);
+        std::optional<uint64_t> pin_of(const components::table::transaction_data& txn, const session_id_t& session);
         // A write the connection cannot take: ClickHouse inside a block, RETURNING off PostgreSQL.
         [[nodiscard]] core::error_t refused_write(const execution_context_t& ctx, bool returning) const;
 
         // ---- the agents ----
-        // An agent for a statement of `transaction` (nullopt: of none): its own agent, else a free
-        // one (then pinned to it); answers when one is free, io_error after the checkout timeout.
-        unique_future<core::result_wrapper_t<std::size_t>> acquire(std::optional<uint64_t> transaction);
+        // An agent for a statement of `transaction` (nullopt: of none) of `session`: its own agent, else
+        // a free one (then pinned to it); answers when one is free, io_error after the checkout
+        // timeout; connection_closed for a closed transaction (end_session) unless `ending`, a step
+        // that ends it.
+        unique_future<core::result_wrapper_t<std::size_t>>
+        acquire(std::optional<uint64_t> transaction, const session_id_t& session, bool ending = false);
         std::optional<std::size_t> free_for(const std::optional<uint64_t>& transaction) const;
         void take(std::size_t agent, const std::optional<uint64_t>& transaction);
         // The agent is free again (and, `unpin`, no transaction's): the next waiter it suits takes it.
@@ -429,16 +459,26 @@ namespace otterstax::federation {
         template<typename Method, typename... Args>
         auto send_to(std::size_t agent, Method method, Args&&... args);
 
-        unique_future<core::error_t> run_steps(uint64_t transaction, std::vector<step_t> steps);
+        unique_future<core::error_t>
+        run_steps(uint64_t transaction, session_id_t session, std::vector<step_t> steps);
+        // The steps that end `state` without a COMMIT: ROLLBACK (or unpin), then the compensations of
+        // the DDL MySQL / ClickHouse ran at once, the last first.
+        static std::vector<step_t> rollback_steps(participant_t& state);
         // The rows of `sql`, held to `types`; `declared`: ClickHouse's types of the columns read.
         unique_future<core::result_wrapper_t<std::vector<components::vector::data_chunk_t>>>
         read(std::optional<uint64_t> transaction,
+             session_id_t session,
              std::string sql,
              std::vector<std::optional<std::string>> declared,
              std::vector<components::types::complex_logical_type> types,
              core::date::timezone_offset_t timezone);
-        unique_future<core::result_wrapper_t<std::uint64_t>>
-        write(std::optional<uint64_t> transaction, std::string sql, write_kind_t kind);
+        // `strict_store`: the statement relies on a strict sql_mode (sql_gen::statement_needs_t).
+        unique_future<core::result_wrapper_t<std::uint64_t>> write(std::optional<uint64_t> transaction,
+                                                                   session_id_t session,
+                                                                   std::string sql,
+                                                                   write_kind_t kind,
+                                                                   bool strict_store = false,
+                                                                   qualified_name_t table = {});
         services::disk::fetch_batch_t open_cursor(std::vector<components::vector::data_chunk_t> chunks,
                                                   std::vector<components::types::complex_logical_type> types);
         core::result_wrapper_t<services::disk::fetch_batch_t> next_page(uint64_t cursor_id);
@@ -453,11 +493,13 @@ namespace otterstax::federation {
         offer_block(const execution_context_t& ctx,
                     std::unique_ptr<components::logical_plan::detached_block_t> block,
                     const components::vector::storage_parameters& parameters);
-        // The statement of a take with `parameters` (placeholders: every parameter `?`).
+        // The statement of a take with `parameters` (placeholders: every parameter `?`); `needs`
+        // (optional): what it asks of the session that runs it.
         core::result_wrapper_t<std::string> take_sql(const take_t& take,
                                                      const components::vector::storage_parameters* parameters,
                                                      bool placeholders,
-                                                     bool returning) const;
+                                                     bool returning,
+                                                     sql_gen::statement_needs_t* needs = nullptr) const;
 
         std::pmr::memory_resource* resource_;
         connection_t connection_;
@@ -475,6 +517,7 @@ namespace otterstax::federation {
         std::atomic<bool> running_{true};
         std::atomic<std::uint64_t> loop_passes_{0};
         std::atomic<std::size_t> pinned_{0};
+        std::atomic<std::size_t> waiting_{0};
         std::atomic<std::chrono::milliseconds::rep> checkout_timeout_ms_{60000};
         // Read and written by the agents (declared before agents_, which goes first).
         reachability_t reachability_;

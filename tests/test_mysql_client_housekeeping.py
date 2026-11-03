@@ -44,8 +44,9 @@ ER_PARSE_ERROR = 1064
 ER_NOT_SUPPORTED_YET = 1235
 SERVER_STATUS_NO_BACKSLASH_ESCAPES = 0x0200
 # How the server reads the text: MySQL's defaults (no ANSI_QUOTES, no
-# NO_BACKSLASH_ESCAPES), `||` concatenating as the engine does.
-SQL_MODE = "PIPES_AS_CONCAT,STRICT_TRANS_TABLES"
+# NO_BACKSLASH_ESCAPES); a value that does not fit its column is an error,
+# never truncated. No PIPES_AS_CONCAT: the engine has no `||` for strings.
+SQL_MODE = "STRICT_TRANS_TABLES"
 INJECTION = "x') OR 1=1 --"
 
 

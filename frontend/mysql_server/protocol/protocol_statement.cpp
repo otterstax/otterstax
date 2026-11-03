@@ -578,11 +578,13 @@ namespace frontend::mysql {
                 return int64_t{0};
             }
             // How the frontend reads the text (protocol/lexer.hpp: MySQL's own
-            // lexical rules, so neither ANSI_QUOTES nor NO_BACKSLASH_ESCAPES),
-            // `||` concatenating as the engine does, and a value that does not
-            // fit an error, never truncated.
+            // lexical rules, so neither ANSI_QUOTES nor NO_BACKSLASH_ESCAPES)
+            // and what the engine does with a written value: one out of its
+            // column's range, text that is no number, a NULL for a NOT NULL
+            // column are errors, never truncated or defaulted. No
+            // PIPES_AS_CONCAT: the engine has no `||` for strings (OTB-concat).
             if (name == "sql_mode") {
-                return std::string{"PIPES_AS_CONCAT,STRICT_TRANS_TABLES"};
+                return std::string{"STRICT_TRANS_TABLES"};
             }
             if (name == "system_time_zone") {
                 return std::string{"UTC"};

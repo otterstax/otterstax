@@ -66,35 +66,10 @@ namespace {
 
 } // namespace
 
-TEST_CASE("make_failed_future: reports the error without touching an io_context") {
-    auto* resource = std::pmr::new_delete_resource();
-
-    // The synchronous-failure path of executeQuery (unknown uuid, closed connector,
-    // failed reconnect): a ready future carrying the error, so the function has one
-    // single way to report a failure instead of a throw plus a value.
-    auto fut = otterstax::make_failed_future<std::unique_ptr<std::string>>(
-        core::error_t(core::error_code_t::undefined_object, std::pmr::string{"no such connection", resource}));
-
-    auto outcome = fut.get();
-    REQUIRE(outcome.has_error());
-    REQUIRE(outcome.error().type == core::error_code_t::undefined_object);
-}
-
-TEST_CASE("make_failed_future: error-only handlers collapse to a bare core::error_t") {
-    auto* resource = std::pmr::new_delete_resource();
-
-    // query_result_t maps an asio_error_t handler onto core::error_t rather than
-    // result_wrapper_t<asio_error_t>, so a failure is never carried twice behind two
-    // different predicates.
-    static_assert(std::is_same_v<otterstax::query_result_t<otterstax::asio_error_t>, core::error_t>);
-
-    auto fut = otterstax::make_failed_future<otterstax::asio_error_t>(
-        core::error_t(core::error_code_t::io_error, std::pmr::string{"connector is not connected", resource}));
-
-    auto err = fut.get();
-    REQUIRE(err.contains_error());
-    REQUIRE(err.type == core::error_code_t::io_error);
-}
+// query_result_t maps an asio_error_t handler onto core::error_t rather than
+// result_wrapper_t<asio_error_t>, so a failure is never carried twice behind two
+// different predicates.
+static_assert(std::is_same_v<otterstax::query_result_t<otterstax::asio_error_t>, core::error_t>);
 
 TEST_CASE("as_query_result: shapes a handler's return into the marshaled outcome") {
     auto* resource = std::pmr::new_delete_resource();

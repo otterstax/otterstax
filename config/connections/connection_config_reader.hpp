@@ -20,17 +20,19 @@
 namespace config {
 
 // The connection alias no `connections:` entry may take, compared case-insensitively:
-// it is the engine database that holds the remote-table metadata (federation.remote_tables /
-// remote_columns). An alias is the first qualifier of a federated name,
+// it is OtterStax's own database (federation.public.remote_names, the Kafka
+// bookkeeping in federation.kafka). An alias is the first part of a four-part name,
 // so a connection under it would shadow that database. (A header-only constant: config
 // links nothing of the federation.)
 inline constexpr std::string_view reserved_connection_alias = otterstax::federation::metadata_database;
 
 // Every alias no `connections:` entry may take (any case, any section), with what
 // the name is. (`kafka` is not among them: the Kafka objects are the schema
-// main.kafka, a two- or three-part name, never the uid slot of a four-part one.)
+// main.kafka, a two- or three-part name, never the connection slot of a four-part one.)
 inline constexpr std::array<std::pair<std::string_view, std::string_view>, 2> reserved_connection_aliases{{
-    {reserved_connection_alias, "the engine database of the remote-table metadata"},
+    {reserved_connection_alias,
+     "OtterStax's own database (federation.public.remote_names: the backends' spelling of the remote "
+     "tables; federation.kafka.*: the Kafka bookkeeping)"},
     // The engine's default local database (every session's place is main.public; the Kafka
     // objects are main.kafka): a connection under it would read main.public.t and main.db.public.t
     // as two different things, and the CREATE DATABASE guard would own the database main.

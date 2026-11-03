@@ -134,10 +134,18 @@ namespace fakebackend {
             log_.clear();
             on_.clear();
             discoveries_ = 0;
+            session_checks_ = 0;
         }
+        // The discovery queries answered: the information_schema listings (and a MySQL table's
+        // `WHERE 1 = 0` probe).
         int discoveries() const {
             std::lock_guard guard(mutex_);
             return discoveries_;
+        }
+        // The MySQL sessions an agent checked after it opened them (`SELECT @@SESSION.sql_mode`).
+        int session_checks() const {
+            std::lock_guard guard(mutex_);
+            return session_checks_;
         }
 
         // A read the hook answers instead of the canned tables.
@@ -157,11 +165,13 @@ namespace fakebackend {
             std::lock_guard guard(mutex_);
             fail_commits_ = fail;
         }
-        // A refusal (`code`) of every read and write whose text contains `needle`: a table that
-        // already exists, a column that does, a deadlock.
-        void fail_statements(std::string needle, core::error_code_t code) {
+        // A refusal (`code`) of every read, write and statement other than a transaction step whose
+        // text contains `needle`: a table that already exists, a column that does, a deadlock. Its
+        // text "fake backend: refused <sql>", followed by ": <text>" when one is given (a server's
+        // message, which follows the statement as in the real connectors' errors).
+        void fail_statements(std::string needle, core::error_code_t code, std::string text = {}) {
             std::lock_guard guard(mutex_);
-            fail_statements_.emplace_back(std::move(needle), code);
+            fail_statements_.push_back(refusal_t{std::move(needle), code, std::move(text)});
         }
         // The server goes down (every connection to it is lost, a connect fails after `connect_delay`,
         // as a host that does not answer) or comes back.
@@ -173,6 +183,12 @@ namespace fakebackend {
         bool down() const {
             std::lock_guard guard(mutex_);
             return down_;
+        }
+        // The session sql_mode a MySQL agent reads of every session it opens (`SELECT @@SESSION.sql_mode`;
+        // empty by default).
+        void set_sql_mode(std::string mode) {
+            std::lock_guard guard(mutex_);
+            sql_mode_ = std::move(mode);
         }
         // The connects tried since the start.
         int connects() const { return connects_.load(); }
@@ -333,6 +349,11 @@ namespace fakebackend {
                 line = "exec " + sql;
             }
             note(connection, line);
+            if (line.rfind("exec ", 0) == 0) {
+                if (auto refused = refusal(sql)) {
+                    return std::move(*refused);
+                }
+            }
             if (line == "commit" && fail_commits_) {
                 return core::error_t{core::error_code_t::io_error, std::pmr::string{"fake backend: COMMIT lost", &resource_}};
             }
@@ -363,16 +384,17 @@ namespace fakebackend {
             return out;
         }
 
-        // A MySQL discovery query, answered as a MySQL server would (the agent's discovery reads
-        // these result sets): the sql_mode, the information_schema listing, a table's probe.
+        // A MySQL metadata query, answered as a MySQL server would (the agent reads these result
+        // sets): the session's sql_mode, the information_schema listing, a table's probe.
         std::optional<boost::mysql::results> mysql_metadata(std::string_view query) {
             std::lock_guard guard(mutex_);
             using boost::mysql::column_type;
             if (query.find("sql_mode") != std::string_view::npos) {
-                ++discoveries_;
-                return mysql::mock_results({{"@@SESSION.sql_mode", column_type::varchar}}, {{std::string{""}}});
+                ++session_checks_;
+                return mysql::mock_results({{"@@SESSION.sql_mode", column_type::varchar}}, {{sql_mode_}});
             }
             if (query.find("information_schema") != std::string_view::npos) {
+                ++discoveries_;
                 std::vector<mysql::mock_row_t> rows;
                 for (const auto& table : tables_) {
                     rows.push_back({table.table});
@@ -380,6 +402,7 @@ namespace fakebackend {
                 return mysql::mock_results({{"TABLE_NAME", column_type::varchar}}, rows);
             }
             if (query.find("1 = 0") != std::string_view::npos) {
+                ++discoveries_;
                 for (const auto& table : tables_) {
                     if (query.find(quoted(table.table)) == std::string_view::npos) {
                         continue;
@@ -448,13 +471,19 @@ namespace fakebackend {
             on_.push_back(connection);
         }
         std::optional<core::error_t> refusal(const std::string& sql) {
-            for (const auto& [needle, code] : fail_statements_) {
+            for (const auto& [needle, code, text] : fail_statements_) {
                 if (sql.find(needle) != std::string::npos) {
-                    return core::error_t{code, std::pmr::string{("fake backend: refused " + sql).c_str(), &resource_}};
+                    const auto what = "fake backend: refused " + sql + (text.empty() ? "" : ": " + text);
+                    return core::error_t{code, std::pmr::string{what.c_str(), &resource_}};
                 }
             }
             return std::nullopt;
         }
+        struct refusal_t {
+            std::string needle;
+            core::error_code_t code;
+            std::string text;
+        };
         std::string quoted(const std::string& name) const {
             return kind_ == backend_type_t::PostgreSQL ? "\"" + name + "\"" : "`" + name + "`";
         }
@@ -468,13 +497,15 @@ namespace fakebackend {
         scan_hook_t hook_;
         std::optional<core::error_code_t> fail_writes_;
         bool fail_commits_{false};
-        std::vector<std::pair<std::string, core::error_code_t>> fail_statements_;
+        std::vector<refusal_t> fail_statements_;
         bool down_{false};
+        std::string sql_mode_;
         std::chrono::milliseconds connect_delay_{0};
         std::atomic<int> connects_{0};
         bool block_reads_{false};
         std::atomic<int> hanging_{0};
         int discoveries_{0};
+        int session_checks_{0};
         std::chrono::milliseconds delay_{0};
     };
 

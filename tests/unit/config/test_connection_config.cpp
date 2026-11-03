@@ -1119,3 +1119,89 @@ TEST_CASE("load_config: the spark_connect session timeout is read and range-chec
         CHECK(mentions(err, "service.spark_connect.session_timeout_s"));
     }
 }
+
+// ── unknown keys ─────────────────────────────────────────────────────────────
+
+// A key the reader does not know is a typo the operator must see (a `pool_sise` would otherwise be
+// the default pool silently): refused at every level, the message naming the key and where it is.
+TEST_CASE("load_config: an unknown key is refused at every level, naming the key and its place") {
+    const std::pair<const char*, const char*> cases[] = {
+        {"servce:\n  mysql: { port: 8816 }\n", R"(unknown key "servce" in (document))"},
+        {"service:\n  mysqll: { port: 8816 }\n", R"(unknown key "mysqll" in service)"},
+        {"service:\n  flight_sql: { host: h, prot: 1 }\n", R"(unknown key "prot" in service.flight_sql)"},
+        {"service:\n  mysql: { port: 8816, host: h }\n", R"(unknown key "host" in service.mysql)"},
+        {"service:\n  postgres: { prt: 8817 }\n", R"(unknown key "prt" in service.postgres)"},
+        {"service:\n  spark_connect: { session_timeout: 5 }\n", R"(unknown key "session_timeout" in service.spark_connect)"},
+        {"service:\n  connection_retry: { max_attempt: 3 }\n", R"(unknown key "max_attempt" in service.connection_retry)"},
+        {"service:\n  engine: { data_dir: /d, wal_dir: /w }\n", R"(unknown key "wal_dir" in service.engine)"},
+        {"service:\n  runtime: { session: { threads: 1 } }\n", R"(unknown key "session" in service.runtime)"},
+        {"service:\n  runtime: { general: { threads: 1, max_throughput: 5 } }\n",
+         R"(unknown key "max_throughput" in service.runtime.general)"},
+        {"service:\n  runtime: { spark_connect_io: { thread: 1 } }\n",
+         R"(unknown key "thread" in service.runtime.spark_connect_io)"},
+        {"connections:\n  clickhose: []\n", R"(unknown key "clickhose" in connections)"},
+        {"connections:\n  mysql:\n    - { alias: a, host: h, username: u, database: d, pool_sise: 2 }\n",
+         R"(unknown key "pool_sise" in connections.mysql[0])"},
+        {"connections:\n  postgresql:\n    - { alias: a, host: h, username: u, database: d }\n"
+         "    - { alias: b, host: h, username: u, database: d, shema: s }\n",
+         R"(unknown key "shema" in connections.postgresql[1])"},
+        {"connections:\n  clickhouse:\n    - { alias: a, host: h, username: u, database: d, tabel: t }\n",
+         R"(unknown key "tabel" in connections.clickhouse[0])"},
+        {"connections:\n  s3:\n    - { alias: a, access_key: k, secret_key: s, end_point: e }\n",
+         R"(unknown key "end_point" in connections.s3[0])"},
+    };
+    for (const auto& [yaml, message] : cases) {
+        INFO(yaml);
+        auto path = write_temp(yaml);
+        auto err = load_error(path);
+        INFO(err.what.c_str());
+        CHECK(err.type == core::error_code_t::invalid_parameter);
+        CHECK(mentions(err, message));
+        std::filesystem::remove(path);
+    }
+}
+
+TEST_CASE("parse_connections: an unknown key of an entry is refused before the entry is validated") {
+    auto err = parse_error(connections_node("connections:\n  mysql:\n    - { alias: a, pool_sise: 2 }\n"));
+    CHECK(err.type == core::error_code_t::invalid_parameter);
+    CHECK(mentions(err, R"(unknown key "pool_sise" in connections.mysql[0])"));
+}
+
+// Every config.yaml the repository ships (the template, the demo, the quick start, the benchmarks,
+// the integration tests, the manual stack) loads: none carries a key the reader refuses.
+TEST_CASE("load_config: every config yaml of the repository loads") {
+    namespace fs = std::filesystem;
+    const fs::path root{OTTERSTAX_SOURCE_DIR};
+    // Dockerfile.test copies only the sources it builds (no examples/, benchmark/config.yaml,
+    // scripts/database/): the shipped files are checked where the whole checkout is.
+    if (!fs::exists(root / "examples")) {
+        SKIP("not a full checkout: " << root.string());
+    }
+    std::vector<fs::path> files;
+    for (auto it = fs::recursive_directory_iterator(root); it != fs::recursive_directory_iterator(); ++it) {
+        const auto name = it->path().filename().string();
+        if (it->is_directory() && (name == ".git" || name.rfind("build", 0) == 0 || name.rfind("cmake-build", 0) == 0)) {
+            it.disable_recursion_pending();
+            continue;
+        }
+        if (it->is_regular_file() && name.rfind("config", 0) == 0 && it->path().extension() == ".yaml") {
+            files.push_back(it->path());
+        }
+    }
+    INFO("root " << root.string());
+    REQUIRE(files.size() >= 7);
+    for (const auto& file : files) {
+        INFO(file.string());
+        auto loaded = config::load_config(resource(), file.string());
+        INFO((loaded.has_error() ? loaded.error().what.c_str() : "ok"));
+        CHECK_FALSE(loaded.has_error());
+    }
+}
+
+// `federation` is OtterStax's own database: the refusal says what it holds.
+TEST_CASE("parse_connections: the refusal of the alias federation says what the database is") {
+    auto err = parse_error(connections_node("connections:\n  mysql:\n    - { alias: federation, host: h, username: u, database: d }\n"));
+    CHECK(mentions(err, "OtterStax's own database"));
+    CHECK(mentions(err, "federation.public.remote_names"));
+    CHECK(mentions(err, "federation.kafka"));
+}

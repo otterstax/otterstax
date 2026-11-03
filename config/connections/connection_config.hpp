@@ -71,8 +71,8 @@ struct ConnectionsConfig {
 };
 
 // Startup retry policy for opening remote backend connections. A slow backend
-// (e.g. a DB still booting) makes the eager connect in addConnection throw; the
-// registrar retries up to max_attempts, sleeping delay_ms between tries.
+// (e.g. a DB still booting) fails the connect or the discovery of the startup;
+// remote_backends_t::open retries up to max_attempts, sleeping delay_ms between tries.
 // max_attempts <= 1 means a single attempt (no retry). Applies to
 // mysql/postgresql/clickhouse — s3 aliases are only stored, not opened.
 struct ConnectionRetryConfig {

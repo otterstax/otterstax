@@ -188,14 +188,4 @@ namespace otterstax {
         co_return std::move(outcome);
     }
 
-    // An already-satisfied future for a failure detected before anything was
-    // spawned, so executeQuery has exactly one way to report an error.
-    template<typename R>
-    query_future_t<R> make_failed_future(core::error_t error) {
-        std::promise<query_result_t<R>> promise;
-        auto future = promise.get_future();
-        promise.set_value(query_result_t<R>{std::move(error)});
-        return future;
-    }
-
 } // namespace otterstax

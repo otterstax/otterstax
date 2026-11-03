@@ -38,12 +38,14 @@ namespace otterstax::catalog {
         backend_type_t kind{backend_type_t::PostgreSQL};
         std::string database; // config.yaml's `database:`, as spelled
         std::string schema;   // PostgreSQL's `schema:`; empty: every user schema
+        std::string table;    // config.yaml's `table:`; empty: every table of the database (schema)
         // The connection's backend actor: its registration staging, its discovery (discover).
         federation::backend_actor_t* actor{nullptr};
     };
 
     // What the startup discovery of one connection found; `discovered` false: the backend did not
-    // answer (unreachable), and its catalog rows are kept as they are.
+    // answer (unreachable) or was left out (no actor: its server answered it cannot be written to),
+    // and its catalog rows are kept as they are.
     struct connection_discovery_t {
         configured_connection_t connection;
         bool discovered{false};
@@ -78,12 +80,28 @@ namespace otterstax::catalog {
     // table_not_exists, schema_not_exists or database_not_exists and `written` — the name as the
     // statement wrote it — has four parts, the first a connection of `connections`. The scope is
     // (connection as configured, its database as configured, the written schema — PostgreSQL's —,
-    // the written table). nullopt otherwise. A table written in another case than the backend
-    // spells it is found only when the written name is the backend's.
+    // the written table). A connection configured with one `table:` is that table only: the written
+    // table must be it (any case), and the scope names it as configured. nullopt otherwise. A table
+    // written in another case than the backend spells it is found only when the written name — or
+    // the configured `table:` — is the backend's.
     [[nodiscard]] std::optional<std::pair<configured_connection_t, qualified_name_t>>
     registration_target(const core::error_t& error,
                         const qualified_name_t& written,
                         std::span<const configured_connection_t> connections);
+
+    // A connection configured with one `table:` is that table only, for DDL too: a CREATE / ALTER /
+    // DROP TABLE or CREATE INDEX (`written`: the table it names, as written) of a connection of
+    // `connections` configured with one `table:` naming another table (any case) is refused before
+    // it reaches the engine or the backend — a table created there would not be the connection's
+    // (the next startup's discovery, scoped by `table:`, drops it from the catalog) —
+    // invalid_parameter `connection "<c>" is configured with table "<X>"` (the message on
+    // `resource`); no_error otherwise, the configured table's own DDL and every name of a
+    // connection without `table:` included. Only a name written in four parts is seen: `t` /
+    // `s.t` in a place that is a connection's database is not (the engine does not name the
+    // place's connection, and a local database may share the name).
+    [[nodiscard]] core::error_t check_table_scope(std::pmr::memory_resource* resource,
+                                                  const qualified_name_t& written,
+                                                  std::span<const configured_connection_t> connections);
 
     // The plans that register `tables` (what `connection`'s discovery answered), to run in order on
     // the actor's registration_session(): CREATE DATABASE / SCHEMA / TABLE IF NOT EXISTS of each,

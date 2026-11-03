@@ -23,8 +23,9 @@ namespace otterstax::federation {
 
     namespace {
 
-        // A backend wakes the loop when it settles a future (its completion hook); this only bounds
-        // a wait on a future something else settles without the hook.
+        // An agent wakes the loop when it settled its answer (backend_agent_t::set_owner); this only
+        // bounds a wait on a future something else settles without waking it (and the checkout
+        // timeout's precision).
         constexpr auto safety_interval = std::chrono::seconds(1);
 
         // storage_total_rows: an estimate is an answer (it only orders the sides of a hash join), and
@@ -242,6 +243,9 @@ namespace otterstax::federation {
             case actor_zeta::msg_id<backend_actor_t, &backend_actor_t::discover>:
                 co_await actor_zeta::dispatch(this, &backend_actor_t::discover, msg);
                 break;
+            case actor_zeta::msg_id<backend_actor_t, &backend_actor_t::end_session>:
+                co_await actor_zeta::dispatch(this, &backend_actor_t::end_session, msg);
+                break;
             default:
                 break;
         }
@@ -308,11 +312,16 @@ namespace otterstax::federation {
         return generator_name(connection_.kind, remote_table_name_t{table.container, table.container, table.remote});
     }
 
-    backend_actor_t::participant_t& backend_actor_t::participant(uint64_t transaction) {
-        return transactions_[transaction];
+    backend_actor_t::participant_t& backend_actor_t::participant(uint64_t transaction, const session_id_t& session) {
+        auto [found, inserted] = transactions_.try_emplace(transaction);
+        if (inserted) {
+            found->second.session = session;
+        }
+        return found->second;
     }
 
-    std::optional<uint64_t> backend_actor_t::pin_of(const components::table::transaction_data& txn) {
+    std::optional<uint64_t> backend_actor_t::pin_of(const components::table::transaction_data& txn,
+                                                    const session_id_t& session) {
         if (connection_.kind == backend_type_t::ClickHouse) {
             return std::nullopt;
         }
@@ -323,19 +332,19 @@ namespace otterstax::federation {
         if (!in_block(txn) && !pinned) {
             return std::nullopt;
         }
-        participant(txn.transaction_id).pinned = true;
+        participant(txn.transaction_id, session).pinned = true;
         return txn.transaction_id;
     }
 
     std::vector<backend_actor_t::step_t>
-    backend_actor_t::before_statement(const components::table::transaction_data& txn) {
+    backend_actor_t::before_statement(const components::table::transaction_data& txn, const session_id_t& session) {
         std::vector<step_t> steps;
         if (connection_.kind == backend_type_t::ClickHouse) {
             return steps;
         }
         // A block is one backend transaction from its first statement on, a read included: a MySQL
         // REPEATABLE READ snapshot (and a PostgreSQL one) holds only inside a transaction.
-        auto& state = participant(txn.transaction_id);
+        auto& state = participant(txn.transaction_id, session);
         state.pinned = true;
         if (!state.began) {
             state.began = true;
@@ -408,9 +417,17 @@ namespace otterstax::federation {
     }
 
     backend_actor_t::unique_future<core::result_wrapper_t<std::size_t>>
-    backend_actor_t::acquire(std::optional<uint64_t> transaction) {
+    backend_actor_t::acquire(std::optional<uint64_t> transaction, const session_id_t& session, bool ending) {
         actor_zeta::promise<core::result_wrapper_t<std::size_t>> promise(resource_);
         auto future = promise.get_future();
+        if (transaction && !ending) {
+            // A transaction whose connection closed ended on the backend (end_session): an agent it
+            // took now would be pinned to it with nobody left to end it.
+            if (auto found = transactions_.find(*transaction); found != transactions_.end() && found->second.closed) {
+                promise.set_value(error(core::error_code_t::connection_closed, "the connection is closed"));
+                return future;
+            }
+        }
         if (agents_.empty()) {
             promise.set_value(error(core::error_code_t::io_error,
                                     "connection \"" + connection_.name + "\" has no connection open"));
@@ -422,7 +439,9 @@ namespace otterstax::federation {
             return future;
         }
         const auto timeout = std::chrono::milliseconds{checkout_timeout_ms_.load(std::memory_order_relaxed)};
-        waiters_.push_back(waiter_t{transaction, std::move(promise), std::chrono::steady_clock::now() + timeout});
+        waiters_.push_back(
+            waiter_t{transaction, session, ending, std::move(promise), std::chrono::steady_clock::now() + timeout});
+        waiting_.store(waiters_.size(), std::memory_order_relaxed);
         return future;
     }
 
@@ -447,6 +466,7 @@ namespace otterstax::federation {
                 ++it;
             }
         }
+        waiting_.store(waiters_.size(), std::memory_order_relaxed);
     }
 
     void backend_actor_t::expire_waiters() {
@@ -465,6 +485,7 @@ namespace otterstax::federation {
                                             " ms (pool_size " + std::to_string(agents_.size()) + ")"));
             it = waiters_.erase(it);
         }
+        waiting_.store(waiters_.size(), std::memory_order_relaxed);
     }
 
     template<typename Method, typename... Args>
@@ -477,8 +498,8 @@ namespace otterstax::federation {
         return std::move(future);
     }
 
-    backend_actor_t::unique_future<core::error_t> backend_actor_t::run_steps(uint64_t transaction,
-                                                                              std::vector<step_t> steps) {
+    backend_actor_t::unique_future<core::error_t>
+    backend_actor_t::run_steps(uint64_t transaction, session_id_t session, std::vector<step_t> steps) {
         for (auto& step : steps) {
             if (step.step) {
                 const bool ends = *step.step == transaction_step_t::commit ||
@@ -488,7 +509,7 @@ namespace otterstax::federation {
                 if (ends && !pins_.contains(transaction)) {
                     continue;
                 }
-                auto agent = co_await acquire(transaction);
+                auto agent = co_await acquire(transaction, session, ends);
                 if (agent.has_error()) {
                     co_return agent.error();
                 }
@@ -500,6 +521,7 @@ namespace otterstax::federation {
                 continue;
             }
             auto written = co_await write(step.pinned ? std::optional<uint64_t>{transaction} : std::nullopt,
+                                          session,
                                           std::move(step.sql),
                                           write_kind_t::insert);
             if (written.has_error()) {
@@ -511,11 +533,12 @@ namespace otterstax::federation {
 
     backend_actor_t::unique_future<core::result_wrapper_t<std::vector<data_chunk_t>>>
     backend_actor_t::read(std::optional<uint64_t> transaction,
+                          session_id_t session,
                           std::string sql,
                           std::vector<std::optional<std::string>> declared,
                           std::vector<complex_logical_type> types,
                           core::date::timezone_offset_t timezone) {
-        auto agent = co_await acquire(transaction);
+        auto agent = co_await acquire(transaction, session);
         if (agent.has_error()) {
             co_return agent.error();
         }
@@ -534,12 +557,18 @@ namespace otterstax::federation {
     }
 
     backend_actor_t::unique_future<core::result_wrapper_t<std::uint64_t>>
-    backend_actor_t::write(std::optional<uint64_t> transaction, std::string sql, write_kind_t kind) {
-        auto agent = co_await acquire(transaction);
+    backend_actor_t::write(std::optional<uint64_t> transaction,
+                           session_id_t session,
+                           std::string sql,
+                           write_kind_t kind,
+                           bool strict_store,
+                           qualified_name_t table) {
+        auto agent = co_await acquire(transaction, session);
         if (agent.has_error()) {
             co_return agent.error();
         }
-        auto written = co_await send_to(agent.value(), &backend_agent_t::write, std::move(sql), kind);
+        auto written =
+            co_await send_to(agent.value(), &backend_agent_t::write, std::move(sql), kind, strict_store, std::move(table));
         release(agent.value(), false);
         co_return written;
     }
@@ -728,7 +757,7 @@ namespace otterstax::federation {
     // ---- storage_contract ----
 
     backend_actor_t::unique_future<core::result_wrapper_t<disk::fetch_batch_t>>
-    backend_actor_t::storage_fetch_next_batch(session_id_t,
+    backend_actor_t::storage_fetch_next_batch(session_id_t session,
                                               oid_t table_oid,
                                               uint64_t cursor_id,
                                               int64_t limit,
@@ -775,20 +804,20 @@ namespace otterstax::federation {
                 co_return generated.error();
             }
             sql = std::move(generated.value());
-            transaction = pin_of(txn);
+            transaction = pin_of(txn, session);
             if (transaction) {
-                steps = before_statement(txn);
+                steps = before_statement(txn, session);
             }
         }
         if (!steps.empty()) {
-            if (auto refused = co_await run_steps(txn.transaction_id, std::move(steps)); refused.contains_error()) {
+            if (auto refused = co_await run_steps(txn.transaction_id, session, std::move(steps)); refused.contains_error()) {
                 co_return refused;
             }
         }
         // The contract hands a scan its session and transaction only, no execution context: no
         // session time zone reaches it, so a read of a table is conformed in UTC (the zone otterbrix's
         // own timestamps carry); a taken block (storage_run_block) has the session's.
-        auto rows = co_await read(transaction, std::move(sql), std::move(declared), types, {});
+        auto rows = co_await read(transaction, session, std::move(sql), std::move(declared), types, {});
         if (rows.has_error()) {
             co_return rows.error();
         }
@@ -866,12 +895,12 @@ namespace otterstax::federation {
                 statements.push_back(std::move(sql.value()));
             }
             if (connection_.kind != backend_type_t::ClickHouse && !statements.empty()) {
-                steps = before_statement(ctx.txn);
+                steps = before_statement(ctx.txn, ctx.session);
                 transaction = ctx.txn.transaction_id;
             }
         }
         if (!steps.empty()) {
-            if (auto refused = co_await run_steps(ctx.txn.transaction_id, std::move(steps)); refused.contains_error()) {
+            if (auto refused = co_await run_steps(ctx.txn.transaction_id, ctx.session, std::move(steps)); refused.contains_error()) {
                 co_return refused;
             }
         }
@@ -879,7 +908,7 @@ namespace otterstax::federation {
         std::vector<data_chunk_t> returned;
         for (auto& sql : statements) {
             if (returning) {
-                auto rows = co_await read(transaction, std::move(sql), {}, types, ctx.session_tz);
+                auto rows = co_await read(transaction, ctx.session, std::move(sql), {}, types, ctx.session_tz);
                 if (rows.has_error()) {
                     co_return rows.error();
                 }
@@ -889,7 +918,7 @@ namespace otterstax::federation {
                 }
                 continue;
             }
-            auto written = co_await write(transaction, std::move(sql), write_kind_t::insert);
+            auto written = co_await write(transaction, ctx.session, std::move(sql), write_kind_t::insert);
             if (written.has_error()) {
                 co_return written.error();
             }
@@ -979,7 +1008,7 @@ namespace otterstax::federation {
                 }
                 if (connection_.kind == backend_type_t::PostgreSQL) {
                     // In the statement's backend transaction: COMMIT at prepare, ROLLBACK at abort.
-                    steps = before_statement(ctx.txn);
+                    steps = before_statement(ctx.txn, ctx.session);
                     steps.push_back(step_t{std::nullopt, {}, std::move(sql.value()), true});
                 } else {
                     // MySQL / ClickHouse DDL commits at once: once it ran, an abort drops the table
@@ -994,13 +1023,13 @@ namespace otterstax::federation {
             }
         }
         if (!steps.empty()) {
-            if (auto refused = co_await run_steps(ctx.txn.transaction_id, std::move(steps)); refused.contains_error()) {
+            if (auto refused = co_await run_steps(ctx.txn.transaction_id, ctx.session, std::move(steps)); refused.contains_error()) {
                 co_return refused;
             }
         }
         {
             OTX_ZONE_N("backend_actor::create_storage_disk::created");
-            auto& state = participant(ctx.txn.transaction_id);
+            auto& state = participant(ctx.txn.transaction_id, ctx.session);
             state.created.push_back(table_oid);
             if (undo) {
                 state.on_abort.push_back(std::move(*undo));
@@ -1022,7 +1051,7 @@ namespace otterstax::federation {
             if (!table) {
                 continue; // a table whose spelling OtterStax lost: only the catalog's rows go
             }
-            auto& state = participant(ctx.txn.transaction_id);
+            auto& state = participant(ctx.txn.transaction_id, ctx.session);
             state.forget.push_back(oid);
             if (registration) {
                 continue;
@@ -1075,7 +1104,7 @@ namespace otterstax::federation {
                     co_return sql.error();
                 }
                 if (connection_.kind == backend_type_t::PostgreSQL) {
-                    steps = before_statement(ctx.txn);
+                    steps = before_statement(ctx.txn, ctx.session);
                     steps.push_back(step_t{std::nullopt, {}, std::move(sql.value()), true});
                 } else {
                     steps.push_back(step_t{std::nullopt, {}, std::move(sql.value()), false});
@@ -1088,13 +1117,13 @@ namespace otterstax::federation {
             }
         }
         if (!steps.empty()) {
-            if (auto refused = co_await run_steps(ctx.txn.transaction_id, std::move(steps)); refused.contains_error()) {
+            if (auto refused = co_await run_steps(ctx.txn.transaction_id, ctx.session, std::move(steps)); refused.contains_error()) {
                 co_return refused; // an ADD the backend refused added nothing: nothing to undo
             }
         }
         {
             OTX_ZONE_N("backend_actor::add_storage_column::added");
-            auto& state = participant(ctx.txn.transaction_id);
+            auto& state = participant(ctx.txn.transaction_id, ctx.session);
             if (undo) {
                 state.on_abort.push_back(std::move(*undo));
             }
@@ -1134,9 +1163,9 @@ namespace otterstax::federation {
                 if (drop.has_error()) {
                     co_return drop.error();
                 }
-                participant(ctx.txn.transaction_id).at_prepare.push_back(std::move(drop.value()));
+                participant(ctx.txn.transaction_id, ctx.session).at_prepare.push_back(std::move(drop.value()));
             } else {
-                static_cast<void>(participant(ctx.txn.transaction_id));
+                static_cast<void>(participant(ctx.txn.transaction_id, ctx.session));
             }
         }
         const oid_t keys[] = {attoid};
@@ -1154,6 +1183,10 @@ namespace otterstax::federation {
                 co_return core::error_t::no_error();
             }
             auto& state = found->second;
+            if (state.closed) {
+                // Rolled back with its connection (end_session): nothing of it can commit.
+                co_return error(core::error_code_t::connection_closed, "the connection is closed");
+            }
             const bool transactional = connection_.kind != backend_type_t::ClickHouse;
             for (auto& sql : state.at_prepare) {
                 if (transactional && !state.began) {
@@ -1168,9 +1201,15 @@ namespace otterstax::federation {
             if (commits) {
                 steps.push_back(step_t{transaction_step_t::commit, {}, {}, true});
             }
+            // While the COMMIT runs the end is otterbrix's: a close of the connection leaves it alone.
+            state.preparing = !steps.empty();
         }
         if (!steps.empty()) {
-            if (auto refused = co_await run_steps(ctx.txn.transaction_id, std::move(steps)); refused.contains_error()) {
+            auto refused = co_await run_steps(ctx.txn.transaction_id, ctx.session, std::move(steps));
+            if (auto found = transactions_.find(ctx.txn.transaction_id); found != transactions_.end()) {
+                found->second.preparing = false;
+            }
+            if (refused.contains_error()) {
                 // The transaction stays as it is: otterbrix answers a refused prepare with an abort,
                 // which rolls the backend transaction back, frees its agent (an ended COMMIT freed it
                 // already) and runs the compensations.
@@ -1205,25 +1244,27 @@ namespace otterstax::federation {
                 co_return;
             }
             auto& state = found->second;
+            if (state.closed) {
+                // It ended with its connection (end_session).
+                transactions_.erase(found);
+                co_return;
+            }
             end_tables(ctx.txn.transaction_id, state.prepared);
-            if (state.began) {
+            if (state.prepared) {
+                // A transaction that held its agent without BEGIN keeps it until here.
+                if (state.pinned) {
+                    steps.push_back(step_t{transaction_step_t::unpin, {}, {}, true});
+                }
+            } else {
                 // Never prepared: what it did goes (a block that only read ends its backend
                 // transaction too).
-                steps.push_back(step_t{transaction_step_t::rollback, {}, {}, true});
-            } else if (state.pinned) {
-                // Pinned without a backend transaction: its agent is free again.
-                steps.push_back(step_t{transaction_step_t::unpin, {}, {}, true});
-            }
-            if (!state.prepared) {
-                for (auto it = state.on_abort.rbegin(); it != state.on_abort.rend(); ++it) {
-                    steps.push_back(step_t{std::nullopt, {}, std::move(*it), false});
-                }
+                steps = rollback_steps(state);
             }
             transactions_.erase(found);
         }
         // Nothing awaits a release: a refusal here only loses the agent's session state (an ending
         // step frees the agent whatever its answer, run_steps).
-        static_cast<void>(co_await run_steps(ctx.txn.transaction_id, std::move(steps)));
+        static_cast<void>(co_await run_steps(ctx.txn.transaction_id, ctx.session, std::move(steps)));
         co_return;
     }
 
@@ -1237,18 +1278,16 @@ namespace otterstax::federation {
                 co_return core::error_t::no_error();
             }
             auto& state = found->second;
+            if (state.closed) {
+                // It ended with its connection (end_session): otterbrix's abort only forgets it.
+                if (from_sub_id == 0) {
+                    transactions_.erase(found);
+                }
+                co_return core::error_t::no_error();
+            }
             if (from_sub_id == 0) {
                 end_tables(ctx.txn.transaction_id, false);
-                if (state.began) {
-                    steps.push_back(step_t{transaction_step_t::rollback, {}, {}, true});
-                } else if (state.pinned) {
-                    steps.push_back(step_t{transaction_step_t::unpin, {}, {}, true});
-                }
-                // The DDL MySQL / ClickHouse committed at once, undone the last first (otterbrix runs
-                // a connection's DDL in autocommit only, so a ROLLBACK TO never meets one).
-                for (auto it = state.on_abort.rbegin(); it != state.on_abort.rend(); ++it) {
-                    steps.push_back(step_t{std::nullopt, {}, std::move(*it), false});
-                }
+                steps = rollback_steps(state);
                 transactions_.erase(found);
             } else {
                 // ROLLBACK TO the oldest backend savepoint of a level >= from_sub_id: every statement
@@ -1265,7 +1304,7 @@ namespace otterstax::federation {
                 }
             }
         }
-        co_return co_await run_steps(ctx.txn.transaction_id, std::move(steps));
+        co_return co_await run_steps(ctx.txn.transaction_id, ctx.session, std::move(steps));
     }
 
     backend_actor_t::unique_future<core::result_wrapper_t<std::pmr::vector<disk::block_take_t>>>
@@ -1303,7 +1342,31 @@ namespace otterstax::federation {
             }
             sql = std::move(generated.value());
             types = take.types;
-            if (take.table_read) {
+            if (!take.table_read && connection_.kind == backend_type_t::ClickHouse) {
+                // A relation taken whole: an answer column under the name of a column of one of its
+                // tables and of that column's type is that column (a derived table's `props` AS
+                // `props`), declared with ClickHouse's own type of it — the wire carries no Tuple
+                // field names, and the page must be the registered type (ch_to_chunk reads a
+                // declared type only where the wire column represents it).
+                const auto& block = *blocks_.at(take.block);
+                for (const auto& type : take.types) {
+                    std::optional<std::string> found;
+                    const auto name = type.has_alias() ? type.alias() : std::string{};
+                    for (const auto& detached : block.tables) {
+                        auto table = table_locked(detached.oid);
+                        if (!table || found) {
+                            continue;
+                        }
+                        for (const auto& column : visible_columns(*table, ctx.txn.transaction_id)) {
+                            if (column.name == name && !column.remote_type.empty() && column.type == type) {
+                                found = column.remote_type;
+                                break;
+                            }
+                        }
+                    }
+                    declared.push_back(std::move(found));
+                }
+            } else if (take.table_read) {
                 if (auto table = table_locked(take.table)) {
                     if (take.columns.empty()) {
                         for (const auto& column : table->columns) {
@@ -1319,17 +1382,17 @@ namespace otterstax::federation {
                     }
                 }
             }
-            transaction = pin_of(ctx.txn);
+            transaction = pin_of(ctx.txn, ctx.session);
             if (transaction) {
-                steps = before_statement(ctx.txn);
+                steps = before_statement(ctx.txn, ctx.session);
             }
         }
         if (!steps.empty()) {
-            if (auto refused = co_await run_steps(ctx.txn.transaction_id, std::move(steps)); refused.contains_error()) {
+            if (auto refused = co_await run_steps(ctx.txn.transaction_id, ctx.session, std::move(steps)); refused.contains_error()) {
                 co_return refused;
             }
         }
-        auto rows = co_await read(transaction, std::move(sql), std::move(declared), types, ctx.session_tz);
+        auto rows = co_await read(transaction, ctx.session, std::move(sql), std::move(declared), types, ctx.session_tz);
         if (rows.has_error()) {
             co_return rows.error();
         }
@@ -1365,7 +1428,9 @@ namespace otterstax::federation {
         std::vector<step_t> steps;
         std::string sql;
         write_kind_t kind = write_kind_t::update;
+        qualified_name_t target;
         std::vector<complex_logical_type> types;
+        sql_gen::statement_needs_t needs;
         {
             OTX_ZONE_N("backend_actor::storage_run_write");
             auto found = takes_.find(std::string{request});
@@ -1379,31 +1444,32 @@ namespace otterstax::federation {
             }
             kind = take.node->type() == components::logical_plan::node_type::delete_t ? write_kind_t::delete_
                                                                                        : write_kind_t::update;
-            auto generated = take_sql(take, &parameters, false, returning);
+            auto generated = take_sql(take, &parameters, false, returning, &needs);
             if (generated.has_error()) {
                 co_return generated.error();
             }
             sql = std::move(generated.value());
-            if (returning) {
-                if (auto table = table_locked(take.node->table_oid())) {
+            if (const auto table = table_locked(take.node->table_oid())) {
+                target = generator_target(*table);
+                if (returning) {
                     for (const auto& column : visible_columns(*table, ctx.txn.transaction_id)) {
                         types.push_back(named(column));
                     }
                 }
             }
             if (connection_.kind != backend_type_t::ClickHouse) {
-                steps = before_statement(ctx.txn);
+                steps = before_statement(ctx.txn, ctx.session);
                 transaction = ctx.txn.transaction_id;
             }
         }
         if (!steps.empty()) {
-            if (auto refused = co_await run_steps(ctx.txn.transaction_id, std::move(steps)); refused.contains_error()) {
+            if (auto refused = co_await run_steps(ctx.txn.transaction_id, ctx.session, std::move(steps)); refused.contains_error()) {
                 co_return refused;
             }
         }
         disk::write_receipt_t receipt{0, 0, false, std::pmr::vector<data_chunk_t>{resource_}};
         if (returning) {
-            auto rows = co_await read(transaction, std::move(sql), {}, types, ctx.session_tz);
+            auto rows = co_await read(transaction, ctx.session, std::move(sql), {}, types, ctx.session_tz);
             if (rows.has_error()) {
                 co_return rows.error();
             }
@@ -1413,7 +1479,8 @@ namespace otterstax::federation {
             receipt.returned = returned_rows(std::move(rows.value()));
             co_return std::move(receipt);
         }
-        auto written = co_await write(transaction, std::move(sql), kind);
+        auto written =
+            co_await write(transaction, ctx.session, std::move(sql), kind, needs.strict_store, std::move(target));
         if (written.has_error()) {
             co_return written.error();
         }
@@ -1427,7 +1494,7 @@ namespace otterstax::federation {
     backend_actor_t::discover(qualified_name_t scope) {
         // Nothing to do before the first co_await: the zone covers the work after the answer (the
         // agent's discovery has its own, backend_agent::discover).
-        auto agent = co_await acquire(std::nullopt);
+        auto agent = co_await acquire(std::nullopt, registration_session_);
         if (agent.has_error()) {
             co_return agent.error();
         }
@@ -1439,6 +1506,59 @@ namespace otterstax::federation {
             ++metadata_;
         }
         co_return reply;
+    }
+
+    std::vector<backend_actor_t::step_t> backend_actor_t::rollback_steps(participant_t& state) {
+        std::vector<step_t> steps;
+        if (state.began) {
+            steps.push_back(step_t{transaction_step_t::rollback, {}, {}, true});
+        } else if (state.pinned) {
+            // Pinned without a backend transaction: its agent is free again.
+            steps.push_back(step_t{transaction_step_t::unpin, {}, {}, true});
+        }
+        // The DDL MySQL / ClickHouse committed at once, undone the last first (otterbrix runs a
+        // connection's DDL in autocommit only, so a ROLLBACK TO never meets one).
+        for (auto it = state.on_abort.rbegin(); it != state.on_abort.rend(); ++it) {
+            steps.push_back(step_t{std::nullopt, {}, std::move(*it), false});
+        }
+        state.on_abort.clear();
+        return steps;
+    }
+
+    backend_actor_t::unique_future<void> backend_actor_t::end_session(session_id_t session) {
+        std::vector<std::pair<uint64_t, std::vector<step_t>>> ends;
+        {
+            OTX_ZONE_N("backend_actor::end_session");
+            // Its statements waiting for an agent leave the queue: nobody waits for their answers. A
+            // step that ends a transaction (a ROLLBACK otterbrix sent already) stays: given up, it would
+            // leave its agent pinned.
+            for (auto it = waiters_.begin(); it != waiters_.end();) {
+                if (it->session == session && !it->ending) {
+                    it->promise.set_value(error(core::error_code_t::connection_closed, "the connection is closed"));
+                    it = waiters_.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            waiting_.store(waiters_.size(), std::memory_order_relaxed);
+            for (auto& [transaction, state] : transactions_) {
+                // A COMMIT that runs or ran ends as otterbrix decides (its release follows).
+                if (state.session != session || state.closed || state.preparing || state.prepared) {
+                    continue;
+                }
+                end_tables(transaction, false);
+                ends.emplace_back(transaction, rollback_steps(state));
+                state = participant_t{};
+                state.session = session;
+                state.closed = true;
+            }
+        }
+        // On the agent the transaction holds, after the statement it runs (run_steps: an ending step
+        // waits for its own agent however long, never for another).
+        for (auto& [transaction, steps] : ends) {
+            static_cast<void>(co_await run_steps(transaction, session, std::move(steps)));
+        }
+        co_return;
     }
 
     core::error_t backend_actor_t::refused_write(const execution_context_t& ctx, bool returning) const {

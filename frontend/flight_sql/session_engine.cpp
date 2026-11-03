@@ -204,25 +204,23 @@ namespace flight::engine {
     }
 
     template<typename Session>
-    session_payload
-    SessionEngine::run_prepared(const Session& session, const std::string& sql, const core::BoundParams& params) {
+    session_payload SessionEngine::run_prepared(const Session& session,
+                                                const core::Prepared& prepared,
+                                                const core::BoundParams& params) {
         OTX_ZONE_N("flight::SessionEngine::run_prepared");
-        auto [id, prepared_payload] = prepare_fresh(session, sql);
         auto parameters = to_param_chunks(params);
         std::size_t rows = 0;
         for (const auto& chunk : parameters) {
             rows += chunk.size();
         }
-        if (prepared_payload.parameter_count > 0 && rows != 1 && rows != 0) {
+        if (prepared.parameter_count > 0 && rows != 1 && rows != 0) {
             // executemany goes row-by-row upstream; a single run takes one row
-            close_quietly(session, id);
             throw core::EngineError("prepared statement takes one parameter row per execution, got " +
                                     std::to_string(rows));
         }
         const std::size_t columns = parameters.empty() ? 0 : parameters.front().column_count();
-        if (prepared_payload.parameter_count > 0 && (rows == 0 || columns != prepared_payload.parameter_count)) {
-            close_quietly(session, id);
-            throw core::EngineError("prepared statement takes " + std::to_string(prepared_payload.parameter_count) +
+        if (prepared.parameter_count > 0 && (rows == 0 || columns != prepared.parameter_count)) {
+            throw core::EngineError("prepared statement takes " + std::to_string(prepared.parameter_count) +
                                     " parameter(s), got " + std::to_string(rows == 0 ? 0 : columns));
         }
         auto bound = parameters.empty()
@@ -230,12 +228,14 @@ namespace flight::engine {
                                                             std::pmr::vector<components::types::complex_logical_type>{resource_},
                                                             1)
                          : std::move(parameters.front());
+        // The entry CreatePreparedStatement left: every execution parses its text again and binds
+        // its own values there (query_session_t::execute_prepared_statement).
         return call(
             session,
-            [&, id = id](query_session_t& target) {
+            [&](query_session_t& target) {
                 return actor_zeta::send(target.address(),
                                         &query_session_t::execute_prepared_statement,
-                                        id,
+                                        prepared.statement,
                                         std::move(bound),
                                         uint64_t{0})
                     .second;
@@ -343,13 +343,14 @@ namespace flight::engine {
             use(*scope);
             return true;
         };
+        // The session's entry of the statement, closed with the session at ClosePreparedStatement:
+        // every execution runs it.
         auto [id, payload] = prepare_fresh(session, query);
-        // Every execution re-prepares the text on this session; the entry the
-        // prepare left is not needed.
-        close_quietly(session, id);
 
         core::Prepared prepared;
         prepared.query = query;
+        prepared.statement = id;
+        prepared.parameter_count = payload.parameter_count;
         if (payload.tag == NodeTag::T_SelectStmt) {
             // The schema handed out at CreatePreparedStatement is the
             // statement's contract; a row-producing statement whose prepare
@@ -387,7 +388,7 @@ namespace flight::engine {
         auto session = [&](auto&& use) { return statements.use_prepared(handle, use); };
         // The first bound row answers; an executemany of a SELECT has no single
         // result to stream.
-        auto payload = run_prepared(session, prepared.query, params);
+        auto payload = run_prepared(session, prepared, params);
         refuse_open_transaction(session);
         if (payload.column_count() == 0) {
             // DDL/DML over the prepared path — an empty dataset
@@ -404,13 +405,13 @@ namespace flight::engine {
         auto session = [&](auto&& use) { return statements.use_prepared(handle, use); };
         std::int64_t affected = 0;
         if (params.empty()) {
-            affected = static_cast<std::int64_t>(run_prepared(session, prepared.query, {}).reported_rows());
+            affected = static_cast<std::int64_t>(run_prepared(session, prepared, {}).reported_rows());
             refuse_open_transaction(session);
         } else {
             // executemany: one execution per bound row, the affected counts sum
             // (the ADBC executemany contract for updates).
             for (const auto& batch : params) {
-                affected += static_cast<std::int64_t>(run_prepared(session, prepared.query, {batch}).reported_rows());
+                affected += static_cast<std::int64_t>(run_prepared(session, prepared, {batch}).reported_rows());
                 refuse_open_transaction(session);
             }
         }

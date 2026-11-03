@@ -83,11 +83,15 @@ struct DbSchema {
     friend auto operator<=>(const DbSchema&, const DbSchema&) = default;
 };
 
-// A prepared query: text + the result and parameter schemas.
+// A prepared query: text + the result and parameter schemas, and the entry its
+// session keeps for it (prepared once at CreatePreparedStatement, run by every
+// execution).
 struct Prepared {
     std::string query;
     std::shared_ptr<arrow::Schema> dataset_schema;   // null for update
     std::shared_ptr<arrow::Schema> parameter_schema; // one field per '?'
+    otterstax::session::statement_id_t statement{};  // the session's entry (query_session_t::prepare_schema)
+    std::size_t parameter_count = 0;                 // the `$n` the statement takes
 };
 
 // Bound parameters: the DoPut batches as the client sent them (the engine

@@ -12,10 +12,14 @@ runs on the engine, which offers it to the connection's backend
     pushed whole — its count is the backend's (MySQL: the rows an UPDATE
     MATCHED, not the rows it changed); a table without a primary key is no
     obstacle;
-  * an UPDATE / DELETE it cannot say whole (here: `WHERE id IN (SELECT id FROM
-    <local table>)`) is refused (0A000 / ER_NOT_SUPPORTED_YET) before anything
-    is written: OtterStax numbers no remote row, so there is no row-by-row
-    path;
+  * an UPDATE / DELETE whose WHERE reads a local table through an
+    uncorrelated sub-query (`WHERE id IN (SELECT id FROM <local table>)`) is one
+    statement too: the engine computes the sub-query first and the backend gets
+    its values as a list (`... IN (1, 2)`), so exactly the rows the sub-query
+    names change;
+  * an UPDATE / DELETE the backend cannot say whole is refused (0A000 /
+    ER_NOT_SUPPORTED_YET) before anything is written: OtterStax numbers no
+    remote row, so there is no row-by-row path;
   * RETURNING is PostgreSQL's alone; an INSERT ... SELECT from a local table
     runs (the engine hands the rows to the backend).
 
@@ -50,7 +54,7 @@ CH_ORDERS = f"{config.CH_ALIAS}.{config.CH_DATABASE}.public.orders"
 
 LOCAL_SCHEMA = "rowdml_local"            # a schema of the session's database, main
 PICK = f"{LOCAL_SCHEMA}.pick"            # (id int): the ids a sub-query picks, 1 and 2
-BIG_PICK = f"{LOCAL_SCHEMA}.big_pick"    # (id bigint): an order_id ClickHouse does not hold
+BIG_PICK = f"{LOCAL_SCHEMA}.big_pick"    # (id bigint): the order_ids a ClickHouse DELETE picks
 NEW_ROWS = f"{LOCAL_SCHEMA}.new_rows"    # (id int, grp string, qty int): rows to copy into a remote table
 
 # Rows 1, 2 and 4 share grp 'a'; rows 1, 2 and 3 share qty 5.
@@ -166,7 +170,7 @@ class RemoteRowDmlTest:
             cur.execute(f"CREATE TABLE {PICK} (id int)")
             cur.execute(f"INSERT INTO {PICK} (id) VALUES (1), (2)")
             cur.execute(f"CREATE TABLE {BIG_PICK} (id bigint)")
-            cur.execute(f"INSERT INTO {BIG_PICK} (id) VALUES (990999)")
+            cur.execute(f"INSERT INTO {BIG_PICK} (id) VALUES (990901), (990902)")
             cur.execute(f"CREATE TABLE {NEW_ROWS} (id int, grp string, qty int)")
             cur.execute(f"INSERT INTO {NEW_ROWS} (id, grp, qty) VALUES (60, 'n', 1), (61, 'n', 1)")
             # The tables were made on the backends after the server started: the
@@ -219,15 +223,17 @@ class RemoteRowDmlTest:
         self.assert_equal(self.mariadb_rows("rowdml_nokey"), [(1, "a", 6), (1, "a", 6)], "the pushed writes' effect")
         print("  MariaDB table without a primary key: pushed UPDATE / DELETE run ✓")
 
-    def test_mysql_write_with_a_local_subquery_is_refused(self):
-        """MariaDB: an UPDATE / DELETE whose WHERE reads a local table is not one statement: refused (1235)."""
+    def test_mysql_write_with_a_local_subquery_changes_the_rows_it_picks(self):
+        """MariaDB: an UPDATE / DELETE whose WHERE reads a local table changes exactly the rows the sub-query picks."""
         self.reset_mariadb("rowdml_keyed", KEYED_ROWS)
-        self.my_refused(f"UPDATE {MYSQL_KEYED} SET qty = 9 WHERE id IN (SELECT id FROM {PICK})",
-                        "one statement", "UPDATE with a local sub-query")
-        self.my_refused(f"DELETE FROM {MYSQL_KEYED} WHERE id IN (SELECT id FROM {PICK})",
-                        "one statement", "DELETE with a local sub-query")
-        self.assert_equal(self.mariadb_rows("rowdml_keyed"), KEYED_ROWS, "nothing was written")
-        print("  MariaDB UPDATE / DELETE over a local sub-query refused (1235) ✓")
+        self.assert_equal(self.my_count(f"UPDATE {MYSQL_KEYED} SET qty = 9 WHERE id IN (SELECT id FROM {PICK})"), 2,
+                          "UPDATE with a local sub-query: the rows 1 and 2 it picks")
+        self.assert_equal(self.mariadb_rows("rowdml_keyed"), [(1, "a", 9), (2, "a", 9), (3, "b", 5), (4, "a", 7)],
+                          "only the picked rows changed")
+        self.assert_equal(self.my_count(f"DELETE FROM {MYSQL_KEYED} WHERE id IN (SELECT id FROM {PICK})"), 2,
+                          "DELETE with a local sub-query")
+        self.assert_equal(self.mariadb_rows("rowdml_keyed"), [(3, "b", 5), (4, "a", 7)], "only the picked rows are gone")
+        print("  MariaDB UPDATE / DELETE over a local sub-query: exactly the picked rows ✓")
 
     def test_mysql_returning_is_refused(self):
         """MariaDB: RETURNING is PostgreSQL's alone — refused before anything is written."""
@@ -248,17 +254,18 @@ class RemoteRowDmlTest:
         self.assert_equal(self.postgres_rows("rowdml_keyed"), [(3, "b", 5), (4, "a", 7)], "rows 1 and 2 are gone")
         print("  PostgreSQL pushed UPDATE / DELETE ✓")
 
-    def test_pg_write_with_a_local_subquery_is_refused(self):
-        """PostgreSQL: an UPDATE / DELETE whose WHERE reads a local table is refused with 0A000."""
+    def test_pg_write_with_a_local_subquery_changes_the_rows_it_picks(self):
+        """PostgreSQL: an UPDATE / DELETE whose WHERE reads a local table changes exactly the rows the sub-query picks."""
         self.reset_postgres("rowdml_keyed", KEYED_ROWS)
-        self.reset_postgres("rowdml_nokey", NOKEY_ROWS)
-        self.pg_refused(f"UPDATE {PG_KEYED} SET qty = 9 WHERE id IN (SELECT id FROM {PICK})",
-                        "one statement", "UPDATE with a local sub-query")
-        self.pg_refused(f"DELETE FROM {PG_NOKEY} WHERE id IN (SELECT id FROM {PICK})",
-                        "one statement", "DELETE with a local sub-query")
-        self.assert_equal(self.postgres_rows("rowdml_keyed"), KEYED_ROWS, "nothing was written")
-        self.assert_equal(self.postgres_rows("rowdml_nokey"), NOKEY_ROWS, "nothing was written")
-        print("  PostgreSQL UPDATE / DELETE over a local sub-query refused (0A000) ✓")
+        self.reset_postgres("rowdml_nokey", NOKEY_ROWS + [(3, "c", 5)])
+        self.assert_equal(self.pg_count(f"UPDATE {PG_KEYED} SET qty = 9 WHERE id IN (SELECT id FROM {PICK})"), 2,
+                          "UPDATE with a local sub-query: the rows 1 and 2 it picks")
+        self.assert_equal(self.postgres_rows("rowdml_keyed"), [(1, "a", 9), (2, "a", 9), (3, "b", 5), (4, "a", 7)],
+                          "only the picked rows changed")
+        self.assert_equal(self.pg_count(f"DELETE FROM {PG_NOKEY} WHERE id IN (SELECT id FROM {PICK})"), 3,
+                          "DELETE with a local sub-query: both rows of id 1 and the row of id 2, no key needed")
+        self.assert_equal(self.postgres_rows("rowdml_nokey"), [(3, "c", 5)], "only the picked rows are gone")
+        print("  PostgreSQL UPDATE / DELETE over a local sub-query: exactly the picked rows ✓")
 
     def test_pg_update_returning_answers_the_written_rows(self):
         """PostgreSQL: UPDATE ... RETURNING answers the rows the backend wrote."""
@@ -280,17 +287,30 @@ class RemoteRowDmlTest:
         print("  INSERT ... SELECT from a local table into PostgreSQL ✓")
 
     # ── ClickHouse ──────────────────────────────────────────────────────────
-    def test_clickhouse_write_with_a_local_subquery_is_refused(self):
-        """ClickHouse: a DELETE whose WHERE reads a local table is refused before anything runs."""
+    def test_clickhouse_write_with_a_local_subquery_deletes_the_rows_it_picks(self):
+        """ClickHouse: a DELETE whose WHERE reads a local table deletes exactly the orders the sub-query picks."""
+        picked = (990901, 990902)
+        kept = 990903
         with self.pg.cursor() as cur:
             cur.execute(f"SELECT count(*) FROM {CH_ORDERS}")
             before = int(cur.fetchall()[0][0])
-        self.pg_refused(f"DELETE FROM {CH_ORDERS} WHERE order_id IN (SELECT id FROM {BIG_PICK})",
-                        "one statement", "ClickHouse")
-        with self.pg.cursor() as cur:
+            cur.execute(
+                f"INSERT INTO {CH_ORDERS}"
+                f" (order_id, campaign_id, product_id, customer_name, order_date, quantity, total_amount) VALUES"
+                f" ({picked[0]}, 1, 1, 'Picked One', '2026-01-01 00:00:00', 1, 1.5),"
+                f" ({picked[1]}, 1, 1, 'Picked Two', '2026-01-01 00:00:00', 1, 1.5),"
+                f" ({kept}, 1, 1, 'Kept', '2026-01-01 00:00:00', 1, 1.5)")
+            try:
+                # A mutation: ClickHouse answers no count (0); the rows tell what it did.
+                cur.execute(f"DELETE FROM {CH_ORDERS} WHERE order_id IN (SELECT id FROM {BIG_PICK})")
+                cur.execute(f"SELECT order_id FROM {CH_ORDERS} WHERE order_id >= {picked[0]} AND order_id <= {kept}"
+                            f" ORDER BY order_id")
+                self.assert_equal([r[0] for r in cur.fetchall()], [kept], "only the picked orders are gone")
+            finally:
+                cur.execute(f"DELETE FROM {CH_ORDERS} WHERE order_id >= {picked[0]} AND order_id <= {kept}")
             cur.execute(f"SELECT count(*) FROM {CH_ORDERS}")
-            self.assert_equal(int(cur.fetchall()[0][0]), before, "no order was touched")
-        print("  ClickHouse DELETE over a local sub-query refused (0A000) ✓")
+            self.assert_equal(int(cur.fetchall()[0][0]), before, "no other order was touched")
+        print("  ClickHouse DELETE over a local sub-query: exactly the picked orders ✓")
 
     def test_clickhouse_write_inside_a_block_is_refused(self):
         """ClickHouse has no transactions: a write inside BEGIN is refused (and fails the block)."""
@@ -339,13 +359,13 @@ class RemoteRowDmlTest:
             self.setup()
             self.test_mysql_pushed_update_counts_matched_rows()
             self.test_mysql_pushed_write_needs_no_primary_key()
-            self.test_mysql_write_with_a_local_subquery_is_refused()
+            self.test_mysql_write_with_a_local_subquery_changes_the_rows_it_picks()
             self.test_mysql_returning_is_refused()
             self.test_pg_pushed_update_and_delete()
-            self.test_pg_write_with_a_local_subquery_is_refused()
+            self.test_pg_write_with_a_local_subquery_changes_the_rows_it_picks()
             self.test_pg_update_returning_answers_the_written_rows()
             self.test_insert_select_from_a_local_table()
-            self.test_clickhouse_write_with_a_local_subquery_is_refused()
+            self.test_clickhouse_write_with_a_local_subquery_deletes_the_rows_it_picks()
             self.test_clickhouse_write_inside_a_block_is_refused()
             self.test_pg_remote_write_inside_a_block_follows_rollback_and_commit()
             self.test_mysql_remote_write_inside_a_block_follows_rollback()

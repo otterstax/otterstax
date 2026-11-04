@@ -195,7 +195,14 @@ call returned). Arrow allocates from its helper threads too (even the serial
 CSV/JSON readers read ahead on a background thread); the pool enters the
 resource one call at a time, but code that also uses the resource directly
 while such a thread runs (S3 background part uploads) needs a thread-safe one —
-the engine's `synchronized_pool_resource` is. Each loader and writer has a
+the engine's `synchronized_pool_resource` is. No helper thread of a loader
+reaches `res` after the call: the csv / ndjson readers read ahead on a pool of
+the reader's own, joined when the reader goes, and `parquet_to_chunk` runs the
+reader's pre-buffered reads on a pool of the load's own, shut down before it
+returns — on Arrow's shared IO pool a worker lets a finished read's task (its
+future, holding the buffer read on `res`) go only after waking the reader, so
+that last free could land after the call returned, in a resource the caller
+had already destroyed (`test_parquet_to_chunk.cpp`). Each loader and writer has a
 stream overload (`std::shared_ptr<arrow::io::RandomAccessFile>` /
 `InputStream` in, `OutputStream` out — Arrow's own handles, for the Arrow
 calls) beside the path / buffer forms; the S3 path uses those. Between actors a

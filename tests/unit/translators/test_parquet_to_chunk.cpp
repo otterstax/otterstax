@@ -2,6 +2,7 @@
 // Copyright 2025-2026  OtterStax
 
 #include "otterbrix/translators/input/arrow_to_chunk.hpp"
+#include "otterbrix/translators/arrow_memory_pool.hpp"
 #include "single_chunk.hpp"
 #include "otterbrix/translators/input/parquet_to_chunk.hpp"
 #include "../../mock/cell.hpp"
@@ -13,10 +14,14 @@
 
 #include <arrow/api.h>
 #include <arrow/io/file.h>
+#include <arrow/io/interfaces.h>
+#include <arrow/util/thread_pool.h>
 #include <parquet/arrow/writer.h>
 
 #include <catch2/catch_all.hpp>
 
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -24,6 +29,7 @@
 #include <memory_resource>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 using components::vector::data_chunk_t;
@@ -394,4 +400,100 @@ TEST_CASE("parquet_to_chunk: a buffer that is not parquet is invalid_text_repres
 
     REQUIRE(loaded.has_error());
     REQUIRE(loaded.error().type == core::error_code_t::invalid_text_representation);
+}
+
+namespace {
+
+// Counts the calls that reach it once closed: one after the load returned came from
+// something the load left running.
+class closing_resource final : public std::pmr::memory_resource {
+public:
+    void close() noexcept { closed_ = true; }
+    int calls_after_close() const noexcept { return late_calls_.load(); }
+
+private:
+    void* do_allocate(std::size_t bytes, std::size_t alignment) override {
+        count();
+        return std::pmr::new_delete_resource()->allocate(bytes, alignment);
+    }
+    void do_deallocate(void* p, std::size_t bytes, std::size_t alignment) override {
+        count();
+        std::pmr::new_delete_resource()->deallocate(p, bytes, alignment);
+    }
+    bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override { return this == &other; }
+    void count() noexcept {
+        if (closed_.load()) {
+            ++late_calls_;
+        }
+    }
+
+    std::atomic<bool> closed_{false};
+    std::atomic<int> late_calls_{0};
+};
+
+// A parquet file whose asynchronous reads (the reader's pre-buffering) run as Arrow's own do,
+// as a task of the executor the reader's IOContext names, which lets the read's future and its
+// buffer go only after it has woken the reader. The pause before it does makes that window wide
+// enough to be seen.
+class late_release_file final : public arrow::io::RandomAccessFile {
+public:
+    explicit late_release_file(std::shared_ptr<arrow::io::RandomAccessFile> file)
+        : file_(std::move(file)) {}
+
+    arrow::Status Close() override { return file_->Close(); }
+    bool closed() const override { return file_->closed(); }
+    arrow::Result<int64_t> Tell() const override { return file_->Tell(); }
+    arrow::Status Seek(int64_t position) override { return file_->Seek(position); }
+    arrow::Result<int64_t> GetSize() override { return file_->GetSize(); }
+    arrow::Result<int64_t> Read(int64_t nbytes, void* out) override { return file_->Read(nbytes, out); }
+    arrow::Result<std::shared_ptr<arrow::Buffer>> Read(int64_t nbytes) override { return file_->Read(nbytes); }
+    arrow::Result<int64_t> ReadAt(int64_t position, int64_t nbytes, void* out) override {
+        return file_->ReadAt(position, nbytes, out);
+    }
+    arrow::Result<std::shared_ptr<arrow::Buffer>> ReadAt(int64_t position, int64_t nbytes) override {
+        return file_->ReadAt(position, nbytes);
+    }
+
+    arrow::Future<std::shared_ptr<arrow::Buffer>>
+    ReadAsync(const arrow::io::IOContext& context, int64_t position, int64_t nbytes) override {
+        auto read = arrow::Future<std::shared_ptr<arrow::Buffer>>::Make();
+        auto spawned = context.executor()->Spawn([file = file_, read, position, nbytes]() mutable {
+            auto buffer = file->ReadAt(position, nbytes);
+            auto held = buffer.ok() ? *buffer : nullptr;
+            read.MarkFinished(std::move(buffer));
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            held.reset();
+            read = {};
+        });
+        if (!spawned.ok()) {
+            return arrow::Future<std::shared_ptr<arrow::Buffer>>::MakeFinished(spawned);
+        }
+        return read;
+    }
+
+private:
+    std::shared_ptr<arrow::io::RandomAccessFile> file_;
+};
+
+} // namespace
+
+TEST_CASE("parquet_to_chunk: nothing of the load reaches the resource after it returned") {
+    // The reads land on the caller's resource (the file is opened on its pool, as the path
+    // overload opens it); a read task still holding its buffer when the load returns would
+    // free it into a resource the caller may already have destroyed.
+    const std::string path = "/tmp/otterstax_test_parquet_to_chunk_late.parquet";
+    write_people_parquet(path);
+    closing_resource resource;
+    auto file = arrow::io::ReadableFile::Open(path, tsl::arrow_pool(&resource));
+    REQUIRE(file.ok());
+    {
+        auto loaded = tsl::parquet_to_chunk(&resource, std::make_shared<late_release_file>(*file));
+        REQUIRE_FALSE(loaded.has_error());
+        CHECK(otterstax::test::single(loaded.value()).size() == 5);
+    }
+    resource.close();
+    // Whatever Arrow's shared IO pool still runs for the load ends before the count.
+    static_cast<arrow::internal::ThreadPool*>(arrow::io::default_io_context().executor())->WaitForIdle();
+    CHECK(resource.calls_after_close() == 0);
+    std::filesystem::remove(path);
 }

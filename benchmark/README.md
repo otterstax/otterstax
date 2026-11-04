@@ -12,7 +12,7 @@ This directory contains three independent benchmark systems:
 
 ## Microbenchmarks (Google Benchmark)
 
-No Docker needed — builds and runs locally in seconds.
+No Docker needed — builds and runs locally.
 
 ```bash
 # All benchmarks, 5 reps
@@ -32,15 +32,15 @@ Results land in `benchmark_results/microbench/<YYYYMMDD_HHMMSS>/`:
 
 ### What is measured
 
-| Benchmark | Description | Typical mean |
-| --- | --- | --- |
-| `BM_ch_to_chunk_{100,1k,10k,100k}` | ClickHouse Block → `data_chunk_t` | 14 µs – 16 ms |
-| `BM_ch_to_chunk_multiblock_10k` | Multi-block merge path | ~1.6 ms |
-| `BM_ch_to_struct` | Schema extraction from ClickHouse Block | ~270 ns |
-| `BM_chunk_to_arrow_schema_{10,50}col` | `data_chunk_t` schema → Arrow schema | 540 ns – 2.6 µs |
-| `BM_mysql_type_mapping_all` | Full MySQL column-type enum mapping | ~33 ns |
-| `BM_parse_{simple_select,join_3table,cross_backend,subquery}` | `GreenplumParser::parse()` | 2–5 µs |
-| `BM_prepare_sql_{simple,cross_backend,subquery}` | `prepare_sql()` subquery extraction | 1.3–2.7 µs |
+| Benchmark | Description |
+| --- | --- |
+| `BM_ch_to_chunk_{100,1k,10k,100k}` | ClickHouse Block → `data_chunk_t` |
+| `BM_ch_to_chunk_multiblock_10k` | Multi-block merge path |
+| `BM_ch_to_struct` | Schema extraction from ClickHouse Block |
+| `BM_chunk_to_arrow_schema_{10,50}col` | `data_chunk_t` schema → Arrow schema |
+| `BM_mysql_type_mapping_all` | Full MySQL column-type enum mapping |
+| `BM_parse_{simple_select,join_3table,cross_backend,subquery}` | `GreenplumParser::parse()` |
+| `BM_prepare_sql_{simple,cross_backend,subquery}` | `prepare_sql()` subquery extraction |
 
 ### CLI reference
 
@@ -172,7 +172,7 @@ Generated  : 2026-06-01 14:32:11 UTC
 Commit     : d8fdb70...
 q          : OK
 rows       : 10
-elapsed_ms : 45.2
+elapsed_ms : <elapsed>
 ```
 
 ### 5. Stop services
@@ -186,16 +186,13 @@ elapsed_ms : 45.2
 
 ## Test categories
 
-| Test                 | What it measures                              | Typical latency |
-|----------------------|-----------------------------------------------|-----------------|
-| `simple_select`      | `LIMIT 100` point-read per table              | 2–50 ms         |
-| `complex_select`     | `GROUP BY` + `HAVING` + `ORDER BY LIMIT 1000` | 5–55 ms         |
-| `join_same_instance` | JOIN within the same engine instance          | 3–9 s           |
-| `join_cross_engine`  | JOIN across two different engine instances    | 3–5 s           |
-| `join_all`           | 3-way JOIN: MySQL + PostgreSQL + ClickHouse   | 47–90 s         |
-
-> **Note:** `join_all` is slow because OtterStax fetches entire tables and filters
-> in-process — there is no predicate pushdown to backends.
+| Test                 | What it measures                              |
+|----------------------|-----------------------------------------------|
+| `simple_select`      | `LIMIT 100` point-read per table              |
+| `complex_select`     | `GROUP BY` + `HAVING` + `ORDER BY LIMIT 1000` |
+| `join_same_instance` | JOIN within the same engine instance          |
+| `join_cross_engine`  | JOIN across two different engine instances    |
+| `join_all`           | 3-way JOIN: MySQL + PostgreSQL + ClickHouse   |
 
 ---
 

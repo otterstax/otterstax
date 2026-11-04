@@ -527,14 +527,17 @@ INSERT whose target, completed by the session's place, is `main.kafka.<obj>` pro
 - Flight SQL keeps no transaction across RPCs: a statement leaving its session inside a block is
   rolled back and refused.
 - A statement a frontend stopped waiting for (90 s, `asio_future_bridge.hpp`) runs to its end; inside
-  a block the frontend fails the block behind it (MySQL `ER_QUERY_TIMEOUT`).
+  a block the frontend fails the block behind it (MySQL `ER_QUERY_TIMEOUT`). A MySQL / PostgreSQL
+  connection that closes (quit, server stop, the client's socket gone) stops waiting at once and closes
+  its session: a statement waiting for a backend agent leaves the queue, a running one runs to its end.
 - A Spark session idle for `session_timeout_s` is closed (its block rolled back); its id is then
   refused `[INVALID_HANDLE.SESSION_CLOSED]`.
 - A COPY rolled back leaves its file / object written (files are not transactional).
 - Waiting is a poll: a settled actor-zeta future wakes nobody, so
-  the query session (sessions pool) and the engine's executor spin while a statement waits — ~3 CPU-s
-  per second of waiting (`[.engine-defect-otb-notify]`, `tests/session/test_session_lifetime.cpp`).
-  The backend actor's loop is woken by its agents.
+  the query session (sessions pool) and the engine's executor spin while a statement waits, burning
+  CPU for as long as it waits (`[.engine-defect-otb-notify]`, `tests/session/test_session_lifetime.cpp`).
+  The backend actor's loop is woken by its agents. The frontends' own poll backs off
+  (`await_backoff_t`: short steps first, then growing ones up to a cap).
 - Docker MariaDB volumes lag on cold start — `docker-run-tests.sh` waits up to 120 s.
 
 ## Critical Dependency Versions (`conanfile.py`)

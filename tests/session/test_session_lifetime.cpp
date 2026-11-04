@@ -426,11 +426,9 @@ TEST_CASE("session close: a statement waiting for a backend connection leaves th
 // statement held on its backend for a second must leave the process idle. In
 // actor-zeta 2.0.0 a cooperative actor suspended on a co_await is requeued on
 // every pass of its pool (completion is flag-only), so today both the session
-// on the sessions pool and the engine's executor on the exec pool spin: about
-// 3.1 CPU-seconds per second of waiting on an 18-core machine (otterbrix
-// 61aa43d6), against 0.03 with nothing in flight. Asserts the correct
-// behaviour; take the dot off once a settled future wakes the actor that
-// awaits it.
+// on the sessions pool and the engine's executor on the exec pool spin for as
+// long as the statement waits. Asserts the correct behaviour; take the dot off
+// once a settled future wakes the actor that awaits it.
 TEST_CASE("session wait: a statement held on its backend does not spin the pools", "[.engine-defect-otb-notify]") {
     auto options = slow_options();
     options.connectors.mysql = &gated_mysql_factory;

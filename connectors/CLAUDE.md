@@ -60,7 +60,8 @@ associated executor keeps them from destroying the final handler uninvoked (brok
 connect). `connectWithTimeout` spawns one `async_connect` under `cancel_after(10 s)` on the strand and
 runs the `io_context` on the calling thread (`run_one_for`) until it completed; `tryReconnect` makes
 three attempts 200 ms apart. A statement runs on the strand too (`runQuery_` → `runOnStrand_`), pinging
-first. `close()` uses the non-throwing `close(ec, diag)` (also from the destructor; a reset socket's
+first. Both spawn on the connector's own `strand_`, never `conn_.get_executor()`: a reconnect replaces
+the stream that executor is read from (a TSAN race over a multi-threaded `io_context`). `close()` uses the non-throwing `close(ec, diag)` (also from the destructor; a reset socket's
 `COM_QUIT` fails with `broken_pipe`, logged as `warn`). `tests/unit/utility/test_mysql_connector.cpp`
 pins both against a fake server.
 

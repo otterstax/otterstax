@@ -340,18 +340,16 @@ namespace {
     // so the race has threads to run on.
     size_t pool_threads() { return std::max<size_t>(8, std::thread::hardware_concurrency()); }
 
-    // Enough connects to hit the timed_cancel_op window on the unfixed code
-    // (observed at iterations 83..2913 over six runs on an 18-core macOS host,
-    // when a connect took ~0.2 ms). A connect now takes ~13 ms of wall time
-    // here, almost all of it idle: connectWithTimeout() re-checks its future
-    // only when run_one_for(10 ms) returns, and with the pool's threads taking
-    // the handlers this thread waits out the 10 ms. 10000 connects one after
-    // another were 117-136 s, past ctest's 120 s; the same 10000 connects from
-    // STRESS_DRIVERS threads at once — each a connector of its own, as every
-    // backend agent holds one — take a few seconds (2 s here: each driver's
-    // run_one_for also runs the others' handlers), and every connect still
-    // races its cancel_after timer against its completion on the pool's
-    // threads, the property under test, now with other connects beside it.
+    // Enough connects to hit the timed_cancel_op window on the unfixed code. A
+    // connect is mostly idle wall time: connectWithTimeout() re-checks its
+    // future only when run_one_for(10 ms) returns, and with the pool's threads
+    // taking the handlers this thread waits out the 10 ms. So the connects run
+    // from STRESS_DRIVERS threads at once rather than one after another, which
+    // would not fit ctest's 120 s — each driver a connector of its own, as every
+    // backend agent holds one, and each driver's run_one_for also running the
+    // others' handlers — and every connect still races its cancel_after timer
+    // against its completion on the pool's threads, the property under test,
+    // now with other connects beside it.
     constexpr int STRESS_DRIVERS = 10;
     constexpr int STRESS_ITERATIONS = 1000; // per driver
 

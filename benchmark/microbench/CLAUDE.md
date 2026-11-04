@@ -114,7 +114,7 @@ Input benchmarks use the **buffer** overloads so only the parse + `data_chunk_t`
 ### `bench_arrow_integration.cpp`
 
 The otterbrix Arrow integration of the file / S3 path, each benchmark next to the per-cell
-code it replaced — run over the same data in the same binary, so the speed-up is measured.
+code it replaced — both run over the same data in the same binary.
 Data: `id` int64, `score` double, `flag` bool, `name` utf8 (`name_<i>`, every 10th NULL); the
 output benchmarks use engine-shaped 1024-row chunks filled through `set_value`, on a
 `synchronized_pool_resource` (the engine's resource kind). All report `items_per_second`

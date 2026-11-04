@@ -15,8 +15,8 @@ stages:
     duration_s: 60
     ramp_secs: 2
     query_pool:
-      simple_select:  1   # 50% — LIMIT 100 point reads (2–50 ms)
-      complex_select: 1   # 50% — GROUP BY + HAVING + ORDER BY (5–55 ms)
+      simple_select:  1   # 50% — LIMIT 100 point reads
+      complex_select: 1   # 50% — GROUP BY + HAVING + ORDER BY
 
   - name: medium
     label: "Stage 2 — Medium Load (5 workers/frontend)"

@@ -230,7 +230,7 @@ benchmark_manual/<YYYYMMDD_HHMMSS>/
 │                       #   Commit     : d8fdb70...
 │                       #   my_query   : OK | ERROR
 │                       #   rows       : 500
-│                       #   elapsed_ms : 88445.0
+│                       #   elapsed_ms : <elapsed>
 └── <query_name>.json   # machine-readable record with the same fields
 ```
 
@@ -304,23 +304,21 @@ re-running an `external_*` benchmark, which regenerates them.)
 
 ## Test categories
 
-| Test                | Description                                           | Typical latency |
-|---------------------|-------------------------------------------------------|-----------------|
-| simple_select       | LIMIT 100 point-read per table                        | 2–50 ms         |
-| complex_select      | GROUP BY + HAVING + ORDER BY LIMIT 1000               | 5–55 ms         |
-| join_same_instance  | JOIN two tables in the same engine instance           | 15–45 ms        |
-| join_cross_engine   | JOIN Group B tables across different engine instances | 15–25 ms; ~0.9–1.1 s with ClickHouse |
-| join_all            | 3-engine JOIN (mysql1 × pg1/ch1 × ch2/mysql2)         | 0.15–0.55 s     |
+| Test                | Description                                           |
+|---------------------|-------------------------------------------------------|
+| simple_select       | LIMIT 100 point-read per table                        |
+| complex_select      | GROUP BY + HAVING + ORDER BY LIMIT 1000               |
+| join_same_instance  | JOIN two tables in the same engine instance           |
+| join_cross_engine   | JOIN Group B tables across different engine instances |
+| join_all            | 3-engine JOIN (mysql1 × pg1/ch1 × ch2/mysql2)         |
 
-(PostgreSQL frontend, 5 repetitions, medians per sub-test.) `join_same_instance`
-is one remote statement per sub-test: the JOIN of two tables of one server, its
+`join_same_instance` is one remote statement per sub-test: the JOIN of two tables of one server, its
 WHERE included, is pushed down whole. `join_cross_engine` and `join_all` JOIN
 tables of different servers, so the JOIN runs in the engine over what each
 server takes of its side (see "What the pushdown sends" below). The ClickHouse pairs of
 `join_cross_engine` JOIN keys of different types (ClickHouse `UInt32` against
 `INT`), which the engine hash-joins over a common cast type (done in
-otterbrix #850); the ~1 s in the table was measured before that and wants
-a new run.
+otterbrix #850).
 
 ## External-table tests (s3/file)
 
@@ -590,10 +588,9 @@ If you need a clean build and the remote is down, wait for it to come back.
 run `--rebuild` (keeps DB volumes) or `--clear` (also wipes DB data and reinitialises).
 
 **Log appears frozen during join_all**
-It should not: a `join_all` rep takes 0.15–0.55 s (see "What the pushdown sends"),
-and Python stdout is unbuffered
-(`PYTHONUNBUFFERED=1`), so output streams in real time. A rep that runs for tens of
-seconds is a regression worth profiling (`--perf`).
+It should not: Python stdout is unbuffered (`PYTHONUNBUFFERED=1`), so output
+streams in real time. A rep that seems stuck is worth profiling (`--perf`; what a
+`join_all` rep sends: "What the pushdown sends").
 
 **"Zone is ended twice" in Tracy captures**
 A zone that spans a `co_await` of a coroutine that can resume on another thread
@@ -673,13 +670,13 @@ stages:
 
 Valid `query_pool` keys:
 
-| Key | Description | Typical latency |
-| --- | ----------- | --------------- |
-| `simple_select` | `LIMIT 100` point reads across all 6 backends | 2–50 ms |
-| `complex_select` | `GROUP BY + HAVING + ORDER BY LIMIT 1000` | 5–55 ms |
-| `join_same_b` | Same-instance join, Group B only (~5 k rows) | 1–3 s |
-| `join_same_instance` | Same-instance join, both groups (up to 60 k rows) | 3–9 s |
-| `join_cross_engine` | Cross-engine join, Group B tables | 3–5 s |
+| Key | Description |
+| --- | ----------- |
+| `simple_select` | `LIMIT 100` point reads across all 6 backends |
+| `complex_select` | `GROUP BY + HAVING + ORDER BY LIMIT 1000` |
+| `join_same_b` | Same-instance join, Group B only (~5 k rows) |
+| `join_same_instance` | Same-instance join, both groups (up to 60 k rows) |
+| `join_cross_engine` | Cross-engine join, Group B tables |
 
 Built-in profiles in `benchmark/stress/profiles/`:
 

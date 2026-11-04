@@ -14,7 +14,7 @@
 #include <components/expressions/sort_expression.hpp>
 #include <components/logical_plan/node.hpp>
 #include <components/logical_plan/param_storage.hpp>
-#include <components/types/logical_value.hpp>
+#include <components/vector/vector_builders.hpp>
 #include <components/types/types.hpp>
 #include <core/result_wrapper.hpp>
 
@@ -251,8 +251,8 @@ namespace frontend::spark {
         }
 
         // Returns a NULL logical value bound to `resource`.
-        ct::logical_value_t null_value(std::pmr::memory_resource* resource) {
-            return ct::logical_value_t{resource, ct::complex_logical_type{ct::logical_type::NA}};
+        components::vector::vector_t null_value(std::pmr::memory_resource* resource) {
+            return components::vector::make_null(resource, ct::complex_logical_type{ct::logical_type::NA});
         }
 
         // --- comparisons in the transformer's form --------------------------------
@@ -384,30 +384,30 @@ namespace frontend::spark {
         expr_result handle_literal(const sc::Expression::Literal& lit,
                                    cl::parameter_node_ptr params,
                                    std::pmr::memory_resource* resource) {
-            ct::logical_value_t value = null_value(resource);
+            components::vector::vector_t value = null_value(resource);
             switch (lit.literal_type_case()) {
                 case sc::Expression::Literal::kNull:
                     break;
                 case sc::Expression::Literal::kBoolean:
-                    value = ct::logical_value_t{resource, lit.boolean()};
+                    value = components::vector::make_scalar(resource, lit.boolean());
                     break;
                 case sc::Expression::Literal::kByte:
-                    value = ct::logical_value_t{resource, static_cast<int64_t>(lit.byte())};
+                    value = components::vector::make_scalar(resource, static_cast<int64_t>(lit.byte()));
                     break;
                 case sc::Expression::Literal::kShort:
-                    value = ct::logical_value_t{resource, static_cast<int64_t>(lit.short_())};
+                    value = components::vector::make_scalar(resource, static_cast<int64_t>(lit.short_()));
                     break;
                 case sc::Expression::Literal::kInteger:
-                    value = ct::logical_value_t{resource, static_cast<int64_t>(lit.integer())};
+                    value = components::vector::make_scalar(resource, static_cast<int64_t>(lit.integer()));
                     break;
                 case sc::Expression::Literal::kLong:
-                    value = ct::logical_value_t{resource, static_cast<int64_t>(lit.long_())};
+                    value = components::vector::make_scalar(resource, static_cast<int64_t>(lit.long_()));
                     break;
                 case sc::Expression::Literal::kFloat:
-                    value = ct::logical_value_t{resource, static_cast<double>(lit.float_())};
+                    value = components::vector::make_scalar(resource, static_cast<double>(lit.float_()));
                     break;
                 case sc::Expression::Literal::kDouble:
-                    value = ct::logical_value_t{resource, lit.double_()};
+                    value = components::vector::make_scalar(resource, lit.double_());
                     break;
                 case sc::Expression::Literal::kDecimal: {
                     const std::string& dval = lit.decimal().value();
@@ -416,23 +416,23 @@ namespace frontend::spark {
                     if (res.ec != std::errc{}) {
                         return bad_expr("Spark decimal literal is not a valid number", resource);
                     }
-                    value = ct::logical_value_t{resource, parsed};
+                    value = components::vector::make_scalar(resource, parsed);
                     break;
                 }
                 case sc::Expression::Literal::kString:
-                    value = ct::logical_value_t{resource, std::string{lit.string()}};
+                    value = components::vector::make_scalar(resource, std::string_view{lit.string()});
                     break;
                 case sc::Expression::Literal::kBinary:
-                    value = ct::logical_value_t{resource, std::string{lit.binary()}};
+                    value = components::vector::make_scalar(resource, std::string_view{lit.binary()});
                     break;
                 case sc::Expression::Literal::kDate:
-                    value = ct::logical_value_t{resource, static_cast<int64_t>(lit.date())};
+                    value = components::vector::make_scalar(resource, static_cast<int64_t>(lit.date()));
                     break;
                 case sc::Expression::Literal::kTimestamp:
-                    value = ct::logical_value_t{resource, static_cast<int64_t>(lit.timestamp())};
+                    value = components::vector::make_scalar(resource, static_cast<int64_t>(lit.timestamp()));
                     break;
                 case sc::Expression::Literal::kTimestampNtz:
-                    value = ct::logical_value_t{resource, static_cast<int64_t>(lit.timestamp_ntz())};
+                    value = components::vector::make_scalar(resource, static_cast<int64_t>(lit.timestamp_ntz()));
                     break;
                 default:
                     return unsupported("unsupported Spark literal type", resource);
@@ -440,7 +440,7 @@ namespace frontend::spark {
 
             // Materialise the value into the parameter store and reference it from a
             // constant scalar expression — mirrors the SQL transformer's T_A_Const path.
-            const auto id = params->add_parameter(std::move(value));
+            const auto id = params->add_parameter(std::move(value), components::vector::parameter_kind::literal);
             auto expr = ce::make_scalar_expression(resource, ce::scalar_type::constant, ce::key_t{resource});
             expr->append_param(id);
             return expr;
@@ -487,8 +487,9 @@ namespace frontend::spark {
                             return child;
                         }
                         // Spark's Average casts its input to DOUBLE (DECIMAL aside) and answers
-                        // DOUBLE. The engine's avg answers its input's type and divides in it,
-                        // so over an integer column it would drop the fraction.
+                        // DOUBLE. The engine's avg answers DOUBLE for an integer argument, but
+                        // FLOAT for a FLOAT and DECIMAL for a DECIMAL; the cast answers DOUBLE
+                        // for every one of them.
                         if (function == "avg") {
                             agg->append_param(as_double(child.value(), resource));
                             continue;
@@ -564,7 +565,7 @@ namespace frontend::spark {
                     }
                     // is_null/is_not_null carry no real RHS; use a NULL placeholder param,
                     // matching the SQL transformer's NullTest lowering.
-                    const auto dummy = params->add_parameter(null_value(resource));
+                    const auto dummy = params->add_parameter(null_value(resource), components::vector::parameter_kind::literal);
                     return ce::make_compare_expression(resource, cls.ctype, as_operand(child.value(), resource), dummy);
                 }
                 case func_kind_t::in_list: {
@@ -638,7 +639,9 @@ namespace frontend::spark {
                         }
                         fargs.push_back(child.value());
                     }
-                    return ce::make_function_expression(resource, ascii_lower_std(name), std::move(fargs));
+                    return ce::make_function_expression(resource,
+                                                        function_qualified_name_t{core::function_name_t{ascii_lower_std(name)}},
+                                                        std::move(fargs));
                 }
             }
             return unsupported("unsupported Spark function kind", resource);

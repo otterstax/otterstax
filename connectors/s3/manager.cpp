@@ -49,7 +49,7 @@ make_s3fs(std::pmr::memory_resource* res, const connect_params& creds) {
 }
 
 core::error_t unknown_alias(std::pmr::memory_resource* res, std::string_view op, std::string_view alias) {
-    return tsl::make_error(res, core::error_code_t::do_not_exists,
+    return tsl::make_error(res, core::error_code_t::undefined_object,
                            std::string{op} + ": unknown alias '" + std::string{alias} + "'");
 }
 
@@ -83,7 +83,7 @@ ConnectorManager::ConnectorManager(std::pmr::memory_resource* res)
         log_->warn("EnsureS3Initialized: {}", status.ToString());
 }
 
-core::result_wrapper_t<std::shared_ptr<arrow::fs::S3FileSystem>>
+core::result_wrapper_t<arrow::fs::S3FileSystem*>
 ConnectorManager::filesystem_for(std::string_view op, std::string_view alias) {
     OTX_ZONE_N("s3::ConnectorManager::filesystem_for");
     auto creds = credentials_store_.find(alias);
@@ -92,14 +92,14 @@ ConnectorManager::filesystem_for(std::string_view op, std::string_view alias) {
         return unknown_alias(resource(), op, alias);
     }
     if (auto cached = filesystems_.find(alias); cached != filesystems_.end()) {
-        return cached->second;
+        return cached->second.get();
     }
     auto made = make_s3fs(resource(), creds->second);
     if (!made.ok()) {
         return tsl::arrow_error(resource(), core::error_code_t::io_error, op, made.status());
     }
     std::pmr::string key{alias, resource()};
-    return filesystems_.emplace(std::move(key), std::move(*made)).first->second;
+    return filesystems_.emplace(std::move(key), std::move(*made)).first->second.get();
 }
 
 std::pair<bool, actor_zeta::detail::enqueue_result>
@@ -175,7 +175,7 @@ ConnectorManager::list(session_hash_t id, std::string alias, std::string s3_path
     if (fs_result.has_error()) {
         co_return fs_result.convert_error<std::pmr::vector<std::pmr::string>>();
     }
-    const auto& fs = fs_result.value();
+    auto* fs = fs_result.value();
 
     arrow::fs::FileSelector sel;
     sel.base_dir       = s3_path;
@@ -197,36 +197,36 @@ ConnectorManager::list(session_hash_t id, std::string alias, std::string s3_path
     co_return std::move(paths);
 }
 
-actor_zeta::unique_future<core::result_wrapper_t<std::shared_ptr<arrow::io::RandomAccessFile>>>
+actor_zeta::unique_future<core::result_wrapper_t<tsl::input_stream_t>>
 ConnectorManager::open_input(session_hash_t id, std::string alias, std::string s3_path) {
     OTX_ZONE_N("s3::ConnectorManager::open_input");
     log_->trace("ConnectorManager::open_input with params:\n Session ID: {}\n Alias: {}\n S3 Path: {}", id, alias, s3_path);
     auto fs = filesystem_for("open_input", alias);
     if (fs.has_error()) {
-        co_return fs.convert_error<std::shared_ptr<arrow::io::RandomAccessFile>>();
+        co_return fs.convert_error<tsl::input_stream_t>();
     }
     auto opened = fs.value()->OpenInputFile(s3_path);
     if (!opened.ok()) {
         co_return tsl::arrow_error(resource(), core::error_code_t::io_error, "open_input", opened.status());
     }
     log_->debug("open_input: s3://{}", s3_path);
-    co_return std::move(*opened);
+    co_return tsl::input_stream_t{std::move(*opened)};
 }
 
-actor_zeta::unique_future<core::result_wrapper_t<std::shared_ptr<arrow::io::OutputStream>>>
+actor_zeta::unique_future<core::result_wrapper_t<tsl::output_stream_t>>
 ConnectorManager::open_output(session_hash_t id, std::string alias, std::string s3_path) {
     OTX_ZONE_N("s3::ConnectorManager::open_output");
     log_->trace("ConnectorManager::open_output with params:\n Session ID: {}\n Alias: {}\n S3 Path: {}", id, alias, s3_path);
     auto fs = filesystem_for("open_output", alias);
     if (fs.has_error()) {
-        co_return fs.convert_error<std::shared_ptr<arrow::io::OutputStream>>();
+        co_return fs.convert_error<tsl::output_stream_t>();
     }
     auto opened = fs.value()->OpenOutputStream(s3_path);
     if (!opened.ok()) {
         co_return tsl::arrow_error(resource(), core::error_code_t::io_error, "open_output", opened.status());
     }
     log_->debug("open_output: s3://{}", s3_path);
-    co_return std::move(*opened);
+    co_return tsl::output_stream_t{std::move(*opened)};
 }
 
 } // namespace conn::s3

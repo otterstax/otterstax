@@ -40,10 +40,10 @@ ALL_TESTS=("${DEFAULT_TESTS[@]}"
            kafka_ingest kafka_produce kafka_stream)
 TESTS=("${DEFAULT_TESTS[@]}")
 BENCH_FILTER=()   # populated by --bench; empty = run default tests
-# arrow is excluded by default: OtterStax FlightSQL serializer crashes on JOIN
-# result sets > ~1000 rows.  Re-add with --frontend arrow once the bug is fixed.
+# arrow (Flight SQL) has the five cross-backend tests only: a test without a
+# benchmarks/<frontend>/<test>.py (external_*, kafka_* over arrow) is skipped.
 ALL_FRONTENDS=(mysql postgres arrow)
-DEFAULT_FRONTENDS=(mysql postgres)
+DEFAULT_FRONTENDS=(mysql postgres arrow)
 _frontend_port() {
     case "$1" in
         mysql)   echo 8816 ;;
@@ -65,8 +65,9 @@ Both Docker images are reused automatically when they already exist.
 Options:
   --repetitions N     Repetitions per sub-test query (default: 10)
   --frontend F        Frontend to run: mysql | postgres | arrow
-                      May be repeated. Default: mysql postgres.
-                      arrow is excluded by default (FlightSQL JOIN bug — see CLAUDE.md).
+                      May be repeated. Default: mysql postgres arrow.
+                      arrow runs the five cross-backend tests only (external_* /
+                      kafka_* have no arrow script and are skipped for it).
   --bench T           Test(s) to run: simple_select | complex_select |
                       join_same_instance | join_cross_engine | join_all |
                       external_load | external_join | external_dump |
@@ -370,7 +371,11 @@ _wait_otterstax() {
 # ---------------------------------------------------------------------------
 _register_connections() {
     echo "Connections read from benchmark/config.yaml at startup (no runtime registration)."
-    $EXTERNAL_ENABLED && _register_s3_credentials
+    # An `a && b` list as the last command would be the function's status: false
+    # without external tests, which `set -e` turns into the end of the script.
+    if $EXTERNAL_ENABLED; then
+        _register_s3_credentials
+    fi
 }
 
 # The bench RustFS s3 alias ('bench_rustfs') is likewise declared in
@@ -692,6 +697,7 @@ echo ""
 
 PASS=0
 FAIL=0
+SKIP=0
 
 for frontend in "${FRONTENDS[@]}"; do
     port="$(_frontend_port "$frontend")"
@@ -699,6 +705,12 @@ for frontend in "${FRONTENDS[@]}"; do
 
         echo ""
         echo "--- $frontend / $test (port $port) ---"
+
+        if [ ! -f "$BENCH_DIR/benchmarks/$frontend/$test.py" ]; then
+            echo "  SKIP: $frontend/$test (no benchmarks/$frontend/$test.py)"
+            SKIP=$((SKIP + 1))
+            continue
+        fi
 
         if $TRACY_SEP; then
             tracy_out="${frontend}_${test}.tracy"
@@ -787,7 +799,7 @@ docker run --rm \
     python /app/scripts/generate_summary.py /results
 
 echo ""
-echo "=== Benchmark complete: $PASS passed, $FAIL failed ==="
+echo "=== Benchmark complete: $PASS passed, $FAIL failed, $SKIP skipped ==="
 echo "    Results: $OUT_DIR"
 echo ""
 

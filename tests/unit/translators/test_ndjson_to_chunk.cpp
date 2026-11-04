@@ -2,6 +2,8 @@
 // Copyright 2025-2026  OtterStax
 
 #include "otterbrix/translators/input/ndjson_to_chunk.hpp"
+#include "single_chunk.hpp"
+#include "../../mock/cell.hpp"
 
 #include <catch2/catch_all.hpp>
 
@@ -33,7 +35,7 @@ data_chunk_t parse(const std::string& s) {
     auto loaded = tsl::ndjson_to_chunk(std::pmr::new_delete_resource(),
                                        reinterpret_cast<const uint8_t*>(s.data()), s.size());
     REQUIRE_FALSE(loaded.has_error());
-    return std::move(loaded.value());
+    return std::move(otterstax::test::single(loaded.value()));
 }
 
 } // namespace
@@ -49,10 +51,10 @@ TEST_CASE("ndjson_to_chunk: buffer overload parses NDJSON columns, rows and valu
     REQUIRE(id >= 0);
     REQUIRE(nm >= 0);
 
-    REQUIRE(chunk.value(id, 0).value<int64_t>() == 1);
-    REQUIRE(chunk.value(id, 2).value<int64_t>() == 3);
-    REQUIRE(chunk.value(nm, 0).value<std::string_view>() == "Alice");
-    REQUIRE(chunk.value(nm, 2).value<std::string_view>() == "Charlie");
+    REQUIRE(otterstax::test::cell(chunk, id, 0).value<int64_t>() == 1);
+    REQUIRE(otterstax::test::cell(chunk, id, 2).value<int64_t>() == 3);
+    REQUIRE(otterstax::test::cell(chunk, nm, 0).value<std::string_view>() == "Alice");
+    REQUIRE(otterstax::test::cell(chunk, nm, 2).value<std::string_view>() == "Charlie");
 }
 
 TEST_CASE("ndjson_to_chunk: buffer overload unwraps a JSON array") {
@@ -60,8 +62,8 @@ TEST_CASE("ndjson_to_chunk: buffer overload unwraps a JSON array") {
 
     REQUIRE(chunk.column_count() == 2);
     REQUIRE(chunk.size() == 2);
-    REQUIRE(chunk.value(col(chunk, "id"), 1).value<int64_t>() == 2);
-    REQUIRE(chunk.value(col(chunk, "name"), 1).value<std::string_view>() == "Bob");
+    REQUIRE(otterstax::test::cell(chunk, col(chunk, "id"), 1).value<int64_t>() == 2);
+    REQUIRE(otterstax::test::cell(chunk, col(chunk, "name"), 1).value<std::string_view>() == "Bob");
 }
 
 TEST_CASE("ndjson_to_chunk: buffer overload unwraps a JSON array with surrounding whitespace") {
@@ -69,7 +71,7 @@ TEST_CASE("ndjson_to_chunk: buffer overload unwraps a JSON array with surroundin
 
     REQUIRE(chunk.column_count() == 2);
     REQUIRE(chunk.size() == 2);
-    REQUIRE(chunk.value(col(chunk, "id"), 0).value<int64_t>() == 1);
+    REQUIRE(otterstax::test::cell(chunk, col(chunk, "id"), 0).value<int64_t>() == 1);
 }
 
 TEST_CASE("ndjson_to_chunk: file overload reads NDJSON") {
@@ -78,11 +80,11 @@ TEST_CASE("ndjson_to_chunk: file overload reads NDJSON") {
 
     auto loaded = tsl::ndjson_to_chunk(std::pmr::new_delete_resource(), path);
     REQUIRE_FALSE(loaded.has_error());
-    const auto& chunk = loaded.value();
+    const auto& chunk = otterstax::test::single(loaded.value());
 
     REQUIRE(chunk.column_count() == 2);
     REQUIRE(chunk.size() == 3);
-    REQUIRE(chunk.value(col(chunk, "id"), 1).value<int64_t>() == 2);
+    REQUIRE(otterstax::test::cell(chunk, col(chunk, "id"), 1).value<int64_t>() == 2);
 
     std::filesystem::remove(path);
 }
@@ -94,13 +96,13 @@ TEST_CASE("ndjson_to_chunk: a missing file is io_error") {
     REQUIRE(loaded.error().type == core::error_code_t::io_error);
 }
 
-TEST_CASE("ndjson_to_chunk: a malformed body is conversion_failure") {
+TEST_CASE("ndjson_to_chunk: a malformed body is invalid_text_representation") {
     const std::string bad = "{\"id\":1,\"name\":\"Alice\"\n{\"id\":2}\n";
     auto loaded = tsl::ndjson_to_chunk(std::pmr::new_delete_resource(),
                                        reinterpret_cast<const uint8_t*>(bad.data()), bad.size());
 
     REQUIRE(loaded.has_error());
-    REQUIRE(loaded.error().type == core::error_code_t::conversion_failure);
+    REQUIRE(loaded.error().type == core::error_code_t::invalid_text_representation);
 }
 
 TEST_CASE("ndjson_to_chunk: a bare integer past int64 is read as a double, losing digits") {
@@ -113,7 +115,7 @@ TEST_CASE("ndjson_to_chunk: a bare integer past int64 is read as a double, losin
     const int wide = col(chunk, "wide");
     REQUIRE(wide >= 0);
     REQUIRE(chunk.types()[wide].type() == components::types::logical_type::DOUBLE);
-    REQUIRE(chunk.value(wide, 0).value<double>() == 18446744073709551616.0);
+    REQUIRE(otterstax::test::cell(chunk, wide, 0).value<double>() == 18446744073709551616.0);
 }
 
 TEST_CASE("ndjson_to_chunk: a quoted 128-bit integer keeps every digit") {
@@ -125,8 +127,8 @@ TEST_CASE("ndjson_to_chunk: a quoted 128-bit integer keeps every digit") {
     const int wide = col(chunk, "wide");
     REQUIRE(wide >= 0);
     REQUIRE(chunk.types()[wide].type() == components::types::logical_type::STRING_LITERAL);
-    REQUIRE(chunk.value(wide, 0).value<std::string_view>() == "18446744073709551616");
-    REQUIRE(chunk.value(wide, 1).value<std::string_view>() == "-170141183460469231731687303715884105728");
+    REQUIRE(otterstax::test::cell(chunk, wide, 0).value<std::string_view>() == "18446744073709551616");
+    REQUIRE(otterstax::test::cell(chunk, wide, 1).value<std::string_view>() == "-170141183460469231731687303715884105728");
 }
 
 TEST_CASE("ndjson_to_chunk: a lone '[' does not crash and is reported") {
@@ -135,5 +137,5 @@ TEST_CASE("ndjson_to_chunk: a lone '[' does not crash and is reported") {
                                        reinterpret_cast<const uint8_t*>(bad.data()), bad.size());
 
     REQUIRE(loaded.has_error());
-    REQUIRE(loaded.error().type == core::error_code_t::conversion_failure);
+    REQUIRE(loaded.error().type == core::error_code_t::invalid_text_representation);
 }

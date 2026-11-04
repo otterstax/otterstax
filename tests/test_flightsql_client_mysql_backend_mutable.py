@@ -37,6 +37,17 @@ def validate_by_request(client, test_query, expected_schema):
             print(f"Warning: Field '{field_name}' has type {field_type}, expected {expected_schema[field_name]}")
             raise TypeError(f"Field '{field_name}' has type {field_type}, expected {expected_schema[field_name]}")
 
+def expect_refused(client, test_query, needle):
+    """GetFlightInfo refuses `test_query` with an error naming `needle`."""
+    try:
+        client.execute(test_query)
+    except pa.ArrowException as e:
+        if needle not in str(e):
+            raise AssertionError(f"the refusal of {test_query!r} must mention {needle!r}: {e}")
+        print(f"  refused as expected: {str(e).splitlines()[0]}")
+        return
+    raise AssertionError(f"{test_query!r} must be refused")
+
 # This script is designed to test the functionality of the FlightSQLServer
 def main(local=False):
     # Select host based on local flag
@@ -56,34 +67,34 @@ def main(local=False):
         'temp_int': pa.int64()
     }
 
-    test_query_1 = "CREATE TABLE campaigns.db1.temp_table (temp_int int);"
+    test_query_1 = "CREATE TABLE campaigns.db1.public.temp_table (temp_int int);"
     validate_by_request(client, test_query_1, expected_schema)
 
-    test_query_2 = "INSERT INTO campaigns.db1.temp_table (temp_int) VALUES (8888);"
+    test_query_2 = "INSERT INTO campaigns.db1.public.temp_table (temp_int) VALUES (8888);"
     validate_by_request(client, test_query_2, expected_schema)
 
-    test_query_3 = "INSERT INTO campaigns.db1.temp_table (temp_int) \
+    test_query_3 = "INSERT INTO campaigns.db1.public.temp_table (temp_int) \
 VALUES (1), (2), (3), (4);"
     validate_by_request(client, test_query_3, expected_schema)
 
-    test_query_4 = "UPDATE campaigns.db1.temp_table SET temp_int = temp_int * 1000 WHERE temp_int < 1000;"
+    test_query_4 = "UPDATE campaigns.db1.public.temp_table SET temp_int = temp_int * 1000 WHERE temp_int < 1000;"
     validate_by_request(client, test_query_4, expected_schema)
 
-    test_query_5 = "DELETE FROM campaigns.db1.temp_table WHERE temp_int >= 8888;"
+    test_query_5 = "DELETE FROM campaigns.db1.public.temp_table WHERE temp_int >= 8888;"
     validate_by_request(client, test_query_5, expected_schema)
 
-    test_query_6 = "INSERT INTO campaigns.db1.temp_table (temp_int) \
-SELECT * FROM campaigns.db1.temp_table \
+    test_query_6 = "INSERT INTO campaigns.db1.public.temp_table (temp_int) \
+SELECT * FROM campaigns.db1.public.temp_table \
 WHERE temp_int = 1000;"
     validate_by_request(client, test_query_6, expected_schema)
 
-    test_query_7 = "CREATE INDEX temp_index ON campaigns.db1.temp_table (temp_int);"
-    validate_by_request(client, test_query_7, expected_schema)
+    # The engine keeps no index of a table of a connection: CREATE INDEX on a
+    # remote table is unimplemented_yet (otterbrix services/collection/executor.cpp,
+    # "indexes and constraints are not kept for a table of connection").
+    test_query_7 = "CREATE INDEX temp_index ON campaigns.db1.public.temp_table (temp_int);"
+    expect_refused(client, test_query_7, "indexes and constraints are not kept")
 
-    test_query_8 = "DROP INDEX campaigns.db1.temp_table.temp_index;"
-    validate_by_request(client, test_query_8, expected_schema)
-
-    test_query_9 = "DROP TABLE campaigns.db1.temp_table;"
+    test_query_9 = "DROP TABLE campaigns.db1.public.temp_table;"
     validate_by_request(client, test_query_9, expected_schema)
 
 def main_test():

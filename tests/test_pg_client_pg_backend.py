@@ -26,7 +26,9 @@ class client:
             'port': 8817,
             'user': 'testuser',
             'password': 'testpass',
-            'dbname': 'products',  # PostgreSQL backend database
+            # The engine database the session is placed in (main.public); an
+            # unknown one is FATAL 3D000. The remote tables are named in full.
+            'dbname': 'main',
         }
         self.test_database = 'products.pgdb.public'
         self.test_table = 'postgresql_test_table'
@@ -166,8 +168,7 @@ class client:
         having changed the backend. Asserted on three wire shapes: psycopg2 goes
         through simple query, psycopg3-with-parameters through Bind/Execute on
         the unnamed statement, and `prepare=True` through a NAMED statement that
-        is Parsed once and Executed repeatedly (the worker drops a statement
-        after it ran, so every later Execute is a re-prepare).
+        is Parsed once and Executed repeatedly.
         """
         table = f"{self.test_database}.{self.test_table}"
 
@@ -360,8 +361,61 @@ class client:
         except Exception as e:
             raise ValueError("psycopg3 prepared queries threw: " + str(e))
 
+    def test_cte_over_a_remote_table(self):
+        """Test 8: a CTE (WITH) over a remote table answers what the same filter answers directly."""
+        products = "products.pgdb.public.products"
+        with self.psycopg2_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(f"SELECT COUNT(product_id) FROM {products} WHERE price < 100")
+            direct = cursor.fetchall()[0][0]
+            cursor.execute(
+                f"WITH cheap AS (SELECT product_id, price FROM {products} WHERE price < 100) "
+                f"SELECT COUNT(product_id) FROM cheap")
+            self.assert_equal(cursor.fetchall()[0][0], direct, "CTE over a remote table")
+            if direct == 0:
+                raise ValueError("the fixture holds no product under 100: the CTE check proves nothing")
+            print(f"CTE over {products}: {direct} rows ✓")
+
+    def test_remote_table_in_a_subquery(self):
+        """Test 9: a remote table inside IN (SELECT ...) and EXISTS (SELECT ...)."""
+        products = "products.pgdb.public.products"
+        with self.psycopg2_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(f"SELECT COUNT(product_id) FROM {products}")
+            total = cursor.fetchall()[0][0]
+            cursor.execute(f"SELECT COUNT(product_id) FROM {products} WHERE price < 100")
+            cheap = cursor.fetchall()[0][0]
+
+            cursor.execute(
+                f"SELECT COUNT(product_id) FROM {products} "
+                f"WHERE product_id IN (SELECT product_id FROM {products} WHERE price < 100)")
+            self.assert_equal(cursor.fetchall()[0][0], cheap, "IN (SELECT ...) over a remote table")
+
+            # Prices are 9.99 .. 499.99 (create_test_data.py): EXISTS of a cheap
+            # product keeps every row, EXISTS of a negative price keeps none.
+            cursor.execute(
+                f"SELECT COUNT(product_id) FROM {products} "
+                f"WHERE EXISTS (SELECT product_id FROM {products} WHERE price < 100)")
+            self.assert_equal(cursor.fetchall()[0][0], total, "EXISTS (true) over a remote table")
+            cursor.execute(
+                f"SELECT COUNT(product_id) FROM {products} "
+                f"WHERE EXISTS (SELECT product_id FROM {products} WHERE price < 0)")
+            self.assert_equal(cursor.fetchall()[0][0], 0, "EXISTS (false) over a remote table")
+            print(f"remote table in IN / EXISTS sub-queries: {cheap} / {total} rows ✓")
+
+    def test_fully_qualified_column_of_a_remote_table(self):
+        """Test 10: a column qualified with the remote table's whole four-part name, as FROM writes it."""
+        products = "products.pgdb.public.products"
+        with self.psycopg2_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(f"SELECT product_id FROM {products} ORDER BY product_id")
+            expected = cursor.fetchall()
+            cursor.execute(f"SELECT {products}.product_id FROM {products} ORDER BY product_id")
+            self.assert_equal(cursor.fetchall(), expected, "five-part column reference")
+            print(f"SELECT {products}.product_id FROM {products}: {len(expected)} rows ✓")
+
     def cleanup_test_data(self):
-        """Test 8: Cleanup - DROP TABLE"""
+        """Cleanup - DROP TABLE"""
         try:
             with self.psycopg2_connection() as conn:
                 cursor = conn.cursor()
@@ -382,6 +436,9 @@ class client:
             self.test_character_encoding()
             self.test_protocol_capability_flags()
             self.test_prepared_queries_psycopg3()
+            self.test_cte_over_a_remote_table()
+            self.test_remote_table_in_a_subquery()
+            self.test_fully_qualified_column_of_a_remote_table()
             print("\033[92mTest success.\033[0m")
         except Exception as e:
             print(f"\033[91mAn error occurred: {e}\033[0m")

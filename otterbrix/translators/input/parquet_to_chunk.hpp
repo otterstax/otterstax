@@ -2,7 +2,7 @@
 // Copyright 2025-2026  OtterStax
 
 #pragma once
-#include <otterbrix/otterbrix.hpp>
+#include <integration/cpp/otterbrix.hpp>
 #include <core/result_wrapper.hpp>
 
 // Clash between otterbrix parser and arrow
@@ -17,19 +17,21 @@
 
 namespace tsl {
 
+// Each answers the file as a run of chunks of at most DEFAULT_VECTOR_CAPACITY rows
+// (arrow_to_chunk.hpp; an empty file is one chunk of its columns and no row).
 // Error messages are owned by `res`; a file that cannot be opened is io_error, a
-// body the parquet reader rejects is conversion_failure, an empty buffer is
+// body the parquet reader rejects is invalid_text_representation, an empty buffer is
 // invalid_parameter. Arrow's own buffers are allocated on `res` too
 // (arrow_memory_pool.hpp), so it must be thread-safe.
-core::result_wrapper_t<components::vector::data_chunk_t>
+core::result_wrapper_t<std::pmr::vector<components::vector::data_chunk_t>>
 parquet_to_chunk(std::pmr::memory_resource* res, const std::string& file_path);
 
-core::result_wrapper_t<components::vector::data_chunk_t>
+core::result_wrapper_t<std::pmr::vector<components::vector::data_chunk_t>>
 parquet_to_chunk(std::pmr::memory_resource* res, const uint8_t* data, size_t size);
 
 // Any random-access source — a local file, an S3 object (ranged reads), a buffer.
 // A null input is invalid_parameter.
-core::result_wrapper_t<components::vector::data_chunk_t>
+core::result_wrapper_t<std::pmr::vector<components::vector::data_chunk_t>>
 parquet_to_chunk(std::pmr::memory_resource* res, std::shared_ptr<arrow::io::RandomAccessFile> input);
 
 // Schema only, without reading the row groups.

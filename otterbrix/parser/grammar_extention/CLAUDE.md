@@ -19,7 +19,7 @@ Two extensions live here:
 Both recognise:
 
 ```sql
-CREATE EXTERNAL TABLE <db>.<table> WITH ( s3_alias = '…', location = '…', format = '…' );
+CREATE EXTERNAL TABLE [[[connection.]database.]schema.]table WITH ( s3_alias = '…', location = '…', format = '…' );
 COPY (<select>) TO '<location>' WITH ( s3_alias = '…', format = '…' );
 ```
 
@@ -98,34 +98,35 @@ Built as part of the normal build:
 ## Registration and routing (wired)
 
 `GreenplumParser` (`otterbrix/parser/parser.{hpp,cpp}`) holds a `parser_extension_registry_t registry_`,
-registers `make_s3_extension()` / `make_file_extension()` in its constructor, calls the 3-arg
-`raw_parser(arena, sql, registry_)`, and constructs the transformer as `transformer(resource_, nullptr,
-&registry_)`. `otterbrix::s3_extension` / `otterbrix::file_extension` are linked into `otterbrix_local`
-(`otterbrix/CMakeLists.txt`). `prepare_sql`'s core-parser pass throws on this syntax and is swallowed
-gracefully, so the registry-aware `raw_parser` does the real parse.
+registers `make_s3_extension()` / `make_file_extension()` (and the Kafka extension) in its constructor,
+calls the 3-arg `raw_parser(arena, sql, registry_)` and constructs the transformer over the same
+registry. `otterbrix::s3_extension` / `otterbrix::file_extension` are linked into `otterbrix_local`
+(`otterbrix/CMakeLists.txt`).
 
 `transform()` lowers each statement into an `otterstax::external::external_node_t` (defined header-only in
-`grammar_extention/external_node.hpp`, tagged `node_type::unused` like `schema_node_t`) carrying
-`op` (create/copy), database, table, location, s3_alias, format, inner_sql. The `Worker`
-(`scheduler/worker.cpp`) — sitting behind the `Scheduler` router in the Scheduler→Worker pool —
-detects it via `dynamic_cast` in `execute` / `execute_statement` / `prepare_schema` and routes through
-`Worker::handle_external_statement`:
+`grammar_extention/external_node.hpp`, tagged `node_type::unused` like `kafka_node_t`) carrying
+`op` (create/copy), the target (`external_target`: one to four parts as written, unquoted identifiers
+folded to lower case, placed as otterbrix places them — `t`, `s.t`, `d.s.t`, `c.d.s.t`; a fifth part is
+refused at parse with otterbrix's wording), location, s3_alias, format, inner_sql. The connection's query session
+(`session/query_session.cpp`) detects it through `ParsedQueryData::extension_kind` and routes by the
+node's op to `query_session_t::load_external_table` / `copy_to` (`session/CLAUDE.md`):
 
-- **CREATE EXTERNAL TABLE** loads the file/object into the engine table — `db::S3Manager::download`
-  (s3://) or `conn::file::FileManager::add_file` (local path).
-- **`COPY (<select>) TO`** parses `inner_sql` and exports the result — `db::S3Manager::upload` or
-  `conn::file::FileManager::dump_file` (both take the pre-parsed `OtterbrixStatementPtr`, run via
-  `db::OtterbrixManager::execute`).
+- **CREATE EXTERNAL TABLE** reads the file/object into a run of chunks (at most 1024 rows each,
+  `otterbrix/CLAUDE.md`, "Chunk contract") — `db::S3Manager::download` (s3://) or
+  `conn::file::FileManager::load_file` (local path) — and loads it on the connection's engine session
+  (`otterstax::engine::create_table_plan` + `load_table`).
+- **`COPY (<select>) TO`** parses `inner_sql` (only a query is accepted: `invalid_parameter` otherwise),
+  runs it on the connection's engine session like any query — remote tables included — and hands the
+  cursor to `db::S3Manager::upload` or `conn::file::FileManager::dump_file`, which write it.
 
 s3 vs local is decided by `external_node_t::is_s3()` (the location scheme). Tests:
 `tests/unit/parser/test_external_routing.cpp` (parse → node) and the
-`Scheduler: CREATE EXTERNAL TABLE + COPY ... TO` case in `tests/system/test_file_ingestion.cpp` (full
-local-file routing through the Worker pool); the s3 path is exercised by the python
+`session: CREATE EXTERNAL TABLE + COPY ... TO` cases in `tests/system/test_file_ingestion.cpp` (full
+local-file routing through a query session); the s3 path is exercised by the python
 integration tests (`tests/test_{schema_,}mysql_s3.py` and friends, against the RustFS in `compose.test.yml`).
 
-## Known limitation
+## Format
 
-The format option in `WITH (...)` is currently advisory — the managers auto-detect the format from the
-location's file extension. The `COPY` `inner_sql` is re-parsed by the Worker (`parser_->parse(ext.inner_sql())`)
-and executed locally (`db::OtterbrixManager::execute`), so cross-backend inner queries are not yet
-supported.
+`format` in `WITH (...)` names the format (`parquet`, `csv`, `ndjson` / `jsonl`); omitted or unknown, it
+is taken from the location's extension (`conn::file::resolve_format`, `connectors/file/types.hpp`), and a
+location that names none is `invalid_parameter`.

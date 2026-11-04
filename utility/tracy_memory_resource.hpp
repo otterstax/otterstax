@@ -11,8 +11,8 @@
 // Memory → Pools view.
 //
 // Lifetime: the wrapper must outlive every PMR container using it as its
-// resource. Declare as a static local in ComponentManager's constructor so the
-// address stays stable for the process lifetime.
+// resource. Declare it in the scope that owns those containers (a parse arena,
+// a per-statement arena) or as a static local so the address stays stable.
 class tracy_memory_resource : public std::pmr::memory_resource {
 public:
     // name must be a string literal (static lifetime). Tracy stores the raw

@@ -8,22 +8,17 @@
 // PySpark reads them. No actor and no I/O, so the unit tests drive it with
 // synthetic rows. Defined in catalog_relations.cpp.
 //
-// What Spark sees (read_catalog):
-//   * a database is a user pg_namespace row (oid >= FIRST_USER_OID) — the
-//     connection alias of a mirror database, the name given to CREATE DATABASE
-//     otherwise — plus "default", which holds the tables created unqualified
-//     (relnamespace 0) and is the current database;
-//   * a table is a user pg_class row of kind r / g (tableType MANAGED) or v / m
-//     (VIEW) in one of those databases. Its namespace is chosen so that
-//     ".".join(namespace + [name]) is the name the SQL path resolves:
-//       mirror of a MySQL / ClickHouse table, `<db>::<table>`    [alias, db]
-//       mirror of a PostgreSQL table, `<db>:<schema>:<table>`    [alias, db, schema]
-//       table of database d                                      [d]
-//       table created unqualified                                []
-//     A mirror database is the one that holds the mirror manifest.
-//   * hidden: system rows, indexes / sequences / composite types / macros, the
-//     mirror manifest `__otterstax_tables`, and the Kafka bookkeeping tables
-//     `kafka.__sources` / `kafka.<source>__offsets`.
+// What Spark sees (read_catalog), read from the engine's catalog
+// (pg_catalog.pg_database / pg_namespace / pg_class; no backend is asked):
+//   * a database is a schema, named as SQL writes the schema: `d.s` for the
+//     schema s of the local database d, `c.d.s` for one of the database d of
+//     the connection c; the current database is the session's place
+//     (current_database(), current_schema());
+//   * a table is a pg_class row of kind r / g (tableType MANAGED) or v / m
+//     (VIEW) of a listed schema; its namespace is [d, s] or [c, d, s], so that
+//     ".".join(namespace + [name]) is the name the SQL path resolves;
+//   * hidden: pg_catalog, information_schema, indexes / sequences / types /
+//     macros, and the database `federation` OtterStax keeps its own tables in.
 //
 // PySpark reads every answer BY POSITION (3.5: pdf.iloc[..]; 4.x: table[i][j]),
 // so the column order below is the contract; the names are Spark's own. An
@@ -40,7 +35,7 @@
 // PySpark 3.5 reads the first six Column fields, 4.x all seven (isCluster).
 // description and locationUri are NULL: the engine keeps neither.
 
-#include "scheduler/session_data.hpp"
+#include "session/session_payload.hpp"
 
 #include <components/types/types.hpp>
 #include <core/result_wrapper.hpp>
@@ -55,36 +50,42 @@ namespace frontend::spark::catalog_rows {
 
     // The one catalog OtterStax answers for.
     inline constexpr std::string_view catalog_name = "otterstax";
-    // The database of the tables created unqualified, and the current database.
-    inline constexpr std::string_view default_database = "default";
 
     // A table as Spark sees it.
     struct table_entry_t {
         std::pmr::string database;                    // the Spark database it is listed under
         std::pmr::string name;                        // Table.name
-        std::pmr::vector<std::pmr::string> qualifier; // Table.namespace
+        std::pmr::vector<std::pmr::string> qualifier; // Table.namespace: [d, s] or [c, d, s]
         bool is_view;
     };
 
     struct catalog_view_t {
         explicit catalog_view_t(std::pmr::memory_resource* resource)
             : databases(resource)
-            , tables(resource) {}
+            , tables(resource)
+            , place(resource)
+            , current_database(resource) {}
 
-        std::pmr::vector<std::pmr::string> databases; // sorted, "default" included
+        std::pmr::vector<std::pmr::string> databases; // sorted
         std::pmr::vector<table_entry_t> tables;       // sorted by database, then name
+        std::pmr::vector<std::pmr::string> place;     // [current_database(), current_schema()]; no schema when NULL
+        std::pmr::string current_database;            // ".".join(place)
     };
 
-    // The catalog from the results of
-    //   SELECT oid, nspname FROM pg_catalog.pg_namespace
-    //   SELECT oid, relname, relnamespace, relkind FROM pg_catalog.pg_class
-    // Columns are found by name; an OID may come in any integer type. A missing
-    // column, a NULL or mistyped cell, or a mirror name not spelled
-    // `<db>:<schema>:<table>` is a schema_error. pg_class is expected to be read
-    // first: a table whose namespace `namespaces` no longer holds was dropped
-    // with its database (DROP DATABASE cascades) and is not listed.
-    core::result_wrapper_t<catalog_view_t> read_catalog(const session_payload& namespaces,
-                                                        const session_payload& classes,
+    // The reads read_catalog takes, in its argument order; their columns are
+    // read by position.
+    //   schemas: datconnection, datname, nspname of every listed schema
+    //   tables:  datconnection, datname, nspname, relname, relkind of every listed table / view
+    //   place:   current_database(), current_schema()
+    std::string schemas_sql();
+    std::string tables_sql();
+    inline constexpr std::string_view place_sql = "SELECT current_database(), current_schema();";
+
+    // The catalog from the answers of the three reads. A cell that is not
+    // text — or a NULL, but current_schema()'s — is an internal_error.
+    core::result_wrapper_t<catalog_view_t> read_catalog(const session_payload& schemas,
+                                                        const session_payload& tables,
+                                                        const session_payload& place,
                                                         std::pmr::memory_resource* resource);
 
     // Spark's name pattern (StringUtils.filterPattern): trimmed, '|' separates
@@ -94,13 +95,15 @@ namespace frontend::spark::catalog_rows {
 
     bool database_exists(const catalog_view_t& view, std::string_view name);
 
-    // The tables `table_name` names. With `db_name`: the tables of that name
-    // listed under that database. Without it: the tables whose identifier —
-    // ".".join(namespace + [name]) — is exactly `table_name`.
-    std::pmr::vector<const table_entry_t*> find_tables(const catalog_view_t& view,
-                                                       std::string_view table_name,
-                                                       std::optional<std::string_view> db_name,
-                                                       std::pmr::memory_resource* resource);
+    // The table `table_name` names, nullptr for none. With `db_name`: the
+    // table of that name listed under that database. Without it: the name as
+    // the SQL path reads it (parse_table_identifier: 1–4 parts, more is
+    // sql_parse_error), completed with the place — `t` is the place's schema's,
+    // `s.t` the place's database's. Names are matched exactly.
+    core::result_wrapper_t<const table_entry_t*> find_table(const catalog_view_t& view,
+                                                            std::string_view table_name,
+                                                            std::optional<std::string_view> db_name,
+                                                            std::pmr::memory_resource* resource);
 
     // `SELECT * FROM` the table's identifier, every part double-quoted (an
     // embedded quote doubled) so the parser keeps its exact case.
@@ -122,16 +125,16 @@ namespace frontend::spark::catalog_rows {
     core::result_wrapper_t<session_payload>
     get_database(const catalog_view_t& view, std::string_view name, std::pmr::memory_resource* resource);
 
-    // listTables: the tables of `db_name` — the current database, "default",
-    // without one — whose name `pattern` matches; database_not_exists for a
-    // database the catalog does not hold.
+    // listTables: the tables of `db_name` — the current database without
+    // one — whose name `pattern` matches; database_not_exists for a database
+    // the catalog does not hold.
     core::result_wrapper_t<session_payload> list_tables(const catalog_view_t& view,
                                                         std::optional<std::string_view> db_name,
                                                         std::optional<std::string_view> pattern,
                                                         std::pmr::memory_resource* resource);
 
-    // getTable: the one table find_tables answers; database_not_exists /
-    // table_not_exists when there is none, ambiguous_name when there are more.
+    // getTable: the table find_table answers; database_not_exists /
+    // table_not_exists when there is none.
     core::result_wrapper_t<session_payload> get_table(const catalog_view_t& view,
                                                       std::string_view table_name,
                                                       std::optional<std::string_view> db_name,

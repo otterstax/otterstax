@@ -1,6 +1,6 @@
 add_subdirectory(utility)
-add_subdirectory(schema)
 add_subdirectory(parser)
 add_subdirectory(translators)
 add_subdirectory(config)
 add_subdirectory(spark_connect)
+add_subdirectory(connectors)

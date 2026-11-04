@@ -15,7 +15,7 @@
 namespace otterstax::kafka::detail {
     namespace {
         core::error_t consumer_error(const std::string& msg) {
-            return core::error_t(core::error_code_t::other_error, std::pmr::string("kafka consumer: " + msg));
+            return core::error_t(core::error_code_t::io_error, std::pmr::string("kafka consumer: " + msg));
         }
     } // namespace
 

@@ -10,7 +10,7 @@
  * Recognised statements (the embedded SELECT of COPY is stripped by the parse
  * driver before this grammar runs, and re-attached afterwards):
  *
- *   CREATE EXTERNAL TABLE <db>.<table> WITH ( location = '/path', format = '...' )
+ *   CREATE EXTERNAL TABLE [[[connection.]database.]schema.]table WITH ( location = '/path', format = '...' )
  *   COPY TO '/path' [ WITH ( format = '...' ) ]
  *
  *-------------------------------------------------------------------------
@@ -42,7 +42,7 @@
 %token <str> IDENT SCONST
 %token KW_CREATE KW_EXTERNAL KW_TABLE KW_COPY KW_TO KW_WITH
 
-%type <stmt> stmt create_stmt copy_stmt
+%type <stmt> stmt create_stmt copy_stmt table_name
 %type <opt>  opt_list option
 
 %%
@@ -68,9 +68,17 @@ opt_semicolon:
     | ';'
     ;
 
+/* One to four parts, as otterbrix names a table: t, s.t, d.s.t, c.d.s.t (a
+ * connection's). A fifth part is counted and refused by the parse driver. */
+table_name:
+    IDENT                   { $$ = file_ext::make_create(resource, $1, nullptr); }
+    | table_name '.' IDENT  { $$ = file_ext::append_name($1, $3); }
+    ;
+
 create_stmt:
-    KW_CREATE KW_EXTERNAL KW_TABLE IDENT '.' IDENT KW_WITH '(' opt_list ')' opt_semicolon {
-        $$ = file_ext::make_create(resource, $4, $6, $9);
+    KW_CREATE KW_EXTERNAL KW_TABLE table_name KW_WITH '(' opt_list ')' opt_semicolon {
+        $$ = $4;
+        $$->options = $7;
         *out = make_extension_node(resource, "file", $$);
     }
     ;

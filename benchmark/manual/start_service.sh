@@ -38,7 +38,7 @@
 #                Rebuilds the image whenever --tracy is specified.
 #                Connect the Tracy GUI to localhost:8086 after the service starts.
 #                No capture is started — Tracy GUI must be opened manually.
-#   -j N         Parallel cmake jobs for the otterstax_app build (default: nproc).
+#   -j N         Parallel jobs for the otterstax_app build (default: min(Docker CPUs, Docker RAM MB / 1536)).
 #   --image-tag  OtterStax image tag (default: bench, or bench-tracy with --tracy).
 set -e
 
@@ -72,6 +72,19 @@ while [[ $# -gt 0 ]]; do
         *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
 done
+
+# With no -j, cap the image build to Docker's RAM (~1.5 GB per job; otterbrix
+# builds from source in the image) — same formula as run_benchmark.sh and
+# CLAUDE.md "Build resources". Dockerfile.test applies it again for BUILD_JOBS=0.
+if [ "$BUILD_JOBS" = "0" ]; then
+    _docker_mem_mb=$(docker info --format '{{.MemTotal}}' 2>/dev/null \
+                     | awk '{printf "%d", $1/1048576}')
+    _docker_cpus=$(docker info --format '{{.NCPU}}' 2>/dev/null || echo 1)
+    _mem_jobs=$(( ${_docker_mem_mb:-2048} / 1536 ))
+    [ "$_mem_jobs" -lt 1 ] && _mem_jobs=1
+    BUILD_JOBS=$(( _docker_cpus < _mem_jobs ? _docker_cpus : _mem_jobs ))
+    echo "Auto build jobs: ${BUILD_JOBS} (Docker: ${_docker_cpus} CPUs, ${_docker_mem_mb:-?} MB RAM)"
+fi
 
 if $ENABLE_TRACY; then
     export WITH_TRACY=true

@@ -3,7 +3,7 @@
 
 #pragma once
 #include <core/result_wrapper.hpp>
-#include <otterbrix/otterbrix.hpp>
+#include <integration/cpp/otterbrix.hpp>
 
 // Clash between otterbrix parser and arrow
 #undef DAY
@@ -15,11 +15,14 @@
 
 namespace tsl {
 
-// Every loader's (and FlightSQL DoPut's) Arrow → chunk step. Each type otterbrix's importer reads
-// goes through it zero-copy (the chunk aliases the batch, kept alive by every column); decimal128
-// (HUGEINT at scale 0, else DECIMAL, out-of-precision refused) and null are read here per cell.
-// Any other type is conversion_failure naming the column.
-core::result_wrapper_t<components::vector::data_chunk_t>
+// Every loader's (and FlightSQL DoPut's) Arrow → chunk step: the batch as a run of chunks of at
+// most DEFAULT_VECTOR_CAPACITY rows (the chunk contract), sharing one column shape; a batch without
+// rows is one chunk of its columns and no row, so the schema survives an empty input (a null
+// batch is an empty run). Each type otterbrix's importer reads goes through it zero-copy (every
+// piece aliases the batch, kept alive by every column); decimal128 (HUGEINT at scale 0, else
+// DECIMAL, out-of-precision refused) and null are read here per cell. Any other type is
+// refused naming the column.
+core::result_wrapper_t<std::pmr::vector<components::vector::data_chunk_t>>
 arrow_to_chunk(std::pmr::memory_resource* res,
                const std::shared_ptr<arrow::RecordBatch>& batch);
 

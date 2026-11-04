@@ -2,13 +2,11 @@
 // Copyright 2025-2026  OtterStax
 
 #include "otterbrix/parser/parser.hpp"
-#include "test_aliases.hpp"
-#include "otterbrix/parser/subquery_extractor.hpp"
-#include "otterbrix/schema/schema_utils.hpp"
 
 #include <catch2/catch_all.hpp>
 
 #include <components/logical_plan/node.hpp>
+#include <components/vector/vector_builders.hpp>
 #include <core/result_wrapper.hpp>
 #include <memory_resource>
 #include <string>
@@ -22,13 +20,6 @@ ParsedQueryDataPtr parse_or_die(GreenplumParser& p, const std::string& sql) {
     return std::move(r.value());
 }
 
-size_t flat_count(const ParsedQueryDataPtr& parsed) {
-    size_t n = 0;
-    for (const auto& batch : parsed->otterbrix_params->external_nodes)
-        n += batch.size();
-    return n;
-}
-
 } // namespace
 
 // ── Error handling ────────────────────────────────────────────────────────────
@@ -36,7 +27,7 @@ size_t flat_count(const ParsedQueryDataPtr& parsed) {
 TEST_CASE("parse: empty string returns error") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource, test_aliases());
+    GreenplumParser parser(resource);
     auto r = parser.parse("");
     REQUIRE(r.has_error());
 }
@@ -44,7 +35,7 @@ TEST_CASE("parse: empty string returns error") {
 TEST_CASE("parse: a lone ';' has no statement and is a parse error") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource, test_aliases());
+    GreenplumParser parser(resource);
     // The grammar accepts the input but yields an empty statement list; there
     // is nothing to plan, so it must surface as sql_parse_error rather than
     // being read as a statement.
@@ -56,7 +47,7 @@ TEST_CASE("parse: a lone ';' has no statement and is a parse error") {
 TEST_CASE("parse: a comment-only input has no statement and is a parse error") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource, test_aliases());
+    GreenplumParser parser(resource);
     auto r = parser.parse("-- c");
     REQUIRE(r.has_error());
     REQUIRE(r.error().type == core::error_code_t::sql_parse_error);
@@ -65,7 +56,7 @@ TEST_CASE("parse: a comment-only input has no statement and is a parse error") {
 TEST_CASE("parse: invalid SQL syntax returns error") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource, test_aliases());
+    GreenplumParser parser(resource);
     auto r = parser.parse("SELECTT * FORM nowhere");
     REQUIRE(r.has_error());
 }
@@ -73,7 +64,7 @@ TEST_CASE("parse: invalid SQL syntax returns error") {
 TEST_CASE("parse: incomplete statement returns error") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource, test_aliases());
+    GreenplumParser parser(resource);
     // Note: a bare "SELECT" is VALID in the PostgreSQL grammar (empty target
     // list), so an actually incomplete statement is used here.
     auto r = parser.parse("SELECT id FROM");
@@ -85,7 +76,7 @@ TEST_CASE("parse: incomplete statement returns error") {
 TEST_CASE("parse: SELECT sets T_SelectStmt tag") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource, test_aliases());
+    GreenplumParser parser(resource);
     auto parsed = parse_or_die(parser, "SELECT id, name FROM orders WHERE id = 1;");
     REQUIRE(parsed->tag == NodeTag::T_SelectStmt);
 }
@@ -93,7 +84,7 @@ TEST_CASE("parse: SELECT sets T_SelectStmt tag") {
 TEST_CASE("parse: INSERT sets T_InsertStmt tag") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource, test_aliases());
+    GreenplumParser parser(resource);
     auto parsed = parse_or_die(parser, "INSERT INTO orders (id, name) VALUES (1, 'test');");
     REQUIRE(parsed->tag == NodeTag::T_InsertStmt);
 }
@@ -101,7 +92,7 @@ TEST_CASE("parse: INSERT sets T_InsertStmt tag") {
 TEST_CASE("parse: UPDATE sets T_UpdateStmt tag") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource, test_aliases());
+    GreenplumParser parser(resource);
     auto parsed = parse_or_die(parser, "UPDATE orders SET name = 'x' WHERE id = 1;");
     REQUIRE(parsed->tag == NodeTag::T_UpdateStmt);
 }
@@ -109,7 +100,7 @@ TEST_CASE("parse: UPDATE sets T_UpdateStmt tag") {
 TEST_CASE("parse: DELETE sets T_DeleteStmt tag") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource, test_aliases());
+    GreenplumParser parser(resource);
     auto parsed = parse_or_die(parser, "DELETE FROM orders WHERE id = 1;");
     REQUIRE(parsed->tag == NodeTag::T_DeleteStmt);
 }
@@ -119,87 +110,25 @@ TEST_CASE("parse: DELETE sets T_DeleteStmt tag") {
 TEST_CASE("parse: no placeholders → parameters_count == 0") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource, test_aliases());
+    GreenplumParser parser(resource);
     auto parsed = parse_or_die(parser, "SELECT id FROM orders WHERE status = 'active';");
-    REQUIRE(parsed->otterbrix_params->parameters_count == 0);
+    REQUIRE(parsed->binder().parameter_count() == 0);
 }
 
 TEST_CASE("parse: one placeholder → parameters_count == 1") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource, test_aliases());
+    GreenplumParser parser(resource);
     auto parsed = parse_or_die(parser, "SELECT id FROM orders WHERE id = $1;");
-    REQUIRE(parsed->otterbrix_params->parameters_count == 1);
+    REQUIRE(parsed->binder().parameter_count() == 1);
 }
 
 TEST_CASE("parse: two placeholders → parameters_count == 2") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource, test_aliases());
+    GreenplumParser parser(resource);
     auto parsed = parse_or_die(parser, "SELECT id FROM orders WHERE id = $1 AND status = $2;");
-    REQUIRE(parsed->otterbrix_params->parameters_count == 2);
-}
-
-// ── external_nodes_count consistency ─────────────────────────────────────────
-
-TEST_CASE("parse: external_nodes_count matches flat node count") {
-    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
-    auto* resource = &arena;
-    GreenplumParser parser(resource, test_aliases());
-
-    auto parsed = parse_or_die(
-        parser,
-        "SELECT o.id, p.name "
-        "FROM uid1.db1.sch1.orders o "
-        "INNER JOIN uid2.db2.sch2.products p ON o.product_id = p.id;");
-
-    REQUIRE(parsed->otterbrix_params->external_nodes_count == flat_count(parsed));
-    REQUIRE(parsed->otterbrix_params->external_nodes_count == 2);
-}
-
-// ── Same-UID batching ─────────────────────────────────────────────────────────
-// When two tables share a unique_identifier, get_external_nodes() places them
-// in separate batches so the scheduler can issue two sequential round-trips
-// to the same connection.
-
-TEST_CASE("parse: same UID in two tables → two batches, one node each") {
-    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
-    auto* resource = &arena;
-    GreenplumParser parser(resource, test_aliases());
-
-    auto parsed = parse_or_die(
-        parser,
-        "SELECT a.id, b.name "
-        "FROM uid1.db1.sch1.table_a a "
-        "INNER JOIN uid1.db1.sch1.table_b b ON a.id = b.id;");
-
-    // Two external nodes from the same uid → two separate batches
-    REQUIRE(parsed->otterbrix_params->external_nodes_count == 2);
-    REQUIRE(parsed->otterbrix_params->external_nodes.size() == 2);
-    REQUIRE(parsed->otterbrix_params->external_nodes[0].size() == 1);
-    REQUIRE(parsed->otterbrix_params->external_nodes[1].size() == 1);
-
-    // Both nodes must carry the same uid (each external entry carries its
-    // resolved target — nodes themselves no longer carry names)
-    REQUIRE(parsed->otterbrix_params->external_nodes[0][0].target.name.unique_identifier == "uid1");
-    REQUIRE(parsed->otterbrix_params->external_nodes[1][0].target.name.unique_identifier == "uid1");
-}
-
-TEST_CASE("parse: different UIDs in two tables → one batch, two nodes") {
-    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
-    auto* resource = &arena;
-    GreenplumParser parser(resource, test_aliases());
-
-    auto parsed = parse_or_die(
-        parser,
-        "SELECT a.id, b.name "
-        "FROM uid1.db1.sch1.table_a a "
-        "INNER JOIN uid2.db2.sch2.table_b b ON a.id = b.id;");
-
-    REQUIRE(parsed->otterbrix_params->external_nodes_count == 2);
-    // Different UIDs do not collide: both nodes fit in a single batch
-    REQUIRE(parsed->otterbrix_params->external_nodes.size() == 1);
-    REQUIRE(parsed->otterbrix_params->external_nodes[0].size() == 2);
+    REQUIRE(parsed->binder().parameter_count() == 2);
 }
 
 // ── Statefulness: parser instance reuse ──────────────────────────────────────
@@ -207,13 +136,13 @@ TEST_CASE("parse: different UIDs in two tables → one batch, two nodes") {
 TEST_CASE("parse: same parser handles multiple successive calls correctly") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource, test_aliases());
+    GreenplumParser parser(resource);
 
     auto r1 = parse_or_die(parser, "SELECT id FROM orders;");
     auto r2 = parse_or_die(parser, "SELECT name FROM products WHERE id = 1;");
 
-    REQUIRE(r1->otterbrix_params->external_nodes_count == 0);
-    REQUIRE(r2->otterbrix_params->external_nodes_count == 0);
+    REQUIRE(r1->sql == "SELECT id FROM orders;");
+    REQUIRE(r2->sql == "SELECT name FROM products WHERE id = 1;");
     REQUIRE(r1->tag == NodeTag::T_SelectStmt);
     REQUIRE(r2->tag == NodeTag::T_SelectStmt);
 }
@@ -221,9 +150,42 @@ TEST_CASE("parse: same parser handles multiple successive calls correctly") {
 TEST_CASE("parse: error then success on same parser instance") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    GreenplumParser parser(resource, test_aliases());
+    GreenplumParser parser(resource);
 
     REQUIRE(parser.parse("NOT VALID SQL !!").has_error());
     auto parsed = parse_or_die(parser, "SELECT id FROM orders;");
     REQUIRE(parsed->tag == NodeTag::T_SelectStmt);
+}
+
+// ── Lifetime ─────────────────────────────────────────────────────────────────
+// The raw parse tree lives on the parse's own arena and is gone when parse()
+// returns; nothing the ParsedQueryData keeps may point into it. A statement
+// with `$n` keeps its transform unfinalized until Bind: binding and
+// finalizing it after the parser and its arena are gone, and destroying it, is
+// what a prepared statement's execute does. On new_delete_resource every free
+// is real, so ASAN (or MallocScribble) sees a dangling read.
+TEST_CASE("parse: a ParsedQueryData outlives the parse with and without parameters") {
+    auto* resource = std::pmr::new_delete_resource();
+    for (const char* sql : {"DELETE FROM orders WHERE id = 1;",
+                            "INSERT INTO orders (id, name) VALUES (1, 'a'), (2, 'b');",
+                            "SELECT id, name FROM orders WHERE id = $1 AND name = $2 LIMIT $3;",
+                            "INSERT INTO orders (id, name) VALUES ($1, $2);",
+                            "UPDATE orders SET name = $1 WHERE id IN (SELECT id FROM other WHERE v = $2);"}) {
+        INFO(sql);
+        ParsedQueryDataPtr parsed;
+        {
+            GreenplumParser parser(resource);
+            parsed = parse_or_die(parser, sql);
+        }
+        if (parsed->awaiting_bind) {
+            auto& binder = parsed->binder();
+            for (size_t n = 1; n <= binder.parameter_count(); ++n) {
+                binder.bind(n, components::vector::make_scalar(resource, std::int64_t{7}));
+            }
+            auto finalized = binder.finalize();
+            INFO((finalized.has_error() ? finalized.error().what.c_str() : "ok"));
+            CHECK_FALSE(finalized.has_error());
+        }
+        parsed.reset();
+    }
 }

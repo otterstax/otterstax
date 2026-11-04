@@ -26,8 +26,11 @@ class client:
             'port': 8816,
             'user': 'testuser',
             'password': 'testpass',
+            # Every statement here is meant to commit on its own: the driver's
+            # SET autocommit reaches the engine and is the connection's own.
+            'autocommit': True,
         }
-        self.test_database = 'campaigns.db1'
+        self.test_database = 'campaigns.db1.public'
         self.test_table = 'mysql_test_table'
         self.test_encoding_table = 'mysql_test_encoding'
 
@@ -118,16 +121,23 @@ class client:
             cursor.execute(f"select campaign_length from {self.test_database}.{self.test_table}")
             initial_l = cursor.fetchall()
 
-            cursor.execute(f"select budget from {self.test_database}.{self.test_table}")
-            initial_b = cursor.fetchall()
+            # A FLOAT column is read over the binary protocol (a prepared
+            # cursor), where it travels as its four bytes: the text protocol
+            # writes it as MySQL does, at most six significant digits.
+            binary = conn.cursor(prepared=True)
+            binary.execute(f"select budget from {self.test_database}.{self.test_table}")
+            initial_b = binary.fetchall()
 
             cursor.execute(f"update {self.test_database}.{self.test_table} set campaign_length = %s where _id = %s", (30, gen_id(1))) # subtract 10
             cursor.execute(f"update {self.test_database}.{self.test_table} set budget = %s where _id = %s", (64617.54, gen_id(1))) # subtract 40
 
-            # sum(int) here has type boost::mysql::decimal, which is translated to DocumentTypes::STRING by translator, hence the constructor
-            # todo: support decimals
+            # The engine types the result, not MariaDB: SUM over an integer
+            # column is BIGINT (MariaDB's own answer, DECIMAL text, is converted
+            # to it), so the value arrives as an int.
             cursor.execute(f"select sum(campaign_length) as sum_ from {self.test_database}.{self.test_table}")
-            upd = int(cursor.fetchall()[0][0])
+            upd = cursor.fetchall()[0][0]
+            if not isinstance(upd, int):
+                raise ValueError(f"sum(int) must arrive as BIGINT (int), got {type(upd).__name__}: {upd!r}")
 
             for row in initial_l:
                 upd -= row[0]
@@ -135,13 +145,17 @@ class client:
             if (upd != -10):
                 raise ValueError(f"Expected campaign_length diff: -10, got: {upd}")
 
-            cursor.execute(f"select sum(budget) as sum_ from {self.test_database}.{self.test_table}")
-            upd = cursor.fetchall()[0][0]
+            binary.execute(f"select sum(budget) as sum_ from {self.test_database}.{self.test_table}")
+            upd = binary.fetchall()[0][0]
 
             for row in initial_b:
                 upd -= row[0]
 
-            self.assert_floating_equal(upd, -29.999999)
+            # SUM over a FLOAT column is FLOAT (the engine's rule: a floating
+            # sum keeps its input type), so the ~7.4e5 total carries float32
+            # precision — a step of 1/16 there — and the difference is -30 to
+            # within that, not to 1e-6.
+            self.assert_floating_equal(upd, -30.0, tol=0.1)
 
     def test_float_column_reads_back_the_stored_value(self):
         """A FLOAT column comes back as the float32 the backend holds, not a rounding of it.
@@ -152,7 +166,9 @@ class client:
         the stored one while SUM() over the same column is exact — the
         inconsistency test_crud_queries trips over. The connector must read
         the rows over the binary protocol, where the float travels as its four
-        bytes.
+        bytes. OtterStax's own text protocol writes a FLOAT as MySQL does (at
+        most six significant digits, "64647.5"), so the client reads it here
+        over the binary protocol too (a prepared cursor).
         """
         table = f"{self.test_database}.{self.test_table}"
         stored = struct.unpack('f', struct.pack('f', 64647.54))[0]
@@ -161,8 +177,9 @@ class client:
             cursor = conn.cursor()
             cursor.execute(f"insert into {table} (_id, campaign_name, campaign_length, budget) values (%s, %s, %s, %s)",
                            (gen_id(100), 'Campaign Float Exact', 1, 64647.54))
-            cursor.execute(f"select budget from {table} where _id = %s", (gen_id(100),))
-            self.assert_floating_equal(cursor.fetchall()[0][0], stored, msg="FLOAT column read back rounded")
+            binary = conn.cursor(prepared=True)
+            binary.execute(f"select budget from {table} where _id = ?", (gen_id(100),))
+            self.assert_floating_equal(binary.fetchall()[0][0], stored, msg="FLOAT column read back rounded")
             cursor.execute(f"delete from {table} where _id = %s", (gen_id(100),))
 
     def test_remote_dml_row_counts(self):
@@ -231,9 +248,11 @@ class client:
             cursor.execute(f"select count(_id) from {table} where campaign_length = {bulk_length}")
             self.assert_equal(int(cursor.fetchall()[0][0]), bulk_rows, "bulk rows must be on the backend")
 
-            # MariaDB counts the rows an UPDATE changed, not the rows it matched
-            # (CLIENT_FOUND_ROWS is not requested), so the new value must be one
-            # no bulk row holds — the bulk budgets are 0.0 .. 1999.0.
+            # OtterStax reports the rows a remote UPDATE matched, read off the
+            # OK packet's "Rows matched: N" (MariaDB's own affected-row count is
+            # the rows it changed: CLIENT_FOUND_ROWS is not requested). The new
+            # value is one no bulk row holds, so matched and changed agree here
+            # either way.
             cursor.execute(f"update {table} set budget = -1.0 where campaign_length = {bulk_length}")
             self.assert_equal(cursor.rowcount, bulk_rows, "COM_QUERY remote UPDATE over 2000 rows")
 
@@ -338,24 +357,29 @@ class client:
                 second_row = cursor.fetchall()
                 self.assert_equal(len(second_row), 1, "Expected one row for reused prepared statement")
 
-                cursor.execute(f"select ? from {self.test_database}.{self.test_table}", (100,))
-                self.assert_equal(cursor.fetchall()[0][0], 100, "Select ? constant failed")
-
         except Exception as e:
             raise ValueError("Prepared queries threw something: " + str(e))
 
-    def test_backend_error_carries_server_message(self):
-        """A statement MariaDB refuses surfaces MariaDB's verdict, not a transport error.
+    def test_prepared_select_of_a_parameter(self):
+        """A prepared `SELECT ? FROM t` answers the bound value per row.
 
-        DROP TABLE needs no registered schema, so the statement reaches the
-        backend untouched and MariaDB answers 1051 "Unknown table". The
-        connector keeps that server message and classifies the code from the
-        server's error (table_not_exists, never io_error / other_error); on the
-        wire the text is what proves the verdict came from the server, since a
-        transport failure carries "connect failed" instead. COM_STMT_EXECUTE
-        takes the same path twice: a statement that failed once is prepared
-        again transparently, so the second run reports the backend again and
-        never the Worker's re-prepare demand.
+        The engine types a select-list parameter (fixed in otterbrix; the
+        C++ twin is "mysql protocol over the wire: a prepared SELECT ? FROM t
+        answers the bound value per row", tests/system/test_frontend_mysql_protocol.cpp).
+        """
+        with self.mysql_connector_connection() as conn:
+            cursor = conn.cursor(prepared=True)
+            cursor.execute(f"select ? from {self.test_database}.{self.test_table}", (100,))
+            self.assert_equal(cursor.fetchall()[0][0], 100, "Select ? constant failed")
+
+    def test_missing_remote_table_is_an_error_not_a_transport_failure(self):
+        """A DROP TABLE of a remote table neither the catalog nor MariaDB has is a "does not exist" error.
+
+        The engine resolves the four-part name in its catalog; the miss sends
+        the session to discover the table on MariaDB, which has none, so the
+        statement fails with the catalog's verdict (never io_error / "connect
+        failed"), and the connection keeps serving. COM_STMT_EXECUTE takes the
+        same path twice and fails the same way both times.
         """
         missing = f"{self.test_database}.no_such_table_{gen_id(404)}"
 
@@ -366,22 +390,22 @@ class client:
                 return str(e)
             raise AssertionError("DROP TABLE of a table the backend does not have must fail")
 
-        with self.mysql_connector_connection() as conn:
-            message = refused(conn.cursor())
-            assert "Unknown table" in message, f"MariaDB's verdict is missing from: {message}"
-            assert "no_such_table" in message, f"the refused table is not named in: {message}"
-            assert "connect failed" not in message, f"a transport error was reported instead: {message}"
+        def check(message, what):
+            assert "no_such_table" in message or "does not exist" in message, \
+                f"{what}: the refusal names neither the table nor its absence: {message}"
+            assert "connect failed" not in message, f"{what}: a transport error was reported instead: {message}"
 
-            # The connection is still usable after the backend refused a statement.
+        with self.mysql_connector_connection() as conn:
+            check(refused(conn.cursor()), "COM_QUERY")
+
+            # The connection is still usable after the refusal.
             cursor = conn.cursor()
             cursor.execute(f"select count(_id) as cnt from {self.test_database}.{self.test_table}")
             cursor.fetchall()
 
             prepared = conn.cursor(prepared=True)
             for attempt in (1, 2):
-                message = refused(prepared)
-                assert "Unknown table" in message, f"COM_STMT_EXECUTE attempt {attempt}: {message}"
-                assert "re-prepared" not in message, f"re-prepare leaked to the client on attempt {attempt}: {message}"
+                check(refused(prepared), f"COM_STMT_EXECUTE attempt {attempt}")
 
     def cleanup_test_data(self):
         try:
@@ -405,7 +429,8 @@ class client:
             self.test_character_encoding()
             self.test_protocol_capability_flags()
             self.test_prepared_queries()
-            self.test_backend_error_carries_server_message()
+            self.test_missing_remote_table_is_an_error_not_a_transport_failure()
+            self.test_prepared_select_of_a_parameter()
             print("\033[92mTest success.\033[0m")
         except Exception as e:
             print(f"\033[91mAn error occurred: {e}\033[0m")

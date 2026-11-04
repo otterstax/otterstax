@@ -57,17 +57,6 @@ endif()
 if (ENABLE_ASAN)
     add_compile_options(-O0 -g -fno-omit-frame-pointer -fsanitize=address)
     add_link_options(-fsanitize=address)
-    # otterbrix's core/pmr.hpp switches base_otterbrix_t's by-value member type
-    # on the CONSUMER's __SANITIZE_ADDRESS__, so an ASAN-built app and the
-    # non-ASAN engine .so disagree on the class layout (size skew → corrupted
-    # `this` crashes at runtime). The macro is informational only — undefining
-    # it does NOT disable instrumentation, it just makes our TUs see the same
-    # layout as the engine. This holds only while the engine package itself is
-    # built without ASAN (the Conan packages are): an ASAN-built engine takes the
-    # other branch and this undefine would skew the layout instead of fixing it.
-    # Remove once the engine stops keying public ABI off consumer sanitizer
-    # macros.
-    add_compile_options(-U__SANITIZE_ADDRESS__)
 endif()
 
 if (ENABLE_TSAN)
@@ -81,7 +70,7 @@ endif()
 
 # Find the Conan packages
 find_package(Arrow REQUIRED)
-find_package(otterbrix REQUIRED COMPONENTS log)
+find_package(otterbrix REQUIRED)
 find_package(actor-zeta REQUIRED)
 find_package(Catch2 3 REQUIRED)
 find_package(Boost 1.88.0 REQUIRED COMPONENTS
@@ -123,11 +112,12 @@ endif()
 add_subdirectory(frontend)
 add_subdirectory(catalog)
 add_subdirectory(connectors)
-add_subdirectory(component_manager)
 add_subdirectory(config)
 add_subdirectory(integration)
 add_subdirectory(otterbrix)
-add_subdirectory(scheduler)
+add_subdirectory(runtime)
+add_subdirectory(session)
+add_subdirectory(backends)
 
 set(${PROJECT_NAME}_HEADERS
 
@@ -152,18 +142,20 @@ add_library(lib_${PROJECT_NAME} INTERFACE
 
 # set_property(TARGET otterbrix_${PROJECT_NAME} PROPERTY EXPORT_NAME ${PROJECT_NAME})
 
-# These internal static libs cross-reference each other (e.g. scheduler uses
-# integration handlers while integration/otterbrix_local use scheduler's
-# schema_utils), so a single left-to-right link pass can miss objects only
-# one of them pulls (e.g. integration/s3/s3_manager.o, referenced solely by
-# the Scheduler). RESCAN groups them (--start-group/--end-group) so the
-# linker re-pulls until the cycle is fully resolved. Apple's ld64 rejects
-# LINK_GROUP:RESCAN for CXX and does not need it — it re-searches archives
-# until no new symbols resolve.
+# These internal static libs cross-reference each other (e.g. session uses
+# integration handlers while the catalog and the file connector use
+# otterbrix_local's engine requests), so a single left-to-right link pass can
+# miss objects only one of them pulls. RESCAN groups them
+# (--start-group/--end-group) so the linker re-pulls until the cycle is fully
+# resolved. Apple's ld64 rejects LINK_GROUP:RESCAN for CXX and does not need
+# it — it re-searches archives until no new symbols resolve. A static lib that
+# links a group member and is linked by one belongs in the group too (CMake
+# rejects such a dependency cycle through a LINK_GROUP): flight_sql_core uses
+# common_server (secure_random_bytes) and flight_sql uses flight_sql_core.
 set(OTTERSTAX_INTERNAL_LIBS
-    flight_sql common_server mysql_server postgres_server
-    spark_connect_server catalog connectors s3 file component_manager
-    integration otterbrix_local scheduler kafka_grammar kafka_runtime)
+    flight_sql flight_sql_core common_server mysql_server postgres_server
+    spark_connect_server catalog catalog_discovery connectors s3 file backends session runtime
+    integration otterbrix_local otterstax_federation kafka_grammar kafka_runtime)
 if(APPLE)
     set(OTTERSTAX_LINK_GROUP ${OTTERSTAX_INTERNAL_LIBS})
 else()
@@ -201,7 +193,6 @@ add_executable(server main.cpp)
 target_link_libraries(server
     PRIVATE
     lib_${PROJECT_NAME}
-    otterbrix_log
     )
 
 # Unit tests

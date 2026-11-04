@@ -70,9 +70,11 @@ exit code 139 and repairs the truncated JSON automatically.
 
 ## End-to-end benchmarks (Docker)
 
-An end-to-end benchmark harness for OtterStax. It measures query latency across two
-frontends by default (MySQL wire and PostgreSQL wire) and five test categories, with
-Arrow/FlightSQL available as an opt-in once the JOIN serialisation bug is fixed.
+An end-to-end benchmark harness for OtterStax. It measures query latency across three
+frontends by default (MySQL wire, PostgreSQL wire and Arrow/FlightSQL) and five test
+categories. Arrow has scripts for those five only: an `external_*` / `kafka_*` test
+selected with `--bench` is skipped for it (`SKIP:` in the log, counted in the final
+line), since there is no `benchmarks/arrow/<test>.py`.
 
 ## End-to-end quick start
 
@@ -108,7 +110,7 @@ Results land in `benchmark_results/<YYYYMMDD_HHMMSS>/`.
 
 ```text
 --repetitions N     Reps per sub-test (default: 10)
---frontend F        mysql | postgres | arrow  (repeatable; default: mysql postgres)
+--frontend F        mysql | postgres | arrow  (repeatable; default: all three)
 --bench T [T ...]   Test(s) to run (space-separated; default: the five
                     cross-backend tests).
                     Values: simple_select complex_select join_same_instance
@@ -187,7 +189,7 @@ Results land in `benchmark_manual/<YYYYMMDD_HHMMSS>/`.
 ### Run a custom query
 
 ```bash
-echo "SELECT * FROM mysql1.benchdb1.campaigns LIMIT 10" > /tmp/my.sql
+echo "SELECT * FROM mysql1.benchdb1.public.campaigns LIMIT 10" > /tmp/my.sql
 ./benchmark/manual/run_query.sh --frontend mysql /tmp/my.sql
 ```
 
@@ -228,7 +230,7 @@ benchmark_manual/<YYYYMMDD_HHMMSS>/
 │                       #   Commit     : d8fdb70...
 │                       #   my_query   : OK | ERROR
 │                       #   rows       : 500
-│                       #   elapsed_ms : 88445.0
+│                       #   elapsed_ms : <elapsed>
 └── <query_name>.json   # machine-readable record with the same fields
 ```
 
@@ -258,7 +260,7 @@ benchmark/
 │   ├── kafka_common.py          # Kafka runners (kafka_ingest/produce/stream) + sql_* builders + kafka_main
 │   ├── mysql/connector.py       # mysql-connector-python, port 8816 (+ connect())
 │   ├── postgres/connector.py    # psycopg2, port 8817 (+ connect())
-│   ├── arrow/connector.py       # flightsql-dbapi, port 8815  ← disabled by default
+│   ├── arrow/connector.py       # flightsql-dbapi, port 8815 (the five cross-backend tests)
 │   └── {mysql,postgres,arrow}/  # One .py file per test category
 │       ├── simple_select.py
 │       ├── complex_select.py
@@ -302,22 +304,27 @@ re-running an `external_*` benchmark, which regenerates them.)
 
 ## Test categories
 
-| Test                | Description                                           | Typical latency |
-|---------------------|-------------------------------------------------------|-----------------|
-| simple_select       | LIMIT 100 point-read per table                        | 2–50 ms         |
-| complex_select      | GROUP BY + HAVING + ORDER BY LIMIT 1000               | 5–55 ms         |
-| join_same_instance  | JOIN two tables in the same engine instance           | 3–9 s           |
-| join_cross_engine   | JOIN Group B tables across different engine instances | 3–5 s           |
-| join_all            | 3-engine JOIN (mysql1 × pg1/ch1 × ch2/mysql2)         | 47–90 s         |
+| Test                | Description                                           |
+|---------------------|-------------------------------------------------------|
+| simple_select       | LIMIT 100 point-read per table                        |
+| complex_select      | GROUP BY + HAVING + ORDER BY LIMIT 1000               |
+| join_same_instance  | JOIN two tables in the same engine instance           |
+| join_cross_engine   | JOIN Group B tables across different engine instances |
+| join_all            | 3-engine JOIN (mysql1 × pg1/ch1 × ch2/mysql2)         |
 
-`join_all` is slow because OtterStax fetches all ~60 k Group A rows regardless of the
-`WHERE campaign_id <= 50` filter — there is no predicate pushdown to backends.
+`join_same_instance` is one remote statement per sub-test: the JOIN of two tables of one server, its
+WHERE included, is pushed down whole. `join_cross_engine` and `join_all` JOIN
+tables of different servers, so the JOIN runs in the engine over what each
+server takes of its side (see "What the pushdown sends" below). The ClickHouse pairs of
+`join_cross_engine` JOIN keys of different types (ClickHouse `UInt32` against
+`INT`), which the engine hash-joins over a common cast type (done in
+otterbrix #850).
 
 ## External-table tests (s3/file)
 
-Three opt-in workloads that exercise the `CREATE EXTERNAL TABLE` / `COPY ... TO`
-grammar extensions — **loading, internal joins and dumps only; no cross-backend
-or JOIN ALL shapes.** Each runs both a local-file (`/fixtures` mount) and an s3
+Five opt-in workloads that exercise the `CREATE EXTERNAL TABLE` / `COPY ... TO`
+grammar extensions — **loading, joins of engine-internal tables and dumps only; no
+backend table takes part.** Each runs both a local-file (`/fixtures` mount) and an s3
 (seeded RustFS) source, so file vs s3 are directly comparable in the sub-test
 breakdown.
 
@@ -328,6 +335,12 @@ breakdown.
 | `external_dump` | `COPY (SELECT * FROM <loaded>) TO <target>` — writer + upload (source loaded once, untimed) | `{file,s3}_{parquet,csv,ndjson}` |
 | `external_join_cross` | external `regions` (s3/file) ⋈ otterbrix-internal `weights` (`CREATE TABLE`+`INSERT`) — the supported s3-join shape from `tests/test_mysql_join_otb_local_s3.py` | `{file,s3}_cross` |
 | `external_join_all` | s3 parquet `regions` ⋈ file csv `web_events` ⋈ internal `weights`, all on `campaign_id` — three origins joined at once | `s3parquet_filecsv_internal` |
+
+Every workload names its tables `bench_ext_<workload>_<frontend>.<table>`: a
+two-part name, the schema of the session's database (`main`), which the runner
+creates first (`CREATE SCHEMA IF NOT EXISTS`, `_ensure_schema` in
+`benchmarks/external_common.py`) — CREATE TABLE / CREATE EXTERNAL TABLE never
+create a schema or a database.
 
 `external_join_cross` / `external_join_all` deliberately load every side into
 otterbrix-internal storage first (external load + a hand-built `bigint` engine
@@ -352,7 +365,7 @@ The `file` and `s3` sources read the **identical** fixtures: bench-otterstax
 mounts `data/fixtures` at `/fixtures`, and RustFS is seeded from the same dir.
 
 ```bash
-# All five external tests, both frontends
+# All five external tests, mysql + postgres (arrow is skipped: no arrow script)
 ./benchmark/scripts/run_benchmark.sh \
   --bench external_load external_join external_dump external_join_cross external_join_all \
   --repetitions 5
@@ -407,7 +420,7 @@ topic is seeded at bring-up the way the s3 bucket is).
 | `kafka_stream` / `stream` | Continuous-query throughput — `CREATE STREAM AS SELECT ... FROM <src>` (pass-all filter, output count == num_records), then drain the stream's output topic until every row has flowed through (poll → transform → produce). Needs a broker consumer, so the runner imports `confluent-kafka`. |
 
 ```bash
-# all three kafka tests, both default frontends
+# all three kafka tests, mysql + postgres (arrow is skipped: no arrow script)
 ./benchmark/scripts/run_benchmark.sh --bench kafka_ingest kafka_produce kafka_stream --repetitions 5
 
 # just ingest, postgres only
@@ -438,8 +451,7 @@ count rows. Every Kafka statement is built by a `sql_*` helper at the top of
 
 **First `kafka_*` run needs a client-image rebuild.** `seed_kafka.py` and the
 stream runner import `confluent-kafka`, added to `Dockerfile.benchmark`. If a
-imports `confluent-kafka`, added to `Dockerfile.benchmark`. If a
-`benchmark-client:latest` image from before this change is still cached,
+`benchmark-client:latest` image built without it is still cached,
 run once with `--rebuild` (or `--clear`) so the seed step doesn't fail with
 `ModuleNotFoundError: confluent_kafka`.
 
@@ -507,10 +519,10 @@ Each test gets its own `.tracy` file. `tracy-capture` runs inside the
 4. `./benchmark/manual/stop_service.sh` when done
 
 **Why `ZoneScopedN` is absent from `mysql::Connector::runQuery_`:**
-The MySQL connector uses `co_await` (Boost.Asio) which can resume on a different
-io_context thread. Tracy zones opened before the suspension would close on the wrong
-thread, causing "Zone is ended twice". The outer `mysql::ConnectorManager::executeQuery`
-zone (single-threaded, non-coroutine) provides equivalent coverage.
+The MySQL connector's statement is a Boost.Asio coroutine: a zone opened before a
+`co_await` could close on another thread ("Zone is ended twice"). The backend
+agent's own zones (`backend_agent::read` / `write` / `step`, non-coroutine, around
+the run of the agent's io_context) cover it.
 
 ## Result files
 
@@ -545,28 +557,17 @@ OtterStax crashes between reps.
 
 ## Known OtterStax limitations affecting benchmarks
 
-### Arrow JOIN serialisation crash (open bug)
+### What the pushdown sends
 
-**Symptom:** `"Array length did not match record batch length"` on rep 1, then
-`"Connection refused"` on reps 2–N for all Arrow JOIN sub-tests.
-
-**Cause:** C++ FlightSQL batch serialiser corrupts the Arrow IPC frame when a JOIN
-result set exceeds ~1 000 rows. OtterStax crashes; subsequent reps fail until the next
-`_ensure_otterstax` restart (which happens between tests, not between reps).
-
-**Status:** Arrow is excluded from the default frontend list (`DEFAULT_FRONTENDS=(mysql postgres)`).
-Arrow remains available via `--frontend arrow`. The TODO is documented in
-`benchmark/benchmarks/arrow/connector.py`. Fix the Arrow IPC serialiser in the C++
-FlightSQL handler, then add `arrow` back to `DEFAULT_FRONTENDS`.
-
-Affected tests: `join_same_instance`, `join_cross_engine`, `join_all` via arrow.
-Unaffected: `simple_select`, `complex_select` via arrow (small result sets).
-
-### No predicate pushdown
-
-OtterStax fetches entire tables from each backend and filters in-process (OtterBrix).
-`WHERE` clauses in SQL **do not** reduce rows fetched from backends. This is why
-`join_all` takes 47–90 s even with `WHERE campaign_id <= 50 LIMIT 500`.
+otterbrix offers each connection's backend actor the blocks of a statement over
+its tables (`storage_offer`; `otterbrix/federation/CLAUDE.md`, "Offer"): a
+relation the dialect says whole — a query block over one table with its filters,
+grouping, aggregates, order and window, a JOIN of tables of that connection with
+the block above it — is taken as one statement; every `join_same_instance`
+sub-test is one. A JOIN of tables of different connections (`join_cross_engine`,
+`join_all`) runs in the engine over what each connection's actor takes of its own
+side; what it does not take is read through the table's scan and finished in the
+engine.
 
 ### Connection aliases required
 
@@ -586,19 +587,15 @@ If you need a clean build and the remote is down, wait for it to come back.
 `bench.yaml` is baked into the benchmark-client image at build time. After editing it,
 run `--rebuild` (keeps DB volumes) or `--clear` (also wipes DB data and reinitialises).
 
-**join_all Arrow results show only errors**
-Expected behaviour until the FlightSQL serialiser bug is fixed. Use `--frontend mysql`
-or `--frontend postgres` for join_all.
-
 **Log appears frozen during join_all**
-`join_all` takes ~60 s per rep (OtterStax fetches 60 k rows with no pushdown).
-2 variants × 5 reps × ~60 s ≈ 10 min. Python stdout is now unbuffered
-(`PYTHONUNBUFFERED=1`) so output streams in real time.
+It should not: Python stdout is unbuffered (`PYTHONUNBUFFERED=1`), so output
+streams in real time. A rep that seems stuck is worth profiling (`--perf`; what a
+`join_all` rep sends: "What the pushdown sends").
 
 **"Zone is ended twice" in Tracy captures**
-This was caused by `ZoneScopedN` inside MySQL connector coroutines that cross
-io_context thread boundaries at `co_await` suspension points. Fixed by removing
-the zone from `mysql::Connector::runQuery_`. See the Tracy profiling section above.
+A zone that spans a `co_await` of a coroutine that can resume on another thread
+(the MySQL connector's statement, a query session's handler). See the Tracy
+profiling section above and the root `CLAUDE.md` Tracy rules.
 
 ---
 
@@ -673,13 +670,13 @@ stages:
 
 Valid `query_pool` keys:
 
-| Key | Description | Typical latency |
-| --- | ----------- | --------------- |
-| `simple_select` | `LIMIT 100` point reads across all 6 backends | 2–50 ms |
-| `complex_select` | `GROUP BY + HAVING + ORDER BY LIMIT 1000` | 5–55 ms |
-| `join_same_b` | Same-instance join, Group B only (~5 k rows) | 1–3 s |
-| `join_same_instance` | Same-instance join, both groups (up to 60 k rows) | 3–9 s |
-| `join_cross_engine` | Cross-engine join, Group B tables | 3–5 s |
+| Key | Description |
+| --- | ----------- |
+| `simple_select` | `LIMIT 100` point reads across all 6 backends |
+| `complex_select` | `GROUP BY + HAVING + ORDER BY LIMIT 1000` |
+| `join_same_b` | Same-instance join, Group B only (~5 k rows) |
+| `join_same_instance` | Same-instance join, both groups (up to 60 k rows) |
+| `join_cross_engine` | Cross-engine join, Group B tables |
 
 Built-in profiles in `benchmark/stress/profiles/`:
 

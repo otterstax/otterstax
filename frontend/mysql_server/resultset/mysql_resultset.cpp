@@ -33,12 +33,11 @@ namespace frontend::mysql {
             // can carry a type with no alias, and alias() has no null guard for
             // such a type; it goes out with the empty name.
             column_definition_41 col(column.type().has_alias() ? column.type().alias() : std::string{}, *wire_type);
-            // A DECIMAL column announces its own scale and display length.
-            apply_decimal_metadata(col, column.type());
+            // The flags of its type; a DECIMAL column its own scale and display length.
+            apply_type_metadata(col, column.type());
             col.schema = database_;
             col.table = table_;
             col.org_table = table_;
-            col.column_flags = 0;
             column_defs_.push_back(col);
         }
     }
@@ -58,7 +57,8 @@ namespace frontend::mysql {
     }
 
     std::vector<std::vector<uint8_t>> mysql_resultset::build_packets(mysql_resultset&& resultset,
-                                                                     uint8_t& sequence_id) {
+                                                                     uint8_t& sequence_id,
+                                                                     server_status_flags_t status) {
         std::vector<std::vector<uint8_t>> packets;
         packets.reserve(1 + resultset.column_defs_.size() + 1 + resultset.encoded_rows_.size() + 1);
 
@@ -74,7 +74,7 @@ namespace frontend::mysql {
         }
 
         // EOF after columns
-        packets.emplace_back(build_eof(writer, sequence_id++));
+        packets.emplace_back(build_eof(writer, sequence_id++, 0, status));
 
         // rows
         for (auto&& row : resultset.encoded_rows_) {
@@ -83,7 +83,7 @@ namespace frontend::mysql {
         }
 
         // Final EOF packet
-        packets.emplace_back(build_eof(writer, sequence_id++));
+        packets.emplace_back(build_eof(writer, sequence_id++, 0, status));
         return packets;
     }
 
@@ -109,7 +109,7 @@ namespace frontend::mysql {
                 writer.write_null();
                 continue;
             }
-            writer.write_length_encoded_string(encode_to_text(chunk, i, row_index));
+            writer.write_length_encoded_string(encode_to_text(chunk, i, row_index, {frontend_type::MYSQL}));
         }
     }
 

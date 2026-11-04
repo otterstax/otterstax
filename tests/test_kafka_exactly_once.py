@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2025-2026  OtterStax
 
-"""Kafka exactly-once STREAM integration test (§5.2d, happy-path).
+"""Kafka exactly-once STREAM integration test (happy path).
 
 The STREAM is created with TRANSACTIONAL=true, so the worker runs a transactional
 producer: each batch is begin_transaction -> produce -> send_offsets_to_-
@@ -106,7 +106,7 @@ class ExactlyOnceTest:
         self.create_topic(self.src_topic)
         self.create_topic(self.out_topic)
         self.conn = psycopg.connect(host=self.host, port=PG_PORT, user="testuser",
-                                    password="testpass", dbname="kafka", autocommit=True)
+                                    password="testpass", dbname="main", autocommit=True)
         self.conn.prepare_threshold = None
         with self.conn.cursor() as cur:
             cur.execute(

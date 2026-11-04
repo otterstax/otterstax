@@ -12,7 +12,7 @@ This directory contains three independent benchmark systems:
 
 ## Microbenchmarks (Google Benchmark)
 
-No Docker needed — builds and runs locally in seconds.
+No Docker needed — builds and runs locally.
 
 ```bash
 # All benchmarks, 5 reps
@@ -32,15 +32,15 @@ Results land in `benchmark_results/microbench/<YYYYMMDD_HHMMSS>/`:
 
 ### What is measured
 
-| Benchmark | Description | Typical mean |
-| --- | --- | --- |
-| `BM_ch_to_chunk_{100,1k,10k,100k}` | ClickHouse Block → `data_chunk_t` | 14 µs – 16 ms |
-| `BM_ch_to_chunk_multiblock_10k` | Multi-block merge path | ~1.6 ms |
-| `BM_ch_to_struct` | Schema extraction from ClickHouse Block | ~270 ns |
-| `BM_chunk_to_arrow_schema_{10,50}col` | `data_chunk_t` schema → Arrow schema | 540 ns – 2.6 µs |
-| `BM_mysql_type_mapping_all` | Full MySQL column-type enum mapping | ~33 ns |
-| `BM_parse_{simple_select,join_3table,cross_backend,subquery}` | `GreenplumParser::parse()` | 2–5 µs |
-| `BM_prepare_sql_{simple,cross_backend,subquery}` | `prepare_sql()` subquery extraction | 1.3–2.7 µs |
+| Benchmark | Description |
+| --- | --- |
+| `BM_ch_to_chunk_{100,1k,10k,100k}` | ClickHouse Block → `data_chunk_t` |
+| `BM_ch_to_chunk_multiblock_10k` | Multi-block merge path |
+| `BM_ch_to_struct` | Schema extraction from ClickHouse Block |
+| `BM_chunk_to_arrow_schema_{10,50}col` | `data_chunk_t` schema → Arrow schema |
+| `BM_mysql_type_mapping_all` | Full MySQL column-type enum mapping |
+| `BM_parse_{simple_select,join_3table,cross_backend,subquery}` | `GreenplumParser::parse()` |
+| `BM_prepare_sql_{simple,cross_backend,subquery}` | `prepare_sql()` subquery extraction |
 
 ### CLI reference
 
@@ -80,7 +80,7 @@ Run everything end-to-end — builds images if needed, starts databases, initial
 data, runs all benchmarks, and writes results.
 
 ```bash
-# Default: mysql + postgres frontends, the 5 cross-backend tests, 10 reps each
+# Default: mysql + postgres + arrow frontends, the 5 cross-backend tests, 10 reps each
 # (external_* s3/file tests are opt-in — see "External-table tests" below)
 ./benchmark/scripts/run_benchmark.sh
 
@@ -158,7 +158,7 @@ files as the automated run, plus a `summary.md`.
 ### 4. Run a custom query
 
 ```bash
-echo "SELECT * FROM mysql1.benchdb1.campaigns LIMIT 10" > /tmp/q.sql
+echo "SELECT * FROM mysql1.benchdb1.public.campaigns LIMIT 10" > /tmp/q.sql
 ./benchmark/manual/run_query.sh --frontend mysql /tmp/q.sql
 ```
 
@@ -172,7 +172,7 @@ Generated  : 2026-06-01 14:32:11 UTC
 Commit     : d8fdb70...
 q          : OK
 rows       : 10
-elapsed_ms : 45.2
+elapsed_ms : <elapsed>
 ```
 
 ### 5. Stop services
@@ -186,16 +186,13 @@ elapsed_ms : 45.2
 
 ## Test categories
 
-| Test                 | What it measures                              | Typical latency |
-|----------------------|-----------------------------------------------|-----------------|
-| `simple_select`      | `LIMIT 100` point-read per table              | 2–50 ms         |
-| `complex_select`     | `GROUP BY` + `HAVING` + `ORDER BY LIMIT 1000` | 5–55 ms         |
-| `join_same_instance` | JOIN within the same engine instance          | 3–9 s           |
-| `join_cross_engine`  | JOIN across two different engine instances    | 3–5 s           |
-| `join_all`           | 3-way JOIN: MySQL + PostgreSQL + ClickHouse   | 47–90 s         |
-
-> **Note:** `join_all` is slow because OtterStax fetches entire tables and filters
-> in-process — there is no predicate pushdown to backends.
+| Test                 | What it measures                              |
+|----------------------|-----------------------------------------------|
+| `simple_select`      | `LIMIT 100` point-read per table              |
+| `complex_select`     | `GROUP BY` + `HAVING` + `ORDER BY LIMIT 1000` |
+| `join_same_instance` | JOIN within the same engine instance          |
+| `join_cross_engine`  | JOIN across two different engine instances    |
+| `join_all`           | 3-way JOIN: MySQL + PostgreSQL + ClickHouse   |
 
 ---
 
@@ -204,8 +201,8 @@ elapsed_ms : 45.2
 Five opt-in workloads that exercise the `CREATE EXTERNAL TABLE` / `COPY ... TO`
 grammar extensions. Each runs both a local-file (`/fixtures` mount) and an s3
 (seeded RustFS) source, so file vs s3 are directly comparable in the sub-test
-breakdown. `mysql` and `postgres` frontends only — `arrow` is excluded by the
-same JOIN serialisation bug as the default test set.
+breakdown. `mysql` and `postgres` frontends only — there is no arrow script for
+them (the Flight SQL DDL path is not covered), so `run_benchmark.sh` skips arrow.
 
 | Test                  | Workload                                                                                | Sub-tests |
 |-----------------------|-----------------------------------------------------------------------------------------|-----------|
@@ -230,7 +227,7 @@ The `bench_rustfs` s3 alias is declared in `benchmark/config.yaml` and
 registered at server startup (no runtime registration step).
 
 ```bash
-# All five external tests, both frontends
+# All five external tests, mysql + postgres (arrow is skipped: no arrow script)
 ./benchmark/scripts/run_benchmark.sh \
   --bench external_load external_join external_dump external_join_cross external_join_all \
   --repetitions 5
@@ -257,12 +254,14 @@ Fixture sizes come from the `external:` block in `bench.yaml` (defaults:
 
 ## Connection aliases
 
-All SQL must qualify table names with the registered alias:
+A remote table is named in four parts, `alias.database.schema.table` (lower case).
+MySQL / ClickHouse have the one schema `public`; a PostgreSQL connection's schema is the
+`schema` of its `config.yaml` entry (`public` here). Three parts always name a local table.
 
 ```sql
-SELECT * FROM mysql1.benchdb1.campaigns LIMIT 5;
+SELECT * FROM mysql1.benchdb1.public.campaigns LIMIT 5;
 SELECT * FROM pg1.benchpg1.public.impressions LIMIT 5;
-SELECT * FROM ch1.benchch1.daily_stats LIMIT 5;
+SELECT * FROM ch1.benchch1.public.daily_stats LIMIT 5;
 ```
 
 | Alias  | Engine     | Database  | Group | Size        |

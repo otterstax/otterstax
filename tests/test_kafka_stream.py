@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2025-2026  OtterStax
 
-"""Kafka continuous STREAM integration test (§5.2c, stateless).
+"""Kafka continuous STREAM integration test (stateless).
 
 CREATE SOURCE, then CREATE STREAM ... AS SELECT ... WHERE ... — a continuous
 worker consumes the source topic, applies the SELECT (filter + projection) to
@@ -96,7 +96,7 @@ class StreamTest:
         self.create_topic(self.src_topic)
         self.create_topic(self.out_topic)
         self.conn = psycopg.connect(host=self.host, port=PG_PORT, user="testuser",
-                                    password="testpass", dbname="kafka", autocommit=True)
+                                    password="testpass", dbname="main", autocommit=True)
         self.conn.prepare_threshold = None
         with self.conn.cursor() as cur:
             cur.execute(

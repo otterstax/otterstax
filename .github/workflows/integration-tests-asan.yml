@@ -26,6 +26,7 @@ jobs:
           build-args: |
             BUILD_TYPE=Release
             ENABLE_ASAN=ON
+            ASAN_DEPS=true
           cache-from: type=gha,scope=asan
           cache-to: type=gha,mode=max,scope=asan
 

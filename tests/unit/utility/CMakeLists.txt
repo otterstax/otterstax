@@ -6,10 +6,8 @@ set(${PROJECT_NAME}_SOURCES
     test_ch_connector.cpp
     test_ch_statement.cpp
     test_connector_errors.cpp
-    test_connector_manager.cpp
     test_mysql_connector.cpp
     test_parse_port.cpp
-    test_session.cpp
     test_wait_barrier.cpp
 )
 
@@ -22,9 +20,8 @@ target_include_directories(
 
 target_link_libraries(
     ${PROJECT_NAME} PRIVATE
-    # test_connector_manager.cpp drives the real ConnectorManagers (with mock
-    # connectors) through a real CatalogManager over the otterbrix mock, so the
-    # binary links the internal libraries the same way test_system does.
+    # The connectors and the wait_barrier helpers live in the internal
+    # libraries, so the binary links them the same way test_system does.
     lib_otterstax
     actor-zeta::actor-zeta
     otterbrix::otterbrix
@@ -33,7 +30,6 @@ target_link_libraries(
     # dependency of this binary, not just a transitive include.
     Boost::boost
     Catch2::Catch2
-    otterbrix_log
 )
 
 if(ENABLE_TRACY)

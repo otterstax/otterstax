@@ -27,11 +27,11 @@ and asserts on the exact packets the server answers with:
     result without columns is exactly what the frontend answers with an OK
     packet (a DML), so neither shape may degrade into one.
   * A prepared statement left unexecuted at COM_QUIT, or at a socket drop
-    without COM_QUIT: the connection's teardown releases it on the Worker
-    (Scheduler::close_statement) and the server keeps accepting and serving
+    without COM_QUIT: the connection's teardown releases it on the query session
+    (the connection closes its query session) and the server keeps accepting and serving
     connections. The release itself is not visible on the wire — this case
     proves the teardown path completes (no crash, no wedged pool slot), not
-    the Worker-side erasure.
+    the session-side erasure.
 
 Everything runs against otterbrix-internal tables, so no backend is involved.
 """
@@ -43,7 +43,7 @@ import sys
 
 from config import get_host, MYSQL_PORT
 
-DB = "mysql_wire_proto"
+DB = "mysql_wire_proto"          # a schema of the session's database, main
 PLAIN = "plain"
 WIDE = "wide"
 UWIDE = "uwide"
@@ -236,7 +236,7 @@ class MysqlWireProtocolTest:
 
     def setup(self):
         self.wire = self.connect()
-        self.run_ok(self.wire, f"CREATE DATABASE {DB}")
+        self.run_ok(self.wire, f"CREATE SCHEMA {DB}")
         self.database_created = True
         self.run_ok(self.wire, f"CREATE TABLE {DB}.{PLAIN} (id bigint, name string)")
         self.created_tables.append(PLAIN)
@@ -257,7 +257,7 @@ class MysqlWireProtocolTest:
             for table in self.created_tables:
                 self.wire.query(f"DROP TABLE {DB}.{table}")
             if self.database_created:
-                self.wire.query(f"DROP DATABASE {DB}")
+                self.wire.query(f"DROP SCHEMA {DB} CASCADE")
         finally:
             self.wire.quit()
             self.wire.close()

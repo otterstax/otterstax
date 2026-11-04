@@ -14,7 +14,7 @@
 // constructor waits for in Handshake(), and the Pong that Ping() waits for.
 // On the connector that is connect() (constructor + Ping) and isConnected()
 // (Ping). At server start connect() runs on the startup thread inside
-// ComponentManager::register_connections, so a silent ClickHouse kept the
+// remote_backends_t::open, so a silent ClickHouse kept the
 // wire-protocol ports from ever coming up.
 //
 // Also pinned: a query must not enter the driver's RetryGuard. With
@@ -22,8 +22,8 @@
 // sleeps retry_timeout, reconnects and pings again, leaving that loop only
 // when the ping succeeds or the reconnect fails on exactly its send_retries-th
 // turn — a backend that completes every handshake but never answers a Ping
-// keeps it reconnecting for good, on the connector pool's io thread. The
-// manager already pings (isConnected) in front of every query, so the
+// keeps it reconnecting for good, on the thread running the statement. The
+// backend agent already pings (isConnected) in front of every query, so the
 // connector opens the driver without ping_before_query and a query against
 // such a backend is one bounded recv on the query itself.
 //
@@ -34,7 +34,7 @@
 // saw (atomics) and the test thread asserts.
 
 #include "connectors/clickhouse/connector.hpp"
-#include "connectors/clickhouse/manager.hpp"
+#include "connectors/clickhouse/connector.hpp"
 #include "utility/thread_pool_manager.hpp"
 #include "utility/wait_barrier.hpp"
 
@@ -466,7 +466,7 @@ TEST_CASE("ch Connector: isConnected() when the server completed the handshake a
 }
 
 TEST_CASE("ch Connector: a query against a server that completes every handshake but never answers a ping fails with io_error in bounded time") {
-    // Two Pongs — the Ping connect() sends and the isConnected() the manager
+    // Two Pongs — the Ping connect() sends and the isConnected() the backend agent
     // runs in front of every query — then nothing is ever answered again, on
     // this connection or on any the driver opens afterwards.
     fake_clickhouse_server server{fake_clickhouse_server::behaviour::handshake, std::string(USER), 2};
@@ -477,9 +477,8 @@ TEST_CASE("ch Connector: a query against a server that completes every handshake
     auto connector = ch::make_ch_connector(resource, params_for(server.port()), "unanswered");
     REQUIRE_FALSE(connector->connect().contains_error());
 
-    // ch::ConnectorManager::executeQuery minus the registry lookup: the
-    // liveness check on the calling thread, then the query marshaled off the
-    // pool's io_context and its outcome taken with get().
+    // What a backend agent does: the liveness check on the calling thread,
+    // then the query marshaled off an io_context and its outcome taken with get().
     REQUIRE(connector->isConnected());
     REQUIRE(server.pongs() == 2);
     // runQuery holds only a reference to its handler: named, and declared before

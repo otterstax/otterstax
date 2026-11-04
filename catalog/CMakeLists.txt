@@ -1,13 +1,25 @@
+# The discovery queries the backend agents run (otterstax_federation links it); the registration
+# of what they found builds on the federation.
+add_library(catalog_discovery discovery.hpp discovery.cpp)
+
+target_link_libraries(catalog_discovery PUBLIC
+    otterbrix_local
+    otterbrix::otterbrix
+    Boost::boost
+)
+
+target_include_directories(catalog_discovery PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+)
+
 set(CATALOG_HEADERS
-    catalog_manager.hpp
-    discovery.hpp
-    schema_store.hpp
+    ownership.hpp
+    registration.hpp
 )
 
 set(CATALOG_SOURCES
-    catalog_manager.cpp
-    discovery.cpp
-    schema_store.cpp
+    ownership.cpp
+    registration.cpp
 )
 
 add_library(catalog
@@ -16,10 +28,11 @@ add_library(catalog
 )
 
 target_link_libraries(catalog PUBLIC
+    catalog_discovery
+    otterstax_federation
     otterbrix_local
     Boost::boost
     otterbrix::otterbrix
-    otterbrix_log
     actor-zeta::actor-zeta
     arrow::arrow
     PostgreSQL::PostgreSQL

@@ -23,6 +23,7 @@
 namespace tsl {
 
 using components::vector::data_chunk_t;
+using chunk_run_t = std::pmr::vector<data_chunk_t>;
 
 namespace {
     // If data starts with '[', unwrap JSON array to NDJSON (one object per line)
@@ -53,7 +54,7 @@ namespace {
         return std::pmr::vector<uint8_t>(data, data + size, res);
     }
 
-    core::result_wrapper_t<data_chunk_t> read_json(std::pmr::memory_resource* res,
+    core::result_wrapper_t<chunk_run_t> read_json(std::pmr::memory_resource* res,
                                                    const std::shared_ptr<arrow::io::InputStream>& input) {
         auto read_opts = arrow::json::ReadOptions::Defaults();
         read_opts.use_threads = false;
@@ -64,19 +65,19 @@ namespace {
         auto reader_result = arrow::json::TableReader::Make(
             arrow_pool(res), input, read_opts, parse_opts);
         if (!reader_result.ok()) {
-            return arrow_error(res, core::error_code_t::conversion_failure,
+            return arrow_error(res, core::error_code_t::invalid_text_representation,
                                "ndjson_to_chunk: reader creation failed", reader_result.status());
         }
 
         auto table_result = (*reader_result)->Read();
         if (!table_result.ok()) {
-            return arrow_error(res, core::error_code_t::conversion_failure,
+            return arrow_error(res, core::error_code_t::invalid_text_representation,
                                "ndjson_to_chunk: read failed", table_result.status());
         }
 
         auto batch = (*table_result)->CombineChunksToBatch(arrow_pool(res));
         if (!batch.ok()) {
-            return arrow_error(res, core::error_code_t::conversion_failure,
+            return arrow_error(res, core::error_code_t::internal_error,
                                "ndjson_to_chunk: combine batches failed", batch.status());
         }
 
@@ -84,7 +85,7 @@ namespace {
     }
 } // namespace
 
-core::result_wrapper_t<data_chunk_t> ndjson_to_chunk(std::pmr::memory_resource* res, const std::string& file_path) {
+core::result_wrapper_t<chunk_run_t> ndjson_to_chunk(std::pmr::memory_resource* res, const std::string& file_path) {
     OTX_ZONE_N("tsl::ndjson_to_chunk(file)");
     auto file_result = arrow::io::ReadableFile::Open(file_path, arrow_pool(res));
     if (!file_result.ok()) {
@@ -94,7 +95,7 @@ core::result_wrapper_t<data_chunk_t> ndjson_to_chunk(std::pmr::memory_resource* 
     return read_json(res, *file_result);
 }
 
-core::result_wrapper_t<data_chunk_t> ndjson_to_chunk(std::pmr::memory_resource* res, const uint8_t* data, size_t size) {
+core::result_wrapper_t<chunk_run_t> ndjson_to_chunk(std::pmr::memory_resource* res, const uint8_t* data, size_t size) {
     OTX_ZONE_N("tsl::ndjson_to_chunk(buffer)");
     auto unwrapped = maybe_unwrap_array(res, data, size);
     auto buffer = std::make_shared<arrow::Buffer>(unwrapped.data(),
@@ -103,7 +104,7 @@ core::result_wrapper_t<data_chunk_t> ndjson_to_chunk(std::pmr::memory_resource* 
     return read_json(res, input);
 }
 
-core::result_wrapper_t<data_chunk_t> ndjson_to_chunk(std::pmr::memory_resource* res,
+core::result_wrapper_t<chunk_run_t> ndjson_to_chunk(std::pmr::memory_resource* res,
                                                      std::shared_ptr<arrow::io::InputStream> input) {
     OTX_ZONE_N("tsl::ndjson_to_chunk(stream)");
     if (!input) {

@@ -10,7 +10,7 @@ import pyarrow as pa
 
 import config
 
-_ORDERS = f"{config.CH_ALIAS}.{config.CH_DATABASE}.orders"
+_ORDERS = f"{config.CH_ALIAS}.{config.CH_DATABASE}.public.orders"
 
 
 def validate_by_request(client, test_name, query, expected_schema):

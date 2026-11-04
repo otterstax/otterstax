@@ -3,7 +3,7 @@
 
 """FlightSQL over otterbrix-internal tables: the GetFlightInfo / DoGet contract.
 
-GetFlightInfoStatement hands out the schema the Worker resolved at prepare time
+GetFlightInfoStatement hands out the schema the query session resolved at prepare time
 and DoGetStatement streams record batches over exactly that schema; nothing is
 re-derived from the result rows. Two things follow and are asserted here:
 
@@ -29,6 +29,7 @@ from flightsql import FlightSQLClient
 
 import config
 
+# A schema of the database `main` (the session's place): `DB.t` names its tables.
 DB = "flight_local_db"
 
 
@@ -46,7 +47,7 @@ class FlightSQLLocalTableTest:
     def setup(self):
         """Two INT tables sharing the key name, plus one table per 128-bit-wide type."""
         self.client = FlightSQLClient(host=self.host, port=config.FLIGHT_PORT, insecure=True)
-        self._update(f"CREATE DATABASE {DB}")
+        self._update(f"CREATE SCHEMA {DB}")
         self._create_table("a", "(id INT, x INT)")
         self._create_table("b", "(id INT, y INT)")
         self._create_table("wide", "(id INT, amount decimal(38, 10))")
@@ -64,9 +65,9 @@ class FlightSQLLocalTableTest:
             except Exception as e:
                 print(f"cleanup: DROP TABLE {DB}.{table} failed: {e}")
         try:
-            self._update(f"DROP DATABASE {DB}")
+            self._update(f"DROP SCHEMA {DB}")
         except Exception as e:
-            print(f"cleanup: DROP DATABASE {DB} failed: {e}")
+            print(f"cleanup: DROP SCHEMA {DB} failed: {e}")
 
     # ── helpers ─────────────────────────────────────────────────────────────
     def _update(self, sql):

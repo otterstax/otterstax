@@ -3,86 +3,68 @@
 [![Unit Tests](https://github.com/otterstax/otterstax/actions/workflows/unit-tests.yml/badge.svg)](https://github.com/otterstax/otterstax/actions/workflows/unit-tests.yml)
 [![Integration Tests](https://github.com/otterstax/otterstax/actions/workflows/integration-tests.yml/badge.svg)](https://github.com/otterstax/otterstax/actions/workflows/integration-tests.yml)
 
-A high-performance SQL federation server that provides unified access to multiple
-databases through MySQL, PostgreSQL, and Apache Arrow FlightSQL wire protocols.
-OtterStax is built on top of the Otterbrix query engine and is docker-friendly
-for easy integration testing and deployment.
+A SQL federation server: one endpoint over several databases, reached through the MySQL and
+PostgreSQL wire protocols, Apache Arrow Flight SQL and Spark Connect. OtterStax is built on the
+Otterbrix query engine, which plans and runs every statement; the tables of the remote databases
+are tables of its catalog, read and written through their backends.
 
 ## Features
 
-- Multi-protocol support: MySQL, PostgreSQL and FlightSQL
-- Database federation: query multiple MariaDB/MySQL, PostgreSQL, and ClickHouse
-  backends through a single endpoint
-- Otterbrix integration: powered by the Otterbrix query engine
-- **File and S3 external tables**: `CREATE EXTERNAL TABLE` ingests parquet,
-  csv, or ndjson from a local path or an `s3://…` URI into the engine; `COPY
-  (<select>) TO '…'` exports any query result back to a local file or an S3
-  object — see [S3 / file external tables](#s3--file-external-tables) below.
-- Docker ready: compose files to bring up test databases and the server
+- Protocols: MySQL, PostgreSQL, Flight SQL, Spark Connect (PySpark 3.5–4.2)
+- Federation: MariaDB / MySQL, PostgreSQL and ClickHouse backends in one statement; a query block
+  over one backend is pushed down to it whole
+- Transactions over local and remote tables (PostgreSQL / MySQL backends), SAVEPOINT included
+- **File and S3 external tables**: `CREATE EXTERNAL TABLE` loads parquet, csv or ndjson from a local
+  path or an `s3://…` URI; `COPY (<select>) TO '…'` exports a query result — see
+  [S3 / file external tables](#s3--file-external-tables)
+- Kafka sources and streams (`CREATE SOURCE` / `CREATE STREAM`)
+- Docker ready: compose files bring up the backends and the server
 
-## Architecture
+## Protocols
 
-OtterStax runs several protocol servers concurrently:
+| Protocol      | Default port |
+|---------------|-------------:|
+| Flight SQL    | 8815 |
+| MySQL         | 8816 |
+| PostgreSQL    | 8817 |
+| Spark Connect | 15002 |
 
-| Protocol   | Default Port | Description |
-|------------|--------------:|-------------|
-| FlightSQL  | 8815          | Apache Arrow FlightSQL protocol |
-| MySQL      | 8816          | MySQL wire protocol |
-| PostgreSQL | 8817          | PostgreSQL wire protocol |
+```bash
+psql -h localhost -p 8817 -U demo main         # the engine's default database is main
+mysql -h 127.0.0.1 -P 8816 -u demo
+```
 
-Server settings and all remote backends / S3 aliases live in a **single
-`config.yaml`** and are read once at server startup (see
-[Connection configuration](#connection-configuration)).
+A PostgreSQL client must name a database the engine has (`main` by default); another one is refused
+(`FATAL 3D000`).
 
 ## Connection configuration
 
-There is a **single config file, `config.yaml`**. It holds the wire-server
-settings and, under a `connections:` section, all remote backends (MariaDB/MySQL,
-PostgreSQL, ClickHouse) and S3 aliases. It is read **once at server startup**; the
-`connections:` section is the single source of truth for connections —
-**there is no runtime add/remove/update API**. To change connections, edit
-`config.yaml` and restart the server.
+There is a **single config file, `config.yaml`**: the server settings under `service:` and, under
+`connections:`, every remote backend and S3 alias. It is read **once at startup** — there is no
+runtime add / remove API; edit the file and restart.
 
-### Locating the file
-
-The path is passed with `--config PATH` and defaults to `config.yaml`, resolved
-**relative to the server's working directory**:
-
-```bash
-./build/server --config path/to/config.yaml
-```
-
-In the provided Docker images the server runs from `/app/build/Release` with no
-`--config`, so it reads `/app/build/Release/config.yaml` — the compose files
-bind-mount a stack-specific `config.yaml` onto that path (and `Dockerfile.test`
-bakes one in for the integration tests). A missing file means the server starts
-with default ports and no connections.
-
-### File format
+The path is `--config PATH` (default `config.yaml`, relative to the working directory). The Docker
+images run the server from `/app/build/Release` with no `--config`, so the compose files
+bind-mount a `config.yaml` onto `/app/build/Release/config.yaml` (`Dockerfile.test` bakes one in).
+A missing file starts the server with default ports and no connections.
 
 ```yaml
 service:
-  flight_sql:
-    host: "0.0.0.0"
-    port: 8815
-  mysql:
-    port: 8816          # wire-server port (NOT a backend)
-  postgres:
-    port: 8817          # wire-server port (NOT a backend)
-  connection_retry:     # optional; startup retry for opening backends
-    max_attempts: 10    #   default 1 (one-shot)
-    delay_ms: 2000      #   default 1000
+  flight_sql: { host: "0.0.0.0", port: 8815 }
+  mysql:      { port: 8816 }           # wire-server port, not a backend
+  postgres:   { port: 8817 }           # wire-server port, not a backend
+  spark_connect: { host: "0.0.0.0", port: 15002 }
+  connection_retry: { max_attempts: 10, delay_ms: 2000 }   # optional; default one attempt
 
 connections:
   mysql:
-    - alias: mysql      # outermost qualifier in federated SQL: mysql.bill.<table>
+    - alias: mysql                     # the first part of every name of this connection
       host: demo-mariadb
-      port: "3306"      # note: port is a string; optional (empty → driver default)
+      port: "3306"                     # a string; optional (empty: the driver's default)
       username: demo
       password: demo
       database: bill
-      table: ""
-
+      table: ""                        # optional: a name limits the startup discovery to it
   postgresql:
     - alias: pg
       host: demo-postgres
@@ -90,9 +72,7 @@ connections:
       username: demo
       password: demo
       database: shop
-      schema: shop      # optional, defaults to "public"
-      table: ""
-
+      schema: shop                     # optional: empty = every user schema of the database
   clickhouse:
     - alias: ch
       host: demo-clickhouse
@@ -100,286 +80,155 @@ connections:
       username: demo
       password: demo
       database: ev
-      table: ""
-
+      pool_size: 2                     # optional: connections kept open (default 4)
   s3:
-    - alias: demo_s3    # referenced by CREATE EXTERNAL TABLE / COPY ... TO via s3_alias=
+    - alias: demo_s3                   # referenced by s3_alias = '...'
       access_key: rustfsadmin
       secret_key: rustfsadmin
-      region: us-east-1         # optional
-      endpoint: demo-rustfs:9000 # optional; switches to http + path-style (RustFS)
+      region: us-east-1                # optional
+      endpoint: demo-rustfs:9000       # optional; http + path-style (RustFS and other S3-compatible stores)
 ```
 
-Wire-server settings live under the top-level `service:` node so
-`service.mysql`/`service.postgres` (wire-server ports) never collide with the
-backends under `connections:`. All `connections:` sections are optional; each
-backend requires `alias`/`host`/`username`/`database` (`port`/`table` optional).
-An entry missing a required field **aborts startup** (fail-fast — the config must
-be fixed), as does malformed YAML. A missing file means the server starts with no
-registered connections. A *valid* connection whose backend is unreachable is
-retried per `service.connection_retry` and, if still down, logged without
-aborting startup (the other backends and local engine stay usable).
+A backend alias is lower-case letters, digits and `_` (not starting with a digit); `federation` and
+`main` are reserved. An invalid entry or malformed YAML **aborts startup**; a valid connection whose
+backend is unreachable is retried per `service.connection_retry` and, if still down, logged — the
+server starts and its statements fail until the backend is back.
 
-### Using an alias
+### Names
 
-Once registered, an alias is the outermost database qualifier in federated SQL:
+A remote table is written in four parts, `alias.database.schema.table`; a MySQL / ClickHouse
+connection has the one schema `public`, a PostgreSQL one its own schemas. Three parts or fewer
+name a local table (`database.schema.table`, `schema.table`, `table`; the session's default place is
+`main.public`).
 
 ```sql
-SELECT * FROM mysql.bill.orders
-JOIN pg.shop.customers ON mysql.bill.orders.customer_id = pg.shop.customers.id;
+SELECT o.order_id, c.name
+FROM   mysql.bill.public.orders o
+JOIN   pg.shop.shop.customers c ON o.customer_id = c.customer_id;
 ```
 
-and the `s3_alias` for external tables:
+A table created on the backend after startup is found on its first use.
 
-```sql
-CREATE EXTERNAL TABLE otter.regions
-    WITH (s3_alias = 'demo_s3', location = 's3://demo-bucket/regions.csv', format = 'csv');
-```
-
-Ready-made `config.yaml` files ship with each runnable stack: `examples/demo/`,
-`examples/simple/example_connetion/`, `tests/scripts/`, `scripts/database/`, and
-`benchmark/` (plus a template at the repo root).
+Ready-made `config.yaml` files ship with each stack: `examples/demo/`, `examples/quick_start/`,
+`tests/scripts/`, `scripts/database/` and `benchmark/` (plus a template at the repo root).
 
 ## S3 / file external tables
 
-OtterStax can pull data into the engine from a local file or an S3-compatible
-object store (AWS S3, RustFS, …) and dump query results back out, all over the
-standard wire protocols. The surface SQL is two grammar extensions:
-
 ```sql
--- Load (auto-detects format from the file extension when omitted)
-CREATE EXTERNAL TABLE db.t
+CREATE SCHEMA eg;
+
+-- Load (the format is taken from the extension when omitted)
+CREATE EXTERNAL TABLE eg.t
     WITH (location = '/path/to/data.parquet', format = 'parquet');
 
-CREATE EXTERNAL TABLE db.t
-    WITH (s3_alias = 'rustfs1',
-          location = 's3://bucket/data.csv',
-          format   = 'csv');
+CREATE EXTERNAL TABLE eg.r
+    WITH (s3_alias = 'demo_s3', location = 's3://bucket/data.csv', format = 'csv');
 
--- Export (inner SELECT is re-parsed and executed by the engine)
-COPY (SELECT * FROM db.t WHERE …) TO '/tmp/out.ndjson'
-    WITH (format = 'ndjson');
-
-COPY (SELECT * FROM db.t) TO 's3://bucket/exported/out.csv'
-    WITH (s3_alias = 'rustfs1', format = 'csv');
+-- Export
+COPY (SELECT * FROM eg.t WHERE …) TO '/tmp/out.ndjson' WITH (format = 'ndjson');
+COPY (SELECT * FROM eg.t) TO 's3://bucket/exported/out.csv' WITH (s3_alias = 'demo_s3', format = 'csv');
 ```
 
-- **Supported formats**: `parquet`, `csv`, `ndjson` (read and write).
-- **Parquet compression** read/write: snappy, brotli, zlib (gzip), lz4, zstd
-  (uncompressed too).
-- **Format auto-detection**: optional — inferred from the file extension when
-  the `format` option is omitted.
-- **After load**: the external table becomes a normal otterbrix-internal
-  table; `SELECT`, `INSERT`, JOIN against other tables, `COPY ... TO` all
-  work the same way. JOINs between any combination of loaded external
-  sources execute in the engine in a single statement, and so do JOINs that
-  mix a **registered remote backend** (MariaDB / MySQL / PostgreSQL /
-  ClickHouse) with an otterbrix-internal table — the backend manager fetches
-  its slice into the engine as `raw_data` and the JOIN runs in-process. (See
-  the deep-dive in [`CLAUDE.md`](CLAUDE.md#working-join-shapes) for the
-  width-of-the-JOIN-key footgun to keep in mind.)
-- **S3 credentials**: declare a named alias in the `connections.s3:` section of
-  `config.yaml`, then reference it through `s3_alias=...`:
-
-  ```yaml
-  s3:
-    - alias: rustfs1
-      access_key: "…"
-      secret_key: "…"
-      region: us-east-1
-      endpoint: rustfs:9000
-  ```
-
-  The `endpoint` field switches the underlying Arrow S3 client to http +
-  path-style addressing (needed for RustFS and other S3-compatible stores); omit it to target real AWS.
-
-Implementation lives under `connectors/{s3,file}/` (raw I/O),
-`integration/s3/` (the `S3Manager` orchestrator), and
-`otterbrix/parser/grammar_extention/{s3,file}/` (the parser extensions). The
-top-level [`CLAUDE.md`](CLAUDE.md#external-tables--file--s3) has the full
-end-to-end actor flow.
+- Formats: `parquet` (snappy, brotli, zlib, lz4, zstd), `csv`, `ndjson`, read and write.
+- The target is named as in `CREATE TABLE`; its schema must exist.
+- A loaded table is an ordinary engine table: `SELECT`, `INSERT`, JOINs with local, external and
+  remote tables, `COPY ... TO`. Keep JOIN-key widths equal on both sides (an int32 against an
+  int64 key matches nothing; see [`CLAUDE.md`](CLAUDE.md#external-tables--file--s3)).
+- S3 objects are streamed, never staged on local disk.
 
 ## Requirements
 
-### Build
+- CMake 3.15+, a C++20 compiler with coroutines, Conan 2.x
+- Docker & Docker Compose, Python 3 (clients and tests)
 
-- CMake 3.15+
-- C++20-capable compiler with coroutine support
-- Conan (2.x) package manager
+## Building
 
-### Runtime (for local testing)
-
-- Docker & Docker Compose
-- Python 3.x (used by clients and test helpers)
-
-- Docker & Docker Compose
-- Python 3.x (used by clients and test helpers)
-
-These instructions assume you are in the repository root.
-
-### Using Docker Compose (recommended for integration testing)
-
-1. Generate test data:
+otterbrix (`1.0.0b2-rc-4`) and actor-zeta come from the `otterbrix` Conan remote; `--build missing`
+builds otterbrix from its recipe where the remote has no binary for your configuration (see
+[`CLAUDE.md`](CLAUDE.md#critical-dependency-versions-conanfilepy)). Size the build jobs to your RAM
+(about 1.5 GB per job).
 
 ```bash
-python fixtures/generate_data.py
+pip install "conan>=2.0" && conan profile detect --force
+conan remote add otterbrix https://conan.otterbrix.com
+conan install conanfile.py --build missing -s build_type=Release -s compiler.cppstd=20
+cmake -S . -B build/Release -DCMAKE_TOOLCHAIN_FILE=build/Release/generators/conan_toolchain.cmake
+cmake --build build/Release --parallel <JOBS>
+./build/Release/server --config config.yaml
 ```
-
-2. Start services (databases + server):
-
-```bash
-docker compose up
-```
-
-3. Configure database connections. The `docker compose up` stack mounts
-   `scripts/database/config.yaml` into the server; edit its `connections:`
-   section to point at your backends and s3 aliases, then restart the server —
-   connections are read only at startup (there is no runtime registration step).
-
-4. Run example queries using the Python client:
-
-```bash
-python examples/simple/flight_sql_example.py examples/simple/example_1.txt
-```
-
-3. (Optional) Add example database connections used by clients:
-
-1. Install and configure Conan (example using a recommended version):
-
-```bash
-pip install "conan>=2.0"
-conan profile detect --force
-# (optional) add Otterbrix remote if required by your conanfile
-# conan remote add otterbrix https://conan.otterbrix.com
-```
-
-2. Create build directory and install dependencies:
-
-```bash
-mkdir -p build && cd build
-conan install ../conanfile.py --build missing -s build_type=Release
-```
-
-3. Configure and build with CMake:
-
-```bash
-cmake -S .. -B . -DCMAKE_BUILD_TYPE=Release
-cmake --build . -- -j$(nproc)
-```
-
-4. Run the server (from the build directory or repo root if configured):
-
-```bash
-./build/server
-```
-
-## Command-line Options
 
 ```
 --help, -h        Show help message
 --config <path>   Path to configuration file (default: config.yaml)
 ```
 
-## Testing
-
-### Run integration tests (Docker-based)
+## Running with Docker Compose
 
 ```bash
-./build/server
+python3 fixtures/generate_data.py  # test data
+docker compose up                  # databases + server; connections from scripts/database/config.yaml
 ```
 
-The script brings up MariaDB/PostgreSQL/ClickHouse containers, loads test data,
-starts the OtterStax server, runs the full Python integration test suite, then
+`examples/quick_start/` and `examples/demo/` are self-contained stacks with their own READMEs.
+
+## Testing
+
+```bash
+./docker-run-tests.sh [-j N] [--tracy | --tracy-sep]
+```
+
+Builds the test image (its `ctest` step runs the C++ suites), brings up MariaDB / PostgreSQL /
+ClickHouse / RustFS / Kafka, runs the Python integration suite and the PySpark client matrix, then
 tears everything down.
 
 | Option | Description |
 | ------ | ----------- |
-| `-h`, `--help` | Print usage and exit |
-| `--tracy` | Collect a single Tracy profile for the entire run → `tracy_profiles/<timestamp>/otterstax.tracy` |
-| `--tracy-sep` | Collect one Tracy profile **per test** → `tracy_profiles/<timestamp>/<test_name>.tracy`. Otterstax is restarted between tests so each file is cleanly finalised. |
-| `-j N` | Parallel jobs for the Docker image build (default: all cores inside the container) |
+| `-j N` | Parallel jobs for the image build (capped to Docker's RAM when omitted) |
+| `--tracy` | One Tracy profile for the whole run → `tracy_profiles/<timestamp>/otterstax.tracy` |
+| `--tracy-sep` | One Tracy profile per test (the server restarts between tests) |
 
-### Benchmark suite
+### Benchmarks
 
 ```bash
 ./benchmark/scripts/run_benchmark.sh [OPTIONS]
 ```
 
-Runs the full benchmark harness: builds images, starts backend DBs (MariaDB, PostgreSQL,
-ClickHouse), initialises data, runs latency tests across MySQL and PostgreSQL wire frontends,
-and writes results to `benchmark_results/<timestamp>/`.
+Builds the images, starts the backends, loads data, runs latency tests over the wire frontends and
+writes `benchmark_results/<timestamp>/`.
 
 | Option | Description |
 | ------ | ----------- |
 | `--repetitions N` | Repetitions per sub-test (default: 10) |
 | `--frontend F` | `mysql` \| `postgres` \| `arrow`; may be repeated; default: `mysql postgres` |
-| `--bench T [T …]` | Tests to run: `simple_select` `complex_select` `join_same_instance` `join_cross_engine` `join_all` `external_load` `external_join` `external_dump` `external_join_cross` `external_join_all`. Selecting any `external_*` test auto-starts RustFS, generates s3/file fixtures, and registers the `bench_rustfs` s3 alias (mysql/postgres frontends only). |
-| `--rebuild` | Force image rebuild even if images already exist |
-| `--clear` | Remove images + DB volumes, rebuild from scratch |
-| `-j N` | Parallel cmake build jobs (auto-capped by available RAM) |
-| `--tracy` | Continuous Tracy capture → `<out-dir>/benchmark.tracy` |
-| `--tracy-sep` | Per-test Tracy capture → `<out-dir>/<frontend>_<test>.tracy` |
-| `--perf` | CPU call-graph sampling with `perf` (99 Hz, dwarf unwind). Outputs `benchmark.perf.data` + `benchmark.perf` (drag into [speedscope.app](https://www.speedscope.app)). |
-| `--perf-alloc` | Like `--perf` but also attaches a `malloc` uprobe so allocation call-sites appear in the call graph alongside CPU samples. Implies `--perf`. |
+| `--bench T [T …]` | `simple_select` `complex_select` `join_same_instance` `join_cross_engine` `join_all` `external_load` `external_join` `external_dump` `external_join_cross` `external_join_all` (an `external_*` test starts RustFS and registers the `bench_rustfs` alias) |
+| `--rebuild` / `--clear` | Rebuild the images / also drop the DB volumes |
+| `-j N` | Parallel build jobs (auto-capped by RAM) |
+| `--tracy` / `--tracy-sep` | Tracy capture, whole run / per test |
+| `--perf` / `--perf-alloc` | `perf` CPU call graph (99 Hz, dwarf) / plus a `malloc` uprobe |
 
-```bash
-# CPU flamegraph for the whole benchmark run
-./benchmark/scripts/run_benchmark.sh --frontend postgres --bench simple_select complex_select --perf
-
-# CPU + allocation hotspots
-./benchmark/scripts/run_benchmark.sh --frontend postgres --bench simple_select complex_select --perf-alloc
-```
-
-#### Examples
-
-```bash
-# Plain run
-./docker-run-tests.sh
-
-# Fast build using 4 cores
-./docker-run-tests.sh -j4
-
-# Collect a single Tracy profile for the whole suite
-./docker-run-tests.sh --tracy
-
-# Collect a separate Tracy file for every individual test
-./docker-run-tests.sh --tracy-sep
-
-# Tracy-sep with a faster build
-./docker-run-tests.sh --tracy-sep -j8
-```
-
-Tracy output is written to `tracy_profiles/` in the repository root and is
-never deleted automatically; each run creates a new timestamped sub-directory.
-
-### Unit tests (containerized)
-
-## Testing
-
-### Run integration tests (Docker-based)
+## Repository layout
 
 ```
 otterstax/
-├── frontend/           # Protocol servers (FlightSQL, MySQL, PostgreSQL)
-├── catalog/            # Metadata catalog + connection type registry
-├── connectors/         # MySQL / PG / ClickHouse / S3 / file connectors
-├── component_manager/  # Component lifecycle management
-├── config/             # Configuration loading and runtime settings
-├── integration/        # Actor wrappers bridging Scheduler ↔ connectors (incl. S3Manager)
-├── otterbrix/          # Otterbrix engine integration + s3/file grammar extensions
-├── scheduler/          # Query routing actor
-├── cmake/              # Build helpers (parser-extension macro)
-├── tests/              # Catch2 C++ tests + python integration suite
-├── examples/           # Demo stack (examples/demo/) + simple client examples (examples/simple/)
-└── fixtures/           # Test data generation
+├── frontend/      # Flight SQL, MySQL, PostgreSQL, Spark Connect servers
+├── session/       # query_session_t: one per client connection
+├── otterbrix/     # parser, SQL generator, translators, engine requests, federation (backend actors)
+├── backends/      # remote connections: agents and backend actors, startup discovery
+├── catalog/       # discovery, registration in the engine's catalog, owned names
+├── connectors/    # MySQL / PostgreSQL / ClickHouse / S3 / file connectors
+├── integration/   # S3Manager, Kafka runtime
+├── runtime/       # thread pools and the embedded engine
+├── config/        # config.yaml reader
+├── tests/         # Catch2 suites, Python integration suite
+├── benchmark/     # benchmark harness
+├── examples/      # demo and quick start stacks
+└── fixtures/      # test data generation
 ```
 
 ## Contributing
 
-Contributions are welcome. Please follow the repository's style and add tests
-for new functionality where appropriate.
+Contributions are welcome. Please follow the repository's style and add tests for new functionality.
 
 ## License
 
-This project is licensed under the Apache License 2.0 — see the [LICENSE](LICENSE)
-file for details.
+Apache License 2.0 — see [LICENSE](LICENSE).

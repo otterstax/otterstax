@@ -8,6 +8,14 @@ from flightsql import FlightSQLClient
 import pyarrow as pa
 import pyarrow.ipc as ipc
 
+# GetTables lists the engine's catalog, local and remote tables alike
+# (frontend/flight_sql/session_engine.cpp, SessionEngine::tables): a catalog is
+# a database as SQL writes it — `d` for a local one, `c.d` for the database d of
+# the connection c (tests/scripts/config.yaml). Only the backend's catalogs are
+# validated here, so a local table of the same name — or one whose column Arrow
+# cannot carry, whose table_schema is NULL — never stands in for a backend table.
+BACKEND_CATALOGS = {'campaigns.db1', 'impressions.db2'}
+
 def validate_table_schemas(client, expected_schemas):
     """Validate table schemas using get_tables method"""
     
@@ -51,6 +59,9 @@ def validate_table_schemas(client, expected_schemas):
         schema_name = tables_table['db_schema_name'][i].as_py()
         table_name = tables_table['table_name'][i].as_py()
         table_type = tables_table['table_type'][i].as_py()
+        if catalog not in BACKEND_CATALOGS:
+            print(f"Skipping {catalog}.{schema_name}.{table_name}: not a MySQL backend database")
+            continue
         
         full_table_name = f"{catalog}.{schema_name}.{table_name}"
         print(f"\nTable: {full_table_name} (type: {table_type})")

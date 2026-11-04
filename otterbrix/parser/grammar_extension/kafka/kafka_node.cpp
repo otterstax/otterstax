@@ -128,6 +128,7 @@ namespace otterstax::kafka {
             node->set_as_select(std::string(stmt.as_select));
         }
         node->set_if_exists(stmt.if_exists);
+        node->set_cascade(stmt.cascade);
 
         return node;
     }
@@ -152,7 +153,12 @@ namespace otterstax::kafka {
         for (const auto& child : root->children()) {
             inspect(child.get());
         }
-        if (!insert || insert->dbname() != KAFKA_DATABASE_NAME) {
+        if (!insert) {
+            return std::nullopt;
+        }
+        const auto& target = insert->target();
+        if (!target.connection.t.empty() || (!target.database.t.empty() && target.database.t != KAFKA_DATABASE_NAME) ||
+            (!target.schema.t.empty() && target.schema.t != KAFKA_SCHEMA_NAME)) {
             return std::nullopt;
         }
         if (insert->children().empty()) {
@@ -163,7 +169,16 @@ namespace otterstax::kafka {
         // the latter a continuous INSERT INTO query — the caller routes on this
         auto source = insert->children().front();
         const bool source_is_select = source->type() != logical_plan::node_type::data_t;
-        return kafka_write_t{insert->relname(), std::move(source), source_is_select};
+        return kafka_write_t{target, std::move(source), source_is_select};
+    }
+
+    bool kafka_target_named(const qualified_name_t& written, std::string_view database, std::string_view schema) {
+        // The completion otterbrix applies to a name the place fills in
+        // (components::catalog::complete_name): a written database brings its
+        // schema slot with it, an empty schema is the place's.
+        const std::string_view db = written.database.t.empty() ? database : std::string_view{written.database.t};
+        const std::string_view sch = written.schema.t.empty() ? schema : std::string_view{written.schema.t};
+        return written.connection.t.empty() && db == KAFKA_DATABASE_NAME && sch == KAFKA_SCHEMA_NAME;
     }
 
     namespace {
@@ -195,17 +210,17 @@ namespace otterstax::kafka {
         logical_plan::node_ptr rehome_operator(std::pmr::memory_resource* resource,
                                                const logical_plan::node_ptr& op) {
             if (op->type() == logical_plan::node_type::match_t) {
-                auto rehomed = logical_plan::make_node_match(resource, {}, {}, {});
+                auto rehomed = logical_plan::make_node_match(resource, qualified_name_t{}, {});
                 rehomed->append_expressions(op->expressions());
                 return rehomed;
             }
             if (op->type() == logical_plan::node_type::select_t) {
-                auto rehomed = logical_plan::make_node_select(resource, {}, {});
+                auto rehomed = logical_plan::make_node_select(resource);
                 rehomed->append_expressions(op->expressions());
                 return rehomed;
             }
             if (op->type() == logical_plan::node_type::group_t) {
-                auto rehomed = logical_plan::make_node_group(resource, {}, {});
+                auto rehomed = logical_plan::make_node_group(resource);
                 rehomed->append_expressions(op->expressions());
                 // The HAVING helpers sit at the tail of that list and are addressed by
                 // count, not by name: a rebuilt group that forgot how many there are
@@ -216,23 +231,20 @@ namespace otterstax::kafka {
             }
             if (op->type() == logical_plan::node_type::sort_t) {
                 const auto* sort = static_cast<const logical_plan::node_sort_t*>(op.get());
-                auto rehomed = logical_plan::make_node_sort(resource, {}, {}, sort->expressions());
+                auto rehomed = logical_plan::make_node_sort(resource, sort->expressions());
                 rehomed->set_read_cap(sort->read_cap());
                 return rehomed;
             }
             if (op->type() == logical_plan::node_type::limit_t) {
                 // The window IS the node's state — an empty-named limit still cuts the batch
-                return logical_plan::make_node_limit(
-                    resource,
-                    {},
-                    {},
-                    static_cast<const logical_plan::node_limit_t*>(op.get())->limit());
+                return logical_plan::make_node_limit(resource,
+                                                     static_cast<const logical_plan::node_limit_t*>(op.get())->limit());
             }
             if (op->type() == logical_plan::node_type::having_t) {
                 // A having carries no counter of its own: the predicate rides in the
                 // expression list (the engine reads its first entry), so the whole list
                 // is carried rather than that one entry
-                auto rehomed = logical_plan::make_node_having(resource, {}, {}, expressions::expression_ptr{});
+                auto rehomed = logical_plan::make_node_having(resource, expressions::expression_ptr{});
                 rehomed->append_expressions(op->expressions());
                 return rehomed;
             }
@@ -247,7 +259,7 @@ namespace otterstax::kafka {
             return std::nullopt;
         }
         kafka_stream_plan_t out;
-        out.source_relname = agg->relname().t;
+        out.source_relname = agg->target().collection.t;
         out.operators.reserve(agg->children().size());
         for (const auto& child : agg->children()) {
             out.operators.push_back(rehome_operator(resource, child));

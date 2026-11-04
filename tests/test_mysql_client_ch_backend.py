@@ -11,7 +11,7 @@ from contextlib import contextmanager
 
 import config
 
-_ORDERS = f"{config.CH_ALIAS}.{config.CH_DATABASE}.orders"
+_ORDERS = f"{config.CH_ALIAS}.{config.CH_DATABASE}.public.orders"
 
 
 class client:
@@ -22,6 +22,10 @@ class client:
             'port': config.MYSQL_PORT,
             'user': 'testuser',
             'password': 'testpass',
+            # Each DML is meant to commit on its own (a ClickHouse write inside
+            # a transaction block is refused; the driver's SET autocommit
+            # reaches the engine).
+            'autocommit': True,
         }
         print(f"Connecting to host: {host}")
 

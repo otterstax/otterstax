@@ -3,10 +3,10 @@
 
 #include "commands.hpp"
 
-#include "../scheduler_engine.hpp"
+#include "../session_engine.hpp"
 
-#include "catalog/catalog_manager.hpp"
 #include "otterbrix/translators/output/chunk_to_arrow.hpp"
+#include "utility/tracy_profiler.hpp"
 
 #include <arrow/array/builder_base.h>
 #include <arrow/array/builder_binary.h>
@@ -17,7 +17,10 @@
 #include <FlightSql.pb.h>
 #include <google/protobuf/any.pb.h>
 
+#include <algorithm>
 #include <memory>
+#include <optional>
+#include <string_view>
 #include <vector>
 
 namespace flight::core {
@@ -26,6 +29,14 @@ namespace fp = arrow::flight::protocol;
 namespace fps = arrow::flight::protocol::sql;
 
 namespace {
+
+// A builder's Append that arrow refuses (out of memory, a value past the
+// array's offset width) is an EngineError, as a refused Finish is.
+void appended(const arrow::Status& st, const char* what) {
+    if (!st.ok()) {
+        throw EngineError(std::string{what} + ": " + st.ToString());
+    }
+}
 
 grpc::Status invalid_argument(std::string_view what) {
     return {grpc::StatusCode::INVALID_ARGUMENT, std::string{what}};
@@ -143,7 +154,7 @@ struct SqlInfoRow {
     std::int32_t i32 = 0;
 };
 
-std::vector<SqlInfoRow> sql_info_rows(const engine::SchedulerEngine& engine) {
+std::vector<SqlInfoRow> sql_info_rows(const engine::SessionEngine& engine) {
     std::vector<SqlInfoRow> rows;
     auto str = [&](std::uint32_t n, std::string v) {
         rows.push_back(SqlInfoRow{n, 0, std::move(v)});
@@ -204,30 +215,30 @@ std::shared_ptr<arrow::RecordBatch> build_sql_info_result(const std::vector<SqlI
                       "int32_to_int32_list_map");
 
     for (const auto& row : rows) {
-        names.Append(row.name);
+        appended(names.Append(row.name), "SqlInfo batch: info_name");
         switch (row.variant) {
             case 0:
-                value.Append(static_cast<std::int8_t>(kString));
-                static_cast<arrow::StringBuilder*>(value.child_builder(kString).get())
-                    ->Append(row.str);
+                appended(value.Append(static_cast<std::int8_t>(kString)), "SqlInfo batch: value");
+                appended(static_cast<arrow::StringBuilder*>(value.child_builder(kString).get())->Append(row.str),
+                         "SqlInfo batch: string_value");
                 break;
             case 1:
-                value.Append(static_cast<std::int8_t>(kBool));
-                static_cast<arrow::BooleanBuilder*>(value.child_builder(kBool).get())
-                    ->Append(row.b);
+                appended(value.Append(static_cast<std::int8_t>(kBool)), "SqlInfo batch: value");
+                appended(static_cast<arrow::BooleanBuilder*>(value.child_builder(kBool).get())->Append(row.b),
+                         "SqlInfo batch: bool_value");
                 break;
             case 2:
-                value.Append(static_cast<std::int8_t>(kInt64));
-                static_cast<arrow::Int64Builder*>(value.child_builder(kInt64).get())
-                    ->Append(row.i64);
+                appended(value.Append(static_cast<std::int8_t>(kInt64)), "SqlInfo batch: value");
+                appended(static_cast<arrow::Int64Builder*>(value.child_builder(kInt64).get())->Append(row.i64),
+                         "SqlInfo batch: bigint_value");
                 break;
             default:
-                value.Append(static_cast<std::int8_t>(kInt32));
-                static_cast<arrow::Int32Builder*>(value.child_builder(kInt32).get())
-                    ->Append(row.i32);
+                appended(value.Append(static_cast<std::int8_t>(kInt32)), "SqlInfo batch: value");
+                appended(static_cast<arrow::Int32Builder*>(value.child_builder(kInt32).get())->Append(row.i32),
+                         "SqlInfo batch: int32_bitmask");
                 break;
         }
-        row_counts.AppendNull(); // value not specified
+        appended(row_counts.AppendNull(), "SqlInfo batch: row_count"); // value not specified
     }
 
     auto status_of = [](const arrow::Status& st, const char* what) {
@@ -248,114 +259,16 @@ std::shared_ptr<arrow::RecordBatch> build_sql_info_result(const std::vector<SqlI
 
 // --- metadata results --------------------------------------------------------
 
-std::shared_ptr<arrow::RecordBatch> catalogs_batch(const EngineMetadata& md) {
-    auto* pool = arrow::default_memory_pool();
-    arrow::StringBuilder builder(pool);
-    for (const auto& c : md.catalogs) {
-        builder.Append(c);
-    }
+// The one table type everything is listed under.
+constexpr std::string_view table_type = "TABLE";
+
+std::shared_ptr<arrow::RecordBatch> table_types_batch() {
+    arrow::StringBuilder builder(arrow::default_memory_pool());
     std::shared_ptr<arrow::Array> array;
-    if (!builder.Finish(&array).ok()) {
-        throw EngineError("catalogs batch");
-    }
-    return arrow::RecordBatch::Make(catalogs_schema(),
-                                    static_cast<std::int64_t>(md.catalogs.size()),
-                                    {std::move(array)});
-}
-
-std::shared_ptr<arrow::RecordBatch> db_schemas_batch(const fps::CommandGetDbSchemas& cmd, const EngineMetadata& md) {
-    auto* pool = arrow::default_memory_pool();
-    arrow::StringBuilder catalogs(pool);
-    arrow::StringBuilder schemas(pool);
-    const std::string filter = cmd.db_schema_filter_pattern().empty()
-                                   ? std::string{}
-                                   : cmd.db_schema_filter_pattern();
-    for (const auto& s : md.db_schemas) {
-        if (!filter.empty() && !like_match(s, filter)) continue;
-        if (md.catalogs.empty()) {
-            catalogs.AppendNull();
-        } else {
-            catalogs.Append(md.catalogs[0]);
-        }
-        schemas.Append(s);
-    }
-    std::shared_ptr<arrow::Array> catalog_array;
-    std::shared_ptr<arrow::Array> schema_array;
-    if (!catalogs.Finish(&catalog_array).ok() || !schemas.Finish(&schema_array).ok()) {
-        throw EngineError("db_schemas batch");
-    }
-    const auto rows = schema_array->length();
-    return arrow::RecordBatch::Make(db_schemas_schema(), rows,
-                                    {std::move(catalog_array), std::move(schema_array)});
-}
-
-std::shared_ptr<arrow::RecordBatch> tables_batch(const fps::CommandGetTables& cmd, const EngineMetadata& md) {
-    auto* pool = arrow::default_memory_pool();
-    arrow::StringBuilder catalogs(pool);
-    arrow::StringBuilder schemas(pool);
-    arrow::StringBuilder names(pool);
-    arrow::StringBuilder types(pool);
-    arrow::BinaryBuilder schema_bytes(pool);
-    const auto& table_filter = cmd.table_name_filter_pattern();
-    for (const auto& t : md.tables) {
-        if (!table_filter.empty() && !like_match(t.name.collection.c_str(), table_filter)) continue;
-        bool type_ok = cmd.table_types().empty();
-        for (const auto& tt : cmd.table_types()) {
-            if (tt == catalog_ext::table_type_name) type_ok = true;
-        }
-        if (!type_ok) continue;
-        catalogs.Append(t.name.database.c_str());
-        schemas.Append(t.name.schema.c_str());
-        names.Append(t.name.collection.c_str());
-        types.Append(std::string{catalog_ext::table_type_name});
-        if (cmd.include_schema()) {
-            // The table's arrow schema, through the project converter the file
-            // paths use; a column the wire cannot carry leaves the cell NULL.
-            auto converted = to_arrow_schema(std::pmr::new_delete_resource(), t.schema);
-            if (converted.has_error()) {
-                schema_bytes.AppendNull();
-                continue;
-            }
-            auto bytes = arrow::ipc::SerializeSchema(*converted.value());
-            if (!bytes.ok()) {
-                throw EngineError("tables batch schema: " + bytes.status().ToString());
-            }
-            schema_bytes.Append(reinterpret_cast<const std::uint8_t*>((*bytes)->data()),
-                                static_cast<std::int32_t>((*bytes)->size()));
-        } else {
-            schema_bytes.AppendNull();
-        }
-    }
-    std::shared_ptr<arrow::Array> catalog_array;
-    std::shared_ptr<arrow::Array> schema_array;
-    std::shared_ptr<arrow::Array> name_array;
-    std::shared_ptr<arrow::Array> type_array;
-    std::shared_ptr<arrow::Array> bytes_array;
-    if (!catalogs.Finish(&catalog_array).ok() || !schemas.Finish(&schema_array).ok() ||
-        !names.Finish(&name_array).ok() || !types.Finish(&type_array).ok() ||
-        !schema_bytes.Finish(&bytes_array).ok()) {
-        throw EngineError("tables batch");
-    }
-    const auto rows = name_array->length();
-    return arrow::RecordBatch::Make(tables_schema(), rows,
-                                    {std::move(catalog_array), std::move(schema_array),
-                                     std::move(name_array), std::move(type_array),
-                                     std::move(bytes_array)});
-}
-
-std::shared_ptr<arrow::RecordBatch> table_types_batch(const EngineMetadata& md) {
-    auto* pool = arrow::default_memory_pool();
-    arrow::StringBuilder builder(pool);
-    for (const auto& t : md.table_types) {
-        builder.Append(t);
-    }
-    std::shared_ptr<arrow::Array> array;
-    if (!builder.Finish(&array).ok()) {
+    if (!builder.Append(std::string{table_type}).ok() || !builder.Finish(&array).ok()) {
         throw EngineError("table_types batch");
     }
-    return arrow::RecordBatch::Make(table_types_schema(),
-                                    static_cast<std::int64_t>(md.table_types.size()),
-                                    {std::move(array)});
+    return arrow::RecordBatch::Make(table_types_schema(), 1, {std::move(array)});
 }
 
 template <typename Command>
@@ -376,31 +289,89 @@ grpc::Status unpack(const fp::FlightDescriptor& descriptor, Command* out) {
 
 } // namespace
 
-bool like_match(std::string_view text, std::string_view pattern) {
-    if (pattern.empty()) return true;
-    // The classic two-pointer LIKE with % and _
-    std::size_t t = 0, p = 0, star_t = std::string_view::npos, star_p = 0;
-    while (t < text.size()) {
-        if (p < pattern.size() && (pattern[p] == '_' || pattern[p] == text[t])) {
-            ++t;
-            ++p;
-        } else if (p < pattern.size() && pattern[p] == '%') {
-            star_t = t;
-            star_p = p++;
-        } else if (star_t != std::string_view::npos) {
-            t = ++star_t;
-            p = star_p + 1;
-        } else {
-            return false;
-        }
+std::shared_ptr<arrow::RecordBatch> catalogs_batch(const std::vector<std::string>& catalogs) {
+    OTX_ZONE_N("flight::catalogs_batch");
+    arrow::StringBuilder builder(arrow::default_memory_pool());
+    for (const auto& c : catalogs) {
+        appended(builder.Append(c), "catalogs batch");
     }
-    while (p < pattern.size() && pattern[p] == '%') ++p;
-    return p == pattern.size();
+    std::shared_ptr<arrow::Array> array;
+    if (!builder.Finish(&array).ok()) {
+        throw EngineError("catalogs batch");
+    }
+    return arrow::RecordBatch::Make(catalogs_schema(), static_cast<std::int64_t>(catalogs.size()), {std::move(array)});
 }
 
-grpc::Status execute_descriptor(FlightSqlCore& core, engine::SchedulerEngine& engine,
+std::shared_ptr<arrow::RecordBatch> db_schemas_batch(const std::vector<DbSchema>& db_schemas) {
+    OTX_ZONE_N("flight::db_schemas_batch");
+    auto* pool = arrow::default_memory_pool();
+    arrow::StringBuilder catalogs(pool);
+    arrow::StringBuilder schemas(pool);
+    for (const auto& s : db_schemas) {
+        appended(catalogs.Append(s.catalog), "db_schemas batch");
+        appended(schemas.Append(s.schema), "db_schemas batch");
+    }
+    std::shared_ptr<arrow::Array> catalog_array;
+    std::shared_ptr<arrow::Array> schema_array;
+    if (!catalogs.Finish(&catalog_array).ok() || !schemas.Finish(&schema_array).ok()) {
+        throw EngineError("db_schemas batch");
+    }
+    const auto rows = schema_array->length();
+    return arrow::RecordBatch::Make(db_schemas_schema(), rows, {std::move(catalog_array), std::move(schema_array)});
+}
+
+std::shared_ptr<arrow::RecordBatch> tables_batch(const std::pmr::vector<table_info>& tables, bool include_schema) {
+    OTX_ZONE_N("flight::tables_batch");
+    auto* pool = arrow::default_memory_pool();
+    arrow::StringBuilder catalogs(pool);
+    arrow::StringBuilder schemas(pool);
+    arrow::StringBuilder names(pool);
+    arrow::StringBuilder types(pool);
+    arrow::BinaryBuilder schema_bytes(pool);
+    for (const auto& t : tables) {
+        appended(catalogs.Append(catalog_of(t.name.connection.t, t.name.database.t)), "tables batch");
+        appended(schemas.Append(std::string{t.name.schema.t}), "tables batch");
+        appended(names.Append(std::string{t.name.collection.t}), "tables batch");
+        appended(types.Append(std::string{table_type}), "tables batch");
+        if (!include_schema) {
+            appended(schema_bytes.AppendNull(), "tables batch");
+            continue;
+        }
+        // The table's arrow schema, through the project converter the file
+        // paths use; a column the wire cannot carry leaves the cell NULL.
+        auto converted = to_arrow_schema(std::pmr::new_delete_resource(), t.schema);
+        if (converted.has_error()) {
+            appended(schema_bytes.AppendNull(), "tables batch");
+            continue;
+        }
+        auto bytes = arrow::ipc::SerializeSchema(*converted.value());
+        if (!bytes.ok()) {
+            throw EngineError("tables batch schema: " + bytes.status().ToString());
+        }
+        appended(schema_bytes.Append(reinterpret_cast<const std::uint8_t*>((*bytes)->data()),
+                                     static_cast<std::int32_t>((*bytes)->size())),
+                 "tables batch");
+    }
+    std::shared_ptr<arrow::Array> catalog_array;
+    std::shared_ptr<arrow::Array> schema_array;
+    std::shared_ptr<arrow::Array> name_array;
+    std::shared_ptr<arrow::Array> type_array;
+    std::shared_ptr<arrow::Array> bytes_array;
+    if (!catalogs.Finish(&catalog_array).ok() || !schemas.Finish(&schema_array).ok() ||
+        !names.Finish(&name_array).ok() || !types.Finish(&type_array).ok() ||
+        !schema_bytes.Finish(&bytes_array).ok()) {
+        throw EngineError("tables batch");
+    }
+    const auto rows = name_array->length();
+    return arrow::RecordBatch::Make(tables_schema(), rows,
+                                    {std::move(catalog_array), std::move(schema_array),
+                                     std::move(name_array), std::move(type_array),
+                                     std::move(bytes_array)});
+}
+
+grpc::Status execute_descriptor(FlightSqlCore& core, engine::SessionEngine& engine,
                                 const fp::FlightDescriptor& descriptor,
-                                std::string* ticket_out) {
+                                const std::string& client, CachedResultPtr* result_out) {
     google::protobuf::Any any;
     if (!any.ParseFromString(descriptor.cmd())) {
         return invalid_argument("flight-sql: malformed command Any");
@@ -419,12 +390,10 @@ grpc::Status execute_descriptor(FlightSqlCore& core, engine::SchedulerEngine& en
         } else if (any.Is<fps::CommandPreparedStatementQuery>()) {
             fps::CommandPreparedStatementQuery cmd;
             any.UnpackTo(&cmd);
-            PreparedStatementState const* state = nullptr;
-            if (const auto st = core.prepared_lookup(cmd.prepared_statement_handle(), &state);
+            if (const auto st = core.execute_prepared(cmd.prepared_statement_handle(), client, &result);
                 !st.ok()) {
                 return st;
             }
-            result = engine.execute_prepared(state->prepared, state->bound);
         } else if (any.Is<fps::CommandGetSqlInfo>()) {
             fps::CommandGetSqlInfo cmd;
             any.UnpackTo(&cmd);
@@ -445,20 +414,32 @@ grpc::Status execute_descriptor(FlightSqlCore& core, engine::SchedulerEngine& en
             result.batches.push_back(build_sql_info_result(rows));
         } else if (any.Is<fps::CommandGetCatalogs>()) {
             result.schema = catalogs_schema();
-            result.batches.push_back(catalogs_batch(engine.metadata()));
+            result.batches.push_back(catalogs_batch(engine.catalogs()));
         } else if (any.Is<fps::CommandGetDbSchemas>()) {
             fps::CommandGetDbSchemas cmd;
             any.UnpackTo(&cmd);
             result.schema = db_schemas_schema();
-            result.batches.push_back(db_schemas_batch(cmd, engine.metadata()));
+            result.batches.push_back(db_schemas_batch(engine.db_schemas(
+                cmd.has_catalog() ? std::optional<std::string>{cmd.catalog()} : std::nullopt,
+                cmd.db_schema_filter_pattern())));
         } else if (any.Is<fps::CommandGetTables>()) {
             fps::CommandGetTables cmd;
             any.UnpackTo(&cmd);
             result.schema = tables_schema();
-            result.batches.push_back(tables_batch(cmd, engine.metadata()));
+            // Everything is a TABLE: a type filter without it selects nothing.
+            const bool listed =
+                cmd.table_types().empty() ||
+                std::find(cmd.table_types().begin(), cmd.table_types().end(), table_type) != cmd.table_types().end();
+            const auto tables =
+                listed ? engine.tables(cmd.has_catalog() ? std::optional<std::string>{cmd.catalog()} : std::nullopt,
+                                       cmd.db_schema_filter_pattern(),
+                                       cmd.table_name_filter_pattern(),
+                                       cmd.include_schema())
+                       : std::pmr::vector<table_info>{};
+            result.batches.push_back(tables_batch(tables, cmd.include_schema()));
         } else if (any.Is<fps::CommandGetTableTypes>()) {
             result.schema = table_types_schema();
-            result.batches.push_back(table_types_batch(engine.metadata()));
+            result.batches.push_back(table_types_batch());
         } else if (any.Is<fps::CommandGetPrimaryKeys>()) {
             // No primary-key support — an empty result with the spec's schema
             result.schema = primary_keys_schema();
@@ -472,13 +453,12 @@ grpc::Status execute_descriptor(FlightSqlCore& core, engine::SchedulerEngine& en
             return {grpc::StatusCode::UNIMPLEMENTED,
                     "flight-sql: command not supported yet: " + type};
         }
+        *result_out = materialize(result.schema, result.batches);
     } catch (const EngineError& e) {
         return {grpc::StatusCode::INVALID_ARGUMENT, std::string{e.what()}};
     } catch (const std::exception& e) {
         return {grpc::StatusCode::INTERNAL, std::string{e.what()}};
     }
-
-    *ticket_out = core.register_result(result.schema, std::move(result.batches));
     return grpc::Status::OK;
 }
 

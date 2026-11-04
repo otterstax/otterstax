@@ -3,6 +3,8 @@
 
 #include "packet_utils.hpp"
 
+#include "../../common/utils.hpp"
+
 namespace frontend::mysql {
     constexpr size_t OK_PAYLOAD_SIZE = 7;
     constexpr uint8_t OK_PACKET_HEADER = 0x00;
@@ -33,49 +35,53 @@ namespace frontend::mysql {
 
     std::vector<uint8_t>
     build_error(packet_writer& writer, uint8_t sequence_id, mysql_error error_code, std::string message) {
-        const char* sql_state; // 5 chars
-
+        // MySQL 8.4's SQLSTATE of the errno (error.hpp, sql_state).
+        const char* sql_state = sql_state::GENERAL_ERROR; // 5 chars
         switch (error_code) {
             case mysql_error::ER_ACCESS_DENIED_ERROR:
-            case mysql_error::ER_DBACCESS_DENIED_ERROR:
-            case mysql_error::ER_TABLEACCESS_DENIED_ERROR:
                 sql_state = sql_state::ACCESS_DENIED;
-                break;
-            case mysql_error::ER_PACKET_TOO_LARGE:
-            case mysql_error::ER_MALFORMED_PACKET:
-            case mysql_error::ER_SEQUENCE_ERROR:
-            case mysql_error::ER_UNKNOWN_ERROR:
-                sql_state = sql_state::PACKET_ERROR;
-                break;
-            case mysql_error::ER_OUT_OF_RESOURCES:
-                sql_state = sql_state::RESOURCE_ERROR;
-                break;
-            case mysql_error::ER_UNKNOWN_COM_ERROR:
-            case mysql_error::ER_PARSE_ERROR:
-            case mysql_error::ER_SYNTAX_ERROR:
-            case mysql_error::ER_WRONG_VALUE_COUNT_ON_ROW:
-            case mysql_error::ER_EMPTY_QUERY:
-                sql_state = sql_state::COMMAND_ERROR;
-                break;
-            case mysql_error::ER_NET_READ_ERROR:
-                sql_state = sql_state::CONNECTION_ERROR;
-                break;
-            case mysql_error::ER_BAD_DB_ERROR:
-            case mysql_error::ER_NO_SUCH_TABLE:
-            case mysql_error::ER_UNKNOWN_TABLE:
-            case mysql_error::ER_DB_CREATE_EXISTS:
-            case mysql_error::ER_DB_DROP_EXISTS:
-            case mysql_error::ER_TABLE_EXISTS_ERROR:
-            case mysql_error::ER_UNKNOWN_STMT_HANDLER:
-            case mysql_error::ER_NOT_SUPPORTED_YET:
-                sql_state = sql_state::COMMAND_ERROR;
                 break;
             case mysql_error::ER_CON_COUNT_ERROR:
             case mysql_error::ER_NOT_SUPPORTED_AUTH_MODE:
-                sql_state = sql_state::NOT_SUPPORTED_AUTH_ERROR;
+                sql_state = sql_state::CONNECTION_REJECTED;
                 break;
-            default:
-                sql_state = sql_state::PROTOCOL_ERROR;
+            case mysql_error::ER_HANDSHAKE_ERROR:
+            case mysql_error::ER_UNKNOWN_COM_ERROR:
+            case mysql_error::ER_PACKET_TOO_LARGE:
+            case mysql_error::ER_NET_READ_ERROR:
+                sql_state = sql_state::COMMUNICATION_LINK_FAILURE;
+                break;
+            case mysql_error::ER_DBACCESS_DENIED_ERROR:
+            case mysql_error::ER_TABLEACCESS_DENIED_ERROR:
+            case mysql_error::ER_BAD_DB_ERROR:
+            case mysql_error::ER_PARSE_ERROR:
+            case mysql_error::ER_EMPTY_QUERY:
+            case mysql_error::ER_SYNTAX_ERROR:
+            case mysql_error::ER_NOT_SUPPORTED_YET:
+            case mysql_error::ER_COLLATION_CHARSET_MISMATCH:
+                sql_state = sql_state::SYNTAX_ERROR_OR_ACCESS_RULE;
+                break;
+            case mysql_error::ER_TABLE_EXISTS_ERROR:
+                sql_state = sql_state::TABLE_EXISTS;
+                break;
+            case mysql_error::ER_NO_SUCH_TABLE:
+            case mysql_error::ER_UNKNOWN_TABLE:
+                sql_state = sql_state::TABLE_NOT_FOUND;
+                break;
+            case mysql_error::ER_WRONG_VALUE_COUNT_ON_ROW:
+                sql_state = sql_state::VALUE_COUNT_MISMATCH;
+                break;
+            case mysql_error::ER_OUT_OF_RESOURCES:
+            case mysql_error::ER_DB_CREATE_EXISTS:
+            case mysql_error::ER_DB_DROP_EXISTS:
+            case mysql_error::ER_UNKNOWN_ERROR:
+            case mysql_error::ER_UNKNOWN_SYSTEM_VARIABLE:
+            case mysql_error::ER_UNKNOWN_STMT_HANDLER:
+            case mysql_error::ER_MALFORMED_PACKET:
+            case mysql_error::ER_SEQUENCE_ERROR:
+            case mysql_error::ER_QUERY_TIMEOUT:
+            case mysql_error::ER_PROTOCOL_ERROR:
+                sql_state = sql_state::GENERAL_ERROR;
                 break;
         }
 
@@ -97,6 +103,19 @@ namespace frontend::mysql {
         return writer.build_from_payload(sequence_id);
     }
 
+    std::optional<std::vector<uint8_t>> mysql_scramble() {
+        auto scramble = secure_random_bytes(AUTH_DATA_FULL_LENGTH);
+        if (scramble) {
+            for (auto& byte : *scramble) {
+                byte &= 0x7f;
+                if (byte == '\0' || byte == '$') {
+                    ++byte;
+                }
+            }
+        }
+        return scramble;
+    }
+
     std::vector<uint8_t> build_handshake_10(packet_writer& writer,
                                             uint32_t connection_id,
                                             std::vector<uint8_t> auth_data,
@@ -116,7 +135,8 @@ namespace frontend::mysql {
         uint32_t capabilities =
             CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION | CLIENT_PLUGIN_AUTH | CLIENT_CONNECT_WITH_DB;
         writer.write_uint16(capabilities & 0xFFFF);                               // lower 2 bytes
-        writer.write_uint8(static_cast<uint8_t>(character_set::UTF8_GENERAL_CI)); // character set
+        static_assert(SERVER_COLLATION_ID == static_cast<uint8_t>(character_set::UTF8MB4_BIN));
+        writer.write_uint8(SERVER_COLLATION_ID); // the server's collation (protocol_const.hpp)
         writer.write_uint16(flags);
         writer.write_uint16((capabilities >> 16) & 0xFFFF); // upper 2 bytes
         writer.write_uint8(AUTH_DATA_FULL_LENGTH + 1);      // + null terminator

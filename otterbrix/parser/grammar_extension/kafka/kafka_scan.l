@@ -46,6 +46,8 @@ namespace {
             {"as", KW_AS},
             {"if", KW_IF},
             {"exists", KW_EXISTS},
+            {"cascade", KW_CASCADE},
+            {"restrict", KW_RESTRICT},
         };
         std::string lower(text, len);
         for (char& c : lower) {
@@ -53,6 +55,10 @@ namespace {
         }
         for (const entry& kw : keywords) {
             if (lower == kw.word) {
+                if (kw.token == KW_CASCADE || kw.token == KW_RESTRICT) {
+                    // Unreserved: may stand as a name, which keeps its source text
+                    value->str = arena_copy(resource, text, len);
+                }
                 return kw.token;
             }
         }

@@ -10,7 +10,7 @@ def make_fetch_factory(host, port):
     def make_fetch(sql):
         def fetch():
             conn = psycopg2.connect(
-                host=host, port=port, user="testuser", password="testpass", dbname="default"
+                host=host, port=port, user="testuser", password="testpass", dbname="main"
             )
             cur = conn.cursor()
             cur.execute(sql)
@@ -27,7 +27,7 @@ def connect(host, port):
     """Persistent autocommit connection for the external-table benchmarks
     (external_load / external_join / external_dump run one statement per call)."""
     conn = psycopg2.connect(
-        host=host, port=port, user="testuser", password="testpass", dbname="default"
+        host=host, port=port, user="testuser", password="testpass", dbname="main"
     )
     conn.autocommit = True
     return conn

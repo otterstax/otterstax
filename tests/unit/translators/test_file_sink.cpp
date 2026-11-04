@@ -61,12 +61,12 @@ TEST_CASE("write_local_file: a write that fails half-way keeps the existing file
         [](const std::shared_ptr<arrow::io::OutputStream>& sink) -> core::result_wrapper_t<bool> {
             const std::string partial = "half of a new export";
             REQUIRE(sink->Write(partial.data(), static_cast<int64_t>(partial.size())).ok());
-            return tsl::make_error(std::pmr::new_delete_resource(), core::error_code_t::conversion_failure,
+            return tsl::make_error(std::pmr::new_delete_resource(), core::error_code_t::invalid_text_representation,
                                    "a value the writer refuses");
         });
 
     REQUIRE(written.has_error());
-    CHECK(written.error().type == core::error_code_t::conversion_failure);
+    CHECK(written.error().type == core::error_code_t::invalid_text_representation);
     CHECK(read_file(target) == "previous export");
     CHECK(strays(dir.path, "out.csv") == 0);
 }

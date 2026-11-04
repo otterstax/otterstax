@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2025-2026  OtterStax
 //
-// The real mysql::Connector over the pool the ConnectorManager gives it — a
-// boost::asio::io_context run by N threads — against a fake MySQL server that
+// The real mysql::Connector over a boost::asio::io_context run by N threads
+// (the backend agent runs its own on one thread; a multi-threaded one is the
+// harder case for the deadline's handlers) — against a fake MySQL server that
 // speaks just enough of the wire for boost.mysql's handshake, COM_PING and
 // COM_QUIT. No frontend, no Docker: the fake listens on 127.0.0.1:0 on its own
 // thread.
@@ -25,7 +26,7 @@
 // saw (atomics) and the test thread asserts.
 
 #include "connectors/mysql/connector.hpp"
-#include "connectors/mysql/manager.hpp"
+#include "connectors/mysql/connector.hpp"
 #include "utility/thread_pool_manager.hpp"
 
 #include <catch2/catch_all.hpp>
@@ -158,8 +159,9 @@ namespace {
     public:
         enum class after_ok
         {
-            serve_commands, // answer COM_PING, close on COM_QUIT / EOF
-            reset_socket    // drop the client (RST) shortly after the OK, before any command
+            serve_commands,   // answer COM_PING, close on COM_QUIT / EOF
+            reset_socket,     // drop the client (RST) shortly after the OK, before any command
+            swallow_commands  // read every command and never answer one (a backend that hangs)
         };
 
         explicit fake_mysql_server(after_ok mode, std::string expected_user)
@@ -193,6 +195,8 @@ namespace {
         size_t resets() const noexcept { return resets_.load(); }
         // Commands other than COM_PING / COM_QUIT.
         size_t unexpected_commands() const noexcept { return unexpected_commands_.load(); }
+        // Commands read and left unanswered (after_ok::swallow_commands).
+        size_t swallowed() const noexcept { return swallowed_.load(); }
 
         // True once `predicate` holds, false at the deadline.
         template<typename Predicate>
@@ -289,6 +293,10 @@ namespace {
                 if (ec || command.empty() || command[0] == COM_QUIT) {
                     break;
                 }
+                if (mode_ == after_ok::swallow_commands) {
+                    ++swallowed_;
+                    continue;
+                }
                 if (command[0] != COM_PING) {
                     ++unexpected_commands_;
                     break;
@@ -311,6 +319,7 @@ namespace {
         std::atomic<size_t> unexpected_users_{0};
         std::atomic<size_t> resets_{0};
         std::atomic<size_t> unexpected_commands_{0};
+        std::atomic<size_t> swallowed_{0};
         std::jthread thread_;
     };
 
@@ -327,14 +336,22 @@ namespace {
         return params;
     }
 
-    // The ConnectorManager's pool: hardware_concurrency() threads on one
-    // io_context, never fewer than eight so the race has threads to run on.
+    // hardware_concurrency() threads on one io_context, never fewer than eight
+    // so the race has threads to run on.
     size_t pool_threads() { return std::max<size_t>(8, std::thread::hardware_concurrency()); }
 
-    // Enough connects to hit the timed_cancel_op window on the unfixed code
-    // (observed at iterations 83..2913 over six runs on an 18-core macOS host,
-    // ~0.2 ms per connect), few enough to keep the fixed test at a few seconds.
-    constexpr int STRESS_ITERATIONS = 10000;
+    // Enough connects to hit the timed_cancel_op window on the unfixed code. A
+    // connect is mostly idle wall time: connectWithTimeout() re-checks its
+    // future only when run_one_for(10 ms) returns, and with the pool's threads
+    // taking the handlers this thread waits out the 10 ms. So the connects run
+    // from STRESS_DRIVERS threads at once rather than one after another, which
+    // would not fit ctest's 120 s — each driver a connector of its own, as every
+    // backend agent holds one, and each driver's run_one_for also running the
+    // others' handlers — and every connect still races its cancel_after timer
+    // against its completion on the pool's threads, the property under test,
+    // now with other connects beside it.
+    constexpr int STRESS_DRIVERS = 10;
+    constexpr int STRESS_ITERATIONS = 1000; // per driver
 
 } // namespace
 
@@ -367,22 +384,42 @@ TEST_CASE("mysql Connector: connect and close in a loop over a multi-threaded io
     auto* resource = std::pmr::new_delete_resource();
     const auto params = params_for(server.port());
 
-    // One connector per iteration, as addConnection does: a fresh
-    // any_connection, one connect, one close, then the destructor.
-    for (int i = 0; i < STRESS_ITERATIONS; ++i) {
-        INFO("iteration " << i);
-        auto connector = mysql::make_mysql_connector(resource, pool.ctx(), params, "stress");
-        core::error_t err = core::error_t::no_error();
-        // On the unfixed code the broken promise surfaces here as a
-        // std::future_error out of connect(), which no caller catches.
-        REQUIRE_NOTHROW(err = connector->connect());
-        REQUIRE_FALSE(err.contains_error());
-        REQUIRE(connector->status() == mysql::Status::Connected);
-        REQUIRE_NOTHROW(connector->close());
-        REQUIRE(connector->isClosed());
+    // One connector per iteration, as a backend agent holds one: a fresh
+    // any_connection, one connect, one close, then the destructor. Catch2's
+    // assertions are not for other threads: each driver counts what failed.
+    std::atomic<int> thrown{0};
+    std::atomic<int> refused{0};
+    std::atomic<int> unclosed{0};
+    {
+        std::vector<std::jthread> drivers;
+        for (int d = 0; d < STRESS_DRIVERS; ++d) {
+            drivers.emplace_back([&] {
+                for (int i = 0; i < STRESS_ITERATIONS; ++i) {
+                    try {
+                        auto connector = mysql::make_mysql_connector(resource, pool.ctx(), params, "stress");
+                        // On the unfixed code the broken promise surfaces here as a
+                        // std::future_error out of connect(), which no caller catches.
+                        auto err = connector->connect();
+                        if (err.contains_error() || connector->status() != mysql::Status::Connected) {
+                            ++refused;
+                            continue;
+                        }
+                        connector->close();
+                        if (!connector->isClosed()) {
+                            ++unclosed;
+                        }
+                    } catch (...) {
+                        ++thrown;
+                    }
+                }
+            });
+        }
     }
+    REQUIRE(thrown.load() == 0);
+    REQUIRE(refused.load() == 0);
+    REQUIRE(unclosed.load() == 0);
 
-    REQUIRE(server.sessions() == static_cast<size_t>(STRESS_ITERATIONS));
+    REQUIRE(server.sessions() == static_cast<size_t>(STRESS_DRIVERS * STRESS_ITERATIONS));
     REQUIRE(server.malformed_logins() == 0);
     REQUIRE(server.unexpected_users() == 0);
     REQUIRE(server.unexpected_commands() == 0);
@@ -431,5 +468,52 @@ TEST_CASE("mysql Connector: destroying a connector whose server went away does n
         // std::terminate, which is why this case is separate from the one above.
     }
 
+    pool.stop();
+}
+
+TEST_CASE("mysql Connector: cancel() aborts a statement the server never answers") {
+    fake_mysql_server server{fake_mysql_server::after_ok::swallow_commands, std::string(USER)};
+    thread_pool_manager pool{pool_threads()};
+    pool.start();
+    auto* resource = std::pmr::new_delete_resource();
+
+    auto connector = mysql::make_mysql_connector(resource, pool.ctx(), params_for(server.port()), "hung");
+    REQUIRE_FALSE(connector->connect().contains_error());
+
+    // The statement as a backend agent spawns it: its ping is read and never
+    // answered, so the statement waits for good.
+    auto handler = [](const boost::mysql::results&) -> otterstax::asio_error_t { return otterstax::asio_error_t{}; };
+    auto running = otterstax::spawn_marshaled<otterstax::asio_error_t>(
+        pool.ctx(),
+        otterstax::run_with_owned_handler<otterstax::asio_error_t, const boost::mysql::results&>(*connector,
+                                                                                                 "SELECT 1",
+                                                                                                 handler),
+        resource);
+    REQUIRE(server.wait_until([&server] { return server.swallowed() == 1; }));
+    REQUIRE(running.wait_for(100ms) == std::future_status::timeout);
+
+    // From another thread, as the shutdown's backend_actor_t::cancel_agents does it.
+    const auto started = std::chrono::steady_clock::now();
+    connector->cancel();
+    REQUIRE(running.wait_for(5s) == std::future_status::ready);
+    CHECK(std::chrono::steady_clock::now() - started < 5s);
+    const auto outcome = running.get();
+    REQUIRE(outcome.contains_error());
+    CHECK(outcome.type == core::error_code_t::io_error);
+
+    // A cancelled connector refuses what follows without touching the connection.
+    auto next = otterstax::spawn_marshaled<otterstax::asio_error_t>(
+        pool.ctx(),
+        otterstax::run_with_owned_handler<otterstax::asio_error_t, const boost::mysql::results&>(*connector,
+                                                                                                 "SELECT 2",
+                                                                                                 handler),
+        resource);
+    REQUIRE(next.wait_for(5s) == std::future_status::ready);
+    const auto refused = next.get();
+    REQUIRE(refused.contains_error());
+    CHECK(std::string{refused.what.c_str()}.find("was cancelled") != std::string::npos);
+    CHECK(server.swallowed() == 1);
+
+    connector.reset();
     pool.stop();
 }

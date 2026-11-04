@@ -1,8 +1,12 @@
 #include "ch_to_chunk.hpp"
 
+#include "decimal_text.hpp"
 #include "otterbrix/translators/error.hpp"
 
 #include "utility/tracy_profiler.hpp"
+
+#include <components/vector/vector_builders.hpp>
+#include <components/vector/vector_operations.hpp>
 
 #include <arpa/inet.h>
 #include <charconv>
@@ -51,11 +55,57 @@ namespace tsl {
                                                             const std::string& alias);
         // The value one wire cell holds, read as `target_type`; nullopt when the wire value has no
         // reading as that type.
-        std::optional<types::logical_value_t> read_value(std::pmr::memory_resource* res,
-                                                         const clickhouse::ColumnRef& col,
-                                                         size_t row,
-                                                         const types::complex_logical_type& target_type);
-        bool has_type(const types::logical_value_t& value, const types::complex_logical_type& type);
+        // The value is a one-row vector of exactly `target_type`, as the column (or the field or
+        // element) it is written into.
+        std::optional<components::vector::vector_t> read_value(std::pmr::memory_resource* res,
+                                                               const clickhouse::ColumnRef& col,
+                                                               size_t row,
+                                                               const types::complex_logical_type& target_type);
+
+        // The precision and scale of a ClickHouse Decimal type node: Decimal(P, S), Decimal32(S) (P 9),
+        // Decimal64(S) (P 18), Decimal128(S) (P 38); nullopt for any other node.
+        std::optional<std::pair<long long, long long>> decimal_spec(const clickhouse::TypeAst& ast) {
+            using c = clickhouse::Type;
+            auto number = [&ast](size_t i) -> std::optional<long long> {
+                if (i >= ast.elements.size() || ast.elements[i].meta != clickhouse::TypeAst::Number) {
+                    return std::nullopt;
+                }
+                return ast.elements[i].value;
+            };
+            switch (ast.code) {
+                case c::Decimal: {
+                    auto precision = number(0);
+                    auto scale = number(1);
+                    if (!precision || !scale) {
+                        return std::nullopt;
+                    }
+                    return std::make_pair(*precision, *scale);
+                }
+                case c::Decimal32:
+                case c::Decimal64:
+                case c::Decimal128: {
+                    auto scale = number(0);
+                    if (!scale) {
+                        return std::nullopt;
+                    }
+                    const long long precision = ast.code == c::Decimal32 ? 9 : ast.code == c::Decimal64 ? 18 : 38;
+                    return std::make_pair(precision, *scale);
+                }
+                default:
+                    return std::nullopt;
+            }
+        }
+
+        // Decimal(P, S) is the engine's DECIMAL(P, S) when it can declare one (P <= 38); a wider one
+        // (Decimal256) is carried as its exact text.
+        types::complex_logical_type decimal_or_text(const clickhouse::TypeAst& ast, const std::string& alias) {
+            if (const auto spec = decimal_spec(ast)) {
+                if (auto decimal = decimal_type(spec->first, spec->second, alias)) {
+                    return std::move(*decimal);
+                }
+            }
+            return {types::logical_type::STRING_LITERAL, alias};
+        }
 
         // The column's type as the wire describes it.
         types::complex_logical_type
@@ -82,6 +132,11 @@ namespace tsl {
             if (declared.type() != wire.type()) {
                 return false;
             }
+            if (declared.type() == lt::DECIMAL) {
+                // A result column under a Decimal column's name is that column only at its width and
+                // scale (`SUM(price) AS price` is Decimal(38, S)).
+                return declared == wire;
+            }
             if (declared.type() == lt::STRUCT) {
                 const auto& declared_fields = declared.child_types();
                 const auto& wire_fields = wire.child_types();
@@ -101,21 +156,30 @@ namespace tsl {
             return true;
         }
 
+        // The system.columns types a result's columns are declared with, by result position: the type
+        // of the table column result column i reads as it is, when it reads one.
+        using declared_types_t = std::vector<std::optional<std::string>>;
+
+        // The type string declared for column `col`, or nullptr.
+        const std::string* declared_string(const declared_types_t& declared_types, size_t col) {
+            return col < declared_types.size() && declared_types[col] ? &*declared_types[col] : nullptr;
+        }
+
         // The type system.columns names for column `col`, when the wire column is a representation of
-        // it. The overrides are the base table's column types keyed by NAME, and a result column can
-        // carry a base column's name without being that column — `AVG(x) AS x` is a Float64 under an
-        // Int32 column's name — so an override the wire column does not represent names another column.
+        // it. A result column can carry a base column's name without being that column — `AVG(x) AS x`
+        // is a Float64 under an Int32 column's name — so a declared type the wire column does not
+        // represent names another column.
         std::optional<types::complex_logical_type>
         declared_type(std::pmr::memory_resource* resource,
                       const clickhouse::Block& block,
                       size_t col,
                       const types::complex_logical_type& wire,
-                      const std::unordered_map<std::string, std::string>& named_type_overrides) {
-            const auto override_it = named_type_overrides.find(block.GetColumnName(col));
-            if (override_it == named_type_overrides.end()) {
+                      const declared_types_t& declared_types) {
+            const std::string* named = declared_string(declared_types, col);
+            if (named == nullptr) {
                 return std::nullopt;
             }
-            auto declared = build_from_named_string(resource, override_it->second, override_it->first);
+            auto declared = build_from_named_string(resource, *named, block.GetColumnName(col));
             if (!represents(declared, wire)) {
                 return std::nullopt;
             }
@@ -129,9 +193,9 @@ namespace tsl {
         column_type(std::pmr::memory_resource* resource,
                     const clickhouse::Block& block,
                     size_t col,
-                    const std::unordered_map<std::string, std::string>& named_type_overrides) {
+                    const declared_types_t& declared_types) {
             auto wire = wire_type(resource, block, col);
-            auto declared = declared_type(resource, block, col, wire, named_type_overrides);
+            auto declared = declared_type(resource, block, col, wire, declared_types);
             if (declared.has_value()) {
                 return std::move(*declared);
             }
@@ -142,14 +206,14 @@ namespace tsl {
                                        const clickhouse::Block& block,
                                        size_t col,
                                        size_t result_row,
-                                       const std::unordered_map<std::string, std::string>& named_type_overrides) {
+                                       const declared_types_t& declared_types) {
             const std::string col_name = block.GetColumnName(col);
             std::string what = "ClickHouse column '" + col_name + "' of wire type " + block[col]->Type()->GetName();
-            if (declared_type(resource, block, col, wire_type(resource, block, col), named_type_overrides).has_value()) {
-                what += " declared " + named_type_overrides.find(col_name)->second;
+            if (declared_type(resource, block, col, wire_type(resource, block, col), declared_types).has_value()) {
+                what += " declared " + *declared_string(declared_types, col);
             }
             what += ": the value in row " + std::to_string(result_row) + " cannot be converted to the column's type";
-            return make_error(resource, core::error_code_t::conversion_failure, what);
+            return make_error(resource, core::error_code_t::datatype_mismatch, what);
         }
 
         // Writes the column's rows of `block` into chunk rows [first_row, first_row + rows).
@@ -159,80 +223,37 @@ namespace tsl {
                                    const types::complex_logical_type& type,
                                    const clickhouse::Block& block,
                                    size_t first_row,
-                                   const std::unordered_map<std::string, std::string>& named_type_overrides) {
+                                   const declared_types_t& declared_types) {
             const size_t nrows = block.GetRowCount();
             if (nrows == 0) {
                 return core::error_t::no_error();
             }
             if (col >= block.GetColumnCount()) {
                 return make_error(resource,
-                                  core::error_code_t::conversion_failure,
+                                  core::error_code_t::protocol_violation,
                                   "ClickHouse block of " + std::to_string(nrows) + " row(s) has no column " +
                                       std::to_string(col));
             }
             const auto& column = block[col];
             for (size_t row = 0; row < nrows; ++row) {
+                // The value is built as the column's own type (its fields and elements as theirs), so
+                // the copy into the column never meets a vector of another type.
                 auto value = read_value(resource, column, row, type);
-                // The engine refuses a value whose type is not its vector's (and a child vector a
-                // field or element of another type), so no such value is handed to set_value.
-                if (!value.has_value() || !has_type(*value, type)) {
-                    return unreadable_value(resource, block, col, first_row + row, named_type_overrides);
+                if (!value.has_value()) {
+                    return unreadable_value(resource, block, col, first_row + row, declared_types);
                 }
-                chunk.set_value(col, first_row + row, *value);
+                components::vector::vector_ops::copy(*value, chunk.data[col], 1, 0, first_row + row);
             }
             return core::error_t::no_error();
         }
 
     } // namespace
 
+    // One chunk for all rows of the blocks, filled in place with no intermediate allocations.
     core::result_wrapper_t<data_chunk_t> ch_to_chunk(std::pmr::memory_resource* resource,
-                                                     const clickhouse::Block& block) {
-        return ch_to_chunk(resource, block, {});
-    }
-
-    core::result_wrapper_t<data_chunk_t>
-    ch_to_chunk(std::pmr::memory_resource* resource,
-                const clickhouse::Block& block,
-                const std::unordered_map<std::string, std::string>& named_type_overrides) {
-        OTX_ZONE_N("tsl::ch_to_chunk(block)");
-        // No affected-row counterpart to mysql_to_chunk / pg_to_chunk here: no
-        // ClickHouse block ever carries a count. An INSERT's written rows arrive
-        // as Progress packets beside the blocks (ch::select_result_t), and the
-        // ClickHouse manager builds the count carrier from them itself
-        // (make_affected_rows_carrier); a column-less block is just a 0-row
-        // chunk.
-        const size_t ncols = block.GetColumnCount();
-        const size_t nrows = block.GetRowCount();
-
-        std::pmr::vector<types::complex_logical_type> col_types{resource};
-        col_types.reserve(ncols);
-        for (size_t col = 0; col < ncols; ++col) {
-            col_types.emplace_back(column_type(resource, block, col, named_type_overrides));
-        }
-
-        data_chunk_t chunk(resource, col_types, nrows);
-        chunk.set_cardinality(nrows);
-
-        for (size_t col = 0; col < ncols; ++col) {
-            if (auto err = write_column(resource, chunk, col, col_types[col], block, 0, named_type_overrides);
-                err.contains_error()) {
-                return std::move(err);
-            }
-        }
-        return chunk;
-    }
-
-    // Multi-block version: allocates one chunk for all rows, fills in-place with no intermediate allocations.
-    core::result_wrapper_t<data_chunk_t> ch_to_chunk(std::pmr::memory_resource* resource,
-                                                     const std::vector<clickhouse::Block>& blocks) {
-        return ch_to_chunk(resource, blocks, {});
-    }
-
-    core::result_wrapper_t<data_chunk_t>
-    ch_to_chunk(std::pmr::memory_resource* resource,
-                const std::vector<clickhouse::Block>& blocks,
-                const std::unordered_map<std::string, std::string>& named_type_overrides) {
-        OTX_ZONE_N("tsl::ch_to_chunk(blocks)");
+                                                     const std::vector<clickhouse::Block>& blocks,
+                                                     const std::vector<std::optional<std::string>>& column_types) {
+        OTX_ZONE_N("tsl::ch_to_chunk");
         // Find schema block (first with column metadata) and count total rows
         const clickhouse::Block* schema_block = nullptr;
         size_t total_rows = 0;
@@ -243,14 +264,17 @@ namespace tsl {
         }
 
         if (!schema_block) {
-            return ch_to_chunk(resource, clickhouse::Block{});
+            // No ClickHouse block ever carries a count: an INSERT's written rows arrive as
+            // Progress packets beside the blocks (ch::select_result_t), which the ClickHouse
+            // backend's write reads. A result without a column is a chunk without one.
+            return data_chunk_t(resource, std::pmr::vector<types::complex_logical_type>{resource}, 0);
         }
 
         const size_t ncols = schema_block->GetColumnCount();
         std::pmr::vector<types::complex_logical_type> col_types{resource};
         col_types.reserve(ncols);
         for (size_t col = 0; col < ncols; ++col) {
-            col_types.emplace_back(column_type(resource, *schema_block, col, named_type_overrides));
+            col_types.emplace_back(column_type(resource, *schema_block, col, column_types));
         }
 
         data_chunk_t chunk(resource, col_types, total_rows);
@@ -259,8 +283,7 @@ namespace tsl {
         for (size_t col = 0; col < ncols; ++col) {
             size_t first_row = 0;
             for (const auto& block : blocks) {
-                if (auto err =
-                        write_column(resource, chunk, col, col_types[col], block, first_row, named_type_overrides);
+                if (auto err = write_column(resource, chunk, col, col_types[col], block, first_row, column_types);
                     err.contains_error()) {
                     return std::move(err);
                 }
@@ -443,6 +466,13 @@ namespace tsl {
             }
             auto paren = s.find('(');
             std::string base = (paren == std::string::npos) ? s : s.substr(0, paren);
+            if (base == "Decimal" || base == "Decimal32" || base == "Decimal64" || base == "Decimal128") {
+                const clickhouse::TypeAst* ast = clickhouse::ParseTypeName(s);
+                if (ast == nullptr) {
+                    return {types::logical_type::STRING_LITERAL, alias};
+                }
+                return decimal_or_text(*ast, alias);
+            }
             return {primitive_name_to_logical(base), alias};
         }
 
@@ -494,8 +524,7 @@ namespace tsl {
 
         // `ticks` counts 10^-precision seconds from the Unix epoch: YYYY-MM-DD hh:mm:ss with
         // `precision` fraction digits, the wall clock in UTC (a column's timezone is not applied).
-        std::optional<types::logical_value_t>
-        epoch_text(std::pmr::memory_resource* res, int64_t ticks, size_t precision) {
+        std::optional<std::string> epoch_text(int64_t ticks, size_t precision) {
             const auto scale = ticks_per_second(precision);
             if (!scale.has_value()) {
                 return std::nullopt;
@@ -526,13 +555,12 @@ namespace tsl {
                           static_cast<int>(second_of_day % 60));
             text += clock;
             append_fraction(text, fraction, precision);
-            return types::logical_value_t{res, std::move(text)};
+            return text;
         }
 
         // A Time / Time64 value counts 10^-precision seconds and may be negative or past a day:
         // [-]hh:mm:ss with `precision` fraction digits, the hours at least two digits.
-        std::optional<types::logical_value_t>
-        time_text(std::pmr::memory_resource* res, int64_t ticks, size_t precision) {
+        std::optional<std::string> time_text(int64_t ticks, size_t precision) {
             const auto scale = ticks_per_second(precision);
             if (!scale.has_value()) {
                 return std::nullopt;
@@ -550,7 +578,7 @@ namespace tsl {
                           static_cast<unsigned long long>(seconds % 60));
             std::string text = clock;
             append_fraction(text, static_cast<int64_t>(magnitude % static_cast<uint64_t>(*scale)), precision);
-            return types::logical_value_t{res, std::move(text)};
+            return text;
         }
 
         // The decimal digits of `magnitude`, a decimal point before the last `scale` of them; exact
@@ -578,99 +606,94 @@ namespace tsl {
             return text;
         }
 
-        types::logical_value_t decimal_text(std::pmr::memory_resource* res, clickhouse::Int128 unscaled, size_t scale) {
+        std::string decimal_text(clickhouse::Int128 unscaled, size_t scale) {
             const bool negative = unscaled < 0;
             // Negated as unsigned, so the most negative value keeps its magnitude.
             const absl::uint128 magnitude =
                 negative ? -static_cast<absl::uint128>(unscaled) : static_cast<absl::uint128>(unscaled);
-            return {res, unscaled_text(negative, magnitude, scale)};
+            return unscaled_text(negative, magnitude, scale);
         }
 
         template<typename EnumColumn>
-        std::optional<types::logical_value_t>
-        enum_text(std::pmr::memory_resource* res, const EnumColumn& enum_col, size_t row) {
+        std::optional<std::string> enum_text(const EnumColumn& enum_col, size_t row) {
             // NameAt looks the value up without checking it is one of the type's items.
             if (!enum_col.Type()->template As<clickhouse::EnumType>()->HasEnumValue(enum_col.At(row))) {
                 return std::nullopt;
             }
-            return types::logical_value_t{res, std::string(enum_col.NameAt(row))};
+            return std::string(enum_col.NameAt(row));
         }
 
         template<typename Number>
-        types::logical_value_t number_text(std::pmr::memory_resource* res, Number value) {
+        std::string number_text(Number value) {
             char buf[32];
             const auto written = std::to_chars(buf, buf + sizeof(buf), value);
-            return {res, std::string(buf, written.ptr)};
+            return std::string(buf, written.ptr);
         }
 
         // A wire value as the column's text; nullopt for a wire type without one (Map, the geo
         // types, Nothing, an Array or a Tuple).
-        std::optional<types::logical_value_t> read_text(std::pmr::memory_resource* res,
-                                                        const clickhouse::ColumnRef& col,
-                                                        clickhouse::Type::Code code,
-                                                        size_t row) {
+        std::optional<std::string>
+        read_text(const clickhouse::ColumnRef& col, clickhouse::Type::Code code, size_t row) {
             using c = clickhouse::Type;
             switch (code) {
                 case c::Int8:
-                    return number_text(res, col->As<clickhouse::ColumnInt8>()->At(row));
+                    return number_text(col->As<clickhouse::ColumnInt8>()->At(row));
                 case c::Int16:
-                    return number_text(res, col->As<clickhouse::ColumnInt16>()->At(row));
+                    return number_text(col->As<clickhouse::ColumnInt16>()->At(row));
                 case c::Int32:
-                    return number_text(res, col->As<clickhouse::ColumnInt32>()->At(row));
+                    return number_text(col->As<clickhouse::ColumnInt32>()->At(row));
                 case c::Int64:
-                    return number_text(res, col->As<clickhouse::ColumnInt64>()->At(row));
+                    return number_text(col->As<clickhouse::ColumnInt64>()->At(row));
                 case c::UInt8:
-                    return number_text(res, col->As<clickhouse::ColumnUInt8>()->At(row));
+                    return number_text(col->As<clickhouse::ColumnUInt8>()->At(row));
                 case c::UInt16:
-                    return number_text(res, col->As<clickhouse::ColumnUInt16>()->At(row));
+                    return number_text(col->As<clickhouse::ColumnUInt16>()->At(row));
                 case c::UInt32:
-                    return number_text(res, col->As<clickhouse::ColumnUInt32>()->At(row));
+                    return number_text(col->As<clickhouse::ColumnUInt32>()->At(row));
                 case c::UInt64:
-                    return number_text(res, col->As<clickhouse::ColumnUInt64>()->At(row));
+                    return number_text(col->As<clickhouse::ColumnUInt64>()->At(row));
                 case c::Float32:
-                    return number_text(res, col->As<clickhouse::ColumnFloat32>()->At(row));
+                    return number_text(col->As<clickhouse::ColumnFloat32>()->At(row));
                 case c::Float64:
-                    return number_text(res, col->As<clickhouse::ColumnFloat64>()->At(row));
+                    return number_text(col->As<clickhouse::ColumnFloat64>()->At(row));
                 case c::String:
-                    return types::logical_value_t{res, std::string(col->As<clickhouse::ColumnString>()->At(row))};
+                    return std::string(col->As<clickhouse::ColumnString>()->At(row));
                 case c::FixedString:
-                    return types::logical_value_t{res, std::string(col->As<clickhouse::ColumnFixedString>()->At(row))};
+                    return std::string(col->As<clickhouse::ColumnFixedString>()->At(row));
                 case c::DateTime:
-                    return epoch_text(res, col->As<clickhouse::ColumnDateTime>()->RawAt(row), 0);
+                    return epoch_text(col->As<clickhouse::ColumnDateTime>()->RawAt(row), 0);
                 case c::DateTime64: {
                     const auto datetime64_col = col->As<clickhouse::ColumnDateTime64>();
-                    return epoch_text(res, datetime64_col->At(row), datetime64_col->GetPrecision());
+                    return epoch_text(datetime64_col->At(row), datetime64_col->GetPrecision());
                 }
                 case c::Time:
-                    return time_text(res, col->As<clickhouse::ColumnTime>()->At(row), 0);
+                    return time_text(col->As<clickhouse::ColumnTime>()->At(row), 0);
                 case c::Time64: {
                     const auto time64_col = col->As<clickhouse::ColumnTime64>();
-                    return time_text(res, time64_col->At(row), time64_col->GetPrecision());
+                    return time_text(time64_col->At(row), time64_col->GetPrecision());
                 }
                 case c::Decimal:
                 case c::Decimal32:
                 case c::Decimal64:
                 case c::Decimal128: {
                     const auto decimal_col = col->As<clickhouse::ColumnDecimal>();
-                    return decimal_text(res, decimal_col->At(row), decimal_col->GetScale());
+                    return decimal_text(decimal_col->At(row), decimal_col->GetScale());
                 }
                 case c::Int128:
-                    return decimal_text(res, col->As<clickhouse::ColumnInt128>()->At(row), 0);
+                    return decimal_text(col->As<clickhouse::ColumnInt128>()->At(row), 0);
                 case c::UInt128:
-                    return types::logical_value_t{
-                        res,
-                        unscaled_text(false, col->As<clickhouse::ColumnUInt128>()->At(row), 0)};
+                    return unscaled_text(false, col->As<clickhouse::ColumnUInt128>()->At(row), 0);
                 case c::Enum8:
-                    return enum_text(res, *col->As<clickhouse::ColumnEnum8>(), row);
+                    return enum_text(*col->As<clickhouse::ColumnEnum8>(), row);
                 case c::Enum16:
-                    return enum_text(res, *col->As<clickhouse::ColumnEnum16>(), row);
+                    return enum_text(*col->As<clickhouse::ColumnEnum16>(), row);
                 case c::IPv4: {
                     const in_addr address = col->As<clickhouse::ColumnIPv4>()->At(row);
                     char buf[INET_ADDRSTRLEN];
                     if (inet_ntop(AF_INET, &address, buf, sizeof(buf)) == nullptr) {
                         return std::nullopt;
                     }
-                    return types::logical_value_t{res, std::string(buf)};
+                    return std::string(buf);
                 }
                 case c::IPv6: {
                     const in6_addr address = col->As<clickhouse::ColumnIPv6>()->At(row);
@@ -678,21 +701,19 @@ namespace tsl {
                     if (inet_ntop(AF_INET6, &address, buf, sizeof(buf)) == nullptr) {
                         return std::nullopt;
                     }
-                    return types::logical_value_t{res, std::string(buf)};
+                    return std::string(buf);
                 }
                 case c::Date:
-                    return types::logical_value_t{res, format_epoch_day(col->As<clickhouse::ColumnDate>()->RawAt(row))};
+                    return format_epoch_day(col->As<clickhouse::ColumnDate>()->RawAt(row));
                 case c::Date32:
-                    return types::logical_value_t{res,
-                                                  format_epoch_day(col->As<clickhouse::ColumnDate32>()->RawAt(row))};
+                    return format_epoch_day(col->As<clickhouse::ColumnDate32>()->RawAt(row));
                 case c::UUID: {
                     auto u = col->As<clickhouse::ColumnUUID>()->At(row);
                     std::ostringstream oss;
                     oss << std::hex << std::setfill('0') << std::setw(16) << u.first << std::setw(16) << u.second;
                     std::string hex = oss.str();
-                    return types::logical_value_t{res,
-                                                  hex.substr(0, 8) + "-" + hex.substr(8, 4) + "-" + hex.substr(12, 4) +
-                                                      "-" + hex.substr(16, 4) + "-" + hex.substr(20, 12)};
+                    return hex.substr(0, 8) + "-" + hex.substr(8, 4) + "-" + hex.substr(12, 4) + "-" + hex.substr(16, 4) +
+                           "-" + hex.substr(20, 12);
                 }
                 default:
                     return std::nullopt;
@@ -700,47 +721,49 @@ namespace tsl {
         }
 
         template<typename Target, typename Source>
-        std::optional<types::logical_value_t> integer_as(std::pmr::memory_resource* res, Source value) {
+        std::optional<components::vector::vector_t>
+        integer_as(std::pmr::memory_resource* res, const types::complex_logical_type& target_type, Source value) {
             if (!std::in_range<Target>(value)) {
                 return std::nullopt;
             }
-            return types::logical_value_t{res, static_cast<Target>(value)};
+            return components::vector::make_scalar(res, target_type, static_cast<Target>(value));
         }
 
         // An integer wire value as the integer column type Target, when Target holds it.
         template<typename Target>
-        std::optional<types::logical_value_t> read_integer(std::pmr::memory_resource* res,
-                                                           const clickhouse::ColumnRef& col,
-                                                           clickhouse::Type::Code code,
-                                                           size_t row) {
+        std::optional<components::vector::vector_t> read_integer(std::pmr::memory_resource* res,
+                                                                 const clickhouse::ColumnRef& col,
+                                                                 clickhouse::Type::Code code,
+                                                                 size_t row,
+                                                                 const types::complex_logical_type& target_type) {
             using c = clickhouse::Type;
             switch (code) {
                 case c::Int8:
-                    return integer_as<Target>(res, col->As<clickhouse::ColumnInt8>()->At(row));
+                    return integer_as<Target>(res, target_type, col->As<clickhouse::ColumnInt8>()->At(row));
                 case c::Int16:
-                    return integer_as<Target>(res, col->As<clickhouse::ColumnInt16>()->At(row));
+                    return integer_as<Target>(res, target_type, col->As<clickhouse::ColumnInt16>()->At(row));
                 case c::Int32:
-                    return integer_as<Target>(res, col->As<clickhouse::ColumnInt32>()->At(row));
+                    return integer_as<Target>(res, target_type, col->As<clickhouse::ColumnInt32>()->At(row));
                 case c::Int64:
-                    return integer_as<Target>(res, col->As<clickhouse::ColumnInt64>()->At(row));
+                    return integer_as<Target>(res, target_type, col->As<clickhouse::ColumnInt64>()->At(row));
                 case c::UInt8:
-                    return integer_as<Target>(res, col->As<clickhouse::ColumnUInt8>()->At(row));
+                    return integer_as<Target>(res, target_type, col->As<clickhouse::ColumnUInt8>()->At(row));
                 case c::UInt16:
-                    return integer_as<Target>(res, col->As<clickhouse::ColumnUInt16>()->At(row));
+                    return integer_as<Target>(res, target_type, col->As<clickhouse::ColumnUInt16>()->At(row));
                 case c::UInt32:
-                    return integer_as<Target>(res, col->As<clickhouse::ColumnUInt32>()->At(row));
+                    return integer_as<Target>(res, target_type, col->As<clickhouse::ColumnUInt32>()->At(row));
                 case c::UInt64:
-                    return integer_as<Target>(res, col->As<clickhouse::ColumnUInt64>()->At(row));
+                    return integer_as<Target>(res, target_type, col->As<clickhouse::ColumnUInt64>()->At(row));
                 default:
                     return std::nullopt;
             }
         }
 
-        std::optional<types::logical_value_t> read_struct(std::pmr::memory_resource* res,
-                                                          const clickhouse::ColumnRef& col,
-                                                          clickhouse::Type::Code code,
-                                                          size_t row,
-                                                          const types::complex_logical_type& target_type) {
+        std::optional<components::vector::vector_t> read_struct(std::pmr::memory_resource* res,
+                                                                const clickhouse::ColumnRef& col,
+                                                                clickhouse::Type::Code code,
+                                                                size_t row,
+                                                                const types::complex_logical_type& target_type) {
             if (code != clickhouse::Type::Tuple) {
                 return std::nullopt;
             }
@@ -749,7 +772,7 @@ namespace tsl {
             if (!tuple_col || tuple_col->TupleSize() != field_types.size()) {
                 return std::nullopt;
             }
-            std::vector<types::logical_value_t> fields;
+            std::vector<components::vector::vector_t> fields;
             fields.reserve(field_types.size());
             for (size_t i = 0; i < field_types.size(); ++i) {
                 auto field = read_value(res, (*tuple_col)[i], row, field_types[i]);
@@ -758,14 +781,14 @@ namespace tsl {
                 }
                 fields.emplace_back(std::move(*field));
             }
-            return types::logical_value_t::create_struct(res, target_type, fields);
+            return components::vector::make_struct(res, target_type, fields);
         }
 
-        std::optional<types::logical_value_t> read_list(std::pmr::memory_resource* res,
-                                                        const clickhouse::ColumnRef& col,
-                                                        clickhouse::Type::Code code,
-                                                        size_t row,
-                                                        const types::complex_logical_type& target_type) {
+        std::optional<components::vector::vector_t> read_list(std::pmr::memory_resource* res,
+                                                              const clickhouse::ColumnRef& col,
+                                                              clickhouse::Type::Code code,
+                                                              size_t row,
+                                                              const types::complex_logical_type& target_type) {
             if (code != clickhouse::Type::Array) {
                 return std::nullopt;
             }
@@ -777,7 +800,7 @@ namespace tsl {
             // The element type is the extension's, read through child_type(); child_types() is
             // a STRUCT's field list and reads past the end of an ARRAY / LIST extension.
             const auto& item_type = target_type.child_type();
-            std::vector<types::logical_value_t> values;
+            std::vector<components::vector::vector_t> values;
             values.reserve(items->Size());
             for (size_t i = 0; i < items->Size(); ++i) {
                 auto item = read_value(res, items, i, item_type);
@@ -786,13 +809,13 @@ namespace tsl {
                 }
                 values.emplace_back(std::move(*item));
             }
-            return types::logical_value_t::create_list(res, item_type, values);
+            return components::vector::make_list(res, item_type, values);
         }
 
-        std::optional<types::logical_value_t> read_value(std::pmr::memory_resource* res,
-                                                         const clickhouse::ColumnRef& col,
-                                                         size_t row,
-                                                         const types::complex_logical_type& target_type) {
+        std::optional<components::vector::vector_t> read_value(std::pmr::memory_resource* res,
+                                                               const clickhouse::ColumnRef& col,
+                                                               size_t row,
+                                                               const types::complex_logical_type& target_type) {
             using c = clickhouse::Type;
             using lt = types::logical_type;
             const auto code = col->Type()->GetCode();
@@ -802,7 +825,7 @@ namespace tsl {
                     return std::nullopt;
                 }
                 if (nullable_col->IsNull(row)) {
-                    return types::logical_value_t{res, nullptr};
+                    return components::vector::make_null(res, target_type);
                 }
                 return read_value(res, nullable_col->Nested(), row, target_type);
             }
@@ -811,13 +834,13 @@ namespace tsl {
                 // Nullable or not; an item is the dictionary's own value, Void for its NULL.
                 const auto item = col->GetItem(row);
                 if (item.type == c::Void) {
-                    return types::logical_value_t{res, nullptr};
+                    return components::vector::make_null(res, target_type);
                 }
                 if (target_type.type() != lt::STRING_LITERAL ||
                     (item.type != c::String && item.type != c::FixedString)) {
                     return std::nullopt;
                 }
-                return types::logical_value_t{res, std::string(item.data)};
+                return components::vector::make_scalar(res, target_type, std::string_view{item.data});
             }
             switch (target_type.type()) {
                 case lt::BOOLEAN:
@@ -825,40 +848,60 @@ namespace tsl {
                     if (code != c::UInt8) {
                         return std::nullopt;
                     }
-                    return types::logical_value_t{res, col->As<clickhouse::ColumnUInt8>()->At(row) != 0};
+                    return components::vector::make_scalar(res, target_type, col->As<clickhouse::ColumnUInt8>()->At(row) != 0);
                 case lt::TINYINT:
-                    return read_integer<int8_t>(res, col, code, row);
+                    return read_integer<int8_t>(res, col, code, row, target_type);
                 case lt::SMALLINT:
-                    return read_integer<int16_t>(res, col, code, row);
+                    return read_integer<int16_t>(res, col, code, row, target_type);
                 case lt::INTEGER:
-                    return read_integer<int32_t>(res, col, code, row);
+                    return read_integer<int32_t>(res, col, code, row, target_type);
                 case lt::BIGINT:
-                    return read_integer<int64_t>(res, col, code, row);
+                    return read_integer<int64_t>(res, col, code, row, target_type);
                 case lt::UTINYINT:
-                    return read_integer<uint8_t>(res, col, code, row);
+                    return read_integer<uint8_t>(res, col, code, row, target_type);
                 case lt::USMALLINT:
-                    return read_integer<uint16_t>(res, col, code, row);
+                    return read_integer<uint16_t>(res, col, code, row, target_type);
                 case lt::UINTEGER:
-                    return read_integer<uint32_t>(res, col, code, row);
+                    return read_integer<uint32_t>(res, col, code, row, target_type);
                 case lt::UBIGINT:
-                    return read_integer<uint64_t>(res, col, code, row);
+                    return read_integer<uint64_t>(res, col, code, row, target_type);
                 case lt::FLOAT:
                     if (code != c::Float32) {
                         return std::nullopt;
                     }
-                    return types::logical_value_t{res, col->As<clickhouse::ColumnFloat32>()->At(row)};
+                    return components::vector::make_scalar(res, target_type, col->As<clickhouse::ColumnFloat32>()->At(row));
                 case lt::DOUBLE:
                     if (code == c::Float32) {
-                        return types::logical_value_t{
+                        return components::vector::make_scalar(
                             res,
-                            static_cast<double>(col->As<clickhouse::ColumnFloat32>()->At(row))};
+                            target_type,
+                            static_cast<double>(col->As<clickhouse::ColumnFloat32>()->At(row)));
                     }
                     if (code != c::Float64) {
                         return std::nullopt;
                     }
-                    return types::logical_value_t{res, col->As<clickhouse::ColumnFloat64>()->At(row)};
-                case lt::STRING_LITERAL:
-                    return read_text(res, col, code, row);
+                    return components::vector::make_scalar(res, target_type, col->As<clickhouse::ColumnFloat64>()->At(row));
+                case lt::DECIMAL: {
+                    // The unscaled integer the wire carries, at the scale the column declares.
+                    if (code != c::Decimal && code != c::Decimal32 && code != c::Decimal64 && code != c::Decimal128) {
+                        return std::nullopt;
+                    }
+                    const auto decimal_col = col->As<clickhouse::ColumnDecimal>();
+                    const auto* spec = target_type.extension_as<types::decimal_logical_type_extension>();
+                    if (!decimal_col || spec == nullptr || decimal_col->GetScale() != spec->scale() ||
+                        decimal_col->GetPrecision() > spec->width()) {
+                        return std::nullopt;
+                    }
+                    const types::int128_t unscaled = decimal_col->At(row);
+                    return components::vector::make_decimal(res, target_type, unscaled);
+                }
+                case lt::STRING_LITERAL: {
+                    auto text = read_text(col, code, row);
+                    if (!text.has_value()) {
+                        return std::nullopt;
+                    }
+                    return components::vector::make_scalar(res, target_type, std::string_view{*text});
+                }
                 case lt::STRUCT:
                     return read_struct(res, col, code, row, target_type);
                 case lt::LIST:
@@ -866,34 +909,6 @@ namespace tsl {
                 default:
                     return std::nullopt;
             }
-        }
-
-        bool has_type(const types::logical_value_t& value, const types::complex_logical_type& type) {
-            using lt = types::logical_type;
-            if (value.is_null()) {
-                return true;
-            }
-            if (value.type() != type) {
-                return false;
-            }
-            if (type.type() == lt::STRUCT) {
-                const auto& fields = value.children();
-                if (fields.size() != type.child_types().size()) {
-                    return false;
-                }
-                for (size_t i = 0; i < fields.size(); ++i) {
-                    if (!has_type(fields[i], type.child_types()[i])) {
-                        return false;
-                    }
-                }
-            } else if (type.type() == lt::LIST) {
-                for (const auto& item : value.children()) {
-                    if (!has_type(item, type.child_type())) {
-                        return false;
-                    }
-                }
-            }
-            return true;
         }
 
         types::complex_logical_type
@@ -934,14 +949,13 @@ namespace tsl {
                 case meta::Enum:
                     return {types::logical_type::STRING_LITERAL, alias};
                 default:
+                    if (decimal_spec(ast)) {
+                        return decimal_or_text(ast, alias);
+                    }
                     return {ch_code_to_logical(ast.code), alias};
             }
         }
     } // namespace
-
-    types::complex_logical_type ch_to_struct(std::pmr::memory_resource* resource, const clickhouse::Block& block) {
-        return ch_to_struct(resource, block, {});
-    }
 
     types::complex_logical_type ch_to_struct(std::pmr::memory_resource* resource,
                                              const clickhouse::Block& block,
@@ -952,8 +966,16 @@ namespace tsl {
         std::pmr::vector<types::complex_logical_type> fields(resource);
         fields.reserve(ncols);
 
+        // The probe reads the table's columns under their own names: each column's declared type is
+        // its name's.
+        declared_types_t declared_types(ncols);
         for (size_t col = 0; col < ncols; ++col) {
-            fields.emplace_back(column_type(resource, block, col, named_type_overrides));
+            if (const auto it = named_type_overrides.find(block.GetColumnName(col)); it != named_type_overrides.end()) {
+                declared_types[col] = it->second;
+            }
+        }
+        for (size_t col = 0; col < ncols; ++col) {
+            fields.emplace_back(column_type(resource, block, col, declared_types));
         }
 
         return types::complex_logical_type::create_struct("", std::move(fields));

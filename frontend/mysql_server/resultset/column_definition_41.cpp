@@ -3,6 +3,8 @@
 
 #include "column_definition_41.hpp"
 
+#include "../mysql_defs/column_flags.hpp"
+
 #include <cassert>
 
 namespace frontend::mysql {
@@ -91,26 +93,62 @@ namespace frontend::mysql {
             case field_type::MYSQL_TYPE_NEWDECIMAL:
                 // A numeric column, so the binary charset as every other number
                 // above. The length stands for the widest DECIMAL the engine can
-                // build until apply_decimal_metadata puts the column's own
+                // build until apply_type_metadata puts the column's own
                 // (width, scale) here.
                 column_length = components::types::DECIMAL_MAX_WIDTH + 2;
                 charset = character_set::BINARY;
                 break;
             default:
                 column_length = 255;
-                charset = character_set::UTF8_GENERAL_CI;
+                // The handshake's collation: utf-8 text compared byte by byte.
+                charset = character_set::UTF8MB4_BIN;
                 break;
         }
     }
 
-    void apply_decimal_metadata(column_definition_41& column, const components::types::complex_logical_type& type) {
+    void apply_type_metadata(column_definition_41& column, const components::types::complex_logical_type& type) {
+        using components::types::logical_type;
+        // The flags MySQL's Item::init_make_field derives from the type: a
+        // column that compares as binary (a number, a date: the binary
+        // charset init_type gave it) is BINARY_FLAG, an unsigned integer
+        // UNSIGNED_FLAG (what makes a client read 200 of a TINYINT as 200 and
+        // not -56), an ENUM's label ENUM_FLAG. NOT_NULL_FLAG is never set: a
+        // result column says nothing of its nullability. A text column has
+        // none of them: MySQL would mark one under utf8mb4_bin BINARY too
+        // (my_binary_compare), which some drivers read as bytes (older
+        // mysql-connector-python answered such a column with a bytearray),
+        // while the collation (SERVER_COLLATION_ID) already says how it
+        // compares.
+        column.column_flags = 0;
+        if (column.charset == character_set::BINARY) {
+            column.column_flags |= BINARY_FLAG;
+        }
+        switch (type.type()) {
+            case logical_type::UTINYINT:
+            case logical_type::USMALLINT:
+            case logical_type::UINTEGER:
+            case logical_type::UBIGINT:
+                column.column_flags |= UNSIGNED_FLAG;
+                break;
+            case logical_type::ENUM:
+                column.column_flags |= ENUM_FLAG;
+                break;
+            default:
+                break;
+        }
+        if (type.type() == logical_type::BOOLEAN) {
+            // TINYINT(1), what MySQL declares a BOOLEAN as (Connector/J reads
+            // such a column as a boolean).
+            column.column_length = 1;
+            return;
+        }
         if (type.type() != components::types::logical_type::DECIMAL) {
             return;
         }
         const auto* extension = type.extension_as<components::types::decimal_logical_type_extension>();
         // A DECIMAL always carries its (width, scale): create_decimal is the only
         // way to build one.
-        assert(extension != nullptr && "apply_decimal_metadata: a DECIMAL column without its extension");
+        assert(extension != nullptr && "apply_type_metadata: a DECIMAL column without its extension");
         column.decimals = extension->scale();
         // The digits, the sign, and the point when there is a fractional part —
         // the display length MySQL reports for DECIMAL(width, scale).

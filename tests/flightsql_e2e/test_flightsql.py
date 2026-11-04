@@ -26,14 +26,16 @@ import FlightSql_pb2 as sqlpb  # noqa: E402
 
 DB = "flight_e2e"
 CATALOG = DB
+# The suite's tables: the schema public of its database (`d.s.t`).
+TABLES = f"{DB}.public"
 PH = "$1"
 
 adbc_dbapi = pytest.importorskip("adbc_driver_flightsql.dbapi")
 
 
 def sql(query_template):
-    """Substitute the DB prefix: sql('SELECT * FROM {db}.people')."""
-    return query_template.format(db=DB)
+    """Substitute the tables' prefix: sql('SELECT * FROM {db}.people')."""
+    return query_template.format(db=TABLES)
 
 
 def command_any(cmd):
@@ -72,14 +74,14 @@ def seeded(server_uri):
         pass  # nothing left over
     do_update(f"CREATE DATABASE {DB}")
     for ddl in [
-        f"CREATE TABLE {DB}.numbers (id BIGINT, name STRING, score DOUBLE)",
-        f"CREATE TABLE {DB}.people (person_id BIGINT, full_name STRING, age INT, active BOOLEAN)",
+        f"CREATE TABLE {TABLES}.numbers (id BIGINT, name STRING, score DOUBLE)",
+        f"CREATE TABLE {TABLES}.people (person_id BIGINT, full_name STRING, age INT, active BOOLEAN)",
     ]:
         do_update(ddl)
 
     numbers = ", ".join(
         f"({i}, {'NULL' if i == 3 else chr(39) + f'row-{i}' + chr(39)}, {i}.5)" for i in range(16))
-    do_update(f"INSERT INTO {DB}.numbers (id, name, score) VALUES {numbers}")
+    do_update(f"INSERT INTO {TABLES}.numbers (id, name, score) VALUES {numbers}")
     people = ", ".join([
         "(100, 'Alice', 21, true)",
         "(101, 'Bob', NULL, false)",
@@ -87,7 +89,7 @@ def seeded(server_uri):
         "(103, 'Dave', 40, NULL)",
         "(104, 'Frank', 52, true)",
     ])
-    do_update(f"INSERT INTO {DB}.people (person_id, full_name, age, active) VALUES {people}")
+    do_update(f"INSERT INTO {TABLES}.people (person_id, full_name, age, active) VALUES {people}")
     yield client
     try:
         do_update(f"DROP DATABASE {DB}")
@@ -167,16 +169,18 @@ class TestADBCDriver:
             assert cur.fetch_arrow_table().num_rows == 1
             cur.close()
 
-    def test_get_objects(self, server_uri):
-        # The metadata mirrors the REGISTERED backends (the catalog store holds
-        # their mirrored tables): with backends up their databases answer as
-        # catalogs, without any the root catalog does. The test runs in both
-        # environments and asserts the answer's shape, not the deployment.
+    def test_get_objects(self, server_uri, seeded):
+        # The listing is the engine's catalog (pg_database / pg_namespace /
+        # pg_class): the local databases and the connections' (`c.d`) alike,
+        # the database `federation` and the system schemas hidden. So the
+        # suite's own database is a catalog whatever backends the deployment has.
         with adbc_dbapi.connect(server_uri) as conn:
             objects = conn.adbc_get_objects(depth="all").read_all()
             assert objects.num_rows >= 1
             catalogs = objects.column("catalog_name").to_pylist()
             assert all(isinstance(c, str) for c in catalogs)
+            assert CATALOG in catalogs, f"the local database {CATALOG!r} is not listed: {catalogs}"
+            assert "federation" not in catalogs, f"the federation metadata database is listed: {catalogs}"
 
     def test_get_info(self, server_uri):
         with adbc_dbapi.connect(server_uri) as conn:
@@ -189,7 +193,7 @@ class TestADBCPrepared:
         with adbc_dbapi.connect(server_uri) as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    f"SELECT * FROM {DB}.people WHERE person_id = {PH}",
+                    f"SELECT * FROM {TABLES}.people WHERE person_id = {PH}",
                     parameters=pyarrow.RecordBatch.from_arrays(
                         [pyarrow.array([100], type=pyarrow.int64())], names=["0"]))
                 table = cur.fetch_arrow_table()
@@ -200,7 +204,7 @@ class TestADBCPrepared:
         with adbc_dbapi.connect(server_uri) as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    f"SELECT * FROM {DB}.people WHERE full_name = {PH}",
+                    f"SELECT * FROM {TABLES}.people WHERE full_name = {PH}",
                     parameters=pyarrow.RecordBatch.from_arrays(
                         [pyarrow.array(["Carol"], type=pyarrow.string())], names=["0"]))
                 table = cur.fetch_arrow_table()
@@ -212,7 +216,7 @@ class TestADBCPrepared:
         # which pyarrow do_put does not surface (see do_update above).
         with adbc_dbapi.connect(server_uri) as conn:
             with conn.cursor() as cur:
-                cur.execute(f"UPDATE {DB}.numbers SET score = 42.0 WHERE id = {PH}",
+                cur.execute(f"UPDATE {TABLES}.numbers SET score = 42.0 WHERE id = {PH}",
                             parameters=pyarrow.RecordBatch.from_arrays(
                                 [pyarrow.array([2], type=pyarrow.int64())], names=["0"]))
                 cur.execute(sql("SELECT score FROM {db}.numbers WHERE id = 2"))
@@ -222,7 +226,7 @@ class TestADBCPrepared:
         with adbc_dbapi.connect(server_uri) as conn:
             with conn.cursor() as cur:
                 stmt = cur.adbc_statement
-                stmt.set_sql_query(f"SELECT * FROM {DB}.people WHERE age > {PH}")
+                stmt.set_sql_query(f"SELECT * FROM {TABLES}.people WHERE age > {PH}")
                 stmt.prepare()
                 stmt.bind(pyarrow.RecordBatch.from_arrays(
                     [pyarrow.array([25], type=pyarrow.int64())], names=["0"]))

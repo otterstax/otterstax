@@ -52,7 +52,7 @@ connections:
       username: chuser
       password: chpassword
       database: chdb
-      table: orders
+      table: ""
 
   s3:
     - alias: rustfstest

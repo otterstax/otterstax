@@ -1,5 +1,5 @@
 -- Example 9: Mutations on an engine table — INSERT / UPDATE / DROP.
--- Requires example 6 (for the `qs` database). A small scratch table shows the
+-- Requires example 6 (for the `qs` schema). A small scratch table shows the
 -- full lifecycle; UPDATE reports the number of rows it changed ("UPDATE 2").
 -- (DELETE works the same way and reports "DELETE N"; the same statements also
 --  work on the S3-loaded qs.* tables.)

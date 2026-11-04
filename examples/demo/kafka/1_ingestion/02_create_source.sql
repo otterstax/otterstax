@@ -7,7 +7,9 @@
 -- crash mid-batch never duplicates or drops a record.
 \echo '>>> CREATE SOURCE orders_live  (Kafka topic → SQL table, exactly-once)'
 
-DROP SOURCE IF EXISTS orders_live;
+-- CASCADE: on a replay the stream of step 4 still reads this source, and a
+-- plain (RESTRICT) DROP SOURCE refuses while it does; step 4 re-creates it.
+DROP SOURCE IF EXISTS orders_live CASCADE;
 
 CREATE SOURCE orders_live (
     event_id    VARCHAR,

@@ -3,6 +3,7 @@
 
 #include "frontend_connection.hpp"
 
+#include <array>
 #include <utility>
 
 namespace {
@@ -53,6 +54,9 @@ namespace frontend {
                               boost::system::error_code ec;
                               socket_.close(ec);
                               read_timer_.cancel();
+                              // The handler running (if any) stops waiting for its
+                              // statement: the close does not wait for the answer.
+                              handler_cancel_.emit(boost::asio::cancellation_type::terminal);
                           }));
     }
 
@@ -63,8 +67,8 @@ namespace frontend {
     }
 
     void frontend_connection::release() {
-        // Releases what the connection holds on the Scheduler (unexecuted
-        // prepared statements); the connection is whole here and nothing else
+        // Closes the connection's query session (its unexecuted prepared
+        // statements go with it); the connection is whole here and nothing else
         // of it is queued anywhere.
         finish_impl();
 
@@ -108,7 +112,85 @@ namespace frontend {
         return true;
     }
 
+    void frontend_connection::run_handler(boost::asio::awaitable<void> handler) {
+        handling_ = true;
+        ++handler_generation_;
+        watch_peer_close();
+        boost::asio::co_spawn(
+            socket_.get_executor(),
+            std::move(handler),
+            boost::asio::bind_cancellation_slot(
+                handler_cancel_.slot(),
+                boost::asio::bind_executor(socket_.get_executor(), safe_callback([this](std::exception_ptr error) {
+                                               handling_ = false;
+                                               const bool read = std::exchange(read_deferred_, false);
+                                               if (error) {
+                                                   rethrow_unless_cancelled(error);
+                                                   return;
+                                               }
+                                               if (read && !closed_) {
+                                                   read_packet();
+                                               }
+                                           }))));
+    }
+
+    void frontend_connection::rethrow_unless_cancelled(std::exception_ptr error) {
+        try {
+            std::rethrow_exception(error);
+        } catch (const boost::system::system_error& e) {
+            // The close's cancellation (finish()) ended the handler's wait.
+            if (closed_ && e.code() == boost::asio::error::operation_aborted) {
+                logger()->debug("[Connection {}] the handler stopped waiting: the connection closed", connection_id_);
+                return;
+            }
+            throw; // safe_callback ends the connection
+        }
+    }
+
+    void frontend_connection::watch_peer_close() {
+        if (watching_peer_ || closed_) {
+            return;
+        }
+        watching_peer_ = true;
+        socket_.async_wait(
+            boost::asio::ip::tcp::socket::wait_read,
+            safe_callback([this, generation = handler_generation_](boost::system::error_code ec) {
+                watching_peer_ = false;
+                if (closed_ || !handling_) {
+                    return; // the read loop sees the client from here on
+                }
+                if (generation != handler_generation_) {
+                    // Armed for an earlier handler: what woke it may be the
+                    // message this handler runs, already read.
+                    watch_peer_close();
+                    return;
+                }
+                if (!ec) {
+                    std::array<char, 1> byte{};
+                    boost::system::error_code peek;
+                    // Never blocks: asynchronous operations ignore the mode.
+                    socket_.non_blocking(true, peek);
+                    const auto bytes =
+                        peek ? 0
+                             : socket_.receive(boost::asio::buffer(byte), boost::asio::socket_base::message_peek, peek);
+                    if (peek == boost::asio::error::would_block) {
+                        watch_peer_close();
+                        return;
+                    }
+                    if (!peek && bytes > 0) {
+                        return; // the client's next message, read once the handler ended
+                    }
+                }
+                logger()->info("[Connection {}] READ: Client disconnected while its statement runs", connection_id_);
+                finish();
+            }));
+    }
+
     void frontend_connection::read_packet() {
+        if (handling_) {
+            read_deferred_ = true;
+            return;
+        }
         logger()->debug("[Connection {}] READ: Starting header read", connection_id_);
 
         arm_read_timeout("header");
@@ -171,7 +253,7 @@ namespace frontend {
                 } else {
                     std::vector<uint8_t> payload(std::make_move_iterator(read_buffer_.begin()),
                                                  std::make_move_iterator(read_buffer_.begin() + payload_length));
-                    handle_packet(std::move(head), std::move(payload));
+                    run_handler(handle_packet(std::move(head), std::move(payload)));
                 }
             }));
     }

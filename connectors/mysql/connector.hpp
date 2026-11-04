@@ -16,7 +16,9 @@
 #include <boost/mysql/statement.hpp>
 
 #include <boost/asio/awaitable.hpp>
+#include <boost/asio/bind_cancellation_slot.hpp>
 #include <boost/asio/cancel_after.hpp>
+#include <boost/asio/cancellation_signal.hpp>
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/executor_work_guard.hpp>
 #include <boost/asio/io_context.hpp>
@@ -29,13 +31,15 @@
 #include "utility/function_ref.hpp"
 #include "utility/tracy_profiler.hpp"
 #include "utility/wait_barrier.hpp"
-#include <otterbrix/otterbrix.hpp>
+#include <integration/cpp/otterbrix.hpp>
 
+#include <atomic>
 #include <concepts>
 #include <coroutine>
 #include <exception>
 #include <memory>
 #include <memory_resource>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -60,7 +64,7 @@ namespace mysql {
     // connect()/tryReconnect() return it, and each runQuery overload resolves to
     // the marshaled outcome of its handler (see otterstax::query_result_t).
     // runQuery takes the handler as a non-owning otterstax::function_ref_t: the
-    // callable must outlive the returned awaitable. ConnectorManager::executeQuery
+    // callable must outlive the returned awaitable. The backend agent (backend_agent.hpp)
     // binds the copy otterstax::run_with_owned_handler keeps in its frame.
     class IConnector {
     public:
@@ -73,6 +77,13 @@ namespace mysql {
         virtual core::error_t tryReconnect() = 0;
         virtual bool isClosed() const noexcept = 0;
         virtual std::string alias() const noexcept = 0;
+        // Aborts the statement this connector runs, from any thread (the backend agent's cancel at
+        // shutdown): the running operation — a statement, or the connect of a (re)connect, whose
+        // attempts stop too — is cancelled on the connection's strand and completes with io_error, and
+        // the connector refuses every later statement and connect — a cancelled Boost.MySQL
+        // connection is unusable. Never blocks. The default does nothing: a connector that cannot
+        // abort (a test stub) lets its statement finish.
+        virtual void cancel() noexcept {}
 
         virtual asio::awaitable<core::result_wrapper_t<std::unique_ptr<data_chunk_t>>>
         runQuery(std::string_view query,
@@ -99,6 +110,7 @@ namespace mysql {
         core::error_t tryReconnect() override;
         bool isClosed() const noexcept override;
         std::string alias() const noexcept override;
+        void cancel() noexcept override;
 
         asio::awaitable<core::result_wrapper_t<std::unique_ptr<data_chunk_t>>>
         runQuery(std::string_view query,
@@ -126,14 +138,14 @@ namespace mysql {
         // PostgreSQL on 5432) both sides wait for the other's first packet and
         // the call blocks until the remote auth timeout closes the socket —
         // freezing the startup thread for minutes. asyncConnect_ runs the async
-        // op under asio::cancel_after on the connection's strand (the pool is
-        // started before any addConnection) and this wrapper blocks on its
-        // marshaled outcome (spawn_marshaled), so the verdict — success, the
-        // driver's error, operation_aborted on timeout, io_error if the pool
-        // went away — always arrives as a value, never as an exception.
+        // op under asio::cancel_after on the connection's strand and this
+        // wrapper runs the connection's io_context on the calling thread until
+        // its marshaled outcome (spawn_marshaled) is ready, so the verdict —
+        // success, the driver's error, operation_aborted on timeout — always
+        // arrives as a value, never as an exception.
         //
-        // The strand is load-bearing. conn_ lives on an io_context run by N
-        // pool threads, and asio::cancel_after (boost 1.88,
+        // The strand is load-bearing. conn_ lives on an io_context more than
+        // one thread may run (a test's pool), and asio::cancel_after (boost 1.88,
         // asio/detail/timed_cancel_op.hpp) completes through TWO handlers that
         // share a ref_count of 2: the operation's handle_op does
         // `timer_.cancel(); release();`, the cancelled timer's handle_timer
@@ -151,10 +163,10 @@ namespace mysql {
         core::error_t connectWithTimeout(boost::mysql::diagnostics& diag);
 
         // The connect itself: one async_connect under the deadline, awaited on
-        // conn_'s strand. On failure the error is io_error carrying
+        // the connection's strand (strand_). On failure the error is io_error carrying
         // ec.message(); `diag` (the caller's) carries the server message. No
-        // Tracy zone: the body runs on a pool thread while connectWithTimeout
-        // blocks on the startup thread.
+        // Tracy zone: the coroutine suspends at its co_await and resumes inside
+        // connectWithTimeout's run_one_for (or on a test's pool thread).
         asio::awaitable<core::error_t> asyncConnect_(boost::mysql::diagnostics& diag);
 
         // The backend's verdict on a statement, classified (errors.hpp) and carrying
@@ -164,10 +176,38 @@ namespace mysql {
                                   std::string_view query) const;
         core::error_t connection_error(std::string_view what) const;
 
+        // What cancel() reaches a running statement through. `signal` is touched on the connection's
+        // strand only (the statement binds its slot there, cancel() posts the emission there);
+        // `requested` is what a statement checks before each operation, so a cancel that lands
+        // between two operations is not missed. Shared with the posted emission, which may run after
+        // the connector is gone.
+        struct cancel_state_t {
+            std::atomic<bool> requested{false};
+            asio::cancellation_signal signal;
+        };
+
+        core::error_t cancelled_error() const;
+
+        // The statement runs on the connection's strand (cancel() delivers its signal there): the
+        // caller's coroutine, spawned on the io_context, awaits it. strand_, never
+        // conn_.get_executor(): a reconnect replaces the stream that executor is read from.
         template<typename Callable>
         requires std::invocable<Callable, const boost::mysql::results&>
             asio::awaitable<otterstax::query_result_t<std::invoke_result_t<Callable, const boost::mysql::results&>>>
             runQuery_(std::string_view query, Callable handler) {
+            // optional: co_spawn's completion value must be default-constructible, and the outcome
+            // (core::error_t inside) is not. It always holds a value once the statement returned.
+            auto outcome = co_await asio::co_spawn(strand_,
+                                                   runOnStrand_(std::string{query}, std::move(handler)),
+                                                   asio::use_awaitable);
+            co_return std::move(*outcome);
+        }
+
+        template<typename Callable>
+        requires std::invocable<Callable, const boost::mysql::results&>
+            asio::awaitable<
+                std::optional<otterstax::query_result_t<std::invoke_result_t<Callable, const boost::mysql::results&>>>>
+            runOnStrand_(std::string query, Callable handler) {
             using result_t = std::invoke_result_t<Callable, const boost::mysql::results&>;
             // No Tracy zone: this coroutine crosses io_context threads at every
             // co_await, so a zone opened here would be closed on another thread.
@@ -176,20 +216,28 @@ namespace mysql {
                 log_->error(err);
                 co_return connection_error(err);
             }
+            // Every operation binds the cancel signal's slot; a terminal cancellation leaves the
+            // connection unusable, which is why a cancelled connector refuses what follows.
+            auto cancellable = [this](boost::system::error_code& ec) {
+                return asio::bind_cancellation_slot(cancel_->signal.slot(),
+                                                    asio::redirect_error(asio::use_awaitable, ec));
+            };
             boost::system::error_code ec;
             bm::diagnostics diag;
-            co_await conn_.async_ping(diag, asio::redirect_error(asio::use_awaitable, ec));
+            if (cancel_->requested.load(std::memory_order_acquire)) {
+                co_return cancelled_error();
+            }
+            co_await conn_.async_ping(diag, cancellable(ec));
 
+            if (cancel_->requested.load(std::memory_order_acquire)) {
+                co_return cancelled_error();
+            }
             if (ec) {
                 std::string err = "[Run query] Connector with alias: " + alias_ + " ping failed: " + ec.message();
                 log_->error(err);
                 co_return connection_error(err);
             }
 
-            // TODO add timeout or table check asio::cancel_after(std::chrono::seconds(5)) use boost 1.87
-            // TODO add atomic working status to block removing while get results from
-            // DB
-            // Issue the SQL query to the server
             log_->debug("Alias: {} query: {}", alias_, query);
             // Binary protocol, never COM_QUERY: the text protocol renders a FLOAT
             // column with FLT_DIG significant digits (the stored 64647.5390625
@@ -197,8 +245,10 @@ namespace mysql {
             // backend holds. The statement is prepared, then executed and closed
             // in one pipeline round trip; the close stage runs even when the
             // execute stage fails, so no server-side handle outlives the query.
-            bm::statement statement =
-                co_await conn_.async_prepare_statement(query, diag, asio::redirect_error(asio::use_awaitable, ec));
+            bm::statement statement = co_await conn_.async_prepare_statement(query, diag, cancellable(ec));
+            if (cancel_->requested.load(std::memory_order_acquire)) {
+                co_return cancelled_error();
+            }
             if (ec) {
                 co_return query_error(ec, diag, query);
             }
@@ -206,7 +256,10 @@ namespace mysql {
             bm::pipeline_request pipeline;
             pipeline.add_execute(statement).add_close_statement(statement);
             std::vector<bm::stage_response> stages;
-            co_await conn_.async_run_pipeline(pipeline, stages, diag, asio::redirect_error(asio::use_awaitable, ec));
+            co_await conn_.async_run_pipeline(pipeline, stages, diag, cancellable(ec));
+            if (cancel_->requested.load(std::memory_order_acquire)) {
+                co_return cancelled_error();
+            }
             const bm::stage_response& executed = stages.front();
             if (ec) {
                 co_return query_error(ec, executed.error() ? executed.diag() : diag, query);
@@ -217,7 +270,11 @@ namespace mysql {
 
     private:
         std::pmr::memory_resource* resource_;
+        // The connection's strand, kept apart from conn_: cancel() posts to it from another thread,
+        // while a (re)connect on the agent's thread replaces the stream conn_.get_executor() reads.
+        asio::strand<asio::io_context::executor_type> strand_;
         bm::any_connection conn_;
+        std::shared_ptr<cancel_state_t> cancel_{std::make_shared<cancel_state_t>()};
         bm::connect_params params_;
         Status status_;
         std::mutex mutex_;
@@ -232,5 +289,9 @@ namespace mysql {
                                                               asio::io_context&,
                                                               bm::connect_params,
                                                               std::string);
+
+    // The real connector, as production builds it (remote_backends_t's default factory).
+    std::unique_ptr<IConnector>
+    make_mysql_connector(std::pmr::memory_resource* resource, asio::io_context& io_ctx, bm::connect_params params, std::string alias);
 
 } // namespace mysql

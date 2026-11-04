@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2025-2026  OtterStax
 
+#include "otterbrix/translators/input/decimal_text.hpp"
+#include "single_chunk.hpp"
 #include "otterbrix/translators/input/csv_to_chunk.hpp"
 #include "otterbrix/translators/input/ndjson_to_chunk.hpp"
 #include "otterbrix/translators/output/chunk_to_ndjson.hpp"
 #include "rows_chunk.hpp"
+#include "../../mock/cell.hpp"
 
 #include <catch2/catch_all.hpp>
 
@@ -18,7 +21,6 @@
 
 using components::types::complex_logical_type;
 using components::types::logical_type;
-using components::types::logical_value_t;
 using components::vector::data_chunk_t;
 using otterstax::test::make_rows_chunk;
 
@@ -28,7 +30,7 @@ namespace {
         const std::string csv = "id,name\n1,Alice\n2,Bob\n3,Charlie\n4,Dave\n5,Eve\n";
         auto loaded = tsl::csv_to_chunk(res, reinterpret_cast<const uint8_t*>(csv.data()), csv.size());
         REQUIRE_FALSE(loaded.has_error());
-        return std::move(loaded.value());
+        return std::move(otterstax::test::single(loaded.value()));
     }
 
     int col(const data_chunk_t& chunk, std::string_view name) {
@@ -67,9 +69,9 @@ TEST_CASE("chunk_to_ndjson: a DECIMAL is written with its point not as the unsca
     types.push_back(amount.value());
     data_chunk_t chunk(res, types, 3);
     chunk.set_cardinality(3);
-    chunk.set_value(0, 0, logical_value_t::create_decimal(res, types[0], int64_t{12345}));
-    chunk.set_value(0, 1, logical_value_t::create_decimal(res, types[0], int64_t{-12345}));
-    chunk.set_value(0, 2, logical_value_t{res, nullptr});
+    tsl::set_decimal_raw(chunk.data[0], 0, int64_t{12345});
+    tsl::set_decimal_raw(chunk.data[0], 1, int64_t{-12345});
+    chunk.data[0].set_null(2, true);
 
     std::pmr::vector<data_chunk_t> chunks(res);
     chunks.push_back(std::move(chunk));
@@ -104,13 +106,13 @@ TEST_CASE("chunk_to_ndjson: round-trips through ndjson_to_chunk") {
 
     auto back = tsl::ndjson_to_chunk(res, path);
     REQUIRE_FALSE(back.has_error());
-    const auto& chunk = back.value();
+    const auto& chunk = otterstax::test::single((back.value()));
     REQUIRE(chunk.column_count() == 2);
     REQUIRE(chunk.size() == 5);
-    REQUIRE(chunk.value(col(chunk, "id"), 0).value<int64_t>() == 1);
-    REQUIRE(chunk.value(col(chunk, "id"), 4).value<int64_t>() == 5);
-    REQUIRE(chunk.value(col(chunk, "name"), 0).value<std::string_view>() == "Alice");
-    REQUIRE(chunk.value(col(chunk, "name"), 4).value<std::string_view>() == "Eve");
+    REQUIRE(otterstax::test::cell(chunk, col(chunk, "id"), 0).value<int64_t>() == 1);
+    REQUIRE(otterstax::test::cell(chunk, col(chunk, "id"), 4).value<int64_t>() == 5);
+    REQUIRE(otterstax::test::cell(chunk, col(chunk, "name"), 0).value<std::string_view>() == "Alice");
+    REQUIRE(otterstax::test::cell(chunk, col(chunk, "name"), 4).value<std::string_view>() == "Eve");
 
     std::filesystem::remove(path);
 }
@@ -172,14 +174,14 @@ TEST_CASE("chunk_to_ndjson: a column without a name is refused, nothing is writt
     types.emplace_back(logical_type::BIGINT);
     data_chunk_t chunk(res, types, 1);
     chunk.set_cardinality(1);
-    chunk.set_value(0, 0, logical_value_t{res, int64_t{42}});
+    chunk.set_value(0, 0, int64_t{42});
 
     std::pmr::vector<data_chunk_t> chunks(res);
     chunks.push_back(std::move(chunk));
 
     auto written = tsl::chunk_to_ndjson(res, chunks, path);
     REQUIRE(written.has_error());
-    REQUIRE(written.error().type == core::error_code_t::schema_error);
+    REQUIRE(written.error().type == core::error_code_t::undefined_column);
     REQUIRE_FALSE(std::filesystem::exists(path));
 }
 
@@ -198,7 +200,7 @@ TEST_CASE("chunk_to_ndjson: a nested column is refused instead of being written 
 
     auto written = tsl::chunk_to_ndjson(res, chunks, path);
     REQUIRE(written.has_error());
-    REQUIRE(written.error().type == core::error_code_t::conversion_failure);
+    REQUIRE(written.error().type == core::error_code_t::unimplemented_yet);
     REQUIRE_FALSE(std::filesystem::exists(path));
 }
 
@@ -222,9 +224,9 @@ TEST_CASE("chunk_to_ndjson: a hugeint column is written as a JSON string and rea
     data_chunk_t chunk(res, types, 3);
     chunk.set_cardinality(3);
     const auto big = absl::MakeInt128(1, 0); // 2^64
-    chunk.set_value(0, 0, logical_value_t{res, big});
-    chunk.set_value(0, 1, logical_value_t{res, -big});
-    chunk.set_value(0, 2, logical_value_t{res, nullptr});
+    chunk.set_value(0, 0, big);
+    chunk.set_value(0, 1, -big);
+    chunk.data[0].set_null(2, true);
 
     std::pmr::vector<data_chunk_t> chunks(res);
     chunks.push_back(std::move(chunk));
@@ -243,14 +245,14 @@ TEST_CASE("chunk_to_ndjson: a hugeint column is written as a JSON string and rea
     // nothing about the value was rounded away on the way out.
     auto back = tsl::ndjson_to_chunk(res, path);
     REQUIRE_FALSE(back.has_error());
-    const auto& reloaded = back.value();
+    const auto& reloaded = otterstax::test::single((back.value()));
     REQUIRE(reloaded.size() == 3);
     const int wide = col(reloaded, "wide");
     REQUIRE(wide >= 0);
     REQUIRE(reloaded.types()[wide].type() == logical_type::STRING_LITERAL);
-    REQUIRE(reloaded.value(wide, 0).value<std::string_view>() == "18446744073709551616");
-    REQUIRE(reloaded.value(wide, 1).value<std::string_view>() == "-18446744073709551616");
-    REQUIRE(reloaded.value(wide, 2).is_null());
+    REQUIRE(otterstax::test::cell(reloaded, wide, 0).value<std::string_view>() == "18446744073709551616");
+    REQUIRE(otterstax::test::cell(reloaded, wide, 1).value<std::string_view>() == "-18446744073709551616");
+    REQUIRE(otterstax::test::cell(reloaded, wide, 2).is_null());
 
     std::filesystem::remove(path);
 }
@@ -272,7 +274,7 @@ TEST_CASE("chunk_to_ndjson: a uhugeint column is refused instead of being writte
 
     auto written = tsl::chunk_to_ndjson(res, chunks, path);
     REQUIRE(written.has_error());
-    REQUIRE(written.error().type == core::error_code_t::conversion_failure);
+    REQUIRE(written.error().type == core::error_code_t::unimplemented_yet);
     REQUIRE(std::string_view{written.error().what.c_str()}.find("wide") != std::string_view::npos);
     REQUIRE_FALSE(std::filesystem::exists(path));
 }
@@ -287,10 +289,10 @@ TEST_CASE("chunk_to_ndjson: strings are JSON-escaped, NULL cells are null") {
     types.emplace_back(logical_type::BIGINT, "n");
     data_chunk_t chunk(res, types, 2);
     chunk.set_cardinality(2);
-    chunk.set_value(0, 0, logical_value_t{res, std::string{"a\"b\\c\nd\x01"}});
-    chunk.set_value(1, 0, logical_value_t{res, int64_t{7}});
-    chunk.set_value(0, 1, logical_value_t{res, nullptr});
-    chunk.set_value(1, 1, logical_value_t{res, nullptr});
+    chunk.set_value(0, 0, std::string_view{"a\"b\\c\nd\x01"});
+    chunk.set_value(1, 0, int64_t{7});
+    chunk.data[0].set_null(1, true);
+    chunk.data[1].set_null(1, true);
 
     std::pmr::vector<data_chunk_t> chunks(res);
     chunks.push_back(std::move(chunk));
@@ -335,20 +337,18 @@ TEST_CASE("chunk_to_ndjson: DATE TIME and TIMESTAMP are written as otterbrix's t
     types.emplace_back(logical_type::TIMESTAMP_TZ, "at_utc");
     data_chunk_t chunk(res, types, 2);
     chunk.set_cardinality(2);
-    chunk.set_value(0, 0, logical_value_t{res, core::date::date_t{core::date::days{engine_days}}});
-    chunk.set_value(1, 0, logical_value_t{res, core::date::time_t{core::date::microseconds{half_past_ten + 250'000}}});
+    chunk.set_value(0, 0, core::date::date_t{core::date::days{engine_days}});
+    chunk.set_value(1, 0, core::date::time_t{core::date::microseconds{half_past_ten + 250'000}});
     chunk.set_value(2,
                     0,
-                    logical_value_t{res,
-                                    core::date::timestamp_t{
-                                        core::date::microseconds{engine_days * 86'400'000'000LL + half_past_ten}}});
+                    core::date::timestamp_t{
+                                        core::date::microseconds{engine_days * 86'400'000'000LL + half_past_ten}});
     chunk.set_value(3,
                     0,
-                    logical_value_t{res,
-                                    core::date::timestamptz_t{
-                                        core::date::microseconds{engine_days * 86'400'000'000LL + half_past_ten}}});
+                    core::date::timestamptz_t{
+                                        core::date::microseconds{engine_days * 86'400'000'000LL + half_past_ten}});
     for (uint64_t c = 0; c < 4; ++c) {
-        chunk.set_value(c, 1, logical_value_t{res, nullptr});
+        chunk.data[c].set_null(1, true);
     }
     std::pmr::vector<data_chunk_t> chunks(res);
     chunks.push_back(std::move(chunk));

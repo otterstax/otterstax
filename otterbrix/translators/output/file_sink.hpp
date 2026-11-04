@@ -86,14 +86,14 @@ namespace tsl {
 
     // The csv / parquet stream form: each chunk through chunk_to_file_batch into the writer `open`
     // makes from the first batch's schema, one batch at a time, then Close() (the parquet footer).
-    // `sink` stays open for the caller to commit or abort; an empty run is conversion_failure.
+    // `sink` stays open for the caller to commit or abort; an empty run is invalid_parameter.
     template<typename Open>
     core::result_wrapper_t<bool> write_batches(std::pmr::memory_resource* res,
                                                std::string_view scope,
                                                const std::pmr::vector<components::vector::data_chunk_t>& chunks,
                                                Open&& open) {
         if (chunks.empty()) {
-            return make_error(res, core::error_code_t::conversion_failure,
+            return make_error(res, core::error_code_t::invalid_parameter,
                               std::string{scope} + ": no chunk to take the schema from");
         }
         auto first = chunk_to_file_batch(res, chunks.front());

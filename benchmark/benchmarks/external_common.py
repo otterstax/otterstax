@@ -105,6 +105,12 @@ def _exec(conn, sql, fetch=False, ignore=False):
             pass
 
 
+def _ensure_schema(conn, db):
+    """`db.table` is a two-part name: the schema `db` of the session's database
+    (main), which CREATE TABLE / CREATE EXTERNAL TABLE need to exist."""
+    _exec(conn, f"CREATE SCHEMA IF NOT EXISTS {db}")
+
+
 def _drop(conn, db, table):
     _exec(conn, f"DROP TABLE {db}.{table}", ignore=True)
 
@@ -148,6 +154,7 @@ def run_external_load(frontend, connect, host, port, sources, reps, out_dir):
     result = BenchmarkResult("external_load", frontend, reps)
     conn = connect(host, port)
     try:
+        _ensure_schema(conn, db)
         for source in sources:
             for fmt, (filename, name) in FORMATS.items():
                 sub = f"{source}_{fmt}"
@@ -179,6 +186,7 @@ def run_external_join(frontend, connect, host, port, sources, reps, out_dir):
     result = BenchmarkResult("external_join", frontend, reps)
     conn = connect(host, port)
     try:
+        _ensure_schema(conn, db)
         for source in sources:
             sub = f"{source}_join"
             r_tbl, e_tbl = f"regions_{source}", f"web_events_{source}"
@@ -226,6 +234,7 @@ def run_external_dump(frontend, connect, host, port, sources, reps, out_dir):
         # Untimed setup: load the fact table once from the local file so the
         # dump benchmark isolates the writer + upload, not the s3 read.
         try:
+            _ensure_schema(conn, db)
             _drop(conn, db, src_tbl)
             _load_external(conn, db, src_tbl, "file", "csv")
         except Exception as exc:  # noqa: BLE001
@@ -265,6 +274,7 @@ def run_external_join_cross(frontend, connect, host, port, sources, reps, out_di
     result = BenchmarkResult("external_join_cross", frontend, reps)
     conn = connect(host, port)
     try:
+        _ensure_schema(conn, db)
         for source in sources:
             sub = f"{source}_cross"
             r_tbl, w_tbl = f"regions_{source}", f"weights_{source}"
@@ -316,6 +326,7 @@ def run_external_join_all(frontend, connect, host, port, sources, reps, out_dir)
     r_tbl, e_tbl, w_tbl = "regions_all", "web_events_all", "weights_all"
     try:
         try:
+            _ensure_schema(conn, db)
             _drop(conn, db, r_tbl)
             _drop(conn, db, e_tbl)
             _drop(conn, db, w_tbl)

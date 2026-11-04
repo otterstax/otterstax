@@ -12,6 +12,7 @@
 
 #include <components/logical_plan/node_create_collection.hpp>
 #include <components/logical_plan/node_create_database.hpp>
+#include <components/logical_plan/node_create_schema.hpp>
 #include <components/logical_plan/node_drop.hpp>
 #include <components/logical_plan/param_storage.hpp>
 #include <components/sql/transformer/utils.hpp>
@@ -41,8 +42,9 @@ namespace otterstax::kafka {
         assert(resource_ != nullptr);
         assert(log_.is_valid());
         log_->info("KafkaManager initialized (pollers {})", start_pollers_ ? "on" : "off");
-        // recover() is NOT called here: the ctor runs mid-spawn, before the scheduler
-        // pool is up; component_manager calls it once everything is initialised
+        // recover() is NOT called here: the ctor runs mid-spawn, while main.cpp is
+        // still assembling the process; main calls it once the remote tables
+        // are registered (backends::register_remote_tables)
         loop_thread_ = std::thread([this] {
             std::pmr::list<in_flight_entry_t> in_flight(resource_);
             while (loop_running_.load(std::memory_order_acquire)) {
@@ -150,7 +152,7 @@ namespace otterstax::kafka {
     }
 
     actor_zeta::unique_future<cursor::cursor_t_ptr> KafkaManager::send_plan(logical_plan::execution_plan_t plan) {
-        // Async channel into the engine's manager_dispatcher_t (as OtterbrixManager uses)
+        // Async channel into the engine's manager_dispatcher_t (as otterstax::engine requests do)
         return actor_zeta::otterbrix::send(dispatcher_address_,
                                            &services::dispatcher::manager_dispatcher_t::execute_plan,
                                            components::session::session_id_t(),
@@ -158,38 +160,94 @@ namespace otterstax::kafka {
             .second;
     }
 
-    actor_zeta::unique_future<cursor::cursor_t_ptr> KafkaManager::ensure_database() {
-        auto create = logical_plan::make_node_create_database(resource_,
-                                                              core::dbname_t{std::string{KAFKA_DATABASE_NAME}},
-                                                              /*if_not_exists*/ true);
-        return send_plan(
-            logical_plan::execution_plan_t{resource_, create, logical_plan::make_parameter_node(resource_)});
+    bool kafka_object_names_t::contains(std::string_view name) const {
+        std::lock_guard guard(mutex_);
+        return names_.find(std::string{name}) != names_.end();
     }
 
-    actor_zeta::unique_future<cursor::cursor_t_ptr> KafkaManager::create_table(
-        const std::string& name,
-        std::vector<table::column_definition_t> columns,
-        bool if_not_exists) {
-        OTX_ZONE_N("KafkaManager::create_table");
+    void kafka_object_names_t::insert(const std::string& name) {
+        std::lock_guard guard(mutex_);
+        names_.insert(name);
+    }
+
+    void kafka_object_names_t::erase(const std::string& name) {
+        std::lock_guard guard(mutex_);
+        names_.erase(name);
+    }
+
+    void KafkaManager::register_object(const std::string& name, kafka_object_t object) {
+        registry_[name] = std::move(object);
+        object_names_.insert(name);
+    }
+
+    void KafkaManager::forget_object(const std::string& name) {
+        registry_.erase(name);
+        object_names_.erase(name);
+    }
+
+    std::vector<logical_plan::execution_plan_t> KafkaManager::storage_plans() {
+        OTX_ZONE_N("KafkaManager::storage_plans");
+        auto plan = [&](logical_plan::node_ptr node) {
+            return logical_plan::execution_plan_t{resource_, std::move(node), logical_plan::make_parameter_node(resource_)};
+        };
+        auto schema = [&](const char* database) {
+            return plan(logical_plan::make_node_create_schema(
+                resource_,
+                qualified_name_t{core::dbname_t{std::string{database}},
+                                 core::schema_t{std::string{KAFKA_SCHEMA_NAME}},
+                                 core::relname_t{}},
+                /*if_not_exists*/ true));
+        };
+        std::vector<table::column_definition_t> sources;
+        for (const char* column :
+             {"name", "kind", "topic", "bootstrap", "group_id", "offset_reset", "transactional", "as_select"}) {
+            sources.emplace_back(column, types::complex_logical_type(types::logical_type::STRING_LITERAL));
+        }
+        std::vector<logical_plan::execution_plan_t> plans;
+        plans.push_back(plan(logical_plan::make_node_create_database(
+            resource_,
+            qualified_name_t{core::dbname_t{std::string{KAFKA_SERVICE_DATABASE_NAME}}, core::schema_t{}, core::relname_t{}},
+            /*if_not_exists*/ true)));
+        plans.push_back(schema(KAFKA_SERVICE_DATABASE_NAME));
+        plans.push_back(schema(KAFKA_DATABASE_NAME));
+        plans.push_back(create_table_plan(kafka_service_table_name(KAFKA_SOURCES_TABLE),
+                                          std::move(sources),
+                                          /*if_not_exists*/ true));
+        return plans;
+    }
+
+    logical_plan::execution_plan_t KafkaManager::create_table_plan(const qualified_name_t& name,
+                                                                   std::vector<table::column_definition_t> columns,
+                                                                   bool if_not_exists) {
+        OTX_ZONE_N("KafkaManager::create_table_plan");
         for (auto& col : columns) {
             col.type().set_alias(col.name());
         }
         auto create = logical_plan::make_node_create_collection(resource_,
-                                                                core::relname_t{name},
+                                                                name.collection,
                                                                 std::move(columns),
                                                                 {},
                                                                 if_not_exists);
-        logical_plan::node_ptr node =
-            sql::transform::name_catalog_target(std::string{KAFKA_DATABASE_NAME}, std::string{}, create);
-        return send_plan(logical_plan::execution_plan_t{resource_, node, logical_plan::make_parameter_node(resource_)});
+        create->set_target(name);
+        return logical_plan::execution_plan_t{resource_, create, logical_plan::make_parameter_node(resource_)};
     }
 
-    actor_zeta::unique_future<cursor::cursor_t_ptr> KafkaManager::drop_table(const std::string& name) {
+    actor_zeta::unique_future<cursor::cursor_t_ptr> KafkaManager::create_table(
+        const qualified_name_t& name,
+        std::vector<table::column_definition_t> columns,
+        bool if_not_exists) {
+        OTX_ZONE_N("KafkaManager::create_table");
+        return send_plan(create_table_plan(name, std::move(columns), if_not_exists));
+    }
+
+    actor_zeta::unique_future<cursor::cursor_t_ptr>
+    KafkaManager::drop_table(const qualified_name_t& name, components::catalog::drop_behavior_t behavior) {
         OTX_ZONE_N("KafkaManager::drop_table");
         auto drop = logical_plan::make_node_drop(resource_, logical_plan::drop_target_kind::collection);
-        // A source's tables go together with whatever depends on them
-        drop->set_behavior(components::catalog::drop_behavior_t::cascade_);
-        logical_plan::node_ptr node = sql::transform::name_catalog_target(std::string{KAFKA_DATABASE_NAME}, name, drop);
-        return send_plan(logical_plan::execution_plan_t{resource_, node, logical_plan::make_parameter_node(resource_)});
+        // RESTRICT refuses while a VIEW (or another normal dependent) reads the
+        // table; CASCADE drops those dependents with it
+        drop->set_behavior(behavior);
+        drop->set_target(name);
+        return send_plan(logical_plan::execution_plan_t{resource_, drop, logical_plan::make_parameter_node(resource_)});
     }
 } // namespace otterstax::kafka

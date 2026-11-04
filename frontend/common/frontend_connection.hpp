@@ -92,8 +92,9 @@ namespace frontend {
         // pending operation has completed and before the pool slot is released
         // — the only point every way of ending a connection (client
         // quit/terminate, socket drop, protocol error, read timeout, server
-        // stop) passes through. The Scheduler outlives the frontend servers, so
-        // a message sent from here has a live receiver.
+        // stop) passes through. The connection closes its query session here;
+        // a statement still running in it (the client gave up waiting) finishes
+        // and the session frees itself afterwards.
         virtual void finish_impl() = 0;
 
         virtual log_t& get_logger_impl() = 0;
@@ -104,10 +105,31 @@ namespace frontend {
         // connection has answered the client; the body is not read then.
         virtual bool validate_payload_size(const std::vector<uint8_t>& header, uint32_t& size) = 0;
 
-        virtual void handle_packet(std::vector<uint8_t> header, std::vector<uint8_t> payload) = 0;
+        // One client message, run as a coroutine on the connection's strand
+        // (run_handler): a statement it awaits on the query session suspends
+        // it and leaves the thread to the server's other connections.
+        virtual boost::asio::awaitable<void> handle_packet(std::vector<uint8_t> header,
+                                                           std::vector<uint8_t> payload) = 0;
         virtual void handle_network_read_error(std::string description) = 0;
         virtual void handle_out_of_resources_error(std::string description) = 0;
 
+        // Runs `handler` on the connection's strand as a pending operation. A
+        // statement it awaits holds no thread of the pool: a MySQL / PostgreSQL
+        // connection waiting for its statement — for a backend agent another
+        // connection's block holds, say — never keeps the pool from reading
+        // the client whose quit / Terminate frees that agent (the session's
+        // close ends the block through backend_actor_t::end_session, never
+        // through one of the engine's executors). A COMMIT / ROLLBACK of that
+        // client is a statement for an engine executor: with every executor
+        // (four) running a statement that waits for the agent, it still waits
+        // until their checkout timeout. The next message is
+        // read only after the handler ended (a read_packet() it started is
+        // deferred to then), so a connection handles one message at a time;
+        // an exception out of it ends the connection. The close (finish(): a
+        // quit, a server stop, the client gone — watch_peer_close) cancels the
+        // handler's wait for its statement: the handler ends at once, the
+        // statement runs on in the session, which the connection then closes.
+        void run_handler(boost::asio::awaitable<void> handler);
         void read_packet(); // method for getting into message-read loop
         void send_packet(std::vector<uint8_t> packet, bool continue_reading = true);
         void send_packet_merged(std::vector<std::vector<uint8_t>> packets);
@@ -140,6 +162,15 @@ namespace frontend {
         static constexpr size_t TRY_RESEND_RESULTSET_ATTEMPTS = 3;
 
         void read_packet_payload(std::vector<uint8_t> header);
+        // A handler's end by an exception: quiet when it is the close's
+        // cancellation (operation_aborted once closed), rethrown otherwise.
+        void rethrow_unless_cancelled(std::exception_ptr error);
+        // While a handler runs no read is in flight, so a client that drops
+        // its socket would go unseen until the statement answered: a wait for
+        // the socket to turn readable stands in for the read. Readable with a
+        // byte to peek is the client's next message (read after the handler;
+        // the watch ends), readable with none is the client gone — finish().
+        void watch_peer_close();
         void complete_operation();
         void release();
 
@@ -149,6 +180,16 @@ namespace frontend {
         std::atomic<bool> finish_requested_{false};
         // Strand-only.
         bool closed_{false};
+        // Strand-only: a handler of run_handler is running, and a read it
+        // asked for waits for its end.
+        bool handling_{false};
+        bool read_deferred_{false};
+        // Strand-only: which handler a peer-close watch belongs to, and
+        // whether one is armed (one at a time).
+        uint64_t handler_generation_{0};
+        bool watching_peer_{false};
+        // Strand-only: bound to each handler (run_handler), emitted by the close.
+        boost::asio::cancellation_signal handler_cancel_;
         // Incremented by safe_callback (any thread that starts an operation),
         // decremented on the strand by the wrapper.
         std::atomic<size_t> pending_ops_{0};

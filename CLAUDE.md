@@ -1,43 +1,45 @@
 # CLAUDE.md
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+It is the map; every module with a `CLAUDE.md` of its own holds the details.
 
 ## What This Project Is
 
-OtterStax is a federated SQL query server. Clients connect via MySQL wire protocol (8816), PostgreSQL wire protocol (8817), Arrow Flight SQL (8815 — served by an in-house implementation, no Arrow Flight dependency), or Spark Connect (15002 — gRPC, for PySpark clients: `spark.sql()`, DataFrame operations, `spark.catalog`). Queries are either executed locally by the Otterbrix engine or dispatched to registered remote database backends (MariaDB/MySQL, PostgreSQL, ClickHouse). There is a **single config file** (`config.yaml`) that holds the wire-server settings and, under a `connections:` section, every remote backend and s3 alias — read once at startup. That `connections:` section is the single source of truth for connections; there is no runtime add/remove API.
+OtterStax is a federated SQL server: wire frontends + the embedded otterbrix engine + remote backends.
+Clients connect over the MySQL wire (8816), the PostgreSQL wire (8817), Arrow Flight SQL (8815, an
+in-house server, no Arrow Flight dependency) or Spark Connect (15002, gRPC, for PySpark: `spark.sql()`,
+DataFrames, `spark.catalog`). **Every statement runs on otterbrix.** A table of a remote backend
+(MariaDB / MySQL, PostgreSQL, ClickHouse) is an ordinary row of otterbrix's catalog in a database of
+a *connection*; otterbrix plans the statement and reaches the table's rows only through its storage
+contract, which OtterStax answers with one backend actor per connection. One file, `config.yaml`,
+read once at startup, holds the server settings and every connection.
 
 ## Connection Config
 
-Everything lives in **one YAML file, `config.yaml`** — the wire-server settings
-and, under `connections:`, every remote backend and s3 alias. It is **read once
-at server startup**; the `connections:` section is the single source of truth for
-connections. There is **no runtime add/remove/update API** (the old HTTP server on
-port 8085 was removed). To change connections, edit `config.yaml` and restart the
-server. See `config/CLAUDE.md` for the full config-layer reference.
-
-### The file and how it is located
-
-The path comes from the `--config PATH` flag (default `config.yaml`), resolved
-**relative to the server's working directory**. In containers the server runs from
-`WORKDIR /app/build/Release` with no `--config`, so at runtime it reads
-`/app/build/Release/config.yaml`, provided either by:
-
-- **baking** it into the image (`Dockerfile.test` `COPY`s the test `config.yaml`
-  there), or
-- **bind-mounting** a stack-specific `config.yaml` onto that path (compose files)
-  — a mount overrides anything baked in.
-
-A missing file → the server starts with default ports and no connections.
-
-### File format
+`config.yaml` — path from `--config PATH` (default `config.yaml`, relative to the working
+directory; a missing file = default ports, no connections). Containers run from
+`/app/build/Release` with no `--config`: the file is baked (`Dockerfile.test`) or bind-mounted
+(compose files) onto `/app/build/Release/config.yaml`. There is no runtime add/remove API: edit and
+restart. Full reference: `config/CLAUDE.md`.
 
 ```yaml
 service:
-  flight_sql: { host: "0.0.0.0", port: 8815 }
-  mysql:      { port: 8816 }      # wire-server port (NOT a backend)
-  postgres:   { port: 8817 }      # wire-server port (NOT a backend)
-  spark_connect: { host: "0.0.0.0", port: 15002 }   # Spark Connect gRPC server
-  connection_retry: { max_attempts: 10, delay_ms: 2000 }
+  flight_sql:    { host: "0.0.0.0", port: 8815 }
+  mysql:         { port: 8816 }     # wire-server port (NOT a backend)
+  postgres:      { port: 8817 }     # wire-server port (NOT a backend)
+  spark_connect: { host: "0.0.0.0", port: 15002, session_timeout_s: 3600 }  # 0 = never expire
+  connection_retry: { max_attempts: 10, delay_ms: 2000 }   # default 1 / 1000 = one attempt
+  engine:  { data_dir: /tmp/test_collection_sql/base, log_dir: "" }        # log_dir empty = data_dir
+  runtime:                          # every thread pool; every key optional
+    general: { threads: 3 }         # engine pools (>= 1)
+    exec:    { threads: 3 }
+    disk:    { threads: 3 }
+    sessions: { threads: 0 }        # 0 = max(2, hardware threads)
+    backends: { threads: 0 }        # 0 = max(2, hardware threads, sum of every pool_size)
+    mysql_io: { threads: 0 }        # frontends: 0 = max(2, hardware threads)
+    postgres_io: { threads: 0 }
+    flight_sql_io: { threads: 0 }
+    spark_connect_io: { threads: 0 }
 
 connections:
   mysql:
@@ -45,512 +47,512 @@ connections:
   postgresql:
     - { alias: pg, host: demo-postgres, port: "5432", username: demo, password: demo, database: shop, schema: shop, table: "" }
   clickhouse:
-    - { alias: ch, host: demo-clickhouse, port: "9000", username: demo, password: demo, database: ev, table: "" }
+    - { alias: ch, host: demo-clickhouse, port: "9000", username: demo, password: demo, database: ev, table: "", pool_size: 2 }
   s3:
     - { alias: demo_s3, access_key: rustfsadmin, secret_key: rustfsadmin, region: us-east-1, endpoint: demo-rustfs:9000 }
 ```
 
-Wire-server settings live under the top-level `service:` node so
-`service.mysql`/`service.postgres` (**wire-server ports**) never collide with the
-backends under `connections:` (`connections.mysql`/`connections.postgresql`) —
-different nesting. All `connections:` sections are optional (missing → empty).
-`port` is an **optional string** (empty → driver default). `schema` defaults to
-`public`. s3 `region`/`session_token`/`endpoint` are optional; malformed YAML
-aborts startup. `service.connection_retry` (optional; default `max_attempts: 1`,
-`delay_ms: 1000` = one-shot) sets how many times startup retries opening a slow
-backend. The `alias` is the outermost qualifier in federated SQL
-(`SELECT ... FROM alias.db.table ...`, see **Federated Query Syntax**) and the
-`s3_alias` referenced by `CREATE EXTERNAL TABLE` / `COPY ... TO`. A backend alias
-(mysql / postgresql / clickhouse) must be an unquoted SQL identifier
-(`[a-z_][a-z0-9_]*`) and name one connection across the three sections —
-anything else aborts startup.
-
-### Flow through the code
-
-```text
-main.cpp
-  → config::ConfigReader.load(config.yaml)      → result_wrapper_t<ServiceConfig> { ports…, ConnectionsConfig connections }
-        (internally: parse_connections(config["connections"], resource) → plain descriptor structs)
-        (parse_connections validates every entry → the first incomplete one is returned as
-         core::error_t{invalid_parameter} → main logs it and returns 1 before the engine, any actor
-         or connector exists — ComponentManager is constructed only after the config is accepted)
-  → conn::s3::subsystem_finalizer_t            — declared before ComponentManager: the s3 actor it spawns
-                                                 initialises Arrow S3, and the process must FinalizeS3
-                                                 after the actor graph is gone on every exit path
-  → ComponentManager(make_create_config(...))   → engine + actor graph + worker pool
-  → ComponentManager::register_connections(server_config.connections, server_config.connection_retry)
-       mysql/pg/ch: ConnectorManager::addConnection(conn::api_server::*Params)   — opens the connector,
-                    retried up to connection_retry.max_attempts (delay_ms between tries)
-       s3         : actor send &conn::s3::ConnectorManager::add_credentials      — stores the alias (no retry)
-```
-
-- Parsing + validation live in the `config` target (`config/`), which has **no
-  connector dependencies** — `parse_connections` produces plain
-  `config::ConnectionsConfig` descriptor structs held inside `ServiceConfig` and
-  **returns `core::error_t{invalid_parameter}` (built from `validation_error`)
-  for the first incomplete entry, malformed port or non-scalar field**; a file
-  that is not YAML is a `conversion_failure`. Nothing in `config/` throws: the
-  yaml-cpp calls are the only throwing sites and each is converted where it is
-  made (`config/yaml_scalar.hpp`, `YAML::LoadFile` in `ConfigReader::load`).
-  `main.cpp` logs the error and returns 1, so an invalid connection aborts
-  startup rather than coming up half-configured.
-- Registration lives in `ComponentManager::register_connections` (it owns the
-  connector managers), converting the pre-validated descriptors → connector param
-  structs. Opening a backend is best-effort: it is retried up to
-  `connection_retry.max_attempts`, and a backend that is still unreachable logs an
-  error but does not abort startup (the other backends and local engine stay up).
-
-### Where each stack's config.yaml lives
+- `port` is an optional string (empty = driver default). `pool_size` (backends, default 4,
+  `config::default_pool_size`) = agents of the connection, one physical connection each.
+- `schema` (PostgreSQL): a name = only that schema, empty = every user schema of the database.
+  MySQL / ClickHouse connections have the one schema `public`.
+- `table`: a name makes the connection **that table only** — the startup discovery and its
+  reconciliation keep it alone, and a statement missing another table of the connection gets its
+  own miss (no discovery is asked); empty = every base table.
+- `alias`: the first part of a remote name and the connection's name in otterbrix. A backend
+  alias must be an unquoted identifier `[a-z_][a-z0-9_]*`; backend aliases are one namespace
+  (mysql / postgresql / clickhouse together), s3 aliases another (any spelling). `federation` and
+  `main` are reserved (any case, any section).
+- Refused at load (stderr, exit 1): malformed YAML, a section that is not a mapping, an unknown
+  key at any level (`unknown key "pool_sise" in connections.mysql[0]`), an incomplete entry, a bad
+  port / `pool_size` / thread count, a reserved, malformed or duplicate alias.
+  An unreachable backend is not a config error: retried per `connection_retry`, then logged, the
+  server starts. A MySQL server under `sql_mode` `NO_BACKSLASH_ESCAPES` is left out at once (no
+  retry, no actor, not in the engine's map: a statement naming it is refused), the server starts.
+  A PostgreSQL server under `standard_conforming_strings = off` needs nothing: a literal holding a
+  backslash is written `E'…'`, which reads the same under either setting.
 
 | Stack | File | Delivery |
 |-------|------|----------|
-| repo default / template | `config.yaml` (repo root) | not baked; copy/mount it or pass `--config` |
-| demo (`examples/demo/`) | `config.yaml` / `config_local.yaml` (`--local`) | mounted by `examples/demo/compose.yml` |
+| template | `config.yaml` (repo root) | copy / mount / `--config` |
+| demo | `examples/demo/config.yaml`, `config_local.yaml` | mounted by `examples/demo/compose.yml` |
+| quick start | `examples/quick_start/config.yaml` | mounted by `examples/quick_start/compose.yml` |
 | integration tests | `tests/scripts/config.yaml` | baked by `Dockerfile.test` |
 | root manual stack | `scripts/database/config.yaml` | mounted by `compose.yml` |
 | benchmarks | `benchmark/config.yaml` | mounted by `benchmark/compose_benchmark.yml` |
-| examples/simple | `examples/simple/example_connetion/config{,_local}.yaml` | pass `--config <file>` |
 
-Unit tests: `tests/unit/config/` (`test_unit_config`).
+### Startup (`main.cpp`)
+
+`main.cpp` owns every part as locals: declaration order = build order, reverse = destruction
+order (an aborted startup unwinds the same way).
+
+```text
+main.cpp
+  → --config PATH; config::load_config        — a refusal to stderr, return 1 (no logger yet)
+  → initialize_all_loggers(log_directory(engine))
+  → conn::s3::subsystem_finalizer_t           — FinalizeS3 after everything else is gone
+  → backends::backends_threads(...)           — the backends pool sized against the connections
+  → runtime::runtime_t(runtime)               — memory resource + the five actor-zeta pools
+  → backends::remote_backends_t::open(connections, connection_retry)
+       per connection: pool_size backend_agent_t (connect), discovery on the first agent (retried),
+       a backend_actor_t over its agents; an unreachable one keeps its actor and agents
+       (they connect on the first statement); a bad descriptor → return 1
+  → runtime::engine_t::open(runtime, engine, remote->primitives())
+                                              — otterbrix with one backend address per connection
+  → spawn conn::s3::ConnectorManager, FileManager, S3Manager, KafkaManager
+  → backends::register_s3_aliases             — an error → return 1
+  → backends::register_remote_tables          — the discovery into otterbrix's catalog (no SQL to a
+                                                backend); an engine refusal → return 1
+  → kafka->recover()
+  → session::make_session_services(..., remote->connections())
+  → session::session_factory_t
+  → Flight SQL / MySQL / PostgreSQL / Spark Connect servers; flight->run() blocks until SIGTERM / SIGINT
+```
+
+Shutdown: servers → `~session_factory_t` (sessions drain 30 s, sessions pool stops) → Kafka, S3,
+file, s3 connector → engine (final CHECKPOINT) → remote backends (agents cancelled, backends pool
+stopped, actors and agents destroyed) → runtime → FinalizeS3.
 
 ## Build resources — avoid OOM (check RAM + threads first)
 
-**Before building (local or in Docker), size the parallelism to available RAM.**
-Compiling otterbrix/Arrow TUs needs **~1.5–2 GB per job**; running `-j nproc`
-blindly is the #1 cause of OOM kills (`c++: internal compiler error: Killed`) and
-Docker BuildKit `ResourceExhausted` failures — especially in Docker Desktop where
-the VM's RAM is far smaller than the host's.
+**Size the parallelism to RAM before building (local or Docker).** An otterbrix / Arrow TU needs
+~1.5–2 GB per job; `-j nproc` is the #1 cause of `c++: internal compiler error: Killed` and BuildKit
+`ResourceExhausted`, especially in Docker Desktop, whose VM is far smaller than the host.
 
-- **Check first:**
-  - Host: `nproc` (Linux) / `sysctl -n hw.ncpu` (macOS); RAM via `free -g` / `sysctl -n hw.memsize`.
-  - **Docker** (what matters for image builds): `docker info --format '{{.NCPU}} CPUs / {{.MemTotal}} bytes'`. Docker Desktop's default is often 2–8 GB regardless of host RAM.
-- **Pick jobs:** `JOBS = min(nCPU, floor(RAM_MB / 1536))` (≈1.5 GB/job). Example: a
-  Docker VM with 8 GB → `floor(8192/1536)=5` jobs even on a 14-CPU host.
-- **Apply it:**
-  - Local: `cmake --build build/Release --parallel <JOBS>`
-  - `docker build --build-arg BUILD_JOBS=<JOBS> -f Dockerfile.test ...`
-  - `./docker-run-tests.sh -j <JOBS>`
-  - `./benchmark/scripts/run_benchmark.sh` / `run_stress_benchmarks.sh` already
-    **auto-cap** to this formula when `-j` is omitted (see `run_benchmark.sh`).
-- If a build still gets `Killed`/`ResourceExhausted`, halve `JOBS` or raise the
-  Docker Desktop memory limit (Settings → Resources).
+- Check: host `nproc` / `sysctl -n hw.ncpu`, `free -g` / `sysctl -n hw.memsize`; Docker
+  `docker info --format '{{.NCPU}} CPUs / {{.MemTotal}} bytes'`.
+- `JOBS = min(nCPU, floor(RAM_MB / 1536))` — an 8 GB Docker VM → 5 jobs even on 14 CPUs.
+- Apply: `cmake --build build/Release --parallel <JOBS>`, `docker build --build-arg BUILD_JOBS=<JOBS>`,
+  `./docker-run-tests.sh -j <JOBS>`. `run_benchmark.sh` / `run_stress_benchmarks.sh` /
+  `docker-run-tests.sh` / `benchmark/manual/start_service.sh` auto-cap without `-j`; inside the
+  images `BUILD_JOBS=0` resolves to `min(nproc, MemTotal_MB / 1536)`.
+- Still `Killed`: halve `JOBS` or raise the Docker Desktop memory limit.
 
 ## Build Commands
 
 ```bash
-# Install Conan deps
-# IMPORTANT: if conanfile.py changed, remove ./build first before re-running
-conan install conanfile.py --build missing -s build_type=Release
+# Conan deps (if conanfile.py changed, remove ./build first). As the images build it (Dockerfile:
+# cppstd 20, Dockerfile.test: gnu20), every package at the one standard: an abseil built at cppstd 17
+# has no operator<=> on absl::int128, which otterbrix's core/date/date_types.hpp:143 compares with.
+conan install conanfile.py --build missing -s build_type=Release -s compiler.cppstd=20
 
-# Configure
-cmake -S . -B build/Release \
-  -DCMAKE_TOOLCHAIN_FILE=build/Release/generators/conan_toolchain.cmake
-
-# Build (5 parallel jobs)
-/usr/local/bin/cmake --build /workspaces/otterstax/build/Release --parallel 5 --
-
-# Build with tests enabled
+# Configure (+ tests) and build
 cmake -S . -B build/Release -DBUILD_TESTS=ON \
   -DCMAKE_TOOLCHAIN_FILE=build/Release/generators/conan_toolchain.cmake
-/usr/local/bin/cmake --build /workspaces/otterstax/build/Release --parallel 5 --
+cmake --build build/Release --parallel <JOBS>
+# macOS / Homebrew: add -DBISON_EXECUTABLE=/opt/homebrew/opt/bison/bin/bison (the system bison is too old)
 
-# Run a single test binary (Catch2) — binaries sit under build/Release/tests/<dir>/
-./build/Release/tests/system/test_system                    # tests/system
-./build/Release/tests/unit/parser/test_parser               # tests/unit/parser
-./build/Release/tests/unit/schema/test_schema               # tests/unit/schema
-./build/Release/tests/unit/utility/test_utils               # tests/unit/utility
+# The 12 Catch2 binaries (build/Release/tests/<dir>/; names are the project() names, tests/CLAUDE.md)
+./build/Release/tests/system/test_system
+./build/Release/tests/session/test_session
+./build/Release/tests/runtime/test_runtime
+./build/Release/tests/federation/test_federation
+./build/Release/tests/mysql-front/test_mysql_front
+./build/Release/tests/unit/connectors/test_unit_connectors
+./build/Release/tests/unit/parser/test_parser
+./build/Release/tests/unit/parser/grammar_extension/kafka/test_kafka_grammar
+./build/Release/tests/unit/utility/test_utils
 ./build/Release/tests/unit/translators/test_unit_translators
 ./build/Release/tests/unit/config/test_unit_config
 ./build/Release/tests/unit/spark_connect/test_unit_spark_connect
-./build/Release/tests/unit/parser/grammar_extension/kafka/test_kafka_grammar
-./build/Release/tests/mysql-front/test_mysql_front          # tests/mysql-front
 
-# Build with sanitizers (not both at once)
-cmake -S . -B build/Release -DENABLE_ASAN=ON -DBUILD_TESTS=ON \
-  -DCMAKE_TOOLCHAIN_FILE=build/Release/generators/conan_toolchain.cmake
-cmake -S . -B build/Release -DENABLE_TSAN=ON -DBUILD_TESTS=ON \
-  -DCMAKE_TOOLCHAIN_FILE=build/Release/generators/conan_toolchain.cmake
-# ASAN caveat: the engine's core/pmr.hpp keys a public class layout off the
-# consumer's __SANITIZE_ADDRESS__, so an ASAN build undefines that macro
-# (CMakeLists.txt) to match the non-ASAN Conan engine package. That workaround
-# is valid only while the engine is built without ASAN — an ASAN-built engine
-# would need the macro left defined. The CI sanitizer workflows also export
-# ENABLE_ASAN/ENABLE_TSAN to docker-run-tests.sh, which skips the Kafka
-# crash-recovery (kill -9) step under sanitizers.
+# Sanitizers (not both at once)
+cmake -S . -B build/Release -DENABLE_ASAN=ON -DBUILD_TESTS=ON -DCMAKE_TOOLCHAIN_FILE=...
+cmake -S . -B build/Release -DENABLE_TSAN=ON -DBUILD_TESTS=ON -DCMAKE_TOOLCHAIN_FILE=...
+# ASAN needs ASAN-built dependencies (asan-deps.profile, "The ASAN image" below): the engine's own
+# headers key no layout off sanitizer macros, but gRPC's and abseil's do, and libotterbrix embeds
+# and exports the abseil the executable calls. macOS: run with
+# ASAN_OPTIONS=detect_container_overflow=0 (containers annotated by our code are freed into the
+# uninstrumented engine's pool: false positives). LeakSanitizer is unsupported on Apple Silicon.
+# The CI sanitizer workflows export ENABLE_ASAN / ENABLE_TSAN to docker-run-tests.sh, which skips
+# the Kafka crash-recovery (kill -9) step.
 
-# Adjust log verbosity (default ERROR)
+# Log verbosity (default ERROR; the engine's log follows it)
 cmake -S . -B build/Release -DSPDLOG_ACTIVE_LEVEL=SPDLOG_LEVEL_DEBUG ...
+```
+
+### The TSAN image (`Dockerfile.test`, `TSAN_DEPS=true`)
+
+`tsan-deps.profile` rebuilds the libraries that synchronize through atomics with
+`-fsanitize=thread` (otterbrix, actor-zeta, librdkafka, gRPC, abseil, protobuf, re2), and nothing
+instrumented runs at build time:
+
+- protoc and grpc_cpp_plugin come from the build context: the profile adds
+  `&: protobuf/<v>, grpc/<v>` as `[tool_requires]` (profile-only: in `conanfile.py` it would build a
+  second grpc for the build context), and `protobuf::protoc` / `gRPC::grpc_cpp_plugin` resolve to
+  them through `CMAKE_PROGRAM_PATH`;
+- the TSAN grpc is built with `codegen=False` (OtterStax links `gRPC::grpc++` only);
+- Catch2 discovery is `PRE_TEST` under `ENABLE_TSAN` (`tests/CMakeLists.txt`).
+
+A TSAN executable re-executes itself with `personality(ADDR_NO_RANDOMIZE)` on arm64, which Docker's
+default seccomp refuses, so the image's `ctest` step cannot pass inside `docker build` on Apple
+Silicon (CI builds it on amd64). On arm64 build without it and run the tests in a container:
+
+```bash
+docker build -f Dockerfile.test --build-arg TSAN_DEPS=true --build-arg ENABLE_TSAN=ON \
+  --build-arg RUN_TESTS=false --build-arg BUILD_JOBS=<JOBS> -t otterstax-tsan .
+docker run --rm --security-opt seccomp=unconfined -w /app/build/Release otterstax-tsan \
+  ctest -C Release --output-on-failure --timeout 120
+```
+
+### The ASAN image (`Dockerfile.test`, `ASAN_DEPS=true`)
+
+An `ENABLE_ASAN=ON` build over the prebuilt packages is not sound: headers change layouts under
+ASAN. gRPC's `GRPC_ASAN_ENABLED` adds `leak_checker` to `gpr_mu` (`grpc::ClientContext` 448 → 456
+bytes: a bad-free in the core from the Spark gRPC client of `test_system`); abseil's
+`ABSL_HAVE_ADDRESS_SANITIZER` turns on swisstable / btree generations (`CommonFields` gains a
+generation pointer and crosses into the compiled library). `asan-deps.profile` therefore rebuilds
+with `-fsanitize=address` gRPC, abseil, protobuf and re2 (every package that compiles abseil's
+containers) and otterbrix (through its own `ENABLE_ASAN`: `libotterbrix` embeds and exports abseil +
+re2, and the executable binds its raw_hash_set calls to that copy). actor-zeta, clickhouse-cpp
+(abseil's `int128` only) and the rest stay prebuilt. The build tools come from the build context
+as in the TSAN image (`[tool_requires]` protoc / grpc_cpp_plugin, grpc `codegen=False`): an ASAN
+protoc would fail the codegen on Linux, LeakSanitizer turning a leak into exit code 23.
+`ENABLE_ASAN=ON ./docker-run-tests.sh` builds this image (compose passes `ENABLE_ASAN` and
+`ASAN_DEPS`); the ASAN workflow passes `ASAN_DEPS=true`. On a host:
+
+```bash
+conan install conanfile.py --build missing -pr:h asan-deps.profile -pr:b default \
+  -s build_type=Release -s compiler.cppstd=20 -c tools.build:jobs=<JOBS> -of build/asan-deps
+ln -sfn build/Release/lib build/asan-deps/lib   # the binaries' rpath lib/ → the generators' lib dir
+cmake -S . -B build/asan-deps -DENABLE_ASAN=ON -DBUILD_TESTS=ON -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_TOOLCHAIN_FILE=build/asan-deps/build/Release/generators/conan_toolchain.cmake
 ```
 
 ## Docker Workflows
 
-> Cap build parallelism to Docker's RAM to avoid OOM — see **Build resources**
-> above. Pass `-j <JOBS>` / `--build-arg BUILD_JOBS=<JOBS>` on the commands below.
+Cap the jobs (see **Build resources**).
 
 ```bash
-# Run all integration tests (handles DB startup timing)
-chmod +x ./docker-run-tests.sh && ./docker-run-tests.sh -j 5
-
-# Build containerized unit tests
-docker build -f Dockerfile.test --build-arg BUILD_JOBS=5 -t otterstax-test .
-
-# Full stack for manual testing
-python fixtures/generate_data.py
-docker compose up
-
-# Benchmark suite (builds images, starts DBs, runs tests, writes results)
+./docker-run-tests.sh -j <JOBS>                     # integration suite + PySpark client matrix
+docker build -f Dockerfile.test --build-arg BUILD_JOBS=<JOBS> -t otterstax-test .   # unit tests in the image
+python3 fixtures/generate_data.py && docker compose up   # full stack for manual testing
 ./benchmark/scripts/run_benchmark.sh --repetitions 5
-
-# Benchmark with CPU call-graph profiling (perf, 99 Hz dwarf unwind)
-# Outputs: benchmark_results/<ts>/benchmark.perf.data + benchmark.perf (speedscope)
-./benchmark/scripts/run_benchmark.sh --perf --frontend postgres --bench simple_select
-
-# Benchmark with CPU + allocation hotspot profiling (malloc uprobe, every call site)
-./benchmark/scripts/run_benchmark.sh --perf-alloc --frontend postgres --bench simple_select
-
-# Manual interactive mode (start services, run queries/benchmarks by hand, then stop)
-./benchmark/manual/start_service.sh            # start (reuses existing image)
-./benchmark/manual/start_service.sh --rebuild  # force rebuild both images
-./benchmark/manual/start_service.sh --perf     # start + perf recording (saved on stop)
-./benchmark/manual/start_service.sh --perf-alloc  # + malloc uprobe
-./benchmark/manual/stop_service.sh             # stop (saves perf.data if active)
+./benchmark/scripts/run_benchmark.sh --perf --frontend postgres --bench simple_select        # CPU call graph
+./benchmark/scripts/run_benchmark.sh --perf-alloc --frontend postgres --bench simple_select  # + malloc uprobe
+./benchmark/manual/start_service.sh [--rebuild] [--perf] [--perf-alloc]; ./benchmark/manual/stop_service.sh
 ```
 
 ## Architecture Overview
 
-All components are actor-zeta actors (`actor_mixin` for the Scheduler,
-`basic_actor` for Workers and the integration managers) communicating through
-typed coroutine futures. The flow for every query:
-
 ```text
-Frontend (MySQL/PG/FlightSQL/Spark Connect)
-  → Scheduler::execute()          — thin router, hashes session_hash → Worker
-  → Worker::execute()             — owns the parser, runs the full pipeline
-  → CatalogManager                — resolve schemas, set backend type on ParsedQueryData
-  → [if remote] integration/{sql,postgresql,clickhouse}::ConnectionManager
-       → connectors/{mysql,postgresql,clickhouse}::ConnectorManager::executeQuery()
-       → otterbrix/translators/input/  — convert raw results to data_chunk_t
-  → [if local] integration/otterbrix::OtterbrixManager
-       → otterbrix/operators/execute_plan — delegate to Otterbrix engine
-  → otterbrix/translators/output/chunk_to_arrow — convert to Arrow RecordBatch
-  → Worker co_returns result_wrapper_t<session_payload>
-  → frontend awaits via asio_future_bridge → sends response
+Frontend (MySQL / PostgreSQL / Flight SQL / Spark Connect)          frontend/CLAUDE.md
+  → query_session_t (one per client connection, sessions pool)      session/CLAUDE.md
+       parser → ownership guards → one ENGINE session per connection: every statement, its
+       transaction, its settings, its describe and prepared statements are the engine's
+  → otterbrix: names, plan, optimizer, execution
+       a local table → otterbrix's disk
+       a table of a connection → that connection's backend_actor_t (storage_contract messages)
+  → backend_actor_t (one per connection, its own loop thread)       otterbrix/federation/CLAUDE.md
+       storage_offer: the blocks the dialect says whole (a SELECT block, a JOIN of the
+       connection, an UPDATE / DELETE) become ONE statement (sql_gen); the rest is read
+       by scans and written by INSERT … VALUES; the answer conformed to the planned types
+  → backend_agent_t (pool_size per connection, backends pool; one physical connection each)
+       runs the statement on its connector, translates the rows (tsl::*_to_chunk), wakes the actor
+  → the answer back through the engine's cursor → the session → the frontend
+       (asio_future_bridge.hpp; Spark: await_future.hpp)
 ```
 
-The Spark Connect frontend enters this pipeline two ways. SQL text goes through
-`Scheduler::execute` like the other frontends: a `spark.sql()` statement that is
-not a query runs at once, while a query is handed back to the client unrun (as
-its SQL relation) and runs when the client acts on its DataFrame
-(`prepare_schema` for `df.schema`). A DataFrame — translated into an otterbrix
-logical plan inside the frontend (`frontend/spark_connect_server/plan_translator/`)
-— goes through `Scheduler::execute_plan`, or `Scheduler::prepare_plan` for
-`df.schema` (described, never executed). Both plan entry points join the Worker
-where parsing ends (`scheduler/CLAUDE.md`).
-
-The Scheduler is a session-affinity router over a pool of `Worker` actors
-(spawned on an `actor_zeta::scheduler::sharing_scheduler`); every session
-keyed by `session_hash_t` always lands on `workers_[id % N]`. The Scheduler's
-own thread runs an otterbrix-style event loop: `enqueue_impl` (any sender
-thread) only pushes into a lock-free inbox and signals a CV; all coroutine
-work happens on the loop thread. Frontends never block on shared state — they
-hold the future returned by `Scheduler::execute` and poll it from the
-per-connection asio executor through `frontend/common/asio_future_bridge.hpp`
-(the Spark Connect handlers, which run on an `agrpc::GrpcExecutor`, through its
-gRPC form, `frontend/spark_connect_server/await_future.hpp`). That bridge, in
-either form, is the only supported way to pick up an actor result; the
-`cv_wrapper` condvar handoff it replaced has been deleted.
+- **Registration.** At startup `catalog::register_connections` turns the discovery into otterbrix
+  catalog rows — `CREATE DATABASE c.d`, `CREATE SCHEMA c.d.s`, `CREATE TABLE c.d.s.t`, lower case — on
+  the actors' registration session, so no SQL reaches a backend; the backend's own spelling is the
+  actor's, kept in `federation.public.remote_names`. A restart reconciles the catalog with the new
+  discovery (new tables registered, gone ones dropped, changed columns altered). A statement that
+  misses a table of a configured connection (created on the backend later) registers it
+  (`catalog::registration_target` → the actor's `discover` → `registration_plans`) and runs once
+  more if its failure left the session outside a block. `catalog/CLAUDE.md`.
+- **Transactions.** The engine keeps the block and stamps its status on every answer
+  (`query_session_t::transaction_status()`: PostgreSQL's `I` / `T` / `E`, MySQL's
+  `SERVER_STATUS_IN_TRANS`). SAVEPOINT / ROLLBACK TO / RELEASE are the engine's. A PostgreSQL / MySQL
+  block holds one agent from its first statement (BEGIN before it, a read too) to its end;
+  `SAVEPOINT s<k>` before each savepoint level's first statement; COMMIT = the engine's prepare.
+- **Settings.** `SET` / `RESET` go to the engine, per session (it has `timezone`, `autocommit`,
+  `search_path`); the frontends translate their own forms (MySQL `SET @@x`, `USE`, `time_zone`) and
+  keep only the protocol parameters (PostgreSQL `client_encoding`, `DateStyle`, `application_name`,
+  `extra_float_digits`, …; MySQL character sets). `frontend/CLAUDE.md`.
+- **Prepared statements** are reusable: the session keeps the text and the engine's describe, and
+  each execute binds and runs it again until `close_statement`.
+- **Spark Connect**: `spark.sql()` text through `query_session_t::execute` (a query handed back
+  unrun as its SQL relation), a DataFrame translated in the frontend
+  (`spark_connect_server/plan_translator/`) through `execute_plan` / `prepare_plan`; one query session
+  per Spark session.
+- Frontends never block on shared state: they poll the session's future through
+  `frontend/common/asio_future_bridge.hpp` (Spark: `spark_connect_server/await_future.hpp`), the only
+  supported way to pick up an actor result.
 
 ### Key Types
 
-- `session_hash_t` — unique ID threaded through every component for a single query (also the Worker routing key)
-- `core::result_wrapper_t<session_payload>` (`Worker::session_result` / `Scheduler::session_result`) — the typed result returned through the actor-zeta future; carries either the payload or `core::error_t`
-- `ParsedQueryData` / `ParsedQueryDataPtr` — output of the Otterbrix SQL parser; carries the logical plan, `backend_type_t`, and per-node backend assignments for mixed queries
-- `backend_type_t` — `{Unknown, MySQL, PostgreSQL, ClickHouse, Mixed, Otterbrix}`; set by `CatalogManager::get_catalog_schema` after schema resolution
+- `session::query_session_t` / `session_ptr` — a client connection's session; `statement_id_t`
+  per statement (`next_statement()`); `session_result` = `core::result_wrapper_t<session_payload>`
+  (schema, chunks, `affected_rows`, tag, `transaction`, `setting_changes`, `savepoint`).
+- `components::session::session_id_t` — the engine session (`engine_session()`), one per query session.
+- `ParsedQueryData` / `ParsedQueryDataPtr` (`otterbrix/parser/parser.hpp`) — `plan`
+  (`ExecutionPlanPtr`, `types/otterbrix.hpp`: otterbrix's `execution_plan_t`, names as written),
+  `binder`, `tag`, `extension_kind`, `sql`, `awaiting_bind`.
+- `qualified_name_t` — `connection.database.schema.table`, an empty part = not written.
+- `backend_type_t` (`otterbrix/backend_type.hpp`) — `{MySQL, PostgreSQL, ClickHouse}`: the dialect
+  `sql_gen` writes, the one spelling of a backend's kind.
+- `federation::backend_actor_t` / `backend_agent_t` — the storage of a connection's tables / one
+  physical connection; `remote_backends_t::primitives()` — the connection → actor address map
+  `open_engine` takes.
+- `catalog::configured_connection_t` / `connection_discovery_t` — a configured connection with its
+  actor / what its startup discovery found.
 
 ### Actor Message Pattern
 
 ```cpp
-auto [needs_sched, future] = actor_zeta::send(
-    target_address,
-    &TargetActor::method,   // type-safe method pointer — no route enums
-    arg1, arg2
-);
+auto [needs_sched, future] = actor_zeta::send(target_address, &TargetActor::method, arg1, arg2);
 auto result = co_await std::move(future);
 ```
 
 Every handler is listed in the actor's `dispatch_traits` alias and the `behavior()` coroutine.
+actor-zeta 2.0: no blocking `get()` / `wait()` on a future, no `co_await` outside an actor coroutine.
 
-### Federated Query Syntax
+### Names
 
-A table behind a configured connection is named after its alias (see
-**Connection Config** above):
+Names are otterbrix's, as written (unquoted identifiers fold to lower case):
+
+| Written | Means |
+|---------|-------|
+| `c.d.s.t` | table `t` of connection `c` (its database `d`, schema `s`: `public` on MySQL / ClickHouse) |
+| `d.s.t` | a **local** table (three parts are always local) |
+| `s.t`, `t` | completed by the session's place, `search_path` (default `main.public`) |
 
 ```sql
-SELECT * FROM my.bill.orders o JOIN pg.shop.customers c ON ...   -- alias.db.table
-SELECT * FROM pg.shop.public.customers                            -- alias.db.schema.table
+SELECT o.id, c.name
+FROM mysql.bill.public.orders o JOIN pg.shop.shop.customers c ON o.customer_id = c.id;
 ```
 
-One function reads every table reference — `otterstax::names::canonical_table_name`
-(`otterbrix/parser/alias_registry.hpp`), used by the SQL parser and the Spark
-translator alike, for SELECT, JOIN, derived tables and every DML/DDL target and
-source. The parser rewrites each federated name to the canonical four segments
-`alias.db.schema.table` before the engine transformer sees it:
-
-- **Three segments `a.b.c`** are federated only when `a` is a configured alias;
-  otherwise they are a local `db.schema.table`, and a local table has no schema
-  (`invalid_parameter`, write `db.table`). One or two segments are always local;
-  `alias.table` is refused (`invalid_parameter`).
-- **PostgreSQL** pins the database and the schema to the connection (`database`,
-  `schema` in the config): another database is `invalid_parameter`, another
-  schema `unimplemented_yet` (one schema per alias — configure a second alias for
-  another schema).
-- **MySQL / ClickHouse** have no schema level: the database is free and goes into
-  the backend SQL, a schema segment is `invalid_parameter` (write `alias.db.table`).
-- **Columns** may be qualified by the table, `db.table`, the FROM alias, or the
-  five-segment `alias.db.schema.table.col`; `alias.db.table.col` names no FROM
-  element (`table_not_exists`).
-- **Errors** name the table canonically (`pg.shop.public.orders`), not as written.
-- **Not reached** by the rewrite: a CTE body and a subquery inside an expression
-  (WHERE, SELECT list, HAVING) — a federated name there is read as a local one.
-- An alias and a local engine database share one namespace (the alias's mirror
-  is an engine database of that name): `CREATE/DROP DATABASE <alias>` is refused,
-  and an alias does not register over an existing local database.
-
-The rows `tests/system/test_name_canonicalization.cpp` (`[names]`) pin each rule
-by what reaches the backend.
+- A column may be qualified by every suffix of its table's name (`c.d.s.t.col`).
+- PostgreSQL wire: the StartupMessage `database` sets `search_path = '<db>.public'`; a database the
+  engine does not have is `FATAL 3D000` with the hint `The default database is "main".` — clients
+  connect with `dbname=main`. MySQL: the handshake database / `USE` / `COM_INIT_DB` set the same.
+- Flight SQL catalogs are `d` (local) and `c.d` (a connection's database); a Spark database is a
+  schema (`d.s` / `c.d.s`).
+- `CREATE DATABASE <alias>` and DDL / DML on `federation.*` are refused (`catalog/ownership.hpp`).
 
 ## Profiling Instrumentation (Tracy) — MANDATORY
 
-Every main function MUST be instrumented with a Tracy zone. This is not optional:
-when you add or substantially edit a main function, you MUST add the macro.
+Every main function MUST carry a Tracy zone: an actor handler (every method in `dispatch_traits` /
+`behavior()`), a public top-level entry point of a translation unit, an expensive operation
+(parsing, discovery, SQL generation, translation, plan execution).
 
-A "main function" is any of:
-
-- An actor handler (every method listed in a `dispatch_traits` / `behavior()` coroutine)
-- A public/top-level entry point of a translation unit (free functions exposed via a header)
-- An expensive operation (parsing, schema discovery, SQL generation, data translation, plan execution)
-
-Rules:
-
-- Include the profiler header: `#include "utility/tracy_profiler.hpp"` (placed with the
-  project's own includes, after the unit's own header).
-- Add `OTX_ZONE_N("Scope::function")` as the **first statement** of the function body,
-  using a stable, qualified name (e.g. `"Worker::execute"`, `"catalog::get_catalog_schema"`,
-  `"sql_gen::generate_query"`, `"parser::prepare_sql"`).
-- **Exception — coroutine handlers that can resume on another thread.** When a handler's
-  coroutine can suspend at a `co_await` and resume on another thread, or interleave with
-  other coroutines on one thread (`Worker` on the `sharing_scheduler`, the `Scheduler`
-  event loop), open the zone as the first statement of a nested block
-  `{ OTX_ZONE_N("Scope::function"); ... }` that closes before the first `co_await`.
-  Tracy requires a zone to end on the thread that began it, in LIFO order; a zone spanning
-  a suspension point breaks both and corrupts the capture. Only `assert`s, objects that
-  must live for the whole coroutine (`Timer`, `erase_on_exit_t`) and the variables the
-  block fills (the `unique_future`, the parsed query data) may precede that block; the
-  awaited actor instruments its own work. A handler of an actor whose `enqueue_impl`
-  drives the coroutine to completion on the sender's thread (e.g. `CatalogManager`,
-  `S3Manager`, `FileManager`) keeps the zone as its first statement even across
-  `co_await`: the awaited call runs nested on the same thread. If such an actor moves off
-  that synchronous path, its handlers fall under this exception. See
-  `scheduler/CLAUDE.md`, "Tracy zones in coroutines".
-- The macros compile to **no-ops** unless Tracy is enabled, so there is no release-build cost.
-
-Do NOT instrument:
-
-- Recursive AST/tree walkers on a per-call basis (one zone per node floods the profiler) —
-  instrument the non-recursive top-level entry point that drives them instead.
-- Trivial getters/setters and O(1) map lookups (e.g. `schema_store_t::find`).
-
-Available macros (see `utility/tracy_profiler.hpp`): `OTX_ZONE()`, `OTX_ZONE_N(name)`,
-`OTX_FRAME()`, `OTX_PLOT(name, val)`, `OTX_MESSAGE(msg)`, `OTX_LOCKABLE(type, var)`.
+- `#include "utility/tracy_profiler.hpp"` (with the project's own includes, after the unit's header).
+- `OTX_ZONE_N("Scope::function")` as the **first statement**, a stable qualified name
+  (`"query_session::execute"`, `"catalog::registration_plans"`, `"backend_actor::storage_offer"`).
+- **Coroutines that can resume on another thread or interleave on one** (`query_session_t` on the
+  sessions pool, `backend_actor_t` on its loop): open the zone in a nested block
+  `{ OTX_ZONE_N(...); ... }` that closes before the first `co_await` — a Tracy zone must end on the
+  thread that began it, in LIFO order. Only `assert`s, objects living for the whole coroutine
+  (`Timer`, `erase_on_exit_t`) and the variables the block fills may precede it; work after a
+  `co_await` opens its own block. An actor whose `enqueue_impl` runs the coroutine to completion on
+  the sender's thread (`S3Manager`, `FileManager`) keeps the zone as its first statement.
+  `session/CLAUDE.md`, "Tracy zones in coroutines".
+- Not instrumented: recursive tree walkers per node (instrument their entry point), trivial getters
+  and O(1) lookups.
+- Macros (no-ops unless Tracy is enabled): `OTX_ZONE()`, `OTX_ZONE_N(name)`, `OTX_FRAME()`,
+  `OTX_PLOT(name, val)`, `OTX_MESSAGE(msg)`, `OTX_LOCKABLE(type, var)`.
 
 ## External Tables — File & S3
 
-OtterStax can ingest data from local files and S3-compatible object stores
-into otterbrix-internal storage, query it like any other table, and export
-query results back out. Both the loader and the exporter are exposed as SQL
-through grammar extensions registered on the parser side.
-
-### Surface SQL
-
 ```sql
--- Load a local file into otterbrix-internal storage
-CREATE EXTERNAL TABLE <db>.<table>
-    WITH (location = '/path/to/file.parquet', format = 'parquet');
-
--- Load an S3 object (after registering credentials via REST — see below)
-CREATE EXTERNAL TABLE <db>.<table>
-    WITH (s3_alias = 'rustfs1',
-          location = 's3://bucket/path/file.csv',
-          format   = 'csv');
-
--- Export an arbitrary SELECT (inner query is re-parsed and executed by the engine)
-COPY (SELECT col_a, col_b FROM <db>.<table>) TO '/tmp/out.ndjson'
-    WITH (format = 'ndjson');
-
-COPY (SELECT * FROM <db>.<table>) TO 's3://bucket/exported/out.csv'
-    WITH (s3_alias = 'rustfs1', format = 'csv');
+CREATE EXTERNAL TABLE eg.regions                       -- t, s.t, d.s.t or c.d.s.t, as CREATE TABLE
+    WITH (s3_alias = 'rustfs1', location = 's3://bucket/regions.parquet', format = 'parquet');
+CREATE EXTERNAL TABLE eg.weights WITH (location = '/fixtures/weights.csv');   -- format from the extension
+COPY (SELECT * FROM eg.regions) TO 's3://bucket/out/regions.csv' WITH (s3_alias = 'rustfs1', format = 'csv');
 ```
 
-Supported formats (both `CREATE EXTERNAL TABLE` and `COPY ... TO`):
+- Formats `parquet` (snappy / brotli / zlib / lz4 / zstd), `csv`, `ndjson`, both directions; the
+  `s3_alias` is a `connections.s3` entry.
+- Both statements run on the client's engine session (its place, snapshot, transaction): a load
+  outside a block is BEGIN / CREATE / INSERT / COMMIT, inside a block part of it. The schema of the
+  target must exist (the database is never created); an existing table is `table_already_exists`.
+- A loader answers a run of chunks of ≤ 1024 rows (`data_chunks_from_arrow`); an empty file makes a
+  table with its columns and no row. S3 objects stream through `tsl::arrow_stream_t` (one owner,
+  move-only; an output let go unclosed is aborted) with no local staging file; a COPY to a local
+  path writes a temporary sibling renamed over the target only on success.
+- Flow: `query_session_t::load_external_table` → `FileManager::load_file` (local) or
+  `S3Manager::download` → `engine::create_table_plan` + `engine::load_table`; `copy_to` → the inner
+  query (a query only) on the engine → `FileManager::dump_file` / `S3Manager::upload`.
+- Details: `otterbrix/CLAUDE.md` (translators), `otterbrix/parser/grammar_extention/CLAUDE.md`
+  (grammar), `connectors/CLAUDE.md` (s3 / file).
 
-| Format    | Loader (`translators/input/`) | Writer (`translators/output/`) |
-|-----------|-------------------------------|--------------------------------|
-| `parquet` | `parquet_to_chunk` (Arrow + snappy + brotli + zlib + lz4 + zstd) | `chunk_to_parquet` |
-| `csv`     | `csv_to_chunk`                | `chunk_to_csv`     |
-| `ndjson`  | `ndjson_to_chunk`             | `chunk_to_ndjson`  |
+**JOIN-key widths must agree.** An equi-JOIN of an int32 column with an int64 one answers no rows,
+silently: declare a local column `bigint` against parquet's int64, and widen or stage a backend
+`INT` (int32) before joining it with a local `bigint` — or join on a string key
+(`tests/CLAUDE.md`, "JOIN-key width sensitivity").
 
-`format` is optional in both statements — if omitted, it is auto-detected from
-the location's file extension. Once loaded, the table is a normal
-otterbrix-internal table; the parquet→engine schema/column types survive into
-the engine catalog (int64, double, utf8 strings, etc.). The database segment
-(`<db>` above) is auto-created by `CREATE EXTERNAL TABLE` if it doesn't exist.
+## Kafka
 
-### How it flows through the actor graph
-
-```text
-Frontend
-  → Scheduler::execute()              — thin router, hashes session_hash → Worker
-  → Worker::execute()                 — owns the parser, runs the full pipeline
-  → [parser extension claims the statement → otterstax::external::external_node_t]
-  → Worker::handle_external_statement
-       → CREATE EXTERNAL TABLE:
-           local path  → conn::file::FileManager::add_file → OtterbrixManager engine load
-           s3:// URI   → db::S3Manager::download: s3 ConnectorManager::open_input
-                         → FileManager::add_file reads the object stream (no local copy)
-       → COPY (<inner>) TO ...:
-           inner SQL re-parsed; result chunk runs through chunk_to_<fmt>;
-           local path  → FileManager::dump_file (file committed only on success)
-           s3:// URI   → S3Manager::upload: ConnectorManager::open_output
-                         → FileManager::dump_file writes into the stream → Close
-                         (any failure Aborts it: no partial object is published)
-  → returns empty session_payload via future; DDL/COPY return no rows
-```
-
-No byte of an S3 object is staged on local disk in either direction, and
-`WITH (format = ...)` names the format for s3 locations too (the object key's
-extension is the fallback). Every Arrow buffer on these paths — readers,
-builders, writers, S3 read and part buffers — is allocated on the caller's
-`std::pmr::memory_resource` through `tsl::arrow_pool`
-(`otterbrix/translators/arrow_memory_pool.hpp`), not Arrow's default pool.
-Exported parquet is snappy-compressed in row groups of up to
-`tsl::parquet_row_group_rows` (128 Ki) rows.
-
-Implementation entry points:
-
-- **Grammar extensions** — `otterbrix/parser/grammar_extention/s3/` and
-  `.../file/`. Each ships a `*_gram.y` + `*_scan.l` + `*_extension.cpp` and is
-  registered with the parser registry at `otterbrix/parser/parser.cpp`. The
-  `cmake/otterbrix_parser_extension.cmake` helper macro builds them.
-- **Connectors** — `connectors/s3/` (Arrow's `arrow::fs::S3FileSystem`,
-  initialised via `arrow::fs::EnsureS3Initialized`, one cached per alias;
-  `open_input` / `open_output` hand out object streams) and `connectors/file/`
-  (filesystem ingestion; `FileAddParams::input` / `FileMetadata::output` carry
-  a stream instead of a path).
-- **Integration actors** — `integration/s3/s3_manager.{hpp,cpp}` streams
-  objects between the s3 connector and `FileManager` (so COPY ... TO
-  's3://...' is a single pass with no staging file).
-- **Connection config** — s3 aliases are declared in the `connections.s3:`
-  section of `config.yaml` (`alias`, `access_key`, `secret_key`, `region`,
-  `endpoint`) and registered at startup. The alias is then used by the
-  `s3_alias` option on `CREATE EXTERNAL TABLE` / `COPY ... TO`.
-
-### Working JOIN shapes
-
-All combinations below are joinable in a single SQL statement:
-
-- otterbrix-internal table ⋈ s3 external (after `CREATE EXTERNAL TABLE`).
-- s3 external ⋈ local-file external.
-- Two `CREATE EXTERNAL TABLE`'d sources of any mix of formats (parquet ⋈ csv ⋈
-  ndjson).
-- Two registered backends (cross-backend, classified as `Mixed`).
-- **Registered backend ⋈ otterbrix-internal table** in a single statement. The
-  backend manager fetches its slice through the existing single-backend
-  dispatch and inlines it as `node_raw_data`
-  (`integration/sql/connection_manager.cpp:162-164` for MySQL; PG/CH have the
-  equivalent). The engine then resolves the symbolic local side by its
-  stamped `table_oid` (`catalog/catalog_manager.cpp:240-242`) and JOINs raw
-  data against engine-resident rows. The live demo's
-  `examples/demo/sql/step_4.sql` exercises exactly this shape every run.
-
-After `CREATE EXTERNAL TABLE`, the loaded table behaves identically to one
-created via `CREATE TABLE` — `INSERT INTO`, `SELECT`, JOIN, `COPY ... TO` all
-work the same way.
-
-**JOIN-key type widths must agree on both sides.** An equi-JOIN between an
-int32 column and an int64 column silently drops every row in the engine — no
-error, just an empty result. The two width footguns to watch for:
-
-- Local `int` (int32) vs parquet `int64` — declare the local column `bigint`
-  to match the parquet loader's column type.
-- Backend `INT` (int32, as `mysql_to_chunk` surfaces it) vs a local `bigint`
-  joined against it — either widen the backend column on the backend side or
-  stage the backend slice into a local `bigint` table first
-  (`tests/test_mysql_join_sql_s3_to_s3.py` does the staging path). Joining on
-  a string key avoids the issue entirely, which is what `step_4.sql` and
-  `tests/test_mysql_join_otb_local_backend.py` do. The test-side conventions
-  are in `tests/CLAUDE.md`, "JOIN-key width sensitivity".
-
-### Round-trip example
-
-```sql
--- Bring two datasets in
-CREATE EXTERNAL TABLE eg.regions
-    WITH (s3_alias='rustfs1', location='s3://test-bucket/regions.parquet', format='parquet');
-CREATE EXTERNAL TABLE eg.weights
-    WITH (location='/fixtures/weights.csv', format='csv');
-
--- JOIN them and persist the result into another otterbrix-internal table
-CREATE TABLE eg.weighted_regions (region_id bigint, region_name string, weight double);
-INSERT INTO eg.weighted_regions (region_id, region_name, weight)
-    SELECT r.region_id, r.region_name, w.weight
-    FROM   eg.regions r JOIN eg.weights w ON r.campaign_id = w.campaign_id;
-
--- Export to s3
-COPY (SELECT * FROM eg.weighted_regions) TO 's3://test-bucket/out/weighted.csv'
-    WITH (s3_alias='rustfs1', format='csv');
-```
-
-End-to-end coverage lives in `tests/test_{schema_}mysql_{file,s3}.py`,
-`tests/test_mysql_file_ndjson.py`, `tests/test_mysql_join_sql_s3_to_s3.py`,
-`tests/test_mysql_join_otb_local_s3.py`, and
-`tests/test_mysql_join_otb_local_s3_file.py` (3-origin: s3 parquet ⋈ file csv ⋈
-otterbrix-internal — shadow of `external_join_all` benchmark), all driven by
-`docker-run-tests.sh`.
+`CREATE / DROP SOURCE | STREAM` (grammar `otterbrix/parser/grammar_extension/kafka/`, runtime
+`integration/kafka/`, `KafkaManager`). The objects are tables of the schema `main.kafka`
+(`main.kafka.<obj>`); the bookkeeping is `federation.kafka.__sources` / `<source>__offsets`. An
+INSERT whose target, completed by the session's place, is `main.kafka.<obj>` produces to Kafka.
+`integration/kafka/CLAUDE.md`.
 
 ## Directory Map
 
 | Directory | CMake target | Role |
 | --------- | ------------ | ---- |
-| `connectors/` | `connectors`, `s3`, `file` | Raw DB connections (Boost.MySQL, libpq, clickhouse-cpp), S3 (Arrow `S3FileSystem`), local-file ingestion. `api_connections/` holds the `conn::api_server::*Params` structs consumed by `addConnection` |
-| `config/` | `config` | Single `config.yaml` reader — wire-server settings + `connections:` section (single source of truth for backend/s3 connections). See `config/CLAUDE.md` |
-| `catalog/` | `catalog` | Schema discovery + connection type registry (`CatalogManager`) |
-| `integration/` | `integration` | Actor wrappers bridging Worker ↔ ConnectorManagers (incl. `db::S3Manager`); each backend actor is the sole driver of its ConnectorManager and answers the catalog's `discover` |
-| `integration/kafka/` | `kafka_runtime` | `KafkaManager` actor + `detail/` impl (consumer/producer/poller/stream/reader); Kafka SOURCE/STREAM objects, librdkafka |
-| `otterbrix/` | `otterbrix_local` (+ `otterbrix_s3_extension`, `otterbrix_file_extension`) | Parser, SQL generator, translators, plan execution, grammar extensions for `CREATE EXTERNAL TABLE` / `COPY ... TO` |
-| `otterbrix/parser/grammar_extension/kafka/` | `kafka_grammar` | Kafka DDL parser extension (flex+bison): `kafka_node_t`, `kafka_write_target` |
-| `scheduler/` | `scheduler` | `Scheduler` router + `Worker` pool (full parse→catalog→backend→otterbrix pipeline, including external-statement dispatch) + schema computation utilities |
-| `frontend/` | `flight_sql`, `mysql_server`, `postgres_server`, `spark_connect_server` | Wire-protocol frontends (await `Scheduler` futures via `asio_future_bridge.hpp`). `flight_sql/` is the in-house Flight SQL server: asio-grpc handlers over gRPC, the data plane on the project's arrow core (`arrow::ipc` + `tsl::*` translators) — no Arrow Flight dependency. The Spark Connect gRPC server (asio-grpc; `spark.sql()` through `Scheduler::execute`, DataFrame plans through `Scheduler::execute_plan`, awaited via `await_future.hpp`). See `frontend/CLAUDE.md` |
-| `utility/` | (header-only) | `session`, `wait_barrier` (connector error marshalling), `asio_error`, `table_info`, logger, profiler |
-| `cmake/` | (helper macros) | `otterbrix_parser_extension.cmake` — builds the s3/file flex+bison grammar extensions |
-| `tests/` | `test_system`, `test_parser`, `test_schema`, `test_utils`, `test_unit_translators`, `test_unit_config`, `test_unit_spark_connect`, `test_kafka_grammar`, `test_mysql_front` | Catch2 tests + python integration suite under `tests/test_*.py` (the `test_spark_client_*.py` files run in the PySpark client matrix, `Dockerfile.spark-test`; binary names are the `project()` names in `tests/*/CMakeLists.txt`; see `tests/CLAUDE.md`) |
+| `config/` | `config` | `config.yaml` reader: `service:` + `connections:` (no connector dependency). `config/CLAUDE.md` |
+| `runtime/` | `runtime` | `runtime_t` (memory resource, the pools general / exec / disk / sessions / backends) and `engine_t` (the embedded otterbrix). `runtime/CLAUDE.md` |
+| `backends/` | `backends` | `remote_backends_t` (agents + backend actor per connection, startup discovery with `connection_retry.hpp`, `primitives()`), `register_s3_aliases`, `register_remote_tables` |
+| `otterbrix/federation/` | `otterstax_federation` | `backend_actor_t` (storage contract, `storage_offer`, transactions, DDL), `backend_agent_t`, `reachability_t`, `conform_to_result`, `federation.public.remote_names`. `otterbrix/federation/CLAUDE.md` |
+| `catalog/` | `catalog`, `catalog_discovery` | discovery queries / replies (`discovery.hpp`), registration in otterbrix's catalog (`registration.hpp`), owned names (`ownership.hpp`). `catalog/CLAUDE.md` |
+| `session/` | `session` | `query_session_t`, `session_factory_t`, `make_session_services`, `plan_inspection`. `session/CLAUDE.md` |
+| `otterbrix/` | `otterbrix_local` | parser (`parser/`), `sql_gen` (`query_generation/`), translators (`translators/`), engine requests (`operators/engine_requests.hpp`), s3 / file grammar (`parser/grammar_extention/`). `otterbrix/CLAUDE.md` |
+| `otterbrix/parser/grammar_extension/kafka/` | `kafka_grammar` | Kafka DDL grammar, Kafka names |
+| `connectors/` | `connectors`, `s3`, `file` | MySQL (Boost.MySQL) / PostgreSQL (libpq) / ClickHouse (clickhouse-cpp) connectors, the s3 connector actor (`conn::s3::ConnectorManager`, Arrow `S3FileSystem`), `conn::file::FileManager`. `connectors/CLAUDE.md` |
+| `integration/` | `integration`, `kafka_runtime` | `db::S3Manager` (s3 ↔ file streams); `kafka/` the Kafka runtime. `integration/CLAUDE.md`, `integration/kafka/CLAUDE.md` |
+| `frontend/` | `common_server`, `flight_sql`, `mysql_server`, `postgres_server`, `spark_connect_server` | the four servers. `frontend/CLAUDE.md` |
+| `types/` | (header-only) | `ExecutionPlanPtr`, `plan_root` |
+| `utility/` | (header-only) | logger, Tracy macros, `asio_error`, `wait_barrier`, `thread_pool_manager`, `parse_port`, `table_info`, … `utility/CLAUDE.md` |
+| `cmake/` | — | `otterbrix_parser_extension.cmake` (flex + bison extensions), conan hooks |
+| `tests/` | the 12 binaries above | Catch2 suites + the python integration suite and PySpark client matrix. `tests/CLAUDE.md` |
+| `benchmark/`, `examples/` | — | benchmark harness (`benchmark/CLAUDE.md`), demo and quick start stacks |
 
 ## Known Constraints
 
-- `ConnectorManager::addConnection` is the only write to a connector registry and runs on the startup thread before any query reaches the integration actor that drives the manager (`connectors/mysql/manager.hpp`); there is no remove path
-- One query per connection at a time: each alias owns a single `boost::mysql::any_connection` and nothing serializes overlapping statements on it (`Connector::runQuery_` in `connectors/mysql/connector.hpp`; the pg/ch connectors are shaped the same way)
-- A subquery inside an expression is dropped: the engine transformer lowers `WHERE x IN (SELECT …)` (and likely `EXISTS` / a scalar subquery) into a plan of its own in `execution_plan_t::sub_queries`, while `GreenplumParser::parse` keeps only the main plan (`binder.node_ptr()`) and `OtterbrixDataManager::execute_plan` runs that alone — the statement answers without the subquery's rows and without an error, even over local tables
-- Array types support only single dimension (see the `TODO: multiple dimentions array` in `write_column_def`, `otterbrix/query_generation/sql_query_generator.cpp`)
-- Docker MariaDB volumes lag on cold start — `docker-run-tests.sh` has a 120 s wait
-- Engine (rc-3): an aggregate whose arguments are all constants is wrong over a **local** engine table — `SELECT count(1)` / `sum(1)` over a 3-row table answers 1, and 1 per group, and `count(1)` over no rows crashes the process — because `execution_dag_t::run` evaluates an all-constant node over one row per chunk (engine `components/execution_dag/execution_dag.cpp:972-995`). `OtterbrixDataManager::execute_plan` (`otterbrix/operators/execute_plan.cpp`) guards every plan the engine runs, SQL and Spark alike: `count(<non-NULL literal>)` becomes `COUNT(*)`, any other aggregate over constants is refused as `unimplemented_yet` (`sum() over a constant argument is not supported`). Backend mirrors are unaffected (`COUNT(1)` is pushed to the backend). The request to the engine is `docs/otterbrix_request_constant_aggregates.md`
-- Engine (rc-3): `avg` and `sum` answer their input's type (`compute/kernels/aggregate.cpp`, `same_type_resolver`) and accumulate in it, so over a **local** engine table `avg` of an integer column drops the fraction (`avg(bigint)` over 1, 2, 3, 4, 6 answers 3) and `avg` / `sum` of a SMALLINT or INTEGER column overflow past its range. Backend mirrors are unaffected (the backend computes them). The Spark frontend averages its argument cast to DOUBLE, as Spark's `Average` does; the SQL path waits for the engine (`docs/otterbrix_request_avg_integer_division.md`)
+**Transactions and writes on a backend**
 
-## Critical Dependency Versions
+- A PostgreSQL / MySQL block holds one agent (connection) of its connection to its end: more open
+  blocks than `pool_size` wait for a free agent up to 60 s, then `io_error`. A client that closes its
+  connection inside a block (a driver with autocommit off) frees the agent at once: the session's
+  close ends its transaction on every backend actor itself (`backend_actor_t::end_session`), not
+  through otterbrix's ROLLBACK, which waits for one of otterbrix's executors (four, each running one
+  statement at a time) — all of them may be running statements that wait for that agent. A COMMIT /
+  ROLLBACK a client sends while every executor runs such a waiting statement still waits for an
+  executor until those statements' checkout timeout (a waiting statement holds its otterbrix executor).
+- A block writes to one connection: a write to a second connection in the same block is
+  `unimplemented_yet` and fails the block (otterbrix's one write place).
+- ClickHouse has no transactions: a write inside a block is refused (`unimplemented_yet`).
+- A ClickHouse UPDATE / DELETE is a mutation: one that fails on a part is killed by the agent
+  (`KILL MUTATION` of the one mutation ClickHouse names, so it is not retried forever) and the
+  statement answers its error, but the parts it already rewrote keep the change (no rollback). When
+  ClickHouse names several mutations failing together, none is killed (the error says so).
+- An UPDATE / DELETE of a remote table runs only as ONE statement of its backend; one the dialect
+  cannot say whole (a JOIN with another server or a local table, a correlated sub-query over one, an
+  expression with no literal in the dialect) is `unimplemented_yet` — OtterStax numbers no remote
+  row. An uncorrelated sub-query over a local table (`WHERE id IN (SELECT id FROM <local table>)`)
+  is no obstacle: otterbrix computes it first and the backend gets its values (`IN (2, 3)`).
+  RETURNING: PostgreSQL only.
+- otterbrix casts an UPDATE value to its column's type, and a literal is BIGINT / DOUBLE: `SET i = i + 1`
+  (INTEGER), `SET f = 2.5` (FLOAT) narrow, range-checked. MySQL / ClickHouse have no such CAST, so the
+  backend's store does the check (otterbrix does not mark the assignment's cast): MySQL writes the value uncast, which only a
+  session under `STRICT_TRANS_TABLES` / `STRICT_ALL_TABLES` refuses out of range (ER 1264) — a session
+  without a strict `sql_mode` refuses such an UPDATE (`unimplemented_yet`); on a non-transactional
+  (MyISAM) table under `STRICT_TRANS_TABLES` alone MySQL clamps after the first row, and a computed
+  DOUBLE below FLOAT's smallest value is stored as 0 where the engine refuses it. ClickHouse:
+  `if(isNull(x), NULL, accurateCast(x, 'Nullable(Int32)'))` for an integer (a NULL row stays NULL);
+  a DOUBLE into Float32 only as a bound value
+  (`f = f + 1` is `unimplemented_yet`). A fraction into an integer column stays `unimplemented_yet`
+  on both (MySQL rounds a DECIMAL half away from zero, the engine to even).
+- An INSERT that omits a column sends NULL for it: the backend's DEFAULT / serial / AUTO_INCREMENT is
+  lost (NOT NULL → `not_null_violation`) — otterbrix leaves no column to the backend's DEFAULT. An INSERT … SELECT of one backend is
+  not pushed down (its rows pass through the engine).
+- Remote DDL (`CREATE / DROP / ALTER TABLE c.d.s.t`) runs only in autocommit (otterbrix refuses it
+  inside a block, `unimplemented_yet`): otterbrix's storage contract has no DDL inside a transaction. MySQL / ClickHouse DDL commits on the
+  backend at once (an engine failure afterwards is compensated by a DROP); a DROP TABLE / COLUMN is
+  sent at COMMIT.
+- `CREATE / DROP INDEX` on a remote table is refused by otterbrix (its storage contract has no index).
+- `CREATE EXTERNAL TABLE` into a four-part target is not atomic: CREATE and INSERT are two
+  autocommit statements.
+- A backend's COMMIT that succeeded while otterbrix's own commit marker failed leaves the outcome in
+  doubt (no two-phase commit).
+- The count of a MySQL UPDATE is the rows it matched (read off the OK packet's info: Boost.MySQL sets
+  no `CLIENT_FOUND_ROWS`); ClickHouse answers `written_rows` for an INSERT and 0 for a mutation.
 
-- Otterbrix 1.0.0b2-rc-3 (custom Conan remote: `https://conan.otterbrix.com`; pinned by recipe revision in `conanfile.py`)
-- Arrow 24.0.0 (with `with_s3=True`, `with_parquet=True`, `with_csv=True`, `with_json=True`, plus snappy/brotli/zlib/lz4/zstd compression codecs)
-- Boost 1.88.0
-- actor-zeta 1.2.0
-- Catch2 3.15.1 (v3 — `find_package(Catch2 3)` required by the otterbrix recipe)
-- asio-grpc 3.7.0 (`backend=boost` in `conanfile.py`) over gRPC 1.69.0 — the Spark Connect server
-- Spark Connect protocol 4.2.0 — the protos are vendored from apache/spark v4.2.0 into `frontend/spark_connect_server/proto/spark/connect/`; the server answers `SparkVersion` 4.2.0
-- PySpark clients 3.5.0–4.2.0 — every released client (20 versions) runs the E2E matrix (`Dockerfile.spark-test`, see `tests/CLAUDE.md`)
+**Connections and names**
+
+- `table:` of a connection makes it that one table: the startup discovery and a miss register it
+  alone (a miss of another table of it is the statement's own miss, no discovery sent), and DDL of
+  any other table of it written in four parts — CREATE / ALTER / DROP TABLE, CREATE INDEX, CREATE
+  EXTERNAL TABLE — is refused by the session before the engine and the backend (`invalid_parameter`
+  `connection "<c>" is configured with table "<X>"`, `catalog::check_table_scope`; a short name in a
+  place that is the connection's database is not seen). Without `table:` a miss registers any table
+  of the connection's database (and, on PostgreSQL, of its configured schema or any schema when none
+  is).
+- Registration by a miss looks the table up by the written name, which otterbrix keeps in lower
+  case: a backend table spelled with upper-case letters is found only by the startup discovery.
+- A connection unreachable at startup keeps its actor and its catalog rows of the last discovery;
+  a statement then fails at the connection. A failed connect marks the connection unreachable for
+  10 s: until then every statement that needs a connect fails at once (`io_error` `connection
+  "<alias>" is unreachable`). A table never registered on such a connection answers that failure
+  of the connection (the miss's discovery could not reach the backend), not otterbrix's "does not
+  exist"; a backend that answers without the table leaves the miss.
+- A connection removed from `config.yaml` keeps its catalog databases (a warning in the BACKENDS log).
+- A MySQL session under `sql_mode` `NO_BACKSLASH_ESCAPES` is refused (`unimplemented_yet`: the
+  generated literals double a backslash): every agent reads `@@SESSION.sql_mode` of every session it
+  opens, at startup and at every reconnect (`backend_agent_t::check_session`). At startup the
+  connection is left out on that first answer (`open_failure_kind_t::unusable`, no retry): no actor,
+  no address in the engine's map, not among the sessions' connections — a statement naming it is
+  refused (`undefined_object`, its catalog rows of an earlier start included), the other connections
+  serve. A server switched to it while OtterStax runs is found at the agent's next connect: that
+  statement is refused before any SQL of it is sent, the session closed, and the next statement
+  connects and asks again. PostgreSQL's `standard_conforming_strings` is not checked: a string
+  literal holding a backslash is written as an escape string constant `E'…'` with the backslash
+  doubled (`sql_gen`, `catalog::escape_sql_literal`), which reads the same under on and off.
+- An agent runs its statement (and a reconnect: connect bounded by 10 s) on a backends-pool thread;
+  MySQL / PostgreSQL bound no statement, so a hung backend holds that thread until the shutdown
+  cancels the agents (no cancel of a running statement from the client).
+- One `remote_backends_t` per `runtime_t`: its destructor stops the runtime's backends pool.
+- `storage_total_rows` answers a constant estimate (1000), no query (otterbrix asks for no table size).
+
+**Results and semantics**
+
+- A pushed-down expression is evaluated by the backend with its semantics (division by zero: MySQL
+  NULL, PostgreSQL an error, ClickHouse `inf`); the result *types* are always the engine's
+  (`conform_to_result`).
+- `count(*)` is UBIGINT (otterbrix): MySQL wire unsigned BIGINT (Connector/J `getObject` →
+  `BigInteger`), PostgreSQL int8.
+- Arrays of one dimension only (`TODO: multiple dimentions array`, `sql_query_generator.cpp`).
+
+**Sessions and drivers**
+
+- SET / SHOW a driver sends that the engine does not have is refused (otterbrix has neither the
+  settings drivers send nor SHOW): MySQL Connector/J `SQL_SELECT_LIMIT`, Rails `sql_mode` /
+  `wait_timeout` (`1149`), a PostgreSQL `SHOW` of anything but the client parameters
+  (`application_name`, `client_encoding`, `extra_float_digits`) — `SHOW DateStyle`,
+  `SHOW server_version`, … go to the engine, which has no SHOW.
+- `DISCARD ALL` is refused (outside a block by the engine; inside `25001`): otterbrix has no
+  DISCARD. pgbouncer: `server_reset_query = 'RESET ALL; DEALLOCATE ALL'`.
+- No `NoticeResponse` (an `application_name` cut to 63 bytes, a `SET LOCAL` outside a block warn
+  nothing).
+- A client-parameter `SET` (`application_name`, …) run through Execute without BEGIN, followed by an
+  error before Sync, is not undone (PostgreSQL's implicit pipeline transaction).
+- The startup `TimeZone` is reported as the engine keeps it, `utc` (the engine's session settings
+  cannot be read back).
+- Server-wide settings are refused from a client (`unimplemented_yet`): `ALTER SYSTEM`, `ALTER
+  DATABASE | ROLE … SET`, MySQL `SET GLOBAL | PERSIST | @@global.x`.
+- Flight SQL keeps no transaction across RPCs: a statement leaving its session inside a block is
+  rolled back and refused.
+- A statement a frontend stopped waiting for (90 s, `asio_future_bridge.hpp`) runs to its end; inside
+  a block the frontend fails the block behind it (MySQL `ER_QUERY_TIMEOUT`). A MySQL / PostgreSQL
+  connection that closes (quit, server stop, the client's socket gone) stops waiting at once and closes
+  its session: a statement waiting for a backend agent leaves the queue, a running one runs to its end.
+- A Spark session idle for `session_timeout_s` is closed (its block rolled back); its id is then
+  refused `[INVALID_HANDLE.SESSION_CLOSED]`.
+- A COPY rolled back leaves its file / object written (files are not transactional).
+- Waiting is a poll: a settled actor-zeta future wakes nobody, so
+  the query session (sessions pool) and the engine's executor spin while a statement waits, burning
+  CPU for as long as it waits (`[.engine-defect-otb-notify]`, `tests/session/test_session_lifetime.cpp`).
+  The backend actor's loop is woken by its agents. The frontends' own poll backs off
+  (`await_backoff_t`: short steps first, then growing ones up to a cap).
+- Docker MariaDB volumes lag on cold start — `docker-run-tests.sh` waits up to 120 s.
+
+## Critical Dependency Versions (`conanfile.py`)
+
+- otterbrix `1.0.0b2-rc-4#0cdaa27b38b1da19885a7b44e01fa4e7` from `conan.otterbrix.com` — tag `1.0.0b2-rc-4`
+  on otterbrix `main` `01ec5268` (PR #850 merged; the tree of `feat/otterstax-requests` @ `af99cccf`). The remote
+  holds only a Linux x86_64 gcc 13 Release static binary; OtterStax links it shared (`otterbrix/*:shared=True`,
+  `conanfile.py`), so `conan install … --build missing` builds it from the remote recipe against the abseil / re2 /
+  boost overrides of `conanfile.py`. One `libotterbrix.so`. The TSAN image passes `--build="otterbrix/*"
+  --build="actor-zeta/*"`, the ASAN image `--build="otterbrix/*"` (instrumentation).
+- actor-zeta `2.0.0#887bc992cac0ead59e5bdf5c90c844f4` from `conan.otterbrix.com` (Linux x86_64 gcc 13
+  binary; other configurations `--build missing`).
+- Arrow 24.0.0 (shared; s3, parquet, csv, json; snappy / brotli / zlib / lz4 / zstd)
+- Boost 1.88.0, gRPC 1.69.0 + asio-grpc 3.7.0 (`backend=boost`), libpq 15.4, clickhouse-cpp 2.6.1,
+  librdkafka 2.14.2, yaml-cpp 0.7.0, spdlog 1.15.1, fmt 11.1.3, Catch2 3.15.1, tracy 0.13.1 (optional)
+- Spark Connect protocol 4.2.0 (protos vendored in `frontend/spark_connect_server/proto/`; the server
+  answers `SparkVersion` 4.2.0); PySpark clients 3.5.0–4.2.0 (20 versions) in the E2E matrix
+  (`Dockerfile.spark-test`, `tests/CLAUDE.md`).

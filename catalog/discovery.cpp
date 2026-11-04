@@ -10,6 +10,9 @@
 #include <components/logical_plan/node_aggregate.hpp>
 #include <components/logical_plan/node_match.hpp>
 #include <components/logical_plan/param_storage.hpp>
+#include <components/vector/vector_builders.hpp>
+
+#include <cstdint>
 
 using namespace components;
 
@@ -18,9 +21,16 @@ namespace otterstax::catalog {
     std::pmr::string
     escape_sql_literal(std::pmr::memory_resource* resource, std::string_view value, backend_type_t backend) {
         OTX_ZONE_N("catalog::escape_sql_literal");
-        const bool backslash_escapes = backend == backend_type_t::MySQL || backend == backend_type_t::ClickHouse;
+        // A PostgreSQL value holding a backslash is an escape string constant, E'...', which reads
+        // the backslash as an escape whatever standard_conforming_strings says (sql_gen's
+        // write_string_literal writes the same).
+        const bool backslash_escapes = backend == backend_type_t::MySQL || backend == backend_type_t::ClickHouse ||
+                                       value.find('\\') != std::string_view::npos;
         std::pmr::string out{resource};
-        out.reserve(value.size() + 2);
+        out.reserve(value.size() + 3);
+        if (backslash_escapes && backend == backend_type_t::PostgreSQL) {
+            out.push_back('E');
+        }
         out.push_back('\'');
         for (char c : value) {
             if (c == '\'') {
@@ -41,6 +51,20 @@ namespace otterstax::catalog {
         if (backend == backend_type_t::ClickHouse) {
             query.append("SELECT name FROM system.tables WHERE database = ");
             query.append(escape_sql_literal(resource, scope, backend));
+            return query;
+        }
+        if (backend == backend_type_t::PostgreSQL) {
+            // (schema, table): one schema, or every user schema of the database.
+            query.append("SELECT table_schema, table_name FROM information_schema.tables WHERE table_type = 'BASE TABLE' "
+                         "AND ");
+            if (scope.empty()) {
+                query.append("table_schema NOT IN ('pg_catalog', 'information_schema') AND table_schema NOT LIKE "
+                             "E'pg\\\\_toast%' AND table_schema NOT LIKE E'pg\\\\_temp%'");
+            } else {
+                query.append("table_schema = ");
+                query.append(escape_sql_literal(resource, scope, backend));
+            }
+            query.append(" ORDER BY table_schema, table_name;");
             return query;
         }
         query.append("SELECT table_name FROM information_schema.tables WHERE table_schema = ");
@@ -64,22 +88,23 @@ namespace otterstax::catalog {
     make_schema_probe_query(std::pmr::memory_resource* resource, const qualified_name_t& name, backend_type_t backend) {
         OTX_ZONE_N("catalog::make_schema_probe_query");
         logical_plan::parameter_node_t param(resource);
-        auto node = logical_plan::make_node_aggregate(resource,
-                                                      core::uid_t{name.unique_identifier},
-                                                      core::dbname_t{name.database},
-                                                      core::relname_t{name.collection});
+        auto node = logical_plan::make_node_aggregate(
+            resource,
+            qualified_name_t{name.connection, name.database, core::schema_t{}, name.collection});
+        const auto one = param.add_parameter(vector::make_scalar(resource, std::int64_t{1}), vector::parameter_kind::literal);
+        const auto zero = param.add_parameter(vector::make_scalar(resource, std::int64_t{0}), vector::parameter_kind::literal);
         node->append_child(logical_plan::make_node_match(
             resource,
-            core::dbname_t{name.database},
-            core::relname_t{name.collection},
-            expressions::make_compare_expression(resource,
-                                                 expressions::compare_type::eq,
-                                                 param.add_parameter(types::logical_value_t(resource, 1)),
-                                                 param.add_parameter(types::logical_value_t(resource, 0)))));
+            qualified_name_t{name.database, core::schema_t{}, name.collection},
+            expressions::make_compare_expression(resource, expressions::compare_type::eq, one, zero)));
 
-        otterstax::names::resolved_target_t probe_target{components::catalog::INVALID_OID, name, {}};
-        std::pmr::vector<external_entry_t> empty_batch{resource};
-        return sql_gen::generate_query(node, &param.parameters(), backend, probe_target, empty_batch, resource);
+        sql_gen::statement_target_t probe_target{name};
+        return sql_gen::generate_query(node,
+                                       &param.parameters(),
+                                       backend,
+                                       probe_target,
+                                       resource,
+                                       sql_gen::generation_options_t{.validated = false});
     }
 
     core::error_t make_discovery_error(std::pmr::memory_resource* resource,
@@ -99,7 +124,7 @@ namespace otterstax::catalog {
         if (failed_tables.size() > max_named) {
             msg.append(", ...");
         }
-        return core::error_t(core::error_code_t::schema_error, std::move(msg));
+        return core::error_t(core::error_code_t::undefined_object, std::move(msg));
     }
 
 } // namespace otterstax::catalog

@@ -1,6 +1,6 @@
 -- Step 6: Federated MRR. Three backends, LEFT JOIN, CASE WHEN inside SUM,
 -- HAVING via alias.
--- Backends: mysql.bill (invoices), pg.shop (customers), ch.ev (sessions).
+-- Backends: mysql.bill.public (invoices), pg.shop.shop (customers), ch.ev.public (sessions).
 SELECT c.tier,
        SUM(CASE WHEN i.status = 'paid' THEN i.amount ELSE 0 END) AS mrr,
        COUNT(DISTINCT s.user_id)                                 AS active_users,
@@ -8,13 +8,13 @@ SELECT c.tier,
        MAX(i.amount)                                             AS max_invoice
 FROM (
     SELECT customer_id, amount, status
-    FROM   mysql.bill.invoices
+    FROM   mysql.bill.public.invoices
     WHERE  ts >= '2026-03-20'
 ) i
-INNER JOIN pg.shop.customers c ON c.customer_id = i.customer_id
+INNER JOIN pg.shop.shop.customers c ON c.customer_id = i.customer_id
 LEFT  JOIN (
     SELECT user_id
-    FROM   ch.ev.sessions
+    FROM   ch.ev.public.sessions
     WHERE  ts >= '2026-03-20'
 ) s ON s.user_id = c.customer_id
 GROUP BY c.tier

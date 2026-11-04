@@ -3,7 +3,7 @@
 
 """
 End-to-end integration test for demo steps 1-6 with all three backends
-(mysql.bill, pg.shop, ch.ev) live.
+(mysql.bill.public, pg.shop.shop, ch.ev.public) live.
 
 Reads SQL from `examples/demo/sql/*.sql` — single source of truth shared with
 the interactive psql session. If you change a query there, the test changes
@@ -16,7 +16,7 @@ Pre-conditions:
   * The mysql / pg / ch aliases come from that config file at server startup.
   * Seed data is `examples/demo/generate_data.py` with its fixed SEED — the
     exact row count asserted for step 4 depends on it.
-  * The `otter` database from step 3a is dropped by cleanup.sql in the finally
+  * The `otter` schema from step 3a is dropped by cleanup.sql in the finally
     block, so consecutive runs need no manual reset.
 
 Run:
@@ -48,6 +48,7 @@ def make_conn(local: bool) -> psycopg.Connection:
         port=config.PG_PORT,
         user="demo",
         password="demo",
+        dbname="main",  # the engine database (an unknown one is FATAL 3D000)
         autocommit=True,
     )
 

@@ -170,10 +170,10 @@ with open(INIT / "s3" / "promotions.ndjson", "w") as fh:
         fh.write(json.dumps(row) + "\n")
 
 # ── PG #1: customers ─────────────────────────────────────────────────────────
-# Tables live in a schema whose name equals the database (shop.shop) so the
-# clean 3-part federated form `pgshop.shop.customers` resolves — OtterStax
-# promotes `alias.db.table` to `alias.db.<db-as-schema>.table` (matches the
-# demo's db==schema==shop). Config `schema:` must agree.
+# Tables live in a schema whose name equals the database (shop.shop), as in the
+# demo (db==schema==shop). The connection's config `schema:` names that schema,
+# so the federated name is `pgshop.shop.shop.customers`
+# (alias.database.schema.table).
 pg1 = ["""\
 CREATE DATABASE shop;
 \\c shop

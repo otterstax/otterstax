@@ -12,7 +12,6 @@
 #include <components/expressions/scalar_expression.hpp>
 #include <components/expressions/sort_expression.hpp>
 #include <components/logical_plan/param_storage.hpp>
-#include <components/types/logical_value.hpp>
 #include <components/types/types.hpp>
 #include <core/result_wrapper.hpp>
 
@@ -59,7 +58,7 @@ TEST_CASE("expression_to_plan: literal boolean") {
     REQUIRE(scalar->params().size() == 1);
 
     const auto id = std::get<core::parameter_id_t>(scalar->params().front());
-    REQUIRE(params->parameter(id).value<bool>() == true);
+    REQUIRE(params->parameter(id).get_value<bool>(0) == true);
 }
 
 TEST_CASE("expression_to_plan: literal integer") {
@@ -80,7 +79,7 @@ TEST_CASE("expression_to_plan: literal integer") {
     REQUIRE(scalar->params().size() == 1);
 
     const auto id = std::get<core::parameter_id_t>(scalar->params().front());
-    REQUIRE(params->parameter(id).value<int64_t>() == 42);
+    REQUIRE(params->parameter(id).get_value<int64_t>(0) == 42);
 }
 
 TEST_CASE("expression_to_plan: literal string") {
@@ -101,7 +100,7 @@ TEST_CASE("expression_to_plan: literal string") {
     REQUIRE(scalar->params().size() == 1);
 
     const auto id = std::get<core::parameter_id_t>(scalar->params().front());
-    REQUIRE(params->parameter(id) == ct::logical_value_t{resource, std::string{"hello"}});
+    REQUIRE(params->parameter(id).get_value<std::string_view>(0) == "hello");
 }
 
 // ── UnresolvedAttribute ───────────────────────────────────────────────────────
@@ -205,9 +204,9 @@ TEST_CASE("expression_to_plan: avg averages its argument cast to DOUBLE") {
     auto* agg = static_cast<ce::aggregate_expression_t*>(out.get());
     CHECK(agg->function_name() == "avg");
     REQUIRE(agg->params().size() == 1);
-    // Spark's Average casts its input to DOUBLE; the engine's avg would keep a BIGINT
-    // column's type and drop the fraction. The column is the cast's key, as in the SQL
-    // transformer's avg(CAST(amount AS double)).
+    // Spark's Average casts its input to DOUBLE; the engine's avg answers DOUBLE for a
+    // BIGINT column already, but would keep a FLOAT or DECIMAL column's type. The column
+    // is the cast's key, as in the SQL transformer's avg(CAST(amount AS double)).
     REQUIRE(ce::is_expr(agg->params().front()));
     const auto& operand = ce::as_expr(agg->params().front());
     REQUIRE(operand->group() == ce::expression_group::cast);
@@ -264,7 +263,7 @@ TEST_CASE("expression_to_plan: unresolved function = (comparison operator)") {
     REQUIRE(ce::is_key(cmp->left()));
     CHECK(ce::as_key(cmp->left()).as_string() == "id");
     REQUIRE(ce::is_parameter(cmp->right()));
-    CHECK(params->parameter(ce::as_parameter(cmp->right())).value<int64_t>() == 1);
+    CHECK(params->parameter(ce::as_parameter(cmp->right())).get_value<int64_t>(0) == 1);
 }
 
 TEST_CASE("expression_to_plan: == compares a column key with a bound parameter") {
@@ -289,7 +288,7 @@ TEST_CASE("expression_to_plan: == compares a column key with a bound parameter")
     REQUIRE(ce::is_key(cmp->left()));
     CHECK(ce::as_key(cmp->left()).as_string() == "region");
     REQUIRE(ce::is_parameter(cmp->right()));
-    CHECK(params->parameter(ce::as_parameter(cmp->right())).value<std::string_view>() == "north");
+    CHECK(params->parameter(ce::as_parameter(cmp->right())).get_value<std::string_view>(0) == "north");
 }
 
 TEST_CASE("expression_to_plan: isNull compares a column key with a NULL placeholder") {

@@ -5,10 +5,13 @@
 // picks up an actor result:
 //
 //   ok      -> the waiter really blocks until the producer answers
-//   timeout -> it gives up at the deadline, reports AWAIT_TIMEOUT_CODE
-//   error   -> a producer-side failure wakes it early and passes through as-is
+//   timeout -> it gives up at the deadline: status timed_out
+//   error   -> a producer-side failure wakes it early and passes through as-is,
+//              status answered whatever its code
 //   failed  -> actor-zeta's own failure channel (`promise::error`, also the
-//              cancellation channel) wakes it early as AWAIT_FAILED_CODE
+//              cancellation channel) wakes it early: status broken
+//   poll    -> the step starts short and backs off after the fast phase
+//   cancel  -> a terminal cancellation of the awaiting coroutine ends it at once
 //
 // Every message the bridge creates lives on the resource the caller hands in.
 // Catch2 assertions are not thread-safe: the producer threads only record what
@@ -20,6 +23,8 @@
 #include <catch2/catch_all.hpp>
 
 #include <actor-zeta.hpp>
+#include <boost/asio/bind_cancellation_slot.hpp>
+#include <boost/asio/cancellation_signal.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -35,9 +40,10 @@ namespace {
     using payload_t = std::pmr::string;
     using result_t = core::result_wrapper_t<payload_t>;
     using future_t = actor_zeta::unique_future<result_t>;
+    using awaited_t = otterstax::awaited_t<payload_t>;
 
     // Drive the bridge exactly the way a frontend handler does.
-    result_t await_on_io(future_t fut, std::chrono::milliseconds timeout, std::pmr::memory_resource* resource) {
+    awaited_t await_on_io(future_t fut, std::chrono::milliseconds timeout, std::pmr::memory_resource* resource) {
         return otterstax::await_future_blocking<payload_t>(std::move(fut), resource, timeout);
     }
 
@@ -65,6 +71,7 @@ TEST_CASE("asio_future_bridge: ok") {
     auto result = await_on_io(std::move(fut), 5000ms, &resource);
     const auto duration = elapsed_ms_since(start);
 
+    REQUIRE(result.status() == otterstax::await_status_t::answered);
     REQUIRE_FALSE(result.has_error());
     REQUIRE(result.value() == "Hello, World!");
     // Really waited for the producer, and woke on it rather than on the deadline.
@@ -103,9 +110,11 @@ TEST_CASE("asio_future_bridge: timeout") {
     REQUIRE(consumer_was_gone.load());
 
     REQUIRE(result.has_error());
-    // The frontends branch on the code to report a timeout rather than a query
-    // error, so it is part of the contract — the message is not.
-    REQUIRE(result.error().type == otterstax::AWAIT_TIMEOUT_CODE);
+    // The frontends branch on the status to report a timeout rather than a
+    // query error, so it is part of the contract — the code and the message
+    // are not.
+    REQUIRE(result.timed_out());
+    REQUIRE(result.status() == otterstax::await_status_t::timed_out);
     REQUIRE(result.error().what.get_allocator().resource() == &resource);
     REQUIRE(duration >= 200);
     REQUIRE(duration < 260);
@@ -133,6 +142,8 @@ TEST_CASE("asio_future_bridge: error") {
     const auto duration = elapsed_ms_since(start);
 
     REQUIRE(result.has_error());
+    REQUIRE(result.status() == otterstax::await_status_t::answered);
+    REQUIRE_FALSE(result.timed_out());
     // The worker's error passes through untouched: same code, same message, and
     // the message still lives on the producer's resource (moved, never copied).
     REQUIRE(result.error().type == core::error_code_t::sql_parse_error);
@@ -167,18 +178,88 @@ TEST_CASE("asio_future_bridge: infra failure") {
     const auto duration = elapsed_ms_since(start);
 
     REQUIRE(result.has_error());
-    REQUIRE(result.error().type == otterstax::AWAIT_FAILED_CODE);
+    REQUIRE(result.status() == otterstax::await_status_t::broken);
+    REQUIRE_FALSE(result.timed_out());
     REQUIRE_FALSE(result.error().what.empty());
     REQUIRE(result.error().what.get_allocator().resource() == &resource);
     REQUIRE(duration >= 100);
     REQUIRE(duration < 180);
 }
 
-TEST_CASE("asio_future_bridge: timeout and infra failure are distinct codes") {
-    // A frontend maps the timeout to its protocol's "query cancelled" error and
-    // everything else to a generic failure, which only works while the two
-    // bridge codes differ from each other.
-    STATIC_REQUIRE(otterstax::AWAIT_TIMEOUT_CODE != otterstax::AWAIT_FAILED_CODE);
-    STATIC_REQUIRE(otterstax::AWAIT_TIMEOUT_CODE != core::error_code_t::other_error);
-    STATIC_REQUIRE(otterstax::AWAIT_TIMEOUT_CODE != core::error_code_t::none);
+// The engine answers with every code the bridge could pick for itself —
+// io_error and internal_error among them — so an engine answer carrying it must reach
+// the frontend as the engine's error, never as the bridge's timeout.
+TEST_CASE("asio_future_bridge: a worker error with any code is not a timeout") {
+    std::pmr::synchronized_pool_resource resource;
+    for (const auto code : {core::error_code_t::no_active_sql_transaction,
+                            core::error_code_t::internal_error,
+                            core::error_code_t::io_error,
+                            core::error_code_t::connection_closed}) {
+        actor_zeta::promise<result_t> producer{&resource};
+        auto fut = producer.get_future();
+        producer.set_value(result_t{core::error_t{code, std::pmr::string{"engine said no", &resource}}});
+
+        auto result = await_on_io(std::move(fut), 2000ms, &resource);
+        REQUIRE(result.status() == otterstax::await_status_t::answered);
+        REQUIRE_FALSE(result.timed_out());
+        REQUIRE(result.has_error());
+        REQUIRE(result.error().type == code);
+        REQUIRE(result.error().what == "engine said no");
+    }
+}
+
+TEST_CASE("asio_future_bridge: the poll step starts short and grows after the fast phase") {
+    const auto start = std::chrono::steady_clock::now();
+    otterstax::await_backoff_t backoff(start);
+    // Doubling from the first step to AWAIT_POLL_STEP while the wait is young.
+    CHECK(backoff.next(start) == otterstax::AWAIT_POLL_FIRST_STEP);
+    std::chrono::microseconds step{};
+    for (int i = 0; i < 16; ++i) {
+        step = backoff.next(start + 50ms);
+    }
+    CHECK(step == otterstax::AWAIT_POLL_STEP);
+    // Past AWAIT_FAST_PHASE it doubles on, up to AWAIT_POLL_MAX_STEP.
+    CHECK(backoff.next(start + 150ms) == otterstax::AWAIT_POLL_STEP);
+    CHECK(backoff.next(start + 150ms) == 2 * otterstax::AWAIT_POLL_STEP);
+    for (int i = 0; i < 16; ++i) {
+        step = backoff.next(start + 1s);
+    }
+    CHECK(step == otterstax::AWAIT_POLL_MAX_STEP);
+}
+
+TEST_CASE("asio_future_bridge: a cancelled await ends at once") {
+    // A wire connection's close emits a terminal cancellation into the handler
+    // that awaits its statement: the poll stops waiting and asio ends the
+    // coroutine with operation_aborted at its next co_await.
+    std::pmr::synchronized_pool_resource resource;
+    actor_zeta::promise<result_t> producer{&resource};
+    auto fut = producer.get_future();
+
+    boost::asio::io_context io;
+    boost::asio::cancellation_signal cancel;
+    std::exception_ptr ended;
+    bool completed = false;
+    boost::asio::co_spawn(
+        io,
+        [&]() -> boost::asio::awaitable<void> {
+            [[maybe_unused]] auto r = co_await otterstax::async_await_future<payload_t>(std::move(fut), &resource, 10s);
+        },
+        boost::asio::bind_cancellation_slot(cancel.slot(), [&](std::exception_ptr error) {
+            completed = true;
+            ended = error;
+        }));
+    boost::asio::steady_timer emit(io, 200ms); // well past the fast phase
+    emit.async_wait([&](boost::system::error_code) { cancel.emit(boost::asio::cancellation_type::terminal); });
+
+    const auto start = std::chrono::steady_clock::now();
+    io.run();
+    REQUIRE(completed);
+    CHECK(elapsed_ms_since(start) < 2000);
+    REQUIRE(ended != nullptr);
+    try {
+        std::rethrow_exception(ended);
+    } catch (const boost::system::system_error& e) {
+        CHECK(e.code() == boost::asio::error::operation_aborted);
+    }
+    producer.set_value(result_t{payload_t{"late", &resource}}); // the producer may still answer
 }

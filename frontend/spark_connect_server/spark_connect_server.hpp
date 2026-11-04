@@ -14,6 +14,8 @@ namespace frontend::spark {
 
         void start();
         void stop();
+        // The bound port (tests bind port 0); 0 when not listening.
+        [[nodiscard]] int local_port() const noexcept { return impl_.local_port(); }
 
     private:
         SparkConnectServiceImpl impl_;

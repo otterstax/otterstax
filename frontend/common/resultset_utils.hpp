@@ -6,11 +6,13 @@
 #include "../mysql_server/packet/length_encoded.hpp"
 #include "../mysql_server/packet/packet_writer.hpp"
 #include "../postgres_server/packet/packet_writer.hpp"
+#include "float_text.hpp"
 #include "protocol_config.hpp"
 
 #include <components/types/types.hpp>
 #include <components/vector/data_chunk.hpp>
 
+#include <bit>
 #include <cassert>
 #include <optional>
 #include <string>
@@ -37,7 +39,9 @@ namespace frontend {
     // case for it. The text encoder covers NA, the scalars, DECIMAL, HUGEINT,
     // ENUM, ARRAY, LIST and STRUCT; the binary one NA, the scalars, and
     // DECIMAL/HUGEINT on the MySQL wire alone — which is why this is answered
-    // per frontend and not per type.
+    // per frontend and not per type. What a nested type holds is checked by
+    // find_unsupported_column (every element and field must have a text
+    // rendering of its own).
     template<frontend_type front_type>
     bool is_encodable(components::types::logical_type type, result_encoding encoding);
 
@@ -59,7 +63,7 @@ namespace frontend {
     std::string unsupported_column_message(const unsupported_column& column);
 
     template<frontend_type type>
-    constexpr size_t
+    size_t
     estimate_text_field_size(const components::vector::data_chunk_t& chunk, size_t column_index, size_t row_index);
 
     // The digits of a DECIMAL cell: the stored unscaled integer with the point
@@ -74,11 +78,23 @@ namespace frontend {
     // nothing after the point, with no sentinel among its values.
     std::string
     decimal_to_text(const components::vector::data_chunk_t& chunk, size_t column_index, size_t row_index);
+    // The same rendering of value `index` of a flat DECIMAL / HUGEINT vector (a
+    // nested element's storage, an array's child or a composite's field).
+    std::string decimal_to_text(const components::vector::vector_t& vec, uint64_t index);
 
-    std::string encode_to_text(const components::vector::data_chunk_t& chunk, size_t column_index, size_t row_index);
+    // A cell as text, as `format`'s wire writes it: a BOOLEAN as boolout's t /
+    // f on PostgreSQL (a nested element too), as MySQL's TINYINT(1) 1 / 0; a
+    // FLOAT / DOUBLE (a nested element too) as float_text.hpp says; an ENUM
+    // by its label. An array (LIST / ARRAY) is written as PostgreSQL's
+    // array_out writes it ({a,"b c",NULL}), a composite value (STRUCT) as
+    // record_out ((1,,"a b")), each nested value as its own type writes it.
+    std::string encode_to_text(const components::vector::data_chunk_t& chunk,
+                               size_t column_index,
+                               size_t row_index,
+                               const text_format_t& format);
 
     template<frontend_type front_type>
-    constexpr size_t
+    size_t
     estimate_binary_field_size(const components::vector::data_chunk_t& chunk, size_t column_index, size_t row_index);
 
     template<frontend_type front_type,
@@ -95,23 +111,43 @@ namespace frontend {
             case components::types::logical_type::BOOLEAN:
                 writer.write_uint8(chunk.data[column_index].data<bool>()[row_index] ? 1 : 0);
                 break;
+            // PostgreSQL has no 1-byte or unsigned integer: each goes out at the
+            // width of the type get_field_type names for it (int2, int4, int8),
+            // in the writer's order (PostgreSQL's network order, MySQL's
+            // little-endian).
             case components::types::logical_type::TINYINT:
-                writer.write_uint8(static_cast<uint8_t>(chunk.data[column_index].data<int8_t>()[row_index]));
+                if constexpr (front_type == frontend_type::MYSQL) {
+                    writer.write_uint8(static_cast<uint8_t>(chunk.data[column_index].data<int8_t>()[row_index]));
+                } else {
+                    writer.write_int16(chunk.data[column_index].data<int8_t>()[row_index]);
+                }
                 break;
             case components::types::logical_type::UTINYINT:
-                writer.write_uint8(chunk.data[column_index].data<uint8_t>()[row_index]);
+                if constexpr (front_type == frontend_type::MYSQL) {
+                    writer.write_uint8(chunk.data[column_index].data<uint8_t>()[row_index]);
+                } else {
+                    writer.write_int16(chunk.data[column_index].data<uint8_t>()[row_index]);
+                }
                 break;
             case components::types::logical_type::SMALLINT:
                 writer.write_int16(chunk.data[column_index].data<int16_t>()[row_index]);
                 break;
             case components::types::logical_type::USMALLINT:
-                writer.write_uint16(chunk.data[column_index].data<uint16_t>()[row_index]);
+                if constexpr (front_type == frontend_type::MYSQL) {
+                    writer.write_uint16(chunk.data[column_index].data<uint16_t>()[row_index]);
+                } else {
+                    writer.write_int32(chunk.data[column_index].data<uint16_t>()[row_index]);
+                }
                 break;
             case components::types::logical_type::INTEGER:
                 writer.write_int32(chunk.data[column_index].data<int32_t>()[row_index]);
                 break;
             case components::types::logical_type::UINTEGER:
-                writer.write_uint32(chunk.data[column_index].data<uint32_t>()[row_index]);
+                if constexpr (front_type == frontend_type::MYSQL) {
+                    writer.write_uint32(chunk.data[column_index].data<uint32_t>()[row_index]);
+                } else {
+                    writer.write_int64(chunk.data[column_index].data<uint32_t>()[row_index]);
+                }
                 break;
             case components::types::logical_type::BIGINT:
                 writer.write_int64(chunk.data[column_index].data<int64_t>()[row_index]);
@@ -119,28 +155,23 @@ namespace frontend {
             case components::types::logical_type::UBIGINT:
                 writer.write_uint64(chunk.data[column_index].data<uint64_t>()[row_index]);
                 break;
-            case components::types::logical_type::FLOAT: {
-                float f = chunk.data[column_index].data<float>()[row_index];
-                const uint8_t* ptr = reinterpret_cast<const uint8_t*>(&f);
-                for (int j = 0; j < 4; ++j) {
-                    writer.write_uint8(ptr[j]);
-                }
+            // The IEEE bits in the writer's order: float4send / float8send's
+            // network order, MySQL's float4store / float8store little-endian —
+            // never the host's.
+            case components::types::logical_type::FLOAT:
+                writer.write_uint32(std::bit_cast<uint32_t>(chunk.data[column_index].data<float>()[row_index]));
                 break;
-            }
-            case components::types::logical_type::DOUBLE: {
-                double d = chunk.data[column_index].data<double>()[row_index];
-                const uint8_t* ptr = reinterpret_cast<const uint8_t*>(&d);
-                for (int j = 0; j < 8; ++j) {
-                    writer.write_uint8(ptr[j]);
-                }
+            case components::types::logical_type::DOUBLE:
+                writer.write_uint64(std::bit_cast<uint64_t>(chunk.data[column_index].data<double>()[row_index]));
                 break;
-            }
             case components::types::logical_type::STRING_LITERAL: {
                 if constexpr (front_type == frontend_type::MYSQL) {
                     writer.write_length_encoded_string(
                         std::string(chunk.data[column_index].data<std::string_view>()[row_index]));
                 } else {
-                    writer.write_string_null(std::string(chunk.data[column_index].data<std::string_view>()[row_index]));
+                    // textsend: the bytes alone, as many as the field's length.
+                    writer.write_string_fixed(
+                        std::string(chunk.data[column_index].data<std::string_view>()[row_index]));
                 }
                 break;
             }

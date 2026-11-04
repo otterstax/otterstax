@@ -315,7 +315,7 @@ namespace frontend::spark {
                     message.append("' has a type show() cannot render (logical type ");
                     append_integer(message, static_cast<unsigned>(vector.type().type()));
                     message.push_back(')');
-                    return core::error_t{core::error_code_t::conversion_failure, std::move(message)};
+                    return core::error_t{core::error_code_t::unimplemented_yet, std::move(message)};
                 }
             }
             return core::error_t::no_error();
@@ -376,7 +376,7 @@ namespace frontend::spark {
                 }
                 if (chunk.column_count() != column_count) {
                     return core::error_t{
-                        core::error_code_t::conversion_failure,
+                        core::error_code_t::internal_error,
                         std::pmr::string{"df.show(): the chunks of the result do not hold the same columns", resource}};
                 }
                 for (uint64_t row = 0; row < chunk.size() && data_rows <= rows_shown; ++row, ++data_rows) {

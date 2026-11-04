@@ -6,19 +6,13 @@
 # INSERT VALUES. This is the shape `examples/demo/sql/step_4.sql` proves
 # works end-to-end:
 #
-#   FROM <backend>.<…> c JOIN <local_db>.<table> w ON <string-key>
+#   FROM <alias>.<db>.public.<t> c JOIN <local_schema>.<table> w ON <string-key>
 #
-# Mechanism (full citations in step_4's analysis):
-#   1. Parser drops the local table from `external_nodes`
-#      (otterbrix/parser/parser.cpp:212).
-#   2. `CatalogManager::update_backend_type_impl` sees only the backend → the
-#      query is classified as that single backend, not Mixed.
-#   3. The backend manager fetches just its slice (`generate_select` emits one
-#      table per FROM clause), substitutes the customers/campaigns node with
-#      `make_node_raw_data` (mirrors integration/sql/connection_manager.cpp:162),
-#      and hands the mutated plan to OtterbrixManager.
-#   4. The engine resolves the local side by its stamped `table_oid` against
-#      its own pg_catalog and JOINs raw_data ⋈ engine-resident rows.
+# Mechanism: the engine resolves both tables from its own catalog — the local
+# one in main, the backend one as a table of the connection's database (its
+# four-part name, otterbrix/federation/CLAUDE.md), reads the backend table through
+# its storage's scan (the JOIN is not pushed down: one side is local) and JOINs
+# the two in-process.
 #
 # The previously-disabled version of this test used a bigint JOIN key, which
 # silently dropped every row because of an int width mismatch between the
@@ -36,7 +30,7 @@ from external_helpers import ExternalTableTester
 
 LABEL = "DATA — MySQL wire / JOIN sql backend ⋈ otterbrix-local (string key)"
 
-SQL_BACKEND_TABLE = "campaigns.db1.campaigns"
+SQL_BACKEND_TABLE = "campaigns.db1.public.campaigns"
 INTERNAL_DB = "jotb_local_backend"
 LOCAL_TABLE = "campaign_tags"
 # Pick the first `SAMPLE_SIZE` backend campaigns deterministically via a
@@ -78,17 +72,9 @@ def run(local=False):
         f"expected {SAMPLE_SIZE} backend rows, got {len(sample)}"
     sample_names = {row[1] for row in sample}
 
-    # ── 2. Materialize the local engine database. Plain CREATE TABLE in an
-    #       unknown database errors out; CREATE EXTERNAL TABLE auto-creates the
-    #       db as a side effect, so we use a throwaway external table as the
-    #       bootstrap and immediately drop it. The drop only removes the
-    #       table — the engine database stays so the CREATE TABLE below can
-    #       reuse it.
-    cur.execute(
-        f"CREATE EXTERNAL TABLE {INTERNAL_DB}._bootstrap "
-        f"WITH (location = '/fixtures/people.csv', format = 'csv');"
-    )
-    cur.execute(f"drop table {INTERNAL_DB}._bootstrap")
+    # ── 2. The local schema (a schema of the session's database, main):
+    #       a two-part CREATE TABLE needs it to exist.
+    tester.ensure_schema(cur, INTERNAL_DB)
 
     # ── 3. CREATE TABLE + INSERT VALUES into otterbrix-internal storage.
     #       Both JOIN-key columns are strings, mirroring step_4's
@@ -144,7 +130,7 @@ def run(local=False):
 
     print(f"  ✓ {SQL_BACKEND_TABLE} ⋈ {INTERNAL_DB}.{LOCAL_TABLE} "
           f"on campaign_name (string=string) → {len(rows)} rows; "
-          f"backend slice fetched, raw_data ⋈ engine-resident table executed in otterbrix")
+          f"backend table read through its federation scan, JOINed in the engine")
 
     conn.close()
     tester.cleanup()

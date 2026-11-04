@@ -33,7 +33,7 @@ namespace otterstax::kafka::detail {
                                  const components::cursor::cursor_t_ptr& cursor,
                                  const char* step) {
             if (!cursor) {
-                return core::error_t(core::error_code_t::other_error,
+                return core::error_t(core::error_code_t::internal_error,
                                      std::pmr::string{std::string{step} + ": no reply from the engine", resource});
             }
             if (cursor->is_error()) {
@@ -47,27 +47,25 @@ namespace otterstax::kafka::detail {
 
     core::error_t ingest_at_least_once(actor_zeta::address_t dispatcher_address,
                                        std::pmr::memory_resource* resource,
-                                       const std::string& database,
-                                       const std::string& table,
+                                       const qualified_name_t& table,
                                        components::vector::data_chunk_t chunk) {
         OTX_ZONE_N("kafka::poller::ingest_at_least_once");
         if (chunk.size() == 0) {
             return core::error_t::no_error();
         }
         return step_error(resource,
-                          drive(kafka_insert(dispatcher_address, resource, database, table, std::move(chunk))),
+                          drive(kafka_insert(dispatcher_address, resource, table, std::move(chunk))),
                           "insert");
     }
 
     core::error_t ingest_transactional(actor_zeta::address_t dispatcher_address,
                                        std::pmr::memory_resource* resource,
-                                       const std::string& database,
-                                       const std::string& table,
+                                       const qualified_name_t& table,
+                                       const qualified_name_t& offsets_table,
                                        const std::map<int32_t, int64_t>& next_offsets,
                                        components::vector::data_chunk_t chunk) {
         OTX_ZONE_N("kafka::poller::ingest_transactional");
         const auto session = components::session::session_id_t::generate_uid();
-        const std::string offsets_table = table + "__offsets";
 
         auto error = step_error(resource,
                                 drive(kafka_query_session(dispatcher_address, resource, session, "BEGIN;")),
@@ -76,7 +74,7 @@ namespace otterstax::kafka::detail {
         if (began && chunk.size() > 0) {
             error = step_error(
                 resource,
-                drive(kafka_insert_session(dispatcher_address, resource, session, database, table, std::move(chunk))),
+                drive(kafka_insert_session(dispatcher_address, resource, session, table, std::move(chunk))),
                 "insert");
         }
         if (!error.contains_error()) {
@@ -84,7 +82,6 @@ namespace otterstax::kafka::detail {
                                drive(write_offsets_session(dispatcher_address,
                                                            resource,
                                                            session,
-                                                           database,
                                                            offsets_table,
                                                            next_offsets)),
                                "offsets insert");
@@ -102,9 +99,8 @@ namespace otterstax::kafka::detail {
                                        "ROLLBACK");
             if (rollback.contains_error()) {
                 get_logger(logger_tag::KAFKA_MANAGER)
-                    ->error("kafka poller: rollback for '{}.{}' failed (code {}): {}",
-                            database,
-                            table,
+                    ->error("kafka poller: rollback for '{}' failed (code {}): {}",
+                            table.to_string(),
                             static_cast<int32_t>(rollback.type),
                             rollback.what.c_str());
             }
@@ -114,15 +110,15 @@ namespace otterstax::kafka::detail {
 
     kafka_poller_t::kafka_poller_t(actor_zeta::address_t dispatcher_address,
                                    std::pmr::memory_resource* resource,
-                                   std::string database,
-                                   std::string table,
+                                   qualified_name_t table,
+                                   qualified_name_t offsets_table,
                                    std::vector<kafka_column_t> columns,
                                    kafka_consumer_t consumer,
                                    bool transactional) noexcept
         : dispatcher_address_(std::move(dispatcher_address))
         , resource_(resource)
-        , database_(std::move(database))
         , table_(std::move(table))
+        , offsets_table_(std::move(offsets_table))
         , columns_(std::move(columns))
         , transactional_(transactional)
         , consumer_(std::move(consumer)) {
@@ -161,12 +157,12 @@ namespace otterstax::kafka::detail {
                 }
                 error = ingest_transactional(dispatcher_address_,
                                              resource_,
-                                             database_,
                                              table_,
+                                             offsets_table_,
                                              next_offsets,
                                              std::move(chunk));
             } else {
-                error = ingest_at_least_once(dispatcher_address_, resource_, database_, table_, std::move(chunk));
+                error = ingest_at_least_once(dispatcher_address_, resource_, table_, std::move(chunk));
             }
 
             if (error.contains_error()) {
@@ -174,11 +170,10 @@ namespace otterstax::kafka::detail {
                 // the next poll re-delivers it, and back off before retrying
                 ++consecutive_failures_;
                 get_logger(logger_tag::KAFKA_MANAGER)
-                    ->error("kafka poller: batch of {} record(s) for '{}.{}' failed (code {}): {}; rewinding, "
+                    ->error("kafka poller: batch of {} record(s) for '{}' failed (code {}): {}; rewinding, "
                             "retry #{} in {} ms",
                             records.size(),
-                            database_,
-                            table_,
+                            table_.to_string(),
                             static_cast<int32_t>(error.type),
                             error.what.c_str(),
                             consecutive_failures_,
@@ -186,7 +181,7 @@ namespace otterstax::kafka::detail {
                 // A failed seek is non-fatal — restart's table-seek still resumes
                 if (auto seek = consumer_.seek_to_batch_start(records); seek.contains_error()) {
                     get_logger(logger_tag::KAFKA_MANAGER)
-                        ->error("kafka poller: rewind for '{}.{}' failed: {}", database_, table_, seek.what.c_str());
+                        ->error("kafka poller: rewind for '{}' failed: {}", table_.to_string(), seek.what.c_str());
                 }
                 pause_after_failure();
                 continue;

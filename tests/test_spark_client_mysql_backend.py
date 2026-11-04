@@ -6,9 +6,9 @@ E2E test: Spark Connect (port 15002) frontend querying a MySQL/MariaDB backend.
 
 Exercises both supported execution paths through the OtterStax Spark Connect server:
   * Path A — spark.sql("...") passes the federated SQL string straight through to
-    the Scheduler, which resolves the `campaigns` alias to the MariaDB backend.
+    the query session, which resolves the `campaigns` alias to the MariaDB backend.
   * Path B — DataFrame ops (filter/select) build a logical plan in the
-    plan_translator and run through the same Scheduler pipeline.
+    plan_translator and run through the same query-session pipeline.
 
 Usage:
     python test_spark_client_mysql_backend.py            # docker (host=test-otterstax)
@@ -31,7 +31,7 @@ def main(local=False):
     print(f"# Spark Connect Client - MySQL Backend Tests")
     print(f"{'#'*70}")
     print(f"Connecting to Spark Connect server at: sc://{host}:{port}")
-    print(f"Target: MySQL backend (campaigns.db1.campaigns)")
+    print(f"Target: MySQL backend (campaigns.db1.public.campaigns)")
     print(f"{'#'*70}\n")
 
     spark = SparkSession.builder.remote(f"sc://{host}:{port}").getOrCreate()
@@ -52,7 +52,7 @@ def main(local=False):
     print(f"\n{'='*70}")
     print("Running: Test 1 - spark.sql() SQL pass-through")
     print(f"{'='*70}")
-    df = spark.sql("SELECT * FROM campaigns.db1.campaigns LIMIT 5")
+    df = spark.sql("SELECT * FROM campaigns.db1.public.campaigns LIMIT 5")
     rows = df.collect()
     assert len(rows) == 5, f"Expected 5 rows, got {len(rows)}"
     print(f"  ✅ Got {len(rows)} rows")
@@ -63,7 +63,7 @@ def main(local=False):
     print(f"\n{'='*70}")
     print("Running: Test 2 - DataFrame.filter().select() (Path B)")
     print(f"{'='*70}")
-    df2 = (spark.sql("SELECT * FROM campaigns.db1.campaigns")
+    df2 = (spark.sql("SELECT * FROM campaigns.db1.public.campaigns")
            .filter("budget > 0")
            .select("campaign_name", "budget"))
     rows2 = df2.collect()

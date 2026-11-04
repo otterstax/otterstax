@@ -9,9 +9,14 @@
 namespace config {
 
 // Plain-data descriptors for the connection config file. These carry no
-// connector dependencies; the ComponentManager converts them into the
-// connector-specific parameter structs when it registers connections at
+// connector dependencies; remote_backends_t::open (backends) and
+// backends::register_s3_aliases (s3) convert them into the
+// connector-specific parameter structs when they register connections at
 // startup.
+
+// The connections kept open to a backend whose entry names no `pool_size`: a transaction block holds
+// one of them from its first statement to its end, so four blocks of one connection run at once.
+inline constexpr int default_pool_size = 4;
 
 struct MysqlConnectionDesc {
     std::string alias;
@@ -21,6 +26,7 @@ struct MysqlConnectionDesc {
     std::string password;
     std::string database;
     std::string table;
+    int pool_size = default_pool_size;  // optional; connections kept open to the backend, >= 1
 };
 
 struct PgConnectionDesc {
@@ -30,8 +36,9 @@ struct PgConnectionDesc {
     std::string username;
     std::string password;
     std::string database;
-    std::string schema{"public"};  // PostgreSQL schema, defaults to "public"
+    std::string schema;  // PostgreSQL schema; empty: every user schema of the database
     std::string table;
+    int pool_size = default_pool_size;  // optional; connections kept open to the backend, >= 1
 };
 
 struct ChConnectionDesc {
@@ -42,6 +49,7 @@ struct ChConnectionDesc {
     std::string password;
     std::string database;
     std::string table;
+    int pool_size = default_pool_size;  // optional; connections kept open to the backend, >= 1
 };
 
 struct S3CredentialDesc {
@@ -63,8 +71,8 @@ struct ConnectionsConfig {
 };
 
 // Startup retry policy for opening remote backend connections. A slow backend
-// (e.g. a DB still booting) makes the eager connect in addConnection throw; the
-// registrar retries up to max_attempts, sleeping delay_ms between tries.
+// (e.g. a DB still booting) fails the connect or the discovery of the startup;
+// remote_backends_t::open retries up to max_attempts, sleeping delay_ms between tries.
 // max_attempts <= 1 means a single attempt (no retry). Applies to
 // mysql/postgresql/clickhouse — s3 aliases are only stored, not opened.
 struct ConnectionRetryConfig {

@@ -116,17 +116,16 @@ pool independently so concurrent workers hit different queries.
 
 ### Valid `query_pool` keys
 
-| Key | Description | Typical latency |
-| --- | ----------- | --------------- |
-| `simple_select` | `LIMIT 100` point reads across all 6 backends | 2–50 ms |
-| `complex_select` | `GROUP BY + HAVING + ORDER BY LIMIT 1000` | 5–55 ms |
-| `join_same_b` | Same-instance join, Group B only (~5 k rows) | 1–3 s |
-| `join_same_instance` | Same-instance join, both groups (up to 60 k rows) | 3–9 s |
-| `join_cross_engine` | Cross-engine join, Group B tables | 3–5 s |
+| Key | Description |
+| --- | ----------- |
+| `simple_select` | `LIMIT 100` point reads across all 6 backends |
+| `complex_select` | `GROUP BY + HAVING + ORDER BY LIMIT 1000` |
+| `join_same_b` | Same-instance join, Group B only (~5 k rows) |
+| `join_same_instance` | Same-instance join, both groups (up to 60 k rows) |
+| `join_cross_engine` | Cross-engine join, Group B tables |
 
-> **`join_all` is not available as a pool key.** A single `join_all` query takes 47–90 s
-> (full-table scan, no predicate pushdown) and would make per-stage statistics
-> uninterpretable.
+> **`join_all` is not available as a pool key.** It is left out of the stress pool so
+> that one long query does not dominate the per-stage statistics.
 
 ---
 
@@ -150,9 +149,9 @@ Each `*_results.json` includes a `by_query_type` field:
 ```json
 {
   "by_query_type": {
-    "simple_select":   { "count": 312, "qps": 5.2, "p50_ms": 18.4, "p95_ms": 42.1, "p99_ms": 61.3 },
-    "complex_select":  { "count": 305, "qps": 5.1, "p50_ms": 25.7, "p95_ms": 58.0, "p99_ms": 79.2 },
-    "join_same_b":     { "count": 41,  "qps": 0.7, "p50_ms": 1340, "p95_ms": 2100, "p99_ms": 2800 },
+    "simple_select":     { "count": <n>, "qps": <qps>, "p50_ms": <ms>, "p95_ms": <ms>, "p99_ms": <ms> },
+    "complex_select":    { ... },
+    "join_same_b":       { ... },
     "join_cross_engine": { ... }
   }
 }
@@ -227,7 +226,7 @@ CLI entry point.  Parses args → loads profile or builds defaults → loops ove
    ./benchmark/stress/run_stress_benchmarks.sh --no-init -p benchmark/stress/profiles/my_profile.yaml
    ```
 
-   (`--no-init` reuses existing DB data so you skip the ~2 min initialisation step.)
+   (`--no-init` reuses existing DB data so you skip the initialisation step.)
 
 ## Adding a new query category
 

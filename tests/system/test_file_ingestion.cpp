@@ -2,14 +2,13 @@
 // Copyright 2025-2026  OtterStax
 
 #include "frontend/common/asio_future_bridge.hpp"
-#include "scheduler_stack.hpp"
-#include "integration/otterbrix/otterbrix_manager.hpp"
+#include "../mock/cell.hpp"
+#include "session_stack.hpp"
 #include "integration/s3/s3_manager.hpp"
-#include "otterbrix/operators/execute_plan.hpp"
+#include "otterbrix/operators/engine_requests.hpp"
 #include "otterbrix/parser/parser.hpp"
 #include "connectors/file/manager.hpp"
 #include "connectors/s3/manager.hpp"
-#include "scheduler/scheduler.hpp"
 #include "utility/logger.hpp"
 #include "utility/session.hpp"
 
@@ -18,7 +17,6 @@
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/detached.hpp>
 #include <boost/asio/io_context.hpp>
-#include <otterbrix/otterbrix.hpp>
 
 #include <chrono>
 #include <thread>
@@ -39,7 +37,6 @@
 
 namespace {
 
-using otterstax::test::init_test_otterbrix;
 
 void write_test_parquet(const std::string& path) {
     arrow::Int32Builder  id_b;
@@ -93,53 +90,58 @@ void write_test_ndjson(const std::string& path) {
       << "{\"id\":5,\"name\":\"Eve\"}\n";
 }
 
-// dump_file now takes a pre-parsed statement instead of database/table; build a
-// "SELECT * FROM <db>.<tbl>" plan to reproduce the old whole-table dump.
-OtterbrixStatementPtr select_all(std::pmr::memory_resource* res,
-                                 const std::string& db, const std::string& tbl) {
-    auto parser = make_parser(res, no_aliases());
-    auto parsed = parser->parse("SELECT * FROM " + db + "." + tbl + ";");
-    REQUIRE_FALSE(parsed.has_error());
-    return std::move(parsed.value()->otterbrix_params);
+// The load behind CREATE EXTERNAL TABLE, the session's steps on the test's
+// engine session: the file read by the file manager, the table created from its
+// columns and the rows inserted (one transaction of its own).
+core::result_wrapper_t<bool> load_into(otterstax::test::test_engine_t& engine,
+                                       const actor_zeta::address_t& file_manager,
+                                       conn::file::FileLoadParams params,
+                                       const qualified_name_t& target) {
+    auto read = actor_zeta::send(file_manager, &conn::file::FileManager::load_file, session_hash_t{1}, std::move(params))
+                    .second.take_ready();
+    if (read.has_error()) {
+        return read.convert_error<bool>();
+    }
+    auto create = otterstax::engine::create_table_plan(engine.resource(), target, read.value());
+    if (create.has_error()) {
+        return create.convert_error<bool>();
+    }
+    auto cursor = engine.drive(otterstax::engine::load_table(engine.resource(),
+                                                             engine.dispatcher(),
+                                                             engine.session(),
+                                                             std::move(create.value()),
+                                                             target,
+                                                             std::move(read.value()),
+                                                             /*own_block=*/true));
+    if (cursor->is_error()) {
+        return core::error_t(cursor->get_error().type,
+                             std::pmr::string{cursor->get_error().what.c_str(), engine.resource()});
+    }
+    return true;
 }
 
-} // namespace
+conn::file::FileLoadParams load_params(const std::string& path, const std::string& format) {
+    conn::file::FileLoadParams params;
+    params.path   = path;
+    params.format = format;
+    return params;
+}
 
+// main.public.<table>: a one-part name from the test session's default place.
+qualified_name_t people_table(const std::string& table = "people") {
+    return qualified_name_t{core::relname_t{table}};
+}
 
-TEST_CASE("FileManager: parquet ingestion and SELECT") {
-    const std::string db       = "FileIngestionDb";
-    const std::string tbl      = "People";
-    const std::string parquet  = "/tmp/test_file_ingestion.parquet";
-    const std::string data_dir = "/tmp/test_file_ingestion_otterbrix";
-
+// Loads `path` into main.public.people and reads it back.
+void require_loaded(const std::string& path, const std::string& format, const std::string& data_dir) {
     std::filesystem::remove_all(data_dir);
-    write_test_parquet(parquet);
+    auto otterbrix = std::make_unique<otterstax::test::test_engine_t>(data_dir);
+    auto file_manager = actor_zeta::spawn<conn::file::FileManager>(otterbrix->resource());
 
-    db::otterbrix_engine_ptr otterbrix = init_test_otterbrix(data_dir);
-    auto resource = otterbrix->dispatcher()->resource();
-
-    auto otterbrix_manager =
-        actor_zeta::spawn<db::OtterbrixManager>(resource, make_otterbrix_manager(otterbrix));
-    auto file_manager =
-        actor_zeta::spawn<conn::file::FileManager>(resource, otterbrix_manager->address());
-
-    conn::file::FileAddParams params;
-    params.database = db;
-    params.table    = tbl;
-    params.path     = parquet;
-    params.format   = "parquet";
-
-    auto res = actor_zeta::send(file_manager->address(),
-                                &conn::file::FileManager::add_file, session_id().hash(),
-                                std::move(params))
-                   .second.take_ready();
+    auto res = load_into(*otterbrix, file_manager->address(), load_params(path, format), people_table());
+    INFO("load: " << (res.has_error() ? res.error().what.c_str() : "ok"));
     REQUIRE_FALSE(res.has_error());
-    REQUIRE(res.value() == true);
-
-    session_id session;
-    auto cur = otterbrix->dispatcher()->execute_sql(
-        session, "SELECT * FROM " + db + "." + tbl + ";");
-
+    auto cur = otterbrix->sql("SELECT * FROM people;");
     REQUIRE(cur->is_success());
     REQUIRE(cur->size() == 5);
     REQUIRE(cur->chunks().front().column_count() == 2);
@@ -148,116 +150,102 @@ TEST_CASE("FileManager: parquet ingestion and SELECT") {
     // checkpoint that writes to data_dir; removing it first causes a SIGSEGV.
     cur.reset();
     file_manager.reset();
-    otterbrix_manager.reset();
     otterbrix.reset();
-
-    std::filesystem::remove(parquet);
     std::filesystem::remove_all(data_dir);
+}
+
+// The rows of a loaded run, and the columns its chunks share.
+uint64_t rows_of(const std::pmr::vector<components::vector::data_chunk_t>& run) {
+    uint64_t rows = 0;
+    for (const auto& chunk : run) {
+        rows += chunk.size();
+    }
+    return rows;
+}
+
+uint64_t columns_of(const std::pmr::vector<components::vector::data_chunk_t>& run) {
+    return run.empty() ? 0 : run.front().column_count();
+}
+
+// Loads `src` into main.public.people (when the table is not there yet) and
+// dumps SELECT * of it to `out` in `format` — or to `output` when it is set.
+void load_and_dump(otterstax::test::test_engine_t& engine,
+                   const actor_zeta::address_t& file_manager,
+                   const std::string& src,
+                   const std::string& out,
+                   conn::file::FileFormat format,
+                   tsl::output_stream_t output = {}) {
+    auto rows = engine.sql("SELECT * FROM people;");
+    if (rows->is_error()) {
+        auto loaded = load_into(engine, file_manager, load_params(src, "auto"), people_table());
+        INFO("load: " << (loaded.has_error() ? loaded.error().what.c_str() : "ok"));
+        REQUIRE_FALSE(loaded.has_error());
+        rows = engine.sql("SELECT * FROM people;");
+    }
+    REQUIRE(rows->is_success());
+    auto dump_res = actor_zeta::send(file_manager,
+                                     &conn::file::FileManager::dump_file,
+                                     session_hash_t{1},
+                                     conn::file::FileMetadata{std::move(rows), out, format, std::move(output)})
+                        .second.take_ready();
+    INFO("dump: " << (dump_res.has_error() ? dump_res.error().what.c_str() : "ok"));
+    REQUIRE_FALSE(dump_res.has_error());
+    REQUIRE(dump_res.value());
+}
+
+} // namespace
+
+
+TEST_CASE("FileManager: parquet ingestion and SELECT") {
+    const std::string parquet = "/tmp/test_file_ingestion.parquet";
+    write_test_parquet(parquet);
+    require_loaded(parquet, "parquet", "/tmp/test_file_ingestion_otterbrix");
+    std::filesystem::remove(parquet);
 }
 
 TEST_CASE("FileManager: csv ingestion and SELECT") {
-    const std::string db       = "FileIngestionCsvDb";
-    const std::string tbl      = "People";
-    const std::string csv      = "/tmp/test_file_ingestion.csv";
-    const std::string data_dir = "/tmp/test_file_ingestion_csv_otterbrix";
-
-    std::filesystem::remove_all(data_dir);
+    const std::string csv = "/tmp/test_file_ingestion.csv";
     write_test_csv(csv);
-
-    db::otterbrix_engine_ptr otterbrix = init_test_otterbrix(data_dir);
-    auto resource = otterbrix->dispatcher()->resource();
-
-    auto otterbrix_manager =
-        actor_zeta::spawn<db::OtterbrixManager>(resource, make_otterbrix_manager(otterbrix));
-    auto file_manager =
-        actor_zeta::spawn<conn::file::FileManager>(resource, otterbrix_manager->address());
-
-    conn::file::FileAddParams params;
-    params.database = db;
-    params.table    = tbl;
-    params.path     = csv;
-    params.format   = "csv";
-
-    auto res = actor_zeta::send(file_manager->address(),
-                                &conn::file::FileManager::add_file, session_id().hash(),
-                                std::move(params))
-                   .second.take_ready();
-    REQUIRE_FALSE(res.has_error());
-    REQUIRE(res.value() == true);
-
-    session_id session;
-    auto cur = otterbrix->dispatcher()->execute_sql(
-        session, "SELECT * FROM " + db + "." + tbl + ";");
-
-    REQUIRE(cur->is_success());
-    REQUIRE(cur->size() == 5);
-    REQUIRE(cur->chunks().front().column_count() == 2);
-
-    cur.reset();
-    file_manager.reset();
-    otterbrix_manager.reset();
-    otterbrix.reset();
-
+    require_loaded(csv, "csv", "/tmp/test_file_ingestion_csv_otterbrix");
     std::filesystem::remove(csv);
-    std::filesystem::remove_all(data_dir);
 }
 
 TEST_CASE("FileManager: ndjson ingestion and SELECT") {
-    const std::string db       = "FileIngestionJsonDb";
-    const std::string tbl      = "People";
-    const std::string ndjson   = "/tmp/test_file_ingestion.ndjson";
-    const std::string data_dir = "/tmp/test_file_ingestion_json_otterbrix";
-
-    std::filesystem::remove_all(data_dir);
+    const std::string ndjson = "/tmp/test_file_ingestion.ndjson";
     write_test_ndjson(ndjson);
-
-    db::otterbrix_engine_ptr otterbrix = init_test_otterbrix(data_dir);
-    auto resource = otterbrix->dispatcher()->resource();
-
-    auto otterbrix_manager =
-        actor_zeta::spawn<db::OtterbrixManager>(resource, make_otterbrix_manager(otterbrix));
-    auto file_manager =
-        actor_zeta::spawn<conn::file::FileManager>(resource, otterbrix_manager->address());
-
-    conn::file::FileAddParams params;
-    params.database = db;
-    params.table    = tbl;
-    params.path     = ndjson;
-    params.format   = "ndjson";
-
-    auto res = actor_zeta::send(file_manager->address(),
-                                &conn::file::FileManager::add_file, session_id().hash(),
-                                std::move(params))
-                   .second.take_ready();
-    REQUIRE_FALSE(res.has_error());
-    REQUIRE(res.value() == true);
-
-    session_id session;
-    auto cur = otterbrix->dispatcher()->execute_sql(
-        session, "SELECT * FROM " + db + "." + tbl + ";");
-
-    REQUIRE(cur->is_success());
-    REQUIRE(cur->size() == 5);
-    REQUIRE(cur->chunks().front().column_count() == 2);
-
-    cur.reset();
-    file_manager.reset();
-    otterbrix_manager.reset();
-    otterbrix.reset();
-
+    require_loaded(ndjson, "ndjson", "/tmp/test_file_ingestion_json_otterbrix");
     std::filesystem::remove(ndjson);
+}
+
+TEST_CASE("FileManager: a file that is not there is io_error and nothing is created") {
+    const std::string data_dir = "/tmp/test_file_ingestion_missing_otterbrix";
+    std::filesystem::remove_all(data_dir);
+    auto otterbrix = std::make_unique<otterstax::test::test_engine_t>(data_dir);
+    auto file_manager = actor_zeta::spawn<conn::file::FileManager>(otterbrix->resource());
+
+    {
+        // The error's text lives on the engine's resource: it goes before the engine.
+        auto res = load_into(*otterbrix,
+                             file_manager->address(),
+                             load_params("/tmp/test_file_ingestion_not_there.csv", "csv"),
+                             people_table());
+        REQUIRE(res.has_error());
+        CHECK(res.error().type == core::error_code_t::io_error);
+        CHECK(otterbrix->sql("SELECT * FROM people;")->is_error());
+    }
+
+    file_manager.reset();
+    otterbrix.reset();
     std::filesystem::remove_all(data_dir);
 }
 
 // ── dump tests ────────────────────────────────────────────────────────────────
-// Each dump test: ingest a file → dump_file → verify the output file exists and
-// re-reads correctly via the input translator (no second otterbrix needed).
+// Each dump test: load a file → dump_file of a SELECT's rows → verify the output
+// file exists and re-reads correctly via the input translator.
 
 TEST_CASE("FileManager: parquet dump and re-read") {
-    const std::string db       = "DumpParquetDb";
-    const std::string tbl      = "People";
     const std::string parquet  = "/tmp/test_dump.parquet";
-    const std::string out       = "/tmp/test_dump_out.parquet";
+    const std::string out      = "/tmp/test_dump_out.parquet";
     const std::string data_dir = "/tmp/test_dump_parquet_otterbrix";
 
     std::filesystem::remove_all(data_dir);
@@ -265,35 +253,12 @@ TEST_CASE("FileManager: parquet dump and re-read") {
     std::filesystem::remove(out);
     write_test_parquet(parquet);
 
-    db::otterbrix_engine_ptr otterbrix = init_test_otterbrix(data_dir);
-    auto resource = otterbrix->dispatcher()->resource();
-
-    auto otterbrix_manager =
-        actor_zeta::spawn<db::OtterbrixManager>(resource, make_otterbrix_manager(otterbrix));
-    auto file_manager =
-        actor_zeta::spawn<conn::file::FileManager>(resource, otterbrix_manager->address());
-
-    conn::file::FileAddParams params;
-    params.database = db;
-    params.table    = tbl;
-    params.path     = parquet;
-    params.format   = "parquet";
-
-    auto add_res = actor_zeta::send(file_manager->address(),
-                                    &conn::file::FileManager::add_file, session_id().hash(),
-                                    std::move(params))
-                       .second.take_ready();
-    REQUIRE_FALSE(add_res.has_error());
-    REQUIRE(add_res.value() == true);
+    auto otterbrix = std::make_unique<otterstax::test::test_engine_t>(data_dir);
+    auto resource = otterbrix->resource();
+    auto file_manager = actor_zeta::spawn<conn::file::FileManager>(resource);
 
     // File dump: written to the exact path requested.
-    auto dump_res = actor_zeta::send(file_manager->address(),
-                                     &conn::file::FileManager::dump_file, session_id().hash(),
-                                     conn::file::FileMetadata{select_all(resource, db, tbl), out,
-                                                                  conn::file::FileFormat::Parquet})
-                        .second.take_ready();
-    REQUIRE_FALSE(dump_res.has_error());
-    REQUIRE(dump_res.value());
+    load_and_dump(*otterbrix, file_manager->address(), parquet, out, conn::file::FileFormat::Parquet);
     const std::string& dumped = out;
     REQUIRE(std::filesystem::exists(dumped));
 
@@ -303,35 +268,31 @@ TEST_CASE("FileManager: parquet dump and re-read") {
     {
         auto loaded = tsl::parquet_to_chunk(resource, dumped);
         REQUIRE_FALSE(loaded.has_error());
-        REQUIRE(loaded.value().size() == 5);
-        REQUIRE(loaded.value().column_count() == 2);
+        REQUIRE(rows_of(loaded.value()) == 5);
+        REQUIRE(columns_of(loaded.value()) == 2);
     }
 
     // Stream dump (the S3 upload path): the rows go to the given stream, nothing is
-    // written at `path`, and the stream is left open for the sender to commit.
+    // written at `path`, and the file manager publishes (closes) the stream once the
+    // whole result is written.
     {
+        // The test keeps Arrow's own handle to read the bytes back.
         auto sink = arrow::io::BufferOutputStream::Create().ValueOrDie();
         const std::string label = "/tmp/test_dump_stream_label.parquet";
         std::filesystem::remove(label);
-        auto stream_res = actor_zeta::send(file_manager->address(),
-                                           &conn::file::FileManager::dump_file, session_id().hash(),
-                                           conn::file::FileMetadata{select_all(resource, db, tbl), label,
-                                                                    conn::file::FileFormat::Parquet, sink})
-                              .second.take_ready();
-        REQUIRE_FALSE(stream_res.has_error());
-        REQUIRE(stream_res.value());
+        load_and_dump(*otterbrix, file_manager->address(), parquet, label, conn::file::FileFormat::Parquet,
+                      tsl::output_stream_t{sink});
         REQUIRE_FALSE(std::filesystem::exists(label));
-        REQUIRE_FALSE(sink->closed());
+        REQUIRE(sink->closed());
 
         auto bytes = sink->Finish().ValueOrDie();
         auto loaded = tsl::parquet_to_chunk(resource, bytes->data(), static_cast<size_t>(bytes->size()));
         REQUIRE_FALSE(loaded.has_error());
-        REQUIRE(loaded.value().size() == 5);
-        REQUIRE(loaded.value().column_count() == 2);
+        REQUIRE(rows_of(loaded.value()) == 5);
+        REQUIRE(columns_of(loaded.value()) == 2);
     }
 
     file_manager.reset();
-    otterbrix_manager.reset();
     otterbrix.reset();
 
     std::filesystem::remove(parquet);
@@ -340,10 +301,8 @@ TEST_CASE("FileManager: parquet dump and re-read") {
 }
 
 TEST_CASE("FileManager: csv dump and re-read") {
-    const std::string db       = "DumpCsvDb";
-    const std::string tbl      = "People";
     const std::string csv      = "/tmp/test_dump.csv";
-    const std::string out       = "/tmp/test_dump_out.csv";
+    const std::string out      = "/tmp/test_dump_out.csv";
     const std::string data_dir = "/tmp/test_dump_csv_otterbrix";
 
     std::filesystem::remove_all(data_dir);
@@ -351,49 +310,21 @@ TEST_CASE("FileManager: csv dump and re-read") {
     std::filesystem::remove(out);
     write_test_csv(csv);
 
-    db::otterbrix_engine_ptr otterbrix = init_test_otterbrix(data_dir);
-    auto resource = otterbrix->dispatcher()->resource();
+    auto otterbrix = std::make_unique<otterstax::test::test_engine_t>(data_dir);
+    auto resource = otterbrix->resource();
+    auto file_manager = actor_zeta::spawn<conn::file::FileManager>(resource);
 
-    auto otterbrix_manager =
-        actor_zeta::spawn<db::OtterbrixManager>(resource, make_otterbrix_manager(otterbrix));
-    auto file_manager =
-        actor_zeta::spawn<conn::file::FileManager>(resource, otterbrix_manager->address());
-
-    conn::file::FileAddParams params;
-    params.database = db;
-    params.table    = tbl;
-    params.path     = csv;
-    params.format   = "csv";
-
-    auto add_res = actor_zeta::send(file_manager->address(),
-                                    &conn::file::FileManager::add_file, session_id().hash(),
-                                    std::move(params))
-                       .second.take_ready();
-    REQUIRE_FALSE(add_res.has_error());
-    REQUIRE(add_res.value() == true);
-
-    auto dump_res = actor_zeta::send(file_manager->address(),
-                                     &conn::file::FileManager::dump_file, session_id().hash(),
-                                     conn::file::FileMetadata{select_all(resource, db, tbl), out,
-                                                                  conn::file::FileFormat::CSV})
-                        .second.take_ready();
-    REQUIRE_FALSE(dump_res.has_error());
-    REQUIRE(dump_res.value());
+    load_and_dump(*otterbrix, file_manager->address(), csv, out, conn::file::FileFormat::CSV);
     const std::string& dumped = out;
     REQUIRE(std::filesystem::exists(dumped));
-
-    // Verify dumped file content via the input translator.
-    // Scope the chunk so its pmr-backed buffers are released before we tear
-    // down otterbrix (which owns the resource the chunk was allocated from).
     {
         auto loaded = tsl::csv_to_chunk(resource, dumped, ',', /*has_header=*/true);
         REQUIRE_FALSE(loaded.has_error());
-        REQUIRE(loaded.value().size() == 5);
-        REQUIRE(loaded.value().column_count() == 2);
+        REQUIRE(rows_of(loaded.value()) == 5);
+        REQUIRE(columns_of(loaded.value()) == 2);
     }
 
     file_manager.reset();
-    otterbrix_manager.reset();
     otterbrix.reset();
 
     std::filesystem::remove(csv);
@@ -402,10 +333,8 @@ TEST_CASE("FileManager: csv dump and re-read") {
 }
 
 TEST_CASE("FileManager: ndjson dump and re-read") {
-    const std::string db       = "DumpJsonDb";
-    const std::string tbl      = "People";
     const std::string ndjson   = "/tmp/test_dump.ndjson";
-    const std::string out       = "/tmp/test_dump_out.ndjson";
+    const std::string out      = "/tmp/test_dump_out.ndjson";
     const std::string data_dir = "/tmp/test_dump_json_otterbrix";
 
     std::filesystem::remove_all(data_dir);
@@ -413,49 +342,21 @@ TEST_CASE("FileManager: ndjson dump and re-read") {
     std::filesystem::remove(out);
     write_test_ndjson(ndjson);
 
-    db::otterbrix_engine_ptr otterbrix = init_test_otterbrix(data_dir);
-    auto resource = otterbrix->dispatcher()->resource();
+    auto otterbrix = std::make_unique<otterstax::test::test_engine_t>(data_dir);
+    auto resource = otterbrix->resource();
+    auto file_manager = actor_zeta::spawn<conn::file::FileManager>(resource);
 
-    auto otterbrix_manager =
-        actor_zeta::spawn<db::OtterbrixManager>(resource, make_otterbrix_manager(otterbrix));
-    auto file_manager =
-        actor_zeta::spawn<conn::file::FileManager>(resource, otterbrix_manager->address());
-
-    conn::file::FileAddParams params;
-    params.database = db;
-    params.table    = tbl;
-    params.path     = ndjson;
-    params.format   = "ndjson";
-
-    auto add_res = actor_zeta::send(file_manager->address(),
-                                    &conn::file::FileManager::add_file, session_id().hash(),
-                                    std::move(params))
-                       .second.take_ready();
-    REQUIRE_FALSE(add_res.has_error());
-    REQUIRE(add_res.value() == true);
-
-    auto dump_res = actor_zeta::send(file_manager->address(),
-                                     &conn::file::FileManager::dump_file, session_id().hash(),
-                                     conn::file::FileMetadata{select_all(resource, db, tbl), out,
-                                                                  conn::file::FileFormat::NDJSON})
-                        .second.take_ready();
-    REQUIRE_FALSE(dump_res.has_error());
-    REQUIRE(dump_res.value());
+    load_and_dump(*otterbrix, file_manager->address(), ndjson, out, conn::file::FileFormat::NDJSON);
     const std::string& dumped = out;
     REQUIRE(std::filesystem::exists(dumped));
-
-    // Verify dumped file content via the input translator.
-    // Scope the chunk so its pmr-backed buffers are released before we tear
-    // down otterbrix (which owns the resource the chunk was allocated from).
     {
         auto loaded = tsl::ndjson_to_chunk(resource, dumped);
         REQUIRE_FALSE(loaded.has_error());
-        REQUIRE(loaded.value().size() == 5);
-        REQUIRE(loaded.value().column_count() == 2);
+        REQUIRE(rows_of(loaded.value()) == 5);
+        REQUIRE(columns_of(loaded.value()) == 2);
     }
 
     file_manager.reset();
-    otterbrix_manager.reset();
     otterbrix.reset();
 
     std::filesystem::remove(ndjson);
@@ -463,115 +364,114 @@ TEST_CASE("FileManager: ndjson dump and re-read") {
     std::filesystem::remove_all(data_dir);
 }
 
-// ── end-to-end via the Scheduler ────────────────────────────────────────────
+// ── end-to-end through a query session ─────────────────────────────────────
 // Drive CREATE EXTERNAL TABLE / COPY ... TO through the real GreenplumParser +
-// Scheduler routing (the s3/file grammar-extension wiring), for local files.
-// The stack itself lives in scheduler_stack.hpp — test_dml_result_shape.cpp and
-// test_worker_exception_safety.cpp drive the same one.
+// the session's routing (the s3/file grammar-extension wiring), for local files.
+// The stack itself lives in session_stack.hpp — test_dml_result_shape.cpp and
+// test_session_exception_safety.cpp drive the same one.
 
 using otterstax::test::await_session;
 using otterstax::test::engine_row_count;
-using otterstax::test::run_scheduler_sql;
-using otterstax::test::scheduler_stack;
-using otterstax::test::with_scheduler_stack;
+using otterstax::test::run_session_or_fail;
+using otterstax::test::run_session_sql;
+using otterstax::test::session_stack;
+using otterstax::test::with_session_stack;
 
-TEST_CASE("Scheduler: CREATE EXTERNAL TABLE + COPY ... TO (parquet) route to the file manager") {
-    with_scheduler_stack("/tmp/test_ext_routing_parquet_otb", [](scheduler_stack s) {
-        const std::string db = "ExtParquetDb", tbl = "People";
+TEST_CASE("session: CREATE EXTERNAL TABLE + COPY ... TO (parquet) through the session") {
+    with_session_stack("/tmp/test_ext_routing_parquet_otb", [](session_stack s) {
         const std::string src = "/tmp/test_ext_create.parquet", out = "/tmp/test_ext_copy_out.parquet";
         std::filesystem::remove(src);
         std::filesystem::remove(out);
         write_test_parquet(src);
 
+        run_session_or_fail(s, 4000, "CREATE SCHEMA ExtParquet");
         std::string err;
-        auto st = run_scheduler_sql(
-            s, 4001, "CREATE EXTERNAL TABLE " + db + "." + tbl + " WITH (location = '" + src + "', format = 'parquet')",
+        auto st = run_session_sql(
+            s, 4001, "CREATE EXTERNAL TABLE ExtParquet.People WITH (location = '" + src + "', format = 'parquet')",
             err);
         INFO("CREATE error: " << err);
         REQUIRE(st);
-        REQUIRE(engine_row_count(s, db, tbl) == 5);
+        REQUIRE(engine_row_count(s, "main.extparquet", "people") == 5);
 
-        st = run_scheduler_sql(
-            s, 4002, "COPY (SELECT * FROM " + db + "." + tbl + ") TO '" + out + "' WITH (format = 'parquet')", err);
+        st = run_session_sql(
+            s, 4002, "COPY (SELECT * FROM ExtParquet.People) TO '" + out + "' WITH (format = 'parquet')", err);
         INFO("COPY error: " << err);
         REQUIRE(st);
         REQUIRE(std::filesystem::exists(out));
         auto loaded = tsl::parquet_to_chunk(s.resource, out);
         REQUIRE_FALSE(loaded.has_error());
-        REQUIRE(loaded.value().size() == 5);
+        REQUIRE(rows_of(loaded.value()) == 5);
 
         std::filesystem::remove(src);
         std::filesystem::remove(out);
     });
 }
 
-TEST_CASE("Scheduler: CREATE EXTERNAL TABLE + COPY ... TO (csv), format auto-detected from extension") {
-    with_scheduler_stack("/tmp/test_ext_routing_csv_otb", [](scheduler_stack s) {
-        const std::string db = "ExtCsvDb", tbl = "People";
+TEST_CASE("session: CREATE EXTERNAL TABLE + COPY ... TO (csv) with the format from the extension") {
+    with_session_stack("/tmp/test_ext_routing_csv_otb", [](session_stack s) {
         const std::string src = "/tmp/test_ext_create.csv", out = "/tmp/test_ext_copy_out.csv";
         std::filesystem::remove(src);
         std::filesystem::remove(out);
         write_test_csv(src);
 
+        run_session_or_fail(s, 4100, "CREATE SCHEMA ExtCsv");
         std::string err;
         // No format option on CREATE — resolved from the ".csv" extension.
-        auto st = run_scheduler_sql(s, 4101,
-                                    "CREATE EXTERNAL TABLE " + db + "." + tbl + " WITH (location = '" + src + "')", err);
+        auto st = run_session_sql(s, 4101, "CREATE EXTERNAL TABLE ExtCsv.People WITH (location = '" + src + "')", err);
         INFO("CREATE error: " << err);
         REQUIRE(st);
-        REQUIRE(engine_row_count(s, db, tbl) == 5);
+        REQUIRE(engine_row_count(s, "main.extcsv", "people") == 5);
 
-        st = run_scheduler_sql(s, 4102,
-                               "COPY (SELECT * FROM " + db + "." + tbl + ") TO '" + out + "' WITH (format = 'csv')", err);
+        st = run_session_sql(s, 4102, "COPY (SELECT * FROM ExtCsv.People) TO '" + out + "' WITH (format = 'csv')", err);
         INFO("COPY error: " << err);
         REQUIRE(st);
         REQUIRE(std::filesystem::exists(out));
         auto loaded = tsl::csv_to_chunk(s.resource, out, ',', /*has_header=*/true);
         REQUIRE_FALSE(loaded.has_error());
-        REQUIRE(loaded.value().size() == 5);
+        REQUIRE(rows_of(loaded.value()) == 5);
 
         std::filesystem::remove(src);
         std::filesystem::remove(out);
     });
 }
 
-TEST_CASE("Scheduler: CREATE EXTERNAL TABLE on a missing file fails cleanly") {
-    with_scheduler_stack("/tmp/test_ext_routing_err_otb", [](scheduler_stack s) {
+TEST_CASE("session: CREATE EXTERNAL TABLE on a missing file fails cleanly") {
+    with_session_stack("/tmp/test_ext_routing_err_otb", [](session_stack s) {
         const std::string missing = "/tmp/test_ext_does_not_exist.parquet";
         std::filesystem::remove(missing);
 
         std::string err;
-        auto st = run_scheduler_sql(
-            s, 4201, "CREATE EXTERNAL TABLE ErrDb.People WITH (location = '" + missing + "', format = 'parquet')", err);
+        auto st = run_session_sql(
+            s, 4201, "CREATE EXTERNAL TABLE people WITH (location = '" + missing + "', format = 'parquet')", err);
         REQUIRE_FALSE(st);
         REQUIRE_FALSE(err.empty());
     });
 }
 
-TEST_CASE("Scheduler: external statement via prepare_schema + execute_statement (FlightSQL two-phase)") {
+TEST_CASE("session: external statement via prepare_schema + execute_statement (FlightSQL two-phase)") {
     using namespace std::chrono_literals;
-    with_scheduler_stack("/tmp/test_ext_routing_twophase_otb", [](scheduler_stack s) {
-        const std::string db = "ExtTwoPhaseDb", tbl = "People";
+    with_session_stack("/tmp/test_ext_routing_twophase_otb", [](session_stack s) {
         const std::string src = "/tmp/test_ext_twophase.parquet";
         std::filesystem::remove(src);
         write_test_parquet(src);
 
+        run_session_or_fail(s, 4300, "CREATE SCHEMA ExtTwoPhase");
         const session_hash_t id = 4301;
         const std::string sql =
-            "CREATE EXTERNAL TABLE " + db + "." + tbl + " WITH (location = '" + src + "', format = 'parquet')";
+            "CREATE EXTERNAL TABLE ExtTwoPhase.People WITH (location = '" + src + "', format = 'parquet')";
 
         // GetFlightInfo phase — returns an (empty) schema and stores the metadata.
-        auto [ns1, fut1] = actor_zeta::send(s.scheduler, &Scheduler::prepare_schema, id, sql);
+        auto [ns1, fut1] = actor_zeta::send(s.session, &otterstax::session::query_session_t::prepare_schema, otterstax::test::stmt(id), sql);
         auto r1 = await_session(std::move(fut1), 10000ms, s.resource);
         INFO("prepare_schema error: " << (r1.has_error() ? r1.error().what.c_str() : ""));
         REQUIRE_FALSE(r1.has_error());
 
         // DoGet phase — reuses the stored statement and performs the load.
-        auto [ns2, fut2] = actor_zeta::send(s.scheduler, &Scheduler::execute_statement, id);
+        auto [ns2, fut2] = actor_zeta::send(s.session, &otterstax::session::query_session_t::execute_statement, otterstax::test::stmt(id));
         auto r2 = await_session(std::move(fut2), 10000ms, s.resource);
         INFO("execute_statement error: " << (r2.has_error() ? r2.error().what.c_str() : ""));
         REQUIRE_FALSE(r2.has_error());
-        REQUIRE(engine_row_count(s, db, tbl) == 5);
+        REQUIRE(engine_row_count(s, "main.exttwophase", "people") == 5);
 
         std::filesystem::remove(src);
     });
@@ -580,7 +480,7 @@ TEST_CASE("Scheduler: external statement via prepare_schema + execute_statement 
 // ── wider than one engine chunk ───────────────────────────────────────────────
 // A loader builds the whole file as one chunk; the engine takes at most
 // DEFAULT_VECTOR_CAPACITY (1024) rows per chunk, so the rows reach the insert as a
-// run of such chunks (OtterbrixDataManager::insert_rows). Every row must arrive
+// run of such chunks (otterstax::engine::load_table). Every row must arrive
 // with its values: probed on both sides of both chunk boundaries of 2500 rows.
 
 namespace {
@@ -621,31 +521,21 @@ void write_wide_parquet(const std::string& path) {
     REQUIRE((*sink)->Close().ok());
 }
 
-// Loads `params` through FileManager::add_file into a fresh engine at `data_dir`
-// and reads the table back ordered by id: every chunk within the engine's bound,
-// all wide_file_rows rows, the probe rows with their values.
-void require_wide_file_ingested(conn::file::FileAddParams params, const std::string& data_dir) {
+// Loads `params` through the file manager into main.public.people of a fresh
+// engine at `data_dir` and reads the table back ordered by id: every chunk within
+// the engine's bound, all wide_file_rows rows, the probe rows with their values.
+void require_wide_file_ingested(conn::file::FileLoadParams params, const std::string& data_dir) {
     using components::vector::DEFAULT_VECTOR_CAPACITY;
     std::filesystem::remove_all(data_dir);
-    const std::string select = "SELECT * FROM " + params.database + "." + params.table + " ORDER BY id;";
+    const std::string select = "SELECT * FROM people ORDER BY id;";
 
-    db::otterbrix_engine_ptr otterbrix = init_test_otterbrix(data_dir);
-    auto resource = otterbrix->dispatcher()->resource();
+    auto otterbrix = std::make_unique<otterstax::test::test_engine_t>(data_dir);
+    auto file_manager = actor_zeta::spawn<conn::file::FileManager>(otterbrix->resource());
 
-    auto otterbrix_manager =
-        actor_zeta::spawn<db::OtterbrixManager>(resource, make_otterbrix_manager(otterbrix));
-    auto file_manager =
-        actor_zeta::spawn<conn::file::FileManager>(resource, otterbrix_manager->address());
-
-    auto res = actor_zeta::send(file_manager->address(),
-                                &conn::file::FileManager::add_file, session_id().hash(),
-                                std::move(params))
-                   .second.take_ready();
-    INFO("add_file: " << (res.has_error() ? res.error().what.c_str() : "ok"));
+    auto res = load_into(*otterbrix, file_manager->address(), std::move(params), people_table());
+    INFO("load: " << (res.has_error() ? res.error().what.c_str() : "ok"));
     REQUIRE_FALSE(res.has_error());
-
-    session_id session;
-    auto cur = otterbrix->dispatcher()->execute_sql(session, select);
+    auto cur = otterbrix->sql(select);
     INFO("select: " << (cur->is_error() ? cur->get_error().what.c_str() : "ok"));
     REQUIRE(cur->is_success());
     REQUIRE(cur->size() == wide_file_rows);
@@ -670,13 +560,12 @@ void require_wide_file_ingested(conn::file::FileAddParams params, const std::str
             at -= chunk.size();
         }
         REQUIRE(holder != nullptr);
-        REQUIRE(holder->value(0, at).value<int64_t>() == static_cast<int64_t>(row));
-        REQUIRE(holder->value(1, at).value<std::string_view>() == wide_file_name(row));
+        REQUIRE(otterstax::test::cell(*holder, 0, at).value<int64_t>() == static_cast<int64_t>(row));
+        REQUIRE(otterstax::test::cell(*holder, 1, at).value<std::string_view>() == wide_file_name(row));
     }
 
     cur.reset();
     file_manager.reset();
-    otterbrix_manager.reset();
     otterbrix.reset();
     std::filesystem::remove_all(data_dir);
 }
@@ -687,12 +576,7 @@ TEST_CASE("FileManager: a csv wider than one engine chunk is ingested with every
     const std::string csv = "/tmp/test_file_ingestion_wide.csv";
     write_wide_csv(csv);
 
-    conn::file::FileAddParams params;
-    params.database = "WideCsvDb";
-    params.table    = "People";
-    params.path     = csv;
-    params.format   = "csv";
-    require_wide_file_ingested(std::move(params), "/tmp/test_file_ingestion_wide_csv_otterbrix");
+    require_wide_file_ingested(load_params(csv, "csv"), "/tmp/test_file_ingestion_wide_csv_otterbrix");
 
     std::filesystem::remove(csv);
 }
@@ -701,12 +585,7 @@ TEST_CASE("FileManager: a parquet wider than one engine chunk is ingested with e
     const std::string parquet = "/tmp/test_file_ingestion_wide.parquet";
     write_wide_parquet(parquet);
 
-    conn::file::FileAddParams params;
-    params.database = "WideParquetDb";
-    params.table    = "People";
-    params.path     = parquet;
-    params.format   = "parquet";
-    require_wide_file_ingested(std::move(params), "/tmp/test_file_ingestion_wide_parquet_otterbrix");
+    require_wide_file_ingested(load_params(parquet, "parquet"), "/tmp/test_file_ingestion_wide_parquet_otterbrix");
 
     std::filesystem::remove(parquet);
 }

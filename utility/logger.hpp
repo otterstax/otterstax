@@ -15,30 +15,28 @@
 #include <string_view>
 
 namespace logger_tag {
-    inline constexpr std::string_view CATALOG_MANAGER = "CatalogManager";
     inline constexpr std::string_view CONNECTOR = "Connector";
-    inline constexpr std::string_view CONNECTOR_MANAGER = "ConnectorManager";
-    inline constexpr std::string_view OTTERBRIX_MANAGER = "OtterbrixManager";
-    inline constexpr std::string_view SQL_CONNECTION_MANAGER = "MySQLManager";
-    inline constexpr std::string_view PG_CONNECTION_MANAGER = "PostgressManager";
     inline constexpr std::string_view FRONTEND_SERVER = "FrontendServer";
     inline constexpr std::string_view FLIGHTSQL_SERVER = "FlightSQLServer";
     inline constexpr std::string_view SPARK_CONNECT_SERVER = "SparkConnectServer";
     inline constexpr std::string_view MYSQL_CONNECTION = "MysqlConnection";
     inline constexpr std::string_view POSTGRES_CONNECTION = "PostgresConnection";
-    inline constexpr std::string_view CH_CONNECTION_MANAGER = "ClickhouseManager";
     inline constexpr std::string_view FILE_MANAGER = "FileManager";
     inline constexpr std::string_view FILE_CONNECTION_MANAGER = "FileConnectionManager";
     inline constexpr std::string_view S3_MANAGER = "ConnectorManager";
     inline constexpr std::string_view S3_CONNECTION_MANAGER = "S3ConnectionManager";
-    inline constexpr std::string_view SCHEDULER = "Scheduler";
+    inline constexpr std::string_view SESSION = "Session";
+    inline constexpr std::string_view BACKENDS = "Backends";
     inline constexpr std::string_view PARSER = "Parser";
     inline constexpr std::string_view KAFKA_MANAGER = "KafkaManager";
     inline constexpr std::string_view Main = "Main";
-    inline constexpr std::string_view Config = "Config";
 } // namespace logger_tag
 
-inline log_t get_logger(std::string_view tag) { return get_logger(std::string(tag)); }
+// The engine no longer keeps a registry of named loggers (each engine owns its
+// log, components/log/log.hpp make_log); OtterStax's named loggers live in
+// spdlog's own registry, filled by initialize_logger below. A tag nobody
+// initialized answers an invalid log_t, as the engine's lookup used to.
+inline log_t get_logger(std::string_view tag) { return log_t(spdlog::get(std::string(tag))); }
 
 // from otterbrix, we need to make a new named logger, not the default one
 inline log_t initialize_logger(std::string name, std::string prefix) {
@@ -82,14 +80,8 @@ inline void initialize_all_loggers(const std::string& prefix) {
     // Set global default level to match compile-time level
     spdlog::set_level(static_cast<spdlog::level::level_enum>(SPDLOG_ACTIVE_LEVEL));
     
-    static constexpr std::array<std::string_view, 21> all_loggers = {
-        logger_tag::CATALOG_MANAGER,
+    static constexpr std::array<std::string_view, 15> all_loggers = {
         logger_tag::CONNECTOR,
-        logger_tag::CONNECTOR_MANAGER,
-        logger_tag::OTTERBRIX_MANAGER,
-        logger_tag::SQL_CONNECTION_MANAGER,
-        logger_tag::PG_CONNECTION_MANAGER,
-        logger_tag::CH_CONNECTION_MANAGER,
         logger_tag::FILE_MANAGER,
         logger_tag::FILE_CONNECTION_MANAGER,
         logger_tag::S3_MANAGER,
@@ -99,11 +91,11 @@ inline void initialize_all_loggers(const std::string& prefix) {
         logger_tag::SPARK_CONNECT_SERVER,
         logger_tag::MYSQL_CONNECTION,
         logger_tag::POSTGRES_CONNECTION,
-        logger_tag::SCHEDULER,
+        logger_tag::SESSION,
+        logger_tag::BACKENDS,
         logger_tag::PARSER,
         logger_tag::KAFKA_MANAGER,
         logger_tag::Main,
-        logger_tag::Config,
     };
 
     for (auto tag : all_loggers) {

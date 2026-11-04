@@ -166,6 +166,10 @@ namespace frontend::spark {
         {
             OTX_ZONE_N("SparkConnectServiceImpl::handle_release_session");
             response.set_session_id(request.session_id());
+            // The Spark session ends: its query session (and engine session)
+            // closes now — a statement it took runs to its end first — and its
+            // id is refused from here on.
+            spark_sessions_.release(request.session_id());
         }
         co_await rpc.finish(response, grpc::Status::OK);
     }

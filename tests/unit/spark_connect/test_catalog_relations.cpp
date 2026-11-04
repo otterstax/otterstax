@@ -24,114 +24,70 @@ namespace {
     namespace cv = components::vector;
     namespace rows = frontend::spark::catalog_rows;
 
-    struct namespace_row {
-        uint32_t oid;
-        std::string_view name;
-    };
-
-    struct class_row {
-        uint32_t oid;
-        std::string_view name;
-        uint32_t namespace_oid;
-        std::string_view kind;
-    };
-
-    session_payload payload_of(std::pmr::vector<ct::complex_logical_type> types,
-                               cv::data_chunk_t chunk,
-                               std::pmr::memory_resource* resource) {
+    // A read's answer: text columns (`width` of them), one row per entry;
+    // std::nullopt is a NULL cell.
+    using cell_t = std::optional<std::string_view>;
+    session_payload text_result(size_t width,
+                                std::initializer_list<std::vector<cell_t>> input,
+                                std::pmr::memory_resource* resource) {
+        std::pmr::vector<ct::complex_logical_type> types(resource);
+        for (size_t i = 0; i < width; ++i) {
+            types.emplace_back(ct::logical_type::STRING_LITERAL, "c" + std::to_string(i));
+        }
+        cv::data_chunk_t chunk(resource, types);
+        uint64_t at = 0;
+        for (const auto& row : input) {
+            for (size_t column = 0; column < width; ++column) {
+                if (row[column]) {
+                    chunk.set_value(column, at, *row[column]);
+                } else {
+                    chunk.data[column].set_null(at, true);
+                }
+            }
+            ++at;
+        }
+        chunk.set_cardinality(at);
         std::pmr::vector<cv::data_chunk_t> chunks(resource);
         chunks.push_back(std::move(chunk));
-        return session_payload{ct::complex_logical_type::create_struct("", types),
-                               std::move(chunks),
-                               0,
-                               NodeTag::T_Null};
+        return session_payload{ct::complex_logical_type::create_struct("", types), std::move(chunks), 0, NodeTag::T_Null};
     }
 
-    void set_oid(cv::data_chunk_t& chunk, uint64_t column, uint64_t row, uint32_t oid) {
-        if (chunk.data[column].type().type() == ct::logical_type::BIGINT) {
-            chunk.set_value(column, row, static_cast<int64_t>(oid));
-        } else {
-            chunk.set_value(column, row, oid);
-        }
+    // What schemas_sql() answers: datconnection, datname, nspname.
+    session_payload fixture_schemas(std::pmr::memory_resource* resource) {
+        return text_result(3,
+                           {{"", "main", "public"},
+                            {"", "shop", "public"},
+                            {"", "shop", "sales"},
+                            {"", "empty_db", "public"},
+                            {"mysql", "bill", "public"},
+                            {"pg", "shop", "public"}},
+                           resource);
     }
 
-    // What `SELECT oid, nspname FROM pg_catalog.pg_namespace` answers.
-    session_payload namespaces_result(std::initializer_list<namespace_row> input, std::pmr::memory_resource* resource) {
-        std::pmr::vector<ct::complex_logical_type> types(resource);
-        types.emplace_back(ct::logical_type::UINTEGER, "oid");
-        types.emplace_back(ct::logical_type::STRING_LITERAL, "nspname");
-        cv::data_chunk_t chunk(resource, types);
-        uint64_t at = 0;
-        for (const auto& row : input) {
-            set_oid(chunk, 0, at, row.oid);
-            chunk.set_value(1, at, row.name);
-            ++at;
-        }
-        chunk.set_cardinality(at);
-        return payload_of(std::move(types), std::move(chunk), resource);
+    // What tables_sql() answers: datconnection, datname, nspname, relname, relkind.
+    session_payload fixture_tables(std::pmr::memory_resource* resource) {
+        return text_result(5,
+                           {{"", "main", "public", "loose", "r"},
+                            {"", "shop", "public", "orders", "r"},
+                            {"", "shop", "public", "orders_by_day", "v"},
+                            {"", "shop", "public", "daily", "m"},
+                            {"", "shop", "public", "docs", "g"},
+                            {"", "shop", "sales", "orders", "r"},
+                            {"mysql", "bill", "public", "payments", "r"},
+                            {"pg", "shop", "public", "products", "r"}},
+                           resource);
     }
 
-    // What `SELECT oid, relname, relnamespace, relkind FROM pg_catalog.pg_class`
-    // answers, the OIDs typed `oid_type`.
-    session_payload classes_result(std::initializer_list<class_row> input,
-                                   ct::logical_type oid_type,
-                                   std::pmr::memory_resource* resource) {
-        std::pmr::vector<ct::complex_logical_type> types(resource);
-        types.emplace_back(oid_type, "oid");
-        types.emplace_back(ct::logical_type::STRING_LITERAL, "relname");
-        types.emplace_back(oid_type, "relnamespace");
-        types.emplace_back(ct::logical_type::STRING_LITERAL, "relkind");
-        cv::data_chunk_t chunk(resource, types);
-        uint64_t at = 0;
-        for (const auto& row : input) {
-            set_oid(chunk, 0, at, row.oid);
-            chunk.set_value(1, at, row.name);
-            set_oid(chunk, 2, at, row.namespace_oid);
-            chunk.set_value(3, at, row.kind);
-            ++at;
-        }
-        chunk.set_cardinality(at);
-        return payload_of(std::move(types), std::move(chunk), resource);
-    }
-
-    session_payload fixture_namespaces(std::pmr::memory_resource* resource) {
-        return namespaces_result({{1, "pg_catalog"},
-                                  {2, "public"},
-                                  {3, "information_schema"},
-                                  {16384, "shop"},
-                                  {16390, "mysql"},
-                                  {16400, "pg"},
-                                  {16410, "kafka"},
-                                  {16420, "empty_db"}},
-                                 resource);
-    }
-
-    session_payload fixture_classes(std::pmr::memory_resource* resource) {
-        return classes_result({{10, "pg_namespace", 1, "r"},
-                               {11, "pg_class", 1, "r"},
-                               {16385, "orders", 16384, "r"},
-                               {16386, "orders_pkey", 16384, "i"},
-                               {16387, "orders_by_day", 16384, "v"},
-                               {16388, "orders_id_seq", 16384, "S"},
-                               {16389, "loose", 0, "r"},
-                               {16391, "__otterstax_tables", 16390, "r"},
-                               {16392, "bill::payments", 16390, "r"},
-                               {16401, "__otterstax_tables", 16400, "r"},
-                               {16402, "shop:public:products", 16400, "r"},
-                               {16411, "__sources", 16410, "r"},
-                               {16412, "clicks", 16410, "r"},
-                               {16413, "clicks__offsets", 16410, "r"},
-                               {16421, "point", 2, "c"},
-                               {16422, "daily", 16384, "m"},
-                               {16423, "docs", 16384, "g"},
-                               {16424, "add_one", 16384, "F"},
-                               {16425, "shadow", 2, "r"}},
-                              ct::logical_type::UINTEGER,
-                              resource);
+    // What place_sql answers: current_database(), current_schema().
+    session_payload place_of(cell_t database, cell_t schema, std::pmr::memory_resource* resource) {
+        return text_result(2, {{database, schema}}, resource);
     }
 
     rows::catalog_view_t fixture_view(std::pmr::memory_resource* resource) {
-        auto loaded = rows::read_catalog(fixture_namespaces(resource), fixture_classes(resource), resource);
+        auto loaded = rows::read_catalog(fixture_schemas(resource),
+                                         fixture_tables(resource),
+                                         place_of("main", "public", resource),
+                                         resource);
         REQUIRE_FALSE(loaded.has_error());
         return std::move(loaded.value());
     }
@@ -201,142 +157,109 @@ namespace {
 
 // ── pg_catalog rows → what Spark sees ───────────────────────────────────────
 
-TEST_CASE("spark catalog: databases are the user namespaces plus default") {
+TEST_CASE("spark catalog: a database is a schema, named as SQL writes it") {
     std::pmr::synchronized_pool_resource pool;
     const auto view = fixture_view(&pool);
 
     std::vector<std::string> databases(view.databases.begin(), view.databases.end());
-    CHECK(databases == std::vector<std::string>{"default", "empty_db", "kafka", "mysql", "pg", "shop"});
+    CHECK(databases == std::vector<std::string>{"empty_db.public",
+                                                "main.public",
+                                                "mysql.bill.public",
+                                                "pg.shop.public",
+                                                "shop.public",
+                                                "shop.sales"});
+    CHECK(parts_of(view.place) == std::vector<std::string>{"main", "public"});
+    CHECK(view.current_database == "main.public");
 }
 
-TEST_CASE("spark catalog: tables are classified and the internal ones hidden") {
+TEST_CASE("spark catalog: tables are classified under their namespace") {
     std::pmr::synchronized_pool_resource pool;
     const auto view = fixture_view(&pool);
 
-    // Sorted by database, then name. Hidden: system rows, the index, the
-    // sequence, the composite type, the macro, a table in `public`, both
-    // mirror manifests and the Kafka bookkeeping tables.
+    // Sorted by database, then name.
     REQUIRE(view.tables.size() == 8);
 
     const auto& loose = view.tables[0];
-    CHECK(loose.database == "default");
+    CHECK(loose.database == "main.public");
     CHECK(loose.name == "loose");
-    CHECK(loose.qualifier.empty());
+    CHECK(parts_of(loose.qualifier) == std::vector<std::string>{"main", "public"});
     CHECK_FALSE(loose.is_view);
 
-    const auto& clicks = view.tables[1];
-    CHECK(clicks.database == "kafka");
-    CHECK(clicks.name == "clicks");
-    CHECK(parts_of(clicks.qualifier) == std::vector<std::string>{"kafka"});
-
-    // MySQL / ClickHouse mirror `<db>::<table>`: [alias, db].
-    const auto& payments = view.tables[2];
-    CHECK(payments.database == "mysql");
+    // A table of a connection's database: [c, d, s].
+    const auto& payments = view.tables[1];
+    CHECK(payments.database == "mysql.bill.public");
     CHECK(payments.name == "payments");
-    CHECK(parts_of(payments.qualifier) == std::vector<std::string>{"mysql", "bill"});
-    CHECK_FALSE(payments.is_view);
+    CHECK(parts_of(payments.qualifier) == std::vector<std::string>{"mysql", "bill", "public"});
 
-    // PostgreSQL mirror `<db>:<schema>:<table>`: [alias, db, schema].
-    const auto& products = view.tables[3];
-    CHECK(products.database == "pg");
-    CHECK(products.name == "products");
+    const auto& products = view.tables[2];
+    CHECK(products.database == "pg.shop.public");
     CHECK(parts_of(products.qualifier) == std::vector<std::string>{"pg", "shop", "public"});
 
-    // Local database: [d]; v / m are views, r / g tables.
+    // A local database's schema: [d, s]; v / m are views, r / g tables.
     const std::vector<std::pair<std::string_view, bool>> shop = {{"daily", true},
                                                                  {"docs", false},
                                                                  {"orders", false},
                                                                  {"orders_by_day", true}};
     for (size_t i = 0; i < shop.size(); ++i) {
-        const auto& table = view.tables[4 + i];
+        const auto& table = view.tables[3 + i];
         INFO(shop[i].first);
-        CHECK(table.database == "shop");
+        CHECK(table.database == "shop.public");
         CHECK(table.name == shop[i].first);
-        CHECK(parts_of(table.qualifier) == std::vector<std::string>{"shop"});
+        CHECK(parts_of(table.qualifier) == std::vector<std::string>{"shop", "public"});
         CHECK(table.is_view == shop[i].second);
     }
+    CHECK(view.tables[7].database == "shop.sales");
 }
 
-TEST_CASE("spark catalog: columns are found by name and an OID may be any integer type") {
+TEST_CASE("spark catalog: the reads hide the system schemas and the federation database") {
+    for (const auto& sql : {rows::schemas_sql(), rows::tables_sql()}) {
+        INFO(sql);
+        CHECK(sql.find("NOT IN ('pg_catalog', 'information_schema')") != std::string::npos);
+        CHECK(sql.find("d.datname = 'federation'") != std::string::npos);
+    }
+    CHECK(rows::tables_sql().find("c.relkind IN ('r', 'g', 'v', 'm')") != std::string::npos);
+}
+
+TEST_CASE("spark catalog: the place without a schema is the database alone") {
     std::pmr::synchronized_pool_resource pool;
     auto* resource = &pool;
-
-    // pg_class with BIGINT OIDs and its columns in another order.
-    std::pmr::vector<ct::complex_logical_type> types(resource);
-    types.emplace_back(ct::logical_type::STRING_LITERAL, "relkind");
-    types.emplace_back(ct::logical_type::BIGINT, "relnamespace");
-    types.emplace_back(ct::logical_type::STRING_LITERAL, "relname");
-    types.emplace_back(ct::logical_type::BIGINT, "oid");
-    cv::data_chunk_t chunk(resource, types);
-    chunk.set_value(0, 0, std::string_view{"r"});
-    chunk.set_value(1, 0, int64_t{16384});
-    chunk.set_value(2, 0, std::string_view{"orders"});
-    chunk.set_value(3, 0, int64_t{16385});
-    chunk.set_cardinality(1);
-    const auto classes = payload_of(std::move(types), std::move(chunk), resource);
-
-    auto loaded = rows::read_catalog(namespaces_result({{16384, "shop"}}, resource), classes, resource);
+    auto loaded =
+        rows::read_catalog(fixture_schemas(resource), fixture_tables(resource), place_of("main", std::nullopt, resource), resource);
     REQUIRE_FALSE(loaded.has_error());
-    REQUIRE(loaded.value().tables.size() == 1);
-    CHECK(loaded.value().tables[0].database == "shop");
-    CHECK(loaded.value().tables[0].name == "orders");
+    CHECK(loaded.value().current_database == "main");
+    auto bare = rows::find_table(loaded.value(), "loose", std::nullopt, resource);
+    REQUIRE_FALSE(bare.has_error());
+    CHECK(bare.value() == nullptr);
 }
 
-TEST_CASE("spark catalog: unreadable pg_catalog rows are a schema_error") {
+TEST_CASE("spark catalog: unreadable rows are an internal_error") {
     std::pmr::synchronized_pool_resource pool;
     auto* resource = &pool;
-    const auto namespaces = namespaces_result({{16384, "shop"}, {16390, "mysql"}}, resource);
 
-    SECTION("a missing column") {
-        std::pmr::vector<ct::complex_logical_type> types(resource);
-        types.emplace_back(ct::logical_type::UINTEGER, "oid");
-        types.emplace_back(ct::logical_type::STRING_LITERAL, "relname");
-        cv::data_chunk_t chunk(resource, types);
-        chunk.set_value(0, 0, uint32_t{16385});
-        chunk.set_value(1, 0, std::string_view{"orders"});
-        chunk.set_cardinality(1);
+    SECTION("a NULL cell") {
+        auto loaded = rows::read_catalog(fixture_schemas(resource),
+                                         text_result(5, {{"", "shop", "public", std::nullopt, "r"}}, resource),
+                                         place_of("main", "public", resource),
+                                         resource);
+        REQUIRE(loaded.has_error());
+        CHECK(loaded.error().type == core::error_code_t::internal_error);
+    }
+
+    SECTION("a row of another width") {
+        auto loaded = rows::read_catalog(text_result(2, {{"", "shop"}}, resource),
+                                         fixture_tables(resource),
+                                         place_of("main", "public", resource),
+                                         resource);
+        REQUIRE(loaded.has_error());
+        CHECK(loaded.error().type == core::error_code_t::internal_error);
+    }
+
+    SECTION("no place") {
         auto loaded =
-            rows::read_catalog(namespaces, payload_of(std::move(types), std::move(chunk), resource), resource);
+            rows::read_catalog(fixture_schemas(resource), fixture_tables(resource), text_result(2, {}, resource), resource);
         REQUIRE(loaded.has_error());
-        CHECK(loaded.error().type == core::error_code_t::schema_error);
+        CHECK(loaded.error().type == core::error_code_t::internal_error);
     }
-
-    SECTION("a NULL oid") {
-        auto classes = classes_result({{16385, "orders", 16384, "r"}}, ct::logical_type::UINTEGER, resource);
-        classes.chunks.front().data[0].set_null(0, true);
-        auto loaded = rows::read_catalog(namespaces, classes, resource);
-        REQUIRE(loaded.has_error());
-        CHECK(loaded.error().type == core::error_code_t::schema_error);
-    }
-
-    SECTION("a mirror name that is not <db>:<schema>:<table>") {
-        auto loaded = rows::read_catalog(
-            namespaces,
-            classes_result({{16391, "__otterstax_tables", 16390, "r"}, {16392, "payments", 16390, "r"}},
-                           ct::logical_type::UINTEGER,
-                           resource),
-            resource);
-        REQUIRE(loaded.has_error());
-        CHECK(loaded.error().type == core::error_code_t::schema_error);
-    }
-}
-
-TEST_CASE("spark catalog: a table whose database was dropped between the two reads is not listed") {
-    std::pmr::synchronized_pool_resource pool;
-    auto* resource = &pool;
-
-    // pg_class, read first, still lists `orders` of namespace 16500; pg_namespace,
-    // read after a DROP DATABASE (which cascades), no longer holds it.
-    auto loaded = rows::read_catalog(namespaces_result({{16384, "shop"}}, resource),
-                                     classes_result({{16385, "orders", 16500, "r"}, {16386, "items", 16384, "r"}},
-                                                    ct::logical_type::UINTEGER,
-                                                    resource),
-                                     resource);
-    REQUIRE_FALSE(loaded.has_error());
-    REQUIRE(loaded.value().tables.size() == 1);
-    CHECK(loaded.value().tables[0].name == "items");
-    std::vector<std::string> databases(loaded.value().databases.begin(), loaded.value().databases.end());
-    CHECK(databases == std::vector<std::string>{"default", "shop"});
 }
 
 // ── Spark name patterns ─────────────────────────────────────────────────────
@@ -365,38 +288,41 @@ TEST_CASE("spark catalog: patterns") {
 
 // ── Qualified-name resolution ───────────────────────────────────────────────
 
-TEST_CASE("spark catalog: a table is found by the identifier the SQL path reads") {
+TEST_CASE("spark catalog: a table is found by the name the SQL path reads") {
     std::pmr::synchronized_pool_resource pool;
     auto* resource = &pool;
     const auto view = fixture_view(resource);
-    const auto count = [&](std::string_view name, std::optional<std::string_view> db) {
-        return rows::find_tables(view, name, db, resource).size();
+    const auto found = [&](std::string_view name, std::optional<std::string_view> db) -> std::string {
+        auto table = rows::find_table(view, name, db, resource);
+        REQUIRE_FALSE(table.has_error());
+        return table.value() == nullptr ? std::string{"-"}
+                                         : std::string{table.value()->database} + "/" + std::string{table.value()->name};
     };
 
-    CHECK(count("mysql.bill.payments", std::nullopt) == 1);
-    CHECK(count("pg.shop.public.products", std::nullopt) == 1);
-    CHECK(count("shop.orders", std::nullopt) == 1);
-    CHECK(count("loose", std::nullopt) == 1);
+    CHECK(found("mysql.bill.public.payments", std::nullopt) == "mysql.bill.public/payments");
+    CHECK(found("pg.shop.public.products", std::nullopt) == "pg.shop.public/products");
+    CHECK(found("shop.sales.orders", std::nullopt) == "shop.sales/orders");
+    CHECK(found("`shop`.`public`.orders", std::nullopt) == "shop.public/orders");
+    // Completed with the place, main.public.
+    CHECK(found("loose", std::nullopt) == "main.public/loose");
+    CHECK(found("public.loose", std::nullopt) == "main.public/loose");
 
-    CHECK(count("orders", std::nullopt) == 0); // only the unqualified tables answer a bare name
-    CHECK(count("mysql.payments", std::nullopt) == 0);
-    CHECK(count("bill.payments", std::nullopt) == 0);
-    CHECK(count("Shop.orders", std::nullopt) == 0); // names are matched exactly
-    CHECK(count("default.loose", std::nullopt) == 0);
+    CHECK(found("orders", std::nullopt) == "-");
+    CHECK(found("shop.orders", std::nullopt) == "-"); // the schema shop of main
+    CHECK(found("Shop.public.orders", std::nullopt) == "-"); // names are matched exactly
+    CHECK(found("bill.public.payments", std::nullopt) == "-"); // three parts are a local database
 
-    CHECK(count("payments", "mysql") == 1);
-    CHECK(count("products", "pg") == 1);
-    CHECK(count("loose", "default") == 1);
-    CHECK(count("orders", "shop") == 1);
-    CHECK(count("shop.orders", "shop") == 0); // with a database the name is not split
-    CHECK(count("orders", "nope") == 0);
+    CHECK(found("payments", "mysql.bill.public") == "mysql.bill.public/payments");
+    CHECK(found("orders", "shop.sales") == "shop.sales/orders");
+    CHECK(found("shop.public.orders", "shop.public") == "-"); // with a database the name is not split
+    CHECK(found("orders", "nope") == "-");
 
-    const auto products = rows::find_tables(view, "pg.shop.public.products", std::nullopt, resource);
-    REQUIRE(products.size() == 1);
-    CHECK(products.front()->name == "products");
+    auto five = rows::find_table(view, "a.b.c.d.e", std::nullopt, resource);
+    REQUIRE(five.has_error());
+    CHECK(five.error().type == core::error_code_t::sql_parse_error);
 }
 
-TEST_CASE("spark catalog: getTable answers one table or says why not") {
+TEST_CASE("spark catalog: getTable answers the table or says why not") {
     std::pmr::synchronized_pool_resource pool;
     auto* resource = &pool;
     const auto view = fixture_view(resource);
@@ -409,26 +335,17 @@ TEST_CASE("spark catalog: getTable answers one table or says why not") {
     REQUIRE(no_database.has_error());
     CHECK(no_database.error().type == core::error_code_t::database_not_exists);
 
-    auto not_there = rows::get_table(view, "nope", "shop", resource);
+    auto not_there = rows::get_table(view, "nope", "shop.public", resource);
     REQUIRE(not_there.has_error());
     CHECK(not_there.error().type == core::error_code_t::table_not_exists);
 
-    // Two mirrored databases of one connection, each with a `t`.
-    auto loaded = rows::read_catalog(
-        namespaces_result({{16390, "mysql"}}, resource),
-        classes_result(
-            {{16391, "__otterstax_tables", 16390, "r"}, {16392, "db1::t", 16390, "r"}, {16393, "db2::t", 16390, "r"}},
-            ct::logical_type::UINTEGER,
-            resource),
-        resource);
-    REQUIRE_FALSE(loaded.has_error());
-    CHECK(rows::find_tables(loaded.value(), "t", "mysql", resource).size() == 2);
-    auto ambiguous = rows::get_table(loaded.value(), "t", "mysql", resource);
-    REQUIRE(ambiguous.has_error());
-    CHECK(ambiguous.error().type == core::error_code_t::ambiguous_name);
-    auto qualified = rows::get_table(loaded.value(), "mysql.db2.t", std::nullopt, resource);
+    auto five = rows::get_table(view, "a.b.c.d.e", std::nullopt, resource);
+    REQUIRE(five.has_error());
+    CHECK(five.error().type == core::error_code_t::sql_parse_error);
+
+    auto qualified = rows::get_table(view, "shop.sales.orders", std::nullopt, resource);
     REQUIRE_FALSE(qualified.has_error());
-    CHECK(list_at(qualified.value(), 2, 0) == std::vector<std::string>{"mysql", "db2"});
+    CHECK(list_at(qualified.value(), 2, 0) == std::vector<std::string>{"shop", "sales"});
 }
 
 TEST_CASE("spark catalog: the column probe quotes every part") {
@@ -436,20 +353,23 @@ TEST_CASE("spark catalog: the column probe quotes every part") {
     auto* resource = &pool;
     const auto view = fixture_view(resource);
 
-    const auto products = rows::find_tables(view, "products", "pg", resource);
-    REQUIRE(products.size() == 1);
-    CHECK(rows::select_all_query(*products.front()) == R"(SELECT * FROM "pg"."shop"."public"."products")");
+    auto products = rows::find_table(view, "products", "pg.shop.public", resource);
+    REQUIRE_FALSE(products.has_error());
+    REQUIRE(products.value() != nullptr);
+    CHECK(rows::select_all_query(*products.value()) == R"(SELECT * FROM "pg"."shop"."public"."products")");
 
-    const auto loose = rows::find_tables(view, "loose", "default", resource);
-    REQUIRE(loose.size() == 1);
-    CHECK(rows::select_all_query(*loose.front()) == R"(SELECT * FROM "loose")");
+    auto loose = rows::find_table(view, "loose", std::nullopt, resource);
+    REQUIRE_FALSE(loose.has_error());
+    REQUIRE(loose.value() != nullptr);
+    CHECK(rows::select_all_query(*loose.value()) == R"(SELECT * FROM "main"."public"."loose")");
 
-    rows::table_entry_t odd{std::pmr::string{"Shop", resource},
+    rows::table_entry_t odd{std::pmr::string{"Shop.public", resource},
                             std::pmr::string{"we\"ird", resource},
                             std::pmr::vector<std::pmr::string>{resource},
                             false};
     odd.qualifier.emplace_back("Shop");
-    CHECK(rows::select_all_query(odd) == R"(SELECT * FROM "Shop"."we""ird")");
+    odd.qualifier.emplace_back("public");
+    CHECK(rows::select_all_query(odd) == R"(SELECT * FROM "Shop"."public"."we""ird")");
 }
 
 // ── Row layouts PySpark reads by position ───────────────────────────────────
@@ -458,10 +378,10 @@ TEST_CASE("spark catalog: single values") {
     std::pmr::synchronized_pool_resource pool;
     auto* resource = &pool;
 
-    const auto current = rows::string_payload(rows::default_database, resource);
+    const auto current = rows::string_payload("main.public", resource);
     require_layout(current, {{"value", ct::logical_type::STRING_LITERAL}});
     REQUIRE(current.size() == 1);
-    CHECK(text_at(current, 0, 0) == "default");
+    CHECK(text_at(current, 0, 0) == "main.public");
 
     const auto exists = rows::boolean_payload(true, resource);
     require_layout(exists, {{"value", ct::logical_type::BOOLEAN}});
@@ -495,29 +415,30 @@ TEST_CASE("spark catalog: Database rows") {
     const auto all = rows::list_databases(view, std::nullopt, resource);
     require_layout(all, database_layout);
     REQUIRE(all.size() == 6);
-    CHECK(text_at(all, 0, 0) == "default");
+    CHECK(text_at(all, 0, 0) == "empty_db.public");
     CHECK(text_at(all, 1, 0) == "otterstax");
     CHECK(null_at(all, 2, 0));
     CHECK(null_at(all, 3, 0));
 
     const auto matched = rows::list_databases(view, "m*|P*", resource);
-    REQUIRE(matched.size() == 2);
-    CHECK(text_at(matched, 0, 0) == "mysql");
-    CHECK(text_at(matched, 0, 1) == "pg");
+    REQUIRE(matched.size() == 3);
+    CHECK(text_at(matched, 0, 0) == "main.public");
+    CHECK(text_at(matched, 0, 1) == "mysql.bill.public");
+    CHECK(text_at(matched, 0, 2) == "pg.shop.public");
 
-    auto shop = rows::get_database(view, "shop", resource);
-    REQUIRE_FALSE(shop.has_error());
-    require_layout(shop.value(), database_layout);
-    REQUIRE(shop.value().size() == 1);
-    CHECK(text_at(shop.value(), 0, 0) == "shop");
+    auto sales = rows::get_database(view, "shop.sales", resource);
+    REQUIRE_FALSE(sales.has_error());
+    require_layout(sales.value(), database_layout);
+    REQUIRE(sales.value().size() == 1);
+    CHECK(text_at(sales.value(), 0, 0) == "shop.sales");
 
-    auto missing = rows::get_database(view, "public", resource);
+    auto missing = rows::get_database(view, "shop", resource);
     REQUIRE(missing.has_error());
     CHECK(missing.error().type == core::error_code_t::database_not_exists);
 
-    CHECK(rows::database_exists(view, "default"));
-    CHECK(rows::database_exists(view, "empty_db"));
-    CHECK_FALSE(rows::database_exists(view, "pg_catalog"));
+    CHECK(rows::database_exists(view, "main.public"));
+    CHECK(rows::database_exists(view, "empty_db.public"));
+    CHECK_FALSE(rows::database_exists(view, "main.pg_catalog"));
 }
 
 TEST_CASE("spark catalog: Table rows") {
@@ -525,7 +446,7 @@ TEST_CASE("spark catalog: Table rows") {
     auto* resource = &pool;
     const auto view = fixture_view(resource);
 
-    auto mysql = rows::list_tables(view, "mysql", std::nullopt, resource);
+    auto mysql = rows::list_tables(view, "mysql.bill.public", std::nullopt, resource);
     REQUIRE_FALSE(mysql.has_error());
     const auto& payload = mysql.value();
     require_layout(payload, table_layout);
@@ -534,20 +455,19 @@ TEST_CASE("spark catalog: Table rows") {
     REQUIRE(payload.size() == 1);
     CHECK(text_at(payload, 0, 0) == "payments");
     CHECK(text_at(payload, 1, 0) == "otterstax");
-    CHECK(list_at(payload, 2, 0) == std::vector<std::string>{"mysql", "bill"});
+    CHECK(list_at(payload, 2, 0) == std::vector<std::string>{"mysql", "bill", "public"});
     CHECK(null_at(payload, 3, 0));
     CHECK(text_at(payload, 4, 0) == "MANAGED");
     CHECK_FALSE(flag_at(payload, 5, 0));
 
-    // Without a database: the current one, "default"; its namespace is empty, not NULL.
+    // Without a database: the current one, main.public.
     auto current = rows::list_tables(view, std::nullopt, std::nullopt, resource);
     REQUIRE_FALSE(current.has_error());
     REQUIRE(current.value().size() == 1);
     CHECK(text_at(current.value(), 0, 0) == "loose");
-    CHECK_FALSE(null_at(current.value(), 2, 0));
-    CHECK(list_at(current.value(), 2, 0).empty());
+    CHECK(list_at(current.value(), 2, 0) == std::vector<std::string>{"main", "public"});
 
-    auto orders = rows::list_tables(view, "shop", "orders*", resource);
+    auto orders = rows::list_tables(view, "shop.public", "orders*", resource);
     REQUIRE_FALSE(orders.has_error());
     REQUIRE(orders.value().size() == 2);
     CHECK(text_at(orders.value(), 0, 0) == "orders");
@@ -556,7 +476,7 @@ TEST_CASE("spark catalog: Table rows") {
     CHECK(text_at(orders.value(), 4, 1) == "VIEW");
 
     // No row is still the whole layout, in one empty chunk.
-    auto empty = rows::list_tables(view, "empty_db", std::nullopt, resource);
+    auto empty = rows::list_tables(view, "empty_db.public", std::nullopt, resource);
     REQUIRE_FALSE(empty.has_error());
     require_layout(empty.value(), table_layout);
     CHECK(empty.value().chunks.size() == 1);

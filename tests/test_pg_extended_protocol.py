@@ -18,21 +18,16 @@ the exact message sequence the server answers with:
     statement's projection resolved against the columns the engine reports for
     the relations it reads, so a named column carries the type its values will
     arrive under and `SELECT *` goes out expanded into the table's own columns.
-    What that computation cannot answer — the width of a JOIN whose same-named
-    columns it merges — is what the Execute check below is for.
+    The engine describes the plan before Bind (no execution), so a parameterized
+    JOIN of two tables sharing every column name is described with all four
+    columns, and its Execute streams rows of that very shape.
   * Describe of a portal: a portal is a bound statement, so a statement that
     answers rows is RUN and described by the result it actually answers — the
     real column types — and its Execute streams that stored result rather than
     running anything again. A DML portal is not run: it answers NoData, and the
     Execute is what writes, exactly once.
-  * Execute of a statement described before Bind whose executed result has
-    another shape (a different column count, or a column under another type
-    oid): ErrorResponse 0A000 "cached plan must not change result type", as
-    PostgreSQL answers, and not one row under the shape the client holds.
-  * A named statement executed twice, and again after a failed execution: the
-    Worker keeps a prepared statement for one execution only, so the frontend
-    prepares it again under the hood; a second Execute must never surface the
-    Worker's "must be re-prepared" verdict.
+  * A named statement executed twice, and again after a failed execution: every
+    Execute runs it again and a failed one fails the same way the second time.
   * An error inside an extended-query pipeline (Parse, Bind, Describe,
     Execute): ErrorResponse alone, the rest of the pipeline is discarded, and
     the Sync answers the one ReadyForQuery — never two. A failed simple Query
@@ -61,10 +56,10 @@ the exact message sequence the server answers with:
     RowDescription, on the simple Query and on the Execute of a portal the
     client never described alike.
   * A named statement parsed but never executed, then Terminate or a socket
-    drop: the connection's teardown releases it on the Worker
-    (Scheduler::close_statement) and the server keeps accepting and serving
+    drop: the connection's teardown releases it on the query session
+    (the connection closes its query session) and the server keeps accepting and serving
     connections. The release is not visible on the wire — the case proves the
-    teardown path completes (no crash, no wedged pool slot), not the Worker-
+    teardown path completes (no crash, no wedged pool slot), not the session-
     side erasure.
   * A message truncated inside its fields after startup (an Execute cut
     before its row limit, a Query without its terminator): ErrorResponse with
@@ -89,7 +84,7 @@ import sys
 
 from config import get_host, PG_PORT
 
-DB = "pg_ext_proto"
+DB = "pg_ext_proto"     # a schema of the session's database, main
 TABLE = "rows"
 ROWS = 5
 
@@ -294,12 +289,15 @@ class PgExtendedProtocolTest:
 
     def connect(self):
         wire = PgWire(self.host, PG_PORT)
-        wire.startup("testuser", DB)
+        # The StartupMessage names an engine database (an unknown one is FATAL
+        # 3D000): the session is placed in main.public.
+        wire.startup("testuser", "main")
         return wire
 
     def setup(self):
         self.wire = self.connect()
-        self.assert_no_error(self.wire.query(f"CREATE DATABASE {DB}"), "CREATE DATABASE")
+        self.wire.query(f"DROP SCHEMA IF EXISTS {DB} CASCADE")
+        self.assert_no_error(self.wire.query(f"CREATE SCHEMA {DB}"), "CREATE SCHEMA")
         self.database_created = True
         self.assert_no_error(self.wire.query(f"CREATE TABLE {DB}.{TABLE} (id bigint, name string)"), "CREATE TABLE")
         self.table_created = True
@@ -315,9 +313,7 @@ class PgExtendedProtocolTest:
         self.assert_no_error(self.wire.query(f"CREATE TABLE {DB}.{UWIDE_TABLE} (id INT, big uhugeint)"),
                              "CREATE TABLE with a uhugeint column")
         self.uwide_table_created = True
-        # The JOIN pair: every column name is shared, so what a prepare can
-        # compute before Bind merges the two schemas into two columns while the
-        # engine answers four.
+        # The JOIN pair: every column name is shared (four columns, two names).
         for table in (JOIN_LEFT, JOIN_RIGHT):
             self.assert_no_error(self.wire.query(f"CREATE TABLE {DB}.{table} (id bigint, name string)"),
                                  f"CREATE TABLE {table}")
@@ -339,7 +335,7 @@ class PgExtendedProtocolTest:
             for table in self.join_tables_created:
                 self.wire.query(f"DROP TABLE {DB}.{table}")
             if self.database_created:
-                self.wire.query(f"DROP DATABASE {DB}")
+                self.wire.query(f"DROP SCHEMA {DB} CASCADE")
         finally:
             self.wire.close()
 
@@ -567,6 +563,10 @@ class PgExtendedProtocolTest:
         w = self.wire
         before = self.row_count()
 
+        # A named portal lives until its transaction ends (PostgreSQL): outside a
+        # block the Sync ends the implicit transaction and drops it, so the
+        # portal is described and executed inside one block.
+        self.assert_no_error(w.query("BEGIN"), "BEGIN")
         w.parse("dml_desc", f"INSERT INTO {DB}.{TABLE} (id, name) VALUES ($1, $2)", [OID_INT8, OID_TEXT])
         w.bind("dp", "dml_desc", ["77", "row_77"])
         w.describe("P", "dp")
@@ -583,19 +583,18 @@ class PgExtendedProtocolTest:
         self.assert_no_error(messages, "Execute of the described INSERT portal")
         self.assert_equal(command_tag(first(messages, COMMAND_COMPLETE)), "INSERT 0 1", "the INSERT ran")
         self.assert_equal(self.row_count(), before + 1, "exactly one row was written, by the Execute alone")
+        self.assert_no_error(w.query("COMMIT"), "COMMIT")
 
         self.assert_no_error(self.wire.query(f"DELETE FROM {DB}.{TABLE} WHERE id = 77"), "cleanup of the written row")
         print("  Describe(portal) of a DML: NoData, nothing written, Execute writes once ✓")
 
-    def test_execute_refuses_a_result_shape_the_describe_did_not_promise(self):
-        """A shape described before Bind that the result does not match: 0A000, never rows of another shape."""
+    def test_describe_of_a_parameterized_join_is_the_executed_shape(self):
+        """Describe before Bind of a JOIN sharing every column name: all four columns, and the Execute streams them."""
         w = self.wire
 
-        # A JOIN of two tables sharing every column name: what a prepare can
-        # compute before Bind merges the two schemas BY NAME and describes two
-        # columns, while the engine answers all four. A client that decodes by
-        # the description it holds would read the row short, so the Execute is
-        # refused the way PostgreSQL refuses it.
+        # A JOIN of two tables sharing every column name: the engine describes
+        # the plan before Bind with the four columns it answers (as PostgreSQL
+        # does), so the Execute streams rows of the described shape.
         joined = (f"SELECT * FROM {DB}.{JOIN_LEFT} JOIN {DB}.{JOIN_RIGHT} "
                   f"ON {JOIN_LEFT}.id = {JOIN_RIGHT}.id WHERE {JOIN_LEFT}.id = $1")
         w.parse("guessed", joined, [OID_INT8])
@@ -604,18 +603,17 @@ class PgExtendedProtocolTest:
         messages = w.read_until_ready()
         self.assert_no_error(messages, "Describe(statement) of a parameterized JOIN")
         self.assert_equal([f["name"] for f in row_description_fields(first(messages, ROW_DESCRIPTION))],
-                          ["id", "name"], "the same-named columns of the two tables are merged into one description")
+                          ["id", "name", "id", "name"], "both tables' columns are described, none merged")
 
         w.bind("", "guessed", ["2"])
         w.execute("", 0)
         w.sync()
-        messages = self.read_failed_pipeline(w)
-        self.assert_equal(kinds(messages), [BIND_COMPLETE, ERROR_RESPONSE, READY_FOR_QUERY],
-                          "the Execute is refused and nothing is streamed under the stale shape")
-        fields = error_fields(first(messages, ERROR_RESPONSE))
-        self.assert_equal(fields.get("C"), SQLSTATE_FEATURE_NOT_SUPPORTED, "PostgreSQL's sqlstate for this")
-        self.assert_equal(fields.get("M"), "cached plan must not change result type", "PostgreSQL's own wording")
-        assert DATA_ROW not in kinds(messages), "no row may go out under a shape the client was not given"
+        messages = w.read_until_ready()
+        self.assert_no_error(messages, "Execute of the described JOIN")
+        self.assert_equal(kinds(messages), [BIND_COMPLETE, DATA_ROW, COMMAND_COMPLETE, READY_FOR_QUERY],
+                          "the JOIN streams its row under the description the client holds")
+        self.assert_equal(data_row_texts(first(messages, DATA_ROW)),
+                          ["2", f"{JOIN_LEFT}_2", "2", f"{JOIN_RIGHT}_2"], "the row carries all four columns")
 
         # The control: a statement the prepare could type exactly is described
         # before Bind and executed under that very description — and the Execute
@@ -635,7 +633,7 @@ class PgExtendedProtocolTest:
         self.assert_equal(kinds(messages), [BIND_COMPLETE, DATA_ROW, COMMAND_COMPLETE, READY_FOR_QUERY],
                           "a described statement streams its rows without a second RowDescription")
         self.assert_equal(data_row_texts(first(messages, DATA_ROW)), ["2", "row_2"], "the row")
-        print("  Execute after a stale Describe -> 0A000 'cached plan must not change result type' ✓")
+        print("  Describe(S) of a parameterized JOIN -> four columns, the Execute streams them ✓")
 
     def test_named_statement_executes_twice_and_after_a_failure(self):
         """A named statement survives its first execution and a failed one."""
@@ -657,8 +655,7 @@ class PgExtendedProtocolTest:
         # bigint column is refused when the INSERT runs ("insert_node: can not
         # convert data column[0] type to table type"), not at Parse, whose
         # prepare of a DML statement does not touch the engine. The failure must
-        # be the engine's verdict both times, never the Worker's re-prepare
-        # demand.
+        # be the engine's verdict both times.
         w.parse("failing", f"INSERT INTO {DB}.{TABLE} (id, name) VALUES ('not a number', 'row_x')")
         w.sync()
         self.assert_no_error(w.read_until_ready(), "Parse of an INSERT with a literal the column cannot hold")
@@ -673,7 +670,7 @@ class PgExtendedProtocolTest:
             assert COMMAND_COMPLETE not in kinds(messages), f"attempt {attempt}: nothing completes after the error"
         self.assert_equal([data_row_texts(p)[0] for k, p in self.wire.query(f"SELECT count(*) FROM {DB}.{TABLE}")
                            if k == DATA_ROW], [str(ROWS)], "the failed INSERTs wrote nothing")
-        print("  named statement: two Executes, then two failing ones, no re-prepare leak ✓")
+        print("  named statement: two Executes, then two failing ones, the same verdict ✓")
 
     def test_bind_rejects_a_literal_the_type_cannot_hold(self):
         """Bind '12abc' for an int8: ErrorResponse 22P02 and no BindComplete."""
@@ -1007,7 +1004,7 @@ class PgExtendedProtocolTest:
             self.test_describe_portal_describes_the_executed_result()
             self.test_describe_portal_of_a_dml_does_not_execute_it()
             self.test_describe_statement_of_a_returning_dml_names_its_columns()
-            self.test_execute_refuses_a_result_shape_the_describe_did_not_promise()
+            self.test_describe_of_a_parameterized_join_is_the_executed_shape()
             self.test_named_statement_executes_twice_and_after_a_failure()
             self.test_bind_rejects_a_literal_the_type_cannot_hold()
             self.test_binary_result_format_is_reported_in_row_description()

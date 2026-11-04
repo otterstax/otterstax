@@ -5,6 +5,8 @@
 
 #include "s3_connect_params.hpp"
 
+#include "otterbrix/translators/arrow_stream.hpp"
+
 #include "utility/session.hpp"
 #include <actor-zeta.hpp>
 #include <core/result_wrapper.hpp>
@@ -48,21 +50,21 @@ public:
     add_credentials(session_hash_t id, connect_params params);
 
     /// List objects under s3_path (non-recursive). s3_path is "bucket/prefix".
-    /// Errors: do_not_exists (unknown alias), io_error (S3 failure).
+    /// Errors: undefined_object (unknown alias), io_error (S3 failure).
     actor_zeta::unique_future<core::result_wrapper_t<std::pmr::vector<std::pmr::string>>>
     list(session_hash_t id, std::string alias, std::string s3_path);
 
     /// Open one object ("bucket/key") for reading. RandomAccessFile is-an
     /// InputStream, so the one handler serves parquet (ranged reads) and csv /
     /// ndjson (sequential). Nothing is staged on local disk.
-    /// Errors: do_not_exists (unknown alias), io_error (S3 failure, no such object).
-    actor_zeta::unique_future<core::result_wrapper_t<std::shared_ptr<arrow::io::RandomAccessFile>>>
+    /// Errors: undefined_object (unknown alias), io_error (S3 failure, no such object).
+    actor_zeta::unique_future<core::result_wrapper_t<tsl::input_stream_t>>
     open_input(session_hash_t id, std::string alias, std::string s3_path);
 
-    /// Open one object ("bucket/key") for writing. Only the caller's Close() publishes it;
-    /// every other path must Abort() — Arrow's S3 stream completes the upload from its
-    /// destructor. Errors: do_not_exists (unknown alias), io_error (S3 failure).
-    actor_zeta::unique_future<core::result_wrapper_t<std::shared_ptr<arrow::io::OutputStream>>>
+    /// Open one object ("bucket/key") for writing. Only the holder's close() publishes it;
+    /// a stream let go unclosed is aborted (tsl::output_stream_t) — Arrow's S3 stream would
+    /// complete the upload from its destructor. Errors: undefined_object (unknown alias), io_error (S3 failure).
+    actor_zeta::unique_future<core::result_wrapper_t<tsl::output_stream_t>>
     open_output(session_hash_t id, std::string alias, std::string s3_path);
 
     using dispatch_traits = actor_zeta::dispatch_traits<
@@ -89,9 +91,9 @@ private:
     using filesystem_cache_t =
         std::pmr::unordered_map<std::pmr::string, std::shared_ptr<arrow::fs::S3FileSystem>, alias_hash, std::equal_to<>>;
 
-    // The alias's filesystem, built and cached on first use.
-    // Errors: do_not_exists (unknown alias, message prefixed by `op`), io_error.
-    core::result_wrapper_t<std::shared_ptr<arrow::fs::S3FileSystem>> filesystem_for(std::string_view op,
+    // The alias's filesystem, built and cached on first use; the cache owns it.
+    // Errors: undefined_object (unknown alias, message prefixed by `op`), io_error.
+    core::result_wrapper_t<arrow::fs::S3FileSystem*> filesystem_for(std::string_view op,
                                                                                     std::string_view alias);
 
     std::pmr::memory_resource*                      resource_;

@@ -31,8 +31,8 @@ from queries import (  # noqa: E402
 FRONTENDS = ["mysql", "postgres"]
 FRONTEND_PORTS: dict = {"mysql": 8816, "postgres": 8817}
 
-# Group B join_same_instance sub-tests only (~5 k rows; complete in 1–3 s).
-# Group A camp×imp joins take 3–9 s and are too slow for baseline/medium stages.
+# Group B join_same_instance sub-tests only (~5 k rows); the Group A camp×imp
+# joins (up to 60 k rows) stay out of this key.
 _JOIN_SAME_B = [(n, s) for n, s in JOIN_SAME_INSTANCE if n.startswith("prod_ord_")]
 
 VALID_POOL_KEYS: dict = {

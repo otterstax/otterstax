@@ -3,7 +3,7 @@
 
 #include "server.hpp"
 
-#include "scheduler_engine.hpp"
+#include "session_engine.hpp"
 
 #include "utility/tracy_profiler.hpp"
 
@@ -20,14 +20,14 @@ namespace flight::server {
     flight_sql_server::flight_sql_server(const config_t& config)
         : log_(get_logger(logger_tag::FLIGHTSQL_SERVER))
         , address_(config.host + ":" + std::to_string(config.port))
-        , threads_(std::max<std::size_t>(1, config.threads))
+        , threads_(config.threads)
         , core_(core::AuthService::anonymous(),
-                std::make_unique<engine::SchedulerEngine>(config.scheduler_address,
-                                                          config.catalog_address,
-                                                          config.resource))
+                std::make_unique<engine::SessionEngine>(*config.sessions, config.resource))
         , flight_server_(core_) {
         assert(log_.is_valid());
         assert(config.resource != nullptr && "memory resource must not be null");
+        assert(config.sessions != nullptr && "the session factory must not be null");
+        assert(threads_ > 0 && "the Flight SQL server needs at least one thread");
         log_->info("FlightSQLServer initialized successfully");
     }
 

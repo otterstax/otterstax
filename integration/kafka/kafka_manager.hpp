@@ -10,6 +10,7 @@
 #include <components/cursor/cursor.hpp>
 #include <components/log/log.hpp>
 #include <components/logical_plan/execution_plan.hpp>
+#include <components/catalog/results/ddl_result.hpp>
 #include <components/table/column_definition.hpp>
 #include <core/result_wrapper.hpp>
 
@@ -22,8 +23,10 @@
 #include <memory_resource>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace otterstax::kafka {
@@ -32,6 +35,24 @@ namespace otterstax::kafka {
         class kafka_producer_t;
         class kafka_stream_t;
     } // namespace detail
+
+    // The names of the registered objects (SOURCEs, STREAMs, INSERT INTO
+    // queries), readable from any thread: what the query session asks of an
+    // INSERT whose target's last part could be one, before it completes the
+    // target with its place (main.kafka.<name> is the object) — a lookup under
+    // the lock, no message on the INSERT's path. Written by the KafkaManager's
+    // loop as it registers and forgets objects; owned by the KafkaManager, which
+    // outlives every query session.
+    class kafka_object_names_t final {
+    public:
+        [[nodiscard]] bool contains(std::string_view name) const;
+        void insert(const std::string& name);
+        void erase(const std::string& name);
+
+    private:
+        mutable std::mutex mutex_;
+        std::unordered_set<std::string> names_;
+    };
 
     // Runtime owner of kafka SOURCE / STREAM objects. On a kafka_node_t (CREATE/DROP)
     // it creates the backing otterbrix table and records the binding:
@@ -46,7 +67,7 @@ namespace otterstax::kafka {
         // start_pollers: when true, CREATE SOURCE also launches a background
         // ingestion poller per source (needs a reachable broker). Off by default
         // so broker-free unit/system tests don't spawn consumer threads;
-        // component_manager turns it on
+        // main.cpp turns it on in the server
         KafkaManager(std::pmr::memory_resource* resource,
                      actor_zeta::address_t engine_dispatcher_address,
                      bool start_pollers = false);
@@ -55,13 +76,13 @@ namespace otterstax::kafka {
         std::pmr::memory_resource* resource() const noexcept { return resource_; }
 
         // Handle one parsed kafka DDL statement. Returns an (empty) success
-        // cursor or an error cursor — the Scheduler completes the session off it
+        // cursor or an error cursor — the query session completes the session off it
         actor_zeta::unique_future<components::cursor::cursor_t_ptr> execute(session_hash_t id, kafka_node_ptr node);
 
         // Publish the rows of an `INSERT INTO kafka.<obj>` to the object's topic
         // `source` is the insert's source subplan, executed here to materialise the
         // rows (no table write); the object's poller re-ingests them. Returns an
-        // (empty) success cursor or an error cursor — the Scheduler completes off it
+        // (empty) success cursor or an error cursor — the query session completes off it
         actor_zeta::unique_future<components::cursor::cursor_t_ptr>
         produce(session_hash_t id, std::string relname, components::logical_plan::node_ptr source);
 
@@ -77,14 +98,25 @@ namespace otterstax::kafka {
         actor_zeta::unique_future<components::cursor::cursor_t_ptr>
         add_stream_insert(session_hash_t id, std::string stream, std::string insert_sql);
 
-        // Relaunch persisted SOURCEs after an engine restart. Called
-        // by component_manager AFTER full init (scheduler/executor pool started); NOT
-        // from the ctor (which runs mid-spawn — a poller started that early races the
-        // half-initialised engine). No-op unless start_pollers_. Reads kafka.__sources,
-        // re-reads each backing table's columns from the catalog, rebuilds registry_,
-        // relaunches pollers (Phase 2 table-seek then resumes from kafka.<src>__offsets)
+        // The registered objects' names, for the query sessions.
+        const kafka_object_names_t& object_names() const noexcept { return object_names_; }
+
+        // The startup of the Kafka objects. Called by main.cpp AFTER full init
+        // (engine open, connections registered); NOT from the ctor (which runs
+        // mid-spawn — a poller started that early races the half-initialised
+        // engine). Makes the schemas main.kafka and federation.kafka and the table
+        // federation.kafka.__sources exist (storage_plans), then — with
+        // start_pollers_ only — reads __sources, re-reads each backing table's
+        // columns (the engine's describe), rebuilds registry_ and relaunches the
+        // pollers (Phase 2 table-seek then resumes from federation.kafka.<src>__offsets)
         // Drives the dispatcher directly (no actor mailbox), safe to call inline
         void recover();
+
+        // Test seam: whether an ingestion poller is registered for source `name`.
+        // Reads pollers_ off the actor loop without a lock, so call it only while
+        // no message is in flight (after the reply future of the last send was
+        // driven to ready — the reply publishes the loop's writes)
+        bool has_poller(const std::string& name) const { return pollers_.count(name) != 0; }
 
         using dispatch_traits = actor_zeta::
             dispatch_traits<&KafkaManager::execute, &KafkaManager::produce, &KafkaManager::add_stream_insert>;
@@ -101,6 +133,16 @@ namespace otterstax::kafka {
             std::vector<kafka_column_t> columns;
             std::unordered_map<std::string, std::string> options;
             std::string as_select; // streams only
+            // Streams and INSERT INTO queries: the kafka object their SELECT reads
+            // (the SELECT's FROM). Empty for a SOURCE. What DROP ... RESTRICT asks
+            // about and DROP ... CASCADE follows
+            std::string source;
+        };
+
+        // A stream or INSERT INTO query that reads another kafka object
+        struct reader_t {
+            std::string name;
+            bool insert_query; // false: a STREAM
         };
 
         // Async hand-off of a finished plan to the engine's manager_dispatcher_t
@@ -114,22 +156,65 @@ namespace otterstax::kafka {
         actor_zeta::unique_future<components::cursor::cursor_t_ptr> handle_drop_source(kafka_node_ptr node);
         actor_zeta::unique_future<components::cursor::cursor_t_ptr> handle_drop_stream(kafka_node_ptr node);
 
-        // CREATE DATABASE "kafka" IF NOT EXISTS — idempotent across restarts
-        actor_zeta::unique_future<components::cursor::cursor_t_ptr> ensure_database();
+        // What the Kafka objects are stored in, each idempotent across restarts:
+        // CREATE DATABASE IF NOT EXISTS federation (OtterStax's service database,
+        // also made by the remote tables' registration), CREATE SCHEMA IF NOT
+        // EXISTS federation.kafka and main.kafka, CREATE TABLE IF NOT EXISTS
+        // federation.kafka.__sources
+        std::vector<components::logical_plan::execution_plan_t> storage_plans();
+        // storage_plans() once per process (recover() runs them at startup); an
+        // error cursor when one is refused — a CREATE that cannot persist its
+        // metadata must fail rather than come up unrecoverable
+        actor_zeta::unique_future<components::cursor::cursor_t_ptr> ensure_storage();
 
-        // CREATE TABLE kafka.<name> (columns) [IF NOT EXISTS]. Non-coroutine
-        // (returns the send() future); the caller co_awaits
+        // CREATE TABLE <name> (columns) [IF NOT EXISTS], plan only
+        components::logical_plan::execution_plan_t
+        create_table_plan(const qualified_name_t& name,
+                          std::vector<components::table::column_definition_t> columns,
+                          bool if_not_exists);
+        // create_table_plan sent. Non-coroutine (returns the send() future); the
+        // caller co_awaits
         actor_zeta::unique_future<components::cursor::cursor_t_ptr>
-        create_table(const std::string& name,
+        create_table(const qualified_name_t& name,
                      std::vector<components::table::column_definition_t> columns,
                      bool if_not_exists);
-        // DROP TABLE kafka.<name>. Non-coroutine (returns the send() future); a
-        // missing table is reported by the engine as table_not_exists
-        actor_zeta::unique_future<components::cursor::cursor_t_ptr> drop_table(const std::string& name);
-        // Drop a SOURCE's backing table and its __offsets table. The backing table's
-        // result decides the outcome; an absent __offsets table is not an error
-        // (a half-created source must still be removable)
-        actor_zeta::unique_future<components::cursor::cursor_t_ptr> drop_source_tables(const std::string& name);
+        // DROP TABLE <name> RESTRICT | CASCADE. Non-coroutine (returns the
+        // send() future); a missing table is reported by the engine as
+        // table_not_exists, a RESTRICT drop under a dependent VIEW as
+        // dependent_objects_still_exist
+        actor_zeta::unique_future<components::cursor::cursor_t_ptr>
+        drop_table(const qualified_name_t& name, components::catalog::drop_behavior_t behavior);
+        // Drop a SOURCE's backing table with `behavior`, then — only when that
+        // drop succeeded or found no table — its internal __offsets table
+        // (always CASCADE). Answers the backing table's result: a refused or
+        // failed drop leaves both tables as they were. A failed __offsets drop is
+        // logged, never answered: the source is gone by then, and an absent
+        // __offsets table is not an error (a half-created source must still be
+        // removable)
+        actor_zeta::unique_future<components::cursor::cursor_t_ptr>
+        drop_source_tables(const std::string& name, components::catalog::drop_behavior_t behavior);
+
+        // The streams and INSERT INTO queries outside `name`'s own set (the object
+        // itself plus, for a STREAM, its INSERT INTO queries) that read an object
+        // of that set, sorted by name — what DROP ... RESTRICT refuses over
+        std::vector<reader_t> blocking_readers(const std::string& name) const;
+        // Every stream-like object DROP ... CASCADE of `name` takes: `name`'s own
+        // set and, transitively, every reader of an object already taken together
+        // with that reader's own set. `name` itself is included only when it is a
+        // stream-like object (not a SOURCE)
+        std::vector<std::string> cascade_closure(const std::string& name) const;
+        // Stop + forget stream-like objects (worker, registry, producer, INSERT
+        // query bookkeeping) and delete their federation.kafka.__sources rows. A row that
+        // cannot be deleted is logged — the object is already stopped and
+        // unregistered, and recover() deletes a row whose source is gone
+        actor_zeta::unique_future<components::cursor::cursor_t_ptr>
+        forget_stream_objects(std::vector<std::string> names);
+        // The RESTRICT refusal of DROP SOURCE `name` by the engine, its dependent
+        // named: the oid in the engine's DETAIL resolved through pg_class /
+        // pg_namespace. Falls back to the engine's own message when the oid
+        // cannot be resolved
+        actor_zeta::unique_future<components::cursor::cursor_t_ptr>
+        describe_restrict_refusal(const std::string& name, components::cursor::cursor_t_ptr refused);
 
         // Lazily open (and cache) the topic producer for a kafka object; returns the
         // cached producer or an error if the broker connection could not be opened
@@ -140,21 +225,15 @@ namespace otterstax::kafka {
         // The kafka object registry is in-memory, so a restart would forget every
         // SOURCE and never relaunch its poller (the engine recovers the backing
         // tables but nothing restarts ingestion). We persist each object's options
-        // to a kafka.__sources table; on startup recover() reads it back, re-reads
-        // the columns from the recovered backing table through the engine-side
-        // schema probe (otterbrix/operators/schema_probe.hpp — the answer comes off
-        // the validated plan, so an empty table has a schema too), rebuilds
-        // registry_, and relaunches the pollers (Phase 2 table-seek then resumes
-        // from kafka.<src>__offsets). Columns are NOT stored — the catalog is their
-        // single source of truth
+        // to federation.kafka.__sources; on startup recover() reads it back,
+        // re-reads the columns of the recovered backing table (the engine's
+        // describe of SELECT * FROM main.kafka.<src>: typed from the catalog, so an
+        // empty table has a schema too), rebuilds registry_, and relaunches the
+        // pollers (Phase 2 table-seek then resumes from
+        // federation.kafka.<src>__offsets). Columns are NOT stored — the catalog is
+        // their single source of truth
 
-        // CREATE TABLE kafka.__sources IF NOT EXISTS (idempotent across restarts)
-        actor_zeta::unique_future<components::cursor::cursor_t_ptr> ensure_sources_table();
-        // co_await ensure_sources_table() once per process (idempotent guard).
-        // Returns an error cursor when the table could not be ensured — a CREATE
-        // that cannot persist its metadata must fail rather than come up unrecoverable
-        actor_zeta::unique_future<components::cursor::cursor_t_ptr> ensure_sources_table_once();
-        // INSERT one object's options into kafka.__sources (called before register)
+        // INSERT one object's options into federation.kafka.__sources (called before register)
         // Returns the engine future — co_awaited inside execute (NOT spun, so it
         // composes with the handler coroutine)
         actor_zeta::unique_future<components::cursor::cursor_t_ptr> persist_source_meta(const std::string& name,
@@ -165,12 +244,17 @@ namespace otterstax::kafka {
                                                                                         const std::string& offset_reset,
                                                                                         bool transactional,
                                                                                         const std::string& as_select);
-        // DELETE one object's row from kafka.__sources (called on DROP). co_awaited
+        // DELETE one object's row from federation.kafka.__sources (called on DROP). co_awaited
         actor_zeta::unique_future<components::cursor::cursor_t_ptr> delete_source_meta(const std::string& name);
         // Launch the ingestion poller for an already-registered source
         // (registry_[name] supplies columns + options). Shared by CREATE SOURCE and
         // recover(). Logs and leaves the poller absent on failure
         void launch_source_poller(const std::string& name, bool transactional);
+        // registry_[name] = object, its name published in object_names_.
+        void register_object(const std::string& name, kafka_object_t object);
+        // registry_ and object_names_ without `name`.
+        void forget_object(const std::string& name);
+
         // Launch the continuous-query worker for an already-registered stream
         // (registry_[name].as_select + options; its source must already be in
         // registry_). Shared by CREATE STREAM and recover(). Logs + skips on failure
@@ -180,9 +264,11 @@ namespace otterstax::kafka {
         actor_zeta::address_t dispatcher_address_;
         log_t log_;
         bool start_pollers_;
-        bool database_ensured_{false};
-        bool sources_table_ensured_{false}; // kafka.__sources created this process
+        bool storage_ensured_{false}; // storage_plans() run this process
+        // Written only through register_object / forget_object, which keep
+        // object_names_ in step.
         std::unordered_map<std::string, kafka_object_t> registry_;
+        kafka_object_names_t object_names_;
         std::unordered_map<std::string, std::unique_ptr<detail::kafka_poller_t>> pollers_;
         std::unordered_map<std::string, std::unique_ptr<detail::kafka_producer_t>> producers_;
         std::unordered_map<std::string, std::unique_ptr<detail::kafka_stream_t>> streams_;

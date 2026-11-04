@@ -133,7 +133,7 @@ namespace {
                 break;
         }
         return tsl::make_error(res,
-                               core::error_code_t::conversion_failure,
+                               core::error_code_t::unimplemented_yet,
                                "to_arrow_schema: column '" + field_name(t) + "' has logical type " +
                                    std::to_string(static_cast<int>(t.type())) + " (physical type " +
                                    std::to_string(static_cast<int>(t.to_physical_type())) +
@@ -192,21 +192,18 @@ namespace {
 
         ca::arrow_schema_wrapper_t schema;
         ca::arrow_array_wrapper_t array;
-        // The exporter reports a type it has no mapping for by throwing. exported_natively admits
-        // none such, so a throw here is a broken invariant (or an allocation failure) — reported
-        // as a value at this boundary, never let out of the translator.
-        try {
-            ca::to_arrow_schema(&schema.arrow_schema, view_types);
-            ca::to_arrow_array(view, &array.arrow_array);
-        } catch (const std::exception& e) {
-            return tsl::make_error(res,
-                                   core::error_code_t::conversion_failure,
-                                   std::string{"chunk_to_record_batch: native export failed: "} + e.what());
+        // exported_natively admits no type the exporter has no mapping for, so a refusal here is
+        // a broken invariant (or an allocation failure), reported with the exporter's code.
+        if (auto described = ca::to_arrow_schema(res, &schema.arrow_schema, view_types); described.contains_error()) {
+            return described;
+        }
+        if (auto exported = ca::to_arrow_array(view, &array.arrow_array); exported.contains_error()) {
+            return exported;
         }
         // Takes both structs over (the wrappers release whatever an import leaves behind).
         auto batch = arrow::ImportRecordBatch(&array.arrow_array, &schema.arrow_schema);
         if (!batch.ok()) {
-            return tsl::arrow_error(res, core::error_code_t::conversion_failure,
+            return tsl::arrow_error(res, core::error_code_t::internal_error,
                                     "chunk_to_record_batch: import batch", batch.status());
         }
         return (*batch)->columns();
@@ -276,7 +273,7 @@ make_batch(std::pmr::memory_resource* res, const data_chunk_t& chunk, bool large
     if (nrows == 0) {
         auto empty = arrow::RecordBatch::MakeEmpty(schema, tsl::arrow_pool(res));
         if (!empty.ok()) {
-            return tsl::arrow_error(res, core::error_code_t::conversion_failure, "chunk_to_record_batch: empty batch",
+            return tsl::arrow_error(res, core::error_code_t::internal_error, "chunk_to_record_batch: empty batch",
                                     empty.status());
         }
         return std::move(*empty);
@@ -305,7 +302,7 @@ make_batch(std::pmr::memory_resource* res, const data_chunk_t& chunk, bool large
             const auto& expected = schema->field(static_cast<int>(native[i]))->type();
             if (!native_arrays[i]->type()->Equals(*expected)) {
                 return tsl::make_error(res,
-                                       core::error_code_t::conversion_failure,
+                                       core::error_code_t::internal_error,
                                        "chunk_to_record_batch: column '" + field_name(types[native[i]]) +
                                            "' was exported as " + native_arrays[i]->type()->ToString() + ", not " +
                                            expected->ToString());
@@ -321,20 +318,20 @@ make_batch(std::pmr::memory_resource* res, const data_chunk_t& chunk, bool large
     {                                                                                                     \
         arrow::Builder b{pool};                                                                           \
         if (auto st = b.Reserve(nrows); !st.ok()) {                                                       \
-            return tsl::arrow_error(res, core::error_code_t::conversion_failure,                         \
+            return tsl::arrow_error(res, core::error_code_t::internal_error,                         \
                                     "chunk_to_record_batch: reserve", st);                               \
         }                                                                                                 \
         for (int64_t r = 0; r < nrows; r++) {                                                            \
-            auto v = chunk.value(static_cast<uint64_t>(c), static_cast<uint64_t>(r));                    \
-            auto st = v.is_null() ? b.AppendNull() : b.Append(v.value<cpp_type>());                       \
+            const auto row = static_cast<uint64_t>(r);                                                    \
+            auto st = column.is_null(row) ? b.AppendNull() : b.Append(column.get_value<cpp_type>(row));   \
             if (!st.ok()) {                                                                               \
-                return tsl::arrow_error(res, core::error_code_t::conversion_failure,                     \
+                return tsl::arrow_error(res, core::error_code_t::internal_error,                         \
                                         "chunk_to_record_batch: append", st);                            \
             }                                                                                             \
         }                                                                                                 \
         std::shared_ptr<arrow::Array> arr;                                                                \
         if (auto st = b.Finish(&arr); !st.ok()) {                                                         \
-            return tsl::arrow_error(res, core::error_code_t::conversion_failure,                         \
+            return tsl::arrow_error(res, core::error_code_t::internal_error,                             \
                                     "chunk_to_record_batch: finish", st);                                \
         }                                                                                                 \
         arrays.push_back(std::move(arr));                                                                 \
@@ -346,6 +343,7 @@ make_batch(std::pmr::memory_resource* res, const data_chunk_t& chunk, bool large
             arrays.push_back(native_arrays[next_native++]);
             continue;
         }
+        const auto& column = chunk.data[c];
         if (travels_as_decimal(types[c])) {
             // The schema field for this column is decimal128(precision, scale) and a builder
             // carries its own type, so both must name it. What is appended is the stored
@@ -355,29 +353,29 @@ make_batch(std::pmr::memory_resource* res, const data_chunk_t& chunk, bool large
             const std::string name = field_name(types[c]);
             arrow::Decimal128Builder b{arrow::decimal128(spec.precision, spec.scale), pool};
             if (auto st = b.Reserve(nrows); !st.ok()) {
-                return tsl::arrow_error(res, core::error_code_t::conversion_failure,
+                return tsl::arrow_error(res, core::error_code_t::internal_error,
                                         "chunk_to_record_batch: reserve", st);
             }
             for (int64_t r = 0; r < nrows; r++) {
-                auto v = chunk.value(static_cast<uint64_t>(c), static_cast<uint64_t>(r));
+                const auto row = static_cast<uint64_t>(r);
                 arrow::Status st;
-                if (v.is_null()) {
+                if (column.is_null(row)) {
                     st = b.AppendNull();
                 } else {
-                    auto carried = to_arrow_decimal(res, v, "chunk_to_record_batch", name);
+                    auto carried = to_arrow_decimal(res, column, row, "chunk_to_record_batch", name);
                     if (carried.has_error()) {
                         return carried.convert_error<std::shared_ptr<arrow::RecordBatch>>();
                     }
                     st = b.Append(carried.value());
                 }
                 if (!st.ok()) {
-                    return tsl::arrow_error(res, core::error_code_t::conversion_failure,
+                    return tsl::arrow_error(res, core::error_code_t::internal_error,
                                             "chunk_to_record_batch: append decimal", st);
                 }
             }
             std::shared_ptr<arrow::Array> arr;
             if (auto st = b.Finish(&arr); !st.ok()) {
-                return tsl::arrow_error(res, core::error_code_t::conversion_failure,
+                return tsl::arrow_error(res, core::error_code_t::internal_error,
                                         "chunk_to_record_batch: finish", st);
             }
             arrays.push_back(std::move(arr));
@@ -398,21 +396,21 @@ make_batch(std::pmr::memory_resource* res, const data_chunk_t& chunk, bool large
             case physical_type::STRING: {
                 arrow::StringBuilder b{pool};
                 if (auto st = b.Reserve(nrows); !st.ok()) {
-                    return tsl::arrow_error(res, core::error_code_t::conversion_failure,
+                    return tsl::arrow_error(res, core::error_code_t::internal_error,
                                             "chunk_to_record_batch: reserve", st);
                 }
                 for (int64_t r = 0; r < nrows; r++) {
-                    auto v = chunk.value(static_cast<uint64_t>(c),
-                                        static_cast<uint64_t>(r));
-                    auto st = v.is_null() ? b.AppendNull() : b.Append(v.value<const std::string&>());
+                    const auto row = static_cast<uint64_t>(r);
+                    auto st = column.is_null(row) ? b.AppendNull()
+                                                  : b.Append(column.get_value<std::string_view>(row));
                     if (!st.ok()) {
-                        return tsl::arrow_error(res, core::error_code_t::conversion_failure,
+                        return tsl::arrow_error(res, core::error_code_t::internal_error,
                                                 "chunk_to_record_batch: append string", st);
                     }
                 }
                 std::shared_ptr<arrow::Array> arr;
                 if (auto st = b.Finish(&arr); !st.ok()) {
-                    return tsl::arrow_error(res, core::error_code_t::conversion_failure,
+                    return tsl::arrow_error(res, core::error_code_t::internal_error,
                                             "chunk_to_record_batch: finish", st);
                 }
                 arrays.push_back(std::move(arr));
@@ -423,12 +421,12 @@ make_batch(std::pmr::memory_resource* res, const data_chunk_t& chunk, bool large
                 // the faithful representation, not a stand-in.
                 arrow::NullBuilder b{pool};
                 if (auto st = b.AppendNulls(nrows); !st.ok()) {
-                    return tsl::arrow_error(res, core::error_code_t::conversion_failure,
+                    return tsl::arrow_error(res, core::error_code_t::internal_error,
                                             "chunk_to_record_batch: append nulls", st);
                 }
                 std::shared_ptr<arrow::Array> arr;
                 if (auto st = b.Finish(&arr); !st.ok()) {
-                    return tsl::arrow_error(res, core::error_code_t::conversion_failure,
+                    return tsl::arrow_error(res, core::error_code_t::internal_error,
                                             "chunk_to_record_batch: finish", st);
                 }
                 arrays.push_back(std::move(arr));
@@ -437,7 +435,7 @@ make_batch(std::pmr::memory_resource* res, const data_chunk_t& chunk, bool large
             default:
                 // Unreachable after validate_writable_columns; kept as an error so a new
                 // physical type can never fall through to a wrong array.
-                return tsl::make_error(res, core::error_code_t::conversion_failure,
+                return tsl::make_error(res, core::error_code_t::internal_error,
                                        "chunk_to_record_batch: unsupported column type");
         }
     }
@@ -462,20 +460,21 @@ chunk_to_file_batch(std::pmr::memory_resource* res, const data_chunk_t& chunk) {
 }
 
 core::result_wrapper_t<arrow::Decimal128> to_arrow_decimal(std::pmr::memory_resource* res,
-                                                           const components::types::logical_value_t& value,
+                                                           const components::vector::vector_t& column,
+                                                           uint64_t row,
                                                            std::string_view scope,
                                                            std::string_view column_name) {
-    const auto& type = value.type();
+    const auto& type = column.type();
     const auto spec = spec_of(type);
     const auto stored_as = type.to_physical_type();
 
     // The engine keeps a DECIMAL's unscaled integer at the width its precision needs, so it is
     // read back at that same width and sign-extended; reading a narrower one as int128 would
     // take the neighbouring bytes with it. A HUGEINT is already 128 bits wide.
-    const auto raw_storage = tsl::read_unscaled_decimal(type, value);
+    const auto raw_storage = tsl::read_unscaled_decimal(column, row);
     if (!raw_storage.has_value()) {
         return tsl::make_error(res,
-                               core::error_code_t::conversion_failure,
+                               core::error_code_t::internal_error,
                                std::string{scope} + ": column '" + std::string{column_name} +
                                    "' is stored at a width no decimal carrier reads");
     }
@@ -486,7 +485,7 @@ core::result_wrapper_t<arrow::Decimal128> to_arrow_decimal(std::pmr::memory_reso
     // put a perfectly finite number where the engine holds none.
     if (type.type() == types::logical_type::DECIMAL && types::decimal_special::is_special(stored_as, raw)) {
         return tsl::make_error(res,
-                               core::error_code_t::conversion_failure,
+                               core::error_code_t::unimplemented_yet,
                                std::string{scope} + ": column '" + std::string{column_name} +
                                    "' holds a non-finite DECIMAL (the engine's Infinity / NaN sentinel), which "
                                    "decimal128 has no representation for");
@@ -502,7 +501,7 @@ core::result_wrapper_t<arrow::Decimal128> to_arrow_decimal(std::pmr::memory_reso
     // and every stream readable under the schema it declares.
     if (!carried.FitsInPrecision(spec.precision)) {
         return tsl::make_error(res,
-                               core::error_code_t::conversion_failure,
+                               core::error_code_t::numeric_value_out_of_range,
                                std::string{scope} + ": column '" + std::string{column_name} + "' holds " +
                                    carried.ToString(0) + ", which decimal128(" + std::to_string(spec.precision) +
                                    ", " + std::to_string(spec.scale) +

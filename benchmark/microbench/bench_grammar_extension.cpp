@@ -110,7 +110,7 @@ static void BM_registry_parse_s3_create(benchmark::State& state) {
     auto registry = make_registry();
     for (auto _ : state) {
         std::pmr::monotonic_buffer_resource arena;
-        auto* tree = raw_parser(&arena, kS3Create, registry);
+        auto tree = raw_parser(&arena, kS3Create, registry);
         benchmark::DoNotOptimize(tree);
     }
 }
@@ -120,7 +120,7 @@ static void BM_registry_parse_file_create(benchmark::State& state) {
     auto registry = make_registry();
     for (auto _ : state) {
         std::pmr::monotonic_buffer_resource arena;
-        auto* tree = raw_parser(&arena, kFileCreate, registry);
+        auto tree = raw_parser(&arena, kFileCreate, registry);
         benchmark::DoNotOptimize(tree);
     }
 }
@@ -132,7 +132,7 @@ static void BM_registry_parse_core_select(benchmark::State& state) {
     auto registry = make_registry();
     for (auto _ : state) {
         std::pmr::monotonic_buffer_resource arena;
-        auto* tree = raw_parser(&arena, kCoreSelect, registry);
+        auto tree = raw_parser(&arena, kCoreSelect, registry);
         benchmark::DoNotOptimize(tree);
     }
 }

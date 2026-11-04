@@ -9,7 +9,7 @@ it returns must not run a CREATE or an INSERT again. show() prints the text the
 server lays out (Spark's Dataset.showString); the expected text is rebuilt here
 by the same rules.
 
-setup() creates a local database under a unique name (the matrix runs several
+setup() creates a local schema (of `main`, the session's place) under a unique name (the matrix runs several
 clients against one server at once) with a table for show() and one for the
 run-once checks; cleanup() drops them.
 
@@ -17,7 +17,7 @@ Cases:
   test_sql_derived_table_mysql — spark.sql(<derived table over campaigns>).collect() = the rows filtered in Python
   test_sql_derived_table_pg    — spark.sql(<GROUP BY derived table over products>).collect() = the sums added in Python
   test_sql_count               — spark.sql("SELECT ...").count() = the statement's row count
-  test_sql_ddl_runs_once       — collect() on the DataFrames of CREATE DATABASE / CREATE TABLE does not run them again
+  test_sql_ddl_runs_once       — collect() on the DataFrames of CREATE SCHEMA / CREATE TABLE does not run them again
   test_sql_insert_runs_once    — collect(), twice, on the DataFrame of an INSERT leaves the one row it inserted
   test_show                    — df.show(): header, separators, NULL, a long string cut to 20 characters with "..."
   test_show_top_rows           — df.show(3): three rows, then "only showing top 3 rows"
@@ -45,7 +45,7 @@ from pyspark.sql import SparkSession
 
 import config
 
-CAMPAIGNS = "campaigns.db1.campaigns"  # MySQL: campaign_id, campaign_name, campaign_length, budget
+CAMPAIGNS = "campaigns.db1.public.campaigns"  # MySQL: campaign_id, campaign_name, campaign_length, budget
 PRODUCTS = "products.pgdb.public.products"    # PostgreSQL: product_id, campaign_id, product_name, price, category
 
 # A derived table over each mirror. Sums of two-decimal prices never equal
@@ -68,10 +68,10 @@ class SparkSqlAndShowTest:
         self.url = f"sc://{config.get_host(local)}:{config.SPARK_CONNECT_PORT}"
         self.db = f"spark_sql_{uuid.uuid4().hex[:8]}"
         self.spark = None
-        self.created_db = None     # the DataFrame spark.sql() returned for CREATE DATABASE
+        self.created_db = None     # the DataFrame spark.sql() returned for CREATE SCHEMA
         self.created_table = None  # ... and for CREATE TABLE <ONCE_TABLE>
         self.tables = []           # local tables to drop, in creation order
-        print(f"PySpark client {pyspark.__version__}, Spark Connect server {self.url}, local database {self.db}")
+        print(f"PySpark client {pyspark.__version__}, Spark Connect server {self.url}, local schema main.{self.db}")
 
     # --- helpers ---
 
@@ -161,9 +161,9 @@ class SparkSqlAndShowTest:
     # --- setup / teardown ---
 
     def setup(self):
-        """The session; a local database with the show() table and the run-once table, made through spark.sql()."""
+        """The session; a local schema with the show() table and the run-once table, made through spark.sql()."""
         self.spark = SparkSession.builder.remote(self.url).getOrCreate()
-        self.created_db = self.spark.sql(f"CREATE DATABASE {self.db}")
+        self.created_db = self.spark.sql(f"CREATE SCHEMA {self.db}")
         self.spark.sql(f"CREATE TABLE {self.db}.{SHOW_TABLE} (id bigint, name string)")
         self.tables.append(SHOW_TABLE)
         values = ", ".join(f"({i}, {self.literal(name)})" for i, name in SHOW_ROWS)
@@ -179,7 +179,7 @@ class SparkSqlAndShowTest:
             for table in reversed(self.tables):
                 self.spark.sql(f"DROP TABLE {self.db}.{table}")
             if self.created_db is not None:
-                self.spark.sql(f"DROP DATABASE {self.db}")
+                self.spark.sql(f"DROP SCHEMA {self.db}")
         finally:
             self.spark.stop()
 
@@ -217,13 +217,13 @@ class SparkSqlAndShowTest:
         print(f"  ✅ spark.sql(...).count(): {len(expected)} (derived table), {products} (products)")
 
     def test_sql_ddl_runs_once(self):
-        """Collecting the DataFrames of CREATE DATABASE and CREATE TABLE does not run them again."""
-        # A second CREATE of the same database or table would fail: it exists.
+        """Collecting the DataFrames of CREATE SCHEMA and CREATE TABLE does not run them again."""
+        # A second CREATE of the same schema or table would fail: it exists.
         self.created_db.collect()
         self.created_table.collect()
         self.assert_equal(self.spark.sql(f"SELECT id FROM {self.db}.{ONCE_TABLE}").collect(), [],
                           f"{ONCE_TABLE} after collecting its CREATE TABLE")
-        print("  ✅ collect() on CREATE DATABASE / CREATE TABLE ran neither again")
+        print("  ✅ collect() on CREATE SCHEMA / CREATE TABLE ran neither again")
 
     def test_sql_insert_runs_once(self):
         """Collecting the DataFrame of an INSERT, twice, leaves the one row the INSERT wrote."""

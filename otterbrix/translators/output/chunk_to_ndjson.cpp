@@ -9,7 +9,7 @@
 
 #include "utility/tracy_profiler.hpp"
 
-#include <components/types/logical_value.hpp>
+#include <components/vector/vector.hpp>
 #include <components/types/types.hpp>
 #include <core/date/date_to_string.hpp>
 
@@ -68,10 +68,11 @@ void write_floating(std::ostream& out, T value) {
 
 core::result_wrapper_t<bool> write_value(std::pmr::memory_resource* res,
                                          std::ostream& out,
-                                         const components::types::logical_value_t& val,
+                                         const components::vector::vector_t& column,
+                                         uint64_t row,
                                          std::string_view column_name) {
     using components::types::physical_type;
-    if (val.is_null()) {
+    if (column.is_null(row)) {
         out << "null";
         return true;
     }
@@ -81,12 +82,12 @@ core::result_wrapper_t<bool> write_value(std::pmr::memory_resource* res,
     // 128-bit integer below it goes out as a JSON *string*, not a number: JSON has one number
     // type and readers carry it in a double, so the digits a scale exists to keep would be
     // rounded away in the reader even when written correctly here.
-    if (val.type().type() == components::types::logical_type::DECIMAL) {
-        auto carried = to_arrow_decimal(res, val, "chunk_to_ndjson", column_name);
+    if (column.type().type() == components::types::logical_type::DECIMAL) {
+        auto carried = to_arrow_decimal(res, column, row, "chunk_to_ndjson", column_name);
         if (carried.has_error()) {
             return carried.convert_error<bool>();
         }
-        const auto scale = val.type().extension_as<components::types::decimal_logical_type_extension>()->scale();
+        const auto scale = column.type().extension_as<components::types::decimal_logical_type_extension>()->scale();
         out << '"' << carried.value().ToString(static_cast<int32_t>(scale)) << '"';
         return true;
     }
@@ -98,18 +99,18 @@ core::result_wrapper_t<bool> write_value(std::pmr::memory_resource* res,
         namespace cd = core::date;
         using components::types::logical_type;
         std::string text;
-        switch (val.type().type()) {
+        switch (column.type().type()) {
             case logical_type::DATE:
-                text = cd::to_string(val.value<cd::date_t>());
+                text = cd::to_string(column.get_value<cd::date_t>(row));
                 break;
             case logical_type::TIME:
-                text = cd::to_string(val.value<cd::time_t>());
+                text = cd::to_string(column.get_value<cd::time_t>(row));
                 break;
             case logical_type::TIMESTAMP:
-                text = cd::to_string(val.value<cd::timestamp_t>());
+                text = cd::to_string(column.get_value<cd::timestamp_t>(row));
                 break;
             case logical_type::TIMESTAMP_TZ:
-                text = cd::to_string(val.value<cd::timestamptz_t>());
+                text = cd::to_string(column.get_value<cd::timestamptz_t>(row));
                 break;
             default:
                 break;
@@ -128,24 +129,24 @@ core::result_wrapper_t<bool> write_value(std::pmr::memory_resource* res,
     // has one number type and readers carry it in a double, so a bare number is rounded
     // above 2^53 — Arrow's own JSON reader infers double for anything past int64 and
     // reads 2^64 back as 1.8446744073709552e+19. The digits are exact inside a string.
-    switch (val.type().to_physical_type()) {
-        case physical_type::BOOL:   out << (val.value<bool>() ? "true" : "false"); break;
-        case physical_type::INT8:   write_number(out, static_cast<int>(val.value<int8_t>())); break;
-        case physical_type::INT16:  write_number(out, val.value<int16_t>()); break;
-        case physical_type::INT32:  write_number(out, val.value<int32_t>()); break;
-        case physical_type::INT64:  write_number(out, val.value<int64_t>()); break;
-        case physical_type::UINT8:  write_number(out, static_cast<unsigned>(val.value<uint8_t>())); break;
-        case physical_type::UINT16: write_number(out, val.value<uint16_t>()); break;
-        case physical_type::UINT32: write_number(out, val.value<uint32_t>()); break;
-        case physical_type::UINT64: write_number(out, val.value<uint64_t>()); break;
+    switch (column.type().to_physical_type()) {
+        case physical_type::BOOL:   out << (column.get_value<bool>(row) ? "true" : "false"); break;
+        case physical_type::INT8:   write_number(out, static_cast<int>(column.get_value<int8_t>(row))); break;
+        case physical_type::INT16:  write_number(out, column.get_value<int16_t>(row)); break;
+        case physical_type::INT32:  write_number(out, column.get_value<int32_t>(row)); break;
+        case physical_type::INT64:  write_number(out, column.get_value<int64_t>(row)); break;
+        case physical_type::UINT8:  write_number(out, static_cast<unsigned>(column.get_value<uint8_t>(row))); break;
+        case physical_type::UINT16: write_number(out, column.get_value<uint16_t>(row)); break;
+        case physical_type::UINT32: write_number(out, column.get_value<uint32_t>(row)); break;
+        case physical_type::UINT64: write_number(out, column.get_value<uint64_t>(row)); break;
         case physical_type::INT128:
-            out << '"' << val.value<components::types::int128_t>() << '"';
+            out << '"' << column.get_value<components::types::int128_t>(row) << '"';
             break;
-        case physical_type::FLOAT:  write_floating(out, val.value<float>()); break;
-        case physical_type::DOUBLE: write_floating(out, val.value<double>()); break;
+        case physical_type::FLOAT:  write_floating(out, column.get_value<float>(row)); break;
+        case physical_type::DOUBLE: write_floating(out, column.get_value<double>(row)); break;
         case physical_type::STRING:
             out << '"';
-            write_escaped(out, val.value<const std::string&>());
+            write_escaped(out, column.get_value<std::string_view>(row));
             out << '"';
             break;
         default:
@@ -206,10 +207,8 @@ core::result_wrapper_t<bool> chunk_to_ndjson(std::pmr::memory_resource* res,
             out << '{';
             for (size_t c = 0; c < ncols; c++) {
                 out << keys[c];
-                auto written = write_value(res,
-                                           out,
-                                           chunk.value(static_cast<uint64_t>(c), static_cast<uint64_t>(r)),
-                                           types[c].alias());
+                auto written =
+                    write_value(res, out, chunk.data[c], static_cast<uint64_t>(r), types[c].alias());
                 if (written.has_error()) {
                     return written;
                 }

@@ -16,10 +16,10 @@ stages:
     duration_s: 60
     ramp_secs: 2
     query_pool:
-      simple_select:     1   # 25% — LIMIT 100 point reads (2–50 ms)
-      complex_select:    1   # 25% — GROUP BY + HAVING + ORDER BY (5–55 ms)
-      join_same_b:       1   # 25% — same-instance join, Group B ~5 k rows (1–3 s)
-      join_cross_engine: 1   # 25% — cross-engine join, Group B (3–5 s)
+      simple_select:     1   # 25% — LIMIT 100 point reads
+      complex_select:    1   # 25% — GROUP BY + HAVING + ORDER BY
+      join_same_b:       1   # 25% — same-instance join, Group B ~5 k rows
+      join_cross_engine: 1   # 25% — cross-engine join, Group B
 
   - name: medium
     label: "Stage 2 — Medium Load (5 workers/frontend)"

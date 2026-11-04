@@ -92,7 +92,9 @@ std::pmr::vector<data_chunk_t> make_batch(std::pmr::memory_resource* res, int n,
         state.SkipWithError(loaded.error().what.c_str());
         return chunks;
     }
-    chunks.push_back(std::move(loaded.value()));
+    for (auto& chunk : loaded.value()) {
+        chunks.push_back(std::move(chunk));
+    }
     return chunks;
 }
 

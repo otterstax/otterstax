@@ -3,6 +3,7 @@ project(test_unit_config)
 set(${PROJECT_NAME}_SOURCES
     main.cpp
     test_connection_config.cpp
+    test_engine_config.cpp
 )
 
 add_executable(${PROJECT_NAME} ${${PROJECT_NAME}_SOURCES})
@@ -11,6 +12,9 @@ target_include_directories(
     ${PROJECT_NAME} PRIVATE
     ${CMAKE_SOURCE_DIR}
 )
+
+# The repository's config files (load_config: every config yaml of the repository loads).
+target_compile_definitions(${PROJECT_NAME} PRIVATE OTTERSTAX_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 
 target_link_libraries(
     ${PROJECT_NAME} PRIVATE

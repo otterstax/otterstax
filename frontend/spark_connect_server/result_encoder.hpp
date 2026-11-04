@@ -27,7 +27,8 @@ namespace frontend::spark {
     // Converts a session_payload's chunk + schema into ArrowBatch IPC stream bytes.
     //
     // The function never throws: every otterbrix / Arrow failure is mapped to a
-    // `core::error_t` (usually `conversion_failure`). `resource` backs the
+    // `core::error_t` (a column the batch cannot carry: `unimplemented_yet`; an
+    // Arrow failure: `internal_error`). `resource` backs the
     // `std::pmr::string` of any emitted error.
     //
     // `schema` is accepted to mirror `session_payload`'s fields, but the Arrow

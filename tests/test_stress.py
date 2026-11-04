@@ -28,14 +28,17 @@ def make_config(local: bool):
         'mysql_port': 8816,
         'user': 'testuser',
         'password': 'testpass',
-        'mysql_db': 'campaigns.db1',
+        'mysql_db': 'campaigns.db1.public',
     }
 
 
 def _connect(cfg):
+    # Each write is meant to commit on its own and be counted from another
+    # connection: autocommit=True keeps every statement its own transaction.
     return mysql.connector.connect(
         host=cfg['host'], port=cfg['mysql_port'],
         user=cfg['user'], password=cfg['password'],
+        autocommit=True,
     )
 
 

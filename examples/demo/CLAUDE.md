@@ -9,9 +9,9 @@ Everything demo-related lives in this folder (`examples/demo/`). Paths below are
 OtterStax is a federated SQL engine. The demo registers three real backends, one
 S3-compatible object store, and a Kafka broker —
 
-- **MariaDB** (`mysql.bill`) — orders, invoices (ACID transactions)
-- **PostgreSQL** (`pg.shop`) — customers (with ENUM tier), products
-- **ClickHouse** (`ch.ev`) — sessions (with nested struct columns, columnar OLAP)
+- **MariaDB** (`mysql.bill.public`) — orders, invoices (ACID transactions)
+- **PostgreSQL** (`pg.shop.shop`) — customers (with ENUM tier), products
+- **ClickHouse** (`ch.ev.public`) — sessions (with nested struct columns, columnar OLAP)
 - **RustFS** (`s3_alias = 'demo_s3'`) — single bucket `demo-bucket` for the
   external-table demo (steps 7-9)
 - **Kafka / redpanda** (`demo-kafka`, host `127.0.0.1:19093`) — live order-event
@@ -24,7 +24,7 @@ The **Kafka streaming act** is a separate, step-by-step tour under `kafka/`
 write path, continuous streams, and fan-in) — see `kafka/README.md`. It needs
 the `demo-kafka` broker (started by `up.sh`) and the pg/ch connections.
 
-Demo SQL uses the **3-part** qualifier form `<alias>.<db>.<tbl>` (e.g. `mysql.bill.orders`, `pg.shop.customers`, `ch.ev.sessions`). The parser rewrites a 3-part name behind a configured alias to its canonical 4-part shape — the PostgreSQL schema comes from the connection's `schema` in `config.yaml`, MySQL/CH have none — then `sql_gen::table_reference` emits backend-native qualifiers (`db.tbl` for MySQL/CH, `schema.tbl` for PG). See the root `CLAUDE.md`, "Federated Query Syntax". External tables live under the `otter` engine database (`otter.regions`, `otter.promos`) — same database created by step_3a, so the cleanup script tears them down together.
+Demo SQL names every remote table in **4 parts** `<alias>.<database>.<schema>.<table>` (e.g. `mysql.bill.public.orders`, `pg.shop.shop.customers`, `ch.ev.public.sessions`): a MySQL / ClickHouse connection has the one schema `public`, a PostgreSQL connection the schema its `schema:` names (`shop` here). Three parts are always a local table (`d.s.t`). The psql clients connect to the database `main` (a database the engine does not have is refused, `FATAL 3D000`), so the session's place is `main.public`. Local tables live in the schema `otter` of `main` (`otter.warehouses`, and the external tables `otter.regions`, `otter.promos`) — the schema created by step_3a, so the cleanup script tears them down together.
 
 ## Pick a mode
 
@@ -52,7 +52,7 @@ examples/demo/up.sh
 
 This does, in order:
 
-1. `python examples/demo/generate_data.py` — writes `examples/demo/init/{mariadb,postgres,clickhouse}/init.sql` with seeded data (correlated IDs across backends, time windows aligned to demo predicates) **and** writes `examples/demo/init/s3/{regions.csv,promos.parquet}` (6 rows + 12 rows) for steps 7-9.
+1. `python3 examples/demo/generate_data.py` — writes `examples/demo/init/{mariadb,postgres,clickhouse}/init.sql` with seeded data (correlated IDs across backends, time windows aligned to demo predicates) **and** writes `examples/demo/init/s3/{regions.csv,promos.parquet}` (6 rows + 12 rows) for steps 7-9.
 2. `docker compose -f examples/demo/compose.yml --profile full up -d --build` — starts MariaDB + PostgreSQL + ClickHouse + RustFS + the `demo-rustfs-init` one-shot (which `aws s3 mb s3://demo-bucket && aws s3 cp --recursive /fixtures/ s3://demo-bucket/`) + the `otterstax_app` container.
 3. Polls each container's healthcheck (up to 3 minutes). `demo-rustfs-init` exits cleanly once seeding finishes; it's not polled.
 4. Connections require no registration step: `examples/demo/config.yaml` (docker-DNS hostnames: `demo-mariadb`, `demo-rustfs`, …) is mounted into the `demo-otterstax` container by `compose.yml` and read once at startup — server settings, the mysql/pg/ch backends **and** the `demo_s3` alias all come from that one file.
@@ -82,18 +82,18 @@ Bench mode starts the three backends + RustFS + `demo-rustfs-init` + `demo-kafka
 Once the server is up (connections load from the config file at startup), run each step against the PG wire:
 
 ```bash
-psql -h localhost -p 8817 -U demo demo -f examples/demo/sql/step_1.sql
-psql -h localhost -p 8817 -U demo demo -f examples/demo/sql/step_2.sql
-psql -h localhost -p 8817 -U demo demo -f examples/demo/sql/step_3a_ddl.sql
-psql -h localhost -p 8817 -U demo demo -f examples/demo/sql/step_3b_insert.sql
-psql -h localhost -p 8817 -U demo demo -f examples/demo/sql/step_3c_select.sql
-psql -h localhost -p 8817 -U demo demo -f examples/demo/sql/step_3d_main.sql
-psql -h localhost -p 8817 -U demo demo -f examples/demo/sql/step_4.sql
-psql -h localhost -p 8817 -U demo demo -f examples/demo/sql/step_5.sql
-psql -h localhost -p 8817 -U demo demo -f examples/demo/sql/step_6.sql
-psql -h localhost -p 8817 -U demo demo -f examples/demo/sql/step_7.sql   # s3 csv     → otter.regions
-psql -h localhost -p 8817 -U demo demo -f examples/demo/sql/step_8.sql   # s3 parquet → otter.promos
-psql -h localhost -p 8817 -U demo demo -f examples/demo/sql/step_9.sql   # JOIN + COPY back to s3
+psql -h localhost -p 8817 -U demo main -f examples/demo/sql/step_1.sql
+psql -h localhost -p 8817 -U demo main -f examples/demo/sql/step_2.sql
+psql -h localhost -p 8817 -U demo main -f examples/demo/sql/step_3a_ddl.sql
+psql -h localhost -p 8817 -U demo main -f examples/demo/sql/step_3b_insert.sql
+psql -h localhost -p 8817 -U demo main -f examples/demo/sql/step_3c_select.sql
+psql -h localhost -p 8817 -U demo main -f examples/demo/sql/step_3d_main.sql
+psql -h localhost -p 8817 -U demo main -f examples/demo/sql/step_4.sql
+psql -h localhost -p 8817 -U demo main -f examples/demo/sql/step_5.sql
+psql -h localhost -p 8817 -U demo main -f examples/demo/sql/step_6.sql
+psql -h localhost -p 8817 -U demo main -f examples/demo/sql/step_7.sql   # s3 csv     → otter.regions
+psql -h localhost -p 8817 -U demo main -f examples/demo/sql/step_8.sql   # s3 parquet → otter.promos
+psql -h localhost -p 8817 -U demo main -f examples/demo/sql/step_9.sql   # JOIN + COPY back to s3
 ```
 
 Or all at once with `examples/demo/run-queries.sh` (`for f in sql/step_*.sql; do psql … -f $f; done` — lexicographic sort matches the intended order).
@@ -117,14 +117,14 @@ Each step is a single SELECT (or DDL/INSERT for 3a/3b, DDL/COPY for 7/8/9). Expe
 
 ## Re-running
 
-`CREATE DATABASE otter` from step 3a and the `CREATE EXTERNAL TABLE` calls
-from steps 7-8 fail the second time because the engine state persists.
-`cleanup.sql` drops the s3-loaded tables (`otter.regions`, `otter.promos`,
-`otter.promos_by_region_rt`) and then the whole `otter` database — run it
-before redoing the demo:
+`CREATE SCHEMA otter` / `CREATE TYPE` from step 3a and the `CREATE EXTERNAL
+TABLE` calls from steps 7-8 fail the second time because the engine state
+persists. `cleanup.sql` drops the tables (`otter.warehouses`, `otter.regions`,
+`otter.promos`, `otter.promos_by_region_rt`), the `otter` schema and the types
+of step 3a — run it before redoing the demo:
 
 ```bash
-psql -h localhost -p 8817 -U demo demo -f examples/demo/sql/cleanup.sql
+psql -h localhost -p 8817 -U demo main -f examples/demo/sql/cleanup.sql
 ```
 
 The `s3://demo-bucket/exports/promos_by_region.csv` object that step_9 writes
@@ -134,7 +134,9 @@ the RustFS container along with the rest (the bucket is recreated by
 `demo-rustfs-init` on the next `up`).
 
 The Kafka act is re-runnable in place — each step's `DROP SOURCE IF EXISTS …
-CREATE SOURCE …` (and `DROP STREAM …`) re-creates its objects cleanly, so you can
+CASCADE; CREATE SOURCE …` (and `DROP STREAM …`) re-creates its objects cleanly
+(CASCADE because DROP SOURCE is RESTRICT by default and refuses while a stream or
+fan-in query of a later step still reads the source), so you can
 replay `run_all.sh` (or an individual step) without recreating otterstax.
 Every Kafka step script exits non-zero on its first failed sub-step. `run_all.sh`
 checks the PG wire first and stops at the first failed step, so its
@@ -153,12 +155,14 @@ examples/demo/down.sh
 | `docker: permission denied` | User not in `docker` group | The scripts try `sudo -n docker` automatically. If sudo asks for password, fix by adding user to `docker` group or enabling NOPASSWD. |
 | `python: No module named faker` | venv not active | `python -m pip install faker`, or activate the project venv first. |
 | `Connection refused` on port 8817 | otterstax not ready yet | The healthcheck loop waits up to 180s. If it timed out, check `docker logs demo-otterstax`. |
-| `CREATE DATABASE otter ... already exists` on rerun | Step 3a persists state | Run `examples/demo/sql/cleanup.sql` or `examples/demo/down.sh && examples/demo/up.sh`. |
+| `CREATE SCHEMA otter ... already exists` on rerun | Step 3a persists state | Run `examples/demo/sql/cleanup.sql` or `examples/demo/down.sh && examples/demo/up.sh`. |
 | `psql: error: server closed the connection unexpectedly` | otterstax crashed mid-query | `docker logs demo-otterstax | tail -50`. Cross-backend ARRAY queries and some struct cases are known to crash; demo SQL avoids these but custom queries may hit them. |
 | `er_table_exists_error` on test data | State from previous run leaked into backend volumes | `examples/demo/down.sh` then bring up fresh. |
+| A remote table written `mysql.bill.orders` is not found | Three parts name a local table `database.schema.table` | Write the remote table in four parts: `mysql.bill.public.orders`, `pg.shop.shop.customers`, `ch.ev.public.sessions`. |
+| `FATAL 3D000 database "demo" does not exist` at connect | The client named a database the engine does not have | Connect to `main` (`psql -h localhost -p 8817 -U demo main`). |
 | `Otterbrix execution failed: database does not exist` | Query routed to local engine that doesn't know the external alias | Check the config file (`config.yaml` / `config_local.yaml`) `connections:` section has all three backends and restart the server — connections load only at startup. |
 | `External table is not registered: …` from step 7/8/9 | The `demo_s3` alias was not in the config file this server read | Add the `s3:` `demo_s3` entry under `connections:` and restart the server. |
-| Step 8 fails with `External table is not registered` and `init/s3/promos.parquet` is missing | `pyarrow` not installed when `generate_data.py` ran | `pip install pyarrow` and re-run `python examples/demo/generate_data.py`, then `docker compose -f examples/demo/compose.yml up -d demo-rustfs-init` to re-seed. |
+| Step 8 fails with `External table is not registered` and `init/s3/promos.parquet` is missing | `pyarrow` not installed when `generate_data.py` ran | `pip install pyarrow` and re-run `python3 examples/demo/generate_data.py`, then `docker compose -f examples/demo/compose.yml up -d demo-rustfs-init` to re-seed. |
 | Step 9 hangs or returns `Cannot reach rustfs:9000` from inside the server | s3 endpoint mismatch (docker vs local config) | In docker mode the alias points at `demo-rustfs:9000`; in bench mode it points at `localhost:3206`. Use the matching config file (`config.yaml` vs `config_local.yaml`) and restart the server. |
 
 ## File reference
@@ -179,7 +183,7 @@ All paths relative to `examples/demo/`:
 | `config.yaml` | single config file for docker mode (server settings + connections; docker-DNS hostnames `demo-mariadb`, `demo-rustfs`, …); mounted into the container, read at startup |
 | `config_local.yaml` | single config file for bench/local mode (host-published ports: 3201/3202/3204/3206) — pass with `--config` |
 | `sql/step_*.sql` | the actual demo queries — `step_7` / `step_8` load from s3, `step_9` JOINs and dumps back |
-| `sql/cleanup.sql` | drops the s3-loaded tables and the `otter` engine database |
+| `sql/cleanup.sql` | drops the local tables, the `otter` schema of `main` and the step-3a types |
 
 ## Hand-off note
 

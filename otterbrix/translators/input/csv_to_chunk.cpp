@@ -21,9 +21,10 @@
 namespace tsl {
 
 using components::vector::data_chunk_t;
+using chunk_run_t = std::pmr::vector<data_chunk_t>;
 
 namespace {
-    core::result_wrapper_t<data_chunk_t> read_csv(std::pmr::memory_resource* res,
+    core::result_wrapper_t<chunk_run_t> read_csv(std::pmr::memory_resource* res,
                                                   const std::shared_ptr<arrow::io::InputStream>& input,
                                                   char delimiter, bool has_header) {
         auto read_opts = arrow::csv::ReadOptions::Defaults();
@@ -42,19 +43,19 @@ namespace {
             arrow::io::IOContext(arrow_pool(res)),
             input, read_opts, parse_opts, convert_opts);
         if (!reader_result.ok()) {
-            return arrow_error(res, core::error_code_t::conversion_failure,
+            return arrow_error(res, core::error_code_t::invalid_text_representation,
                                "csv_to_chunk: reader creation failed", reader_result.status());
         }
 
         auto table_result = (*reader_result)->Read();
         if (!table_result.ok()) {
-            return arrow_error(res, core::error_code_t::conversion_failure,
+            return arrow_error(res, core::error_code_t::invalid_text_representation,
                                "csv_to_chunk: read failed", table_result.status());
         }
 
         auto batch = (*table_result)->CombineChunksToBatch(arrow_pool(res));
         if (!batch.ok()) {
-            return arrow_error(res, core::error_code_t::conversion_failure,
+            return arrow_error(res, core::error_code_t::internal_error,
                                "csv_to_chunk: combine batches failed", batch.status());
         }
 
@@ -62,7 +63,7 @@ namespace {
     }
 } // namespace
 
-core::result_wrapper_t<data_chunk_t> csv_to_chunk(std::pmr::memory_resource* res, const std::string& file_path,
+core::result_wrapper_t<chunk_run_t> csv_to_chunk(std::pmr::memory_resource* res, const std::string& file_path,
                                                   char delimiter, bool has_header) {
     OTX_ZONE_N("tsl::csv_to_chunk(file)");
     auto file_result = arrow::io::ReadableFile::Open(file_path, arrow_pool(res));
@@ -73,7 +74,7 @@ core::result_wrapper_t<data_chunk_t> csv_to_chunk(std::pmr::memory_resource* res
     return read_csv(res, *file_result, delimiter, has_header);
 }
 
-core::result_wrapper_t<data_chunk_t> csv_to_chunk(std::pmr::memory_resource* res, const uint8_t* data, size_t size,
+core::result_wrapper_t<chunk_run_t> csv_to_chunk(std::pmr::memory_resource* res, const uint8_t* data, size_t size,
                                                   char delimiter, bool has_header) {
     OTX_ZONE_N("tsl::csv_to_chunk(buffer)");
     auto buffer = std::make_shared<arrow::Buffer>(data, static_cast<int64_t>(size));
@@ -81,7 +82,7 @@ core::result_wrapper_t<data_chunk_t> csv_to_chunk(std::pmr::memory_resource* res
     return read_csv(res, input, delimiter, has_header);
 }
 
-core::result_wrapper_t<data_chunk_t> csv_to_chunk(std::pmr::memory_resource* res,
+core::result_wrapper_t<chunk_run_t> csv_to_chunk(std::pmr::memory_resource* res,
                                                   std::shared_ptr<arrow::io::InputStream> input,
                                                   char delimiter, bool has_header) {
     OTX_ZONE_N("tsl::csv_to_chunk(stream)");

@@ -26,7 +26,7 @@ does not.
   the examples independent of each backend's integer width.
 - **Seed backend tables are read-only in the examples.** Example 9 creates,
   updates and drops an engine table (`qs.scratch`); `sql/cleanup.sql` drops only
-  the engine database `qs` and the tables example 6 loaded from S3. Never add a
+  the engine schema `qs` and the tables example 6 loaded from S3. Never add a
   `DROP` / `UPDATE` against `pgshop`, `pgcat`, `sales` or `web` — it would change
   the backend's real data, which persists (see below).
 - **Flat schemas.** No ENUM / composite / tuple columns — those belong to

@@ -3,40 +3,23 @@
 
 #pragma once
 
-#include "otterbrix/parser/parser.hpp"
+#include "otterbrix/backend_type.hpp"
 #include "utility/table_info.hpp"
 
+#include <components/base/collection_full_name.hpp>
 #include <components/types/types.hpp>
 #include <core/result_wrapper.hpp>
 
-#include <cstdint>
+#include <algorithm>
 #include <memory_resource>
 #include <string>
 #include <string_view>
+#include <vector>
 
-// Types and query builders shared by the catalog (which owns the mirror of
-// the discovered tables) and the three backend integration actors (which own
-// the connector managers and run the discovery queries).
-namespace catalog_ext {
-
-    enum class ConnectionType : uint8_t
-    {
-        MySQL = 0,
-        PostgreSQL = 1,
-        ClickHouse = 2
-    };
-
-    // One table discovered on a remote backend: full qualified name plus the
-    // STRUCT of column types produced by the input translators.
-    struct discovered_table_t {
-        qualified_name_t name;
-        components::types::complex_logical_type schema;
-    };
-
-    using discovered_tables_t = std::pmr::vector<discovered_table_t>;
-
-} // namespace catalog_ext
-
+// Query builders of schema discovery, used by the backend agents
+// (otterbrix/federation/backend_agent.hpp), which run the discovery queries.
+// What a discovery finds is registered in otterbrix's catalog by
+// catalog/registration.hpp.
 namespace otterstax::catalog {
 
     // Single-quoted SQL string literal for the handwritten discovery queries
@@ -50,7 +33,10 @@ namespace otterstax::catalog {
     // Whole-database table listing per dialect — the only handwritten queries
     // besides the named-types one; every per-table probe goes through
     // sql_gen::generate_query. `scope` is the MySQL database, the PostgreSQL
-    // schema or the ClickHouse database respectively.
+    // schema or the ClickHouse database respectively. MySQL / ClickHouse answer
+    // one column (the table); PostgreSQL two (table_schema, table_name), and an
+    // empty `scope` lists every user schema (not pg_catalog, information_schema,
+    // pg_toast*, pg_temp*).
     std::pmr::string
     make_list_tables_query(std::pmr::memory_resource* resource, backend_type_t backend, std::string_view scope);
 
@@ -68,7 +54,8 @@ namespace otterstax::catalog {
     make_schema_probe_query(std::pmr::memory_resource* resource, const qualified_name_t& name, backend_type_t backend);
 
     // Per-table discovery failures are collected and folded into one hard
-    // error naming the failure count and the first few tables.
+    // error naming the failure count and the first few tables
+    // (undefined_object).
     core::error_t make_discovery_error(std::pmr::memory_resource* resource,
                                        const std::pmr::vector<std::pmr::string>& failed_tables);
 

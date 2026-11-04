@@ -3,17 +3,12 @@
 
 #pragma once
 
-#include "types/otterbrix.hpp"
+#include <components/cursor/cursor.hpp>
 
-// Clash between otterbrix parser macros and Arrow headers
-#undef DAY
-#undef SECOND
-
-#include <arrow/io/type_fwd.h>
+#include "otterbrix/translators/arrow_stream.hpp"
 
 #include <cstdint>
 #include <filesystem>
-#include <memory>
 #include <string>
 
 namespace conn::file {
@@ -35,23 +30,21 @@ inline FileFormat resolve_format(const std::string& format, const std::string& p
     return FileFormat::Unknown;
 }
 
+// What dump_file writes: `rows` (a cursor's result, a run of <=1024-row chunks)
+// in `format` at `path`.
 struct FileMetadata {
-    // Pre-parsed query whose result is dumped to `path`. Replaces the former
-    // database/table pair, so an arbitrary SELECT (e.g. a COPY's inner query)
-    // can be exported, not just a whole table.
-    OtterbrixStatementPtr statement;
+    components::cursor::cursor_t_ptr rows;
     std::string path;
     FileFormat  format{FileFormat::Unknown};
     // When set, the result is written here instead of to a file at `path` (which
-    // then only names the target in messages), and the stream is left open:
-    // committing or aborting it is the sender's call — an S3 upload must never
-    // publish a partial object.
-    std::shared_ptr<arrow::io::OutputStream> output;
+    // then only names the target in messages). dump_file holds the stream last: it
+    // publishes it (close) only when the whole result was written, and a stream it
+    // lets go unclosed is aborted — an S3 upload never publishes a partial object.
+    tsl::output_stream_t output;
 };
 
-struct FileAddParams {
-    std::string database;
-    std::string table;
+// What load_file reads: the file at `path` (or `input`) in `format`.
+struct FileLoadParams {
     std::string path;
     std::string format;        // "parquet" | "csv" | "ndjson" | "auto"
     std::string csv_delimiter; // single char, default ","
@@ -59,7 +52,7 @@ struct FileAddParams {
     // When set, the rows are read from here instead of from a file at `path`,
     // which then only names the source (format resolution, messages) — an S3
     // object streamed without a local copy.
-    std::shared_ptr<arrow::io::RandomAccessFile> input;
+    tsl::input_stream_t input;
 };
 
 } // namespace conn::file

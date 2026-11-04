@@ -63,8 +63,9 @@ TEST_CASE("file: CREATE EXTERNAL TABLE (local path) is parsed into the AST") {
     const auto* s = file_parse_ok(
         &arena, "CREATE EXTERNAL TABLE file.trades WITH (location='/data/trades.parquet', format='parquet');");
     CHECK(s->kind == file_ext::file_stmt_kind::create_external_table);
-    CHECK(ceq(s->db, "file"));
-    CHECK(ceq(s->table, "trades"));
+    REQUIRE(s->name_parts == 2);
+    CHECK(ceq(s->name[0], "file"));
+    CHECK(ceq(s->name[1], "trades"));
     CHECK(ceq(s->location, "/data/trades.parquet"));
     CHECK(ceq(s->format, "parquet"));
 }
@@ -133,8 +134,10 @@ TEST_CASE("file registry: a local-path statement is routed to the file extension
     // The WITH ( ... = ... ) clause is required: the core parser accepts a bare
     // `COPY (SELECT ...) TO 'file'` as its own CopyStmt, so without it the
     // extension would never be consulted.
-    auto* tree =
+    auto parsed =
         raw_parser(&arena, "COPY (SELECT * FROM file.t) TO '/data/out.parquet' WITH (format='parquet');", registry);
+    REQUIRE_FALSE(parsed.has_error());
+    auto* tree = parsed.value();
     REQUIRE(tree != NIL);
     auto* node = reinterpret_cast<Node*>(linitial(tree));
     REQUIRE(nodeTag(node) == T_ExtensionNode);
@@ -142,23 +145,27 @@ TEST_CASE("file registry: a local-path statement is routed to the file extension
     CHECK(extension_payload<s3_ext::s3_stmt>(tree, "s3") == nullptr);
 }
 
-// ── transform stage (lowers to an external_node_t the Scheduler routes) ──────
+// ── transform stage (lowers to an external_node_t the query session routes) ──────
 
 TEST_CASE("file transform: ExtensionNode lowers to an external_node_t") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto registry = make_registry();
     auto* node = reinterpret_cast<Node*>(
-        linitial(raw_parser(&arena, "CREATE EXTERNAL TABLE file.t WITH (location='/data/d.parquet');", registry)));
+        linitial(raw_parser(&arena, "CREATE EXTERNAL TABLE file.t WITH (location='/data/d.parquet');", registry).value()));
     REQUIRE(nodeTag(node) == T_ExtensionNode);
 
     components::sql::transform::transformer tr(&arena, nullptr, &registry);
     auto result = tr.transform(*node);
     REQUIRE_FALSE(result.has_error());
-    REQUIRE(result.node_ptr() != nullptr);
+    // The plan is reached only through finalize().
+    auto finalized = result.finalize();
+    REQUIRE_FALSE(finalized.has_error());
+    const auto root = finalized.value().sub_queries.back();
+    REQUIRE(root != nullptr);
     // external_node_t is tagged node_type::unused; nothing else the extension
     // transform produces carries that tag.
-    REQUIRE(result.node_ptr()->type() == components::logical_plan::node_type::unused);
-    auto* ext = static_cast<otterstax::external::external_node_t*>(result.node_ptr().get());
+    REQUIRE(root->type() == components::logical_plan::node_type::unused);
+    auto* ext = static_cast<otterstax::external::external_node_t*>(root.get());
     CHECK(ext->op() == otterstax::external::external_op_t::create_external_table);
     CHECK_FALSE(ext->is_s3());
     CHECK(ext->location() == "/data/d.parquet");

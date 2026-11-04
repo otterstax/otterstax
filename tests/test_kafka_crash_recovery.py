@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2025-2026  OtterStax
 
-"""Kafka exactly-once CRASH-RECOVERY test (§5.4 Phase 4 + Phase 5).
+"""Kafka exactly-once CRASH-RECOVERY test (sources and streams).
 
 The fault-injection proof that the kafka runtime survives a hard crash
 exactly-once. Unlike the other test_kafka_*.py scripts (which expect an
@@ -66,11 +66,11 @@ NUM_RECORDS = 5000
 KILL_AT = NUM_RECORDS // 3          # kill once this many rows are committed (mid-ingest)
 STREAM_CUTOFF = NUM_RECORDS // 2    # STREAM keeps rows with id < cutoff
 INSERT_ROWS = 20
-FANIN_BATCH = 1500                  # §5.3 fan-in: rows per source per batch (each source = 2 batches)
+FANIN_BATCH = 1500                  # fan-in: rows per source per batch (each source = 2 batches)
 PG_WAIT_S = 25
 DOCKER_PG_WAIT_S = 90   # docker start + WAL recover has more headroom than the native binary
 WAIT_S = 60
-# Hardcoded in main.cpp: ComponentManager(make_create_config("/tmp/test_collection_sql/base")).
+# The engine's default data_dir (config::DEFAULT_ENGINE_DATA_DIR, service.engine.data_dir unset): /tmp/test_collection_sql/base.
 DATA_DIR = "/tmp/test_collection_sql"
 
 
@@ -189,7 +189,7 @@ class KafkaCrashRecoveryTest:
 
     def _connect(self):
         conn = psycopg.connect(host=self.host, port=PG_PORT, user="testuser",
-                               password="testpass", dbname="postgres", autocommit=True, connect_timeout=1)
+                               password="testpass", dbname="main", autocommit=True, connect_timeout=1)
         conn.prepare_threshold = None  # don't cache the empty-table schemaless Describe
         return conn
 
@@ -290,7 +290,7 @@ class KafkaCrashRecoveryTest:
         print(f"✅ STREAM survived crash exactly-once: {total} filtered rows in out topic (ids 0..{STREAM_CUTOFF-1})")
 
     def test_fanin_survives_crash(self):
-        """§5.3 fan-in: a STREAM plus an `INSERT INTO <stream> SELECT` query merge
+        """Fan-in: a STREAM plus an `INSERT INTO <stream> SELECT` query merge
         two sources into ONE output topic, exactly-once, across a kill -9.
 
             CREATE STREAM merged AS SELECT ... FROM src_a        (src_a's ids)
@@ -301,7 +301,7 @@ class KafkaCrashRecoveryTest:
           A. Produce batch 1 to both source topics; CREATE the SOURCEs; let both
              ingest batch 1; settle so their backing tables are durably checkpointed.
           B. CREATE the base STREAM + the fan-in INSERT INTO query (both process
-             batch 1 into the out topic); settle so their kafka.__sources rows are
+             batch 1 into the out topic); settle so their federation.kafka.__sources rows are
              durably checkpointed.
           C. Produce batch 2, then kill -9 IMMEDIATELY — the out topic is still
              missing batch 2. recover() MUST relaunch BOTH workers (the stream in
@@ -311,7 +311,7 @@ class KafkaCrashRecoveryTest:
 
         Why batches + settle (not a plain mid-ingest kill): recover() re-reads each
         source's columns from its backing TABLE and finds the INSERT INTO query in
-        kafka.__sources — both engine tables. A crash-truncated EMPTY table recovers
+        federation.kafka.__sources — both engine tables. A crash-truncated EMPTY table recovers
         schemaless (B-WAL-1/B-WAL-3) → recover() skips the source and its dependent
         query. Establishing that durable state BEFORE the crash makes recovery
         deterministic while batch 2 keeps the out topic genuinely incomplete at the
@@ -347,7 +347,7 @@ class KafkaCrashRecoveryTest:
         time.sleep(5)  # settle: checkpoint the source tables
 
         # Phase B — the base STREAM + the fan-in INSERT INTO query (process batch 1),
-        # then settle so their kafka.__sources rows are durable before the crash.
+        # then settle so their federation.kafka.__sources rows are durable before the crash.
         with conn.cursor() as cur:
             cur.execute(f"CREATE STREAM {stream} "
                         f"WITH (KAFKA_TOPIC='{out_topic}', VALUE_FORMAT='JSON', "
@@ -355,7 +355,7 @@ class KafkaCrashRecoveryTest:
                         f"AS SELECT id, seq FROM kafka.{src_a};")
             cur.execute(f"INSERT INTO kafka.{stream} SELECT id, seq FROM kafka.{src_b};")
         conn.close()
-        time.sleep(5)  # settle: checkpoint kafka.__sources (so recover() sees the INSERT INTO query)
+        time.sleep(5)  # settle: checkpoint federation.kafka.__sources (so recover() sees the INSERT INTO query)
 
         # Phase C — produce batch 2, then kill immediately (out topic still missing it).
         self.produce(topic_a, p, start=p)              # a batch 2: [p, 2p)
@@ -428,7 +428,7 @@ class KafkaCrashRecoveryTest:
         def do_insert():
             try:
                 c = psycopg.connect(host=self.host, port=PG_PORT, user="testuser",
-                                    password="testpass", dbname="postgres", autocommit=True)
+                                    password="testpass", dbname="main", autocommit=True)
                 with c.cursor() as cur:
                     cur.execute(f"INSERT INTO kafka.{source} (id, seq) VALUES {values};")
                 c.close()

@@ -35,14 +35,24 @@ ARG BUILD_TYPE=Release
 ARG WITH_TRACY=false
 ARG WITH_PERF=false
 ARG BUILD_JOBS=0
-# TSAN_DEPS=true rebuilds otterbrix + actor-zeta from source with
-# -fsanitize=thread (see tsan-deps.profile). Without it the prebuilt engine's
-# atomics are invisible to TSAN and the sanitizer job has no diagnostic power.
+# TSAN_DEPS=true rebuilds otterbrix + actor-zeta, librdkafka and gRPC with
+# abseil / protobuf / re2 from source with -fsanitize=thread (see
+# tsan-deps.profile; the code generators protoc / grpc_cpp_plugin come from a
+# plain build-context grpc / protobuf, so nothing instrumented runs at build time). Without it the prebuilt libraries' atomics are invisible
+# to TSAN and the sanitizer job has no diagnostic power.
 # It also switches all TSAN-instrumented code (deps and otterstax alike) to
 # g++-12: gcc-11's libtsan misses the pthread_cond_clockwait interceptor
 # (google/sanitizers#1259), yielding false "double lock" reports on every
 # condition_variable::wait_for, and one process must link a single libtsan.
 ARG TSAN_DEPS=false
+# ASAN_DEPS=true rebuilds gRPC with abseil / protobuf / re2, and otterbrix
+# (whose library embeds and exports abseil + re2), from source with
+# -fsanitize=address (see asan-deps.profile; protoc / grpc_cpp_plugin come from
+# a plain build-context grpc / protobuf, as for TSAN). Their headers change
+# layouts under ASAN (gpr_mu's leak_checker, abseil's swisstable generations),
+# so an ENABLE_ASAN=ON build over the prebuilt packages hands them the wrong
+# field addresses. Pass it with ENABLE_ASAN=ON.
+ARG ASAN_DEPS=false
 
 RUN if [ "$TSAN_DEPS" = "true" ]; then \
         apt-get update && \
@@ -54,40 +64,42 @@ RUN if [ "$TSAN_DEPS" = "true" ]; then \
 # cmake_layout places generators + libs at build/${BUILD_TYPE}/ — matching
 # the devcontainer preset layout exactly.
 WORKDIR /app
-COPY conanfile.py tsan-deps.profile ./
+COPY conanfile.py tsan-deps.profile asan-deps.profile ./
 COPY cmake/conan-hooks/hook_librdkafka_c11threads_off.py ./conan-hooks/
-RUN if [ "$TSAN_DEPS" = "true" ]; then \
+# BUILD_JOBS caps conan's from-source builds too (tools.build:jobs): otterbrix
+# needs ~1.5-2 GB per job — see CLAUDE.md "Build resources". BUILD_JOBS=0 means
+# min(nproc, MemTotal_MB / 1536) of the build VM, never a bare nproc.
+RUN _jobs="${BUILD_JOBS}" && \
+    if [ "$_jobs" = "0" ]; then \
+        _mem_jobs=$(( $(awk '/^MemTotal:/ {print int($2/1024)}' /proc/meminfo) / 1536 )) && \
+        if [ "$_mem_jobs" -lt 1 ]; then _mem_jobs=1; fi && \
+        _jobs=$(( $(nproc) < _mem_jobs ? $(nproc) : _mem_jobs )); \
+    fi && \
+    echo "conan from-source build jobs: ${_jobs}" && \
+    _jobs_conf=(-c "tools.build:jobs=${_jobs}") && \
+    if [ "$TSAN_DEPS" = "true" ]; then \
         mkdir -p /root/.conan2/extensions/hooks && \
         cp ./conan-hooks/hook_librdkafka_c11threads_off.py /root/.conan2/extensions/hooks/ && \
-        conan install conanfile.py --build missing \
+        conan install conanfile.py --build missing "${_jobs_conf[@]}" \
             --build="otterbrix/*" --build="actor-zeta/*" --build="librdkafka/*" \
             -pr:h ./tsan-deps.profile \
             -s build_type=${BUILD_TYPE} \
-            -s compiler.cppstd=gnu20 \
-            -s 'clickhouse-cpp/*:compiler.cppstd=17' \
-            -s 'abseil/*:compiler.cppstd=17' \
-            -s 'protobuf/*:compiler.cppstd=17' \
-            -s 're2/*:compiler.cppstd=17' \
-            -s 'grpc/*:compiler.cppstd=17'; \
+            -s compiler.cppstd=gnu20; \
+    elif [ "$ASAN_DEPS" = "true" ]; then \
+        conan install conanfile.py --build missing "${_jobs_conf[@]}" \
+            --build="otterbrix/*" \
+            -pr:h ./asan-deps.profile -pr:b default \
+            -s build_type=${BUILD_TYPE} \
+            -s compiler.cppstd=gnu20; \
     elif [ "$WITH_TRACY" = "true" ]; then \
-        conan install conanfile.py --build missing \
+        conan install conanfile.py --build missing "${_jobs_conf[@]}" \
             -s build_type=${BUILD_TYPE} \
             -s compiler.cppstd=gnu20 \
-            -s 'clickhouse-cpp/*:compiler.cppstd=17' \
-            -s 'abseil/*:compiler.cppstd=17' \
-            -s 'protobuf/*:compiler.cppstd=17' \
-            -s 're2/*:compiler.cppstd=17' \
-            -s 'grpc/*:compiler.cppstd=17' \
             -o "&:with_tracy=True"; \
     else \
-        conan install conanfile.py --build missing \
+        conan install conanfile.py --build missing "${_jobs_conf[@]}" \
             -s build_type=${BUILD_TYPE} \
-            -s compiler.cppstd=gnu20 \
-            -s 'clickhouse-cpp/*:compiler.cppstd=17' \
-            -s 'abseil/*:compiler.cppstd=17' \
-            -s 'protobuf/*:compiler.cppstd=17' \
-            -s 're2/*:compiler.cppstd=17' \
-            -s 'grpc/*:compiler.cppstd=17'; \
+            -s compiler.cppstd=gnu20; \
     fi
 
 # Install perf tools when WITH_PERF=true.
@@ -101,7 +113,12 @@ RUN if [ "$WITH_PERF" = "true" ]; then \
 fi
 
 # Build tracy-capture CLI when Tracy is enabled
-RUN _jobs=$([ "${BUILD_JOBS}" = "0" ] && nproc || echo "${BUILD_JOBS}") && \
+RUN _jobs="${BUILD_JOBS}" && \
+    if [ "$_jobs" = "0" ]; then \
+        _mem_jobs=$(( $(awk '/^MemTotal:/ {print int($2/1024)}' /proc/meminfo) / 1536 )) && \
+        if [ "$_mem_jobs" -lt 1 ]; then _mem_jobs=1; fi && \
+        _jobs=$(( $(nproc) < _mem_jobs ? $(nproc) : _mem_jobs )); \
+    fi && \
     if [ "$WITH_TRACY" = "true" ]; then \
         curl -L https://github.com/wolfpld/tracy/archive/refs/tags/v0.13.1.tar.gz \
             | tar xz -C /tmp && \
@@ -119,8 +136,9 @@ COPY ./connectors ./connectors
 COPY ./integration ./integration
 COPY ./frontend/ ./frontend
 COPY ./otterbrix ./otterbrix
-COPY ./component_manager ./component_manager
-COPY ./scheduler ./scheduler
+COPY ./runtime ./runtime
+COPY ./backends ./backends
+COPY ./session ./session
 COPY ./types ./types
 COPY ./utility ./utility
 COPY ./cmake ./cmake
@@ -137,11 +155,16 @@ ARG ENABLE_TSAN=OFF
 # ON compiles benchmark/microbench (otterstax_bench) as well; nothing runs it.
 ARG BUILD_BENCHMARKS=OFF
 
-# TSAN suppressions for known-bad third-party code (spdlog in libotterbrix_log.so).
+# TSAN suppressions for known-bad third-party code (see tsan.supp).
 # Only takes effect in TSAN builds; plain Release / ASAN ignore it.
 ENV TSAN_OPTIONS="suppressions=/app/tsan.supp"
 
-RUN _jobs=$([ "${BUILD_JOBS}" = "0" ] && nproc || echo "${BUILD_JOBS}") && \
+RUN _jobs="${BUILD_JOBS}" && \
+    if [ "$_jobs" = "0" ]; then \
+        _mem_jobs=$(( $(awk '/^MemTotal:/ {print int($2/1024)}' /proc/meminfo) / 1536 )) && \
+        if [ "$_mem_jobs" -lt 1 ]; then _mem_jobs=1; fi && \
+        _jobs=$(( $(nproc) < _mem_jobs ? $(nproc) : _mem_jobs )); \
+    fi && \
     _tracy=$([ "${WITH_TRACY}" = "true" ] && echo "ON" || echo "OFF") && \
     _perf=$([ "${WITH_PERF}" = "true" ] && echo "ON" || echo "OFF") && \
     _cc=$([ "${TSAN_DEPS}" = "true" ] && echo "-DCMAKE_C_COMPILER=gcc-12 -DCMAKE_CXX_COMPILER=g++-12" || echo "") && \
@@ -160,11 +183,18 @@ WORKDIR /app/build/${BUILD_TYPE}
 
 # Tracy-enabled builds skip tests: Tracy's profiler init crashes in a headless
 # Docker container (no profiler server attached). Non-Tracy CI builds run all tests.
+# RUN_TESTS=false skips them too: a TSAN image built on arm64, whose instrumented
+# binaries cannot run under docker build's seccomp filter (personality
+# ADDR_NO_RANDOMIZE, see CLAUDE.md "The TSAN image") — its tests run in a
+# container started with --security-opt seccomp=unconfined instead.
 ARG WITH_TRACY=false
-RUN if [ "${WITH_TRACY}" != "true" ]; then \
-        ctest -C ${BUILD_TYPE} --output-on-failure --timeout 120; \
-    else \
+ARG RUN_TESTS=true
+RUN if [ "${WITH_TRACY}" = "true" ]; then \
         echo "Skipping tests: Tracy build (headless Docker, no profiler attached)"; \
+    elif [ "${RUN_TESTS}" != "true" ]; then \
+        echo "Skipping tests: RUN_TESTS=${RUN_TESTS}"; \
+    else \
+        ctest -C ${BUILD_TYPE} --output-on-failure --timeout 120; \
     fi
 
 # External-table fixtures baked into the image so the file/s3 tests work in CI

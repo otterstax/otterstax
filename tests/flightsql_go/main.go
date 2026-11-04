@@ -2,8 +2,8 @@
 // Copyright 2025-2026  OtterStax
 //
 // e2e harness on the original Go Arrow Flight SQL driver
-// (github.com/apache/arrow-go, gRPC-Go stack): it seeds its own database over
-// the wire and drives SELECT / LIMIT / a parameterized query / an INSERT.
+// (github.com/apache/arrow-go, gRPC-Go stack): it seeds its own schema (of the
+// database main, the session's place) over the wire and drives SELECT / LIMIT / a parameterized query / an INSERT.
 // Usage: go run . host:port
 package main
 
@@ -32,8 +32,8 @@ func exec(dbh *sql.DB, query string) int64 {
 	return n
 }
 
-// dropBestEffort ignores its error: the engine's parser has no IF EXISTS, so a
-// leftover of an aborted run answering "does not exist" is the normal case.
+// dropBestEffort ignores its error: the cleanup of a leftover of an aborted run
+// must not fail the run.
 func dropBestEffort(dbh *sql.DB, query string) {
 	if _, err := dbh.Exec(query); err != nil {
 		fmt.Println("cleanup:", query, "->", err)
@@ -51,9 +51,8 @@ func main() {
 	check(err, "open")
 	defer dbh.Close()
 
-	dropBestEffort(dbh, "DROP TABLE "+db+".numbers")
-	dropBestEffort(dbh, "DROP DATABASE "+db)
-	exec(dbh, "CREATE DATABASE "+db)
+	dropBestEffort(dbh, "DROP SCHEMA IF EXISTS "+db+" CASCADE")
+	exec(dbh, "CREATE SCHEMA "+db)
 	exec(dbh, "CREATE TABLE "+db+".numbers (id BIGINT, name STRING, score DOUBLE)")
 	for i := 0; i < 8; i++ {
 		exec(dbh, fmt.Sprintf("INSERT INTO %s.numbers (id, name, score) VALUES (%d, 'row-%d', %d.5)", db, i, i, i))
@@ -110,6 +109,6 @@ func main() {
 	}
 	fmt.Println("insert ok")
 
-	exec(dbh, "DROP DATABASE "+db)
+	exec(dbh, "DROP SCHEMA "+db+" CASCADE")
 	fmt.Println("GO E2E OK")
 }

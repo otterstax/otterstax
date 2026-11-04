@@ -12,6 +12,14 @@ import pyarrow.ipc as ipc
 
 import config
 
+# GetTables lists the engine's catalog, local and remote tables alike
+# (frontend/flight_sql/session_engine.cpp, SessionEngine::tables): a catalog is
+# a database as SQL writes it — `d` for a local one, `c.d` for the database d of
+# the connection c (tests/scripts/config.yaml). Only the backend's catalogs are
+# validated here, so a local table of the same name — or one whose column Arrow
+# cannot carry, whose table_schema is NULL — never stands in for a backend table.
+BACKEND_CATALOGS = {f"{config.CH_ALIAS}.{config.CH_DATABASE}"}
+
 
 def validate_table_schemas(client, expected_schemas):
     max_attempts = 15
@@ -43,6 +51,9 @@ def validate_table_schemas(client, expected_schemas):
         catalog    = tables_table['catalog_name'][i].as_py()
         schema_name = tables_table['db_schema_name'][i].as_py()
         table_name  = tables_table['table_name'][i].as_py()
+        if catalog not in BACKEND_CATALOGS:
+            print(f"Skipping {catalog}.{schema_name}.{table_name}: not the ClickHouse backend database")
+            continue
 
         full_name = f"{catalog}.{schema_name}.{table_name}"
         print(f"\nTable: {full_name}")

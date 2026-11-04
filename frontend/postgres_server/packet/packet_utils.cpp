@@ -3,6 +3,8 @@
 
 #include "packet_utils.hpp"
 
+#include <components/vector/vector_builders.hpp>
+
 #include <cerrno>
 #include <charconv>
 #include <cstdlib>
@@ -11,18 +13,18 @@
 
 namespace {
 
-    using components::types::logical_value_t;
+    using components::vector::vector_t;
 
     core::error_t bad_literal(std::pmr::memory_resource* resource, const std::string& text) {
         std::pmr::string what{"Invalid text literal for the declared parameter type: ", resource};
         what += text.c_str();
-        return core::error_t{core::error_code_t::conversion_failure, std::move(what)};
+        return core::error_t{core::error_code_t::invalid_text_representation, std::move(what)};
     }
 
     // The whole text must be one number of the target type: no sign-less
     // truncation, no trailing characters, no out-of-range wrap-around.
     template<typename Int>
-    core::result_wrapper_t<logical_value_t>
+    core::result_wrapper_t<vector_t>
     parse_integer(std::pmr::memory_resource* resource, const std::string& text) {
         Int value{};
         const char* const end = text.data() + text.size();
@@ -30,11 +32,11 @@ namespace {
         if (text.empty() || ec != std::errc{} || parsed_to != end) {
             return bad_literal(resource, text);
         }
-        return logical_value_t{resource, value};
+        return components::vector::make_scalar(resource, value);
     }
 
     template<typename Float>
-    core::result_wrapper_t<logical_value_t>
+    core::result_wrapper_t<vector_t>
     parse_floating(std::pmr::memory_resource* resource, const std::string& text) {
         // strtod/strtof report errors through errno and the end pointer: a
         // non-throwing parse with the range check the wire format requires.
@@ -49,7 +51,7 @@ namespace {
         if (text.empty() || errno == ERANGE || parsed_to != text.c_str() + text.size()) {
             return bad_literal(resource, text);
         }
-        return logical_value_t{resource, value};
+        return components::vector::make_scalar(resource, value);
     }
 
 } // namespace
@@ -93,6 +95,10 @@ namespace frontend::postgres {
                 return delete_rows(rows);
             case T_DropStmt:
                 return {"DROP"};
+            case T_VariableSetStmt:
+                return {"SET"};
+            case T_VariableShowStmt:
+                return {"SHOW"};
             default:
                 return {"COMMAND"};
         }
@@ -105,7 +111,12 @@ namespace frontend::postgres {
     command_complete_tag command_complete_tag::commit() { return {"COMMIT"}; }
     command_complete_tag command_complete_tag::rollback() { return {"ROLLBACK"}; }
     command_complete_tag command_complete_tag::savepoint() { return {"SAVEPOINT"}; }
+    command_complete_tag command_complete_tag::reset() { return {"RESET"}; }
+
     command_complete_tag command_complete_tag::release() { return {"RELEASE"}; }
+    command_complete_tag command_complete_tag::deallocate(bool all) {
+        return {all ? "DEALLOCATE ALL" : "DEALLOCATE"};
+    }
 
     std::optional<frontend::result_encoding> get_format_code(const std::vector<frontend::result_encoding>& format,
                                                              size_t i) {
@@ -124,14 +135,14 @@ namespace frontend::postgres {
         }
     }
 
-    core::result_wrapper_t<logical_value_t>
+    core::result_wrapper_t<vector_t>
     parse_text_parameter(std::pmr::memory_resource* resource, field_type type, std::string text) {
         switch (type) {
             case field_type::BOOL:
                 if (text != "t" && text != "f") {
                     return bad_literal(resource, text);
                 }
-                return logical_value_t{resource, text == "t"};
+                return components::vector::make_scalar(resource, text == "t");
             case field_type::INT2:
                 return parse_integer<int16_t>(resource, text);
             case field_type::INT4:
@@ -143,7 +154,7 @@ namespace frontend::postgres {
             case field_type::FLOAT8:
                 return parse_floating<double>(resource, text);
             case field_type::TEXT:
-                return logical_value_t{resource, std::move(text)};
+                return components::vector::make_scalar(resource, std::string_view{text});
             default:
                 return core::error_t{core::error_code_t::unimplemented_yet,
                                      std::pmr::string{"Unsupported parameter type", resource}};
@@ -156,15 +167,23 @@ namespace frontend::postgres {
         return writer.build_from_payload(message_type::backend::AUTHENTICATION);
     }
 
-    std::vector<uint8_t>
-    build_error_response(packet_writer& writer, const char* sqlstate, std::string message, error_severity severity) {
-        writer.reserve_payload(ERROR_FIXED_SIZE + message.size() + severity.tag.size());
+    std::vector<uint8_t> build_error_response(packet_writer& writer,
+                                              const char* sqlstate,
+                                              std::string message,
+                                              error_severity severity,
+                                              std::string hint) {
+        writer.reserve_payload(ERROR_FIXED_SIZE + message.size() + severity.tag.size() +
+                               (hint.empty() ? 0 : hint.size() + 2));
         writer.write_uint8(static_cast<uint8_t>('S'));
         writer.write_string_null(std::move(severity.tag));
         writer.write_uint8(static_cast<uint8_t>('C'));
         writer.write_string_null(sqlstate);
         writer.write_uint8(static_cast<uint8_t>('M'));
         writer.write_string_null(std::move(message));
+        if (!hint.empty()) {
+            writer.write_uint8(static_cast<uint8_t>('H'));
+            writer.write_string_null(std::move(hint));
+        }
         writer.write_uint8(0x00); // terminator
         return writer.build_from_payload(message_type::backend::ERROR_RESPONSE);
     }

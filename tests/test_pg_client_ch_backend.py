@@ -11,7 +11,7 @@ from contextlib import contextmanager
 
 import config
 
-_ORDERS = f"{config.CH_ALIAS}.{config.CH_DATABASE}.orders"
+_ORDERS = f"{config.CH_ALIAS}.{config.CH_DATABASE}.public.orders"
 
 
 class client:
@@ -22,7 +22,7 @@ class client:
             'port': config.PG_PORT,
             'user': 'testuser',
             'password': 'testpass',
-            'dbname': config.CH_ALIAS,
+            'dbname': 'main',  # the engine database the session is placed in
         }
         print(f"Connecting to host: {host}")
 
@@ -212,6 +212,52 @@ class client:
             finally:
                 cur.execute(f"DELETE FROM {_ORDERS} WHERE {counted}")
 
+    def test_ch_numeric_null_and_failed_mutation(self):
+        """A NULL under a numeric cast stays NULL on ClickHouse, and a failed mutation is taken back.
+
+        `i + 1` over an Int32 column is computed as BIGINT: the cast ClickHouse gets is Nullable, so a
+        NULL row answers NULL (a bare `CAST(x AS Int64)` refuses it, and `isNull` over it counts no
+        row); `SET i = i + 3000000000` over the NULL row keeps it NULL (accurateCast alone would check
+        0 + 3000000000). An UPDATE that overflows the column fails; its mutation is killed, so the next
+        UPDATE of the table runs.
+        """
+        table = f"{config.CH_ALIAS}.{config.CH_DATABASE}.public.pg_numeric_null"
+        with self.pg_connection() as conn:
+            cur = conn.cursor()
+            try:
+                cur.execute(f"DROP TABLE {table}")
+            except psycopg2.Error:
+                pass
+            try:
+                cur.execute(f"CREATE TABLE {table} (_id string, i int)")
+                cur.execute(f"INSERT INTO {table} (_id, i) VALUES ('a', 1), ('n', NULL)")
+
+                cur.execute(f"SELECT _id, i + 1 FROM {table} ORDER BY _id")
+                self.assert_equal(cur.fetchall(), [('a', 2), ('n', None)], "i + 1 over a NULL row is NULL")
+                cur.execute(f"SELECT _id FROM {table} WHERE i + 1 > 0 ORDER BY _id")
+                self.assert_equal(cur.fetchall(), [('a',)], "a NULL row is not > 0")
+                cur.execute(f"SELECT count(*) FROM {table} WHERE i + 1 IS NULL")
+                self.assert_equal(cur.fetchone()[0], 1, "count(*) WHERE i + 1 IS NULL")
+
+                cur.execute(f"UPDATE {table} SET i = i + 1 WHERE _id = 'n'")
+                # Past Int32 only under the NULL's default 0: the engine keeps NULL, so does ClickHouse.
+                cur.execute(f"UPDATE {table} SET i = i + 3000000000 WHERE _id = 'n'")
+                cur.execute(f"UPDATE {table} SET i = i + 1 WHERE _id = 'a'")
+                cur.execute(f"SELECT _id, i FROM {table} ORDER BY _id")
+                self.assert_equal(cur.fetchall(), [('a', 2), ('n', None)], "UPDATE SET i = i + 1 keeps NULL")
+
+                try:
+                    cur.execute(f"UPDATE {table} SET i = i * 3000000000 WHERE _id = 'a'")
+                    raise AssertionError("an UPDATE past Int32 must be refused")
+                except psycopg2.Error as e:
+                    assert "cannot be safely converted" in str(e) or "CANNOT_CONVERT_TYPE" in str(e), str(e)
+                cur.execute(f"UPDATE {table} SET i = 5 WHERE _id = 'a'")
+                cur.execute(f"SELECT _id, i FROM {table} ORDER BY _id")
+                self.assert_equal(cur.fetchall(), [('a', 5), ('n', None)], "the UPDATE after a failed one")
+                print("  NULL under a numeric cast, a failed mutation killed ✓")
+            finally:
+                cur.execute(f"DROP TABLE {table}")
+
     def run_all_tests(self):
         self.test_ch_select()
         self.test_ch_select_with_where()
@@ -220,6 +266,7 @@ class client:
         self.test_ch_offset_without_limit()
         self.test_ch_limit_offset_window()
         self.test_ch_remote_dml_row_counts()
+        self.test_ch_numeric_null_and_failed_mutation()
 
 
 def main_test():

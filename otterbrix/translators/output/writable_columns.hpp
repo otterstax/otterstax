@@ -65,7 +65,7 @@ namespace tsl {
                 message.append(": column ");
                 message.append(std::to_string(c).c_str());
                 message.append(" has no name");
-                return core::error_t(core::error_code_t::schema_error, std::move(message));
+                return core::error_t(core::error_code_t::undefined_column, std::move(message));
             }
             if (!is_writable_scalar(types[c])) {
                 std::pmr::string message{res};
@@ -75,7 +75,7 @@ namespace tsl {
                 message.append("' (physical type ");
                 message.append(std::to_string(static_cast<unsigned>(types[c].to_physical_type())).c_str());
                 message.append(")");
-                return core::error_t(core::error_code_t::conversion_failure, std::move(message));
+                return core::error_t(core::error_code_t::unimplemented_yet, std::move(message));
             }
         }
         return true;

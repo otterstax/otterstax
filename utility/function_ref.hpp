@@ -20,9 +20,9 @@ namespace otterstax {
     // Lifetime: the reference does not keep the callable alive. The callable must
     // outlive every call made through the reference; for a connector query that
     // means until the awaitable the reference was handed to has completed.
-    // otterstax::run_with_owned_handler (wait_barrier.hpp) is where executeQuery
-    // binds a query's handler, and it binds the copy held in its own coroutine
-    // frame.
+    // otterstax::run_with_owned_handler (wait_barrier.hpp) is where the backend
+    // agent (backend_agent_t::run) binds a query's handler, and it binds the copy
+    // held in its own coroutine frame.
     //
     // Only a named, non-const object binds: a temporary would be gone before the
     // call, so an rvalue argument does not compile.

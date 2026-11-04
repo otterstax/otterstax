@@ -143,7 +143,11 @@ TEST_CASE("arrow_pool: a csv load allocates Arrow's buffers on the caller's reso
     {
         auto loaded = tsl::csv_to_chunk(&ledger, path);
         REQUIRE_FALSE(loaded.has_error());
-        REQUIRE(loaded.value().size() == 2000);
+        uint64_t rows = 0;
+        for (const auto& chunk : loaded.value()) {
+            rows += chunk.size();
+        }
+        REQUIRE(rows == 2000);
         // The file's read buffers alone are as large as the file; before the pool
         // they came from Arrow's default pool and never touched this resource.
         CHECK(tsl::arrow_pool(&ledger)->total_bytes_allocated() - total_before >= static_cast<int64_t>(file_size));

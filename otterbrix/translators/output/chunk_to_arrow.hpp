@@ -7,7 +7,7 @@
 
 #include <arrow/api.h>
 
-#include <otterbrix/otterbrix.hpp>
+#include <integration/cpp/otterbrix.hpp>
 
 #include <memory_resource>
 #include <string_view>
@@ -15,8 +15,8 @@
 // Arrow schema of a column list. A column without an alias maps to an Arrow field
 // with an empty name: the schema carries exactly the information the column has,
 // and nothing is dereferenced. A column whose physical type has no Arrow mapping
-// (UINT128, BIT, UNKNOWN, and the other INT128 reading — UUID) is a
-// conversion_failure naming the column; nothing here throws. HUGEINT is the one
+// (UINT128, BIT, UNKNOWN, and the other INT128 reading — UUID) is
+// unimplemented_yet naming the column; nothing here throws. HUGEINT is the one
 // INT128 reading that maps: Arrow has no 128-bit integer type, so it becomes
 // decimal128(38, 0), scale 0 keeping it an integer.
 //
@@ -52,7 +52,7 @@ chunk_to_file_batch(std::pmr::memory_resource* res, const components::vector::da
 // decimal carrier uses. The scale is not applied to the value — it rides in the Arrow type,
 // which is what makes the pair exact.
 //
-// Two payloads are refused as conversion_failure, `scope` and `column_name` opening the
+// The cell is row `row` of `column` (not NULL). Two payloads are refused, `scope` and `column_name` opening the
 // message (built only when refusing, so a cell costs no string): a DECIMAL holding one of the
 // engine's non-finite sentinels (±Infinity / NaN, the extremes of its storage width — see
 // components::types::decimal_special), which decimal128 has no representation for at all; and
@@ -63,6 +63,7 @@ chunk_to_file_batch(std::pmr::memory_resource* res, const components::vector::da
 // Shared with the FlightSQL batch stream, which encodes the same two column types cell by cell
 // against the prepared schema rather than through chunk_to_record_batch.
 core::result_wrapper_t<arrow::Decimal128> to_arrow_decimal(std::pmr::memory_resource* res,
-                                                           const components::types::logical_value_t& value,
+                                                           const components::vector::vector_t& column,
+                                                           uint64_t row,
                                                            std::string_view scope,
                                                            std::string_view column_name);

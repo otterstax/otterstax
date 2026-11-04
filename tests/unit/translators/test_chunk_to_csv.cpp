@@ -2,8 +2,10 @@
 // Copyright 2025-2026  OtterStax
 
 #include "otterbrix/translators/input/csv_to_chunk.hpp"
+#include "single_chunk.hpp"
 #include "otterbrix/translators/output/chunk_to_csv.hpp"
 #include "rows_chunk.hpp"
+#include "../../mock/cell.hpp"
 
 #include <catch2/catch_all.hpp>
 
@@ -17,7 +19,6 @@
 
 using components::types::complex_logical_type;
 using components::types::logical_type;
-using components::types::logical_value_t;
 using components::vector::data_chunk_t;
 using otterstax::test::make_rows_chunk;
 
@@ -28,7 +29,7 @@ namespace {
         const std::string csv = "id,name\n1,Alice\n2,Bob\n3,Charlie\n4,Dave\n5,Eve\n";
         auto loaded = tsl::csv_to_chunk(res, reinterpret_cast<const uint8_t*>(csv.data()), csv.size());
         REQUIRE_FALSE(loaded.has_error());
-        return std::move(loaded.value());
+        return std::move(otterstax::test::single(loaded.value()));
     }
 
     std::vector<std::string> read_lines(const std::string& path) {
@@ -59,12 +60,12 @@ TEST_CASE("chunk_to_csv: round-trips through csv_to_chunk") {
 
     auto back = tsl::csv_to_chunk(res, path);
     REQUIRE_FALSE(back.has_error());
-    REQUIRE(back.value().column_count() == 2);
-    REQUIRE(back.value().size() == 5);
-    REQUIRE(back.value().value(0, 0).value<int64_t>() == 1);
-    REQUIRE(back.value().value(0, 4).value<int64_t>() == 5);
-    REQUIRE(back.value().value(1, 0).value<std::string_view>() == "Alice");
-    REQUIRE(back.value().value(1, 4).value<std::string_view>() == "Eve");
+    REQUIRE(otterstax::test::single(back.value()).column_count() == 2);
+    REQUIRE(otterstax::test::single(back.value()).size() == 5);
+    REQUIRE(otterstax::test::cell(otterstax::test::single(back.value()), 0, 0).value<int64_t>() == 1);
+    REQUIRE(otterstax::test::cell(otterstax::test::single(back.value()), 0, 4).value<int64_t>() == 5);
+    REQUIRE(otterstax::test::cell(otterstax::test::single(back.value()), 1, 0).value<std::string_view>() == "Alice");
+    REQUIRE(otterstax::test::cell(otterstax::test::single(back.value()), 1, 4).value<std::string_view>() == "Eve");
 
     std::filesystem::remove(path);
 }
@@ -126,14 +127,14 @@ TEST_CASE("chunk_to_csv: a column without a name is refused, nothing is written"
     types.emplace_back(logical_type::BIGINT);
     data_chunk_t chunk(res, types, 1);
     chunk.set_cardinality(1);
-    chunk.set_value(0, 0, logical_value_t{res, int64_t{42}});
+    chunk.set_value(0, 0, int64_t{42});
 
     std::pmr::vector<data_chunk_t> chunks(res);
     chunks.push_back(std::move(chunk));
 
     auto written = tsl::chunk_to_csv(res, chunks, path);
     REQUIRE(written.has_error());
-    REQUIRE(written.error().type == core::error_code_t::schema_error);
+    REQUIRE(written.error().type == core::error_code_t::undefined_column);
     REQUIRE_FALSE(std::filesystem::exists(path));
 }
 
@@ -150,8 +151,8 @@ TEST_CASE("chunk_to_csv: a hugeint column keeps its full width") {
     data_chunk_t chunk(res, types, 2);
     chunk.set_cardinality(2);
     const auto big = absl::MakeInt128(1, 0); // 2^64
-    chunk.set_value(0, 0, logical_value_t{res, big});
-    chunk.set_value(0, 1, logical_value_t{res, -big});
+    chunk.set_value(0, 0, big);
+    chunk.set_value(0, 1, -big);
 
     std::pmr::vector<data_chunk_t> chunks(res);
     chunks.push_back(std::move(chunk));
@@ -184,7 +185,7 @@ TEST_CASE("chunk_to_csv: a hugeint written to csv comes back as a double") {
     types.emplace_back(logical_type::HUGEINT, "wide");
     data_chunk_t chunk(res, types, 1);
     chunk.set_cardinality(1);
-    chunk.set_value(0, 0, logical_value_t{res, absl::MakeInt128(1, 0)}); // 2^64
+    chunk.set_value(0, 0, absl::MakeInt128(1, 0)); // 2^64
 
     std::pmr::vector<data_chunk_t> chunks(res);
     chunks.push_back(std::move(chunk));
@@ -192,8 +193,8 @@ TEST_CASE("chunk_to_csv: a hugeint written to csv comes back as a double") {
 
     auto back = tsl::csv_to_chunk(res, path);
     REQUIRE_FALSE(back.has_error());
-    REQUIRE(back.value().types()[0].type() == logical_type::DOUBLE);
-    REQUIRE(back.value().value(0, 0).value<double>() == 18446744073709551616.0);
+    REQUIRE(otterstax::test::single(back.value()).types()[0].type() == logical_type::DOUBLE);
+    REQUIRE(otterstax::test::cell(otterstax::test::single(back.value()), 0, 0).value<double>() == 18446744073709551616.0);
 
     std::filesystem::remove(path);
 }

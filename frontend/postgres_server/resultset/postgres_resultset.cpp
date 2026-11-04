@@ -23,12 +23,13 @@ namespace frontend::postgres {
         return true;
     }
 
-    postgres_resultset::postgres_resultset(packet_writer& writer, bool datarow_only)
+    postgres_resultset::postgres_resultset(packet_writer& writer, extra_float_digits_t digits, bool datarow_only)
         : format_()
         , field_desc_()
         , encoded_rows_()
         , writer_(writer)
-        , datarow_only_(datarow_only) {}
+        , datarow_only_(datarow_only)
+        , extra_float_digits_(digits) {}
 
     void postgres_resultset::add_encoding(std::vector<result_encoding> format) { format_ = std::move(format); }
 
@@ -86,7 +87,7 @@ namespace frontend::postgres {
                 writer.write_int32(estimate_binary_field_size<frontend_type::POSTGRES>(chunk, i, row_index));
                 encode_to_binary<frontend_type::POSTGRES>(writer, chunk, i, row_index);
             } else {
-                auto str = encode_to_text(chunk, i, row_index);
+                auto str = encode_to_text(chunk, i, row_index, {frontend_type::POSTGRES, extra_float_digits_.value});
                 writer.write_int32(str.size());
                 writer.write_string_fixed(std::move(str));
             }

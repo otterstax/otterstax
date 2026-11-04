@@ -2,13 +2,9 @@
 // Copyright 2025-2026  OtterStax
 
 #pragma once
-#include <components/session/session.hpp>
 
-using session_id = components::session::session_id_t;
+#include <cstddef>
+
+// The per-call id the file / s3 managers and Kafka take
+// for a statement (session::to_hash of the query session's statement id).
 using session_hash_t = std::size_t;
-
-enum class flightsql_session_type : uint8_t
-{
-    GET_FLIGHT_INFO,
-    DO_GET,
-};

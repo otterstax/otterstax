@@ -5,19 +5,15 @@
 
 #include <libpq-fe.h>
 
-#include <string_view>
 #include <vector>
 
 namespace otterstax::test {
 
-    // A PGresult shaped like libpq's CommandComplete outcome: no columns, no tuples, and
-    // `command_tag` ("UPDATE 5000", "CREATE TABLE") as its command status. The caller
-    // owns the result (PQclear).
-    PGresult* make_command_result(std::string_view command_tag);
-
     struct pg_column {
         const char* name;
         Oid typid;
+        // The column's type modifier (PQfmod): NUMERIC(p, s) is ((p << 16) | s) + 4; -1 none.
+        int typmod = -1;
     };
 
     // A PGresult with `columns` and one tuple per entry of `rows`; a nullptr cell is SQL
@@ -26,7 +22,7 @@ namespace otterstax::test {
     PGresult* make_tuples_result(const std::vector<pg_column>& columns,
                                  const std::vector<std::vector<const char*>>& rows);
 
-    // RAII owner for a PGresult built by the factories above.
+    // RAII owner for a PGresult built by the factory above.
     class pg_result_guard {
     public:
         explicit pg_result_guard(PGresult* result)

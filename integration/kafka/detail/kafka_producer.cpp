@@ -12,7 +12,7 @@
 namespace otterstax::kafka::detail {
     namespace {
         core::error_t producer_error(const std::string& msg) {
-            return core::error_t(core::error_code_t::other_error, std::pmr::string(("kafka producer: " + msg).c_str()));
+            return core::error_t(core::error_code_t::io_error, std::pmr::string(("kafka producer: " + msg).c_str()));
         }
 
         // Consume librdkafka's Error (nullptr == success) into a value, keeping its

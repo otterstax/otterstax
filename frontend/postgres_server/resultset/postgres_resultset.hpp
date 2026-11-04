@@ -25,9 +25,18 @@ namespace frontend::postgres {
     bool same_wire_shape(const std::pmr::vector<components::types::complex_logical_type>& described,
                          const components::vector::data_chunk_t& executed);
 
+    // The connection's extra_float_digits: how a float cell's text is written
+    // (float_text.hpp). A type of its own, so that it is never taken for the
+    // flag beside it.
+    struct extra_float_digits_t {
+        int value;
+    };
+
     class postgres_resultset {
     public:
-        postgres_resultset(packet_writer& writer, bool datarow_only = false);
+        // `datarow_only`: the client knows the row shape already (no
+        // RowDescription in front of the rows).
+        postgres_resultset(packet_writer& writer, extra_float_digits_t digits, bool datarow_only = false);
 
         void add_encoding(std::vector<result_encoding> format);
         void add_chunk_columns(const components::vector::data_chunk_t& chunk,
@@ -43,5 +52,6 @@ namespace frontend::postgres {
         std::vector<std::vector<uint8_t>> encoded_rows_;
         std::reference_wrapper<packet_writer> writer_;
         bool datarow_only_;
+        extra_float_digits_t extra_float_digits_;
     };
 } // namespace frontend::postgres

@@ -23,10 +23,11 @@ Cases:
   test_sql_limit_then_limit             — spark.sql("... LIMIT 10").limit(3) is the first three of those rows
   test_union_by_name_reordered_rejected — unionByName over reordered columns is refused, naming unionByName
 
-setup() creates a local database and table through spark.sql() under a unique
-name (the matrix runs several clients against one server at once); cleanup()
-drops them. Only API present in PySpark 3.5 is used, so the file runs unchanged
-on every client of the matrix (3.5.0 ... 4.2.0, see Dockerfile.spark-test).
+setup() creates a local schema (of `main`, the session's place) and a table in
+it through spark.sql() under a unique name (the matrix runs several clients
+against one server at once); cleanup() drops them. Only API present in PySpark
+3.5 is used, so the file runs unchanged on every client of the matrix (3.5.0 ...
+4.2.0, see Dockerfile.spark-test).
 
 Usage:
     python test_spark_client_dataframe_ops.py            # docker (host=test-otterstax)
@@ -45,7 +46,7 @@ from pyspark.sql import functions as F
 
 import config
 
-CAMPAIGNS = "campaigns.db1.campaigns"  # MySQL: campaign_id, campaign_name, campaign_length, budget
+CAMPAIGNS = "campaigns.db1.public.campaigns"  # MySQL: campaign_id, campaign_name, campaign_length, budget
 PRODUCTS = "products.pgdb.public.products"    # PostgreSQL: product_id, campaign_id, product_name, price, category
 
 # The local table: (id, grp, amount), the last row twice so distinct() has a row to drop.
@@ -65,7 +66,7 @@ class SparkDataFrameOpsTest:
         self.totals = {}       # table -> row count
         self.db_created = False
         self.table_created = False
-        print(f"PySpark client {pyspark.__version__}, Spark Connect server {self.url}, local database {self.db}")
+        print(f"PySpark client {pyspark.__version__}, Spark Connect server {self.url}, local schema main.{self.db}")
 
     # --- helpers ---
 
@@ -133,7 +134,7 @@ class SparkDataFrameOpsTest:
         self.spark = SparkSession.builder.remote(self.url).getOrCreate()
         self.campaigns = self.spark.table(CAMPAIGNS)
         self.products = self.spark.table(PRODUCTS)
-        self.spark.sql(f"CREATE DATABASE {self.db}")
+        self.spark.sql(f"CREATE SCHEMA {self.db}")
         self.db_created = True
         self.spark.sql(f"CREATE TABLE {self.local_table} (id bigint, grp string, amount bigint)")
         self.table_created = True
@@ -151,7 +152,7 @@ class SparkDataFrameOpsTest:
             if self.table_created:
                 self.spark.sql(f"DROP TABLE {self.local_table}")
             if self.db_created:
-                self.spark.sql(f"DROP DATABASE {self.db}")
+                self.spark.sql(f"DROP SCHEMA {self.db}")
         finally:
             self.spark.stop()
 
@@ -210,8 +211,8 @@ class SparkDataFrameOpsTest:
 
     def test_avg_keeps_the_fraction(self):
         """avg over the local table's BIGINT column answers the DOUBLE mean of the rows, fraction kept."""
-        # The rows are the reference: the engine's own AVG over BIGINT, which the SQL
-        # path runs, drops the fraction.
+        # The rows are the reference (the SQL path's AVG over the BIGINT column answers
+        # the same DOUBLE means: the engine widens an integer argument).
         amounts = [amount for _, _, amount in LOCAL_ROWS]
         got = self.local.agg(F.avg("amount").alias("mean")).collect()[0]["mean"]
         if not isinstance(got, float):

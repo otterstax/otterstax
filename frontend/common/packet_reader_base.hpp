@@ -29,6 +29,11 @@ namespace frontend {
     public:
         packet_reader_base(std::vector<uint8_t> data);
         virtual ~packet_reader_base() = default;
+        // A reader moves with its packet (a coroutine takes one by value).
+        packet_reader_base(const packet_reader_base&) = default;
+        packet_reader_base(packet_reader_base&&) noexcept = default;
+        packet_reader_base& operator=(const packet_reader_base&) = default;
+        packet_reader_base& operator=(packet_reader_base&&) noexcept = default;
 
         uint8_t read_uint8();
         std::string read_string_null();

@@ -1,6 +1,7 @@
 -- Step 3a: ENUM + composite types + a local table — fully on the engine,
--- no external backends needed.
-CREATE DATABASE otter;
+-- no external backends needed. `otter` is a schema of the session's database
+-- (`main`): `otter.warehouses` is main.otter.warehouses.
+CREATE SCHEMA otter;
 
 CREATE TYPE tier_t AS ENUM('bronze','silver','gold');
 

@@ -1,0 +1,13 @@
+# Keep the build context small: no Dockerfile COPYs any of these, and the host
+# build tree alone is gigabytes.
+.git
+.idea
+.vscode
+build
+cmake-build-*
+benchmark_results
+benchmark_manual
+tracy_profiles
+logs
+log
+wal

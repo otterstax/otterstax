@@ -6,7 +6,7 @@
 #   examples/demo/up.sh --local    # bench mode: 3 backends only; run otterstax locally
 #
 # After exit (full mode), server listens on:
-#   PG  wire   localhost:8817   (psql -h localhost -p 8817 -U demo demo)
+#   PG  wire   localhost:8817   (psql -h localhost -p 8817 -U demo main)
 #   MySQL wire localhost:8816
 #   FlightSQL  localhost:8815
 #
@@ -48,7 +48,7 @@ fi
 # --- 1. Generate init SQL ---
 echo "=== 1. Generating demo data ==="
 if [ -f ../../.venv/bin/activate ]; then source ../../.venv/bin/activate; fi
-python ./generate_data.py
+python3 ./generate_data.py
 
 # --- 2. Bring up containers ---
 echo ""
@@ -131,7 +131,7 @@ cat <<'EOF'
 ✅  Demo stack is up.
 
   PostgreSQL wire (used by demo):
-    psql -h localhost -p 8817 -U demo demo
+    psql -h localhost -p 8817 -U demo main
 
   Other wires:
     mysql -h localhost -P 8816 -u demo -pdemo
@@ -139,18 +139,18 @@ cat <<'EOF'
 
   Run demo SQL files step-by-step (paths relative to repo root):
 
-    psql -h localhost -p 8817 -U demo demo -f examples/demo/sql/step_1.sql
-    psql -h localhost -p 8817 -U demo demo -f examples/demo/sql/step_2.sql
-    psql -h localhost -p 8817 -U demo demo -f examples/demo/sql/step_3a_ddl.sql
-    psql -h localhost -p 8817 -U demo demo -f examples/demo/sql/step_3b_insert.sql
-    psql -h localhost -p 8817 -U demo demo -f examples/demo/sql/step_3c_select.sql
-    psql -h localhost -p 8817 -U demo demo -f examples/demo/sql/step_3d_main.sql
-    psql -h localhost -p 8817 -U demo demo -f examples/demo/sql/step_4.sql
-    psql -h localhost -p 8817 -U demo demo -f examples/demo/sql/step_5.sql
-    psql -h localhost -p 8817 -U demo demo -f examples/demo/sql/step_6.sql
-    psql -h localhost -p 8817 -U demo demo -f examples/demo/sql/step_7.sql   # s3 csv load
-    psql -h localhost -p 8817 -U demo demo -f examples/demo/sql/step_8.sql   # s3 parquet load
-    psql -h localhost -p 8817 -U demo demo -f examples/demo/sql/step_9.sql   # JOIN + dump back to s3
+    psql -h localhost -p 8817 -U demo main -f examples/demo/sql/step_1.sql
+    psql -h localhost -p 8817 -U demo main -f examples/demo/sql/step_2.sql
+    psql -h localhost -p 8817 -U demo main -f examples/demo/sql/step_3a_ddl.sql
+    psql -h localhost -p 8817 -U demo main -f examples/demo/sql/step_3b_insert.sql
+    psql -h localhost -p 8817 -U demo main -f examples/demo/sql/step_3c_select.sql
+    psql -h localhost -p 8817 -U demo main -f examples/demo/sql/step_3d_main.sql
+    psql -h localhost -p 8817 -U demo main -f examples/demo/sql/step_4.sql
+    psql -h localhost -p 8817 -U demo main -f examples/demo/sql/step_5.sql
+    psql -h localhost -p 8817 -U demo main -f examples/demo/sql/step_6.sql
+    psql -h localhost -p 8817 -U demo main -f examples/demo/sql/step_7.sql   # s3 csv load
+    psql -h localhost -p 8817 -U demo main -f examples/demo/sql/step_8.sql   # s3 parquet load
+    psql -h localhost -p 8817 -U demo main -f examples/demo/sql/step_9.sql   # JOIN + dump back to s3
 
   Or all at once:
     examples/demo/run-queries.sh
@@ -163,7 +163,7 @@ cat <<'EOF'
   After running steps 3a-3b / 7-8 (which create otter.warehouses / otter.regions /
   otter.promos), run cleanup before re-doing the demo:
 
-    psql -h localhost -p 8817 -U demo demo -f examples/demo/sql/cleanup.sql
+    psql -h localhost -p 8817 -U demo main -f examples/demo/sql/cleanup.sql
 
   Tear everything down (releases volumes — clickhouse re-init needs this,
   and the RustFS bucket is recreated on next `up`):

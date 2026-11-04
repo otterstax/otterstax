@@ -8,7 +8,7 @@
 
 #include <filesystem>
 
-// FileManager/S3Manager construction (reachable via the Scheduler stack) calls
+// FileManager/S3Manager construction (reachable via the session stack) calls
 // arrow::fs::EnsureS3Initialized() transitively. Arrow requires a matching
 // FinalizeS3() before exit or it warns and may segfault during static teardown;
 // the same guard the server's main.cpp holds does it once the run is over.

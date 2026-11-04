@@ -15,7 +15,7 @@
 namespace file_ext {
 
     enum class file_stmt_kind {
-        create_external_table, // CREATE EXTERNAL TABLE <db>.<table> WITH (...)
+        create_external_table, // CREATE EXTERNAL TABLE [[[c.]d.]s.]t WITH (...)
         copy_to                // COPY (<inner_sql>) TO '<location>' WITH (...)
     };
 
@@ -29,8 +29,8 @@ namespace file_ext {
 
     struct file_stmt {
         file_stmt_kind kind;
-        const char*    db;        // create only: e.g. "file"
-        const char*    table;     // create only: e.g. "trades"
+        const char*  name[4];   // create only: the table name's parts as written
+        int          name_parts; // create only: how many — more than 4 is refused at parse
         const char*    inner_sql; // copy only: raw SELECT text (filled by the driver)
         const char*    location;  // create: WITH location=...   copy: the TO target
         const char*    format;    // resolved from options, or nullptr
@@ -95,8 +95,7 @@ namespace file_ext {
     inline file_stmt* make_stmt(std::pmr::memory_resource* resource, file_stmt_kind kind) {
         auto* s = static_cast<file_stmt*>(resource->allocate(sizeof(file_stmt)));
         s->kind = kind;
-        s->db = nullptr;
-        s->table = nullptr;
+        s->name_parts = 0;
         s->inner_sql = nullptr;
         s->location = nullptr;
         s->format = nullptr;
@@ -104,12 +103,22 @@ namespace file_ext {
         return s;
     }
 
+    // A CREATE EXTERNAL TABLE whose name is `first`; append_name adds the next part.
     inline file_stmt*
-    make_create(std::pmr::memory_resource* resource, const char* db, const char* table, file_option* options) {
+    make_create(std::pmr::memory_resource* resource, const char* first, file_option* options) {
         file_stmt* s = make_stmt(resource, file_stmt_kind::create_external_table);
-        s->db = db;
-        s->table = table;
+        s->name[0] = first;
+        s->name_parts = 1;
         s->options = options;
+        return s;
+    }
+
+    // One more part of a CREATE EXTERNAL TABLE name; a fifth is only counted.
+    inline file_stmt* append_name(file_stmt* s, const char* part) {
+        if (s->name_parts < 4) {
+            s->name[s->name_parts] = part;
+        }
+        ++s->name_parts;
         return s;
     }
 

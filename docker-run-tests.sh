@@ -226,17 +226,8 @@ compose down --volumes --remove-orphans 2>/dev/null || true
 # Clean up init directories to ensure fresh data
 rm -rf init/mariadb1/* init/mariadb2/* init/postgres/* init/clickhouse/* 2>/dev/null || true
 
-# TEMPORARY (OTB-tag, docs/proposals/otterbrix-embedding.md): the pinned
-# otterbrix package exists only in the local Conan cache, so archive its recipe
-# into .conan-local/ for Dockerfile.test to restore (actor-zeta comes from the
-# conan remote). Only needed when this script builds test-otterstax itself
-# (no IMAGE_TAG).
+# Only needed when this script builds test-otterstax itself (no IMAGE_TAG).
 if [ -z "${IMAGE_TAG}" ]; then
-    if ! "$SCRIPT_DIR/scripts/conan/export_local_packages.sh"; then
-        echo "❌ Cannot provide the local otterbrix Conan recipe to the image build." >&2
-        echo "   Fix the error above, then re-run (or run scripts/conan/export_local_packages.sh by hand)." >&2
-        exit 1
-    fi
     # otterbrix builds from source inside the image (~1.5-2 GB per job):
     # with no -j, cap the jobs to Docker's RAM like run_benchmark.sh
     # does (CLAUDE.md "Build resources") instead of nproc.

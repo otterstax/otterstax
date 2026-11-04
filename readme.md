@@ -143,12 +143,14 @@ COPY (SELECT * FROM eg.t) TO 's3://bucket/exported/out.csv' WITH (s3_alias = 'de
 
 ## Building
 
-The pinned otterbrix package is, for now, a local Conan package (see
+otterbrix (`1.0.0b2-rc-4`) and actor-zeta come from the `otterbrix` Conan remote; `--build missing`
+builds otterbrix from its recipe where the remote has no binary for your configuration (see
 [`CLAUDE.md`](CLAUDE.md#critical-dependency-versions-conanfilepy)). Size the build jobs to your RAM
 (about 1.5 GB per job).
 
 ```bash
 pip install "conan>=2.0" && conan profile detect --force
+conan remote add otterbrix https://conan.otterbrix.com
 conan install conanfile.py --build missing -s build_type=Release -s compiler.cppstd=20
 cmake -S . -B build/Release -DCMAKE_TOOLCHAIN_FILE=build/Release/generators/conan_toolchain.cmake
 cmake --build build/Release --parallel <JOBS>

@@ -189,8 +189,8 @@ namespace frontend::mysql {
         // The user named in the HandshakeResponse (USER(), CURRENT_USER()).
         std::string user_;
         // What the last SET / USE the engine accepted set, as @@autocommit,
-        // @@time_zone and DATABASE() answer it (the engine has no SHOW,
-        // OTB-show); a refused SET changes none of them. A SET a ROLLBACK
+        // @@time_zone and DATABASE() answer it (the engine has no SHOW);
+        // a refused SET changes none of them. A SET a ROLLBACK
         // later undoes is not followed here.
         bool autocommit_{true};
         std::string time_zone_{"SYSTEM"};

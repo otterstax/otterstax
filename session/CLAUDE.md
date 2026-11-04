@@ -47,16 +47,14 @@ connection object.
   `co_await`. The mailbox is the statement queue; there is no second queue.
   `tests/session/test_session_lifetime.cpp` ("one statement at a time across real
   suspensions") pins it with every statement sent before any answer is read.
-- **Waiting is a poll (OTB-notify).** actor-zeta 2.0.0 settles a future by
+- **Waiting is a poll.** actor-zeta 2.0.0 settles a future by
   flags alone and wakes nobody: while the session is suspended on the engine's
   future, `basic_actor::resume` answers `resume` and the pool requeues the job at
   once, so a statement that waits costs CPU of the sessions pool (and the
   engine's executor spins the same way on its exec pool). The session keeps the
   plain `co_await` until actor-zeta / otterbrix wake an actor when the future it
-  awaits settles (`docs/proposals/actor-zeta.md`, AZ-waker / AZ-park; the
-  engine's side OTB-notify in `docs/proposals/otterbrix-embedding.md`). The
-  hidden `[.engine-defect-otb-notify]` case in `test_session_lifetime.cpp`
-  asserts the idle wait.
+  awaits settles. The hidden `[.engine-defect-otb-notify]` case in
+  `test_session_lifetime.cpp` asserts the idle wait.
 
 ### Entry points
 
@@ -115,8 +113,8 @@ may go away in the middle of a statement:
   once (`otterbrix/federation/CLAUDE.md`, "A closed connection"). Not left to
   the engine's ROLLBACK: that is a statement for one of the engine's four
   executors, each running one statement at a time, and every one of them may
-  be running a statement of another block that waits for this very agent
-  (OTB-executor-wait). A statement of the session still running on a backend
+  be running a statement of another block that waits for this very agent.
+  A statement of the session still running on a backend
   is answered `connection_closed` at its next request there.
 - Then the engine's `manager_dispatcher_t::close_session` for the connection's
   engine session (not awaited): the engine takes it after the statements the
@@ -225,8 +223,7 @@ backend: `otterbrix/federation/CLAUDE.md`, "Transactions"):
 
 A `SET` / `RESET` / `RESET ALL` / `SET LOCAL` is an ordinary statement of the
 engine, which keeps settings per session (`timezone`, `autocommit`,
-`search_path`; a parameter it does not have is its refusal — OTB-driver-settings,
-OTB-show). An executed one answers what it assigned (`setting_changes`, each
+`search_path`; a parameter it does not have is its refusal). An executed one answers what it assigned (`setting_changes`, each
 value canonicalised as the engine does, `plan::setting_changes`) and a
 SAVEPOINT / RELEASE / ROLLBACK TO the savepoint it named (`savepoint`), which
 the PostgreSQL frontend follows for its ParameterStatus (`frontend/CLAUDE.md`).

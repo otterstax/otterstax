@@ -36,8 +36,7 @@ void stop_backends();                                           // idempotent; ~
   `runtime_t` builds them and never starts or stops them: `open_engine` starts them,
   and the engine's shutdown stops them. An actor-zeta pool cannot be restarted.
   `scheduler_t::start` appends a second set of workers, and `stop()` on a pool that
-  was never started indexes an empty vector (asked of actor-zeta as AZ-pool-lifecycle,
-  `docs/proposals/actor-zeta.md`). So the three pools serve **one** engine.
+  was never started indexes an empty vector. So the three pools serve **one** engine.
   `engine_t::open` lends them (`fresh → lent`) and the engine's destructor spends them
   (`lent → spent`); a refused open spends them too, unstarted (`lent → spent`). A
   second engine — after a reopen or after a refused open — needs a second `runtime_t`:

@@ -39,19 +39,7 @@ RUN rm /bin/sh && ln -s /bin/bash /bin/sh
 # devcontainer preset layout exactly.
 WORKDIR /app
 COPY conanfile.py .
-# TEMPORARY (OTB-tag, docs/proposals/otterbrix-embedding.md): restore the
-# local-only otterbrix recipe archived by scripts/conan/export_local_packages.sh
-# and build it from source; without the archive the install falls back to the
-# remotes. actor-zeta comes from the remote like any other dependency. See
-# Dockerfile.test.
-COPY .conan-local/ /tmp/conan-local/
-RUN _local_build=() && \
-    if [ -f /tmp/conan-local/local_recipes.tgz ]; then \
-        conan cache restore /tmp/conan-local/local_recipes.tgz && \
-        _local_build=(--build="otterbrix/*"); \
-    fi && \
-    rm -rf /tmp/conan-local && \
-    _jobs="${BUILD_JOBS}" && \
+RUN _jobs="${BUILD_JOBS}" && \
     if [ "$_jobs" = "0" ]; then \
         _mem_jobs=$(( $(awk '/^MemTotal:/ {print int($2/1024)}' /proc/meminfo) / 1536 )) && \
         if [ "$_mem_jobs" -lt 1 ]; then _mem_jobs=1; fi && \
@@ -60,12 +48,12 @@ RUN _local_build=() && \
     echo "conan from-source build jobs: ${_jobs}" && \
     _jobs_conf=(-c "tools.build:jobs=${_jobs}") && \
     if [ "$WITH_TRACY" = "true" ]; then \
-        conan install conanfile.py --build missing "${_local_build[@]}" "${_jobs_conf[@]}" \
+        conan install conanfile.py --build missing "${_jobs_conf[@]}" \
             -s build_type=Release \
             -s compiler.cppstd=20 \
             -o "&:with_tracy=True"; \
     else \
-        conan install conanfile.py --build missing "${_local_build[@]}" "${_jobs_conf[@]}" \
+        conan install conanfile.py --build missing "${_jobs_conf[@]}" \
             -s build_type=Release \
             -s compiler.cppstd=20; \
     fi

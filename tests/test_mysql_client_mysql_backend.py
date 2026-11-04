@@ -363,7 +363,7 @@ class client:
     def test_prepared_select_of_a_parameter(self):
         """A prepared `SELECT ? FROM t` answers the bound value per row.
 
-        The engine types a select-list parameter (OTB-select-param closed; the
+        The engine types a select-list parameter (fixed in otterbrix; the
         C++ twin is "mysql protocol over the wire: a prepared SELECT ? FROM t
         answers the bound value per row", tests/system/test_frontend_mysql_protocol.cpp).
         """

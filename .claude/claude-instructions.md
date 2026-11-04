@@ -30,8 +30,8 @@ looks unrelated to the change; `-j 4` builds cleanly:
   dropping its `session_ptr`, never destroyed directly (`session/CLAUDE.md`, the close protocol).
 - **Errors.** Nothing throws across a module boundary: `core::error_t` / `core::result_wrapper_t<T>`,
   `[[nodiscard]]`; a third-party throw is caught where it is made.
-- **otterbrix first.** What otterbrix lacks is a request in `docs/proposals/otterbrix-embedding.md`
-  (`OTB-…`), not a workaround in OtterStax; a claim about otterbrix is checked in its sources
+- **otterbrix first.** What otterbrix lacks is a request to otterbrix, not a workaround in
+  OtterStax; a claim about otterbrix is checked in its sources
   (`~/CLionProjects/otterbrix`).
 - **Namespaces.** `otterstax::{runtime, backends, federation, catalog, session, engine, kafka}`;
   `frontend::{mysql, postgres, spark}`, `flight::*`; the connectors `mysql::` / `pg::` / `ch::`,

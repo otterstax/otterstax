@@ -163,7 +163,7 @@ namespace otterstax::backends {
         OTX_ZONE_N("remote_backends_t::~remote_backends_t");
         // The engine is gone: no statement reaches an actor any more. The running statements are
         // aborted, the pool joins its threads (no agent job runs or waits after that: an actor-zeta
-        // actor is destroyed only off a pool that runs it, AZ-teardown), then the actors and their
+        // actor is destroyed only off a pool that runs it), then the actors and their
         // agents go.
         for (auto& actor : actors_) {
             actor->cancel_agents();

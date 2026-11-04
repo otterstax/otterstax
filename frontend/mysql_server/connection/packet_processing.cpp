@@ -476,7 +476,7 @@ namespace frontend::mysql {
     void mysql_connection::send_statement_error(core::error_code_t code, std::string error) {
         // A statement the engine does not support is ER_NOT_SUPPORTED_YET, by
         // COM_QUERY and COM_STMT_PREPARE alike; every other code is
-        // ER_SYNTAX_ERROR until the engine maps its codes (OTB-sqlstate).
+        // ER_SYNTAX_ERROR until the engine maps its codes.
         send_error(code == core::error_code_t::unimplemented_yet ? mysql_error::ER_NOT_SUPPORTED_YET
                                                                  : mysql_error::ER_SYNTAX_ERROR,
                    std::move(error));

@@ -369,7 +369,7 @@ namespace frontend::postgres {
         }
 
         // The SQLSTATE of an engine code, where the tests read one; the full
-        // table is otterbrix's to give (OTB-sqlstate). nullptr: none.
+        // table is otterbrix's to give. nullptr: none.
         const char* sqlstate_of(core::error_code_t code) {
             switch (code) {
                 case core::error_code_t::transaction_finalized:

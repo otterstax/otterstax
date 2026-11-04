@@ -145,7 +145,7 @@ TEST_CASE("session prepared: every execute binds its own values") {
 
 // A parameter in the select list (PostgreSQL's `SELECT $1 FROM t`, MySQL's
 // `SELECT ? FROM t` once the frontend numbered it): the engine types it by its
-// bound value and answers it once per row (OTB-select-param, fixed in
+// bound value and answers it once per row (fixed in
 // otterbrix; its validator used to throw std::bad_variant_access over it).
 TEST_CASE("session prepared: a select-list parameter answers its bound value once per row") {
     with_session_stack("/tmp/test_session_prepared_select_param", [](session_stack s) {

@@ -29,7 +29,7 @@ namespace otterstax::federation {
         constexpr auto safety_interval = std::chrono::seconds(1);
 
         // storage_total_rows: an estimate is an answer (it only orders the sides of a hash join), and
-        // the discovery reads no statistics, so every remote table answers the same (OTB-total-rows).
+        // the discovery reads no statistics, so every remote table answers the same.
         constexpr std::uint64_t estimated_rows = 1000;
 
         std::string savepoint_name(uint64_t sub_id) { return "s" + std::to_string(sub_id); }

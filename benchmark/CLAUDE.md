@@ -318,8 +318,8 @@ WHERE included, is pushed down whole. `join_cross_engine` and `join_all` JOIN
 tables of different servers, so the JOIN runs in the engine over what each
 server takes of its side (see "What the pushdown sends" below). The ClickHouse pairs of
 `join_cross_engine` JOIN keys of different types (ClickHouse `UInt32` against
-`INT`), which the engine hash-joins over a common cast type (OTB-hash-join-cast,
-done in otterbrix #850); the ~1 s in the table was measured before that and wants
+`INT`), which the engine hash-joins over a common cast type (done in
+otterbrix #850); the ~1 s in the table was measured before that and wants
 a new run.
 
 ## External-table tests (s3/file)

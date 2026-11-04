@@ -582,7 +582,7 @@ namespace frontend::mysql {
             // and what the engine does with a written value: one out of its
             // column's range, text that is no number, a NULL for a NOT NULL
             // column are errors, never truncated or defaulted. No
-            // PIPES_AS_CONCAT: the engine has no `||` for strings (OTB-concat).
+            // PIPES_AS_CONCAT: the engine has no `||` for strings.
             if (name == "sql_mode") {
                 return std::string{"STRICT_TRANS_TABLES"};
             }

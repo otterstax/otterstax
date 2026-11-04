@@ -422,7 +422,7 @@ TEST_CASE("session close: a statement waiting for a backend connection leaves th
     CHECK(wait_until([&] { return actor.pinned() == 0; }, 5000ms));
 }
 
-// Hidden until OTB-notify (docs/proposals/otterbrix-embedding.md): a
+// Hidden until a settled future wakes the actor that awaits it: a
 // statement held on its backend for a second must leave the process idle. In
 // actor-zeta 2.0.0 a cooperative actor suspended on a co_await is requeued on
 // every pass of its pool (completion is flag-only), so today both the session

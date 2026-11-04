@@ -457,7 +457,7 @@ namespace otterstax::federation {
                 break;
         }
         // The answer is settled: the actor's loop, which awaits it, wakes (actor-zeta's futures wake
-        // nobody, AZ-waker).
+        // nobody).
         if (wake_ != nullptr) {
             wake_(owner_);
         }

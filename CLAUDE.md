@@ -233,29 +233,6 @@ python3 fixtures/generate_data.py && docker compose up   # full stack for manual
 ./benchmark/manual/start_service.sh [--rebuild] [--perf] [--perf-alloc]; ./benchmark/manual/stop_service.sh
 ```
 
-### TEMPORARY: local otterbrix recipe in Docker builds (until OTB-tag)
-
-`conanfile.py` pins `otterbrix/1.0.0b2-embedding.af99cccf#768a4129e770a4ee17925809ab74744b`, which
-exists only in the developer's local Conan cache. `scripts/conan/export_local_packages.sh`
-(`--force` to rewrite) archives its recipe + sources into `.conan-local/local_recipes.tgz`
-(git-ignored, rewritten only when the ref#revision changes); `Dockerfile` / `Dockerfile.test`
-`COPY .conan-local/`, restore the archive when present and build otterbrix from source
-(`--build="otterbrix/*"`), otherwise resolve it from the remotes. `actor-zeta/2.0.0#887bc992…` is on
-`conan.otterbrix.com` and is not part of this.
-
-- `docker-run-tests.sh` (without `IMAGE_TAG`), the three benchmark scripts and
-  `examples/demo/up.sh` run the script first; a package missing from the local cache is a warning
-  (it prints the `conan create` command and exits 0). A plain `docker build` / `docker compose up
-  --build` does not run it — run it by hand.
-- The TSAN branch always passes `--build="otterbrix/*" --build="actor-zeta/*"` (instrumentation,
-  not this workaround).
-- CI builds from a clean checkout without the archive, so it cannot resolve the pinned otterbrix
-  until OTB-tag. `.dockerignore` must not exclude `.conan-local/`.
-- Once OTB-tag lands: point `conanfile.py` at the tag; delete `scripts/conan/`, `.conan-local/`, its
-  `.gitignore` / `.dockerignore` blocks, the `COPY .conan-local/` + restore lines and `_local_build`
-  in both Dockerfiles, and the `export_local_packages.sh` calls. Keep `tools.build:jobs`, the job
-  auto-cap and the TSAN `--build` flags.
-
 ## Architecture Overview
 
 ```text
@@ -433,11 +410,8 @@ INSERT whose target, completed by the session's place, is `main.kafka.<obj>` pro
 | `cmake/` | — | `otterbrix_parser_extension.cmake` (flex + bison extensions), conan hooks |
 | `tests/` | the 12 binaries above | Catch2 suites + the python integration suite and PySpark client matrix. `tests/CLAUDE.md` |
 | `benchmark/`, `examples/` | — | benchmark harness (`benchmark/CLAUDE.md`), demo and quick start stacks |
-| `docs/proposals/` | — | what OtterStax asks of otterbrix (`otterbrix-embedding.md`, `OTB-…`) and actor-zeta (`actor-zeta.md`, `AZ-…`) |
 
 ## Known Constraints
-
-`OTB-…` / `AZ-…` are requests in `docs/proposals/otterbrix-embedding.md` / `actor-zeta.md`.
 
 **Transactions and writes on a backend**
 
@@ -448,7 +422,7 @@ INSERT whose target, completed by the session's place, is `main.kafka.<obj>` pro
   through otterbrix's ROLLBACK, which waits for one of otterbrix's executors (four, each running one
   statement at a time) — all of them may be running statements that wait for that agent. A COMMIT /
   ROLLBACK a client sends while every executor runs such a waiting statement still waits for an
-  executor until those statements' checkout timeout (OTB-executor-wait).
+  executor until those statements' checkout timeout (a waiting statement holds its otterbrix executor).
 - A block writes to one connection: a write to a second connection in the same block is
   `unimplemented_yet` and fails the block (otterbrix's one write place).
 - ClickHouse has no transactions: a write inside a block is refused (`unimplemented_yet`).
@@ -464,7 +438,7 @@ INSERT whose target, completed by the session's place, is `main.kafka.<obj>` pro
   RETURNING: PostgreSQL only.
 - otterbrix casts an UPDATE value to its column's type, and a literal is BIGINT / DOUBLE: `SET i = i + 1`
   (INTEGER), `SET f = 2.5` (FLOAT) narrow, range-checked. MySQL / ClickHouse have no such CAST, so the
-  backend's store does the check (OTB-assignment-cast): MySQL writes the value uncast, which only a
+  backend's store does the check (otterbrix does not mark the assignment's cast): MySQL writes the value uncast, which only a
   session under `STRICT_TRANS_TABLES` / `STRICT_ALL_TABLES` refuses out of range (ER 1264) — a session
   without a strict `sql_mode` refuses such an UPDATE (`unimplemented_yet`); on a non-transactional
   (MyISAM) table under `STRICT_TRANS_TABLES` alone MySQL clamps after the first row, and a computed
@@ -474,17 +448,17 @@ INSERT whose target, completed by the session's place, is `main.kafka.<obj>` pro
   (`f = f + 1` is `unimplemented_yet`). A fraction into an integer column stays `unimplemented_yet`
   on both (MySQL rounds a DECIMAL half away from zero, the engine to even).
 - An INSERT that omits a column sends NULL for it: the backend's DEFAULT / serial / AUTO_INCREMENT is
-  lost (NOT NULL → `not_null_violation`) — OTB-append-omitted. An INSERT … SELECT of one backend is
+  lost (NOT NULL → `not_null_violation`) — otterbrix leaves no column to the backend's DEFAULT. An INSERT … SELECT of one backend is
   not pushed down (its rows pass through the engine).
 - Remote DDL (`CREATE / DROP / ALTER TABLE c.d.s.t`) runs only in autocommit (otterbrix refuses it
-  inside a block, `unimplemented_yet`) — OTB-txn-storage. MySQL / ClickHouse DDL commits on the
+  inside a block, `unimplemented_yet`): otterbrix's storage contract has no DDL inside a transaction. MySQL / ClickHouse DDL commits on the
   backend at once (an engine failure afterwards is compensated by a DROP); a DROP TABLE / COLUMN is
   sent at COMMIT.
-- `CREATE / DROP INDEX` on a remote table is refused by otterbrix — OTB-storage-index.
+- `CREATE / DROP INDEX` on a remote table is refused by otterbrix (its storage contract has no index).
 - `CREATE EXTERNAL TABLE` into a four-part target is not atomic: CREATE and INSERT are two
-  autocommit statements — OTB-txn-storage.
+  autocommit statements.
 - A backend's COMMIT that succeeded while otterbrix's own commit marker failed leaves the outcome in
-  doubt (no two-phase commit) — OTB-txn-storage.
+  doubt (no two-phase commit).
 - The count of a MySQL UPDATE is the rows it matched (read off the OK packet's info: Boost.MySQL sets
   no `CLIENT_FOUND_ROWS`); ClickHouse answers `written_rows` for an INSERT and 0 for a mutation.
 
@@ -499,8 +473,7 @@ INSERT whose target, completed by the session's place, is `main.kafka.<obj>` pro
   of the connection's database (and, on PostgreSQL, of its configured schema or any schema when none
   is).
 - Registration by a miss looks the table up by the written name, which otterbrix keeps in lower
-  case: a backend table spelled with upper-case letters is found only by the startup discovery
-  (OTB-name-case).
+  case: a backend table spelled with upper-case letters is found only by the startup discovery.
 - A connection unreachable at startup keeps its actor and its catalog rows of the last discovery;
   a statement then fails at the connection. A failed connect marks the connection unreachable for
   10 s: until then every statement that needs a connect fails at once (`io_error` `connection
@@ -521,9 +494,9 @@ INSERT whose target, completed by the session's place, is `main.kafka.<obj>` pro
   doubled (`sql_gen`, `catalog::escape_sql_literal`), which reads the same under on and off.
 - An agent runs its statement (and a reconnect: connect bounded by 10 s) on a backends-pool thread;
   MySQL / PostgreSQL bound no statement, so a hung backend holds that thread until the shutdown
-  cancels the agents (OTB-cancel: no cancel of a running statement from the client).
+  cancels the agents (no cancel of a running statement from the client).
 - One `remote_backends_t` per `runtime_t`: its destructor stops the runtime's backends pool.
-- `storage_total_rows` answers a constant estimate (1000), no query — OTB-total-rows.
+- `storage_total_rows` answers a constant estimate (1000), no query (otterbrix asks for no table size).
 
 **Results and semantics**
 
@@ -536,12 +509,13 @@ INSERT whose target, completed by the session's place, is `main.kafka.<obj>` pro
 
 **Sessions and drivers**
 
-- SET / SHOW a driver sends that the engine does not have is refused until OTB-driver-settings /
-  OTB-show: MySQL Connector/J `SQL_SELECT_LIMIT`, Rails `sql_mode` / `wait_timeout` (`1149`), a
-  PostgreSQL `SHOW` of anything but the client parameters (`application_name`, `client_encoding`,
-  `extra_float_digits`) — `SHOW DateStyle`, `SHOW server_version`, … go to the engine, which has no SHOW.
-- `DISCARD ALL` is refused (outside a block by the engine; inside `25001`) — OTB-discard. pgbouncer:
-  `server_reset_query = 'RESET ALL; DEALLOCATE ALL'`.
+- SET / SHOW a driver sends that the engine does not have is refused (otterbrix has neither the
+  settings drivers send nor SHOW): MySQL Connector/J `SQL_SELECT_LIMIT`, Rails `sql_mode` /
+  `wait_timeout` (`1149`), a PostgreSQL `SHOW` of anything but the client parameters
+  (`application_name`, `client_encoding`, `extra_float_digits`) — `SHOW DateStyle`,
+  `SHOW server_version`, … go to the engine, which has no SHOW.
+- `DISCARD ALL` is refused (outside a block by the engine; inside `25001`): otterbrix has no
+  DISCARD. pgbouncer: `server_reset_query = 'RESET ALL; DEALLOCATE ALL'`.
 - No `NoticeResponse` (an `application_name` cut to 63 bytes, a `SET LOCAL` outside a block warn
   nothing).
 - A client-parameter `SET` (`application_name`, …) run through Execute without BEGIN, followed by an
@@ -557,7 +531,7 @@ INSERT whose target, completed by the session's place, is `main.kafka.<obj>` pro
 - A Spark session idle for `session_timeout_s` is closed (its block rolled back); its id is then
   refused `[INVALID_HANDLE.SESSION_CLOSED]`.
 - A COPY rolled back leaves its file / object written (files are not transactional).
-- Waiting is a poll (OTB-notify, AZ-waker / AZ-park): a settled actor-zeta future wakes nobody, so
+- Waiting is a poll: a settled actor-zeta future wakes nobody, so
   the query session (sessions pool) and the engine's executor spin while a statement waits — ~3 CPU-s
   per second of waiting (`[.engine-defect-otb-notify]`, `tests/session/test_session_lifetime.cpp`).
   The backend actor's loop is woken by its agents.
@@ -565,16 +539,14 @@ INSERT whose target, completed by the session's place, is `main.kafka.<obj>` pro
 
 ## Critical Dependency Versions (`conanfile.py`)
 
-- otterbrix `1.0.0b2-embedding.af99cccf#768a4129…` — a **local** package from otterbrix branch
-  `feat/otterstax-requests` (PR #850; `61aa43d6` + `39ca5e96`, the clone / `count(*)` fix, + `af99cccf`,
-  `count(NULL)`): `conan create .
-  --version 1.0.0b2-embedding.af99cccf -pr:h profiles/release -pr:b default -o "otterbrix/*:shared=True"`
-  exports the recipe (its binary is built against otterbrix's own dependency versions); the binary OtterStax
-  links comes from OtterStax's `conan install … --build="missing:otterbrix/*"`, against the abseil / re2 /
-  boost overrides of `conanfile.py`. One `libotterbrix.so`. Docker
-  builds it from the recipe archive until OTB-tag (above).
+- otterbrix `1.0.0b2-rc-4#0cdaa27b38b1da19885a7b44e01fa4e7` from `conan.otterbrix.com` — tag `1.0.0b2-rc-4`
+  on otterbrix `main` `01ec5268` (PR #850 merged; the tree of `feat/otterstax-requests` @ `af99cccf`). The remote
+  holds only a Linux x86_64 gcc 13 Release static binary; OtterStax links it shared (`otterbrix/*:shared=True`,
+  `conanfile.py`), so `conan install … --build missing` builds it from the remote recipe against the abseil / re2 /
+  boost overrides of `conanfile.py`. One `libotterbrix.so`. The TSAN image passes `--build="otterbrix/*"
+  --build="actor-zeta/*"`, the ASAN image `--build="otterbrix/*"` (instrumentation).
 - actor-zeta `2.0.0#887bc992cac0ead59e5bdf5c90c844f4` from `conan.otterbrix.com` (Linux x86_64 gcc 13
-  binary; other configurations `--build missing`). What OtterStax asks of it: `docs/proposals/actor-zeta.md`.
+  binary; other configurations `--build missing`).
 - Arrow 24.0.0 (shared; s3, parquet, csv, json; snappy / brotli / zlib / lz4 / zstd)
 - Boost 1.88.0, gRPC 1.69.0 + asio-grpc 3.7.0 (`backend=boost`), libpq 15.4, clickhouse-cpp 2.6.1,
   librdkafka 2.14.2, yaml-cpp 0.7.0, spdlog 1.15.1, fmt 11.1.3, Catch2 3.15.1, tracy 0.13.1 (optional)

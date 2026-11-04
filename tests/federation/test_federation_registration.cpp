@@ -229,7 +229,7 @@ TEST_CASE("registration: a restart keeps a table a local view holds and starts")
     CHECK(rows_of(stack.ok("SELECT id FROM pg.shop.public.t;")) == std::vector<std::string>{"1"});
 }
 
-// G1 (OTB-resolve-uid) is gone with the four-part model: a connection's table is a row of a database
+// G1 (a local database capturing a connection's names) is gone with the four-part model: a connection's table is a row of a database
 // of the connection (pg_database.datconnection), named c.d.s.t, and a local one is d.s.t / s.t / t.
 // A local database named as a connection's database — or as the connection itself — answers its own
 // rows, and the connection's table keeps answering the backend's: neither captures the other.

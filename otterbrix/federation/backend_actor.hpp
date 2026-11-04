@@ -60,7 +60,7 @@ namespace sql_gen {
 // free agent (the agent of its transaction, when it has one), is sent to it and the agent is
 // scheduled on the pool; with no agent free the statement waits in the actor's queue (no thread is
 // held) until one is released, up to the checkout timeout. The agent settles the answer and wakes the
-// loop (actor-zeta has no waker on a future: AZ-waker). With nothing to do the loop sleeps.
+// loop (actor-zeta has no waker on a future). With nothing to do the loop sleeps.
 //
 // Names. otterbrix keeps every remote table in lower case (c.d.s.t, its columns); the backend's
 // spelling of each is the actor's, keyed by the table's oid and the columns' attoids, kept in the

@@ -121,7 +121,7 @@ Notable dialect points:
   operand (`CAST(a AS BIGINT) = 5` → `a = 5`): that is the validator's cast between two widths, and
   every dialect compares them exactly;
 - an UPDATE assignment's narrowing cast (`write_assignment_cast`): otterbrix wraps a SET value not of its
-  column's type in a `cast_kind::cast` to that type (OTB-assignment-cast: unmarked, so the topmost cast
+  column's type in a `cast_kind::cast` to that type (unmarked, so the topmost cast
   of a SET value to the column's own type is taken as it — a user's CAST there is the same cast for a
   number). Where `numeric_cast_target` has no spelling, the store into the column range-checks:
   MySQL — an integer into a narrower integer, a DOUBLE into FLOAT — gets the value uncast and

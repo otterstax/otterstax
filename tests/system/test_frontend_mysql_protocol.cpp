@@ -584,7 +584,7 @@ TEST_CASE("mysql protocol over the wire: a prepared ? reaches the session as $n"
 }
 
 // The engine types a select-list parameter by its bound value: the value once
-// per row (it used to throw inside the engine's executor, OTB-select-param).
+// per row (it used to throw inside the engine's executor).
 TEST_CASE("mysql protocol over the wire: a prepared SELECT ? FROM t answers the bound value per row") {
     fixture f("otterstax_mysql_protocol_bare_param_value");
     const auto stmt = prepare_ok(f.client, "SELECT ? FROM wp.t");

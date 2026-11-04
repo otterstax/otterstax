@@ -163,7 +163,7 @@ namespace frontend::mysql {
         std::string user;
         std::string host;
         // What the last SET / USE the engine accepted on this connection set
-        // (the engine has no SHOW to read them back, OTB-show): @@autocommit,
+        // (the engine has no SHOW to read them back): @@autocommit,
         // @@time_zone (as written, 'SYSTEM' for the engine's default) and
         // DATABASE() (none before a USE).
         bool autocommit = true;

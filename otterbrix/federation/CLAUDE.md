@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Role
 
 `otterbrix/federation/` (library `otterstax_federation`) is the core of the federation on otterbrix
-61aa43d6 (`docs/embedding-host-api.md` in the otterbrix repo). A remote table is an ordinary row of
+`1.0.0b2-rc-4` (`01ec5268`; `docs/embedding-host-api.md` in the otterbrix repo). A remote table is an ordinary row of
 otterbrix's catalog in a database of a connection (`pg_database.datconnection`), named
 `connection.database.schema.table` (`c.d.s.t`, every part lower case); otterbrix resolves every
 name, plans every statement and reaches the table's rows only through the eighteen messages of its
@@ -30,7 +30,7 @@ config.yaml, `backend_actor_t`, which turns each message into SQL of the connect
 
 - **Loop.** `enqueue_impl` pushes the message into the inbox and wakes the loop; the loop starts each
   message's behavior and resumes the coroutines whose awaited future is ready. An agent's answer
-  settles on a backends-pool thread, and an actor-zeta future wakes nobody (AZ-waker), so the agent
+  settles on a backends-pool thread, and an actor-zeta future wakes nobody, so the agent
   wakes the loop itself after it settled (`backend_agent_t::set_owner`); idle, the loop sleeps (a
   1 s bound while something is in flight). Every handler's Tracy zone closes before its first
   `co_await` (the coroutines interleave on the loop thread).
@@ -74,7 +74,7 @@ config.yaml, `backend_actor_t`, which turns each message into SQL of the connect
 - **Reads.** `storage_fetch_next_batch` (a table offered nothing was taken of): `SELECT <projected
   columns> FROM <table> [LIMIT n]` (`sql_gen::generate_table_read`), the answer conformed, pages of at
   most 1024 rows of the cursor (cursor id never 0, an empty page ends it), `storage_close_cursor`
-  forgets it. `storage_total_rows` answers an estimate without a query (1000; OTB-total-rows).
+  forgets it. `storage_total_rows` answers an estimate without a query (1000).
 - **Offer.** An UPDATE / DELETE block is one statement or the offer is refused (`unimplemented_yet`:
   OtterStax numbers no remote row, `storage_update` / `storage_delete_rows` refuse); RETURNING only on
   PostgreSQL (every column of the table, `generation_options_t::returning`); ClickHouse inside a block
@@ -102,7 +102,7 @@ config.yaml, `backend_actor_t`, which turns each message into SQL of the connect
   checkout timeout.
 - **A closed connection** (`end_session(session)`, sent by `query_session_t::close` to every actor,
   not awaited). otterbrix's own ROLLBACK of a closed session is a statement for one of its executors,
-  each of which runs one statement at a time (OTB-executor-wait), and every executor may be running a
+  each of which runs one statement at a time, and every executor may be running a
   statement of another block waiting in this actor's queue for the agent the closed block holds: the
   ROLLBACK would wait for them until their checkout timeout. So the actor ends the session itself: its
   statements waiting for an agent are answered `connection_closed` at once and leave the queue; its
@@ -142,7 +142,7 @@ config.yaml, `backend_actor_t`, which turns each message into SQL of the connect
   registration). On a client's session: PostgreSQL in the backend transaction (COMMIT at prepare);
   MySQL / ClickHouse at once with a compensating DROP at abort; a DROP TABLE / DROP COLUMN waits for the
   prepare. Every reply is `ddl_reply_t{false, remote_names rows}`. CREATE / DROP INDEX of a remote
-  table never reaches the actor: otterbrix refuses it (`unimplemented_yet`, OTB-storage-index).
+  table never reaches the actor: otterbrix refuses it (`unimplemented_yet`).
 
 ## Contracts
 

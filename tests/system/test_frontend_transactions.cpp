@@ -46,14 +46,14 @@ namespace {
     constexpr uint8_t EOF_HEADER = 0xFE;
 
     template<typename Server>
-    frontend::frontend_server_config make_config(const otterstax::test::session_stack& stack) {
+    frontend::frontend_server_config make_config(const otterstax::test::session_stack& stack, size_t threads = 4) {
         return frontend::frontend_server_config{
             .resource = stack.resource,
             .port = 0,
             .sessions = stack.sessions,
             .read_timeout = std::chrono::seconds(frontend::CONNECTION_TIMEOUT_SEC),
             .accept_retry_delay = std::chrono::milliseconds(frontend::ACCEPT_RETRY_DELAY_MS),
-            .pool_size = 4,
+            .pool_size = threads,
         };
     }
 
@@ -1103,6 +1103,71 @@ TEST_CASE("wire disconnect: a client that drops its socket mid-statement leaves 
         mysql_ok(next, "CREATE DATABASE after_drop");
         next.close();
         CHECK(wait_for_live(sessions, baseline, 10000ms));
+        server.stop();
+    }
+}
+
+// A statement waiting for its connection's backend agent holds no thread of
+// the wire server: the client whose block holds the agent is still read, its
+// quit closes the session (backend_actor_t::end_session frees the agent) and
+// the waiting statement is answered at once. One io thread and one agent: a
+// waiting statement that blocked the thread would leave the quit unread until
+// the checkout timeout (60 s) failed it — 16 clients of mysql-connector-python
+// (autocommit off: every SELECT opens a block) over 4 io threads and
+// pool_size 4 deadlocked so.
+TEST_CASE("wire waiting: a statement waiting for a backend agent holds no thread of the server") {
+    otterstax::test::stack_options_t options;
+    options.connections.mysql = otterstax::test::mock_mysql({"m"});
+    options.connections.mysql.front().pool_size = 1;
+    otterstax::test::session_stack_owner owner(otterstax::test::unique_test_dir("otterstax_wire_agent_wait"), options);
+    SECTION("mysql") {
+        const std::string remote_select = "SELECT id FROM m.db.public.`table`"; // MySQL quotes a name with backticks
+        frontend::mysql::mysql_server server(make_config<frontend::mysql::mysql_server>(owner.stack(), 1));
+        server.start();
+        raw_client holder(server.local_port());
+        raw_client waiter(server.local_port());
+        mysql_handshake(holder);
+        mysql_handshake(waiter);
+        mysql_ok(holder, "SET autocommit = 0");
+        // The block's first statement takes the only agent and keeps it.
+        CHECK((mysql_resultset_flags(holder, remote_select) & SERVER_STATUS_IN_TRANS) != 0);
+
+        waiter.write(mysql_query_packet(remote_select));
+        std::this_thread::sleep_for(300ms); // the waiter's statement is in the agent queue
+        holder.write(mysql_frame(0, {0x01})); // COM_QUIT
+        holder.close();
+
+        const auto first = mysql_read_packet(waiter);
+        INFO((first.size() > 9 && first[0] == ERR_HEADER ? mysql_err_text(first) : std::string{}));
+        REQUIRE(first[0] == 1); // one column: the rows came
+        server.stop();
+    }
+    SECTION("postgres") {
+        const std::string remote_select = "SELECT id FROM m.db.public.\"table\"";
+        frontend::postgres::postgres_server server(make_config<frontend::postgres::postgres_server>(owner.stack(), 1));
+        server.start();
+        raw_client holder(server.local_port());
+        raw_client waiter(server.local_port());
+        pg_startup(holder);
+        pg_startup(waiter);
+        pg_ok(holder, "BEGIN", "BEGIN", 'T');
+        const auto held = pg_query(holder, remote_select);
+        INFO(held.sqlstate() << " " << held.error_text());
+        REQUIRE(held.first('E') == nullptr);
+        CHECK(held.status == 'T');
+
+        waiter.write(pg_frame('Q', cstr(remote_select)));
+        std::this_thread::sleep_for(300ms);
+        holder.write(pg_frame('X', {})); // Terminate
+        holder.close();
+
+        pg_answer answer;
+        for (int guard = 0; guard < 16 && (answer.messages.empty() || answer.messages.back().type != 'Z'); ++guard) {
+            answer.messages.push_back(pg_read_message(waiter));
+        }
+        INFO(answer.sqlstate() << " " << answer.error_text());
+        REQUIRE(answer.first('E') == nullptr);
+        CHECK(answer.first('D') != nullptr);
         server.stop();
     }
 }

@@ -199,7 +199,7 @@ namespace frontend::postgres {
                         } else if (code == message_code::SSL_REQUEST_CODE) {
                             handle_ssl_decline(reader);
                         } else if (code == message_code::PROTOCOL_VERSION_3_0) {
-                            handle_startup_message(code, reader);
+                            run_handler(handle_startup_message(code, std::move(reader)));
                         } else {
                             send_error_response(sql_state::PROTOCOL_VIOLATION,
                                                 "Unsupported protocol version: " + std::to_string(code),
@@ -209,19 +209,24 @@ namespace frontend::postgres {
             }));
     }
 
-    void postgres_connection::handle_packet(std::vector<uint8_t> header, std::vector<uint8_t> payload) {
-        OTX_ZONE_N("pg::handle_packet");
+    boost::asio::awaitable<void> postgres_connection::handle_packet(std::vector<uint8_t> header,
+                                                                    std::vector<uint8_t> payload) {
         assert(header.size() == 5);
         auto message_type = static_cast<char>(header[0]);
-        // A failed pipeline discards every message up to its Sync, which sends
-        // the single ReadyForQuery; Terminate still ends the connection.
-        if (pipeline_.has_error() && message_type != message_type::frontend::SYNC &&
-            message_type != message_type::frontend::TERMINATE) {
-            log_->debug("[Connection {}] '{}' message discarded: the pipeline failed, waiting for Sync",
-                        connection_id_,
-                        message_type);
-            read_packet();
-            return;
+        {
+            // A zone never spans a co_await (the coroutine resumes on any
+            // thread of the pool): the handlers below carry their own.
+            OTX_ZONE_N("pg::handle_packet");
+            // A failed pipeline discards every message up to its Sync, which sends
+            // the single ReadyForQuery; Terminate still ends the connection.
+            if (pipeline_.has_error() && message_type != message_type::frontend::SYNC &&
+                message_type != message_type::frontend::TERMINATE) {
+                log_->debug("[Connection {}] '{}' message discarded: the pipeline failed, waiting for Sync",
+                            connection_id_,
+                            message_type);
+                read_packet();
+                co_return;
+            }
         }
         // `payload` is the whole body the length prefix declared
         // (read_packet_payload reads exactly that many bytes), so a body
@@ -245,12 +250,12 @@ namespace frontend::postgres {
                 // The query text without its terminator.
                 if (!reader.ok()) {
                     send_error_response(sql_state::PROTOCOL_VIOLATION, "Truncated QUERY message: unterminated query");
-                    return;
+                    co_return;
                 }
                 // Nothing may follow the terminator.
                 if (reader.remaining() != 0) {
                     send_error_response(sql_state::PROTOCOL_VIOLATION, INVALID_MESSAGE_FORMAT);
-                    return;
+                    co_return;
                 }
 
                 if (query.empty()) {
@@ -262,7 +267,7 @@ namespace frontend::postgres {
                 }
 
                 log_->info("[Connection {}] QUERY message: '{}'", connection_id_, query);
-                handle_query(std::move(query));
+                co_await handle_query(std::move(query));
                 break;
             }
             case message_type::frontend::PARSE: {
@@ -272,34 +277,34 @@ namespace frontend::postgres {
 
                 if (!reader.remaining()) {
                     send_error_response(sql_state::PROTOCOL_VIOLATION, "Truncated PARSE message statement name");
-                    return;
+                    co_return;
                 }
 
                 auto stmt = reader.read_string_null();
                 if (!reader.remaining()) {
                     send_error_response(sql_state::PROTOCOL_VIOLATION, "Truncated PARSE message query");
-                    return;
+                    co_return;
                 }
 
                 auto query = reader.read_string_null();
                 if (reader.remaining() < 2) {
                     send_error_response(sql_state::PROTOCOL_VIOLATION, "Truncated PARSE message parameters");
-                    return;
+                    co_return;
                 }
 
                 auto num_params = reader.read_int16();
                 if (reader.remaining() < 4 * num_params) {
                     send_error_response(sql_state::PROTOCOL_VIOLATION, "Truncated PARSE message parameter types");
-                    return;
+                    co_return;
                 }
 
                 // A string above without its terminator.
                 if (!reader.ok()) {
                     send_error_response(sql_state::PROTOCOL_VIOLATION, "Truncated PARSE message");
-                    return;
+                    co_return;
                 }
 
-                handle_parse(std::move(stmt), std::move(query), num_params, std::move(reader));
+                co_await handle_parse(std::move(stmt), std::move(query), num_params, std::move(reader));
                 break;
             }
             case message_type::frontend::BIND: {
@@ -309,28 +314,28 @@ namespace frontend::postgres {
 
                 if (!reader.remaining()) {
                     send_error_response(sql_state::PROTOCOL_VIOLATION, "Truncated BIND portal name");
-                    return;
+                    co_return;
                 }
 
                 auto portal_name = reader.read_string_null();
                 if (!reader.remaining()) {
                     send_error_response(sql_state::PROTOCOL_VIOLATION,
                                         "Truncated BIND message prepared statement name");
-                    return;
+                    co_return;
                 }
 
                 auto stmt = reader.read_string_null();
                 if (reader.remaining() < 2) {
                     send_error_response(sql_state::PROTOCOL_VIOLATION,
                                         "Truncated BIND message parameter format codes");
-                    return;
+                    co_return;
                 }
 
                 auto format_len = reader.read_int16();
                 if (reader.remaining() < 2 * format_len) {
                     send_error_response(sql_state::PROTOCOL_VIOLATION,
                                         "Truncated BIND message parameter format codes");
-                    return;
+                    co_return;
                 }
 
                 std::vector<result_encoding> format;
@@ -341,17 +346,21 @@ namespace frontend::postgres {
 
                 if (reader.remaining() < 2) {
                     send_error_response(sql_state::PROTOCOL_VIOLATION, "Truncated BIND message parameter values");
-                    return;
+                    co_return;
                 }
 
                 auto num_params = reader.read_int16();
                 // A string above without its terminator.
                 if (!reader.ok()) {
                     send_error_response(sql_state::PROTOCOL_VIOLATION, "Truncated BIND message");
-                    return;
+                    co_return;
                 }
 
-                handle_bind(std::move(stmt), std::move(portal_name), std::move(format), num_params, std::move(reader));
+                co_await handle_bind(std::move(stmt),
+                                     std::move(portal_name),
+                                     std::move(format),
+                                     num_params,
+                                     std::move(reader));
                 break;
             }
             case message_type::frontend::EXECUTE: {
@@ -361,28 +370,28 @@ namespace frontend::postgres {
 
                 if (!reader.remaining()) {
                     send_error_response(sql_state::PROTOCOL_VIOLATION, "Truncated EXECUTE message statement name");
-                    return;
+                    co_return;
                 }
 
                 auto portal = reader.read_string_null();
                 if (reader.remaining() < 4) {
                     send_error_response(sql_state::PROTOCOL_VIOLATION, "Truncated EXECUTE message row limit");
-                    return;
+                    co_return;
                 }
 
                 auto limit = reader.read_int32();
                 // The portal name without its terminator.
                 if (!reader.ok()) {
                     send_error_response(sql_state::PROTOCOL_VIOLATION, "Truncated EXECUTE message");
-                    return;
+                    co_return;
                 }
                 // Nothing may follow the row limit.
                 if (reader.remaining() != 0) {
                     send_error_response(sql_state::PROTOCOL_VIOLATION, INVALID_MESSAGE_FORMAT);
-                    return;
+                    co_return;
                 }
 
-                handle_execute(std::move(portal), limit);
+                co_await handle_execute(std::move(portal), limit);
                 break;
             }
             case message_type::frontend::CLOSE: // fall-through
@@ -395,7 +404,7 @@ namespace frontend::postgres {
                 std::string str = is_close ? "CLOSE" : "DESCRIBE";
                 if (!reader.remaining()) {
                     send_error_response(sql_state::PROTOCOL_VIOLATION, "Truncated " + str + " message type");
-                    return;
+                    co_return;
                 }
 
                 char type = reader.read_uint8();
@@ -404,12 +413,12 @@ namespace frontend::postgres {
                     send_error_response(sql_state::PROTOCOL_VIOLATION,
                                         std::string("Unknown ") + str +
                                             " statement/portal type: " + std::to_string(type));
-                    return;
+                    co_return;
                 }
 
                 if (!reader.remaining()) {
                     send_error_response(sql_state::PROTOCOL_VIOLATION, "Truncated " + str + " message name");
-                    return;
+                    co_return;
                 }
 
                 auto arg = static_cast<describe_close_arg>(type);
@@ -417,15 +426,19 @@ namespace frontend::postgres {
                 // The name without its terminator.
                 if (!reader.ok()) {
                     send_error_response(sql_state::PROTOCOL_VIOLATION, "Truncated " + str + " message");
-                    return;
+                    co_return;
                 }
                 // Nothing may follow the name.
                 if (reader.remaining() != 0) {
                     send_error_response(sql_state::PROTOCOL_VIOLATION, INVALID_MESSAGE_FORMAT);
-                    return;
+                    co_return;
                 }
 
-                is_close ? handle_close(arg, std::move(name)) : handle_describe(arg, std::move(name));
+                if (is_close) {
+                    co_await handle_close(arg, std::move(name));
+                } else {
+                    co_await handle_describe(arg, std::move(name));
+                }
                 break;
             }
             case message_type::frontend::SYNC: {
@@ -437,14 +450,14 @@ namespace frontend::postgres {
                 // its ReadyForQuery at once.
                 if (!payload.empty()) {
                     send_error_response(sql_state::PROTOCOL_VIOLATION, INVALID_MESSAGE_FORMAT);
-                    return;
+                    co_return;
                 }
                 // Outside a block the Sync ends the implicit transaction, and
                 // with it every portal (PostgreSQL drops them at the
                 // transaction's end): a window one of them left open is closed
                 // (it holds the statement's snapshot until it ends).
                 if (session_->transaction_status() == components::session::transaction_status_t::idle) {
-                    release_portals(true);
+                    co_await release_portals(true);
                 }
                 std::vector<std::vector<uint8_t>> response;
                 append_ready_for_query(response);
@@ -457,7 +470,7 @@ namespace frontend::postgres {
                 // Flush has no fields.
                 if (!payload.empty()) {
                     send_error_response(sql_state::PROTOCOL_VIOLATION, INVALID_MESSAGE_FORMAT);
-                    return;
+                    co_return;
                 }
                 read_packet(); // every answer is already written: nothing to flush
                 break;

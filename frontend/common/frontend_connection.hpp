@@ -105,10 +105,22 @@ namespace frontend {
         // connection has answered the client; the body is not read then.
         virtual bool validate_payload_size(const std::vector<uint8_t>& header, uint32_t& size) = 0;
 
-        virtual void handle_packet(std::vector<uint8_t> header, std::vector<uint8_t> payload) = 0;
+        // One client message, run as a coroutine on the connection's strand
+        // (run_handler): a statement it awaits on the query session suspends
+        // it and leaves the thread to the server's other connections.
+        virtual boost::asio::awaitable<void> handle_packet(std::vector<uint8_t> header, std::vector<uint8_t> payload) = 0;
         virtual void handle_network_read_error(std::string description) = 0;
         virtual void handle_out_of_resources_error(std::string description) = 0;
 
+        // Runs `handler` on the connection's strand as a pending operation. A
+        // statement it awaits holds no thread of the pool: a MySQL / PostgreSQL
+        // connection waiting for its statement — for a backend agent another
+        // connection's block holds, say — never keeps the pool from reading
+        // the client whose COMMIT / ROLLBACK / quit frees that agent. The next
+        // message is read only after the handler ended (a read_packet() it
+        // started is deferred to then), so a connection handles one message
+        // at a time; an exception out of it ends the connection.
+        void run_handler(boost::asio::awaitable<void> handler);
         void read_packet(); // method for getting into message-read loop
         void send_packet(std::vector<uint8_t> packet, bool continue_reading = true);
         void send_packet_merged(std::vector<std::vector<uint8_t>> packets);
@@ -150,6 +162,10 @@ namespace frontend {
         std::atomic<bool> finish_requested_{false};
         // Strand-only.
         bool closed_{false};
+        // Strand-only: a handler of run_handler is running, and a read it
+        // asked for waits for its end.
+        bool handling_{false};
+        bool read_deferred_{false};
         // Incremented by safe_callback (any thread that starts an operation),
         // decremented on the strand by the wrapper.
         std::atomic<size_t> pending_ops_{0};

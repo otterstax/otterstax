@@ -113,8 +113,9 @@ silently in force. Error messages live on the `std::pmr::memory_resource*` passe
   `backends_threads` logs a warning. The other four (default 0) are plain thread
   pools that are not `runtime_t`'s:
   `mysql_io` / `postgres_io` (the asio pool of each wire server; a connection
-  holds one of its threads while its statement runs, so the pool bounds the
-  statements in flight over that wire), `flight_sql_io` (the Flight SQL
+  waiting for its statement holds none of its threads — its message handler is a
+  coroutine on the connection's strand —, so the pool bounds no statements in
+  flight), `flight_sql_io` (the Flight SQL
   `GrpcContext` threads; its adapter blocks the calling thread for the length of a
   query), `spark_connect_io` (one `GrpcContext` per thread; the handlers are
   coroutines) — each 0 = `max(2, hardware threads)`, resolved by

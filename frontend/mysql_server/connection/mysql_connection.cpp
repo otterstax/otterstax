@@ -97,7 +97,8 @@ namespace frontend::mysql {
             }));
     }
 
-    void mysql_connection::handle_packet(std::vector<uint8_t> header, std::vector<uint8_t> payload) {
+    boost::asio::awaitable<void> mysql_connection::handle_packet(std::vector<uint8_t> header,
+                                                                 std::vector<uint8_t> payload) {
         assert(header.size() == 4);
         uint8_t seq_id = header[3];
 
@@ -115,27 +116,27 @@ namespace frontend::mysql {
                 // The server writes the handshake and moves to AUTH before it
                 // reads anything, so no packet can be handled in this state.
                 send_error(mysql_error::ER_SEQUENCE_ERROR, "Packet received before the server handshake");
-                return;
+                co_return;
         }
 
         if (!sequence_valid) {
             std::string state_str = state_ == connection_state::AUTH ? "AUTH" : "COMMAND";
             send_error(mysql_error::ER_SEQUENCE_ERROR,
                        "Packet sequence error in " + std::move(state_str) + " got: " + std::to_string(seq_id));
-            return;
+            co_return;
         }
 
         if (payload.size() > client_max_packet_size_) {
             send_error(mysql_error::ER_PACKET_TOO_LARGE, "Packet exceeds max_allowed_packet");
-            return;
+            co_return;
         }
 
         switch (state_) {
             case connection_state::AUTH:
-                handle_auth(std::move(payload));
+                co_await handle_auth(std::move(payload));
                 break;
             case connection_state::COMMAND:
-                handle_command(std::move(payload));
+                co_await handle_command(std::move(payload));
                 break;
             case connection_state::HANDSHAKE:
                 break; // refused by the first switch above

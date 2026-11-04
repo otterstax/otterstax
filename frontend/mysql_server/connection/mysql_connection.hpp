@@ -67,7 +67,7 @@ namespace frontend::mysql {
         uint32_t get_packet_size(const std::vector<uint8_t>& header) const override;
         bool validate_payload_size(const std::vector<uint8_t>& header, uint32_t& size) override;
 
-        void handle_packet(std::vector<uint8_t> header, std::vector<uint8_t> payload) override;
+        boost::asio::awaitable<void> handle_packet(std::vector<uint8_t> header, std::vector<uint8_t> payload) override;
         void handle_network_read_error(std::string description) override;
         void handle_out_of_resources_error(std::string description) override;
 
@@ -81,12 +81,17 @@ namespace frontend::mysql {
 
         void send_handshake();
 
-        void handle_auth(std::vector<uint8_t> payload);
-        void handle_command(std::vector<uint8_t> payload);
+        // Every handler that awaits the session is a coroutine on the
+        // connection's strand (frontend_connection::run_handler): waiting for
+        // a statement holds no thread of the server's pool.
+        using session_future = actor_zeta::unique_future<otterstax::session::query_session_t::session_result>;
+
+        boost::asio::awaitable<void> handle_auth(std::vector<uint8_t> payload);
+        boost::asio::awaitable<void> handle_command(std::vector<uint8_t> payload);
         // COM_QUERY: the text is read by MySQL's lexical rules and written in
         // the engine's form (protocol/lexer.hpp, to_engine_text) before the
         // session sees it; a `?` in it is ER_PARSE_ERROR, as MySQL answers it.
-        void handle_query(std::string query);
+        boost::asio::awaitable<void> handle_query(std::string query);
         // A text to_engine_text refused: the ERR packet, with an open block
         // failed behind it as an engine parse error fails it.
         void refuse_text(text_refusal_t refusal);
@@ -98,26 +103,24 @@ namespace frontend::mysql {
         // open block behind an answer the client never asked to fail); a SET and
         // a USE go to the engine as its SET and the engine answers them
         // (answer_setting, answer_use). True when the answer went out.
-        bool serve_protocol_statement(std::string_view query);
+        boost::asio::awaitable<bool> serve_protocol_statement(std::string_view query);
         // Every assignment of `set` in ONE engine statement
         // (engine_setting_plan), as MySQL applies a SET: all or none. A
         // refusal — the frontend's, the engine's parser's or the engine's — is
         // the ERR packet with nothing applied, else an OK packet; only then is
         // what the engine accepted remembered (autocommit_, time_zone_).
-        void answer_setting(const set_variables_t& set);
+        boost::asio::awaitable<void> answer_setting(const set_variables_t& set);
         // SET search_path = '<database>.public' on the engine: an OK packet and
         // database_ remembered, or the ERR packet — ER_BAD_DB_ERROR for a
         // database or schema that does not exist, any other refusal as
         // send_statement_error answers a statement. False when the engine
         // refused (the ERR packet went out).
-        bool answer_use(const std::string& database, bool answer_ok);
+        boost::asio::awaitable<bool> answer_use(const std::string& database, bool answer_ok);
         // Awaits a statement of the frontend's own (a SET, a USE) on the
         // session; false after the ERR packet went out: the bridge's own
         // failures (answer_await_failure), ER_BAD_DB_ERROR for a missing
         // database / schema when `names_database`, else send_statement_error.
-        bool await_own_statement(
-            actor_zeta::unique_future<otterstax::session::query_session_t::session_result> future,
-            bool names_database);
+        boost::asio::awaitable<bool> await_own_statement(session_future future, bool names_database);
         // What the protocol statements' answers are derived from.
         protocol_context_t protocol_context() const;
         // A session error as an ERR packet (COM_QUERY, COM_STMT_PREPARE,
@@ -147,7 +150,7 @@ namespace frontend::mysql {
         // session ever sees it — the engine's grammar reads a bare `?` as an
         // operator. A protocol statement is prepared by the frontend itself
         // (prepare_protocol_statement).
-        void handle_prepared_stmt(std::string_view query);
+        boost::asio::awaitable<void> handle_prepared_stmt(std::string query);
         // COM_STMT_PREPARE of a protocol statement: STMT_PREPARE_OK with its
         // columns (computed now, as MySQL resolves a system variable at prepare:
         // an unknown one is refused here, failing no block) and
@@ -157,7 +160,7 @@ namespace frontend::mysql {
         // COM_STMT_EXECUTE of a prepared protocol statement: its answer as a
         // binary resultset or an OK / ERR packet (a SET / USE: the engine's); the
         // parameters are not read.
-        void execute_protocol_statement(const protocol_statement_t& statement);
+        boost::asio::awaitable<void> execute_protocol_statement(const protocol_statement_t& statement);
 
         // The COM_STMT_EXECUTE values, `$<i+1>` at i, each a one-row vector.
         std::pmr::vector<components::vector::vector_t>
@@ -166,9 +169,10 @@ namespace frontend::mysql {
                               std::pmr::vector<uint16_t>& param_types,
                               packet_reader&& reader);
         // Drops an unexecuted statement in the session; a failure is logged only.
-        void close_stmt_in_session(otterstax::session::statement_id_t stmt_session, const char* reason);
-        void handle_execute_stmt(prepared_stmt_meta& stmt,
-                                 std::pmr::vector<components::vector::vector_t> param_values);
+        boost::asio::awaitable<void> close_stmt_in_session(otterstax::session::statement_id_t stmt_session,
+                                                           const char* reason);
+        boost::asio::awaitable<void> handle_execute_stmt(prepared_stmt_meta& stmt,
+                                                         std::pmr::vector<components::vector::vector_t> param_values);
 
         void send_resultset(mysql_resultset&& result);
         void send_error(mysql_error error_code, std::string message);

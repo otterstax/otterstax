@@ -107,14 +107,16 @@ namespace mysql {
 
     core::error_t Connector::connectWithTimeout(bm::diagnostics& diag) {
         OTX_ZONE_N("mysql::Connector::connectWithTimeout");
-        auto outcome =
-            otterstax::spawn_marshaled<otterstax::asio_error_t>(conn_.get_executor(), asyncConnect_(diag), resource_);
+        // strand_, never conn_.get_executor(): that executor is the stream's, and the connect replaces
+        // the stream (variant_stream's connect assigns a fresh socket) on whichever thread runs the
+        // spawned coroutine — on an io_context more than one thread runs, another thread, while this
+        // one would still be reading it. strand_ is never written after the constructor.
+        auto& io = strand_.get_inner_executor().context();
+        auto outcome = otterstax::spawn_marshaled<otterstax::asio_error_t>(strand_, asyncConnect_(diag), resource_);
         // The calling thread runs the connection's io_context until the connect completed: the
         // backend agent that owns the connector (and its io_context) runs it on its own thread for
         // every statement, and nobody else does. An io_context other threads run as well (a test's
         // pool) is driven by them too; run_one_for only bounds this thread's wait for its next handler.
-        // The constructor built conn_ over a strand of an io_context.
-        auto& io = static_cast<asio::io_context&>(asio::query(conn_.get_executor(), asio::execution::context));
         while (outcome.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
             if (io.stopped()) {
                 io.restart();

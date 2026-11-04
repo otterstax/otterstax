@@ -148,7 +148,7 @@ namespace frontend::postgres {
         // its body is read.
         bool validate_payload_size(const std::vector<uint8_t>& header, uint32_t& size) override;
 
-        void handle_packet(std::vector<uint8_t> header, std::vector<uint8_t> payload) override;
+        boost::asio::awaitable<void> handle_packet(std::vector<uint8_t> header, std::vector<uint8_t> payload) override;
         void handle_network_read_error(std::string description) override;
         void handle_out_of_resources_error(std::string description) override;
 
@@ -159,6 +159,11 @@ namespace frontend::postgres {
             AUTH,
             COMMAND
         };
+
+        // Every handler that awaits the session is a coroutine on the
+        // connection's strand (frontend_connection::run_handler): waiting for
+        // a statement holds no thread of the server's pool.
+        using session_future = actor_zeta::unique_future<otterstax::session::query_session_t::session_result>;
 
         void read_initial_message();
         // `reader` stands after the protocol version the caller dispatched on.
@@ -172,11 +177,12 @@ namespace frontend::postgres {
         // other parameter SET in the engine, in that order (PostgreSQL's), a
         // refusal FATAL with the engine's text. `user` names nobody to
         // authenticate; `_pq_.*` are protocol extensions.
-        void handle_startup_message(int32_t protocol_version, packet_reader& reader);
+        boost::asio::awaitable<void> handle_startup_message(int32_t protocol_version, packet_reader reader);
         // The startup's engine settings in order; false after the FATAL error.
         // Each one the engine applied is followed (follow_parameters).
-        [[nodiscard]] bool apply_startup_settings(const std::optional<std::string>& database,
-                                                  const std::vector<std::pair<std::string, std::string>>& settings);
+        [[nodiscard]] boost::asio::awaitable<bool>
+        apply_startup_settings(const std::optional<std::string>& database,
+                               const std::vector<std::pair<std::string, std::string>>& settings);
         // The reported engine settings as a fresh session has them, the
         // default every session shares: the engine's built-in values with the
         // stored pg_catalog.pg_settings rows over them (the last row of a
@@ -186,7 +192,7 @@ namespace frontend::postgres {
         // still they are read per connection: the frontend has no per-server
         // slot (frontend_server constructs the connections) and the read is
         // one catalog scan on the connection's own engine session.
-        void read_default_settings();
+        boost::asio::awaitable<void> read_default_settings();
         // A SET of a protocol parameter (Query, or an Execute of one Parse
         // kept): a failed block refuses it (25P02), a value OtterStax does not
         // give is 22023, a SET of a client parameter changes the connection's
@@ -221,22 +227,23 @@ namespace frontend::postgres {
         std::vector<std::vector<uint8_t>>
         answer_show(client_parameter_t parameter, const std::vector<result_encoding>& format, bool row_shape_known);
         void handle_ssl_decline(packet_reader& reader);
-        void handle_query(std::string query);
+        boost::asio::awaitable<void> handle_query(std::string query);
         // DEALLOCATE [PREPARE] <name> | ALL on the simple-query route: run_deallocate,
         // then CommandComplete DEALLOCATE / DEALLOCATE ALL and ReadyForQuery.
-        void handle_deallocate(const deallocate_statement_t& statement, const std::string& sql);
+        boost::asio::awaitable<void> handle_deallocate(const deallocate_statement_t& statement, const std::string& sql);
         // A name of the connection's statement map (Parse) is dropped there, as
         // PostgreSQL's DEALLOCATE does — the session entry released, the portals
         // bound from it left open; a failed block refuses it with 25P02. Any
         // other name is the engine's (SQL PREPARE): `sql` runs on the session,
         // the engine's answer; DEALLOCATE ALL drops the map's and runs on the
         // engine. Returns false after sending the ErrorResponse.
-        bool run_deallocate(const deallocate_statement_t& statement, const std::string& sql);
+        boost::asio::awaitable<bool> run_deallocate(const deallocate_statement_t& statement, const std::string& sql);
 
         // Every session call is awaited here: the bridge, plus the end of a
         // pending failure once an answer shows the session ran it.
-        otterstax::awaited_t<session_payload>
-        await_session(actor_zeta::unique_future<otterstax::session::query_session_t::session_result> fut);
+        boost::asio::awaitable<otterstax::awaited_t<session_payload>> await_session(session_future fut);
+        // `sql` executed on the session, through await_session.
+        boost::asio::awaitable<otterstax::awaited_t<session_payload>> execute_own(std::string sql);
         // The block is failed ('E'): the session's, or a failure sent to it and
         // not yet seen applied.
         bool block_aborted() const;
@@ -257,28 +264,29 @@ namespace frontend::postgres {
                                 std::string_view prefix,
                                 error_severity severity = error_severity::error());
 
-        void handle_parse(std::string stmt, std::string query, int16_t num_params, packet_reader&& reader);
-        void handle_bind(std::string stmt,
+        boost::asio::awaitable<void> handle_parse(std::string stmt, std::string query, int16_t num_params, packet_reader&& reader);
+        boost::asio::awaitable<void> handle_bind(std::string stmt,
                          std::string portal_name,
-                         std::vector<result_encoding> format,
-                         int16_t num_params,
-                         packet_reader&& reader);
-        void handle_execute(std::string portal_name, int32_t limit);
-        void handle_close(describe_close_arg type, std::string name);
-        void handle_describe(describe_close_arg type, std::string name);
+                                     std::vector<result_encoding> format,
+                                     int16_t num_params,
+                                     packet_reader&& reader);
+        boost::asio::awaitable<void> handle_execute(std::string portal_name, int32_t limit);
+        boost::asio::awaitable<void> handle_close(describe_close_arg type, std::string name);
+        boost::asio::awaitable<void> handle_describe(describe_close_arg type, std::string name);
 
         // Close / a Parse replacing a statement: the statement with its portals,
         // or the portal.
-        void do_close(describe_close_arg type, std::string name);
+        boost::asio::awaitable<void> do_close(describe_close_arg type, std::string name);
         // Forgets the named statement and releases its session entry; its
         // portals are left alone (each keeps its statement's run, and prepares
         // the text again at its Execute: portal_entry).
-        void drop_statement(const std::string& name);
+        boost::asio::awaitable<void> drop_statement(std::string name);
         // The session entry a portal runs: its statement's while that statement
         // is still the one of its name, else its text prepared again under a
         // fresh id (`temporary`: closed by the caller after the run, through
         // close_session_statement). std::nullopt after the ErrorResponse.
-        std::optional<otterstax::session::statement_id_t> portal_entry(const portal_meta& portal, bool& temporary);
+        boost::asio::awaitable<std::optional<otterstax::session::statement_id_t>> portal_entry(const portal_meta& portal,
+                                                                                     bool& temporary);
         // Appends a RowDescription (with the given result format codes) for a
         // resolved schema, NoData otherwise; `described` is set to whether a
         // RowDescription went out — only then does the client know the row
@@ -290,16 +298,16 @@ namespace frontend::postgres {
                                        bool& described);
         // Closes the portal's engine window, if one is open (Close, a replacing
         // Bind, an autocommit Sync); a failure is logged only.
-        void close_window(portal_meta& portal);
+        boost::asio::awaitable<void> close_window(portal_meta& portal);
         using portal_iterator = std::pmr::unordered_map<std::string, portal_meta>::iterator;
         // Ends a portal: its window closed when `close_windows` (a window the
         // transaction's end ended is not), the portal forgotten. Answers the
         // next portal.
-        portal_iterator release_portal(portal_iterator it, bool close_windows);
+        boost::asio::awaitable<portal_iterator> release_portal(portal_iterator it, bool close_windows);
         // Every portal, as release_portal ends one: at the transaction's end.
-        void release_portals(bool close_windows);
+        boost::asio::awaitable<void> release_portals(bool close_windows);
         // close_statement of the session's entry; a failure is logged only.
-        void close_session_statement(otterstax::session::statement_id_t stmt_session);
+        boost::asio::awaitable<void> close_session_statement(otterstax::session::statement_id_t stmt_session);
         // PostgreSQL's text for a message with bytes after its last field.
         static constexpr const char* INVALID_MESSAGE_FORMAT = "invalid message format";
         // `hint`: the ErrorResponse's H field, empty for none.

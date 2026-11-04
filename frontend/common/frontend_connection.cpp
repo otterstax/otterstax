@@ -108,7 +108,28 @@ namespace frontend {
         return true;
     }
 
+    void frontend_connection::run_handler(boost::asio::awaitable<void> handler) {
+        handling_ = true;
+        boost::asio::co_spawn(
+            socket_.get_executor(),
+            std::move(handler),
+            boost::asio::bind_executor(socket_.get_executor(), safe_callback([this](std::exception_ptr error) {
+                                           handling_ = false;
+                                           const bool read = std::exchange(read_deferred_, false);
+                                           if (error) {
+                                               std::rethrow_exception(error); // safe_callback ends the connection
+                                           }
+                                           if (read && !closed_) {
+                                               read_packet();
+                                           }
+                                       })));
+    }
+
     void frontend_connection::read_packet() {
+        if (handling_) {
+            read_deferred_ = true;
+            return;
+        }
         logger()->debug("[Connection {}] READ: Starting header read", connection_id_);
 
         arm_read_timeout("header");
@@ -171,7 +192,7 @@ namespace frontend {
                 } else {
                     std::vector<uint8_t> payload(std::make_move_iterator(read_buffer_.begin()),
                                                  std::make_move_iterator(read_buffer_.begin() + payload_length));
-                    handle_packet(std::move(head), std::move(payload));
+                    run_handler(handle_packet(std::move(head), std::move(payload)));
                 }
             }));
     }

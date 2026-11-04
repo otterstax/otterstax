@@ -236,6 +236,7 @@ namespace otterstax::kafka {
         const qualified_name_t& name,
         std::vector<table::column_definition_t> columns,
         bool if_not_exists) {
+        OTX_ZONE_N("KafkaManager::create_table");
         return send_plan(create_table_plan(name, std::move(columns), if_not_exists));
     }
 

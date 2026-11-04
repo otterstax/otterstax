@@ -248,8 +248,11 @@ int main(int argc, char* argv[]) {
         .io_threads = otterstax::runtime::resolve_threads(server_config.runtime.spark_connect_io.threads),
     });
 
+    OTX_MESSAGE_L("startup: mysql server starting");
     mysql->start();
+    OTX_MESSAGE_L("startup: postgres server starting");
     postgres->start();
+    OTX_MESSAGE_L("startup: spark connect server starting");
     spark->start();
     log->info("MySQL Server running on port {}...", server_config.mysql.port);
     log->info("Postgres Server running on port {}...", server_config.postgres.port);
@@ -273,8 +276,11 @@ int main(int argc, char* argv[]) {
         OTX_MESSAGE_L("shutdown: initiated");
         log->info("Shutdown initiated — stopping all servers...");
         spark.reset();
+        OTX_MESSAGE_L("shutdown: spark connect server stopped");
         postgres.reset();
+        OTX_MESSAGE_L("shutdown: postgres server stopped");
         mysql.reset();
+        OTX_MESSAGE_L("shutdown: mysql server stopped");
         flight.reset();
         OTX_MESSAGE_L("shutdown: frontends stopped");
         sessions.reset();
@@ -289,6 +295,7 @@ int main(int argc, char* argv[]) {
         remote.reset();
         OTX_MESSAGE_L("shutdown: remote backends stopped");
         log->info("Graceful shutdown complete.");
+        OTX_MESSAGE_L("shutdown: complete");
     }
 
     return 0;

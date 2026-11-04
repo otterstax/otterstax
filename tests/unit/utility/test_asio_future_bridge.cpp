@@ -10,6 +10,8 @@
 //              status answered whatever its code
 //   failed  -> actor-zeta's own failure channel (`promise::error`, also the
 //              cancellation channel) wakes it early: status broken
+//   poll    -> the step starts short and backs off after the fast phase
+//   cancel  -> a terminal cancellation of the awaiting coroutine ends it at once
 //
 // Every message the bridge creates lives on the resource the caller hands in.
 // Catch2 assertions are not thread-safe: the producer threads only record what
@@ -21,6 +23,8 @@
 #include <catch2/catch_all.hpp>
 
 #include <actor-zeta.hpp>
+#include <boost/asio/bind_cancellation_slot.hpp>
+#include <boost/asio/cancellation_signal.hpp>
 
 #include <atomic>
 #include <chrono>
@@ -202,4 +206,60 @@ TEST_CASE("asio_future_bridge: a worker error with any code is not a timeout") {
         REQUIRE(result.error().type == code);
         REQUIRE(result.error().what == "engine said no");
     }
+}
+
+TEST_CASE("asio_future_bridge: the poll step starts short and grows after the fast phase") {
+    const auto start = std::chrono::steady_clock::now();
+    otterstax::await_backoff_t backoff(start);
+    // Doubling from the first step to AWAIT_POLL_STEP while the wait is young.
+    CHECK(backoff.next(start) == otterstax::AWAIT_POLL_FIRST_STEP);
+    std::chrono::microseconds step{};
+    for (int i = 0; i < 16; ++i) {
+        step = backoff.next(start + 50ms);
+    }
+    CHECK(step == otterstax::AWAIT_POLL_STEP);
+    // Past AWAIT_FAST_PHASE it doubles on, up to AWAIT_POLL_MAX_STEP.
+    CHECK(backoff.next(start + 150ms) == otterstax::AWAIT_POLL_STEP);
+    CHECK(backoff.next(start + 150ms) == 2 * otterstax::AWAIT_POLL_STEP);
+    for (int i = 0; i < 16; ++i) {
+        step = backoff.next(start + 1s);
+    }
+    CHECK(step == otterstax::AWAIT_POLL_MAX_STEP);
+}
+
+TEST_CASE("asio_future_bridge: a cancelled await ends at once") {
+    // A wire connection's close emits a terminal cancellation into the handler
+    // that awaits its statement: the poll stops waiting and asio ends the
+    // coroutine with operation_aborted at its next co_await.
+    std::pmr::synchronized_pool_resource resource;
+    actor_zeta::promise<result_t> producer{&resource};
+    auto fut = producer.get_future();
+
+    boost::asio::io_context io;
+    boost::asio::cancellation_signal cancel;
+    std::exception_ptr ended;
+    bool completed = false;
+    boost::asio::co_spawn(
+        io,
+        [&]() -> boost::asio::awaitable<void> {
+            [[maybe_unused]] auto r = co_await otterstax::async_await_future<payload_t>(std::move(fut), &resource, 10s);
+        },
+        boost::asio::bind_cancellation_slot(cancel.slot(), [&](std::exception_ptr error) {
+            completed = true;
+            ended = error;
+        }));
+    boost::asio::steady_timer emit(io, 200ms); // well past the fast phase
+    emit.async_wait([&](boost::system::error_code) { cancel.emit(boost::asio::cancellation_type::terminal); });
+
+    const auto start = std::chrono::steady_clock::now();
+    io.run();
+    REQUIRE(completed);
+    CHECK(elapsed_ms_since(start) < 2000);
+    REQUIRE(ended != nullptr);
+    try {
+        std::rethrow_exception(ended);
+    } catch (const boost::system::system_error& e) {
+        CHECK(e.code() == boost::asio::error::operation_aborted);
+    }
+    producer.set_value(result_t{payload_t{"late", &resource}}); // the producer may still answer
 }

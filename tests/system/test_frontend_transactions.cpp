@@ -1172,6 +1172,130 @@ TEST_CASE("wire waiting: a statement waiting for a backend agent holds no thread
     }
 }
 
+// The close of a connection does not wait for the statement its handler
+// awaits (frontend_connection::run_handler): a server stopped while a
+// statement of its waits for the backend agent another server's client holds
+// returns at once — it waited for the agent's checkout timeout (60 s) before —,
+// the waiting statement leaves the agent's queue with its session's close, and
+// the agent serves the next client once its holder quits.
+TEST_CASE("wire waiting: a server stop does not wait for a statement waiting for a backend agent") {
+    otterstax::test::stack_options_t options;
+    options.connections.mysql = otterstax::test::mock_mysql({"m"});
+    options.connections.mysql.front().pool_size = 1;
+    otterstax::test::session_stack_owner owner(otterstax::test::unique_test_dir("otterstax_wire_stop_wait"), options);
+    auto& sessions = owner.sessions();
+    const size_t baseline = sessions.live_sessions();
+    const std::string remote_select = "SELECT id FROM m.db.public.`table`";
+
+    frontend::mysql::mysql_server holding(make_config<frontend::mysql::mysql_server>(owner.stack(), 1));
+    holding.start();
+    raw_client holder(holding.local_port());
+    mysql_handshake(holder);
+    mysql_ok(holder, "SET autocommit = 0");
+    CHECK((mysql_resultset_flags(holder, remote_select) & SERVER_STATUS_IN_TRANS) != 0); // holds the only agent
+
+    SECTION("postgres") {
+        frontend::postgres::postgres_server server(make_config<frontend::postgres::postgres_server>(owner.stack(), 1));
+        server.start();
+        raw_client waiter(server.local_port());
+        pg_startup(waiter);
+        waiter.write(pg_frame('Q', cstr("SELECT id FROM m.db.public.\"table\"")));
+        std::this_thread::sleep_for(300ms); // the waiter's statement is in the agent queue
+        const auto started = std::chrono::steady_clock::now();
+        server.stop();
+        CHECK(std::chrono::steady_clock::now() - started < 5s);
+    }
+    SECTION("mysql") {
+        frontend::mysql::mysql_server server(make_config<frontend::mysql::mysql_server>(owner.stack(), 1));
+        server.start();
+        raw_client waiter(server.local_port());
+        mysql_handshake(waiter);
+        waiter.write(mysql_query_packet(remote_select));
+        std::this_thread::sleep_for(300ms);
+        const auto started = std::chrono::steady_clock::now();
+        server.stop();
+        CHECK(std::chrono::steady_clock::now() - started < 5s);
+    }
+    // The waiter's session is closed: only the holder's is live.
+    CHECK(wait_for_live(sessions, baseline + 1, 5000ms));
+
+    holder.write(mysql_frame(0, {0x01})); // COM_QUIT frees the agent
+    holder.close();
+    raw_client next(holding.local_port());
+    mysql_handshake(next);
+    mysql_ok(next, "SET autocommit = 0");
+    const auto started = std::chrono::steady_clock::now();
+    CHECK((mysql_resultset_flags(next, remote_select) & SERVER_STATUS_IN_TRANS) != 0);
+    CHECK(std::chrono::steady_clock::now() - started < 5s);
+    next.close();
+    CHECK(wait_for_live(sessions, baseline, 10000ms));
+    holding.stop();
+}
+
+// A client that drops its socket while its statement waits for a backend
+// agent is seen at once (no read is in flight while a handler runs: the
+// connection watches the socket instead, frontend_connection::watch_peer_close):
+// its session closes and its statement leaves the agent's queue, so the agent
+// its holder frees goes to the next client — the dropped client's statement
+// never runs. Before, its session lived until the statement was answered.
+TEST_CASE("wire waiting: a client gone while its statement waits for a backend agent closes its session at once") {
+    otterstax::test::stack_options_t options;
+    options.connections.mysql = otterstax::test::mock_mysql({"m"});
+    options.connections.mysql.front().pool_size = 1;
+    otterstax::test::session_stack_owner owner(otterstax::test::unique_test_dir("otterstax_wire_gone_wait"), options);
+    auto& sessions = owner.sessions();
+    const size_t baseline = sessions.live_sessions();
+    const std::string remote_select = "SELECT id FROM m.db.public.`table`";
+
+    frontend::mysql::mysql_server holding(make_config<frontend::mysql::mysql_server>(owner.stack(), 1));
+    holding.start();
+    raw_client holder(holding.local_port());
+    mysql_handshake(holder);
+    mysql_ok(holder, "SET autocommit = 0");
+    CHECK((mysql_resultset_flags(holder, remote_select) & SERVER_STATUS_IN_TRANS) != 0); // holds the only agent
+
+    SECTION("postgres") {
+        frontend::postgres::postgres_server server(make_config<frontend::postgres::postgres_server>(owner.stack(), 1));
+        server.start();
+        {
+            raw_client gone(server.local_port());
+            pg_startup(gone);
+            pg_ok(gone, "BEGIN", "BEGIN", 'T'); // its statement would hold the agent until the block ends
+            gone.write(pg_frame('Q', cstr("SELECT id FROM m.db.public.\"table\"")));
+            std::this_thread::sleep_for(300ms); // in the agent queue
+            gone.close();
+        }
+        CHECK(wait_for_live(sessions, baseline + 1, 5000ms)); // the holder's alone
+        server.stop();
+    }
+    SECTION("mysql") {
+        frontend::mysql::mysql_server server(make_config<frontend::mysql::mysql_server>(owner.stack(), 1));
+        server.start();
+        {
+            raw_client gone(server.local_port());
+            mysql_handshake(gone);
+            mysql_ok(gone, "SET autocommit = 0"); // its statement would hold the agent until the block ends
+            gone.write(mysql_query_packet(remote_select));
+            std::this_thread::sleep_for(300ms);
+            gone.close();
+        }
+        CHECK(wait_for_live(sessions, baseline + 1, 5000ms));
+        server.stop();
+    }
+
+    holder.write(mysql_frame(0, {0x01})); // COM_QUIT frees the agent
+    holder.close();
+    raw_client next(holding.local_port());
+    mysql_handshake(next);
+    mysql_ok(next, "SET autocommit = 0");
+    const auto started = std::chrono::steady_clock::now();
+    CHECK((mysql_resultset_flags(next, remote_select) & SERVER_STATUS_IN_TRANS) != 0);
+    CHECK(std::chrono::steady_clock::now() - started < 5s);
+    next.close();
+    CHECK(wait_for_live(sessions, baseline, 10000ms));
+    holding.stop();
+}
+
 namespace {
 
     // The text of the first cell of the first row of a simple-Query answer.

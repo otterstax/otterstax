@@ -5,9 +5,11 @@
 //
 // actor-zeta 2.0 futures expose no blocking wait and no completion callback —
 // only the non-blocking is_ready()/failed()/take_ready() trio — so we poll with a
-// short steady_timer between checks. A frontend handler drives this from a local
-// io_context (io.run()) so the handler thread parks on the timer between polls
-// instead of busy-spinning.
+// steady_timer between checks (await_backoff_t). The MySQL / PostgreSQL
+// connections co_await async_await_future on their strand, which suspends the
+// handler and leaves the io thread to the server's other connections; a caller
+// with no coroutine of its own (Flight SQL) drives it on a private io_context
+// (await_future_blocking), its thread parked on the timer between polls.
 //
 // The future is held BY MOVE (no std::shared_ptr); the bridge never throws.
 // What it answers is an awaited_t: the worker's own result, or the bridge's two
@@ -30,6 +32,7 @@
 #include <boost/asio/this_coro.hpp>
 #include <boost/asio/use_awaitable.hpp>
 
+#include <algorithm>
 #include <cassert>
 #include <chrono>
 #include <cstdint>
@@ -43,8 +46,37 @@ namespace otterstax {
 
     namespace asio = boost::asio;
 
-    inline constexpr std::chrono::milliseconds AWAIT_POLL_STEP{1};
     inline constexpr std::chrono::milliseconds DEFAULT_TIMEOUT{90000};
+
+    // The poll schedule of every bridge (this one and the Spark frontend's,
+    // spark_connect_server/await_future.hpp). The first step is short and
+    // doubles up to AWAIT_POLL_STEP, so a fast answer is picked up at once;
+    // once a statement has waited AWAIT_FAST_PHASE (for a backend agent another
+    // block holds, say) the step doubles on up to AWAIT_POLL_MAX_STEP — a
+    // waiting statement wakes its pool rarely, and an answer after that is
+    // picked up late by at most one step.
+    inline constexpr std::chrono::microseconds AWAIT_POLL_FIRST_STEP{16};
+    inline constexpr std::chrono::microseconds AWAIT_POLL_STEP{1000};
+    inline constexpr std::chrono::milliseconds AWAIT_FAST_PHASE{100};
+    inline constexpr std::chrono::microseconds AWAIT_POLL_MAX_STEP{32000};
+
+    class await_backoff_t {
+    public:
+        explicit await_backoff_t(std::chrono::steady_clock::time_point start) noexcept
+            : start_(start) {}
+
+        // The wait before the next poll, at `now`.
+        [[nodiscard]] std::chrono::microseconds next(std::chrono::steady_clock::time_point now) noexcept {
+            const auto step = step_;
+            const auto cap = now - start_ < AWAIT_FAST_PHASE ? AWAIT_POLL_STEP : AWAIT_POLL_MAX_STEP;
+            step_ = std::min(step_ * 2, cap);
+            return step;
+        }
+
+    private:
+        std::chrono::steady_clock::time_point start_;
+        std::chrono::microseconds step_{AWAIT_POLL_FIRST_STEP};
+    };
 
     // How an await ended.
     enum class await_status_t : std::uint8_t
@@ -123,7 +155,11 @@ namespace otterstax {
     // Await an actor-zeta future from inside a boost::asio coroutine. Answers
     // the worker's result_wrapper_t<T> (status answered), or the bridge's
     // timeout / broken channel, whose message lives on `resource`. `fut` is
-    // consumed (moved in).
+    // consumed (moved in). A terminal cancellation of the coroutine (a wire
+    // connection's close, frontend_connection::run_handler) ends the poll's
+    // timer wait at once, and asio throws operation_aborted at the coroutine's
+    // next co_await: the caller is abandoned, the future dropped unread as at
+    // a timeout (the statement runs on in its session). Nothing else throws.
     template<typename T>
     asio::awaitable<awaited_t<T>> async_await_future(actor_zeta::unique_future<core::result_wrapper_t<T>> fut,
                                                      std::pmr::memory_resource* resource,
@@ -131,13 +167,16 @@ namespace otterstax {
         assert(resource != nullptr && "async_await_future: memory resource must not be null");
         auto executor = co_await asio::this_coro::executor;
         asio::steady_timer timer(executor);
-        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        const auto start = std::chrono::steady_clock::now();
+        const auto deadline = start + timeout;
+        await_backoff_t backoff(start);
 
         while (!fut.is_ready() && !fut.failed()) {
-            if (std::chrono::steady_clock::now() >= deadline) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline) {
                 co_return await_timed_out<T>(resource);
             }
-            timer.expires_after(AWAIT_POLL_STEP);
+            timer.expires_after(backoff.next(now));
             boost::system::error_code ec;
             co_await timer.async_wait(asio::redirect_error(asio::use_awaitable, ec));
         }

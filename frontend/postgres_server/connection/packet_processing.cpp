@@ -127,62 +127,63 @@ namespace frontend::postgres {
         // them, not to the startup's value (the startup's SET is an ordinary
         // SET in the engine).
         co_await read_default_settings();
-        if (!co_await apply_startup_settings(database, options)) {
+        if (!co_await apply_startup_settings(std::move(database), std::move(options))) {
             co_return;
         }
-        OTX_ZONE_N("pg::handle_startup_message::answer"); // no co_await follows
+        {
+            OTX_ZONE_N("pg::handle_startup_message::answer");
+            std::vector<std::vector<uint8_t>> msg;
+            msg.emplace_back(build_auth_ok(writer_));
+            // The client's encoding, then the protocol's parameters: what OtterStax
+            // does, fixed.
+            reported_.client_encoding = client_encoding_.current();
+            msg.emplace_back(build_parameter_status(writer_, "client_encoding", reported_.client_encoding));
+            for (const auto& parameter : protocol_parameters()) {
+                msg.emplace_back(
+                    build_parameter_status(writer_, std::string{parameter.name}, std::string{parameter.value}));
+            }
+            // Read-only facts of the server: the PostgreSQL version it speaks, the
+            // encoding the engine stores text in, the timestamps' microsecond
+            // integers (core/date/date_types.hpp).
+            msg.emplace_back(build_parameter_status(writer_, "server_version", "18.0"));
+            msg.emplace_back(build_parameter_status(writer_, "server_encoding", "UTF8"));
+            msg.emplace_back(build_parameter_status(writer_, "integer_datetimes", "on"));
+            // The engine session's, as the engine has them.
+            reported_.timezone = timezone_.current();
+            reported_.search_path = search_path_.current();
+            msg.emplace_back(build_parameter_status(writer_, "TimeZone", reported_.timezone));
+            msg.emplace_back(build_parameter_status(writer_, "search_path", reported_.search_path));
+            // The client's own, reported empty when it named none (PostgreSQL's
+            // default).
+            log_->info("[Connection {}] application_name: \"{}\", client_encoding: {}, extra_float_digits: {}",
+                       connection_id_,
+                       application_name_.session,
+                       client_encoding_.session,
+                       extra_float_digits_.session);
+            reported_.application_name = application_name_.current();
+            msg.emplace_back(build_parameter_status(writer_, "application_name", reported_.application_name));
 
-        std::vector<std::vector<uint8_t>> msg;
-        msg.emplace_back(build_auth_ok(writer_));
-        // The client's encoding, then the protocol's parameters: what OtterStax
-        // does, fixed.
-        reported_.client_encoding = client_encoding_.current();
-        msg.emplace_back(build_parameter_status(writer_, "client_encoding", reported_.client_encoding));
-        for (const auto& parameter : protocol_parameters()) {
-            msg.emplace_back(
-                build_parameter_status(writer_, std::string{parameter.name}, std::string{parameter.value}));
+            auto secret_key = secure_random_bytes(use_protocol_3_2_ ? SECRET_KEY_3_2_SIZE : SECRET_KEY_SIZE);
+            if (!secret_key) {
+                send_error_response(sql_state::INTERNAL_ERROR,
+                                    "the server could not generate the cancel key",
+                                    error_severity::fatal());
+                co_return;
+            }
+            backend_secret_key_ = std::move(*secret_key);
+            msg.emplace_back(build_backend_key_data(writer_, connection_id_, backend_secret_key_));
+
+            log_->debug("[Connection {}] Generated BackendKeyData: key_size={} bytes",
+                        connection_id_,
+                        backend_secret_key_.size());
+            msg.emplace_back(build_ready_for_query(writer_, transaction_status::IDLE));
+            send_packet_merged(std::move(msg)); // send packet & begin message-handling loop
         }
-        // Read-only facts of the server: the PostgreSQL version it speaks, the
-        // encoding the engine stores text in, the timestamps' microsecond
-        // integers (core/date/date_types.hpp).
-        msg.emplace_back(build_parameter_status(writer_, "server_version", "18.0"));
-        msg.emplace_back(build_parameter_status(writer_, "server_encoding", "UTF8"));
-        msg.emplace_back(build_parameter_status(writer_, "integer_datetimes", "on"));
-        // The engine session's, as the engine has them.
-        reported_.timezone = timezone_.current();
-        reported_.search_path = search_path_.current();
-        msg.emplace_back(build_parameter_status(writer_, "TimeZone", reported_.timezone));
-        msg.emplace_back(build_parameter_status(writer_, "search_path", reported_.search_path));
-        // The client's own, reported empty when it named none (PostgreSQL's
-        // default).
-        log_->info("[Connection {}] application_name: \"{}\", client_encoding: {}, extra_float_digits: {}",
-                   connection_id_,
-                   application_name_.session,
-                   client_encoding_.session,
-                   extra_float_digits_.session);
-        reported_.application_name = application_name_.current();
-        msg.emplace_back(build_parameter_status(writer_, "application_name", reported_.application_name));
-
-        auto secret_key = secure_random_bytes(use_protocol_3_2_ ? SECRET_KEY_3_2_SIZE : SECRET_KEY_SIZE);
-        if (!secret_key) {
-            send_error_response(sql_state::INTERNAL_ERROR,
-                                "the server could not generate the cancel key",
-                                error_severity::fatal());
-            co_return;
-        }
-        backend_secret_key_ = std::move(*secret_key);
-        msg.emplace_back(build_backend_key_data(writer_, connection_id_, backend_secret_key_));
-
-        log_->debug("[Connection {}] Generated BackendKeyData: key_size={} bytes",
-                    connection_id_,
-                    backend_secret_key_.size());
-        msg.emplace_back(build_ready_for_query(writer_, transaction_status::IDLE));
-        send_packet_merged(std::move(msg)); // send packet & begin message-handling loop
     }
 
     boost::asio::awaitable<bool>
-    postgres_connection::apply_startup_settings(const std::optional<std::string>& database,
-                                                const std::vector<std::pair<std::string, std::string>>& settings) {
+    postgres_connection::apply_startup_settings(std::optional<std::string> database,
+                                                std::vector<std::pair<std::string, std::string>> settings) {
         {
             OTX_ZONE_N("pg::apply_startup_settings");
             // The protocol's first: nothing reaches the engine unless all are true.
@@ -277,47 +278,49 @@ namespace frontend::postgres {
         // row of a setting winning (the table is append-only; the engine reads
         // the last one at its start), each through the engine's set_setting.
         auto r = co_await execute_own(std::string{"SELECT name, setting FROM pg_catalog.pg_settings"});
-        OTX_ZONE_N("pg::read_default_settings"); // after the only co_await
-        components::catalog::session_catalog_t defaults;
-        if (r.has_error()) {
-            log_->warn("[Connection {}] pg_settings could not be read: {}", connection_id_, r.error().what.c_str());
-        } else {
-            for (const auto& chunk : r.value().chunks) {
-                // Two text columns, or the rows are not what this reads.
-                if (chunk.column_count() < 2 ||
-                    chunk.data[0].type().type() != types::logical_type::STRING_LITERAL ||
-                    chunk.data[1].type().type() != types::logical_type::STRING_LITERAL) {
-                    log_->warn("[Connection {}] pg_settings answered columns other than (name, setting): ignored",
-                               connection_id_);
-                    continue;
-                }
-                for (uint64_t row = 0; row < chunk.size(); ++row) {
-                    if (chunk.data[0].is_null(row) || chunk.data[1].is_null(row)) {
+        {
+            OTX_ZONE_N("pg::read_default_settings");
+            components::catalog::session_catalog_t defaults;
+            if (r.has_error()) {
+                log_->warn("[Connection {}] pg_settings could not be read: {}", connection_id_, r.error().what.c_str());
+            } else {
+                for (const auto& chunk : r.value().chunks) {
+                    // Two text columns, or the rows are not what this reads.
+                    if (chunk.column_count() < 2 ||
+                        chunk.data[0].type().type() != types::logical_type::STRING_LITERAL ||
+                        chunk.data[1].type().type() != types::logical_type::STRING_LITERAL) {
+                        log_->warn("[Connection {}] pg_settings answered columns other than (name, setting): ignored",
+                                   connection_id_);
                         continue;
                     }
-                    const auto* setting = setting_of_row(chunk.data[0].data<std::string_view>()[row]);
-                    if (setting == nullptr) {
-                        continue;
-                    }
-                    const auto value = chunk.data[1].data<std::string_view>()[row];
-                    if (auto refused = components::catalog::set_setting(defaults, setting->id, value, resource_);
-                        refused.contains_error()) {
-                        log_->warn("[Connection {}] pg_settings {} = '{}' refused: {}",
-                                   connection_id_,
-                                   setting->sql_name,
-                                   value,
-                                   refused.what.c_str());
+                    for (uint64_t row = 0; row < chunk.size(); ++row) {
+                        if (chunk.data[0].is_null(row) || chunk.data[1].is_null(row)) {
+                            continue;
+                        }
+                        const auto* setting = setting_of_row(chunk.data[0].data<std::string_view>()[row]);
+                        if (setting == nullptr) {
+                            continue;
+                        }
+                        const auto value = chunk.data[1].data<std::string_view>()[row];
+                        if (auto refused = components::catalog::set_setting(defaults, setting->id, value, resource_);
+                            refused.contains_error()) {
+                            log_->warn("[Connection {}] pg_settings {} = '{}' refused: {}",
+                                       connection_id_,
+                                       setting->sql_name,
+                                       value,
+                                       refused.what.c_str());
+                        }
                     }
                 }
             }
+            const auto value_of = [&](components::catalog::setting_id id) {
+                return std::string{components::catalog::current_setting_value(defaults, id, resource_)};
+            };
+            timezone_.reset = value_of(components::catalog::setting_id::timezone);
+            timezone_.session = timezone_.reset;
+            search_path_.reset = value_of(components::catalog::setting_id::search_path);
+            search_path_.session = search_path_.reset;
         }
-        const auto value_of = [&](components::catalog::setting_id id) {
-            return std::string{components::catalog::current_setting_value(defaults, id, resource_)};
-        };
-        timezone_.reset = value_of(components::catalog::setting_id::timezone);
-        timezone_.session = timezone_.reset;
-        search_path_.reset = value_of(components::catalog::setting_id::search_path);
-        search_path_.session = search_path_.reset;
     }
 
     void postgres_connection::handle_ssl_decline(frontend::postgres::packet_reader& reader) {
@@ -655,8 +658,8 @@ namespace frontend::postgres {
                             "current transaction is aborted, commands ignored until end of transaction block");
     }
 
-    boost::asio::awaitable<bool> postgres_connection::run_deallocate(const deallocate_statement_t& statement,
-                                                                     const std::string& sql) {
+    boost::asio::awaitable<bool> postgres_connection::run_deallocate(deallocate_statement_t statement,
+                                                                     std::string sql) {
         bool own = false;
         {
             OTX_ZONE_N("pg::run_deallocate");
@@ -673,7 +676,7 @@ namespace frontend::postgres {
         }
         // The engine's store (SQL PREPARE): its answer, 26000 for a name it
         // does not have either, 25P02 in a failed block.
-        auto r = co_await execute_own(sql);
+        auto r = co_await execute_own(std::move(sql));
         if (r.has_error()) {
             send_session_error(r, "");
             co_return false;
@@ -695,31 +698,33 @@ namespace frontend::postgres {
         co_return true;
     }
 
-    boost::asio::awaitable<void> postgres_connection::handle_deallocate(const deallocate_statement_t& statement,
-                                                                        const std::string& sql) {
-        if (!co_await run_deallocate(statement, sql)) {
+    boost::asio::awaitable<void> postgres_connection::handle_deallocate(deallocate_statement_t statement,
+                                                                        std::string sql) {
+        const bool all = !statement.name.has_value();
+        if (!co_await run_deallocate(std::move(statement), std::move(sql))) {
             co_return;
         }
-        OTX_ZONE_N("pg::handle_deallocate"); // no co_await follows
-        std::vector<std::vector<uint8_t>> response;
-        response.emplace_back(
-            build_command_complete(writer_, command_complete_tag::deallocate(!statement.name.has_value())));
-        append_ready_for_query(response);
-        send_packet_merged(std::move(response));
+        {
+            OTX_ZONE_N("pg::handle_deallocate");
+            std::vector<std::vector<uint8_t>> response;
+            response.emplace_back(build_command_complete(writer_, command_complete_tag::deallocate(all)));
+            append_ready_for_query(response);
+            send_packet_merged(std::move(response));
+        }
     }
 
     boost::asio::awaitable<void> postgres_connection::handle_query(std::string query) {
-        if (auto deallocate = deallocate_statement(resource_, query)) {
-            co_await handle_deallocate(*deallocate, query);
-            co_return;
-        }
+        std::optional<deallocate_statement_t> deallocate;
         // RESET ALL resets the engine's settings (the session runs it) and the
         // client parameters behind its success; DISCARD ALL too, which
         // PostgreSQL runs only outside a block (PreventInTransactionBlock).
         bool resets_client_parameters = false;
         {
             OTX_ZONE_N("pg::handle_query");
-            if (auto setting = protocol_setting_statement(resource_, query)) {
+            deallocate = deallocate_statement(resource_, query);
+            if (deallocate) {
+                // run below: handle_deallocate
+            } else if (auto setting = protocol_setting_statement(resource_, query)) {
                 if (setting->all) {
                     resets_client_parameters = true;
                 } else {
@@ -754,6 +759,10 @@ namespace frontend::postgres {
                 co_return;
             }
         }
+        if (deallocate) {
+            co_await handle_deallocate(std::move(*deallocate), std::move(query));
+            co_return;
+        }
         auto r = co_await execute_own(query);
         if (r.has_error()) {
             send_session_error(r, "");
@@ -767,39 +776,74 @@ namespace frontend::postgres {
         if (ends_block(sdata_result)) {
             co_await release_portals(false); // portals are released at the transaction's end
         }
-        OTX_ZONE_N("pg::handle_query::answer"); // no co_await follows
-        int64_t rows_cnt = static_cast<int64_t>(sdata_result.reported_rows());
-        std::vector<std::vector<uint8_t>> response;
-        if (sdata_result.column_count() > 0) {
-            // A column the text encoder cannot carry is an ErrorResponse, not a
-            // dropped connection.
-            if (auto bad = find_unsupported_column<frontend_type::POSTGRES>(sdata_result.chunks.front(),
-                                                                           {result_encoding::TEXT})) {
-                send_error_response(sql_state::FEATURE_NOT_SUPPORTED,
-                                    unsupported_column_message<frontend_type::POSTGRES>(*bad));
-                co_return;
-            }
-
-            postgres_resultset result(writer_, extra_float_digits_t{extra_float_digits_.current()});
-            result.add_chunk_columns(sdata_result.chunks.front()); // default text encoding
-            for (auto& ch : sdata_result.chunks) {
-                for (size_t i = 0; i < ch.size(); ++i) {
-                    result.add_row(ch, i);
+        {
+            OTX_ZONE_N("pg::handle_query::answer");
+            int64_t rows_cnt = static_cast<int64_t>(sdata_result.reported_rows());
+            std::vector<std::vector<uint8_t>> response;
+            if (sdata_result.column_count() > 0) {
+                // A column the text encoder cannot carry is an ErrorResponse, not a
+                // dropped connection.
+                if (auto bad = find_unsupported_column<frontend_type::POSTGRES>(sdata_result.chunks.front(),
+                                                                               {result_encoding::TEXT})) {
+                    send_error_response(sql_state::FEATURE_NOT_SUPPORTED,
+                                        unsupported_column_message<frontend_type::POSTGRES>(*bad));
+                    co_return;
                 }
+
+                postgres_resultset result(writer_, extra_float_digits_t{extra_float_digits_.current()});
+                result.add_chunk_columns(sdata_result.chunks.front()); // default text encoding
+                for (auto& ch : sdata_result.chunks) {
+                    for (size_t i = 0; i < ch.size(); ++i) {
+                        result.add_row(ch, i);
+                    }
+                }
+                response = postgres_resultset::build_packets(std::move(result));
             }
-            response = postgres_resultset::build_packets(std::move(result));
+            response.emplace_back(build_command_complete(writer_, tag_of(sdata_result, rows_cnt, query)));
+            // A reported parameter the statement changed (a SET, the end of the
+            // block a SET was in), as PostgreSQL sends it before the ReadyForQuery.
+            append_ready_for_query(response);
+            send_packet_merged(std::move(response));
         }
-        response.emplace_back(build_command_complete(writer_, tag_of(sdata_result, rows_cnt, query)));
-        // A reported parameter the statement changed (a SET, the end of the
-        // block a SET was in), as PostgreSQL sends it before the ReadyForQuery.
-        append_ready_for_query(response);
-        send_packet_merged(std::move(response));
     }
 
     boost::asio::awaitable<void>
-    postgres_connection::handle_parse(std::string stmt, std::string query, int16_t num_params, packet_reader&& reader) {
+    postgres_connection::keep_statement(std::string stmt, std::pmr::vector<int32_t> oids, statement_run_t run) {
+        std::pmr::vector<field_type> types(resource_);
+        {
+            OTX_ZONE_N("pg::keep_statement");
+            if (block_aborted()) {
+                refuse_in_aborted_block();
+                co_return;
+            }
+            // The statement uses no parameter, and PostgreSQL takes a Parse that
+            // declares types for parameters the statement does not use: they are
+            // its parameters (described, bound) all the same — but an undeclared
+            // one (oid 0) has no type to be described by (42P18).
+            for (std::size_t i = 0; i < oids.size(); ++i) {
+                if (oids[i] == 0) {
+                    send_error_response(sql_state::INDETERMINATE_DATATYPE,
+                                        "could not determine data type of parameter $" + std::to_string(i + 1));
+                    co_return;
+                }
+                types.push_back(static_cast<field_type>(oids[i]));
+            }
+        }
+        co_await do_close(describe_close_arg::STATEMENT, stmt);
+        const auto count = static_cast<uint32_t>(types.size());
+        statement_name_map_.emplace(std::move(stmt), prepared_stmt_meta(std::move(run), count, std::move(types)));
+        send_packet(build_parse_complete(writer_));
+    }
+
+    boost::asio::awaitable<void>
+    postgres_connection::handle_parse(std::string stmt, std::string query, int16_t num_params, packet_reader reader) {
         std::pmr::vector<int32_t> oids(resource_);
         std::pmr::vector<std::optional<field_type>> declared(resource_);
+        otterstax::session::statement_id_t id{};
+        // A statement the frontend keeps (DEALLOCATE, a protocol SET, SHOW of a
+        // client parameter): run at Execute, never prepared by the session.
+        std::optional<statement_run_t> kept;
+        std::optional<protocol_setting_t> setting;
         {
             OTX_ZONE_N("pg::handle_parse");
             log_->info("[Connection {}] PARSE stmt: \"{}\", query: \"{}\"", connection_id_, stmt, query);
@@ -824,64 +868,33 @@ namespace frontend::postgres {
                 send_error_response(sql_state::PROTOCOL_VIOLATION, INVALID_MESSAGE_FORMAT);
                 co_return;
             }
-        }
 
-        const auto id = session_->next_statement();
-        // A statement the frontend keeps (DEALLOCATE, a protocol SET, SHOW of a
-        // client parameter): run at Execute, never prepared by the session. It
-        // uses no parameter, and PostgreSQL takes a Parse that declares types
-        // for parameters the statement does not use: they are its parameters
-        // (described, bound) all the same — but an undeclared one (oid 0) has
-        // no type to be described by (42P18).
-        // A coroutine awaited where it is called: `keep` and what it refers to
-        // outlive it.
-        const auto keep = [&](statement_run_t run) -> boost::asio::awaitable<void> {
-            if (block_aborted()) {
-                refuse_in_aborted_block();
-                co_return;
+            id = session_->next_statement();
+            setting = protocol_setting_statement(resource_, query);
+            if (auto deallocate = deallocate_statement(resource_, query)) {
+                kept.emplace(resource_, id, query, types::complex_logical_type{}, T_DeallocateStmt);
+                kept->deallocate = std::move(*deallocate);
+            } else if (setting && !setting->all) {
+                // So is a SET of a protocol parameter: checked at Execute, as
+                // PostgreSQL applies a SET when it runs. RESET ALL is the engine's,
+                // the client parameters reset behind it.
+                kept.emplace(resource_, id, query, types::complex_logical_type{}, T_VariableSetStmt);
+                kept->protocol_setting = std::move(*setting);
+            } else if (const auto shown = show_client_parameter(resource_, query)) {
+                // And SHOW of a client parameter: answered at Execute, described by
+                // its one text column.
+                std::pmr::vector<types::complex_logical_type> columns(resource_);
+                columns.emplace_back(types::logical_type::STRING_LITERAL, std::string{client_parameter_name(*shown)});
+                kept.emplace(resource_,
+                             id,
+                             query,
+                             types::complex_logical_type::create_struct("", columns),
+                             T_VariableShowStmt);
+                kept->show = *shown;
             }
-            std::pmr::vector<field_type> types(resource_);
-            for (std::size_t i = 0; i < oids.size(); ++i) {
-                if (oids[i] == 0) {
-                    send_error_response(sql_state::INDETERMINATE_DATATYPE,
-                                        "could not determine data type of parameter $" + std::to_string(i + 1));
-                    co_return;
-                }
-                types.push_back(static_cast<field_type>(oids[i]));
-            }
-            co_await do_close(describe_close_arg::STATEMENT, stmt);
-            const auto count = static_cast<uint32_t>(types.size());
-            statement_name_map_.emplace(std::move(stmt), prepared_stmt_meta(std::move(run), count, std::move(types)));
-            send_packet(build_parse_complete(writer_));
-        };
-        if (auto deallocate = deallocate_statement(resource_, query)) {
-            statement_run_t run(resource_, id, query, types::complex_logical_type{}, T_DeallocateStmt);
-            run.deallocate = std::move(*deallocate);
-            co_await keep(std::move(run));
-            co_return;
         }
-        // So is a SET of a protocol parameter: checked at Execute, as
-        // PostgreSQL applies a SET when it runs. RESET ALL is the engine's,
-        // the client parameters reset behind it.
-        auto setting = protocol_setting_statement(resource_, query);
-        if (setting && !setting->all) {
-            statement_run_t run(resource_, id, query, types::complex_logical_type{}, T_VariableSetStmt);
-            run.protocol_setting = std::move(*setting);
-            co_await keep(std::move(run));
-            co_return;
-        }
-        // And SHOW of a client parameter: answered at Execute, described by
-        // its one text column.
-        if (const auto shown = show_client_parameter(resource_, query)) {
-            std::pmr::vector<types::complex_logical_type> columns(resource_);
-            columns.emplace_back(types::logical_type::STRING_LITERAL, std::string{client_parameter_name(*shown)});
-            statement_run_t run(resource_,
-                                id,
-                                query,
-                                types::complex_logical_type::create_struct("", columns),
-                                T_VariableShowStmt);
-            run.show = *shown;
-            co_await keep(std::move(run));
+        if (kept) {
+            co_await keep_statement(std::move(stmt), std::move(oids), std::move(*kept));
             co_return;
         }
         // The engine describes the statement (a failed block refuses it, but
@@ -942,7 +955,7 @@ namespace frontend::postgres {
                                                                   std::string portal_name,
                                                                   std::vector<result_encoding> format,
                                                                   int16_t num_params,
-                                                                  packet_reader&& reader) {
+                                                                  packet_reader reader) {
         auto it = statement_name_map_.end();
         portal_t params(resource_);
         std::vector<result_encoding> out_format;
@@ -1108,7 +1121,6 @@ namespace frontend::postgres {
                 send_error_response(sql_state::PROTOCOL_VIOLATION, INVALID_MESSAGE_FORMAT);
                 co_return;
             }
-
         }
 
         // add & create portal; portals with identical name replace each other
@@ -1127,33 +1139,31 @@ namespace frontend::postgres {
         send_packet(build_bind_complete(writer_));
     }
 
-    boost::asio::awaitable<void> postgres_connection::close_window(portal_meta& portal) {
+    boost::asio::awaitable<void> postgres_connection::close_window(uint64_t window) {
         session_future fut;
         {
             OTX_ZONE_N("pg::close_window");
-            if (portal.window == 0 || session_ == nullptr) {
+            if (window == 0 || session_ == nullptr) {
                 co_return;
             }
-            fut = actor_zeta::send(session_->address(),
-                                   &otterstax::session::query_session_t::close_window,
-                                   portal.window)
+            fut = actor_zeta::send(session_->address(), &otterstax::session::query_session_t::close_window, window)
                       .second;
         }
         auto r = co_await await_session(std::move(fut));
         if (r.has_error()) {
             log_->warn("[Connection {}] the window of a portal could not be closed: {}", connection_id_, r.error().what);
         }
-        portal.window = 0;
-        portal.done = true;
     }
 
     boost::asio::awaitable<postgres_connection::portal_iterator>
     postgres_connection::release_portal(portal_iterator it, bool close_windows) {
         if (close_windows) {
-            co_await close_window(it->second);
+            co_await close_window(it->second.window);
         }
-        OTX_ZONE_N("pg::release_portal"); // after the only co_await
-        co_return portals_.erase(it);
+        {
+            OTX_ZONE_N("pg::release_portal");
+            co_return portals_.erase(it);
+        }
     }
 
     boost::asio::awaitable<void> postgres_connection::release_portals(bool close_windows) {
@@ -1164,29 +1174,33 @@ namespace frontend::postgres {
 
     boost::asio::awaitable<void>
     postgres_connection::close_session_statement(otterstax::session::statement_id_t stmt_session) {
-        if (session_ == nullptr) {
-            co_return;
+        session_future fut;
+        {
+            OTX_ZONE_N("pg::close_session_statement");
+            if (session_ == nullptr) {
+                co_return;
+            }
+            // a query session schedules itself: needs_sched is always false
+            fut = actor_zeta::send(session_->address(),
+                                   &otterstax::session::query_session_t::close_statement,
+                                   stmt_session)
+                      .second;
         }
-        // a query session schedules itself: needs_sched is always false
-        [[maybe_unused]] auto [needs_sched, fut] = actor_zeta::send(session_->address(),
-                                                                    &otterstax::session::query_session_t::close_statement,
-                                                                    stmt_session);
         auto r = co_await await_session(std::move(fut));
         if (r.has_error()) {
             log_->warn("[Connection {}] close_statement failed: {}", connection_id_, r.error().what);
         }
     }
 
-    boost::asio::awaitable<std::optional<otterstax::session::statement_id_t>>
-    postgres_connection::portal_entry(const portal_meta& portal, bool& temporary) {
-        temporary = false;
+    boost::asio::awaitable<std::optional<postgres_connection::portal_entry_t>>
+    postgres_connection::portal_entry(const portal_meta& portal) {
         otterstax::session::statement_id_t id{};
         session_future fut;
         {
             OTX_ZONE_N("pg::portal_entry");
             if (auto it = statement_name_map_.find(portal.statement_name);
                 it != statement_name_map_.end() && it->second.run.stmt_session == portal.run.stmt_session) {
-                co_return portal.run.stmt_session;
+                co_return portal_entry_t{portal.run.stmt_session, false};
             }
             // The statement was DEALLOCATEd since the Bind: the portal prepares its
             // text again, as PostgreSQL's portal keeps its plan.
@@ -1202,8 +1216,7 @@ namespace frontend::postgres {
             send_session_error(r, "Syntax error: ");
             co_return std::nullopt;
         }
-        temporary = true;
-        co_return id;
+        co_return portal_entry_t{id, true};
     }
 
     boost::asio::awaitable<void> postgres_connection::handle_execute(std::string portal_name, int32_t limit) {
@@ -1231,11 +1244,10 @@ namespace frontend::postgres {
         const auto& run = portal.run;
         if (run.deallocate) {
             // run_deallocate may drop statements, never the portal this runs.
-            const auto statement = *run.deallocate;
-            const std::string sql{run.sql};
+            const bool all = !run.deallocate->name.has_value();
             portal.done = true;
-            if (co_await run_deallocate(statement, sql)) {
-                send_packet(build_command_complete(writer_, command_complete_tag::deallocate(!statement.name.has_value())));
+            if (co_await run_deallocate(*run.deallocate, std::string{run.sql})) {
+                send_packet(build_command_complete(writer_, command_complete_tag::deallocate(all)));
             }
             co_return;
         }
@@ -1279,19 +1291,18 @@ namespace frontend::postgres {
                                    count)
                       .second;
         } else {
-            bool temporary = false;
-            const auto entry = co_await portal_entry(portal, temporary);
+            const auto entry = co_await portal_entry(portal);
             if (!entry) {
                 co_await release_portal(it, false);
                 co_return;
             }
-            if (temporary) {
-                temporary_entry = entry;
+            if (entry->temporary) {
+                temporary_entry = entry->id;
             }
             if (limit > 0) {
                 fut = actor_zeta::send(session_->address(),
                                        &otterstax::session::query_session_t::execute_window,
-                                       *entry,
+                                       entry->id,
                                        otterstax::session::parameter_row(resource_, std::move(portal.params)),
                                        uint64_t{0},
                                        count)
@@ -1299,7 +1310,7 @@ namespace frontend::postgres {
             } else {
                 fut = actor_zeta::send(session_->address(),
                                        &otterstax::session::query_session_t::execute_prepared_statement,
-                                       *entry,
+                                       entry->id,
                                        otterstax::session::parameter_row(resource_, std::move(portal.params)),
                                        uint64_t{0})
                           .second;
@@ -1450,71 +1461,86 @@ namespace frontend::postgres {
     }
 
     boost::asio::awaitable<void> postgres_connection::handle_describe(describe_close_arg type, std::string name) {
-        log_->info("[Connection {}] DESCRIBE name: \"{}\" type:\"{}\"", connection_id_, name, static_cast<char>(type));
-
         std::vector<std::vector<uint8_t>> packets;
-        if (type == describe_close_arg::STATEMENT) {
-            auto it = statement_name_map_.find(name);
-            if (it == statement_name_map_.end()) {
-                send_error_response(sql_state::INVALID_SQL_STATAMENT_NAME, "Statement " + name + " does not exist");
-                co_return;
-            }
-            // A statement has no result formats yet (they come with Bind), so its
-            // RowDescription is text; ParameterDescription always precedes it.
-            auto& statement = it->second;
-            packets.emplace_back(build_parameter_description(writer_, statement.specified_types));
-            if (!do_describe(statement.run.schema, {result_encoding::TEXT}, packets, statement.described)) {
-                co_return;
-            }
-            // A portal already bound from it (Parse, Bind, Describe(statement),
-            // Execute): the client has the row shape now too.
-            for (auto& [portal_name, portal] : portals_) {
-                if (portal.statement_name == name && portal.run.stmt_session == statement.run.stmt_session) {
-                    portal.statement_described = statement.described;
+        // A portal the engine describes, below; every other Describe is
+        // answered in the block.
+        auto described = portals_.end();
+        {
+            OTX_ZONE_N("pg::handle_describe");
+            log_->info("[Connection {}] DESCRIBE name: \"{}\" type:\"{}\"",
+                       connection_id_,
+                       name,
+                       static_cast<char>(type));
+            if (type == describe_close_arg::STATEMENT) {
+                auto it = statement_name_map_.find(name);
+                if (it == statement_name_map_.end()) {
+                    send_error_response(sql_state::INVALID_SQL_STATAMENT_NAME, "Statement " + name + " does not exist");
+                    co_return;
                 }
+                // A statement has no result formats yet (they come with Bind), so its
+                // RowDescription is text; ParameterDescription always precedes it.
+                auto& statement = it->second;
+                packets.emplace_back(build_parameter_description(writer_, statement.specified_types));
+                if (!do_describe(statement.run.schema, {result_encoding::TEXT}, packets, statement.described)) {
+                    co_return;
+                }
+                // A portal already bound from it (Parse, Bind, Describe(statement),
+                // Execute): the client has the row shape now too.
+                for (auto& [portal_name, portal] : portals_) {
+                    if (portal.statement_name == name && portal.run.stmt_session == statement.run.stmt_session) {
+                        portal.statement_described = statement.described;
+                    }
+                }
+                send_packet_merged(std::move(packets));
+                co_return;
             }
-        } else {
             auto it = portals_.find(name);
             if (it == portals_.end()) {
                 send_error_response(sql_state::INVALID_NAME, "Portal " + name + " does not exist");
                 co_return;
             }
-            // A portal is a BOUND statement: the engine describes it with the
-            // Bind's values in it (a `$n` takes its value's type), and runs
-            // nothing — a DML described this way writes nothing.
             auto& portal = it->second;
             if (portal.run.frontend_only()) {
                 // A SHOW's one column, NoData for the others.
-                if (!do_describe(portal.run.schema, portal.format, packets, portal.described)) {
-                    co_return;
+                if (do_describe(portal.run.schema, portal.format, packets, portal.described)) {
+                    send_packet_merged(std::move(packets));
                 }
-            } else {
-                bool temporary = false;
-                const auto entry = co_await portal_entry(portal, temporary);
-                if (!entry) {
-                    co_return;
-                }
-                [[maybe_unused]] auto [needs_sched, fut] =
-                    actor_zeta::send(session_->address(),
-                                     &otterstax::session::query_session_t::describe_bound,
-                                     *entry,
-                                     copy_row(resource_, portal.params),
-                                     uint64_t{0});
-                auto r = co_await await_session(std::move(fut));
-                if (temporary) {
-                    co_await close_session_statement(*entry);
-                }
-                if (r.has_error()) {
-                    send_session_error(r, "");
-                    co_return;
-                }
-                if (!do_describe(r.value().schema, portal.format, packets, portal.described)) {
-                    co_return;
-                }
+                co_return;
+            }
+            described = it;
+        }
+        // A portal is a BOUND statement: the engine describes it with the
+        // Bind's values in it (a `$n` takes its value's type), and runs
+        // nothing — a DML described this way writes nothing.
+        auto& portal = described->second;
+        const auto entry = co_await portal_entry(portal);
+        if (!entry) {
+            co_return;
+        }
+        session_future fut;
+        {
+            OTX_ZONE_N("pg::handle_describe::bound");
+            fut = actor_zeta::send(session_->address(),
+                                   &otterstax::session::query_session_t::describe_bound,
+                                   entry->id,
+                                   copy_row(resource_, portal.params),
+                                   uint64_t{0})
+                      .second;
+        }
+        auto r = co_await await_session(std::move(fut));
+        if (entry->temporary) {
+            co_await close_session_statement(entry->id);
+        }
+        {
+            OTX_ZONE_N("pg::handle_describe::answer");
+            if (r.has_error()) {
+                send_session_error(r, "");
+                co_return;
+            }
+            if (do_describe(r.value().schema, portal.format, packets, portal.described)) {
+                send_packet_merged(std::move(packets));
             }
         }
-        OTX_ZONE_N("pg::handle_describe"); // after every co_await
-        send_packet_merged(std::move(packets));
     }
 
     bool postgres_connection::do_describe(const types::complex_logical_type& schema,

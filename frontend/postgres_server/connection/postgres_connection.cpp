@@ -241,199 +241,224 @@ namespace frontend::postgres {
         // protocol does not define (validate_payload_size) are FATAL.
         switch (message_type) {
             case message_type::frontend::QUERY: {
-                // The simple protocol answers ReadyForQuery itself, after the
-                // result or the error.
-                pipeline_.end_pipeline();
-                packet_reader reader(
-                    {std::make_move_iterator(payload.begin()), std::make_move_iterator(payload.end())});
-                std::string query = reader.read_string_null();
-                // The query text without its terminator.
-                if (!reader.ok()) {
-                    send_error_response(sql_state::PROTOCOL_VIOLATION, "Truncated QUERY message: unterminated query");
-                    co_return;
-                }
-                // Nothing may follow the terminator.
-                if (reader.remaining() != 0) {
-                    send_error_response(sql_state::PROTOCOL_VIOLATION, INVALID_MESSAGE_FORMAT);
-                    co_return;
-                }
+                std::string query;
+                {
+                    OTX_ZONE_N("pg::handle_packet::query");
+                    // The simple protocol answers ReadyForQuery itself, after the
+                    // result or the error.
+                    pipeline_.end_pipeline();
+                    packet_reader reader(
+                        {std::make_move_iterator(payload.begin()), std::make_move_iterator(payload.end())});
+                    query = reader.read_string_null();
+                    // The query text without its terminator.
+                    if (!reader.ok()) {
+                        send_error_response(sql_state::PROTOCOL_VIOLATION,
+                                            "Truncated QUERY message: unterminated query");
+                        co_return;
+                    }
+                    // Nothing may follow the terminator.
+                    if (reader.remaining() != 0) {
+                        send_error_response(sql_state::PROTOCOL_VIOLATION, INVALID_MESSAGE_FORMAT);
+                        co_return;
+                    }
 
-                if (query.empty()) {
-                    std::vector<std::vector<uint8_t>> response;
-                    response.emplace_back(build_empty_query_response(writer_));
-                    append_ready_for_query(response);
-                    send_packet_merged(std::move(response));
-                    break;
-                }
+                    if (query.empty()) {
+                        std::vector<std::vector<uint8_t>> response;
+                        response.emplace_back(build_empty_query_response(writer_));
+                        append_ready_for_query(response);
+                        send_packet_merged(std::move(response));
+                        co_return;
+                    }
 
-                log_->info("[Connection {}] QUERY message: '{}'", connection_id_, query);
+                    log_->info("[Connection {}] QUERY message: '{}'", connection_id_, query);
+                }
                 co_await handle_query(std::move(query));
                 break;
             }
             case message_type::frontend::PARSE: {
-                pipeline_.begin_pipeline();
-                packet_reader reader(
-                    {std::make_move_iterator(payload.begin()), std::make_move_iterator(payload.end())});
+                std::string stmt;
+                std::string query;
+                int16_t num_params = 0;
+                std::optional<packet_reader> reader;
+                {
+                    OTX_ZONE_N("pg::handle_packet::parse");
+                    pipeline_.begin_pipeline();
+                    reader.emplace(std::vector<uint8_t>{std::make_move_iterator(payload.begin()),
+                                                        std::make_move_iterator(payload.end())});
 
-                if (!reader.remaining()) {
-                    send_error_response(sql_state::PROTOCOL_VIOLATION, "Truncated PARSE message statement name");
-                    co_return;
+                    if (!reader->remaining()) {
+                        send_error_response(sql_state::PROTOCOL_VIOLATION, "Truncated PARSE message statement name");
+                        co_return;
+                    }
+
+                    stmt = reader->read_string_null();
+                    if (!reader->remaining()) {
+                        send_error_response(sql_state::PROTOCOL_VIOLATION, "Truncated PARSE message query");
+                        co_return;
+                    }
+
+                    query = reader->read_string_null();
+                    if (reader->remaining() < 2) {
+                        send_error_response(sql_state::PROTOCOL_VIOLATION, "Truncated PARSE message parameters");
+                        co_return;
+                    }
+
+                    num_params = reader->read_int16();
+                    if (reader->remaining() < 4 * num_params) {
+                        send_error_response(sql_state::PROTOCOL_VIOLATION, "Truncated PARSE message parameter types");
+                        co_return;
+                    }
+
+                    // A string above without its terminator.
+                    if (!reader->ok()) {
+                        send_error_response(sql_state::PROTOCOL_VIOLATION, "Truncated PARSE message");
+                        co_return;
+                    }
                 }
-
-                auto stmt = reader.read_string_null();
-                if (!reader.remaining()) {
-                    send_error_response(sql_state::PROTOCOL_VIOLATION, "Truncated PARSE message query");
-                    co_return;
-                }
-
-                auto query = reader.read_string_null();
-                if (reader.remaining() < 2) {
-                    send_error_response(sql_state::PROTOCOL_VIOLATION, "Truncated PARSE message parameters");
-                    co_return;
-                }
-
-                auto num_params = reader.read_int16();
-                if (reader.remaining() < 4 * num_params) {
-                    send_error_response(sql_state::PROTOCOL_VIOLATION, "Truncated PARSE message parameter types");
-                    co_return;
-                }
-
-                // A string above without its terminator.
-                if (!reader.ok()) {
-                    send_error_response(sql_state::PROTOCOL_VIOLATION, "Truncated PARSE message");
-                    co_return;
-                }
-
-                co_await handle_parse(std::move(stmt), std::move(query), num_params, std::move(reader));
+                co_await handle_parse(std::move(stmt), std::move(query), num_params, std::move(*reader));
                 break;
             }
             case message_type::frontend::BIND: {
-                pipeline_.begin_pipeline();
-                packet_reader reader(
-                    {std::make_move_iterator(payload.begin()), std::make_move_iterator(payload.end())});
-
-                if (!reader.remaining()) {
-                    send_error_response(sql_state::PROTOCOL_VIOLATION, "Truncated BIND portal name");
-                    co_return;
-                }
-
-                auto portal_name = reader.read_string_null();
-                if (!reader.remaining()) {
-                    send_error_response(sql_state::PROTOCOL_VIOLATION,
-                                        "Truncated BIND message prepared statement name");
-                    co_return;
-                }
-
-                auto stmt = reader.read_string_null();
-                if (reader.remaining() < 2) {
-                    send_error_response(sql_state::PROTOCOL_VIOLATION,
-                                        "Truncated BIND message parameter format codes");
-                    co_return;
-                }
-
-                auto format_len = reader.read_int16();
-                if (reader.remaining() < 2 * format_len) {
-                    send_error_response(sql_state::PROTOCOL_VIOLATION,
-                                        "Truncated BIND message parameter format codes");
-                    co_return;
-                }
-
+                std::string portal_name;
+                std::string stmt;
                 std::vector<result_encoding> format;
-                format.reserve(format_len);
-                for (int16_t i = 0; i < format_len; ++i) {
-                    format.emplace_back(static_cast<result_encoding>(reader.read_int16()));
-                }
+                int16_t num_params = 0;
+                std::optional<packet_reader> reader;
+                {
+                    OTX_ZONE_N("pg::handle_packet::bind");
+                    pipeline_.begin_pipeline();
+                    reader.emplace(std::vector<uint8_t>{std::make_move_iterator(payload.begin()),
+                                                        std::make_move_iterator(payload.end())});
 
-                if (reader.remaining() < 2) {
-                    send_error_response(sql_state::PROTOCOL_VIOLATION, "Truncated BIND message parameter values");
-                    co_return;
-                }
+                    if (!reader->remaining()) {
+                        send_error_response(sql_state::PROTOCOL_VIOLATION, "Truncated BIND portal name");
+                        co_return;
+                    }
 
-                auto num_params = reader.read_int16();
-                // A string above without its terminator.
-                if (!reader.ok()) {
-                    send_error_response(sql_state::PROTOCOL_VIOLATION, "Truncated BIND message");
-                    co_return;
-                }
+                    portal_name = reader->read_string_null();
+                    if (!reader->remaining()) {
+                        send_error_response(sql_state::PROTOCOL_VIOLATION,
+                                            "Truncated BIND message prepared statement name");
+                        co_return;
+                    }
 
+                    stmt = reader->read_string_null();
+                    if (reader->remaining() < 2) {
+                        send_error_response(sql_state::PROTOCOL_VIOLATION,
+                                            "Truncated BIND message parameter format codes");
+                        co_return;
+                    }
+
+                    auto format_len = reader->read_int16();
+                    if (reader->remaining() < 2 * format_len) {
+                        send_error_response(sql_state::PROTOCOL_VIOLATION,
+                                            "Truncated BIND message parameter format codes");
+                        co_return;
+                    }
+
+                    format.reserve(format_len);
+                    for (int16_t i = 0; i < format_len; ++i) {
+                        format.emplace_back(static_cast<result_encoding>(reader->read_int16()));
+                    }
+
+                    if (reader->remaining() < 2) {
+                        send_error_response(sql_state::PROTOCOL_VIOLATION, "Truncated BIND message parameter values");
+                        co_return;
+                    }
+
+                    num_params = reader->read_int16();
+                    // A string above without its terminator.
+                    if (!reader->ok()) {
+                        send_error_response(sql_state::PROTOCOL_VIOLATION, "Truncated BIND message");
+                        co_return;
+                    }
+                }
                 co_await handle_bind(std::move(stmt),
                                      std::move(portal_name),
                                      std::move(format),
                                      num_params,
-                                     std::move(reader));
+                                     std::move(*reader));
                 break;
             }
             case message_type::frontend::EXECUTE: {
-                pipeline_.begin_pipeline();
-                packet_reader reader(
-                    {std::make_move_iterator(payload.begin()), std::make_move_iterator(payload.end())});
+                std::string portal;
+                int32_t limit = 0;
+                {
+                    OTX_ZONE_N("pg::handle_packet::execute");
+                    pipeline_.begin_pipeline();
+                    packet_reader reader(
+                        {std::make_move_iterator(payload.begin()), std::make_move_iterator(payload.end())});
 
-                if (!reader.remaining()) {
-                    send_error_response(sql_state::PROTOCOL_VIOLATION, "Truncated EXECUTE message statement name");
-                    co_return;
-                }
+                    if (!reader.remaining()) {
+                        send_error_response(sql_state::PROTOCOL_VIOLATION, "Truncated EXECUTE message statement name");
+                        co_return;
+                    }
 
-                auto portal = reader.read_string_null();
-                if (reader.remaining() < 4) {
-                    send_error_response(sql_state::PROTOCOL_VIOLATION, "Truncated EXECUTE message row limit");
-                    co_return;
-                }
+                    portal = reader.read_string_null();
+                    if (reader.remaining() < 4) {
+                        send_error_response(sql_state::PROTOCOL_VIOLATION, "Truncated EXECUTE message row limit");
+                        co_return;
+                    }
 
-                auto limit = reader.read_int32();
-                // The portal name without its terminator.
-                if (!reader.ok()) {
-                    send_error_response(sql_state::PROTOCOL_VIOLATION, "Truncated EXECUTE message");
-                    co_return;
+                    limit = reader.read_int32();
+                    // The portal name without its terminator.
+                    if (!reader.ok()) {
+                        send_error_response(sql_state::PROTOCOL_VIOLATION, "Truncated EXECUTE message");
+                        co_return;
+                    }
+                    // Nothing may follow the row limit.
+                    if (reader.remaining() != 0) {
+                        send_error_response(sql_state::PROTOCOL_VIOLATION, INVALID_MESSAGE_FORMAT);
+                        co_return;
+                    }
                 }
-                // Nothing may follow the row limit.
-                if (reader.remaining() != 0) {
-                    send_error_response(sql_state::PROTOCOL_VIOLATION, INVALID_MESSAGE_FORMAT);
-                    co_return;
-                }
-
                 co_await handle_execute(std::move(portal), limit);
                 break;
             }
             case message_type::frontend::CLOSE: // fall-through
             case message_type::frontend::DESCRIBE: {
-                pipeline_.begin_pipeline();
-                packet_reader reader(
-                    {std::make_move_iterator(payload.begin()), std::make_move_iterator(payload.end())});
+                const bool is_close = message_type == message_type::frontend::CLOSE;
+                auto arg = describe_close_arg::STATEMENT;
+                std::string name;
+                {
+                    OTX_ZONE_N("pg::handle_packet::close_describe");
+                    pipeline_.begin_pipeline();
+                    packet_reader reader(
+                        {std::make_move_iterator(payload.begin()), std::make_move_iterator(payload.end())});
 
-                bool is_close = message_type == message_type::frontend::CLOSE;
-                std::string str = is_close ? "CLOSE" : "DESCRIBE";
-                if (!reader.remaining()) {
-                    send_error_response(sql_state::PROTOCOL_VIOLATION, "Truncated " + str + " message type");
-                    co_return;
-                }
+                    std::string str = is_close ? "CLOSE" : "DESCRIBE";
+                    if (!reader.remaining()) {
+                        send_error_response(sql_state::PROTOCOL_VIOLATION, "Truncated " + str + " message type");
+                        co_return;
+                    }
 
-                char type = reader.read_uint8();
-                if (type != static_cast<char>(describe_close_arg::PORTAL) &&
-                    type != static_cast<char>(describe_close_arg::STATEMENT)) {
-                    send_error_response(sql_state::PROTOCOL_VIOLATION,
-                                        std::string("Unknown ") + str +
-                                            " statement/portal type: " + std::to_string(type));
-                    co_return;
-                }
+                    char type = reader.read_uint8();
+                    if (type != static_cast<char>(describe_close_arg::PORTAL) &&
+                        type != static_cast<char>(describe_close_arg::STATEMENT)) {
+                        send_error_response(sql_state::PROTOCOL_VIOLATION,
+                                            std::string("Unknown ") + str +
+                                                " statement/portal type: " + std::to_string(type));
+                        co_return;
+                    }
 
-                if (!reader.remaining()) {
-                    send_error_response(sql_state::PROTOCOL_VIOLATION, "Truncated " + str + " message name");
-                    co_return;
-                }
+                    if (!reader.remaining()) {
+                        send_error_response(sql_state::PROTOCOL_VIOLATION, "Truncated " + str + " message name");
+                        co_return;
+                    }
 
-                auto arg = static_cast<describe_close_arg>(type);
-                auto name = reader.read_string_null();
-                // The name without its terminator.
-                if (!reader.ok()) {
-                    send_error_response(sql_state::PROTOCOL_VIOLATION, "Truncated " + str + " message");
-                    co_return;
+                    arg = static_cast<describe_close_arg>(type);
+                    name = reader.read_string_null();
+                    // The name without its terminator.
+                    if (!reader.ok()) {
+                        send_error_response(sql_state::PROTOCOL_VIOLATION, "Truncated " + str + " message");
+                        co_return;
+                    }
+                    // Nothing may follow the name.
+                    if (reader.remaining() != 0) {
+                        send_error_response(sql_state::PROTOCOL_VIOLATION, INVALID_MESSAGE_FORMAT);
+                        co_return;
+                    }
                 }
-                // Nothing may follow the name.
-                if (reader.remaining() != 0) {
-                    send_error_response(sql_state::PROTOCOL_VIOLATION, INVALID_MESSAGE_FORMAT);
-                    co_return;
-                }
-
                 if (is_close) {
                     co_await handle_close(arg, std::move(name));
                 } else {

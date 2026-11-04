@@ -83,7 +83,10 @@ namespace frontend::mysql {
 
         // Every handler that awaits the session is a coroutine on the
         // connection's strand (frontend_connection::run_handler): waiting for
-        // a statement holds no thread of the server's pool.
+        // a statement holds no thread of the server's pool. The coroutines take
+        // their arguments by value (serve_protocol_statement's `query` is read
+        // before its first suspension only): nothing they await from refers
+        // into the connection's statement map.
         using session_future = actor_zeta::unique_future<otterstax::session::query_session_t::session_result>;
 
         boost::asio::awaitable<void> handle_auth(std::vector<uint8_t> payload);
@@ -109,13 +112,13 @@ namespace frontend::mysql {
         // refusal — the frontend's, the engine's parser's or the engine's — is
         // the ERR packet with nothing applied, else an OK packet; only then is
         // what the engine accepted remembered (autocommit_, time_zone_).
-        boost::asio::awaitable<void> answer_setting(const set_variables_t& set);
+        boost::asio::awaitable<void> answer_setting(set_variables_t set);
         // SET search_path = '<database>.public' on the engine: an OK packet and
         // database_ remembered, or the ERR packet — ER_BAD_DB_ERROR for a
         // database or schema that does not exist, any other refusal as
         // send_statement_error answers a statement. False when the engine
         // refused (the ERR packet went out).
-        boost::asio::awaitable<bool> answer_use(const std::string& database, bool answer_ok);
+        boost::asio::awaitable<bool> answer_use(std::string database, bool answer_ok);
         // Awaits a statement of the frontend's own (a SET, a USE) on the
         // session; false after the ERR packet went out: the bridge's own
         // failures (answer_await_failure), ER_BAD_DB_ERROR for a missing
@@ -160,7 +163,7 @@ namespace frontend::mysql {
         // COM_STMT_EXECUTE of a prepared protocol statement: its answer as a
         // binary resultset or an OK / ERR packet (a SET / USE: the engine's); the
         // parameters are not read.
-        boost::asio::awaitable<void> execute_protocol_statement(const protocol_statement_t& statement);
+        boost::asio::awaitable<void> execute_protocol_statement(protocol_statement_t statement);
 
         // The COM_STMT_EXECUTE values, `$<i+1>` at i, each a one-row vector.
         std::pmr::vector<components::vector::vector_t>
@@ -171,7 +174,10 @@ namespace frontend::mysql {
         // Drops an unexecuted statement in the session; a failure is logged only.
         boost::asio::awaitable<void> close_stmt_in_session(otterstax::session::statement_id_t stmt_session,
                                                            const char* reason);
-        boost::asio::awaitable<void> handle_execute_stmt(prepared_stmt_meta& stmt,
+        // COM_STMT_EXECUTE of the session's `stmt_session`, or of the prepared
+        // protocol statement `protocol` (the frontend's answer).
+        boost::asio::awaitable<void> handle_execute_stmt(otterstax::session::statement_id_t stmt_session,
+                                                         std::optional<protocol_statement_t> protocol,
                                                          std::pmr::vector<components::vector::vector_t> param_values);
 
         void send_resultset(mysql_resultset&& result);

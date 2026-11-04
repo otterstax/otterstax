@@ -35,9 +35,11 @@ namespace frontend {
         // configuration error (asserted).
         std::chrono::milliseconds accept_retry_delay;
         // Threads of the server's asio pool (service.runtime.mysql_io /
-        // postgres_io, resolved by main.cpp). A connection holds one while
-        // its statement runs, so this bounds the statements in flight over the
-        // wire. No default — zero threads would serve nothing (asserted).
+        // postgres_io, resolved by main.cpp). A connection holds one only while
+        // it reads, writes or works on a message: waiting for its statement it
+        // holds none (frontend_connection::run_handler), so this bounds no
+        // statements in flight. No default — zero threads would serve nothing
+        // (asserted).
         size_t pool_size;
     };
 

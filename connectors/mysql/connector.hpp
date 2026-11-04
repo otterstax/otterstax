@@ -163,7 +163,7 @@ namespace mysql {
         core::error_t connectWithTimeout(boost::mysql::diagnostics& diag);
 
         // The connect itself: one async_connect under the deadline, awaited on
-        // conn_'s strand. On failure the error is io_error carrying
+        // the connection's strand (strand_). On failure the error is io_error carrying
         // ec.message(); `diag` (the caller's) carries the server message. No
         // Tracy zone: the coroutine suspends at its co_await and resumes inside
         // connectWithTimeout's run_one_for (or on a test's pool thread).
@@ -189,14 +189,15 @@ namespace mysql {
         core::error_t cancelled_error() const;
 
         // The statement runs on the connection's strand (cancel() delivers its signal there): the
-        // caller's coroutine, spawned on the io_context, awaits it.
+        // caller's coroutine, spawned on the io_context, awaits it. strand_, never
+        // conn_.get_executor(): a reconnect replaces the stream that executor is read from.
         template<typename Callable>
         requires std::invocable<Callable, const boost::mysql::results&>
             asio::awaitable<otterstax::query_result_t<std::invoke_result_t<Callable, const boost::mysql::results&>>>
             runQuery_(std::string_view query, Callable handler) {
             // optional: co_spawn's completion value must be default-constructible, and the outcome
             // (core::error_t inside) is not. It always holds a value once the statement returned.
-            auto outcome = co_await asio::co_spawn(conn_.get_executor(),
+            auto outcome = co_await asio::co_spawn(strand_,
                                                    runOnStrand_(std::string{query}, std::move(handler)),
                                                    asio::use_awaitable);
             co_return std::move(*outcome);

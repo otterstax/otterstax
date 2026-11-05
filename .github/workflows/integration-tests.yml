@@ -42,3 +42,10 @@ jobs:
           IMAGE_TAG: ci-${{ github.sha }}
           SPARK_CLIENT_IMAGE: otterstax_spark_client:ci-${{ github.sha }}
         run: ./docker-run-tests.sh
+
+      # docker-run-tests.sh brings the stack down only on a normal finish; after a
+      # failed step or a killed job the backends (restart: unless-stopped) stay up
+      # on the runner and come back after every daemon restart.
+      - name: Tear down test stack
+        if: always()
+        run: docker compose -f compose.test.yml down --volumes --remove-orphans || true

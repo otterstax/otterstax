@@ -15,10 +15,13 @@ import config
 # GetTables lists the engine's catalog, local and remote tables alike
 # (frontend/flight_sql/session_engine.cpp, SessionEngine::tables): a catalog is
 # a database as SQL writes it — `d` for a local one, `c.d` for the database d of
-# the connection c (tests/scripts/config.yaml). Only the backend's catalogs are
-# validated here, so a local table of the same name — or one whose column Arrow
-# cannot carry, whose table_schema is NULL — never stands in for a backend table.
-BACKEND_CATALOGS = {f"{config.CH_ALIAS}.{config.CH_DATABASE}"}
+# the connection c. A ClickHouse connection's database is `def`
+# (catalog::def_database) and its database chdb is the schema under it, so the
+# catalog here is `chtest.def` (tests/scripts/config.yaml). Only the backend's
+# catalogs are validated here, so a local table of the same name — or one whose
+# column Arrow cannot carry, whose table_schema is NULL — never stands in for a
+# backend table.
+BACKEND_CATALOGS = {f"{config.CH_ALIAS}.def"}
 
 
 def validate_table_schemas(client, expected_schemas):

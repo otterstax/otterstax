@@ -20,7 +20,7 @@ namespace frontend::mysql {
         , sequence_id_(0)
         , next_statement_id_(0)
         , client_max_packet_size_(DEFAULT_MAX_PACKET_SIZE)
-        , session_(sessions.open())
+        , session_(sessions.open(otterstax::session::database_term_t::schema))
         , state_(connection_state::HANDSHAKE)
         , log_(get_logger(logger_tag::MYSQL_CONNECTION)) {
         assert(log_.is_valid());
@@ -160,8 +160,7 @@ namespace frontend::mysql {
         // The write is initiated before the close is posted, so the ERR packet
         // reaches the client ahead of the FIN (the same order the PG frontend
         // relies on for a FATAL ErrorResponse).
-        send_packet(build_error(writer_, sequence_id_++, mysql_error::ER_MALFORMED_PACKET, std::move(message)),
-                    false);
+        send_packet(build_error(writer_, sequence_id_++, mysql_error::ER_MALFORMED_PACKET, std::move(message)), false);
         finish();
     }
 } // namespace frontend::mysql

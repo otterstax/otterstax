@@ -11,7 +11,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ### `parser/`
 
 `IParser` / `GreenplumParser` — thin interface over the Otterbrix SQL parser: the engine's `raw_parser` (with the s3 / file / kafka extensions registered) and transformer over the statement text as written. `parse()` returns `core::result_wrapper_t<ParsedQueryDataPtr>` (a refusal is the engine's error, never an exception) which carries:
-- `plan` (`ExecutionPlanPtr`, `types/otterbrix.hpp`: the engine's `execution_plan_t` — its root `plan_root()`, the flattened sub-queries ahead of it, the catalog lookups the transformer registered, the parameter node); every name is the name the client wrote, 1–4 parts (`t`, `s.t`, `d.s.t` local, `c.d.s.t` a connection's table), resolved by the engine. For a statement still awaiting its Bind, the describe plan (`finalize_for_describe`: every `$n` unbound)
+- `plan` (`ExecutionPlanPtr`, `types/otterbrix.hpp`: the engine's `execution_plan_t` — its root `plan_root()`, the flattened sub-queries ahead of it, the catalog lookups the transformer registered, the parameter node); every name is the name the client wrote, up to three parts (`t`, `s.t` completed by the place, `uid.ns.t` a connection's table, `local.ns.t` local — four parts are refused), resolved by the engine. For a statement still awaiting its Bind, the describe plan (`finalize_for_describe`: every `$n` unbound)
 - `binder()` (`transform_result`) — binds the client's values and finalizes the statement (`query_session_t::parse_bound`)
 - `sql` — the text, which the query session parses again to run a statement a second time (a plan is single-use: a prepared statement's executions, the registration retry)
 - `tag`, `extension_kind`, `awaiting_bind`
@@ -33,9 +33,9 @@ The Kafka DDL grammar extension (library `kafka_grammar`): a self-contained
 flex+bison pair (`kafka_yy` prefix, isolated from the core parser) producing a
 `kafka_node_t` for `CREATE/DROP SOURCE/STREAM` (DROP takes `[IF EXISTS] <name>
 [CASCADE | RESTRICT]`, RESTRICT by default — `kafka_node_t::cascade()`), registered into `GreenplumParser`
-via `make_kafka_extension()`. Also defines the Kafka names (`kafka_table_name`: `main.kafka.<obj>`;
+via `make_kafka_extension()`. Also defines the Kafka names (`kafka_table_name`: `local.kafka.<obj>`;
 `kafka_service_table_name` / `kafka_offsets_table_name`: `federation.kafka.*`), `kafka_write_target`
-(an INSERT whose written target can name `main.kafka.<obj>`) with `kafka_target_named` (the target
+(an INSERT whose written target can name `local.kafka.<obj>`) with `kafka_target_named` (the target
 completed by the session's place), and `kafka_stream_source` / `kafka_find_aggregate` (stream plan helpers). Namespace `otterstax::kafka`. The Kafka **runtime** that
 consumes these nodes lives in `integration/kafka/` — see its CLAUDE.md.
 
@@ -247,7 +247,7 @@ extension when `format=` is omitted).
 - `sql_plan` — one bookkeeping SQL statement through the engine's own parser and transformer.
 - `send_plan` — one plan on a session. (A statement that failed before the engine is reported by the query session itself, `manager_dispatcher_t::refuse_statement`, so it fails an open transaction.)
 - `execute_statement` — runs a parsed statement (`ExecutionPlanPtr`) and holds the answer to the shape its root owes: a DML without RETURNING answers its count through `cursor->affected_rows()` (a write to a remote table too: the backend's count for a statement the backend actor ran whole, otherwise the rows the engine handed the storage; `federation/CLAUDE.md`), a row-producing statement without columns is `internal_error`. Every cursor carries the engine's transaction status and window (`transaction_status()`, `portal_id()`, `has_more()`). A describe is the engine's own (`session/CLAUDE.md`).
-- `create_table_plan` / `load_table` — the load behind CREATE EXTERNAL TABLE, on the session it is given (the query session passes its connection's): CREATE TABLE of the target as written (1–4 parts, its empty slots the session's place; the database is not created, a missing schema and an existing relation are the engine's refusals — `table_already_exists`), a column without a name or an empty run `invalid_parameter`; then the insert of the loader's run (each chunk within the chunk contract); `own_block` wraps both in BEGIN / COMMIT, ROLLBACK on a failure, the answer carrying the status the session is left in.
+- `create_table_plan` / `load_table` — the load behind CREATE EXTERNAL TABLE, on the session it is given (the query session passes its connection's): CREATE TABLE of the target as written (up to three parts, its empty slots the session's place; the database is not created, a missing schema and an existing relation are the engine's refusals — `table_already_exists`), a column without a name or an empty run `invalid_parameter`; then the insert of the loader's run (each chunk within the chunk contract); `own_block` wraps both in BEGIN / COMMIT, ROLLBACK on a failure, the answer carrying the status the session is left in.
 
 The engine evaluates aggregates over constants correctly, so no plan rewrite or guard stands in front of it (`tests/system/test_constant_aggregates.cpp` pins the engine's answers). `tests/system/test_engine_requests.cpp` and `tests/system/test_external_registration.cpp` cover these over a real engine.
 

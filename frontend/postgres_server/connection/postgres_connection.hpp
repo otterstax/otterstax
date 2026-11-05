@@ -251,6 +251,8 @@ namespace frontend::postgres {
         boost::asio::awaitable<otterstax::awaited_t<session_payload>> await_session(session_future fut);
         // `sql` executed on the session, through await_session.
         boost::asio::awaitable<otterstax::awaited_t<session_payload>> execute_own(std::string sql);
+        // Places the session where the client named (query_session_t::use).
+        boost::asio::awaitable<otterstax::awaited_t<session_payload>> use_own(std::string named);
         // The block is failed ('E'): the session's, or a failure sent to it and
         // not yet seen applied.
         bool block_aborted() const;

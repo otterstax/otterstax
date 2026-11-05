@@ -55,14 +55,15 @@ connections:
 - `port` is an optional string (empty = driver default). `pool_size` (backends, default 4,
   `config::default_pool_size`) = agents of the connection, one physical connection each.
 - `schema` (PostgreSQL): a name = only that schema, empty = every user schema of the database.
-  MySQL / ClickHouse connections have the one schema `public`.
+  A MySQL / ClickHouse connection sees every user database of its server (each a namespace);
+  its `database:` is the connection's default namespace (and, with `table:`, that table's database).
 - `table`: a name makes the connection **that table only** — the startup discovery and its
   reconciliation keep it alone, and a statement missing another table of the connection gets its
   own miss (no discovery is asked); empty = every base table.
 - `alias`: the first part of a remote name and the connection's name in otterbrix. A backend
   alias must be an unquoted identifier `[a-z_][a-z0-9_]*`; backend aliases are one namespace
-  (mysql / postgresql / clickhouse together), s3 aliases another (any spelling). `federation` and
-  `main` are reserved (any case, any section).
+  (mysql / postgresql / clickhouse together), s3 aliases another (any spelling). `local`,
+  `federation` and `main` are reserved (any case, any section).
 - Refused at load (stderr, exit 1): malformed YAML, a section that is not a mapping, an unknown
   key at any level (`unknown key "pool_sise" in connections.mysql[0]`), an incomplete entry, a bad
   port / `pool_size` / thread count, a reserved, malformed or duplicate alias.
@@ -254,7 +255,9 @@ Frontend (MySQL / PostgreSQL / Flight SQL / Spark Connect)          frontend/CLA
 ```
 
 - **Registration.** At startup `catalog::register_connections` turns the discovery into otterbrix
-  catalog rows — `CREATE DATABASE c.d`, `CREATE SCHEMA c.d.s`, `CREATE TABLE c.d.s.t`, lower case — on
+  catalog rows — `CREATE DATABASE c.d` (one per connection: PostgreSQL its `database:`, MySQL /
+  ClickHouse `def`), `CREATE SCHEMA c.d.ns` (a namespace of the backend: PostgreSQL schema, MySQL /
+  ClickHouse database), `CREATE TABLE c.d.ns.t`, lower case — on
   the actors' registration session, so no SQL reaches a backend; the backend's own spelling is the
   actor's, kept in `federation.public.remote_names`. A restart reconciles the catalog with the new
   discovery (new tables registered, gone ones dropped, changed columns altered). A statement that
@@ -310,26 +313,44 @@ actor-zeta 2.0: no blocking `get()` / `wait()` on a future, no `co_await` outsid
 
 ### Names
 
-Names are otterbrix's, as written (unquoted identifiers fold to lower case):
+A table is `connection.namespace.table`: the first part is always a connection, or `local` for the
+clients' own tables (unquoted identifiers fold to lower case).
 
 | Written | Means |
 |---------|-------|
-| `c.d.s.t` | table `t` of connection `c` (its database `d`, schema `s`: `public` on MySQL / ClickHouse) |
-| `d.s.t` | a **local** table (three parts are always local) |
-| `s.t`, `t` | completed by the session's place, `search_path` (default `main.public`) |
+| `uid.ns.t` | table `t` of connection `uid`; `ns` is the backend's database on MySQL / ClickHouse, its schema on PostgreSQL (whose database is the connection's `database:`) |
+| `local.ns.t` | a local table: `local` is the engine database of the clients' tables, `ns` its schema |
+| `s.t`, `t` | completed by the session's place — only one the client chose (below); without it, refused |
 
 ```sql
-SELECT o.id, c.name
-FROM mysql.bill.public.orders o JOIN pg.shop.shop.customers c ON o.customer_id = c.id;
+SELECT o.id, c.name FROM mysql.bill.orders o JOIN pg.shop.customers c ON o.customer_id = c.id;
 ```
 
-- A column may be qualified by every suffix of its table's name (`c.d.s.t.col`).
-- PostgreSQL wire: the StartupMessage `database` sets `search_path = '<db>.public'`; a database the
-  engine does not have is `FATAL 3D000` with the hint `The default database is "main".` — clients
-  connect with `dbname=main`. MySQL: the handshake database / `USE` / `COM_INIT_DB` set the same.
-- Flight SQL catalogs are `d` (local) and `c.d` (a connection's database); a Spark database is a
-  schema (`d.s` / `c.d.s`).
-- `CREATE DATABASE <alias>` and DDL / DML on `federation.*` are refused (`catalog/ownership.hpp`).
+- Through one connection every backend names two levels — PostgreSQL a schema of the database the
+  connection is open on (it reads no other database), MySQL / ClickHouse a database of the server —
+  so the alias is the SQL catalog and every name has three parts. Four parts are refused
+  (`a table is named connection.namespace.table`, `query_session_t::guard_ownership`).
+- Layout: a connection is one engine database (PostgreSQL: its `database:`; MySQL / ClickHouse: `def`,
+  `catalog::def_database`), its namespaces that database's schemas; otterbrix reads a first part that
+  is a connection as that database (`lookup_database`), so nothing rewrites a name. A MySQL /
+  ClickHouse connection sees every user database of its server.
+- A column is qualified by at most `uid.ns.t.col`; a table under an alias by its alias only.
+- **The place** is the client's choice: the PostgreSQL StartupMessage `database`, the MySQL handshake
+  database / `USE` / `COM_INIT_DB`, Spark's current database name `uid` (its default namespace:
+  PostgreSQL's configured schema or `public`, MySQL / ClickHouse's configured database), `uid.ns`,
+  `local` (`local.public`) or `local.ns` (`catalog::client_place`, `query_session_t::use`); anything else
+  is `FATAL 3D000`. A session that named none has no place: the startup sets
+  `ALTER SYSTEM SET search_path = ''`, and a name of one or two parts is refused.
+- Namespace DDL lands in `local`: `CREATE / DROP SCHEMA x` is `local.x` wherever the session stands;
+  `CREATE / DROP DATABASE x` is `local.x` for a MySQL or Spark client (its database is a schema) and
+  refused for a PostgreSQL or Flight SQL one (its database is a connection; connections come from
+  config.yaml) — `plan::place_namespace_ddl` (`session/query_session.hpp`).
+- `local`, `main` and `federation` are reserved aliases; an alias that is the name of an existing
+  local database is refused at startup (`catalog::register_connections`). No client makes or drops an
+  engine database (the namespace DDL above), so a connection's and OtterStax's own are out of its
+  reach; DDL / DML on `federation.*` and a DROP of `local.kafka` are refused (`catalog/ownership.hpp`).
+- Flight SQL catalogs are still `d` (local) and `c.d` (a connection's database); a Spark database is
+  `uid.ns` / `local.ns`.
 
 ## Profiling Instrumentation (Tracy) — MANDATORY
 
@@ -356,7 +377,7 @@ Every main function MUST carry a Tracy zone: an actor handler (every method in `
 ## External Tables — File & S3
 
 ```sql
-CREATE EXTERNAL TABLE eg.regions                       -- t, s.t, d.s.t or c.d.s.t, as CREATE TABLE
+CREATE EXTERNAL TABLE eg.regions                       -- t, s.t or x.s.t (three parts), as CREATE TABLE
     WITH (s3_alias = 'rustfs1', location = 's3://bucket/regions.parquet', format = 'parquet');
 CREATE EXTERNAL TABLE eg.weights WITH (location = '/fixtures/weights.csv');   -- format from the extension
 COPY (SELECT * FROM eg.regions) TO 's3://bucket/out/regions.csv' WITH (s3_alias = 'rustfs1', format = 'csv');
@@ -385,9 +406,10 @@ silently: declare a local column `bigint` against parquet's int64, and widen or 
 ## Kafka
 
 `CREATE / DROP SOURCE | STREAM` (grammar `otterbrix/parser/grammar_extension/kafka/`, runtime
-`integration/kafka/`, `KafkaManager`). The objects are tables of the schema `main.kafka`
-(`main.kafka.<obj>`); the bookkeeping is `federation.kafka.__sources` / `<source>__offsets`. An
-INSERT whose target, completed by the session's place, is `main.kafka.<obj>` produces to Kafka.
+`integration/kafka/`, `KafkaManager`). The objects are tables of the schema `local.kafka`
+(`local.kafka.<obj>`, `kafka.<obj>` from a place in `local`); the bookkeeping is
+`federation.kafka.__sources` / `<source>__offsets`. An INSERT whose target, completed by the
+session's place, is `local.kafka.<obj>` produces to Kafka.
 `integration/kafka/CLAUDE.md`.
 
 ## Directory Map
@@ -450,12 +472,12 @@ INSERT whose target, completed by the session's place, is `main.kafka.<obj>` pro
 - An INSERT that omits a column sends NULL for it: the backend's DEFAULT / serial / AUTO_INCREMENT is
   lost (NOT NULL → `not_null_violation`) — otterbrix leaves no column to the backend's DEFAULT. An INSERT … SELECT of one backend is
   not pushed down (its rows pass through the engine).
-- Remote DDL (`CREATE / DROP / ALTER TABLE c.d.s.t`) runs only in autocommit (otterbrix refuses it
+- Remote DDL (`CREATE / DROP / ALTER TABLE uid.ns.t`) runs only in autocommit (otterbrix refuses it
   inside a block, `unimplemented_yet`): otterbrix's storage contract has no DDL inside a transaction. MySQL / ClickHouse DDL commits on the
   backend at once (an engine failure afterwards is compensated by a DROP); a DROP TABLE / COLUMN is
   sent at COMMIT.
 - `CREATE / DROP INDEX` on a remote table is refused by otterbrix (its storage contract has no index).
-- `CREATE EXTERNAL TABLE` into a four-part target is not atomic: CREATE and INSERT are two
+- `CREATE EXTERNAL TABLE` into a connection's table is not atomic: CREATE and INSERT are two
   autocommit statements.
 - A backend's COMMIT that succeeded while otterbrix's own commit marker failed leaves the outcome in
   doubt (no two-phase commit).
@@ -466,7 +488,7 @@ INSERT whose target, completed by the session's place, is `main.kafka.<obj>` pro
 
 - `table:` of a connection makes it that one table: the startup discovery and a miss register it
   alone (a miss of another table of it is the statement's own miss, no discovery sent), and DDL of
-  any other table of it written in four parts — CREATE / ALTER / DROP TABLE, CREATE INDEX, CREATE
+  any other table of it named `uid.ns.t` — CREATE / ALTER / DROP TABLE, CREATE INDEX, CREATE
   EXTERNAL TABLE — is refused by the session before the engine and the backend (`invalid_parameter`
   `connection "<c>" is configured with table "<X>"`, `catalog::check_table_scope`; a short name in a
   place that is the connection's database is not seen). Without `table:` a miss registers any table

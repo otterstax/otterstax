@@ -42,7 +42,6 @@
 #include <vector>
 
 namespace fedtest {
-
     namespace fed = otterstax::federation;
     namespace cat = otterstax::catalog;
     using components::types::complex_logical_type;
@@ -146,16 +145,18 @@ namespace fedtest {
             auto opened = engine_t::open(config, components::planner::primitives_t{addresses_});
             REQUIRE_FALSE(opened.has_error());
             engine_.emplace(std::move(opened.value()));
-            cat::engine_calls_t calls{
-                [this](const components::session::session_id_t& session, const std::string& sql) {
-                    return engine_->dispatcher()->execute_sql(session, sql);
-                },
-                [this](const components::session::session_id_t& session, components::logical_plan::execution_plan_t plan) {
-                    return engine_->dispatcher()->execute_plan(session, std::move(plan));
-                }};
+            cat::engine_calls_t calls{[this](const components::session::session_id_t& session, const std::string& sql) {
+                                          return engine_->dispatcher()->execute_sql(session, sql);
+                                      },
+                                      [this](const components::session::session_id_t& session,
+                                             components::logical_plan::execution_plan_t plan) {
+                                          return engine_->dispatcher()->execute_plan(session, std::move(plan));
+                                      }};
             auto registered = cat::register_connections(&resource_, calls, registration_session_, discoveries);
             INFO(std::string{registered.what});
             REQUIRE_FALSE(registered.contains_error());
+            // The startup leaves a session without a place; the fixture's stands where the engine's tests do.
+            ok("SET search_path = 'main.public';");
         }
 
         void close() {
@@ -177,7 +178,8 @@ namespace fedtest {
         }
 
         components::cursor::cursor_t_ptr sql(const std::string& text) { return sql(session_, text); }
-        components::cursor::cursor_t_ptr sql(const components::session::session_id_t& session, const std::string& text) {
+        components::cursor::cursor_t_ptr sql(const components::session::session_id_t& session,
+                                             const std::string& text) {
             return engine_->dispatcher()->execute_sql(session, text);
         }
         // A statement that must succeed.
@@ -277,5 +279,4 @@ namespace fedtest {
         }
         return out;
     }
-
 } // namespace fedtest

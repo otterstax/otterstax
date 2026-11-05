@@ -3,6 +3,7 @@ project(test_federation)
 set(${PROJECT_NAME}_SOURCES
     main.cpp
     test_federation_registration.cpp
+    test_connection_names.cpp
     test_federation_scans.cpp
     test_federation_offer.cpp
     test_federation_transactions.cpp

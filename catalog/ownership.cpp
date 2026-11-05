@@ -7,48 +7,15 @@
 #include "otterbrix/parser/grammar_extension/kafka/kafka_node.hpp"
 #include "utility/tracy_profiler.hpp"
 
-#include <optional>
+#include <string>
+#include <string_view>
 
 namespace otterstax::catalog {
+    static_assert(std::string_view{kafka::KAFKA_DATABASE_NAME} == federation::local_database,
+                  "the Kafka objects live in the local database");
 
-    namespace {
-
-        // The owner of `name`, or nullopt when nobody owns it.
-        std::optional<std::string> database_owner(std::string_view name, std::span<const std::string> connections) {
-            const auto folded = federation::fold_identifier(name);
-            if (folded == federation::fold_identifier(federation::metadata_database)) {
-                return std::string{federation::metadata_database};
-            }
-            for (const auto& connection : connections) {
-                if (federation::fold_identifier(connection) == folded) {
-                    return connection;
-                }
-            }
-            return std::nullopt;
-        }
-
-    } // namespace
-
-    core::error_t check_database_ownership(std::pmr::memory_resource* resource,
-                                           std::string_view name,
-                                           std::span<const std::string> connections) {
-        OTX_ZONE_N("catalog::check_database_ownership");
-        auto owner = database_owner(name, connections);
-        if (!owner) {
-            return core::error_t::no_error();
-        }
-        std::pmr::string what{resource};
-        what.append("database '");
-        what.append(name);
-        what.append("' is owned by connection '");
-        what.append(*owner);
-        what.push_back('\'');
-        return core::error_t(core::error_code_t::invalid_parameter, std::move(what));
-    }
-
-    core::error_t check_write_ownership(std::pmr::memory_resource* resource,
-                                        const qualified_name_t& target,
-                                        bool drops_schema) {
+    core::error_t
+    check_write_ownership(std::pmr::memory_resource* resource, const qualified_name_t& target, bool drops_schema) {
         OTX_ZONE_N("catalog::check_write_ownership");
         const auto database = federation::fold_identifier(target.database.t);
         std::pmr::string what{resource};
@@ -71,5 +38,4 @@ namespace otterstax::catalog {
         }
         return core::error_t(core::error_code_t::invalid_parameter, std::move(what));
     }
-
 } // namespace otterstax::catalog

@@ -42,14 +42,14 @@ public:
         // discovers, read whole (the storage's scan; no clause to push down).
         auto node = logical_plan::make_node_aggregate(
             config_.resource,
-            qualified_name_t{core::connection_name_t{"1"}, core::dbname_t{"db"}, core::schema_t{}, core::relname_t{"table"}});
+            qualified_name_t{core::dbname_t{"1"}, core::schema_t{"db"}, core::relname_t{"table"}});
         auto params = logical_plan::make_parameter_node(config_.resource);
-        auto binder = sql::transform::transform_result(
-            config_.resource,
-            logical_plan::execution_plan_t(config_.resource, node, params),
-            sql::transform::transform_result::parameter_map_t{config_.resource},
-            sql::transform::transform_result::insert_map_t{config_.resource},
-            sql::transform::transform_result::insert_rows_t(config_.resource));
+        auto binder =
+            sql::transform::transform_result(config_.resource,
+                                             logical_plan::execution_plan_t(config_.resource, node, params),
+                                             sql::transform::transform_result::parameter_map_t{config_.resource},
+                                             sql::transform::transform_result::insert_map_t{config_.resource},
+                                             sql::transform::transform_result::insert_rows_t(config_.resource));
         auto parsed = std::make_unique<ParsedQueryData>(
             std::make_unique<logical_plan::execution_plan_t>(config_.resource, std::move(node), std::move(params)),
             std::move(binder),

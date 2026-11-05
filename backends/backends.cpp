@@ -20,7 +20,6 @@
 #include <utility>
 
 namespace otterstax::backends {
-
     core::error_t register_s3_aliases(std::pmr::memory_resource* resource,
                                       actor_zeta::address_t s3_connector,
                                       const config::ConnectionsConfig& connections) {
@@ -60,13 +59,10 @@ namespace otterstax::backends {
         return core::error_t::no_error();
     }
 
-    core::error_t register_remote_tables(std::pmr::memory_resource* resource,
-                                         runtime::engine_t& engine,
-                                         remote_backends_t& remote) {
+    core::error_t
+    register_remote_tables(std::pmr::memory_resource* resource, runtime::engine_t& engine, remote_backends_t& remote) {
         OTX_ZONE_N("backends::register_remote_tables");
-        if (remote.discovered().empty()) {
-            return core::error_t::no_error(); // no connection to register
-        }
+        // Without connections too: the local database and the sessions' empty place are the startup's.
         catalog::engine_calls_t calls{
             [&engine, resource](const components::session::session_id_t& session, const std::string& sql) {
                 auto plan = otterstax::engine::sql_plan(resource, sql);
@@ -81,5 +77,4 @@ namespace otterstax::backends {
             }};
         return catalog::register_connections(resource, calls, remote.registration_session(), remote.discovered());
     }
-
 } // namespace otterstax::backends

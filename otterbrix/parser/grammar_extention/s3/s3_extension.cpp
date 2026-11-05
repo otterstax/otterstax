@@ -108,8 +108,8 @@ namespace s3_ext {
         // Cheap claim check: only CREATE EXTERNAL TABLE / COPY are ours. The
         // core parser already ran and rejected this query, so we never see a
         // statement the core grammar accepts.
-        std::string inner_sql;            // captured embedded SELECT for COPY
-        std::string scrubbed = query;     // what the grammar actually parses
+        std::string inner_sql;        // captured embedded SELECT for COPY
+        std::string scrubbed = query; // what the grammar actually parses
 
         std::size_t pos = 0;
         bool is_create = match_word_ci(query, pos, "create") && match_word_ci(query, pos, "external") &&
@@ -167,7 +167,7 @@ namespace s3_ext {
             // otterbrix's own refusal of a longer name (qualified_name_of)
             std::pmr::string what{"CREATE EXTERNAL TABLE: the table name has ", resource};
             what += std::to_string(stmt->name_parts);
-            what += " parts; write it as [connection.][database.][schema.]name";
+            what += " parts; write it as [connection.][namespace.]name";
             return core::error_t(core::error_code_t::sql_parse_error, std::move(what));
         }
 
@@ -192,15 +192,15 @@ namespace s3_ext {
         const auto op = stmt->kind == s3_stmt_kind::create_external_table
                             ? otterstax::external::external_op_t::create_external_table
                             : otterstax::external::external_op_t::copy_to;
-        return otterstax::external::make_external_node(resource,
-                                                       op,
-                                                       stmt->kind == s3_stmt_kind::create_external_table
-                                                           ? otterstax::external::external_target(stmt->name,
-                                                                                                  stmt->name_parts)
-                                                           : qualified_name_t{},
-                                                       str(stmt->location),
-                                                       str(stmt->s3_alias),
-                                                       str(stmt->format),
-                                                       str(stmt->inner_sql));
+        return otterstax::external::make_external_node(
+            resource,
+            op,
+            stmt->kind == s3_stmt_kind::create_external_table
+                ? otterstax::external::external_target(stmt->name, stmt->name_parts)
+                : qualified_name_t{},
+            str(stmt->location),
+            str(stmt->s3_alias),
+            str(stmt->format),
+            str(stmt->inner_sql));
     }
 } // namespace s3_ext

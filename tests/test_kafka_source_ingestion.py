@@ -89,7 +89,7 @@ class SourceIngestionTest:
         self.create_topic(self.topic)
         self.produce_records(self.topic, self.records)
         self.conn = psycopg.connect(host=self.host, port=PG_PORT, user="testuser",
-                                    password="testpass", dbname="main", autocommit=True)
+                                    password="testpass", dbname="local", autocommit=True)
         # Don't let psycopg server-prepare the poll query: while the table is still
         # empty the engine returns a schemaless result (Describe -> NoData), and a
         # prepared statement would cache that and never see the rows once they land.

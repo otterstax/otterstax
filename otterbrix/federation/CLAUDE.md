@@ -6,8 +6,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `otterbrix/federation/` (library `otterstax_federation`) is the core of the federation on otterbrix
 `1.0.0b2-rc-4` (`01ec5268`; `docs/embedding-host-api.md` in the otterbrix repo). A remote table is an ordinary row of
-otterbrix's catalog in a database of a connection (`pg_database.datconnection`), named
-`connection.database.schema.table` (`c.d.s.t`, every part lower case); otterbrix resolves every
+otterbrix's catalog in the connection's one engine database (`pg_database.datconnection`; the full form
+`c.d.ns.t` — `d` the connection's configured database on PostgreSQL, `def` on MySQL / ClickHouse — while
+the client writes `c.ns.t`, the engine reading a first part that is a connection as its database; every
+part lower case); otterbrix resolves every
 name, plans every statement and reaches the table's rows only through the eighteen messages of its
 storage contract (`services/disk/storage_contract.hpp`), sent to the address the map of
 `open_engine` gives the connection. OtterStax answers them with one actor per connection of

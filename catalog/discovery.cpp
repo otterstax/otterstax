@@ -17,7 +17,6 @@
 using namespace components;
 
 namespace otterstax::catalog {
-
     std::pmr::string
     escape_sql_literal(std::pmr::memory_resource* resource, std::string_view value, backend_type_t backend) {
         OTX_ZONE_N("catalog::escape_sql_literal");
@@ -55,8 +54,9 @@ namespace otterstax::catalog {
         }
         if (backend == backend_type_t::PostgreSQL) {
             // (schema, table): one schema, or every user schema of the database.
-            query.append("SELECT table_schema, table_name FROM information_schema.tables WHERE table_type = 'BASE TABLE' "
-                         "AND ");
+            query.append(
+                "SELECT table_schema, table_name FROM information_schema.tables WHERE table_type = 'BASE TABLE' "
+                "AND ");
             if (scope.empty()) {
                 query.append("table_schema NOT IN ('pg_catalog', 'information_schema') AND table_schema NOT LIKE "
                              "E'pg\\\\_toast%' AND table_schema NOT LIKE E'pg\\\\_temp%'");
@@ -71,6 +71,18 @@ namespace otterstax::catalog {
         query.append(escape_sql_literal(resource, scope, backend));
         query.append(" AND table_type = 'BASE TABLE';");
         return query;
+    }
+
+    std::pmr::string make_list_databases_query(std::pmr::memory_resource* resource, backend_type_t backend) {
+        OTX_ZONE_N("catalog::make_list_databases_query");
+        if (backend == backend_type_t::ClickHouse) {
+            return std::pmr::string{"SELECT name FROM system.databases WHERE name NOT IN ('system', "
+                                    "'information_schema', 'INFORMATION_SCHEMA') ORDER BY name;",
+                                    resource};
+        }
+        return std::pmr::string{"SELECT schema_name FROM information_schema.schemata WHERE schema_name NOT IN "
+                                "('information_schema', 'mysql', 'performance_schema', 'sys') ORDER BY schema_name;",
+                                resource};
     }
 
     std::pmr::string
@@ -91,8 +103,10 @@ namespace otterstax::catalog {
         auto node = logical_plan::make_node_aggregate(
             resource,
             qualified_name_t{name.connection, name.database, core::schema_t{}, name.collection});
-        const auto one = param.add_parameter(vector::make_scalar(resource, std::int64_t{1}), vector::parameter_kind::literal);
-        const auto zero = param.add_parameter(vector::make_scalar(resource, std::int64_t{0}), vector::parameter_kind::literal);
+        const auto one =
+            param.add_parameter(vector::make_scalar(resource, std::int64_t{1}), vector::parameter_kind::literal);
+        const auto zero =
+            param.add_parameter(vector::make_scalar(resource, std::int64_t{0}), vector::parameter_kind::literal);
         node->append_child(logical_plan::make_node_match(
             resource,
             qualified_name_t{name.database, core::schema_t{}, name.collection},
@@ -126,5 +140,4 @@ namespace otterstax::catalog {
         }
         return core::error_t(core::error_code_t::undefined_object, std::move(msg));
     }
-
 } // namespace otterstax::catalog

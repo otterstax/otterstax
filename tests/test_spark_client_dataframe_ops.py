@@ -46,8 +46,8 @@ from pyspark.sql import functions as F
 
 import config
 
-CAMPAIGNS = "campaigns.db1.public.campaigns"  # MySQL: campaign_id, campaign_name, campaign_length, budget
-PRODUCTS = "products.pgdb.public.products"    # PostgreSQL: product_id, campaign_id, product_name, price, category
+CAMPAIGNS = "campaigns.db1.campaigns"  # MySQL: campaign_id, campaign_name, campaign_length, budget
+PRODUCTS = "products.public.products"    # PostgreSQL: product_id, campaign_id, product_name, price, category
 
 # The local table: (id, grp, amount), the last row twice so distinct() has a row to drop.
 LOCAL_TABLE = "ops_items"
@@ -58,7 +58,9 @@ class SparkDataFrameOpsTest:
     def __init__(self, local=False):
         self.url = f"sc://{config.get_host(local)}:{config.SPARK_CONNECT_PORT}"
         self.db = f"spark_ops_{uuid.uuid4().hex[:8]}"
-        self.local_table = f"{self.db}.{LOCAL_TABLE}"
+        # Spark sessions have no place: one- and two-part table names are
+        # refused, so every table statement names its tables in full.
+        self.local_table = f"local.{self.db}.{LOCAL_TABLE}"
         self.spark = None
         self.campaigns = None  # spark.table(CAMPAIGNS)
         self.products = None   # spark.table(PRODUCTS)
@@ -66,7 +68,7 @@ class SparkDataFrameOpsTest:
         self.totals = {}       # table -> row count
         self.db_created = False
         self.table_created = False
-        print(f"PySpark client {pyspark.__version__}, Spark Connect server {self.url}, local schema main.{self.db}")
+        print(f"PySpark client {pyspark.__version__}, Spark Connect server {self.url}, local schema local.{self.db}")
 
     # --- helpers ---
 

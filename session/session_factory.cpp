@@ -11,7 +11,6 @@
 #include <vector>
 
 namespace otterstax::session {
-
     namespace {
         // How long the shutdown waits for the sessions of closed connections to
         // finish the statement in flight before it stops the sessions pool.
@@ -54,13 +53,14 @@ namespace otterstax::session {
         reap();
     }
 
-    session_ptr session_factory_t::open() {
+    session_ptr session_factory_t::open(database_term_t term) {
         OTX_ZONE_N("session_factory::open");
         auto spawned = actor_zeta::spawn<query_session_t>(resource_,
                                                           scheduler_,
                                                           parser_factory_(resource_),
                                                           services_,
-                                                          this);
+                                                          this,
+                                                          term);
         add(spawned.get());
         // The session frees itself (query_session_t::destroy); the owner's handle
         // only closes it.
@@ -120,5 +120,4 @@ namespace otterstax::session {
             actor_zeta::pmr::deleter_t{session->resource()}(session);
         }
     }
-
 } // namespace otterstax::session

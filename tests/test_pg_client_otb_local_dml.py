@@ -63,7 +63,7 @@ class LocalDmlRowCountTest:
 
     def _connect(self):
         return psycopg.connect(host=self.host, port=PG_PORT, user="testuser",
-                               password="testpass", dbname="main", autocommit=True)
+                               password="testpass", dbname="local", autocommit=True)
 
     def setup(self):
         self.conn = self._connect()

@@ -29,9 +29,9 @@ class client:
             'password': 'testpass',
             # The engine database the session is placed in (main.public); an
             # unknown one is FATAL 3D000. The remote tables are named in full.
-            'dbname': 'main',
+            'dbname': 'local',
         }
-        self.test_database = 'campaigns.db1.public'
+        self.test_database = 'campaigns.db1'
         self.test_table = 'postgresql_test_table'
         self.test_encoding_table = 'postgresql_test_encoding'
 
@@ -376,7 +376,7 @@ class client:
         """A DROP TABLE of a remote table neither the catalog nor MariaDB has fails on the PG wire too.
 
         Same shape as the MySQL-wire case: the engine's catalog misses the
-        four-part name, the discovery on MariaDB finds no table, and the
+        three-part name, the discovery on MariaDB finds no table, and the
         ErrorResponse carries the catalog's "does not exist" verdict — not a
         transport failure; the connection keeps serving.
         """

@@ -24,13 +24,13 @@
 #include <memory_resource>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <thread>
 #include <variant>
 #include <vector>
 
 namespace fakebackend {
-
     namespace fed = otterstax::federation;
     using components::types::complex_logical_type;
     using components::types::logical_type;
@@ -56,8 +56,8 @@ namespace fakebackend {
     };
 
     inline components::vector::data_chunk_t chunk_of(std::pmr::memory_resource* resource,
-                                                      const std::vector<complex_logical_type>& columns,
-                                                      const std::vector<row_t>& rows) {
+                                                     const std::vector<complex_logical_type>& columns,
+                                                     const std::vector<row_t>& rows) {
         std::pmr::vector<complex_logical_type> types{columns.begin(), columns.end(), resource};
         components::vector::data_chunk_t chunk(resource, types, std::max<std::size_t>(rows.size(), 1));
         for (std::size_t r = 0; r < rows.size(); ++r) {
@@ -93,8 +93,9 @@ namespace fakebackend {
         }
         void drop_table(const std::string& name) {
             std::lock_guard guard(mutex_);
-            tables_.erase(std::remove_if(tables_.begin(), tables_.end(), [&](const auto& t) { return t.table == name; }),
-                          tables_.end());
+            tables_.erase(
+                std::remove_if(tables_.begin(), tables_.end(), [&](const auto& t) { return t.table == name; }),
+                tables_.end());
         }
         canned_table_t* find(const std::string& name) {
             for (auto& table : tables_) {
@@ -149,8 +150,8 @@ namespace fakebackend {
         }
 
         // A read the hook answers instead of the canned tables.
-        using scan_hook_t =
-            std::function<std::optional<components::vector::data_chunk_t>(const std::string& sql, std::pmr::memory_resource*)>;
+        using scan_hook_t = std::function<std::optional<components::vector::data_chunk_t>(const std::string& sql,
+                                                                                          std::pmr::memory_resource*)>;
         void on_scan(scan_hook_t hook) {
             std::lock_guard guard(mutex_);
             hook_ = std::move(hook);
@@ -205,7 +206,8 @@ namespace fakebackend {
                 return core::error_t::no_error();
             }
             std::this_thread::sleep_for(delay);
-            return core::error_t{core::error_code_t::io_error, std::pmr::string{"fake backend: connection refused", &resource_}};
+            return core::error_t{core::error_code_t::io_error,
+                                 std::pmr::string{"fake backend: connection refused", &resource_}};
         }
         // A line of log() a connector writes for itself: a statement refused inside an aborted
         // transaction ("aborted <sql>").
@@ -238,9 +240,8 @@ namespace fakebackend {
 
         // ---- what the fake connectors run ----
 
-        core::result_wrapper_t<std::unique_ptr<components::vector::data_chunk_t>> read(int connection,
-                                                                                       bool open,
-                                                                                       std::string_view query) {
+        core::result_wrapper_t<std::unique_ptr<components::vector::data_chunk_t>>
+        read(int connection, bool open, std::string_view query) {
             std::chrono::milliseconds delay{0};
             {
                 std::lock_guard guard(mutex_);
@@ -329,7 +330,8 @@ namespace fakebackend {
             auto name = [&sql] {
                 auto at = sql.rfind(' ');
                 std::string out = sql.substr(at + 1);
-                out.erase(std::remove_if(out.begin(), out.end(), [](char c) { return c == '"' || c == '`'; }), out.end());
+                out.erase(std::remove_if(out.begin(), out.end(), [](char c) { return c == '"' || c == '`'; }),
+                          out.end());
                 return out;
             };
             std::string line;
@@ -355,7 +357,8 @@ namespace fakebackend {
                 }
             }
             if (line == "commit" && fail_commits_) {
-                return core::error_t{core::error_code_t::io_error, std::pmr::string{"fake backend: COMMIT lost", &resource_}};
+                return core::error_t{core::error_code_t::io_error,
+                                     std::pmr::string{"fake backend: COMMIT lost", &resource_}};
             }
             return core::error_t::no_error();
         }
@@ -375,10 +378,11 @@ namespace fakebackend {
                 }
                 std::pmr::vector<complex_logical_type> fields{table.columns.begin(), table.columns.end(), &resource_};
                 out.push_back(fed::discovered_table_t{
-                    qualified_name_t{core::connection_name_t{scope.connection.t},
-                                     core::dbname_t{kind_ == backend_type_t::PostgreSQL ? scope.database.t : table.database},
-                                     core::schema_t{kind_ == backend_type_t::PostgreSQL ? table.schema : std::string{}},
-                                     core::relname_t{table.table}},
+                    qualified_name_t{
+                        core::connection_name_t{scope.connection.t},
+                        core::dbname_t{kind_ == backend_type_t::PostgreSQL ? scope.database.t : table.database},
+                        core::schema_t{kind_ == backend_type_t::PostgreSQL ? table.schema : std::string{}},
+                        core::relname_t{table.table}},
                     complex_logical_type::create_struct("row", fields)});
             }
             return out;
@@ -393,11 +397,25 @@ namespace fakebackend {
                 ++session_checks_;
                 return mysql::mock_results({{"@@SESSION.sql_mode", column_type::varchar}}, {{sql_mode_}});
             }
+            if (query.find("information_schema.schemata") != std::string_view::npos) {
+                ++discoveries_;
+                std::set<std::string> databases;
+                for (const auto& table : tables_) {
+                    databases.insert(table.database);
+                }
+                std::vector<mysql::mock_row_t> rows;
+                for (const auto& database : databases) {
+                    rows.push_back({database});
+                }
+                return mysql::mock_results({{"SCHEMA_NAME", column_type::varchar}}, rows);
+            }
             if (query.find("information_schema") != std::string_view::npos) {
                 ++discoveries_;
                 std::vector<mysql::mock_row_t> rows;
                 for (const auto& table : tables_) {
-                    rows.push_back({table.table});
+                    if (query.find("table_schema = '" + table.database + "'") != std::string_view::npos) {
+                        rows.push_back({table.table});
+                    }
                 }
                 return mysql::mock_results({{"TABLE_NAME", column_type::varchar}}, rows);
             }
@@ -439,8 +457,16 @@ namespace fakebackend {
                     if (!every_schema && query.find("'" + table.schema + "'") == std::string_view::npos) {
                         continue;
                     }
-                    PQsetvalue(result.get(), row, 0, const_cast<char*>(table.schema.c_str()), static_cast<int>(table.schema.size()));
-                    PQsetvalue(result.get(), row, 1, const_cast<char*>(table.table.c_str()), static_cast<int>(table.table.size()));
+                    PQsetvalue(result.get(),
+                               row,
+                               0,
+                               const_cast<char*>(table.schema.c_str()),
+                               static_cast<int>(table.schema.size()));
+                    PQsetvalue(result.get(),
+                               row,
+                               1,
+                               const_cast<char*>(table.table.c_str()),
+                               static_cast<int>(table.table.size()));
                     ++row;
                 }
                 return result;
@@ -455,7 +481,8 @@ namespace fakebackend {
                         const unsigned oid = c.type() == logical_type::BIGINT   ? 20
                                              : c.type() == logical_type::DOUBLE ? 701
                                                                                 : 25;
-                        const int length = c.type() == logical_type::BIGINT || c.type() == logical_type::DOUBLE ? 8 : -1;
+                        const int length =
+                            c.type() == logical_type::BIGINT || c.type() == logical_type::DOUBLE ? 8 : -1;
                         columns.push_back({const_cast<char*>(c.alias().c_str()), 0, 0, 0, oid, length, -1});
                     }
                     PQsetResultAttrs(result.get(), static_cast<int>(columns.size()), columns.data());
@@ -602,7 +629,8 @@ namespace fakebackend {
             const std::string sql{query};
             const auto savepoint = [&sql] {
                 auto out = sql.substr(sql.rfind(' ') + 1);
-                out.erase(std::remove_if(out.begin(), out.end(), [](char c) { return c == '"' || c == '`'; }), out.end());
+                out.erase(std::remove_if(out.begin(), out.end(), [](char c) { return c == '"' || c == '`'; }),
+                          out.end());
                 return out;
             };
             const bool ends = sql == "COMMIT" || sql == "ROLLBACK";
@@ -666,13 +694,17 @@ namespace fakebackend {
         std::pmr::synchronized_pool_resource resource_;
     };
 
-    using fake_mysql_t = fake_connector_t<mysql::IConnector, mysql::Status, boost::mysql::connect_params, const boost::mysql::results&>;
+    using fake_mysql_t =
+        fake_connector_t<mysql::IConnector, mysql::Status, boost::mysql::connect_params, const boost::mysql::results&>;
     using fake_pg_t = fake_connector_t<pg::IConnector, pg::Status, pg::connect_params, PGresult*>;
     using fake_ch_t = fake_connector_t<ch::IConnector, ch::Status, ch::connect_params, const ch::select_result_t&>;
 
     // An agent over a fake connector of `kind` (its number `number`).
-    inline fed::backend_agent_ptr
-    fake_agent(std::pmr::memory_resource* resource, const std::string& name, backend_type_t kind, fake_backend_t& server, int number) {
+    inline fed::backend_agent_ptr fake_agent(std::pmr::memory_resource* resource,
+                                             const std::string& name,
+                                             backend_type_t kind,
+                                             fake_backend_t& server,
+                                             int number) {
         auto agent = actor_zeta::spawn<fed::backend_agent_t>(resource, name);
         switch (kind) {
             case backend_type_t::MySQL:
@@ -698,5 +730,4 @@ namespace fakebackend {
         }
         return std::move(future).take_ready();
     }
-
 } // namespace fakebackend

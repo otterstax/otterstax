@@ -10,8 +10,8 @@ connection, a Flight SQL RPC or prepared statement, a Spark session), and the
 `session_factory_t` the frontends open them from. Every statement a client sends
 goes parse → ownership guard → its route: CREATE EXTERNAL TABLE / COPY ... TO,
 Kafka DDL and writes, else the engine on the connection's engine session. A
-remote table is an ordinary table of otterbrix's catalog (a database of a
-connection, `c.d.s.t`); otterbrix plans every statement over it and reaches its
+remote table is an ordinary table of otterbrix's catalog (a table of a
+connection, `uid.ns.t`); otterbrix plans every statement over it and reaches its
 rows through the connection's backend actor (`otterbrix/federation/CLAUDE.md`).
 A statement that misses a table created on the backend after startup registers
 it and runs once more. There is no router and no shared pipeline actor in front
@@ -23,7 +23,7 @@ of it.
 |------|------|
 | `query_session.{hpp,cpp}` | The actor, `session_services_t` (everything it sends to) and `make_session_services` (builds it, refusing an empty address), `parameter_row`, `session_ptr` / `session_closer_t`; `command_payload` (a statement that ran without rows — CREATE EXTERNAL TABLE / COPY ... TO, Kafka — under its tag) and `rows_payload` (an engine cursor) anonymous in the `.cpp` |
 | `session_factory.{hpp,cpp}` | `session_factory_t`: opens sessions and holds the ones that exist (`add` / `forget` / `reap` private, `forget` called by the session as it frees itself); its destructor is the sessions' shutdown (drain, `runtime_t::stop_sessions`, reap) |
-| `plan_inspection.{hpp,cpp}` | Pure plan readers: extension root, `transaction_command`, `database_ddl_target`, `write_target` (the relation or schema a DDL / DML changes, as written), `setting_changes`, `savepoint_name`, `is_query` (what COPY exports), `statement_names` (every table name as written, for the registration of a missed table) |
+| `plan_inspection.{hpp,cpp}` | Pure plan readers: extension root, `transaction_command`, `place_namespace_ddl` (a client's CREATE / DROP DATABASE / SCHEMA into local, or refused), `write_target` (the relation or schema a DDL / DML changes, as written), `setting_changes`, `savepoint_name`, `is_query` (what COPY exports), `statement_names` (every table name as written, for the registration of a missed table) |
 | `session_payload.hpp` | `transaction_command_t`; `session_payload`: schema, chunks, `parameter_count` / `parameter_types`, tag, `affected_rows`, `transaction`, `portal` / `has_more`, `setting_changes`, `savepoint`; `reported_rows()` |
 | `session_ids.hpp` | `statement_id_t` (a strong id), `to_hash` |
 
@@ -269,9 +269,9 @@ connection is unknown on another. The engine's SQL `PREPARE` / `EXECUTE` /
 statement over a table of a connection it does not have (created on the backend
 after startup), `register_missed` looks for it among the statement's names as
 written (`plan::statement_names`): `catalog::registration_target` names a
-four-part name of a connection, and a short `t` / `s.t` is completed with the
-session's place (`SELECT current_database(), current_schema()`) for every
-connection whose database the place's is. For each target the connection's
+three-part name of a connection (`uid.ns.t`), and a short `t` / `s.t` is completed with the
+session's place, whose `current_connection()` names that connection (`uid.ns.t`). For
+each target the connection's
 backend actor discovers the table (a message the session awaits — its thread
 does not wait for the backend) and `catalog::registration_plans` records it on
 the actor's registration session (`catalog/CLAUDE.md`), whatever the client's
@@ -312,16 +312,16 @@ refuse a missing plan and a grammar-extension root (`extension_kind` set) with
 
 `guard_ownership` runs on every entry that runs or describes a plan and answers
 `invalid_parameter` before the statement reaches the engine
-(`catalog/ownership.hpp`, `catalog/CLAUDE.md`): `CREATE DATABASE` /
-`DROP DATABASE` of a connection's name (`check_database_ownership` over
-`aliases`) or of `federation`, any DDL or DML of a relation of `federation`
-(`check_write_ownership` over `plan::write_target`), and DDL of a table of a
+(`catalog/ownership.hpp`, `catalog/CLAUDE.md`): a table name of four parts, any
+DDL or DML of a relation of `federation` (`check_write_ownership` over
+`plan::write_target`), a DROP of the schema `local.kafka`, and DDL of a table of a
 connection configured with one `table:` naming another table
 (`catalog::check_table_scope` over `services_.connections`, the table DDL
-`write_target` marks `table_ddl`; `load_external_table` checks its four-part
-target the same way before the file is read). A `DROP SCHEMA` is checked
-in `dispatch`, its name completed with the session's place, so `main.kafka`
-stays protected from a place in `main`.
+`write_target` marks `table_ddl`; `load_external_table` checks its connection-table
+target the same way before the file is read). No CREATE / DROP DATABASE
+reaches it: the parse already made it a schema of `local` or refused it
+(`plan::place_namespace_ddl`), so a client never makes or drops an engine
+database, a connection's or `federation` included.
 
 ### External-table and Kafka statements
 
@@ -335,11 +335,11 @@ only move the bytes:
 - load → the target's ownership checked; the file read into chunks of at most
   1024 rows by `db::S3Manager::download` (s3://) or
   `conn::file::FileManager::load_file` (local); then `engine::create_table_plan`
-  of the target as written (1–4 parts, completed by the place as any CREATE TABLE:
+  of the target as written (up to three parts, completed by the place as any CREATE TABLE:
   the database is not created, a missing schema is the engine's refusal, an
   existing table `table_already_exists`) and `engine::load_table`: outside a block
   BEGIN / CREATE / INSERT / COMMIT (the table with its rows or nothing), inside a
-  block two more statements of it; a connection's table (four parts, or a short
+  block two more statements of it; a connection's table (`uid.ns.t`, or a short
   name in a place that is a connection's database) is created and filled in
   autocommit — two statements, not atomic — and inside a block as otterbrix's
   rules for a remote write in a block decide;
@@ -356,7 +356,7 @@ Success is an empty payload under the statement's tag (`command_payload`);
 (`kafka_node_t`) goes to `KafkaManager::execute` and cannot be prepared. An
 INSERT is a Kafka write when its target (`kafka_write_target`) names a registered
 object and, completed with the session's place (asked only then), is
-`main.kafka.<obj>` (`names_kafka_object`, `integration/kafka/CLAUDE.md`,
+`local.kafka.<obj>` (`names_kafka_object`, `integration/kafka/CLAUDE.md`,
 "Routing"); an `INSERT … SELECT` into one goes to the Kafka manager as text.
 
 ### Describe (prepare)

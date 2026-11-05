@@ -20,7 +20,6 @@
 #include <set>
 
 namespace otterstax::catalog {
-
     namespace fed = otterstax::federation;
     using components::logical_plan::execution_plan_t;
     using components::logical_plan::node_ptr;
@@ -28,7 +27,6 @@ namespace otterstax::catalog {
     using components::types::logical_type;
 
     namespace {
-
         execution_plan_t plan_of(std::pmr::memory_resource* resource, node_ptr node) {
             return execution_plan_t{resource, std::move(node), components::logical_plan::make_parameter_node(resource)};
         }
@@ -98,14 +96,14 @@ namespace otterstax::catalog {
         placed_t place(const configured_connection_t& connection, const fed::discovered_table_t& table) {
             placed_t out;
             out.remote_database = table.name.database.t.empty() ? connection.database : table.name.database.t;
-            out.database = fed::fold_identifier(out.remote_database);
+            out.database = engine_database(connection);
             if (connection.kind == backend_type_t::PostgreSQL) {
                 out.remote_schema = !table.name.schema.t.empty() ? table.name.schema.t
                                     : !connection.schema.empty() ? connection.schema
                                                                  : std::string{"public"};
                 out.schema = fed::fold_identifier(out.remote_schema);
             } else {
-                out.schema = "public";
+                out.schema = fed::fold_identifier(out.remote_database);
             }
             out.table = fed::fold_identifier(table.name.collection.t);
             return out;
@@ -127,12 +125,12 @@ namespace otterstax::catalog {
                 auto type = child;
                 type.set_alias(name);
                 const auto declared = table.remote_types.find(remote);
-                out.push_back(fed::registered_column_t{components::catalog::INVALID_OID,
-                                                       name,
-                                                       std::move(type),
-                                                       remote,
-                                                       declared != table.remote_types.end() ? declared->second
-                                                                                            : std::string{}});
+                out.push_back(
+                    fed::registered_column_t{components::catalog::INVALID_OID,
+                                             name,
+                                             std::move(type),
+                                             remote,
+                                             declared != table.remote_types.end() ? declared->second : std::string{}});
             }
             return out;
         }
@@ -142,7 +140,6 @@ namespace otterstax::catalog {
             std::string connection;
             fed::registered_table_t table;
         };
-
     } // namespace
 
     std::vector<execution_plan_t> registration_plans(std::pmr::memory_resource* resource,
@@ -183,13 +180,12 @@ namespace otterstax::catalog {
             for (const auto& column : *columns) {
                 definitions.emplace_back(column.name, column.type);
             }
-            connection.actor->stage_table(fed::registered_table_t{components::catalog::INVALID_OID,
-                                                      name,
-                                                      connection.kind == backend_type_t::PostgreSQL
-                                                          ? placed.remote_schema
-                                                          : placed.remote_database,
-                                                      discovered.name.collection.t,
-                                                      std::move(*columns)});
+            connection.actor->stage_table(fed::registered_table_t{
+                components::catalog::INVALID_OID,
+                name,
+                connection.kind == backend_type_t::PostgreSQL ? placed.remote_schema : placed.remote_database,
+                discovered.name.collection.t,
+                std::move(*columns)});
             auto create = components::logical_plan::make_node_create_collection(resource,
                                                                                 core::relname_t{placed.table},
                                                                                 std::move(definitions),
@@ -201,6 +197,30 @@ namespace otterstax::catalog {
         return plans;
     }
 
+    std::string engine_database(const configured_connection_t& connection) {
+        return connection.kind == backend_type_t::PostgreSQL ? fed::fold_identifier(connection.database)
+                                                             : std::string{def_database};
+    }
+
+    const configured_connection_t* configured(std::string_view name,
+                                              std::span<const configured_connection_t> connections) {
+        const auto folded = fed::fold_identifier(std::string{name});
+        for (const auto& connection : connections) {
+            if (fed::fold_identifier(connection.name) == folded) {
+                return &connection;
+            }
+        }
+        return nullptr;
+    }
+
+    namespace {
+        // The alias `written` starts with: its connection part (four parts), or else its database part, which a
+        // client's connection.namespace.table fills.
+        const std::string& alias_of(const qualified_name_t& written) {
+            return written.connection.t.empty() ? written.database.t : written.connection.t;
+        }
+    } // namespace
+
     std::optional<std::pair<configured_connection_t, qualified_name_t>>
     registration_target(const core::error_t& error,
                         const qualified_name_t& written,
@@ -210,71 +230,90 @@ namespace otterstax::catalog {
             error.type != core::error_code_t::database_not_exists) {
             return std::nullopt;
         }
-        if (written.connection.t.empty() || written.database.t.empty() || written.schema.t.empty() ||
+        // connection.namespace.table: the engine's database slot holds the connection, its schema slot the namespace.
+        if (!written.connection.t.empty() || written.database.t.empty() || written.schema.t.empty() ||
             written.collection.t.empty()) {
             return std::nullopt;
         }
-        const auto folded = fed::fold_identifier(written.connection.t);
-        for (const auto& connection : connections) {
-            if (fed::fold_identifier(connection.name) != folded) {
-                continue;
-            }
-            if (fed::fold_identifier(connection.database) != fed::fold_identifier(written.database.t)) {
-                return std::nullopt; // a connection reaches its one database
-            }
-            // A connection configured with one `table:` is that table only, in the configured
-            // spelling; any other name of it misses.
-            if (!connection.table.empty() &&
-                fed::fold_identifier(connection.table) != fed::fold_identifier(written.collection.t)) {
+        const auto* connection = configured(written.database.t, connections);
+        if (connection == nullptr) {
+            return std::nullopt;
+        }
+        const auto& space = written.schema.t;
+        // A connection configured with one `table:` is that table only, in the configured spelling; any other name
+        // of it misses.
+        if (!connection->table.empty() &&
+            fed::fold_identifier(connection->table) != fed::fold_identifier(written.collection.t)) {
+            return std::nullopt;
+        }
+        const std::string& table = connection->table.empty() ? written.collection.t : connection->table;
+        if (connection->kind != backend_type_t::PostgreSQL) {
+            // Every database of the server is a namespace of the connection; one configured `table:` is that
+            // table of the configured database.
+            if (!connection->table.empty() &&
+                fed::fold_identifier(connection->database) != fed::fold_identifier(space)) {
                 return std::nullopt;
             }
-            const std::string& table = connection.table.empty() ? written.collection.t : connection.table;
-            if (connection.kind != backend_type_t::PostgreSQL) {
-                if (fed::fold_identifier(written.schema.t) != "public") {
-                    return std::nullopt;
-                }
-                return std::pair{connection,
-                                 qualified_name_t{core::connection_name_t{connection.name},
-                                                  core::dbname_t{connection.database},
-                                                  core::schema_t{},
-                                                  core::relname_t{table}}};
-            }
-            if (!connection.schema.empty() &&
-                fed::fold_identifier(connection.schema) != fed::fold_identifier(written.schema.t)) {
-                return std::nullopt;
-            }
-            return std::pair{connection,
-                             qualified_name_t{core::connection_name_t{connection.name},
-                                              core::dbname_t{connection.database},
-                                              core::schema_t{connection.schema.empty() ? written.schema.t
-                                                                                       : connection.schema},
+            return std::pair{*connection,
+                             qualified_name_t{core::connection_name_t{connection->name},
+                                              core::dbname_t{connection->table.empty() ? space : connection->database},
+                                              core::schema_t{},
                                               core::relname_t{table}}};
         }
-        return std::nullopt;
+        if (!connection->schema.empty() && fed::fold_identifier(connection->schema) != fed::fold_identifier(space)) {
+            return std::nullopt;
+        }
+        return std::pair{*connection,
+                         qualified_name_t{core::connection_name_t{connection->name},
+                                          core::dbname_t{connection->database},
+                                          core::schema_t{connection->schema.empty() ? space : connection->schema},
+                                          core::relname_t{table}}};
+    }
+
+    core::result_wrapper_t<std::string> client_place(std::pmr::memory_resource* resource,
+                                                     std::string_view named,
+                                                     std::span<const configured_connection_t> connections) {
+        OTX_ZONE_N("catalog::client_place");
+        if (named.empty()) {
+            return std::string{};
+        }
+        const auto dot = named.find('.');
+        if (dot != std::string_view::npos && named.find('.', dot + 1) != std::string_view::npos) {
+            const std::string what =
+                "\"" + std::string{named} + "\": a database is connection[.namespace] or local[.namespace]";
+            return core::error_t(core::error_code_t::invalid_parameter, std::pmr::string{what.c_str(), resource});
+        }
+        const auto first = named.substr(0, dot);
+        const bool local = fed::fold_identifier(std::string{first}) == fed::local_database;
+        const auto* connection = local ? nullptr : configured(first, connections);
+        if (!local && connection == nullptr) {
+            const std::string what = "database \"" + std::string{named} + "\" does not exist";
+            return core::error_t(core::error_code_t::database_not_exists, std::pmr::string{what.c_str(), resource});
+        }
+        if (dot != std::string_view::npos) {
+            return std::string{named};
+        }
+        if (local) {
+            return std::string{fed::local_database} + ".public";
+        }
+        if (connection->kind == backend_type_t::PostgreSQL) {
+            return connection->name + "." + (connection->schema.empty() ? std::string{"public"} : connection->schema);
+        }
+        return connection->name + "." + connection->database;
     }
 
     core::error_t check_table_scope(std::pmr::memory_resource* resource,
                                     const qualified_name_t& written,
                                     std::span<const configured_connection_t> connections) {
         OTX_ZONE_N("catalog::check_table_scope");
-        if (written.connection.t.empty()) {
+        const auto* connection = configured(alias_of(written), connections);
+        if (connection == nullptr || connection->table.empty() ||
+            fed::fold_identifier(connection->table) == fed::fold_identifier(written.collection.t)) {
             return core::error_t::no_error();
         }
-        const auto folded = fed::fold_identifier(written.connection.t);
-        for (const auto& connection : connections) {
-            if (fed::fold_identifier(connection.name) != folded) {
-                continue;
-            }
-            if (connection.table.empty() ||
-                fed::fold_identifier(connection.table) == fed::fold_identifier(written.collection.t)) {
-                return core::error_t::no_error();
-            }
-            const std::string what = "connection \"" + connection.name + "\" is configured with table \"" +
-                                     connection.table + "\": DDL of its table \"" + written.collection.t +
-                                     "\" is refused";
-            return core::error_t(core::error_code_t::invalid_parameter, std::pmr::string{what.c_str(), resource});
-        }
-        return core::error_t::no_error();
+        const std::string what = "connection \"" + connection->name + "\" is configured with table \"" +
+                                 connection->table + "\": DDL of its table \"" + written.collection.t + "\" is refused";
+        return core::error_t(core::error_code_t::invalid_parameter, std::pmr::string{what.c_str(), resource});
     }
 
     core::error_t register_connections(std::pmr::memory_resource* resource,
@@ -293,9 +332,9 @@ namespace otterstax::catalog {
             return nullptr;
         };
         auto failure = [resource](const std::string& what, const core::error_t& error) {
-            return core::error_t(error.type,
-                                 std::pmr::string{("registration: " + what + ": " + std::string{error.what}).c_str(),
-                                                  resource});
+            return core::error_t(
+                error.type,
+                std::pmr::string{("registration: " + what + ": " + std::string{error.what}).c_str(), resource});
         };
         auto no_cursor = [resource](const std::string& what) {
             return core::error_t(core::error_code_t::internal_error,
@@ -333,16 +372,51 @@ namespace otterstax::catalog {
             err.contains_error()) {
             return err;
         }
-        if (auto created = read("CREATE TABLE IF NOT EXISTS " + names_table +
-                                " (table_oid BIGINT, attoid BIGINT, remote_name TEXT, remote_container TEXT, remote_type TEXT);");
+        if (auto err = run(plan_of(resource,
+                                   components::logical_plan::make_node_create_database(
+                                       resource,
+                                       qualified_name_t{core::dbname_t{std::string{fed::local_database}},
+                                                        core::schema_t{},
+                                                        core::relname_t{}},
+                                       true)),
+                           "CREATE DATABASE local");
+            err.contains_error()) {
+            return err;
+        }
+        // A session has no place until its client names one (client_place): a fresh session reads ''.
+        if (auto unplaced = read("ALTER SYSTEM SET search_path = '';"); unplaced.has_error()) {
+            return unplaced.error();
+        }
+        // The engine refuses a first part that is both a connection and a local database as ambiguous: such an
+        // alias is refused here, before anything of it is registered.
+        auto locals = read("SELECT datname FROM pg_catalog.pg_database WHERE datconnection = '';");
+        if (locals.has_error()) {
+            return locals.error();
+        }
+        std::set<std::string> local_databases;
+        for (const auto& chunk : locals.value()->chunks()) {
+            for (std::uint64_t row = 0; row < chunk.size(); ++row) {
+                local_databases.insert(fed::fold_identifier(text_at(chunk.data[0], row)));
+            }
+        }
+        for (const auto& discovery : connections) {
+            if (local_databases.contains(fed::fold_identifier(discovery.connection.name))) {
+                const std::string what = "registration: connection \"" + discovery.connection.name +
+                                         "\" has the name of a local database; rename it in config.yaml";
+                return core::error_t(core::error_code_t::invalid_parameter, std::pmr::string{what.c_str(), resource});
+            }
+        }
+        if (auto created =
+                read("CREATE TABLE IF NOT EXISTS " + names_table +
+                     " (table_oid BIGINT, attoid BIGINT, remote_name TEXT, remote_container TEXT, remote_type TEXT);");
             created.has_error()) {
             return created.error();
         }
-        auto names_oid = read("SELECT c.oid FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON c.relnamespace "
-                              "= n.oid JOIN pg_catalog.pg_database d ON n.nspdatabase = d.oid WHERE d.datname = '" +
-                              std::string{fed::metadata_database} + "' AND d.datconnection = '' AND n.nspname = '" +
-                              std::string{fed::metadata_schema} + "' AND c.relname = '" +
-                              std::string{fed::remote_names_table} + "';");
+        auto names_oid = read(
+            "SELECT c.oid FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON c.relnamespace "
+            "= n.oid JOIN pg_catalog.pg_database d ON n.nspdatabase = d.oid WHERE d.datname = '" +
+            std::string{fed::metadata_database} + "' AND d.datconnection = '' AND n.nspname = '" +
+            std::string{fed::metadata_schema} + "' AND c.relname = '" + std::string{fed::remote_names_table} + "';");
         if (names_oid.has_error()) {
             return names_oid.error();
         }
@@ -350,7 +424,8 @@ namespace otterstax::catalog {
             if (chunk.size() > 0) {
                 for (const auto& discovery : connections) {
                     if (discovery.connection.actor != nullptr) { // a connection left out has none
-                        discovery.connection.actor->set_names_table(static_cast<fed::oid_t>(integer_at(chunk.data[0], 0)));
+                        discovery.connection.actor->set_names_table(
+                            static_cast<fed::oid_t>(integer_at(chunk.data[0], 0)));
                     }
                 }
             }
@@ -358,8 +433,10 @@ namespace otterstax::catalog {
 
         // The spelling the host table keeps.
         std::map<fed::oid_t, std::pair<std::string, std::string>> spelled_tables; // oid -> (table, container)
-        std::map<std::pair<fed::oid_t, fed::oid_t>, std::pair<std::string, std::string>> spelled_columns; // (name, type)
-        auto names = read("SELECT table_oid, attoid, remote_name, remote_container, remote_type FROM " + names_table + ";");
+        std::map<std::pair<fed::oid_t, fed::oid_t>, std::pair<std::string, std::string>>
+            spelled_columns; // (name, type)
+        auto names =
+            read("SELECT table_oid, attoid, remote_name, remote_container, remote_type FROM " + names_table + ";");
         if (names.has_error()) {
             return names.error();
         }
@@ -377,9 +454,10 @@ namespace otterstax::catalog {
 
         // The catalog's tables of every connection, with their live columns.
         std::map<fed::oid_t, catalog_table_t> catalog;
-        auto tables = read("SELECT d.datconnection, d.datname, n.nspname, c.relname, c.oid FROM pg_catalog.pg_database d "
-                           "JOIN pg_catalog.pg_namespace n ON n.nspdatabase = d.oid JOIN pg_catalog.pg_class c ON "
-                           "c.relnamespace = n.oid WHERE d.datconnection <> '' AND c.relkind = 'r';");
+        auto tables =
+            read("SELECT d.datconnection, d.datname, n.nspname, c.relname, c.oid FROM pg_catalog.pg_database d "
+                 "JOIN pg_catalog.pg_namespace n ON n.nspdatabase = d.oid JOIN pg_catalog.pg_class c ON "
+                 "c.relnamespace = n.oid WHERE d.datconnection <> '' AND c.relkind = 'r';");
         if (tables.has_error()) {
             return tables.error();
         }
@@ -464,7 +542,7 @@ namespace otterstax::catalog {
             }
             std::vector<std::pair<execution_plan_t, std::string>> drops;   // the plan, the table
             std::vector<std::pair<execution_plan_t, std::string>> changes; // the plan, the table
-            std::vector<std::pair<fed::oid_t, std::string>> staged;          // the columns stage_column kept
+            std::vector<std::pair<fed::oid_t, std::string>> staged;        // the columns stage_column kept
             fed::discovered_tables_t added{resource};
             std::set<std::string> desired;
             for (const auto& discovered : discovery.tables) {
@@ -510,8 +588,9 @@ namespace otterstax::catalog {
             }
             for (const auto& [key, entry] : existing) {
                 if (!desired.contains(key)) {
-                    auto drop = components::logical_plan::make_node_drop(resource,
-                                                                         components::logical_plan::drop_target_kind::collection);
+                    auto drop = components::logical_plan::make_node_drop(
+                        resource,
+                        components::logical_plan::drop_target_kind::collection);
                     drop->set_target(entry->table.name);
                     drops.emplace_back(plan_of(resource, std::move(drop)), entry->table.name.to_string());
                 }
@@ -573,5 +652,4 @@ namespace otterstax::catalog {
         }
         return core::error_t::no_error();
     }
-
 } // namespace otterstax::catalog

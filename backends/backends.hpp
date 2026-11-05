@@ -13,7 +13,6 @@
 #include <memory_resource>
 
 namespace otterstax::backends {
-
     // Two startup steps of main.cpp after the engine opened, run by the
     // assembling thread before any frontend accepts a client. The S3 / file /
     // Kafka actors they touch are owned by main (a test: its stack) and spawned
@@ -32,10 +31,9 @@ namespace otterstax::backends {
     // (catalog::register_connections: the host table of the backends'
     // spelling, the catalog's tables handed to their connections' actors, every
     // connection that answered brought in line with its discovery, no SQL to a
-    // backend), on the actors' registration session. Blocks the calling
+    // backend; the local database and the sessions' empty place, connections or
+    // none), on the actors' registration session. Blocks the calling
     // (assembling) thread; an engine refusal is the error and startup aborts.
-    [[nodiscard]] core::error_t register_remote_tables(std::pmr::memory_resource* resource,
-                                                       runtime::engine_t& engine,
-                                                       remote_backends_t& remote);
-
+    [[nodiscard]] core::error_t
+    register_remote_tables(std::pmr::memory_resource* resource, runtime::engine_t& engine, remote_backends_t& remote);
 } // namespace otterstax::backends

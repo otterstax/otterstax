@@ -1,5 +1,5 @@
 -- Step 4: gold customers paired with the warehouse in their city.
--- pg.shop.shop.customers (PG ENUM `tier`) × local otter.warehouses (composite
+-- pg.shop.customers (PG ENUM `tier`) × local local.otter.warehouses (composite
 -- `location`). ENUM cast in WHERE, struct field access on the JOIN key
 -- and projection.
 SELECT c.name,
@@ -10,8 +10,8 @@ SELECT c.name,
        (w.location).city      AS warehouse_city,
        (w.location).country   AS warehouse_country,
        (w.location).zip       AS warehouse_zip
-FROM   pg.shop.shop.customers c
-INNER JOIN otter.warehouses w
+FROM   pg.shop.customers c
+INNER JOIN local.otter.warehouses w
         ON c.addr_city = (w.location).city
 WHERE  c.tier = 'gold'::tier_t
   AND  (w.location).country IN ('DE','IL','US')

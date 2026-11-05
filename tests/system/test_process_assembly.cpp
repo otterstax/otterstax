@@ -39,19 +39,18 @@
 #include <chrono>
 #include <condition_variable>
 #include <filesystem>
+#include <memory>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <utility>
 #include <vector>
-#include <memory>
-#include <string>
 
 using otterstax::session::query_session_t;
 using otterstax::test::await_session;
 using otterstax::test::stmt;
 
 namespace {
-
     using namespace std::chrono_literals;
 
     // A remote statement held on its backend until the test lets it go: the
@@ -90,9 +89,9 @@ namespace {
         using mysql::MockConnector::MockConnector;
         using mysql::MockConnector::runQuery;
 
-        boost::asio::awaitable<core::result_wrapper_t<std::unique_ptr<components::vector::data_chunk_t>>>
-        runQuery(std::string_view,
-                 otterstax::function_ref_t<std::unique_ptr<components::vector::data_chunk_t>(const boost::mysql::results&)>)
+        boost::asio::awaitable<core::result_wrapper_t<std::unique_ptr<components::vector::data_chunk_t>>> runQuery(
+            std::string_view,
+            otterstax::function_ref_t<std::unique_ptr<components::vector::data_chunk_t>(const boost::mysql::results&)>)
             override {
             backend_gate().enter();
             co_return std::make_unique<components::vector::data_chunk_t>(get_chunk());
@@ -101,9 +100,11 @@ namespace {
 
     std::unique_ptr<mysql::IConnector> gated_mysql_factory(std::pmr::memory_resource* resource,
                                                            boost::asio::io_context&,
-                                                           boost::mysql::connect_params,
+                                                           boost::mysql::connect_params params,
                                                            std::string alias) {
-        return std::make_unique<gated_connector>(mock_config{.resource = resource}, std::move(alias));
+        return std::make_unique<gated_connector>(mock_config{.resource = resource},
+                                                 std::move(alias),
+                                                 std::move(params));
     }
 
     // A MySQL server that refuses every connection while `down` is set.
@@ -118,8 +119,9 @@ namespace {
 
         core::error_t connect() override {
             if (backend_down().load()) {
-                return core::error_t(core::error_code_t::io_error,
-                                     std::pmr::string{"the test backend refuses connections", std::pmr::new_delete_resource()});
+                return core::error_t(
+                    core::error_code_t::io_error,
+                    std::pmr::string{"the test backend refuses connections", std::pmr::new_delete_resource()});
             }
             return mysql::MockConnector::connect();
         }
@@ -127,9 +129,11 @@ namespace {
 
     std::unique_ptr<mysql::IConnector> switchable_mysql_factory(std::pmr::memory_resource* resource,
                                                                 boost::asio::io_context&,
-                                                                boost::mysql::connect_params,
+                                                                boost::mysql::connect_params params,
                                                                 std::string alias) {
-        return std::make_unique<switchable_connector>(mock_config{.resource = resource}, std::move(alias));
+        return std::make_unique<switchable_connector>(mock_config{.resource = resource},
+                                                      std::move(alias),
+                                                      std::move(params));
     }
 
     config::ServiceConfig local_ports() {
@@ -216,8 +220,7 @@ namespace {
                                                                          otterstax::runtime::engine_t& engine,
                                                                          otterstax::backends::remote_backends_t& remote,
                                                                          const backend_actors_t& actors) {
-        REQUIRE_FALSE(otterstax::backends::register_remote_tables(runtime.resource(), engine, remote)
-                          .contains_error());
+        REQUIRE_FALSE(otterstax::backends::register_remote_tables(runtime.resource(), engine, remote).contains_error());
         auto services = otterstax::session::make_session_services(runtime.resource(),
                                                                   engine.dispatcher_address(),
                                                                   actors.s3->address(),
@@ -226,7 +229,9 @@ namespace {
                                                                   actors.kafka->object_names(),
                                                                   remote.connections());
         REQUIRE_FALSE(services.has_error());
-        return std::make_unique<otterstax::session::session_factory_t>(runtime, &make_parser, std::move(services.value()));
+        return std::make_unique<otterstax::session::session_factory_t>(runtime,
+                                                                       &make_parser,
+                                                                       std::move(services.value()));
     }
 
     std::unique_ptr<otterstax::runtime::engine_t> open_engine(otterstax::runtime::runtime_t& runtime,
@@ -254,7 +259,6 @@ namespace {
         REQUIRE_FALSE(err.contains_error());
         return remote;
     }
-
 } // namespace
 
 // A statement holds a backends thread for its whole remote call: the auto size
@@ -358,8 +362,8 @@ TEST_CASE("process modules: shutdown runs frontends then sessions then backends 
             REQUIRE_FALSE(r.has_error());
         };
         run(1, "CREATE SCHEMA shut;");
-        run(2, "CREATE TABLE shut.t (id bigint);");
-        std::string insert = "INSERT INTO shut.t (id) VALUES ";
+        run(2, "CREATE TABLE local.shut.t (id bigint);");
+        std::string insert = "INSERT INTO local.shut.t (id) VALUES ";
         for (std::size_t i = 0; i < rows; ++i) {
             insert += (i == 0 ? "(" : ", (") + std::to_string(i) + ")";
         }
@@ -386,7 +390,7 @@ TEST_CASE("process modules: shutdown runs frontends then sessions then backends 
         // What the statement committed is on disk.
         otterstax::test::test_engine_t reopened(dir, /*fresh=*/false);
         reopened.remove_on_exit();
-        auto cursor = reopened.sql("SELECT id FROM shut.t;");
+        auto cursor = reopened.sql("SELECT id FROM local.shut.t;");
         REQUIRE(cursor);
         INFO((cursor->is_error() ? cursor->get_error().what.c_str() : ""));
         REQUIRE_FALSE(cursor->is_error());
@@ -426,7 +430,7 @@ TEST_CASE("process modules: shutdown waits for a remote statement in flight") {
         auto in_flight = actor_zeta::send(session->address(),
                                           &query_session_t::execute,
                                           stmt(1),
-                                          std::string{"SELECT * FROM slowdb.db.public.\"table\";"})
+                                          std::string{"SELECT * FROM slowdb.db.\"table\";"})
                              .second;
         // The statement is on its backend, held there.
         REQUIRE(gate.wait_started(10000ms));
@@ -464,14 +468,14 @@ TEST_CASE("process modules: an unreachable connection fails its statements, not 
     otterstax::test::remote_setup_t setup;
     setup.connectors.mysql = &switchable_mysql_factory;
     setup.connections.mysql = otterstax::test::mock_mysql({"down"});
-    const std::string remote_select = "SELECT * FROM down.db.public.\"table\";";
+    const std::string remote_select = "SELECT * FROM down.db.\"table\";";
 
     // Up at the first start: its table is registered and read.
     backend_down() = false;
     {
         otterstax::test::test_engine_t up(dir, /*fresh=*/true, setup);
-        REQUIRE_FALSE(otterstax::backends::register_remote_tables(up.resource(), up.engine(), up.remote())
-                          .contains_error());
+        REQUIRE_FALSE(
+            otterstax::backends::register_remote_tables(up.resource(), up.engine(), up.remote()).contains_error());
         auto rows = up.sql(remote_select);
         REQUIRE(rows);
         INFO((rows->is_error() ? rows->get_error().what.c_str() : ""));
@@ -487,10 +491,9 @@ TEST_CASE("process modules: an unreachable connection fails its statements, not 
         REQUIRE(restarted.remote().discovered().size() == 1);
         CHECK_FALSE(restarted.remote().discovered().front().discovered);
         REQUIRE(restarted.remote().discovered().front().connection.actor != nullptr);
-        REQUIRE_FALSE(otterstax::backends::register_remote_tables(restarted.resource(),
-                                                                  restarted.engine(),
-                                                                  restarted.remote())
-                          .contains_error());
+        REQUIRE_FALSE(
+            otterstax::backends::register_remote_tables(restarted.resource(), restarted.engine(), restarted.remote())
+                .contains_error());
         auto refused = restarted.sql(remote_select);
         REQUIRE(refused);
         CHECK(refused->is_error());

@@ -24,10 +24,9 @@ namespace components::logical_plan {
 
 namespace otterstax::kafka {
     // The Kafka objects (a SOURCE's backing table, the name an INSERT into a
-    // SOURCE or STREAM is written with) live in the schema `kafka` of otterbrix's
-    // default database `main`: `kafka.x` from the default place main.public,
-    // `main.kafka.x` in full.
-    inline constexpr const char* KAFKA_DATABASE_NAME = "main";
+    // SOURCE or STREAM is written with) live in the schema `kafka` of the clients'
+    // local database: `kafka.x` from a place in local, `local.kafka.x` in full.
+    inline constexpr const char* KAFKA_DATABASE_NAME = "local"; // federation::local_database (catalog/ownership.cpp)
     inline constexpr const char* KAFKA_SCHEMA_NAME = "kafka";
     // Kafka's bookkeeping (`__sources`, `<source>__offsets`) lives in the schema
     // `kafka` of OtterStax's service database `federation`
@@ -185,5 +184,4 @@ namespace otterstax::kafka {
     // object a STREAM or an INSERT INTO query reads
     const components::logical_plan::node_aggregate_t*
     kafka_find_aggregate(const components::logical_plan::node_ptr& root);
-
 } // namespace otterstax::kafka

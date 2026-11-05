@@ -2,14 +2,14 @@
 -- Requires example 6 (for the `qs` schema). A small scratch table shows the
 -- full lifecycle; UPDATE reports the number of rows it changed ("UPDATE 2").
 -- (DELETE works the same way and reports "DELETE N"; the same statements also
---  work on the S3-loaded qs.* tables.)
-CREATE TABLE qs.scratch (id bigint, label string, qty bigint);
+--  work on the S3-loaded local.qs.* tables.)
+CREATE TABLE local.qs.scratch (id bigint, label string, qty bigint);
 
-INSERT INTO qs.scratch (id, label, qty) VALUES
+INSERT INTO local.qs.scratch (id, label, qty) VALUES
   (1, 'alpha', 1), (2, 'beta', 2), (3, 'gamma', 3);
 
-UPDATE qs.scratch SET qty = qty * 10 WHERE id <= 2;   -- rows 1 & 2
+UPDATE local.qs.scratch SET qty = qty * 10 WHERE id <= 2;   -- rows 1 & 2
 
-SELECT * FROM qs.scratch ORDER BY id;
+SELECT * FROM local.qs.scratch ORDER BY id;
 
-DROP TABLE qs.scratch;
+DROP TABLE local.qs.scratch;

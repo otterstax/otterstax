@@ -30,7 +30,6 @@
 #include <vector>
 
 namespace {
-
     using components::vector::data_chunk_t;
     using components::vector::DEFAULT_VECTOR_CAPACITY;
     namespace fed = otterstax::federation;
@@ -82,10 +81,9 @@ namespace {
         bool isClosed() const noexcept override { return false; }
         std::string alias() const noexcept override { return alias_; }
 
-        boost::asio::awaitable<core::result_wrapper_t<std::unique_ptr<data_chunk_t>>>
-        runQuery(std::string_view query,
-                 otterstax::function_ref_t<std::unique_ptr<data_chunk_t>(const ch::select_result_t&)> handler)
-            override {
+        boost::asio::awaitable<core::result_wrapper_t<std::unique_ptr<data_chunk_t>>> runQuery(
+            std::string_view query,
+            otterstax::function_ref_t<std::unique_ptr<data_chunk_t>(const ch::select_result_t&)> handler) override {
             {
                 std::lock_guard guard(g_mutex);
                 g_statements.emplace_back(query);
@@ -96,7 +94,8 @@ namespace {
         }
 
         boost::asio::awaitable<core::result_wrapper_t<int64_t>>
-        runQuery(std::string_view query, otterstax::function_ref_t<int64_t(const ch::select_result_t&)> handler) override {
+        runQuery(std::string_view query,
+                 otterstax::function_ref_t<int64_t(const ch::select_result_t&)> handler) override {
             {
                 std::lock_guard guard(g_mutex);
                 g_statements.emplace_back(query);
@@ -129,7 +128,8 @@ namespace {
 
     config::ConnectionsConfig ch_connection() {
         config::ConnectionsConfig connections;
-        connections.clickhouse.push_back(config::ChConnectionDesc{.alias = kUid, .host = "mock", .database = "ev", .table = "orders"});
+        connections.clickhouse.push_back(
+            config::ChConnectionDesc{.alias = kUid, .host = "mock", .database = "ev", .table = "orders"});
         return connections;
     }
 
@@ -144,7 +144,6 @@ namespace {
             return agent.write(std::move(sql), kind);
         }
     };
-
 } // namespace
 
 TEST_CASE("ClickHouse agent write: an INSERT reports the server's written rows as its affected count") {
@@ -199,20 +198,23 @@ TEST_CASE("ClickHouse DML through a session: INSERT answers written_rows and DEL
     otterstax::test::session_stack_owner owner(otterstax::test::unique_test_dir("test_ch_dml_session"), options);
     const auto s = owner.stack();
 
-    auto inserted = otterstax::test::run_session_sql_payload(
-        s, 1, std::string{"INSERT INTO "} + kUid + ".ev.public.orders (id, name) VALUES (1, 'a'), (2, 'b');");
+    auto inserted = otterstax::test::run_session_sql_payload(s,
+                                                             1,
+                                                             std::string{"INSERT INTO "} + kUid +
+                                                                 ".ev.orders (id, name) VALUES (1, 'a'), (2, 'b');");
     INFO((inserted.has_error() ? inserted.error().what.c_str() : "ok"));
     REQUIRE_FALSE(inserted.has_error());
     REQUIRE(inserted.value().column_count() == 0);
     REQUIRE(inserted.value().reported_rows() == 4);
 
     auto deleted =
-        otterstax::test::run_session_sql_payload(s, 2, std::string{"DELETE FROM "} + kUid + ".ev.public.orders WHERE id = 1;");
+        otterstax::test::run_session_sql_payload(s, 2, std::string{"DELETE FROM "} + kUid + ".ev.orders WHERE id = 1;");
     INFO((deleted.has_error() ? deleted.error().what.c_str() : "ok"));
     REQUIRE_FALSE(deleted.has_error());
     REQUIRE(deleted.value().reported_rows() == 0);
 
     std::lock_guard guard(g_mutex);
-    REQUIRE(g_statements == std::vector<std::string>{"INSERT INTO `ev`.`orders` (`id`, `name`) VALUES (1, 'a'), (2, 'b');",
-                                                     "DELETE FROM `ev`.`orders` WHERE `id` = 1;"});
+    REQUIRE(g_statements ==
+            std::vector<std::string>{"INSERT INTO `ev`.`orders` (`id`, `name`) VALUES (1, 'a'), (2, 'b');",
+                                     "DELETE FROM `ev`.`orders` WHERE `id` = 1;"});
 }

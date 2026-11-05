@@ -7,24 +7,23 @@ E2E test: the Spark Connect catalog API (spark.catalog.*) of OtterStax.
 The mapping under test, in catalog "otterstax" (frontend/spark_connect_server/
 catalog_rows.hpp):
   * a database is a schema, named as SQL writes it: `d.s` for the schema s of
-    the local database d, `c.d.s` for a schema of the database d of the
-    connection c (MySQL / ClickHouse: the schema `public`; PostgreSQL: the
-    backend's schema);
-  * Table.namespace is [c, d, s] for a remote table and [d, s] for a local
-    one, so ".".join(namespace + [name]) is the qualified name of a table —
-    the one tableExists / getTable / listColumns take and spark.table() reads.
+    the local database d, `c.s` for a schema of the connection c — its
+    backend's database on MySQL / ClickHouse, its schema on PostgreSQL;
+  * Table.namespace is [c, s] for a remote table and [d, s] for a local one,
+    so ".".join(namespace + [name]) is the qualified name of a table — the one
+    tableExists / getTable / listColumns take and spark.table() reads.
 
-setup() creates a local schema of the database `main` (the session's place) and
-a table in it through spark.sql() under a unique name (the matrix runs several
-clients against one server at once); cleanup() drops them.
+setup() creates a local schema and a table in it through spark.sql() under a
+unique name (the matrix runs several clients against one server at once);
+cleanup() drops them.
 
 Cases:
   test_current_catalog_is_otterstax — currentCatalog() is "otterstax", listCatalogs() lists it
   test_list_databases               — both connections' schemas and the local schema, in catalog "otterstax"
   test_database_exists              — true for those, false for an unknown name
-  test_list_tables_mysql_mirror     — listTables("campaigns.db1.public") -> namespace [campaigns, db1, public]
-  test_list_tables_pg_mirror        — listTables("products.pgdb.public") -> namespace [products, pgdb, public]
-  test_list_tables_local            — listTables("main.<schema>") -> namespace [main, <schema>]
+  test_list_tables_mysql_mirror     — listTables("campaigns.db1") -> namespace [campaigns, db1]
+  test_list_tables_pg_mirror        — listTables("products.public") -> namespace [products, public]
+  test_list_tables_local            — listTables("local.<schema>") -> namespace [local, <schema>]
   test_table_exists                 — by (name, database) and by qualified name; unknown -> false
   test_get_table                    — getTable(qualified name) -> name, catalog, namespace
   test_list_columns                 — listColumns(qualified name) -> column names in table order
@@ -55,9 +54,9 @@ CATALOG = "otterstax"
 # namespace and its column names in table order.
 Expected = namedtuple("Expected", "database name namespace columns")
 
-MYSQL_MIRROR = Expected("campaigns.db1.public", "campaigns", ["campaigns", "db1", "public"],
+MYSQL_MIRROR = Expected("campaigns.db1", "campaigns", ["campaigns", "db1"],
                         ["campaign_id", "campaign_name", "campaign_length", "budget"])
-PG_MIRROR = Expected("products.pgdb.public", "products", ["products", "pgdb", "public"],
+PG_MIRROR = Expected("products.public", "products", ["products", "public"],
                      ["product_id", "campaign_id", "product_name", "price", "category"])
 
 LOCAL_TABLE = "items"
@@ -67,14 +66,17 @@ LOCAL_ROWS = [(1, "one"), (2, "two"), (3, "three")]
 class SparkCatalogTest:
     def __init__(self, local=False):
         self.url = f"sc://{config.get_host(local)}:{config.SPARK_CONNECT_PORT}"
-        # A schema of `main`, the session's place: `<schema>.<table>` names its
-        # tables, Spark lists it as the database `main.<schema>`.
+        # A schema of `local`, the clients' own database.
         self.db = f"spark_catalog_{uuid.uuid4().hex[:8]}"
-        self.local = Expected(f"main.{self.db}", LOCAL_TABLE, ["main", self.db], ["id", "name"])
+        # Spark sessions have no place: one- and two-part table names are
+        # refused, so every table statement names its tables in full. The
+        # catalog API takes the schema's database name, `local.<schema>`.
+        self.local_db = f"local.{self.db}"
+        self.local = Expected(self.local_db, LOCAL_TABLE, ["local", self.db], ["id", "name"])
         self.spark = None
         self.db_created = False
         self.table_created = False
-        print(f"PySpark client {pyspark.__version__}, Spark Connect server {self.url}, local schema main.{self.db}")
+        print(f"PySpark client {pyspark.__version__}, Spark Connect server {self.url}, local schema local.{self.db}")
 
     # --- helpers ---
 
@@ -110,18 +112,18 @@ class SparkCatalogTest:
         self.spark = SparkSession.builder.remote(self.url).getOrCreate()
         self.spark.sql(f"CREATE SCHEMA {self.db}")
         self.db_created = True
-        self.spark.sql(f"CREATE TABLE {self.db}.{LOCAL_TABLE} (id bigint, name string)")
+        self.spark.sql(f"CREATE TABLE {self.local_db}.{LOCAL_TABLE} (id bigint, name string)")
         self.table_created = True
         values = ", ".join(f"({i}, '{name}')" for i, name in LOCAL_ROWS)
-        self.spark.sql(f"INSERT INTO {self.db}.{LOCAL_TABLE} (id, name) VALUES {values}")
-        print(f"  created {self.db}.{LOCAL_TABLE} with {len(LOCAL_ROWS)} rows")
+        self.spark.sql(f"INSERT INTO {self.local_db}.{LOCAL_TABLE} (id, name) VALUES {values}")
+        print(f"  created {self.local_db}.{LOCAL_TABLE} with {len(LOCAL_ROWS)} rows")
 
     def cleanup(self):
         if self.spark is None:
             return
         try:
             if self.table_created:
-                self.spark.sql(f"DROP TABLE {self.db}.{LOCAL_TABLE}")
+                self.spark.sql(f"DROP TABLE {self.local_db}.{LOCAL_TABLE}")
             if self.db_created:
                 self.spark.sql(f"DROP SCHEMA {self.db}")
                 print(f"  dropped {self.db}")
@@ -158,11 +160,11 @@ class SparkCatalogTest:
               "false for an unknown name and a bare alias")
 
     def test_list_tables_mysql_mirror(self):
-        """listTables(<alias.db.public>) lists a MySQL table under namespace [alias, db, public]."""
+        """listTables(<alias.db>) lists a MySQL table under namespace [alias, db]."""
         self.assert_table(self.listed_table(MYSQL_MIRROR), MYSQL_MIRROR, f"listTables({MYSQL_MIRROR.database!r})")
 
     def test_list_tables_pg_mirror(self):
-        """listTables(<alias.db.schema>) lists a PostgreSQL table under namespace [alias, db, schema]."""
+        """listTables(<alias.schema>) lists a PostgreSQL table under namespace [alias, schema]."""
         self.assert_table(self.listed_table(PG_MIRROR), PG_MIRROR, f"listTables({PG_MIRROR.database!r})")
 
     def test_list_tables_local(self):

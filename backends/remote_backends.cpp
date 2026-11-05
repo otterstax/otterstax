@@ -21,9 +21,7 @@
 #include <utility>
 
 namespace otterstax::backends {
-
     namespace {
-
         // The connections config.yaml opens to one backend kind.
         template<typename Descriptors>
         std::size_t opened_connections(const Descriptors& entries) noexcept {
@@ -130,7 +128,6 @@ namespace otterstax::backends {
         std::string schema_of(const config::MysqlConnectionDesc&) { return {}; }
         std::string schema_of(const config::PgConnectionDesc& c) { return c.schema; }
         std::string schema_of(const config::ChConnectionDesc&) { return {}; }
-
     } // namespace
 
     std::size_t backends_threads(std::size_t configured, const config::ConnectionsConfig& connections) {
@@ -213,8 +210,11 @@ namespace otterstax::backends {
                 }
                 return agents;
             };
+            // A MySQL / ClickHouse connection sees every database of its server; one configured `table:` is
+            // that table of the configured database.
+            const bool whole_server = kind != backend_type_t::PostgreSQL && c.table.empty();
             const qualified_name_t scope{core::connection_name_t{c.alias},
-                                         core::dbname_t{c.database},
+                                         core::dbname_t{whole_server ? std::string{} : c.database},
                                          core::schema_t{schema_of(c)},
                                          core::relname_t{c.table}};
             std::vector<federation::backend_agent_ptr> agents;
@@ -235,8 +235,9 @@ namespace otterstax::backends {
                     for (auto& agent : agents) {
                         if (auto failed = agent->connect(); failed.contains_error()) {
                             unusable = agent->session_refused();
-                            return open_failure_t{unusable ? open_failure_kind_t::unusable : open_failure_kind_t::unreachable,
-                                                  core::error_t(failed.type, std::pmr::string{failed.what.c_str(), resource_})};
+                            return open_failure_t{
+                                unusable ? open_failure_kind_t::unusable : open_failure_kind_t::unreachable,
+                                core::error_t(failed.type, std::pmr::string{failed.what.c_str(), resource_})};
                         }
                     }
                     auto reply = agents.front()->discover_now(scope);
@@ -245,8 +246,9 @@ namespace otterstax::backends {
                         return open_failure_t{
                             unusable ? open_failure_kind_t::unusable : open_failure_kind_t::unreachable,
                             core::error_t(reply.error().type,
-                                          std::pmr::string{("schema discovery: " + std::string{reply.error().what.c_str()}).c_str(),
-                                                           resource_})};
+                                          std::pmr::string{
+                                              ("schema discovery: " + std::string{reply.error().what.c_str()}).c_str(),
+                                              resource_})};
                     }
                     tables = std::move(reply.value());
                     return std::nullopt;
@@ -318,15 +320,6 @@ namespace otterstax::backends {
         return out;
     }
 
-    std::vector<std::string> remote_backends_t::aliases() const {
-        std::vector<std::string> out;
-        out.reserve(discovered_.size());
-        for (const auto& discovery : discovered_) {
-            out.push_back(discovery.connection.name);
-        }
-        return out;
-    }
-
     federation::backend_actor_t* remote_backends_t::actor(std::string_view alias) const noexcept {
         for (const auto& discovery : discovered_) {
             if (discovery.connection.name == alias) {
@@ -339,5 +332,4 @@ namespace otterstax::backends {
     components::planner::primitives_t remote_backends_t::primitives() const noexcept {
         return components::planner::primitives_t{addresses_};
     }
-
 } // namespace otterstax::backends

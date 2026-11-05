@@ -32,7 +32,6 @@
 #include <vector>
 
 namespace {
-
     using namespace otterstax::test::wire;
     using namespace std::chrono_literals;
     namespace sc = ::spark::connect;
@@ -50,7 +49,7 @@ namespace {
         return options;
     }
 
-    std::string fresh(const std::string& table) { return "pg.pgdb.public." + table; }
+    std::string fresh(const std::string& table) { return "pg.public." + table; }
 
     frontend::frontend_server_config wire_config(const otterstax::test::session_stack& stack) {
         return frontend::frontend_server_config{
@@ -95,7 +94,6 @@ namespace {
         const auto* e = first_of(messages, 'E');
         return e ? pg_error_field(e->payload, 'M') : std::string{};
     }
-
 } // namespace
 
 TEST_CASE("frontend registration: a PostgreSQL Parse and Describe registers the table it missed") {
@@ -198,8 +196,8 @@ TEST_CASE("frontend registration: Spark df.schema and spark.table register the t
     });
     server.start();
     REQUIRE(server.local_port() > 0);
-    auto stub = sc::SparkConnectService::NewStub(grpc::CreateChannel("127.0.0.1:" + std::to_string(server.local_port()),
-                                                                     grpc::InsecureChannelCredentials()));
+    auto stub = sc::SparkConnectService::NewStub(
+        grpc::CreateChannel("127.0.0.1:" + std::to_string(server.local_port()), grpc::InsecureChannelCredentials()));
     constexpr const char* kSession = "00112233-4455-6677-8899-aabbccddee01";
     auto read_plan = [](const std::string& identifier) {
         sc::Plan plan;

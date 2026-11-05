@@ -22,14 +22,13 @@
 #include <string>
 
 namespace {
-
     // The first aggregate under (or at) `node` that reads a table of the connection `uid`.
-    components::logical_plan::node_ptr block_of(const components::logical_plan::node_ptr& node, const std::string& uid) {
+    components::logical_plan::node_ptr block_of(const components::logical_plan::node_ptr& node,
+                                                const std::string& uid) {
         if (!node) {
             return nullptr;
         }
-        if (node->type() == components::logical_plan::node_type::aggregate_t &&
-            node->target().connection.t == uid) {
+        if (node->type() == components::logical_plan::node_type::aggregate_t && node->target().connection.t == uid) {
             return node;
         }
         for (const auto& child : node->children()) {
@@ -66,12 +65,11 @@ namespace {
         }
     }
 
-    const char* kMysqlFilter = "SELECT id, name, status FROM mysql.bill.public.orders WHERE status = 'active' "
+    const char* kMysqlFilter = "SELECT id, name, status FROM mysql.bill.orders WHERE status = 'active' "
                                "ORDER BY id LIMIT 100";
-    const char* kPgAggregate = "SELECT category, count(*) AS n, sum(price) AS total FROM pg.shop.shop.products "
+    const char* kPgAggregate = "SELECT category, count(*) AS n, sum(price) AS total FROM pg.shop.products "
                                "WHERE price > 10 GROUP BY category HAVING count(*) > 1";
-    const char* kChFilter = "SELECT session_id, ts FROM ch.ev.public.sessions WHERE country = 'DE' AND ts > 100";
-
+    const char* kChFilter = "SELECT session_id, ts FROM ch.ev.sessions WHERE country = 'DE' AND ts > 100";
 } // namespace
 
 // ── generate_query ────────────────────────────────────────────────────────────

@@ -36,7 +36,6 @@ using fakebackend::column;
 using code = core::error_code_t;
 
 namespace {
-
     // shop.orders (id BIGINT): 1, 2.
     fakebackend::canned_table_t table_in_shop(const char* name) {
         return {"shop", "public", name, {column("id", logical_type::BIGINT)}, {{std::int64_t{1}}, {std::int64_t{2}}}};
@@ -65,7 +64,6 @@ namespace {
         ~data_dir_guard() { std::filesystem::remove_all(path); }
         std::string path;
     };
-
 } // namespace
 
 TEST_CASE("registration scope: a connection configured with one table registers no other table by a miss") {
@@ -76,12 +74,12 @@ TEST_CASE("registration scope: a connection configured with one table registers 
     options.connections.mysql.push_back(mysql_entry("one", "orders"));
     session_stack_owner owner(unique_test_dir("otterstax_scope_one_table"), options);
 
-    CHECK(rows_of(run_session_sql_payload(owner.stack(), 1, "SELECT id FROM one.shop.public.orders;")) == 2);
+    CHECK(rows_of(run_session_sql_payload(owner.stack(), 1, "SELECT id FROM one.shop.orders;")) == 2);
 
     // A table the backend got after startup, of a connection that is one table only.
     servers.server("one").add_table(table_in_shop("other"));
     servers.forget_sent();
-    auto missed = run_session_sql_payload(owner.stack(), 2, "SELECT id FROM one.shop.public.other;");
+    auto missed = run_session_sql_payload(owner.stack(), 2, "SELECT id FROM one.shop.other;");
     REQUIRE(missed.has_error());
     INFO(missed.error().what.c_str());
     CHECK(missed.error().type == code::table_not_exists);
@@ -89,7 +87,7 @@ TEST_CASE("registration scope: a connection configured with one table registers 
     CHECK(servers.sent("one").empty());
 
     // The configured table still answers.
-    CHECK(rows_of(run_session_sql_payload(owner.stack(), 3, "SELECT id FROM one.shop.public.orders;")) == 2);
+    CHECK(rows_of(run_session_sql_payload(owner.stack(), 3, "SELECT id FROM one.shop.orders;")) == 2);
 }
 
 TEST_CASE("registration scope: a miss over an unreachable connection answers the connection's failure") {
@@ -108,7 +106,7 @@ TEST_CASE("registration scope: a miss over an unreachable connection answers the
     owner.remote().actor("down")->set_unreachable_interval(std::chrono::milliseconds{0});
 
     // Nothing of `down` is registered: the miss asks its backend, which cannot be reached.
-    auto unreachable = run_session_sql_payload(owner.stack(), 1, "SELECT id FROM down.shop.public.orders;");
+    auto unreachable = run_session_sql_payload(owner.stack(), 1, "SELECT id FROM down.shop.orders;");
     REQUIRE(unreachable.has_error());
     INFO(unreachable.error().what.c_str());
     CHECK(unreachable.error().type == code::io_error);
@@ -116,14 +114,14 @@ TEST_CASE("registration scope: a miss over an unreachable connection answers the
     CHECK_FALSE(mentions(unreachable.error(), "does not exist"));
 
     // A backend that answers it has no such table: the statement's own miss.
-    auto missing = run_session_sql_payload(owner.stack(), 2, "SELECT id FROM up.shop.public.nothing;");
+    auto missing = run_session_sql_payload(owner.stack(), 2, "SELECT id FROM up.shop.nothing;");
     REQUIRE(missing.has_error());
     INFO(missing.error().what.c_str());
     CHECK(missing.error().type == code::table_not_exists);
 
     // Back up: the miss registers the table and the statement runs.
     servers.server("down").set_down(false);
-    CHECK(rows_of(run_session_sql_payload(owner.stack(), 3, "SELECT id FROM down.shop.public.orders;")) == 2);
+    CHECK(rows_of(run_session_sql_payload(owner.stack(), 3, "SELECT id FROM down.shop.orders;")) == 2);
 }
 
 TEST_CASE("registration scope: a MySQL server under NO_BACKSLASH_ESCAPES is left out on its first answer") {
@@ -141,7 +139,7 @@ TEST_CASE("registration scope: a MySQL server under NO_BACKSLASH_ESCAPES is left
     // A first start under the default sql_mode registers the table.
     {
         session_stack_owner first(dir.path, options);
-        CHECK(rows_of(run_session_sql_payload(first.stack(), 1, "SELECT id FROM nbe.shop.public.orders;")) == 2);
+        CHECK(rows_of(run_session_sql_payload(first.stack(), 1, "SELECT id FROM nbe.shop.orders;")) == 2);
     }
 
     servers.server("nbe").set_sql_mode("STRICT_TRANS_TABLES,NO_BACKSLASH_ESCAPES");
@@ -152,7 +150,8 @@ TEST_CASE("registration scope: a MySQL server under NO_BACKSLASH_ESCAPES is left
     CHECK(servers.server("nbe").session_checks() == 1);
     CHECK(servers.server("nbe").discoveries() == 0);
     const auto& discovered = owner.remote().discovered();
-    const auto nbe = std::find_if(discovered.begin(), discovered.end(), [](const auto& d) { return d.connection.name == "nbe"; });
+    const auto nbe =
+        std::find_if(discovered.begin(), discovered.end(), [](const auto& d) { return d.connection.name == "nbe"; });
     REQUIRE(nbe != discovered.end());
     CHECK_FALSE(nbe->discovered);
     // Left out: no actor, no address in the engine's map, not among the session's connections.
@@ -164,15 +163,16 @@ TEST_CASE("registration scope: a MySQL server under NO_BACKSLASH_ESCAPES is left
     CHECK(std::none_of(connections.begin(), connections.end(), [](const auto& c) { return c.name == "nbe"; }));
 
     // Its catalog rows of the first start answer that the connection is not there; the process serves on.
-    auto refused = run_session_sql_payload(owner.stack(), 2, "SELECT id FROM nbe.shop.public.orders;");
+    auto refused = run_session_sql_payload(owner.stack(), 2, "SELECT id FROM nbe.shop.orders;");
     REQUIRE(refused.has_error());
     INFO(refused.error().what.c_str());
     CHECK(refused.error().type == code::undefined_object);
     CHECK(servers.server("nbe").log().empty());
-    CHECK(rows_of(run_session_sql_payload(owner.stack(), 3, "SELECT id FROM plain.shop.public.orders;")) == 2);
+    CHECK(rows_of(run_session_sql_payload(owner.stack(), 3, "SELECT id FROM plain.shop.orders;")) == 2);
 }
 
-TEST_CASE("registration scope: a MySQL session opened by a reconnect under NO_BACKSLASH_ESCAPES refuses its statements") {
+TEST_CASE(
+    "registration scope: a MySQL session opened by a reconnect under NO_BACKSLASH_ESCAPES refuses its statements") {
     fake_servers_t servers;
     servers.add("m", backend_type_t::MySQL).add_table(table_in_shop("orders"));
     stack_options_t options;
@@ -182,20 +182,20 @@ TEST_CASE("registration scope: a MySQL session opened by a reconnect under NO_BA
     options.connections.mysql.push_back(entry);
     session_stack_owner owner(unique_test_dir("otterstax_scope_nbe_reconnect"), options);
     owner.remote().actor("m")->set_unreachable_interval(std::chrono::milliseconds{0});
-    CHECK(rows_of(run_session_sql_payload(owner.stack(), 1, "SELECT id FROM m.shop.public.orders;")) == 2);
+    CHECK(rows_of(run_session_sql_payload(owner.stack(), 1, "SELECT id FROM m.shop.orders;")) == 2);
 
     // The server goes away and comes back under NO_BACKSLASH_ESCAPES (replaced, or its global
     // sql_mode changed): the connection is lost, the agent connects again.
     servers.server("m").set_sql_mode("STRICT_TRANS_TABLES,NO_BACKSLASH_ESCAPES");
     servers.server("m").set_down(true);
-    auto lost = run_session_sql_payload(owner.stack(), 2, "SELECT id FROM m.shop.public.orders;");
+    auto lost = run_session_sql_payload(owner.stack(), 2, "SELECT id FROM m.shop.orders;");
     REQUIRE(lost.has_error());
     CHECK(lost.error().type == code::io_error);
     servers.server("m").set_down(false);
     servers.forget_sent();
 
     for (int attempt = 0; attempt < 2; ++attempt) {
-        auto refused = run_session_sql_payload(owner.stack(), 3 + attempt, "SELECT id FROM m.shop.public.orders;");
+        auto refused = run_session_sql_payload(owner.stack(), 3 + attempt, "SELECT id FROM m.shop.orders;");
         REQUIRE(refused.has_error());
         INFO(refused.error().what.c_str());
         CHECK(refused.error().type == code::unimplemented_yet);
@@ -207,7 +207,7 @@ TEST_CASE("registration scope: a MySQL session opened by a reconnect under NO_BA
 
     // Back to the default sql_mode: the next session passes and the statement runs.
     servers.server("m").set_sql_mode("");
-    CHECK(rows_of(run_session_sql_payload(owner.stack(), 5, "SELECT id FROM m.shop.public.orders;")) == 2);
+    CHECK(rows_of(run_session_sql_payload(owner.stack(), 5, "SELECT id FROM m.shop.orders;")) == 2);
     CHECK(servers.server("m").session_checks() == 3);
 }
 
@@ -231,34 +231,38 @@ TEST_CASE("registration scope: DDL of another table of a one-table connection is
         CHECK(servers.server("one").discoveries() == 0);
     };
     session_hash_t id = 1;
-    for (const char* sql : {"CREATE TABLE one.shop.public.other (id BIGINT);",
-                            "CREATE TABLE ONE.Shop.Public.Other (id BIGINT);",
-                            "DROP TABLE one.shop.public.other;",
-                            "DROP TABLE IF EXISTS one.shop.public.other;",
-                            "ALTER TABLE one.shop.public.other ADD COLUMN v BIGINT;",
-                            "CREATE INDEX other_id ON one.shop.public.other (id);",
+    for (const char* sql : {"CREATE TABLE one.shop.other (id BIGINT);",
+                            "CREATE TABLE ONE.Shop.Other (id BIGINT);",
+                            "DROP TABLE one.shop.other;",
+                            "DROP TABLE IF EXISTS one.shop.other;",
+                            "ALTER TABLE one.shop.other ADD COLUMN v BIGINT;",
+                            "CREATE INDEX other_id ON one.shop.other (id);",
                             // The file is never read: the target is refused first.
-                            "CREATE EXTERNAL TABLE one.shop.public.other WITH (location = '/nonexistent/other.csv', "
+                            "CREATE EXTERNAL TABLE one.shop.other WITH (location = '/nonexistent/other.csv', "
                             "format = 'csv');"}) {
         INFO(sql);
         refused_before_backend(run_session_sql_payload(owner.stack(), id++, sql));
     }
     // A prepare is refused the same way.
-    refused_before_backend(prepare_session_sql(owner.stack(), id++, "CREATE TABLE one.shop.public.other (id BIGINT);"));
+    refused_before_backend(prepare_session_sql(owner.stack(), id++, "CREATE TABLE one.shop.other (id BIGINT);"));
 
     // The configured table's own DDL reaches the backend as before.
-    auto altered = run_session_sql_payload(owner.stack(), id++, "ALTER TABLE one.shop.public.orders ADD COLUMN v BIGINT;");
+    auto altered = run_session_sql_payload(owner.stack(), id++, "ALTER TABLE one.shop.orders ADD COLUMN v BIGINT;");
     INFO((altered.has_error() ? altered.error().what.c_str() : "ok"));
     CHECK_FALSE(altered.has_error());
-    auto dropped = run_session_sql_payload(owner.stack(), id++, "DROP TABLE one.shop.public.orders;");
+    auto dropped = run_session_sql_payload(owner.stack(), id++, "DROP TABLE one.shop.orders;");
     INFO((dropped.has_error() ? dropped.error().what.c_str() : "ok"));
     CHECK_FALSE(dropped.has_error());
     const auto sent_one = servers.sent("one");
-    CHECK(std::any_of(sent_one.begin(), sent_one.end(), [](const auto& s) { return s.find("ALTER TABLE") != std::string::npos; }));
-    CHECK(std::any_of(sent_one.begin(), sent_one.end(), [](const auto& s) { return s.find("DROP TABLE") != std::string::npos; }));
+    CHECK(std::any_of(sent_one.begin(), sent_one.end(), [](const auto& s) {
+        return s.find("ALTER TABLE") != std::string::npos;
+    }));
+    CHECK(std::any_of(sent_one.begin(), sent_one.end(), [](const auto& s) {
+        return s.find("DROP TABLE") != std::string::npos;
+    }));
 
     // A connection without `table:` creates any table on the backend, as before.
-    auto created = run_session_sql_payload(owner.stack(), id++, "CREATE TABLE every.shop.public.other (id BIGINT);");
+    auto created = run_session_sql_payload(owner.stack(), id++, "CREATE TABLE every.shop.other (id BIGINT);");
     INFO((created.has_error() ? created.error().what.c_str() : "ok"));
     CHECK_FALSE(created.has_error());
     CHECK(servers.sent("every") == std::vector<std::string>{"CREATE TABLE `shop`.`other` (`id` bigint);"});

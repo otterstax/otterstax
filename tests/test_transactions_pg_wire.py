@@ -59,7 +59,7 @@ class PgWireTransactionTest:
 
     def connect(self, autocommit=True):
         return psycopg.connect(host=self.host, port=PG_PORT, user="testuser",
-                               password="testpass", dbname="main", autocommit=autocommit)
+                               password="testpass", dbname="local", autocommit=autocommit)
 
     def ids(self, conn, low, high):
         """The ids in [low, high] the connection sees, sorted."""

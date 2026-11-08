@@ -69,6 +69,8 @@ COPY cmake/conan-hooks/hook_librdkafka_c11threads_off.py ./conan-hooks/
 # BUILD_JOBS caps conan's from-source builds too (tools.build:jobs): otterbrix
 # needs ~1.5-2 GB per job — see CLAUDE.md "Build resources". BUILD_JOBS=0 means
 # min(nproc, MemTotal_MB / 1536) of the build VM, never a bare nproc.
+# A recipe's source download (github.com) can meet a run of 504s (CI): retry
+# 10 times, 15 s apart (tools.files.download, default 2 x 5 s).
 RUN _jobs="${BUILD_JOBS}" && \
     if [ "$_jobs" = "0" ]; then \
         _mem_jobs=$(( $(awk '/^MemTotal:/ {print int($2/1024)}' /proc/meminfo) / 1536 )) && \
@@ -76,7 +78,8 @@ RUN _jobs="${BUILD_JOBS}" && \
         _jobs=$(( $(nproc) < _mem_jobs ? $(nproc) : _mem_jobs )); \
     fi && \
     echo "conan from-source build jobs: ${_jobs}" && \
-    _jobs_conf=(-c "tools.build:jobs=${_jobs}") && \
+    _jobs_conf=(-c "tools.build:jobs=${_jobs}" \
+        -c tools.files.download:retry=10 -c tools.files.download:retry_wait=15) && \
     if [ "$TSAN_DEPS" = "true" ]; then \
         mkdir -p /root/.conan2/extensions/hooks && \
         cp ./conan-hooks/hook_librdkafka_c11threads_off.py /root/.conan2/extensions/hooks/ && \

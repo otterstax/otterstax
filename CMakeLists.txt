@@ -195,6 +195,28 @@ target_link_libraries(server
     lib_${PROJECT_NAME}
     )
 
+# The conan package (conanfile.py package()) ships the core as ONE archive: a
+# consumer cannot repeat the LINK_GROUP above, and the linker resolves the
+# cross-references inside a single archive by itself. Every static library of
+# the core goes in — the internal group plus the ones it reaches transitively.
+# Built only on request (not part of `all`); Linux only, as is the package.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    set(OTTERSTAX_CORE_ARCHIVE_LIBS ${OTTERSTAX_INTERNAL_LIBS}
+        config flight_sql_proto otterbrix_s3_extension otterbrix_file_extension)
+    set(OTTERSTAX_CORE_ARCHIVE ${CMAKE_BINARY_DIR}/libotterstax_core.a)
+    set(_otterstax_core_mri "CREATE ${OTTERSTAX_CORE_ARCHIVE}\n")
+    foreach(_lib IN LISTS OTTERSTAX_CORE_ARCHIVE_LIBS)
+        string(APPEND _otterstax_core_mri "ADDLIB $<TARGET_FILE:${_lib}>\n")
+    endforeach()
+    string(APPEND _otterstax_core_mri "SAVE\nEND\n")
+    file(GENERATE OUTPUT ${CMAKE_BINARY_DIR}/otterstax_core.mri CONTENT "${_otterstax_core_mri}")
+    add_custom_target(otterstax_core_archive
+        COMMAND ${CMAKE_COMMAND} -E rm -f ${OTTERSTAX_CORE_ARCHIVE}
+        COMMAND ${CMAKE_AR} -M < ${CMAKE_BINARY_DIR}/otterstax_core.mri
+        BYPRODUCTS ${OTTERSTAX_CORE_ARCHIVE})
+    add_dependencies(otterstax_core_archive ${OTTERSTAX_CORE_ARCHIVE_LIBS})
+endif()
+
 # Unit tests
 if(BUILD_TESTS)
     enable_testing()

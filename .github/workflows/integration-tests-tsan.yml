@@ -12,6 +12,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # GCC 12's TSAN runtime cannot map its shadow memory under 32 bits of mmap
+      # ASLR entropy (startup "unexpected memory mapping" or a bare SIGSEGV), and
+      # inside docker build it cannot re-exec itself without ASLR (seccomp refuses
+      # personality). The runner image sets 28 in /etc/sysctl.conf, which Ubuntu
+      # 26.04 no longer applies (actions/runner-images#15108). Kernel-wide, so the
+      # build containers see it; lasts for this job only.
+      - name: Lower mmap ASLR entropy for TSAN
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 

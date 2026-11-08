@@ -2,7 +2,7 @@
 # Copyright 2025-2026  OtterStax
 
 from conan import ConanFile
-from conan.tools.cmake import CMakeToolchain, CMakeDeps, cmake_layout
+from conan.tools.cmake import CMake, CMakeToolchain, CMakeDeps, cmake_layout
 from conan.tools.files import copy
 import os
 import glob
@@ -11,20 +11,45 @@ import subprocess
 
 class OtterStax(ConanFile):
     name = "otterstax"
-    version = "1.0.0"
+    # No version here: the package's comes from `conan create . --version=<ver>`
+    # (conan refuses one that differs from a written one). The package is the
+    # core as one static archive (CMakeLists.txt, otterstax_core_archive) + its headers.
+    package_type = "static-library"
 
     # Binary configuration
     settings = "os", "compiler", "build_type", "arch"
     options = {
-        "shared":      [True, False],
         "fPIC":        [True, False],
         "with_tracy":  [True, False],
     }
     default_options = {
-        "shared":      False,
         "fPIC":        True,
         "with_tracy":  False,
     }
+
+    # What the core build reads (the Dockerfile COPYs the same set).
+    exports_sources = (
+        "CMakeLists.txt", "main.cpp", "cmake/*",
+        "backends/*", "catalog/*", "config/*", "connectors/*", "frontend/*",
+        "integration/*", "otterbrix/*", "runtime/*", "session/*", "types/*", "utility/*",
+    )
+
+    # Include roots of the core (target_include_directories of its libraries):
+    # the repository root, three source directories, and the generated headers
+    # package() copies under include/gen/.
+    _include_roots = (
+        "include",
+        "include/frontend/flight_sql",
+        "include/config",
+        "include/otterbrix/parser/grammar_extension/kafka",
+        "include/otterbrix/parser/grammar_extention/s3",
+        "include/otterbrix/parser/grammar_extention/file",
+        "include/gen/flight_proto",
+        "include/gen/spark",
+        "include/gen/kafka",
+        "include/gen/s3",
+        "include/gen/file",
+    )
 
     def layout(self):
         cmake_layout(self)
@@ -35,32 +60,32 @@ class OtterStax(ConanFile):
 
     def requirements(self):
         if self.options.with_tracy:
-            self.requires("tracy/0.13.1")
-        self.requires("arrow/24.0.0")
-        self.requires("openssl/3.0.13")
+            self.requires("tracy/0.13.1", transitive_headers=True)
+        self.requires("arrow/24.0.0", transitive_headers=True)
+        self.requires("openssl/3.0.13", transitive_headers=True)
         self.requires("boost/1.88.0", override=True)
-        self.requires("fmt/11.1.3")
-        self.requires("spdlog/1.15.1")
-        self.requires("msgpack-cxx/4.1.1")
-        self.requires("catch2/3.15.1")
-        self.requires("grpc/1.69.0")
-        self.requires("asio-grpc/3.7.0")
+        self.requires("fmt/11.1.3", transitive_headers=True)
+        self.requires("spdlog/1.15.1", transitive_headers=True)
+        self.requires("msgpack-cxx/4.1.1", transitive_headers=True)
+        self.requires("catch2/3.15.1", transitive_headers=True)
+        self.requires("grpc/1.69.0", transitive_headers=True)
+        self.requires("asio-grpc/3.7.0", transitive_headers=True)
         self.requires("aws-sdk-cpp/1.11.352", override=True)
         self.requires("abseil/20250127.0", override=True)
         # otterbrix 1.0.0b2-rc-4 pins re2/20240702 while grpc 1.69 pins re2/20250722 —
         # unify on grpc's (newer) pin; re2's API is stable across the two.
         self.requires("re2/20250722", override=True)
         self.requires("c-ares/1.34.6", override=True)
-        self.requires("benchmark/1.6.1")
-        self.requires("zlib/1.3.1")
-        self.requires("bzip2/1.0.8")
-        self.requires("otterbrix/1.0.0b2-rc-4#0cdaa27b38b1da19885a7b44e01fa4e7")
-        self.requires("magic_enum/0.8.1")
-        self.requires("actor-zeta/2.0.0#887bc992cac0ead59e5bdf5c90c844f4")
-        self.requires("libpq/15.4")
-        self.requires("yaml-cpp/0.7.0")
-        self.requires("clickhouse-cpp/2.6.1")
-        self.requires("librdkafka/2.14.2")
+        self.requires("benchmark/1.6.1", transitive_headers=True)
+        self.requires("zlib/1.3.1", transitive_headers=True)
+        self.requires("bzip2/1.0.8", transitive_headers=True)
+        self.requires("otterbrix/1.0.0b2-rc-4#0cdaa27b38b1da19885a7b44e01fa4e7", transitive_headers=True)
+        self.requires("magic_enum/0.8.1", transitive_headers=True)
+        self.requires("actor-zeta/2.0.0#887bc992cac0ead59e5bdf5c90c844f4", transitive_headers=True)
+        self.requires("libpq/15.4", transitive_headers=True)
+        self.requires("yaml-cpp/0.7.0", transitive_headers=True)
+        self.requires("clickhouse-cpp/2.6.1", transitive_headers=True)
+        self.requires("librdkafka/2.14.2", transitive_headers=True)
 
     def config_options(self):
         if self.settings.os == "Windows":
@@ -134,3 +159,38 @@ class OtterStax(ConanFile):
             for so in glob.glob(os.path.join(lib_output_dir, "*.so*")):
                 if os.path.isfile(so) and not os.path.islink(so):
                     subprocess.run([patchelf_bin, "--set-rpath", "$ORIGIN", so], check=True)
+
+    def build(self):
+        cmake = CMake(self)
+        cmake.configure(variables={"BUILD_TESTS": "OFF", "BUILD_BENCHMARKS": "OFF"})
+        cmake.build(target="otterstax_core_archive")
+
+    def package(self):
+        include = os.path.join(self.package_folder, "include")
+        for pattern in ("*.hpp", "*.h"):
+            # cmake_layout puts the build folder under the source folder
+            copy(self, pattern, src=self.source_folder, dst=include, excludes=("build/*",))
+        generated = {
+            "flight_proto": "frontend/flight_sql/generated/proto",
+            "spark":        "frontend/spark_connect_server/generated",
+            "kafka":        "otterbrix/parser/grammar_extension/kafka",
+            "s3":           "otterbrix/parser/grammar_extention/s3",
+            "file":         "otterbrix/parser/grammar_extention/file",
+        }
+        for name, subdir in generated.items():
+            for pattern in ("*.hpp", "*.h"):
+                copy(self, pattern, src=os.path.join(self.build_folder, subdir),
+                     dst=os.path.join(include, "gen", name))
+        copy(self, "libotterstax_core.a", src=self.build_folder,
+             dst=os.path.join(self.package_folder, "lib"))
+
+    def package_info(self):
+        self.cpp_info.libs = ["otterstax_core"]
+        self.cpp_info.includedirs = list(self._include_roots)
+        # The core's headers expand these macros (logger, OTX_ZONE): a consumer
+        # compiles them as the core did (CMakeLists.txt add_compile_definitions).
+        self.cpp_info.defines = ["SPDLOG_ACTIVE_LEVEL=SPDLOG_LEVEL_ERROR"]
+        if self.options.with_tracy:
+            self.cpp_info.defines.append("TRACY_ENABLE")
+        if self.settings.os == "Linux":
+            self.cpp_info.system_libs = ["pthread", "dl"]

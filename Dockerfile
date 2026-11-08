@@ -39,6 +39,8 @@ RUN rm /bin/sh && ln -s /bin/bash /bin/sh
 # devcontainer preset layout exactly.
 WORKDIR /app
 COPY conanfile.py .
+# A recipe's source download (github.com) can meet a run of 504s (CI): retry
+# 10 times, 15 s apart (tools.files.download, default 2 x 5 s).
 RUN _jobs="${BUILD_JOBS}" && \
     if [ "$_jobs" = "0" ]; then \
         _mem_jobs=$(( $(awk '/^MemTotal:/ {print int($2/1024)}' /proc/meminfo) / 1536 )) && \
@@ -46,7 +48,8 @@ RUN _jobs="${BUILD_JOBS}" && \
         _jobs=$(( $(nproc) < _mem_jobs ? $(nproc) : _mem_jobs )); \
     fi && \
     echo "conan from-source build jobs: ${_jobs}" && \
-    _jobs_conf=(-c "tools.build:jobs=${_jobs}") && \
+    _jobs_conf=(-c "tools.build:jobs=${_jobs}" \
+        -c tools.files.download:retry=10 -c tools.files.download:retry_wait=15) && \
     if [ "$WITH_TRACY" = "true" ]; then \
         conan install conanfile.py --build missing "${_jobs_conf[@]}" \
             -s build_type=Release \

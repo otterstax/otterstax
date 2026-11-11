@@ -30,7 +30,7 @@ from external_helpers import ExternalTableTester
 
 LABEL = "DATA — MySQL wire / JOIN sql backend ⋈ otterbrix-local (string key)"
 
-SQL_BACKEND_TABLE = "campaigns.db1.public.campaigns"
+SQL_BACKEND_TABLE = "campaigns.db1.campaigns"
 INTERNAL_DB = "jotb_local_backend"
 LOCAL_TABLE = "campaign_tags"
 # Pick the first `SAMPLE_SIZE` backend campaigns deterministically via a

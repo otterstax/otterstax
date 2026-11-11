@@ -48,7 +48,7 @@ def make_conn(local: bool) -> psycopg.Connection:
         port=config.PG_PORT,
         user="demo",
         password="demo",
-        dbname="main",  # the engine database (an unknown one is FATAL 3D000)
+        dbname="local",  # the engine database (an unknown one is FATAL 3D000)
         autocommit=True,
     )
 

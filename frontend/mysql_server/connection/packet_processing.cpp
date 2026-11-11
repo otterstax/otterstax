@@ -385,9 +385,9 @@ namespace frontend::mysql {
             OTX_ZONE_N("mysql::answer_use");
             // a query session schedules itself: needs_sched is always false
             [[maybe_unused]] auto [needs_sched, sent] = actor_zeta::send(session_->address(),
-                                                                         &otterstax::session::query_session_t::execute,
+                                                                         &otterstax::session::query_session_t::use,
                                                                          session_->next_statement(),
-                                                                         engine_search_path_statement(database));
+                                                                         database);
             fut = std::move(sent);
         }
         if (!co_await await_own_statement(std::move(fut), true)) {
@@ -470,7 +470,7 @@ namespace frontend::mysql {
             // A column the text resultset cannot encode is an error packet, not a
             // dropped connection.
             if (auto bad = find_unsupported_column<frontend_type::MYSQL>(sdata_result.chunks.front(),
-                                                                        {result_encoding::TEXT})) {
+                                                                         {result_encoding::TEXT})) {
                 send_error(mysql_error::ER_NOT_SUPPORTED_YET, unsupported_column_message<frontend_type::MYSQL>(*bad));
                 co_return;
             }
@@ -602,7 +602,7 @@ namespace frontend::mysql {
         // has just stored is released — no execute will ever consume it.
         if (column_cnt) {
             if (auto bad = find_unsupported_column<frontend_type::MYSQL>(result.schema.child_types(),
-                                                                        {result_encoding::BINARY})) {
+                                                                         {result_encoding::BINARY})) {
                 co_await close_stmt_in_session(id, "COM_STMT_PREPARE refused");
                 auto message = unsupported_column_message<frontend_type::MYSQL>(*bad);
                 fail_open_block(message);
@@ -782,7 +782,8 @@ namespace frontend::mysql {
             bool is_null = (null_bitmap[i / 8] >> (i % 8)) & 1;
             if (is_null) {
                 param_values.push_back(components::vector::make_null(
-                    resource_, components::types::complex_logical_type{components::types::logical_type::NA}));
+                    resource_,
+                    components::types::complex_logical_type{components::types::logical_type::NA}));
                 continue;
             }
 
@@ -923,7 +924,7 @@ namespace frontend::mysql {
             // The executed columns may differ from the prepared schema (a
             // parameterized statement has none at prepare time): checked again.
             if (auto bad = find_unsupported_column<frontend_type::MYSQL>(sdata_result.chunks.front(),
-                                                                        {result_encoding::BINARY})) {
+                                                                         {result_encoding::BINARY})) {
                 send_error(mysql_error::ER_NOT_SUPPORTED_YET, unsupported_column_message<frontend_type::MYSQL>(*bad));
                 co_return;
             }

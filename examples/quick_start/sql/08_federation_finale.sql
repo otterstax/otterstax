@@ -8,12 +8,12 @@ SELECT c.country, p.category, v.channel,
        COUNT(DISTINCT o.order_id)     AS orders_cnt,
        SUM(o.amount)                  AS revenue,
        SUM(o.amount - pcst.unit_cost) AS gross_margin
-FROM   sales.ops.public.orders       o
-JOIN   pgshop.shop.shop.customers  c    ON c.customer_id   = o.customer_id
-JOIN   pgcat.catalog.catalog.products p    ON p.product_id    = o.product_id
-JOIN   web.analytics.public.pageviews v   ON v.customer_id   = o.customer_id
+FROM   sales.ops.orders       o
+JOIN   pgshop.shop.customers  c    ON c.customer_id   = o.customer_id
+JOIN   pgcat.catalog.products p    ON p.product_id    = o.product_id
+JOIN   web.analytics.pageviews v   ON v.customer_id   = o.customer_id
                                   AND v.product_id    = o.product_id
-JOIN   qs.product_costs       pcst ON pcst.product_id = o.product_id
+JOIN   local.qs.product_costs       pcst ON pcst.product_id = o.product_id
 WHERE  o.status = 'paid'
 GROUP BY c.country, p.category, v.channel
 ORDER BY gross_margin DESC

@@ -79,7 +79,7 @@ class OtterStax(ConanFile):
         self.requires("benchmark/1.6.1", transitive_headers=True)
         self.requires("zlib/1.3.1", transitive_headers=True)
         self.requires("bzip2/1.0.8", transitive_headers=True)
-        self.requires("otterbrix/1.0.0b2-rc-4#0cdaa27b38b1da19885a7b44e01fa4e7", transitive_headers=True)
+        self.requires("otterbrix/1.0.0b2-rc-5#16618189f65c1b55a04b6b4057d696ee", transitive_headers=True)
         self.requires("magic_enum/0.8.1", transitive_headers=True)
         self.requires("actor-zeta/2.0.0#887bc992cac0ead59e5bdf5c90c844f4", transitive_headers=True)
         self.requires("libpq/15.4", transitive_headers=True)

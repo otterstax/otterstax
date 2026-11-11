@@ -20,13 +20,13 @@
 // Tagged node_type::unused so the engine never tries to execute it. Header-only (all virtuals inline) so both the
 // extension static libs and otterbrix_local can use it without a link edge.
 namespace otterstax::external {
-
-    // The most parts a table name is written with: [connection.][database.][schema.]name.
-    inline constexpr int max_name_parts = 4;
+    // The most parts a table name is written with: [connection.][namespace.]name, or a local
+    // database's [database.][schema.]name.
+    inline constexpr int max_name_parts = 3;
 
     // A table name of CREATE EXTERNAL TABLE as written, its parts folded to lower
     // case as the engine folds an unquoted identifier and placed as otterbrix
-    // places them: `t`, `s.t`, `d.s.t` (local), `c.d.s.t` (a connection's). The
+    // places them: `t`, `s.t`, `x.s.t` (x a connection or a local database). The
     // empty slots are the session's place. `count` is 1..max_name_parts.
     inline qualified_name_t external_target(const char* const* parts, int count) {
         auto folded = [&](int i) {
@@ -44,13 +44,11 @@ namespace otterstax::external {
         if (count >= 3) {
             name.database = core::dbname_t{folded(count - 3)};
         }
-        if (count >= 4) {
-            name.connection = core::connection_name_t{folded(count - 4)};
-        }
         return name;
     }
 
-    enum class external_op_t {
+    enum class external_op_t
+    {
         create_external_table, // CREATE EXTERNAL TABLE [[[c.]d.]s.]t WITH (location=...)
         copy_to                // COPY (<inner_sql>) TO '<location>' WITH (...)
     };
@@ -117,5 +115,4 @@ namespace otterstax::external {
                                                      std::move(format),
                                                      std::move(inner_sql))};
     }
-
 } // namespace otterstax::external

@@ -10,7 +10,7 @@ from contextlib import contextmanager
 
 import config
 
-_PRODUCTS = "products.pgdb.public.products"
+_PRODUCTS = "products.public.products"
 
 
 class client:
@@ -20,6 +20,7 @@ class client:
             'host': host,
             'port': config.MYSQL_PORT,
             'user': 'testuser',
+            'database': 'local',
             'password': 'testpass',
         }
         print(f"Connecting to host: {host}")

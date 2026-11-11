@@ -5,6 +5,9 @@
 
 #include "utility/logger.hpp"
 
+#include <spdlog/spdlog.h>
+
+#include <chrono>
 #include <filesystem>
 
 // The engine log writes through the otterstax Main logger's sinks
@@ -12,5 +15,6 @@
 // main.cpp does for the server. Under CTest each case runs in its own process.
 int main(int argc, char* argv[]) {
     initialize_all_loggers((std::filesystem::temp_directory_path() / "otterstax-test-logs").string());
+    spdlog::flush_every(std::chrono::seconds::zero());
     return Catch::Session().run(argc, argv);
 }

@@ -40,7 +40,6 @@ using otterstax::test::session_stack_owner;
 using otterstax::test::stmt;
 
 namespace {
-
     namespace sc = ::spark::connect;
     namespace ct = components::types;
     using status_t = query_session_t::transaction_status_t;
@@ -59,7 +58,7 @@ namespace {
     }
 
     // A table of the connection the startup did not register.
-    std::string fresh(const std::string& table) { return "pg.pgdb.public." + table; }
+    std::string fresh(const std::string& table) { return "pg.public." + table; }
 
     void require_rows(const core::result_wrapper_t<session_payload>& result, std::size_t rows) {
         INFO((result.has_error() ? result.error().what.c_str() : "ok"));
@@ -81,10 +80,8 @@ namespace {
         return plan;
     }
 
-    core::result_wrapper_t<session_payload> run_plan(const session_stack& s,
-                                                      session_hash_t id,
-                                                      const sc::Plan& plan,
-                                                      bool prepare) {
+    core::result_wrapper_t<session_payload>
+    run_plan(const session_stack& s, session_hash_t id, const sc::Plan& plan, bool prepare) {
         // What the ExecutePlan / AnalyzePlan RPC sends: the translation and its rebuild.
         auto translated = frontend::spark::translate_for_session(plan, s.resource);
         INFO("translate: " << (translated.has_error() ? translated.error().what.c_str() : "ok"));
@@ -101,7 +98,6 @@ namespace {
                                                     std::move(translated.value().rebuild));
         return await_session(std::move(fut), std::chrono::milliseconds(10000), s.resource);
     }
-
 } // namespace
 
 TEST_CASE("session registration: a direct execute registers the table and runs once more") {
@@ -221,10 +217,12 @@ TEST_CASE("session COPY ... TO: the inner statement must be a query") {
     run_session_or_fail(s, 20071, "CREATE TABLE keep.t (id bigint);");
     run_session_or_fail(s, 20072, "INSERT INTO keep.t (id) VALUES (1), (2);");
 
-    for (const std::string inner : {"DROP DATABASE federation", "BEGIN", "DELETE FROM keep.t",
-                                    "INSERT INTO keep.t (id) VALUES (3)", "CREATE TABLE keep.u (id bigint)"}) {
-        auto refused =
-            run_session_sql_payload(s, 20073, "COPY (" + inner + ") TO '" + out + "' WITH (format = 'csv')");
+    for (const std::string inner : {"DROP DATABASE federation",
+                                    "BEGIN",
+                                    "DELETE FROM keep.t",
+                                    "INSERT INTO keep.t (id) VALUES (3)",
+                                    "CREATE TABLE keep.u (id bigint)"}) {
+        auto refused = run_session_sql_payload(s, 20073, "COPY (" + inner + ") TO '" + out + "' WITH (format = 'csv')");
         INFO(inner);
         REQUIRE(refused.has_error());
         CHECK(refused.error().type == core::error_code_t::invalid_parameter);
@@ -245,16 +243,16 @@ TEST_CASE("session COPY ... TO: the inner statement must be a query") {
 }
 
 // `t` and `s.t` take the session's place: in a place that is a connection's
-// database (SET search_path = 'c.d.s'), the table a short name missed is the
+// namespace (SET search_path = 'c.s'), the table a short name missed is the
 // connection's, registered and read by the run once more.
 TEST_CASE("session registration: a short name in a connection's place registers the table") {
     session_stack_owner owner("/tmp/test_session_registration_short", pg_options());
     auto s = owner.stack();
-    run_session_or_fail(s, 20090, "SET search_path = 'pg.pgdb.public';");
+    run_session_or_fail(s, 20090, "SET search_path = 'pg.public';");
     require_rows(run_session_sql_payload(s, 20091, "SELECT * FROM short_name;"), 2);
     require_rows(run_session_sql_payload(s, 20092, "SELECT * FROM public.two_parts;"), 2);
     // A local place: the name is a local table's, nothing is registered for it.
-    run_session_or_fail(s, 20093, "SET search_path = 'main.public';");
+    run_session_or_fail(s, 20093, "SET search_path = 'local.public';");
     auto local = run_session_sql_payload(s, 20094, "SELECT * FROM not_here;");
     REQUIRE(local.has_error());
 }

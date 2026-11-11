@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2025-2026  OtterStax
 
-#include "config/connections/connection_config_reader.hpp"
 #include "config/config.hpp"
+#include "config/connections/connection_config_reader.hpp"
 
 #include <catch2/catch_all.hpp>
 #include <yaml-cpp/yaml.h>
@@ -17,61 +17,54 @@
 #include <vector>
 
 namespace {
+    std::pmr::memory_resource* resource() { return std::pmr::new_delete_resource(); }
 
-std::pmr::memory_resource* resource() {
-    return std::pmr::new_delete_resource();
-}
+    // Parse a YAML string and return its top-level `connections` node.
+    YAML::Node connections_node(const std::string& yaml) { return YAML::Load(yaml)["connections"]; }
 
-// Parse a YAML string and return its top-level `connections` node.
-YAML::Node connections_node(const std::string& yaml) {
-    return YAML::Load(yaml)["connections"];
-}
+    // parse_connections on a node that must be accepted; the descriptors it produced.
+    config::ConnectionsConfig parse_ok(const YAML::Node& node) {
+        auto parsed = config::parse_connections(node, resource());
+        REQUIRE_FALSE(parsed.has_error());
+        return std::move(parsed.value());
+    }
 
-// parse_connections on a node that must be accepted; the descriptors it produced.
-config::ConnectionsConfig parse_ok(const YAML::Node& node) {
-    auto parsed = config::parse_connections(node, resource());
-    REQUIRE_FALSE(parsed.has_error());
-    return std::move(parsed.value());
-}
+    // parse_connections on a node that must be rejected; the error it produced.
+    core::error_t parse_error(const YAML::Node& node) {
+        auto parsed = config::parse_connections(node, resource());
+        REQUIRE(parsed.has_error());
+        return parsed.error();
+    }
 
-// parse_connections on a node that must be rejected; the error it produced.
-core::error_t parse_error(const YAML::Node& node) {
-    auto parsed = config::parse_connections(node, resource());
-    REQUIRE(parsed.has_error());
-    return parsed.error();
-}
+    // load_config on a file that must be accepted; the whole ServiceConfig.
+    config::ServiceConfig load_ok(const std::string& path) {
+        auto loaded = config::load_config(resource(), path);
+        REQUIRE_FALSE(loaded.has_error());
+        return std::move(loaded.value());
+    }
 
-// load_config on a file that must be accepted; the whole ServiceConfig.
-config::ServiceConfig load_ok(const std::string& path) {
-    auto loaded = config::load_config(resource(), path);
-    REQUIRE_FALSE(loaded.has_error());
-    return std::move(loaded.value());
-}
+    // load_config on a file that must be rejected; the error it produced.
+    core::error_t load_error(const std::string& path) {
+        auto loaded = config::load_config(resource(), path);
+        REQUIRE(loaded.has_error());
+        return loaded.error();
+    }
 
-// load_config on a file that must be rejected; the error it produced.
-core::error_t load_error(const std::string& path) {
-    auto loaded = config::load_config(resource(), path);
-    REQUIRE(loaded.has_error());
-    return loaded.error();
-}
+    bool mentions(const core::error_t& error, std::string_view text) {
+        return std::string_view{error.what.data(), error.what.size()}.find(text) != std::string_view::npos;
+    }
 
-bool mentions(const core::error_t& error, std::string_view text) {
-    return std::string_view{error.what.data(), error.what.size()}.find(text) != std::string_view::npos;
-}
-
-// Write `content` to a unique temp file and return its path (used for the
-// whole-file load_config tests).
-std::string write_temp(const std::string& content) {
-    static std::atomic<int> counter{0};
-    auto path = std::filesystem::temp_directory_path() /
-                ("otterstax_cfg_" + std::to_string(counter++) + ".yaml");
-    std::ofstream out(path);
-    out << content;
-    out.close();
-    return path.string();
-}
-
-}  // namespace
+    // Write `content` to a unique temp file and return its path (used for the
+    // whole-file load_config tests).
+    std::string write_temp(const std::string& content) {
+        static std::atomic<int> counter{0};
+        auto path = std::filesystem::temp_directory_path() / ("otterstax_cfg_" + std::to_string(counter++) + ".yaml");
+        std::ofstream out(path);
+        out << content;
+        out.close();
+        return path.string();
+    }
+} // namespace
 
 // ── parse_connections (the `connections:` subtree) ───────────────────────────
 
@@ -171,7 +164,7 @@ connections:
 }
 
 TEST_CASE("parse_connections: null/missing node yields an empty config") {
-    YAML::Node absent;  // null node
+    YAML::Node absent; // null node
     auto cfg = parse_ok(absent);
     CHECK(cfg.mysql.empty());
     CHECK(cfg.postgresql.empty());
@@ -547,8 +540,7 @@ TEST_CASE("parse_connections: the alias federation is refused in every section a
         for (const char* section : {"mysql", "postgresql", "clickhouse", "s3"}) {
             INFO("section " << section);
             const std::string fields = std::string_view{section} == "s3" ? s3_fields : backend_fields;
-            const std::string yaml =
-                std::string("connections:\n  ") + section + ":\n    - { alias: " + alias + fields;
+            const std::string yaml = std::string("connections:\n  ") + section + ":\n    - { alias: " + alias + fields;
             auto err = parse_error(connections_node(yaml));
             CHECK(err.type == core::error_code_t::invalid_parameter);
             CHECK(mentions(err, std::string("invalid ") + section + " connection"));
@@ -558,8 +550,8 @@ TEST_CASE("parse_connections: the alias federation is refused in every section a
     }
 }
 
-// `main` is the engine's default local database (every session's place is main.public): a
-// connection under it would make main.public.t and main.db.public.t two different things.
+// `main` is the engine's own database (its system catalog main.pg_catalog): a connection under it
+// would give main.pg_catalog.t a second reading.
 TEST_CASE("parse_connections: the alias main is refused in every section and any case") {
     const std::string backend_fields = ", host: h, username: u, database: d }\n";
     const std::string s3_fields = ", access_key: k, secret_key: s }\n";
@@ -568,13 +560,12 @@ TEST_CASE("parse_connections: the alias main is refused in every section and any
         for (const char* section : {"mysql", "postgresql", "clickhouse", "s3"}) {
             INFO("section " << section);
             const std::string fields = std::string_view{section} == "s3" ? s3_fields : backend_fields;
-            const std::string yaml =
-                std::string("connections:\n  ") + section + ":\n    - { alias: " + alias + fields;
+            const std::string yaml = std::string("connections:\n  ") + section + ":\n    - { alias: " + alias + fields;
             auto err = parse_error(connections_node(yaml));
             CHECK(err.type == core::error_code_t::invalid_parameter);
             CHECK(mentions(err, std::string("alias='") + alias + "'"));
             CHECK(mentions(err, "reserved"));
-            CHECK(mentions(err, "default local database"));
+            CHECK(mentions(err, "the engine's own database"));
         }
     }
     config::PgConnectionDesc pg{.alias = "Main", .host = "h", .username = "u", .database = "d"};
@@ -593,8 +584,7 @@ TEST_CASE("parse_connections: the alias kafka is an ordinary alias in every sect
             INFO("section " << section);
             const bool s3 = std::string_view{section} == "s3";
             const std::string fields = s3 ? s3_fields : backend_fields;
-            const std::string yaml =
-                std::string("connections:\n  ") + section + ":\n    - { alias: " + alias + fields;
+            const std::string yaml = std::string("connections:\n  ") + section + ":\n    - { alias: " + alias + fields;
             if (!s3 && std::string_view{alias} != "kafka") {
                 // A backend alias is an unquoted identifier: an upper-case letter is refused
                 // as such, not as a reserved name.
@@ -668,7 +658,11 @@ TEST_CASE("validation_error: the reserved alias is reported after the missing fi
     CHECK(err3->find("host") != std::string::npos);
 
     // The reserved alias outranks a bad port.
-    config::PgConnectionDesc bad_port{.alias = "federation", .host = "h", .port = "abc", .username = "u", .database = "d"};
+    config::PgConnectionDesc bad_port{.alias = "federation",
+                                      .host = "h",
+                                      .port = "abc",
+                                      .username = "u",
+                                      .database = "d"};
     auto err4 = config::validation_error(bad_port);
     REQUIRE(err4.has_value());
     CHECK(err4->find("reserved") != std::string::npos);
@@ -778,7 +772,7 @@ service:
 }
 
 TEST_CASE("load_config: malformed YAML is an error") {
-    const std::string yaml = "service: [ {port: }";  // unbalanced flow mapping
+    const std::string yaml = "service: [ {port: }"; // unbalanced flow mapping
     auto err = load_error(write_temp(yaml));
     CHECK(err.type == core::error_code_t::invalid_text_representation);
     CHECK(mentions(err, "configuration file"));
@@ -1018,7 +1012,8 @@ TEST_CASE("parse_connections: a backend alias is reachable from SQL and names on
          "  mysql:\n" + entry("shop", my) + "\n  postgresql:\n" + entry("pg_2", pg) + "\n  clickhouse:\n" +
              entry("ch", ch) + "\n",
          true},
-        {"same alias in two sections", "  mysql:\n" + entry("shop", my) + "\n  postgresql:\n" + entry("shop", pg) + "\n",
+        {"same alias in two sections",
+         "  mysql:\n" + entry("shop", my) + "\n  postgresql:\n" + entry("shop", pg) + "\n",
          false},
         {"same alias twice in one section", "  clickhouse:\n" + entry("ch", ch) + "\n" + entry("ch", ch) + "\n", false},
         {"alias with an upper-case letter", "  postgresql:\n" + entry("Shop", pg) + "\n", false},
@@ -1114,7 +1109,8 @@ TEST_CASE("load_config: the spark_connect session timeout is read and range-chec
     }
     for (const char* bad : {"-1", "abc", "1.5", "99999999999"}) {
         INFO(bad);
-        auto err = load_error(write_temp(std::string("service:\n  spark_connect: { session_timeout_s: ") + bad + " }\n"));
+        auto err =
+            load_error(write_temp(std::string("service:\n  spark_connect: { session_timeout_s: ") + bad + " }\n"));
         CHECK(err.type == core::error_code_t::invalid_parameter);
         CHECK(mentions(err, "service.spark_connect.session_timeout_s"));
     }
@@ -1131,8 +1127,10 @@ TEST_CASE("load_config: an unknown key is refused at every level, naming the key
         {"service:\n  flight_sql: { host: h, prot: 1 }\n", R"(unknown key "prot" in service.flight_sql)"},
         {"service:\n  mysql: { port: 8816, host: h }\n", R"(unknown key "host" in service.mysql)"},
         {"service:\n  postgres: { prt: 8817 }\n", R"(unknown key "prt" in service.postgres)"},
-        {"service:\n  spark_connect: { session_timeout: 5 }\n", R"(unknown key "session_timeout" in service.spark_connect)"},
-        {"service:\n  connection_retry: { max_attempt: 3 }\n", R"(unknown key "max_attempt" in service.connection_retry)"},
+        {"service:\n  spark_connect: { session_timeout: 5 }\n",
+         R"(unknown key "session_timeout" in service.spark_connect)"},
+        {"service:\n  connection_retry: { max_attempt: 3 }\n",
+         R"(unknown key "max_attempt" in service.connection_retry)"},
         {"service:\n  engine: { data_dir: /d, wal_dir: /w }\n", R"(unknown key "wal_dir" in service.engine)"},
         {"service:\n  runtime: { session: { threads: 1 } }\n", R"(unknown key "session" in service.runtime)"},
         {"service:\n  runtime: { general: { threads: 1, max_throughput: 5 } }\n",
@@ -1180,7 +1178,8 @@ TEST_CASE("load_config: every config yaml of the repository loads") {
     std::vector<fs::path> files;
     for (auto it = fs::recursive_directory_iterator(root); it != fs::recursive_directory_iterator(); ++it) {
         const auto name = it->path().filename().string();
-        if (it->is_directory() && (name == ".git" || name.rfind("build", 0) == 0 || name.rfind("cmake-build", 0) == 0)) {
+        if (it->is_directory() &&
+            (name == ".git" || name.rfind("build", 0) == 0 || name.rfind("cmake-build", 0) == 0)) {
             it.disable_recursion_pending();
             continue;
         }
@@ -1200,7 +1199,8 @@ TEST_CASE("load_config: every config yaml of the repository loads") {
 
 // `federation` is OtterStax's own database: the refusal says what it holds.
 TEST_CASE("parse_connections: the refusal of the alias federation says what the database is") {
-    auto err = parse_error(connections_node("connections:\n  mysql:\n    - { alias: federation, host: h, username: u, database: d }\n"));
+    auto err = parse_error(
+        connections_node("connections:\n  mysql:\n    - { alias: federation, host: h, username: u, database: d }\n"));
     CHECK(mentions(err, "OtterStax's own database"));
     CHECK(mentions(err, "federation.public.remote_names"));
     CHECK(mentions(err, "federation.kafka"));

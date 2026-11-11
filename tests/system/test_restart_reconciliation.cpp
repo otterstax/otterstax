@@ -41,7 +41,6 @@ using otterstax::test::run_session_sql_payload;
 using otterstax::test::session_stack;
 
 namespace {
-
     constexpr const char* kUid = "shop";
     constexpr const char* kSchema = "public";
 
@@ -119,8 +118,8 @@ namespace {
                 continue;
             }
             const auto end = at + reference.size();
-            if (end == unquoted.size() || !(std::isalnum(static_cast<unsigned char>(unquoted[end])) ||
-                                            unquoted[end] == '_')) {
+            if (end == unquoted.size() ||
+                !(std::isalnum(static_cast<unsigned char>(unquoted[end])) || unquoted[end] == '_')) {
                 return &table;
             }
         }
@@ -161,7 +160,11 @@ namespace {
         }
         PQsetResultAttrs(result.get(), 2, attrs);
         for (std::size_t r = 0; r < tables.size(); ++r) {
-            PQsetvalue(result.get(), static_cast<int>(r), 0, const_cast<char*>(kSchema), static_cast<int>(std::string_view{kSchema}.size()));
+            PQsetvalue(result.get(),
+                       static_cast<int>(r),
+                       0,
+                       const_cast<char*>(kSchema),
+                       static_cast<int>(std::string_view{kSchema}.size()));
             PQsetvalue(result.get(),
                        static_cast<int>(r),
                        1,
@@ -413,18 +416,15 @@ namespace {
 
     // SELECT * over the external table through a session: the mock's rows
     // under the discovered columns.
-    void require_select_star(const session_stack& s,
-                             session_hash_t id,
-                             const std::string& table,
-                             std::size_t column_count) {
-        auto payload = run_session_sql_payload(
-            s, id, "SELECT * FROM " + std::string{kUid} + ".pgdb." + kSchema + "." + table + ";");
+    void
+    require_select_star(const session_stack& s, session_hash_t id, const std::string& table, std::size_t column_count) {
+        auto payload =
+            run_session_sql_payload(s, id, "SELECT * FROM " + std::string{kUid} + "." + kSchema + "." + table + ";");
         INFO("SELECT: " << (payload.has_error() ? payload.error().what.c_str() : "ok"));
         REQUIRE_FALSE(payload.has_error());
         REQUIRE(payload.value().size() == kBackendRows);
         REQUIRE(payload.value().column_count() == column_count);
     }
-
 } // namespace
 
 TEST_CASE("restart reconciliation: after a restart the remote tables are registered once and keep answering") {
@@ -433,13 +433,15 @@ TEST_CASE("restart reconciliation: after a restart the remote tables are registe
     take_writes();
     {
         server_run first(dir.path);
-        REQUIRE(first.listed_tables() == std::vector<std::string>{"shop.pgdb.public.customers", "shop.pgdb.public.orders"});
+        REQUIRE(first.listed_tables() ==
+                std::vector<std::string>{"shop.pgdb.public.customers", "shop.pgdb.public.orders"});
         require_select_star(first.stack(), 9490, "orders", 2);
     }
 
     server_run restarted(dir.path);
     // Registered once, not twice; no DDL reached the backend.
-    REQUIRE(restarted.listed_tables() == std::vector<std::string>{"shop.pgdb.public.customers", "shop.pgdb.public.orders"});
+    REQUIRE(restarted.listed_tables() ==
+            std::vector<std::string>{"shop.pgdb.public.customers", "shop.pgdb.public.orders"});
     REQUIRE(restarted.listed_columns("orders") == std::vector<std::string>{"id", "name"});
     require_select_star(restarted.stack(), 9500, "orders", 2);
     require_select_star(restarted.stack(), 9501, "customers", 2);
@@ -484,7 +486,7 @@ TEST_CASE("restart reconciliation: a table the backend no longer has is gone aft
     CHECK(take_writes().empty());
 
     // A statement naming it misses: a registration finds nothing, the statement's own error answers.
-    auto missing = run_session_sql_payload(restarted.stack(), 9541, "SELECT * FROM shop.pgdb.public.customers;");
+    auto missing = run_session_sql_payload(restarted.stack(), 9541, "SELECT * FROM shop.public.customers;");
     REQUIRE(missing.has_error());
     CHECK(missing.error().type == core::error_code_t::table_not_exists);
 }
@@ -501,7 +503,7 @@ TEST_CASE("restart reconciliation: a connection taken out of the configuration k
     // and a statement over them answers that the connection does not exist.
     server_run restarted(dir.path, /*configured=*/false);
     CHECK(restarted.listed_tables().size() == 2);
-    auto read = run_session_sql_payload(restarted.stack(), 9545, "SELECT * FROM shop.pgdb.public.orders;");
+    auto read = run_session_sql_payload(restarted.stack(), 9545, "SELECT * FROM shop.public.orders;");
     REQUIRE(read.has_error());
     CHECK(read.error().type == core::error_code_t::undefined_object);
 }
@@ -519,9 +521,10 @@ TEST_CASE("restart reconciliation: two connections then one keeps serving the co
     }
 
     server_run restarted(dir.path, std::vector<std::string>{kUid});
-    CHECK(restarted.listed_tables(kUid) == std::vector<std::string>{"shop.pgdb.public.customers", "shop.pgdb.public.orders"});
+    CHECK(restarted.listed_tables(kUid) ==
+          std::vector<std::string>{"shop.pgdb.public.customers", "shop.pgdb.public.orders"});
     require_select_star(restarted.stack(), 9550, "orders", 2);
-    auto gone = run_session_sql_payload(restarted.stack(), 9551, "SELECT * FROM outlet.pgdb.public.orders;");
+    auto gone = run_session_sql_payload(restarted.stack(), 9551, "SELECT * FROM outlet.public.orders;");
     REQUIRE(gone.has_error());
     CHECK(gone.error().type == core::error_code_t::undefined_object);
 }
@@ -546,7 +549,7 @@ TEST_CASE("restart reconciliation: a configured connection that is unreachable k
         CHECK(down.listed_columns("orders").size() == 2);
         // The name resolves; the read fails at the connection, which was never opened — not as a
         // missing table.
-        auto read = run_session_sql_payload(down.stack(), 9560, "SELECT * FROM shop.pgdb.public.orders;");
+        auto read = run_session_sql_payload(down.stack(), 9560, "SELECT * FROM shop.public.orders;");
         REQUIRE(read.has_error());
         INFO(read.error().what.c_str());
         CHECK(read.error().type != core::error_code_t::table_not_exists);

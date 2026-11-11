@@ -45,8 +45,8 @@ from pyspark.sql import SparkSession
 
 import config
 
-CAMPAIGNS = "campaigns.db1.public.campaigns"  # MySQL: campaign_id, campaign_name, campaign_length, budget
-PRODUCTS = "products.pgdb.public.products"    # PostgreSQL: product_id, campaign_id, product_name, price, category
+CAMPAIGNS = "campaigns.db1.campaigns"  # MySQL: campaign_id, campaign_name, campaign_length, budget
+PRODUCTS = "products.public.products"  # PostgreSQL: product_id, campaign_id, product_name, price, category
 
 # A derived table over each mirror. Sums of two-decimal prices never equal
 # 800.005, so no campaign sits on the PostgreSQL threshold.
@@ -67,11 +67,14 @@ class SparkSqlAndShowTest:
     def __init__(self, local=False):
         self.url = f"sc://{config.get_host(local)}:{config.SPARK_CONNECT_PORT}"
         self.db = f"spark_sql_{uuid.uuid4().hex[:8]}"
+        # Spark sessions have no place: one- and two-part table names are
+        # refused, so every table statement names its tables in full.
+        self.local_db = f"local.{self.db}"
         self.spark = None
         self.created_db = None     # the DataFrame spark.sql() returned for CREATE SCHEMA
         self.created_table = None  # ... and for CREATE TABLE <ONCE_TABLE>
         self.tables = []           # local tables to drop, in creation order
-        print(f"PySpark client {pyspark.__version__}, Spark Connect server {self.url}, local schema main.{self.db}")
+        print(f"PySpark client {pyspark.__version__}, Spark Connect server {self.url}, local schema local.{self.db}")
 
     # --- helpers ---
 
@@ -156,7 +159,7 @@ class SparkSqlAndShowTest:
 
     def show_frame(self):
         """The show() table, ordered so the printed rows are known."""
-        return self.spark.table(f"{self.db}.{SHOW_TABLE}").orderBy("id")
+        return self.spark.table(f"{self.local_db}.{SHOW_TABLE}").orderBy("id")
 
     # --- setup / teardown ---
 
@@ -164,20 +167,20 @@ class SparkSqlAndShowTest:
         """The session; a local schema with the show() table and the run-once table, made through spark.sql()."""
         self.spark = SparkSession.builder.remote(self.url).getOrCreate()
         self.created_db = self.spark.sql(f"CREATE SCHEMA {self.db}")
-        self.spark.sql(f"CREATE TABLE {self.db}.{SHOW_TABLE} (id bigint, name string)")
+        self.spark.sql(f"CREATE TABLE {self.local_db}.{SHOW_TABLE} (id bigint, name string)")
         self.tables.append(SHOW_TABLE)
         values = ", ".join(f"({i}, {self.literal(name)})" for i, name in SHOW_ROWS)
-        self.spark.sql(f"INSERT INTO {self.db}.{SHOW_TABLE} (id, name) VALUES {values}")
-        self.created_table = self.spark.sql(f"CREATE TABLE {self.db}.{ONCE_TABLE} (id bigint, name string)")
+        self.spark.sql(f"INSERT INTO {self.local_db}.{SHOW_TABLE} (id, name) VALUES {values}")
+        self.created_table = self.spark.sql(f"CREATE TABLE {self.local_db}.{ONCE_TABLE} (id bigint, name string)")
         self.tables.append(ONCE_TABLE)
-        print(f"  created {self.db}.{SHOW_TABLE} ({len(SHOW_ROWS)} rows) and {self.db}.{ONCE_TABLE} (empty)")
+        print(f"  created {self.local_db}.{SHOW_TABLE} ({len(SHOW_ROWS)} rows) and {self.local_db}.{ONCE_TABLE} (empty)")
 
     def cleanup(self):
         if self.spark is None:
             return
         try:
             for table in reversed(self.tables):
-                self.spark.sql(f"DROP TABLE {self.db}.{table}")
+                self.spark.sql(f"DROP TABLE {self.local_db}.{table}")
             if self.created_db is not None:
                 self.spark.sql(f"DROP SCHEMA {self.db}")
         finally:
@@ -221,16 +224,16 @@ class SparkSqlAndShowTest:
         # A second CREATE of the same schema or table would fail: it exists.
         self.created_db.collect()
         self.created_table.collect()
-        self.assert_equal(self.spark.sql(f"SELECT id FROM {self.db}.{ONCE_TABLE}").collect(), [],
+        self.assert_equal(self.spark.sql(f"SELECT id FROM {self.local_db}.{ONCE_TABLE}").collect(), [],
                           f"{ONCE_TABLE} after collecting its CREATE TABLE")
         print("  ✅ collect() on CREATE SCHEMA / CREATE TABLE ran neither again")
 
     def test_sql_insert_runs_once(self):
         """Collecting the DataFrame of an INSERT, twice, leaves the one row the INSERT wrote."""
-        inserted = self.spark.sql(f"INSERT INTO {self.db}.{ONCE_TABLE} (id, name) VALUES (1, 'one')")
+        inserted = self.spark.sql(f"INSERT INTO {self.local_db}.{ONCE_TABLE} (id, name) VALUES (1, 'one')")
         inserted.collect()
         inserted.collect()
-        rows = [tuple(r) for r in self.spark.sql(f"SELECT id, name FROM {self.db}.{ONCE_TABLE}").collect()]
+        rows = [tuple(r) for r in self.spark.sql(f"SELECT id, name FROM {self.local_db}.{ONCE_TABLE}").collect()]
         self.assert_equal(rows, [(1, "one")], "rows after one INSERT and two collect() calls on its DataFrame")
         print("  ✅ INSERT through spark.sql() ran once: one row after two collect() calls")
 
@@ -254,7 +257,7 @@ class SparkSqlAndShowTest:
 
     def test_sql_show(self):
         """spark.sql("SELECT ...").show() prints the table df.show() prints."""
-        df = self.spark.sql(f"SELECT id, name FROM {self.db}.{SHOW_TABLE} ORDER BY id")
+        df = self.spark.sql(f"SELECT id, name FROM {self.local_db}.{SHOW_TABLE} ORDER BY id")
         self.assert_shown(self.printed(df.show), "spark.sql('SELECT id, name ... ORDER BY id').show()")
 
     def run_all_tests(self):

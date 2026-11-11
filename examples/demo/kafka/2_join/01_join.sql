@@ -1,8 +1,8 @@
 -- Sub-step 2 — the federated join. One statement, three systems:
 --
 --   kafka.orders_live   (engine-internal, fed from Kafka in real time)
---     ⋈ pg.shop.shop.customers   (PostgreSQL — customer reference, ENUM tier)
---     ⋈ ch.ev.public.sessions      (ClickHouse — session analytics)
+--     ⋈ pg.shop.customers   (PostgreSQL — customer reference, ENUM tier)
+--     ⋈ ch.ev.sessions      (ClickHouse — session analytics)
 \echo '>>> JOIN: live Kafka orders  ⋈  ClickHouse sessions  ⋈  Postgres customers'
 
 SELECT c.name,
@@ -14,11 +14,11 @@ SELECT c.name,
        s.browsed_category,
        s.traffic_source
 FROM   kafka.orders_live k
-INNER JOIN pg.shop.shop.customers c
+INNER JOIN pg.shop.customers c
         ON c.customer_id = k.customer_id
 INNER JOIN (
     SELECT user_id, browsed_category, traffic_source
-    FROM   ch.ev.public.sessions
+    FROM   ch.ev.sessions
 ) s ON s.user_id = k.customer_id
 WHERE  k.status = 'paid'
 ORDER  BY k.amount DESC

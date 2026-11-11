@@ -21,8 +21,8 @@
 // and result relation, a SQL relation without arguments, the empty
 // LocalRelation, the name of an unsupported command) are pinned last.
 
-#include "frontend/spark_connect_server/service.hpp"
 #include "../mock/cell.hpp"
+#include "frontend/spark_connect_server/service.hpp"
 #include "otterbrix/parser/parser.hpp"
 #include "session_stack.hpp"
 
@@ -53,11 +53,10 @@ using otterstax::test::run_session_sql_payload;
 using otterstax::test::session_stack;
 
 namespace {
-
     constexpr const char* kUid = "planpg";
     // Every column of the one remote table, in backend order: the projection
     // the mock answers the describe probe and the data query with.
-    constexpr std::string_view kSql = "SELECT id, name, price FROM planpg.pgdb.public.items;";
+    constexpr std::string_view kSql = "SELECT id, name, price FROM planpg.public.items;";
 
     constexpr Oid kInt4Oid = 23;
     constexpr Oid kFloat8Oid = 701;
@@ -322,7 +321,6 @@ namespace {
     }
 
 #pragma GCC diagnostic pop
-
 } // namespace
 
 TEST_CASE("prepare_plan: a parsed remote SELECT is described and never executed") {
@@ -391,8 +389,9 @@ TEST_CASE("spark.sql classification: the parse tells a query from a command and 
     auto s = owner.stack();
     session_hash_t id = 9940;
     std::string err;
-    for (const char* setup :
-         {"CREATE SCHEMA plandb;", "CREATE TABLE plandb.t (id bigint);", "INSERT INTO plandb.t (id) VALUES (1);"}) {
+    for (const char* setup : {"CREATE SCHEMA plandb;",
+                              "CREATE TABLE local.plandb.t (id bigint);",
+                              "INSERT INTO local.plandb.t (id) VALUES (1);"}) {
         const bool ran = run_session_sql(s, id++, setup, err);
         INFO(setup << ": " << err);
         REQUIRE(ran);
@@ -410,16 +409,16 @@ TEST_CASE("spark.sql classification: the parse tells a query from a command and 
 
     // An INSERT is a command, and classifying it writes nothing: the row is
     // written by the one execute ExecutePlan sends for it.
-    const std::string insert = "INSERT INTO plandb.t (id) VALUES (2);";
+    const std::string insert = "INSERT INTO local.plandb.t (id) VALUES (2);";
     auto command = frontend::spark::classify_sql(insert, s.resource);
     INFO("classify_sql(insert): " << (command.has_error() ? command.error().what.c_str() : "ok"));
     REQUIRE_FALSE(command.has_error());
     CHECK(command.value() == frontend::spark::sql_statement_t::command);
-    CHECK(engine_row_count(s, "plandb", "t") == 1);
+    CHECK(engine_row_count(s, "local.plandb", "t") == 1);
     const bool inserted = run_session_sql(s, id++, insert, err);
     INFO("INSERT: " << err);
     REQUIRE(inserted);
-    CHECK(engine_row_count(s, "plandb", "t") == 2);
+    CHECK(engine_row_count(s, "local.plandb", "t") == 2);
 }
 
 // ── Plan shapes the Spark Connect frontend answers without translating ──────
@@ -519,7 +518,7 @@ TEST_CASE("spark plan shapes: classify_sql calls only a SELECT of the core gramm
     // Queries — one with a derived table included, which the SQL path runs and
     // the DataFrame translator refuses.
     CHECK(kind_of("SELECT 1") == sql_statement_t::query);
-    CHECK(kind_of("SELECT d.id FROM (SELECT id FROM planpg.pgdb.public.items) d") == sql_statement_t::query);
+    CHECK(kind_of("SELECT d.id FROM (SELECT id FROM planpg.public.items) d") == sql_statement_t::query);
 
     // Commands: DDL, DML, and the statements the file / s3 and Kafka grammar
     // extensions claim.

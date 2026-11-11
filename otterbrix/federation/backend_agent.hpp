@@ -45,7 +45,6 @@
 // cancel() work as on any io_context. One statement at a time: the actor sends an agent the next
 // one only after the answer to the last.
 namespace otterstax::federation {
-
     enum class write_kind_t : std::uint8_t
     {
         insert,
@@ -157,7 +156,8 @@ namespace otterstax::federation {
         // column, the system.columns type of the table column it reads as it is (nullopt: computed).
         // `metadata`: the connection's discovery count; a PostgreSQL agent that read its ENUM labels
         // under another count reads them again first.
-        unique_future<rows_t> read(std::string sql, std::vector<std::optional<std::string>> declared, std::uint64_t metadata);
+        unique_future<rows_t>
+        read(std::string sql, std::vector<std::optional<std::string>> declared, std::uint64_t metadata);
         // The rows the backend reports it wrote: MySQL's affected rows (for an UPDATE the rows it
         // matched, mysql_update_rows_matched), PostgreSQL's command tag, ClickHouse's written_rows
         // for an INSERT and 0 for a mutation, which reports nothing. `strict_store`: the statement
@@ -221,19 +221,33 @@ namespace otterstax::federation {
 
         rows_t read_mysql(mysql::IConnector& connector, const std::string& sql);
         rows_t read_pg(pg::IConnector& connector, const std::string& sql, std::uint64_t metadata);
-        rows_t read_ch(ch::IConnector& connector, const std::string& sql, const std::vector<std::optional<std::string>>& declared);
-        core::result_wrapper_t<std::uint64_t> write_mysql(mysql::IConnector& connector, const std::string& sql, write_kind_t kind);
+        rows_t read_ch(ch::IConnector& connector,
+                       const std::string& sql,
+                       const std::vector<std::optional<std::string>>& declared);
+        core::result_wrapper_t<std::uint64_t>
+        write_mysql(mysql::IConnector& connector, const std::string& sql, write_kind_t kind);
         core::result_wrapper_t<std::uint64_t> write_pg(pg::IConnector& connector, const std::string& sql);
         core::result_wrapper_t<std::uint64_t>
         write_ch(ch::IConnector& connector, const std::string& sql, write_kind_t kind, const qualified_name_t& table);
         // The answer to a ClickHouse mutation of `table` that failed with `failed`: the mutation is
         // killed (ClickHouse would retry it forever, and every later mutation of the table would
         // fail with its error), then `failed` answered; a KILL that failed adds its own error.
-        [[nodiscard]] core::error_t
-        kill_failed_mutation(ch::IConnector& connector, const std::string& sql, const qualified_name_t& table, core::error_t failed);
-        core::result_wrapper_t<discovered_tables_t> discover_mysql(mysql::IConnector& connector, const qualified_name_t& scope);
-        core::result_wrapper_t<discovered_tables_t> discover_pg(pg::IConnector& connector, const qualified_name_t& scope);
-        core::result_wrapper_t<discovered_tables_t> discover_ch(ch::IConnector& connector, const qualified_name_t& scope);
+        [[nodiscard]] core::error_t kill_failed_mutation(ch::IConnector& connector,
+                                                         const std::string& sql,
+                                                         const qualified_name_t& table,
+                                                         core::error_t failed);
+        core::result_wrapper_t<discovered_tables_t> discover_mysql(mysql::IConnector& connector,
+                                                                   const qualified_name_t& scope);
+        // One database of the server (scope.database), or its one table (scope.collection).
+        core::result_wrapper_t<discovered_tables_t> discover_mysql_in(mysql::IConnector& connector,
+                                                                      const qualified_name_t& scope);
+        core::result_wrapper_t<discovered_tables_t> discover_pg(pg::IConnector& connector,
+                                                                const qualified_name_t& scope);
+        core::result_wrapper_t<discovered_tables_t> discover_ch(ch::IConnector& connector,
+                                                                const qualified_name_t& scope);
+        // One database of the server (scope.database), or its one table (scope.collection).
+        core::result_wrapper_t<discovered_tables_t> discover_ch_in(ch::IConnector& connector,
+                                                                   const qualified_name_t& scope);
         [[nodiscard]] core::error_t fetch_enums(pg::IConnector& connector);
 
         std::pmr::memory_resource* resource_;
@@ -280,5 +294,4 @@ namespace otterstax::federation {
     };
 
     using backend_agent_ptr = std::unique_ptr<backend_agent_t, actor_zeta::pmr::deleter_t>;
-
 } // namespace otterstax::federation

@@ -47,7 +47,6 @@
 #include <vector>
 
 namespace frontend::spark::catalog_rows {
-
     // The one catalog OtterStax answers for.
     inline constexpr std::string_view catalog_name = "otterstax";
 
@@ -68,7 +67,7 @@ namespace frontend::spark::catalog_rows {
 
         std::pmr::vector<std::pmr::string> databases; // sorted
         std::pmr::vector<table_entry_t> tables;       // sorted by database, then name
-        std::pmr::vector<std::pmr::string> place;     // [current_database(), current_schema()]; no schema when NULL
+        std::pmr::vector<std::pmr::string> place;     // [connection or database, schema]; empty without a place
         std::pmr::string current_database;            // ".".join(place)
     };
 
@@ -76,7 +75,8 @@ namespace frontend::spark::catalog_rows {
     // read by position.
     //   schemas: datconnection, datname, nspname of every listed schema
     //   tables:  datconnection, datname, nspname, relname, relkind of every listed table / view
-    //   place:   current_database(), current_schema()
+    //   place:   current_database() and current_schema() — the place as the session's
+    //            search_path spells it (the schema NULL when the place is gone)
     std::string schemas_sql();
     std::string tables_sql();
     inline constexpr std::string_view place_sql = "SELECT current_database(), current_schema();";
@@ -148,5 +148,4 @@ namespace frontend::spark::catalog_rows {
     // prepared schema carries no nullability.
     session_payload list_columns(const components::types::complex_logical_type& schema,
                                  std::pmr::memory_resource* resource);
-
 } // namespace frontend::spark::catalog_rows

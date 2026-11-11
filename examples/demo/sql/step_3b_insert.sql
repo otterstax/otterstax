@@ -1,6 +1,6 @@
 -- Step 3b: INSERT three warehouses with composite payload via ROW(...).
 -- Cities chosen to match seeded customer addresses for step 4.
-INSERT INTO otter.warehouses
+INSERT INTO local.otter.warehouses
        (warehouse_id, code, tier, location, spec, priority_high, priority_med, priority_low) VALUES
   ('11111111-1111-1111-1111-111111111111',
    'TLV-1',

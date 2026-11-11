@@ -48,7 +48,7 @@ try:
         import psycopg2
         conn = psycopg2.connect(
             host=args.host, port=args.port,
-            user="testuser", password="testpass", dbname="main"
+            user="testuser", password="testpass", dbname="local"
         )
         cur = conn.cursor()
         cur.execute(args.sql)

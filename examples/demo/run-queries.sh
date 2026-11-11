@@ -9,7 +9,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-URI="postgresql://demo:demo@127.0.0.1:8817/main"
+URI="postgresql://demo:demo@127.0.0.1:8817/local"
 
 for f in sql/step_*.sql; do
     echo "============================================================"

@@ -45,7 +45,7 @@ Nothing in `config/` throws. Every entry point returns a
 | a connection entry that is a scalar (`mysql: [name]`) | `invalid_parameter` | the section + entry position + "expected a mapping of keys" |
 | a connection field that is not a scalar (`host: [a, b]`) | `invalid_parameter` | the section + entry position + field |
 | an incomplete connection entry, or a malformed backend port | `invalid_parameter` | the section + `alias='…'` + the missing field / bad port |
-| a connection whose alias is `federation` or `main` in any case, in any section | `invalid_parameter` | the section + `alias='…'` + "reserved" + what the name is |
+| a connection whose alias is `local`, `federation` or `main` in any case, in any section | `invalid_parameter` | the section + `alias='…'` + "reserved" + what the name is |
 | a backend alias (mysql / postgresql / clickhouse) that is not an unquoted SQL identifier (`[a-z_][a-z0-9_]*`) | `invalid_parameter` | the section + `alias='…'` + the rule ("unquoted") |
 | a backend alias (mysql / postgresql / clickhouse) equal to another one, or an s3 alias equal to another s3 alias | `invalid_parameter` | the section + `alias='…'` + "already taken by" the other entry |
 | a `pool_size` below 1, or one that is not an integer | `invalid_parameter` | the section + `alias='…'` (or entry position) + `pool_size` |
@@ -137,7 +137,8 @@ silently in force. Error messages live on the `std::pmr::memory_resource*` passe
   plus `int pool_size = default_pool_size` (4) on each of them;
   `alias/access_key/secret_key/region/session_token/endpoint` for s3). PostgreSQL
   `schema` empty (the default) = every user schema of the database, a name = that
-  schema only; MySQL / ClickHouse have the one schema `public`.
+  schema only; a MySQL / ClickHouse connection sees every user database of its server,
+  its `database` being the default namespace (and, with `table`, that table's database).
   `pool_size` (validated `>= 1`) is the number of agents — one physical
   connection each — `remote_backends_t::open` builds for the connection. A
   transaction block holds one agent from its first statement to its end, so
@@ -181,19 +182,20 @@ silently in force. Error messages live on the `std::pmr::memory_resource*` passe
   defined as the federation's `metadata_database` — a header-only constant),
   OtterStax's own database (`federation.public.remote_names`, the backends'
   spelling of the remote tables, `otterbrix/federation/metadata.hpp`;
-  `federation.kafka.*`, Kafka's bookkeeping — the refusal says so), and `main`, the
-  engine's default local database. An alias is the first part of a four-part
-  name, so a connection under it would shadow that database. Then a backend alias (mysql / postgresql /
+  `federation.kafka.*`, Kafka's bookkeeping — the refusal says so), and `main` / `local`, the reserved
+  names beside the local engine database of the clients' tables. An alias is the first part of every
+  table name (`uid.ns.t`), so a connection under one of them would give the name a second reading.
+  Then a backend alias (mysql / postgresql /
   clickhouse) must be an **unquoted SQL identifier**, `[a-z_][a-z0-9_]*`: it is
   the first segment of a federated table name, written unquoted in SQL, so it
   must be what the lexer folds an unquoted identifier to — an upper-case letter,
   a dot, a dash or a leading digit would be unreachable. s3 aliases are a string
   literal (`s3_alias = '…'`) and take any spelling. `kafka` is an ordinary alias: the Kafka objects are
-  the schema `main.kafka`, never the first part of a four-part name. `pool_size` is checked last (every backend section). `parse_connections` turns a non-empty
+  the schema `local.kafka` of the local database. `pool_size` is checked last (every backend section). `parse_connections` turns a non-empty
   result into its `invalid_parameter`.
 - After every entry passed, `parse_connections` checks the **aliases**: the
   mysql / postgresql / clickhouse aliases share one namespace — an alias is the
-  connection every four-part name starts with — so two equal entries, in one
+  connection every remote name (`uid.ns.t`) starts with — so two equal entries, in one
   section or two, are refused: one backend would be unreachable.
   s3 aliases are another namespace (the `s3_alias` option of CREATE EXTERNAL
   TABLE / COPY ... TO, looked up exactly by `conn::s3::ConnectorManager`, where a
@@ -344,7 +346,7 @@ rules).
 parsing, null/missing node, missing sections, pg `schema` empty when omitted, optional s3
 fields, order preservation, the `pool_size` default 4, **`invalid_parameter` on an incomplete entry, a
 malformed port, a non-scalar field, a bad `pool_size`, or the reserved aliases
-`federation` / `main` in any case and any section** (an alias merely containing
+`federation` / `main` / `local` in any case and any section** (`test_connection_names.cpp`; an alias merely containing
 the word is accepted; `kafka` is accepted), **a backend alias taken twice across sections, two equal
 s3 aliases** (an s3 alias equal to a backend alias, or differing in case, is
 accepted), the `[names]` table of backend aliases (duplicates within and across

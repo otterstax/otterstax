@@ -25,7 +25,6 @@
 #include <vector>
 
 namespace {
-
     using row_t = std::pair<std::string, std::string>;
 
     std::vector<std::string> strings_of(const std::shared_ptr<arrow::Array>& array) {
@@ -62,8 +61,8 @@ namespace {
         return out;
     }
 
-    // Two MySQL connections m1 / m2 (database db, its one table `table`), two
-    // local databases and a schema of main.
+    // Two MySQL connections m1 / m2 (database db, its one table `table`); the local
+    // namespaces `loc`, `alpha` and `sales` are schemas of the engine's database `local`.
     struct metadata_stack {
         otterstax::test::session_stack_owner owner;
         flight::engine::SessionEngine engine;
@@ -73,70 +72,72 @@ namespace {
                     otterstax::test::stack_options_t{
                         .connections = config::ConnectionsConfig{.mysql = otterstax::test::mock_mysql({"m1", "m2"})}})
             , engine(owner.sessions(), owner.engine().resource()) {
-            REQUIRE(engine.execute_update("CREATE DATABASE loc") == 0);
-            REQUIRE(engine.execute_update("CREATE TABLE loc.public.items (id bigint)") == 0);
-            REQUIRE(engine.execute_update("CREATE TABLE loc.public.labels (id bigint)") == 0);
-            REQUIRE(engine.execute_update("CREATE DATABASE alpha") == 0);
-            REQUIRE(engine.execute_update("CREATE TABLE alpha.public.t (id bigint)") == 0);
+            REQUIRE(engine.execute_update("CREATE SCHEMA loc") == 0);
+            REQUIRE(engine.execute_update("CREATE TABLE local.loc.items (id bigint)") == 0);
+            REQUIRE(engine.execute_update("CREATE TABLE local.loc.labels (id bigint)") == 0);
+            REQUIRE(engine.execute_update("CREATE SCHEMA alpha") == 0);
+            REQUIRE(engine.execute_update("CREATE TABLE local.alpha.t (id bigint)") == 0);
             REQUIRE(engine.execute_update("CREATE SCHEMA sales") == 0);
-            REQUIRE(engine.execute_update("CREATE TABLE sales.leads (id bigint)") == 0);
+            REQUIRE(engine.execute_update("CREATE TABLE local.sales.leads (id bigint)") == 0);
         }
     };
-
 } // namespace
 
+// The catalogs are the engine's databases as SQL writes them: `d` local, `c.d` for a
+// connection's.
 TEST_CASE("flight metadata: GetCatalogs lists every database once, as SQL writes it") {
     metadata_stack fx("otterstax_flight_metadata_catalogs");
     auto batch = flight::core::catalogs_batch(fx.engine.catalogs());
     REQUIRE(batch->num_columns() == 1);
-    CHECK(strings_of(batch->column(0)) == std::vector<std::string>{"alpha", "loc", "m1.db", "m2.db", "main"});
+    CHECK(strings_of(batch->column(0)) == std::vector<std::string>{"local", "m1.def", "m2.def", "main"});
 }
 
 TEST_CASE("flight metadata: GetDbSchemas keeps each schema under its own catalog") {
     metadata_stack fx("otterstax_flight_metadata_schemas");
 
-    CHECK(schemas_of(fx.engine.db_schemas(std::nullopt, "")) == std::vector<row_t>{{"alpha", "public"},
-                                                                                     {"loc", "public"},
-                                                                                     {"m1.db", "public"},
-                                                                                     {"m2.db", "public"},
-                                                                                     {"main", "public"},
-                                                                                     {"main", "sales"}});
+    CHECK(schemas_of(fx.engine.db_schemas(std::nullopt, "")) == std::vector<row_t>{{"local", "alpha"},
+                                                                                   {"local", "loc"},
+                                                                                   {"local", "public"},
+                                                                                   {"local", "sales"},
+                                                                                   {"m1.def", "db"},
+                                                                                   {"m2.def", "db"},
+                                                                                   {"main", "public"}});
 
     SECTION("catalog is an exact match") {
-        CHECK(schemas_of(fx.engine.db_schemas("m1.db", "")) == std::vector<row_t>{{"m1.db", "public"}});
-        CHECK(schemas_of(fx.engine.db_schemas("main", "")) ==
-              std::vector<row_t>{{"main", "public"}, {"main", "sales"}});
+        CHECK(schemas_of(fx.engine.db_schemas("m1.def", "")) == std::vector<row_t>{{"m1.def", "db"}});
+        CHECK(schemas_of(fx.engine.db_schemas("main", "")) == std::vector<row_t>{{"main", "public"}});
         CHECK(fx.engine.db_schemas("m%", "").empty());
         CHECK(fx.engine.db_schemas("", "").empty());
         CHECK(fx.engine.db_schemas("federation", "").empty());
     }
 
     SECTION("db_schema_filter_pattern is a LIKE pattern") {
-        CHECK(schemas_of(fx.engine.db_schemas(std::nullopt, "s%")) == std::vector<row_t>{{"main", "sales"}});
-        CHECK(fx.engine.db_schemas(std::nullopt, "p_blic").size() == 5);
+        CHECK(schemas_of(fx.engine.db_schemas(std::nullopt, "s%")) == std::vector<row_t>{{"local", "sales"}});
+        CHECK(fx.engine.db_schemas(std::nullopt, "p_blic").size() == 2);
         CHECK(fx.engine.db_schemas(std::nullopt, "pg_%").empty());
     }
 
     SECTION("filters combine") {
-        CHECK(fx.engine.db_schemas("loc", "s%").empty());
-        CHECK(schemas_of(fx.engine.db_schemas("main", "s%")) == std::vector<row_t>{{"main", "sales"}});
+        CHECK(fx.engine.db_schemas("m1.def", "s%").empty());
+        CHECK(schemas_of(fx.engine.db_schemas("local", "s%")) == std::vector<row_t>{{"local", "sales"}});
     }
 }
 
 TEST_CASE("flight metadata: GetTables applies the catalog, schema and table filters") {
     metadata_stack fx("otterstax_flight_metadata_tables");
 
-    CHECK(tables_of(fx.engine.tables(std::nullopt, "", "", false)) == std::vector<std::string>{"alpha|public|t",
-                                                                                             "loc|public|items",
-                                                                                             "loc|public|labels",
-                                                                                             "m1.db|public|table",
-                                                                                             "m2.db|public|table",
-                                                                                             "main|sales|leads"});
-    CHECK(tables_of(fx.engine.tables("loc", "", "", false)) ==
-          std::vector<std::string>{"loc|public|items", "loc|public|labels"});
-    CHECK(tables_of(fx.engine.tables("m2.db", "", "", false)) == std::vector<std::string>{"m2.db|public|table"});
-    CHECK(tables_of(fx.engine.tables(std::nullopt, "sal%", "", false)) == std::vector<std::string>{"main|sales|leads"});
-    CHECK(tables_of(fx.engine.tables("loc", "pub%", "l%", false)) == std::vector<std::string>{"loc|public|labels"});
+    CHECK(tables_of(fx.engine.tables(std::nullopt, "", "", false)) == std::vector<std::string>{"local|alpha|t",
+                                                                                               "local|loc|items",
+                                                                                               "local|loc|labels",
+                                                                                               "local|sales|leads",
+                                                                                               "m1.def|db|table",
+                                                                                               "m2.def|db|table"});
+    CHECK(tables_of(fx.engine.tables("local", "loc", "", false)) ==
+          std::vector<std::string>{"local|loc|items", "local|loc|labels"});
+    CHECK(tables_of(fx.engine.tables("m2.def", "", "", false)) == std::vector<std::string>{"m2.def|db|table"});
+    CHECK(tables_of(fx.engine.tables(std::nullopt, "sal%", "", false)) ==
+          std::vector<std::string>{"local|sales|leads"});
+    CHECK(tables_of(fx.engine.tables("local", "loc", "l%", false)) == std::vector<std::string>{"local|loc|labels"});
 }
 
 TEST_CASE("flight metadata: GetTables with include_schema describes each table in the engine") {
@@ -158,9 +159,9 @@ TEST_CASE("flight metadata: GetTables with include_schema describes each table i
         }
         return names;
     };
-    CHECK(columns_of("loc.items") == std::vector<std::string>{"id"});
+    CHECK(columns_of("local.items") == std::vector<std::string>{"id"});
     // A table of a connection: its registered columns, no SQL to the backend.
-    CHECK(columns_of("m1.db.table") == std::vector<std::string>{"id", "name"});
+    CHECK(columns_of("m1.def.table") == std::vector<std::string>{"id", "name"});
 
     auto batch = flight::core::tables_batch(tables, true);
     REQUIRE(batch->num_rows() == 6);

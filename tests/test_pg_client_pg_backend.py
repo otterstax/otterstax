@@ -28,9 +28,9 @@ class client:
             'password': 'testpass',
             # The engine database the session is placed in (main.public); an
             # unknown one is FATAL 3D000. The remote tables are named in full.
-            'dbname': 'main',
+            'dbname': 'local',
         }
-        self.test_database = 'products.pgdb.public'
+        self.test_database = 'products.public'
         self.test_table = 'postgresql_test_table'
         self.test_encoding_table = 'postgresql_test_encoding'
 
@@ -363,7 +363,7 @@ class client:
 
     def test_cte_over_a_remote_table(self):
         """Test 8: a CTE (WITH) over a remote table answers what the same filter answers directly."""
-        products = "products.pgdb.public.products"
+        products = "products.public.products"
         with self.psycopg2_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(f"SELECT COUNT(product_id) FROM {products} WHERE price < 100")
@@ -378,7 +378,7 @@ class client:
 
     def test_remote_table_in_a_subquery(self):
         """Test 9: a remote table inside IN (SELECT ...) and EXISTS (SELECT ...)."""
-        products = "products.pgdb.public.products"
+        products = "products.public.products"
         with self.psycopg2_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(f"SELECT COUNT(product_id) FROM {products}")
@@ -405,7 +405,7 @@ class client:
 
     def test_fully_qualified_column_of_a_remote_table(self):
         """Test 10: a column qualified with the remote table's whole four-part name, as FROM writes it."""
-        products = "products.pgdb.public.products"
+        products = "products.public.products"
         with self.psycopg2_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(f"SELECT product_id FROM {products} ORDER BY product_id")

@@ -21,11 +21,9 @@
 #include <utility>
 
 namespace otterstax::federation {
-
     using components::vector::data_chunk_t;
 
     namespace {
-
         bool ends_transaction(transaction_step_t step) noexcept {
             return step == transaction_step_t::commit || step == transaction_step_t::rollback;
         }
@@ -41,7 +39,6 @@ namespace otterstax::federation {
             }
             return "unknown";
         }
-
     } // namespace
 
     std::optional<std::uint64_t> mysql_update_rows_matched(std::string_view info) {
@@ -246,8 +243,7 @@ namespace otterstax::federation {
         if (reachability_ != nullptr) {
             if (now() < reachability_->unreachable_until_ms.load(std::memory_order_acquire)) {
                 return error(core::error_code_t::io_error,
-                             "connection \"" + connection_ +
-                                 "\" is unreachable: a connect failed less than " +
+                             "connection \"" + connection_ + "\" is unreachable: a connect failed less than " +
                                  std::to_string(reachability_->interval_ms.load(std::memory_order_relaxed) / 1000) +
                                  " s ago, the next one is tried after that");
             }
@@ -260,8 +256,8 @@ namespace otterstax::federation {
         }
         if (failed.contains_error()) {
             return error(core::error_code_t::io_error,
-                         "connection \"" + connection_ + "\" is unreachable: " +
-                             std::string{failed.what.data(), failed.what.size()});
+                         "connection \"" + connection_ +
+                             "\" is unreachable: " + std::string{failed.what.data(), failed.what.size()});
         }
         return check_session();
     }
@@ -270,11 +266,10 @@ namespace otterstax::federation {
     auto backend_agent_t::run(Connector& connector, std::string_view sql, Handler handler) {
         using outcome_t = otterstax::query_result_t<R>;
         try {
-            auto outcome = otterstax::spawn_marshaled<R>(io_,
-                                                         otterstax::run_with_owned_handler<R, Arg>(connector,
-                                                                                                   sql,
-                                                                                                   std::move(handler)),
-                                                         resource_);
+            auto outcome = otterstax::spawn_marshaled<R>(
+                io_,
+                otterstax::run_with_owned_handler<R, Arg>(connector, sql, std::move(handler)),
+                resource_);
             // The connector's io_context is the agent's alone: it runs here until the statement (and
             // every handler it derived, a deadline included) completed.
             io_.restart();
@@ -344,7 +339,8 @@ namespace otterstax::federation {
         reopen_ = true;
         if (failed.contains_error()) {
             return error(failed.type,
-                         "the session's sql_mode could not be read: " + std::string{failed.what.data(), failed.what.size()});
+                         "the session's sql_mode could not be read: " +
+                             std::string{failed.what.data(), failed.what.size()});
         }
         session_refused_ = true;
         auto refused = error(core::error_code_t::unimplemented_yet,
@@ -513,7 +509,8 @@ namespace otterstax::federation {
         if (log_.is_valid()) {
             log_->debug("{} write: \"{}\"", connection_, sql);
         }
-        core::result_wrapper_t<std::uint64_t> written = error(core::error_code_t::internal_error, "no connector attached");
+        core::result_wrapper_t<std::uint64_t> written =
+            error(core::error_code_t::internal_error, "no connector attached");
         if (auto* my = std::get_if<std::unique_ptr<mysql::IConnector>>(&connector_)) {
             written = write_mysql(**my, sql, kind);
         } else if (auto* pg = std::get_if<std::unique_ptr<pg::IConnector>>(&connector_)) {
@@ -527,7 +524,8 @@ namespace otterstax::federation {
         co_return written;
     }
 
-    backend_agent_t::unique_future<core::error_t> backend_agent_t::step(transaction_step_t step, std::string savepoint) {
+    backend_agent_t::unique_future<core::error_t> backend_agent_t::step(transaction_step_t step,
+                                                                        std::string savepoint) {
         OTX_ZONE_N("backend_agent::step");
         if (kind_ == backend_type_t::ClickHouse) {
             if (step == transaction_step_t::unpin) {
@@ -688,8 +686,42 @@ namespace otterstax::federation {
         return static_cast<std::uint64_t>(outcome.value());
     }
 
-    core::result_wrapper_t<discovered_tables_t>
-    backend_agent_t::discover_mysql(mysql::IConnector& connector, const qualified_name_t& scope) {
+    core::result_wrapper_t<discovered_tables_t> backend_agent_t::discover_mysql(mysql::IConnector& connector,
+                                                                                const qualified_name_t& scope) {
+        if (!scope.database.t.empty() || !scope.collection.t.empty()) {
+            return discover_mysql_in(connector, scope);
+        }
+        // The whole server: each of its user databases.
+        std::vector<std::string> databases;
+        auto listed = [&databases](const boost::mysql::results& result) -> otterstax::asio_error_t {
+            for (auto row : result.rows()) {
+                auto view = row.at(0).as_string();
+                databases.emplace_back(view.data(), view.size());
+            }
+            return otterstax::asio_error_t{};
+        };
+        auto query = otterstax::catalog::make_list_databases_query(resource_, backend_type_t::MySQL);
+        if (auto failed = run<otterstax::asio_error_t, const boost::mysql::results&>(connector, query, listed);
+            failed.contains_error()) {
+            return failed;
+        }
+        discovered_tables_t every(resource_);
+        for (const auto& database : databases) {
+            auto in_one = scope;
+            in_one.database = core::dbname_t{database};
+            auto found = discover_mysql_in(connector, in_one);
+            if (found.has_error()) {
+                return found;
+            }
+            for (auto& table : found.value()) {
+                every.push_back(std::move(table));
+            }
+        }
+        return every;
+    }
+
+    core::result_wrapper_t<discovered_tables_t> backend_agent_t::discover_mysql_in(mysql::IConnector& connector,
+                                                                                   const qualified_name_t& scope) {
         discovered_tables_t out(resource_);
         // The session's sql_mode was checked when it was opened (check_session).
         auto probe = [this, &out, &connector](const qualified_name_t& table) -> core::error_t {
@@ -715,9 +747,6 @@ namespace otterstax::federation {
                 return failed;
             }
             return out;
-        }
-        if (scope.database.t.empty()) {
-            return error(core::error_code_t::invalid_parameter, "no database configured to discover");
         }
         auto list = otterstax::catalog::make_list_tables_query(resource_, backend_type_t::MySQL, scope.database.t);
         std::vector<std::string> names;
@@ -882,7 +911,8 @@ namespace otterstax::federation {
             }
             return otterstax::asio_error_t{};
         };
-        if (auto failed = run<otterstax::asio_error_t, PGresult*>(connector, list, list_handler); failed.contains_error()) {
+        if (auto failed = run<otterstax::asio_error_t, PGresult*>(connector, list, list_handler);
+            failed.contains_error()) {
             return failed;
         }
         std::pmr::vector<std::pmr::string> failed_tables(resource_);
@@ -909,7 +939,8 @@ namespace otterstax::federation {
                                                      const std::string& sql,
                                                      const std::vector<std::optional<std::string>>& declared) {
         std::optional<core::error_t> conversion;
-        auto handler = [this, &conversion, &declared](const ch::select_result_t& result) -> std::unique_ptr<data_chunk_t> {
+        auto handler =
+            [this, &conversion, &declared](const ch::select_result_t& result) -> std::unique_ptr<data_chunk_t> {
             auto converted = tsl::ch_to_chunk(resource_, result.blocks, declared);
             if (converted.has_error()) {
                 conversion.emplace(core::error_on(resource_, converted.error()));
@@ -969,9 +1000,9 @@ namespace otterstax::federation {
             return failed;
         }
         const auto with = [this, &failed](const std::string& note) {
-            return core::error_t{failed.type,
-                                 std::pmr::string{(std::string{failed.what.data(), failed.what.size()} + note).c_str(),
-                                                  resource_}};
+            return core::error_t{
+                failed.type,
+                std::pmr::string{(std::string{failed.what.data(), failed.what.size()} + note).c_str(), resource_}};
         };
         if (ids.size() > 1) {
             // Which of them is this statement's ClickHouse does not say; the others are not ours.
@@ -979,7 +1010,8 @@ namespace otterstax::federation {
             for (const auto& id : ids) {
                 listed += (listed.empty() ? "" : ", ") + id;
             }
-            return with("; ClickHouse names the mutations " + listed + " as failed together and does not say which "
+            return with("; ClickHouse names the mutations " + listed +
+                        " as failed together and does not say which "
                         "one this statement's is: none was killed (KILL MUTATION by hand)");
         }
         std::string kill = "KILL MUTATION WHERE database = ";
@@ -989,8 +1021,12 @@ namespace otterstax::federation {
         kill += " AND mutation_id = ";
         kill += otterstax::catalog::escape_sql_literal(resource_, ids.front(), backend_type_t::ClickHouse);
         if (log_.is_valid()) {
-            log_->warn("{}: the mutation {} of {}.{} failed, killing it: \"{}\"", connection_, ids.front(),
-                       table.database.t, table.collection.t, kill);
+            log_->warn("{}: the mutation {} of {}.{} failed, killing it: \"{}\"",
+                       connection_,
+                       ids.front(),
+                       table.database.t,
+                       table.collection.t,
+                       kill);
         }
         auto ok = [](const ch::select_result_t&) -> otterstax::asio_error_t { return otterstax::asio_error_t{}; };
         if (auto refused = run<otterstax::asio_error_t, const ch::select_result_t&>(connector, kill, ok);
@@ -1003,9 +1039,49 @@ namespace otterstax::federation {
 
     core::result_wrapper_t<discovered_tables_t> backend_agent_t::discover_ch(ch::IConnector& connector,
                                                                              const qualified_name_t& scope) {
-        if (scope.database.t.empty()) {
-            return error(core::error_code_t::invalid_parameter, "no database configured to discover");
+        if (!scope.database.t.empty()) {
+            return discover_ch_in(connector, scope);
         }
+        // The whole server: each of its user databases.
+        std::vector<std::string> databases;
+        auto listed = [this, &databases](const ch::select_result_t& result) -> otterstax::asio_error_t {
+            for (const auto& block : result.blocks) {
+                if (block.GetRowCount() == 0) {
+                    continue;
+                }
+                auto column = block[0]->As<clickhouse::ColumnString>();
+                if (!column) {
+                    return error(core::error_code_t::protocol_violation, "the database listing is not a string column");
+                }
+                for (size_t i = 0; i < block.GetRowCount(); ++i) {
+                    auto view = column->At(i);
+                    databases.emplace_back(view.data(), view.size());
+                }
+            }
+            return otterstax::asio_error_t{};
+        };
+        auto query = otterstax::catalog::make_list_databases_query(resource_, backend_type_t::ClickHouse);
+        if (auto failed = run<otterstax::asio_error_t, const ch::select_result_t&>(connector, query, listed);
+            failed.contains_error()) {
+            return failed;
+        }
+        discovered_tables_t every(resource_);
+        for (const auto& database : databases) {
+            auto in_one = scope;
+            in_one.database = core::dbname_t{database};
+            auto found = discover_ch_in(connector, in_one);
+            if (found.has_error()) {
+                return found;
+            }
+            for (auto& table : found.value()) {
+                every.push_back(std::move(table));
+            }
+        }
+        return every;
+    }
+
+    core::result_wrapper_t<discovered_tables_t> backend_agent_t::discover_ch_in(ch::IConnector& connector,
+                                                                                const qualified_name_t& scope) {
         const std::string& database = scope.database.t;
         discovered_tables_t out(resource_);
         // The system.columns types first (a named Tuple, a Bool, a LowCardinality column is read as
@@ -1036,12 +1112,14 @@ namespace otterstax::federation {
                 return otterstax::asio_error_t{};
             };
             auto types_query = otterstax::catalog::make_named_types_query(resource_, database, name);
-            if (auto failed = run<otterstax::asio_error_t, const ch::select_result_t&>(connector, types_query, types_handler);
+            if (auto failed =
+                    run<otterstax::asio_error_t, const ch::select_result_t&>(connector, types_query, types_handler);
                 failed.contains_error()) {
                 return failed;
             }
             qualified_name_t table(scope.connection, core::dbname_t{database}, core::schema_t{}, core::relname_t{name});
-            auto schema_handler = [this, &table, &types, &out](const ch::select_result_t& result) -> otterstax::asio_error_t {
+            auto schema_handler =
+                [this, &table, &types, &out](const ch::select_result_t& result) -> otterstax::asio_error_t {
                 if (result.blocks.empty() || result.blocks[0].GetColumnCount() == 0) {
                     return error(core::error_code_t::protocol_violation,
                                  "the schema probe returned no columns for " + table.database.t + "." +
@@ -1098,5 +1176,4 @@ namespace otterstax::federation {
         }
         return out;
     }
-
 } // namespace otterstax::federation

@@ -114,7 +114,7 @@ def main(local=False):
     print(f"# FlightSQL Client - PostgreSQL Backend Tests")
     print(f"{'#'*70}")
     print(f"Connecting to FlightSQL server at: {host}:8815")
-    print(f"Target: PostgreSQL backend (products.pgdb.public)")
+    print(f"Target: PostgreSQL backend (products.public)")
     print(f"{'#'*70}\n")
 
     # Initialize the client
@@ -149,19 +149,19 @@ def main(local=False):
     print(f"{'='*70}")
 
     # Test query 1: Simple SELECT from products table
-    test_query_1 = "SELECT * FROM products.pgdb.public.products;"
+    test_query_1 = "SELECT * FROM products.public.products;"
     validate_by_request(client, "Test 1: Simple SELECT", test_query_1, expected_schema_products)
 
     # Test query 2: SELECT with WHERE clause
-    test_query_2 = "SELECT * FROM products.pgdb.public.products WHERE price > 100;"
+    test_query_2 = "SELECT * FROM products.public.products WHERE price > 100;"
     validate_by_request(client, "Test 2: SELECT with WHERE", test_query_2, expected_schema_products)
 
     # Test query 3: SELECT with ORDER BY
-    test_query_3 = "SELECT * FROM products.pgdb.public.products ORDER BY price DESC;"
+    test_query_3 = "SELECT * FROM products.public.products ORDER BY price DESC;"
     validate_by_request(client, "Test 3: SELECT with ORDER BY", test_query_3, expected_schema_products)
 
     # Test query 4: SELECT specific columns with numeric filter (string filter has server bug)
-    test_query_4 = "SELECT product_id, product_name, price FROM products.pgdb.public.products WHERE price > 300;"
+    test_query_4 = "SELECT product_id, product_name, price FROM products.public.products WHERE price > 300;"
     expected_schema_subset = {
         'product_id': pa.int32(),
         'product_name': pa.string(),
@@ -170,7 +170,7 @@ def main(local=False):
     validate_by_request(client, "Test 4: SELECT with numeric filter", test_query_4, expected_schema_subset)
 
     # Test query 5: SELECT with LIMIT
-    test_query_5 = "SELECT product_id, product_name, price FROM products.pgdb.public.products WHERE price > 200 LIMIT 10;"
+    test_query_5 = "SELECT product_id, product_name, price FROM products.public.products WHERE price > 200 LIMIT 10;"
     expected_schema_limit = {
         'product_id': pa.int32(),
         'product_name': pa.string(),
@@ -181,7 +181,7 @@ def main(local=False):
     # Test query 6: the projection of a remote SELECT is resolved by the catalog
     # whatever its parameters, but GetFlightInfoStatement binds nothing, so a
     # `$1` placeholder is refused before a ticket exists.
-    test_query_6 = "SELECT product_id, price FROM products.pgdb.public.products WHERE product_id = $1;"
+    test_query_6 = "SELECT product_id, price FROM products.public.products WHERE product_id = $1;"
     expect_refused_at_get_flight_info(client, "Test 6: Parameterized SELECT refused by GetFlightInfo",
                                       test_query_6, "unbound parameter")
 

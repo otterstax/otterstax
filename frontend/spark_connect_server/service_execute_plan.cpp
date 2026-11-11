@@ -44,9 +44,7 @@
 #include <utility>
 
 namespace frontend::spark {
-
     namespace {
-
         // How ExecutePlan answers a plan; decided before the handler's first suspension.
         enum class answer_t
         {
@@ -63,7 +61,6 @@ namespace frontend::spark {
         grpc::Status no_response_id() {
             return {grpc::StatusCode::UNAVAILABLE, "cannot generate a secure response id"};
         }
-
     } // namespace
 
 // The flat SqlCommand / SQL argument fields are deprecated in the protocol, but
@@ -124,15 +121,14 @@ namespace frontend::spark {
         if (translated.has_error()) {
             return std::move(translated.error());
         }
-        return session_plan_t{
-            .data = std::move(translated.value().parsed_data),
-            .rebuild = [plan, resource]() -> core::result_wrapper_t<ParsedQueryDataPtr> {
-                auto again = relation_to_plan(plan, resource);
-                if (again.has_error()) {
-                    return std::move(again.error());
-                }
-                return std::move(again.value().parsed_data);
-            }};
+        return session_plan_t{.data = std::move(translated.value().parsed_data),
+                              .rebuild = [plan, resource]() -> core::result_wrapper_t<ParsedQueryDataPtr> {
+                                  auto again = relation_to_plan(plan, resource);
+                                  if (again.has_error()) {
+                                      return std::move(again.error());
+                                  }
+                                  return std::move(again.value().parsed_data);
+                              }};
     }
 
     bool is_empty_local_relation(const sc::Relation& relation) {
@@ -180,13 +176,25 @@ namespace frontend::spark {
         std::optional<std::string> statement;
         ParsedQueryDataPtr statement_plan;
         query_session_t::rebuild_fn rebuild;
+        query_session_t::unique_future<query_session_t::session_result> place;
         {
             OTX_ZONE_N("SparkConnectServiceImpl::handle_execute_plan");
             if (!spark_sessions_.open_or_use(
                     spark_session_id,
                     std::chrono::steady_clock::now(),
                     [&](query_session_t& session) { hash = session.next_statement(); },
-                    [this] { return sessions_->open(); })) {
+                    [this, &place] {
+                        auto session = sessions_->open(otterstax::session::database_term_t::schema);
+                        // Spark's current database exists before the client names one:
+                        // local.public here, what currentDatabase() answers first. A USE
+                        // of the client's replaces it.
+                        place = std::move(actor_zeta::send(session->address(),
+                                                            &query_session_t::use,
+                                                            session->next_statement(),
+                                                            std::string{"local"})
+                                               .second);
+                        return session;
+                    })) {
                 refusal = session_closed_status(spark_session_id);
             } else if (plan.has_root() && contains_window(plan.root())) {
                 // Pre-flight: reject Window functions before any actor work.
@@ -257,19 +265,22 @@ namespace frontend::spark {
             }
             // The statement chosen above, queued on the session.
             if ((statement || statement_plan) &&
-                !spark_sessions_.begin(spark_session_id, std::chrono::steady_clock::now(), [&](query_session_t& session) {
-                    fut = statement_plan ? std::move(actor_zeta::send(session.address(),
-                                                                      &query_session_t::execute_plan,
-                                                                      hash,
-                                                                      std::move(statement_plan),
-                                                                      std::move(rebuild))
-                                                         .second)
-                                         : std::move(actor_zeta::send(session.address(),
-                                                                      &query_session_t::execute,
-                                                                      hash,
-                                                                      std::move(*statement))
-                                                         .second);
-                })) {
+                !spark_sessions_.begin(spark_session_id,
+                                       std::chrono::steady_clock::now(),
+                                       [&](query_session_t& session) {
+                                           fut = statement_plan
+                                                     ? std::move(actor_zeta::send(session.address(),
+                                                                                  &query_session_t::execute_plan,
+                                                                                  hash,
+                                                                                  std::move(statement_plan),
+                                                                                  std::move(rebuild))
+                                                                     .second)
+                                                     : std::move(actor_zeta::send(session.address(),
+                                                                                  &query_session_t::execute,
+                                                                                  hash,
+                                                                                  std::move(*statement))
+                                                                     .second);
+                                       })) {
                 answer = answer_t::refused;
                 refusal = session_closed_status(spark_session_id);
             }
@@ -277,7 +288,18 @@ namespace frontend::spark {
         // A queued statement keeps the Spark session from expiring until the
         // request ends, its answer awaited and sent (spark_sessions_.begin … finish).
         boost::scope::scope_exit step_done(
-            [&] { spark_sessions_.finish(spark_session_id, std::chrono::steady_clock::now()); }, fut.valid());
+            [&] { spark_sessions_.finish(spark_session_id, std::chrono::steady_clock::now()); },
+            fut.valid());
+        // The place, awaited before the request answers: it is the session's first
+        // statement, its refusal is this request's refusal.
+        if (place.valid()) {
+            auto set = co_await await_future<session_payload>(std::move(place), resource_);
+            if (set.has_error()) {
+                fail_unanswered(spark_session_id, set.status());
+                co_await rpc.finish(error_status(spark_session_id, set.error()));
+                co_return;
+            }
+        }
         if (answer == answer_t::refused) {
             co_await fail_refused(spark_session_id, refusal);
             co_await rpc.finish(refusal);
@@ -330,13 +352,12 @@ namespace frontend::spark {
             // The catalog reads await the session themselves, each reaching it
             // as a step of this request; a timed-out read has nothing a COMMIT
             // could publish.
-            result = otterstax::awaited_t<session_payload>{
-                co_await handle_catalog_relation(plan.root().catalog(),
-                                                 spark_sessions_,
-                                                 spark_session_id,
-                                                 hash,
-                                                 resource_),
-                otterstax::await_status_t::answered};
+            result = otterstax::awaited_t<session_payload>{co_await handle_catalog_relation(plan.root().catalog(),
+                                                                                            spark_sessions_,
+                                                                                            spark_session_id,
+                                                                                            hash,
+                                                                                            resource_),
+                                                           otterstax::await_status_t::answered};
         } else if (fut.valid()) {
             result = co_await await_future<session_payload>(std::move(fut), resource_);
         }
@@ -456,5 +477,4 @@ namespace frontend::spark {
         }
         return std::pmr::string{uuid->data(), uuid->size(), resource_};
     }
-
 } // namespace frontend::spark

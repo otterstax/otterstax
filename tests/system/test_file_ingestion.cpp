@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2025-2026  OtterStax
 
-#include "frontend/common/asio_future_bridge.hpp"
 #include "../mock/cell.hpp"
-#include "session_stack.hpp"
+#include "connectors/file/manager.hpp"
+#include "connectors/s3/manager.hpp"
+#include "frontend/common/asio_future_bridge.hpp"
 #include "integration/s3/s3_manager.hpp"
 #include "otterbrix/operators/engine_requests.hpp"
 #include "otterbrix/parser/parser.hpp"
-#include "connectors/file/manager.hpp"
-#include "connectors/s3/manager.hpp"
+#include "session_stack.hpp"
 #include "utility/logger.hpp"
 #include "utility/session.hpp"
 
@@ -21,9 +21,9 @@
 #include <chrono>
 #include <thread>
 
-#include "otterbrix/translators/input/parquet_to_chunk.hpp"
 #include "otterbrix/translators/input/csv_to_chunk.hpp"
 #include "otterbrix/translators/input/ndjson_to_chunk.hpp"
+#include "otterbrix/translators/input/parquet_to_chunk.hpp"
 
 #include <arrow/api.h>
 #include <arrow/io/file.h>
@@ -36,165 +36,161 @@
 #include <string>
 
 namespace {
+    void write_test_parquet(const std::string& path) {
+        arrow::Int32Builder id_b;
+        arrow::StringBuilder name_b;
 
+        auto s1 = id_b.AppendValues({1, 2, 3, 4, 5});
+        auto s2 = name_b.AppendValues(std::vector<std::string>{"Alice", "Bob", "Charlie", "Dave", "Eve"});
+        if (!s1.ok() || !s2.ok())
+            throw std::runtime_error("Arrow builder append failed");
 
-void write_test_parquet(const std::string& path) {
-    arrow::Int32Builder  id_b;
-    arrow::StringBuilder name_b;
+        std::shared_ptr<arrow::Array> id_arr, name_arr;
+        if (!id_b.Finish(&id_arr).ok() || !name_b.Finish(&name_arr).ok())
+            throw std::runtime_error("Arrow builder finish failed");
 
-    auto s1 = id_b.AppendValues({1, 2, 3, 4, 5});
-    auto s2 = name_b.AppendValues(
-        std::vector<std::string>{"Alice", "Bob", "Charlie", "Dave", "Eve"});
-    if (!s1.ok() || !s2.ok())
-        throw std::runtime_error("Arrow builder append failed");
+        auto schema = arrow::schema({
+            arrow::field("id", arrow::int32()),
+            arrow::field("name", arrow::utf8()),
+        });
+        auto table = arrow::Table::Make(schema, {id_arr, name_arr});
 
-    std::shared_ptr<arrow::Array> id_arr, name_arr;
-    if (!id_b.Finish(&id_arr).ok() || !name_b.Finish(&name_arr).ok())
-        throw std::runtime_error("Arrow builder finish failed");
+        auto sink_result = arrow::io::FileOutputStream::Open(path);
+        if (!sink_result.ok())
+            throw std::runtime_error("Cannot open parquet output: " + sink_result.status().ToString());
 
-    auto schema = arrow::schema({
-        arrow::field("id",   arrow::int32()),
-        arrow::field("name", arrow::utf8()),
-    });
-    auto table = arrow::Table::Make(schema, {id_arr, name_arr});
+        auto status =
+            parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), *sink_result, /*chunk_size=*/1024);
+        if (!status.ok())
+            throw std::runtime_error("WriteTable failed: " + status.ToString());
 
-    auto sink_result = arrow::io::FileOutputStream::Open(path);
-    if (!sink_result.ok())
-        throw std::runtime_error("Cannot open parquet output: " + sink_result.status().ToString());
-
-    auto status = parquet::arrow::WriteTable(
-        *table, arrow::default_memory_pool(), *sink_result, /*chunk_size=*/1024);
-    if (!status.ok())
-        throw std::runtime_error("WriteTable failed: " + status.ToString());
-
-    if (!(*sink_result)->Close().ok())
-        throw std::runtime_error("Close failed");
-}
-
-void write_test_csv(const std::string& path) {
-    std::ofstream f(path);
-    f << "id,name\n"
-      << "1,Alice\n"
-      << "2,Bob\n"
-      << "3,Charlie\n"
-      << "4,Dave\n"
-      << "5,Eve\n";
-}
-
-void write_test_ndjson(const std::string& path) {
-    std::ofstream f(path);
-    f << "{\"id\":1,\"name\":\"Alice\"}\n"
-      << "{\"id\":2,\"name\":\"Bob\"}\n"
-      << "{\"id\":3,\"name\":\"Charlie\"}\n"
-      << "{\"id\":4,\"name\":\"Dave\"}\n"
-      << "{\"id\":5,\"name\":\"Eve\"}\n";
-}
-
-// The load behind CREATE EXTERNAL TABLE, the session's steps on the test's
-// engine session: the file read by the file manager, the table created from its
-// columns and the rows inserted (one transaction of its own).
-core::result_wrapper_t<bool> load_into(otterstax::test::test_engine_t& engine,
-                                       const actor_zeta::address_t& file_manager,
-                                       conn::file::FileLoadParams params,
-                                       const qualified_name_t& target) {
-    auto read = actor_zeta::send(file_manager, &conn::file::FileManager::load_file, session_hash_t{1}, std::move(params))
-                    .second.take_ready();
-    if (read.has_error()) {
-        return read.convert_error<bool>();
+        if (!(*sink_result)->Close().ok())
+            throw std::runtime_error("Close failed");
     }
-    auto create = otterstax::engine::create_table_plan(engine.resource(), target, read.value());
-    if (create.has_error()) {
-        return create.convert_error<bool>();
+
+    void write_test_csv(const std::string& path) {
+        std::ofstream f(path);
+        f << "id,name\n"
+          << "1,Alice\n"
+          << "2,Bob\n"
+          << "3,Charlie\n"
+          << "4,Dave\n"
+          << "5,Eve\n";
     }
-    auto cursor = engine.drive(otterstax::engine::load_table(engine.resource(),
-                                                             engine.dispatcher(),
-                                                             engine.session(),
-                                                             std::move(create.value()),
-                                                             target,
-                                                             std::move(read.value()),
-                                                             /*own_block=*/true));
-    if (cursor->is_error()) {
-        return core::error_t(cursor->get_error().type,
-                             std::pmr::string{cursor->get_error().what.c_str(), engine.resource()});
+
+    void write_test_ndjson(const std::string& path) {
+        std::ofstream f(path);
+        f << "{\"id\":1,\"name\":\"Alice\"}\n"
+          << "{\"id\":2,\"name\":\"Bob\"}\n"
+          << "{\"id\":3,\"name\":\"Charlie\"}\n"
+          << "{\"id\":4,\"name\":\"Dave\"}\n"
+          << "{\"id\":5,\"name\":\"Eve\"}\n";
     }
-    return true;
-}
 
-conn::file::FileLoadParams load_params(const std::string& path, const std::string& format) {
-    conn::file::FileLoadParams params;
-    params.path   = path;
-    params.format = format;
-    return params;
-}
-
-// main.public.<table>: a one-part name from the test session's default place.
-qualified_name_t people_table(const std::string& table = "people") {
-    return qualified_name_t{core::relname_t{table}};
-}
-
-// Loads `path` into main.public.people and reads it back.
-void require_loaded(const std::string& path, const std::string& format, const std::string& data_dir) {
-    std::filesystem::remove_all(data_dir);
-    auto otterbrix = std::make_unique<otterstax::test::test_engine_t>(data_dir);
-    auto file_manager = actor_zeta::spawn<conn::file::FileManager>(otterbrix->resource());
-
-    auto res = load_into(*otterbrix, file_manager->address(), load_params(path, format), people_table());
-    INFO("load: " << (res.has_error() ? res.error().what.c_str() : "ok"));
-    REQUIRE_FALSE(res.has_error());
-    auto cur = otterbrix->sql("SELECT * FROM people;");
-    REQUIRE(cur->is_success());
-    REQUIRE(cur->size() == 5);
-    REQUIRE(cur->chunks().front().column_count() == 2);
-
-    // Destroy otterbrix before removing data_dir: the destructor runs a disk
-    // checkpoint that writes to data_dir; removing it first causes a SIGSEGV.
-    cur.reset();
-    file_manager.reset();
-    otterbrix.reset();
-    std::filesystem::remove_all(data_dir);
-}
-
-// The rows of a loaded run, and the columns its chunks share.
-uint64_t rows_of(const std::pmr::vector<components::vector::data_chunk_t>& run) {
-    uint64_t rows = 0;
-    for (const auto& chunk : run) {
-        rows += chunk.size();
+    // The load behind CREATE EXTERNAL TABLE, the session's steps on the test's
+    // engine session: the file read by the file manager, the table created from its
+    // columns and the rows inserted (one transaction of its own).
+    core::result_wrapper_t<bool> load_into(otterstax::test::test_engine_t& engine,
+                                           const actor_zeta::address_t& file_manager,
+                                           conn::file::FileLoadParams params,
+                                           const qualified_name_t& target) {
+        auto read =
+            actor_zeta::send(file_manager, &conn::file::FileManager::load_file, session_hash_t{1}, std::move(params))
+                .second.take_ready();
+        if (read.has_error()) {
+            return read.convert_error<bool>();
+        }
+        auto create = otterstax::engine::create_table_plan(engine.resource(), target, read.value());
+        if (create.has_error()) {
+            return create.convert_error<bool>();
+        }
+        auto cursor = engine.drive(otterstax::engine::load_table(engine.resource(),
+                                                                 engine.dispatcher(),
+                                                                 engine.session(),
+                                                                 std::move(create.value()),
+                                                                 target,
+                                                                 std::move(read.value()),
+                                                                 /*own_block=*/true));
+        if (cursor->is_error()) {
+            return core::error_t(cursor->get_error().type,
+                                 std::pmr::string{cursor->get_error().what.c_str(), engine.resource()});
+        }
+        return true;
     }
-    return rows;
-}
 
-uint64_t columns_of(const std::pmr::vector<components::vector::data_chunk_t>& run) {
-    return run.empty() ? 0 : run.front().column_count();
-}
-
-// Loads `src` into main.public.people (when the table is not there yet) and
-// dumps SELECT * of it to `out` in `format` — or to `output` when it is set.
-void load_and_dump(otterstax::test::test_engine_t& engine,
-                   const actor_zeta::address_t& file_manager,
-                   const std::string& src,
-                   const std::string& out,
-                   conn::file::FileFormat format,
-                   tsl::output_stream_t output = {}) {
-    auto rows = engine.sql("SELECT * FROM people;");
-    if (rows->is_error()) {
-        auto loaded = load_into(engine, file_manager, load_params(src, "auto"), people_table());
-        INFO("load: " << (loaded.has_error() ? loaded.error().what.c_str() : "ok"));
-        REQUIRE_FALSE(loaded.has_error());
-        rows = engine.sql("SELECT * FROM people;");
+    conn::file::FileLoadParams load_params(const std::string& path, const std::string& format) {
+        conn::file::FileLoadParams params;
+        params.path = path;
+        params.format = format;
+        return params;
     }
-    REQUIRE(rows->is_success());
-    auto dump_res = actor_zeta::send(file_manager,
-                                     &conn::file::FileManager::dump_file,
-                                     session_hash_t{1},
-                                     conn::file::FileMetadata{std::move(rows), out, format, std::move(output)})
-                        .second.take_ready();
-    INFO("dump: " << (dump_res.has_error() ? dump_res.error().what.c_str() : "ok"));
-    REQUIRE_FALSE(dump_res.has_error());
-    REQUIRE(dump_res.value());
-}
 
+    // main.public.<table>: a one-part name from the test session's default place.
+    qualified_name_t people_table(const std::string& table = "people") {
+        return qualified_name_t{core::relname_t{table}};
+    }
+
+    // Loads `path` into main.public.people and reads it back.
+    void require_loaded(const std::string& path, const std::string& format, const std::string& data_dir) {
+        std::filesystem::remove_all(data_dir);
+        auto otterbrix = std::make_unique<otterstax::test::test_engine_t>(data_dir);
+        auto file_manager = actor_zeta::spawn<conn::file::FileManager>(otterbrix->resource());
+
+        auto res = load_into(*otterbrix, file_manager->address(), load_params(path, format), people_table());
+        INFO("load: " << (res.has_error() ? res.error().what.c_str() : "ok"));
+        REQUIRE_FALSE(res.has_error());
+        auto cur = otterbrix->sql("SELECT * FROM people;");
+        REQUIRE(cur->is_success());
+        REQUIRE(cur->size() == 5);
+        REQUIRE(cur->chunks().front().column_count() == 2);
+
+        // Destroy otterbrix before removing data_dir: the destructor runs a disk
+        // checkpoint that writes to data_dir; removing it first causes a SIGSEGV.
+        cur.reset();
+        file_manager.reset();
+        otterbrix.reset();
+        std::filesystem::remove_all(data_dir);
+    }
+
+    // The rows of a loaded run, and the columns its chunks share.
+    uint64_t rows_of(const std::pmr::vector<components::vector::data_chunk_t>& run) {
+        uint64_t rows = 0;
+        for (const auto& chunk : run) {
+            rows += chunk.size();
+        }
+        return rows;
+    }
+
+    uint64_t columns_of(const std::pmr::vector<components::vector::data_chunk_t>& run) {
+        return run.empty() ? 0 : run.front().column_count();
+    }
+
+    // Loads `src` into main.public.people (when the table is not there yet) and
+    // dumps SELECT * of it to `out` in `format` — or to `output` when it is set.
+    void load_and_dump(otterstax::test::test_engine_t& engine,
+                       const actor_zeta::address_t& file_manager,
+                       const std::string& src,
+                       const std::string& out,
+                       conn::file::FileFormat format,
+                       tsl::output_stream_t output = {}) {
+        auto rows = engine.sql("SELECT * FROM people;");
+        if (rows->is_error()) {
+            auto loaded = load_into(engine, file_manager, load_params(src, "auto"), people_table());
+            INFO("load: " << (loaded.has_error() ? loaded.error().what.c_str() : "ok"));
+            REQUIRE_FALSE(loaded.has_error());
+            rows = engine.sql("SELECT * FROM people;");
+        }
+        REQUIRE(rows->is_success());
+        auto dump_res = actor_zeta::send(file_manager,
+                                         &conn::file::FileManager::dump_file,
+                                         session_hash_t{1},
+                                         conn::file::FileMetadata{std::move(rows), out, format, std::move(output)})
+                            .second.take_ready();
+        INFO("dump: " << (dump_res.has_error() ? dump_res.error().what.c_str() : "ok"));
+        REQUIRE_FALSE(dump_res.has_error());
+        REQUIRE(dump_res.value());
+    }
 } // namespace
-
 
 TEST_CASE("FileManager: parquet ingestion and SELECT") {
     const std::string parquet = "/tmp/test_file_ingestion.parquet";
@@ -244,8 +240,8 @@ TEST_CASE("FileManager: a file that is not there is io_error and nothing is crea
 // file exists and re-reads correctly via the input translator.
 
 TEST_CASE("FileManager: parquet dump and re-read") {
-    const std::string parquet  = "/tmp/test_dump.parquet";
-    const std::string out      = "/tmp/test_dump_out.parquet";
+    const std::string parquet = "/tmp/test_dump.parquet";
+    const std::string out = "/tmp/test_dump_out.parquet";
     const std::string data_dir = "/tmp/test_dump_parquet_otterbrix";
 
     std::filesystem::remove_all(data_dir);
@@ -280,7 +276,11 @@ TEST_CASE("FileManager: parquet dump and re-read") {
         auto sink = arrow::io::BufferOutputStream::Create().ValueOrDie();
         const std::string label = "/tmp/test_dump_stream_label.parquet";
         std::filesystem::remove(label);
-        load_and_dump(*otterbrix, file_manager->address(), parquet, label, conn::file::FileFormat::Parquet,
+        load_and_dump(*otterbrix,
+                      file_manager->address(),
+                      parquet,
+                      label,
+                      conn::file::FileFormat::Parquet,
                       tsl::output_stream_t{sink});
         REQUIRE_FALSE(std::filesystem::exists(label));
         REQUIRE(sink->closed());
@@ -301,8 +301,8 @@ TEST_CASE("FileManager: parquet dump and re-read") {
 }
 
 TEST_CASE("FileManager: csv dump and re-read") {
-    const std::string csv      = "/tmp/test_dump.csv";
-    const std::string out      = "/tmp/test_dump_out.csv";
+    const std::string csv = "/tmp/test_dump.csv";
+    const std::string out = "/tmp/test_dump_out.csv";
     const std::string data_dir = "/tmp/test_dump_csv_otterbrix";
 
     std::filesystem::remove_all(data_dir);
@@ -333,8 +333,8 @@ TEST_CASE("FileManager: csv dump and re-read") {
 }
 
 TEST_CASE("FileManager: ndjson dump and re-read") {
-    const std::string ndjson   = "/tmp/test_dump.ndjson";
-    const std::string out      = "/tmp/test_dump_out.ndjson";
+    const std::string ndjson = "/tmp/test_dump.ndjson";
+    const std::string out = "/tmp/test_dump_out.ndjson";
     const std::string data_dir = "/tmp/test_dump_json_otterbrix";
 
     std::filesystem::remove_all(data_dir);
@@ -386,15 +386,19 @@ TEST_CASE("session: CREATE EXTERNAL TABLE + COPY ... TO (parquet) through the se
 
         run_session_or_fail(s, 4000, "CREATE SCHEMA ExtParquet");
         std::string err;
-        auto st = run_session_sql(
-            s, 4001, "CREATE EXTERNAL TABLE ExtParquet.People WITH (location = '" + src + "', format = 'parquet')",
-            err);
+        auto st = run_session_sql(s,
+                                  4001,
+                                  "CREATE EXTERNAL TABLE ExtParquet.People WITH (location = '" + src +
+                                      "', format = 'parquet')",
+                                  err);
         INFO("CREATE error: " << err);
         REQUIRE(st);
-        REQUIRE(engine_row_count(s, "main.extparquet", "people") == 5);
+        REQUIRE(engine_row_count(s, "local.extparquet", "people") == 5);
 
-        st = run_session_sql(
-            s, 4002, "COPY (SELECT * FROM ExtParquet.People) TO '" + out + "' WITH (format = 'parquet')", err);
+        st = run_session_sql(s,
+                             4002,
+                             "COPY (SELECT * FROM ExtParquet.People) TO '" + out + "' WITH (format = 'parquet')",
+                             err);
         INFO("COPY error: " << err);
         REQUIRE(st);
         REQUIRE(std::filesystem::exists(out));
@@ -420,7 +424,7 @@ TEST_CASE("session: CREATE EXTERNAL TABLE + COPY ... TO (csv) with the format fr
         auto st = run_session_sql(s, 4101, "CREATE EXTERNAL TABLE ExtCsv.People WITH (location = '" + src + "')", err);
         INFO("CREATE error: " << err);
         REQUIRE(st);
-        REQUIRE(engine_row_count(s, "main.extcsv", "people") == 5);
+        REQUIRE(engine_row_count(s, "local.extcsv", "people") == 5);
 
         st = run_session_sql(s, 4102, "COPY (SELECT * FROM ExtCsv.People) TO '" + out + "' WITH (format = 'csv')", err);
         INFO("COPY error: " << err);
@@ -441,8 +445,11 @@ TEST_CASE("session: CREATE EXTERNAL TABLE on a missing file fails cleanly") {
         std::filesystem::remove(missing);
 
         std::string err;
-        auto st = run_session_sql(
-            s, 4201, "CREATE EXTERNAL TABLE people WITH (location = '" + missing + "', format = 'parquet')", err);
+        auto st =
+            run_session_sql(s,
+                            4201,
+                            "CREATE EXTERNAL TABLE people WITH (location = '" + missing + "', format = 'parquet')",
+                            err);
         REQUIRE_FALSE(st);
         REQUIRE_FALSE(err.empty());
     });
@@ -461,17 +468,22 @@ TEST_CASE("session: external statement via prepare_schema + execute_statement (F
             "CREATE EXTERNAL TABLE ExtTwoPhase.People WITH (location = '" + src + "', format = 'parquet')";
 
         // GetFlightInfo phase — returns an (empty) schema and stores the metadata.
-        auto [ns1, fut1] = actor_zeta::send(s.session, &otterstax::session::query_session_t::prepare_schema, otterstax::test::stmt(id), sql);
+        auto [ns1, fut1] = actor_zeta::send(s.session,
+                                            &otterstax::session::query_session_t::prepare_schema,
+                                            otterstax::test::stmt(id),
+                                            sql);
         auto r1 = await_session(std::move(fut1), 10000ms, s.resource);
         INFO("prepare_schema error: " << (r1.has_error() ? r1.error().what.c_str() : ""));
         REQUIRE_FALSE(r1.has_error());
 
         // DoGet phase — reuses the stored statement and performs the load.
-        auto [ns2, fut2] = actor_zeta::send(s.session, &otterstax::session::query_session_t::execute_statement, otterstax::test::stmt(id));
+        auto [ns2, fut2] = actor_zeta::send(s.session,
+                                            &otterstax::session::query_session_t::execute_statement,
+                                            otterstax::test::stmt(id));
         auto r2 = await_session(std::move(fut2), 10000ms, s.resource);
         INFO("execute_statement error: " << (r2.has_error() ? r2.error().what.c_str() : ""));
         REQUIRE_FALSE(r2.has_error());
-        REQUIRE(engine_row_count(s, "main.exttwophase", "people") == 5);
+        REQUIRE(engine_row_count(s, "local.exttwophase", "people") == 5);
 
         std::filesystem::remove(src);
     });
@@ -484,92 +496,90 @@ TEST_CASE("session: external statement via prepare_schema + execute_statement (F
 // with its values: probed on both sides of both chunk boundaries of 2500 rows.
 
 namespace {
+    constexpr size_t wide_file_rows = 2500;
+    constexpr size_t wide_file_probe_rows[] = {0, 1023, 1024, 1025, 2047, 2048, wide_file_rows - 1};
 
-constexpr size_t wide_file_rows = 2500;
-constexpr size_t wide_file_probe_rows[] = {0, 1023, 1024, 1025, 2047, 2048, wide_file_rows - 1};
+    std::string wide_file_name(size_t row) { return "name_" + std::to_string(row); }
 
-std::string wide_file_name(size_t row) { return "name_" + std::to_string(row); }
-
-// (id, name) with id = row and name = "name_<row>".
-void write_wide_csv(const std::string& path) {
-    std::ofstream f(path);
-    f << "id,name\n";
-    for (size_t row = 0; row < wide_file_rows; ++row) {
-        f << row << ',' << wide_file_name(row) << '\n';
-    }
-}
-
-// (id INT64, name UTF8) as write_wide_csv, in row groups of 1000 rows — the file's
-// own chunking does not line up with the engine's.
-void write_wide_parquet(const std::string& path) {
-    arrow::Int64Builder  id_b;
-    arrow::StringBuilder name_b;
-    bool appended = true;
-    for (size_t row = 0; row < wide_file_rows; ++row) {
-        appended = appended && id_b.Append(static_cast<int64_t>(row)).ok();
-        appended = appended && name_b.Append(wide_file_name(row)).ok();
-    }
-    REQUIRE(appended);
-    std::shared_ptr<arrow::Array> id_arr, name_arr;
-    REQUIRE(id_b.Finish(&id_arr).ok());
-    REQUIRE(name_b.Finish(&name_arr).ok());
-    auto schema = arrow::schema({arrow::field("id", arrow::int64()), arrow::field("name", arrow::utf8())});
-    auto table  = arrow::Table::Make(schema, {id_arr, name_arr});
-    auto sink   = arrow::io::FileOutputStream::Open(path);
-    REQUIRE(sink.ok());
-    REQUIRE(parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), *sink, /*chunk_size=*/1000).ok());
-    REQUIRE((*sink)->Close().ok());
-}
-
-// Loads `params` through the file manager into main.public.people of a fresh
-// engine at `data_dir` and reads the table back ordered by id: every chunk within
-// the engine's bound, all wide_file_rows rows, the probe rows with their values.
-void require_wide_file_ingested(conn::file::FileLoadParams params, const std::string& data_dir) {
-    using components::vector::DEFAULT_VECTOR_CAPACITY;
-    std::filesystem::remove_all(data_dir);
-    const std::string select = "SELECT * FROM people ORDER BY id;";
-
-    auto otterbrix = std::make_unique<otterstax::test::test_engine_t>(data_dir);
-    auto file_manager = actor_zeta::spawn<conn::file::FileManager>(otterbrix->resource());
-
-    auto res = load_into(*otterbrix, file_manager->address(), std::move(params), people_table());
-    INFO("load: " << (res.has_error() ? res.error().what.c_str() : "ok"));
-    REQUIRE_FALSE(res.has_error());
-    auto cur = otterbrix->sql(select);
-    INFO("select: " << (cur->is_error() ? cur->get_error().what.c_str() : "ok"));
-    REQUIRE(cur->is_success());
-    REQUIRE(cur->size() == wide_file_rows);
-
-    size_t total = 0;
-    for (const auto& chunk : cur->chunks()) {
-        REQUIRE(chunk.size() <= DEFAULT_VECTOR_CAPACITY);
-        REQUIRE(chunk.column_count() == 2);
-        total += chunk.size();
-    }
-    REQUIRE(total == wide_file_rows);
-
-    for (const size_t row : wide_file_probe_rows) {
-        INFO("row " << row);
-        size_t at = row;
-        const components::vector::data_chunk_t* holder = nullptr;
-        for (const auto& chunk : cur->chunks()) {
-            if (at < chunk.size()) {
-                holder = &chunk;
-                break;
-            }
-            at -= chunk.size();
+    // (id, name) with id = row and name = "name_<row>".
+    void write_wide_csv(const std::string& path) {
+        std::ofstream f(path);
+        f << "id,name\n";
+        for (size_t row = 0; row < wide_file_rows; ++row) {
+            f << row << ',' << wide_file_name(row) << '\n';
         }
-        REQUIRE(holder != nullptr);
-        REQUIRE(otterstax::test::cell(*holder, 0, at).value<int64_t>() == static_cast<int64_t>(row));
-        REQUIRE(otterstax::test::cell(*holder, 1, at).value<std::string_view>() == wide_file_name(row));
     }
 
-    cur.reset();
-    file_manager.reset();
-    otterbrix.reset();
-    std::filesystem::remove_all(data_dir);
-}
+    // (id INT64, name UTF8) as write_wide_csv, in row groups of 1000 rows — the file's
+    // own chunking does not line up with the engine's.
+    void write_wide_parquet(const std::string& path) {
+        arrow::Int64Builder id_b;
+        arrow::StringBuilder name_b;
+        bool appended = true;
+        for (size_t row = 0; row < wide_file_rows; ++row) {
+            appended = appended && id_b.Append(static_cast<int64_t>(row)).ok();
+            appended = appended && name_b.Append(wide_file_name(row)).ok();
+        }
+        REQUIRE(appended);
+        std::shared_ptr<arrow::Array> id_arr, name_arr;
+        REQUIRE(id_b.Finish(&id_arr).ok());
+        REQUIRE(name_b.Finish(&name_arr).ok());
+        auto schema = arrow::schema({arrow::field("id", arrow::int64()), arrow::field("name", arrow::utf8())});
+        auto table = arrow::Table::Make(schema, {id_arr, name_arr});
+        auto sink = arrow::io::FileOutputStream::Open(path);
+        REQUIRE(sink.ok());
+        REQUIRE(parquet::arrow::WriteTable(*table, arrow::default_memory_pool(), *sink, /*chunk_size=*/1000).ok());
+        REQUIRE((*sink)->Close().ok());
+    }
 
+    // Loads `params` through the file manager into main.public.people of a fresh
+    // engine at `data_dir` and reads the table back ordered by id: every chunk within
+    // the engine's bound, all wide_file_rows rows, the probe rows with their values.
+    void require_wide_file_ingested(conn::file::FileLoadParams params, const std::string& data_dir) {
+        using components::vector::DEFAULT_VECTOR_CAPACITY;
+        std::filesystem::remove_all(data_dir);
+        const std::string select = "SELECT * FROM people ORDER BY id;";
+
+        auto otterbrix = std::make_unique<otterstax::test::test_engine_t>(data_dir);
+        auto file_manager = actor_zeta::spawn<conn::file::FileManager>(otterbrix->resource());
+
+        auto res = load_into(*otterbrix, file_manager->address(), std::move(params), people_table());
+        INFO("load: " << (res.has_error() ? res.error().what.c_str() : "ok"));
+        REQUIRE_FALSE(res.has_error());
+        auto cur = otterbrix->sql(select);
+        INFO("select: " << (cur->is_error() ? cur->get_error().what.c_str() : "ok"));
+        REQUIRE(cur->is_success());
+        REQUIRE(cur->size() == wide_file_rows);
+
+        size_t total = 0;
+        for (const auto& chunk : cur->chunks()) {
+            REQUIRE(chunk.size() <= DEFAULT_VECTOR_CAPACITY);
+            REQUIRE(chunk.column_count() == 2);
+            total += chunk.size();
+        }
+        REQUIRE(total == wide_file_rows);
+
+        for (const size_t row : wide_file_probe_rows) {
+            INFO("row " << row);
+            size_t at = row;
+            const components::vector::data_chunk_t* holder = nullptr;
+            for (const auto& chunk : cur->chunks()) {
+                if (at < chunk.size()) {
+                    holder = &chunk;
+                    break;
+                }
+                at -= chunk.size();
+            }
+            REQUIRE(holder != nullptr);
+            REQUIRE(otterstax::test::cell(*holder, 0, at).value<int64_t>() == static_cast<int64_t>(row));
+            REQUIRE(otterstax::test::cell(*holder, 1, at).value<std::string_view>() == wide_file_name(row));
+        }
+
+        cur.reset();
+        file_manager.reset();
+        otterbrix.reset();
+        std::filesystem::remove_all(data_dir);
+    }
 } // namespace
 
 TEST_CASE("FileManager: a csv wider than one engine chunk is ingested with every row") {

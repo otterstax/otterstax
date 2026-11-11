@@ -5,6 +5,6 @@ SELECT warehouse_id,
        (spec).weight_2,
        (spec).primary_barcode,
        priority_med
-FROM   otter.warehouses
+FROM   local.otter.warehouses
 WHERE  (location).country = 'IL'
   AND  (spec).photo IS NULL;

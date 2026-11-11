@@ -63,11 +63,11 @@ class MySqlClientHousekeepingTest:
             raise AssertionError(f"expected {expected!r}, got {actual!r}. {msg}")
 
     def connect(self):
-        return pymysql.connect(host=self.host, port=config.MYSQL_PORT, user="testuser",
+        return pymysql.connect(host=self.host, port=config.MYSQL_PORT, user="testuser", database="local",
                                password="testpass", autocommit=True)
 
     def connector(self, **kwargs):
-        return mysql.connector.connect(host=self.host, port=config.MYSQL_PORT, user="testuser",
+        return mysql.connector.connect(host=self.host, port=config.MYSQL_PORT, user="testuser", database="local",
                                        password="testpass", **kwargs)
 
     # ── setup / teardown ────────────────────────────────────────────────────
@@ -130,7 +130,7 @@ class MySqlClientHousekeepingTest:
                 raise AssertionError("SELECT @@query_cache_size must fail")
 
     def test_show_variables_and_warnings(self):
-        """SHOW VARIABLES LIKE filters; SHOW WARNINGS is empty; DATABASE() is NULL."""
+        """SHOW VARIABLES LIKE filters; SHOW WARNINGS is empty; DATABASE() is the place."""
         with self.admin.cursor() as cur:
             cur.execute("SHOW VARIABLES LIKE 'sql_mode'")
             rows = cur.fetchall()
@@ -140,7 +140,7 @@ class MySqlClientHousekeepingTest:
             cur.execute("SHOW WARNINGS")
             self.assert_equal(cur.fetchall(), ())
             cur.execute("SELECT DATABASE()")
-            self.assert_equal(cur.fetchone()[0], None)
+            self.assert_equal(cur.fetchone()[0], "local")
 
     def test_quote_and_backslash_round_trip(self):
         """PyMySQL escapes with a backslash (no NO_BACKSLASH_ESCAPES flag): the value comes back intact."""

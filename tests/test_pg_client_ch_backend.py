@@ -11,7 +11,7 @@ from contextlib import contextmanager
 
 import config
 
-_ORDERS = f"{config.CH_ALIAS}.{config.CH_DATABASE}.public.orders"
+_ORDERS = f"{config.CH_ALIAS}.{config.CH_DATABASE}.orders"
 
 
 class client:
@@ -22,7 +22,7 @@ class client:
             'port': config.PG_PORT,
             'user': 'testuser',
             'password': 'testpass',
-            'dbname': 'main',  # the engine database the session is placed in
+            'dbname': 'local',  # the session's place: the local database
         }
         print(f"Connecting to host: {host}")
 
@@ -221,7 +221,7 @@ class client:
         0 + 3000000000). An UPDATE that overflows the column fails; its mutation is killed, so the next
         UPDATE of the table runs.
         """
-        table = f"{config.CH_ALIAS}.{config.CH_DATABASE}.public.pg_numeric_null"
+        table = f"{config.CH_ALIAS}.{config.CH_DATABASE}.pg_numeric_null"
         with self.pg_connection() as conn:
             cur = conn.cursor()
             try:

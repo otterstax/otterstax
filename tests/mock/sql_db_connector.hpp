@@ -31,7 +31,6 @@
 #include <vector>
 
 namespace mysql {
-
     // A valid, completed boost::mysql::results carrying a single OK packet
     // (zero columns, zero rows). Lets the catalog's schema-discovery handler
     // call results.meta() safely against the mock connector.
@@ -109,8 +108,12 @@ namespace mysql {
         return result;
     }
 
-    // What the default mock discovers: one table `table` in the connection's
-    // database, (id INT, name VARCHAR) — the columns its data path answers.
+    // What the default mock discovers: its server has the one database the connection is opened on
+    // (`connect_params::database`), holding one table `table`, (id INT, name VARCHAR) — the columns its
+    // data path answers.
+    inline boost::mysql::results mock_database_listing(const std::string& database) {
+        return mock_results({{"SCHEMA_NAME", boost::mysql::column_type::varchar}}, {{database}});
+    }
     inline const boost::mysql::results& mock_table_listing() {
         static const boost::mysql::results results =
             mock_results({{"TABLE_NAME", boost::mysql::column_type::varchar}}, {{std::string{"table"}}});
@@ -124,9 +127,10 @@ namespace mysql {
 
     class MockConnector : public mysql::IConnector {
     public:
-        explicit MockConnector(mock_config config, std::string alias = "mock_connector")
+        explicit MockConnector(mock_config config, std::string alias = "mock_connector", bm::connect_params params = {})
             : config_(std::move(config))
-            , alias_(std::move(alias)) {
+            , alias_(std::move(alias))
+            , params_(std::move(params)) {
             std::cout << "MockConnector created with config: " << std::endl;
             std::cout << "can_throw: " << config_.can_throw << std::endl;
             std::cout << "return_empty: " << config_.return_empty << std::endl;
@@ -137,7 +141,7 @@ namespace mysql {
 
         mysql::Status status() const noexcept override { return mysql::Status::Connected; }
 
-        bm::connect_params params() const noexcept override { return bm::connect_params{}; }
+        bm::connect_params params() const noexcept override { return params_; }
 
         void close() override { std::cout << "MockConnector closed." << std::endl; }
 
@@ -194,10 +198,9 @@ namespace mysql {
         // The data overloads throw when configured to: that models a driver or
         // translator exception raised inside the coroutine on the io thread, which
         // the backend agent (backend_agent_t::run) must hand back as an error value.
-        asio::awaitable<core::result_wrapper_t<std::unique_ptr<data_chunk_t>>>
-        runQuery(std::string_view query,
-                 otterstax::function_ref_t<std::unique_ptr<data_chunk_t>(const boost::mysql::results&)> handler)
-            override {
+        asio::awaitable<core::result_wrapper_t<std::unique_ptr<data_chunk_t>>> runQuery(
+            std::string_view query,
+            otterstax::function_ref_t<std::unique_ptr<data_chunk_t>(const boost::mysql::results&)> handler) override {
             std::cout << "MockConnector running query: " << query << std::endl;
 
             if (config_.can_throw) {
@@ -235,6 +238,10 @@ namespace mysql {
         runQuery(std::string_view query,
                  otterstax::function_ref_t<otterstax::asio_error_t(const boost::mysql::results&)> handler) override {
             std::cout << "MockConnector running schema query: " << query << std::endl;
+            if (query.find("information_schema.schemata") != std::string_view::npos) {
+                co_return otterstax::as_query_result<otterstax::asio_error_t>(
+                    handler(mock_database_listing(params_.database)));
+            }
             if (query.find("information_schema") != std::string_view::npos) {
                 co_return otterstax::as_query_result<otterstax::asio_error_t>(handler(mock_table_listing()));
             }
@@ -247,32 +254,36 @@ namespace mysql {
     private:
         mock_config config_;
         std::string alias_;
+        bm::connect_params params_;
     };
-
 } // namespace mysql
 
 inline std::unique_ptr<mysql::IConnector> mysql_mock_connector_factory(std::pmr::memory_resource* resource,
                                                                        boost::asio::io_context&,
-                                                                       boost::mysql::connect_params,
+                                                                       boost::mysql::connect_params params,
                                                                        std::string alias) {
     std::cout << "Creating MockConnector." << std::endl;
-    return std::make_unique<mysql::MockConnector>(mock_config{.resource = resource}, std::move(alias));
+    return std::make_unique<mysql::MockConnector>(mock_config{.resource = resource},
+                                                  std::move(alias),
+                                                  std::move(params));
 }
 
 inline std::unique_ptr<mysql::IConnector> mysql_mock_connector_factory_throw(std::pmr::memory_resource* resource,
                                                                              boost::asio::io_context&,
-                                                                             boost::mysql::connect_params,
+                                                                             boost::mysql::connect_params params,
                                                                              std::string alias) {
     std::cout << "Creating MockConnector." << std::endl;
     return std::make_unique<mysql::MockConnector>(mock_config{.resource = resource, .can_throw = true},
-                                                  std::move(alias));
+                                                  std::move(alias),
+                                                  std::move(params));
 }
 
 inline std::unique_ptr<mysql::IConnector> mysql_mock_connector_factory_return_empty(std::pmr::memory_resource* resource,
                                                                                     boost::asio::io_context&,
-                                                                                    boost::mysql::connect_params,
+                                                                                    boost::mysql::connect_params params,
                                                                                     std::string alias) {
     std::cout << "Creating MockConnector." << std::endl;
     return std::make_unique<mysql::MockConnector>(mock_config{.resource = resource, .return_empty = true},
-                                                  std::move(alias));
+                                                  std::move(alias),
+                                                  std::move(params));
 }

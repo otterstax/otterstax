@@ -396,18 +396,26 @@ wait_for_pg_table postgres1 pguser pgdb products
 wait_for_ch_table clickhouse1 chuser chpassword chdb orders
 
 # Wait for the one-shot rustfs-init to finish seeding test-bucket so the s3
-# external-table tests find their fixtures. It exits after seeding.
+# external-table tests find their fixtures. It exits after seeding; a failed
+# exit is reported with its logs and the run goes on — the s3 tests answer the
+# missing objects on their own.
 echo "🕒 Waiting for RustFS bucket seeding to complete..."
 for i in {1..60}; do
     status=$(docker inspect test-rustfs-init --format '{{.State.Status}}' 2>/dev/null || echo "missing")
     if [ "$status" = "exited" ]; then
-        echo "✅ RustFS test-bucket seeded"
+        code=$(docker inspect test-rustfs-init --format '{{.State.ExitCode}}' 2>/dev/null || echo "?")
+        if [ "$code" = "0" ]; then
+            echo "✅ RustFS test-bucket seeded"
+        else
+            echo "❌ rustfs-init exited with code $code — test-bucket is not seeded, the s3 tests will fail"
+            compose logs rustfs-init 2>/dev/null || true
+        fi
         break
     fi
     sleep 2
     if [ $i -eq 60 ]; then
         echo "⚠️  rustfs-init did not finish in time; s3 tests may retry"
-        compose logs rustfs-init | tail -10 2>/dev/null || true
+        compose logs rustfs-init 2>/dev/null || true
     fi
 done
 

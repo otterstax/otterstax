@@ -3,11 +3,13 @@
 
 #include "session/plan_inspection.hpp"
 
+#include "otterbrix/federation/metadata.hpp"
 #include "otterbrix/parser/grammar_extension/kafka/kafka_node.hpp"
 #include "otterbrix/parser/grammar_extention/external_node.hpp"
 #include "utility/tracy_profiler.hpp"
 
 #include <components/logical_plan/node_create_database.hpp>
+#include <components/logical_plan/node_create_schema.hpp>
 #include <components/logical_plan/node_drop.hpp>
 #include <components/logical_plan/node_set_setting.hpp>
 #include <components/logical_plan/node_transaction.hpp>
@@ -17,15 +19,12 @@
 #include <string_view>
 
 namespace otterstax::session::plan {
-
     using namespace components;
 
     namespace {
-
         core::error_t make_error(std::pmr::memory_resource* resource, core::error_code_t code, std::string_view what) {
             return core::error_t{code, std::pmr::string{what, resource}};
         }
-
     } // namespace
 
     extension_root_t extension_root(const ParsedQueryData& data) {
@@ -69,27 +68,52 @@ namespace otterstax::session::plan {
     // Both DDL statements keep the name on the DDL node itself — catalog
     // resolves live outside the plan tree. The sequence unwrap stays as the
     // defensive read of a wrapped root.
-    core::result_wrapper_t<std::pmr::string> database_ddl_target(std::pmr::memory_resource* resource,
-                                                                 const ParsedQueryData& data) {
-        const logical_plan::node_t* root = plan_statement_node(plan_root(*data.plan).get());
-        if (root == nullptr) {
-            return std::pmr::string{resource};
+    core::error_t
+    place_namespace_ddl(std::pmr::memory_resource* resource, ParsedQueryData& data, database_term_t term) {
+        OTX_ZONE_N("plan::place_namespace_ddl");
+        if (!data.plan || data.plan->sub_queries.empty() || !data.plan->sub_queries.back()) {
+            return core::error_t::no_error();
         }
+        auto& root = data.plan->sub_queries.back();
+        auto in_local = [](std::string schema) {
+            return qualified_name_t{core::connection_name_t{},
+                                    core::dbname_t{std::string{otterstax::federation::local_database}},
+                                    core::schema_t{std::move(schema)},
+                                    core::relname_t{}};
+        };
+        auto refused = [resource] {
+            return core::error_t(core::error_code_t::invalid_parameter,
+                                 std::pmr::string{"a database is a connection, and connections come from config.yaml; "
+                                                  "CREATE SCHEMA makes a namespace of local",
+                                                  resource});
+        };
+        auto bare = [](const qualified_name_t& name) { return name.connection.t.empty() && name.database.t.empty(); };
         if (root->type() == logical_plan::node_type::create_database_t) {
             const auto& create = static_cast<const logical_plan::node_create_database_t&>(*root);
-            return std::pmr::string{std::string_view{create.target().database.t}, resource};
+            if (term == database_term_t::catalog) {
+                return refused();
+            }
+            root = logical_plan::make_node_create_schema(resource,
+                                                         in_local(create.target().database.t),
+                                                         create.if_not_exists());
+        } else if (root->type() == logical_plan::node_type::create_schema_t && bare(root->target())) {
+            root->set_target(in_local(root->target().schema.t));
+        } else if (root->type() == logical_plan::node_type::drop_t) {
+            const auto& drop = static_cast<const logical_plan::node_drop_t&>(*root);
+            if (drop.kind() == logical_plan::drop_target_kind::schema && bare(drop.target())) {
+                root->set_target(in_local(drop.target().schema.t));
+            } else if (drop.kind() == logical_plan::drop_target_kind::database) {
+                if (term == database_term_t::catalog) {
+                    return refused();
+                }
+                auto schema = logical_plan::make_node_drop(resource, logical_plan::drop_target_kind::schema);
+                schema->set_target(in_local(drop.target().database.t));
+                schema->set_if_exists(drop.if_exists());
+                schema->set_behavior(components::catalog::drop_behavior_t::cascade_);
+                root = std::move(schema);
+            }
         }
-        if (root->type() != logical_plan::node_type::drop_t) {
-            return std::pmr::string{resource};
-        }
-        const auto& drop = static_cast<const logical_plan::node_drop_t&>(*root);
-        if (drop.kind() != logical_plan::drop_target_kind::database) {
-            return std::pmr::string{resource};
-        }
-        if (drop.target().database.t.empty()) {
-            return make_error(resource, core::error_code_t::invalid_parameter, "DROP DATABASE names no database");
-        }
-        return std::pmr::string{std::string_view{drop.target().database.t}, resource};
+        return core::error_t::no_error();
     }
 
     std::optional<write_target_t> write_target(const ParsedQueryData& data) {
@@ -141,16 +165,16 @@ namespace otterstax::session::plan {
             return changes;
         }
         const auto& set = static_cast<const logical_plan::node_set_setting_t&>(*plan_root(*data.plan));
-        if (set.scope() == catalog::setting_scope_t::system) {
+        if (set.scope() == components::catalog::setting_scope_t::system) {
             return changes;
         }
-        const bool local = set.scope() == catalog::setting_scope_t::local;
+        const bool local = set.scope() == components::catalog::setting_scope_t::local;
         for (const auto& assignment : set.assignments()) {
             if (assignment.is_default) {
                 changes.push_back({assignment.id, std::nullopt, local});
                 continue;
             }
-            auto canonical = catalog::canonical_setting_value(assignment.id, assignment.value, resource);
+            auto canonical = components::catalog::canonical_setting_value(assignment.id, assignment.value, resource);
             if (canonical.has_error()) {
                 continue; // the engine refuses it: the statement fails
             }
@@ -220,5 +244,4 @@ namespace otterstax::session::plan {
         }
         return names;
     }
-
 } // namespace otterstax::session::plan

@@ -57,8 +57,8 @@ def main(local=False):
     print(f"{'='*70}")
     df = spark.sql("""
         SELECT p.product_id, p.product_name, p.price, c.campaign_name
-        FROM products.pgdb.public.products p
-        JOIN campaigns.db1.public.campaigns c ON p.campaign_id = c.campaign_id
+        FROM products.public.products p
+        JOIN campaigns.db1.campaigns c ON p.campaign_id = c.campaign_id
         LIMIT 10
     """)
     rows = df.collect()
@@ -74,8 +74,8 @@ def main(local=False):
     print(f"{'='*70}")
     df2 = spark.sql("""
         SELECT p.product_name, p.price, c.campaign_name, c.budget
-        FROM products.pgdb.public.products p
-        JOIN campaigns.db1.public.campaigns c ON p.campaign_id = c.campaign_id
+        FROM products.public.products p
+        JOIN campaigns.db1.campaigns c ON p.campaign_id = c.campaign_id
         WHERE p.price > 100
         LIMIT 10
     """)
@@ -92,9 +92,9 @@ def main(local=False):
     print("Running: Test 3 - Path B: DataFrame.join() across backends")
     print(f"{'='*70}")
     campaigns_df = spark.sql("SELECT campaign_id, campaign_name, budget "
-                             "FROM campaigns.db1.public.campaigns")
+                             "FROM campaigns.db1.campaigns")
     products_df = spark.sql("SELECT product_id, campaign_id, product_name, price "
-                            "FROM products.pgdb.public.products")
+                            "FROM products.public.products")
     joined = (products_df.join(campaigns_df, on="campaign_id", how="inner")
               .select("product_name", "price", "campaign_name")
               .limit(10))
@@ -113,8 +113,8 @@ def main(local=False):
         SELECT c.campaign_name,
                COUNT(p.product_id) AS product_count,
                AVG(p.price) AS avg_product_price
-        FROM campaigns.db1.public.campaigns c
-        JOIN products.pgdb.public.products p ON c.campaign_id = p.campaign_id
+        FROM campaigns.db1.campaigns c
+        JOIN products.public.products p ON c.campaign_id = p.campaign_id
         GROUP BY c.campaign_name
         ORDER BY product_count DESC
         LIMIT 10

@@ -33,7 +33,6 @@
 #include <utility>
 
 namespace frontend::spark {
-
     boost::asio::awaitable<void, agrpc::GrpcExecutor> SparkConnectServiceImpl::handle_analyze_plan(
         agrpc::ServerRPC<&sc::SparkConnectService::AsyncService::RequestAnalyzePlan>& rpc,
         sc::AnalyzePlanRequest& request) {
@@ -53,6 +52,7 @@ namespace frontend::spark {
         std::optional<std::string> statement;
         ParsedQueryDataPtr statement_plan;
         query_session_t::rebuild_fn rebuild;
+        query_session_t::unique_future<query_session_t::session_result> place;
         {
             OTX_ZONE_N("SparkConnectServiceImpl::handle_analyze_plan");
             response.set_session_id(spark_session_id);
@@ -60,7 +60,18 @@ namespace frontend::spark {
                 spark_session_id,
                 std::chrono::steady_clock::now(),
                 [&](query_session_t& session) { hash = session.next_statement(); },
-                [this] { return sessions_->open(); });
+                [this, &place] {
+                    auto session = sessions_->open(otterstax::session::database_term_t::schema);
+                    // Spark's current database exists before the client names one:
+                    // local.public here, what currentDatabase() answers first. A USE
+                    // of the client's replaces it.
+                    place = std::move(actor_zeta::send(session->address(),
+                                                        &query_session_t::use,
+                                                        session->next_statement(),
+                                                        std::string{"local"})
+                                           .second);
+                    return session;
+                });
             if (!reached) {
                 refusal = session_closed_status(spark_session_id);
             }
@@ -124,26 +135,41 @@ namespace frontend::spark {
             }
             // The statement chosen above, queued on the session.
             if ((statement || statement_plan) &&
-                !spark_sessions_.begin(spark_session_id, std::chrono::steady_clock::now(), [&](query_session_t& session) {
-                    prepare_fut = statement_plan ? std::move(actor_zeta::send(session.address(),
-                                                                              &query_session_t::prepare_plan,
-                                                                              hash,
-                                                                              std::move(statement_plan),
-                                                                              std::move(rebuild))
-                                                                 .second)
-                                                 : std::move(actor_zeta::send(session.address(),
-                                                                              &query_session_t::prepare_schema,
-                                                                              hash,
-                                                                              std::move(*statement))
-                                                                 .second);
-                })) {
+                !spark_sessions_.begin(spark_session_id,
+                                       std::chrono::steady_clock::now(),
+                                       [&](query_session_t& session) {
+                                           prepare_fut =
+                                               statement_plan
+                                                   ? std::move(actor_zeta::send(session.address(),
+                                                                                &query_session_t::prepare_plan,
+                                                                                hash,
+                                                                                std::move(statement_plan),
+                                                                                std::move(rebuild))
+                                                                   .second)
+                                                   : std::move(actor_zeta::send(session.address(),
+                                                                                &query_session_t::prepare_schema,
+                                                                                hash,
+                                                                                std::move(*statement))
+                                                                   .second);
+                                       })) {
                 refusal = session_closed_status(spark_session_id);
             }
         }
         // A queued prepare keeps the Spark session from expiring until the
         // request ends (spark_sessions_.begin … finish).
         boost::scope::scope_exit prepare_done(
-            [&] { spark_sessions_.finish(spark_session_id, std::chrono::steady_clock::now()); }, prepare_fut.valid());
+            [&] { spark_sessions_.finish(spark_session_id, std::chrono::steady_clock::now()); },
+            prepare_fut.valid());
+
+        // The place, awaited before the request answers: it is the session's first
+        // statement, its refusal is this request's refusal.
+        if (place.valid()) {
+            auto set = co_await await_future<session_payload>(std::move(place), resource_);
+            if (set.has_error()) {
+                co_await rpc.finish_with_error(error_status(spark_session_id, set.error()));
+                co_return;
+            }
+        }
 
         if (!refusal.ok()) {
             co_await rpc.finish_with_error(refusal);
@@ -162,10 +188,11 @@ namespace frontend::spark {
             // took the statement with it). A failed close is logged; the answer
             // is still the schema.
             query_session_t::unique_future<query_session_t::session_result> close_fut;
-            if (spark_sessions_.begin(spark_session_id, std::chrono::steady_clock::now(), [&](query_session_t& session) {
-                    close_fut = std::move(
-                        actor_zeta::send(session.address(), &query_session_t::close_statement, hash).second);
-                })) {
+            if (spark_sessions_
+                    .begin(spark_session_id, std::chrono::steady_clock::now(), [&](query_session_t& session) {
+                        close_fut = std::move(
+                            actor_zeta::send(session.address(), &query_session_t::close_statement, hash).second);
+                    })) {
                 boost::scope::scope_exit close_done(
                     [&] { spark_sessions_.finish(spark_session_id, std::chrono::steady_clock::now()); });
                 auto closed = co_await await_future<session_payload>(std::move(close_fut), resource_);
@@ -192,5 +219,4 @@ namespace frontend::spark {
 
         co_await rpc.finish(response, grpc::Status::OK);
     }
-
 } // namespace frontend::spark

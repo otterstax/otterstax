@@ -50,11 +50,12 @@ namespace {
     constexpr auto SLOW_WAIT = std::chrono::milliseconds(300);
 
     std::unique_ptr<mysql::IConnector> mysql_mock_connector_factory_slow(std::pmr::memory_resource* resource,
-                                                                        boost::asio::io_context&,
-                                                                        boost::mysql::connect_params,
-                                                                        std::string alias) {
+                                                                         boost::asio::io_context&,
+                                                                         boost::mysql::connect_params params,
+                                                                         std::string alias) {
         return std::make_unique<mysql::MockConnector>(mock_config{.resource = resource, .wait_time = SLOW_WAIT},
-                                                      std::move(alias));
+                                                      std::move(alias),
+                                                      std::move(params));
     }
 
     // How long a test thread polls a cross-actor future; poll_until_ready
@@ -107,10 +108,9 @@ namespace {
         bool isClosed() const noexcept override { return false; }
         std::string alias() const noexcept override { return alias_; }
 
-        boost::asio::awaitable<core::result_wrapper_t<std::unique_ptr<data_chunk_t>>>
-        runQuery(std::string_view,
-                 otterstax::function_ref_t<std::unique_ptr<data_chunk_t>(const ch::select_result_t&)> handler)
-            override {
+        boost::asio::awaitable<core::result_wrapper_t<std::unique_ptr<data_chunk_t>>> runQuery(
+            std::string_view,
+            otterstax::function_ref_t<std::unique_ptr<data_chunk_t>(const ch::select_result_t&)> handler) override {
             // The table's columns, no row.
             ch::select_result_t outcome;
             outcome.blocks.push_back(ch_header_block());
@@ -140,7 +140,6 @@ namespace {
     ch_header_connector_factory(std::pmr::memory_resource*, ch::connect_params params, std::string alias) {
         return std::make_unique<ch_header_connector>(std::move(params), std::move(alias));
     }
-
 } // namespace
 
 // The whole stack with mock connectors: N connections, each its own query
@@ -210,14 +209,14 @@ TEST_CASE("slow MySQL connector does not starve other connections") {
     // Baseline: time for a single statement.
     auto baseline_start = std::chrono::steady_clock::now();
     {
-        auto fut = actor_zeta::send(owner.stack().session, &query_session_t::execute, stmt(1000), std::string("SELECT 1"))
-                       .second;
+        auto fut =
+            actor_zeta::send(owner.stack().session, &query_session_t::execute, stmt(1000), std::string("SELECT 1"))
+                .second;
         auto r = await_session(std::move(fut), WAIT_TIMEOUT, resource);
         REQUIRE_FALSE(r.has_error());
     }
     auto baseline_end = std::chrono::steady_clock::now();
-    auto baseline_ms =
-        std::chrono::duration_cast<std::chrono::milliseconds>(baseline_end - baseline_start).count();
+    auto baseline_ms = std::chrono::duration_cast<std::chrono::milliseconds>(baseline_end - baseline_start).count();
 
     // SESSIONS connections in parallel.
     std::vector<actor_zeta::address_t> connections;
@@ -237,31 +236,29 @@ TEST_CASE("slow MySQL connector does not starve other connections") {
         results.push_back(await_session(std::move(futs[i]), WAIT_TIMEOUT, resource));
     }
     auto parallel_end = std::chrono::steady_clock::now();
-    auto parallel_ms =
-        std::chrono::duration_cast<std::chrono::milliseconds>(parallel_end - parallel_start).count();
+    auto parallel_ms = std::chrono::duration_cast<std::chrono::milliseconds>(parallel_end - parallel_start).count();
 
     for (size_t i = 0; i < SESSIONS; ++i) {
         REQUIRE_FALSE(results[i].has_error());
     }
 
     double ratio = baseline_ms > 0 ? static_cast<double>(parallel_ms) / static_cast<double>(baseline_ms) : 0.0;
-    WARN("baseline=" << baseline_ms << "ms, parallel(" << SESSIONS << ")=" << parallel_ms
-                     << "ms, ratio=" << ratio);
+    WARN("baseline=" << baseline_ms << "ms, parallel(" << SESSIONS << ")=" << parallel_ms << "ms, ratio=" << ratio);
 
     REQUIRE(parallel_ms < WAIT_TIMEOUT.count());
 }
 
 namespace {
-
     namespace fed = otterstax::federation;
 
     // The remote backends alone over `connectors`, the connections of
     // `connections` opened (no engine). `runtime` lends its backends pool and
     // must outlive the module.
-    std::unique_ptr<otterstax::backends::remote_backends_t> open_remote(std::pmr::memory_resource* resource,
-                                                                        otterstax::runtime::runtime_t& runtime,
-                                                                        otterstax::backends::connector_factories_t connectors,
-                                                                        const config::ConnectionsConfig& connections) {
+    std::unique_ptr<otterstax::backends::remote_backends_t>
+    open_remote(std::pmr::memory_resource* resource,
+                otterstax::runtime::runtime_t& runtime,
+                otterstax::backends::connector_factories_t connectors,
+                const config::ConnectionsConfig& connections) {
         auto remote = std::make_unique<otterstax::backends::remote_backends_t>(
             resource,
             otterstax::backends::remote_backends_options_t{.connectors = connectors, .runtime = &runtime});
@@ -277,8 +274,8 @@ namespace {
     // The startup discovery's table (id, name) handed to the connection's actor, as the
     // registration does once the engine is open (oid `table_oid`).
     fed::backend_actor_t& actor_with_table(otterstax::backends::remote_backends_t& remote,
-                                          const std::string& alias,
-                                          const std::string& container) {
+                                           const std::string& alias,
+                                           const std::string& container) {
         auto* actor = remote.actor(alias);
         REQUIRE(actor != nullptr);
         const auto& discovered = remote.discovered().front();
@@ -296,12 +293,12 @@ namespace {
         fed::oid_t attoid = 1;
         for (const auto& column : table.schema.child_types()) {
             const auto type = table.remote_types.find(column.alias());
-            registered.columns.push_back(fed::registered_column_t{attoid++,
-                                                                  column.alias(),
-                                                                  column,
-                                                                  column.alias(),
-                                                                  type == table.remote_types.end() ? std::string{}
-                                                                                                   : type->second});
+            registered.columns.push_back(
+                fed::registered_column_t{attoid++,
+                                         column.alias(),
+                                         column,
+                                         column.alias(),
+                                         type == table.remote_types.end() ? std::string{} : type->second});
         }
         actor->load_tables({std::move(registered)});
         return *actor;
@@ -351,7 +348,6 @@ namespace {
         verdict.ok = true;
         return verdict;
     }
-
 } // namespace
 
 // A PostgreSQL connection's actor: reads and re-discoveries sent from many threads at once run on
@@ -382,14 +378,12 @@ TEST_CASE("PostgreSQL actor: parallel reads and re-discovery share no unsynchron
         for (size_t t = 0; t < THREADS; ++t) {
             threads.emplace_back([&, t] {
                 for (size_t r = 0; r < ROUNDS; ++r) {
-                    verdicts[t * ROUNDS + r] =
-                        t % 2 == 0 ? scan_once(actor)
-                                   : discover_once(
-                                         actor,
-                                         qualified_name_t{core::connection_name_t{"1"},
-                                                          core::dbname_t{"pgdb"},
-                                                          core::schema_t{"public"},
-                                                          core::relname_t{"t"}});
+                    verdicts[t * ROUNDS + r] = t % 2 == 0 ? scan_once(actor)
+                                                          : discover_once(actor,
+                                                                          qualified_name_t{core::connection_name_t{"1"},
+                                                                                           core::dbname_t{"pgdb"},
+                                                                                           core::schema_t{"public"},
+                                                                                           core::relname_t{"t"}});
                 }
             });
         }
@@ -429,12 +423,12 @@ TEST_CASE("ClickHouse actor: parallel reads and re-discovery share no unsynchron
         for (size_t t = 0; t < THREADS; ++t) {
             threads.emplace_back([&, t] {
                 for (size_t r = 0; r < ROUNDS; ++r) {
-                    verdicts[t * ROUNDS + r] =
-                        t % 2 == 0
-                            ? scan_once(actor)
-                            : discover_once(
-                                  actor,
-                                  qualified_name_t{core::connection_name_t{"1"}, core::dbname_t{"ev"}, core::schema_t{}, core::relname_t{"t"}});
+                    verdicts[t * ROUNDS + r] = t % 2 == 0 ? scan_once(actor)
+                                                          : discover_once(actor,
+                                                                          qualified_name_t{core::connection_name_t{"1"},
+                                                                                           core::dbname_t{"ev"},
+                                                                                           core::schema_t{},
+                                                                                           core::relname_t{"t"}});
                 }
             });
         }

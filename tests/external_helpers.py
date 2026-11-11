@@ -19,7 +19,7 @@ all be asserted:
 Both correlate on campaign_id (1..50), so the two external tables JOIN with each
 other (and would JOIN the MariaDB/PG/CH backends, which share campaign_id).
 
-`<schema>` is a schema of the session's database (`main`): a two-part name is
+`<schema>` is a schema of the session's database (`local`): a two-part name is
 schema.table, and the schema must exist, so the helpers `CREATE SCHEMA IF NOT
 EXISTS` it first and drop it (CASCADE) on cleanup.
 
@@ -83,6 +83,7 @@ class ExternalTableTester:
             "port": config.MYSQL_PORT,
             "user": "testuser",
             "password": "testpass",
+            "database": "local",
             # Every statement is meant to commit on its own (the driver's SET
             # autocommit reaches the engine and is the connection's own).
             "autocommit": True,
@@ -128,7 +129,7 @@ class ExternalTableTester:
 
     # ── DDL helpers ──────────────────────────────────────────────────────────
     def ensure_schema(self, cur, db):
-        """`db` is a schema of the session's database (main): create it once."""
+        """`db` is a schema of the session's database `local`: create it once."""
         if db not in self._schemas:
             cur.execute(f"CREATE SCHEMA IF NOT EXISTS {db}")
             self._schemas.append(db)

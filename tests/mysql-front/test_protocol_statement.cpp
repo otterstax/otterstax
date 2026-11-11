@@ -468,7 +468,8 @@ TEST_CASE("mysql protocol: SET NAMES SET CHARACTER SET and the MySQL SET forms")
     }
     CHECK(engine("SET character_set_results = NULL, autocommit = 0") == statements_t{"SET autocommit = 'off'"});
 
-    for (const char* sql : {"SET @@session.autocommit = OFF", "SET autocommit=0", "SET AUTOCOMMIT = 0", "set autocommit = false"}) {
+    for (const char* sql :
+         {"SET @@session.autocommit = OFF", "SET autocommit=0", "SET AUTOCOMMIT = 0", "set autocommit = false"}) {
         CHECK(engine(sql) == statements_t{"SET autocommit = 'off'"});
     }
     CHECK(engine("SET autocommit = 1") == statements_t{"SET autocommit = 'on'"});
@@ -517,12 +518,12 @@ TEST_CASE("mysql protocol: SET NAMES SET CHARACTER SET and the MySQL SET forms")
     CHECK(std::get<set_variables_t>(*expression).refusal->code == mysql_error::ER_NOT_SUPPORTED_YET);
 
     // SET TRANSACTION and a user variable are no setting: the engine reads them.
-    for (const char* sql : {"SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED", "SET TRANSACTION READ ONLY", "SET @x = 1"}) {
+    for (const char* sql :
+         {"SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED", "SET TRANSACTION READ ONLY", "SET @x = 1"}) {
         INFO(sql);
         CHECK_FALSE(classify_protocol_statement(sql).has_value());
     }
 }
-
 
 // A character set the wire does not carry refuses the whole statement before
 // anything of it runs; so does a collation of another character set and, in
@@ -574,17 +575,19 @@ TEST_CASE("mysql protocol: a character set other than utf-8 is refused") {
         CHECK(refusal->code == mysql_error::ER_NOT_SUPPORTED_YET);
     }
 }
-TEST_CASE("mysql protocol: USE is the session's place") {
+// The database a USE names, as written: the session turns it into its place (catalog::client_place).
+TEST_CASE("mysql protocol: USE names the session's place") {
     auto use = [](const char* sql) {
         auto statement = classify_protocol_statement(sql);
         INFO(sql);
         REQUIRE(statement.has_value());
         REQUIRE(std::holds_alternative<use_database_t>(*statement));
-        return engine_search_path_statement(std::get<use_database_t>(*statement).database);
+        return std::get<use_database_t>(*statement).database;
     };
-    CHECK(use("USE shop") == "SET search_path = 'shop.public'");
-    CHECK(use("use `Shop`;") == "SET search_path = 'Shop.public'");
-    CHECK(use("USE pg.shop") == "SET search_path = 'pg.shop.public'");
+    CHECK(use("USE shop") == "shop");
+    CHECK(use("use `Shop`;") == "Shop");
+    CHECK(use("USE pg.shop") == "pg.shop");
+    CHECK(use("USE `my.bill`") == "my.bill");
     CHECK_FALSE(classify_protocol_statement("USE a.b.c").has_value());
     CHECK_FALSE(classify_protocol_statement("USE").has_value());
 }

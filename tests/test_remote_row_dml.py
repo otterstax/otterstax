@@ -46,11 +46,11 @@ import config
 MARIADB = dict(host="mariadb1", port=3306, user="user1", password="password1", database="db1")
 POSTGRES = dict(host="postgres1", port=5432, user="pguser", password="pgpassword", dbname="pgdb")
 
-MYSQL_KEYED = "campaigns.db1.public.rowdml_keyed"
-MYSQL_NOKEY = "campaigns.db1.public.rowdml_nokey"
-PG_KEYED = "products.pgdb.public.rowdml_keyed"
-PG_NOKEY = "products.pgdb.public.rowdml_nokey"
-CH_ORDERS = f"{config.CH_ALIAS}.{config.CH_DATABASE}.public.orders"
+MYSQL_KEYED = "campaigns.db1.rowdml_keyed"
+MYSQL_NOKEY = "campaigns.db1.rowdml_nokey"
+PG_KEYED = "products.public.rowdml_keyed"
+PG_NOKEY = "products.public.rowdml_nokey"
+CH_ORDERS = f"{config.CH_ALIAS}.{config.CH_DATABASE}.orders"
 
 LOCAL_SCHEMA = "rowdml_local"            # a schema of the session's database, main
 PICK = f"{LOCAL_SCHEMA}.pick"            # (id int): the ids a sub-query picks, 1 and 2
@@ -157,12 +157,13 @@ class RemoteRowDmlTest:
         self.reset_postgres("rowdml_keyed", KEYED_ROWS)
         self.reset_postgres("rowdml_nokey", NOKEY_ROWS)
 
-        # The session's place is main.public: `dbname` must name a database the
-        # engine has (an unknown one is FATAL 3D000).
+        # The session's place is local: the place a client chose, one the engine
+        # has (an unknown one is FATAL 3D000 / ERR 1049); the two-part local
+        # names below complete by it.
         self.pg = psycopg.connect(host=self.host, port=config.PG_PORT, user="testuser",
-                                  password="testpass", dbname="main", autocommit=True)
+                                  password="testpass", dbname="local", autocommit=True)
         self.my = pymysql.connect(host=self.host, port=config.MYSQL_PORT, user="testuser",
-                                  password="testpass", autocommit=True)
+                                  password="testpass", database="local", autocommit=True)
         with self.pg.cursor() as cur:
             cur.execute(f"DROP SCHEMA IF EXISTS {LOCAL_SCHEMA} CASCADE")
             cur.execute(f"CREATE SCHEMA {LOCAL_SCHEMA}")

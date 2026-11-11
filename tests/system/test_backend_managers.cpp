@@ -48,14 +48,13 @@
 #include <vector>
 
 namespace {
-
     namespace fed = otterstax::federation;
 
     // A connector that answers a data query with no chunk at all.
     class chunkless_connector final : public mysql::MockConnector {
     public:
-        chunkless_connector(mock_config config, std::string alias)
-            : mysql::MockConnector(std::move(config), std::move(alias)) {}
+        chunkless_connector(mock_config config, std::string alias, boost::mysql::connect_params params)
+            : mysql::MockConnector(std::move(config), std::move(alias), std::move(params)) {}
 
         boost::asio::awaitable<core::result_wrapper_t<std::unique_ptr<data_chunk_t>>>
         runQuery(std::string_view,
@@ -66,9 +65,11 @@ namespace {
 
     std::unique_ptr<mysql::IConnector> chunkless_connector_factory(std::pmr::memory_resource* resource,
                                                                    boost::asio::io_context&,
-                                                                   boost::mysql::connect_params,
+                                                                   boost::mysql::connect_params params,
                                                                    std::string alias) {
-        return std::make_unique<chunkless_connector>(mock_config{.resource = resource}, std::move(alias));
+        return std::make_unique<chunkless_connector>(mock_config{.resource = resource},
+                                                     std::move(alias),
+                                                     std::move(params));
     }
 
     // More rows than one engine chunk holds (DEFAULT_VECTOR_CAPACITY = 1024).
@@ -98,8 +99,8 @@ namespace {
     // A connector whose data query answers a result set wider than one engine chunk.
     class wide_slice_connector final : public mysql::MockConnector {
     public:
-        wide_slice_connector(mock_config config, std::string alias)
-            : mysql::MockConnector(config, std::move(alias))
+        wide_slice_connector(mock_config config, std::string alias, boost::mysql::connect_params params)
+            : mysql::MockConnector(config, std::move(alias), std::move(params))
             , resource_(config.resource) {}
 
         boost::asio::awaitable<core::result_wrapper_t<std::unique_ptr<data_chunk_t>>>
@@ -114,9 +115,11 @@ namespace {
 
     std::unique_ptr<mysql::IConnector> wide_slice_connector_factory(std::pmr::memory_resource* resource,
                                                                     boost::asio::io_context&,
-                                                                    boost::mysql::connect_params,
+                                                                    boost::mysql::connect_params params,
                                                                     std::string alias) {
-        return std::make_unique<wide_slice_connector>(mock_config{.resource = resource}, std::move(alias));
+        return std::make_unique<wide_slice_connector>(mock_config{.resource = resource},
+                                                      std::move(alias),
+                                                      std::move(params));
     }
 
     // The chunk of a run holding its global row `row`, and the row's index inside that chunk.
@@ -155,16 +158,13 @@ namespace {
             REQUIRE(otterstax::test::cell(*cell.chunk, 1, cell.row).value<std::string_view>() == wide_slice_name(row));
         }
     }
-
 } // namespace
 
 namespace {
-
     // One read of db.table on a MySQL agent over the connector `factory`.
     otterstax::federation::backend_agent_t::rows_t scan(otterstax::test::agent_driver_t& agent) {
         return agent.read("SELECT `id`, `name` FROM `db`.`table`");
     }
-
 } // namespace
 
 TEST_CASE("mysql agent read: a connector that resolves without a chunk is an error, not a dereference") {
@@ -227,14 +227,14 @@ TEST_CASE("federation write: a remote DML answers the backend's count through th
     otterstax::test::session_stack_owner owner(otterstax::test::unique_test_dir("test_backend_managers_dml"), options);
     auto updated = otterstax::test::run_session_sql_payload(owner.stack(),
                                                             1,
-                                                            "UPDATE orders.db.public.\"table\" SET name = 'x' WHERE id = 1;");
+                                                            "UPDATE orders.db.\"table\" SET name = 'x' WHERE id = 1;");
     INFO((updated.has_error() ? updated.error().what.c_str() : "ok"));
     REQUIRE_FALSE(updated.has_error());
     REQUIRE(updated.value().column_count() == 0);
     REQUIRE(updated.value().reported_rows() == 42);
 
     auto deleted =
-        otterstax::test::run_session_sql_payload(owner.stack(), 2, "DELETE FROM orders.db.public.\"table\" WHERE id = 1;");
+        otterstax::test::run_session_sql_payload(owner.stack(), 2, "DELETE FROM orders.db.\"table\" WHERE id = 1;");
     INFO((deleted.has_error() ? deleted.error().what.c_str() : "ok"));
     REQUIRE_FALSE(deleted.has_error());
     REQUIRE(deleted.value().column_count() == 0);
@@ -242,18 +242,18 @@ TEST_CASE("federation write: a remote DML answers the backend's count through th
 
     // An INSERT reaches the backend as a write of the rows the engine appended: the count is the
     // backend's as well.
-    auto inserted = otterstax::test::run_session_sql_payload(owner.stack(),
-                                                             4,
-                                                             "INSERT INTO orders.db.public.\"table\" (id, name) VALUES (9, 'z');");
+    auto inserted =
+        otterstax::test::run_session_sql_payload(owner.stack(),
+                                                 4,
+                                                 "INSERT INTO orders.db.\"table\" (id, name) VALUES (9, 'z');");
     INFO((inserted.has_error() ? inserted.error().what.c_str() : "ok"));
     REQUIRE_FALSE(inserted.has_error());
     REQUIRE(inserted.value().column_count() == 0);
     REQUIRE(inserted.value().reported_rows() == 42);
 
     // ... prepared and executed with a bound value as well.
-    auto prepared = otterstax::test::prepare_session_sql(owner.stack(),
-                                                         3,
-                                                         "DELETE FROM orders.db.public.\"table\" WHERE id = $1;");
+    auto prepared =
+        otterstax::test::prepare_session_sql(owner.stack(), 3, "DELETE FROM orders.db.\"table\" WHERE id = $1;");
     INFO((prepared.has_error() ? prepared.error().what.c_str() : "ok"));
     REQUIRE_FALSE(prepared.has_error());
     std::pmr::vector<components::vector::vector_t> values(owner.engine().resource());
@@ -285,7 +285,6 @@ TEST_CASE("federation write: a remote DML answers the backend's count through th
 // connector (its discovery answers the table's columns).
 
 namespace {
-
     constexpr const char* kNotNullUid = "nulls";
     constexpr size_t not_null_rows = 2000;
     constexpr Oid kNotNullInt4Oid = 23;
@@ -297,7 +296,7 @@ namespace {
 
     std::string not_null_label(size_t row) { return "label_" + std::to_string(row); }
 
-    // The backend table nulls.pgdb.public.src (id INT4 = row, label TEXT =
+    // The backend table nulls.public.src (id INT4 = row, label TEXT =
     // "label_<row>"), whose label is NULL on row NullRow alone.
     template<size_t NullRow>
     class null_label_pg_connector final : public pg::IConnector {
@@ -397,8 +396,9 @@ namespace {
         return std::make_unique<null_label_pg_connector<NullRow>>(resource, std::move(params), std::move(alias));
     }
 
-    using pg_factory_fn =
-        std::unique_ptr<pg::IConnector> (*)(std::pmr::memory_resource*, pg::connect_params, std::string);
+    using pg_factory_fn = std::unique_ptr<pg::IConnector> (*)(std::pmr::memory_resource*,
+                                                              pg::connect_params,
+                                                              std::string);
 
     // Real engine, real parser; the PostgreSQL connection is the mock above,
     // configured under kNotNullUid with its table discovered at startup.
@@ -430,8 +430,10 @@ namespace {
         otterstax::test::session_stack_owner owner_;
     };
 
-    constexpr const char* kNotNullTable = "CREATE TABLE nndb.target (id int, label string NOT NULL);";
+    constexpr const char* kNotNullTable = "CREATE TABLE local.nndb.target (id int, label string NOT NULL);";
     constexpr const char* kNotNullSchema = "CREATE SCHEMA nndb;";
+    // The engine alone registers no connection: its sessions stand in main.public.
+    constexpr const char* kEngineNotNullTable = "CREATE TABLE nndb.target (id int, label string NOT NULL);";
 
     // What a statement answered, and how many rows nndb.target holds afterwards.
     struct not_null_insert_outcome_t {
@@ -457,11 +459,11 @@ namespace {
         auto inserted = otterstax::test::run_session_sql_payload(
             s,
             id++,
-            "INSERT INTO nndb.target (id, label) SELECT id, label FROM nulls.pgdb.public.src;");
+            "INSERT INTO local.nndb.target (id, label) SELECT id, label FROM nulls.public.src;");
         not_null_insert_outcome_t outcome{inserted.has_error(),
                                           inserted.has_error() ? std::string{inserted.error().what.c_str()}
                                                                : std::string{},
-                                          otterstax::test::engine_row_count(s, "nndb", "target")};
+                                          otterstax::test::engine_row_count(s, "local.nndb", "target")};
         return outcome;
     }
 
@@ -473,7 +475,7 @@ namespace {
             auto created_db = engine->sql(kNotNullSchema);
             REQUIRE(created_db);
             REQUIRE_FALSE(created_db->is_error());
-            auto created_tbl = engine->sql(kNotNullTable);
+            auto created_tbl = engine->sql(kEngineNotNullTable);
             REQUIRE(created_tbl);
             REQUIRE_FALSE(created_tbl->is_error());
 
@@ -488,8 +490,8 @@ namespace {
             sql += ";";
             auto inserted = engine->sql(sql);
             outcome.refused = !inserted || inserted->is_error();
-            outcome.error = inserted && inserted->is_error() ? std::string{inserted->get_error().what.c_str()}
-                                                             : std::string{};
+            outcome.error =
+                inserted && inserted->is_error() ? std::string{inserted->get_error().what.c_str()} : std::string{};
 
             auto counted = engine->sql("SELECT * FROM nndb.target;");
             REQUIRE(counted);
@@ -501,7 +503,6 @@ namespace {
         std::filesystem::remove_all(data_dir);
         return outcome;
     }
-
 } // namespace
 
 TEST_CASE("INSERT ... SELECT from a backend: a NULL in the first chunk of a NOT NULL column refuses the statement") {
@@ -545,9 +546,8 @@ TEST_CASE("engine alone: a literal INSERT with a NULL past the first chunk of a 
 // discovered named types), then the connection's backend actor hands them to the engine in pages.
 
 namespace {
-
     constexpr const char* kChUid = "chx";
-    constexpr const char* kChEvents = "chx.chdb.public.events";
+    constexpr const char* kChEvents = "chx.chdb.events";
     constexpr size_t ch_event_rows = 2500;
     // The rows of the first data block; the second holds the rest, so the block boundary falls inside
     // an engine chunk.
@@ -708,10 +708,9 @@ namespace {
 
         // The data query: AVG(score) AS score is ClickHouse's Float64 avg under the Int32 column's name;
         // any other statement is the rows of the columns it selects, in two blocks.
-        boost::asio::awaitable<core::result_wrapper_t<std::unique_ptr<data_chunk_t>>>
-        runQuery(std::string_view query,
-                 otterstax::function_ref_t<std::unique_ptr<data_chunk_t>(const ch::select_result_t&)> handler)
-            override {
+        boost::asio::awaitable<core::result_wrapper_t<std::unique_ptr<data_chunk_t>>> runQuery(
+            std::string_view query,
+            otterstax::function_ref_t<std::unique_ptr<data_chunk_t>(const ch::select_result_t&)> handler) override {
             ch::select_result_t outcome;
             if (query.find("AVG(") != std::string_view::npos) {
                 auto averages = std::make_shared<clickhouse::ColumnFloat64>();
@@ -845,7 +844,6 @@ namespace {
         sql += ";";
         return sql;
     }
-
 } // namespace
 
 TEST_CASE("ClickHouse agent slice: 2500 rows with LIST and STRUCT columns reach the engine cursor intact") {
@@ -864,7 +862,7 @@ TEST_CASE("ClickHouse agent slice: 2500 rows with LIST and STRUCT columns reach 
         total += chunk.size();
     }
     REQUIRE(total == ch_event_rows);
-    const auto column_types =chunks.front().types();
+    const auto column_types = chunks.front().types();
     REQUIRE(column_types[1].type() == types::logical_type::LIST);
     REQUIRE(column_types[2].type() == types::logical_type::LIST);
     REQUIRE(column_types[3].type() == types::logical_type::STRUCT);
@@ -940,7 +938,7 @@ TEST_CASE("ClickHouse prepare_schema: AVG(score) AS score is prepared and stream
     INFO("execute: " << (executed.has_error() ? executed.error().what.c_str() : "ok"));
     REQUIRE_FALSE(executed.has_error());
     REQUIRE(executed.value().size() == 1);
-    const auto column_types =executed.value().chunks.front().types();
+    const auto column_types = executed.value().chunks.front().types();
     REQUIRE(column_types.size() == 1);
     REQUIRE(column_types[0].type() == types::logical_type::DOUBLE);
     REQUIRE(column_types[0].type() == schema.child_types()[0].type());
@@ -977,7 +975,7 @@ TEST_CASE("ClickHouse prepare_schema: named-type columns are prepared and execut
     INFO("execute: " << (executed.has_error() ? executed.error().what.c_str() : "ok"));
     REQUIRE_FALSE(executed.has_error());
     REQUIRE(executed.value().size() == ch_event_rows);
-    const auto column_types =executed.value().chunks.front().types();
+    const auto column_types = executed.value().chunks.front().types();
     REQUIRE(column_types.size() == schema.child_types().size());
     for (size_t col = 0; col < column_types.size(); ++col) {
         INFO("column " << col);

@@ -37,13 +37,14 @@ using otterstax::test::stmt;
 using otterstax::test::with_session_stack_parser;
 
 namespace {
-
     // The whole stack over a real engine, the mock MySQL connector `factory`
     // and the mock parser `parser`, with the two MySQL connections ("1", "2")
     // the mock parser's statement resolves against.
     class mock_stack {
     public:
-        mock_stack(const std::string& data_dir, mysql::connector_factory factory, otterstax::session::parser_factory_fn parser)
+        mock_stack(const std::string& data_dir,
+                   mysql::connector_factory factory,
+                   otterstax::session::parser_factory_fn parser)
             : owner_(data_dir, options(factory, parser)) {}
 
         actor_zeta::address_t open_session() { return owner_.open_connection(); }
@@ -68,7 +69,6 @@ namespace {
     }
 
     constexpr const char* kSql = "SELECT 1 AS test";
-
 } // namespace
 
 TEST_CASE("session: a remote SELECT runs through the backend and the engine") {
@@ -233,7 +233,6 @@ TEST_CASE("session: parallel connections over the real engine keep their own ord
 }
 
 namespace {
-
     constexpr const char* kThrowText = "second_parse_boom";
 
     // Delegates to a real parser but throws on its second call: the inner query
@@ -269,7 +268,6 @@ namespace {
     parser_ptr make_non_std_throwing_parser(std::pmr::memory_resource*) {
         return std::make_unique<throwing_non_std_parser>();
     }
-
 } // namespace
 
 TEST_CASE("session: an exception from the inner COPY parse is an error and the session stays usable") {
@@ -304,12 +302,14 @@ TEST_CASE("session: a non-std exception at the parser boundary becomes a parse e
     });
 }
 
-TEST_CASE("session: a database a connection owns is refused before the engine") {
+TEST_CASE("session: what OtterStax owns is refused before the engine") {
     with_session_stack_parser("/tmp/test_session_ddl_guard", &make_parser, [](session_stack s) {
         // OtterStax's service database (remote names, Kafka's bookkeeping).
-        auto r = run_session_sql_payload(s, 8400, "CREATE DATABASE federation;");
+        auto r = run_session_sql_payload(s, 8400, "CREATE TABLE federation.public.mine (id bigint);");
         REQUIRE(r.has_error());
         REQUIRE(r.error().type == core::error_code_t::invalid_parameter);
-        run_session_or_fail(s, 8401, "CREATE DATABASE free_name;");
+        // A client's database is a schema of local, under any name.
+        run_session_or_fail(s, 8401, "CREATE DATABASE federation;");
+        run_session_or_fail(s, 8402, "CREATE TABLE local.federation.t (id bigint);");
     });
 }

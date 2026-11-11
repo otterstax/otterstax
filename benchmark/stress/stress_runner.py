@@ -50,7 +50,7 @@ def _connect(frontend: str, host: str, port: int):
         port=port,
         user="testuser",
         password="testpass",
-        dbname="main",
+        dbname="local",
         connect_timeout=10,
     )
     conn.autocommit = True   # avoid implicit transaction overhead on read-only queries

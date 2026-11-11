@@ -203,6 +203,7 @@ services:
         # RustFS (like every S3-compatible store) serves path-style addressing;
         # a CLI that switched its default away from it retries into a domain
         # the compose network cannot resolve and the seeding fails.
+        set -e
         aws configure set default.s3.addressing_style path
         aws --endpoint-url http://rustfs:9000 s3 mb s3://test-bucket
         aws --endpoint-url http://rustfs:9000 s3api put-bucket-policy --bucket test-bucket --policy '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":["*"]},"Action":["s3:GetObject"],"Resource":["arn:aws:s3:::test-bucket/*"]}]}'

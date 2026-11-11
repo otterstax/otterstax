@@ -185,7 +185,7 @@ class TestADBCDriver:
             assert all(isinstance(c, str) for c in catalogs)
             assert CATALOG in catalogs, f"the local database {CATALOG!r} is not listed: {catalogs}"
             assert "federation" not in catalogs, f"the federation metadata database is listed: {catalogs}"
-            scoped = conn.adbc_get_objects(depth="all", catalog=CATALOG, db_schema=DB).read_all()
+            scoped = conn.adbc_get_objects(depth="all", catalog_filter=CATALOG, db_schema_filter=DB).read_all()
             assert scoped.num_rows == 1, \
                 f"the suite's schema {DB!r} is not listed under {CATALOG!r}"
 

@@ -24,14 +24,19 @@
 #include <grpcpp/security/credentials.h>
 #include <spark/connect/base.grpc.pb.h>
 
+#include <arrow/buffer.h>
+#include <arrow/io/memory.h>
+#include <arrow/ipc/reader.h>
+#include <arrow/scalar.h>
+
 #include <chrono>
 #include <memory>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace {
-
     namespace sc = ::spark::connect;
     using namespace std::chrono_literals;
 
@@ -80,6 +85,39 @@ namespace {
             return stub_->ReleaseSession(&context, request, &response);
         }
 
+        // spark.catalog.currentDatabase() as an ExecutePlan with a Catalog root.
+        // The answer streams the cell as one Arrow IPC batch; read as a string.
+        std::pair<grpc::Status, std::string> current_database(const std::string& session = kSparkSession) {
+            sc::ExecutePlanRequest request;
+            request.set_session_id(session);
+            request.mutable_user_context()->set_user_id("test");
+            request.mutable_plan()->mutable_root()->mutable_catalog()->mutable_current_database();
+            grpc::ClientContext context;
+            context.set_deadline(std::chrono::system_clock::now() + 30s);
+            auto reader = stub_->ExecutePlan(&context, request);
+            sc::ExecutePlanResponse response;
+            std::string database;
+            while (reader->Read(&response)) {
+                if (!response.has_arrow_batch()) {
+                    continue;
+                }
+                const std::string& batch_bytes = response.arrow_batch().data();
+                auto open = arrow::ipc::RecordBatchStreamReader::Open(
+                    std::make_shared<arrow::io::BufferReader>(arrow::Buffer::FromString(batch_bytes)));
+                REQUIRE(open.ok());
+                auto next = (*open)->Next();
+                REQUIRE(next.ok());
+                if (*next == nullptr) {
+                    continue;
+                }
+                const auto cell = (*next)->column(0)->GetScalar(0);
+                REQUIRE(cell.ok());
+                const auto& text = static_cast<const arrow::StringScalar&>(*cell.ValueOrDie());
+                database.assign(reinterpret_cast<const char*>(text.value->data()), text.value->size());
+            }
+            return {reader->Finish(), database};
+        }
+
     private:
         std::unique_ptr<sc::SparkConnectService::Stub> stub_;
     };
@@ -88,7 +126,6 @@ namespace {
         INFO(what << ": " << status.error_message());
         REQUIRE(status.ok());
     }
-
 } // namespace
 
 TEST_CASE("spark transactions: a statement classify_sql refuses inside a block fails the block") {
@@ -100,9 +137,9 @@ TEST_CASE("spark transactions: a statement classify_sql refuses inside a block f
     auto& sessions = owner.sessions();
 
     require_ok(client.sql("CREATE DATABASE spx"), "CREATE DATABASE");
-    require_ok(client.sql("CREATE TABLE spx.public.t (id bigint)"), "CREATE TABLE");
+    require_ok(client.sql("CREATE TABLE local.spx.t (id bigint)"), "CREATE TABLE");
     require_ok(client.sql("BEGIN"), "BEGIN");
-    require_ok(client.sql("INSERT INTO spx.public.t (id) VALUES (1)"), "INSERT");
+    require_ok(client.sql("INSERT INTO local.spx.t (id) VALUES (1)"), "INSERT");
     CHECK(sessions.sessions_in_block() == 1);
 
     // Refused by the frontend before the session runs anything.
@@ -110,7 +147,7 @@ TEST_CASE("spark transactions: a statement classify_sql refuses inside a block f
     CHECK(refused.error_code() == grpc::StatusCode::INVALID_ARGUMENT);
 
     // The block failed behind it, as any error inside a block fails it.
-    const auto after = client.sql("INSERT INTO spx.public.t (id) VALUES (2)");
+    const auto after = client.sql("INSERT INTO local.spx.t (id) VALUES (2)");
     INFO(after.error_message());
     CHECK_FALSE(after.ok());
     CHECK(after.error_message().find("only ROLLBACK") != std::string::npos);
@@ -119,7 +156,7 @@ TEST_CASE("spark transactions: a statement classify_sql refuses inside a block f
     CHECK(sessions.sessions_in_block() == 0);
     // Outside a block a refusal fails nothing.
     CHECK(client.sql("EXPLAIN SELECT 1").error_code() == grpc::StatusCode::INVALID_ARGUMENT);
-    require_ok(client.sql("INSERT INTO spx.public.t (id) VALUES (3)"), "INSERT after the refusal");
+    require_ok(client.sql("INSERT INTO local.spx.t (id) VALUES (3)"), "INSERT after the refusal");
     server.stop();
 }
 
@@ -152,8 +189,10 @@ TEST_CASE("spark transactions: a server-wide setting through spark.sql is refuse
     spark_client client(server.local_port());
     auto& sessions = owner.sessions();
 
-    for (const char* sql : {"ALTER SYSTEM SET timezone = 'UTC'", "ALTER SYSTEM RESET ALL",
-                            "ALTER DATABASE main SET timezone = 'UTC'", "ALTER ROLE r SET timezone = 'UTC'"}) {
+    for (const char* sql : {"ALTER SYSTEM SET timezone = 'UTC'",
+                            "ALTER SYSTEM RESET ALL",
+                            "ALTER DATABASE main SET timezone = 'UTC'",
+                            "ALTER ROLE r SET timezone = 'UTC'"}) {
         INFO(sql);
         const auto refused = client.sql(sql);
         CHECK_FALSE(refused.ok());
@@ -168,5 +207,22 @@ TEST_CASE("spark transactions: a server-wide setting through spark.sql is refuse
     CHECK(after.error_message().find("only ROLLBACK") != std::string::npos);
     require_ok(client.sql("ROLLBACK"), "ROLLBACK");
     CHECK(sessions.sessions_in_block() == 0);
+    server.stop();
+}
+
+// Spark's current database exists before the client names one, as Spark's
+// default database does: local.public here. A USE of the client's replaces it.
+TEST_CASE("spark sessions: a fresh session reads local.public as its current database") {
+    otterstax::test::session_stack_owner owner(otterstax::test::unique_test_dir("otterstax_spark_default_place"));
+    frontend::spark::spark_connect_server server(spark_config(owner.stack()));
+    server.start();
+    REQUIRE(server.local_port() > 0);
+    spark_client client(server.local_port());
+
+    require_ok(client.sql("SELECT 1"), "the session's first statement");
+    const auto answered = client.current_database();
+    INFO("currentDatabase: " << answered.first.error_message());
+    REQUIRE(answered.first.ok());
+    REQUIRE(answered.second == "local.public");
     server.stop();
 }

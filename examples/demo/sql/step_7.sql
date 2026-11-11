@@ -4,9 +4,9 @@
 --   of the config file (config.yaml in docker mode / config_local.yaml with
 --   --local, where the endpoint points at host:3206).
 --
--- After this DDL, otter.regions is a normal engine-internal table. Inspect with:
---   SELECT * FROM otter.regions ORDER BY region_id LIMIT 10;
-CREATE EXTERNAL TABLE otter.regions
+-- After this DDL, local.otter.regions is a normal engine-internal table. Inspect with:
+--   SELECT * FROM local.otter.regions ORDER BY region_id LIMIT 10;
+CREATE EXTERNAL TABLE local.otter.regions
     WITH (s3_alias = 'demo_s3',
           location = 's3://demo-bucket/regions.csv',
           format   = 'csv');

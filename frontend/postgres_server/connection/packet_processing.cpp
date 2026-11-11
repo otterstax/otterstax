@@ -233,25 +233,20 @@ namespace frontend::postgres {
         }
         // Each SET the engine applied is followed by await_session.
         if (database && !database->empty()) {
-            auto r = co_await execute_own(engine_set_statement("search_path", *database + ".public"));
+            auto r = co_await use_own(*database);
             if (r.has_error()) {
                 const auto code = r.error().type;
                 if (!r.timed_out() && code == core::error_code_t::database_not_exists) {
-                    // The database a client that names none is placed in
-                    // (otterbrix's built-in search_path, main.public).
                     send_error_response(sql_state::INVALID_CATALOG_NAME,
                                         "database \"" + *database + "\" does not exist",
                                         error_severity::fatal(),
-                                        "The default database is \"main\".");
+                                        "A database is a connection, connection.namespace, local or local.namespace.");
                 } else if (!r.timed_out() && code == core::error_code_t::schema_not_exists) {
-                    // The database is there, its public schema (the place a
-                    // StartupMessage's database names) is not. PostgreSQL never
-                    // refuses a connection for a search_path schema, but the
-                    // engine cannot place a session in one that does not exist:
-                    // the refusal names the schema, never "the database does not
-                    // exist" for a database that does.
+                    // The connection is there, the namespace the database names is not. PostgreSQL never refuses a
+                    // connection for a search_path schema, but the engine cannot place a session in one that does
+                    // not exist: the refusal names the schema, never "the database does not exist" for one that does.
                     send_error_response(sql_state::INVALID_SCHEMA_NAME,
-                                        "schema \"" + *database + ".public\" does not exist",
+                                        std::string{r.error().what.c_str()},
                                         error_severity::fatal());
                 } else {
                     send_session_error(r, "", error_severity::fatal());
@@ -410,6 +405,15 @@ namespace frontend::postgres {
         co_return r;
     }
 
+    boost::asio::awaitable<otterstax::awaited_t<session_payload>> postgres_connection::use_own(std::string named) {
+        // a query session schedules itself: needs_sched is always false
+        [[maybe_unused]] auto [needs_sched, fut] = actor_zeta::send(session_->address(),
+                                                                    &otterstax::session::query_session_t::use,
+                                                                    session_->next_statement(),
+                                                                    std::move(named));
+        co_return co_await await_session(std::move(fut));
+    }
+
     boost::asio::awaitable<otterstax::awaited_t<session_payload>> postgres_connection::execute_own(std::string sql) {
         // a query session schedules itself: needs_sched is always false
         [[maybe_unused]] auto [needs_sched, fut] = actor_zeta::send(session_->address(),
@@ -424,8 +428,7 @@ namespace frontend::postgres {
         if (session_ == nullptr || answer.timed_out()) {
             return; // nothing the statement did is known yet
         }
-        const bool inside_block =
-            session_->transaction_status() != components::session::transaction_status_t::idle;
+        const bool inside_block = session_->transaction_status() != components::session::transaction_status_t::idle;
         if (!answer.has_error()) {
             const auto& payload = answer.value();
             for (const auto& change : payload.setting_changes) {
@@ -483,8 +486,7 @@ namespace frontend::postgres {
 
     void postgres_connection::reset_client_parameters() {
         OTX_ZONE_N("pg::reset_client_parameters");
-        const bool inside_block =
-            session_->transaction_status() != components::session::transaction_status_t::idle;
+        const bool inside_block = session_->transaction_status() != components::session::transaction_status_t::idle;
         application_name_.set(application_name_.reset, false, inside_block);
         client_encoding_.set(client_encoding_.reset, false, inside_block);
         extra_float_digits_.set(extra_float_digits_.reset, false, inside_block);
@@ -557,12 +559,11 @@ namespace frontend::postgres {
         OTX_ZONE_N("pg::set_client_parameter");
         // A failed block was refused before: the session is idle or in an open
         // block.
-        const bool inside_block =
-            session_->transaction_status() != components::session::transaction_status_t::idle;
+        const bool inside_block = session_->transaction_status() != components::session::transaction_status_t::idle;
         switch (*setting.client) {
             case client_parameter_t::application_name: {
                 auto& name = application_name_;
-                std::string value = setting.value    ? clean_application_name(*setting.value)
+                std::string value = setting.value     ? clean_application_name(*setting.value)
                                     : setting.current ? name.current()
                                                       : name.reset;
                 name.set(std::move(value), setting.local, inside_block);
@@ -784,7 +785,7 @@ namespace frontend::postgres {
                 // A column the text encoder cannot carry is an ErrorResponse, not a
                 // dropped connection.
                 if (auto bad = find_unsupported_column<frontend_type::POSTGRES>(sdata_result.chunks.front(),
-                                                                               {result_encoding::TEXT})) {
+                                                                                {result_encoding::TEXT})) {
                     send_error_response(sql_state::FEATURE_NOT_SUPPORTED,
                                         unsupported_column_message<frontend_type::POSTGRES>(*bad));
                     co_return;
@@ -900,10 +901,8 @@ namespace frontend::postgres {
         // The engine describes the statement (a failed block refuses it, but
         // a COMMIT / ROLLBACK / ROLLBACK TO, with 25P02, as PostgreSQL's Parse).
         // a query session schedules itself: needs_sched is always false
-        [[maybe_unused]] auto [needs_sched, fut] = actor_zeta::send(session_->address(),
-                                                                    &otterstax::session::query_session_t::prepare_schema,
-                                                                    id,
-                                                                    query);
+        [[maybe_unused]] auto [needs_sched, fut] =
+            actor_zeta::send(session_->address(), &otterstax::session::query_session_t::prepare_schema, id, query);
         auto r = co_await await_session(std::move(fut));
 
         if (r.has_error()) {
@@ -1005,7 +1004,8 @@ namespace frontend::postgres {
                 int32_t len = reader.read_int32();
                 if (len == -1) {
                     params.push_back(components::vector::make_null(
-                        resource_, components::types::complex_logical_type{components::types::logical_type::NA}));
+                        resource_,
+                        components::types::complex_logical_type{components::types::logical_type::NA}));
                     continue;
                 }
 
@@ -1151,7 +1151,9 @@ namespace frontend::postgres {
         }
         auto r = co_await await_session(std::move(fut));
         if (r.has_error()) {
-            log_->warn("[Connection {}] the window of a portal could not be closed: {}", connection_id_, r.error().what);
+            log_->warn("[Connection {}] the window of a portal could not be closed: {}",
+                       connection_id_,
+                       r.error().what);
         }
     }
 
@@ -1412,10 +1414,7 @@ namespace frontend::postgres {
     boost::asio::awaitable<void> postgres_connection::handle_close(describe_close_arg type, std::string name) {
         {
             OTX_ZONE_N("pg::handle_close");
-            log_->info("[Connection {}] CLOSE name: \"{}\" type:\"{}\"",
-                       connection_id_,
-                       name,
-                       static_cast<char>(type));
+            log_->info("[Connection {}] CLOSE name: \"{}\" type:\"{}\"", connection_id_, name, static_cast<char>(type));
         }
         co_await do_close(type, std::move(name));
         send_packet(build_close_complete(writer_));

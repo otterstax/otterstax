@@ -25,12 +25,13 @@ class client:
             'host': host,
             'port': 8816,
             'user': 'testuser',
+            'database': 'local',
             'password': 'testpass',
             # Every statement here is meant to commit on its own: the driver's
             # SET autocommit reaches the engine and is the connection's own.
             'autocommit': True,
         }
-        self.test_database = 'campaigns.db1.public'
+        self.test_database = 'campaigns.db1'
         self.test_table = 'mysql_test_table'
         self.test_encoding_table = 'mysql_test_encoding'
 
@@ -375,7 +376,7 @@ class client:
     def test_missing_remote_table_is_an_error_not_a_transport_failure(self):
         """A DROP TABLE of a remote table neither the catalog nor MariaDB has is a "does not exist" error.
 
-        The engine resolves the four-part name in its catalog; the miss sends
+        The engine resolves the three-part name in its catalog; the miss sends
         the session to discover the table on MariaDB, which has none, so the
         statement fails with the catalog's verdict (never io_error / "connect
         failed"), and the connection keeps serving. COM_STMT_EXECUTE takes the

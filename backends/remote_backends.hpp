@@ -27,7 +27,6 @@ namespace otterstax::runtime {
 } // namespace otterstax::runtime
 
 namespace otterstax::backends {
-
     // How a backend connection is opened: the server's real connectors, or a
     // test's mocks.
     struct connector_factories_t {
@@ -105,10 +104,9 @@ namespace otterstax::backends {
             return discovered_;
         }
         // Every configured connection that has its actor (the session's
-        // registration of a table it missed, the database-name guard); one
-        // left out is not among them.
+        // registration of a table it missed, its table-scope guard); one left
+        // out is not among them.
         [[nodiscard]] std::vector<catalog::configured_connection_t> connections() const;
-        [[nodiscard]] std::vector<std::string> aliases() const;
         // The backend actor of a configured connection (null for another name).
         [[nodiscard]] federation::backend_actor_t* actor(std::string_view alias) const noexcept;
         // The session the registration runs on: DDL of it reaches no backend.
@@ -128,5 +126,4 @@ namespace otterstax::backends {
         std::vector<federation::backend_actor_ptr> actors_;
         std::vector<components::planner::backend_address_t> addresses_;
     };
-
 } // namespace otterstax::backends

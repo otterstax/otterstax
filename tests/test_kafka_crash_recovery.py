@@ -189,7 +189,7 @@ class KafkaCrashRecoveryTest:
 
     def _connect(self):
         conn = psycopg.connect(host=self.host, port=PG_PORT, user="testuser",
-                               password="testpass", dbname="main", autocommit=True, connect_timeout=1)
+                               password="testpass", dbname="local", autocommit=True, connect_timeout=1)
         conn.prepare_threshold = None  # don't cache the empty-table schemaless Describe
         return conn
 
@@ -428,7 +428,7 @@ class KafkaCrashRecoveryTest:
         def do_insert():
             try:
                 c = psycopg.connect(host=self.host, port=PG_PORT, user="testuser",
-                                    password="testpass", dbname="main", autocommit=True)
+                                    password="testpass", dbname="local", autocommit=True)
                 with c.cursor() as cur:
                     cur.execute(f"INSERT INTO kafka.{source} (id, seq) VALUES {values};")
                 c.close()

@@ -2,8 +2,10 @@
 // Copyright 2025-2026  OtterStax
 //
 // e2e harness on the original Go Arrow Flight SQL driver
-// (github.com/apache/arrow-go, gRPC-Go stack): it seeds its own schema (of the
-// database main, the session's place) over the wire and drives SELECT / LIMIT / a parameterized query / an INSERT.
+// (github.com/apache/arrow-go, gRPC-Go stack): it seeds its own schema over
+// the wire and drives SELECT / LIMIT / a parameterized query / an INSERT.
+// Flight SQL has no place field, so every table statement names its tables in
+// full, `local.flight_e2e_go.t`.
 // Usage: go run . host:port
 package main
 
@@ -16,6 +18,11 @@ import (
 )
 
 const db = "flight_e2e_go"
+
+// tables are named in full: the schema of the clients' own database `local`.
+func table(name string) string {
+	return "local." + db + "." + name
+}
 
 func check(err error, what string) {
 	if err != nil {
@@ -53,13 +60,13 @@ func main() {
 
 	dropBestEffort(dbh, "DROP SCHEMA IF EXISTS "+db+" CASCADE")
 	exec(dbh, "CREATE SCHEMA "+db)
-	exec(dbh, "CREATE TABLE "+db+".numbers (id BIGINT, name STRING, score DOUBLE)")
+	exec(dbh, "CREATE TABLE "+table("numbers")+" (id BIGINT, name STRING, score DOUBLE)")
 	for i := 0; i < 8; i++ {
-		exec(dbh, fmt.Sprintf("INSERT INTO %s.numbers (id, name, score) VALUES (%d, 'row-%d', %d.5)", db, i, i, i))
+		exec(dbh, fmt.Sprintf("INSERT INTO %s (id, name, score) VALUES (%d, 'row-%d', %d.5)", table("numbers"), i, i, i))
 	}
 
 	// 1) SELECT + LIMIT
-	rows, err := dbh.Query("SELECT * FROM " + db + ".numbers LIMIT 5")
+	rows, err := dbh.Query("SELECT * FROM " + table("numbers") + " LIMIT 5")
 	check(err, "select")
 	count := 0
 	for rows.Next() {
@@ -81,7 +88,7 @@ func main() {
 	fmt.Println("select+limit ok")
 
 	// 2) a parameterized query
-	rows2, err := dbh.Query("SELECT * FROM "+db+".numbers WHERE id = $1", int64(3))
+	rows2, err := dbh.Query("SELECT * FROM "+table("numbers")+" WHERE id = $1", int64(3))
 	check(err, "prepared select")
 	names := 0
 	for rows2.Next() {
@@ -103,7 +110,7 @@ func main() {
 	fmt.Println("prepared ok")
 
 	// 3) INSERT (Exec)
-	if n := exec(dbh, "INSERT INTO "+db+".numbers (id, name, score) VALUES (900, 'GoE2E', 7.5)"); n != 1 {
+	if n := exec(dbh, "INSERT INTO "+table("numbers")+" (id, name, score) VALUES (900, 'GoE2E', 7.5)"); n != 1 {
 		fmt.Fprintf(os.Stderr, "FAIL insert affected: %d\n", n)
 		os.Exit(1)
 	}

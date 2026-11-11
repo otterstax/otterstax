@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2025-2026  OtterStax
 //
-// Database-level DDL on a name OtterStax owns: a connection of config.yaml (a
-// local database of that name would read like the connection) and OtterStax's
-// own database `federation` (DROP DATABASE is CASCADE; it holds Kafka's
-// bookkeeping too — the Kafka objects are the schema main.kafka). The
-// session checks the name (catalog::check_database_ownership) before the
-// statement reaches the engine, on every entry point a frontend uses, and the
-// refusal leaves the engine and the connection's remote tables untouched.
+// What user DDL / DML must leave alone. A client's CREATE / DROP DATABASE never names an engine
+// database: it is a schema of local for a client whose database is a schema (MySQL, Spark) and
+// refused for one whose database is a catalog (plan::place_namespace_ddl;
+// test_connection_names) — so a connection's database and OtterStax's own `federation` are out of
+// its reach by construction. Inside them the session refuses, before the engine, a written relation of
+// `federation` (remote names, Kafka's bookkeeping) and a DROP of the Kafka objects' schema
+// local.kafka (catalog::check_write_ownership).
 
-#include "catalog/ownership.hpp"
 #include "../mock/cell.hpp"
 #include "session_stack.hpp"
 #include "test_helpers.hpp"
@@ -20,27 +19,18 @@
 #include <catch2/catch_all.hpp>
 
 #include <cctype>
-#include <chrono>
 #include <cstdint>
-#include <filesystem>
-#include <memory>
-#include <memory_resource>
 #include <string>
-#include <thread>
 
-using otterstax::test::await_session;
 using otterstax::test::execute_session_statement;
 using otterstax::test::prepare_session_sql;
 using otterstax::test::run_session_sql_payload;
 using otterstax::test::session_stack;
 
 namespace {
-
-    // The uid is deliberately mixed-case: config.yaml spells it so, while an
-    // unquoted `DROP DATABASE shopdb` reaches the session lower-cased. Only a
-    // case-insensitive match protects both forms.
+    // The uid is deliberately mixed-case: config.yaml spells it so, while an unquoted `shopdb`
+    // reaches the session lower-cased.
     constexpr const char* kUid = "ShopDb";
-    constexpr const char* kNoEntry = "prepared statement does not exist";
 
     // Real engine, real parser; the MySQL connection is a mock connector
     // configured under kUid, its one table `table` discovered at startup.
@@ -51,17 +41,11 @@ namespace {
 
         session_stack stack() const { return owner_.stack(); }
 
-        // The ownership verdict on a name, bypassing the session.
-        core::error_t verdict(const std::string& dbname) {
-            return otterstax::catalog::check_database_ownership(owner_.engine().resource(),
-                                                                dbname,
-                                                                owner_.engine().remote().aliases());
-        }
-
-        // The refused statement created no local database under the connection's name, and
-        // the connection's remote table still answers.
+        // No engine database was made under the connection's name, the connection's remote table still
+        // answers, and OtterStax's metadata still lists it.
         void require_untouched() {
-            auto databases = owner_.engine().sql("SELECT datname FROM pg_catalog.pg_database WHERE datconnection = '';");
+            auto databases =
+                owner_.engine().sql("SELECT datname FROM pg_catalog.pg_database WHERE datconnection = '';");
             REQUIRE(databases);
             INFO((databases->is_error() ? databases->get_error().what.c_str() : ""));
             REQUIRE_FALSE(databases->is_error());
@@ -74,10 +58,17 @@ namespace {
                     CHECK(name != "shopdb");
                 }
             }
-            auto remote = run_session_sql_payload(owner_.stack(), 9999, "SELECT * FROM shopdb.db.public.\"table\";");
+            auto remote = run_session_sql_payload(owner_.stack(), 9999, "SELECT * FROM shopdb.db.\"table\";");
             INFO((remote.has_error() ? remote.error().what.c_str() : ""));
             REQUIRE_FALSE(remote.has_error());
             CHECK(remote.value().size() == 2);
+            auto listed =
+                run_session_sql_payload(owner_.stack(),
+                                        9998,
+                                        "SELECT remote_name FROM federation.public.remote_names WHERE attoid = 0;");
+            INFO((listed.has_error() ? listed.error().what.c_str() : ""));
+            REQUIRE_FALSE(listed.has_error());
+            CHECK(listed.value().size() == 1);
         }
 
     private:
@@ -89,120 +80,57 @@ namespace {
 
         otterstax::test::session_stack_owner owner_;
     };
-
-    void require_owned_by(const core::result_wrapper_t<session_payload>& r,
-                          const std::string& dbname,
-                          const std::string& owner) {
-        REQUIRE(r.has_error());
-        REQUIRE(r.error().type == core::error_code_t::invalid_parameter);
-        REQUIRE(std::string{r.error().what.c_str()} ==
-                "database '" + dbname + "' is owned by connection '" + owner + "'");
-    }
-
 } // namespace
 
-TEST_CASE("database ownership: DROP DATABASE <uid> is refused and the remote tables stay reachable") {
-    guarded_stack_owner owner("/tmp/test_db_owner_drop_uid");
+TEST_CASE("ownership: a client's CREATE / DROP DATABASE is a schema of local, whatever its name") {
+    guarded_stack_owner owner("/tmp/test_db_owner_namespace_ddl");
     auto s = owner.stack();
     session_hash_t id = 9400;
-
-    SECTION("lower-cased unquoted identifier") {
-        require_owned_by(run_session_sql_payload(s, id++, "DROP DATABASE shopdb;"), "shopdb", kUid);
+    struct case_t {
+        const char* sql;
+        bool succeeds;
+    };
+    // DROP DATABASE federation is DROP SCHEMA local.federation CASCADE: there is none yet.
+    for (const auto& [sql, succeeds] : {case_t{"DROP DATABASE federation;", false},
+                                        case_t{"DROP DATABASE shopdb;", false},
+                                        case_t{"CREATE DATABASE shopdb;", true},
+                                        case_t{"CREATE DATABASE \"ShopDb\";", true},
+                                        case_t{"CREATE DATABASE IF NOT EXISTS shopdb;", true},
+                                        case_t{"CREATE DATABASE federation;", true},
+                                        case_t{"DROP DATABASE federation;", true},
+                                        case_t{"DROP DATABASE shopdb;", true},
+                                        case_t{"DROP DATABASE \"ShopDb\";", true}}) {
+        auto r = run_session_sql_payload(s, id++, sql);
+        INFO(sql << " -> " << (r.has_error() ? r.error().what.c_str() : "ok"));
+        CHECK(r.has_error() != succeeds);
+        if (!succeeds && r.has_error()) {
+            CHECK(r.error().type == core::error_code_t::schema_not_exists);
+        }
     }
-    SECTION("quoted identifier in the uid's own spelling") {
-        require_owned_by(run_session_sql_payload(s, id++, "DROP DATABASE \"ShopDb\";"), kUid, kUid);
-    }
-    SECTION("quoted identifier in another case") {
-        require_owned_by(run_session_sql_payload(s, id++, "DROP DATABASE \"SHOPDB\";"), "SHOPDB", kUid);
-    }
-
-    owner.require_untouched();
-    REQUIRE(owner.verdict(kUid).contains_error());
-}
-
-TEST_CASE("database ownership: CREATE DATABASE <uid> is refused") {
-    guarded_stack_owner owner("/tmp/test_db_owner_create_uid");
-    auto s = owner.stack();
-    session_hash_t id = 9420;
-
-    require_owned_by(run_session_sql_payload(s, id++, "CREATE DATABASE shopdb;"), "shopdb", kUid);
-    require_owned_by(run_session_sql_payload(s, id++, "CREATE DATABASE \"ShopDb\";"), kUid, kUid);
-    require_owned_by(run_session_sql_payload(s, id++, "CREATE DATABASE IF NOT EXISTS shopdb;"), "shopdb", kUid);
-
-    owner.require_untouched();
-}
-
-TEST_CASE("database ownership: the federation metadata database is refused") {
-    guarded_stack_owner owner("/tmp/test_db_owner_federation");
-    auto s = owner.stack();
-    session_hash_t id = 9430;
-
-    require_owned_by(run_session_sql_payload(s, id++, "DROP DATABASE federation;"), "federation", "federation");
-    require_owned_by(run_session_sql_payload(s, id++, "CREATE DATABASE \"Federation\";"), "Federation", "federation");
-    // The metadata is intact: the connection's table is still listed.
-    auto listed = run_session_sql_payload(s, id++, "SELECT remote_name FROM federation.public.remote_names WHERE attoid = 0;");
-    INFO((listed.has_error() ? listed.error().what.c_str() : ""));
-    REQUIRE_FALSE(listed.has_error());
-    CHECK(listed.value().size() == 1);
-}
-
-TEST_CASE("database ownership: the prepared path is guarded at prepare time") {
-    guarded_stack_owner owner("/tmp/test_db_owner_prepared");
-    auto s = owner.stack();
-    const session_hash_t stmt = 9460;
-
-    require_owned_by(prepare_session_sql(s, stmt, "DROP DATABASE shopdb;"), "shopdb", kUid);
-
-    // Nothing was stored for the session: the execute phase has no entry to run.
-    auto executed = execute_session_statement(s, stmt);
-    REQUIRE(executed.has_error());
-    REQUIRE(executed.error().type == core::error_code_t::invalid_parameter);
-    REQUIRE(std::string{executed.error().what.c_str()} == kNoEntry);
-
-    owner.require_untouched();
-}
-
-TEST_CASE("database ownership: a user database passes the guard on both paths") {
-    guarded_stack_owner owner("/tmp/test_db_owner_user_db");
-    auto s = owner.stack();
-    session_hash_t id = 9480;
-
-    auto created = run_session_sql_payload(s, id++, "CREATE DATABASE userdb;");
-    INFO("CREATE DATABASE: " << created.error().what.c_str());
-    REQUIRE_FALSE(created.has_error());
-
-    auto dropped = run_session_sql_payload(s, id++, "DROP DATABASE userdb;");
-    INFO("DROP DATABASE: " << dropped.error().what.c_str());
-    REQUIRE_FALSE(dropped.has_error());
-
     const session_hash_t stmt = id++;
-    auto prepared = prepare_session_sql(s, stmt, "CREATE DATABASE prepared_db;");
-    INFO("prepare: " << prepared.error().what.c_str());
-    REQUIRE_FALSE(prepared.has_error());
+    REQUIRE_FALSE(prepare_session_sql(s, stmt, "CREATE DATABASE prepared_db;").has_error());
     auto executed = execute_session_statement(s, stmt);
-    INFO("execute: " << executed.error().what.c_str());
+    INFO("execute: " << (executed.has_error() ? executed.error().what.c_str() : "ok"));
     REQUIRE_FALSE(executed.has_error());
+    REQUIRE_FALSE(run_session_sql_payload(s, id++, "CREATE TABLE local.prepared_db.t (id bigint);").has_error());
 
-    // The guard itself is a pure lookup: a free name is free before and after.
-    REQUIRE_FALSE(owner.verdict("userdb").contains_error());
-    REQUIRE(owner.verdict("shopdb").contains_error());
-    REQUIRE(owner.verdict("SHOPDB").contains_error());
+    owner.require_untouched();
 }
 
-// Inside the databases: a relation of `federation` written (DDL or DML) and
-// the schema of the Kafka objects dropped are refused before the engine, on
-// the direct and the prepared path and for CREATE EXTERNAL TABLE; reading
-// `federation` and writing a user schema named like Kafka's elsewhere pass.
-TEST_CASE("database ownership: federation relations and the schema main.kafka are refused") {
+// A relation of `federation` written (DDL or DML) and the schema of the Kafka objects dropped are
+// refused before the engine, on the direct and the prepared path and for CREATE EXTERNAL TABLE;
+// reading `federation` passes.
+TEST_CASE("ownership: federation relations and the schema local.kafka are refused") {
     guarded_stack_owner owner("/tmp/test_ownership_write_guard");
     auto s = owner.stack();
     session_hash_t id = 9700;
-    for (const std::string sql : {"DELETE FROM federation.public.remote_names;",
-                                  "INSERT INTO federation.public.remote_names SELECT * FROM federation.public.remote_names;",
-                                  "DROP TABLE federation.public.remote_names;",
-                                  "CREATE TABLE federation.public.mine (id bigint);",
-                                  "DROP SCHEMA kafka CASCADE;",
-                                  "CREATE EXTERNAL TABLE federation.public.loaded WITH (location = '/nowhere.csv', format = 'csv')"}) {
+    for (const std::string sql :
+         {"DELETE FROM federation.public.remote_names;",
+          "INSERT INTO federation.public.remote_names SELECT * FROM federation.public.remote_names;",
+          "DROP TABLE federation.public.remote_names;",
+          "CREATE TABLE federation.public.mine (id bigint);",
+          "DROP SCHEMA kafka CASCADE;",
+          "CREATE EXTERNAL TABLE federation.public.loaded WITH (location = '/nowhere.csv', format = 'csv')"}) {
         INFO(sql);
         auto direct = run_session_sql_payload(s, id++, sql);
         REQUIRE(direct.has_error());
@@ -213,16 +141,11 @@ TEST_CASE("database ownership: federation relations and the schema main.kafka ar
     REQUIRE(prepared.has_error());
     CHECK(prepared.error().type == core::error_code_t::invalid_parameter);
 
-    // DROP SCHEMA names a schema of the place: from federation, its kafka schema.
+    // A client's DROP SCHEMA names a schema of local wherever the session stands.
     REQUIRE_FALSE(run_session_sql_payload(s, id++, "SET search_path = 'federation.public';").has_error());
     REQUIRE(run_session_sql_payload(s, id++, "DROP SCHEMA kafka CASCADE;").has_error());
-    REQUIRE_FALSE(run_session_sql_payload(s, id++, "SET search_path = 'main.public';").has_error());
+    REQUIRE_FALSE(run_session_sql_payload(s, id++, "SET search_path = 'local.public';").has_error());
 
     REQUIRE_FALSE(run_session_sql_payload(s, id++, "SELECT * FROM federation.public.remote_names;").has_error());
-    REQUIRE_FALSE(run_session_sql_payload(s, id++, "CREATE DATABASE other;").has_error());
-    REQUIRE_FALSE(run_session_sql_payload(s, id++, "SET search_path = 'other.public';").has_error());
-    REQUIRE_FALSE(run_session_sql_payload(s, id++, "CREATE SCHEMA kafka;").has_error());
-    auto dropped = run_session_sql_payload(s, id++, "DROP SCHEMA kafka;");
-    INFO((dropped.has_error() ? dropped.error().what.c_str() : "ok"));
-    REQUIRE_FALSE(dropped.has_error());
+    owner.require_untouched();
 }

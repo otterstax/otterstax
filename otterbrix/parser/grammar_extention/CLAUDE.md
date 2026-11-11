@@ -19,7 +19,7 @@ Two extensions live here:
 Both recognise:
 
 ```sql
-CREATE EXTERNAL TABLE [[[connection.]database.]schema.]table WITH ( s3_alias = '…', location = '…', format = '…' );
+CREATE EXTERNAL TABLE [namespace.]table WITH ( s3_alias = '…', location = '…', format = '…' );   -- t, s.t or x.s.t (up to three parts)
 COPY (<select>) TO '<location>' WITH ( s3_alias = '…', format = '…' );
 ```
 
@@ -105,8 +105,9 @@ registry. `otterbrix::s3_extension` / `otterbrix::file_extension` are linked int
 
 `transform()` lowers each statement into an `otterstax::external::external_node_t` (defined header-only in
 `grammar_extention/external_node.hpp`, tagged `node_type::unused` like `kafka_node_t`) carrying
-`op` (create/copy), the target (`external_target`: one to four parts as written, unquoted identifiers
-folded to lower case, placed as otterbrix places them — `t`, `s.t`, `d.s.t`, `c.d.s.t`; a fifth part is
+`op` (create/copy), the target (`external_target`: up to three parts as written, unquoted identifiers
+folded to lower case, placed as otterbrix places them — `t`, `s.t`, `x.s.t` (`x` a connection or a local
+database), its empty slots the session's place; a fourth part is
 refused at parse with otterbrix's wording), location, s3_alias, format, inner_sql. The connection's query session
 (`session/query_session.cpp`) detects it through `ParsedQueryData::extension_kind` and routes by the
 node's op to `query_session_t::load_external_table` / `copy_to` (`session/CLAUDE.md`):

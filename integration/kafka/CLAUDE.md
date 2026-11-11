@@ -27,21 +27,21 @@ Library: `kafka_runtime` (links `kafka_grammar` + `otterbrix_local`).
 
 `kafka_manager.{hpp,cpp}` — `actor_zeta::actor::actor_mixin<KafkaManager>`.
 
-- **Names.** The Kafka objects live in the schema `kafka` of otterbrix's default
-  database: `main.kafka.<name>` (`kafka_table_name`), so `kafka.<name>` from the
-  default place `main.public` names them. The bookkeeping lives in the
+- **Names.** The Kafka objects live in the schema `kafka` of the clients' local
+  database: `local.kafka.<name>` (`kafka_table_name`), so `kafka.<name>` from a
+  place in `local` names them. The bookkeeping lives in the
   schema `kafka` of OtterStax's service database `federation`:
   `federation.kafka.__sources` (`kafka_service_table_name`) and
   `federation.kafka.<source>__offsets` (`kafka_offsets_table_name`) — hidden from
   the listings with the rest of `federation`, never a name a client writes. The
   schemas and `__sources` are made by `storage_plans()` (CREATE DATABASE IF NOT
-  EXISTS federation, CREATE SCHEMA IF NOT EXISTS federation.kafka / main.kafka as
+  EXISTS federation, CREATE SCHEMA IF NOT EXISTS federation.kafka / local.kafka as
   `node_create_schema` plans — the parser takes no `CREATE SCHEMA d.s` —, CREATE
   TABLE IF NOT EXISTS `__sources`): at startup by `recover()`, and once per
   process by `ensure_storage()` before a CREATE persists anything.
 - `execute(session_hash_t, kafka_node_ptr)` — runs a parsed Kafka DDL node
   (CREATE/DROP SOURCE/STREAM). SOURCE → `ensure_storage()` + create the backing
-  table `main.kafka.<name>` (+ `federation.kafka.<name>__offsets`) + register + (if
+  table `local.kafka.<name>` (+ `federation.kafka.<name>__offsets`) + register + (if
   `start_pollers_`) launch a poller. STREAM → its output columns are the engine's
   describe (`explain_type::describe`) of the plan the worker runs over each batch
   (`stream_batch_plan` over no rows of the source's columns, `describe_stream`):
@@ -83,7 +83,7 @@ Library: `kafka_runtime` (links `kafka_grammar` + `otterbrix_local`).
   error, a VIEW under the name) is only skipped; so is a source row
   whose backing table is gone.
   A source's columns are not persisted: they are the engine's describe of
-  `SELECT * FROM main.kafka.<src>` (typed from the catalog, so an empty table
+  `SELECT * FROM local.kafka.<src>` (typed from the catalog, so an empty table
   recovers with the same schema as a populated one); a missing backing table is
   skipped, a VIEW under the source's name (its `pg_class.relkind`, asked through
   `pg_database` / `pg_namespace` / `pg_class`) is refused. A stream's and an INSERT
@@ -102,7 +102,7 @@ Dependents come from two places:
   `cascade_closure(name)` follows readers transitively (each dropped stream takes
   its own INSERT queries).
 - **Engine side** — VIEWs (and other normal `pg_depend` dependents) over
-  `main.kafka.<source>`; the backing table is dropped with `drop_behavior_t::restrict_`
+  `local.kafka.<source>`; the backing table is dropped with `drop_behavior_t::restrict_`
   or `cascade_`.
 
 `DROP SOURCE s` (RESTRICT):
@@ -112,7 +112,7 @@ Dependents come from two places:
 1. any Kafka-side reader → `dependent_objects_still_exist` `kafka: cannot drop source 's': insert
    query 'm__insert__0', stream 'st' depend on it; use DROP SOURCE s CASCADE`,
    before anything is stopped (`IF EXISTS` does not forgive it);
-2. the poller is stopped and `main.kafka.s` dropped RESTRICT. A refusal relaunches the
+2. the poller is stopped and `local.kafka.s` dropped RESTRICT. A refusal relaunches the
    poller and keeps registry, `__sources` row and the offsets table untouched; the
    engine's DETAIL oid is resolved through `pg_catalog.pg_class` +
    `pg_namespace` (`describe_restrict_refusal`, the oid spelled as a number into
@@ -123,14 +123,14 @@ Dependents come from two places:
    engine's own message after the same `kafka: cannot drop source 's': ` prefix,
    with the engine's code (`dependent_objects_still_exist` for the refusal). A missing table without
    IF EXISTS keeps the engine's bare answer (`table_not_exists`);
-3. only after `main.kafka.s` is gone (or absent) is `federation.kafka.s__offsets` dropped — always
+3. only after `local.kafka.s` is gone (or absent) is `federation.kafka.s__offsets` dropped — always
    CASCADE: it is internal, and a VIEW someone put over it must not strand a
    source whose table is already gone. A failed offsets drop is logged, not
    answered (a later `DROP SOURCE IF EXISTS s` removes the leftover);
 4. registry / producer / poller (a concurrent refused DROP of the same source may
    have relaunched it meanwhile) / `__sources` row cleanup.
 
-`DROP SOURCE s CASCADE`: the same, minus the refusals; `main.kafka.s` is dropped CASCADE
+`DROP SOURCE s CASCADE`: the same, minus the refusals; `local.kafka.s` is dropped CASCADE
 (dependent views go, recursively), then `__offsets`, then every stream / INSERT
 query of `cascade_closure` is stopped and forgotten (`forget_stream_objects`:
 worker, registry, producer, INSERT bookkeeping, then their `__sources` rows), then
@@ -162,12 +162,12 @@ modes. CASCADE drops `cascade_closure(x)`.
 The query session (`session/query_session.cpp`) detects Kafka work after parsing:
 a `kafka_node_t` plan root → `KafkaManager::execute`; else `kafka_write_target(node)`
 lets through an INSERT whose target, as written, can name a Kafka object (no
-connection, a written database `main`, a written schema `kafka`). It is a Kafka
+connection, a written database `local`, a written schema `kafka`). It is a Kafka
 write when `object_names().contains(<last part>)` and the name, its empty slots
 completed with the session's place (`SELECT current_database(), current_schema()`
 on the connection's engine session, asked only then; a three-part name needs
-none), is `main.kafka.<obj>` (`kafka_target_named`): `kafka.s` from `main.public`,
-`s` from `main.kafka`, `main.kafka.s` from anywhere. Any other INSERT is the
+none), is `local.kafka.<obj>` (`kafka_target_named`): `kafka.s` from a place in
+`local` (`local.public`), `s` from `local.kafka`, `local.kafka.s` from anywhere. Any other INSERT is the
 engine's. The write splits on `source_is_select` — a `VALUES` write
 (`node_raw_data` source) → `KafkaManager::produce` (one-shot), a `SELECT` source →
 `KafkaManager::add_stream_insert` (continuous). All are sent as actor messages and
@@ -178,10 +178,9 @@ engine's. The write splits on `source_is_select` — a `VALUES` write
 - The grammar reserves `partition` → the offsets column is `partition_id`.
 - `INSERT INTO kafka.<obj>` produces to the object's topic (SOURCE and STREAM
   alike); the produced rows are validated against the object's schema first.
-- A session whose place is a connection's (`c.d.s`) completes `kafka.s` to
-  `c.d.kafka.s`, but `current_database()` does not say the connection: such an
-  INSERT is taken for `main.kafka.s` when `d` is `main` (otterbrix has no
-  `current_connection()`).
+- A session placed in a connection (`uid.ns` — only a client's explicit choice,
+  `catalog::client_place`) completes `kafka.s` to `uid.kafka.s`, which is no Kafka
+  object: `kafka.<obj>` names one only from a place in `local`.
 - Declarable column types are the JSON-ingestible five (`INT`, `BIGINT`, `DOUBLE`,
   `BOOLEAN`, `VARCHAR`/`TEXT`/`STRING`); `map_column_type` rejects the rest at parse
   time. A JSON `null` ingests as SQL NULL; an integer outside the column's range

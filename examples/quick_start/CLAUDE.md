@@ -25,8 +25,8 @@ does not.
   engine (root `CLAUDE.md`, "JOIN-key type widths must agree"); string keys keep
   the examples independent of each backend's integer width.
 - **Seed backend tables are read-only in the examples.** Example 9 creates,
-  updates and drops an engine table (`qs.scratch`); `sql/cleanup.sql` drops only
-  the engine schema `qs` and the tables example 6 loaded from S3. Never add a
+  updates and drops an engine table (`local.qs.scratch`); `sql/cleanup.sql` drops only
+  the engine schema `local.qs` and the tables example 6 loaded from S3. Never add a
   `DROP` / `UPDATE` against `pgshop`, `pgcat`, `sales` or `web` — it would change
   the backend's real data, which persists (see below).
 - **Flat schemas.** No ENUM / composite / tuple columns — those belong to
@@ -44,7 +44,7 @@ does not.
 - **Persistence:** every backend and RustFS has a named volume, so data —
   including a user's `UPDATE`s — survives `restart` and `down`/`up`; `down -v`
   rebuilds it from the committed `init/**` files. Kafka has no volume and is
-  re-seeded by `qs-kafka-init` on every `up`. Engine tables (`qs.*`, example 6)
+  re-seeded by `qs-kafka-init` on every `up`. Engine tables (`local.qs.*`, example 6)
   and Kafka sources/streams (K1/K4) are stored inside the OtterStax container (no
   volume): they survive `restart` — sources and streams resume — and are lost on
   `down`/`up`.

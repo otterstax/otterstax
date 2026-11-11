@@ -509,7 +509,7 @@ print(f"""✅ S3 demo fixtures written:
 # examples/demo/kafka/lib/_common.sh (rpk produce inside the demo-kafka container).
 #   demo_orders_live  — the main event feed (features 1-6)
 #   demo_orders_intl  — a second feed used only by the fan-in demo (feature 7)
-# customer_id is drawn from customers that ALSO appear in ch.ev.public.sessions, so the
+# customer_id is drawn from customers that ALSO appear in ch.ev.sessions, so the
 # kafka ⋈ ClickHouse ⋈ Postgres JOIN returns real rows. Every join key is a
 # string (UUID) — a string key sidesteps the int32/int64 width footgun the
 # top-level CLAUDE.md warns about.

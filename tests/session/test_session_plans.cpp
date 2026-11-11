@@ -9,8 +9,8 @@
 // answers for the same SQL (test_prepare_plan.cpp, over the same recording
 // PostgreSQL mock connector), and the refusals both share.
 
-#include "../system/session_stack.hpp"
 #include "../mock/cell.hpp"
+#include "../system/session_stack.hpp"
 
 #include "frontend/spark_connect_server/plan_translator/relation_to_plan.hpp"
 
@@ -46,7 +46,6 @@ using otterstax::test::session_stack_owner;
 using otterstax::test::with_session_stack;
 
 namespace {
-
     namespace sc = ::spark::connect;
     namespace ct = components::types;
 
@@ -187,7 +186,6 @@ namespace {
         std::sort(values.begin(), values.end());
         return values;
     }
-
 } // namespace
 
 TEST_CASE("session plan: Read Project and Filter answer the matching rows", "[spark-plan]") {
@@ -255,9 +253,8 @@ TEST_CASE("session plan: execute_plan and prepare_plan refuse a missing plan and
 // ─── A remote SELECT described and executed as a plan (recording PG mock) ────
 
 namespace {
-
     constexpr const char* kUid = "planpg";
-    constexpr std::string_view kSql = "SELECT id, name, price FROM planpg.pgdb.public.items;";
+    constexpr std::string_view kSql = "SELECT id, name, price FROM planpg.public.items;";
 
     constexpr Oid kInt4Oid = 23;
     constexpr Oid kFloat8Oid = 701;
@@ -450,7 +447,6 @@ namespace {
         std::sort(rows.begin(), rows.end(), [](const item_row& a, const item_row& b) { return a.id < b.id; });
         return rows;
     }
-
 } // namespace
 
 TEST_CASE("session prepare_plan: a parsed remote SELECT is described and never executed") {
@@ -506,26 +502,26 @@ TEST_CASE("session execute_plan: a parsed remote SELECT returns the rows execute
 }
 
 // A DataFrame over a remote table: the Spark translator names the table as the
-// SQL path does (four parts name a connection's table, three a local one), and
+// SQL path does (connection.namespace.table; four parts are refused), and
 // the engine reads it through the connection's backend, for execute_plan and
 // prepare_plan.
 TEST_CASE("session execute_plan: a DataFrame over a remote table reads it through the federation") {
     plan_stack_owner owner("/tmp/test_session_plan_remote_dataframe");
     auto s = owner.stack();
 
-    auto all = execute_session_plan(s, 9940, translate(s, read_table(std::string{kUid} + ".pgdb.public.items")));
+    auto all = execute_session_plan(s, 9940, translate(s, read_table(std::string{kUid} + ".public.items")));
     INFO("read: " << (all.has_error() ? all.error().what.c_str() : "ok"));
     REQUIRE_FALSE(all.has_error());
     const std::vector<item_row> expected(kRows.begin(), kRows.end());
     REQUIRE(rows_of(all.value()) == expected);
 
-    // Three parts are always a local database's (d.s.t): no connection's.
-    auto three = execute_session_plan(s, 9941, translate(s, read_table(std::string{kUid} + ".public.items")));
-    CHECK(three.has_error());
+    // Four parts would be a second full name of the table.
+    auto four = execute_session_plan(s, 9941, translate(s, read_table(std::string{kUid} + ".pgdb.public.items")));
+    CHECK(four.has_error());
 
     // df.schema of the same read: described, never executed.
     reset_queries();
-    auto described = prepare_session_plan(s, 9942, translate(s, read_table(std::string{kUid} + ".pgdb.public.items")));
+    auto described = prepare_session_plan(s, 9942, translate(s, read_table(std::string{kUid} + ".public.items")));
     INFO("prepare_plan: " << (described.has_error() ? described.error().what.c_str() : "ok"));
     REQUIRE_FALSE(described.has_error());
     require_item_schema(described.value().schema);

@@ -19,12 +19,13 @@ import pyarrow as pa
 import pyarrow.ipc as ipc
 
 # GetTables lists the engine's own tables beside the remote ones
-# (frontend/flight_sql/session_engine.cpp): a local table under its database
-# (`main`), a remote one under `<alias>.<database>` with its schema. Only the
+# (frontend/flight_sql/session_engine.cpp): a local table under its database,
+# a remote one under `c.d` — PostgreSQL its configured database, MySQL `def`
+# (catalog::def_database) with its databases as the schemas under it. Only the
 # backends' catalogs are validated here, so a local table of the same name — or
 # one whose column Arrow cannot carry, whose table_schema is NULL — never
 # stands in for a backend table.
-BACKEND_CATALOGS = {'campaigns.db1', 'impressions.db2', 'products.pgdb'}
+BACKEND_CATALOGS = {'campaigns.def', 'impressions.def', 'products.pgdb'}
 
 
 def validate_table_schemas(client, expected_schemas, test_name):

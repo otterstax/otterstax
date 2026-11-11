@@ -23,7 +23,6 @@
 #include <vector>
 
 namespace {
-
     using namespace std::chrono_literals;
     using flight::core::FlightSqlCore;
 
@@ -71,7 +70,6 @@ namespace {
         REQUIRE(core.execute_update_prepared(handle, kClient, &affected).ok());
         return affected;
     }
-
 } // namespace
 
 TEST_CASE("flight session scope: a statement by text runs on a session closed when it returns") {
@@ -82,9 +80,9 @@ TEST_CASE("flight session scope: a statement by text runs on a session closed wh
     auto& engine = core.engine();
 
     CHECK(engine.execute_update("CREATE SCHEMA fs") == 0);
-    CHECK(engine.execute_update("CREATE TABLE fs.t (id bigint)") == 0);
-    CHECK(engine.execute_update("INSERT INTO fs.t (id) VALUES (1), (2), (3)") == 3);
-    CHECK(rows_of(engine.execute("SELECT id FROM fs.t")) == 3);
+    CHECK(engine.execute_update("CREATE TABLE local.fs.t (id bigint)") == 0);
+    CHECK(engine.execute_update("INSERT INTO local.fs.t (id) VALUES (1), (2), (3)") == 3);
+    CHECK(rows_of(engine.execute("SELECT id FROM local.fs.t")) == 3);
     CHECK(wait_for_live(sessions, baseline));
 }
 
@@ -95,13 +93,13 @@ TEST_CASE("flight session scope: a prepared statement keeps one session until it
     auto core = make_core(owner);
     auto& engine = core.engine();
     REQUIRE(engine.execute_update("CREATE SCHEMA fp") == 0);
-    REQUIRE(engine.execute_update("CREATE TABLE fp.t (id bigint)") == 0);
-    REQUIRE(engine.execute_update("INSERT INTO fp.t (id) VALUES (1), (2)") == 2);
+    REQUIRE(engine.execute_update("CREATE TABLE local.fp.t (id bigint)") == 0);
+    REQUIRE(engine.execute_update("INSERT INTO local.fp.t (id) VALUES (1), (2)") == 2);
     REQUIRE(wait_for_live(sessions, baseline));
 
-    const auto select = prepare(core, "SELECT id FROM fp.t");
+    const auto select = prepare(core, "SELECT id FROM local.fp.t");
     CHECK(sessions.live_sessions() == baseline + 1);
-    const auto insert = prepare(core, "INSERT INTO fp.t (id) VALUES (7)");
+    const auto insert = prepare(core, "INSERT INTO local.fp.t (id) VALUES (7)");
     CHECK(sessions.live_sessions() == baseline + 2);
 
     // Executions run on the statement's session: no session is opened for them.
@@ -134,12 +132,12 @@ TEST_CASE("flight session scope: a close racing executions of the statement") {
     const size_t baseline = sessions.live_sessions();
     auto core = make_core(owner);
     REQUIRE(core.engine().execute_update("CREATE SCHEMA fr") == 0);
-    REQUIRE(core.engine().execute_update("CREATE TABLE fr.t (id bigint)") == 0);
-    REQUIRE(core.engine().execute_update("INSERT INTO fr.t (id) VALUES (1), (2), (3)") == 3);
+    REQUIRE(core.engine().execute_update("CREATE TABLE local.fr.t (id bigint)") == 0);
+    REQUIRE(core.engine().execute_update("INSERT INTO local.fr.t (id) VALUES (1), (2), (3)") == 3);
     REQUIRE(wait_for_live(sessions, baseline));
 
     for (int round = 0; round < 10; ++round) {
-        const auto handle = prepare(core, "SELECT id FROM fr.t");
+        const auto handle = prepare(core, "SELECT id FROM local.fr.t");
         std::atomic<int> answered{0};
         std::atomic<int> unexpected{0};
         std::vector<std::thread> executions;
@@ -182,7 +180,7 @@ TEST_CASE("flight session scope: BEGIN is refused and leaves no transaction open
     auto core = make_core(owner);
     auto& engine = core.engine();
     REQUIRE(engine.execute_update("CREATE SCHEMA fb") == 0);
-    REQUIRE(engine.execute_update("CREATE TABLE fb.t (id bigint)") == 0);
+    REQUIRE(engine.execute_update("CREATE TABLE local.fb.t (id bigint)") == 0);
 
     auto refused = [](auto&& call) {
         try {
@@ -215,8 +213,8 @@ TEST_CASE("flight session scope: BEGIN is refused and leaves no transaction open
 
     // COMMIT / ROLLBACK by text end nothing and are accepted (autocommit).
     CHECK(engine.execute_update("COMMIT") == 0);
-    CHECK(engine.execute_update("INSERT INTO fb.t (id) VALUES (1)") == 1);
-    CHECK(rows_of(engine.execute("SELECT id FROM fb.t")) == 1);
+    CHECK(engine.execute_update("INSERT INTO local.fb.t (id) VALUES (1)") == 1);
+    CHECK(rows_of(engine.execute("SELECT id FROM local.fb.t")) == 1);
 }
 
 // A prepared statement is ONE entry of its session, prepared at CreatePreparedStatement and run by
@@ -228,10 +226,10 @@ TEST_CASE("flight session scope: executions of a prepared statement add no entry
     auto core = make_core(owner);
     auto& engine = core.engine();
     REQUIRE(engine.execute_update("CREATE SCHEMA fe") == 0);
-    REQUIRE(engine.execute_update("CREATE TABLE fe.t (id bigint)") == 0);
-    REQUIRE(engine.execute_update("INSERT INTO fe.t (id) VALUES (1), (2)") == 2);
+    REQUIRE(engine.execute_update("CREATE TABLE local.fe.t (id bigint)") == 0);
+    REQUIRE(engine.execute_update("INSERT INTO local.fe.t (id) VALUES (1), (2)") == 2);
 
-    const auto select = prepare(core, "SELECT id FROM fe.t");
+    const auto select = prepare(core, "SELECT id FROM local.fe.t");
     for (int run = 0; run < 5; ++run) {
         CHECK(rows_of_prepared(core, select) == 2);
     }
@@ -246,11 +244,12 @@ TEST_CASE("flight session scope: executions of a prepared statement add no entry
     for (std::size_t id = 1; id < issued; ++id) {
         query_session_t::unique_future<query_session_t::session_result> future;
         REQUIRE(core.use_prepared(select, [&](query_session_t& session) {
-            future = actor_zeta::send(session.address(), &query_session_t::execute_statement, statement_id_t{id}).second;
+            future =
+                actor_zeta::send(session.address(), &query_session_t::execute_statement, statement_id_t{id}).second;
         }));
         auto answer = otterstax::await_future_blocking<session_payload>(std::move(future), owner.engine().resource());
-        const bool unknown = answer.has_error() &&
-                             std::string{answer.error().what.c_str()}.find("does not exist") != std::string::npos;
+        const bool unknown =
+            answer.has_error() && std::string{answer.error().what.c_str()}.find("does not exist") != std::string::npos;
         if (!unknown) {
             ++entries;
         }

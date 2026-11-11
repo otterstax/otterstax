@@ -22,9 +22,7 @@
 using namespace components::types;
 
 namespace flight::engine {
-
     namespace {
-
         // Every error leaving the adapter is an EngineError: the Flight SQL
         // core maps it to INVALID_ARGUMENT with the text attached.
         // `::core` is the global namespace; a bare `core` here would resolve
@@ -44,14 +42,12 @@ namespace flight::engine {
             for (const auto& field : schema.fields()) {
                 if (arrow::is_nested(field->type()->id())) {
                     throw core::EngineError("the record batch stream encodes scalar columns only: column '" +
-                                            field->name() + "' has nested type " +
-                                            field->type()->ToString());
+                                            field->name() + "' has nested type " + field->type()->ToString());
                 }
             }
         }
 
-        core::QueryResult to_query_result(std::pmr::memory_resource* resource,
-                                          session_payload& payload) {
+        core::QueryResult to_query_result(std::pmr::memory_resource* resource, session_payload& payload) {
             core::QueryResult result;
             auto schema = to_arrow_schema(resource, payload.schema);
             if (schema.has_error()) {
@@ -134,7 +130,6 @@ namespace flight::engine {
             }
             return rows;
         }
-
     } // namespace
 
     SessionEngine::SessionEngine(otterstax::session::session_factory_t& sessions, std::pmr::memory_resource* resource)
@@ -223,11 +218,12 @@ namespace flight::engine {
             throw core::EngineError("prepared statement takes " + std::to_string(prepared.parameter_count) +
                                     " parameter(s), got " + std::to_string(rows == 0 ? 0 : columns));
         }
-        auto bound = parameters.empty()
-                         ? components::vector::data_chunk_t(resource_,
-                                                            std::pmr::vector<components::types::complex_logical_type>{resource_},
-                                                            1)
-                         : std::move(parameters.front());
+        auto bound =
+            parameters.empty()
+                ? components::vector::data_chunk_t(resource_,
+                                                   std::pmr::vector<components::types::complex_logical_type>{resource_},
+                                                   1)
+                : std::move(parameters.front());
         // The entry CreatePreparedStatement left: every execution parses its text again and binds
         // its own values there (query_session_t::execute_prepared_statement).
         return call(
@@ -277,7 +273,8 @@ namespace flight::engine {
                 },
                 "closing the prepared statement");
         } catch (const core::EngineError& e) {
-            get_logger(logger_tag::FLIGHTSQL_SERVER)->warn("close_statement of a prepared statement failed: {}", e.what());
+            get_logger(logger_tag::FLIGHTSQL_SERVER)
+                ->warn("close_statement of a prepared statement failed: {}", e.what());
         }
     }
 
@@ -469,13 +466,13 @@ namespace flight::engine {
             return true;
         };
         // Tables and views (r / g / v / m); no index, sequence or type.
-        auto listed = run_query(session,
-                                "SELECT d.datconnection, d.datname, n.nspname, c.relname FROM pg_catalog.pg_class c "
-                                "JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid JOIN pg_catalog.pg_database "
-                                "d ON n.nspdatabase = d.oid" +
-                                    listed_schemas_where() + " AND c.relkind IN ('r', 'g', 'v', 'm')" +
-                                    catalog_filter(catalog) + like_filter("n.nspname", schema_pattern) +
-                                    like_filter("c.relname", table_pattern) + ";");
+        auto listed =
+            run_query(session,
+                      "SELECT d.datconnection, d.datname, n.nspname, c.relname FROM pg_catalog.pg_class c "
+                      "JOIN pg_catalog.pg_namespace n ON c.relnamespace = n.oid JOIN pg_catalog.pg_database "
+                      "d ON n.nspdatabase = d.oid" +
+                          listed_schemas_where() + " AND c.relkind IN ('r', 'g', 'v', 'm')" + catalog_filter(catalog) +
+                          like_filter("n.nspname", schema_pattern) + like_filter("c.relname", table_pattern) + ";");
         std::pmr::vector<table_info> out(resource_);
         for (auto& row : text_rows(listed)) {
             out.push_back(table_info{qualified_name_t{::core::connection_name_t{row.at(0)},
@@ -485,8 +482,12 @@ namespace flight::engine {
                                      {}});
         }
         std::sort(out.begin(), out.end(), [](const table_info& a, const table_info& b) {
-            return std::tuple{core::catalog_of(a.name.connection.t, a.name.database.t), a.name.schema.t, a.name.collection.t} <
-                   std::tuple{core::catalog_of(b.name.connection.t, b.name.database.t), b.name.schema.t, b.name.collection.t};
+            return std::tuple{core::catalog_of(a.name.connection.t, a.name.database.t),
+                              a.name.schema.t,
+                              a.name.collection.t} <
+                   std::tuple{core::catalog_of(b.name.connection.t, b.name.database.t),
+                              b.name.schema.t,
+                              b.name.collection.t};
         });
         if (!include_schema) {
             return out;
@@ -494,13 +495,10 @@ namespace flight::engine {
         // The columns: the engine's describe of each table's `SELECT *` (no
         // backend is asked). A table dropped since the listing keeps no schema.
         for (auto& table : out) {
-            std::string sql = "SELECT * FROM ";
-            for (const auto* part : {&table.name.connection.t, &table.name.database.t, &table.name.schema.t}) {
-                if (!part->empty()) {
-                    sql += enquote(*part, '"') + ".";
-                }
-            }
-            sql += enquote(table.name.collection.t, '"') + ";";
+            // As a client names it: connection.namespace.table, or a local database's.
+            const auto& first = table.name.connection.t.empty() ? table.name.database.t : table.name.connection.t;
+            std::string sql = "SELECT * FROM " + enquote(first, '"') + "." + enquote(table.name.schema.t, '"') + "." +
+                              enquote(table.name.collection.t, '"') + ";";
             try {
                 auto [id, described] = prepare_fresh(session, sql);
                 close_quietly(session, id);
@@ -512,8 +510,5 @@ namespace flight::engine {
         return out;
     }
 
-    std::string SessionEngine::dialect_name() const {
-        return "otterstax";
-    }
-
+    std::string SessionEngine::dialect_name() const { return "otterstax"; }
 } // namespace flight::engine

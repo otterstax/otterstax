@@ -18,61 +18,54 @@
 // spdlog::shutdown() is registered via atexit to avoid a race between the
 // spdlog background-flush thread and static destructors at process exit.
 namespace {
-struct LoggerInit {
-    LoggerInit() {
-        initialize_all_loggers("/tmp/bench_logs");
-        spdlog::set_level(spdlog::level::off);
-        std::atexit([] { spdlog::shutdown(); });
-    }
-};
-static const LoggerInit logger_init;
+    struct LoggerInit {
+        LoggerInit() {
+            initialize_all_loggers("/tmp/bench_logs");
+            spdlog::set_level(spdlog::level::off);
+            std::atexit([] { spdlog::shutdown(); });
+        }
+    };
+    static const LoggerInit logger_init;
 } // namespace
 
 // GreenplumParser is stateless between parse() calls, so one instance is
 // constructed once and reused across all iterations of a benchmark.
 
 namespace {
+    const char* kSimpleSelect = "SELECT id, name, status FROM orders WHERE status = 'active'";
 
-const char* kSimpleSelect = "SELECT id, name, status FROM orders WHERE status = 'active'";
+    const char* kJoin3Table = "SELECT o.id, p.name, c.email "
+                              "FROM mysql.bill.orders o "
+                              "INNER JOIN mysql.bill.products p ON o.product_id = p.id "
+                              "INNER JOIN mysql.bill.customers c ON o.customer_id = c.id";
 
-const char* kJoin3Table =
-    "SELECT o.id, p.name, c.email "
-    "FROM mysql.bill.public.orders o "
-    "INNER JOIN mysql.bill.public.products p ON o.product_id = p.id "
-    "INNER JOIN mysql.bill.public.customers c ON o.customer_id = c.id";
+    const char* kCrossBackend = "SELECT o.id, p.name "
+                                "FROM mysql.bill.orders o "
+                                "INNER JOIN pg.shop.products p ON o.product_id = p.id";
 
-const char* kCrossBackend =
-    "SELECT o.id, p.name "
-    "FROM mysql.bill.public.orders o "
-    "INNER JOIN pg.shop.shop.products p ON o.product_id = p.id";
+    const char* kSubquery = "SELECT category, total "
+                            "FROM (SELECT category, SUM(amount) AS total "
+                            "      FROM mysql.bill.transactions "
+                            "      GROUP BY category) sub "
+                            "WHERE total > 1000";
 
-const char* kSubquery =
-    "SELECT category, total "
-    "FROM (SELECT category, SUM(amount) AS total "
-    "      FROM mysql.bill.public.transactions "
-    "      GROUP BY category) sub "
-    "WHERE total > 1000";
+    // Mirrors the complex_select end-to-end benchmark: GROUP BY + HAVING + ORDER BY + LIMIT.
+    const char* kComplexSelect = "SELECT campaign_id, COUNT(*) AS impressions, SUM(cost) AS total_cost "
+                                 "FROM mysql.bill.impressions "
+                                 "WHERE status = 'active' "
+                                 "GROUP BY campaign_id "
+                                 "HAVING COUNT(*) > 100 "
+                                 "ORDER BY total_cost DESC "
+                                 "LIMIT 1000";
 
-// Mirrors the complex_select end-to-end benchmark: GROUP BY + HAVING + ORDER BY + LIMIT.
-const char* kComplexSelect =
-    "SELECT campaign_id, COUNT(*) AS impressions, SUM(cost) AS total_cost "
-    "FROM mysql.bill.public.impressions "
-    "WHERE status = 'active' "
-    "GROUP BY campaign_id "
-    "HAVING COUNT(*) > 100 "
-    "ORDER BY total_cost DESC "
-    "LIMIT 1000";
-
-// Three-backend cross-engine join: MySQL × PostgreSQL × ClickHouse — three
-// remote names on one plan, the widest statement the parser carries whole.
-const char* kThreeBackendJoin =
-    "SELECT o.id, p.name, e.session_id "
-    "FROM mysql.bill.public.orders o "
-    "INNER JOIN pg.shop.shop.products p ON o.product_id = p.id "
-    "INNER JOIN ch.ev.public.events e ON o.campaign_id = e.campaign_id "
-    "WHERE o.status = 'active' "
-    "LIMIT 500";
-
+    // Three-backend cross-engine join: MySQL × PostgreSQL × ClickHouse — three
+    // remote names on one plan, the widest statement the parser carries whole.
+    const char* kThreeBackendJoin = "SELECT o.id, p.name, e.session_id "
+                                    "FROM mysql.bill.orders o "
+                                    "INNER JOIN pg.shop.products p ON o.product_id = p.id "
+                                    "INNER JOIN ch.ev.events e ON o.campaign_id = e.campaign_id "
+                                    "WHERE o.status = 'active' "
+                                    "LIMIT 500";
 } // namespace
 
 // ── GreenplumParser::parse() ─────────────────────────────────────────────────

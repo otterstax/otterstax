@@ -207,7 +207,7 @@ TEST_CASE("flight prepared handles: random unique handles that only their creato
     otterstax::test::session_stack_owner owner(otterstax::test::unique_test_dir("otterstax_flight_handles"));
     auto engine = std::make_unique<flight::engine::SessionEngine>(owner.sessions(), owner.engine().resource());
     REQUIRE(engine->execute_update("CREATE SCHEMA fh") == 0);
-    REQUIRE(engine->execute_update("CREATE TABLE fh.t (id bigint)") == 0);
+    REQUIRE(engine->execute_update("CREATE TABLE local.fh.t (id bigint)") == 0);
     FlightSqlCore core(flight::core::AuthService::anonymous(), std::move(engine));
 
     auto auth = flight::core::AuthService::basic("u", "p");
@@ -217,7 +217,7 @@ TEST_CASE("flight prepared handles: random unique handles that only their creato
     std::set<std::string> handles;
     for (int i = 0; i < 8; ++i) {
         std::string handle;
-        REQUIRE(core.create_prepared("SELECT id FROM fh.t", alice, &handle).ok());
+        REQUIRE(core.create_prepared("SELECT id FROM local.fh.t", alice, &handle).ok());
         REQUIRE(is_random_id(handle, "otterstax-prepared/"));
         handles.insert(handle);
     }
@@ -234,7 +234,7 @@ TEST_CASE("flight prepared handles: random unique handles that only their creato
 
     // Alice still can.
     REQUIRE(core.prepared_lookup(handle, alice, &state).ok());
-    REQUIRE(state.prepared.query == "SELECT id FROM fh.t");
+    REQUIRE(state.prepared.query == "SELECT id FROM local.fh.t");
     REQUIRE(core.prepared_bind(handle, alice, {}).ok());
     for (const auto& h : handles) {
         REQUIRE(core.close_prepared(h, alice).ok());

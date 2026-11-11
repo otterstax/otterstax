@@ -5,8 +5,8 @@
 // describe of statements that carry them: a relation only a sub-query reads is
 // analyzed with the statement, and a scalar sub-query's column is typed.
 
-#include "../system/session_stack.hpp"
 #include "../mock/cell.hpp"
+#include "../system/session_stack.hpp"
 
 #include <catch2/catch_all.hpp>
 
@@ -25,11 +25,10 @@ using otterstax::test::session_stack;
 using otterstax::test::with_session_stack;
 
 namespace {
-
     using ids_t = std::vector<int64_t>;
     namespace ct = components::types;
 
-    // sq.t: ids 1..4; sq.u: ids 2 and 3.
+    // sq.t: ids 1..4 (local.sq.t); sq.u: ids 2 and 3.
     void seed(const session_stack& s, session_hash_t& id) {
         run_session_or_fail(s, id++, "CREATE SCHEMA sq;");
         run_session_or_fail(s, id++, "CREATE TABLE sq.t (id bigint, name string);");
@@ -73,7 +72,6 @@ namespace {
         }
         return nullptr;
     }
-
 } // namespace
 
 TEST_CASE("session sub-query: IN EXISTS and scalar sub-queries over local tables", "[subquery]") {
@@ -81,13 +79,15 @@ TEST_CASE("session sub-query: IN EXISTS and scalar sub-queries over local tables
         session_hash_t id = 14100;
         seed(s, id);
 
-        CHECK(ids_of(s, id++, "SELECT id FROM sq.t WHERE id IN (SELECT id FROM sq.u) ORDER BY id;") == ids_t{2, 3});
-        CHECK(ids_of(s, id++, "SELECT id FROM sq.t WHERE EXISTS (SELECT id FROM sq.u) ORDER BY id;") ==
+        CHECK(ids_of(s, id++, "SELECT id FROM local.sq.t WHERE id IN (SELECT id FROM local.sq.u) ORDER BY id;") ==
+              ids_t{2, 3});
+        CHECK(ids_of(s, id++, "SELECT id FROM local.sq.t WHERE EXISTS (SELECT id FROM local.sq.u) ORDER BY id;") ==
               ids_t{1, 2, 3, 4});
-        CHECK(ids_of(s, id++, "SELECT id FROM sq.t WHERE id = (SELECT max(id) FROM sq.u);") == ids_t{3});
+        CHECK(ids_of(s, id++, "SELECT id FROM local.sq.t WHERE id = (SELECT max(id) FROM local.sq.u);") == ids_t{3});
         CHECK(ids_of(s,
                      id++,
-                     "SELECT id FROM sq.t WHERE id IN (SELECT id FROM sq.u) AND id < (SELECT max(id) FROM sq.u) "
+                     "SELECT id FROM local.sq.t WHERE id IN (SELECT id FROM local.sq.u) AND id < (SELECT max(id) FROM "
+                     "local.sq.u) "
                      "ORDER BY id;") == ids_t{2});
     });
 }
@@ -98,19 +98,21 @@ TEST_CASE("session sub-query: prepared statements carry their sub-queries", "[su
         seed(s, id);
 
         std::string prepare_err;
-        auto prepared = run_session_prepared(s,
-                                             id++,
-                                             "SELECT id FROM sq.t WHERE id IN (SELECT id FROM sq.u) ORDER BY id;",
-                                             prepare_err);
+        auto prepared =
+            run_session_prepared(s,
+                                 id++,
+                                 "SELECT id FROM local.sq.t WHERE id IN (SELECT id FROM local.sq.u) ORDER BY id;",
+                                 prepare_err);
         INFO(prepare_err << (prepared.has_error() ? prepared.error().what.c_str() : ""));
         REQUIRE_FALSE(prepared.has_error());
         CHECK(first_column(prepared.value().chunks) == ids_t{2, 3});
 
         const session_hash_t bound_id = id++;
-        auto parsed = prepare_session_sql(s,
-                                          bound_id,
-                                          "SELECT id FROM sq.t WHERE id IN (SELECT id FROM sq.u WHERE id > $1) "
-                                          "ORDER BY id;");
+        auto parsed =
+            prepare_session_sql(s,
+                                bound_id,
+                                "SELECT id FROM local.sq.t WHERE id IN (SELECT id FROM local.sq.u WHERE id > $1) "
+                                "ORDER BY id;");
         INFO((parsed.has_error() ? parsed.error().what.c_str() : ""));
         REQUIRE_FALSE(parsed.has_error());
         std::pmr::vector<components::vector::vector_t> params(s.resource);
@@ -127,9 +129,9 @@ TEST_CASE("session sub-query: DML with an IN sub-query touches the selected rows
         session_hash_t id = 14300;
         seed(s, id);
 
-        run_session_or_fail(s, id++, "DELETE FROM sq.t WHERE id IN (SELECT id FROM sq.u);");
-        CHECK(engine_row_count(s, "sq", "t") == 2);
-        CHECK(ids_of(s, id++, "SELECT id FROM sq.t ORDER BY id;") == ids_t{1, 4});
+        run_session_or_fail(s, id++, "DELETE FROM local.sq.t WHERE id IN (SELECT id FROM local.sq.u);");
+        CHECK(engine_row_count(s, "local.sq", "t") == 2);
+        CHECK(ids_of(s, id++, "SELECT id FROM local.sq.t ORDER BY id;") == ids_t{1, 4});
     });
 }
 
@@ -143,7 +145,7 @@ TEST_CASE("session sub-query: a sub-query relation the engine lacks fails the pr
         auto prepared = prepare_session_sql(
             s,
             id++,
-            "SELECT id FROM sq.t WHERE id = $1 AND id IN (SELECT id FROM sq.not_there);");
+            "SELECT id FROM local.sq.t WHERE id = $1 AND id IN (SELECT id FROM local.sq.not_there);");
         REQUIRE(prepared.has_error());
         CHECK(prepared.error().type == core::error_code_t::table_not_exists);
     });
@@ -159,7 +161,9 @@ TEST_CASE("session sub-query: a scalar sub-query column of a parameterized state
 
         const session_hash_t stmt = id++;
         auto prepared =
-            prepare_session_sql(s, stmt, "SELECT id, (SELECT max(id) FROM sq.u) AS top FROM sq.t WHERE id = $1;");
+            prepare_session_sql(s,
+                                stmt,
+                                "SELECT id, (SELECT max(id) FROM local.sq.u) AS top FROM local.sq.t WHERE id = $1;");
         INFO((prepared.has_error() ? prepared.error().what.c_str() : ""));
         REQUIRE_FALSE(prepared.has_error());
         REQUIRE(prepared.value().parameter_count == 1);

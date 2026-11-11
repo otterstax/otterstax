@@ -39,7 +39,6 @@ using otterstax::test::stack_options_t;
 using otterstax::test::stmt;
 
 namespace {
-
     using namespace std::chrono_literals;
 
     stack_options_t mock_options(mysql::connector_factory mysql_factory, otterstax::session::parser_factory_fn parser) {
@@ -54,11 +53,11 @@ namespace {
         auto [ns, fut] = actor_zeta::send(s.session, &query_session_t::execute, stmt(1), sql);
         return await_session(std::move(fut), 10000ms, s.resource);
     }
-
 } // namespace
 
 TEST_CASE("pipeline: a remote SELECT runs through the MySQL backend and the engine") {
-    session_stack_owner owner("/tmp/test_pipeline_base", mock_options(&mysql_mock_connector_factory, &make_mock_parser));
+    session_stack_owner owner("/tmp/test_pipeline_base",
+                              mock_options(&mysql_mock_connector_factory, &make_mock_parser));
     auto r = execute(owner.stack(), "SELECT 1 AS test");
     INFO((r.has_error() ? r.error().what.c_str() : ""));
     REQUIRE_FALSE(r.has_error());
@@ -115,7 +114,7 @@ TEST_CASE("pipeline: a JOIN over two servers reads each through the federation a
     // Each mock discovered its table `table` (id, name) and answers rows
     // (1, name_0), (2, name_1).
     auto r = execute(owner.stack(),
-                     "SELECT c.id, p.name FROM campaigns.db.public.\"table\" c JOIN products.pgdb.public.\"table\" p "
+                     "SELECT c.id, p.name FROM campaigns.db.\"table\" c JOIN products.public.\"table\" p "
                      "ON c.id = p.id;");
     INFO((r.has_error() ? r.error().what.c_str() : ""));
     REQUIRE_FALSE(r.has_error());
@@ -177,11 +176,12 @@ TEST_CASE("describe: a SELECT is described by the engine, its parameters typed")
     REQUIRE(otterstax::test::run_session_sql(s, 1, "CREATE DATABASE db1;", err));
     REQUIRE(otterstax::test::run_session_sql(s,
                                              2,
-                                             "CREATE TABLE db1.public.campaigns (campaign_id BIGINT, campaign_name "
+                                             "CREATE TABLE local.db1.campaigns (campaign_id BIGINT, campaign_name "
                                              "STRING, budget DOUBLE);",
                                              err));
 
-    auto described = prepare_session_sql(s, 3, "SELECT campaign_name, budget FROM db1.public.campaigns WHERE campaign_id = $1;");
+    auto described =
+        prepare_session_sql(s, 3, "SELECT campaign_name, budget FROM local.db1.campaigns WHERE campaign_id = $1;");
     INFO((described.has_error() ? described.error().what.c_str() : ""));
     REQUIRE_FALSE(described.has_error());
     const auto& schema = described.value().schema;
@@ -217,7 +217,7 @@ TEST_CASE("describe: a SELECT of a connection's table is typed from its catalog 
     session_stack_owner owner(otterstax::test::unique_test_dir("/tmp/test_describe_seq_remote"), options);
     const auto s = owner.stack();
 
-    auto described = prepare_session_sql(s, 1, "SELECT id, name FROM products.pgdb.public.\"table\";");
+    auto described = prepare_session_sql(s, 1, "SELECT id, name FROM products.public.\"table\";");
     INFO((described.has_error() ? described.error().what.c_str() : ""));
     REQUIRE_FALSE(described.has_error());
     const auto& schema = described.value().schema;

@@ -43,7 +43,7 @@ import sys
 
 from config import get_host, MYSQL_PORT
 
-DB = "mysql_wire_proto"          # a schema of the session's database, main
+DB = "mysql_wire_proto"          # a schema of the local database
 PLAIN = "plain"
 WIDE = "wide"
 UWIDE = "uwide"
@@ -52,6 +52,11 @@ ROWS = 3
 CLIENT_PROTOCOL_41 = 0x00000200
 CLIENT_SECURE_CONNECTION = 0x00008000
 CLIENT_PLUGIN_AUTH = 0x00080000
+CLIENT_CONNECT_WITH_DB = 0x00000008
+
+# The handshake's database is the session's place: without it a session has no
+# place and one- and two-part names are refused
+PLACE = "local"
 
 COM_QUIT = 0x01
 COM_QUERY = 0x03
@@ -107,10 +112,12 @@ class MysqlWire:
     def handshake(self, user):
         greeting = self.read_packet()
         assert greeting[0] == 10, f"expected HandshakeV10, got protocol {greeting[0]}"
-        flags = CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION | CLIENT_PLUGIN_AUTH
+        flags = (CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION | CLIENT_PLUGIN_AUTH
+                 | CLIENT_CONNECT_WITH_DB)
         response = struct.pack("<IIB", flags, 16 * 1024 * 1024, 33) + b"\x00" * 23
         response += user.encode() + b"\x00"
         response += b"\x00"                        # empty auth response (1-byte length)
+        response += PLACE.encode() + b"\x00"       # database: the session's place
         response += b"mysql_native_password\x00"
         self.send_packet(response, 1)
         ok = self.read_packet()

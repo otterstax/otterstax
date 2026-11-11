@@ -1,6 +1,7 @@
 -- Step 3a: ENUM + composite types + a local table — fully on the engine,
--- no external backends needed. `otter` is a schema of the session's database
--- (`main`): `otter.warehouses` is main.otter.warehouses.
+-- no external backends needed. `otter` is a schema of the local database:
+-- `CREATE SCHEMA otter` always lands in `local`, so the table is
+-- `local.otter.warehouses`.
 CREATE SCHEMA otter;
 
 CREATE TYPE tier_t AS ENUM('bronze','silver','gold');
@@ -23,7 +24,7 @@ CREATE TYPE spec_t AS (
   photo             STRING
 );
 
-CREATE TABLE otter.warehouses (
+CREATE TABLE local.otter.warehouses (
   warehouse_id  STRING,
   code          STRING,        -- e.g. "TLV-1" / "BER-1" / "NYC-1"
   tier          tier_t,

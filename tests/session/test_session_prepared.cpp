@@ -34,7 +34,6 @@ using otterstax::test::stmt;
 using otterstax::test::with_session_stack;
 
 namespace {
-
     constexpr const char* kUnknown = "prepared statement does not exist";
 
     std::pmr::vector<components::vector::vector_t> no_parameters(const session_stack& s) {
@@ -53,11 +52,10 @@ namespace {
         REQUIRE(std::string{r.error().what.c_str()} == kUnknown);
     }
 
-    core::result_wrapper_t<session_payload> send_and_await(const session_stack& s,
-                                                           actor_zeta::unique_future<query_session_t::session_result> fut) {
+    core::result_wrapper_t<session_payload>
+    send_and_await(const session_stack& s, actor_zeta::unique_future<query_session_t::session_result> fut) {
         return otterstax::test::await_session(std::move(fut), std::chrono::milliseconds(10000), s.resource);
     }
-
 } // namespace
 
 TEST_CASE("session prepared: a statement runs any number of times") {
@@ -100,8 +98,8 @@ TEST_CASE("session prepared: a failed execute keeps the entry") {
         CHECK(failed.error().type == core::error_code_t::table_not_exists);
         REQUIRE_FALSE(
             run_session_sql_payload(s, id++, "CREATE TABLE dmldb.people (id bigint, name string);").has_error());
-        REQUIRE_FALSE(run_session_sql_payload(s, id++, "INSERT INTO dmldb.people (id, name) VALUES (1, 'a');")
-                          .has_error());
+        REQUIRE_FALSE(
+            run_session_sql_payload(s, id++, "INSERT INTO dmldb.people (id, name) VALUES (1, 'a');").has_error());
         auto rerun = execute_session_statement(s, stmt);
         INFO("re-execute error: " << rerun.error().what.c_str());
         REQUIRE_FALSE(rerun.has_error());
@@ -236,7 +234,7 @@ TEST_CASE("session direct execute: a statement with placeholders and no Bind is 
             REQUIRE(r.error().type == core::error_code_t::invalid_parameter);
             REQUIRE(std::string{r.error().what.c_str()}.find("no values bound") != std::string::npos);
         }
-        REQUIRE(engine_row_count(s, "dmldb", "people") == 3);
+        REQUIRE(engine_row_count(s, "local.dmldb", "people") == 3);
     });
 }
 
@@ -273,7 +271,7 @@ TEST_CASE("session prepared: RETURNING is described by the engine") {
         CHECK(schema.child_types()[0].type() == components::types::logical_type::BIGINT);
         CHECK(schema.child_types()[1].alias() == "name");
         // The describe wrote nothing.
-        REQUIRE(engine_row_count(s, "dmldb", "people") == 3);
+        REQUIRE(engine_row_count(s, "local.dmldb", "people") == 3);
     });
 }
 
@@ -344,7 +342,8 @@ TEST_CASE("session prepared: a window answers a page at a time") {
         REQUIRE(opened.value().has_more);
         auto [ns5, fut5] = actor_zeta::send(s.session, &query_session_t::close_window, opened.value().portal);
         REQUIRE_FALSE(send_and_await(s, std::move(fut5)).has_error());
-        auto [ns6, fut6] = actor_zeta::send(s.session, &query_session_t::fetch_window, opened.value().portal, uint64_t{1});
+        auto [ns6, fut6] =
+            actor_zeta::send(s.session, &query_session_t::fetch_window, opened.value().portal, uint64_t{1});
         CHECK(send_and_await(s, std::move(fut6)).has_error());
     });
 }

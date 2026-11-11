@@ -31,7 +31,7 @@ import pymysql
 
 import config
 
-SCHEMA = "txn_mysql_wire"              # a schema of the session's database, main
+SCHEMA = "txn_mysql_wire"              # a schema of local, the clients' own database
 TABLE = "items"
 QUALIFIED = f"{SCHEMA}.{TABLE}"
 SERVER_STATUS_IN_TRANS = 0x0001
@@ -51,7 +51,7 @@ class MySqlWireTransactionTest:
 
     def connect(self, autocommit=True):
         return pymysql.connect(host=self.host, port=config.MYSQL_PORT, user="testuser",
-                               password="testpass", autocommit=autocommit)
+                               password="testpass", database="local", autocommit=autocommit)
 
     def ids(self, conn, low, high):
         """The ids in [low, high] the connection sees, sorted."""

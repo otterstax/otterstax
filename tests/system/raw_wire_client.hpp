@@ -24,14 +24,12 @@
 #include <vector>
 
 namespace otterstax::test::wire {
-
     // Upper bound on how long the server may take to act on a trigger.
     constexpr auto SERVER_REACTION = std::chrono::seconds(5);
 
     // Milliseconds since `from`, for the diagnostics that accompany a missed deadline.
     inline long long since_ms(std::chrono::steady_clock::time_point from) {
-        return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - from)
-            .count();
+        return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - from).count();
     }
 
     // A blocking client on its own io_context; nothing here touches the server's pool.
@@ -173,6 +171,29 @@ namespace otterstax::test::wire {
         REQUIRE(ok[0] == 0x00);
     }
 
+    // The same, with the connection's database (the session's place): CLIENT_CONNECT_WITH_DB.
+    inline void mysql_handshake_in(raw_client& client, const std::string& database) {
+        mysql_read_handshake(client);
+
+        auto resp = mysql_handshake_response_head();
+        const uint32_t flags = frontend::mysql::CLIENT_PROTOCOL_41 | frontend::mysql::CLIENT_SECURE_CONNECTION |
+                               0x8; // CLIENT_CONNECT_WITH_DB
+        for (int i = 0; i < 4; ++i) {
+            resp[i] = static_cast<uint8_t>((flags >> (8 * i)) & 0xFF);
+        }
+        const std::string user = "test";
+        resp.insert(resp.end(), user.begin(), user.end());
+        resp.push_back(0);
+        resp.push_back(0); // auth length
+        resp.insert(resp.end(), database.begin(), database.end());
+        resp.push_back(0);
+        client.write(mysql_frame(1, resp));
+
+        auto ok = mysql_read_packet(client);
+        REQUIRE(!ok.empty());
+        REQUIRE(ok[0] == 0x00);
+    }
+
     // ---- PostgreSQL wire ----------------------------------------------------
 
     // [type:1][length:4 incl. itself][payload]
@@ -259,8 +280,7 @@ namespace otterstax::test::wire {
 
     // AuthenticationOk, ParameterStatus..., BackendKeyData, ReadyForQuery.
     inline void pg_startup(raw_client& client) {
-        const auto answer = pg_startup_answer(client, {{"user", "test"}, {"database", "main"}});
+        const auto answer = pg_startup_answer(client, {{"user", "test"}, {"database", "local"}});
         REQUIRE(answer.back().type == 'Z');
     }
-
 } // namespace otterstax::test::wire

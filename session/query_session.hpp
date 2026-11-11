@@ -20,9 +20,8 @@
 
 #include <atomic>
 #include <cassert>
-#include <functional>
-#include <vector>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <memory_resource>
 #include <optional>
@@ -30,6 +29,7 @@
 #include <string>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 // The external-table and Kafka route types stay forward-declared: pulling them
 // in would drag Arrow's S3 filesystem and the parser AST into every frontend
@@ -42,8 +42,16 @@ namespace otterstax::kafka {
 }
 
 namespace otterstax::session {
-
     class session_factory_t;
+
+    // What a client's "database" is: a catalog (PostgreSQL, FlightSQL) — a connection of
+    // config.yaml — or a schema (MySQL, Spark), a namespace of `local`. CREATE / DROP
+    // DATABASE follow it.
+    enum class database_term_t
+    {
+        catalog,
+        schema
+    };
 
     // Everything a session sends to besides itself: the engine dispatcher
     // (runtime::engine_t::dispatcher_address(), the address every request of
@@ -70,8 +78,6 @@ namespace otterstax::session {
         // KafkaManager::object_names(): the KafkaManager outlives every session.
         const otterstax::kafka::kafka_object_names_t* kafka_objects{nullptr};
         std::vector<otterstax::catalog::configured_connection_t> connections;
-        // The connections' names, as config.yaml spells them (the guard's).
-        std::vector<std::string> aliases;
     };
 
     // What every query session sends to, complete: an empty address, or
@@ -91,7 +97,9 @@ namespace otterstax::session {
     // vector (components::vector::make_scalar / make_null).
     inline components::vector::data_chunk_t parameter_row(std::pmr::memory_resource* resource,
                                                           std::pmr::vector<components::vector::vector_t> values) {
-        components::vector::data_chunk_t row(resource, std::pmr::vector<components::types::complex_logical_type>{resource}, 1);
+        components::vector::data_chunk_t row(resource,
+                                             std::pmr::vector<components::types::complex_logical_type>{resource},
+                                             1);
         row.data.reserve(values.size());
         for (auto& value : values) {
             row.data.push_back(std::move(value));
@@ -167,7 +175,8 @@ namespace otterstax::session {
                         actor_zeta::scheduler_raw scheduler,
                         std::unique_ptr<IParser> parser,
                         session_services_t services,
-                        session_factory_t* factory);
+                        session_factory_t* factory,
+                        database_term_t term = database_term_t::catalog);
         ~query_session_t();
 
         std::pmr::memory_resource* resource() const noexcept { return resource_; }
@@ -186,22 +195,22 @@ namespace otterstax::session {
         }
 
         unique_future<session_result> execute(statement_id_t id, std::string sql);
+        // Places the session where its client named (a StartupMessage's database, USE, Spark's current database):
+        // the SET search_path of catalog::client_place, or its database_not_exists.
+        unique_future<session_result> use(statement_id_t id, std::string named);
         // Runs the prepared statement `id` without values (one without `$n`).
         unique_future<session_result> execute_statement(statement_id_t id);
         // Binds row `row` of `parameters` into the prepared statement — column i
         // is `$<i+1>`, one row is one set of values — and runs it.
-        unique_future<session_result> execute_prepared_statement(statement_id_t id,
-                                                                 components::vector::data_chunk_t parameters,
-                                                                 uint64_t row);
+        unique_future<session_result>
+        execute_prepared_statement(statement_id_t id, components::vector::data_chunk_t parameters, uint64_t row);
         // As execute_prepared_statement, answering at most `window` rows
         // (execution_plan_t::fetch_window, `window` > 0); while more may follow
         // the payload names the engine's portal (`portal`, `has_more`), read on
         // with fetch_window and closed with close_window. In autocommit any
         // other statement of the session closes it first (the engine's rule).
-        unique_future<session_result> execute_window(statement_id_t id,
-                                                     components::vector::data_chunk_t parameters,
-                                                     uint64_t row,
-                                                     uint64_t window);
+        unique_future<session_result>
+        execute_window(statement_id_t id, components::vector::data_chunk_t parameters, uint64_t row, uint64_t window);
         // The next `count` rows of a window (components::logical_plan::fetch_all:
         // every row left), answered as execute_window answers.
         unique_future<session_result> fetch_window(uint64_t portal, uint64_t count);
@@ -214,9 +223,8 @@ namespace otterstax::session {
         // The describe of the prepared statement `id` with row `row` of
         // `parameters` bound (a `$n` keeps its value's type): a PostgreSQL
         // Describe of a portal; nothing runs, nothing is kept.
-        unique_future<session_result> describe_bound(statement_id_t id,
-                                                     components::vector::data_chunk_t parameters,
-                                                     uint64_t row);
+        unique_future<session_result>
+        describe_bound(statement_id_t id, components::vector::data_chunk_t parameters, uint64_t row);
         // Forgets a prepared statement; idempotent.
         unique_future<session_result> close_statement(statement_id_t id);
         // Pre-built plans (the Spark Connect frontend translates a DataFrame
@@ -248,7 +256,8 @@ namespace otterstax::session {
                                                             &query_session_t::close_statement,
                                                             &query_session_t::execute_plan,
                                                             &query_session_t::prepare_plan,
-                                                            &query_session_t::fail_transaction>;
+                                                            &query_session_t::fail_transaction,
+                                                            &query_session_t::use>;
 
         actor_zeta::behavior_t behavior(actor_zeta::mailbox::message* msg);
 
@@ -297,6 +306,8 @@ namespace otterstax::session {
         log_t log_;
         std::unique_ptr<IParser> parser_;
         session_services_t services_;
+        // What this client's "database" is (plan::place_namespace_ddl).
+        database_term_t term_;
         session_factory_t* factory_;
         components::session::session_id_t engine_session_;
         std::pmr::unordered_map<statement_id_t, prepared_t> prepared_;
@@ -356,7 +367,11 @@ namespace otterstax::session {
         // What the engine is asked of a statement: to run it (holding the
         // answer to the shape its root owes, otterstax::engine::execute_statement)
         // or to describe it.
-        enum class engine_call_t : std::uint8_t { execute, describe };
+        enum class engine_call_t : std::uint8_t
+        {
+            execute,
+            describe
+        };
 
         // The one road of a statement to the engine, every entry's: `data` sent
         // on the connection's session as `call` asks (`window` for a run), its
@@ -425,15 +440,17 @@ namespace otterstax::session {
         // registered with the Kafka manager (its object names, read under their
         // lock: no message) and the name, its empty slots filled
         // from the session's place (SELECT current_database(), current_schema()
-        // on the connection's engine session), main.kafka.<object>.
+        // on the connection's engine session), local.kafka.<object>.
         unique_future<bool> names_kafka_object(qualified_name_t target);
 
-        // The session's place as the engine has it: SELECT current_database(),
-        // current_schema() on the connection's engine session. The engine names
-        // no connection here (a place that is a connection's database answers
-        // its database alone). nullopt when it cannot be read — a failed block
-        // refuses the query.
+        // The session's place as the engine has it: its database and schema
+        // (current_database(), current_schema()) and, for a place in a
+        // connection, the connection (the first part of the full place the
+        // engine keeps as search_path, connection.database.schema). nullopt when
+        // it cannot be read or the session has none — a failed block refuses
+        // the query.
         struct place_t {
+            std::string connection; // '' for a local place
             std::string database;
             std::string schema;
         };
@@ -447,9 +464,8 @@ namespace otterstax::session {
         // connection's table (four parts) in autocommit. COPY runs its query
         // here and hands the result to the file / s3 manager to write. Neither
         // produces rows: success is an empty payload under the statement's `tag`.
-        unique_future<session_result> load_external_table(statement_id_t id,
-                                                          const otterstax::external::external_node_t& ext,
-                                                          NodeTag tag);
+        unique_future<session_result>
+        load_external_table(statement_id_t id, const otterstax::external::external_node_t& ext, NodeTag tag);
         unique_future<session_result>
         copy_to(statement_id_t id, const otterstax::external::external_node_t& ext, NodeTag tag);
     };
@@ -465,5 +481,4 @@ namespace otterstax::session {
 
     // The owner's handle of one session: dropping it closes the session.
     using session_ptr = std::unique_ptr<query_session_t, session_closer_t>;
-
 } // namespace otterstax::session

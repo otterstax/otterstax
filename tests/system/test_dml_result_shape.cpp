@@ -17,8 +17,8 @@
 // The 0-row DELETE case covers the batch invariant: an empty result is one
 // empty chunk, never no chunks, because column_count() reads chunks.front().
 
-#include "session_stack.hpp"
 #include "../mock/cell.hpp"
+#include "session_stack.hpp"
 
 #include <catch2/catch_all.hpp>
 
@@ -35,12 +35,11 @@ using otterstax::test::prepare_session_sql;
 using otterstax::test::run_session_prepared;
 using otterstax::test::run_session_sql;
 using otterstax::test::run_session_sql_payload;
-using otterstax::test::session_stack;
 using otterstax::test::seed_people_bulk;
+using otterstax::test::session_stack;
 using otterstax::test::with_session_stack;
 
 namespace {
-
     // Fresh db.table with one bigint and one STRING column, `rows` rows.
     void seed_people(const session_stack& s, session_hash_t& id, size_t rows) {
         std::string err;
@@ -62,7 +61,6 @@ namespace {
     // More rows than one DEFAULT_VECTOR_CAPACITY chunk holds: the engine's
     // affected count (cursor affected_rows()) is not bounded by a chunk.
     constexpr size_t kMultiChunkRows = 2500;
-
 } // namespace
 
 TEST_CASE("local DELETE returns an affected count, not table columns") {
@@ -133,7 +131,7 @@ TEST_CASE("local DELETE spanning several chunks returns the whole count without 
     with_session_stack("/tmp/test_dml_shape_delete_multichunk", [](session_stack s) {
         session_hash_t id = 7600;
         seed_people_bulk(s, id, kMultiChunkRows);
-        REQUIRE(engine_row_count(s, "dmldb", "people") == kMultiChunkRows);
+        REQUIRE(engine_row_count(s, "local.dmldb", "people") == kMultiChunkRows);
 
         auto r = run_session_sql_payload(s, id++, "DELETE FROM dmldb.people WHERE id > 0;");
         INFO("DELETE error: " << r.error().what.c_str());
@@ -148,7 +146,7 @@ TEST_CASE("local DELETE spanning several chunks returns the whole count without 
         for (const auto& chunk : payload.chunks) {
             REQUIRE(chunk.column_count() == 0);
         }
-        REQUIRE(engine_row_count(s, "dmldb", "people") == 0);
+        REQUIRE(engine_row_count(s, "local.dmldb", "people") == 0);
     });
 }
 
@@ -169,7 +167,7 @@ TEST_CASE("local UPDATE spanning several chunks returns the whole count without 
         for (const auto& chunk : payload.chunks) {
             REQUIRE(chunk.column_count() == 0);
         }
-        REQUIRE(engine_row_count(s, "dmldb", "people") == kMultiChunkRows);
+        REQUIRE(engine_row_count(s, "local.dmldb", "people") == kMultiChunkRows);
     });
 }
 
@@ -234,7 +232,7 @@ TEST_CASE("EXPLAIN DELETE is refused by the query session and deletes nothing") 
         REQUIRE(r.has_error());
         REQUIRE(r.error().type == core::error_code_t::unimplemented_yet);
 
-        REQUIRE(engine_row_count(s, "dmldb", "people") == 3);
+        REQUIRE(engine_row_count(s, "local.dmldb", "people") == 3);
     });
 }
 
@@ -251,7 +249,6 @@ TEST_CASE("EXPLAIN DELETE is refused by the query session and deletes nothing") 
 // The FOREIGN KEY case below drives a constraint down both routes.
 
 namespace {
-
     using parameters_t = std::pmr::vector<components::vector::vector_t>;
 
     // The statement ran: `rows` is the payload's reported rows (its row count,
@@ -291,7 +288,6 @@ namespace {
         std::sort(ids.begin(), ids.end());
         return ids;
     }
-
 } // namespace
 
 TEST_CASE("constraints: CHECK on INSERT and UPDATE through a query session") {
@@ -313,10 +309,9 @@ TEST_CASE("constraints: CHECK on INSERT and UPDATE through a query session") {
         require_refused(run_session_sql_payload(s, id++, "INSERT INTO cdb.checked (id, qty) VALUES (2, -1);"),
                         core::error_code_t::check_violation,
                         unnamed);
-        require_refused(
-            run_session_prepared(s, id++, "INSERT INTO cdb.checked (id, qty) VALUES (3, -2)", prepare_err),
-            core::error_code_t::check_violation,
-            unnamed);
+        require_refused(run_session_prepared(s, id++, "INSERT INTO cdb.checked (id, qty) VALUES (3, -2)", prepare_err),
+                        core::error_code_t::check_violation,
+                        unnamed);
         require_refused(run_session_sql_payload(s, id++, "UPDATE cdb.checked SET qty = -5 WHERE id = 1;"),
                         core::error_code_t::check_violation,
                         unnamed);
@@ -348,10 +343,9 @@ TEST_CASE("constraints: PRIMARY KEY duplicate through a query session") {
         session_hash_t id = 8200;
         std::string prepare_err;
         require_ran(run_session_sql_payload(s, id++, "CREATE SCHEMA cdb;"), 0, 0);
-        require_ran(
-            run_session_sql_payload(s, id++, "CREATE TABLE cdb.keyed (id bigint PRIMARY KEY, name string);"),
-            0,
-            0);
+        require_ran(run_session_sql_payload(s, id++, "CREATE TABLE cdb.keyed (id bigint PRIMARY KEY, name string);"),
+                    0,
+                    0);
         require_ran(run_session_sql_payload(s, id++, "INSERT INTO cdb.keyed (id, name) VALUES (1, 'a');"), 1, 0);
 
         // The PRIMARY KEY is enforced: a duplicate key is refused on the simple
@@ -364,10 +358,9 @@ TEST_CASE("constraints: PRIMARY KEY duplicate through a query session") {
         require_refused(run_session_prepared(s, id++, "INSERT INTO cdb.keyed (id, name) VALUES (1, 'c')", prepare_err),
                         core::error_code_t::unique_violation,
                         duplicate);
-        require_refused(
-            run_session_sql_payload(s, id++, "INSERT INTO cdb.keyed (id, name) VALUES (2, 'x'), (2, 'y');"),
-            core::error_code_t::unique_violation,
-            "Otterbrix execution failed: UNIQUE constraint violated: duplicate key within write batch");
+        require_refused(run_session_sql_payload(s, id++, "INSERT INTO cdb.keyed (id, name) VALUES (2, 'x'), (2, 'y');"),
+                        core::error_code_t::unique_violation,
+                        "Otterbrix execution failed: UNIQUE constraint violated: duplicate key within write batch");
         auto keys = run_session_sql_payload(s, id++, "SELECT id, name FROM cdb.keyed;");
         require_ran(keys, 1, 2);
         REQUIRE(ids_of(keys.value()) == std::vector<std::int64_t>{1});
@@ -379,20 +372,18 @@ TEST_CASE("constraints: FOREIGN KEY on INSERT through the simple and the prepare
         session_hash_t id = 8300;
         std::string prepare_err;
         require_ran(run_session_sql_payload(s, id++, "CREATE SCHEMA cdb;"), 0, 0);
-        require_ran(
-            run_session_sql_payload(s, id++, "CREATE TABLE cdb.parent (id bigint PRIMARY KEY, name string);"),
-            0,
-            0);
-        require_ran(run_session_sql_payload(
-                        s,
-                        id++,
-                        "CREATE TABLE cdb.child (id bigint, parent_id bigint REFERENCES cdb.parent (id));"),
+        require_ran(run_session_sql_payload(s, id++, "CREATE TABLE cdb.parent (id bigint PRIMARY KEY, name string);"),
                     0,
                     0);
         require_ran(
-            run_session_sql_payload(s, id++, "INSERT INTO cdb.parent (id, name) VALUES (1, 'p1'), (2, 'p2');"),
-            2,
+            run_session_sql_payload(s,
+                                    id++,
+                                    "CREATE TABLE cdb.child (id bigint, parent_id bigint REFERENCES cdb.parent (id));"),
+            0,
             0);
+        require_ran(run_session_sql_payload(s, id++, "INSERT INTO cdb.parent (id, name) VALUES (1, 'p1'), (2, 'p2');"),
+                    2,
+                    0);
         require_ran(run_session_sql_payload(s, id++, "INSERT INTO cdb.child (id, parent_id) VALUES (10, 1);"), 1, 0);
 
         // The FOREIGN KEY is enforced on INSERT: a child naming a parent that is
@@ -457,25 +448,24 @@ TEST_CASE("constraints: FOREIGN KEY on a referencing DELETE through the simple a
         session_hash_t id = 8400;
         std::string prepare_err;
         require_ran(run_session_sql_payload(s, id++, "CREATE SCHEMA cdb;"), 0, 0);
-        require_ran(
-            run_session_sql_payload(s, id++, "CREATE TABLE cdb.parent (id bigint PRIMARY KEY, name string);"),
-            0,
-            0);
-        require_ran(run_session_sql_payload(
-                        s,
-                        id++,
-                        "CREATE TABLE cdb.child (id bigint, parent_id bigint REFERENCES cdb.parent (id));"),
+        require_ran(run_session_sql_payload(s, id++, "CREATE TABLE cdb.parent (id bigint PRIMARY KEY, name string);"),
                     0,
                     0);
-        require_ran(run_session_sql_payload(s,
-                                              id++,
-                                              "INSERT INTO cdb.parent (id, name) VALUES (1, 'p1'), (2, 'p2'), (3, 'p3');"),
-                    3,
-                    0);
         require_ran(
-            run_session_sql_payload(s, id++, "INSERT INTO cdb.child (id, parent_id) VALUES (10, 1), (20, 2);"),
-            2,
+            run_session_sql_payload(s,
+                                    id++,
+                                    "CREATE TABLE cdb.child (id bigint, parent_id bigint REFERENCES cdb.parent (id));"),
+            0,
             0);
+        require_ran(
+            run_session_sql_payload(s,
+                                    id++,
+                                    "INSERT INTO cdb.parent (id, name) VALUES (1, 'p1'), (2, 'p2'), (3, 'p3');"),
+            3,
+            0);
+        require_ran(run_session_sql_payload(s, id++, "INSERT INTO cdb.child (id, parent_id) VALUES (10, 1), (20, 2);"),
+                    2,
+                    0);
 
         // The FOREIGN KEY is enforced on the referenced side too: deleting a
         // parent a child still references is refused on both routes. The parent
@@ -508,8 +498,8 @@ TEST_CASE("constraint DDL: REFERENCES to a table that does not exist") {
         // column constraint is named in the refusal by its kind.
         require_refused(
             run_session_sql_payload(s,
-                                      id++,
-                                      "CREATE TABLE cdb.orphan (id bigint, parent_id bigint REFERENCES cdb.nope (id));"),
+                                    id++,
+                                    "CREATE TABLE cdb.orphan (id bigint, parent_id bigint REFERENCES cdb.nope (id));"),
             core::error_code_t::table_not_exists,
             "Otterbrix execution failed: FOREIGN KEY constraint: referenced relation \"cdb.nope\" does not exist");
         // The refusal left nothing behind: the table it named is not there.
@@ -519,9 +509,9 @@ TEST_CASE("constraint DDL: REFERENCES to a table that does not exist") {
         // carries the name it was declared under.
         require_refused(
             run_session_sql_payload(s,
-                                      id++,
-                                      "CREATE TABLE cdb.orphan2 (id bigint, parent_id bigint, "
-                                      "CONSTRAINT orphan2_fk FOREIGN KEY (parent_id) REFERENCES nodb.nope (id));"),
+                                    id++,
+                                    "CREATE TABLE cdb.orphan2 (id bigint, parent_id bigint, "
+                                    "CONSTRAINT orphan2_fk FOREIGN KEY (parent_id) REFERENCES nodb.nope (id));"),
             core::error_code_t::table_not_exists,
             "Otterbrix execution failed: constraint \"orphan2_fk\": referenced relation \"nodb.nope\" does not exist");
         REQUIRE(run_session_sql_payload(s, id++, "SELECT id FROM cdb.orphan2;").has_error());
@@ -554,9 +544,10 @@ TEST_CASE("constraint DDL: ALTER TABLE ADD CONSTRAINT and DROP CONSTRAINT") {
         // CREATE TABLE, and so is the drop of a constraint never declared.
         require_ran(run_session_sql_payload(s, id++, "ALTER TABLE cdb.t ADD CONSTRAINT t_pk PRIMARY KEY (id);"), 0, 0);
         require_refused(
-            run_session_sql_payload(s,
-                                      id++,
-                                      "ALTER TABLE cdb.t ADD CONSTRAINT t_fk FOREIGN KEY (qty) REFERENCES cdb.nope (id);"),
+            run_session_sql_payload(
+                s,
+                id++,
+                "ALTER TABLE cdb.t ADD CONSTRAINT t_fk FOREIGN KEY (qty) REFERENCES cdb.nope (id);"),
             core::error_code_t::table_not_exists,
             "Otterbrix execution failed: constraint \"t_fk\": referenced relation \"cdb.nope\" does not exist");
         require_refused(run_session_sql_payload(s, id++, "ALTER TABLE cdb.t DROP CONSTRAINT nope;"),
@@ -591,8 +582,7 @@ TEST_CASE("prepared matrix: WHERE and LIMIT and IN parameters") {
         }
         {
             const session_hash_t stmt = id++;
-            require_prepared(prepare_session_sql(s, stmt, "SELECT id, name FROM dmldb.people WHERE id IN ($1, $2)"),
-                             2);
+            require_prepared(prepare_session_sql(s, stmt, "SELECT id, name FROM dmldb.people WHERE id IN ($1, $2)"), 2);
             parameters_t p{s.resource};
             p.push_back(components::vector::make_scalar(s.resource, std::int64_t{1}));
             p.push_back(components::vector::make_scalar(s.resource, std::int64_t{3}));
@@ -619,7 +609,8 @@ TEST_CASE("prepared matrix: INSERT and UPDATE and DELETE parameters") {
         {
             auto r = run_session_sql_payload(s, id++, "SELECT id, name FROM dmldb.people WHERE id = 10;");
             require_ran(r, 1, 2);
-            REQUIRE(std::string{otterstax::test::cell(r.value().chunks.front(), 1, 0).value<std::string_view>()} == "ten");
+            REQUIRE(std::string{otterstax::test::cell(r.value().chunks.front(), 1, 0).value<std::string_view>()} ==
+                    "ten");
         }
         {
             const session_hash_t stmt = id++;
@@ -632,7 +623,8 @@ TEST_CASE("prepared matrix: INSERT and UPDATE and DELETE parameters") {
         {
             auto r = run_session_sql_payload(s, id++, "SELECT name FROM dmldb.people WHERE id = 10;");
             require_ran(r, 1, 1);
-            REQUIRE(std::string{otterstax::test::cell(r.value().chunks.front(), 0, 0).value<std::string_view>()} == "renamed");
+            REQUIRE(std::string{otterstax::test::cell(r.value().chunks.front(), 0, 0).value<std::string_view>()} ==
+                    "renamed");
         }
         {
             const session_hash_t stmt = id++;
@@ -657,7 +649,9 @@ TEST_CASE("prepared matrix: a NULL parameter") {
             require_prepared(prepare_session_sql(s, stmt, "INSERT INTO dmldb.people (id, name) VALUES ($1, $2)"), 2);
             parameters_t p{s.resource};
             p.push_back(components::vector::make_scalar(s.resource, std::int64_t{20}));
-            p.push_back(components::vector::make_null(s.resource, components::types::complex_logical_type{components::types::logical_type::NA}));
+            p.push_back(components::vector::make_null(
+                s.resource,
+                components::types::complex_logical_type{components::types::logical_type::NA}));
             require_ran(execute_session_prepared(s, stmt, std::move(p)), 1, 0);
         }
         auto nulls = run_session_sql_payload(s, id++, "SELECT id FROM dmldb.people WHERE name IS NULL;");
@@ -680,7 +674,9 @@ TEST_CASE("prepared matrix: WHERE id = $1 with a NULL parameter answers no rows"
         const session_hash_t stmt = id++;
         require_prepared(prepare_session_sql(s, stmt, "SELECT id FROM dmldb.people WHERE id = $1"), 1);
         parameters_t p{s.resource};
-        p.push_back(components::vector::make_null(s.resource, components::types::complex_logical_type{components::types::logical_type::NA}));
+        p.push_back(components::vector::make_null(
+            s.resource,
+            components::types::complex_logical_type{components::types::logical_type::NA}));
         auto r = execute_session_prepared(s, stmt, std::move(p));
         require_ran(r, 0, 1);
         REQUIRE(r.value().chunks.front().types()[0].alias() == "id");
@@ -761,8 +757,7 @@ TEST_CASE("prepared matrix: a parameterized SELECT is prepared from the engine's
         // same, so there is nothing for the frontend's check to refuse here
         // either.
         const session_hash_t shift_stmt = id++;
-        auto shifted =
-            prepare_session_sql(s, shift_stmt, "SELECT id + $1 AS shifted FROM dmldb.people WHERE id = 2");
+        auto shifted = prepare_session_sql(s, shift_stmt, "SELECT id + $1 AS shifted FROM dmldb.people WHERE id = 2");
         require_prepared(shifted, 1);
         REQUIRE(shifted.value().schema.child_types().size() == 1);
         INFO("described shifted: " << static_cast<int>(shifted.value().schema.child_types()[0].type()));
@@ -771,8 +766,7 @@ TEST_CASE("prepared matrix: a parameterized SELECT is prepared from the engine's
         sp.push_back(components::vector::make_scalar(s.resource, std::int64_t{10}));
         auto shift_ran = execute_session_prepared(s, shift_stmt, std::move(sp));
         require_ran(shift_ran, 1, 1);
-        REQUIRE(shift_ran.value().chunks.front().types()[0].type() ==
-                shifted.value().schema.child_types()[0].type());
+        REQUIRE(shift_ran.value().chunks.front().types()[0].type() == shifted.value().schema.child_types()[0].type());
 
         // A DML answers an affected count, which has no result schema —
         // placeholders or not.
@@ -877,8 +871,10 @@ TEST_CASE("prepared matrix: a set operation is described from its first branch")
 
         // With one, executed under that very description: same width, same type.
         const session_hash_t stmt = id++;
-        auto parameterized = prepare_session_sql(
-            s, stmt, "SELECT id FROM dmldb.people WHERE id = $1 UNION ALL SELECT id FROM dmldb.tags");
+        auto parameterized =
+            prepare_session_sql(s,
+                                stmt,
+                                "SELECT id FROM dmldb.people WHERE id = $1 UNION ALL SELECT id FROM dmldb.tags");
         require_prepared(parameterized, 1);
         REQUIRE(parameterized.value().schema.type() == components::types::logical_type::STRUCT);
         REQUIRE(parameterized.value().schema.child_types().size() == 1);
@@ -969,7 +965,6 @@ TEST_CASE("session_payload: the accessors stay defined on an emptied batch") {
     REQUIRE(payload.empty());
 }
 
-
 // A DML with RETURNING answers ROWS, so it HAS a result schema and the prepare
 // must describe it. NoData is not an available answer: it states that the
 // statement returns no rows, and the clients that live by a statement's
@@ -986,7 +981,7 @@ TEST_CASE("prepared matrix: a DML with RETURNING is described from its target co
     with_session_stack("/tmp/test_dml_returning_describe", [](session_stack s) {
         session_hash_t id = 9300;
         seed_people(s, id, 3);
-        REQUIRE(engine_row_count(s, "dmldb", "people") == 3);
+        REQUIRE(engine_row_count(s, "local.dmldb", "people") == 3);
 
         const auto bigint = components::types::logical_type::BIGINT;
         const auto text = components::types::logical_type::STRING_LITERAL;
@@ -996,8 +991,10 @@ TEST_CASE("prepared matrix: a DML with RETURNING is described from its target co
         // types the target table carries them by.
         {
             const session_hash_t stmt = id++;
-            auto prepared = prepare_session_sql(
-                s, stmt, "INSERT INTO dmldb.people (id, name) VALUES (60, 'sixty') RETURNING id, name");
+            auto prepared =
+                prepare_session_sql(s,
+                                    stmt,
+                                    "INSERT INTO dmldb.people (id, name) VALUES (60, 'sixty') RETURNING id, name");
             require_prepared(prepared, 0);
             const auto& schema = prepared.value().schema;
             REQUIRE(schema.type() == structure);
@@ -1008,7 +1005,7 @@ TEST_CASE("prepared matrix: a DML with RETURNING is described from its target co
             REQUIRE(schema.child_types()[1].type() == text);
 
             // Describing wrote nothing: the row is still not in the table.
-            REQUIRE(engine_row_count(s, "dmldb", "people") == 3);
+            REQUIRE(engine_row_count(s, "local.dmldb", "people") == 3);
 
             // ...and the execution answers exactly the shape that was described,
             // so the frontend's check on it has nothing to refuse.
@@ -1021,7 +1018,7 @@ TEST_CASE("prepared matrix: a DML with RETURNING is described from its target co
                                << ", executed " << static_cast<int>(executed[i].type()));
                 REQUIRE(executed[i].type() == schema.child_types()[i].type());
             }
-            REQUIRE(engine_row_count(s, "dmldb", "people") == 4);
+            REQUIRE(engine_row_count(s, "local.dmldb", "people") == 4);
         }
 
         // RETURNING * is the target's own columns, in its own order — what the
@@ -1040,11 +1037,11 @@ TEST_CASE("prepared matrix: a DML with RETURNING is described from its target co
             REQUIRE(schema.child_types()[1].alias() == "name");
             REQUIRE(schema.child_types()[0].type() == bigint);
             REQUIRE(schema.child_types()[1].type() == text);
-            REQUIRE(engine_row_count(s, "dmldb", "people") == 4);
+            REQUIRE(engine_row_count(s, "local.dmldb", "people") == 4);
 
             auto ran = execute_session_statement(s, stmt);
             require_ran(ran, 1, 2);
-            REQUIRE(engine_row_count(s, "dmldb", "people") == 5);
+            REQUIRE(engine_row_count(s, "local.dmldb", "people") == 5);
         }
 
         // An output alias renames the column but does not retype it: the type is
@@ -1052,17 +1049,19 @@ TEST_CASE("prepared matrix: a DML with RETURNING is described from its target co
         {
             const session_hash_t stmt = id++;
             auto prepared =
-                prepare_session_sql(s, stmt, "INSERT INTO dmldb.people (id, name) VALUES (62, 'two') RETURNING id AS pk");
+                prepare_session_sql(s,
+                                    stmt,
+                                    "INSERT INTO dmldb.people (id, name) VALUES (62, 'two') RETURNING id AS pk");
             require_prepared(prepared, 0);
             const auto& schema = prepared.value().schema;
             REQUIRE(schema.type() == structure);
             REQUIRE(schema.child_types().size() == 1);
             REQUIRE(schema.child_types()[0].alias() == "pk");
             REQUIRE(schema.child_types()[0].type() == bigint);
-            REQUIRE(engine_row_count(s, "dmldb", "people") == 5);
+            REQUIRE(engine_row_count(s, "local.dmldb", "people") == 5);
 
             require_ran(execute_session_statement(s, stmt), 1, 1);
-            REQUIRE(engine_row_count(s, "dmldb", "people") == 6);
+            REQUIRE(engine_row_count(s, "local.dmldb", "people") == 6);
         }
 
         // UPDATE and DELETE are described the same way, and describing them
@@ -1087,15 +1086,14 @@ TEST_CASE("prepared matrix: a DML with RETURNING is described from its target co
         }
         {
             const session_hash_t stmt = id++;
-            auto prepared =
-                prepare_session_sql(s, stmt, "DELETE FROM dmldb.people WHERE id = 61 RETURNING id, name");
+            auto prepared = prepare_session_sql(s, stmt, "DELETE FROM dmldb.people WHERE id = 61 RETURNING id, name");
             require_prepared(prepared, 0);
             REQUIRE(prepared.value().schema.type() == structure);
             REQUIRE(prepared.value().schema.child_types().size() == 2);
-            REQUIRE(engine_row_count(s, "dmldb", "people") == 6);
+            REQUIRE(engine_row_count(s, "local.dmldb", "people") == 6);
 
             require_ran(execute_session_statement(s, stmt), 1, 2);
-            REQUIRE(engine_row_count(s, "dmldb", "people") == 5);
+            REQUIRE(engine_row_count(s, "local.dmldb", "people") == 5);
         }
 
         // A placeholder changes none of it: the RETURNING columns come off the
@@ -1103,15 +1101,15 @@ TEST_CASE("prepared matrix: a DML with RETURNING is described from its target co
         // the statement carries both its schema and its parameter count.
         {
             const session_hash_t stmt = id++;
-            auto prepared = prepare_session_sql(
-                s, stmt, "INSERT INTO dmldb.people (id, name) VALUES ($1, $2) RETURNING id, name");
+            auto prepared =
+                prepare_session_sql(s, stmt, "INSERT INTO dmldb.people (id, name) VALUES ($1, $2) RETURNING id, name");
             require_prepared(prepared, 2);
             const auto& schema = prepared.value().schema;
             REQUIRE(schema.type() == structure);
             REQUIRE(schema.child_types().size() == 2);
             REQUIRE(schema.child_types()[0].type() == bigint);
             REQUIRE(schema.child_types()[1].type() == text);
-            REQUIRE(engine_row_count(s, "dmldb", "people") == 5);
+            REQUIRE(engine_row_count(s, "local.dmldb", "people") == 5);
 
             parameters_t p{s.resource};
             p.push_back(components::vector::make_scalar(s.resource, std::int64_t{70}));
@@ -1122,7 +1120,7 @@ TEST_CASE("prepared matrix: a DML with RETURNING is described from its target co
             REQUIRE(executed.size() == 2);
             REQUIRE(executed[0].type() == schema.child_types()[0].type());
             REQUIRE(executed[1].type() == schema.child_types()[1].type());
-            REQUIRE(engine_row_count(s, "dmldb", "people") == 6);
+            REQUIRE(engine_row_count(s, "local.dmldb", "people") == 6);
         }
 
         // The control: the same statements WITHOUT a RETURNING clause answer an
@@ -1171,10 +1169,10 @@ TEST_CASE("prepared matrix: a self join numbers one probe per relation not per n
         // reaches it before the last distinct relation (see above).
         const session_hash_t stmt = id++;
         auto prepared = prepare_session_sql(s,
-                                              stmt,
-                                              "SELECT p1.id, t.name, p2.name FROM dmldb.people p1 "
-                                              "JOIN dmldb.tags t ON t.id = p1.id "
-                                              "JOIN dmldb.people p2 ON p2.id = p1.id WHERE p1.id = $1");
+                                            stmt,
+                                            "SELECT p1.id, t.name, p2.name FROM dmldb.people p1 "
+                                            "JOIN dmldb.tags t ON t.id = p1.id "
+                                            "JOIN dmldb.people p2 ON p2.id = p1.id WHERE p1.id = $1");
         require_prepared(prepared, 1);
         const auto& schema = prepared.value().schema;
         REQUIRE(schema.type() == components::types::logical_type::STRUCT);

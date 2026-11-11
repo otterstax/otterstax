@@ -154,7 +154,7 @@ namespace file_ext {
             // otterbrix's own refusal of a longer name (qualified_name_of)
             std::pmr::string what{"CREATE EXTERNAL TABLE: the table name has ", resource};
             what += std::to_string(stmt->name_parts);
-            what += " parts; write it as [connection.][database.][schema.]name";
+            what += " parts; write it as [connection.][namespace.]name";
             return core::error_t(core::error_code_t::sql_parse_error, std::move(what));
         }
 
@@ -178,15 +178,15 @@ namespace file_ext {
         const auto op = stmt->kind == file_stmt_kind::create_external_table
                             ? otterstax::external::external_op_t::create_external_table
                             : otterstax::external::external_op_t::copy_to;
-        return otterstax::external::make_external_node(resource,
-                                                       op,
-                                                       stmt->kind == file_stmt_kind::create_external_table
-                                                           ? otterstax::external::external_target(stmt->name,
-                                                                                                  stmt->name_parts)
-                                                           : qualified_name_t{},
-                                                       str(stmt->location),
-                                                       /*s3_alias=*/std::string{},
-                                                       str(stmt->format),
-                                                       str(stmt->inner_sql));
+        return otterstax::external::make_external_node(
+            resource,
+            op,
+            stmt->kind == file_stmt_kind::create_external_table
+                ? otterstax::external::external_target(stmt->name, stmt->name_parts)
+                : qualified_name_t{},
+            str(stmt->location),
+            /*s3_alias=*/std::string{},
+            str(stmt->format),
+            str(stmt->inner_sql));
     }
 } // namespace file_ext

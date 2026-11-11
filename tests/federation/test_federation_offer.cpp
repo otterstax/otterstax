@@ -11,7 +11,6 @@
 using namespace fedtest;
 
 namespace {
-
     struct dialect_t {
         std::string connection;
         backend_type_t kind;
@@ -57,14 +56,14 @@ namespace {
     }
 
     std::string table_of(const dialect_t& d, const std::string& name) {
-        return d.connection + ".shop.public." + name;
+        const std::string& ns = d.kind == backend_type_t::PostgreSQL ? d.schema : d.database;
+        return d.connection + "." + ns + "." + name;
     }
 
     std::string last_read(fed_stack_t& stack, const dialect_t& d) {
         const auto reads = starting_with(stack.backend(d.connection).log(), "scan ");
         return reads.empty() ? std::string{} : reads.back();
     }
-
 } // namespace
 
 TEST_CASE("offer: a SELECT block of one table is one statement of each dialect") {
@@ -75,13 +74,14 @@ TEST_CASE("offer: a SELECT block of one table is one statement of each dialect")
         INFO(d.connection);
         // The fake answers the columns the SELECT list names; the block's own answer is checked by
         // its text.
-        stack.backend(d.connection).on_scan([](const std::string& sql, std::pmr::memory_resource* resource)
-                                                -> std::optional<components::vector::data_chunk_t> {
-            if (sql.find("WHERE") == std::string::npos) {
-                return std::nullopt;
-            }
-            return chunk_of(resource, {column("id", logical_type::BIGINT)}, {{std::int64_t{2}}, {std::int64_t{3}}});
-        });
+        stack.backend(d.connection)
+            .on_scan([](const std::string& sql,
+                        std::pmr::memory_resource* resource) -> std::optional<components::vector::data_chunk_t> {
+                if (sql.find("WHERE") == std::string::npos) {
+                    return std::nullopt;
+                }
+                return chunk_of(resource, {column("id", logical_type::BIGINT)}, {{std::int64_t{2}}, {std::int64_t{3}}});
+            });
         auto cursor = stack.ok("SELECT id FROM " + table_of(d, "orders") + " WHERE amount > 10 ORDER BY id LIMIT 5;");
         CHECK(rows_of(cursor) == std::vector<std::string>{"2", "3"});
         const auto sql = last_read(stack, d);
@@ -100,16 +100,18 @@ TEST_CASE("offer: a GROUP BY block is one statement and its answer is held to ot
     stack.open();
     for (const auto& d : dialects()) {
         INFO(d.connection);
-        stack.backend(d.connection).on_scan([](const std::string& sql, std::pmr::memory_resource* resource)
-                                                -> std::optional<components::vector::data_chunk_t> {
-            if (sql.find("GROUP BY") == std::string::npos) {
-                return std::nullopt;
-            }
-            // A backend answering the sum as text (MySQL's DECIMAL of an integer SUM).
-            return chunk_of(resource,
-                            {column("note", logical_type::STRING_LITERAL), column("s", logical_type::STRING_LITERAL)},
-                            {{std::string{"a"}, std::string{"5"}}});
-        });
+        stack.backend(d.connection)
+            .on_scan([](const std::string& sql,
+                        std::pmr::memory_resource* resource) -> std::optional<components::vector::data_chunk_t> {
+                if (sql.find("GROUP BY") == std::string::npos) {
+                    return std::nullopt;
+                }
+                // A backend answering the sum as text (MySQL's DECIMAL of an integer SUM).
+                return chunk_of(
+                    resource,
+                    {column("note", logical_type::STRING_LITERAL), column("s", logical_type::STRING_LITERAL)},
+                    {{std::string{"a"}, std::string{"5"}}});
+            });
         auto cursor = stack.ok("SELECT note, sum(amount) AS s FROM " + table_of(d, "orders") + " GROUP BY note;");
         CHECK(rows_of(cursor) == std::vector<std::string>{"a|5"});
         CHECK(last_read(stack, d).find("GROUP BY") != std::string::npos);
@@ -122,15 +124,16 @@ TEST_CASE("offer: a JOIN of two tables of one connection is one statement") {
     stack.open();
     for (const auto& d : dialects()) {
         INFO(d.connection);
-        stack.backend(d.connection).on_scan([](const std::string& sql, std::pmr::memory_resource* resource)
-                                                -> std::optional<components::vector::data_chunk_t> {
-            if (sql.find("JOIN") == std::string::npos) {
-                return std::nullopt;
-            }
-            return chunk_of(resource,
-                            {column("id", logical_type::BIGINT), column("qty", logical_type::BIGINT)},
-                            {{std::int64_t{2}, std::int64_t{7}}});
-        });
+        stack.backend(d.connection)
+            .on_scan([](const std::string& sql,
+                        std::pmr::memory_resource* resource) -> std::optional<components::vector::data_chunk_t> {
+                if (sql.find("JOIN") == std::string::npos) {
+                    return std::nullopt;
+                }
+                return chunk_of(resource,
+                                {column("id", logical_type::BIGINT), column("qty", logical_type::BIGINT)},
+                                {{std::int64_t{2}, std::int64_t{7}}});
+            });
         auto cursor = stack.ok("SELECT o.id, i.qty FROM " + table_of(d, "orders") + " o JOIN " + table_of(d, "items") +
                                " i ON o.id = i.order_id;");
         CHECK(rows_of(cursor) == std::vector<std::string>{"2|7"});
@@ -146,7 +149,8 @@ TEST_CASE("offer: a WHERE conjunct the dialect cannot say stays with otterbrix")
     auto& stack = *owned;
     stack.open();
     const auto& d = dialects()[1]; // MySQL
-    auto cursor = stack.ok("SELECT id FROM " + table_of(d, "orders") + " WHERE amount > 10 AND cbrt(amount) > 3 ORDER BY id;");
+    auto cursor =
+        stack.ok("SELECT id FROM " + table_of(d, "orders") + " WHERE amount > 10 AND cbrt(amount) > 3 ORDER BY id;");
     CHECK(rows_of(cursor) == std::vector<std::string>{"2", "3"});
     const auto sql = last_read(stack, d);
     INFO(sql);
@@ -186,7 +190,8 @@ TEST_CASE("offer: an UPDATE the backend cannot run whole is refused") {
     for (const auto& d : dialects()) {
         INFO(d.connection);
         stack.backend(d.connection).clear();
-        auto refused = stack.refused("UPDATE " + table_of(d, "orders") + " SET note = l.t FROM main.public.l l WHERE id = l.a;");
+        auto refused =
+            stack.refused("UPDATE " + table_of(d, "orders") + " SET note = l.t FROM main.public.l l WHERE id = l.a;");
         CHECK(refused.type == core::error_code_t::unimplemented_yet);
         CHECK(starting_with(stack.backend(d.connection).log(), "write ").empty());
     }
@@ -202,17 +207,18 @@ TEST_CASE("offer: RETURNING is PostgreSQL's alone") {
     CHECK(stack.refused("INSERT INTO " + table_of(my, "orders") + " VALUES (9, 9, 'n') RETURNING id;").type ==
           core::error_code_t::unimplemented_yet);
     const auto& pg = dialects()[0];
-    stack.backend(pg.connection).on_scan([](const std::string& sql, std::pmr::memory_resource* resource)
-                                             -> std::optional<components::vector::data_chunk_t> {
-        if (sql.find("RETURNING") == std::string::npos) {
-            return std::nullopt;
-        }
-        return chunk_of(resource,
-                        {column("id", logical_type::BIGINT),
-                         column("amount", logical_type::BIGINT),
-                         column("note", logical_type::STRING_LITERAL)},
-                        {{std::int64_t{2}, std::int64_t{50}, std::string{"z"}}});
-    });
+    stack.backend(pg.connection)
+        .on_scan([](const std::string& sql,
+                    std::pmr::memory_resource* resource) -> std::optional<components::vector::data_chunk_t> {
+            if (sql.find("RETURNING") == std::string::npos) {
+                return std::nullopt;
+            }
+            return chunk_of(resource,
+                            {column("id", logical_type::BIGINT),
+                             column("amount", logical_type::BIGINT),
+                             column("note", logical_type::STRING_LITERAL)},
+                            {{std::int64_t{2}, std::int64_t{50}, std::string{"z"}}});
+        });
     auto returned = stack.ok("UPDATE " + table_of(pg, "orders") + " SET note = 'z' WHERE id = 2 RETURNING id, note;");
     CHECK(rows_of(returned) == std::vector<std::string>{"2|z"});
 }
@@ -229,14 +235,15 @@ TEST_CASE("offer: a value of an ENUM type is pushed as its label") {
     stack.backend("pg").add_table({"shop", "public", "moods", {column("id", logical_type::BIGINT), mood}, {}});
     stack.open();
     stack.ok("CREATE TYPE mood AS ENUM ('a', 'b', 'c');");
-    stack.backend("pg").on_scan([](const std::string& sql, std::pmr::memory_resource* resource)
-                                    -> std::optional<components::vector::data_chunk_t> {
-        if (sql.find("WHERE") == std::string::npos) {
-            return std::nullopt;
-        }
-        return chunk_of(resource, {column("id", logical_type::BIGINT)}, {{std::int64_t{2}}});
-    });
-    auto cursor = stack.ok("SELECT id FROM pg.shop.public.moods WHERE m = 'b'::mood;");
+    stack.backend("pg").on_scan(
+        [](const std::string& sql,
+           std::pmr::memory_resource* resource) -> std::optional<components::vector::data_chunk_t> {
+            if (sql.find("WHERE") == std::string::npos) {
+                return std::nullopt;
+            }
+            return chunk_of(resource, {column("id", logical_type::BIGINT)}, {{std::int64_t{2}}});
+        });
+    auto cursor = stack.ok("SELECT id FROM pg.public.moods WHERE m = 'b'::mood;");
     CHECK(rows_of(cursor) == std::vector<std::string>{"2"});
     const auto reads = starting_with(stack.backend("pg").log(), "scan ");
     REQUIRE_FALSE(reads.empty());
@@ -249,26 +256,31 @@ TEST_CASE("offer: a value of an ENUM type is pushed as its label") {
 // CAST neither narrows nor range-checks, so the statement leaves the range check to the store into
 // the column, which only a strict sql_mode makes an error; ClickHouse's mutation gets accurateCast.
 TEST_CASE("offer: an UPDATE narrowing its value to the column is one statement where the store range-checks it") {
-    auto owned = std::make_unique<fed_stack_t>(std::vector<connection_spec_t>{{"pg", backend_type_t::PostgreSQL, "shop", "public"},
-                                                                              {"my", backend_type_t::MySQL, "shop", ""},
-                                                                              {"lax", backend_type_t::MySQL, "shop", ""},
-                                                                              {"ch", backend_type_t::ClickHouse, "shop", ""}});
+    auto owned = std::make_unique<fed_stack_t>(
+        std::vector<connection_spec_t>{{"pg", backend_type_t::PostgreSQL, "shop", "public"},
+                                       {"my", backend_type_t::MySQL, "shop", ""},
+                                       {"lax", backend_type_t::MySQL, "shop", ""},
+                                       {"ch", backend_type_t::ClickHouse, "shop", ""}});
     auto& stack = *owned;
     for (const std::string connection : {"pg", "my", "lax", "ch"}) {
-        stack.backend(connection).add_table({"shop",
-                                             connection == "pg" ? "public" : "",
-                                             "counts",
-                                             {column("id", logical_type::BIGINT),
-                                              column("i", logical_type::INTEGER),
-                                              column("f", logical_type::FLOAT)},
-                                             {}});
+        stack.backend(connection)
+            .add_table({"shop",
+                        connection == "pg" ? "public" : "",
+                        "counts",
+                        {column("id", logical_type::BIGINT),
+                         column("i", logical_type::INTEGER),
+                         column("f", logical_type::FLOAT)},
+                        {}});
     }
     stack.backend("my").set_sql_mode("STRICT_TRANS_TABLES,NO_ENGINE_SUBSTITUTION");
     stack.backend("lax").set_sql_mode("NO_ENGINE_SUBSTITUTION");
     stack.open();
+    auto counts_table = [](const std::string& connection) {
+        return connection + (connection == "pg" ? ".public" : ".shop") + ".counts";
+    };
     auto written = [&](const std::string& connection, const std::string& set) {
         stack.backend(connection).clear();
-        stack.ok("UPDATE " + connection + ".shop.public.counts SET " + set + " WHERE id = 1;");
+        stack.ok("UPDATE " + counts_table(connection) + " SET " + set + " WHERE id = 1;");
         const auto writes = starting_with(stack.backend(connection).log(), "write ");
         REQUIRE(writes.size() == 1);
         return writes.front();
@@ -294,13 +306,13 @@ TEST_CASE("offer: an UPDATE narrowing its value to the column is one statement w
               "write UPDATE `shop`.`counts` SET `f` = (CAST(`f` AS DOUBLE) + CAST(1 AS DOUBLE)) WHERE `id` = 1; @txn");
         CHECK(written("ch", "f = 2.5").find("CAST(2.5 AS Float32)") != std::string::npos);
         stack.backend("ch").clear();
-        auto refused = stack.refused("UPDATE ch.shop.public.counts SET f = f + 1 WHERE id = 1;");
+        auto refused = stack.refused("UPDATE ch.shop.counts SET f = f + 1 WHERE id = 1;");
         CHECK(refused.type == core::error_code_t::unimplemented_yet);
         CHECK(starting_with(stack.backend("ch").log(), "write ").empty());
     }
     SECTION("a MySQL session without a strict sql_mode takes no narrowing assignment") {
         stack.backend("lax").clear();
-        auto refused = stack.refused("UPDATE lax.shop.public.counts SET i = i + 1 WHERE id = 1;");
+        auto refused = stack.refused("UPDATE lax.shop.counts SET i = i + 1 WHERE id = 1;");
         CHECK(refused.type == core::error_code_t::unimplemented_yet);
         CHECK(std::string{refused.what}.find("strict sql_mode") != std::string::npos);
         CHECK(starting_with(stack.backend("lax").log(), "write ").empty());
@@ -312,7 +324,7 @@ TEST_CASE("offer: an UPDATE narrowing its value to the column is one statement w
         for (const std::string connection : {"my", "ch"}) {
             INFO(connection);
             stack.backend(connection).clear();
-            CHECK(stack.refused("UPDATE " + connection + ".shop.public.counts SET i = 2.5 WHERE id = 1;").type ==
+            CHECK(stack.refused("UPDATE " + counts_table(connection) + " SET i = 2.5 WHERE id = 1;").type ==
                   core::error_code_t::unimplemented_yet);
             CHECK(starting_with(stack.backend(connection).log(), "write ").empty());
         }
@@ -324,7 +336,8 @@ TEST_CASE("offer: an UPDATE narrowing its value to the column is one statement w
 // the table the statement wrote (its backend spelling), the client gets the mutation's own error, and
 // the next UPDATE of the table runs.
 TEST_CASE("offer: a ClickHouse mutation that failed is killed and the table takes the next UPDATE") {
-    auto owned = std::make_unique<fed_stack_t>(std::vector<connection_spec_t>{{"ch", backend_type_t::ClickHouse, "Shop", ""}});
+    auto owned =
+        std::make_unique<fed_stack_t>(std::vector<connection_spec_t>{{"ch", backend_type_t::ClickHouse, "Shop", ""}});
     auto& stack = *owned;
     stack.backend("ch").add_table(
         {"Shop", "", "Counts", {column("id", logical_type::BIGINT), column("i", logical_type::INTEGER)}, {}});
@@ -334,14 +347,15 @@ TEST_CASE("offer: a ClickHouse mutation that failed is killed and the table take
                                "column Int64 cannot be safely converted into type Int32'";
     stack.backend("ch").fail_statements("3000000000", core::error_code_t::internal_error, reason);
     stack.backend("ch").clear();
-    auto refused = stack.refused("UPDATE ch.shop.public.counts SET i = i * 3000000000 WHERE id = 1;");
+    auto refused = stack.refused("UPDATE ch.shop.counts SET i = i * 3000000000 WHERE id = 1;");
     CHECK(refused.type == core::error_code_t::internal_error);
     CHECK(std::string{refused.what}.find(reason) != std::string::npos);
     const auto log = stack.backend("ch").log();
     REQUIRE(log.size() == 2);
     CHECK(log[0].rfind("write ALTER TABLE `Shop`.`Counts` UPDATE ", 0) == 0);
-    CHECK(log[1] == "exec KILL MUTATION WHERE database = 'Shop' AND table = 'Counts' AND mutation_id = 'mutation_4.txt'");
+    CHECK(log[1] ==
+          "exec KILL MUTATION WHERE database = 'Shop' AND table = 'Counts' AND mutation_id = 'mutation_4.txt'");
     stack.backend("ch").clear();
-    stack.ok("UPDATE ch.shop.public.counts SET i = i + 1 WHERE id = 1;");
+    stack.ok("UPDATE ch.shop.counts SET i = i + 1 WHERE id = 1;");
     CHECK(starting_with(stack.backend("ch").log(), "write ALTER TABLE `Shop`.`Counts` UPDATE ").size() == 1);
 }

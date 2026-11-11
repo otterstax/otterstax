@@ -291,7 +291,7 @@ class PgExtendedProtocolTest:
         wire = PgWire(self.host, PG_PORT)
         # The StartupMessage names an engine database (an unknown one is FATAL
         # 3D000): the session is placed in main.public.
-        wire.startup("testuser", "main")
+        wire.startup("testuser", "local")
         return wire
 
     def setup(self):

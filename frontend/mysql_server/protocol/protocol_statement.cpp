@@ -426,9 +426,9 @@ namespace frontend::mysql {
                     literal = (value[0]->value == "-" ? "-" : "") + value[1]->value;
                 }
                 if (!literal && !set.refusal) {
-                    set.refusal = protocol_refusal_t{mysql_error::ER_NOT_SUPPORTED_YET,
-                                                     "SET " + name->value +
-                                                         ": the value must be one literal, word or number"};
+                    set.refusal =
+                        protocol_refusal_t{mysql_error::ER_NOT_SUPPORTED_YET,
+                                           "SET " + name->value + ": the value must be one literal, word or number"};
                 }
                 set.settings.push_back(engine_setting(name->value, is_default ? std::nullopt : std::move(literal)));
             } while (c.punct(","));
@@ -442,9 +442,10 @@ namespace frontend::mysql {
             // the engine; one that is not true refuses the whole statement.
             for (const auto& setting : set.settings) {
                 if (!set.refusal && is_charset_variable(setting.name)) {
-                    set.refusal = charset_refusal(setting.name,
-                                                  setting.value ? to_lower(*setting.value) : std::string{SERVER_CHARSET},
-                                                  std::nullopt);
+                    set.refusal =
+                        charset_refusal(setting.name,
+                                        setting.value ? to_lower(*setting.value) : std::string{SERVER_CHARSET},
+                                        std::nullopt);
                 }
             }
             std::erase_if(set.settings, [](const setting_t& setting) { return is_charset_variable(setting.name); });
@@ -700,10 +701,7 @@ namespace frontend::mysql {
             return chunk;
         }
 
-        void set_cell(data_chunk_t& chunk,
-                      std::size_t column,
-                      std::size_t row,
-                      const variable_value_t& value) {
+        void set_cell(data_chunk_t& chunk, std::size_t column, std::size_t row, const variable_value_t& value) {
             if (const auto* number = std::get_if<int64_t>(&value)) {
                 chunk.set_value(column, row, *number);
             } else if (const auto* text = std::get_if<std::string>(&value)) {
@@ -858,9 +856,9 @@ namespace frontend::mysql {
             auto& data = parsed.value();
             const logical_plan::node_t* root = data && data->plan ? plan_root(*data->plan).get() : nullptr;
             if (root == nullptr || root->type() != logical_plan::node_type::set_setting_t) {
-                return core::error_t{core::error_code_t::internal_error,
-                                     std::pmr::string{"the engine read the frontend's SET as another statement",
-                                                      resource}};
+                return core::error_t{
+                    core::error_code_t::internal_error,
+                    std::pmr::string{"the engine read the frontend's SET as another statement", resource}};
             }
             const auto& set = static_cast<const logical_plan::node_set_setting_t&>(*root);
             assert(set.scope() == catalog::setting_scope_t::session && "the frontend writes a session's SET only");
@@ -898,11 +896,6 @@ namespace frontend::mysql {
                                       " is not supported: OtterStax reads and sends utf8mb4 only"};
     }
 
-    std::string engine_search_path_statement(std::string_view database) {
-        OTX_ZONE_N("mysql_protocol::engine_search_path_statement");
-        return "SET search_path = " + engine_literal(std::string{database} + ".public");
-    }
-
     protocol_answer_t answer_protocol_statement(std::pmr::memory_resource* resource,
                                                 const protocol_statement_t& statement,
                                                 const protocol_context_t& context) {
@@ -919,5 +912,4 @@ namespace frontend::mysql {
         assert(false && "a SET and a USE are answered by the engine");
         return protocol_refusal_t{mysql_error::ER_UNKNOWN_ERROR, "not a statement the frontend answers"};
     }
-
 } // namespace frontend::mysql

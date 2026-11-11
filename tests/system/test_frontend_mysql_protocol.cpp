@@ -26,13 +26,13 @@
 #include <components/logical_plan/node_set_setting.hpp>
 
 #include <cstdint>
+#include <cstring>
 #include <optional>
 #include <string>
 #include <variant>
 #include <vector>
 
 namespace {
-
     using namespace otterstax::test::wire;
 
     constexpr uint8_t COM_QUERY = 0x03;
@@ -255,13 +255,40 @@ namespace {
         }
     }
 
-    // A session ready for COM_QUERY, its table wp.t holding ids 1..3.
+    // HandshakeResponse41 naming `collation` as the client's character set and,
+    // when `database` is given, that database as the session's place; the
+    // server's answer (OK, or the ERR that refuses the login).
+    std::vector<uint8_t> handshake_with(raw_client& client, uint8_t collation, const char* database = nullptr) {
+        mysql_read_handshake(client);
+        auto resp = mysql_handshake_response_head(collation);
+        uint32_t flags = frontend::mysql::CLIENT_PROTOCOL_41 | frontend::mysql::CLIENT_SECURE_CONNECTION;
+        if (database) {
+            flags |= frontend::mysql::CLIENT_CONNECT_WITH_DB;
+        }
+        for (int i = 0; i < 4; ++i) {
+            resp[i] = static_cast<uint8_t>((flags >> (8 * i)) & 0xFF);
+        }
+        const std::string user = "test";
+        resp.insert(resp.end(), user.begin(), user.end());
+        resp.push_back(0);
+        resp.push_back(0); // auth length
+        if (database) {
+            resp.insert(resp.end(), database, database + std::strlen(database));
+            resp.push_back(0);
+        }
+        client.write(mysql_frame(1, resp));
+        return mysql_read_packet(client);
+    }
+
+    // A session ready for COM_QUERY in the place local.public, its table wp.t holding ids 1..3.
     struct fixture {
         explicit fixture(const char* name)
             : owner(otterstax::test::unique_test_dir(name))
             , server(make_config(owner.stack()))
             , client((server.start(), server.local_port())) {
-            mysql_handshake(client);
+            auto ok = handshake_with(client, 33, "local");
+            REQUIRE(!ok.empty());
+            REQUIRE(ok[0] == OK_HEADER);
             query_ok(client, "CREATE SCHEMA wp"); // `wp.t` is schema.table
             query_ok(client, "CREATE TABLE wp.t (id bigint, name string)");
             query_ok(client, "INSERT INTO wp.t (id, name) VALUES (1, 'a'), (2, '?'), (3, 'c')");
@@ -283,8 +310,13 @@ TEST_CASE("mysql protocol over the wire: the mysql CLI's connect query is answer
 
     auto db = query_rows(f.client, "SELECT DATABASE(), USER() limit 1");
     REQUIRE(db.rows.size() == 1);
-    CHECK_FALSE(db.rows[0][0].has_value());
+    CHECK(db.rows[0][0].value() == "local");             // the HandshakeResponse's database
     CHECK(db.rows[0][1].value().rfind("test@", 0) == 0); // the HandshakeResponse's user
+
+    // A session that names no database reports none.
+    raw_client no_place(f.server.local_port());
+    mysql_handshake(no_place);
+    CHECK_FALSE(query_rows(no_place, "SELECT DATABASE()").rows[0][0].has_value());
 }
 
 TEST_CASE("mysql protocol over the wire: Connector/J's variable query is answered as a resultset") {
@@ -338,7 +370,9 @@ TEST_CASE("mysql protocol over the wire: the MySQL SET forms reach the engine as
     CHECK(query_rows(f.client, "SELECT @@autocommit").rows[0][0] == "0");
     CHECK((query_ok(f.client, "INSERT INTO wp.t (id, name) VALUES (4, 'd')") & SERVER_STATUS_IN_TRANS) != 0);
     raw_client other(f.server.local_port());
-    mysql_handshake(other);
+    auto ok = handshake_with(other, 33, "local");
+    REQUIRE(!ok.empty());
+    REQUIRE(ok[0] == OK_HEADER);
     CHECK(query_rows(other, "SELECT count(*) FROM wp.t").rows[0][0] == "3");
     CHECK((query_ok(f.client, "COMMIT") & SERVER_STATUS_IN_TRANS) == 0);
     CHECK(query_rows(other, "SELECT count(*) FROM wp.t").rows[0][0] == "4");
@@ -403,7 +437,9 @@ TEST_CASE("mysql protocol: a SET of several variables is one engine statement") 
         return std::get<frontend::mysql::set_variables_t>(*statement).settings;
     };
 
-    auto plan = frontend::mysql::engine_setting_plan(resource, settings_of("SET autocommit = 0, time_zone = 'UTC', time_zone = SYSTEM"));
+    auto plan =
+        frontend::mysql::engine_setting_plan(resource,
+                                             settings_of("SET autocommit = 0, time_zone = 'UTC', time_zone = SYSTEM"));
     REQUIRE_FALSE(plan.has_error());
     REQUIRE(plan.value()->plan);
     REQUIRE(plan.value()->plan->sub_queries.size() == 1);
@@ -458,7 +494,9 @@ TEST_CASE("mysql protocol over the wire: a SET of several variables is applied w
     // ... and the engine: autocommit still on, an INSERT commits on its own.
     CHECK((query_ok(f.client, "INSERT INTO wp.t (id, name) VALUES (4, 'd')") & SERVER_STATUS_IN_TRANS) == 0);
     raw_client other(f.server.local_port());
-    mysql_handshake(other);
+    auto ok_other = handshake_with(other, 33, "local");
+    REQUIRE(!ok_other.empty());
+    REQUIRE(ok_other[0] == OK_HEADER);
     CHECK(query_rows(other, "SELECT count(*) FROM wp.t").rows[0][0] == "4");
 
     // Every assignment the engine takes is applied by the one statement.
@@ -481,24 +519,28 @@ TEST_CASE("mysql protocol over the wire: a SET of several variables is applied w
 TEST_CASE("mysql protocol over the wire: USE, COM_INIT_DB and the handshake's database are the session's place") {
     fixture f("otterstax_mysql_protocol_use");
     query_ok(f.client, "CREATE DATABASE shop");
-    CHECK_FALSE(query_rows(f.client, "SELECT DATABASE()").rows[0][0].has_value());
-    query_ok(f.client, "USE shop");
-    CHECK(query_rows(f.client, "SELECT DATABASE()").rows[0][0] == "shop");
-    // A bare name is the place's: shop.public.
+    raw_client no_place(f.server.local_port());
+    mysql_handshake(no_place);
+    CHECK_FALSE(query_rows(no_place, "SELECT DATABASE()").rows[0][0].has_value());
+    query_ok(f.client, "USE local.shop");
+    CHECK(query_rows(f.client, "SELECT DATABASE()").rows[0][0] == "local.shop");
+    // A bare name is the place's: local.shop.
     query_ok(f.client, "CREATE TABLE u (id bigint)");
     query_ok(f.client, "INSERT INTO u (id) VALUES (7)");
-    CHECK(query_rows(f.client, "SELECT id FROM shop.public.u").rows[0][0] == "7");
+    CHECK(query_rows(f.client, "SELECT id FROM local.shop.u").rows[0][0] == "7");
     // A database the engine does not have is ER_BAD_DB_ERROR; the place stays.
-    CHECK(err_code(query(f.client, "USE nosuch")) == static_cast<uint16_t>(frontend::mysql::mysql_error::ER_BAD_DB_ERROR));
-    CHECK(query_rows(f.client, "SELECT DATABASE()").rows[0][0] == "shop");
+    CHECK(err_code(query(f.client, "USE nosuch")) ==
+          static_cast<uint16_t>(frontend::mysql::mysql_error::ER_BAD_DB_ERROR));
+    CHECK(query_rows(f.client, "SELECT DATABASE()").rows[0][0] == "local.shop");
 
     // COM_INIT_DB is the same statement.
-    f.client.write(mysql_command(COM_INIT_DB, "main"));
+    f.client.write(mysql_command(COM_INIT_DB, "local"));
     REQUIRE(mysql_read_packet(f.client)[0] == OK_HEADER);
-    CHECK(query_rows(f.client, "SELECT DATABASE()").rows[0][0] == "main");
+    CHECK(query_rows(f.client, "SELECT DATABASE()").rows[0][0] == "local");
     CHECK(query_rows(f.client, "SELECT count(*) FROM wp.t").rows[0][0] == "3");
     f.client.write(mysql_command(COM_INIT_DB, "nosuch"));
-    CHECK(err_code(mysql_read_packet(f.client)) == static_cast<uint16_t>(frontend::mysql::mysql_error::ER_BAD_DB_ERROR));
+    CHECK(err_code(mysql_read_packet(f.client)) ==
+          static_cast<uint16_t>(frontend::mysql::mysql_error::ER_BAD_DB_ERROR));
 
     // The HandshakeResponse's database: the connection starts there, or is refused.
     const auto connect_to = [&](const std::string& database) {
@@ -523,7 +565,7 @@ TEST_CASE("mysql protocol over the wire: USE, COM_INIT_DB and the handshake's da
         }
         return current;
     };
-    CHECK(connect_to("shop") == std::optional<std::string>{"shop"});
+    CHECK(connect_to("local") == std::optional<std::string>{"local"});
     CHECK_FALSE(connect_to("nosuch").has_value());
 }
 
@@ -536,23 +578,23 @@ TEST_CASE("mysql protocol over the wire: only a missing database is ER_BAD_DB_ER
     query_ok(f.client, "CREATE DATABASE shop");
     const auto syntax_error = static_cast<uint16_t>(frontend::mysql::mysql_error::ER_SYNTAX_ERROR);
 
-    // [[connection.]database.]schema: a place of four parts is no place.
+    // connection[.namespace] or local[.namespace]: a place of three parts is no place.
     const auto malformed = query(f.client, "USE `a.b.c`");
     INFO(err_text(malformed));
     CHECK(err_code(malformed) == syntax_error);
 
     query_ok(f.client, "BEGIN");
     CHECK(query(f.client, "SELECT id FROM wp.nowhere")[0] == ERR_HEADER);
-    const auto in_failed = query(f.client, "USE shop");
+    const auto in_failed = query(f.client, "USE local.shop");
     INFO(err_text(in_failed));
     CHECK(err_code(in_failed) == syntax_error);
-    f.client.write(mysql_command(COM_INIT_DB, "shop"));
+    f.client.write(mysql_command(COM_INIT_DB, "local"));
     CHECK(err_code(mysql_read_packet(f.client)) == syntax_error);
     query_ok(f.client, "ROLLBACK");
 
     // Outside the block the same database is used.
-    query_ok(f.client, "USE shop");
-    CHECK(query_rows(f.client, "SELECT DATABASE()").rows[0][0] == "shop");
+    query_ok(f.client, "USE local.shop");
+    CHECK(query_rows(f.client, "SELECT DATABASE()").rows[0][0] == "local.shop");
 }
 
 TEST_CASE("mysql protocol over the wire: a prepared ? reaches the session as $n") {
@@ -672,7 +714,9 @@ TEST_CASE("mysql protocol over the wire: the collation is utf8mb4_bin in the han
     }
     {
         raw_client client(server.local_port());
-        mysql_handshake(client);
+        auto ok = handshake_with(client, 33, "local");
+        REQUIRE(!ok.empty());
+        REQUIRE(ok[0] == OK_HEADER);
         query_ok(client, "CREATE SCHEMA coll");
         query_ok(client, "CREATE TABLE coll.t (id bigint, name string)");
         query_ok(client, "INSERT INTO coll.t (id, name) VALUES (1, 'a'), (2, 'A')");
@@ -820,14 +864,18 @@ TEST_CASE("mysql protocol over the wire: a refused SET fails an open block on CO
         const char* sql;
         frontend::mysql::mysql_error code;
     };
-    for (const auto& route : {route_t{"COM_QUERY", false, "SET NAMES latin1", frontend::mysql::mysql_error::ER_NOT_SUPPORTED_YET},
-                              route_t{"COM_STMT_PREPARE", true, "SET NAMES latin1", frontend::mysql::mysql_error::ER_NOT_SUPPORTED_YET},
-                              // The engine's SET takes a string constant: a parameter is refused at prepare.
-                              route_t{"COM_STMT_PREPARE", true, "SET @@session.autocommit = ?", frontend::mysql::mysql_error::ER_NOT_SUPPORTED_YET},
-                              route_t{"COM_STMT_PREPARE",
-                                      true,
-                                      "SET NAMES utf8mb4 COLLATE latin1_swedish_ci",
-                                      frontend::mysql::mysql_error::ER_COLLATION_CHARSET_MISMATCH}}) {
+    for (const auto& route :
+         {route_t{"COM_QUERY", false, "SET NAMES latin1", frontend::mysql::mysql_error::ER_NOT_SUPPORTED_YET},
+          route_t{"COM_STMT_PREPARE", true, "SET NAMES latin1", frontend::mysql::mysql_error::ER_NOT_SUPPORTED_YET},
+          // The engine's SET takes a string constant: a parameter is refused at prepare.
+          route_t{"COM_STMT_PREPARE",
+                  true,
+                  "SET @@session.autocommit = ?",
+                  frontend::mysql::mysql_error::ER_NOT_SUPPORTED_YET},
+          route_t{"COM_STMT_PREPARE",
+                  true,
+                  "SET NAMES utf8mb4 COLLATE latin1_swedish_ci",
+                  frontend::mysql::mysql_error::ER_COLLATION_CHARSET_MISMATCH}}) {
         INFO(route.name << ": " << route.sql);
         query_ok(f.client, "BEGIN");
         query_ok(f.client, "INSERT INTO wp.t (id, name) VALUES (4, 'd')");
@@ -846,21 +894,6 @@ TEST_CASE("mysql protocol over the wire: a refused SET fails an open block on CO
         CHECK(query_rows(f.client, "SELECT count(*) FROM wp.t").rows[0][0] == "3");
     }
 }
-
-namespace {
-    // HandshakeResponse41 naming `collation` as the client's character set; the
-    // server's answer (OK, or the ERR that refuses the login).
-    std::vector<uint8_t> handshake_with(raw_client& client, uint8_t collation) {
-        mysql_read_handshake(client);
-        auto resp = mysql_handshake_response_head(collation);
-        const std::string user = "test";
-        resp.insert(resp.end(), user.begin(), user.end());
-        resp.push_back(0);
-        resp.push_back(0); // auth length
-        client.write(mysql_frame(1, resp));
-        return mysql_read_packet(client);
-    }
-} // namespace
 
 // The HandshakeResponse's character set is the protocol's, checked as SET NAMES
 // is: a utf-8 collation logs in, another one is refused and the connection
@@ -886,7 +919,7 @@ TEST_CASE("mysql protocol over the wire: the handshake's character set is utf-8 
 TEST_CASE("mysql protocol over the wire: PyMySQL's connect sequence reaches the first query") {
     fixture f("otterstax_mysql_protocol_pymysql_connect");
     raw_client client(f.server.local_port());
-    REQUIRE((ok_status(handshake_with(client, 45)) & SERVER_STATUS_AUTOCOMMIT) != 0);
+    REQUIRE((ok_status(handshake_with(client, 45, "local")) & SERVER_STATUS_AUTOCOMMIT) != 0);
     query_ok(client, "SET NAMES utf8mb4");
     query_ok(client, "SET NAMES utf8mb4 COLLATE utf8mb4_general_ci");
     CHECK((query_ok(client, "SET AUTOCOMMIT = 0") & SERVER_STATUS_AUTOCOMMIT) == 0);

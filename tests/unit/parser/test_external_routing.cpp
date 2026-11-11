@@ -13,6 +13,8 @@
 
 #include <memory_resource>
 #include <string>
+#include <utility>
+#include <vector>
 
 using otterstax::external::external_node_t;
 using otterstax::external::external_op_t;
@@ -32,8 +34,8 @@ namespace {
 TEST_CASE("external: CREATE EXTERNAL TABLE on a local path lowers to external_node_t") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     GreenplumParser parser(&arena);
-    auto r = parser.parse(
-        "CREATE EXTERNAL TABLE file.people WITH (location = '/tmp/people.parquet', format = 'parquet')");
+    auto r =
+        parser.parse("CREATE EXTERNAL TABLE file.people WITH (location = '/tmp/people.parquet', format = 'parquet')");
     REQUIRE_FALSE(r.has_error());
 
     auto* node = as_external(plan_root(*r.value()->plan));
@@ -62,16 +64,19 @@ TEST_CASE("external: CREATE EXTERNAL TABLE names its table in one to four parts"
     CHECK(target_of("People") == qualified_name_t{core::relname_t{"people"}});
     CHECK(target_of("Db.Sch.People") ==
           qualified_name_t{core::dbname_t{"db"}, core::schema_t{"sch"}, core::relname_t{"people"}});
-    CHECK(target_of("pg.shop.public.orders") == qualified_name_t{core::connection_name_t{"pg"},
-                                                                 core::dbname_t{"shop"},
-                                                                 core::schema_t{"public"},
-                                                                 core::relname_t{"orders"}});
+    CHECK(target_of("pg.shop.orders") ==
+          qualified_name_t{core::dbname_t{"pg"}, core::schema_t{"shop"}, core::relname_t{"orders"}});
 
-    auto five = parser.parse("CREATE EXTERNAL TABLE a.b.c.d.e WITH (location = '/tmp/p.csv')");
-    REQUIRE(five.has_error());
-    CHECK(five.error().type == core::error_code_t::sql_parse_error);
-    CHECK(std::string{five.error().what.c_str()} ==
-          "CREATE EXTERNAL TABLE: the table name has 5 parts; write it as [connection.][database.][schema.]name");
+    for (const auto& [name, parts] :
+         std::vector<std::pair<std::string, int>>{{"pg.shop.public.orders", 4}, {"a.b.c.d.e", 5}}) {
+        INFO(name);
+        auto refused = parser.parse("CREATE EXTERNAL TABLE " + name + " WITH (location = '/tmp/p.csv')");
+        REQUIRE(refused.has_error());
+        CHECK(refused.error().type == core::error_code_t::sql_parse_error);
+        CHECK(std::string{refused.error().what.c_str()} == "CREATE EXTERNAL TABLE: the table name has " +
+                                                               std::to_string(parts) +
+                                                               " parts; write it as [connection.][namespace.]name");
+    }
 }
 
 TEST_CASE("external: CREATE EXTERNAL TABLE on an s3 URI lowers to external_node_t") {
@@ -107,8 +112,8 @@ TEST_CASE("external: COPY (...) TO a local path captures the inner query") {
 TEST_CASE("external: COPY (...) TO an s3 URI captures the inner query and alias") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     GreenplumParser parser(&arena);
-    auto r = parser.parse(
-        "COPY (SELECT 1) TO 's3://bucket/out.parquet' WITH (s3_alias = 'rustfs1', format = 'parquet')");
+    auto r =
+        parser.parse("COPY (SELECT 1) TO 's3://bucket/out.parquet' WITH (s3_alias = 'rustfs1', format = 'parquet')");
     REQUIRE_FALSE(r.has_error());
 
     auto* node = as_external(plan_root(*r.value()->plan));

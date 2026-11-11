@@ -29,8 +29,12 @@ from flightsql import FlightSQLClient
 
 import config
 
-# A schema of the database `main` (the session's place): `DB.t` names its tables.
-DB = "flight_local_db"
+# Flight SQL has no place field: a session that named none refuses one- and
+# two-part table names. Namespace DDL lands in `local` wherever the session
+# stands (`CREATE SCHEMA flight_local_db`), and every table statement names
+# its tables in full, `local.flight_local_db.t`.
+SCHEMA = "flight_local_db"
+DB = f"local.{SCHEMA}"
 
 
 class FlightSQLLocalTableTest:
@@ -47,7 +51,7 @@ class FlightSQLLocalTableTest:
     def setup(self):
         """Two INT tables sharing the key name, plus one table per 128-bit-wide type."""
         self.client = FlightSQLClient(host=self.host, port=config.FLIGHT_PORT, insecure=True)
-        self._update(f"CREATE SCHEMA {DB}")
+        self._update(f"CREATE SCHEMA {SCHEMA}")
         self._create_table("a", "(id INT, x INT)")
         self._create_table("b", "(id INT, y INT)")
         self._create_table("wide", "(id INT, amount decimal(38, 10))")
@@ -65,7 +69,7 @@ class FlightSQLLocalTableTest:
             except Exception as e:
                 print(f"cleanup: DROP TABLE {DB}.{table} failed: {e}")
         try:
-            self._update(f"DROP SCHEMA {DB}")
+            self._update(f"DROP SCHEMA {SCHEMA}")
         except Exception as e:
             print(f"cleanup: DROP SCHEMA {DB} failed: {e}")
 

@@ -21,10 +21,12 @@
 // host keeps the backend's own spelling of it in an ordinary table of its own, keyed by otterbrix's
 // oids, which the backend actor answers as host rows of every DDL step (backend_actor.hpp).
 namespace otterstax::federation {
-
     // The local database of OtterStax's own tables (the Kafka objects' tables live there too).
     inline constexpr std::string_view metadata_database = "federation";
     inline constexpr std::string_view metadata_schema = "public";
+
+    // The local database of the clients' own tables: local.<namespace>.<table>.
+    inline constexpr std::string_view local_database = "local";
 
     // federation.public.remote_names: the backend's spelling of every remote table and column.
     //  - a table:  (table_oid, 0, the table's name, the database (MySQL / ClickHouse) or schema
@@ -77,5 +79,4 @@ namespace otterstax::federation {
     };
 
     using discovered_tables_t = std::pmr::vector<discovered_table_t>;
-
 } // namespace otterstax::federation

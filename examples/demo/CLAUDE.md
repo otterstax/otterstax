@@ -9,9 +9,9 @@ Everything demo-related lives in this folder (`examples/demo/`). Paths below are
 OtterStax is a federated SQL engine. The demo registers three real backends, one
 S3-compatible object store, and a Kafka broker —
 
-- **MariaDB** (`mysql.bill.public`) — orders, invoices (ACID transactions)
-- **PostgreSQL** (`pg.shop.shop`) — customers (with ENUM tier), products
-- **ClickHouse** (`ch.ev.public`) — sessions (with nested struct columns, columnar OLAP)
+- **MariaDB** (`mysql.bill`) — orders, invoices (ACID transactions)
+- **PostgreSQL** (`pg.shop`) — customers (with ENUM tier), products
+- **ClickHouse** (`ch.ev`) — sessions (with nested struct columns, columnar OLAP)
 - **RustFS** (`s3_alias = 'demo_s3'`) — single bucket `demo-bucket` for the
   external-table demo (steps 7-9)
 - **Kafka / redpanda** (`demo-kafka`, host `127.0.0.1:19093`) — live order-event
@@ -24,7 +24,7 @@ The **Kafka streaming act** is a separate, step-by-step tour under `kafka/`
 write path, continuous streams, and fan-in) — see `kafka/README.md`. It needs
 the `demo-kafka` broker (started by `up.sh`) and the pg/ch connections.
 
-Demo SQL names every remote table in **4 parts** `<alias>.<database>.<schema>.<table>` (e.g. `mysql.bill.public.orders`, `pg.shop.shop.customers`, `ch.ev.public.sessions`): a MySQL / ClickHouse connection has the one schema `public`, a PostgreSQL connection the schema its `schema:` names (`shop` here). Three parts are always a local table (`d.s.t`). The psql clients connect to the database `main` (a database the engine does not have is refused, `FATAL 3D000`), so the session's place is `main.public`. Local tables live in the schema `otter` of `main` (`otter.warehouses`, and the external tables `otter.regions`, `otter.promos`) — the schema created by step_3a, so the cleanup script tears them down together.
+Demo SQL names every remote table in **3 parts** `<alias>.<namespace>.<table>` (e.g. `mysql.bill.orders`, `pg.shop.customers`, `ch.ev.sessions`): the namespace is a database of the MySQL / ClickHouse server and a schema of the PostgreSQL connection's `database:` (`shop` here). Four parts are refused; local tables are `local.<schema>.<table>`. The psql clients connect to the database `local`, so the session's place is `local.public` (a name that is neither `local[.ns]` nor a connection `uid[.ns]` is refused, `FATAL 3D000`). Local tables live in the schema `otter` of `local` (`local.otter.warehouses`, and the external tables `local.otter.regions`, `local.otter.promos`) — the schema created by step_3a (`CREATE SCHEMA otter` always lands in `local`), so the cleanup script tears them down.
 
 ## Pick a mode
 
@@ -82,18 +82,18 @@ Bench mode starts the three backends + RustFS + `demo-rustfs-init` + `demo-kafka
 Once the server is up (connections load from the config file at startup), run each step against the PG wire:
 
 ```bash
-psql -h localhost -p 8817 -U demo main -f examples/demo/sql/step_1.sql
-psql -h localhost -p 8817 -U demo main -f examples/demo/sql/step_2.sql
-psql -h localhost -p 8817 -U demo main -f examples/demo/sql/step_3a_ddl.sql
-psql -h localhost -p 8817 -U demo main -f examples/demo/sql/step_3b_insert.sql
-psql -h localhost -p 8817 -U demo main -f examples/demo/sql/step_3c_select.sql
-psql -h localhost -p 8817 -U demo main -f examples/demo/sql/step_3d_main.sql
-psql -h localhost -p 8817 -U demo main -f examples/demo/sql/step_4.sql
-psql -h localhost -p 8817 -U demo main -f examples/demo/sql/step_5.sql
-psql -h localhost -p 8817 -U demo main -f examples/demo/sql/step_6.sql
-psql -h localhost -p 8817 -U demo main -f examples/demo/sql/step_7.sql   # s3 csv     → otter.regions
-psql -h localhost -p 8817 -U demo main -f examples/demo/sql/step_8.sql   # s3 parquet → otter.promos
-psql -h localhost -p 8817 -U demo main -f examples/demo/sql/step_9.sql   # JOIN + COPY back to s3
+psql -h localhost -p 8817 -U demo local -f examples/demo/sql/step_1.sql
+psql -h localhost -p 8817 -U demo local -f examples/demo/sql/step_2.sql
+psql -h localhost -p 8817 -U demo local -f examples/demo/sql/step_3a_ddl.sql
+psql -h localhost -p 8817 -U demo local -f examples/demo/sql/step_3b_insert.sql
+psql -h localhost -p 8817 -U demo local -f examples/demo/sql/step_3c_select.sql
+psql -h localhost -p 8817 -U demo local -f examples/demo/sql/step_3d_main.sql
+psql -h localhost -p 8817 -U demo local -f examples/demo/sql/step_4.sql
+psql -h localhost -p 8817 -U demo local -f examples/demo/sql/step_5.sql
+psql -h localhost -p 8817 -U demo local -f examples/demo/sql/step_6.sql
+psql -h localhost -p 8817 -U demo local -f examples/demo/sql/step_7.sql   # s3 csv     → otter.regions
+psql -h localhost -p 8817 -U demo local -f examples/demo/sql/step_8.sql   # s3 parquet → otter.promos
+psql -h localhost -p 8817 -U demo local -f examples/demo/sql/step_9.sql   # JOIN + COPY back to s3
 ```
 
 Or all at once with `examples/demo/run-queries.sh` (`for f in sql/step_*.sql; do psql … -f $f; done` — lexicographic sort matches the intended order).
@@ -124,7 +124,7 @@ persists. `cleanup.sql` drops the tables (`otter.warehouses`, `otter.regions`,
 of step 3a — run it before redoing the demo:
 
 ```bash
-psql -h localhost -p 8817 -U demo main -f examples/demo/sql/cleanup.sql
+psql -h localhost -p 8817 -U demo local -f examples/demo/sql/cleanup.sql
 ```
 
 The `s3://demo-bucket/exports/promos_by_region.csv` object that step_9 writes
@@ -158,8 +158,8 @@ examples/demo/down.sh
 | `CREATE SCHEMA otter ... already exists` on rerun | Step 3a persists state | Run `examples/demo/sql/cleanup.sql` or `examples/demo/down.sh && examples/demo/up.sh`. |
 | `psql: error: server closed the connection unexpectedly` | otterstax crashed mid-query | `docker logs demo-otterstax | tail -50`. Cross-backend ARRAY queries and some struct cases are known to crash; demo SQL avoids these but custom queries may hit them. |
 | `er_table_exists_error` on test data | State from previous run leaked into backend volumes | `examples/demo/down.sh` then bring up fresh. |
-| A remote table written `mysql.bill.orders` is not found | Three parts name a local table `database.schema.table` | Write the remote table in four parts: `mysql.bill.public.orders`, `pg.shop.shop.customers`, `ch.ev.public.sessions`. |
-| `FATAL 3D000 database "demo" does not exist` at connect | The client named a database the engine does not have | Connect to `main` (`psql -h localhost -p 8817 -U demo main`). |
+| A remote table written `mysql.bill.public.orders` is refused | Four parts would be a second full name of the table | Write it in three parts: `mysql.bill.orders`, `pg.shop.customers`, `ch.ev.sessions`. |
+| `FATAL 3D000 database "demo" does not exist` at connect | The client named a place OtterStax does not have | Connect to `local` (`psql -h localhost -p 8817 -U demo local`), or to a connection (`mysql`, `pg.shop`). |
 | `Otterbrix execution failed: database does not exist` | Query routed to local engine that doesn't know the external alias | Check the config file (`config.yaml` / `config_local.yaml`) `connections:` section has all three backends and restart the server — connections load only at startup. |
 | `External table is not registered: …` from step 7/8/9 | The `demo_s3` alias was not in the config file this server read | Add the `s3:` `demo_s3` entry under `connections:` and restart the server. |
 | Step 8 fails with `External table is not registered` and `init/s3/promos.parquet` is missing | `pyarrow` not installed when `generate_data.py` ran | `pip install pyarrow` and re-run `python3 examples/demo/generate_data.py`, then `docker compose -f examples/demo/compose.yml up -d demo-rustfs-init` to re-seed. |
@@ -183,7 +183,7 @@ All paths relative to `examples/demo/`:
 | `config.yaml` | single config file for docker mode (server settings + connections; docker-DNS hostnames `demo-mariadb`, `demo-rustfs`, …); mounted into the container, read at startup |
 | `config_local.yaml` | single config file for bench/local mode (host-published ports: 3201/3202/3204/3206) — pass with `--config` |
 | `sql/step_*.sql` | the actual demo queries — `step_7` / `step_8` load from s3, `step_9` JOINs and dumps back |
-| `sql/cleanup.sql` | drops the local tables, the `otter` schema of `main` and the step-3a types |
+| `sql/cleanup.sql` | drops the local tables, the schema `local.otter` and the step-3a types |
 
 ## Hand-off note
 

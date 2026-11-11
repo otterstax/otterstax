@@ -33,7 +33,6 @@
 #include <vector>
 
 namespace {
-
     using namespace otterstax::test::wire;
     using namespace std::chrono_literals;
 
@@ -261,11 +260,12 @@ namespace {
 
     std::unique_ptr<mysql::IConnector> slow_mysql_factory(std::pmr::memory_resource* resource,
                                                           boost::asio::io_context&,
-                                                          boost::mysql::connect_params,
+                                                          boost::mysql::connect_params params,
                                                           std::string alias) {
         return std::make_unique<mysql::MockConnector>(
             mock_config{.resource = resource, .wait_time = std::chrono::milliseconds(800)},
-            std::move(alias));
+            std::move(alias),
+            std::move(params));
     }
 
     class slow_or_real_parser final : public IParser {
@@ -286,7 +286,8 @@ namespace {
         return std::make_unique<slow_or_real_parser>(resource);
     }
 
-    bool wait_for_live(otterstax::session::session_factory_t& sessions, size_t live, std::chrono::milliseconds timeout) {
+    bool
+    wait_for_live(otterstax::session::session_factory_t& sessions, size_t live, std::chrono::milliseconds timeout) {
         for (auto waited = 0ms; waited < timeout; waited += 10ms) {
             if (sessions.live_sessions() == live) {
                 return true;
@@ -295,7 +296,6 @@ namespace {
         }
         return sessions.live_sessions() == live;
     }
-
 } // namespace
 
 TEST_CASE("wire transactions: postgres ROLLBACK discards and COMMIT publishes the block's rows") {
@@ -345,12 +345,8 @@ TEST_CASE("wire transactions: postgres error aborts the block until it ends") {
     CHECK(refused.sqlstate() == frontend::postgres::sql_state::IN_FAILED_SQL_TRANSACTION);
     CHECK(refused.status == 'E');
 
-    SECTION("COMMIT ends it as a rollback") {
-        pg_ok(a, "COMMIT", "ROLLBACK", 'I');
-    }
-    SECTION("ROLLBACK ends it") {
-        pg_ok(a, "ROLLBACK", "ROLLBACK", 'I');
-    }
+    SECTION("COMMIT ends it as a rollback") { pg_ok(a, "COMMIT", "ROLLBACK", 'I'); }
+    SECTION("ROLLBACK ends it") { pg_ok(a, "ROLLBACK", "ROLLBACK", 'I'); }
     CHECK(pg_count(a, "wta.t", 'I') == 0);
     server.stop();
 }
@@ -468,16 +464,17 @@ TEST_CASE("wire transactions: postgres frontend error inside a block fails it") 
 TEST_CASE("wire statements: postgres CommandComplete names a remote CREATE TABLE and DROP TABLE") {
     otterstax::test::stack_options_t options;
     options.connections.mysql = otterstax::test::mock_mysql({"orders"});
-    otterstax::test::session_stack_owner owner(otterstax::test::unique_test_dir("otterstax_wire_pg_remote_ddl"), options);
+    otterstax::test::session_stack_owner owner(otterstax::test::unique_test_dir("otterstax_wire_pg_remote_ddl"),
+                                               options);
     frontend::postgres::postgres_server server(make_config<frontend::postgres::postgres_server>(owner.stack()));
     server.start();
 
     raw_client a(server.local_port());
     pg_startup(a);
-    pg_ok(a, "CREATE TABLE orders.db.public.created_remote (id bigint)", "CREATE TABLE", 'I');
-    pg_ok(a, "DROP TABLE orders.db.public.created_remote", "DROP", 'I');
-    pg_extended_ok(a, "CREATE TABLE orders.db.public.created_extended (id bigint)", "CREATE TABLE", 'I');
-    pg_extended_ok(a, "DROP TABLE orders.db.public.created_extended", "DROP", 'I');
+    pg_ok(a, "CREATE TABLE orders.db.created_remote (id bigint)", "CREATE TABLE", 'I');
+    pg_ok(a, "DROP TABLE orders.db.created_remote", "DROP", 'I');
+    pg_extended_ok(a, "CREATE TABLE orders.db.created_extended (id bigint)", "CREATE TABLE", 'I');
+    pg_extended_ok(a, "DROP TABLE orders.db.created_extended", "DROP", 'I');
     server.stop();
 }
 
@@ -630,7 +627,8 @@ TEST_CASE("wire statements: postgres DEALLOCATE through the extended protocol ke
     types.clear();
     tags.clear();
     read_until_ready(types, tags);
-    CHECK(tags == std::vector<std::string>{"E:" + std::string{frontend::postgres::sql_state::INVALID_SQL_STATAMENT_NAME}});
+    CHECK(tags ==
+          std::vector<std::string>{"E:" + std::string{frontend::postgres::sql_state::INVALID_SQL_STATAMENT_NAME}});
 
     // DEALLOCATE ALL and an unknown name, through the extended protocol.
     send({parse("s2", "SELECT id FROM wdx.t"), pg_frame('S', {})});
@@ -652,12 +650,13 @@ TEST_CASE("wire statements: postgres DEALLOCATE through the extended protocol ke
     // Close(statement), unlike DEALLOCATE, closes the portals bound from it.
     send({parse("s3", "SELECT id FROM wdx.t"),
           bind("p3", "s3"),
-          pg_frame('C', [] {
-              std::vector<uint8_t> body{'S'};
-              auto name = cstr("s3");
-              body.insert(body.end(), name.begin(), name.end());
-              return body;
-          }()),
+          pg_frame('C',
+                   [] {
+                       std::vector<uint8_t> body{'S'};
+                       auto name = cstr("s3");
+                       body.insert(body.end(), name.begin(), name.end());
+                       return body;
+                   }()),
           execute("p3"),
           pg_frame('S', {})});
     types.clear();
@@ -896,9 +895,9 @@ TEST_CASE("wire settings: a mysql SET autocommit is its connection's own") {
     raw_client a(server.local_port());
     raw_client b(server.local_port());
     raw_client c(server.local_port());
-    mysql_handshake(a);
-    mysql_handshake(b);
-    mysql_handshake(c);
+    mysql_handshake_in(a, "local");
+    mysql_handshake_in(b, "local");
+    mysql_handshake_in(c, "local");
     mysql_ok(a, "CREATE SCHEMA mys");
     mysql_ok(a, "CREATE TABLE mys.t (id bigint)");
 
@@ -923,8 +922,8 @@ TEST_CASE("wire transactions: mysql SAVEPOINT runs in the engine") {
 
     raw_client a(server.local_port());
     raw_client b(server.local_port());
-    mysql_handshake(a);
-    mysql_handshake(b);
+    mysql_handshake_in(a, "local");
+    mysql_handshake_in(b, "local");
     mysql_ok(a, "CREATE SCHEMA msp");
     mysql_ok(a, "CREATE TABLE msp.t (id bigint)");
     static_cast<void>(mysql_err(a, "SAVEPOINT sp"));
@@ -959,8 +958,8 @@ TEST_CASE("wire transactions: mysql SET NAMES is the frontend's check") {
 
     raw_client a(server.local_port());
     raw_client b(server.local_port());
-    mysql_handshake(a);
-    mysql_handshake(b);
+    mysql_handshake_in(a, "local");
+    mysql_handshake_in(b, "local");
     mysql_ok(a, "CREATE SCHEMA mtn");
     mysql_ok(a, "CREATE TABLE mtn.t (id bigint)");
     mysql_ok(a, "SET NAMES utf8mb4");
@@ -986,7 +985,7 @@ TEST_CASE("wire transactions: mysql status flags carry SERVER_STATUS_IN_TRANS in
     server.start();
 
     raw_client a(server.local_port());
-    mysql_handshake(a);
+    mysql_handshake_in(a, "local");
     auto created = mysql_ok_flags(a, "CREATE SCHEMA mts");
     CHECK((created & SERVER_STATUS_IN_TRANS) == 0);
     CHECK((created & SERVER_STATUS_AUTOCOMMIT) != 0);
@@ -1015,8 +1014,8 @@ TEST_CASE("wire transactions: mysql ROLLBACK discards and COMMIT publishes the b
 
     raw_client a(server.local_port());
     raw_client b(server.local_port());
-    mysql_handshake(a);
-    mysql_handshake(b);
+    mysql_handshake_in(a, "local");
+    mysql_handshake_in(b, "local");
     mysql_ok(a, "CREATE SCHEMA mtx");
     mysql_ok(a, "CREATE TABLE mtx.t (id bigint)");
 
@@ -1041,7 +1040,7 @@ TEST_CASE("wire transactions: mysql error aborts the block until it ends") {
     server.start();
 
     raw_client a(server.local_port());
-    mysql_handshake(a);
+    mysql_handshake_in(a, "local");
     mysql_ok(a, "CREATE SCHEMA mta");
     mysql_ok(a, "CREATE TABLE mta.t (id bigint)");
 
@@ -1052,12 +1051,8 @@ TEST_CASE("wire transactions: mysql error aborts the block until it ends") {
     INFO(refused);
     CHECK(refused.find("only ROLLBACK") != std::string::npos);
 
-    SECTION("COMMIT ends it as a rollback") {
-        mysql_ok(a, "COMMIT");
-    }
-    SECTION("ROLLBACK ends it") {
-        mysql_ok(a, "ROLLBACK");
-    }
+    SECTION("COMMIT ends it as a rollback") { mysql_ok(a, "COMMIT"); }
+    SECTION("ROLLBACK ends it") { mysql_ok(a, "ROLLBACK"); }
     CHECK(mysql_count(a, "mta.t") == 0);
     server.stop();
 }
@@ -1083,7 +1078,7 @@ TEST_CASE("wire disconnect: a client that drops its socket mid-statement leaves 
         }
         raw_client next(server.local_port());
         pg_startup(next);
-        pg_ok(next, "CREATE DATABASE after_drop", "CREATE DATABASE", 'I');
+        pg_ok(next, "CREATE SCHEMA after_drop", "CREATE SCHEMA", 'I');
         next.close();
         CHECK(wait_for_live(sessions, baseline, 10000ms));
         server.stop();
@@ -1093,13 +1088,13 @@ TEST_CASE("wire disconnect: a client that drops its socket mid-statement leaves 
         server.start();
         for (int cycle = 0; cycle < 3; ++cycle) {
             raw_client gone(server.local_port());
-            mysql_handshake(gone);
+            mysql_handshake_in(gone, "local");
             gone.write(mysql_query_packet(kSlow));
             std::this_thread::sleep_for(100ms);
             gone.close();
         }
         raw_client next(server.local_port());
-        mysql_handshake(next);
+        mysql_handshake_in(next, "local");
         mysql_ok(next, "CREATE DATABASE after_drop");
         next.close();
         CHECK(wait_for_live(sessions, baseline, 10000ms));
@@ -1121,19 +1116,19 @@ TEST_CASE("wire waiting: a statement waiting for a backend agent holds no thread
     options.connections.mysql.front().pool_size = 1;
     otterstax::test::session_stack_owner owner(otterstax::test::unique_test_dir("otterstax_wire_agent_wait"), options);
     SECTION("mysql") {
-        const std::string remote_select = "SELECT id FROM m.db.public.`table`"; // MySQL quotes a name with backticks
+        const std::string remote_select = "SELECT id FROM m.db.`table`"; // MySQL quotes a name with backticks
         frontend::mysql::mysql_server server(make_config<frontend::mysql::mysql_server>(owner.stack(), 1));
         server.start();
         raw_client holder(server.local_port());
         raw_client waiter(server.local_port());
-        mysql_handshake(holder);
-        mysql_handshake(waiter);
+        mysql_handshake_in(holder, "local");
+        mysql_handshake_in(waiter, "local");
         mysql_ok(holder, "SET autocommit = 0");
         // The block's first statement takes the only agent and keeps it.
         CHECK((mysql_resultset_flags(holder, remote_select) & SERVER_STATUS_IN_TRANS) != 0);
 
         waiter.write(mysql_query_packet(remote_select));
-        std::this_thread::sleep_for(300ms); // the waiter's statement is in the agent queue
+        std::this_thread::sleep_for(300ms);   // the waiter's statement is in the agent queue
         holder.write(mysql_frame(0, {0x01})); // COM_QUIT
         holder.close();
 
@@ -1143,7 +1138,7 @@ TEST_CASE("wire waiting: a statement waiting for a backend agent holds no thread
         server.stop();
     }
     SECTION("postgres") {
-        const std::string remote_select = "SELECT id FROM m.db.public.\"table\"";
+        const std::string remote_select = "SELECT id FROM m.db.\"table\"";
         frontend::postgres::postgres_server server(make_config<frontend::postgres::postgres_server>(owner.stack(), 1));
         server.start();
         raw_client holder(server.local_port());
@@ -1185,12 +1180,12 @@ TEST_CASE("wire waiting: a server stop does not wait for a statement waiting for
     otterstax::test::session_stack_owner owner(otterstax::test::unique_test_dir("otterstax_wire_stop_wait"), options);
     auto& sessions = owner.sessions();
     const size_t baseline = sessions.live_sessions();
-    const std::string remote_select = "SELECT id FROM m.db.public.`table`";
+    const std::string remote_select = "SELECT id FROM m.db.`table`";
 
     frontend::mysql::mysql_server holding(make_config<frontend::mysql::mysql_server>(owner.stack(), 1));
     holding.start();
     raw_client holder(holding.local_port());
-    mysql_handshake(holder);
+    mysql_handshake_in(holder, "local");
     mysql_ok(holder, "SET autocommit = 0");
     CHECK((mysql_resultset_flags(holder, remote_select) & SERVER_STATUS_IN_TRANS) != 0); // holds the only agent
 
@@ -1199,7 +1194,7 @@ TEST_CASE("wire waiting: a server stop does not wait for a statement waiting for
         server.start();
         raw_client waiter(server.local_port());
         pg_startup(waiter);
-        waiter.write(pg_frame('Q', cstr("SELECT id FROM m.db.public.\"table\"")));
+        waiter.write(pg_frame('Q', cstr("SELECT id FROM m.db.\"table\"")));
         std::this_thread::sleep_for(300ms); // the waiter's statement is in the agent queue
         const auto started = std::chrono::steady_clock::now();
         server.stop();
@@ -1209,7 +1204,7 @@ TEST_CASE("wire waiting: a server stop does not wait for a statement waiting for
         frontend::mysql::mysql_server server(make_config<frontend::mysql::mysql_server>(owner.stack(), 1));
         server.start();
         raw_client waiter(server.local_port());
-        mysql_handshake(waiter);
+        mysql_handshake_in(waiter, "local");
         waiter.write(mysql_query_packet(remote_select));
         std::this_thread::sleep_for(300ms);
         const auto started = std::chrono::steady_clock::now();
@@ -1222,7 +1217,7 @@ TEST_CASE("wire waiting: a server stop does not wait for a statement waiting for
     holder.write(mysql_frame(0, {0x01})); // COM_QUIT frees the agent
     holder.close();
     raw_client next(holding.local_port());
-    mysql_handshake(next);
+    mysql_handshake_in(next, "local");
     mysql_ok(next, "SET autocommit = 0");
     const auto started = std::chrono::steady_clock::now();
     CHECK((mysql_resultset_flags(next, remote_select) & SERVER_STATUS_IN_TRANS) != 0);
@@ -1245,12 +1240,12 @@ TEST_CASE("wire waiting: a client gone while its statement waits for a backend a
     otterstax::test::session_stack_owner owner(otterstax::test::unique_test_dir("otterstax_wire_gone_wait"), options);
     auto& sessions = owner.sessions();
     const size_t baseline = sessions.live_sessions();
-    const std::string remote_select = "SELECT id FROM m.db.public.`table`";
+    const std::string remote_select = "SELECT id FROM m.db.`table`";
 
     frontend::mysql::mysql_server holding(make_config<frontend::mysql::mysql_server>(owner.stack(), 1));
     holding.start();
     raw_client holder(holding.local_port());
-    mysql_handshake(holder);
+    mysql_handshake_in(holder, "local");
     mysql_ok(holder, "SET autocommit = 0");
     CHECK((mysql_resultset_flags(holder, remote_select) & SERVER_STATUS_IN_TRANS) != 0); // holds the only agent
 
@@ -1261,7 +1256,7 @@ TEST_CASE("wire waiting: a client gone while its statement waits for a backend a
             raw_client gone(server.local_port());
             pg_startup(gone);
             pg_ok(gone, "BEGIN", "BEGIN", 'T'); // its statement would hold the agent until the block ends
-            gone.write(pg_frame('Q', cstr("SELECT id FROM m.db.public.\"table\"")));
+            gone.write(pg_frame('Q', cstr("SELECT id FROM m.db.\"table\"")));
             std::this_thread::sleep_for(300ms); // in the agent queue
             gone.close();
         }
@@ -1273,7 +1268,7 @@ TEST_CASE("wire waiting: a client gone while its statement waits for a backend a
         server.start();
         {
             raw_client gone(server.local_port());
-            mysql_handshake(gone);
+            mysql_handshake_in(gone, "local");
             mysql_ok(gone, "SET autocommit = 0"); // its statement would hold the agent until the block ends
             gone.write(mysql_query_packet(remote_select));
             std::this_thread::sleep_for(300ms);
@@ -1286,7 +1281,7 @@ TEST_CASE("wire waiting: a client gone while its statement waits for a backend a
     holder.write(mysql_frame(0, {0x01})); // COM_QUIT frees the agent
     holder.close();
     raw_client next(holding.local_port());
-    mysql_handshake(next);
+    mysql_handshake_in(next, "local");
     mysql_ok(next, "SET autocommit = 0");
     const auto started = std::chrono::steady_clock::now();
     CHECK((mysql_resultset_flags(next, remote_select) & SERVER_STATUS_IN_TRANS) != 0);
@@ -1297,7 +1292,6 @@ TEST_CASE("wire waiting: a client gone while its statement waits for a backend a
 }
 
 namespace {
-
     // The text of the first cell of the first row of a simple-Query answer.
     std::string pg_first_text(const pg_answer& answer) {
         const auto* row = answer.first('D');
@@ -1325,7 +1319,6 @@ namespace {
     }
 
     constexpr const char* kServerWide = "server-wide settings are not changed by a client";
-
 } // namespace
 
 // A client changes its own session's settings only: ALTER SYSTEM, ALTER
@@ -1338,15 +1331,15 @@ TEST_CASE("wire settings: postgres server-wide settings are refused") {
     server.start();
     raw_client a(server.local_port());
     pg_startup(a);
-    pg_ok(a, "CREATE DATABASE other", "CREATE DATABASE", 'I');
+    pg_ok(a, "CREATE SCHEMA other", "CREATE SCHEMA", 'I');
 
-    for (const char* sql : {"ALTER SYSTEM SET search_path = 'other.public'",
+    for (const char* sql : {"ALTER SYSTEM SET search_path = 'local.other'",
                             "ALTER SYSTEM SET timezone TO 'Asia/Tokyo'",
                             "ALTER SYSTEM RESET timezone",
                             "ALTER SYSTEM RESET ALL",
-                            "ALTER DATABASE main SET search_path = 'other.public'",
-                            "ALTER DATABASE main RESET ALL",
-                            "ALTER ROLE test SET search_path = 'other.public'",
+                            "ALTER DATABASE local SET search_path = 'local.other'",
+                            "ALTER DATABASE local RESET ALL",
+                            "ALTER ROLE test SET search_path = 'local.other'",
                             "ALTER ROLE ALL RESET timezone"}) {
         INFO(sql);
         auto simple = pg_query(a, sql);
@@ -1360,7 +1353,7 @@ TEST_CASE("wire settings: postgres server-wide settings are refused") {
     // Another (new) session sits where every session starts.
     raw_client b(server.local_port());
     pg_startup(b);
-    CHECK(pg_first_text(pg_query(b, "SELECT current_database()")) == "main");
+    CHECK(pg_first_text(pg_query(b, "SELECT current_database()")) == "local");
 
     pg_ok(a, "BEGIN", "BEGIN", 'T');
     auto in_block = pg_query(a, "ALTER SYSTEM SET timezone TO 'UTC'");
@@ -1381,8 +1374,8 @@ TEST_CASE("wire settings: mysql server-wide settings are refused") {
     server.start();
     raw_client a(server.local_port());
     raw_client b(server.local_port());
-    mysql_handshake(a);
-    mysql_handshake(b);
+    mysql_handshake_in(a, "local");
+    mysql_handshake_in(b, "local");
     mysql_ok(a, "CREATE SCHEMA msw");
     mysql_ok(a, "CREATE TABLE msw.t (id bigint)");
 
@@ -1436,7 +1429,7 @@ TEST_CASE("wire settings: a postgres SET reports ParameterStatus") {
     // The value as the engine keeps it (its canonical spelling, lower case).
     CHECK(pg_parameter_status(timezone) == std::vector<std::string>{"TimeZone=asia/tokyo"});
     // The startup's search_path already: nothing changed, nothing reported.
-    auto path = pg_extended(a, "SET search_path = 'main.public'");
+    auto path = pg_extended(a, "SET search_path = 'local.public'");
     REQUIRE(path.first('E') == nullptr);
     CHECK(pg_parameter_status(path).empty());
     CHECK(pg_parameter_status(pg_query(a, "SET autocommit TO on")).empty());
@@ -1454,7 +1447,6 @@ TEST_CASE("wire settings: a postgres SET reports ParameterStatus") {
 }
 
 namespace {
-
     // The ParameterStatus messages of a startup answer, as name=value.
     std::vector<std::string> pg_startup_status(const std::vector<pg_message>& messages) {
         pg_answer answer;
@@ -1486,7 +1478,6 @@ namespace {
         CHECK(client.wait_for_close());
         return refusal;
     }
-
 } // namespace
 
 // The protocol's parameters in a StartupMessage are checked against what
@@ -1503,7 +1494,7 @@ TEST_CASE("wire startup: postgres protocol parameters are checked against what O
         raw_client a(server.local_port());
         const auto answer = pg_startup_answer(a,
                                               {{"user", "test"},
-                                               {"database", "main"},
+                                               {"database", "local"},
                                                {"client_encoding", "UTF8"},
                                                {"DateStyle", "ISO"},
                                                {"standard_conforming_strings", "on"},
@@ -1521,7 +1512,7 @@ TEST_CASE("wire startup: postgres protocol parameters are checked against what O
                                   // (TimeZone), canonicalised as the engine
                                   // keeps every value.
                                   "TimeZone=utc",
-                                  "search_path=main.public"}) {
+                                  "search_path=local.public"}) {
             INFO(entry);
             CHECK(has_status(status, entry));
         }
@@ -1534,12 +1525,11 @@ TEST_CASE("wire startup: postgres protocol parameters are checked against what O
     {
         // PostgreSQL's other spellings of the same values.
         raw_client a(server.local_port());
-        const auto answer = pg_startup_answer(
-            a,
-            {{"user", "test"},
-             {"client_encoding", "utf-8"},
-             {"DateStyle", "ISO, MDY"},
-             {"options", "-c client_encoding=unicode"}});
+        const auto answer = pg_startup_answer(a,
+                                              {{"user", "test"},
+                                               {"client_encoding", "utf-8"},
+                                               {"DateStyle", "ISO, MDY"},
+                                               {"options", "-c client_encoding=unicode"}});
         REQUIRE(answer.back().type == 'Z');
     }
     struct refused_t {
@@ -1553,7 +1543,7 @@ TEST_CASE("wire startup: postgres protocol parameters are checked against what O
                                       refused_t{"standard_conforming_strings", "off"}}) {
         INFO(name << "=" << value);
         raw_client a(server.local_port());
-        const auto refusal = pg_refused_startup(a, {{"user", "test"}, {"database", "main"}, {name, value}});
+        const auto refusal = pg_refused_startup(a, {{"user", "test"}, {"database", "local"}, {name, value}});
         CHECK(refusal.severity == "FATAL");
         CHECK(refusal.sqlstate == frontend::postgres::sql_state::INVALID_PARAMETER_VALUE);
         const auto expected = std::string{"invalid value for parameter \""} + name + "\": \"" + value + "\"";
@@ -1580,15 +1570,15 @@ TEST_CASE("wire startup: postgres database options and engine settings") {
     {
         raw_client a(server.local_port());
         pg_startup(a);
-        pg_ok(a, "CREATE DATABASE other", "CREATE DATABASE", 'I');
-        CHECK(pg_first_text(pg_query(a, "SELECT current_database()")) == "main");
+        pg_ok(a, "CREATE SCHEMA other", "CREATE SCHEMA", 'I');
+        CHECK(pg_first_text(pg_query(a, "SELECT current_database()")) == "local");
     }
     {
         raw_client a(server.local_port());
-        const auto answer = pg_startup_answer(a, {{"user", "test"}, {"database", "other"}});
+        const auto answer = pg_startup_answer(a, {{"user", "test"}, {"database", "local.other"}});
         REQUIRE(answer.back().type == 'Z');
-        CHECK(has_status(pg_startup_status(answer), "search_path=other.public"));
-        CHECK(pg_first_text(pg_query(a, "SELECT current_database()")) == "other");
+        CHECK(has_status(pg_startup_status(answer), "search_path=local.other"));
+        CHECK(pg_first_text(pg_query(a, "SELECT current_database()")) == "local");
     }
     {
         raw_client a(server.local_port());
@@ -1596,20 +1586,20 @@ TEST_CASE("wire startup: postgres database options and engine settings") {
         CHECK(refusal.severity == "FATAL");
         CHECK(refusal.sqlstate == frontend::postgres::sql_state::INVALID_CATALOG_NAME);
         CHECK(refusal.message == "database \"nope\" does not exist");
-        CHECK(refusal.hint == "The default database is \"main\".");
+        CHECK(refusal.hint == "A database is a connection, connection.namespace, local or local.namespace.");
     }
     {
         // `options` after the database: its search_path is the place.
         raw_client a(server.local_port());
         const auto answer = pg_startup_answer(
             a,
-            {{"user", "test"}, {"database", "main"}, {"options", "-c search_path=other.public --TimeZone=Asia/Tokyo"}});
+            {{"user", "test"}, {"database", "local"}, {"options", "-c search_path=local.other --TimeZone=Asia/Tokyo"}});
         REQUIRE(answer.back().type == 'Z');
         const auto status = pg_startup_status(answer);
-        CHECK(has_status(status, "search_path=other.public"));
+        CHECK(has_status(status, "search_path=local.other"));
         // As the engine keeps it: lower case (canonical_setting_value).
         CHECK(has_status(status, "TimeZone=asia/tokyo"));
-        CHECK(pg_first_text(pg_query(a, "SELECT current_database()")) == "other");
+        CHECK(pg_first_text(pg_query(a, "SELECT current_database()")) == "local");
     }
     {
         raw_client a(server.local_port());
@@ -1621,7 +1611,7 @@ TEST_CASE("wire startup: postgres database options and engine settings") {
         // psql and PgJDBC send application_name in every StartupMessage.
         raw_client a(server.local_port());
         const auto answer =
-            pg_startup_answer(a, {{"user", "test"}, {"database", "main"}, {"application_name", "psql"}});
+            pg_startup_answer(a, {{"user", "test"}, {"database", "local"}, {"application_name", "psql"}});
         REQUIRE(answer.back().type == 'Z');
         CHECK(has_status(pg_startup_status(answer), "application_name=psql"));
         CHECK(pg_first_text(pg_query(a, "SELECT 1")) == "1");
@@ -1646,7 +1636,6 @@ TEST_CASE("wire startup: postgres database options and engine settings") {
 }
 
 namespace {
-
     // The one text cell of a SHOW answer, after checking its RowDescription:
     // one column named `column`, type text (oid 25), and the tag SHOW.
     std::string pg_show_value(const pg_answer& answer, const std::string& column) {
@@ -1678,7 +1667,6 @@ namespace {
     }
 
     std::vector<std::string> one(std::string value) { return {std::move(value)}; }
-
 } // namespace
 
 // application_name is the client's value, kept by the frontend per connection
@@ -1702,7 +1690,7 @@ TEST_CASE("wire settings: postgres application_name is kept by the frontend") {
     }
     {
         raw_client a(server.local_port());
-        const auto answer = pg_startup_answer(a, {{"user", "test"}, {"database", "main"}});
+        const auto answer = pg_startup_answer(a, {{"user", "test"}, {"database", "local"}});
         REQUIRE(answer.back().type == 'Z');
         CHECK(has_status(pg_startup_status(answer), "application_name="));
     }
@@ -1715,7 +1703,8 @@ TEST_CASE("wire settings: postgres application_name is kept by the frontend") {
     {
         raw_client a(server.local_port());
         const auto answer = pg_startup_answer(
-            a, {{"user", "test"}, {"options", "--application-name=first"}, {"application_name", "second"}});
+            a,
+            {{"user", "test"}, {"options", "--application-name=first"}, {"application_name", "second"}});
         REQUIRE(answer.back().type == 'Z');
         const auto status = pg_startup_status(answer);
         CHECK(has_status(status, "application_name=second"));
@@ -1736,7 +1725,7 @@ TEST_CASE("wire settings: postgres application_name is kept by the frontend") {
     }
 
     raw_client a(server.local_port());
-    const auto started = pg_startup_answer(a, {{"user", "test"}, {"database", "main"}, {"application_name", "start"}});
+    const auto started = pg_startup_answer(a, {{"user", "test"}, {"database", "local"}, {"application_name", "start"}});
     REQUIRE(started.back().type == 'Z');
     CHECK(pg_first_text(pg_query(a, "SELECT 1")) == "1");
     CHECK(pg_show_value(pg_query(a, "SHOW application_name"), "application_name") == "start");
@@ -1751,8 +1740,7 @@ TEST_CASE("wire settings: postgres application_name is kept by the frontend") {
     // The same value again changes nothing: nothing is reported.
     CHECK(pg_application_name_status(pg_query(a, "SET SESSION application_name TO 'other'")).empty());
     // Cleaned as at startup.
-    CHECK(pg_application_name_status(pg_query(a, "SET application_name = E'tab\\there'")) ==
-          one("tab\\x09here"));
+    CHECK(pg_application_name_status(pg_query(a, "SET application_name = E'tab\\there'")) == one("tab\\x09here"));
 
     auto extended = pg_extended(a, "SET application_name TO 'ext'");
     REQUIRE(extended.first('E') == nullptr);
@@ -1807,7 +1795,7 @@ TEST_CASE("wire settings: postgres application_name is kept by the frontend") {
 
     // A failed block refuses SET and SHOW as it refuses every statement.
     pg_ok(a, "BEGIN", "BEGIN", 'T');
-    CHECK(pg_query(a, "SELECT * FROM main.public.no_such_table").status == 'E');
+    CHECK(pg_query(a, "SELECT * FROM local.public.no_such_table").status == 'E');
     for (const char* sql : {"SET application_name = 'x'", "RESET application_name", "SHOW application_name"}) {
         INFO(sql);
         auto simple = pg_query(a, sql);
@@ -1825,7 +1813,6 @@ TEST_CASE("wire settings: postgres application_name is kept by the frontend") {
 }
 
 namespace {
-
     // The text cells of a simple-Query answer's DataRows, in order.
     std::vector<std::string> pg_texts(const pg_answer& answer) {
         INFO(answer.sqlstate() << " " << answer.error_text());
@@ -1851,7 +1838,6 @@ namespace {
         }
         return out;
     }
-
 } // namespace
 
 // extra_float_digits is the client's, kept by the frontend per connection as
@@ -1866,29 +1852,29 @@ TEST_CASE("wire settings: postgres extra_float_digits is kept by the frontend") 
     server.start();
     const std::vector<std::string> shortest{"0.30000000000000004", "1e-09", "1e+300", "123456789.123", "0.1"};
     const std::vector<std::string> printf_form{"0.3", "1e-09", "1e+300", "123456789.123", "0.1"};
-    const char* select = "SELECT d FROM main.public.fl ORDER BY id";
+    const char* select = "SELECT d FROM local.public.fl ORDER BY id";
     {
         raw_client a(server.local_port());
         pg_startup(a);
-        pg_ok(a, "CREATE TABLE main.public.fl (id bigint, d float8)", "CREATE TABLE", 'I');
+        pg_ok(a, "CREATE TABLE local.public.fl (id bigint, d float8)", "CREATE TABLE", 'I');
         pg_ok(a,
-              "INSERT INTO main.public.fl (id, d) VALUES (1, 0.30000000000000004), (2, 0.000000001), (3, 1e300), "
+              "INSERT INTO local.public.fl (id, d) VALUES (1, 0.30000000000000004), (2, 0.000000001), (3, 1e300), "
               "(4, 123456789.123), (5, 0.1)",
               "INSERT 0 5",
               'I');
-        pg_ok(a, "CREATE TABLE main.public.fl4 (f float4)", "CREATE TABLE", 'I');
-        pg_ok(a, "INSERT INTO main.public.fl4 (f) VALUES (3.14159265)", "INSERT 0 1", 'I');
+        pg_ok(a, "CREATE TABLE local.public.fl4 (f float4)", "CREATE TABLE", 'I');
+        pg_ok(a, "INSERT INTO local.public.fl4 (f) VALUES (3.14159265)", "INSERT 0 1", 'I');
         // The default is 1: the shortest exact form.
         CHECK(pg_show_value(pg_query(a, "SHOW extra_float_digits"), "extra_float_digits") == "1");
         CHECK(pg_texts(pg_query(a, select)) == shortest);
-        CHECK(pg_texts(pg_query(a, "SELECT f FROM main.public.fl4")) == std::vector<std::string>{"3.1415927"});
+        CHECK(pg_texts(pg_query(a, "SELECT f FROM local.public.fl4")) == std::vector<std::string>{"3.1415927"});
 
         auto set = pg_query(a, "SET extra_float_digits = 0");
         REQUIRE(set.first('E') == nullptr);
         CHECK(set.tag() == "SET");
         CHECK(pg_parameter_status(set).empty());
         CHECK(pg_texts(pg_query(a, select)) == printf_form);
-        CHECK(pg_texts(pg_query(a, "SELECT f FROM main.public.fl4")) == std::vector<std::string>{"3.14159"});
+        CHECK(pg_texts(pg_query(a, "SELECT f FROM local.public.fl4")) == std::vector<std::string>{"3.14159"});
         CHECK(pg_texts(pg_extended(a, select)) == printf_form);
         CHECK(pg_show_value(pg_extended(a, "SHOW extra_float_digits"), "extra_float_digits") == "0");
 
@@ -1929,7 +1915,8 @@ TEST_CASE("wire settings: postgres extra_float_digits is kept by the frontend") 
         // PgJDBC's StartupMessage: 3, and RESET goes back to it.
         raw_client a(server.local_port());
         const auto answer = pg_startup_answer(
-            a, {{"user", "test"}, {"database", "main"}, {"extra_float_digits", "3"}, {"application_name", "jdbc"}});
+            a,
+            {{"user", "test"}, {"database", "local"}, {"extra_float_digits", "3"}, {"application_name", "jdbc"}});
         REQUIRE(answer.back().type == 'Z');
         for (const auto& entry : pg_startup_status(answer)) {
             CHECK_FALSE(entry.starts_with("extra_float_digits="));
@@ -1963,10 +1950,10 @@ TEST_CASE("wire text: a postgres boolean is t or f") {
     server.start();
     raw_client a(server.local_port());
     pg_startup(a);
-    pg_ok(a, "CREATE TABLE main.public.flags (id bigint, ok bool)", "CREATE TABLE", 'I');
-    pg_ok(a, "INSERT INTO main.public.flags (id, ok) VALUES (1, true), (2, false)", "INSERT 0 2", 'I');
-    CHECK(pg_texts(pg_query(a, "SELECT ok FROM main.public.flags ORDER BY id")) == std::vector<std::string>{"t", "f"});
-    CHECK(pg_texts(pg_extended(a, "SELECT ok FROM main.public.flags ORDER BY id")) ==
+    pg_ok(a, "CREATE TABLE local.public.flags (id bigint, ok bool)", "CREATE TABLE", 'I');
+    pg_ok(a, "INSERT INTO local.public.flags (id, ok) VALUES (1, true), (2, false)", "INSERT 0 2", 'I');
+    CHECK(pg_texts(pg_query(a, "SELECT ok FROM local.public.flags ORDER BY id")) == std::vector<std::string>{"t", "f"});
+    CHECK(pg_texts(pg_extended(a, "SELECT ok FROM local.public.flags ORDER BY id")) ==
           std::vector<std::string>{"t", "f"});
     CHECK(pg_texts(pg_query(a, "SELECT ARRAY[true, false]")) == std::vector<std::string>{"{t,f}"});
     server.stop();
@@ -2075,8 +2062,7 @@ TEST_CASE("wire statements: postgres portals end at an autocommit Sync and with 
         return answer;
     };
 
-    REQUIRE(exchange({parse("s1", "SELECT id FROM wpe.t"), bind("p1", "s1"), pg_frame('S', {})}).first('E') ==
-            nullptr);
+    REQUIRE(exchange({parse("s1", "SELECT id FROM wpe.t"), bind("p1", "s1"), pg_frame('S', {})}).first('E') == nullptr);
     auto after_sync = exchange({execute("p1"), pg_frame('S', {})});
     CHECK(after_sync.first('E') != nullptr);
 
@@ -2103,11 +2089,9 @@ TEST_CASE("wire statements: postgres portals end at an autocommit Sync and with 
 }
 
 namespace {
-
     // Extended-protocol frames for the cases below.
-    std::vector<uint8_t> pg_parse_frame(const std::string& name,
-                                        const std::string& sql,
-                                        const std::vector<uint32_t>& types = {}) {
+    std::vector<uint8_t>
+    pg_parse_frame(const std::string& name, const std::string& sql, const std::vector<uint32_t>& types = {}) {
         auto body = cstr(name);
         auto text = cstr(sql);
         body.insert(body.end(), text.begin(), text.end());
@@ -2124,8 +2108,9 @@ namespace {
     }
 
     // Bind of `statement` into `portal` with text values (none: no parameters).
-    std::vector<uint8_t>
-    pg_bind_frame(const std::string& portal, const std::string& statement, const std::vector<std::string>& values = {}) {
+    std::vector<uint8_t> pg_bind_frame(const std::string& portal,
+                                       const std::string& statement,
+                                       const std::vector<std::string>& values = {}) {
         auto body = cstr(portal);
         auto name = cstr(statement);
         body.insert(body.end(), name.begin(), name.end());
@@ -2196,7 +2181,6 @@ namespace {
         }
         return out;
     }
-
 } // namespace
 
 // client_encoding is the client's, UTF8 or SQL_ASCII (psql on a terminal in the
@@ -2260,7 +2244,7 @@ TEST_CASE("wire settings: postgres TimeZone and search_path are reported wheneve
     server.start();
     raw_client a(server.local_port());
     pg_startup(a);
-    pg_ok(a, "CREATE DATABASE other", "CREATE DATABASE", 'I');
+    pg_ok(a, "CREATE SCHEMA other", "CREATE SCHEMA", 'I');
 
     CHECK(pg_status_of(pg_query(a, "SET TimeZone TO 'Asia/Tokyo'"), "TimeZone") == one("asia/tokyo"));
     CHECK(pg_parameter_status(pg_query(a, "SET TimeZone TO 'ASIA/TOKYO'")).empty());
@@ -2277,14 +2261,14 @@ TEST_CASE("wire settings: postgres TimeZone and search_path are reported wheneve
 
     // Kept by COMMIT: nothing more to report.
     pg_ok(a, "BEGIN", "BEGIN", 'T');
-    CHECK(pg_status_of(pg_query(a, "SET search_path = 'other.public'"), "search_path") == one("other.public"));
+    CHECK(pg_status_of(pg_query(a, "SET search_path = 'local.other'"), "search_path") == one("local.other"));
     CHECK(pg_parameter_status(pg_query(a, "COMMIT")).empty());
-    CHECK(pg_first_text(pg_query(a, "SELECT current_database()")) == "other");
+    CHECK(pg_first_text(pg_query(a, "SELECT current_database()")) == "local");
 
     // A SET LOCAL ends with its block.
     pg_extended_ok(a, "BEGIN", "BEGIN", 'T');
-    CHECK(pg_status_of(pg_extended(a, "SET LOCAL search_path = 'main.public'"), "search_path") == one("main.public"));
-    CHECK(pg_status_of(pg_extended(a, "COMMIT"), "search_path") == one("other.public"));
+    CHECK(pg_status_of(pg_extended(a, "SET LOCAL search_path = 'local.public'"), "search_path") == one("local.public"));
+    CHECK(pg_status_of(pg_extended(a, "COMMIT"), "search_path") == one("local.other"));
 
     // ROLLBACK TO a savepoint takes the value back to the savepoint's.
     pg_ok(a, "BEGIN", "BEGIN", 'T');
@@ -2297,7 +2281,7 @@ TEST_CASE("wire settings: postgres TimeZone and search_path are reported wheneve
     // A failed block's ROLLBACK takes back what the block set.
     pg_ok(a, "BEGIN", "BEGIN", 'T');
     CHECK(pg_status_of(pg_query(a, "SET TimeZone = 'Europe/Paris'"), "TimeZone") == one("europe/paris"));
-    CHECK(pg_query(a, "SELECT * FROM main.public.nowhere").status == 'E');
+    CHECK(pg_query(a, "SELECT * FROM local.public.nowhere").status == 'E');
     CHECK(pg_status_of(pg_query(a, "ROLLBACK"), "TimeZone") == one("asia/tokyo"));
 
     // On the extended route the ParameterStatus comes after the
@@ -2359,7 +2343,8 @@ TEST_CASE("wire settings: postgres RESET is tagged RESET and a SET takes one val
     server.start();
     raw_client a(server.local_port());
     pg_startup(a);
-    for (const char* sql : {"RESET application_name", "RESET extra_float_digits", "RESET DateStyle", "RESET TimeZone"}) {
+    for (const char* sql :
+         {"RESET application_name", "RESET extra_float_digits", "RESET DateStyle", "RESET TimeZone"}) {
         INFO(sql);
         pg_ok(a, sql, "RESET", 'I');
         pg_extended_ok(a, sql, "RESET", 'I');
@@ -2495,15 +2480,14 @@ TEST_CASE("wire startup: postgres database without its public schema") {
     {
         raw_client a(server.local_port());
         pg_startup(a);
-        pg_ok(a, "CREATE DATABASE bare", "CREATE DATABASE", 'I');
-        pg_ok(a, "SET search_path = 'bare.public'", "SET", 'I');
+        // A client's DROP SCHEMA names a schema of local: this is local.public.
         pg_ok(a, "DROP SCHEMA public", "DROP", 'I');
     }
     raw_client a(server.local_port());
-    const auto refusal = pg_refused_startup(a, {{"user", "test"}, {"database", "bare"}});
+    const auto refusal = pg_refused_startup(a, {{"user", "test"}, {"database", "local"}});
     CHECK(refusal.severity == "FATAL");
     CHECK(refusal.sqlstate == "3F000");
-    CHECK(refusal.message == "schema \"bare.public\" does not exist");
+    CHECK(refusal.message == "schema \"local.public\" does not exist");
     server.stop();
 }
 

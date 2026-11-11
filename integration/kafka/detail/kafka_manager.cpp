@@ -188,15 +188,17 @@ namespace otterstax::kafka {
     std::vector<logical_plan::execution_plan_t> KafkaManager::storage_plans() {
         OTX_ZONE_N("KafkaManager::storage_plans");
         auto plan = [&](logical_plan::node_ptr node) {
-            return logical_plan::execution_plan_t{resource_, std::move(node), logical_plan::make_parameter_node(resource_)};
+            return logical_plan::execution_plan_t{resource_,
+                                                  std::move(node),
+                                                  logical_plan::make_parameter_node(resource_)};
         };
         auto schema = [&](const char* database) {
-            return plan(logical_plan::make_node_create_schema(
-                resource_,
-                qualified_name_t{core::dbname_t{std::string{database}},
-                                 core::schema_t{std::string{KAFKA_SCHEMA_NAME}},
-                                 core::relname_t{}},
-                /*if_not_exists*/ true));
+            return plan(
+                logical_plan::make_node_create_schema(resource_,
+                                                      qualified_name_t{core::dbname_t{std::string{database}},
+                                                                       core::schema_t{std::string{KAFKA_SCHEMA_NAME}},
+                                                                       core::relname_t{}},
+                                                      /*if_not_exists*/ true));
         };
         std::vector<table::column_definition_t> sources;
         for (const char* column :
@@ -206,9 +208,15 @@ namespace otterstax::kafka {
         std::vector<logical_plan::execution_plan_t> plans;
         plans.push_back(plan(logical_plan::make_node_create_database(
             resource_,
-            qualified_name_t{core::dbname_t{std::string{KAFKA_SERVICE_DATABASE_NAME}}, core::schema_t{}, core::relname_t{}},
+            qualified_name_t{core::dbname_t{std::string{KAFKA_SERVICE_DATABASE_NAME}},
+                             core::schema_t{},
+                             core::relname_t{}},
             /*if_not_exists*/ true)));
         plans.push_back(schema(KAFKA_SERVICE_DATABASE_NAME));
+        plans.push_back(plan(logical_plan::make_node_create_database(
+            resource_,
+            qualified_name_t{core::dbname_t{std::string{KAFKA_DATABASE_NAME}}, core::schema_t{}, core::relname_t{}},
+            /*if_not_exists*/ true)));
         plans.push_back(schema(KAFKA_DATABASE_NAME));
         plans.push_back(create_table_plan(kafka_service_table_name(KAFKA_SOURCES_TABLE),
                                           std::move(sources),
@@ -232,10 +240,10 @@ namespace otterstax::kafka {
         return logical_plan::execution_plan_t{resource_, create, logical_plan::make_parameter_node(resource_)};
     }
 
-    actor_zeta::unique_future<cursor::cursor_t_ptr> KafkaManager::create_table(
-        const qualified_name_t& name,
-        std::vector<table::column_definition_t> columns,
-        bool if_not_exists) {
+    actor_zeta::unique_future<cursor::cursor_t_ptr>
+    KafkaManager::create_table(const qualified_name_t& name,
+                               std::vector<table::column_definition_t> columns,
+                               bool if_not_exists) {
         OTX_ZONE_N("KafkaManager::create_table");
         return send_plan(create_table_plan(name, std::move(columns), if_not_exists));
     }

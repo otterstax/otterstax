@@ -21,7 +21,6 @@
 // What a discovery finds is registered in otterbrix's catalog by
 // catalog/registration.hpp.
 namespace otterstax::catalog {
-
     // Single-quoted SQL string literal for the handwritten discovery queries
     // (information_schema / system.tables / system.columns). The apostrophe is
     // doubled everywhere; MySQL (default sql_mode) and ClickHouse additionally
@@ -39,6 +38,10 @@ namespace otterstax::catalog {
     // pg_toast*, pg_temp*).
     std::pmr::string
     make_list_tables_query(std::pmr::memory_resource* resource, backend_type_t backend, std::string_view scope);
+
+    // The user databases of a MySQL or ClickHouse server, one column of names: every database but the server's
+    // own (MySQL information_schema, mysql, performance_schema, sys; ClickHouse system, information_schema).
+    std::pmr::string make_list_databases_query(std::pmr::memory_resource* resource, backend_type_t backend);
 
     // ClickHouse column type strings of one table (system.columns), the source
     // of the named-type overrides (Tuple(...) with field names) that the
@@ -58,5 +61,4 @@ namespace otterstax::catalog {
     // (undefined_object).
     core::error_t make_discovery_error(std::pmr::memory_resource* resource,
                                        const std::pmr::vector<std::pmr::string>& failed_tables);
-
 } // namespace otterstax::catalog

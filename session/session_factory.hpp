@@ -19,7 +19,6 @@
 #include <unordered_set>
 
 namespace otterstax::session {
-
     // The parser one session owns (otterbrix/parser/parser.hpp make_parser in
     // the server; tests pass mock parsers).
     using parser_factory_fn = parser_ptr (*)(std::pmr::memory_resource*);
@@ -51,8 +50,8 @@ namespace otterstax::session {
         // (the servers) must be gone before.
         ~session_factory_t();
 
-        // A new connection's session; dropping the handle closes it.
-        [[nodiscard]] session_ptr open();
+        // A new connection's session, its client's database `term`; dropping the handle closes it.
+        [[nodiscard]] session_ptr open(database_term_t term = database_term_t::catalog);
 
         [[nodiscard]] std::size_t live_sessions() const;
         // The live sessions inside a transaction block (open or failed) after
@@ -85,5 +84,4 @@ namespace otterstax::session {
         std::condition_variable empty_;
         std::unordered_set<query_session_t*> sessions_;
     };
-
 } // namespace otterstax::session

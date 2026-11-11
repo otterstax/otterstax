@@ -44,5 +44,6 @@ looks unrelated to the change; `-j 4` builds cleanly:
    for the sessions).
 2. `std::make_unique` for an actor (use `actor_zeta::spawn` with the pmr deleter).
 3. A blocking `get()` / `wait()` on an actor-zeta future.
-4. Three parts for a remote table: `c.d.s.t` is a connection's table, `d.s.t` always a local one.
+4. A four-part table name: a table is `uid.ns.t` (a connection, or `local` for
+   the clients' own tables); four parts are refused.
 5. Weakening or hiding a test to make a run green (`tests/CLAUDE.md`, "Engine-defect tags").

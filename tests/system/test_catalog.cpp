@@ -27,7 +27,6 @@
 #include <vector>
 
 namespace {
-
     namespace cat = otterstax::catalog;
 
     // ClickHouse connector whose schema-discovery overload replays a fixed set of
@@ -48,8 +47,7 @@ namespace {
         bool isClosed() const noexcept override { return false; }
         std::string alias() const noexcept override { return alias_; }
 
-        boost::asio::awaitable<core::result_wrapper_t<std::unique_ptr<components::vector::data_chunk_t>>>
-        runQuery(
+        boost::asio::awaitable<core::result_wrapper_t<std::unique_ptr<components::vector::data_chunk_t>>> runQuery(
             std::string_view,
             otterstax::function_ref_t<std::unique_ptr<components::vector::data_chunk_t>(const ch::select_result_t&)>)
             override {
@@ -104,9 +102,9 @@ namespace {
     }
 
     config::PgConnectionDesc pg_connection(const std::string& alias,
-                                const std::string& database,
-                                const std::string& schema,
-                                const std::string& table) {
+                                           const std::string& database,
+                                           const std::string& schema,
+                                           const std::string& table) {
         return config::PgConnectionDesc{.alias = alias,
                                         .host = "localhost",
                                         .port = "5432",
@@ -170,7 +168,6 @@ namespace {
         connections.postgresql.push_back(pg_connection("crm", "crmdb", "sales", "customers"));
         return connections;
     }
-
 } // namespace
 
 // ── escape_sql_literal ───────────────────────────────────────────────────────
@@ -203,7 +200,8 @@ TEST_CASE("escape_sql_literal: backslash-quote injection stays inside the litera
 // The listing of every user schema leaves out pg_toast* / pg_temp* by a LIKE whose `_` is escaped:
 // written E'pg\\_toast%', a server under standard_conforming_strings = off reads the same
 // pattern (in 'pg\_toast%' it would read `\_` as `_`, a wildcard).
-TEST_CASE("make_list_tables_query: the PostgreSQL LIKE patterns read the same under either standard_conforming_strings") {
+TEST_CASE(
+    "make_list_tables_query: the PostgreSQL LIKE patterns read the same under either standard_conforming_strings") {
     std::pmr::monotonic_buffer_resource arena(std::pmr::new_delete_resource());
     const auto query = std::string{cat::make_list_tables_query(&arena, backend_type_t::PostgreSQL, "")};
     INFO(query);
@@ -227,7 +225,6 @@ TEST_CASE("escape_sql_literal: apostrophes are doubled on every backend") {
 // connection) and records nothing; the server still starts.
 
 namespace {
-
     void require_left_out(catalog_stack& fx, const std::string& alias) {
         REQUIRE(fx.owner.remote().actor(alias) != nullptr);
         for (const auto& discovery : fx.owner.remote().discovered()) {
@@ -235,7 +232,6 @@ namespace {
         }
         REQUIRE(fx.names().empty());
     }
-
 } // namespace
 
 TEST_CASE("catalog discovery: a ClickHouse probe without a header block records nothing") {
@@ -264,15 +260,6 @@ TEST_CASE("catalog discovery: a discovered column without a name records nothing
     REQUIRE(fx.names().empty());
 }
 
-TEST_CASE("catalog discovery: a ClickHouse connection without a database is refused before probing") {
-    // The replay connector would answer a probe with no header block; the
-    // refusal comes before it.
-    config::ConnectionsConfig connections;
-    connections.clickhouse.push_back(ch_events("nodb", ""));
-    catalog_stack fx("test_catalog_ch_nodb", connections, &ch_empty_probe_factory);
-    require_left_out(fx, "nodb");
-}
-
 // No `schema:` is every user schema of the database. The mock's
 // information_schema listing answers one table, `public`.`table`, so the
 // connection names no table (every table of every user schema).
@@ -282,37 +269,10 @@ TEST_CASE("catalog discovery: a PostgreSQL connection without a schema registers
     catalog_stack fx("test_catalog_pg_noschema", connections);
     REQUIRE(fx.names() == std::vector<std::string>{"noschema.pgdb.public.table"});
     auto read =
-        otterstax::test::run_session_sql_payload(fx.owner.stack(), 1, "SELECT * FROM noschema.pgdb.public.\"table\";");
+        otterstax::test::run_session_sql_payload(fx.owner.stack(), 1, "SELECT * FROM noschema.public.\"table\";");
     INFO((read.has_error() ? read.error().what.c_str() : "ok"));
     REQUIRE_FALSE(read.has_error());
     REQUIRE(read.value().size() == 2);
-}
-
-// ── owned database names ─────────────────────────────────────────────────────
-// A connection of config.yaml (a local database of that name would read like
-// the connection) and OtterStax's own database. Unquoted identifiers reach the engine lower-cased, so the
-// match ignores case. `kafka` is not owned: the Kafka objects are the schema main.kafka.
-
-TEST_CASE("catalog check_database_ownership: connection uids and federation are owned names") {
-    config::ConnectionsConfig connections;
-    connections.postgresql.push_back(pg_connection("PgAlias", "pgdb", "public", "orders"));
-    catalog_stack fx("test_catalog_ownership", connections);
-    auto* resource = fx.owner.engine().resource();
-    const auto aliases = fx.owner.remote().aliases();
-
-    for (const char* owned : {"PgAlias", "pgalias", "PGALIAS", "federation", "Federation"}) {
-        INFO("database name = " << owned);
-        auto verdict = cat::check_database_ownership(resource, owned, aliases);
-        REQUIRE(verdict.contains_error());
-        REQUIRE(verdict.type == core::error_code_t::invalid_parameter);
-    }
-    // The owner is named in the configured spelling.
-    CHECK(std::string{cat::check_database_ownership(resource, "pgalias", aliases).what.c_str()} ==
-          "database 'pgalias' is owned by connection 'PgAlias'");
-
-    REQUIRE_FALSE(cat::check_database_ownership(resource, "orders", aliases).contains_error());
-    REQUIRE_FALSE(cat::check_database_ownership(resource, "pgdb", aliases).contains_error());
-    REQUIRE_FALSE(cat::check_database_ownership(resource, "kafka", aliases).contains_error());
 }
 
 // ── remote DDL ───────────────────────────────────────────────────────────────
@@ -324,7 +284,7 @@ TEST_CASE("catalog remote DDL: DROP TABLE runs on the backend and takes the tabl
     const auto s = fx.owner.stack();
     REQUIRE(fx.names() == std::vector<std::string>{"crm.crmdb.sales.customers", "shop.pgdb.public.orders"});
 
-    auto dropped = otterstax::test::run_session_sql_payload(s, 1, "DROP TABLE shop.pgdb.public.orders;");
+    auto dropped = otterstax::test::run_session_sql_payload(s, 1, "DROP TABLE shop.public.orders;");
     INFO((dropped.has_error() ? dropped.error().what.c_str() : "ok"));
     REQUIRE_FALSE(dropped.has_error());
     REQUIRE(fx.names() == std::vector<std::string>{"crm.crmdb.sales.customers"});
@@ -333,7 +293,7 @@ TEST_CASE("catalog remote DDL: DROP TABLE runs on the backend and takes the tabl
     // `customers` only) is no DDL target of it: the session refuses the DROP
     // before the engine (the mock backend would answer any table it is asked
     // about) and the catalog keeps what it had.
-    auto unknown = otterstax::test::run_session_sql_payload(s, 2, "DROP TABLE crm.crmdb.sales.never_discovered;");
+    auto unknown = otterstax::test::run_session_sql_payload(s, 2, "DROP TABLE crm.sales.never_discovered;");
     REQUIRE(unknown.has_error());
     INFO(unknown.error().what.c_str());
     CHECK(unknown.error().type == core::error_code_t::invalid_parameter);
@@ -341,9 +301,9 @@ TEST_CASE("catalog remote DDL: DROP TABLE runs on the backend and takes the tabl
           std::string::npos);
     REQUIRE(fx.names() == std::vector<std::string>{"crm.crmdb.sales.customers"});
 
-    // A four-part name whose first part is no connection of config.yaml is
-    // not discovered: otterbrix's "does not exist".
-    auto foreign = otterstax::test::run_session_sql_payload(s, 3, "DROP TABLE nowhere.crmdb.sales.customers;");
+    // A name whose first part is no connection of config.yaml is not discovered:
+    // otterbrix's "does not exist".
+    auto foreign = otterstax::test::run_session_sql_payload(s, 3, "DROP TABLE nowhere.sales.customers;");
     REQUIRE(foreign.has_error());
     REQUIRE(fx.names() == std::vector<std::string>{"crm.crmdb.sales.customers"});
 }

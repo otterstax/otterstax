@@ -36,12 +36,12 @@ CLICKHOUSE = dict(host=config.CH_DOCKER_HOST, port=config.CH_PORT, user="chuser"
 POSTGRES = dict(host="postgres1", port=5432, user="pguser", password="pgpassword", dbname="pgdb")
 MARIADB = dict(host="mariadb1", port=3306, user="user1", password="password1", database="db1")
 
-CH_PRODUCTS = f"{config.CH_ALIAS}.{config.CH_DATABASE}.public.pj_products"
-CH_FLAGS = f"{config.CH_ALIAS}.{config.CH_DATABASE}.public.pj_flags"
-PG_CUSTOMERS = "products.pgdb.public.pj_customers"
-PG_ORDERS = "products.pgdb.public.pj_orders"
-MY_PRODUCTS = "campaigns.db1.public.pj_products"
-MY_FLAGS = "campaigns.db1.public.pj_flags"
+CH_PRODUCTS = f"{config.CH_ALIAS}.{config.CH_DATABASE}.pj_products"
+CH_FLAGS = f"{config.CH_ALIAS}.{config.CH_DATABASE}.pj_flags"
+PG_CUSTOMERS = "products.public.pj_customers"
+PG_ORDERS = "products.public.pj_orders"
+MY_PRODUCTS = "campaigns.db1.pj_products"
+MY_FLAGS = "campaigns.db1.pj_flags"
 
 # products: 1 apple, 2 pear, 3 plum (no flags row). The flags' own `name` sorts the other way round
 # from the products' (apple's flag is z-one, pear's a-two): sorting by the wrong table's `name`
@@ -105,7 +105,7 @@ class PushedJoinsTest:
                             [(pid, name) for pid, name, _ in FLAGS])
 
         self.pg = psycopg2.connect(host=self.host, port=config.PG_PORT, user="testuser", password="testpass",
-                                   dbname="main")  # the engine database the session is placed in
+                                   dbname="local")  # the engine database the session is placed in
         self.pg.autocommit = True
         # The tables were made on the backends after the server started: the first statement naming
         # each one registers it.

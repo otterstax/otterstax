@@ -16,6 +16,11 @@ MANIFEST=/opt/pyspark/manifest
 LOG_DIR=/app/logs
 SERVER=test-otterstax
 PORT=15002
+# A client with a deadline-less RPC that never answers would wedge the whole
+# step: bound every run, so a hung one FAILS with its output as the evidence.
+# SIGABRT, not the default SIGTERM, so `python -X faulthandler` dumps the
+# threads of the hung client into its output — the RPC it stands in.
+TEST_TIMEOUT=${SPARK_MATRIX_TEST_TIMEOUT:-600}
 
 cd /app
 TESTS=(test_spark_client_*.py)
@@ -42,10 +47,11 @@ run_version() {
         if ! timeout 2 bash -c "</dev/tcp/$SERVER/$PORT" 2>/dev/null; then
             echo "Spark Connect server $SERVER:$PORT is unreachable; not run" > "$out"
             status=FAIL
-        elif PYTHONPATH="/opt/pyspark/$version" "$python" "$test" > "$out" 2>&1; then
+        elif PYTHONPATH="/opt/pyspark/$version" timeout -s ABRT "$TEST_TIMEOUT" "$python" -X faulthandler "$test" > "$out" 2>&1; then
             status=PASS
             passed=$((passed + 1))
         else
+            [ "$?" -eq 124 ] && echo "timed out after ${TEST_TIMEOUT}s — faulthandler dump above" >> "$out"
             status=FAIL
         fi
         echo "$status" > "$RESULTS/$version.$test.status"

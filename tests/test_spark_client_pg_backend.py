@@ -5,7 +5,7 @@
 E2E test: Spark Connect (port 15002) frontend querying a PostgreSQL backend.
 
 Mirrors test_spark_client_mysql_backend.py but targets the `products` alias,
-which resolves to the PostgreSQL backend (products.pgdb.public.products).
+which resolves to the PostgreSQL backend (products.public.products).
 
 Usage:
     python test_spark_client_pg_backend.py            # docker (host=test-otterstax)
@@ -28,7 +28,7 @@ def main(local=False):
     print(f"# Spark Connect Client - PostgreSQL Backend Tests")
     print(f"{'#'*70}")
     print(f"Connecting to Spark Connect server at: sc://{host}:{port}")
-    print(f"Target: PostgreSQL backend (products.pgdb.public.products)")
+    print(f"Target: PostgreSQL backend (products.public.products)")
     print(f"{'#'*70}\n")
 
     spark = SparkSession.builder.remote(f"sc://{host}:{port}").getOrCreate()
@@ -49,7 +49,7 @@ def main(local=False):
     print(f"\n{'='*70}")
     print("Running: Test 1 - spark.sql() SQL pass-through")
     print(f"{'='*70}")
-    df = spark.sql("SELECT * FROM products.pgdb.public.products LIMIT 5")
+    df = spark.sql("SELECT * FROM products.public.products LIMIT 5")
     rows = df.collect()
     assert len(rows) == 5, f"Expected 5 rows, got {len(rows)}"
     print(f"  ✅ Got {len(rows)} rows")
@@ -60,7 +60,7 @@ def main(local=False):
     print(f"\n{'='*70}")
     print("Running: Test 2 - DataFrame.filter().select() (Path B)")
     print(f"{'='*70}")
-    df2 = (spark.sql("SELECT * FROM products.pgdb.public.products")
+    df2 = (spark.sql("SELECT * FROM products.public.products")
            .filter("price > 100")
            .select("product_name", "price"))
     rows2 = df2.collect()
@@ -85,7 +85,7 @@ def main(local=False):
     print(f"\n{'='*70}")
     print("Running: Test 4 - select() projection + collect()")
     print(f"{'='*70}")
-    df3 = (spark.sql("SELECT * FROM products.pgdb.public.products")
+    df3 = (spark.sql("SELECT * FROM products.public.products")
            .select("product_id", "product_name", "price")
            .filter("price > 200")
            .limit(10))

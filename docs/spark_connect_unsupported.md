@@ -39,19 +39,21 @@ the arguments are not bound. `spark.sql()` over DataFrame arguments is refused
 
 Every Spark session has one OtterStax session, opened by its first request and
 closed by `ReleaseSession` or after `service.spark_connect.session_timeout_s`
-without a request: its place (`SET search_path`, `main.public` at the start) and
+without a request: its place (the current database you set — `uid`, `uid.ns`,
+`local` or `local.ns`; without one, short names refuse) and
 an open transaction last across its `spark.sql()` statements. Nothing else is
 kept per Spark session (no temporary views, no runtime configuration).
 
 ## Reading data
 
 - `spark.table(name)` / `spark.read.table(name)` — the name is read the way SQL
-  reads it: `t`, `s.t` and `d.s.t` are local tables (a name with fewer parts is
-  completed by the session's place, `main.public` at the start), `alias.db.schema.t`
-  a table of the backend registered as `alias` (MySQL and ClickHouse have the one
-  schema `public`: `alias.db.public.t`). Three parts never name a backend's table.
-  More than four parts are refused (`improper qualified name (too many dotted
-  names)`). Backticks quote a part that contains a `.`.
+  reads it: `t` / `s.t` are completed by the session's place (only the current
+  database you set), `uid.ns.t` names a table of the connection `uid` (a
+  PostgreSQL namespace is a schema of its configured database, a MySQL /
+  ClickHouse namespace one of its databases), `local.ns.t` a local table.
+  Four-part names are refused (`a table is named connection.namespace.table`);
+  more than four parts are refused at parse (`improper qualified name (too many
+  dotted names)`). Backticks quote a part that contains a `.`.
 - `spark.range(start, end, step)` — a single `id` column of at most 1024 rows
   (`Spark Range exceeds maximum materialization size (1024 rows)`).
 - Refused: file, JDBC and other format readers (`Spark DataSource reads are not
@@ -251,16 +253,15 @@ Rows reach PySpark as Arrow batches.
 
 `spark.catalog` is answered from the engine's own catalog (`pg_database`,
 `pg_namespace`, `pg_class`; no backend is asked), in catalog `otterstax`. A Spark
-database is a schema, named as SQL names it.
+database is a namespace, named as SQL names it.
 
-- **Databases** — `d.s` for the schema `s` of the local database `d`
-  (`main.public` among them), `alias.db.s` for a schema of the database `db` of
-  the backend registered as `alias`. The schemas `pg_catalog` and
-  `information_schema` and the database `federation` (OtterStax's own tables)
-  are hidden. The current database is the session's place
-  (`current_database()`, `current_schema()`).
-- **Tables** — `Table.namespace` is `[d, s]` for a local table and
-  `[alias, db, s]` for a backend's, so `".".join(namespace + [name])` is the name
+- **Databases** — `uid.ns` for the namespace `ns` of the connection `uid`,
+  `local.ns` for one of the local database (`local.public` among them). The
+  schemas `pg_catalog` and `information_schema` and the database `federation`
+  (OtterStax's own tables) are hidden. The current database is the session's
+  place (`current_database()`, `current_schema()`).
+- **Tables** — `Table.namespace` is `[uid, ns]` for a connection's table and
+  `[local, ns]` for a local one, so `".".join(namespace + [name])` is the name
   `spark.table()` and SQL read. `tableType` is `MANAGED` for tables and `VIEW`
   for views and materialized views.
 - **Supported** — `currentCatalog()`, `listCatalogs()`, `currentDatabase()`,

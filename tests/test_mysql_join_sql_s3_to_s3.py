@@ -51,7 +51,7 @@ EXPECTED_JOIN_ROWS = len(JOIN_CAMPAIGN_IDS) * 4
 
 # Source: campaigns lives in MariaDB1 (alias 'campaigns', db 'db1'; a MySQL
 # connection's one schema is 'public').
-SQL_BACKEND_TABLE = "campaigns.db1.public.campaigns"
+SQL_BACKEND_TABLE = "campaigns.db1.campaigns"
 
 # Otterbrix-internal schema of the session's database (main). Used for BOTH the
 # parquet-loaded regions and the persisted JOIN result — the tester creates the

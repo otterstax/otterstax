@@ -40,7 +40,6 @@
 #include <vector>
 
 namespace {
-
     // ── PostgreSQL: the ENUM query fails, the rest of the discovery would not ──
 
     class pg_enum_failing_connector final : public pg::IConnector {
@@ -139,8 +138,8 @@ namespace {
             block.AppendColumn("t", std::make_shared<clickhouse::ColumnString>());
         } else {
             block.AppendColumn("t",
-                               std::make_shared<clickhouse::ColumnTuple>(std::vector<clickhouse::ColumnRef>{
-                                   std::make_shared<clickhouse::ColumnInt32>()}));
+                               std::make_shared<clickhouse::ColumnTuple>(
+                                   std::vector<clickhouse::ColumnRef>{std::make_shared<clickhouse::ColumnInt32>()}));
         }
         return block;
     }
@@ -160,10 +159,9 @@ namespace {
         bool isClosed() const noexcept override { return false; }
         std::string alias() const noexcept override { return alias_; }
 
-        boost::asio::awaitable<core::result_wrapper_t<std::unique_ptr<data_chunk_t>>>
-        runQuery(std::string_view,
-                 otterstax::function_ref_t<std::unique_ptr<data_chunk_t>(const ch::select_result_t&)> handler)
-            override {
+        boost::asio::awaitable<core::result_wrapper_t<std::unique_ptr<data_chunk_t>>> runQuery(
+            std::string_view,
+            otterstax::function_ref_t<std::unique_ptr<data_chunk_t>(const ch::select_result_t&)> handler) override {
             ch::select_result_t outcome;
             co_return handler(outcome);
         }
@@ -230,7 +228,8 @@ namespace {
         core::result_wrapper_t<otterstax::federation::discovered_tables_t> discover(const qualified_name_t& scope) {
             auto* actor = remote.actor(scope.connection.t);
             REQUIRE(actor != nullptr);
-            auto [needs_sched, future] = actor_zeta::send(actor, &otterstax::federation::backend_actor_t::discover, scope);
+            auto [needs_sched, future] =
+                actor_zeta::send(actor, &otterstax::federation::backend_actor_t::discover, scope);
             static_cast<void>(needs_sched);
             REQUIRE(otterstax::test::poll_until_ready(future, std::chrono::seconds(30)));
             return std::move(future).take_ready();
@@ -245,7 +244,6 @@ namespace {
         REQUIRE(fields.front().alias() == "t");
         return fields.front().type();
     }
-
 } // namespace
 
 TEST_CASE("PostgreSQL discovery: a failed ENUM query leaves the connection undiscovered") {
@@ -267,7 +265,9 @@ TEST_CASE("PostgreSQL discovery: a failed ENUM query leaves the connection undis
     auto opened = remote.open(connections, config::ConnectionRetryConfig{});
     INFO(opened.what.c_str());
     REQUIRE_FALSE(opened.contains_error());
-    REQUIRE(std::none_of(remote.discovered().begin(), remote.discovered().end(), [](const auto& d) { return d.discovered; }));
+    REQUIRE(std::none_of(remote.discovered().begin(), remote.discovered().end(), [](const auto& d) {
+        return d.discovered;
+    }));
 
     // The discovery itself answers the pg_enum failure, code and text: asked of
     // an agent over the same connector.
@@ -303,7 +303,9 @@ TEST_CASE("ClickHouse discovery: a malformed system.columns answer leaves the co
 
     auto opened = stack.open("ev_alias", "ev", "events");
     REQUIRE_FALSE(opened.contains_error());
-    REQUIRE(std::none_of(stack.remote.discovered().begin(), stack.remote.discovered().end(), [](const auto& d) { return d.discovered; }));
+    REQUIRE(std::none_of(stack.remote.discovered().begin(), stack.remote.discovered().end(), [](const auto& d) {
+        return d.discovered;
+    }));
 }
 
 TEST_CASE("ClickHouse discovery: a rediscovered table carries the backend's current named types") {
@@ -319,7 +321,10 @@ TEST_CASE("ClickHouse discovery: a rediscovered table carries the backend's curr
     // The backend now reports a named tuple for the same column: the override
     // must shape the discovered schema, and the entry seen first must not win.
     g_ch_type_variant.store(1);
-    auto second = stack.discover(qualified_name_t{core::connection_name_t{"1"}, core::dbname_t{"ev"}, core::schema_t{}, core::relname_t{"events"}});
+    auto second = stack.discover(qualified_name_t{core::connection_name_t{"1"},
+                                                  core::dbname_t{"ev"},
+                                                  core::schema_t{},
+                                                  core::relname_t{"events"}});
     REQUIRE_FALSE(second.has_error());
     REQUIRE(column_t_type(second.value()) == components::types::logical_type::STRUCT);
 
@@ -336,7 +341,6 @@ TEST_CASE("ClickHouse discovery: a rediscovered table carries the backend's curr
 // ── ClickHouse: one table name in two databases of one connection ──────────
 
 namespace {
-
     // `events` in two databases: system.columns declares its UInt8 column `flag` as `Bool` in
     // `db1` and as plain `UInt8` in `db2`; the probe and every read answer the wire's UInt8.
     class ch_two_databases_connector final : public ch::IConnector {
@@ -354,10 +358,9 @@ namespace {
         bool isClosed() const noexcept override { return false; }
         std::string alias() const noexcept override { return alias_; }
 
-        boost::asio::awaitable<core::result_wrapper_t<std::unique_ptr<data_chunk_t>>>
-        runQuery(std::string_view,
-                 otterstax::function_ref_t<std::unique_ptr<data_chunk_t>(const ch::select_result_t&)> handler)
-            override {
+        boost::asio::awaitable<core::result_wrapper_t<std::unique_ptr<data_chunk_t>>> runQuery(
+            std::string_view,
+            otterstax::function_ref_t<std::unique_ptr<data_chunk_t>(const ch::select_result_t&)> handler) override {
             auto flag = std::make_shared<clickhouse::ColumnUInt8>();
             flag->Append(1);
             ch::select_result_t outcome;
@@ -399,7 +402,6 @@ namespace {
     ch_two_databases_factory(std::pmr::memory_resource*, ch::connect_params params, std::string alias) {
         return std::make_unique<ch_two_databases_connector>(std::move(params), std::move(alias));
     }
-
 } // namespace
 
 TEST_CASE("ClickHouse discovery: a table name in two databases of one connection keeps each database's named types") {
@@ -407,8 +409,10 @@ TEST_CASE("ClickHouse discovery: a table name in two databases of one connection
     // held to them (the registered columns of each table carry their own).
     otterstax::test::agent_driver_t agent(&ch_two_databases_factory, "ch");
     auto flag_type = [&](const std::string& database) {
-        auto reply = agent.discover(
-            qualified_name_t{core::connection_name_t{"ch"}, core::dbname_t{database}, core::schema_t{}, core::relname_t{"events"}});
+        auto reply = agent.discover(qualified_name_t{core::connection_name_t{"ch"},
+                                                     core::dbname_t{database},
+                                                     core::schema_t{},
+                                                     core::relname_t{"events"}});
         INFO((reply.has_error() ? reply.error().what.c_str() : "ok"));
         REQUIRE_FALSE(reply.has_error());
         REQUIRE(reply.value().size() == 1);
@@ -462,11 +466,9 @@ TEST_CASE("MySQL discovery: a configured table is the only table the startup dis
     CHECK(whole.tables.front().name.collection.t == "table");
 }
 
-
 // ── MySQL: a server under NO_BACKSLASH_ESCAPES is refused at startup (its session's check) ──
 
 namespace {
-
     // The default MySQL mock, except that the connection named `nbe` reports
     // a session sql_mode holding NO_BACKSLASH_ESCAPES (every other one a
     // sql_mode without it).
@@ -480,9 +482,10 @@ namespace {
         runQuery(std::string_view query,
                  otterstax::function_ref_t<otterstax::asio_error_t(const boost::mysql::results&)> handler) override {
             if (query.find("sql_mode") != std::string_view::npos) {
-                const auto mode = mysql::mock_results(
-                    {{"@@SESSION.sql_mode", boost::mysql::column_type::varchar}},
-                    {{std::string{alias_ == "nbe" ? "STRICT_TRANS_TABLES,NO_BACKSLASH_ESCAPES" : "STRICT_TRANS_TABLES"}}});
+                const auto mode =
+                    mysql::mock_results({{"@@SESSION.sql_mode", boost::mysql::column_type::varchar}},
+                                        {{std::string{alias_ == "nbe" ? "STRICT_TRANS_TABLES,NO_BACKSLASH_ESCAPES"
+                                                                      : "STRICT_TRANS_TABLES"}}});
                 co_return otterstax::as_query_result<otterstax::asio_error_t>(handler(mode));
             }
             co_return co_await mysql::MockConnector::runQuery(query, handler);
@@ -499,7 +502,6 @@ namespace {
                                                               std::string alias) {
         return std::make_unique<sql_mode_mysql_connector>(resource, std::move(alias));
     }
-
 } // namespace
 
 TEST_CASE("MySQL discovery: a server under NO_BACKSLASH_ESCAPES is left out and the others serve") {
@@ -519,7 +521,7 @@ TEST_CASE("MySQL discovery: a server under NO_BACKSLASH_ESCAPES is left out and 
     CHECK_FALSE(remote.discovered().back().discovered);
 
     // The other connection serves its table; the refused one is unknown.
-    auto served = owner.engine().sql("SELECT id, name FROM plain.db.public.orders;");
+    auto served = owner.engine().sql("SELECT id, name FROM plain.db.orders;");
     REQUIRE(served);
     INFO((served->is_error() ? served->get_error().what.c_str() : "ok"));
     REQUIRE_FALSE(served->is_error());
@@ -528,7 +530,7 @@ TEST_CASE("MySQL discovery: a server under NO_BACKSLASH_ESCAPES is left out and 
         rows += chunk.size();
     }
     CHECK(rows == 2);
-    auto refused = owner.engine().sql("SELECT id, name FROM nbe.db.public.orders;");
+    auto refused = owner.engine().sql("SELECT id, name FROM nbe.db.orders;");
     REQUIRE(refused);
     CHECK(refused->is_error());
 

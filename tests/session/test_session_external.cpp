@@ -29,7 +29,6 @@ using otterstax::test::session_stack;
 using otterstax::test::with_session_stack;
 
 namespace {
-
     void write_test_csv(const std::string& path) {
         std::ofstream f(path);
         f << "id,name\n"
@@ -51,7 +50,6 @@ namespace {
         }
         return rows;
     }
-
 } // namespace
 
 TEST_CASE("session external: CREATE EXTERNAL TABLE and COPY TO a csv file") {
@@ -71,16 +69,17 @@ TEST_CASE("session external: CREATE EXTERNAL TABLE and COPY TO a csv file") {
         // DDL answers no rows and no count.
         REQUIRE(created.value().column_count() == 0);
         REQUIRE(created.value().empty());
-        REQUIRE(engine_row_count(s, "main.sessext", "people") == 5);
+        REQUIRE(engine_row_count(s, "local.sessext", "people") == 5);
 
         run_session_or_fail(s, 4102, "COPY (SELECT * FROM SessExt.People) TO '" + out + "' WITH (format = 'csv')");
         CHECK(csv_rows(s, out) == 5);
 
         // A second load under the name is refused and appends nothing.
-        auto again = run_session_sql_payload(s, 4103, "CREATE EXTERNAL TABLE SessExt.People WITH (location = '" + src + "')");
+        auto again =
+            run_session_sql_payload(s, 4103, "CREATE EXTERNAL TABLE SessExt.People WITH (location = '" + src + "')");
         REQUIRE(again.has_error());
         CHECK(again.error().type == core::error_code_t::table_already_exists);
-        CHECK(engine_row_count(s, "main.sessext", "people") == 5);
+        CHECK(engine_row_count(s, "local.sessext", "people") == 5);
 
         std::filesystem::remove(src);
         std::filesystem::remove(out);
@@ -94,25 +93,26 @@ TEST_CASE("session external: the loaded table is named as any table, from the se
         write_test_csv(src);
         const std::string with = " WITH (location = '" + src + "')";
 
-        // One part: the place's schema (main.public by default).
+        // One part: the place's schema (local.public by default).
         run_session_or_fail(s, 4110, "CREATE EXTERNAL TABLE people_here" + with);
-        CHECK(engine_row_count(s, "main.public", "people_here") == 5);
+        CHECK(engine_row_count(s, "local.public", "people_here") == 5);
 
-        // Three parts: a local database's schema; the database is not created.
+        // Three parts: a namespace of a database; the database is not created.
         auto no_database = run_session_sql_payload(s, 4111, "CREATE EXTERNAL TABLE nodb.public.people" + with);
         REQUIRE(no_database.has_error());
         INFO(no_database.error().what.c_str());
         CHECK(std::string{no_database.error().what.c_str()}.starts_with("CREATE EXTERNAL TABLE failed: "));
+        // This client's database is a schema: CREATE DATABASE extdb is the schema local.extdb.
         run_session_or_fail(s, 4112, "CREATE DATABASE extdb");
-        run_session_or_fail(s, 4113, "CREATE EXTERNAL TABLE extdb.public.people" + with);
-        CHECK(engine_row_count(s, "extdb.public", "people") == 5);
+        run_session_or_fail(s, 4113, "CREATE EXTERNAL TABLE local.extdb.people" + with);
+        CHECK(engine_row_count(s, "local.extdb", "people") == 5);
 
         // A schema the place names: SET search_path moves the one-part name.
-        run_session_or_fail(s, 4114, "SET search_path = 'extdb.public'");
+        run_session_or_fail(s, 4114, "SET search_path = 'local.extdb'");
         run_session_or_fail(s, 4115, "CREATE SCHEMA staging");
-        run_session_or_fail(s, 4116, "SET search_path = 'extdb.staging'");
+        run_session_or_fail(s, 4116, "SET search_path = 'local.staging'");
         run_session_or_fail(s, 4119, "CREATE EXTERNAL TABLE people_staged" + with);
-        CHECK(engine_row_count(s, "extdb.staging", "people_staged") == 5);
+        CHECK(engine_row_count(s, "local.staging", "people_staged") == 5);
 
         // A schema that does not exist is refused, as CREATE TABLE refuses it.
         auto no_schema = run_session_sql_payload(s, 4117, "CREATE EXTERNAL TABLE noschema.people" + with);
@@ -147,7 +147,7 @@ TEST_CASE("session external: the load and COPY run in the client's transaction")
         // session outside a block.
         run_session_or_fail(s, 4124, "CREATE EXTERNAL TABLE kept WITH (location = '" + src + "')");
         CHECK(session->transaction_status() == components::session::transaction_status_t::idle);
-        CHECK(engine_row_count(s, "main.public", "kept") == 5);
+        CHECK(engine_row_count(s, "local.public", "kept") == 5);
 
         // A load that fails inside a block fails the block, as any statement.
         run_session_or_fail(s, 4125, "BEGIN");
@@ -163,7 +163,7 @@ TEST_CASE("session external: the load and COPY run in the client's transaction")
 
 // Four parts name a connection's table: the engine creates it on the backend
 // and writes the rows there, statement by statement (no block of the load's own).
-TEST_CASE("session external: a four-part target loads into the connection's table") {
+TEST_CASE("session external: a connection's target loads into the connection's table") {
     otterstax::test::stack_options_t options;
     options.connections.mysql = otterstax::test::mock_mysql({"orders"});
     otterstax::test::session_stack_owner owner(otterstax::test::unique_test_dir("otterstax_session_ext_remote"),
@@ -173,7 +173,8 @@ TEST_CASE("session external: a four-part target loads into the connection's tabl
     std::filesystem::remove(src);
     write_test_csv(src);
 
-    auto loaded = run_session_sql_payload(s, 4130, "CREATE EXTERNAL TABLE orders.db.public.loaded WITH (location = '" + src + "')");
+    auto loaded =
+        run_session_sql_payload(s, 4130, "CREATE EXTERNAL TABLE orders.db.loaded WITH (location = '" + src + "')");
     INFO("load: " << (loaded.has_error() ? loaded.error().what.c_str() : "ok"));
     CHECK_FALSE(loaded.has_error());
 
@@ -182,7 +183,7 @@ TEST_CASE("session external: a four-part target loads into the connection's tabl
     // autocommit only, so the load is refused and fails the block.
     run_session_or_fail(s, 4131, "BEGIN");
     auto in_block =
-        run_session_sql_payload(s, 4132, "CREATE EXTERNAL TABLE orders.db.public.in_block WITH (location = '" + src + "')");
+        run_session_sql_payload(s, 4132, "CREATE EXTERNAL TABLE orders.db.in_block WITH (location = '" + src + "')");
     REQUIRE(in_block.has_error());
     CHECK(std::string{in_block.error().what.c_str()} ==
           "CREATE EXTERNAL TABLE failed: connection \"orders\" only supports DDL in autocommit");
@@ -235,7 +236,7 @@ TEST_CASE("session external: prepare_schema then execute_statement loads the fil
         auto executed = execute_session_statement(s, id);
         INFO("execute_statement error: " << (executed.has_error() ? executed.error().what.c_str() : ""));
         REQUIRE_FALSE(executed.has_error());
-        REQUIRE(engine_row_count(s, "main.sesstwophase", "people") == 5);
+        REQUIRE(engine_row_count(s, "local.sesstwophase", "people") == 5);
 
         std::filesystem::remove(src);
     });

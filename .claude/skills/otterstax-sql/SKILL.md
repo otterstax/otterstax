@@ -23,9 +23,12 @@ echo "SELECT 1" | .claude/skills/otterstax-sql/psql.sh    # SQL from stdin
 
 It calls the host `psql` against the OtterStax PG wire. **The wire does not
 authenticate** — any user/password is accepted. **The database is honoured**: it
-places the session (`search_path = <db>.public`), and a database the engine does
-not have is refused at connect (`FATAL 3D000 database "<db>" does not exist`, hint
-`The default database is "main".`). The defaults below work out of the box against
+places the session (`SET search_path` to one of `uid`, `uid.ns`, `local`
+(`local.public`) or `local.ns` — `uid` a connection alias, a bare `uid` its
+default namespace), and a name that is neither a connection nor `local` is
+refused at connect (`FATAL 3D000 database "<db>" does not exist`, hint
+`A database is a connection, connection.namespace, local or local namespace.`).
+The defaults below work out of the box against
 a local engine. Override `HOST`/`PORT` only to reach a remote one:
 
 | Var | Default | Notes |
@@ -33,7 +36,7 @@ a local engine. Override `HOST`/`PORT` only to reach a remote one:
 | `OTTERSTAX_HOST` | `localhost` | |
 | `OTTERSTAX_PORT` | `8817` | |
 | `OTTERSTAX_USER` | `otterstax` | not checked by the wire |
-| `OTTERSTAX_DB` | `main` | must be a database of the engine (`main` is its default) |
+| `OTTERSTAX_DB` | `main` | must be a place: `local` (a fresh engine's own database — set this), a connection alias, or `alias.ns` |
 | `OTTERSTAX_PASSWORD` | *(empty)* | not checked by the wire |
 
 `psql` must be on PATH. On macOS: `brew install libpq` then add
@@ -48,18 +51,18 @@ recovery hint on that exit code.
 A connection alias is the outermost qualifier. Backends are declared under
 `connections:` in the server's `config.yaml` and registered once at startup —
 there is no runtime add/remove API; to change them, edit the file and restart the
-server. Reference their tables in **four parts**:
+server. Reference their tables in **three parts**:
 
 ```sql
-SELECT * FROM <alias>.<db>.<schema>.<tbl> JOIN <alias2>.<db>.<schema>.<tbl2> ON ...
+SELECT * FROM <alias>.<ns>.<tbl> JOIN <alias2>.<ns2>.<tbl2> ON ...
 ```
 
-`<db>` is the connection's configured `database` (lower case). `<schema>` is
-`public` for a MySQL / ClickHouse connection; for a PostgreSQL connection it is the
-configured `schema:` (or, with none configured, any user schema of the database).
-Example: `mysql.bill.public.orders`, `pg.shop.shop.customers` (config `schema: shop`),
-`ch.ev.public.sessions`. A name whose first part is no configured alias is the
-engine's `... does not exist`.
+`<ns>` is a namespace of the connection (lower case): for PostgreSQL a schema of
+its configured `database` (the configured `schema:`, or, with none configured, any
+user schema); for MySQL / ClickHouse one of the server's databases.
+Example: `mysql.bill.orders`, `pg.shop.customers` (config `schema: shop`),
+`ch.ev.sessions`. A first part that is neither a connection nor `local` answers
+`database "<x>" does not exist`; `local.<ns>.<tbl>` names your own tables.
 
 ## SQL support matrix
 
@@ -77,14 +80,16 @@ otterbrix engine. Some features only survive the engine path.
 
 | Form | Means |
 |---|---|
-| 4 parts `<alias>.<db>.<schema>.<tbl>` | a remote table of the connection `<alias>` |
-| 3 parts `<db>.<schema>.<tbl>` | a **local** engine table — never a remote one |
-| 2 parts `<schema>.<tbl>` | a local table in the session's database (`main` by default) |
-| 1 part `<tbl>` | a local table found by `search_path` (`main.public` by default) |
+| 3 parts `<uid>.<ns>.<tbl>` | a table of the connection `<uid>` (PostgreSQL: a schema of its configured database; MySQL / ClickHouse: a database), or `local.<ns>.<tbl>` for a local one |
+| 2 parts `<ns>.<tbl>` | completed by the session's place: `uid.ns` → `uid.ns.<ns>.<tbl>`, `local.ns` → `local.ns.<ns>.<tbl>` |
+| 1 part `<tbl>` | completed by the session's place the same way (`local.public` from the place `local`) |
 
-`<alias>` = a connection declared under `connections:` in `config.yaml` (`main`
-and `federation` are reserved and cannot be aliases). The old 3-part remote form
-`<alias>.<db>.<tbl>` no longer reaches a backend. A table created on the backend
+`<uid>` = a connection declared under `connections:` in `config.yaml` (`local`,
+`main` and `federation` are reserved and cannot be aliases). **Four-part names are
+refused** (`a table is named connection.namespace.table`). The place is only what
+the client chose at connect — the `database` of the StartupMessage (or MySQL `USE`,
+Spark's current database); connecting without one leaves the session no place and
+short names refuse. A table created on the backend
 while the server runs is discovered on the first statement that names it.
 
 ### SELECT / read
@@ -130,12 +135,12 @@ while the server runs is discovered on the first statement that names it.
 
 | Feature | Syntax | Status |
 |---|---|---|
-| Create database (local) | `CREATE DATABASE <db>` (with its `public` schema; a connection alias, `federation` refused) | ✅ |
-| Create schema (local) | `CREATE SCHEMA [IF NOT EXISTS] <s>` — in the session's database; needed before `CREATE TABLE <s>.<tbl>` / `CREATE EXTERNAL TABLE <s>.<tbl>` | ✅ |
+| Create database | `CREATE DATABASE <db>` — refused on the PostgreSQL wire (a database is a connection; connections come only from `config.yaml`) | ❌ use `CREATE SCHEMA` for a local namespace |
+| Create schema (local) | `CREATE SCHEMA [IF NOT EXISTS] <s>` — lands in the local database (`local.<s>`) wherever the session stands; needed before `CREATE TABLE <s>.<tbl>` / `CREATE EXTERNAL TABLE <s>.<tbl>` | ✅ |
 | Create ENUM type | `CREATE TYPE <name> AS ENUM(...)` | ✅ |
 | Create composite/STRUCT type | `CREATE TYPE <name> AS (<field> <type>, ...)` | ✅ |
 | Create table (scalar + custom types) | `CREATE TABLE <tbl> (<col> <type>, ...)` | ✅ |
-| Create / drop a remote table | `CREATE TABLE <alias>.<db>.<schema>.<tbl> (...)` / `DROP TABLE ...` — runs on the backend | ✅ |
+| Create / drop a remote table | `CREATE TABLE <alias>.<ns>.<tbl> (...)` / `DROP TABLE ...` — runs on the backend | ✅ |
 | Create index | `CREATE INDEX <ix> ON <tbl> (<col>)` | ✅ |
 | Drop index / table / schema / database | `DROP INDEX|TABLE|SCHEMA|DATABASE ...` | ✅ |
 
@@ -166,8 +171,10 @@ while the server runs is discovered on the first statement that names it.
 
 Apply these to turn a `⚠️`/`❌` into a `✅`:
 
-1. **Qualify every remote table in four parts**, `<alias>.<db>.<schema>.<tbl>`
-   (`public` for MySQL / ClickHouse). Three parts and fewer are local names.
+1. **Qualify every remote table in three parts**, `<alias>.<ns>.<tbl>` (`<ns>` a
+   schema of the connection's database on PostgreSQL, a database on MySQL /
+   ClickHouse). Short names need a place (the `database` you connected with);
+   four parts are refused.
 2. **Date/time columns come back as text — or not at all.** A backend's
    `date`/`timestamp`/`datetime` column is carried as the text the backend prints:
    compare it with a string literal (`<ts_col> >= '<date>'`, pushed down) and parse
@@ -221,9 +228,10 @@ shape on a small `LIMIT`/`WHERE` slice before running it broadly.
 |---|---|---|
 | `psql: command not found` | client not installed | `brew install libpq`; add its `bin` to PATH |
 | port 8817 `Connection refused` | no OtterStax server on that host/port | start the server or set `OTTERSTAX_HOST`/`OTTERSTAX_PORT` |
-| `FATAL 3D000 database "<db>" does not exist` at connect | the client named a database the engine does not have | connect to `main` (`OTTERSTAX_DB=main`, the default) or a database you created |
-| `... does not exist` for `<alias>.<db>.<tbl>` | three parts name a local table | write the remote table in four parts, `<alias>.<db>.<schema>.<tbl>` |
-| `... does not exist` for a four-part name | alias not declared in the server's config, or a wrong `<db>` / `<schema>` | add the alias under `connections:` in `config.yaml` and restart the server; check the configured `database` / `schema` |
+| `FATAL 3D000 database "<db>" does not exist` at connect | the client named something that is neither a connection nor `local` | set `OTTERSTAX_DB=local` (a fresh engine's own database) or to a connection alias |
+| `... does not exist` for a one- or two-part name | the session has no place (no `database` at connect) or the place lacks that namespace | reconnect with `OTTERSTAX_DB=<place>` (`local`, `alias`, `alias.ns`), or qualify in full `<alias>.<ns>.<tbl>` |
+| `... does not exist` for `<alias>.<ns>.<tbl>` | alias not declared in the server's config, or a wrong `<ns>` | add the alias under `connections:` in `config.yaml` and restart the server; check the configured `database` / `schema` |
+| `a table is named connection.namespace.table` | a four-part name | write the table in three parts, `<alias>.<ns>.<tbl>` |
 | `UPDATE of "<t>" cannot run as one statement of connection "<alias>"` | a remote write the backend cannot run whole | rewrite it as one backend statement (no local / other-server source) |
 | `SET <name> is not supported` | the engine has only `timezone`, `autocommit`, `search_path` | drop the `SET` |
 | `column '<col>' has type TIMESTAMP (19), which the PostgreSQL wire cannot encode in text format` | local engine date/time column in the result set | apply Rule 2 |

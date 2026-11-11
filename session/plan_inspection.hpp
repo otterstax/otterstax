@@ -4,6 +4,7 @@
 #pragma once
 
 #include "otterbrix/parser/parser.hpp"
+#include "session/query_session.hpp"
 #include "session/session_payload.hpp"
 #include "types/otterbrix.hpp"
 
@@ -26,7 +27,6 @@ namespace otterstax::kafka {
 // What a query session reads off a parsed statement before it routes or
 // describes it. Pure functions over the plan: no actor, no I/O.
 namespace otterstax::session::plan {
-
     // Root carriers produced by the grammar extensions. Both are
     // node_type::unused (the engine never executes them), so the plan root's
     // type cannot tell them apart; the parser records the claiming extension on
@@ -43,18 +43,12 @@ namespace otterstax::session::plan {
     // RELEASE / ROLLBACK TO) the plan root is; `none` for every other statement.
     transaction_command_t transaction_command(const ParsedQueryData& data);
 
-    // The database a CREATE DATABASE / DROP DATABASE statement names; empty
-    // for every other statement. A DROP DATABASE root without one names nothing
-    // and is refused (invalid_parameter) rather than passed on.
-    core::result_wrapper_t<std::pmr::string> database_ddl_target(std::pmr::memory_resource* resource,
-                                                                 const ParsedQueryData& data);
-
     // The relation or schema a DDL or DML statement changes, as written (every
     // slot as the statement spells it): the target of an INSERT / UPDATE /
     // DELETE, a CREATE / ALTER / DROP of a relation, an index, a view, a
     // sequence, a type, a schema. nullopt for every other statement (a query, a
-    // transaction or setting statement, CREATE / DROP DATABASE — those are
-    // database_ddl_target's). `drops_schema`: a DROP SCHEMA. `table_ddl`: a
+    // transaction or setting statement, a CREATE / DROP DATABASE — which
+    // place_namespace_ddl leaves to no client). `drops_schema`: a DROP SCHEMA. `table_ddl`: a
     // CREATE / ALTER / DROP TABLE, a constraint or a CREATE INDEX — the name is
     // the table's (catalog::check_table_scope).
     struct write_target_t {
@@ -63,6 +57,12 @@ namespace otterstax::session::plan {
         bool table_ddl{false};
     };
     std::optional<write_target_t> write_target(const ParsedQueryData& data);
+
+    // A client's namespace DDL lands in `local`: CREATE / DROP SCHEMA of a bare name is local's schema, wherever the
+    // session stands; so is CREATE / DROP DATABASE when the client's database is a schema. When it is a catalog,
+    // CREATE / DROP DATABASE is refused (invalid_parameter): a new catalog is a connection, and connections come from
+    // config.yaml. Every other statement is left as it is.
+    core::error_t place_namespace_ddl(std::pmr::memory_resource* resource, ParsedQueryData& data, database_term_t term);
 
     // What a SET / RESET / RESET ALL of the session or SET LOCAL assigns, as
     // the engine applies it (session_payload::setting_changes): each value
@@ -86,5 +86,4 @@ namespace otterstax::session::plan {
     // among (catalog::registration_target).
     std::pmr::vector<qualified_name_t> statement_names(std::pmr::memory_resource* resource,
                                                        const components::logical_plan::execution_plan_t& statement);
-
 } // namespace otterstax::session::plan

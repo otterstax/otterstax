@@ -27,12 +27,10 @@
 #include <utility>
 
 namespace otterstax::session {
-
     using namespace components;
     using core::error_code_t;
 
     namespace {
-
         // Every error_t the session hands back is built on the session's resource.
         core::error_t make_error(std::pmr::memory_resource* resource, error_code_t code, std::string_view what) {
             return core::error_t{code, std::pmr::string{what, resource}};
@@ -77,10 +75,10 @@ namespace otterstax::session {
         // statement's describe_explain), as wrapper_dispatcher_t::describe_sql
         // asks it.
         void mark_describe(logical_plan::execution_plan_t& plan) {
-            plan.explain = plan.explain == logical_plan::explain_type::none ? logical_plan::explain_type::describe
-                                                                             : logical_plan::explain_type::describe_explain;
+            plan.explain = plan.explain == logical_plan::explain_type::none
+                               ? logical_plan::explain_type::describe
+                               : logical_plan::explain_type::describe_explain;
         }
-
     } // namespace
 
     core::result_wrapper_t<session_services_t>
@@ -97,8 +95,7 @@ namespace otterstax::session {
                                     .file = std::move(file),
                                     .kafka = std::move(kafka),
                                     .kafka_objects = &kafka_objects,
-                                    .connections = std::move(connections),
-                                    .aliases = {}};
+                                    .connections = std::move(connections)};
         const std::pair<const char*, const actor_zeta::address_t*> required[] = {
             {"engine dispatcher", &services.engine_dispatcher},
             {"s3 manager", &services.s3},
@@ -117,13 +114,10 @@ namespace otterstax::session {
             if (connection.actor == nullptr) {
                 return core::error_t(
                     core::error_code_t::invalid_parameter,
-                    std::pmr::string{("session services: connection '" + connection.name + "' has no backend actor").c_str(),
-                                     resource});
+                    std::pmr::string{
+                        ("session services: connection '" + connection.name + "' has no backend actor").c_str(),
+                        resource});
             }
-        }
-        services.aliases.reserve(services.connections.size());
-        for (const auto& connection : services.connections) {
-            services.aliases.push_back(connection.name);
         }
         return services;
     }
@@ -132,13 +126,15 @@ namespace otterstax::session {
                                      actor_zeta::scheduler_raw scheduler,
                                      std::unique_ptr<IParser> parser,
                                      session_services_t services,
-                                     session_factory_t* factory)
+                                     session_factory_t* factory,
+                                     database_term_t term)
         : actor_zeta::basic_actor<query_session_t>(res)
         , resource_(res)
         , scheduler_(scheduler)
         , log_(get_logger(logger_tag::SESSION))
         , parser_(std::move(parser))
         , services_(std::move(services))
+        , term_(term)
         , factory_(factory)
         , engine_session_(components::session::session_id_t::generate_uid())
         , prepared_(res) {
@@ -255,6 +251,8 @@ namespace otterstax::session {
         auto cmd = msg->command();
         if (cmd == actor_zeta::msg_id<query_session_t, &query_session_t::execute>) {
             co_await actor_zeta::dispatch(this, &query_session_t::execute, msg);
+        } else if (cmd == actor_zeta::msg_id<query_session_t, &query_session_t::use>) {
+            co_await actor_zeta::dispatch(this, &query_session_t::use, msg);
         } else if (cmd == actor_zeta::msg_id<query_session_t, &query_session_t::execute_statement>) {
             co_await actor_zeta::dispatch(this, &query_session_t::execute_statement, msg);
         } else if (cmd == actor_zeta::msg_id<query_session_t, &query_session_t::execute_prepared_statement>) {
@@ -291,6 +289,36 @@ namespace otterstax::session {
     // of order) and corrupt the trace, so each handler opens its zone in a block
     // that closes before the first co_await.
 
+    actor_zeta::unique_future<query_session_t::session_result> query_session_t::use(statement_id_t id,
+                                                                                    std::string named) {
+        std::string sql;
+        std::string where;
+        {
+            OTX_ZONE_N("query_session::use");
+            auto place = catalog::client_place(resource(), named, services_.connections);
+            if (place.has_error()) {
+                co_return forward_error(resource(), place.error(), "");
+            }
+            where = std::move(place.value());
+            sql = "SET search_path = '";
+            for (const char ch : where) {
+                sql += ch;
+                if (ch == '\'') {
+                    sql += '\'';
+                }
+            }
+            sql += "';";
+        }
+        auto placed = co_await execute(id, std::move(sql));
+        // The engine names the schema it missed; the client named the place.
+        if (placed.has_error() && placed.error().type == error_code_t::schema_not_exists) {
+            co_return make_error(resource(),
+                                 error_code_t::schema_not_exists,
+                                 "schema \"" + where + "\" does not exist");
+        }
+        co_return placed;
+    }
+
     actor_zeta::unique_future<query_session_t::session_result> query_session_t::execute(statement_id_t id,
                                                                                         std::string sql) {
         Timer timer("query_session::execute", log_);
@@ -312,7 +340,8 @@ namespace otterstax::session {
                 // A direct execute has no Bind.
                 refused.emplace(make_error(resource(),
                                            error_code_t::invalid_parameter,
-                                           "statement has " + std::to_string(parsed.value()->binder().parameter_count()) +
+                                           "statement has " +
+                                               std::to_string(parsed.value()->binder().parameter_count()) +
                                                " parameter(s) and no values bound; prepare and bind it"));
             } else {
                 data = std::move(parsed.value());
@@ -352,11 +381,8 @@ namespace otterstax::session {
         co_return co_await execute_entry(id, std::move(*values), 0);
     }
 
-    actor_zeta::unique_future<query_session_t::session_result> query_session_t::execute_window(
-        statement_id_t id,
-        vector::data_chunk_t parameters,
-        uint64_t row,
-        uint64_t window) {
+    actor_zeta::unique_future<query_session_t::session_result>
+    query_session_t::execute_window(statement_id_t id, vector::data_chunk_t parameters, uint64_t row, uint64_t window) {
         std::optional<bound_values_t> values;
         {
             OTX_ZONE_N("query_session::execute_window");
@@ -382,7 +408,8 @@ namespace otterstax::session {
             engine_answered_ = false;
             auto it = prepared_.find(id);
             if (it == prepared_.end()) {
-                refused.emplace(make_error(resource(), error_code_t::invalid_parameter, "prepared statement does not exist"));
+                refused.emplace(
+                    make_error(resource(), error_code_t::invalid_parameter, "prepared statement does not exist"));
             } else if (values.chunk.column_count() != 0 && values.row >= values.chunk.size()) {
                 refused.emplace(make_error(resource(),
                                            error_code_t::invalid_parameter,
@@ -485,8 +512,9 @@ namespace otterstax::session {
                 data = std::move(parsed.value());
                 const auto root = plan::extension_root(*data);
                 if (root.kafka != nullptr) {
-                    answered.emplace(
-                        make_error(resource(), error_code_t::unimplemented_yet, "Kafka DDL statements cannot be prepared"));
+                    answered.emplace(make_error(resource(),
+                                                error_code_t::unimplemented_yet,
+                                                "Kafka DDL statements cannot be prepared"));
                 } else if (root.external != nullptr) {
                     // CREATE EXTERNAL TABLE / COPY ... TO answers no rows; the
                     // work runs at execute.
@@ -531,7 +559,8 @@ namespace otterstax::session {
             engine_answered_ = false;
             auto it = prepared_.find(id);
             if (it == prepared_.end()) {
-                refused.emplace(make_error(resource(), error_code_t::invalid_parameter, "prepared statement does not exist"));
+                refused.emplace(
+                    make_error(resource(), error_code_t::invalid_parameter, "prepared statement does not exist"));
             } else {
                 sql = it->second.sql;
                 auto parsed = parse_bound(sql, values, true);
@@ -571,7 +600,8 @@ namespace otterstax::session {
             command_ = transaction_command_t::none;
             engine_answered_ = false;
             if (!data || !data->plan || !plan_root(*data->plan)) {
-                refused.emplace(make_error(resource(), error_code_t::invalid_parameter, "execute_plan: no plan to execute"));
+                refused.emplace(
+                    make_error(resource(), error_code_t::invalid_parameter, "execute_plan: no plan to execute"));
             } else if (data->extension_kind != extension_kind_t::none) {
                 // Grammar-extension roots come from SQL text only; a pre-built
                 // plan is a query.
@@ -601,7 +631,8 @@ namespace otterstax::session {
             command_ = transaction_command_t::none;
             engine_answered_ = false;
             if (!data || !data->plan || !plan_root(*data->plan)) {
-                refused.emplace(make_error(resource(), error_code_t::invalid_parameter, "prepare_plan: no plan to describe"));
+                refused.emplace(
+                    make_error(resource(), error_code_t::invalid_parameter, "prepare_plan: no plan to describe"));
             } else if (data->extension_kind != extension_kind_t::none) {
                 refused.emplace(make_error(resource(),
                                            error_code_t::invalid_parameter,
@@ -703,7 +734,6 @@ namespace otterstax::session {
                               uint64_t window) {
         plan::extension_root_t root;
         std::optional<otterstax::kafka::kafka_write_t> write;
-        std::optional<plan::write_target_t> dropped_schema;
         {
             OTX_ZONE_N("query_session::dispatch");
             command_ = plan::transaction_command(*data);
@@ -717,32 +747,15 @@ namespace otterstax::session {
             // rest (before a file is read or a topic written).
             root = plan::extension_root(*data);
             write = otterstax::kafka::kafka_write_target(plan_root(*data->plan));
-            dropped_schema = plan::write_target(*data);
-            if (dropped_schema && !dropped_schema->drops_schema) {
-                dropped_schema.reset();
-            }
             if (root.external != nullptr || root.kafka != nullptr) {
                 if (auto refused = refuse_in_failed_block(); refused.contains_error()) {
                     co_return std::move(refused);
                 }
             }
         }
-        // DROP SCHEMA takes a simple name: the schema of the session's place,
-        // which main.kafka is from a place in main.
-        if (dropped_schema && transaction_status() != transaction_status_t::failed) {
-            auto where = co_await place();
-            OTX_ZONE_N("query_session::dispatch::drop_schema");
-            if (where && dropped_schema->name.database.t.empty()) {
-                dropped_schema->name.database = core::dbname_t{where->database};
-            }
-            if (auto owned = otterstax::catalog::check_write_ownership(resource(), dropped_schema->name, true);
-                owned.contains_error()) {
-                co_return std::move(owned);
-            }
-        }
         // An INSERT whose name can be a Kafka object's is one when the object is
         // registered and the name, completed with the session's place, is
-        // main.kafka.<object>; any other INSERT is the engine's.
+        // local.kafka.<object>; any other INSERT is the engine's.
         if (write && !co_await names_kafka_object(write->target)) {
             write.reset();
         }
@@ -842,7 +855,9 @@ namespace otterstax::session {
         std::optional<actor_zeta::unique_future<cursor::cursor_t_ptr>> asked;
         {
             OTX_ZONE_N("query_session::place");
-            auto plan = otterstax::engine::sql_plan(resource(), "SELECT current_database(), current_schema();");
+            auto plan =
+                otterstax::engine::sql_plan(resource(),
+                                            "SELECT current_connection(), current_database(), current_schema();");
             if (plan.has_error()) {
                 log_->error("query_session: the session's place cannot be asked: {}", plan.error().what.c_str());
                 co_return std::nullopt;
@@ -855,19 +870,20 @@ namespace otterstax::session {
         if (!answer || answer->is_error() || answer->size() == 0) {
             co_return std::nullopt;
         }
-        auto database = answer->get<std::string_view>(0, 0);
-        auto schema = answer->get<std::string_view>(1, 0);
-        if (database.has_error() || schema.has_error()) {
+        auto connection = answer->get<std::string_view>(0, 0);
+        auto database = answer->get<std::string_view>(1, 0);
+        auto schema = answer->get<std::string_view>(2, 0);
+        if (connection.has_error() || database.has_error() || schema.has_error()) {
             co_return std::nullopt;
         }
-        co_return place_t{std::string{database.value()}, std::string{schema.value()}};
+        co_return place_t{std::string{connection.value()}, std::string{database.value()}, std::string{schema.value()}};
     }
 
-    actor_zeta::unique_future<query_session_t::session_result> query_session_t::run_on_engine(
-        types::complex_logical_type schema,
-        ParsedQueryDataPtr data,
-        rebuild_fn rebuild,
-        uint64_t window) {
+    actor_zeta::unique_future<query_session_t::session_result>
+    query_session_t::run_on_engine(types::complex_logical_type schema,
+                                   ParsedQueryDataPtr data,
+                                   rebuild_fn rebuild,
+                                   uint64_t window) {
         const NodeTag tag = data->tag;
         auto cursor = co_await on_engine(std::move(data), std::move(rebuild), engine_call_t::execute, window);
         OTX_ZONE_N("query_session::run_on_engine::payload");
@@ -955,9 +971,9 @@ namespace otterstax::session {
         std::pmr::vector<qualified_name_t> short_names(resource());
         {
             OTX_ZONE_N("query_session::register_missed");
-            if (services_.connections.empty() || (error.type != error_code_t::table_not_exists &&
-                                                  error.type != error_code_t::schema_not_exists &&
-                                                  error.type != error_code_t::database_not_exists)) {
+            if (services_.connections.empty() ||
+                (error.type != error_code_t::table_not_exists && error.type != error_code_t::schema_not_exists &&
+                 error.type != error_code_t::database_not_exists)) {
                 co_return registration_outcome_t{};
             }
             for (auto& name : names) {
@@ -968,31 +984,20 @@ namespace otterstax::session {
                 }
             }
         }
-        // `t` and `s.t` take the session's place, a connection's database too
-        // (`SET search_path = 'c.d.s'`). The engine names the place's database
-        // and schema but not its connection, so every connection whose database
-        // that is gets the completed name: the table is registered where the
-        // backend has it, and the statement's own completion decides what the
-        // run once more reads. A failed block refuses the question.
+        // `t` and `s.t` take the session's place: in a connection's place (current_connection()) they are that
+        // connection's connection.namespace.table. A failed block refuses the question.
         if (!short_names.empty() && transaction_status() != transaction_status_t::failed) {
             auto where = co_await place();
             OTX_ZONE_N("query_session::register_missed::complete");
-            if (where) {
-                const auto database = otterstax::federation::fold_identifier(where->database);
+            if (where && !where->connection.empty()) {
                 for (const auto& name : short_names) {
-                    for (const auto& connection : services_.connections) {
-                        if (otterstax::federation::fold_identifier(connection.database) != database) {
-                            continue;
-                        }
-                        const qualified_name_t completed{
-                            core::connection_name_t{connection.name},
-                            core::dbname_t{where->database},
-                            core::schema_t{name.schema.t.empty() ? where->schema : name.schema.t},
-                            core::relname_t{name.collection.t}};
-                        if (auto target =
-                                otterstax::catalog::registration_target(error, completed, services_.connections)) {
-                            targets.push_back(std::move(*target));
-                        }
+                    const qualified_name_t completed{
+                        core::dbname_t{where->connection},
+                        core::schema_t{name.schema.t.empty() ? where->schema : name.schema.t},
+                        core::relname_t{name.collection.t}};
+                    if (auto target =
+                            otterstax::catalog::registration_target(error, completed, services_.connections)) {
+                        targets.push_back(std::move(*target));
                     }
                 }
             }
@@ -1004,8 +1009,7 @@ namespace otterstax::session {
             }
             log_->info("query_session: registering {} table(s) after: {}", targets.size(), error.what.c_str());
         }
-        // Each target on its own: one a backend does not have (a completed
-        // short name of another connection) leaves the others registered.
+        // Each target on its own: one a backend does not have leaves the others registered.
         registration_outcome_t outcome;
         for (auto& [connection, scope] : targets) {
             // The connection's backend actor discovers the table on one of its agents; this
@@ -1021,7 +1025,9 @@ namespace otterstax::session {
             {
                 OTX_ZONE_N("query_session::register_missed::plans");
                 if (reply.has_error()) {
-                    log_->warn("query_session: {} cannot be discovered: {}", scope.to_string(), reply.error().what.c_str());
+                    log_->warn("query_session: {} cannot be discovered: {}",
+                               scope.to_string(),
+                               reply.error().what.c_str());
                     // The connection failed, not the name: that is the client's answer. A backend
                     // that answered (no such table, a refused probe) leaves the statement's miss.
                     const auto code = reply.error().type;
@@ -1092,24 +1098,21 @@ namespace otterstax::session {
 
     core::error_t query_session_t::guard_ownership(const ParsedQueryData& data) {
         OTX_ZONE_N("query_session::guard_ownership");
-        auto target = plan::database_ddl_target(resource(), data);
-        if (target.has_error()) {
-            return forward_error(resource(), target.error(), "");
-        }
-        if (!target.value().empty()) {
-            return otterstax::catalog::check_database_ownership(resource(), target.value(), services_.aliases);
+        // A table is connection.namespace.table: a fourth part would be a second full name of it.
+        for (const auto& name : plan::statement_names(resource(), *data.plan)) {
+            if (!name.connection.t.empty()) {
+                const std::string what = "\"" + name.to_string() + "\": a table is named connection.namespace.table";
+                return core::error_t(error_code_t::invalid_parameter, std::pmr::string{what.c_str(), resource()});
+            }
         }
         auto written = plan::write_target(data);
         if (!written) {
             return core::error_t::no_error();
         }
-        // DROP SCHEMA names a schema of the session's place: dispatch asks the
-        // place before it runs (a describe changes nothing).
-        if (!written->drops_schema) {
-            if (auto owned = otterstax::catalog::check_write_ownership(resource(), written->name, false);
-                owned.contains_error()) {
-                return owned;
-            }
+        // A DROP SCHEMA names a schema of local (plan::place_namespace_ddl), Kafka's included.
+        if (auto owned = otterstax::catalog::check_write_ownership(resource(), written->name, written->drops_schema);
+            owned.contains_error()) {
+            return owned;
         }
         // A connection configured with one `table:` takes DDL of that table only.
         if (written->table_ddl) {
@@ -1141,17 +1144,22 @@ namespace otterstax::session {
                 co_return std::move(scoped);
             }
             if (ext.is_s3()) {
-                read.emplace(
-                    actor_zeta::send(
-                        services_.s3, &db::S3Manager::download, to_hash(id), ext.s3_alias(), ext.object_path(), ext.format())
-                        .second);
+                read.emplace(actor_zeta::send(services_.s3,
+                                              &db::S3Manager::download,
+                                              to_hash(id),
+                                              ext.s3_alias(),
+                                              ext.object_path(),
+                                              ext.format())
+                                 .second);
             } else {
                 conn::file::FileLoadParams params;
                 params.path = ext.location();
                 params.format = ext.format().empty() ? std::string{"auto"} : ext.format();
-                read.emplace(
-                    actor_zeta::send(services_.file, &conn::file::FileManager::load_file, to_hash(id), std::move(params))
-                        .second);
+                read.emplace(actor_zeta::send(services_.file,
+                                              &conn::file::FileManager::load_file,
+                                              to_hash(id),
+                                              std::move(params))
+                                 .second);
             }
         }
         auto rows = co_await std::move(*read);
@@ -1159,21 +1167,17 @@ namespace otterstax::session {
             co_return forward_error(resource(), rows.error(), "CREATE EXTERNAL TABLE failed: ");
         }
         // Outside a block the load is one transaction of its own (the table and
-        // its rows, or nothing). A connection's table — four parts, or `t` /
-        // `s.t` in a place that is a connection's database (the engine names
-        // the place's database, not its connection: a database some connection
-        // reaches counts as the connection's) — is created and filled in
+        // its rows, or nothing). A connection's table — one whose place is a
+        // connection's (current_connection()) — is created and filled in
         // autocommit: inside a block the backend decides (otterbrix's rules for
         // a remote write in a block).
-        bool own_block = transaction_status() == transaction_status_t::idle && ext.target().connection.t.empty();
+        bool own_block = transaction_status() == transaction_status_t::idle &&
+                         otterstax::catalog::configured(ext.target().database.t, services_.connections) == nullptr;
         if (own_block && ext.target().database.t.empty() && !services_.connections.empty()) {
             auto where = co_await place();
             OTX_ZONE_N("query_session::load_external_table::place");
             if (where) {
-                const auto database = otterstax::federation::fold_identifier(where->database);
-                for (const auto& connection : services_.connections) {
-                    own_block = own_block && otterstax::federation::fold_identifier(connection.database) != database;
-                }
+                own_block = where->connection.empty();
             }
         }
         std::optional<otterstax::engine::cursor_future_t> loaded;
@@ -1223,9 +1227,10 @@ namespace otterstax::session {
             // Only a query has rows to export: a statement of any other kind
             // (DDL, DML, a transaction statement) is refused before it runs.
             if (!plan::is_query(*parsed.value())) {
-                co_return make_error(resource(),
-                                     error_code_t::invalid_parameter,
-                                     "COPY ... TO: the inner statement must be a query (SELECT, VALUES, a set operation)");
+                co_return make_error(
+                    resource(),
+                    error_code_t::invalid_parameter,
+                    "COPY ... TO: the inner statement must be a query (SELECT, VALUES, a set operation)");
             }
             inner = std::move(parsed.value());
 
@@ -1292,6 +1297,9 @@ namespace otterstax::session {
             if (!parsed.value() || !parsed.value()->plan || !plan_root(*parsed.value()->plan)) {
                 return make_error(resource(), error_code_t::sql_parse_error, "parser returned no plan");
             }
+            if (auto placed = plan::place_namespace_ddl(resource(), *parsed.value(), term_); placed.contains_error()) {
+                return placed;
+            }
             return parsed;
         } catch (const std::exception& e) {
             log_->error("query_session::parse_sql: parser threw: {}", e.what());
@@ -1336,5 +1344,4 @@ namespace otterstax::session {
         data.awaiting_bind = false;
         return parsed;
     }
-
 } // namespace otterstax::session

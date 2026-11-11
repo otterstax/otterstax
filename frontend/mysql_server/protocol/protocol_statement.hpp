@@ -24,12 +24,11 @@
 // commit — which the engine's grammar (PostgreSQL's) cannot read: no
 // `@@variable`, no SHOW VARIABLES / SHOW WARNINGS, no MySQL SET forms, no USE.
 // The SELECTs and SHOWs are answered by the frontend; a SET is one engine
-// statement of all its assignments (engine_setting_plan), a USE the engine's
-// SET search_path (engine_search_path_statement), and the engine answers them. A statement is
+// statement of all its assignments (engine_setting_plan), a USE the session's place
+// (query_session_t::use), and the engine answers them. A statement is
 // recognised by MySQL's grammar over the lexer's tokens, never by a substring.
 // Any other text is not a protocol statement and goes to the query session.
 namespace frontend::mysql {
-
     // A refusal of a protocol statement, as the ERR packet carries it.
     struct protocol_refusal_t {
         mysql_error code;
@@ -72,9 +71,8 @@ namespace frontend::mysql {
         std::optional<protocol_refusal_t> refusal;
     };
 
-    // USE <database> [;] — `database` as written, `alias.db` for a database of
-    // a connection: the session's place, SET search_path = '<database>.public'
-    // (engine_search_path_statement).
+    // USE <database> [;] — `database` as written (`connection`, `connection.namespace`, `local`,
+    // `local.namespace`): the session's place (query_session_t::use, catalog::client_place).
     struct use_database_t {
         std::string database;
     };
@@ -100,9 +98,6 @@ namespace frontend::mysql {
     // query_session_t::execute_plan.
     [[nodiscard]] core::result_wrapper_t<ParsedQueryDataPtr>
     engine_setting_plan(std::pmr::memory_resource* resource, const std::vector<setting_t>& settings);
-
-    // SET search_path = '<database>.public'.
-    [[nodiscard]] std::string engine_search_path_statement(std::string_view database);
 
     // A select item: `@@[scope.]name` or one of the session functions.
     struct select_item_t {
@@ -149,7 +144,7 @@ namespace frontend::mysql {
     // with a syntax error, which the engine's form of the text gives (lexer.hpp).
     // Never throws.
     [[nodiscard]] std::optional<protocol_statement_t> classify_protocol_statement(std::string_view sql,
-                                                                                bool placeholders = false);
+                                                                                  bool placeholders = false);
 
     // What the answers are derived from: the server's own settings, so a client
     // reads back what the server actually does.
@@ -178,5 +173,4 @@ namespace frontend::mysql {
     [[nodiscard]] protocol_answer_t answer_protocol_statement(std::pmr::memory_resource* resource,
                                                               const protocol_statement_t& statement,
                                                               const protocol_context_t& context);
-
 } // namespace frontend::mysql

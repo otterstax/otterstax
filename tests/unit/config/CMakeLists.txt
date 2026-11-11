@@ -3,6 +3,7 @@ project(test_unit_config)
 set(${PROJECT_NAME}_SOURCES
     main.cpp
     test_connection_config.cpp
+    test_connection_names.cpp
     test_engine_config.cpp
 )
 

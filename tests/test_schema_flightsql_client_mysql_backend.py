@@ -11,10 +11,13 @@ import pyarrow.ipc as ipc
 # GetTables lists the engine's catalog, local and remote tables alike
 # (frontend/flight_sql/session_engine.cpp, SessionEngine::tables): a catalog is
 # a database as SQL writes it — `d` for a local one, `c.d` for the database d of
-# the connection c (tests/scripts/config.yaml). Only the backend's catalogs are
-# validated here, so a local table of the same name — or one whose column Arrow
-# cannot carry, whose table_schema is NULL — never stands in for a backend table.
-BACKEND_CATALOGS = {'campaigns.db1', 'impressions.db2'}
+# the connection c. A MySQL connection's database is `def`
+# (catalog::def_database) and its databases are the schemas under it, so the
+# catalogs here are `campaigns.def` / `impressions.def` (tests/scripts/config.yaml).
+# Only the backend's catalogs are validated here, so a local table of the same
+# name — or one whose column Arrow cannot carry, whose table_schema is NULL —
+# never stands in for a backend table.
+BACKEND_CATALOGS = {'campaigns.def', 'impressions.def'}
 
 def validate_table_schemas(client, expected_schemas):
     """Validate table schemas using get_tables method"""

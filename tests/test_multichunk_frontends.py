@@ -68,11 +68,12 @@ class MultiChunkFrontendTest:
     # ── fixture ─────────────────────────────────────────────────────────────
     def setup(self):
         """Load the 5000-row csv into otterbrix-internal storage."""
-        # No `database=`: every reference below is fully qualified, and the
-        # external-table tests connect the same way (external_helpers.conn_cfg).
+        # `database="local"` is the session's place; the two-part references
+        # below complete by it, the way the external-table tests connect
+        # (external_helpers.conn_cfg).
         self.mysql_conn = mysql.connector.connect(
             host=self.host, port=config.MYSQL_PORT,
-            user="testuser", password="testpass", autocommit=True)
+            user="testuser", password="testpass", database="local", autocommit=True)
         cur = self.mysql_conn.cursor()
         # CREATE EXTERNAL TABLE names its table as CREATE TABLE does: the
         # schema must exist.
@@ -145,7 +146,7 @@ class MultiChunkFrontendTest:
     def test_pg_simple_protocol_spans_chunks(self):
         """PG simple query: all 5000 rows, not the first chunk."""
         with psycopg.connect(host=self.host, port=config.PG_PORT, user="testuser",
-                             password="testpass", dbname="main", autocommit=True) as conn:
+                             password="testpass", dbname="local", autocommit=True) as conn:
             conn.prepare_threshold = None
             with conn.cursor() as cur:
                 cur.execute(f"SELECT event_id, campaign_id, value FROM {DB}.{TABLE}")
@@ -158,7 +159,7 @@ class MultiChunkFrontendTest:
     def test_pg_extended_protocol_spans_chunks(self):
         """PG Bind/Execute: same, through the row-limit-aware path."""
         with psycopg.connect(host=self.host, port=config.PG_PORT, user="testuser",
-                             password="testpass", dbname="main", autocommit=True) as conn:
+                             password="testpass", dbname="local", autocommit=True) as conn:
             conn.prepare_threshold = None
             with conn.cursor() as cur:
                 # A parameter switches psycopg3 to the extended protocol, which
@@ -209,7 +210,8 @@ class MultiChunkFrontendTest:
 
     def test_flightsql_spans_chunks(self):
         """FlightSQL DoGet: the multi-batch reader must emit every chunk."""
-        table = self._flight_rows(f"SELECT event_id, campaign_id, value FROM {DB}.{TABLE}")
+        # Flight SQL has no place field: the table is named in full.
+        table = self._flight_rows(f"SELECT event_id, campaign_id, value FROM local.{DB}.{TABLE}")
         print(f"  FlightSQL schema: {[f.name for f in table.schema]}")
         self.assert_equal(table.num_rows, EXPECTED_ROWS, "FlightSQL row count")
         # num_rows alone is not enough: a stream with the right row count and

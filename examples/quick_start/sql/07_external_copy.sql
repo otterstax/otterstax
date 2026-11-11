@@ -4,8 +4,8 @@
 -- console afterwards). Requires example 6 to have run first.
 COPY (
     SELECT pc.product_id, pc.unit_cost, pr.promo_code, pr.discount_pct
-    FROM   qs.product_costs pc
-    JOIN   qs.promotions   pr ON pr.product_id = pc.product_id
+    FROM   local.qs.product_costs pc
+    JOIN   local.qs.promotions   pr ON pr.product_id = pc.product_id
     ORDER  BY pc.product_id
 ) TO 's3://quickstart-bucket/exports/promo_costs.csv'
     WITH (s3_alias = 'qs_s3', format = 'csv');

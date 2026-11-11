@@ -11,8 +11,8 @@
 // semantics, isolated per connection, the status the engine stamps on every
 // answer, SET in the engine, and close_session when the session closes.
 
-#include "../system/session_stack.hpp"
 #include "../mock/cell.hpp"
+#include "../system/session_stack.hpp"
 
 #include "../mock/mock_config.hpp"
 #include "../mock/parser.hpp"
@@ -25,9 +25,9 @@
 #include <chrono>
 #include <condition_variable>
 #include <functional>
-#include <optional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -43,7 +43,6 @@ using otterstax::test::stack_options_t;
 using otterstax::test::stmt;
 
 namespace {
-
     using namespace std::chrono_literals;
     using future_t = actor_zeta::unique_future<core::result_wrapper_t<session_payload>>;
 
@@ -54,10 +53,11 @@ namespace {
     // the MySQL backend actor while the mock sleeps on its agent's backends-pool thread.
     std::unique_ptr<mysql::IConnector> slow_mysql_factory(std::pmr::memory_resource* resource,
                                                           boost::asio::io_context&,
-                                                          boost::mysql::connect_params,
+                                                          boost::mysql::connect_params params,
                                                           std::string alias) {
         return std::make_unique<mysql::MockConnector>(mock_config{.resource = resource, .wait_time = kSlowFor},
-                                                      std::move(alias));
+                                                      std::move(alias),
+                                                      std::move(params));
     }
 
     // kSlow parses to the mock parser's remote SELECT over uid "1"; any other
@@ -131,9 +131,9 @@ namespace {
         using mysql::MockConnector::MockConnector;
         using mysql::MockConnector::runQuery;
 
-        boost::asio::awaitable<core::result_wrapper_t<std::unique_ptr<components::vector::data_chunk_t>>>
-        runQuery(std::string_view,
-                 otterstax::function_ref_t<std::unique_ptr<components::vector::data_chunk_t>(const boost::mysql::results&)>)
+        boost::asio::awaitable<core::result_wrapper_t<std::unique_ptr<components::vector::data_chunk_t>>> runQuery(
+            std::string_view,
+            otterstax::function_ref_t<std::unique_ptr<components::vector::data_chunk_t>(const boost::mysql::results&)>)
             override {
             backend_gate().enter();
             co_return std::make_unique<components::vector::data_chunk_t>(get_chunk());
@@ -142,9 +142,11 @@ namespace {
 
     std::unique_ptr<mysql::IConnector> gated_mysql_factory(std::pmr::memory_resource* resource,
                                                            boost::asio::io_context&,
-                                                           boost::mysql::connect_params,
+                                                           boost::mysql::connect_params params,
                                                            std::string alias) {
-        return std::make_unique<gated_connector>(mock_config{.resource = resource}, std::move(alias));
+        return std::make_unique<gated_connector>(mock_config{.resource = resource},
+                                                 std::move(alias),
+                                                 std::move(params));
     }
 
     future_t send_sql(const actor_zeta::address_t& session, session_hash_t id, const std::string& sql) {
@@ -168,7 +170,8 @@ namespace {
         return count_of(run_session_sql_payload(s, id, "SELECT count(*) FROM " + table + ";"));
     }
 
-    bool wait_for_live(otterstax::session::session_factory_t& sessions, size_t live, std::chrono::milliseconds timeout) {
+    bool
+    wait_for_live(otterstax::session::session_factory_t& sessions, size_t live, std::chrono::milliseconds timeout) {
         for (auto waited = 0ms; waited < timeout; waited += 10ms) {
             if (sessions.live_sessions() == live) {
                 return true;
@@ -183,7 +186,6 @@ namespace {
         INFO(r.error().what.c_str());
         CHECK(std::string_view{r.error().what.c_str()}.find(text) != std::string_view::npos);
     }
-
 } // namespace
 
 TEST_CASE("session services: make_session_services sets every address") {
@@ -250,8 +252,6 @@ TEST_CASE("session services: connections without the backend actor are refused")
                                                                 owner.kafka_objects(),
                                                                 owner.remote().connections());
     REQUIRE_FALSE(with_actor.has_error());
-    REQUIRE(with_actor.value().aliases.size() == 1);
-    CHECK(with_actor.value().aliases.front() == "orders");
 }
 
 TEST_CASE("session close: an idle session frees itself at once") {
@@ -303,8 +303,7 @@ TEST_CASE("session close: a statement in flight finishes and what was queued beh
 }
 
 namespace {
-
-    constexpr const char* kRemoteSelect = "SELECT * FROM orders.db.public.\"table\";";
+    constexpr const char* kRemoteSelect = "SELECT * FROM orders.db.\"table\";";
 
     // One MySQL connection "orders" of one agent (pool_size 1): every block that reads it holds
     // that agent until it ends.
@@ -336,7 +335,6 @@ namespace {
         }
         return true;
     }
-
 } // namespace
 
 // A client that closes its connection inside a block (a driver with autocommit off: its first
@@ -465,7 +463,7 @@ TEST_CASE("session order: one statement at a time across real suspensions") {
     session_stack_owner owner(otterstax::test::unique_test_dir("otterstax_session_order_suspend"), slow_options());
     const auto s = owner.stack();
     run_session_or_fail(s, 1, "CREATE SCHEMA ord;");
-    run_session_or_fail(s, 2, "CREATE TABLE ord.t (id bigint);");
+    run_session_or_fail(s, 2, "CREATE TABLE local.ord.t (id bigint);");
 
     constexpr size_t kRounds = 12;
     std::vector<future_t> inserts;
@@ -476,8 +474,9 @@ TEST_CASE("session order: one statement at a time across real suspensions") {
         if (round % 4 == 0) {
             slows.push_back(send_sql(s.session, id++, kSlow));
         }
-        inserts.push_back(send_sql(s.session, id++, "INSERT INTO ord.t (id) VALUES (" + std::to_string(round) + ");"));
-        counts.push_back(send_sql(s.session, id++, "SELECT count(*) FROM ord.t;"));
+        inserts.push_back(
+            send_sql(s.session, id++, "INSERT INTO local.ord.t (id) VALUES (" + std::to_string(round) + ");"));
+        counts.push_back(send_sql(s.session, id++, "SELECT count(*) FROM local.ord.t;"));
     }
 
     for (size_t round = 0; round < kRounds; ++round) {
@@ -535,8 +534,7 @@ TEST_CASE("session transaction: an error aborts the block until ROLLBACK") {
         auto parse = run_session_sql_payload(s, 5, "SELEC broken;");
         REQUIRE(parse.has_error());
         CHECK(parse.error().type == core::error_code_t::sql_parse_error);
-        require_error_containing(run_session_sql_payload(s, 6, "INSERT INTO txa.t (id) VALUES (2);"),
-                                 "only ROLLBACK");
+        require_error_containing(run_session_sql_payload(s, 6, "INSERT INTO txa.t (id) VALUES (2);"), "only ROLLBACK");
         // The engine answers the COMMIT of a failed block with success and
         // rolls it back; the session tags it ROLLBACK, as PostgreSQL does.
         auto commit = run_session_sql_payload(s, 7, "COMMIT;");
@@ -607,9 +605,7 @@ TEST_CASE("transaction status: the session reads the engine's status on every an
     CHECK(inserted.value().transaction == transaction_command_t::none);
     CHECK(session->transaction_status() == status_t::in_transaction);
 
-    SECTION("an engine error") {
-        REQUIRE(run_session_sql_payload(s, 5, "SELECT * FROM txs.nowhere;").has_error());
-    }
+    SECTION("an engine error") { REQUIRE(run_session_sql_payload(s, 5, "SELECT * FROM txs.nowhere;").has_error()); }
     SECTION("a prepare the engine refuses") {
         REQUIRE(otterstax::test::prepare_session_sql(s, 5, "SELECT nowhere FROM txs.t;").has_error());
     }
@@ -803,8 +799,8 @@ TEST_CASE("transaction status: a statement over a connection's table is refused 
     run_session_or_fail(s, 1, "BEGIN;");
     REQUIRE(run_session_sql_payload(s, 2, "SELECT * FROM txr_nowhere.t;").has_error());
     REQUIRE(session->transaction_status() == status_t::failed);
-    for (const char* sql : {"UPDATE orders.db.public.\"table\" SET name = 'x' WHERE id = 1;",
-                            "CREATE TABLE orders.db.public.created_in_failed_block (id bigint);"}) {
+    for (const char* sql : {"UPDATE orders.db.\"table\" SET name = 'x' WHERE id = 1;",
+                            "CREATE TABLE orders.db.created_in_failed_block (id bigint);"}) {
         INFO(sql);
         auto refused = run_session_sql_payload(s, 3, sql);
         require_error_containing(refused, "only ROLLBACK");

@@ -27,9 +27,9 @@
 #include "config/connections/connection_config.hpp"
 #include "connectors/file/manager.hpp"
 #include "connectors/s3/manager.hpp"
+#include "frontend/common/asio_future_bridge.hpp"
 #include "integration/kafka/kafka_manager.hpp"
 #include "integration/s3/s3_manager.hpp"
-#include "frontend/common/asio_future_bridge.hpp"
 #include "otterbrix/operators/engine_requests.hpp"
 #include "otterbrix/parser/parser.hpp"
 #include "runtime/engine.hpp"
@@ -69,7 +69,6 @@
 #include <unistd.h>
 
 namespace otterstax::test {
-
     // A data directory of its own for a test that needs an engine but does not
     // name a directory: /tmp/<prefix>-<pid>-<n>.
     inline std::string unique_test_dir(const std::string& prefix) {
@@ -125,9 +124,7 @@ namespace otterstax::test {
     // directory after destroying the first, with `fresh` off.
     class test_engine_t {
     public:
-        explicit test_engine_t(std::string data_dir,
-                               bool fresh = true,
-                               remote_setup_t remote = {})
+        explicit test_engine_t(std::string data_dir, bool fresh = true, remote_setup_t remote = {})
             : data_dir_(std::move(data_dir))
             , session_(components::session::session_id_t::generate_uid())
             , remove_on_exit_(fresh) {
@@ -236,6 +233,11 @@ namespace otterstax::test {
         bool kafka_pollers = false;
         // Wipe the data dir before and after.
         bool fresh = true;
+        // The database every connection of the stack names when it opens, as a client's StartupMessage or USE
+        // does (query_session_t::use); empty: none, so a session has no place.
+        std::string database = "local";
+        // What the stack's clients call a database: a schema of local by default, as a MySQL client does.
+        otterstax::session::database_term_t database_term = otterstax::session::database_term_t::schema;
     };
 
     // Owns the whole stack and one default connection, its parts declared in
@@ -249,17 +251,19 @@ namespace otterstax::test {
     public:
         explicit session_stack_owner(const std::string& data_dir, stack_options_t options = {})
             : options_(options)
-            , engine_(std::make_unique<test_engine_t>(
-                  data_dir,
-                  options.fresh,
-                  remote_setup_t{.connectors = options.connectors, .connections = options.connections, .retry = options.retry}))
+            , engine_(std::make_unique<test_engine_t>(data_dir,
+                                                      options.fresh,
+                                                      remote_setup_t{.connectors = options.connectors,
+                                                                     .connections = options.connections,
+                                                                     .retry = options.retry}))
             , s3_connector_(actor_zeta::spawn<conn::s3::ConnectorManager>(engine_->resource()))
             , file_(actor_zeta::spawn<conn::file::FileManager>(engine_->resource()))
             , s3_(actor_zeta::spawn<db::S3Manager>(engine_->resource(), s3_connector_->address(), file_->address()))
             , kafka_(actor_zeta::spawn<otterstax::kafka::KafkaManager>(engine_->resource(),
                                                                        engine_->dispatcher(),
                                                                        options.kafka_pollers)) {
-            if (auto err = backends::register_s3_aliases(engine_->resource(), s3_connector_->address(), options.connections);
+            if (auto err =
+                    backends::register_s3_aliases(engine_->resource(), s3_connector_->address(), options.connections);
                 err.contains_error()) {
                 FAIL("s3 aliases refused: " << err.what.c_str());
             }
@@ -302,12 +306,17 @@ namespace otterstax::test {
 
         // Another connection on the same engine, owned by the stack.
         actor_zeta::address_t open_connection() {
-            connections_.push_back(sessions_->open());
+            connections_.push_back(sessions_->open(options_.database_term));
+            place(*connections_.back());
             return connections_.back()->address();
         }
 
         // A connection the caller owns (and may close mid-statement).
-        otterstax::session::session_ptr open_session() { return sessions_->open(); }
+        otterstax::session::session_ptr open_session() {
+            auto session = sessions_->open(options_.database_term);
+            place(*session);
+            return session;
+        }
 
         // The first connection (the stack's default).
         session_stack stack() const {
@@ -325,6 +334,24 @@ namespace otterstax::test {
         otterstax::session::session_factory_t& sessions() { return *sessions_; }
 
     private:
+        // A test parser answers its canned plans, the SET of a place too: only the engine's parser places a session.
+        void place(otterstax::session::query_session_t& session) {
+            if (options_.database.empty() || options_.parser_factory != &make_parser) {
+                return;
+            }
+            auto [_, placed] = actor_zeta::send(session.address(),
+                                                &otterstax::session::query_session_t::use,
+                                                session.next_statement(),
+                                                options_.database);
+            auto answer = otterstax::await_future_blocking<session_payload>(std::move(placed),
+                                                                            engine_->resource(),
+                                                                            std::chrono::milliseconds(10000));
+            if (answer.has_error()) {
+                FAIL("a connection of the stack is not placed in " << options_.database << ": "
+                                                                   << answer.error().what.c_str());
+            }
+        }
+
         stack_options_t options_;
         std::unique_ptr<test_engine_t> engine_;
         template<typename T>
@@ -483,8 +510,8 @@ namespace otterstax::test {
     inline size_t engine_row_count(const session_stack& s, const std::string& db, const std::string& tbl) {
         auto cur = s.engine->sql("SELECT * FROM " + db + "." + tbl + ";");
         if (!cur || cur->is_error()) {
-            FAIL("engine_row_count: SELECT * FROM " << db << "." << tbl << " failed: "
-                                                    << (cur ? cur->get_error().what.c_str() : "null cursor"));
+            FAIL("engine_row_count: SELECT * FROM "
+                 << db << "." << tbl << " failed: " << (cur ? cur->get_error().what.c_str() : "null cursor"));
         }
         return cur->size();
     }
@@ -493,11 +520,11 @@ namespace otterstax::test {
     // multi-row VALUES batches so a table larger than one chunk is cheap to seed.
     inline void seed_people_bulk(const session_stack& s, session_hash_t& id, size_t rows) {
         run_session_or_fail(s, id++, "CREATE SCHEMA dmldb;");
-        run_session_or_fail(s, id++, "CREATE TABLE dmldb.people (id bigint, name string);");
+        run_session_or_fail(s, id++, "CREATE TABLE local.dmldb.people (id bigint, name string);");
         constexpr size_t batch = 500;
         for (size_t first = 0; first < rows; first += batch) {
             const size_t last = std::min(rows, first + batch);
-            std::string sql = "INSERT INTO dmldb.people (id, name) VALUES ";
+            std::string sql = "INSERT INTO local.dmldb.people (id, name) VALUES ";
             for (size_t i = first; i < last; ++i) {
                 if (i != first) {
                     sql += ", ";
@@ -508,5 +535,4 @@ namespace otterstax::test {
             run_session_or_fail(s, id++, sql);
         }
     }
-
 } // namespace otterstax::test

@@ -19,18 +19,23 @@
 #include <string>
 #include <vector>
 
-// The registration of the connections' tables in otterbrix's catalog. A connection's table is
-// ordinary catalog rows of a database of the connection (pg_database.datconnection):
+// The registration of the connections' tables in otterbrix's catalog. A connection's tables are
+// ordinary catalog rows of its one database (pg_database.datconnection), which a client names
+// connection.namespace.table: the engine reads a first part that is a connection as its database.
 //
-//   c.d          CREATE DATABASE, a plan naming the connection (SQL has no spelling for it)
-//   c.d.s        CREATE SCHEMA — MySQL / ClickHouse: `public`; PostgreSQL: config.yaml's `schema`,
-//                or every user schema of the database when it names none
+//   c.d          CREATE DATABASE, a plan naming the connection (SQL has no spelling for it):
+//                PostgreSQL — config.yaml's `database`; MySQL / ClickHouse — def_database
+//   c.d.s        CREATE SCHEMA — PostgreSQL: config.yaml's `schema`, or every user schema of the
+//                database when it names none; MySQL / ClickHouse: the backend's database
 //   c.d.s.t      CREATE TABLE with the discovered columns
 //
 // every name in lower case (the backend's spelling goes to the backend actor, staged before the
 // CREATE, and from its DDL reply into federation.public.remote_names). Every statement runs on the
 // actor's registration session, so no SQL reaches a backend: the table is there already.
 namespace otterstax::catalog {
+    // The engine database of a MySQL or ClickHouse connection, whose databases are its schemas: MySQL's own name for
+    // its one catalog (information_schema.TABLE_CATALOG).
+    inline constexpr std::string_view def_database = "def";
 
     // A connection of config.yaml as the registration sees it.
     struct configured_connection_t {
@@ -42,6 +47,14 @@ namespace otterstax::catalog {
         // The connection's backend actor: its registration staging, its discovery (discover).
         federation::backend_actor_t* actor{nullptr};
     };
+
+    // The connection's one engine database, the name the engine's current_database() answers in its
+    // place: PostgreSQL's `database:`, MySQL / ClickHouse def_database — in lower case.
+    [[nodiscard]] std::string engine_database(const configured_connection_t& connection);
+
+    // The connection of `connections` whose alias is `name` (any case); null for none.
+    [[nodiscard]] const configured_connection_t* configured(std::string_view name,
+                                                            std::span<const configured_connection_t> connections);
 
     // What the startup discovery of one connection found; `discovered` false: the backend did not
     // answer (unreachable) or was left out (no actor: its server answered it cannot be written to),
@@ -59,7 +72,7 @@ namespace otterstax::catalog {
         std::function<components::cursor::cursor_t_ptr(const components::session::session_id_t&, const std::string&)>
             sql;
         std::function<components::cursor::cursor_t_ptr(const components::session::session_id_t&,
-                                                        components::logical_plan::execution_plan_t)>
+                                                       components::logical_plan::execution_plan_t)>
             plan;
     };
 
@@ -78,9 +91,11 @@ namespace otterstax::catalog {
 
     // The scope to discover when a statement of a client missed a remote table: `error` is
     // table_not_exists, schema_not_exists or database_not_exists and `written` — the name as the
-    // statement wrote it — has four parts, the first a connection of `connections`. The scope is
-    // (connection as configured, its database as configured, the written schema — PostgreSQL's —,
-    // the written table). A connection configured with one `table:` is that table only: the written
+    // statement wrote it — is connection.namespace.table, the connection one of `connections`. The
+    // namespace is a database of a MySQL / ClickHouse connection's server (the configured one for
+    // a connection of one `table:`), a schema of a PostgreSQL one (the configured one when it names
+    // one). The scope is (connection as configured,
+    // its database as configured, the schema — PostgreSQL's —, the written table). A connection configured with one `table:` is that table only: the written
     // table must be it (any case), and the scope names it as configured. nullopt otherwise. A table
     // written in another case than the backend spells it is found only when the written name — or
     // the configured `table:` — is the backend's.
@@ -89,6 +104,17 @@ namespace otterstax::catalog {
                         const qualified_name_t& written,
                         std::span<const configured_connection_t> connections);
 
+    // The place a client names for its session (a PostgreSQL StartupMessage's database, MySQL's USE, Spark's current
+    // database), as a search_path: `connection.namespace` / `local.namespace` as named; a connection alone, its
+    // default namespace (PostgreSQL: the configured schema or public; MySQL / ClickHouse: the configured database);
+    // `local` alone, local.public; nothing, "" (no place). More than two parts is invalid_parameter; a first part
+    // that is neither `local` nor a connection is database_not_exists `database "<named>" does not exist` (the
+    // message on `resource`).
+    [[nodiscard]] core::result_wrapper_t<std::string>
+    client_place(std::pmr::memory_resource* resource,
+                 std::string_view named,
+                 std::span<const configured_connection_t> connections);
+
     // A connection configured with one `table:` is that table only, for DDL too: a CREATE / ALTER /
     // DROP TABLE or CREATE INDEX (`written`: the table it names, as written) of a connection of
     // `connections` configured with one `table:` naming another table (any case) is refused before
@@ -96,9 +122,9 @@ namespace otterstax::catalog {
     // (the next startup's discovery, scoped by `table:`, drops it from the catalog) —
     // invalid_parameter `connection "<c>" is configured with table "<X>"` (the message on
     // `resource`); no_error otherwise, the configured table's own DDL and every name of a
-    // connection without `table:` included. Only a name written in four parts is seen: `t` /
-    // `s.t` in a place that is a connection's database is not (the engine does not name the
-    // place's connection, and a local database may share the name).
+    // connection without `table:` included. A name is seen when it names the connection —
+    // connection.namespace.table or four parts —; `t` / `s.t` in a place that is a connection's
+    // database is not (the engine does not name the place's connection).
     [[nodiscard]] core::error_t check_table_scope(std::pmr::memory_resource* resource,
                                                   const qualified_name_t& written,
                                                   std::span<const configured_connection_t> connections);
@@ -111,5 +137,4 @@ namespace otterstax::catalog {
     registration_plans(std::pmr::memory_resource* resource,
                        const configured_connection_t& connection,
                        const federation::discovered_tables_t& tables);
-
 } // namespace otterstax::catalog

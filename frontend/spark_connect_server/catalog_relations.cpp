@@ -43,9 +43,7 @@
 #include <utility>
 
 namespace frontend::spark {
-
     namespace {
-
         namespace ct = components::types;
         namespace cv = components::vector;
 
@@ -55,17 +53,16 @@ namespace frontend::spark {
             (what.append(std::string_view{parts}), ...);
             return core::error_t{code, std::move(what)};
         }
-
     } // namespace
 
     namespace catalog_rows {
-
         namespace {
-
             // Row `row` of `chunk` as its text cells, nullopt when one is not
             // text (a NULL included) but `nullable` (the column index allowed NULL, as empty).
-            std::optional<std::pmr::vector<std::pmr::string>>
-            text_row(const cv::data_chunk_t& chunk, uint64_t row, std::optional<size_t> nullable, std::pmr::memory_resource* resource) {
+            std::optional<std::pmr::vector<std::pmr::string>> text_row(const cv::data_chunk_t& chunk,
+                                                                       uint64_t row,
+                                                                       std::optional<size_t> nullable,
+                                                                       std::pmr::memory_resource* resource) {
                 std::pmr::vector<std::pmr::string> cells(resource);
                 for (size_t column = 0; column < chunk.column_count(); ++column) {
                     const auto& cell = chunk.data[column];
@@ -107,20 +104,19 @@ namespace frontend::spark {
                 return rows;
             }
 
-            // The schema of `cells` (datconnection, datname, nspname, ...) as
-            // its namespace: [d, s] or [c, d, s].
+            // The schema of `cells` (datconnection, datname, nspname, ...) as a
+            // client names it: [connection, s] for a connection's, [d, s] for a
+            // local database's.
             std::pmr::vector<std::pmr::string> namespace_of(const std::pmr::vector<std::pmr::string>& cells,
                                                             std::pmr::memory_resource* resource) {
                 std::pmr::vector<std::pmr::string> parts(resource);
-                if (!cells[0].empty()) {
-                    parts.push_back(cells[0]);
-                }
-                parts.push_back(cells[1]);
+                parts.push_back(cells[0].empty() ? cells[1] : cells[0]);
                 parts.push_back(cells[2]);
                 return parts;
             }
 
-            std::pmr::string joined(const std::pmr::vector<std::pmr::string>& parts, std::pmr::memory_resource* resource) {
+            std::pmr::string joined(const std::pmr::vector<std::pmr::string>& parts,
+                                    std::pmr::memory_resource* resource) {
                 std::pmr::string out(resource);
                 for (const auto& part : parts) {
                     if (!out.empty()) {
@@ -367,7 +363,6 @@ namespace frontend::spark {
                                   *db_name,
                                   "'");
             }
-
         } // namespace
 
         namespace {
@@ -406,13 +401,16 @@ namespace frontend::spark {
             if (table_rows.has_error()) {
                 return table_rows.convert_error<catalog_view_t>();
             }
-            // current_schema() is NULL when the place is gone.
+            // current_schema() is NULL when the place is gone: its cell reads empty and
+            // its part is left out, so the place is the database alone.
             auto place_rows = text_rows(place, 2, "place", size_t{1}, resource);
             if (place_rows.has_error()) {
                 return place_rows.convert_error<catalog_view_t>();
             }
             if (place_rows.value().size() != 1) {
-                return make_error(resource, core::error_code_t::internal_error, "spark.catalog: the place read answered no row");
+                return make_error(resource,
+                                  core::error_code_t::internal_error,
+                                  "spark.catalog: the place read answered no row");
             }
 
             catalog_view_t view(resource);
@@ -655,11 +653,9 @@ namespace frontend::spark {
                 },
                 resource);
         }
-
     } // namespace catalog_rows
 
     namespace {
-
         namespace rows = catalog_rows;
 
         template<typename Operation>
@@ -716,9 +712,7 @@ namespace frontend::spark {
             if (!sessions.begin(id, std::chrono::steady_clock::now(), [&](query_session_t& target) {
                     future = send(target);
                 })) {
-                co_return make_error(resource,
-                                     core::error_code_t::connection_closed,
-                                     "the Spark session was closed");
+                co_return make_error(resource, core::error_code_t::connection_closed, "the Spark session was closed");
             }
             boost::scope::scope_exit step_done([&] { sessions.finish(id, std::chrono::steady_clock::now()); });
             co_return co_await await_future<session_payload>(std::move(future), resource);
@@ -740,7 +734,6 @@ namespace frontend::spark {
                 },
                 resource);
         }
-
     } // namespace
 
     boost::asio::awaitable<core::result_wrapper_t<session_payload>, agrpc::GrpcExecutor>
@@ -857,5 +850,4 @@ namespace frontend::spark {
         }
         co_return rows::list_columns(prepared.value().schema, resource);
     }
-
 } // namespace frontend::spark

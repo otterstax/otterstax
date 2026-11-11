@@ -30,12 +30,13 @@ are tables of its catalog, read and written through their backends.
 | Spark Connect | 15002 |
 
 ```bash
-psql -h localhost -p 8817 -U demo main         # the engine's default database is main
+psql -h localhost -p 8817 -U demo local        # `local` is the engine database of your own tables
 mysql -h 127.0.0.1 -P 8816 -u demo
 ```
 
-A PostgreSQL client must name a database the engine has (`main` by default); another one is refused
-(`FATAL 3D000`).
+A PostgreSQL client names its place: a connection alias, `alias.namespace`, `local` or
+`local.namespace` (above, `local`). A name that is neither a connection nor `local` is refused
+(`FATAL 3D000`); naming nothing leaves the session no place and short names refuse.
 
 ## Connection configuration
 
@@ -89,23 +90,28 @@ connections:
       endpoint: demo-rustfs:9000       # optional; http + path-style (RustFS and other S3-compatible stores)
 ```
 
-A backend alias is lower-case letters, digits and `_` (not starting with a digit); `federation` and
-`main` are reserved. An invalid entry or malformed YAML **aborts startup**; a valid connection whose
+A backend alias is lower-case letters, digits and `_` (not starting with a digit); `federation`, `main`
+and `local` are reserved. An invalid entry or malformed YAML **aborts startup**; a valid connection whose
 backend is unreachable is retried per `service.connection_retry` and, if still down, logged — the
 server starts and its statements fail until the backend is back.
 
 ### Names
 
-A remote table is written in four parts, `alias.database.schema.table`; a MySQL / ClickHouse
-connection has the one schema `public`, a PostgreSQL one its own schemas. Three parts or fewer
-name a local table (`database.schema.table`, `schema.table`, `table`; the session's default place is
-`main.public`).
+A table is written in three parts, `connection.namespace.table` — the first part is a connection, or
+`local` for your own tables. Through one connection every backend names two levels: a PostgreSQL
+namespace is a schema of the connection's configured database, a MySQL / ClickHouse namespace one of
+its databases.
 
 ```sql
 SELECT o.order_id, c.name
-FROM   mysql.bill.public.orders o
-JOIN   pg.shop.shop.customers c ON o.customer_id = c.customer_id;
+FROM   mysql.bill.orders o
+JOIN   pg.shop.customers c ON o.customer_id = c.customer_id;
 ```
+
+Short names (`table`, `schema.table`) are completed by the session's place — only what you chose at
+connect (the PostgreSQL `database`, the MySQL handshake database / `USE`, Spark's current database):
+a connection (`uid`), one of its namespaces (`uid.ns`), or `local` / `local.ns` for your own tables.
+Without a choice there is no place and short names refuse; four-part names are refused.
 
 A table created on the backend after startup is found on its first use.
 

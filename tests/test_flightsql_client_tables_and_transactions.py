@@ -6,11 +6,13 @@
   * GetTables answers one listing of the engine's catalog, local and remote
     tables alike (frontend/flight_sql/session_engine.cpp, SessionEngine::tables):
     a catalog is a database as SQL writes it — `d` for a local one, `c.d` for
-    the database d of the connection c — and the schema is its schema (MySQL /
-    ClickHouse: `public`), so catalog.schema.table is the name the SQL path
-    reads. The database `federation` (the remote-table spellings and the Kafka
-    bookkeeping tables) and the system schemas are hidden. With include_schema
-    each row carries its columns.
+    the database d of the connection c (MySQL / ClickHouse: `def`) — and the
+    schema is a schema of it: a database of the backend on MySQL / ClickHouse
+    (`db1`), a schema of the configured database on PostgreSQL (`public`), so
+    catalog.schema.table is the name the SQL path reads. The database
+    `federation` (the remote-table spellings and the Kafka bookkeeping tables)
+    and the system schemas are hidden. With include_schema each row carries
+    its columns.
   * A statement run by text runs on a query session of its own, closed when the
     RPC returns (autocommit). A transaction opened there could never be ended,
     so a BEGIN — through the query RPC (GetFlightInfo) or the update RPC
@@ -28,17 +30,20 @@ from flightsql import FlightSQLClient
 
 import config
 
-# The local table: a schema of the database `main` (the session's place), so
-# `DB.TABLE` names it and GetTables lists it under catalog `main`, schema DB.
-LOCAL_CATALOG = "main"
-DB = "flight_tables_db"
+# The local table: a schema of local (`local.flight_tables_db.local_items` —
+# Flight SQL has no place field, so every table statement names it in full),
+# listed by GetTables under catalog `local`, schema `flight_tables_db`.
+LOCAL_CATALOG = "local"
+SCHEMA = "flight_tables_db"
+DB = f"local.{SCHEMA}"
 TABLE = "local_items"
 
 # A table every integration stack registers (tests/scripts/config.yaml:
-# alias `campaigns` over MariaDB database db1, seeded by create_test_data.py),
-# listed as campaigns.db1 / public / campaigns.
-REMOTE_CATALOG = "campaigns.db1"
-REMOTE_SCHEMA = "public"
+# alias `campaigns` over MariaDB database db1, seeded by create_test_data.py).
+# A MySQL connection's database is `def` (catalog::def_database) and db1 is the
+# schema under it: campaigns.def / db1 / campaigns.
+REMOTE_CATALOG = "campaigns.def"
+REMOTE_SCHEMA = "db1"
 REMOTE_TABLE = "campaigns"
 
 BEGIN_REFUSAL = "a transaction cannot be opened over Flight SQL"
@@ -93,7 +98,7 @@ class FlightSqlTablesAndTransactionsTest:
     # ── setup / teardown ────────────────────────────────────────────────────
     def setup(self):
         self.client = FlightSQLClient(host=self.host, port=config.FLIGHT_PORT, insecure=True)
-        self.update(f"CREATE SCHEMA {DB}")
+        self.update(f"CREATE SCHEMA {SCHEMA}")
         self.database_created = True
         self.update(f"CREATE TABLE {DB}.{TABLE} (id bigint, label string)")
         self.table_created = True
@@ -108,15 +113,16 @@ class FlightSqlTablesAndTransactionsTest:
             print(f"cleanup: DROP TABLE {DB}.{TABLE} failed: {e}")
         try:
             if self.database_created:
-                self.update(f"DROP SCHEMA {DB}")
+                self.update(f"DROP SCHEMA {SCHEMA}")
         except Exception as e:
-            print(f"cleanup: DROP SCHEMA {DB} failed: {e}")
+            print(f"cleanup: DROP SCHEMA {SCHEMA} failed: {e}")
 
     # ── cases ───────────────────────────────────────────────────────────────
     def test_get_tables_lists_local_and_remote_tables(self):
-        """GetTables holds the local table (catalog main, its schema) and a remote one (catalog c.d), each with its columns."""
+        """GetTables holds the local table (catalog local, its schema) and a remote one (catalog c.d), each with its columns."""
         rows = self.listing()
-        local = [r for r in rows if r["catalog"] == LOCAL_CATALOG and r["schema"] == DB and r["table"] == TABLE]
+        local = [r for r in rows if r["catalog"] == LOCAL_CATALOG and r["schema"] == SCHEMA
+                 and r["table"] == TABLE]
         self.assert_equal(len(local), 1, f"the local table {LOCAL_CATALOG}.{DB}.{TABLE} is listed once")
         self.assert_equal(local[0]["fields"], {"id": pa.int64(), "label": pa.string()},
                           "the local table's columns")

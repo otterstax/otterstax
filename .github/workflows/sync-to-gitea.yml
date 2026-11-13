@@ -1,0 +1,155 @@
+name: Sync to Gitea
+
+# Copies every PR merged into main here to the private Gitea repository. The
+# PR's original commits are pushed unchanged to the Gitea branch github/pr-<N>,
+# and a "WIP:" Gitea PR is opened from it against main. The two repositories'
+# histories differ, so the branch is rebased onto Gitea's main by hand (the
+# command is in the Gitea PR description) before it is merged there.
+# One way only: nothing comes back from Gitea.
+#
+# A PR labelled "no copy gitea" is not copied, by a merge or a manual run alike: set
+# the label before merging. To copy it after all, remove the label and run the
+# workflow manually with its number.
+#
+# Setup:
+#   environment gitea-sync (deployment branches: main only)
+#     secret   GITEA_TOKEN  Gitea access token, scope "repository: read and write",
+#                           of a user with write access to the Gitea repository
+#   variable   GITEA_URL    e.g. https://git.otterstax.com
+#   variable   GITEA_REPO   optional, default otterstax/otterstax
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: 'Number of a merged PR to copy (e.g. one merged before this workflow existed)'
+        required: true
+      force:
+        description: 'Overwrite github/pr-<N> on Gitea if it already exists'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  pull-requests: read
+
+# No concurrency group: GitHub keeps one pending run per group and cancels the
+# rest, which would drop PRs merged in quick succession. Runs copy different
+# PRs to different branches, so they may overlap.
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    environment: gitea-sync
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Copy merged PRs to Gitea
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+          INPUT_PR: ${{ inputs.pr }}
+          INPUT_FORCE: ${{ inputs.force }}
+          SKIP_LABEL: no copy gitea
+          GITEA_URL: ${{ vars.GITEA_URL }}
+          GITEA_REPO: ${{ vars.GITEA_REPO || 'otterstax/otterstax' }}
+          GITEA_TOKEN: ${{ secrets.GITEA_TOKEN }}
+        run: |
+          set -euo pipefail
+          : "${GITEA_URL:?set the GITEA_URL repository variable}"
+          : "${GITEA_TOKEN:?set the GITEA_TOKEN secret of the gitea-sync environment}"
+          GITEA_URL=${GITEA_URL%/}
+          GITEA_GIT="$GITEA_URL/$GITEA_REPO.git"
+          # git over HTTPS: the token as the basic-auth user name
+          AUTH=$(printf '%s:x-oauth-basic' "$GITEA_TOKEN" | base64 -w0)
+          echo "::add-mask::$AUTH"
+          gitea_git() { git -c http.extraHeader="Authorization: Basic $AUTH" "$@"; }
+
+          # The PRs to copy: the one asked for, or every merged PR whose commits this push brought in.
+          if [ "$EVENT" = workflow_dispatch ]; then
+            [[ "$INPUT_PR" =~ ^[0-9]+$ ]] || { echo "::error::pr must be a PR number, got '$INPUT_PR'"; exit 1; }
+            prs=$INPUT_PR
+          else
+            if [[ "$BEFORE" =~ ^0+$ ]] || ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+              commits=$AFTER
+            else
+              commits=$(git rev-list --reverse "$BEFORE..$AFTER")
+            fi
+            prs=$(for c in $commits; do
+                    gh api "repos/$REPO/commits/$c/pulls" \
+                      --jq '.[] | select(.merged_at != null and .base.ref == "main") | .number'
+                  done | awk '!seen[$0]++')
+          fi
+          if [ -z "$prs" ]; then
+            echo "No merged PR in this push, nothing to copy."
+            exit 0
+          fi
+
+          tmp=$(mktemp -d)
+          failed=0
+          for n in $prs; do
+            pr=$(gh api "repos/$REPO/pulls/$n")
+            if [ "$(jq -r .merged_at <<<"$pr")" = null ] || [ "$(jq -r .base.ref <<<"$pr")" != main ]; then
+              echo "::warning::#$n is not merged into main, skipped"
+              continue
+            fi
+            if jq -e --arg label "$SKIP_LABEL" 'any(.labels[]; (.name | ascii_downcase) == ($label | ascii_downcase))' <<<"$pr" >/dev/null; then
+              echo "#$n: labelled '$SKIP_LABEL', not copied"
+              continue
+            fi
+            branch="github/pr-$n"
+            # A branch already there may carry a manual rebase: never overwrite it unless asked.
+            existing=$(gitea_git ls-remote --heads "$GITEA_GIT" "refs/heads/$branch")
+            if [ -n "$existing" ] && [ "$INPUT_FORCE" != true ]; then
+              echo "#$n: $branch is already on Gitea, skipped (run manually with force to overwrite)"
+              continue
+            fi
+
+            # The PR's original commits: base..head, where base is where it left main.
+            git fetch --quiet --no-tags origin "+refs/pull/$n/head:refs/remotes/pr/$n"
+            head=$(git rev-parse "refs/remotes/pr/$n")
+            base=$(git merge-base "$head" "$(jq -r .merge_commit_sha <<<"$pr")^1")
+            count=$(git rev-list --count "$base..$head")
+            if [ "$INPUT_FORCE" = true ]; then
+              gitea_git push --force "$GITEA_GIT" "$head:refs/heads/$branch"
+            else
+              gitea_git push "$GITEA_GIT" "$head:refs/heads/$branch"
+            fi
+
+            title=$(jq -r .title <<<"$pr")
+            {
+              printf 'Copied from GitHub [%s#%s](%s) by @%s, merged %s: the original %s commit(s) of `%s`, unchanged.\n\n' \
+                "$REPO" "$n" "$(jq -r .html_url <<<"$pr")" "$(jq -r .user.login <<<"$pr")" \
+                "$(jq -r .merged_at <<<"$pr")" "$count" "$(jq -r .head.ref <<<"$pr")"
+              printf '**Not rebased yet.** The branch still sits on GitHub'"'"'s history, so the diff here is much larger than the PR. '
+              printf 'Rebase it onto main, then drop `WIP:` from the title:\n\n'
+              printf '```sh\ngit fetch origin\ngit switch -C %s origin/%s\ngit rebase --onto origin/main %s\ngit push --force-with-lease origin %s\n```\n' \
+                "$branch" "$branch" "$base" "$branch"
+              printf '\n(`%s` is the commit the PR started from on GitHub.)\n' "${base:0:10}"
+              description=$(jq -r '.body // ""' <<<"$pr")
+              if [ -n "$description" ]; then
+                printf '\n---\n\n%s\n' "$description"
+              fi
+            } > "$tmp/body.md"
+            jq -n --arg head "$branch" --arg title "WIP: [gh#$n] $title" --rawfile body "$tmp/body.md" \
+              '{head: $head, base: "main", title: $title, body: $body}' > "$tmp/payload.json"
+            code=$(curl -sS -o "$tmp/response.json" -w '%{http_code}' -X POST \
+                     -H "Authorization: token $GITEA_TOKEN" -H 'Content-Type: application/json' \
+                     --data @"$tmp/payload.json" "$GITEA_URL/api/v1/repos/$GITEA_REPO/pulls")
+            case "$code" in
+              201) url=$(jq -r .html_url "$tmp/response.json")
+                   echo "#$n: $count commit(s) -> $url"
+                   echo "- #$n $title → $url" >> "$GITHUB_STEP_SUMMARY" ;;
+              409) echo "#$n: a Gitea PR from $branch is already open; the branch was updated" ;;
+              *)   echo "::error::#$n: branch pushed, but the Gitea PR was not created (HTTP $code): $(head -c 500 "$tmp/response.json")"
+                   failed=1 ;;
+            esac
+          done
+          exit "$failed"

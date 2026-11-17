@@ -143,7 +143,7 @@ wait_for_database_init() {
             echo "✅ Table $table is ready in $container"
             return 0
         fi
-        echo "⏳ Waiting for table $table... ($i/60)"
+        echo "⏳ Waiting for table $table... ($i/120)"
         sleep 5
     done
     echo "❌ Timeout waiting for table $table in $container"
@@ -190,7 +190,7 @@ wait_for_ch_table() {
             echo "✅ Table $table is ready in $container"
             return 0
         fi
-        echo "⏳ Waiting for table $table... ($i/60)"
+        echo "⏳ Waiting for table $table... ($i/120)"
         sleep 5
     done
     echo "❌ Timeout waiting for table $table in $container"
@@ -210,7 +210,7 @@ wait_for_pg_table() {
             echo "✅ Table $table is ready in $container"
             return 0
         fi
-        echo "⏳ Waiting for table $table... ($i/60)"
+        echo "⏳ Waiting for table $table... ($i/120)"
         sleep 5
     done
     echo "❌ Timeout waiting for table $table in $container"

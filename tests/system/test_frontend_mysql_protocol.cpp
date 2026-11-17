@@ -46,6 +46,10 @@ namespace {
     constexpr uint8_t COM_INIT_DB = 0x02;
     constexpr uint16_t SERVER_STATUS_NO_BACKSLASH_ESCAPES = 0x0200;
     constexpr uint8_t MYSQL_TYPE_LONGLONG = 0x08;
+    constexpr uint8_t MYSQL_TYPE_NEWDECIMAL = 0xF6;
+    // The wire type's unsigned bit: a decimal's sign lives in its text, so the
+    // bit decides nothing.
+    constexpr uint16_t UNSIGNED_FLAG = 0x8000;
 
     frontend::frontend_server_config make_config(const otterstax::test::session_stack& stack) {
         return frontend::frontend_server_config{
@@ -227,6 +231,34 @@ namespace {
                     payload.push_back(static_cast<uint8_t>((static_cast<uint64_t>(value) >> (8 * b)) & 0xFF));
                 }
             }
+        }
+        client.write(mysql_frame(0, payload));
+        return mysql_read_packet(client);
+    }
+
+    // COM_STMT_EXECUTE binding one parameter whose value is a length-encoded
+    // string (NEWDECIMAL): [0x17][id:4][flags][iterations:4][NULL bitmap]
+    // [new-params-bound][type:2][value]. A null text sets the bitmap's bit and
+    // sends no value; with the flag clear no type is sent (MariaDB's second
+    // execution: the types of the first are kept). The first packet of the answer.
+    std::vector<uint8_t> execute_decimal(raw_client& client,
+                                         const prepared& stmt,
+                                         uint16_t type,
+                                         const char* text,
+                                         bool new_params_bound = true) {
+        std::vector<uint8_t> payload{COM_STMT_EXECUTE};
+        payload.insert(payload.end(), stmt.id.begin(), stmt.id.end());
+        payload.insert(payload.end(), {0x00, 0x01, 0x00, 0x00, 0x00});
+        payload.push_back(text == nullptr ? 0x01 : 0x00);
+        payload.push_back(new_params_bound ? 0x01 : 0x00);
+        if (new_params_bound) {
+            payload.insert(payload.end(), {static_cast<uint8_t>(type & 0xFF), static_cast<uint8_t>(type >> 8)});
+        }
+        if (text != nullptr) {
+            const size_t length = std::strlen(text);
+            REQUIRE(length < 251);
+            payload.push_back(static_cast<uint8_t>(length));
+            payload.insert(payload.end(), text, text + length);
         }
         client.write(mysql_frame(0, payload));
         return mysql_read_packet(client);
@@ -687,6 +719,87 @@ TEST_CASE("mysql protocol over the wire: a refused statement's errno on COM_STMT
         CHECK(err_code(executed) == static_cast<uint16_t>(frontend::mysql::mysql_error::ER_SYNTAX_ERROR));
     }
     CHECK(query_rows(f.client, "SELECT count(*) FROM wp.t").rows[0][0] == "3");
+}
+
+// A NEWDECIMAL (246) COM_STMT_EXECUTE parameter arrives as a length-encoded
+// string and is read at the engine type the prepare described for its `?` —
+// DECIMAL(10, 2) here: a fraction past the scale rounds the engine's way (ties
+// away from zero), the wire type's unsigned bit carries no sign, a NULL is the
+// bitmap's bit alone, and a value the column's precision cannot hold — or one
+// no decimal reads — is refused at the bind, the frontend's own errno, never
+// the statement mapper's 1149.
+TEST_CASE("mysql protocol over the wire: COM_STMT_EXECUTE carries a NEWDECIMAL parameter") {
+    fixture f("otterstax_mysql_protocol_decimal_param");
+    query_ok(f.client, "CREATE TABLE wp.prices (id bigint, price decimal(10, 2))");
+    query_ok(f.client, "INSERT INTO wp.prices (id, price) VALUES (1, 1.25), (2, 1.26), (3, -1.25)");
+    // The literal filters the table; the rows below bind the same values.
+    CHECK(query_rows(f.client, "SELECT id FROM wp.prices WHERE price = 1.25").rows[0][0] == "1");
+    const auto stmt = prepare_ok(f.client, "SELECT id FROM wp.prices WHERE price = ?");
+    REQUIRE(stmt.parameters == 1);
+
+    struct decimal_param_t {
+        const char* name;
+        uint16_t type;
+        const char* text;         // nullptr: the NULL bit set and no value bytes
+        std::vector<int64_t> ids; // the rows the bound value filters out
+        uint16_t refused;         // the errno of a refusal at the bind instead of rows; 0: rows
+    };
+    const std::vector<decimal_param_t> rows{
+        {"a NULL parameter is the bitmap's bit and answers no row", MYSQL_TYPE_NEWDECIMAL, nullptr, {}, 0},
+        {"a 246 parameter filters its row", MYSQL_TYPE_NEWDECIMAL, "1.25", {1}, 0},
+        // 0 is the pre-5.0 DECIMAL the drivers keep sending for one
+        // (mysql-connector-python's Decimal): the same length-encoded string.
+        {"the pre-5.0 DECIMAL binds as the same decimal", 0x00, "1.25", {1}, 0},
+        {"the pre-5.0 DECIMAL NULL is the bitmap's bit", 0x00, nullptr, {}, 0},
+        {"a fraction past the scale rounds half away from zero", MYSQL_TYPE_NEWDECIMAL, "1.255", {2}, 0},
+        {"the unsigned bit carries no sign: the text does", MYSQL_TYPE_NEWDECIMAL | UNSIGNED_FLAG, "-1.25", {3}, 0},
+        {"a value past the column's precision is refused at the bind",
+         MYSQL_TYPE_NEWDECIMAL,
+         "12345678901.25",
+         {},
+         static_cast<uint16_t>(frontend::mysql::mysql_error::ER_PARAM_PAST_PRECISION)},
+        {"a text no decimal reads is refused at the bind",
+         MYSQL_TYPE_NEWDECIMAL,
+         "abc",
+         {},
+         static_cast<uint16_t>(frontend::mysql::mysql_error::ER_PARAM_NOT_A_DECIMAL)},
+    };
+    for (const auto& row : rows) {
+        INFO(row.name);
+        const auto first = execute_decimal(f.client, stmt, row.type, row.text);
+        if (row.refused != 0) {
+            INFO(err_text(first));
+            REQUIRE(first[0] == ERR_HEADER);
+            CHECK(err_code(first) == row.refused);
+            // The refusal names the bound parameter by its position (the one
+            // '?' this statement wrote), never by the engine's '$1'.
+            CHECK(err_text(first).find("parameter 1") != std::string::npos);
+            continue;
+        }
+        INFO(err_text(first));
+        REQUIRE(first[0] != ERR_HEADER);
+        CHECK(read_bigint_rows(f.client, first) == row.ids);
+    }
+
+    // MariaDB sends no types on a second execution: the ones of the first are
+    // kept, and the values follow at once.
+    CHECK(read_bigint_rows(f.client, execute_decimal(f.client, stmt, MYSQL_TYPE_NEWDECIMAL, "1.25")) ==
+          std::vector<int64_t>{1});
+    CHECK(read_bigint_rows(f.client, execute_decimal(f.client, stmt, MYSQL_TYPE_NEWDECIMAL, "-1.25", false)) ==
+          std::vector<int64_t>{3});
+
+    // A decimal bound at a slot the engine typed otherwise: `id` is BIGINT, so
+    // the describe types this `?` BIGINT, and the bind refuses the decimal
+    // naming it — the statement mapper's 1149, not a frontend errno.
+    const auto by_id = prepare_ok(f.client, "SELECT id FROM wp.prices WHERE id = ?");
+    const auto wrong = execute_decimal(f.client, by_id, MYSQL_TYPE_NEWDECIMAL, "1.25");
+    INFO(err_text(wrong));
+    REQUIRE(wrong[0] == ERR_HEADER);
+    CHECK(err_code(wrong) == static_cast<uint16_t>(frontend::mysql::mysql_error::ER_SYNTAX_ERROR));
+    CHECK(err_text(wrong).find("BIGINT") != std::string::npos);
+
+    // The connection keeps serving.
+    CHECK(query_rows(f.client, "SELECT count(*) FROM wp.prices").rows[0][0] == "3");
 }
 
 // The handshake and every text column announce the collation the engine

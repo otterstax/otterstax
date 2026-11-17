@@ -20,6 +20,11 @@ names it.
     name as ambiguous (MariaDB 1052).
   * PostgreSQL: DISTINCT ON over a JOIN — over plain columns and over a grouped
     projection, whose DISTINCT ON key names the group's output.
+  * Across backends (PostgreSQL × MariaDB / ClickHouse): a LEFT, a RIGHT and a
+    FULL JOIN answer with NULL on the padded side — no connection can say a JOIN
+    of two connections whole, so the engine joins the fetched pages itself; a
+    FULL JOIN of two MariaDB tables is the same: MariaDB has no FULL JOIN, the
+    offer is not taken and the engine computes the rows.
 """
 
 import argparse
@@ -45,11 +50,13 @@ MY_FLAGS = "campaigns.db1.pj_flags"
 
 # products: 1 apple, 2 pear, 3 plum (no flags row). The flags' own `name` sorts the other way round
 # from the products' (apple's flag is z-one, pear's a-two): sorting by the wrong table's `name`
-# picks the other row.
+# picks the other row. Flag 9 x-nine has neither a product nor a customer: the unmatched row of the
+# cross-backend RIGHT and FULL joins.
 PRODUCTS = [(1, "apple"), (2, "pear"), (3, "plum")]
-FLAGS = [(1, "z-one", True), (2, "a-two", False)]
-# customers 1 ann, 2 bob; ann's orders 10 and 30, bob's 20, 20 and 5.
-CUSTOMERS = [(1, "ann"), (2, "bob")]
+FLAGS = [(1, "z-one", True), (2, "a-two", False), (9, "x-nine", True)]
+# customers 1 ann, 2 bob, 3 cyd (no orders, no flags: the unmatched row of the cross-backend LEFT
+# and FULL joins); ann's orders 10 and 30, bob's 20, 20 and 5.
+CUSTOMERS = [(1, "ann"), (2, "bob"), (3, "cyd")]
 ORDERS = [(1, 1, 10), (2, 1, 30), (3, 2, 20), (4, 2, 20), (5, 2, 5)]
 
 
@@ -190,6 +197,43 @@ class PushedJoinsTest:
             "each customer's largest amount and how many orders hold it")
         print("  PostgreSQL DISTINCT ON over a grouped JOIN ✓")
 
+    # ── across backends ─────────────────────────────────────────────────────
+    def test_cross_backend_left_join_pads_the_flags_with_null(self):
+        """PostgreSQL LEFT JOIN MariaDB: the customer without a flags row reads NULL on the flags' side."""
+        self.assert_equal(
+            self.rows(f"SELECT c.name, f.name FROM {PG_CUSTOMERS} c LEFT JOIN {MY_FLAGS} f "
+                      f"ON c.id = f.product_id ORDER BY c.id"),
+            [("ann", "z-one"), ("bob", "a-two"), ("cyd", None)],
+            "cyd has no flags row; the engine joins the fetched pages, no connection can say it whole")
+        print("  cross-backend LEFT JOIN: the padded side is NULL ✓")
+
+    def test_cross_backend_right_join_pads_the_customers_with_null(self):
+        """PostgreSQL RIGHT JOIN MariaDB: the flag without a customer reads NULL on the customers' side."""
+        self.assert_equal(
+            self.rows(f"SELECT c.name, f.name FROM {PG_CUSTOMERS} c RIGHT JOIN {MY_FLAGS} f "
+                      f"ON c.id = f.product_id ORDER BY f.product_id"),
+            [("ann", "z-one"), ("bob", "a-two"), (None, "x-nine")],
+            "x-nine has no customer")
+        print("  cross-backend RIGHT JOIN: the customers' side is NULL ✓")
+
+    def test_cross_backend_full_join_pads_both_sides_with_null(self):
+        """PostgreSQL FULL JOIN ClickHouse: the customer without flags and the flag without a customer read NULL."""
+        self.assert_equal(
+            self.rows(f"SELECT c.name, f.name FROM {PG_CUSTOMERS} c FULL JOIN {CH_FLAGS} f "
+                      f"ON c.id = f.product_id ORDER BY c.id"),
+            [("ann", "z-one"), ("bob", "a-two"), ("cyd", None), (None, "x-nine")],
+            "both unmatched rows, the engine's ASC placing the NULL key last")
+        print("  cross-backend FULL JOIN: NULLs on both sides ✓")
+
+    def test_mariadb_full_join_runs_in_the_engine(self):
+        """MariaDB has no FULL JOIN: the offer is not taken and the engine joins the fetched pages itself."""
+        self.assert_equal(
+            self.rows(f"SELECT p.name, f.name FROM {MY_PRODUCTS} p FULL JOIN {MY_FLAGS} f "
+                      f"ON p.product_id = f.product_id ORDER BY p.product_id"),
+            [("apple", "z-one"), ("pear", "a-two"), ("plum", None), (None, "x-nine")],
+            "the product without flags and the flag without a product, the engine's ASC placing the NULL key last")
+        print("  MariaDB FULL JOIN: computed by the engine ✓")
+
     def run_all_tests(self):
         try:
             self.setup()
@@ -199,6 +243,10 @@ class PushedJoinsTest:
             self.test_mariadb_order_by_a_name_both_tables_have()
             self.test_pg_distinct_on_over_a_join()
             self.test_pg_distinct_on_over_a_grouped_join()
+            self.test_cross_backend_left_join_pads_the_flags_with_null()
+            self.test_cross_backend_right_join_pads_the_customers_with_null()
+            self.test_cross_backend_full_join_pads_both_sides_with_null()
+            self.test_mariadb_full_join_runs_in_the_engine()
         finally:
             self.cleanup()
 

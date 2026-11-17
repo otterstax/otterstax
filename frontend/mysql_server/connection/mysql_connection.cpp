@@ -33,7 +33,8 @@ namespace frontend::mysql {
                                                              uint32_t parameter_count)
         : stmt_session(stmt_session)
         , parameter_count(parameter_count)
-        , param_types(resource) {}
+        , param_wire_types(resource)
+        , engine_types(resource) {}
 
     std::vector<uint8_t> mysql_connection::build_too_many_connections_error() {
         packet_writer writer;

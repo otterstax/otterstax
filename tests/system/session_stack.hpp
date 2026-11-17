@@ -69,6 +69,16 @@
 #include <unistd.h>
 
 namespace otterstax::test {
+    // The helpers' await deadline through the asio bridge. A sanitizer build
+    // runs the same stack an order of magnitude slower (and the CI sanitizer
+    // jobs share one runner), so its deadline is wider; the statement keeps
+    // running past the deadline either way (asio_future_bridge.hpp).
+#if defined(__SANITIZE_THREAD__) || defined(__SANITIZE_ADDRESS__)
+    inline constexpr std::chrono::milliseconds session_await_deadline{60000};
+#else
+    inline constexpr std::chrono::milliseconds session_await_deadline{10000};
+#endif
+
     // A data directory of its own for a test that needs an engine but does not
     // name a directory: /tmp/<prefix>-<pid>-<n>.
     inline std::string unique_test_dir(const std::string& prefix) {
@@ -345,7 +355,7 @@ namespace otterstax::test {
                                                 options_.database);
             auto answer = otterstax::await_future_blocking<session_payload>(std::move(placed),
                                                                             engine_->resource(),
-                                                                            std::chrono::milliseconds(10000));
+                                                                            session_await_deadline);
             if (answer.has_error()) {
                 FAIL("a connection of the stack is not placed in " << options_.database << ": "
                                                                    << answer.error().what.c_str());
@@ -395,7 +405,7 @@ namespace otterstax::test {
     run_session_sql_payload(const session_stack& s,
                             session_hash_t id,
                             const std::string& sql,
-                            std::chrono::milliseconds timeout = std::chrono::milliseconds(10000)) {
+                            std::chrono::milliseconds timeout = session_await_deadline) {
         auto [ns, fut] = actor_zeta::send(s.session, &otterstax::session::query_session_t::execute, stmt(id), sql);
         return await_session(std::move(fut), timeout, s.resource);
     }
@@ -414,7 +424,7 @@ namespace otterstax::test {
     prepare_session_sql(const session_stack& s,
                         session_hash_t id,
                         const std::string& sql,
-                        std::chrono::milliseconds timeout = std::chrono::milliseconds(10000)) {
+                        std::chrono::milliseconds timeout = session_await_deadline) {
         auto [ns, fut] =
             actor_zeta::send(s.session, &otterstax::session::query_session_t::prepare_schema, stmt(id), sql);
         return await_session(std::move(fut), timeout, s.resource);
@@ -423,7 +433,7 @@ namespace otterstax::test {
     inline core::result_wrapper_t<session_payload>
     execute_session_statement(const session_stack& s,
                               session_hash_t id,
-                              std::chrono::milliseconds timeout = std::chrono::milliseconds(10000)) {
+                              std::chrono::milliseconds timeout = session_await_deadline) {
         auto [ns, fut] = actor_zeta::send(s.session, &otterstax::session::query_session_t::execute_statement, stmt(id));
         return await_session(std::move(fut), timeout, s.resource);
     }
@@ -432,7 +442,7 @@ namespace otterstax::test {
     execute_session_prepared(const session_stack& s,
                              session_hash_t id,
                              std::pmr::vector<components::vector::vector_t> parameters,
-                             std::chrono::milliseconds timeout = std::chrono::milliseconds(10000)) {
+                             std::chrono::milliseconds timeout = session_await_deadline) {
         auto [ns, fut] = actor_zeta::send(s.session,
                                           &otterstax::session::query_session_t::execute_prepared_statement,
                                           stmt(id),
@@ -444,7 +454,7 @@ namespace otterstax::test {
     inline core::result_wrapper_t<session_payload>
     close_session_statement(const session_stack& s,
                             session_hash_t id,
-                            std::chrono::milliseconds timeout = std::chrono::milliseconds(10000)) {
+                            std::chrono::milliseconds timeout = session_await_deadline) {
         auto [ns, fut] = actor_zeta::send(s.session, &otterstax::session::query_session_t::close_statement, stmt(id));
         return await_session(std::move(fut), timeout, s.resource);
     }
@@ -453,7 +463,7 @@ namespace otterstax::test {
     execute_session_plan(const session_stack& s,
                          session_hash_t id,
                          ParsedQueryDataPtr plan,
-                         std::chrono::milliseconds timeout = std::chrono::milliseconds(10000),
+                         std::chrono::milliseconds timeout = session_await_deadline,
                          otterstax::session::query_session_t::rebuild_fn rebuild = {}) {
         auto [ns, fut] = actor_zeta::send(s.session,
                                           &otterstax::session::query_session_t::execute_plan,
@@ -467,7 +477,7 @@ namespace otterstax::test {
     prepare_session_plan(const session_stack& s,
                          session_hash_t id,
                          ParsedQueryDataPtr plan,
-                         std::chrono::milliseconds timeout = std::chrono::milliseconds(10000),
+                         std::chrono::milliseconds timeout = session_await_deadline,
                          otterstax::session::query_session_t::rebuild_fn rebuild = {}) {
         auto [ns, fut] = actor_zeta::send(s.session,
                                           &otterstax::session::query_session_t::prepare_plan,
@@ -488,7 +498,7 @@ namespace otterstax::test {
                          session_hash_t id,
                          const std::string& sql,
                          std::string& prepare_err,
-                         std::chrono::milliseconds timeout = std::chrono::milliseconds(10000)) {
+                         std::chrono::milliseconds timeout = session_await_deadline) {
         auto prepared = prepare_session_sql(s, id, sql, timeout);
         if (prepared.has_error()) {
             prepare_err = std::string{prepared.error().what.c_str()};

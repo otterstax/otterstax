@@ -3,11 +3,13 @@
 //
 // PostgreSQL wire encoding of the extended-query protocol pieces the
 // connection assembles: ParameterDescription, PortalSuspended, RowDescription
-// format codes, the text-format Bind parameter conversion, the pipeline
-// error state that decides when ReadyForQuery follows an ErrorResponse, the
-// transaction block status ReadyForQuery carries, and the DEALLOCATE the
-// frontend reads off the raw tree.
+// format codes, the text- and binary-format Bind parameter conversions, the
+// bare select-list parameter the raw tree names, the pipeline error state
+// that decides when ReadyForQuery follows an ErrorResponse, the transaction
+// block status ReadyForQuery carries, and the DEALLOCATE the frontend reads
+// off the raw tree.
 
+#include "frontend/postgres_server/connection/bare_select_parameter.hpp"
 #include "frontend/postgres_server/connection/deallocate_statement.hpp"
 #include "frontend/postgres_server/connection/pipeline_state.hpp"
 #include "frontend/postgres_server/connection/protocol_parameters.hpp"
@@ -22,6 +24,7 @@
 #include <limits>
 #include <memory_resource>
 #include <string>
+#include <vector>
 
 using namespace components;
 using namespace frontend;
@@ -304,6 +307,140 @@ TEST_CASE("pg parse_text_parameter: a literal the type cannot hold is invalid_te
         REQUIRE(parsed.error().type == core::error_code_t::invalid_text_representation);
         REQUIRE(parsed.error().what.get_allocator().resource() == resource);
     }
+}
+
+namespace {
+
+    // The value bytes of PostgreSQL's numeric_send: ndigits, weight, sign,
+    // display scale, then the base-10000 groups, all big-endian int16.
+    std::string numeric_value(int weight, uint16_t sign, const std::vector<uint16_t>& groups, uint16_t dscale = 0) {
+        std::string value;
+        const auto put = [&value](uint16_t field) {
+            value.push_back(static_cast<char>(field >> 8));
+            value.push_back(static_cast<char>(field & 0xFF));
+        };
+        put(static_cast<uint16_t>(groups.size()));
+        put(static_cast<uint16_t>(weight));
+        put(sign);
+        put(dscale);
+        for (const auto group : groups) {
+            put(group);
+        }
+        return value;
+    }
+}
+
+TEST_CASE("pg parse_binary_numeric_parameter: the exact decimal at the described DECIMAL") {
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
+    auto* resource = &arena;
+    // The engine refuses an out-of-window spec; the cases below keep the
+    // window (38, 10), (10, 2), (38, 0).
+    auto wide_spec = types::complex_logical_type::create_decimal(resource, 38, 10, "");
+    auto scale2_spec = types::complex_logical_type::create_decimal(resource, 38, 2, "");
+    auto small_spec = types::complex_logical_type::create_decimal(resource, 10, 2, "");
+    auto whole_spec = types::complex_logical_type::create_decimal(resource, 38, 0, "");
+    REQUIRE_FALSE(wide_spec.has_error());
+    REQUIRE_FALSE(scale2_spec.has_error());
+    REQUIRE_FALSE(small_spec.has_error());
+    REQUIRE_FALSE(whole_spec.has_error());
+    const auto& wide = wide_spec.value();
+    const auto& scale2 = scale2_spec.value();
+    const auto& small = small_spec.value();
+    const auto& whole = whole_spec.value();
+
+    // 1.5, its sign, zero without digits, a weight below the first digit
+    // group, rounding half away from zero at the described scale, the
+    // exponent form a stripped trailing zero leaves.
+    auto parsed = parse_binary_numeric_parameter(resource, &wide, numeric_value(0, 0x0000, {1, 5000}));
+    REQUIRE_FALSE(parsed.has_error());
+    CHECK(parsed.value().get_value<types::int128_t>(0) == types::int128_t{15000000000LL});
+
+    parsed = parse_binary_numeric_parameter(resource, &wide, numeric_value(0, 0x4000, {1, 2500}));
+    REQUIRE_FALSE(parsed.has_error());
+    CHECK(parsed.value().get_value<types::int128_t>(0) == types::int128_t{-12500000000LL});
+
+    parsed = parse_binary_numeric_parameter(resource, &wide, numeric_value(0, 0x0000, {}));
+    REQUIRE_FALSE(parsed.has_error());
+    CHECK(parsed.value().get_value<types::int128_t>(0) == types::int128_t{0});
+
+    parsed = parse_binary_numeric_parameter(resource, &wide, numeric_value(-1, 0x0000, {12}));
+    REQUIRE_FALSE(parsed.has_error());
+    CHECK(parsed.value().get_value<types::int128_t>(0) == types::int128_t{12000000LL});
+
+    parsed = parse_binary_numeric_parameter(resource, &scale2, numeric_value(0, 0x0000, {1, 2350}));
+    REQUIRE_FALSE(parsed.has_error());
+    CHECK(parsed.value().get_value<types::int128_t>(0) == types::int128_t{124});
+
+    parsed = parse_binary_numeric_parameter(resource, &whole, numeric_value(1, 0x0000, {1}));
+    REQUIRE_FALSE(parsed.has_error());
+    CHECK(parsed.value().get_value<types::int128_t>(0) == types::int128_t{10000});
+}
+
+TEST_CASE("pg parse_binary_numeric_parameter: a value the format or the type cannot hold is refused") {
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
+    auto* resource = &arena;
+    auto small_spec = types::complex_logical_type::create_decimal(resource, 10, 2, "");
+    REQUIRE_FALSE(small_spec.has_error());
+    const auto& small = small_spec.value();
+    const auto integer = types::complex_logical_type{types::logical_type::INTEGER};
+    const auto text = types::complex_logical_type{types::logical_type::STRING_LITERAL};
+
+    // Truncated, a length the digit count contradicts, a group past 9999, a
+    // sign that is none: 22P02's literal the format cannot hold. NaN and the
+    // infinities, a value past the described precision, an engine type that
+    // takes no NUMERIC.
+    struct refusal_t {
+        std::string value;
+        const types::complex_logical_type* engine;
+        core::error_code_t code;
+    };
+    const std::vector<refusal_t> failing = {
+        {std::string{"\x01\x02\x03\x04", 4}, &small, core::error_code_t::invalid_text_representation},
+        {numeric_value(0, 0x0000, {1, 2}) + "tail", &small, core::error_code_t::invalid_text_representation},
+        {numeric_value(0, 0x0000, {10000}), &small, core::error_code_t::invalid_text_representation},
+        {numeric_value(0, 0x2000, {1}), &small, core::error_code_t::invalid_text_representation},
+        {numeric_value(0, 0xC000, {}), nullptr, core::error_code_t::unimplemented_yet},
+        {numeric_value(0, 0xD000, {}), nullptr, core::error_code_t::unimplemented_yet},
+        {numeric_value(0, 0xF000, {}), nullptr, core::error_code_t::unimplemented_yet},
+        {numeric_value(2, 0x0000, {123, 4567, 8901}), &small, core::error_code_t::numeric_value_out_of_range},
+        {numeric_value(0, 0x0000, {1, 5000}), &integer, core::error_code_t::datatype_mismatch},
+    };
+    for (size_t i = 0; i < failing.size(); ++i) {
+        INFO("case " << i);
+        auto parsed = parse_binary_numeric_parameter(resource, failing[i].engine, failing[i].value);
+        REQUIRE(parsed.has_error());
+        REQUIRE(parsed.error().type == failing[i].code);
+        REQUIRE(parsed.error().what.get_allocator().resource() == resource);
+    }
+
+    // A parameter the engine typed as no DECIMAL — or knows nothing of —
+    // binds the exact decimal text, as its own string.
+    auto as_text = parse_binary_numeric_parameter(resource, &text, numeric_value(0, 0x0000, {1, 5000}));
+    REQUIRE_FALSE(as_text.has_error());
+    CHECK(as_text.value().get_value<std::string_view>(0) == "1.5000");
+    as_text = parse_binary_numeric_parameter(resource, nullptr, numeric_value(0, 0x0000, {1, 5000}));
+    REQUIRE_FALSE(as_text.has_error());
+    CHECK(as_text.value().get_value<std::string_view>(0) == "1.5000");
+}
+
+// The parameter PostgreSQL types by no context and answers 42P18 for at the
+// Parse: one standing alone as a select-list column. A parameter an
+// expression types, a typed select list, and every text that is not one
+// plain SELECT answer none here.
+TEST_CASE("pg frontend: the bare select-list parameter off the raw tree") {
+    auto* resource = std::pmr::new_delete_resource();
+    CHECK(bare_select_parameter(resource, "SELECT $1") == 1);
+    CHECK(bare_select_parameter(resource, "select $1 as v") == 1);
+    CHECK(bare_select_parameter(resource, "SELECT $1 AS v FROM scores WHERE id = 1") == 1);
+    CHECK(bare_select_parameter(resource, "SELECT $1, score + $2 FROM scores") == 1);
+    CHECK(bare_select_parameter(resource, "SELECT score + $1 AS v FROM scores") == std::nullopt);
+    CHECK(bare_select_parameter(resource, "SELECT $1::int AS v") == std::nullopt);
+    CHECK(bare_select_parameter(resource, "SELECT * FROM scores WHERE name = $1") == std::nullopt);
+    CHECK(bare_select_parameter(resource, "SELECT 1") == std::nullopt);
+    CHECK(bare_select_parameter(resource, "WITH x AS (SELECT $1) SELECT * FROM x") == std::nullopt);
+    CHECK(bare_select_parameter(resource, "SELECT $1; SELECT 2") == std::nullopt);
+    CHECK(bare_select_parameter(resource, "INSERT INTO scores VALUES ($1)") == std::nullopt);
+    CHECK(bare_select_parameter(resource, "not sql at all") == std::nullopt);
 }
 
 // An error inside an extended-query pipeline answers ErrorResponse alone: the

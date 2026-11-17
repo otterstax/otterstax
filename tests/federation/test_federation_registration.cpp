@@ -184,6 +184,29 @@ TEST_CASE("registration: PostgreSQL without a configured schema registers every 
     }
 }
 
+TEST_CASE("registration: one PostgreSQL connection joins tables from two schemas") {
+    fed_stack_t stack({{"pg", backend_type_t::PostgreSQL, "shop", ""}});
+    stack.backend("pg").add_table(
+        {"shop", "a", "t1", {column("id", logical_type::BIGINT)}, {{std::int64_t{1}}, {std::int64_t{2}}}});
+    stack.backend("pg").add_table(
+        {"shop", "b", "t2", {column("id", logical_type::BIGINT)}, {{std::int64_t{2}}, {std::int64_t{3}}}});
+    // The JOIN of the connection is offered whole; the fake cannot compute it — answer the row
+    // the ON picks out of the canned tables.
+    stack.backend("pg").on_scan(
+        [](const std::string& sql,
+           std::pmr::memory_resource* resource) -> std::optional<components::vector::data_chunk_t> {
+            if (sql.find(" JOIN ") == std::string::npos) {
+                return std::nullopt;
+            }
+            return chunk_of(resource,
+                            {column("id", logical_type::BIGINT), column("id", logical_type::BIGINT)},
+                            {{std::int64_t{2}, std::int64_t{2}}});
+        });
+    stack.open();
+    CHECK(rows_of(stack.ok("SELECT a.id, b.id FROM pg.a.t1 a JOIN pg.b.t2 b ON a.id = b.id;")) ==
+          std::vector<std::string>{"2|2"});
+}
+
 TEST_CASE("registration: a restart keeps a table a local view holds and starts") {
     fed_stack_t stack({{"pg", backend_type_t::PostgreSQL, "shop", "public"}});
     stack.backend("pg").add_table({"shop",

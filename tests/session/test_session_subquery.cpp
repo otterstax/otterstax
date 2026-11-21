@@ -189,3 +189,31 @@ TEST_CASE("session sub-query: a scalar sub-query column of a parameterized state
         CHECK(otterstax::test::cell(chunk, 1, 0).value<int64_t>() == 3);
     });
 }
+
+TEST_CASE("session sub-query: NOT IN and NOT EXISTS over local tables", "[subquery]") {
+    with_session_stack("/tmp/test_session_subquery_not", [](session_stack s) {
+        session_hash_t id = 14450;
+        seed(s, id);
+
+        CHECK(ids_of(s, id++, "SELECT id FROM local.sq.t WHERE id NOT IN (SELECT id FROM local.sq.u) ORDER BY id;") ==
+              ids_t{1, 4});
+        CHECK(ids_of(s, id++, "SELECT id FROM local.sq.t WHERE NOT EXISTS (SELECT id FROM local.sq.u) ORDER BY id;") ==
+              ids_t{});
+        CHECK(
+            ids_of(
+                s,
+                id++,
+                "SELECT id FROM local.sq.t WHERE id NOT IN (SELECT id FROM local.sq.u WHERE id > 100) ORDER BY id;") ==
+            ids_t{1, 2, 3, 4});
+        CHECK(ids_of(s,
+                     id++,
+                     "SELECT id FROM local.sq.t WHERE NOT EXISTS (SELECT id FROM local.sq.u WHERE id > 100) "
+                     "ORDER BY id;") == ids_t{1, 2, 3, 4});
+
+        run_session_or_fail(s, id++, "INSERT INTO sq.u (id) VALUES (NULL);");
+        CHECK(ids_of(s, id++, "SELECT id FROM local.sq.t WHERE id NOT IN (SELECT id FROM local.sq.u) ORDER BY id;") ==
+              ids_t{});
+        CHECK(ids_of(s, id++, "SELECT id FROM local.sq.t WHERE id IN (SELECT id FROM local.sq.u) ORDER BY id;") ==
+              ids_t{2, 3});
+    });
+}

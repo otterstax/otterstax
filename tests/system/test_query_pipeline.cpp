@@ -192,8 +192,8 @@ TEST_CASE("describe: a SELECT is described by the engine, its parameters typed")
     CHECK(schema.child_types()[1].alias() == "budget");
     CHECK(schema.child_types()[1].type() == types::logical_type::DOUBLE);
     REQUIRE(described.value().parameter_count == 1);
-    REQUIRE(described.value().parameter_types.size() == 1);
-    CHECK(described.value().parameter_types[0].type() == types::logical_type::BIGINT);
+    REQUIRE(described.value().engine_types.size() == 1);
+    CHECK(described.value().engine_types[0].type() == types::logical_type::BIGINT);
 }
 
 TEST_CASE("describe: a statement without rows has no schema") {
@@ -202,7 +202,7 @@ TEST_CASE("describe: a statement without rows has no schema") {
     auto described = prepare_session_sql(s, 1, "CREATE DATABASE describe_only;");
     REQUIRE_FALSE(described.has_error());
     CHECK(described.value().schema.type() != types::logical_type::STRUCT);
-    CHECK(described.value().parameter_types.empty());
+    CHECK(described.value().engine_types.empty());
 }
 
 TEST_CASE("describe: a SELECT of a connection's table is typed from its catalog rows") {

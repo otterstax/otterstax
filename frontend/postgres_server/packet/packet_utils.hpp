@@ -10,6 +10,7 @@
 #include "packet_writer.hpp"
 
 #include <components/sql/parser/nodes/nodes.h>
+#include <components/types/types.hpp>
 #include <components/vector/vector.hpp>
 #include <core/result_wrapper.hpp>
 
@@ -63,13 +64,27 @@ namespace frontend::postgres {
     std::optional<frontend::result_encoding> get_format_code(const std::vector<frontend::result_encoding>& format,
                                                              size_t i);
 
-    // A text-format Bind parameter value converted to the engine value of the
-    // statement's declared type. A literal the type cannot hold (garbage,
-    // trailing characters, out of range) is `invalid_text_representation`; a
-    // type the frontend cannot bind is `unimplemented_yet`. Nothing throws here.
-    // The value is a one-row vector.
     core::result_wrapper_t<components::vector::vector_t>
-    parse_text_parameter(std::pmr::memory_resource* resource, field_type type, std::string text);
+    parse_text_parameter(std::pmr::memory_resource* resource,
+                         field_type type,
+                         const components::types::complex_logical_type* engine_type,
+                         std::string text);
+
+    inline core::result_wrapper_t<components::vector::vector_t>
+    parse_text_parameter(std::pmr::memory_resource* resource, field_type type, std::string text) {
+        return parse_text_parameter(resource, type, nullptr, std::move(text));
+    }
+
+    // A binary Bind parameter of the declared NUMERIC type: PostgreSQL's
+    // numeric_send layout (sign, weight, base-10000 digit groups) — backend
+    // internal per https://www.postgresql.org/docs/current/protocol.html, read
+    // as numeric_recv in src/backend/utils/adt/numeric.c. The number is rebuilt
+    // as decimal text and bound like a text NUMERIC literal, refusals included;
+    // a malformed body `datatype_mismatch`, NaN/Infinity `unimplemented_yet`.
+    core::result_wrapper_t<components::vector::vector_t>
+    parse_binary_numeric_parameter(std::pmr::memory_resource* resource,
+                                   const components::types::complex_logical_type* engine_type,
+                                   std::string_view value);
 
     std::vector<uint8_t> build_auth_ok(packet_writer& writer);
 
@@ -104,7 +119,7 @@ namespace frontend::postgres {
 
     // ParameterDescription ('t'): the OID of every parameter of a prepared statement.
     std::vector<uint8_t> build_parameter_description(packet_writer& writer,
-                                                     const std::pmr::vector<field_type>& parameter_types);
+                                                     const std::pmr::vector<field_type>& parameter_oids);
 
     // PortalSuspended ('s'): Execute stopped at its row limit; the portal keeps the rest.
     std::vector<uint8_t> build_portal_suspended(packet_writer& writer);

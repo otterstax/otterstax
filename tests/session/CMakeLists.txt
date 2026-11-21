@@ -4,6 +4,7 @@ set(${PROJECT_NAME}_SOURCES
     main.cpp
     test_session_pipeline.cpp
     test_session_prepared.cpp
+    test_session_types.cpp
     test_session_subquery.cpp
     test_session_external.cpp
     test_session_kafka.cpp

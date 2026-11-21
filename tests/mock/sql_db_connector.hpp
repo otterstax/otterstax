@@ -52,15 +52,18 @@ namespace mysql {
         std::string name;
         boost::mysql::column_type type;
         bool is_unsigned = false;
+        std::uint32_t column_length = 0;
+        std::uint8_t decimals = 0;
     };
 
     using mock_row_t = std::vector<std::optional<std::string>>;
 
     // A completed text result set with `columns` and `rows` (each value in the
-    // text form MySQL sends, NULL as nullopt), manufactured through
-    // boost::mysql::detail::access the way the connection fills one: the column
-    // definitions in metadata_mode::full, then every row as its wire message (a
-    // length-encoded string per field, 0xFB for NULL).
+    // text form MySQL sends, NULL as nullopt; a column's display length and
+    // decimals when set — the DECIMAL(p, s) a probe registers), manufactured
+    // through boost::mysql::detail::access the way the connection fills one: the
+    // column definitions in metadata_mode::full, then every row as its wire
+    // message (a length-encoded string per field, 0xFB for NULL).
     inline boost::mysql::results mock_results(const std::vector<mock_column_t>& columns,
                                               const std::vector<mock_row_t>& rows = {}) {
         boost::mysql::results result;
@@ -73,6 +76,8 @@ namespace mysql {
             coldef.type = column.type;
             coldef.flags =
                 static_cast<std::uint16_t>(column.is_unsigned ? boost::mysql::detail::column_flags::unsigned_ : 0);
+            coldef.column_length = column.column_length;
+            coldef.decimals = column.decimals;
             boost::mysql::diagnostics diag;
             [[maybe_unused]] auto meta_ec = impl.on_meta(coldef, diag);
             assert(!meta_ec && "mock result set: on_meta must not fail");

@@ -3,6 +3,10 @@
 
 #include "packet_utils.hpp"
 
+#include "../../common/utils.hpp"
+#include "otterbrix/translators/input/decimal_text.hpp"
+
+#include <components/casts/kernels/string_cast.hpp>
 #include <components/vector/vector_builders.hpp>
 
 #include <cerrno>
@@ -19,6 +23,12 @@ namespace {
         std::pmr::string what{"Invalid text literal for the declared parameter type: ", resource};
         what += text.c_str();
         return core::error_t{core::error_code_t::invalid_text_representation, std::move(what)};
+    }
+
+    core::error_t literal_past_precision(std::pmr::memory_resource* resource, const std::string& text) {
+        std::pmr::string what{"The value is past the declared parameter type's precision: ", resource};
+        what += text.c_str();
+        return core::error_t{core::error_code_t::numeric_value_out_of_range, std::move(what)};
     }
 
     // The whole text must be one number of the target type: no sign-less
@@ -54,9 +64,132 @@ namespace {
         return components::vector::make_scalar(resource, value);
     }
 
+    // The NUMERIC literal as the engine's DECIMAL: read with the engine's own
+    // parse into the described (p, s) — a longer fraction rounds half away
+    // from zero, a value past the precision is refused — and stored at the
+    // width the type is held in.
+    core::result_wrapper_t<vector_t>
+    parse_decimal_parameter(std::pmr::memory_resource* resource,
+                            const components::types::complex_logical_type& type,
+                            const std::string& text) {
+        const auto* spec = type.extension_as<components::types::decimal_logical_type_extension>();
+        components::types::int128_t unscaled = 0;
+        using components::casts::kernels::detail::parse_decimal;
+        using components::casts::kernels::detail::parse_outcome;
+        switch (parse_decimal(text, spec->width(), spec->scale(), &unscaled)) {
+            case parse_outcome::parsed:
+                break;
+            case parse_outcome::out_of_range:
+                return literal_past_precision(resource, text);
+            default:
+                return bad_literal(resource, text);
+        }
+        auto bound = type;
+        bound.set_alias(std::string{});
+        return components::vector::make_decimal(resource, bound, unscaled);
+    }
+
+    // What the wire's NUMERIC literal binds as: the engine's type of the
+    // parameter decides. A parameter the engine typed as neither DECIMAL nor a
+    // string takes no NUMERIC literal.
+    core::result_wrapper_t<vector_t>
+    parse_numeric_parameter(std::pmr::memory_resource* resource,
+                            const components::types::complex_logical_type* engine_type,
+                            std::string text) {
+        if (engine_type == nullptr || engine_type->type() == components::types::logical_type::NA ||
+            engine_type->type() == components::types::logical_type::STRING_LITERAL) {
+            return components::vector::make_scalar(resource, std::string_view{text});
+        }
+        if (engine_type->type() != components::types::logical_type::DECIMAL) {
+            std::pmr::string what{"The parameter is typed ", resource};
+            what += frontend::logical_type_name(engine_type->type());
+            what += ", which does not take a NUMERIC literal: ";
+            what += text.c_str();
+            return core::error_t{core::error_code_t::datatype_mismatch, std::move(what)};
+        }
+        return parse_decimal_parameter(resource, *engine_type, text);
+    }
+
 } // namespace
 
 namespace frontend::postgres {
+    core::result_wrapper_t<components::vector::vector_t>
+    parse_binary_numeric_parameter(std::pmr::memory_resource* resource,
+                                   const components::types::complex_logical_type* engine_type,
+                                   std::string_view value) {
+        constexpr uint16_t NUMERIC_NEG = 0x4000;
+        constexpr uint16_t NUMERIC_NAN = 0xC000;
+        constexpr uint16_t NUMERIC_PINF = 0xD000;
+        constexpr uint16_t NUMERIC_NINF = 0xF000;
+        // A malformed value is a literal the format cannot hold (22P02 on the
+        // wire, the Bind's default refusal), not a type conflict.
+        const auto bad = [&](const char* what) {
+            return core::error_t{core::error_code_t::invalid_text_representation,
+                                 std::pmr::string{what, resource}};
+        };
+        if (value.size() < 8) {
+            return bad("Truncated binary NUMERIC parameter");
+        }
+        const auto field = [&value](size_t at) {
+            return static_cast<uint16_t>(static_cast<unsigned char>(value[at]) << 8 |
+                                         static_cast<unsigned char>(value[at + 1]));
+        };
+        const auto ndigits = static_cast<int>(static_cast<int16_t>(field(0)));
+        const auto weight = static_cast<int>(static_cast<int16_t>(field(2)));
+        const auto sign = field(4);
+        // field(6) is the display scale: the digits carry the value, the
+        // engine's described DECIMAL carries the bound.
+        if (ndigits < 0 || value.size() != 8u + 2u * static_cast<unsigned>(ndigits)) {
+            return bad("Malformed binary NUMERIC parameter");
+        }
+        if (sign == NUMERIC_NAN || sign == NUMERIC_PINF || sign == NUMERIC_NINF) {
+            return core::error_t{core::error_code_t::unimplemented_yet,
+                                 std::pmr::string{"NaN and Infinity NUMERIC parameters are not supported", resource}};
+        }
+        if (sign != 0 && sign != NUMERIC_NEG) {
+            return bad("Invalid binary NUMERIC sign");
+        }
+        // The digit groups of Σ d[i]·10^(4·(weight−i)): the first flat, every
+        // later one exactly four digits; the point sits 4·(ndigits−1−weight)
+        // digits from the right, which a zero count and any negative weight
+        // fold into one fractional tail.
+        if (ndigits == 0) {
+            return parse_numeric_parameter(resource, engine_type, sign == NUMERIC_NEG ? "-0" : "0");
+        }
+        std::string digits;
+        digits.reserve(static_cast<size_t>(ndigits) * 4u);
+        for (int i = 0; i < ndigits; ++i) {
+            const auto group = field(8 + 2u * static_cast<size_t>(i));
+            if (group > 9999) {
+                return bad("Invalid binary NUMERIC digit group");
+            }
+            const auto written = std::to_string(group);
+            if (i > 0) {
+                digits.append(4u - written.size(), '0');
+            }
+            digits += written;
+        }
+        std::string text;
+        if (sign == NUMERIC_NEG) {
+            text.push_back('-');
+        }
+        const auto point_from_right = 4 * (ndigits - 1 - weight);
+        if (point_from_right <= 0) {
+            text += digits;
+            text.append(static_cast<size_t>(-point_from_right), '0');
+        } else if (static_cast<int>(digits.size()) > point_from_right) {
+            text.append(digits, 0, digits.size() - static_cast<size_t>(point_from_right));
+            text.push_back('.');
+            text.append(digits, digits.size() - static_cast<size_t>(point_from_right),
+                        static_cast<size_t>(point_from_right));
+        } else {
+            text += "0.";
+            text.append(static_cast<size_t>(point_from_right - static_cast<int>(digits.size())), '0');
+            text += digits;
+        }
+        return parse_numeric_parameter(resource, engine_type, std::move(text));
+    }
+
     constexpr size_t AUTH_OK_SIZE = 4;
     constexpr size_t ERROR_FIXED_SIZE = 3 + 5; // S, C, M + sqlstate
     constexpr size_t BACKEND_KEY_SIZE = 8;
@@ -136,7 +269,10 @@ namespace frontend::postgres {
     }
 
     core::result_wrapper_t<vector_t>
-    parse_text_parameter(std::pmr::memory_resource* resource, field_type type, std::string text) {
+    parse_text_parameter(std::pmr::memory_resource* resource,
+                         field_type type,
+                         const components::types::complex_logical_type* engine_type,
+                         std::string text) {
         switch (type) {
             case field_type::BOOL:
                 if (text != "t" && text != "f") {
@@ -153,6 +289,8 @@ namespace frontend::postgres {
                 return parse_floating<float>(resource, text);
             case field_type::FLOAT8:
                 return parse_floating<double>(resource, text);
+            case field_type::NUMERIC:
+                return parse_numeric_parameter(resource, engine_type, text);
             case field_type::TEXT:
                 return components::vector::make_scalar(resource, std::string_view{text});
             default:
@@ -258,10 +396,10 @@ namespace frontend::postgres {
     }
 
     std::vector<uint8_t> build_parameter_description(packet_writer& writer,
-                                                     const std::pmr::vector<field_type>& parameter_types) {
-        writer.reserve_payload(2 + 4 * parameter_types.size());
-        writer.write_int16(static_cast<int16_t>(parameter_types.size()));
-        for (auto type : parameter_types) {
+                                                     const std::pmr::vector<field_type>& parameter_oids) {
+        writer.reserve_payload(2 + 4 * parameter_oids.size());
+        writer.write_int16(static_cast<int16_t>(parameter_oids.size()));
+        for (auto type : parameter_oids) {
             writer.write_int32(static_cast<int32_t>(static_cast<oid_t>(type)));
         }
         return writer.build_from_payload(message_type::backend::PARAMETER_DESCRIPTION);

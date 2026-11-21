@@ -34,6 +34,28 @@ the exact message sequence the server answers with:
     keeps ErrorResponse followed by ReadyForQuery at once.
   * Bind with a text literal the parameter type cannot hold ('12abc' for an
     int8): ErrorResponse with 22P02, and no BindComplete before it.
+  * A parameter over a DECIMAL(10, 2) column (`WHERE price = $1`): the literal
+    rides text, the parameter declared NUMERIC (oid 1700) on Parse or left to
+    the engine — the ParameterDescription answers 1700 either way — and a
+    literal the type holds binds and selects its row with the scale and the
+    sign kept; a literal past the precision ('999999999.99') is ErrorResponse
+    22003 with no BindComplete, the statement alive after.
+  * A Parse that declares no parameter types (asyncpg's shape): the
+    ParameterDescription carries the engine's own type of every parameter and
+    the Execute answers; a parameter no clause types — a `WHERE $1 = $2` or
+    a select-list `$1` alone — is refused at Parse with 42P18 naming it,
+    while the client's declared type serves the same statement.
+  * A binary-format NUMERIC Bind parameter (psycopg's shape) binds through
+    the same parse as a text NUMERIC literal: the described DECIMAL bounds
+    it, the same refusals.
+  * A NUMERIC declaration is a type of its own: over a parameter the engine
+    typed an integer, a decimal literal is refused at the Bind with 42804
+    naming the type, the statement itself alive — it binds a proper integer
+    parameter. A parameter typed by two clauses of different types is refused
+    at Parse with 42P08 naming the parameter. And a frontend-kept statement
+    (a SET of a client parameter) has no engine types: its declared literal
+    binds as its own text and the SET completes with the value of its own
+    text, not the bound one.
   * Bind asking for binary result columns: RowDescription reports format code
     1 for every column.
   * A `hugeint` result column is carried in text: it is described as NUMERIC
@@ -90,6 +112,7 @@ ROWS = 5
 
 WIDE_TABLE = "wide"    # (id INT, big hugeint)  — carried as NUMERIC in text
 UWIDE_TABLE = "uwide"  # (id INT, big uhugeint) — no wire type at all
+DECIMAL_TABLE = "prices"  # (id bigint, price decimal(10, 2)) — one row per decimal parameter literal
 
 # Two tables with the same column names: a prepare merges a JOIN of them by
 # name and describes two columns, the engine answers all four.
@@ -101,8 +124,11 @@ OID_INT8 = 20
 OID_TEXT = 25
 OID_NUMERIC = 1700
 SQLSTATE_INVALID_TEXT_REPRESENTATION = "22P02"
+SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE = "22003"
 SQLSTATE_FEATURE_NOT_SUPPORTED = "0A000"
 SQLSTATE_PROTOCOL_VIOLATION = "08P01"
+SQLSTATE_INDETERMINATE_DATATYPE = "42P18"
+SQLSTATE_DATATYPE_MISMATCH = "42804"
 
 # Message type bytes the assertions name.
 PARSE_COMPLETE = b"1"
@@ -110,6 +136,7 @@ BIND_COMPLETE = b"2"
 PARAMETER_DESCRIPTION = b"t"
 ROW_DESCRIPTION = b"T"
 NO_DATA = b"n"
+PARAMETER_STATUS = b"S"
 DATA_ROW = b"D"
 PORTAL_SUSPENDED = b"s"
 COMMAND_COMPLETE = b"C"
@@ -159,6 +186,23 @@ class PgWire:
         payload += struct.pack("!h", len(result_formats))
         for code in result_formats:
             payload += struct.pack("!h", code)
+        self._send(b"B", payload)
+
+    def bind_raw_params(self, portal, statement, params, result_formats=()):
+        """A Bind whose parameters carry their own format code: (code, bytes) per parameter, None as NULL."""
+        payload = _cstr(portal) + _cstr(statement)
+        payload += struct.pack("!h", len(params))           # parameter format codes
+        for code, raw in params:
+            payload += struct.pack("!h", code)
+        payload += struct.pack("!h", len(params))           # the parameter values
+        for code, raw in params:
+            if raw is None:
+                payload += struct.pack("!i", -1)
+            else:
+                payload += struct.pack("!i", len(raw)) + raw
+        payload += struct.pack("!h", len(result_formats))
+        for fmt in result_formats:
+            payload += struct.pack("!h", fmt)
         self._send(b"B", payload)
 
     def describe(self, kind, name):
@@ -275,6 +319,7 @@ class PgExtendedProtocolTest:
         self.table_created = False
         self.wide_table_created = False
         self.uwide_table_created = False
+        self.decimal_table_created = False
         self.join_tables_created = []
 
     # ── helpers ────────────────────────────────────────────────────────────
@@ -321,6 +366,15 @@ class PgExtendedProtocolTest:
             self.assert_no_error(
                 self.wire.query(f"INSERT INTO {DB}.{table} (id, name) VALUES (1, '{table}_1'), (2, '{table}_2')"),
                 f"INSERT into {table}")
+        # The decimal rows are quoted literals: the value arrives at the column
+        # through the engine's own string -> DECIMAL parse, exactly. Each is the
+        # only row its price selects.
+        self.assert_no_error(self.wire.query(f"CREATE TABLE {DB}.{DECIMAL_TABLE} (id bigint, price decimal(10, 2))"),
+                             "CREATE TABLE with a decimal column")
+        self.decimal_table_created = True
+        self.assert_no_error(
+            self.wire.query(f"INSERT INTO {DB}.{DECIMAL_TABLE} (id, price) VALUES (1, '1.25'), (2, '-3.50'), (3, '0.10')"),
+            "INSERT into the decimal table")
 
     def cleanup(self):
         if self.wire is None:
@@ -334,6 +388,8 @@ class PgExtendedProtocolTest:
                 self.wire.query(f"DROP TABLE {DB}.{UWIDE_TABLE}")
             for table in self.join_tables_created:
                 self.wire.query(f"DROP TABLE {DB}.{table}")
+            if self.decimal_table_created:
+                self.wire.query(f"DROP TABLE {DB}.{DECIMAL_TABLE}")
             if self.database_created:
                 self.wire.query(f"DROP SCHEMA {DB} CASCADE")
         finally:
@@ -440,6 +496,125 @@ class PgExtendedProtocolTest:
         self.assert_equal([f["name"] for f in fields], ["id"], "the projected column keeps its name")
         self.assert_equal(fields[0]["type_oid"], OID_INT8, "and is typed from the engine's own column")
         print("  ParameterDescription [int8] + RowDescription [id int8] ✓")
+
+    def test_describe_statement_of_an_undeclared_parameter_carries_the_engine_oid(self):
+        """Parse with no declared types: ParameterDescription carries the engine's own OID and the Execute answers."""
+        w = self.wire
+        w.parse("untyped_id", f"SELECT id, name FROM {DB}.{TABLE} WHERE id = $1")
+        w.describe("S", "untyped_id")
+        w.sync()
+        messages = w.read_until_ready()
+        self.assert_no_error(messages, "Describe of an undeclared parameter")
+
+        self.assert_equal(parameter_oids(first(messages, PARAMETER_DESCRIPTION)), [OID_INT8],
+                          "the engine's own type of the parameter")
+        fields = row_description_fields(first(messages, ROW_DESCRIPTION))
+        self.assert_equal([f["type_oid"] for f in fields], [OID_INT8, OID_TEXT], "the described columns")
+
+        w.bind("", "untyped_id", ["2"])
+        w.execute("", 0)
+        w.sync()
+        messages = w.read_until_ready()
+        self.assert_no_error(messages, "Execute of the undeclared parameter")
+        self.assert_equal(data_row_texts(first(messages, DATA_ROW)), ["2", "row_2"], "the bound value ran")
+        print("  undeclared Parse -> ParameterDescription [int8], Execute answers ✓")
+
+    def test_a_bare_placeholder_in_the_select_list_is_indeterminate_datatype(self):
+        """Parse with no declared types: a select-list $1 alone is refused 42P18, as PostgreSQL's Parse."""
+        w = self.wire
+        # A select-list output column no clause types: PostgreSQL refuses the
+        # Parse itself, storing no statement — the client's declared type
+        # serves the same statement (the next case).
+        w.parse("bare_param", "SELECT $1 AS v")
+        w.sync()
+        messages = self.read_failed_pipeline(w)
+
+        self.assert_equal(kinds(messages), [ERROR_RESPONSE, READY_FOR_QUERY],
+                          "a select-list parameter no clause types is refused at Parse")
+        fields = error_fields(first(messages, ERROR_RESPONSE))
+        self.assert_equal(fields.get("C"), SQLSTATE_INDETERMINATE_DATATYPE,
+                          "sqlstate of a parameter no type can be deduced for")
+        message = fields.get("M", "")
+        assert "$1" in message, f"the message must name the parameter: {message}"
+        print(f"  SELECT $1 -> 42P18 '{message}' ✓")
+
+    def test_a_bare_placeholder_served_when_the_client_declares_its_type(self):
+        """Parse declaring the type: the same select-list $1 is served, announced and delivered as declared."""
+        w = self.wire
+        w.parse("typed_bare_param", "SELECT $1 AS v", [OID_TEXT])
+        w.describe("S", "typed_bare_param")
+        w.sync()
+        messages = w.read_until_ready()
+        self.assert_no_error(messages, "Describe of a declared select-list parameter")
+
+        self.assert_equal(parameter_oids(first(messages, PARAMETER_DESCRIPTION)), [OID_TEXT],
+                          "the client's declared type is announced")
+        fields = row_description_fields(first(messages, ROW_DESCRIPTION))
+        self.assert_equal([f["name"] for f in fields], ["v"], "the aliased output column keeps its name")
+        self.assert_equal([f["type_oid"] for f in fields], [OID_TEXT],
+                          "an output column that is the parameter alone is typed by it")
+
+        w.bind("typed_bare_p", "typed_bare_param", ["one"])
+        w.describe("P", "typed_bare_p")
+        w.execute("typed_bare_p", 0)
+        w.sync()
+        messages = w.read_until_ready()
+        self.assert_no_error(messages, "Execute of the declared bare parameter")
+        self.assert_equal(kinds(messages),
+                          [BIND_COMPLETE, ROW_DESCRIPTION, DATA_ROW, COMMAND_COMPLETE, READY_FOR_QUERY],
+                          "the executed result is described once and its row follows")
+        self.assert_equal(data_row_texts(first(messages, DATA_ROW)), ["one"], "the bound text is delivered")
+        self.assert_equal(command_tag(first(messages, COMMAND_COMPLETE)), "SELECT 1",
+                          "a SELECT with no FROM answers one row")
+        print("  SELECT $1 AS v (declared text) -> ParameterDescription [text], Execute delivers 'one' ✓")
+
+    def test_a_select_list_parameter_inside_an_expression_is_served(self):
+        """`SELECT id + $1`: the expression types the parameter, nothing is refused."""
+        w = self.wire
+        w.parse("context_param", f"SELECT id + $1 AS v FROM {DB}.{TABLE} WHERE id = 1")
+        w.describe("S", "context_param")
+        w.sync()
+        messages = w.read_until_ready()
+        self.assert_no_error(messages, "Describe of a parameter inside a select-list expression")
+        self.assert_equal(parameter_oids(first(messages, PARAMETER_DESCRIPTION)), [OID_INT8],
+                          "the expression's BIGINT types the parameter")
+        print("  SELECT id + $1 -> ParameterDescription [int8], nothing refused ✓")
+
+    def test_describe_of_an_untypable_parameter_is_indeterminate_datatype(self):
+        """Two parameters compared with no typed anchor: ErrorResponse 42P18 naming the lowest."""
+        w = self.wire
+        w.parse("untyped_pair", f"SELECT id FROM {DB}.{DECIMAL_TABLE} WHERE $1 = $2")
+        w.sync()
+        messages = self.read_failed_pipeline(w)
+
+        self.assert_equal(kinds(messages), [ERROR_RESPONSE, READY_FOR_QUERY],
+                          "a parameter no clause types is refused at Parse")
+        fields = error_fields(first(messages, ERROR_RESPONSE))
+        self.assert_equal(fields.get("C"), SQLSTATE_INDETERMINATE_DATATYPE,
+                          "sqlstate of a parameter no type can be deduced for")
+        message = fields.get("M", "")
+        assert "$1" in message, f"the message must name the parameter: {message}"
+        print(f"  WHERE $1 = $2 -> 42P18 '{message}' ✓")
+
+    def test_a_parameter_in_two_typed_contexts_is_ambiguous(self):
+        """$1 typed by id = $1 and by name = $1: refused at Parse naming the conflict."""
+        w = self.wire
+        w.parse("two_ways", f"SELECT id FROM {DB}.{TABLE} WHERE id = $1 AND name = $1")
+        w.sync()
+        messages = self.read_failed_pipeline(w)
+
+        self.assert_equal(kinds(messages), [ERROR_RESPONSE, READY_FOR_QUERY],
+                          "a parameter two clauses type differently is refused at Parse")
+        fields = error_fields(first(messages, ERROR_RESPONSE))
+        message = fields.get("M", "")
+        assert "no type is common" in message, f"the message must name the conflict: {message}"
+        # otterbrix rc-5 refuses the conflicting parameter with its own "no
+        # type is common to every side of eq", answered 42601 — the branch's
+        # earlier engine answered ambiguous_parameter (42P08), and PostgreSQL
+        # itself answers 42P18. Which wire answer the contract wants is an
+        # open question for the review; pinned as the engine answers today.
+        self.assert_equal(fields.get("C"), "42601", "sqlstate of a parameter typed two ways")
+        print(f"  id = $1 AND name = $1 -> 42601 '{message}' ✓")
 
     def test_describe_statement_expands_a_star_before_bind(self):
         """Describe('S') of `SELECT * ... WHERE id = $1`: the table's columns, and the Execute streams them."""
@@ -695,6 +870,222 @@ class PgExtendedProtocolTest:
         self.assert_no_error(messages, "Bind after a failed Bind")
         self.assert_equal([data_row_texts(p)[0] for k, p in messages if k == DATA_ROW], ["3"], "rows of the retried Bind")
         print("  Bind '12abc' as int8 -> 22P02, no BindComplete ✓")
+
+    def test_decimal_parameter_binds_under_its_declared_numeric_oid(self):
+        """Bind a decimal literal for a DECIMAL(10, 2) parameter declared NUMERIC: its row, scale and sign kept."""
+        w = self.wire
+        w.parse("priced", f"SELECT id, price FROM {DB}.{DECIMAL_TABLE} WHERE price = $1", [OID_NUMERIC])
+        w.describe("S", "priced")
+        w.sync()
+        messages = w.read_until_ready()
+        self.assert_no_error(messages, "Describe of a declared decimal parameter")
+
+        self.assert_equal(parameter_oids(first(messages, PARAMETER_DESCRIPTION)), [OID_NUMERIC],
+                          "the declared NUMERIC parameter type")
+        self.assert_equal([f["type_oid"] for f in row_description_fields(first(messages, ROW_DESCRIPTION))],
+                          [OID_INT8, OID_NUMERIC], "the described columns")
+
+        for literal, row in [("1.25", ["1", "1.25"]), ("-3.50", ["2", "-3.50"]), ("0.10", ["3", "0.10"])]:
+            w.bind("", "priced", [literal])
+            w.execute("", 0)
+            w.sync()
+            messages = w.read_until_ready()
+            self.assert_no_error(messages, f"Bind of the decimal literal {literal}")
+            self.assert_equal(kinds(messages), [BIND_COMPLETE, DATA_ROW, COMMAND_COMPLETE, READY_FOR_QUERY],
+                              "each bound literal answers its row")
+            self.assert_equal(data_row_texts(first(messages, DATA_ROW)), row, f"the row {literal} selects")
+        print("  Bind '1.25' / '-3.50' / '0.10' as NUMERIC -> their rows, scale and sign kept ✓")
+
+    def test_decimal_parameter_binds_without_a_declared_type(self):
+        """Parse with no declared types: ParameterDescription still carries NUMERIC, and the bind answers."""
+        w = self.wire
+        w.parse("untyped_price", f"SELECT id, price FROM {DB}.{DECIMAL_TABLE} WHERE price = $1")
+        w.describe("S", "untyped_price")
+        w.sync()
+        messages = w.read_until_ready()
+        self.assert_no_error(messages, "Describe of an undeclared decimal parameter")
+
+        self.assert_equal(parameter_oids(first(messages, PARAMETER_DESCRIPTION)), [OID_NUMERIC],
+                          "the engine's own type of the parameter")
+
+        w.bind("", "untyped_price", ["1.25"])
+        w.execute("", 0)
+        w.sync()
+        messages = w.read_until_ready()
+        self.assert_no_error(messages, "Bind of an undeclared decimal parameter")
+        self.assert_equal(data_row_texts(first(messages, DATA_ROW)), ["1", "1.25"], "the row 1.25 selects")
+        print("  undeclared Parse -> ParameterDescription [1700], Bind '1.25' answers ✓")
+
+    def test_decimal_parameter_refuses_a_value_past_the_precision(self):
+        """Bind '999999999.99' for a DECIMAL(10, 2) parameter: ErrorResponse 22003 and no BindComplete."""
+        w = self.wire
+        w.parse("priced_lit", f"SELECT id FROM {DB}.{DECIMAL_TABLE} WHERE price = $1", [OID_NUMERIC])
+        w.sync()
+        self.assert_no_error(w.read_until_ready(), "Parse of the decimal statement")
+
+        w.bind("", "priced_lit", ["999999999.99"])
+        w.execute("", 0)
+        w.sync()
+        messages = self.read_failed_pipeline(w)
+
+        self.assert_equal(kinds(messages), [ERROR_RESPONSE, READY_FOR_QUERY],
+                          "a failed decimal Bind: the error alone, the Execute discarded")
+        fields = error_fields(first(messages, ERROR_RESPONSE))
+        self.assert_equal(fields.get("C"), SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
+                          "sqlstate of a literal past the precision")
+
+        # The statement is intact: a literal the type holds binds and runs.
+        w.bind("", "priced_lit", ["1.25"])
+        w.execute("", 0)
+        w.sync()
+        messages = w.read_until_ready()
+        self.assert_no_error(messages, "Bind after a failed decimal Bind")
+        self.assert_equal([data_row_texts(p)[0] for k, p in messages if k == DATA_ROW], ["1"],
+                          "rows of the retried Bind")
+        print("  Bind '999999999.99' as NUMERIC -> 22003, no BindComplete ✓")
+
+    def test_numeric_literal_refused_for_an_integer_parameter(self):
+        """A decimal literal for a parameter the engine typed BIGINT: 42804 naming the type, no BindComplete."""
+        w = self.wire
+        w.parse("numeric_int", f"SELECT id FROM {DB}.{DECIMAL_TABLE} WHERE id = $1", [OID_NUMERIC])
+        w.describe("S", "numeric_int")
+        w.sync()
+        messages = w.read_until_ready()
+        self.assert_no_error(messages, "Describe of a declared NUMERIC parameter over an integer column")
+
+        self.assert_equal(parameter_oids(first(messages, PARAMETER_DESCRIPTION)), [OID_NUMERIC],
+                          "the declared NUMERIC parameter type")
+        self.assert_equal([f["type_oid"] for f in row_description_fields(first(messages, ROW_DESCRIPTION))],
+                          [OID_INT8], "the engine types the parameter from the integer column")
+
+        w.bind("", "numeric_int", ["1.25"])
+        w.execute("", 0)
+        w.sync()
+        messages = self.read_failed_pipeline(w)
+        self.assert_equal(kinds(messages), [ERROR_RESPONSE, READY_FOR_QUERY],
+                          "a refused decimal Bind: the error alone, the Execute discarded")
+        fields = error_fields(first(messages, ERROR_RESPONSE))
+        self.assert_equal(fields.get("C"), SQLSTATE_DATATYPE_MISMATCH,
+                          "sqlstate of a literal of another type than the parameter's")
+        message = fields.get("M", "")
+        assert "BIGINT" in message, f"the message must name the expected type: {message}"
+
+        # The statement itself is sound: without the NUMERIC declaration the
+        # engine types the parameter int8 and a proper integer literal answers.
+        w.parse("int_int", f"SELECT id FROM {DB}.{DECIMAL_TABLE} WHERE id = $1")
+        w.bind("", "int_int", ["2"])
+        w.execute("", 0)
+        w.sync()
+        messages = w.read_until_ready()
+        self.assert_no_error(messages, "Bind of a proper integer after the refused one")
+        # The statement was never described: its Execute describes the rows
+        # once, in front of them.
+        self.assert_equal(kinds(messages),
+                          [PARSE_COMPLETE, BIND_COMPLETE, ROW_DESCRIPTION, DATA_ROW, COMMAND_COMPLETE,
+                           READY_FOR_QUERY],
+                          "the statement rebinds")
+        self.assert_equal([data_row_texts(p)[0] for k, p in messages if k == DATA_ROW], ["2"],
+                          "the row 2 selects")
+        print("  Bind '1.25' as NUMERIC over an int8 parameter -> 42804 naming BIGINT, no BindComplete ✓")
+
+    def test_a_binary_numeric_parameter_binds_as_its_exact_decimal(self):
+        """A binary NUMERIC Bind parameter (psycopg's shape) binds the exact value at the described DECIMAL."""
+        w = self.wire
+        w.parse("bin_numeric", f"SELECT id, price FROM {DB}.{DECIMAL_TABLE} WHERE price = $1")
+        w.describe("S", "bin_numeric")
+        w.sync()
+        messages = w.read_until_ready()
+        self.assert_no_error(messages, "Describe of a binary NUMERIC parameter")
+        self.assert_equal(parameter_oids(first(messages, PARAMETER_DESCRIPTION)), [OID_NUMERIC],
+                          "the described decimal parameter is announced NUMERIC")
+
+        # numeric_send: ndigits, weight, sign, display scale, then the
+        # base-10000 groups. 1.25 is digits [1, 2500] at weight 0.
+        w.bind_raw_params("bin_p", "bin_numeric", [(1, struct.pack("!hhhh", 2, 0, 0, 2) + struct.pack("!2h", 1, 2500))])
+        w.execute("bin_p", 0)
+        w.sync()
+        messages = w.read_until_ready()
+        self.assert_no_error(messages, "Bind of a binary NUMERIC parameter")
+        self.assert_equal(kinds(messages), [BIND_COMPLETE, DATA_ROW, COMMAND_COMPLETE, READY_FOR_QUERY],
+                          "the bound binary decimal answers its row")
+        self.assert_equal(data_row_texts(first(messages, DATA_ROW)), ["1", "1.25"], "the exact decimal matched")
+
+        # The sign rides the sign field; NULL is a -1 length with no bytes.
+        w.bind_raw_params("bin_n", "bin_numeric", [(1, struct.pack("!hhhh", 2, 0, 0x4000, 2) + struct.pack("!2h", 3, 5000))])
+        w.execute("bin_n", 0)
+        w.sync()
+        messages = w.read_until_ready()
+        self.assert_no_error(messages, "Bind of a negative binary NUMERIC")
+        self.assert_equal(data_row_texts(first(messages, DATA_ROW)), ["2", "-3.50"], "the sign survived the wire")
+
+        w.bind_raw_params("bin_null", "bin_numeric", [(1, None)])
+        w.execute("bin_null", 0)
+        w.sync()
+        messages = w.read_until_ready()
+        self.assert_no_error(messages, "Bind of a NULL binary NUMERIC")
+        # The portal was never described: its Execute answers no RowDescription.
+        self.assert_equal(kinds(messages), [BIND_COMPLETE, COMMAND_COMPLETE, READY_FOR_QUERY],
+                          "price = NULL answers no row")
+        print("  binary NUMERIC 1.25 / -3.50 / NULL -> their rows, sign and scale kept ✓")
+
+    def test_a_binary_numeric_parameter_refuses_malformed_and_special_values(self):
+        """A malformed binary NUMERIC is 22P02 and a NaN is 0A000, both with no BindComplete."""
+        w = self.wire
+        w.parse("bin_bad", f"SELECT id FROM {DB}.{DECIMAL_TABLE} WHERE price = $1")
+        w.sync()
+        self.assert_no_error(w.read_until_ready(), "Parse of the malformed-bind statement")
+
+        # The header promises five digit groups, the body carries one.
+        w.bind_raw_params("bin_bad_p", "bin_bad",
+                          [(1, struct.pack("!hhhh", 5, 0, 0, 0) + struct.pack("!h", 5))])
+        w.sync()
+        messages = self.read_failed_pipeline(w)
+        self.assert_equal(kinds(messages), [ERROR_RESPONSE, READY_FOR_QUERY],
+                          "a length the digit count contradicts is refused at the Bind")
+        fields = error_fields(first(messages, ERROR_RESPONSE))
+        self.assert_equal(fields.get("C"), SQLSTATE_INVALID_TEXT_REPRESENTATION,
+                          "sqlstate of a malformed binary NUMERIC")
+
+        # NaN carries no decimal and binds as none.
+        w.bind_raw_params("bin_nan_p", "bin_bad",
+                          [(1, struct.pack("!hhHh", 0, 0, 0xC000, 0))])
+        w.sync()
+        messages = self.read_failed_pipeline(w)
+        fields = error_fields(first(messages, ERROR_RESPONSE))
+        self.assert_equal(fields.get("C"), SQLSTATE_FEATURE_NOT_SUPPORTED,
+                          "sqlstate of a NaN NUMERIC parameter")
+
+        # 12345678901.00 past DECIMAL(10, 2): the same 22003 as its text literal.
+        w.bind_raw_params("bin_big_p", "bin_bad",
+                          [(1, struct.pack("!hhhh", 3, 2, 0, 2) + struct.pack("!3h", 123, 4567, 8901))])
+        w.sync()
+        messages = self.read_failed_pipeline(w)
+        fields = error_fields(first(messages, ERROR_RESPONSE))
+        self.assert_equal(fields.get("C"), SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
+                          "sqlstate of a binary NUMERIC past the precision")
+        print("  malformed binary NUMERIC -> 22P02, NaN -> 0A000, past precision -> 22003, no BindComplete ✓")
+
+    def test_a_kept_set_binds_its_declared_parameter_as_text(self):
+        """A kept SET with a declared NUMERIC parameter: the literal binds as its own text and the SET completes."""
+        w = self.wire
+        w.parse("kept_setting", "SET application_name = 'wire-probe'", [OID_NUMERIC])
+        w.bind("", "kept_setting", ["2.5"])
+        w.execute("", 0)
+        w.sync()
+        messages = w.read_until_ready()
+        self.assert_no_error(messages, "Execute of a kept SET with a declared parameter")
+
+        # The frontend keeps the statement, so it has no engine types: the Bind
+        # takes the literal as its own text and the SET runs with the value its
+        # own text carries — the bound one is not consumed.
+        self.assert_equal(kinds(messages),
+                          [PARSE_COMPLETE, BIND_COMPLETE, COMMAND_COMPLETE, PARAMETER_STATUS, READY_FOR_QUERY],
+                          "the SET completes and the Sync reports its changed value")
+        self.assert_equal(command_tag(first(messages, COMMAND_COMPLETE)), "SET", "the SET completed")
+        name, value = first(messages, PARAMETER_STATUS).rstrip(b"\x00").split(b"\x00")
+        self.assert_equal(name, b"application_name", "the reported parameter")
+        self.assert_equal(value, b"wire-probe", "the SET took the value of its own text, not the bound literal")
+        print("  kept SET with a declared NUMERIC parameter: the literal binds as text, the SET completes ✓")
 
     def test_binary_result_format_is_reported_in_row_description(self):
         """Result format code 1 in Bind: RowDescription says 1 for every column."""
@@ -1000,6 +1391,14 @@ class PgExtendedProtocolTest:
             self.setup()
             self.test_execute_row_limit_suspends_the_portal()
             self.test_describe_statement_reports_parameter_oids()
+            self.test_describe_statement_of_an_undeclared_parameter_carries_the_engine_oid()
+            self.test_a_bare_placeholder_in_the_select_list_is_indeterminate_datatype()
+            self.test_a_bare_placeholder_served_when_the_client_declares_its_type()
+            self.test_a_select_list_parameter_inside_an_expression_is_served()
+            self.test_a_binary_numeric_parameter_binds_as_its_exact_decimal()
+            self.test_a_binary_numeric_parameter_refuses_malformed_and_special_values()
+            self.test_describe_of_an_untypable_parameter_is_indeterminate_datatype()
+            self.test_a_parameter_in_two_typed_contexts_is_ambiguous()
             self.test_describe_statement_expands_a_star_before_bind()
             self.test_describe_portal_describes_the_executed_result()
             self.test_describe_portal_of_a_dml_does_not_execute_it()
@@ -1007,6 +1406,11 @@ class PgExtendedProtocolTest:
             self.test_describe_of_a_parameterized_join_is_the_executed_shape()
             self.test_named_statement_executes_twice_and_after_a_failure()
             self.test_bind_rejects_a_literal_the_type_cannot_hold()
+            self.test_decimal_parameter_binds_under_its_declared_numeric_oid()
+            self.test_decimal_parameter_binds_without_a_declared_type()
+            self.test_decimal_parameter_refuses_a_value_past_the_precision()
+            self.test_numeric_literal_refused_for_an_integer_parameter()
+            self.test_a_kept_set_binds_its_declared_parameter_as_text()
             self.test_binary_result_format_is_reported_in_row_description()
             self.test_hugeint_column_is_carried_as_numeric_in_text_and_refused_in_binary()
             self.test_unsupported_column_type_is_an_error_not_a_disconnect()

@@ -5,6 +5,7 @@ set(POSTGRES_SERVER_HEADERS
     packet/packet_reader.hpp
     packet/packet_writer.hpp
     packet/packet_utils.hpp
+    connection/bare_select_parameter.hpp
     connection/deallocate_statement.hpp
     connection/postgres_connection.hpp
     connection/pipeline_state.hpp
@@ -18,6 +19,7 @@ set(POSTGRES_SERVER_SOURCES
      packet/packet_reader.cpp
      packet/packet_writer.cpp
      packet/packet_utils.cpp
+     connection/bare_select_parameter.cpp
      connection/deallocate_statement.cpp
      connection/packet_processing.cpp
      connection/postgres_connection.cpp

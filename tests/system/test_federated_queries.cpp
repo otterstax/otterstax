@@ -706,6 +706,106 @@ TEST_CASE("federated names: a table the backend got after startup is registered 
     CHECK(f.nothing_sent());
 }
 
+TEST_CASE("federated queries: HAVING with a scalar sub-query reads the sub-query first") {
+    federated_t f("otterstax_fq_having_subquery");
+    for (const auto& d : {pg_dialect, my_dialect}) {
+        INFO("connection " << d.alias);
+        const auto avg = backend_sql(d, R"(SELECT AVG("amount") AS "avg" FROM {T};)");
+        f.answer(d.alias, avg, {column("avg", logical_type::DOUBLE)}, {{20.0}});
+        const auto sum_type = d.quote == '"' ? "float8" : "DOUBLE";
+        const auto grouped = backend_sql(d,
+                                         "SELECT \"customer\" FROM {T} GROUP BY \"customer\" HAVING "
+                                         "CAST(SUM(\"amount\") AS " +
+                                             std::string{sum_type} + ") > 20;");
+        f.answer(d.alias, grouped, {text("customer")}, {{s("ann")}});
+        CHECK(f.rows(query(d,
+                           "SELECT {a}.{n}.orders.customer FROM {a}.{n}.orders GROUP BY {a}.{n}.orders.customer "
+                           "HAVING sum(amount) > (SELECT avg(amount) FROM {a}.{n}.orders);")) == rows_t{"ann"});
+        CHECK(f.sent(d.alias) == std::vector<std::string>{avg, grouped});
+    }
+}
+
+TEST_CASE("federated queries: LIMIT inside an IN sub-query rides the sub-query's own statement") {
+    federated_t f("otterstax_fq_in_limit");
+    for (const auto& d : {pg_dialect, my_dialect}) {
+        INFO("connection " << d.alias);
+        const auto limited = backend_sql(d, R"(SELECT "customer" FROM {T} LIMIT 1;)");
+        f.answer(d.alias, limited, {text("customer")}, {{s("ann")}});
+        CHECK(f.rows(query(d,
+                           "SELECT name FROM loc.cust WHERE name IN (SELECT customer FROM "
+                           "{a}.{n}.orders LIMIT 1);")) == rows_t{"ann"});
+        CHECK(f.sent(d.alias) == std::vector<std::string>{limited});
+    }
+}
+
+TEST_CASE("federated queries: GROUP BY and DISTINCT inside an IN sub-query ride its push") {
+    federated_t f("otterstax_fq_in_shapes");
+    for (const auto& d : {pg_dialect, my_dialect}) {
+        INFO("connection " << d.alias);
+        const auto grouped = backend_sql(d, R"(SELECT "customer" FROM {T} GROUP BY "customer";)");
+        f.answer(d.alias, grouped, {text("customer")}, {{s("ann")}, {s("bob")}});
+        CHECK(sorted(f.rows(query(d,
+                                  "SELECT name FROM loc.cust WHERE name IN (SELECT customer FROM "
+                                  "{a}.{n}.orders GROUP BY customer);"))) == rows_t{"ann", "bob"});
+        CHECK(f.sent(d.alias) == std::vector<std::string>{grouped});
+
+        const auto distinct = backend_sql(d, R"(SELECT DISTINCT "customer" FROM {T};)");
+        f.answer(d.alias, distinct, {text("customer")}, {{s("ann")}, {s("bob")}});
+        CHECK(sorted(f.rows(query(d,
+                                  "SELECT name FROM loc.cust WHERE name IN (SELECT DISTINCT customer FROM "
+                                  "{a}.{n}.orders);"))) == rows_t{"ann", "bob"});
+        CHECK(f.sent(d.alias) == std::vector<std::string>{distinct});
+    }
+}
+
+TEST_CASE("federated queries: a CTE over the local namesake table JOINed with a connection's table") {
+    federated_t f("otterstax_fq_cte_namesake");
+    // The local side of the G1 rules: the schema `my` names on its backend, as a local database.
+    for (const char* sql : {"CREATE DATABASE shop;",
+                            "CREATE TABLE shop.orders (id bigint, customer string, amount bigint);",
+                            "INSERT INTO shop.orders (id, customer, amount) VALUES (42, 'loc', 1);"}) {
+        f.ok(sql);
+    }
+    // The CTE reads the local table, the remote side its plain scan, the JOIN itself the engine's.
+    CHECK(f.rows("WITH x AS (SELECT id FROM shop.orders) SELECT x.id, m.id FROM x JOIN my.shop.orders m "
+                 "ON x.id = m.id + 41;") == rows_t{"42|1"});
+    CHECK(f.sent("my") == std::vector<std::string>{"SELECT `id` FROM `shop`.`orders`;"});
+    CHECK(f.sent("pg") == std::vector<std::string>{});
+    CHECK(f.sent("pgb") == std::vector<std::string>{});
+}
+
+TEST_CASE("federated queries: a CTE over one connection JOINed with another connection reads both sides") {
+    federated_t f("otterstax_fq_cte_two_servers");
+    // The CTE block is pushed whole to its connection, the other side its plain scan; a JOIN of
+    // two connections is offered to neither as one statement.
+    const auto pushed = backend_sql(pg_dialect, R"(SELECT "d0"."id" FROM (SELECT "id" AS "id" FROM {T}) AS "d0";)");
+    CHECK(sorted(f.rows("WITH x AS (SELECT id FROM pg.public.orders) SELECT m.id FROM x JOIN my.shop.orders m "
+                        "ON x.id = m.id;")) == rows_t{"1", "2", "3"});
+    CHECK(f.sent("pg") == std::vector<std::string>{pushed});
+    CHECK(f.sent("my") == std::vector<std::string>{backend_sql(my_dialect, R"(SELECT "id" FROM {T};)")});
+}
+
+TEST_CASE("federated queries: WITH RECURSIVE over a remote table iterates in the engine") {
+    federated_t f("otterstax_fq_recursive_cte");
+    // The anchor is the backend's one read of the table; the fixpoint iterations and the count
+    // are the engine's: ids 1, 2, 3 breed 1, 2 then 1 again before the filter empties.
+    CHECK(f.rows("WITH RECURSIVE r AS (SELECT id FROM pg.public.orders UNION ALL SELECT id - 1 FROM r "
+                 "WHERE id > 1) SELECT count(*) FROM r;") == rows_t{"6"});
+    CHECK(f.sent("pg") == std::vector<std::string>{backend_sql(pg_dialect, R"(SELECT "id" FROM {T};)")});
+    CHECK(f.sent("my") == std::vector<std::string>{});
+}
+
+TEST_CASE("federated queries: a CTE inside an IN sub-query pushes as the derived table it is") {
+    federated_t f("otterstax_fq_cte_in_subquery");
+    // The WITH lowers inside the sub-query: its body is the derived table pushed to the connection.
+    const auto pushed =
+        backend_sql(pg_dialect, R"(SELECT "d0"."customer" FROM (SELECT "customer" AS "customer" FROM {T}) AS "d0";)");
+    CHECK(sorted(f.rows("SELECT name FROM loc.cust WHERE name IN (WITH y AS (SELECT customer FROM "
+                        "pg.public.orders) SELECT customer FROM y);")) == rows_t{"ann", "bob"});
+    CHECK(f.sent("pg") == std::vector<std::string>{pushed});
+    CHECK(f.sent("my") == std::vector<std::string>{});
+}
+
 // ─── Savepoints over a remote write ─────────────────────────────────────────
 
 TEST_CASE("federated savepoints: ROLLBACK TO is the backend's ROLLBACK TO the level's savepoint") {

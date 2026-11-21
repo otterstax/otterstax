@@ -12,6 +12,7 @@ Covers:
   - MySQL + ClickHouse JOINs
   - PostgreSQL + ClickHouse JOINs
   - MySQL + PostgreSQL + ClickHouse triple JOINs
+  - triple JOINs in reverse order and SELECT * over same-named keys
 """
 
 import sys
@@ -39,6 +40,31 @@ def run_query(cfg, query):
         cur = conn.cursor()
         cur.execute(query)
         return cur.fetchall()
+    finally:
+        conn.close()
+
+
+def run_exec(cfg, query):
+    """A statement with no result set (DDL / INSERT): remote DDL runs only in
+    autocommit, so it takes its own autocommit connection."""
+    conn = psycopg2.connect(**cfg)
+    conn.autocommit = True
+    try:
+        cur = conn.cursor()
+        cur.execute(query)
+    finally:
+        conn.close()
+
+
+def run_query_columns(cfg, query):
+    """A SELECT read together with its column names (a JOIN's SELECT * carries
+    each side's key, so names repeat)."""
+    conn = psycopg2.connect(**cfg)
+    conn.autocommit = True
+    try:
+        cur = conn.cursor()
+        cur.execute(query)
+        return [d[0] for d in cur.description], cur.fetchall()
     finally:
         conn.close()
 
@@ -168,6 +194,60 @@ def test_triple_join(cfg):
     print(f"\n✅ Triple Backend JOIN Tests PASSED")
 
 
+def test_triple_join_shapes(cfg):
+    print(f"\n{'='*70}")
+    print("Cross-Backend Triple JOIN Shapes — Same-Named Keys (PG wire)")
+    print(f"{'='*70}")
+
+    # One table per backend, every key spelled the same: the chain
+    # triple_a ⋈ triple_b ⋈ triple_c keeps exactly the ids (10, 12) — every
+    # table also holds a row an INNER JOIN drops (a4, b11, b13, c102).
+    drops = []
+    try:
+        run_exec(cfg, "CREATE TABLE campaigns.db1.triple_a (id int, name string)")
+        drops.append("DROP TABLE campaigns.db1.triple_a")
+        run_exec(cfg, "CREATE TABLE products.public.triple_b (id int, a_id int)")
+        drops.append("DROP TABLE products.public.triple_b")
+        run_exec(cfg, "CREATE TABLE chtest.chdb.triple_c (id int, b_id int)")
+        drops.append("DROP TABLE chtest.chdb.triple_c")
+        run_exec(cfg, "INSERT INTO campaigns.db1.triple_a (id, name) VALUES "
+                      "(1, 'alpha'), (2, 'beta'), (3, 'gamma'), (4, 'delta')")
+        run_exec(cfg, "INSERT INTO products.public.triple_b (id, a_id) VALUES "
+                      "(10, 1), (11, 1), (12, 2), (13, 3)")
+        run_exec(cfg, "INSERT INTO chtest.chdb.triple_c (id, b_id) VALUES "
+                      "(100, 10), (101, 12), (102, 99)")
+
+
+        print("\n-- Test 2: the same three tables joined in the reversed order")
+        rows = run_query(cfg, """
+            SELECT products.public.triple_b.id
+            FROM chtest.chdb.triple_c
+            INNER JOIN products.public.triple_b ON chtest.chdb.triple_c.b_id = products.public.triple_b.id
+            INNER JOIN campaigns.db1.triple_a ON products.public.triple_b.a_id = campaigns.db1.triple_a.id
+        """)
+        assert sorted(rows) == [(10,), (12,)], \
+            f"reversed triple JOIN returned {sorted(rows)}, expected [(10,), (12,)]"
+        print(f"  ✓ {len(rows)} rows, exactly ids 10 and 12")
+
+        print("\n-- Test 3: SELECT * over the three sources: every side's key, exact row count")
+        columns, rows = run_query_columns(cfg, """
+            SELECT *
+            FROM campaigns.db1.triple_a
+            INNER JOIN products.public.triple_b ON campaigns.db1.triple_a.id = products.public.triple_b.a_id
+            INNER JOIN chtest.chdb.triple_c ON products.public.triple_b.id = chtest.chdb.triple_c.b_id
+        """)
+        assert columns == ["id", "name", "id", "a_id", "id", "b_id"], \
+            f"SELECT * carried columns {columns}, expected ['id', 'name', 'id', 'a_id', 'id', 'b_id']"
+        assert len(rows) == 2, f"SELECT * returned {len(rows)} rows, expected 2"
+        print(f"  ✓ columns {columns}, {len(rows)} rows")
+
+    finally:
+        for statement in reversed(drops):
+            run_exec(cfg, statement)
+
+    print(f"\n✅ Triple JOIN Shape Tests PASSED")
+
+
 def main_test():
     parser = argparse.ArgumentParser(description='Cross-backend query tests via PostgreSQL wire')
     parser.add_argument('--local', action='store_true',
@@ -181,6 +261,7 @@ def main_test():
         test_mysql_ch_joins(cfg)
         test_pg_ch_joins(cfg)
         test_triple_join(cfg)
+        test_triple_join_shapes(cfg)
 
         print("\n" + "=" * 70)
         print("\033[92m✅ ALL TESTS PASSED - Cross-Backend Queries (PostgreSQL wire)\033[0m")

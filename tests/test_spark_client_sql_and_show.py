@@ -16,6 +16,7 @@ run-once checks; cleanup() drops them.
 Cases:
   test_sql_derived_table_mysql — spark.sql(<derived table over campaigns>).collect() = the rows filtered in Python
   test_sql_derived_table_pg    — spark.sql(<GROUP BY derived table over products>).collect() = the sums added in Python
+  test_sql_subquery_mysql      — spark.sql(<sub-query over campaigns>).collect() = the rows filtered in Python
   test_sql_count               — spark.sql("SELECT ...").count() = the statement's row count
   test_sql_ddl_runs_once       — collect() on the DataFrames of CREATE SCHEMA / CREATE TABLE does not run them again
   test_sql_insert_runs_once    — collect(), twice, on the DataFrame of an INSERT leaves the one row it inserted
@@ -56,6 +57,8 @@ MYSQL_DERIVED = (f"SELECT d.campaign_id, d.budget FROM "
 PG_DERIVED = (f"SELECT d.campaign_id, d.total FROM "
               f"(SELECT campaign_id, SUM(price) AS total FROM {PRODUCTS} GROUP BY campaign_id) d "
               f"WHERE d.total > 800.005")
+MYSQL_SUBQUERY = (f"SELECT campaign_id, campaign_name FROM {CAMPAIGNS} WHERE campaign_id <= 25 "
+                  f"AND campaign_id IN (SELECT campaign_id FROM {CAMPAIGNS} WHERE budget > 50000)")
 
 SHOW_TABLE = "show_items"
 SHOW_COLUMNS = ("id", "name")
@@ -93,6 +96,12 @@ class SparkSqlAndShowTest:
         """MYSQL_DERIVED's rows, filtered in Python from the plain table."""
         rows = self.spark.sql(f"SELECT campaign_id, budget FROM {CAMPAIGNS}").collect()
         return sorted((r["campaign_id"], r["budget"]) for r in rows
+                      if r["budget"] > 50000 and r["campaign_id"] <= 25), len(rows)
+
+    def mysql_subquery_expected(self):
+        """MYSQL_SUBQUERY's rows, filtered in Python from the plain table."""
+        rows = self.spark.sql(f"SELECT campaign_id, campaign_name, budget FROM {CAMPAIGNS}").collect()
+        return sorted((r["campaign_id"], r["campaign_name"]) for r in rows
                       if r["budget"] > 50000 and r["campaign_id"] <= 25), len(rows)
 
     def pg_derived_expected(self):
@@ -210,6 +219,15 @@ class SparkSqlAndShowTest:
             raise AssertionError(f"{PG_DERIVED} kept {len(got)} of {campaigns} campaigns; it does not discriminate")
         print(f"  ✅ GROUP BY derived table over products: {len(got)} of {campaigns} campaigns, as summed in Python")
 
+    def test_sql_subquery_mysql(self):
+        """spark.sql() over a sub-query of campaigns returns the rows the plain table gives when filtered in Python."""
+        expected, total = self.mysql_subquery_expected()
+        got = sorted((r["campaign_id"], r["campaign_name"]) for r in self.spark.sql(MYSQL_SUBQUERY).collect())
+        self.assert_equal(got, expected, f"rows of {MYSQL_SUBQUERY}")
+        if not 0 < len(got) < total:
+            raise AssertionError(f"{MYSQL_SUBQUERY} kept {len(got)} of {total} rows; it does not discriminate")
+        print(f"  ✅ sub-query over campaigns: {len(got)} of {total} rows, as filtered in Python")
+
     def test_sql_count(self):
         """spark.sql("SELECT ...").count() is the number of rows the statement returns."""
         expected, _ = self.mysql_derived_expected()
@@ -265,6 +283,7 @@ class SparkSqlAndShowTest:
             self.setup()
             self.test_sql_derived_table_mysql()
             self.test_sql_derived_table_pg()
+            self.test_sql_subquery_mysql()
             self.test_sql_count()
             self.test_sql_ddl_runs_once()
             self.test_sql_insert_runs_once()

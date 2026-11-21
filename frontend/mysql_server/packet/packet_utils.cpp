@@ -81,6 +81,8 @@ namespace frontend::mysql {
             case mysql_error::ER_SEQUENCE_ERROR:
             case mysql_error::ER_QUERY_TIMEOUT:
             case mysql_error::ER_PROTOCOL_ERROR:
+            case mysql_error::ER_PARAM_NOT_A_DECIMAL:
+            case mysql_error::ER_PARAM_PAST_PRECISION:
                 sql_state = sql_state::GENERAL_ERROR;
                 break;
         }

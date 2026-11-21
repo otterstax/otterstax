@@ -3,6 +3,7 @@
 
 #include "postgres_connection.hpp"
 
+#include "bare_select_parameter.hpp"
 #include "utility/tracy_memory_resource.hpp"
 #include "utility/tracy_profiler.hpp"
 
@@ -374,8 +375,27 @@ namespace frontend::postgres {
                     return sql_state::INVALID_SQL_STATAMENT_NAME;
                 case core::error_code_t::no_active_sql_transaction:
                     return sql_state::NO_ACTIVE_SQL_TRANSACTION;
+                case core::error_code_t::indeterminate_datatype:
+                    return sql_state::INDETERMINATE_DATATYPE;
+                case core::error_code_t::ambiguous_parameter:
+                    return sql_state::AMBIGUOUS_PARAMETER;
                 default:
                     return nullptr;
+            }
+        }
+
+        // The SQLSTATE of a Bind the frontend refuses: the parse's own codes,
+        // else the literal's 22P02.
+        const char* sqlstate_of_bind_refusal(core::error_code_t code) {
+            switch (code) {
+                case core::error_code_t::unimplemented_yet:
+                    return sql_state::FEATURE_NOT_SUPPORTED;
+                case core::error_code_t::numeric_value_out_of_range:
+                    return sql_state::NUMERIC_VALUE_OUT_OF_RANGE;
+                case core::error_code_t::datatype_mismatch:
+                    return sql_state::DATATYPE_MISMATCH;
+                default:
+                    return sql_state::INVALID_TEXT_REPRESENTATION;
             }
         }
 
@@ -923,26 +943,40 @@ namespace frontend::postgres {
                                     " parameter(s), the statement has " + std::to_string(result.parameter_count));
             co_return;
         }
+        // A parameter that is only a select-list column has no type: 42P18
+        // unless the client declared one, as PostgreSQL refuses the Parse.
+        if (declared.size() < static_cast<size_t>(result.parameter_count)) {
+            const auto bare = bare_select_parameter(resource_, query);
+            if (bare && (*bare > static_cast<int>(declared.size()) || !declared[*bare - 1].has_value())) {
+                co_await close_session_statement(id);
+                send_error_response(sql_state::INDETERMINATE_DATATYPE,
+                                    "could not determine data type of parameter $" + std::to_string(*bare));
+                co_return;
+            }
+        }
         // The client's type, else the engine's, else text.
-        std::pmr::vector<field_type> parameter_types(resource_);
-        parameter_types.reserve(result.parameter_count);
+        std::pmr::vector<field_type> specified_types(resource_);
+        specified_types.reserve(result.parameter_count);
         for (size_t i = 0; i < result.parameter_count; ++i) {
             if (i < declared.size() && declared[i]) {
-                parameter_types.push_back(*declared[i]);
+                specified_types.push_back(*declared[i]);
                 continue;
             }
             std::optional<field_type> engine;
-            if (i < result.parameter_types.size()) {
-                engine = get_field_type(result.parameter_types[i].type());
+            if (i < result.engine_types.size()) {
+                engine = get_field_type(result.engine_types[i].type());
             }
-            parameter_types.push_back(engine.value_or(field_type::TEXT));
+            specified_types.push_back(engine.value_or(field_type::TEXT));
         }
 
         // statements with identical name replace each other, together with their portals
         co_await do_close(describe_close_arg::STATEMENT, stmt);
         statement_run_t run(resource_, id, query, std::move(result.schema), result.tag);
         run.resets_client_parameters = setting.has_value(); // RESET ALL
-        prepared_stmt_meta meta(std::move(run), result.parameter_count, std::move(parameter_types));
+        prepared_stmt_meta meta(std::move(run),
+                                result.parameter_count,
+                                std::move(specified_types),
+                                std::move(result.engine_types));
         meta.transaction_exit = result.transaction == otterstax::session::transaction_command_t::commit ||
                                 result.transaction == otterstax::session::transaction_command_t::rollback ||
                                 result.transaction == otterstax::session::transaction_command_t::rollback_to;
@@ -1020,13 +1054,13 @@ namespace frontend::postgres {
                     for (int j = 0; j < len; str[j++] = static_cast<char>(reader.read_uint8()))
                         ;
 
-                    auto parsed = parse_text_parameter(resource_, type, std::move(str));
+                    const components::types::complex_logical_type* engine_type =
+                        i < statement.engine_types.size() ? &statement.engine_types[i] : nullptr;
+                    auto parsed = parse_text_parameter(resource_, type, engine_type, std::move(str));
                     if (parsed.has_error()) {
                         // The portal is incomplete: nothing may follow the error, in
                         // particular no BindComplete.
-                        send_error_response(parsed.error().type == core::error_code_t::unimplemented_yet
-                                                ? sql_state::FEATURE_NOT_SUPPORTED
-                                                : sql_state::INVALID_TEXT_REPRESENTATION,
+                        send_error_response(sqlstate_of_bind_refusal(parsed.error().type),
                                             std::string{parsed.error().what.c_str()});
                         co_return;
                     }
@@ -1079,6 +1113,25 @@ namespace frontend::postgres {
                         }
                         uint64_t raw = reader.read_uint64();
                         params.push_back(components::vector::make_scalar(resource_, std::bit_cast<double>(raw)));
+                        break;
+                    }
+                    case field_type::NUMERIC: {
+                        std::string value(len, '\0');
+                        for (int j = 0; j < len; value[j++] = static_cast<char>(reader.read_uint8()))
+                            ;
+                        // The same contract as a NUMERIC literal: the engine's
+                        // type decides, the described DECIMAL bounds it.
+                        const components::types::complex_logical_type* engine_type =
+                            i < statement.engine_types.size() ? &statement.engine_types[i] : nullptr;
+                        auto parsed = parse_binary_numeric_parameter(resource_, engine_type, value);
+                        if (parsed.has_error()) {
+                            // The portal is incomplete: nothing may follow the error, in
+                            // particular no BindComplete.
+                            send_error_response(sqlstate_of_bind_refusal(parsed.error().type),
+                                                std::string{parsed.error().what.c_str()});
+                            co_return;
+                        }
+                        params.emplace_back(std::move(parsed.value()));
                         break;
                     }
                     case field_type::TEXT: {

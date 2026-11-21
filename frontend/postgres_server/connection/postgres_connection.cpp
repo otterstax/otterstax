@@ -75,6 +75,16 @@ namespace frontend::postgres {
         , show(other.show)
         , resets_client_parameters(other.resets_client_parameters) {}
 
+    postgres_connection::prepared_stmt_meta::prepared_stmt_meta(
+        statement_run_t run,
+        uint32_t parameter_count,
+        std::pmr::vector<field_type> specified_types,
+        std::pmr::vector<components::types::complex_logical_type> engine_types)
+        : run(std::move(run))
+        , parameter_count(parameter_count)
+        , specified_types(std::move(specified_types))
+        , engine_types(std::move(engine_types)) {}
+
     postgres_connection::prepared_stmt_meta::prepared_stmt_meta(statement_run_t run,
                                                                 uint32_t parameter_count,
                                                                 std::pmr::vector<field_type> specified_types)
@@ -558,7 +568,8 @@ namespace frontend::postgres {
             send_packet(build_error_response(writer_, sqlstate, std::move(message), severity, std::move(hint)));
         } else {
             std::vector<std::vector<uint8_t>> response;
-            response.emplace_back(build_error_response(writer_, sqlstate, std::move(message), severity, std::move(hint)));
+            response.emplace_back(
+                build_error_response(writer_, sqlstate, std::move(message), severity, std::move(hint)));
             append_ready_for_query(response);
             send_packet_merged(std::move(response));
         }

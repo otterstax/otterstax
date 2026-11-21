@@ -5,9 +5,11 @@
 
 #include "../protocol/lexer.hpp"
 
+#include "../../common/utils.hpp"
 #include "utility/tracy_memory_resource.hpp"
 #include "utility/tracy_profiler.hpp"
 
+#include <components/casts/kernels/string_cast.hpp>
 #include <components/vector/vector_builders.hpp>
 
 using namespace components;
@@ -15,6 +17,8 @@ using namespace components;
 namespace {
     // see https://dev.mysql.com/doc/dev/mysql-server/9.5.0/page_protocol_binary_resultset.html
     constexpr size_t null_bitmap_size(size_t column_count) { return (column_count + 7) / 8; }
+
+    namespace decimal_parse = components::casts::kernels::detail;
 } // namespace
 
 namespace frontend::mysql {
@@ -207,8 +211,11 @@ namespace frontend::mysql {
                                num_params);
 
                     if (num_params != 0) {
-                        param_values =
-                            handle_execute_params(stmt_id, num_params, it_stmt->second.param_types, std::move(reader));
+                        param_values = handle_execute_params(stmt_id,
+                                                             num_params,
+                                                             it_stmt->second.param_wire_types,
+                                                             it_stmt->second.engine_types,
+                                                             std::move(reader));
                         if (param_values.empty()) {
                             co_return; // refused
                         }
@@ -624,8 +631,12 @@ namespace frontend::mysql {
             packets.push_back(
                 build_stmt_prepare_ok(writer_, sequence_id_++, next_statement_id_, column_cnt, result.parameter_count));
             // The session keeps the statement (`?` already written as `$n`) for
-            // every COM_STMT_EXECUTE until COM_STMT_CLOSE.
-            statement_id_map_.emplace(next_statement_id_++, prepared_stmt_meta(resource_, id, result.parameter_count));
+            // every COM_STMT_EXECUTE until COM_STMT_CLOSE, with the describe's
+            // parameter types: the engine type of every `$n` a decimal bind
+            // reads.
+            prepared_stmt_meta meta(resource_, id, result.parameter_count);
+            meta.engine_types = std::move(result.engine_types);
+            statement_id_map_.emplace(next_statement_id_++, std::move(meta));
 
             // params
             if (result.parameter_count) {
@@ -687,6 +698,9 @@ namespace frontend::mysql {
         packets.reserve(4 + column_cnt + parameter_count);
         packets.push_back(
             build_stmt_prepare_ok(writer_, sequence_id_++, next_statement_id_, column_cnt, parameter_count));
+        // `engine_types` stays empty: no engine describe answers a protocol
+        // statement, and every value bound to one rides as the string it came
+        // as.
         prepared_stmt_meta meta(resource_, session_->next_statement(), parameter_count);
         meta.protocol = std::move(statement); // nothing in the session to close or execute
         statement_id_map_.emplace(next_statement_id_++, std::move(meta));
@@ -738,11 +752,12 @@ namespace frontend::mysql {
         }
     }
 
-    std::pmr::vector<components::vector::vector_t>
-    mysql_connection::handle_execute_params(uint32_t stmt_id,
-                                            size_t num_params,
-                                            std::pmr::vector<uint16_t>& param_types,
-                                            packet_reader&& reader) {
+    std::pmr::vector<components::vector::vector_t> mysql_connection::handle_execute_params(
+        uint32_t stmt_id,
+        size_t num_params,
+        std::pmr::vector<uint16_t>& param_wire_types,
+        const std::pmr::vector<components::types::complex_logical_type>& engine_types,
+        packet_reader&& reader) {
         std::vector<uint8_t> null_bitmap(null_bitmap_size(num_params));
         for (auto& b : null_bitmap) {
             b = reader.read_uint8();
@@ -752,26 +767,26 @@ namespace frontend::mysql {
         // todo: identify session type (if possible)
         uint8_t new_params_bound_flag = reader.read_uint8();
         if (new_params_bound_flag) {
-            param_types.clear();
-            param_types.reserve(num_params);
+            param_wire_types.clear();
+            param_wire_types.reserve(num_params);
             for (size_t i = 0; i < num_params; ++i) {
                 uint16_t t = reader.read_uint16();
-                param_types.push_back(t);
+                param_wire_types.push_back(t);
             }
         }
 
         // Checked before the types are used: a type read past the end is 0
         // (MYSQL_TYPE_DECIMAL), which would be refused as unsupported instead.
         if (!reader.ok()) {
-            param_types.clear();
+            param_wire_types.clear();
             send_malformed_packet_error("Malformed COM_STMT_EXECUTE packet: parameter types");
             return {};
         }
 
-        if (param_types.size() != num_params) {
+        if (param_wire_types.size() != num_params) {
             send_error(mysql_error::ER_UNKNOWN_STMT_HANDLER,
                        "Missing parameter types for statement with id=" + std::to_string(stmt_id) + ": " +
-                           std::to_string(param_types.size()) + " parameters passed out of " +
+                           std::to_string(param_wire_types.size()) + " parameters passed out of " +
                            std::to_string(num_params));
             return {};
         }
@@ -787,7 +802,7 @@ namespace frontend::mysql {
                 continue;
             }
 
-            uint16_t raw_type = param_types[i];
+            uint16_t raw_type = param_wire_types[i];
             uint8_t type = raw_type & 0xFF;
             bool is_unsigned = (raw_type & 0x8000) != 0;
             switch (static_cast<field_type>(type)) {
@@ -842,6 +857,56 @@ namespace frontend::mysql {
                 case field_type::MYSQL_TYPE_BLOB: {
                     std::string s = reader.read_length_encoded_string();
                     param_values.push_back(components::vector::make_scalar(resource_, std::string_view{s}));
+                    break;
+                }
+                case field_type::MYSQL_TYPE_DECIMAL:
+                case field_type::MYSQL_TYPE_NEWDECIMAL: {
+                    // 246 rides as the length-encoded string MySQL prints a decimal
+                    // with — type 0, the pre-5.0 DECIMAL, the same (COM_STMT_EXECUTE:
+                    // https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_com_stmt_execute.html).
+                    std::string s = reader.read_length_encoded_string();
+                    // A value cut short by the packet's end is no data: the
+                    // malformed-packet refusal, before any reading of it.
+                    if (!reader.ok()) {
+                        send_malformed_packet_error("Malformed COM_STMT_EXECUTE packet: parameter values");
+                        return {};
+                    }
+                    const types::complex_logical_type* engine_type =
+                        i < engine_types.size() ? &engine_types[i] : nullptr;
+                    if (engine_type == nullptr || engine_type->type() == types::logical_type::STRING_LITERAL ||
+                        engine_type->type() == types::logical_type::NA) {
+                        param_values.push_back(components::vector::make_scalar(resource_, std::string_view{s}));
+                        break;
+                    }
+                    if (engine_type->type() != types::logical_type::DECIMAL) {
+                        send_error(mysql_error::ER_SYNTAX_ERROR,
+                                   "parameter " + std::to_string(i + 1) + " takes a value of type " +
+                                       std::string(logical_type_name(engine_type->type())) + ", not a decimal");
+                        return {};
+                    }
+                    const auto* decimal = engine_type->extension_as<types::decimal_logical_type_extension>();
+                    types::int128_t unscaled = 0;
+                    if (const auto outcome =
+                            decimal_parse::parse_decimal(s, decimal->width(), decimal->scale(), &unscaled);
+                        outcome != decimal_parse::parse_outcome::parsed) {
+                        const auto expected = "DECIMAL(" + std::to_string(decimal->width()) + ", " +
+                                              std::to_string(decimal->scale()) + ")";
+                        if (outcome == decimal_parse::parse_outcome::out_of_range) {
+                            send_error(mysql_error::ER_PARAM_PAST_PRECISION,
+                                       "value for parameter " + std::to_string(i + 1) + " is past the precision of " +
+                                           expected);
+                        } else {
+                            send_error(mysql_error::ER_PARAM_NOT_A_DECIMAL,
+                                       "incorrect decimal value for parameter " + std::to_string(i + 1) + ", " +
+                                           expected + " expected");
+                        }
+                        return {};
+                    }
+                    // The described type carries a name (the column's); a bound
+                    // value's type keeps none, as parse_decimal_parameter keeps none.
+                    auto bound = *engine_type;
+                    bound.set_alias(std::string{});
+                    param_values.push_back(components::vector::make_decimal(resource_, bound, unscaled));
                     break;
                 }
                 default:

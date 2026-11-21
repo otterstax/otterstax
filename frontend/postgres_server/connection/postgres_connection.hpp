@@ -86,6 +86,11 @@ namespace frontend::postgres {
         struct prepared_stmt_meta {
             prepared_stmt_meta(statement_run_t run,
                                uint32_t parameter_count,
+                               std::pmr::vector<field_type> specified_types,
+                               std::pmr::vector<components::types::complex_logical_type> engine_types);
+            // A Parse the frontend keeps itself: no engine types.
+            prepared_stmt_meta(statement_run_t run,
+                               uint32_t parameter_count,
                                std::pmr::vector<field_type> specified_types);
 
             statement_run_t run;
@@ -93,6 +98,9 @@ namespace frontend::postgres {
             // The type each `$n` is bound by: the client's (Parse), else the
             // engine's (the describe's parameter types), else text.
             std::pmr::vector<field_type> specified_types;
+            // The engine's type of each `$n` from the describe: what a NUMERIC
+            // literal binds as. Empty for a statement the frontend keeps.
+            std::pmr::vector<components::types::complex_logical_type> engine_types;
             // Describe(statement) already gave the client a RowDescription.
             bool described{false};
             // COMMIT / ROLLBACK / ROLLBACK TO (the describe's transaction

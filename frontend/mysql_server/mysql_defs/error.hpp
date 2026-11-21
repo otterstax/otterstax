@@ -33,6 +33,13 @@ namespace frontend::mysql {
         ER_TABLE_EXISTS_ERROR = 1050,       // Table already exists
         ER_UNKNOWN_TABLE = 1109,            // Unknown table
         ER_SYNTAX_ERROR = 1149,             // Syntax error
+        // A NEWDECIMAL (246) parameter the bind refuses: the text no decimal
+        // reads (1265), a value past the column's precision (1366). The names
+        // are ours — MySQL's own constants of similar names sit at other
+        // numbers (1265 WARN_DATA_TRUNCATED, 1292 ER_TRUNCATED_WRONG_VALUE,
+        // 1366 ER_INCORRECT_VALUE, 1406 ER_DATA_TOO_LONG).
+        ER_PARAM_NOT_A_DECIMAL = 1265,
+        ER_PARAM_PAST_PRECISION = 1366,
         ER_EMPTY_QUERY = 1065,              // Query was empty
         ER_UNKNOWN_STMT_HANDLER = 1243,     // Unknown prepared statement handler
         ER_NOT_SUPPORTED_YET = 1235,        // A result column type the wire cannot encode

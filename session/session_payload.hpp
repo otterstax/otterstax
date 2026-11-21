@@ -57,7 +57,7 @@ namespace otterstax::session {
 // (query_session_t::transaction_status()).
 //
 // A prepare answers `schema` (a STRUCT of the result columns, NA for a
-// statement without rows) and `parameter_types`, the engine's type of each
+// statement without rows) and `engine_types`, the engine's type of each
 // `$n` (cursor_t::parameter_types(), `$<i+1>` at i). A statement run under a
 // window (query_session_t::execute_window / fetch_window) answers `portal`, the
 // engine's portal while more rows may follow (`has_more`), 0 once it ended.
@@ -68,7 +68,7 @@ struct session_payload {
     NodeTag tag;
     size_t affected_rows{0};
     otterstax::session::transaction_command_t transaction{otterstax::session::transaction_command_t::none};
-    std::pmr::vector<components::types::complex_logical_type> parameter_types;
+    std::pmr::vector<components::types::complex_logical_type> engine_types;
     std::uint64_t portal{0};
     bool has_more{false};
     // What an executed statement that succeeded did to the engine session's
@@ -93,7 +93,7 @@ struct session_payload {
         , chunks(resource)
         , parameter_count(0)
         , tag(NodeTag::T_Null)
-        , parameter_types(resource) {
+        , engine_types(resource) {
         chunks.emplace_back(resource, std::pmr::vector<components::types::complex_logical_type>{resource}, 0);
     }
 
@@ -107,7 +107,7 @@ struct session_payload {
         , parameter_count(parameter_count)
         , tag(tag)
         , affected_rows(affected_rows)
-        , parameter_types(this->chunks.get_allocator()) {
+        , engine_types(this->chunks.get_allocator()) {
         // `this->`, not `chunks`: the parameter shadows the member here and has
         // already been moved from. The producer contract is one empty chunk for
         // an empty result, never no chunks.

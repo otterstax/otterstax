@@ -1092,7 +1092,7 @@ namespace otterstax::session {
             schema = types::complex_logical_type::create_struct("", cursor->type_data());
         }
         session_payload payload{std::move(schema), std::move(chunks), parameter_count, tag};
-        payload.parameter_types.assign(cursor->parameter_types().begin(), cursor->parameter_types().end());
+        payload.engine_types.assign(cursor->parameter_types().begin(), cursor->parameter_types().end());
         co_return std::move(payload);
     }
 

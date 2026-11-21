@@ -46,7 +46,11 @@ namespace frontend::mysql {
             // it for every COM_STMT_EXECUTE until COM_STMT_CLOSE.
             otterstax::session::statement_id_t stmt_session;
             uint32_t parameter_count;
-            std::pmr::vector<uint16_t> param_types;
+            std::pmr::vector<uint16_t> param_wire_types;
+            // The prepare's describe of the engine type of every `$n`
+            // (`$<i+1>` at i); a decimal bind reads its (p, s) here. Empty for
+            // a protocol statement: every bound value rides as its string.
+            std::pmr::vector<components::types::complex_logical_type> engine_types;
             // A protocol statement (SELECT @@x, SET @@x = ?, SHOW VARIABLES, ...)
             // prepared by a driver: answered by the frontend at every
             // COM_STMT_EXECUTE as COM_QUERY answers it, never stored in the
@@ -165,11 +169,14 @@ namespace frontend::mysql {
         // parameters are not read.
         boost::asio::awaitable<void> execute_protocol_statement(protocol_statement_t statement);
 
-        // The COM_STMT_EXECUTE values, `$<i+1>` at i, each a one-row vector.
+        // The COM_STMT_EXECUTE values, `$<i+1>` at i, each a one-row vector;
+        // `engine_types` the prepare's described engine type of each `$n`
+        // (empty for a protocol statement). Empty on a refusal it answered.
         std::pmr::vector<components::vector::vector_t>
         handle_execute_params(uint32_t stmt_id,
                               size_t num_params,
-                              std::pmr::vector<uint16_t>& param_types,
+                              std::pmr::vector<uint16_t>& param_wire_types,
+                              const std::pmr::vector<components::types::complex_logical_type>& engine_types,
                               packet_reader&& reader);
         // Drops an unexecuted statement in the session; a failure is logged only.
         boost::asio::awaitable<void> close_stmt_in_session(otterstax::session::statement_id_t stmt_session,

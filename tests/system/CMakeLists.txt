@@ -44,6 +44,7 @@ set(${PROJECT_NAME}_SOURCES
     test_federated_queries.cpp
     test_connection_names.cpp
     test_registration_scope.cpp
+    test_prepared_types.cpp
 )
 
 add_executable(${PROJECT_NAME} ${${PROJECT_NAME}_SOURCES})

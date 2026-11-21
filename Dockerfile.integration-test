@@ -55,6 +55,7 @@ RUN pip install --no-cache-dir \
     mysql-connector-python \
     "psycopg[binary]" \
     psycopg2-binary \
+    asyncpg \
     clickhouse-driver \
     tabulate \
     faker \
@@ -71,8 +72,8 @@ COPY --from=goharness /out/flightsql_go /usr/local/bin/flightsql_go
 # run. Subdirectories (scripts/, system/, unit/, s3/, mock/, mysql-front/)
 # are intentionally excluded by the *.py glob — except the FlightSQL e2e suite
 # and its Go harness, which docker-run-tests.sh runs via pytest / the binary.
-COPY ./tests/scripts .
-COPY ./tests/*.py .
+COPY ./tests/scripts ./
+COPY ./tests/*.py ./
 COPY ./tests/flightsql_e2e ./flightsql_e2e
 COPY ./tests/flightsql_go ./flightsql_go
 # The .proto the python stubs regenerate from (the same source the server

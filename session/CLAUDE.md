@@ -24,7 +24,7 @@ of it.
 | `query_session.{hpp,cpp}` | The actor, `session_services_t` (everything it sends to) and `make_session_services` (builds it, refusing an empty address), `parameter_row`, `session_ptr` / `session_closer_t`; `command_payload` (a statement that ran without rows — CREATE EXTERNAL TABLE / COPY ... TO, Kafka — under its tag) and `rows_payload` (an engine cursor) anonymous in the `.cpp` |
 | `session_factory.{hpp,cpp}` | `session_factory_t`: opens sessions and holds the ones that exist (`add` / `forget` / `reap` private, `forget` called by the session as it frees itself); its destructor is the sessions' shutdown (drain, `runtime_t::stop_sessions`, reap) |
 | `plan_inspection.{hpp,cpp}` | Pure plan readers: extension root, `transaction_command`, `place_namespace_ddl` (a client's CREATE / DROP DATABASE / SCHEMA into local, or refused), `write_target` (the relation or schema a DDL / DML changes, as written), `setting_changes`, `savepoint_name`, `is_query` (what COPY exports), `statement_names` (every table name as written, for the registration of a missed table) |
-| `session_payload.hpp` | `transaction_command_t`; `session_payload`: schema, chunks, `parameter_count` / `parameter_types`, tag, `affected_rows`, `transaction`, `portal` / `has_more`, `setting_changes`, `savepoint`; `reported_rows()` |
+| `session_payload.hpp` | `transaction_command_t`; `session_payload`: schema, chunks, `parameter_count` / `engine_types`, tag, `affected_rows`, `transaction`, `portal` / `has_more`, `setting_changes`, `savepoint`; `reported_rows()` |
 | `session_ids.hpp` | `statement_id_t` (a strong id), `to_hash` |
 
 ## The actor
@@ -366,7 +366,7 @@ on `engine_session_`, through `on_engine`): the engine analyzes it as a run
 would and answers right after — nothing planned for execution, no backend
 reached (a remote table's columns are its catalog's). The payload is the result
 columns as a STRUCT (NA for a statement without rows), the engine's type of every
-`$n` (`parameter_types`) and the parameter count; the result types are the
+`$n` (`engine_types`) and the parameter count; the result types are the
 engine's (count(*) UBIGINT, an integer sum BIGINT, avg DOUBLE), the types an
 execution answers. RETURNING, sub-queries and set operations are the engine's
 describe too. `describe_bound` describes with the client's values bound (a `$n`

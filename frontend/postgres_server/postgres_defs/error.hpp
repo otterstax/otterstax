@@ -57,6 +57,7 @@ namespace frontend::postgres::sql_state {
     inline constexpr const char* UNDEFINED_TABLE = "42P01";
     inline constexpr const char* UNDEFINED_PARAMETER = "42P02";
     inline constexpr const char* INDETERMINATE_DATATYPE = "42P18";
+    inline constexpr const char* AMBIGUOUS_PARAMETER = "42P08";
     inline constexpr const char* DUPLICATE_TABLE = "42P07";
     inline constexpr const char* DUPLICATE_COLUMN = "42701";
     inline constexpr const char* AMBIGUOUS_COLUMN = "42702";

@@ -129,8 +129,8 @@ TEST_CASE("session prepared: every execute binds its own values") {
         REQUIRE_FALSE(prepared.has_error());
         REQUIRE(prepared.value().parameter_count == 1);
         // The engine types the parameter by its context.
-        REQUIRE(prepared.value().parameter_types.size() == 1);
-        CHECK(prepared.value().parameter_types[0].type() == components::types::logical_type::BIGINT);
+        REQUIRE(prepared.value().engine_types.size() == 1);
+        CHECK(prepared.value().engine_types[0].type() == components::types::logical_type::BIGINT);
 
         for (std::int64_t key : {2, 3, 1}) {
             auto executed = execute_session_prepared(s, stmt, one_parameter(s, key));

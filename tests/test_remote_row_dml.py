@@ -287,6 +287,23 @@ class RemoteRowDmlTest:
                           "the copied rows are on the backend")
         print("  INSERT ... SELECT from a local table into PostgreSQL ✓")
 
+    # ── cross-backend DML ─────────────────────────────────────────────────────
+    def test_pg_update_with_a_subquery_over_another_backend(self):
+        """UPDATE PostgreSQL rows selected by a MariaDB subquery changes exactly those rows."""
+        self.reset_mariadb("rowdml_keyed", KEYED_ROWS)
+        self.reset_postgres("rowdml_keyed", KEYED_ROWS)
+        self.assert_equal(self.pg_count(f"UPDATE {PG_KEYED} SET qty = 9 WHERE id IN (SELECT id FROM {MYSQL_KEYED} WHERE grp = 'a')"), 3)
+        self.assert_equal(self.postgres_rows("rowdml_keyed"), [(1, "a", 9), (2, "a", 9), (3, "b", 5), (4, "a", 9)])
+        self.assert_equal(self.mariadb_rows("rowdml_keyed"), KEYED_ROWS)
+
+    def test_pg_delete_with_a_subquery_over_another_backend(self):
+        """DELETE PostgreSQL rows selected by a MariaDB subquery removes exactly those rows."""
+        self.reset_mariadb("rowdml_keyed", KEYED_ROWS)
+        self.reset_postgres("rowdml_keyed", KEYED_ROWS)
+        self.assert_equal(self.pg_count(f"DELETE FROM {PG_KEYED} WHERE id IN (SELECT id FROM {MYSQL_KEYED} WHERE grp = 'b')"), 1)
+        self.assert_equal(self.postgres_rows("rowdml_keyed"), [(1, "a", 5), (2, "a", 5), (4, "a", 7)])
+        self.assert_equal(self.mariadb_rows("rowdml_keyed"), KEYED_ROWS)
+
     # ── ClickHouse ──────────────────────────────────────────────────────────
     def test_clickhouse_write_with_a_local_subquery_deletes_the_rows_it_picks(self):
         """ClickHouse: a DELETE whose WHERE reads a local table deletes exactly the orders the sub-query picks."""
@@ -366,6 +383,8 @@ class RemoteRowDmlTest:
             self.test_pg_write_with_a_local_subquery_changes_the_rows_it_picks()
             self.test_pg_update_returning_answers_the_written_rows()
             self.test_insert_select_from_a_local_table()
+            self.test_pg_update_with_a_subquery_over_another_backend()
+            self.test_pg_delete_with_a_subquery_over_another_backend()
             self.test_clickhouse_write_with_a_local_subquery_deletes_the_rows_it_picks()
             self.test_clickhouse_write_inside_a_block_is_refused()
             self.test_pg_remote_write_inside_a_block_follows_rollback_and_commit()

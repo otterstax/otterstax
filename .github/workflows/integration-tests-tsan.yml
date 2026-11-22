@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+  packages: read
+
 jobs:
   integration-tests-tsan:
     runs-on: ubuntu-latest
@@ -24,6 +28,13 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      - name: Dependency image
+        id: deps
+        uses: ./.github/actions/deps-image
+        with:
+          variant: tsan
+          token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Build test image with TSAN
         uses: docker/build-push-action@v5
         with:
@@ -33,6 +44,7 @@ jobs:
           load: true
           tags: otterstax_app:ci-tsan-${{ github.sha }}
           build-args: |
+            DEPS_IMAGE=${{ steps.deps.outputs.image }}
             BUILD_TYPE=Release
             ENABLE_TSAN=ON
             TSAN_DEPS=true

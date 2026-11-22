@@ -1,0 +1,124 @@
+# The dependency images: Ubuntu, the build tools, conan and every conan package
+# of conanfile.py already built in conan's cache. Dockerfile and Dockerfile.test
+# start FROM one of them (ARG DEPS_IMAGE) and compile only OtterStax.
+#
+#   target release — every package, plain (-s compiler.cppstd=gnu20)
+#   target asan    — FROM release + the packages asan-deps.profile instruments
+#                    (grpc, abseil, protobuf, re2, otterbrix)
+#   target tsan    — FROM release + the packages tsan-deps.profile instruments
+#                    (the same, actor-zeta and librdkafka), built with g++-12
+#
+# The sanitizer targets start from the release one: a package the profile does
+# not touch has the same conan package id there, so it is taken from the cache
+# and only the instrumented ones are compiled.
+#
+# Published as ghcr.io/otterstax/otterstax-deps[-asan|-tsan]:<tag>, the tag a
+# hash of the files this image is made of (scripts/deps-image.sh). Locally:
+#   ./scripts/deps-image.sh release      # pull or build, tag otterstax-deps:local
+#
+# RELEASE_IMAGE is what asan / tsan start from: the `release` stage of this file
+# by default, a published image when CI passes its reference.
+ARG RELEASE_IMAGE=release
+
+FROM ubuntu:22.04 AS release
+
+ENV TZ=America/US
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONFAULTHANDLER=1
+
+RUN apt update && \
+    apt upgrade -y && \
+    apt install -y \
+        build-essential \
+        ninja-build \
+        git \
+        pkg-config \
+        libdbus-1-dev \
+        python3-pip \
+        python3-venv \
+        python3-dev curl gnupg apt-transport-https \
+        zlib1g libgflags2.2 libgflags-dev \
+        libssl-dev bison flex tzdata && \
+    apt clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# cmake.org answers 403 to conan's HTTP client, so the conancenter cmake binary
+# recipe cannot be fetched; the pip-installed cmake is declared as the platform
+# tool_requires of the build profile instead (it satisfies the recipes' <4 range).
+RUN pip3 install --no-cache-dir conan==2.21.0 'cmake<4.0' && \
+     conan profile detect --force && \
+     printf '\n[platform_tool_requires]\ncmake/%s\n' "$(cmake --version | head -1 | awk '{print $3}')" \
+         >> "$(conan profile path default)" && \
+     conan remote add otterbrix https://conan.otterbrix.com
+
+RUN rm /bin/sh && ln -s /bin/bash /bin/sh
+
+# Run conan install from the project root so self.source_folder=/app and
+# cmake_layout places generators + libs at build/Release/ — matching the
+# devcontainer preset layout exactly.
+WORKDIR /app
+COPY conanfile.py tsan-deps.profile asan-deps.profile ./
+COPY cmake/conan-hooks/hook_librdkafka_c11threads_off.py ./conan-hooks/
+
+# The jobs of conan's from-source builds (tools.build:jobs): otterbrix needs
+# ~1.5-2 GB per job — see CLAUDE.md "Build resources". Always
+# min(nproc, MemTotal_MB / 1536) of the build VM: not a build argument, so a
+# different job count never invalidates this layer.
+# A recipe's source download (github.com) can meet a run of 504s (CI): retry
+# 10 times, 15 s apart (tools.files.download, default 2 x 5 s).
+RUN _mem_jobs=$(( $(awk '/^MemTotal:/ {print int($2/1024)}' /proc/meminfo) / 1536 )) && \
+    if [ "$_mem_jobs" -lt 1 ]; then _mem_jobs=1; fi && \
+    _jobs=$(( $(nproc) < _mem_jobs ? $(nproc) : _mem_jobs )) && \
+    echo "conan from-source build jobs: ${_jobs}" && \
+    conan install conanfile.py --build missing \
+        -c "tools.build:jobs=${_jobs}" \
+        -c tools.files.download:retry=10 -c tools.files.download:retry_wait=15 \
+        -s build_type=Release \
+        -s compiler.cppstd=gnu20
+
+# ASAN: gRPC with abseil / protobuf / re2, and otterbrix (whose library embeds
+# and exports abseil + re2), rebuilt with -fsanitize=address. Their headers
+# change layouts under ASAN (gpr_mu's leak_checker, abseil's swisstable
+# generations), so an ENABLE_ASAN=ON build over the plain packages hands them
+# the wrong field addresses. protoc / grpc_cpp_plugin come from a plain
+# build-context grpc / protobuf, so nothing instrumented runs at build time.
+FROM ${RELEASE_IMAGE} AS asan
+
+RUN _mem_jobs=$(( $(awk '/^MemTotal:/ {print int($2/1024)}' /proc/meminfo) / 1536 )) && \
+    if [ "$_mem_jobs" -lt 1 ]; then _mem_jobs=1; fi && \
+    _jobs=$(( $(nproc) < _mem_jobs ? $(nproc) : _mem_jobs )) && \
+    echo "conan from-source build jobs: ${_jobs}" && \
+    conan install conanfile.py --build missing \
+        -c "tools.build:jobs=${_jobs}" \
+        -c tools.files.download:retry=10 -c tools.files.download:retry_wait=15 \
+        --build="otterbrix/*" \
+        -pr:h ./asan-deps.profile -pr:b default \
+        -s build_type=Release \
+        -s compiler.cppstd=gnu20
+
+# TSAN: otterbrix + actor-zeta, librdkafka and gRPC with abseil / protobuf / re2
+# rebuilt with -fsanitize=thread: without it the libraries' atomics are
+# invisible to TSAN and the sanitizer job has no diagnostic power. All
+# TSAN-instrumented code (these and otterstax alike) is built with g++-12:
+# gcc-11's libtsan misses the pthread_cond_clockwait interceptor
+# (google/sanitizers#1259), yielding false "double lock" reports on every
+# condition_variable::wait_for, and one process must link a single libtsan.
+FROM ${RELEASE_IMAGE} AS tsan
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends g++-12 && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+RUN _mem_jobs=$(( $(awk '/^MemTotal:/ {print int($2/1024)}' /proc/meminfo) / 1536 )) && \
+    if [ "$_mem_jobs" -lt 1 ]; then _mem_jobs=1; fi && \
+    _jobs=$(( $(nproc) < _mem_jobs ? $(nproc) : _mem_jobs )) && \
+    echo "conan from-source build jobs: ${_jobs}" && \
+    mkdir -p /root/.conan2/extensions/hooks && \
+    cp ./conan-hooks/hook_librdkafka_c11threads_off.py /root/.conan2/extensions/hooks/ && \
+    conan install conanfile.py --build missing \
+        -c "tools.build:jobs=${_jobs}" \
+        -c tools.files.download:retry=10 -c tools.files.download:retry_wait=15 \
+        --build="otterbrix/*" --build="actor-zeta/*" --build="librdkafka/*" \
+        -pr:h ./tsan-deps.profile \
+        -s build_type=Release \
+        -s compiler.cppstd=gnu20

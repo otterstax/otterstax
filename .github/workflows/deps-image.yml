@@ -1,0 +1,113 @@
+name: Dependency images
+
+# Dockerfile.deps: Ubuntu, the build tools and every conan package of
+# conanfile.py, prebuilt, in three variants:
+#   ghcr.io/otterstax/otterstax-deps:<tag>        plain
+#   ghcr.io/otterstax/otterstax-deps-asan:<tag>   + the ASAN-instrumented packages
+#   ghcr.io/otterstax/otterstax-deps-tsan:<tag>   + the TSAN-instrumented packages
+# The tag is a hash of the files the image is made of (scripts/deps-image.sh),
+# so an image is built once per state of conanfile.py and the profiles: a run
+# that finds its image published only checks that and ends. The other workflows
+# wait for the image (.github/actions/deps-image) and start FROM it.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.ref.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image reference
+        id: ref
+        run: |
+          image="$(./scripts/deps-image.sh --ref release)"
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+          if docker manifest inspect "$image" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "${image} is published"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "${image} is not published: building"
+          fi
+
+      - name: Set up Docker Buildx
+        if: steps.ref.outputs.exists == 'false'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        if: steps.ref.outputs.exists == 'false'
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.deps
+          target: release
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.ref.outputs.image }}
+
+  sanitizer:
+    needs: release
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [asan, tsan]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image reference
+        id: ref
+        run: |
+          image="$(./scripts/deps-image.sh --ref ${{ matrix.variant }})"
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+          if docker manifest inspect "$image" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "${image} is published"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "${image} is not published: building"
+          fi
+
+      - name: Set up Docker Buildx
+        if: steps.ref.outputs.exists == 'false'
+        uses: docker/setup-buildx-action@v3
+
+      # FROM the published plain image: only the packages the profile
+      # instruments are compiled.
+      - name: Build and push
+        if: steps.ref.outputs.exists == 'false'
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.deps
+          target: ${{ matrix.variant }}
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            RELEASE_IMAGE=${{ needs.release.outputs.image }}
+          tags: ${{ steps.ref.outputs.image }}

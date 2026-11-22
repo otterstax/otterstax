@@ -118,6 +118,10 @@ services:
       args:
         WITH_TRACY: ${WITH_TRACY:-false}
         BUILD_JOBS: ${BUILD_JOBS:-0}
+        # The dependency image of the variant (scripts/deps-image.sh), which
+        # docker-run-tests.sh resolves; otterstax-deps:local is what one run of
+        # that script leaves behind.
+        DEPS_IMAGE: ${DEPS_IMAGE:-otterstax-deps:local}
         # ENABLE_ASAN=ON ./docker-run-tests.sh: the ASAN image, its
         # dependencies instrumented too (asan-deps.profile)
         ENABLE_ASAN: ${ENABLE_ASAN:-OFF}

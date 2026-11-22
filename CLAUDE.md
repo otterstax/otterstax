@@ -135,8 +135,8 @@ stopped, actors and agents destroyed) → runtime → FinalizeS3.
 ## Build Commands
 
 ```bash
-# Conan deps (if conanfile.py changed, remove ./build first). As the images build it (Dockerfile:
-# cppstd 20, Dockerfile.test: gnu20), every package at the one standard: an abseil built at cppstd 17
+# Conan deps (if conanfile.py changed, remove ./build first). Every package at the one standard
+# (the images build them at gnu20, Dockerfile.deps): an abseil built at cppstd 17
 # has no operator<=> on absl::int128, which otterbrix's core/date/date_types.hpp:143 compares with.
 conan install conanfile.py --build missing -s build_type=Release -s compiler.cppstd=20
 
@@ -193,7 +193,8 @@ default seccomp refuses, so the image's `ctest` step cannot pass inside `docker 
 Silicon (CI builds it on amd64). On arm64 build without it and run the tests in a container:
 
 ```bash
-docker build -f Dockerfile.test --build-arg TSAN_DEPS=true --build-arg ENABLE_TSAN=ON \
+docker build -f Dockerfile.test --build-arg DEPS_IMAGE="$(./scripts/deps-image.sh tsan)" \
+  --build-arg TSAN_DEPS=true --build-arg ENABLE_TSAN=ON \
   --build-arg RUN_TESTS=false --build-arg BUILD_JOBS=<JOBS> -t otterstax-tsan .
 docker run --rm --security-opt seccomp=unconfined -w /app/build/Release otterstax-tsan \
   ctest -C Release --output-on-failure --timeout 120
@@ -227,8 +228,38 @@ cmake -S . -B build/asan-deps -DENABLE_ASAN=ON -DBUILD_TESTS=ON -DCMAKE_BUILD_TY
 
 Cap the jobs (see **Build resources**).
 
+### Dependency images (`Dockerfile.deps`)
+
+`Dockerfile` and `Dockerfile.test` compile only OtterStax: they start `FROM ${DEPS_IMAGE}`, an
+image that already holds the system packages, conan and every conan package of `conanfile.py`
+(`-s compiler.cppstd=gnu20`). Three variants, three packages on ghcr.io:
+
+| Variant | Image | Holds |
+|---|---|---|
+| `release` | `ghcr.io/otterstax/otterstax-deps:<tag>` | every package, plain |
+| `asan` | `ghcr.io/otterstax/otterstax-deps-asan:<tag>` | `release` + the 5 packages `asan-deps.profile` instruments |
+| `tsan` | `ghcr.io/otterstax/otterstax-deps-tsan:<tag>` | `release` + the 7 packages `tsan-deps.profile` instruments, g++-12 |
+
+- The sanitizer images are built `FROM` the release one: a package its profile does not touch has
+  the same conan package id, so it is taken from the cache (44 of 49 under ASAN, 42 under TSAN).
+- `<tag>` is a hash of `Dockerfile.deps`, `conanfile.py`, the two profiles and the librdkafka conan
+  hook (`scripts/deps-image.sh --tag`): a change of any names a new image, anything else reuses
+  the published one.
+- `./scripts/deps-image.sh [release|asan|tsan]` puts the image into the local store and prints its
+  reference: pulled on amd64, built here otherwise (the registry holds `linux/amd64` only — on an
+  arm64 Mac the first run compiles every dependency, once for both Dockerfiles). It also tags
+  `<name>:local`, the default `DEPS_IMAGE`, so a bare `docker build` / `docker compose build` works
+  afterwards. `docker-run-tests.sh` and the benchmark scripts call it themselves.
+- Both Dockerfiles still run `conan install`: over the image it only writes the generators; a
+  package the image lacks (a `conanfile.py` newer than the image, Tracy) is built there.
+- CI: the `Dependency images` workflow publishes the images of a commit's tag (a run whose images
+  exist ends at once); every other workflow waits for its image (`.github/actions/deps-image`)
+  and passes it as `DEPS_IMAGE`. A pull request from a fork cannot publish: it works while it
+  leaves the tag's files alone.
+
 ```bash
 ./docker-run-tests.sh -j <JOBS>                     # integration suite + PySpark client matrix
+./scripts/deps-image.sh release                     # once: the dependency image, tagged otterstax-deps:local
 docker build -f Dockerfile.test --build-arg BUILD_JOBS=<JOBS> -t otterstax-test .   # unit tests in the image
 python3 fixtures/generate_data.py && docker compose up   # full stack for manual testing
 ./benchmark/scripts/run_benchmark.sh --repetitions 5

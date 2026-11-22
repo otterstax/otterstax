@@ -204,6 +204,7 @@ any refusal of the config.
 
 ```bash
 python3 fixtures/generate_data.py  # test data
+./scripts/deps-image.sh release    # once: the image with the prebuilt dependencies
 docker compose up                  # databases + server; connections from scripts/database/config.yaml
 ```
 

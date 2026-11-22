@@ -1,42 +1,21 @@
-FROM ubuntu:22.04 AS builder
-
-ENV TZ=America/US
-ENV DEBIAN_FRONTEND=noninteractive
-ENV PYTHONFAULTHANDLER=1
+# The system packages, conan and every conan package come prebuilt in the
+# dependency image (Dockerfile.deps, target release): this file compiles only
+# OtterStax. `./scripts/deps-image.sh release` pulls or builds it and tags it
+# otterstax-deps:local; CI passes the published reference.
+ARG DEPS_IMAGE=otterstax-deps:local
+FROM ${DEPS_IMAGE} AS builder
 
 ARG WITH_TRACY=false
-# Parallel jobs for the conan from-source builds (tools.build:jobs) and the
-# otterstax build. otterbrix needs ~1.5-2 GB per job — see CLAUDE.md
+# Parallel jobs for the otterstax build and for any conan package the
+# dependency image lacks. otterbrix needs ~1.5-2 GB per job — see CLAUDE.md
 # "Build resources" before raising it. 0 = min(nproc, MemTotal_MB / 1536).
 ARG BUILD_JOBS=5
 
-RUN apt update && \
-    apt upgrade -y && \
-    apt install -y \
-        build-essential \
-        ninja-build \
-        python3-pip \
-        python3-venv \
-        python3-dev curl gnupg apt-transport-https \
-        zlib1g libgflags2.2 libgflags-dev \
-        libssl-dev bison flex tzdata && \
-    apt clean && \
-    rm -rf /var/lib/apt/lists/*
-
-# cmake.org answers 403 to conan's HTTP client, so the conancenter cmake binary
-# recipe cannot be fetched; the pip-installed cmake is declared as the platform
-# tool_requires of the build profile instead (it satisfies the recipes' <4 range).
-RUN pip3 install --no-cache-dir conan==2.21.0 'cmake<4.0' && \
-     conan profile detect --force && \
-     printf '\n[platform_tool_requires]\ncmake/%s\n' "$(cmake --version | head -1 | awk '{print $3}')" \
-         >> "$(conan profile path default)" && \
-     conan remote add otterbrix https://conan.otterbrix.com
-
-RUN rm /bin/sh && ln -s /bin/bash /bin/sh
-
 # Run conan install from the project root so self.source_folder=/app and
 # cmake_layout places generators + libs at build/Release/ — matching the
-# devcontainer preset layout exactly.
+# devcontainer preset layout exactly. Over the dependency image every package
+# is already in conan's cache, so this only writes the generators; a package the
+# image lacks (conanfile.py changed since it was built, Tracy) is built here.
 WORKDIR /app
 COPY conanfile.py .
 # A recipe's source download (github.com) can meet a run of 504s (CI): retry
@@ -53,12 +32,12 @@ RUN _jobs="${BUILD_JOBS}" && \
     if [ "$WITH_TRACY" = "true" ]; then \
         conan install conanfile.py --build missing "${_jobs_conf[@]}" \
             -s build_type=Release \
-            -s compiler.cppstd=20 \
+            -s compiler.cppstd=gnu20 \
             -o "&:with_tracy=True"; \
     else \
         conan install conanfile.py --build missing "${_jobs_conf[@]}" \
             -s build_type=Release \
-            -s compiler.cppstd=20; \
+            -s compiler.cppstd=gnu20; \
     fi
 
 # Build tracy-capture CLI (headless, no GUI deps) when Tracy is enabled

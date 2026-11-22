@@ -90,7 +90,8 @@ namespace sql_gen {
         // caller for its source table.
         bool validated{true};
         // UPDATE / DELETE: ` RETURNING <target.all_columns>` (every column of each changed row, the
-        // declared order) is appended. PostgreSQL only; unimplemented_yet elsewhere.
+        // declared order) is appended. PostgreSQL and MySQL (the backend answers what it does not
+        // have: MySQL, a MariaDB UPDATE); unimplemented_yet on ClickHouse.
         bool returning{false};
     };
 
@@ -149,8 +150,8 @@ namespace sql_gen {
 
     // The rows of an INSERT into a remote table: INSERT INTO <table> (<columns>) VALUES (...), ...
     // — `columns[i]` (backend spelling) receives column `column_indexes[i]` of `rows`. `rows` must
-    // hold a row and a column. `returning_columns` not empty: ` RETURNING <them>` (PostgreSQL only,
-    // unimplemented_yet elsewhere).
+    // hold a row and a column. `returning_columns` not empty: ` RETURNING <them>` (PostgreSQL, MySQL —
+    // MariaDB answers it, MySQL refuses it itself —; unimplemented_yet on ClickHouse).
     core::result_wrapper_t<std::string> generate_insert_rows(backend_type_t backend,
                                                              const qualified_name_t& table,
                                                              std::span<const std::string> columns,

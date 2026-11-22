@@ -3,6 +3,7 @@
 
 #include "registration.hpp"
 
+#include "host_functions.hpp"
 #include "otterbrix/federation/metadata.hpp"
 #include "utility/logger.hpp"
 #include "utility/tracy_profiler.hpp"
@@ -61,6 +62,16 @@ namespace otterstax::catalog {
                 default:
                     return 0;
             }
+        }
+
+        fed::oid_t oid_at(const components::vector::vector_t& column, std::uint64_t row) {
+            if (column.is_null(row)) {
+                return fed::oid_t{};
+            }
+            if (column.type().type() == logical_type::OID) {
+                return column.get_value<fed::oid_t>(row);
+            }
+            return fed::oid_t{static_cast<std::uint32_t>(integer_at(column, row))};
         }
 
         std::string text_at(const components::vector::vector_t& column, std::uint64_t row) {
@@ -319,7 +330,8 @@ namespace otterstax::catalog {
     core::error_t register_connections(std::pmr::memory_resource* resource,
                                        const engine_calls_t& engine,
                                        const components::session::session_id_t& session,
-                                       std::span<const connection_discovery_t> connections) {
+                                       std::span<const connection_discovery_t> connections,
+                                       std::string_view time_zone) {
         OTX_ZONE_N("catalog::register_connections");
         auto log = get_logger(logger_tag::BACKENDS);
         // The actor of a connection by its name in otterbrix (folded).
@@ -383,9 +395,37 @@ namespace otterstax::catalog {
             err.contains_error()) {
             return err;
         }
+        // The host's functions (version()) into local.public: the process's code, registered at every start. One
+        // this process already registered (a second register_connections), or a name the engine has, is there
+        // (duplicate_function); a local.public a client dropped leaves them out, with a warning — never a refused
+        // start.
+        for (auto& node : host_function_registrations(resource)) {
+            auto err = run(plan_of(resource, std::move(node)), "register the host's functions");
+            if (!err.contains_error() || err.type == core::error_code_t::duplicate_function) {
+                continue;
+            }
+            if (err.type == core::error_code_t::schema_not_exists) {
+                if (log.is_valid()) {
+                    log->warn("{}: the host's functions are left out", err.what.c_str());
+                }
+                continue;
+            }
+            return err;
+        }
         // A session has no place until its client names one (client_place): a fresh session reads ''.
         if (auto unplaced = read("ALTER SYSTEM SET search_path = '';"); unplaced.has_error()) {
             return unplaced.error();
+        }
+        // The server's time zone is config.yaml's, whatever the engine kept from an earlier start.
+        std::string zone_literal;
+        for (const char c : time_zone) {
+            zone_literal.push_back(c);
+            if (c == '\'') {
+                zone_literal.push_back(c);
+            }
+        }
+        if (auto zoned = read("ALTER SYSTEM SET timezone = '" + zone_literal + "';"); zoned.has_error()) {
+            return zoned.error();
         }
         // The engine refuses a first part that is both a connection and a local database as ambiguous: such an
         // alias is refused here, before anything of it is registered.
@@ -408,7 +448,7 @@ namespace otterstax::catalog {
         }
         if (auto created =
                 read("CREATE TABLE IF NOT EXISTS " + names_table +
-                     " (table_oid BIGINT, attoid BIGINT, remote_name TEXT, remote_container TEXT, remote_type TEXT);");
+                     " (table_oid OID, attoid OID, remote_name TEXT, remote_container TEXT, remote_type TEXT);");
             created.has_error()) {
             return created.error();
         }
@@ -425,7 +465,7 @@ namespace otterstax::catalog {
                 for (const auto& discovery : connections) {
                     if (discovery.connection.actor != nullptr) { // a connection left out has none
                         discovery.connection.actor->set_names_table(
-                            static_cast<fed::oid_t>(integer_at(chunk.data[0], 0)));
+                            oid_at(chunk.data[0], 0));
                     }
                 }
             }
@@ -442,9 +482,9 @@ namespace otterstax::catalog {
         }
         for (const auto& chunk : names.value()->chunks()) {
             for (std::uint64_t row = 0; row < chunk.size(); ++row) {
-                const auto oid = static_cast<fed::oid_t>(integer_at(chunk.data[0], row));
-                const auto attoid = static_cast<fed::oid_t>(integer_at(chunk.data[1], row));
-                if (attoid == 0) {
+                const auto oid = oid_at(chunk.data[0], row);
+                const auto attoid = oid_at(chunk.data[1], row);
+                if (attoid == fed::oid_t{}) {
                     spelled_tables[oid] = {text_at(chunk.data[2], row), text_at(chunk.data[3], row)};
                 } else {
                     spelled_columns[{oid, attoid}] = {text_at(chunk.data[2], row), text_at(chunk.data[4], row)};
@@ -465,7 +505,7 @@ namespace otterstax::catalog {
             for (std::uint64_t row = 0; row < chunk.size(); ++row) {
                 catalog_table_t entry;
                 entry.connection = text_at(chunk.data[0], row);
-                entry.table.oid = static_cast<fed::oid_t>(integer_at(chunk.data[4], row));
+                entry.table.oid = oid_at(chunk.data[4], row);
                 entry.table.name = name_of(entry.connection,
                                            text_at(chunk.data[1], row),
                                            text_at(chunk.data[2], row),
@@ -486,17 +526,17 @@ namespace otterstax::catalog {
             }
             for (const auto& chunk : attributes.value()->chunks()) {
                 for (std::uint64_t row = 0; row < chunk.size(); ++row) {
-                    auto table = catalog.find(static_cast<fed::oid_t>(integer_at(chunk.data[0], row)));
+                    auto table = catalog.find(oid_at(chunk.data[0], row));
                     if (table == catalog.end() || flag_at(chunk.data[5], row)) {
                         continue;
                     }
                     fed::registered_column_t column;
-                    column.attoid = static_cast<fed::oid_t>(integer_at(chunk.data[1], row));
+                    column.attoid = oid_at(chunk.data[1], row);
                     column.name = text_at(chunk.data[2], row);
                     const auto spec = text_at(chunk.data[4], row);
                     if (spec.empty()) {
                         column.type = complex_logical_type{components::catalog::oid_to_builtin_type(
-                            static_cast<fed::oid_t>(integer_at(chunk.data[3], row)))};
+                            oid_at(chunk.data[3], row))};
                     } else {
                         auto decoded = components::catalog::decode_type_spec(resource, spec);
                         if (decoded.has_error()) {

@@ -72,7 +72,7 @@ namespace {
 
     constexpr std::array<item_column, 3> kColumns{{
         {"id", kInt4Oid, components::types::logical_type::INTEGER},
-        {"name", kVarcharOid, components::types::logical_type::STRING_LITERAL},
+        {"name", kVarcharOid, components::types::logical_type::TEXT},
         {"price", kFloat8Oid, components::types::logical_type::DOUBLE},
     }};
 

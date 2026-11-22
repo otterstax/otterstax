@@ -3,6 +3,8 @@
 
 #include "packet_writer.hpp"
 
+#include <utility>
+
 namespace frontend::mysql {
     void packet_writer::reserve_payload(size_t length) {
         packet_writer_base::reserve_payload(length, PACKET_HEADER_SIZE);
@@ -59,5 +61,49 @@ namespace frontend::mysql {
         payload_[3] = sequence_id;
 
         return extract_payload();
+    }
+
+    std::vector<std::vector<uint8_t>> packet_writer::build_from_payload_pieces() {
+        if (!is_reserved_) {
+            payload_.insert(payload_.begin(), PACKET_HEADER_SIZE, 0);
+            is_reserved_ = true;
+        }
+        const size_t payload_size = payload_.size() - PACKET_HEADER_SIZE;
+        if (payload_size < MAX_PACKET_SIZE) {
+            std::vector<std::vector<uint8_t>> one;
+            one.push_back(build_from_payload(0));
+            return one;
+        }
+
+        const uint32_t full_pieces = static_cast<uint32_t>(payload_size / MAX_PACKET_SIZE);
+        const uint32_t tail = static_cast<uint32_t>(payload_size % MAX_PACKET_SIZE);
+
+        const auto piece = [this](size_t offset, uint32_t length) {
+            const uint8_t head[PACKET_HEADER_SIZE] = {extract_nth_byte_le<0>(length),
+                                                      extract_nth_byte_le<1>(length),
+                                                      extract_nth_byte_le<2>(length),
+                                                      0}; // the caller stamps the pieces' sequence ids
+
+            std::vector<uint8_t> packet;
+            packet.reserve(PACKET_HEADER_SIZE + length);
+            packet.insert(packet.end(), head, head + PACKET_HEADER_SIZE);
+            packet.insert(packet.end(),
+                          payload_.begin() + static_cast<std::ptrdiff_t>(offset),
+                          payload_.begin() + static_cast<std::ptrdiff_t>(offset) + length);
+            return std::move(packet);
+        };
+
+        std::vector<std::vector<uint8_t>> packets;
+        packets.reserve(full_pieces + 1);
+
+        size_t offset = PACKET_HEADER_SIZE;
+        for (uint32_t i = 0; i < full_pieces; ++i) {
+            packets.push_back(piece(offset, MAX_PACKET_SIZE));
+            offset += MAX_PACKET_SIZE;
+        }
+        packets.push_back(piece(offset, tail));
+
+        std::ignore = extract_payload(); // the payload went out in pieces; reset the writer
+        return packets;
     }
 } // namespace frontend::mysql

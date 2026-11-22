@@ -75,6 +75,10 @@ silently in force. Error messages live on the `std::pmr::memory_resource*` passe
 - `config::ServiceConfig` — `{ FlightSqlConfig flight_sql; MysqlConfig mysql;
   PostgresConfig postgres; SparkConnectConfig spark_connect; EngineConfig engine;
   RuntimeConfig runtime; ConnectionRetryConfig connection_retry;
+  std::string timezone;   // service.timezone, default "UTC": the server's time zone — every session's TimeZone
+                          // until its client sets one, applied at every startup over what the engine kept
+                          // (ALTER SYSTEM SET timezone, catalog::register_connections); a zone the engine does
+                          // not name refuses the startup, an empty one the load (invalid_parameter)
   ConnectionsConfig connections; }`. The
   `flight_sql`/`mysql`/`postgres`/`spark_connect`/`engine`/`runtime`/`connection_retry`
   fields come from the top-level `service:` node; `connections` from the

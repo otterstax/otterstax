@@ -72,16 +72,16 @@ class OtterStax(ConanFile):
         self.requires("asio-grpc/3.7.0", transitive_headers=True)
         self.requires("aws-sdk-cpp/1.11.352", override=True)
         self.requires("abseil/20250127.0", override=True)
-        # otterbrix 1.0.0b2-rc-4 pins re2/20240702 while grpc 1.69 pins re2/20250722 —
+        # otterbrix 1.0.0b2-rc-7 pins re2/20240702 while grpc 1.69 pins re2/20250722 —
         # unify on grpc's (newer) pin; re2's API is stable across the two.
         self.requires("re2/20250722", override=True)
         self.requires("c-ares/1.34.6", override=True)
         self.requires("benchmark/1.6.1", transitive_headers=True)
         self.requires("zlib/1.3.1", transitive_headers=True)
         self.requires("bzip2/1.0.8", transitive_headers=True)
-        self.requires("otterbrix/1.0.0b2-rc-5#16618189f65c1b55a04b6b4057d696ee", transitive_headers=True)
+        self.requires("otterbrix/1.0.0b2-rc-7#01a9e7c6173c1b2f198da8efa2887499", transitive_headers=True)
         self.requires("magic_enum/0.8.1", transitive_headers=True)
-        self.requires("actor-zeta/2.0.0#887bc992cac0ead59e5bdf5c90c844f4", transitive_headers=True)
+        self.requires("actor-zeta/2.0.1#b72880c342fcff50f62cc8c16d460cd1", transitive_headers=True)
         self.requires("libpq/15.4", transitive_headers=True)
         self.requires("yaml-cpp/0.7.0", transitive_headers=True)
         self.requires("clickhouse-cpp/2.6.1", transitive_headers=True)

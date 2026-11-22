@@ -14,10 +14,6 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_L
     set(CMAKE_CXX_FLAGS "-fcoroutines")
 endif()
 
-# Project cmake modules (e.g. vendored otterbrix_parser_extension.cmake used by
-# the SQL grammar extensions under otterbrix/parser/grammar_extention/).
-list(APPEND CMAKE_MODULE_PATH ${CMAKE_SOURCE_DIR}/cmake)
-
 # Load all shared deps from the local lib/ dir next to the binary.
 # CMAKE_INSTALL_RPATH is used at both build and install time (BUILD_WITH_INSTALL_RPATH),
 # overriding CMake's default behavior of embedding absolute conan cache paths.

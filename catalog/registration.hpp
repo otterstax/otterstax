@@ -14,6 +14,7 @@
 
 #include <functional>
 #include <memory_resource>
+#include <string_view>
 #include <optional>
 #include <span>
 #include <string>
@@ -84,10 +85,14 @@ namespace otterstax::catalog {
     // (a changed type: dropped and added), all on `session` (the actors' registration session), so
     // the backends get no SQL. A connection the catalog has and config.yaml no longer names keeps its
     // databases (a warning in the BACKENDS log). An engine refusal is the error (startup aborts).
+    // `time_zone`: the server's (config.yaml `service.timezone`), every session's TimeZone until its client sets
+    // one — applied over what the engine kept (ALTER SYSTEM SET timezone); one the engine does not name is the
+    // error.
     [[nodiscard]] core::error_t register_connections(std::pmr::memory_resource* resource,
                                                      const engine_calls_t& engine,
                                                      const components::session::session_id_t& session,
-                                                     std::span<const connection_discovery_t> connections);
+                                                     std::span<const connection_discovery_t> connections,
+                                                     std::string_view time_zone = "UTC");
 
     // The scope to discover when a statement of a client missed a remote table: `error` is
     // table_not_exists, schema_not_exists or database_not_exists and `written` — the name as the

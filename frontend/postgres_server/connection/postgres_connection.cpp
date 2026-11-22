@@ -40,8 +40,8 @@ namespace frontend::postgres {
                                              otterstax::session::session_factory_t& sessions,
                                              connection_close_sink& close_sink,
                                              size_t slot,
-                                             std::chrono::milliseconds read_timeout)
-        : frontend_connection(std::move(socket), connection_id, close_sink, slot, read_timeout)
+                                             connection_timeouts_t timeouts)
+        : frontend_connection(std::move(socket), connection_id, close_sink, slot, timeouts)
         , resource_(resource)
         , statement_name_map_(resource_)
         , portals_(resource_)
@@ -52,6 +52,12 @@ namespace frontend::postgres {
         assert(log_.is_valid());
         assert(resource_ != nullptr && "memory resource must not be null");
         assert(session_ != nullptr && "every connection has a query session");
+        idle_session_timeout_.reset = timeouts.idle.count();
+        idle_session_timeout_.session = idle_session_timeout_.reset;
+    }
+
+    std::chrono::milliseconds postgres_connection::idle_timeout() const {
+        return std::chrono::milliseconds(idle_session_timeout_.current());
     }
 
     postgres_connection::statement_run_t::statement_run_t(std::pmr::memory_resource* resource,
@@ -197,8 +203,7 @@ namespace frontend::postgres {
                             return;
                         }
 
-                        std::vector<uint8_t> payload(std::make_move_iterator(read_buffer_.begin()),
-                                                     std::make_move_iterator(read_buffer_.begin() + length));
+                        std::vector<uint8_t> payload(read_buffer_.begin(), read_buffer_.begin() + length);
                         packet_reader reader(std::move(payload));
 
                         auto code = reader.read_int32();
@@ -208,6 +213,8 @@ namespace frontend::postgres {
                                                 error_severity::fatal());
                         } else if (code == message_code::SSL_REQUEST_CODE) {
                             handle_ssl_decline(reader);
+                        } else if (code == message_code::CANCEL_REQUEST_CODE) {
+                            handle_cancel_request(reader);
                         } else if (code == message_code::PROTOCOL_VERSION_3_0) {
                             run_handler(handle_startup_message(code, std::move(reader)));
                         } else {
@@ -257,8 +264,7 @@ namespace frontend::postgres {
                     // The simple protocol answers ReadyForQuery itself, after the
                     // result or the error.
                     pipeline_.end_pipeline();
-                    packet_reader reader(
-                        {std::make_move_iterator(payload.begin()), std::make_move_iterator(payload.end())});
+                    packet_reader reader({payload.begin(), payload.end()});
                     query = reader.read_string_null();
                     // The query text without its terminator.
                     if (!reader.ok()) {
@@ -293,8 +299,7 @@ namespace frontend::postgres {
                 {
                     OTX_ZONE_N("pg::handle_packet::parse");
                     pipeline_.begin_pipeline();
-                    reader.emplace(std::vector<uint8_t>{std::make_move_iterator(payload.begin()),
-                                                        std::make_move_iterator(payload.end())});
+                    reader.emplace(std::vector<uint8_t>{payload.begin(), payload.end()});
 
                     if (!reader->remaining()) {
                         send_error_response(sql_state::PROTOCOL_VIOLATION, "Truncated PARSE message statement name");
@@ -337,8 +342,7 @@ namespace frontend::postgres {
                 {
                     OTX_ZONE_N("pg::handle_packet::bind");
                     pipeline_.begin_pipeline();
-                    reader.emplace(std::vector<uint8_t>{std::make_move_iterator(payload.begin()),
-                                                        std::make_move_iterator(payload.end())});
+                    reader.emplace(std::vector<uint8_t>{payload.begin(), payload.end()});
 
                     if (!reader->remaining()) {
                         send_error_response(sql_state::PROTOCOL_VIOLATION, "Truncated BIND portal name");
@@ -396,8 +400,7 @@ namespace frontend::postgres {
                 {
                     OTX_ZONE_N("pg::handle_packet::execute");
                     pipeline_.begin_pipeline();
-                    packet_reader reader(
-                        {std::make_move_iterator(payload.begin()), std::make_move_iterator(payload.end())});
+                    packet_reader reader({payload.begin(), payload.end()});
 
                     if (!reader.remaining()) {
                         send_error_response(sql_state::PROTOCOL_VIOLATION, "Truncated EXECUTE message statement name");
@@ -433,8 +436,7 @@ namespace frontend::postgres {
                 {
                     OTX_ZONE_N("pg::handle_packet::close_describe");
                     pipeline_.begin_pipeline();
-                    packet_reader reader(
-                        {std::make_move_iterator(payload.begin()), std::make_move_iterator(payload.end())});
+                    packet_reader reader({payload.begin(), payload.end()});
 
                     std::string str = is_close ? "CLOSE" : "DESCRIBE";
                     if (!reader.remaining()) {

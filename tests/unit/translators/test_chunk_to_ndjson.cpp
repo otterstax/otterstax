@@ -249,7 +249,7 @@ TEST_CASE("chunk_to_ndjson: a hugeint column is written as a JSON string and rea
     REQUIRE(reloaded.size() == 3);
     const int wide = col(reloaded, "wide");
     REQUIRE(wide >= 0);
-    REQUIRE(reloaded.types()[wide].type() == logical_type::STRING_LITERAL);
+    REQUIRE(reloaded.types()[wide].type() == logical_type::TEXT);
     REQUIRE(otterstax::test::cell(reloaded, wide, 0).value<std::string_view>() == "18446744073709551616");
     REQUIRE(otterstax::test::cell(reloaded, wide, 1).value<std::string_view>() == "-18446744073709551616");
     REQUIRE(otterstax::test::cell(reloaded, wide, 2).is_null());
@@ -285,7 +285,7 @@ TEST_CASE("chunk_to_ndjson: strings are JSON-escaped, NULL cells are null") {
     const std::string path = "/tmp/otterstax_test_chunk_to_ndjson_escape.ndjson";
 
     std::pmr::vector<complex_logical_type> types{res};
-    types.emplace_back(logical_type::STRING_LITERAL, "text");
+    types.emplace_back(logical_type::TEXT, "text");
     types.emplace_back(logical_type::BIGINT, "n");
     data_chunk_t chunk(res, types, 2);
     chunk.set_cardinality(2);

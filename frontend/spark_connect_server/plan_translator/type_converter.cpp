@@ -38,6 +38,7 @@ namespace frontend::spark {
             case logical_type::SMALLINT:
                 result.mutable_short_();
                 break;
+            case logical_type::OID:
             case logical_type::UINTEGER:
             case logical_type::INTEGER:
                 result.mutable_integer();
@@ -62,6 +63,7 @@ namespace frontend::spark {
                 }
                 break;
             }
+            case logical_type::TEXT:
             case logical_type::STRING_LITERAL:
             // Spark Connect has no TIME type; fall back to STRING.
             case logical_type::TIME:

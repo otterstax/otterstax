@@ -14,6 +14,7 @@
 #include <array>
 #include <cassert>
 #include <charconv>
+#include <limits>
 
 namespace frontend::mysql {
     namespace {
@@ -24,6 +25,10 @@ namespace frontend::mysql {
             cursor_t(std::string_view sql, const std::vector<token_t>& tokens)
                 : sql_(sql)
                 , tokens_(tokens) {}
+
+            // The position, to read a form again from it.
+            [[nodiscard]] std::size_t mark() const noexcept { return pos_; }
+            void rewind(std::size_t mark) noexcept { pos_ = mark; }
 
             [[nodiscard]] const token_t* peek(std::size_t ahead = 0) const {
                 return pos_ + ahead < tokens_.size() ? &tokens_[pos_ + ahead] : nullptr;
@@ -449,6 +454,35 @@ namespace frontend::mysql {
                 }
             }
             std::erase_if(set.settings, [](const setting_t& setting) { return is_charset_variable(setting.name); });
+            // wait_timeout is the connection's idle timeout: the frontend's. The last assignment wins.
+            for (const auto& setting : set.settings) {
+                if (setting.name != "wait_timeout") {
+                    continue;
+                }
+                if (!setting.value) {
+                    set.wait_timeout = 0; // DEFAULT
+                    continue;
+                }
+                const std::string& text = *setting.value;
+                const bool negative = !text.empty() && text.front() == '-';
+                const auto digits = std::string_view{text}.substr(negative ? 1 : 0);
+                if (digits.empty() || digits.find_first_not_of("0123456789") != std::string_view::npos) {
+                    if (!set.refusal) {
+                        set.refusal = protocol_refusal_t{mysql_error::ER_WRONG_TYPE_FOR_VAR,
+                                                         "Incorrect argument type to variable 'wait_timeout'"};
+                    }
+                    continue;
+                }
+                // MySQL clamps (with a warning) to the variable's range: 1 .. 31536000 seconds.
+                constexpr uint64_t max_timeout = 31536000;
+                uint64_t seconds = 1;
+                if (!negative) {
+                    seconds = digits.size() > 9 ? max_timeout : std::stoull(std::string{digits});
+                    seconds = std::clamp<uint64_t>(seconds, 1, max_timeout);
+                }
+                set.wait_timeout = seconds;
+            }
+            std::erase_if(set.settings, [](const setting_t& setting) { return setting.name == "wait_timeout"; });
             return set;
         }
 
@@ -493,7 +527,108 @@ namespace frontend::mysql {
             return out;
         }
 
-        std::optional<protocol_statement_t> classify_show(cursor_t& c) {
+        // A table name of one to three parts, as the engine folds them (lower case, a backquoted name too).
+        std::optional<std::vector<std::string>> table_name(cursor_t& c) {
+            std::vector<std::string> name;
+            do {
+                auto part = c.name(false);
+                if (!part) {
+                    return std::nullopt;
+                }
+                name.push_back(to_lower(std::move(*part)));
+            } while (c.punct("."));
+            if (name.size() > 3) {
+                return std::nullopt;
+            }
+            return name;
+        }
+
+        // An optional LIKE '<pattern>' and the statement's end; false for anything else (a WHERE).
+        bool like_and_end(cursor_t& c, std::optional<std::string>& like) {
+            if (c.word("like")) {
+                const auto* pattern = c.take(token_kind::string);
+                if (pattern == nullptr) {
+                    return false;
+                }
+                like = pattern->value;
+            }
+            return c.at_statement_end();
+        }
+
+        std::optional<protocol_statement_t> classify_describe(cursor_t& c) {
+            describe_table_t describe;
+            auto name = table_name(c);
+            if (!name || !c.at_statement_end()) {
+                return std::nullopt; // DESCRIBE SELECT …, DESCRIBE t col: the engine's
+            }
+            describe.name = std::move(*name);
+            return describe;
+        }
+
+        // The catalog SHOW forms: CREATE TABLE, [FULL] COLUMNS / FIELDS, [FULL] TABLES, DATABASES / SCHEMAS.
+        std::optional<protocol_statement_t> classify_catalog_show(cursor_t& c) {
+            if (c.peek_word("create") && c.peek_word("table", 1)) {
+                c.word("create");
+                c.word("table");
+                auto name = table_name(c);
+                if (!name || !c.at_statement_end()) {
+                    return std::nullopt;
+                }
+                return show_create_table_t{std::move(*name)};
+            }
+            if (c.word("databases") || c.word("schemas")) {
+                show_databases_t show;
+                if (!like_and_end(c, show.like)) {
+                    return std::nullopt;
+                }
+                return show;
+            }
+            const bool full = c.word("full");
+            if (c.word("tables")) {
+                show_tables_t show{.full = full};
+                if (c.word("from") || c.word("in")) {
+                    auto from = c.name(false);
+                    if (!from) {
+                        return std::nullopt;
+                    }
+                    show.from = to_lower(std::move(*from));
+                }
+                if (!like_and_end(c, show.like)) {
+                    return std::nullopt;
+                }
+                return show;
+            }
+            if (c.word("columns") || c.word("fields")) {
+                if (!c.word("from") && !c.word("in")) {
+                    return std::nullopt;
+                }
+                auto name = table_name(c);
+                if (!name) {
+                    return std::nullopt;
+                }
+                if (c.word("from") || c.word("in")) {
+                    auto database = c.name(false);
+                    if (!database || name->size() != 1) {
+                        return std::nullopt;
+                    }
+                    name->insert(name->begin(), to_lower(std::move(*database)));
+                }
+                if (!c.at_statement_end()) {
+                    return std::nullopt; // LIKE / WHERE: the engine's
+                }
+                return describe_table_t{std::move(*name), full};
+            }
+            return std::nullopt;
+        }
+
+        std::optional<protocol_statement_t> classify_show(cursor_t& c, bool placeholders) {
+            if (!placeholders) {
+                const auto start = c.mark();
+                if (auto catalog = classify_catalog_show(c)) {
+                    return catalog;
+                }
+                c.rewind(start);
+            }
             const bool scoped = c.peek() != nullptr && c.peek()->kind == token_kind::word &&
                                 is_scope(c.peek()->value) && c.word(c.peek()->value);
             if (c.word("variables")) {
@@ -554,11 +689,20 @@ namespace frontend::mysql {
             if (name == "collation_connection" || name == "collation_database" || name == "collation_server") {
                 return std::string{SERVER_COLLATION};
             }
+            // Every table is the engine's, and a transaction of it is rolled back
+            // whole: MySQL's transactional engine (Django reads it to know
+            // whether ROLLBACK undoes anything).
+            if (name == "default_storage_engine" || name == "default_tmp_storage_engine") {
+                return std::string{"InnoDB"};
+            }
             if (name == "init_connect") {
                 return std::string{};
             }
-            if (name == "interactive_timeout" || name == "wait_timeout") {
+            if (name == "wait_timeout") {
                 return timeout;
+            }
+            if (name == "interactive_timeout") {
+                return static_cast<int64_t>(context.interactive_timeout.count());
             }
             if (name == "license") {
                 return std::string{"Apache-2.0"};
@@ -587,6 +731,10 @@ namespace frontend::mysql {
             if (name == "sql_mode") {
                 return std::string{"STRICT_TRANS_TABLES"};
             }
+            // `WHERE id IS NULL` never reads the last inserted id.
+            if (name == "sql_auto_is_null") {
+                return int64_t{0};
+            }
             if (name == "system_time_zone") {
                 return std::string{"UTC"};
             }
@@ -614,7 +762,7 @@ namespace frontend::mysql {
         }
 
         // Every variable system_variable answers, by name: SHOW VARIABLES.
-        constexpr std::array<std::string_view, 30> variable_names{"auto_increment_increment",
+        constexpr std::array<std::string_view, 33> variable_names{"auto_increment_increment",
                                                                   "auto_increment_offset",
                                                                   "autocommit",
                                                                   "character_set_client",
@@ -626,6 +774,8 @@ namespace frontend::mysql {
                                                                   "collation_connection",
                                                                   "collation_database",
                                                                   "collation_server",
+                                                                  "default_storage_engine",
+                                                                  "default_tmp_storage_engine",
                                                                   "init_connect",
                                                                   "interactive_timeout",
                                                                   "license",
@@ -633,6 +783,7 @@ namespace frontend::mysql {
                                                                   "max_allowed_packet",
                                                                   "net_write_timeout",
                                                                   "performance_schema",
+                                                                  "sql_auto_is_null",
                                                                   "sql_mode",
                                                                   "system_time_zone",
                                                                   "time_zone",
@@ -711,53 +862,54 @@ namespace frontend::mysql {
             }
         }
 
+        // The value of `item` as this connection runs, nullopt for a system variable the server does not have.
+        std::optional<variable_value_t> item_value(const select_item_t& item, const protocol_context_t& context) {
+            using kind_t = select_item_t::kind_t;
+            switch (item.kind) {
+                case kind_t::variable:
+                    return system_variable(item.variable, context);
+                // The database of the last USE / COM_INIT_DB / HandshakeResponse
+                // the engine accepted, NULL before one.
+                case kind_t::database:
+                    if (context.database) {
+                        return variable_value_t{*context.database};
+                    }
+                    return variable_value_t{std::monostate{}};
+                case kind_t::version:
+                    return variable_value_t{std::string{SERVER_VERSION}};
+                case kind_t::user:
+                    return variable_value_t{context.user + "@" + context.host};
+                // No account is authenticated: the user stands for itself
+                // from any host.
+                case kind_t::current_user:
+                    return variable_value_t{context.user + "@%"};
+                case kind_t::connection_id:
+                    return variable_value_t{static_cast<int64_t>(context.connection_id)};
+            }
+            return std::nullopt;
+        }
+
+        protocol_refusal_t unknown_variable(const std::string& name) {
+            return protocol_refusal_t{mysql_error::ER_UNKNOWN_SYSTEM_VARIABLE, "Unknown system variable '" + name + "'"};
+        }
+
         protocol_answer_t answer_select(std::pmr::memory_resource* resource,
                                         const select_variables_t& select,
                                         const protocol_context_t& context) {
-            using kind_t = select_item_t::kind_t;
             std::vector<variable_value_t> values;
             values.reserve(select.items.size());
             for (const auto& item : select.items) {
-                switch (item.kind) {
-                    case kind_t::variable: {
-                        auto value = system_variable(item.variable, context);
-                        if (!value) {
-                            return protocol_refusal_t{mysql_error::ER_UNKNOWN_SYSTEM_VARIABLE,
-                                                      "Unknown system variable '" + item.variable + "'"};
-                        }
-                        values.push_back(std::move(*value));
-                        break;
-                    }
-                    // The database of the last USE / COM_INIT_DB / HandshakeResponse
-                    // the engine accepted, NULL before one.
-                    case kind_t::database:
-                        if (context.database) {
-                            values.emplace_back(*context.database);
-                        } else {
-                            values.emplace_back(std::monostate{});
-                        }
-                        break;
-                    case kind_t::version:
-                        values.emplace_back(std::string{SERVER_VERSION});
-                        break;
-                    case kind_t::user:
-                        values.emplace_back(context.user + "@" + context.host);
-                        break;
-                    // No account is authenticated: the user stands for itself
-                    // from any host.
-                    case kind_t::current_user:
-                        values.emplace_back(context.user + "@%");
-                        break;
-                    case kind_t::connection_id:
-                        values.emplace_back(static_cast<int64_t>(context.connection_id));
-                        break;
+                auto value = item_value(item, context);
+                if (!value) {
+                    return unknown_variable(item.variable);
                 }
+                values.push_back(std::move(*value));
             }
             std::pmr::vector<complex_logical_type> types(resource);
             types.reserve(values.size());
             for (std::size_t i = 0; i < values.size(); ++i) {
                 types.emplace_back(std::holds_alternative<int64_t>(values[i]) ? logical_type::BIGINT
-                                                                              : logical_type::STRING_LITERAL,
+                                                                              : logical_type::TEXT,
                                    select.items[i].column);
             }
             auto chunk = make_chunk(resource, types, select.rows);
@@ -780,8 +932,8 @@ namespace frontend::mysql {
             }
             std::sort(names.begin(), names.end());
             std::pmr::vector<complex_logical_type> types(resource);
-            types.emplace_back(logical_type::STRING_LITERAL, "Variable_name");
-            types.emplace_back(logical_type::STRING_LITERAL, "Value");
+            types.emplace_back(logical_type::TEXT, "Variable_name");
+            types.emplace_back(logical_type::TEXT, "Value");
             auto chunk = make_chunk(resource, types, names.size());
             for (std::size_t row = 0; row < names.size(); ++row) {
                 chunk.set_value(0, row, std::string_view{names[row]});
@@ -793,9 +945,9 @@ namespace frontend::mysql {
 
         protocol_answer_t answer_show_warnings(std::pmr::memory_resource* resource) {
             std::pmr::vector<complex_logical_type> types(resource);
-            types.emplace_back(logical_type::STRING_LITERAL, "Level");
+            types.emplace_back(logical_type::TEXT, "Level");
             types.emplace_back(logical_type::INTEGER, "Code");
-            types.emplace_back(logical_type::STRING_LITERAL, "Message");
+            types.emplace_back(logical_type::TEXT, "Message");
             return make_chunk(resource, types, 0);
         }
     } // namespace
@@ -822,13 +974,32 @@ namespace frontend::mysql {
             return classify_reset(c);
         }
         if (c.word("show")) {
-            return classify_show(c);
+            return classify_show(c, placeholders);
         }
         if (c.word("use")) {
             return classify_use(c);
         }
+        if (!placeholders && (c.word("describe") || c.word("desc"))) {
+            return classify_describe(c);
+        }
+        if (!placeholders && c.word("kill")) {
+            kill_t kill;
+            if (c.word("query")) {
+                kill.query_only = true;
+            } else {
+                c.word("connection");
+            }
+            const auto id = c.number();
+            if (!id || *id > std::numeric_limits<std::uint32_t>::max() || !c.at_statement_end()) {
+                return std::nullopt;
+            }
+            kill.connection_id = static_cast<std::uint32_t>(*id);
+            return kill;
+        }
         return std::nullopt;
     }
+
+    bool mysql_like(std::string_view text, std::string_view pattern) { return like(text, pattern); }
 
     std::string engine_setting_statement(const setting_t& setting) {
         OTX_ZONE_N("mysql_protocol::engine_setting_statement");
@@ -896,6 +1067,112 @@ namespace frontend::mysql {
                                       " is not supported: OtterStax reads and sends utf8mb4 only"};
     }
 
+    std::optional<std::variant<std::string, protocol_refusal_t>>
+    substitute_session_values(std::string_view sql, const protocol_context_t& context) {
+        OTX_ZONE_N("mysql_protocol::substitute_session_values");
+        auto tokens = tokenize(sql);
+        if (!tokens || tokens->empty() || tokens->front().kind != token_kind::word ||
+            tokens->front().value != "select") {
+            return std::nullopt;
+        }
+        const auto& t = *tokens;
+        const auto is_punct = [&](std::size_t i, std::string_view p) {
+            return i < t.size() && t[i].kind == token_kind::punct && t[i].value == p;
+        };
+        const auto is_word = [&](std::size_t i, std::string_view w) {
+            return i < t.size() && t[i].kind == token_kind::word && t[i].value == w;
+        };
+        // MySQL's literal of `value`: its default sql_mode reads a backslash as an escape.
+        const auto literal = [](const variable_value_t& value) {
+            if (const auto* number = std::get_if<int64_t>(&value)) {
+                return std::to_string(*number);
+            }
+            const auto* text = std::get_if<std::string>(&value);
+            if (text == nullptr) {
+                return std::string{"NULL"};
+            }
+            std::string out{"'"};
+            for (char c : *text) {
+                if (c == '\\' || c == '\'') {
+                    out.push_back(c);
+                }
+                out.push_back(c);
+            }
+            out.push_back('\'');
+            return out;
+        };
+        std::string out;
+        std::size_t copied = 0;
+        bool substituted = false;
+        int depth = 0;
+        for (std::size_t i = 0; i < t.size(); ++i) {
+            if (is_punct(i, "(")) {
+                ++depth;
+                continue;
+            }
+            if (is_punct(i, ")")) {
+                --depth;
+                continue;
+            }
+            select_item_t item{};
+            std::size_t last = i; // the item's last token
+            if (t[i].kind == token_kind::at_at) {
+                std::size_t name = i + 1;
+                if (name < t.size() && t[name].kind == token_kind::word &&
+                    is_scope(t[name].value) && is_punct(name + 1, ".")) {
+                    name += 2;
+                }
+                if (name >= t.size() || t[name].kind != token_kind::word) {
+                    continue; // the engine refuses it as written
+                }
+                item.kind = select_item_t::kind_t::variable;
+                item.variable = t[name].value;
+                last = name;
+            } else if (t[i].kind == token_kind::word && is_punct(i + 1, "(") && is_punct(i + 2, ")") &&
+                       !(i > 0 && is_punct(i - 1, "."))) {
+                const auto kind = session_function(t[i].value);
+                if (!kind) {
+                    continue;
+                }
+                item.kind = *kind;
+                last = i + 2;
+            } else {
+                continue;
+            }
+            auto value = item_value(item, context);
+            if (!value) {
+                return std::variant<std::string, protocol_refusal_t>{unknown_variable(item.variable)};
+            }
+            // A whole select item without an alias keeps MySQL's column name: the item as written.
+            const bool starts_item = depth == 0 && (is_word(i - 1, "select") || is_punct(i - 1, ","));
+            const std::size_t next = last + 1;
+            const bool ends_item = depth == 0 && (next == t.size() || is_punct(next, ",") || is_punct(next, ";") ||
+                                                  is_word(next, "from") || is_word(next, "limit") ||
+                                                  is_word(next, "into"));
+            out.append(sql.substr(copied, t[i].begin - copied));
+            out.append(literal(*value));
+            if (starts_item && ends_item) {
+                std::string column{sql.substr(t[i].begin, t[last].end - t[i].begin)};
+                std::string quoted{" AS `"};
+                for (char c : column) {
+                    if (c == '`') {
+                        quoted.push_back(c);
+                    }
+                    quoted.push_back(c);
+                }
+                out.append(quoted).push_back('`');
+            }
+            copied = t[last].end;
+            substituted = true;
+            i = last;
+        }
+        if (!substituted) {
+            return std::nullopt;
+        }
+        out.append(sql.substr(copied));
+        return std::variant<std::string, protocol_refusal_t>{std::move(out)};
+    }
+
     protocol_answer_t answer_protocol_statement(std::pmr::memory_resource* resource,
                                                 const protocol_statement_t& statement,
                                                 const protocol_context_t& context) {
@@ -909,7 +1186,7 @@ namespace frontend::mysql {
         if (std::holds_alternative<show_warnings_t>(statement)) {
             return answer_show_warnings(resource);
         }
-        assert(false && "a SET and a USE are answered by the engine");
+        assert(false && "a SET, a USE and SHOW CREATE TABLE are answered by the engine");
         return protocol_refusal_t{mysql_error::ER_UNKNOWN_ERROR, "not a statement the frontend answers"};
     }
 } // namespace frontend::mysql

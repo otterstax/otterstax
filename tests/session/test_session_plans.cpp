@@ -268,7 +268,7 @@ namespace {
 
     constexpr std::array<item_column, 3> kColumns{{
         {"id", kInt4Oid, ct::logical_type::INTEGER},
-        {"name", kVarcharOid, ct::logical_type::STRING_LITERAL},
+        {"name", kVarcharOid, ct::logical_type::TEXT},
         {"price", kFloat8Oid, ct::logical_type::DOUBLE},
     }};
 

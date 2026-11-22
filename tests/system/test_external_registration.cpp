@@ -32,7 +32,7 @@ namespace {
         std::pmr::vector<complex_logical_type> types(resource);
         types.emplace_back(logical_type::BIGINT);
         types.back().set_alias("id");
-        types.emplace_back(logical_type::STRING_LITERAL);
+        types.emplace_back(logical_type::TEXT);
         types.back().set_alias("name");
         components::vector::data_chunk_t chunk{resource, types, rows};
         for (std::size_t i = 0; i < rows; ++i) {

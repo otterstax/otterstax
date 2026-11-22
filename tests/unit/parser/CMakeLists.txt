@@ -4,6 +4,7 @@ project(test_parser)
 
 set(${PROJECT_NAME}_SOURCES
     main.cpp
+    test_fromless_filters.cpp
     test_parser_integration.cpp
     test_query_gen.cpp
     test_parser_extras.cpp

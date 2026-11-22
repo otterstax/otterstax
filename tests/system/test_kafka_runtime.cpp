@@ -282,7 +282,7 @@ TEST_CASE("kafka json: batch -> data_chunk drops malformed/incomplete rows") {
 
     std::vector<otterstax::kafka::kafka_column_t> columns = {
         {"id", complex_logical_type(logical_type::INTEGER)},
-        {"name", complex_logical_type(logical_type::STRING_LITERAL)},
+        {"name", complex_logical_type(logical_type::TEXT)},
     };
 
     auto chunk = otterstax::kafka::detail::json_to_chunk(resource,
@@ -476,7 +476,7 @@ TEST_CASE("kafka stream node-swap: aggregate(empty)+raw_data applies the SELECT"
 
     std::vector<otterstax::kafka::kafka_column_t> cols{
         {"id", ty::complex_logical_type(ty::logical_type::INTEGER)},
-        {"name", ty::complex_logical_type(ty::logical_type::STRING_LITERAL)}};
+        {"name", ty::complex_logical_type(ty::logical_type::TEXT)}};
     std::vector<std::string> payloads;
     for (int i = 1; i <= 5; ++i) {
         payloads.push_back("{\"id\":" + std::to_string(i) + ",\"name\":\"name_" + std::to_string(i) + "\"}");
@@ -585,7 +585,7 @@ TEST_CASE("kafka stream node-swap: the ORDER BY / LIMIT / HAVING tail is re-home
 
     const std::vector<otterstax::kafka::kafka_column_t> cols{
         {"id", ty::complex_logical_type(ty::logical_type::INTEGER)},
-        {"name", ty::complex_logical_type(ty::logical_type::STRING_LITERAL)}};
+        {"name", ty::complex_logical_type(ty::logical_type::TEXT)}};
 
     struct swap_result_t {
         std::vector<lp::node_type> operators;
@@ -856,7 +856,7 @@ TEST_CASE("kafka schema guard: chunk_matches_columns accepts a matching chunk, r
     namespace k = otterstax::kafka;
 
     std::vector<k::kafka_column_t> declared = {{"id", complex_logical_type(logical_type::INTEGER)},
-                                               {"name", complex_logical_type(logical_type::STRING_LITERAL)}};
+                                               {"name", complex_logical_type(logical_type::TEXT)}};
 
     // Matching: built from the declared columns -> every row round-trips
     {
@@ -871,8 +871,8 @@ TEST_CASE("kafka schema guard: chunk_matches_columns accepts a matching chunk, r
     }
     // Wrong type, same names + count: id holds a string -> won't re-ingest as INT
     {
-        std::vector<k::kafka_column_t> wrong = {{"id", complex_logical_type(logical_type::STRING_LITERAL)},
-                                                {"name", complex_logical_type(logical_type::STRING_LITERAL)}};
+        std::vector<k::kafka_column_t> wrong = {{"id", complex_logical_type(logical_type::TEXT)},
+                                                {"name", complex_logical_type(logical_type::TEXT)}};
         std::pmr::vector<components::vector::data_chunk_t> chunks(resource);
 
         chunks.push_back(k::detail::json_to_chunk(resource, wrong, {R"({"id":"x","name":"a"})"}));
@@ -930,8 +930,8 @@ TEST_CASE("kafka produce: a schema-mismatched INSERT is rejected, nothing produc
     // Wrong type: id is a string -> can't re-ingest as INT
     {
         std::vector<otterstax::kafka::kafka_column_t> wrong{
-            {"id", ty::complex_logical_type(ty::logical_type::STRING_LITERAL)},
-            {"name", ty::complex_logical_type(ty::logical_type::STRING_LITERAL)}};
+            {"id", ty::complex_logical_type(ty::logical_type::TEXT)},
+            {"name", ty::complex_logical_type(ty::logical_type::TEXT)}};
         auto bad = otterstax::kafka::detail::json_to_chunk(resource, wrong, {R"({"id":"x","name":"a"})"});
         REQUIRE(bad.size() == 1);
         auto cur = produce(lp::make_node_raw_data(resource, std::move(bad)));
@@ -983,7 +983,7 @@ TEST_CASE("kafka stream write: SELECT output schema is derived; INSERT routes to
     {
         const std::vector<otterstax::kafka::kafka_column_t> source_cols{
             {"id", ty::complex_logical_type(ty::logical_type::INTEGER)},
-            {"name", ty::complex_logical_type(ty::logical_type::STRING_LITERAL)}};
+            {"name", ty::complex_logical_type(ty::logical_type::TEXT)}};
         auto schema_of = [&](const std::string& sql) {
             auto plan = otterstax::kafka::detail::kafka_parse_plan(resource, sql);
             REQUIRE_FALSE(plan.has_error());
@@ -1081,7 +1081,7 @@ TEST_CASE("kafka stream: a COUNT column is declared and produced as the type the
 
     const std::vector<otterstax::kafka::kafka_column_t> source_cols{
         {"id", ty::complex_logical_type(ty::logical_type::INTEGER)},
-        {"name", ty::complex_logical_type(ty::logical_type::STRING_LITERAL)}};
+        {"name", ty::complex_logical_type(ty::logical_type::TEXT)}};
     auto plan = kd::kafka_parse_plan(resource, "SELECT name, COUNT(*) AS cnt FROM local.kafka.s GROUP BY name;");
     REQUIRE_FALSE(plan.has_error());
     REQUIRE_FALSE(plan.value().sub_queries.empty());
@@ -1150,7 +1150,7 @@ TEST_CASE("kafka json: out-of-range numbers are rejected without throwing, JSON 
     std::vector<otterstax::kafka::kafka_column_t> columns = {
         {"id", complex_logical_type(logical_type::INTEGER)},
         {"big", complex_logical_type(logical_type::BIGINT)},
-        {"name", complex_logical_type(logical_type::STRING_LITERAL)},
+        {"name", complex_logical_type(logical_type::TEXT)},
     };
 
     auto chunk = otterstax::kafka::detail::json_to_chunk(
@@ -1184,12 +1184,12 @@ TEST_CASE("kafka schema guard: an alias-less chunk and a mismatching second chun
     namespace k = otterstax::kafka;
 
     std::vector<k::kafka_column_t> declared = {{"id", complex_logical_type(logical_type::INTEGER)},
-                                               {"name", complex_logical_type(logical_type::STRING_LITERAL)}};
+                                               {"name", complex_logical_type(logical_type::TEXT)}};
 
     // Two chunks: the first round-trips, the second holds a string in `id`
     {
-        std::vector<k::kafka_column_t> wrong = {{"id", complex_logical_type(logical_type::STRING_LITERAL)},
-                                                {"name", complex_logical_type(logical_type::STRING_LITERAL)}};
+        std::vector<k::kafka_column_t> wrong = {{"id", complex_logical_type(logical_type::TEXT)},
+                                                {"name", complex_logical_type(logical_type::TEXT)}};
         std::pmr::vector<components::vector::data_chunk_t> chunks(resource);
         chunks.push_back(k::detail::json_to_chunk(resource, declared, {R"({"id":1,"name":"a"})"}));
         chunks.push_back(k::detail::json_to_chunk(resource, wrong, {R"({"id":"x","name":"b"})"}));
@@ -1202,7 +1202,7 @@ TEST_CASE("kafka schema guard: an alias-less chunk and a mismatching second chun
     {
         std::pmr::vector<complex_logical_type> types(resource);
         types.emplace_back(logical_type::INTEGER);
-        types.emplace_back(logical_type::STRING_LITERAL);
+        types.emplace_back(logical_type::TEXT);
         components::vector::data_chunk_t bare(resource, types, 1);
         bare.set_value(0, 0, int32_t{1});
         bare.set_value(1, 0, std::string_view{"a"});
@@ -1221,7 +1221,7 @@ TEST_CASE("kafka json: chunk_to_json over more than 1024 rows keeps every row in
     namespace k = otterstax::kafka;
 
     std::vector<k::kafka_column_t> columns = {{"id", complex_logical_type(logical_type::BIGINT)},
-                                              {"name", complex_logical_type(logical_type::STRING_LITERAL)}};
+                                              {"name", complex_logical_type(logical_type::TEXT)}};
     // A cursor batch: a full 1024-row chunk followed by a 500-row tail
     std::pmr::vector<components::vector::data_chunk_t> chunks(resource);
     chunks.push_back(k::detail::json_to_chunk(resource, columns, id_name_payloads(0, 1024)));
@@ -1457,7 +1457,7 @@ TEST_CASE("kafka drop: DROP SOURCE removes the offsets table; a missing source e
         namespace ty = components::types;
         std::vector<otterstax::kafka::kafka_column_t> cols{
             {"id", ty::complex_logical_type(ty::logical_type::INTEGER)},
-            {"name", ty::complex_logical_type(ty::logical_type::STRING_LITERAL)}};
+            {"name", ty::complex_logical_type(ty::logical_type::TEXT)}};
         auto chunk = otterstax::kafka::detail::json_to_chunk(resource, cols, {R"({"id":1,"name":"a"})"});
         auto [_, fut] = actor_zeta::send(kafka_mgr->address(),
                                          &KafkaManager::produce,
@@ -1639,7 +1639,7 @@ TEST_CASE("kafka recover: __sources rows past the first chunk are replayed, a mi
         std::pmr::vector<ty::complex_logical_type> col_types(resource);
         for (const char* alias :
              {"name", "kind", "topic", "bootstrap", "group_id", "offset_reset", "transactional", "as_select"}) {
-            ty::complex_logical_type t(ty::logical_type::STRING_LITERAL);
+            ty::complex_logical_type t(ty::logical_type::TEXT);
             t.set_alias(alias);
             col_types.push_back(std::move(t));
         }
@@ -1920,7 +1920,7 @@ TEST_CASE("kafka drop: DROP SOURCE with a dependent VIEW") {
         // Ingestion still lands, and the view reads it
         std::vector<otterstax::kafka::kafka_column_t> cols{
             {"id", components::types::complex_logical_type(components::types::logical_type::INTEGER)},
-            {"name", components::types::complex_logical_type(components::types::logical_type::STRING_LITERAL)}};
+            {"name", components::types::complex_logical_type(components::types::logical_type::TEXT)}};
         auto error = kd::ingest_at_least_once(addr,
                                               resource,
                                               otterstax::kafka::kafka_table_name("s"),
@@ -2320,7 +2320,7 @@ TEST_CASE("kafka recover: a stream over a stream is recovered whatever the row o
         std::pmr::vector<ty::complex_logical_type> col_types(resource);
         for (const char* alias :
              {"name", "kind", "topic", "bootstrap", "group_id", "offset_reset", "transactional", "as_select"}) {
-            ty::complex_logical_type t(ty::logical_type::STRING_LITERAL);
+            ty::complex_logical_type t(ty::logical_type::TEXT);
             t.set_alias(alias);
             col_types.push_back(std::move(t));
         }

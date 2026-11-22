@@ -8,10 +8,14 @@
 
 #include <components/casts/kernels/string_cast.hpp>
 #include <components/vector/vector_builders.hpp>
+#include <core/date/date_parse.hpp>
 
+#include <cctype>
 #include <cerrno>
 #include <charconv>
 #include <cstdlib>
+#include <optional>
+#include <string_view>
 #include <system_error>
 #include <type_traits>
 
@@ -23,6 +27,56 @@ namespace {
         std::pmr::string what{"Invalid text literal for the declared parameter type: ", resource};
         what += text.c_str();
         return core::error_t{core::error_code_t::invalid_text_representation, std::move(what)};
+    }
+
+    // PostgreSQL 18's boolin (parse_bool_with_len): blanks around the value, any case, a prefix of true / yes /
+    // false / no, on / of / off (two letters at least), 1 / 0.
+    std::optional<bool> parse_pg_bool(std::string_view text) {
+        const auto blank = [](char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v'; };
+        while (!text.empty() && blank(text.front())) {
+            text.remove_prefix(1);
+        }
+        while (!text.empty() && blank(text.back())) {
+            text.remove_suffix(1);
+        }
+        if (text.empty()) {
+            return std::nullopt;
+        }
+        const auto prefix_of = [&](std::string_view word) {
+            if (text.size() > word.size()) {
+                return false;
+            }
+            for (std::size_t i = 0; i < text.size(); ++i) {
+                if (std::tolower(static_cast<unsigned char>(text[i])) != word[i]) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        switch (std::tolower(static_cast<unsigned char>(text.front()))) {
+            case 't':
+                return prefix_of("true") ? std::optional<bool>{true} : std::nullopt;
+            case 'y':
+                return prefix_of("yes") ? std::optional<bool>{true} : std::nullopt;
+            case 'f':
+                return prefix_of("false") ? std::optional<bool>{false} : std::nullopt;
+            case 'n':
+                return prefix_of("no") ? std::optional<bool>{false} : std::nullopt;
+            case 'o':
+                if (text.size() >= 2 && prefix_of("on")) {
+                    return true;
+                }
+                if (text.size() >= 2 && prefix_of("off")) {
+                    return false;
+                }
+                return std::nullopt;
+            case '1':
+                return text.size() == 1 ? std::optional<bool>{true} : std::nullopt;
+            case '0':
+                return text.size() == 1 ? std::optional<bool>{false} : std::nullopt;
+            default:
+                return std::nullopt;
+        }
     }
 
     core::error_t literal_past_precision(std::pmr::memory_resource* resource, const std::string& text) {
@@ -97,6 +151,7 @@ namespace {
                             const components::types::complex_logical_type* engine_type,
                             std::string text) {
         if (engine_type == nullptr || engine_type->type() == components::types::logical_type::NA ||
+            engine_type->type() == components::types::logical_type::TEXT ||
             engine_type->type() == components::types::logical_type::STRING_LITERAL) {
             return components::vector::make_scalar(resource, std::string_view{text});
         }
@@ -272,13 +327,36 @@ namespace frontend::postgres {
     parse_text_parameter(std::pmr::memory_resource* resource,
                          field_type type,
                          const components::types::complex_logical_type* engine_type,
-                         std::string text) {
+                         std::string text,
+                         const core::date::time_zone_t* time_zone) {
+        const core::date::time_zone_t utc;
+        const auto& zone = time_zone != nullptr ? *time_zone : utc;
+        const auto temporal = [&](auto parsed) -> core::result_wrapper_t<vector_t> {
+            if (!parsed) {
+                return bad_literal(resource, text);
+            }
+            return components::vector::make_scalar(resource, *parsed);
+        };
         switch (type) {
-            case field_type::BOOL:
-                if (text != "t" && text != "f") {
+            case field_type::DATE:
+                return temporal(core::date::parse_date(text));
+            case field_type::TIME:
+                return temporal(core::date::parse_time(text));
+            case field_type::TIMETZ:
+                return temporal(core::date::parse_timetz(text, zone));
+            case field_type::TIMESTAMP:
+                return temporal(core::date::parse_timestamp(text));
+            case field_type::TIMESTAMPTZ:
+                return temporal(core::date::parse_timestamptz(text, zone));
+            case field_type::INTERVAL:
+                return temporal(core::date::parse_interval(text));
+            case field_type::BOOL: {
+                const auto value = parse_pg_bool(text);
+                if (!value) {
                     return bad_literal(resource, text);
                 }
-                return components::vector::make_scalar(resource, text == "t");
+                return components::vector::make_scalar(resource, *value);
+            }
             case field_type::INT2:
                 return parse_integer<int16_t>(resource, text);
             case field_type::INT4:

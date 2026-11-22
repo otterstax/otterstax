@@ -1105,8 +1105,8 @@ class PgExtendedProtocolTest:
         self.assert_equal(id_len, 8, "a binary int8 is eight bytes on the wire")
         print("  RowDescription format code 1 for binary results ✓")
 
-    def test_hugeint_column_is_carried_as_numeric_in_text_and_refused_in_binary(self):
-        """A hugeint column: NUMERIC in text on every route, ErrorResponse 0A000 in binary."""
+    def test_hugeint_column_is_carried_as_numeric_in_text_and_binary(self):
+        """A hugeint column: NUMERIC on every route, in text and in binary."""
         w = self.wire
 
         # Simple Query: the executed chunk carries the column as HUGEINT, which
@@ -1146,26 +1146,29 @@ class PgExtendedProtocolTest:
                           "a text Execute carries the column")
         self.assert_hugeint_field(row_description_fields(first(messages, ROW_DESCRIPTION))[1], "Execute (text)")
 
-        # Execute with binary result format: refused. Binary NUMERIC is
-        # PostgreSQL's internal digit-group encoding, which this frontend does
-        # not write, and a DataRow states each field's length before its bytes.
+        # Execute with binary result format: answered. A hugeint goes out as
+        # NUMERIC in numeric_send's digit groups (pg_numeric_send), as asyncpg
+        # asks every column in binary.
         w.parse("wide_e", f"SELECT * FROM {DB}.{WIDE_TABLE}")
         w.bind("", "wide_e", result_formats=[1])
         w.execute("", 0)
         w.sync()
-        messages = self.read_failed_pipeline(w)
-        self.assert_equal(kinds(messages), [PARSE_COMPLETE, BIND_COMPLETE, ERROR_RESPONSE, READY_FOR_QUERY],
-                          "a refused binary Execute")
-        assert DATA_ROW not in kinds(messages), "no row may be sent in a format the column has no encoder for"
-        binary = self.assert_unsupported_column_error(messages, "Execute (binary)", encoding="binary",
-                                                     type_name="HUGEINT")
+        messages = w.read_until_ready()
+        self.assert_no_error(messages, "Execute over a hugeint column in binary")
+        self.assert_equal(kinds(messages),
+                          [PARSE_COMPLETE, BIND_COMPLETE, ROW_DESCRIPTION, COMMAND_COMPLETE, READY_FOR_QUERY],
+                          "a binary Execute carries the column")
+        fields = row_description_fields(first(messages, ROW_DESCRIPTION))
+        self.assert_equal(fields[1]["type_oid"], OID_NUMERIC, "Execute (binary): the hugeint rides NUMERIC")
+        self.assert_equal(row_description_formats(first(messages, ROW_DESCRIPTION)), [1, 1],
+                          "Execute (binary): every column in binary")
 
         # The same connection keeps serving, simple and extended alike.
         messages = w.query("SELECT 1")
-        self.assert_no_error(messages, "SELECT 1 after the binary refusal")
+        self.assert_no_error(messages, "SELECT 1 after the binary Execute")
         self.assert_equal(kinds(messages), [ROW_DESCRIPTION, DATA_ROW, COMMAND_COMPLETE, READY_FOR_QUERY],
                           "SELECT 1 on the same connection")
-        print(f"  hugeint -> NUMERIC in text, binary refused: '{binary}' ✓")
+        print("  hugeint -> NUMERIC in text and in binary ✓")
 
     def test_unsupported_column_type_is_an_error_not_a_disconnect(self):
         """A uhugeint column: ErrorResponse 0A000 naming it, on every path; the connection lives on."""
@@ -1412,7 +1415,7 @@ class PgExtendedProtocolTest:
             self.test_numeric_literal_refused_for_an_integer_parameter()
             self.test_a_kept_set_binds_its_declared_parameter_as_text()
             self.test_binary_result_format_is_reported_in_row_description()
-            self.test_hugeint_column_is_carried_as_numeric_in_text_and_refused_in_binary()
+            self.test_hugeint_column_is_carried_as_numeric_in_text_and_binary()
             self.test_unsupported_column_type_is_an_error_not_a_disconnect()
             self.test_select_of_a_single_column_is_never_a_bare_command_complete()
             self.test_terminate_with_an_unexecuted_named_statement_keeps_the_server_serving()

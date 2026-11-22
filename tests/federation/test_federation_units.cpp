@@ -24,7 +24,7 @@ namespace {
 TEST_CASE("conform: a column of another type is cast to the declared one and named") {
     casts_t casts;
     auto chunk = chunk_of(&casts.resource,
-                     {column("x", logical_type::BIGINT), column("t", logical_type::STRING_LITERAL)},
+                     {column("x", logical_type::BIGINT), column("t", logical_type::TEXT)},
                      {{std::int64_t{7}, std::string{"12"}}});
     const std::vector<complex_logical_type> declared{column("a", logical_type::BIGINT), column("b", logical_type::BIGINT)};
     auto refused = fed::conform_to_result(&casts.resource, casts.registry, "SELECT", declared, {}, chunk);
@@ -45,7 +45,7 @@ TEST_CASE("conform: another column count is datatype_mismatch") {
 
 TEST_CASE("conform: a text that is no number is the cast's refusal") {
     casts_t casts;
-    auto chunk = chunk_of(&casts.resource, {column("x", logical_type::STRING_LITERAL)}, {{std::string{"abc"}}});
+    auto chunk = chunk_of(&casts.resource, {column("x", logical_type::TEXT)}, {{std::string{"abc"}}});
     const std::vector<complex_logical_type> declared{column("a", logical_type::BIGINT)};
     auto refused = fed::conform_to_result(&casts.resource, casts.registry, "SELECT", declared, {}, chunk);
     CHECK(refused.contains_error());

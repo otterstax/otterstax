@@ -35,7 +35,10 @@ namespace frontend::mysql {
                          otterstax::session::session_factory_t& sessions,
                          connection_close_sink& close_sink,
                          size_t slot,
-                         std::chrono::milliseconds read_timeout);
+                         connection_timeouts_t timeouts);
+
+        // SET wait_timeout's value, else the server's.
+        std::chrono::milliseconds idle_timeout() const override;
 
         struct prepared_stmt_meta {
             prepared_stmt_meta(std::pmr::memory_resource* resource,
@@ -95,6 +98,7 @@ namespace frontend::mysql {
 
         boost::asio::awaitable<void> handle_auth(std::vector<uint8_t> payload);
         boost::asio::awaitable<void> handle_command(std::vector<uint8_t> payload);
+        boost::asio::awaitable<void> handle_command_packet(uint8_t seq_id, std::vector<uint8_t> payload);
         // COM_QUERY: the text is read by MySQL's lexical rules and written in
         // the engine's form (protocol/lexer.hpp, to_engine_text) before the
         // session sees it; a `?` in it is ER_PARSE_ERROR, as MySQL answers it.
@@ -118,7 +122,7 @@ namespace frontend::mysql {
         // what the engine accepted remembered (autocommit_, time_zone_).
         boost::asio::awaitable<void> answer_setting(set_variables_t set);
         // SET search_path = '<database>.public' on the engine: an OK packet and
-        // database_ remembered, or the ERR packet — ER_BAD_DB_ERROR for a
+        // database_ the engine's current_schema() of that place (DATABASE()), or the ERR packet — ER_BAD_DB_ERROR for a
         // database or schema that does not exist, any other refusal as
         // send_statement_error answers a statement. False when the engine
         // refused (the ERR packet went out).
@@ -130,6 +134,8 @@ namespace frontend::mysql {
         boost::asio::awaitable<bool> await_own_statement(session_future future, bool names_database);
         // What the protocol statements' answers are derived from.
         protocol_context_t protocol_context() const;
+        // @@time_zone as a zone, which a TIMESTAMPTZ (MySQL's TIMESTAMP) cell is shown in.
+        core::date::time_zone_t session_time_zone() const;
         // A session error as an ERR packet (COM_QUERY, COM_STMT_PREPARE,
         // COM_STMT_EXECUTE, a SET, a USE that names an existing place): `code`
         // a statement the engine does not support is ER_NOT_SUPPORTED_YET,
@@ -178,6 +184,32 @@ namespace frontend::mysql {
                               std::pmr::vector<uint16_t>& param_wire_types,
                               const std::pmr::vector<components::types::complex_logical_type>& engine_types,
                               packet_reader&& reader);
+        // The catalog statements (protocol/show_create_table.hpp), answered from the engine's catalog through the
+        // session, never a backend. A table: its columns and NOT NULL (pg_attribute, the table found as its written
+        // name resolves — a short one by the session's place), the types the engine's describe of SELECT * gives
+        // them, the PRIMARY KEY (pg_constraint); nullopt once the refusal went out (ER_NO_SUCH_TABLE, a failed
+        // read as the statement's error).
+        struct catalog_table_t {
+            std::string table;
+            std::vector<create_table_column_t> columns;
+            std::vector<std::string> primary_key;
+        };
+        boost::asio::awaitable<std::optional<catalog_table_t>> read_catalog_table(const std::vector<std::string>& name);
+        boost::asio::awaitable<otterstax::awaited_t<session_payload>> run_catalog_query(std::string sql);
+        // True once a failed catalog read was answered (its error, or the await's failure).
+        bool answer_catalog_failure(const otterstax::awaited_t<session_payload>& answer);
+        void send_text_rows(const text_rows_t& rows);
+        boost::asio::awaitable<void> answer_show_create_table(show_create_table_t show);
+        // DESCRIBE / SHOW [FULL] COLUMNS: describe_rows.
+        boost::asio::awaitable<void> answer_describe(describe_table_t describe);
+        // SHOW [FULL] TABLES: the relations (kinds r / g / v / m) of the schema named, else the place's
+        // (current_schema(); none chosen ER_NO_DB_ERROR), of the session's current database; Tables_in_<db>,
+        // Table_type BASE TABLE / VIEW.
+        boost::asio::awaitable<void> answer_show_tables(show_tables_t show);
+        // KILL [QUERY | CONNECTION] <id> over the server's cancel registry.
+        void answer_kill(const kill_t& kill);
+        // SHOW DATABASES: the schemas of the session's current database, sorted; Database.
+        boost::asio::awaitable<void> answer_show_databases(show_databases_t show);
         // Drops an unexecuted statement in the session; a failure is logged only.
         boost::asio::awaitable<void> close_stmt_in_session(otterstax::session::statement_id_t stmt_session,
                                                            const char* reason);
@@ -189,6 +221,7 @@ namespace frontend::mysql {
 
         void send_resultset(mysql_resultset&& result);
         void send_error(mysql_error error_code, std::string message);
+        void send_fatal_error(mysql_error error_code, std::string message);
         // ERR 1835 (ER_MALFORMED_PACKET) followed by the close of the
         // connection: a packet shorter than the fields its command carries
         // leaves nothing this client sends trustworthy.
@@ -199,7 +232,6 @@ namespace frontend::mysql {
         packet_writer writer_;
         uint8_t sequence_id_;
         uint32_t next_statement_id_;
-        uint32_t client_max_packet_size_;
         // The connection's query session: one engine session, its transaction
         // and its prepared statements. Closed in finish_impl.
         otterstax::session::session_ptr session_;
@@ -211,8 +243,18 @@ namespace frontend::mysql {
         // later undoes is not followed here.
         bool autocommit_{true};
         std::string time_zone_{"SYSTEM"};
+        // SET wait_timeout: this connection's idle timeout; none is the server's (default_idle_timeout()).
+        std::optional<std::chrono::seconds> wait_timeout_;
         std::optional<std::string> database_;
         connection_state state_;
+        // The pieces of a command split over wire packets: every packet but
+        // the last exactly MAX_PACKET_SIZE of payload, the last shorter — or
+        // empty, when the payload fills MAX_PACKET_SIZE exactly. Empty while
+        // no reassembly is in progress; bounded by MAX_ALLOWED_PACKET, the
+        // overflow tearing the connection.
+        std::vector<uint8_t> command_;
+        // The sequence the next piece of `command_` carries.
+        uint8_t command_seq_ = 0;
         log_t log_;
     };
 } // namespace frontend::mysql

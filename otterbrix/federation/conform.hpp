@@ -6,7 +6,7 @@
 #include <components/casts/cast_registry.hpp>
 #include <components/types/types.hpp>
 #include <components/vector/data_chunk.hpp>
-#include <core/date/date_types.hpp>
+#include <core/date/time_zone.hpp>
 #include <core/result_wrapper.hpp>
 
 #include <memory_resource>
@@ -28,7 +28,7 @@ namespace otterstax::federation {
                                                   const components::casts::cast_registry_t& casts,
                                                   std::string_view statement,
                                                   std::span<const components::types::complex_logical_type> declared,
-                                                  core::date::timezone_offset_t timezone,
+                                                  core::date::time_zone_t timezone,
                                                   components::vector::data_chunk_t& chunk);
 
 } // namespace otterstax::federation

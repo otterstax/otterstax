@@ -3,6 +3,7 @@
 
 #include "mysql_connection.hpp"
 #include "utility/logger.hpp"
+#include "utility/tracy_profiler.hpp"
 
 using namespace components;
 
@@ -13,13 +14,12 @@ namespace frontend::mysql {
                                        otterstax::session::session_factory_t& sessions,
                                        connection_close_sink& close_sink,
                                        size_t slot,
-                                       std::chrono::milliseconds read_timeout)
-        : frontend_connection(std::move(socket), connection_id, close_sink, slot, read_timeout)
+                                       connection_timeouts_t timeouts)
+        : frontend_connection(std::move(socket), connection_id, close_sink, slot, timeouts)
         , resource_(resource)
         , statement_id_map_(resource_)
         , sequence_id_(0)
         , next_statement_id_(0)
-        , client_max_packet_size_(DEFAULT_MAX_PACKET_SIZE)
         , session_(sessions.open(otterstax::session::database_term_t::schema))
         , state_(connection_state::HANDSHAKE)
         , log_(get_logger(logger_tag::MYSQL_CONNECTION)) {
@@ -110,8 +110,12 @@ namespace frontend::mysql {
                 sequence_id_ = 2;
                 break;
             case connection_state::COMMAND:
-                sequence_valid = (seq_id == 0); // start with 0
-                sequence_id_ = 1;
+                if (command_.empty()) {
+                    sequence_valid = (seq_id == 0);
+                    sequence_id_ = 1;
+                } else {
+                    sequence_valid = (seq_id == command_seq_);
+                }
                 break;
             case connection_state::HANDSHAKE:
                 // The server writes the handshake and moves to AUTH before it
@@ -121,14 +125,17 @@ namespace frontend::mysql {
         }
 
         if (!sequence_valid) {
+            if (!command_.empty()) {
+                // Mid-command the two sides are in different commands, and a
+                // stream cannot resync inside one: the connection ends.
+                sequence_id_ = seq_id + 1;
+                send_fatal_error(mysql_error::ER_SEQUENCE_ERROR,
+                                 "Packet sequence error in COMMAND got: " + std::to_string(seq_id));
+                co_return;
+            }
             std::string state_str = state_ == connection_state::AUTH ? "AUTH" : "COMMAND";
             send_error(mysql_error::ER_SEQUENCE_ERROR,
                        "Packet sequence error in " + std::move(state_str) + " got: " + std::to_string(seq_id));
-            co_return;
-        }
-
-        if (payload.size() > client_max_packet_size_) {
-            send_error(mysql_error::ER_PACKET_TOO_LARGE, "Packet exceeds max_allowed_packet");
             co_return;
         }
 
@@ -137,11 +144,51 @@ namespace frontend::mysql {
                 co_await handle_auth(std::move(payload));
                 break;
             case connection_state::COMMAND:
-                co_await handle_command(std::move(payload));
+                co_await handle_command_packet(seq_id, std::move(payload));
                 break;
             case connection_state::HANDSHAKE:
                 break; // refused by the first switch above
         }
+    }
+
+    boost::asio::awaitable<void> mysql_connection::handle_command_packet(uint8_t seq_id, std::vector<uint8_t> payload) {
+        { OTX_ZONE_N("mysql::handle_command_packet"); }
+        if (command_.empty()) {
+            if (payload.size() < MAX_PACKET_SIZE) {
+                // The whole command in one wire packet.
+                sequence_id_ = seq_id + 1;
+                co_await handle_command(std::move(payload));
+                co_return;
+            }
+            if (payload.size() > MAX_ALLOWED_PACKET) {
+                sequence_id_ = seq_id + 1;
+                send_fatal_error(mysql_error::ER_PACKET_TOO_LARGE, "Command exceeds max_allowed_packet");
+                co_return;
+            }
+            command_ = std::move(payload);
+            command_seq_ = seq_id + 1;
+            read_packet(); // the next piece, once this handler ends
+            co_return;
+        }
+
+        if (command_.size() + payload.size() > MAX_ALLOWED_PACKET) {
+            command_.clear();
+            command_.shrink_to_fit();
+            sequence_id_ = seq_id + 1;
+            send_fatal_error(mysql_error::ER_PACKET_TOO_LARGE, "Command exceeds max_allowed_packet");
+            co_return;
+        }
+        command_.insert(command_.end(), payload.begin(), payload.end());
+        if (payload.size() == MAX_PACKET_SIZE) {
+            // Still a full packet: the command continues.
+            command_seq_ = seq_id + 1;
+            read_packet();
+            co_return;
+        }
+        // A piece shorter than a full packet ends the command, an empty one too
+        sequence_id_ = seq_id + 1;
+        std::vector<uint8_t> whole = std::move(command_);
+        co_await handle_command(std::move(whole));
     }
 
     void mysql_connection::send_error(mysql_error error_code, std::string message) {
@@ -153,15 +200,15 @@ namespace frontend::mysql {
         send_packet(build_error(writer_, sequence_id_++, error_code, std::move(message)));
     }
 
-    void mysql_connection::send_malformed_packet_error(std::string message) {
-        log_->warn("[Connection {}] ERROR: malformed packet, disconnecting: msg='{}' seq={}",
-                   connection_id_,
-                   message,
-                   static_cast<int>(sequence_id_));
-        // The write is initiated before the close is posted, so the ERR packet
+    void mysql_connection::send_fatal_error(mysql_error error_code, std::string message) {
+        // The ERR write is initiated before the close is posted, so the packet
         // reaches the client ahead of the FIN (the same order the PG frontend
         // relies on for a FATAL ErrorResponse).
-        send_packet(build_error(writer_, sequence_id_++, mysql_error::ER_MALFORMED_PACKET, std::move(message)), false);
+        send_error(error_code, std::move(message));
         finish();
+    }
+
+    void mysql_connection::send_malformed_packet_error(std::string message) {
+        send_fatal_error(mysql_error::ER_MALFORMED_PACKET, std::move(message));
     }
 } // namespace frontend::mysql

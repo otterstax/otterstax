@@ -215,7 +215,7 @@ TEST_CASE("agent: ClickHouse has no transactions, unpin is the one step it answe
 TEST_CASE("agent: a read answers the rows of its statement, a write the backend's count") {
     agent_stack_t stack(backend_type_t::PostgreSQL);
     stack.server.add_table(
-        {"shop", "public", "t", {column("id", logical_type::BIGINT), column("note", logical_type::STRING_LITERAL)},
+        {"shop", "public", "t", {column("id", logical_type::BIGINT), column("note", logical_type::TEXT)},
          {{std::int64_t{1}, std::string{"a"}}, {std::int64_t{2}, std::string{"b"}}}});
     auto rows = wait_ready(stack.send(&fed::backend_agent_t::read,
                                       std::string{R"(SELECT "note" FROM "public"."t")"},
@@ -231,12 +231,41 @@ TEST_CASE("agent: a read answers the rows of its statement, a write the backend'
                                          false,
                                          qualified_name_t{}));
     REQUIRE_FALSE(written.has_error());
-    CHECK(written.value() == 2);
+    CHECK(written.value().count == 2);
+}
+
+// A MySQL INSERT answers the id it generated first (its OK packet's last_insert_id), which becomes the write
+// receipt's generated_id and the MySQL wire's last_insert_id; no other write and no other dialect answers one.
+TEST_CASE("agent: a MySQL INSERT answers its generated id") {
+    const auto write = [](agent_stack_t& stack, std::string sql, fed::write_kind_t kind) {
+        auto written = wait_ready(stack.send(&fed::backend_agent_t::write, std::move(sql), kind, false, qualified_name_t{}));
+        INFO((written.has_error() ? std::string{written.error().what} : std::string{"ok"}));
+        REQUIRE_FALSE(written.has_error());
+        return written.value();
+    };
+    agent_stack_t stack(backend_type_t::MySQL);
+    REQUIRE_FALSE(stack.agent->connect().contains_error());
+    // No AUTO_INCREMENT: none generated.
+    auto none = write(stack, "INSERT INTO `bill`.`t` (`a`) VALUES (1)", fed::write_kind_t::insert);
+    CHECK(none.count == 1);
+    CHECK(none.generated_id == 0);
+    stack.server.set_next_insert_id(41);
+    auto two = write(stack, "INSERT INTO `bill`.`t` (`a`) VALUES (1), (2)", fed::write_kind_t::insert);
+    CHECK(two.count == 2);
+    CHECK(two.generated_id == 41);
+    CHECK(write(stack, "INSERT INTO `bill`.`t` (`a`) VALUES (3)", fed::write_kind_t::insert).generated_id == 43);
+    CHECK(write(stack, "DELETE FROM `bill`.`t`", fed::write_kind_t::delete_).generated_id == 0);
+
+    agent_stack_t pg(backend_type_t::PostgreSQL);
+    pg.server.set_next_insert_id(7);
+    auto pg_written = write(pg, R"(INSERT INTO "public"."t" ("a") VALUES (1))", fed::write_kind_t::insert);
+    CHECK(pg_written.count == 1);
+    CHECK(pg_written.generated_id == 0);
 }
 
 TEST_CASE("agent: a MySQL discovery reads the server's listing and probes") {
     agent_stack_t stack(backend_type_t::MySQL);
-    stack.server.add_table({"Bill", "", "Orders", {column("id", logical_type::BIGINT), column("Note", logical_type::STRING_LITERAL)}, {}});
+    stack.server.add_table({"Bill", "", "Orders", {column("id", logical_type::BIGINT), column("Note", logical_type::TEXT)}, {}});
     auto reply = wait_ready(stack.send(&fed::backend_agent_t::discover,
                                        qualified_name_t{core::connection_name_t{"my"},
                                                         core::dbname_t{"Bill"},
@@ -318,7 +347,7 @@ TEST_CASE("agent: cancel ends a statement the backend never answers and refuses 
 
 namespace {
 
-    constexpr fed::oid_t table_oid = 100;
+    constexpr fed::oid_t table_oid{100};
 
     // A PostgreSQL connection's actor over `agents` fake agents and one registered table
     // pg.shop.public.t (id, note).
@@ -327,7 +356,7 @@ namespace {
             : server(backend_type_t::PostgreSQL)
             , pool(threads) {
             server.add_table(
-                {"shop", "public", "t", {column("id", logical_type::BIGINT), column("note", logical_type::STRING_LITERAL)},
+                {"shop", "public", "t", {column("id", logical_type::BIGINT), column("note", logical_type::TEXT)},
                  {{std::int64_t{1}, std::string{"a"}}}});
             std::vector<fed::backend_agent_ptr> agents;
             for (int i = 0; i < agents_count; ++i) {
@@ -340,13 +369,13 @@ namespace {
                                                              pool.pool.get());
             REQUIRE_FALSE(actor->construction_error().contains_error());
             auto id = column("id", logical_type::BIGINT);
-            auto note = column("note", logical_type::STRING_LITERAL);
+            auto note = column("note", logical_type::TEXT);
             actor->load_tables({fed::registered_table_t{
                 table_oid,
                 qualified_name_t{core::connection_name_t{"pg"}, core::dbname_t{"shop"}, core::schema_t{"public"}, core::relname_t{"t"}},
                 "public",
                 "t",
-                {fed::registered_column_t{1, "id", id, "id"}, fed::registered_column_t{2, "note", note, "note"}}}});
+                {fed::registered_column_t{fed::oid_t{1}, "id", id, "id"}, fed::registered_column_t{fed::oid_t{2}, "note", note, "note"}}}});
         }
         // main's shutdown: the agents cancelled, the pool stopped, the actor destroyed.
         ~actor_stack_t() { shut_down(); }

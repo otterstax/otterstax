@@ -58,7 +58,7 @@ namespace {
     std::pmr::vector<cv::data_chunk_t> widgets(std::pmr::memory_resource* resource) {
         std::pmr::vector<ct::complex_logical_type> types(resource);
         types.emplace_back(ct::logical_type::INTEGER, "id");
-        types.emplace_back(ct::logical_type::STRING_LITERAL, "name");
+        types.emplace_back(ct::logical_type::TEXT, "name");
         cv::data_chunk_t chunk(resource, types, 2);
         chunk.set_value(0, 0, int32_t{1});
         chunk.set_value(1, 0, std::string_view{"widget"});
@@ -143,7 +143,7 @@ TEST_CASE("show_string: truncate 0 aligns the cells left") {
 
 TEST_CASE("show_string: a long cell is cut to truncate characters with an ellipsis") {
     std::pmr::synchronized_pool_resource pool;
-    auto chunks = one_cell(ct::complex_logical_type{ct::logical_type::STRING_LITERAL},
+    auto chunks = one_cell(ct::complex_logical_type{ct::logical_type::TEXT},
                            std::string_view{"abcdefghijklmnopqrstuvwxyz"},
                            &pool);
     // truncate 20: the first 17 characters and "...".
@@ -178,7 +178,7 @@ TEST_CASE("show_string: a NULL cell reads NULL") {
     std::pmr::synchronized_pool_resource pool;
     std::pmr::vector<ct::complex_logical_type> types(&pool);
     types.emplace_back(ct::logical_type::INTEGER, "id");
-    types.emplace_back(ct::logical_type::STRING_LITERAL, "name");
+    types.emplace_back(ct::logical_type::TEXT, "name");
     cv::data_chunk_t chunk(&pool, types, 2);
     chunk.set_value(0, 0, int32_t{1});
     chunk.data[1].validity().set_invalid(0);
@@ -263,7 +263,7 @@ TEST_CASE("show_string: the schema's field names head the columns") {
     std::pmr::synchronized_pool_resource pool;
     std::pmr::vector<ct::complex_logical_type> fields(&pool);
     fields.emplace_back(ct::logical_type::INTEGER, "product_id");
-    fields.emplace_back(ct::logical_type::STRING_LITERAL, "title");
+    fields.emplace_back(ct::logical_type::TEXT, "title");
     const auto schema = ct::complex_logical_type::create_struct("row", fields);
     CHECK(render(schema, widgets(&pool), 20, 0, false, &pool) == "+----------+------+\n"
                                                                  "|product_id|title |\n"
@@ -289,14 +289,14 @@ TEST_CASE("show_string: an unnamed column is col<i>") {
 
 TEST_CASE("show_string: control characters are escaped") {
     std::pmr::synchronized_pool_resource pool;
-    CHECK(cell_of(ct::logical_type::STRING_LITERAL, std::string_view{"a\tb\nc"}, &pool) == one_cell_table("a\\tb\\nc"));
+    CHECK(cell_of(ct::logical_type::TEXT, std::string_view{"a\tb\nc"}, &pool) == one_cell_table("a\\tb\\nc"));
 }
 
 TEST_CASE("show_string: a full-width character takes two columns") {
     std::pmr::synchronized_pool_resource pool;
     // Two CJK characters are four columns wide: the frame is four dashes and the
     // one-character header is padded by three.
-    CHECK(cell_of(ct::logical_type::STRING_LITERAL, std::string_view{"\xE6\x97\xA5\xE6\x9C\xAC"}, &pool) ==
+    CHECK(cell_of(ct::logical_type::TEXT, std::string_view{"\xE6\x97\xA5\xE6\x9C\xAC"}, &pool) ==
           "+----+\n"
           "|c   |\n"
           "+----+\n"

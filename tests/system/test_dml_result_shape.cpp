@@ -711,7 +711,7 @@ TEST_CASE("prepared matrix: a parameterized SELECT is prepared from the engine's
         INFO("described id: " << static_cast<int>(schema.child_types()[0].type())
                               << ", name: " << static_cast<int>(schema.child_types()[1].type()));
         REQUIRE(schema.child_types()[0].type() == components::types::logical_type::BIGINT);
-        REQUIRE(schema.child_types()[1].type() == components::types::logical_type::STRING_LITERAL);
+        REQUIRE(schema.child_types()[1].type() == components::types::logical_type::TEXT);
 
         // The control: the same statement without a placeholder is validated by
         // the engine, which stamps the very same types.
@@ -720,7 +720,7 @@ TEST_CASE("prepared matrix: a parameterized SELECT is prepared from the engine's
         REQUIRE_FALSE(exact.has_error());
         REQUIRE(exact.value().schema.child_types().size() == 2);
         REQUIRE(exact.value().schema.child_types()[0].type() == components::types::logical_type::BIGINT);
-        REQUIRE(exact.value().schema.child_types()[1].type() == components::types::logical_type::STRING_LITERAL);
+        REQUIRE(exact.value().schema.child_types()[1].type() == components::types::logical_type::TEXT);
 
         // `SELECT *` names no column on the plan, so the whole probed schema is
         // the answer: the table's columns, in order, typed. It used to be a
@@ -736,7 +736,7 @@ TEST_CASE("prepared matrix: a parameterized SELECT is prepared from the engine's
         REQUIRE(star_schema.child_types()[0].alias() == "id");
         REQUIRE(star_schema.child_types()[1].alias() == "name");
         REQUIRE(star_schema.child_types()[0].type() == components::types::logical_type::BIGINT);
-        REQUIRE(star_schema.child_types()[1].type() == components::types::logical_type::STRING_LITERAL);
+        REQUIRE(star_schema.child_types()[1].type() == components::types::logical_type::TEXT);
 
         // ...and the execution answers exactly that, column for column: there
         // is nothing left for the frontend's check to refuse.
@@ -984,7 +984,7 @@ TEST_CASE("prepared matrix: a DML with RETURNING is described from its target co
         REQUIRE(engine_row_count(s, "local.dmldb", "people") == 3);
 
         const auto bigint = components::types::logical_type::BIGINT;
-        const auto text = components::types::logical_type::STRING_LITERAL;
+        const auto text = components::types::logical_type::TEXT;
         const auto structure = components::types::logical_type::STRUCT;
 
         // A RETURNING column list: the columns it names, under the names and the
@@ -1181,8 +1181,8 @@ TEST_CASE("prepared matrix: a self join numbers one probe per relation not per n
         INFO("described join columns: " << schema.child_types().size());
         REQUIRE(schema.child_types().size() == 3);
         REQUIRE(schema.child_types()[0].type() == components::types::logical_type::BIGINT);
-        REQUIRE(schema.child_types()[1].type() == components::types::logical_type::STRING_LITERAL);
-        REQUIRE(schema.child_types()[2].type() == components::types::logical_type::STRING_LITERAL);
+        REQUIRE(schema.child_types()[1].type() == components::types::logical_type::TEXT);
+        REQUIRE(schema.child_types()[2].type() == components::types::logical_type::TEXT);
 
         parameters_t p{s.resource};
         p.push_back(components::vector::make_scalar(s.resource, std::int64_t{1}));

@@ -148,6 +148,14 @@ namespace frontend::spark {
             cl::parameter_node_ptr params;
             // Parses spark.sql() leaves and filter strings (parse_fragment).
             GreenplumParser parser;
+            // The last id this translator gave a join input (a USING key names its input by it). A
+            // parsed fragment numbers its own FROM elements from 1, so these start far above them.
+            ce::source_element_id_t last_element{ce::source_element_id_t{1} << 30};
+
+            ce::source_element_id_t number_input(cl::node_t& input) {
+                input.set_source_element(++last_element);
+                return input.source_element();
+            }
         };
 
         // A DataFrame operation that stacks a clause onto the aggregate below it.
@@ -747,20 +755,29 @@ namespace frontend::spark {
                 // compare(key_t, key_t) — a key_t implicitly converts to param_storage.
                 // A compare(get_field_scalar, get_field_scalar) shape would not be
                 // evaluable by the remote SQL generator or the local value-getter.
-                // The keys MUST carry a side (left/right): the join value-getter selects
-                // the input chunk by key.side(), and the validator rejects an
-                // undefined-side key whose bare name occurs in both inputs as ambiguous.
-                // The validator stamps key.path() from side+schema afterwards.
+                // Each key MUST name its input (the id of the join's child it reads):
+                // the validator rejects a key whose bare name occurs in both inputs as
+                // ambiguous, and resolves a key naming an input against that input only,
+                // stamping key.path() over the left input's columns then the right's.
+                // An input that is a parsed fragment's root keeps its own columns' names,
+                // which is all a reference inside it needs once it is renumbered.
+                const auto left_element = ctx.number_input(*join_node->children()[0]);
+                const auto right_element = ctx.number_input(*join_node->children()[1]);
+                auto input_key = [resource](std::string_view name, ce::source_element_id_t element) {
+                    ce::key_t key(resource, name);
+                    key.set_source_element(element);
+                    return key;
+                };
                 if (join.using_columns_size() == 1) {
-                    ce::key_t left_key(resource, std::string_view(join.using_columns(0)), ce::side_t::left);
-                    ce::key_t right_key(resource, std::string_view(join.using_columns(0)), ce::side_t::right);
+                    auto left_key = input_key(join.using_columns(0), left_element);
+                    auto right_key = input_key(join.using_columns(0), right_element);
                     join_node->append_expression(
                         ce::make_compare_expression(resource, ce::compare_type::eq, left_key, right_key));
                 } else {
                     auto and_expr = ce::make_compare_union_expression(resource, ce::compare_type::union_and);
                     for (const auto& col : join.using_columns()) {
-                        ce::key_t left_key(resource, std::string_view(col), ce::side_t::left);
-                        ce::key_t right_key(resource, std::string_view(col), ce::side_t::right);
+                        auto left_key = input_key(col, left_element);
+                        auto right_key = input_key(col, right_element);
                         and_expr->append_child(
                             ce::make_compare_expression(resource, ce::compare_type::eq, left_key, right_key));
                     }

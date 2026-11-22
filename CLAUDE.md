@@ -29,6 +29,7 @@ service:
   postgres:      { port: 8817 }     # wire-server port (NOT a backend)
   spark_connect: { host: "0.0.0.0", port: 15002, session_timeout_s: 3600 }  # 0 = never expire
   connection_retry: { max_attempts: 10, delay_ms: 2000 }   # default 1 / 1000 = one attempt
+  timezone: UTC                     # the server's: every session's TimeZone until its client sets one
   engine:  { data_dir: /tmp/test_collection_sql/base, log_dir: "" }        # log_dir empty = data_dir
   runtime:                          # every thread pool; every key optional
     general: { threads: 3 }         # engine pools (>= 1)
@@ -272,7 +273,12 @@ Frontend (MySQL / PostgreSQL / Flight SQL / Spark Connect)          frontend/CLA
 - **Settings.** `SET` / `RESET` go to the engine, per session (it has `timezone`, `autocommit`,
   `search_path`); the frontends translate their own forms (MySQL `SET @@x`, `USE`, `time_zone`) and
   keep only the protocol parameters (PostgreSQL `client_encoding`, `DateStyle`, `application_name`,
-  `extra_float_digits`, …; MySQL character sets). `frontend/CLAUDE.md`.
+  `extra_float_digits`, `idle_session_timeout`, …; MySQL character sets, `wait_timeout`). `frontend/CLAUDE.md`.
+- **Idle timeout.** A MySQL / PostgreSQL connection past its handshake is closed after
+  `IDLE_TIMEOUT_SEC` (28800 s, `frontend/common/protocol_config.hpp`) without a message; each
+  connection sets its own — MySQL `SET [SESSION] wait_timeout = N` (`@@wait_timeout`), PostgreSQL
+  `SET idle_session_timeout = '5min'` (or its StartupMessage; `0` never) — and the handshake and a
+  message's body keep `CONNECTION_TIMEOUT_SEC` (30 s).
 - **Prepared statements** are reusable: the session keeps the text and the engine's describe, and
   each execute binds and runs it again until `close_statement`.
 - **Spark Connect**: `spark.sql()` text through `query_session_t::execute` (a query handed back
@@ -335,6 +341,16 @@ SELECT o.id, c.name FROM mysql.bill.orders o JOIN pg.shop.customers c ON o.custo
   is a connection as that database (`lookup_database`), so nothing rewrites a name. A MySQL /
   ClickHouse connection sees every user database of its server.
 - A column is qualified by at most `uid.ns.t.col`; a table under an alias by its alias only.
+- A quoted qualifier holding dots whose first segment is a connection or `local` is the name it spells
+  (an ORM's one schema slot): `"pg.public"."items"` — and MySQL's `` `pg.public`.items `` — is
+  `pg.public.items`; an alias `AS "pg.total"` and any other quoted name keep their dots
+  (`catalog::split_dotted_names`, run on every text `query_session_t::parse_sql` parses).
+- A call of a host function (`version()`, and `obj_description` / `col_description` (NULL) until otterbrix
+  has them; registered in `local.public` at startup) written bare or as `pg_catalog.<name>()` is written
+  `local.public.<name>()` before the parse, and `pg_table_is_visible(x)` as a sub-query over pg_catalog and
+  the session's place
+  (`catalog::qualify_host_calls`): otterbrix keeps no host function in pg_catalog, and a call naming
+  `local.public` reaches it from any place.
 - **The place** is the client's choice: the PostgreSQL StartupMessage `database`, the MySQL handshake
   database / `USE` / `COM_INIT_DB`, Spark's current database name `uid` (its default namespace:
   PostgreSQL's configured schema or `public`, MySQL / ClickHouse's configured database), `uid.ns`,
@@ -429,7 +445,7 @@ session's place, is `local.kafka.<obj>` produces to Kafka.
 | `frontend/` | `common_server`, `flight_sql`, `mysql_server`, `postgres_server`, `spark_connect_server` | the four servers. `frontend/CLAUDE.md` |
 | `types/` | (header-only) | `ExecutionPlanPtr`, `plan_root` |
 | `utility/` | (header-only) | logger, Tracy macros, `asio_error`, `wait_barrier`, `thread_pool_manager`, `parse_port`, `table_info`, … `utility/CLAUDE.md` |
-| `cmake/` | — | `otterbrix_parser_extension.cmake` (flex + bison extensions), conan hooks |
+| `cmake/` | — | conan hooks |
 | `tests/` | the 12 binaries above | Catch2 suites + the python integration suite and PySpark client matrix. `tests/CLAUDE.md` |
 | `benchmark/`, `examples/` | — | benchmark harness (`benchmark/CLAUDE.md`), demo and quick start stacks |
 
@@ -457,7 +473,9 @@ session's place, is `local.kafka.<obj>` produces to Kafka.
   expression with no literal in the dialect) is `unimplemented_yet` — OtterStax numbers no remote
   row. An uncorrelated sub-query over a local table (`WHERE id IN (SELECT id FROM <local table>)`)
   is no obstacle: otterbrix computes it first and the backend gets its values (`IN (2, 3)`).
-  RETURNING: PostgreSQL only.
+  RETURNING: sent to PostgreSQL and MySQL — the backend answers what it has (MariaDB INSERT / DELETE
+  … RETURNING, MariaDB 13's UPDATE … RETURNING too; MySQL's and an older MariaDB's UPDATE … RETURNING are the server's
+  own refusal); ClickHouse refused.
 - otterbrix casts an UPDATE value to its column's type, and a literal is BIGINT / DOUBLE: `SET i = i + 1`
   (INTEGER), `SET f = 2.5` (FLOAT) narrow, range-checked. MySQL / ClickHouse have no such CAST, so the
   backend's store does the check (otterbrix does not mark the assignment's cast): MySQL writes the value uncast, which only a
@@ -469,9 +487,9 @@ session's place, is `local.kafka.<obj>` produces to Kafka.
   a DOUBLE into Float32 only as a bound value
   (`f = f + 1` is `unimplemented_yet`). A fraction into an integer column stays `unimplemented_yet`
   on both (MySQL rounds a DECIMAL half away from zero, the engine to even).
-- An INSERT that omits a column sends NULL for it: the backend's DEFAULT / serial / AUTO_INCREMENT is
-  lost (NOT NULL → `not_null_violation`) — otterbrix leaves no column to the backend's DEFAULT. An INSERT … SELECT of one backend is
-  not pushed down (its rows pass through the engine).
+- An INSERT names only the columns the client wrote (`INSERT INTO t (id) …` is `INSERT … ("id") VALUES …`
+  on the backend): an omitted column takes the backend's DEFAULT / serial / AUTO_INCREMENT. An INSERT … SELECT
+  of one backend is not pushed down (its rows pass through the engine).
 - Remote DDL (`CREATE / DROP / ALTER TABLE uid.ns.t`) runs only in autocommit (otterbrix refuses it
   inside a block, `unimplemented_yet`): otterbrix's storage contract has no DDL inside a transaction. MySQL / ClickHouse DDL commits on the
   backend at once (an engine failure afterwards is compensated by a DROP); a DROP TABLE / COLUMN is
@@ -483,6 +501,10 @@ session's place, is `local.kafka.<obj>` produces to Kafka.
   doubt (no two-phase commit).
 - The count of a MySQL UPDATE is the rows it matched (read off the OK packet's info: Boost.MySQL sets
   no `CLIENT_FOUND_ROWS`); ClickHouse answers `written_rows` for an INSERT and 0 for a mutation.
+- An INSERT's generated id (the MySQL wire's `last_insert_id`, `cursor.lastrowid`) is a MySQL backend's
+  AUTO_INCREMENT only — its OK packet's `last_insert_id`, the first of the statement (otterbrix's
+  `write_receipt_t::generated_id` → `cursor_t::generated_id()` → `session_payload::generated_id`); an
+  INSERT into a PostgreSQL / ClickHouse connection or a local table reports 0.
 
 **Connections and names**
 
@@ -516,12 +538,26 @@ session's place, is `local.kafka.<obj>` produces to Kafka.
   doubled (`sql_gen`, `catalog::escape_sql_literal`), which reads the same under on and off.
 - An agent runs its statement (and a reconnect: connect bounded by 10 s) on a backends-pool thread;
   MySQL / PostgreSQL bound no statement, so a hung backend holds that thread until the shutdown
-  cancels the agents (no cancel of a running statement from the client).
+  cancels the agents. A client's cancel (PostgreSQL CancelRequest, MySQL `KILL QUERY` / `KILL CONNECTION`)
+  stops the waiting connection's await and answers it cancelled (`frontend/common/cancel_registry.hpp`), but
+  the statement runs on: the engine has no cancel.
 - One `remote_backends_t` per `runtime_t`: its destructor stops the runtime's backends pool.
 - `storage_total_rows` answers a constant estimate (1000), no query (otterbrix asks for no table size).
 
 **Results and semantics**
 
+- Backend dates and times are the engine's temporal types: MySQL DATE / DATETIME / TIMESTAMP / TIME as DATE /
+  TIMESTAMP / TIMESTAMPTZ / TIME, PostgreSQL's as themselves (TIMETZ, INTERVAL too), ClickHouse Date / Date32 as
+  DATE and DateTime / DateTime64 as TIMESTAMPTZ (Time stays text). Every agent session reads them in one form —
+  MySQL `time_zone = '+00:00'`, PostgreSQL `DateStyle ISO`, `IntervalStyle postgres`, `TimeZone UTC`
+  (`backend_agent_t::check_session`) — so instants are exact across backends; a value the engine's type has no room
+  for (a MySQL zero date, a TIME past a day, PostgreSQL `infinity`) refuses the read. A pushed-down expression that
+  depends on a zone (`ts::date`, `now()`) runs on the backend in UTC, not the client's TimeZone, until the agents
+  follow the session's zone (otterbrix's `time_zone_t` exposes no zone name yet). A remote column registered as
+  TEXT by an earlier version is re-typed by the next startup's reconciliation.
+- A MySQL / MariaDB `TINYINT(1)` (a display width of 1: `BOOLEAN`, `BOOL`, a Django BooleanField) is
+  registered and read as BOOLEAN, any value but 0 true (Connector/J's `tinyInt1isBit`): a TINYINT(1) that
+  stores other small integers reads them as `true`. Every other TINYINT is an integer.
 - A pushed-down expression is evaluated by the backend with its semantics (division by zero: MySQL
   NULL, PostgreSQL an error, ClickHouse `inf`); the result *types* are always the engine's
   (`conform_to_result`).
@@ -532,9 +568,9 @@ session's place, is `local.kafka.<obj>` produces to Kafka.
 **Sessions and drivers**
 
 - SET / SHOW a driver sends that the engine does not have is refused (otterbrix has neither the
-  settings drivers send nor SHOW): MySQL Connector/J `SQL_SELECT_LIMIT`, Rails `sql_mode` /
-  `wait_timeout` (`1149`), a PostgreSQL `SHOW` of anything but the client parameters
-  (`application_name`, `client_encoding`, `extra_float_digits`) — `SHOW DateStyle`,
+  settings drivers send nor SHOW): MySQL Connector/J `SQL_SELECT_LIMIT`, Rails `sql_mode`
+  (`1149`), a PostgreSQL `SHOW` of anything but the client parameters
+  (`application_name`, `client_encoding`, `extra_float_digits`, `idle_session_timeout`) — `SHOW DateStyle`,
   `SHOW server_version`, … go to the engine, which has no SHOW.
 - `DISCARD ALL` is refused (outside a block by the engine; inside `25001`): otterbrix has no
   DISCARD. pgbouncer: `server_reset_query = 'RESET ALL; DEALLOCATE ALL'`.
@@ -564,13 +600,14 @@ session's place, is `local.kafka.<obj>` produces to Kafka.
 
 ## Critical Dependency Versions (`conanfile.py`)
 
-- otterbrix `1.0.0b2-rc-4#0cdaa27b38b1da19885a7b44e01fa4e7` from `conan.otterbrix.com` — tag `1.0.0b2-rc-4`
-  on otterbrix `main` `01ec5268` (PR #850 merged; the tree of `feat/otterstax-requests` @ `af99cccf`). The remote
+- otterbrix `1.0.0b2-rc-7#01a9e7c6173c1b2f198da8efa2887499` from `conan.otterbrix.com` (source: the
+  GitHub tag `1.0.0b2-rc-7`). The remote
   holds only a Linux x86_64 gcc 13 Release static binary; OtterStax links it shared (`otterbrix/*:shared=True`,
   `conanfile.py`), so `conan install … --build missing` builds it from the remote recipe against the abseil / re2 /
-  boost overrides of `conanfile.py`. One `libotterbrix.so`. The TSAN image passes `--build="otterbrix/*"
+  boost overrides of `conanfile.py` (its own pins, abseil 20260107.1 / re2 20240702, cannot be taken: that
+  abseil breaks protobuf 5.27 / gRPC 1.69). One `libotterbrix.so`. The TSAN image passes `--build="otterbrix/*"
   --build="actor-zeta/*"`, the ASAN image `--build="otterbrix/*"` (instrumentation).
-- actor-zeta `2.0.0#887bc992cac0ead59e5bdf5c90c844f4` from `conan.otterbrix.com` (Linux x86_64 gcc 13
+- actor-zeta `2.0.1#b72880c342fcff50f62cc8c16d460cd1` from `conan.otterbrix.com` (Linux x86_64 gcc 13
   binary; other configurations `--build missing`).
 - Arrow 24.0.0 (shared; s3, parquet, csv, json; snappy / brotli / zlib / lz4 / zstd)
 - Boost 1.88.0, gRPC 1.69.0 + asio-grpc 3.7.0 (`backend=boost`), libpq 15.4, clickhouse-cpp 2.6.1,

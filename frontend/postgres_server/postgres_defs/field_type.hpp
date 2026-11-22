@@ -22,8 +22,12 @@ namespace frontend::postgres {
         TEXT = 25,
         FLOAT4 = 700,
         FLOAT8 = 701,
+        DATE = 1082,
+        TIME = 1083,
         TIMESTAMP = 1114,
         TIMESTAMPTZ = 1184,
+        INTERVAL = 1186,
+        TIMETZ = 1266,
         BIT = 1560,
         NUMERIC = 1700,
         UUID = 2950,
@@ -76,6 +80,14 @@ namespace frontend::postgres {
                 return field_type::TIMESTAMP;
             case static_cast<oid_t>(field_type::TIMESTAMPTZ):
                 return field_type::TIMESTAMPTZ;
+            case static_cast<oid_t>(field_type::DATE):
+                return field_type::DATE;
+            case static_cast<oid_t>(field_type::TIME):
+                return field_type::TIME;
+            case static_cast<oid_t>(field_type::TIMETZ):
+                return field_type::TIMETZ;
+            case static_cast<oid_t>(field_type::INTERVAL):
+                return field_type::INTERVAL;
             default:
                 return field_type::NA;
         }

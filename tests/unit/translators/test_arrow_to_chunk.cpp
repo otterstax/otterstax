@@ -147,7 +147,7 @@ TEST_CASE("arrow_to_chunk: natively read columns keep their types names and valu
     CHECK(types[0].alias() == "amount");
     CHECK(types[1].type() == logical_type::BIGINT);
     CHECK(types[1].alias() == "id");
-    CHECK(types[2].type() == logical_type::STRING_LITERAL);
+    CHECK(types[2].type() == logical_type::TEXT);
     CHECK(types[2].alias() == "name");
     CHECK(types[3].type() == logical_type::BOOLEAN);
     CHECK(types[3].alias() == "flag");
@@ -243,7 +243,7 @@ TEST_CASE("arrow_to_chunk: dates timestamps and dictionary strings are read by o
     CHECK(types[0].type() == logical_type::DATE);
     CHECK(types[0].alias() == "day");
     CHECK(types[1].type() == logical_type::TIMESTAMP);
-    CHECK(types[2].type() == logical_type::STRING_LITERAL);
+    CHECK(types[2].type() == logical_type::TEXT);
     CHECK(types[2].alias() == "label");
 
     constexpr int64_t engine_days = 19000 - 10957;

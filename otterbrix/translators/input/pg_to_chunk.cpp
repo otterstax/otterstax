@@ -8,6 +8,7 @@
 #include "utility/tracy_profiler.hpp"
 
 #include <components/casts/kernels/string_cast.hpp>
+#include <core/date/date_parse.hpp>
 
 #include <algorithm>
 #include <charconv>
@@ -34,6 +35,8 @@ namespace pg_oid {
     constexpr Oid TIMEOID = 1083;
     constexpr Oid TIMESTAMPOID = 1114;
     constexpr Oid TIMESTAMPTZOID = 1184;
+    constexpr Oid INTERVALOID = 1186;
+    constexpr Oid TIMETZOID = 1266;
     constexpr Oid NUMERICOID = 1700;
     constexpr Oid UUIDOID = 2950;
     constexpr Oid JSONOID = 114;
@@ -184,6 +187,30 @@ namespace tsl {
             return parse_outcome::parsed;
         }
 
+        // The date/time family as the engine's own types, read off PostgreSQL's ISO text (every agent session runs
+        // under DateStyle ISO, IntervalStyle postgres and TimeZone UTC — backend_agent_t::check_session — and a
+        // timestamptz / timetz carries its offset). A value the engine's type has no room for — infinity, -infinity,
+        // a year past the engine's range — is refused (out_of_range), never altered.
+        template<typename T, std::optional<T> (*parse)(std::string_view)>
+        parse_outcome set_temporal(data_chunk_t& chunk,
+                                   PGresult* result,
+                                   int row_index,
+                                   int column_index,
+                                   const types::complex_logical_type&) {
+            if (PQgetisnull(result, row_index, column_index)) {
+                chunk.data[column_index].set_null(row_index, true);
+                return parse_outcome::parsed;
+            }
+            const std::string_view text{PQgetvalue(result, row_index, column_index)};
+            auto value = parse(text);
+            if (!value) {
+                return text.find("infinity") != std::string_view::npos ? parse_outcome::out_of_range
+                                                                       : parse_outcome::malformed;
+            }
+            chunk.data[column_index].set_value(row_index, std::move(*value));
+            return parse_outcome::parsed;
+        }
+
         parse_outcome set_bytea(data_chunk_t& chunk,
                        PGresult* result,
                        int row_index,
@@ -324,7 +351,7 @@ namespace tsl {
                             return {set_decimal, std::move(*decimal)};
                         }
                     }
-                    return {set_string, {types::logical_type::STRING_LITERAL, column_name}};
+                    return {set_string, {types::logical_type::TEXT, column_name}};
                 }
 
                 case pg_oid::CHAROID:
@@ -333,18 +360,33 @@ namespace tsl {
                 case pg_oid::UUIDOID:
                 case pg_oid::JSONOID:
                 case pg_oid::JSONBOID:
+                    return {set_string, {types::logical_type::TEXT, column_name}};
+
                 case pg_oid::DATEOID:
+                    return {set_temporal<core::date::date_t, &core::date::parse_date>,
+                            {types::logical_type::DATE, column_name}};
                 case pg_oid::TIMEOID:
+                    return {set_temporal<core::date::time_t, &core::date::parse_time>,
+                            {types::logical_type::TIME, column_name}};
+                case pg_oid::TIMETZOID:
+                    return {set_temporal<core::date::timetz_t, &core::date::parse_timetz>,
+                            {types::logical_type::TIME_TZ, column_name}};
                 case pg_oid::TIMESTAMPOID:
+                    return {set_temporal<core::date::timestamp_t, &core::date::parse_timestamp>,
+                            {types::logical_type::TIMESTAMP, column_name}};
                 case pg_oid::TIMESTAMPTZOID:
-                    return {set_string, {types::logical_type::STRING_LITERAL, column_name}};
+                    return {set_temporal<core::date::timestamptz_t, &core::date::parse_timestamptz>,
+                            {types::logical_type::TIMESTAMP_TZ, column_name}};
+                case pg_oid::INTERVALOID:
+                    return {set_temporal<core::date::interval_t, &core::date::parse_interval>,
+                            {types::logical_type::INTERVAL, column_name}};
 
                 case pg_oid::BYTEAOID:
-                    return {set_bytea, {types::logical_type::STRING_LITERAL, column_name}};
+                    return {set_bytea, {types::logical_type::TEXT, column_name}};
 
                 default: {
                     // Default to string for unknown types
-                    return {set_string, {types::logical_type::STRING_LITERAL, column_name}};
+                    return {set_string, {types::logical_type::TEXT, column_name}};
                 }
             }
         }

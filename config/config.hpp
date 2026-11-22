@@ -113,6 +113,11 @@ struct ServiceConfig {
     RuntimeConfig runtime;
     // Startup retry policy for opening backend connections (from `service.connection_retry`).
     ConnectionRetryConfig connection_retry;
+    // `service.timezone`: the server's time zone — every session's TimeZone until its client sets one, applied over
+    // whatever the engine kept (ALTER SYSTEM SET timezone at every startup, catalog::register_connections). A
+    // fixed offset (`+03:00`), an IANA zone (`Europe/Berlin`) or an abbreviation, as the engine's TimeZone reads it;
+    // one it does not name refuses the startup.
+    std::string timezone = "UTC";
     // Remote backends + s3 aliases parsed from the `connections:` section of the
     // same config file. Single source of truth for connections — opened once at
     // startup: the backends by remote_backends_t::open, the s3 aliases by

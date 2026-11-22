@@ -16,6 +16,7 @@ namespace frontend::postgres {
     namespace message_code {
         inline constexpr int32_t PROTOCOL_VERSION_3_0 = 0x00030000; // version 3.0, startup message
         inline constexpr int32_t SSL_REQUEST_CODE = 80877103;
+        inline constexpr int32_t CANCEL_REQUEST_CODE = 80877102; // its process id and secret key follow
     } // namespace message_code
 
     namespace message_type {

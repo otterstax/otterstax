@@ -13,6 +13,7 @@
 // while its statement runs leaves the server serving and its session freed
 // once the statement ended.
 
+#include "utility/server_version.hpp"
 #include "frontend/mysql_server/mysql_server.hpp"
 #include "frontend/postgres_server/postgres_defs/error.hpp"
 #include "frontend/postgres_server/postgres_server.hpp"
@@ -1959,6 +1960,42 @@ TEST_CASE("wire text: a postgres boolean is t or f") {
     server.stop();
 }
 
+// The engine's temporal columns go out as PostgreSQL's own types (date 1082, timestamp 1114, timestamptz 1184),
+// their text as timestamp_out writes it — a timestamptz in the session's TimeZone, following a SET of it.
+TEST_CASE("wire text: postgres temporal columns are their own types") {
+    otterstax::test::session_stack_owner owner(otterstax::test::unique_test_dir("otterstax_wire_pg_temporal"));
+    frontend::postgres::postgres_server server(make_config<frontend::postgres::postgres_server>(owner.stack()));
+    server.start();
+    raw_client a(server.local_port());
+    pg_startup(a);
+    pg_ok(a, "CREATE TABLE local.public.ev (d date, ts timestamp, tz timestamptz)", "CREATE TABLE", 'I');
+    pg_ok(a,
+          "INSERT INTO local.public.ev (d, ts, tz) VALUES ('2026-01-02', '2026-01-02 10:00:00.5', "
+          "'2026-01-02 10:00:00+00')",
+          "INSERT 0 1",
+          'I');
+    const auto answer = pg_query(a, "SELECT d, ts, tz FROM local.public.ev");
+    const auto* description = answer.first('T');
+    REQUIRE(description != nullptr);
+    // The three type oids, read off the RowDescription (name, table oid, attnum, then the oid).
+    std::vector<uint32_t> oids;
+    const auto& p = description->payload;
+    size_t at = 2;
+    for (int c = 0; c < 3; ++c) {
+        while (p[at] != 0) {
+            ++at;
+        }
+        at += 1 + 4 + 2;
+        oids.push_back((uint32_t{p[at]} << 24) | (uint32_t{p[at + 1]} << 16) | (uint32_t{p[at + 2]} << 8) | p[at + 3]);
+        at += 4 + 2 + 4 + 2;
+    }
+    CHECK(oids == std::vector<uint32_t>{1082, 1114, 1184});
+    CHECK(pg_texts(answer) == std::vector<std::string>{"2026-01-02", "2026-01-02 10:00:00.5", "2026-01-02 10:00:00+00"});
+    pg_ok(a, "SET TimeZone = '+03:00'", "SET", 'I');
+    CHECK(pg_texts(pg_query(a, "SELECT tz FROM local.public.ev")) == std::vector<std::string>{"2026-01-02 13:00:00+03"});
+    server.stop();
+}
+
 // A SET / RESET of a protocol parameter is the frontend's, by Query and by the
 // extended protocol: OtterStax's value is accepted (SET, nothing reported:
 // nothing changed), another one refused with 22023; a failed block refuses it
@@ -2182,6 +2219,85 @@ namespace {
         return out;
     }
 } // namespace
+
+// A bool parameter declared bool (OID 16) and bound as text reads as PostgreSQL's boolin: pg8000 binds Python
+// True as "true".
+TEST_CASE("wire parameters: a postgres bool parameter reads every boolin spelling") {
+    otterstax::test::session_stack_owner owner(otterstax::test::unique_test_dir("otterstax_wire_pg_bool_parameter"));
+    frontend::postgres::postgres_server server(make_config<frontend::postgres::postgres_server>(owner.stack()));
+    server.start();
+    raw_client a(server.local_port());
+    pg_startup(a);
+    pg_ok(a, "CREATE TABLE local.public.flags (id bigint, ok bool)", "CREATE TABLE", 'I');
+    const std::vector<std::pair<std::string, std::string>> bound{
+        {"1", "true"}, {"2", "false"}, {"3", "t"}, {"4", "OFF"}, {"5", " yes "}, {"6", "0"}};
+    for (const auto& [id, value] : bound) {
+        INFO(value);
+        auto answer = pg_exchange(a,
+                                  {pg_parse_frame("", "INSERT INTO local.public.flags (id, ok) VALUES ($1, $2)", {20, 16}),
+                                   pg_bind_frame("", "", {id, value}),
+                                   pg_execute_frame(""),
+                                   pg_frame('S', {})});
+        INFO(answer.sqlstate() << " " << answer.error_text());
+        REQUIRE(answer.first('E') == nullptr);
+        CHECK(answer.tag() == "INSERT 0 1");
+    }
+    CHECK(pg_texts(pg_query(a, "SELECT ok FROM local.public.flags ORDER BY id")) ==
+          std::vector<std::string>{"t", "f", "t", "f", "t", "f"});
+    // What boolin refuses is 22P02, as PostgreSQL answers it.
+    auto refused = pg_exchange(a,
+                               {pg_parse_frame("", "INSERT INTO local.public.flags (id, ok) VALUES ($1, $2)", {20, 16}),
+                                pg_bind_frame("", "", {"7", "maybe"}),
+                                pg_execute_frame(""),
+                                pg_frame('S', {})});
+    CHECK(refused.sqlstate() == "22P02");
+    server.stop();
+}
+
+// psycopg 3 binds a datetime as timestamp (1114) in text, asyncpg in binary under the type the engine describes:
+// both reach the column as the engine's own value; a parameter compared with a timestamp column is described
+// 1114.
+TEST_CASE("wire parameters: postgres temporal parameters in text and binary") {
+    otterstax::test::session_stack_owner owner(otterstax::test::unique_test_dir("otterstax_wire_pg_temporal_params"));
+    frontend::postgres::postgres_server server(make_config<frontend::postgres::postgres_server>(owner.stack()));
+    server.start();
+    raw_client a(server.local_port());
+    pg_startup(a);
+    pg_ok(a, "CREATE TABLE local.public.ev (id bigint, ts timestamp)", "CREATE TABLE", 'I');
+    // Text, declared 1114.
+    auto text = pg_exchange(a,
+                            {pg_parse_frame("", "INSERT INTO local.public.ev (id, ts) VALUES ($1, $2)", {20, 1114}),
+                             pg_bind_frame("", "", {"1", "2026-01-02 10:00:00.5"}),
+                             pg_execute_frame(""),
+                             pg_frame('S', {})});
+    INFO(text.sqlstate() << " " << text.error_text());
+    REQUIRE(text.first('E') == nullptr);
+    // Binary, the type left to the engine's describe: ParameterDescription answers 1114 for $1.
+    auto described = pg_exchange(a,
+                                 {pg_parse_frame("q", "SELECT id FROM local.public.ev WHERE ts = $1"),
+                                  pg_describe_statement_frame("q"),
+                                  pg_frame('S', {})});
+    const auto* parameters = described.first('t');
+    REQUIRE(parameters != nullptr);
+    REQUIRE(parameters->payload.size() == 6);
+    const uint32_t oid = (uint32_t{parameters->payload[2]} << 24) | (uint32_t{parameters->payload[3]} << 16) |
+                         (uint32_t{parameters->payload[4]} << 8) | parameters->payload[5];
+    CHECK(oid == 1114);
+    // 2026-01-02 10:00:00.5 as timestamp_send: microseconds since 2000-01-01, big-endian.
+    const int64_t micros = 9498LL * 86'400'000'000 + 36'000'500'000;
+    std::vector<uint8_t> body = cstr("");
+    const auto name = cstr("q");
+    body.insert(body.end(), name.begin(), name.end());
+    body.insert(body.end(), {0x00, 0x01, 0x00, 0x01}); // one format code: binary
+    body.insert(body.end(), {0x00, 0x01, 0x00, 0x00, 0x00, 0x08});
+    for (int shift = 56; shift >= 0; shift -= 8) {
+        body.push_back(static_cast<uint8_t>(static_cast<uint64_t>(micros) >> shift));
+    }
+    body.insert(body.end(), {0x00, 0x00}); // every result text
+    auto bound = pg_exchange(a, {pg_frame('B', body), pg_execute_frame(""), pg_frame('S', {})});
+    CHECK(pg_texts(bound) == std::vector<std::string>{"1"});
+    server.stop();
+}
 
 // client_encoding is the client's, UTF8 or SQL_ASCII (psql on a terminal in the
 // C locale sends `auto`, which libpq turns into SQL_ASCII): kept under
@@ -2480,8 +2596,8 @@ TEST_CASE("wire startup: postgres database without its public schema") {
     {
         raw_client a(server.local_port());
         pg_startup(a);
-        // A client's DROP SCHEMA names a schema of local: this is local.public.
-        pg_ok(a, "DROP SCHEMA public", "DROP", 'I');
+        // A client's DROP SCHEMA names a schema of local: this is local.public, with the host's version() in it.
+        pg_ok(a, "DROP SCHEMA public CASCADE", "DROP", 'I');
     }
     raw_client a(server.local_port());
     const auto refusal = pg_refused_startup(a, {{"user", "test"}, {"database", "local"}});
@@ -2574,4 +2690,132 @@ TEST_CASE("wire statements: postgres Execute of a described statement whose tabl
     // The connection serves on.
     pg_ok(a, "DROP SCHEMA wcp CASCADE", "DROP", 'I');
     server.stop();
+}
+
+// SHOW of a value the frontend holds fixed — a protocol parameter, a server fact —
+// is the frontend's, on the simple and the extended route: SQLAlchemy's connect
+// sends SHOW standard_conforming_strings, SHOW TRANSACTION ISOLATION LEVEL and
+// SHOW max_identifier_length, which the engine (no SHOW) would refuse.
+TEST_CASE("wire statements: postgres SHOW of the fixed parameters and the server's facts") {
+    otterstax::test::session_stack_owner owner(otterstax::test::unique_test_dir("otterstax_wire_pg_show_fixed"));
+    frontend::postgres::postgres_server server(make_config<frontend::postgres::postgres_server>(owner.stack()));
+    server.start();
+    raw_client a(server.local_port());
+    pg_startup(a);
+    CHECK(pg_show_value(pg_query(a, "show standard_conforming_strings"), "standard_conforming_strings") == "on");
+    CHECK(pg_show_value(pg_query(a, "SHOW TRANSACTION ISOLATION LEVEL"), "transaction_isolation") ==
+          "repeatable read");
+    CHECK(pg_show_value(pg_query(a, "SHOW max_identifier_length"), "max_identifier_length") == "63");
+    CHECK(pg_show_value(pg_query(a, "SHOW datestyle"), "DateStyle") == "ISO, MDY");
+    CHECK(pg_show_value(pg_extended(a, "SHOW server_version"), "server_version") ==
+          std::string{otterstax::postgres_server_version});
+    server.stop();
+}
+
+// A client's cancel of a statement another connection waits for (cancel_registry.hpp): MySQL KILL QUERY / KILL
+// CONNECTION <id>, PostgreSQL's CancelRequest with the BackendKeyData. The waiter's statement waits for the only
+// backend agent, which the holder's block keeps: the cancel answers the waiter at once (the statement itself stays in
+// the agent queue — the engine has no cancel), and the waiter's connection serves on.
+TEST_CASE("wire cancel: KILL QUERY and CancelRequest answer a waiting statement cancelled") {
+    otterstax::test::stack_options_t options;
+    options.connections.mysql = otterstax::test::mock_mysql({"m"});
+    options.connections.mysql.front().pool_size = 1;
+    otterstax::test::session_stack_owner owner(otterstax::test::unique_test_dir("otterstax_wire_cancel"), options);
+    SECTION("mysql") {
+        const std::string remote_select = "SELECT id FROM m.db.`table`";
+        frontend::mysql::mysql_server server(make_config<frontend::mysql::mysql_server>(owner.stack()));
+        server.start();
+        raw_client holder(server.local_port());
+        raw_client waiter(server.local_port());
+        raw_client killer(server.local_port());
+        mysql_handshake_in(holder, "local");
+        mysql_handshake_in(waiter, "local");
+        mysql_handshake_in(killer, "local");
+        // The waiter's connection id: the one cell of SELECT CONNECTION_ID().
+        waiter.write(mysql_query_packet("SELECT CONNECTION_ID()"));
+        REQUIRE(mysql_read_packet(waiter)[0] == 1);
+        mysql_read_packet(waiter); // the column
+        mysql_read_packet(waiter); // EOF
+        const auto row = mysql_read_packet(waiter);
+        const std::string id(row.begin() + 1, row.begin() + 1 + row[0]);
+        mysql_read_packet(waiter); // EOF
+        mysql_ok(holder, "SET autocommit = 0");
+        CHECK((mysql_resultset_flags(holder, remote_select) & SERVER_STATUS_IN_TRANS) != 0);
+
+        waiter.write(mysql_query_packet(remote_select));
+        std::this_thread::sleep_for(300ms); // the waiter's statement waits for the agent
+        mysql_ok(killer, "KILL QUERY " + id);
+        const auto cancelled = mysql_read_packet(waiter);
+        REQUIRE(cancelled[0] == ERR_HEADER);
+        CHECK((cancelled[1] | (cancelled[2] << 8)) == 1317); // ER_QUERY_INTERRUPTED
+        CHECK(mysql_err_text(cancelled).find("interrupted") != std::string::npos);
+        // The cancelled statement still holds the waiter's session (it waits for the agent, in order): once the
+        // holder ends its block, it runs out and the waiter's next statement is served.
+        mysql_ok(holder, "ROLLBACK");
+        mysql_ok(waiter, "CREATE DATABASE after_cancel");
+
+        // An unknown id is ER_NO_SUCH_THREAD; KILL CONNECTION closes the connection.
+        killer.write(mysql_query_packet("KILL QUERY 999999"));
+        const auto unknown = mysql_read_packet(killer);
+        REQUIRE(unknown[0] == ERR_HEADER);
+        CHECK((unknown[1] | (unknown[2] << 8)) == 1094);
+        mysql_ok(killer, "KILL CONNECTION " + id);
+        CHECK(waiter.wait_for_close()); // closed by the server
+        server.stop();
+    }
+    SECTION("postgres") {
+        const std::string remote_select = "SELECT id FROM m.db.\"table\"";
+        frontend::postgres::postgres_server server(make_config<frontend::postgres::postgres_server>(owner.stack()));
+        server.start();
+        raw_client holder(server.local_port());
+        raw_client waiter(server.local_port());
+        pg_startup(holder);
+        const auto started = pg_startup_answer(waiter, {{"user", "test"}, {"database", "local"}});
+        std::vector<uint8_t> key_data;
+        for (const auto& message : started) {
+            if (message.type == 'K') {
+                key_data = message.payload; // the process id, then the secret key
+            }
+        }
+        REQUIRE(key_data.size() >= 8);
+        pg_ok(holder, "BEGIN", "BEGIN", 'T');
+        REQUIRE(pg_query(holder, remote_select).first('E') == nullptr);
+
+        const auto cancel_request = [&](std::vector<uint8_t> key) {
+            raw_client canceller(server.local_port());
+            std::vector<uint8_t> body{0x04, 0xD2, 0x16, 0x2E}; // 80877102
+            body.insert(body.end(), key_data.begin(), key_data.begin() + 4);
+            body.insert(body.end(), key.begin(), key.end());
+            const auto length = static_cast<uint32_t>(body.size() + 4);
+            std::vector<uint8_t> packet{static_cast<uint8_t>(length >> 24),
+                                        static_cast<uint8_t>(length >> 16),
+                                        static_cast<uint8_t>(length >> 8),
+                                        static_cast<uint8_t>(length)};
+            packet.insert(packet.end(), body.begin(), body.end());
+            canceller.write(packet);
+            CHECK(canceller.wait_for_close()); // no reply: the server closes it
+        };
+        waiter.write(pg_frame('Q', cstr(remote_select)));
+        std::this_thread::sleep_for(300ms);
+        // A wrong key cancels nothing.
+        std::vector<uint8_t> wrong(key_data.begin() + 4, key_data.end());
+        wrong.front() ^= 0xFF;
+        cancel_request(wrong);
+        std::this_thread::sleep_for(300ms);
+        // The right one: the waiter answers 57014 and ReadyForQuery.
+        cancel_request(std::vector<uint8_t>(key_data.begin() + 4, key_data.end()));
+        pg_answer answer;
+        for (int guard = 0; guard < 16 && (answer.messages.empty() || answer.messages.back().type != 'Z'); ++guard) {
+            answer.messages.push_back(pg_read_message(waiter));
+        }
+        REQUIRE(answer.messages.back().type == 'Z');
+        answer.status = static_cast<char>(answer.messages.back().payload[0]);
+        CHECK(answer.sqlstate() == "57014");
+        CHECK(answer.error_text() == "canceling statement due to user request");
+        CHECK(answer.status == 'I');
+        pg_ok(holder, "ROLLBACK", "ROLLBACK", 'I'); // the cancelled statement then runs out of the waiter's session
+        pg_ok(waiter, "CREATE SCHEMA after_cancel", "CREATE SCHEMA", 'I'); // and the connection serves on
+        holder.write(pg_frame('X', {}));
+        server.stop();
+    }
 }

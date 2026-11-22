@@ -203,7 +203,7 @@ namespace otterstax::kafka {
         std::vector<table::column_definition_t> sources;
         for (const char* column :
              {"name", "kind", "topic", "bootstrap", "group_id", "offset_reset", "transactional", "as_select"}) {
-            sources.emplace_back(column, types::complex_logical_type(types::logical_type::STRING_LITERAL));
+            sources.emplace_back(column, types::complex_logical_type(types::logical_type::TEXT));
         }
         std::vector<logical_plan::execution_plan_t> plans;
         plans.push_back(plan(logical_plan::make_node_create_database(

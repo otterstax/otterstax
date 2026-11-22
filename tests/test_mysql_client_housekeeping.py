@@ -139,8 +139,10 @@ class MySqlClientHousekeepingTest:
             self.assert_equal(rows[0][1], SQL_MODE, "MySQL's default lexical rules")
             cur.execute("SHOW WARNINGS")
             self.assert_equal(cur.fetchall(), ())
+            # DATABASE() is the namespace a short name resolves into, the engine's current_schema() of the
+            # place: the handshake's `local` is local.public.
             cur.execute("SELECT DATABASE()")
-            self.assert_equal(cur.fetchone()[0], "local")
+            self.assert_equal(cur.fetchone()[0], "public")
 
     def test_quote_and_backslash_round_trip(self):
         """PyMySQL escapes with a backslash (no NO_BACKSLASH_ESCAPES flag): the value comes back intact."""

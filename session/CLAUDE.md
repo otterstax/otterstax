@@ -47,7 +47,7 @@ connection object.
   `co_await`. The mailbox is the statement queue; there is no second queue.
   `tests/session/test_session_lifetime.cpp` ("one statement at a time across real
   suspensions") pins it with every statement sent before any answer is read.
-- **Waiting is a poll.** actor-zeta 2.0.0 settles a future by
+- **Waiting is a poll.** actor-zeta 2.0.1 settles a future by
   flags alone and wakes nobody: while the session is suspended on the engine's
   future, `basic_actor::resume` answers `resume` and the pool requeues the job at
   once, so a statement that waits costs CPU of the sessions pool (and the

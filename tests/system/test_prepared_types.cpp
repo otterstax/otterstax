@@ -18,7 +18,7 @@
 //   conformed by the engine's decimal-to-integer cast. Announced and
 //   delivered are BIGINT either way.
 // - An unconstrained NUMERIC column: registered as its exact text, so a
-//   prepared SELECT of it announces STRING_LITERAL and delivers the text.
+//   prepared SELECT of it announces TEXT and delivers the text.
 // - A backend answer the registration does not describe is refused and
 //   streams nothing: two columns where the plan declares one is
 //   datatype_mismatch (the remote table changed since it was registered), a
@@ -748,8 +748,8 @@ TEST_CASE("an unconstrained NUMERIC column announces text and delivers it throug
     session_stack_owner owner(unique_test_dir("otterstax_prepared_types_numeric_text"), typed_options());
     const auto s = owner.stack();
     auto column = run_column(s, 1, "SELECT wide FROM pgdec.public.loose WHERE id = $1", bound_id(s, 1));
-    CHECK(label_of(column.announced) == "STRING_LITERAL");
-    CHECK(label_of(column.chunk.data[0].type()) == "STRING_LITERAL");
+    CHECK(label_of(column.announced) == "TEXT");
+    CHECK(label_of(column.chunk.data[0].type()) == "TEXT");
     CHECK(cell(column.chunk, 0, 0).value<std::string_view>() == "12345.6789");
 }
 

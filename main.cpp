@@ -183,7 +183,7 @@ int main(int argc, char* argv[]) {
     }
     // The remote tables the startup discovery found, registered in the
     // engine's catalog (no SQL to a backend) before any client can name one.
-    if (auto registered = otterstax::backends::register_remote_tables(runtime.resource(), *engine, *remote);
+    if (auto registered = otterstax::backends::register_remote_tables(runtime.resource(), *engine, *remote, server_config.timezone);
         registered.contains_error()) {
         log->error("Failed to register the remote tables: {}", registered.what.c_str());
         return 1;
@@ -213,7 +213,8 @@ int main(int argc, char* argv[]) {
         std::make_unique<otterstax::session::session_factory_t>(runtime, &make_parser, std::move(services.value()));
     // Each server's threads come from service.runtime (0 = auto,
     // runtime::resolve_threads). A wire connection waits
-    // frontend::CONNECTION_TIMEOUT_SEC for the next client bytes, and the accept
+    // frontend::IDLE_TIMEOUT_SEC for its next message (CONNECTION_TIMEOUT_SEC within its handshake / startup
+    // and a message's body), and the accept
     // chain pauses frontend::ACCEPT_RETRY_DELAY_MS after building a connection
     // threw (frontend/common/protocol_config.hpp).
     auto flight = std::make_unique<flight::server::flight_sql_server>(flight::server::config_t{
@@ -230,6 +231,7 @@ int main(int argc, char* argv[]) {
         .read_timeout = std::chrono::seconds(frontend::CONNECTION_TIMEOUT_SEC),
         .accept_retry_delay = std::chrono::milliseconds(frontend::ACCEPT_RETRY_DELAY_MS),
         .pool_size = otterstax::runtime::resolve_threads(server_config.runtime.mysql_io.threads),
+        .idle_timeout = std::chrono::seconds(frontend::IDLE_TIMEOUT_SEC),
     });
     auto postgres = std::make_unique<frontend::postgres::postgres_server>(frontend::frontend_server_config{
         .resource = runtime.resource(),
@@ -238,6 +240,7 @@ int main(int argc, char* argv[]) {
         .read_timeout = std::chrono::seconds(frontend::CONNECTION_TIMEOUT_SEC),
         .accept_retry_delay = std::chrono::milliseconds(frontend::ACCEPT_RETRY_DELAY_MS),
         .pool_size = otterstax::runtime::resolve_threads(server_config.runtime.postgres_io.threads),
+        .idle_timeout = std::chrono::seconds(frontend::IDLE_TIMEOUT_SEC),
     });
     auto spark = std::make_unique<frontend::spark::spark_connect_server>(frontend::spark::SparkConnectServerConfig{
         .host = server_config.spark_connect.host,

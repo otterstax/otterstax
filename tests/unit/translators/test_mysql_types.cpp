@@ -175,8 +175,8 @@ TEST_CASE("mysql discovery keeps every column name and order of the result set")
     REQUIRE(fields[3].alias() == "ts");
     REQUIRE(fields[0].type() == logical_type::BIGINT);
     REQUIRE(fields[1].type() == logical_type::DOUBLE);
-    REQUIRE(fields[2].type() == logical_type::STRING_LITERAL);
-    REQUIRE(fields[3].type() == logical_type::STRING_LITERAL);
+    REQUIRE(fields[2].type() == logical_type::TEXT);
+    REQUIRE(fields[3].type() == logical_type::TIMESTAMP_TZ);
 }
 
 // ── the table, per type ──────────────────────────────────────────────────────
@@ -195,6 +195,33 @@ TEST_CASE("mysql types: integer types unsigned") {
     REQUIRE(discovered_type(column_type::mediumint, true) == logical_type::UINTEGER);
     REQUIRE(discovered_type(column_type::int_, true) == logical_type::UINTEGER);
     REQUIRE(discovered_type(column_type::bigint, true) == logical_type::UBIGINT);
+}
+
+// TINYINT(1) is how MySQL / MariaDB spell BOOLEAN (BOOL, a Django BooleanField): BOOLEAN on both paths, any value
+// but 0 true (Connector/J's tinyInt1isBit); any other display width is an integer.
+TEST_CASE("mysql types: TINYINT(1) is BOOLEAN") {
+    auto* resource = std::pmr::new_delete_resource();
+    for (bool is_unsigned : {false, true}) {
+        INFO("unsigned = " << is_unsigned);
+        auto result = make_results({{"active", column_type::tinyint, is_unsigned, 1}},
+                                   {{std::string{"0"}}, {std::string{"1"}}, {std::string{"5"}}, {std::nullopt}});
+        auto schema = tsl::mysql_to_struct(resource, result);
+        REQUIRE_FALSE(schema.has_error());
+        REQUIRE(schema.value().child_types().front().type() == logical_type::BOOLEAN);
+        CHECK(schema.value().child_types().front().alias() == "active");
+        auto chunk = tsl::mysql_to_chunk(resource, result);
+        REQUIRE_FALSE(chunk.has_error());
+        const auto& column = chunk.value().data[0];
+        REQUIRE(column.type().type() == logical_type::BOOLEAN);
+        REQUIRE(chunk.value().size() == 4);
+        CHECK_FALSE(column.get_value<bool>(0));
+        CHECK(column.get_value<bool>(1));
+        CHECK(column.get_value<bool>(2));
+        CHECK(column.is_null(3));
+    }
+    auto wide = tsl::mysql_to_struct(resource, make_results({{"n", column_type::tinyint, false, 4}}));
+    REQUIRE_FALSE(wide.has_error());
+    CHECK(wide.value().child_types().front().type() == logical_type::TINYINT);
 }
 
 TEST_CASE("mysql types: floating-point types") {
@@ -221,30 +248,69 @@ TEST_CASE("mysql types: year is an integer") {
 }
 
 TEST_CASE("mysql types: string-mapped types") {
-    REQUIRE(discovered_type(column_type::text, false) == logical_type::STRING_LITERAL);
-    REQUIRE(discovered_type(column_type::char_, false) == logical_type::STRING_LITERAL);
-    REQUIRE(discovered_type(column_type::varchar, false) == logical_type::STRING_LITERAL);
-    REQUIRE(discovered_type(column_type::blob, false) == logical_type::STRING_LITERAL);
-    REQUIRE(discovered_type(column_type::enum_, false) == logical_type::STRING_LITERAL);
-    REQUIRE(discovered_type(column_type::set, false) == logical_type::STRING_LITERAL);
-    REQUIRE(discovered_type(column_type::json, false) == logical_type::STRING_LITERAL);
-    REQUIRE(discovered_type(column_type::binary, false) == logical_type::STRING_LITERAL);
-    REQUIRE(discovered_type(column_type::varbinary, false) == logical_type::STRING_LITERAL);
+    REQUIRE(discovered_type(column_type::text, false) == logical_type::TEXT);
+    REQUIRE(discovered_type(column_type::char_, false) == logical_type::TEXT);
+    REQUIRE(discovered_type(column_type::varchar, false) == logical_type::TEXT);
+    REQUIRE(discovered_type(column_type::blob, false) == logical_type::TEXT);
+    REQUIRE(discovered_type(column_type::enum_, false) == logical_type::TEXT);
+    REQUIRE(discovered_type(column_type::set, false) == logical_type::TEXT);
+    REQUIRE(discovered_type(column_type::json, false) == logical_type::TEXT);
+    REQUIRE(discovered_type(column_type::binary, false) == logical_type::TEXT);
+    REQUIRE(discovered_type(column_type::varbinary, false) == logical_type::TEXT);
     // GEOMETRY reaches the client as the WKB bytes of the value, which is what
     // the wire sends for it (boost reads it as a blob, like every binary type).
-    REQUIRE(discovered_type(column_type::geometry, false) == logical_type::STRING_LITERAL);
+    REQUIRE(discovered_type(column_type::geometry, false) == logical_type::TEXT);
 }
 
-// The engine has DATE / TIME / TIMESTAMP types, but neither wire frontend can
-// encode one (frontend::{mysql,postgres}::get_field_type answers nullopt), so a
-// column carried under them could not be served to any client. They are carried
-// as the text MySQL itself prints, which is what ch_to_chunk does for the
-// ClickHouse date/time family.
-TEST_CASE("mysql types: date and time types are carried as text") {
-    REQUIRE(discovered_type(column_type::date, false) == logical_type::STRING_LITERAL);
-    REQUIRE(discovered_type(column_type::datetime, false) == logical_type::STRING_LITERAL);
-    REQUIRE(discovered_type(column_type::timestamp, false) == logical_type::STRING_LITERAL);
-    REQUIRE(discovered_type(column_type::time, false) == logical_type::STRING_LITERAL);
+// The date/time family as the engine's types: DATE a DATE, DATETIME a TIMESTAMP (a wall clock), TIMESTAMP a
+// TIMESTAMPTZ (an instant; every agent session reads it in UTC), TIME a TIME.
+TEST_CASE("mysql types: date and time types are the engine's") {
+    REQUIRE(discovered_type(column_type::date, false) == logical_type::DATE);
+    REQUIRE(discovered_type(column_type::datetime, false) == logical_type::TIMESTAMP);
+    REQUIRE(discovered_type(column_type::timestamp, false) == logical_type::TIMESTAMP_TZ);
+    REQUIRE(discovered_type(column_type::time, false) == logical_type::TIME);
+}
+
+TEST_CASE("mysql types: date and time values read as the engine's") {
+    auto* resource = std::pmr::new_delete_resource();
+    auto result = make_results({{"d", column_type::date, false, 10},
+                                {"dt", column_type::datetime, false, 26, 6},
+                                {"ts", column_type::timestamp, false, 19},
+                                {"t", column_type::time, false, 10}},
+                               {{std::string{"2026-01-02"},
+                                 std::string{"2026-01-02 10:00:00.500000"},
+                                 std::string{"2026-01-02 10:00:00"},
+                                 std::string{"10:11:12"}},
+                                {std::nullopt, std::nullopt, std::nullopt, std::nullopt}});
+    auto chunk = tsl::mysql_to_chunk(resource, result);
+    INFO((chunk.has_error() ? std::string{chunk.error().what.c_str()} : std::string{}));
+    REQUIRE_FALSE(chunk.has_error());
+    const auto& c = chunk.value();
+    CHECK(c.data[0].get_value<core::date::date_t>(0).value.count() == 9498); // days since 2000-01-01
+    CHECK(c.data[1].get_value<core::date::timestamp_t>(0).value.count() == 9498LL * 86'400'000'000 + 36'000'500'000);
+    CHECK(c.data[2].get_value<core::date::timestamptz_t>(0).value.count() == 9498LL * 86'400'000'000 + 36'000'000'000);
+    CHECK(c.data[3].get_value<core::date::time_t>(0).value.count() == 36'672'000'000);
+    for (std::size_t column = 0; column < 4; ++column) {
+        CHECK(c.data[column].is_null(1));
+    }
+}
+
+// A value the engine's type has no room for is refused, never altered: MySQL's zero date (and a partial one), a
+// TIME past one day (MySQL's TIME is a duration up to 838:59:59, the engine's a time of day).
+TEST_CASE("mysql types: a zero date and a TIME past a day are refused") {
+    auto* resource = std::pmr::new_delete_resource();
+    for (const auto& [column, text] : std::vector<std::pair<my_col, std::string>>{
+             {{"d", column_type::date, false, 10}, "0000-00-00"},
+             {{"d", column_type::date, false, 10}, "2026-00-15"},
+             {{"dt", column_type::datetime, false, 19}, "0000-00-00 00:00:00"},
+             {{"t", column_type::time, false, 10}, "25:00:00"},
+             {{"t", column_type::time, false, 10}, "-01:00:00"}}) {
+        INFO(text);
+        auto chunk = tsl::mysql_to_chunk(resource, make_results({column}, {{text}}));
+        REQUIRE(chunk.has_error());
+        CHECK(chunk.error().type == core::error_code_t::numeric_value_out_of_range);
+        CHECK(std::string{chunk.error().what.c_str()}.find("'" + column.name + "'") != std::string::npos);
+    }
 }
 
 // A type this build has never seen is refused as a value by both paths — never
@@ -344,9 +410,9 @@ TEST_CASE("mysql types: a DECIMAL wider than 38 digits is carried as its exact t
     auto result = make_results({{"huge", column_type::decimal, false, 67, 30}}, {{sixty_five}});
     auto chunk = tsl::mysql_to_chunk(resource, result);
     REQUIRE_FALSE(chunk.has_error());
-    REQUIRE(chunk.value().types().front().type() == logical_type::STRING_LITERAL);
+    REQUIRE(chunk.value().types().front().type() == logical_type::TEXT);
     REQUIRE(otterstax::test::cell(chunk.value(), 0, 0).value<std::string_view>() == sixty_five);
-    REQUIRE(discovered_type(column_type::decimal, false) == logical_type::STRING_LITERAL); // no precision reported
+    REQUIRE(discovered_type(column_type::decimal, false) == logical_type::TEXT); // no precision reported
 }
 
 // A DECIMAL text the declared precision cannot hold is a numeric_value_out_of_range naming the column.

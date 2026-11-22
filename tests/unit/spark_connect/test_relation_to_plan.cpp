@@ -503,11 +503,15 @@ TEST_CASE("relation_to_plan: Join using_columns builds an equi-compare in key fo
     // value-getter can evaluate).
     REQUIRE(ce::is_key(cmp->left()));
     REQUIRE(ce::is_key(cmp->right()));
-    // The keys must carry opposite sides — the join value-getter selects the
-    // input chunk by key.side(), and an undefined-side bare key that occurs in
-    // both inputs is rejected as ambiguous by the validator.
-    CHECK(ce::as_key(cmp->left()).side() == ce::side_t::left);
-    CHECK(ce::as_key(cmp->right()).side() == ce::side_t::right);
+    // Each key names its own input (the id of the join's child it reads): a bare
+    // key that occurs in both inputs is rejected as ambiguous by the validator.
+    const auto& join_children = children[0]->children();
+    REQUIRE(join_children.size() == 2);
+    CHECK(join_children[0]->source_element() != ce::NO_SOURCE_ELEMENT);
+    CHECK(join_children[1]->source_element() != ce::NO_SOURCE_ELEMENT);
+    CHECK(join_children[0]->source_element() != join_children[1]->source_element());
+    CHECK(ce::as_key(cmp->left()).source_element() == join_children[0]->source_element());
+    CHECK(ce::as_key(cmp->right()).source_element() == join_children[1]->source_element());
 }
 
 TEST_CASE("relation_to_plan: crossJoin carries a match-everything condition") {

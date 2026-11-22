@@ -9,6 +9,7 @@ set(${PROJECT_NAME}_SOURCES
     test_federation_transactions.cpp
     test_federation_units.cpp
     test_federation_joins.cpp
+    test_dotted_names.cpp
 )
 
 add_executable(${PROJECT_NAME} ${${PROJECT_NAME}_SOURCES})

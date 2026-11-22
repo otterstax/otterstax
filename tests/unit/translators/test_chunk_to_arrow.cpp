@@ -54,7 +54,7 @@ TEST_CASE("to_arrow_schema(struct): scalar types map to correct Arrow types") {
         {"u64",   logical_type::UBIGINT},
         {"f32",   logical_type::FLOAT},
         {"f64",   logical_type::DOUBLE},
-        {"txt",   logical_type::STRING_LITERAL},
+        {"txt",   logical_type::TEXT},
     });
 
     auto schema = schema_of(struct_t);
@@ -75,7 +75,7 @@ TEST_CASE("to_arrow_schema(struct): scalar types map to correct Arrow types") {
 }
 
 TEST_CASE("to_arrow_schema(struct): field names are preserved") {
-    auto struct_t = make_struct({{"user_id", logical_type::INTEGER}, {"email", logical_type::STRING_LITERAL}});
+    auto struct_t = make_struct({{"user_id", logical_type::INTEGER}, {"email", logical_type::TEXT}});
 
     auto schema = schema_of(struct_t);
 
@@ -156,7 +156,7 @@ TEST_CASE("to_arrow_schema(vec): vector overload works like struct overload") {
     std::pmr::vector<complex_logical_type> types{std::pmr::new_delete_resource()};
     complex_logical_type t1{logical_type::INTEGER};
     t1.set_alias("id");
-    complex_logical_type t2{logical_type::STRING_LITERAL};
+    complex_logical_type t2{logical_type::TEXT};
     t2.set_alias("name");
     types.push_back(t1);
     types.push_back(t2);
@@ -177,7 +177,7 @@ TEST_CASE("to_arrow_schema(vec): vector overload works like struct overload") {
 TEST_CASE("to_arrow_schema(vec): a column without an alias becomes a field with an empty name") {
     std::pmr::vector<complex_logical_type> types{std::pmr::new_delete_resource()};
     types.emplace_back(logical_type::INTEGER);
-    complex_logical_type named{logical_type::STRING_LITERAL};
+    complex_logical_type named{logical_type::TEXT};
     named.set_alias("name");
     types.push_back(named);
 
@@ -457,7 +457,7 @@ TEST_CASE("chunk_to_record_batch: a UHUGEINT column is refused before any array 
 
 TEST_CASE("chunk_to_record_batch: flat named scalar columns become a RecordBatch with the same values") {
     auto* res = std::pmr::new_delete_resource();
-    auto types = named_types(res, {{"id", logical_type::BIGINT}, {"name", logical_type::STRING_LITERAL}});
+    auto types = named_types(res, {{"id", logical_type::BIGINT}, {"name", logical_type::TEXT}});
     data_chunk_t chunk(res, types, 3);
     chunk.set_cardinality(3);
     for (int64_t r = 0; r < 3; ++r) {
@@ -559,7 +559,7 @@ TEST_CASE("chunk_to_record_batch: natively exported columns keep their values NU
     auto types = named_types(res,
                              {{"flag", logical_type::BOOLEAN},
                               {"i8", logical_type::TINYINT},
-                              {"label", logical_type::STRING_LITERAL},
+                              {"label", logical_type::TEXT},
                               {"i16", logical_type::SMALLINT},
                               {"i32", logical_type::INTEGER},
                               {"i64", logical_type::BIGINT},
@@ -666,7 +666,7 @@ TEST_CASE("chunk_to_record_batch: a DATE is written on Arrow's epoch and a STRIN
     // The engine counts days from 2000-01-01, Arrow's date32 from 1970-01-01: otterbrix's
     // exporter moves the value. 2022-01-08 is 8043 engine days and 19000 Arrow days.
     auto* res = std::pmr::new_delete_resource();
-    auto types = named_types(res, {{"day", logical_type::DATE}, {"name", logical_type::STRING_LITERAL}});
+    auto types = named_types(res, {{"day", logical_type::DATE}, {"name", logical_type::TEXT}});
     data_chunk_t chunk(res, types, 2);
     chunk.set_cardinality(2);
     chunk.set_value(0, 0, core::date::date_t{core::date::days{19000 - 10957}});
@@ -689,7 +689,7 @@ TEST_CASE("chunk_to_record_batch: a DATE is written on Arrow's epoch and a STRIN
 
 TEST_CASE("chunk_to_file_batch: strings are written by otterbrix's exporter as large_utf8") {
     auto* res = std::pmr::new_delete_resource();
-    auto types = named_types(res, {{"id", logical_type::BIGINT}, {"name", logical_type::STRING_LITERAL}});
+    auto types = named_types(res, {{"id", logical_type::BIGINT}, {"name", logical_type::TEXT}});
     constexpr uint64_t rows = 1500;
     data_chunk_t chunk(res, types, rows);
     chunk.set_cardinality(rows);

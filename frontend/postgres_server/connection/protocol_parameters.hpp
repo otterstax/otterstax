@@ -62,12 +62,18 @@ namespace frontend::postgres {
     //   (GUC_REPORT); either way the text crosses the wire as the engine holds
     //   it, UTF-8, never converted — what SQL_ASCII (no conversion) promises;
     // - extra_float_digits: how a float cell's text is written
-    //   (float_text.hpp; PgJDBC and psycopg send 3), not reported.
+    //   (float_text.hpp; PgJDBC and psycopg send 3), not reported;
+    // - idle_session_timeout: how long the connection waits for its next
+    //   message before it is closed (frontend_connection::idle_timeout), the
+    //   server's (IDLE_TIMEOUT_SEC) unless the client sets its own, 0 never;
+    //   not reported. PostgreSQL's covers an idle session outside a block only;
+    //   OtterStax has one idle timeout, inside a block too.
     enum class client_parameter_t : std::uint8_t
     {
         application_name,
         client_encoding,
         extra_float_digits,
+        idle_session_timeout,
     };
     // The client parameter named `name` (any case).
     [[nodiscard]] std::optional<client_parameter_t> find_client_parameter(std::string_view name) noexcept;
@@ -81,6 +87,14 @@ namespace frontend::postgres {
     // or `<n> is outside the valid range for parameter "extra_float_digits"
     // (-15 .. 3)`.
     [[nodiscard]] std::variant<int, std::string> parse_extra_float_digits(std::string_view written);
+
+    // A written idle_session_timeout as PostgreSQL's parse_int reads an int GUC of unit ms: a number (strtol base
+    // 0, else strtod), blanks, an optional unit "us", "ms", "s", "min", "h" or "d" (none: ms), blanks, rounded
+    // to whole ms, in 0 .. 2147483647 ms; else the refusal's message (22023) in PostgreSQL's words.
+    [[nodiscard]] std::variant<std::int64_t, std::string> parse_idle_session_timeout(std::string_view written);
+    // How SHOW writes `ms` (PostgreSQL's _ShowOption): "0", else in the largest unit of d / h / min / s / ms
+    // that holds it whole ("8h", "90s", "1500ms").
+    [[nodiscard]] std::string show_milliseconds(std::int64_t ms);
 
     // A written client_encoding as PostgreSQL's check_client_encoding keeps it
     // when it names UTF8 or SQL_ASCII (pg_valid_client_encoding's spellings:
@@ -216,11 +230,34 @@ namespace frontend::postgres {
     // tree; only a text whose first keyword is DISCARD is parsed.
     [[nodiscard]] bool discard_all_statement(std::pmr::memory_resource* resource, std::string_view sql);
 
-    // The client parameter of SHOW <client parameter>, read off the raw parse
+    // Read-only facts of the server, a name and its fixed value: the PostgreSQL
+    // version it speaks, the encoding the engine stores text in, the timestamps'
+    // microsecond integers — reported at startup (ParameterStatus) — and the
+    // values drivers SHOW at connect: the isolation of a block (it reads the
+    // snapshot taken when it began: repeatable read; SQLAlchemy's SHOW
+    // TRANSACTION ISOLATION LEVEL is `transaction_isolation`) and the identifier
+    // length (SQLAlchemy's SHOW max_identifier_length).
+    struct server_fact_t {
+        std::string_view name;
+        std::string_view value;
+        bool reported; // sent as ParameterStatus at startup (GUC_REPORT)
+    };
+    [[nodiscard]] std::span<const server_fact_t> server_facts() noexcept;
+
+    // What SHOW <name> answers in the frontend: a client parameter (its current
+    // value is the connection's), or a fixed value — a protocol parameter's or a
+    // server fact's —, under its canonical name (the column's name, as
+    // PostgreSQL names SHOW's column).
+    struct shown_parameter_t {
+        std::string_view name;
+        std::optional<client_parameter_t> client;
+        std::string_view value; // when not a client parameter
+    };
+    // SHOW <name> of a parameter the frontend answers, read off the raw parse
     // tree (a VariableShowStmt, one statement). Only a text whose first keyword
     // is SHOW is parsed; a SHOW of anything else goes to the session.
-    [[nodiscard]] std::optional<client_parameter_t> show_client_parameter(std::pmr::memory_resource* resource,
-                                                                          std::string_view sql);
+    [[nodiscard]] std::optional<shown_parameter_t> show_parameter(std::pmr::memory_resource* resource,
+                                                                  std::string_view sql);
 
     // The StartupMessage's `options`, as PostgreSQL's pg_split_opts and
     // process_postgres_switches read them: words split at blanks (a backslash

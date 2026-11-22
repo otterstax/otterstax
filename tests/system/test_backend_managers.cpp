@@ -85,7 +85,7 @@ namespace {
     data_chunk_t make_wide_slice(std::pmr::memory_resource* resource) {
         std::pmr::vector<types::complex_logical_type> fields(resource);
         fields.emplace_back(types::logical_type::INTEGER, "id");
-        fields.emplace_back(types::logical_type::STRING_LITERAL, "name");
+        fields.emplace_back(types::logical_type::TEXT, "name");
         data_chunk_t chunk(resource, fields, wide_slice_rows);
         for (size_t row = 0; row < wide_slice_rows; ++row) {
             chunk.set_value(0, row, static_cast<int32_t>(row));
@@ -199,7 +199,7 @@ TEST_CASE("mysql agent write: the count the backend reports is the write's") {
     INFO((written.has_error() ? written.error().what.c_str() : "ok"));
     REQUIRE_FALSE(written.has_error());
     // The mock connector answers every write with 42 affected rows.
-    REQUIRE(written.value() == 42);
+    REQUIRE(written.value().count == 42);
 }
 
 TEST_CASE("federation read: a result wider than one engine chunk reaches the cursor as chunks within the bound") {
@@ -334,11 +334,11 @@ namespace {
             const size_t id_col = label_first ? 1 : 0;
             const size_t label_col = label_first ? 0 : 1;
             if (label_first) {
-                fields.emplace_back(types::logical_type::STRING_LITERAL, "label");
+                fields.emplace_back(types::logical_type::TEXT, "label");
                 fields.emplace_back(types::logical_type::INTEGER, "id");
             } else {
                 fields.emplace_back(types::logical_type::INTEGER, "id");
-                fields.emplace_back(types::logical_type::STRING_LITERAL, "label");
+                fields.emplace_back(types::logical_type::TEXT, "label");
             }
             auto chunk = std::make_unique<data_chunk_t>(resource_, fields, not_null_rows);
             for (size_t row = 0; row < not_null_rows; ++row) {

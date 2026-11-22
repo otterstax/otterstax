@@ -12,6 +12,9 @@ namespace frontend::mysql {
         ER_ACCESS_DENIED_ERROR = 1045,
         ER_UNKNOWN_COM_ERROR = 1047,
         ER_BAD_DB_ERROR = 1049,
+        ER_NO_DB_ERROR = 1046, // No database selected (3D000)
+        ER_NO_SUCH_THREAD = 1094,     // Unknown thread id: KILL of no connection
+        ER_QUERY_INTERRUPTED = 1317, // Query execution was interrupted (70100): a KILL QUERY
         ER_HANDSHAKE_ERROR = 1043,
         ER_UNKNOWN_ERROR = 1105,
         ER_PACKET_TOO_LARGE = 1153,
@@ -45,6 +48,7 @@ namespace frontend::mysql {
         ER_NOT_SUPPORTED_YET = 1235,        // A result column type the wire cannot encode
         ER_QUERY_TIMEOUT = 3024,
         ER_UNKNOWN_SYSTEM_VARIABLE = 1193, // SELECT @@<a variable the server does not have>
+        ER_WRONG_TYPE_FOR_VAR = 1232,      // SET wait_timeout = 'x': Incorrect argument type to variable
         ER_COLLATION_CHARSET_MISMATCH = 1253, // COLLATION 'x' is not valid for CHARACTER SET 'y'
     };
 
@@ -60,5 +64,7 @@ namespace frontend::mysql {
         static constexpr const char* TABLE_EXISTS = "42S01";
         static constexpr const char* TABLE_NOT_FOUND = "42S02";
         static constexpr const char* VALUE_COUNT_MISMATCH = "21S01";
+        static constexpr const char* INVALID_CATALOG_NAME = "3D000";
+        static constexpr const char* QUERY_INTERRUPTED = "70100";
     };
 } // namespace frontend::mysql

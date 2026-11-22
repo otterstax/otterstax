@@ -76,7 +76,7 @@ TEST_CASE("pg_to_struct: column names and types come from the result attributes"
     REQUIRE(s.child_types()[0].alias() == "id");
     REQUIRE(s.child_types()[0].type() == logical_type::INTEGER);
     REQUIRE(s.child_types()[1].alias() == "label");
-    REQUIRE(s.child_types()[1].type() == logical_type::STRING_LITERAL);
+    REQUIRE(s.child_types()[1].type() == logical_type::TEXT);
 }
 
 TEST_CASE("pg_to_chunk: empty PGresult produces zero-row chunk") {
@@ -209,8 +209,8 @@ TEST_CASE("pg_to_chunk: a NUMERIC wider than the engine's DECIMAL is carried as 
         REQUIRE_FALSE(converted.has_error());
         const auto& chunk = converted.value();
         for (size_t col = 0; col < 3; ++col) {
-            REQUIRE(chunk.types()[col].type() == logical_type::STRING_LITERAL);
-            REQUIRE(schema.child_types()[col].type() == logical_type::STRING_LITERAL);
+            REQUIRE(chunk.types()[col].type() == logical_type::TEXT);
+            REQUIRE(schema.child_types()[col].type() == logical_type::TEXT);
         }
         REQUIRE(otterstax::test::cell(chunk, 0, 0).value<std::string_view>() == "0.333333333333333333333333");
         REQUIRE(otterstax::test::cell(chunk, 1, 0).value<std::string_view>() == "123456789012345678901234567890123456789012345678.90");
@@ -228,4 +228,51 @@ TEST_CASE("pg_to_chunk: a NUMERIC value past its declared precision is numeric_v
         REQUIRE(converted.error().type == core::error_code_t::numeric_value_out_of_range);
         REQUIRE(std::string{converted.error().what.c_str()}.find("price") != std::string::npos);
     });
+}
+
+// The date/time family as the engine's types, read off PostgreSQL's ISO text (every agent session runs under
+// DateStyle ISO, IntervalStyle postgres, TimeZone UTC); infinity, which the engine's types have no room for, is
+// refused.
+TEST_CASE("pg_to_chunk: date and time columns are the engine's temporal types") {
+    pg_result_guard g(make_tuples_result({{"d", 1082}, {"t", 1083}, {"ttz", 1266}, {"ts", 1114}, {"tz", 1184}, {"iv", 1186}},
+                                         {{"2026-01-02",
+                                           "10:11:12.25",
+                                           "10:00:00+03",
+                                           "2026-01-02 10:00:00.5",
+                                           "2026-01-02 13:00:00+03",
+                                           "2 mons 3 days 04:00:00"},
+                                          {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}}));
+    auto* res = std::pmr::new_delete_resource();
+    auto schema = tsl::pg_to_struct(res, g.get());
+    REQUIRE(schema.child_types().size() == 6);
+    using LT = components::types::logical_type;
+    CHECK(schema.child_types()[0].type() == LT::DATE);
+    CHECK(schema.child_types()[1].type() == LT::TIME);
+    CHECK(schema.child_types()[2].type() == LT::TIME_TZ);
+    CHECK(schema.child_types()[3].type() == LT::TIMESTAMP);
+    CHECK(schema.child_types()[4].type() == LT::TIMESTAMP_TZ);
+    CHECK(schema.child_types()[5].type() == LT::INTERVAL);
+    auto converted = tsl::pg_to_chunk(res, g.get());
+    INFO((converted.has_error() ? std::string{converted.error().what.c_str()} : std::string{}));
+    REQUIRE_FALSE(converted.has_error());
+    const auto& chunk = converted.value();
+    CHECK(chunk.data[0].get_value<core::date::date_t>(0).value.count() == 9498);
+    CHECK(chunk.data[1].get_value<core::date::time_t>(0).value.count() == 36'672'250'000);
+    CHECK(chunk.data[2].get_value<core::date::timetz_t>(0).zone.count() == 10800);
+    CHECK(chunk.data[3].get_value<core::date::timestamp_t>(0).value.count() == 9498LL * 86'400'000'000 + 36'000'500'000);
+    // 13:00 at +03 is the instant 10:00 UTC.
+    CHECK(chunk.data[4].get_value<core::date::timestamptz_t>(0).value.count() ==
+          9498LL * 86'400'000'000 + 36'000'000'000);
+    const auto interval = chunk.data[5].get_value<core::date::interval_t>(0);
+    CHECK(interval.month.count() == 2);
+    CHECK(interval.day.count() == 3);
+    CHECK(interval.time.count() == 14'400'000'000);
+    for (std::size_t column = 0; column < 6; ++column) {
+        CHECK(chunk.data[column].is_null(1));
+    }
+
+    pg_result_guard infinite(make_tuples_result({{"ts", 1114}}, {{"infinity"}}));
+    auto refused = tsl::pg_to_chunk(res, infinite.get());
+    REQUIRE(refused.has_error());
+    CHECK(std::string{refused.error().what.c_str()}.find("ts") != std::string::npos);
 }

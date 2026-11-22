@@ -24,7 +24,7 @@ namespace {
         owned->backend("pg").add_table({"shop",
                                        "public",
                                        "t",
-                                       {column("id", logical_type::BIGINT), column("note", logical_type::STRING_LITERAL)},
+                                       {column("id", logical_type::BIGINT), column("note", logical_type::TEXT)},
                                        std::move(data)});
         return owned;
     }
@@ -148,7 +148,7 @@ TEST_CASE("scans: with every agent busy a read waits in the actor's queue, not o
     stack.backend("pg").add_table({"shop",
                                    "public",
                                    "t",
-                                   {column("id", logical_type::BIGINT), column("note", logical_type::STRING_LITERAL)},
+                                   {column("id", logical_type::BIGINT), column("note", logical_type::TEXT)},
                                    {{std::int64_t{1}, std::string{"a"}}}});
     stack.open();
     stack.backend("pg").answer_later(std::chrono::milliseconds(100));

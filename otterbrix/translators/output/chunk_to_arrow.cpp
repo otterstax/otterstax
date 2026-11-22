@@ -95,7 +95,7 @@ namespace {
                 return std::shared_ptr<arrow::DataType>{arrow::float32()};
             case types::physical_type::DOUBLE:
                 return std::shared_ptr<arrow::DataType>{arrow::float64()};
-            case types::physical_type::STRING:
+            case types::physical_type::TEXT:
                 return std::shared_ptr<arrow::DataType>{arrow::utf8()};
             case types::physical_type::NA:
                 return std::shared_ptr<arrow::DataType>{arrow::null()};
@@ -153,6 +153,7 @@ namespace {
             case types::logical_type::BIGINT:
             case types::logical_type::UTINYINT:
             case types::logical_type::USMALLINT:
+            case types::logical_type::OID:
             case types::logical_type::UINTEGER:
             case types::logical_type::UBIGINT:
             case types::logical_type::FLOAT:
@@ -162,6 +163,7 @@ namespace {
             case types::logical_type::TIMESTAMP:
             case types::logical_type::TIMESTAMP_TZ:
                 return true;
+            case types::logical_type::TEXT:
             case types::logical_type::STRING_LITERAL:
                 return large_strings;
             default:
@@ -217,7 +219,7 @@ namespace {
         arrow::FieldVector field_vector;
         field_vector.reserve(types.size());
         for (const auto& type : types) {
-            if (large_strings && type.type() == logical_type::STRING_LITERAL) {
+            if (large_strings && type.type() == logical_type::TEXT) {
                 field_vector.push_back(arrow::field(field_name(type), arrow::large_utf8()));
                 continue;
             }
@@ -393,7 +395,7 @@ make_batch(std::pmr::memory_resource* res, const data_chunk_t& chunk, bool large
             case physical_type::UINT64: BUILD_COL(UInt64Builder,  uint64_t)
             case physical_type::FLOAT:  BUILD_COL(FloatBuilder,   float)
             case physical_type::DOUBLE: BUILD_COL(DoubleBuilder,  double)
-            case physical_type::STRING: {
+            case physical_type::TEXT: {
                 arrow::StringBuilder b{pool};
                 if (auto st = b.Reserve(nrows); !st.ok()) {
                     return tsl::arrow_error(res, core::error_code_t::internal_error,

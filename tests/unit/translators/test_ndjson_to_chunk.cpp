@@ -126,7 +126,7 @@ TEST_CASE("ndjson_to_chunk: a quoted 128-bit integer keeps every digit") {
 
     const int wide = col(chunk, "wide");
     REQUIRE(wide >= 0);
-    REQUIRE(chunk.types()[wide].type() == components::types::logical_type::STRING_LITERAL);
+    REQUIRE(chunk.types()[wide].type() == components::types::logical_type::TEXT);
     REQUIRE(otterstax::test::cell(chunk, wide, 0).value<std::string_view>() == "18446744073709551616");
     REQUIRE(otterstax::test::cell(chunk, wide, 1).value<std::string_view>() == "-170141183460469231731687303715884105728");
 }

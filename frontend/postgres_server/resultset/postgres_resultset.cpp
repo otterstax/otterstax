@@ -87,7 +87,7 @@ namespace frontend::postgres {
                 writer.write_int32(estimate_binary_field_size<frontend_type::POSTGRES>(chunk, i, row_index));
                 encode_to_binary<frontend_type::POSTGRES>(writer, chunk, i, row_index);
             } else {
-                auto str = encode_to_text(chunk, i, row_index, {frontend_type::POSTGRES, extra_float_digits_.value});
+                auto str = encode_to_text(chunk, i, row_index, {frontend_type::POSTGRES, extra_float_digits_.value, &time_zone_});
                 writer.write_int32(str.size());
                 writer.write_string_fixed(std::move(str));
             }

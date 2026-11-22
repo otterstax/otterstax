@@ -3,6 +3,7 @@
 
 #include "resultset_utils.hpp"
 
+#include "temporal_wire.hpp"
 #include "utils.hpp"
 #include "utility/tracy_profiler.hpp"
 
@@ -24,11 +25,13 @@ namespace frontend {
                 case LT::SMALLINT:
                 case LT::USMALLINT:
                 case LT::INTEGER:
+                case LT::OID:
                 case LT::UINTEGER:
                 case LT::BIGINT:
                 case LT::UBIGINT:
                 case LT::FLOAT:
                 case LT::DOUBLE:
+                case LT::TEXT:
                 case LT::STRING_LITERAL:
                 case LT::DECIMAL:
                 case LT::HUGEINT:
@@ -36,6 +39,12 @@ namespace frontend {
                 case LT::ARRAY:
                 case LT::LIST:
                 case LT::STRUCT:
+                case LT::DATE:
+                case LT::TIME:
+                case LT::TIME_TZ:
+                case LT::TIMESTAMP:
+                case LT::TIMESTAMP_TZ:
+                case LT::INTERVAL:
                     return true;
                 default:
                     return false;
@@ -53,32 +62,29 @@ namespace frontend {
                 case LT::SMALLINT:
                 case LT::USMALLINT:
                 case LT::INTEGER:
+                case LT::OID:
                 case LT::UINTEGER:
                 case LT::BIGINT:
                 case LT::UBIGINT:
                 case LT::FLOAT:
                 case LT::DOUBLE:
+                case LT::TEXT:
                 case LT::STRING_LITERAL:
+                // The temporal types (temporal_wire.hpp): PostgreSQL's binary format is the engine's storage, MySQL's
+                // its binary DATE / TIME / DATETIME layout. A type a wire has no type for (MySQL's TIME_TZ,
+                // INTERVAL) is refused by has_wire_type before this is asked.
+                case LT::DATE:
+                case LT::TIME:
+                case LT::TIME_TZ:
+                case LT::TIMESTAMP:
+                case LT::TIMESTAMP_TZ:
+                case LT::INTERVAL:
                     return true;
                 case LT::DECIMAL:
                 case LT::HUGEINT:
-                    // A HUGEINT travels as the same digits as a DECIMAL, at
-                    // scale 0, and therefore under the same two answers.
-                    // MySQL puts a NEWDECIMAL field of a binary resultset row on
-                    // the wire as the same length-encoded string the text row
-                    // carries, so the one rendering serves both formats.
-                    // PostgreSQL's binary NUMERIC is its own encoding — a
-                    // sequence of base-10000 digit groups behind a
-                    // weight/sign/dscale header, whose layout PostgreSQL
-                    // documents as backend-internal ("Values passed in binary
-                    // format require knowledge of the internal representation
-                    // expected by the backend", libpq's PQexecParams) rather
-                    // than as part of the client protocol. This frontend does
-                    // not write it, and a DataRow states each field's length
-                    // before the bytes, so a guessed encoding would desynchronise
-                    // the row rather than merely mis-state one number. The column
-                    // is refused in that format instead, and carried in text.
-                    return front_type == frontend_type::MYSQL;
+                    // Both formats on both wires: MySQL's binary NEWDECIMAL is the text's length-encoded string,
+                    // PostgreSQL's binary NUMERIC its numeric_send digit groups (pg_numeric_send).
+                    return true;
                 default:
                     return false;
             }
@@ -118,15 +124,23 @@ namespace frontend {
                     case LT::SMALLINT:
                     case LT::USMALLINT:
                     case LT::INTEGER:
+                    case LT::OID:
                     case LT::UINTEGER:
                     case LT::BIGINT:
                     case LT::UBIGINT:
                     case LT::HUGEINT:
                     case LT::FLOAT:
                     case LT::DOUBLE:
+                    case LT::TEXT:
                     case LT::STRING_LITERAL:
                     case LT::DECIMAL:
                     case LT::ENUM:
+                    case LT::DATE:
+                    case LT::TIME:
+                    case LT::TIME_TZ:
+                    case LT::TIMESTAMP:
+                    case LT::TIMESTAMP_TZ:
+                    case LT::INTERVAL:
                         return true;
                     case LT::LIST:
                     case LT::ARRAY:
@@ -318,6 +332,7 @@ namespace frontend {
                     return std::to_string(vec.data<uint16_t>()[index]);
                 case LT::INTEGER:
                     return std::to_string(vec.data<int32_t>()[index]);
+                case LT::OID:
                 case LT::UINTEGER:
                     return std::to_string(vec.data<uint32_t>()[index]);
                 case LT::BIGINT:
@@ -328,6 +343,7 @@ namespace frontend {
                     return float_text(format, vec.data<float>()[index]);
                 case LT::DOUBLE:
                     return double_text(format, vec.data<double>()[index]);
+                case LT::TEXT:
                 case LT::STRING_LITERAL:
                     return std::string(vec.data<std::string_view>()[index]);
                 case LT::DECIMAL:
@@ -340,6 +356,13 @@ namespace frontend {
                     return array_text(vec, index, format);
                 case LT::STRUCT:
                     return record_text(vec, index, format);
+                case LT::DATE:
+                case LT::TIME:
+                case LT::TIME_TZ:
+                case LT::TIMESTAMP:
+                case LT::TIMESTAMP_TZ:
+                case LT::INTERVAL:
+                    return temporal::text(vec, index, format);
                 default:
                     assert(false && "element_text: a nested type nested_text_encodable refuses");
                     return {};
@@ -499,6 +522,7 @@ namespace frontend {
                 row_sz = SMALLINT_TEXT_SIZE;
                 break;
             case components::types::logical_type::INTEGER:
+            case components::types::logical_type::OID:
             case components::types::logical_type::UINTEGER:
                 row_sz = INTEGER_TEXT_SIZE;
                 break;
@@ -512,6 +536,7 @@ namespace frontend {
             case components::types::logical_type::DOUBLE:
                 row_sz = DOUBLE_TEXT_SIZE;
                 break;
+            case components::types::logical_type::TEXT:
             case components::types::logical_type::STRING_LITERAL: {
                 auto sv = chunk.data[column_index].data<std::string_view>()[row_index];
                 row_sz = sv.size();
@@ -564,12 +589,14 @@ namespace frontend {
             case components::types::logical_type::INTEGER:
             case components::types::logical_type::FLOAT:
                 return 4;
+            case components::types::logical_type::OID:
             case components::types::logical_type::UINTEGER:
                 return type == frontend_type::MYSQL ? 4 : 8;
             case components::types::logical_type::BIGINT:
             case components::types::logical_type::UBIGINT:
             case components::types::logical_type::DOUBLE:
                 return 8;
+            case components::types::logical_type::TEXT:
             case components::types::logical_type::STRING_LITERAL: {
                 auto view = chunk.data[column_index].data<std::string_view>()[row_index];
                 if constexpr (type == frontend_type::MYSQL) {
@@ -578,19 +605,38 @@ namespace frontend {
                     return view.size();
                 }
             }
+            // What encode_to_binary writes (temporal_wire.hpp): PostgreSQL the engine's storage, MySQL a length byte
+            // and the binary DATE (4) / DATETIME (7, 11 with microseconds) / TIME (8, 12) fields.
+            case components::types::logical_type::DATE:
+                return type == frontend_type::MYSQL ? 1 + 4 : 4;
+            case components::types::logical_type::TIME: {
+                if constexpr (type == frontend_type::MYSQL) {
+                    const auto time = chunk.data[column_index].get_value<core::date::time_t>(row_index);
+                    return time.value.count() % 1'000'000 != 0 ? 1 + 12 : 1 + 8;
+                } else {
+                    return 8;
+                }
+            }
+            case components::types::logical_type::TIMESTAMP:
+            case components::types::logical_type::TIMESTAMP_TZ: {
+                if constexpr (type == frontend_type::MYSQL) {
+                    const auto micros = chunk.data[column_index].get_value<core::date::timestamp_t>(row_index);
+                    return temporal::civil_of(micros.value).microsecond != 0 ? 1 + 11 : 1 + 7;
+                } else {
+                    return 8;
+                }
+            }
+            case components::types::logical_type::TIME_TZ:
+                return 12; // PostgreSQL only: MySQL has no TIME_TZ
+            case components::types::logical_type::INTERVAL:
+                return 16; // PostgreSQL only: MySQL has no INTERVAL
             case components::types::logical_type::DECIMAL:
             case components::types::logical_type::HUGEINT: {
                 if constexpr (type == frontend_type::MYSQL) {
                     return mysql::get_length_encoded_string_size(
                         decimal_to_text(chunk, column_index, row_index).size());
                 } else {
-                    // Unreachable: is_encodable<POSTGRES> is false for both of
-                    // these in BINARY, so the column is refused before a binary
-                    // row is sized. A PostgreSQL DataRow writes this size as the
-                    // field's length prefix, so there is nothing safe to answer
-                    // here.
-                    assert(false && "estimate_binary_field_size: PostgreSQL binary NUMERIC is refused, never sized");
-                    return 0;
+                    return pg_numeric_send(decimal_to_text(chunk, column_index, row_index)).size();
                 }
             }
             default:
@@ -599,6 +645,77 @@ namespace frontend {
                 assert(false && "estimate_binary_field_size: column type was not checked with is_encodable");
                 return 0;
         }
+    }
+
+    std::vector<uint8_t> pg_numeric_send(std::string_view text) {
+        constexpr uint16_t NUMERIC_NEG = 0x4000;
+        constexpr uint16_t NUMERIC_NAN = 0xC000;
+        constexpr uint16_t NUMERIC_PINF = 0xD000;
+        constexpr uint16_t NUMERIC_NINF = 0xF000;
+        std::vector<uint8_t> out;
+        const auto put = [&out](int32_t field) {
+            const auto value = static_cast<uint16_t>(field);
+            out.push_back(static_cast<uint8_t>(value >> 8));
+            out.push_back(static_cast<uint8_t>(value & 0xFF));
+        };
+        const auto special = [&](uint16_t sign) {
+            put(0);
+            put(0);
+            put(sign);
+            put(0);
+            return out;
+        };
+        if (text == "NaN") {
+            return special(NUMERIC_NAN);
+        }
+        if (text == "Infinity") {
+            return special(NUMERIC_PINF);
+        }
+        if (text == "-Infinity") {
+            return special(NUMERIC_NINF);
+        }
+        const bool negative = !text.empty() && text.front() == '-';
+        if (negative) {
+            text.remove_prefix(1);
+        }
+        const auto point = text.find('.');
+        std::string integer{text.substr(0, point)};
+        std::string fraction{point == std::string_view::npos ? std::string_view{} : text.substr(point + 1)};
+        const auto scale = static_cast<int32_t>(fraction.size());
+        integer.insert(0, (4 - integer.size() % 4) % 4, '0');
+        fraction.append((4 - fraction.size() % 4) % 4, '0');
+        std::vector<int32_t> groups;
+        for (std::size_t at = 0; at < integer.size(); at += 4) {
+            groups.push_back(std::stoi(integer.substr(at, 4)));
+        }
+        int32_t weight = static_cast<int32_t>(groups.size()) - 1;
+        for (std::size_t at = 0; at < fraction.size(); at += 4) {
+            groups.push_back(std::stoi(fraction.substr(at, 4)));
+        }
+        std::size_t first = 0;
+        while (first < groups.size() && groups[first] == 0) {
+            ++first;
+            --weight;
+        }
+        std::size_t last = groups.size();
+        while (last > first && groups[last - 1] == 0) {
+            --last;
+        }
+        if (first == last) { // zero: no group, weight 0, positive
+            put(0);
+            put(0);
+            put(0);
+            put(scale);
+            return out;
+        }
+        put(static_cast<int32_t>(last - first));
+        put(weight);
+        put(negative ? NUMERIC_NEG : 0);
+        put(scale);
+        for (std::size_t at = first; at < last; ++at) {
+            put(groups[at]);
+        }
+        return out;
     }
 
     std::string
@@ -723,6 +840,7 @@ namespace frontend {
                 return std::to_string(chunk.data[column_index].data<uint16_t>()[row_index]);
             case components::types::logical_type::INTEGER:
                 return std::to_string(chunk.data[column_index].data<int32_t>()[row_index]);
+            case components::types::logical_type::OID:
             case components::types::logical_type::UINTEGER:
                 return std::to_string(chunk.data[column_index].data<uint32_t>()[row_index]);
             case components::types::logical_type::BIGINT:
@@ -733,6 +851,7 @@ namespace frontend {
                 return float_text(format, chunk.data[column_index].data<float>()[row_index]);
             case components::types::logical_type::DOUBLE:
                 return double_text(format, chunk.data[column_index].data<double>()[row_index]);
+            case components::types::logical_type::TEXT:
             case components::types::logical_type::STRING_LITERAL:
                 return std::string(chunk.data[column_index].data<std::string_view>()[row_index]);
             case components::types::logical_type::DECIMAL:
@@ -747,6 +866,15 @@ namespace frontend {
                 return array_text(chunk.data[column_index], row_index, format);
             case components::types::logical_type::STRUCT:
                 return record_text(chunk.data[column_index], row_index, format);
+            case components::types::logical_type::DATE:
+            case components::types::logical_type::TIME:
+            case components::types::logical_type::TIME_TZ:
+            case components::types::logical_type::TIMESTAMP:
+            case components::types::logical_type::TIMESTAMP_TZ:
+            case components::types::logical_type::INTERVAL: {
+                const auto [storage, at] = storage_of(chunk.data[column_index], row_index);
+                return temporal::text(*storage, at, format);
+            }
             default:
                 // Unreachable: is_encodable<type>(.., TEXT) is checked for every
                 // column before a text row is encoded.

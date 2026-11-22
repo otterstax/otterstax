@@ -28,7 +28,7 @@ namespace {
         std::vector<kafka_column_t> cols;
         cols.push_back({"id", complex_logical_type(logical_type::BIGINT)});
         cols.push_back({"campaign_id", complex_logical_type(logical_type::BIGINT)});
-        cols.push_back({"event_type", complex_logical_type(logical_type::STRING_LITERAL)});
+        cols.push_back({"event_type", complex_logical_type(logical_type::TEXT)});
         cols.push_back({"amount", complex_logical_type(logical_type::DOUBLE)});
         cols.push_back({"ts", complex_logical_type(logical_type::BIGINT)});
         return cols;

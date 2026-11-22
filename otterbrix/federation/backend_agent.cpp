@@ -305,6 +305,23 @@ namespace otterstax::federation {
         OTX_ZONE_N("backend_agent::check_session");
         reopen_ = false;
         session_refused_ = false;
+        // PostgreSQL answers dates, times and intervals as text in the session's DateStyle / IntervalStyle, a
+        // timestamptz in its TimeZone: every session reads them in the one form pg_to_chunk parses (ISO, postgres,
+        // UTC). A session that cannot be set is not kept.
+        if (auto* pg = std::get_if<std::unique_ptr<pg::IConnector>>(&connector_)) {
+            auto set = run<otterstax::asio_error_t, PGresult*>(
+                **pg, "SET DateStyle = ISO; SET IntervalStyle = postgres; SET TimeZone = 'UTC'", [](PGresult*) {
+                    return otterstax::asio_error_t{};
+                });
+            if (set.contains_error()) {
+                (*pg)->close();
+                reopen_ = true;
+                return error(set.type,
+                             "the session's DateStyle / IntervalStyle / TimeZone could not be set: " +
+                                 std::string{set.what.data(), set.what.size()});
+            }
+            return core::error_t::no_error();
+        }
         auto* my = std::get_if<std::unique_ptr<mysql::IConnector>>(&connector_);
         if (my == nullptr) {
             return core::error_t::no_error();
@@ -315,6 +332,19 @@ namespace otterstax::federation {
         // command), so every session is asked.
         // Whether the mode is strict decides which UPDATE may leave its range check to the store into
         // the column (sql_gen::statement_needs_t, write).
+        // A TIMESTAMP is an instant MySQL shows in the session's time_zone: every session reads (and is written)
+        // it in UTC, so mysql_to_chunk reads its fields as UTC's (an offset needs no time-zone tables). Before the
+        // sql_mode, which a failure of this leaves unread: the session is not kept either way.
+        auto zoned = run<otterstax::asio_error_t, const boost::mysql::results&>(
+            **my, "SET SESSION time_zone = '+00:00'", [](const boost::mysql::results&) {
+                return otterstax::asio_error_t{};
+            });
+        if (zoned.contains_error()) {
+            (*my)->close();
+            reopen_ = true;
+            return error(zoned.type,
+                         "the session's time_zone could not be set: " + std::string{zoned.what.data(), zoned.what.size()});
+        }
         bool no_backslash_escapes = false;
         strict_session_ = false;
         auto mode_handler = [this,
@@ -487,7 +517,7 @@ namespace otterstax::federation {
         co_return rows;
     }
 
-    backend_agent_t::unique_future<core::result_wrapper_t<std::uint64_t>>
+    backend_agent_t::unique_future<core::result_wrapper_t<write_answer_t>>
     backend_agent_t::write(std::string sql, write_kind_t kind, bool strict_store, qualified_name_t table) {
         OTX_ZONE_N("backend_agent::write");
         if (!in_transaction_) {
@@ -509,14 +539,20 @@ namespace otterstax::federation {
         if (log_.is_valid()) {
             log_->debug("{} write: \"{}\"", connection_, sql);
         }
-        core::result_wrapper_t<std::uint64_t> written =
+        core::result_wrapper_t<write_answer_t> written =
             error(core::error_code_t::internal_error, "no connector attached");
+        const auto count_only = [](core::result_wrapper_t<std::uint64_t> count) -> core::result_wrapper_t<write_answer_t> {
+            if (count.has_error()) {
+                return count.error();
+            }
+            return write_answer_t{count.value(), 0};
+        };
         if (auto* my = std::get_if<std::unique_ptr<mysql::IConnector>>(&connector_)) {
             written = write_mysql(**my, sql, kind);
         } else if (auto* pg = std::get_if<std::unique_ptr<pg::IConnector>>(&connector_)) {
-            written = write_pg(**pg, sql);
+            written = count_only(write_pg(**pg, sql));
         } else if (auto* ch = std::get_if<std::unique_ptr<ch::IConnector>>(&connector_)) {
-            written = write_ch(**ch, sql, kind, table);
+            written = count_only(write_ch(**ch, sql, kind, table));
         }
         if (written.has_error()) {
             note_failure(written.error());
@@ -659,13 +695,18 @@ namespace otterstax::federation {
         return rows;
     }
 
-    core::result_wrapper_t<std::uint64_t>
+    core::result_wrapper_t<write_answer_t>
     backend_agent_t::write_mysql(mysql::IConnector& connector, const std::string& sql, write_kind_t kind) {
         // An UPDATE answers the rows it matched (mysql_update_rows_matched), an INSERT / DELETE its
-        // affected rows.
+        // affected rows; an INSERT the id it generated first (the OK packet's last_insert_id).
         const bool update = kind == write_kind_t::update;
+        const bool insert = kind == write_kind_t::insert;
         bool info_missing = false;
-        auto handler = [update, &info_missing](const boost::mysql::results& result) -> int64_t {
+        std::uint64_t generated_id = 0;
+        auto handler = [update, insert, &info_missing, &generated_id](const boost::mysql::results& result) -> int64_t {
+            if (insert) {
+                generated_id = result.last_insert_id();
+            }
             if (!update) {
                 return static_cast<int64_t>(result.affected_rows());
             }
@@ -683,7 +724,7 @@ namespace otterstax::federation {
         if (info_missing) {
             return error(core::error_code_t::protocol_violation, "an UPDATE answered without its matched rows");
         }
-        return static_cast<std::uint64_t>(outcome.value());
+        return write_answer_t{static_cast<std::uint64_t>(outcome.value()), generated_id};
     }
 
     core::result_wrapper_t<discovered_tables_t> backend_agent_t::discover_mysql(mysql::IConnector& connector,

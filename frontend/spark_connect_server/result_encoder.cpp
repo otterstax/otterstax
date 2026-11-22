@@ -40,6 +40,7 @@ namespace frontend::spark {
                     return ct::logical_type::TINYINT;
                 case ct::logical_type::USMALLINT:
                     return ct::logical_type::SMALLINT;
+                case ct::logical_type::OID:
                 case ct::logical_type::UINTEGER:
                     return ct::logical_type::INTEGER;
                 case ct::logical_type::UBIGINT:
@@ -73,10 +74,12 @@ namespace frontend::spark {
                 case ct::logical_type::BIGINT:
                 case ct::logical_type::UTINYINT:
                 case ct::logical_type::USMALLINT:
+                case ct::logical_type::OID:
                 case ct::logical_type::UINTEGER:
                 case ct::logical_type::UBIGINT:
                 case ct::logical_type::FLOAT:
                 case ct::logical_type::DOUBLE:
+                case ct::logical_type::TEXT:
                 case ct::logical_type::STRING_LITERAL:
                 case ct::logical_type::DATE:
                 case ct::logical_type::TIME:

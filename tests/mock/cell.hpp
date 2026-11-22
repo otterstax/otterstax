@@ -41,7 +41,7 @@ namespace otterstax::test {
         T value() const {
             REQUIRE_FALSE(null_);
             if constexpr (std::is_same_v<T, std::string_view>) {
-                REQUIRE(leaf_->type().to_physical_type() == components::types::physical_type::STRING);
+                REQUIRE(leaf_->type().to_physical_type() == components::types::physical_type::TEXT);
             } else {
                 REQUIRE(leaf_->type().to_physical_type() ==
                         components::types::to_physical_type(components::types::to_logical_type<T>()));

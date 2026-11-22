@@ -8,10 +8,12 @@
 #include "utility/tracy_memory_resource.hpp"
 #include "utility/tracy_profiler.hpp"
 
+#include <components/logical_plan/node_data.hpp>
 #include <components/logical_plan/node_drop.hpp>
 #include <components/sql/parser/parser.h>
 #include <components/sql/transformer/utils.hpp>
 
+#include <algorithm>
 #include <cassert>
 #include <string>
 #include <vector>
@@ -191,6 +193,7 @@ core::result_wrapper_t<ParsedQueryDataPtr> GreenplumParser::parse(const std::str
         log_->error("parse: finalize failed: {}", finalized.error().what.c_str());
         return finalized.convert_error<ParsedQueryDataPtr>();
     }
+    give_fromless_filters_a_row(finalized.value());
     // The last sub-query is the statement; the ones before it are the
     // `IN (SELECT ...)` / `EXISTS (SELECT ...)` / scalar sub-queries the
     // transformer flattened out of it, which the engine runs first and binds
@@ -211,6 +214,58 @@ core::result_wrapper_t<ParsedQueryDataPtr> GreenplumParser::parse(const std::str
     result->sql = sql;
 
     return result;
+}
+
+namespace {
+    // The clauses of an aggregate: every other child is its source (a table read, a derived table, a join,
+    // raw data, a CTE scan, …).
+    bool is_clause(logical_plan::node_type type) {
+        using logical_plan::node_type;
+        return type == node_type::match_t || type == node_type::group_t || type == node_type::select_t ||
+               type == node_type::sort_t || type == node_type::limit_t || type == node_type::having_t;
+    }
+
+    void give_rows(std::pmr::memory_resource* resource, const logical_plan::node_ptr& node) {
+        if (!node) {
+            return;
+        }
+        for (const auto& child : node->children()) {
+            give_rows(resource, child);
+        }
+        if (node->type() != logical_plan::node_type::aggregate_t || !node->target().empty()) {
+            return; // not a query block, or one reading a table
+        }
+        const auto& children = node->children();
+        const bool filters = std::any_of(children.begin(), children.end(), [](const logical_plan::node_ptr& c) {
+            return c && c->type() == logical_plan::node_type::match_t;
+        });
+        const bool sourced = std::any_of(children.begin(), children.end(), [](const logical_plan::node_ptr& c) {
+            return c && !is_clause(c->type());
+        });
+        if (!filters || sourced) {
+            return;
+        }
+        // One column, as `(VALUES (1))` has: a source of no column loses the result's types when the filter keeps
+        // no row (the select then answers a result without columns). Its name is no name a query can write
+        // unquoted, and a block without FROM names no column of its source.
+        std::pmr::vector<components::types::complex_logical_type> one_column(resource);
+        one_column.emplace_back(components::types::logical_type::BIGINT, "?otterstax_row?");
+        components::vector::data_chunk_t one_row(resource, one_column, 1);
+        one_row.set_value(0, 0, std::int64_t{1});
+        one_row.set_cardinality(1);
+        logical_plan::node_ptr source{new logical_plan::node_data_t(resource, std::move(one_row))};
+        auto& mutable_children = node->children();
+        mutable_children.insert(mutable_children.begin(), source);
+    }
+} // namespace
+
+void give_fromless_filters_a_row(logical_plan::execution_plan_t& plan) {
+    OTX_ZONE_N("otterbrix::give_fromless_filters_a_row");
+    for (const auto& query : plan.sub_queries) {
+        if (query) {
+            give_rows(query->resource(), query);
+        }
+    }
 }
 
 core::result_wrapper_t<logical_plan::node_ptr>

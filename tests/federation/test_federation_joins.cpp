@@ -21,8 +21,8 @@ namespace {
         stack.backend("pg").add_table({"shop",
                                        "public",
                                        "customers",
-                                       {column("name", logical_type::STRING_LITERAL),
-                                        column("addr_city", logical_type::STRING_LITERAL)},
+                                       {column("name", logical_type::TEXT),
+                                        column("addr_city", logical_type::TEXT)},
                                        {{std::string{"Ann"}, std::string{"Berlin"}},
                                         {std::string{"Bob"}, std::string{"Tel Aviv"}}}});
         stack.open();

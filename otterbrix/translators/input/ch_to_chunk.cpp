@@ -6,6 +6,7 @@
 #include "utility/tracy_profiler.hpp"
 
 #include <components/vector/vector_builders.hpp>
+#include <core/date/date_types.hpp>
 #include <components/vector/vector_operations.hpp>
 
 #include <arpa/inet.h>
@@ -104,7 +105,7 @@ namespace tsl {
                     return std::move(*decimal);
                 }
             }
-            return {types::logical_type::STRING_LITERAL, alias};
+            return {types::logical_type::TEXT, alias};
         }
 
         // The column's type as the wire describes it.
@@ -317,16 +318,20 @@ namespace tsl {
                     return types::logical_type::FLOAT;
                 case c::Float64:
                     return types::logical_type::DOUBLE;
-                case c::String:
-                case c::FixedString:
+                // A Date / Date32 is a day; a DateTime / DateTime64 an instant (seconds or 10^-p seconds since
+                // the Unix epoch in UTC, whatever zone the column displays in).
                 case c::Date:
                 case c::Date32:
+                    return types::logical_type::DATE;
                 case c::DateTime:
                 case c::DateTime64:
+                    return types::logical_type::TIMESTAMP_TZ;
+                case c::String:
+                case c::FixedString:
                 case c::UUID:
-                    return types::logical_type::STRING_LITERAL;
+                    return types::logical_type::TEXT;
                 default:
-                    return types::logical_type::STRING_LITERAL;
+                    return types::logical_type::TEXT;
             }
         }
 
@@ -353,8 +358,12 @@ namespace tsl {
                 return types::logical_type::DOUBLE;
             if (name == "Bool")
                 return types::logical_type::BOOLEAN;
+            if (name == "Date" || name == "Date32")
+                return types::logical_type::DATE;
+            if (name == "DateTime" || name == "DateTime64")
+                return types::logical_type::TIMESTAMP_TZ;
             // String, FixedString, Date, DateTime, DateTime64, UUID, Enum*, ... = String
-            return types::logical_type::STRING_LITERAL;
+            return types::logical_type::TEXT;
         }
 
         types::complex_logical_type build_from_named_string(std::pmr::memory_resource* resource,
@@ -428,7 +437,7 @@ namespace tsl {
             size_t a = type_str.find_first_not_of(" \t");
             size_t b = type_str.find_last_not_of(" \t");
             if (a == std::string::npos) {
-                return {types::logical_type::STRING_LITERAL, alias};
+                return {types::logical_type::TEXT, alias};
             }
             std::string s = type_str.substr(a, b - a + 1);
 
@@ -442,7 +451,7 @@ namespace tsl {
             if (auto inner = strip_wrapper(s, "SimpleAggregateFunction"); !inner.empty()) {
                 auto arguments = split_named_tuple_fields(inner);
                 if (arguments.size() < 2) {
-                    return {types::logical_type::STRING_LITERAL, alias};
+                    return {types::logical_type::TEXT, alias};
                 }
                 return build_from_named_string(resource, arguments.back().second, alias);
             }
@@ -469,7 +478,7 @@ namespace tsl {
             if (base == "Decimal" || base == "Decimal32" || base == "Decimal64" || base == "Decimal128") {
                 const clickhouse::TypeAst* ast = clickhouse::ParseTypeName(s);
                 if (ast == nullptr) {
-                    return {types::logical_type::STRING_LITERAL, alias};
+                    return {types::logical_type::TEXT, alias};
                 }
                 return decimal_or_text(*ast, alias);
             }
@@ -836,7 +845,7 @@ namespace tsl {
                 if (item.type == c::Void) {
                     return components::vector::make_null(res, target_type);
                 }
-                if (target_type.type() != lt::STRING_LITERAL ||
+                if (target_type.type() != lt::TEXT ||
                     (item.type != c::String && item.type != c::FixedString)) {
                     return std::nullopt;
                 }
@@ -895,6 +904,7 @@ namespace tsl {
                     const types::int128_t unscaled = decimal_col->At(row);
                     return components::vector::make_decimal(res, target_type, unscaled);
                 }
+                case lt::TEXT:
                 case lt::STRING_LITERAL: {
                     auto text = read_text(col, code, row);
                     if (!text.has_value()) {
@@ -906,6 +916,52 @@ namespace tsl {
                     return read_struct(res, col, code, row, target_type);
                 case lt::LIST:
                     return read_list(res, col, code, row, target_type);
+                // The engine counts from 2000-01-01, ClickHouse from 1970-01-01: 10957 days apart.
+                case lt::DATE: {
+                    constexpr int64_t engine_epoch_day = 10957;
+                    int64_t day = 0;
+                    if (code == c::Date) {
+                        day = col->As<clickhouse::ColumnDate>()->RawAt(row);
+                    } else if (code == c::Date32) {
+                        day = col->As<clickhouse::ColumnDate32>()->RawAt(row);
+                    } else {
+                        return std::nullopt;
+                    }
+                    return components::vector::make_scalar(
+                        res,
+                        target_type,
+                        core::date::date_t{core::date::days{static_cast<int32_t>(day - engine_epoch_day)}});
+                }
+                // Microseconds since 2000-01-01 UTC; a DateTime64 finer than microseconds floors to the engine's.
+                case lt::TIMESTAMP_TZ: {
+                    constexpr int64_t engine_epoch_second = 946'684'800;
+                    int64_t micros = 0;
+                    if (code == c::DateTime) {
+                        micros = (static_cast<int64_t>(col->As<clickhouse::ColumnDateTime>()->RawAt(row)) -
+                                  engine_epoch_second) *
+                                 1'000'000;
+                    } else if (code == c::DateTime64) {
+                        const auto datetime64 = col->As<clickhouse::ColumnDateTime64>();
+                        const auto scale = ticks_per_second(datetime64->GetPrecision());
+                        if (!scale.has_value()) {
+                            return std::nullopt;
+                        }
+                        const int64_t ticks = datetime64->At(row);
+                        int64_t seconds = ticks / *scale;
+                        int64_t fraction = ticks % *scale;
+                        if (fraction < 0) {
+                            fraction += *scale;
+                            --seconds;
+                        }
+                        const int64_t fraction_micros =
+                            *scale >= 1'000'000 ? fraction / (*scale / 1'000'000) : fraction * (1'000'000 / *scale);
+                        micros = (seconds - engine_epoch_second) * 1'000'000 + fraction_micros;
+                    } else {
+                        return std::nullopt;
+                    }
+                    return components::vector::make_scalar(
+                        res, target_type, core::date::timestamptz_t{core::date::microseconds{micros}});
+                }
                 default:
                     return std::nullopt;
             }
@@ -917,7 +973,7 @@ namespace tsl {
             switch (ast.meta) {
                 case meta::Array: {
                     if (ast.elements.empty()) {
-                        return {types::logical_type::STRING_LITERAL, alias};
+                        return {types::logical_type::TEXT, alias};
                     }
                     auto inner = ast_to_complex_type(resource, ast.elements[0], "");
                     return types::complex_logical_type::create_list(inner, alias);
@@ -936,18 +992,18 @@ namespace tsl {
                 }
                 case meta::Nullable: {
                     if (ast.elements.empty()) {
-                        return {types::logical_type::STRING_LITERAL, alias};
+                        return {types::logical_type::TEXT, alias};
                     }
                     return ast_to_complex_type(resource, ast.elements[0], alias);
                 }
                 case meta::LowCardinality: {
                     if (ast.elements.empty()) {
-                        return {types::logical_type::STRING_LITERAL, alias};
+                        return {types::logical_type::TEXT, alias};
                     }
                     return ast_to_complex_type(resource, ast.elements[0], alias);
                 }
                 case meta::Enum:
-                    return {types::logical_type::STRING_LITERAL, alias};
+                    return {types::logical_type::TEXT, alias};
                 default:
                     if (decimal_spec(ast)) {
                         return decimal_or_text(ast, alias);

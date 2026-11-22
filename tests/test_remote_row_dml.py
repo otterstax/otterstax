@@ -20,8 +20,10 @@ runs on the engine, which offers it to the connection's backend
   * an UPDATE / DELETE the backend cannot say whole is refused (0A000 /
     ER_NOT_SUPPORTED_YET) before anything is written: OtterStax numbers no
     remote row, so there is no row-by-row path;
-  * RETURNING is PostgreSQL's alone; an INSERT ... SELECT from a local table
-    runs (the engine hands the rows to the backend).
+  * RETURNING is sent to PostgreSQL and MariaDB, whose server answers what it
+    has (MariaDB: INSERT / DELETE ... RETURNING, an UPDATE ... RETURNING its own
+    syntax error); an INSERT ... SELECT from a local table runs (the engine hands
+    the rows to the backend).
 
 Inside an explicit block a PostgreSQL / MariaDB write runs in ONE backend
 transaction: ROLLBACK undoes it on the backend, COMMIT publishes it. A
@@ -236,13 +238,45 @@ class RemoteRowDmlTest:
         self.assert_equal(self.mariadb_rows("rowdml_keyed"), [(3, "b", 5), (4, "a", 7)], "only the picked rows are gone")
         print("  MariaDB UPDATE / DELETE over a local sub-query: exactly the picked rows ✓")
 
-    def test_mysql_returning_is_refused(self):
-        """MariaDB: RETURNING is PostgreSQL's alone — refused before anything is written."""
+    def mariadb_answers_update_returning(self):
+        """Whether this MariaDB server takes UPDATE ... RETURNING (13.0 does, earlier ones refuse it): asked of the
+        server itself, on a statement that changes no row."""
+        try:
+            with self.mariadb.cursor() as cur:
+                cur.execute("UPDATE rowdml_keyed SET qty = qty WHERE id = -1 RETURNING id")
+                cur.fetchall()
+        except pymysql.MySQLError:
+            return False
+        return True
+
+    def test_mysql_returning_is_the_servers(self):
+        """MariaDB answers INSERT / DELETE ... RETURNING; its UPDATE ... RETURNING is whatever MariaDB answers:
+        the rows on a server that has it, the server's own refusal on one that does not."""
         self.reset_mariadb("rowdml_keyed", KEYED_ROWS)
-        self.my_refused(f"UPDATE {MYSQL_KEYED} SET qty = 1 WHERE id = 3 RETURNING id",
-                        "RETURNING", "MariaDB UPDATE ... RETURNING")
-        self.assert_equal(self.mariadb_rows("rowdml_keyed"), KEYED_ROWS, "nothing was written")
-        print("  MariaDB RETURNING refused ✓")
+        with self.my.cursor() as cur:
+            cur.execute(f"INSERT INTO {MYSQL_KEYED} (id, grp, qty) VALUES (5, 'c', 1) RETURNING id, grp")
+            self.assert_equal([tuple(r) for r in cur.fetchall()], [(5, "c")], "INSERT ... RETURNING rows")
+            cur.execute(f"DELETE FROM {MYSQL_KEYED} WHERE id = 5 RETURNING id, qty")
+            self.assert_equal([tuple(r) for r in cur.fetchall()], [(5, 1)], "DELETE ... RETURNING rows")
+        self.assert_equal(self.mariadb_rows("rowdml_keyed"), KEYED_ROWS, "inserted, then deleted")
+        if self.mariadb_answers_update_returning():
+            with self.my.cursor() as cur:
+                cur.execute(f"UPDATE {MYSQL_KEYED} SET qty = 1 WHERE id = 3 RETURNING id, qty")
+                self.assert_equal([tuple(r) for r in cur.fetchall()], [(3, 1)], "UPDATE ... RETURNING rows")
+            expected = [r if r[0] != 3 else (3, r[1], 1) for r in KEYED_ROWS]
+            self.assert_equal(self.mariadb_rows("rowdml_keyed"), expected, "the UPDATE wrote its row")
+            self.reset_mariadb("rowdml_keyed", KEYED_ROWS)
+            print("  MariaDB INSERT / UPDATE / DELETE ... RETURNING answered by the server ✓")
+            return
+        try:
+            with self.my.cursor() as cur:
+                cur.execute(f"UPDATE {MYSQL_KEYED} SET qty = 1 WHERE id = 3 RETURNING id")
+        except pymysql.MySQLError as e:
+            assert "RETURNING" in str(e) or "syntax" in str(e).lower(), f"MariaDB's own refusal: {e}"
+        else:
+            raise AssertionError("MariaDB UPDATE ... RETURNING must be refused by a MariaDB that has none")
+        self.assert_equal(self.mariadb_rows("rowdml_keyed"), KEYED_ROWS, "the refused UPDATE wrote nothing")
+        print("  MariaDB INSERT / DELETE ... RETURNING answered, UPDATE ... RETURNING MariaDB's refusal ✓")
 
     # ── PostgreSQL, over the PostgreSQL wire ────────────────────────────────
     def test_pg_pushed_update_and_delete(self):
@@ -378,7 +412,7 @@ class RemoteRowDmlTest:
             self.test_mysql_pushed_update_counts_matched_rows()
             self.test_mysql_pushed_write_needs_no_primary_key()
             self.test_mysql_write_with_a_local_subquery_changes_the_rows_it_picks()
-            self.test_mysql_returning_is_refused()
+            self.test_mysql_returning_is_the_servers()
             self.test_pg_pushed_update_and_delete()
             self.test_pg_write_with_a_local_subquery_changes_the_rows_it_picks()
             self.test_pg_update_returning_answers_the_written_rows()

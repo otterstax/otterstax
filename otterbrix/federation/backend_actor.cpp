@@ -537,7 +537,7 @@ namespace otterstax::federation {
                           std::string sql,
                           std::vector<std::optional<std::string>> declared,
                           std::vector<complex_logical_type> types,
-                          core::date::timezone_offset_t timezone) {
+                          core::date::time_zone_t timezone) {
         auto agent = co_await acquire(transaction, session);
         if (agent.has_error()) {
             co_return agent.error();
@@ -556,7 +556,7 @@ namespace otterstax::federation {
         co_return std::move(rows.value());
     }
 
-    backend_actor_t::unique_future<core::result_wrapper_t<std::uint64_t>>
+    backend_actor_t::unique_future<core::result_wrapper_t<write_answer_t>>
     backend_actor_t::write(std::optional<uint64_t> transaction,
                            session_id_t session,
                            std::string sql,
@@ -635,8 +635,8 @@ namespace otterstax::federation {
         }
         std::pmr::vector<complex_logical_type> types{resource_};
         for (std::size_t i = 0; i < remote_names_layout::count; ++i) {
-            complex_logical_type type{i < remote_names_layout::remote_name ? logical_type::BIGINT
-                                                                           : logical_type::STRING_LITERAL};
+            complex_logical_type type{i < remote_names_layout::remote_name ? logical_type::OID
+                                                                           : logical_type::TEXT};
             type.set_alias(std::string{remote_names_layout::names[i]});
             types.push_back(std::move(type));
         }
@@ -649,10 +649,9 @@ namespace otterstax::federation {
                 const auto at = written + row;
                 const bool table_row = with_table && at == 0;
                 const auto* column = table_row ? nullptr : &columns[at - (with_table ? 1 : 0)];
-                chunk.set_value(remote_names_layout::table_oid, row, static_cast<int64_t>(table.oid));
-                chunk.set_value(remote_names_layout::attoid,
-                                row,
-                                static_cast<int64_t>(table_row ? 0 : column->attoid));
+                chunk.set_value(remote_names_layout::table_oid, row, table.oid);
+                // The table's own row has no column: attoid 0, as pg_attribute numbers none so.
+                chunk.set_value(remote_names_layout::attoid, row, table_row ? oid_t{} : column->attoid);
                 chunk.set_value(remote_names_layout::remote_name,
                                 row,
                                 std::string_view{table_row ? table.remote : column->remote});
@@ -686,7 +685,7 @@ namespace otterstax::federation {
             return rows;
         }
         rows.delete_column = key_column;
-        complex_logical_type type{logical_type::BIGINT};
+        complex_logical_type type{logical_type::OID};
         type.set_alias(std::string{remote_names_layout::names[key_column]});
         std::pmr::vector<complex_logical_type> types{resource_};
         types.push_back(type);
@@ -694,7 +693,7 @@ namespace otterstax::federation {
             const auto count = std::min<std::size_t>(keys.size() - written, components::vector::DEFAULT_VECTOR_CAPACITY);
             data_chunk_t chunk(resource_, types, count);
             for (std::size_t row = 0; row < count; ++row) {
-                chunk.set_value(0, row, static_cast<int64_t>(keys[written + row]));
+                chunk.set_value(0, row, keys[written + row]);
             }
             chunk.set_cardinality(count);
             rows.delete_keys.push_back(std::move(chunk));
@@ -776,7 +775,7 @@ namespace otterstax::federation {
             auto table = table_locked(table_oid);
             if (!table) {
                 co_return error(core::error_code_t::undefined_object,
-                                "the backend of OtterStax has no table of oid " + std::to_string(table_oid));
+                                "the backend of OtterStax has no table of oid " + std::to_string(static_cast<std::uint32_t>(table_oid)));
             }
             // projected_cols are positions among the columns of the transaction's snapshot.
             table->columns = visible_columns(*table, txn.transaction_id);
@@ -852,7 +851,7 @@ namespace otterstax::federation {
             auto table = table_locked(table_oid);
             if (!table) {
                 co_return error(core::error_code_t::undefined_object,
-                                "the backend of OtterStax has no table of oid " + std::to_string(table_oid));
+                                "the backend of OtterStax has no table of oid " + std::to_string(static_cast<std::uint32_t>(table_oid)));
             }
             if (auto refused = refused_write(ctx, returning); refused.contains_error()) {
                 co_return refused;
@@ -867,7 +866,7 @@ namespace otterstax::federation {
                 if (column == table->columns.end()) {
                     co_return error(core::error_code_t::undefined_column,
                                     "table \"" + table->name.to_string() + "\" has no column of attoid " +
-                                        std::to_string(attoids[i]));
+                                        std::to_string(static_cast<std::uint32_t>(attoids[i])));
                 }
                 columns.push_back(column->remote);
                 indexes.push_back(i);
@@ -922,7 +921,11 @@ namespace otterstax::federation {
             if (written.has_error()) {
                 co_return written.error();
             }
-            receipt.count += written.value();
+            receipt.count += written.value().count;
+            // The statement's first generated id: a later chunk's rows were generated after.
+            if (receipt.generated_id == 0) {
+                receipt.generated_id = written.value().generated_id;
+            }
         }
         receipt.returned = returned_rows(std::move(returned));
         co_return std::move(receipt);
@@ -937,7 +940,7 @@ namespace otterstax::federation {
         OTX_ZONE_N("backend_actor::storage_update");
         auto table = table_locked(table_oid);
         co_return error(core::error_code_t::unimplemented_yet,
-                        "UPDATE of remote table \"" + (table ? table->name.to_string() : std::to_string(table_oid)) +
+                        "UPDATE of remote table \"" + (table ? table->name.to_string() : std::to_string(static_cast<std::uint32_t>(table_oid))) +
                             "\" runs only as one statement of its backend: OtterStax numbers no remote row");
     }
 
@@ -946,7 +949,7 @@ namespace otterstax::federation {
         OTX_ZONE_N("backend_actor::storage_delete_rows");
         auto table = table_locked(table_oid);
         co_return error(core::error_code_t::unimplemented_yet,
-                        "DELETE of remote table \"" + (table ? table->name.to_string() : std::to_string(table_oid)) +
+                        "DELETE of remote table \"" + (table ? table->name.to_string() : std::to_string(static_cast<std::uint32_t>(table_oid))) +
                             "\" runs only as one statement of its backend: OtterStax numbers no remote row");
     }
 
@@ -1079,7 +1082,7 @@ namespace otterstax::federation {
             auto table = table_locked(table_oid);
             if (!table) {
                 co_return error(core::error_code_t::undefined_object,
-                                "the backend of OtterStax has no table of oid " + std::to_string(table_oid));
+                                "the backend of OtterStax has no table of oid " + std::to_string(static_cast<std::uint32_t>(table_oid)));
             }
             const bool registration = ctx.session == registration_session_;
             // The transaction's own until it ended (end_tables).
@@ -1141,7 +1144,7 @@ namespace otterstax::federation {
         auto table = table_locked(table_oid);
         if (!table) {
             co_return error(core::error_code_t::undefined_object,
-                            "the backend of OtterStax has no table of oid " + std::to_string(table_oid));
+                            "the backend of OtterStax has no table of oid " + std::to_string(static_cast<std::uint32_t>(table_oid)));
         }
         auto column = std::find_if(table->columns.begin(), table->columns.end(), [attoid](const auto& c) {
             return c.attoid == attoid;
@@ -1484,7 +1487,7 @@ namespace otterstax::federation {
         if (written.has_error()) {
             co_return written.error();
         }
-        receipt.count = written.value();
+        receipt.count = written.value().count;
         co_return std::move(receipt);
     }
 
@@ -1568,10 +1571,12 @@ namespace otterstax::federation {
                              "\" is ClickHouse, which has no transactions: a write inside a transaction block is not "
                              "supported");
         }
-        if (returning && connection_.kind != backend_type_t::PostgreSQL) {
+        // A MySQL connection is sent its RETURNING: MariaDB answers INSERT / DELETE ... RETURNING, MySQL and an
+        // UPDATE answer the server's own refusal. ClickHouse's writes are mutations, which say no RETURNING.
+        if (returning && connection_.kind == backend_type_t::ClickHouse) {
             return error(core::error_code_t::unimplemented_yet,
                          "RETURNING of a write to connection \"" + connection_.name + "\" (" +
-                             kind_name(connection_.kind) + ") is not supported: only PostgreSQL answers its rows");
+                             kind_name(connection_.kind) + ") is not supported: a ClickHouse write answers no rows");
         }
         return core::error_t::no_error();
     }

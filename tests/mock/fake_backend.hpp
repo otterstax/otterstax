@@ -191,6 +191,21 @@ namespace fakebackend {
             std::lock_guard guard(mutex_);
             sql_mode_ = std::move(mode);
         }
+        // The AUTO_INCREMENT id the next MySQL INSERT generates first (its OK packet's last_insert_id), each
+        // INSERT taking one per row; 0 (the default): an INSERT generates none.
+        void set_next_insert_id(std::uint64_t id) {
+            std::lock_guard guard(mutex_);
+            next_insert_id_ = id;
+        }
+        // The id an INSERT of `rows` rows generated first, the next one moved past them.
+        std::uint64_t take_insert_id(std::uint64_t rows) {
+            std::lock_guard guard(mutex_);
+            const auto first = next_insert_id_;
+            if (first != 0) {
+                next_insert_id_ += rows;
+            }
+            return first;
+        }
         // The connects tried since the start.
         int connects() const { return connects_.load(); }
         core::error_t try_connect() {
@@ -393,6 +408,10 @@ namespace fakebackend {
         std::optional<boost::mysql::results> mysql_metadata(std::string_view query) {
             std::lock_guard guard(mutex_);
             using boost::mysql::column_type;
+            // The agent's UTC time_zone of every session it opens (check_session): answered, never logged.
+            if (query.starts_with("SET SESSION time_zone")) {
+                return mysql::mock_ok_results(0, 0);
+            }
             if (query.find("sql_mode") != std::string_view::npos) {
                 ++session_checks_;
                 return mysql::mock_results({{"@@SESSION.sql_mode", column_type::varchar}}, {{sql_mode_}});
@@ -527,6 +546,7 @@ namespace fakebackend {
         std::vector<refusal_t> fail_statements_;
         bool down_{false};
         std::string sql_mode_;
+        std::uint64_t next_insert_id_{0};
         std::chrono::milliseconds connect_delay_{0};
         std::atomic<int> connects_{0};
         bool block_reads_{false};
@@ -600,13 +620,21 @@ namespace fakebackend {
             co_return rows;
         }
         boost::asio::awaitable<core::result_wrapper_t<int64_t>>
-        runQuery(std::string_view query, otterstax::function_ref_t<int64_t(Arg)>) override {
+        runQuery(std::string_view query, otterstax::function_ref_t<int64_t(Arg)> handler) override {
             if (aborted_) {
                 co_return refused_aborted(query);
             }
             auto written = server_.write(number_, open_, query);
             if (written.has_error()) {
                 failed(written.error().type);
+            }
+            // A MySQL INSERT answers its OK packet, which the agent's handler reads (affected rows, last_insert_id).
+            if constexpr (mysql_kind) {
+                if (!written.has_error() && query.starts_with("INSERT")) {
+                    const auto rows = static_cast<std::uint64_t>(written.value());
+                    const auto ok = mysql::mock_ok_results(rows, server_.take_insert_id(rows));
+                    co_return handler(ok);
+                }
             }
             co_return written;
         }
@@ -617,6 +645,13 @@ namespace fakebackend {
                     co_return otterstax::as_query_result<otterstax::asio_error_t>(handler(*metadata));
                 }
             } else if constexpr (postgresql) {
+                // The agent's DateStyle / IntervalStyle / TimeZone of every session (check_session): answered,
+                // never logged.
+                if (query.starts_with("SET DateStyle")) {
+                    std::unique_ptr<PGresult, decltype(&PQclear)> ok(PQmakeEmptyPGresult(nullptr, PGRES_COMMAND_OK),
+                                                                     &PQclear);
+                    co_return otterstax::as_query_result<otterstax::asio_error_t>(handler(ok.get()));
+                }
                 if (query.find("pg_enum") != std::string_view::npos) {
                     std::unique_ptr<PGresult, decltype(&PQclear)> empty(PQmakeEmptyPGresult(nullptr, PGRES_TUPLES_OK),
                                                                         &PQclear);

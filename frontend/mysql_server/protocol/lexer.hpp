@@ -98,6 +98,9 @@ namespace frontend::mysql {
     //     and refuses a COM_QUERY text (ER_PARSE_ERROR, as MySQL answers it);
     //   - `--` that is no comment (MySQL wants a blank after it) is written
     //     `- -`, which the engine would otherwise read as a comment.
+    //   - MySQL's `LIMIT offset, count` (each a number or a `?`) is written
+    //     `OFFSET offset LIMIT count`, the engine's grammar's form, its values
+    //     in the order they were written (a `?` of each binds as MySQL binds it).
     // Refused: an unterminated literal, identifier or comment (ER_PARSE_ERROR),
     // a name beginning with `$` (ER_PARSE_ERROR: the engine reads `$1` as a
     // parameter and `$tag$` as a dollar quote), and a NUL character

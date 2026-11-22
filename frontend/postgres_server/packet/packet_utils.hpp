@@ -9,6 +9,7 @@
 #include "../resultset/field_description.hpp"
 #include "packet_writer.hpp"
 
+#include <core/date/time_zone.hpp>
 #include <components/sql/parser/nodes/nodes.h>
 #include <components/types/types.hpp>
 #include <components/vector/vector.hpp>
@@ -64,11 +65,15 @@ namespace frontend::postgres {
     std::optional<frontend::result_encoding> get_format_code(const std::vector<frontend::result_encoding>& format,
                                                              size_t i);
 
+    // A text Bind parameter of `type`. A date / time / timetz / timestamp / timestamptz / interval is read as
+    // PostgreSQL reads it (core::date's ISO parse), a timestamptz or timetz written without an offset in `time_zone`
+    // (the session's TimeZone; null UTC).
     core::result_wrapper_t<components::vector::vector_t>
     parse_text_parameter(std::pmr::memory_resource* resource,
                          field_type type,
                          const components::types::complex_logical_type* engine_type,
-                         std::string text);
+                         std::string text,
+                         const core::date::time_zone_t* time_zone = nullptr);
 
     inline core::result_wrapper_t<components::vector::vector_t>
     parse_text_parameter(std::pmr::memory_resource* resource, field_type type, std::string text) {

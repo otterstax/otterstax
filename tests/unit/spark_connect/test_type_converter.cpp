@@ -40,7 +40,7 @@ TEST_CASE("type_converter: double (float64) scalar") {
 }
 
 TEST_CASE("type_converter: string scalar") {
-    ct::complex_logical_type type{ct::logical_type::STRING_LITERAL};
+    ct::complex_logical_type type{ct::logical_type::TEXT};
     auto dt = frontend::spark::to_spark_data_type(type);
     REQUIRE(dt.kind_case() == sc::DataType::kString);
 }
@@ -69,7 +69,7 @@ TEST_CASE("type_converter: struct with multiple fields") {
     auto id_field = ct::complex_logical_type{ct::logical_type::INTEGER};
     id_field.set_alias("id");
     fields.push_back(id_field);
-    auto name_field = ct::complex_logical_type{ct::logical_type::STRING_LITERAL};
+    auto name_field = ct::complex_logical_type{ct::logical_type::TEXT};
     name_field.set_alias("name");
     fields.push_back(name_field);
 

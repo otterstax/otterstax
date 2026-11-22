@@ -9,6 +9,7 @@
 // block status ReadyForQuery carries, and the DEALLOCATE the frontend reads
 // off the raw tree.
 
+#include "utility/server_version.hpp"
 #include "frontend/postgres_server/connection/bare_select_parameter.hpp"
 #include "frontend/postgres_server/connection/deallocate_statement.hpp"
 #include "frontend/postgres_server/connection/pipeline_state.hpp"
@@ -17,6 +18,7 @@
 #include "frontend/postgres_server/packet/packet_writer.hpp"
 #include "frontend/postgres_server/packet/packet_utils.hpp"
 #include "frontend/postgres_server/resultset/postgres_resultset.hpp"
+#include "temporal_chunk.hpp"
 
 #include <catch2/catch_all.hpp>
 
@@ -41,7 +43,7 @@ namespace {
     vector::data_chunk_t make_row(std::pmr::memory_resource* resource) {
         std::pmr::vector<types::complex_logical_type> fields(resource);
         fields.emplace_back(types::logical_type::INTEGER, "id");
-        fields.emplace_back(types::logical_type::STRING_LITERAL, "name");
+        fields.emplace_back(types::logical_type::TEXT, "name");
         vector::data_chunk_t chunk(resource, fields);
         chunk.set_value(0, 0, int32_t{7});
         chunk.set_value(1, 0, std::string_view{"seven"});
@@ -211,11 +213,11 @@ TEST_CASE("pg RowDescription: a Describe with explicit formats encodes them") {
 TEST_CASE("pg same_wire_shape: a shape described before Bind against the executed chunk") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
-    auto executed = chunk_of(resource, {types::logical_type::INTEGER, types::logical_type::STRING_LITERAL});
+    auto executed = chunk_of(resource, {types::logical_type::INTEGER, types::logical_type::TEXT});
 
     SECTION("the columns it was described as") {
         REQUIRE(same_wire_shape(
-            described_columns(resource, {types::logical_type::INTEGER, types::logical_type::STRING_LITERAL}),
+            described_columns(resource, {types::logical_type::INTEGER, types::logical_type::TEXT}),
             executed));
     }
 
@@ -223,7 +225,7 @@ TEST_CASE("pg same_wire_shape: a shape described before Bind against the execute
         REQUIRE_FALSE(same_wire_shape(described_columns(resource, {types::logical_type::INTEGER}), executed));
         REQUIRE_FALSE(same_wire_shape(described_columns(resource,
                                                         {types::logical_type::INTEGER,
-                                                         types::logical_type::STRING_LITERAL,
+                                                         types::logical_type::TEXT,
                                                          types::logical_type::DOUBLE}),
                                       executed));
         REQUIRE_FALSE(same_wire_shape(described_columns(resource, {}), executed));
@@ -284,6 +286,23 @@ TEST_CASE("pg parse_text_parameter: well-formed literals") {
     REQUIRE(s.value().get_value<std::string_view>(0) == "12abc");
 }
 
+// pg8000 binds Python True as the text "true"; PostgreSQL's boolin reads every spelling below.
+TEST_CASE("pg parse_text_parameter: a bool reads as PostgreSQL's boolin") {
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
+    for (const char* text : {"t", "true", "TRUE", "True", "tr", "y", "yes", "on", "ON", "1", "  true ", "\ttrue\n"}) {
+        INFO(text);
+        auto parsed = parse_text_parameter(&arena, field_type::BOOL, text);
+        REQUIRE_FALSE(parsed.has_error());
+        CHECK(parsed.value().get_value<bool>(0));
+    }
+    for (const char* text : {"f", "false", "FALSE", "fal", "n", "no", "of", "off", "OFF", "0", " false "}) {
+        INFO(text);
+        auto parsed = parse_text_parameter(&arena, field_type::BOOL, text);
+        REQUIRE_FALSE(parsed.has_error());
+        CHECK_FALSE(parsed.value().get_value<bool>(0));
+    }
+}
+
 TEST_CASE("pg parse_text_parameter: a literal the type cannot hold is invalid_text_representation") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
@@ -298,7 +317,13 @@ TEST_CASE("pg parse_text_parameter: a literal the type cannot hold is invalid_te
         std::pair{field_type::FLOAT4, "abc"},
         std::pair{field_type::FLOAT8, "1.5x"},
         std::pair{field_type::FLOAT8, ""},
-        std::pair{field_type::BOOL, "yes"},
+        // What PostgreSQL's boolin refuses too.
+        std::pair{field_type::BOOL, ""},
+        std::pair{field_type::BOOL, "o"},     // on or off
+        std::pair{field_type::BOOL, "truex"}, // not a prefix
+        std::pair{field_type::BOOL, "2"},
+        std::pair{field_type::BOOL, "10"},
+        std::pair{field_type::BOOL, "t f"},
     };
     for (const auto& [type, text] : failing) {
         INFO("type oid " << static_cast<oid_t>(type) << " text '" << text << "'");
@@ -383,7 +408,7 @@ TEST_CASE("pg parse_binary_numeric_parameter: a value the format or the type can
     REQUIRE_FALSE(small_spec.has_error());
     const auto& small = small_spec.value();
     const auto integer = types::complex_logical_type{types::logical_type::INTEGER};
-    const auto text = types::complex_logical_type{types::logical_type::STRING_LITERAL};
+    const auto text = types::complex_logical_type{types::logical_type::TEXT};
 
     // Truncated, a length the digit count contradicts, a group past 9999, a
     // sign that is none: 22P02's literal the format cannot hold. NaN and the
@@ -623,13 +648,34 @@ TEST_CASE("pg frontend: SET RESET and SHOW of application_name by the raw tree")
     CHECK(fixed->parameter == find_protocol_parameter("IntervalStyle"));
     CHECK_FALSE(fixed->client.has_value());
 
-    CHECK(show_client_parameter(resource, "SHOW application_name") == client_parameter_t::application_name);
-    CHECK(show_client_parameter(resource, "  show APPLICATION_NAME;") == client_parameter_t::application_name);
-    CHECK(show_client_parameter(resource, "SHOW extra_float_digits") == client_parameter_t::extra_float_digits);
-    CHECK_FALSE(show_client_parameter(resource, "SHOW timezone").has_value());
-    CHECK_FALSE(show_client_parameter(resource, "SELECT 1").has_value());
-    CHECK_FALSE(show_client_parameter(resource, "SHOW application_name; SHOW application_name").has_value());
-    CHECK_FALSE(show_client_parameter(resource, "SET application_name = 'x'").has_value());
+    const auto client_of = [&](const char* sql) {
+        const auto shown = show_parameter(resource, sql);
+        return shown ? shown->client : std::nullopt;
+    };
+    CHECK(client_of("SHOW application_name") == client_parameter_t::application_name);
+    CHECK(client_of("  show APPLICATION_NAME;") == client_parameter_t::application_name);
+    CHECK(client_of("SHOW extra_float_digits") == client_parameter_t::extra_float_digits);
+    CHECK_FALSE(show_parameter(resource, "SHOW timezone").has_value()); // the engine's
+    CHECK_FALSE(show_parameter(resource, "SELECT 1").has_value());
+    CHECK_FALSE(show_parameter(resource, "SHOW application_name; SHOW application_name").has_value());
+    CHECK_FALSE(show_parameter(resource, "SET application_name = 'x'").has_value());
+    // The fixed values, under their canonical names: the protocol parameters and
+    // the server's facts (SQLAlchemy's connect: standard_conforming_strings,
+    // SHOW TRANSACTION ISOLATION LEVEL, max_identifier_length).
+    const auto fixed_of = [&](const char* sql) {
+        const auto shown = show_parameter(resource, sql);
+        REQUIRE(shown.has_value());
+        CHECK_FALSE(shown->client.has_value());
+        return std::pair{std::string{shown->name}, std::string{shown->value}};
+    };
+    CHECK(fixed_of("show standard_conforming_strings") == std::pair{std::string{"standard_conforming_strings"}, std::string{"on"}});
+    CHECK(fixed_of("SHOW datestyle") == std::pair{std::string{"DateStyle"}, std::string{"ISO, MDY"}});
+    CHECK(fixed_of("SHOW IntervalStyle").second == "postgres");
+    CHECK(fixed_of("SHOW server_version").second == std::string{otterstax::postgres_server_version});
+    CHECK(fixed_of("show transaction isolation level") ==
+          std::pair{std::string{"transaction_isolation"}, std::string{"repeatable read"}});
+    CHECK(fixed_of("SHOW max_identifier_length").second == "63");
+    CHECK(fixed_of("SHOW server_encoding").second == "UTF8");
 }
 
 // extra_float_digits is an integer the client sets, read as PostgreSQL's
@@ -734,7 +780,7 @@ TEST_CASE("pg binary DataRow: every scalar at its type's width in network order"
     fields.emplace_back(types::logical_type::BIGINT, "bi");
     fields.emplace_back(types::logical_type::FLOAT, "f");
     fields.emplace_back(types::logical_type::DOUBLE, "d");
-    fields.emplace_back(types::logical_type::STRING_LITERAL, "s");
+    fields.emplace_back(types::logical_type::TEXT, "s");
     fields.emplace_back(types::logical_type::BOOLEAN, "b");
     vector::data_chunk_t chunk(resource, fields);
     chunk.set_value(0, 0, int8_t{-2});
@@ -1074,7 +1120,7 @@ TEST_CASE("pg text: a composite value is written as record_out writes it") {
     auto* resource = &arena;
     std::pmr::vector<types::complex_logical_type> fields(resource);
     fields.emplace_back(types::logical_type::INTEGER, "i");
-    fields.emplace_back(types::logical_type::STRING_LITERAL, "s");
+    fields.emplace_back(types::logical_type::TEXT, "s");
     auto decimal = types::complex_logical_type::create_decimal(resource, 10, 2, "d");
     REQUIRE_FALSE(decimal.has_error());
     fields.push_back(decimal.value());
@@ -1127,7 +1173,7 @@ TEST_CASE("pg text: an array is written as array_out writes it") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto* resource = &arena;
     std::pmr::vector<types::complex_logical_type> columns(resource);
-    columns.push_back(types::complex_logical_type::create_list(types::logical_type::STRING_LITERAL, "s"));
+    columns.push_back(types::complex_logical_type::create_list(types::logical_type::TEXT, "s"));
     auto decimal = types::complex_logical_type::create_decimal(resource, 6, 3, "");
     REQUIRE_FALSE(decimal.has_error());
     columns.push_back(types::complex_logical_type::create_list(decimal.value(), "d"));
@@ -1175,7 +1221,7 @@ TEST_CASE("find_unsupported_column: a nested element without a text rendering is
     auto* resource = &arena;
     std::pmr::vector<types::complex_logical_type> fields(resource);
     fields.emplace_back(types::logical_type::INTEGER, "i");
-    fields.emplace_back(types::logical_type::TIMESTAMP, "t");
+    fields.emplace_back(types::logical_type::UUID, "t");
     std::pmr::vector<types::complex_logical_type> columns(resource);
     columns.push_back(types::complex_logical_type::create_struct("r", fields, "r"));
     columns.push_back(types::complex_logical_type::create_list(types::logical_type::UHUGEINT, "l"));
@@ -1194,4 +1240,170 @@ TEST_CASE("find_unsupported_column: a nested element without a text rendering is
     std::pmr::vector<types::complex_logical_type> good(resource);
     good.push_back(types::complex_logical_type::create_struct("g", good_fields, "g"));
     CHECK_FALSE(find_unsupported_column<frontend_type::POSTGRES>(good, {result_encoding::TEXT}).has_value());
+}
+
+// idle_session_timeout is the connection's idle timeout, an int GUC of unit ms read as PostgreSQL's parse_int
+// reads one (a unit, rounding), in 0 .. INT_MAX ms; SHOW writes it in its largest whole unit.
+TEST_CASE("pg frontend: idle_session_timeout is read as PostgreSQL reads an int GUC of unit ms") {
+    CHECK(find_client_parameter("IDLE_SESSION_TIMEOUT") == client_parameter_t::idle_session_timeout);
+    CHECK(client_parameter_name(client_parameter_t::idle_session_timeout) == "idle_session_timeout");
+    const auto value = [](std::string_view written) {
+        auto parsed = parse_idle_session_timeout(written);
+        INFO(written);
+        REQUIRE(std::holds_alternative<std::int64_t>(parsed));
+        return std::get<std::int64_t>(parsed);
+    };
+    const auto refusal = [](std::string_view written) {
+        auto parsed = parse_idle_session_timeout(written);
+        INFO(written);
+        REQUIRE(std::holds_alternative<std::string>(parsed));
+        return std::get<std::string>(parsed);
+    };
+    CHECK(value("0") == 0);
+    CHECK(value("1500") == 1500);
+    CHECK(value("1500ms") == 1500);
+    CHECK(value("30s") == 30000);
+    CHECK(value(" 5 min ") == 300000);
+    CHECK(value("8h") == 28800000);
+    CHECK(value("1d") == 86400000);
+    CHECK(value("2600us") == 3); // rounded to whole ms (rint: 2500us is 2)
+    CHECK(value("2500us") == 2);
+    CHECK(value("1.5s") == 1500);
+    CHECK(value("0x10") == 16);
+    CHECK(refusal("abc") == "invalid value for parameter \"idle_session_timeout\": \"abc\"");
+    CHECK(refusal("5 weeks") == "invalid value for parameter \"idle_session_timeout\": \"5 weeks\"");
+    CHECK(refusal("5S") == "invalid value for parameter \"idle_session_timeout\": \"5S\""); // units are case-sensitive
+    CHECK(refusal("-1") ==
+          "-1 ms is outside the valid range for parameter \"idle_session_timeout\" (0 ms .. 2147483647 ms)");
+    // Past int: PostgreSQL's "invalid value" (its HINT: Value exceeds integer range).
+    CHECK(refusal("30d") == "invalid value for parameter \"idle_session_timeout\": \"30d\"");
+
+    CHECK(show_milliseconds(0) == "0");
+    CHECK(show_milliseconds(28800000) == "8h");
+    CHECK(show_milliseconds(90000) == "90s");
+    CHECK(show_milliseconds(300000) == "5min");
+    CHECK(show_milliseconds(1500) == "1500ms");
+    CHECK(show_milliseconds(172800000) == "2d");
+}
+
+// PostgreSQL's binary temporal values are the engine's storage: days and microseconds since 2000-01-01
+// (date_send, timestamp_send — a timestamptz the instant itself), microseconds of the day (time_send), timetz's
+// offset west of UTC, an interval's microseconds, days, months — all in network order.
+TEST_CASE("pg binary DataRow: the temporal types are the engine's storage") {
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
+    auto chunk = temporal_test::chunk(&arena);
+    packet_writer w;
+    postgres_resultset result(w, extra_float_digits_t{1});
+    result.set_time_zone(temporal_test::plus_three());
+    result.add_chunk_columns(chunk);
+    result.add_encoding({result_encoding::BINARY});
+    result.add_row(chunk, 0);
+    auto packets = postgres_resultset::build_packets(std::move(result));
+    REQUIRE(packets.size() == 2);
+
+    packet_reader description(packets[0]);
+    check_header(description, 'T', static_cast<int32_t>(packets[0].size()) - 5);
+    REQUIRE(description.read_int16() == 6);
+    std::vector<std::pair<int32_t, int16_t>> types;
+    for (int i = 0; i < 6; ++i) {
+        description.read_string_null();
+        description.read_int32();
+        description.read_int16();
+        const int32_t oid = description.read_int32();
+        const int16_t size = description.read_int16();
+        types.emplace_back(oid, size);
+        description.read_int32();
+        description.read_int16();
+    }
+    CHECK(types == std::vector<std::pair<int32_t, int16_t>>{{1082, 4}, {1083, 8}, {1114, 8}, {1184, 8}, {1266, 12},
+                                                            {1186, 16}});
+
+    packet_reader row(packets[1]);
+    check_header(row, 'D', static_cast<int32_t>(packets[1].size()) - 5);
+    REQUIRE(row.read_int16() == 6);
+    REQUIRE(row.read_int32() == 4);
+    CHECK(row.read_int32() == temporal_test::date_days);
+    REQUIRE(row.read_int32() == 8);
+    CHECK(row.read_int64() == temporal_test::time_micros);
+    REQUIRE(row.read_int32() == 8);
+    CHECK(row.read_int64() == temporal_test::timestamp_micros);
+    REQUIRE(row.read_int32() == 8);
+    CHECK(row.read_int64() == temporal_test::instant_micros); // the instant, whatever the session's zone
+    REQUIRE(row.read_int32() == 12);
+    CHECK(row.read_int64() == 36'000'000'000);
+    CHECK(row.read_int32() == -10800); // +03 is 10800 s west of UTC negated
+    REQUIRE(row.read_int32() == 16);
+    CHECK(row.read_int64() == 14'400'000'000);
+    CHECK(row.read_int32() == 3);
+    CHECK(row.read_int32() == 2);
+    CHECK(row.remaining() == 0);
+    CHECK(row.ok());
+}
+
+// A text Bind parameter of a date / time type is read as PostgreSQL reads it; a timestamptz written without an
+// offset is the session's TimeZone's.
+TEST_CASE("pg parse_text_parameter: the temporal types") {
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
+    const auto zone = temporal_test::plus_three();
+    auto d = parse_text_parameter(&arena, field_type::DATE, nullptr, "2026-01-02", &zone);
+    REQUIRE_FALSE(d.has_error());
+    CHECK(d.value().get_value<core::date::date_t>(0).value.count() == temporal_test::date_days);
+    auto ts = parse_text_parameter(&arena, field_type::TIMESTAMP, nullptr, "2026-01-02 10:00:00.5", &zone);
+    REQUIRE_FALSE(ts.has_error());
+    CHECK(ts.value().get_value<core::date::timestamp_t>(0).value.count() == temporal_test::timestamp_micros);
+    // With an offset, the instant it names; without one, the session's zone (+03:00) reads it.
+    auto with = parse_text_parameter(&arena, field_type::TIMESTAMPTZ, nullptr, "2026-01-02 10:00:00+00", &zone);
+    REQUIRE_FALSE(with.has_error());
+    CHECK(with.value().get_value<core::date::timestamptz_t>(0).value.count() == temporal_test::instant_micros);
+    auto without = parse_text_parameter(&arena, field_type::TIMESTAMPTZ, nullptr, "2026-01-02 13:00:00", &zone);
+    REQUIRE_FALSE(without.has_error());
+    CHECK(without.value().get_value<core::date::timestamptz_t>(0).value.count() == temporal_test::instant_micros);
+    auto t = parse_text_parameter(&arena, field_type::TIME, nullptr, "10:11:12.25", &zone);
+    REQUIRE_FALSE(t.has_error());
+    CHECK(t.value().get_value<core::date::time_t>(0).value.count() == temporal_test::time_micros);
+    auto iv = parse_text_parameter(&arena, field_type::INTERVAL, nullptr, "2 mons 3 days 04:00:00", &zone);
+    REQUIRE_FALSE(iv.has_error());
+    CHECK(iv.value().get_value<core::date::interval_t>(0).month.count() == 2);
+    auto bad = parse_text_parameter(&arena, field_type::DATE, nullptr, "yesterday-ish", &zone);
+    REQUIRE(bad.has_error());
+    CHECK(bad.error().type == core::error_code_t::invalid_text_representation);
+}
+
+// A DECIMAL column in binary is numeric_send (asyncpg asks every result column in binary): the field's length is
+// the digit groups' bytes, so the row stays framed.
+TEST_CASE("pg binary DataRow: a DECIMAL cell is numeric_send") {
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
+    auto* resource = &arena;
+    auto type = types::complex_logical_type::create_decimal(resource, 9, 2);
+    REQUIRE_FALSE(type.has_error());
+    auto decimal = type.value();
+    decimal.set_alias("price");
+    std::pmr::vector<types::complex_logical_type> fields(resource);
+    fields.push_back(decimal);
+    fields.emplace_back(types::logical_type::INTEGER, "after");
+    vector::data_chunk_t chunk(resource, fields, 1);
+    chunk.data[0].set_value(0, int32_t{12345}); // 123.45 at scale 2 (INT32 storage: width 9)
+    chunk.set_value(1, 0, int32_t{7});
+    chunk.set_cardinality(1);
+
+    packet_writer w;
+    postgres_resultset result(w, extra_float_digits_t{1});
+    result.add_chunk_columns(chunk);
+    result.add_encoding({result_encoding::BINARY});
+    result.add_row(chunk, 0);
+    auto packets = postgres_resultset::build_packets(std::move(result));
+    REQUIRE(packets.size() == 2);
+    packet_reader row(packets[1]);
+    check_header(row, 'D', static_cast<int32_t>(packets[1].size()) - 5);
+    REQUIRE(row.read_int16() == 2);
+    REQUIRE(row.read_int32() == 12); // 4 fields + 2 groups
+    CHECK(row.read_int16() == 2);    // ndigits
+    CHECK(row.read_int16() == 0);    // weight
+    CHECK(row.read_int16() == 0);    // positive
+    CHECK(row.read_int16() == 2);    // dscale
+    CHECK(row.read_int16() == 123);
+    CHECK(row.read_int16() == 4500);
+    REQUIRE(row.read_int32() == 4); // the next field framed where it should be
+    CHECK(row.read_int32() == 7);
+    CHECK(row.remaining() == 0);
 }

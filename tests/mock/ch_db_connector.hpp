@@ -52,7 +52,7 @@ namespace ch {
                 if (c == 0) {
                     fields.emplace_back(types::logical_type::INTEGER, "id");
                 } else {
-                    fields.emplace_back(types::logical_type::STRING_LITERAL, "name");
+                    fields.emplace_back(types::logical_type::TEXT, "name");
                 }
             }
             if (config_.return_empty) {

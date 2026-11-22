@@ -3,6 +3,8 @@
 
 #include "protocol_parameters.hpp"
 
+#include "utility/server_version.hpp"
+
 #include "deallocate_statement.hpp"
 
 #include "utility/tracy_profiler.hpp"
@@ -173,7 +175,8 @@ namespace frontend::postgres {
     std::optional<client_parameter_t> find_client_parameter(std::string_view name) noexcept {
         for (auto parameter : {client_parameter_t::application_name,
                                client_parameter_t::client_encoding,
-                               client_parameter_t::extra_float_digits}) {
+                               client_parameter_t::extra_float_digits,
+                               client_parameter_t::idle_session_timeout}) {
             if (keyword_is(name, client_parameter_name(parameter))) {
                 return parameter;
             }
@@ -189,6 +192,8 @@ namespace frontend::postgres {
                 return "client_encoding";
             case client_parameter_t::extra_float_digits:
                 return "extra_float_digits";
+            case client_parameter_t::idle_session_timeout:
+                return "idle_session_timeout";
         }
         return {};
     }
@@ -230,6 +235,81 @@ namespace frontend::postgres {
                    std::to_string(min) + " .. " + std::to_string(max) + ")";
         }
         return digits;
+    }
+
+    std::variant<std::int64_t, std::string> parse_idle_session_timeout(std::string_view written) {
+        OTX_ZONE_N("pg::parse_idle_session_timeout");
+        constexpr std::int64_t max = 2147483647; // INT_MAX ms
+        const std::string text{written};
+        const auto invalid = [&] {
+            return "invalid value for parameter \"idle_session_timeout\": \"" + text + "\"";
+        };
+        const char* begin = text.c_str();
+        char* end = nullptr;
+        errno = 0;
+        double value = static_cast<double>(std::strtol(begin, &end, 0));
+        if (*end == '.' || *end == 'e' || *end == 'E' || errno == ERANGE) {
+            errno = 0;
+            value = std::strtod(begin, &end);
+        }
+        if (end == begin || errno == ERANGE || std::isnan(value)) {
+            return invalid();
+        }
+        while (std::isspace(static_cast<unsigned char>(*end))) {
+            ++end;
+        }
+        // The unit: letters up to the blanks that may end the value (convert_to_base_unit, case-sensitive).
+        const char* unit_begin = end;
+        while (std::isalpha(static_cast<unsigned char>(*end))) {
+            ++end;
+        }
+        const std::string unit(unit_begin, static_cast<const char*>(end));
+        while (std::isspace(static_cast<unsigned char>(*end))) {
+            ++end;
+        }
+        if (*end != '\0') {
+            return invalid();
+        }
+        double multiplier = 1;
+        if (unit.empty() || unit == "ms") {
+            multiplier = 1;
+        } else if (unit == "us") {
+            multiplier = 0.001;
+        } else if (unit == "s") {
+            multiplier = 1000;
+        } else if (unit == "min") {
+            multiplier = 60000;
+        } else if (unit == "h") {
+            multiplier = 3600000;
+        } else if (unit == "d") {
+            multiplier = 86400000;
+        } else {
+            return invalid(); // PostgreSQL's HINT names the valid units: us, ms, s, min, h, d
+        }
+        value = std::rint(value * multiplier);
+        if (value > static_cast<double>(INT_MAX) || value < static_cast<double>(INT_MIN)) {
+            return invalid();
+        }
+        const auto ms = static_cast<std::int64_t>(value);
+        if (ms < 0 || ms > max) {
+            return std::to_string(ms) + " ms is outside the valid range for parameter \"idle_session_timeout\" (0 ms .. " +
+                   std::to_string(max) + " ms)";
+        }
+        return ms;
+    }
+
+    std::string show_milliseconds(std::int64_t ms) {
+        if (ms == 0) {
+            return "0";
+        }
+        constexpr std::pair<std::int64_t, const char*> units[] = {
+            {86400000, "d"}, {3600000, "h"}, {60000, "min"}, {1000, "s"}, {1, "ms"}};
+        for (const auto& [size, name] : units) {
+            if (ms % size == 0) {
+                return std::to_string(ms / size) + name;
+            }
+        }
+        return std::to_string(ms) + "ms";
     }
 
     std::optional<std::string> client_encoding_value(std::string_view written) {
@@ -381,9 +461,20 @@ namespace frontend::postgres {
         return discard != nullptr && discard->target == DISCARD_ALL;
     }
 
-    std::optional<client_parameter_t> show_client_parameter(std::pmr::memory_resource* resource,
-                                                            std::string_view sql) {
-        OTX_ZONE_N("pg::show_client_parameter");
+    std::span<const server_fact_t> server_facts() noexcept {
+        static const server_fact_t facts[] = {
+            {"server_version", otterstax::postgres_server_version, true},
+            {"server_encoding", "UTF8", true},
+            {"integer_datetimes", "on", true},
+            {"transaction_isolation", "repeatable read", false},
+            {"default_transaction_isolation", "repeatable read", false},
+            {"max_identifier_length", "63", false},
+        };
+        return facts;
+    }
+
+    std::optional<shown_parameter_t> show_parameter(std::pmr::memory_resource* resource, std::string_view sql) {
+        OTX_ZONE_N("pg::show_parameter");
         if (!keyword_is(first_keyword(sql), "show")) {
             return std::nullopt;
         }
@@ -392,7 +483,21 @@ namespace frontend::postgres {
         if (show == nullptr) {
             return std::nullopt;
         }
-        return show->name != nullptr ? find_client_parameter(show->name) : std::nullopt;
+        if (show->name == nullptr) {
+            return std::nullopt;
+        }
+        if (const auto client = find_client_parameter(show->name)) {
+            return shown_parameter_t{client_parameter_name(*client), client, {}};
+        }
+        if (const auto* parameter = find_protocol_parameter(show->name)) {
+            return shown_parameter_t{parameter->name, std::nullopt, parameter->value};
+        }
+        for (const auto& fact : server_facts()) {
+            if (keyword_is(show->name, fact.name)) {
+                return shown_parameter_t{fact.name, std::nullopt, fact.value};
+            }
+        }
+        return std::nullopt;
     }
 
     startup_options_t startup_options(std::string_view options) {

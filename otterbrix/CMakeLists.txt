@@ -44,7 +44,8 @@ set(OTTERBRIX_SOURCES
 )
 
 # SQL grammar extensions (s3 / file): each builds its own flex+bison grammar via
-# the vendored otterbrix_add_parser_extension() helper (cmake/, on CMAKE_MODULE_PATH).
+# otterbrix_add_parser_extension(), which find_package(otterbrix) defines (the
+# package's lib/cmake/otterbrix/otterbrix_parser_extension.cmake build module).
 # Defined before otterbrix_local so it can link the produced ALIAS targets. The
 # GreenplumParser registers them (parser/grammar_extention/CLAUDE.md).
 add_subdirectory(parser/grammar_extention/s3)

@@ -77,7 +77,7 @@ namespace {
                         case logical_type::UBIGINT:
                             line += std::to_string(v.get_value<std::uint64_t>(r));
                             break;
-                        case logical_type::STRING_LITERAL:
+                        case logical_type::TEXT:
                             line += std::string{v.get_value<std::string_view>(r)};
                             break;
                         default:
@@ -130,7 +130,7 @@ namespace {
                 schema,
                 "orders",
                 {column("id", logical_type::BIGINT),
-                 column("customer", logical_type::STRING_LITERAL),
+                 column("customer", logical_type::TEXT),
                  column("amount", logical_type::BIGINT)},
                 {{std::int64_t{1}, std::string{"ann"}, std::int64_t{10}},
                  {std::int64_t{2}, std::string{"bob"}, std::int64_t{20}},
@@ -151,7 +151,7 @@ namespace {
             {"shop",
              "public",
              "items",
-             {column("id", logical_type::BIGINT), column("label", logical_type::STRING_LITERAL)},
+             {column("id", logical_type::BIGINT), column("label", logical_type::TEXT)},
              {{std::int64_t{1}, std::string{"x"}}, {std::int64_t{3}, std::string{"z"}}}});
         return true;
     }
@@ -235,7 +235,7 @@ namespace {
 
     components::types::complex_logical_type bigint(const char* name) { return column(name, logical_type::BIGINT); }
     components::types::complex_logical_type text(const char* name) {
-        return column(name, logical_type::STRING_LITERAL);
+        return column(name, logical_type::TEXT);
     }
     fakebackend::value_t i(std::int64_t v) { return v; }
     fakebackend::value_t s(const char* v) { return std::string{v}; }
@@ -598,15 +598,15 @@ namespace {
             {"INSERT into a connection's table",
              "INSERT INTO pg.public.orders (id) VALUES (1);",
              {},
-             {{"pg", {R"(INSERT INTO "public"."orders" ("id", "customer", "amount") VALUES (1, NULL, NULL);)"}}}},
+             {{"pg", {R"(INSERT INTO "public"."orders" ("id") VALUES (1);)"}}}},
             {"INSERT on the second schema",
              "INSERT INTO pgb.sales.orders (id) VALUES (1);",
              {},
-             {{"pgb", {R"(INSERT INTO "sales"."orders" ("id", "customer", "amount") VALUES (1, NULL, NULL);)"}}}},
+             {{"pgb", {R"(INSERT INTO "sales"."orders" ("id") VALUES (1);)"}}}},
             {"INSERT on MySQL",
              "INSERT INTO my.shop.orders (id) VALUES (1);",
              {},
-             {{"my", {"INSERT INTO `shop`.`orders` (`id`, `customer`, `amount`) VALUES (1, NULL, NULL);"}}}},
+             {{"my", {"INSERT INTO `shop`.`orders` (`id`) VALUES (1);"}}}},
             {"UPDATE",
              "UPDATE pg.public.orders SET amount = 1 WHERE id = 1;",
              {},
@@ -628,7 +628,7 @@ namespace {
              {},
              {{"my", {my_ids}},
               {"pg",
-               {R"(INSERT INTO "public"."orders" ("id", "customer", "amount") VALUES (1, NULL, NULL), (2, NULL, NULL), (3, NULL, NULL);)"}}}},
+               {R"(INSERT INTO "public"."orders" ("id") VALUES (1), (2), (3);)"}}}},
             {"a local write target fed by the remote table of the same names",
              "INSERT INTO shop.orders (id) SELECT id FROM my.shop.orders;",
              {},

@@ -120,7 +120,7 @@ namespace flight::engine {
                 for (std::uint64_t row = 0; row < chunk.size(); ++row) {
                     auto& cells = rows.emplace_back();
                     for (const auto& column : chunk.data) {
-                        if (column.is_null(row) || column.type().type() != logical_type::STRING_LITERAL) {
+                        if (column.is_null(row) || column.type().type() != logical_type::TEXT) {
                             cells.emplace_back();
                         } else {
                             cells.emplace_back(column.get_value<std::string_view>(row));

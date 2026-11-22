@@ -273,6 +273,7 @@ namespace frontend::spark {
                 case ct::logical_type::INTEGER:
                     append_integer(out, vector.get_value<int32_t>(row));
                     break;
+                case ct::logical_type::OID:
                 case ct::logical_type::UINTEGER:
                     append_integer(out, vector.get_value<uint32_t>(row));
                     break;
@@ -293,6 +294,7 @@ namespace frontend::spark {
                 case ct::logical_type::DOUBLE:
                     append_java_floating(out, vector.get_value<double>(row));
                     break;
+                case ct::logical_type::TEXT:
                 case ct::logical_type::STRING_LITERAL:
                     out.append(vector.get_value<std::string_view>(row));
                     break;
@@ -493,7 +495,7 @@ namespace frontend::spark {
     session_payload make_show_string_payload(std::string_view text, std::pmr::memory_resource* resource) {
         OTX_ZONE_N("spark::make_show_string_payload");
         std::pmr::vector<ct::complex_logical_type> columns(resource);
-        columns.emplace_back(ct::logical_type::STRING_LITERAL, std::string{show_string_column});
+        columns.emplace_back(ct::logical_type::TEXT, std::string{show_string_column});
         auto schema = ct::complex_logical_type::create_struct(std::string{show_string_column}, columns);
         cv::data_chunk_t chunk(resource, columns, 1);
         chunk.set_value(0, 0, text);

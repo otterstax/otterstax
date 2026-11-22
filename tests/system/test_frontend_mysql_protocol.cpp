@@ -15,6 +15,7 @@
 // transformer before).
 
 #include "frontend/mysql_server/mysql_defs/error.hpp"
+#include "frontend/mysql_server/mysql_defs/capabilities.hpp"
 #include "frontend/mysql_server/mysql_server.hpp"
 #include "frontend/mysql_server/protocol/protocol_statement.hpp"
 #include "frontend/mysql_server/protocol_const.hpp"
@@ -264,6 +265,20 @@ namespace {
         return mysql_read_packet(client);
     }
 
+    // COM_STMT_EXECUTE of a one-parameter statement whose value is `value` as the wire carries it (its own length
+    // byte included): a binary DATE / DATETIME / TIME.
+    std::vector<uint8_t> execute_raw(raw_client& client, const prepared& stmt, uint16_t type, const std::vector<uint8_t>& value) {
+        std::vector<uint8_t> payload{COM_STMT_EXECUTE};
+        payload.insert(payload.end(), stmt.id.begin(), stmt.id.end());
+        payload.insert(payload.end(), {0x00, 0x01, 0x00, 0x00, 0x00});
+        payload.push_back(0x00); // NULL bitmap
+        payload.push_back(0x01); // new params bound
+        payload.insert(payload.end(), {static_cast<uint8_t>(type & 0xFF), static_cast<uint8_t>(type >> 8)});
+        payload.insert(payload.end(), value.begin(), value.end());
+        client.write(mysql_frame(0, payload));
+        return mysql_read_packet(client);
+    }
+
     // A binary resultset of one BIGINT column after its column-count packet:
     // the row values (a row is [0x00][NULL bitmap: 1 byte][int64 LE]).
     std::vector<int64_t> read_bigint_rows(raw_client& client, const std::vector<uint8_t>& first) {
@@ -289,10 +304,15 @@ namespace {
 
     // HandshakeResponse41 naming `collation` as the client's character set and,
     // when `database` is given, that database as the session's place; the
-    // server's answer (OK, or the ERR that refuses the login).
-    std::vector<uint8_t> handshake_with(raw_client& client, uint8_t collation, const char* database = nullptr) {
+    // server's answer (OK, or the ERR that refuses the login). `max_packet`
+    // is the client's advertised packet size, 16MB by default, 0 for the
+    // drivers that advertise no limit.
+    std::vector<uint8_t> handshake_with(raw_client& client,
+                                        uint8_t collation,
+                                        const char* database = nullptr,
+                                        uint32_t max_packet = 16 * 1024 * 1024) {
         mysql_read_handshake(client);
-        auto resp = mysql_handshake_response_head(collation);
+        auto resp = mysql_handshake_response_head(collation, max_packet);
         uint32_t flags = frontend::mysql::CLIENT_PROTOCOL_41 | frontend::mysql::CLIENT_SECURE_CONNECTION;
         if (database) {
             flags |= frontend::mysql::CLIENT_CONNECT_WITH_DB;
@@ -333,6 +353,34 @@ namespace {
     };
 } // namespace
 
+// mysqlclient (MySQLdb) turns autocommit off only on a server announcing CLIENT_TRANSACTIONS; without it every
+// write of a transaction it means to roll back autocommits.
+TEST_CASE("mysql protocol over the wire: the handshake announces CLIENT_TRANSACTIONS") {
+    fixture f("otterstax_mysql_protocol_capabilities");
+    raw_client other(f.server.local_port());
+    const auto handshake = mysql_read_packet(other);
+    REQUIRE(handshake.size() > 1);
+    REQUIRE(handshake[0] == 10);
+    // HandshakeV10: version, server version NUL, connection id (4), auth data part 1 (8), filler (1), the lower
+    // capabilities (2), charset (1), status (2), the upper capabilities (2).
+    std::size_t pos = 1;
+    while (pos < handshake.size() && handshake[pos] != 0) {
+        ++pos;
+    }
+    pos += 1 + 4 + 8 + 1;
+    REQUIRE(pos + 7 <= handshake.size());
+    const uint32_t capabilities = static_cast<uint32_t>(handshake[pos]) | (static_cast<uint32_t>(handshake[pos + 1]) << 8) |
+                                  (static_cast<uint32_t>(handshake[pos + 5]) << 16) |
+                                  (static_cast<uint32_t>(handshake[pos + 6]) << 24);
+    CHECK((capabilities & frontend::mysql::CLIENT_TRANSACTIONS) != 0);
+    CHECK((capabilities & frontend::mysql::CLIENT_PROTOCOL_41) != 0);
+    // What it promises: the OK packets carry the status, autocommit off and a block open.
+    CHECK((query_ok(f.client, "SET autocommit = 0") & SERVER_STATUS_AUTOCOMMIT) == 0);
+    CHECK((query_ok(f.client, "INSERT INTO wp.t (id, name) VALUES (4, 'd')") & SERVER_STATUS_IN_TRANS) != 0);
+    CHECK((query_ok(f.client, "ROLLBACK") & SERVER_STATUS_IN_TRANS) == 0);
+    CHECK(query_rows(f.client, "SELECT count(*) FROM wp.t").rows[0][0] == "3");
+}
+
 TEST_CASE("mysql protocol over the wire: the mysql CLI's connect query is answered") {
     fixture f("otterstax_mysql_protocol_cli");
     auto version = query_rows(f.client, "select @@version_comment limit 1");
@@ -342,7 +390,7 @@ TEST_CASE("mysql protocol over the wire: the mysql CLI's connect query is answer
 
     auto db = query_rows(f.client, "SELECT DATABASE(), USER() limit 1");
     REQUIRE(db.rows.size() == 1);
-    CHECK(db.rows[0][0].value() == "local");             // the HandshakeResponse's database
+    CHECK(db.rows[0][0].value() == "public");            // the HandshakeResponse's database: local's schema
     CHECK(db.rows[0][1].value().rfind("test@", 0) == 0); // the HandshakeResponse's user
 
     // A session that names no database reports none.
@@ -368,8 +416,32 @@ TEST_CASE("mysql protocol over the wire: Connector/J's variable query is answere
     CHECK(vars.rows[0][3] == std::to_string(frontend::mysql::MAX_ALLOWED_PACKET));
     // MySQL's default lexical rules: backslash escapes, "..." a string.
     CHECK(vars.rows[0][4] == "STRICT_TRANS_TABLES");
-    CHECK(vars.rows[0][6] == std::to_string(frontend::CONNECTION_TIMEOUT_SEC));
+    CHECK(vars.rows[0][6] == std::to_string(frontend::IDLE_TIMEOUT_SEC)); // @@wait_timeout: the idle timeout
     CHECK((vars.status & SERVER_STATUS_NO_BACKSLASH_ESCAPES) == 0);
+}
+
+TEST_CASE("mysql protocol over the wire: Django's connection probe is answered by the engine") {
+    fixture f("otterstax_mysql_protocol_django");
+    // django/db/backends/mysql/base.py, mysql_server_data: variables and CONVERT_TZ in one SELECT list.
+    auto probe = query_rows(f.client,
+                            "SELECT VERSION(), @@sql_mode, @@default_storage_engine, @@sql_auto_is_null, "
+                            "@@lower_case_table_names, CONVERT_TZ('2001-01-01 01:00:00', 'UTC', 'UTC') IS NOT NULL");
+    REQUIRE(probe.names.size() == 6);
+    CHECK(probe.names[1] == "@@sql_mode");
+    REQUIRE(probe.rows.size() == 1);
+    CHECK(probe.rows[0][0] == std::string{frontend::mysql::SERVER_VERSION});
+    CHECK(probe.rows[0][1] == "STRICT_TRANS_TABLES");
+    CHECK(probe.rows[0][2] == "InnoDB");
+    CHECK(probe.rows[0][3] == "0");
+    CHECK(probe.rows[0][4] == "1");
+    CHECK(probe.rows[0][5] == "1");
+    // A variable read inside a statement over a table.
+    auto rows = query_rows(f.client, "SELECT count(*) + @@auto_increment_offset FROM wp.t");
+    REQUIRE(rows.rows.size() == 1);
+    CHECK(rows.rows[0][0] == "4");
+    // An unknown one among engine expressions.
+    CHECK(err_code(query(f.client, "SELECT @@no_such_variable, 1 + 1")) ==
+          static_cast<uint16_t>(frontend::mysql::mysql_error::ER_UNKNOWN_SYSTEM_VARIABLE));
 }
 
 TEST_CASE("mysql protocol over the wire: an unknown variable SHOW VARIABLES and SHOW WARNINGS") {
@@ -408,14 +480,25 @@ TEST_CASE("mysql protocol over the wire: the MySQL SET forms reach the engine as
     CHECK(query_rows(other, "SELECT count(*) FROM wp.t").rows[0][0] == "3");
     CHECK((query_ok(f.client, "COMMIT") & SERVER_STATUS_IN_TRANS) == 0);
     CHECK(query_rows(other, "SELECT count(*) FROM wp.t").rows[0][0] == "4");
-    // The SET itself is a statement while autocommit is off: the engine opens a
-    // transaction for it, which stays until COMMIT (MySQL's SET autocommit = 1
-    // would commit it).
+    // MySQL: autocommit turned from 0 to 1 commits the open transaction — the
+    // one the SET itself opened, and the writes before it.
+    CHECK((query_ok(f.client, "INSERT INTO wp.t (id, name) VALUES (60, 'f')") & SERVER_STATUS_IN_TRANS) != 0);
     const auto on = query_ok(f.client, "SET AUTOCOMMIT = 1");
     CHECK((on & SERVER_STATUS_AUTOCOMMIT) != 0);
-    CHECK((on & SERVER_STATUS_IN_TRANS) != 0);
-    CHECK((query_ok(f.client, "COMMIT") & SERVER_STATUS_IN_TRANS) == 0);
+    CHECK((on & SERVER_STATUS_IN_TRANS) == 0);
+    CHECK(query_rows(other, "SELECT count(*) FROM wp.t").rows[0][0] == "5");
     CHECK(query_rows(f.client, "SELECT @@session.autocommit").rows[0][0] == "1");
+    // pymysql's connect (autocommit 0), then Django's / SQLAlchemy's autocommit 1:
+    // an error afterwards fails no block, the next statement runs.
+    query_ok(f.client, "SET autocommit = 0");
+    CHECK((query_ok(f.client, "SET autocommit = 1") & SERVER_STATUS_IN_TRANS) == 0);
+    CHECK(query(f.client, "SELECT * FROM wp.nowhere")[0] == ERR_HEADER);
+    CHECK(query_rows(f.client, "SELECT count(*) FROM wp.t").rows[0][0] == "5");
+    // Inside BEGIN with autocommit already on, SET autocommit = 1 commits nothing.
+    query_ok(f.client, "BEGIN");
+    CHECK((query_ok(f.client, "SET autocommit = 1") & SERVER_STATUS_IN_TRANS) != 0);
+    query_ok(f.client, "ROLLBACK");
+    CHECK((query_ok(f.client, "DELETE FROM wp.t WHERE id = 60") & SERVER_STATUS_IN_TRANS) == 0);
     CHECK((query_ok(f.client, "INSERT INTO wp.t (id, name) VALUES (5, 'e')") & SERVER_STATUS_IN_TRANS) == 0);
     CHECK(query_rows(other, "SELECT count(*) FROM wp.t").rows[0][0] == "5");
     // The other connection's autocommit is its own.
@@ -555,7 +638,7 @@ TEST_CASE("mysql protocol over the wire: USE, COM_INIT_DB and the handshake's da
     mysql_handshake(no_place);
     CHECK_FALSE(query_rows(no_place, "SELECT DATABASE()").rows[0][0].has_value());
     query_ok(f.client, "USE local.shop");
-    CHECK(query_rows(f.client, "SELECT DATABASE()").rows[0][0] == "local.shop");
+    CHECK(query_rows(f.client, "SELECT DATABASE()").rows[0][0] == "shop"); // the place's schema
     // A bare name is the place's: local.shop.
     query_ok(f.client, "CREATE TABLE u (id bigint)");
     query_ok(f.client, "INSERT INTO u (id) VALUES (7)");
@@ -563,12 +646,12 @@ TEST_CASE("mysql protocol over the wire: USE, COM_INIT_DB and the handshake's da
     // A database the engine does not have is ER_BAD_DB_ERROR; the place stays.
     CHECK(err_code(query(f.client, "USE nosuch")) ==
           static_cast<uint16_t>(frontend::mysql::mysql_error::ER_BAD_DB_ERROR));
-    CHECK(query_rows(f.client, "SELECT DATABASE()").rows[0][0] == "local.shop");
+    CHECK(query_rows(f.client, "SELECT DATABASE()").rows[0][0] == "shop"); // the place's schema
 
     // COM_INIT_DB is the same statement.
     f.client.write(mysql_command(COM_INIT_DB, "local"));
     REQUIRE(mysql_read_packet(f.client)[0] == OK_HEADER);
-    CHECK(query_rows(f.client, "SELECT DATABASE()").rows[0][0] == "local");
+    CHECK(query_rows(f.client, "SELECT DATABASE()").rows[0][0] == "public");
     CHECK(query_rows(f.client, "SELECT count(*) FROM wp.t").rows[0][0] == "3");
     f.client.write(mysql_command(COM_INIT_DB, "nosuch"));
     CHECK(err_code(mysql_read_packet(f.client)) ==
@@ -597,7 +680,7 @@ TEST_CASE("mysql protocol over the wire: USE, COM_INIT_DB and the handshake's da
         }
         return current;
     };
-    CHECK(connect_to("local") == std::optional<std::string>{"local"});
+    CHECK(connect_to("local") == std::optional<std::string>{"public"});
     CHECK_FALSE(connect_to("nosuch").has_value());
 }
 
@@ -626,7 +709,7 @@ TEST_CASE("mysql protocol over the wire: only a missing database is ER_BAD_DB_ER
 
     // Outside the block the same database is used.
     query_ok(f.client, "USE local.shop");
-    CHECK(query_rows(f.client, "SELECT DATABASE()").rows[0][0] == "local.shop");
+    CHECK(query_rows(f.client, "SELECT DATABASE()").rows[0][0] == "shop"); // the place's schema
 }
 
 TEST_CASE("mysql protocol over the wire: a prepared ? reaches the session as $n") {
@@ -651,6 +734,21 @@ TEST_CASE("mysql protocol over the wire: a prepared ? reaches the session as $n"
         const auto stmt = prepare_ok(f.client, "SELECT id FROM wp.t WHERE id > ? ORDER BY id LIMIT ?");
         CHECK(stmt.parameters == 2);
         CHECK(read_bigint_rows(f.client, execute(f.client, stmt, {1, 1})) == std::vector<int64_t>{2});
+    }
+
+    // MySQL's LIMIT offset, count (SQLAlchemy's .limit().offset()): the first `?` is the offset.
+    SECTION("LIMIT ?, ?") {
+        const auto stmt = prepare_ok(f.client, "SELECT id FROM wp.t ORDER BY id LIMIT ?, ?");
+        CHECK(stmt.parameters == 2);
+        CHECK(read_bigint_rows(f.client, execute(f.client, stmt, {1, 2})) == std::vector<int64_t>{2, 3});
+        CHECK(read_bigint_rows(f.client, execute(f.client, stmt, {2, 5})) == std::vector<int64_t>{3});
+    }
+
+    SECTION("LIMIT 1, 2 by COM_QUERY") {
+        const auto rows = query_rows(f.client, "SELECT id FROM wp.t ORDER BY id LIMIT 1, 2");
+        REQUIRE(rows.rows.size() == 2);
+        CHECK(rows.rows[0][0] == "2");
+        CHECK(rows.rows[1][0] == "3");
     }
 
     // The connection keeps serving.
@@ -1074,4 +1172,206 @@ TEST_CASE("mysql protocol over the wire: a BOOLEAN cell is 1 or 0") {
     REQUIRE(rows.rows.size() == 2);
     CHECK(rows.rows[0][0] == "1");
     CHECK(rows.rows[1][0] == "0");
+}
+
+TEST_CASE("mysql protocol over the wire: a client advertising no packet size is served") {
+    fixture f("otterstax_mysql_protocol_zero_max_packet");
+    raw_client zero_max(f.server.local_port());
+    auto ok = handshake_with(zero_max, 33, "local", 0);
+    REQUIRE(!ok.empty());
+    REQUIRE(ok[0] == OK_HEADER);
+    auto one = query_rows(zero_max, "SELECT 1 AS one");
+    REQUIRE(one.rows.size() == 1);
+    CHECK(one.rows[0][0] == "1");
+
+    // The read bound admits a whole wire packet, whatever the client advertised. Payload of exactly MAX_PACKET_SIZE
+    // is read whole — and its length reading as "more follows", it ends at the compliant empty terminator packet
+    const std::string at_wire_max = "SELECT 1 /*" + std::string(frontend::mysql::MAX_PACKET_SIZE - 14, ' ') + "*/";
+    REQUIRE(1 + at_wire_max.size() == frontend::mysql::MAX_PACKET_SIZE);
+    std::vector<uint8_t> biggest{COM_QUERY};
+    biggest.insert(biggest.end(), at_wire_max.begin(), at_wire_max.end());
+    REQUIRE(biggest.size() == frontend::mysql::MAX_PACKET_SIZE);
+    zero_max.write(mysql_frame(0, biggest));
+    zero_max.write(mysql_frame(1, std::vector<uint8_t>{}));
+    const auto head = zero_max.read_exact(4);
+    CHECK(head[3] == 2);
+    const uint32_t plen = head[0] | (head[1] << 8) | (head[2] << 16);
+    auto served = read_text_resultset(zero_max, zero_max.read_exact(plen));
+    REQUIRE(served.rows.size() == 1);
+    CHECK(served.rows[0][0] == "1");
+
+    const std::string under_wire_max = "SELECT 1 /*" + std::string(frontend::mysql::MAX_PACKET_SIZE - 15, ' ') + "*/";
+    REQUIRE(1 + under_wire_max.size() == frontend::mysql::MAX_PACKET_SIZE - 1);
+    auto under = query_rows(zero_max, under_wire_max);
+    REQUIRE(under.rows.size() == 1);
+    CHECK(under.rows[0][0] == "1");
+
+    one = query_rows(zero_max, "SELECT 1 AS one");
+    REQUIRE(one.rows.size() == 1);
+    CHECK(one.rows[0][0] == "1");
+}
+
+TEST_CASE("mysql protocol over the wire: a command split over wire packets is reassembled") {
+    fixture f("otterstax_mysql_protocol_reassembly");
+    // The padding is a comment, which the lexer writes as one blank: the frame is what is tested, and 16 MB of
+    // text through the engine's parse outlasts SERVER_REACTION under TSAN. The comment's last byte travels in the
+    // second piece, so a lost piece leaves it unterminated (ER_PARSE_ERROR), never the result.
+    const std::string sql = "SELECT 1000 /*" + std::string(frontend::mysql::MAX_PACKET_SIZE - 16, ' ') + "*/";
+    REQUIRE(sql.size() == frontend::mysql::MAX_PACKET_SIZE);
+
+    std::vector<uint8_t> first{COM_QUERY};
+    first.insert(first.end(), sql.begin(), sql.end() - 1);
+    REQUIRE(first.size() == frontend::mysql::MAX_PACKET_SIZE);
+    const std::vector<uint8_t> second{static_cast<uint8_t>(sql.back())};
+
+    f.client.write(mysql_frame(0, first));
+    f.client.write(mysql_frame(1, second));
+    const auto head = f.client.read_exact(4);
+    CHECK(head[3] == 2); // the answer's sequence: the terminator's own, plus one
+    const uint32_t plen = head[0] | (head[1] << 8) | (head[2] << 16);
+    auto rs = read_text_resultset(f.client, f.client.read_exact(plen));
+    REQUIRE(rs.rows.size() == 1);
+    CHECK(rs.rows[0][0] == "1000");
+}
+
+TEST_CASE("mysql protocol over the wire: a payload of exactly one wire packet ends at the empty terminator") {
+    fixture f("otterstax_mysql_protocol_reassembly_empty_terminator");
+    // A comment as padding, as above: the engine reads a short text.
+    const std::string sql = "SELECT 1000 AS one /*" + std::string(frontend::mysql::MAX_PACKET_SIZE - 24, ' ') + "*/";
+    REQUIRE(1 + sql.size() == frontend::mysql::MAX_PACKET_SIZE);
+
+    std::vector<uint8_t> first{COM_QUERY};
+    first.insert(first.end(), sql.begin(), sql.end());
+    REQUIRE(first.size() == frontend::mysql::MAX_PACKET_SIZE);
+
+    f.client.write(mysql_frame(0, first));
+    f.client.write(mysql_frame(1, std::vector<uint8_t>{}));
+    const auto head = f.client.read_exact(4);
+    CHECK(head[3] == 2);
+    const uint32_t plen = head[0] | (head[1] << 8) | (head[2] << 16);
+    auto rs = read_text_resultset(f.client, f.client.read_exact(plen));
+    REQUIRE(rs.rows.size() == 1);
+    CHECK(rs.rows[0][0] == "1000");
+}
+
+TEST_CASE("mysql protocol over the wire: a command over max_allowed_packet tears the connection") {
+    fixture f("otterstax_mysql_protocol_reassembly_overflow");
+    std::vector<uint8_t> first(frontend::mysql::MAX_PACKET_SIZE, 'x');
+    first[0] = COM_QUERY;
+    f.client.write(mysql_frame(0, first));
+    f.client.write(mysql_frame(1, std::vector<uint8_t>(frontend::mysql::MAX_PACKET_SIZE, 'x')));
+    const auto head = f.client.read_exact(4);
+    CHECK(head[3] == 2); // the tear's sequence: the crossing piece's own, plus one
+    const uint32_t plen = head[0] | (head[1] << 8) | (head[2] << 16);
+    const auto refused = f.client.read_exact(plen);
+    CHECK(err_code(refused) == static_cast<uint16_t>(frontend::mysql::mysql_error::ER_PACKET_TOO_LARGE));
+    CHECK(f.client.wait_for_close());
+
+    raw_client fresh(f.server.local_port());
+    mysql_handshake(fresh);
+    auto one = query_rows(fresh, "SELECT 1 AS one");
+    REQUIRE(one.rows.size() == 1);
+    CHECK(one.rows[0][0] == "1");
+}
+
+TEST_CASE("mysql protocol over the wire: a sequence break mid-reassembly tears the connection") {
+    fixture f("otterstax_mysql_protocol_reassembly_sequence_break");
+    std::vector<uint8_t> first(frontend::mysql::MAX_PACKET_SIZE, 'x');
+    first[0] = COM_QUERY;
+    f.client.write(mysql_frame(0, first));
+    f.client.write(mysql_frame(5, {0x53, 0x45, 0x4C, 0x45}));
+    const auto refused = mysql_read_packet(f.client);
+    CHECK(err_code(refused) == static_cast<uint16_t>(frontend::mysql::mysql_error::ER_SEQUENCE_ERROR));
+    CHECK(f.client.wait_for_close());
+}
+
+// mysql-connector-python / Connector/J bind a datetime / date / time in MySQL's binary layouts; the engine takes
+// them as its TIMESTAMP / DATE / TIME. A zero date has no engine value: refused.
+TEST_CASE("mysql protocol over the wire: binary date and time parameters") {
+    fixture f("otterstax_mysql_protocol_temporal_params");
+    query_ok(f.client, "CREATE TABLE wp.ev (id bigint, d date, ts timestamp, t time)");
+    query_ok(f.client, "INSERT INTO wp.ev (id, d, ts, t) VALUES (1, '2026-01-02', '2026-01-02 10:00:00.5', '10:11:12')");
+    constexpr uint16_t MYSQL_TYPE_TIMESTAMP = 7, MYSQL_TYPE_DATE = 10, MYSQL_TYPE_TIME = 11, MYSQL_TYPE_DATETIME = 12;
+    // 2026 = 0x07EA, little-endian.
+    {
+        const auto stmt = prepare_ok(f.client, "SELECT id FROM wp.ev WHERE ts = ?");
+        CHECK(read_bigint_rows(f.client,
+                               execute_raw(f.client,
+                                           stmt,
+                                           MYSQL_TYPE_DATETIME,
+                                           {11, 0xEA, 0x07, 1, 2, 10, 0, 0, 0x20, 0xA1, 0x07, 0x00})) ==
+              std::vector<int64_t>{1}); // .500000 µs = 0x07A120
+        CHECK(read_bigint_rows(f.client,
+                               execute_raw(f.client, stmt, MYSQL_TYPE_TIMESTAMP, {7, 0xEA, 0x07, 1, 2, 10, 0, 0})) ==
+              std::vector<int64_t>{}); // no fraction: another instant
+    }
+    {
+        const auto stmt = prepare_ok(f.client, "SELECT id FROM wp.ev WHERE d = ?");
+        CHECK(read_bigint_rows(f.client, execute_raw(f.client, stmt, MYSQL_TYPE_DATE, {4, 0xEA, 0x07, 1, 2})) ==
+              std::vector<int64_t>{1});
+        // The zero date (length 0) is no date the engine holds.
+        CHECK(err_code(execute_raw(f.client, stmt, MYSQL_TYPE_DATE, {0})) ==
+              static_cast<uint16_t>(frontend::mysql::mysql_error::ER_SYNTAX_ERROR));
+    }
+    {
+        const auto stmt = prepare_ok(f.client, "SELECT id FROM wp.ev WHERE t = ?");
+        CHECK(read_bigint_rows(f.client, execute_raw(f.client, stmt, MYSQL_TYPE_TIME, {8, 0, 0, 0, 0, 0, 10, 11, 12})) ==
+              std::vector<int64_t>{1});
+        // A day and more is MySQL's, not a time of day.
+        CHECK(err_code(execute_raw(f.client, stmt, MYSQL_TYPE_TIME, {8, 0, 1, 0, 0, 0, 1, 0, 0})) ==
+              static_cast<uint16_t>(frontend::mysql::mysql_error::ER_SYNTAX_ERROR));
+    }
+}
+
+// SHOW CREATE TABLE from the engine's catalog (SQLAlchemy's MySQL reflection); DATABASE() the place's schema, so
+// Peewee's information_schema.columns WHERE table_schema = DATABASE() finds the table's columns.
+TEST_CASE("mysql protocol over the wire: SHOW CREATE TABLE and DATABASE() for introspection") {
+    fixture f("otterstax_mysql_protocol_show_create");
+    query_ok(f.client, "CREATE TABLE wp.k (a bigint, b bigint, name text NOT NULL, price decimal(9,2), PRIMARY KEY (a, b))");
+    auto shown = query_rows(f.client, "SHOW CREATE TABLE wp.k");
+    REQUIRE(shown.names == std::vector<std::string>{"Table", "Create Table"});
+    REQUIRE(shown.rows.size() == 1);
+    CHECK(shown.rows[0][0] == "k");
+    CHECK(shown.rows[0][1] == "CREATE TABLE `k` (\n"
+                              "  `a` bigint NOT NULL,\n"
+                              "  `b` bigint NOT NULL,\n"
+                              "  `name` text NOT NULL,\n"
+                              "  `price` decimal(9,2),\n"
+                              "  PRIMARY KEY (`a`,`b`)\n"
+                              ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin");
+    CHECK(err_code(query(f.client, "SHOW CREATE TABLE wp.nowhere")) ==
+          static_cast<uint16_t>(frontend::mysql::mysql_error::ER_NO_SUCH_TABLE));
+    query_ok(f.client, "USE local.wp");
+    CHECK(query_rows(f.client, "SHOW CREATE TABLE k").rows.size() == 1); // a short name: the place's
+    auto columns = query_rows(f.client,
+                              "SELECT column_name FROM information_schema.columns WHERE table_name = 'k' AND "
+                              "table_schema = DATABASE() ORDER BY ordinal_position");
+    CHECK(columns.rows.size() == 4);
+
+    // DESCRIBE (SQLAlchemy's has_table: 1146 for a missing table), SHOW TABLES, SHOW DATABASES.
+    auto described = query_rows(f.client, "DESCRIBE `wp`.`k`");
+    REQUIRE(described.names == std::vector<std::string>{"Field", "Type", "Null", "Key", "Default", "Extra"});
+    REQUIRE(described.rows.size() == 4);
+    CHECK(described.rows[0][0] == "a");
+    CHECK(described.rows[0][3] == "PRI");
+    CHECK(described.rows[2][2] == "NO");
+    CHECK_FALSE(described.rows[3][4].has_value());
+    CHECK(err_code(query(f.client, "DESCRIBE wp.nowhere")) ==
+          static_cast<uint16_t>(frontend::mysql::mysql_error::ER_NO_SUCH_TABLE));
+    auto tables = query_rows(f.client, "SHOW FULL TABLES");
+    REQUIRE(tables.names == std::vector<std::string>{"Tables_in_wp", "Table_type"});
+    std::vector<std::string> listed;
+    for (const auto& row : tables.rows) {
+        listed.push_back(row[0].value());
+        CHECK(row[1] == "BASE TABLE");
+    }
+    CHECK(std::find(listed.begin(), listed.end(), "k") != listed.end());
+    CHECK(std::find(listed.begin(), listed.end(), "t") != listed.end());
+    CHECK(query_rows(f.client, "SHOW TABLES LIKE 'K'").rows.size() == 1);
+    auto databases = query_rows(f.client, "SHOW DATABASES LIKE 'wp'");
+    REQUIRE(databases.names == std::vector<std::string>{"Database"});
+    CHECK(databases.rows.size() == 1);
+    raw_client no_place(f.server.local_port());
+    mysql_handshake(no_place);
+    CHECK(err_code(query(no_place, "SHOW TABLES")) == static_cast<uint16_t>(frontend::mysql::mysql_error::ER_NO_DB_ERROR));
 }

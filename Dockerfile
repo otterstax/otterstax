@@ -19,7 +19,7 @@ RUN apt update && \
         python3-venv \
         python3-dev curl gnupg apt-transport-https \
         zlib1g libgflags2.2 libgflags-dev \
-        libssl-dev bison flex && \
+        libssl-dev bison flex tzdata && \
     apt clean && \
     rm -rf /var/lib/apt/lists/*
 

@@ -9,6 +9,7 @@
 // fails an open block as any refusal does. A SET of the session runs in the
 // engine and reports what PostgreSQL reports.
 
+#include <algorithm>
 #include "../system/session_stack.hpp"
 
 #include <catch2/catch_all.hpp>
@@ -78,7 +79,16 @@ TEST_CASE("session settings: an executed SET names what it assigned") {
     CHECK_FALSE(reset.value().setting_changes[0].value.has_value());
     auto all = run_session_sql_payload(s, id++, "RESET ALL;");
     REQUIRE_FALSE(all.has_error());
-    CHECK(all.value().setting_changes.size() == components::catalog::all_settings().size());
+    // RESET ALL resets every setting but the current transaction's own modes, as PostgreSQL leaves them
+    // (GUC_NO_RESET_ALL): transaction_read_only / _isolation / _deferrable.
+    const auto reset_by_all = std::count_if(
+        components::catalog::all_settings().begin(),
+        components::catalog::all_settings().end(),
+        [](const components::catalog::setting_def_t& def) {
+            return def.id != setting_id::transaction_read_only && def.id != setting_id::transaction_isolation &&
+                   def.id != setting_id::transaction_deferrable;
+        });
+    CHECK(all.value().setting_changes.size() == static_cast<std::size_t>(reset_by_all));
 
     run_session_or_fail(s, id++, "BEGIN;");
     auto local = run_session_sql_payload(s, id++, "SET LOCAL timezone = 'UTC';");

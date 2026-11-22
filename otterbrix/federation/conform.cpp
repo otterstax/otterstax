@@ -16,7 +16,7 @@ namespace otterstax::federation {
                                     const components::casts::cast_registry_t& casts,
                                     std::string_view statement,
                                     std::span<const components::types::complex_logical_type> declared,
-                                    core::date::timezone_offset_t timezone,
+                                    core::date::time_zone_t timezone,
                                     components::vector::data_chunk_t& chunk) {
         OTX_ZONE_N("federation::conform_to_result");
         if (chunk.column_count() != declared.size()) {

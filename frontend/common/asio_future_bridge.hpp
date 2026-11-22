@@ -21,6 +21,8 @@
 
 #include <core/result_wrapper.hpp>
 
+#include "cancel_registry.hpp"
+
 #include <actor-zeta.hpp>
 
 #include <boost/asio/awaitable.hpp>
@@ -91,6 +93,9 @@ namespace otterstax {
         // of the chain that runs the statement (the engine's executor among
         // them) — the shape of a broken promise. The statement got no answer.
         broken,
+        // A client cancelled it (cancel_registry.hpp: PostgreSQL's CancelRequest, MySQL's KILL QUERY) while it was
+        // awaited. As at a timeout, the worker goes on (the engine has no cancel) and its answer is never read.
+        cancelled,
     };
 
     // A bridge's answer: the worker's result_wrapper_t<T> — or, when the bridge
@@ -105,8 +110,13 @@ namespace otterstax {
             , status_(status) {}
 
         [[nodiscard]] await_status_t status() const noexcept { return status_; }
-        // The bridge stopped waiting: the statement may still be running.
+        // The deadline passed first.
         [[nodiscard]] bool timed_out() const noexcept { return status_ == await_status_t::timed_out; }
+        // The bridge stopped waiting — the deadline passed, or a client cancelled the statement: the statement may
+        // still be running, nothing it did is known.
+        [[nodiscard]] bool stopped_waiting() const noexcept {
+            return status_ == await_status_t::timed_out || status_ == await_status_t::cancelled;
+        }
 
     private:
         await_status_t status_;
@@ -126,6 +136,8 @@ namespace otterstax {
                 return std::string{"the statement exceeded the execution limit"};
             case await_status_t::broken:
                 return std::string{"the statement failed without an answer"};
+            case await_status_t::cancelled:
+                return std::string{"canceling statement due to user request"};
         }
         return std::nullopt;
     }
@@ -136,6 +148,13 @@ namespace otterstax {
         return awaited_t<T>{core::error_t{core::error_code_t::io_error,
                                           std::pmr::string{"await deadline reached", resource}},
                             await_status_t::timed_out};
+    }
+
+    template<typename T>
+    awaited_t<T> await_cancelled(std::pmr::memory_resource* resource) {
+        return awaited_t<T>{core::error_t{core::error_code_t::io_error,
+                                          std::pmr::string{"canceling statement due to user request", resource}},
+                            await_status_t::cancelled};
     }
 
     // `ec` is the failed future's code. actor-zeta stamps errc::interrupted on
@@ -160,18 +179,34 @@ namespace otterstax {
     // timer wait at once, and asio throws operation_aborted at the coroutine's
     // next co_await: the caller is abandoned, the future dropped unread as at
     // a timeout (the statement runs on in its session). Nothing else throws.
+    // `cancel` (a wire connection's, on its strand): the await is numbered there for the time it runs, and a
+    // client's cancel of it (cancel_registry.hpp) ends it, status cancelled, at the next poll — the poll's steps are
+    // capped (AWAIT_POLL_MAX_STEP), so a cancel is seen within one.
     template<typename T>
     asio::awaitable<awaited_t<T>> async_await_future(actor_zeta::unique_future<core::result_wrapper_t<T>> fut,
                                                      std::pmr::memory_resource* resource,
-                                                     std::chrono::milliseconds timeout = DEFAULT_TIMEOUT) {
+                                                     std::chrono::milliseconds timeout = DEFAULT_TIMEOUT,
+                                                     frontend::statement_cancel_t* cancel = nullptr) {
         assert(resource != nullptr && "async_await_future: memory resource must not be null");
         auto executor = co_await asio::this_coro::executor;
         asio::steady_timer timer(executor);
         const auto start = std::chrono::steady_clock::now();
         const auto deadline = start + timeout;
         await_backoff_t backoff(start);
+        const auto statement = cancel != nullptr ? cancel->begin() : 0;
+        struct end_t {
+            frontend::statement_cancel_t* cancel;
+            ~end_t() {
+                if (cancel != nullptr) {
+                    cancel->end();
+                }
+            }
+        } end{cancel};
 
         while (!fut.is_ready() && !fut.failed()) {
+            if (cancel != nullptr && cancel->cancelled(statement)) {
+                co_return await_cancelled<T>(resource);
+            }
             const auto now = std::chrono::steady_clock::now();
             if (now >= deadline) {
                 co_return await_timed_out<T>(resource);

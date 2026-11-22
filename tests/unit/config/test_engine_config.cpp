@@ -254,3 +254,13 @@ TEST_CASE("service.engine: the log directory is log_dir, else data_dir") {
     CHECK(config::log_directory(engine) == "/var/log/otterstax");
     CHECK(config::log_directory(config::EngineConfig{}) == config::DEFAULT_ENGINE_DATA_DIR);
 }
+
+// service.timezone: the server's time zone, UTC when absent; read as text (the engine checks the zone at startup),
+// an empty one refused.
+TEST_CASE("service.timezone: the server's time zone") {
+    CHECK(load_ok("service:\n  mysql: { port: 8816 }\n").timezone == "UTC");
+    CHECK(load_ok("service:\n  timezone: Europe/Berlin\n").timezone == "Europe/Berlin");
+    CHECK(load_ok("service:\n  timezone: \"+03:00\"\n").timezone == "+03:00");
+    CHECK(mentions(load_error("service:\n  timezone: \"\"\n"), "service.timezone"));
+    CHECK(load_error("service:\n  timezone: [a, b]\n").contains_error());
+}

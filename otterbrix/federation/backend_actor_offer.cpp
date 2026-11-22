@@ -129,7 +129,7 @@ namespace otterstax::federation {
         };
         auto missing = [&](oid_t oid) {
             return core::error_t{core::error_code_t::undefined_object,
-                                 std::pmr::string{("the backend of OtterStax has no table of oid " + std::to_string(oid)).c_str(),
+                                 std::pmr::string{("the backend of OtterStax has no table of oid " + std::to_string(static_cast<std::uint32_t>(oid))).c_str(),
                                                   resource_}};
         };
 
@@ -228,16 +228,17 @@ namespace otterstax::federation {
             const auto& returning = update ? static_cast<const node_update_t&>(root).returning()
                                            : static_cast<const node_delete_t&>(root).returning();
             const auto* table = blocks_.at(block_id)->table(root.table_oid());
-            const std::string name = table ? table->name.to_string() : std::to_string(root.table_oid());
+            const std::string name = table ? table->name.to_string() : std::to_string(static_cast<std::uint32_t>(root.table_oid()));
             const std::string verb = update ? "UPDATE" : "DELETE";
             if (target.kind == backend_type_t::ClickHouse && ctx.txn.command_id != 0) {
                 return refuse(verb + " of \"" + name + "\": connection \"" + target.name +
                               "\" is ClickHouse, which has no transactions: a write inside a transaction block is "
                               "not supported");
             }
-            if (!returning.empty() && target.kind != backend_type_t::PostgreSQL) {
-                return refuse(verb + " ... RETURNING of \"" + name + "\" is not supported: only PostgreSQL answers "
-                                     "the rows it wrote");
+            // MySQL's server answers what it has (MariaDB DELETE ... RETURNING; MySQL and an UPDATE refuse it).
+            if (!returning.empty() && target.kind == backend_type_t::ClickHouse) {
+                return refuse(verb + " ... RETURNING of \"" + name + "\" is not supported: a ClickHouse mutation "
+                                     "answers no rows");
             }
             take_t take;
             take.block = block_id;

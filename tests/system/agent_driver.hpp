@@ -68,7 +68,7 @@ namespace otterstax::test {
         federation::backend_agent_t::rows_t read(std::string sql, std::vector<std::optional<std::string>> declared = {}) {
             return wait(send(&federation::backend_agent_t::read, std::move(sql), std::move(declared), std::uint64_t{1}));
         }
-        core::result_wrapper_t<std::uint64_t> write(std::string sql, federation::write_kind_t kind) {
+        core::result_wrapper_t<federation::write_answer_t> write(std::string sql, federation::write_kind_t kind) {
             return wait(send(&federation::backend_agent_t::write, std::move(sql), kind, false, qualified_name_t{}));
         }
         core::result_wrapper_t<federation::discovered_tables_t> discover(qualified_name_t scope) {

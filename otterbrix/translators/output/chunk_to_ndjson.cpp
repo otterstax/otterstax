@@ -144,7 +144,7 @@ core::result_wrapper_t<bool> write_value(std::pmr::memory_resource* res,
             break;
         case physical_type::FLOAT:  write_floating(out, column.get_value<float>(row)); break;
         case physical_type::DOUBLE: write_floating(out, column.get_value<double>(row)); break;
-        case physical_type::STRING:
+        case physical_type::TEXT:
             out << '"';
             write_escaped(out, column.get_value<std::string_view>(row));
             out << '"';

@@ -83,6 +83,7 @@ namespace otterstax::kafka {
             case types::logical_type::BIGINT:
             case types::logical_type::DOUBLE:
             case types::logical_type::BOOLEAN:
+            case types::logical_type::TEXT:
             case types::logical_type::STRING_LITERAL:
                 return types::complex_logical_type(sql::transform::get_logical_type(canonical));
             default:

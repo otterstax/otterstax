@@ -8,6 +8,7 @@
 #include "federation_fixture.hpp"
 
 #include "catalog/ownership.hpp"
+#include "utility/server_version.hpp"
 
 using namespace fedtest;
 
@@ -23,7 +24,7 @@ namespace {
             {"shop",
              "Sales",
              "Orders",
-             {column("Id", logical_type::BIGINT), column("Note", logical_type::STRING_LITERAL)},
+             {column("Id", logical_type::BIGINT), column("Note", logical_type::TEXT)},
              {{std::int64_t{1}, std::string{"a"}}, {std::int64_t{2}, std::string{"b"}}}});
         stack.backend("my").add_table({"Bill",
                                        "",
@@ -82,7 +83,7 @@ TEST_CASE("registration: a restart drops a table the backend lost and follows a 
     stack.open();
     stack.backend("ch").drop_table("events");
     auto* orders = stack.backend("my").find("Orders");
-    orders->columns = {column("id", logical_type::BIGINT), column("Total", logical_type::STRING_LITERAL)};
+    orders->columns = {column("id", logical_type::BIGINT), column("Total", logical_type::TEXT)};
     orders->rows = {{std::int64_t{1}, std::string{"x"}}};
     stack.reopen();
     CHECK(all_changes(stack) == 0);
@@ -212,7 +213,7 @@ TEST_CASE("registration: a restart keeps a table a local view holds and starts")
     stack.backend("pg").add_table({"shop",
                                    "public",
                                    "t",
-                                   {column("id", logical_type::BIGINT), column("note", logical_type::STRING_LITERAL)},
+                                   {column("id", logical_type::BIGINT), column("note", logical_type::TEXT)},
                                    {{std::int64_t{1}, std::string{"a"}}}});
     stack.backend("pg").add_table({"shop", "public", "u", {column("id", logical_type::BIGINT)}, {{std::int64_t{9}}}});
     stack.backend("pg").add_table({"shop", "public", "w", {column("k", logical_type::BIGINT)}, {{std::int64_t{3}}}});
@@ -304,4 +305,90 @@ TEST_CASE("registration: a connection configured with one table is a target for 
     REQUIRE(pg.has_value());
     CHECK(pg->second.schema.t == "Sales");
     CHECK(pg->second.collection.t == "Orders");
+}
+
+TEST_CASE("registration: version() is registered in local.public at every startup") {
+    fed_stack_t stack(three_backends());
+    seed(stack);
+    stack.open();
+    const std::vector<std::string> version{std::string{otterstax::version_text}};
+    auto check_version = [&] {
+        stack.ok("SET search_path = 'local.public';");
+        CHECK(rows_of(stack.ok("SELECT version();")) == version);
+        CHECK(rows_of(stack.ok("SELECT local.public.version();")) == version);
+    };
+    check_version();
+    // The pg_proc rows outlive the process, the kernel does not: a restart registers it again over them.
+    stack.reopen();
+    check_version();
+    CHECK(all_changes(stack) == 0);
+}
+
+TEST_CASE("registration: a startup without local.public leaves the host's functions out") {
+    fed_stack_t stack(three_backends());
+    seed(stack);
+    stack.open();
+    stack.ok("SET search_path = 'local.public';");
+    stack.ok("DROP SCHEMA public CASCADE;");
+    // The next start registers the connections all the same; version() has no schema to go into.
+    stack.reopen();
+    CHECK(rows_of(stack.ok("SELECT id FROM pg.sales.orders ORDER BY id;")) == std::vector<std::string>{"1", "2"});
+    CHECK(stack.refused("SELECT local.public.version();").contains_error());
+}
+
+// otterbrix scopes a pg_catalog-qualified call to the built-ins only (executor.cpp register_call_schemas /
+// scope_calls complete only an unqualified call with the place's schema), so a host function is out of its reach.
+// SQLAlchemy's PostgreSQL dialects send exactly this in initialize().
+TEST_CASE("registration: pg_catalog.version() reaches the host's version()", "[.engine-defect-pgcatalog-udf]") {
+    fed_stack_t stack(three_backends());
+    seed(stack);
+    stack.open();
+    stack.ok("SET search_path = 'local.public';");
+    CHECK(rows_of(stack.ok("SELECT pg_catalog.version();")) ==
+          std::vector<std::string>{std::string{otterstax::version_text}});
+}
+
+// Straight against the engine (OtterStax's parser and its give_fromless_filters_a_row left out): a query block without
+// FROM that filters aborts the whole process (operator_t::open_impl, abort()) — run alone, it takes the test binary
+// down until otterbrix opens the source-less filter.
+TEST_CASE("registration: a block without FROM that filters runs on the engine", "[.engine-defect-fromless-where]") {
+    fed_stack_t stack(three_backends());
+    seed(stack);
+    stack.open();
+    stack.ok("SET search_path = 'local.public';");
+    CHECK(rows_of(stack.ok("SELECT 1 WHERE true;")) == std::vector<std::string>{"1"});
+}
+
+// config.yaml's service.timezone is the server's: every new session's TimeZone, applied over what the engine kept;
+// a zone the engine does not name fails the registration (the startup).
+TEST_CASE("registration: the server's time zone is config.yaml's") {
+    fed_stack_t stack(three_backends());
+    seed(stack);
+    stack.open();
+    const auto zone_of_a_new_session = [&] {
+        components::session::session_id_t fresh;
+        auto cursor = stack.sql(fresh, "SELECT current_setting('timezone');");
+        INFO((cursor->is_error() ? std::string{cursor->get_error().what} : std::string{}));
+        REQUIRE(cursor->is_success());
+        return rows_of(cursor);
+    };
+    CHECK(zone_of_a_new_session() == std::vector<std::string>{"utc"}); // the engine keeps a name in lower case
+    cat::engine_calls_t calls{[&stack](const components::session::session_id_t& session, const std::string& sql) {
+                                  return stack.dispatcher()->execute_sql(session, sql);
+                              },
+                              [&stack](const components::session::session_id_t& session,
+                                       components::logical_plan::execution_plan_t plan) {
+                                  return stack.dispatcher()->execute_plan(session, std::move(plan));
+                              }};
+    const std::vector<cat::connection_discovery_t> none;
+    REQUIRE_FALSE(
+        cat::register_connections(stack.resource(), calls, stack.registration_session(), none, "Europe/Berlin")
+            .contains_error());
+    CHECK(zone_of_a_new_session() == std::vector<std::string>{"europe/berlin"});
+    // A later start with another zone overrides it.
+    REQUIRE_FALSE(cat::register_connections(stack.resource(), calls, stack.registration_session(), none, "+03:00")
+                      .contains_error());
+    CHECK(zone_of_a_new_session() != std::vector<std::string>{"europe/berlin"});
+    CHECK(cat::register_connections(stack.resource(), calls, stack.registration_session(), none, "Nowhere/Atlantis")
+              .contains_error());
 }

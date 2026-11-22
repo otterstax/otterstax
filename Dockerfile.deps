@@ -103,6 +103,9 @@ RUN _mem_jobs=$(( $(awk '/^MemTotal:/ {print int($2/1024)}' /proc/meminfo) / 153
 # gcc-11's libtsan misses the pthread_cond_clockwait interceptor
 # (google/sanitizers#1259), yielding false "double lock" reports on every
 # condition_variable::wait_for, and one process must link a single libtsan.
+# The librdkafka hook patches the sources at post_source, and the release stage
+# has already downloaded them unpatched: they are dropped from conan's cache
+# first, so this build fetches them again and the hook runs.
 FROM ${RELEASE_IMAGE} AS tsan
 
 RUN apt-get update && \
@@ -115,6 +118,7 @@ RUN _mem_jobs=$(( $(awk '/^MemTotal:/ {print int($2/1024)}' /proc/meminfo) / 153
     echo "conan from-source build jobs: ${_jobs}" && \
     mkdir -p /root/.conan2/extensions/hooks && \
     cp ./conan-hooks/hook_librdkafka_c11threads_off.py /root/.conan2/extensions/hooks/ && \
+    conan cache clean "librdkafka/*" --source && \
     conan install conanfile.py --build missing \
         -c "tools.build:jobs=${_jobs}" \
         -c tools.files.download:retry=10 -c tools.files.download:retry_wait=15 \

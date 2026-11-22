@@ -25,8 +25,10 @@
 #include "frontend/mysql_server/packet/packet_reader.hpp"
 #include "frontend/mysql_server/resultset/mysql_resultset.hpp"
 #include "frontend/postgres_server/packet/packet_reader.hpp"
+#include "frontend/postgres_server/packet/packet_utils.hpp"
 #include "frontend/postgres_server/resultset/postgres_resultset.hpp"
 #include "otterbrix/translators/input/decimal_text.hpp"
+#include "temporal_chunk.hpp"
 
 #include <catch2/catch_all.hpp>
 
@@ -59,7 +61,7 @@ namespace {
     std::pmr::vector<types::complex_logical_type> struct_and_int(std::pmr::memory_resource* resource) {
         std::pmr::vector<types::complex_logical_type> fields(resource);
         fields.emplace_back(LT::INTEGER, "x");
-        fields.emplace_back(LT::STRING_LITERAL, "y");
+        fields.emplace_back(LT::TEXT, "y");
         std::pmr::vector<types::complex_logical_type> columns(resource);
         columns.push_back(types::complex_logical_type::create_struct("point", fields, "pt"));
         columns.emplace_back(LT::INTEGER, "id");
@@ -124,7 +126,7 @@ namespace {
 
 TEST_CASE("wire type mapping: a logical type without a protocol type is nullopt") {
     for (LT unmapped :
-         {LT::UHUGEINT, LT::DATE, LT::TIMESTAMP, LT::BLOB, LT::UUID, LT::UNKNOWN, LT::INVALID}) {
+         {LT::UHUGEINT, LT::BLOB, LT::UUID, LT::UNKNOWN, LT::INVALID}) {
         INFO("logical type " << logical_type_name(unmapped));
         REQUIRE_FALSE(mysql::get_field_type(unmapped).has_value());
         REQUIRE_FALSE(postgres::get_field_type(unmapped).has_value());
@@ -176,7 +178,7 @@ TEST_CASE("logical_type_name names every enumerator used in the refusal message"
 
 TEST_CASE("is_encodable: mapped scalars in both formats, nested types in text only, unmapped in neither") {
     for (LT scalar : {LT::NA, LT::BOOLEAN, LT::TINYINT, LT::INTEGER, LT::UBIGINT, LT::FLOAT, LT::DOUBLE,
-                      LT::STRING_LITERAL}) {
+                      LT::TEXT}) {
         INFO("logical type " << logical_type_name(scalar));
         REQUIRE(is_encodable<frontend_type::MYSQL>(scalar, result_encoding::TEXT));
         REQUIRE(is_encodable<frontend_type::MYSQL>(scalar, result_encoding::BINARY));
@@ -190,7 +192,7 @@ TEST_CASE("is_encodable: mapped scalars in both formats, nested types in text on
         REQUIRE(is_encodable<frontend_type::POSTGRES>(nested, result_encoding::TEXT));
         REQUIRE_FALSE(is_encodable<frontend_type::POSTGRES>(nested, result_encoding::BINARY));
     }
-    for (LT unmapped : {LT::UHUGEINT, LT::UNKNOWN, LT::DATE}) {
+    for (LT unmapped : {LT::UHUGEINT, LT::UNKNOWN, LT::UUID}) {
         INFO("logical type " << logical_type_name(unmapped));
         REQUIRE_FALSE(is_encodable<frontend_type::MYSQL>(unmapped, result_encoding::TEXT));
         REQUIRE_FALSE(is_encodable<frontend_type::MYSQL>(unmapped, result_encoding::BINARY));
@@ -199,7 +201,7 @@ TEST_CASE("is_encodable: mapped scalars in both formats, nested types in text on
     }
 }
 
-TEST_CASE("is_encodable: DECIMAL travels on every format but PostgreSQL binary") {
+TEST_CASE("is_encodable: DECIMAL travels on every format") {
     // MySQL carries a NEWDECIMAL field as a length-encoded string in the binary
     // resultset row exactly as in the text one, so one rendering serves both
     // formats. PostgreSQL binary NUMERIC is a different encoding altogether
@@ -208,10 +210,10 @@ TEST_CASE("is_encodable: DECIMAL travels on every format but PostgreSQL binary")
     REQUIRE(is_encodable<frontend_type::MYSQL>(LT::DECIMAL, result_encoding::TEXT));
     REQUIRE(is_encodable<frontend_type::MYSQL>(LT::DECIMAL, result_encoding::BINARY));
     REQUIRE(is_encodable<frontend_type::POSTGRES>(LT::DECIMAL, result_encoding::TEXT));
-    REQUIRE_FALSE(is_encodable<frontend_type::POSTGRES>(LT::DECIMAL, result_encoding::BINARY));
+    REQUIRE(is_encodable<frontend_type::POSTGRES>(LT::DECIMAL, result_encoding::BINARY)); // numeric_send
 }
 
-TEST_CASE("is_encodable: HUGEINT follows DECIMAL onto every format but PostgreSQL binary") {
+TEST_CASE("is_encodable: HUGEINT follows DECIMAL onto every format") {
     // It goes out under the same wire type, so it takes the same two answers:
     // MySQL carries a NEWDECIMAL field as a length-encoded string in a binary
     // row exactly as in a text one, while PostgreSQL's binary NUMERIC is an
@@ -219,7 +221,7 @@ TEST_CASE("is_encodable: HUGEINT follows DECIMAL onto every format but PostgreSQ
     REQUIRE(is_encodable<frontend_type::MYSQL>(LT::HUGEINT, result_encoding::TEXT));
     REQUIRE(is_encodable<frontend_type::MYSQL>(LT::HUGEINT, result_encoding::BINARY));
     REQUIRE(is_encodable<frontend_type::POSTGRES>(LT::HUGEINT, result_encoding::TEXT));
-    REQUIRE_FALSE(is_encodable<frontend_type::POSTGRES>(LT::HUGEINT, result_encoding::BINARY));
+    REQUIRE(is_encodable<frontend_type::POSTGRES>(LT::HUGEINT, result_encoding::BINARY)); // numeric_send
 }
 
 TEST_CASE("find_unsupported_column: a UHUGEINT column in a prepared schema is named") {
@@ -239,24 +241,13 @@ TEST_CASE("find_unsupported_column: a UHUGEINT column in a prepared schema is na
     REQUIRE(my->encoding == result_encoding::BINARY);
 }
 
-TEST_CASE("find_unsupported_column: a HUGEINT column is refused in PostgreSQL binary only") {
+TEST_CASE("find_unsupported_column: a HUGEINT column is carried in every format") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     auto columns = int_and_hugeint(&arena);
-
-    REQUIRE_FALSE(find_unsupported_column<frontend_type::MYSQL>(columns, {result_encoding::TEXT}).has_value());
-    REQUIRE_FALSE(find_unsupported_column<frontend_type::MYSQL>(columns, {result_encoding::BINARY}).has_value());
-    REQUIRE_FALSE(find_unsupported_column<frontend_type::POSTGRES>(columns, {result_encoding::TEXT}).has_value());
-
-    auto refused = find_unsupported_column<frontend_type::POSTGRES>(columns, {result_encoding::BINARY});
-    REQUIRE(refused.has_value());
-    REQUIRE(refused->name == "big");
-    REQUIRE(refused->type == LT::HUGEINT);
-    REQUIRE(refused->encoding == result_encoding::BINARY);
-
-    // The refusal follows the column's own format code, not the statement's.
-    REQUIRE_FALSE(find_unsupported_column<frontend_type::POSTGRES>(columns,
-                                                                    {result_encoding::BINARY, result_encoding::TEXT})
-                      .has_value());
+    for (auto encoding : {result_encoding::TEXT, result_encoding::BINARY}) {
+        REQUIRE_FALSE(find_unsupported_column<frontend_type::MYSQL>(columns, {encoding}).has_value());
+        REQUIRE_FALSE(find_unsupported_column<frontend_type::POSTGRES>(columns, {encoding}).has_value());
+    }
 }
 
 TEST_CASE("find_unsupported_column: an UNKNOWN user type is named by the column it is on") {
@@ -296,7 +287,7 @@ TEST_CASE("find_unsupported_column: every encodable column answers nullopt") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     std::pmr::vector<types::complex_logical_type> columns(&arena);
     columns.emplace_back(LT::INTEGER, "id");
-    columns.emplace_back(LT::STRING_LITERAL, "name");
+    columns.emplace_back(LT::TEXT, "name");
     columns.emplace_back(LT::DOUBLE, "weight");
     vector::data_chunk_t chunk(&arena, columns);
 
@@ -343,44 +334,52 @@ TEST_CASE("find_unsupported_column: per-column result formats are honoured") {
             .has_value());
 }
 
-TEST_CASE("find_unsupported_column: a DECIMAL column is refused in PostgreSQL binary only") {
+TEST_CASE("find_unsupported_column: a DECIMAL column is carried in every format") {
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
     std::pmr::vector<types::complex_logical_type> columns(&arena);
     columns.emplace_back(LT::INTEGER, "id");
     columns.push_back(decimal_type(&arena, 18, 4, "amount"));
-
-    REQUIRE_FALSE(find_unsupported_column<frontend_type::MYSQL>(columns, {result_encoding::TEXT}).has_value());
-    REQUIRE_FALSE(find_unsupported_column<frontend_type::MYSQL>(columns, {result_encoding::BINARY}).has_value());
-    REQUIRE_FALSE(find_unsupported_column<frontend_type::POSTGRES>(columns, {result_encoding::TEXT}).has_value());
-
-    auto refused = find_unsupported_column<frontend_type::POSTGRES>(columns, {result_encoding::BINARY});
-    REQUIRE(refused.has_value());
-    REQUIRE(refused->name == "amount");
-    REQUIRE(refused->type == LT::DECIMAL);
-    REQUIRE(refused->encoding == result_encoding::BINARY);
-
-    // Per-column formats: the DECIMAL in text next to a binary int passes, and
-    // the refusal follows the column's own format code, not the statement's.
-    REQUIRE_FALSE(find_unsupported_column<frontend_type::POSTGRES>(columns,
-                                                                    {result_encoding::BINARY, result_encoding::TEXT})
-                      .has_value());
-    auto per_column =
-        find_unsupported_column<frontend_type::POSTGRES>(columns, {result_encoding::TEXT, result_encoding::BINARY});
-    REQUIRE(per_column.has_value());
-    REQUIRE(per_column->name == "amount");
+    for (auto encoding : {result_encoding::TEXT, result_encoding::BINARY}) {
+        REQUIRE_FALSE(find_unsupported_column<frontend_type::MYSQL>(columns, {encoding}).has_value());
+        REQUIRE_FALSE(find_unsupported_column<frontend_type::POSTGRES>(columns, {encoding}).has_value());
+    }
+    auto chunk = decimal_chunk(&arena, decimal_type(&arena, 9, 2, "price"), {types::int128_t{125}});
+    REQUIRE_FALSE(find_unsupported_column<frontend_type::POSTGRES>(chunk, {result_encoding::BINARY}).has_value());
 }
 
-TEST_CASE("find_unsupported_column: an executed DECIMAL chunk follows the same rule") {
+// PostgreSQL's numeric_send of what decimal_to_text writes: base-10000 groups behind (ndigits, weight, sign,
+// dscale), zero groups at both ends dropped — and the parameter reader (parse_binary_numeric_parameter, the
+// inverse) reads every one back as the same text.
+TEST_CASE("pg_numeric_send: numeric_send's digit groups") {
+    const auto fields = [](const std::vector<uint8_t>& bytes) {
+        std::vector<int32_t> out;
+        for (std::size_t at = 0; at + 1 < bytes.size(); at += 2) {
+            out.push_back(static_cast<int16_t>(static_cast<uint16_t>(bytes[at] << 8 | bytes[at + 1])));
+        }
+        return out;
+    };
+    using v = std::vector<int32_t>;
+    CHECK(fields(pg_numeric_send("12345.678")) == v{3, 1, 0, 3, 1, 2345, 6780});
+    CHECK(fields(pg_numeric_send("-0.0012")) == v{1, -1, 0x4000, 4, 12});
+    CHECK(fields(pg_numeric_send("10000")) == v{1, 1, 0, 0, 1});
+    CHECK(fields(pg_numeric_send("0.00")) == v{0, 0, 0, 2});
+    CHECK(fields(pg_numeric_send("NaN")) == v{0, 0, static_cast<int16_t>(0xC000), 0});
+    CHECK(fields(pg_numeric_send("Infinity")) == v{0, 0, static_cast<int16_t>(0xD000), 0});
+    CHECK(fields(pg_numeric_send("-Infinity")) == v{0, 0, static_cast<int16_t>(0xF000), 0});
     std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
-    auto chunk = decimal_chunk(&arena, decimal_type(&arena, 9, 2, "price"), {types::int128_t{125}});
-
-    REQUIRE_FALSE(find_unsupported_column<frontend_type::MYSQL>(chunk, {result_encoding::BINARY}).has_value());
-    REQUIRE_FALSE(find_unsupported_column<frontend_type::POSTGRES>(chunk, {}).has_value());
-
-    auto refused = find_unsupported_column<frontend_type::POSTGRES>(chunk, {result_encoding::BINARY});
-    REQUIRE(refused.has_value());
-    REQUIRE(refused->name == "price");
-    REQUIRE(refused->type == LT::DECIMAL);
+    for (const char* text : {"12345.678", "-0.0012", "10000", "1.5", "-99999999999999999999.99"}) {
+        INFO(text);
+        const auto bytes = pg_numeric_send(text);
+        auto read = postgres::parse_binary_numeric_parameter(
+            &arena, nullptr, std::string_view{reinterpret_cast<const char*>(bytes.data()), bytes.size()});
+        REQUIRE_FALSE(read.has_error());
+        // The reader takes no display scale (the described DECIMAL bounds a parameter): it prints whole groups.
+        std::string back{read.value().get_value<std::string_view>(0)};
+        while (back.find('.') != std::string::npos && (back.back() == '0' || back.back() == '.')) {
+            back.pop_back();
+        }
+        CHECK(back == text);
+    }
 }
 
 TEST_CASE("DECIMAL text: the point sits at the scale of the type for every storage width") {
@@ -688,4 +687,55 @@ TEST_CASE("unsupported_column_message names the column, its type and the format"
     REQUIRE(my.find("UHUGEINT") != std::string::npos);
     REQUIRE(my.find("MySQL") != std::string::npos);
     REQUIRE(my.find("binary") != std::string::npos);
+}
+
+// The engine's temporal types go out as each wire's own: PostgreSQL date / time / timetz / timestamp /
+// timestamptz / interval, MySQL DATE / TIME / DATETIME / TIMESTAMP (MySQL has no TIMETZ nor INTERVAL).
+TEST_CASE("wire type mapping: the temporal types") {
+    CHECK(postgres::get_field_type(LT::DATE) == postgres::field_type::DATE);
+    CHECK(postgres::get_field_type(LT::TIME) == postgres::field_type::TIME);
+    CHECK(postgres::get_field_type(LT::TIME_TZ) == postgres::field_type::TIMETZ);
+    CHECK(postgres::get_field_type(LT::TIMESTAMP) == postgres::field_type::TIMESTAMP);
+    CHECK(postgres::get_field_type(LT::TIMESTAMP_TZ) == postgres::field_type::TIMESTAMPTZ);
+    CHECK(postgres::get_field_type(LT::INTERVAL) == postgres::field_type::INTERVAL);
+    CHECK(static_cast<int>(postgres::field_type::DATE) == 1082);
+    CHECK(static_cast<int>(postgres::field_type::TIMETZ) == 1266);
+    CHECK(mysql::get_field_type(LT::DATE) == mysql::field_type::MYSQL_TYPE_DATE);
+    CHECK(mysql::get_field_type(LT::TIME) == mysql::field_type::MYSQL_TYPE_TIME);
+    CHECK(mysql::get_field_type(LT::TIMESTAMP) == mysql::field_type::MYSQL_TYPE_DATETIME);
+    CHECK(mysql::get_field_type(LT::TIMESTAMP_TZ) == mysql::field_type::MYSQL_TYPE_TIMESTAMP);
+    CHECK_FALSE(mysql::get_field_type(LT::TIME_TZ).has_value());
+    CHECK_FALSE(mysql::get_field_type(LT::INTERVAL).has_value());
+    for (LT type : {LT::DATE, LT::TIME, LT::TIME_TZ, LT::TIMESTAMP, LT::TIMESTAMP_TZ, LT::INTERVAL}) {
+        INFO(logical_type_name(type));
+        for (auto encoding : {result_encoding::TEXT, result_encoding::BINARY}) {
+            CHECK(is_encodable<frontend_type::POSTGRES>(type, encoding));
+        }
+    }
+    for (LT type : {LT::DATE, LT::TIME, LT::TIMESTAMP, LT::TIMESTAMP_TZ}) {
+        for (auto encoding : {result_encoding::TEXT, result_encoding::BINARY}) {
+            CHECK(is_encodable<frontend_type::MYSQL>(type, encoding));
+        }
+    }
+}
+
+// PostgreSQL's ISO text (date_out / time_out / timestamp_out, the fraction trimmed; a timestamptz in the session's
+// TimeZone with its offset); MySQL's with six fraction digits, a TIMESTAMP as the session zone's local time.
+TEST_CASE("encode_to_text: the temporal types on each wire") {
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
+    auto chunk = temporal_test::chunk(&arena);
+    const auto zone = temporal_test::plus_three();
+    const text_format_t pg{frontend_type::POSTGRES, 1, &zone};
+    CHECK(encode_to_text(chunk, 0, 0, pg) == "2026-01-02");
+    CHECK(encode_to_text(chunk, 1, 0, pg) == "10:11:12.25");
+    CHECK(encode_to_text(chunk, 2, 0, pg) == "2026-01-02 10:00:00.5");
+    CHECK(encode_to_text(chunk, 3, 0, pg) == "2026-01-02 13:00:00+03");
+    CHECK(encode_to_text(chunk, 3, 0, {frontend_type::POSTGRES, 1}) == "2026-01-02 10:00:00+00"); // UTC
+    CHECK(encode_to_text(chunk, 4, 0, pg) == "10:00:00+03");
+    CHECK(encode_to_text(chunk, 5, 0, pg) == "2 mons 3 days 04:00:00");
+    const text_format_t my{frontend_type::MYSQL, default_extra_float_digits, &zone};
+    CHECK(encode_to_text(chunk, 0, 0, my) == "2026-01-02");
+    CHECK(encode_to_text(chunk, 1, 0, my) == "10:11:12.250000");
+    CHECK(encode_to_text(chunk, 2, 0, my) == "2026-01-02 10:00:00.500000");
+    CHECK(encode_to_text(chunk, 3, 0, my) == "2026-01-02 13:00:00.000000");
 }

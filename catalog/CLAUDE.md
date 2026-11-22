@@ -15,6 +15,9 @@ is the only catalog: a remote table is rows of `pg_database` (`datconnection`), 
 | `discovery.hpp` | The handwritten discovery queries the backend agents run (`otterbrix/federation/backend_agent.hpp`), the schema probe, `make_discovery_error`, `escape_sql_literal` (the quote doubled; the backslash doubled on MySQL / ClickHouse, and on PostgreSQL inside `E'…'` for a value that holds one) |
 | `registration.hpp` | `register_connections` (startup), `registration_target` / `registration_plans` (a table a statement missed), `check_table_scope` (DDL of a one-table connection) |
 | `ownership.hpp` | `check_write_ownership(resource, target, drops_schema)` |
+| `sql_tokens.hpp` | `engine_tokens`: the names and punctuation of the engine's text, literals / comments / dollar quotes / `$n` left out — the one lexer of the passes below |
+| `dotted_names.hpp` | `qualify_host_calls`: a host function's call, bare or `pg_catalog.`, written `local.public.f()` (not after INTO / TABLE / EXISTS / ON / REFERENCES / VIEW / TYPE, where it names a table); `split_dotted_names`: a quoted qualifier `"c.ns"` (`c` a connection or `local`, the next token a `.`) written `"c"."ns"` before the parse (`query_session_t::parse_sql`); literals, comments, dollar quotes, aliases untouched |
+| `host_functions.hpp` | The host's functions (`version()`, `obj_description`, `col_description`), registered into `local.public` by `register_connections` at every startup |
 
 Nothing here throws; every failure is a `core::result_wrapper_t` / `core::error_t` value.
 
@@ -38,6 +41,29 @@ Every statement runs on the backend actor's registration session, so no SQL reac
   database `local`, leaves fresh sessions without a place (`ALTER SYSTEM SET search_path = ''`) and
   refuses an alias that is the name of an existing local database (the engine would read the first
   part of a three-part name as both) — with connections or none.
+- **Host functions** (`host_functions.hpp`): right after `CREATE DATABASE local`, `register_connections`
+  registers `version()` (TEXT, `otterstax::version_text`, `utility/server_version.hpp`: `PostgreSQL 18.0
+  (OtterStax)`, the same version as the PostgreSQL wire's `server_version`) and the catalog functions Django's
+  introspection calls that the engine does not have yet — `obj_description(oid, catalog)` /
+  `col_description(oid, attnum)` (TEXT, NULL for every row: OtterStax keeps no comment), every argument
+  of any type — into `local.public` through
+  otterbrix's `node_register_udf_t` with an explicit schema. The kernel is the process's code: its
+  pg_proc rows outlive a restart, the function does not, so every start registers it again (the engine
+  rewrites the rows of the same name and inputs). A function this process already holds (a second
+  `register_connections`) is `duplicate_function`, taken as registered; a `local.public` a client dropped
+  (`DROP SCHEMA public CASCADE` from a place in `local`: the function depends on the schema, so a plain
+  DROP is refused, as PostgreSQL refuses it) leaves the functions out with a warning — never a refused
+  start. otterbrix scopes a bare call to the built-ins and the functions of the **session's place
+  schema**, a `pg_catalog.`-qualified one to the built-ins alone, and its catalog serialization keeps no
+  user-defined function or cast in pg_catalog (`[.engine-defect-pgcatalog-udf]`). So the session writes
+  every call of a host function — `version()`, `pg_catalog.version()`, `pg_catalog.obj_description(…)`, … —
+  as `local.public.<name>(…)`, and `[pg_catalog.]pg_table_is_visible(x)` (Django's table list) as
+  `((x) IN (<pg_catalog's relations and the session's place's>))` — the search path's meaning, which no
+  host function can give (a kernel sees no session's place): OtterStax's own tables, another connection's
+  and another schema's are not visible
+  before the parse (`qualify_host_calls`, `dotted_names.hpp`; the reason is the comment over it), which a
+  qualified call reaches from any place: a connection's, `local`'s, none. Drop the pass once pg_catalog
+  can hold a host's function.
 - **Names.** Lower case, one engine database per connection: `c.d.ns.t` with `d` the configured
   database for PostgreSQL and `def_database` (`def`) for MySQL / ClickHouse; `ns` the discovered
   schema for PostgreSQL (config `schema: X` → only X; none → every user schema) and the backend's

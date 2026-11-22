@@ -6,6 +6,14 @@
 
 #include <catch2/catch_all.hpp>
 
+#include <core/date/date_parse.hpp>
+
+namespace {
+    // The engine's DATE of an ISO date, and its TIMESTAMPTZ of a UTC wall clock (ClickHouse's instants are UTC).
+    int32_t engine_day(std::string_view iso) { return core::date::parse_date(iso).value().value.count(); }
+    int64_t engine_instant(std::string_view utc) { return core::date::parse_timestamp(utc).value().value.count(); }
+} // namespace
+
 #include <clickhouse/columns/array.h>
 #include <clickhouse/columns/date.h>
 #include <clickhouse/columns/decimal.h>
@@ -79,7 +87,7 @@ TEST_CASE("ch_to_struct: schema extraction for primitive types") {
     REQUIRE(s.child_types()[1].type() == logical_type::DOUBLE);
     REQUIRE(s.child_types()[1].alias() == "score");
 
-    REQUIRE(s.child_types()[2].type() == logical_type::STRING_LITERAL);
+    REQUIRE(s.child_types()[2].type() == logical_type::TEXT);
     REQUIRE(s.child_types()[2].alias() == "label");
 }
 
@@ -317,12 +325,12 @@ void require_scalar_types(const data_chunk_t& chunk) {
         {"u64", logical_type::UBIGINT},
         {"f32", logical_type::FLOAT},
         {"f64", logical_type::DOUBLE},
-        {"s", logical_type::STRING_LITERAL},
-        {"fs", logical_type::STRING_LITERAL},
-        {"d", logical_type::STRING_LITERAL},
-        {"dt", logical_type::STRING_LITERAL},
-        {"dt64", logical_type::STRING_LITERAL},
-        {"uuid", logical_type::STRING_LITERAL},
+        {"s", logical_type::TEXT},
+        {"fs", logical_type::TEXT},
+        {"d", logical_type::DATE},
+        {"dt", logical_type::TIMESTAMP_TZ},
+        {"dt64", logical_type::TIMESTAMP_TZ},
+        {"uuid", logical_type::TEXT},
         {"n_i32", logical_type::INTEGER},
         {"arr", logical_type::LIST},
     };
@@ -347,11 +355,13 @@ void require_scalar_values(const data_chunk_t& chunk, uint64_t row) {
     REQUIRE(otterstax::test::cell(chunk, 9, row).value<double>() == -2.5);
     REQUIRE(otterstax::test::cell(chunk, 10, row).value<std::string_view>() == "text");
     REQUIRE(otterstax::test::cell(chunk, 11, row).value<std::string_view>() == "abcd");
-    REQUIRE(otterstax::test::cell(chunk, 12, row).value<std::string_view>() == "1970-01-01");
-    REQUIRE(otterstax::test::cell(chunk, 13, row).value<std::string_view>() == "2024-01-02 03:04:05");
-    // Without an override DateTime64 is its text with the column's precision, and an Array is
-    // a LIST of its elements.
-    REQUIRE(otterstax::test::cell(chunk, 14, row).value<std::string_view>() == "2024-01-02 03:04:05.123");
+    // A Date is the engine's DATE, a DateTime / DateTime64 its TIMESTAMPTZ (the instant), and an Array a LIST of
+    // its elements.
+    REQUIRE(chunk.data[12].get_value<core::date::date_t>(row).value.count() == engine_day("1970-01-01"));
+    REQUIRE(chunk.data[13].get_value<core::date::timestamptz_t>(row).value.count() ==
+            engine_instant("2024-01-02 03:04:05"));
+    REQUIRE(chunk.data[14].get_value<core::date::timestamptz_t>(row).value.count() ==
+            engine_instant("2024-01-02 03:04:05.123"));
     REQUIRE(otterstax::test::cell(chunk, 15, row).value<std::string_view>() == "01234567-89ab-cdef-fedc-ba9876543210");
     REQUIRE(otterstax::test::cell(chunk, 16, row).value<int32_t>() == 5);
     REQUIRE(otterstax::test::cell(chunk, 17, row).child_count() == 2);
@@ -412,7 +422,7 @@ TEST_CASE("ch_to_chunk characterization: Nullable columns keep the nested type a
         const auto& chunk = converted.value();
         REQUIRE(chunk.size() == 2);
         REQUIRE(chunk.types()[0].type() == logical_type::INTEGER);
-        REQUIRE(chunk.types()[1].type() == logical_type::STRING_LITERAL);
+        REQUIRE(chunk.types()[1].type() == logical_type::TEXT);
         REQUIRE(otterstax::test::cell(chunk, 0, 0).value<int32_t>() == 5);
         REQUIRE(otterstax::test::cell(chunk, 0, 1).is_null());
         REQUIRE(otterstax::test::cell(chunk, 1, 0).is_null());
@@ -424,7 +434,7 @@ TEST_CASE("ch_to_chunk characterization: Nullable columns keep the nested type a
         const auto& chunk = converted.value();
         REQUIRE(chunk.size() == 4);
         REQUIRE(chunk.types()[0].type() == logical_type::INTEGER);
-        REQUIRE(chunk.types()[1].type() == logical_type::STRING_LITERAL);
+        REQUIRE(chunk.types()[1].type() == logical_type::TEXT);
         REQUIRE(otterstax::test::cell(chunk, 0, 0).value<int32_t>() == 5);
         REQUIRE(otterstax::test::cell(chunk, 0, 1).is_null());
         REQUIRE(otterstax::test::cell(chunk, 0, 2).is_null());
@@ -455,7 +465,7 @@ TEST_CASE("ch_to_chunk characterization: scalar named-type override keeps the pr
     REQUIRE(chunk.size() == 2);
     REQUIRE(chunk.types()[0].type() == logical_type::BIGINT);
     REQUIRE(chunk.types()[0].alias() == "v");
-    REQUIRE(chunk.types()[1].type() == logical_type::STRING_LITERAL);
+    REQUIRE(chunk.types()[1].type() == logical_type::TEXT);
     REQUIRE(chunk.types()[1].alias() == "w");
     REQUIRE(otterstax::test::cell(chunk, 0, 0).value<int64_t>() == 42);
     REQUIRE(otterstax::test::cell(chunk, 0, 1).is_null());
@@ -473,7 +483,7 @@ TEST_CASE("ch_to_chunk characterization: Tuple override reads a STRUCT column") 
         REQUIRE(type.child_types().size() == 2);
         REQUIRE(type.child_types()[0].type() == logical_type::INTEGER);
         REQUIRE(type.child_types()[0].alias() == "id");
-        REQUIRE(type.child_types()[1].type() == logical_type::STRING_LITERAL);
+        REQUIRE(type.child_types()[1].type() == logical_type::TEXT);
         REQUIRE(type.child_types()[1].alias() == "name");
     };
 
@@ -579,7 +589,7 @@ TEST_CASE("ch_to_struct characterization: Array override is a LIST") {
     const auto& type = s.child_types()[0];
     REQUIRE(type.type() == logical_type::LIST);
     REQUIRE(type.alias() == "tags");
-    REQUIRE(type.child_type().type() == logical_type::STRING_LITERAL);
+    REQUIRE(type.child_type().type() == logical_type::TEXT);
     REQUIRE(type.extension()->type() == logical_type_extension::extension_type::LIST);
 }
 
@@ -624,7 +634,7 @@ TEST_CASE("ch_to_chunk: Array override reads every row's elements across block b
         REQUIRE(chunk.types()[0].type() == logical_type::LIST);
         REQUIRE(chunk.types()[0].child_type().type() == logical_type::INTEGER);
         REQUIRE(chunk.types()[1].type() == logical_type::LIST);
-        REQUIRE(chunk.types()[1].child_type().type() == logical_type::STRING_LITERAL);
+        REQUIRE(chunk.types()[1].child_type().type() == logical_type::TEXT);
         for (size_t row = 0; row < nums.size(); ++row) {
             CAPTURE(row);
             const auto num_value = otterstax::test::cell(chunk, 0, row);
@@ -691,18 +701,21 @@ TEST_CASE("ch_to_chunk: Date and Date32 columns read the calendar day the wire c
 
     auto require_rows = [](const data_chunk_t& chunk) {
         REQUIRE(chunk.size() == 3);
-        REQUIRE(chunk.types()[0].type() == logical_type::STRING_LITERAL);
-        REQUIRE(chunk.types()[1].type() == logical_type::STRING_LITERAL);
-        REQUIRE(chunk.types()[2].type() == logical_type::STRING_LITERAL);
-        REQUIRE(otterstax::test::cell(chunk, 0, 0).value<std::string_view>() == "2024-01-15");
-        REQUIRE(otterstax::test::cell(chunk, 0, 1).value<std::string_view>() == "1970-01-01");
-        REQUIRE(otterstax::test::cell(chunk, 0, 2).value<std::string_view>() == "2149-06-06");
-        REQUIRE(otterstax::test::cell(chunk, 1, 0).value<std::string_view>() == "1969-12-31");
-        REQUIRE(otterstax::test::cell(chunk, 1, 1).value<std::string_view>() == "1900-01-01");
-        REQUIRE(otterstax::test::cell(chunk, 1, 2).value<std::string_view>() == "2299-12-31");
-        REQUIRE(otterstax::test::cell(chunk, 2, 0).value<std::string_view>() == "2024-01-15");
-        REQUIRE(otterstax::test::cell(chunk, 2, 1).is_null());
-        REQUIRE(otterstax::test::cell(chunk, 2, 2).value<std::string_view>() == "1970-01-01");
+        for (std::size_t col = 0; col < 3; ++col) {
+            REQUIRE(chunk.types()[col].type() == logical_type::DATE);
+        }
+        const auto day = [&](std::size_t col, std::size_t row) {
+            return chunk.data[col].get_value<core::date::date_t>(row).value.count();
+        };
+        REQUIRE(day(0, 0) == engine_day("2024-01-15"));
+        REQUIRE(day(0, 1) == engine_day("1970-01-01"));
+        REQUIRE(day(0, 2) == engine_day("2149-06-06"));
+        REQUIRE(day(1, 0) == engine_day("1969-12-31"));
+        REQUIRE(day(1, 1) == engine_day("1900-01-01"));
+        REQUIRE(day(1, 2) == engine_day("2299-12-31"));
+        REQUIRE(day(2, 0) == engine_day("2024-01-15"));
+        REQUIRE(chunk.data[2].is_null(1));
+        REQUIRE(day(2, 2) == engine_day("1970-01-01"));
     };
 
     SECTION("single block") {
@@ -884,7 +897,7 @@ TEST_CASE("ch_to_chunk: a named-type override reads each wire value as the colum
                                  words.size(),
                                  {{"word", "LowCardinality(String)"}},
                                  [&](const data_chunk_t& chunk) {
-                                     REQUIRE(chunk.types()[0].type() == logical_type::STRING_LITERAL);
+                                     REQUIRE(chunk.types()[0].type() == logical_type::TEXT);
                                      for (size_t row = 0; row < words.size(); ++row) {
                                          require_written(chunk, 0, row);
                                          REQUIRE(otterstax::test::cell(chunk, 0, row).value<std::string_view>() == words[row]);
@@ -903,7 +916,7 @@ TEST_CASE("ch_to_chunk: a named-type override reads each wire value as the colum
                                  words.size(),
                                  {{"word", "LowCardinality(Nullable(String))"}},
                                  [&](const data_chunk_t& chunk) {
-                                     REQUIRE(chunk.types()[0].type() == logical_type::STRING_LITERAL);
+                                     REQUIRE(chunk.types()[0].type() == logical_type::TEXT);
                                      require_written(chunk, 0, 0);
                                      REQUIRE(otterstax::test::cell(chunk, 0, 0).value<std::string_view>() == "z");
                                      REQUIRE(otterstax::test::cell(chunk, 0, 1).is_null());
@@ -1013,7 +1026,7 @@ TEST_CASE("ch_to_chunk: a wire column that does not represent its override's typ
         require_wire_column(make_block,
                             texts.size(),
                             {{"id", "Int32"}},
-                            logical_type::STRING_LITERAL,
+                            logical_type::TEXT,
                             [&](const otterstax::test::cell_t& value, size_t row) {
                                 REQUIRE(value.value<std::string_view>() == texts[row]);
                             });
@@ -1179,7 +1192,7 @@ TEST_CASE("ch_to_chunk: a wire column that does not represent its override's typ
                             [&](const otterstax::test::cell_t& value, size_t row) {
                                 const auto& fields = value.type().child_types();
                                 REQUIRE(fields.size() == 2);
-                                REQUIRE(fields[0].type() == logical_type::STRING_LITERAL);
+                                REQUIRE(fields[0].type() == logical_type::TEXT);
                                 REQUIRE(fields[0].alias() != "id");
                                 REQUIRE(fields[1].type() == logical_type::INTEGER);
                                 REQUIRE(value.child(0).value<std::string_view>() == names[row]);
@@ -1216,7 +1229,7 @@ TEST_CASE("ch_to_chunk: Array override is a LIST of each row's own length") {
         REQUIRE(types[0].type() == logical_type::LIST);
         REQUIRE(types[0].child_type().type() == logical_type::INTEGER);
         REQUIRE(types[1].type() == logical_type::LIST);
-        REQUIRE(types[1].child_type().type() == logical_type::STRING_LITERAL);
+        REQUIRE(types[1].child_type().type() == logical_type::TEXT);
         REQUIRE(types[2].type() == logical_type::LIST);
         REQUIRE(types[2].child_type().type() == logical_type::BOOLEAN);
         // The schema discovery registers under the same overrides is the chunk's.
@@ -1341,10 +1354,19 @@ TEST_CASE("ch_to_chunk: wire types without a numeric mapping are read as their t
         for (size_t col = 0; col < expected.size(); ++col) {
             CAPTURE(expected[col].name);
             REQUIRE(types[col].alias() == expected[col].name);
-            REQUIRE(types[col].type() == logical_type::STRING_LITERAL);
+            // A DateTime64 is the engine's TIMESTAMPTZ (the instant; the column's display zone is no part of
+            // it), every other named type the text.
+            const bool instant = std::string_view{expected[col].name}.starts_with("dt64");
+            REQUIRE(types[col].type() == (instant ? logical_type::TIMESTAMP_TZ : logical_type::TEXT));
             for (size_t row = 0; row < 2; ++row) {
                 require_written(chunk, col, row);
-                REQUIRE(otterstax::test::cell(chunk, col, row).value<std::string_view>() == expected[col].texts[row]);
+                if (instant) {
+                    REQUIRE(chunk.data[col].get_value<core::date::timestamptz_t>(row).value.count() ==
+                            engine_instant(expected[col].texts[row]));
+                } else {
+                    REQUIRE(otterstax::test::cell(chunk, col, row).value<std::string_view>() ==
+                            expected[col].texts[row]);
+                }
             }
         }
     };
@@ -1368,7 +1390,8 @@ TEST_CASE("ch_to_chunk: wire types without a numeric mapping are read as their t
             REQUIRE(schema.child_types().size() == types.size());
             for (size_t col = 0; col < types.size(); ++col) {
                 CAPTURE(expected[col].name);
-                REQUIRE(schema.child_types()[col].type() == logical_type::STRING_LITERAL);
+                const bool instant = std::string_view{expected[col].name}.starts_with("dt64");
+                REQUIRE(schema.child_types()[col].type() == (instant ? logical_type::TIMESTAMP_TZ : logical_type::TEXT));
                 REQUIRE(schema.child_types()[col] == types[col]);
             }
         }
@@ -1493,7 +1516,7 @@ TEST_CASE("ch_to_chunk: a wire type without a reading is datatype_mismatch") {
                                                   make_block(0, 2),
                                                   {{"attrs", "Map(String, UInt64)"}});
             REQUIRE(schema.child_types().size() == 1);
-            REQUIRE(schema.child_types()[0].type() == logical_type::STRING_LITERAL);
+            REQUIRE(schema.child_types()[0].type() == logical_type::TEXT);
         }
     }
     SECTION("Nothing") {
@@ -1518,7 +1541,7 @@ TEST_CASE("ch_to_chunk: a Nullable(Nothing) column is its NULL rows") {
     };
     convert_single_and_split(make_block, 2, {}, [](const data_chunk_t& chunk) {
         REQUIRE(chunk.size() == 2);
-        REQUIRE(chunk.types()[0].type() == logical_type::STRING_LITERAL);
+        REQUIRE(chunk.types()[0].type() == logical_type::TEXT);
         REQUIRE(otterstax::test::cell(chunk, 0, 0).is_null());
         REQUIRE(otterstax::test::cell(chunk, 0, 1).is_null());
     });

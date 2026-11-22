@@ -78,17 +78,21 @@ namespace frontend::mysql {
             case field_type::MYSQL_TYPE_STRING:
                 column_length = 0xFFFF; // 65535
                 break;
+            // The engine keeps microseconds: DATETIME(6) / TIMESTAMP(6) / TIME(6), as MySQL describes them.
             case field_type::MYSQL_TYPE_DATETIME:
-                column_length = 19;
+            case field_type::MYSQL_TYPE_TIMESTAMP:
+                column_length = 26;
                 charset = character_set::BINARY;
+                decimals = 6;
                 break;
             case field_type::MYSQL_TYPE_DATE:
                 column_length = 10;
                 charset = character_set::BINARY;
                 break;
             case field_type::MYSQL_TYPE_TIME:
-                column_length = 8;
+                column_length = 17;
                 charset = character_set::BINARY;
+                decimals = 6;
                 break;
             case field_type::MYSQL_TYPE_NEWDECIMAL:
                 // A numeric column, so the binary charset as every other number
@@ -126,6 +130,7 @@ namespace frontend::mysql {
         switch (type.type()) {
             case logical_type::UTINYINT:
             case logical_type::USMALLINT:
+            case logical_type::OID:
             case logical_type::UINTEGER:
             case logical_type::UBIGINT:
                 column.column_flags |= UNSIGNED_FLAG;

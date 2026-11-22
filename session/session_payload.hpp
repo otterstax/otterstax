@@ -67,6 +67,10 @@ struct session_payload {
     size_t parameter_count;
     NodeTag tag;
     size_t affected_rows{0};
+    // Of an INSERT: the first value the storage generated for an AUTO_INCREMENT column (cursor_t::generated_id(),
+    // a MySQL backend's last_insert_id), 0 when it generated none — MySQL's LAST_INSERT_ID, the MySQL wire's OK
+    // packet's last_insert_id.
+    std::uint64_t generated_id{0};
     otterstax::session::transaction_command_t transaction{otterstax::session::transaction_command_t::none};
     std::pmr::vector<components::types::complex_logical_type> engine_types;
     std::uint64_t portal{0};

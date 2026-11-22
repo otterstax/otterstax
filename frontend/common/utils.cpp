@@ -28,6 +28,7 @@ namespace frontend {
                 case components::types::logical_type::USMALLINT:
                     return mysql::field_type::MYSQL_TYPE_SHORT;
                 case components::types::logical_type::INTEGER:
+                case components::types::logical_type::OID:
                 case components::types::logical_type::UINTEGER:
                     return mysql::field_type::MYSQL_TYPE_LONG;
                 case components::types::logical_type::BIGINT:
@@ -37,6 +38,7 @@ namespace frontend {
                     return mysql::field_type::MYSQL_TYPE_FLOAT;
                 case components::types::logical_type::DOUBLE:
                     return mysql::field_type::MYSQL_TYPE_DOUBLE;
+                case components::types::logical_type::TEXT:
                 case components::types::logical_type::STRING_LITERAL:
                 case components::types::logical_type::ENUM:
                     // ENUM serialises as the label string on the wire
@@ -59,6 +61,16 @@ namespace frontend {
                     // whose value is a string of digits, so every one of them
                     // arrives intact where a 64-bit type would have to round.
                     return mysql::field_type::MYSQL_TYPE_NEWDECIMAL;
+                // The temporal types: a TIMESTAMPTZ is MySQL's TIMESTAMP (an instant shown in the session's zone),
+                // a TIMESTAMP its DATETIME. MySQL has no TIME_TZ nor INTERVAL: refused below.
+                case components::types::logical_type::DATE:
+                    return mysql::field_type::MYSQL_TYPE_DATE;
+                case components::types::logical_type::TIME:
+                    return mysql::field_type::MYSQL_TYPE_TIME;
+                case components::types::logical_type::TIMESTAMP:
+                    return mysql::field_type::MYSQL_TYPE_DATETIME;
+                case components::types::logical_type::TIMESTAMP_TZ:
+                    return mysql::field_type::MYSQL_TYPE_TIMESTAMP;
                     //            case components::types::logical_type::BLOB:
                     //                return field_type::MYSQL_TYPE_BLOB;
                     //            case components::types::logical_type::BIT:
@@ -87,6 +99,7 @@ namespace frontend {
                 case components::types::logical_type::USMALLINT:
                 case components::types::logical_type::INTEGER:
                     return postgres::field_type::INT4;
+                case components::types::logical_type::OID:
                 case components::types::logical_type::UINTEGER:
                 case components::types::logical_type::BIGINT:
                 case components::types::logical_type::UBIGINT:
@@ -95,6 +108,7 @@ namespace frontend {
                     return postgres::field_type::FLOAT4;
                 case components::types::logical_type::DOUBLE:
                     return postgres::field_type::FLOAT8;
+                case components::types::logical_type::TEXT:
                 case components::types::logical_type::STRING_LITERAL:
                 case components::types::logical_type::NA:
                 case components::types::logical_type::ENUM:
@@ -116,6 +130,18 @@ namespace frontend {
                     // encoder: is_encodable<POSTGRES> refuses the column in
                     // binary (see resultset_utils.cpp).
                     return postgres::field_type::NUMERIC;
+                case components::types::logical_type::DATE:
+                    return postgres::field_type::DATE;
+                case components::types::logical_type::TIME:
+                    return postgres::field_type::TIME;
+                case components::types::logical_type::TIME_TZ:
+                    return postgres::field_type::TIMETZ;
+                case components::types::logical_type::TIMESTAMP:
+                    return postgres::field_type::TIMESTAMP;
+                case components::types::logical_type::TIMESTAMP_TZ:
+                    return postgres::field_type::TIMESTAMPTZ;
+                case components::types::logical_type::INTERVAL:
+                    return postgres::field_type::INTERVAL;
                 default:
                     // No PostgreSQL type OID for this logical type; the caller
                     // refuses the column with an ErrorResponse (find_unsupported_column).
@@ -171,12 +197,16 @@ namespace frontend {
                 return "USMALLINT";
             case LT::UINTEGER:
                 return "UINTEGER";
+            case LT::OID:
+                return "OID";
             case LT::UBIGINT:
                 return "UBIGINT";
             case LT::UHUGEINT:
                 return "UHUGEINT";
             case LT::BIT:
                 return "BIT";
+            case LT::TEXT:
+                return "TEXT";
             case LT::STRING_LITERAL:
                 return "STRING_LITERAL";
             case LT::INTEGER_LITERAL:

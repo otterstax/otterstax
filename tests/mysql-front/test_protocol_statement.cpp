@@ -307,6 +307,34 @@ TEST_CASE("mysql protocol: placeholders become $n in a prepared text only") {
     }
 }
 
+// SQLAlchemy's MySQL dialect renders .limit(2).offset(1) as LIMIT 1, 2; the engine's grammar reads OFFSET 1 LIMIT 2.
+TEST_CASE("mysql protocol: LIMIT offset, count in the engine's form") {
+    struct case_t {
+        const char* sql;
+        const char* expected;
+    };
+    const case_t query_cases[] = {
+        {"SELECT id FROM t ORDER BY id LIMIT 1, 2", "SELECT id FROM t ORDER BY id OFFSET 1 LIMIT 2"},
+        {"SELECT id FROM t LIMIT 10,20;", "SELECT id FROM t OFFSET 10 LIMIT 20;"},
+        {"select id from t limit 3 /* c */ , 5", "select id from t OFFSET 3 LIMIT 5"},
+        {"SELECT * FROM (SELECT id FROM t LIMIT 0, 1) s LIMIT 1", "SELECT * FROM (SELECT id FROM t OFFSET 0 LIMIT 1) s LIMIT 1"},
+        // As written: one value, LIMIT ... OFFSET ..., a list that is not LIMIT's.
+        {"SELECT id FROM t LIMIT 2", "SELECT id FROM t LIMIT 2"},
+        {"SELECT id FROM t LIMIT 2 OFFSET 1", "SELECT id FROM t LIMIT 2 OFFSET 1"},
+        {"SELECT 1, 2 FROM t WHERE a IN (1, 2)", "SELECT 1, 2 FROM t WHERE a IN (1, 2)"},
+        {"SELECT 'LIMIT 1, 2' FROM t", "SELECT 'LIMIT 1, 2' FROM t"},
+        {"SELECT `limit` FROM t", "SELECT \"limit\" FROM t"},
+    };
+    for (const auto& c : query_cases) {
+        INFO(c.sql);
+        CHECK(engine_text(c.sql).sql == c.expected);
+    }
+    // The placeholders keep their order: the first `?` is the offset, as MySQL binds it.
+    auto prepared = engine_text("SELECT id FROM t WHERE a = ? LIMIT ?, ?", text_command_t::prepare);
+    CHECK(prepared.sql == "SELECT id FROM t WHERE a = $1 OFFSET $2 LIMIT $3");
+    CHECK(prepared.placeholders == 3);
+}
+
 TEST_CASE("mysql protocol: texts the engine would misread are refused") {
     // MySQL answers a `?` in a COM_QUERY text with a syntax error; the engine
     // would read it as an operator (and SELECT ? + 1 killed the process).
@@ -421,7 +449,8 @@ TEST_CASE("mysql protocol: anything but variables and aliases goes to the sessio
                             "SELECT count(*) FROM db.t",
                             "SHOW VARIABLES WHERE Variable_name = 'x'",
                             "SHOW GLOBAL WARNINGS",
-                            "SHOW TABLES",
+                            "SHOW TABLES WHERE x = 1",
+                            "SHOW GLOBAL TABLES",
                             "SET @x = 1",
                             "SET @@session.x = 1, @y = 2",
                             "SET PASSWORD = 'secret'",
@@ -703,7 +732,7 @@ TEST_CASE("mysql protocol: SHOW VARIABLES filters by LIKE and sorts by name") {
     CHECK(one.rows[0][1] == "1");
 
     CHECK(over_the_wire(answer_rows(resource, "SHOW VARIABLES LIKE 'no_such_%'")).rows.empty());
-    CHECK(over_the_wire(answer_rows(resource, "SHOW VARIABLES")).rows.size() == 30);
+    CHECK(over_the_wire(answer_rows(resource, "SHOW VARIABLES")).rows.size() == 33);
 }
 
 TEST_CASE("mysql protocol: SHOW WARNINGS is the empty list") {
@@ -782,4 +811,257 @@ TEST_CASE("mysql protocol: an ERR packet carries MySQL's SQLSTATE of its errno")
         }
         CHECK(sqlstate == state);
     }
+}
+
+namespace {
+    std::optional<std::string> substituted(std::string_view sql) {
+        auto out = substitute_session_values(sql, context());
+        if (!out) {
+            return std::nullopt;
+        }
+        if (auto* refusal = std::get_if<protocol_refusal_t>(&*out)) {
+            FAIL("refused: " << refusal->message);
+        }
+        return std::get<std::string>(*out);
+    }
+} // namespace
+
+// Django's MySQL backend, once per connection (django/db/backends/mysql/base.py, mysql_server_data).
+TEST_CASE("mysql protocol: a SELECT mixing variables with engine expressions gets their values") {
+    constexpr const char* django = "SELECT VERSION(), @@sql_mode, @@default_storage_engine, @@sql_auto_is_null, "
+                                   "@@lower_case_table_names, CONVERT_TZ('2001-01-01 01:00:00', 'UTC', 'UTC') IS NOT "
+                                   "NULL";
+    // Not the frontend's to answer whole: CONVERT_TZ is the engine's.
+    CHECK_FALSE(classify_protocol_statement(django).has_value());
+    CHECK(substituted(django) ==
+          "SELECT '9.5.0' AS `VERSION()`, 'STRICT_TRANS_TABLES' AS `@@sql_mode`, 'InnoDB' AS "
+          "`@@default_storage_engine`, 0 AS `@@sql_auto_is_null`, 1 AS `@@lower_case_table_names`, "
+          "CONVERT_TZ('2001-01-01 01:00:00', 'UTC', 'UTC') IS NOT NULL");
+
+    // An alias is kept, an item inside an expression gets none, a scope is read.
+    CHECK(substituted("SELECT @@session.autocommit AS ac, 1 + @@auto_increment_offset, DATABASE() FROM t LIMIT 1") ==
+          "SELECT 1 AS ac, 1 + 1, NULL AS `DATABASE()` FROM t LIMIT 1");
+    CHECK(substituted("SELECT id FROM t WHERE owner = USER()") == "SELECT id FROM t WHERE owner = 'alice@10.0.0.5'");
+    CHECK(substituted("SELECT CONNECTION_ID(), x") == "SELECT 7 AS `CONNECTION_ID()`, x");
+    // A quote and a backslash in a value are MySQL-escaped.
+    protocol_context_t odd = context();
+    odd.database = "it's\\db";
+    const auto escaped = substitute_session_values("SELECT DATABASE(), 1", odd);
+    REQUIRE(escaped.has_value());
+    CHECK(std::get<std::string>(*escaped) == "SELECT 'it''s\\\\db' AS `DATABASE()`, 1");
+}
+
+TEST_CASE("mysql protocol: a text reading no variable is left alone") {
+    for (const char* sql : {"SELECT 1", "SELECT id FROM t", "INSERT INTO t VALUES (1)", "UPDATE t SET x = 1",
+                            "SELECT s.version() FROM t", "SELECT version FROM t", "SELECT '@@sql_mode'",
+                            "SELECT `@@sql_mode` FROM t"}) {
+        INFO(sql);
+        CHECK_FALSE(substitute_session_values(sql, context()).has_value());
+    }
+}
+
+TEST_CASE("mysql protocol: a mixed SELECT of an unknown variable is ER_UNKNOWN_SYSTEM_VARIABLE") {
+    const auto out = substitute_session_values("SELECT @@no_such_variable, 1 + 1", context());
+    REQUIRE(out.has_value());
+    const auto* refusal = std::get_if<protocol_refusal_t>(&*out);
+    REQUIRE(refusal != nullptr);
+    CHECK(refusal->code == mysql_error::ER_UNKNOWN_SYSTEM_VARIABLE);
+    CHECK(refusal->message == "Unknown system variable 'no_such_variable'");
+}
+
+TEST_CASE("mysql protocol: the storage engine and sql_auto_is_null are answered") {
+    auto* resource = std::pmr::new_delete_resource();
+    auto rows = over_the_wire(answer_rows(resource, "SELECT @@default_storage_engine, @@sql_auto_is_null"));
+    REQUIRE(rows.rows.size() == 1);
+    CHECK(rows.rows[0] == std::vector<std::optional<std::string>>{"InnoDB", "0"});
+}
+
+// wait_timeout is the connection's idle timeout, the frontend's: never sent to the engine, clamped as MySQL clamps
+// it, applied with the rest of its SET.
+TEST_CASE("mysql protocol: SET wait_timeout is the frontend's") {
+    const auto set_of = [](const char* sql) {
+        auto statement = classify_protocol_statement(sql);
+        INFO(sql);
+        REQUIRE(statement.has_value());
+        REQUIRE(std::holds_alternative<set_variables_t>(*statement));
+        return std::get<set_variables_t>(*statement);
+    };
+    for (const auto& [sql, seconds] : std::vector<std::pair<const char*, uint64_t>>{
+             {"SET wait_timeout = 100", 100},
+             {"SET SESSION wait_timeout = 5", 5},
+             {"SET @@session.wait_timeout = 60", 60},
+             {"SET @@wait_timeout := 7", 7},
+             {"SET wait_timeout = DEFAULT", 0}, // the server's
+             {"SET wait_timeout = 0", 1},       // clamped to 1 .. 31536000
+             {"SET wait_timeout = -5", 1},
+             {"SET wait_timeout = 99999999999", 31536000},
+             {"SET wait_timeout = 1, wait_timeout = 2", 2}}) {
+        const auto set = set_of(sql);
+        INFO(sql);
+        CHECK_FALSE(set.refusal.has_value());
+        CHECK(set.settings.empty());
+        REQUIRE(set.wait_timeout.has_value());
+        CHECK(*set.wait_timeout == seconds);
+    }
+    // With other assignments: they go to the engine, wait_timeout does not.
+    const auto mixed = set_of("SET wait_timeout = 30, autocommit = 0");
+    REQUIRE(mixed.settings.size() == 1);
+    CHECK(engine_setting_statement(mixed.settings[0]) == "SET autocommit = 'off'");
+    CHECK(mixed.wait_timeout == uint64_t{30});
+    // No integer: MySQL's 1232, nothing applied.
+    for (const char* sql : {"SET wait_timeout = 'abc'", "SET wait_timeout = 1.5", "SET wait_timeout = ON"}) {
+        const auto set = set_of(sql);
+        INFO(sql);
+        REQUIRE(set.refusal.has_value());
+        CHECK(set.refusal->code == mysql_error::ER_WRONG_TYPE_FOR_VAR);
+    }
+    // A server-wide one is refused whole, as every SET GLOBAL.
+    CHECK(set_of("SET GLOBAL wait_timeout = 10").refusal->code == mysql_error::ER_NOT_SUPPORTED_YET);
+}
+
+TEST_CASE("mysql protocol: @@wait_timeout is the connection's and @@interactive_timeout the server's") {
+    auto* resource = std::pmr::new_delete_resource();
+    auto ctx = context();
+    ctx.wait_timeout = std::chrono::seconds(5);
+    ctx.interactive_timeout = std::chrono::seconds(28800);
+    auto statement = classify_protocol_statement("SELECT @@wait_timeout, @@interactive_timeout");
+    REQUIRE(statement.has_value());
+    auto answer = answer_protocol_statement(resource, *statement, ctx);
+    REQUIRE(std::holds_alternative<components::vector::data_chunk_t>(answer));
+    auto rows = over_the_wire(std::get<components::vector::data_chunk_t>(answer));
+    REQUIRE(rows.rows.size() == 1);
+    CHECK(rows.rows[0] == std::vector<std::optional<std::string>>{"5", "28800"});
+}
+
+// SHOW CREATE TABLE (SQLAlchemy's MySQL reflection): one to three name parts, folded, a COM_QUERY text only.
+TEST_CASE("mysql protocol: SHOW CREATE TABLE") {
+    const auto name_of = [](const char* sql) {
+        auto statement = classify_protocol_statement(sql);
+        INFO(sql);
+        REQUIRE(statement.has_value());
+        REQUIRE(std::holds_alternative<show_create_table_t>(*statement));
+        return std::get<show_create_table_t>(*statement).name;
+    };
+    using parts = std::vector<std::string>;
+    CHECK(name_of("SHOW CREATE TABLE items") == parts{"items"});
+    CHECK(name_of("show create table `Public`.`Items`;") == parts{"public", "items"});
+    CHECK(name_of("SHOW CREATE TABLE my.bill.orders") == parts{"my", "bill", "orders"});
+    CHECK_FALSE(classify_protocol_statement("SHOW CREATE TABLE a.b.c.d").has_value());
+    CHECK_FALSE(classify_protocol_statement("SHOW CREATE TABLE").has_value());
+    CHECK_FALSE(classify_protocol_statement("SHOW CREATE TABLE t", true).has_value()); // a prepare is the engine's
+
+    using LT = components::types::logical_type;
+    auto decimal = components::types::complex_logical_type::create_decimal(std::pmr::new_delete_resource(), 9, 2);
+    REQUIRE_FALSE(decimal.has_error());
+    CHECK(mysql_type_name(decimal.value()) == "decimal(9,2)");
+    CHECK(mysql_type_name(components::types::complex_logical_type{LT::BOOLEAN}) == "tinyint(1)");
+    CHECK(mysql_type_name(components::types::complex_logical_type{LT::UBIGINT}) == "bigint unsigned");
+    CHECK(mysql_type_name(components::types::complex_logical_type{LT::TIMESTAMP}) == "datetime(6)");
+    CHECK(mysql_type_name(components::types::complex_logical_type{LT::TIMESTAMP_TZ}) == "timestamp(6)");
+    CHECK(mysql_type_name(components::types::complex_logical_type{LT::TEXT}) == "text");
+    CHECK(mysql_type_name(components::types::complex_logical_type{LT::INTERVAL}) == "text");
+
+    std::vector<create_table_column_t> columns;
+    columns.push_back({"id", components::types::complex_logical_type{LT::BIGINT}, true});
+    columns.push_back({"na`me", components::types::complex_logical_type{LT::TEXT}, false});
+    CHECK(create_table_text("t", columns, {"id"}) ==
+          "CREATE TABLE `t` (\n"
+          "  `id` bigint NOT NULL,\n"
+          "  `na``me` text,\n"
+          "  PRIMARY KEY (`id`)\n"
+          ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin");
+    CHECK(create_table_text("t", {columns[1]}, {}) ==
+          "CREATE TABLE `t` (\n  `na``me` text\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin");
+}
+
+// MySQL's DDL spelling in CREATE / ALTER TABLE (mysql_ddl_form, inside to_engine_text): storage and display options
+// dropped, MySQL's type names written as the engine's, what the engine has nothing for refused with its reason.
+TEST_CASE("mysql protocol: MySQL DDL written in the engine's spelling") {
+    const auto squeezed = [](std::string text) {
+        std::string out;
+        for (char c : text) {
+            if (c == ' ' && (out.empty() || out.back() == ' ' || out.back() == '(')) {
+                continue;
+            }
+            if ((c == ',' || c == ')' || c == ';' || c == '\n') && !out.empty() && out.back() == ' ') {
+                out.pop_back();
+            }
+            out.push_back(c);
+        }
+        while (!out.empty() && out.back() == ' ') {
+            out.pop_back();
+        }
+        return out;
+    };
+    const auto ddl = [&](const char* sql) { return squeezed(engine_text(sql).sql); };
+    // SQLAlchemy's create_all.
+    CHECK(ddl("CREATE TABLE sa_book (\n\tid INTEGER NOT NULL, \n\ttitle LONGTEXT NOT NULL, \n\tpublished DATETIME, "
+              "\n\tin_stock BOOL, \n\tPRIMARY KEY (id)\n)ENGINE=InnoDB DEFAULT CHARSET=utf8mb4") ==
+          "CREATE TABLE sa_book (\n\tid INTEGER NOT NULL,\n\ttitle text NOT NULL,\n\tpublished timestamp,\n\tin_stock "
+          "BOOL,\n\tPRIMARY KEY (id)\n)");
+    // Django's: datetime(6), tinyint(1) as a bool, display widths, a column COMMENT and CHARACTER SET.
+    CHECK(ddl("CREATE TABLE `t` (`d` datetime(6) NULL, `b` tinyint(1) NOT NULL, `n` int(11), `m` mediumint, "
+              "`c` varchar(5) CHARACTER SET utf8mb4 COMMENT 'x', `comment` text) ENGINE = InnoDB COMMENT = 'tbl' "
+              "COLLATE = utf8mb4_bin;") ==
+          "CREATE TABLE \"t\" (\"d\" timestamp NULL, \"b\" boolean NOT NULL, \"n\" int, \"m\" integer, \"c\" "
+          "varchar(5), \"comment\" text);");
+    CHECK(ddl("ALTER TABLE `t` ADD COLUMN `x` longtext NULL") == "ALTER TABLE \"t\" ADD COLUMN \"x\" text NULL");
+    CHECK(ddl("ALTER TABLE t MODIFY d datetime(6)") == "ALTER TABLE t MODIFY d timestamp");
+    // Text that only looks like it stays: a column named datetime, a decimal's (p, s), a literal.
+    CHECK(ddl("CREATE TABLE t (datetime int, p decimal(9,2) DEFAULT 'longtext')") ==
+          "CREATE TABLE t (datetime int, p decimal(9,2) DEFAULT 'longtext')");
+    CHECK(ddl("SELECT datetime FROM t") == "SELECT datetime FROM t");
+    // Refused with the reason.
+    CHECK(refusal_of("CREATE TABLE t (id bigint AUTO_INCREMENT PRIMARY KEY)").code == mysql_error::ER_NOT_SUPPORTED_YET);
+    CHECK(refusal_of("CREATE TABLE t (id int) DEFAULT CHARSET=latin1").message.find("latin1") != std::string::npos);
+    CHECK(refusal_of("CREATE TABLE t (id int) COLLATE=utf8mb4_general_ci").code == mysql_error::ER_NOT_SUPPORTED_YET);
+    CHECK(refusal_of("CREATE TABLE t (c text CHARACTER SET latin1)").code == mysql_error::ER_NOT_SUPPORTED_YET);
+}
+
+// The catalog statements the MySQL dialects send: DESCRIBE / SHOW COLUMNS, SHOW TABLES, SHOW DATABASES.
+TEST_CASE("mysql protocol: the catalog statements") {
+    const auto statement = [](const char* sql) {
+        auto classified = classify_protocol_statement(sql);
+        INFO(sql);
+        REQUIRE(classified.has_value());
+        return *classified;
+    };
+    using parts = std::vector<std::string>;
+    auto describe = std::get<describe_table_t>(statement("DESCRIBE `public`.`sa_book`"));
+    CHECK(describe.name == parts{"public", "sa_book"});
+    CHECK_FALSE(describe.full);
+    CHECK(std::get<describe_table_t>(statement("desc t")).name == parts{"t"});
+    describe = std::get<describe_table_t>(statement("SHOW FULL COLUMNS FROM t FROM db"));
+    CHECK(describe.name == parts{"db", "t"});
+    CHECK(describe.full);
+    CHECK_FALSE(classify_protocol_statement("DESCRIBE SELECT 1").has_value());
+    CHECK_FALSE(classify_protocol_statement("SHOW COLUMNS FROM t LIKE 'a%'").has_value());
+
+    auto tables = std::get<show_tables_t>(statement("SHOW FULL TABLES FROM `public`"));
+    CHECK(tables.full);
+    CHECK(tables.from == std::optional<std::string>{"public"});
+    tables = std::get<show_tables_t>(statement("show tables like 'sa\\_%'"));
+    CHECK_FALSE(tables.full);
+    CHECK(tables.like == std::optional<std::string>{"sa\\_%"});
+    CHECK_FALSE(classify_protocol_statement("SHOW TABLES WHERE x = 1").has_value());
+    CHECK(std::holds_alternative<show_databases_t>(statement("SHOW SCHEMAS")));
+    CHECK(std::get<show_databases_t>(statement("SHOW DATABASES LIKE 'p%'")).like == std::optional<std::string>{"p%"});
+    CHECK(std::holds_alternative<show_variables_t>(statement("SHOW SESSION VARIABLES"))); // still the variables
+    CHECK(mysql_like("Sa_Book", "sa\\_%"));
+    CHECK_FALSE(mysql_like("saxbook", "sa\\_%"));
+
+    using LT = components::types::logical_type;
+    std::vector<create_table_column_t> columns;
+    columns.push_back({"id", components::types::complex_logical_type{LT::BIGINT}, true});
+    columns.push_back({"title", components::types::complex_logical_type{LT::TEXT}, false});
+    const auto rows = describe_rows(columns, {"id"}, false);
+    CHECK(rows.names == parts{"Field", "Type", "Null", "Key", "Default", "Extra"});
+    using row_t = std::vector<std::optional<std::string>>;
+    REQUIRE(rows.rows.size() == 2);
+    CHECK(rows.rows[0] == row_t{"id", "bigint", "NO", "PRI", std::nullopt, ""});
+    CHECK(rows.rows[1] == row_t{"title", "text", "YES", "", std::nullopt, ""});
+    const auto full = describe_rows(columns, {}, true);
+    CHECK(full.names.size() == 9);
+    CHECK(full.rows[1][2] == std::optional<std::string>{"utf8mb4_bin"});
+    CHECK(full.rows[0][2] == std::nullopt);
 }

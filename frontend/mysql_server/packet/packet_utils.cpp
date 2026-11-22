@@ -21,13 +21,17 @@ namespace frontend::mysql {
     constexpr size_t STMT_PREPARE_OK_SIZE = 12;
 
     std::vector<uint8_t>
-    build_ok(packet_writer& writer, uint8_t sequence_id, uint64_t affected_rows, server_status_flags_t server_flags) {
+    build_ok(packet_writer& writer,
+             uint8_t sequence_id,
+             uint64_t affected_rows,
+             server_status_flags_t server_flags,
+             uint64_t last_insert_id) {
         writer.reserve_payload(OK_PAYLOAD_SIZE);
         writer.write_uint8(OK_PACKET_HEADER); // OK header
         // Both counts are length-encoded: a single byte carries at most 250,
         // and 0xFB..0xFF in that position are the NULL / int-size markers.
         writer.write_length_encoded_integer(affected_rows);
-        writer.write_length_encoded_integer(0); // last insert-id
+        writer.write_length_encoded_integer(last_insert_id);
         writer.write_uint16(server_flags);      // status flags (autocommit)
         writer.write_uint16(0x0000);            // warnings
         return writer.build_from_payload(sequence_id);
@@ -59,6 +63,7 @@ namespace frontend::mysql {
             case mysql_error::ER_SYNTAX_ERROR:
             case mysql_error::ER_NOT_SUPPORTED_YET:
             case mysql_error::ER_COLLATION_CHARSET_MISMATCH:
+            case mysql_error::ER_WRONG_TYPE_FOR_VAR:
                 sql_state = sql_state::SYNTAX_ERROR_OR_ACCESS_RULE;
                 break;
             case mysql_error::ER_TABLE_EXISTS_ERROR:
@@ -70,6 +75,15 @@ namespace frontend::mysql {
                 break;
             case mysql_error::ER_WRONG_VALUE_COUNT_ON_ROW:
                 sql_state = sql_state::VALUE_COUNT_MISMATCH;
+                break;
+            case mysql_error::ER_NO_DB_ERROR:
+                sql_state = sql_state::INVALID_CATALOG_NAME;
+                break;
+            case mysql_error::ER_QUERY_INTERRUPTED:
+                sql_state = sql_state::QUERY_INTERRUPTED;
+                break;
+            case mysql_error::ER_NO_SUCH_THREAD:
+                sql_state = sql_state::GENERAL_ERROR;
                 break;
             case mysql_error::ER_OUT_OF_RESOURCES:
             case mysql_error::ER_DB_CREATE_EXISTS:
@@ -133,9 +147,11 @@ namespace frontend::mysql {
         }
         writer.write_uint8(0); // filler
 
-        // CLIENT_CONNECT_WITH_DB for HandshakeResponse41
-        uint32_t capabilities =
-            CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION | CLIENT_PLUGIN_AUTH | CLIENT_CONNECT_WITH_DB;
+        // CLIENT_CONNECT_WITH_DB for HandshakeResponse41. CLIENT_TRANSACTIONS: every OK / EOF packet carries the
+        // status flags (SERVER_STATUS_IN_TRANS, SERVER_STATUS_AUTOCOMMIT: status_flags()) — mysqlclient sends its
+        // `SET autocommit = 0` only to a server announcing it, so without it every write autocommits.
+        uint32_t capabilities = CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION | CLIENT_PLUGIN_AUTH |
+                                CLIENT_CONNECT_WITH_DB | CLIENT_TRANSACTIONS;
         writer.write_uint16(capabilities & 0xFFFF);                               // lower 2 bytes
         static_assert(SERVER_COLLATION_ID == static_cast<uint8_t>(character_set::UTF8MB4_BIN));
         writer.write_uint8(SERVER_COLLATION_ID); // the server's collation (protocol_const.hpp)

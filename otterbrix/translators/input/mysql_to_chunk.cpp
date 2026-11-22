@@ -8,6 +8,9 @@
 #include "utility/tracy_profiler.hpp"
 
 #include <components/casts/kernels/string_cast.hpp>
+#include <core/date/date_types.hpp>
+
+#include <chrono>
 
 #include <optional>
 #include <sstream>
@@ -32,6 +35,21 @@ namespace tsl {
                 column_index,
                 row_index,
                 static_cast<int8_t>(rows.at(row_index).at(column_index).as_int64()));
+            return parse_outcome::parsed;
+        }
+
+        // TINYINT(1), MySQL's BOOLEAN: any value but 0 is true (Connector/J's tinyInt1isBit), under the column's
+        // own signedness.
+        parse_outcome
+        set_tinyint_bool(data_chunk_t& chunk, const boost::mysql::rows_view& rows, size_t row_index, size_t column_index) {
+            const auto field = rows.at(row_index).at(column_index);
+            if (field.kind() == boost::mysql::field_kind::null) {
+                chunk.data[column_index].set_null(row_index, true);
+                return parse_outcome::parsed;
+            }
+            const bool value = field.kind() == boost::mysql::field_kind::uint64 ? field.as_uint64() != 0
+                                                                                 : field.as_int64() != 0;
+            chunk.set_value(column_index, row_index, value);
             return parse_outcome::parsed;
         }
 
@@ -212,128 +230,78 @@ namespace tsl {
             return parse_outcome::parsed;
         }
 
-        // `value` in at least `width` digits, zero-padded, as MySQL prints it.
-        void append_padded(std::string& out, uint64_t value, size_t width) {
-            char digits[20];
-            size_t count = 0;
-            do {
-                digits[count++] = static_cast<char>('0' + value % 10);
-                value /= 10;
-            } while (value != 0);
-            for (size_t pad = count; pad < width; ++pad) {
-                out.push_back('0');
+        // The date/time family as the engine's own types: DATE a DATE, DATETIME a TIMESTAMP (a wall clock, no
+        // zone), TIMESTAMP a TIMESTAMPTZ (an instant: MySQL keeps it in UTC and shows it in the session's
+        // time_zone, and every agent session reads it in UTC — backend_agent_t::check_session), TIME a TIME. A
+        // value the engine's type has no room for is refused, never altered (the statement's error names it): a
+        // zero or partial date ('0000-00-00', '2026-00-15'), which boost reads as an invalid date, and a TIME
+        // outside one day — MySQL's is a signed duration up to 838:59:59, the engine's a time of day.
+        std::optional<std::chrono::sys_days> calendar_day(int year, unsigned month, unsigned day) {
+            const std::chrono::year_month_day ymd{std::chrono::year{year}, std::chrono::month{month}, std::chrono::day{day}};
+            if (!ymd.ok()) {
+                return std::nullopt;
             }
-            while (count-- > 0) {
-                out.push_back(digits[count]);
-            }
+            return std::chrono::sys_days{ymd};
         }
 
-        // The date/time family is carried as the text MySQL itself prints, which
-        // is how such a column reaches a client: the engine has DATE / TIME /
-        // TIMESTAMP types, but neither wire frontend can encode one
-        // (frontend::{mysql,postgres}::get_field_type answers nullopt), so a
-        // column carried under them could not be served at all. ch_to_chunk reads
-        // the ClickHouse date/time family as text for the same reason. The fields
-        // are read one by one rather than through a time_point conversion, so
-        // MySQL's zero date ('0000-00-00', which boost reports as an invalid
-        // date) renders as itself instead of being a conversion the value has
-        // none of.
-        std::string date_text(const boost::mysql::date& value) {
-            std::string out;
-            out.reserve(10);
-            append_padded(out, value.year(), 4);
-            out.push_back('-');
-            append_padded(out, value.month(), 2);
-            out.push_back('-');
-            append_padded(out, value.day(), 2);
-            return out;
-        }
-
-        std::string datetime_text(const boost::mysql::datetime& value) {
-            std::string out;
-            out.reserve(26);
-            append_padded(out, value.year(), 4);
-            out.push_back('-');
-            append_padded(out, value.month(), 2);
-            out.push_back('-');
-            append_padded(out, value.day(), 2);
-            out.push_back(' ');
-            append_padded(out, value.hour(), 2);
-            out.push_back(':');
-            append_padded(out, value.minute(), 2);
-            out.push_back(':');
-            append_padded(out, value.second(), 2);
-            if (value.microsecond() != 0) {
-                out.push_back('.');
-                append_padded(out, value.microsecond(), 6);
+        std::optional<core::date::microseconds> datetime_micros(const boost::mysql::datetime& value) {
+            const auto day = calendar_day(value.year(), value.month(), value.day());
+            if (!day) {
+                return std::nullopt;
             }
-            return out;
-        }
-
-        // TIME is a signed duration, not a clock reading: MySQL's range is
-        // [-838:59:59, 838:59:59], so the hour field is not bounded by 24 and the
-        // sign belongs to the whole value. The magnitude is taken in unsigned
-        // arithmetic, so the most negative count — which has no positive
-        // counterpart — renders exactly instead of overflowing.
-        std::string time_text(boost::mysql::time value) {
-            std::string out;
-            out.reserve(17);
-            const auto micros = value.count();
-            uint64_t magnitude = 0;
-            if (micros < 0) {
-                out.push_back('-');
-                magnitude = ~static_cast<uint64_t>(micros) + 1u;
-            } else {
-                magnitude = static_cast<uint64_t>(micros);
-            }
-            const uint64_t fraction = magnitude % 1000000u;
-            const uint64_t seconds = magnitude / 1000000u;
-            append_padded(out, seconds / 3600u, 2);
-            out.push_back(':');
-            append_padded(out, (seconds / 60u) % 60u, 2);
-            out.push_back(':');
-            append_padded(out, seconds % 60u, 2);
-            if (fraction != 0) {
-                out.push_back('.');
-                append_padded(out, fraction, 6);
-            }
-            return out;
+            const core::date::microseconds time_of_day{
+                static_cast<int64_t>(value.hour()) * 3'600'000'000 + static_cast<int64_t>(value.minute()) * 60'000'000 +
+                static_cast<int64_t>(value.second()) * 1'000'000 + static_cast<int64_t>(value.microsecond())};
+            return core::date::from_sys_days_us(*day, time_of_day);
         }
 
         parse_outcome set_date(data_chunk_t& chunk, const boost::mysql::rows_view& rows, size_t row_index, size_t column_index) {
-            if (rows.at(row_index).at(column_index).kind() == boost::mysql::field_kind::null) {
+            const auto field = rows.at(row_index).at(column_index);
+            if (field.kind() == boost::mysql::field_kind::null) {
                 chunk.data[column_index].set_null(row_index, true);
                 return parse_outcome::parsed;
             }
-            chunk.set_value(
-                column_index,
-                row_index,
-                std::string_view{date_text(rows.at(row_index).at(column_index).as_date())});
+            const auto value = field.as_date();
+            const auto day = calendar_day(value.year(), value.month(), value.day());
+            if (!day) {
+                return parse_outcome::out_of_range;
+            }
+            chunk.data[column_index].set_value(row_index, core::date::from_sys_days(*day));
             return parse_outcome::parsed;
         }
 
+        // DATETIME: a TIMESTAMP; MySQL's TIMESTAMP (`instant`): a TIMESTAMPTZ, the fields being UTC's.
+        template<bool instant>
         parse_outcome
         set_datetime(data_chunk_t& chunk, const boost::mysql::rows_view& rows, size_t row_index, size_t column_index) {
-            if (rows.at(row_index).at(column_index).kind() == boost::mysql::field_kind::null) {
+            const auto field = rows.at(row_index).at(column_index);
+            if (field.kind() == boost::mysql::field_kind::null) {
                 chunk.data[column_index].set_null(row_index, true);
                 return parse_outcome::parsed;
             }
-            chunk.set_value(
-                column_index,
-                row_index,
-                std::string_view{datetime_text(rows.at(row_index).at(column_index).as_datetime())});
+            const auto micros = datetime_micros(field.as_datetime());
+            if (!micros) {
+                return parse_outcome::out_of_range;
+            }
+            if constexpr (instant) {
+                chunk.data[column_index].set_value(row_index, core::date::timestamptz_t{*micros});
+            } else {
+                chunk.data[column_index].set_value(row_index, core::date::timestamp_t{*micros});
+            }
             return parse_outcome::parsed;
         }
 
         parse_outcome set_time(data_chunk_t& chunk, const boost::mysql::rows_view& rows, size_t row_index, size_t column_index) {
-            if (rows.at(row_index).at(column_index).kind() == boost::mysql::field_kind::null) {
+            const auto field = rows.at(row_index).at(column_index);
+            if (field.kind() == boost::mysql::field_kind::null) {
                 chunk.data[column_index].set_null(row_index, true);
                 return parse_outcome::parsed;
             }
-            chunk.set_value(
-                column_index,
-                row_index,
-                std::string_view{time_text(rows.at(row_index).at(column_index).as_time())});
+            const auto micros = field.as_time().count();
+            if (micros < 0 || micros >= 86'400'000'000) {
+                return parse_outcome::out_of_range;
+            }
+            chunk.data[column_index].set_value(row_index, core::date::time_t{core::date::microseconds{micros}});
             return parse_outcome::parsed;
         }
 
@@ -361,6 +329,12 @@ namespace tsl {
         std::optional<value_translator_t> to_local_translator(const boost::mysql::metadata& column, bool is_signed) {
             switch (column.type()) {
                 case boost::mysql::column_type::tinyint: {
+                    // TINYINT(1) is how MySQL / MariaDB spell BOOLEAN (BOOL, a Django BooleanField): a display
+                    // width of 1 in the column definition. Every other TINYINT is an integer.
+                    if (column.column_length() == 1) {
+                        return value_translator_t{set_tinyint_bool,
+                                                  {types::logical_type::BOOLEAN, column.column_name()}};
+                    }
                     if (is_signed) {
                         // spdlog::debug("Set int8 handler");
                         return value_translator_t{set_int8, {types::logical_type::TINYINT, column.column_name()}};
@@ -430,7 +404,7 @@ namespace tsl {
                     if (auto decimal = decimal_type(precision, scale, column.column_name())) {
                         return value_translator_t{set_decimal, std::move(*decimal)};
                     }
-                    return value_translator_t{set_string, {types::logical_type::STRING_LITERAL, column.column_name()}};
+                    return value_translator_t{set_string, {types::logical_type::TEXT, column.column_name()}};
                 }
                 // Every type the wire sends as a string: ENUM and SET arrive as the label
                 // text, JSON as the document text.
@@ -441,7 +415,7 @@ namespace tsl {
                 case boost::mysql::column_type::set:
                 case boost::mysql::column_type::json: {
                     // spdlog::debug("Set string handler");
-                    return value_translator_t{set_string, {types::logical_type::STRING_LITERAL, column.column_name()}};
+                    return value_translator_t{set_string, {types::logical_type::TEXT, column.column_name()}};
                 }
                 // Every type the wire sends as a binary string. GEOMETRY is read
                 // as the WKB bytes of the value, which is what MySQL sends for it.
@@ -450,22 +424,18 @@ namespace tsl {
                 case boost::mysql::column_type::blob:
                 case boost::mysql::column_type::geometry: {
                     // spdlog::debug("Set blob handler");
-                    return value_translator_t{set_blob, {types::logical_type::STRING_LITERAL, column.column_name()}};
+                    return value_translator_t{set_blob, {types::logical_type::TEXT, column.column_name()}};
                 }
-                case boost::mysql::column_type::date: {
-                    // spdlog::debug("Set date handler");
-                    return value_translator_t{set_date, {types::logical_type::STRING_LITERAL, column.column_name()}};
-                }
+                case boost::mysql::column_type::date:
+                    return value_translator_t{set_date, {types::logical_type::DATE, column.column_name()}};
                 case boost::mysql::column_type::datetime:
-                case boost::mysql::column_type::timestamp: {
-                    // spdlog::debug("Set datetime handler");
-                    return value_translator_t{set_datetime,
-                                              {types::logical_type::STRING_LITERAL, column.column_name()}};
-                }
-                case boost::mysql::column_type::time: {
-                    // spdlog::debug("Set time handler");
-                    return value_translator_t{set_time, {types::logical_type::STRING_LITERAL, column.column_name()}};
-                }
+                    return value_translator_t{set_datetime<false>,
+                                              {types::logical_type::TIMESTAMP, column.column_name()}};
+                case boost::mysql::column_type::timestamp:
+                    return value_translator_t{set_datetime<true>,
+                                              {types::logical_type::TIMESTAMP_TZ, column.column_name()}};
+                case boost::mysql::column_type::time:
+                    return value_translator_t{set_time, {types::logical_type::TIME, column.column_name()}};
                 default:
                     return std::nullopt;
             }

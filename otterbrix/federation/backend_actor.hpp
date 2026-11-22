@@ -17,11 +17,12 @@
 #include <actor-zeta/mailbox/message.hpp>
 #include <actor-zeta/scheduler/sharing_scheduler.hpp>
 
-#include <components/casts/cast_registry.hpp>
+#include <components//casts/cast_registry.hpp>
 #include <components/logical_plan/detached_block.hpp>
 #include <components/planner/host_hooks.hpp>
 #include <components/session/session.hpp>
 #include <components/vector/data_chunk.hpp>
+#include <core/date/time_zone.hpp>
 #include <services/disk/storage_contract.hpp>
 #include <services/loop_thread.hpp>
 
@@ -91,6 +92,7 @@ namespace otterstax::federation {
     class backend_agent_t;
     using backend_agent_ptr = std::unique_ptr<backend_agent_t, actor_zeta::pmr::deleter_t>;
     enum class write_kind_t : std::uint8_t;
+    struct write_answer_t;
     enum class transaction_step_t : std::uint8_t;
 
     // A connection of config.yaml as the actor serves it.
@@ -471,9 +473,9 @@ namespace otterstax::federation {
              std::string sql,
              std::vector<std::optional<std::string>> declared,
              std::vector<components::types::complex_logical_type> types,
-             core::date::timezone_offset_t timezone);
+             core::date::time_zone_t timezone);
         // `strict_store`: the statement relies on a strict sql_mode (sql_gen::statement_needs_t).
-        unique_future<core::result_wrapper_t<std::uint64_t>> write(std::optional<uint64_t> transaction,
+        unique_future<core::result_wrapper_t<write_answer_t>> write(std::optional<uint64_t> transaction,
                                                                    session_id_t session,
                                                                    std::string sql,
                                                                    write_kind_t kind,

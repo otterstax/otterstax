@@ -8,6 +8,7 @@
 #include "frontend/postgres_server/postgres_server.hpp"
 #include "frontend/spark_connect_server/plan_translator/relation_to_plan.hpp"
 #include "raw_wire_client.hpp"
+#include "utility/server_version.hpp"
 
 #include <spark/connect/relations.pb.h>
 
@@ -44,7 +45,7 @@ namespace {
                         line += std::to_string(v.get_value<std::int64_t>(r));
                     } else if (type == logical_type::UBIGINT) {
                         line += std::to_string(v.get_value<std::uint64_t>(r));
-                    } else if (type == logical_type::STRING_LITERAL) {
+                    } else if (type == logical_type::TEXT) {
                         line += std::string{v.get_value<std::string_view>(r)};
                     } else {
                         line += "<type " + std::to_string(static_cast<int>(type)) + ">";
@@ -67,7 +68,7 @@ namespace {
                 "",
                 "orders",
                 {column("id", logical_type::BIGINT),
-                 column("customer", logical_type::STRING_LITERAL),
+                 column("customer", logical_type::TEXT),
                  column("amount", logical_type::BIGINT)},
                 {{std::int64_t{1}, std::string{"ann"}, std::int64_t{10}},
                  {std::int64_t{2}, std::string{"bob"}, std::int64_t{20}},
@@ -81,7 +82,7 @@ namespace {
         return {"shop_db",
                 "shop",
                 "customers",
-                {column("id", logical_type::BIGINT), column("name", logical_type::STRING_LITERAL)},
+                {column("id", logical_type::BIGINT), column("name", logical_type::TEXT)},
                 {{std::int64_t{1}, std::string{"ann"}},
                  {std::int64_t{2}, std::string{"bob"}},
                  {std::int64_t{3}, std::string{"cid"}}}};
@@ -176,6 +177,7 @@ namespace {
         session_stack stack() const { return owner_.stack(); }
         session_hash_t next_id() { return id_++; }
         std::vector<std::string> sent(const char* alias) { return servers_.sent(alias); }
+        fakebackend::fake_backend_t& server(const char* alias) { return servers_.server(alias); }
 
         static constexpr std::array<const char*, 3> aliases() { return {"my", "pg", "pg_sales"}; }
 
@@ -496,4 +498,206 @@ TEST_CASE("connection names: a namespace statement lands in local") {
     for (const char* alias : names_t::aliases()) {
         CHECK(f.sent(alias).empty());
     }
+}
+
+// An ORM's one schema slot is quoted whole: "pg.shop"."customers" is pg.shop.customers. The MySQL frontend writes a
+// backquoted `my.bill` so too.
+TEST_CASE("connection names: a quoted connection.namespace qualifier names the table") {
+    names_t f("otterstax_cn_dotted");
+    f.reaches(R"(SELECT id FROM "pg.shop"."customers";)", "pg", pg_table("shop", "customers"));
+    CHECK(sorted(f.rows(R"(SELECT "pg.shop".customers.id FROM "pg.shop".customers;)")) == rows_t{"1", "2", "3"});
+    f.reaches(R"(SELECT id FROM "my.bill".orders;)", "my", my_table("bill", "orders"));
+    CHECK(sorted(f.rows(R"(SELECT label FROM "local.eg".regions;)")) == rows_t{"ann", "bob"});
+    // An alias keeps its dots.
+    CHECK(f.rows(R"(SELECT count(*) AS "pg.total" FROM "pg.shop".customers;)") == rows_t{"3"});
+    {
+        auto payload = f.ok(R"(SELECT id AS "pg.id" FROM "pg.shop".customers WHERE id = 1;)");
+        REQUIRE_FALSE(payload.chunks.empty());
+        REQUIRE(payload.chunks.front().column_count() == 1);
+        const auto& type = payload.chunks.front().data[0].type();
+        REQUIRE(type.has_alias());
+        CHECK(type.alias() == "pg.id");
+    }
+    // A first segment that names no connection stays one identifier, named whole by the refusal.
+    f.ok("SET search_path = 'local.public';");
+    const auto nope = f.refused(R"(SELECT id FROM "nope.shop".customers;)");
+    INFO(nope.what.c_str());
+    CHECK(std::string{nope.what.c_str()}.find("nope.shop") != std::string::npos);
+
+    // The MySQL wire.
+    frontend::frontend_server_config config{.resource = f.stack().resource,
+                                            .port = 0,
+                                            .sessions = f.stack().sessions,
+                                            .read_timeout = std::chrono::seconds(frontend::CONNECTION_TIMEOUT_SEC),
+                                            .accept_retry_delay =
+                                                std::chrono::milliseconds(frontend::ACCEPT_RETRY_DELAY_MS),
+                                            .pool_size = 2};
+    frontend::mysql::mysql_server mysql(config);
+    mysql.start();
+    wire::raw_client my(mysql.local_port());
+    wire::mysql_handshake(my);
+    const std::string sql = "SELECT id FROM `my.bill`.orders";
+    std::vector<uint8_t> payload{0x03};
+    payload.insert(payload.end(), sql.begin(), sql.end());
+    my.write(wire::mysql_frame(0, payload));
+    const auto first = wire::mysql_read_packet(my);
+    REQUIRE_FALSE(first.empty());
+    CHECK(first[0] == 0x01); // one column, not ERR (0xff)
+    mysql.stop();
+}
+
+// A MySQL INSERT's generated id (the backend's last_insert_id, otterbrix's write receipt and cursor) is the session's
+// generated_id and the MySQL wire's OK packet's last_insert_id; a local table or another dialect generates none.
+TEST_CASE("connection names: a MySQL INSERT answers the id its backend generated") {
+    names_t f("otterstax_cn_insert_id");
+    f.server("my").set_next_insert_id(100);
+    auto two = f.ok("INSERT INTO my.bill.orders (id, customer, amount) VALUES (4, 'dan', 1), (5, 'eve', 2);");
+    CHECK(two.affected_rows == 2);
+    CHECK(two.generated_id == 100);
+    CHECK(f.ok("INSERT INTO local.eg.regions (id, label) VALUES (3, 'cid');").generated_id == 0);
+    f.server("pg").set_next_insert_id(7);
+    CHECK(f.ok("INSERT INTO pg.shop.t (id) VALUES (9);").generated_id == 0);
+    CHECK(f.ok("SELECT id FROM my.bill.orders;").generated_id == 0);
+
+    // The MySQL wire: OK packet [0x00][affected_rows][last_insert_id]..., each length-encoded.
+    frontend::frontend_server_config config{.resource = f.stack().resource,
+                                            .port = 0,
+                                            .sessions = f.stack().sessions,
+                                            .read_timeout = std::chrono::seconds(frontend::CONNECTION_TIMEOUT_SEC),
+                                            .accept_retry_delay =
+                                                std::chrono::milliseconds(frontend::ACCEPT_RETRY_DELAY_MS),
+                                            .pool_size = 2};
+    frontend::mysql::mysql_server mysql(config);
+    mysql.start();
+    wire::raw_client my(mysql.local_port());
+    wire::mysql_handshake(my);
+    const std::string sql = "INSERT INTO my.bill.orders (id, customer, amount) VALUES (6, 'fay', 3)";
+    std::vector<uint8_t> payload{0x03};
+    payload.insert(payload.end(), sql.begin(), sql.end());
+    my.write(wire::mysql_frame(0, payload));
+    const auto ok = wire::mysql_read_packet(my);
+    REQUIRE(ok.size() >= 3);
+    CHECK(ok[0] == 0x00);
+    CHECK(ok[1] == 1);   // affected rows
+    CHECK(ok[2] == 102); // last_insert_id: 100 and 101 went to the session's INSERT
+    mysql.stop();
+}
+
+// version() and pg_catalog.version() (SQLAlchemy's PostgreSQL dialects on connect) answer from any place: the
+// session writes them local.public.version() (catalog::qualify_host_calls), pg_catalog holding no host function.
+TEST_CASE("connection names: version() answers from any place") {
+    names_t f("otterstax_cn_version");
+    for (const char* place : {"SET search_path = 'pg.shop';", "SET search_path = 'my.bill';",
+                              "SET search_path = 'local.eg';", "SET search_path = '';"}) {
+        INFO(place);
+        f.ok(place);
+        CHECK(f.rows("SELECT version();") == rows_t{std::string{otterstax::version_text}});
+        CHECK(f.rows("select pg_catalog.version()") == rows_t{std::string{otterstax::version_text}});
+    }
+}
+
+// The MySQL wire over a connection's table: SHOW CREATE TABLE from the catalog (no backend asked), DATABASE() the
+// connection namespace USE named.
+TEST_CASE("connection names: SHOW CREATE TABLE and DATABASE() over a connection") {
+    names_t f("otterstax_cn_show_create");
+    frontend::frontend_server_config config{.resource = f.stack().resource,
+                                            .port = 0,
+                                            .sessions = f.stack().sessions,
+                                            .read_timeout = std::chrono::seconds(frontend::CONNECTION_TIMEOUT_SEC),
+                                            .accept_retry_delay =
+                                                std::chrono::milliseconds(frontend::ACCEPT_RETRY_DELAY_MS),
+                                            .pool_size = 2};
+    frontend::mysql::mysql_server mysql(config);
+    mysql.start();
+    wire::raw_client my(mysql.local_port());
+    wire::mysql_handshake(my);
+    const auto first_cell = [&](const std::string& sql) {
+        std::vector<uint8_t> payload{0x03};
+        payload.insert(payload.end(), sql.begin(), sql.end());
+        my.write(wire::mysql_frame(0, payload));
+        auto head = wire::mysql_read_packet(my);
+        REQUIRE_FALSE(head.empty());
+        REQUIRE(head[0] != 0xFF);
+        for (uint8_t c = 0; c < head[0]; ++c) {
+            wire::mysql_read_packet(my); // column definitions
+        }
+        wire::mysql_read_packet(my); // EOF
+        std::vector<std::string> cells;
+        for (;;) {
+            auto row = wire::mysql_read_packet(my);
+            if (row.size() == 5 && row[0] == 0xFE) {
+                break;
+            }
+            // Length-encoded cells: < 251 one byte, 0xFC two bytes.
+            size_t at = 0;
+            while (at < row.size()) {
+                size_t length = row[at];
+                at += 1;
+                if (length == 0xFC) {
+                    length = row[at] | (row[at + 1] << 8);
+                    at += 2;
+                }
+                cells.emplace_back(row.begin() + static_cast<std::ptrdiff_t>(at),
+                                   row.begin() + static_cast<std::ptrdiff_t>(at + length));
+                at += length;
+            }
+        }
+        return cells;
+    };
+    const auto shown = first_cell("SHOW CREATE TABLE my.bill.orders");
+    REQUIRE(shown.size() == 2);
+    CHECK(shown[1] == "CREATE TABLE `orders` (\n"
+                      "  `id` bigint,\n"
+                      "  `customer` text,\n"
+                      "  `amount` bigint\n"
+                      ") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin");
+    CHECK(f.sent("my").empty()); // the catalog's, no SQL to the backend
+    std::vector<uint8_t> use{0x03};
+    const std::string use_sql = "USE my.bill";
+    use.insert(use.end(), use_sql.begin(), use_sql.end());
+    my.write(wire::mysql_frame(0, use));
+    REQUIRE(wire::mysql_read_packet(my)[0] == 0x00);
+    CHECK(first_cell("SELECT DATABASE()") == std::vector<std::string>{"bill"});
+    mysql.stop();
+}
+
+// PostgreSQL's catalog functions Django's introspection calls, the host's until the engine has them.
+TEST_CASE("connection names: the host's catalog functions answer from any place") {
+    names_t f("otterstax_cn_catalog_functions");
+    f.ok("SET search_path = 'pg.shop';");
+    // As Django writes it: pg_table_is_visible a predicate, obj_description a column.
+    CHECK(f.rows("SELECT c.relname, obj_description(c.oid, 'pg_class') FROM pg_catalog.pg_class c "
+                 "WHERE c.relname = 'customers' AND pg_catalog.pg_table_is_visible(c.oid);") ==
+          rows_t{"customers|null"});
+    // Visible: the place's schema and pg_catalog — never OtterStax's own tables (federation.public.remote_names),
+    // another connection's or another schema's.
+    const auto visible_names = [&] {
+        return f.rows("SELECT c.relname FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON "
+                      "c.relnamespace = n.oid WHERE c.relkind = 'r' AND n.nspname <> 'pg_catalog' AND "
+                      "pg_table_is_visible(c.oid) ORDER BY c.relname;");
+    };
+    CHECK(visible_names() == rows_t{"customers", "t"}); // pg.shop's — never pg_sales.sales.t
+    CHECK(f.rows("SELECT count(*) FROM pg_catalog.pg_class c WHERE c.relname = 'pg_class' AND "
+                 "pg_table_is_visible(c.oid);") == rows_t{"1"});
+    f.ok("SET search_path = 'local.public';");
+    CHECK(visible_names().empty()); // local.public holds no table here
+    CHECK(f.rows("SELECT col_description(c.oid, 1) FROM pg_catalog.pg_class c WHERE c.relname = 'customers';") ==
+          rows_t{"null"});
+}
+
+// A query block without FROM that filters, at every depth, answers as PostgreSQL does (the session's parser gives it a
+// one-row source: give_fromless_filters_a_row; straight on the engine it aborts the process,
+// [.engine-defect-fromless-where]) — the server keeps serving.
+TEST_CASE("connection names: a query block without FROM that filters") {
+    names_t f("otterstax_cn_fromless_where");
+    f.ok("SET search_path = 'pg.shop';");
+    CHECK(f.rows("SELECT 1 WHERE true;") == rows_t{"1"});
+    CHECK(f.rows("SELECT 1 WHERE false;").empty());
+    CHECK(f.rows("SELECT count(*) WHERE false;") == rows_t{"0"});
+    CHECK(f.rows("SELECT 1 WHERE EXISTS (SELECT id FROM pg.shop.customers);") == rows_t{"1"});
+    CHECK(f.rows("SELECT id FROM pg.shop.t WHERE EXISTS (SELECT 1 WHERE true);") == rows_t{"5"});
+    CHECK(f.rows("SELECT (SELECT 7 WHERE true);") == rows_t{"7"});
+    CHECK(f.rows("SELECT 1 UNION ALL SELECT 2 WHERE false;") == rows_t{"1"});
+    CHECK(f.rows("WITH a AS (SELECT 3 AS x WHERE 1 = 1) SELECT x FROM a;") == rows_t{"3"});
+    CHECK(f.rows("SELECT 1;") == rows_t{"1"}); // and the session serves on
 }

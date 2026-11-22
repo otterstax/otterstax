@@ -27,6 +27,8 @@ namespace frontend::mysql {
                         std::string table = "");
 
         void add_chunk_columns(const components::vector::data_chunk_t& chunk);
+        // The session's time zone, which a TIMESTAMPTZ (MySQL's TIMESTAMP) is shown in; UTC until set.
+        void set_time_zone(core::date::time_zone_t zone) { time_zone_ = std::move(zone); }
 
         void add_row(const components::vector::data_chunk_t& chunk, size_t row_index);
 
@@ -50,6 +52,7 @@ namespace frontend::mysql {
         std::string database_;
         std::string table_;
         result_encoding encoding_;
+        core::date::time_zone_t time_zone_;
     };
 
 } // namespace frontend::mysql

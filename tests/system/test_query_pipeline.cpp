@@ -188,7 +188,7 @@ TEST_CASE("describe: a SELECT is described by the engine, its parameters typed")
     REQUIRE(schema.type() == types::logical_type::STRUCT);
     REQUIRE(schema.child_types().size() == 2);
     CHECK(schema.child_types()[0].alias() == "campaign_name");
-    CHECK(schema.child_types()[0].type() == types::logical_type::STRING_LITERAL);
+    CHECK(schema.child_types()[0].type() == types::logical_type::TEXT);
     CHECK(schema.child_types()[1].alias() == "budget");
     CHECK(schema.child_types()[1].type() == types::logical_type::DOUBLE);
     REQUIRE(described.value().parameter_count == 1);
@@ -226,5 +226,5 @@ TEST_CASE("describe: a SELECT of a connection's table is typed from its catalog 
     CHECK(schema.child_types()[0].alias() == "id");
     CHECK(schema.child_types()[0].type() == types::logical_type::INTEGER);
     CHECK(schema.child_types()[1].alias() == "name");
-    CHECK(schema.child_types()[1].type() == types::logical_type::STRING_LITERAL);
+    CHECK(schema.child_types()[1].type() == types::logical_type::TEXT);
 }

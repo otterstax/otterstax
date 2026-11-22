@@ -26,6 +26,7 @@ set(MYSQL_SERVER_SOURCES
      packet/packet_utils.cpp
      protocol/lexer.cpp
      protocol/protocol_statement.cpp
+     protocol/show_create_table.cpp
      resultset/column_definition_41.cpp
      resultset/mysql_resultset.cpp
      connection/mysql_connection.cpp

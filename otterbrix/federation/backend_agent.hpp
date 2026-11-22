@@ -52,6 +52,14 @@ namespace otterstax::federation {
         delete_
     };
 
+    // What a write did: the rows it wrote (write's count), and of a MySQL INSERT the first value the backend
+    // generated for an AUTO_INCREMENT column (the OK packet's last_insert_id, MySQL's LAST_INSERT_ID), 0 when it
+    // generated none or for any other write.
+    struct write_answer_t {
+        std::uint64_t count{0};
+        std::uint64_t generated_id{0};
+    };
+
     // One step of the backend transaction an engine transaction holds on its agent. commit /
     // rollback / unpin end it (unpin: a transaction that only read, no BEGIN was sent);
     // savepoint / rollback_to_savepoint / release_savepoint name the savepoint `savepoint`.
@@ -165,7 +173,7 @@ namespace otterstax::federation {
         // nothing sent, on a MySQL session whose sql_mode is not. `table`: the table an UPDATE /
         // DELETE writes, as the generator names it (ClickHouse: database.table), where a ClickHouse
         // mutation that failed is killed (write_ch).
-        unique_future<core::result_wrapper_t<std::uint64_t>>
+        unique_future<core::result_wrapper_t<write_answer_t>>
         write(std::string sql, write_kind_t kind, bool strict_store, qualified_name_t table);
         // One transaction step (transaction_statement). A failed COMMIT / ROLLBACK replaces the
         // connection's session (close, reconnect: the backend rolls back what it held); an unpin
@@ -224,7 +232,7 @@ namespace otterstax::federation {
         rows_t read_ch(ch::IConnector& connector,
                        const std::string& sql,
                        const std::vector<std::optional<std::string>>& declared);
-        core::result_wrapper_t<std::uint64_t>
+        core::result_wrapper_t<write_answer_t>
         write_mysql(mysql::IConnector& connector, const std::string& sql, write_kind_t kind);
         core::result_wrapper_t<std::uint64_t> write_pg(pg::IConnector& connector, const std::string& sql);
         core::result_wrapper_t<std::uint64_t>

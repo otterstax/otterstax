@@ -256,7 +256,7 @@ namespace fedtest {
                         case logical_type::DOUBLE:
                             line += std::to_string(v.get_value<double>(r));
                             break;
-                        case logical_type::STRING_LITERAL:
+                        case logical_type::TEXT:
                             line += std::string{v.get_value<std::string_view>(r)};
                             break;
                         default:

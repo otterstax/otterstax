@@ -269,7 +269,7 @@ namespace {
         return remote;
     }
 
-    constexpr fed::oid_t table_oid = 100;
+    constexpr fed::oid_t table_oid{100};
 
     // The startup discovery's table (id, name) handed to the connection's actor, as the
     // registration does once the engine is open (oid `table_oid`).
@@ -290,11 +290,11 @@ namespace {
                                            container,
                                            table.name.collection.t,
                                            {}};
-        fed::oid_t attoid = 1;
+        std::uint32_t attoid = 1;
         for (const auto& column : table.schema.child_types()) {
             const auto type = table.remote_types.find(column.alias());
             registered.columns.push_back(
-                fed::registered_column_t{attoid++,
+                fed::registered_column_t{fed::oid_t{attoid++},
                                          column.alias(),
                                          column,
                                          column.alias(),

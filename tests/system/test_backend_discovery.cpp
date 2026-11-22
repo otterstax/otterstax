@@ -316,7 +316,7 @@ TEST_CASE("ClickHouse discovery: a rediscovered table carries the backend's curr
     INFO(opened.what.c_str());
     REQUIRE_FALSE(opened.contains_error());
     REQUIRE(stack.remote.discovered().size() == 1);
-    REQUIRE(column_t_type(stack.remote.discovered().front().tables) == components::types::logical_type::STRING_LITERAL);
+    REQUIRE(column_t_type(stack.remote.discovered().front().tables) == components::types::logical_type::TEXT);
 
     // The backend now reports a named tuple for the same column: the override
     // must shape the discovered schema, and the entry seen first must not win.

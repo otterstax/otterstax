@@ -78,6 +78,15 @@ public:
     virtual core::result_wrapper_t<ParsedQueryDataPtr> parse(const std::string& sql) = 0;
 };
 
+// A query block without FROM that filters — `SELECT 1 WHERE p`, at any depth: a sub-query, a CTE, a set operation's
+// branch, an INSERT … SELECT — is a source-less aggregate with a match, and otterbrix rc-7 aborts the whole process
+// opening it (operator_t::open_impl, an abort(); `[.engine-defect-fromless-where]`). Such a block is given the one-row
+// source PostgreSQL reads it over — `$raw_data` of one row of one hidden column, the shape `FROM (VALUES (1))` plans to —
+// which changes no answer: the filter keeps the one row or none. Every plan of `plan` (its sub-queries too). Run on
+// every finalized plan (GreenplumParser::parse, query_session_t::parse_bound); drop once the engine opens the
+// source-less filter itself.
+void give_fromless_filters_a_row(components::logical_plan::execution_plan_t& plan);
+
 class GreenplumParser : public IParser {
 public:
     explicit GreenplumParser(std::pmr::memory_resource* resource);

@@ -51,13 +51,13 @@ def main(local=False):
 
     # CH type mappings (from ch_to_chunk.cpp):
     # Int64 → BIGINT → int64, Int32 → INTEGER → int32
-    # String/DateTime → STRING_LITERAL → string, Float64 → DOUBLE → float64
+    # String → TEXT → string, DateTime → TIMESTAMPTZ → timestamp[us, UTC], Float64 → DOUBLE → float64
     expected_orders = {
         'order_id':      pa.int64(),
         'campaign_id':   pa.int32(),
         'product_id':    pa.int32(),
         'customer_name': pa.string(),
-        'order_date':    pa.string(),
+        'order_date':    pa.timestamp('us', tz='UTC'),
         'quantity':      pa.int32(),
         'total_amount':  pa.float64(),
     }

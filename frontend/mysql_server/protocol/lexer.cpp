@@ -601,9 +601,240 @@ namespace frontend::mysql {
         return tokens;
     }
 
+    namespace {
+        // MySQL's `LIMIT offset, count` (SQLAlchemy's MySQL dialect renders limit + offset so) written as
+        // `OFFSET offset LIMIT count`, which the engine's grammar reads: the two values keep their order, so a `?`
+        // of each binds as MySQL binds it. Each value is a number or a `?`; any other text is as it was.
+        std::string limit_offset_form(std::string_view sql) {
+            const auto tokens = tokenize(sql);
+            if (!tokens) {
+                return std::string{sql}; // the engine's form refuses it
+            }
+            const auto& t = *tokens;
+            const auto value = [&](std::size_t i) {
+                return i < t.size() &&
+                       (t[i].kind == token_kind::number || (t[i].kind == token_kind::punct && t[i].value == "?"));
+            };
+            std::string out;
+            std::size_t copied = 0;
+            for (std::size_t i = 0; i + 3 < t.size(); ++i) {
+                if (t[i].kind != token_kind::word || t[i].value != "limit" || !value(i + 1) ||
+                    t[i + 2].kind != token_kind::punct || t[i + 2].value != "," || !value(i + 3)) {
+                    continue;
+                }
+                out.append(sql.substr(copied, t[i].begin - copied));
+                out.append("OFFSET ");
+                out.append(sql.substr(t[i + 1].begin, t[i + 1].end - t[i + 1].begin));
+                out.append(" LIMIT ");
+                out.append(sql.substr(t[i + 3].begin, t[i + 3].end - t[i + 3].begin));
+                copied = t[i + 3].end;
+                i += 3;
+            }
+            if (copied == 0) {
+                return std::string{sql};
+            }
+            out.append(sql.substr(copied));
+            return out;
+        }
+
+        // MySQL's DDL spelling in a CREATE [TEMPORARY] TABLE / ALTER TABLE, written as the engine's: what only
+        // names MySQL's storage or display goes, a type the engine names otherwise is renamed, and a form it has
+        // nothing for is refused with its reason (a syntax error would say less). Django's and SQLAlchemy's MySQL
+        // DDL carries all of them.
+        //   - a column's type (the word after its name: after `(` / `,` of the column list, ADD / MODIFY
+        //     [COLUMN], CHANGE [COLUMN] <old>): longtext / mediumtext / tinytext text, datetime[(p)] timestamp
+        //     (the engine's microseconds), tinyint(1) boolean (as a backend's TINYINT(1) is read), mediumint
+        //     integer, an integer's display width (`int(11)`) dropped;
+        //   - a column's CHARACTER SET / CHARSET <utf-8 charset> and COMMENT '<text>' dropped (the engine stores
+        //     UTF-8, OtterStax keeps no comment); AUTO_INCREMENT refused (the engine has no identity column yet);
+        //   - the table options after the column list — [DEFAULT] {ENGINE | CHARSET | CHARACTER SET | COLLATE |
+        //     AUTO_INCREMENT | ROW_FORMAT | COMMENT | KEY_BLOCK_SIZE} [=] <value> — dropped: every table is the
+        //     engine's; a charset that is not utf-8 or a collation that is not binary refused, as everywhere.
+        std::variant<std::string, text_refusal_t> mysql_ddl_form(std::string_view sql) {
+            const auto tokens = tokenize(sql);
+            if (!tokens || tokens->size() < 3) {
+                return std::string{sql};
+            }
+            const auto& t = *tokens;
+            const auto word = [&](std::size_t i, std::string_view w) {
+                return i < t.size() && t[i].kind == token_kind::word && t[i].value == w;
+            };
+            const auto punct = [&](std::size_t i, std::string_view p) {
+                return i < t.size() && t[i].kind == token_kind::punct && t[i].value == p;
+            };
+            const auto is_name = [&](std::size_t i) {
+                return i < t.size() && (t[i].kind == token_kind::word || t[i].kind == token_kind::quoted_identifier);
+            };
+            std::size_t k = 1;
+            const bool create = word(0, "create");
+            if (create && word(1, "temporary")) {
+                k = 2;
+            }
+            if (!(create || word(0, "alter")) || !word(k, "table")) {
+                return std::string{sql};
+            }
+            const auto utf8_charset = [](std::string_view name) {
+                return name == "utf8mb4" || name == "utf8mb3" || name == "utf8";
+            };
+            const auto charset_refusal = [](const std::string& name) {
+                return text_refusal_t{mysql_error::ER_NOT_SUPPORTED_YET,
+                                      "CHARACTER SET " + name + " is not supported: the server stores UTF-8 text"};
+            };
+            struct edit_t {
+                std::size_t begin;
+                std::size_t end;
+                std::string text;
+            };
+            std::vector<edit_t> edits;
+            const auto drop = [&](std::size_t first, std::size_t last) { // tokens first..last, inclusive
+                edits.push_back({t[first].begin, t[last].end, " "});
+            };
+            std::size_t depth = 0;
+            std::size_t list_end = t.size(); // CREATE TABLE: the token closing the column list
+            for (std::size_t i = k + 1; i < t.size(); ++i) {
+                if (punct(i, "(")) {
+                    ++depth;
+                    continue;
+                }
+                if (punct(i, ")")) {
+                    if (depth > 0 && --depth == 0 && create && list_end == t.size()) {
+                        list_end = i;
+                        break;
+                    }
+                    continue;
+                }
+                if (t[i].kind != token_kind::word) {
+                    continue;
+                }
+                // A column's type: the word after the column's name.
+                const bool type_position =
+                    i >= 2 && is_name(i - 1) &&
+                    ((depth == 1 && (punct(i - 2, "(") || punct(i - 2, ","))) || word(i - 2, "add") ||
+                     word(i - 2, "modify") || (word(i - 2, "column") && !word(i - 3, "change")) ||
+                     (i >= 3 && is_name(i - 2) && (word(i - 3, "change") || (word(i - 3, "column") && word(i - 4, "change")))));
+                const bool constraint = i >= 1 && (word(i - 1, "primary") || word(i - 1, "key") || word(i - 1, "index") ||
+                                                   word(i - 1, "unique") || word(i - 1, "constraint") ||
+                                                   word(i - 1, "foreign") || word(i - 1, "check"));
+                if (type_position && !constraint) {
+                    const auto& type = t[i].value;
+                    // `(n)` after the type: its width (one number).
+                    const bool width = punct(i + 1, "(") && i + 3 < t.size() && t[i + 2].kind == token_kind::number &&
+                                       punct(i + 3, ")");
+                    if (type == "longtext" || type == "mediumtext" || type == "tinytext") {
+                        edits.push_back({t[i].begin, t[i].end, "text"});
+                    } else if (type == "datetime") {
+                        edits.push_back({t[i].begin, width ? t[i + 3].end : t[i].end, "timestamp"});
+                    } else if (type == "tinyint" && width && t[i + 2].value == "1") {
+                        edits.push_back({t[i].begin, t[i + 3].end, "boolean"});
+                    } else if (type == "mediumint") {
+                        edits.push_back({t[i].begin, width ? t[i + 3].end : t[i].end, "integer"});
+                    } else if (width && (type == "tinyint" || type == "smallint" || type == "int" ||
+                                         type == "integer" || type == "bigint")) {
+                        edits.push_back({t[i + 1].begin, t[i + 3].end, ""});
+                    }
+                    continue;
+                }
+                if (depth >= 1 || !create) {
+                    if (t[i].value == "auto_increment" && !punct(i + 1, "=")) {
+                        return text_refusal_t{mysql_error::ER_NOT_SUPPORTED_YET,
+                                              "AUTO_INCREMENT is not supported: the engine has no identity column yet"};
+                    }
+                    // CHARACTER SET <cs> / CHARSET <cs> of a column.
+                    std::size_t value = 0;
+                    if (t[i].value == "character" && word(i + 1, "set")) {
+                        value = i + 2;
+                    } else if (t[i].value == "charset") {
+                        value = i + 1;
+                    }
+                    if (value != 0 && is_name(value)) {
+                        if (!utf8_charset(t[value].value)) {
+                            return charset_refusal(t[value].value);
+                        }
+                        drop(i, value);
+                        i = value;
+                        continue;
+                    }
+                    if (t[i].value == "comment" && i + 1 < t.size() && t[i + 1].kind == token_kind::string) {
+                        drop(i, i + 1);
+                        ++i;
+                        continue;
+                    }
+                }
+            }
+            // The table options after the column list.
+            if (create && list_end < t.size()) {
+                std::size_t i = list_end + 1;
+                const std::size_t options_begin = i;
+                while (i < t.size() && !punct(i, ";")) {
+                    std::size_t at = i;
+                    if (word(at, "default")) {
+                        ++at;
+                    }
+                    std::size_t value = at + 1;
+                    std::string name;
+                    if (word(at, "character") && word(at + 1, "set")) {
+                        name = "charset";
+                        value = at + 2;
+                    } else if (at < t.size() && t[at].kind == token_kind::word &&
+                               (t[at].value == "engine" || t[at].value == "charset" || t[at].value == "collate" ||
+                                t[at].value == "auto_increment" || t[at].value == "row_format" ||
+                                t[at].value == "comment" || t[at].value == "key_block_size")) {
+                        name = t[at].value;
+                    } else {
+                        break; // not an option of ours: the engine reads (or refuses) the rest
+                    }
+                    if (punct(value, "=")) {
+                        ++value;
+                    }
+                    if (value >= t.size() || t[value].kind == token_kind::punct) {
+                        break;
+                    }
+                    if (name == "charset" && !utf8_charset(t[value].value)) {
+                        return charset_refusal(t[value].value);
+                    }
+                    if (name == "collate" && !is_binary_collation(t[value].value)) {
+                        return text_refusal_t{mysql_error::ER_NOT_SUPPORTED_YET,
+                                              "COLLATE " + t[value].value +
+                                                  " is not supported: the server compares strings byte by byte "
+                                                  "(utf8mb4_bin)"};
+                    }
+                    i = value + 1;
+                    if (punct(i, ",")) {
+                        ++i;
+                    }
+                }
+                if (i > options_begin) {
+                    drop(options_begin, i - 1);
+                }
+            }
+            if (edits.empty()) {
+                return std::string{sql};
+            }
+            std::sort(edits.begin(), edits.end(), [](const edit_t& a, const edit_t& b) { return a.begin < b.begin; });
+            std::string out;
+            std::size_t copied = 0;
+            for (const auto& edit : edits) {
+                if (edit.begin < copied) {
+                    continue; // inside an edit already made
+                }
+                out.append(sql.substr(copied, edit.begin - copied));
+                out.append(edit.text);
+                copied = edit.end;
+            }
+            out.append(sql.substr(copied));
+            return out;
+        }
+    } // namespace
+
     std::variant<engine_text_t, text_refusal_t>
-    to_engine_text(std::string_view sql, text_command_t command) {
+    to_engine_text(std::string_view written, text_command_t command) {
         OTX_ZONE_N("mysql_protocol::to_engine_text");
+        auto ddl = mysql_ddl_form(written);
+        if (auto* refusal = std::get_if<text_refusal_t>(&ddl)) {
+            return std::move(*refusal);
+        }
+        const std::string limited = limit_offset_form(std::get<std::string>(ddl));
+        const std::string_view sql{limited};
         engine_text_t out;
         out.sql.reserve(sql.size() + 16);
         std::string& text = out.sql;

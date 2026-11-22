@@ -30,7 +30,7 @@ namespace {
     text_result(size_t width, std::initializer_list<std::vector<cell_t>> input, std::pmr::memory_resource* resource) {
         std::pmr::vector<ct::complex_logical_type> types(resource);
         for (size_t i = 0; i < width; ++i) {
-            types.emplace_back(ct::logical_type::STRING_LITERAL, "c" + std::to_string(i));
+            types.emplace_back(ct::logical_type::TEXT, "c" + std::to_string(i));
         }
         cv::data_chunk_t chunk(resource, types);
         uint64_t at = 0;
@@ -143,16 +143,16 @@ namespace {
         return std::vector<std::string>(parts.begin(), parts.end());
     }
 
-    const std::initializer_list<column_spec> database_layout = {{"name", ct::logical_type::STRING_LITERAL},
-                                                                {"catalog", ct::logical_type::STRING_LITERAL},
-                                                                {"description", ct::logical_type::STRING_LITERAL},
-                                                                {"locationUri", ct::logical_type::STRING_LITERAL}};
+    const std::initializer_list<column_spec> database_layout = {{"name", ct::logical_type::TEXT},
+                                                                {"catalog", ct::logical_type::TEXT},
+                                                                {"description", ct::logical_type::TEXT},
+                                                                {"locationUri", ct::logical_type::TEXT}};
 
-    const std::initializer_list<column_spec> table_layout = {{"name", ct::logical_type::STRING_LITERAL},
-                                                             {"catalog", ct::logical_type::STRING_LITERAL},
+    const std::initializer_list<column_spec> table_layout = {{"name", ct::logical_type::TEXT},
+                                                             {"catalog", ct::logical_type::TEXT},
                                                              {"namespace", ct::logical_type::LIST},
-                                                             {"description", ct::logical_type::STRING_LITERAL},
-                                                             {"tableType", ct::logical_type::STRING_LITERAL},
+                                                             {"description", ct::logical_type::TEXT},
+                                                             {"tableType", ct::logical_type::TEXT},
                                                              {"isTemporary", ct::logical_type::BOOLEAN}};
 } // namespace
 
@@ -385,7 +385,7 @@ TEST_CASE("spark catalog: single values") {
     auto* resource = &pool;
 
     const auto current = rows::string_payload("main.public", resource);
-    require_layout(current, {{"value", ct::logical_type::STRING_LITERAL}});
+    require_layout(current, {{"value", ct::logical_type::TEXT}});
     REQUIRE(current.size() == 1);
     CHECK(text_at(current, 0, 0) == "main.public");
 
@@ -401,7 +401,7 @@ TEST_CASE("spark catalog: CatalogMetadata rows") {
 
     const auto all = rows::list_catalogs(std::nullopt, resource);
     require_layout(all,
-                   {{"name", ct::logical_type::STRING_LITERAL}, {"description", ct::logical_type::STRING_LITERAL}});
+                   {{"name", ct::logical_type::TEXT}, {"description", ct::logical_type::TEXT}});
     REQUIRE(all.size() == 1);
     CHECK(text_at(all, 0, 0) == "otterstax");
     CHECK(null_at(all, 1, 0));
@@ -409,7 +409,7 @@ TEST_CASE("spark catalog: CatalogMetadata rows") {
     CHECK(rows::list_catalogs("OTTER*", resource).size() == 1);
     const auto none = rows::list_catalogs("spark_catalog", resource);
     require_layout(none,
-                   {{"name", ct::logical_type::STRING_LITERAL}, {"description", ct::logical_type::STRING_LITERAL}});
+                   {{"name", ct::logical_type::TEXT}, {"description", ct::logical_type::TEXT}});
     CHECK(none.size() == 0);
 }
 
@@ -456,8 +456,8 @@ TEST_CASE("spark catalog: Table rows") {
     REQUIRE_FALSE(mysql.has_error());
     const auto& payload = mysql.value();
     require_layout(payload, table_layout);
-    CHECK(payload.schema.child_types()[2].child_type().type() == ct::logical_type::STRING_LITERAL);
-    CHECK(payload.chunks.front().data[2].type().child_type().type() == ct::logical_type::STRING_LITERAL);
+    CHECK(payload.schema.child_types()[2].child_type().type() == ct::logical_type::TEXT);
+    CHECK(payload.chunks.front().data[2].type().child_type().type() == ct::logical_type::TEXT);
     REQUIRE(payload.size() == 1);
     CHECK(text_at(payload, 0, 0) == "payments");
     CHECK(text_at(payload, 1, 0) == "otterstax");
@@ -506,21 +506,21 @@ TEST_CASE("spark catalog: Column rows") {
 
     std::pmr::vector<ct::complex_logical_type> fields(resource);
     fields.emplace_back(ct::logical_type::BIGINT, "id");
-    fields.emplace_back(ct::logical_type::STRING_LITERAL, "name");
+    fields.emplace_back(ct::logical_type::TEXT, "name");
     auto price = ct::complex_logical_type::create_decimal(resource, 12, 2, "price");
     REQUIRE_FALSE(price.has_error());
     fields.push_back(price.value());
     fields.push_back(
-        ct::complex_logical_type::create_list(ct::complex_logical_type{ct::logical_type::STRING_LITERAL}, "tags"));
+        ct::complex_logical_type::create_list(ct::complex_logical_type{ct::logical_type::TEXT}, "tags"));
     fields.emplace_back(ct::logical_type::UBIGINT, "hits");
     fields.emplace_back(ct::logical_type::BOOLEAN); // unnamed
     const auto schema = ct::complex_logical_type::create_struct("", fields);
 
     const auto columns = rows::list_columns(schema, resource);
     require_layout(columns,
-                   {{"name", ct::logical_type::STRING_LITERAL},
-                    {"description", ct::logical_type::STRING_LITERAL},
-                    {"dataType", ct::logical_type::STRING_LITERAL},
+                   {{"name", ct::logical_type::TEXT},
+                    {"description", ct::logical_type::TEXT},
+                    {"dataType", ct::logical_type::TEXT},
                     {"nullable", ct::logical_type::BOOLEAN},
                     {"isPartition", ct::logical_type::BOOLEAN},
                     {"isBucket", ct::logical_type::BOOLEAN},

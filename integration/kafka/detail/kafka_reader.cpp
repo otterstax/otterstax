@@ -114,6 +114,7 @@ namespace otterstax::kafka::detail {
                     column.set_value(row, double{d});
                     return nullptr;
                 }
+                case types::logical_type::TEXT:
                 case types::logical_type::STRING_LITERAL:
                     if (!jv.is_string()) {
                         return "not a string";
@@ -175,6 +176,7 @@ namespace otterstax::kafka::detail {
                         case types::logical_type::BOOLEAN:
                             obj[key] = value.get_value<bool>(row);
                             break;
+                        case types::logical_type::TEXT:
                         case types::logical_type::STRING_LITERAL:
                             obj[key] = std::string(value.get_value<std::string_view>(row));
                             break;
@@ -423,11 +425,12 @@ namespace otterstax::kafka::detail {
         auto params = logical_plan::make_parameter_node(resource);
         const auto value_param =
             params->add_parameter(vector::make_scalar(resource, std::string_view{value}), vector::parameter_kind::literal);
-        // side_t::left: the predicate column belongs to the (single) target table
-        // transform_delete reaches this via key.deduce_side(names); a hand-built key
-        // defaults to side_t::undefined, which leaves the column unresolved and the
-        // full_scan feeds operator_delete a chunk whose types carry no alias (crash)
-        expressions::key_t column_key(resource, column, expressions::side_t::left);
+        // The target is the statement's one FROM element, numbered as transform_delete
+        // numbers it (the first id): the predicate column names it, and the delete node
+        // carries the same id, which the validator stamps on the target's columns
+        constexpr expressions::source_element_id_t target_element = expressions::NO_SOURCE_ELEMENT + 1;
+        expressions::key_t column_key(resource, column);
+        column_key.set_source_element(target_element);
         auto predicate =
             expressions::make_compare_expression(resource, expressions::compare_type::eq, column_key, value_param);
         auto match = logical_plan::make_node_match(resource, target, predicate);
@@ -435,6 +438,7 @@ namespace otterstax::kafka::detail {
         auto del = logical_plan::make_node_delete(resource,
                                                   match,
                                                   logical_plan::make_node_limit(resource, logical_plan::limit_t::all()));
+        del->set_source_element(target_element);
         del->set_target(target);
         logical_plan::execution_plan_t plan{resource, del, std::move(params)};
         // The target's lookup, as transform_delete registers a write target

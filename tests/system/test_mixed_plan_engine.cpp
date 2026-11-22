@@ -99,7 +99,7 @@ TEST_CASE("pure engine: group by string key over node_data", "[engine-group-by-s
                     child =
                         components::logical_plan::make_node_raw_data(resource,
                                                                      make_chunk({{"campaign_id", lt::INTEGER},
-                                                                                 {"campaign_name", lt::STRING_LITERAL},
+                                                                                 {"campaign_name", lt::TEXT},
                                                                                  {"budget", lt::DOUBLE}}));
                     ++swapped;
                     continue;
@@ -109,7 +109,7 @@ TEST_CASE("pure engine: group by string key over node_data", "[engine-group-by-s
                         components::logical_plan::make_node_raw_data(resource,
                                                                      make_chunk({{"product_id", lt::INTEGER},
                                                                                  {"campaign_id", lt::INTEGER},
-                                                                                 {"product_name", lt::STRING_LITERAL},
+                                                                                 {"product_name", lt::TEXT},
                                                                                  {"price", lt::DOUBLE}}));
                     ++swapped;
                     continue;

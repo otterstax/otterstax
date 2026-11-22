@@ -149,7 +149,7 @@ COPY (SELECT * FROM eg.t) TO 's3://bucket/exported/out.csv' WITH (s3_alias = 'de
 
 ## Building
 
-otterbrix (`1.0.0b2-rc-4`) and actor-zeta come from the `otterbrix` Conan remote; `--build missing`
+otterbrix (`1.0.0b2-rc-7`) and actor-zeta come from the `otterbrix` Conan remote; `--build missing`
 builds otterbrix from its recipe where the remote has no binary for your configuration (see
 [`CLAUDE.md`](CLAUDE.md#critical-dependency-versions-conanfilepy)). Size the build jobs to your RAM
 (about 1.5 GB per job).

@@ -40,8 +40,10 @@ namespace {
     constexpr auto SHORT_TIMEOUT = 300ms;
 
     template<typename Server>
-    frontend::frontend_server_config make_config(const otterstax::test::session_stack& stack,
-                                                 std::chrono::milliseconds read_timeout) {
+    frontend::frontend_server_config
+    make_config(const otterstax::test::session_stack& stack,
+                std::chrono::milliseconds read_timeout,
+                std::chrono::milliseconds idle_timeout = std::chrono::seconds(frontend::IDLE_TIMEOUT_SEC)) {
         return frontend::frontend_server_config{
             .resource = stack.resource,
             .port = 0,
@@ -49,6 +51,7 @@ namespace {
             .read_timeout = read_timeout,
             .accept_retry_delay = std::chrono::milliseconds(frontend::ACCEPT_RETRY_DELAY_MS),
             .pool_size = 4,
+            .idle_timeout = idle_timeout,
         };
     }
 
@@ -104,7 +107,7 @@ namespace {
 
     template<typename Server, typename Attach>
     void idle_timeout_closes(const otterstax::test::session_stack& stack, int cycles, Attach&& attach) {
-        Server server(make_config<Server>(stack, SHORT_TIMEOUT));
+        Server server(make_config<Server>(stack, SHORT_TIMEOUT, SHORT_TIMEOUT));
         server.start();
         for (int i = 0; i < cycles; ++i) {
             raw_client idle(server.local_port());
@@ -281,6 +284,118 @@ TEST_CASE("frontend_connection: mysql idle read timeout closes the connection an
 TEST_CASE("frontend_connection: postgres idle read timeout closes the connection and frees the slot") {
     otterstax::test::session_stack_owner owner("/tmp/otterstax_frontend_lifetime_pg_idle");
     idle_timeout_closes<frontend::postgres::postgres_server>(owner.stack(), 5, &pg_startup);
+}
+
+// The handshake / startup and a message's body take the read timeout; the wait for the next message of an
+// established connection the idle timeout (a client's pool keeps an idle connection, as against MySQL).
+template<typename Server, typename Attach>
+void established_connection_outlives_read_timeout(const otterstax::test::session_stack& stack, Attach&& attach) {
+    Server server(make_config<Server>(stack, SHORT_TIMEOUT, std::chrono::seconds(60)));
+    server.start();
+    raw_client idle(server.local_port());
+    attach(idle);
+    // Past the read timeout several times over, the established connection is open.
+    CHECK_FALSE(idle.wait_for_close(SHORT_TIMEOUT * 4));
+    // A client silent before its handshake is still closed at the read timeout.
+    raw_client silent(server.local_port());
+    const auto started = std::chrono::steady_clock::now();
+    REQUIRE(silent.wait_for_close());
+    CHECK(std::chrono::steady_clock::now() - started < std::chrono::seconds(30));
+    server.stop();
+}
+
+namespace {
+    // A simple Query's answer up to its ReadyForQuery: the message types, and the first DataRow's first cell.
+    std::pair<std::string, std::string> pg_simple(raw_client& client, const std::string& sql) {
+        std::vector<uint8_t> text{sql.begin(), sql.end()};
+        text.push_back(0);
+        client.write(pg_frame('Q', text));
+        std::string types;
+        std::string cell;
+        for (int guard = 0; guard < 64; ++guard) {
+            const auto message = pg_read_message(client);
+            types.push_back(message.type);
+            if (message.type == 'D' && cell.empty() && message.payload.size() >= 6) {
+                const uint32_t size = (uint32_t{message.payload[2]} << 24) | (uint32_t{message.payload[3]} << 16) |
+                                      (uint32_t{message.payload[4]} << 8) | uint32_t{message.payload[5]};
+                cell.assign(message.payload.begin() + 6, message.payload.begin() + 6 + size);
+            }
+            if (message.type == 'Z') {
+                return {types, cell};
+            }
+        }
+        FAIL("no ReadyForQuery");
+        return {};
+    }
+
+    // A COM_QUERY's first answer packet.
+    std::vector<uint8_t> mysql_simple(raw_client& client, const std::string& sql) {
+        std::vector<uint8_t> payload{0x03};
+        payload.insert(payload.end(), sql.begin(), sql.end());
+        client.write(mysql_frame(0, payload));
+        return mysql_read_packet(client);
+    }
+} // namespace
+
+// Each connection sets its own idle timeout: MySQL's SET wait_timeout, PostgreSQL's SET idle_session_timeout.
+TEST_CASE("frontend_connection: mysql SET wait_timeout is the connection's idle timeout") {
+    otterstax::test::session_stack_owner owner(otterstax::test::unique_test_dir("otterstax_conn_mysql_wait_timeout"));
+    frontend::mysql::mysql_server server(make_config<frontend::mysql::mysql_server>(owner.stack(),
+                                                                                    PRODUCTION_TIMEOUT,
+                                                                                    std::chrono::seconds(60)));
+    server.start();
+    raw_client other(server.local_port());
+    mysql_handshake(other);
+    raw_client client(server.local_port());
+    mysql_handshake(client);
+    REQUIRE(mysql_simple(client, "SET SESSION wait_timeout = 1")[0] == 0x00); // OK
+    const auto started = std::chrono::steady_clock::now();
+    REQUIRE(client.wait_for_close(std::chrono::seconds(10)));
+    CHECK(std::chrono::steady_clock::now() - started >= 500ms);
+    // The other connection keeps the server's.
+    CHECK_FALSE(other.wait_for_close(SHORT_TIMEOUT));
+    server.stop();
+}
+
+TEST_CASE("frontend_connection: postgres SET idle_session_timeout is the connection's idle timeout") {
+    otterstax::test::session_stack_owner owner(otterstax::test::unique_test_dir("otterstax_conn_pg_idle_session"));
+    frontend::postgres::postgres_server server(make_config<frontend::postgres::postgres_server>(owner.stack(),
+                                                                                                PRODUCTION_TIMEOUT,
+                                                                                                SHORT_TIMEOUT));
+    server.start();
+    // 0: never closed as idle, past the server's short idle timeout.
+    raw_client never(server.local_port());
+    pg_startup(never);
+    CHECK(pg_simple(never, "SET idle_session_timeout = 0").first == "CZ");
+    CHECK(pg_simple(never, "SHOW idle_session_timeout").second == "0");
+    CHECK_FALSE(never.wait_for_close(SHORT_TIMEOUT * 4));
+    // A SET inside a block the ROLLBACK drops: back to 0.
+    CHECK(pg_simple(never, "BEGIN").first == "CZ");
+    CHECK(pg_simple(never, "SET idle_session_timeout = '100ms'").first == "CZ");
+    CHECK(pg_simple(never, "ROLLBACK").first == "CZ");
+    CHECK(pg_simple(never, "SHOW idle_session_timeout").second == "0");
+    CHECK_FALSE(never.wait_for_close(SHORT_TIMEOUT * 2));
+    // A refused value is 22023 and changes nothing.
+    CHECK(pg_simple(never, "SET idle_session_timeout = 'soon'").first == "EZ");
+    // A timeout of its own, given in the StartupMessage, closes it.
+    raw_client own(server.local_port());
+    REQUIRE(pg_startup_answer(own, {{"user", "test"}, {"database", "local"}, {"idle_session_timeout", "1s"}}).back().type ==
+            'Z');
+    CHECK(pg_simple(own, "SHOW idle_session_timeout").second == "1s");
+    const auto started = std::chrono::steady_clock::now();
+    REQUIRE(own.wait_for_close(std::chrono::seconds(10)));
+    CHECK(std::chrono::steady_clock::now() - started >= 500ms);
+    server.stop();
+}
+
+TEST_CASE("frontend_connection: mysql established connection takes the idle timeout") {
+    otterstax::test::session_stack_owner owner(otterstax::test::unique_test_dir("otterstax_conn_mysql_idle_long"));
+    established_connection_outlives_read_timeout<frontend::mysql::mysql_server>(owner.stack(), &mysql_handshake);
+}
+
+TEST_CASE("frontend_connection: postgres established connection takes the idle timeout") {
+    otterstax::test::session_stack_owner owner(otterstax::test::unique_test_dir("otterstax_conn_pg_idle_long"));
+    established_connection_outlives_read_timeout<frontend::postgres::postgres_server>(owner.stack(), &pg_startup);
 }
 
 TEST_CASE("frontend_connection: postgres initial-read timeout closes a silent client") {

@@ -60,7 +60,10 @@ namespace otterstax::backends {
     }
 
     core::error_t
-    register_remote_tables(std::pmr::memory_resource* resource, runtime::engine_t& engine, remote_backends_t& remote) {
+    register_remote_tables(std::pmr::memory_resource* resource,
+                           runtime::engine_t& engine,
+                           remote_backends_t& remote,
+                           std::string_view time_zone) {
         OTX_ZONE_N("backends::register_remote_tables");
         // Without connections too: the local database and the sessions' empty place are the startup's.
         catalog::engine_calls_t calls{
@@ -75,6 +78,10 @@ namespace otterstax::backends {
                       components::logical_plan::execution_plan_t plan) {
                 return engine.execute_plan_blocking(session, std::move(plan));
             }};
-        return catalog::register_connections(resource, calls, remote.registration_session(), remote.discovered());
+        return catalog::register_connections(resource,
+                                             calls,
+                                             remote.registration_session(),
+                                             remote.discovered(),
+                                             time_zone);
     }
 } // namespace otterstax::backends

@@ -7,10 +7,12 @@
 #include <string_view>
 
 namespace frontend::mysql {
-    inline constexpr uint32_t PACKET_HEADER_SIZE = 4;     // length(int<3>) + seq_id(int<1>)
-    inline constexpr uint32_t MAX_PACKET_SIZE = 0xFFFFFF; // 16MB - 1 (max client packet size)
+    inline constexpr uint32_t PACKET_HEADER_SIZE = 4; // length(int<3>) + seq_id(int<1>)
+    // The payload cap of one wire packet (16MB - 1). A longer payload leaves
+    // in several packets split at exactly this length: the length is all a
+    // client reads to tell a continuation (0xFFFFFF) from the payload's end.
+    inline constexpr uint32_t MAX_PACKET_SIZE = 0xFFFFFF;
     inline constexpr uint32_t MIN_PACKET_SIZE = 1;
-    inline constexpr uint32_t DEFAULT_MAX_PACKET_SIZE = 16 * 1024 * 1024; // 16MB client default limit
     inline constexpr uint8_t PROTOCOL_VERSION = 10;
     inline constexpr std::string_view SERVER_VERSION = "9.5.0";
     // SERVER_VERSION as MySQL numbers it (major * 10000 + minor * 100 + patch):
@@ -29,10 +31,12 @@ namespace frontend::mysql {
     inline constexpr std::string_view SERVER_CHARSET = "utf8mb4";
     inline constexpr std::string_view SERVER_COLLATION = "utf8mb4_bin";
 
-    // @@max_allowed_packet: the largest command the server reads. It does not
-    // reassemble a command split over several packets, so one packet's payload
-    // bounds it (MAX_PACKET_SIZE), rounded down to the multiple of 1024 MySQL
-    // requires of the variable. A driver that splits at it (the Go driver
-    // writes at most max_allowed_packet - 1 bytes) never sends a continuation.
-    inline constexpr uint32_t MAX_ALLOWED_PACKET = MAX_PACKET_SIZE / 1024 * 1024;
+    // @@max_allowed_packet: MariaDB's default 16MB, a multiple of 1024 as the
+    // variable requires — the bound of a command's whole payload, however
+    // many wire packets it is split into (every one but the last exactly
+    // MAX_PACKET_SIZE, the last shorter — or empty, when the payload fills
+    // MAX_PACKET_SIZE exactly). A command over the bound tears the
+    // connection (ER_PACKET_TOO_LARGE), as MariaDB tears a client whose
+    // packet is bigger than max_allowed_packet.
+    inline constexpr uint32_t MAX_ALLOWED_PACKET = 16 * 1024 * 1024;
 } // namespace frontend::mysql

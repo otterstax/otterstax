@@ -3,6 +3,7 @@
 
 #include "session/query_session.hpp"
 
+#include "catalog/dotted_names.hpp"
 #include "catalog/ownership.hpp"
 #include "connectors/file/manager.hpp"
 #include "integration/kafka/kafka_manager.hpp"
@@ -66,6 +67,7 @@ namespace otterstax::session {
                 chunks.emplace_back(resource, std::pmr::vector<types::complex_logical_type>{resource}, 0);
             }
             session_payload payload{std::move(schema), std::move(chunks), 0, tag, affected};
+            payload.generated_id = cursor->is_write() ? cursor->generated_id() : 0;
             payload.portal = cursor->portal_id();
             payload.has_more = cursor->has_more();
             return payload;
@@ -1290,7 +1292,10 @@ namespace otterstax::session {
         // The engine's raw parser sits behind IParser::parse, and a test parser
         // may throw on purpose; the catch is confined to this call.
         try {
-            auto parsed = parser_->parse(sql);
+            // A quoted "c.ns" qualifier (an ORM's one schema slot) is the name c.ns it means; a call of a host
+            // function (version()) reaches it from any place (catalog::qualify_host_calls: pg_catalog cannot hold it).
+            auto parsed = parser_->parse(otterstax::catalog::qualify_host_calls(
+                otterstax::catalog::split_dotted_names(sql, services_.connections)));
             if (parsed.has_error()) {
                 return parsed;
             }
@@ -1340,6 +1345,7 @@ namespace otterstax::session {
         if (finalized.has_error()) {
             return forward_error(resource(), finalized.error(), "Argument binding failed: ");
         }
+        give_fromless_filters_a_row(finalized.value());
         *data.plan = std::move(finalized.value());
         data.awaiting_bind = false;
         return parsed;

@@ -236,7 +236,7 @@ namespace frontend::spark {
                 return ct::logical_type::FLOAT;
             }
             if (ieq(s, "string") || ieq(s, "varchar") || ieq(s, "char") || ieq(s, "text")) {
-                return ct::logical_type::STRING_LITERAL;
+                return ct::logical_type::TEXT;
             }
             if (ieq(s, "boolean") || ieq(s, "bool")) {
                 return ct::logical_type::BOOLEAN;
@@ -707,7 +707,7 @@ namespace frontend::spark {
                         if (result->group() == ce::expression_group::scalar) {
                             auto* scalar = static_cast<ce::scalar_expression_t*>(result.get());
                             if (scalar->type() == ce::scalar_type::get_field && scalar->params().empty()) {
-                                out_key.set_side(scalar->key().side());
+                                out_key.set_source_element(scalar->key().source_element());
                                 return ce::make_scalar_expression(resource,
                                                                   ce::scalar_type::get_field,
                                                                   out_key,

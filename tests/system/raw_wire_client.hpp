@@ -40,7 +40,23 @@ namespace otterstax::test::wire {
             socket_.connect({boost::asio::ip::make_address("127.0.0.1"), port});
         }
 
-        void write(const std::vector<uint8_t>& bytes) { boost::asio::write(socket_, boost::asio::buffer(bytes)); }
+        void write(const std::vector<uint8_t>& bytes, std::chrono::milliseconds deadline = SERVER_REACTION) {
+            boost::system::error_code result;
+            bool done = false;
+            boost::asio::async_write(socket_, boost::asio::buffer(bytes), [&](boost::system::error_code ec, size_t) {
+                result = ec;
+                done = true;
+            });
+            ctx_.restart();
+            ctx_.run_for(deadline);
+            if (!done) {
+                socket_.cancel();
+                ctx_.run();
+            }
+            INFO("write(" << bytes.size() << "): done=" << done << " ec=" << result.message());
+            REQUIRE(done);
+            REQUIRE(!result);
+        }
 
         // Reads exactly `n` bytes or gives up at the deadline (REQUIRE fails).
         std::vector<uint8_t> read_exact(size_t n, std::chrono::milliseconds deadline = SERVER_REACTION) {
@@ -138,14 +154,16 @@ namespace otterstax::test::wire {
     }
 
     // The fixed 32-byte head of HandshakeResponse41: flags, max packet, the
-    // client's collation (utf8_general_ci by default), filler.
-    inline std::vector<uint8_t> mysql_handshake_response_head(uint8_t collation = 33) {
+    // client's collation (utf8_general_ci by default), filler. `max_packet`
+    // is what the client advertises in the handshake — 16MB by default, 0 is
+    // what go-sql-driver/mysql and mysql2 send.
+    inline std::vector<uint8_t> mysql_handshake_response_head(uint8_t collation = 33,
+                                                              uint32_t max_packet = 16 * 1024 * 1024) {
         std::vector<uint8_t> resp;
         const uint32_t flags = frontend::mysql::CLIENT_PROTOCOL_41 | frontend::mysql::CLIENT_SECURE_CONNECTION;
         for (int i = 0; i < 4; ++i) {
             resp.push_back(static_cast<uint8_t>((flags >> (8 * i)) & 0xFF));
         }
-        const uint32_t max_packet = 16 * 1024 * 1024;
         for (int i = 0; i < 4; ++i) {
             resp.push_back(static_cast<uint8_t>((max_packet >> (8 * i)) & 0xFF));
         }

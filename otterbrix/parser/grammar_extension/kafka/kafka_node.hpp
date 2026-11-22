@@ -114,7 +114,7 @@ namespace otterstax::kafka {
 
     // Maps a (case-insensitive) SQL type keyword to an otterbrix logical type.
     // Only the JSON-ingestible types are accepted (INTEGER, BIGINT, DOUBLE, BOOLEAN,
-    // STRING_LITERAL); std::nullopt for anything else, which CREATE rejects
+    // TEXT); std::nullopt for anything else, which CREATE rejects
     std::optional<components::types::complex_logical_type> map_column_type(std::string_view type_name);
 
     // Lowers a parsed kafka AST statement into a kafka_node_t built on `resource`

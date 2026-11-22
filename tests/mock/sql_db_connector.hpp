@@ -47,6 +47,18 @@ namespace mysql {
         return results;
     }
 
+    // A completed OK result: what a write answers, its affected rows and last_insert_id.
+    inline boost::mysql::results mock_ok_results(std::uint64_t affected_rows, std::uint64_t last_insert_id) {
+        boost::mysql::results r;
+        auto& impl = boost::mysql::detail::access::get_impl(r);
+        impl.reset(boost::mysql::detail::resultset_encoding::text, boost::mysql::metadata_mode::minimal);
+        boost::mysql::diagnostics diag;
+        [[maybe_unused]] auto ec =
+            impl.on_head_ok_packet(boost::mysql::detail::ok_view{affected_rows, last_insert_id, 0, 0, {}}, diag);
+        assert(!ec && "mock result set: on_head_ok_packet must not fail");
+        return r;
+    }
+
     // One column of a manufactured result set.
     struct mock_column_t {
         std::string name;
@@ -174,7 +186,7 @@ namespace mysql {
                 if (c == 0) {
                     fields.emplace_back(types::logical_type::INTEGER, "id");
                 } else {
-                    fields.emplace_back(types::logical_type::STRING_LITERAL, "name");
+                    fields.emplace_back(types::logical_type::TEXT, "name");
                 }
             }
             if (config_.return_empty) {

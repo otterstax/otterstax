@@ -219,7 +219,7 @@ static void BM_merge_schemas_2x3col(benchmark::State& state) {
         schema.back().set_alias("id_" + std::to_string(s));
         schema.emplace_back(logical_type::DOUBLE);
         schema.back().set_alias("score_" + std::to_string(s));
-        schema.emplace_back(logical_type::STRING_LITERAL);
+        schema.emplace_back(logical_type::TEXT);
         schema.back().set_alias("name_" + std::to_string(s));
         schemas.push_back(std::move(schema));
     }

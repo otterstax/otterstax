@@ -144,7 +144,7 @@ TEST_CASE("prepare announces the type its execute delivers over a local table", 
             {"score", logical_type::INTEGER},
             {"big", logical_type::BIGINT},
             {"ratio", logical_type::DOUBLE},
-            {"name", logical_type::STRING_LITERAL},
+            {"name", logical_type::TEXT},
             {"price", logical_type::DECIMAL, 10, 2},
             {"COUNT(*)", logical_type::UBIGINT},
             {"SUM(score)", logical_type::BIGINT},
@@ -208,8 +208,8 @@ TEST_CASE("a bare placeholder in the select list announces text and delivers it"
         std::pmr::vector<components::vector::vector_t> parameters{s.resource};
         parameters.push_back(components::vector::make_scalar(s.resource, "one"));
         const auto types = prepare_and_execute(s, id++, sql, std::move(parameters));
-        CHECK(label_of(types.announced) == "STRING_LITERAL");
-        CHECK(label_of(types.delivered) == "STRING_LITERAL");
+        CHECK(label_of(types.announced) == "TEXT");
+        CHECK(label_of(types.delivered) == "TEXT");
     });
 }
 

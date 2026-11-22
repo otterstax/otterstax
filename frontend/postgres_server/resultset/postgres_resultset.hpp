@@ -39,6 +39,8 @@ namespace frontend::postgres {
         postgres_resultset(packet_writer& writer, extra_float_digits_t digits, bool datarow_only = false);
 
         void add_encoding(std::vector<result_encoding> format);
+        // The session's TimeZone, which a timestamptz cell's text is shown in; UTC until set.
+        void set_time_zone(core::date::time_zone_t zone) { time_zone_ = std::move(zone); }
         void add_chunk_columns(const components::vector::data_chunk_t& chunk,
                                result_encoding encoding = result_encoding::TEXT);
 
@@ -53,5 +55,6 @@ namespace frontend::postgres {
         std::reference_wrapper<packet_writer> writer_;
         bool datarow_only_;
         extra_float_digits_t extra_float_digits_;
+        core::date::time_zone_t time_zone_;
     };
 } // namespace frontend::postgres

@@ -21,7 +21,9 @@ namespace frontend::mysql {
     build_ok(packet_writer& writer,
              uint8_t sequence_id,
              uint64_t affected_rows = 0,
-             server_status_flags_t flags = static_cast<uint16_t>(server_status::SERVER_STATUS_AUTOCOMMIT));
+             server_status_flags_t flags = static_cast<uint16_t>(server_status::SERVER_STATUS_AUTOCOMMIT),
+             // The statement's generated id (session_payload::generated_id), 0 for none.
+             uint64_t last_insert_id = 0);
 
     // https://dev.mysql.com/doc/dev/mysql-server/9.5.0/page_protocol_basic_err_packet.html
     std::vector<uint8_t>

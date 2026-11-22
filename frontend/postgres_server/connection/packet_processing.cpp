@@ -4,6 +4,7 @@
 #include "postgres_connection.hpp"
 
 #include "bare_select_parameter.hpp"
+#include "utility/server_version.hpp"
 #include "utility/tracy_memory_resource.hpp"
 #include "utility/tracy_profiler.hpp"
 
@@ -146,9 +147,11 @@ namespace frontend::postgres {
             // Read-only facts of the server: the PostgreSQL version it speaks, the
             // encoding the engine stores text in, the timestamps' microsecond
             // integers (core/date/date_types.hpp).
-            msg.emplace_back(build_parameter_status(writer_, "server_version", "18.0"));
-            msg.emplace_back(build_parameter_status(writer_, "server_encoding", "UTF8"));
-            msg.emplace_back(build_parameter_status(writer_, "integer_datetimes", "on"));
+            for (const auto& fact : server_facts()) {
+                if (fact.reported) {
+                    msg.emplace_back(build_parameter_status(writer_, std::string{fact.name}, std::string{fact.value}));
+                }
+            }
             // The engine session's, as the engine has them.
             reported_.timezone = timezone_.current();
             reported_.search_path = search_path_.current();
@@ -173,11 +176,14 @@ namespace frontend::postgres {
             }
             backend_secret_key_ = std::move(*secret_key);
             msg.emplace_back(build_backend_key_data(writer_, connection_id_, backend_secret_key_));
+            // A CancelRequest names this connection by them from now on.
+            cancels().add(connection_id_, &statement_cancel_, this, backend_secret_key_);
 
             log_->debug("[Connection {}] Generated BackendKeyData: key_size={} bytes",
                         connection_id_,
                         backend_secret_key_.size());
             msg.emplace_back(build_ready_for_query(writer_, transaction_status::IDLE));
+            mark_established();
             send_packet_merged(std::move(msg)); // send packet & begin message-handling loop
         }
     }
@@ -221,6 +227,18 @@ namespace frontend::postgres {
                             extra_float_digits_.session = extra_float_digits_.reset;
                             continue;
                         }
+                        case client_parameter_t::idle_session_timeout: {
+                            auto timeout = parse_idle_session_timeout(value);
+                            if (auto* refusal = std::get_if<std::string>(&timeout)) {
+                                send_error_response(sql_state::INVALID_PARAMETER_VALUE,
+                                                    std::move(*refusal),
+                                                    error_severity::fatal());
+                                co_return false;
+                            }
+                            idle_session_timeout_.reset = std::get<std::int64_t>(timeout);
+                            idle_session_timeout_.session = idle_session_timeout_.reset;
+                            continue;
+                        }
                     }
                 } else if (const auto* parameter = find_protocol_parameter(name)) {
                     if (auto refusal = check_protocol_parameter(*parameter, value)) {
@@ -237,12 +255,12 @@ namespace frontend::postgres {
             auto r = co_await use_own(*database);
             if (r.has_error()) {
                 const auto code = r.error().type;
-                if (!r.timed_out() && code == core::error_code_t::database_not_exists) {
+                if (!r.stopped_waiting() && code == core::error_code_t::database_not_exists) {
                     send_error_response(sql_state::INVALID_CATALOG_NAME,
                                         "database \"" + *database + "\" does not exist",
                                         error_severity::fatal(),
                                         "A database is a connection, connection.namespace, local or local.namespace.");
-                } else if (!r.timed_out() && code == core::error_code_t::schema_not_exists) {
+                } else if (!r.stopped_waiting() && code == core::error_code_t::schema_not_exists) {
                     // The connection is there, the namespace the database names is not. PostgreSQL never refuses a
                     // connection for a search_path schema, but the engine cannot place a session in one that does
                     // not exist: the refusal names the schema, never "the database does not exist" for one that does.
@@ -283,8 +301,8 @@ namespace frontend::postgres {
                 for (const auto& chunk : r.value().chunks) {
                     // Two text columns, or the rows are not what this reads.
                     if (chunk.column_count() < 2 ||
-                        chunk.data[0].type().type() != types::logical_type::STRING_LITERAL ||
-                        chunk.data[1].type().type() != types::logical_type::STRING_LITERAL) {
+                        chunk.data[0].type().type() != types::logical_type::TEXT ||
+                        chunk.data[1].type().type() != types::logical_type::TEXT) {
                         log_->warn("[Connection {}] pg_settings answered columns other than (name, setting): ignored",
                                    connection_id_);
                         continue;
@@ -317,6 +335,25 @@ namespace frontend::postgres {
             search_path_.reset = value_of(components::catalog::setting_id::search_path);
             search_path_.session = search_path_.reset;
         }
+    }
+
+    void postgres_connection::handle_cancel_request(frontend::postgres::packet_reader& reader) {
+        OTX_ZONE_N("pg::handle_cancel_request");
+        const auto pid = reader.read_int32();
+        std::vector<uint8_t> key;
+        while (reader.ok() && reader.remaining() > 0) {
+            key.push_back(reader.read_uint8());
+        }
+        if (reader.ok()) {
+            const auto outcome = cancels().cancel(static_cast<uint32_t>(pid), key);
+            log_->info("[Connection {}] CancelRequest for process {}: {}",
+                       connection_id_,
+                       pid,
+                       outcome == cancel_registry_t::outcome_t::cancelled         ? "cancelled"
+                       : outcome == cancel_registry_t::outcome_t::nothing_running ? "nothing running"
+                                                                                  : "no such process");
+        }
+        finish();
     }
 
     void postgres_connection::handle_ssl_decline(frontend::postgres::packet_reader& reader) {
@@ -414,11 +451,11 @@ namespace frontend::postgres {
 
     boost::asio::awaitable<otterstax::awaited_t<session_payload>>
     postgres_connection::await_session(session_future fut) {
-        auto r = co_await otterstax::async_await_future<session_payload>(std::move(fut), resource_);
+        auto r = co_await otterstax::async_await_future<session_payload>(std::move(fut), resource_, otterstax::DEFAULT_TIMEOUT, &statement_cancel_);
         // Any answer but the bridge's timeout comes after every message sent
         // before the statement, a fail_transaction included: the session's block
         // is current again.
-        if (!r.timed_out()) {
+        if (!r.stopped_waiting()) {
             failure_pending_ = false;
         }
         follow_parameters(r);
@@ -445,7 +482,7 @@ namespace frontend::postgres {
 
     void postgres_connection::follow_parameters(const otterstax::awaited_t<session_payload>& answer) {
         OTX_ZONE_N("pg::follow_parameters");
-        if (session_ == nullptr || answer.timed_out()) {
+        if (session_ == nullptr || answer.stopped_waiting()) {
             return; // nothing the statement did is known yet
         }
         const bool inside_block = session_->transaction_status() != components::session::transaction_status_t::idle;
@@ -472,6 +509,7 @@ namespace frontend::postgres {
                     apply(application_name_);
                     apply(client_encoding_);
                     apply(extra_float_digits_);
+                    apply(idle_session_timeout_);
                     apply(timezone_);
                     apply(search_path_);
                 };
@@ -499,6 +537,7 @@ namespace frontend::postgres {
             application_name_.end_block(committed);
             client_encoding_.end_block(committed);
             extra_float_digits_.end_block(committed);
+            idle_session_timeout_.end_block(committed);
             timezone_.end_block(committed);
             search_path_.end_block(committed);
         }
@@ -510,11 +549,21 @@ namespace frontend::postgres {
         application_name_.set(application_name_.reset, false, inside_block);
         client_encoding_.set(client_encoding_.reset, false, inside_block);
         extra_float_digits_.set(extra_float_digits_.reset, false, inside_block);
+        idle_session_timeout_.set(idle_session_timeout_.reset, false, inside_block);
     }
 
     command_complete_tag postgres_connection::setting_tag(const protocol_setting_t& setting) const {
         return setting.reset ? command_complete_tag::reset()
                              : command_complete_tag::simple_command(T_VariableSetStmt, 0);
+    }
+
+    core::date::time_zone_t postgres_connection::session_time_zone() const {
+        // The engine's TimeZone as the session follows it (timezone_); one the zone database cannot name is UTC.
+        core::date::time_zone_t zone;
+        if (!core::date::setting_time_zone(timezone_.current(), &zone)) {
+            return core::date::time_zone_t{};
+        }
+        return zone;
     }
 
     void postgres_connection::append_ready_for_query(std::vector<std::vector<uint8_t>>& response) {
@@ -536,11 +585,14 @@ namespace frontend::postgres {
                                                  std::string_view prefix,
                                                  error_severity severity) {
         const auto& error = answer.error();
-        if (answer.timed_out()) {
+        if (answer.stopped_waiting()) {
             // The statement goes on running; send_error_response fails an open
             // block behind it, so a COMMIT cannot publish what the client was told
-            // is cancelled.
-            send_error_response(sql_state::QUERY_CANCELED, "Query exceeded execution limit", severity);
+            // is cancelled. A client's CancelRequest is PostgreSQL's own wording.
+            send_error_response(sql_state::QUERY_CANCELED,
+                                answer.timed_out() ? "Query exceeded execution limit"
+                                                   : "canceling statement due to user request",
+                                severity);
         } else if (const char* state = sqlstate_of(error.type)) {
             send_error_response(state, std::string{error.what.c_str()}, severity);
         } else {
@@ -620,28 +672,48 @@ namespace frontend::postgres {
                 digits.set(value, setting.local, inside_block);
                 return true;
             }
+            case client_parameter_t::idle_session_timeout: {
+                auto& timeout = idle_session_timeout_;
+                std::int64_t value = setting.current ? timeout.current() : timeout.reset;
+                if (setting.value) {
+                    auto parsed = parse_idle_session_timeout(*setting.value);
+                    if (auto* refusal = std::get_if<std::string>(&parsed)) {
+                        // Inside a block the error fails it (send_error_response).
+                        send_error_response(sql_state::INVALID_PARAMETER_VALUE, std::move(*refusal));
+                        return false;
+                    }
+                    value = std::get<std::int64_t>(parsed);
+                }
+                timeout.set(value, setting.local, inside_block);
+                return true;
+            }
         }
         return true;
     }
 
-    std::vector<std::vector<uint8_t>> postgres_connection::answer_show(client_parameter_t parameter,
+    std::vector<std::vector<uint8_t>> postgres_connection::answer_show(const shown_parameter_t& shown,
                                                                        const std::vector<result_encoding>& format,
                                                                        bool row_shape_known) {
         OTX_ZONE_N("pg::answer_show");
         std::pmr::vector<types::complex_logical_type> columns(resource_);
-        columns.emplace_back(types::logical_type::STRING_LITERAL, std::string{client_parameter_name(parameter)});
+        columns.emplace_back(types::logical_type::TEXT, std::string{shown.name});
         components::vector::data_chunk_t chunk(resource_, columns);
-        std::string value;
-        switch (parameter) {
-            case client_parameter_t::application_name:
-                value = application_name_.current();
-                break;
-            case client_parameter_t::client_encoding:
-                value = client_encoding_.current();
-                break;
-            case client_parameter_t::extra_float_digits:
-                value = std::to_string(extra_float_digits_.current());
-                break;
+        std::string value{shown.value};
+        if (shown.client) {
+            switch (*shown.client) {
+                case client_parameter_t::application_name:
+                    value = application_name_.current();
+                    break;
+                case client_parameter_t::client_encoding:
+                    value = client_encoding_.current();
+                    break;
+                case client_parameter_t::extra_float_digits:
+                    value = std::to_string(extra_float_digits_.current());
+                    break;
+                case client_parameter_t::idle_session_timeout:
+                    value = show_milliseconds(idle_session_timeout_.current());
+                    break;
+            }
         }
         chunk.set_value(0, 0, std::string_view{value});
         chunk.set_cardinality(1);
@@ -768,7 +840,7 @@ namespace frontend::postgres {
                     co_return;
                 }
                 resets_client_parameters = true;
-            } else if (const auto shown = show_client_parameter(resource_, query)) {
+            } else if (const auto shown = show_parameter(resource_, query)) {
                 // As the engine refuses every statement of a failed block.
                 if (block_aborted()) {
                     refuse_in_aborted_block();
@@ -812,6 +884,7 @@ namespace frontend::postgres {
                 }
 
                 postgres_resultset result(writer_, extra_float_digits_t{extra_float_digits_.current()});
+                result.set_time_zone(session_time_zone());
                 result.add_chunk_columns(sdata_result.chunks.front()); // default text encoding
                 for (auto& ch : sdata_result.chunks) {
                     for (size_t i = 0; i < ch.size(); ++i) {
@@ -901,11 +974,11 @@ namespace frontend::postgres {
                 // the client parameters reset behind it.
                 kept.emplace(resource_, id, query, types::complex_logical_type{}, T_VariableSetStmt);
                 kept->protocol_setting = std::move(*setting);
-            } else if (const auto shown = show_client_parameter(resource_, query)) {
-                // And SHOW of a client parameter: answered at Execute, described by
-                // its one text column.
+            } else if (const auto shown = show_parameter(resource_, query)) {
+                // And SHOW of a parameter the frontend answers: at Execute,
+                // described by its one text column.
                 std::pmr::vector<types::complex_logical_type> columns(resource_);
-                columns.emplace_back(types::logical_type::STRING_LITERAL, std::string{client_parameter_name(*shown)});
+                columns.emplace_back(types::logical_type::TEXT, std::string{shown->name});
                 kept.emplace(resource_,
                              id,
                              query,
@@ -1056,7 +1129,8 @@ namespace frontend::postgres {
 
                     const components::types::complex_logical_type* engine_type =
                         i < statement.engine_types.size() ? &statement.engine_types[i] : nullptr;
-                    auto parsed = parse_text_parameter(resource_, type, engine_type, std::move(str));
+                    const auto zone = session_time_zone();
+                    auto parsed = parse_text_parameter(resource_, type, engine_type, std::move(str), &zone);
                     if (parsed.has_error()) {
                         // The portal is incomplete: nothing may follow the error, in
                         // particular no BindComplete.
@@ -1139,6 +1213,46 @@ namespace frontend::postgres {
                         for (int j = 0; j < len; str[j++] = static_cast<char>(reader.read_uint8()))
                             ;
                         params.push_back(components::vector::make_scalar(resource_, std::string_view{str}));
+                        break;
+                    }
+                    // The temporal types' binary is the engine's storage (date_recv / time_recv / timestamp_recv /
+                    // timetz_recv — its offset west of UTC — / interval_recv; resultset_utils.hpp writes the same).
+                    case field_type::DATE:
+                    case field_type::TIME:
+                    case field_type::TIMESTAMP:
+                    case field_type::TIMESTAMPTZ:
+                    case field_type::TIMETZ:
+                    case field_type::INTERVAL: {
+                        const int32_t expected = type == field_type::DATE     ? 4
+                                                 : type == field_type::TIMETZ ? 12
+                                                 : type == field_type::INTERVAL ? 16
+                                                                                : 8;
+                        if (len != expected) {
+                            send_error_response(sql_state::PROTOCOL_VIOLATION, "Invalid date/time binary length");
+                            co_return;
+                        }
+                        using namespace core::date;
+                        if (type == field_type::DATE) {
+                            params.push_back(components::vector::make_scalar(resource_, date_t{days{reader.read_int32()}}));
+                        } else if (type == field_type::TIME) {
+                            params.push_back(
+                                components::vector::make_scalar(resource_, core::date::time_t{microseconds{reader.read_int64()}}));
+                        } else if (type == field_type::TIMESTAMP) {
+                            params.push_back(components::vector::make_scalar(
+                                resource_, timestamp_t{microseconds{reader.read_int64()}}));
+                        } else if (type == field_type::TIMESTAMPTZ) {
+                            params.push_back(components::vector::make_scalar(
+                                resource_, timestamptz_t{microseconds{reader.read_int64()}}));
+                        } else if (type == field_type::TIMETZ) {
+                            const microseconds time{reader.read_int64()};
+                            const timezone_offset_t zone{-reader.read_int32()};
+                            params.push_back(components::vector::make_scalar(resource_, timetz_t{time, zone}));
+                        } else {
+                            const microseconds time{reader.read_int64()};
+                            const days day{reader.read_int32()};
+                            const months month{reader.read_int32()};
+                            params.push_back(components::vector::make_scalar(resource_, interval_t{time, day, month}));
+                        }
                         break;
                     }
                     default:
@@ -1432,6 +1546,7 @@ namespace frontend::postgres {
                 postgres_resultset result(writer_,
                                           extra_float_digits_t{extra_float_digits_.current()},
                                           row_shape_known);
+                result.set_time_zone(session_time_zone());
                 if (!row_shape_known) {
                     result.add_chunk_columns(payload.chunks.front());
                     portal.described = true;
@@ -1633,6 +1748,8 @@ namespace frontend::postgres {
 
     void postgres_connection::finish_impl() {
         OTX_ZONE_N("pg::finish_impl");
+        // Before the connection is destroyed: no CancelRequest reaches it afterwards.
+        cancels().remove(connection_id_);
         // The prepared statements live in the connection's session and go with
         // it. Closing the session never waits: a statement still running (the
         // client stopped waiting for it) finishes, then the session frees itself.

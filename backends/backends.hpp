@@ -11,6 +11,7 @@
 #include <core/result_wrapper.hpp>
 
 #include <memory_resource>
+#include <string_view>
 
 namespace otterstax::backends {
     // Two startup steps of main.cpp after the engine opened, run by the
@@ -34,6 +35,9 @@ namespace otterstax::backends {
     // backend; the local database and the sessions' empty place, connections or
     // none), on the actors' registration session. Blocks the calling
     // (assembling) thread; an engine refusal is the error and startup aborts.
-    [[nodiscard]] core::error_t
-    register_remote_tables(std::pmr::memory_resource* resource, runtime::engine_t& engine, remote_backends_t& remote);
+    // `time_zone`: config.yaml's `service.timezone` (register_connections).
+    [[nodiscard]] core::error_t register_remote_tables(std::pmr::memory_resource* resource,
+                                                       runtime::engine_t& engine,
+                                                       remote_backends_t& remote,
+                                                       std::string_view time_zone = "UTC");
 } // namespace otterstax::backends

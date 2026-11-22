@@ -119,6 +119,7 @@ namespace otterstax::engine {
             const auto affected = cursor->is_write() ? cursor->affected_rows() : cursor->size();
             auto written = cursor::make_cursor(resource);
             written->set_written(affected);
+            written->set_generated_id(cursor->generated_id()); // an INSERT's (the MySQL wire's last_insert_id)
             written->set_transaction_status(cursor->transaction_status());
             co_return written;
         }

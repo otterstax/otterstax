@@ -86,9 +86,9 @@ The core bison parser always runs **first**; only queries it rejects reach the r
 
 Built as part of the normal build:
 
-- `cmake/otterbrix_parser_extension.cmake` is vendored into the repo and put on `CMAKE_MODULE_PATH` (root
-  `CMakeLists.txt`). It provides `otterbrix_add_parser_extension(...)` — the helper is **not shipped in the
-  packaged Conan include dir** — and links the produced library against `otterbrix::otterbrix` (the only
+- `otterbrix_add_parser_extension(...)` comes with the otterbrix package: its
+  `lib/cmake/otterbrix/otterbrix_parser_extension.cmake` is a `cmake_build_modules` entry, so
+  `find_package(otterbrix)` defines it (no `include()` needed). It links the produced library against `otterbrix::otterbrix` (the only
   exported component target; `otterbrix::sql` is not exported). `bison`/`flex` must be on PATH.
 - `otterbrix/CMakeLists.txt` adds both subdirectories, producing the static libs `otterbrix::s3_extension`
   and `otterbrix::file_extension`.

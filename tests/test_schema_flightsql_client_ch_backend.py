@@ -101,8 +101,8 @@ def main(local=False):
     # CH type mappings (from ch_to_chunk.cpp / to_local_translator):
     # Int64  → BIGINT         → pa.int64()
     # Int32  → INTEGER        → pa.int32()
-    # String → STRING_LITERAL → pa.string()
-    # DateTime → STRING_LITERAL → pa.string()
+    # String → TEXT → pa.string()
+    # DateTime → TIMESTAMPTZ → pa.timestamp('us', tz='UTC')
     # Float64 → DOUBLE        → pa.float64()
     expected_schemas = {
         'orders': {
@@ -110,7 +110,7 @@ def main(local=False):
             'campaign_id':   pa.int32(),
             'product_id':    pa.int32(),
             'customer_name': pa.string(),
-            'order_date':    pa.string(),
+            'order_date':    pa.timestamp('us', tz='UTC'),
             'quantity':      pa.int32(),
             'total_amount':  pa.float64(),
         }

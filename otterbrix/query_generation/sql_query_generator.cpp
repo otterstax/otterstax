@@ -104,10 +104,18 @@ namespace {
         const std::pmr::unordered_map<std::string_view, const expression_i*>* aliases{nullptr};
         bool expand_computed_aliases{false};
         // The two tables of an UPDATE ... FROM / DELETE ... USING: a column is
-        // written qualified by the table its key's side names. Null outside such
+        // written qualified by the table its key's position names. Null outside such
         // a statement, where one table makes every bare name unambiguous.
         const qualified_name_t* left_table{nullptr};
         const qualified_name_t* right_table{nullptr};
+        // The number of columns of `left_table`: the validator numbers a key of such a
+        // statement over the target's columns followed by the source's, so a position
+        // below it is the target's and one at or past it the source's.
+        std::size_t left_width{0};
+        // The ids the transformer gave the two tables of such a statement (the DML node's and its
+        // source child's): a key naming one by its id is that table's.
+        components::expressions::source_element_id_t left_element{components::expressions::NO_SOURCE_ELEMENT};
+        components::expressions::source_element_id_t right_element{components::expressions::NO_SOURCE_ELEMENT};
         // How the columns are spelled on the backend: of the one table of a
         // single-table statement (`columns`), of the two tables of a two-table
         // one (`left_columns` / `right_columns`, by the key's side). Null: as the
@@ -118,8 +126,10 @@ namespace {
         sql_gen::generation_options_t options{};
         // A query over relations (a JOIN tree, a derived table; validated tree only): the columns
         // its FROM outputs, numbered as the engine numbers them (a column key's path), and, while
-        // a JOIN's ON condition is written, the columns of its two sides (the key's side picks one,
-        // its path the column). Null outside such a query: a column is named by the plan's name.
+        // a JOIN's ON condition is written, the columns of its two sides (the validator numbers an
+        // ON key over the left side's columns followed by the right side's: a position below the
+        // left side's width is the left's, one past it the right's, less that width). Null outside
+        // such a query: a column is named by the plan's name.
         const source_columns_t* source{nullptr};
         const source_columns_t* left_source{nullptr};
         const source_columns_t* right_source{nullptr};
@@ -138,6 +148,11 @@ namespace {
         bool keys_name_outputs{false};
         // An UPDATE assignment was left to MySQL's store into the column (statement_needs_t).
         bool strict_store{false};
+        // The rows of an INSERT's VALUES are being written, and (ClickHouse) a TIMESTAMP / TIMESTAMPTZ
+        // of them was written as UTC text: the VALUES needs SETTINGS date_time_input_format = 'best_effort'
+        // (write_temporal_literal).
+        bool values_rows{false};
+        bool values_text_datetime{false};
 
         bool failed() const noexcept { return error.contains_error(); }
         void fail(core::error_code_t code, std::string_view msg) {
@@ -284,6 +299,7 @@ namespace {
                 return "float8";
             case logical_type::BLOB:
             case logical_type::BIT:
+            case logical_type::TEXT:
             case logical_type::STRING_LITERAL:
                 return "text";
             default:
@@ -317,6 +333,7 @@ namespace {
                 return "double";
             case logical_type::BLOB:
             case logical_type::BIT:
+            case logical_type::TEXT:
             case logical_type::STRING_LITERAL:
                 return "text";
             default:
@@ -350,6 +367,7 @@ namespace {
                 return "Float64";
             case logical_type::BLOB:
             case logical_type::BIT:
+            case logical_type::TEXT:
             case logical_type::STRING_LITERAL:
                 return "String";
             default:
@@ -561,9 +579,25 @@ namespace {
     // DATE / TIME / TIMESTAMP / TIMESTAMPTZ in each dialect's typed form, the text
     // being the engine's own rendering (core/date/date_to_string.hpp: ISO date,
     // hh:mm:ss[.ffffff], a TIMESTAMPTZ in UTC with its `+00`). What a dialect
-    // cannot type is unimplemented_yet: ClickHouse 23.8 has no TIME, and only
-    // PostgreSQL has a TIMESTAMPTZ literal. A ClickHouse TIMESTAMP is read and
-    // written in UTC.
+    // cannot type is unimplemented_yet: ClickHouse 23.8 has no TIME. A TIMESTAMPTZ
+    // is PostgreSQL's own literal elsewhere UTC's wall clock (MySQL's agent
+    // sessions run in UTC, ClickHouse's literal names the zone); a ClickHouse
+    // TIMESTAMP is read and written in UTC.
+    //
+    // A ClickHouse INSERT's VALUES row takes no toDateTime64(...): the Values format converts the
+    // expression's value (a Decimal64) to the column's type as a field, which a DateTime column refuses
+    // ("Type mismatch in IN or VALUES section. Expected: DateTime. Got: Decimal64"). The row holds the
+    // UTC text with its `Z` instead, read under date_time_input_format = 'best_effort' into a DateTime
+    // (fraction dropped), a DateTime64 and a column of another zone alike (write_values_rows).
+    void write_clickhouse_datetime(std::stringstream& stream, std::string_view utc_text, gen_ctx_t& ctx) {
+        if (ctx.values_rows) {
+            stream << "'" << utc_text << "Z'";
+            ctx.values_text_datetime = true;
+        } else {
+            stream << "toDateTime64('" << utc_text << "', 6, 'UTC')";
+        }
+    }
+
     void write_temporal_literal(std::stringstream& stream,
                                 const components::vector::vector_t& leaf,
                                 std::uint64_t index,
@@ -591,19 +625,28 @@ namespace {
                     // In UTC, as ch_to_chunk renders every DateTime / DateTime64 it reads: without
                     // the zone ClickHouse would parse the text in the server's time zone. A DATE
                     // has no zone.
-                    stream << "toDateTime64('" << text << "', 6, 'UTC')";
+                    write_clickhouse_datetime(stream, text, ctx);
                 } else {
                     stream << "TIMESTAMP '" << text << "'";
                 }
                 return;
             }
-            case logical_type::TIMESTAMP_TZ:
-                if (ctx.backend != backend_type_t::PostgreSQL) {
-                    break;
+            case logical_type::TIMESTAMP_TZ: {
+                const auto instant = leaf.get_value<core::date::timestamptz_t>(index);
+                if (ctx.backend == backend_type_t::PostgreSQL) {
+                    stream << "TIMESTAMPTZ '" << core::date::to_string(instant) << "'";
+                    return;
                 }
-                stream << "TIMESTAMPTZ '" << core::date::to_string(leaf.get_value<core::date::timestamptz_t>(index))
-                       << "'";
+                // The instant as UTC's wall clock: every MySQL agent session runs in UTC (backend_agent_t::
+                // check_session), so a TIMESTAMP column compares it as the instant; ClickHouse is told the zone.
+                const auto utc = core::date::to_string(core::date::timestamp_t{instant.value});
+                if (ch) {
+                    write_clickhouse_datetime(stream, utc, ctx);
+                } else {
+                    stream << "TIMESTAMP '" << utc << "'";
+                }
                 return;
+            }
             default:
                 break;
         }
@@ -712,6 +755,7 @@ namespace {
             case logical_type::UHUGEINT:
                 stream << leaf.get_value<components::types::uint128_t>(index);
                 break;
+            case logical_type::TEXT:
             case logical_type::STRING_LITERAL:
                 write_string_literal(stream, leaf.get_value<std::string_view>(index), backend);
                 break;
@@ -888,7 +932,7 @@ namespace {
     }
 
     // A column reference. In an UPDATE ... FROM / DELETE ... USING the same bare
-    // name can exist in both tables, so a key whose side names one of them is
+    // name can exist in both tables, so a key whose position names one of them is
     // written qualified by that table; outside such a statement there is one
     // table and the bare name is unambiguous. A key carrying a cast type is the
     // engine's typed field selection: dropping the type would change the value
@@ -896,19 +940,65 @@ namespace {
     // The columns a key names a column of in a query over relations: the side of the JOIN whose
     // ON condition is being written, or the FROM of the query. Null: not a relational query, or a
     // key without a position (an output alias).
-    const source_columns_t* source_of(const components::expressions::key_t& key, const gen_ctx_t& ctx) {
+    struct column_at_t {
+        const source_columns_t* source;
+        std::size_t index; // the column's position in `source`
+    };
+
+    std::optional<column_at_t> column_at(const components::expressions::key_t& key, const gen_ctx_t& ctx) {
         if (key.path().empty()) {
-            return nullptr;
+            return std::nullopt;
         }
+        const std::size_t position = key.path().front();
         if (ctx.left_source != nullptr || ctx.right_source != nullptr) {
-            // In an ON condition the side says which of the two the path numbers.
-            return key.side() == side_t::left    ? ctx.left_source
-                   : key.side() == side_t::right ? ctx.right_source
-                                                 : nullptr;
+            // In an ON condition the path numbers the left side's columns, then the right side's.
+            const std::size_t left_width = ctx.left_source != nullptr ? ctx.left_source->size() : 0;
+            if (position < left_width) {
+                return column_at_t{ctx.left_source, position};
+            }
+            if (ctx.right_source == nullptr) {
+                return std::nullopt;
+            }
+            return column_at_t{ctx.right_source, position - left_width};
         }
-        // In a query block the path numbers what its FROM outputs, whatever the side (the engine
-        // expands `p.*` into positioned keys without one).
-        return ctx.source;
+        // In a query block the path numbers what its FROM outputs (the engine expands `p.*` into
+        // positioned keys).
+        if (ctx.source == nullptr) {
+            return std::nullopt;
+        }
+        return column_at_t{ctx.source, position};
+    }
+
+    // Which table of an UPDATE ... FROM / DELETE ... USING a key names: the one whose id it carries
+    // (the transformer names the table a reference resolves to), else by its position (the validator
+    // numbers the target's columns first). Unknown: neither says — a bare name is then written as the
+    // client wrote it (the backend resolves it, or refuses it as ambiguous), while a qualified one is
+    // refused: written bare it could read the other table's column. None: not such a statement.
+    enum class two_table_side_t
+    {
+        none,
+        target,
+        source,
+        unknown
+    };
+
+    two_table_side_t two_table_side(const components::expressions::key_t& key, const gen_ctx_t& ctx) {
+        using components::expressions::NO_SOURCE_ELEMENT;
+        if (ctx.left_table == nullptr) {
+            return two_table_side_t::none;
+        }
+        if (const auto element = key.source_element(); element != NO_SOURCE_ELEMENT) {
+            if (element == ctx.left_element) {
+                return two_table_side_t::target;
+            }
+            if (element == ctx.right_element) {
+                return two_table_side_t::source;
+            }
+        }
+        if (!key.path().empty() && ctx.left_width != 0) {
+            return key.path().front() < ctx.left_width ? two_table_side_t::target : two_table_side_t::source;
+        }
+        return two_table_side_t::unknown;
     }
 
     bool in_relational_query(const gen_ctx_t& ctx) noexcept {
@@ -941,13 +1031,13 @@ namespace {
             // The validator numbers every column reference by the position of the column in what
             // the FROM outputs (in a JOIN's ON, in what its side outputs): that position, not the
             // name, says which table the column is of — two tables may share a column name.
-            const auto* source = source_of(key, ctx);
-            if (source == nullptr && find_alias(ctx.aliases, key) != nullptr) {
+            const auto at = column_at(key, ctx);
+            if (!at && find_alias(ctx.aliases, key) != nullptr) {
                 // An output alias of the SELECT (ORDER BY n): every dialect resolves it there.
                 write_key(stream, key, ctx.backend);
                 return;
             }
-            if (source == nullptr) {
+            if (!at) {
                 ctx.fail(core::error_code_t::unimplemented_yet,
                          "a column reference without a position in a query over several tables: ",
                          key.as_string());
@@ -958,21 +1048,28 @@ namespace {
                          "a struct-member reference is not generated for a query over several tables");
                 return;
             }
-            if (key.path().front() >= source->size()) {
+            if (at->index >= at->source->size()) {
                 ctx.fail(core::error_code_t::invalid_parameter,
                          "a column reference past the columns its relation outputs: ",
                          key.as_string());
                 return;
             }
-            write_source_column(stream, (*source)[key.path().front()], ctx);
+            write_source_column(stream, (*at->source)[at->index], ctx);
             return;
         }
         const qualified_name_t* table = nullptr;
         const sql_gen::column_map_t* columns = ctx.columns;
-        if (key.side() == side_t::left && ctx.left_table != nullptr) {
+        const auto side = two_table_side(key, ctx);
+        if (side == two_table_side_t::unknown && key.has_qualifier()) {
+            ctx.fail(core::error_code_t::unimplemented_yet,
+                     "a qualified column reference naming neither table of a two-table statement: ",
+                     key.as_string());
+            return;
+        }
+        if (side == two_table_side_t::target) {
             table = ctx.left_table;
             columns = ctx.left_columns;
-        } else if (key.side() == side_t::right && ctx.right_table != nullptr) {
+        } else if (side == two_table_side_t::source && ctx.right_table != nullptr) {
             table = ctx.right_table;
             columns = ctx.right_columns;
         }
@@ -1022,7 +1119,7 @@ namespace {
             write_key(stream, key, ctx.backend);
             return;
         }
-        if (source_of(key, ctx) != nullptr) {
+        if (column_at(key, ctx)) {
             // A positioned column of a query over relations: never an output alias, even where an
             // output carries the column's name.
             write_column(stream, key, ctx);
@@ -1462,6 +1559,7 @@ namespace {
                 return "FLOAT";
             case logical_type::DOUBLE:
                 return "DOUBLE";
+            case logical_type::TEXT:
             case logical_type::STRING_LITERAL:
                 return "CHAR";
             default:
@@ -1534,16 +1632,17 @@ namespace {
                 }
                 return std::nullopt;
             }
-            if (const auto* source = source_of(key, ctx)) {
-                if (key.path().size() == 1 && key.path().front() < source->size()) {
-                    return (*source)[key.path().front()].type;
+            if (const auto at = column_at(key, ctx)) {
+                if (key.path().size() == 1 && at->index < at->source->size()) {
+                    return (*at->source)[at->index].type;
                 }
                 return std::nullopt;
             }
             const sql_gen::column_map_t* columns = ctx.columns;
-            if (key.side() == side_t::left && ctx.left_columns != nullptr) {
+            const auto side = two_table_side(key, ctx);
+            if (side == two_table_side_t::target && ctx.left_columns != nullptr) {
                 columns = ctx.left_columns;
-            } else if (key.side() == side_t::right && ctx.right_columns != nullptr) {
+            } else if (side == two_table_side_t::source && ctx.right_columns != nullptr) {
                 columns = ctx.right_columns;
             }
             if (columns != nullptr && key.storage().size() == 1) {
@@ -2685,11 +2784,13 @@ namespace {
         }
     }
 
-    // Which sides of a JOIN an operand reads.
+    // Which sides of a JOIN an operand reads. The validator numbers an ON key over the left side's
+    // columns followed by the right side's, so its position says its side.
     struct sides_t {
+        std::size_t left_width{0};
         bool left{false};
         bool right{false};
-        bool other{false}; // a column reference without a side: not decidable
+        bool other{false}; // a column reference without a position: not decidable
     };
 
     void collect_sides(const expression_i& expr, sides_t& sides);
@@ -2697,12 +2798,12 @@ namespace {
     void collect_sides(const param_storage& operand, sides_t& sides) {
         if (is_key(operand)) {
             const auto& key = as_key(operand);
-            if (key.side() == side_t::left) {
-                sides.left = true;
-            } else if (key.side() == side_t::right) {
-                sides.right = true;
-            } else {
+            if (key.path().empty()) {
                 sides.other = true;
+            } else if (key.path().front() < sides.left_width) {
+                sides.left = true;
+            } else {
+                sides.right = true;
             }
         } else if (is_expr(operand) && as_expr(operand)) {
             collect_sides(*as_expr(operand), sides);
@@ -2754,7 +2855,7 @@ namespace {
     // join takes only on the side whose rows it does not preserve (LEFT: the right side, RIGHT: the
     // left side, FULL: none). Anything else is refused ("Unsupported JOIN ON conditions") or, for a
     // condition on a preserved side, not run with the engine's semantics.
-    bool clickhouse_join_condition(const expression_i& condition, join_type type) {
+    bool clickhouse_join_condition(const expression_i& condition, join_type type, std::size_t left_width) {
         std::vector<const expression_i*> conjuncts;
         if (condition.group() == expression_group::compare &&
             static_cast<const compare_expression_t&>(condition).type() == compare_type::union_and) {
@@ -2772,8 +2873,8 @@ namespace {
             if (conjunct->group() == expression_group::compare) {
                 const auto& compare = static_cast<const compare_expression_t&>(*conjunct);
                 if (compare.type() == compare_type::eq && compare.children().empty()) {
-                    sides_t left;
-                    sides_t right;
+                    sides_t left{left_width};
+                    sides_t right{left_width};
                     collect_sides(compare.left(), left);
                     collect_sides(compare.right(), right);
                     const bool across = !left.other && !right.other &&
@@ -2785,7 +2886,7 @@ namespace {
                     }
                 }
             }
-            sides_t sides;
+            sides_t sides{left_width};
             collect_sides(*conjunct, sides);
             if (sides.other || (sides.left && sides.right)) {
                 return false;
@@ -2862,12 +2963,6 @@ namespace {
                 return;
         }
         const join_type type = join.type() == join_type::cross ? join_type::inner : join.type();
-        if (ch && !always && !clickhouse_join_condition(*join.expressions().front(), type)) {
-            ctx.fail(core::error_code_t::unimplemented_yet,
-                     "ClickHouse runs a JOIN ON equalities between the two sides, with conditions only on the "
-                     "side an outer join does not preserve");
-            return;
-        }
         if (ch && always && outer) {
             ctx.fail(core::error_code_t::unimplemented_yet, "ClickHouse runs no outer JOIN without an equality");
             return;
@@ -2887,6 +2982,13 @@ namespace {
         write_relation(stream, join.children()[1], right, ctx);
         if (nested) {
             stream << ")";
+        }
+        // Checked once the left side's width is known: an ON key's position says its side.
+        if (ch && !always && !ctx.failed() && !clickhouse_join_condition(*join.expressions().front(), type, left.size())) {
+            ctx.fail(core::error_code_t::unimplemented_yet,
+                     "ClickHouse runs a JOIN ON equalities between the two sides, with conditions only on the "
+                     "side an outer join does not preserve");
+            return;
         }
         if (keyword != " CROSS JOIN ") {
             stream << " ON ";
@@ -3752,8 +3854,8 @@ namespace {
     }
 
     // ` RETURNING <every column of the target>` (the declared order), each qualified by the target
-    // when a second table is named: PostgreSQL only — MySQL has no RETURNING, ClickHouse's
-    // mutations answer no rows.
+    // when a second table is named: PostgreSQL and MySQL (MariaDB answers DELETE ... RETURNING; MySQL
+    // and a MariaDB UPDATE refuse it themselves) — ClickHouse's mutations answer no rows.
     void write_returning(std::stringstream& stream,
                          const sql_gen::statement_target_t& target,
                          bool qualified,
@@ -3761,7 +3863,7 @@ namespace {
         if (!ctx.options.returning || ctx.failed()) {
             return;
         }
-        if (ctx.backend != backend_type_t::PostgreSQL) {
+        if (ctx.backend == backend_type_t::ClickHouse) {
             ctx.fail(core::error_code_t::unimplemented_yet, "RETURNING is not supported by this backend");
             return;
         }
@@ -3825,6 +3927,10 @@ namespace {
             // the wrong one would delete rows the statement never matched.
             ctx.left_table = &target.name;
             ctx.right_table = &target.from_name;
+            ctx.left_width = target.all_columns.size();
+            ctx.left_element = node->source_element();
+            ctx.right_element = parts.source != nullptr ? parts.source->source_element()
+                                                        : components::expressions::NO_SOURCE_ELEMENT;
             ctx.left_columns = target.columns;
             ctx.right_columns = target.from_columns;
         }
@@ -3833,6 +3939,9 @@ namespace {
         ctx.clause = "query";
         ctx.left_table = nullptr;
         ctx.right_table = nullptr;
+        ctx.left_width = 0;
+        ctx.left_element = components::expressions::NO_SOURCE_ELEMENT;
+        ctx.right_element = components::expressions::NO_SOURCE_ELEMENT;
         ctx.left_columns = nullptr;
         ctx.right_columns = nullptr;
         if (has_dml_limit(parts)) {
@@ -3879,6 +3988,10 @@ namespace {
             // written — instead.
             ctx.left_table = &target.name;
             ctx.right_table = &target.from_name;
+            ctx.left_width = target.all_columns.size();
+            ctx.left_element = node->source_element();
+            ctx.right_element = parts.source != nullptr ? parts.source->source_element()
+                                                        : components::expressions::NO_SOURCE_ELEMENT;
             ctx.left_columns = target.columns;
             ctx.right_columns = target.from_columns;
         }
@@ -3927,12 +4040,31 @@ namespace {
         }
         ctx.left_table = nullptr;
         ctx.right_table = nullptr;
+        ctx.left_width = 0;
+        ctx.left_element = components::expressions::NO_SOURCE_ELEMENT;
+        ctx.right_element = components::expressions::NO_SOURCE_ELEMENT;
         ctx.left_columns = nullptr;
         ctx.right_columns = nullptr;
         if (has_dml_limit(parts)) {
             stream << " LIMIT " << parts.limit->limit().count();
         }
         write_returning(stream, target, with_source, ctx);
+    }
+
+    // `VALUES (...), (...)`, the rows written by `write_rows(rows_stream)`. A ClickHouse row holding a
+    // TIMESTAMP / TIMESTAMPTZ as UTC text (write_clickhouse_datetime) is read under
+    // `SETTINGS date_time_input_format = 'best_effort'`, the clause an INSERT takes before its VALUES.
+    template<typename WriteRows>
+    void write_values_rows(std::stringstream& stream, gen_ctx_t& ctx, WriteRows&& write_rows) {
+        std::stringstream rows;
+        ctx.values_rows = true;
+        ctx.values_text_datetime = false;
+        write_rows(rows);
+        ctx.values_rows = false;
+        if (ctx.values_text_datetime) {
+            stream << "SETTINGS date_time_input_format = 'best_effort' ";
+        }
+        stream << "VALUES " << rows.str();
     }
 
     // VALUES (...), (...) for every row of the chunk.
@@ -3944,22 +4076,23 @@ namespace {
             ctx.fail(core::error_code_t::invalid_parameter, "VALUES without rows or columns");
             return;
         }
-        stream << "VALUES ";
-        bool comma = false;
-        for (size_t i = 0; i < chunk.size(); i++) {
-            if (comma) {
-                stream << ", ";
-            }
-            stream << "(";
-            for (size_t j = 0; j < chunk.column_count(); j++) {
-                if (j != 0) {
-                    stream << ", ";
+        write_values_rows(stream, ctx, [&](std::stringstream& rows) {
+            bool comma = false;
+            for (size_t i = 0; i < chunk.size(); i++) {
+                if (comma) {
+                    rows << ", ";
                 }
-                write_cell(stream, chunk.data[j], i, ctx);
+                rows << "(";
+                for (size_t j = 0; j < chunk.column_count(); j++) {
+                    if (j != 0) {
+                        rows << ", ";
+                    }
+                    write_cell(rows, chunk.data[j], i, ctx);
+                }
+                rows << ")";
+                comma = true;
             }
-            stream << ")";
-            comma = true;
-        }
+        });
     }
 
     void generate_insert(std::stringstream& stream,
@@ -4131,7 +4264,7 @@ namespace sql_gen {
             ctx.fail(core::error_code_t::invalid_parameter, "INSERT: no rows or no columns to write");
             return core::result_wrapper_t<std::string>{std::move(ctx.error)};
         }
-        if (!returning_columns.empty() && backend != backend_type_t::PostgreSQL) {
+        if (!returning_columns.empty() && backend == backend_type_t::ClickHouse) {
             ctx.fail(core::error_code_t::unimplemented_yet, "RETURNING is not supported by this backend");
             return core::result_wrapper_t<std::string>{std::move(ctx.error)};
         }
@@ -4145,21 +4278,23 @@ namespace sql_gen {
             }
             quote_ident(stream, columns[i], backend);
         }
-        stream << ") VALUES ";
-        for (std::uint64_t row = 0; row < rows.size() && !ctx.failed(); ++row) {
-            stream << (row == 0 ? "(" : ", (");
-            for (std::size_t i = 0; i < column_indexes.size(); ++i) {
-                if (i != 0) {
-                    stream << ", ";
+        stream << ") ";
+        write_values_rows(stream, ctx, [&](std::stringstream& values) {
+            for (std::uint64_t row = 0; row < rows.size() && !ctx.failed(); ++row) {
+                values << (row == 0 ? "(" : ", (");
+                for (std::size_t i = 0; i < column_indexes.size(); ++i) {
+                    if (i != 0) {
+                        values << ", ";
+                    }
+                    if (column_indexes[i] >= rows.column_count()) {
+                        ctx.fail(core::error_code_t::invalid_parameter, "INSERT: a column index past the row");
+                        break;
+                    }
+                    write_cell(values, rows.data[column_indexes[i]], row, ctx);
                 }
-                if (column_indexes[i] >= rows.column_count()) {
-                    ctx.fail(core::error_code_t::invalid_parameter, "INSERT: a column index past the row");
-                    break;
-                }
-                write_cell(stream, rows.data[column_indexes[i]], row, ctx);
+                values << ")";
             }
-            stream << ")";
-        }
+        });
         if (!returning_columns.empty()) {
             stream << " RETURNING ";
             for (std::size_t i = 0; i < returning_columns.size(); ++i) {

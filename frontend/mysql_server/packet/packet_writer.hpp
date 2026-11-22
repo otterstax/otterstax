@@ -30,6 +30,9 @@ namespace frontend::mysql {
 
         std::vector<uint8_t> build_from_payload(uint8_t sequence_id);
 
+        // slice payload above MAX_PACKET_SIZE into several wire packets
+        std::vector<std::vector<uint8_t>> build_from_payload_pieces();
+
     private:
         using packet_writer_base::reserve_payload;
     };

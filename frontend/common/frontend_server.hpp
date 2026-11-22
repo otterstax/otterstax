@@ -41,6 +41,9 @@ namespace frontend {
         // statements in flight. No default — zero threads would serve nothing
         // (asserted).
         size_t pool_size;
+        // How long an established connection waits for its next message before it is closed as idle (the
+        // handshake / startup and a message's body take read_timeout). Production passes IDLE_TIMEOUT_SEC.
+        std::chrono::milliseconds idle_timeout{std::chrono::seconds(IDLE_TIMEOUT_SEC)};
     };
 
     template<typename DerivedConnection>
@@ -54,13 +57,14 @@ namespace frontend {
             , accept_retry_timer_(thread_pool_manager_.ctx())
             , next_connection_id_(1)
             , sessions_(config.sessions)
-            , read_timeout_(config.read_timeout)
+            , timeouts_{config.read_timeout, config.idle_timeout}
             , accept_retry_delay_(config.accept_retry_delay)
             , log_(get_logger(logger_tag::FRONTEND_SERVER)) {
             assert(log_.is_valid());
             assert(resource_ != nullptr && "memory resource must not be null");
             assert(sessions_ != nullptr && "the session factory must not be null");
-            assert(read_timeout_.count() > 0 && "read timeout must be positive");
+            assert(timeouts_.read.count() > 0 && "read timeout must be positive");
+            assert(timeouts_.idle.count() > 0 && "idle timeout must be positive");
             assert(accept_retry_delay_.count() > 0 && "accept retry delay must be positive");
             assert(config.pool_size > 0 && "a frontend server needs at least one thread");
             connection_pool_.reserve(MAX_CONNECTIONS);
@@ -157,7 +161,7 @@ namespace frontend {
                                                                                   *sessions_,
                                                                                   close_sink_,
                                                                                   *slot,
-                                                                                  read_timeout_);
+                                                                                  timeouts_);
                     log_->debug("Connection accepted (slot {})", *slot);
                     connection_pool_[*slot]->start();
                 }
@@ -249,8 +253,10 @@ namespace frontend {
 
         otterstax::session::session_factory_t* sessions_;
         std::atomic<uint32_t> next_connection_id_;
-        std::chrono::milliseconds read_timeout_;
+        connection_timeouts_t timeouts_;
         std::chrono::milliseconds accept_retry_delay_;
+        // Before the pool: destroyed after every connection, which removes itself from it in its finish_impl.
+        cancel_registry_t cancels_;
         std::vector<std::unique_ptr<DerivedConnection>> connection_pool_;
         std::queue<size_t> available_slots_;
         log_t log_;
@@ -269,6 +275,7 @@ namespace frontend {
             explicit close_sink_t(frontend_server& server)
                 : server_(server) {}
             void release_connection_slot(size_t slot) override { server_.release_connection_slot(slot); }
+            cancel_registry_t& cancels() override { return server_.cancels_; }
 
         private:
             frontend_server& server_;

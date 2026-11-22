@@ -3,6 +3,7 @@
 
 #include "frontend/mysql_server/packet/packet_reader.hpp"
 #include "frontend/mysql_server/resultset/mysql_resultset.hpp"
+#include "temporal_chunk.hpp"
 
 #include <boost/mysql/column_type.hpp>
 #include <boost/mysql/detail/access.hpp>
@@ -41,7 +42,7 @@ TEST_CASE("text_resultset: single row") {
     auto* resource = std::pmr::new_delete_resource();
 
     std::pmr::vector<components::types::complex_logical_type> fields(resource);
-    fields.emplace_back(components::types::logical_type::STRING_LITERAL, "str");
+    fields.emplace_back(components::types::logical_type::TEXT, "str");
     fields.emplace_back(components::types::logical_type::INTEGER, "int64");
     fields.emplace_back(components::types::logical_type::BOOLEAN, "bool");
     fields.emplace_back(components::types::logical_type::DOUBLE, "double");
@@ -127,7 +128,7 @@ TEST_CASE("text_resultset: single row") {
                     // MySQL's shortest exact form (my_gcvt), not six fixed decimals.
                     REQUIRE(val == "3.141593");
                     break;
-                case components::types::logical_type::STRING_LITERAL:
+                case components::types::logical_type::TEXT:
                     REQUIRE(val == row.data[idx].get_value<std::string_view>(0));
                     break;
                 default:
@@ -141,7 +142,7 @@ TEST_CASE("text_resultset: single row") {
 TEST_CASE("text_resultset: multi row") {
     auto* resource = std::pmr::new_delete_resource();
     std::pmr::vector<components::types::complex_logical_type> fields(resource);
-    fields.emplace_back(types::logical_type::STRING_LITERAL, "str");
+    fields.emplace_back(types::logical_type::TEXT, "str");
 
     vector::data_chunk_t chunk(resource, fields);
     std::string test_str(2000, 's');
@@ -275,7 +276,7 @@ TEST_CASE("binary_resultset: a row whose every cell is NULL writes the bitmap an
     auto* resource = std::pmr::new_delete_resource();
     std::pmr::vector<components::types::complex_logical_type> fields(resource);
     fields.emplace_back(types::logical_type::BIGINT, "id");
-    fields.emplace_back(types::logical_type::STRING_LITERAL, "name");
+    fields.emplace_back(types::logical_type::TEXT, "name");
     fields.emplace_back(types::logical_type::INTEGER, "code");
 
     vector::data_chunk_t chunk(resource, fields);
@@ -309,7 +310,7 @@ TEST_CASE("binary_resultset: a NULL in the first and in the last column keeps th
     auto* resource = std::pmr::new_delete_resource();
     std::pmr::vector<components::types::complex_logical_type> fields(resource);
     fields.emplace_back(types::logical_type::BIGINT, "id");
-    fields.emplace_back(types::logical_type::STRING_LITERAL, "name");
+    fields.emplace_back(types::logical_type::TEXT, "name");
     fields.emplace_back(types::logical_type::INTEGER, "code");
 
     const std::string one = "one";
@@ -407,7 +408,7 @@ TEST_CASE("text_resultset: a NULL cell of a typed column is the 0xFB marker") {
 TEST_CASE("text_resultset: null (data_chunk)") {
     auto* resource = std::pmr::new_delete_resource();
     std::pmr::vector<components::types::complex_logical_type> fields(resource);
-    fields.emplace_back(types::logical_type::STRING_LITERAL, "str");
+    fields.emplace_back(types::logical_type::TEXT, "str");
 
     vector::data_chunk_t chunk(resource, fields);
     chunk.resize(2);
@@ -481,12 +482,9 @@ TEST_CASE("binary_resultset: scalars are little-endian at their MySQL width") {
     while (r.remaining() > 0) {
         bytes.push_back(r.read_uint8());
     }
-    CHECK(bytes == std::vector<uint8_t>{0xFE,
-                                        0xD4, 0xFE,
-                                        0x90, 0xEE, 0xFE, 0xFF,
-                                        0xFB, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-                                        0x00, 0x00, 0xC0, 0x3F,
-                                        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xC0});
+    CHECK(bytes == std::vector<uint8_t>{0xFE, 0xD4, 0xFE, 0x90, 0xEE, 0xFE, 0xFF, 0xFB, 0xFF,
+                                        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0xC0,
+                                        0x3F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xC0});
 }
 
 namespace {
@@ -502,9 +500,8 @@ namespace {
         return {packet.data() + 4, packet.size() - 4};
     }
 
-    boost_decoded_t decode_with_boost(const std::vector<std::vector<uint8_t>>& packets,
-                                      size_t columns,
-                                      result_encoding encoding) {
+    boost_decoded_t
+    decode_with_boost(const std::vector<std::vector<uint8_t>>& packets, size_t columns, result_encoding encoding) {
         REQUIRE(packets.size() == columns + 4); // count + defs + eof + row + eof
         boost_decoded_t out;
         for (size_t i = 0; i < columns; ++i) {
@@ -513,14 +510,12 @@ namespace {
             out.meta.push_back(boost::mysql::detail::access::construct<boost::mysql::metadata>(coldef, true));
         }
         std::vector<boost::mysql::field_view> views(columns);
-        REQUIRE_FALSE(boost::mysql::detail::deserialize_row(encoding == result_encoding::TEXT
-                                                                ? boost::mysql::detail::resultset_encoding::text
-                                                                : boost::mysql::detail::resultset_encoding::binary,
-                                                            payload_of(packets[columns + 2]),
-                                                            boost::mysql::metadata_collection_view(out.meta.data(),
-                                                                                                   out.meta.size()),
-                                                            boost::span<boost::mysql::field_view>(views.data(),
-                                                                                                  views.size())));
+        REQUIRE_FALSE(boost::mysql::detail::deserialize_row(
+            encoding == result_encoding::TEXT ? boost::mysql::detail::resultset_encoding::text
+                                              : boost::mysql::detail::resultset_encoding::binary,
+            payload_of(packets[columns + 2]),
+            boost::mysql::metadata_collection_view(out.meta.data(), out.meta.size()),
+            boost::span<boost::mysql::field_view>(views.data(), views.size())));
         for (const auto& view : views) {
             out.row.emplace_back(view);
         }
@@ -607,7 +602,7 @@ TEST_CASE("mysql resultset: the column flags follow the column's type") {
     fields.emplace_back(types::logical_type::UBIGINT, "u");
     fields.emplace_back(types::logical_type::DOUBLE, "d");
     fields.emplace_back(types::logical_type::BOOLEAN, "b");
-    fields.emplace_back(types::logical_type::STRING_LITERAL, "s");
+    fields.emplace_back(types::logical_type::TEXT, "s");
     vector::data_chunk_t chunk(resource, fields);
     chunk.set_value(0, 0, int64_t{1});
     chunk.set_value(1, 0, uint64_t{1});
@@ -632,4 +627,157 @@ TEST_CASE("mysql resultset: the column flags follow the column's type") {
     column_definition_41 label("e", field_type::MYSQL_TYPE_STRING);
     apply_type_metadata(label, components::types::complex_logical_type{types::logical_type::ENUM});
     CHECK(label.column_flags == ENUM_FLAG);
+}
+
+namespace {
+    // The byte count of the prefix of a length-encoded string of `len` bytes.
+    size_t lenenc_prefix_size(size_t len) {
+        if (len < 251) {
+            return 1;
+        }
+        if (len < 65536) {
+            return 3;
+        }
+        if (len < (size_t{1} << 24)) {
+            return 4;
+        }
+        return 9;
+    }
+
+    // A one-TEXT-column chunk whose single row's cell makes the row payload
+    // (the length prefix plus the bytes) exactly `payload` bytes long.
+    vector::data_chunk_t one_text_row(std::pmr::memory_resource* resource, size_t payload) {
+        size_t bytes = payload - lenenc_prefix_size(payload - 1);
+        while (bytes + lenenc_prefix_size(bytes) != payload) {
+            --bytes;
+        }
+        const std::string cell(bytes, 'x');
+
+        std::pmr::vector<components::types::complex_logical_type> fields(resource);
+        fields.emplace_back(components::types::logical_type::TEXT, "s");
+        vector::data_chunk_t row(resource, fields);
+        row.set_value(0, 0, std::string_view{cell});
+        row.set_cardinality(1);
+        return row;
+    }
+
+    // The payload length and the seq id of every wire packet between `first`
+    // and the final EOF (with one column, the row's pieces).
+    std::vector<std::pair<uint32_t, uint8_t>> piece_headers(const std::vector<std::vector<uint8_t>>& packets,
+                                                            size_t first) {
+        std::vector<std::pair<uint32_t, uint8_t>> out;
+        for (size_t i = first; i + 1 < packets.size(); ++i) {
+            REQUIRE(packets[i].size() >= 4);
+            out.emplace_back(packets[i][0] | (packets[i][1] << 8) | (packets[i][2] << 16), packets[i][3]);
+        }
+        return out;
+    }
+} // namespace
+
+TEST_CASE("text_resultset: a row at one packet's limit leaves as a full piece and an empty terminator") {
+    auto* resource = std::pmr::new_delete_resource();
+    auto row = one_text_row(resource, MAX_PACKET_SIZE);
+
+    packet_writer w;
+    mysql_resultset result(w, result_encoding::TEXT, "db", "tbl");
+    result.add_chunk_columns(row);
+    result.add_row(row, 0);
+    uint8_t seq = 0;
+    const auto packets = mysql_resultset::build_packets(std::move(result), seq);
+
+    const auto pieces = piece_headers(packets, 3);
+    REQUIRE(pieces.size() == 2);
+    CHECK(pieces[0].first == MAX_PACKET_SIZE);
+    CHECK(pieces[1].first == 0);
+    CHECK(pieces[0].second == 3); // after count + column def + eof
+    CHECK(pieces[1].second == 4);
+}
+
+TEST_CASE("text_resultset: a row past one packet's limit is split at MAX_PACKET_SIZE") {
+    auto* resource = std::pmr::new_delete_resource();
+    auto row = one_text_row(resource, size_t{MAX_PACKET_SIZE} + 1);
+
+    packet_writer w;
+    mysql_resultset result(w, result_encoding::TEXT, "db", "tbl");
+    result.add_chunk_columns(row);
+    result.add_row(row, 0);
+    uint8_t seq = 0;
+    const auto packets = mysql_resultset::build_packets(std::move(result), seq);
+
+    const auto pieces = piece_headers(packets, 3);
+    REQUIRE(pieces.size() == 2);
+    CHECK(pieces[0].first == MAX_PACKET_SIZE);
+    CHECK(pieces[1].first == 1);
+    CHECK(pieces[0].second == 3);
+    CHECK(pieces[1].second == 4);
+    CHECK(packets[4].back() == 'x'); // the last byte of the overflow piece
+}
+
+TEST_CASE("text_resultset: an exact multiple of the packet limit gains an empty terminator") {
+    auto* resource = std::pmr::new_delete_resource();
+    auto row = one_text_row(resource, 2 * size_t{MAX_PACKET_SIZE});
+
+    packet_writer w;
+    mysql_resultset result(w, result_encoding::TEXT, "db", "tbl");
+    result.add_chunk_columns(row);
+    result.add_row(row, 0);
+    uint8_t seq = 0;
+    const auto packets = mysql_resultset::build_packets(std::move(result), seq);
+
+    const auto pieces = piece_headers(packets, 3);
+    REQUIRE(pieces.size() == 3);
+    CHECK(pieces[0].first == MAX_PACKET_SIZE);
+    CHECK(pieces[1].first == MAX_PACKET_SIZE);
+    CHECK(pieces[2].first == 0);
+    CHECK(pieces[0].second == 3);
+    CHECK(pieces[1].second == 4);
+    CHECK(pieces[2].second == 5);
+}
+
+TEST_CASE("text_resultset: a split row's last piece carries what the full pieces overflow") {
+    auto* resource = std::pmr::new_delete_resource();
+    auto row = one_text_row(resource, 2 * size_t{MAX_PACKET_SIZE} + 5);
+
+    packet_writer w;
+    mysql_resultset result(w, result_encoding::TEXT, "db", "tbl");
+    result.add_chunk_columns(row);
+    result.add_row(row, 0);
+    uint8_t seq = 0;
+    const auto packets = mysql_resultset::build_packets(std::move(result), seq);
+
+    const auto pieces = piece_headers(packets, 3);
+    REQUIRE(pieces.size() == 3);
+    CHECK(pieces[0].first == MAX_PACKET_SIZE);
+    CHECK(pieces[1].first == MAX_PACKET_SIZE);
+    CHECK(pieces[2].first == 5);
+    CHECK(pieces[2].second == 5);
+    CHECK(packets[5].back() == 'x');
+}
+
+// MySQL's DATE / TIME / DATETIME / TIMESTAMP as boost.mysql reads them back, in both encodings: the text with six
+// fraction digits (the columns announce 6 decimals), the binary row's length-prefixed fields; a TIMESTAMPTZ is
+// MySQL's TIMESTAMP, the session zone's local time.
+TEST_CASE("mysql resultset: the temporal types are read back by boost.mysql") {
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
+    auto* resource = &arena;
+    const auto chunk = temporal_test::chunk(resource, false);
+    for (auto encoding : {result_encoding::TEXT, result_encoding::BINARY}) {
+        INFO((encoding == result_encoding::TEXT ? "text" : "binary"));
+        packet_writer w;
+        mysql_resultset result(w, encoding, "db", "tbl");
+        result.set_time_zone(temporal_test::plus_three());
+        result.add_chunk_columns(chunk);
+        result.add_row(chunk, 0);
+        uint8_t seq = 0;
+        const auto decoded = decode_with_boost(mysql_resultset::build_packets(std::move(result), seq), 4, encoding);
+        CHECK(decoded.meta[0].type() == boost::mysql::column_type::date);
+        CHECK(decoded.meta[1].type() == boost::mysql::column_type::time);
+        CHECK(decoded.meta[2].type() == boost::mysql::column_type::datetime);
+        CHECK(decoded.meta[3].type() == boost::mysql::column_type::timestamp);
+        CHECK(decoded.row[0].as_date() == boost::mysql::date(2026, 1, 2));
+        CHECK(decoded.row[1].as_time() == std::chrono::hours(10) + std::chrono::minutes(11) +
+                                              std::chrono::seconds(12) + std::chrono::microseconds(250000));
+        CHECK(decoded.row[2].as_datetime() == boost::mysql::datetime(2026, 1, 2, 10, 0, 0, 500000));
+        CHECK(decoded.row[3].as_datetime() == boost::mysql::datetime(2026, 1, 2, 13, 0, 0, 0));
+    }
 }

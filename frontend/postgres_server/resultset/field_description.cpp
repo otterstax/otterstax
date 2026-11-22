@@ -21,13 +21,21 @@ namespace frontend::postgres {
                 break;
             case field_type::FLOAT4:
             case field_type::INT4:
+            case field_type::DATE:
                 type_size = 4;
                 break;
             case field_type::FLOAT8:
             case field_type::INT8:
+            case field_type::TIME:
             case field_type::TIMESTAMP:
             case field_type::TIMESTAMPTZ:
                 type_size = 8;
+                break;
+            case field_type::TIMETZ:
+                type_size = 12;
+                break;
+            case field_type::INTERVAL:
+                type_size = 16;
                 break;
             case field_type::UUID:
                 type_size = 16;

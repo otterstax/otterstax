@@ -1026,11 +1026,66 @@ TEST_CASE("generate_insert_rows: DATE and TIMESTAMP are typed literals, TIME has
     CHECK(d.value() == "toDate('2000-01-02')");
     auto ts = literal_of(timestamp, backend_type_t::ClickHouse, resource);
     REQUIRE_FALSE(ts.has_error());
-    // In UTC, as ch_to_chunk reads every DateTime / DateTime64.
-    CHECK(ts.value() == "toDateTime64('2000-01-01 01:00:00.5', 6, 'UTC')");
+    // In UTC, as ch_to_chunk reads every DateTime / DateTime64: the text with its `Z` (a toDateTime64(...) is refused
+    // by a DateTime column of a VALUES row), read under date_time_input_format = 'best_effort'.
+    CHECK(ts.value() == "'2000-01-01 01:00:00.5Z'");
     auto t = literal_of(time, backend_type_t::ClickHouse, resource);
     REQUIRE(t.has_error());
     CHECK(t.error().type == core::error_code_t::unimplemented_yet);
+}
+
+// A TIMESTAMPTZ is PostgreSQL's own literal; MySQL's is UTC's wall clock (every agent session runs in UTC, so a
+// TIMESTAMP column compares it as the instant), ClickHouse's names the zone.
+TEST_CASE("generate_insert_rows: a TIMESTAMPTZ is the instant in every dialect") {
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
+    auto* resource = &arena;
+    // 2000-01-01 01:00:00.5 UTC
+    const auto instant = components::vector::make_scalar(
+        resource,
+        core::date::timestamptz_t{core::date::microseconds{3600LL * 1000000 + 500000}});
+    auto pg = literal_of(instant, backend_type_t::PostgreSQL, resource);
+    REQUIRE_FALSE(pg.has_error());
+    CHECK(pg.value() == "TIMESTAMPTZ '2000-01-01 01:00:00.5+00'");
+    auto my = literal_of(instant, backend_type_t::MySQL, resource);
+    REQUIRE_FALSE(my.has_error());
+    CHECK(my.value() == "TIMESTAMP '2000-01-01 01:00:00.5'");
+    auto ch = literal_of(instant, backend_type_t::ClickHouse, resource);
+    REQUIRE_FALSE(ch.has_error());
+    CHECK(ch.value() == "'2000-01-01 01:00:00.5Z'");
+}
+
+// ClickHouse's Values format converts a toDateTime64(...) value (a Decimal64) to a DateTime column's type as a field,
+// which it refuses ("Type mismatch in IN or VALUES section. Expected: DateTime. Got: Decimal64"): a VALUES row holds
+// the UTC text, read in best_effort under the INSERT's SETTINGS; a row without one takes no SETTINGS.
+TEST_CASE("generate_insert_rows: a ClickHouse timestamp row is read under date_time_input_format best_effort") {
+    std::pmr::monotonic_buffer_resource arena{std::pmr::new_delete_resource()};
+    auto* resource = &arena;
+    const std::vector<std::string> columns{"c0"};
+    const std::vector<std::size_t> indexes{0};
+    const qualified_name_t table{core::dbname_t{"db"}, core::schema_t{"db"}, core::relname_t{"t"}};
+    auto chunk_of = [&](const components::vector::vector_t& value) {
+        std::pmr::vector<components::types::complex_logical_type> fields(resource);
+        fields.push_back(value.type());
+        components::vector::data_chunk_t chunk(resource, fields, 1);
+        chunk.data[0] = components::vector::make_flat_copy(resource, value, 1);
+        chunk.set_cardinality(1);
+        return chunk;
+    };
+    const auto instant = components::vector::make_scalar(
+        resource,
+        core::date::timestamptz_t{core::date::microseconds{3600LL * 1000000}});
+    auto ts = sql_gen::generate_insert_rows(backend_type_t::ClickHouse, table, columns, indexes, chunk_of(instant), resource);
+    REQUIRE_FALSE(ts.has_error());
+    CHECK(ts.value() ==
+          "INSERT INTO `db`.`t` (`c0`) SETTINGS date_time_input_format = 'best_effort' "
+          "VALUES ('2000-01-01 01:00:00Z');");
+    auto my = sql_gen::generate_insert_rows(backend_type_t::MySQL, table, columns, indexes, chunk_of(instant), resource);
+    REQUIRE_FALSE(my.has_error());
+    CHECK(my.value().find("SETTINGS") == std::string::npos);
+    const auto date = components::vector::make_scalar(resource, core::date::date_t{core::date::days{1}});
+    auto d = sql_gen::generate_insert_rows(backend_type_t::ClickHouse, table, columns, indexes, chunk_of(date), resource);
+    REQUIRE_FALSE(d.has_error());
+    CHECK(d.value() == "INSERT INTO `db`.`t` (`c0`) VALUES (toDate('2000-01-02'));");
 }
 
 TEST_CASE("generate_insert_rows: an unsupported value type is unimplemented_yet, not broken SQL") {

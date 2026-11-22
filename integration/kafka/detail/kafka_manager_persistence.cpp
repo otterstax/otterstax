@@ -169,7 +169,7 @@ namespace otterstax::kafka {
         // crashes the engine on this table)
         std::pmr::vector<types::complex_logical_type> col_types(resource_);
         auto str_col = [&](const char* alias) {
-            types::complex_logical_type t(types::logical_type::STRING_LITERAL);
+            types::complex_logical_type t(types::logical_type::TEXT);
             t.set_alias(alias);
             return t;
         };

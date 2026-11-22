@@ -140,8 +140,13 @@ namespace {
         explicit ch_backends(ch::connector_factory factory)
             : agent(factory, kUid) {}
 
+        // The count of the write (ClickHouse generates no id).
         core::result_wrapper_t<std::uint64_t> write(fed::write_kind_t kind, std::string sql) {
-            return agent.write(std::move(sql), kind);
+            auto written = agent.write(std::move(sql), kind);
+            if (written.has_error()) {
+                return written.error();
+            }
+            return written.value().count;
         }
     };
 } // namespace

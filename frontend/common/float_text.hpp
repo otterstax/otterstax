@@ -5,6 +5,8 @@
 
 #include "protocol_config.hpp"
 
+#include <core/date/time_zone.hpp>
+
 #include <string>
 
 // The text of a FLOAT / DOUBLE cell, as each wire's own server writes it.
@@ -42,6 +44,8 @@ namespace frontend {
     struct text_format_t {
         frontend_type wire;
         int extra_float_digits{default_extra_float_digits};
+        // The session's time zone a TIMESTAMPTZ is shown in (temporal_wire.hpp); null: UTC.
+        const core::date::time_zone_t* time_zone{nullptr};
     };
 
     [[nodiscard]] std::string double_text(const text_format_t& format, double value);

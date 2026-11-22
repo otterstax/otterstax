@@ -336,7 +336,7 @@ core::result_wrapper_t<ServiceConfig> load_config(std::pmr::memory_resource* res
         if (auto unknown = require_known_keys(
                 service,
                 "service",
-                {"flight_sql", "mysql", "postgres", "spark_connect", "connection_retry", "engine", "runtime"},
+                {"flight_sql", "mysql", "postgres", "spark_connect", "connection_retry", "engine", "runtime", "timezone"},
                 resource);
             unknown.contains_error()) {
             return unknown;
@@ -381,6 +381,17 @@ core::result_wrapper_t<ServiceConfig> load_config(std::pmr::memory_resource* res
                 return retry.error();
             }
             server_config.connection_retry = retry.value();
+        }
+        if (service["timezone"]) {
+            auto zone = yaml_scalar<std::string>(service["timezone"], "service.timezone", resource);
+            if (zone.has_error()) {
+                return zone.error();
+            }
+            if (zone.value().empty()) {
+                return core::error_t(core::error_code_t::invalid_parameter,
+                                     std::pmr::string{"service.timezone: a time zone is required", resource});
+            }
+            server_config.timezone = std::move(zone.value());
         }
         if (service["engine"]) {
             auto engine = parse_engine(service["engine"], resource);

@@ -68,7 +68,7 @@ namespace {
         types.emplace_back(logical_type::BIGINT, "id");
         types.emplace_back(logical_type::DOUBLE, "score");
         types.emplace_back(logical_type::BOOLEAN, "flag");
-        types.emplace_back(logical_type::STRING_LITERAL, "name");
+        types.emplace_back(logical_type::TEXT, "name");
         return types;
     }
 

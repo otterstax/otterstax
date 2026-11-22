@@ -5,7 +5,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Role
 
 `otterbrix/federation/` (library `otterstax_federation`) is the core of the federation on otterbrix
-`1.0.0b2-rc-4` (`01ec5268`; `docs/embedding-host-api.md` in the otterbrix repo). A remote table is an ordinary row of
+`1.0.0b2-rc-7` (`docs/embedding-host-api.md` in the otterbrix repo). A remote table is an ordinary row of
 otterbrix's catalog in the connection's one engine database (`pg_database.datconnection`; the full form
 `c.d.ns.t` — `d` the connection's configured database on PostgreSQL, `def` on MySQL / ClickHouse — while
 the client writes `c.ns.t`, the engine reading a first part that is a connection as its database; every
@@ -47,8 +47,10 @@ config.yaml, `backend_actor_t`, which turns each message into SQL of the connect
   pinned). An agent pings before a statement outside a transaction and reconnects a connection that
   failed it; a pinned connection is not reconnected (it would lose the transaction).
 - **Every session checked.** A session an agent opens — `connect()` at startup, every reconnect
-  (a lost connection, `reset_session`) — is checked before it serves (`check_session`): MySQL
-  `SELECT @@SESSION.sql_mode`, a mode with `NO_BACKSLASH_ESCAPES` refused (`unimplemented_yet`: the
+  (a lost connection, `reset_session`) — is checked before it serves (`check_session`) and set to read temporal values in one form: PostgreSQL
+  `SET DateStyle = ISO; SET IntervalStyle = postgres; SET TimeZone = 'UTC'` (what `pg_to_chunk` parses), MySQL
+  `SET SESSION time_zone = '+00:00'` (a TIMESTAMP read as the UTC instant `mysql_to_chunk` maps to TIMESTAMPTZ;
+  a failure closes the session) then `SELECT @@SESSION.sql_mode`, a mode with `NO_BACKSLASH_ESCAPES` refused (`unimplemented_yet`: the
   generated literals double a backslash, which such a session would read as two characters); whether
   the mode is strict (`STRICT_TRANS_TABLES` / `STRICT_ALL_TABLES`) is kept: a write whose statement
   leaves an UPDATE's narrowing to the store into the column (`sql_gen::statement_needs_t::strict_store`,
@@ -78,8 +80,10 @@ config.yaml, `backend_actor_t`, which turns each message into SQL of the connect
   most 1024 rows of the cursor (cursor id never 0, an empty page ends it), `storage_close_cursor`
   forgets it. `storage_total_rows` answers an estimate without a query (1000).
 - **Offer.** An UPDATE / DELETE block is one statement or the offer is refused (`unimplemented_yet`:
-  OtterStax numbers no remote row, `storage_update` / `storage_delete_rows` refuse); RETURNING only on
-  PostgreSQL (every column of the table, `generation_options_t::returning`); ClickHouse inside a block
+  OtterStax numbers no remote row, `storage_update` / `storage_delete_rows` refuse); RETURNING on
+  PostgreSQL and MySQL (every column of the table, `generation_options_t::returning`; the server answers
+  what it has — MariaDB INSERT / DELETE … RETURNING, MySQL and a MariaDB UPDATE refuse it themselves),
+  refused on ClickHouse (its mutations answer no rows); ClickHouse inside a block
   refused. Read blocks, top down: a relation (a SELECT block, a JOIN tree of the connection) the
   dialect says whole is taken (its answer the node's `output_types`); else, for a SELECT block of one
   table, its WHERE is taken with the conjuncts the dialect says, the others left as `residual` (the
@@ -89,7 +93,10 @@ config.yaml, `backend_actor_t`, which turns each message into SQL of the connect
   whole that carries a table column's name and type is declared with that column's `system.columns` type,
   so a Tuple's field names, which the wire does not carry, are the registered ones — a STRUCT has no
   cast in otterbrix, and the page must be the declared type), `storage_run_write` runs a taken write (its
-  count the backend's; with RETURNING the rows of the PostgreSQL statement, read as a scan).
+  count the backend's; with RETURNING the rows of the PostgreSQL / MySQL statement, read as a scan). A write
+  answers `write_answer_t {count, generated_id}`: of a MySQL INSERT the OK packet's `last_insert_id`,
+  the receipt's `generated_id` the statement's first (an INSERT cut in several statements keeps the
+  first statement's).
 - **Writes.** `storage_append`: one `INSERT … VALUES` per chunk (at most `max_rows_per_write` rows a
   message), `awaits_publish = false`. ClickHouse: a write inside a transaction block
   (`ctx.txn.command_id != 0`) is `unimplemented_yet`; a mutation (UPDATE / DELETE) that failed on a

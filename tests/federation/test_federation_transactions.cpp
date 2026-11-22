@@ -19,7 +19,7 @@ namespace {
             {"shop",
              "public",
              "t",
-             {column("id", logical_type::BIGINT), column("note", logical_type::STRING_LITERAL)},
+             {column("id", logical_type::BIGINT), column("note", logical_type::TEXT)},
              {{std::int64_t{1}, std::string{"a"}}}});
         stack.backend("ch").add_table({"ev", "", "e", {column("id", logical_type::BIGINT)}, {{std::int64_t{1}}}});
         return owned;
@@ -229,7 +229,7 @@ namespace {
                                            {"ch", backend_type_t::ClickHouse, "ev", ""}});
         auto& stack = *owned;
         const std::vector<complex_logical_type> columns{column("id", logical_type::BIGINT),
-                                                        column("note", logical_type::STRING_LITERAL)};
+                                                        column("note", logical_type::TEXT)};
         const std::vector<row_t> rows{{std::int64_t{1}, std::string{"a"}}};
         stack.backend("pg").add_table({"shop", "public", "t", columns, rows});
         stack.backend("pg").add_table(

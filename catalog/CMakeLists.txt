@@ -13,11 +13,17 @@ target_include_directories(catalog_discovery PUBLIC
 )
 
 set(CATALOG_HEADERS
+    sql_tokens.hpp
+    dotted_names.hpp
+    host_functions.hpp
     ownership.hpp
     registration.hpp
 )
 
 set(CATALOG_SOURCES
+    sql_tokens.cpp
+    dotted_names.cpp
+    host_functions.cpp
     ownership.cpp
     registration.cpp
 )

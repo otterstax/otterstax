@@ -85,14 +85,14 @@ namespace {
                             otterstax::session::session_factory_t& sessions,
                             frontend::connection_close_sink& close_sink,
                             size_t slot,
-                            std::chrono::milliseconds read_timeout)
+                            frontend::connection_timeouts_t timeouts)
             : mysql_connection(count_construction(resource),
                                std::move(socket),
                                connection_id,
                                sessions,
                                close_sink,
                                slot,
-                               read_timeout) {}
+                               timeouts) {}
     };
 
     using retry_server = frontend::frontend_server<throwing_connection>;

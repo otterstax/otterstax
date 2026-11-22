@@ -4,6 +4,7 @@
 #pragma once
 
 #include "../mysql_defs/error.hpp"
+#include "show_create_table.hpp"
 
 #include "otterbrix/parser/parser.hpp"
 
@@ -69,6 +70,11 @@ namespace frontend::mysql {
     struct set_variables_t {
         std::vector<setting_t> settings;
         std::optional<protocol_refusal_t> refusal;
+        // SET [SESSION] wait_timeout = N: the connection's idle timeout, the frontend's (never in `settings`), in
+        // seconds clamped to MySQL's 1 .. 31536000 as MySQL clamps it; 0 for DEFAULT (the server's). A value
+        // that is no integer refuses the statement (ER_WRONG_TYPE_FOR_VAR). Applied once the engine accepted the
+        // rest of the statement.
+        std::optional<uint64_t> wait_timeout;
     };
 
     // USE <database> [;] — `database` as written (`connection`, `connection.namespace`, `local`,
@@ -83,6 +89,10 @@ namespace frontend::mysql {
     [[nodiscard]] std::optional<protocol_refusal_t> handshake_charset_refusal(uint8_t collation_id);
 
     // The engine's statement for `setting`: SET name = 'value' / RESET name.
+    // MySQL's LIKE: `%`, `_`, a backslash escaping the next character, letters
+    // compared without case (SHOW VARIABLES, SHOW TABLES, SHOW DATABASES).
+    [[nodiscard]] bool mysql_like(std::string_view text, std::string_view pattern);
+
     [[nodiscard]] std::string engine_setting_statement(const setting_t& setting);
 
     // The engine's ONE statement for every assignment of a SET (`settings`, at
@@ -134,8 +144,27 @@ namespace frontend::mysql {
     // OK / EOF packet says 0), so the answer is the empty list.
     struct show_warnings_t {};
 
-    using protocol_statement_t =
-        std::variant<set_variables_t, use_database_t, select_variables_t, show_variables_t, show_warnings_t>;
+    // KILL [QUERY | CONNECTION] <connection id> [;]: QUERY cancels the statement that connection waits for
+    // (cancel_registry.hpp), CONNECTION (the default) also closes it. Answered by the frontend over the server's
+    // registry; it touches no session, so it is answered in any block. A COM_QUERY text only.
+    struct kill_t {
+        std::uint32_t connection_id{0};
+        bool query_only{false};
+    };
+
+    // The catalog statements (show_create_table.hpp: SHOW CREATE TABLE, DESCRIBE / SHOW COLUMNS, SHOW TABLES,
+    // SHOW DATABASES) are answered from the engine's catalog, as a SET / USE runs on the engine: never by
+    // answer_protocol_statement; a COM_QUERY text only (a prepare of one is the engine's).
+    using protocol_statement_t = std::variant<set_variables_t,
+                                              use_database_t,
+                                              select_variables_t,
+                                              show_variables_t,
+                                              show_warnings_t,
+                                              show_create_table_t,
+                                              describe_table_t,
+                                              show_tables_t,
+                                              show_databases_t,
+                                              kill_t>;
 
     // The protocol statement `sql` is, std::nullopt for anything else (the
     // statement then goes to the query session). A `?` placeholder makes no
@@ -164,6 +193,9 @@ namespace frontend::mysql {
         bool autocommit = true;
         std::string time_zone = "SYSTEM";
         std::optional<std::string> database;
+        // What a new connection's wait_timeout is (@@interactive_timeout: a session sets wait_timeout, which
+        // this one is not).
+        std::chrono::seconds interactive_timeout{28800};
     };
 
     // A text resultset (the chunk: column names are the types' aliases, one
@@ -173,4 +205,16 @@ namespace frontend::mysql {
     [[nodiscard]] protocol_answer_t answer_protocol_statement(std::pmr::memory_resource* resource,
                                                               const protocol_statement_t& statement,
                                                               const protocol_context_t& context);
+
+    // A SELECT the frontend does not answer whole (classify_protocol_statement) that reads a system variable or a
+    // session function — Django's `SELECT VERSION(), @@sql_mode, ..., CONVERT_TZ(...) IS NOT NULL` — written for
+    // the engine, which has neither: each `@@[scope.]name` and each call `DATABASE()` / `SCHEMA()` / `VERSION()` /
+    // `USER()` / `SESSION_USER()` / `SYSTEM_USER()` / `CURRENT_USER()` / `CONNECTION_ID()` (never a qualified
+    // `x.version()`) replaced by the literal of the value answer_protocol_statement gives it, the rest as written;
+    // an item that is a whole select item without an alias gets AS `<item as written>`, MySQL's column name.
+    // nullopt when `sql` is no SELECT or reads none of them (the text goes on unchanged); a variable the server
+    // does not have is the refusal ER_UNKNOWN_SYSTEM_VARIABLE. The values are this connection's when the text is
+    // read: a COM_STMT_PREPARE's at the prepare, as MySQL resolves a system variable. Never throws.
+    [[nodiscard]] std::optional<std::variant<std::string, protocol_refusal_t>>
+    substitute_session_values(std::string_view sql, const protocol_context_t& context);
 } // namespace frontend::mysql

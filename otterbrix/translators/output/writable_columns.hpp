@@ -44,7 +44,7 @@ namespace tsl {
             case physical_type::UINT64:
             case physical_type::FLOAT:
             case physical_type::DOUBLE:
-            case physical_type::STRING:
+            case physical_type::TEXT:
             case physical_type::NA:
                 return true;
             case physical_type::INT128:

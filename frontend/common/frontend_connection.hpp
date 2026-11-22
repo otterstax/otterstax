@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "cancel_registry.hpp"
 #include "protocol_config.hpp"
 
 #include <actor-zeta.hpp>
@@ -23,6 +24,8 @@ namespace frontend {
     class connection_close_sink {
     public:
         virtual void release_connection_slot(size_t slot) = 0;
+        // The server's cancellable connections (cancel_registry.hpp), outliving every connection.
+        virtual cancel_registry_t& cancels() = 0;
 
     protected:
         ~connection_close_sink() = default;
@@ -39,13 +42,20 @@ namespace frontend {
     // (its slot released, after finish_impl) exactly once, by the completion
     // that brings pending_ops_ to zero once the close has run — never while a
     // handler that names `this` is still queued.
+    // How long a connection waits for client bytes: `read` for a read the client is in the middle of (the
+    // handshake / startup, a message's body), `idle` for the next message once the connection is established.
+    struct connection_timeouts_t {
+        std::chrono::milliseconds read;
+        std::chrono::milliseconds idle;
+    };
+
     class frontend_connection {
     public:
         frontend_connection(boost::asio::ip::tcp::socket&& socket,
                             uint32_t connection_id,
                             connection_close_sink& close_sink,
                             size_t slot,
-                            std::chrono::milliseconds read_timeout);
+                            connection_timeouts_t timeouts);
 
         virtual ~frontend_connection() = default;
 
@@ -139,7 +149,19 @@ namespace frontend {
         // started, cancelled by its completion. A timer completion that belongs
         // to an earlier arm (the read completed as the timer fired) is ignored.
         void arm_read_timeout(const char* stage);
+        // The handshake / startup is done: the wait for the next message is the idle timeout from now on.
+        void mark_established() { established_ = true; }
+        // The server's idle timeout, every connection's to begin with.
+        std::chrono::milliseconds default_idle_timeout() const { return timeouts_.idle; }
+        // The idle timeout of this connection, read each time the wait for the next message starts: the server's,
+        // unless the wire lets its client set its own (MySQL wait_timeout, PostgreSQL idle_session_timeout).
+        // Zero: no idle timeout.
+        virtual std::chrono::milliseconds idle_timeout() const { return timeouts_.idle; }
         void cancel_read_timeout();
+        // The server's registry of cancellable connections; a connection adds itself once a client can name it
+        // and removes itself in finish_impl. statement_cancel_ is what the bridge's await reads.
+        cancel_registry_t& cancels() const { return *cancels_; }
+        statement_cancel_t statement_cancel_;
         // Grows read_buffer_ to `size` bytes; false (after reporting to the
         // client) when the size is over MAX_BUFFER_SIZE or cannot be allocated.
         bool ensure_read_buffer(uint32_t size);
@@ -152,10 +174,11 @@ namespace frontend {
         uint32_t connection_id_;
         // Cleared on the first close so the slot is released exactly once.
         connection_close_sink* close_sink_;
+        cancel_registry_t* cancels_;
         size_t slot_;
         std::vector<uint8_t> read_buffer_;
         std::vector<uint8_t> send_buffer_;
-        std::chrono::milliseconds read_timeout_;
+        connection_timeouts_t timeouts_;
 
     private:
         static constexpr size_t READ_BUFFER_SIZE = 4096;
@@ -174,6 +197,8 @@ namespace frontend {
         void complete_operation();
         void release();
 
+        // Strand-only: mark_established() ran.
+        bool established_{false};
         boost::asio::steady_timer read_timer_;
         uint64_t read_timer_generation_{0};
         // Gate for finish(): the first caller wins, later ones do nothing.
@@ -194,5 +219,16 @@ namespace frontend {
         // decremented on the strand by the wrapper.
         std::atomic<size_t> pending_ops_{0};
     };
+
+    inline bool cancel_registry_t::close(std::uint32_t id) {
+        std::lock_guard lock(mutex_);
+        const auto found = entries_.find(id);
+        if (found == entries_.end()) {
+            return false;
+        }
+        found->second.cancel->request();
+        found->second.connection->finish();
+        return true;
+    }
 
 } // namespace frontend

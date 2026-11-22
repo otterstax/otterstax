@@ -40,7 +40,10 @@ namespace frontend::postgres {
                             otterstax::session::session_factory_t& sessions,
                             connection_close_sink& close_sink,
                             size_t slot,
-                            std::chrono::milliseconds read_timeout);
+                            connection_timeouts_t timeouts);
+
+        // idle_session_timeout's current value (0: none).
+        std::chrono::milliseconds idle_timeout() const override;
 
         // What a statement runs: the part of it a portal bound from it keeps
         // (a copy, taken at Bind), so a portal outlives the statement's
@@ -72,7 +75,7 @@ namespace frontend::postgres {
             std::optional<protocol_setting_t> protocol_setting;
             // SHOW of a client parameter prepared through Parse: the frontend
             // answers it at Execute (`schema` is its one text column).
-            std::optional<client_parameter_t> show;
+            std::optional<shown_parameter_t> show;
             // RESET ALL / DISCARD ALL: the engine runs it, the frontend resets
             // the client parameters behind its success.
             bool resets_client_parameters{false};
@@ -226,6 +229,8 @@ namespace frontend::postgres {
         // value back), a ROLLBACK TO, inside a block too. extra_float_digits is
         // not reported (no GUC_REPORT).
         void append_ready_for_query(std::vector<std::vector<uint8_t>>& response);
+        // The session's TimeZone (timezone_.current()) as a zone, which a timestamptz cell is shown in.
+        core::date::time_zone_t session_time_zone() const;
         // What an answered statement did to the parameters the frontend
         // follows: the engine settings it assigned (session_payload::
         // setting_changes), a savepoint it set, released or rolled back to, the
@@ -240,8 +245,12 @@ namespace frontend::postgres {
         // The answer of SHOW <client parameter>: a RowDescription unless
         // `row_shape_known`, one DataRow in `format`, CommandComplete SHOW.
         std::vector<std::vector<uint8_t>>
-        answer_show(client_parameter_t parameter, const std::vector<result_encoding>& format, bool row_shape_known);
+        answer_show(const shown_parameter_t& shown, const std::vector<result_encoding>& format, bool row_shape_known);
         void handle_ssl_decline(packet_reader& reader);
+        // CancelRequest: the statement the connection of that process id and secret key waits for is cancelled
+        // (cancel_registry.hpp) — it answers its client 57014 —, and this connection closes without a reply, as
+        // PostgreSQL's does (a wrong key, an unknown process id: the same silence).
+        void handle_cancel_request(packet_reader& reader);
         boost::asio::awaitable<void> handle_query(std::string query);
         // DEALLOCATE [PREPARE] <name> | ALL on the simple-query route: run_deallocate,
         // then CommandComplete DEALLOCATE / DEALLOCATE ALL and ReadyForQuery.
@@ -365,6 +374,8 @@ namespace frontend::postgres {
         client_setting_t<std::string> client_encoding_{"UTF8", "UTF8"};
         // How this connection's float cells are written as text.
         client_setting_t<int> extra_float_digits_{default_extra_float_digits, default_extra_float_digits};
+        // idle_session_timeout in ms: the server's idle timeout (default_idle_timeout()) to begin with, 0 never.
+        client_setting_t<std::int64_t> idle_session_timeout_{};
         // The engine settings PostgreSQL reports, followed as the engine keeps
         // them (follow_parameters): `reset` the engine's default
         // (read_default_settings), the startup's SET its session value.

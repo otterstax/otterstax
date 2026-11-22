@@ -300,8 +300,8 @@ TEST_CASE("kafka grammar: only JSON-ingestible column types are accepted") {
     CHECK(map_column_type("DOUBLE")->type() == logical_type::DOUBLE);
     CHECK(map_column_type("BOOLEAN")->type() == logical_type::BOOLEAN);
     CHECK(map_column_type("bool")->type() == logical_type::BOOLEAN);
-    CHECK(map_column_type("VARCHAR")->type() == logical_type::STRING_LITERAL);
-    CHECK(map_column_type("TEXT")->type() == logical_type::STRING_LITERAL);
+    CHECK(map_column_type("VARCHAR")->type() == logical_type::TEXT);
+    CHECK(map_column_type("TEXT")->type() == logical_type::TEXT);
 
     // Otterbrix types with no JSON mapping: a source declared with one would ingest
     // nothing, so CREATE rejects it instead of creating a table nobody can fill
@@ -348,7 +348,7 @@ TEST_CASE("kafka grammar: transform lowers to a kafka_node_t") {
     CHECK(kn->columns()[0].name == "id");
     CHECK(kn->columns()[0].type.type() == components::types::logical_type::BIGINT);
     CHECK(kn->columns()[0].type.alias() == "id");
-    CHECK(kn->columns()[1].type.type() == components::types::logical_type::STRING_LITERAL);
+    CHECK(kn->columns()[1].type.type() == components::types::logical_type::TEXT);
 
     // WITH keys are upper-cased by transform and reachable via option()
     CHECK(kn->option("KAFKA_TOPIC") == "orders_topic");

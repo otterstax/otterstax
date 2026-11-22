@@ -41,7 +41,7 @@ namespace {
                             "orders",
                             {column("id", logical_type::BIGINT),
                              column("amount", logical_type::BIGINT),
-                             column("note", logical_type::STRING_LITERAL)},
+                             column("note", logical_type::TEXT)},
                             {{std::int64_t{1}, std::int64_t{5}, std::string{"a"}},
                              {std::int64_t{2}, std::int64_t{50}, std::string{"b"}},
                              {std::int64_t{3}, std::int64_t{500}, std::string{"c"}}}});
@@ -109,7 +109,7 @@ TEST_CASE("offer: a GROUP BY block is one statement and its answer is held to ot
                 // A backend answering the sum as text (MySQL's DECIMAL of an integer SUM).
                 return chunk_of(
                     resource,
-                    {column("note", logical_type::STRING_LITERAL), column("s", logical_type::STRING_LITERAL)},
+                    {column("note", logical_type::TEXT), column("s", logical_type::TEXT)},
                     {{std::string{"a"}, std::string{"5"}}});
             });
         auto cursor = stack.ok("SELECT note, sum(amount) AS s FROM " + table_of(d, "orders") + " GROUP BY note;");
@@ -197,14 +197,39 @@ TEST_CASE("offer: an UPDATE the backend cannot run whole is refused") {
     }
 }
 
-TEST_CASE("offer: RETURNING is PostgreSQL's alone") {
+// RETURNING is sent to PostgreSQL and to MySQL, whose server says what it has: MariaDB answers INSERT / DELETE ...
+// RETURNING rows, MySQL and a MariaDB UPDATE refuse it themselves. ClickHouse's writes are mutations: refused here.
+TEST_CASE("offer: RETURNING is the backend's to answer") {
     auto owned = make_stack();
     auto& stack = *owned;
     stack.open();
     const auto& my = dialects()[1];
-    CHECK(stack.refused("UPDATE " + table_of(my, "orders") + " SET note = 'z' WHERE id = 2 RETURNING id;").type ==
-          core::error_code_t::unimplemented_yet);
-    CHECK(stack.refused("INSERT INTO " + table_of(my, "orders") + " VALUES (9, 9, 'n') RETURNING id;").type ==
+    stack.backend(my.connection)
+        .on_scan([](const std::string& sql,
+                    std::pmr::memory_resource* resource) -> std::optional<components::vector::data_chunk_t> {
+            if (sql.find("RETURNING") == std::string::npos) {
+                return std::nullopt;
+            }
+            return chunk_of(resource,
+                            {column("id", logical_type::BIGINT),
+                             column("amount", logical_type::BIGINT),
+                             column("note", logical_type::TEXT)},
+                            {{std::int64_t{9}, std::int64_t{9}, std::string{"n"}}});
+        });
+    auto inserted = stack.ok("INSERT INTO " + table_of(my, "orders") + " VALUES (9, 9, 'n') RETURNING id, note;");
+    CHECK(rows_of(inserted) == std::vector<std::string>{"9|n"});
+    const auto sent = starting_with(stack.backend(my.connection).log(), "scan ");
+    REQUIRE_FALSE(sent.empty());
+    INFO(sent.back());
+    CHECK(sent.back().find("INSERT INTO `shop`.`orders`") != std::string::npos);
+    CHECK(sent.back().find(" RETURNING `id`, `amount`, `note`") != std::string::npos);
+    // A refusal is the server's: the fake refuses what the test tells it to, as MySQL refuses RETURNING.
+    stack.backend(my.connection).fail_statements("UPDATE", core::error_code_t::sql_parse_error);
+    const auto update = stack.refused("UPDATE " + table_of(my, "orders") + " SET note = 'z' WHERE id = 2 RETURNING id;");
+    INFO(std::string{update.what});
+    CHECK(update.type == core::error_code_t::sql_parse_error);
+    const auto& ch = dialects()[2];
+    CHECK(stack.refused("INSERT INTO " + table_of(ch, "orders") + " VALUES (9, 9, 'n') RETURNING id;").type ==
           core::error_code_t::unimplemented_yet);
     const auto& pg = dialects()[0];
     stack.backend(pg.connection)
@@ -216,7 +241,7 @@ TEST_CASE("offer: RETURNING is PostgreSQL's alone") {
             return chunk_of(resource,
                             {column("id", logical_type::BIGINT),
                              column("amount", logical_type::BIGINT),
-                             column("note", logical_type::STRING_LITERAL)},
+                             column("note", logical_type::TEXT)},
                             {{std::int64_t{2}, std::int64_t{50}, std::string{"z"}}});
         });
     auto returned = stack.ok("UPDATE " + table_of(pg, "orders") + " SET note = 'z' WHERE id = 2 RETURNING id, note;");

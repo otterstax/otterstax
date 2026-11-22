@@ -65,7 +65,7 @@ namespace {
         return {std::move(name), kInt4Oid, components::types::logical_type::INTEGER};
     }
     backend_column varchar(std::string name) {
-        return {std::move(name), kVarcharOid, components::types::logical_type::STRING_LITERAL};
+        return {std::move(name), kVarcharOid, components::types::logical_type::TEXT};
     }
     backend_column float8(std::string name) {
         return {std::move(name), kFloat8Oid, components::types::logical_type::DOUBLE};
@@ -247,6 +247,11 @@ namespace {
         boost::asio::awaitable<core::error_t>
         runQuery(std::string_view query,
                  otterstax::function_ref_t<otterstax::asio_error_t(PGresult*)> handler) override {
+            // The agent's session settings (DateStyle / IntervalStyle / TimeZone, check_session).
+            if (query.starts_with("SET ")) {
+                auto result = empty_tuples();
+                co_return otterstax::as_query_result<otterstax::asio_error_t>(handler(result.get()));
+            }
             if (query.find("pg_enum") != std::string_view::npos) {
                 auto result = empty_tuples();
                 co_return otterstax::as_query_result<otterstax::asio_error_t>(handler(result.get()));

@@ -52,13 +52,13 @@ namespace frontend::mysql {
             encode_row_binary(chunk, row_index);
         }
 
-        // seq_id is 0, will be set during build packets
-        encoded_rows_.push_back(writer.build_from_payload(0));
+        for (auto&& packet : writer.build_from_payload_pieces()) {
+            encoded_rows_.push_back(std::move(packet));
+        }
     }
 
-    std::vector<std::vector<uint8_t>> mysql_resultset::build_packets(mysql_resultset&& resultset,
-                                                                     uint8_t& sequence_id,
-                                                                     server_status_flags_t status) {
+    std::vector<std::vector<uint8_t>>
+    mysql_resultset::build_packets(mysql_resultset&& resultset, uint8_t& sequence_id, server_status_flags_t status) {
         std::vector<std::vector<uint8_t>> packets;
         packets.reserve(1 + resultset.column_defs_.size() + 1 + resultset.encoded_rows_.size() + 1);
 
@@ -109,7 +109,7 @@ namespace frontend::mysql {
                 writer.write_null();
                 continue;
             }
-            writer.write_length_encoded_string(encode_to_text(chunk, i, row_index, {frontend_type::MYSQL}));
+            writer.write_length_encoded_string(encode_to_text(chunk, i, row_index, {frontend_type::MYSQL, default_extra_float_digits, &time_zone_}));
         }
     }
 
@@ -161,7 +161,7 @@ namespace frontend::mysql {
             if (chunk.data[i].is_null(row_index)) {
                 continue;
             }
-            encode_to_binary<frontend_type::MYSQL>(writer, chunk, i, row_index);
+            encode_to_binary<frontend_type::MYSQL>(writer, chunk, i, row_index, &time_zone_);
         }
     }
 } // namespace frontend::mysql

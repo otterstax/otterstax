@@ -68,7 +68,7 @@ namespace frontend::spark {
                     const auto& cell = chunk.data[column];
                     if (cell.is_null(row) && nullable == column) {
                         cells.emplace_back();
-                    } else if (cell.is_null(row) || cell.type().type() != ct::logical_type::STRING_LITERAL) {
+                    } else if (cell.is_null(row) || cell.type().type() != ct::logical_type::TEXT) {
                         return std::nullopt;
                     } else {
                         cells.emplace_back(cell.get_value<std::string_view>(row));
@@ -253,7 +253,7 @@ namespace frontend::spark {
             }
 
             ct::complex_logical_type text_column(std::string_view alias) {
-                return ct::complex_logical_type{ct::logical_type::STRING_LITERAL, std::string{alias}};
+                return ct::complex_logical_type{ct::logical_type::TEXT, std::string{alias}};
             }
 
             ct::complex_logical_type flag_column(std::string_view alias) {
@@ -261,7 +261,7 @@ namespace frontend::spark {
             }
 
             ct::complex_logical_type text_list_column(std::string_view alias) {
-                return ct::complex_logical_type::create_list(ct::complex_logical_type{ct::logical_type::STRING_LITERAL},
+                return ct::complex_logical_type::create_list(ct::complex_logical_type{ct::logical_type::TEXT},
                                                              std::string{alias});
             }
 

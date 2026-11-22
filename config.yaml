@@ -32,6 +32,9 @@ service:
   connection_retry:
     max_attempts: 10
     delay_ms: 2000
+  # Required: the engine's directory (the .lock, the WAL, the tables, the logs).
+  engine:
+    data_dir: /tmp/test_collection_sql/base
 
 # Remote backends + s3 aliases. All sections are optional. `port` is a string;
 # a postgresql `schema` limits the connection to that schema (empty: every user

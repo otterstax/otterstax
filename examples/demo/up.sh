@@ -57,7 +57,7 @@ if $LOCAL; then
     $COMPOSE_CMD -f compose.yml up -d demo-mariadb demo-postgres demo-clickhouse demo-rustfs demo-rustfs-init demo-kafka
 else
     echo "=== 2. Starting full demo stack (compose.yml --profile full) ==="
-    $COMPOSE_CMD --profile full -f compose.yml up -d --build
+    $COMPOSE_CMD --profile full -f compose.yml up -d
 fi
 
 # --- 3. Wait for healthchecks ---

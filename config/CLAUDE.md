@@ -84,7 +84,7 @@ silently in force. Error messages live on the `std::pmr::memory_resource*` passe
   fields come from the top-level `service:` node; `connections` from the
   `connections:` node of the same file.
 - `config::EngineConfig` (`service.engine`) — the embedded otterbrix engine:
-  `data_dir` (default `DEFAULT_ENGINE_DATA_DIR` = `/tmp/test_collection_sql/base`,
+  `data_dir` (required, no default: `main.cpp` refuses to start while it is empty;
   the engine's `.lock`, WAL and tables) and
   `log_dir` (empty → `data_dir`; `config::log_directory(engine)` answers it). `log_dir` is where
   **every** log file of the server goes: `main.cpp` reads the config first (a refused
@@ -255,16 +255,22 @@ Two failure modes, deliberately different:
 
 The path comes from the `--config PATH` flag (default `config.yaml`), resolved
 **relative to the server's working directory**. In containers the server runs
-from `WORKDIR /app/build/Release` with no `--config`, so it reads
-`/app/build/Release/config.yaml`, delivered by either:
+from `WORKDIR /app/build/Release`:
 
-- **Baking** — `Dockerfile.test` `COPY`s a stack `config.yaml` to that path (the
-  integration-test backends). Good for CI / DinD where bind-mounts don't work.
-- **Mounting** — compose files bind-mount a stack `config.yaml` onto that path
-  (`examples/demo/compose.yml`, `compose.yml`, `benchmark/compose_benchmark.yml`).
-  A mount overrides anything baked in.
+- **The test image** (`Dockerfile.test`) passes no `--config`, so it reads
+  `/app/build/Release/config.yaml`: baked (`COPY` of `tests/scripts/config.yaml`,
+  good for CI / DinD where bind-mounts don't work) or bind-mounted onto that path
+  (`benchmark/compose_benchmark.yml`).
+- **The public image** (`Dockerfile`, stage `runtime`) runs
+  `./server --config /otterstax/config.yaml`. The baked file names only
+  `service.engine.data_dir: /otterstax/data` (a `VOLUME`); compose files bind-mount
+  a stack `config.yaml` over it (`compose.yml`, `examples/demo/compose.yml`,
+  `examples/quick_start/compose.yml`). A mount replaces the baked file whole, so the
+  mounted one sets `data_dir` itself.
 
-A missing file → the server starts with default ports and no connections.
+A missing file, or one that does not set `service.engine.data_dir`, refuses the
+startup: `main.cpp` writes the reason to stderr and returns 1 (`load_config` itself
+still answers the default `ServiceConfig` for a missing file).
 
 ## config.yaml format
 
@@ -275,8 +281,8 @@ service:
   postgres:   { port: 8817 }        # wire-server port
   spark_connect: { host: "0.0.0.0", port: 15002, session_timeout_s: 3600 }   # Spark Connect gRPC server
   connection_retry: { max_attempts: 10, delay_ms: 2000 }
-  engine:                           # embedded otterbrix engine; every key optional
-    data_dir: /tmp/test_collection_sql/base   # holds .lock, the WAL and the tables
+  engine:                           # embedded otterbrix engine
+    data_dir: /tmp/test_collection_sql/base   # required; holds .lock, the WAL and the tables
     log_dir: <dir>                  # default data_dir; every log file of the server
   runtime:                          # thread pools; every key optional
     general:  { threads: 3 }        # engine pools: threads >= 1

@@ -15,7 +15,7 @@ cd examples/quick_start
 docker compose up -d
 ```
 
-First run builds/reuses the `otterstax_app:latest` image and seeds every backend from
+First run pulls the `ghcr.io/otterstax/otterstax:0.2.0` image and seeds every backend from
 `init/`. Wait until all report `healthy` (~30–60 s):
 
 ```bash

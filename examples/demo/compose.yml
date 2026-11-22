@@ -157,10 +157,7 @@ services:
 
   # Optional — brought up only with `--profile full`.
   demo-otterstax:
-    build:
-      context: ../..
-      dockerfile: Dockerfile
-    image: otterstax_app:latest
+    image: ghcr.io/otterstax/otterstax:0.2.0
     container_name: demo-otterstax
     profiles: ["full"]
     depends_on:
@@ -179,10 +176,10 @@ services:
       - "8816:8816"    # MySQL wire
       - "8817:8817"    # PostgreSQL wire
     volumes:
-      # Single config file (server settings + connections). Mounted onto the
-      # server's default config path (config.yaml, relative to WORKDIR
-      # /app/build/Release). Uses docker-DNS hostnames for otterstax-in-docker.
-      - ./config.yaml:/app/build/Release/config.yaml:ro
+      # Single config file (server settings + connections). Mounted over the
+      # image's own config, the path its command names. Uses docker-DNS
+      # hostnames for otterstax-in-docker.
+      - ./config.yaml:/otterstax/config.yaml:ro
     healthcheck:
       # No HTTP management port anymore — probe the PostgreSQL wire port instead.
       test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/localhost/8817' || exit 1"]

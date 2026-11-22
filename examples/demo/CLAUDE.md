@@ -32,7 +32,7 @@ Two ways to run, pick **one**:
 
 | Mode | When | Otterstax | Command |
 |---|---|---|---|
-| **Full docker** | One-shot demo, no local build | Built inside docker (image `otterstax_app`) | `examples/demo/up.sh` |
+| **Full docker** | One-shot demo, no local build | The published image `ghcr.io/otterstax/otterstax:0.2.0` | `examples/demo/up.sh` |
 | **Bench** (local) | You already have a built `./build/server` and want to iterate on the engine | Local binary, you start it yourself | `examples/demo/up.sh --local` |
 
 Full docker is the default; choose `--local` only if the user explicitly asks to iterate on otterstax itself.
@@ -53,7 +53,7 @@ examples/demo/up.sh
 This does, in order:
 
 1. `python3 examples/demo/generate_data.py` — writes `examples/demo/init/{mariadb,postgres,clickhouse}/init.sql` with seeded data (correlated IDs across backends, time windows aligned to demo predicates) **and** writes `examples/demo/init/s3/{regions.csv,promos.parquet}` (6 rows + 12 rows) for steps 7-9.
-2. `docker compose -f examples/demo/compose.yml --profile full up -d --build` — starts MariaDB + PostgreSQL + ClickHouse + RustFS + the `demo-rustfs-init` one-shot (which `aws s3 mb s3://demo-bucket && aws s3 cp --recursive /fixtures/ s3://demo-bucket/`) + the `otterstax_app` container.
+2. `docker compose -f examples/demo/compose.yml --profile full up -d` — starts MariaDB + PostgreSQL + ClickHouse + RustFS + the `demo-rustfs-init` one-shot (which `aws s3 mb s3://demo-bucket && aws s3 cp --recursive /fixtures/ s3://demo-bucket/`) + the `demo-otterstax` container (the published image, pulled on the first run).
 3. Polls each container's healthcheck (up to 3 minutes). `demo-rustfs-init` exits cleanly once seeding finishes; it's not polled.
 4. Connections require no registration step: `examples/demo/config.yaml` (docker-DNS hostnames: `demo-mariadb`, `demo-rustfs`, …) is mounted into the `demo-otterstax` container by `compose.yml` and read once at startup — server settings, the mysql/pg/ch backends **and** the `demo_s3` alias all come from that one file.
 5. Prints the `psql` invocation lines.

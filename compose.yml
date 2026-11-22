@@ -113,9 +113,8 @@ services:
     volumes:
       - ./app_data:/app/data
       # Single config file (server settings + connections, docker-DNS hostnames).
-      # Mounted onto the server's default config path (config.yaml, relative to
-      # WORKDIR /app/build/Release).
-      - ./scripts/database/config.yaml:/app/build/Release/config.yaml:ro
+      # Mounted over the image's own config, the path its command names.
+      - ./scripts/database/config.yaml:/otterstax/config.yaml:ro
     networks:
       - app_network
 

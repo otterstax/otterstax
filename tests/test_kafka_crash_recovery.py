@@ -70,7 +70,7 @@ FANIN_BATCH = 1500                  # fan-in: rows per source per batch (each so
 PG_WAIT_S = 25
 DOCKER_PG_WAIT_S = 90   # docker start + WAL recover has more headroom than the native binary
 WAIT_S = 60
-# The engine's default data_dir (config::DEFAULT_ENGINE_DATA_DIR, service.engine.data_dir unset): /tmp/test_collection_sql/base.
+# The engine's data_dir of the test image (service.engine.data_dir in tests/scripts/config.yaml): /tmp/test_collection_sql/base.
 DATA_DIR = "/tmp/test_collection_sql"
 
 

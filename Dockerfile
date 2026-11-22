@@ -87,6 +87,10 @@ COPY ./cmake ./cmake
 COPY ./main.cpp ./main.cpp
 COPY ./CMakeLists.txt ./CMakeLists.txt
 
+# The log level compiled in (CMakeLists.txt's own default is ERROR): at INFO the
+# container log shows the startup, the config file read and the stop.
+ARG SPDLOG_ACTIVE_LEVEL=SPDLOG_LEVEL_INFO
+
 RUN _jobs="${BUILD_JOBS}" && \
     if [ "$_jobs" = "0" ]; then \
         _mem_jobs=$(( $(awk '/^MemTotal:/ {print int($2/1024)}' /proc/meminfo) / 1536 )) && \
@@ -95,6 +99,7 @@ RUN _jobs="${BUILD_JOBS}" && \
     fi && \
     cmake -S . -B build/Release \
         -DCMAKE_TOOLCHAIN_FILE=build/Release/generators/conan_toolchain.cmake \
+        -DSPDLOG_ACTIVE_LEVEL="${SPDLOG_ACTIVE_LEVEL}" \
         -DCMAKE_BUILD_TYPE=Release && \
     cmake --build build/Release --target all -- -j${_jobs}
 
@@ -103,3 +108,31 @@ EXPOSE 8086
 
 WORKDIR /app/build/Release
 CMD [ "./server" ]
+
+# The published image (the default target): the server, the shared libraries it
+# loads from lib/ and a config that names only the data directory. No compiler,
+# no sources. The config is /otterstax/config.yaml — bind-mount your own over it
+# (it must set service.engine.data_dir too); the data is the volume
+# /otterstax/data. The server stops on SIGTERM: give it time to drain the
+# sessions and write the final CHECKPOINT (`docker stop -t 60`).
+FROM ubuntu:22.04 AS runtime
+
+RUN apt update && \
+    DEBIAN_FRONTEND=noninteractive apt install -y --no-install-recommends \
+        ca-certificates tzdata && \
+    apt clean && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app/build/Release/server /app/build/Release/server
+COPY --from=builder /app/build/Release/lib /app/build/Release/lib
+
+RUN mkdir -p /otterstax/data && \
+    printf 'service:\n  engine:\n    data_dir: /otterstax/data\n' > /otterstax/config.yaml
+
+VOLUME /otterstax/data
+
+# Flight SQL, MySQL wire, PostgreSQL wire, Spark Connect.
+EXPOSE 8815 8816 8817 15002
+
+WORKDIR /app/build/Release
+CMD ["./server", "--config", "/otterstax/config.yaml"]

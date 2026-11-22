@@ -44,10 +44,10 @@ There is a **single config file, `config.yaml`**: the server settings under `ser
 `connections:`, every remote backend and S3 alias. It is read **once at startup** — there is no
 runtime add / remove API; edit the file and restart.
 
-The path is `--config PATH` (default `config.yaml`, relative to the working directory). The Docker
-images run the server from `/app/build/Release` with no `--config`, so the compose files
-bind-mount a `config.yaml` onto `/app/build/Release/config.yaml` (`Dockerfile.test` bakes one in).
-A missing file starts the server with default ports and no connections.
+The path is `--config PATH` (default `config.yaml`, relative to the working directory). The file
+must exist and must set `service.engine.data_dir`, the directory the engine keeps its tables, WAL
+and logs in; without either the server writes the reason to stderr and exits with code 1. Every
+other key has a default. The public image reads `/otterstax/config.yaml` (see [Docker](#docker)).
 
 ```yaml
 service:
@@ -168,6 +168,38 @@ cmake --build build/Release --parallel <JOBS>
 --config <path>   Path to configuration file (default: config.yaml)
 ```
 
+## Docker
+
+```bash
+docker pull ghcr.io/otterstax/otterstax:0.2.0      # or: otterstax/otterstax:0.2.0 (Docker Hub)
+
+docker run -d --name otterstax --stop-timeout 60 \
+  -p 8815:8815 -p 8816:8816 -p 8817:8817 -p 15002:15002 \
+  -v "$PWD/config.yaml:/otterstax/config.yaml:ro" \
+  -v otterstax-data:/otterstax/data \
+  ghcr.io/otterstax/otterstax:0.2.0
+```
+
+The image is `linux/amd64`. Two paths matter:
+
+- `/otterstax/config.yaml` is the config. The image ships one that sets only the data directory,
+  so the container also starts with no mount: default ports, no connections. Your file replaces
+  it whole, so it has to carry the same line:
+
+  ```yaml
+  service:
+    engine:
+      data_dir: /otterstax/data
+  ```
+
+- `/otterstax/data` is the data: local tables, the WAL, Kafka offsets, log files. Keep it on a
+  volume or it goes away with the container.
+
+The config is read once. To apply a change, edit the file and `docker restart otterstax`. On
+`docker stop` the server drains the open sessions (up to 30 s) and writes a final checkpoint,
+which is what `--stop-timeout 60` leaves room for. `docker logs otterstax` shows the startup and
+any refusal of the config.
+
 ## Running with Docker Compose
 
 ```bash
@@ -175,7 +207,8 @@ python3 fixtures/generate_data.py  # test data
 docker compose up                  # databases + server; connections from scripts/database/config.yaml
 ```
 
-`examples/quick_start/` and `examples/demo/` are self-contained stacks with their own READMEs.
+`examples/quick_start/` and `examples/demo/` are self-contained stacks with their own READMEs;
+they run the published image, so nothing is compiled.
 
 ## Testing
 

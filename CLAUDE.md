@@ -17,10 +17,12 @@ read once at startup, holds the server settings and every connection.
 ## Connection Config
 
 `config.yaml` — path from `--config PATH` (default `config.yaml`, relative to the working
-directory; a missing file = default ports, no connections). Containers run from
-`/app/build/Release` with no `--config`: the file is baked (`Dockerfile.test`) or bind-mounted
-(compose files) onto `/app/build/Release/config.yaml`. There is no runtime add/remove API: edit and
-restart. Full reference: `config/CLAUDE.md`.
+directory). A missing file, or one without `service.engine.data_dir`, refuses the startup (stderr,
+exit 1). Containers run from `/app/build/Release`: the test image (`Dockerfile.test`) bakes the file
+there and passes no `--config`; the public image (`Dockerfile`, stage `runtime`) runs
+`./server --config /otterstax/config.yaml`, a baked file that names only `data_dir: /otterstax/data`
+(the volume), and compose files bind-mount their own over it. There is no runtime add/remove API:
+edit and restart. Full reference: `config/CLAUDE.md`.
 
 ```yaml
 service:
@@ -30,7 +32,7 @@ service:
   spark_connect: { host: "0.0.0.0", port: 15002, session_timeout_s: 3600 }  # 0 = never expire
   connection_retry: { max_attempts: 10, delay_ms: 2000 }   # default 1 / 1000 = one attempt
   timezone: UTC                     # the server's: every session's TimeZone until its client sets one
-  engine:  { data_dir: /tmp/test_collection_sql/base, log_dir: "" }        # log_dir empty = data_dir
+  engine:  { data_dir: /tmp/test_collection_sql/base, log_dir: "" }        # data_dir required; log_dir empty = data_dir
   runtime:                          # every thread pool; every key optional
     general: { threads: 3 }         # engine pools (>= 1)
     exec:    { threads: 3 }
@@ -65,7 +67,7 @@ connections:
   alias must be an unquoted identifier `[a-z_][a-z0-9_]*`; backend aliases are one namespace
   (mysql / postgresql / clickhouse together), s3 aliases another (any spelling). `local`,
   `federation` and `main` are reserved (any case, any section).
-- Refused at load (stderr, exit 1): malformed YAML, a section that is not a mapping, an unknown
+- Refused at load (stderr, exit 1): a missing file, no `service.engine.data_dir`, malformed YAML, a section that is not a mapping, an unknown
   key at any level (`unknown key "pool_sise" in connections.mysql[0]`), an incomplete entry, a bad
   port / `pool_size` / thread count, a reserved, malformed or duplicate alias.
   An unreachable backend is not a config error: retried per `connection_retry`, then logged, the
@@ -90,7 +92,7 @@ order (an aborted startup unwinds the same way).
 
 ```text
 main.cpp
-  → --config PATH; config::load_config        — a refusal to stderr, return 1 (no logger yet)
+  → --config PATH; config::load_config        — a missing file, a refusal or no data_dir: stderr, return 1 (no logger yet)
   → initialize_all_loggers(log_directory(engine))
   → conn::s3::subsystem_finalizer_t           — FinalizeS3 after everything else is gone
   → backends::backends_threads(...)           — the backends pool sized against the connections

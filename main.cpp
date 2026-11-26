@@ -98,6 +98,10 @@ int main(int argc, char* argv[]) {
     // service.runtime, and under `connections:` every remote backend and s3
     // alias — the single source of truth for connections. An invalid file
     // aborts startup here, before any module exists.
+    if (!std::filesystem::exists(config_path)) {
+        std::cerr << "Configuration file '" << config_path << "' not found" << std::endl;
+        return 1;
+    }
     std::pmr::synchronized_pool_resource startup_resource(std::pmr::new_delete_resource());
     auto loaded = config::load_config(&startup_resource, config_path);
     if (loaded.has_error()) {
@@ -106,6 +110,10 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     config::ServiceConfig server_config = std::move(loaded.value());
+    if (server_config.engine.data_dir.empty()) {
+        std::cerr << "Configuration '" << config_path << "' does not set service.engine.data_dir" << std::endl;
+        return 1;
+    }
 
     // Every logger, and the engine's log over Main's sinks, under log_dir.
     const std::string& log_dir = config::log_directory(server_config.engine);
@@ -117,13 +125,7 @@ int main(int argc, char* argv[]) {
     }
     auto log = get_logger(logger_tag::Main);
     log->info("Starting server...");
-    if (std::filesystem::exists(config_path)) {
-        log->info("Configuration loaded from '{}'; logs under '{}'", config_path, log_dir);
-    } else {
-        log->warn("Configuration file '{}' not found: default values, no connections; logs under '{}'",
-                  config_path,
-                  log_dir);
-    }
+    log->info("Configuration loaded from '{}'; logs under '{}'", config_path, log_dir);
 
     // The s3 connector actor spawned below initialises Arrow's S3 subsystem; the process owes Arrow a FinalizeS3 before exit on every path
     // below, aborted startups included. Declared before every module so it

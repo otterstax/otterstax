@@ -17,10 +17,12 @@ read once at startup, holds the server settings and every connection.
 ## Connection Config
 
 `config.yaml` — path from `--config PATH` (default `config.yaml`, relative to the working
-directory; a missing file = default ports, no connections). Containers run from
-`/app/build/Release` with no `--config`: the file is baked (`Dockerfile.test`) or bind-mounted
-(compose files) onto `/app/build/Release/config.yaml`. There is no runtime add/remove API: edit and
-restart. Full reference: `config/CLAUDE.md`.
+directory). A missing file, or one without `service.engine.data_dir`, refuses the startup (stderr,
+exit 1). Containers run from `/app/build/Release`: the test image (`Dockerfile.test`) bakes the file
+there and passes no `--config`; the public image (`Dockerfile`, stage `runtime`) runs
+`./server --config /otterstax/config.yaml`, a baked file that names only `data_dir: /otterstax/data`
+(the volume), and compose files bind-mount their own over it. There is no runtime add/remove API:
+edit and restart. Full reference: `config/CLAUDE.md`.
 
 ```yaml
 service:
@@ -30,7 +32,7 @@ service:
   spark_connect: { host: "0.0.0.0", port: 15002, session_timeout_s: 3600 }  # 0 = never expire
   connection_retry: { max_attempts: 10, delay_ms: 2000 }   # default 1 / 1000 = one attempt
   timezone: UTC                     # the server's: every session's TimeZone until its client sets one
-  engine:  { data_dir: /tmp/test_collection_sql/base, log_dir: "" }        # log_dir empty = data_dir
+  engine:  { data_dir: /tmp/test_collection_sql/base, log_dir: "" }        # data_dir required; log_dir empty = data_dir
   runtime:                          # every thread pool; every key optional
     general: { threads: 3 }         # engine pools (>= 1)
     exec:    { threads: 3 }
@@ -65,7 +67,7 @@ connections:
   alias must be an unquoted identifier `[a-z_][a-z0-9_]*`; backend aliases are one namespace
   (mysql / postgresql / clickhouse together), s3 aliases another (any spelling). `local`,
   `federation` and `main` are reserved (any case, any section).
-- Refused at load (stderr, exit 1): malformed YAML, a section that is not a mapping, an unknown
+- Refused at load (stderr, exit 1): a missing file, no `service.engine.data_dir`, malformed YAML, a section that is not a mapping, an unknown
   key at any level (`unknown key "pool_sise" in connections.mysql[0]`), an incomplete entry, a bad
   port / `pool_size` / thread count, a reserved, malformed or duplicate alias.
   An unreachable backend is not a config error: retried per `connection_retry`, then logged, the
@@ -90,7 +92,7 @@ order (an aborted startup unwinds the same way).
 
 ```text
 main.cpp
-  → --config PATH; config::load_config        — a refusal to stderr, return 1 (no logger yet)
+  → --config PATH; config::load_config        — a missing file, a refusal or no data_dir: stderr, return 1 (no logger yet)
   → initialize_all_loggers(log_directory(engine))
   → conn::s3::subsystem_finalizer_t           — FinalizeS3 after everything else is gone
   → backends::backends_threads(...)           — the backends pool sized against the connections
@@ -133,8 +135,8 @@ stopped, actors and agents destroyed) → runtime → FinalizeS3.
 ## Build Commands
 
 ```bash
-# Conan deps (if conanfile.py changed, remove ./build first). As the images build it (Dockerfile:
-# cppstd 20, Dockerfile.test: gnu20), every package at the one standard: an abseil built at cppstd 17
+# Conan deps (if conanfile.py changed, remove ./build first). Every package at the one standard
+# (the images build them at gnu20, Dockerfile.deps): an abseil built at cppstd 17
 # has no operator<=> on absl::int128, which otterbrix's core/date/date_types.hpp:143 compares with.
 conan install conanfile.py --build missing -s build_type=Release -s compiler.cppstd=20
 
@@ -191,7 +193,8 @@ default seccomp refuses, so the image's `ctest` step cannot pass inside `docker 
 Silicon (CI builds it on amd64). On arm64 build without it and run the tests in a container:
 
 ```bash
-docker build -f Dockerfile.test --build-arg TSAN_DEPS=true --build-arg ENABLE_TSAN=ON \
+docker build -f Dockerfile.test --build-arg DEPS_IMAGE="$(./scripts/deps-image.sh tsan)" \
+  --build-arg TSAN_DEPS=true --build-arg ENABLE_TSAN=ON \
   --build-arg RUN_TESTS=false --build-arg BUILD_JOBS=<JOBS> -t otterstax-tsan .
 docker run --rm --security-opt seccomp=unconfined -w /app/build/Release otterstax-tsan \
   ctest -C Release --output-on-failure --timeout 120
@@ -225,8 +228,38 @@ cmake -S . -B build/asan-deps -DENABLE_ASAN=ON -DBUILD_TESTS=ON -DCMAKE_BUILD_TY
 
 Cap the jobs (see **Build resources**).
 
+### Dependency images (`Dockerfile.deps`)
+
+`Dockerfile` and `Dockerfile.test` compile only OtterStax: they start `FROM ${DEPS_IMAGE}`, an
+image that already holds the system packages, conan and every conan package of `conanfile.py`
+(`-s compiler.cppstd=gnu20`). Three variants, three packages on ghcr.io:
+
+| Variant | Image | Holds |
+|---|---|---|
+| `release` | `ghcr.io/otterstax/otterstax-deps:<tag>` | every package, plain |
+| `asan` | `ghcr.io/otterstax/otterstax-deps-asan:<tag>` | `release` + the 5 packages `asan-deps.profile` instruments |
+| `tsan` | `ghcr.io/otterstax/otterstax-deps-tsan:<tag>` | `release` + the 7 packages `tsan-deps.profile` instruments, g++-12 |
+
+- The sanitizer images are built `FROM` the release one: a package its profile does not touch has
+  the same conan package id, so it is taken from the cache (44 of 49 under ASAN, 42 under TSAN).
+- `<tag>` is a hash of `Dockerfile.deps`, `conanfile.py`, the two profiles and the librdkafka conan
+  hook (`scripts/deps-image.sh --tag`): a change of any names a new image, anything else reuses
+  the published one.
+- `./scripts/deps-image.sh [release|asan|tsan]` puts the image into the local store and prints its
+  reference: pulled on amd64, built here otherwise (the registry holds `linux/amd64` only — on an
+  arm64 Mac the first run compiles every dependency, once for both Dockerfiles). It also tags
+  `<name>:local`, the default `DEPS_IMAGE`, so a bare `docker build` / `docker compose build` works
+  afterwards. `docker-run-tests.sh` and the benchmark scripts call it themselves.
+- Both Dockerfiles still run `conan install`: over the image it only writes the generators; a
+  package the image lacks (a `conanfile.py` newer than the image, Tracy) is built there.
+- CI: the `Dependency images` workflow publishes the images of a commit's tag (a run whose images
+  exist ends at once); every other workflow waits for its image (`.github/actions/deps-image`)
+  and passes it as `DEPS_IMAGE`. A pull request from a fork cannot publish: it works while it
+  leaves the tag's files alone.
+
 ```bash
 ./docker-run-tests.sh -j <JOBS>                     # integration suite + PySpark client matrix
+./scripts/deps-image.sh release                     # once: the dependency image, tagged otterstax-deps:local
 docker build -f Dockerfile.test --build-arg BUILD_JOBS=<JOBS> -t otterstax-test .   # unit tests in the image
 python3 fixtures/generate_data.py && docker compose up   # full stack for manual testing
 ./benchmark/scripts/run_benchmark.sh --repetitions 5

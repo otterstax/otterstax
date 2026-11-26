@@ -196,10 +196,7 @@ services:
     networks: [quickstart_net]
 
   qs-otterstax:
-    build:
-      context: ../..
-      dockerfile: Dockerfile
-    image: otterstax_app:latest
+    image: ghcr.io/otterstax/otterstax:0.2.0
     container_name: qs-otterstax
     depends_on:
       qs-postgres-shop:
@@ -217,7 +214,7 @@ services:
     ports:
       - "8817:8817"    # PostgreSQL wire — the only published frontend
     volumes:
-      - ./config.yaml:/app/build/Release/config.yaml:ro
+      - ./config.yaml:/otterstax/config.yaml:ro
     healthcheck:
       test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/localhost/8817' || exit 1"]
       interval: 5s

@@ -123,8 +123,9 @@ TEST_CASE("engine: the runtime's sessions pool stops independently of the engine
 
 TEST_CASE("engine: make_engine_configuration puts every directory in data_dir by default") {
     config::EngineConfig engine;
+    engine.data_dir = "/srv/otterstax/data";
     auto configuration = make_engine_configuration(engine);
-    const std::filesystem::path data_dir = config::DEFAULT_ENGINE_DATA_DIR;
+    const std::filesystem::path data_dir = engine.data_dir;
     CHECK(configuration.main_path == data_dir);
     CHECK(configuration.wal.path == data_dir);
     CHECK(configuration.disk.path == data_dir);

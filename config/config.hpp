@@ -38,17 +38,14 @@ struct SparkConnectConfig {
     std::uint32_t session_timeout_s = 3600;
 };
 
-// The engine's data dir when `service.engine.data_dir` is not set.
-inline constexpr const char* DEFAULT_ENGINE_DATA_DIR = "/tmp/test_collection_sql/base";
-
 // `service.engine`: the embedded otterbrix engine (otterbrix
-// configuration::config). Every key is optional; everything else the engine
-// takes is otterbrix's own default. Plain data: the runtime/ target turns it
+// configuration::config). `data_dir` is required (main.cpp refuses to start
+// without it); everything else the engine takes is otterbrix's own default. Plain data: the runtime/ target turns it
 // into a configuration::config (otterstax::runtime::make_engine_configuration).
 struct EngineConfig {
     // The engine's own directory: it holds the `.lock` that refuses a second
-    // engine, the WAL and the tables.
-    std::string data_dir = DEFAULT_ENGINE_DATA_DIR;
+    // engine, the WAL and the tables. No default: empty until the file names it.
+    std::string data_dir;
     // Where every log file of the server goes — otterstax's loggers and the
     // engine's lines, which share Main's sinks (config::log_directory: empty →
     // data_dir). main.cpp creates the loggers there once the file is read; what

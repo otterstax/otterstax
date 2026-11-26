@@ -15,6 +15,9 @@ service:
   connection_retry:
     max_attempts: 10
     delay_ms: 2000
+  # Required: the engine's directory (the .lock, the WAL, the tables, the logs).
+  engine:
+    data_dir: /tmp/test_collection_sql/base
 
 connections:
   mysql:

@@ -96,6 +96,7 @@ if $ENABLE_TRACY; then
     echo "Building otterstax_app:${IMAGE_TAG} with Tracy enabled..."
     docker build -t "otterstax_app:${IMAGE_TAG}" \
         -f "$REPO_ROOT/Dockerfile.test" \
+        --build-arg DEPS_IMAGE="$("$REPO_ROOT/scripts/deps-image.sh" release)" \
         --build-arg WITH_TRACY=true \
         --build-arg WITH_PERF="${ENABLE_PERF}" \
         --build-arg BUILD_JOBS="${BUILD_JOBS}" \
@@ -104,6 +105,7 @@ elif $FORCE_REBUILD; then
     echo "Building otterstax_app:${IMAGE_TAG} ..."
     docker build -t "otterstax_app:${IMAGE_TAG}" \
         -f "$REPO_ROOT/Dockerfile.test" \
+        --build-arg DEPS_IMAGE="$("$REPO_ROOT/scripts/deps-image.sh" release)" \
         --build-arg WITH_PERF="${ENABLE_PERF}" \
         --build-arg BUILD_JOBS="${BUILD_JOBS}" \
         "$REPO_ROOT"
@@ -121,6 +123,7 @@ if $ENABLE_PERF; then
         echo "  perf not found in image — rebuilding with perf tools..."
         docker build -t "otterstax_app:${IMAGE_TAG}" \
             -f "$REPO_ROOT/Dockerfile.test" \
+            --build-arg DEPS_IMAGE="$("$REPO_ROOT/scripts/deps-image.sh" release)" \
             --build-arg WITH_PERF=true \
             --build-arg BUILD_JOBS="${BUILD_JOBS}" \
             "$REPO_ROOT"

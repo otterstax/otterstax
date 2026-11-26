@@ -275,6 +275,13 @@ if [ -n "${IMAGE_TAG}" ]; then
     echo "ℹ️  IMAGE_TAG=${IMAGE_TAG} set; skipping test-otterstax build"
     compose build test-client rustfs-init $SPARK_CLIENT_BUILD
 else
+    # Dockerfile.test starts FROM the dependency image of its variant: pulled,
+    # or built here once when the registry has none for this platform.
+    _deps_variant=release
+    [ "${ENABLE_ASAN:-OFF}" = "ON" ] && _deps_variant=asan
+    DEPS_IMAGE="$("$SCRIPT_DIR/scripts/deps-image.sh" "$_deps_variant")"
+    export DEPS_IMAGE
+    echo "ℹ️  Dependency image: ${DEPS_IMAGE}"
     compose build test-client test-otterstax rustfs-init $SPARK_CLIENT_BUILD
 fi
 

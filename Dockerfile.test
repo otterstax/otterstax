@@ -1,35 +1,11 @@
-FROM ubuntu:22.04 AS builder
-
-ENV TZ=America/US
-ENV DEBIAN_FRONTEND=noninteractive
-ENV PYTHONFAULTHANDLER=1
-
-RUN apt update && \
-    apt upgrade -y && \
-    apt install -y \
-        build-essential \
-        ninja-build \
-        git \
-        pkg-config \
-        libdbus-1-dev \
-        python3-pip \
-        python3-venv \
-        python3-dev curl gnupg apt-transport-https \
-        zlib1g \
-        libssl-dev bison flex tzdata && \
-    apt clean && \
-    rm -rf /var/lib/apt/lists/*
-
-# cmake.org answers 403 to conan's HTTP client, so the conancenter cmake binary
-# recipe cannot be fetched; the pip-installed cmake is declared as the platform
-# tool_requires of the build profile instead (it satisfies the recipes' <4 range).
-RUN pip3 install --no-cache-dir conan==2.21.0 'cmake<4.0' && \
-     conan profile detect --force && \
-     printf '\n[platform_tool_requires]\ncmake/%s\n' "$(cmake --version | head -1 | awk '{print $3}')" \
-         >> "$(conan profile path default)" && \
-     conan remote add otterbrix https://conan.otterbrix.com
-
-RUN rm /bin/sh && ln -s /bin/bash /bin/sh
+# The system packages, conan and every conan package come prebuilt in a
+# dependency image (Dockerfile.deps): this file compiles only OtterStax and its
+# tests. DEPS_IMAGE is the image of the variant being built — otterstax-deps
+# (plain), otterstax-deps-asan with ASAN_DEPS=true, otterstax-deps-tsan with
+# TSAN_DEPS=true. `./scripts/deps-image.sh <release|asan|tsan>` pulls or builds
+# it and prints its reference; CI passes the published one.
+ARG DEPS_IMAGE=otterstax-deps:local
+FROM ${DEPS_IMAGE} AS builder
 
 ARG BUILD_TYPE=Release
 ARG WITH_TRACY=false
@@ -53,12 +29,6 @@ ARG TSAN_DEPS=false
 # so an ENABLE_ASAN=ON build over the prebuilt packages hands them the wrong
 # field addresses. Pass it with ENABLE_ASAN=ON.
 ARG ASAN_DEPS=false
-
-RUN if [ "$TSAN_DEPS" = "true" ]; then \
-        apt-get update && \
-        apt-get install -y --no-install-recommends g++-12 && \
-        apt-get clean && rm -rf /var/lib/apt/lists/*; \
-    fi
 
 # Run conan install from the project root so self.source_folder=/app and
 # cmake_layout places generators + libs at build/${BUILD_TYPE}/ — matching
@@ -84,13 +54,11 @@ RUN _jobs="${BUILD_JOBS}" && \
         mkdir -p /root/.conan2/extensions/hooks && \
         cp ./conan-hooks/hook_librdkafka_c11threads_off.py /root/.conan2/extensions/hooks/ && \
         conan install conanfile.py --build missing "${_jobs_conf[@]}" \
-            --build="otterbrix/*" --build="actor-zeta/*" --build="librdkafka/*" \
             -pr:h ./tsan-deps.profile \
             -s build_type=${BUILD_TYPE} \
             -s compiler.cppstd=gnu20; \
     elif [ "$ASAN_DEPS" = "true" ]; then \
         conan install conanfile.py --build missing "${_jobs_conf[@]}" \
-            --build="otterbrix/*" \
             -pr:h ./asan-deps.profile -pr:b default \
             -s build_type=${BUILD_TYPE} \
             -s compiler.cppstd=gnu20; \

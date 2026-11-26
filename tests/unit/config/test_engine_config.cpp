@@ -64,7 +64,7 @@ namespace {
     }
 
     void check_default_engine(const config::EngineConfig& engine) {
-        CHECK(engine.data_dir == config::DEFAULT_ENGINE_DATA_DIR);
+        CHECK(engine.data_dir.empty());
         CHECK(engine.log_dir.empty());
     }
 
@@ -252,7 +252,6 @@ TEST_CASE("service.engine: the log directory is log_dir, else data_dir") {
     CHECK(config::log_directory(engine) == "/srv/otterstax/data");
     engine.log_dir = "/var/log/otterstax";
     CHECK(config::log_directory(engine) == "/var/log/otterstax");
-    CHECK(config::log_directory(config::EngineConfig{}) == config::DEFAULT_ENGINE_DATA_DIR);
 }
 
 // service.timezone: the server's time zone, UTC when absent; read as text (the engine checks the zone at startup),

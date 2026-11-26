@@ -1,0 +1,54 @@
+name: Dependency image
+description: >
+  The published dependency image of a build variant (Dockerfile.deps): logs in
+  to ghcr.io, waits until the "Dependency images" workflow has pushed the image
+  of this tree's tag, and outputs its reference for the DEPS_IMAGE build
+  argument of Dockerfile / Dockerfile.test.
+inputs:
+  variant:
+    description: release, asan or tsan
+    required: false
+    default: release
+  token:
+    description: A token that can read the packages (GITHUB_TOKEN)
+    required: true
+  timeout-minutes:
+    description: How long to wait for the image to appear
+    required: false
+    default: "240"
+outputs:
+  image:
+    description: ghcr.io/otterstax/otterstax-deps[-asan|-tsan]:<tag>
+    value: ${{ steps.wait.outputs.image }}
+runs:
+  using: composite
+  steps:
+    - name: Log in to ghcr.io
+      uses: docker/login-action@v3
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ inputs.token }}
+
+    # The image is built by the "Dependency images" workflow of the same push.
+    # It exists already unless conanfile.py or a profile changed; then this
+    # waits for that workflow instead of compiling the dependencies here.
+    - name: Wait for the dependency image
+      id: wait
+      shell: bash
+      env:
+        VARIANT: ${{ inputs.variant }}
+        TIMEOUT_MINUTES: ${{ inputs.timeout-minutes }}
+      run: |
+        image="$(./scripts/deps-image.sh --ref "$VARIANT")"
+        echo "image=${image}" >> "$GITHUB_OUTPUT"
+        deadline=$(( $(date +%s) + TIMEOUT_MINUTES * 60 ))
+        until docker manifest inspect "$image" >/dev/null 2>&1; do
+          if [ "$(date +%s)" -ge "$deadline" ]; then
+            echo "::error::${image} did not appear in ${TIMEOUT_MINUTES} min: see the Dependency images workflow of this commit"
+            exit 1
+          fi
+          echo "waiting for ${image}"
+          sleep 60
+        done
+        echo "found ${image}"
